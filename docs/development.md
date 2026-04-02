@@ -1,0 +1,285 @@
+# Development Setup
+
+## Prerequisites
+
+| Tool | Version | Install |
+|---|---|---|
+| Node.js | 20+ | [nodejs.org](https://nodejs.org) or `nvm` |
+| npm | 10+ | Bundled with Node.js |
+| PostgreSQL | 14+ | [postgresql.org](https://www.postgresql.org) |
+| Redis | 6+ | [redis.io](https://redis.io) |
+| Git | any | `apt install git` |
+
+## Initial Setup
+
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/yourorg/onetwo3d-ims.git
+cd onetwo3d-ims
+```
+
+### 2. Install dependencies
+
+```bash
+npm install
+```
+
+### 3. Configure environment
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env` and set at minimum:
+
+```env
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/onetwo3d_ims_dev
+AUTH_SECRET=any-random-32-char-string-for-dev
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+AUTH_URL=http://localhost:3000
+```
+
+For development, you can leave WooCommerce, Xero, and FX API fields blank — those integrations will simply be disabled until configured.
+
+### 4. Create the development database
+
+```bash
+# If PostgreSQL is running locally
+createdb onetwo3d_ims_dev
+
+# Or via psql
+psql -U postgres -c "CREATE DATABASE onetwo3d_ims_dev;"
+```
+
+### 5. Run migrations
+
+```bash
+npx prisma migrate dev
+```
+
+This applies all migrations and generates the Prisma client.
+
+### 6. Start the development server
+
+```bash
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000).
+
+---
+
+## Database
+
+### Prisma workflow
+
+```bash
+# After editing prisma/schema.prisma, create a new migration:
+npx prisma migrate dev --name describe_your_change
+
+# Apply existing migrations (e.g. after pulling changes):
+npx prisma migrate dev
+
+# Inspect the database visually:
+npx prisma studio
+
+# Reset database (WARNING: deletes all data):
+npx prisma migrate reset
+
+# Generate Prisma client without migrating:
+npx prisma generate
+```
+
+### Seed data
+
+```bash
+npm run db:seed
+```
+
+This creates:
+- Default warehouses (EAR2, CBG, RES, QUA)
+- Base currencies (GBP, EUR, USD, NOK, SEK, CAD)
+- Default tax rates
+- Default organisation record
+- A test admin user (`admin@example.com` / `password`)
+
+---
+
+## Background Workers
+
+In development, start the BullMQ worker in a separate terminal:
+
+```bash
+npm run worker
+```
+
+The worker handles:
+- FX rate refresh (hourly)
+- WooCommerce order polling (if webhooks are disabled)
+- Xero sync queue processing
+
+---
+
+## Project Structure
+
+```
+onetwo3d-ims/
+├── app/                          # Next.js App Router
+│   ├── (auth)/                   # Public auth pages (login, 2FA)
+│   ├── (dashboard)/              # Protected pages (all modules)
+│   │   ├── dashboard/
+│   │   ├── inventory/
+│   │   ├── stock-control/
+│   │   ├── purchase-orders/
+│   │   ├── sales/
+│   │   ├── manufacturing/
+│   │   ├── analytics/
+│   │   ├── sync/
+│   │   ├── settings/
+│   │   └── activity/
+│   └── api/                      # Route handlers (REST API)
+│       ├── auth/
+│       ├── products/
+│       ├── inventory/
+│       ├── purchase-orders/
+│       ├── sales/
+│       ├── warehouses/
+│       ├── suppliers/
+│       ├── manufacturing/
+│       ├── sync/
+│       │   ├── woocommerce/
+│       │   └── xero/
+│       └── webhooks/
+│           └── woocommerce/
+├── components/
+│   ├── ui/                       # shadcn/ui components
+│   └── [feature]/                # Feature-specific components
+├── lib/
+│   ├── auth/                     # Auth.js configuration
+│   ├── db/                       # Prisma client singleton
+│   ├── fifo/                     # COGS/FIFO calculation engine
+│   ├── landed-cost/              # Landed cost distribution logic
+│   ├── fx/                       # FX rate fetching and caching
+│   ├── pdf/                      # PDF templates (PO, RFQ)
+│   ├── email/                    # Nodemailer email sending
+│   ├── queue/                    # BullMQ queue definitions
+│   ├── woocommerce/              # WooCommerce API client
+│   └── xero/                     # Xero API client and journal builders
+├── workers/                      # BullMQ worker processes
+│   └── index.ts                  # Worker entry point
+├── prisma/
+│   ├── schema.prisma             # Database schema (source of truth)
+│   ├── migrations/               # Applied migrations
+│   └── seed.ts                   # Development seed data
+├── scripts/
+│   ├── install.sh                # Production installer
+│   ├── update.sh                 # Production update script
+│   └── backup.sh                 # Database backup script
+├── docs/                         # Documentation
+├── public/                       # Static assets
+├── .env.example                  # Environment variable template
+└── ecosystem.config.js           # PM2 configuration (generated by install.sh)
+```
+
+---
+
+## Available npm Scripts
+
+| Script | Description |
+|---|---|
+| `npm run dev` | Start Next.js development server with hot reload |
+| `npm run build` | Build for production |
+| `npm run start` | Start production server (requires build) |
+| `npm run worker` | Start BullMQ background worker |
+| `npm run db:seed` | Seed the database with development data |
+| `npm run db:studio` | Open Prisma Studio |
+| `npm run lint` | Run ESLint |
+| `npm run type-check` | Run TypeScript compiler (no emit) |
+| `npm run cli -- <command>` | Run CLI commands (e.g. `create-user`) |
+
+---
+
+## Code Conventions
+
+### API Route Handlers
+
+All route handlers live in `app/api/` and follow this pattern:
+
+```typescript
+// app/api/products/route.ts
+import { NextRequest } from 'next/server'
+import { z } from 'zod'
+import { db } from '@/lib/db'
+import { requireAuth } from '@/lib/auth/server'
+
+const createSchema = z.object({
+  sku: z.string().min(1),
+  name: z.string().min(1),
+})
+
+export async function POST(request: NextRequest) {
+  await requireAuth(request)
+
+  const body = await request.json()
+  const data = createSchema.parse(body)
+
+  const product = await db.product.create({ data })
+
+  return Response.json(product, { status: 201 })
+}
+```
+
+### Validation
+
+Use `zod` for all request validation. Schemas live alongside the route handler or in a shared `lib/schemas/` file if reused across routes.
+
+### Database access
+
+Always use the Prisma client singleton from `lib/db`:
+
+```typescript
+import { db } from '@/lib/db'
+```
+
+Never instantiate `new PrismaClient()` directly in route handlers.
+
+### Monetary values
+
+- All monetary values in the database are stored as `Decimal` (Prisma) / `DECIMAL` (PostgreSQL)
+- In TypeScript, use the `Decimal` type from `@prisma/client`
+- Never use `number` for money — floating point precision is unacceptable for financial data
+- All amounts stored in **both** the original currency and GBP equivalent
+
+### FIFO COGS
+
+The FIFO engine lives in `lib/fifo/`. It should be the **only** place that creates `CostLayer` and `CogsEntry` records. Never create these directly in route handlers.
+
+---
+
+## Testing WooCommerce Webhooks Locally
+
+Use [ngrok](https://ngrok.com) or [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/) to expose your local server:
+
+```bash
+# Using ngrok
+npx ngrok http 3000
+
+# Configure the resulting URL as your webhook delivery URL in WooCommerce
+# e.g. https://abc123.ngrok.io/api/webhooks/woocommerce
+```
+
+---
+
+## Environment Variables
+
+See [docs/configuration.md](configuration.md) for the full reference.
+
+For development, only these are required to get the app running:
+
+```env
+DATABASE_URL=postgresql://postgres:postgres@localhost:5432/onetwo3d_ims_dev
+AUTH_SECRET=dev-secret-at-least-32-characters-long
+NEXT_PUBLIC_APP_URL=http://localhost:3000
+AUTH_URL=http://localhost:3000
+```
