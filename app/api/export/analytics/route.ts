@@ -91,23 +91,23 @@ export async function GET(req: NextRequest) {
     }
     case 'po_received': {
       const rows = await getReceivedGoods(dateFrom, dateTo)
-      const data = rows.map((r) => ({ poReference: r.poReference, supplierName: r.supplierName, receivedAt: r.receivedAt.slice(0, 10), warehouseCode: r.warehouseCode, lineCount: r.lineCount, totalQty: r.totalQty }))
-      return csvResponse(toCsv(data, ['poReference', 'supplierName', 'receivedAt', 'warehouseCode', 'lineCount', 'totalQty']), `received-goods-${date}.csv`)
+      const data = rows.map((r) => ({ sku: r.sku, productName: r.productName, poReference: r.poReference, supplierName: r.supplierName, grnReference: r.grnReference, warehouseCode: r.warehouseCode, qtyReceived: r.qtyReceived, unitCostGbp: r.unitCostGbp.toFixed(2), totalGbp: r.totalGbp.toFixed(2), landedUnitCostGbp: r.landedUnitCostGbp.toFixed(2), status: r.status, receivedAt: r.receivedAt.slice(0, 10) }))
+      return csvResponse(toCsv(data, ['sku', 'productName', 'poReference', 'supplierName', 'grnReference', 'warehouseCode', 'qtyReceived', 'unitCostGbp', 'totalGbp', 'landedUnitCostGbp', 'status', 'receivedAt']), `received-goods-${date}.csv`)
     }
     case 'po_bills': {
       const rows = await getPurchaseBills(dateFrom, dateTo)
-      const data = rows.map((r) => ({ invoiceNumber: r.invoiceNumber, poReference: r.poReference, supplierName: r.supplierName, invoiceDate: r.invoiceDate.slice(0, 10), totalGbp: r.totalGbp.toFixed(2) }))
-      return csvResponse(toCsv(data, ['invoiceNumber', 'poReference', 'supplierName', 'invoiceDate', 'totalGbp']), `purchase-bills-${date}.csv`)
+      const data = rows.map((r) => ({ poReference: r.poReference, supplierName: r.supplierName, invoiceNumber: r.invoiceNumber, sku: r.sku, productName: r.productName, qtyBilled: r.qtyBilled, invoiceDate: r.invoiceDate.slice(0, 10), totalForeign: r.totalForeign.toFixed(2), totalGbp: r.totalGbp.toFixed(2), status: r.status }))
+      return csvResponse(toCsv(data, ['poReference', 'supplierName', 'invoiceNumber', 'sku', 'productName', 'qtyBilled', 'invoiceDate', 'totalForeign', 'totalGbp', 'status']), `purchase-bills-${date}.csv`)
     }
     case 'po_aging': {
       const rows = await getSupplierAging()
-      const data = rows.map((r) => ({ supplierName: r.supplierName, totalInvoiced: r.totalInvoiced.toFixed(2), poCount: r.poCount, avgLeadTimeDays: r.avgLeadTimeDays }))
-      return csvResponse(toCsv(data, ['supplierName', 'totalInvoiced', 'poCount', 'avgLeadTimeDays']), `supplier-aging-${date}.csv`)
+      const data = rows.map((r) => ({ supplierName: r.supplierName, grossAmount: r.grossAmount.toFixed(2), refunds: r.refunds.toFixed(2), netAmount: r.netAmount.toFixed(2), landedCosts: r.landedCosts.toFixed(2), tax: r.tax.toFixed(2), totalAmount: r.totalAmount.toFixed(2), billedAmount: r.billedAmount.toFixed(2), dueAmount: r.dueAmount.toFixed(2), overdue0_30: r.overdue0_30.toFixed(2), overdue31_60: r.overdue31_60.toFixed(2), overdue61_90: r.overdue61_90.toFixed(2), overdue91plus: r.overdue91plus.toFixed(2), poCount: r.poCount, avgLeadTimeDays: r.avgLeadTimeDays }))
+      return csvResponse(toCsv(data, ['supplierName', 'grossAmount', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'dueAmount', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus', 'poCount', 'avgLeadTimeDays']), `supplier-aging-${date}.csv`)
     }
     case 'po_details': {
       const rows = await getPurchaseDetails(dateFrom, dateTo)
-      const data = rows.map((r) => ({ reference: r.reference, type: r.type, status: r.status, supplierName: r.supplierName, currency: r.currency, totalForeign: r.totalForeign.toFixed(2), totalGbp: r.totalGbp.toFixed(2), lineCount: r.lineCount, createdAt: r.createdAt.slice(0, 10) }))
-      return csvResponse(toCsv(data, ['reference', 'type', 'status', 'supplierName', 'currency', 'totalForeign', 'totalGbp', 'lineCount', 'createdAt']), `purchase-details-${date}.csv`)
+      const data = rows.map((r) => ({ reference: r.reference, sku: r.sku, productName: r.productName, barcode: r.barcode, type: r.type, status: r.status, supplierName: r.supplierName, currency: r.currency, qty: r.qty, totalForeign: r.totalForeign.toFixed(2), totalGbp: r.totalGbp.toFixed(2), createdAt: r.createdAt.slice(0, 10) }))
+      return csvResponse(toCsv(data, ['reference', 'sku', 'productName', 'barcode', 'type', 'status', 'supplierName', 'currency', 'qty', 'totalForeign', 'totalGbp', 'createdAt']), `purchase-details-${date}.csv`)
     }
 
     case 'inv_onhand': {
