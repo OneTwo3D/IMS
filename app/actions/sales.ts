@@ -353,8 +353,12 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
   try {
     if (!input.lines.length) return { success: false, error: 'Add at least one line item' }
     if (!input.customerName?.trim()) return { success: false, error: 'Customer name is required' }
+    for (const l of input.lines) {
+      if (l.qty <= 0) return { success: false, error: `Invalid qty for ${l.sku}` }
+      if (l.unitPriceForeign < 0) return { success: false, error: `Negative price for ${l.sku}` }
+    }
 
-    const fxRate = input.fxRateToGbp || 1
+    const fxRate = input.fxRateToGbp && input.fxRateToGbp > 0 ? input.fxRateToGbp : 1
     const vatRate = input.taxRateValue ?? 0
     const inclVat = input.pricesIncludeVat && vatRate > 0
     let subtotalForeign = 0
@@ -507,13 +511,28 @@ export async function updateSalesOrderStatus(
     })
     if (!so) return { success: false, error: 'Order not found' }
 
+    // Valid status transitions
+    const VALID_TRANSITIONS: Record<string, string[]> = {
+      PENDING: ['PROCESSING', 'CANCELLED', 'ON_HOLD'],
+      PROCESSING: ['PICKING', 'CANCELLED', 'ON_HOLD'],
+      PICKING: ['PACKED', 'CANCELLED', 'ON_HOLD'],
+      PACKED: ['SHIPPED', 'CANCELLED', 'ON_HOLD'],
+      SHIPPED: ['COMPLETED'],
+      ON_HOLD: ['PENDING', 'PROCESSING', 'CANCELLED'],
+    }
+    const allowed = VALID_TRANSITIONS[so.status] ?? []
+    if (!allowed.includes(targetStatus)) {
+      return { success: false, error: `Cannot transition from ${so.status} to ${targetStatus}` }
+    }
+
     const data: Record<string, unknown> = { status: targetStatus }
 
     // On SHIPPED: record shipped date, tracking, and create stock movements
     if (targetStatus === 'SHIPPED') {
+      const warehouseId = extra?.shipFromWarehouseId || so.shipFromWarehouseId
+      if (!warehouseId) return { success: false, error: 'A warehouse must be selected before shipping' }
       data.shippedAt = new Date()
       if (extra?.trackingNumber) data.trackingNumber = extra.trackingNumber
-      const warehouseId = extra?.shipFromWarehouseId || so.shipFromWarehouseId
       if (extra?.shipFromWarehouseId) data.shipFromWarehouseId = extra.shipFromWarehouseId
 
       if (warehouseId) {
@@ -717,9 +736,13 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
 
 export async function deleteSalesOrder(id: string): Promise<{ success: boolean; error?: string }> {
   try {
-    const so = await db.salesOrder.findUnique({ where: { id }, select: { status: true, shipFromWarehouseId: true, lines: { select: { productId: true, qty: true } } } })
+    const so = await db.salesOrder.findUnique({
+      where: { id },
+      select: { status: true, shipFromWarehouseId: true, lines: { select: { productId: true, qty: true } }, _count: { select: { refunds: true, payments: true } } },
+    })
     if (!so) return { success: false, error: 'Order not found' }
     if (so.status !== 'PENDING') return { success: false, error: 'Only pending orders can be deleted' }
+    if (so._count.refunds > 0 || so._count.payments > 0) return { success: false, error: 'Cannot delete an order with refunds or payments' }
 
     // Release reserved stock
     if (so.shipFromWarehouseId) {
@@ -784,13 +807,16 @@ export async function updateSalesOrderNotes(
 
 export async function generateInvoiceNumber(id: string): Promise<{ success: boolean; invoiceNumber?: string; error?: string }> {
   try {
-    const so = await db.salesOrder.findUnique({ where: { id }, select: { invoiceNumber: true } })
-    if (!so) return { success: false, error: 'Order not found' }
-    if (so.invoiceNumber) return { success: true, invoiceNumber: so.invoiceNumber }
-
-    const count = await db.salesOrder.count({ where: { invoiceNumber: { not: null } } })
-    const num = `INV-${new Date().getFullYear()}-${String(count + 1).padStart(5, '0')}`
-    await db.salesOrder.update({ where: { id }, data: { invoiceNumber: num, invoicedAt: new Date() } })
+    // Use a transaction to prevent race conditions on invoice numbering
+    const num = await db.$transaction(async (tx) => {
+      const so = await tx.salesOrder.findUnique({ where: { id }, select: { invoiceNumber: true } })
+      if (!so) throw new Error('Order not found')
+      if (so.invoiceNumber) return so.invoiceNumber
+      const count = await tx.salesOrder.count({ where: { invoiceNumber: { not: null } } })
+      const invNum = `INV-${new Date().getFullYear()}-${String(count + 1).padStart(5, '0')}`
+      await tx.salesOrder.update({ where: { id }, data: { invoiceNumber: invNum, invoicedAt: new Date() } })
+      return invNum
+    })
     revalidatePath(`/sales/${id}`)
     return { success: true, invoiceNumber: num }
   } catch (e) {
@@ -825,6 +851,7 @@ export async function addPayment(input: {
   paidAt?: string
 }): Promise<{ success: boolean; error?: string }> {
   try {
+    if (!input.amount || input.amount <= 0) return { success: false, error: 'Amount must be greater than 0' }
     await db.payment.create({
       data: {
         orderId: input.orderId,

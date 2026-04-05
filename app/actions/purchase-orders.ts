@@ -168,10 +168,15 @@ function makeReference(): string {
   return `PO-${ymd}-${rand}`
 }
 
+function safeFxRate(rate: number): number {
+  return rate > 0 ? rate : 1
+}
+
 function calcLineTotals(unitCostForeign: number, qty: number, fxRate: number) {
+  const rate = safeFxRate(fxRate)
   const totalForeign = Math.round(unitCostForeign * qty * 10000) / 10000
-  const unitCostGbp = Math.round((unitCostForeign / fxRate) * 1000000) / 1000000
-  const totalGbp = Math.round((totalForeign / fxRate) * 10000) / 10000
+  const unitCostGbp = Math.round((unitCostForeign / rate) * 1000000) / 1000000
+  const totalGbp = Math.round((totalForeign / rate) * 10000) / 10000
   return { unitCostGbp, totalForeign, totalGbp }
 }
 
@@ -589,8 +594,13 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
 export async function createPurchaseOrder(input: CreatePoInput): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
     if (!input.lines.length) return { success: false, error: 'At least one line is required' }
+    // Validate line inputs
+    for (const l of input.lines) {
+      if (l.qty <= 0) return { success: false, error: `Invalid qty for ${l.sku}` }
+      if (l.unitCostForeign < 0) return { success: false, error: `Negative cost for ${l.sku}` }
+    }
 
-    const fxRate = input.fxRateToGbp || 1
+    const fxRate = safeFxRate(input.fxRateToGbp || 1)
     const vatRate = input.taxRateValue ?? 0
     const inclVat = input.pricesIncludeVat && vatRate > 0
     let subtotalForeign = 0
@@ -834,6 +844,17 @@ export async function receivePurchaseOrder(
     const linesWithQty = receiptLines.filter((rl) => rl.qtyReceived > 0)
     if (!linesWithQty.length) return { success: false, error: 'No quantities to receive' }
 
+    // Validate: can't receive more than outstanding qty
+    for (const rl of linesWithQty) {
+      if (!rl.warehouseId) return { success: false, error: 'Warehouse is required for each line' }
+      const poLine = po.lines.find((l) => l.id === rl.poLineId)
+      if (!poLine) return { success: false, error: 'Invalid PO line' }
+      const outstanding = Number(poLine.qty) - Number(poLine.qtyReceived)
+      if (rl.qtyReceived > outstanding) {
+        return { success: false, error: `Cannot receive more than outstanding qty (${outstanding})` }
+      }
+    }
+
     // Create receipt
     const receiptRef = `RCP-${po.reference}-${Date.now().toString(36).toUpperCase()}`
     await db.purchaseReceipt.create({
@@ -1036,6 +1057,13 @@ export async function returnPurchaseOrder(
       const netReceived = Number(poLine.qtyReceived) - Number(poLine.qtyReturned)
       if (rl.qtyReturned > netReceived) {
         return { success: false, error: `Cannot return more than net received quantity` }
+      }
+      // Check stock level won't go negative
+      const stockLevel = await db.stockLevel.findUnique({
+        where: { productId_warehouseId: { productId: poLine.productId, warehouseId: rl.warehouseId } },
+      })
+      if (stockLevel && Number(stockLevel.quantity) < rl.qtyReturned) {
+        return { success: false, error: `Insufficient stock to return (only ${Number(stockLevel.quantity)} available)` }
       }
     }
 
