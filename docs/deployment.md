@@ -1,6 +1,6 @@
 # Deployment Guide
 
-This guide covers deploying OneTwo3D IMS to a production LXC container on a Proxmox host (or any Debian/Ubuntu server). The current production environment uses OLS (OpenLiteSpeed) as the reverse proxy.
+This guide covers deploying OneTwo3D IMS to a production LXC container on a Proxmox host (or any Debian/Ubuntu server). The production environment uses OLS (OpenLiteSpeed) as the reverse proxy.
 
 ## Prerequisites
 
@@ -19,7 +19,6 @@ This guide covers deploying OneTwo3D IMS to a production LXC container on a Prox
 | Component | Location | Purpose |
 |---|---|---|
 | OLS (OpenLiteSpeed) | `10.0.3.12` | Reverse proxy, SSL termination |
-| Redis | `10.0.3.11` | BullMQ background job queues |
 | PostgreSQL | Local or separate LXC | Primary database |
 
 ### External Services
@@ -39,7 +38,7 @@ A DNS A record pointing your domain (e.g. `ims.yourdomain.com`) to the OLS serve
 
 ## Automated Installation
 
-The installer script handles everything interactively. It installs Node.js, PostgreSQL, nginx (or you can use OLS separately), PM2, configures the database, builds the app, and sets up process management.
+The installer script handles everything interactively. It installs Node.js, PostgreSQL, PM2, configures the database, builds the app, and sets up process management. The script also offers nginx as an option, but the actual production setup uses OLS at `10.0.3.12`.
 
 ### Step 1 -- Prepare the LXC Container
 
@@ -177,31 +176,21 @@ sudo -u imsapp npm run build
 ### 4. Start with PM2
 
 ```bash
-sudo -u imsapp pm2 start /opt/onetwo3d-ims/ecosystem.config.js
+sudo -u imsapp pm2 start npm --name onetwo3d-ims -- start
 pm2 startup systemd -u imsapp --hp /opt/onetwo3d-ims | tail -1 | bash
 pm2 save
 ```
 
-### 5. Configure Reverse Proxy
+### 5. Configure OLS Reverse Proxy
 
 The production setup uses OLS (OpenLiteSpeed) at `10.0.3.12`. Configure a virtual host that proxies to the Next.js process on port 3000.
 
-Alternatively, the install script can configure nginx. For nginx:
+Key OLS settings:
+- Proxy to `http://<app-server-ip>:3000`
+- Enable WebSocket passthrough for Next.js HMR (development only)
+- SSL termination at OLS with your domain certificate
 
-```bash
-# Copy the generated config to sites-available
-ln -s /etc/nginx/sites-available/onetwo3d-ims /etc/nginx/sites-enabled/
-nginx -t && systemctl reload nginx
-```
-
-### 6. Enable SSL (Optional)
-
-```bash
-apt-get install -y certbot python3-certbot-nginx
-certbot --nginx -d ims.yourdomain.com
-```
-
-### 7. Set Up FX Rate Cron
+### 6. Set Up FX Rate Cron
 
 ```bash
 # Add to the app user's crontab
@@ -239,21 +228,18 @@ bash scripts/update.sh --skip-build  # Migrations + restart only (no rebuild)
 
 ## Process Management
 
-The app runs under PM2:
+The app runs under PM2 as a single process:
 
 | Process | Description |
 |---|---|
 | `onetwo3d-ims` | Next.js web server (port 3000) |
-| `onetwo3d-ims-worker` | BullMQ background worker |
 
 ### Common PM2 Commands
 
 ```bash
 pm2 status                        # Show all processes
 pm2 logs onetwo3d-ims             # Live web server logs
-pm2 logs onetwo3d-ims-worker      # Live worker logs
 pm2 restart onetwo3d-ims          # Restart web server
-pm2 restart onetwo3d-ims-worker   # Restart worker
 pm2 reload onetwo3d-ims           # Zero-downtime reload
 pm2 stop onetwo3d-ims             # Stop web server
 ```
@@ -268,9 +254,8 @@ pm2 stop onetwo3d-ims             # Stop web server
 | `/opt/onetwo3d-ims/.env` | Environment configuration (chmod 600) |
 | `/opt/onetwo3d-ims/.next/` | Next.js build output |
 | `/opt/onetwo3d-ims/uploads/invoices/` | Uploaded supplier invoice PDFs |
-| `/opt/onetwo3d-ims/ecosystem.config.js` | PM2 process configuration |
 | `/var/lib/onetwo3d-ims/` | Persistent data (Xero tokens) |
-| `/var/log/onetwo3d-ims/` | Application and worker logs |
+| `/var/log/onetwo3d-ims/` | Application logs |
 | `/var/backups/onetwo3d-ims/` | Database backups |
 | `/etc/logrotate.d/onetwo3d-ims` | Log rotation configuration |
 
@@ -318,7 +303,7 @@ pm2 logs onetwo3d-ims --lines 50
 Common causes:
 - `DATABASE_URL` incorrect -- test with `psql $DATABASE_URL`
 - `AUTH_SECRET` too short -- must be at least 32 characters
-- Port conflict -- change the port in the ecosystem config
+- Port conflict -- change the port in PM2 configuration
 - Missing build -- run `npm run build` first
 
 ### Database Connection Refused
@@ -328,7 +313,7 @@ systemctl status postgresql
 psql postgresql://imsuser:password@localhost:5432/onetwo3d_ims
 ```
 
-### OLS / nginx 502 Bad Gateway
+### OLS 502 Bad Gateway
 
 The Next.js process is not running or not listening on the expected port:
 

@@ -14,33 +14,26 @@
 |                  |  - Auth.js (session management)          |   |
 |                  +-------------------+----------------------+   |
 |                                      |                          |
-|  +-----------------------------------v----------------------+   |
-|  |  BullMQ Worker Process (tsx workers/index.ts)            |   |
-|  |  - FX rate refresh (daily cron)                          |   |
-|  |  - Xero journal sync                                     |   |
-|  |  - WooCommerce order poll (optional)                     |   |
-|  +-------------------+--------------------------------------+   |
-|                      |                                          |
-+----------------------|------------------------------------------+
-                       |
-      +----------------+----------------+
-      |                |                |
-      v                v                v
-+------------+  +-------------+  +------------------+
-| PostgreSQL |  | Redis LXC   |  | External APIs    |
-| (database) |  | 10.0.3.11   |  | - WooCommerce    |
-|            |  | (BullMQ)    |  | - Xero (UK)      |
-+------------+  +-------------+  | - frankfurter.dev|
-                                 | - SMTP           |
-                                 +------------------+
++--------------------------------------|---(cron: 06:00)----------+
+                                       |       |
+                      +----------------+-------+--------+
+                      |                                 |
+                      v                                 v
+               +------------+                  +------------------+
+               | PostgreSQL |                  | External APIs    |
+               | (database) |                  | - WooCommerce    |
+               +------------+                  | - Xero (UK)      |
+                                               | - frankfurter.dev|
+                                               | - SMTP           |
+                                               +------------------+
 ```
 
 ### Infrastructure
 
 - **OLS (OpenLiteSpeed)** at `10.0.3.12` acts as the reverse proxy, terminating SSL and forwarding requests to the Next.js process.
-- **Redis** at `10.0.3.11` provides the queue backend for BullMQ background jobs.
 - **PostgreSQL** stores all application data (~40 models).
 - The Next.js process runs on port 3000 (default) via PM2.
+- A system cron job calls `/api/cron/fx-rates` daily at 06:00 to refresh exchange rates.
 
 ---
 
@@ -192,23 +185,25 @@ User roles: `ADMIN`, `WAREHOUSE`, `FINANCE`, `READONLY`.
 
 ---
 
-## Background Jobs
+## Background Tasks
 
-BullMQ queues run in a separate worker process (`npm run worker` / `tsx workers/index.ts`), connected to Redis at `10.0.3.11`.
+There is no separate worker process. Background tasks are handled via HTTP endpoints triggered by system cron jobs.
 
-| Queue | Job | Trigger | Description |
+| Task | Endpoint | Schedule | Description |
 |---|---|---|---|
-| `fx` | `refresh-rates` | Daily cron (06:00) via curl to `/api/cron/fx-rates` | Fetch latest rates from frankfurter.dev |
-| `wc` | `poll-orders` | Configurable interval | Poll WooCommerce for new/updated orders |
-| `wc` | `sync-stock` | On demand / scheduled | Push stock levels to WooCommerce |
-| `xero` | `sync-cogs` | Daily | Push COGS journal entries to Xero |
-| `xero` | `sync-po-invoice` | On PO invoice creation | Push purchase invoice to Xero |
+| FX rate refresh | `GET /api/cron/fx-rates` | Daily at 06:00 | Fetch latest rates from frankfurter.dev (free, no API key) and upsert FxRate rows for all active currencies |
+
+The cron job is configured in the system crontab:
+
+```cron
+0 6 * * * curl -fsS http://localhost:3000/api/cron/fx-rates > /dev/null 2>&1
+```
 
 ---
 
 ## PDF Generation
 
-PDFs are generated server-side using **PDFKit** (configured as a server external package in `next.config.ts`). The PDF system lives in `lib/pdf.ts` and provides:
+PDFs are generated server-side using **PDFKit** (configured as `serverExternalPackages: ['pdfkit']` in `next.config.ts`). The PDF system lives in `lib/pdf.ts` and provides:
 
 - `getBranding()` -- reads company info and brand colors from the Organisation and Settings tables
 - `createPdfDocument()` -- creates an A4 PDFDocument with standard margins and helpers
@@ -260,7 +255,7 @@ Account codes are mapped in Settings. The Xero Chart of Accounts is imported and
 
 ### Token Management
 
-Xero OAuth 2.0 tokens are stored at `XERO_TOKEN_PATH` (JSON file). The worker auto-refreshes the access token before each API call. Refresh tokens expire after 60 days of non-use.
+Xero OAuth 2.0 tokens are stored at `XERO_TOKEN_PATH` (JSON file). The access token is refreshed before each API call. Refresh tokens expire after 60 days of non-use.
 
 ---
 

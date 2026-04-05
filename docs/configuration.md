@@ -26,17 +26,6 @@ Prisma 7 with the `pg` driver adapter is used. The Prisma client is generated to
 
 ---
 
-## Redis
-
-Used by BullMQ for background job queues (FX rate updates, Xero sync, WooCommerce polling).
-
-| Variable | Required | Default | Description |
-|---|---|---|---|
-| `REDIS_URL` | Yes | -- | Redis connection URL. Format: `redis://[:password@]host[:port][/db]`. Default Redis instance: `10.0.3.11`. |
-| `REDIS_PASSWORD` | No | -- | Redis password, if required. Leave blank if Redis has no auth. |
-
----
-
 ## WooCommerce
 
 | Variable | Required | Default | Description |
@@ -74,15 +63,17 @@ Xero uses OAuth 2.0. Create an app at [developer.xero.com](https://developer.xer
 
 ## FX Rates
 
-FX rates are fetched from the frankfurter.dev API (no API key required) via a daily cron job that hits `/api/cron/fx-rates`.
+FX rates are fetched from the frankfurter.dev API (free, no API key required) via a daily cron job that hits `/api/cron/fx-rates` at 06:00.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FX_API_KEY` | No | -- | API key for exchangerate-api.com (legacy). The current implementation uses frankfurter.dev which requires no key. |
 | `FX_BASE_CURRENCY` | No | `GBP` | Base currency for all internal calculations. |
-| `FX_REFRESH_CRON` | No | `0 * * * *` | Cron expression for FX rate refresh frequency. |
 
-The cron is set up by the install script as a system crontab entry that runs `curl` against `/api/cron/fx-rates` daily at 06:00.
+The cron is set up as a system crontab entry that runs `curl` against `/api/cron/fx-rates` daily at 06:00:
+
+```cron
+0 6 * * * curl -fsS http://localhost:3000/api/cron/fx-rates > /dev/null 2>&1
+```
 
 ---
 

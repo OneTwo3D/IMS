@@ -13,6 +13,7 @@ import {
   BarChart3,
   Settings,
   ActivitySquare,
+  HelpCircle,
   ChevronLeft,
   ChevronRight,
 } from 'lucide-react'
@@ -48,6 +49,7 @@ const NAV_ITEMS_BOTTOM = [
   { href: '/analytics',       label: 'Analytics',        icon: BarChart3 },
   { href: '/activity',        label: 'Activity',         icon: ActivitySquare },
   { href: '/settings',        label: 'Settings',         icon: Settings },
+  { href: '/help',            label: 'Help',             icon: HelpCircle },
 ]
 
 export function Sidebar() {

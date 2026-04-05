@@ -7,7 +7,6 @@
 | Node.js | 20+ | [nodejs.org](https://nodejs.org) or `nvm` |
 | npm | 10+ | Bundled with Node.js |
 | PostgreSQL | 14+ | [postgresql.org](https://www.postgresql.org) |
-| Redis | 6+ | [redis.io](https://redis.io) |
 | Git | any | `apt install git` |
 
 ## Initial Setup
@@ -40,7 +39,7 @@ NEXT_PUBLIC_APP_URL=http://localhost:3000
 AUTH_URL=http://localhost:3000
 ```
 
-For development, you can leave WooCommerce, Xero, SMTP, and FX API fields blank. Those integrations will be disabled until configured.
+For development, you can leave WooCommerce, Xero, and SMTP fields blank. Those integrations will be disabled until configured.
 
 ### 4. Create the development database
 
@@ -75,18 +74,6 @@ npm run dev
 ```
 
 Open [http://localhost:3000](http://localhost:3000). The dev server uses Turbopack for fast compilation.
-
----
-
-## Background Workers
-
-In development, start the BullMQ worker in a separate terminal:
-
-```bash
-npm run worker
-```
-
-This requires a running Redis instance. The worker handles FX rate refresh, WooCommerce order polling, and Xero sync queue processing.
 
 ---
 
@@ -163,16 +150,13 @@ onetwo3d-ims/
 │   ├── pdf.ts                        # PDFKit helpers, branding, table drawing
 │   └── utils.ts                      # General utility functions (cn, formatters)
 ├── prisma/
-│   ├── schema.prisma                 # Database schema (1210 lines, ~40 models)
+│   ├── schema.prisma                 # Database schema (~40 models)
 │   ├── migrations/                   # Applied database migrations
 │   ├── seed.ts                       # Development seed data
 │   └── config.ts                     # Prisma configuration
 ├── prisma.config.ts                  # Prisma 7 config (datasource URL)
 ├── scripts/
-│   ├── cli.ts                        # CLI utility (create-user, etc.)
-│   ├── install.sh                    # Production installer
-│   ├── update.sh                     # Production update script
-│   └── backup.sh                     # Database backup script
+│   └── cli.ts                        # CLI utility (create-user, etc.)
 ├── types/
 │   └── next-auth.d.ts                # Auth.js type extensions
 ├── uploads/                          # Uploaded files (supplier invoices)
@@ -197,7 +181,6 @@ onetwo3d-ims/
 | `npm run start` | Start production server (requires prior build) |
 | `npm run lint` | Run ESLint |
 | `npm run type-check` | Run TypeScript compiler (type check only, no emit) |
-| `npm run worker` | Start BullMQ background worker |
 | `npm run db:seed` | Seed the database with development data |
 | `npm run db:studio` | Open Prisma Studio for visual database inspection |
 | `npm run cli` | Run CLI commands (e.g. `npm run cli -- create-user`) |
@@ -344,5 +327,3 @@ AUTH_SECRET=dev-secret-at-least-32-characters-long
 NEXT_PUBLIC_APP_URL=http://localhost:3000
 AUTH_URL=http://localhost:3000
 ```
-
-Optionally, set `REDIS_URL` if you want to run the background worker locally.
