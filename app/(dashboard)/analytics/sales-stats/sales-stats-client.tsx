@@ -3,7 +3,7 @@
 import { useState, useMemo, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
-import { Filter, X, Plus, ArrowUp, ArrowDown, Settings2, Save, Trash2, Loader2 } from 'lucide-react'
+import { Filter, X, Plus, ArrowUp, ArrowDown, Settings2, Save, Trash2, Loader2, Download } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -378,6 +378,9 @@ export function SalesStatsClient({ productStats, shipments, invoices, refunds, a
           {tab !== 'products' && (
             <Input placeholder="Search…" value={otherSearch} onChange={(e) => setOtherSearch(e.target.value)} className="h-7 text-xs w-48" />
           )}
+          <a href={`/api/export/analytics?type=${tab}`} className="inline-flex items-center gap-0.5 rounded-md border border-input bg-background px-2 h-7 text-xs font-medium hover:bg-muted">
+            <Download className="h-3 w-3" />CSV
+          </a>
         </div>
       </div>
 

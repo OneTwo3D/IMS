@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { AlertTriangle, ArrowDown, ArrowUp, Minus, Settings2, ShoppingCart, Loader2, TrendingUp, TrendingDown, Package } from 'lucide-react'
+import { AlertTriangle, ArrowDown, ArrowUp, Minus, Settings2, ShoppingCart, Loader2, TrendingUp, TrendingDown, Package, Download } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -226,6 +226,9 @@ export function ForecastClient({ forecasts, settings }: Props) {
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Reorder Forecast</h1>
         <div className="flex items-center gap-2">
+          <a href="/api/export/analytics?type=forecast" className="inline-flex items-center gap-1 rounded-md border border-input bg-background px-2.5 h-8 text-sm font-medium hover:bg-muted">
+            <Download className="h-4 w-4" />Export CSV
+          </a>
           <Button variant="outline" size="sm" onClick={() => setShowTraining(true)}>
             <Package className="h-4 w-4 mr-1" />Training Data
           </Button>
