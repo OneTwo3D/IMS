@@ -1,10 +1,10 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useMemo, useCallback } from 'react'
 import Link from 'next/link'
-import { Download, Search } from 'lucide-react'
-import { Button } from '@/components/ui/button'
+import { Filter, X, ArrowUp, ArrowDown } from 'lucide-react'
 import { Input } from '@/components/ui/input'
+import { Button } from '@/components/ui/button'
 import { ProductLink } from '@/components/inventory/product-link'
 import type {
   SalesStatRow, SalesStatSummary,
@@ -32,14 +32,266 @@ const TABS: { key: Tab; label: string }[] = [
 function fmtGbp(v: number): string { return `£${v.toFixed(2)}` }
 function fmtDate(iso: string): string { return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) }
 
+// ---------------------------------------------------------------------------
+// Generic filterable + sortable table
+// ---------------------------------------------------------------------------
+
+type ColDef<T> = {
+  key: string
+  label: string
+  align?: 'left' | 'right'
+  width?: string
+  render: (row: T) => React.ReactNode
+  getValue: (row: T) => string | number  // for filtering + sorting
+  className?: string
+  footerRender?: () => React.ReactNode
+}
+
+type SortDir = 'asc' | 'desc'
+
+function FilterableTable<T extends { _key: string }>({
+  columns,
+  data,
+  emptyMessage,
+}: {
+  columns: ColDef<T>[]
+  data: T[]
+  emptyMessage?: string
+}) {
+  const [filters, setFilters] = useState<Record<string, string>>({})
+  const [showFilters, setShowFilters] = useState(false)
+  const [sortCol, setSortCol] = useState<string | null>(null)
+  const [sortDir, setSortDir] = useState<SortDir>('asc')
+
+  const activeFilterCount = Object.values(filters).filter(Boolean).length
+
+  const setFilter = useCallback((key: string, value: string) => {
+    setFilters((prev) => ({ ...prev, [key]: value }))
+  }, [])
+
+  const clearFilters = useCallback(() => {
+    setFilters({})
+  }, [])
+
+  function handleSort(key: string) {
+    if (sortCol === key) {
+      setSortDir((d) => d === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortCol(key)
+      setSortDir('asc')
+    }
+  }
+
+  const filtered = useMemo(() => {
+    let result = data
+    for (const col of columns) {
+      const f = filters[col.key]?.toLowerCase()
+      if (!f) continue
+      result = result.filter((row) => {
+        const val = String(col.getValue(row)).toLowerCase()
+        // Support numeric comparisons: >100, <50, >=10
+        if (f.startsWith('>=')) { const n = parseFloat(f.slice(2)); return !isNaN(n) && Number(col.getValue(row)) >= n }
+        if (f.startsWith('<=')) { const n = parseFloat(f.slice(2)); return !isNaN(n) && Number(col.getValue(row)) <= n }
+        if (f.startsWith('>')) { const n = parseFloat(f.slice(1)); return !isNaN(n) && Number(col.getValue(row)) > n }
+        if (f.startsWith('<')) { const n = parseFloat(f.slice(1)); return !isNaN(n) && Number(col.getValue(row)) < n }
+        if (f.startsWith('=')) { const n = parseFloat(f.slice(1)); return !isNaN(n) && Number(col.getValue(row)) === n }
+        return val.includes(f)
+      })
+    }
+
+    if (sortCol) {
+      const col = columns.find((c) => c.key === sortCol)
+      if (col) {
+        result = [...result].sort((a, b) => {
+          const va = col.getValue(a)
+          const vb = col.getValue(b)
+          const cmp = typeof va === 'number' && typeof vb === 'number'
+            ? va - vb
+            : String(va).localeCompare(String(vb))
+          return sortDir === 'asc' ? cmp : -cmp
+        })
+      }
+    }
+
+    return result
+  }, [data, filters, sortCol, sortDir, columns])
+
+  return (
+    <div className="rounded-md border overflow-hidden">
+      <div className="flex items-center justify-between px-3 py-1.5 bg-muted/30 border-b">
+        <span className="text-xs text-muted-foreground">{filtered.length} of {data.length} rows</span>
+        <div className="flex items-center gap-1.5">
+          {activeFilterCount > 0 && (
+            <Button variant="ghost" size="sm" className="h-6 text-xs text-destructive" onClick={clearFilters}>
+              <X className="h-3 w-3 mr-0.5" />Clear ({activeFilterCount})
+            </Button>
+          )}
+          <Button variant={showFilters ? 'default' : 'outline'} size="sm" className="h-6 text-xs" onClick={() => setShowFilters((v) => !v)}>
+            <Filter className="h-3 w-3 mr-0.5" />Filter
+          </Button>
+        </div>
+      </div>
+      <table className="w-full text-sm">
+        <thead className="border-b bg-muted/50">
+          <tr>
+            {columns.map((col) => (
+              <th key={col.key}
+                className={`px-3 py-2 text-xs font-medium text-muted-foreground cursor-pointer hover:text-foreground select-none ${col.align === 'right' ? 'text-right' : 'text-left'} ${col.width ?? ''}`}
+                onClick={() => handleSort(col.key)}
+              >
+                <span className="inline-flex items-center gap-0.5">
+                  {col.label}
+                  {sortCol === col.key && (
+                    sortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+                  )}
+                </span>
+              </th>
+            ))}
+          </tr>
+          {showFilters && (
+            <tr className="bg-muted/20">
+              {columns.map((col) => (
+                <th key={col.key} className="px-2 py-1">
+                  <Input
+                    value={filters[col.key] ?? ''}
+                    onChange={(e) => setFilter(col.key, e.target.value)}
+                    placeholder={col.align === 'right' ? '>0, <100…' : 'Filter…'}
+                    className="h-6 text-[11px] bg-background"
+                  />
+                </th>
+              ))}
+            </tr>
+          )}
+        </thead>
+        <tbody className="divide-y">
+          {filtered.map((row) => (
+            <tr key={row._key} className="hover:bg-muted/30">
+              {columns.map((col) => (
+                <td key={col.key} className={`px-3 py-2 ${col.align === 'right' ? 'text-right' : ''} ${col.className ?? ''}`}>
+                  {col.render(row)}
+                </td>
+              ))}
+            </tr>
+          ))}
+        </tbody>
+        {columns.some((c) => c.footerRender) && (
+          <tfoot className="border-t bg-muted/30 text-sm font-medium">
+            <tr>
+              {columns.map((col) => (
+                <td key={col.key} className={`px-3 py-2 ${col.align === 'right' ? 'text-right' : ''}`}>
+                  {col.footerRender?.() ?? ''}
+                </td>
+              ))}
+            </tr>
+          </tfoot>
+        )}
+      </table>
+      {filtered.length === 0 && (
+        <p className="text-center text-sm text-muted-foreground py-8">{emptyMessage ?? 'No data found.'}</p>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Main component
+// ---------------------------------------------------------------------------
+
 export function SalesStatsClient({ productStats, shipments, invoices, refunds, aging }: Props) {
   const [tab, setTab] = useState<Tab>('products')
-  const [search, setSearch] = useState('')
-  const [dateFrom, setDateFrom] = useState('')
-  const [dateTo, setDateTo] = useState('')
-
-  const q = search.toLowerCase()
   const { rows, summary } = productStats
+
+  // Wrap data with _key for FilterableTable
+  const productData = useMemo(() => rows.map((r) => ({ ...r, _key: r.productId })), [rows])
+  const shipmentData = useMemo(() => shipments.map((s) => ({ ...s, _key: s.orderId })), [shipments])
+  const invoiceData = useMemo(() => invoices.map((i) => ({ ...i, _key: i.orderId })), [invoices])
+  const refundData = useMemo(() => refunds.map((r) => ({ ...r, _key: r.id })), [refunds])
+  const agingData = useMemo(() => aging.map((a) => ({ ...a, _key: a.customerId || a.customerName })), [aging])
+
+  // Column definitions
+  const productCols: ColDef<SalesStatRow & { _key: string }>[] = [
+    { key: 'product', label: 'Product', getValue: (r) => `${r.sku} ${r.name}`,
+      render: (r) => <ProductLink productId={r.productId} sku={r.sku} name={r.name} />,
+      footerRender: () => <span>Totals</span> },
+    { key: 'qtySold', label: 'Sold', align: 'right', width: 'w-16', getValue: (r) => r.qtySold,
+      render: (r) => <span className="tabular-nums text-xs">{r.qtySold}</span>,
+      footerRender: () => <span className="tabular-nums">{summary.totalQtySold}</span> },
+    { key: 'qtyRefunded', label: 'Refunded', align: 'right', width: 'w-16', getValue: (r) => r.qtyRefunded,
+      render: (r) => <span className="tabular-nums text-xs text-orange-600">{r.qtyRefunded > 0 ? r.qtyRefunded : '—'}</span> },
+    { key: 'netQty', label: 'Net Qty', align: 'right', width: 'w-16', getValue: (r) => r.netQty,
+      render: (r) => <span className="tabular-nums text-xs font-medium">{r.netQty}</span> },
+    { key: 'grossRevenue', label: 'Gross Rev', align: 'right', width: 'w-24', getValue: (r) => r.grossRevenue,
+      render: (r) => <span className="tabular-nums text-xs font-mono">{fmtGbp(r.grossRevenue)}</span>,
+      footerRender: () => <span className="tabular-nums font-mono">{fmtGbp(summary.totalGrossRevenue)}</span> },
+    { key: 'discounts', label: 'Discounts', align: 'right', width: 'w-20', getValue: (r) => r.discounts,
+      render: (r) => <span className="tabular-nums text-xs font-mono text-destructive">{r.discounts > 0 ? fmtGbp(r.discounts) : '—'}</span>,
+      footerRender: () => <span className="tabular-nums font-mono text-destructive">{fmtGbp(summary.totalDiscounts)}</span> },
+    { key: 'refunds', label: 'Refunds', align: 'right', width: 'w-20', getValue: (r) => r.refunds,
+      render: (r) => <span className="tabular-nums text-xs font-mono text-orange-600">{r.refunds > 0 ? fmtGbp(r.refunds) : '—'}</span>,
+      footerRender: () => <span className="tabular-nums font-mono text-orange-600">{fmtGbp(summary.totalRefunds)}</span> },
+    { key: 'netRevenue', label: 'Net Revenue', align: 'right', width: 'w-24', getValue: (r) => r.netRevenue,
+      render: (r) => <span className="tabular-nums text-xs font-mono font-medium">{fmtGbp(r.netRevenue)}</span>,
+      footerRender: () => <span className="tabular-nums font-mono">{fmtGbp(summary.totalNetRevenue)}</span> },
+    { key: 'cogs', label: 'COGS', align: 'right', width: 'w-20', getValue: (r) => r.cogs,
+      render: (r) => <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.cogs > 0 ? fmtGbp(r.cogs) : '—'}</span>,
+      footerRender: () => <span className="tabular-nums font-mono text-muted-foreground">{fmtGbp(summary.totalCogs)}</span> },
+    { key: 'grossProfit', label: 'Profit', align: 'right', width: 'w-24', getValue: (r) => r.grossProfit,
+      render: (r) => <span className={`tabular-nums text-xs font-mono ${r.grossProfit >= 0 ? 'text-green-600' : 'text-destructive'}`}>{fmtGbp(r.grossProfit)}</span>,
+      footerRender: () => <span className="tabular-nums font-mono text-green-600">{fmtGbp(summary.totalGrossProfit)}</span> },
+    { key: 'marginPct', label: 'Margin', align: 'right', width: 'w-16', getValue: (r) => r.marginPct,
+      render: (r) => <span className={`tabular-nums text-xs ${r.marginPct < 0 ? 'text-destructive' : ''}`}>{r.marginPct}%</span>,
+      footerRender: () => <span className="tabular-nums">{summary.avgMarginPct}%</span> },
+    { key: 'orderCount', label: 'Orders', align: 'right', width: 'w-16', getValue: (r) => r.orderCount,
+      render: (r) => <span className="tabular-nums text-xs text-muted-foreground">{r.orderCount}</span>,
+      footerRender: () => <span className="tabular-nums text-muted-foreground">{summary.totalOrders}</span> },
+  ]
+
+  const shipmentCols: ColDef<ShipmentRow & { _key: string }>[] = [
+    { key: 'order', label: 'Order', getValue: (r) => r.orderNumber,
+      render: (r) => <Link href={`/sales/${r.orderId}`} className="font-mono text-xs hover:underline">{r.orderNumber}</Link> },
+    { key: 'customer', label: 'Customer', getValue: (r) => r.customerName, render: (r) => <span className="text-xs">{r.customerName}</span> },
+    { key: 'shipped', label: 'Shipped', getValue: (r) => r.shippedAt, render: (r) => <span className="text-xs text-muted-foreground">{fmtDate(r.shippedAt)}</span> },
+    { key: 'service', label: 'Service', getValue: (r) => r.shippingService ?? '', render: (r) => <span className="text-xs text-muted-foreground">{r.shippingService ?? '—'}</span> },
+    { key: 'tracking', label: 'Tracking', getValue: (r) => r.trackingNumber ?? '', render: (r) => <span className="text-xs font-mono text-muted-foreground">{r.trackingNumber ?? '—'}</span> },
+    { key: 'warehouse', label: 'Warehouse', getValue: (r) => r.warehouse ?? '', render: (r) => <span className="text-xs">{r.warehouse ?? '—'}</span> },
+    { key: 'items', label: 'Items', align: 'right', width: 'w-16', getValue: (r) => r.lineCount, render: (r) => <span className="tabular-nums text-xs">{r.lineCount}</span> },
+    { key: 'total', label: 'Total', align: 'right', getValue: (r) => r.totalGbp, render: (r) => <span className="tabular-nums text-xs font-mono">{fmtGbp(r.totalGbp)}</span> },
+  ]
+
+  const invoiceCols: ColDef<InvoiceRow & { _key: string }>[] = [
+    { key: 'invoice', label: 'Invoice', getValue: (r) => r.invoiceNumber, render: (r) => <span className="font-mono text-xs font-medium">{r.invoiceNumber}</span> },
+    { key: 'order', label: 'Order', getValue: (r) => r.orderNumber,
+      render: (r) => <Link href={`/sales/${r.orderId}`} className="font-mono text-xs hover:underline">{r.orderNumber}</Link> },
+    { key: 'customer', label: 'Customer', getValue: (r) => r.customerName, render: (r) => <span className="text-xs">{r.customerName}</span> },
+    { key: 'date', label: 'Date', getValue: (r) => r.invoicedAt, render: (r) => <span className="text-xs text-muted-foreground">{fmtDate(r.invoicedAt)}</span> },
+    { key: 'total', label: 'Total', align: 'right', getValue: (r) => r.totalGbp, render: (r) => <span className="tabular-nums text-xs font-mono">{fmtGbp(r.totalGbp)}</span> },
+    { key: 'paid', label: 'Paid', getValue: (r) => r.paidAt ?? 'Unpaid',
+      render: (r) => r.paidAt ? <span className="text-xs text-green-600">{fmtDate(r.paidAt)}</span> : <span className="text-xs text-orange-600">Unpaid</span> },
+    { key: 'balance', label: 'Balance', align: 'right', getValue: (r) => r.balance,
+      render: (r) => <span className={`tabular-nums text-xs font-mono ${r.balance > 0.01 ? 'text-destructive font-medium' : 'text-green-600'}`}>{r.balance > 0.01 ? fmtGbp(r.balance) : 'Settled'}</span> },
+  ]
+
+  const refundCols: ColDef<RefundRow & { _key: string }>[] = [
+    { key: 'cn', label: 'Credit Note', getValue: (r) => r.creditNoteNumber ?? '', render: (r) => <span className="font-mono text-xs font-medium">{r.creditNoteNumber ?? '—'}</span> },
+    { key: 'order', label: 'Order', getValue: (r) => r.orderNumber,
+      render: (r) => <Link href={`/sales/${r.orderId}`} className="font-mono text-xs hover:underline">{r.orderNumber}</Link> },
+    { key: 'customer', label: 'Customer', getValue: (r) => r.customerName, render: (r) => <span className="text-xs">{r.customerName}</span> },
+    { key: 'date', label: 'Date', getValue: (r) => r.refundedAt, render: (r) => <span className="text-xs text-muted-foreground">{fmtDate(r.refundedAt)}</span> },
+    { key: 'reason', label: 'Reason', getValue: (r) => r.reason ?? '', render: (r) => <span className="text-xs text-muted-foreground truncate max-w-40 block">{r.reason ?? '—'}</span> },
+    { key: 'amount', label: 'Amount', align: 'right', getValue: (r) => r.totalGbp, render: (r) => <span className="tabular-nums text-xs font-mono text-destructive">{fmtGbp(r.totalGbp)}</span> },
+  ]
+
+  const agingCols: ColDef<CustomerAgingRow & { _key: string }>[] = [
+    { key: 'customer', label: 'Customer', getValue: (r) => r.customerName, render: (r) => <span className="font-medium">{r.customerName}</span> },
+    { key: 'invoiced', label: 'Total Invoiced', align: 'right', getValue: (r) => r.totalInvoiced, render: (r) => <span className="tabular-nums text-xs font-mono">{fmtGbp(r.totalInvoiced)}</span> },
+    { key: 'paid', label: 'Total Paid', align: 'right', getValue: (r) => r.totalPaid, render: (r) => <span className="tabular-nums text-xs font-mono text-green-600">{fmtGbp(r.totalPaid)}</span> },
+    { key: 'outstanding', label: 'Outstanding', align: 'right', getValue: (r) => r.outstanding,
+      render: (r) => <span className={`tabular-nums text-xs font-mono ${r.outstanding > 0.01 ? 'text-orange-600 font-medium' : ''}`}>{r.outstanding > 0.01 ? fmtGbp(r.outstanding) : '—'}</span> },
+    { key: 'overdue', label: 'Overdue (30d+)', align: 'right', getValue: (r) => r.overdueAmount,
+      render: (r) => <span className={`tabular-nums text-xs font-mono ${r.overdueAmount > 0 ? 'text-destructive font-medium' : ''}`}>{r.overdueAmount > 0 ? fmtGbp(r.overdueAmount) : '—'}</span> },
+    { key: 'oldest', label: 'Oldest Unpaid', align: 'right', getValue: (r) => r.oldestUnpaidDays,
+      render: (r) => <span className={`tabular-nums text-xs ${r.oldestUnpaidDays > 60 ? 'text-destructive font-medium' : r.oldestUnpaidDays > 30 ? 'text-orange-600' : 'text-muted-foreground'}`}>{r.oldestUnpaidDays > 0 ? `${r.oldestUnpaidDays}d` : '—'}</span> },
+  ]
 
   return (
     <div className="space-y-4">
@@ -79,197 +331,14 @@ export function SalesStatsClient({ productStats, shipments, invoices, refunds, a
             onClick={() => setTab(t.key)}
           >{t.label}</button>
         ))}
-        <div className="ml-auto flex items-center gap-2 pb-1">
-          <div className="relative">
-            <Search className="absolute left-2 top-1.5 h-3.5 w-3.5 text-muted-foreground" />
-            <Input placeholder="Search…" value={search} onChange={(e) => setSearch(e.target.value)} className="h-7 text-xs pl-7 w-48" />
-          </div>
-        </div>
       </div>
 
       {/* Tab content */}
-      {tab === 'products' && (
-        <div className="rounded-md border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="border-b bg-muted/50">
-              <tr>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-16">Sold</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-16">Refunded</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-16">Net Qty</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-24">Gross Rev</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-20">Discounts</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-20">Refunds</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-24">Net Revenue</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-20">COGS</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-24">Profit</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-16">Margin</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-16">Orders</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {rows.filter((r) => !q || r.sku.toLowerCase().includes(q) || r.name.toLowerCase().includes(q)).map((r) => (
-                <tr key={r.productId} className="hover:bg-muted/30">
-                  <td className="px-3 py-2"><ProductLink productId={r.productId} sku={r.sku} name={r.name} /></td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs">{r.qtySold}</td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs text-orange-600">{r.qtyRefunded > 0 ? r.qtyRefunded : '—'}</td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs font-medium">{r.netQty}</td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs font-mono">{fmtGbp(r.grossRevenue)}</td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs font-mono text-destructive">{r.discounts > 0 ? fmtGbp(r.discounts) : '—'}</td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs font-mono text-orange-600">{r.refunds > 0 ? fmtGbp(r.refunds) : '—'}</td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs font-mono font-medium">{fmtGbp(r.netRevenue)}</td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs font-mono text-muted-foreground">{r.cogs > 0 ? fmtGbp(r.cogs) : '—'}</td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs font-mono"><span className={r.grossProfit >= 0 ? 'text-green-600' : 'text-destructive'}>{fmtGbp(r.grossProfit)}</span></td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs"><span className={r.marginPct >= 0 ? '' : 'text-destructive'}>{r.marginPct}%</span></td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs text-muted-foreground">{r.orderCount}</td>
-                </tr>
-              ))}
-            </tbody>
-            <tfoot className="border-t bg-muted/30 text-sm font-medium">
-              <tr>
-                <td className="px-3 py-2">Totals</td>
-                <td className="px-3 py-2 text-right tabular-nums">{summary.totalQtySold}</td>
-                <td className="px-3 py-2" />
-                <td className="px-3 py-2" />
-                <td className="px-3 py-2 text-right tabular-nums font-mono">{fmtGbp(summary.totalGrossRevenue)}</td>
-                <td className="px-3 py-2 text-right tabular-nums font-mono text-destructive">{fmtGbp(summary.totalDiscounts)}</td>
-                <td className="px-3 py-2 text-right tabular-nums font-mono text-orange-600">{fmtGbp(summary.totalRefunds)}</td>
-                <td className="px-3 py-2 text-right tabular-nums font-mono">{fmtGbp(summary.totalNetRevenue)}</td>
-                <td className="px-3 py-2 text-right tabular-nums font-mono text-muted-foreground">{fmtGbp(summary.totalCogs)}</td>
-                <td className="px-3 py-2 text-right tabular-nums font-mono text-green-600">{fmtGbp(summary.totalGrossProfit)}</td>
-                <td className="px-3 py-2 text-right tabular-nums">{summary.avgMarginPct}%</td>
-                <td className="px-3 py-2 text-right tabular-nums text-muted-foreground">{summary.totalOrders}</td>
-              </tr>
-            </tfoot>
-          </table>
-        </div>
-      )}
-
-      {tab === 'shipments' && (
-        <div className="rounded-md border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="border-b bg-muted/50">
-              <tr>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Order</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Customer</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Shipped</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Service</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Tracking</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Warehouse</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Items</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Total</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {shipments.filter((s) => !q || s.orderNumber.toLowerCase().includes(q) || s.customerName.toLowerCase().includes(q)).map((s) => (
-                <tr key={s.orderId} className="hover:bg-muted/30">
-                  <td className="px-3 py-2 font-mono text-xs"><Link href={`/sales/${s.orderId}`} className="hover:underline">{s.orderNumber}</Link></td>
-                  <td className="px-3 py-2 text-xs">{s.customerName}</td>
-                  <td className="px-3 py-2 text-xs text-muted-foreground">{fmtDate(s.shippedAt)}</td>
-                  <td className="px-3 py-2 text-xs text-muted-foreground">{s.shippingService ?? '—'}</td>
-                  <td className="px-3 py-2 text-xs font-mono text-muted-foreground">{s.trackingNumber ?? '—'}</td>
-                  <td className="px-3 py-2 text-xs">{s.warehouse ?? '—'}</td>
-                  <td className="px-3 py-2 text-right text-xs tabular-nums">{s.lineCount}</td>
-                  <td className="px-3 py-2 text-right text-xs font-mono">{fmtGbp(s.totalGbp)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {shipments.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">No shipments found.</p>}
-        </div>
-      )}
-
-      {tab === 'invoices' && (
-        <div className="rounded-md border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="border-b bg-muted/50">
-              <tr>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Invoice</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Order</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Customer</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Date</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Total</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Paid</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Balance</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {invoices.filter((i) => !q || i.invoiceNumber.toLowerCase().includes(q) || i.customerName.toLowerCase().includes(q)).map((i) => (
-                <tr key={i.orderId} className="hover:bg-muted/30">
-                  <td className="px-3 py-2 font-mono text-xs font-medium">{i.invoiceNumber}</td>
-                  <td className="px-3 py-2 font-mono text-xs"><Link href={`/sales/${i.orderId}`} className="hover:underline">{i.orderNumber}</Link></td>
-                  <td className="px-3 py-2 text-xs">{i.customerName}</td>
-                  <td className="px-3 py-2 text-xs text-muted-foreground">{fmtDate(i.invoicedAt)}</td>
-                  <td className="px-3 py-2 text-right text-xs font-mono">{fmtGbp(i.totalGbp)}</td>
-                  <td className="px-3 py-2 text-xs">{i.paidAt ? <span className="text-green-600">{fmtDate(i.paidAt)}</span> : <span className="text-orange-600">Unpaid</span>}</td>
-                  <td className="px-3 py-2 text-right text-xs font-mono"><span className={i.balance > 0.01 ? 'text-destructive font-medium' : 'text-green-600'}>{i.balance > 0.01 ? fmtGbp(i.balance) : 'Settled'}</span></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {invoices.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">No invoices found.</p>}
-        </div>
-      )}
-
-      {tab === 'refunds' && (
-        <div className="rounded-md border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="border-b bg-muted/50">
-              <tr>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Credit Note</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Order</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Customer</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Date</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Reason</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Amount</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {refunds.filter((r) => !q || (r.creditNoteNumber ?? '').toLowerCase().includes(q) || r.customerName.toLowerCase().includes(q)).map((r) => (
-                <tr key={r.id} className="hover:bg-muted/30">
-                  <td className="px-3 py-2 font-mono text-xs font-medium">{r.creditNoteNumber ?? '—'}</td>
-                  <td className="px-3 py-2 font-mono text-xs"><Link href={`/sales/${r.orderId}`} className="hover:underline">{r.orderNumber}</Link></td>
-                  <td className="px-3 py-2 text-xs">{r.customerName}</td>
-                  <td className="px-3 py-2 text-xs text-muted-foreground">{fmtDate(r.refundedAt)}</td>
-                  <td className="px-3 py-2 text-xs text-muted-foreground truncate max-w-40">{r.reason ?? '—'}</td>
-                  <td className="px-3 py-2 text-right text-xs font-mono text-destructive">{fmtGbp(r.totalGbp)}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {refunds.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">No refunds found.</p>}
-        </div>
-      )}
-
-      {tab === 'aging' && (
-        <div className="rounded-md border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="border-b bg-muted/50">
-              <tr>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Customer</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Total Invoiced</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Total Paid</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Outstanding</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Overdue (30d+)</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Oldest Unpaid</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {aging.filter((a) => !q || a.customerName.toLowerCase().includes(q)).map((a) => (
-                <tr key={a.customerId || a.customerName} className="hover:bg-muted/30">
-                  <td className="px-3 py-2 font-medium">{a.customerName}</td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs font-mono">{fmtGbp(a.totalInvoiced)}</td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs font-mono text-green-600">{fmtGbp(a.totalPaid)}</td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs font-mono"><span className={a.outstanding > 0.01 ? 'text-orange-600 font-medium' : ''}>{a.outstanding > 0.01 ? fmtGbp(a.outstanding) : '—'}</span></td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs font-mono"><span className={a.overdueAmount > 0 ? 'text-destructive font-medium' : ''}>{a.overdueAmount > 0 ? fmtGbp(a.overdueAmount) : '—'}</span></td>
-                  <td className="px-3 py-2 text-right tabular-nums text-xs"><span className={a.oldestUnpaidDays > 60 ? 'text-destructive font-medium' : a.oldestUnpaidDays > 30 ? 'text-orange-600' : 'text-muted-foreground'}>{a.oldestUnpaidDays > 0 ? `${a.oldestUnpaidDays}d` : '—'}</span></td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-          {aging.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">No invoice data found.</p>}
-        </div>
-      )}
+      {tab === 'products' && <FilterableTable columns={productCols} data={productData} emptyMessage="No product sales data." />}
+      {tab === 'shipments' && <FilterableTable columns={shipmentCols} data={shipmentData} emptyMessage="No shipments found." />}
+      {tab === 'invoices' && <FilterableTable columns={invoiceCols} data={invoiceData} emptyMessage="No invoices found." />}
+      {tab === 'refunds' && <FilterableTable columns={refundCols} data={refundData} emptyMessage="No refunds found." />}
+      {tab === 'aging' && <FilterableTable columns={agingCols} data={agingData} emptyMessage="No invoice data found." />}
     </div>
   )
 }
