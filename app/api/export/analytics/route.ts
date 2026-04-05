@@ -1,5 +1,6 @@
 import { NextRequest } from 'next/server'
 import { getProductSalesStats, getShipments, getInvoiceStats, getRefundStats, getCustomerAging } from '@/app/actions/sales-stats'
+import { getPurchaseProductStats, getReceivedGoods, getPurchaseBills, getSupplierAging, getPurchaseDetails } from '@/app/actions/purchase-stats'
 import { generateForecasts } from '@/app/actions/forecasting'
 import { toCsv, csvResponse } from '@/lib/csv'
 
@@ -80,6 +81,32 @@ export async function GET(req: NextRequest) {
         recommendedOrderQty: r.recommendedOrderQty, daysUntilStockout: r.daysUntilStockout,
       }))
       return csvResponse(toCsv(data, ['sku', 'name', 'stockUnit', 'abcClass', 'urgency', 'currentStock', 'availableStock', 'avgDailyDemand', 'demandTrend', 'supplierName', 'avgLeadTimeDays', 'reorderPoint', 'safetyStock', 'recommendedOrderQty', 'daysUntilStockout']), `reorder-forecast-${date}.csv`)
+    }
+
+    case 'po_products': {
+      const rows = await getPurchaseProductStats(dateFrom, dateTo)
+      const data = rows.map((r) => ({ sku: r.sku, name: r.name, type: r.type, stockUnit: r.stockUnit, qtyOrdered: r.qtyOrdered, qtyReceived: r.qtyReceived, qtyReturned: r.qtyReturned, netQty: r.netQty, totalGbp: r.totalGbp.toFixed(2), landedCostGbp: r.landedCostGbp.toFixed(2), avgUnitCostGbp: r.avgUnitCostGbp.toFixed(4), supplierCount: r.supplierCount, poCount: r.poCount }))
+      return csvResponse(toCsv(data, ['sku', 'name', 'type', 'stockUnit', 'qtyOrdered', 'qtyReceived', 'qtyReturned', 'netQty', 'totalGbp', 'landedCostGbp', 'avgUnitCostGbp', 'supplierCount', 'poCount']), `purchase-stats-products-${date}.csv`)
+    }
+    case 'po_received': {
+      const rows = await getReceivedGoods(dateFrom, dateTo)
+      const data = rows.map((r) => ({ poReference: r.poReference, supplierName: r.supplierName, receivedAt: r.receivedAt.slice(0, 10), warehouseCode: r.warehouseCode, lineCount: r.lineCount, totalQty: r.totalQty }))
+      return csvResponse(toCsv(data, ['poReference', 'supplierName', 'receivedAt', 'warehouseCode', 'lineCount', 'totalQty']), `received-goods-${date}.csv`)
+    }
+    case 'po_bills': {
+      const rows = await getPurchaseBills(dateFrom, dateTo)
+      const data = rows.map((r) => ({ invoiceNumber: r.invoiceNumber, poReference: r.poReference, supplierName: r.supplierName, invoiceDate: r.invoiceDate.slice(0, 10), totalGbp: r.totalGbp.toFixed(2) }))
+      return csvResponse(toCsv(data, ['invoiceNumber', 'poReference', 'supplierName', 'invoiceDate', 'totalGbp']), `purchase-bills-${date}.csv`)
+    }
+    case 'po_aging': {
+      const rows = await getSupplierAging()
+      const data = rows.map((r) => ({ supplierName: r.supplierName, totalInvoiced: r.totalInvoiced.toFixed(2), poCount: r.poCount, avgLeadTimeDays: r.avgLeadTimeDays }))
+      return csvResponse(toCsv(data, ['supplierName', 'totalInvoiced', 'poCount', 'avgLeadTimeDays']), `supplier-aging-${date}.csv`)
+    }
+    case 'po_details': {
+      const rows = await getPurchaseDetails(dateFrom, dateTo)
+      const data = rows.map((r) => ({ reference: r.reference, type: r.type, status: r.status, supplierName: r.supplierName, currency: r.currency, totalForeign: r.totalForeign.toFixed(2), totalGbp: r.totalGbp.toFixed(2), lineCount: r.lineCount, createdAt: r.createdAt.slice(0, 10) }))
+      return csvResponse(toCsv(data, ['reference', 'type', 'status', 'supplierName', 'currency', 'totalForeign', 'totalGbp', 'lineCount', 'createdAt']), `purchase-details-${date}.csv`)
     }
 
     default:

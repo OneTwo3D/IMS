@@ -44,8 +44,9 @@ const SALES_CHILDREN = [
 ]
 
 const ANALYTICS_CHILDREN = [
-  { href: '/analytics/sales-stats', label: 'Sales Statistics' },
-  { href: '/analytics/forecast',    label: 'Reorder Forecast' },
+  { href: '/analytics/sales-stats',    label: 'Sales Statistics' },
+  { href: '/analytics/purchase-stats', label: 'Purchase Statistics' },
+  { href: '/analytics/forecast',       label: 'Reorder Forecast' },
 ]
 
 const NAV_ITEMS_BOTTOM = [

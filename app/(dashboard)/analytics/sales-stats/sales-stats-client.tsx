@@ -58,6 +58,9 @@ const PRODUCT_FIELDS = [
   { key: 'avgOrderValue', label: 'Avg Order Value (£)', type: 'number' as const },
   { key: 'salesPrice', label: 'Sales Price (£)', type: 'number' as const },
   { key: 'weight', label: 'Weight (kg)', type: 'number' as const },
+  { key: 'currentStock', label: 'Qty on Hand', type: 'number' as const },
+  { key: 'reservedQty', label: 'Qty Allocated', type: 'number' as const },
+  { key: 'availableStock', label: 'Qty Available', type: 'number' as const },
 ]
 
 const TEXT_OPERATORS = [
@@ -325,6 +328,9 @@ export function SalesStatsClient({ productStats, shipments, invoices, refunds, a
     avgOrderValue: { label: 'Avg Order', align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{fmtGbp(r.avgOrderValue)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtGbp(summary.avgOrderValue)}</span> },
     salesPrice: { label: 'List Price', align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{r.salesPrice != null ? fmtGbp(r.salesPrice) : '—'}</span> },
     weight: { label: 'Weight', align: 'right', render: (r) => <span className="tabular-nums text-xs">{r.weight != null ? `${r.weight}kg` : '—'}</span> },
+    currentStock: { label: 'On Hand', align: 'right', render: (r) => <span className="tabular-nums text-xs">{r.currentStock}</span> },
+    reservedQty: { label: 'Allocated', align: 'right', render: (r) => <span className={`tabular-nums text-xs ${r.reservedQty > 0 ? 'text-orange-600' : 'text-muted-foreground'}`}>{r.reservedQty > 0 ? r.reservedQty : '—'}</span> },
+    availableStock: { label: 'Available', align: 'right', render: (r) => <span className={`tabular-nums text-xs font-medium ${r.availableStock <= 0 ? 'text-destructive' : ''}`}>{r.availableStock}</span> },
   }
 
   // Simple table renderers for other tabs (reuse existing patterns with search filter)

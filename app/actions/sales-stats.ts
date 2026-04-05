@@ -17,6 +17,9 @@ export type SalesStatRow = {
   weight: number | null
   salesPrice: number | null
   active: boolean
+  currentStock: number
+  reservedQty: number
+  availableStock: number
   qtySold: number
   qtyRefunded: number
   netQty: number
@@ -119,7 +122,10 @@ export async function getProductSalesStats(
   const productMap = new Map<string, SalesStatRow>()
 
   // Get product details
-  const products = await db.product.findMany({ select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, weight: true, salesPriceGbp: true, active: true } })
+  const products = await db.product.findMany({
+    select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, weight: true, salesPriceGbp: true, active: true,
+      stockLevels: { select: { quantity: true, reservedQty: true } } },
+  })
   const productInfo = new Map(products.map((p) => [p.id, p]))
 
   for (const order of orders) {
@@ -138,6 +144,9 @@ export async function getProductSalesStats(
           weight: info?.weight ? Number(info.weight) : null,
           salesPrice: info?.salesPriceGbp ? Number(info.salesPriceGbp) : null,
           active: info?.active ?? true,
+          currentStock: info?.stockLevels.reduce((s, sl) => s + Number(sl.quantity), 0) ?? 0,
+          reservedQty: info?.stockLevels.reduce((s, sl) => s + Number(sl.reservedQty), 0) ?? 0,
+          availableStock: info ? info.stockLevels.reduce((s, sl) => s + Number(sl.quantity) - Number(sl.reservedQty), 0) : 0,
           qtySold: 0, qtyRefunded: 0, netQty: 0,
           grossRevenue: 0, discounts: 0, refunds: 0, netRevenue: 0,
           cogs: 0, grossProfit: 0, marginPct: 0,
