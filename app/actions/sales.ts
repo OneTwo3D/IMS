@@ -417,8 +417,8 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       totalTaxGbp += Math.round((shippingTax / fxRate) * 10000) / 10000
     }
 
-    // Order-level discount
-    const orderDiscForeign = input.orderDiscountForeign ?? 0
+    // Order-level discount — cap at subtotal to prevent negative totals
+    const orderDiscForeign = Math.min(input.orderDiscountForeign ?? 0, subtotalForeign)
     const orderDiscGbp = Math.round((orderDiscForeign / fxRate) * 10000) / 10000
     // Reduce subtotal by order discount (already net if inclVat)
     const discNetForeign = inclVat ? orderDiscForeign / (1 + vatRate) : orderDiscForeign
@@ -596,15 +596,22 @@ export async function createRefund(
   try {
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
-      select: { id: true, status: true, fxRateToGbp: true },
+      select: { id: true, status: true, fxRateToGbp: true, totalGbp: true },
     })
     if (!so) return { success: false, error: 'Order not found' }
 
     const refundLines = lines.filter((l) => l.qty > 0)
     if (!refundLines.length) return { success: false, error: 'Select at least one line to refund' }
 
-    const fxRate = Number(so.fxRateToGbp)
+    const fxRate = Number(so.fxRateToGbp) || 1
     const totalGbp = refundLines.reduce((s, l) => s + l.totalGbp, 0)
+
+    // Validate refund doesn't exceed order total
+    const existingRefunds = await db.salesOrderRefund.findMany({ where: { orderId }, select: { totalGbp: true } })
+    const previouslyRefunded = existingRefunds.reduce((s, r) => s + Number(r.totalGbp), 0)
+    if (totalGbp + previouslyRefunded > Number(so.totalGbp) * 1.001) { // small tolerance for rounding
+      return { success: false, error: 'Refund total would exceed order total' }
+    }
     const totalForeign = Math.round(totalGbp * fxRate * 10000) / 10000
 
     // Generate credit note number
@@ -654,11 +661,13 @@ export async function createRefund(
       }
     }
 
-    // Update order status
-    const allRefunded = totalGbp >= Number(so.fxRateToGbp) // simplified check
+    // Update order status based on total refunded vs order total
+    const totalRefundedNow = previouslyRefunded + totalGbp
+    const orderTotal = Number(so.totalGbp)
+    const newStatus = totalRefundedNow >= orderTotal * 0.999 ? 'REFUNDED' : 'PARTIALLY_REFUNDED'
     await db.salesOrder.update({
       where: { id: orderId },
-      data: { status: refundLines.length > 0 ? 'PARTIALLY_REFUNDED' : so.status },
+      data: { status: newStatus },
     })
 
     revalidatePath('/sales')
@@ -766,18 +775,21 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
 
 export async function markSalesOrderPaid(id: string): Promise<{ success: boolean; error?: string }> {
   try {
-    const so = await db.salesOrder.findUnique({ where: { id }, select: { paidAt: true } })
+    const so = await db.salesOrder.findUnique({ where: { id }, select: { paidAt: true, invoiceNumber: true } })
     if (!so) return { success: false, error: 'Order not found' }
 
+    const markingAsPaid = !so.paidAt // transitioning from unpaid to paid
     await db.salesOrder.update({
       where: { id },
-      data: { paidAt: so.paidAt ? null : new Date() }, // toggle
+      data: { paidAt: markingAsPaid ? new Date() : null },
     })
 
-    // Check if invoice should be auto-generated
-    const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
-    if (trigger?.value === 'on_paid' && !so.paidAt) {
-      await generateInvoiceNumber(id)
+    // Only auto-generate invoice when transitioning TO paid (not when toggling off)
+    if (markingAsPaid && !so.invoiceNumber) {
+      const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
+      if (trigger?.value === 'on_paid') {
+        await generateInvoiceNumber(id)
+      }
     }
 
     revalidatePath('/sales')
