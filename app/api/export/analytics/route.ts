@@ -1,6 +1,7 @@
 import { NextRequest } from 'next/server'
 import { getProductSalesStats, getShipments, getInvoiceStats, getRefundStats, getCustomerAging } from '@/app/actions/sales-stats'
 import { getPurchaseProductStats, getReceivedGoods, getPurchaseBills, getSupplierAging, getPurchaseDetails } from '@/app/actions/purchase-stats'
+import { getStockOnHand, getStockMovements, getStockAllocations, getReorderInventory } from '@/app/actions/inventory-stats'
 import { generateForecasts } from '@/app/actions/forecasting'
 import { toCsv, csvResponse } from '@/lib/csv'
 
@@ -107,6 +108,27 @@ export async function GET(req: NextRequest) {
       const rows = await getPurchaseDetails(dateFrom, dateTo)
       const data = rows.map((r) => ({ reference: r.reference, type: r.type, status: r.status, supplierName: r.supplierName, currency: r.currency, totalForeign: r.totalForeign.toFixed(2), totalGbp: r.totalGbp.toFixed(2), lineCount: r.lineCount, createdAt: r.createdAt.slice(0, 10) }))
       return csvResponse(toCsv(data, ['reference', 'type', 'status', 'supplierName', 'currency', 'totalForeign', 'totalGbp', 'lineCount', 'createdAt']), `purchase-details-${date}.csv`)
+    }
+
+    case 'inv_onhand': {
+      const rows = await getStockOnHand()
+      const data = rows.map((r) => ({ sku: r.sku, name: r.name, type: r.type, stockUnit: r.stockUnit, barcode: r.barcode, warehouse: r.warehouseCode, quantity: r.quantity, reserved: r.reservedQty, available: r.available, value: r.inventoryValue.toFixed(2) }))
+      return csvResponse(toCsv(data, ['sku', 'name', 'type', 'stockUnit', 'barcode', 'warehouse', 'quantity', 'reserved', 'available', 'value']), `stock-on-hand-${date}.csv`)
+    }
+    case 'inv_movements': {
+      const rows = await getStockMovements(dateFrom, dateTo)
+      const data = rows.map((r) => ({ type: r.type, sku: r.sku, productName: r.productName, from: r.fromWarehouse, to: r.toWarehouse, qty: r.qty, note: r.note, date: r.createdAt.slice(0, 10) }))
+      return csvResponse(toCsv(data, ['type', 'sku', 'productName', 'from', 'to', 'qty', 'note', 'date']), `stock-movements-${date}.csv`)
+    }
+    case 'inv_allocations': {
+      const rows = await getStockAllocations()
+      const data = rows.map((r) => ({ sku: r.sku, productName: r.productName, warehouse: r.warehouseCode, totalStock: r.totalStock, reserved: r.reservedQty, available: r.available, pendingOrders: r.pendingOrders }))
+      return csvResponse(toCsv(data, ['sku', 'productName', 'warehouse', 'totalStock', 'reserved', 'available', 'pendingOrders']), `stock-allocations-${date}.csv`)
+    }
+    case 'inv_reorder': {
+      const rows = await getReorderInventory()
+      const data = rows.map((r) => ({ sku: r.sku, name: r.name, stockUnit: r.stockUnit, currentStock: r.currentStock, available: r.availableStock, reorderPoint: r.reorderPoint, shortfall: r.shortfall, supplier: r.supplierName, dailyDemand: r.avgDailyDemand, daysToStockout: r.daysUntilStockout }))
+      return csvResponse(toCsv(data, ['sku', 'name', 'stockUnit', 'currentStock', 'available', 'reorderPoint', 'shortfall', 'supplier', 'dailyDemand', 'daysToStockout']), `reorder-inventory-${date}.csv`)
     }
 
     default:
