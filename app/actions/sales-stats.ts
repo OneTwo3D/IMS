@@ -1,5 +1,6 @@
 'use server'
 
+import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 
 // ---------------------------------------------------------------------------
@@ -10,7 +11,12 @@ export type SalesStatRow = {
   productId: string
   sku: string
   name: string
+  type: string
   stockUnit: string
+  barcode: string | null
+  weight: number | null
+  salesPrice: number | null
+  active: boolean
   qtySold: number
   qtyRefunded: number
   netQty: number
@@ -113,7 +119,7 @@ export async function getProductSalesStats(
   const productMap = new Map<string, SalesStatRow>()
 
   // Get product details
-  const products = await db.product.findMany({ select: { id: true, sku: true, name: true, stockUnit: true } })
+  const products = await db.product.findMany({ select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, weight: true, salesPriceGbp: true, active: true } })
   const productInfo = new Map(products.map((p) => [p.id, p]))
 
   for (const order of orders) {
@@ -126,7 +132,12 @@ export async function getProductSalesStats(
           productId: pid,
           sku: info?.sku ?? line.sku ?? '',
           name: info?.name ?? line.description,
+          type: info?.type ?? 'SIMPLE',
           stockUnit: info?.stockUnit ?? 'pcs',
+          barcode: info?.barcode ?? null,
+          weight: info?.weight ? Number(info.weight) : null,
+          salesPrice: info?.salesPriceGbp ? Number(info.salesPriceGbp) : null,
+          active: info?.active ?? true,
           qtySold: 0, qtyRefunded: 0, netQty: 0,
           grossRevenue: 0, discounts: 0, refunds: 0, netRevenue: 0,
           cogs: 0, grossProfit: 0, marginPct: 0,
@@ -334,4 +345,48 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
   }
 
   return rows
+}
+
+// ---------------------------------------------------------------------------
+// Saved Views
+// ---------------------------------------------------------------------------
+
+export type SavedView = {
+  id: string
+  name: string
+  tab: string
+  columns: string[]
+  filters: { field: string; operator: string; value: string }[]
+}
+
+export async function getSavedViews(): Promise<SavedView[]> {
+  const row = await db.setting.findUnique({ where: { key: 'sales_stats_views' } })
+  if (row?.value) {
+    try { return JSON.parse(row.value) } catch {}
+  }
+  return []
+}
+
+export async function saveView(view: SavedView): Promise<void> {
+  const views = await getSavedViews()
+  const existing = views.findIndex((v) => v.id === view.id)
+  if (existing >= 0) views[existing] = view
+  else views.push(view)
+  await db.setting.upsert({
+    where: { key: 'sales_stats_views' },
+    create: { key: 'sales_stats_views', value: JSON.stringify(views) },
+    update: { value: JSON.stringify(views) },
+  })
+  revalidatePath('/analytics/sales-stats')
+}
+
+export async function deleteView(viewId: string): Promise<void> {
+  const views = await getSavedViews()
+  const filtered = views.filter((v) => v.id !== viewId)
+  await db.setting.upsert({
+    where: { key: 'sales_stats_views' },
+    create: { key: 'sales_stats_views', value: JSON.stringify(filtered) },
+    update: { value: JSON.stringify(filtered) },
+  })
+  revalidatePath('/analytics/sales-stats')
 }

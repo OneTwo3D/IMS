@@ -1,16 +1,17 @@
 import type { Metadata } from 'next'
-import { getProductSalesStats, getShipments, getInvoiceStats, getRefundStats, getCustomerAging } from '@/app/actions/sales-stats'
+import { getProductSalesStats, getShipments, getInvoiceStats, getRefundStats, getCustomerAging, getSavedViews } from '@/app/actions/sales-stats'
 import { SalesStatsClient } from './sales-stats-client'
 
 export const metadata: Metadata = { title: 'Sales Statistics' }
 
 export default async function SalesStatsPage() {
-  const [productStats, shipments, invoices, refunds, aging] = await Promise.all([
+  const [productStats, shipments, invoices, refunds, aging, savedViews] = await Promise.all([
     getProductSalesStats(),
     getShipments(),
     getInvoiceStats(),
     getRefundStats(),
     getCustomerAging(),
+    getSavedViews(),
   ])
 
   return (
@@ -20,6 +21,7 @@ export default async function SalesStatsPage() {
       invoices={invoices}
       refunds={refunds}
       aging={aging}
+      savedViews={savedViews}
     />
   )
 }
