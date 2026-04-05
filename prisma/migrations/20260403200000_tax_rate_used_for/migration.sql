@@ -1,0 +1,2 @@
+ALTER TABLE "tax_rates" ADD COLUMN "usedFor" TEXT NOT NULL DEFAULT 'BOTH';
+ALTER TABLE "tax_rates" ADD COLUMN "xeroTaxType" TEXT;

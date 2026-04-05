@@ -1,0 +1,973 @@
+'use server'
+
+import { revalidatePath } from 'next/cache'
+import { redirect } from 'next/navigation'
+import { z } from 'zod'
+import { db } from '@/lib/db'
+import { ProductType } from '@/app/generated/prisma/client'
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type ProductRow = {
+  id: string
+  sku: string
+  name: string
+  type: ProductType
+  parentSku: string | null
+  barcode: string | null
+  weight: string | null
+  widthCm: string | null
+  heightCm: string | null
+  depthCm: string | null
+  imageUrl: string | null
+  salesPriceGbp: string | null   // regular / list price
+  salePriceGbp: string | null    // sale / discounted price
+  salesPriceTaxInclusive: boolean
+  stockUnit: string
+  oversellAllowed: boolean
+  active: boolean
+  variantCount: number
+  totalStock: string
+  inventoryValue: string  // sum of remainingQty * unitCostGbp
+  createdAt: Date
+  updatedAt: Date
+}
+
+export type ProductDetail = ProductRow & {
+  parentId: string | null   // DB id of parent product (for breadcrumb linking)
+  description: string | null
+  widthCm: string | null
+  heightCm: string | null
+  depthCm: string | null
+  variants: ProductRow[]
+  stockByWarehouse: {
+    warehouseId: string
+    warehouseCode: string
+    warehouseName: string
+    quantity: string
+    reservedQty: string
+    allocatedQty: string    // from active sales orders
+    availableQty: string    // quantity - allocatedQty
+    incomingTransferQty: string  // in-transit transfers arriving at this warehouse
+    incomingPoQty: string        // open PO lines destined for this warehouse
+  }[]
+  incomingPoQty: string    // open PO lines with no warehouse assigned yet (unassigned)
+  costLayers: { id: string; receivedAt: Date; receivedQty: string; remainingQty: string; unitCostGbp: string }[]
+}
+
+export type ProductListResult = {
+  products: ProductRow[]
+  total: number
+  page: number
+  pageSize: number
+}
+
+// ---------------------------------------------------------------------------
+// Queries
+// ---------------------------------------------------------------------------
+
+export async function listProducts(params: {
+  search?: string
+  type?: ProductType | 'ALL'
+  active?: 'true' | 'false' | 'all'
+  page?: number
+  pageSize?: number
+}): Promise<ProductListResult> {
+  const page = Math.max(1, params.page ?? 1)
+  const pageSize = params.pageSize ?? 50
+
+  const where = {
+    ...(params.search
+      ? {
+          OR: [
+            { sku: { contains: params.search, mode: 'insensitive' as const } },
+            { name: { contains: params.search, mode: 'insensitive' as const } },
+            { barcode: { contains: params.search, mode: 'insensitive' as const } },
+          ],
+        }
+      : {}),
+    // By default exclude VARIANT products; pass type='ALL' to include everything
+    ...(params.type === 'ALL'
+      ? {}
+      : params.type
+      ? { type: params.type as ProductType }
+      : { type: { not: 'VARIANT' as const } }),
+    ...(params.active === 'true'
+      ? { active: true }
+      : params.active === 'false'
+      ? { active: false }
+      : {}),
+  }
+
+  const [rawProducts, total] = await Promise.all([
+    db.product.findMany({
+      where,
+      include: {
+        parent: { select: { sku: true } },
+        variants: { select: { id: true } },
+        stockLevels: { select: { quantity: true } },
+        costLayers: {
+          where: { remainingQty: { gt: 0 } },
+          select: { remainingQty: true, unitCostGbp: true },
+        },
+      },
+      orderBy: { sku: 'asc' },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+    }),
+    db.product.count({ where }),
+  ])
+
+  const products: ProductRow[] = rawProducts.map((p) => ({
+    id: p.id,
+    sku: p.sku,
+    name: p.name,
+    type: p.type,
+    parentSku: p.parent?.sku ?? null,
+    barcode: p.barcode,
+    weight: p.weight?.toString() ?? null,
+    widthCm: p.widthCm?.toString() ?? null,
+    heightCm: p.heightCm?.toString() ?? null,
+    depthCm: p.depthCm?.toString() ?? null,
+    imageUrl: p.imageUrl ?? null,
+    salesPriceGbp: p.salesPriceGbp?.toString() ?? null,
+    salePriceGbp: p.salePriceGbp?.toString() ?? null,
+    salesPriceTaxInclusive: p.salesPriceTaxInclusive,
+    stockUnit: p.stockUnit,
+    oversellAllowed: p.oversellAllowed,
+    active: p.active,
+    variantCount: p.variants.length,
+    totalStock: p.stockLevels
+      .reduce((sum, s) => sum + Number(s.quantity), 0)
+      .toFixed(2),
+    inventoryValue: p.costLayers
+      .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostGbp), 0)
+      .toFixed(2),
+    createdAt: p.createdAt,
+    updatedAt: p.updatedAt,
+  }))
+
+  return { products, total, page, pageSize }
+}
+
+export async function getProduct(id: string): Promise<ProductDetail | null> {
+  const [p, activeOrderLines, inTransferLines, openPoLines] = await Promise.all([
+    db.product.findUnique({
+      where: { id },
+      include: {
+        parent: { select: { sku: true } },
+        variants: {
+          include: { stockLevels: { select: { quantity: true } } },
+          orderBy: { sku: 'asc' },
+        },
+        stockLevels: {
+          include: { warehouse: { select: { id: true, code: true, name: true } } },
+          orderBy: { warehouse: { code: 'asc' } },
+        },
+        costLayers: {
+          orderBy: { receivedAt: 'asc' },
+          where: { remainingQty: { gt: 0 } },
+        },
+      },
+    }),
+    // Allocated: active sales order lines, grouped by shipFromWarehouseId
+    db.salesOrderLine.findMany({
+      where: {
+        productId: id,
+        order: {
+          status: { in: ['PENDING', 'PROCESSING', 'PICKING', 'PACKED', 'ON_HOLD'] },
+        },
+      },
+      select: { qty: true, order: { select: { shipFromWarehouseId: true } } },
+    }),
+    // Incoming via stock transfers (in-transit, arriving at destination warehouse)
+    db.stockTransferLine.findMany({
+      where: { productId: id, transfer: { status: 'IN_TRANSIT' } },
+      select: { qty: true, qtyReceived: true, transfer: { select: { toWarehouseId: true, toWarehouse: { select: { id: true, code: true, name: true } } } } },
+    }),
+    // Incoming from open POs (grouped by destination warehouse)
+    db.purchaseOrderLine.findMany({
+      where: {
+        productId: id,
+        po: {
+          status: { in: ['DRAFT', 'RFQ_SENT', 'PO_SENT', 'PARTIALLY_RECEIVED'] },
+          type: 'GOODS',
+        },
+      },
+      select: { qty: true, qtyReceived: true, po: { select: { destinationWarehouseId: true, destinationWarehouse: { select: { id: true, code: true, name: true } } } } },
+    }),
+  ])
+
+  if (!p) return null
+
+  // Build per-warehouse maps
+  const allocatedByWarehouse = new Map<string, number>()
+  for (const line of activeOrderLines) {
+    const wid = line.order.shipFromWarehouseId ?? '__unassigned__'
+    allocatedByWarehouse.set(wid, (allocatedByWarehouse.get(wid) ?? 0) + Number(line.qty))
+  }
+
+  const incomingTransferByWarehouse = new Map<string, number>()
+  const warehouseInfoMap = new Map<string, { id: string; code: string; name: string }>()
+  for (const line of inTransferLines) {
+    const wid = line.transfer.toWarehouseId
+    const remaining = Number(line.qty) - Number(line.qtyReceived)
+    if (remaining > 0) {
+      incomingTransferByWarehouse.set(wid, (incomingTransferByWarehouse.get(wid) ?? 0) + remaining)
+      if (line.transfer.toWarehouse) warehouseInfoMap.set(wid, line.transfer.toWarehouse)
+    }
+  }
+
+  // PO incoming grouped by destination warehouse (null = unassigned)
+  const incomingPoByWarehouse = new Map<string, number>()
+  for (const line of openPoLines) {
+    const wid = line.po.destinationWarehouseId ?? '__unassigned__'
+    const remaining = Math.max(0, Number(line.qty) - Number(line.qtyReceived))
+    if (remaining > 0) {
+      incomingPoByWarehouse.set(wid, (incomingPoByWarehouse.get(wid) ?? 0) + remaining)
+      if (line.po.destinationWarehouse) warehouseInfoMap.set(wid, line.po.destinationWarehouse)
+    }
+  }
+  // Top-level incomingPoQty = only lines with no destination warehouse assigned
+  const incomingPoQty = (incomingPoByWarehouse.get('__unassigned__') ?? 0).toFixed(2)
+
+  // For KIT/BOM: compute unit cost from components; BOM also uses actual stock
+  const isKitOrBom = p.type === 'KIT' || p.type === 'BOM'
+  const kitUnitCost = isKitOrBom ? await computeKitUnitCostGbp(p.id) : 0
+  const fifoInventoryValue = p.costLayers
+    .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostGbp), 0)
+  const totalStockQty = p.stockLevels.reduce((sum, s) => sum + Number(s.quantity), 0)
+  const inventoryValue = isKitOrBom
+    ? (p.type === 'BOM' ? kitUnitCost * totalStockQty : kitUnitCost).toFixed(2)
+    : fifoInventoryValue.toFixed(2)
+
+  return {
+    id: p.id,
+    sku: p.sku,
+    name: p.name,
+    description: p.description,
+    type: p.type,
+    parentId: p.parentId,
+    parentSku: p.parent?.sku ?? null,
+    barcode: p.barcode,
+    weight: p.weight?.toString() ?? null,
+    widthCm: p.widthCm?.toString() ?? null,
+    heightCm: p.heightCm?.toString() ?? null,
+    depthCm: p.depthCm?.toString() ?? null,
+    imageUrl: p.imageUrl ?? null,
+    salesPriceGbp: p.salesPriceGbp?.toString() ?? null,
+    salePriceGbp: p.salePriceGbp?.toString() ?? null,
+    salesPriceTaxInclusive: p.salesPriceTaxInclusive,
+    stockUnit: p.stockUnit,
+    oversellAllowed: p.oversellAllowed,
+    active: p.active,
+    variantCount: p.variants.length,
+    totalStock: totalStockQty.toFixed(2),
+    inventoryValue,
+    createdAt: p.createdAt,
+    updatedAt: p.updatedAt,
+    variants: p.variants.map((v) => ({
+      id: v.id,
+      sku: v.sku,
+      name: v.name,
+      type: v.type,
+      parentSku: p.sku,
+      barcode: v.barcode,
+      weight: v.weight?.toString() ?? null,
+      widthCm: v.widthCm?.toString() ?? null,
+      heightCm: v.heightCm?.toString() ?? null,
+      depthCm: v.depthCm?.toString() ?? null,
+      imageUrl: v.imageUrl ?? null,
+      salesPriceGbp: v.salesPriceGbp?.toString() ?? null,
+      salePriceGbp: v.salePriceGbp?.toString() ?? null,
+      salesPriceTaxInclusive: v.salesPriceTaxInclusive,
+      stockUnit: v.stockUnit,
+      oversellAllowed: v.oversellAllowed,
+      active: v.active,
+      variantCount: 0,
+      totalStock: v.stockLevels
+        .reduce((sum, s) => sum + Number(s.quantity), 0)
+        .toFixed(2),
+      inventoryValue: '0.00',
+      createdAt: v.createdAt,
+      updatedAt: v.updatedAt,
+    })),
+    incomingPoQty,
+    stockByWarehouse: (() => {
+      const existingIds = new Set(p.stockLevels.map((s) => s.warehouse.id))
+      const rows = p.stockLevels.map((s) => {
+        const wid = s.warehouse.id
+        const qty = Number(s.quantity)
+        const allocated = allocatedByWarehouse.get(wid) ?? 0
+        const available = qty - allocated
+        return {
+          warehouseId: wid,
+          warehouseCode: s.warehouse.code,
+          warehouseName: s.warehouse.name,
+          quantity: qty.toFixed(2),
+          reservedQty: s.reservedQty.toString(),
+          allocatedQty: allocated.toFixed(2),
+          availableQty: available.toFixed(2),
+          incomingTransferQty: (incomingTransferByWarehouse.get(wid) ?? 0).toFixed(2),
+          incomingPoQty: (incomingPoByWarehouse.get(wid) ?? 0).toFixed(2),
+        }
+      })
+      // Add rows for warehouses with incoming but no stock level yet
+      const incomingWids = new Set([...incomingTransferByWarehouse.keys(), ...incomingPoByWarehouse.keys()])
+      for (const wid of incomingWids) {
+        if (wid === '__unassigned__' || existingIds.has(wid)) continue
+        const info = warehouseInfoMap.get(wid)
+        if (!info) continue
+        rows.push({
+          warehouseId: wid,
+          warehouseCode: info.code,
+          warehouseName: info.name,
+          quantity: '0.00',
+          reservedQty: '0',
+          allocatedQty: '0.00',
+          availableQty: '0.00',
+          incomingTransferQty: (incomingTransferByWarehouse.get(wid) ?? 0).toFixed(2),
+          incomingPoQty: (incomingPoByWarehouse.get(wid) ?? 0).toFixed(2),
+        })
+      }
+      return rows
+    })(),
+    costLayers: p.costLayers.map((c) => ({
+      id: c.id,
+      receivedAt: c.receivedAt,
+      receivedQty: c.receivedQty.toString(),
+      remainingQty: c.remainingQty.toString(),
+      unitCostGbp: c.unitCostGbp.toString(),
+    })),
+
+  }
+}
+
+export async function getVariableProducts() {
+  return db.product.findMany({
+    where: { type: 'VARIABLE', active: true },
+    select: { id: true, sku: true, name: true },
+    orderBy: { sku: 'asc' },
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Mutations
+// ---------------------------------------------------------------------------
+
+const productSchema = z.object({
+  sku: z.string().min(1).max(100),
+  name: z.string().min(1).max(255),
+  description: z.string().optional(),
+  type: z.nativeEnum(ProductType),
+  parentId: z.string().optional().nullable(),
+  barcode: z.string().optional().nullable(),
+  weight: z.string().optional().nullable(),
+  salesPriceGbp: z.string().optional().nullable(),
+  salePriceGbp: z.string().optional().nullable(),
+  salesPriceTaxInclusive: z.boolean().default(false),
+  stockUnit: z.string().default('pcs'),
+  oversellAllowed: z.boolean().default(true),
+  imageUrl: z.string().optional().nullable(),
+  widthCm: z.string().optional().nullable(),
+  heightCm: z.string().optional().nullable(),
+  depthCm: z.string().optional().nullable(),
+  active: z.boolean().default(true),
+})
+
+export type ProductFormState = {
+  errors?: Record<string, string[]>
+  message?: string
+}
+
+export async function createProduct(
+  _prev: ProductFormState,
+  formData: FormData
+): Promise<ProductFormState> {
+  const raw = {
+    sku: formData.get('sku') as string,
+    name: formData.get('name') as string,
+    description: formData.get('description') as string || undefined,
+    type: formData.get('type') as string,
+    parentId: formData.get('parentId') as string || null,
+    barcode: formData.get('barcode') as string || null,
+    weight: formData.get('weight') as string || null,
+    salesPriceGbp: formData.get('salesPriceGbp') as string || null,
+    salePriceGbp: formData.get('salePriceGbp') as string || null,
+    salesPriceTaxInclusive: formData.get('salesPriceTaxInclusive') === 'on',
+    stockUnit: (formData.get('stockUnit') as string) || 'pcs',
+    oversellAllowed: formData.get('oversellAllowed') === 'true',
+    imageUrl: formData.get('imageUrl') as string || null,
+    widthCm: formData.get('widthCm') as string || null,
+    heightCm: formData.get('heightCm') as string || null,
+    depthCm: formData.get('depthCm') as string || null,
+    active: formData.get('active') !== 'false',
+  }
+
+  const parsed = productSchema.safeParse(raw)
+  if (!parsed.success) {
+    return { errors: parsed.error.flatten().fieldErrors }
+  }
+
+  const data = parsed.data
+
+  // Check SKU uniqueness
+  const existing = await db.product.findUnique({ where: { sku: data.sku } })
+  if (existing) {
+    return { errors: { sku: ['SKU already exists'] } }
+  }
+
+  await db.product.create({
+    data: {
+      sku: data.sku,
+      name: data.name,
+      description: data.description || null,
+      type: data.type,
+      parentId: data.parentId || null,
+      barcode: data.barcode || null,
+      weight: data.weight ? data.weight : null,
+      salesPriceGbp: data.salesPriceGbp ? data.salesPriceGbp : null,
+      salePriceGbp: data.salePriceGbp ? data.salePriceGbp : null,
+      salesPriceTaxInclusive: data.salesPriceTaxInclusive,
+      stockUnit: data.stockUnit,
+      oversellAllowed: data.oversellAllowed,
+      imageUrl: data.imageUrl || null,
+      widthCm: data.widthCm || null,
+      heightCm: data.heightCm || null,
+      depthCm: data.depthCm || null,
+      active: data.active,
+    },
+  })
+
+  revalidatePath('/inventory')
+  redirect('/inventory')
+}
+
+export async function updateProduct(
+  id: string,
+  _prev: ProductFormState,
+  formData: FormData
+): Promise<ProductFormState> {
+  const raw = {
+    sku: formData.get('sku') as string,
+    name: formData.get('name') as string,
+    description: formData.get('description') as string || undefined,
+    type: formData.get('type') as string,
+    parentId: formData.get('parentId') as string || null,
+    barcode: formData.get('barcode') as string || null,
+    weight: formData.get('weight') as string || null,
+    salesPriceGbp: formData.get('salesPriceGbp') as string || null,
+    salePriceGbp: formData.get('salePriceGbp') as string || null,
+    salesPriceTaxInclusive: formData.get('salesPriceTaxInclusive') === 'on',
+    stockUnit: (formData.get('stockUnit') as string) || 'pcs',
+    oversellAllowed: formData.get('oversellAllowed') === 'true',
+    imageUrl: formData.get('imageUrl') as string || null,
+    widthCm: formData.get('widthCm') as string || null,
+    heightCm: formData.get('heightCm') as string || null,
+    depthCm: formData.get('depthCm') as string || null,
+    active: formData.get('active') !== 'false',
+  }
+
+  const parsed = productSchema.safeParse(raw)
+  if (!parsed.success) {
+    return { errors: parsed.error.flatten().fieldErrors }
+  }
+
+  const data = parsed.data
+
+  // Check SKU uniqueness (exclude self)
+  const existing = await db.product.findFirst({ where: { sku: data.sku, NOT: { id } } })
+  if (existing) {
+    return { errors: { sku: ['SKU already in use by another product'] } }
+  }
+
+  await db.product.update({
+    where: { id },
+    data: {
+      sku: data.sku,
+      name: data.name,
+      description: data.description || null,
+      type: data.type,
+      parentId: data.parentId || null,
+      barcode: data.barcode || null,
+      weight: data.weight ? data.weight : null,
+      salesPriceGbp: data.salesPriceGbp ? data.salesPriceGbp : null,
+      salePriceGbp: data.salePriceGbp ? data.salePriceGbp : null,
+      salesPriceTaxInclusive: data.salesPriceTaxInclusive,
+      stockUnit: data.stockUnit,
+      oversellAllowed: data.oversellAllowed,
+      imageUrl: data.imageUrl || null,
+      widthCm: data.widthCm || null,
+      heightCm: data.heightCm || null,
+      depthCm: data.depthCm || null,
+      active: data.active,
+    },
+  })
+
+  revalidatePath('/inventory')
+  revalidatePath(`/inventory/${id}`)
+  redirect(`/inventory/${id}`)
+}
+
+// ---------------------------------------------------------------------------
+// Suppliers for a product (with live FX conversion to GBP)
+// ---------------------------------------------------------------------------
+
+export type ProductSupplierRow = {
+  supplierId: string
+  supplierName: string
+  supplierSku: string | null
+  lastUnitCost: string   // in supplier currency, formatted
+  currency: string
+  currencySymbol: string
+  gbpEquivalent: string | null  // null = no FX rate stored
+  fxRate: string | null         // 1 GBP = fxRate currency units
+  fxFetchedAt: Date | null
+  updatedAt: Date
+}
+
+export async function getProductSuppliers(productId: string): Promise<ProductSupplierRow[]> {
+  const rows = await db.supplierProduct.findMany({
+    where: { productId },
+    include: {
+      supplier: { select: { id: true, name: true } },
+    },
+    orderBy: { updatedAt: 'desc' },
+  })
+
+  if (rows.length === 0) return []
+
+  // Collect unique non-GBP currencies and look up latest FX rate + symbol for each
+  const currencies = [...new Set(rows.map((r) => r.currency).filter((c) => c !== 'GBP'))]
+
+  const symbolMap = new Map<string, string>([['GBP', '£']])
+  const currencyRows = await db.currency.findMany({
+    where: { code: { in: currencies } },
+    select: { code: true, symbol: true },
+  })
+  for (const cr of currencyRows) symbolMap.set(cr.code, cr.symbol)
+
+  const fxMap = new Map<string, { rate: number; fetchedAt: Date }>()
+  await Promise.all(
+    currencies.map(async (code) => {
+      const fx = await db.fxRate.findFirst({
+        where: { toCurrency: code },
+        orderBy: { fetchedAt: 'desc' },
+        select: { rate: true, fetchedAt: true },
+      })
+      if (fx) fxMap.set(code, { rate: Number(fx.rate), fetchedAt: fx.fetchedAt })
+    })
+  )
+
+  return rows.map((r) => {
+    const cost = Number(r.lastUnitCost)
+
+    let gbpEquivalent: string | null = null
+    let fxRate: string | null = null
+    let fxFetchedAt: Date | null = null
+
+    if (r.currency === 'GBP') {
+      gbpEquivalent = cost.toFixed(2)
+      fxRate = '1'
+    } else {
+      const fx = fxMap.get(r.currency)
+      if (fx) {
+        gbpEquivalent = (cost / fx.rate).toFixed(2)
+        fxRate = fx.rate.toFixed(4)
+        fxFetchedAt = fx.fetchedAt
+      }
+    }
+
+    return {
+      supplierId: r.supplierId,
+      supplierName: r.supplier.name,
+      supplierSku: r.supplierSku,
+      lastUnitCost: cost.toFixed(2),
+      currency: r.currency,
+      currencySymbol: symbolMap.get(r.currency) ?? r.currency,
+      gbpEquivalent,
+      fxRate,
+      fxFetchedAt,
+      updatedAt: r.updatedAt,
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Kit/BOM COGS helper — unit cost of one assembled kit/BOM based on components
+// ---------------------------------------------------------------------------
+
+async function computeKitUnitCostGbp(productId: string): Promise<number> {
+  const components = await db.productComponent.findMany({
+    where: { productId },
+    select: {
+      qty: true,
+      component: {
+        select: {
+          costLayers: {
+            where: { remainingQty: { gt: 0 } },
+            select: { remainingQty: true, unitCostGbp: true },
+          },
+        },
+      },
+    },
+  })
+
+  let total = 0
+  for (const comp of components) {
+    const layers = comp.component.costLayers
+    const totalRemaining = layers.reduce((s, l) => s + Number(l.remainingQty), 0)
+    const avgCost = totalRemaining > 0
+      ? layers.reduce((s, l) => s + Number(l.remainingQty) * Number(l.unitCostGbp), 0) / totalRemaining
+      : 0
+    total += Number(comp.qty) * avgCost
+  }
+  return total
+}
+
+// ---------------------------------------------------------------------------
+// Product Components (for KIT and BOM products)
+// ---------------------------------------------------------------------------
+
+export type ProductComponentRow = {
+  id: string
+  componentId: string
+  componentSku: string
+  componentName: string
+  qty: string
+  sortOrder: number
+}
+
+export async function getProductComponents(productId: string): Promise<ProductComponentRow[]> {
+  const rows = await db.productComponent.findMany({
+    where: { productId },
+    include: { component: { select: { id: true, sku: true, name: true } } },
+    orderBy: { sortOrder: 'asc' },
+  })
+  return rows.map((r) => ({
+    id: r.id,
+    componentId: r.componentId,
+    componentSku: r.component.sku,
+    componentName: r.component.name,
+    qty: r.qty.toString(),
+    sortOrder: r.sortOrder,
+  }))
+}
+
+export async function saveProductComponents(
+  productId: string,
+  components: { componentId: string; qty: string }[]
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    await db.productComponent.deleteMany({ where: { productId } })
+    if (components.length > 0) {
+      await db.productComponent.createMany({
+        data: components.map((c, i) => ({
+          productId,
+          componentId: c.componentId,
+          qty: c.qty,
+          sortOrder: i,
+        })),
+      })
+    }
+    revalidatePath(`/inventory/${productId}`)
+    return { success: true }
+  } catch (e: unknown) {
+    return { success: false, error: e instanceof Error ? e.message : 'Failed to save components' }
+  }
+}
+
+export type KitStockRow = {
+  warehouseId: string
+  warehouseCode: string
+  warehouseName: string
+  calculatedQty: number   // max kits that can be assembled
+  limitingComponent: string | null  // SKU of the bottleneck component
+}
+
+export async function getKitStock(productId: string): Promise<KitStockRow[]> {
+  const components = await db.productComponent.findMany({
+    where: { productId },
+    include: { component: { select: { id: true, sku: true } } },
+  })
+  if (components.length === 0) return []
+
+  const warehouses = await db.warehouse.findMany({
+    where: { active: true },
+    select: { id: true, code: true, name: true },
+    orderBy: { code: 'asc' },
+  })
+
+  const componentIds = components.map((c) => c.componentId)
+
+  // All stock levels for component products
+  const stockLevels = await db.stockLevel.findMany({
+    where: { productId: { in: componentIds } },
+    select: { productId: true, warehouseId: true, quantity: true },
+  })
+
+  // Active sales order allocations for component products (per product, per warehouse)
+  const allocations = await db.salesOrderLine.findMany({
+    where: {
+      productId: { in: componentIds },
+      order: { status: { in: ['PENDING', 'PROCESSING', 'PICKING', 'PACKED', 'ON_HOLD'] } },
+    },
+    select: { productId: true, qty: true, order: { select: { shipFromWarehouseId: true } } },
+  })
+
+  // Build lookup: componentId → warehouseId → { stock, allocated }
+  const stockMap = new Map<string, Map<string, number>>()
+  for (const s of stockLevels) {
+    if (!stockMap.has(s.productId)) stockMap.set(s.productId, new Map())
+    stockMap.get(s.productId)!.set(s.warehouseId, Number(s.quantity))
+  }
+
+  const allocMap = new Map<string, Map<string, number>>()
+  for (const a of allocations) {
+    const wid = a.order.shipFromWarehouseId
+    const pid = a.productId
+    if (!wid || !pid) continue
+    if (!allocMap.has(pid)) allocMap.set(pid, new Map())
+    const m = allocMap.get(pid)!
+    m.set(wid, (m.get(wid) ?? 0) + Number(a.qty))
+  }
+
+  return warehouses.map((w) => {
+    let minQty = Infinity
+    let limitingComponent: string | null = null
+
+    for (const comp of components) {
+      const required = Number(comp.qty)
+      const stock = stockMap.get(comp.componentId)?.get(w.id) ?? 0
+      const allocated = allocMap.get(comp.componentId)?.get(w.id) ?? 0
+      const available = Math.max(0, stock - allocated)
+      const canMake = required > 0 ? Math.floor(available / required) : 0
+
+      if (canMake < minQty) {
+        minQty = canMake
+        limitingComponent = comp.component.sku
+      }
+    }
+
+    return {
+      warehouseId: w.id,
+      warehouseCode: w.code,
+      warehouseName: w.name,
+      calculatedQty: minQty === Infinity ? 0 : minQty,
+      limitingComponent: minQty === Infinity ? null : limitingComponent,
+    }
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Product Options (for VARIABLE products)
+// ---------------------------------------------------------------------------
+
+export type ProductOptionRow = {
+  id: string
+  name: string
+  values: string
+  sortOrder: number
+}
+
+export async function getProductOptions(productId: string): Promise<ProductOptionRow[]> {
+  return db.productOption.findMany({
+    where: { productId },
+    orderBy: { sortOrder: 'asc' },
+    select: { id: true, name: true, values: true, sortOrder: true },
+  })
+}
+
+export async function saveProductOptions(
+  productId: string,
+  options: { name: string; values: string }[]
+): Promise<{ success: boolean }> {
+  await db.productOption.deleteMany({ where: { productId } })
+  if (options.length > 0) {
+    await db.productOption.createMany({
+      data: options.map((o, i) => ({
+        productId,
+        name: o.name.trim(),
+        values: o.values,
+        sortOrder: i,
+      })),
+    })
+  }
+  revalidatePath(`/inventory/${productId}`)
+  return { success: true }
+}
+
+export async function generateVariantsFromOptions(
+  productId: string
+): Promise<{ created: number; skipped: number; error?: string }> {
+  const [product, options] = await Promise.all([
+    db.product.findUnique({
+      where: { id: productId },
+      select: { sku: true, name: true, type: true, weight: true, widthCm: true, heightCm: true, depthCm: true },
+    }),
+    db.productOption.findMany({ where: { productId }, orderBy: { sortOrder: 'asc' } }),
+  ])
+
+  if (!product || product.type !== 'VARIABLE') {
+    return { created: 0, skipped: 0, error: 'Product not found or not VARIABLE type' }
+  }
+  if (options.length === 0) {
+    return { created: 0, skipped: 0, error: 'No options defined — save options first' }
+  }
+
+  const optionValues = options.map((o) =>
+    o.values.split(',').map((v) => v.trim()).filter(Boolean)
+  )
+
+  // Cartesian product of all option value arrays
+  const combinations = optionValues.reduce<string[][]>(
+    (acc, arr) => acc.flatMap((combo) => arr.map((v) => [...combo, v])),
+    [[]]
+  )
+
+  const existingVariants = await db.product.findMany({
+    where: { parentId: productId },
+    select: { sku: true },
+  })
+  const existingSkus = new Set(existingVariants.map((v) => v.sku))
+
+  // Determine next sequential number from highest existing -NN suffix
+  const highestNum = existingVariants.reduce((max, v) => {
+    const match = v.sku.match(/-(\d+)$/)
+    return match ? Math.max(max, parseInt(match[1], 10)) : max
+  }, 0)
+
+  let nextNum = highestNum + 1
+  let created = 0
+  let skipped = 0
+
+  for (const combo of combinations) {
+    const sku = `${product.sku}-${String(nextNum).padStart(2, '0')}`
+    const name = `${product.name} - ${combo.join(' ')}`
+    nextNum++
+
+    if (existingSkus.has(sku)) {
+      skipped++
+      continue
+    }
+
+    await db.product.create({
+      data: {
+        sku,
+        name,
+        type: 'VARIANT',
+        parentId: productId,
+        active: true,
+        weight:   product.weight   ?? undefined,
+        widthCm:  product.widthCm  ?? undefined,
+        heightCm: product.heightCm ?? undefined,
+        depthCm:  product.depthCm  ?? undefined,
+      },
+    })
+    created++
+  }
+
+  revalidatePath(`/inventory/${productId}`)
+  return { created, skipped }
+}
+
+export async function deleteOrDeactivateVariant(
+  id: string,
+  forceDeactivate = false
+): Promise<{ action: 'deleted' | 'deactivated' | 'error'; error?: string }> {
+  const product = await db.product.findUnique({
+    where: { id },
+    select: { type: true, parentId: true },
+  })
+  if (!product || product.type !== 'VARIANT') {
+    return { action: 'error', error: 'Not a variant product' }
+  }
+
+  if (!forceDeactivate) {
+    const [movements, orderLines, poLines, costLayers, returnLines] = await Promise.all([
+      db.stockMovement.count({ where: { productId: id } }),
+      db.salesOrderLine.count({ where: { productId: id } }),
+      db.purchaseOrderLine.count({ where: { productId: id } }),
+      db.costLayer.count({ where: { productId: id } }),
+      db.salesOrderRefundLine.count({ where: { productId: id } }),
+    ])
+
+    if (movements > 0 || orderLines > 0 || poLines > 0 || costLayers > 0 || returnLines > 0) {
+      return { action: 'error', error: 'HAS_ACTIVITY' }
+    }
+
+    // Clean up auxiliary records before deletion
+    await db.stockLevel.deleteMany({ where: { productId: id } })
+    await db.wcSyncLog.deleteMany({ where: { entityType: 'Product', entityId: id } })
+    await db.supplierProduct.deleteMany({ where: { productId: id } })
+    await db.product.delete({ where: { id } })
+
+    if (product.parentId) revalidatePath(`/inventory/${product.parentId}`)
+    revalidatePath('/inventory')
+    return { action: 'deleted' }
+  } else {
+    await db.product.update({ where: { id }, data: { active: false } })
+    if (product.parentId) revalidatePath(`/inventory/${product.parentId}`)
+    revalidatePath(`/inventory/${id}`)
+    return { action: 'deactivated' }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bulk actions
+// ---------------------------------------------------------------------------
+
+export async function bulkDeleteProducts(
+  ids: string[]
+): Promise<{ deleted: number; skipped: { sku: string; reason: string }[] }> {
+  const products = await db.product.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, sku: true },
+  })
+
+  let deleted = 0
+  const skipped: { sku: string; reason: string }[] = []
+
+  for (const product of products) {
+    const [movements, orderLines, poLines, costLayers, returnLines, variantCount] = await Promise.all([
+      db.stockMovement.count({ where: { productId: product.id } }),
+      db.salesOrderLine.count({ where: { productId: product.id } }),
+      db.purchaseOrderLine.count({ where: { productId: product.id } }),
+      db.costLayer.count({ where: { productId: product.id } }),
+      db.salesOrderRefundLine.count({ where: { productId: product.id } }),
+      db.product.count({ where: { parentId: product.id } }),
+    ])
+
+    if (variantCount > 0) {
+      skipped.push({ sku: product.sku, reason: 'has variants' })
+      continue
+    }
+    if (movements > 0 || orderLines > 0 || poLines > 0 || costLayers > 0 || returnLines > 0) {
+      skipped.push({ sku: product.sku, reason: 'has activity' })
+      continue
+    }
+
+    await db.stockLevel.deleteMany({ where: { productId: product.id } })
+    await db.wcSyncLog.deleteMany({ where: { entityType: 'Product', entityId: product.id } })
+    await db.supplierProduct.deleteMany({ where: { productId: product.id } })
+    await db.productOption.deleteMany({ where: { productId: product.id } })
+    await db.product.delete({ where: { id: product.id } })
+    deleted++
+  }
+
+  revalidatePath('/inventory')
+  return { deleted, skipped }
+}
+
+export async function bulkDeactivateProducts(
+  ids: string[]
+): Promise<{ deactivated: number }> {
+  await db.product.updateMany({
+    where: { id: { in: ids } },
+    data: { active: false },
+  })
+  revalidatePath('/inventory')
+  return { deactivated: ids.length }
+}

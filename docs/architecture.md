@@ -3,122 +3,177 @@
 ## System Overview
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  LXC Container (Production)                                     │
-│                                                                 │
-│  ┌──────────┐    ┌─────────────────────────────────────────┐   │
-│  │  nginx   │───▶│  Next.js 15 (App Router)                │   │
-│  │ :80/:443 │    │  • Server Components (UI)               │   │
-│  └──────────┘    │  • Route Handlers (REST API)            │   │
-│                  │  • Auth.js (session management)         │   │
-│                  └──────────────────┬────────────────────-─┘   │
-│                                     │                           │
-│                  ┌──────────────────▼──────────────────────┐   │
-│                  │  BullMQ Worker Process                   │   │
-│                  │  • FX rate refresh (hourly)             │   │
-│                  │  • Xero journal sync (daily)            │   │
-│                  │  • WooCommerce order poll (optional)    │   │
-│                  └──────────────────┬───────────────────-──┘   │
-│                                     │                           │
-└─────────────────────────────────────┼───────────────────────────┘
-                                      │
-         ┌────────────────────────────┼──────────────────────┐
-         │                            │                      │
-         ▼                            ▼                      ▼
-┌────────────────┐  ┌─────────────────────┐  ┌──────────────────┐
-│  PostgreSQL    │  │  Redis LXC          │  │  External APIs   │
-│  (database)   │  │  (BullMQ queues)    │  │  • WooCommerce   │
-│               │  │                     │  │  • Xero (UK)     │
-└────────────────┘  └─────────────────────┘  │  • FX Rates      │
-                                              │  • SMTP          │
-                                              └──────────────────┘
++-----------------------------------------------------------------+
+|  IMS Application Server (LXC Container)                         |
+|                                                                 |
+|  +----------+    +------------------------------------------+   |
+|  |   OLS    |--->|  Next.js 16 (App Router)                 |   |
+|  | :80/:443 |    |  - Server Components (UI)                |   |
+|  +----------+    |  - Server Actions (mutations)            |   |
+|                  |  - Route Handlers (API + PDF)            |   |
+|                  |  - Auth.js (session management)          |   |
+|                  +-------------------+----------------------+   |
+|                                      |                          |
+|  +-----------------------------------v----------------------+   |
+|  |  BullMQ Worker Process (tsx workers/index.ts)            |   |
+|  |  - FX rate refresh (daily cron)                          |   |
+|  |  - Xero journal sync                                     |   |
+|  |  - WooCommerce order poll (optional)                     |   |
+|  +-------------------+--------------------------------------+   |
+|                      |                                          |
++----------------------|------------------------------------------+
+                       |
+      +----------------+----------------+
+      |                |                |
+      v                v                v
++------------+  +-------------+  +------------------+
+| PostgreSQL |  | Redis LXC   |  | External APIs    |
+| (database) |  | 10.0.3.11   |  | - WooCommerce    |
+|            |  | (BullMQ)    |  | - Xero (UK)      |
++------------+  +-------------+  | - frankfurter.dev|
+                                 | - SMTP           |
+                                 +------------------+
 ```
+
+### Infrastructure
+
+- **OLS (OpenLiteSpeed)** at `10.0.3.12` acts as the reverse proxy, terminating SSL and forwarding requests to the Next.js process.
+- **Redis** at `10.0.3.11` provides the queue backend for BullMQ background jobs.
+- **PostgreSQL** stores all application data (~40 models).
+- The Next.js process runs on port 3000 (default) via PM2.
 
 ---
 
 ## Request Flow
 
-### Web Request
+### Web Request (Server Action)
 
 ```
-Browser → nginx → Next.js Route Handler
-                  ├── Auth.js: validate session cookie
-                  ├── Zod: validate request body/params
-                  ├── Prisma: query PostgreSQL
-                  └── Response.json(...)
+Browser --> OLS --> Next.js Server Component
+                   +-- Auth.js: validate session cookie
+                   +-- Server Action: validate + mutate via Prisma
+                   +-- revalidatePath / redirect
 ```
 
-### WooCommerce Webhook
+### API Route (PDF / Export / Cron)
 
 ```
-WooCommerce → nginx → /api/webhooks/woocommerce
-                      ├── Verify HMAC signature (WC_WEBHOOK_SECRET)
-                      ├── Parse payload (order.created / order.updated / etc.)
-                      ├── Upsert SalesOrder + SalesOrderLines in DB
-                      ├── Trigger stock movements if order completed/cancelled
-                      └── Queue Xero COGS sync if applicable
+Client --> OLS --> Next.js Route Handler (/api/...)
+                  +-- Auth check (where applicable)
+                  +-- Prisma query
+                  +-- Response (JSON / PDF stream / CSV)
 ```
 
-### Background Job: FX Rate Refresh
+### FX Rate Cron
 
 ```
-BullMQ cron (hourly) → FX worker
-  → exchangerate-api.com GET /latest/GBP
-  → Upsert FxRate rows for all active currencies
-  → Update cached rate in Redis (TTL: 1 hour)
-```
-
-### Background Job: Xero COGS Sync
-
-```
-BullMQ daily job → Xero worker
-  → Fetch all CogsEntry rows with xeroSyncStatus = PENDING for yesterday
-  → Group by date, aggregate by product/account
-  → Build journal entry payload
-  → POST to Xero Journals API
-  → Mark CogsEntry rows as SYNCED
+Daily cron (06:00) --> GET /api/cron/fx-rates
+                       +-- Fetch rates from frankfurter.dev
+                       +-- Upsert FxRate rows for all active currencies
 ```
 
 ---
 
 ## Database Design
 
-### Key design principles
+### Core Principles
 
-**FIFO COGS** — Each goods receipt creates a `CostLayer`. Sales consume layers oldest-first (per product per warehouse) via `CogsEntry`. The FIFO engine in `lib/fifo/` is the single point of write for these tables.
+**FIFO COGS** -- Each goods receipt (purchase receive or opening stock) creates a `CostLayer` with a unit cost and remaining quantity. When stock is consumed (sale dispatch, adjustment, etc.), cost layers are consumed oldest-first per product per warehouse, creating `CogsEntry` records. This provides accurate historical cost tracking.
 
-**Multi-currency** — Every monetary record stores:
-- `*Foreign` fields: amount in the original transaction currency
+**Multi-currency** -- Every monetary record stores both foreign-currency and GBP amounts:
+- `*Foreign` fields: amount in the transaction currency
 - `*Gbp` fields: GBP equivalent at the time of transaction
-- `fxRateToGbp`: the rate used for conversion
+- `fxRateToGbp`: the exchange rate used
 
-This means historical reports always show correct figures, even if the FX rate has since changed.
+Historical reports always show the correct figures regardless of current FX rates.
 
-**Landed costs** — A freight PO (type `FREIGHT`) is linked to a goods PO via `LandedCostLink`. When the goods PO is received, the FIFO engine adds the allocated landed cost to each `CostLayer.unitCostGbp`. The distribution method (by value / weight / quantity / equal split) is configurable per link.
+**Landed costs** -- A freight PO (`type = FREIGHT`) is linked to a goods PO via `LandedCostLink`. When the goods PO is received, landed costs are distributed across `CostLayer.unitCostGbp` values on each line. Distribution methods: by value, by weight, by quantity, or equal split. Retrospective recalculation is supported when freight costs arrive after goods receipt.
 
-**Stock transfers** — A `StockTransfer` with status `IN_TRANSIT` causes stock to be reserved (increments `StockLevel.reservedQty`) on the source warehouse, making it unavailable for new orders. On `COMPLETED`, stock is moved to the destination warehouse.
+**Stock reservation** -- `StockLevel.reservedQty` tracks stock that is allocated but not yet dispatched. Transfers in `IN_TRANSIT` status reserve stock on the source warehouse.
 
-**Variable products** — `Product.type` differentiates:
-- `SIMPLE`: standalone stockable product
-- `VARIABLE`: parent grouping only — no stock, not orderable
-- `VARIANT`: child of a `VARIABLE` parent — stockable, has its own SKU, maps to a WooCommerce variation ID
-- `KIT`: virtual bundle whose components are deducted on sale (handled by the FIFO engine)
+**Discount storage** -- Discounts on sales orders and lines are stored separately as `discountStr` (the original input, e.g. "10%" or "5.00") and `discountAmount` (the computed value). Prices are never baked with discounts applied.
+
+**Tax rate snapshotting** -- Sales orders store `taxRateName` and `taxRatePercent` at the time of creation, ensuring historical accuracy even if tax rates change later.
+
+### Product Types
+
+| Type | Description | Stockable | Has Components |
+|---|---|---|---|
+| `SIMPLE` | Standalone product | Yes | No |
+| `VARIABLE` | Parent grouping for variants | No | No |
+| `VARIANT` | Child of a VARIABLE parent, own SKU | Yes | No |
+| `KIT` | Virtual bundle -- components deducted on sale | Calculated | Yes |
+| `BOM` | Manufactured product -- stock exists after production | Yes | Yes |
+| `NON_INVENTORY` | Service or fee -- not stock-tracked | No | No |
+
+### Key Models (~40 total)
+
+**Core Inventory:**
+- `Product` -- all product types, with SKU, pricing, dimensions, weight, stock unit, images
+- `ProductOption` -- variant options (e.g. Color, Size) with comma-separated values
+- `ProductComponent` -- component list for KIT and BOM products
+- `Warehouse` -- locations (STANDARD, QUARANTINE, RESTOCK types)
+- `StockLevel` -- quantity and reserved quantity per product per warehouse
+- `CostLayer` -- FIFO cost layers with received/remaining quantities and unit cost
+- `CogsEntry` -- consumption records linking cost layers to stock movements
+- `StockMovement` -- audit trail of all stock changes (receipts, dispatches, adjustments, transfers, production)
+
+**Purchasing:**
+- `Supplier`, `SupplierProduct` -- supplier catalog with per-supplier pricing
+- `PurchaseOrder` -- GOODS or FREIGHT type, multi-status workflow
+- `PurchaseOrderLine` -- line items with purchase unit conversion, tax, landed cost
+- `PurchaseUnit` -- packaging-to-stock unit conversion (e.g. "Box of 100" = 100 pcs)
+- `PurchaseReceipt`, `PurchaseReceiptLine` -- goods received records
+- `PurchaseInvoice`, `PurchaseInvoiceLine` -- supplier invoice records with PDF upload
+- `PurchaseReturn`, `PurchaseReturnLine` -- goods returned to supplier
+- `LandedCostLink` -- links freight POs to goods POs
+- `FreightCostLine` -- individual cost items on freight POs
+
+**Sales:**
+- `Customer` -- with billing/shipping addresses (JSON), tax number, WC customer ID
+- `SalesOrder` -- full order with multi-currency totals, shipping, tax, discounts, notes
+- `SalesOrderLine` -- line items with per-line discounts and tax
+- `SalesOrderRefund`, `SalesOrderRefundLine` -- refunds with credit note numbers
+- `Payment` -- payment records against orders or credit notes
+
+**Stock Control:**
+- `StockTransfer`, `StockTransferLine` -- inter-warehouse transfers
+- `StockCount`, `StockCountLine` -- stock count/cycle count workflow
+
+**Manufacturing:**
+- `Bom`, `BomItem` -- bill of materials definitions
+- `Kit`, `KitItem` -- virtual kit definitions
+- `ProductionOrder` -- manufacturing order workflow
+
+**Configuration:**
+- `Organisation` -- company details, base currency, financial year
+- `Setting` -- generic key/value store (JSON-encoded values)
+- `Currency`, `FxRate` -- active currencies and historical exchange rates
+- `TaxRate` -- VAT/GST rates with Xero tax type codes
+- `AdjustmentReason` -- configurable stock adjustment reasons
+
+**Auth and Audit:**
+- `User` -- with roles (ADMIN, WAREHOUSE, FINANCE, READONLY) and optional TOTP 2FA
+- `Session` -- session tokens
+- `ActivityLog` -- full audit trail with entity type, action, metadata
+
+**Integration:**
+- `XeroAccount`, `XeroSyncLog` -- Xero chart of accounts and sync status
+- `WcSyncLog` -- WooCommerce sync log (bidirectional)
 
 ---
 
 ## Module Boundaries
 
-| Module | Data owned | External dependencies |
-|---|---|---|
-| Inventory | `Product`, `StockLevel`, `CostLayer`, `CogsEntry` | WooCommerce (product import) |
-| Purchase Orders | `PurchaseOrder`, `PurchaseOrderLine`, `LandedCostLink`, receipts, invoices, returns, `SupplierProduct` | SMTP (email), PDF renderer |
-| Sales | `SalesOrder`, `SalesOrderLine`, `SalesOrderRefund` | WooCommerce (webhooks + API) |
-| Stock Control | `StockTransfer`, `StockCount` | — |
-| Manufacturing | `Bom`, `BomItem`, `Kit`, `KitItem`, `ProductionOrder` | — |
-| Sync | `WcSyncLog`, `XeroSyncLog`, `XeroAccount` | WooCommerce API, Xero API, Redis |
-| Auth | `User`, `Session` | — |
-| Settings | `Organisation`, `Setting`, `Currency`, `FxRate`, `TaxRate`, `Warehouse` | FX API |
-| Activity | `ActivityLog` | — |
+| Module | Server Actions | Data Owned | API Routes |
+|---|---|---|---|
+| Inventory | `products.ts` | Product, StockLevel, CostLayer, CogsEntry, StockMovement | `/api/export/products`, `/api/export/stock-levels` |
+| Purchases | `purchase-orders.ts`, `suppliers.ts` | PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, PurchaseInvoice, PurchaseReturn, Supplier, SupplierProduct, FreightCostLine, LandedCostLink, PurchaseUnit | `/api/rfq/[id]`, `/api/upload/invoice`, `/api/export/purchase-orders`, `/api/export/suppliers` |
+| Sales | `sales.ts`, `customers.ts` | SalesOrder, SalesOrderLine, SalesOrderRefund, Payment, Customer | `/api/sales-order/[id]`, `/api/invoice/[id]`, `/api/export/sales`, `/api/export/contacts` |
+| Stock Control | `stock.ts`, `transfers.ts` | StockTransfer, StockCount | `/api/export/adjustments`, `/api/export/transfers` |
+| Settings | `settings.ts`, `currencies.ts` | Organisation, Setting, Currency, FxRate, TaxRate, Warehouse, AdjustmentReason | `/api/cron/fx-rates` |
+| Import | `import.ts` | (writes to various tables) | -- |
+| Auth | (Auth.js config) | User, Session | `/api/auth/[...nextauth]`, `/api/auth/totp`, `/api/auth/totp-setup` |
 
 ---
 
@@ -126,86 +181,99 @@ This means historical reports always show correct figures, even if the FX rate h
 
 Auth.js v5 with the **Credentials** provider:
 
-1. User submits email + password
-2. Server verifies `bcrypt` hash stored in `User.passwordHash`
-3. If user has `totpEnabled = true`, a TOTP challenge is issued
-4. On success, Auth.js creates a signed session cookie (JWT or database session)
+1. User submits email + password on the login page
+2. Server verifies the `bcrypt` hash stored in `User.passwordHash`
+3. If `User.totpEnabled = true`, a TOTP challenge screen is shown
+4. On success, Auth.js creates a signed session cookie
 
-TOTP uses the standard TOTP algorithm (RFC 6238, 30-second window). The `User.totpSecret` is stored encrypted. Compatible with any TOTP app (Google Authenticator, Authy, 1Password, etc.).
+TOTP uses the standard TOTP algorithm (RFC 6238, 30-second window). Compatible with any authenticator app (Google Authenticator, Authy, 1Password, etc.). Setup is available in the user profile page with QR code generation.
+
+User roles: `ADMIN`, `WAREHOUSE`, `FINANCE`, `READONLY`.
 
 ---
 
 ## Background Jobs
 
-BullMQ queues run in a separate worker process (`workers/index.ts`), connected to the same PostgreSQL and Redis instances.
+BullMQ queues run in a separate worker process (`npm run worker` / `tsx workers/index.ts`), connected to Redis at `10.0.3.11`.
 
 | Queue | Job | Trigger | Description |
 |---|---|---|---|
-| `fx` | `refresh-rates` | Hourly cron | Fetch latest rates from exchangerate-api.com |
-| `wc` | `poll-orders` | Configurable cron | Poll WooCommerce for new orders (fallback if webhooks not used) |
+| `fx` | `refresh-rates` | Daily cron (06:00) via curl to `/api/cron/fx-rates` | Fetch latest rates from frankfurter.dev |
+| `wc` | `poll-orders` | Configurable interval | Poll WooCommerce for new/updated orders |
 | `wc` | `sync-stock` | On demand / scheduled | Push stock levels to WooCommerce |
-| `xero` | `sync-cogs` | Daily cron | Push COGS journal entries to Xero |
-| `xero` | `sync-po-invoice` | On PO invoice | Push PO invoice to Xero |
-
-Jobs are retried with exponential backoff on failure. Failed jobs are visible in the Settings → Background Jobs UI.
+| `xero` | `sync-cogs` | Daily | Push COGS journal entries to Xero |
+| `xero` | `sync-po-invoice` | On PO invoice creation | Push purchase invoice to Xero |
 
 ---
 
 ## PDF Generation
 
-PO and RFQ PDFs are generated server-side using `@react-pdf/renderer`. Templates live in `lib/pdf/`. PDFs are:
+PDFs are generated server-side using **PDFKit** (configured as a server external package in `next.config.ts`). The PDF system lives in `lib/pdf.ts` and provides:
 
-- Rendered to a `Buffer` in the route handler
-- Either streamed directly as a download response, or
-- Written to `PDF_TEMP_DIR` and attached to an email via Nodemailer
+- `getBranding()` -- reads company info and brand colors from the Organisation and Settings tables
+- `createPdfDocument()` -- creates an A4 PDFDocument with standard margins and helpers
+- Table drawing utilities for consistent formatting across document types
+
+PDF types generated:
+- **RFQ (Request for Quotation)** -- purchase order without prices, sent to suppliers
+- **Purchase Order PDF** -- full PO with prices and terms
+- **Sales Order PDF** -- order confirmation
+- **Invoice PDF** -- customer invoice with auto-generated invoice numbers
+
+PDFs are streamed directly as download responses from route handlers (`/api/rfq/[id]`, `/api/sales-order/[id]`, `/api/invoice/[id]`).
+
+---
+
+## CSV Import/Export
+
+The system supports CSV import and export across multiple modules:
+
+**Export routes** (all under `/api/export/`): products, stock-levels, adjustments, contacts, suppliers, sales, transfers, purchase-orders.
+
+**Import features:**
+- Product CSV import with two-pass processing (parents first, then variants/components)
+- Stock adjustment CSV import (bulk adjustments)
+- Customer CSV import/export
+- Supplier CSV import
+
+CSV utilities are in `lib/csv.ts`.
 
 ---
 
 ## Xero Integration
 
-### Journal entry format
+### Journal Entry Format
 
-**COGS sync** — Daily accumulated journal per product category:
+**COGS sync** -- Daily accumulated journal per product:
 ```
-DR  Cost of Goods Sold account    (total COGS for the day)
-CR  Inventory asset account       (same amount)
-```
-
-**PO Invoice sync** — One journal per PO invoice:
-```
-DR  Inventory asset account       (goods value, per line item)
-CR  Accounts Payable account      (total invoice)
+DR  Cost of Goods Sold    (total COGS for the day)
+CR  Inventory Asset        (same amount)
 ```
 
-Account codes are mapped in Settings → Integrations → Xero. The Chart of Accounts is imported from Xero and stored in `XeroAccount`.
+**PO Invoice sync** -- One journal per purchase invoice:
+```
+DR  Inventory Asset        (goods value per line)
+CR  Accounts Payable       (total invoice)
+```
 
-### Token management
+Account codes are mapped in Settings. The Xero Chart of Accounts is imported and stored in `XeroAccount`.
 
-Xero OAuth 2.0 tokens are stored in `XERO_TOKEN_PATH` (a JSON file). The worker automatically refreshes the access token using the refresh token before each API call. Refresh tokens expire after 60 days of non-use — reconnect via Settings if this occurs.
+### Token Management
+
+Xero OAuth 2.0 tokens are stored at `XERO_TOKEN_PATH` (JSON file). The worker auto-refreshes the access token before each API call. Refresh tokens expire after 60 days of non-use.
 
 ---
 
 ## WooCommerce Integration
 
-### Stock sync (IMS → WooCommerce)
+### Stock Sync (IMS to WooCommerce)
 
-Stock levels are pushed per SKU. The quantity pushed is the **sum** of `StockLevel.quantity - StockLevel.reservedQty` across all warehouses flagged with `syncToWoocommerce = true`.
+Pushed per SKU. The quantity is the sum of `StockLevel.quantity - StockLevel.reservedQty` across all warehouses where `syncToWoocommerce = true`.
 
-For `VARIANT` products: stock is pushed to the WooCommerce variation (`wcVariantId`).  
-For `SIMPLE` products: stock is pushed to the WooCommerce product (`wcProductId`).
+### Order Sync (WooCommerce to IMS)
 
-### Order sync (WooCommerce → IMS)
+Orders arrive via webhook or polling. The system maps WooCommerce product/variation IDs to IMS products, creates or updates SalesOrder records, and converts amounts to GBP at the current FX rate.
 
-Orders are received via webhook. The IMS:
-1. Verifies the HMAC signature using `WC_WEBHOOK_SECRET`
-2. Maps WooCommerce product/variation IDs to IMS `Product` records by `wcProductId`/`wcVariantId`
-3. Creates or updates a `SalesOrder` with all line items
-4. Records the WooCommerce currency and converts amounts to GBP at the current FX rate
+### Refund Handling
 
-### Refund handling
-
-When a WooCommerce refund webhook is received:
-1. A `SalesOrderRefund` is created
-2. The user is prompted (or the default return warehouse is used) to select the return warehouse
-3. Stock is added back to the selected warehouse
-4. COGS are reversed via the FIFO engine (re-adding the consumed cost layers)
+Refunds create `SalesOrderRefund` records with credit note numbers. Stock is returned to the selected (or default) return warehouse, and COGS are reversed through the FIFO engine.

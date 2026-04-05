@@ -1,7 +1,7 @@
 # Configuration Reference
 
-All configuration is via environment variables in the `.env` file.  
-Copy `.env.example` to `.env` and edit before starting the app.
+All configuration is via environment variables in the `.env` file and via the in-app Settings page.
+Copy `.env.example` to `.env` and fill in all values before starting the application.
 
 ---
 
@@ -10,9 +10,9 @@ Copy `.env.example` to `.env` and edit before starting the app.
 | Variable | Required | Default | Description |
 |---|---|---|---|
 | `NODE_ENV` | Yes | `development` | `development` or `production`. Controls build optimisations and error verbosity. |
-| `NEXT_PUBLIC_APP_URL` | Yes | — | Full public URL of the app, no trailing slash. Example: `https://ims.yourdomain.com`. Used for absolute link generation. |
-| `AUTH_SECRET` | Yes | — | Secret used to sign Auth.js session tokens and cookies. Generate with `openssl rand -base64 32`. Must be at least 32 characters. **Rotate periodically.** |
-| `AUTH_URL` | Yes | — | Same as `NEXT_PUBLIC_APP_URL`. Required by Auth.js for OAuth callback URLs. |
+| `NEXT_PUBLIC_APP_URL` | Yes | -- | Full public URL of the app, no trailing slash. Example: `https://ims.yourdomain.com`. Used for absolute link generation. |
+| `AUTH_SECRET` | Yes | -- | Secret used to sign Auth.js session tokens and cookies. Generate with `openssl rand -base64 32`. Must be at least 32 characters. |
+| `AUTH_URL` | Yes | -- | Same as `NEXT_PUBLIC_APP_URL`. Required by Auth.js for callback URLs. |
 
 ---
 
@@ -20,7 +20,9 @@ Copy `.env.example` to `.env` and edit before starting the app.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `DATABASE_URL` | Yes | — | PostgreSQL connection string. Format: `postgresql://USER:PASSWORD@HOST:PORT/DATABASE`. Example: `postgresql://imsuser:secret@localhost:5432/onetwo3d_ims`. |
+| `DATABASE_URL` | Yes | -- | PostgreSQL connection string. Format: `postgresql://USER:PASSWORD@HOST:PORT/DATABASE`. |
+
+Prisma 7 with the `pg` driver adapter is used. The Prisma client is generated to `app/generated/prisma`.
 
 ---
 
@@ -30,8 +32,8 @@ Used by BullMQ for background job queues (FX rate updates, Xero sync, WooCommerc
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `REDIS_URL` | Yes | — | Redis connection URL. Format: `redis://[:password@]host[:port][/db]`. Example: `redis://192.168.1.10:6379`. |
-| `REDIS_PASSWORD` | No | — | Redis password, if required. Leave blank if Redis has no auth. |
+| `REDIS_URL` | Yes | -- | Redis connection URL. Format: `redis://[:password@]host[:port][/db]`. Default Redis instance: `10.0.3.11`. |
+| `REDIS_PASSWORD` | No | -- | Redis password, if required. Leave blank if Redis has no auth. |
 
 ---
 
@@ -39,13 +41,13 @@ Used by BullMQ for background job queues (FX rate updates, Xero sync, WooCommerc
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `WC_STORE_URL` | Yes | — | WooCommerce store base URL, no trailing slash. Example: `https://yourstore.com`. |
-| `WC_CONSUMER_KEY` | Yes | — | WooCommerce REST API consumer key. Generate at: WooCommerce → Settings → Advanced → REST API. |
-| `WC_CONSUMER_SECRET` | Yes | — | WooCommerce REST API consumer secret. |
-| `WC_WEBHOOK_SECRET` | Yes | — | Shared secret for verifying incoming WooCommerce webhooks. Set the same value in each webhook's "Secret" field in WooCommerce. |
+| `WC_STORE_URL` | Yes | -- | WooCommerce store base URL, no trailing slash. |
+| `WC_CONSUMER_KEY` | Yes | -- | REST API consumer key. Generate at: WooCommerce > Settings > Advanced > REST API. |
+| `WC_CONSUMER_SECRET` | Yes | -- | REST API consumer secret. |
+| `WC_WEBHOOK_SECRET` | Yes | -- | Shared secret for verifying incoming WooCommerce webhooks. Set the same value in each webhook's "Secret" field. |
 | `WC_SYNC_STATUSES` | No | `processing` | Comma-separated WooCommerce order statuses that trigger sync into IMS. Example: `processing,on-hold`. |
-| `WC_USE_WEBHOOKS` | No | `true` | `true` = use WooCommerce webhooks (recommended). `false` = poll on an interval. |
-| `WC_POLL_INTERVAL_MINUTES` | No | `5` | Only used when `WC_USE_WEBHOOKS=false`. How often to poll WooCommerce for new/updated orders. |
+| `WC_USE_WEBHOOKS` | No | `true` | `true` = use webhooks (recommended). `false` = poll on an interval. |
+| `WC_POLL_INTERVAL_MINUTES` | No | `5` | Only used when `WC_USE_WEBHOOKS=false`. Polling frequency in minutes. |
 
 ---
 
@@ -55,45 +57,48 @@ Xero uses OAuth 2.0. Create an app at [developer.xero.com](https://developer.xer
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `XERO_CLIENT_ID` | Yes | — | OAuth 2.0 client ID from Xero Developer Portal. |
-| `XERO_CLIENT_SECRET` | Yes | — | OAuth 2.0 client secret from Xero Developer Portal. |
-| `XERO_TENANT_ID` | No | — | Xero organisation (tenant) ID. Retrieved automatically after the OAuth flow and stored in the database. Leave blank on first run. |
-| `XERO_TOKEN_PATH` | No | `/var/lib/onetwo3d-ims/xero/token.json` | File path where the Xero OAuth refresh token is persisted. Must be writable by the app process and outside the app directory (not in git). |
+| `XERO_CLIENT_ID` | Yes | -- | OAuth 2.0 client ID from Xero Developer Portal. |
+| `XERO_CLIENT_SECRET` | Yes | -- | OAuth 2.0 client secret. |
+| `XERO_TENANT_ID` | No | -- | Xero organisation (tenant) ID. Retrieved automatically after OAuth flow. Leave blank on first run. |
+| `XERO_TOKEN_PATH` | No | `/var/lib/onetwo3d-ims/xero-token.json` | File path for persisting the Xero OAuth refresh token. Must be writable and outside the app directory. |
 
-### Setting up the Xero OAuth app
+### Setting Up the Xero OAuth App
 
-1. Go to [developer.xero.com](https://developer.xero.com) → **My Apps** → **New App**
-2. App type: **Web app**
-3. Company name: OneTwo3D Ltd
-4. OAuth 2.0 redirect URI: `https://ims.yourdomain.com/api/sync/xero/callback`
-5. Copy the **Client ID** and **Client Secret** into `.env`
-6. Scopes required: `accounting.transactions`, `accounting.journals.read`, `accounting.settings.read`, `accounting.contacts`, `offline_access`
+1. Go to [developer.xero.com](https://developer.xero.com) > My Apps > New App
+2. App type: Web app
+3. OAuth 2.0 redirect URI: `https://ims.yourdomain.com/api/sync/xero/callback`
+4. Copy the Client ID and Client Secret into `.env`
+5. Required scopes: `accounting.transactions`, `accounting.journals.read`, `accounting.settings.read`, `accounting.contacts`, `offline_access`
 
 ---
 
 ## FX Rates
 
+FX rates are fetched from the frankfurter.dev API (no API key required) via a daily cron job that hits `/api/cron/fx-rates`.
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `FX_API_KEY` | Yes | — | API key from [exchangerate-api.com](https://www.exchangerate-api.com). The free tier allows 1,500 requests/month — more than sufficient with hourly refresh. |
-| `FX_BASE_CURRENCY` | No | `GBP` | Base currency for all internal calculations. All stored GBP amounts are converted from this currency. |
-| `FX_REFRESH_CRON` | No | `0 * * * *` | Cron expression for how often to fetch fresh FX rates. Default: every hour on the hour. |
+| `FX_API_KEY` | No | -- | API key for exchangerate-api.com (legacy). The current implementation uses frankfurter.dev which requires no key. |
+| `FX_BASE_CURRENCY` | No | `GBP` | Base currency for all internal calculations. |
+| `FX_REFRESH_CRON` | No | `0 * * * *` | Cron expression for FX rate refresh frequency. |
+
+The cron is set up by the install script as a system crontab entry that runs `curl` against `/api/cron/fx-rates` daily at 06:00.
 
 ---
 
 ## SMTP
 
-Used for sending Purchase Order PDFs and RFQ emails to suppliers.
+Used for sending RFQ and PO PDFs to suppliers via email.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `SMTP_HOST` | Yes | — | SMTP server hostname. Example: `smtp.postmarkapp.com`. |
-| `SMTP_PORT` | No | `587` | SMTP port. Common values: `587` (STARTTLS), `465` (SSL), `25` (plain). |
-| `SMTP_SECURE` | No | `tls` | Encryption method: `tls` (STARTTLS on port 587), `ssl` (TLS on port 465), `none` (unencrypted). |
-| `SMTP_USER` | Yes | — | SMTP authentication username. |
-| `SMTP_PASSWORD` | Yes | — | SMTP authentication password. |
-| `SMTP_FROM_EMAIL` | Yes | — | From address shown on outgoing emails. Example: `ims@yourdomain.com`. |
-| `SMTP_FROM_NAME` | No | `OneTwo3D IMS` | From name shown on outgoing emails. |
+| `SMTP_HOST` | Yes | -- | SMTP server hostname. |
+| `SMTP_PORT` | No | `587` | SMTP port. Common: `587` (STARTTLS), `465` (SSL), `25` (plain). |
+| `SMTP_SECURE` | No | `tls` | Encryption: `tls`, `ssl`, or `none`. |
+| `SMTP_USER` | Yes | -- | SMTP authentication username. |
+| `SMTP_PASSWORD` | Yes | -- | SMTP authentication password. |
+| `SMTP_FROM_EMAIL` | Yes | -- | From address on outgoing emails. |
+| `SMTP_FROM_NAME` | No | `OneTwo3D IMS` | From name on outgoing emails. |
 
 ---
 
@@ -101,9 +106,9 @@ Used for sending Purchase Order PDFs and RFQ emails to suppliers.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `PDF_TEMP_DIR` | No | `/tmp/onetwo3d-ims/pdf` | Directory for temporarily storing generated PDFs before download/email. Must be writable. |
+| `PDF_TEMP_DIR` | No | `/tmp/onetwo3d-ims/pdf` | Temporary directory for generated PDFs. Must be writable. |
 | `UPLOAD_MAX_SIZE_MB` | No | `10` | Maximum file size for CSV uploads (MB). |
-| `UPLOAD_TEMP_DIR` | No | `/tmp/onetwo3d-ims/uploads` | Directory for temporarily storing uploaded CSV files during import. Must be writable. |
+| `UPLOAD_TEMP_DIR` | No | `/tmp/onetwo3d-ims/uploads` | Temporary directory for uploaded files during import. Must be writable. |
 
 ---
 
@@ -111,35 +116,90 @@ Used for sending Purchase Order PDFs and RFQ emails to suppliers.
 
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `LOG_LEVEL` | No | `info` | Minimum log level to output: `error`, `warn`, `info`, `debug`. Use `debug` only in development — it is very verbose. |
-| `LOG_FORMAT` | No | `json` | Log output format: `json` (structured, for log aggregators) or `pretty` (human-readable, for development). |
+| `LOG_LEVEL` | No | `info` | Minimum log level: `error`, `warn`, `info`, `debug`. |
+| `LOG_FORMAT` | No | `json` | Output format: `json` (structured) or `pretty` (human-readable). |
 
 ---
 
-## Settings stored in the database
+## Settings Page (In-App Configuration)
 
-The following are configured via the **Settings** UI in the app, not via `.env`. They are stored in the `settings` table and can be changed without restarting the app.
+The following settings are managed through the Settings page in the app UI (`/settings`). They are stored in the `settings` and related database tables and take effect immediately without restarting the application.
 
-| Setting | Description |
-|---|---|
-| Organisation name, address, VAT number | Appears on PO/RFQ PDFs |
-| Warehouses | Code, name, type, sale eligibility, WC sync flag |
-| Default warehouse | Used when no warehouse is specified |
-| Default return warehouse | Used for refund returns (default: QUA) |
-| Warehouses synced to WooCommerce | Which warehouse stock totals are pushed to WC |
-| WooCommerce sync order statuses | Overrides `WC_SYNC_STATUSES` env var if set |
-| Xero account mappings | Maps IMS transaction types to Xero account codes |
-| Tax rates | Rate, name, country, default flag |
-| Currencies | Active currencies, display symbol |
-| Financial year start | Month and day (default: 01 May) |
-| Branding | Logo upload, primary colour |
+### VAT Rates
+
+Manage tax rates used across purchases and sales. Each rate has:
+- **Name** -- descriptive label (e.g. "UK Standard Rate")
+- **Rate** -- percentage as a decimal (e.g. 0.2000 for 20%)
+- **Used for** -- SALES, PURCHASE, or BOTH
+- **Xero tax type code** -- maps to the corresponding Xero tax type (e.g. "OUTPUT2", "INPUT2")
+- **Default** flag -- which rate to pre-select on new orders
+
+### Currencies and FX Rates
+
+- Add/remove active currencies (ISO 4217 codes)
+- Set currency type: SALES, PURCHASE, or BOTH
+- View current FX rates (fetched automatically from frankfurter.dev)
+- Manual rate override if needed
+
+Currency symbols are displayed **after** amounts throughout the application (e.g. "2.99 GBP"). All currency values are displayed with 2 decimal places.
+
+### Landed Cost Distribution Method
+
+Global default method for distributing freight/landed costs across purchase order lines:
+- **BY_VALUE** -- proportional to line value
+- **BY_WEIGHT** -- proportional to product weight
+- **BY_QUANTITY** -- proportional to line quantity
+- **EQUAL_SPLIT** -- equal amount per line
+
+Can be overridden per `LandedCostLink`.
+
+### Invoice Generation Trigger
+
+Controls when sales invoices are automatically generated:
+- **On ship** -- invoice generated when order status changes to SHIPPED
+- **On paid** -- invoice generated when payment is recorded
+- **Manual** -- invoices must be generated manually
+
+### Purchase Units
+
+Define packaging units with stock unit conversion factors:
+- **Name** -- e.g. "Box of 100", "Roll (1km)", "Pallet of 48"
+- **Abbreviation** -- e.g. "box", "roll", "plt"
+- **Conversion factor** -- 1 purchase unit = X stock units
+- **Stock unit name** -- what each stock unit is called (e.g. "pcs", "m", "sheets")
+
+### Stock Adjustment Reasons
+
+Configurable list of reasons for stock adjustments:
+- **Name** -- e.g. "Damaged", "Miscounted", "Returned to stock"
+- **Xero account code** -- optional link to a Xero expense account
+- **Sort order** and **active** flag
+
+### Organisation Details
+
+Company information used on PDF documents:
+- Company name, legal name, VAT number, company number
+- Address fields
+- Phone, email, website
+- Logo URL
+- Base currency and financial year start (month/day)
+
+### Warehouse Configuration
+
+Managed via the Warehouses section:
+- **Code** and **name**
+- **Type**: STANDARD, QUARANTINE, or RESTOCK
+- **Available for sale** -- whether stock counts toward saleable inventory
+- **Sync to WooCommerce** -- include in WC stock push
+- **Default warehouse** and **default return warehouse** flags
 
 ---
 
 ## Security Notes
 
-- `.env` is listed in `.gitignore` — **never commit it**
+- `.env` is in `.gitignore` -- never commit it to version control
 - Set file permissions: `chmod 600 /opt/onetwo3d-ims/.env`
-- `AUTH_SECRET` controls session security — treat it like a private key
-- `WC_WEBHOOK_SECRET` and `XERO_CLIENT_SECRET` are sensitive — do not log them
-- The Xero token file (`XERO_TOKEN_PATH`) contains an OAuth refresh token — set it to `chmod 600` and keep it outside the app directory
+- `AUTH_SECRET` controls session security -- treat it like a private key
+- Rotate `AUTH_SECRET` periodically (existing sessions will be invalidated)
+- `WC_WEBHOOK_SECRET` and `XERO_CLIENT_SECRET` are sensitive -- do not log them
+- The Xero token file (`XERO_TOKEN_PATH`) contains an OAuth refresh token -- set `chmod 600` and keep outside the app directory

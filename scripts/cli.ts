@@ -1,0 +1,80 @@
+#!/usr/bin/env tsx
+/**
+ * OneTwo3D IMS CLI
+ * Usage: npm run cli -- <command>
+ *
+ * Commands:
+ *   create-user   Interactively create a new user
+ */
+import { createInterface } from 'readline'
+import { PrismaClient } from '../app/generated/prisma/client'
+import { PrismaPg } from '@prisma/adapter-pg'
+import bcrypt from 'bcryptjs'
+
+const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! })
+const db = new PrismaClient({ adapter })
+
+const rl = createInterface({ input: process.stdin, output: process.stdout })
+const ask = (q: string): Promise<string> =>
+  new Promise((resolve) => rl.question(q, resolve))
+
+async function createUser() {
+  console.log('\n--- Create User ---\n')
+
+  const name = await ask('Name: ')
+  const email = await ask('Email: ')
+
+  const existing = await db.user.findUnique({ where: { email } })
+  if (existing) {
+    console.error(`Error: user with email "${email}" already exists.`)
+    process.exit(1)
+  }
+
+  process.stdout.write('Password: ')
+  const password = await new Promise<string>((resolve) => {
+    const stdin = process.stdin
+    stdin.setRawMode?.(true)
+    stdin.resume()
+    stdin.setEncoding('utf8')
+    let pwd = ''
+    stdin.on('data', (ch: string) => {
+      if (ch === '\r' || ch === '\n') {
+        stdin.setRawMode?.(false)
+        stdin.pause()
+        console.log('')
+        resolve(pwd)
+      } else if (ch === '\u0003') {
+        process.exit()
+      } else {
+        pwd += ch
+        process.stdout.write('*')
+      }
+    })
+  })
+
+  if (password.length < 8) {
+    console.error('Error: password must be at least 8 characters.')
+    process.exit(1)
+  }
+
+  const passwordHash = await bcrypt.hash(password, 12)
+  const user = await db.user.create({
+    data: { name, email, passwordHash, role: 'ADMIN', active: true },
+  })
+
+  console.log(`\nUser created: ${user.email} (ID: ${user.id})`)
+}
+
+const command = process.argv[2]
+
+switch (command) {
+  case 'create-user':
+    createUser()
+      .catch(console.error)
+      .finally(() => { rl.close(); db.$disconnect() })
+    break
+  default:
+    console.log('Available commands: create-user')
+    rl.close()
+    db.$disconnect()
+}

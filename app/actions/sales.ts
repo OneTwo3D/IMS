@@ -1,0 +1,878 @@
+'use server'
+
+import { revalidatePath } from 'next/cache'
+import { db } from '@/lib/db'
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
+
+export type SoStatus =
+  | 'PENDING' | 'PROCESSING' | 'PICKING' | 'PACKED'
+  | 'SHIPPED' | 'COMPLETED' | 'CANCELLED'
+  | 'REFUNDED' | 'PARTIALLY_REFUNDED' | 'ON_HOLD'
+
+export type SoLineRow = {
+  id: string
+  productId: string | null
+  sku: string
+  description: string
+  qty: number
+  unitPriceForeign: number  // original price before discount
+  unitPriceGbp: number
+  discountStr: string | null
+  discountAmount: number
+  taxForeign: number
+  taxGbp: number
+  totalForeign: number
+  totalGbp: number
+  cogsGbp: number | null
+}
+
+export type SoRow = {
+  id: string
+  wcOrderId: number | null
+  wcOrderNumber: string | null
+  status: SoStatus
+  currency: string
+  fxRateToGbp: number
+  customerName: string | null
+  customerEmail: string | null
+  subtotalForeign: number
+  shippingService: string | null
+  shippingForeign: number
+  taxRateName: string | null
+  taxRatePercent: number | null
+  taxForeign: number
+  totalForeign: number
+  totalGbp: number
+  shipFromWarehouseId: string | null
+  shipFromWarehouseName: string | null
+  expectedDelivery: string | null
+  salesRep: string | null
+  trackingNumber: string | null
+  shippedAt: string | null
+  discountStr: string | null
+  discountAmount: number
+  invoiceNumber: string | null
+  invoicedAt: string | null
+  paidAt: string | null
+  notes: string | null
+  internalNotes: string | null
+  createdAt: string
+  lineCount: number
+}
+
+export type SoDetail = SoRow & {
+  billingAddress: unknown
+  shippingAddress: unknown
+  lines: SoLineRow[]
+  refunds: {
+    id: string
+    creditNoteNumber: string | null
+    reason: string | null
+    totalForeign: number
+    totalGbp: number
+    refundedAt: string
+    payments: PaymentRow[]
+    lines: {
+      id: string
+      productId: string | null
+      description: string
+      qty: number
+      totalGbp: number
+    }[]
+  }[]
+  payments: PaymentRow[]
+}
+
+export type SoLineInput = {
+  productId: string
+  sku: string
+  description: string
+  qty: number
+  unitPriceForeign: number
+}
+
+export type CreateSoInput = {
+  customerId?: string
+  customerName: string
+  customerEmail?: string
+  billingAddress?: unknown
+  shippingAddress?: unknown
+  currency: string
+  fxRateToGbp: number
+  shipFromWarehouseId?: string
+  expectedDelivery?: string
+  salesRep?: string
+  notes?: string
+  internalNotes?: string
+  shippingService?: string
+  shippingForeign?: number
+  taxRateName?: string
+  taxRateValue?: number
+  pricesIncludeVat?: boolean
+  fees?: { description: string; amount: number }[]
+  orderDiscountForeign?: number
+  orderDiscountStr?: string
+  lines: (SoLineInput & { discountStr?: string; discountAmount?: number })[]
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function makeReference(): string {
+  const now = new Date()
+  const ymd = now.toISOString().slice(0, 10).replace(/-/g, '')
+  const rand = Math.random().toString(36).slice(2, 6).toUpperCase()
+  return `SO-${ymd}-${rand}`
+}
+
+const SO_SELECT = {
+  id: true,
+  wcOrderId: true,
+  wcOrderNumber: true,
+  status: true,
+  currency: true,
+  fxRateToGbp: true,
+  customerName: true,
+  customerEmail: true,
+  subtotalForeign: true,
+  shippingService: true,
+  shippingForeign: true,
+  taxRateName: true,
+  taxRatePercent: true,
+  taxForeign: true,
+  totalForeign: true,
+  totalGbp: true,
+  shipFromWarehouseId: true,
+  shipFromWarehouse: { select: { name: true } },
+  expectedDelivery: true,
+  salesRep: true,
+  trackingNumber: true,
+  shippedAt: true,
+  discountStr: true,
+  discountAmount: true,
+  invoiceNumber: true,
+  invoicedAt: true,
+  paidAt: true,
+  notes: true,
+  internalNotes: true,
+  createdAt: true,
+  _count: { select: { lines: true } },
+} as const
+
+function mapSoRow(so: {
+  id: string
+  wcOrderId: number | null
+  wcOrderNumber: string | null
+  status: string
+  currency: string
+  fxRateToGbp: unknown
+  customerName: string | null
+  customerEmail: string | null
+  subtotalForeign: unknown
+  shippingService: string | null
+  shippingForeign: unknown
+  taxRateName: string | null
+  taxRatePercent: unknown
+  taxForeign: unknown
+  totalForeign: unknown
+  totalGbp: unknown
+  shipFromWarehouseId: string | null
+  shipFromWarehouse: { name: string } | null
+  expectedDelivery: Date | null
+  salesRep: string | null
+  trackingNumber: string | null
+  shippedAt: Date | null
+  discountStr: string | null
+  discountAmount: unknown
+  invoiceNumber: string | null
+  invoicedAt: Date | null
+  paidAt: Date | null
+  notes: string | null
+  internalNotes: string | null
+  createdAt: Date
+  _count: { lines: number }
+}): SoRow {
+  return {
+    id: so.id,
+    wcOrderId: so.wcOrderId,
+    wcOrderNumber: so.wcOrderNumber,
+    status: so.status as SoStatus,
+    currency: so.currency,
+    fxRateToGbp: Number(so.fxRateToGbp),
+    customerName: so.customerName,
+    customerEmail: so.customerEmail,
+    subtotalForeign: Number(so.subtotalForeign),
+    shippingService: so.shippingService,
+    shippingForeign: Number(so.shippingForeign),
+    taxRateName: so.taxRateName,
+    taxRatePercent: so.taxRatePercent != null ? Number(so.taxRatePercent) : null,
+    taxForeign: Number(so.taxForeign),
+    totalForeign: Number(so.totalForeign),
+    totalGbp: Number(so.totalGbp),
+    shipFromWarehouseId: so.shipFromWarehouseId,
+    shipFromWarehouseName: so.shipFromWarehouse?.name ?? null,
+    expectedDelivery: so.expectedDelivery?.toISOString() ?? null,
+    salesRep: so.salesRep,
+    trackingNumber: so.trackingNumber,
+    shippedAt: so.shippedAt?.toISOString() ?? null,
+    discountStr: so.discountStr,
+    discountAmount: Number(so.discountAmount),
+    invoiceNumber: so.invoiceNumber,
+    invoicedAt: so.invoicedAt?.toISOString() ?? null,
+    paidAt: so.paidAt?.toISOString() ?? null,
+    notes: so.notes,
+    internalNotes: so.internalNotes,
+    createdAt: so.createdAt.toISOString(),
+    lineCount: so._count.lines,
+  }
+}
+
+function mapLine(l: {
+  id: string
+  productId: string | null
+  sku: string | null
+  description: string
+  qty: unknown
+  unitPriceForeign: unknown
+  unitPriceGbp: unknown
+  discountStr: string | null
+  discountAmount: unknown
+  taxForeign: unknown
+  taxGbp: unknown
+  totalForeign: unknown
+  totalGbp: unknown
+  cogsGbp: unknown
+}): SoLineRow {
+  return {
+    id: l.id,
+    productId: l.productId,
+    sku: l.sku ?? '',
+    description: l.description,
+    qty: Number(l.qty),
+    unitPriceForeign: Number(l.unitPriceForeign),
+    unitPriceGbp: Number(l.unitPriceGbp),
+    discountStr: l.discountStr ?? null,
+    discountAmount: Number(l.discountAmount ?? 0),
+    taxForeign: Number(l.taxForeign),
+    taxGbp: Number(l.taxGbp),
+    totalForeign: Number(l.totalForeign),
+    totalGbp: Number(l.totalGbp),
+    cogsGbp: l.cogsGbp != null ? Number(l.cogsGbp) : null,
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Queries
+// ---------------------------------------------------------------------------
+
+export async function getSalesOrders(limit = 200): Promise<SoRow[]> {
+  const orders = await db.salesOrder.findMany({
+    select: SO_SELECT,
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+  })
+  return orders.map(mapSoRow)
+}
+
+export async function getSalesOrder(id: string): Promise<SoDetail | null> {
+  const so = await db.salesOrder.findUnique({
+    where: { id },
+    select: {
+      ...SO_SELECT,
+      billingAddress: true,
+      shippingAddress: true,
+      lines: {
+        select: {
+          id: true, productId: true, sku: true, description: true,
+          qty: true, unitPriceForeign: true, unitPriceGbp: true, discountStr: true, discountAmount: true,
+          taxForeign: true, taxGbp: true, totalForeign: true, totalGbp: true,
+          cogsGbp: true,
+        },
+      },
+      refunds: {
+        select: {
+          id: true, creditNoteNumber: true, reason: true, totalForeign: true, totalGbp: true, refundedAt: true,
+          lines: {
+            select: { id: true, productId: true, description: true, qty: true, totalGbp: true },
+          },
+          payments: {
+            select: { id: true, amount: true, currency: true, method: true, reference: true, notes: true, paidAt: true },
+            orderBy: { paidAt: 'desc' },
+          },
+        },
+        orderBy: { refundedAt: 'desc' },
+      },
+      payments: {
+        select: { id: true, refundId: true, amount: true, currency: true, method: true, reference: true, notes: true, paidAt: true },
+        orderBy: { paidAt: 'desc' },
+      },
+    },
+  })
+  if (!so) return null
+
+  return {
+    ...mapSoRow(so),
+    billingAddress: so.billingAddress,
+    shippingAddress: so.shippingAddress,
+    lines: so.lines.map(mapLine),
+    refunds: so.refunds.map((r) => ({
+      id: r.id,
+      creditNoteNumber: r.creditNoteNumber,
+      reason: r.reason,
+      totalForeign: Number(r.totalForeign),
+      totalGbp: Number(r.totalGbp),
+      refundedAt: r.refundedAt.toISOString(),
+      payments: (r.payments ?? []).map((p) => ({
+        id: p.id, refundId: r.id, creditNoteNumber: r.creditNoteNumber,
+        amount: Number(p.amount), currency: p.currency, method: p.method, reference: p.reference, notes: p.notes, paidAt: p.paidAt.toISOString(),
+      })),
+      lines: r.lines.map((rl) => ({
+        id: rl.id,
+        productId: rl.productId,
+        description: rl.description,
+        qty: Number(rl.qty),
+        totalGbp: Number(rl.totalGbp),
+      })),
+    })),
+    payments: so.payments.map((p) => ({
+      id: p.id, refundId: p.refundId, creditNoteNumber: null,
+      amount: Number(p.amount), currency: p.currency, method: p.method, reference: p.reference, notes: p.notes, paidAt: p.paidAt.toISOString(),
+    })),
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Mutations
+// ---------------------------------------------------------------------------
+
+export async function createSalesOrder(input: CreateSoInput): Promise<{ success: boolean; order?: SoRow; error?: string }> {
+  try {
+    if (!input.lines.length) return { success: false, error: 'Add at least one line item' }
+    if (!input.customerName?.trim()) return { success: false, error: 'Customer name is required' }
+
+    const fxRate = input.fxRateToGbp || 1
+    const vatRate = input.taxRateValue ?? 0
+    const inclVat = input.pricesIncludeVat && vatRate > 0
+    let subtotalForeign = 0
+    let subtotalGbp = 0
+    let totalTaxForeign = 0
+    let totalTaxGbp = 0
+
+    const lineData = input.lines.map((l) => {
+      const discAmt = l.discountAmount ?? 0
+      const grossLine = l.qty * l.unitPriceForeign - discAmt // original price * qty - discount
+      const netForeign = inclVat ? grossLine / (1 + vatRate) : grossLine
+      const unitPriceGbp = Math.round((l.unitPriceForeign / fxRate) * 1000000) / 1000000
+      const totalForeign = Math.round(netForeign * 10000) / 10000
+      const totalGbp = Math.round((totalForeign / fxRate) * 10000) / 10000
+      const lineTax = inclVat ? grossLine - netForeign : netForeign * vatRate
+      const lineTaxForeign = Math.round(lineTax * 10000) / 10000
+      const lineTaxGbp = Math.round((lineTaxForeign / fxRate) * 10000) / 10000
+      subtotalForeign += totalForeign
+      subtotalGbp += totalGbp
+      totalTaxForeign += lineTaxForeign
+      totalTaxGbp += lineTaxGbp
+      return {
+        productId: l.productId,
+        sku: l.sku,
+        description: l.description,
+        qty: l.qty,
+        unitPriceForeign: l.unitPriceForeign, // store ORIGINAL price
+        unitPriceGbp,
+        discountStr: l.discountStr || null,
+        discountAmount: discAmt,
+        taxForeign: lineTaxForeign,
+        taxGbp: lineTaxGbp,
+        totalForeign,
+        totalGbp,
+      }
+    })
+
+    // Shipping
+    const shippingForeign = input.shippingForeign ?? 0
+    const shippingGbp = Math.round((shippingForeign / fxRate) * 10000) / 10000
+
+    // Additional fees → add to shipping (stored in shippingForeign)
+    let feesTotalForeign = 0
+    if (input.fees?.length) {
+      for (const f of input.fees) feesTotalForeign += f.amount
+    }
+    const totalShippingForeign = shippingForeign + feesTotalForeign
+    const totalShippingGbp = Math.round((totalShippingForeign / fxRate) * 10000) / 10000
+
+    // VAT on shipping/fees
+    if (vatRate > 0) {
+      const shippingTax = inclVat
+        ? totalShippingForeign - totalShippingForeign / (1 + vatRate)
+        : totalShippingForeign * vatRate
+      totalTaxForeign += Math.round(shippingTax * 10000) / 10000
+      totalTaxGbp += Math.round((shippingTax / fxRate) * 10000) / 10000
+    }
+
+    // Order-level discount
+    const orderDiscForeign = input.orderDiscountForeign ?? 0
+    const orderDiscGbp = Math.round((orderDiscForeign / fxRate) * 10000) / 10000
+    // Reduce subtotal by order discount (already net if inclVat)
+    const discNetForeign = inclVat ? orderDiscForeign / (1 + vatRate) : orderDiscForeign
+    const discNetGbp = Math.round((discNetForeign / fxRate) * 10000) / 10000
+    subtotalForeign -= discNetForeign
+    subtotalGbp -= discNetGbp
+    if (vatRate > 0) {
+      const discTax = inclVat ? orderDiscForeign - discNetForeign : discNetForeign * vatRate
+      totalTaxForeign -= Math.round(discTax * 10000) / 10000
+      totalTaxGbp -= Math.round((discTax / fxRate) * 10000) / 10000
+    }
+
+    const grandTotalForeign = subtotalForeign + totalTaxForeign + totalShippingForeign
+    const grandTotalGbp = subtotalGbp + totalTaxGbp + totalShippingGbp
+
+    const so = await db.salesOrder.create({
+      data: {
+        wcOrderNumber: makeReference(),
+        status: 'PENDING',
+        currency: input.currency,
+        fxRateToGbp: fxRate,
+        customerId: input.customerId || null,
+        customerName: input.customerName,
+        customerEmail: input.customerEmail || null,
+        billingAddress: input.billingAddress ?? undefined,
+        shippingAddress: input.shippingAddress ?? undefined,
+        subtotalForeign,
+        shippingService: input.shippingService || null,
+        shippingForeign: totalShippingForeign,
+        taxRateName: input.taxRateName || null,
+        taxRatePercent: vatRate > 0 ? vatRate : null,
+        taxForeign: totalTaxForeign,
+        totalForeign: grandTotalForeign,
+        subtotalGbp,
+        shippingGbp: totalShippingGbp,
+        taxGbp: totalTaxGbp,
+        totalGbp: grandTotalGbp,
+        shipFromWarehouseId: input.shipFromWarehouseId || null,
+        expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null,
+        salesRep: input.salesRep || null,
+        discountStr: input.orderDiscountStr || null,
+        discountAmount: input.orderDiscountForeign ?? 0,
+        notes: input.notes || null,
+        internalNotes: input.internalNotes || null,
+        lines: { create: lineData },
+      },
+      select: SO_SELECT,
+    })
+
+    // Reserve stock in the ship-from warehouse
+    if (input.shipFromWarehouseId) {
+      for (const l of input.lines) {
+        if (!l.productId) continue
+        await db.stockLevel.upsert({
+          where: { productId_warehouseId: { productId: l.productId, warehouseId: input.shipFromWarehouseId } },
+          create: { productId: l.productId, warehouseId: input.shipFromWarehouseId, quantity: 0, reservedQty: l.qty },
+          update: { reservedQty: { increment: l.qty } },
+        })
+      }
+    }
+
+    revalidatePath('/sales')
+    return { success: true, order: mapSoRow(so) }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+/** Release reserved stock for all lines of an order */
+async function releaseReservedStock(orderId: string, warehouseId: string, lines: { productId: string | null; qty: unknown }[]) {
+  for (const line of lines) {
+    if (!line.productId) continue
+    const qty = Number(line.qty)
+    await db.stockLevel.updateMany({
+      where: { productId: line.productId, warehouseId },
+      data: { reservedQty: { decrement: qty } },
+    })
+  }
+}
+
+export async function updateSalesOrderStatus(
+  id: string,
+  targetStatus: SoStatus,
+  extra?: { trackingNumber?: string; shipFromWarehouseId?: string },
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const so = await db.salesOrder.findUnique({
+      where: { id },
+      select: { id: true, status: true, shipFromWarehouseId: true, lines: { select: { id: true, productId: true, qty: true } } },
+    })
+    if (!so) return { success: false, error: 'Order not found' }
+
+    const data: Record<string, unknown> = { status: targetStatus }
+
+    // On SHIPPED: record shipped date, tracking, and create stock movements
+    if (targetStatus === 'SHIPPED') {
+      data.shippedAt = new Date()
+      if (extra?.trackingNumber) data.trackingNumber = extra.trackingNumber
+      const warehouseId = extra?.shipFromWarehouseId || so.shipFromWarehouseId
+      if (extra?.shipFromWarehouseId) data.shipFromWarehouseId = extra.shipFromWarehouseId
+
+      if (warehouseId) {
+        // Release reservation and decrement actual stock
+        await releaseReservedStock(id, warehouseId, so.lines)
+        for (const line of so.lines) {
+          if (!line.productId) continue
+          const qty = Number(line.qty)
+          await db.stockMovement.create({
+            data: {
+              type: 'SALE_DISPATCH',
+              productId: line.productId,
+              fromWarehouseId: warehouseId,
+              qty,
+              note: `Dispatched for order`,
+              referenceType: 'SalesOrder',
+              referenceId: id,
+            },
+          })
+          await db.stockLevel.updateMany({
+            where: { productId: line.productId, warehouseId },
+            data: { quantity: { decrement: qty } },
+          })
+        }
+      }
+    }
+
+    if (targetStatus === 'CANCELLED' && so.status === 'SHIPPED') {
+      return { success: false, error: 'Cannot cancel a shipped order — process a refund instead' }
+    }
+
+    // On CANCEL: release reserved stock
+    if (targetStatus === 'CANCELLED' && so.shipFromWarehouseId) {
+      await releaseReservedStock(id, so.shipFromWarehouseId, so.lines)
+    }
+
+    await db.salesOrder.update({ where: { id }, data })
+
+    // Auto-generate invoice on ship if configured
+    if (targetStatus === 'SHIPPED') {
+      const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
+      if (trigger?.value === 'on_shipped') {
+        await generateInvoiceNumber(id)
+      }
+    }
+
+    revalidatePath('/sales')
+    revalidatePath(`/sales/${id}`)
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+export async function createRefund(
+  orderId: string,
+  lines: { productId: string | null; description: string; qty: number; totalGbp: number }[],
+  reason: string,
+  returnWarehouseId?: string,
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const so = await db.salesOrder.findUnique({
+      where: { id: orderId },
+      select: { id: true, status: true, fxRateToGbp: true },
+    })
+    if (!so) return { success: false, error: 'Order not found' }
+
+    const refundLines = lines.filter((l) => l.qty > 0)
+    if (!refundLines.length) return { success: false, error: 'Select at least one line to refund' }
+
+    const fxRate = Number(so.fxRateToGbp)
+    const totalGbp = refundLines.reduce((s, l) => s + l.totalGbp, 0)
+    const totalForeign = Math.round(totalGbp * fxRate * 10000) / 10000
+
+    // Generate credit note number
+    const cnCount = await db.salesOrderRefund.count({ where: { creditNoteNumber: { not: null } } })
+    const creditNoteNumber = `CN-${new Date().getFullYear()}-${String(cnCount + 1).padStart(5, '0')}`
+
+    await db.salesOrderRefund.create({
+      data: {
+        orderId,
+        creditNoteNumber,
+        reason: reason || null,
+        totalForeign,
+        totalGbp,
+        returnWarehouseId: returnWarehouseId || null,
+        lines: {
+          create: refundLines.map((l) => ({
+            productId: l.productId,
+            description: l.description,
+            qty: l.qty,
+            unitPriceGbp: l.qty > 0 ? l.totalGbp / l.qty : 0,
+            totalGbp: l.totalGbp,
+          })),
+        },
+      },
+    })
+
+    // Return stock if warehouse specified
+    if (returnWarehouseId) {
+      for (const l of refundLines) {
+        if (!l.productId) continue
+        await db.stockMovement.create({
+          data: {
+            type: 'RETURN_INBOUND',
+            productId: l.productId,
+            toWarehouseId: returnWarehouseId,
+            qty: l.qty,
+            note: `Refund return`,
+            referenceType: 'SalesOrder',
+            referenceId: orderId,
+          },
+        })
+        await db.stockLevel.upsert({
+          where: { productId_warehouseId: { productId: l.productId, warehouseId: returnWarehouseId } },
+          create: { productId: l.productId, warehouseId: returnWarehouseId, quantity: l.qty, reservedQty: 0 },
+          update: { quantity: { increment: l.qty } },
+        })
+      }
+    }
+
+    // Update order status
+    const allRefunded = totalGbp >= Number(so.fxRateToGbp) // simplified check
+    await db.salesOrder.update({
+      where: { id: orderId },
+      data: { status: refundLines.length > 0 ? 'PARTIALLY_REFUNDED' : so.status },
+    })
+
+    revalidatePath('/sales')
+    revalidatePath(`/sales/${orderId}`)
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Clone, Delete, Mark Paid, Update Notes
+// ---------------------------------------------------------------------------
+
+export async function cloneSalesOrder(id: string): Promise<{ success: boolean; newId?: string; error?: string }> {
+  try {
+    const so = await db.salesOrder.findUnique({
+      where: { id },
+      include: { lines: true },
+    })
+    if (!so) return { success: false, error: 'Order not found' }
+
+    const ref = `SO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
+    const clone = await db.salesOrder.create({
+      data: {
+        wcOrderNumber: ref,
+        status: 'PENDING',
+        currency: so.currency,
+        fxRateToGbp: so.fxRateToGbp,
+        customerId: so.customerId,
+        customerName: so.customerName,
+        customerEmail: so.customerEmail,
+        billingAddress: so.billingAddress ?? undefined,
+        shippingAddress: so.shippingAddress ?? undefined,
+        subtotalForeign: so.subtotalForeign,
+        shippingService: so.shippingService,
+        shippingForeign: so.shippingForeign,
+        taxForeign: so.taxForeign,
+        totalForeign: so.totalForeign,
+        subtotalGbp: so.subtotalGbp,
+        shippingGbp: so.shippingGbp,
+        taxGbp: so.taxGbp,
+        totalGbp: so.totalGbp,
+        shipFromWarehouseId: so.shipFromWarehouseId,
+        salesRep: so.salesRep,
+        discountStr: so.discountStr,
+        discountAmount: so.discountAmount,
+        notes: so.notes,
+        internalNotes: so.internalNotes,
+        lines: {
+          create: so.lines.map((l) => ({
+            productId: l.productId,
+            sku: l.sku,
+            description: l.description,
+            qty: l.qty,
+            unitPriceForeign: l.unitPriceForeign,
+            unitPriceGbp: l.unitPriceGbp,
+            discountStr: l.discountStr,
+            discountAmount: l.discountAmount,
+            taxForeign: l.taxForeign,
+            taxGbp: l.taxGbp,
+            totalForeign: l.totalForeign,
+            totalGbp: l.totalGbp,
+          })),
+        },
+      },
+    })
+
+    revalidatePath('/sales')
+    return { success: true, newId: clone.id }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+export async function deleteSalesOrder(id: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    const so = await db.salesOrder.findUnique({ where: { id }, select: { status: true, shipFromWarehouseId: true, lines: { select: { productId: true, qty: true } } } })
+    if (!so) return { success: false, error: 'Order not found' }
+    if (so.status !== 'PENDING') return { success: false, error: 'Only pending orders can be deleted' }
+
+    // Release reserved stock
+    if (so.shipFromWarehouseId) {
+      for (const line of so.lines) {
+        if (!line.productId) continue
+        await db.stockLevel.updateMany({
+          where: { productId: line.productId, warehouseId: so.shipFromWarehouseId },
+          data: { reservedQty: { decrement: Number(line.qty) } },
+        })
+      }
+    }
+
+    await db.salesOrderLine.deleteMany({ where: { orderId: id } })
+    await db.salesOrder.delete({ where: { id } })
+    revalidatePath('/sales')
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+export async function markSalesOrderPaid(id: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    const so = await db.salesOrder.findUnique({ where: { id }, select: { paidAt: true } })
+    if (!so) return { success: false, error: 'Order not found' }
+
+    await db.salesOrder.update({
+      where: { id },
+      data: { paidAt: so.paidAt ? null : new Date() }, // toggle
+    })
+
+    // Check if invoice should be auto-generated
+    const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
+    if (trigger?.value === 'on_paid' && !so.paidAt) {
+      await generateInvoiceNumber(id)
+    }
+
+    revalidatePath('/sales')
+    revalidatePath(`/sales/${id}`)
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+export async function updateSalesOrderNotes(
+  id: string,
+  notes: string,
+  internalNotes: string,
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    await db.salesOrder.update({
+      where: { id },
+      data: { notes: notes || null, internalNotes: internalNotes || null },
+    })
+    revalidatePath(`/sales/${id}`)
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+export async function generateInvoiceNumber(id: string): Promise<{ success: boolean; invoiceNumber?: string; error?: string }> {
+  try {
+    const so = await db.salesOrder.findUnique({ where: { id }, select: { invoiceNumber: true } })
+    if (!so) return { success: false, error: 'Order not found' }
+    if (so.invoiceNumber) return { success: true, invoiceNumber: so.invoiceNumber }
+
+    const count = await db.salesOrder.count({ where: { invoiceNumber: { not: null } } })
+    const num = `INV-${new Date().getFullYear()}-${String(count + 1).padStart(5, '0')}`
+    await db.salesOrder.update({ where: { id }, data: { invoiceNumber: num, invoicedAt: new Date() } })
+    revalidatePath(`/sales/${id}`)
+    return { success: true, invoiceNumber: num }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Payments
+// ---------------------------------------------------------------------------
+
+export type PaymentRow = {
+  id: string
+  refundId: string | null
+  creditNoteNumber: string | null
+  amount: number
+  currency: string
+  method: string | null
+  reference: string | null
+  notes: string | null
+  paidAt: string
+}
+
+export async function addPayment(input: {
+  orderId: string
+  refundId?: string
+  amount: number
+  currency: string
+  method?: string
+  reference?: string
+  notes?: string
+  paidAt?: string
+}): Promise<{ success: boolean; error?: string }> {
+  try {
+    await db.payment.create({
+      data: {
+        orderId: input.orderId,
+        refundId: input.refundId || null,
+        amount: input.amount,
+        currency: input.currency,
+        method: input.method || null,
+        reference: input.reference || null,
+        notes: input.notes || null,
+        paidAt: input.paidAt ? new Date(input.paidAt) : new Date(),
+      },
+    })
+
+    // Auto-set paidAt on the order if invoice total is fully paid
+    const so = await db.salesOrder.findUnique({
+      where: { id: input.orderId },
+      select: { totalGbp: true, paidAt: true },
+    })
+    if (so && !so.paidAt) {
+      const payments = await db.payment.findMany({
+        where: { orderId: input.orderId, refundId: null },
+        select: { amount: true },
+      })
+      const totalPaid = payments.reduce((s, p) => s + Number(p.amount), 0)
+      if (totalPaid >= Number(so.totalGbp)) {
+        await db.salesOrder.update({ where: { id: input.orderId }, data: { paidAt: new Date() } })
+
+        // Auto-generate invoice if trigger is on_paid
+        const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
+        if (trigger?.value === 'on_paid') {
+          await generateInvoiceNumber(input.orderId)
+        }
+      }
+    }
+
+    revalidatePath(`/sales/${input.orderId}`)
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+export async function deletePayment(paymentId: string, orderId: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    await db.payment.delete({ where: { id: paymentId } })
+    revalidatePath(`/sales/${orderId}`)
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}

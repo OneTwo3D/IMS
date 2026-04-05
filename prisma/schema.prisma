@@ -2,8 +2,9 @@
 // Prisma 7 · PostgreSQL · All modules
 
 generator client {
-  provider = "prisma-client"
-  output   = "../app/generated/prisma"
+  provider        = "prisma-client"
+  output          = "../app/generated/prisma"
+  previewFeatures = ["driverAdapters"]
 }
 
 datasource db {
@@ -23,9 +24,11 @@ enum UserRole {
 
 enum ProductType {
   SIMPLE
-  VARIABLE // parent — not stockable itself
-  VARIANT  // child of a VARIABLE parent
-  KIT      // virtual bundle (no physical assembly)
+  VARIABLE      // parent — not stockable itself
+  VARIANT       // child of a VARIABLE parent
+  KIT           // virtual bundle — stock calculated from components, deducted on sale
+  BOM           // manufactured product — stock only exists after production run
+  NON_INVENTORY // service / fee — unlimited, not tracked
 }
 
 enum WarehouseType {
@@ -88,7 +91,7 @@ enum SalesOrderStatus {
 enum StockTransferStatus {
   DRAFT
   IN_TRANSIT
-  COMPLETED
+  RECEIVED
   CANCELLED
 }
 
@@ -109,6 +112,7 @@ enum ProductionOrderStatus {
 enum XeroSyncType {
   PURCHASE_INVOICE
   COGS_JOURNAL
+  INVENTORY_ADJUSTMENT
 }
 
 enum XeroSyncStatus {
@@ -227,6 +231,19 @@ model Setting {
   @@map("settings")
 }
 
+/// Configurable reasons for stock adjustments, each optionally linked to a Xero account
+model AdjustmentReason {
+  id              String   @id @default(cuid())
+  name            String
+  xeroAccountCode String?
+  sortOrder       Int      @default(0)
+  active          Boolean  @default(true)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@map("adjustment_reasons")
+}
+
 // ---------------------------------------------------------------------------
 // CURRENCIES & FX
 // ---------------------------------------------------------------------------
@@ -266,6 +283,8 @@ model TaxRate {
   name        String   // e.g. "UK Standard Rate"
   rate        Decimal  @db.Decimal(5, 4) // e.g. 0.2000 for 20%
   type        TaxType  @default(VAT)
+  usedFor     String   @default("BOTH") // SALES, PURCHASE, BOTH
+  xeroTaxType String?  // Xero tax type code e.g. "OUTPUT2", "INPUT2"
   countryCode String?  // ISO 3166-1 alpha-2, null = applies globally
   active      Boolean  @default(true)
   isDefault   Boolean  @default(false)
@@ -311,6 +330,7 @@ model Warehouse {
   productionOrders      ProductionOrder[]
   orderShipments        SalesOrder[]    @relation("ShipFromWarehouse")
   refundReturns         SalesOrderRefund[]
+  incomingPurchaseOrders PurchaseOrder[] @relation("PODestinationWarehouse")
 
   @@map("warehouses")
 }
@@ -330,13 +350,22 @@ model Product {
   weight          Decimal?    @db.Decimal(10, 4) // kg, for landed cost by weight
   active          Boolean     @default(true)
 
-  // WooCommerce mapping
-  wcProductId     Int?        // WC product ID (on parent for VARIABLE, on SIMPLE)
-  wcVariantId     Int?        // WC variation ID (on VARIANT only)
+  // Dimensions (cm)
+  widthCm         Decimal?    @db.Decimal(10, 2)
+  heightCm        Decimal?    @db.Decimal(10, 2)
+  depthCm         Decimal?    @db.Decimal(10, 2)
 
-  // Pricing (GBP sales price)
-  salesPriceGbp   Decimal?    @db.Decimal(12, 4)
+  // Media
+  imageUrl        String?     // primary image URL (can be imported from WooCommerce)
+
+  // Pricing (GBP)
+  salesPriceGbp   Decimal?    @db.Decimal(12, 4)   // regular / list price
+  salePriceGbp    Decimal?    @db.Decimal(12, 4)   // sale / discounted price
   salesPriceTaxInclusive Boolean @default(false)
+
+  // Stock behaviour
+  stockUnit       String      @default("pcs")       // display unit for stock levels, e.g. "pcs", "m", "kg"
+  oversellAllowed Boolean     @default(true)        // continue selling when out of stock
 
   createdAt       DateTime    @default(now())
   updatedAt       DateTime    @updatedAt
@@ -355,6 +384,8 @@ model Product {
   salesOrderLines SalesOrderLine[]
   returnLines     SalesOrderRefundLine[]
 
+  options         ProductOption[]
+
   // BOM (this product is the finished good)
   bomAsParent     BomItem[]   @relation("BomParent")
   // BOM (this product is a component)
@@ -363,16 +394,45 @@ model Product {
   // Kit items (this product is the kit)
   kitItems        KitItem[]   @relation("KitParent")
   // Kit items (this product is a component)
-  kitComponents   KitItem[]   @relation("KitComponent")
+  kitItemsAsComponent KitItem[] @relation("KitItemComponent")
+
+  // Product components: direct component list for KIT / BOM products
+  productComponents     ProductComponent[] @relation("ProductHasComponents")
+  usedAsComponentIn     ProductComponent[] @relation("ProductUsedAsComponent")
 
   productionOrdersAsOutput ProductionOrder[]
 
   wcSyncLogs      WcSyncLog[]
 
   @@index([parentId])
-  @@index([wcProductId])
-  @@index([wcVariantId])
   @@map("products")
+}
+
+model ProductOption {
+  id        String   @id @default(cuid())
+  productId String
+  name      String   // e.g. "Color", "Size"
+  values    String   // comma-separated: "Red,Blue,Green"
+  sortOrder Int      @default(0)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+  @@map("product_options")
+}
+
+/// Component list for KIT (virtual bundle) and BOM (manufactured) products
+model ProductComponent {
+  id            String   @id @default(cuid())
+  productId     String   // the KIT or BOM product
+  componentId   String   // component product
+  qty           Decimal  @db.Decimal(12, 4)
+  sortOrder     Int      @default(0)
+
+  product       Product  @relation("ProductHasComponents", fields: [productId], references: [id], onDelete: Cascade)
+  component     Product  @relation("ProductUsedAsComponent", fields: [componentId], references: [id])
+
+  @@unique([productId, componentId])
+  @@map("product_components")
 }
 
 // ---------------------------------------------------------------------------
@@ -521,6 +581,8 @@ model PurchaseOrder {
   fxRateToGbp     Decimal             @db.Decimal(18, 8) // rate at time of creation
   subtotalForeign Decimal             @db.Decimal(18, 4)
   subtotalGbp     Decimal             @db.Decimal(18, 4)
+  taxRateName     String?             // e.g. "UK Standard Rate"
+  taxRatePercent  Decimal?            @db.Decimal(5, 4) // e.g. 0.2000
   taxForeign      Decimal             @db.Decimal(18, 4) @default(0)
   taxGbp          Decimal             @db.Decimal(18, 4) @default(0)
   totalForeign    Decimal             @db.Decimal(18, 4)
@@ -531,6 +593,8 @@ model PurchaseOrder {
   directFreightGbp     Decimal        @db.Decimal(18, 4) @default(0)
 
   landedCostMethod LandedCostMethod  @default(BY_VALUE)
+
+  destinationWarehouseId String?    // where goods will be received (can change before receipt)
 
   notes           String?
   internalNotes   String?
@@ -546,7 +610,8 @@ model PurchaseOrder {
   createdAt       DateTime           @default(now())
   updatedAt       DateTime           @updatedAt
 
-  supplier        Supplier           @relation(fields: [supplierId], references: [id])
+  supplier             Supplier   @relation(fields: [supplierId], references: [id])
+  destinationWarehouse Warehouse? @relation("PODestinationWarehouse", fields: [destinationWarehouseId], references: [id])
   lines           PurchaseOrderLine[]
   receipts        PurchaseReceipt[]
   invoices        PurchaseInvoice[]
@@ -556,6 +621,7 @@ model PurchaseOrder {
   landedCostLinks LandedCostLink[]   @relation("PrimaryPO")
   // This PO as freight/secondary
   asFreightFor    LandedCostLink[]   @relation("FreightPO")
+  freightCostLines FreightCostLine[]
 
   xeroSyncLogs    XeroSyncLog[]
 
@@ -567,8 +633,10 @@ model PurchaseOrderLine {
   poId            String
   productId       String
   description     String?   // override product name if needed
-  qty             Decimal   @db.Decimal(12, 4)
-  unitCostForeign Decimal   @db.Decimal(18, 6)
+  qty             Decimal   @db.Decimal(12, 4) // always in stock units
+  purchaseUnitId  String?
+  purchaseUnitQty Decimal?  @db.Decimal(12, 4) // qty in purchase units (e.g. 2 boxes)
+  unitCostForeign Decimal   @db.Decimal(18, 6)  // cost per purchase unit (or per stock unit if no unit)
   unitCostGbp     Decimal   @db.Decimal(18, 6)
   taxRateId       String?
   taxForeign      Decimal   @db.Decimal(18, 4) @default(0)
@@ -582,12 +650,30 @@ model PurchaseOrderLine {
 
   po              PurchaseOrder    @relation(fields: [poId], references: [id])
   product         Product          @relation(fields: [productId], references: [id])
+  purchaseUnit    PurchaseUnit?    @relation(fields: [purchaseUnitId], references: [id])
   taxRate         TaxRate?         @relation(fields: [taxRateId], references: [id])
   receiptLines    PurchaseReceiptLine[]
   returnLines     PurchaseReturnLine[]
+  invoiceLines    PurchaseInvoiceLine[]
   costLayers      CostLayer[]
 
   @@map("purchase_order_lines")
+}
+
+/// Purchase units — conversion from purchase packaging to stock units
+model PurchaseUnit {
+  id               String   @id @default(cuid())
+  name             String   // e.g. "Box of 100", "Roll (1km)", "Pallet of 48"
+  abbreviation     String   // e.g. "box", "roll", "plt"
+  conversionFactor Decimal  @db.Decimal(12, 4) // 1 purchase unit = X stock units
+  stockUnitName    String   @default("pcs") // what each stock unit is called, e.g. "m", "pcs", "sheets"
+  active           Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  poLines          PurchaseOrderLine[]
+
+  @@map("purchase_units")
 }
 
 /// Links a freight/secondary PO to a primary goods PO for landed cost distribution
@@ -604,6 +690,22 @@ model LandedCostLink {
 
   @@unique([primaryPoId, freightPoId])
   @@map("landed_cost_links")
+}
+
+/// Individual cost line items on a FREIGHT-type PO
+model FreightCostLine {
+  id                 String           @id @default(cuid())
+  poId               String
+  description        String
+  amountForeign      Decimal          @db.Decimal(18, 4)
+  amountGbp          Decimal          @db.Decimal(18, 4)
+  vatable            Boolean          @default(false)
+  distributionMethod LandedCostMethod @default(BY_VALUE)
+  sortOrder          Int              @default(0)
+
+  po                 PurchaseOrder    @relation(fields: [poId], references: [id])
+
+  @@map("freight_cost_lines")
 }
 
 model PurchaseReceipt {
@@ -639,17 +741,38 @@ model PurchaseInvoice {
   invoiceNumber   String?
   invoiceDate     DateTime
   dueDate         DateTime?
+  subtotalForeign Decimal   @db.Decimal(18, 4) @default(0)
+  subtotalGbp     Decimal   @db.Decimal(18, 4) @default(0)
+  taxForeign      Decimal   @db.Decimal(18, 4) @default(0)
+  taxGbp          Decimal   @db.Decimal(18, 4) @default(0)
   totalForeign    Decimal   @db.Decimal(18, 4)
   totalGbp        Decimal   @db.Decimal(18, 4)
   fxRateToGbp     Decimal   @db.Decimal(18, 8)
   notes           String?
+  supplierInvoiceUrl String? // path to uploaded supplier PDF
   xeroInvoiceId   String?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
   po              PurchaseOrder @relation(fields: [poId], references: [id])
+  lines           PurchaseInvoiceLine[]
 
   @@map("purchase_invoices")
+}
+
+model PurchaseInvoiceLine {
+  id              String    @id @default(cuid())
+  invoiceId       String
+  poLineId        String
+  qtyBilled       Decimal   @db.Decimal(12, 4)
+  unitCostForeign Decimal   @db.Decimal(18, 6)
+  totalForeign    Decimal   @db.Decimal(18, 4)
+  totalGbp        Decimal   @db.Decimal(18, 4)
+
+  invoice         PurchaseInvoice   @relation(fields: [invoiceId], references: [id])
+  poLine          PurchaseOrderLine @relation(fields: [poLineId], references: [id])
+
+  @@map("purchase_invoice_lines")
 }
 
 model PurchaseReturn {
@@ -681,6 +804,30 @@ model PurchaseReturnLine {
 }
 
 // ---------------------------------------------------------------------------
+// CUSTOMERS
+// ---------------------------------------------------------------------------
+
+model Customer {
+  id              String    @id @default(cuid())
+  firstName       String
+  lastName        String
+  email           String?
+  phone           String?
+  company         String?
+  taxNumber       String?   // VAT / tax ID
+  billingAddress  Json?     // { line1, line2, city, county, postcode, country }
+  shippingAddress Json?     // { line1, line2, city, county, postcode, country }
+  notes           String?
+  wcCustomerId    Int?      @unique // WooCommerce customer ID
+  active          Boolean   @default(true)
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  salesOrders     SalesOrder[]
+
+  @@map("customers")
+}
+
 // SALES ORDERS
 // ---------------------------------------------------------------------------
 
@@ -693,6 +840,7 @@ model SalesOrder {
   fxRateToGbp       Decimal          @db.Decimal(18, 8) @default(1)
 
   // Customer
+  customerId        String?
   customerName      String?
   customerEmail     String?
   billingAddress    Json?
@@ -700,7 +848,10 @@ model SalesOrder {
 
   // Totals (in order currency)
   subtotalForeign   Decimal          @db.Decimal(18, 4)
+  shippingService   String?          // e.g. "Royal Mail", "DPD Next Day"
   shippingForeign   Decimal          @db.Decimal(18, 4) @default(0)
+  taxRateName       String?          // e.g. "UK Standard Rate"
+  taxRatePercent    Decimal?         @db.Decimal(5, 4) // e.g. 0.2000
   taxForeign        Decimal          @db.Decimal(18, 4) @default(0)
   totalForeign      Decimal          @db.Decimal(18, 4)
 
@@ -712,19 +863,28 @@ model SalesOrder {
 
   // Fulfilment
   shipFromWarehouseId String?
+  expectedDelivery  DateTime?
+  salesRep          String?
   shippedAt         DateTime?
   trackingNumber    String?
-  notes             String?
-  internalNotes     String?
+  discountStr       String?    // order-level discount input e.g. "10%" or "5.00"
+  discountAmount    Decimal    @db.Decimal(18, 4) @default(0) // computed order discount in foreign currency
+  invoiceNumber     String?    // generated invoice reference
+  invoicedAt        DateTime?
+  paidAt            DateTime?
+  notes             String?     // customer-visible notes
+  internalNotes     String?     // private/staff notes
 
   wcCreatedAt       DateTime?        // order date in WooCommerce
   wcUpdatedAt       DateTime?
   createdAt         DateTime         @default(now())
   updatedAt         DateTime         @updatedAt
 
+  customer          Customer?        @relation(fields: [customerId], references: [id])
   shipFromWarehouse Warehouse?       @relation("ShipFromWarehouse", fields: [shipFromWarehouseId], references: [id])
   lines             SalesOrderLine[]
   refunds           SalesOrderRefund[]
+  payments          Payment[]
   wcSyncLogs        WcSyncLog[]
 
   @@index([wcOrderId])
@@ -740,8 +900,10 @@ model SalesOrderLine {
   description     String
   sku             String?
   qty             Decimal    @db.Decimal(12, 4)
-  unitPriceForeign Decimal   @db.Decimal(18, 6)
+  unitPriceForeign Decimal   @db.Decimal(18, 6)  // original price before discount
   unitPriceGbp    Decimal    @db.Decimal(18, 6)
+  discountStr     String?    // e.g. "5%" or "2.50" — original user input
+  discountAmount  Decimal    @db.Decimal(18, 4) @default(0) // computed line discount amount in foreign currency
   taxRateId       String?
   taxForeign      Decimal    @db.Decimal(18, 4) @default(0)
   taxGbp          Decimal    @db.Decimal(18, 4) @default(0)
@@ -759,6 +921,7 @@ model SalesOrderLine {
 model SalesOrderRefund {
   id              String     @id @default(cuid())
   orderId         String
+  creditNoteNumber String?   // e.g. "CN-2025-00001"
   wcRefundId      Int?
   returnWarehouseId String?
   reason          String?
@@ -770,6 +933,7 @@ model SalesOrderRefund {
   order           SalesOrder @relation(fields: [orderId], references: [id])
   returnWarehouse Warehouse? @relation(fields: [returnWarehouseId], references: [id])
   lines           SalesOrderRefundLine[]
+  payments        Payment[]
 
   @@map("sales_order_refunds")
 }
@@ -787,6 +951,25 @@ model SalesOrderRefundLine {
   product         Product?         @relation(fields: [productId], references: [id])
 
   @@map("sales_order_refund_lines")
+}
+
+/// Payments recorded against sales orders (invoices) or credit notes (refunds)
+model Payment {
+  id              String    @id @default(cuid())
+  orderId         String
+  refundId        String?   // null = payment against invoice, set = payment against credit note
+  amount          Decimal   @db.Decimal(18, 4) // positive for receipts, negative for credit note payments
+  currency        String    @default("GBP")
+  method          String?   // e.g. "Bank Transfer", "Card", "Cash", "PayPal"
+  reference       String?   // payment ref / transaction ID
+  notes           String?
+  paidAt          DateTime  @default(now())
+  createdAt       DateTime  @default(now())
+
+  order           SalesOrder       @relation(fields: [orderId], references: [id])
+  refund          SalesOrderRefund? @relation(fields: [refundId], references: [id])
+
+  @@map("payments")
 }
 
 // ---------------------------------------------------------------------------
@@ -817,6 +1000,7 @@ model StockTransferLine {
   transferId  String
   productId   String        // stored directly (no FK to Product to allow orphaned lines in audit)
   sku         String
+  productName String        @default("")
   qty         Decimal       @db.Decimal(12, 4)
   qtyReceived Decimal       @db.Decimal(12, 4) @default(0)
 
@@ -916,7 +1100,7 @@ model KitItem {
 
   kit             Kit     @relation(fields: [kitId], references: [id])
   parentProduct   Product @relation("KitParent", fields: [parentProductId], references: [id])
-  component       Product @relation("KitComponent", fields: [componentProductId], references: [id])
+  component       Product @relation("KitItemComponent", fields: [componentProductId], references: [id])
 
   @@map("kit_items")
 }

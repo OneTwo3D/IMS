@@ -178,10 +178,6 @@ prompt XERO_CLIENT_ID     "Xero client ID"     ""
 prompt XERO_CLIENT_SECRET "Xero client secret" "" "secret"
 
 echo ""
-info "--- FX Rates ---"
-prompt FX_API_KEY "exchangerate-api.com API key" ""
-
-echo ""
 info "--- SMTP ---"
 prompt SMTP_HOST       "SMTP host"           "smtp.yourprovider.com"
 prompt SMTP_PORT       "SMTP port"           "587"
@@ -291,6 +287,7 @@ fi
 
 mkdir -p "${DATA_DIR}" "${LOG_DIR}" \
   "${DATA_DIR}/xero" \
+  "${APP_DIR}/uploads/invoices" \
   /tmp/${APP_NAME}/pdf \
   /tmp/${APP_NAME}/uploads
 
@@ -361,9 +358,8 @@ XERO_CLIENT_SECRET=${XERO_CLIENT_SECRET}
 XERO_TENANT_ID=
 XERO_TOKEN_PATH=${DATA_DIR}/xero/token.json
 
-FX_API_KEY=${FX_API_KEY}
 FX_BASE_CURRENCY=GBP
-FX_REFRESH_CRON=0 * * * *
+# FX rates are fetched daily via cron (see crontab for ${APP_USER}), using frankfurter.dev (no API key needed)
 
 SMTP_HOST=${SMTP_HOST}
 SMTP_PORT=${SMTP_PORT}
@@ -433,23 +429,6 @@ module.exports = {
       merge_logs: true,
       time: true,
     },
-    {
-      name: '${APP_NAME}-worker',
-      cwd: '${APP_DIR}',
-      script: 'workers/index.js',
-      user: '${APP_USER}',
-      env_file: '${APP_DIR}/.env',
-      instances: 1,
-      exec_mode: 'fork',
-      autorestart: true,
-      watch: false,
-      max_memory_restart: '512M',
-      log_file: '${LOG_DIR}/worker.log',
-      error_file: '${LOG_DIR}/worker-error.log',
-      out_file: '${LOG_DIR}/worker-out.log',
-      merge_logs: true,
-      time: true,
-    },
   ],
 };
 EOF
@@ -458,7 +437,6 @@ chown "${APP_USER}:${APP_USER}" "${APP_DIR}/ecosystem.config.js"
 
 # Start (or restart) via PM2
 pm2 delete "${APP_NAME}" 2>/dev/null || true
-pm2 delete "${APP_NAME}-worker" 2>/dev/null || true
 pm2 start "${APP_DIR}/ecosystem.config.js"
 pm2 save
 
@@ -585,7 +563,14 @@ EOF
 success "Log rotation configured."
 
 # ---------------------------------------------------------------------------
-# 13. Firewall hints (ufw)
+# 13. FX rate cron
+# ---------------------------------------------------------------------------
+header "Setting up FX rate cron"
+(crontab -u "${APP_USER}" -l 2>/dev/null || true; echo "0 6 * * * curl -fsS http://localhost:${APP_PORT}/api/cron/fx-rates > /dev/null 2>&1") | sort -u | crontab -u "${APP_USER}" -
+success "Daily FX rate fetch cron added (06:00)."
+
+# ---------------------------------------------------------------------------
+# 14. Firewall hints (ufw)
 # ---------------------------------------------------------------------------
 if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
   header "Firewall"
@@ -595,7 +580,7 @@ if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
 fi
 
 # ---------------------------------------------------------------------------
-# 14. Post-install summary
+# 15. Post-install summary
 # ---------------------------------------------------------------------------
 header "Installation complete!"
 
