@@ -112,4 +112,4 @@ scripts/
 
 ## License
 
-Proprietary — OneTwo3D Ltd.
+Proprietary — One Two Enterprises Ltd (trading as OneTwo3D).
