@@ -1,5 +1,5 @@
 import type { Metadata } from 'next'
-import { SlidersHorizontal, Coins, Ship, Receipt, PackageOpen, FileText } from 'lucide-react'
+import { SlidersHorizontal, Coins, Ship, Receipt, PackageOpen, FileText, RotateCcw } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { getAdjustmentReasons, getSetting, getTaxRates, getPurchaseUnits } from '@/app/actions/settings'
 import { getCurrencies } from '@/app/actions/currencies'
@@ -9,6 +9,7 @@ import { LandedCostMethodSetting } from '@/components/settings/landed-cost-metho
 import { TaxRatesTable } from '@/components/settings/tax-rates-table'
 import { PurchaseUnitsTable } from '@/components/settings/purchase-units-table'
 import { InvoiceTriggerSetting } from '@/components/settings/invoice-trigger'
+import { DatabaseReset } from '@/components/settings/database-reset'
 
 export const metadata: Metadata = { title: 'Settings' }
 
@@ -109,6 +110,19 @@ export default async function SettingsPage() {
           instead of the default inventory adjustment account.
         </p>
         <AdjustmentReasonsTable reasons={reasons} />
+      </Card>
+
+      {/* Database Reset */}
+      <Card className="p-6 border-destructive/30">
+        <div className="flex items-center gap-2 mb-4">
+          <RotateCcw className="h-4 w-4 text-destructive" />
+          <h2 className="text-base font-semibold text-destructive">Database Reset</h2>
+        </div>
+        <p className="text-sm text-muted-foreground mb-4">
+          Reset parts of the database. This is useful for clearing test data before going live,
+          or for starting fresh. User accounts are always preserved.
+        </p>
+        <DatabaseReset />
       </Card>
     </div>
   )
