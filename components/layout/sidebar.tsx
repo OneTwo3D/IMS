@@ -43,10 +43,14 @@ const SALES_CHILDREN = [
   { href: '/sales/contacts', label: 'Customers' },
 ]
 
+const ANALYTICS_CHILDREN = [
+  { href: '/analytics/sales-stats', label: 'Sales Statistics' },
+  { href: '/analytics/forecast',    label: 'Reorder Forecast' },
+]
+
 const NAV_ITEMS_BOTTOM = [
   { href: '/manufacturing',   label: 'Manufacturing',    icon: Factory },
   { href: '/sync',            label: 'Sync',             icon: RefreshCw },
-  { href: '/analytics',       label: 'Analytics',        icon: BarChart3 },
   { href: '/activity',        label: 'Activity',         icon: ActivitySquare },
   { href: '/settings',        label: 'Settings',         icon: Settings },
   { href: '/help',            label: 'Help',             icon: HelpCircle },
@@ -93,6 +97,12 @@ export function Sidebar() {
           label="Sales"
           icon={TrendingUp}
           children={SALES_CHILDREN}
+          collapsed={collapsed}
+        />
+        <NavGroup
+          label="Analytics"
+          icon={BarChart3}
+          children={ANALYTICS_CHILDREN}
           collapsed={collapsed}
         />
         {NAV_ITEMS_BOTTOM.map((item) => (
