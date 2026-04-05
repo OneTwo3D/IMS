@@ -138,8 +138,30 @@ export async function importProductsCsv(formData: FormData): Promise<ImportResul
     }
 
     if (components.length > 0) {
+      // Check for self-reference
+      if (components.some((c) => c.componentId === productId)) {
+        result.errors.push(`Row ${cr.lineNum}: ${cr.sku} cannot be a component of itself`)
+        continue
+      }
+
+      // Check for circular references via BFS
+      let hasCycle = false
+      const visited = new Set<string>()
+      const queue = components.map((c) => c.componentId)
+      while (queue.length > 0) {
+        const current = queue.shift()!
+        if (current === productId) { hasCycle = true; break }
+        if (visited.has(current)) continue
+        visited.add(current)
+        const children = await db.productComponent.findMany({ where: { productId: current }, select: { componentId: true } })
+        for (const child of children) queue.push(child.componentId)
+      }
+      if (hasCycle) {
+        result.errors.push(`Row ${cr.lineNum}: circular BOM reference detected for ${cr.sku}`)
+        continue
+      }
+
       try {
-        // Delete existing components and recreate
         await db.productComponent.deleteMany({ where: { productId } })
         await db.productComponent.createMany({
           data: components.map((c, i) => ({
