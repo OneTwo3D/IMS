@@ -1,12 +1,14 @@
 import type { Metadata } from 'next'
+import { generateForecasts, getForecastSettings } from '@/app/actions/forecasting'
+import { ForecastClient } from './forecast-client'
 
-export const metadata: Metadata = { title: 'Analytics' }
+export const metadata: Metadata = { title: 'Analytics — Reorder Forecast' }
 
-export default function Page() {
-  return (
-    <div>
-      <h1 className="text-2xl font-semibold capitalize">analytics</h1>
-      <p className="mt-2 text-muted-foreground">This module is under construction.</p>
-    </div>
-  )
+export default async function AnalyticsPage() {
+  const [forecasts, settings] = await Promise.all([
+    generateForecasts(),
+    getForecastSettings(),
+  ])
+
+  return <ForecastClient forecasts={forecasts} settings={settings} />
 }
