@@ -48,8 +48,8 @@ export function HelpClient({ doc, allDocs }: Props) {
           prose-h3:text-base prose-h3:mt-6 prose-h3:mb-2
           prose-p:text-sm prose-p:leading-relaxed
           prose-li:text-sm
-          prose-code:text-xs prose-code:bg-muted prose-code:px-1 prose-code:py-0.5 prose-code:rounded
-          prose-pre:bg-muted prose-pre:text-xs
+          prose-code:text-xs prose-code:bg-zinc-900 prose-code:text-zinc-100 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded dark:prose-code:bg-zinc-800 dark:prose-code:text-zinc-200
+          prose-pre:bg-zinc-900 prose-pre:text-zinc-100 prose-pre:text-xs prose-pre:rounded-lg prose-pre:p-4 dark:prose-pre:bg-zinc-800 dark:prose-pre:text-zinc-200
           prose-table:text-sm
           prose-th:text-left prose-th:px-3 prose-th:py-2 prose-th:bg-muted/50 prose-th:font-medium prose-th:text-muted-foreground
           prose-td:px-3 prose-td:py-2 prose-td:border-t
