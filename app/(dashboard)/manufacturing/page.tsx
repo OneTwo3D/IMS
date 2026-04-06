@@ -1,12 +1,11 @@
 import type { Metadata } from 'next'
+import { getManufacturingOrders } from '@/app/actions/manufacturing'
+import { ManufacturingClient } from './manufacturing-client'
 
 export const metadata: Metadata = { title: 'Manufacturing' }
 
-export default function Page() {
-  return (
-    <div>
-      <h1 className="text-2xl font-semibold capitalize">manufacturing</h1>
-      <p className="mt-2 text-muted-foreground">This module is under construction.</p>
-    </div>
-  )
+export default async function ManufacturingPage() {
+  const { rows, total } = await getManufacturingOrders({ page: 1, pageSize: 50 })
+
+  return <ManufacturingClient initialRows={rows} initialTotal={total} />
 }

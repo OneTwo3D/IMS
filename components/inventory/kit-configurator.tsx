@@ -1,11 +1,10 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
-import { Plus, Trash2, Save } from 'lucide-react'
+import { Plus, Trash2, Save, Search, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Select } from '@/components/ui/select'
 import { saveProductComponents, type ProductComponentRow } from '@/app/actions/products'
 
 type SimpleProduct = { id: string; sku: string; name: string }
@@ -35,9 +34,8 @@ export function KitConfigurator({ productId, productType, initialComponents, all
   const [message, setMessage] = useState('')
 
   const isBom = productType === 'BOM'
-
-  // Products selectable as components — exclude self
   const options = allProducts.filter((p) => p.id !== productId)
+  const productMap = new Map(allProducts.map((p) => [p.id, p]))
 
   function addLine() {
     setLines((prev) => [...prev, { key: nextKey, componentId: '', qty: '1' }])
@@ -75,6 +73,9 @@ export function KitConfigurator({ productId, productType, initialComponents, all
     ? 'Define which components are consumed when manufacturing this product.'
     : 'Define which components make up this kit. Stock is calculated from component availability.'
 
+  // Already-selected IDs (to prevent duplicates)
+  const selectedIds = new Set(lines.map((l) => l.componentId).filter(Boolean))
+
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">{hint}</p>
@@ -85,25 +86,20 @@ export function KitConfigurator({ productId, productType, initialComponents, all
 
       {lines.length > 0 && (
         <div className="space-y-2">
-          <div className="grid grid-cols-[1fr_20_auto] gap-2 text-xs text-muted-foreground px-1">
+          <div className="grid grid-cols-[1fr_auto_auto] gap-2 text-xs text-muted-foreground px-1">
             <span>Component</span>
-            <span className="w-20 text-center">Qty</span>
+            <span className="w-24 text-center">Qty</span>
             <span className="w-8" />
           </div>
           {lines.map((line) => (
             <div key={line.key} className="grid grid-cols-[1fr_auto_auto] gap-2 items-center">
-              <Select
+              <ComponentSearch
                 value={line.componentId}
-                onChange={(e) => updateLine(line.key, 'componentId', e.target.value)}
-                className="h-8 text-sm"
-              >
-                <option value="">— Select component —</option>
-                {options.map((p) => (
-                  <option key={p.id} value={p.id}>
-                    {p.sku} — {p.name}
-                  </option>
-                ))}
-              </Select>
+                options={options}
+                selectedIds={selectedIds}
+                productMap={productMap}
+                onChange={(id) => updateLine(line.key, 'componentId', id)}
+              />
               <Input
                 type="number"
                 min="0.0001"
@@ -142,6 +138,97 @@ export function KitConfigurator({ productId, productType, initialComponents, all
           </span>
         )}
       </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Inline search component for picking a product
+// ---------------------------------------------------------------------------
+
+function ComponentSearch({
+  value,
+  options,
+  selectedIds,
+  productMap,
+  onChange,
+}: {
+  value: string
+  options: SimpleProduct[]
+  selectedIds: Set<string>
+  productMap: Map<string, SimpleProduct>
+  onChange: (id: string) => void
+}) {
+  const [query, setQuery] = useState('')
+  const [open, setOpen] = useState(false)
+  const ref = useRef<HTMLDivElement>(null)
+
+  // Close on outside click
+  useEffect(() => {
+    if (!open) return
+    function handleClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false)
+    }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [open])
+
+  const selected = value ? productMap.get(value) : null
+
+  const filtered = query
+    ? options.filter((p) => {
+        if (selectedIds.has(p.id) && p.id !== value) return false
+        const q = query.toLowerCase()
+        return p.sku.toLowerCase().includes(q) || p.name.toLowerCase().includes(q)
+      }).slice(0, 15)
+    : []
+
+  if (selected && !open) {
+    return (
+      <div className="flex items-center h-8 rounded-md border px-2 text-sm gap-1">
+        <span className="font-mono text-xs text-muted-foreground">{selected.sku}</span>
+        <span className="truncate flex-1">{selected.name}</span>
+        <button
+          type="button"
+          onClick={() => { onChange(''); setQuery(''); setOpen(true) }}
+          className="shrink-0 text-muted-foreground hover:text-foreground"
+        >
+          <X className="h-3 w-3" />
+        </button>
+      </div>
+    )
+  }
+
+  return (
+    <div className="relative" ref={ref}>
+      <Search className="absolute left-2 top-1/2 -translate-y-1/2 h-3.5 w-3.5 text-muted-foreground" />
+      <Input
+        value={query}
+        onChange={(e) => { setQuery(e.target.value); setOpen(true) }}
+        onFocus={() => { if (query) setOpen(true) }}
+        placeholder="Search SKU or name..."
+        className="h-8 text-sm pl-7"
+        autoFocus={!value}
+      />
+      {open && query && (
+        <div className="absolute z-50 top-full mt-1 left-0 right-0 max-h-48 overflow-y-auto rounded-md border bg-popover shadow-lg">
+          {filtered.length === 0 ? (
+            <p className="px-3 py-2 text-xs text-muted-foreground">No products found.</p>
+          ) : (
+            filtered.map((p) => (
+              <button
+                key={p.id}
+                type="button"
+                onClick={() => { onChange(p.id); setQuery(''); setOpen(false) }}
+                className="flex items-center w-full px-3 py-1.5 text-left hover:bg-muted/50 text-sm gap-2"
+              >
+                <span className="font-mono text-xs text-muted-foreground w-24 shrink-0">{p.sku}</span>
+                <span className="truncate">{p.name}</span>
+              </button>
+            ))
+          )}
+        </div>
+      )}
     </div>
   )
 }

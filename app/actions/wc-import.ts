@@ -2,6 +2,7 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 
 // ---------------------------------------------------------------------------
 // WooCommerce API helper
@@ -164,11 +165,13 @@ export async function importHistoricalWcOrders(
     result.message = `Imported ${result.ordersProcessed} orders, created ${result.movementsCreated} demand records. Skipped ${result.skipped}.`
 
     revalidatePath('/analytics')
+    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.ordersProcessed} historical WC orders` })
     return result
   } catch (e) {
     result.status = 'error'
     result.message = String(e)
     result.errors.push(String(e))
+    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import historical WC orders: ${String(e)}` })
     return result
   }
 }
@@ -229,10 +232,12 @@ export async function importHistoricalSalesCsv(
     result.status = 'done'
     result.message = `Created ${result.movementsCreated} demand records from CSV. Skipped ${result.skipped}.`
     revalidatePath('/analytics')
+    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.movementsCreated} historical sales from CSV` })
     return result
   } catch (e) {
     result.status = 'error'
     result.message = String(e)
+    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import historical sales from CSV: ${String(e)}` })
     return result
   }
 }

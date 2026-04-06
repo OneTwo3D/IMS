@@ -14,6 +14,7 @@ import { DeleteVariantButton } from '@/components/inventory/delete-variant-butto
 import { WcLinkButton } from '@/components/inventory/wc-link-button'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
+import { StockDetailPopup } from '@/components/inventory/stock-detail-popups'
 import type { ProductType } from '@/app/generated/prisma/client'
 
 const TYPE_LABELS: Record<ProductType, string> = {
@@ -57,6 +58,11 @@ export default async function ProductDetailPage({
     product.type === 'KIT' ? getKitStock(id) : Promise.resolve([]),
   ])
 
+  // Check if product is linked to WooCommerce
+  const wcLinked = await db.wcSyncLog.count({
+    where: { entityType: 'Product', entityId: id, status: 'SYNCED' },
+  }) > 0
+
   // For the kit configurator: all stockable products (not self, not VARIABLE, not NON_INVENTORY)
   const allSimpleProducts = isKitOrBom
     ? await db.product.findMany({
@@ -91,7 +97,7 @@ export default async function ProductDetailPage({
             {product.active ? 'Active' : 'Inactive'}
           </Badge>
           <Badge variant="secondary">{TYPE_LABELS[product.type]}</Badge>
-          <WcLinkButton sku={product.sku} />
+          {wcLinked && <WcLinkButton sku={product.sku} />}
           {product.type === 'VARIANT' && (
             <DeleteVariantButton
               variantId={id}
@@ -325,13 +331,21 @@ export default async function ProductDetailPage({
                           {Number(s.quantity).toLocaleString()}
                         </span>
                         <span className={`font-mono text-right text-xs ${Number(s.allocatedQty) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground'}`}>
-                          {Number(s.allocatedQty) > 0 ? Number(s.allocatedQty).toLocaleString() : '—'}
+                          {Number(s.allocatedQty) > 0 ? (
+                            <StockDetailPopup productId={product.id} warehouseId={s.warehouseId} type="allocated">
+                              {Number(s.allocatedQty).toLocaleString()}
+                            </StockDetailPopup>
+                          ) : '—'}
                         </span>
                         <span className={`font-mono text-right text-xs font-medium ${Number(s.availableQty) < 0 ? 'text-destructive' : ''}`}>
                           {Number(s.availableQty).toLocaleString()}
                         </span>
                         <span className={`font-mono text-right text-xs ${incoming > 0 ? 'text-blue-600 dark:text-blue-400 font-medium' : 'text-muted-foreground'}`}>
-                          {incoming > 0 ? `+${incoming.toLocaleString()}` : '—'}
+                          {incoming > 0 ? (
+                            <StockDetailPopup productId={product.id} warehouseId={s.warehouseId} type="incoming">
+                              +{incoming.toLocaleString()}
+                            </StockDetailPopup>
+                          ) : '—'}
                         </span>
                       </div>
                     )

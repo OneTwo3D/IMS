@@ -102,6 +102,11 @@ enum StockCountStatus {
   CANCELLED
 }
 
+enum ProductionOrderType {
+  ASSEMBLY
+  DISASSEMBLY
+}
+
 enum ProductionOrderStatus {
   DRAFT
   IN_PROGRESS
@@ -137,13 +142,24 @@ enum ActivityEntityType {
   PRODUCT
   WAREHOUSE
   SUPPLIER
+  CUSTOMER
   PURCHASE_ORDER
   SALES_ORDER
   STOCK_TRANSFER
   STOCK_COUNT
+  STOCK_ADJUSTMENT
   PRODUCTION_ORDER
   SETTING
   IMPORT
+  SYNC
+  CURRENCY
+  SYSTEM
+}
+
+enum ActivityLogLevel {
+  INFO
+  WARNING
+  ERROR
 }
 
 enum TaxType {
@@ -168,6 +184,7 @@ model User {
   name           String
   passwordHash   String
   role           UserRole  @default(ADMIN)
+  pictureUrl     String?
   totpSecret     String?   // null = 2FA not enabled
   totpEnabled    Boolean   @default(false)
   active         Boolean   @default(true)
@@ -177,8 +194,24 @@ model User {
 
   activityLogs   ActivityLog[]
   sessions       Session[]
+  passkeys       Passkey[]
 
   @@map("users")
+}
+
+model Passkey {
+  id                  String   @id @default(cuid())
+  userId              String
+  credentialId        String   @unique
+  credentialPublicKey Bytes
+  counter             BigInt   @default(0)
+  transports          String[] // e.g. ["usb", "ble", "nfc", "internal"]
+  name                String   @default("Passkey")
+  createdAt           DateTime @default(now())
+
+  user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("passkeys")
 }
 
 model Session {
@@ -212,7 +245,8 @@ model Organisation {
   phone          String?
   email          String?
   website        String?
-  logoUrl        String?
+  logoUrl        String?   // square icon logo (sidebar, top-left)
+  documentLogoUrl String?  // wide/rectangular logo for PDF document headers
   baseCurrency   String  @default("GBP")
   financialYearStartMonth Int @default(5) // May = 5
   financialYearStartDay   Int @default(1)
@@ -229,6 +263,23 @@ model Setting {
   updatedAt DateTime @updatedAt
 
   @@map("settings")
+}
+
+/// Customisable document templates for PDF generation
+model DocumentTemplate {
+  id             String   @id @default(cuid())
+  type           String   @unique // sales_order, purchase_order, invoice, packing_slip, credit_note, rfq
+  headerNote     String?  // text above the table
+  footerNote     String?  // text below the table
+  termsText      String?  // terms & conditions
+  customFooter   String?  // free text printed at the bottom of every page
+  showLogo       Boolean  @default(true)
+  showVat        Boolean  @default(true)
+  showPaymentTerms Boolean @default(false)
+  paymentTermsText String? // e.g. "Net 30 days"
+  updatedAt      DateTime @updatedAt
+
+  @@map("document_templates")
 }
 
 /// Configurable reasons for stock adjustments, each optionally linked to a Xero account
@@ -546,6 +597,7 @@ model Supplier {
   taxRate         TaxRate?  @relation(fields: [taxRateId], references: [id])
   purchaseOrders  PurchaseOrder[]
   supplierProducts SupplierProduct[]
+  productionOrders ProductionOrder[]
 
   @@map("suppliers")
 }
@@ -1108,9 +1160,11 @@ model KitItem {
 model ProductionOrder {
   id              String                @id @default(cuid())
   reference       String                @unique
+  orderType       ProductionOrderType   @default(ASSEMBLY)
   bomId           String
   outputProductId String               // finished good
   warehouseId     String               // produced in / stock added to
+  manufacturerId  String?              // optional: supplier acting as manufacturer
   qtyPlanned      Decimal              @db.Decimal(12, 4)
   qtyProduced     Decimal              @db.Decimal(12, 4) @default(0)
   status          ProductionOrderStatus @default(DRAFT)
@@ -1124,7 +1178,10 @@ model ProductionOrder {
   bom             Bom                  @relation(fields: [bomId], references: [id])
   outputProduct   Product              @relation(fields: [outputProductId], references: [id])
   warehouse       Warehouse            @relation(fields: [warehouseId], references: [id])
+  manufacturer    Supplier?            @relation(fields: [manufacturerId], references: [id])
 
+  @@index([status])
+  @@index([createdAt])
   @@map("production_orders")
 }
 
@@ -1197,14 +1254,17 @@ model ActivityLog {
   entityType  ActivityEntityType
   entityId    String?
   action      String             // e.g. "created", "updated", "deleted", "status_changed"
-  description String?
+  tag         String             // human-friendly category: sales, purchase, inventory, stock, sync, settings, auth, import, manufacturing, system
+  level       ActivityLogLevel   @default(INFO)
+  description String             // human-readable clear text
   metadata    Json?              // diff or extra context
-  ipAddress   String?
   createdAt   DateTime           @default(now())
 
   user        User?              @relation(fields: [userId], references: [id], onDelete: SetNull)
 
   @@index([entityType, entityId])
   @@index([createdAt])
+  @@index([tag])
+  @@index([level])
   @@map("activity_logs")
 }

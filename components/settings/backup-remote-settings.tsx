@@ -1,0 +1,149 @@
+'use client'
+
+import { useState, useTransition } from 'react'
+import { Loader2, Check, Cloud, Server } from 'lucide-react'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
+import { setSetting } from '@/app/actions/settings'
+
+type Props = {
+  s3: { endpoint: string; region: string; bucket: string; accessKey: string; secretKey: string; prefix: string }
+  sftp: { host: string; port: string; user: string; password: string; privateKey: string; path: string }
+}
+
+export function BackupRemoteSettings({ s3, sftp }: Props) {
+  const [isPending, startTransition] = useTransition()
+  const [saved, setSaved] = useState<string | null>(null)
+
+  const [s3State, setS3] = useState(s3)
+  const [sftpState, setSftp] = useState(sftp)
+
+  function showSaved(key: string) { setSaved(key); setTimeout(() => setSaved(null), 2000) }
+
+  function handleSaveS3() {
+    startTransition(async () => {
+      await Promise.all([
+        setSetting('backup_s3_endpoint', s3State.endpoint),
+        setSetting('backup_s3_region', s3State.region),
+        setSetting('backup_s3_bucket', s3State.bucket),
+        setSetting('backup_s3_access_key', s3State.accessKey),
+        setSetting('backup_s3_secret_key', s3State.secretKey),
+        setSetting('backup_s3_prefix', s3State.prefix),
+      ])
+      showSaved('s3')
+    })
+  }
+
+  function handleSaveSftp() {
+    startTransition(async () => {
+      await Promise.all([
+        setSetting('backup_sftp_host', sftpState.host),
+        setSetting('backup_sftp_port', sftpState.port),
+        setSetting('backup_sftp_user', sftpState.user),
+        setSetting('backup_sftp_password', sftpState.password),
+        setSetting('backup_sftp_private_key', sftpState.privateKey),
+        setSetting('backup_sftp_path', sftpState.path),
+      ])
+      showSaved('sftp')
+    })
+  }
+
+  return (
+    <div className="space-y-6">
+      {/* S3 */}
+      <div>
+        <div className="flex items-center gap-2 mb-3">
+          <Cloud className="h-4 w-4 text-muted-foreground" />
+          <h3 className="text-sm font-medium">S3 Compatible Storage</h3>
+        </div>
+        <p className="text-xs text-muted-foreground mb-3">
+          Works with AWS S3, MinIO, Backblaze B2, Cloudflare R2, DigitalOcean Spaces, etc.
+        </p>
+        <div className="grid grid-cols-2 gap-3 max-w-lg">
+          <div className="space-y-1.5 col-span-2">
+            <Label className="text-xs">Endpoint (optional — leave blank for AWS S3)</Label>
+            <Input value={s3State.endpoint} onChange={(e) => setS3((p) => ({ ...p, endpoint: e.target.value }))} className="h-9" placeholder="https://s3.eu-west-1.amazonaws.com" />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Region</Label>
+            <Input value={s3State.region} onChange={(e) => setS3((p) => ({ ...p, region: e.target.value }))} className="h-9" placeholder="eu-west-1" />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Bucket</Label>
+            <Input value={s3State.bucket} onChange={(e) => setS3((p) => ({ ...p, bucket: e.target.value }))} className="h-9" placeholder="my-backups" />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Access Key</Label>
+            <Input value={s3State.accessKey} onChange={(e) => setS3((p) => ({ ...p, accessKey: e.target.value }))} className="h-9" autoComplete="off" />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Secret Key</Label>
+            <Input type="password" value={s3State.secretKey} onChange={(e) => setS3((p) => ({ ...p, secretKey: e.target.value }))} className="h-9" autoComplete="off" />
+          </div>
+          <div className="space-y-1.5 col-span-2">
+            <Label className="text-xs">Path Prefix (optional)</Label>
+            <Input value={s3State.prefix} onChange={(e) => setS3((p) => ({ ...p, prefix: e.target.value }))} className="h-9" placeholder="ims/backups" />
+          </div>
+        </div>
+        <div className="flex items-center gap-2 mt-3">
+          <Button size="sm" onClick={handleSaveS3} disabled={isPending}>
+            {isPending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}Save S3 Settings
+          </Button>
+          {saved === 's3' && <span className="text-sm text-green-600 flex items-center gap-1"><Check className="h-3 w-3" />Saved</span>}
+        </div>
+      </div>
+
+      <div className="border-t" />
+
+      {/* SFTP */}
+      <div>
+        <div className="flex items-center gap-2 mb-3">
+          <Server className="h-4 w-4 text-muted-foreground" />
+          <h3 className="text-sm font-medium">SFTP Server</h3>
+        </div>
+        <p className="text-xs text-muted-foreground mb-3">
+          Supports password and private key (certificate) authentication.
+        </p>
+        <div className="grid grid-cols-2 gap-3 max-w-lg">
+          <div className="space-y-1.5">
+            <Label className="text-xs">Host</Label>
+            <Input value={sftpState.host} onChange={(e) => setSftp((p) => ({ ...p, host: e.target.value }))} className="h-9" placeholder="backup.example.com" />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Port</Label>
+            <Input value={sftpState.port} onChange={(e) => setSftp((p) => ({ ...p, port: e.target.value }))} className="h-9" placeholder="22" />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Username</Label>
+            <Input value={sftpState.user} onChange={(e) => setSftp((p) => ({ ...p, user: e.target.value }))} className="h-9" autoComplete="off" />
+          </div>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Password (if not using key)</Label>
+            <Input type="password" value={sftpState.password} onChange={(e) => setSftp((p) => ({ ...p, password: e.target.value }))} className="h-9" autoComplete="off" />
+          </div>
+          <div className="space-y-1.5 col-span-2">
+            <Label className="text-xs">Private Key (PEM format — paste the full key including BEGIN/END lines)</Label>
+            <Textarea
+              value={sftpState.privateKey}
+              onChange={(e) => setSftp((p) => ({ ...p, privateKey: e.target.value }))}
+              className="text-xs font-mono min-h-[80px]"
+              placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"
+            />
+          </div>
+          <div className="space-y-1.5 col-span-2">
+            <Label className="text-xs">Remote Path</Label>
+            <Input value={sftpState.path} onChange={(e) => setSftp((p) => ({ ...p, path: e.target.value }))} className="h-9" placeholder="/backups/ims" />
+          </div>
+        </div>
+        <div className="flex items-center gap-2 mt-3">
+          <Button size="sm" onClick={handleSaveSftp} disabled={isPending}>
+            {isPending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}Save SFTP Settings
+          </Button>
+          {saved === 'sftp' && <span className="text-sm text-green-600 flex items-center gap-1"><Check className="h-3 w-3" />Saved</span>}
+        </div>
+      </div>
+    </div>
+  )
+}

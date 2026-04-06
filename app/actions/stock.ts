@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -49,6 +50,9 @@ export async function adjustStock(
   const isAddition = qtyNum > 0
   const absQty = Math.abs(qtyNum).toString()
 
+  let logSku = ''
+  let logWarehouseName = ''
+
   try {
     await db.$transaction(async (tx) => {
       // Look up reason (name + optional Xero account code)
@@ -92,6 +96,12 @@ export async function adjustStock(
           },
         },
       })
+
+      // Capture info for activity log
+      const logProduct = await tx.product.findUnique({ where: { id: productId }, select: { sku: true } })
+      const logWarehouse = await tx.warehouse.findUnique({ where: { id: warehouseId }, select: { name: true } })
+      logSku = logProduct?.sku ?? productId
+      logWarehouseName = logWarehouse?.name ?? warehouseId
 
       // Queue Xero sync — prefer reason's account code, fall back to global setting
       const effectiveXeroAccount = xeroAccountCode ?? (() => {
@@ -164,9 +174,28 @@ export async function adjustStock(
 
     revalidatePath(`/inventory/${productId}`)
     revalidatePath('/stock-control')
+
+    logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      entityId: productId,
+      action: 'adjusted',
+      tag: 'stock',
+      description: `Adjusted stock for ${logSku}: ${qtyNum} units at ${logWarehouseName}`,
+    })
+
     return { success: true }
   } catch (e) {
     console.error(e)
+
+    logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      entityId: productId,
+      action: 'adjusted',
+      tag: 'stock',
+      level: 'ERROR',
+      description: e instanceof Error ? e.message : 'Failed to save adjustment.',
+    })
+
     return { message: 'Failed to save adjustment. Please try again.' }
   }
 }
@@ -252,9 +281,26 @@ export async function bulkAdjustStock(
 
     revalidatePath('/stock-control')
     revalidatePath('/inventory')
+
+    logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      action: 'bulk_adjusted',
+      tag: 'stock',
+      description: `Bulk adjusted stock for ${valid.length} products`,
+    })
+
     return { success: true, count: valid.length }
   } catch (e) {
     console.error(e)
+
+    logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      action: 'bulk_adjusted',
+      tag: 'stock',
+      level: 'ERROR',
+      description: e instanceof Error ? e.message : 'Failed to save adjustments.',
+    })
+
     return { message: 'Failed to save adjustments. Please try again.' }
   }
 }
@@ -327,6 +373,8 @@ export async function updateAdjustmentMovement(
     return { message: 'Quantity must be non-zero.' }
   }
 
+  let oldSignedQtyForLog = 0
+
   try {
     await db.$transaction(async (tx) => {
       const movement = await tx.stockMovement.findUnique({
@@ -338,6 +386,7 @@ export async function updateAdjustmentMovement(
       const oldIsAddition = movement.toWarehouseId !== null
       const oldWarehouseId = (oldIsAddition ? movement.toWarehouseId : movement.fromWarehouseId)!
       const oldSignedQty = oldIsAddition ? Number(movement.qty) : -Number(movement.qty)
+      oldSignedQtyForLog = oldSignedQty
 
       const newIsAddition = newSignedQty > 0
       const newAbsQty = Math.abs(newSignedQty).toString()
@@ -371,9 +420,28 @@ export async function updateAdjustmentMovement(
 
     revalidatePath('/stock-control')
     revalidatePath('/inventory')
+
+    logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      entityId: id,
+      action: 'adjustment_updated',
+      tag: 'stock',
+      description: `Updated stock adjustment: qty changed from ${oldSignedQtyForLog} to ${newSignedQty}`,
+    })
+
     return { success: true }
   } catch (e) {
     console.error(e)
+
+    logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      entityId: id,
+      action: 'adjustment_updated',
+      tag: 'stock',
+      level: 'ERROR',
+      description: e instanceof Error ? e.message : 'Failed to update adjustment.',
+    })
+
     return { message: 'Failed to update adjustment.' }
   }
 }

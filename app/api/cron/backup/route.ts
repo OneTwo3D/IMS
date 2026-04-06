@@ -1,0 +1,105 @@
+import { NextResponse } from 'next/server'
+import { exec } from 'child_process'
+import { mkdir, readdir, stat, unlink } from 'fs/promises'
+import path from 'path'
+import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
+
+const BACKUP_DIR = path.join(process.cwd(), 'backups')
+
+async function getSetting(key: string): Promise<string> {
+  const row = await db.setting.findUnique({ where: { key } })
+  return row?.value ?? ''
+}
+
+function getDbConfig() {
+  const url = new URL(process.env.DATABASE_URL!)
+  return {
+    host: url.hostname,
+    port: url.port || '5432',
+    user: url.username,
+    password: url.password,
+    database: url.pathname.slice(1),
+  }
+}
+
+// Called daily by cron: curl http://localhost:3000/api/cron/backup
+export async function GET() {
+  const enabled = await getSetting('backup_schedule_enabled')
+  if (enabled !== 'true') {
+    return NextResponse.json({ skipped: true, reason: 'Scheduled backups disabled' })
+  }
+
+  const retentionDays = parseInt(await getSetting('backup_retention_days') || '30')
+  const maxBackups = parseInt(await getSetting('backup_max_count') || '10')
+
+  const dbConf = getDbConfig()
+  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+  const filename = `scheduled-${ts}.sql`
+  const filePath = path.join(BACKUP_DIR, filename)
+
+  await mkdir(BACKUP_DIR, { recursive: true })
+
+  // Create backup
+  const created = await new Promise<boolean>((resolve) => {
+    const cmd = `PGPASSWORD=${dbConf.password} pg_dump -h ${dbConf.host} -p ${dbConf.port} -U ${dbConf.user} -d ${dbConf.database} --no-owner --no-acl -F p -f "${filePath}"`
+    exec(cmd, { timeout: 120000 }, (error) => {
+      if (error) {
+        logActivity({ entityType: 'SYSTEM', tag: 'system', action: 'scheduled_backup', level: 'ERROR', description: `Scheduled backup failed: ${error.message}` })
+        resolve(false)
+      } else {
+        resolve(true)
+      }
+    })
+  })
+
+  if (!created) return NextResponse.json({ error: 'Backup creation failed' }, { status: 500 })
+
+  // Upload to remote if configured
+  const autoUploadTarget = await getSetting('backup_auto_upload')
+  let uploaded = false
+  if (autoUploadTarget === 's3' || autoUploadTarget === 'sftp') {
+    try {
+      const res = await fetch(`${process.env.NEXT_PUBLIC_APP_URL}/api/backup/upload-remote`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename, target: autoUploadTarget }),
+      })
+      uploaded = res.ok
+    } catch {
+      logActivity({ entityType: 'SYSTEM', tag: 'system', action: 'scheduled_backup', level: 'WARNING', description: `Scheduled backup created but remote upload to ${autoUploadTarget} failed` })
+    }
+  }
+
+  // Cleanup: remove old backups beyond retention
+  let deleted = 0
+  try {
+    const files = await readdir(BACKUP_DIR)
+    const backups: { name: string; mtime: Date }[] = []
+    for (const f of files) {
+      if (!f.endsWith('.sql') && !f.endsWith('.dump')) continue
+      const s = await stat(path.join(BACKUP_DIR, f))
+      backups.push({ name: f, mtime: s.mtime })
+    }
+    backups.sort((a, b) => b.mtime.getTime() - a.mtime.getTime())
+
+    const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000
+
+    for (let i = 0; i < backups.length; i++) {
+      const shouldDelete = i >= maxBackups || backups[i].mtime.getTime() < cutoff
+      if (shouldDelete) {
+        await unlink(path.join(BACKUP_DIR, backups[i].name))
+        deleted++
+      }
+    }
+  } catch { /* ignore cleanup errors */ }
+
+  logActivity({
+    entityType: 'SYSTEM',
+    tag: 'system',
+    action: 'scheduled_backup',
+    description: `Scheduled backup ${filename} created${uploaded ? ` and uploaded to ${autoUploadTarget}` : ''}${deleted > 0 ? `, ${deleted} old backup(s) purged` : ''}`,
+  })
+
+  return NextResponse.json({ filename, uploaded, deleted })
+}

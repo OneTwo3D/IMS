@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 
 // ---------------------------------------------------------------------------
 // Adjustment Reasons
@@ -58,9 +59,11 @@ export async function createAdjustmentReason(
       data: { name, xeroAccountCode: xeroAccountCode || null, sortOrder, active },
       select: { id: true, name: true, xeroAccountCode: true, sortOrder: true, active: true },
     })
-    revalidatePath('/settings')
+    logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created adjustment reason: ${name}` })
+    revalidatePath('/settings', 'layout')
     return { success: true, item }
   } catch {
+    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create adjustment reason: ${name}` })
     return { message: 'Failed to create reason.' }
   }
 }
@@ -80,9 +83,11 @@ export async function updateAdjustmentReason(
       data: { name, xeroAccountCode: xeroAccountCode || null, sortOrder, active },
       select: { id: true, name: true, xeroAccountCode: true, sortOrder: true, active: true },
     })
-    revalidatePath('/settings')
+    logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'updated', description: `Updated adjustment reason: ${name}` })
+    revalidatePath('/settings', 'layout')
     return { success: true, item }
   } catch {
+    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update adjustment reason: ${name}` })
     return { message: 'Failed to update reason.' }
   }
 }
@@ -90,9 +95,11 @@ export async function updateAdjustmentReason(
 export async function deleteAdjustmentReason(id: string): Promise<{ error?: string }> {
   try {
     await db.adjustmentReason.delete({ where: { id } })
-    revalidatePath('/settings')
+    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted adjustment reason' })
+    revalidatePath('/settings', 'layout')
     return {}
   } catch {
+    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', level: 'ERROR', description: 'Failed to delete adjustment reason' })
     return { error: 'Failed to delete reason.' }
   }
 }
@@ -145,9 +152,11 @@ export async function createTaxRate(input: {
         xeroTaxType: input.xeroTaxType || null,
       },
     })
-    revalidatePath('/settings')
+    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created tax rate: ${input.name} (${input.rate}%)` })
+    revalidatePath('/settings', 'layout')
     return { success: true }
   } catch (e) {
+    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create tax rate: ${input.name}` })
     return { success: false, error: String(e) }
   }
 }
@@ -170,9 +179,11 @@ export async function updateTaxRate(id: string, input: {
         ...(input.active !== undefined && { active: input.active }),
       },
     })
-    revalidatePath('/settings')
+    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated tax rate: ${input.name ?? id}` })
+    revalidatePath('/settings', 'layout')
     return { success: true }
   } catch (e) {
+    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update tax rate: ${input.name ?? id}` })
     return { success: false, error: String(e) }
   }
 }
@@ -203,7 +214,8 @@ export async function setSetting(key: string, value: string): Promise<void> {
     create: { key, value },
     update: { value },
   })
-  revalidatePath('/settings')
+  logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: `Updated setting: ${key}` })
+  revalidatePath('/settings', 'layout')
 }
 
 // ---------------------------------------------------------------------------
@@ -253,9 +265,11 @@ export async function createPurchaseUnit(input: {
         stockUnitName: input.stockUnitName || 'pcs',
       },
     })
-    revalidatePath('/settings')
+    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created purchase unit: ${input.name}` })
+    revalidatePath('/settings', 'layout')
     return { success: true }
   } catch (e) {
+    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create purchase unit: ${input.name}` })
     return { success: false, error: String(e) }
   }
 }
@@ -291,9 +305,11 @@ export async function updatePurchaseUnit(id: string, input: {
         ...(input.active !== undefined && { active: input.active }),
       },
     })
-    revalidatePath('/settings')
+    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated purchase unit: ${input.name ?? id}` })
+    revalidatePath('/settings', 'layout')
     return { success: true }
   } catch (e) {
+    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update purchase unit: ${input.name ?? id}` })
     return { success: false, error: String(e) }
   }
 }

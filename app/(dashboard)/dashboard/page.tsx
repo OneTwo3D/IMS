@@ -1,12 +1,25 @@
 import type { Metadata } from 'next'
+import { getDashboardData } from '@/app/actions/dashboard'
+import { DashboardClient } from './dashboard-client'
 
 export const metadata: Metadata = { title: 'Dashboard' }
 
-export default function Page() {
+export default async function Page() {
+  const initialPeriod = 'this_month' as const
+  const initialCompare = 'previous_period' as const
+  const { kpi, chartData, topProducts, recentOrders, incomingPOs, periodLabel, compLabel } = await getDashboardData(initialPeriod, initialCompare)
+
   return (
-    <div>
-      <h1 className="text-2xl font-semibold capitalize">dashboard</h1>
-      <p className="mt-2 text-muted-foreground">This module is under construction.</p>
-    </div>
+    <DashboardClient
+      kpi={kpi}
+      chartData={chartData}
+      topProducts={topProducts}
+      recentOrders={recentOrders}
+      incomingPOs={incomingPOs}
+      periodLabel={periodLabel}
+      compLabel={compLabel}
+      initialPeriod={initialPeriod}
+      initialCompare={initialCompare}
+    />
   )
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# OneTwo3D IMS — Production Installer
+# One Two Inventory — Production Installer
 # =============================================================================
 # Supported OS : Debian 11/12, Ubuntu 22.04/24.04 (LXC containers)
 # Run as       : root  (or with sudo)
@@ -19,7 +19,8 @@
 #  10. Runs database migrations
 #  11. Writes the systemd service (via PM2)
 #  12. Configures nginx reverse proxy
-#  13. Prints post-install summary
+#  13. Sets up cron jobs (FX rates, activity cleanup, backups)
+#  14. Prints post-install summary
 # =============================================================================
 
 set -euo pipefail
@@ -48,11 +49,12 @@ header() {
 # ---------------------------------------------------------------------------
 # Defaults (overridden by prompts or --non-interactive env vars)
 # ---------------------------------------------------------------------------
-APP_NAME="onetwo3d-ims"
+APP_NAME="one-two-inventory"
 APP_USER="imsapp"
 APP_DIR="/opt/${APP_NAME}"
 DATA_DIR="/var/lib/${APP_NAME}"
 LOG_DIR="/var/log/${APP_NAME}"
+BACKUP_DIR="${DATA_DIR}/backups"
 NGINX_CONF="/etc/nginx/sites-available/${APP_NAME}"
 NODE_VERSION="20"
 
@@ -63,10 +65,8 @@ NON_INTERACTIVE=false
 # Helper: prompt with default
 # ---------------------------------------------------------------------------
 prompt() {
-  # Usage: prompt VARNAME "Question" "default_value" [secret]
   local varname="$1" question="$2" default="$3" secret="${4:-}"
   if $NON_INTERACTIVE; then
-    # In non-interactive mode, use the env var if set, otherwise use default
     eval "$varname=\"\${$varname:-$default}\""
     return
   fi
@@ -80,7 +80,6 @@ prompt() {
 }
 
 prompt_yn() {
-  # Usage: prompt_yn VARNAME "Question" y|n
   local varname="$1" question="$2" default="${3:-y}"
   if $NON_INTERACTIVE; then
     eval "$varname=\"\${$varname:-$default}\""
@@ -99,7 +98,6 @@ header "Pre-flight checks"
 
 [[ $EUID -ne 0 ]] && die "This script must be run as root. Try: sudo bash install.sh"
 
-# OS check
 if [[ -f /etc/os-release ]]; then
   . /etc/os-release
   OS_ID="${ID}"
@@ -113,7 +111,6 @@ else
   die "Cannot detect OS. /etc/os-release not found."
 fi
 
-# Check internet connectivity
 if ! curl -fsS --max-time 5 https://deb.nodesource.com > /dev/null 2>&1; then
   die "No internet connectivity. This installer requires internet access."
 fi
@@ -132,7 +129,7 @@ echo ""
 # App source
 prompt_yn INSTALL_FROM_GIT "Clone app from a git repository?" "y"
 if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
-  prompt GIT_REPO_URL  "Git repository URL" "https://github.com/yourorg/onetwo3d-ims.git"
+  prompt GIT_REPO_URL  "Git repository URL" "https://github.com/yourorg/one-two-inventory.git"
   prompt GIT_BRANCH    "Branch to deploy"   "main"
 else
   prompt LOCAL_SOURCE_DIR "Path to local app directory (will be copied)" "/root/ims/onetwo3d-ims"
@@ -147,7 +144,7 @@ echo ""
 info "--- PostgreSQL ---"
 prompt_yn INSTALL_POSTGRES "Install PostgreSQL on this server?" "y"
 if [[ "$INSTALL_POSTGRES" == "y" ]]; then
-  prompt DB_NAME      "Database name"           "onetwo3d_ims"
+  prompt DB_NAME      "Database name"           "one_two_inventory"
   prompt DB_USER      "Database user"           "imsuser"
   prompt DB_PASSWORD  "Database password"       "$(openssl rand -hex 16)" "secret"
   DB_HOST="localhost"
@@ -155,7 +152,7 @@ if [[ "$INSTALL_POSTGRES" == "y" ]]; then
 else
   prompt DB_HOST      "PostgreSQL host"         "localhost"
   prompt DB_PORT      "PostgreSQL port"         "5432"
-  prompt DB_NAME      "Database name"           "onetwo3d_ims"
+  prompt DB_NAME      "Database name"           "one_two_inventory"
   prompt DB_USER      "Database user"           "imsuser"
   prompt DB_PASSWORD  "Database password"       "" "secret"
 fi
@@ -166,26 +163,16 @@ prompt REDIS_URL      "Redis URL (redis://host:port)" "redis://localhost:6379"
 prompt REDIS_PASSWORD "Redis password (leave blank if none)" ""
 
 echo ""
-info "--- WooCommerce ---"
-prompt WC_STORE_URL       "WooCommerce store URL"      "https://yourstore.com"
-prompt WC_CONSUMER_KEY    "WooCommerce consumer key"   "ck_"
-prompt WC_CONSUMER_SECRET "WooCommerce consumer secret" "cs_" "secret"
+info "--- WooCommerce (optional — can be configured later in Settings) ---"
+prompt WC_STORE_URL       "WooCommerce store URL"      ""
+prompt WC_CONSUMER_KEY    "WooCommerce consumer key"   ""
+prompt WC_CONSUMER_SECRET "WooCommerce consumer secret" "" "secret"
 prompt WC_WEBHOOK_SECRET  "WooCommerce webhook secret"  "$(openssl rand -hex 16)" "secret"
 
 echo ""
-info "--- Xero ---"
+info "--- Xero (optional — can be configured later in Settings) ---"
 prompt XERO_CLIENT_ID     "Xero client ID"     ""
 prompt XERO_CLIENT_SECRET "Xero client secret" "" "secret"
-
-echo ""
-info "--- SMTP ---"
-prompt SMTP_HOST       "SMTP host"           "smtp.yourprovider.com"
-prompt SMTP_PORT       "SMTP port"           "587"
-prompt SMTP_SECURE     "SMTP encryption (tls|ssl|none)" "tls"
-prompt SMTP_USER       "SMTP username"       ""
-prompt SMTP_PASSWORD   "SMTP password"       "" "secret"
-prompt SMTP_FROM_EMAIL "From email address"  "ims@${APP_DOMAIN}"
-prompt SMTP_FROM_NAME  "From name"           "OneTwo3D IMS"
 
 echo ""
 info "--- nginx ---"
@@ -229,7 +216,6 @@ else
   success "Node.js $(node --version) installed."
 fi
 
-# Install PM2 globally
 if ! command -v pm2 &>/dev/null; then
   npm install -g pm2 --quiet
   success "PM2 installed."
@@ -252,7 +238,6 @@ if [[ "$INSTALL_POSTGRES" == "y" ]]; then
     success "PostgreSQL already installed."
   fi
 
-  # Create DB and user
   info "Creating database '${DB_NAME}' and user '${DB_USER}'..."
   sudo -u postgres psql -v ON_ERROR_STOP=1 <<-EOSQL
     DO \$\$
@@ -285,9 +270,12 @@ else
   success "System user '${APP_USER}' already exists."
 fi
 
-mkdir -p "${DATA_DIR}" "${LOG_DIR}" \
+mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BACKUP_DIR}" \
   "${DATA_DIR}/xero" \
   "${APP_DIR}/uploads/invoices" \
+  "${APP_DIR}/public/uploads/branding" \
+  "${APP_DIR}/public/uploads/avatars" \
+  "${APP_DIR}/backups" \
   /tmp/${APP_NAME}/pdf \
   /tmp/${APP_NAME}/uploads
 
@@ -319,6 +307,7 @@ else
     --exclude='node_modules' \
     --exclude='.next' \
     --exclude='.env' \
+    --exclude='backups' \
     "${LOCAL_SOURCE_DIR%/}/" "${APP_DIR}/"
   chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
   success "Files copied."
@@ -332,8 +321,7 @@ header "Writing .env configuration"
 AUTH_SECRET="$(openssl rand -base64 32)"
 
 cat > "${APP_DIR}/.env" <<EOF
-# Generated by install.sh on $(date -u +"%Y-%m-%d %H:%M:%S UTC")
-# Do not edit manually — re-run install.sh or edit and restart the service.
+# One Two Inventory — generated by install.sh on $(date -u +"%Y-%m-%d %H:%M:%S UTC")
 
 NEXT_PUBLIC_APP_URL=https://${APP_DOMAIN}
 NODE_ENV=production
@@ -359,15 +347,6 @@ XERO_TENANT_ID=
 XERO_TOKEN_PATH=${DATA_DIR}/xero/token.json
 
 FX_BASE_CURRENCY=GBP
-# FX rates are fetched daily via cron (see crontab for ${APP_USER}), using frankfurter.dev (no API key needed)
-
-SMTP_HOST=${SMTP_HOST}
-SMTP_PORT=${SMTP_PORT}
-SMTP_SECURE=${SMTP_SECURE}
-SMTP_USER=${SMTP_USER}
-SMTP_PASSWORD=${SMTP_PASSWORD}
-SMTP_FROM_EMAIL=${SMTP_FROM_EMAIL}
-SMTP_FROM_NAME=${SMTP_FROM_NAME}
 
 PDF_TEMP_DIR=/tmp/${APP_NAME}/pdf
 UPLOAD_MAX_SIZE_MB=10
@@ -394,8 +373,15 @@ header "Running database migrations"
 
 cd "${APP_DIR}"
 sudo -u "${APP_USER}" DATABASE_URL="${DATABASE_URL}" \
+  npx prisma generate --schema prisma/schema.prisma
+sudo -u "${APP_USER}" DATABASE_URL="${DATABASE_URL}" \
   npx prisma migrate deploy --schema prisma/schema.prisma
 success "Database migrations applied."
+
+header "Seeding database"
+
+sudo -u "${APP_USER}" DATABASE_URL="${DATABASE_URL}" \
+  npx prisma db seed 2>/dev/null || warn "Seeding skipped (may already be seeded)."
 
 header "Building Next.js application"
 
@@ -435,12 +421,10 @@ EOF
 
 chown "${APP_USER}:${APP_USER}" "${APP_DIR}/ecosystem.config.js"
 
-# Start (or restart) via PM2
 pm2 delete "${APP_NAME}" 2>/dev/null || true
 pm2 start "${APP_DIR}/ecosystem.config.js"
 pm2 save
 
-# Register PM2 startup with systemd
 pm2 startup systemd -u "${APP_USER}" --hp "${APP_DIR}" | tail -1 | bash || true
 systemctl enable "pm2-${APP_USER}" 2>/dev/null || true
 
@@ -453,7 +437,7 @@ if [[ "$CONFIGURE_NGINX" == "y" ]]; then
   header "Configuring nginx"
 
   cat > "${NGINX_CONF}" <<EOF
-# OneTwo3D IMS — nginx reverse proxy
+# One Two Inventory — nginx reverse proxy
 # Generated by install.sh on $(date -u +"%Y-%m-%d %H:%M:%S UTC")
 
 upstream ${APP_NAME}_upstream {
@@ -466,17 +450,14 @@ server {
     listen [::]:80;
     server_name ${APP_DOMAIN};
 
-    # Security headers
     add_header X-Frame-Options        "SAMEORIGIN"   always;
     add_header X-Content-Type-Options "nosniff"      always;
     add_header X-XSS-Protection       "1; mode=block" always;
     add_header Referrer-Policy        "strict-origin-when-cross-origin" always;
 
-    # Logging
     access_log /var/log/nginx/${APP_NAME}-access.log;
     error_log  /var/log/nginx/${APP_NAME}-error.log;
 
-    # Max upload size (for CSV imports)
     client_max_body_size 20M;
 
     location / {
@@ -493,7 +474,6 @@ server {
         proxy_connect_timeout 75s;
     }
 
-    # WooCommerce webhook endpoint — higher timeout
     location /api/webhooks/ {
         proxy_pass         http://${APP_NAME}_upstream;
         proxy_http_version 1.1;
@@ -512,7 +492,6 @@ EOF
   nginx -t && systemctl reload nginx
   success "nginx configured and reloaded."
 
-  # SSL with Let's Encrypt
   if [[ "$ENABLE_SSL" == "y" ]]; then
     header "Setting up SSL (Let's Encrypt)"
     if ! command -v certbot &>/dev/null; then
@@ -563,11 +542,27 @@ EOF
 success "Log rotation configured."
 
 # ---------------------------------------------------------------------------
-# 13. FX rate cron
+# 13. Cron jobs
 # ---------------------------------------------------------------------------
-header "Setting up FX rate cron"
-(crontab -u "${APP_USER}" -l 2>/dev/null || true; echo "0 6 * * * curl -fsS http://localhost:${APP_PORT}/api/cron/fx-rates > /dev/null 2>&1") | sort -u | crontab -u "${APP_USER}" -
-success "Daily FX rate fetch cron added (06:00)."
+header "Setting up cron jobs"
+
+CRON_LINES=(
+  "0 6 * * * curl -fsS http://localhost:${APP_PORT}/api/cron/fx-rates > /dev/null 2>&1"
+  "0 3 * * * curl -fsS http://localhost:${APP_PORT}/api/cron/activity-cleanup > /dev/null 2>&1"
+  "0 2 * * * curl -fsS http://localhost:${APP_PORT}/api/cron/backup > /dev/null 2>&1"
+)
+
+{
+  crontab -u "${APP_USER}" -l 2>/dev/null || true
+  for line in "${CRON_LINES[@]}"; do
+    echo "$line"
+  done
+} | sort -u | crontab -u "${APP_USER}" -
+
+success "Cron jobs configured:"
+echo "  - 02:00 Daily scheduled backup (if enabled in settings)"
+echo "  - 03:00 Activity log cleanup"
+echo "  - 06:00 FX rate update"
 
 # ---------------------------------------------------------------------------
 # 14. Firewall hints (ufw)
@@ -584,12 +579,13 @@ fi
 # ---------------------------------------------------------------------------
 header "Installation complete!"
 
-echo -e "${GREEN}${BOLD}OneTwo3D IMS has been installed successfully.${RESET}"
+echo -e "${GREEN}${BOLD}One Two Inventory has been installed successfully.${RESET}"
 echo ""
 echo -e "  App directory  : ${BOLD}${APP_DIR}${RESET}"
 echo -e "  Config file    : ${BOLD}${APP_DIR}/.env${RESET}"
 echo -e "  Logs           : ${BOLD}${LOG_DIR}${RESET}"
 echo -e "  Data           : ${BOLD}${DATA_DIR}${RESET}"
+echo -e "  Backups        : ${BOLD}${APP_DIR}/backups${RESET}"
 echo -e "  Database       : ${BOLD}${DB_NAME}${RESET} @ ${DB_HOST}:${DB_PORT}"
 echo ""
 echo -e "  App URL        : ${BOLD}http${ENABLE_SSL:+s}://${APP_DOMAIN}${RESET}"
@@ -599,23 +595,25 @@ echo ""
 echo -e "  1. Create the first admin user:"
 echo -e "     ${BOLD}cd ${APP_DIR} && npm run cli -- create-user${RESET}"
 echo ""
-echo -e "  2. Connect Xero (OAuth flow):"
-echo -e "     Visit ${BOLD}http${ENABLE_SSL:+s}://${APP_DOMAIN}/settings/integrations/xero${RESET}"
+echo -e "  2. Configure company settings:"
+echo -e "     Visit ${BOLD}http${ENABLE_SSL:+s}://${APP_DOMAIN}/settings/company${RESET}"
+echo -e "     Set up company name, logos, branding, document templates, email"
 echo ""
-echo -e "  3. Configure WooCommerce webhooks to point to:"
-echo -e "     ${BOLD}https://${APP_DOMAIN}/api/webhooks/woocommerce${RESET}"
-echo -e "     (order.created, order.updated, order.deleted)"
+echo -e "  3. Configure backup strategy:"
+echo -e "     Visit ${BOLD}http${ENABLE_SSL:+s}://${APP_DOMAIN}/settings/backup${RESET}"
+echo -e "     Set up S3 or SFTP remote storage and enable scheduled backups"
 echo ""
-echo -e "  4. Import existing data:"
-echo -e "     Products : sync from WooCommerce in Settings → Integrations"
-echo -e "     COGS     : Settings → Import → COGS CSV"
-echo -e "     Suppliers: Settings → Import → Suppliers CSV"
-echo -e "     BOMs     : Settings → Import → BOMs CSV"
+echo -e "  4. Configure WooCommerce (optional):"
+echo -e "     Set up WC sync in ${BOLD}http${ENABLE_SSL:+s}://${APP_DOMAIN}/sync${RESET}"
+echo -e "     Configure webhooks to: ${BOLD}https://${APP_DOMAIN}/api/webhooks/woocommerce${RESET}"
 echo ""
-echo -e "  5. View PM2 process status:"
+echo -e "  5. Import existing data:"
+echo -e "     Products, suppliers, BOMs, stock — all via CSV import in the respective modules"
+echo ""
+echo -e "  6. View PM2 process status:"
 echo -e "     ${BOLD}pm2 status${RESET}"
 echo ""
-echo -e "  6. View live logs:"
+echo -e "  7. View live logs:"
 echo -e "     ${BOLD}pm2 logs ${APP_NAME}${RESET}"
 echo ""
 

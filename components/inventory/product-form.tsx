@@ -1,7 +1,6 @@
 'use client'
 
 import { useActionState, useState } from 'react'
-import { Download } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -13,7 +12,6 @@ import {
   DialogHeader,
   DialogTitle,
 } from '@/components/ui/dialog'
-import { fetchWcImage } from '@/app/actions/stock'
 import type { ProductFormState } from '@/app/actions/products'
 
 type VariableProduct = { id: string; sku: string; name: string }
@@ -80,8 +78,6 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
     active:               defaultValues?.active               ?? true,
   })
 
-  const [wcImporting, setWcImporting] = useState(false)
-  const [wcError, setWcError] = useState('')
 
   function set<K extends keyof typeof fields>(key: K, value: (typeof fields)[K]) {
     setFields((prev) => ({ ...prev, [key]: value }))
@@ -90,16 +86,6 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
   const typeOptions = fields.type === 'VARIANT'
     ? [{ value: 'VARIANT', label: 'Variant (child)' }, ...PRODUCT_TYPES_BASE]
     : PRODUCT_TYPES_BASE
-
-  async function importFromWc() {
-    if (!fields.sku) { setWcError('Save the product with a SKU first'); return }
-    setWcImporting(true)
-    setWcError('')
-    const result = await fetchWcImage(fields.sku)
-    setWcImporting(false)
-    if (result.error) { setWcError(result.error); return }
-    if (result.imageUrl) set('imageUrl', result.imageUrl)
-  }
 
   const e = state.errors ?? {}
 
@@ -283,26 +269,13 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
       {/* Image */}
       <div className="space-y-1.5">
         <Label htmlFor="imageUrl">Product Image URL</Label>
-        <div className="flex gap-2">
-          <Input
-            id="imageUrl"
-            name="imageUrl"
-            value={fields.imageUrl}
-            onChange={(ev) => set('imageUrl', ev.target.value)}
-            placeholder="https://…"
-          />
-          <Button
-            type="button"
-            variant="outline"
-            size="icon"
-            onClick={importFromWc}
-            disabled={wcImporting}
-            title="Import from WooCommerce"
-          >
-            <Download className="h-4 w-4" />
-          </Button>
-        </div>
-        {wcError && <p className="text-xs text-destructive">{wcError}</p>}
+        <Input
+          id="imageUrl"
+          name="imageUrl"
+          value={fields.imageUrl}
+          onChange={(ev) => set('imageUrl', ev.target.value)}
+          placeholder="https://…"
+        />
         {fields.imageUrl && (
           <div className="mt-2 w-24 h-24 rounded-lg border border-border overflow-hidden bg-muted">
             <img

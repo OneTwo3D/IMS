@@ -2,6 +2,7 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 
 export type ResetLevel = 'transactions' | 'products' | 'full'
 
@@ -79,8 +80,10 @@ export async function resetDatabase(level: ResetLevel): Promise<{ success: boole
     }
 
     revalidatePath('/')
+    logActivity({ entityType: 'SYSTEM', tag: 'system', action: 'database_reset', level: 'WARNING', description: `Database reset: ${level} (transactions/products/full)` })
     return { success: true }
   } catch (e) {
+    logActivity({ entityType: 'SYSTEM', tag: 'system', action: 'database_reset', level: 'ERROR', description: `Failed to reset database: ${String(e)}` })
     return { success: false, error: String(e) }
   }
 }

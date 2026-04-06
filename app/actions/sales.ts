@@ -2,6 +2,7 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -478,11 +479,43 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
           update: { reservedQty: { increment: l.qty } },
         })
       }
+      // Log stock reservations
+      for (const l of input.lines) {
+        if (!l.productId) continue
+        logActivity({
+          entityType: 'STOCK_ADJUSTMENT',
+          entityId: l.productId,
+          action: 'reserved',
+          tag: 'stock',
+          level: 'INFO',
+          description: `Reserved ${l.qty} units of ${l.sku} for order ${so.wcOrderNumber}`,
+          metadata: { sku: l.sku, qty: l.qty, orderNumber: so.wcOrderNumber, warehouseId: input.shipFromWarehouseId },
+        })
+      }
     }
 
     revalidatePath('/sales')
-    return { success: true, order: mapSoRow(so) }
+    const mapped = mapSoRow(so)
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: so.id,
+      action: 'created',
+      tag: 'sales',
+      level: 'INFO',
+      description: `Created sales order ${mapped.wcOrderNumber}`,
+      metadata: { orderNumber: mapped.wcOrderNumber, totalGbp: mapped.totalGbp, currency: mapped.currency },
+    })
+    return { success: true, order: mapped }
   } catch (e) {
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: null,
+      action: 'created',
+      tag: 'sales',
+      level: 'ERROR',
+      description: `Failed to create sales order: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -497,6 +530,15 @@ async function releaseReservedStock(orderId: string, warehouseId: string, lines:
       data: { reservedQty: { decrement: qty } },
     })
   }
+  logActivity({
+    entityType: 'STOCK_ADJUSTMENT',
+    entityId: orderId,
+    action: 'reservation_released',
+    tag: 'stock',
+    level: 'INFO',
+    description: `Released reserved stock for order ${orderId}`,
+    metadata: { orderId, warehouseId },
+  })
 }
 
 export async function updateSalesOrderStatus(
@@ -507,7 +549,7 @@ export async function updateSalesOrderStatus(
   try {
     const so = await db.salesOrder.findUnique({
       where: { id },
-      select: { id: true, status: true, shipFromWarehouseId: true, lines: { select: { id: true, productId: true, qty: true } } },
+      select: { id: true, wcOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { id: true, productId: true, qty: true } } },
     })
     if (!so) return { success: false, error: 'Order not found' }
 
@@ -556,6 +598,15 @@ export async function updateSalesOrderStatus(
             where: { productId: line.productId, warehouseId },
             data: { quantity: { decrement: qty } },
           })
+          logActivity({
+            entityType: 'STOCK_ADJUSTMENT',
+            entityId: line.productId,
+            action: 'dispatched',
+            tag: 'stock',
+            level: 'INFO',
+            description: `Dispatched ${qty} units of product ${line.productId} for order ${so.wcOrderNumber}`,
+            metadata: { productId: line.productId, qty, orderNumber: so.wcOrderNumber, warehouseId },
+          })
         }
       }
     }
@@ -581,8 +632,26 @@ export async function updateSalesOrderStatus(
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${id}`)
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'status_changed',
+      tag: 'sales',
+      level: 'INFO',
+      description: `Updated sales order ${so.wcOrderNumber} status to ${targetStatus}`,
+      metadata: { orderNumber: so.wcOrderNumber, previousStatus: so.status, newStatus: targetStatus },
+    })
     return { success: true }
   } catch (e) {
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'status_changed',
+      tag: 'sales',
+      level: 'ERROR',
+      description: `Failed to update sales order status: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -596,7 +665,7 @@ export async function createRefund(
   try {
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
-      select: { id: true, status: true, fxRateToGbp: true, totalGbp: true },
+      select: { id: true, wcOrderNumber: true, status: true, fxRateToGbp: true, totalGbp: true },
     })
     if (!so) return { success: false, error: 'Order not found' }
 
@@ -658,6 +727,15 @@ export async function createRefund(
           create: { productId: l.productId, warehouseId: returnWarehouseId, quantity: l.qty, reservedQty: 0 },
           update: { quantity: { increment: l.qty } },
         })
+        logActivity({
+          entityType: 'STOCK_ADJUSTMENT',
+          entityId: l.productId,
+          action: 'return_inbound',
+          tag: 'stock',
+          level: 'INFO',
+          description: `Returned ${l.qty} units of ${l.description} to warehouse ${returnWarehouseId} for refund on order ${so.wcOrderNumber}`,
+          metadata: { productId: l.productId, qty: l.qty, orderNumber: so.wcOrderNumber, warehouseId: returnWarehouseId },
+        })
       }
     }
 
@@ -672,8 +750,26 @@ export async function createRefund(
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'refunded',
+      tag: 'sales',
+      level: 'INFO',
+      description: `Created refund for order ${so.wcOrderNumber} — £${totalGbp.toFixed(2)}`,
+      metadata: { orderNumber: so.wcOrderNumber, totalGbp, creditNoteNumber, reason },
+    })
     return { success: true }
   } catch (e) {
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'refunded',
+      tag: 'sales',
+      level: 'ERROR',
+      description: `Failed to create refund: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -737,8 +833,26 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     })
 
     revalidatePath('/sales')
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: clone.id,
+      action: 'cloned',
+      tag: 'sales',
+      level: 'INFO',
+      description: `Cloned sales order ${so.wcOrderNumber}`,
+      metadata: { sourceOrderId: id, sourceOrderNumber: so.wcOrderNumber, newOrderNumber: ref },
+    })
     return { success: true, newId: clone.id }
   } catch (e) {
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'cloned',
+      tag: 'sales',
+      level: 'ERROR',
+      description: `Failed to clone sales order: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -747,7 +861,7 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
   try {
     const so = await db.salesOrder.findUnique({
       where: { id },
-      select: { status: true, shipFromWarehouseId: true, lines: { select: { productId: true, qty: true } }, _count: { select: { refunds: true, payments: true } } },
+      select: { wcOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { productId: true, qty: true } }, _count: { select: { refunds: true, payments: true } } },
     })
     if (!so) return { success: false, error: 'Order not found' }
     if (so.status !== 'PENDING') return { success: false, error: 'Only pending orders can be deleted' }
@@ -762,20 +876,47 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
           data: { reservedQty: { decrement: Number(line.qty) } },
         })
       }
+      logActivity({
+        entityType: 'STOCK_ADJUSTMENT',
+        entityId: id,
+        action: 'reservation_released',
+        tag: 'stock',
+        level: 'INFO',
+        description: `Released stock reservations for deleted order ${so.wcOrderNumber}`,
+        metadata: { orderNumber: so.wcOrderNumber, warehouseId: so.shipFromWarehouseId },
+      })
     }
 
     await db.salesOrderLine.deleteMany({ where: { orderId: id } })
     await db.salesOrder.delete({ where: { id } })
     revalidatePath('/sales')
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'deleted',
+      tag: 'sales',
+      level: 'INFO',
+      description: `Deleted sales order ${so.wcOrderNumber}`,
+      metadata: { orderNumber: so.wcOrderNumber },
+    })
     return { success: true }
   } catch (e) {
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'deleted',
+      tag: 'sales',
+      level: 'ERROR',
+      description: `Failed to delete sales order: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
 
 export async function markSalesOrderPaid(id: string): Promise<{ success: boolean; error?: string }> {
   try {
-    const so = await db.salesOrder.findUnique({ where: { id }, select: { paidAt: true, invoiceNumber: true } })
+    const so = await db.salesOrder.findUnique({ where: { id }, select: { wcOrderNumber: true, paidAt: true, invoiceNumber: true } })
     if (!so) return { success: false, error: 'Order not found' }
 
     const markingAsPaid = !so.paidAt // transitioning from unpaid to paid
@@ -794,8 +935,26 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${id}`)
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'paid',
+      tag: 'sales',
+      level: 'INFO',
+      description: `Marked sales order ${so.wcOrderNumber} as paid`,
+      metadata: { orderNumber: so.wcOrderNumber, markingAsPaid },
+    })
     return { success: true }
   } catch (e) {
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'paid',
+      tag: 'sales',
+      level: 'ERROR',
+      description: `Failed to mark sales order as paid: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -806,13 +965,32 @@ export async function updateSalesOrderNotes(
   internalNotes: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await db.salesOrder.update({
+    const so = await db.salesOrder.update({
       where: { id },
       data: { notes: notes || null, internalNotes: internalNotes || null },
+      select: { wcOrderNumber: true },
     })
     revalidatePath(`/sales/${id}`)
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'updated',
+      tag: 'sales',
+      level: 'INFO',
+      description: `Updated notes for order ${so.wcOrderNumber}`,
+      metadata: { orderNumber: so.wcOrderNumber },
+    })
     return { success: true }
   } catch (e) {
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'updated',
+      tag: 'sales',
+      level: 'ERROR',
+      description: `Failed to update sales order notes: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -820,18 +998,36 @@ export async function updateSalesOrderNotes(
 export async function generateInvoiceNumber(id: string): Promise<{ success: boolean; invoiceNumber?: string; error?: string }> {
   try {
     // Use a transaction to prevent race conditions on invoice numbering
-    const num = await db.$transaction(async (tx) => {
-      const so = await tx.salesOrder.findUnique({ where: { id }, select: { invoiceNumber: true } })
+    const result = await db.$transaction(async (tx) => {
+      const so = await tx.salesOrder.findUnique({ where: { id }, select: { wcOrderNumber: true, invoiceNumber: true } })
       if (!so) throw new Error('Order not found')
-      if (so.invoiceNumber) return so.invoiceNumber
+      if (so.invoiceNumber) return { invoiceNumber: so.invoiceNumber, orderNumber: so.wcOrderNumber }
       const count = await tx.salesOrder.count({ where: { invoiceNumber: { not: null } } })
       const invNum = `INV-${new Date().getFullYear()}-${String(count + 1).padStart(5, '0')}`
       await tx.salesOrder.update({ where: { id }, data: { invoiceNumber: invNum, invoicedAt: new Date() } })
-      return invNum
+      return { invoiceNumber: invNum, orderNumber: so.wcOrderNumber }
     })
     revalidatePath(`/sales/${id}`)
-    return { success: true, invoiceNumber: num }
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'invoice_generated',
+      tag: 'sales',
+      level: 'INFO',
+      description: `Generated invoice number for order ${result.orderNumber}`,
+      metadata: { orderNumber: result.orderNumber, invoiceNumber: result.invoiceNumber },
+    })
+    return { success: true, invoiceNumber: result.invoiceNumber }
   } catch (e) {
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: id,
+      action: 'invoice_generated',
+      tag: 'sales',
+      level: 'ERROR',
+      description: `Failed to generate invoice number: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -880,7 +1076,7 @@ export async function addPayment(input: {
     // Auto-set paidAt on the order if invoice total is fully paid
     const so = await db.salesOrder.findUnique({
       where: { id: input.orderId },
-      select: { totalGbp: true, paidAt: true },
+      select: { wcOrderNumber: true, totalGbp: true, paidAt: true },
     })
     if (so && !so.paidAt) {
       const payments = await db.payment.findMany({
@@ -900,8 +1096,26 @@ export async function addPayment(input: {
     }
 
     revalidatePath(`/sales/${input.orderId}`)
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: input.orderId,
+      action: 'payment_added',
+      tag: 'sales',
+      level: 'INFO',
+      description: `Added £${input.amount.toFixed(2)} payment to order ${so?.wcOrderNumber ?? input.orderId}`,
+      metadata: { orderNumber: so?.wcOrderNumber, amount: input.amount, currency: input.currency, method: input.method },
+    })
     return { success: true }
   } catch (e) {
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: input.orderId,
+      action: 'payment_added',
+      tag: 'sales',
+      level: 'ERROR',
+      description: `Failed to add payment: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -909,9 +1123,28 @@ export async function addPayment(input: {
 export async function deletePayment(paymentId: string, orderId: string): Promise<{ success: boolean; error?: string }> {
   try {
     await db.payment.delete({ where: { id: paymentId } })
+    const so = await db.salesOrder.findUnique({ where: { id: orderId }, select: { wcOrderNumber: true } })
     revalidatePath(`/sales/${orderId}`)
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'payment_deleted',
+      tag: 'sales',
+      level: 'INFO',
+      description: `Deleted payment from order ${so?.wcOrderNumber ?? orderId}`,
+      metadata: { orderNumber: so?.wcOrderNumber, paymentId },
+    })
     return { success: true }
   } catch (e) {
+    logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'payment_deleted',
+      tag: 'sales',
+      level: 'ERROR',
+      description: `Failed to delete payment: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }

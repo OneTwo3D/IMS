@@ -2,6 +2,7 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -69,6 +70,7 @@ export async function createCurrency(input: {
       // Reactivate if inactive
       if (!exists.active) {
         await db.currency.update({ where: { code }, data: { active: true, name: input.name, symbol: input.symbol } })
+        logActivity({ entityType: 'CURRENCY', entityId: code, tag: 'settings', action: 'created', description: `Added currency: ${code}` })
         revalidatePath('/settings')
         return { success: true }
       }
@@ -82,9 +84,11 @@ export async function createCurrency(input: {
     // Immediately fetch FX rate for this currency
     await fetchSingleFxRate(code)
 
+    logActivity({ entityType: 'CURRENCY', entityId: code, tag: 'settings', action: 'created', description: `Added currency: ${code}` })
     revalidatePath('/settings')
     return { success: true }
   } catch (e) {
+    logActivity({ entityType: 'CURRENCY', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to add currency: ${input.code}` })
     return { success: false, error: String(e) }
   }
 }
@@ -93,9 +97,11 @@ export async function toggleCurrency(code: string, active: boolean): Promise<{ s
   try {
     if (code === 'GBP') return { success: false, error: 'Cannot deactivate base currency' }
     await db.currency.update({ where: { code }, data: { active } })
+    logActivity({ entityType: 'CURRENCY', entityId: code, tag: 'settings', action: 'updated', description: `Toggled currency ${code} ${active ? 'on' : 'off'}` })
     revalidatePath('/settings')
     return { success: true }
   } catch (e) {
+    logActivity({ entityType: 'CURRENCY', entityId: code, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to toggle currency ${code}` })
     return { success: false, error: String(e) }
   }
 }
@@ -167,10 +173,18 @@ export async function fetchAllFxRates(): Promise<{ success: boolean; updated: st
       }
     }
 
-    revalidatePath('/settings')
+    // Record last fetched timestamp
+    await db.setting.upsert({
+      where: { key: 'fx_last_fetched' },
+      create: { key: 'fx_last_fetched', value: new Date().toISOString() },
+      update: { value: new Date().toISOString() },
+    })
+    logActivity({ entityType: 'SYNC', tag: 'sync', action: 'fx_rates_fetched', description: `Fetched FX rates for ${updated.length} currencies` })
+    revalidatePath('/settings', 'layout')
     revalidatePath('/purchase-orders')
     return { success: true, updated, failed }
   } catch (e) {
+    logActivity({ entityType: 'SYNC', tag: 'sync', action: 'fx_rates_fetched', level: 'ERROR', description: `Failed to fetch FX rates: ${String(e)}` })
     return { success: false, updated: [], failed: [], error: String(e) }
   }
 }

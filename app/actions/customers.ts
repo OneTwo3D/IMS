@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
+import { logActivity } from '@/lib/activity-log'
 
 export type AddressData = {
   line1?: string
@@ -109,8 +110,10 @@ export async function createCustomer(input: CustomerInput): Promise<{ success: b
     })
     revalidatePath('/sales/contacts')
     revalidatePath('/sales')
+    logActivity({ entityType: 'CUSTOMER', entityId: c.id, tag: 'sales', action: 'created', description: `Created customer: ${[input.firstName, input.lastName].filter(Boolean).join(' ')}` })
     return { success: true, customer: mapCustomer(c) }
   } catch (e) {
+    logActivity({ entityType: 'CUSTOMER', tag: 'sales', action: 'created', level: 'ERROR', description: `Failed to create customer: ${String(e)}` })
     return { success: false, error: String(e) }
   }
 }
@@ -134,8 +137,10 @@ export async function updateCustomer(id: string, input: Partial<CustomerInput> &
     })
     revalidatePath('/sales/contacts')
     revalidatePath('/sales')
+    logActivity({ entityType: 'CUSTOMER', entityId: id, tag: 'sales', action: 'updated', description: `Updated customer: ${input.firstName ?? ''}${input.lastName ? ' ' + input.lastName : ''}`.trim() })
     return { success: true }
   } catch (e) {
+    logActivity({ entityType: 'CUSTOMER', entityId: id, tag: 'sales', action: 'updated', level: 'ERROR', description: `Failed to update customer: ${String(e)}` })
     return { success: false, error: String(e) }
   }
 }
@@ -166,8 +171,10 @@ export async function importContactsCsv(formData: FormData): Promise<{ success?:
       count++
     }
     revalidatePath('/sales/contacts')
+    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${count} contacts from CSV` })
     return { success: true, count }
   } catch (e) {
+    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import contacts from CSV: ${String(e)}` })
     return { error: String(e) }
   }
 }

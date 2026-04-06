@@ -1,4 +1,7 @@
 import PDFDocument from 'pdfkit'
+import { readFile } from 'fs/promises'
+import path from 'path'
+import sharp from 'sharp'
 import { db } from '@/lib/db'
 
 // ---------------------------------------------------------------------------
@@ -8,34 +11,47 @@ import { db } from '@/lib/db'
 export type Branding = {
   companyName: string
   legalName: string
+  vatNumber: string
   address: string
   phone: string
   email: string
   website: string
-  logoUrl: string | null
+  salesEmail: string
+  purchasesEmail: string
+  supportEmail: string
+  logoUrl: string | null          // square icon logo
+  documentLogoUrl: string | null  // wide rectangular logo for PDF headers
   primaryColor: string   // hex, e.g. '#1a1a2e'
   accentColor: string    // hex, e.g. '#0f4c81'
 }
 
 export async function getBranding(): Promise<Branding> {
-  const [org, primarySetting, accentSetting] = await Promise.all([
+  const [org, primarySetting, accentSetting, salesEmailSetting, purchasesEmailSetting, supportEmailSetting] = await Promise.all([
     db.organisation.findFirst(),
     db.setting.findUnique({ where: { key: 'brand_primary_color' } }),
     db.setting.findUnique({ where: { key: 'brand_accent_color' } }),
+    db.setting.findUnique({ where: { key: 'email_sales_email' } }),
+    db.setting.findUnique({ where: { key: 'email_purchases_email' } }),
+    db.setting.findUnique({ where: { key: 'email_support_email' } }),
   ])
 
-  const address = [org?.addressLine1, org?.addressLine2, org?.city, org?.postcode, org?.country]
+  const address = [org?.addressLine1, org?.addressLine2, [org?.city, org?.postcode].filter(Boolean).join(' '), org?.country]
     .filter(Boolean)
-    .join(', ')
+    .join('\n')
 
   return {
     companyName: org?.name ?? 'Our Company',
     legalName: org?.legalName ?? org?.name ?? 'Our Company',
+    vatNumber: org?.vatNumber ?? '',
     address,
     phone: org?.phone ?? '',
     email: org?.email ?? '',
     website: org?.website ?? '',
+    salesEmail: salesEmailSetting?.value ?? '',
+    purchasesEmail: purchasesEmailSetting?.value ?? '',
+    supportEmail: supportEmailSetting?.value ?? '',
     logoUrl: org?.logoUrl ?? null,
+    documentLogoUrl: org?.documentLogoUrl ?? null,
     primaryColor: primarySetting?.value ?? '#1a1a2e',
     accentColor: accentSetting?.value ?? '#0f4c81',
   }
@@ -49,6 +65,14 @@ export async function getBranding(): Promise<Branding> {
 function hexToRgb(hex: string): [number, number, number] {
   const h = hex.replace('#', '')
   return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)]
+}
+
+/** Returns white or black text depending on background luminance */
+function contrastText(bgHex: string): string {
+  const [r, g, b] = hexToRgb(bgHex)
+  // Relative luminance (sRGB)
+  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+  return luminance > 0.55 ? '#000000' : '#ffffff'
 }
 
 export type PdfTableColumn = {
@@ -79,7 +103,29 @@ export function createPdfDocument(options?: { title?: string }) {
 /**
  * Draw the document header with company info and recipient
  */
-export function drawHeader(
+/**
+ * Load a logo image from the public directory for embedding in PDFs.
+ * Returns null if the file doesn't exist or isn't a supported format.
+ */
+async function loadLogoBuffer(logoUrl: string | null): Promise<Buffer | null> {
+  if (!logoUrl) return null
+  try {
+    // Strip query string and /api prefix, resolve to filesystem path
+    let urlPath = logoUrl.split('?')[0]
+    if (urlPath.startsWith('/api/')) urlPath = urlPath.slice(4)
+    const filePath = path.join(process.cwd(), 'public', urlPath)
+    const raw = await readFile(filePath)
+    // SVG → convert to PNG via sharp (PDFKit doesn't support SVG natively)
+    if (filePath.endsWith('.svg')) {
+      return Buffer.from(await sharp(raw).resize({ width: 600 }).png().toBuffer())
+    }
+    return raw
+  } catch {
+    return null
+  }
+}
+
+export async function drawHeader(
   doc: PDFKit.PDFDocument,
   branding: Branding,
   opts: {
@@ -97,18 +143,34 @@ export function drawHeader(
   const primaryRgb = hexToRgb(branding.primaryColor)
   const pageWidth = 595.28 - 100
 
-  // Title bar
-  doc
-    .rect(50, 50, pageWidth, 32)
-    .fill(primaryRgb)
+  // Logo row: logo on left, document title right-aligned on same line
+  const logoBuf = await loadLogoBuffer(branding.documentLogoUrl)
+  const logoRowTop = 50
+  const logoHeight = 50
+  if (logoBuf) {
+    try {
+      doc.image(logoBuf, 50, logoRowTop, { width: 180, height: logoHeight, fit: [180, logoHeight] })
+    } catch {
+      // If image fails to load, skip it
+    }
+  }
+
+  // Title — right-aligned, vertically centred with logo, in accent colour
   doc
     .font('Helvetica-Bold')
-    .fontSize(14)
-    .fillColor('#ffffff')
-    .text(opts.title, 60, 58, { width: pageWidth - 20 })
+    .fontSize(20)
+    .fillColor(hexToRgb(branding.accentColor))
+    .text(opts.title.toUpperCase(), 50, logoRowTop + (logoBuf ? 15 : 0), { width: pageWidth, align: 'right' })
+
+  const headerTop = logoRowTop + logoHeight + 12
+
+  // Coloured accent bar
+  doc
+    .rect(50, headerTop, pageWidth, 3)
+    .fill(primaryRgb)
 
   doc.fillColor('#000000')
-  doc.y = 95
+  doc.y = headerTop + 12
 
   // From / To columns
   const colW = pageWidth / 2
@@ -174,13 +236,17 @@ export function drawTable(
 
   let y = doc.y
 
-  // Header background
+  // Header background — light tint of accent colour
   const totalWidth = columns.reduce((s, c) => s + c.width, 0)
-  doc.rect(startX, y, totalWidth, headerHeight).fill([...accentRgb, 0.1] as unknown as string)
+  // Mix accent RGB with white at 15% opacity for a subtle tint
+  const tintR = Math.round(accentRgb[0] + (255 - accentRgb[0]) * 0.85)
+  const tintG = Math.round(accentRgb[1] + (255 - accentRgb[1]) * 0.85)
+  const tintB = Math.round(accentRgb[2] + (255 - accentRgb[2]) * 0.85)
+  doc.rect(startX, y, totalWidth, headerHeight).fill([tintR, tintG, tintB])
 
-  // Header text
+  // Header text — dark colour matching accent
   let x = startX
-  doc.font('Helvetica-Bold').fontSize(7).fillColor('#444444')
+  doc.font('Helvetica-Bold').fontSize(7).fillColor(accentRgb)
   for (const col of columns) {
     const textOpts = { width: col.width - 8, align: (col.align ?? 'left') as 'left' | 'right' | 'center' }
     doc.text(col.label.toUpperCase(), x + 4, y + 7, textOpts)
@@ -223,18 +289,31 @@ export function drawTable(
 }
 
 /**
- * Draw a footer note
+ * Draw a footer note. If customFooter is provided it appears as a separate
+ * free-text block at the very bottom of the page.
  */
-export function drawFooter(doc: PDFKit.PDFDocument, text: string, branding: Branding) {
+export function drawFooter(doc: PDFKit.PDFDocument, text: string, branding: Branding, opts?: { customFooter?: string | null; contactEmail?: string | null }) {
   if (doc.y > 720) doc.addPage()
   doc.y += 10
+  const pw = 595.28 - 100
   doc
     .font('Helvetica')
     .fontSize(8)
     .fillColor('#888888')
-    .text(text, 50, doc.y, { width: 595.28 - 100, align: 'center' })
-  if (branding.email) {
-    doc.text(`Contact: ${branding.email}`, { width: 595.28 - 100, align: 'center' })
+    .text(text, 50, doc.y, { width: pw, align: 'center' })
+  const email = opts?.contactEmail || branding.email
+  if (email) {
+    doc.text(`Contact: ${email}`, { width: pw, align: 'center' })
+  }
+  const customFooter = opts?.customFooter
+  // Custom footer — free text at the bottom
+  if (customFooter) {
+    const pageBottom = 842 - 50 // A4 height minus bottom margin
+    const footerHeight = 30
+    const footerY = Math.max(doc.y + 20, pageBottom - footerHeight)
+    doc.moveTo(50, footerY - 5).lineTo(545, footerY - 5).lineWidth(0.25).strokeColor('#dddddd').stroke()
+    doc.font('Helvetica').fontSize(7).fillColor('#888888')
+      .text(customFooter, 50, footerY, { width: 595.28 - 100, align: 'center' })
   }
 }
 

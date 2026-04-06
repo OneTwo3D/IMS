@@ -63,20 +63,22 @@ export function DatabaseReset() {
     <div className="space-y-4">
       <div className="grid grid-cols-3 gap-3">
         {LEVELS.map((l) => (
-          <div key={l.key} className={`rounded-md border p-4 space-y-2 ${l.key === 'full' ? 'border-destructive/50' : ''}`}>
+          <div key={l.key} className={`rounded-md border p-4 flex flex-col ${l.key === 'full' ? 'border-destructive/50' : ''}`}>
             <h3 className="text-sm font-medium">{l.label}</h3>
-            <p className="text-xs text-muted-foreground">{l.description}</p>
-            <ul className="text-xs text-muted-foreground space-y-0.5 list-disc pl-4">
+            <p className="text-xs text-muted-foreground mt-2">{l.description}</p>
+            <ul className="text-xs text-muted-foreground space-y-0.5 list-disc pl-4 mt-2">
               {l.items.map((item, i) => <li key={i}>{item}</li>)}
             </ul>
-            <Button
-              variant={l.key === 'full' ? 'destructive' : 'outline'}
-              size="sm"
-              className="w-full mt-2"
-              onClick={() => { setSelectedLevel(l.key); setShowDialog(true); setConfirmation(''); setResult(null) }}
-            >
-              {l.label}
-            </Button>
+            <div className="mt-auto pt-4">
+              <Button
+                variant={l.key === 'full' ? 'destructive' : 'outline'}
+                size="sm"
+                className="w-full"
+                onClick={() => { setSelectedLevel(l.key); setShowDialog(true); setConfirmation(''); setResult(null) }}
+              >
+                {l.label}
+              </Button>
+            </div>
           </div>
         ))}
       </div>

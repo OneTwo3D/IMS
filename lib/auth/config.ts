@@ -31,12 +31,20 @@ export const authConfig: NextAuthConfig = {
       if (isLoggedIn) return true
       return false // redirect to /login
     },
-    jwt({ token, user }) {
+    jwt({ token, user, trigger, session }) {
       if (user) {
         token.id = user.id
         token.role = (user as { role?: string }).role
         token.totpEnabled = (user as { totpEnabled?: boolean }).totpEnabled
         token.totpVerified = (user as { totpVerified?: boolean }).totpVerified ?? false
+        token.pictureUrl = (user as { pictureUrl?: string | null }).pictureUrl ?? null
+      }
+      // Allow client-side session.update() to refresh token fields
+      if (trigger === 'update' && session) {
+        if (session.pictureUrl !== undefined) token.pictureUrl = session.pictureUrl
+        if (session.totpVerified !== undefined) token.totpVerified = session.totpVerified
+        if (session.totpEnabled !== undefined) token.totpEnabled = session.totpEnabled
+        if (session.name !== undefined) token.name = session.name
       }
       return token
     },
@@ -46,12 +54,14 @@ export const authConfig: NextAuthConfig = {
         session.user.role = token.role as string
         session.user.totpEnabled = token.totpEnabled as boolean
         session.user.totpVerified = token.totpVerified as boolean
+        session.user.pictureUrl = token.pictureUrl as string | null
       }
       return session
     },
   },
   providers: [
     Credentials({
+      id: 'credentials',
       async authorize(credentials) {
         const parsed = loginSchema.safeParse(credentials)
         if (!parsed.success) return null
@@ -64,6 +74,7 @@ export const authConfig: NextAuthConfig = {
             name: true,
             passwordHash: true,
             role: true,
+            pictureUrl: true,
             totpEnabled: true,
             active: true,
           },
@@ -82,8 +93,48 @@ export const authConfig: NextAuthConfig = {
           email: user.email,
           name: user.name,
           role: user.role,
+          pictureUrl: user.pictureUrl,
           totpEnabled: user.totpEnabled,
-          totpVerified: false, // always start unverified; TOTP challenge sets this
+          totpVerified: false,
+        }
+      },
+    }),
+    Credentials({
+      id: 'passkey',
+      credentials: {
+        userId: { type: 'text' },
+      },
+      async authorize(credentials) {
+        // This provider is only called after WebAuthn verification succeeds on the client.
+        // The server action verifyPasskeyAuthentication already verified the passkey,
+        // so we just look up the user by ID here.
+        const userId = credentials?.userId as string | undefined
+        if (!userId) return null
+
+        const user = await db.user.findUnique({
+          where: { id: userId },
+          select: {
+            id: true,
+            email: true,
+            name: true,
+            role: true,
+            pictureUrl: true,
+            totpEnabled: true,
+            active: true,
+          },
+        })
+
+        if (!user || !user.active) return null
+
+        return {
+          id: user.id,
+          email: user.email,
+          name: user.name,
+          role: user.role,
+          pictureUrl: user.pictureUrl,
+          totpEnabled: user.totpEnabled,
+          // Passkey counts as strong auth — skip TOTP
+          totpVerified: true,
         }
       },
     }),

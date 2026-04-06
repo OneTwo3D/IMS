@@ -2,6 +2,7 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -711,8 +712,27 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
     }
 
     revalidatePath('/purchase-orders')
-    return { success: true, po: mapPoRow(po) }
+    const mapped = mapPoRow(po)
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: mapped.id,
+      action: 'created',
+      tag: 'purchase',
+      level: 'INFO',
+      description: `Created PO ${mapped.reference} for ${mapped.supplierName}`,
+      metadata: { reference: mapped.reference, supplierId: input.supplierId, currency: input.currency, lineCount: input.lines.length },
+    })
+    return { success: true, po: mapped }
   } catch (e) {
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: null,
+      action: 'created',
+      tag: 'purchase',
+      level: 'ERROR',
+      description: `Failed to create PO: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -783,8 +803,27 @@ export async function updatePurchaseOrder(
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
-    return { success: true, po: mapPoRow(po) }
+    const mapped = mapPoRow(po)
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: id,
+      action: 'updated',
+      tag: 'purchase',
+      level: 'INFO',
+      description: `Updated PO ${mapped.reference}`,
+      metadata: { reference: mapped.reference },
+    })
+    return { success: true, po: mapped }
   } catch (e) {
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: id,
+      action: 'updated',
+      tag: 'purchase',
+      level: 'ERROR',
+      description: `Failed to update PO ${id}: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -794,7 +833,7 @@ export async function advancePoStatus(
   targetStatus: 'PO_SENT' | 'RFQ_SENT',
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    const existing = await db.purchaseOrder.findUnique({ where: { id }, select: { status: true } })
+    const existing = await db.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
     if (!existing) return { success: false, error: 'PO not found' }
 
     const now = new Date()
@@ -805,8 +844,26 @@ export async function advancePoStatus(
     await db.purchaseOrder.update({ where: { id }, data })
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: id,
+      action: 'status_changed',
+      tag: 'purchase',
+      level: 'INFO',
+      description: `Advanced PO ${existing.reference} to ${targetStatus}`,
+      metadata: { reference: existing.reference, previousStatus: existing.status, newStatus: targetStatus },
+    })
     return { success: true }
   } catch (e) {
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: id,
+      action: 'status_changed',
+      tag: 'purchase',
+      level: 'ERROR',
+      description: `Failed to advance PO ${id} status: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -972,23 +1029,77 @@ export async function receivePurchaseOrder(
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: id,
+      action: 'received',
+      tag: 'purchase',
+      level: 'INFO',
+      description: `Received PO ${po.reference} (${linesWithQty.length} lines)`,
+      metadata: { reference: po.reference, lineCount: linesWithQty.length, newStatus },
+    })
+
+    // Log stock movement for the receipt
+    const receiptWarehouseNames = await db.warehouse.findMany({
+      where: { id: { in: linesWithQty.map((rl) => rl.warehouseId) } },
+      select: { id: true, name: true },
+    })
+    const whNameMap = Object.fromEntries(receiptWarehouseNames.map((w) => [w.id, w.name]))
+    const warehouseNamesList = [...new Set(linesWithQty.map((rl) => whNameMap[rl.warehouseId] ?? rl.warehouseId))].join(', ')
+    logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      entityId: id,
+      action: 'purchase_receipt',
+      tag: 'stock',
+      level: 'INFO',
+      description: `Received ${linesWithQty.length} lines for PO ${po.reference} into ${warehouseNamesList}`,
+      metadata: { reference: po.reference, lineCount: linesWithQty.length },
+    })
+
     return { success: true }
   } catch (e) {
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: id,
+      action: 'received',
+      tag: 'purchase',
+      level: 'ERROR',
+      description: `Failed to receive PO ${id}: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
 
 export async function cancelPurchaseOrder(id: string): Promise<{ success: boolean; error?: string }> {
   try {
-    const existing = await db.purchaseOrder.findUnique({ where: { id }, select: { status: true } })
+    const existing = await db.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
     if (!existing) return { success: false, error: 'PO not found' }
     if (existing.status !== 'DRAFT') return { success: false, error: 'Only DRAFT POs can be cancelled' }
 
     await db.purchaseOrder.update({ where: { id }, data: { status: 'CANCELLED' } })
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: id,
+      action: 'cancelled',
+      tag: 'purchase',
+      level: 'INFO',
+      description: `Cancelled PO ${existing.reference}`,
+      metadata: { reference: existing.reference },
+    })
     return { success: true }
   } catch (e) {
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: id,
+      action: 'cancelled',
+      tag: 'purchase',
+      level: 'ERROR',
+      description: `Failed to cancel PO ${id}: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -1116,8 +1227,38 @@ export async function returnPurchaseOrder(
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: id,
+      action: 'returned',
+      tag: 'purchase',
+      level: 'INFO',
+      description: `Created return for PO ${po.reference}`,
+      metadata: { reference: po.reference, lineCount: linesWithQty.length, reason },
+    })
+
+    // Log stock movement for the return
+    logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      entityId: id,
+      action: 'purchase_return',
+      tag: 'stock',
+      level: 'INFO',
+      description: `Returned stock for PO ${po.reference}`,
+      metadata: { reference: po.reference, lineCount: linesWithQty.length, reason },
+    })
+
     return { success: true }
   } catch (e) {
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: id,
+      action: 'returned',
+      tag: 'purchase',
+      level: 'ERROR',
+      description: `Failed to return PO ${id}: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -1177,6 +1318,7 @@ export async function createInvoice(
       where: { id: poId },
       select: {
         id: true,
+        reference: true,
         status: true,
         fxRateToGbp: true,
         taxForeign: true,
@@ -1243,8 +1385,26 @@ export async function createInvoice(
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${poId}`)
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: poId,
+      action: 'invoiced',
+      tag: 'purchase',
+      level: 'INFO',
+      description: `Created invoice for PO ${po.reference}`,
+      metadata: { reference: po.reference, invoiceNumber: input.invoiceNumber ?? null, lineCount: linesWithQty.length },
+    })
     return { success: true }
   } catch (e) {
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: poId,
+      action: 'invoiced',
+      tag: 'purchase',
+      level: 'ERROR',
+      description: `Failed to create invoice for PO ${poId}: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -1333,8 +1493,27 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
       revalidatePath(`/purchase-orders/${pid}`)
     }
     revalidatePath('/purchase-orders')
-    return { success: true, po: mapPoRow(po) }
+    const mapped = mapPoRow(po)
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: mapped.id,
+      action: 'created',
+      tag: 'purchase',
+      level: 'INFO',
+      description: `Created freight PO ${mapped.reference}`,
+      metadata: { reference: mapped.reference, supplierId: input.supplierId, primaryPoIds: input.primaryPoIds, costLineCount: input.costLines.length },
+    })
+    return { success: true, po: mapped }
   } catch (e) {
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: null,
+      action: 'created',
+      tag: 'purchase',
+      level: 'ERROR',
+      description: `Failed to create freight PO: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }
@@ -1426,7 +1605,7 @@ export async function updateFreightPoCosts(
   try {
     const po = await db.purchaseOrder.findUnique({
       where: { id: freightPoId },
-      select: { id: true, type: true, fxRateToGbp: true },
+      select: { id: true, reference: true, type: true, fxRateToGbp: true },
     })
     if (!po) return { success: false, error: 'PO not found' }
     if (po.type !== 'FREIGHT') return { success: false, error: 'Not a freight PO' }
@@ -1479,8 +1658,26 @@ export async function updateFreightPoCosts(
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${freightPoId}`)
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: freightPoId,
+      action: 'updated',
+      tag: 'purchase',
+      level: 'INFO',
+      description: `Updated freight costs for PO ${po.reference}`,
+      metadata: { reference: po.reference, costLineCount: costLines.length },
+    })
     return { success: true }
   } catch (e) {
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: freightPoId,
+      action: 'updated',
+      tag: 'purchase',
+      level: 'ERROR',
+      description: `Failed to update freight costs for PO ${freightPoId}: ${String(e)}`,
+      metadata: null,
+    })
     return { success: false, error: String(e) }
   }
 }

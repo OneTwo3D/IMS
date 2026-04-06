@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
+import { logActivity } from '@/lib/activity-log'
 
 export type SupplierRow = {
   id: string
@@ -151,8 +152,10 @@ export async function createSupplier(input: SupplierInput): Promise<{ success: b
       select: SUPPLIER_SELECT,
     })
     revalidatePath('/purchase-orders')
+    logActivity({ entityType: 'SUPPLIER', entityId: s.id, tag: 'purchase', action: 'created', description: `Created supplier: ${input.name}` })
     return { success: true, supplier: mapSupplier(s) }
   } catch (e) {
+    logActivity({ entityType: 'SUPPLIER', tag: 'purchase', action: 'created', level: 'ERROR', description: `Failed to create supplier: ${String(e)}` })
     return { success: false, error: String(e) }
   }
 }
@@ -183,8 +186,10 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
       select: SUPPLIER_SELECT,
     })
     revalidatePath('/purchase-orders')
+    logActivity({ entityType: 'SUPPLIER', entityId: s.id, tag: 'purchase', action: 'updated', description: `Updated supplier: ${s.name}` })
     return { success: true, supplier: mapSupplier(s) }
   } catch (e) {
+    logActivity({ entityType: 'SUPPLIER', entityId: id, tag: 'purchase', action: 'updated', level: 'ERROR', description: `Failed to update supplier: ${String(e)}` })
     return { success: false, error: String(e) }
   }
 }
@@ -211,8 +216,10 @@ export async function importSuppliersCsv(formData: FormData): Promise<{ success?
       count++
     }
     revalidatePath('/purchase-orders/suppliers')
+    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${count} suppliers from CSV` })
     return { success: true, count }
   } catch (e) {
+    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import suppliers from CSV: ${String(e)}` })
     return { error: String(e) }
   }
 }

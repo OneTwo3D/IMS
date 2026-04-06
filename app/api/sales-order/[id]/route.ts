@@ -59,28 +59,31 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 
   drawTable(doc, columns, rows, branding)
 
-  // Totals
+  // Totals — aligned with last table column
   doc.y += 5
-  const rX = 395
+  const tableRight = 50 + columns.reduce((s, c) => s + c.width, 0)
+  const vW = columns[columns.length - 1].width
+  const lW = 80
+  const lX = tableRight - vW - lW
   doc.font('Helvetica').fontSize(9).fillColor('#666')
-  doc.text(`Subtotal:`, rX, doc.y, { width: 60, align: 'right' })
-  doc.text(`${Number(so.subtotalForeign).toFixed(2)}${sym}`, rX + 65, doc.y - doc.currentLineHeight(), { width: 50, align: 'right' })
+  doc.text('Subtotal:', lX, doc.y, { width: lW, align: 'right' })
+  doc.text(`${Number(so.subtotalForeign).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
   if (Number(so.discountAmount) > 0) {
-    doc.text(`Discount:`, rX, doc.y, { width: 60, align: 'right' })
-    doc.text(`-${Number(so.discountAmount).toFixed(2)}${sym}`, rX + 65, doc.y - doc.currentLineHeight(), { width: 50, align: 'right' })
+    doc.text('Discount:', lX, doc.y, { width: lW, align: 'right' })
+    doc.text(`-${Number(so.discountAmount).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
   }
   if (Number(so.shippingForeign) > 0) {
-    doc.text(`Shipping:`, rX, doc.y, { width: 60, align: 'right' })
-    doc.text(`${Number(so.shippingForeign).toFixed(2)}${sym}`, rX + 65, doc.y - doc.currentLineHeight(), { width: 50, align: 'right' })
+    doc.text('Shipping:', lX, doc.y, { width: lW, align: 'right' })
+    doc.text(`${Number(so.shippingForeign).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
   }
   if (Number(so.taxForeign) > 0) {
     const taxLabel = (so.taxRateName ?? 'Tax') + (so.taxRatePercent != null ? ` (${(Number(so.taxRatePercent) * 100).toFixed(0)}%)` : '') + ':'
-    doc.text(taxLabel, rX - 20, doc.y, { width: 80, align: 'right' })
-    doc.text(`${Number(so.taxForeign).toFixed(2)}${sym}`, rX + 65, doc.y - doc.currentLineHeight(), { width: 50, align: 'right' })
+    doc.text(taxLabel, lX, doc.y, { width: lW, align: 'right' })
+    doc.text(`${Number(so.taxForeign).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
   }
   doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
-  doc.text(`Total:`, rX, doc.y + 3, { width: 60, align: 'right' })
-  doc.text(`${Number(so.totalForeign).toFixed(2)}${sym}`, rX + 65, doc.y - doc.currentLineHeight(), { width: 50, align: 'right' })
+  doc.text('Total:', lX, doc.y + 3, { width: lW, align: 'right' })
+  doc.text(`${Number(so.totalForeign).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
 
   if (so.notes) {
     doc.y += 15
@@ -88,7 +91,8 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     doc.font('Helvetica').fontSize(9).fillColor('#333').text(so.notes, 50, doc.y + 2, { width: 495 })
   }
 
-  drawFooter(doc, 'Thank you for your order.', branding)
+  const tpl = await db.documentTemplate.findUnique({ where: { type: 'sales_order' }, select: { customFooter: true } })
+  drawFooter(doc, 'Thank you for your order.', branding, { customFooter: tpl?.customFooter, contactEmail: branding.salesEmail })
   const buffer = await pdfToBuffer(doc)
   return new NextResponse(new Uint8Array(buffer), {
     headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="Order-${so.wcOrderNumber}.pdf"` },

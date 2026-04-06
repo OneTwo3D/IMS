@@ -7,6 +7,7 @@ declare module 'next-auth' {
       role: string
       totpEnabled: boolean
       totpVerified: boolean
+      pictureUrl: string | null
     } & DefaultSession['user']
   }
 }

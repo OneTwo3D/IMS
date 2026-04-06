@@ -1,5 +1,5 @@
 import { NextRequest } from 'next/server'
-import { getProductSalesStats, getShipments, getInvoiceStats, getRefundStats, getCustomerAging } from '@/app/actions/sales-stats'
+import { getProductSalesStats, getShipments, getDetails, getInvoiceStats, getRefundStats, getCustomerAging } from '@/app/actions/sales-stats'
 import { getPurchaseProductStats, getReceivedGoods, getPurchaseBills, getSupplierAging, getPurchaseDetails } from '@/app/actions/purchase-stats'
 import { getStockOnHand, getStockMovements, getStockAllocations, getReorderInventory } from '@/app/actions/inventory-stats'
 import { generateForecasts } from '@/app/actions/forecasting'
@@ -32,43 +32,56 @@ export async function GET(req: NextRequest) {
     case 'shipments': {
       const rows = await getShipments(dateFrom, dateTo)
       const data = rows.map((r) => ({
-        orderNumber: r.orderNumber, customerName: r.customerName,
-        shippedAt: r.shippedAt.slice(0, 10), shippingService: r.shippingService,
-        trackingNumber: r.trackingNumber, warehouse: r.warehouse,
-        lineCount: r.lineCount, totalGbp: r.totalGbp.toFixed(2),
+        productName: r.productName, orderNumber: r.orderNumber, trackingNumber: r.trackingNumber,
+        sku: r.sku, barcode: r.barcode, customerName: r.customerName, salesRep: r.salesRep,
+        qty: r.qty, shippingService: r.shippingService, shippedAt: r.shippedAt.slice(0, 10),
+        warehouse: r.warehouse, totalGbp: r.totalGbp.toFixed(2),
       }))
-      return csvResponse(toCsv(data, ['orderNumber', 'customerName', 'shippedAt', 'shippingService', 'trackingNumber', 'warehouse', 'lineCount', 'totalGbp']), `shipments-${date}.csv`)
+      return csvResponse(toCsv(data, ['productName', 'orderNumber', 'trackingNumber', 'sku', 'barcode', 'customerName', 'salesRep', 'qty', 'shippingService', 'shippedAt', 'warehouse', 'totalGbp']), `shipments-${date}.csv`)
+    }
+
+    case 'details': {
+      const rows = await getDetails(dateFrom, dateTo)
+      const data = rows.map((r) => ({
+        productName: r.productName, sku: r.sku, barcode: r.barcode,
+        customerName: r.customerName, salesRep: r.salesRep, status: r.status,
+        qty: r.qty, totalGbp: r.totalGbp.toFixed(2), createdAt: r.createdAt.slice(0, 10),
+      }))
+      return csvResponse(toCsv(data, ['productName', 'sku', 'barcode', 'customerName', 'salesRep', 'status', 'qty', 'totalGbp', 'createdAt']), `sales-details-${date}.csv`)
     }
 
     case 'invoices': {
       const rows = await getInvoiceStats(dateFrom, dateTo)
       const data = rows.map((r) => ({
-        invoiceNumber: r.invoiceNumber, orderNumber: r.orderNumber,
-        customerName: r.customerName, invoicedAt: r.invoicedAt.slice(0, 10),
-        totalGbp: r.totalGbp.toFixed(2), paidAt: r.paidAt?.slice(0, 10) ?? '',
-        balance: r.balance.toFixed(2),
+        productName: r.productName, orderNumber: r.orderNumber, invoiceNumber: r.invoiceNumber,
+        invoicedAt: r.invoicedAt.slice(0, 10), sku: r.sku, customerName: r.customerName,
+        salesRep: r.salesRep, status: r.paidAt ? 'Paid' : 'Unpaid', qty: r.qty,
+        totalGbp: r.totalGbp.toFixed(2), balance: r.balance.toFixed(2),
       }))
-      return csvResponse(toCsv(data, ['invoiceNumber', 'orderNumber', 'customerName', 'invoicedAt', 'totalGbp', 'paidAt', 'balance']), `invoices-${date}.csv`)
+      return csvResponse(toCsv(data, ['productName', 'orderNumber', 'invoiceNumber', 'invoicedAt', 'sku', 'customerName', 'salesRep', 'status', 'qty', 'totalGbp', 'balance']), `invoices-${date}.csv`)
     }
 
     case 'refunds': {
       const rows = await getRefundStats(dateFrom, dateTo)
       const data = rows.map((r) => ({
-        creditNoteNumber: r.creditNoteNumber, orderNumber: r.orderNumber,
-        customerName: r.customerName, refundedAt: r.refundedAt.slice(0, 10),
-        reason: r.reason, totalGbp: r.totalGbp.toFixed(2),
+        productName: r.productName, orderNumber: r.orderNumber, creditNoteNumber: r.creditNoteNumber,
+        refundedAt: r.refundedAt.slice(0, 10), salesRep: r.salesRep, qty: r.qty,
+        totalGbp: r.totalGbp.toFixed(2), pctOfSale: r.pctOfSale, reason: r.reason,
       }))
-      return csvResponse(toCsv(data, ['creditNoteNumber', 'orderNumber', 'customerName', 'refundedAt', 'reason', 'totalGbp']), `refunds-${date}.csv`)
+      return csvResponse(toCsv(data, ['productName', 'orderNumber', 'creditNoteNumber', 'refundedAt', 'salesRep', 'qty', 'totalGbp', 'pctOfSale', 'reason']), `refunds-${date}.csv`)
     }
 
     case 'aging': {
       const rows = await getCustomerAging()
       const data = rows.map((r) => ({
-        customerName: r.customerName, totalInvoiced: r.totalInvoiced.toFixed(2),
-        totalPaid: r.totalPaid.toFixed(2), outstanding: r.outstanding.toFixed(2),
-        overdueAmount: r.overdueAmount.toFixed(2), oldestUnpaidDays: r.oldestUnpaidDays,
+        orderNumber: r.orderNumber, customerName: r.customerName, salesRep: r.salesRep,
+        warehouse: r.warehouse, createdAt: r.createdAt.slice(0, 10),
+        salesTotal: r.salesTotal.toFixed(2), refundsTotal: r.refundsTotal.toFixed(2),
+        netTotal: r.netTotal.toFixed(2), dueAmount: r.dueAmount.toFixed(2), avgDso: r.avgDso,
+        overdue0_30: r.overdue0_30.toFixed(2), overdue31_60: r.overdue31_60.toFixed(2),
+        overdue61_90: r.overdue61_90.toFixed(2), overdue91plus: r.overdue91plus.toFixed(2),
       }))
-      return csvResponse(toCsv(data, ['customerName', 'totalInvoiced', 'totalPaid', 'outstanding', 'overdueAmount', 'oldestUnpaidDays']), `customer-aging-${date}.csv`)
+      return csvResponse(toCsv(data, ['orderNumber', 'customerName', 'salesRep', 'warehouse', 'createdAt', 'salesTotal', 'refundsTotal', 'netTotal', 'dueAmount', 'avgDso', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus']), `customer-aging-${date}.csv`)
     }
 
     case 'forecast': {

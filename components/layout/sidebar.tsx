@@ -50,15 +50,29 @@ const ANALYTICS_CHILDREN = [
   { href: '/analytics/forecast',        label: 'Reorder Forecast' },
 ]
 
+const SETTINGS_CHILDREN = [
+  { href: '/settings/company',     label: 'Company' },
+  { href: '/settings/inventory',   label: 'Inventory' },
+  { href: '/settings/sales',       label: 'Sales' },
+  { href: '/settings/purchasing',  label: 'Purchasing' },
+  { href: '/settings/accounting',  label: 'Accounting' },
+  { href: '/settings/backup',      label: 'Backup & Restore' },
+  { href: '/settings/system',      label: 'System' },
+]
+
 const NAV_ITEMS_BOTTOM = [
   { href: '/manufacturing',   label: 'Manufacturing',    icon: Factory },
   { href: '/sync',            label: 'Sync',             icon: RefreshCw },
   { href: '/activity',        label: 'Activity',         icon: ActivitySquare },
-  { href: '/settings',        label: 'Settings',         icon: Settings },
   { href: '/help',            label: 'Help',             icon: HelpCircle },
 ]
 
-export function Sidebar() {
+type SidebarProps = {
+  companyName?: string
+  logoUrl?: string | null
+}
+
+export function Sidebar({ companyName, logoUrl }: SidebarProps = {}) {
   const [collapsed, setCollapsed] = useState(false)
 
   return (
@@ -71,10 +85,15 @@ export function Sidebar() {
       {/* Logo */}
       <div className={cn('flex h-14 items-center border-b px-3', collapsed && 'justify-center')}>
         <Link href="/dashboard" className="flex items-center gap-2 font-semibold">
-          <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground text-xs font-bold">
-            12
-          </span>
-          {!collapsed && <span className="text-sm">OneTwo3D IMS</span>}
+          {logoUrl ? (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img src={logoUrl} alt="" className="h-7 w-7 shrink-0 rounded-md object-contain" />
+          ) : (
+            <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground text-xs font-bold">
+              12
+            </span>
+          )}
+          {!collapsed && <span className="text-sm">{companyName || 'One Two Inventory'}</span>}
         </Link>
       </div>
 
@@ -110,6 +129,12 @@ export function Sidebar() {
         {NAV_ITEMS_BOTTOM.map((item) => (
           <NavItem key={item.href} {...item} collapsed={collapsed} />
         ))}
+        <NavGroup
+          label="Settings"
+          icon={Settings}
+          children={SETTINGS_CHILDREN}
+          collapsed={collapsed}
+        />
       </nav>
 
       <Separator />

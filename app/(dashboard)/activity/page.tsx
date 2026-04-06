@@ -1,12 +1,14 @@
 import type { Metadata } from 'next'
+import { getActivityLogs, getActivityTags } from '@/app/actions/activity-log'
+import { ActivityClient } from './activity-client'
 
-export const metadata: Metadata = { title: 'Activity' }
+export const metadata: Metadata = { title: 'Activity Log' }
 
-export default function Page() {
-  return (
-    <div>
-      <h1 className="text-2xl font-semibold capitalize">activity</h1>
-      <p className="mt-2 text-muted-foreground">This module is under construction.</p>
-    </div>
-  )
+export default async function Page() {
+  const [{ rows, total }, tags] = await Promise.all([
+    getActivityLogs({ page: 1, pageSize: 50 }),
+    getActivityTags(),
+  ])
+
+  return <ActivityClient initialRows={rows} initialTotal={total} availableTags={tags} />
 }

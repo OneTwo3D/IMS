@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { redirect } from 'next/navigation'
 import { z } from 'zod'
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 import { ProductType } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -300,15 +301,15 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       const rows = p.stockLevels.map((s) => {
         const wid = s.warehouse.id
         const qty = Number(s.quantity)
-        const allocated = allocatedByWarehouse.get(wid) ?? 0
-        const available = qty - allocated
+        const reserved = Number(s.reservedQty)
+        const available = qty - reserved
         return {
           warehouseId: wid,
           warehouseCode: s.warehouse.code,
           warehouseName: s.warehouse.name,
           quantity: qty.toFixed(2),
           reservedQty: s.reservedQty.toString(),
-          allocatedQty: allocated.toFixed(2),
+          allocatedQty: reserved.toFixed(2),
           availableQty: available.toFixed(2),
           incomingTransferQty: (incomingTransferByWarehouse.get(wid) ?? 0).toFixed(2),
           incomingPoQty: (incomingPoByWarehouse.get(wid) ?? 0).toFixed(2),
@@ -441,6 +442,16 @@ export async function createProduct(
     },
   })
 
+  logActivity({
+    entityType: 'PRODUCT',
+    entityId: null,
+    action: 'created',
+    tag: 'inventory',
+    level: 'INFO',
+    description: `Created product ${data.sku} — ${data.name}`,
+    metadata: { sku: data.sku, name: data.name, type: data.type },
+  })
+
   revalidatePath('/inventory')
   redirect('/inventory')
 }
@@ -504,6 +515,16 @@ export async function updateProduct(
       depthCm: data.depthCm || null,
       active: data.active,
     },
+  })
+
+  logActivity({
+    entityType: 'PRODUCT',
+    entityId: id,
+    action: 'updated',
+    tag: 'inventory',
+    level: 'INFO',
+    description: `Updated product ${data.sku} — ${data.name}`,
+    metadata: { sku: data.sku, name: data.name, type: data.type },
   })
 
   revalidatePath('/inventory')
@@ -714,10 +735,30 @@ export async function saveProductComponents(
         })),
       })
     }
+    logActivity({
+      entityType: 'PRODUCT',
+      entityId: productId,
+      action: 'updated',
+      tag: 'manufacturing',
+      level: 'INFO',
+      description: `Updated BOM/kit components for product ${productId}`,
+      metadata: { componentCount: components.length },
+    })
+
     revalidatePath(`/inventory/${productId}`)
     return { success: true }
   } catch (e: unknown) {
-    return { success: false, error: e instanceof Error ? e.message : 'Failed to save components' }
+    const errorMsg = e instanceof Error ? e.message : 'Failed to save components'
+    logActivity({
+      entityType: 'PRODUCT',
+      entityId: productId,
+      action: 'updated',
+      tag: 'manufacturing',
+      level: 'ERROR',
+      description: `Failed to update BOM/kit components for product ${productId}`,
+      metadata: { error: errorMsg },
+    })
+    return { success: false, error: errorMsg }
   }
 }
 
@@ -747,33 +788,14 @@ export async function getKitStock(productId: string): Promise<KitStockRow[]> {
   // All stock levels for component products
   const stockLevels = await db.stockLevel.findMany({
     where: { productId: { in: componentIds } },
-    select: { productId: true, warehouseId: true, quantity: true },
+    select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
   })
 
-  // Active sales order allocations for component products (per product, per warehouse)
-  const allocations = await db.salesOrderLine.findMany({
-    where: {
-      productId: { in: componentIds },
-      order: { status: { in: ['PENDING', 'PROCESSING', 'PICKING', 'PACKED', 'ON_HOLD'] } },
-    },
-    select: { productId: true, qty: true, order: { select: { shipFromWarehouseId: true } } },
-  })
-
-  // Build lookup: componentId → warehouseId → { stock, allocated }
+  // Build lookup: componentId → warehouseId → available (quantity - reservedQty)
   const stockMap = new Map<string, Map<string, number>>()
   for (const s of stockLevels) {
     if (!stockMap.has(s.productId)) stockMap.set(s.productId, new Map())
-    stockMap.get(s.productId)!.set(s.warehouseId, Number(s.quantity))
-  }
-
-  const allocMap = new Map<string, Map<string, number>>()
-  for (const a of allocations) {
-    const wid = a.order.shipFromWarehouseId
-    const pid = a.productId
-    if (!wid || !pid) continue
-    if (!allocMap.has(pid)) allocMap.set(pid, new Map())
-    const m = allocMap.get(pid)!
-    m.set(wid, (m.get(wid) ?? 0) + Number(a.qty))
+    stockMap.get(s.productId)!.set(s.warehouseId, Number(s.quantity) - Number(s.reservedQty))
   }
 
   return warehouses.map((w) => {
@@ -782,9 +804,7 @@ export async function getKitStock(productId: string): Promise<KitStockRow[]> {
 
     for (const comp of components) {
       const required = Number(comp.qty)
-      const stock = stockMap.get(comp.componentId)?.get(w.id) ?? 0
-      const allocated = allocMap.get(comp.componentId)?.get(w.id) ?? 0
-      const available = Math.max(0, stock - allocated)
+      const available = Math.max(0, stockMap.get(comp.componentId)?.get(w.id) ?? 0)
       const canMake = required > 0 ? Math.floor(available / required) : 0
 
       if (canMake < minQty) {
@@ -837,6 +857,16 @@ export async function saveProductOptions(
       })),
     })
   }
+  logActivity({
+    entityType: 'PRODUCT',
+    entityId: productId,
+    action: 'updated',
+    tag: 'inventory',
+    level: 'INFO',
+    description: `Updated variant options for product ${productId}`,
+    metadata: { optionCount: options.length },
+  })
+
   revalidatePath(`/inventory/${productId}`)
   return { success: true }
 }
@@ -853,9 +883,27 @@ export async function generateVariantsFromOptions(
   ])
 
   if (!product || product.type !== 'VARIABLE') {
+    logActivity({
+      entityType: 'PRODUCT',
+      entityId: productId,
+      action: 'created',
+      tag: 'inventory',
+      level: 'ERROR',
+      description: `Failed to generate variants: product not found or not VARIABLE type`,
+      metadata: { productId },
+    })
     return { created: 0, skipped: 0, error: 'Product not found or not VARIABLE type' }
   }
   if (options.length === 0) {
+    logActivity({
+      entityType: 'PRODUCT',
+      entityId: productId,
+      action: 'created',
+      tag: 'inventory',
+      level: 'ERROR',
+      description: `Failed to generate variants: no options defined for product ${productId}`,
+      metadata: { productId },
+    })
     return { created: 0, skipped: 0, error: 'No options defined — save options first' }
   }
 
@@ -911,6 +959,16 @@ export async function generateVariantsFromOptions(
     created++
   }
 
+  logActivity({
+    entityType: 'PRODUCT',
+    entityId: productId,
+    action: 'created',
+    tag: 'inventory',
+    level: 'INFO',
+    description: `Generated ${created} variants for product ${productId}`,
+    metadata: { created, skipped },
+  })
+
   revalidatePath(`/inventory/${productId}`)
   return { created, skipped }
 }
@@ -924,6 +982,15 @@ export async function deleteOrDeactivateVariant(
     select: { type: true, parentId: true },
   })
   if (!product || product.type !== 'VARIANT') {
+    logActivity({
+      entityType: 'PRODUCT',
+      entityId: id,
+      action: 'deleted',
+      tag: 'inventory',
+      level: 'ERROR',
+      description: `Failed to delete/deactivate variant ${id}: not a variant product`,
+      metadata: null,
+    })
     return { action: 'error', error: 'Not a variant product' }
   }
 
@@ -946,11 +1013,32 @@ export async function deleteOrDeactivateVariant(
     await db.supplierProduct.deleteMany({ where: { productId: id } })
     await db.product.delete({ where: { id } })
 
+    logActivity({
+      entityType: 'PRODUCT',
+      entityId: id,
+      action: 'deleted',
+      tag: 'inventory',
+      level: 'INFO',
+      description: `Deleted variant ${id}`,
+      metadata: { parentId: product.parentId },
+    })
+
     if (product.parentId) revalidatePath(`/inventory/${product.parentId}`)
     revalidatePath('/inventory')
     return { action: 'deleted' }
   } else {
     await db.product.update({ where: { id }, data: { active: false } })
+
+    logActivity({
+      entityType: 'PRODUCT',
+      entityId: id,
+      action: 'deactivated',
+      tag: 'inventory',
+      level: 'INFO',
+      description: `Deactivated variant ${id}`,
+      metadata: { parentId: product.parentId },
+    })
+
     if (product.parentId) revalidatePath(`/inventory/${product.parentId}`)
     revalidatePath(`/inventory/${id}`)
     return { action: 'deactivated' }
@@ -999,6 +1087,16 @@ export async function bulkDeleteProducts(
     deleted++
   }
 
+  logActivity({
+    entityType: 'PRODUCT',
+    entityId: null,
+    action: 'bulk_deleted',
+    tag: 'inventory',
+    level: 'INFO',
+    description: `Bulk deleted ${deleted} products`,
+    metadata: { deleted, skippedCount: skipped.length, skipped },
+  })
+
   revalidatePath('/inventory')
   return { deleted, skipped }
 }
@@ -1010,6 +1108,189 @@ export async function bulkDeactivateProducts(
     where: { id: { in: ids } },
     data: { active: false },
   })
+  logActivity({
+    entityType: 'PRODUCT',
+    entityId: null,
+    action: 'bulk_deactivated',
+    tag: 'inventory',
+    level: 'INFO',
+    description: `Bulk deactivated ${ids.length} products`,
+    metadata: { count: ids.length },
+  })
+
   revalidatePath('/inventory')
   return { deactivated: ids.length }
+}
+
+// ---------------------------------------------------------------------------
+// Stock allocation & incoming details (for popups on product page)
+// ---------------------------------------------------------------------------
+
+export type AllocationDetail = {
+  type: 'sales_order' | 'manufacturing_order'
+  id: string
+  reference: string
+  qty: number
+  status: string
+}
+
+export async function getAllocationDetails(productId: string, warehouseId: string): Promise<AllocationDetail[]> {
+  const [salesLines, moOrders] = await Promise.all([
+    // Sales orders allocating this product from this warehouse
+    db.salesOrderLine.findMany({
+      where: {
+        productId,
+        order: {
+          shipFromWarehouseId: warehouseId,
+          status: { in: ['PENDING', 'PROCESSING', 'PICKING', 'PACKED', 'ON_HOLD'] },
+        },
+      },
+      select: {
+        qty: true,
+        order: { select: { id: true, wcOrderNumber: true, status: true } },
+      },
+    }),
+    // Manufacturing orders reserving this product (as component for assembly, or as output for disassembly)
+    db.productionOrder.findMany({
+      where: {
+        status: 'IN_PROGRESS',
+        warehouseId,
+        OR: [
+          // Assembly: this product is a component
+          {
+            orderType: 'ASSEMBLY',
+            outputProduct: { productComponents: { some: { componentId: productId } } },
+          },
+          // Disassembly: this product is the output being disassembled
+          {
+            orderType: 'DISASSEMBLY',
+            outputProductId: productId,
+          },
+        ],
+      },
+      select: {
+        id: true,
+        reference: true,
+        orderType: true,
+        qtyPlanned: true,
+        status: true,
+        outputProduct: {
+          select: {
+            productComponents: {
+              where: { componentId: productId },
+              select: { qty: true },
+            },
+          },
+        },
+      },
+    }),
+  ])
+
+  const results: AllocationDetail[] = []
+
+  for (const line of salesLines) {
+    results.push({
+      type: 'sales_order',
+      id: line.order.id,
+      reference: line.order.wcOrderNumber ?? line.order.id.slice(0, 8),
+      qty: Number(line.qty),
+      status: line.order.status,
+    })
+  }
+
+  for (const mo of moOrders) {
+    let qty: number
+    if (mo.orderType === 'DISASSEMBLY') {
+      qty = Number(mo.qtyPlanned)
+    } else {
+      // Assembly: qty = component qty per unit * planned units
+      const compQty = mo.outputProduct.productComponents[0]?.qty
+      qty = compQty ? Number(compQty) * Number(mo.qtyPlanned) : Number(mo.qtyPlanned)
+    }
+    results.push({
+      type: 'manufacturing_order',
+      id: mo.id,
+      reference: mo.reference,
+      qty,
+      status: mo.status,
+    })
+  }
+
+  return results
+}
+
+export type IncomingDetail = {
+  type: 'purchase_order' | 'transfer'
+  id: string
+  reference: string
+  qty: number
+  status: string
+  expectedDate: string | null
+}
+
+export async function getIncomingDetails(productId: string, warehouseId: string): Promise<IncomingDetail[]> {
+  const [poLines, transferLines] = await Promise.all([
+    // PO lines incoming to this warehouse
+    db.purchaseOrderLine.findMany({
+      where: {
+        productId,
+        po: {
+          destinationWarehouseId: warehouseId,
+          status: { in: ['PO_SENT', 'PARTIALLY_RECEIVED'] },
+        },
+      },
+      select: {
+        qty: true,
+        qtyReceived: true,
+        po: { select: { id: true, reference: true, status: true, expectedDelivery: true } },
+      },
+    }),
+    // Transfer lines incoming to this warehouse
+    db.stockTransferLine.findMany({
+      where: {
+        productId,
+        transfer: {
+          toWarehouseId: warehouseId,
+          status: 'IN_TRANSIT',
+        },
+      },
+      select: {
+        qty: true,
+        qtyReceived: true,
+        transfer: { select: { id: true, reference: true, status: true } },
+      },
+    }),
+  ])
+
+  const results: IncomingDetail[] = []
+
+  for (const line of poLines) {
+    const remaining = Number(line.qty) - Number(line.qtyReceived)
+    if (remaining > 0) {
+      results.push({
+        type: 'purchase_order',
+        id: line.po.id,
+        reference: line.po.reference,
+        qty: remaining,
+        status: line.po.status,
+        expectedDate: line.po.expectedDelivery?.toISOString() ?? null,
+      })
+    }
+  }
+
+  for (const line of transferLines) {
+    const remaining = Number(line.qty) - Number(line.qtyReceived)
+    if (remaining > 0) {
+      results.push({
+        type: 'transfer',
+        id: line.transfer.id,
+        reference: line.transfer.reference,
+        qty: remaining,
+        status: line.transfer.status,
+        expectedDate: null,
+      })
+    }
+  }
+
+  return results
 }

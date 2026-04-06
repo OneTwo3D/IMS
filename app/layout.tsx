@@ -2,13 +2,17 @@ import type { Metadata } from 'next'
 import { Inter } from 'next/font/google'
 import { ThemeProvider } from 'next-themes'
 import { TooltipProvider } from '@/components/ui/tooltip'
+import { AuthSessionProvider } from '@/components/providers/session-provider'
+import { db } from '@/lib/db'
 import './globals.css'
 
 const inter = Inter({ subsets: ['latin'], variable: '--font-sans' })
 
-export const metadata: Metadata = {
-  title: { default: 'OneTwo3D IMS', template: '%s | OneTwo3D IMS' },
-  description: 'Inventory Management System',
+export async function generateMetadata(): Promise<Metadata> {
+  return {
+    title: { default: 'One Two Inventory', template: '%s | One Two Inventory' },
+    description: 'Inventory Management System',
+  }
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -21,7 +25,9 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           enableSystem
           disableTransitionOnChange
         >
-          <TooltipProvider delay={300}>{children}</TooltipProvider>
+          <AuthSessionProvider>
+            <TooltipProvider delay={300}>{children}</TooltipProvider>
+          </AuthSessionProvider>
         </ThemeProvider>
       </body>
     </html>

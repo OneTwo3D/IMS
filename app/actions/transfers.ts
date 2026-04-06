@@ -2,6 +2,7 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -180,9 +181,28 @@ export async function createTransfer(
       select: TRANSFER_SELECT,
     })
     revalidatePath('/stock-control/transfers')
-    return { success: true, transfer: await mapRow(transfer) }
+
+    const mapped = await mapRow(transfer)
+    logActivity({
+      entityType: 'STOCK_TRANSFER',
+      entityId: transfer.id,
+      action: 'created',
+      tag: 'stock',
+      description: `Created transfer from ${mapped.fromWarehouseName} to ${mapped.toWarehouseName}`,
+    })
+
+    return { success: true, transfer: mapped }
   } catch (e) {
     console.error(e)
+
+    logActivity({
+      entityType: 'STOCK_TRANSFER',
+      action: 'created',
+      tag: 'stock',
+      level: 'ERROR',
+      description: e instanceof Error ? e.message : 'Failed to create transfer.',
+    })
+
     return { message: 'Failed to create transfer.' }
   }
 }
@@ -233,9 +253,28 @@ export async function updateTransferDraft(
 
     const updated = await db.stockTransfer.findUniqueOrThrow({ where: { id }, select: TRANSFER_SELECT })
     revalidatePath('/stock-control/transfers')
+
+    logActivity({
+      entityType: 'STOCK_TRANSFER',
+      entityId: id,
+      action: 'updated',
+      tag: 'stock',
+      description: 'Updated transfer draft',
+    })
+
     return { success: true, transfer: await mapRow(updated) }
   } catch (e) {
     console.error(e)
+
+    logActivity({
+      entityType: 'STOCK_TRANSFER',
+      entityId: id,
+      action: 'updated',
+      tag: 'stock',
+      level: 'ERROR',
+      description: e instanceof Error ? e.message : 'Failed to update transfer.',
+    })
+
     return { message: 'Failed to update transfer.' }
   }
 }
@@ -297,10 +336,40 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
 
     revalidatePath('/stock-control/transfers')
     revalidatePath('/inventory')
+
+    const dispatched = await db.stockTransfer.findUnique({
+      where: { id },
+      select: { reference: true, fromWarehouse: { select: { name: true } }, toWarehouse: { select: { name: true } }, lines: { select: { id: true } } },
+    })
+    logActivity({
+      entityType: 'STOCK_TRANSFER',
+      entityId: id,
+      action: 'dispatched',
+      tag: 'stock',
+      description: `Dispatched transfer from ${dispatched?.fromWarehouse.name ?? id} to ${dispatched?.toWarehouse.name ?? id}`,
+    })
+    logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      entityId: id,
+      action: 'transfer_out',
+      tag: 'stock',
+      description: `Transfer ${dispatched?.reference ?? id}: dispatched ${dispatched?.lines.length ?? 0} items from ${dispatched?.fromWarehouse.name ?? id}`,
+    })
+
     return { success: true }
   } catch (e: unknown) {
     console.error(e)
     const msg = e instanceof Error ? e.message : 'Failed to dispatch transfer.'
+
+    logActivity({
+      entityType: 'STOCK_TRANSFER',
+      entityId: id,
+      action: 'dispatched',
+      tag: 'stock',
+      level: 'ERROR',
+      description: msg,
+    })
+
     return { message: msg }
   }
 }
@@ -353,10 +422,40 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
 
     revalidatePath('/stock-control/transfers')
     revalidatePath('/inventory')
+
+    const received = await db.stockTransfer.findUnique({
+      where: { id },
+      select: { reference: true, toWarehouse: { select: { name: true } }, lines: { select: { id: true } } },
+    })
+    logActivity({
+      entityType: 'STOCK_TRANSFER',
+      entityId: id,
+      action: 'received',
+      tag: 'stock',
+      description: `Received transfer at ${received?.toWarehouse.name ?? id}`,
+    })
+    logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      entityId: id,
+      action: 'transfer_in',
+      tag: 'stock',
+      description: `Transfer ${received?.reference ?? id}: received ${received?.lines.length ?? 0} items at ${received?.toWarehouse.name ?? id}`,
+    })
+
     return { success: true }
   } catch (e: unknown) {
     console.error(e)
     const msg = e instanceof Error ? e.message : 'Failed to receive transfer.'
+
+    logActivity({
+      entityType: 'STOCK_TRANSFER',
+      entityId: id,
+      action: 'received',
+      tag: 'stock',
+      level: 'ERROR',
+      description: msg,
+    })
+
     return { message: msg }
   }
 }
@@ -373,9 +472,28 @@ export async function cancelTransfer(id: string): Promise<TransferResult> {
 
     await db.stockTransfer.update({ where: { id }, data: { status: 'CANCELLED' } })
     revalidatePath('/stock-control/transfers')
+
+    logActivity({
+      entityType: 'STOCK_TRANSFER',
+      entityId: id,
+      action: 'cancelled',
+      tag: 'stock',
+      description: 'Cancelled transfer',
+    })
+
     return { success: true }
   } catch (e) {
     console.error(e)
+
+    logActivity({
+      entityType: 'STOCK_TRANSFER',
+      entityId: id,
+      action: 'cancelled',
+      tag: 'stock',
+      level: 'ERROR',
+      description: e instanceof Error ? e.message : 'Failed to cancel transfer.',
+    })
+
     return { message: 'Failed to cancel transfer.' }
   }
 }

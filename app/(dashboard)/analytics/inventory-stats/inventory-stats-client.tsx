@@ -15,6 +15,7 @@ import { saveView, type SavedView } from '@/app/actions/sales-stats'
 type Tab = 'onhand' | 'movements' | 'allocations' | 'reorder'
 type FilterRule = { id: string; field: string; operator: string; value: string }
 type SortDir = 'asc' | 'desc'
+type FieldDef = { key: string; label: string; type: 'text' | 'number' | 'select'; options?: string[] }
 
 type Props = {
   stockOnHand: StockOnHandRow[]
@@ -35,29 +36,83 @@ function fmtGbp(v: number): string { return `£${v.toFixed(2)}` }
 function fmtDate(iso: string): string { return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) }
 function makeId() { return Math.random().toString(36).slice(2, 8) }
 
-const ONHAND_FIELDS = [
-  { key: 'sku', label: 'SKU', type: 'text' as const },
-  { key: 'name', label: 'Product Name', type: 'text' as const },
-  { key: 'type', label: 'Product Type', type: 'select' as const, options: ['SIMPLE', 'VARIANT', 'KIT', 'BOM'] },
-  { key: 'barcode', label: 'Barcode', type: 'text' as const },
-  { key: 'warehouseCode', label: 'Warehouse', type: 'text' as const },
-  { key: 'active', label: 'Active', type: 'select' as const, options: ['true', 'false'] },
-  { key: 'quantity', label: 'Quantity', type: 'number' as const },
-  { key: 'reservedQty', label: 'Reserved', type: 'number' as const },
-  { key: 'available', label: 'Available', type: 'number' as const },
-  { key: 'inventoryValue', label: 'Value (£)', type: 'number' as const },
-  { key: 'stockUnit', label: 'Stock Unit', type: 'text' as const },
+// ---------------------------------------------------------------------------
+// Field definitions per tab
+// ---------------------------------------------------------------------------
+const ONHAND_FIELDS: FieldDef[] = [
+  { key: 'sku', label: 'SKU', type: 'text' },
+  { key: 'name', label: 'Product Name', type: 'text' },
+  { key: 'type', label: 'Product Type', type: 'select', options: ['SIMPLE', 'VARIANT', 'KIT', 'BOM'] },
+  { key: 'barcode', label: 'Barcode', type: 'text' },
+  { key: 'warehouseCode', label: 'Warehouse', type: 'text' },
+  { key: 'active', label: 'Active', type: 'select', options: ['true', 'false'] },
+  { key: 'quantity', label: 'Quantity', type: 'number' },
+  { key: 'reservedQty', label: 'Reserved', type: 'number' },
+  { key: 'available', label: 'Available', type: 'number' },
+  { key: 'inventoryValue', label: 'Value (£)', type: 'number' },
+  { key: 'stockUnit', label: 'Stock Unit', type: 'text' },
 ]
 
+const MOVEMENT_FIELDS: FieldDef[] = [
+  { key: 'type', label: 'Type', type: 'select', options: ['PURCHASE_RECEIPT', 'SALE_DISPATCH', 'RETURN_INBOUND', 'TRANSFER_OUT', 'TRANSFER_IN', 'ADJUSTMENT', 'PRODUCTION_IN', 'PRODUCTION_OUT', 'OPENING_STOCK'] },
+  { key: 'sku', label: 'SKU', type: 'text' },
+  { key: 'productName', label: 'Product Name', type: 'text' },
+  { key: 'fromWarehouse', label: 'From Warehouse', type: 'text' },
+  { key: 'toWarehouse', label: 'To Warehouse', type: 'text' },
+  { key: 'qty', label: 'Quantity', type: 'number' },
+  { key: 'note', label: 'Note', type: 'text' },
+  { key: 'createdAt', label: 'Date', type: 'text' },
+]
+
+const ALLOCATION_FIELDS: FieldDef[] = [
+  { key: 'sku', label: 'SKU', type: 'text' },
+  { key: 'productName', label: 'Product Name', type: 'text' },
+  { key: 'warehouseCode', label: 'Warehouse', type: 'text' },
+  { key: 'totalStock', label: 'Total Stock', type: 'number' },
+  { key: 'reservedQty', label: 'Reserved', type: 'number' },
+  { key: 'available', label: 'Available', type: 'number' },
+  { key: 'pendingOrders', label: 'Pending Orders', type: 'number' },
+]
+
+const REORDER_FIELDS: FieldDef[] = [
+  { key: 'sku', label: 'SKU', type: 'text' },
+  { key: 'name', label: 'Product Name', type: 'text' },
+  { key: 'currentStock', label: 'Current Stock', type: 'number' },
+  { key: 'availableStock', label: 'Available', type: 'number' },
+  { key: 'reorderPoint', label: 'Reorder Point', type: 'number' },
+  { key: 'shortfall', label: 'Shortfall', type: 'number' },
+  { key: 'avgDailyDemand', label: 'Daily Demand', type: 'number' },
+  { key: 'daysUntilStockout', label: 'Days to S/O', type: 'number' },
+  { key: 'supplierName', label: 'Supplier', type: 'text' },
+  { key: 'stockUnit', label: 'Stock Unit', type: 'text' },
+]
+
+const TAB_FIELDS: Record<Tab, FieldDef[]> = {
+  onhand: ONHAND_FIELDS,
+  movements: MOVEMENT_FIELDS,
+  allocations: ALLOCATION_FIELDS,
+  reorder: REORDER_FIELDS,
+}
+
+const DEFAULT_COLS: Record<Tab, string[]> = {
+  onhand: ['sku', 'name', 'type', 'warehouseCode', 'quantity', 'reservedQty', 'available', 'inventoryValue', 'stockUnit'],
+  movements: ['type', 'sku', 'productName', 'fromWarehouse', 'toWarehouse', 'qty', 'note', 'createdAt'],
+  allocations: ['sku', 'productName', 'warehouseCode', 'totalStock', 'reservedQty', 'available', 'pendingOrders'],
+  reorder: ['sku', 'name', 'currentStock', 'availableStock', 'reorderPoint', 'shortfall', 'avgDailyDemand', 'daysUntilStockout', 'supplierName'],
+}
+
+// ---------------------------------------------------------------------------
+// Filter helpers
+// ---------------------------------------------------------------------------
 const TEXT_OPS = [{ value: 'contains', label: 'contains' }, { value: 'equals', label: 'equals' }, { value: 'starts_with', label: 'starts with' }]
 const NUM_OPS = [{ value: '>', label: '>' }, { value: '>=', label: '>=' }, { value: '<', label: '<' }, { value: '<=', label: '<=' }, { value: '=', label: '=' }]
 const SEL_OPS = [{ value: 'is', label: 'is' }, { value: 'is_not', label: 'is not' }]
 
-function getOps(key: string) { const f = ONHAND_FIELDS.find((pf) => pf.key === key); return f?.type === 'number' ? NUM_OPS : f?.type === 'select' ? SEL_OPS : TEXT_OPS }
-function getOpts(key: string) { return ONHAND_FIELDS.find((pf) => pf.key === key)?.options }
+function getOps(fields: FieldDef[], key: string) { const f = fields.find((pf) => pf.key === key); return f?.type === 'number' ? NUM_OPS : f?.type === 'select' ? SEL_OPS : TEXT_OPS }
+function getOpts(fields: FieldDef[], key: string) { return fields.find((pf) => pf.key === key)?.options }
 
-function applyFilter(val: string | number | null | boolean, rule: FilterRule): boolean {
-  const v = String(val ?? '').toLowerCase(); const rv = rule.value.toLowerCase()
+function applyFilter(val: string | number | null | boolean | undefined, rule: FilterRule): boolean {
+  const v = val == null ? '' : String(val).toLowerCase(); const rv = rule.value.toLowerCase()
   switch (rule.operator) {
     case 'contains': return v.includes(rv); case 'equals': case 'is': return v === rv; case 'starts_with': return v.startsWith(rv); case 'is_not': return v !== rv
     case '>': return Number(val) > Number(rule.value); case '>=': return Number(val) >= Number(rule.value)
@@ -66,36 +121,65 @@ function applyFilter(val: string | number | null | boolean, rule: FilterRule): b
   }
 }
 
-function FilterDialog({ rules, onApply, onClose }: { rules: FilterRule[]; onApply: (r: FilterRule[]) => void; onClose: () => void }) {
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function getVal(row: any, field: string): string | number | null {
+  const v = row[field]
+  return v === undefined ? null : v
+}
+
+// ---------------------------------------------------------------------------
+// Filter Dialog
+// ---------------------------------------------------------------------------
+function FilterDialog({ fields, rules, onApply, onClose }: { fields: FieldDef[]; rules: FilterRule[]; onApply: (r: FilterRule[]) => void; onClose: () => void }) {
   const [local, setLocal] = useState<FilterRule[]>(rules.length ? [...rules] : [])
+
+  function addRule() { setLocal((prev) => [...prev, { id: makeId(), field: fields[0].key, operator: 'contains', value: '' }]) }
+  function removeRule(id: string) { setLocal((prev) => prev.filter((r) => r.id !== id)) }
+  function updateRule(id: string, updates: Partial<FilterRule>) {
+    setLocal((prev) => prev.map((r) => r.id === id ? { ...r, ...updates } : r))
+  }
+
   return (<Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-xl sm:max-w-xl"><DialogHeader><DialogTitle>Filters</DialogTitle></DialogHeader>
     <div className="space-y-3 min-h-[200px]">
-      {local.map((rule) => (<div key={rule.id} className="flex items-center gap-2">
-        <select value={rule.field} onChange={(e) => { const f = e.target.value; setLocal((p) => p.map((r) => r.id === rule.id ? { ...r, field: f, operator: getOps(f)[0].value, value: '' } : r)) }} className="h-8 rounded-md border border-input bg-background px-2 text-xs w-40">
-          {ONHAND_FIELDS.map((f) => <option key={f.key} value={f.key}>{f.label}</option>)}</select>
-        <select value={rule.operator} onChange={(e) => setLocal((p) => p.map((r) => r.id === rule.id ? { ...r, operator: e.target.value } : r))} className="h-8 rounded-md border border-input bg-background px-2 text-xs w-32">
-          {getOps(rule.field).map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select>
-        {getOpts(rule.field) ? (<select value={rule.value} onChange={(e) => setLocal((p) => p.map((r) => r.id === rule.id ? { ...r, value: e.target.value } : r))} className="flex-1 h-8 rounded-md border border-input bg-background px-2 text-xs">
-          <option value="">Select…</option>{getOpts(rule.field)!.map((o) => <option key={o} value={o}>{o}</option>)}</select>
-        ) : (<Input value={rule.value} onChange={(e) => setLocal((p) => p.map((r) => r.id === rule.id ? { ...r, value: e.target.value } : r))} placeholder="Value" className="flex-1 h-8 text-xs" />)}
-        <button type="button" onClick={() => setLocal((p) => p.filter((r) => r.id !== rule.id))} className="text-destructive"><X className="h-4 w-4" /></button>
-      </div>))}
-      <button type="button" onClick={() => setLocal((p) => [...p, { id: makeId(), field: 'sku', operator: 'contains', value: '' }])} className="w-full flex items-center justify-center gap-1 rounded-md border border-dashed border-input py-2 text-xs text-muted-foreground hover:text-foreground"><Plus className="h-3 w-3" />Add Filter</button>
+      {local.map((rule) => {
+        const ops = getOps(fields, rule.field)
+        const options = getOpts(fields, rule.field)
+        return (
+          <div key={rule.id} className="flex items-center gap-2">
+            <select value={rule.field} onChange={(e) => { const f = e.target.value; const newOps = getOps(fields, f); updateRule(rule.id, { field: f, operator: newOps[0].value, value: '' }) }} className="h-8 rounded-md border border-input bg-background px-2 text-xs w-40">
+              {fields.map((f) => <option key={f.key} value={f.key}>{f.label}</option>)}</select>
+            <select value={rule.operator} onChange={(e) => updateRule(rule.id, { operator: e.target.value })} className="h-8 rounded-md border border-input bg-background px-2 text-xs w-32">
+              {ops.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}</select>
+            {options ? (<select value={rule.value} onChange={(e) => updateRule(rule.id, { value: e.target.value })} className="flex-1 h-8 rounded-md border border-input bg-background px-2 text-xs">
+              <option value="">Select…</option>{options.map((o) => <option key={o} value={o}>{o}</option>)}</select>
+            ) : (<Input value={rule.value} onChange={(e) => updateRule(rule.id, { value: e.target.value })} placeholder="Value" className="flex-1 h-8 text-xs" />)}
+            <button type="button" onClick={() => removeRule(rule.id)} className="text-destructive hover:text-destructive/80 shrink-0"><X className="h-4 w-4" /></button>
+          </div>
+        )
+      })}
+      <button type="button" onClick={addRule} className="w-full flex items-center justify-center gap-1 rounded-md border border-dashed border-input py-2 text-xs text-muted-foreground hover:text-foreground hover:border-foreground transition-colors"><Plus className="h-3 w-3" />Add Filter</button>
     </div>
     <DialogFooter><Button variant="outline" onClick={() => { onApply([]); onClose() }}>Reset</Button><Button onClick={() => { onApply(local.filter((r) => r.value)); onClose() }}>Apply</Button></DialogFooter>
   </DialogContent></Dialog>)
 }
 
-function ColumnPickerDialog({ visible, onApply, onClose }: { visible: string[]; onApply: (c: string[]) => void; onClose: () => void }) {
+// ---------------------------------------------------------------------------
+// Column Picker Dialog
+// ---------------------------------------------------------------------------
+function ColumnPickerDialog({ fields, visible, onApply, onClose }: { fields: FieldDef[]; visible: string[]; onApply: (c: string[]) => void; onClose: () => void }) {
   const [local, setLocal] = useState<Set<string>>(new Set(visible))
+  function toggle(key: string) { setLocal((prev) => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n }) }
   return (<Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-sm sm:max-w-sm"><DialogHeader><DialogTitle>Columns</DialogTitle></DialogHeader>
-    <div className="space-y-1 max-h-80 overflow-y-auto">{ONHAND_FIELDS.map((f) => (
-      <label key={f.key} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-muted rounded px-2 py-1"><input type="checkbox" checked={local.has(f.key)} onChange={() => setLocal((p) => { const n = new Set(p); n.has(f.key) ? n.delete(f.key) : n.add(f.key); return n })} className="rounded border-input" />{f.label}</label>
+    <div className="space-y-1 max-h-80 overflow-y-auto">{fields.map((f) => (
+      <label key={f.key} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-muted rounded px-2 py-1"><input type="checkbox" checked={local.has(f.key)} onChange={() => toggle(f.key)} className="rounded border-input" />{f.label}</label>
     ))}</div>
     <DialogFooter><Button variant="outline" onClick={onClose}>Cancel</Button><Button onClick={() => { onApply(Array.from(local)); onClose() }}>Apply</Button></DialogFooter>
   </DialogContent></Dialog>)
 }
 
+// ---------------------------------------------------------------------------
+// Save View Dialog
+// ---------------------------------------------------------------------------
 function SaveViewDialog({ tab, columns, filters, onClose }: { tab: string; columns: string[]; filters: FilterRule[]; onClose: () => void }) {
   const router = useRouter(); const [isPending, startTransition] = useTransition(); const [name, setName] = useState('')
   return (<Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-sm sm:max-w-sm"><DialogHeader><DialogTitle>Save View</DialogTitle></DialogHeader>
@@ -103,8 +187,6 @@ function SaveViewDialog({ tab, columns, filters, onClose }: { tab: string; colum
     <DialogFooter><Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button><Button onClick={() => { if (!name.trim()) return; startTransition(async () => { await saveView({ id: makeId(), name, tab: `inv_${tab}`, columns, filters: filters.map((r) => ({ field: r.field, operator: r.operator, value: r.value })) }); router.refresh(); onClose() }) }} disabled={isPending || !name.trim()}>{isPending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}Save</Button></DialogFooter>
   </DialogContent></Dialog>)
 }
-
-const DEFAULT_COLS = ['sku', 'name', 'type', 'warehouseCode', 'quantity', 'reservedQty', 'available', 'inventoryValue', 'stockUnit']
 
 const MOVEMENT_LABELS: Record<string, string> = {
   PURCHASE_RECEIPT: 'Purchase Receipt', SALE_DISPATCH: 'Sale Dispatch', RETURN_INBOUND: 'Return Inbound',
@@ -116,32 +198,67 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
   const router = useRouter(); const [isPending, startTransition] = useTransition()
   const [tab, setTab] = useState<Tab>('onhand')
   const [filterRules, setFilterRules] = useState<FilterRule[]>([])
-  const [visibleCols, setVisibleCols] = useState<string[]>(DEFAULT_COLS)
+  const [visibleColsMap, setVisibleColsMap] = useState<Record<Tab, string[]>>({ ...DEFAULT_COLS })
   const [showFilter, setShowFilter] = useState(false); const [showColPicker, setShowColPicker] = useState(false); const [showSaveView, setShowSaveView] = useState(false)
   const [sortCol, setSortCol] = useState<string | null>('sku'); const [sortDir, setSortDir] = useState<SortDir>('asc')
-  const [search, setSearch] = useState('')
-  const sq = search.toLowerCase()
+
+  const fields = TAB_FIELDS[tab]
+  const visibleCols = visibleColsMap[tab]
+
+  function setVisibleCols(cols: string[]) {
+    setVisibleColsMap((prev) => ({ ...prev, [tab]: cols }))
+  }
 
   function handleSort(key: string) { if (sortCol === key) setSortDir((d) => d === 'asc' ? 'desc' : 'asc'); else { setSortCol(key); setSortDir('asc') } }
-  function loadView(v: SavedView) { setTab(v.tab.replace('inv_', '') as Tab); setVisibleCols(v.columns); setFilterRules(v.filters.map((f) => ({ ...f, id: makeId() }))) }
+
+  function handleTabChange(t: Tab) {
+    setTab(t); setFilterRules([]); setSortCol(null)
+  }
+
+  function loadView(v: SavedView) {
+    const t = v.tab.replace('inv_', '') as Tab
+    setTab(t)
+    setVisibleColsMap((prev) => ({ ...prev, [t]: v.columns }))
+    setFilterRules(v.filters.map((f) => ({ ...f, id: makeId() })))
+  }
+
   function SortIcon({ col }: { col: string }) { return sortCol === col ? (sortDir === 'asc' ? <ArrowUp className="h-3 w-3 inline" /> : <ArrowDown className="h-3 w-3 inline" />) : null }
   const TH = ({ col, children, right }: { col: string; children: React.ReactNode; right?: boolean }) => (
     <th className={`px-3 py-2 text-xs font-medium text-muted-foreground cursor-pointer hover:text-foreground select-none whitespace-nowrap ${right ? 'text-right' : 'text-left'}`} onClick={() => handleSort(col)}>{children} <SortIcon col={col} /></th>
   )
 
-  const filteredOnHand = useMemo(() => {
-    let r = stockOnHand
-    for (const rule of filterRules) { if (rule.value) r = r.filter((row) => applyFilter((row as Record<string, unknown>)[rule.field] as string | number | null, rule)) }
-    if (sortCol) r = [...r].sort((a, b) => { const va = (a as Record<string, unknown>)[sortCol] ?? 0; const vb = (b as Record<string, unknown>)[sortCol] ?? 0; const c = typeof va === 'number' && typeof vb === 'number' ? va - vb : String(va).localeCompare(String(vb)); return sortDir === 'asc' ? c : -c })
-    return r
-  }, [stockOnHand, filterRules, sortCol, sortDir])
+  // Generic filter + sort for any tab data
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function filterAndSort<T extends Record<string, any>>(data: T[]): T[] {
+    let result = data
+    for (const rule of filterRules) {
+      if (!rule.value) continue
+      result = result.filter((row) => applyFilter(getVal(row, rule.field), rule))
+    }
+    if (sortCol) {
+      result = [...result].sort((a, b) => {
+        const va = getVal(a, sortCol) ?? 0
+        const vb = getVal(b, sortCol) ?? 0
+        const cmp = typeof va === 'number' && typeof vb === 'number' ? va - vb : String(va).localeCompare(String(vb))
+        return sortDir === 'asc' ? cmp : -cmp
+      })
+    }
+    return result
+  }
+
+  // Filtered data per tab
+  const filteredOnHand = useMemo(() => filterAndSort(stockOnHand), [stockOnHand, filterRules, sortCol, sortDir])
+  const filteredMovements = useMemo(() => filterAndSort(movements), [movements, filterRules, sortCol, sortDir])
+  const filteredAllocations = useMemo(() => filterAndSort(allocations), [allocations, filterRules, sortCol, sortDir])
+  const filteredReorder = useMemo(() => filterAndSort(reorder), [reorder, filterRules, sortCol, sortDir])
 
   const totalQty = stockOnHand.reduce((s, r) => s + r.quantity, 0)
   const totalReserved = stockOnHand.reduce((s, r) => s + r.reservedQty, 0)
   const totalAvailable = stockOnHand.reduce((s, r) => s + r.available, 0)
   const totalValue = stockOnHand.reduce((s, r) => s + r.inventoryValue, 0)
 
-  const colR: Record<string, { label: string; align: string; render: (r: StockOnHandRow) => React.ReactNode; footer?: () => React.ReactNode }> = {
+  // On-hand column renderers (special formatting with footer)
+  const onhandColR: Record<string, { label: string; align: string; render: (r: StockOnHandRow) => React.ReactNode; footer?: () => React.ReactNode }> = {
     sku: { label: 'Product', align: 'left', render: (r) => <ProductLink productId={r.productId} sku={r.sku} name={r.name} />, footer: () => <span>Totals</span> },
     name: { label: 'Name', align: 'left', render: (r) => <span className="text-xs truncate max-w-32 block">{r.name}</span> },
     type: { label: 'Type', align: 'left', render: (r) => <span className="text-xs">{r.type}</span> },
@@ -153,6 +270,57 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
     reservedQty: { label: 'Reserved', align: 'right', render: (r) => <span className={`tabular-nums text-xs ${r.reservedQty > 0 ? 'text-orange-600' : 'text-muted-foreground'}`}>{r.reservedQty > 0 ? r.reservedQty : '—'}</span>, footer: () => <span className="tabular-nums text-orange-600">{totalReserved}</span> },
     available: { label: 'Available', align: 'right', render: (r) => <span className={`tabular-nums text-xs font-medium ${r.available <= 0 ? 'text-destructive' : ''}`}>{r.available}</span>, footer: () => <span className="tabular-nums">{totalAvailable}</span> },
     inventoryValue: { label: 'Value (£)', align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{r.inventoryValue > 0 ? fmtGbp(r.inventoryValue) : '—'}</span>, footer: () => <span className="tabular-nums font-mono">{fmtGbp(totalValue)}</span> },
+  }
+
+  // Generic cell renderer for non-onhand tabs
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  function renderCell(row: any, key: string, tabKey: Tab): React.ReactNode {
+    const v = row[key]
+
+    if (tabKey === 'movements') {
+      if (key === 'type') return <span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium border bg-muted">{MOVEMENT_LABELS[v] ?? v}</span>
+      if (key === 'sku') return <ProductLink productId={row.productId} sku={row.sku} name={row.productName} />
+      if (key === 'fromWarehouse' || key === 'toWarehouse') return <span className="text-xs font-mono">{v ?? '—'}</span>
+      if (key === 'qty') return <span className="tabular-nums text-xs font-medium">{v}</span>
+      if (key === 'note') return <span className="text-xs text-muted-foreground truncate max-w-48 block">{v ?? '—'}</span>
+      if (key === 'createdAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
+    }
+
+    if (tabKey === 'allocations') {
+      if (key === 'sku') return <ProductLink productId={row.productId} sku={row.sku} name={row.productName} />
+      if (key === 'warehouseCode') return <span className="text-xs font-medium">{v}</span>
+      if (key === 'totalStock') return <span className="tabular-nums text-xs">{v}</span>
+      if (key === 'reservedQty') return <span className="tabular-nums text-xs text-orange-600 font-medium">{v}</span>
+      if (key === 'available') return <span className={`tabular-nums text-xs ${v <= 0 ? 'text-destructive font-medium' : ''}`}>{v}</span>
+      if (key === 'pendingOrders') return <span className="tabular-nums text-xs text-muted-foreground">{v}</span>
+    }
+
+    if (tabKey === 'reorder') {
+      if (key === 'sku') return <ProductLink productId={row.productId} sku={row.sku} name={row.name} />
+      if (key === 'currentStock') return <span className="tabular-nums text-xs">{v} {row.stockUnit}</span>
+      if (key === 'availableStock') return <span className={`tabular-nums text-xs ${v <= 0 ? 'text-destructive font-bold' : ''}`}>{v}</span>
+      if (key === 'reorderPoint') return <span className="tabular-nums text-xs">{v}</span>
+      if (key === 'shortfall') return <span className="tabular-nums text-xs text-destructive font-medium">{v}</span>
+      if (key === 'avgDailyDemand') return <span className="tabular-nums text-xs">{v.toFixed(1)}</span>
+      if (key === 'daysUntilStockout') return <span className={`tabular-nums text-xs ${v <= 0 ? 'text-destructive font-bold' : v <= 14 ? 'text-orange-600 font-medium' : ''}`}>{v >= 999 ? '—' : `${v}d`}</span>
+      if (key === 'supplierName') return <span className="text-xs text-muted-foreground">{v ?? '—'}</span>
+    }
+
+    // Default
+    if (v == null) return <span className="text-xs text-muted-foreground">—</span>
+    if (typeof v === 'number') return <span className="tabular-nums text-xs">{v}</span>
+    return <span className="text-xs">{String(v)}</span>
+  }
+
+  // Determine alignment for a field
+  function fieldAlign(key: string): 'left' | 'right' {
+    const f = fields.find((fd) => fd.key === key)
+    return f?.type === 'number' ? 'right' : 'left'
+  }
+
+  // Field label lookup
+  function fieldLabel(key: string): string {
+    return fields.find((fd) => fd.key === key)?.label ?? key
   }
 
   return (
@@ -167,18 +335,15 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
       </div>
 
       <div className="flex items-center gap-1 border-b">
-        {TABS.map((t) => (<button key={t.key} type="button" className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors -mb-px ${tab === t.key ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground'}`} onClick={() => setTab(t.key)}>{t.label}</button>))}
+        {TABS.map((t) => (<button key={t.key} type="button" className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors -mb-px ${tab === t.key ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground'}`} onClick={() => handleTabChange(t.key)}>{t.label}</button>))}
         <div className="ml-auto flex items-center gap-1.5 pb-1">
           {savedViews.filter((v) => v.tab.startsWith('inv_')).length > 0 && (
             <select onChange={(e) => { const v = savedViews.find((sv) => sv.id === e.target.value); if (v) loadView(v); e.target.value = '' }} className="h-7 rounded-md border border-input bg-background px-2 text-xs" defaultValue="">
               <option value="" disabled>Saved Views…</option>{savedViews.filter((v) => v.tab.startsWith('inv_')).map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}</select>
           )}
-          {tab === 'onhand' && (<>
-            <Button variant={filterRules.length > 0 ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => setShowFilter(true)}><Filter className="h-3 w-3 mr-0.5" />Filter{filterRules.length > 0 ? ` (${filterRules.length})` : ''}</Button>
-            <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowColPicker(true)}><Settings2 className="h-3 w-3 mr-0.5" />Columns</Button>
-            <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowSaveView(true)}><Save className="h-3 w-3 mr-0.5" />Save View</Button>
-          </>)}
-          {tab !== 'onhand' && <Input placeholder="Search…" value={search} onChange={(e) => setSearch(e.target.value)} className="h-7 text-xs w-48" />}
+          <Button variant={filterRules.length > 0 ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => setShowFilter(true)}><Filter className="h-3 w-3 mr-0.5" />Filter{filterRules.length > 0 ? ` (${filterRules.length})` : ''}</Button>
+          <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowColPicker(true)}><Settings2 className="h-3 w-3 mr-0.5" />Columns</Button>
+          <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowSaveView(true)}><Save className="h-3 w-3 mr-0.5" />Save View</Button>
           <a href={`/api/export/analytics?type=inv_${tab}`} className="inline-flex items-center gap-0.5 rounded-md border border-input bg-background px-2 h-7 text-xs font-medium hover:bg-muted"><Download className="h-3 w-3" />CSV</a>
         </div>
       </div>
@@ -188,92 +353,68 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
         <div className="rounded-md border overflow-hidden">
           <div className="px-3 py-1.5 bg-muted/30 border-b text-xs text-muted-foreground">{filteredOnHand.length} of {stockOnHand.length} rows</div>
           <div className="overflow-x-auto"><table className="w-full text-sm"><thead className="border-b bg-muted/50"><tr>
-            {visibleCols.map((k) => { const c = colR[k]; return c ? <TH key={k} col={k} right={c.align === 'right'}>{c.label}</TH> : null })}
+            {visibleCols.map((k) => { const c = onhandColR[k]; return c ? <TH key={k} col={k} right={c.align === 'right'}>{c.label}</TH> : null })}
           </tr></thead><tbody className="divide-y">
-            {filteredOnHand.map((r, i) => (<tr key={`${r.productId}-${r.warehouseCode}`} className="hover:bg-muted/30">
-              {visibleCols.map((k) => { const c = colR[k]; return c ? <td key={k} className={`px-3 py-2 ${c.align === 'right' ? 'text-right' : ''}`}>{c.render(r)}</td> : null })}
+            {filteredOnHand.map((r) => (<tr key={`${r.productId}-${r.warehouseCode}`} className="hover:bg-muted/30">
+              {visibleCols.map((k) => { const c = onhandColR[k]; return c ? <td key={k} className={`px-3 py-2 ${c.align === 'right' ? 'text-right' : ''}`}>{c.render(r)}</td> : null })}
             </tr>))}
           </tbody>
           <tfoot className="border-t bg-muted/30 font-medium text-sm"><tr>
-            {visibleCols.map((k) => { const c = colR[k]; return <td key={k} className={`px-3 py-2 ${c?.align === 'right' ? 'text-right' : ''}`}>{c?.footer?.() ?? ''}</td> })}
+            {visibleCols.map((k) => { const c = onhandColR[k]; return <td key={k} className={`px-3 py-2 ${c?.align === 'right' ? 'text-right' : ''}`}>{c?.footer?.() ?? ''}</td> })}
           </tr></tfoot></table></div>
         </div>
       )}
 
       {/* Stock Movements */}
       {tab === 'movements' && (
-        <div className="rounded-md border overflow-hidden"><table className="w-full text-sm"><thead className="border-b bg-muted/50"><tr>
-          <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Type</th>
-          <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
-          <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">From</th>
-          <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">To</th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Qty</th>
-          <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Note</th>
-          <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Date</th>
-        </tr></thead><tbody className="divide-y">
-          {movements.filter((m) => !sq || m.sku.toLowerCase().includes(sq) || m.productName.toLowerCase().includes(sq) || m.type.toLowerCase().includes(sq)).map((m) => (
-            <tr key={m.id} className="hover:bg-muted/30">
-              <td className="px-3 py-2 text-xs"><span className="inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium border bg-muted">{MOVEMENT_LABELS[m.type] ?? m.type}</span></td>
-              <td className="px-3 py-2"><ProductLink productId={m.productId} sku={m.sku} name={m.productName} /></td>
-              <td className="px-3 py-2 text-xs font-mono">{m.fromWarehouse ?? '—'}</td>
-              <td className="px-3 py-2 text-xs font-mono">{m.toWarehouse ?? '—'}</td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs font-medium">{m.qty}</td>
-              <td className="px-3 py-2 text-xs text-muted-foreground truncate max-w-48">{m.note ?? '—'}</td>
-              <td className="px-3 py-2 text-xs text-muted-foreground">{fmtDate(m.createdAt)}</td>
-            </tr>))}
-        </tbody></table>{movements.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">No movements found.</p>}</div>
+        <div className="rounded-md border overflow-hidden">
+          <div className="px-3 py-1.5 bg-muted/30 border-b text-xs text-muted-foreground">{filteredMovements.length} of {movements.length} rows</div>
+          <div className="overflow-x-auto"><table className="w-full text-sm"><thead className="border-b bg-muted/50"><tr>
+            {visibleCols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
+          </tr></thead><tbody className="divide-y">
+            {filteredMovements.map((m) => (
+              <tr key={m.id} className="hover:bg-muted/30">
+                {visibleCols.map((k) => <td key={k} className={`px-3 py-2 ${fieldAlign(k) === 'right' ? 'text-right' : ''}`}>{renderCell(m, k, 'movements')}</td>)}
+              </tr>))}
+          </tbody></table></div>
+          {movements.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">No movements found.</p>}
+        </div>
       )}
 
       {/* Allocations */}
       {tab === 'allocations' && (
-        <div className="rounded-md border overflow-hidden"><table className="w-full text-sm"><thead className="border-b bg-muted/50"><tr>
-          <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
-          <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Warehouse</th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Total Stock</th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Reserved</th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Available</th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Pending Orders</th>
-        </tr></thead><tbody className="divide-y">
-          {allocations.filter((a) => !sq || a.sku.toLowerCase().includes(sq) || a.productName.toLowerCase().includes(sq)).map((a) => (
-            <tr key={`${a.productId}-${a.warehouseCode}`} className="hover:bg-muted/30">
-              <td className="px-3 py-2"><ProductLink productId={a.productId} sku={a.sku} name={a.productName} /></td>
-              <td className="px-3 py-2 text-xs font-medium">{a.warehouseCode}</td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs">{a.totalStock}</td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs text-orange-600 font-medium">{a.reservedQty}</td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs"><span className={a.available <= 0 ? 'text-destructive font-medium' : ''}>{a.available}</span></td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs text-muted-foreground">{a.pendingOrders}</td>
-            </tr>))}
-        </tbody></table>{allocations.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">No allocations found.</p>}</div>
+        <div className="rounded-md border overflow-hidden">
+          <div className="px-3 py-1.5 bg-muted/30 border-b text-xs text-muted-foreground">{filteredAllocations.length} of {allocations.length} rows</div>
+          <div className="overflow-x-auto"><table className="w-full text-sm"><thead className="border-b bg-muted/50"><tr>
+            {visibleCols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
+          </tr></thead><tbody className="divide-y">
+            {filteredAllocations.map((a) => (
+              <tr key={`${a.productId}-${a.warehouseCode}`} className="hover:bg-muted/30">
+                {visibleCols.map((k) => <td key={k} className={`px-3 py-2 ${fieldAlign(k) === 'right' ? 'text-right' : ''}`}>{renderCell(a, k, 'allocations')}</td>)}
+              </tr>))}
+          </tbody></table></div>
+          {allocations.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">No allocations found.</p>}
+        </div>
       )}
 
       {/* Reorder */}
       {tab === 'reorder' && (
-        <div className="rounded-md border overflow-hidden"><table className="w-full text-sm"><thead className="border-b bg-muted/50"><tr>
-          <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Current</th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Available</th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Reorder Point</th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Shortfall</th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Daily Demand</th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Days to S/O</th>
-          <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Supplier</th>
-        </tr></thead><tbody className="divide-y">
-          {reorder.filter((r) => !sq || r.sku.toLowerCase().includes(sq) || r.name.toLowerCase().includes(sq)).map((r) => (
-            <tr key={r.productId} className={`hover:bg-muted/30 ${r.availableStock <= 0 ? 'bg-red-50 dark:bg-red-950/20' : ''}`}>
-              <td className="px-3 py-2"><ProductLink productId={r.productId} sku={r.sku} name={r.name} /></td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs">{r.currentStock} {r.stockUnit}</td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs"><span className={r.availableStock <= 0 ? 'text-destructive font-bold' : ''}>{r.availableStock}</span></td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs">{r.reorderPoint}</td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs text-destructive font-medium">{r.shortfall}</td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs">{r.avgDailyDemand.toFixed(1)}</td>
-              <td className="px-3 py-2 text-right tabular-nums text-xs"><span className={r.daysUntilStockout <= 0 ? 'text-destructive font-bold' : r.daysUntilStockout <= 14 ? 'text-orange-600 font-medium' : ''}>{r.daysUntilStockout >= 999 ? '—' : `${r.daysUntilStockout}d`}</span></td>
-              <td className="px-3 py-2 text-xs text-muted-foreground">{r.supplierName ?? '—'}</td>
-            </tr>))}
-        </tbody></table>{reorder.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">All products above reorder point.</p>}</div>
+        <div className="rounded-md border overflow-hidden">
+          <div className="px-3 py-1.5 bg-muted/30 border-b text-xs text-muted-foreground">{filteredReorder.length} of {reorder.length} rows</div>
+          <div className="overflow-x-auto"><table className="w-full text-sm"><thead className="border-b bg-muted/50"><tr>
+            {visibleCols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
+          </tr></thead><tbody className="divide-y">
+            {filteredReorder.map((r) => (
+              <tr key={r.productId} className={`hover:bg-muted/30 ${r.availableStock <= 0 ? 'bg-red-50 dark:bg-red-950/20' : ''}`}>
+                {visibleCols.map((k) => <td key={k} className={`px-3 py-2 ${fieldAlign(k) === 'right' ? 'text-right' : ''}`}>{renderCell(r, k, 'reorder')}</td>)}
+              </tr>))}
+          </tbody></table></div>
+          {reorder.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">All products above reorder point.</p>}
+        </div>
       )}
 
-      {showFilter && <FilterDialog rules={filterRules} onApply={setFilterRules} onClose={() => setShowFilter(false)} />}
-      {showColPicker && <ColumnPickerDialog visible={visibleCols} onApply={setVisibleCols} onClose={() => setShowColPicker(false)} />}
+      {showFilter && <FilterDialog fields={fields} rules={filterRules} onApply={setFilterRules} onClose={() => setShowFilter(false)} />}
+      {showColPicker && <ColumnPickerDialog fields={fields} visible={visibleCols} onApply={setVisibleCols} onClose={() => setShowColPicker(false)} />}
       {showSaveView && <SaveViewDialog tab={tab} columns={visibleCols} filters={filterRules} onClose={() => setShowSaveView(false)} />}
     </div>
   )

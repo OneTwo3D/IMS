@@ -153,10 +153,12 @@ export async function GET(
     doc.y += 10
   }
 
+  const tpl = await db.documentTemplate.findUnique({ where: { type: 'rfq' }, select: { customFooter: true } })
   drawFooter(
     doc,
     'Please reply with your quotation including unit prices, lead time, and shipping costs.',
     branding,
+    { customFooter: tpl?.customFooter, contactEmail: branding.purchasesEmail },
   )
 
   const buffer = await pdfToBuffer(doc)
