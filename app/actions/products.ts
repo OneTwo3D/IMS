@@ -178,7 +178,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       where: {
         productId: id,
         order: {
-          status: { in: ['PENDING', 'PROCESSING', 'PICKING', 'PACKED', 'ON_HOLD'] },
+          status: { in: ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'ON_HOLD'] },
         },
       },
       select: { qty: true, order: { select: { shipFromWarehouseId: true } } },
@@ -1135,14 +1135,14 @@ export type AllocationDetail = {
 }
 
 export async function getAllocationDetails(productId: string, warehouseId: string): Promise<AllocationDetail[]> {
-  const [salesLines, moOrders] = await Promise.all([
-    // Sales orders allocating this product from this warehouse
-    db.salesOrderLine.findMany({
+  const [salesAllocs, moOrders] = await Promise.all([
+    // Sales order allocations for this product from this warehouse
+    db.orderAllocation.findMany({
       where: {
         productId,
+        warehouseId,
         order: {
-          shipFromWarehouseId: warehouseId,
-          status: { in: ['PENDING', 'PROCESSING', 'PICKING', 'PACKED', 'ON_HOLD'] },
+          status: { in: ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'ON_HOLD'] },
         },
       },
       select: {
@@ -1188,13 +1188,13 @@ export async function getAllocationDetails(productId: string, warehouseId: strin
 
   const results: AllocationDetail[] = []
 
-  for (const line of salesLines) {
+  for (const alloc of salesAllocs) {
     results.push({
       type: 'sales_order',
-      id: line.order.id,
-      reference: line.order.wcOrderNumber ?? line.order.id.slice(0, 8),
-      qty: Number(line.qty),
-      status: line.order.status,
+      id: alloc.order.id,
+      reference: alloc.order.wcOrderNumber ?? alloc.order.id.slice(0, 8),
+      qty: Number(alloc.qty),
+      status: alloc.order.status,
     })
   }
 

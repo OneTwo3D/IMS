@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { exec } from 'child_process'
+import { execFile } from 'child_process'
 import { mkdir, readFile } from 'fs/promises'
 import path from 'path'
 import { auth } from '@/lib/auth'
@@ -32,9 +32,8 @@ export async function POST() {
   await mkdir(BACKUP_DIR, { recursive: true })
 
   return new Promise<NextResponse>((resolve) => {
-    const cmd = `PGPASSWORD=${db.password} pg_dump -h ${db.host} -p ${db.port} -U ${db.user} -d ${db.database} --no-owner --no-acl -F p -f "${filePath}"`
-
-    exec(cmd, { timeout: 120000 }, async (error) => {
+    const args = ['-h', db.host, '-p', db.port, '-U', db.user, '-d', db.database, '--no-owner', '--no-acl', '-F', 'p', '-f', filePath]
+    execFile('pg_dump', args, { timeout: 120000, env: { ...process.env, PGPASSWORD: db.password } }, async (error) => {
       if (error) {
         logActivity({
           entityType: 'SYSTEM',

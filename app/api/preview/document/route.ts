@@ -15,7 +15,7 @@ import {
 const SAMPLE_RECIPIENT = {
   name: 'Acme Manufacturing Ltd',
   contact: 'John Smith',
-  address: '123 Industrial Estate, Birmingham, B1 2AB, GB',
+  address: '123 Industrial Estate\nBirmingham\nB1 2AB\nGB',
   email: 'orders@acme-mfg.co.uk',
 }
 
@@ -162,7 +162,7 @@ async function generatePurchaseOrderPreview(branding: Branding) {
     title: 'Purchase Order',
     reference: 'PO-20260405-X7K2',
     date: TODAY(),
-    recipient: { ...SAMPLE_RECIPIENT, name: 'Filament Supplies GmbH', address: 'Industriestr. 42, 10115 Berlin, DE' },
+    recipient: { ...SAMPLE_RECIPIENT, name: 'Filament Supplies GmbH', address: 'Industriestr. 42\n10115 Berlin\nDE' },
   })
 
   drawTemplateNotes(doc, tpl, 'header')
@@ -192,7 +192,7 @@ async function generateRfqPreview(branding: Branding) {
     title: 'Request for Quotation',
     reference: 'PO-20260405-R3Q1',
     date: TODAY(),
-    recipient: { ...SAMPLE_RECIPIENT, name: 'Filament Supplies GmbH', address: 'Industriestr. 42, 10115 Berlin, DE' },
+    recipient: { ...SAMPLE_RECIPIENT, name: 'Filament Supplies GmbH', address: 'Industriestr. 42\n10115 Berlin\nDE' },
   })
 
   drawTemplateNotes(doc, tpl, 'header')
@@ -287,7 +287,7 @@ async function generateManufacturingOrderPreview(branding: Branding) {
     title: 'Manufacturing Order',
     reference: 'MO-20260405-X7K2',
     date: TODAY(),
-    recipient: { ...SAMPLE_RECIPIENT, name: 'Precision Assembly Ltd', address: '45 Workshop Lane, Sheffield, S1 4AB, GB' },
+    recipient: { ...SAMPLE_RECIPIENT, name: 'Precision Assembly Ltd', address: '45 Workshop Lane\nSheffield\nS1 4AB\nGB' },
   })
 
   drawTemplateNotes(doc, tpl, 'header')

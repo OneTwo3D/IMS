@@ -9,9 +9,10 @@ import { logActivity } from '@/lib/activity-log'
 // ---------------------------------------------------------------------------
 
 export type SoStatus =
-  | 'PENDING' | 'PROCESSING' | 'PICKING' | 'PACKED'
-  | 'SHIPPED' | 'COMPLETED' | 'CANCELLED'
-  | 'REFUNDED' | 'PARTIALLY_REFUNDED' | 'ON_HOLD'
+  | 'DRAFT' | 'PENDING_PAYMENT' | 'ON_HOLD'
+  | 'PROCESSING' | 'ALLOCATED' | 'PICKING' | 'PACKING'
+  | 'SHIPPED' | 'COMPLETED' | 'DELIVERED'
+  | 'CANCELLED' | 'REFUNDED' | 'PARTIALLY_REFUNDED'
 
 export type SoLineRow = {
   id: string
@@ -438,7 +439,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     const so = await db.salesOrder.create({
       data: {
         wcOrderNumber: makeReference(),
-        status: 'PENDING',
+        status: 'DRAFT',
         currency: input.currency,
         fxRateToGbp: fxRate,
         customerId: input.customerId || null,
@@ -469,30 +470,9 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       select: SO_SELECT,
     })
 
-    // Reserve stock in the ship-from warehouse
-    if (input.shipFromWarehouseId) {
-      for (const l of input.lines) {
-        if (!l.productId) continue
-        await db.stockLevel.upsert({
-          where: { productId_warehouseId: { productId: l.productId, warehouseId: input.shipFromWarehouseId } },
-          create: { productId: l.productId, warehouseId: input.shipFromWarehouseId, quantity: 0, reservedQty: l.qty },
-          update: { reservedQty: { increment: l.qty } },
-        })
-      }
-      // Log stock reservations
-      for (const l of input.lines) {
-        if (!l.productId) continue
-        logActivity({
-          entityType: 'STOCK_ADJUSTMENT',
-          entityId: l.productId,
-          action: 'reserved',
-          tag: 'stock',
-          level: 'INFO',
-          description: `Reserved ${l.qty} units of ${l.sku} for order ${so.wcOrderNumber}`,
-          metadata: { sku: l.sku, qty: l.qty, orderNumber: so.wcOrderNumber, warehouseId: input.shipFromWarehouseId },
-        })
-      }
-    }
+    // Auto-allocate stock across warehouses
+    const { autoAllocateOrder } = await import('./allocation')
+    await autoAllocateOrder(so.id)
 
     revalidatePath('/sales')
     const mapped = mapSoRow(so)
@@ -549,18 +529,21 @@ export async function updateSalesOrderStatus(
   try {
     const so = await db.salesOrder.findUnique({
       where: { id },
-      select: { id: true, wcOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { id: true, productId: true, qty: true } } },
+      select: { id: true, wcOrderId: true, wcOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { id: true, productId: true, qty: true } } },
     })
     if (!so) return { success: false, error: 'Order not found' }
 
     // Valid status transitions
     const VALID_TRANSITIONS: Record<string, string[]> = {
-      PENDING: ['PROCESSING', 'CANCELLED', 'ON_HOLD'],
-      PROCESSING: ['PICKING', 'CANCELLED', 'ON_HOLD'],
-      PICKING: ['PACKED', 'CANCELLED', 'ON_HOLD'],
-      PACKED: ['SHIPPED', 'CANCELLED', 'ON_HOLD'],
+      DRAFT: ['PROCESSING', 'PENDING_PAYMENT', 'CANCELLED', 'ON_HOLD'],
+      PENDING_PAYMENT: ['PROCESSING', 'DRAFT', 'CANCELLED', 'ON_HOLD'],
+      ON_HOLD: ['DRAFT', 'PROCESSING', 'CANCELLED'],
+      PROCESSING: ['ALLOCATED', 'CANCELLED', 'ON_HOLD'],
+      ALLOCATED: ['PICKING', 'PROCESSING', 'CANCELLED', 'ON_HOLD'],
+      PICKING: ['PACKING', 'CANCELLED', 'ON_HOLD'],
+      PACKING: ['SHIPPED', 'CANCELLED', 'ON_HOLD'],
       SHIPPED: ['COMPLETED'],
-      ON_HOLD: ['PENDING', 'PROCESSING', 'CANCELLED'],
+      COMPLETED: ['DELIVERED'],
     }
     const allowed = VALID_TRANSITIONS[so.status] ?? []
     if (!allowed.includes(targetStatus)) {
@@ -569,17 +552,39 @@ export async function updateSalesOrderStatus(
 
     const data: Record<string, unknown> = { status: targetStatus }
 
-    // On SHIPPED: record shipped date, tracking, and create stock movements
+    // On SHIPPED: check if shipments exist (new flow) or use legacy single-warehouse flow
     if (targetStatus === 'SHIPPED') {
-      const warehouseId = extra?.shipFromWarehouseId || so.shipFromWarehouseId
-      if (!warehouseId) return { success: false, error: 'A warehouse must be selected before shipping' }
-      data.shippedAt = new Date()
-      if (extra?.trackingNumber) data.trackingNumber = extra.trackingNumber
-      if (extra?.shipFromWarehouseId) data.shipFromWarehouseId = extra.shipFromWarehouseId
+      const shipmentCount = await db.shipment.count({ where: { orderId: id } })
+      if (shipmentCount > 0) {
+        // New multi-shipment flow — shipping is handled per-shipment via updateShipmentStatus
+        // This direct SHIPPED transition should only happen when all shipments are already shipped
+        const unshipped = await db.shipment.count({ where: { orderId: id, status: { not: 'SHIPPED' } } })
+        if (unshipped > 0) {
+          return { success: false, error: 'Ship individual shipments first — not all shipments are shipped yet' }
+        }
+        data.shippedAt = new Date()
+        if (extra?.trackingNumber) data.trackingNumber = extra.trackingNumber
+      } else {
+        // Legacy single-warehouse flow
+        const warehouseId = extra?.shipFromWarehouseId || so.shipFromWarehouseId
+        if (!warehouseId) return { success: false, error: 'A warehouse must be selected before shipping' }
+        data.shippedAt = new Date()
+        if (extra?.trackingNumber) data.trackingNumber = extra.trackingNumber
+        if (extra?.shipFromWarehouseId) data.shipFromWarehouseId = extra.shipFromWarehouseId
 
-      if (warehouseId) {
-        // Release reservation and decrement actual stock
-        await releaseReservedStock(id, warehouseId, so.lines)
+        // Release allocations
+        const allocs = await db.orderAllocation.findMany({ where: { orderId: id } })
+        if (allocs.length > 0) {
+          for (const alloc of allocs) {
+            await db.stockLevel.updateMany({
+              where: { productId: alloc.productId, warehouseId: alloc.warehouseId },
+              data: { reservedQty: { decrement: Number(alloc.qty) } },
+            })
+          }
+        } else if (so.shipFromWarehouseId) {
+          await releaseReservedStock(id, warehouseId, so.lines)
+        }
+
         for (const line of so.lines) {
           if (!line.productId) continue
           const qty = Number(line.qty)
@@ -615,9 +620,12 @@ export async function updateSalesOrderStatus(
       return { success: false, error: 'Cannot cancel a shipped order — process a refund instead' }
     }
 
-    // On CANCEL: release reserved stock
-    if (targetStatus === 'CANCELLED' && so.shipFromWarehouseId) {
-      await releaseReservedStock(id, so.shipFromWarehouseId, so.lines)
+    // On CANCEL: release all allocations
+    if (targetStatus === 'CANCELLED') {
+      const { deallocateOrder } = await import('./allocation')
+      await deallocateOrder(id)
+      // Also delete any pending shipments
+      await db.shipment.deleteMany({ where: { orderId: id, status: { in: ['PENDING', 'PICKING', 'PACKED'] as const } } })
     }
 
     await db.salesOrder.update({ where: { id }, data })
@@ -641,6 +649,14 @@ export async function updateSalesOrderStatus(
       description: `Updated sales order ${so.wcOrderNumber} status to ${targetStatus}`,
       metadata: { orderNumber: so.wcOrderNumber, previousStatus: so.status, newStatus: targetStatus },
     })
+
+    // Push status to WooCommerce (fire-and-forget)
+    if (so.wcOrderId) {
+      import('@/lib/connectors/woocommerce/sync/order-status').then((m) =>
+        m.pushImsStatusToWc(id, targetStatus as never).catch(() => {}),
+      )
+    }
+
     return { success: true }
   } catch (e) {
     logActivity({
@@ -790,7 +806,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     const clone = await db.salesOrder.create({
       data: {
         wcOrderNumber: ref,
-        status: 'PENDING',
+        status: 'DRAFT',
         currency: so.currency,
         fxRateToGbp: so.fxRateToGbp,
         customerId: so.customerId,
@@ -832,6 +848,10 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
       },
     })
 
+    // Auto-allocate stock for cloned order
+    const { autoAllocateOrder } = await import('./allocation')
+    await autoAllocateOrder(clone.id)
+
     revalidatePath('/sales')
     logActivity({
       entityType: 'SALES_ORDER',
@@ -864,28 +884,12 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
       select: { wcOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { productId: true, qty: true } }, _count: { select: { refunds: true, payments: true } } },
     })
     if (!so) return { success: false, error: 'Order not found' }
-    if (so.status !== 'PENDING') return { success: false, error: 'Only pending orders can be deleted' }
+    if (!['DRAFT', 'PENDING_PAYMENT', 'ALLOCATED'].includes(so.status)) return { success: false, error: 'Only draft/pending payment orders can be deleted' }
     if (so._count.refunds > 0 || so._count.payments > 0) return { success: false, error: 'Cannot delete an order with refunds or payments' }
 
-    // Release reserved stock
-    if (so.shipFromWarehouseId) {
-      for (const line of so.lines) {
-        if (!line.productId) continue
-        await db.stockLevel.updateMany({
-          where: { productId: line.productId, warehouseId: so.shipFromWarehouseId },
-          data: { reservedQty: { decrement: Number(line.qty) } },
-        })
-      }
-      logActivity({
-        entityType: 'STOCK_ADJUSTMENT',
-        entityId: id,
-        action: 'reservation_released',
-        tag: 'stock',
-        level: 'INFO',
-        description: `Released stock reservations for deleted order ${so.wcOrderNumber}`,
-        metadata: { orderNumber: so.wcOrderNumber, warehouseId: so.shipFromWarehouseId },
-      })
-    }
+    // Release allocations
+    const { deallocateOrder } = await import('./allocation')
+    await deallocateOrder(id)
 
     await db.salesOrderLine.deleteMany({ where: { orderId: id } })
     await db.salesOrder.delete({ where: { id } })

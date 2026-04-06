@@ -1,8 +1,8 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useState, useTransition, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
-import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2 } from 'lucide-react'
+import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Check } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -14,36 +14,69 @@ import {
   addPayment, deletePayment,
   type SoDetail, type SoStatus, type PaymentRow,
 } from '@/app/actions/sales'
+import { sendSalesOrderEmail, sendInvoiceEmail } from '@/app/actions/email'
+import {
+  autoAllocateOrder, getOrderAllocations, getOrderShipments,
+  deallocateOrder, confirmAllocations, updateAllocation, addAllocation,
+  updateShipmentStatus,
+  type AllocationRow, type ShipmentRow,
+} from '@/app/actions/allocation'
 import type { CurrencyRow } from '@/app/actions/currencies'
 import type { StockLevelEntry } from '@/app/actions/stock'
 import { ProductLink } from '@/components/inventory/product-link'
 
-type Warehouse = { id: string; code: string; name: string }
-type Props = { order: SoDetail; warehouses: Warehouse[]; currencies: CurrencyRow[]; wcUrl?: string; stockLevels: Record<string, Record<string, StockLevelEntry>> }
+type WarehouseInfo = { id: string; code: string; name: string }
+type Props = {
+  order: SoDetail
+  warehouses: WarehouseInfo[]
+  currencies: CurrencyRow[]
+  wcUrl?: string
+  stockLevels: Record<string, Record<string, StockLevelEntry>>
+  initialAllocations: AllocationRow[]
+  initialShipments: ShipmentRow[]
+  carriers: string[]
+  deliveryTrackingEnabled: boolean
+}
 
 const STATUS_LABELS: Record<SoStatus, string> = {
-  PENDING: 'Pending', PROCESSING: 'Processing', PICKING: 'Picking', PACKED: 'Packed',
-  SHIPPED: 'Shipped', COMPLETED: 'Completed', CANCELLED: 'Cancelled',
-  REFUNDED: 'Refunded', PARTIALLY_REFUNDED: 'Part. Refunded', ON_HOLD: 'On Hold',
+  DRAFT: 'Draft', PENDING_PAYMENT: 'Pending Payment', ON_HOLD: 'On Hold',
+  PROCESSING: 'Processing', ALLOCATED: 'Allocated', PICKING: 'Picking', PACKING: 'Packing',
+  SHIPPED: 'Shipped', COMPLETED: 'Completed', DELIVERED: 'Delivered',
+  CANCELLED: 'Cancelled', REFUNDED: 'Refunded', PARTIALLY_REFUNDED: 'Part. Refunded',
 }
 const STATUS_CLASS: Record<SoStatus, string> = {
-  PENDING: 'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200',
+  DRAFT: 'bg-gray-100 text-gray-800 border-gray-200 dark:bg-gray-800 dark:text-gray-200',
+  PENDING_PAYMENT: 'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200',
+  ON_HOLD: 'bg-muted text-muted-foreground border-muted',
   PROCESSING: 'bg-blue-100 text-blue-800 border-blue-200 dark:bg-blue-900 dark:text-blue-200',
+  ALLOCATED: 'bg-cyan-100 text-cyan-800 border-cyan-200 dark:bg-cyan-900 dark:text-cyan-200',
   PICKING: 'bg-blue-100 text-blue-800 border-blue-200 dark:bg-blue-900 dark:text-blue-200',
-  PACKED: 'bg-indigo-100 text-indigo-800 border-indigo-200 dark:bg-indigo-900 dark:text-indigo-200',
+  PACKING: 'bg-indigo-100 text-indigo-800 border-indigo-200 dark:bg-indigo-900 dark:text-indigo-200',
   SHIPPED: 'bg-purple-100 text-purple-800 border-purple-200 dark:bg-purple-900 dark:text-purple-200',
   COMPLETED: 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200',
+  DELIVERED: 'bg-emerald-100 text-emerald-800 border-emerald-200 dark:bg-emerald-900 dark:text-emerald-200',
   CANCELLED: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200',
   REFUNDED: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200',
   PARTIALLY_REFUNDED: 'bg-orange-100 text-orange-800 border-orange-200 dark:bg-orange-900 dark:text-orange-200',
-  ON_HOLD: 'bg-muted text-muted-foreground border-muted',
 }
-const STATUS_FLOW: Record<string, { label: string; icon: typeof Truck; target: SoStatus }[]> = {
-  PENDING: [{ label: 'Process', icon: Package, target: 'PROCESSING' }],
-  PROCESSING: [{ label: 'Start Picking', icon: Package, target: 'PICKING' }],
-  PICKING: [{ label: 'Mark Packed', icon: PackageCheck, target: 'PACKED' }],
-  PACKED: [{ label: 'Ship', icon: Truck, target: 'SHIPPED' }],
+// Status flow for orders WITH shipments (shipment-level picking/packing/shipping)
+const STATUS_FLOW_SHIPMENTS: Record<string, { label: string; icon: typeof Truck; target: SoStatus }[]> = {
+  DRAFT: [{ label: 'Process', icon: Package, target: 'PROCESSING' }],
+  PENDING_PAYMENT: [{ label: 'Process', icon: Package, target: 'PROCESSING' }],
+  PROCESSING: [{ label: 'Allocate', icon: Package, target: 'ALLOCATED' }],
   SHIPPED: [{ label: 'Complete', icon: PackageCheck, target: 'COMPLETED' }],
+  COMPLETED: [{ label: 'Delivered', icon: PackageCheck, target: 'DELIVERED' }],
+}
+// Status flow for orders WITHOUT shipments (legacy / simple flow)
+const STATUS_FLOW_LEGACY: Record<string, { label: string; icon: typeof Truck; target: SoStatus }[]> = {
+  DRAFT: [{ label: 'Process', icon: Package, target: 'PROCESSING' }],
+  PENDING_PAYMENT: [{ label: 'Process', icon: Package, target: 'PROCESSING' }],
+  PROCESSING: [{ label: 'Allocate', icon: Package, target: 'ALLOCATED' }],
+  ALLOCATED: [{ label: 'Start Picking', icon: Package, target: 'PICKING' }],
+  PICKING: [{ label: 'Mark Packed', icon: PackageCheck, target: 'PACKING' }],
+  PACKING: [{ label: 'Ship', icon: Truck, target: 'SHIPPED' }],
+  SHIPPED: [{ label: 'Complete', icon: PackageCheck, target: 'COMPLETED' }],
+  COMPLETED: [{ label: 'Delivered', icon: PackageCheck, target: 'DELIVERED' }],
 }
 
 // Optional columns for the line items table
@@ -61,10 +94,11 @@ const OPT_COLUMNS: { key: OptCol; label: string }[] = [
 // ---------------------------------------------------------------------------
 // Ship dialog
 // ---------------------------------------------------------------------------
-function ShipDialog({ order, warehouses, onClose }: { order: SoDetail; warehouses: Warehouse[]; onClose: () => void }) {
+function ShipDialog({ order, warehouses, carriers, onClose }: { order: SoDetail; warehouses: WarehouseInfo[]; carriers: string[]; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [tracking, setTracking] = useState('')
+  const [carrier, setCarrier] = useState(order.shippingService ?? '')
   const [whId, setWhId] = useState(order.shipFromWarehouseId ?? warehouses[0]?.id ?? '')
   const [error, setError] = useState('')
   function handleShip() {
@@ -83,8 +117,13 @@ function ShipDialog({ order, warehouses, onClose }: { order: SoDetail; warehouse
           <select value={whId} onChange={(e) => setWhId(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
             {warehouses.map((w) => (<option key={w.id} value={w.id}>{w.code} — {w.name}</option>))}
           </select></div>
+        <div className="space-y-1.5"><Label>Carrier</Label>
+          <select value={carrier} onChange={(e) => setCarrier(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
+            <option value="">Select carrier...</option>
+            {carriers.map((c) => (<option key={c} value={c}>{c}</option>))}
+          </select></div>
         <div className="space-y-1.5"><Label>Tracking Number</Label>
-          <Input value={tracking} onChange={(e) => setTracking(e.target.value)} placeholder="Optional" className="h-9 text-sm" /></div>
+          <Input value={tracking} onChange={(e) => setTracking(e.target.value)} placeholder="Optional" className="h-9 text-sm font-mono" /></div>
         {error && <p className="text-sm text-destructive">{error}</p>}
       </div>
       <DialogFooter>
@@ -98,7 +137,7 @@ function ShipDialog({ order, warehouses, onClose }: { order: SoDetail; warehouse
 // ---------------------------------------------------------------------------
 // Refund dialog
 // ---------------------------------------------------------------------------
-function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; warehouses: Warehouse[]; sym: string; onClose: () => void }) {
+function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; warehouses: WarehouseInfo[]; sym: string; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [reason, setReason] = useState('')
@@ -254,9 +293,419 @@ function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, onClose 
 }
 
 // ---------------------------------------------------------------------------
+// Allocation Panel
+// ---------------------------------------------------------------------------
+function AllocationPanel({
+  orderId, allocations, lines, warehouses, status, onRefresh,
+}: {
+  orderId: string
+  allocations: AllocationRow[]
+  lines: { id: string; productId: string | null; sku: string; description: string; qty: number }[]
+  warehouses: WarehouseInfo[]
+  status: SoStatus
+  onRefresh: () => void
+}) {
+  const [isPending, startTransition] = useTransition()
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editWhId, setEditWhId] = useState('')
+  const [editQty, setEditQty] = useState('')
+  const [error, setError] = useState('')
+  const [showAddLine, setShowAddLine] = useState<string | null>(null) // lineId
+  const [addWhId, setAddWhId] = useState('')
+  const [addQty, setAddQty] = useState('')
+
+  // Group allocations by warehouse
+  const byWarehouse = new Map<string, { code: string; name: string; allocs: AllocationRow[] }>()
+  for (const a of allocations) {
+    const group = byWarehouse.get(a.warehouseId) ?? { code: a.warehouseCode, name: a.warehouseName, allocs: [] }
+    group.allocs.push(a)
+    byWarehouse.set(a.warehouseId, group)
+  }
+
+  // Find backordered lines (not fully allocated)
+  const allocatedByLine = new Map<string, number>()
+  for (const a of allocations) {
+    allocatedByLine.set(a.lineId, (allocatedByLine.get(a.lineId) ?? 0) + a.qty)
+  }
+  const backorderLines = lines.filter((l) => {
+    if (!l.productId) return false
+    const allocated = allocatedByLine.get(l.id) ?? 0
+    return allocated < l.qty
+  })
+
+  function handleDeallocate() {
+    setError('')
+    startTransition(async () => {
+      const result = await deallocateOrder(orderId)
+      if (result.success) onRefresh()
+      else setError(result.error ?? 'Failed')
+    })
+  }
+
+  function handleReAllocate() {
+    setError('')
+    startTransition(async () => {
+      const result = await autoAllocateOrder(orderId)
+      if (result.success) onRefresh()
+      else setError(result.error ?? 'Failed')
+    })
+  }
+
+  function handleSaveEdit(allocId: string) {
+    setError('')
+    const qty = parseFloat(editQty)
+    if (isNaN(qty) || qty < 0) { setError('Invalid quantity'); return }
+    startTransition(async () => {
+      const result = await updateAllocation(allocId, editWhId, qty)
+      if (result.success) { setEditingId(null); onRefresh() }
+      else setError(result.error ?? 'Failed')
+    })
+  }
+
+  function handleAddAllocation(lineId: string, productId: string) {
+    setError('')
+    const qty = parseFloat(addQty)
+    if (isNaN(qty) || qty <= 0) { setError('Invalid quantity'); return }
+    startTransition(async () => {
+      const result = await addAllocation(orderId, lineId, productId, addWhId, qty)
+      if (result.success) { setShowAddLine(null); setAddQty(''); onRefresh() }
+      else setError(result.error ?? 'Failed')
+    })
+  }
+
+  return (
+    <div className="rounded-md border overflow-hidden">
+      <div className="border-b px-4 py-2 bg-muted/50 flex items-center justify-between">
+        <h2 className="text-sm font-medium flex items-center gap-2">
+          <Warehouse className="h-4 w-4 text-muted-foreground" />
+          Stock Allocation
+        </h2>
+        <div className="flex items-center gap-1.5">
+          {['PROCESSING', 'ALLOCATED'].includes(status) && (
+            <Button variant="outline" size="sm" className="h-7 text-xs" onClick={handleReAllocate} disabled={isPending}>
+              {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
+              {allocations.length > 0 ? 'Re-Allocate' : 'Auto-Allocate'}
+            </Button>
+          )}
+          {allocations.length > 0 && status === 'ALLOCATED' && (
+            <Button size="sm" className="h-7 text-xs" onClick={() => {
+              startTransition(async () => {
+                const result = await confirmAllocations(orderId)
+                if (result.success) onRefresh()
+                else setError(result.error ?? 'Failed')
+              })
+            }} disabled={isPending}>
+              {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
+              Create Shipments
+            </Button>
+          )}
+          {allocations.length > 0 && (
+            <Button variant="outline" size="sm" className="h-7 text-xs text-destructive hover:text-destructive" onClick={handleDeallocate} disabled={isPending}>
+              Deallocate
+            </Button>
+          )}
+        </div>
+      </div>
+
+      {error && <p className="px-4 py-2 text-sm text-destructive">{error}</p>}
+
+      {allocations.length === 0 && backorderLines.length === 0 && (
+        <div className="px-4 py-6 text-center text-sm text-muted-foreground">
+          No allocations yet. Click &ldquo;Allocate&rdquo; to auto-assign stock from warehouses.
+        </div>
+      )}
+
+      {/* Allocated items grouped by warehouse */}
+      {[...byWarehouse.entries()].map(([whId, { code, name, allocs }]) => (
+        <div key={whId} className="border-b last:border-b-0">
+          <div className="px-4 py-2 bg-muted/20 flex items-center justify-between">
+            <div className="flex items-center gap-2 text-sm">
+              <span className="font-medium font-mono">{code}</span>
+              <span className="text-muted-foreground">—</span>
+              <span className="text-muted-foreground">{name}</span>
+            </div>
+            <span className="text-xs text-muted-foreground">{allocs.length} item(s)</span>
+          </div>
+          <div className="divide-y">
+            {allocs.map((a) => {
+              const isEditing = editingId === a.id
+              const allocated = a.qty
+              const ordered = a.lineQty
+              const isFull = allocated >= ordered
+              return (
+                <div key={a.id} className="px-4 py-2.5 flex items-center gap-3">
+                  {a.imageUrl ? (
+                    <img src={a.imageUrl} alt="" className="w-8 h-8 rounded object-cover shrink-0" />
+                  ) : (
+                    <div className="w-8 h-8 rounded bg-muted shrink-0" />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <ProductLink productId={a.productId} sku={a.productSku} name={a.productName} />
+                  </div>
+                  {isEditing ? (
+                    <div className="flex items-center gap-2">
+                      <select value={editWhId} onChange={(e) => setEditWhId(e.target.value)} className="h-7 rounded border border-input bg-background px-2 text-xs">
+                        {warehouses.map((w) => (<option key={w.id} value={w.id}>{w.code}</option>))}
+                      </select>
+                      <Input type="number" min={0} step={1} value={editQty} onChange={(e) => setEditQty(e.target.value)} className="h-7 w-16 text-xs text-right font-mono" />
+                      <Button size="sm" className="h-7 text-xs" onClick={() => handleSaveEdit(a.id)} disabled={isPending}>Save</Button>
+                      <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => setEditingId(null)}>×</Button>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-3">
+                      <span className="text-xs text-muted-foreground">
+                        Allocated Stock <span className="font-mono font-medium text-foreground">{allocated}</span> / {ordered}
+                      </span>
+                      {isFull ? (
+                        <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
+                          <Check className="h-3 w-3 mr-0.5" />Full
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">
+                          Partial
+                        </span>
+                      )}
+                      {['PROCESSING', 'ALLOCATED'].includes(status) && (
+                        <button type="button" className="text-xs text-primary hover:underline" onClick={() => { setEditingId(a.id); setEditWhId(a.warehouseId); setEditQty(String(a.qty)) }}>
+                          Change
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      ))}
+
+      {/* Backorder items */}
+      {backorderLines.length > 0 && (
+        <div className="border-t">
+          <div className="px-4 py-2 bg-yellow-50 dark:bg-yellow-950/30 flex items-center gap-2">
+            <AlertTriangle className="h-4 w-4 text-yellow-600" />
+            <span className="text-sm font-medium text-yellow-800 dark:text-yellow-200">Backorder</span>
+          </div>
+          <div className="divide-y">
+            {backorderLines.map((l) => {
+              const allocated = allocatedByLine.get(l.id) ?? 0
+              const short = l.qty - allocated
+              const isAdding = showAddLine === l.id
+              return (
+                <div key={l.id} className="px-4 py-2.5 flex items-center gap-3">
+                  <div className="w-8 h-8 rounded bg-muted shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    {l.productId ? <ProductLink productId={l.productId} sku={l.sku} name={l.description} /> : <span className="text-sm">{l.description}</span>}
+                  </div>
+                  {isAdding ? (
+                    <div className="flex items-center gap-2">
+                      <select value={addWhId} onChange={(e) => setAddWhId(e.target.value)} className="h-7 rounded border border-input bg-background px-2 text-xs">
+                        <option value="">Warehouse…</option>
+                        {warehouses.map((w) => (<option key={w.id} value={w.id}>{w.code}</option>))}
+                      </select>
+                      <Input type="number" min={1} step={1} value={addQty} onChange={(e) => setAddQty(e.target.value)} placeholder={String(short)} className="h-7 w-16 text-xs text-right font-mono" />
+                      <Button size="sm" className="h-7 text-xs" onClick={() => l.productId && handleAddAllocation(l.id, l.productId)} disabled={isPending || !addWhId}>Add</Button>
+                      <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => setShowAddLine(null)}>×</Button>
+                    </div>
+                  ) : (
+                    <div className="flex items-center gap-3">
+                      <span className="text-xs text-muted-foreground">
+                        Short <span className="font-mono font-medium text-destructive">{short}</span> of {l.qty}
+                      </span>
+                      <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">
+                        Backorder
+                      </span>
+                      {['PROCESSING', 'ALLOCATED'].includes(status) && l.productId && (
+                        <button type="button" className="text-xs text-primary hover:underline" onClick={() => { setShowAddLine(l.id); setAddWhId(warehouses[0]?.id ?? ''); setAddQty(String(short)) }}>
+                          Allocate
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Shipments Panel
+// ---------------------------------------------------------------------------
+
+const SHIPMENT_STATUS_LABELS: Record<string, string> = {
+  PENDING: 'Pending', PICKING: 'Picking', PACKED: 'Packed', SHIPPED: 'Shipped',
+}
+const SHIPMENT_STATUS_CLASS: Record<string, string> = {
+  PENDING: 'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200',
+  PICKING: 'bg-blue-100 text-blue-800 border-blue-200 dark:bg-blue-900 dark:text-blue-200',
+  PACKED: 'bg-indigo-100 text-indigo-800 border-indigo-200 dark:bg-indigo-900 dark:text-indigo-200',
+  SHIPPED: 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200',
+}
+const SHIPMENT_FLOW: Record<string, { label: string; target: string }> = {
+  PENDING: { label: 'Start Picking', target: 'PICKING' },
+  PICKING: { label: 'Mark Packed', target: 'PACKED' },
+  PACKED: { label: 'Ship', target: 'SHIPPED' },
+}
+
+const CARRIER_TRACKING_URLS: Record<string, string> = {
+  'Royal Mail': 'https://www.royalmail.com/track-your-item#/tracking-results/',
+  'DPD': 'https://track.dpd.co.uk/parcels/',
+  'DHL': 'https://www.dhl.com/gb-en/home/tracking/tracking-parcel.html?submit=1&tracking-id=',
+  'DHL Express': 'https://www.dhl.com/gb-en/home/tracking/tracking-express.html?submit=1&tracking-id=',
+  'FedEx': 'https://www.fedex.com/fedextrack/?trknbr=',
+  'UPS': 'https://www.ups.com/track?tracknum=',
+  'Hermes / Evri': 'https://www.evri.com/track/parcel/',
+  'Yodel': 'https://www.yodel.co.uk/tracking/',
+  'Amazon Logistics': 'https://track.amazon.co.uk/tracking/',
+  'ParcelForce': 'https://www.parcelforce.com/track-trace?trackNumber=',
+  'TNT': 'https://www.tnt.com/express/en_gb/site/tracking.html?searchType=con&cons=',
+  'GLS': 'https://gls-group.com/GB/en/parcel-tracking?match=',
+  'Collect+': 'https://www.collectplus.co.uk/track/',
+}
+
+function getTrackingUrl(carrier: string | null, trackingNumber: string): string | null {
+  if (!carrier || !trackingNumber) return null
+  const baseUrl = CARRIER_TRACKING_URLS[carrier]
+  if (baseUrl) return baseUrl + encodeURIComponent(trackingNumber)
+  // Fallback: try 17track universal tracker
+  return `https://t.17track.net/en#nums=${encodeURIComponent(trackingNumber)}`
+}
+
+function ShipmentsPanel({
+  shipments, warehouses, carriers, deliveryTrackingEnabled, onRefresh,
+}: {
+  shipments: ShipmentRow[]
+  warehouses: WarehouseInfo[]
+  carriers: string[]
+  deliveryTrackingEnabled: boolean
+  onRefresh: () => void
+}) {
+  const [isPending, startTransition] = useTransition()
+  const [shipDialogId, setShipDialogId] = useState<string | null>(null)
+  const [tracking, setTracking] = useState('')
+  const [service, setService] = useState('')
+  const [error, setError] = useState('')
+
+  function handleAdvance(shipmentId: string, target: string) {
+    if (target === 'SHIPPED') {
+      setShipDialogId(shipmentId)
+      setTracking('')
+      setService('')
+      return
+    }
+    setError('')
+    startTransition(async () => {
+      const result = await updateShipmentStatus(shipmentId, target)
+      if (result.success) onRefresh()
+      else setError(result.error ?? 'Failed')
+    })
+  }
+
+  function handleShip(shipmentId: string) {
+    setError('')
+    startTransition(async () => {
+      const result = await updateShipmentStatus(shipmentId, 'SHIPPED', {
+        trackingNumber: tracking || undefined,
+        shippingService: service || undefined,
+      })
+      if (result.success) { setShipDialogId(null); onRefresh() }
+      else setError(result.error ?? 'Failed')
+    })
+  }
+
+  return (
+    <div className="space-y-3">
+      {error && <p className="text-sm text-destructive">{error}</p>}
+      {shipments.map((s) => {
+        const nextAction = SHIPMENT_FLOW[s.status]
+        return (
+          <div key={s.id} className="rounded-md border overflow-hidden">
+            <div className="px-4 py-2 bg-muted/50 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Truck className="h-4 w-4 text-muted-foreground" />
+                <span className="text-sm font-medium">Shipment from <span className="font-mono">{s.warehouseCode}</span></span>
+                <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${SHIPMENT_STATUS_CLASS[s.status] ?? ''}`}>
+                  {SHIPMENT_STATUS_LABELS[s.status] ?? s.status}
+                </span>
+                {s.trackingNumber && (() => {
+                  const url = deliveryTrackingEnabled ? getTrackingUrl(s.shippingService, s.trackingNumber) : null
+                  return url ? (
+                    <a href={url} target="_blank" rel="noopener noreferrer" className="inline-flex items-center gap-1 text-xs font-mono text-primary hover:underline">
+                      <ExternalLink className="h-3 w-3" />#{s.trackingNumber}
+                    </a>
+                  ) : (
+                    <span className="text-xs font-mono text-muted-foreground">#{s.trackingNumber}</span>
+                  )
+                })()}
+              </div>
+              <div className="flex items-center gap-1.5">
+                {nextAction && s.status !== 'SHIPPED' && (
+                  <Button size="sm" className="h-7 text-xs" onClick={() => handleAdvance(s.id, nextAction.target)} disabled={isPending}>
+                    {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
+                    {nextAction.label}
+                  </Button>
+                )}
+              </div>
+            </div>
+            <div className="divide-y">
+              {s.lines.map((l) => (
+                <div key={l.id} className="px-4 py-2 flex items-center gap-3">
+                  {l.imageUrl ? (
+                    <img src={l.imageUrl} alt="" className="w-8 h-8 rounded object-cover shrink-0" />
+                  ) : (
+                    <div className="w-8 h-8 rounded bg-muted shrink-0" />
+                  )}
+                  <div className="flex-1 min-w-0">
+                    <ProductLink productId={l.productId} sku={l.productSku} name={l.productName} />
+                  </div>
+                  <span className="text-xs text-muted-foreground tabular-nums">Qty: <span className="font-mono font-medium text-foreground">{l.qty}</span></span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )
+      })}
+
+      {/* Ship dialog */}
+      {shipDialogId && (
+        <Dialog open onOpenChange={() => {}}>
+          <DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
+            <DialogHeader><DialogTitle>Ship Parcel</DialogTitle></DialogHeader>
+            <div className="space-y-4">
+              <div className="space-y-1.5">
+                <Label>Carrier</Label>
+                <select value={service} onChange={(e) => setService(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
+                  <option value="">Select carrier...</option>
+                  {carriers.map((c) => (<option key={c} value={c}>{c}</option>))}
+                </select>
+              </div>
+              <div className="space-y-1.5">
+                <Label>Tracking Number</Label>
+                <Input value={tracking} onChange={(e) => setTracking(e.target.value)} placeholder="Optional" className="h-9 text-sm font-mono" />
+              </div>
+              {error && <p className="text-sm text-destructive">{error}</p>}
+            </div>
+            <DialogFooter>
+              <Button variant="outline" onClick={() => setShipDialogId(null)} disabled={isPending}>Cancel</Button>
+              <Button onClick={() => handleShip(shipDialogId)} disabled={isPending}>
+                {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Confirm Shipment
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stockLevels }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stockLevels, initialAllocations, initialShipments, carriers, deliveryTrackingEnabled }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [showShip, setShowShip] = useState(false)
@@ -268,18 +717,40 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
   const [showPayment, setShowPayment] = useState<{ refundId?: string; creditNoteNumber?: string } | null>(null)
   const [visibleCols, setVisibleCols] = useState<Set<OptCol>>(new Set())
   const [error, setError] = useState('')
+  const [allocations, setAllocations] = useState<AllocationRow[]>(initialAllocations)
+  const [shipments, setShipments] = useState<ShipmentRow[]>(initialShipments)
 
   const symbolMap: Record<string, string> = { GBP: '£' }
   for (const c of currencies) symbolMap[c.code] = c.symbol
   const sym = symbolMap[so.currency] ?? so.currency
 
-  const nextActions = STATUS_FLOW[so.status] ?? []
-  const canCancel = ['PENDING', 'PROCESSING', 'PICKING', 'PACKED', 'ON_HOLD'].includes(so.status)
-  const canDelete = so.status === 'PENDING'
-  const canRefund = ['SHIPPED', 'COMPLETED', 'PARTIALLY_REFUNDED'].includes(so.status)
+  const hasShipments = shipments.length > 0
+  const baseFlow = hasShipments ? STATUS_FLOW_SHIPMENTS : STATUS_FLOW_LEGACY
+  // Filter out Delivered action if delivery tracking is not enabled
+  const nextActions = (baseFlow[so.status] ?? []).filter((a) => a.target !== 'DELIVERED' || deliveryTrackingEnabled)
+  const canCancel = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status)
+  const canDelete = ['DRAFT', 'PENDING_PAYMENT'].includes(so.status)
+  const canRefund = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'].includes(so.status)
+  // Show allocation panel for PROCESSING/ALLOCATED (and when no shipments yet)
+  const showAllocations = ['PROCESSING', 'ALLOCATED'].includes(so.status) && !hasShipments
+  const showShipments = ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) && hasShipments
+
+  const refreshAllocations = useCallback(() => {
+    getOrderAllocations(so.id).then(setAllocations)
+    getOrderShipments(so.id).then(setShipments)
+  }, [so.id])
 
   function handleStatusChange(target: SoStatus) {
     if (target === 'SHIPPED') { setShowShip(true); return }
+    if (target === 'ALLOCATED') {
+      setError('')
+      startTransition(async () => {
+        const result = await autoAllocateOrder(so.id)
+        if (result.success) { refreshAllocations(); router.refresh() }
+        else setError(result.error ?? 'Failed')
+      })
+      return
+    }
     setError('')
     startTransition(async () => {
       const result = await updateSalesOrderStatus(so.id, target)
@@ -335,18 +806,22 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
     setVisibleCols((prev) => { const n = new Set(prev); n.has(col) ? n.delete(col) : n.add(col); return n })
   }
 
-  function getMailtoLink() {
-    if (!so.customerEmail) return null
-    const subject = encodeURIComponent(`Order ${so.wcOrderNumber ?? so.id.slice(0, 8)}`)
-    const body = encodeURIComponent(`Dear ${so.customerName ?? 'Customer'},\n\nPlease find attached your order confirmation.\n\nKind regards`)
-    return `mailto:${so.customerEmail}?subject=${subject}&body=${body}`
+  function handleEmailOrder() {
+    setError('')
+    startTransition(async () => {
+      const result = await sendSalesOrderEmail(so.id)
+      if (result.success) { setError(''); alert('Order confirmation sent to ' + so.customerEmail) }
+      else setError(result.error ?? 'Failed to send email')
+    })
   }
 
-  function getInvoiceMailtoLink() {
-    if (!so.customerEmail || !so.invoiceNumber) return null
-    const subject = encodeURIComponent(`Invoice ${so.invoiceNumber}`)
-    const body = encodeURIComponent(`Dear ${so.customerName ?? 'Customer'},\n\nPlease find attached your invoice ${so.invoiceNumber}.\n\nKind regards`)
-    return `mailto:${so.customerEmail}?subject=${subject}&body=${body}`
+  function handleEmailInvoice() {
+    setError('')
+    startTransition(async () => {
+      const result = await sendInvoiceEmail(so.id)
+      if (result.success) { setError(''); alert('Invoice sent to ' + so.customerEmail) }
+      else setError(result.error ?? 'Failed to send email')
+    })
   }
 
   // COGS per line (approximate from totalGbp)
@@ -381,13 +856,13 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
             </Button>
           )}
           {so.customerEmail && (
-            <Button variant="outline" size="sm" onClick={() => { const l = getMailtoLink(); if (l) window.location.href = l }}>
-              <Mail className="h-4 w-4 mr-1" />Email
+            <Button variant="outline" size="sm" onClick={handleEmailOrder} disabled={isPending}>
+              {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Mail className="h-4 w-4 mr-1" />}Email
             </Button>
           )}
           {so.invoiceNumber && so.customerEmail && (
-            <Button variant="outline" size="sm" onClick={() => { const l = getInvoiceMailtoLink(); if (l) window.location.href = l }}>
-              <Mail className="h-4 w-4 mr-1" />Email Invoice
+            <Button variant="outline" size="sm" onClick={handleEmailInvoice} disabled={isPending}>
+              {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Mail className="h-4 w-4 mr-1" />}Email Invoice
             </Button>
           )}
 
@@ -475,11 +950,41 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
         </div>
         {so.expectedDelivery && <div><span className="text-muted-foreground">Expected Delivery</span><p className="font-medium">{new Date(so.expectedDelivery).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}</p></div>}
         {so.salesRep && <div><span className="text-muted-foreground">Sales Rep</span><p className="font-medium">{so.salesRep}</p></div>}
-        {so.trackingNumber && <div><span className="text-muted-foreground">Tracking</span><p className="font-medium font-mono text-xs">{so.trackingNumber}</p></div>}
+        {so.trackingNumber && <div><span className="text-muted-foreground">Tracking</span>{(() => {
+          const url = deliveryTrackingEnabled ? getTrackingUrl(so.shippingService, so.trackingNumber) : null
+          return url ? (
+            <a href={url} target="_blank" rel="noopener noreferrer" className="flex items-center gap-1 font-medium font-mono text-xs text-primary hover:underline">
+              <ExternalLink className="h-3 w-3" />{so.trackingNumber}
+            </a>
+          ) : <p className="font-medium font-mono text-xs">{so.trackingNumber}</p>
+        })()}</div>}
         {so.shippedAt && <div><span className="text-muted-foreground">Shipped</span><p className="font-medium">{new Date(so.shippedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}</p></div>}
         {so.notes && <div className="col-span-2"><span className="text-muted-foreground">Customer Notes</span><p className="mt-0.5 whitespace-pre-wrap">{so.notes}</p></div>}
         {so.internalNotes && <div className="col-span-2"><span className="text-muted-foreground">Private Notes</span><p className="mt-0.5 whitespace-pre-wrap text-muted-foreground italic">{so.internalNotes}</p></div>}
       </div>
+
+      {/* Allocation Panel */}
+      {showAllocations && (
+        <AllocationPanel
+          orderId={so.id}
+          allocations={allocations}
+          lines={so.lines}
+          warehouses={warehouses}
+          status={so.status}
+          onRefresh={() => { refreshAllocations(); router.refresh() }}
+        />
+      )}
+
+      {/* Shipments Panel */}
+      {showShipments && (
+        <ShipmentsPanel
+          shipments={shipments}
+          warehouses={warehouses}
+          carriers={carriers}
+          deliveryTrackingEnabled={deliveryTrackingEnabled}
+          onRefresh={() => { refreshAllocations(); router.refresh() }}
+        />
+      )}
 
       {/* Lines table */}
       <div className="rounded-md border overflow-hidden">
@@ -524,7 +1029,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
               const revenueGbp = line.totalGbp
               const margin = revenueGbp - cogs
               const marginPct = revenueGbp > 0 ? (margin / revenueGbp) * 100 : 0
-              const shipped = ['SHIPPED', 'COMPLETED'].includes(so.status) ? line.qty : 0
+              const shipped = ['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) ? line.qty : 0
               const cancelled = so.status === 'CANCELLED' ? line.qty : 0
               const returned = so.refunds?.reduce((s, r) => s + r.lines.filter((rl) => rl.productId === line.productId).reduce((s2, rl) => s2 + rl.qty, 0), 0) ?? 0
               return (
@@ -584,7 +1089,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
                 <FileText className="h-3 w-3 mr-1" />PDF
               </Button>
               {so.customerEmail && (
-                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => { const l = getInvoiceMailtoLink(); if (l) window.location.href = l }}>
+                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={handleEmailInvoice} disabled={isPending}>
                   <Mail className="h-3 w-3 mr-1" />Email
                 </Button>
               )}
@@ -686,7 +1191,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
       )}
 
       {/* Dialogs */}
-      {showShip && <ShipDialog order={so} warehouses={warehouses} onClose={() => setShowShip(false)} />}
+      {showShip && <ShipDialog order={so} warehouses={warehouses} carriers={carriers} onClose={() => setShowShip(false)} />}
       {showRefund && <RefundDialog order={so} warehouses={warehouses} sym={sym} onClose={() => setShowRefund(false)} />}
       {showNotes && <NotesDialog order={so} onClose={() => setShowNotes(false)} />}
       {showPayment && <PaymentDialog orderId={so.id} refundId={showPayment.refundId} creditNoteNumber={showPayment.creditNoteNumber} currency={so.currency} onClose={() => setShowPayment(null)} />}
@@ -786,8 +1291,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
               <FileText className="h-4 w-4 mr-1" />Print / Download PDF
             </Button>
             {so.customerEmail && (
-              <Button variant="outline" onClick={() => { const l = getInvoiceMailtoLink(); if (l) window.location.href = l }}>
-                <Mail className="h-4 w-4 mr-1" />Email to Customer
+              <Button variant="outline" onClick={handleEmailInvoice} disabled={isPending}>
+                {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Mail className="h-4 w-4 mr-1" />}Email to Customer
               </Button>
             )}
             {canRefund && (

@@ -17,9 +17,11 @@ datasource db {
 
 enum UserRole {
   ADMIN
+  MANAGER
   WAREHOUSE
   FINANCE
   READONLY
+  SUPPLIER
 }
 
 enum ProductType {
@@ -76,16 +78,26 @@ enum LandedCostMethod {
 }
 
 enum SalesOrderStatus {
-  PENDING
+  DRAFT
+  PENDING_PAYMENT
+  ON_HOLD
   PROCESSING
+  ALLOCATED
   PICKING
-  PACKED
+  PACKING
   SHIPPED
   COMPLETED
+  DELIVERED
   CANCELLED
   REFUNDED
   PARTIALLY_REFUNDED
-  ON_HOLD
+}
+
+enum ShipmentStatus {
+  PENDING
+  PICKING
+  PACKED
+  SHIPPED
 }
 
 enum StockTransferStatus {
@@ -184,6 +196,7 @@ model User {
   name           String
   passwordHash   String
   role           UserRole  @default(ADMIN)
+  supplierId     String?   // set when role=SUPPLIER — links to their company
   pictureUrl     String?
   totpSecret     String?   // null = 2FA not enabled
   totpEnabled    Boolean   @default(false)
@@ -192,6 +205,7 @@ model User {
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
 
+  supplier       Supplier? @relation(fields: [supplierId], references: [id])
   activityLogs   ActivityLog[]
   sessions       Session[]
   passkeys       Passkey[]
@@ -345,6 +359,7 @@ model TaxRate {
   supplierTaxRate Supplier[]
   orderLines      SalesOrderLine[]
   poLines         PurchaseOrderLine[]
+  wcTaxMappings   WcTaxMapping[]
 
   @@map("tax_rates")
 }
@@ -382,6 +397,8 @@ model Warehouse {
   orderShipments        SalesOrder[]    @relation("ShipFromWarehouse")
   refundReturns         SalesOrderRefund[]
   incomingPurchaseOrders PurchaseOrder[] @relation("PODestinationWarehouse")
+  orderAllocations      OrderAllocation[]
+  shipments             Shipment[]
 
   @@map("warehouses")
 }
@@ -452,6 +469,9 @@ model Product {
   usedAsComponentIn     ProductComponent[] @relation("ProductUsedAsComponent")
 
   productionOrdersAsOutput ProductionOrder[]
+
+  orderAllocations OrderAllocation[]
+  shipmentLines    ShipmentLine[]
 
   wcSyncLogs      WcSyncLog[]
 
@@ -598,6 +618,7 @@ model Supplier {
   purchaseOrders  PurchaseOrder[]
   supplierProducts SupplierProduct[]
   productionOrders ProductionOrder[]
+  users           User[]
 
   @@map("suppliers")
 }
@@ -887,7 +908,7 @@ model SalesOrder {
   id                String           @id @default(cuid())
   wcOrderId         Int?             @unique // WooCommerce order ID
   wcOrderNumber     String?          // WC order number (may differ from ID)
-  status            SalesOrderStatus @default(PENDING)
+  status            SalesOrderStatus @default(DRAFT)
   currency          String           @default("GBP")
   fxRateToGbp       Decimal          @db.Decimal(18, 8) @default(1)
 
@@ -937,6 +958,8 @@ model SalesOrder {
   lines             SalesOrderLine[]
   refunds           SalesOrderRefund[]
   payments          Payment[]
+  allocations       OrderAllocation[]
+  shipments         Shipment[]
   wcSyncLogs        WcSyncLog[]
 
   @@index([wcOrderId])
@@ -966,6 +989,8 @@ model SalesOrderLine {
   order           SalesOrder @relation(fields: [orderId], references: [id])
   product         Product?   @relation(fields: [productId], references: [id])
   taxRate         TaxRate?   @relation(fields: [taxRateId], references: [id])
+  allocations     OrderAllocation[]
+  shipmentLines   ShipmentLine[]
 
   @@map("sales_order_lines")
 }
@@ -1245,6 +1270,34 @@ model WcSyncLog {
 }
 
 // ---------------------------------------------------------------------------
+// WOOCOMMERCE SYNC MAPPINGS
+// ---------------------------------------------------------------------------
+
+/// Maps WC tax classes (e.g. "standard", "reduced-rate") to IMS TaxRate records
+model WcTaxMapping {
+  id         String   @id @default(cuid())
+  wcTaxClass String   @unique
+  taxRateId  String
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  taxRate    TaxRate  @relation(fields: [taxRateId], references: [id])
+
+  @@map("wc_tax_mappings")
+}
+
+/// Maps WC order statuses to IMS SalesOrderStatus values
+model WcStatusMapping {
+  id        String           @id @default(cuid())
+  wcStatus  String           @unique
+  imsStatus SalesOrderStatus
+  createdAt DateTime         @default(now())
+  updatedAt DateTime         @updatedAt
+
+  @@map("wc_status_mappings")
+}
+
+// ---------------------------------------------------------------------------
 // ACTIVITY LOG
 // ---------------------------------------------------------------------------
 
@@ -1267,4 +1320,64 @@ model ActivityLog {
   @@index([tag])
   @@index([level])
   @@map("activity_logs")
+}
+
+// ---------------------------------------------------------------------------
+// ORDER ALLOCATIONS & SHIPMENTS
+// ---------------------------------------------------------------------------
+
+/// Per-line warehouse allocation for sales orders
+model OrderAllocation {
+  id          String   @id @default(cuid())
+  orderId     String
+  lineId      String
+  productId   String
+  warehouseId String
+  qty         Decimal  @db.Decimal(12, 4)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  order       SalesOrder     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  line        SalesOrderLine @relation(fields: [lineId], references: [id], onDelete: Cascade)
+  product     Product        @relation(fields: [productId], references: [id])
+  warehouse   Warehouse      @relation(fields: [warehouseId], references: [id])
+
+  @@unique([lineId, warehouseId])
+  @@index([orderId])
+  @@map("order_allocations")
+}
+
+/// A shipment groups allocated lines from one warehouse
+model Shipment {
+  id              String         @id @default(cuid())
+  orderId         String
+  warehouseId     String
+  status          ShipmentStatus @default(PENDING)
+  trackingNumber  String?
+  shippingService String?
+  shippedAt       DateTime?
+  createdAt       DateTime       @default(now())
+  updatedAt       DateTime       @updatedAt
+
+  order           SalesOrder     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  warehouse       Warehouse      @relation(fields: [warehouseId], references: [id])
+  lines           ShipmentLine[]
+
+  @@index([orderId])
+  @@map("shipments")
+}
+
+/// Line items within a shipment
+model ShipmentLine {
+  id          String   @id @default(cuid())
+  shipmentId  String
+  lineId      String
+  productId   String
+  qty         Decimal  @db.Decimal(12, 4)
+
+  shipment    Shipment       @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  line        SalesOrderLine @relation(fields: [lineId], references: [id])
+  product     Product        @relation(fields: [productId], references: [id])
+
+  @@map("shipment_lines")
 }

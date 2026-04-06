@@ -1,9 +1,10 @@
 import { NextResponse } from 'next/server'
-import { exec } from 'child_process'
+import { execFile } from 'child_process'
 import { mkdir, readdir, stat, unlink } from 'fs/promises'
 import path from 'path'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { verifyCron } from '@/lib/cron-auth'
 
 const BACKUP_DIR = path.join(process.cwd(), 'backups')
 
@@ -23,8 +24,9 @@ function getDbConfig() {
   }
 }
 
-// Called daily by cron: curl http://localhost:3000/api/cron/backup
-export async function GET() {
+export async function GET(request: Request) {
+  const cronErr = verifyCron(request)
+  if (cronErr) return cronErr
   const enabled = await getSetting('backup_schedule_enabled')
   if (enabled !== 'true') {
     return NextResponse.json({ skipped: true, reason: 'Scheduled backups disabled' })
@@ -40,10 +42,10 @@ export async function GET() {
 
   await mkdir(BACKUP_DIR, { recursive: true })
 
-  // Create backup
+  // Create backup (using execFile to prevent command injection)
   const created = await new Promise<boolean>((resolve) => {
-    const cmd = `PGPASSWORD=${dbConf.password} pg_dump -h ${dbConf.host} -p ${dbConf.port} -U ${dbConf.user} -d ${dbConf.database} --no-owner --no-acl -F p -f "${filePath}"`
-    exec(cmd, { timeout: 120000 }, (error) => {
+    const args = ['-h', dbConf.host, '-p', dbConf.port, '-U', dbConf.user, '-d', dbConf.database, '--no-owner', '--no-acl', '-F', 'p', '-f', filePath]
+    execFile('pg_dump', args, { timeout: 120000, env: { ...process.env, PGPASSWORD: dbConf.password } }, (error) => {
       if (error) {
         logActivity({ entityType: 'SYSTEM', tag: 'system', action: 'scheduled_backup', level: 'ERROR', description: `Scheduled backup failed: ${error.message}` })
         resolve(false)

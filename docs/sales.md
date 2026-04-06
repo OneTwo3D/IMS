@@ -1,6 +1,6 @@
 # Sales Orders
 
-Sales orders track customer purchases from creation through to dispatch and completion. Orders can be created manually or imported automatically from WooCommerce.
+Sales orders track customer purchases from creation through to allocation, multi-shipment dispatch, and completion. Orders can be created manually or imported automatically from WooCommerce.
 
 ## Sales Order List
 
@@ -25,28 +25,71 @@ To create a new order manually:
 
 When WooCommerce sync is configured, orders are imported automatically into the system. These orders display a **WooCommerce link** that takes you directly to the order in your WC admin panel. This link only appears for orders that were synced from WooCommerce (i.e. those with a WC Order ID).
 
+WooCommerce orders follow the full completion flow: when WC marks an order as completed, the system auto-allocates stock and creates shipments with tracking information. See the [Integrations Dashboard](#integrations-dashboard) documentation for details on WooCommerce sync configuration.
+
 ## Order Statuses
 
 Sales orders progress through the following statuses:
 
 | Status | Description |
 |---|---|
-| **Pending** | Order created, awaiting confirmation |
+| **Draft** | Order created but not yet confirmed |
+| **Pending Payment** | Order awaiting payment |
+| **On Hold** | Order paused, awaiting further action |
 | **Processing** | Order confirmed and being prepared |
+| **Allocated** | Stock has been allocated from warehouses |
 | **Picking** | Items are being picked from the warehouse |
-| **Packed** | Items picked and packed, ready for dispatch |
+| **Packing** | Items picked, being packed for dispatch |
 | **Shipped** | Order has been dispatched to the customer |
 | **Completed** | Order fulfilled and closed |
+| **Delivered** | Order confirmed as delivered (requires delivery tracking module) |
 | **Cancelled** | Order cancelled, stock reservations released |
-| **On Hold** | Order paused, awaiting further action |
 
 ## Stock Allocation
 
-When a sales order is created, the requested stock is **reserved** against your inventory. This reserved quantity prevents the same stock from being promised to multiple orders. You will see the reserved quantity reflected in your inventory figures until the order is dispatched or cancelled.
+Stock allocation determines which warehouse(s) will fulfil each order line. The system uses an **OrderAllocation** model to track per-line, per-warehouse allocation.
 
-## Dispatching
+### Auto-Allocation
 
-When you dispatch an order, the reserved stock is **deducted** from the selected warehouse. A stock movement record is created automatically to maintain a full audit trail.
+The smart auto-allocation algorithm minimises the number of shipments by consolidating warehouses. It analyses stock availability across all warehouses and assigns lines to as few warehouses as possible.
+
+### Allocation Panel
+
+The order detail page includes an allocation panel that shows:
+
+- **Allocations grouped by warehouse** -- see which warehouse fulfils which lines
+- **Backorder items** -- lines where insufficient stock is available
+- **Manual edit** -- override allocations manually if needed
+
+## Multi-Shipment System
+
+Orders can be shipped in multiple shipments, each from a different warehouse. The system uses **Shipment** and **ShipmentLine** models to track each shipment independently.
+
+### Shipment Workflow
+
+Each shipment progresses through its own lifecycle:
+
+```
+PENDING --> PICKING --> PACKED --> SHIPPED
+```
+
+### Shipment Features
+
+- Each shipment gets an **independent tracking number**
+- Select a **shipping carrier** from the configurable carrier dropdown
+- **Tracking links** open the carrier's website when delivery tracking is enabled
+- Multiple shipments can be in different stages simultaneously
+
+## Delivery Tracking
+
+When the delivery tracking module is enabled (in **Settings > Sales**), the system supports:
+
+- **Carrier selection** from a configurable list of shipping carriers (Royal Mail, DPD, DHL, FedEx, UPS, and others)
+- **Tracking URLs** for 13 pre-configured carriers with a 17track fallback
+- **Delivery status updates** via WooCommerce (AST plugin) or TrackShip API
+- **DELIVERED status** becomes available as the final order status
+
+See [Settings > Sales](#delivery-tracking-settings) for configuration details.
 
 ## Refunds
 
@@ -89,3 +132,4 @@ PDFs use your company branding (logo, colours, and footer) as configured in Sett
 
 - **Clone an order** to quickly create a new order based on an existing one
 - **Update notes** to add internal comments or special instructions to any order
+- **Email documents** directly via SMTP with PDF attachments (sales order or invoice)

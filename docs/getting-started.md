@@ -9,8 +9,9 @@ Whether you manage a single warehouse or multiple locations, One Two Inventory g
 
 - **Inventory** -- Track products across warehouses with FIFO costing and real-time stock levels.
 - **Purchasing** -- Create purchase orders, receive stock, manage suppliers, and handle landed costs.
-- **Sales** -- Process sales orders and allocate stock automatically.
+- **Sales** -- Process sales orders with smart stock allocation, multi-warehouse shipments, and delivery tracking.
 - **Manufacturing** -- Define bills of materials and build finished goods from components.
+- **Integrations** -- Connect WooCommerce for automatic order import, status sync, and stock push.
 - **Analytics** -- Monitor gross sales, net sales, COGS, and margin from a live dashboard.
 
 
@@ -43,9 +44,11 @@ The sidebar organises the system into sections:
 | **Inventory** | Product catalogue, stock levels, and product details |
 | **Stock Control** | Adjustments and warehouse transfers |
 | **Purchasing** | Purchase orders, suppliers, and receiving |
-| **Sales** | Sales orders and fulfilment |
+| **Sales** | Sales orders, allocation, shipments, and fulfilment |
 | **Manufacturing** | Build orders for BOM products |
-| **Settings** | Company, warehouses, users, and configuration |
+| **Sync** | External integrations (WooCommerce, Shopify, Xero, REST API) |
+| **Analytics** | Sales, purchasing, and inventory reports |
+| **Settings** | Company, warehouses, users, roles, and configuration |
 
 
 ## Key Concepts

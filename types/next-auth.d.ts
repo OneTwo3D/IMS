@@ -5,9 +5,18 @@ declare module 'next-auth' {
     user: {
       id: string
       role: string
+      supplierId: string | null
       totpEnabled: boolean
       totpVerified: boolean
       pictureUrl: string | null
     } & DefaultSession['user']
+  }
+
+  interface User {
+    role?: string
+    supplierId?: string | null
+    totpEnabled?: boolean
+    totpVerified?: boolean
+    pictureUrl?: string | null
   }
 }

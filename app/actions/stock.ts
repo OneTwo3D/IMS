@@ -489,33 +489,7 @@ export async function fetchWcImage(
   }
 }
 
-export async function fetchWcProductUrl(
-  sku: string
-): Promise<{ permalink: string | null; error?: string }> {
-  try {
-    const [urlSetting, keySetting, secretSetting] = await Promise.all([
-      db.setting.findUnique({ where: { key: 'wc_url' } }),
-      db.setting.findUnique({ where: { key: 'wc_consumer_key' } }),
-      db.setting.findUnique({ where: { key: 'wc_consumer_secret' } }),
-    ])
-    if (!urlSetting || !keySetting || !secretSetting) {
-      return { permalink: null, error: 'WooCommerce not configured in Settings' }
-    }
-    const wcUrl = JSON.parse(urlSetting.value)
-    const key = JSON.parse(keySetting.value)
-    const secret = JSON.parse(secretSetting.value)
-    const auth = Buffer.from(`${key}:${secret}`).toString('base64')
-    const endpoint = `${wcUrl}/wp-json/wc/v3/products?sku=${encodeURIComponent(sku)}&per_page=1`
-    const res = await fetch(endpoint, { headers: { Authorization: `Basic ${auth}` }, cache: 'no-store' })
-    if (!res.ok) return { permalink: null, error: `WooCommerce API error: ${res.status}` }
-    const data = await res.json()
-    const product = Array.isArray(data) ? data[0] : data
-    if (!product) return { permalink: null, error: `No WooCommerce product found for SKU "${sku}"` }
-    return { permalink: product.permalink ?? null }
-  } catch {
-    return { permalink: null, error: 'Failed to fetch from WooCommerce' }
-  }
-}
+// WC product URL lookup: see lib/connectors/woocommerce/products.ts
 
 // ---------------------------------------------------------------------------
 // List warehouses (for forms)

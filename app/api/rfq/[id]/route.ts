@@ -53,6 +53,10 @@ export async function GET(
   }
 
   const branding = await getBranding()
+  const tpl = await db.documentTemplate.findUnique({
+    where: { type: 'rfq' },
+    select: { headerNote: true, footerNote: true, termsText: true, customFooter: true },
+  })
 
   const supplierAddress = [
     po.supplier.addressLine1,
@@ -62,7 +66,7 @@ export async function GET(
     po.supplier.country,
   ]
     .filter(Boolean)
-    .join(', ')
+    .join('\n')
 
   const dateStr = po.createdAt.toLocaleDateString('en-GB', {
     day: 'numeric',
@@ -73,7 +77,7 @@ export async function GET(
   // Build PDF
   const { doc } = createPdfDocument({ title: `RFQ — ${po.reference}` })
 
-  drawHeader(doc, branding, {
+  await drawHeader(doc, branding, {
     title: 'Request for Quotation',
     reference: po.reference,
     date: dateStr,
@@ -98,6 +102,12 @@ export async function GET(
       .fillColor('#000000')
       .text(`Required by: ${expectedStr}`, 50, doc.y)
     doc.y += 6
+  }
+
+  // Header note from template
+  if (tpl?.headerNote) {
+    doc.font('Helvetica').fontSize(8).fillColor('#555').text(tpl.headerNote!, 50, doc.y, { width: 495 })
+    doc.y += 8
   }
 
   doc
@@ -153,7 +163,19 @@ export async function GET(
     doc.y += 10
   }
 
-  const tpl = await db.documentTemplate.findUnique({ where: { type: 'rfq' }, select: { customFooter: true } })
+  // Footer note from template
+  if (tpl?.footerNote) {
+    doc.y += 10
+    doc.font('Helvetica').fontSize(8).fillColor('#555').text(tpl.footerNote, 50, doc.y, { width: 495 })
+  }
+
+  // Terms from template
+  if (tpl?.termsText) {
+    doc.y += 10
+    doc.font('Helvetica-Bold').fontSize(7).fillColor('#888').text('TERMS & CONDITIONS', 50, doc.y)
+    doc.font('Helvetica').fontSize(7).fillColor('#888').text(tpl.termsText, 50, doc.y + 2, { width: 495 })
+  }
+
   drawFooter(
     doc,
     'Please reply with your quotation including unit prices, lead time, and shipping costs.',

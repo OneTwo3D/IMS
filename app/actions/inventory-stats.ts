@@ -135,7 +135,7 @@ export async function getStockAllocations(): Promise<StockAllocationRow[]> {
 
   // Count pending orders per product
   const pendingLines = await db.salesOrderLine.findMany({
-    where: { order: { status: { in: ['PENDING', 'PROCESSING', 'PICKING', 'PACKED'] } } },
+    where: { order: { status: { in: ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'] } } },
     select: { productId: true, orderId: true },
   })
   const pendingByProduct = new Map<string, Set<string>>()

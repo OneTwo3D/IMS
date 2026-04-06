@@ -93,7 +93,7 @@ Scheduled backups are triggered via a cron endpoint:
 /api/cron/backup
 ```
 
-Configure your server's cron scheduler to call this endpoint at your preferred time. For example, to run backups daily at 02:00:
+Configure your server's cron scheduler to call this endpoint at your preferred time. Cron endpoints require the `CRON_SECRET` header or must originate from localhost. For example, to run backups daily at 02:00:
 
 ```
 0 2 * * * curl -s http://localhost:3000/api/cron/backup

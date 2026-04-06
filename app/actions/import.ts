@@ -387,15 +387,18 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<ImportRe
         return { productId: l.productId, sku: l.sku, description: l.description, qty: l.qty, unitPriceForeign: l.unitPrice, unitPriceGbp: l.unitPrice, taxForeign: 0, taxGbp: 0, totalForeign: total, totalGbp: total }
       })
       const ref = `SO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
-      await db.salesOrder.create({
+      const so = await db.salesOrder.create({
         data: {
-          wcOrderNumber: ref, status: 'PENDING', currency: g.currency, fxRateToGbp: 1,
+          wcOrderNumber: ref, status: 'DRAFT', currency: g.currency, fxRateToGbp: 1,
           customerName: g.customerName, subtotalForeign, shippingForeign: 0, taxForeign: 0,
           totalForeign: subtotalForeign, subtotalGbp: subtotalForeign, shippingGbp: 0, taxGbp: 0, totalGbp: subtotalForeign,
           notes: g.notes || null,
           lines: { create: lineData },
         },
       })
+      // Auto-allocate stock
+      const { autoAllocateOrder } = await import('./allocation')
+      await autoAllocateOrder(so.id)
       result.created += g.lines.length
     } catch (e: unknown) {
       result.errors.push(String(e))

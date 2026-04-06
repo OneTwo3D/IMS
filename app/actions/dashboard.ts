@@ -185,7 +185,7 @@ export async function getDashboardData(
       select: { totalGbp: true },
     }),
     db.salesOrder.findMany({
-      where: { status: { in: ['PENDING', 'PROCESSING', 'PICKING', 'PACKED'] } },
+      where: { status: { in: ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'] } },
       select: { totalGbp: true },
     }),
     db.salesOrderRefund.findMany({

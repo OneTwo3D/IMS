@@ -1,6 +1,6 @@
 # Settings
 
-Settings are organised in the sidebar under seven sub-sections. Each section controls a different aspect of the system.
+Settings are organised in the sidebar under eight sub-sections. Each section controls a different aspect of the system.
 
 ## Company Settings
 
@@ -95,6 +95,16 @@ Set the **invoice generation trigger** to control when invoices are created auto
 - **On ship** — invoice created when the order is shipped
 - **On paid** — invoice created when the order is fully paid
 
+### Delivery Tracking
+
+Toggle the delivery tracking module on or off. When enabled:
+
+- **Source** — choose between WooCommerce (AST plugin) or TrackShip API direct
+- **Shipping carriers** — configure which carriers are available in the carrier dropdown when shipping orders. Pre-populated with common carriers: Royal Mail, DPD, DHL, FedEx, UPS, Hermes/Evri, Yodel, Parcelforce, TNT, Amazon Logistics, GLS, USPS, and more.
+- **Tracking links** — when delivery tracking is enabled, tracking numbers become clickable links that open the carrier's tracking website. A 17track fallback is used for carriers without a dedicated tracking URL.
+- **Delivery status cron** — the endpoint `/api/cron/delivery-status` polls for delivery status updates on a schedule.
+- The **DELIVERED** order status becomes available in the order workflow.
+
 ## Purchasing Settings
 
 - **Purchase units** — define units of measure with conversion factors (e.g. 1 case = 12 units)
@@ -110,6 +120,10 @@ Set the **invoice generation trigger** to control when invoices are created auto
 ## Backup & Restore
 
 Full system backup and restore functionality. See the [Backup & Restore](backup-restore.md) guide for details.
+
+## User Management
+
+Manage user accounts and roles from **Settings > Users**. See the [User Management & Security](user-management.md) guide for full details on roles and permissions.
 
 ## System Settings
 

@@ -74,7 +74,7 @@ export async function GET(
   const dateStr = order.createdAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
 
   const recipientAddr = order.manufacturer
-    ? [order.manufacturer.addressLine1, order.manufacturer.addressLine2, order.manufacturer.city, order.manufacturer.postcode, order.manufacturer.country].filter(Boolean).join(', ')
+    ? [order.manufacturer.addressLine1, order.manufacturer.addressLine2, order.manufacturer.city, order.manufacturer.postcode, order.manufacturer.country].filter(Boolean).join('\n')
     : undefined
 
   await drawHeader(doc, branding, {

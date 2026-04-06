@@ -14,18 +14,28 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   if (!so) return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
   const branding = await getBranding()
+  const tpl = await db.documentTemplate.findUnique({
+    where: { type: 'sales_order' },
+    select: { headerNote: true, footerNote: true, termsText: true, customFooter: true, showPaymentTerms: true, paymentTermsText: true },
+  })
   const { doc } = createPdfDocument({ title: `Order ${so.wcOrderNumber}` })
   const date = so.createdAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
 
   const shipAddr = so.shippingAddress as Record<string, string> | null
-  const recipientAddr = shipAddr ? [shipAddr.line1, shipAddr.line2, shipAddr.city, shipAddr.postcode, shipAddr.country].filter(Boolean).join(', ') : ''
+  const recipientAddr = shipAddr ? [shipAddr.line1, shipAddr.line2, shipAddr.city, shipAddr.postcode, shipAddr.country].filter(Boolean).join('\n') : ''
 
-  drawHeader(doc, branding, {
+  await drawHeader(doc, branding, {
     title: 'Sales Order',
     reference: so.wcOrderNumber ?? so.id.slice(0, 8),
     date,
     recipient: { name: so.customerName ?? 'Customer', address: recipientAddr, email: so.customerEmail },
   })
+
+  // Header note from template
+  if (tpl?.headerNote) {
+    doc.font('Helvetica').fontSize(8).fillColor('#555').text(tpl.headerNote, 50, doc.y, { width: 495 })
+    doc.y += 8
+  }
 
   if (so.expectedDelivery) {
     doc.font('Helvetica').fontSize(9).fillColor('#333').text(`Expected delivery: ${so.expectedDelivery.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}`, 50, doc.y)
@@ -48,10 +58,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   ]
 
   const rows = so.lines.map((l, i) => [
-    String(i + 1),
-    l.sku ?? '',
-    l.description,
-    String(Number(l.qty)),
+    String(i + 1), l.sku ?? '', l.description, String(Number(l.qty)),
     Number(l.unitPriceForeign).toFixed(2),
     Number(l.discountAmount) > 0 ? `-${Number(l.discountAmount).toFixed(2)}` : '',
     Number(l.totalForeign).toFixed(2),
@@ -59,7 +66,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 
   drawTable(doc, columns, rows, branding)
 
-  // Totals — aligned with last table column
+  // Totals
   doc.y += 5
   const tableRight = 50 + columns.reduce((s, c) => s + c.width, 0)
   const vW = columns[columns.length - 1].width
@@ -85,13 +92,31 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   doc.text('Total:', lX, doc.y + 3, { width: lW, align: 'right' })
   doc.text(`${Number(so.totalForeign).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
 
+  // Footer note from template
+  if (tpl?.footerNote) {
+    doc.y += 10
+    doc.font('Helvetica').fontSize(8).fillColor('#555').text(tpl.footerNote, 50, doc.y, { width: 495 })
+  }
+
+  // Terms from template
+  if (tpl?.termsText) {
+    doc.y += 10
+    doc.font('Helvetica-Bold').fontSize(7).fillColor('#888').text('TERMS & CONDITIONS', 50, doc.y)
+    doc.font('Helvetica').fontSize(7).fillColor('#888').text(tpl.termsText, 50, doc.y + 2, { width: 495 })
+  }
+
+  // Payment terms
+  if (tpl?.showPaymentTerms && tpl?.paymentTermsText) {
+    doc.y += 8
+    doc.font('Helvetica').fontSize(8).fillColor('#555').text(`Payment terms: ${tpl.paymentTermsText}`, 50, doc.y)
+  }
+
   if (so.notes) {
     doc.y += 15
     doc.font('Helvetica').fontSize(7).fillColor('#888').text('NOTES', 50, doc.y)
     doc.font('Helvetica').fontSize(9).fillColor('#333').text(so.notes, 50, doc.y + 2, { width: 495 })
   }
 
-  const tpl = await db.documentTemplate.findUnique({ where: { type: 'sales_order' }, select: { customFooter: true } })
   drawFooter(doc, 'Thank you for your order.', branding, { customFooter: tpl?.customFooter, contactEmail: branding.salesEmail })
   const buffer = await pdfToBuffer(doc)
   return new NextResponse(new Uint8Array(buffer), {

@@ -24,7 +24,7 @@ Click the tag filter buttons to show only entries from a specific area:
 
 | Tag | Covers |
 |---|---|
-| sales | Orders, dispatch, refunds, payments, stock reservations |
+| sales | Orders, allocation, shipments, dispatch, refunds, payments, stock reservations |
 | purchase | Purchase orders, receiving, returns, invoicing |
 | inventory | Product creation and updates, bulk operations, component changes |
 | stock | Adjustments, transfers (dispatch and receive), manufacturing production in/out, reservations |
@@ -57,6 +57,8 @@ The activity log displays 50 entries per page. Use the pagination controls to na
 
 ### Sales
 - Order creation and status changes
+- Stock allocation and auto-allocation
+- Shipment creation, status progression, and tracking
 - Dispatch and shipping
 - Refunds and credit notes
 - Payment recording
@@ -86,6 +88,8 @@ The activity log displays 50 entries per page. Use the pagination controls to na
 - Profile updates (name, email, avatar)
 - Password changes
 - Passkey registration and deletion
+- User creation, update, and deletion (admin)
+- Role changes
 
 ### Import
 - CSV imports with counts of records created, updated, and skipped

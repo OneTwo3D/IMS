@@ -71,4 +71,6 @@ A transfer can be cancelled at any stage. If stock has already been dispatched, 
 
 ## Activity Log
 
-All stock movements -- adjustments, transfers, purchase receipts, sales allocations, and build orders -- are recorded in the activity log. This gives you a complete audit trail of every change to every product's stock level.
+All stock movements -- adjustments, transfers, purchase receipts, sales allocations, shipment dispatches, and build orders -- are recorded in the activity log. This gives you a complete audit trail of every change to every product's stock level.
+
+Stock allocation for sales orders is managed by the dedicated allocation system, which tracks per-line, per-warehouse assignments using the `OrderAllocation` model. See the [Sales Orders](sales.md) documentation for details on the allocation and multi-shipment workflow.

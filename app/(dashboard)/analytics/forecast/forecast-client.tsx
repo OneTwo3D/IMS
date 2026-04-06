@@ -12,7 +12,8 @@ import {
   saveForecastSettings, createReorderPOs,
   type ProductForecast, type ForecastSettings,
 } from '@/app/actions/forecasting'
-import { importHistoricalWcOrders, importHistoricalSalesCsv } from '@/app/actions/wc-import'
+import { importHistoricalWcOrders } from '@/lib/connectors/woocommerce/orders'
+import { importHistoricalSalesCsv } from '@/app/actions/wc-import'
 
 type Props = { forecasts: ProductForecast[]; settings: ForecastSettings }
 

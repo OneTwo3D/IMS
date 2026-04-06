@@ -1,9 +1,11 @@
 import { NextResponse } from 'next/server'
+import { verifyCron } from '@/lib/cron-auth'
 import { purgeExpiredActivityLogs } from '@/lib/activity-log-cleanup'
 import { logActivity } from '@/lib/activity-log'
 
-// Called daily by cron: curl http://localhost:3000/api/cron/activity-cleanup
-export async function GET() {
+export async function GET(request: Request) {
+  const err = verifyCron(request)
+  if (err) return err
   const { totalDeleted, retention } = await purgeExpiredActivityLogs()
 
   if (totalDeleted > 0) {

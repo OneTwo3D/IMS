@@ -6,10 +6,20 @@ The system generates branded PDF documents for all key business transactions. PD
 
 ### Branding
 
-- **Document logo** — a rectangular logo displayed at the top of every document. SVG logos are supported and automatically converted to PNG for PDF embedding.
+- **Document logo** — a rectangular logo displayed at the top of every document. SVG logos are supported and automatically converted to PNG for PDF embedding. Logo loading includes path traversal protection to prevent unauthorised file access.
 - **Accent colours** — your brand colours are applied to document headers and table styling.
 - **Auto-contrast text** — text colour on coloured backgrounds (title bar, table headers) automatically adapts for readability on both light and dark backgrounds.
-- **Company address** — formatted with line breaks as configured in company settings.
+- **Company address** — formatted on separate lines as configured in company settings.
+
+### Template Fields
+
+All PDF routes now correctly load and render the full set of template fields:
+
+- **Header note** — text displayed above the line items
+- **Footer note** — text displayed below the line items
+- **Terms & conditions** — printed at the end of the document
+- **Payment terms** — payment terms text included on the document
+- **Custom page footer** — text at the bottom of every page
 
 ### Footer & Contact Details
 
@@ -66,7 +76,16 @@ Previews always use the latest saved settings and are never cached, so you see y
 
 ## Email Templates
 
-When you email a document (e.g. sending a purchase order to a supplier or an invoice to a customer), the system generates a branded HTML email.
+When you email a document (e.g. sending a purchase order to a supplier or an invoice to a customer), the system sends a branded HTML email via SMTP with the PDF attached.
+
+### SMTP Sending
+
+Emails are sent server-side using nodemailer via your configured SMTP settings (see **Settings > Company > Email/SMTP**). The email buttons on sales orders and invoices send directly via SMTP rather than opening a mailto link. The following email functions are available:
+
+- **sendSalesOrderEmail** — sends the sales order PDF to the customer
+- **sendInvoiceEmail** — sends the invoice PDF to the customer
+
+Both functions attach the generated PDF document to the email automatically.
 
 ### Email Structure
 

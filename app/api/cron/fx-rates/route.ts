@@ -1,8 +1,10 @@
 import { NextResponse } from 'next/server'
+import { verifyCron } from '@/lib/cron-auth'
 import { fetchAllFxRates } from '@/app/actions/currencies'
 
-// Called daily by cron: curl http://localhost:3000/api/cron/fx-rates
-export async function GET() {
+export async function GET(request: Request) {
+  const err = verifyCron(request)
+  if (err) return err
   const result = await fetchAllFxRates()
   return NextResponse.json(result)
 }

@@ -3,7 +3,7 @@
 import { useState } from 'react'
 import { ExternalLink } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { fetchWcProductUrl } from '@/app/actions/stock'
+import { fetchWcProductUrl } from '@/lib/connectors/woocommerce/products'
 
 export function WcLinkButton({ sku }: { sku: string }) {
   const [loading, setLoading] = useState(false)

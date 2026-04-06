@@ -8,32 +8,38 @@ import { Input } from '@/components/ui/input'
 import { ChevronRight, Search } from 'lucide-react'
 
 const STATUS_LABELS: Record<SoStatus, string> = {
-  PENDING: 'Pending',
+  DRAFT: 'Draft',
+  PENDING_PAYMENT: 'Pending Payment',
+  ON_HOLD: 'On Hold',
   PROCESSING: 'Processing',
+  ALLOCATED: 'Allocated',
   PICKING: 'Picking',
-  PACKED: 'Packed',
+  PACKING: 'Packing',
   SHIPPED: 'Shipped',
   COMPLETED: 'Completed',
+  DELIVERED: 'Delivered',
   CANCELLED: 'Cancelled',
   REFUNDED: 'Refunded',
   PARTIALLY_REFUNDED: 'Part. Refunded',
-  ON_HOLD: 'On Hold',
 }
 
 const STATUS_CLASS: Record<SoStatus, string> = {
-  PENDING: 'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200',
+  DRAFT: 'bg-gray-100 text-gray-800 border-gray-200 dark:bg-gray-800 dark:text-gray-200',
+  PENDING_PAYMENT: 'bg-yellow-100 text-yellow-800 border-yellow-200 dark:bg-yellow-900 dark:text-yellow-200',
+  ON_HOLD: 'bg-muted text-muted-foreground border-muted',
   PROCESSING: 'bg-blue-100 text-blue-800 border-blue-200 dark:bg-blue-900 dark:text-blue-200',
+  ALLOCATED: 'bg-cyan-100 text-cyan-800 border-cyan-200 dark:bg-cyan-900 dark:text-cyan-200',
   PICKING: 'bg-blue-100 text-blue-800 border-blue-200 dark:bg-blue-900 dark:text-blue-200',
-  PACKED: 'bg-indigo-100 text-indigo-800 border-indigo-200 dark:bg-indigo-900 dark:text-indigo-200',
+  PACKING: 'bg-indigo-100 text-indigo-800 border-indigo-200 dark:bg-indigo-900 dark:text-indigo-200',
   SHIPPED: 'bg-purple-100 text-purple-800 border-purple-200 dark:bg-purple-900 dark:text-purple-200',
   COMPLETED: 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200',
+  DELIVERED: 'bg-emerald-100 text-emerald-800 border-emerald-200 dark:bg-emerald-900 dark:text-emerald-200',
   CANCELLED: 'text-destructive border-destructive/30',
   REFUNDED: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200',
   PARTIALLY_REFUNDED: 'bg-orange-100 text-orange-800 border-orange-200 dark:bg-orange-900 dark:text-orange-200',
-  ON_HOLD: 'bg-muted text-muted-foreground border-muted',
 }
 
-const FILTER_STATUSES: SoStatus[] = ['PENDING', 'PROCESSING', 'PICKING', 'PACKED', 'SHIPPED', 'COMPLETED', 'CANCELLED']
+const FILTER_STATUSES: SoStatus[] = ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED']
 
 function timeAgo(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime()

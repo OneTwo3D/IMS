@@ -24,9 +24,11 @@ Your role is displayed on the profile page but cannot be changed by you — only
 | Role | Description |
 |---|---|
 | Administrator | Full access to all features and settings |
-| Warehouse Manager | Inventory, stock control, purchasing, and manufacturing |
+| Manager | Full operational access without system administration |
+| Warehouse | Inventory, stock control, purchasing, and manufacturing |
 | Finance | Sales, purchasing, invoicing, and accounting integrations |
 | Read Only | View-only access across all modules |
+| Supplier | Supplier portal access only (see below) |
 
 ### Join Date
 
@@ -87,6 +89,37 @@ The login page provides two ways to sign in:
 
 - **Email and password** — the standard login form, followed by a TOTP prompt if two-factor authentication is enabled
 - **Sign in with Passkey** — a single button that triggers your browser's passkey flow
+
+
+## User Administration (Settings > Users)
+
+Administrators can manage all user accounts from **Settings > Users**:
+
+- **Create users** — add new users with name, email, password, and role assignment
+- **Edit users** — update user details and change roles
+- **Delete users** — remove user accounts
+
+Role assignment is validated on both client and server to prevent privilege escalation.
+
+
+## Permission System
+
+The system includes a role-based access control (RBAC) layer defined in `lib/permissions.ts`. Permissions control:
+
+- **Sidebar filtering** — each role sees only the navigation items relevant to their access level
+- **Server action authorisation** — all mutations (allocation, email sending, sync operations, etc.) verify the user's role before executing
+- **API route protection** — cron endpoints require `CRON_SECRET` or localhost origin
+
+
+## Supplier Portal
+
+Users with the **Supplier** role access a dedicated portal with its own navigation:
+
+- **RFQs** — view requests for quotation and submit quotes (with prices, quantities, PO number, delivery date, and shipping details)
+- **Purchase Orders** — view purchase orders addressed to their supplier company
+- **My Products** — view products linked to their supplier (without financial data such as prices, margins, or COGS)
+
+Supplier users are linked to a supplier company record. They cannot access prices, margins, COGS data, or analytics. Line ownership is verified server-side to prevent suppliers from viewing or modifying other suppliers' data.
 
 
 ## Sessions

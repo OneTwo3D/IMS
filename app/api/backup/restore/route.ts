@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { exec } from 'child_process'
+import { execFile } from 'child_process'
 import { writeFile, mkdir } from 'fs/promises'
 import path from 'path'
 import { auth } from '@/lib/auth'
@@ -49,10 +49,8 @@ export async function POST(req: NextRequest) {
   }
 
   return new Promise<NextResponse>((resolve) => {
-    // Drop and recreate all tables, then restore
-    const cmd = `PGPASSWORD=${db.password} psql -h ${db.host} -p ${db.port} -U ${db.user} -d ${db.database} -f "${restorePath}" --single-transaction`
-
-    exec(cmd, { timeout: 300000 }, (error, _stdout, stderr) => {
+    const args = ['-h', db.host, '-p', db.port, '-U', db.user, '-d', db.database, '-f', restorePath, '--single-transaction']
+    execFile('psql', args, { timeout: 300000, env: { ...process.env, PGPASSWORD: db.password } }, (error, _stdout, stderr) => {
       if (error) {
         logActivity({
           entityType: 'SYSTEM',

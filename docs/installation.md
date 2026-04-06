@@ -115,15 +115,17 @@ PM2 is configured with:
 
 ## Cron Jobs
 
-Three scheduled tasks are configured automatically:
+Five scheduled tasks are configured automatically:
 
 | Time | Endpoint | Purpose |
 |---|---|---|
 | 02:00 | `/api/cron/backup` | Scheduled backup (if enabled in settings) with retention and remote upload |
 | 03:00 | `/api/cron/activity-cleanup` | Purge activity log entries past their retention period |
+| Every 5 min | `/api/cron/wc-sync` | Poll WooCommerce for order, product, and stock changes |
+| Every 15 min | `/api/cron/delivery-status` | Poll delivery tracking providers for shipment status updates |
 | 06:00 | `/api/cron/fx-rates` | Fetch latest exchange rates from frankfurter.dev |
 
-All cron jobs run under the `imsapp` user and call the application's API endpoints via `curl`.
+All cron jobs run under the `imsapp` user and call the application's API endpoints via `curl`. Cron endpoints require the `CRON_SECRET` header or a request from localhost for security.
 
 
 ## Updating
@@ -175,6 +177,11 @@ Key variables in the `.env` file:
 | `FX_BASE_CURRENCY` | Base currency for exchange rates (default: `GBP`) |
 | `PDF_TEMP_DIR` | Temporary directory for PDF generation |
 | `UPLOAD_MAX_SIZE_MB` | Maximum upload file size in MB (default: `10`) |
+| `CRON_SECRET` | Shared secret for authenticating cron endpoint requests |
+| `SMTP_HOST` | SMTP server hostname (can also be configured in Settings) |
+| `SMTP_PORT` | SMTP server port |
+| `SMTP_USER` | SMTP authentication username |
+| `SMTP_PASS` | SMTP authentication password |
 
 
 ## Reverse Proxy

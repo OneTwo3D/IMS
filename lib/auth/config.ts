@@ -35,6 +35,7 @@ export const authConfig: NextAuthConfig = {
       if (user) {
         token.id = user.id
         token.role = (user as { role?: string }).role
+        token.supplierId = (user as { supplierId?: string | null }).supplierId ?? null
         token.totpEnabled = (user as { totpEnabled?: boolean }).totpEnabled
         token.totpVerified = (user as { totpVerified?: boolean }).totpVerified ?? false
         token.pictureUrl = (user as { pictureUrl?: string | null }).pictureUrl ?? null
@@ -52,6 +53,7 @@ export const authConfig: NextAuthConfig = {
       if (token) {
         session.user.id = token.id as string
         session.user.role = token.role as string
+        session.user.supplierId = token.supplierId as string | null
         session.user.totpEnabled = token.totpEnabled as boolean
         session.user.totpVerified = token.totpVerified as boolean
         session.user.pictureUrl = token.pictureUrl as string | null
@@ -74,6 +76,7 @@ export const authConfig: NextAuthConfig = {
             name: true,
             passwordHash: true,
             role: true,
+            supplierId: true,
             pictureUrl: true,
             totpEnabled: true,
             active: true,
@@ -93,6 +96,7 @@ export const authConfig: NextAuthConfig = {
           email: user.email,
           name: user.name,
           role: user.role,
+          supplierId: user.supplierId,
           pictureUrl: user.pictureUrl,
           totpEnabled: user.totpEnabled,
           totpVerified: false,

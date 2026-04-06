@@ -99,3 +99,14 @@ Navigate to **Purchasing > Suppliers** to manage your supplier list. Each suppli
 ## Auto-Save Last PO Prices
 
 Every time a purchase order is sent or received, the system saves the **last PO price** for each supplier-product combination, along with the FX rate at the time. When you next create a PO for the same supplier and product, the price is pre-filled automatically. This saves time and reduces data entry errors.
+
+
+## Supplier Portal
+
+Suppliers with user accounts (SUPPLIER role) can access a dedicated portal to:
+
+- **View RFQs** addressed to their company and **submit quotes** with prices, quantities, PO number, delivery date, and shipping details
+- **View Purchase Orders** for their company
+- **View their products** linked to the supplier (without financial data such as sell prices, margins, or COGS)
+
+Supplier users see a separate navigation with only the sections relevant to them. All supplier actions are verified server-side to ensure suppliers can only access their own data.

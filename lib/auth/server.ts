@@ -10,6 +10,7 @@ export type AuthSession = {
     email: string
     name: string
     role: string
+    supplierId: string | null
     totpEnabled: boolean
     totpVerified: boolean
   }

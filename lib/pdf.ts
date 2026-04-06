@@ -113,7 +113,10 @@ async function loadLogoBuffer(logoUrl: string | null): Promise<Buffer | null> {
     // Strip query string and /api prefix, resolve to filesystem path
     let urlPath = logoUrl.split('?')[0]
     if (urlPath.startsWith('/api/')) urlPath = urlPath.slice(4)
-    const filePath = path.join(process.cwd(), 'public', urlPath)
+    const publicDir = path.join(process.cwd(), 'public')
+    const filePath = path.resolve(publicDir, urlPath.replace(/^\//, ''))
+    // Guard against path traversal
+    if (!filePath.startsWith(publicDir)) return null
     const raw = await readFile(filePath)
     // SVG → convert to PNG via sharp (PDFKit doesn't support SVG natively)
     if (filePath.endsWith('.svg')) {

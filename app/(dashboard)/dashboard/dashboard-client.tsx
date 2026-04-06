@@ -35,11 +35,14 @@ function ChangeBadge({ current, previous }: { current: number; previous: number 
 }
 
 const STATUS_COLORS: Record<string, string> = {
-  PENDING: 'bg-yellow-100 text-yellow-700', PROCESSING: 'bg-blue-100 text-blue-700',
-  PICKING: 'bg-indigo-100 text-indigo-700', PACKED: 'bg-indigo-100 text-indigo-700',
-  SHIPPED: 'bg-green-100 text-green-700', COMPLETED: 'bg-green-100 text-green-700',
+  DRAFT: 'bg-gray-100 text-gray-700', PENDING_PAYMENT: 'bg-yellow-100 text-yellow-700',
+  ON_HOLD: 'bg-yellow-100 text-yellow-700',
+  PROCESSING: 'bg-blue-100 text-blue-700', ALLOCATED: 'bg-cyan-100 text-cyan-700',
+  PICKING: 'bg-indigo-100 text-indigo-700', PACKING: 'bg-indigo-100 text-indigo-700',
+  SHIPPED: 'bg-purple-100 text-purple-700', COMPLETED: 'bg-green-100 text-green-700',
+  DELIVERED: 'bg-emerald-100 text-emerald-700',
   PARTIALLY_REFUNDED: 'bg-orange-100 text-orange-700', REFUNDED: 'bg-red-100 text-red-700',
-  CANCELLED: 'bg-gray-100 text-gray-700', ON_HOLD: 'bg-yellow-100 text-yellow-700',
+  CANCELLED: 'bg-gray-100 text-gray-700',
   PO_SENT: 'bg-blue-100 text-blue-700', PARTIALLY_RECEIVED: 'bg-indigo-100 text-indigo-700',
 }
 

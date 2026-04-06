@@ -8,6 +8,7 @@
 | Database | PostgreSQL via Prisma 7 ORM |
 | Authentication | NextAuth v5 (Auth.js) with JWT sessions, credentials + passkey (WebAuthn) providers |
 | PDF Generation | PDFKit with sharp for SVG-to-PNG conversion |
+| Email | nodemailer (SMTP) |
 | Charts | Recharts |
 | Styling | TailwindCSS 4 |
 | Process Manager | PM2 |
@@ -53,6 +54,8 @@
 | `app/api/` | API Route Handlers — PDF generation, CSV export, cron endpoints, file uploads, webhooks |
 | `components/` | React components organised by module (auth, inventory, layout, profile, settings, ui) |
 | `lib/` | Shared utilities — database client, PDF generation, email templates, CSV handling, activity logging |
+| `lib/connectors/` | External system connectors (WooCommerce, with interfaces for Shopify, Xero, QuickBooks) |
+| `lib/connectors/woocommerce/` | WooCommerce connector module — order import, status sync, refund sync, product sync, stock sync |
 | `prisma/` | Database schema, migrations, and seed data |
 | `docs/` | User-facing documentation (rendered in the app) |
 | `scripts/` | Installation and maintenance scripts |
@@ -137,6 +140,8 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 **Sales:**
 - `Customer` — with billing/shipping addresses, tax number
 - `SalesOrder`, `SalesOrderLine` — orders with multi-currency totals, shipping, tax, discounts
+- `OrderAllocation` — per-line, per-warehouse stock allocation records
+- `Shipment`, `ShipmentLine` — multi-warehouse shipments with independent tracking and carrier
 - `SalesOrderRefund`, `SalesOrderRefundLine` — refunds with credit note numbers
 - `Payment` — payment records against orders or credit notes
 
@@ -157,12 +162,15 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 - `AdjustmentReason` — configurable stock adjustment reasons
 
 **Auth and Audit:**
-- `User` — with roles (ADMIN, WAREHOUSE, FINANCE, READONLY), optional TOTP 2FA, passkey support
+- `User` — with roles (ADMIN, MANAGER, WAREHOUSE, FINANCE, READONLY, SUPPLIER), optional TOTP 2FA, passkey support
 - `ActivityLog` — full audit trail with entity type, action, level, tag, and metadata
 
 **Integration:**
 - `XeroAccount`, `XeroSyncLog` — Xero chart of accounts and sync status
 - `WcSyncLog` — WooCommerce sync log
+- `WcStatusMapping` — bidirectional WC-to-IMS status mapping (with seeded defaults)
+- `WcTaxClassMapping` — WC tax class to IMS TaxRate mapping
+- `ShippingCarrier` — configurable shipping carriers with tracking URLs
 
 
 ## Module Boundaries
@@ -171,12 +179,13 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 |---|---|---|
 | Inventory | `products.ts` | `/api/export/products`, `/api/export/stock-levels` |
 | Purchases | `purchase-orders.ts`, `suppliers.ts` | `/api/rfq/[id]`, `/api/upload/invoice`, `/api/export/purchase-orders`, `/api/export/suppliers` |
-| Sales | `sales.ts`, `customers.ts` | `/api/sales-order/[id]`, `/api/invoice/[id]`, `/api/export/sales`, `/api/export/contacts` |
+| Sales | `sales.ts`, `customers.ts`, `allocation.ts` | `/api/sales-order/[id]`, `/api/invoice/[id]`, `/api/export/sales`, `/api/export/contacts` |
 | Stock Control | `stock.ts`, `transfers.ts` | `/api/export/adjustments`, `/api/export/transfers` |
 | Manufacturing | `manufacturing.ts` | `/api/manufacturing-order/[id]` |
 | Settings | `settings.ts`, `company.ts`, `currencies.ts` | `/api/cron/fx-rates` |
 | Import | `import.ts`, `wc-import.ts` | `/api/import/` |
-| Auth | `profile.ts`, `passkey.ts` | `/api/auth/[...nextauth]`, `/api/auth/totp`, `/api/auth/totp-setup` |
+| Integrations | `wc-sync.ts` | `/api/webhooks/woocommerce/orders`, `/api/webhooks/woocommerce/refunds`, `/api/webhooks/woocommerce/products`, `/api/cron/wc-sync`, `/api/cron/delivery-status` |
+| Auth | `profile.ts`, `passkey.ts`, `users.ts` | `/api/auth/[...nextauth]`, `/api/auth/totp`, `/api/auth/totp-setup` |
 | Dashboard | `dashboard.ts` | — |
 | Analytics | `sales-stats.ts`, `purchase-stats.ts`, `inventory-stats.ts`, `forecasting.ts` | — |
 | Backup | `backup.ts` | `/api/backup/`, `/api/cron/backup` |
@@ -199,7 +208,9 @@ Auth.js v5 with two providers:
 3. Server verifies the assertion against stored public keys
 4. Session is created without requiring TOTP (passkey is already strong authentication)
 
-User roles: `ADMIN`, `WAREHOUSE`, `FINANCE`, `READONLY`.
+User roles: `ADMIN`, `MANAGER`, `WAREHOUSE`, `FINANCE`, `READONLY`, `SUPPLIER`.
+
+A permission system (`lib/permissions.ts`) controls sidebar visibility and server action authorisation per role. Supplier users are linked to a supplier company and access a dedicated portal.
 
 
 ## Background Tasks
@@ -211,6 +222,10 @@ There is no separate worker process. Background tasks are handled via HTTP endpo
 | FX rate refresh | `GET /api/cron/fx-rates` | Daily 06:00 | Fetch rates from frankfurter.dev and upsert FxRate rows |
 | Activity cleanup | `GET /api/cron/activity-cleanup` | Daily 03:00 | Purge activity log entries past retention |
 | Scheduled backup | `GET /api/cron/backup` | Daily 02:00 | Create backup, apply retention, upload to remote storage |
+| WooCommerce sync | `GET /api/cron/wc-sync` | Every 5 min | Poll WooCommerce for order, product, and stock changes |
+| Delivery status | `GET /api/cron/delivery-status` | Every 15 min | Poll delivery tracking providers for shipment status updates |
+
+All cron endpoints require the `CRON_SECRET` header or a request from localhost for security.
 
 
 ## PDF Generation
@@ -219,9 +234,21 @@ PDFs are generated server-side using PDFKit (configured as `serverExternalPackag
 
 - `getBranding()` — reads company info, logos, and brand colours from the Organisation and Settings tables
 - `createPdfDocument()` — creates an A4 PDFDocument with standard margins and helpers
+- `drawHeader()` — async function for rendering the document header with logo and addresses (all routes now correctly `await` this call)
 - Table drawing utilities for consistent formatting across document types
-- SVG logo conversion via sharp
+- SVG logo conversion via sharp, with path traversal guard on logo file loading
 - Auto-contrast text colour calculation
+- All template fields loaded: headerNote, footerNote, termsText, paymentTermsText, customFooter
+- TO address renders on separate lines (not comma-separated)
+
+### Email Sending
+
+Outbound email is handled by `lib/mailer.ts` using nodemailer:
+
+- SMTP configuration from Settings (host, port, security, credentials)
+- `sendSalesOrderEmail()` — sends sales order PDF as attachment
+- `sendInvoiceEmail()` — sends invoice PDF as attachment
+- Email buttons in the UI send via SMTP server-side (not mailto links)
 
 PDF types: Sales Order, Purchase Order, Invoice, Packing Slip, Credit Note, RFQ, Manufacturing Order.
 
@@ -248,6 +275,24 @@ CSV utilities are in `lib/csv.ts`.
 - OAuth 2.0 tokens stored at `XERO_TOKEN_PATH`, refreshed before each API call
 
 ### WooCommerce
-- Stock sync (IMS to WC) — pushed per SKU across sync-enabled warehouses
-- Order sync (WC to IMS) — via webhook or polling, with FX conversion
-- Refund handling — creates refund records with credit notes and COGS reversal
+
+WooCommerce integration is implemented as a modular connector in `lib/connectors/woocommerce/`, following the shared `ShoppingConnector` and `AccountingConnector` interfaces.
+
+- **Order import** — via webhook (`/api/webhooks/woocommerce/orders`) or cron polling (`/api/cron/wc-sync`), with FX conversion
+- **Status sync** — bidirectional mapping between WC and IMS statuses (configurable via `WcStatusMapping` with seeded defaults matching WC flowchart)
+- **Refund sync** — creates refund records with credit notes and COGS reversal, via webhook (`/api/webhooks/woocommerce/refunds`)
+- **Product sync** — bidirectional product data sync via webhook (`/api/webhooks/woocommerce/products`)
+- **Stock sync** — IMS to WC, pushed per SKU across sync-enabled warehouses
+- **Tax class mapping** — maps WC tax classes to IMS TaxRate records
+- **Completion flow** — WC completed status triggers auto-allocation, shipment creation with tracking
+- **Webhook security** — HMAC verification using timing-safe comparison (`timingSafeEqual`)
+
+### Integrations Dashboard
+
+The `/sync` page provides a unified view of all connectors:
+
+- **WooCommerce** — connection settings, order/product/stock sync config, tax mapping, status mapping, sync log
+- **Shopify** — tile shown (coming soon)
+- **Xero** — tile shown (coming soon)
+- **QuickBooks** — tile shown (coming soon)
+- **REST API** — tile with endpoint documentation
