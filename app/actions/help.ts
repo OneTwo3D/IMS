@@ -12,14 +12,40 @@ export type HelpDoc = {
 const DOCS_DIR = path.join(process.cwd(), 'docs')
 
 const TITLE_MAP: Record<string, string> = {
-  'user-guide': 'User Guide',
+  'getting-started': 'Getting Started',
+  'dashboard': 'Dashboard',
+  'inventory': 'Inventory Management',
+  'stock-control': 'Stock Control',
+  'purchasing': 'Purchasing',
+  'sales': 'Sales Orders',
+  'manufacturing': 'Manufacturing',
+  'analytics': 'Analytics & Reports',
+  'settings': 'Settings',
+  'backup-restore': 'Backup & Restore',
+  'user-management': 'User Management & Security',
+  'documents-email': 'Documents & Email',
+  'activity-log': 'Activity Log',
+  'installation': 'Installation & Deployment',
   'architecture': 'Architecture',
-  'configuration': 'Configuration',
-  'development': 'Development',
-  'deployment': 'Deployment',
 }
 
-const DOC_ORDER = ['user-guide', 'architecture', 'configuration', 'development', 'deployment']
+const DOC_ORDER = [
+  'getting-started',
+  'dashboard',
+  'inventory',
+  'stock-control',
+  'purchasing',
+  'sales',
+  'manufacturing',
+  'analytics',
+  'settings',
+  'backup-restore',
+  'user-management',
+  'documents-email',
+  'activity-log',
+  'installation',
+  'architecture',
+]
 
 function extractTitle(content: string, slug: string): string {
   const match = content.match(/^#\s+(.+)$/m)
