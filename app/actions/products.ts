@@ -724,6 +724,9 @@ export async function saveProductComponents(
       return { success: false, error: 'Circular reference detected — a component eventually references this product' }
     }
 
+    const _p = await db.product.findUnique({ where: { id: productId }, select: { sku: true } })
+    const _sku = _p?.sku ?? productId
+
     await db.productComponent.deleteMany({ where: { productId } })
     if (components.length > 0) {
       await db.productComponent.createMany({
@@ -741,7 +744,7 @@ export async function saveProductComponents(
       action: 'updated',
       tag: 'manufacturing',
       level: 'INFO',
-      description: `Updated BOM/kit components for product ${productId}`,
+      description: `Updated BOM/kit components for SKU ${_sku}`,
       metadata: { componentCount: components.length },
     })
 
@@ -755,7 +758,7 @@ export async function saveProductComponents(
       action: 'updated',
       tag: 'manufacturing',
       level: 'ERROR',
-      description: `Failed to update BOM/kit components for product ${productId}`,
+      description: `Failed to update BOM/kit components for SKU ${productId}`,
       metadata: { error: errorMsg },
     })
     return { success: false, error: errorMsg }
@@ -846,6 +849,8 @@ export async function saveProductOptions(
   productId: string,
   options: { name: string; values: string }[]
 ): Promise<{ success: boolean }> {
+  const _p = await db.product.findUnique({ where: { id: productId }, select: { sku: true } })
+  const _sku = _p?.sku ?? productId
   await db.productOption.deleteMany({ where: { productId } })
   if (options.length > 0) {
     await db.productOption.createMany({
@@ -863,7 +868,7 @@ export async function saveProductOptions(
     action: 'updated',
     tag: 'inventory',
     level: 'INFO',
-    description: `Updated variant options for product ${productId}`,
+    description: `Updated variant options for SKU ${_sku}`,
     metadata: { optionCount: options.length },
   })
 
@@ -901,7 +906,7 @@ export async function generateVariantsFromOptions(
       action: 'created',
       tag: 'inventory',
       level: 'ERROR',
-      description: `Failed to generate variants: no options defined for product ${productId}`,
+      description: `Failed to generate variants: no options defined for SKU ${product.sku}`,
       metadata: { productId },
     })
     return { created: 0, skipped: 0, error: 'No options defined — save options first' }
@@ -965,7 +970,7 @@ export async function generateVariantsFromOptions(
     action: 'created',
     tag: 'inventory',
     level: 'INFO',
-    description: `Generated ${created} variants for product ${productId}`,
+    description: `Generated ${created} variants for SKU ${product.sku}`,
     metadata: { created, skipped },
   })
 

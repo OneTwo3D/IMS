@@ -529,7 +529,7 @@ export async function updateSalesOrderStatus(
   try {
     const so = await db.salesOrder.findUnique({
       where: { id },
-      select: { id: true, wcOrderId: true, wcOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { id: true, productId: true, qty: true } } },
+      select: { id: true, wcOrderId: true, wcOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { id: true, productId: true, sku: true, qty: true } } },
     })
     if (!so) return { success: false, error: 'Order not found' }
 
@@ -609,8 +609,8 @@ export async function updateSalesOrderStatus(
             action: 'dispatched',
             tag: 'stock',
             level: 'INFO',
-            description: `Dispatched ${qty} units of product ${line.productId} for order ${so.wcOrderNumber}`,
-            metadata: { productId: line.productId, qty, orderNumber: so.wcOrderNumber, warehouseId },
+            description: `Dispatched ${qty} units of SKU ${line.sku ?? line.productId} for order ${so.wcOrderNumber}`,
+            metadata: { sku: line.sku, productId: line.productId, qty, orderNumber: so.wcOrderNumber, warehouseId },
           })
         }
       }

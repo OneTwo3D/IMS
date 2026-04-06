@@ -563,7 +563,7 @@ export async function updateShipmentStatus(
       where: { id: shipmentId },
       include: {
         order: { select: { id: true, wcOrderNumber: true, status: true } },
-        lines: { select: { lineId: true, productId: true, qty: true } },
+        lines: { select: { lineId: true, productId: true, qty: true, product: { select: { sku: true } } } },
         warehouse: { select: { code: true } },
       },
     })
@@ -617,8 +617,8 @@ export async function updateShipmentStatus(
           action: 'dispatched',
           tag: 'stock',
           level: 'INFO',
-          description: `Dispatched ${qty} units from ${shipment.warehouse.code} for order ${shipment.order.wcOrderNumber}`,
-          metadata: { productId: line.productId, qty, orderNumber: shipment.order.wcOrderNumber, warehouseId: shipment.warehouseId },
+          description: `Dispatched ${qty} units of SKU ${line.product.sku} from ${shipment.warehouse.code} for order ${shipment.order.wcOrderNumber}`,
+          metadata: { sku: line.product.sku, productId: line.productId, qty, orderNumber: shipment.order.wcOrderNumber, warehouseId: shipment.warehouseId },
         })
       }
 

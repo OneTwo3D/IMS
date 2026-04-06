@@ -308,6 +308,7 @@ export async function submitProductEdit(
     // Verify product belongs to this supplier
     const link = await db.supplierProduct.findUnique({
       where: { supplierId_productId: { supplierId: ctx.supplierId, productId } },
+      include: { product: { select: { sku: true } } },
     })
     if (!link) return { success: false, error: 'Product not accessible' }
 
@@ -321,7 +322,7 @@ export async function submitProductEdit(
 
     logActivity({
       entityType: 'PRODUCT', entityId: productId, action: 'supplier_edit_proposed', tag: 'inventory', level: 'INFO',
-      description: `Supplier proposed edits for product ${productId}`,
+      description: `Supplier proposed edits for SKU ${link.product.sku}`,
       metadata: { supplierId: ctx.supplierId, proposedChanges: data },
     })
     revalidatePath('/supplier/products')
