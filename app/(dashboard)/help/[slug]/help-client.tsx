@@ -3,6 +3,7 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import Markdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
 import { cn } from '@/lib/utils'
 import type { HelpDoc } from '@/app/actions/help'
 
@@ -57,7 +58,7 @@ export function HelpClient({ doc, allDocs }: Props) {
           prose-strong:font-semibold
           prose-hr:my-6
         ">
-          <Markdown>{doc.content}</Markdown>
+          <Markdown remarkPlugins={[remarkGfm]}>{doc.content}</Markdown>
         </div>
       </article>
     </div>
