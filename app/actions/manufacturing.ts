@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { requireAuth } from '@/lib/auth/server'
 import type { ProductionOrderStatus, ProductionOrderType } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -13,6 +14,7 @@ export type ManufacturingOrderRow = {
   id: string
   reference: string
   orderType: string
+  productId: string
   productSku: string
   productName: string
   warehouseName: string
@@ -59,6 +61,7 @@ type ListFilters = {
 }
 
 export async function getManufacturingOrders(filters: ListFilters = {}) {
+  await requireAuth()
   const { search, status, orderType, page = 1, pageSize = 50 } = filters
 
   const where: Record<string, unknown> = {}
@@ -88,7 +91,7 @@ export async function getManufacturingOrders(filters: ListFilters = {}) {
         startedAt: true,
         completedAt: true,
         notes: true,
-        outputProduct: { select: { sku: true, name: true } },
+        outputProduct: { select: { id: true, sku: true, name: true } },
         warehouse: { select: { name: true } },
         manufacturer: { select: { name: true } },
       },
@@ -104,6 +107,7 @@ export async function getManufacturingOrders(filters: ListFilters = {}) {
       id: r.id,
       reference: r.reference,
       orderType: r.orderType,
+      productId: r.outputProduct.id,
       productSku: r.outputProduct.sku,
       productName: r.outputProduct.name,
       warehouseName: r.warehouse.name,
@@ -126,6 +130,7 @@ export async function getManufacturingOrders(filters: ListFilters = {}) {
 // ---------------------------------------------------------------------------
 
 export async function getBomProducts(): Promise<BomProduct[]> {
+  await requireAuth()
   const products = await db.product.findMany({
     where: { type: 'BOM', active: true },
     select: {
@@ -160,6 +165,7 @@ export async function getBomProducts(): Promise<BomProduct[]> {
 }
 
 export async function getWarehouses(): Promise<WarehouseOption[]> {
+  await requireAuth()
   return db.warehouse.findMany({
     where: { active: true },
     select: { id: true, code: true, name: true },
@@ -168,6 +174,7 @@ export async function getWarehouses(): Promise<WarehouseOption[]> {
 }
 
 export async function getSuppliers(): Promise<SupplierOption[]> {
+  await requireAuth()
   return db.supplier.findMany({
     where: { active: true },
     select: { id: true, name: true },
@@ -180,6 +187,7 @@ export async function getComponentStock(
   productId: string,
   warehouseId: string,
 ): Promise<{ componentId: string; available: number; needed: number }[]> {
+  await requireAuth()
   const product = await db.product.findUnique({
     where: { id: productId },
     select: {
@@ -210,6 +218,7 @@ export async function getComponentStock(
 
 /** Max units that can be assembled from available stock */
 export async function getMaxAssembly(productId: string, warehouseId: string): Promise<number> {
+  await requireAuth()
   const stock = await getComponentStock(productId, warehouseId)
   if (stock.length === 0) return 0
   return Math.max(0, Math.floor(Math.min(...stock.map((s) => s.needed > 0 ? s.available / s.needed : Infinity))))
@@ -217,6 +226,7 @@ export async function getMaxAssembly(productId: string, warehouseId: string): Pr
 
 /** For disassembly: how many of the assembled product are available */
 export async function getDisassemblyStock(productId: string, warehouseId: string): Promise<number> {
+  await requireAuth()
   const level = await db.stockLevel.findUnique({
     where: { productId_warehouseId: { productId, warehouseId } },
     select: { quantity: true, reservedQty: true },
@@ -227,6 +237,7 @@ export async function getDisassemblyStock(productId: string, warehouseId: string
 
 /** Get the last manufacturer used for a product's production order */
 export async function getLastManufacturer(productId: string): Promise<string | null> {
+  await requireAuth()
   const last = await db.productionOrder.findFirst({
     where: { outputProductId: productId, manufacturerId: { not: null } },
     orderBy: { createdAt: 'desc' },
@@ -258,6 +269,7 @@ type CreateInput = {
 
 export async function createManufacturingOrder(input: CreateInput): Promise<{ success: boolean; error?: string; id?: string }> {
   try {
+    await requireAuth()
     // Validate product has BOM components
     const product = await db.product.findUnique({
       where: { id: input.productId },
@@ -342,6 +354,7 @@ export async function updateManufacturingOrderStatus(
   status: ProductionOrderStatus,
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     const order = await db.productionOrder.findUnique({
       where: { id },
       select: {
@@ -694,6 +707,7 @@ export type ManufacturingOrderDetail = {
 }
 
 export async function getManufacturingOrder(id: string): Promise<ManufacturingOrderDetail | null> {
+  await requireAuth()
   const o = await db.productionOrder.findUnique({
     where: { id },
     select: {

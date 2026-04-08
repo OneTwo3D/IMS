@@ -12,6 +12,7 @@ import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
+import { ProductLink } from '@/components/inventory/product-link'
 import {
   getManufacturingOrders,
   getBomProducts,
@@ -184,8 +185,7 @@ export function ManufacturingClient({ initialRows, initialTotal }: Props) {
                     </Badge>
                   </td>
                   <td className="px-3 py-2">
-                    <span className="font-mono text-xs text-muted-foreground mr-1">{r.productSku}</span>
-                    {r.productName}
+                    <ProductLink productId={r.productId} sku={r.productSku} name={r.productName} skuClassName="font-mono text-xs text-muted-foreground mr-1" />
                   </td>
                   <td className="px-3 py-2">{r.warehouseName}</td>
                   <td className="px-3 py-2 text-muted-foreground">{r.manufacturerName ?? '—'}</td>
@@ -269,7 +269,7 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
       setWarehouses(w)
       setSuppliers(s)
       setLoading(false)
-    })
+    }).catch(() => { setLoading(false) })
   }, [])
 
   // When product or warehouse changes, recalculate stock
@@ -288,13 +288,13 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
         setMaxUnits(max)
         setComponentStocks(stocks)
         setLoadingStock(false)
-      })
+      }).catch(() => { setLoadingStock(false) })
     } else {
       getDisassemblyStock(selectedProduct.id, warehouseId).then((max) => {
         setMaxUnits(max)
         setComponentStocks([])
         setLoadingStock(false)
-      })
+      }).catch(() => { setLoadingStock(false) })
     }
   }, [selectedProduct, warehouseId, orderType])
 
@@ -303,7 +303,7 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
     if (!selectedProduct) return
     getLastManufacturer(selectedProduct.id).then((id) => {
       if (id) setManufacturerId(id)
-    })
+    }).catch(() => {})
   }, [selectedProduct])
 
   const filteredProducts = bomProducts.filter((p) => {

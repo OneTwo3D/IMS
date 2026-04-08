@@ -73,9 +73,9 @@ export async function processWcCompletion(orderId: string, wcOrder: WcFullOrder)
     }
   }
 
-  // Step 5: If order is not yet COMPLETED/SHIPPED, update it
+  // Step 5: If order is shipped, move to COMPLETED (only valid transition)
   const updated = await db.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } })
-  if (updated && !['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(updated.status)) {
+  if (updated?.status === 'SHIPPED') {
     await db.salesOrder.update({ where: { id: orderId }, data: { status: 'COMPLETED' } })
   }
 

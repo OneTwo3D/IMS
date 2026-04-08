@@ -36,6 +36,25 @@ export async function requireAuth(): Promise<AuthSession> {
 }
 
 /**
+ * Requires the user to have one of the specified roles.
+ * Returns the session if authorized, otherwise throws / returns JSON 403.
+ */
+export async function requireRole(...roles: string[]): Promise<AuthSession> {
+  const session = await requireAuth()
+  if (!roles.includes(session.user.role)) {
+    throw new Error('Forbidden')
+  }
+  return session
+}
+
+/**
+ * Requires the user to be an ADMIN.
+ */
+export async function requireAdmin(): Promise<AuthSession> {
+  return requireRole('ADMIN')
+}
+
+/**
  * Returns the current session or null — does not redirect.
  */
 export async function getSession(): Promise<AuthSession | null> {

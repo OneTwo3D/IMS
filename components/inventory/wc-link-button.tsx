@@ -12,13 +12,15 @@ export function WcLinkButton({ sku }: { sku: string }) {
   async function handleClick() {
     setLoading(true)
     setError(null)
-    const result = await fetchWcProductUrl(sku)
-    setLoading(false)
-    if (result.error || !result.permalink) {
-      setError(result.error ?? 'No permalink found')
-      return
-    }
-    window.open(result.permalink, '_blank', 'noopener,noreferrer')
+    try {
+      const result = await fetchWcProductUrl(sku)
+      setLoading(false)
+      if (result.error || !result.permalink) {
+        setError(result.error ?? 'No permalink found')
+        return
+      }
+      window.open(result.permalink, '_blank', 'noopener,noreferrer')
+    } catch { setError('An unexpected error occurred.'); setLoading(false) }
   }
 
   return (

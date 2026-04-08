@@ -5,6 +5,7 @@ import { redirect } from 'next/navigation'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { requireAuth } from '@/lib/auth/server'
 import { ProductType } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -76,6 +77,7 @@ export async function listProducts(params: {
   page?: number
   pageSize?: number
 }): Promise<ProductListResult> {
+  await requireAuth()
   const page = Math.max(1, params.page ?? 1)
   const pageSize = params.pageSize ?? 50
 
@@ -154,6 +156,7 @@ export async function listProducts(params: {
 }
 
 export async function getProduct(id: string): Promise<ProductDetail | null> {
+  await requireAuth()
   const [p, activeOrderLines, inTransferLines, openPoLines] = await Promise.all([
     db.product.findUnique({
       where: { id },
@@ -347,6 +350,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
 }
 
 export async function getVariableProducts() {
+  await requireAuth()
   return db.product.findMany({
     where: { type: 'VARIABLE', active: true },
     select: { id: true, sku: true, name: true },
@@ -387,6 +391,7 @@ export async function createProduct(
   _prev: ProductFormState,
   formData: FormData
 ): Promise<ProductFormState> {
+  await requireAuth()
   const raw = {
     sku: formData.get('sku') as string,
     name: formData.get('name') as string,
@@ -461,6 +466,7 @@ export async function updateProduct(
   _prev: ProductFormState,
   formData: FormData
 ): Promise<ProductFormState> {
+  await requireAuth()
   const raw = {
     sku: formData.get('sku') as string,
     name: formData.get('name') as string,
@@ -550,6 +556,7 @@ export type ProductSupplierRow = {
 }
 
 export async function getProductSuppliers(productId: string): Promise<ProductSupplierRow[]> {
+  await requireAuth()
   const rows = await db.supplierProduct.findMany({
     where: { productId },
     include: {
@@ -662,6 +669,7 @@ export type ProductComponentRow = {
 }
 
 export async function getProductComponents(productId: string): Promise<ProductComponentRow[]> {
+  await requireAuth()
   const rows = await db.productComponent.findMany({
     where: { productId },
     include: { component: { select: { id: true, sku: true, name: true } } },
@@ -713,6 +721,7 @@ export async function saveProductComponents(
   components: { componentId: string; qty: string }[]
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     // Check for self-reference
     if (components.some((c) => c.componentId === productId)) {
       return { success: false, error: 'A product cannot be a component of itself' }
@@ -774,6 +783,7 @@ export type KitStockRow = {
 }
 
 export async function getKitStock(productId: string): Promise<KitStockRow[]> {
+  await requireAuth()
   const components = await db.productComponent.findMany({
     where: { productId },
     include: { component: { select: { id: true, sku: true } } },
@@ -838,6 +848,7 @@ export type ProductOptionRow = {
 }
 
 export async function getProductOptions(productId: string): Promise<ProductOptionRow[]> {
+  await requireAuth()
   return db.productOption.findMany({
     where: { productId },
     orderBy: { sortOrder: 'asc' },
@@ -849,6 +860,7 @@ export async function saveProductOptions(
   productId: string,
   options: { name: string; values: string }[]
 ): Promise<{ success: boolean }> {
+  await requireAuth()
   const _p = await db.product.findUnique({ where: { id: productId }, select: { sku: true } })
   const _sku = _p?.sku ?? productId
   await db.productOption.deleteMany({ where: { productId } })
@@ -879,6 +891,7 @@ export async function saveProductOptions(
 export async function generateVariantsFromOptions(
   productId: string
 ): Promise<{ created: number; skipped: number; error?: string }> {
+  await requireAuth()
   const [product, options] = await Promise.all([
     db.product.findUnique({
       where: { id: productId },
@@ -982,6 +995,7 @@ export async function deleteOrDeactivateVariant(
   id: string,
   forceDeactivate = false
 ): Promise<{ action: 'deleted' | 'deactivated' | 'error'; error?: string }> {
+  await requireAuth()
   const product = await db.product.findUnique({
     where: { id },
     select: { type: true, parentId: true },
@@ -1057,6 +1071,7 @@ export async function deleteOrDeactivateVariant(
 export async function bulkDeleteProducts(
   ids: string[]
 ): Promise<{ deleted: number; skipped: { sku: string; reason: string }[] }> {
+  await requireAuth()
   const products = await db.product.findMany({
     where: { id: { in: ids } },
     select: { id: true, sku: true },
@@ -1109,6 +1124,7 @@ export async function bulkDeleteProducts(
 export async function bulkDeactivateProducts(
   ids: string[]
 ): Promise<{ deactivated: number }> {
+  await requireAuth()
   await db.product.updateMany({
     where: { id: { in: ids } },
     data: { active: false },
@@ -1140,6 +1156,7 @@ export type AllocationDetail = {
 }
 
 export async function getAllocationDetails(productId: string, warehouseId: string): Promise<AllocationDetail[]> {
+  await requireAuth()
   const [salesAllocs, moOrders] = await Promise.all([
     // Sales order allocations for this product from this warehouse
     db.orderAllocation.findMany({
@@ -1234,6 +1251,7 @@ export type IncomingDetail = {
 }
 
 export async function getIncomingDetails(productId: string, warehouseId: string): Promise<IncomingDetail[]> {
+  await requireAuth()
   const [poLines, transferLines] = await Promise.all([
     // PO lines incoming to this warehouse
     db.purchaseOrderLine.findMany({

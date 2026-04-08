@@ -54,6 +54,7 @@ export type ShipmentRow = {
 // ---------------------------------------------------------------------------
 
 export async function getOrderAllocations(orderId: string): Promise<AllocationRow[]> {
+  await requireAuth()
   const rows = await db.orderAllocation.findMany({
     where: { orderId },
     include: {
@@ -83,6 +84,7 @@ export async function getOrderAllocations(orderId: string): Promise<AllocationRo
 // ---------------------------------------------------------------------------
 
 export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]> {
+  await requireAuth()
   const rows = await db.shipment.findMany({
     where: { orderId },
     include: {
@@ -286,8 +288,11 @@ export async function autoAllocateOrder(orderId: string): Promise<{ success: boo
       })
     }
 
-    // Update order status to ALLOCATED (don't change if already beyond PROCESSING)
-    if (['DRAFT', 'PENDING_PAYMENT', 'PROCESSING'].includes(so.status)) {
+    // Update order status — ensure we go through PROCESSING before ALLOCATED
+    if (['DRAFT', 'PENDING_PAYMENT'].includes(so.status)) {
+      // Transition through PROCESSING first, then to ALLOCATED
+      await db.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
+    } else if (so.status === 'PROCESSING') {
       await db.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
     }
 
@@ -450,6 +455,11 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
         data: { reservedQty: { decrement: Number(alloc.qty) } },
       })
     }
+    // Clamp reservedQty to zero to prevent negative values from stale data
+    await db.stockLevel.updateMany({
+      where: { reservedQty: { lt: 0 } },
+      data: { reservedQty: 0 },
+    })
     await db.orderAllocation.deleteMany({ where: { orderId } })
 
     // Revert to PROCESSING
@@ -622,12 +632,18 @@ export async function updateShipmentStatus(
         })
       }
 
-      // Check if ALL shipments for this order are now shipped
+    }
+
+    // Persist the shipment status change FIRST, before checking order-level status
+    await db.shipment.update({ where: { id: shipmentId }, data })
+
+    // After persisting, check if ALL shipments for this order are now shipped
+    if (targetStatus === 'SHIPPED') {
       const allShipments = await db.shipment.findMany({
         where: { orderId: shipment.orderId },
         select: { id: true, status: true },
       })
-      const allShipped = allShipments.every((s) => s.id === shipmentId ? true : s.status === 'SHIPPED')
+      const allShipped = allShipments.every((s) => s.status === 'SHIPPED')
 
       if (allShipped) {
         // Collect all tracking numbers
@@ -655,13 +671,8 @@ export async function updateShipmentStatus(
           const { generateInvoiceNumber } = await import('./sales')
           await generateInvoiceNumber(shipment.orderId)
         }
-      } else {
-        // At least one shipment shipped but not all — keep as PROCESSING or move to partial
-        // Keep the order in PROCESSING until all shipments are done
       }
     }
-
-    await db.shipment.update({ where: { id: shipmentId }, data })
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${shipment.orderId}`)

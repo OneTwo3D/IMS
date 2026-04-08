@@ -65,9 +65,10 @@ export function LoginForm() {
         return
       }
 
-      // Sign in via the passkey credentials provider
+      // Sign in via the passkey credentials provider with the one-time auth token
       const signInResult = await signIn('passkey', {
         userId: result.user!.id,
+        authToken: result.authToken,
         redirect: false,
       })
 

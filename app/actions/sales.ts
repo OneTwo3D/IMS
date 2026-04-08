@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { requireAuth } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -272,6 +273,7 @@ function mapLine(l: {
 // ---------------------------------------------------------------------------
 
 export async function getSalesOrders(limit = 200): Promise<SoRow[]> {
+  await requireAuth()
   const orders = await db.salesOrder.findMany({
     select: SO_SELECT,
     orderBy: { createdAt: 'desc' },
@@ -281,6 +283,7 @@ export async function getSalesOrders(limit = 200): Promise<SoRow[]> {
 }
 
 export async function getSalesOrder(id: string): Promise<SoDetail | null> {
+  await requireAuth()
   const so = await db.salesOrder.findUnique({
     where: { id },
     select: {
@@ -353,6 +356,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
 
 export async function createSalesOrder(input: CreateSoInput): Promise<{ success: boolean; order?: SoRow; error?: string }> {
   try {
+    await requireAuth()
     if (!input.lines.length) return { success: false, error: 'Add at least one line item' }
     if (!input.customerName?.trim()) return { success: false, error: 'Customer name is required' }
     for (const l of input.lines) {
@@ -527,6 +531,7 @@ export async function updateSalesOrderStatus(
   extra?: { trackingNumber?: string; shipFromWarehouseId?: string },
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     const so = await db.salesOrder.findUnique({
       where: { id },
       select: { id: true, wcOrderId: true, wcOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { id: true, productId: true, sku: true, qty: true } } },
@@ -679,13 +684,15 @@ export async function createRefund(
   returnWarehouseId?: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: { id: true, wcOrderNumber: true, status: true, fxRateToGbp: true, totalGbp: true },
     })
     if (!so) return { success: false, error: 'Order not found' }
 
-    const refundLines = lines.filter((l) => l.qty > 0)
+    // Accept lines with qty > 0 (item refund) or totalGbp > 0 (monetary-only refund)
+    const refundLines = lines.filter((l) => l.qty > 0 || l.totalGbp > 0)
     if (!refundLines.length) return { success: false, error: 'Select at least one line to refund' }
 
     const fxRate = Number(so.fxRateToGbp) || 1
@@ -796,6 +803,7 @@ export async function createRefund(
 
 export async function cloneSalesOrder(id: string): Promise<{ success: boolean; newId?: string; error?: string }> {
   try {
+    await requireAuth()
     const so = await db.salesOrder.findUnique({
       where: { id },
       include: { lines: true },
@@ -827,6 +835,8 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
         salesRep: so.salesRep,
         discountStr: so.discountStr,
         discountAmount: so.discountAmount,
+        taxRateName: so.taxRateName,
+        taxRatePercent: so.taxRatePercent,
         notes: so.notes,
         internalNotes: so.internalNotes,
         lines: {
@@ -839,6 +849,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
             unitPriceGbp: l.unitPriceGbp,
             discountStr: l.discountStr,
             discountAmount: l.discountAmount,
+            taxRateId: l.taxRateId,
             taxForeign: l.taxForeign,
             taxGbp: l.taxGbp,
             totalForeign: l.totalForeign,
@@ -879,12 +890,13 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
 
 export async function deleteSalesOrder(id: string): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     const so = await db.salesOrder.findUnique({
       where: { id },
       select: { wcOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { productId: true, qty: true } }, _count: { select: { refunds: true, payments: true } } },
     })
     if (!so) return { success: false, error: 'Order not found' }
-    if (!['DRAFT', 'PENDING_PAYMENT', 'ALLOCATED'].includes(so.status)) return { success: false, error: 'Only draft/pending payment orders can be deleted' }
+    if (!['DRAFT', 'PENDING_PAYMENT', 'ALLOCATED'].includes(so.status)) return { success: false, error: 'Only draft, pending payment, or allocated orders can be deleted' }
     if (so._count.refunds > 0 || so._count.payments > 0) return { success: false, error: 'Cannot delete an order with refunds or payments' }
 
     // Release allocations
@@ -920,6 +932,7 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
 
 export async function markSalesOrderPaid(id: string): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     const so = await db.salesOrder.findUnique({ where: { id }, select: { wcOrderNumber: true, paidAt: true, invoiceNumber: true } })
     if (!so) return { success: false, error: 'Order not found' }
 
@@ -969,6 +982,7 @@ export async function updateSalesOrderNotes(
   internalNotes: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     const so = await db.salesOrder.update({
       where: { id },
       data: { notes: notes || null, internalNotes: internalNotes || null },
@@ -1001,6 +1015,7 @@ export async function updateSalesOrderNotes(
 
 export async function generateInvoiceNumber(id: string): Promise<{ success: boolean; invoiceNumber?: string; error?: string }> {
   try {
+    await requireAuth()
     // Use a transaction to prevent race conditions on invoice numbering
     const result = await db.$transaction(async (tx) => {
       const so = await tx.salesOrder.findUnique({ where: { id }, select: { wcOrderNumber: true, invoiceNumber: true } })
@@ -1063,6 +1078,7 @@ export async function addPayment(input: {
   paidAt?: string
 }): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     if (!input.amount || input.amount <= 0) return { success: false, error: 'Amount must be greater than 0' }
     await db.payment.create({
       data: {
@@ -1126,6 +1142,7 @@ export async function addPayment(input: {
 
 export async function deletePayment(paymentId: string, orderId: string): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     await db.payment.delete({ where: { id: paymentId } })
     const so = await db.salesOrder.findUnique({ where: { id: orderId }, select: { wcOrderNumber: true } })
     revalidatePath(`/sales/${orderId}`)

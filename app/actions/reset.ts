@@ -3,11 +3,13 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { requireAdmin } from '@/lib/auth/server'
 
 export type ResetLevel = 'transactions' | 'products' | 'full'
 
 export async function resetDatabase(level: ResetLevel): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAdmin()
     // Level 1: Transactions only (orders, POs, stock movements, invoices, payments)
     // Keeps products, warehouses, suppliers, customers, settings
     if (level === 'transactions' || level === 'products' || level === 'full') {

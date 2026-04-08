@@ -3,6 +3,7 @@ import Credentials from 'next-auth/providers/credentials'
 import bcrypt from 'bcryptjs'
 import { z } from 'zod'
 import { db } from '@/lib/db'
+import { consumeAuthToken } from '@/lib/auth/token-store'
 
 const loginSchema = z.object({
   email: z.string().email(),
@@ -31,7 +32,7 @@ export const authConfig: NextAuthConfig = {
       if (isLoggedIn) return true
       return false // redirect to /login
     },
-    jwt({ token, user, trigger, session }) {
+    async jwt({ token, user, trigger, session }) {
       if (user) {
         token.id = user.id
         token.role = (user as { role?: string }).role
@@ -40,12 +41,32 @@ export const authConfig: NextAuthConfig = {
         token.totpVerified = (user as { totpVerified?: boolean }).totpVerified ?? false
         token.pictureUrl = (user as { pictureUrl?: string | null }).pictureUrl ?? null
       }
-      // Allow client-side session.update() to refresh token fields
+      // Allow client-side session.update() to refresh non-sensitive token fields only.
+      // SECURITY: totpVerified and totpEnabled must only be set server-side (TOTP API route),
+      // never from client session.update() — otherwise a user could bypass 2FA.
       if (trigger === 'update' && session) {
         if (session.pictureUrl !== undefined) token.pictureUrl = session.pictureUrl
-        if (session.totpVerified !== undefined) token.totpVerified = session.totpVerified
-        if (session.totpEnabled !== undefined) token.totpEnabled = session.totpEnabled
         if (session.name !== undefined) token.name = session.name
+        // totpVerified can only be set via a server-issued one-time token
+        if (session.totpVerified === true && session._totpToken) {
+          const verified = consumeAuthToken(`totp_verify:${session._totpToken}`)
+          if (verified === token.id) {
+            token.totpVerified = true
+          }
+        }
+        // totpEnabled is refreshed from DB when TOTP setup changes
+        if (session._refreshTotp === true) {
+          // Re-read from DB to get fresh totpEnabled state
+          const { db } = await import('@/lib/db')
+          const user = await db.user.findUnique({
+            where: { id: token.id as string },
+            select: { totpEnabled: true },
+          })
+          if (user) {
+            token.totpEnabled = user.totpEnabled
+            if (!user.totpEnabled) token.totpVerified = false
+          }
+        }
       }
       return token
     },
@@ -107,13 +128,18 @@ export const authConfig: NextAuthConfig = {
       id: 'passkey',
       credentials: {
         userId: { type: 'text' },
+        authToken: { type: 'text' },
       },
       async authorize(credentials) {
-        // This provider is only called after WebAuthn verification succeeds on the client.
-        // The server action verifyPasskeyAuthentication already verified the passkey,
-        // so we just look up the user by ID here.
         const userId = credentials?.userId as string | undefined
-        if (!userId) return null
+        const authToken = credentials?.authToken as string | undefined
+        if (!userId || !authToken) return null
+
+        // Verify the one-time auth token from verifyPasskeyAuthentication.
+        // This binds the signIn call to a successful WebAuthn verification,
+        // preventing direct signIn('passkey', { userId }) without verification.
+        const verifiedUserId = consumeAuthToken(`passkey_auth:${authToken}`)
+        if (!verifiedUserId || verifiedUserId !== userId) return null
 
         const user = await db.user.findUnique({
           where: { id: userId },
@@ -122,6 +148,7 @@ export const authConfig: NextAuthConfig = {
             email: true,
             name: true,
             role: true,
+            supplierId: true,
             pictureUrl: true,
             totpEnabled: true,
             active: true,
@@ -135,6 +162,7 @@ export const authConfig: NextAuthConfig = {
           email: user.email,
           name: user.name,
           role: user.role,
+          supplierId: user.supplierId,
           pictureUrl: user.pictureUrl,
           totpEnabled: user.totpEnabled,
           // Passkey counts as strong auth — skip TOTP

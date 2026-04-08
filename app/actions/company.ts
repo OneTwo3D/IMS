@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { requireAuth } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Organisation
@@ -27,6 +28,7 @@ export type OrganisationData = {
 }
 
 export async function getOrganisation(): Promise<OrganisationData> {
+  await requireAuth()
   const org = await db.organisation.findFirst()
   return {
     name: org?.name ?? '',
@@ -48,6 +50,7 @@ export async function getOrganisation(): Promise<OrganisationData> {
 }
 
 export async function updateOrganisation(data: Partial<OrganisationData>): Promise<{ success: boolean; error?: string }> {
+  await requireAuth()
   try {
     await db.organisation.updateMany({ data })
     logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated company details' })
@@ -61,6 +64,7 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
 }
 
 export async function updateLogoUrl(logoUrl: string | null): Promise<{ success: boolean }> {
+  await requireAuth()
   await db.organisation.updateMany({ data: { logoUrl } })
   logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: logoUrl ? 'Updated company logo' : 'Removed company logo' })
   revalidatePath('/settings')
@@ -95,6 +99,7 @@ const NUMBERING_DEFAULTS: NumberingFormats = {
 }
 
 export async function getNumberingFormats(): Promise<NumberingFormats> {
+  await requireAuth()
   const keys = Object.keys(NUMBERING_DEFAULTS).map((k) => `numbering_${k}`)
   const rows = await db.setting.findMany({ where: { key: { in: keys } } })
   const map = new Map(rows.map((r) => [r.key, r.value]))
@@ -107,6 +112,7 @@ export async function getNumberingFormats(): Promise<NumberingFormats> {
 }
 
 export async function saveNumberingFormats(data: NumberingFormats): Promise<{ success: boolean }> {
+  await requireAuth()
   const ops = Object.entries(data).map(([k, v]) =>
     db.setting.upsert({
       where: { key: `numbering_${k}` },
@@ -153,6 +159,7 @@ const EMAIL_DEFAULTS: EmailSettings = {
 }
 
 export async function getEmailSettings(): Promise<EmailSettings> {
+  await requireAuth()
   const keys = Object.keys(EMAIL_DEFAULTS).map((k) => `email_${k}`)
   const rows = await db.setting.findMany({ where: { key: { in: keys } } })
   const map = new Map(rows.map((r) => [r.key, r.value]))
@@ -161,17 +168,23 @@ export async function getEmailSettings(): Promise<EmailSettings> {
     const v = map.get(`email_${k}`)
     if (v) result[k] = v
   }
+  if (result.smtp_pass) {
+    result.smtp_pass = result.smtp_pass.slice(0, 3) + '***'
+  }
   return result
 }
 
 export async function saveEmailSettings(data: EmailSettings): Promise<{ success: boolean }> {
-  const ops = Object.entries(data).map(([k, v]) =>
-    db.setting.upsert({
-      where: { key: `email_${k}` },
-      create: { key: `email_${k}`, value: v },
-      update: { value: v },
-    }),
-  )
+  await requireAuth()
+  const ops = Object.entries(data)
+    .filter(([k, v]) => !(k === 'smtp_pass' && v.endsWith('***')))
+    .map(([k, v]) =>
+      db.setting.upsert({
+        where: { key: `email_${k}` },
+        create: { key: `email_${k}`, value: v },
+        update: { value: v },
+      }),
+    )
   await db.$transaction(ops)
   logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated email/SMTP settings' })
   revalidatePath('/settings/company')
@@ -188,6 +201,7 @@ export type BrandingColours = {
 }
 
 export async function getBrandingColours(): Promise<BrandingColours> {
+  await requireAuth()
   const [p, a] = await Promise.all([
     db.setting.findUnique({ where: { key: 'brand_primary_color' } }),
     db.setting.findUnique({ where: { key: 'brand_accent_color' } }),
@@ -199,6 +213,7 @@ export async function getBrandingColours(): Promise<BrandingColours> {
 }
 
 export async function saveBrandingColours(data: BrandingColours): Promise<{ success: boolean }> {
+  await requireAuth()
   await db.$transaction([
     db.setting.upsert({ where: { key: 'brand_primary_color' }, create: { key: 'brand_primary_color', value: data.primaryColor }, update: { value: data.primaryColor } }),
     db.setting.upsert({ where: { key: 'brand_accent_color' }, create: { key: 'brand_accent_color', value: data.accentColor }, update: { value: data.accentColor } }),
@@ -228,6 +243,7 @@ export type DocumentTemplateData = {
 const TEMPLATE_TYPES = ['sales_order', 'purchase_order', 'invoice', 'packing_slip', 'credit_note', 'rfq', 'manufacturing_order']
 
 export async function getDocumentTemplates(): Promise<DocumentTemplateData[]> {
+  await requireAuth()
   const rows = await db.documentTemplate.findMany({ orderBy: { type: 'asc' } })
   const map = new Map(rows.map((r) => [r.type, r]))
 
@@ -249,6 +265,7 @@ export async function getDocumentTemplates(): Promise<DocumentTemplateData[]> {
 }
 
 export async function saveDocumentTemplate(data: DocumentTemplateData): Promise<{ success: boolean; error?: string }> {
+  await requireAuth()
   try {
     await db.documentTemplate.upsert({
       where: { type: data.type },

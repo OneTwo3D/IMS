@@ -24,7 +24,7 @@ export function PasskeyManager() {
   const [editName, setEditName] = useState('')
 
   useEffect(() => {
-    listPasskeys().then((keys) => { setPasskeys(keys); setLoading(false) })
+    listPasskeys().then((keys) => { setPasskeys(keys); setLoading(false) }).catch(() => setLoading(false))
   }, [])
 
   async function handleRegister() {
@@ -102,10 +102,10 @@ export function PasskeyManager() {
                       onKeyDown={(e) => e.key === 'Enter' && handleRename(pk.id)}
                       autoFocus
                     />
-                    <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => handleRename(pk.id)} disabled={isPending}>
+                    <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => handleRename(pk.id)} disabled={isPending} aria-label="Confirm rename">
                       <Check className="h-3 w-3" />
                     </Button>
-                    <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => setEditingId(null)}>
+                    <Button variant="ghost" size="icon" className="h-6 w-6" onClick={() => setEditingId(null)} aria-label="Cancel rename">
                       <X className="h-3 w-3" />
                     </Button>
                   </div>
@@ -120,10 +120,10 @@ export function PasskeyManager() {
               </div>
               {editingId !== pk.id && (
                 <div className="flex items-center gap-1">
-                  <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => { setEditingId(pk.id); setEditName(pk.name) }}>
+                  <Button variant="ghost" size="icon" className="h-7 w-7" onClick={() => { setEditingId(pk.id); setEditName(pk.name) }} aria-label="Edit passkey name">
                     <Pencil className="h-3 w-3" />
                   </Button>
-                  <Button variant="ghost" size="icon" className="h-7 w-7 text-destructive" onClick={() => handleDelete(pk.id)} disabled={isPending}>
+                  <Button variant="ghost" size="icon" className="h-7 w-7 text-destructive" onClick={() => handleDelete(pk.id)} disabled={isPending} aria-label="Delete passkey">
                     <Trash2 className="h-3 w-3" />
                   </Button>
                 </div>

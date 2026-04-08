@@ -2,6 +2,7 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
+import { requireAuth } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Products tab (line-level)
@@ -50,6 +51,7 @@ export type SalesStatSummary = {
 }
 
 export async function getProductSalesStats(dateFrom?: string, dateTo?: string): Promise<{ rows: SalesStatRow[]; summary: SalesStatSummary }> {
+  await requireAuth()
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -156,6 +158,7 @@ export type ShipmentRow = {
 }
 
 export async function getShipments(dateFrom?: string, dateTo?: string): Promise<ShipmentRow[]> {
+  await requireAuth()
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -209,6 +212,7 @@ export type DetailRow = {
 }
 
 export async function getDetails(dateFrom?: string, dateTo?: string): Promise<DetailRow[]> {
+  await requireAuth()
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -260,6 +264,7 @@ export type InvoiceRow = {
 }
 
 export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promise<InvoiceRow[]> {
+  await requireAuth()
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -315,6 +320,7 @@ export type RefundRow = {
 }
 
 export async function getRefundStats(dateFrom?: string, dateTo?: string): Promise<RefundRow[]> {
+  await requireAuth()
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -373,6 +379,7 @@ export type CustomerAgingRow = {
 }
 
 export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
+  await requireAuth()
   const orders = await db.salesOrder.findMany({
     where: { invoiceNumber: { not: null } },
     select: {
@@ -427,12 +434,14 @@ export type SavedView = {
 }
 
 export async function getSavedViews(): Promise<SavedView[]> {
+  await requireAuth()
   const row = await db.setting.findUnique({ where: { key: 'sales_stats_views' } })
   if (row?.value) { try { return JSON.parse(row.value) } catch {} }
   return []
 }
 
 export async function saveView(view: SavedView): Promise<void> {
+  await requireAuth()
   const views = await getSavedViews()
   const existing = views.findIndex((v) => v.id === view.id)
   if (existing >= 0) views[existing] = view; else views.push(view)
@@ -441,6 +450,7 @@ export async function saveView(view: SavedView): Promise<void> {
 }
 
 export async function deleteView(viewId: string): Promise<void> {
+  await requireAuth()
   const views = await getSavedViews()
   await db.setting.upsert({ where: { key: 'sales_stats_views' }, create: { key: 'sales_stats_views', value: JSON.stringify(views.filter((v) => v.id !== viewId)) }, update: { value: JSON.stringify(views.filter((v) => v.id !== viewId)) } })
   revalidatePath('/analytics/sales-stats')

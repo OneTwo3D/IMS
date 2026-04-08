@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { requireAuth } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Adjustment Reasons
@@ -18,6 +19,7 @@ export type AdjustmentReason = {
 }
 
 export async function getAdjustmentReasons(activeOnly = false): Promise<AdjustmentReason[]> {
+  await requireAuth()
   return db.adjustmentReason.findMany({
     where: activeOnly ? { active: true } : undefined,
     orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
@@ -49,6 +51,7 @@ export type ReasonInput = {
 export async function createAdjustmentReason(
   data: ReasonInput
 ): Promise<ReasonFormState> {
+  await requireAuth()
   const parsed = reasonSchema.safeParse(data)
   if (!parsed.success) {
     return { errors: parsed.error.flatten().fieldErrors }
@@ -72,6 +75,7 @@ export async function updateAdjustmentReason(
   id: string,
   data: ReasonInput
 ): Promise<ReasonFormState> {
+  await requireAuth()
   const parsed = reasonSchema.safeParse(data)
   if (!parsed.success) {
     return { errors: parsed.error.flatten().fieldErrors }
@@ -93,6 +97,7 @@ export async function updateAdjustmentReason(
 }
 
 export async function deleteAdjustmentReason(id: string): Promise<{ error?: string }> {
+  await requireAuth()
   try {
     await db.adjustmentReason.delete({ where: { id } })
     logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted adjustment reason' })
@@ -120,6 +125,7 @@ export type TaxRateRow = {
 }
 
 export async function getTaxRates(activeOnly = true): Promise<TaxRateRow[]> {
+  await requireAuth()
   const rows = await db.taxRate.findMany({
     where: activeOnly ? { active: true } : undefined,
     orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
@@ -143,6 +149,7 @@ export async function createTaxRate(input: {
   usedFor: string
   xeroTaxType?: string
 }): Promise<{ success: boolean; error?: string }> {
+  await requireAuth()
   try {
     await db.taxRate.create({
       data: {
@@ -168,6 +175,7 @@ export async function updateTaxRate(id: string, input: {
   xeroTaxType?: string
   active?: boolean
 }): Promise<{ success: boolean; error?: string }> {
+  await requireAuth()
   try {
     await db.taxRate.update({
       where: { id },
@@ -193,6 +201,7 @@ export async function updateTaxRate(id: string, input: {
 // ---------------------------------------------------------------------------
 
 export async function getSetting(key: string): Promise<string | null> {
+  await requireAuth()
   const row = await db.setting.findUnique({ where: { key } })
   return row?.value ?? null
 }
@@ -200,6 +209,7 @@ export async function getSetting(key: string): Promise<string | null> {
 export type UserOption = { id: string; name: string; email: string }
 
 export async function getUsers(): Promise<UserOption[]> {
+  await requireAuth()
   const rows = await db.user.findMany({
     where: { active: true },
     select: { id: true, name: true, email: true },
@@ -209,6 +219,7 @@ export async function getUsers(): Promise<UserOption[]> {
 }
 
 export async function setSetting(key: string, value: string): Promise<void> {
+  await requireAuth()
   await db.setting.upsert({
     where: { key },
     create: { key, value },
@@ -232,6 +243,7 @@ export type PurchaseUnitRow = {
 }
 
 export async function getPurchaseUnits(activeOnly = true): Promise<PurchaseUnitRow[]> {
+  await requireAuth()
   const rows = await db.purchaseUnit.findMany({
     where: activeOnly ? { active: true } : undefined,
     orderBy: { name: 'asc' },
@@ -253,6 +265,7 @@ export async function createPurchaseUnit(input: {
   conversionFactor: number
   stockUnitName: string
 }): Promise<{ success: boolean; error?: string }> {
+  await requireAuth()
   try {
     if (!input.name.trim()) return { success: false, error: 'Name is required' }
     if (!input.abbreviation.trim()) return { success: false, error: 'Abbreviation is required' }
@@ -276,6 +289,7 @@ export async function createPurchaseUnit(input: {
 
 /** Returns unique stock unit names from all purchase units, plus "pcs" */
 export async function getStockUnitOptions(): Promise<string[]> {
+  await requireAuth()
   const rows = await db.purchaseUnit.findMany({
     where: { active: true },
     select: { stockUnitName: true },
@@ -294,6 +308,7 @@ export async function updatePurchaseUnit(id: string, input: {
   stockUnitName?: string
   active?: boolean
 }): Promise<{ success: boolean; error?: string }> {
+  await requireAuth()
   try {
     await db.purchaseUnit.update({
       where: { id },

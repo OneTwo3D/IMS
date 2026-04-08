@@ -112,27 +112,31 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
     if (!confirm(`Delete ${ids.length} product${ids.length !== 1 ? 's' : ''}? Products with activity or variants will be skipped.`)) return
     setBulkPending(true)
     setBulkMsg(null)
-    const result = await bulkDeleteProducts(ids)
-    setBulkPending(false)
-    setSelectedIds(new Set())
-    const skippedCount = result.skipped.length
-    setBulkMsg(
-      skippedCount > 0
-        ? `Deleted ${result.deleted}, skipped ${skippedCount} (${result.skipped.map((s) => s.sku).join(', ')})`
-        : `Deleted ${result.deleted} product${result.deleted !== 1 ? 's' : ''}.`
-    )
-    startTransition(() => router.refresh())
+    try {
+      const result = await bulkDeleteProducts(ids)
+      setBulkPending(false)
+      setSelectedIds(new Set())
+      const skippedCount = result.skipped.length
+      setBulkMsg(
+        skippedCount > 0
+          ? `Deleted ${result.deleted}, skipped ${skippedCount} (${result.skipped.map((s) => s.sku).join(', ')})`
+          : `Deleted ${result.deleted} product${result.deleted !== 1 ? 's' : ''}.`
+      )
+      startTransition(() => router.refresh())
+    } catch { setBulkMsg('An unexpected error occurred.'); setBulkPending(false) }
   }
 
   async function handleBulkDeactivate() {
     const ids = [...selectedIds]
     setBulkPending(true)
     setBulkMsg(null)
-    const result = await bulkDeactivateProducts(ids)
-    setBulkPending(false)
-    setSelectedIds(new Set())
-    setBulkMsg(`Deactivated ${result.deactivated} product${result.deactivated !== 1 ? 's' : ''}.`)
-    startTransition(() => router.refresh())
+    try {
+      const result = await bulkDeactivateProducts(ids)
+      setBulkPending(false)
+      setSelectedIds(new Set())
+      setBulkMsg(`Deactivated ${result.deactivated} product${result.deactivated !== 1 ? 's' : ''}.`)
+      startTransition(() => router.refresh())
+    } catch { setBulkMsg('An unexpected error occurred.'); setBulkPending(false) }
   }
 
   // Load from localStorage on mount

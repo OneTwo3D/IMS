@@ -473,8 +473,6 @@ model Product {
   orderAllocations OrderAllocation[]
   shipmentLines    ShipmentLine[]
 
-  wcSyncLogs      WcSyncLog[]
-
   @@index([parentId])
   @@map("products")
 }
@@ -559,8 +557,6 @@ model CogsEntry {
 
   costLayer     CostLayer         @relation(fields: [costLayerId], references: [id])
   movement      StockMovement     @relation(fields: [movementId], references: [id])
-
-  xeroSyncLogs  XeroSyncLog[]
 
   @@map("cogs_entries")
 }
@@ -696,8 +692,8 @@ model PurchaseOrder {
   asFreightFor    LandedCostLink[]   @relation("FreightPO")
   freightCostLines FreightCostLine[]
 
-  xeroSyncLogs    XeroSyncLog[]
-
+  @@index([supplierId])
+  @@index([createdAt])
   @@map("purchase_orders")
 }
 
@@ -960,10 +956,10 @@ model SalesOrder {
   payments          Payment[]
   allocations       OrderAllocation[]
   shipments         Shipment[]
-  wcSyncLogs        WcSyncLog[]
 
   @@index([wcOrderId])
   @@index([status])
+  @@index([createdAt])
   @@map("sales_orders")
 }
 
@@ -1239,8 +1235,8 @@ model XeroSyncLog {
   syncedAt        DateTime?
   createdAt       DateTime      @default(now())
 
-  purchaseOrder   PurchaseOrder? @relation(fields: [referenceId], references: [id], map: "xero_sync_po")
-  cogsEntry       CogsEntry?     @relation(fields: [referenceId], references: [id], map: "xero_sync_cogs")
+  // Polymorphic reference: use referenceType + referenceId for application-level lookups.
+  // No FK constraints — referenceId may point to PurchaseOrder or CogsEntry based on referenceType.
 
   @@index([referenceType, referenceId])
   @@map("xero_sync_logs")
@@ -1262,8 +1258,8 @@ model WcSyncLog {
   syncedAt      DateTime?
   createdAt     DateTime      @default(now())
 
-  product       Product?      @relation(fields: [entityId], references: [id], map: "wc_sync_product")
-  salesOrder    SalesOrder?   @relation(fields: [entityId], references: [id], map: "wc_sync_order")
+  // Polymorphic reference: use entityType + entityId for application-level lookups.
+  // No FK constraints — entityId may point to Product or SalesOrder based on entityType.
 
   @@index([entityType, entityId])
   @@map("wc_sync_logs")

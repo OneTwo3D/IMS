@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { requireAuth } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -22,6 +23,7 @@ export type CurrencyRow = {
 // ---------------------------------------------------------------------------
 
 export async function getCurrencies(activeOnly = true): Promise<CurrencyRow[]> {
+  await requireAuth()
   const rows = await db.currency.findMany({
     where: activeOnly ? { active: true } : undefined,
     orderBy: { code: 'asc' },
@@ -44,6 +46,7 @@ export async function getCurrencies(activeOnly = true): Promise<CurrencyRow[]> {
 
 /** Returns map: { EUR: 1.17, USD: 1.27, ... } */
 export async function getCurrencyRateMap(): Promise<Record<string, number>> {
+  await requireAuth()
   const currencies = await getCurrencies(true)
   const map: Record<string, number> = { GBP: 1 }
   for (const c of currencies) {
@@ -61,6 +64,7 @@ export async function createCurrency(input: {
   name: string
   symbol: string
 }): Promise<{ success: boolean; error?: string }> {
+  await requireAuth()
   try {
     const code = input.code.toUpperCase().trim()
     if (code.length !== 3) return { success: false, error: 'Currency code must be 3 characters' }
@@ -94,6 +98,7 @@ export async function createCurrency(input: {
 }
 
 export async function toggleCurrency(code: string, active: boolean): Promise<{ success: boolean; error?: string }> {
+  await requireAuth()
   try {
     if (code === 'GBP') return { success: false, error: 'Cannot deactivate base currency' }
     await db.currency.update({ where: { code }, data: { active } })
@@ -137,6 +142,7 @@ async function fetchSingleFxRate(code: string): Promise<number | null> {
 
 /** Fetch FX rates for all active currencies (called daily via cron or on demand) */
 export async function fetchAllFxRates(): Promise<{ success: boolean; updated: string[]; failed: string[]; error?: string }> {
+  await requireAuth()
   try {
     const currencies = await db.currency.findMany({
       where: { active: true, code: { not: 'GBP' } },

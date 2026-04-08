@@ -109,7 +109,7 @@ export function Sidebar({ companyName, logoUrl, userRole = 'ADMIN' }: SidebarPro
         </nav>
         <Separator />
         <div className="p-2">
-          <Button variant="ghost" size="sm" className={cn('w-full', collapsed ? 'justify-center px-0' : 'justify-start')} onClick={() => setCollapsed((c) => !c)}>
+          <Button variant="ghost" size="sm" className={cn('w-full', collapsed ? 'justify-center px-0' : 'justify-start')} onClick={() => setCollapsed((c) => !c)} aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
             {collapsed ? <ChevronRight className="h-4 w-4" /> : <><ChevronLeft className="h-4 w-4 mr-2" /><span className="text-xs">Collapse</span></>}
           </Button>
         </div>

@@ -61,6 +61,7 @@ export function Topbar({ userName, userEmail, userPictureUrl }: TopbarProps) {
           onClick={() => setOpen((v) => !v)}
           className="rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           aria-label="User menu"
+          aria-expanded={open}
         >
           <Avatar className="h-8 w-8">
             {pictureUrl && <AvatarImage src={pictureUrl} alt={userName} />}
@@ -69,7 +70,7 @@ export function Topbar({ userName, userEmail, userPictureUrl }: TopbarProps) {
         </button>
 
         {open && (
-          <div className="absolute right-0 top-full mt-1 z-50 w-52 rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg">
+          <div role="menu" className="absolute right-0 top-full mt-1 z-50 w-52 rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg">
             <div className="px-2 py-1.5">
               <p className="text-sm font-medium leading-none">{userName}</p>
               <p className="text-xs leading-none text-muted-foreground mt-1">{userEmail}</p>

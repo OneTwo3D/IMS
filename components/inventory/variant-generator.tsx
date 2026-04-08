@@ -50,23 +50,27 @@ export function VariantGenerator({ productId, initialOptions, variants }: Props)
   async function handleSave() {
     setSaveMsg(null)
     const valid = options.filter((o) => o.name.trim() && o.values.trim())
-    const result = await saveProductOptions(productId, valid)
-    setSaveMsg(result.success ? 'Options saved.' : 'Error saving options.')
+    try {
+      const result = await saveProductOptions(productId, valid)
+      setSaveMsg(result.success ? 'Options saved.' : 'Error saving options.')
+    } catch { setSaveMsg('An unexpected error occurred.') }
   }
 
   async function handleDeleteVariant(variantId: string, variantSku: string) {
     if (!confirm(`Delete variant ${variantSku}?`)) return
-    const result = await deleteOrDeactivateVariant(variantId, false)
-    if (result.action === 'deleted') {
-      router.refresh()
-    } else if (result.error === 'HAS_ACTIVITY') {
-      if (confirm(`${variantSku} has order/stock activity and cannot be deleted. Deactivate it instead?`)) {
-        await deleteOrDeactivateVariant(variantId, true)
+    try {
+      const result = await deleteOrDeactivateVariant(variantId, false)
+      if (result.action === 'deleted') {
         router.refresh()
+      } else if (result.error === 'HAS_ACTIVITY') {
+        if (confirm(`${variantSku} has order/stock activity and cannot be deleted. Deactivate it instead?`)) {
+          await deleteOrDeactivateVariant(variantId, true)
+          router.refresh()
+        }
+      } else {
+        alert(result.error ?? 'Unexpected error')
       }
-    } else {
-      alert(result.error ?? 'Unexpected error')
-    }
+    } catch { alert('An unexpected error occurred.') }
   }
 
   function handleGenerate() {

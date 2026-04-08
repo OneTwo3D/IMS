@@ -1,6 +1,7 @@
 'use server'
 
 import { db } from '@/lib/db'
+import { requireAuth } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -55,6 +56,7 @@ const DEFAULT_SETTINGS: ForecastSettings = {
 }
 
 export async function getForecastSettings(): Promise<ForecastSettings> {
+  await requireAuth()
   const row = await db.setting.findUnique({ where: { key: 'forecast_settings' } })
   if (row?.value) {
     try { return { ...DEFAULT_SETTINGS, ...JSON.parse(row.value) } } catch {}
@@ -63,6 +65,7 @@ export async function getForecastSettings(): Promise<ForecastSettings> {
 }
 
 export async function saveForecastSettings(settings: ForecastSettings): Promise<void> {
+  await requireAuth()
   await db.setting.upsert({
     where: { key: 'forecast_settings' },
     create: { key: 'forecast_settings', value: JSON.stringify(settings) },
@@ -102,6 +105,7 @@ function exponentialSmoothing(data: number[], alpha = 0.3): number {
 // ---------------------------------------------------------------------------
 
 export async function generateForecasts(): Promise<ProductForecast[]> {
+  await requireAuth()
   const settings = await getForecastSettings()
   const now = new Date()
   const reviewStart = new Date(now.getTime() - settings.reviewPeriodDays * 86400000)
@@ -326,6 +330,7 @@ export async function generateForecasts(): Promise<ProductForecast[]> {
 export async function createReorderPOs(
   productIds: string[],
 ): Promise<{ success: boolean; poCount: number; error?: string }> {
+  await requireAuth()
   try {
     const forecasts = await generateForecasts()
     const selected = forecasts.filter((f) => productIds.includes(f.productId) && f.supplierId)

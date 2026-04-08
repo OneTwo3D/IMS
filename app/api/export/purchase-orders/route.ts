@@ -1,10 +1,14 @@
-import { NextRequest } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { toCsv, csvResponse } from '@/lib/csv'
+import { auth } from '@/lib/auth'
 
 const HEADERS = ['reference', 'type', 'status', 'supplier', 'currency', 'fxRate', 'subtotal', 'tax', 'total', 'totalGbp', 'warehouse', 'expectedDelivery', 'supplierRef', 'sku', 'productName', 'qty', 'unitCostForeign', 'unitCostGbp', 'lineTotal', 'qtyReceived', 'qtyReturned', 'notes']
 
 export async function GET(req: NextRequest) {
+  const session = await auth()
+  if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+
   if (req.nextUrl.searchParams.get('template')) {
     return csvResponse(['supplierName', 'currency', 'sku', 'qty', 'unitCostForeign', 'notes'].join(',') + '\r\n', 'purchase-orders-template.csv')
   }

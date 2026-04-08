@@ -38,7 +38,7 @@ export function BackupRestore() {
 
   const refreshList = () => listBackups().then(setBackups)
 
-  useEffect(() => { refreshList().then(() => setLoading(false)) }, [])
+  useEffect(() => { refreshList().then(() => setLoading(false)).catch(() => setLoading(false)) }, [])
 
   async function handleCreate() {
     setMsg(null)

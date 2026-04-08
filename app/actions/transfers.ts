@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { requireAuth } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -124,6 +125,7 @@ const TRANSFER_SELECT = {
 // ---------------------------------------------------------------------------
 
 export async function getTransfers(limit = 200): Promise<TransferRow[]> {
+  await requireAuth()
   const rows = await db.stockTransfer.findMany({
     orderBy: { createdAt: 'desc' },
     take: limit,
@@ -142,6 +144,7 @@ export async function createTransfer(
   lines: TransferLine[],
   notes?: string
 ): Promise<TransferResult> {
+  await requireAuth()
   if (fromWarehouseId === toWarehouseId) {
     return { message: 'Source and destination warehouses must be different.' }
   }
@@ -218,6 +221,7 @@ export async function updateTransferDraft(
   lines: TransferLine[],
   notes?: string
 ): Promise<TransferResult> {
+  await requireAuth()
   if (fromWarehouseId === toWarehouseId) {
     return { message: 'Source and destination warehouses must be different.' }
   }
@@ -285,6 +289,7 @@ export async function updateTransferDraft(
 
 export async function dispatchTransfer(id: string): Promise<TransferResult> {
   try {
+    await requireAuth()
     await db.$transaction(async (tx) => {
       const transfer = await tx.stockTransfer.findUnique({
         where: { id },
@@ -380,6 +385,7 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
 
 export async function receiveTransfer(id: string): Promise<TransferResult> {
   try {
+    await requireAuth()
     await db.$transaction(async (tx) => {
       const transfer = await tx.stockTransfer.findUnique({
         where: { id },
@@ -466,6 +472,7 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
 
 export async function cancelTransfer(id: string): Promise<TransferResult> {
   try {
+    await requireAuth()
     const existing = await db.stockTransfer.findUnique({ where: { id }, select: { status: true } })
     if (!existing) return { message: 'Transfer not found.' }
     if (existing.status !== 'DRAFT') return { message: 'Only draft transfers can be cancelled.' }

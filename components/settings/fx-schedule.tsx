@@ -38,14 +38,16 @@ export function FxScheduleSettings({ enabled, intervalHours, lastFetched }: Prop
   async function handleRefreshNow() {
     setRefreshing(true)
     setRefreshMsg(null)
-    const result = await fetchAllFxRates()
-    setRefreshing(false)
-    if (result.success) {
-      setRefreshMsg(`Updated ${result.updated} rate(s).`)
-      setTimeout(() => setRefreshMsg(null), 3000)
-    } else {
-      setRefreshMsg(result.error ?? 'Failed to fetch rates.')
-    }
+    try {
+      const result = await fetchAllFxRates()
+      setRefreshing(false)
+      if (result.success) {
+        setRefreshMsg(`Updated ${result.updated} rate(s).`)
+        setTimeout(() => setRefreshMsg(null), 3000)
+      } else {
+        setRefreshMsg(result.error ?? 'Failed to fetch rates.')
+      }
+    } catch { setRefreshMsg('An unexpected error occurred.'); setRefreshing(false) }
   }
 
   return (

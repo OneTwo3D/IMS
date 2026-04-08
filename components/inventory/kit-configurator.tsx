@@ -54,18 +54,20 @@ export function KitConfigurator({ productId, productType, initialComponents, all
     const valid = lines.filter((l) => l.componentId && Number(l.qty) > 0)
     setSaving(true)
     setMessage('')
-    const result = await saveProductComponents(
-      productId,
-      valid.map((l) => ({ componentId: l.componentId, qty: l.qty }))
-    )
-    setSaving(false)
-    if (result.success) {
-      setMessage('Saved.')
-      router.refresh()
-      setTimeout(() => setMessage(''), 2000)
-    } else {
-      setMessage(result.error ?? 'Failed to save.')
-    }
+    try {
+      const result = await saveProductComponents(
+        productId,
+        valid.map((l) => ({ componentId: l.componentId, qty: l.qty }))
+      )
+      setSaving(false)
+      if (result.success) {
+        setMessage('Saved.')
+        router.refresh()
+        setTimeout(() => setMessage(''), 2000)
+      } else {
+        setMessage(result.error ?? 'Failed to save.')
+      }
+    } catch { setMessage('An unexpected error occurred.'); setSaving(false) }
   }
 
   const label = isBom ? 'Bill of Materials' : 'Kit Components'

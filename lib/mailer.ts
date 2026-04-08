@@ -36,7 +36,7 @@ export async function sendEmail(opts: EmailOptions): Promise<{ success: boolean;
       port: smtp.port,
       secure: smtp.secure === 'ssl',
       auth: smtp.user ? { user: smtp.user, pass: smtp.pass } : undefined,
-      tls: smtp.secure === 'tls' ? { rejectUnauthorized: false } : undefined,
+      tls: smtp.secure === 'tls' ? { rejectUnauthorized: true } : undefined,
     })
 
     await transport.sendMail({

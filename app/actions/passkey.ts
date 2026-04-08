@@ -10,9 +10,11 @@ import type {
   RegistrationResponseJSON,
   AuthenticationResponseJSON,
 } from '@simplewebauthn/server'
+import { randomBytes } from 'crypto'
 import { db } from '@/lib/db'
 import { auth } from '@/lib/auth'
 import { logActivity } from '@/lib/activity-log'
+import { setAuthToken } from '@/lib/auth/token-store'
 
 const RP_NAME = 'OneTwo3D IMS'
 const RP_ID = process.env.NEXT_PUBLIC_APP_URL
@@ -181,9 +183,14 @@ export async function verifyPasskeyAuthentication(
       data: { counter: BigInt(verification.authenticationInfo.newCounter) },
     })
 
-    // Return user data for signIn
+    // Generate a one-time auth token that binds this verification to the signIn call.
+    // The passkey Credentials provider will consume this token to prevent replay.
+    const authToken = randomBytes(32).toString('hex')
+    setAuthToken(`passkey_auth:${authToken}`, passkey.user.id, 60_000) // 60s TTL
+
     return {
       success: true,
+      authToken,
       user: {
         id: passkey.user.id,
         email: passkey.user.email,

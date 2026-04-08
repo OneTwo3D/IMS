@@ -1,11 +1,15 @@
-import { NextRequest } from 'next/server'
+import { NextRequest, NextResponse } from 'next/server'
 import { getProductSalesStats, getShipments, getDetails, getInvoiceStats, getRefundStats, getCustomerAging } from '@/app/actions/sales-stats'
 import { getPurchaseProductStats, getReceivedGoods, getPurchaseBills, getSupplierAging, getPurchaseDetails } from '@/app/actions/purchase-stats'
 import { getStockOnHand, getStockMovements, getStockAllocations, getReorderInventory } from '@/app/actions/inventory-stats'
 import { generateForecasts } from '@/app/actions/forecasting'
 import { toCsv, csvResponse } from '@/lib/csv'
+import { auth } from '@/lib/auth'
 
 export async function GET(req: NextRequest) {
+  const session = await auth()
+  if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+
   const type = req.nextUrl.searchParams.get('type') ?? 'products'
   const dateFrom = req.nextUrl.searchParams.get('from') ?? undefined
   const dateTo = req.nextUrl.searchParams.get('to') ?? undefined

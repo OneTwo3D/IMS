@@ -1241,7 +1241,13 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
                 <tbody className="divide-y">
                   {so.lines.map((line) => (
                     <tr key={line.id}>
-                      <td className="px-3 py-2">{line.description}{line.sku ? ` (${line.sku})` : ''}</td>
+                      <td className="px-3 py-2">
+                        {line.productId ? (
+                          <ProductLink productId={line.productId} sku={line.sku} name={line.description} skuClassName="font-mono text-xs text-muted-foreground" />
+                        ) : (
+                          <>{line.description}{line.sku ? ` (${line.sku})` : ''}</>
+                        )}
+                      </td>
                       <td className="px-3 py-2 text-right tabular-nums">{line.qty}</td>
                       <td className="px-3 py-2 text-right font-mono text-xs">{line.unitPriceForeign.toFixed(2)}</td>
                       <td className="px-3 py-2 text-right font-mono text-xs text-destructive">{line.discountAmount > 0 ? `-${line.discountAmount.toFixed(2)}` : '—'}</td>

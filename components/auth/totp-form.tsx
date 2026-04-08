@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { signOut } from 'next-auth/react'
+import { signOut, useSession } from 'next-auth/react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -12,6 +12,7 @@ import { Loader2 } from 'lucide-react'
 
 export function TotpForm() {
   const router = useRouter()
+  const { update } = useSession()
   const [code, setCode] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
@@ -36,7 +37,9 @@ export function TotpForm() {
       return
     }
 
-    // TOTP verified — trigger a session refresh then navigate
+    // Update session with the server-issued TOTP verification token
+    await update({ totpVerified: true, _totpToken: data.totpToken })
+
     router.push('/dashboard')
     router.refresh()
   }

@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { requireAuth } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -352,6 +353,7 @@ function mapLine(l: {
 // ---------------------------------------------------------------------------
 
 export async function getPurchaseOrders(limit = 200): Promise<PoRow[]> {
+  await requireAuth()
   const pos = await db.purchaseOrder.findMany({
     select: PO_SELECT,
     orderBy: { createdAt: 'desc' },
@@ -361,6 +363,7 @@ export async function getPurchaseOrders(limit = 200): Promise<PoRow[]> {
 }
 
 export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
+  await requireAuth()
   const po = await db.purchaseOrder.findUnique({
     where: { id },
     select: {
@@ -594,6 +597,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
 
 export async function createPurchaseOrder(input: CreatePoInput): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
+    await requireAuth()
     if (!input.lines.length) return { success: false, error: 'At least one line is required' }
     // Validate line inputs
     for (const l of input.lines) {
@@ -742,6 +746,7 @@ export async function updatePurchaseOrder(
   input: Partial<CreatePoInput>,
 ): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
+    await requireAuth()
     const existing = await db.purchaseOrder.findUnique({
       where: { id },
       select: { status: true, fxRateToGbp: true },
@@ -833,6 +838,7 @@ export async function advancePoStatus(
   targetStatus: 'PO_SENT' | 'RFQ_SENT',
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     const existing = await db.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
     if (!existing) return { success: false, error: 'PO not found' }
 
@@ -874,6 +880,7 @@ export async function receivePurchaseOrder(
   notes?: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     const po = await db.purchaseOrder.findUnique({
       where: { id },
       select: {
@@ -1073,6 +1080,7 @@ export async function receivePurchaseOrder(
 
 export async function cancelPurchaseOrder(id: string): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     const existing = await db.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
     if (!existing) return { success: false, error: 'PO not found' }
     if (existing.status !== 'DRAFT') return { success: false, error: 'Only DRAFT POs can be cancelled' }
@@ -1107,6 +1115,7 @@ export async function cancelPurchaseOrder(id: string): Promise<{ success: boolea
 export async function getSupplierLastPrices(
   supplierId: string,
 ): Promise<Record<string, { lastUnitCost: number; currency: string; supplierSku: string | null }>> {
+  await requireAuth()
   const rows = await db.supplierProduct.findMany({
     where: { supplierId },
     select: { productId: true, lastUnitCost: true, currency: true, supplierSku: true },
@@ -1135,6 +1144,7 @@ export async function returnPurchaseOrder(
   notes?: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     const po = await db.purchaseOrder.findUnique({
       where: { id },
       select: {
@@ -1314,6 +1324,7 @@ export async function createInvoice(
   input: CreateInvoiceInput,
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     const po = await db.purchaseOrder.findUnique({
       where: { id: poId },
       select: {
@@ -1433,6 +1444,7 @@ export type CreateFreightPoInput = {
 
 export async function createFreightPo(input: CreateFreightPoInput): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
+    await requireAuth()
     if (!input.costLines.length) return { success: false, error: 'Add at least one cost line' }
     if (!input.primaryPoIds.length) return { success: false, error: 'Link to at least one primary PO' }
 
@@ -1520,6 +1532,7 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
 
 /** Get linked freight POs for a primary PO, with their cost lines */
 export async function getLinkedFreightPos(primaryPoId: string) {
+  await requireAuth()
   const links = await db.landedCostLink.findMany({
     where: { primaryPoId },
     select: {
@@ -1575,6 +1588,7 @@ export async function getLinkedFreightPos(primaryPoId: string) {
 
 /** Get all GOODS-type POs for linking (for the freight PO form) */
 export async function getGoodsPosForLinking(): Promise<{ id: string; reference: string; supplierName: string; totalForeign: number; currency: string }[]> {
+  await requireAuth()
   const pos = await db.purchaseOrder.findMany({
     where: { type: 'GOODS', status: { notIn: ['DRAFT', 'CANCELLED'] } },
     select: {
@@ -1603,6 +1617,7 @@ export async function updateFreightPoCosts(
   taxRateValue?: number,
 ): Promise<{ success: boolean; error?: string }> {
   try {
+    await requireAuth()
     const po = await db.purchaseOrder.findUnique({
       where: { id: freightPoId },
       select: { id: true, reference: true, type: true, fxRateToGbp: true },

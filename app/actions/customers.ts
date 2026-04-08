@@ -5,6 +5,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
+import { requireAuth } from '@/lib/auth/server'
 
 export type AddressData = {
   line1?: string
@@ -75,6 +76,7 @@ function mapCustomer(c: {
 }
 
 export async function getCustomers(activeOnly = true): Promise<CustomerRow[]> {
+  await requireAuth()
   const rows = await db.customer.findMany({
     where: activeOnly ? { active: true } : undefined,
     orderBy: [{ lastName: 'asc' }, { firstName: 'asc' }],
@@ -84,6 +86,7 @@ export async function getCustomers(activeOnly = true): Promise<CustomerRow[]> {
 }
 
 export async function getCustomer(id: string): Promise<CustomerRow | null> {
+  await requireAuth()
   const c = await db.customer.findUnique({
     where: { id },
     include: { _count: { select: { salesOrders: true } } },
@@ -92,6 +95,7 @@ export async function getCustomer(id: string): Promise<CustomerRow | null> {
 }
 
 export async function createCustomer(input: CustomerInput): Promise<{ success: boolean; customer?: CustomerRow; error?: string }> {
+  await requireAuth()
   try {
     if (!input.firstName?.trim()) return { success: false, error: 'First name is required' }
     const c = await db.customer.create({
@@ -119,6 +123,7 @@ export async function createCustomer(input: CustomerInput): Promise<{ success: b
 }
 
 export async function updateCustomer(id: string, input: Partial<CustomerInput> & { active?: boolean }): Promise<{ success: boolean; error?: string }> {
+  await requireAuth()
   try {
     await db.customer.update({
       where: { id },
@@ -146,6 +151,7 @@ export async function updateCustomer(id: string, input: Partial<CustomerInput> &
 }
 
 export async function importContactsCsv(formData: FormData): Promise<{ success?: boolean; count?: number; error?: string }> {
+  await requireAuth()
   try {
     const file = formData.get('file') as File
     if (!file) return { error: 'No file' }

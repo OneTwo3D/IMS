@@ -5,6 +5,7 @@ import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
 import { ProductType } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
+import { requireAuth } from '@/lib/auth/server'
 
 export type ImportResult = {
   created: number
@@ -20,6 +21,7 @@ export type ImportResult = {
 const VALID_TYPES = new Set<string>(['SIMPLE', 'VARIABLE', 'VARIANT', 'KIT', 'BOM', 'NON_INVENTORY'])
 
 export async function importProductsCsv(formData: FormData): Promise<ImportResult> {
+  await requireAuth()
   const file = formData.get('file') as File | null
   if (!file) return { created: 0, updated: 0, skipped: 0, errors: ['No file provided'] }
 
@@ -193,6 +195,7 @@ export async function importProductsCsv(formData: FormData): Promise<ImportResul
 // ---------------------------------------------------------------------------
 
 export async function importAdjustmentsCsv(formData: FormData): Promise<ImportResult> {
+  await requireAuth()
   const file = formData.get('file') as File | null
   if (!file) return { created: 0, updated: 0, skipped: 0, errors: ['No file provided'] }
 
@@ -276,6 +279,7 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<ImportRe
 // ---------------------------------------------------------------------------
 
 export async function importTransfersCsv(formData: FormData): Promise<ImportResult> {
+  await requireAuth()
   const file = formData.get('file') as File | null
   if (!file) return { created: 0, updated: 0, skipped: 0, errors: ['No file provided'] }
 
@@ -344,6 +348,7 @@ export async function importTransfersCsv(formData: FormData): Promise<ImportResu
 // ---------------------------------------------------------------------------
 
 export async function importSalesOrdersCsv(formData: FormData): Promise<ImportResult> {
+  await requireAuth()
   const file = formData.get('file') as File | null
   if (!file) return { created: 0, updated: 0, skipped: 0, errors: ['No file provided'] }
 
@@ -420,6 +425,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<ImportRe
 // ---------------------------------------------------------------------------
 
 export async function importPurchaseOrdersCsv(formData: FormData): Promise<ImportResult> {
+  await requireAuth()
   const file = formData.get('file') as File | null
   if (!file) return { created: 0, updated: 0, skipped: 0, errors: ['No file provided'] }
 

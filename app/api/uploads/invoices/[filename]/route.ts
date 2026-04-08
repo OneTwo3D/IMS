@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import { auth } from '@/lib/auth'
 import { readFile } from 'fs/promises'
 import path from 'path'
 
@@ -6,6 +7,9 @@ export async function GET(
   _req: Request,
   { params }: { params: Promise<{ filename: string }> },
 ) {
+  const session = await auth()
+  if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+
   const { filename } = await params
   const safeName = path.basename(filename)
   const filepath = path.join(process.cwd(), 'uploads', 'invoices', safeName)

@@ -21,7 +21,8 @@ export async function GET(
   if (!contentType) return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
   try {
-    const filePath = path.join(process.cwd(), 'public', 'uploads', 'branding', filename)
+    const safeName = path.basename(filename)
+    const filePath = path.join(process.cwd(), 'public', 'uploads', 'branding', safeName)
     const buffer = await readFile(filePath)
     return new NextResponse(buffer, {
       headers: {

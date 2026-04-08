@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
+import { requireAuth } from '@/lib/auth/server'
 
 export type SupplierRow = {
   id: string
@@ -115,6 +116,7 @@ function mapSupplier(s: {
 }
 
 export async function getSuppliers(includeInactive = false): Promise<SupplierRow[]> {
+  await requireAuth()
   const rows = await db.supplier.findMany({
     where: includeInactive ? undefined : { active: true },
     select: SUPPLIER_SELECT,
@@ -124,11 +126,13 @@ export async function getSuppliers(includeInactive = false): Promise<SupplierRow
 }
 
 export async function getSupplier(id: string): Promise<SupplierRow | null> {
+  await requireAuth()
   const s = await db.supplier.findUnique({ where: { id }, select: SUPPLIER_SELECT })
   return s ? mapSupplier(s) : null
 }
 
 export async function createSupplier(input: SupplierInput): Promise<{ success: boolean; supplier?: SupplierRow; error?: string }> {
+  await requireAuth()
   try {
     const s = await db.supplier.create({
       data: {
@@ -161,6 +165,7 @@ export async function createSupplier(input: SupplierInput): Promise<{ success: b
 }
 
 export async function updateSupplier(id: string, input: Partial<SupplierInput> & { active?: boolean }): Promise<{ success: boolean; supplier?: SupplierRow; error?: string }> {
+  await requireAuth()
   try {
     const s = await db.supplier.update({
       where: { id },
@@ -195,6 +200,7 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
 }
 
 export async function importSuppliersCsv(formData: FormData): Promise<{ success?: boolean; count?: number; error?: string }> {
+  await requireAuth()
   try {
     const file = formData.get('file') as File
     if (!file) return { error: 'No file' }

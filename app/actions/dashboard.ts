@@ -2,6 +2,7 @@
 
 import { db } from '@/lib/db'
 import { getSetting } from '@/app/actions/settings'
+import { requireAuth } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -156,6 +157,7 @@ export async function getDashboardData(
   periodLabel: string
   compLabel: string
 }> {
+  await requireAuth()
   const fyStartStr = await getSetting('financial_year_start') ?? '04-06'
   const [fyMonth, fyDay] = fyStartStr.split('-').map(Number)
 

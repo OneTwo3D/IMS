@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { requireAuth } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -33,6 +34,7 @@ export async function adjustStock(
   _prev: AdjustmentFormState,
   formData: FormData
 ): Promise<AdjustmentFormState> {
+  await requireAuth()
   const parsed = adjustSchema.safeParse({
     productId: formData.get('productId'),
     warehouseId: formData.get('warehouseId'),
@@ -220,6 +222,7 @@ export type BulkAdjustFormState = {
 export async function bulkAdjustStock(
   lines: BulkAdjustLine[]
 ): Promise<BulkAdjustFormState> {
+  await requireAuth()
   const valid = lines.filter((l) => l.qty !== 0 && l.productId && l.warehouseId)
 
   if (valid.length === 0) {
@@ -323,6 +326,7 @@ export type AdjustmentMovementRow = {
 }
 
 export async function getAdjustmentHistory(limit = 200): Promise<AdjustmentMovementRow[]> {
+  await requireAuth()
   const rows = await db.stockMovement.findMany({
     where: { type: 'ADJUSTMENT' },
     orderBy: { createdAt: 'desc' },
@@ -369,6 +373,7 @@ export async function updateAdjustmentMovement(
   newSignedQty: number,
   newNote: string | null
 ): Promise<UpdateAdjustmentResult> {
+  await requireAuth()
   if (newSignedQty === 0) {
     return { message: 'Quantity must be non-zero.' }
   }
@@ -454,6 +459,7 @@ export async function fetchWcImage(
   sku: string
 ): Promise<{ imageUrl: string | null; error?: string }> {
   try {
+    await requireAuth()
     const urlSetting = await db.setting.findUnique({ where: { key: 'wc_url' } })
     const keySetting = await db.setting.findUnique({ where: { key: 'wc_consumer_key' } })
     const secretSetting = await db.setting.findUnique({ where: { key: 'wc_consumer_secret' } })
@@ -496,6 +502,7 @@ export async function fetchWcImage(
 // ---------------------------------------------------------------------------
 
 export async function getWarehouses() {
+  await requireAuth()
   return db.warehouse.findMany({
     where: { active: true },
     select: { id: true, code: true, name: true, type: true },
@@ -510,6 +517,7 @@ export async function getWarehouses() {
 export type StockLevelEntry = { total: number; available: number }
 
 export async function getStockLevelMap(): Promise<Record<string, Record<string, StockLevelEntry>>> {
+  await requireAuth()
   const levels = await db.stockLevel.findMany({
     select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
   })
@@ -525,6 +533,7 @@ export async function getStockLevelMap(): Promise<Record<string, Record<string, 
 
 /** Avg COGS per product from FIFO cost layers (weighted avg of remaining stock) */
 export async function getAvgCogsMap(): Promise<Record<string, number>> {
+  await requireAuth()
   const layers = await db.costLayer.findMany({
     where: { remainingQty: { gt: 0 } },
     select: { productId: true, remainingQty: true, unitCostGbp: true },
@@ -555,6 +564,7 @@ export type AdjustmentReasonOption = {
 }
 
 export async function getActiveAdjustmentReasons(): Promise<AdjustmentReasonOption[]> {
+  await requireAuth()
   return db.adjustmentReason.findMany({
     where: { active: true },
     orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
