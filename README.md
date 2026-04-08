@@ -1,6 +1,6 @@
-# OneTwo3D IMS
+# onetwoInventory
 
-Inventory Management System for OneTwo3D — built with Next.js 16, TypeScript, Prisma 7, PostgreSQL, and Shadcn/UI.
+Inventory Management System — built with Next.js 16, TypeScript, Prisma 7, PostgreSQL, and Shadcn/UI.
 
 ## Features
 
@@ -112,4 +112,4 @@ scripts/
 
 ## License
 
-Proprietary — One Two Enterprises Ltd (trading as OneTwo3D).
+Proprietary — One Two Enterprises Ltd (onetwoInventory).

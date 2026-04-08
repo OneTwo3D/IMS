@@ -21,7 +21,7 @@ async function main() {
     update: {},
     create: {
       id: 'default',
-      name: 'OneTwo3D Ltd',
+      name: 'onetwoInventory',
       baseCurrency: 'GBP',
       financialYearStartMonth: 5,
       financialYearStartDay: 1,

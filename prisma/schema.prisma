@@ -1,4 +1,4 @@
-// OneTwo3D IMS — Full Prisma Schema
+// onetwoInventory — Full Prisma Schema
 // Prisma 7 · PostgreSQL · All modules
 
 generator client {

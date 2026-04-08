@@ -17,7 +17,7 @@ export async function GET() {
   const session = await requireAuth()
 
   const secret = new TOTP().generateSecret()
-  const otpAuthUrl = new TOTP({ secret, label: session.user.email, issuer: 'OneTwo3D IMS' }).toURI()
+  const otpAuthUrl = new TOTP({ secret, label: session.user.email, issuer: 'onetwoInventory' }).toURI()
   const qrDataUrl = await QRCode.toDataURL(otpAuthUrl)
 
   return Response.json({ secret, qrDataUrl })

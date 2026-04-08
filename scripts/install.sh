@@ -132,7 +132,7 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
   prompt GIT_REPO_URL  "Git repository URL" "https://github.com/yourorg/one-two-inventory.git"
   prompt GIT_BRANCH    "Branch to deploy"   "main"
 else
-  prompt LOCAL_SOURCE_DIR "Path to local app directory (will be copied)" "/root/ims/onetwo3d-ims"
+  prompt LOCAL_SOURCE_DIR "Path to local app directory (will be copied)" "/root/ims/onetwoinventory"
 fi
 
 echo ""

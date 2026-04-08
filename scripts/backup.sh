@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# OneTwo3D IMS — Database Backup Script
+# onetwoInventory — Database Backup Script
 # =============================================================================
 # Creates a compressed, timestamped PostgreSQL dump.
 # Intended to be run via cron for scheduled backups.
@@ -10,12 +10,12 @@
 #   bash backup.sh /path/to/backups   # backup to custom directory
 #
 # Cron example (daily at 02:00):
-#   0 2 * * * /bin/bash /opt/onetwo3d-ims/scripts/backup.sh >> /var/log/onetwo3d-ims/backup.log 2>&1
+#   0 2 * * * /bin/bash /opt/onetwoinventory/scripts/backup.sh >> /var/log/onetwoinventory/backup.log 2>&1
 # =============================================================================
 
 set -euo pipefail
 
-APP_NAME="onetwo3d-ims"
+APP_NAME="onetwoinventory"
 APP_DIR="/opt/${APP_NAME}"
 BACKUP_DIR="${1:-/var/backups/${APP_NAME}}"
 KEEP_DAYS="${BACKUP_KEEP_DAYS:-30}"  # Delete backups older than this many days

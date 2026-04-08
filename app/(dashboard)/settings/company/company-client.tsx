@@ -476,7 +476,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
             <div className="col-span-2 border-t pt-3 mt-1" />
             <div className="space-y-1.5">
               <Label className="text-xs">From Name</Label>
-              <Input value={em.from_name} onChange={(e) => setEm((p) => ({ ...p, from_name: e.target.value }))} className="h-9" placeholder="OneTwo3D" />
+              <Input value={em.from_name} onChange={(e) => setEm((p) => ({ ...p, from_name: e.target.value }))} className="h-9" placeholder="onetwoInventory" />
             </div>
             <div className="space-y-1.5">
               <Label className="text-xs">From Email</Label>

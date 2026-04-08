@@ -16,7 +16,7 @@ import { auth } from '@/lib/auth'
 import { logActivity } from '@/lib/activity-log'
 import { setAuthToken } from '@/lib/auth/token-store'
 
-const RP_NAME = 'OneTwo3D IMS'
+const RP_NAME = 'onetwoInventory'
 const RP_ID = process.env.NEXT_PUBLIC_APP_URL
   ? new URL(process.env.NEXT_PUBLIC_APP_URL).hostname
   : 'localhost'

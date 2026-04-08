@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# OneTwo3D IMS — Update / Redeploy Script
+# onetwoInventory — Update / Redeploy Script
 # =============================================================================
 # Run as root on the production server to update to the latest version.
 #
@@ -32,7 +32,7 @@ header() {
 
 [[ $EUID -ne 0 ]] && die "Run as root: sudo bash update.sh"
 
-APP_NAME="onetwo3d-ims"
+APP_NAME="onetwoinventory"
 APP_USER="imsapp"
 APP_DIR="/opt/${APP_NAME}"
 LOG_DIR="/var/log/${APP_NAME}"

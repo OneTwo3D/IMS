@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 /**
- * OneTwo3D IMS CLI
+ * onetwoInventory CLI
  * Usage: npm run cli -- <command>
  *
  * Commands:
