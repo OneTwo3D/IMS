@@ -3,7 +3,11 @@
 import { useState } from 'react'
 import { Card } from '@/components/ui/card'
 import { SyncClient } from './sync-client'
+import { XeroClient } from './xero-client'
 import type { WcSyncSettings, TaxMappingRow, StatusMappingRow, SyncLogRow } from '@/app/actions/wc-sync'
+import type { XeroSettings, XeroSyncLogRow } from '@/app/actions/xero-sync'
+
+type XeroAccount = { id: string; code: string | null; name: string; type: string }
 
 type Props = {
   wcSettings: WcSyncSettings
@@ -12,6 +16,11 @@ type Props = {
   wcLogs: SyncLogRow[]
   taxRates: { id: string; name: string }[]
   wcCredentials: { url: string; key: string; secret: string; secretMasked: boolean }
+  xeroSettings: XeroSettings & { secretMasked: boolean }
+  xeroConnected: boolean
+  xeroTenantName?: string
+  xeroAccounts: XeroAccount[]
+  xeroLogs: XeroSyncLogRow[]
 }
 
 type ConnectorDef = {
@@ -54,7 +63,7 @@ const CONNECTORS: ConnectorDef[] = [
     description: 'Sync invoices, COGS journals and purchase invoices',
     logo: '/images/xero-banner.png',
     category: 'accounting',
-    available: false,
+    available: true,
   },
   {
     id: 'quickbooks',
@@ -81,7 +90,7 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 
-export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcLogs, taxRates, wcCredentials }: Props) {
+export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcLogs, taxRates, wcCredentials, xeroSettings, xeroConnected, xeroTenantName, xeroAccounts, xeroLogs }: Props) {
   const [activeConnector, setActiveConnector] = useState<string | null>(null)
 
   const wcConnected = !!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secret
@@ -161,6 +170,30 @@ export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcL
     )
   }
 
+  if (activeConnector === 'xero') {
+    return (
+      <div className="space-y-4">
+        <button type="button" onClick={() => setActiveConnector(null)} className="text-sm text-muted-foreground hover:text-foreground flex items-center gap-1">
+          ← Back to Integrations
+        </button>
+        <div className="flex items-center gap-3 mb-2">
+          {CONNECTOR_LOGOS.xero}
+          <div>
+            <h2 className="text-lg font-semibold">Xero Connector</h2>
+            <p className="text-xs text-muted-foreground">Sync invoices, journals, and bills to Xero</p>
+          </div>
+        </div>
+        <XeroClient
+          settings={xeroSettings}
+          connected={xeroConnected}
+          tenantName={xeroTenantName}
+          accounts={xeroAccounts}
+          logs={xeroLogs}
+        />
+      </div>
+    )
+  }
+
   if (activeConnector === 'woocommerce') {
     return (
       <div className="space-y-4">
@@ -229,6 +262,11 @@ export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcL
             >
               <div className="flex items-center justify-between">
                 {CONNECTOR_LOGOS[c.id]}
+                {c.id === 'xero' && xeroConnected && (
+                  <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
+                    Connected
+                  </span>
+                )}
                 {!c.available && (
                   <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-muted text-muted-foreground">
                     Coming Soon

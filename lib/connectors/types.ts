@@ -96,7 +96,7 @@ export interface ShoppingConnector {
 }
 
 // ---------------------------------------------------------------------------
-// Accounting Connector (future: Xero, QuickBooks)
+// Accounting Connector (Xero, QuickBooks future)
 // ---------------------------------------------------------------------------
 
 export type JournalEntry = {
@@ -114,12 +114,69 @@ export type JournalLine = {
   taxType?: string
 }
 
+export type SyncResult = {
+  success: boolean
+  externalId?: string
+  error?: string
+}
+
+export type InvoiceLine = {
+  itemCode?: string
+  description: string
+  quantity: number
+  unitAmount: number
+  accountCode: string
+  taxType?: string
+  discountRate?: number
+}
+
+export type InvoiceData = {
+  invoiceNumber: string
+  contactName: string
+  contactEmail?: string
+  date: string
+  dueDate?: string
+  currency: string
+  lines: InvoiceLine[]
+  shippingAmount?: number
+  shippingDescription?: string
+  shippingAccountCode?: string
+  discountAmount?: number
+  discountAccountCode?: string
+  reference?: string
+}
+
+export type BillData = {
+  invoiceNumber?: string
+  contactName: string
+  date: string
+  dueDate?: string
+  currency: string
+  lines: InvoiceLine[]
+  reference?: string
+}
+
+export type CreditNoteData = {
+  creditNoteNumber: string
+  contactName: string
+  contactEmail?: string
+  date: string
+  currency: string
+  lines: InvoiceLine[]
+  reference?: string
+}
+
 export interface AccountingConnector {
   readonly id: string
   readonly name: string
 
   isConfigured(): Promise<boolean>
-  postJournalEntry(entry: JournalEntry): Promise<{ success: boolean; externalId?: string; error?: string }>
-  postPurchaseInvoice(data: unknown): Promise<{ success: boolean; externalId?: string; error?: string }>
+  isConnected(): Promise<boolean>
+  postJournalEntry(entry: JournalEntry): Promise<SyncResult>
+  postInvoice(data: InvoiceData): Promise<SyncResult>
+  postBill(data: BillData): Promise<SyncResult>
+  postCreditNote(data: CreditNoteData): Promise<SyncResult>
+  findOrCreateContact(name: string, email?: string, isSupplier?: boolean): Promise<SyncResult>
+  findOrCreateItem(code: string, name: string): Promise<SyncResult>
   syncAccounts(): Promise<{ synced: number; errors: string[] }>
 }

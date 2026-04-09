@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { auth } from '@/lib/auth'
+import { queueXeroSync, getXeroSettings } from '@/app/actions/xero-sync'
 
 async function requireAuth() {
   const session = await auth()
@@ -672,6 +673,44 @@ export async function updateShipmentStatus(
           await generateInvoiceNumber(shipment.orderId)
         }
       }
+    }
+
+    // Queue Xero COGS journal on dispatch: DR COGS / CR Inventory
+    if (targetStatus === 'SHIPPED') {
+      try {
+        const xeroSettings = await getXeroSettings()
+        // Calculate COGS from cost layers for dispatched products
+        let totalCogs = 0
+        for (const line of shipment.lines) {
+          const layers = await db.costLayer.findMany({
+            where: { productId: line.productId, warehouseId: shipment.warehouseId, remainingQty: { gt: 0 } },
+            orderBy: { receivedAt: 'asc' },
+          })
+          let remaining = Number(line.qty)
+          for (const layer of layers) {
+            if (remaining <= 0) break
+            const consume = Math.min(remaining, Number(layer.remainingQty))
+            totalCogs += consume * Number(layer.unitCostGbp)
+            remaining -= consume
+          }
+        }
+        if (totalCogs > 0) {
+          await queueXeroSync({
+            type: 'COGS_JOURNAL',
+            referenceType: 'SalesOrder',
+            referenceId: shipment.orderId,
+            payload: {
+              date: new Date().toISOString().slice(0, 10),
+              reference: `COGS: ${shipment.order.wcOrderNumber}`,
+              narration: `Cost of goods sold — order ${shipment.order.wcOrderNumber}, shipment from ${shipment.warehouse.code}`,
+              lines: [
+                { accountCode: xeroSettings.xero_cogs_account, description: `COGS: ${shipment.order.wcOrderNumber}`, debit: Math.round(totalCogs * 100) / 100 },
+                { accountCode: xeroSettings.xero_inventory_account, description: `COGS: ${shipment.order.wcOrderNumber}`, credit: Math.round(totalCogs * 100) / 100 },
+              ],
+            },
+          })
+        }
+      } catch { /* Xero queue errors should never block the main flow */ }
     }
 
     revalidatePath('/sales')

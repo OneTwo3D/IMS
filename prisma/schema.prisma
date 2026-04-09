@@ -130,6 +130,11 @@ enum XeroSyncType {
   PURCHASE_INVOICE
   COGS_JOURNAL
   INVENTORY_ADJUSTMENT
+  SALES_INVOICE
+  CREDIT_NOTE
+  STOCK_IN_TRANSIT
+  STOCK_RECEIPT
+  COGS_REVERSAL
 }
 
 enum XeroSyncStatus {
@@ -944,6 +949,7 @@ model SalesOrder {
   discountAmount    Decimal    @db.Decimal(18, 4) @default(0) // computed order discount in foreign currency
   invoiceNumber     String?    // generated invoice reference
   invoicedAt        DateTime?
+  xeroInvoiceId     String?    // Xero invoice ID after sync
   paidAt            DateTime?
   notes             String?     // customer-visible notes
   internalNotes     String?     // private/staff notes
@@ -999,6 +1005,7 @@ model SalesOrderRefund {
   id              String     @id @default(cuid())
   orderId         String
   creditNoteNumber String?   // e.g. "CN-2025-00001"
+  xeroCreditNoteId String?   // Xero credit note ID after sync
   wcRefundId      Int?
   returnWarehouseId String?
   reason          String?
@@ -1231,19 +1238,34 @@ model XeroSyncLog {
   id              String        @id @default(cuid())
   type            XeroSyncType
   status          XeroSyncStatus @default(PENDING)
-  referenceType   String        // "PurchaseOrder", "CogsEntry"
+  referenceType   String        // "PurchaseOrder", "CogsEntry", "SalesOrder", etc.
   referenceId     String
   xeroTransactionId String?
   payload         Json?         // what was sent
   errorMessage    String?
+  retryCount      Int           @default(0)
   syncedAt        DateTime?
   createdAt       DateTime      @default(now())
 
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
-  // No FK constraints — referenceId may point to PurchaseOrder or CogsEntry based on referenceType.
+  // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.
 
   @@index([referenceType, referenceId])
+  @@index([status, createdAt])
   @@map("xero_sync_logs")
+}
+
+model XeroToken {
+  id            String   @id @default(cuid())
+  accessToken   String
+  refreshToken  String?
+  expiresAt     DateTime
+  tenantId      String
+  tenantName    String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@map("xero_tokens")
 }
 
 // ---------------------------------------------------------------------------

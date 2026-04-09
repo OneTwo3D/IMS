@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth } from '@/lib/auth/server'
+import { queueXeroSync, getXeroSettings } from '@/app/actions/xero-sync'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -786,6 +787,38 @@ export async function createRefund(
       description: `Created refund for order ${so.wcOrderNumber} — £${totalGbp.toFixed(2)}`,
       metadata: { orderNumber: so.wcOrderNumber, totalGbp, creditNoteNumber, reason },
     })
+
+    // Queue Xero credit note sync
+    try {
+      const xeroSettings = await getXeroSettings()
+      const orderForXero = await db.salesOrder.findUnique({
+        where: { id: orderId },
+        select: { customer: { select: { firstName: true, lastName: true, email: true } }, currency: true },
+      })
+      const cnContactName = orderForXero?.customer
+        ? `${orderForXero.customer.firstName} ${orderForXero.customer.lastName}`.trim()
+        : 'Walk-in Customer'
+      await queueXeroSync({
+        type: 'CREDIT_NOTE',
+        referenceType: 'SalesOrderRefund',
+        referenceId: orderId,
+        payload: {
+          creditNoteNumber,
+          contactName: cnContactName,
+          contactEmail: orderForXero?.customer?.email ?? undefined,
+          date: new Date().toISOString().slice(0, 10),
+          currency: orderForXero?.currency ?? 'GBP',
+          reference: so.wcOrderNumber ?? undefined,
+          lines: refundLines.map(l => ({
+            description: l.description || 'Refund line',
+            quantity: l.qty > 0 ? l.qty : 1,
+            unitAmount: l.qty > 0 ? l.totalGbp / l.qty : l.totalGbp,
+            accountCode: xeroSettings.xero_sales_account,
+          })),
+        },
+      })
+    } catch { /* Xero queue errors should never block the main flow */ }
+
     return { success: true }
   } catch (e) {
     logActivity({
@@ -1040,6 +1073,52 @@ export async function generateInvoiceNumber(id: string): Promise<{ success: bool
       description: `Generated invoice number for order ${result.orderNumber}`,
       metadata: { orderNumber: result.orderNumber, invoiceNumber: result.invoiceNumber },
     })
+
+    // Queue Xero sales invoice sync
+    try {
+      const xeroSettings = await getXeroSettings()
+      const fullOrder = await db.salesOrder.findUnique({
+        where: { id },
+        select: {
+          currency: true, shippingGbp: true, discountAmount: true, invoicedAt: true, fxRateToGbp: true,
+          customer: { select: { firstName: true, lastName: true, email: true } },
+          lines: { select: { sku: true, description: true, qty: true, unitPriceGbp: true, totalGbp: true, discountAmount: true } },
+        },
+      })
+      if (fullOrder) {
+        const customerName = fullOrder.customer
+          ? `${fullOrder.customer.firstName} ${fullOrder.customer.lastName}`.trim()
+          : 'Walk-in Customer'
+        const fxRate = Number(fullOrder.fxRateToGbp) || 1
+        const discountGbp = Number(fullOrder.discountAmount) / fxRate
+        await queueXeroSync({
+          type: 'SALES_INVOICE',
+          referenceType: 'SalesOrder',
+          referenceId: id,
+          payload: {
+            invoiceNumber: result.invoiceNumber,
+            contactName: customerName,
+            contactEmail: fullOrder.customer?.email ?? undefined,
+            date: (fullOrder.invoicedAt ?? new Date()).toISOString().slice(0, 10),
+            currency: fullOrder.currency ?? 'GBP',
+            reference: result.orderNumber ?? undefined,
+            lines: fullOrder.lines.map(l => ({
+              itemCode: l.sku ?? undefined,
+              description: l.description ?? l.sku ?? 'Item',
+              quantity: Number(l.qty),
+              unitAmount: Number(l.unitPriceGbp),
+              accountCode: xeroSettings.xero_sales_account,
+            })),
+            shippingAmount: Number(fullOrder.shippingGbp) > 0 ? Number(fullOrder.shippingGbp) : undefined,
+            shippingDescription: 'Shipping',
+            shippingAccountCode: xeroSettings.xero_shipping_account || undefined,
+            discountAmount: discountGbp > 0 ? Math.round(discountGbp * 100) / 100 : undefined,
+            discountAccountCode: xeroSettings.xero_discount_account || undefined,
+          },
+        })
+      }
+    } catch { /* Xero queue errors should never block the main flow */ }
+
     return { success: true, invoiceNumber: result.invoiceNumber }
   } catch (e) {
     logActivity({
