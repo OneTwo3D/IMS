@@ -1,13 +1,13 @@
 import type { Metadata } from 'next'
 import { getWcSyncSettings, getWcTaxMappings, getWcStatusMappings, getWcSyncLogs, getWcCredentials } from '@/app/actions/wc-sync'
-import { getXeroSettingsMasked, getXeroConnectionStatus, getXeroAccounts, getXeroSyncLogs } from '@/app/actions/xero-sync'
+import { getXeroSettingsMasked, getXeroConnectionStatus, getXeroAccounts, getXeroSyncLogs, getPaymentMethodCombos } from '@/app/actions/xero-sync'
 import { getTaxRates } from '@/app/actions/settings'
 import { SyncDashboard } from './sync-dashboard'
 
 export const metadata: Metadata = { title: 'Integrations' }
 
 export default async function SyncPage() {
-  const [settings, taxMappings, statusMappings, logs, wcCreds, taxRatesRaw, xeroSettings, xeroStatus, xeroAccounts, xeroLogs] = await Promise.all([
+  const [settings, taxMappings, statusMappings, logs, wcCreds, taxRatesRaw, xeroSettings, xeroStatus, xeroAccounts, xeroLogs, paymentMethodCombos] = await Promise.all([
     getWcSyncSettings(),
     getWcTaxMappings(),
     getWcStatusMappings(),
@@ -18,6 +18,7 @@ export default async function SyncPage() {
     getXeroConnectionStatus(),
     getXeroAccounts(),
     getXeroSyncLogs(50),
+    getPaymentMethodCombos(),
   ])
 
   const taxRates = taxRatesRaw.map((r: { id: string; name: string }) => ({ id: r.id, name: r.name }))
@@ -42,6 +43,7 @@ export default async function SyncPage() {
         xeroTenantName={xeroStatus.tenantName}
         xeroAccounts={xeroAccounts}
         xeroLogs={xeroLogs}
+        paymentMethodCombos={paymentMethodCombos}
       />
     </div>
   )

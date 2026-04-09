@@ -2,7 +2,7 @@
 
 import { useState, useTransition, useEffect } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, XCircle, Clock } from 'lucide-react'
+import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, XCircle, Clock, Plus, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -16,12 +16,15 @@ import {
 
 type XeroAccount = { id: string; code: string | null; name: string; type: string }
 
+type PaymentMapRow = { method: string; currency: string; accountCode: string }
+
 type Props = {
   settings: XeroSettings & { secretMasked: boolean }
   connected: boolean
   tenantName?: string
   accounts: XeroAccount[]
   logs: XeroSyncLogRow[]
+  paymentMethodCombos: Array<{ paymentMethod: string; currency: string }>
 }
 
 const ACCOUNT_FIELDS: { key: keyof XeroSettings; label: string; description: string }[] = [
@@ -51,7 +54,25 @@ const STATUS_BADGE: Record<string, { variant: 'default' | 'secondary' | 'outline
   FAILED: { variant: 'destructive', label: 'Failed' },
 }
 
-export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs }: Props) {
+function parsePaymentMap(json: string): PaymentMapRow[] {
+  try {
+    const map = JSON.parse(json) as Record<string, string>
+    return Object.entries(map).map(([key, accountCode]) => {
+      const [method, currency] = key.split(':')
+      return { method, currency, accountCode }
+    })
+  } catch { return [] }
+}
+
+function serializePaymentMap(rows: PaymentMapRow[]): string {
+  const map: Record<string, string> = {}
+  for (const r of rows) {
+    if (r.method && r.accountCode) map[`${r.method}:${r.currency || '*'}`] = r.accountCode
+  }
+  return JSON.stringify(map)
+}
+
+export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
@@ -65,6 +86,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [accountsMsg, setAccountsMsg] = useState<string | null>(null)
   const [connecting, setConnecting] = useState(false)
   const [syncingAccounts, setSyncingAccounts] = useState(false)
+  const [paymentMapRows, setPaymentMapRows] = useState<PaymentMapRow[]>(() => parsePaymentMap(init.xero_payment_account_map))
   const searchParams = useSearchParams()
 
   // Handle OAuth redirect query params
@@ -112,7 +134,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
         xero_unearned_revenue_account: s.xero_unearned_revenue_account,
         xero_daily_batch_enabled: s.xero_daily_batch_enabled,
         xero_payment_polling_enabled: s.xero_payment_polling_enabled,
-        xero_payment_account_map: s.xero_payment_account_map,
+        xero_payment_account_map: serializePaymentMap(paymentMapRows),
         order_number_prefix: s.order_number_prefix,
       })
       setMsg(result.success ? 'Settings saved.' : `Error: ${result.error}`)
@@ -336,6 +358,151 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
             <p className="text-[11px] text-muted-foreground">Poll Xero every 15 minutes for paid invoices (manual orders) and paid bills (purchase orders).</p>
           </div>
         </label>
+      </Card>
+
+      {/* Payment Account Mapping */}
+      <Card className="p-6 space-y-4">
+        <div>
+          <h3 className="text-base font-semibold">Payment Account Mapping</h3>
+          <p className="text-xs text-muted-foreground mt-0.5">Map payment method + currency combinations to Xero bank accounts for automatic payment registration.</p>
+        </div>
+        <div className="rounded-md border overflow-hidden">
+          <table className="w-full text-sm">
+            <thead className="bg-muted/50 border-b">
+              <tr>
+                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Payment Method</th>
+                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Currency</th>
+                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Xero Bank Account</th>
+                <th className="px-3 py-2 w-10" />
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {paymentMapRows.map((row, i) => (
+                <tr key={i}>
+                  <td className="px-3 py-1.5">
+                    <Input
+                      value={row.method}
+                      onChange={e => {
+                        const updated = [...paymentMapRows]
+                        updated[i] = { ...row, method: e.target.value }
+                        setPaymentMapRows(updated)
+                      }}
+                      placeholder="e.g. stripe"
+                      className="h-8 text-xs"
+                    />
+                  </td>
+                  <td className="px-3 py-1.5">
+                    <Input
+                      value={row.currency}
+                      onChange={e => {
+                        const updated = [...paymentMapRows]
+                        updated[i] = { ...row, currency: e.target.value }
+                        setPaymentMapRows(updated)
+                      }}
+                      placeholder="e.g. GBP or *"
+                      className="h-8 text-xs w-24"
+                    />
+                  </td>
+                  <td className="px-3 py-1.5">
+                    {accounts.length > 0 ? (
+                      <select
+                        className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        value={row.accountCode}
+                        onChange={e => {
+                          const updated = [...paymentMapRows]
+                          updated[i] = { ...row, accountCode: e.target.value }
+                          setPaymentMapRows(updated)
+                        }}
+                      >
+                        <option value="">— Select —</option>
+                        {accounts.filter(a => a.type === 'BANK').map(a => (
+                          <option key={a.id} value={a.code ?? ''}>
+                            {a.code} — {a.name}
+                          </option>
+                        ))}
+                        {/* Show all accounts if no BANK type found */}
+                        {accounts.filter(a => a.type === 'BANK').length === 0 && accounts.map(a => (
+                          <option key={a.id} value={a.code ?? ''}>
+                            {a.code} — {a.name}
+                          </option>
+                        ))}
+                      </select>
+                    ) : (
+                      <Input
+                        value={row.accountCode}
+                        onChange={e => {
+                          const updated = [...paymentMapRows]
+                          updated[i] = { ...row, accountCode: e.target.value }
+                          setPaymentMapRows(updated)
+                        }}
+                        placeholder="Account code"
+                        className="h-8 text-xs"
+                      />
+                    )}
+                  </td>
+                  <td className="px-3 py-1.5">
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      className="h-8 w-8 p-0"
+                      onClick={() => setPaymentMapRows(paymentMapRows.filter((_, j) => j !== i))}
+                    >
+                      <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
+                    </Button>
+                  </td>
+                </tr>
+              ))}
+              {paymentMapRows.length === 0 && (
+                <tr>
+                  <td colSpan={4} className="px-3 py-4 text-center text-xs text-muted-foreground">No mappings configured. Add a row or use the pre-populate button below.</td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+        <div className="flex items-center gap-3">
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={() => setPaymentMapRows([...paymentMapRows, { method: '', currency: '', accountCode: '' }])}
+          >
+            <Plus className="h-3 w-3 mr-1" />
+            Add Row
+          </Button>
+          {paymentMethodCombos.length > 0 && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => {
+                const existing = new Set(paymentMapRows.map(r => `${r.method}:${r.currency}`))
+                const newRows = paymentMethodCombos
+                  .filter(c => !existing.has(`${c.paymentMethod}:${c.currency}`))
+                  .map(c => ({ method: c.paymentMethod, currency: c.currency, accountCode: '' }))
+                if (newRows.length > 0) setPaymentMapRows([...paymentMapRows, ...newRows])
+              }}
+            >
+              Pre-populate from Orders
+            </Button>
+          )}
+        </div>
+      </Card>
+
+      {/* Order Settings */}
+      <Card className="p-6 space-y-4">
+        <div>
+          <h3 className="text-base font-semibold">Order Settings</h3>
+          <p className="text-xs text-muted-foreground mt-0.5">Configure how order numbers are generated and displayed.</p>
+        </div>
+        <div className="space-y-1.5 max-w-xs">
+          <Label htmlFor="order_number_prefix">Order Number Prefix</Label>
+          <Input
+            id="order_number_prefix"
+            value={s.order_number_prefix}
+            onChange={e => handleField('order_number_prefix', e.target.value)}
+            placeholder="e.g. OT-"
+          />
+          <p className="text-[11px] text-muted-foreground">Prefix added to WooCommerce order numbers in the IMS. Leave empty for no prefix.</p>
+        </div>
       </Card>
 
       {/* Sync Settings */}
