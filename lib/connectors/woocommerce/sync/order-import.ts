@@ -37,7 +37,7 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
 
     // Tax
     const primaryTaxClass = wcOrder.line_items[0]?.tax_class ?? 'standard'
-    const { taxRateName, taxRateValue } = await resolveWcTaxRate(primaryTaxClass)
+    const { taxRateName, taxRateValue, xeroTaxType } = await resolveWcTaxRate(primaryTaxClass)
     const pricesIncludeVat = wcOrder.prices_include_tax
 
     // Line items
@@ -165,6 +165,7 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
             quantity: l.qty,
             unitAmount: Math.round((l.unitPriceForeign / fxRateNum) * 10000) / 10000,
             accountCode: xeroSettings.xero_sales_account,
+            taxType: xeroTaxType ?? undefined,
           })),
           shippingAmount: shippingForeign > 0 ? Math.round((shippingForeign / fxRateNum) * 10000) / 10000 : undefined,
           shippingDescription: 'Shipping',

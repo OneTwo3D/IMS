@@ -164,27 +164,28 @@ export function mapWcShipping(order: WcFullOrder): {
 
 export async function resolveWcTaxRate(
   taxClass: string,
-): Promise<{ taxRateId: string | null; taxRateName: string | null; taxRateValue: number }> {
+): Promise<{ taxRateId: string | null; taxRateName: string | null; taxRateValue: number; xeroTaxType: string | null }> {
   const wcClass = taxClass || 'standard'
   const mapping = await db.wcTaxMapping.findUnique({
     where: { wcTaxClass: wcClass },
-    include: { taxRate: { select: { id: true, name: true, rate: true } } },
+    include: { taxRate: { select: { id: true, name: true, rate: true, xeroTaxType: true } } },
   })
   if (!mapping) {
     // Fallback: use default tax rate
     const defaultRate = await db.taxRate.findFirst({
       where: { isDefault: true, active: true },
-      select: { id: true, name: true, rate: true },
+      select: { id: true, name: true, rate: true, xeroTaxType: true },
     })
     if (defaultRate) {
-      return { taxRateId: defaultRate.id, taxRateName: defaultRate.name, taxRateValue: Number(defaultRate.rate) }
+      return { taxRateId: defaultRate.id, taxRateName: defaultRate.name, taxRateValue: Number(defaultRate.rate), xeroTaxType: defaultRate.xeroTaxType }
     }
-    return { taxRateId: null, taxRateName: null, taxRateValue: 0 }
+    return { taxRateId: null, taxRateName: null, taxRateValue: 0, xeroTaxType: null }
   }
   return {
     taxRateId: mapping.taxRate.id,
     taxRateName: mapping.taxRate.name,
     taxRateValue: Number(mapping.taxRate.rate),
+    xeroTaxType: mapping.taxRate.xeroTaxType,
   }
 }
 

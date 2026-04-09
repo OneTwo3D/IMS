@@ -1443,31 +1443,33 @@ export async function createInvoice(
     // Queue Xero purchase invoice (bill) sync
     try {
       const xeroSettings = await getXeroSettings()
-      const supplier = await db.purchaseOrder.findUnique({
+      const supplierData = await db.purchaseOrder.findUnique({
         where: { id: poId },
-        select: { supplier: { select: { name: true } }, currency: true },
+        select: { supplier: { select: { name: true, taxRate: { select: { xeroTaxType: true } } } }, currency: true },
       })
       const poLines = await db.purchaseOrderLine.findMany({
         where: { id: { in: linesWithQty.map(l => l.poLineId) } },
         select: { product: { select: { sku: true, name: true } } },
       })
       const poLineMap = new Map(poLines.map(l => [l.product?.sku, l.product?.name]))
+      const billTaxType = supplierData?.supplier?.taxRate?.xeroTaxType ?? undefined
       await queueXeroSync({
         type: 'PURCHASE_INVOICE',
         referenceType: 'PurchaseOrder',
         referenceId: poId,
         payload: {
           invoiceNumber: po.reference,  // PO reference becomes Xero bill number
-          contactName: supplier?.supplier?.name ?? 'Unknown Supplier',
+          contactName: supplierData?.supplier?.name ?? 'Unknown Supplier',
           date: input.invoiceDate,
           dueDate: input.dueDate ?? undefined,
-          currency: supplier?.currency ?? 'GBP',
+          currency: supplierData?.currency ?? 'GBP',
           reference: input.invoiceNumber ?? undefined,  // Supplier invoice number as Xero reference
           lines: linesWithQty.map(l => ({
             description: `PO ${po.reference} line`,
             quantity: l.qtyBilled,
             unitAmount: Math.round((l.unitCostForeign / fxRate) * 10000) / 10000,
             accountCode: xeroSettings.xero_purchase_account,
+            taxType: billTaxType,
           })),
           supplierInvoicePath: input.supplierInvoiceUrl ?? undefined,
         },

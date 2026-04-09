@@ -502,6 +502,10 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     try {
       const xeroSettings = await getXeroSettings()
       const discountGbp = Math.round(((input.orderDiscountForeign ?? 0) / fxRate) * 100) / 100
+      // Look up Xero tax type from tax rate name
+      const taxRateForXero = input.taxRateName
+        ? await db.taxRate.findFirst({ where: { name: input.taxRateName, active: true }, select: { xeroTaxType: true } })
+        : null
       await queueXeroSync({
         type: 'SALES_INVOICE',
         referenceType: 'SalesOrder',
@@ -519,6 +523,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
             quantity: l.qty,
             unitAmount: Number(l.unitPriceGbp),
             accountCode: xeroSettings.xero_sales_account,
+            taxType: taxRateForXero?.xeroTaxType ?? undefined,
           })),
           shippingAmount: totalShippingGbp > 0 ? totalShippingGbp : undefined,
           shippingDescription: 'Shipping',
@@ -844,11 +849,15 @@ export async function createRefund(
       const xeroSettings = await getXeroSettings()
       const orderForXero = await db.salesOrder.findUnique({
         where: { id: orderId },
-        select: { customer: { select: { firstName: true, lastName: true, email: true } }, currency: true },
+        select: { customer: { select: { firstName: true, lastName: true, email: true } }, currency: true, taxRateName: true },
       })
       const cnContactName = orderForXero?.customer
         ? `${orderForXero.customer.firstName} ${orderForXero.customer.lastName}`.trim()
         : 'Walk-in Customer'
+      // Look up Xero tax type from the order's tax rate
+      const cnTaxRate = orderForXero?.taxRateName
+        ? await db.taxRate.findFirst({ where: { name: orderForXero.taxRateName, active: true }, select: { xeroTaxType: true } })
+        : null
       await queueXeroSync({
         type: 'CREDIT_NOTE',
         referenceType: 'SalesOrderRefund',
@@ -865,6 +874,7 @@ export async function createRefund(
             quantity: l.qty > 0 ? l.qty : 1,
             unitAmount: l.qty > 0 ? l.totalGbp / l.qty : l.totalGbp,
             accountCode: xeroSettings.xero_sales_account,
+            taxType: cnTaxRate?.xeroTaxType ?? undefined,
           })),
         },
       })
