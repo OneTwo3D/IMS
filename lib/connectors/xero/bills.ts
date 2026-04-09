@@ -19,6 +19,7 @@ type XeroInvoiceResponse = {
  */
 export async function pushPurchaseBill(
   data: BillData,
+  status: string = 'AUTHORISED',
 ): Promise<{ success: boolean; invoiceId?: string; error?: string }> {
   // Find or create the supplier contact
   const contactResult = await findOrCreateContact(data.contactName, undefined, true)
@@ -43,7 +44,7 @@ export async function pushPurchaseBill(
     Type: 'ACCPAY',
     Contact: { ContactID: contactResult.contactId },
     LineItems: lineItems,
-    Status: 'AUTHORISED',
+    Status: status,
     CurrencyCode: data.currency,
     Date: data.date,
   }

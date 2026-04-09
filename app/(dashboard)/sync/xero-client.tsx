@@ -31,6 +31,7 @@ const ACCOUNT_FIELDS: { key: keyof XeroSettings; label: string; description: str
   { key: 'xero_purchase_account', label: 'Purchases', description: 'Default account for purchase bills' },
   { key: 'xero_transit_account', label: 'Stock in Transit', description: 'Goods ordered but not yet received' },
   { key: 'xero_inventory_account', label: 'Inventory Asset', description: 'Stock on hand value' },
+  { key: 'xero_allocated_inventory_account', label: 'Allocated Inventory', description: 'Stock allocated to paid orders awaiting dispatch' },
   { key: 'xero_cogs_account', label: 'Cost of Goods Sold', description: 'COGS booked on dispatch' },
 ]
 
@@ -42,6 +43,7 @@ const SYNC_TYPE_TOGGLES: { key: keyof XeroSettings; label: string; description: 
   { key: 'xero_sync_cogs_journal', label: 'COGS Journals', description: 'Journal: DR COGS / CR Inventory on dispatch' },
   { key: 'xero_sync_cogs_reversal', label: 'COGS Reversals', description: 'Reverse COGS on stock returns' },
   { key: 'xero_sync_inventory_adjustment', label: 'Inventory Adjustments', description: 'Journal for manual stock adjustments' },
+  { key: 'xero_sync_stock_allocation', label: 'Stock Allocation', description: 'Journal: DR Allocated Inventory / CR Inventory when stock is allocated to a paid order' },
 ]
 
 const STATUS_BADGE: Record<string, { variant: 'default' | 'secondary' | 'outline' | 'destructive'; label: string }> = {
@@ -98,12 +100,14 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
         xero_sync_cogs_reversal: s.xero_sync_cogs_reversal,
         xero_sync_stock_receipt: s.xero_sync_stock_receipt,
         xero_sync_inventory_adjustment: s.xero_sync_inventory_adjustment,
+        xero_sync_stock_allocation: s.xero_sync_stock_allocation,
         xero_sync_attach_pdf: s.xero_sync_attach_pdf,
         xero_sales_account: s.xero_sales_account,
         xero_shipping_account: s.xero_shipping_account,
         xero_discount_account: s.xero_discount_account,
         xero_cogs_account: s.xero_cogs_account,
         xero_inventory_account: s.xero_inventory_account,
+        xero_allocated_inventory_account: s.xero_allocated_inventory_account,
         xero_transit_account: s.xero_transit_account,
         xero_purchase_account: s.xero_purchase_account,
       })
@@ -264,20 +268,22 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
           <h3 className="text-base font-semibold">Transaction Types</h3>
           <p className="text-xs text-muted-foreground mt-0.5">Choose which documents and transactions are synced to Xero.</p>
         </div>
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-2 gap-4">
           {SYNC_TYPE_TOGGLES.map(t => (
-            <label key={t.key} className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
-              <input
-                type="checkbox"
-                checked={s[t.key] === 'true'}
-                onChange={e => handleField(t.key, e.target.checked ? 'true' : 'false')}
-                className="h-4 w-4 accent-primary mt-0.5"
-              />
-              <div>
-                <span className="text-sm font-medium">{t.label}</span>
-                <p className="text-[11px] text-muted-foreground">{t.description}</p>
-              </div>
-            </label>
+            <div key={t.key} className="space-y-1.5">
+              <Label htmlFor={t.key}>{t.label}</Label>
+              <select
+                id={t.key}
+                className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                value={s[t.key]}
+                onChange={e => handleField(t.key, e.target.value)}
+              >
+                <option value="off">Off</option>
+                <option value="draft">Draft</option>
+                <option value="submitted">Submitted</option>
+              </select>
+              <p className="text-[11px] text-muted-foreground">{t.description}</p>
+            </div>
           ))}
         </div>
         <div className="border-t pt-3">

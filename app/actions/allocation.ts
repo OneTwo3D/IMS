@@ -297,6 +297,43 @@ export async function autoAllocateOrder(orderId: string): Promise<{ success: boo
       await db.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
     }
 
+    // Queue Xero stock allocation journal: DR Allocated Inventory / CR Inventory
+    if (allocations.length > 0) {
+      try {
+        const xeroSettings = await getXeroSettings()
+        let totalValue = 0
+        for (const alloc of allocations) {
+          const layers = await db.costLayer.findMany({
+            where: { productId: alloc.productId, warehouseId: alloc.warehouseId, remainingQty: { gt: 0 } },
+            orderBy: { receivedAt: 'asc' },
+          })
+          let remaining = alloc.qty
+          for (const layer of layers) {
+            if (remaining <= 0) break
+            const consume = Math.min(remaining, Number(layer.remainingQty))
+            totalValue += consume * Number(layer.unitCostGbp)
+            remaining -= consume
+          }
+        }
+        if (totalValue > 0 && xeroSettings.xero_allocated_inventory_account && xeroSettings.xero_inventory_account) {
+          await queueXeroSync({
+            type: 'STOCK_ALLOCATION',
+            referenceType: 'SalesOrder',
+            referenceId: orderId,
+            payload: {
+              date: new Date().toISOString().slice(0, 10),
+              reference: `Allocation: ${so.wcOrderNumber}`,
+              narration: `Stock allocated to order ${so.wcOrderNumber} — ${allocations.length} line(s)`,
+              lines: [
+                { accountCode: xeroSettings.xero_allocated_inventory_account, description: `Stock allocation: ${so.wcOrderNumber}`, debit: Math.round(totalValue * 100) / 100 },
+                { accountCode: xeroSettings.xero_inventory_account, description: `Stock allocation: ${so.wcOrderNumber}`, credit: Math.round(totalValue * 100) / 100 },
+              ],
+            },
+          })
+        }
+      } catch { /* Xero queue errors should never block the main flow */ }
+    }
+
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
     logActivity({
@@ -462,6 +499,43 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
       data: { reservedQty: 0 },
     })
     await db.orderAllocation.deleteMany({ where: { orderId } })
+
+    // Queue Xero reversal journal: DR Inventory / CR Allocated Inventory
+    if (allocs.length > 0) {
+      try {
+        const xeroSettings = await getXeroSettings()
+        let totalValue = 0
+        for (const alloc of allocs) {
+          const layers = await db.costLayer.findMany({
+            where: { productId: alloc.productId, warehouseId: alloc.warehouseId, remainingQty: { gt: 0 } },
+            orderBy: { receivedAt: 'asc' },
+          })
+          let remaining = Number(alloc.qty)
+          for (const layer of layers) {
+            if (remaining <= 0) break
+            const consume = Math.min(remaining, Number(layer.remainingQty))
+            totalValue += consume * Number(layer.unitCostGbp)
+            remaining -= consume
+          }
+        }
+        if (totalValue > 0 && xeroSettings.xero_allocated_inventory_account && xeroSettings.xero_inventory_account) {
+          await queueXeroSync({
+            type: 'STOCK_ALLOCATION',
+            referenceType: 'SalesOrder',
+            referenceId: orderId,
+            payload: {
+              date: new Date().toISOString().slice(0, 10),
+              reference: `Deallocation: ${so.wcOrderNumber}`,
+              narration: `Stock deallocated from order ${so.wcOrderNumber}`,
+              lines: [
+                { accountCode: xeroSettings.xero_inventory_account, description: `Stock deallocation: ${so.wcOrderNumber}`, debit: Math.round(totalValue * 100) / 100 },
+                { accountCode: xeroSettings.xero_allocated_inventory_account, description: `Stock deallocation: ${so.wcOrderNumber}`, credit: Math.round(totalValue * 100) / 100 },
+              ],
+            },
+          })
+        }
+      } catch { /* Xero queue errors should never block the main flow */ }
+    }
 
     // Revert to PROCESSING
     if (so.status === 'ALLOCATED') {
@@ -705,7 +779,7 @@ export async function updateShipmentStatus(
               narration: `Cost of goods sold — order ${shipment.order.wcOrderNumber}, shipment from ${shipment.warehouse.code}`,
               lines: [
                 { accountCode: xeroSettings.xero_cogs_account, description: `COGS: ${shipment.order.wcOrderNumber}`, debit: Math.round(totalCogs * 100) / 100 },
-                { accountCode: xeroSettings.xero_inventory_account, description: `COGS: ${shipment.order.wcOrderNumber}`, credit: Math.round(totalCogs * 100) / 100 },
+                { accountCode: xeroSettings.xero_allocated_inventory_account || xeroSettings.xero_inventory_account, description: `COGS: ${shipment.order.wcOrderNumber}`, credit: Math.round(totalCogs * 100) / 100 },
               ],
             },
           })

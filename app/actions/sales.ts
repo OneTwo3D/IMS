@@ -819,6 +819,91 @@ export async function createRefund(
       })
     } catch { /* Xero queue errors should never block the main flow */ }
 
+    // Queue Xero COGS reversal or allocation reversal based on shipment state
+    try {
+      const xeroSettings = await getXeroSettings()
+      const productRefundLines = refundLines.filter(l => l.productId && l.qty > 0)
+      if (productRefundLines.length > 0) {
+        // Check if goods were shipped (COGS already booked) or only allocated
+        const shipments = await db.shipment.findMany({
+          where: { orderId, status: 'SHIPPED' },
+          select: { warehouseId: true, lines: { select: { productId: true, qty: true } } },
+        })
+        const shippedQty = new Map<string, { qty: number; warehouseId: string }>()
+        for (const s of shipments) {
+          for (const sl of s.lines) {
+            const existing = shippedQty.get(sl.productId) ?? { qty: 0, warehouseId: s.warehouseId }
+            existing.qty += Number(sl.qty)
+            shippedQty.set(sl.productId, existing)
+          }
+        }
+
+        let cogsReversalValue = 0
+        let allocationReversalValue = 0
+
+        for (const l of productRefundLines) {
+          const shipped = shippedQty.get(l.productId!)
+          // Calculate value from cost layers
+          const warehouseId = shipped?.warehouseId ?? returnWarehouseId
+          if (!warehouseId) continue
+          const layers = await db.costLayer.findMany({
+            where: { productId: l.productId!, warehouseId, remainingQty: { gt: 0 } },
+            orderBy: { receivedAt: 'asc' },
+          })
+          let remaining = l.qty
+          let lineValue = 0
+          for (const layer of layers) {
+            if (remaining <= 0) break
+            const consume = Math.min(remaining, Number(layer.remainingQty))
+            lineValue += consume * Number(layer.unitCostGbp)
+            remaining -= consume
+          }
+
+          if (shipped && shipped.qty >= l.qty) {
+            // Goods were shipped → reverse COGS: DR Inventory / CR COGS
+            cogsReversalValue += lineValue
+          } else {
+            // Goods were allocated but not shipped → reverse allocation: DR Inventory / CR Allocated Inventory
+            allocationReversalValue += lineValue
+          }
+        }
+
+        if (cogsReversalValue > 0 && xeroSettings.xero_cogs_account && xeroSettings.xero_inventory_account) {
+          await queueXeroSync({
+            type: 'COGS_REVERSAL',
+            referenceType: 'SalesOrder',
+            referenceId: orderId,
+            payload: {
+              date: new Date().toISOString().slice(0, 10),
+              reference: `COGS reversal: ${so.wcOrderNumber}`,
+              narration: `COGS reversal — refund on order ${so.wcOrderNumber}`,
+              lines: [
+                { accountCode: xeroSettings.xero_inventory_account, description: `COGS reversal: ${so.wcOrderNumber}`, debit: Math.round(cogsReversalValue * 100) / 100 },
+                { accountCode: xeroSettings.xero_cogs_account, description: `COGS reversal: ${so.wcOrderNumber}`, credit: Math.round(cogsReversalValue * 100) / 100 },
+              ],
+            },
+          })
+        }
+
+        if (allocationReversalValue > 0 && xeroSettings.xero_allocated_inventory_account && xeroSettings.xero_inventory_account) {
+          await queueXeroSync({
+            type: 'STOCK_ALLOCATION',
+            referenceType: 'SalesOrder',
+            referenceId: orderId,
+            payload: {
+              date: new Date().toISOString().slice(0, 10),
+              reference: `Allocation reversal: ${so.wcOrderNumber}`,
+              narration: `Stock allocation reversed — refund on order ${so.wcOrderNumber}`,
+              lines: [
+                { accountCode: xeroSettings.xero_inventory_account, description: `Allocation reversal: ${so.wcOrderNumber}`, debit: Math.round(allocationReversalValue * 100) / 100 },
+                { accountCode: xeroSettings.xero_allocated_inventory_account, description: `Allocation reversal: ${so.wcOrderNumber}`, credit: Math.round(allocationReversalValue * 100) / 100 },
+              ],
+            },
+          })
+        }
+      }
+    } catch { /* Xero queue errors should never block the main flow */ }
+
     return { success: true }
   } catch (e) {
     logActivity({

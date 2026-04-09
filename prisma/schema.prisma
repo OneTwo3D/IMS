@@ -135,6 +135,7 @@ enum XeroSyncType {
   STOCK_IN_TRANSIT
   STOCK_RECEIPT
   COGS_REVERSAL
+  STOCK_ALLOCATION
 }
 
 enum XeroSyncStatus {

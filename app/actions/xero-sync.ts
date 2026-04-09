@@ -22,7 +22,7 @@ export type XeroSettings = {
   xero_client_id: string
   xero_client_secret: string
   xero_sync_enabled: string
-  // Per-transaction-type sync toggles
+  // Per-transaction-type posting mode: 'off' | 'draft' | 'submitted'
   xero_sync_sales_invoice: string
   xero_sync_credit_note: string
   xero_sync_purchase_invoice: string
@@ -31,12 +31,14 @@ export type XeroSettings = {
   xero_sync_stock_receipt: string
   xero_sync_inventory_adjustment: string
   xero_sync_attach_pdf: string
+  xero_sync_stock_allocation: string
   // Account mappings
   xero_sales_account: string
   xero_shipping_account: string
   xero_discount_account: string
   xero_cogs_account: string
   xero_inventory_account: string
+  xero_allocated_inventory_account: string
   xero_transit_account: string
   xero_purchase_account: string
 }
@@ -45,29 +47,32 @@ const XERO_SETTING_KEYS = [
   'xero_client_id', 'xero_client_secret', 'xero_sync_enabled',
   'xero_sync_sales_invoice', 'xero_sync_credit_note', 'xero_sync_purchase_invoice',
   'xero_sync_cogs_journal', 'xero_sync_cogs_reversal',
-  'xero_sync_stock_receipt', 'xero_sync_inventory_adjustment', 'xero_sync_attach_pdf',
+  'xero_sync_stock_receipt', 'xero_sync_inventory_adjustment', 'xero_sync_stock_allocation',
+  'xero_sync_attach_pdf',
   'xero_sales_account', 'xero_shipping_account', 'xero_discount_account',
-  'xero_cogs_account', 'xero_inventory_account', 'xero_transit_account',
-  'xero_purchase_account',
+  'xero_cogs_account', 'xero_inventory_account', 'xero_allocated_inventory_account',
+  'xero_transit_account', 'xero_purchase_account',
 ]
 
 const XERO_DEFAULTS: XeroSettings = {
   xero_client_id: '',
   xero_client_secret: '',
   xero_sync_enabled: 'false',
-  xero_sync_sales_invoice: 'true',
-  xero_sync_credit_note: 'true',
-  xero_sync_purchase_invoice: 'true',
-  xero_sync_cogs_journal: 'true',
-  xero_sync_cogs_reversal: 'true',
-  xero_sync_stock_receipt: 'true',
-  xero_sync_inventory_adjustment: 'true',
+  xero_sync_sales_invoice: 'submitted',
+  xero_sync_credit_note: 'submitted',
+  xero_sync_purchase_invoice: 'submitted',
+  xero_sync_cogs_journal: 'submitted',
+  xero_sync_cogs_reversal: 'submitted',
+  xero_sync_stock_receipt: 'submitted',
+  xero_sync_inventory_adjustment: 'submitted',
+  xero_sync_stock_allocation: 'submitted',
   xero_sync_attach_pdf: 'true',
   xero_sales_account: '',
   xero_shipping_account: '',
   xero_discount_account: '',
   xero_cogs_account: '',
   xero_inventory_account: '',
+  xero_allocated_inventory_account: '',
   xero_transit_account: '',
   xero_purchase_account: '',
 }
@@ -81,6 +86,7 @@ const SYNC_TYPE_SETTING: Record<string, keyof XeroSettings> = {
   COGS_REVERSAL: 'xero_sync_cogs_reversal',
   STOCK_RECEIPT: 'xero_sync_stock_receipt',
   INVENTORY_ADJUSTMENT: 'xero_sync_inventory_adjustment',
+  STOCK_ALLOCATION: 'xero_sync_stock_allocation',
 }
 
 export async function getXeroSettings(): Promise<XeroSettings> {
@@ -297,7 +303,7 @@ export async function triggerXeroSync(): Promise<{ success: boolean; result?: un
 // ---------------------------------------------------------------------------
 
 export async function queueXeroSync(params: {
-  type: 'SALES_INVOICE' | 'CREDIT_NOTE' | 'COGS_REVERSAL' | 'STOCK_IN_TRANSIT' | 'STOCK_RECEIPT' | 'PURCHASE_INVOICE' | 'COGS_JOURNAL' | 'INVENTORY_ADJUSTMENT'
+  type: 'SALES_INVOICE' | 'CREDIT_NOTE' | 'COGS_REVERSAL' | 'STOCK_IN_TRANSIT' | 'STOCK_RECEIPT' | 'PURCHASE_INVOICE' | 'COGS_JOURNAL' | 'INVENTORY_ADJUSTMENT' | 'STOCK_ALLOCATION'
   referenceType: string
   referenceId: string
   payload: Record<string, unknown>
@@ -306,9 +312,13 @@ export async function queueXeroSync(params: {
   const settings = await getXeroSettings()
   if (settings.xero_sync_enabled !== 'true') return
 
-  // Check if this specific sync type is enabled
+  // Check if this specific sync type is enabled (off = disabled)
   const settingKey = SYNC_TYPE_SETTING[params.type]
-  if (settingKey && settings[settingKey] !== 'true') return
+  const postingMode = settingKey ? settings[settingKey] : 'submitted'
+  if (!postingMode || postingMode === 'off') return
+
+  // Include posting mode in payload so the sync processor can set the correct Xero status
+  const payload = { ...params.payload, _postingMode: postingMode }
 
   await db.xeroSyncLog.create({
     data: {
@@ -316,7 +326,7 @@ export async function queueXeroSync(params: {
       status: 'PENDING',
       referenceType: params.referenceType,
       referenceId: params.referenceId,
-      payload: params.payload as never,
+      payload: payload as never,
     },
   })
 }

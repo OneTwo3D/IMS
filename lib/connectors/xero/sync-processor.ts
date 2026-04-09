@@ -105,10 +105,20 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
   return result
 }
 
+/** Resolve _postingMode to Xero API status values */
+function resolveInvoiceStatus(mode: unknown): string {
+  return mode === 'draft' ? 'DRAFT' : 'AUTHORISED'
+}
+function resolveJournalStatus(mode: unknown): string {
+  return mode === 'draft' ? 'DRAFT' : 'POSTED'
+}
+
 async function processEntry(
   type: XeroSyncType,
   payload: SyncPayload,
 ): Promise<{ success: boolean; externalId?: string; error?: string }> {
+  const postingMode = payload._postingMode
+
   switch (type) {
     case 'SALES_INVOICE':
       return pushSalesInvoice({
@@ -125,7 +135,7 @@ async function processEntry(
         discountAmount: payload.discountAmount as number | undefined,
         discountAccountCode: payload.discountAccountCode as string | undefined,
         reference: payload.reference as string | undefined,
-      }).then(r => ({ success: r.success, externalId: r.invoiceId, error: r.error }))
+      }, resolveInvoiceStatus(postingMode)).then(r => ({ success: r.success, externalId: r.invoiceId, error: r.error }))
 
     case 'PURCHASE_INVOICE': {
       const billResult = await pushPurchaseBill({
@@ -136,7 +146,7 @@ async function processEntry(
         currency: payload.currency as string,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
-      })
+      }, resolveInvoiceStatus(postingMode))
       // Attach supplier invoice PDF if available and setting enabled
       if (billResult.success && billResult.invoiceId && payload.supplierInvoicePath) {
         try {
@@ -163,19 +173,20 @@ async function processEntry(
         currency: payload.currency as string,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
-      }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
+      }, resolveInvoiceStatus(postingMode)).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
 
     case 'COGS_JOURNAL':
     case 'INVENTORY_ADJUSTMENT':
     case 'STOCK_IN_TRANSIT':
     case 'STOCK_RECEIPT':
     case 'COGS_REVERSAL':
+    case 'STOCK_ALLOCATION':
       return pushManualJournal({
         date: payload.date as string,
         reference: payload.reference as string,
         narration: payload.narration as string,
         lines: payload.lines as Array<{ accountCode: string; description: string; debit?: number; credit?: number; taxType?: string }>,
-      }).then(r => ({ success: r.success, externalId: r.journalId, error: r.error }))
+      }, resolveJournalStatus(postingMode)).then(r => ({ success: r.success, externalId: r.journalId, error: r.error }))
 
     default:
       return { success: false, error: `Unknown sync type: ${type}` }

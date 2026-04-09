@@ -19,6 +19,7 @@ type XeroCreditNoteResponse = {
  */
 export async function pushCreditNote(
   data: CreditNoteData,
+  status: string = 'AUTHORISED',
 ): Promise<{ success: boolean; creditNoteId?: string; error?: string }> {
   // Find or create the contact
   const contactResult = await findOrCreateContact(data.contactName, data.contactEmail)
@@ -45,7 +46,7 @@ export async function pushCreditNote(
     CreditNoteNumber: data.creditNoteNumber,
     Date: data.date,
     LineItems: lineItems,
-    Status: 'AUTHORISED',
+    Status: status,
     CurrencyCode: data.currency,
   }
   if (data.reference) creditNote.Reference = data.reference

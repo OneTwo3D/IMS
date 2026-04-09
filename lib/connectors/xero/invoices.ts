@@ -19,6 +19,7 @@ type XeroInvoiceResponse = {
  */
 export async function pushSalesInvoice(
   data: InvoiceData,
+  status: string = 'AUTHORISED',
 ): Promise<{ success: boolean; invoiceId?: string; error?: string }> {
   // Find or create the contact
   const contactResult = await findOrCreateContact(data.contactName, data.contactEmail)
@@ -66,7 +67,7 @@ export async function pushSalesInvoice(
     InvoiceNumber: data.invoiceNumber,
     Date: data.date,
     LineItems: lineItems,
-    Status: 'AUTHORISED',
+    Status: status,
     CurrencyCode: data.currency,
   }
   if (data.dueDate) invoice.DueDate = data.dueDate

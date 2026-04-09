@@ -18,6 +18,7 @@ type XeroManualJournalResponse = {
  */
 export async function pushManualJournal(
   entry: JournalEntry,
+  status: string = 'POSTED',
 ): Promise<{ success: boolean; journalId?: string; error?: string }> {
   const journalLines = entry.lines.map((line: JournalLine) => {
     const xeroLine: Record<string, unknown> = {
@@ -41,7 +42,7 @@ export async function pushManualJournal(
     Narration: entry.narration,
     Date: entry.date,
     JournalLines: journalLines,
-    Status: 'POSTED',
+    Status: status,
   }
 
   const res = await xeroPost<XeroManualJournalResponse>('ManualJournals', journal)
