@@ -1499,6 +1499,7 @@ export async function createInvoice(
             unitAmount: Math.round((l.unitCostForeign / fxRate) * 10000) / 10000,
             accountCode: xeroSettings.xero_purchase_account,
           })),
+          supplierInvoicePath: input.supplierInvoiceUrl ?? undefined,
         },
       })
     } catch { /* Xero queue errors should never block the main flow */ }

@@ -3,12 +3,15 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
+import { readFile } from 'fs/promises'
+import { join } from 'path'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { pushSalesInvoice } from './invoices'
 import { pushPurchaseBill } from './bills'
 import { pushCreditNote } from './credit-notes'
 import { pushManualJournal } from './journals'
+import { xeroUploadAttachment } from './api'
 import type { XeroSyncType } from '@/app/generated/prisma/client'
 
 const MAX_RETRIES = 5
@@ -124,8 +127,8 @@ async function processEntry(
         reference: payload.reference as string | undefined,
       }).then(r => ({ success: r.success, externalId: r.invoiceId, error: r.error }))
 
-    case 'PURCHASE_INVOICE':
-      return pushPurchaseBill({
+    case 'PURCHASE_INVOICE': {
+      const billResult = await pushPurchaseBill({
         invoiceNumber: payload.invoiceNumber as string | undefined,
         contactName: payload.contactName as string,
         date: payload.date as string,
@@ -133,7 +136,23 @@ async function processEntry(
         currency: payload.currency as string,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
-      }).then(r => ({ success: r.success, externalId: r.invoiceId, error: r.error }))
+      })
+      // Attach supplier invoice PDF if available and setting enabled
+      if (billResult.success && billResult.invoiceId && payload.supplierInvoicePath) {
+        try {
+          const attachEnabled = await db.setting.findUnique({ where: { key: 'xero_sync_attach_pdf' } })
+          if (attachEnabled?.value !== 'false') {
+            const pdfPath = join(process.cwd(), 'public', payload.supplierInvoicePath as string)
+            const pdfBuffer = await readFile(pdfPath)
+            const filename = (payload.supplierInvoicePath as string).split('/').pop() ?? 'supplier-invoice.pdf'
+            await xeroUploadAttachment('Invoices', billResult.invoiceId, filename, pdfBuffer, 'application/pdf')
+          }
+        } catch {
+          // Attachment failure is non-critical — bill was already created
+        }
+      }
+      return { success: billResult.success, externalId: billResult.invoiceId, error: billResult.error }
+    }
 
     case 'CREDIT_NOTE':
       return pushCreditNote({

@@ -35,6 +35,17 @@ const ACCOUNT_FIELDS: { key: keyof XeroSettings; label: string; description: str
   { key: 'xero_purchase_account', label: 'Purchases', description: 'Default purchase/bill account' },
 ]
 
+const SYNC_TYPE_TOGGLES: { key: keyof XeroSettings; label: string; description: string }[] = [
+  { key: 'xero_sync_sales_invoice', label: 'Sales Invoices', description: 'Push invoices to Xero when generated' },
+  { key: 'xero_sync_credit_note', label: 'Credit Notes', description: 'Push credit notes on refund' },
+  { key: 'xero_sync_purchase_invoice', label: 'Purchase Bills', description: 'Push supplier bills when PO is invoiced' },
+  { key: 'xero_sync_cogs_journal', label: 'COGS Journals', description: 'Cost of goods sold journal on dispatch' },
+  { key: 'xero_sync_cogs_reversal', label: 'COGS Reversals', description: 'Reverse COGS on stock returns' },
+  { key: 'xero_sync_stock_in_transit', label: 'Stock in Transit', description: 'Transit journal when PO is sent' },
+  { key: 'xero_sync_stock_receipt', label: 'Stock Receipts', description: 'Receipt journal when goods received' },
+  { key: 'xero_sync_inventory_adjustment', label: 'Inventory Adjustments', description: 'Journal for manual stock adjustments' },
+]
+
 const STATUS_BADGE: Record<string, { variant: 'default' | 'secondary' | 'outline' | 'destructive'; label: string }> = {
   PENDING: { variant: 'outline', label: 'Pending' },
   SYNCED: { variant: 'default', label: 'Synced' },
@@ -65,6 +76,15 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     startTransition(async () => {
       const result = await saveXeroSettings({
         xero_sync_enabled: s.xero_sync_enabled,
+        xero_sync_sales_invoice: s.xero_sync_sales_invoice,
+        xero_sync_credit_note: s.xero_sync_credit_note,
+        xero_sync_purchase_invoice: s.xero_sync_purchase_invoice,
+        xero_sync_cogs_journal: s.xero_sync_cogs_journal,
+        xero_sync_cogs_reversal: s.xero_sync_cogs_reversal,
+        xero_sync_stock_in_transit: s.xero_sync_stock_in_transit,
+        xero_sync_stock_receipt: s.xero_sync_stock_receipt,
+        xero_sync_inventory_adjustment: s.xero_sync_inventory_adjustment,
+        xero_sync_attach_pdf: s.xero_sync_attach_pdf,
         xero_sales_account: s.xero_sales_account,
         xero_shipping_account: s.xero_shipping_account,
         xero_discount_account: s.xero_discount_account,
@@ -225,6 +245,44 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
             ))}
           </div>
         )}
+      </Card>
+
+      {/* Transaction Types */}
+      <Card className="p-6 space-y-4">
+        <div>
+          <h3 className="text-base font-semibold">Transaction Types</h3>
+          <p className="text-xs text-muted-foreground mt-0.5">Choose which documents and transactions are synced to Xero.</p>
+        </div>
+        <div className="grid grid-cols-2 gap-3">
+          {SYNC_TYPE_TOGGLES.map(t => (
+            <label key={t.key} className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
+              <input
+                type="checkbox"
+                checked={s[t.key] === 'true'}
+                onChange={e => handleField(t.key, e.target.checked ? 'true' : 'false')}
+                className="h-4 w-4 accent-primary mt-0.5"
+              />
+              <div>
+                <span className="text-sm font-medium">{t.label}</span>
+                <p className="text-[11px] text-muted-foreground">{t.description}</p>
+              </div>
+            </label>
+          ))}
+        </div>
+        <div className="border-t pt-3">
+          <label className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
+            <input
+              type="checkbox"
+              checked={s.xero_sync_attach_pdf === 'true'}
+              onChange={e => handleField('xero_sync_attach_pdf', e.target.checked ? 'true' : 'false')}
+              className="h-4 w-4 accent-primary mt-0.5"
+            />
+            <div>
+              <span className="text-sm font-medium">Attach supplier invoice PDFs</span>
+              <p className="text-[11px] text-muted-foreground">When a supplier invoice PDF is uploaded to a PO, attach it to the Xero bill.</p>
+            </div>
+          </label>
+        </div>
       </Card>
 
       {/* Sync Settings */}

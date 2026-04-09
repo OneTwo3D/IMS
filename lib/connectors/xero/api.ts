@@ -93,3 +93,43 @@ export async function xeroPost<T = unknown>(path: string, body: unknown): Promis
 export async function xeroPut<T = unknown>(path: string, body: unknown): Promise<XeroResponse<T>> {
   return xeroFetch<T>('PUT', path, body)
 }
+
+/**
+ * Upload a file attachment to a Xero object (invoice, bill, credit note, etc.).
+ * Uses the Xero Files API: PUT /api.xro/2.0/{endpoint}/{id}/Attachments/{filename}
+ */
+export async function xeroUploadAttachment(
+  endpoint: string,
+  objectId: string,
+  filename: string,
+  fileBuffer: Buffer,
+  contentType: string,
+): Promise<XeroResponse> {
+  const auth = await getAccessToken()
+  if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
+
+  const url = `${XERO_BASE_URL}/${endpoint}/${objectId}/Attachments/${encodeURIComponent(filename)}`
+
+  const res = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      'Authorization': `Bearer ${auth.accessToken}`,
+      'Xero-Tenant-Id': auth.tenantId,
+      'Content-Type': contentType,
+      'Content-Length': String(fileBuffer.length),
+    },
+    body: new Uint8Array(fileBuffer),
+  })
+
+  if (res.status === 429) {
+    return { ok: false, status: 429, error: 'Rate limited' }
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => 'Unknown error')
+    return { ok: false, status: res.status, error: `Attachment upload failed: ${errText}` }
+  }
+
+  const data = await res.json().catch(() => ({}))
+  return { ok: true, status: res.status, data }
+}

@@ -22,6 +22,17 @@ export type XeroSettings = {
   xero_client_id: string
   xero_client_secret: string
   xero_sync_enabled: string
+  // Per-transaction-type sync toggles
+  xero_sync_sales_invoice: string
+  xero_sync_credit_note: string
+  xero_sync_purchase_invoice: string
+  xero_sync_cogs_journal: string
+  xero_sync_cogs_reversal: string
+  xero_sync_stock_in_transit: string
+  xero_sync_stock_receipt: string
+  xero_sync_inventory_adjustment: string
+  xero_sync_attach_pdf: string
+  // Account mappings
   xero_sales_account: string
   xero_shipping_account: string
   xero_discount_account: string
@@ -34,6 +45,9 @@ export type XeroSettings = {
 
 const XERO_SETTING_KEYS = [
   'xero_client_id', 'xero_client_secret', 'xero_sync_enabled',
+  'xero_sync_sales_invoice', 'xero_sync_credit_note', 'xero_sync_purchase_invoice',
+  'xero_sync_cogs_journal', 'xero_sync_cogs_reversal', 'xero_sync_stock_in_transit',
+  'xero_sync_stock_receipt', 'xero_sync_inventory_adjustment', 'xero_sync_attach_pdf',
   'xero_sales_account', 'xero_shipping_account', 'xero_discount_account',
   'xero_cogs_account', 'xero_inventory_account', 'xero_transit_account',
   'xero_transit_credit_account', 'xero_purchase_account',
@@ -43,6 +57,15 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_client_id: '',
   xero_client_secret: '',
   xero_sync_enabled: 'false',
+  xero_sync_sales_invoice: 'true',
+  xero_sync_credit_note: 'true',
+  xero_sync_purchase_invoice: 'true',
+  xero_sync_cogs_journal: 'true',
+  xero_sync_cogs_reversal: 'true',
+  xero_sync_stock_in_transit: 'true',
+  xero_sync_stock_receipt: 'true',
+  xero_sync_inventory_adjustment: 'true',
+  xero_sync_attach_pdf: 'true',
   xero_sales_account: '',
   xero_shipping_account: '',
   xero_discount_account: '',
@@ -51,6 +74,18 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_transit_account: '',
   xero_transit_credit_account: '',
   xero_purchase_account: '',
+}
+
+/** Map sync type enum → setting key for per-type enable/disable */
+const SYNC_TYPE_SETTING: Record<string, keyof XeroSettings> = {
+  SALES_INVOICE: 'xero_sync_sales_invoice',
+  CREDIT_NOTE: 'xero_sync_credit_note',
+  PURCHASE_INVOICE: 'xero_sync_purchase_invoice',
+  COGS_JOURNAL: 'xero_sync_cogs_journal',
+  COGS_REVERSAL: 'xero_sync_cogs_reversal',
+  STOCK_IN_TRANSIT: 'xero_sync_stock_in_transit',
+  STOCK_RECEIPT: 'xero_sync_stock_receipt',
+  INVENTORY_ADJUSTMENT: 'xero_sync_inventory_adjustment',
 }
 
 export async function getXeroSettings(): Promise<XeroSettings> {
@@ -277,9 +312,13 @@ export async function queueXeroSync(params: {
   referenceId: string
   payload: Record<string, unknown>
 }): Promise<void> {
-  // Check if Xero sync is enabled
-  const enabled = await db.setting.findUnique({ where: { key: 'xero_sync_enabled' } })
-  if (enabled?.value !== 'true') return
+  // Check if Xero sync is globally enabled
+  const settings = await getXeroSettings()
+  if (settings.xero_sync_enabled !== 'true') return
+
+  // Check if this specific sync type is enabled
+  const settingKey = SYNC_TYPE_SETTING[params.type]
+  if (settingKey && settings[settingKey] !== 'true') return
 
   await db.xeroSyncLog.create({
     data: {
