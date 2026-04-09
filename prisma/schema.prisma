@@ -207,6 +207,7 @@ model User {
 
   supplier       Supplier? @relation(fields: [supplierId], references: [id])
   activityLogs   ActivityLog[]
+  notifications  Notification[]
   sessions       Session[]
   passkeys       Passkey[]
 
@@ -415,6 +416,8 @@ model Product {
   type            ProductType @default(SIMPLE)
   parentId        String?     // set for VARIANT products
   barcode         String?
+  hsCode          String?
+  countryOfOrigin String?     // 2-letter ISO code
   weight          Decimal?    @db.Decimal(10, 4) // kg, for landed cost by weight
   active          Boolean     @default(true)
 
@@ -485,6 +488,7 @@ model ProductOption {
   sortOrder Int      @default(0)
   product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
 
+  @@unique([productId, name], map: "product_options_productId_name_key")
   @@index([productId])
   @@map("product_options")
 }
@@ -1316,6 +1320,23 @@ model ActivityLog {
   @@index([tag])
   @@index([level])
   @@map("activity_logs")
+}
+
+model Notification {
+  id        String   @id @default(cuid())
+  userId    String?  // null = broadcast to all users
+  type      String   // info | success | warning | error
+  title     String
+  message   String
+  actionUrl String?
+  read      Boolean  @default(false)
+  createdAt DateTime @default(now())
+  readAt    DateTime?
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId, read, createdAt])
+  @@map("notifications")
 }
 
 // ---------------------------------------------------------------------------

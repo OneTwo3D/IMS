@@ -32,6 +32,7 @@ import type { ProductRow } from '@/app/actions/products'
 import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow } from '@/app/actions/settings'
 import { ProductLink } from '@/components/inventory/product-link'
+import { ProductThumb } from '@/components/inventory/product-thumb'
 
 type Warehouse = { id: string; code: string; name: string }
 
@@ -1391,6 +1392,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
           <table className="w-full text-sm">
             <thead className="border-b bg-muted/30">
               <tr>
+                <th className="w-12 px-2 py-2" />
                 <th className="px-4 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
                 <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-44">Qty</th>
                 <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-32">
@@ -1411,6 +1413,9 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             <tbody className="divide-y">
               {po.lines.map((line) => (
                 <tr key={line.id} className={line.qtyRemaining === 0 && line.qtyReturned === 0 ? 'opacity-60' : ''}>
+                  <td className="w-12 px-2 py-1">
+                    <ProductThumb productId={line.productId} imageUrl={line.imageUrl} name={line.productName} />
+                  </td>
                   <td className="px-4 py-2">
                     <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
                   </td>

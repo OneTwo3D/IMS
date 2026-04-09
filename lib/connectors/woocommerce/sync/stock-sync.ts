@@ -36,12 +36,31 @@ export async function pushStockToWc(): Promise<SyncResult> {
     stockByProduct.set(sl.productId, (stockByProduct.get(sl.productId) ?? 0) + available)
   }
 
+  // Check if COGS sync is enabled
+  const cogsSetting = await db.setting.findUnique({ where: { key: 'wc_cogs_sync_enabled' } })
+  const cogsSyncEnabled = cogsSetting?.value === 'true'
+
   // Get products with SKUs
   const productIds = [...stockByProduct.keys()]
   const products = await db.product.findMany({
     where: { id: { in: productIds }, sku: { not: '' } },
     select: { id: true, sku: true },
   })
+
+  // Get next FIFO cost per product (oldest layer with remaining stock)
+  const cogsByProduct = new Map<string, number>()
+  if (cogsSyncEnabled) {
+    for (const product of products) {
+      const oldestLayer = await db.costLayer.findFirst({
+        where: { productId: product.id, remainingQty: { gt: 0 } },
+        orderBy: { receivedAt: 'asc' },
+        select: { unitCostGbp: true },
+      })
+      if (oldestLayer) {
+        cogsByProduct.set(product.id, Number(oldestLayer.unitCostGbp))
+      }
+    }
+  }
 
   // Build SKU → WC product ID map (batch lookup)
   const skuToWcId = new Map<string, number>()
@@ -60,14 +79,21 @@ export async function pushStockToWc(): Promise<SyncResult> {
   }
 
   // Batch update via WC REST API
-  const updates: { id: number; stock_quantity: number; manage_stock: boolean }[] = []
+  const updates: { id: number; stock_quantity: number; manage_stock: boolean; cost_of_goods_sold?: { values: { defined_value: string }[] } }[] = []
 
   for (const product of products) {
     const wcId = skuToWcId.get(product.sku)
     if (!wcId) { result.skipped++; continue }
 
     const available = stockByProduct.get(product.id) ?? 0
-    updates.push({ id: wcId, stock_quantity: Math.floor(available), manage_stock: true })
+    const entry: typeof updates[number] = { id: wcId, stock_quantity: Math.floor(available), manage_stock: true }
+
+    const cogs = cogsByProduct.get(product.id)
+    if (cogs !== undefined) {
+      entry.cost_of_goods_sold = { values: [{ defined_value: cogs.toFixed(2) }] }
+    }
+
+    updates.push(entry)
   }
 
   // Send in batches of 100 (WC API limit)

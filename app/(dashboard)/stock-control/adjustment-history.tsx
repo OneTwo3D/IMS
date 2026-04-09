@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Card } from '@/components/ui/card'
 import { updateAdjustmentMovement, type AdjustmentMovementRow } from '@/app/actions/stock'
 import { ProductLink } from '@/components/inventory/product-link'
+import { ProductThumb } from '@/components/inventory/product-thumb'
 
 type Props = {
   initialRows: AdjustmentMovementRow[]
@@ -89,7 +90,8 @@ export function AdjustmentHistory({ initialRows }: Props) {
       </div>
 
       {/* Header */}
-      <div className="grid grid-cols-[1fr_1fr_auto_1fr_auto] gap-3 px-4 py-2 bg-muted/20 text-xs font-medium text-muted-foreground border-b border-border">
+      <div className="grid grid-cols-[auto_1fr_1fr_auto_1fr_auto] gap-3 px-4 py-2 bg-muted/20 text-xs font-medium text-muted-foreground border-b border-border">
+        <span className="w-9" />
         <span>Product</span>
         <span>Warehouse</span>
         <span className="w-24 text-right">Qty</span>
@@ -102,8 +104,10 @@ export function AdjustmentHistory({ initialRows }: Props) {
         return (
           <div
             key={row.id}
-            className="grid grid-cols-[1fr_1fr_auto_1fr_auto] gap-3 px-4 py-2.5 items-center border-b border-border/50 last:border-0 hover:bg-muted/10 group"
+            className="grid grid-cols-[auto_1fr_1fr_auto_1fr_auto] gap-3 px-4 py-2.5 items-center border-b border-border/50 last:border-0 hover:bg-muted/10 group"
           >
+            {/* Thumbnail */}
+            <ProductThumb productId={row.productId} imageUrl={row.imageUrl} name={row.productName} />
             {/* Product */}
             <div className="min-w-0">
               <ProductLink productId={row.productId} sku={row.productSku} name={row.productName} skuClassName="font-mono text-xs font-medium" />

@@ -17,6 +17,7 @@ export type ManufacturingOrderRow = {
   productId: string
   productSku: string
   productName: string
+  productImageUrl: string | null
   warehouseName: string
   manufacturerName: string | null
   qtyPlanned: number
@@ -91,7 +92,7 @@ export async function getManufacturingOrders(filters: ListFilters = {}) {
         startedAt: true,
         completedAt: true,
         notes: true,
-        outputProduct: { select: { id: true, sku: true, name: true } },
+        outputProduct: { select: { id: true, sku: true, name: true, imageUrl: true } },
         warehouse: { select: { name: true } },
         manufacturer: { select: { name: true } },
       },
@@ -110,6 +111,7 @@ export async function getManufacturingOrders(filters: ListFilters = {}) {
       productId: r.outputProduct.id,
       productSku: r.outputProduct.sku,
       productName: r.outputProduct.name,
+      productImageUrl: r.outputProduct.imageUrl,
       warehouseName: r.warehouse.name,
       manufacturerName: r.manufacturer?.name ?? null,
       qtyPlanned: Number(r.qtyPlanned),
@@ -684,6 +686,7 @@ export type ManufacturingOrderDetail = {
   productSku: string
   productName: string
   productBarcode: string | null
+  productImageUrl: string | null
   warehouseId: string
   warehouseName: string
   warehouseCode: string
@@ -702,6 +705,7 @@ export type ManufacturingOrderDetail = {
     componentSku: string
     componentName: string
     componentBarcode: string | null
+    componentImageUrl: string | null
     qtyPerUnit: number
   }[]
 }
@@ -728,11 +732,12 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
           sku: true,
           name: true,
           barcode: true,
+          imageUrl: true,
           productComponents: {
             select: {
               componentId: true,
               qty: true,
-              component: { select: { sku: true, name: true, barcode: true } },
+              component: { select: { sku: true, name: true, barcode: true, imageUrl: true } },
             },
             orderBy: { sortOrder: 'asc' },
           },
@@ -753,6 +758,7 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
     productSku: o.outputProduct.sku,
     productName: o.outputProduct.name,
     productBarcode: o.outputProduct.barcode,
+    productImageUrl: o.outputProduct.imageUrl,
     warehouseId: o.warehouse.id,
     warehouseName: o.warehouse.name,
     warehouseCode: o.warehouse.code,
@@ -771,6 +777,7 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
       componentSku: c.component.sku,
       componentName: c.component.name,
       componentBarcode: c.component.barcode,
+      componentImageUrl: c.component.imageUrl,
       qtyPerUnit: Number(c.qty),
     })),
   }

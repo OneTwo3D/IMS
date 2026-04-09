@@ -13,6 +13,7 @@ import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { ProductLink } from '@/components/inventory/product-link'
+import { ProductThumb } from '@/components/inventory/product-thumb'
 import {
   getManufacturingOrders,
   getBomProducts,
@@ -159,6 +160,7 @@ export function ManufacturingClient({ initialRows, initialTotal }: Props) {
             <tr className="border-b bg-muted/50">
               <th className="text-left font-medium px-3 py-2">Reference</th>
               <th className="text-left font-medium px-3 py-2">Type</th>
+              <th className="w-12 px-2 py-2" />
               <th className="text-left font-medium px-3 py-2">Product</th>
               <th className="text-left font-medium px-3 py-2">Warehouse</th>
               <th className="text-left font-medium px-3 py-2">Manufacturer</th>
@@ -171,7 +173,7 @@ export function ManufacturingClient({ initialRows, initialTotal }: Props) {
           <tbody>
             {rows.length === 0 ? (
               <tr>
-                <td colSpan={9} className="px-3 py-8 text-center text-muted-foreground">
+                <td colSpan={10} className="px-3 py-8 text-center text-muted-foreground">
                   {isPending ? 'Loading...' : 'No manufacturing orders found.'}
                 </td>
               </tr>
@@ -183,6 +185,9 @@ export function ManufacturingClient({ initialRows, initialTotal }: Props) {
                     <Badge variant="secondary" className="text-xs font-normal">
                       {r.orderType === 'ASSEMBLY' ? 'Assembly' : 'Disassembly'}
                     </Badge>
+                  </td>
+                  <td className="w-12 px-2 py-1">
+                    <ProductThumb productId={r.productId} imageUrl={r.productImageUrl} name={r.productName} />
                   </td>
                   <td className="px-3 py-2">
                     <ProductLink productId={r.productId} sku={r.productSku} name={r.productName} skuClassName="font-mono text-xs text-muted-foreground mr-1" />

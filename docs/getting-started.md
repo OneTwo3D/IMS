@@ -34,6 +34,18 @@ Go to **Settings > Warehouses** and create at least one warehouse. Each warehous
 Head to **Inventory** and click **New Product**. Fill in the SKU, name, product type, and pricing. You can add products one at a time or import them in bulk via CSV.
 
 
+## Notifications
+
+The notification bell in the top bar shows system alerts and updates. Notifications are colour-coded by type:
+
+- **Info** (blue) — routine system events
+- **Success** (green) — completed operations
+- **Warning** (orange) — items that may need attention
+- **Error** (red) — failures requiring action
+
+Unread notifications are indicated by a badge on the bell icon. Click a notification to view its details or navigate to the relevant page.
+
+
 ## Navigation
 
 The sidebar organises the system into sections:

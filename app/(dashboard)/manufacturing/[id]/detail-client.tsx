@@ -5,7 +5,7 @@ import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import {
   ArrowLeft, Factory, Play, CheckCircle2, XCircle, FileText, Mail,
-  Loader2, AlertTriangle, ExternalLink,
+  Loader2, AlertTriangle, ExternalLink, Package,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
@@ -14,6 +14,7 @@ import {
   updateManufacturingOrderStatus,
   type ManufacturingOrderDetail as OrderType,
 } from '@/app/actions/manufacturing'
+import { ProductThumb } from '@/components/inventory/product-thumb'
 
 const STATUS_BADGE: Record<string, string> = {
   DRAFT: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300',
@@ -69,7 +70,7 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
   }
 
   return (
-    <div className="space-y-6 max-w-4xl">
+    <div className="space-y-6 max-w-5xl">
       {/* Header */}
       <div className="flex items-start justify-between">
         <div className="flex items-center gap-3">
@@ -136,7 +137,7 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
       )}
 
       {/* Details grid */}
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-[1fr_1fr_auto] gap-4">
         <Card className="p-4">
           <h2 className="text-sm font-medium mb-3 flex items-center gap-1.5">
             <Factory className="h-4 w-4 text-muted-foreground" />
@@ -216,6 +217,24 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
             </div>
           )}
         </Card>
+
+        {/* Product image */}
+        <Link href={`/inventory/${order.productId}`} target="_blank" className="block">
+          <Card className="p-4 flex flex-col items-center justify-center h-full">
+            {order.productImageUrl ? (
+              <img
+                src={order.productImageUrl}
+                alt={order.productName}
+                className="w-36 h-36 rounded-lg object-contain border border-border bg-muted"
+              />
+            ) : (
+              <span className="flex w-36 h-36 items-center justify-center rounded-lg border border-border bg-muted text-muted-foreground">
+                <Package className="h-12 w-12" />
+              </span>
+            )}
+            <p className="text-xs text-muted-foreground mt-2 text-center font-mono">{order.productSku}</p>
+          </Card>
+        </Link>
       </div>
 
       {/* Components table */}
@@ -228,6 +247,7 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
             <thead>
               <tr className="bg-muted/50 border-b">
                 <th className="text-left font-medium px-3 py-2">#</th>
+                <th className="text-left font-medium px-3 py-2 w-12"></th>
                 <th className="text-left font-medium px-3 py-2">SKU</th>
                 <th className="text-left font-medium px-3 py-2">Component</th>
                 <th className="text-left font-medium px-3 py-2">Barcode</th>
@@ -239,6 +259,9 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
               {order.components.map((c, i) => (
                 <tr key={c.componentId} className="border-b">
                   <td className="px-3 py-2 text-muted-foreground">{i + 1}</td>
+                  <td className="px-3 py-2">
+                    <ProductThumb productId={c.componentId} imageUrl={c.componentImageUrl} name={c.componentName} />
+                  </td>
                   <td className="px-3 py-2 font-mono text-xs">{c.componentSku}</td>
                   <td className="px-3 py-2">
                     <Link href={`/inventory/${c.componentId}`} className="hover:underline" target="_blank">

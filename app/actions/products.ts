@@ -26,12 +26,16 @@ export type ProductRow = {
   imageUrl: string | null
   salesPriceGbp: string | null   // regular / list price
   salePriceGbp: string | null    // sale / discounted price
+  priceRange: { min: string; max: string } | null  // for VARIABLE: min–max of variant regular prices
   salesPriceTaxInclusive: boolean
   stockUnit: string
   oversellAllowed: boolean
   active: boolean
   variantCount: number
   totalStock: string
+  allocatedStock: string    // sum of reservedQty across all warehouses
+  availableStock: string    // totalStock - allocatedStock
+  incomingStock: string     // in-transit transfers + open PO lines
   inventoryValue: string  // sum of remainingQty * unitCostGbp
   createdAt: Date
   updatedAt: Date
@@ -43,6 +47,8 @@ export type ProductDetail = ProductRow & {
   widthCm: string | null
   heightCm: string | null
   depthCm: string | null
+  hsCode: string | null
+  countryOfOrigin: string | null
   variants: ProductRow[]
   stockByWarehouse: {
     warehouseId: string
@@ -70,16 +76,27 @@ export type ProductListResult = {
 // Queries
 // ---------------------------------------------------------------------------
 
+export type SortField = 'sku' | 'name' | 'type' | 'salesPriceGbp' | 'totalStock' | 'active' | 'createdAt' | 'updatedAt'
+export type SortDir = 'asc' | 'desc'
+
+// Fields that can be sorted directly in the DB query
+const DB_SORT_FIELDS = new Set(['sku', 'name', 'type', 'salesPriceGbp', 'active', 'createdAt', 'updatedAt'])
+
 export async function listProducts(params: {
   search?: string
   type?: ProductType | 'ALL'
   active?: 'true' | 'false' | 'all'
   page?: number
   pageSize?: number
+  sort?: SortField
+  dir?: SortDir
 }): Promise<ProductListResult> {
   await requireAuth()
   const page = Math.max(1, params.page ?? 1)
   const pageSize = params.pageSize ?? 50
+  const sortField = params.sort ?? 'sku'
+  const sortDir = params.dir ?? 'asc'
+  const isComputedSort = !DB_SORT_FIELDS.has(sortField)
 
   const where = {
     ...(params.search
@@ -109,21 +126,88 @@ export async function listProducts(params: {
       where,
       include: {
         parent: { select: { sku: true } },
-        variants: { select: { id: true } },
-        stockLevels: { select: { quantity: true } },
+        variants: {
+          select: {
+            id: true,
+            salesPriceGbp: true,
+            salePriceGbp: true,
+            stockLevels: { select: { quantity: true, reservedQty: true } },
+          },
+        },
+        stockLevels: { select: { quantity: true, reservedQty: true } },
         costLayers: {
           where: { remainingQty: { gt: 0 } },
           select: { remainingQty: true, unitCostGbp: true },
         },
       },
-      orderBy: { sku: 'asc' },
-      skip: (page - 1) * pageSize,
-      take: pageSize,
+      orderBy: isComputedSort ? { sku: 'asc' } : { [sortField]: sortDir },
+      // For computed sorts, fetch all rows so we can sort in memory then paginate
+      ...(isComputedSort ? {} : { skip: (page - 1) * pageSize, take: pageSize }),
     }),
     db.product.count({ where }),
   ])
 
-  const products: ProductRow[] = rawProducts.map((p) => ({
+  // Collect all product IDs (including variant IDs) for batch incoming queries
+  const allProductIds: string[] = []
+  for (const p of rawProducts) {
+    allProductIds.push(p.id)
+    for (const v of p.variants) allProductIds.push(v.id)
+  }
+
+  // Batch query incoming stock (transfers + POs) grouped by product
+  const [incomingTransfers, incomingPOs] = await Promise.all([
+    db.stockTransferLine.groupBy({
+      by: ['productId'],
+      where: { productId: { in: allProductIds }, transfer: { status: 'IN_TRANSIT' } },
+      _sum: { qty: true, qtyReceived: true },
+    }),
+    db.purchaseOrderLine.groupBy({
+      by: ['productId'],
+      where: {
+        productId: { in: allProductIds },
+        po: { status: { in: ['DRAFT', 'RFQ_SENT', 'PO_SENT', 'PARTIALLY_RECEIVED'] }, type: 'GOODS' },
+      },
+      _sum: { qty: true, qtyReceived: true },
+    }),
+  ])
+
+  const incomingByProduct = new Map<string, number>()
+  for (const t of incomingTransfers) {
+    const remaining = Math.max(0, Number(t._sum.qty ?? 0) - Number(t._sum.qtyReceived ?? 0))
+    if (remaining > 0) incomingByProduct.set(t.productId, (incomingByProduct.get(t.productId) ?? 0) + remaining)
+  }
+  for (const po of incomingPOs) {
+    const remaining = Math.max(0, Number(po._sum.qty ?? 0) - Number(po._sum.qtyReceived ?? 0))
+    if (remaining > 0) incomingByProduct.set(po.productId, (incomingByProduct.get(po.productId) ?? 0) + remaining)
+  }
+
+  const products: ProductRow[] = rawProducts.map((p) => {
+    // Compute variant price range for VARIABLE products
+    let priceRange: { min: string; max: string } | null = null
+    if (p.type === 'VARIABLE' && p.variants.length > 0) {
+      const prices = p.variants.map((v) => Number(v.salesPriceGbp)).filter((n) => n > 0)
+      if (prices.length) {
+        priceRange = { min: Math.min(...prices).toFixed(2), max: Math.max(...prices).toFixed(2) }
+      }
+    }
+
+    const totalStock = p.type === 'VARIABLE'
+      ? p.variants.reduce((sum, v) =>
+          sum + v.stockLevels.reduce((vs, s) => vs + Number(s.quantity), 0), 0)
+      : p.stockLevels.reduce((sum, s) => sum + Number(s.quantity), 0)
+
+    const allocatedStock = p.type === 'VARIABLE'
+      ? p.variants.reduce((sum, v) =>
+          sum + v.stockLevels.reduce((vs, s) => vs + Number(s.reservedQty), 0), 0)
+      : p.stockLevels.reduce((sum, s) => sum + Number(s.reservedQty), 0)
+
+    const incomingStock = p.type === 'VARIABLE'
+      ? p.variants.reduce((sum, v) => sum + (incomingByProduct.get(v.id) ?? 0), 0)
+      : (incomingByProduct.get(p.id) ?? 0)
+
+    const availableStock = totalStock - allocatedStock
+
+    return {
     id: p.id,
     sku: p.sku,
     name: p.name,
@@ -137,20 +221,35 @@ export async function listProducts(params: {
     imageUrl: p.imageUrl ?? null,
     salesPriceGbp: p.salesPriceGbp?.toString() ?? null,
     salePriceGbp: p.salePriceGbp?.toString() ?? null,
+    priceRange,
     salesPriceTaxInclusive: p.salesPriceTaxInclusive,
     stockUnit: p.stockUnit,
     oversellAllowed: p.oversellAllowed,
     active: p.active,
     variantCount: p.variants.length,
-    totalStock: p.stockLevels
-      .reduce((sum, s) => sum + Number(s.quantity), 0)
-      .toFixed(2),
+    totalStock: totalStock.toFixed(2),
+    allocatedStock: allocatedStock.toFixed(2),
+    availableStock: availableStock.toFixed(2),
+    incomingStock: incomingStock.toFixed(2),
     inventoryValue: p.costLayers
       .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostGbp), 0)
       .toFixed(2),
     createdAt: p.createdAt,
     updatedAt: p.updatedAt,
-  }))
+  }}
+  )
+
+  // For computed sort fields, sort in memory then paginate
+  if (isComputedSort) {
+    const mult = sortDir === 'asc' ? 1 : -1
+    products.sort((a, b) => {
+      const av = Number(a[sortField as keyof ProductRow] ?? 0)
+      const bv = Number(b[sortField as keyof ProductRow] ?? 0)
+      return (av - bv) * mult
+    })
+    const sliced = products.slice((page - 1) * pageSize, page * pageSize)
+    return { products: sliced, total, page, pageSize }
+  }
 
   return { products, total, page, pageSize }
 }
@@ -163,7 +262,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       include: {
         parent: { select: { sku: true } },
         variants: {
-          include: { stockLevels: { select: { quantity: true } } },
+          include: { stockLevels: { select: { quantity: true, reservedQty: true } } },
           orderBy: { sku: 'asc' },
         },
         stockLevels: {
@@ -237,6 +336,42 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
   // Top-level incomingPoQty = only lines with no destination warehouse assigned
   const incomingPoQty = (incomingPoByWarehouse.get('__unassigned__') ?? 0).toFixed(2)
 
+  // Compute aggregate allocated/incoming for the product itself
+  const totalAllocated = p.stockLevels.reduce((sum, s) => sum + Number(s.reservedQty), 0)
+  const totalIncomingTransfer = [...incomingTransferByWarehouse.entries()]
+    .filter(([k]) => k !== '__unassigned__').reduce((sum, [, v]) => sum + v, 0)
+  const totalIncomingPo = [...incomingPoByWarehouse.values()].reduce((sum, v) => sum + v, 0)
+  const productIncoming = totalIncomingTransfer + totalIncomingPo
+
+  // Batch query incoming stock for variants
+  const variantIds = p.variants.map((v) => v.id)
+  const variantIncomingMap = new Map<string, number>()
+  if (variantIds.length > 0) {
+    const [vTransfers, vPOs] = await Promise.all([
+      db.stockTransferLine.groupBy({
+        by: ['productId'],
+        where: { productId: { in: variantIds }, transfer: { status: 'IN_TRANSIT' } },
+        _sum: { qty: true, qtyReceived: true },
+      }),
+      db.purchaseOrderLine.groupBy({
+        by: ['productId'],
+        where: {
+          productId: { in: variantIds },
+          po: { status: { in: ['DRAFT', 'RFQ_SENT', 'PO_SENT', 'PARTIALLY_RECEIVED'] }, type: 'GOODS' },
+        },
+        _sum: { qty: true, qtyReceived: true },
+      }),
+    ])
+    for (const t of vTransfers) {
+      const rem = Math.max(0, Number(t._sum.qty ?? 0) - Number(t._sum.qtyReceived ?? 0))
+      if (rem > 0) variantIncomingMap.set(t.productId, (variantIncomingMap.get(t.productId) ?? 0) + rem)
+    }
+    for (const po of vPOs) {
+      const rem = Math.max(0, Number(po._sum.qty ?? 0) - Number(po._sum.qtyReceived ?? 0))
+      if (rem > 0) variantIncomingMap.set(po.productId, (variantIncomingMap.get(po.productId) ?? 0) + rem)
+    }
+  }
+
   // For KIT/BOM: compute unit cost from components; BOM also uses actual stock
   const isKitOrBom = p.type === 'KIT' || p.type === 'BOM'
   const kitUnitCost = isKitOrBom ? await computeKitUnitCostGbp(p.id) : 0
@@ -256,6 +391,8 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     parentId: p.parentId,
     parentSku: p.parent?.sku ?? null,
     barcode: p.barcode,
+    hsCode: p.hsCode ?? null,
+    countryOfOrigin: p.countryOfOrigin ?? null,
     weight: p.weight?.toString() ?? null,
     widthCm: p.widthCm?.toString() ?? null,
     heightCm: p.heightCm?.toString() ?? null,
@@ -263,12 +400,20 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     imageUrl: p.imageUrl ?? null,
     salesPriceGbp: p.salesPriceGbp?.toString() ?? null,
     salePriceGbp: p.salePriceGbp?.toString() ?? null,
+    priceRange: p.type === 'VARIABLE' && p.variants.length > 0 ? (() => {
+      const prices = p.variants.map((v) => Number(v.salesPriceGbp)).filter((n) => n > 0)
+      if (!prices.length) return null
+      return { min: Math.min(...prices).toFixed(2), max: Math.max(...prices).toFixed(2) }
+    })() : null,
     salesPriceTaxInclusive: p.salesPriceTaxInclusive,
     stockUnit: p.stockUnit,
     oversellAllowed: p.oversellAllowed,
     active: p.active,
     variantCount: p.variants.length,
     totalStock: totalStockQty.toFixed(2),
+    allocatedStock: totalAllocated.toFixed(2),
+    availableStock: (totalStockQty - totalAllocated).toFixed(2),
+    incomingStock: productIncoming.toFixed(2),
     inventoryValue,
     createdAt: p.createdAt,
     updatedAt: p.updatedAt,
@@ -286,6 +431,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       imageUrl: v.imageUrl ?? null,
       salesPriceGbp: v.salesPriceGbp?.toString() ?? null,
       salePriceGbp: v.salePriceGbp?.toString() ?? null,
+      priceRange: null,
       salesPriceTaxInclusive: v.salesPriceTaxInclusive,
       stockUnit: v.stockUnit,
       oversellAllowed: v.oversellAllowed,
@@ -294,6 +440,14 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       totalStock: v.stockLevels
         .reduce((sum, s) => sum + Number(s.quantity), 0)
         .toFixed(2),
+      allocatedStock: v.stockLevels
+        .reduce((sum, s) => sum + Number(s.reservedQty), 0)
+        .toFixed(2),
+      availableStock: (
+        v.stockLevels.reduce((sum, s) => sum + Number(s.quantity), 0) -
+        v.stockLevels.reduce((sum, s) => sum + Number(s.reservedQty), 0)
+      ).toFixed(2),
+      incomingStock: (variantIncomingMap.get(v.id) ?? 0).toFixed(2),
       inventoryValue: '0.00',
       createdAt: v.createdAt,
       updatedAt: v.updatedAt,
@@ -369,6 +523,8 @@ const productSchema = z.object({
   type: z.nativeEnum(ProductType),
   parentId: z.string().optional().nullable(),
   barcode: z.string().optional().nullable(),
+  hsCode: z.string().optional().nullable(),
+  countryOfOrigin: z.string().max(2).optional().nullable(),
   weight: z.string().optional().nullable(),
   salesPriceGbp: z.string().optional().nullable(),
   salePriceGbp: z.string().optional().nullable(),
@@ -399,6 +555,8 @@ export async function createProduct(
     type: formData.get('type') as string,
     parentId: formData.get('parentId') as string || null,
     barcode: formData.get('barcode') as string || null,
+    hsCode: formData.get('hsCode') as string || null,
+    countryOfOrigin: formData.get('countryOfOrigin') as string || null,
     weight: formData.get('weight') as string || null,
     salesPriceGbp: formData.get('salesPriceGbp') as string || null,
     salePriceGbp: formData.get('salePriceGbp') as string || null,
@@ -433,6 +591,8 @@ export async function createProduct(
       type: data.type,
       parentId: data.parentId || null,
       barcode: data.barcode || null,
+      hsCode: data.hsCode || null,
+      countryOfOrigin: data.countryOfOrigin || null,
       weight: data.weight ? data.weight : null,
       salesPriceGbp: data.salesPriceGbp ? data.salesPriceGbp : null,
       salePriceGbp: data.salePriceGbp ? data.salePriceGbp : null,
@@ -474,6 +634,8 @@ export async function updateProduct(
     type: formData.get('type') as string,
     parentId: formData.get('parentId') as string || null,
     barcode: formData.get('barcode') as string || null,
+    hsCode: formData.get('hsCode') as string || null,
+    countryOfOrigin: formData.get('countryOfOrigin') as string || null,
     weight: formData.get('weight') as string || null,
     salesPriceGbp: formData.get('salesPriceGbp') as string || null,
     salePriceGbp: formData.get('salePriceGbp') as string || null,
@@ -509,6 +671,8 @@ export async function updateProduct(
       type: data.type,
       parentId: data.parentId || null,
       barcode: data.barcode || null,
+      hsCode: data.hsCode || null,
+      countryOfOrigin: data.countryOfOrigin || null,
       weight: data.weight ? data.weight : null,
       salesPriceGbp: data.salesPriceGbp ? data.salesPriceGbp : null,
       salePriceGbp: data.salePriceGbp ? data.salePriceGbp : null,

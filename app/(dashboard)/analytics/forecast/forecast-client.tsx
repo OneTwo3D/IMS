@@ -1,18 +1,19 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useState, useEffect, useRef, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { AlertTriangle, ArrowDown, ArrowUp, Minus, Settings2, ShoppingCart, Loader2, TrendingUp, TrendingDown, Package, Download } from 'lucide-react'
+import { AlertTriangle, ArrowDown, ArrowUp, ArrowUpDown, Minus, Settings2, ShoppingCart, Loader2, TrendingUp, TrendingDown, Package, Download, ChevronLeft, ChevronRight } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { ProductLink } from '@/components/inventory/product-link'
+import { ProductThumb } from '@/components/inventory/product-thumb'
 import {
   saveForecastSettings, createReorderPOs,
   type ProductForecast, type ForecastSettings,
 } from '@/app/actions/forecasting'
-import { importHistoricalWcOrders } from '@/lib/connectors/woocommerce/orders'
+import type { HistoricalImportProgress } from '@/lib/connectors/woocommerce/orders'
 import { importHistoricalSalesCsv } from '@/app/actions/wc-import'
 
 type Props = { forecasts: ProductForecast[]; settings: ForecastSettings }
@@ -85,32 +86,86 @@ function SettingsDialog({ settings: initial, onClose }: { settings: ForecastSett
 function TrainingDialog({ onClose }: { onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
+  const [importingType, setImportingType] = useState<'wc' | 'csv' | null>(null)
   const [dateFrom, setDateFrom] = useState('2023-01-01')
   const [dateTo, setDateTo] = useState(new Date().toISOString().slice(0, 10))
   const [result, setResult] = useState<{ message: string; isError: boolean } | null>(null)
-  const fileRef = { current: null as HTMLInputElement | null }
+  const [wcProgress, setWcProgress] = useState<HistoricalImportProgress | null>(null)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  function handleWcImport() {
+  // Poll for WC import progress
+  useEffect(() => {
+    // Check if a job is already running on mount
+    fetch('/api/import/historical-orders').then((r) => r.json()).then((p: HistoricalImportProgress) => {
+      if (p.status === 'running') {
+        setImportingType('wc')
+        setWcProgress(p)
+        startPolling()
+      }
+    }).catch(() => {})
+
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+  }, [])
+
+  function startPolling() {
+    if (pollRef.current) clearInterval(pollRef.current)
+    pollRef.current = setInterval(async () => {
+      try {
+        const res = await fetch('/api/import/historical-orders')
+        const p: HistoricalImportProgress = await res.json()
+        setWcProgress(p)
+        if (p.status === 'done' || p.status === 'error') {
+          if (pollRef.current) clearInterval(pollRef.current)
+          pollRef.current = null
+          setImportingType(null)
+          setResult({ message: p.message, isError: p.status === 'error' })
+          if (p.status === 'done') router.refresh()
+        }
+      } catch { /* ignore poll errors */ }
+    }, 2000)
+  }
+
+  async function handleWcImport() {
     setResult(null)
-    startTransition(async () => {
-      const r = await importHistoricalWcOrders(dateFrom, dateTo)
-      setResult({ message: r.message, isError: r.status === 'error' })
-      if (r.status === 'done') router.refresh()
-    })
+    setWcProgress(null)
+    setImportingType('wc')
+    try {
+      const res = await fetch('/api/import/historical-orders', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dateFrom, dateTo }),
+      })
+      if (!res.ok) {
+        const text = await res.text()
+        setResult({ message: `Server error: ${res.status}`, isError: true })
+        setImportingType(null)
+        return
+      }
+      // Job started — begin polling
+      startPolling()
+    } catch (e) {
+      setResult({ message: String(e), isError: true })
+      setImportingType(null)
+    }
   }
 
   async function handleCsvImport(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (!file) return
     setResult(null)
+    setImportingType('csv')
     startTransition(async () => {
       const fd = new FormData()
       fd.append('file', file)
       const r = await importHistoricalSalesCsv(fd)
       setResult({ message: r.message, isError: r.status === 'error' })
+      setImportingType(null)
       if (r.status === 'done') router.refresh()
     })
   }
+
+  const isWcRunning = importingType === 'wc'
+  const isBusy = isPending || isWcRunning
 
   return (
     <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-lg sm:max-w-lg">
@@ -119,6 +174,7 @@ function TrainingDialog({ onClose }: { onClose: () => void }) {
         <p className="text-muted-foreground">
           Import historical sales data to improve forecast accuracy. This creates demand records
           from past orders without affecting current stock levels.
+          The import runs in the background — you can close this dialog and continue working.
         </p>
 
         {/* WooCommerce import */}
@@ -131,17 +187,35 @@ function TrainingDialog({ onClose }: { onClose: () => void }) {
           <div className="grid grid-cols-2 gap-3">
             <div className="space-y-1">
               <Label className="text-xs">From</Label>
-              <Input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className="h-8 text-sm" />
+              <Input type="date" value={dateFrom} onChange={(e) => setDateFrom(e.target.value)} className="h-8 text-sm" disabled={isWcRunning} />
             </div>
             <div className="space-y-1">
               <Label className="text-xs">To</Label>
-              <Input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className="h-8 text-sm" />
+              <Input type="date" value={dateTo} onChange={(e) => setDateTo(e.target.value)} className="h-8 text-sm" disabled={isWcRunning} />
             </div>
           </div>
-          <Button size="sm" onClick={handleWcImport} disabled={isPending}>
-            {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Package className="h-3 w-3 mr-1" />}
-            Import from WooCommerce
+          <Button size="sm" onClick={handleWcImport} disabled={isBusy}>
+            {isWcRunning ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Package className="h-3 w-3 mr-1" />}
+            {isWcRunning ? 'Importing…' : 'Import from WooCommerce'}
           </Button>
+          {isWcRunning && wcProgress && (
+            <div className="space-y-1.5">
+              <p className="text-xs text-muted-foreground">{wcProgress.message}</p>
+              {wcProgress.totalOrders > 0 && (
+                <div className="w-full bg-muted rounded-full h-1.5">
+                  <div
+                    className="bg-primary h-1.5 rounded-full transition-all"
+                    style={{ width: `${Math.min(100, Math.round(((wcProgress.ordersProcessed + (wcProgress.ordersSkipped ?? 0)) / wcProgress.totalOrders) * 100))}%` }}
+                  />
+                </div>
+              )}
+              <p className="text-xs text-muted-foreground tabular-nums">
+                {wcProgress.ordersProcessed} imported, {wcProgress.movementsCreated} records created
+                {wcProgress.ordersSkipped > 0 && <>, {wcProgress.ordersSkipped} already imported</>}
+                {wcProgress.itemsSkipped > 0 && <>, {wcProgress.itemsSkipped} items skipped (no SKU match)</>}
+              </p>
+            </div>
+          )}
         </div>
 
         {/* CSV import */}
@@ -151,10 +225,10 @@ function TrainingDialog({ onClose }: { onClose: () => void }) {
             Upload a CSV with columns: <code className="text-[10px] bg-muted px-1 rounded">sku, qty, date</code> (date format: YYYY-MM-DD).
             One row per line item sold.
           </p>
-          <label className="inline-flex items-center gap-1 rounded-md border border-input bg-background px-2.5 h-8 text-xs font-medium hover:bg-muted cursor-pointer">
-            {isPending ? <Loader2 className="h-3 w-3 animate-spin" /> : <Package className="h-3 w-3" />}
-            Upload CSV
-            <input type="file" accept=".csv" className="hidden" onChange={handleCsvImport} disabled={isPending} />
+          <label className={`inline-flex items-center gap-1 rounded-md border border-input bg-background px-2.5 h-8 text-xs font-medium cursor-pointer ${isBusy ? 'opacity-50 pointer-events-none' : 'hover:bg-muted'}`}>
+            {importingType === 'csv' ? <Loader2 className="h-3 w-3 animate-spin" /> : <Package className="h-3 w-3" />}
+            {importingType === 'csv' ? 'Uploading…' : 'Upload CSV'}
+            <input type="file" accept=".csv" className="hidden" onChange={handleCsvImport} disabled={isBusy} />
           </label>
         </div>
 
@@ -163,7 +237,7 @@ function TrainingDialog({ onClose }: { onClose: () => void }) {
         )}
       </div>
       <DialogFooter>
-        <Button variant="outline" onClick={onClose} disabled={isPending}>Close</Button>
+        <Button variant="outline" onClick={onClose}>Close</Button>
       </DialogFooter>
     </DialogContent></Dialog>
   )
@@ -172,6 +246,45 @@ function TrainingDialog({ onClose }: { onClose: () => void }) {
 // ---------------------------------------------------------------------------
 // Main component
 // ---------------------------------------------------------------------------
+type SortField = 'sku' | 'abcClass' | 'urgency' | 'availableStock' | 'avgDailyDemand' | 'demandTrend' | 'avgLeadTimeDays' | 'reorderPoint' | 'safetyStock' | 'daysUntilStockout' | 'recommendedOrderQty' | 'supplierName'
+type SortDir = 'asc' | 'desc'
+
+const PAGE_SIZE = 50
+
+function SortHeader({ field, label, align, sortField, sortDir, onSort, className }: {
+  field: SortField; label: string; align: 'left' | 'right'
+  sortField: SortField; sortDir: SortDir; onSort: (f: SortField) => void; className?: string
+}) {
+  const active = sortField === field
+  return (
+    <th className={`px-3 py-2 text-${align} text-xs font-medium text-muted-foreground ${className ?? ''}`}>
+      <button type="button" className="inline-flex items-center gap-0.5 hover:text-foreground" onClick={() => onSort(field)}>
+        {label}
+        {active ? (
+          sortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />
+        ) : (
+          <ArrowUpDown className="h-3 w-3 opacity-30" />
+        )}
+      </button>
+    </th>
+  )
+}
+
+function compareForecast(a: ProductForecast, b: ProductForecast, field: SortField, dir: SortDir): number {
+  let cmp = 0
+  switch (field) {
+    case 'sku': cmp = a.sku.localeCompare(b.sku); break
+    case 'abcClass': cmp = a.abcClass.localeCompare(b.abcClass); break
+    case 'urgency': {
+      const order = { critical: 0, low: 1, ok: 2, overstock: 3 }
+      cmp = (order[a.urgency] ?? 9) - (order[b.urgency] ?? 9); break
+    }
+    case 'supplierName': cmp = (a.supplierName ?? '').localeCompare(b.supplierName ?? ''); break
+    default: cmp = (a[field] as number) - (b[field] as number)
+  }
+  return dir === 'asc' ? cmp : -cmp
+}
+
 export function ForecastClient({ forecasts, settings }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -182,6 +295,19 @@ export function ForecastClient({ forecasts, settings }: Props) {
   const [abcFilter, setAbcFilter] = useState<'all' | 'A' | 'B' | 'C'>('all')
   const [search, setSearch] = useState('')
   const [error, setError] = useState('')
+  const [sortField, setSortField] = useState<SortField>('daysUntilStockout')
+  const [sortDir, setSortDir] = useState<SortDir>('asc')
+  const [page, setPage] = useState(1)
+
+  function toggleSort(field: SortField) {
+    if (sortField === field) {
+      setSortDir((d) => (d === 'asc' ? 'desc' : 'asc'))
+    } else {
+      setSortField(field)
+      setSortDir('asc')
+    }
+    setPage(1)
+  }
 
   const filtered = forecasts.filter((f) => {
     if (filter !== 'all' && f.urgency !== filter) return false
@@ -192,6 +318,11 @@ export function ForecastClient({ forecasts, settings }: Props) {
     }
     return true
   })
+
+  const sorted = [...filtered].sort((a, b) => compareForecast(a, b, sortField, sortDir))
+  const totalPages = Math.max(1, Math.ceil(sorted.length / PAGE_SIZE))
+  const safePage = Math.min(page, totalPages)
+  const paged = sorted.slice((safePage - 1) * PAGE_SIZE, safePage * PAGE_SIZE)
 
   const needsReorder = forecasts.filter((f) => f.urgency === 'critical' || f.urgency === 'low')
 
@@ -267,10 +398,10 @@ export function ForecastClient({ forecasts, settings }: Props) {
 
       {/* Filters */}
       <div className="flex flex-wrap items-center gap-2">
-        <Input placeholder="Search SKU, name, supplier…" value={search} onChange={(e) => setSearch(e.target.value)} className="h-8 text-sm max-w-xs" />
+        <Input placeholder="Search SKU, name, supplier…" value={search} onChange={(e) => { setSearch(e.target.value); setPage(1) }} className="h-8 text-sm max-w-xs" />
         <div className="flex gap-1">
           {(['all', 'critical', 'low', 'ok', 'overstock'] as const).map((u) => (
-            <Button key={u} variant={filter === u ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => setFilter(u)}>
+            <Button key={u} variant={filter === u ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => { setFilter(u); setPage(1) }}>
               {u === 'all' ? 'All' : URGENCY_LABEL[u]}
             </Button>
           ))}
@@ -278,7 +409,7 @@ export function ForecastClient({ forecasts, settings }: Props) {
         <span className="w-px h-5 bg-border" />
         <div className="flex gap-1">
           {(['all', 'A', 'B', 'C'] as const).map((c) => (
-            <Button key={c} variant={abcFilter === c ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => setAbcFilter(c)}>
+            <Button key={c} variant={abcFilter === c ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => { setAbcFilter(c); setPage(1) }}>
               {c === 'all' ? 'All ABC' : `Class ${c}`}
             </Button>
           ))}
@@ -301,27 +432,31 @@ export function ForecastClient({ forecasts, settings }: Props) {
           <thead className="border-b bg-muted/50">
             <tr>
               <th className="w-8 px-3 py-2" />
-              <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
-              <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground w-16">ABC</th>
-              <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground w-20">Status</th>
-              <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-20">Stock</th>
-              <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-20">Daily Demand</th>
-              <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-16">Trend</th>
-              <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-20">Lead Time</th>
-              <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-20">Reorder Pt</th>
-              <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-20">Safety</th>
-              <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-24">Days to S/O</th>
-              <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-20">Order Qty</th>
-              <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Supplier</th>
+              <th className="w-12 px-2 py-2" />
+              <SortHeader field="sku" label="Product" align="left" sortField={sortField} sortDir={sortDir} onSort={toggleSort} />
+              <SortHeader field="abcClass" label="ABC" align="left" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-16" />
+              <SortHeader field="urgency" label="Status" align="left" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
+              <SortHeader field="availableStock" label="Stock" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
+              <SortHeader field="avgDailyDemand" label="Daily Demand" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
+              <SortHeader field="demandTrend" label="Trend" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-16" />
+              <SortHeader field="avgLeadTimeDays" label="Lead Time" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
+              <SortHeader field="reorderPoint" label="Reorder Pt" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
+              <SortHeader field="safetyStock" label="Safety" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
+              <SortHeader field="daysUntilStockout" label="Days to S/O" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-24" />
+              <SortHeader field="recommendedOrderQty" label="Order Qty" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
+              <SortHeader field="supplierName" label="Supplier" align="left" sortField={sortField} sortDir={sortDir} onSort={toggleSort} />
             </tr>
           </thead>
           <tbody className="divide-y">
-            {filtered.map((f) => (
+            {paged.map((f) => (
               <tr key={f.productId} className={`hover:bg-muted/30 ${f.urgency === 'critical' ? 'bg-red-50 dark:bg-red-950/20' : ''}`}>
                 <td className="px-3 py-2">
                   {f.supplierId && f.recommendedOrderQty > 0 && (
                     <input type="checkbox" checked={selected.has(f.productId)} onChange={() => toggleSelect(f.productId)} className="rounded border-input" />
                   )}
+                </td>
+                <td className="w-12 px-2 py-1">
+                  <ProductThumb productId={f.productId} imageUrl={f.imageUrl} name={f.name} />
                 </td>
                 <td className="px-3 py-2">
                   <ProductLink productId={f.productId} sku={f.sku} name={f.name} />
@@ -367,8 +502,38 @@ export function ForecastClient({ forecasts, settings }: Props) {
         </table>
       </div>
 
-      {filtered.length === 0 && (
+      {filtered.length === 0 ? (
         <p className="text-sm text-muted-foreground text-center py-8">No products match the current filters.</p>
+      ) : totalPages > 1 && (
+        <div className="flex items-center justify-between text-sm">
+          <span className="text-muted-foreground text-xs">
+            Showing {(safePage - 1) * PAGE_SIZE + 1}–{Math.min(safePage * PAGE_SIZE, sorted.length)} of {sorted.length}
+          </span>
+          <div className="flex items-center gap-1">
+            <Button variant="outline" size="icon" className="h-7 w-7" disabled={safePage <= 1} onClick={() => setPage(safePage - 1)}>
+              <ChevronLeft className="h-4 w-4" />
+            </Button>
+            {Array.from({ length: totalPages }, (_, i) => i + 1)
+              .filter((p) => p === 1 || p === totalPages || Math.abs(p - safePage) <= 2)
+              .reduce<(number | 'gap')[]>((acc, p, i, arr) => {
+                if (i > 0 && p - (arr[i - 1] as number) > 1) acc.push('gap')
+                acc.push(p)
+                return acc
+              }, [])
+              .map((p, i) =>
+                p === 'gap' ? (
+                  <span key={`gap-${i}`} className="px-1 text-muted-foreground">…</span>
+                ) : (
+                  <Button key={p} variant={p === safePage ? 'default' : 'outline'} size="sm" className="h-7 w-7 text-xs p-0" onClick={() => setPage(p)}>
+                    {p}
+                  </Button>
+                )
+              )}
+            <Button variant="outline" size="icon" className="h-7 w-7" disabled={safePage >= totalPages} onClick={() => setPage(safePage + 1)}>
+              <ChevronRight className="h-4 w-4" />
+            </Button>
+          </div>
+        </div>
       )}
 
       {showSettings && <SettingsDialog settings={settings} onClose={() => setShowSettings(false)} />}

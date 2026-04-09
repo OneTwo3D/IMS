@@ -24,6 +24,7 @@ import {
 import type { CurrencyRow } from '@/app/actions/currencies'
 import type { StockLevelEntry } from '@/app/actions/stock'
 import { ProductLink } from '@/components/inventory/product-link'
+import { ProductThumb } from '@/components/inventory/product-thumb'
 
 type WarehouseInfo = { id: string; code: string; name: string }
 type Props = {
@@ -1009,6 +1010,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
         <table className="w-full text-sm">
           <thead className="border-b bg-muted/30">
             <tr>
+              <th className="w-12 px-2 py-2" />
               <th className="px-4 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
               <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-16">Qty</th>
               <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-28">Unit Price ({sym})</th>
@@ -1034,6 +1036,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
               const returned = so.refunds?.reduce((s, r) => s + r.lines.filter((rl) => rl.productId === line.productId).reduce((s2, rl) => s2 + rl.qty, 0), 0) ?? 0
               return (
                 <tr key={line.id}>
+                  <td className="w-12 px-2 py-1">
+                    {line.productId && <ProductThumb productId={line.productId} imageUrl={line.imageUrl} name={line.description} />}
+                  </td>
                   <td className="px-4 py-2">{line.productId ? <ProductLink productId={line.productId} sku={line.sku} name={line.description} /> : <span className="text-sm">{line.description}</span>}</td>
                   <td className="px-4 py-2 text-right tabular-nums">{line.qty}</td>
                   <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">{line.unitPriceForeign.toFixed(2)}</td>

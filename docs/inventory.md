@@ -20,6 +20,20 @@ Select multiple products using the checkboxes, then choose a bulk action:
 - **Delete** -- Permanently remove the selected products.
 - **Deactivate** -- Mark the selected products as inactive so they no longer appear in order forms.
 
+### Column Visibility
+
+Click the **Columns** button to show or hide table columns. Your selection is saved in the browser so it persists between sessions. Available columns include:
+
+- **SKU**, **Name**, **Type**, **Status** — visible by default
+- **Parent SKU**, **Barcode**, **Dimensions**, **Weight** — hidden by default
+- **Regular Price**, **Sale Price**, **Tax Incl.** — pricing columns
+- **Stock** — total on-hand quantity (visible by default)
+- **Allocated** — quantity reserved by active sales or manufacturing orders (amber when > 0)
+- **Available** — on hand minus allocated (red when negative)
+- **Incoming** — quantity expected from open purchase orders or in-transit transfers (blue)
+- **COGS Value** — total inventory value from FIFO cost layers
+- **Variants**, **Created**, **Updated** — additional metadata columns
+
 ### CSV Export
 
 Click **Export** to download the current filtered product list as a CSV file.
@@ -35,8 +49,10 @@ Click **New Product** to open the product form. The following fields are availab
 | **Name** | The display name shown throughout the system. |
 | **Type** | The product type (see below). |
 | **Barcode** | An optional barcode or EAN for scanning. |
-| **Weight** | Product weight, used for shipping and landed cost calculations. |
-| **Dimensions** | Length, width, and height. |
+| **HS Code** | The Harmonised System code for customs declarations. |
+| **Country of Origin** | The 2-letter ISO country code where the product is manufactured. |
+| **Weight** | Product weight in kg, used for shipping and landed cost calculations. |
+| **Dimensions** | Width, height, and depth in cm. |
 | **Cost Price** | The default purchase cost (overridden by FIFO layers once stock is received). |
 | **Sell Price** | The default selling price. |
 | **Stock Unit** | The unit of measure (e.g. each, kg, metre). |
@@ -111,6 +127,8 @@ This information is used to pre-fill prices when creating new purchase orders.
 ## Variable Products -- Options and Variants
 
 When editing a Variable product, you define **options** (e.g. Size with values S, M, L and Colour with values Red, Blue). The system can then **generate variants** for every combination automatically. Each generated variant inherits the parent's details and can be customised individually.
+
+The variant table on a Variable product's detail page shows each variant with its thumbnail, SKU, name, stock, allocated, available, incoming, price, and status. Click any variant's SKU to open its detail page.
 
 
 ## Kit Products -- Component Stock

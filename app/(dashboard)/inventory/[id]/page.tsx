@@ -123,6 +123,8 @@ export default async function ProductDetailPage({
                 type: product.type,
                 parentId: variableProducts.find((v) => v.sku === product.parentSku)?.id,
                 barcode: product.barcode ?? undefined,
+                hsCode: product.hsCode ?? undefined,
+                countryOfOrigin: product.countryOfOrigin ?? undefined,
                 weight: product.weight ?? undefined,
                 imageUrl: product.imageUrl,
                 widthCm: product.widthCm,

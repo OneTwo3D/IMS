@@ -3,7 +3,7 @@
 import { useState, useTransition } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { Plus, Trash2, Sparkles, UserX } from 'lucide-react'
+import { Plus, Trash2, Sparkles, Package } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -185,9 +185,13 @@ export function VariantGenerator({ productId, initialOptions, variants }: Props)
           <Table>
             <TableHeader>
               <TableRow>
+                <TableHead className="w-12 px-2" />
                 <TableHead>SKU</TableHead>
                 <TableHead>Name</TableHead>
                 <TableHead className="text-right">Stock</TableHead>
+                <TableHead className="text-right">Allocated</TableHead>
+                <TableHead className="text-right">Available</TableHead>
+                <TableHead className="text-right">Incoming</TableHead>
                 <TableHead className="text-right">Price</TableHead>
                 <TableHead>Status</TableHead>
                 <TableHead className="w-10" />
@@ -196,6 +200,17 @@ export function VariantGenerator({ productId, initialOptions, variants }: Props)
             <TableBody>
               {variants.map((v) => (
                 <TableRow key={v.id}>
+                  <TableCell className="w-12 px-2 py-1">
+                    <Link href={`/inventory/${v.id}`} className="block">
+                      {v.imageUrl ? (
+                        <img src={v.imageUrl} alt={v.name} className="h-8 w-8 rounded object-cover border border-border bg-muted" />
+                      ) : (
+                        <span className="flex h-8 w-8 items-center justify-center rounded border border-border bg-muted text-muted-foreground">
+                          <Package className="h-3.5 w-3.5" />
+                        </span>
+                      )}
+                    </Link>
+                  </TableCell>
                   <TableCell>
                     <Link
                       href={`/inventory/${v.id}`}
@@ -207,6 +222,21 @@ export function VariantGenerator({ productId, initialOptions, variants }: Props)
                   <TableCell className="text-sm">{v.name}</TableCell>
                   <TableCell className="text-right font-mono text-sm">
                     {Number(v.totalStock).toLocaleString()}
+                  </TableCell>
+                  <TableCell className="text-right font-mono text-sm">
+                    {Number(v.allocatedStock) > 0
+                      ? <span className="text-amber-600">{Number(v.allocatedStock).toLocaleString()}</span>
+                      : '—'}
+                  </TableCell>
+                  <TableCell className="text-right font-mono text-sm">
+                    <span className={Number(v.availableStock) < 0 ? 'text-destructive' : ''}>
+                      {Number(v.availableStock).toLocaleString()}
+                    </span>
+                  </TableCell>
+                  <TableCell className="text-right font-mono text-sm">
+                    {Number(v.incomingStock) > 0
+                      ? <span className="text-blue-600">+{Number(v.incomingStock).toLocaleString()}</span>
+                      : '—'}
                   </TableCell>
                   <TableCell className="text-right font-mono text-sm">
                     {v.salesPriceGbp ? `£${Number(v.salesPriceGbp).toFixed(2)}` : '—'}

@@ -16,6 +16,7 @@ export type PoLineRow = {
   productId: string
   sku: string
   productName: string
+  imageUrl: string | null
   description: string | null
   qty: number
   unitCostForeign: number
@@ -226,7 +227,7 @@ const PO_SELECT = {
       qtyReceived: true,
       qtyReturned: true,
       sortOrder: true,
-      product: { select: { sku: true, name: true } },
+      product: { select: { sku: true, name: true, imageUrl: true } },
     },
     orderBy: { sortOrder: 'asc' as const },
   },
@@ -319,7 +320,7 @@ function mapLine(l: {
   qtyReceived: unknown
   qtyReturned: unknown
   sortOrder: number
-  product: { sku: string; name: string }
+  product: { sku: string; name: string; imageUrl: string | null }
 }): PoLineRow {
   const qty = Number(l.qty)
   const qtyReceived = Number(l.qtyReceived)
@@ -329,6 +330,7 @@ function mapLine(l: {
     productId: l.productId,
     sku: l.product.sku,
     productName: l.product.name,
+    imageUrl: l.product.imageUrl,
     description: l.description,
     qty,
     unitCostForeign: Number(l.unitCostForeign),
@@ -383,7 +385,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
               poLine: {
                 select: {
                   productId: true,
-                  product: { select: { sku: true, name: true } },
+                  product: { select: { sku: true, name: true, imageUrl: true } },
                 },
               },
             },
@@ -407,7 +409,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
               poLine: {
                 select: {
                   productId: true,
-                  product: { select: { sku: true, name: true } },
+                  product: { select: { sku: true, name: true, imageUrl: true } },
                 },
               },
             },
@@ -441,7 +443,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
               poLine: {
                 select: {
                   productId: true,
-                  product: { select: { sku: true, name: true } },
+                  product: { select: { sku: true, name: true, imageUrl: true } },
                 },
               },
             },

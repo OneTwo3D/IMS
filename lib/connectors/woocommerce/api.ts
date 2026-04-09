@@ -21,10 +21,10 @@ export async function wcFetch(
   path: string,
   params: Record<string, string> = {},
   creds?: ConnectorCredentials | null,
-): Promise<{ data: unknown; totalPages: number; error?: string }> {
+): Promise<{ data: unknown; totalPages: number; totalItems: number; error?: string }> {
   const credentials = creds ?? (await getWcCredentials())
   if (!credentials) {
-    return { data: null, totalPages: 0, error: 'WooCommerce not configured. Set wc_url, wc_consumer_key, wc_consumer_secret in Settings.' }
+    return { data: null, totalPages: 0, totalItems: 0, error: 'WooCommerce not configured. Set wc_url, wc_consumer_key, wc_consumer_secret in Settings.' }
   }
 
   const url = new URL(`${credentials.url}/wp-json/wc/v3${path}`)
@@ -33,16 +33,22 @@ export async function wcFetch(
   const auth = Buffer.from(`${credentials.key}:${credentials.secret}`).toString('base64')
   const res = await fetch(url.toString(), {
     headers: { Authorization: `Basic ${auth}` },
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(120000),
   })
 
   if (!res.ok) {
-    return { data: null, totalPages: 0, error: `WC API error: ${res.status} ${res.statusText}` }
+    return { data: null, totalPages: 0, totalItems: 0, error: `WC API error: ${res.status} ${res.statusText}` }
+  }
+
+  const contentType = res.headers.get('content-type') ?? ''
+  if (!contentType.includes('application/json')) {
+    return { data: null, totalPages: 0, totalItems: 0, error: `WC API returned non-JSON response (${contentType}). The server may have timed out.` }
   }
 
   const totalPages = parseInt(res.headers.get('x-wp-totalpages') ?? '1')
+  const totalItems = parseInt(res.headers.get('x-wp-total') ?? '0')
   const data = await res.json()
-  return { data, totalPages }
+  return { data, totalPages, totalItems }
 }
 
 export async function wcPost(

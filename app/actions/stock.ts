@@ -317,6 +317,7 @@ export type AdjustmentMovementRow = {
   productId: string
   productSku: string
   productName: string
+  imageUrl: string | null
   warehouseId: string
   warehouseName: string
   warehouseCode: string
@@ -339,7 +340,7 @@ export async function getAdjustmentHistory(limit = 200): Promise<AdjustmentMovem
       qty: true,
       note: true,
       createdAt: true,
-      product: { select: { sku: true, name: true } },
+      product: { select: { sku: true, name: true, imageUrl: true } },
       fromWarehouse: { select: { id: true, code: true, name: true } },
       toWarehouse: { select: { id: true, code: true, name: true } },
     },
@@ -353,6 +354,7 @@ export async function getAdjustmentHistory(limit = 200): Promise<AdjustmentMovem
       productId: r.productId,
       productSku: r.product.sku,
       productName: r.product.name,
+      imageUrl: r.product.imageUrl,
       warehouseId: warehouse?.id ?? '',
       warehouseName: warehouse?.name ?? '',
       warehouseCode: warehouse?.code ?? '',

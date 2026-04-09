@@ -69,6 +69,8 @@ No stock changes occur as nothing was allocated.
 The detail page shows:
 
 - Full order details including product, components, quantities, and warehouse
+- **Product image** — a larger product thumbnail displayed alongside the order details for quick visual identification
+- **Component thumbnails** — each component row in the table includes a small product image
 - Current progress status
 - Options to generate a **PDF** or **email the manufacturer**
 

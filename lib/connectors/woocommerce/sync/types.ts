@@ -186,7 +186,28 @@ export type WcFullProduct = {
   variations: number[]
   meta_data: WcMeta[]
   parent_id: number
-  barcode?: string
+  global_unique_id?: string  // WC 9.2+ native GTIN/EAN/UPC/ISBN field
+}
+
+export type WcVariation = {
+  id: number
+  sku: string
+  status: string
+  description: string
+  price: string
+  regular_price: string
+  sale_price: string
+  on_sale: boolean
+  manage_stock: boolean
+  stock_quantity: number | null
+  stock_status: string
+  weight: string
+  dimensions: { length: string; width: string; height: string }
+  images: { id: number; src: string; name: string; alt: string }[]  // WC variation: single-element array
+  attributes: { id: number; name: string; option: string }[]
+  meta_data: WcMeta[]
+  parent_id: number
+  global_unique_id?: string
 }
 
 export type WcTrackingItem = {

@@ -13,7 +13,7 @@
 export { getWcCredentials, wcFetch, wcPost, wcPut } from './api'
 
 // Legacy exports
-export { importHistoricalWcOrders, type HistoricalImportProgress } from './orders'
+export { startHistoricalImport, getImportProgress, type HistoricalImportProgress } from './orders'
 export { fetchWcProductUrl } from './products'
 export { getWcDeliveryStatus } from './delivery'
 

@@ -191,6 +191,11 @@ export async function syncNewWcOrders(): Promise<SyncResult> {
 
   const lastSync = lastSyncSetting?.value || null
 
+  // First-time import: fetch all statuses to get the full order history
+  if (!lastSync) {
+    statuses = ['pending', 'processing', 'on-hold', 'completed', 'cancelled', 'refunded', 'failed']
+  }
+
   // Fetch orders page by page
   let page = 1
   let totalPages = 1

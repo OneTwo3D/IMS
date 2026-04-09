@@ -35,6 +35,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   const [s, setS] = useState(init)
   const [saved, setSaved] = useState(false)
   const [syncResult, setSyncResult] = useState<string | null>(null)
+  const [syncingType, setSyncingType] = useState<'orders' | 'products' | 'stock' | null>(null)
   const [newTaxClass, setNewTaxClass] = useState('')
   const [newTaxRateId, setNewTaxRateId] = useState('')
   const [wcUrl, setWcUrl] = useState(wcCredentials.url)
@@ -55,8 +56,10 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
 
   function handleSync(type: 'orders' | 'products' | 'stock') {
     setSyncResult(null)
+    setSyncingType(type)
     startTransition(async () => {
       const result = await triggerManualSync(type)
+      setSyncingType(null)
       if (result.success) {
         setSyncResult(`${type} sync completed: ${JSON.stringify(result.result)}`)
         router.refresh()
@@ -164,7 +167,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
 
         <div className="flex items-center gap-2">
           <Button size="sm" onClick={() => handleSync('orders')} disabled={isPending}>
-            {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
+            {syncingType === 'orders' ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
             Sync Orders Now
           </Button>
           {s.last_wc_order_sync_at && (
@@ -191,8 +194,9 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
                 </label>
               ))}
             </div>
-            <Button size="sm" variant="outline" onClick={() => handleSync('products')} disabled={isPending}>
-              <RefreshCw className="h-3 w-3 mr-1" />Sync Products Now
+            <Button size="sm" onClick={() => handleSync('products')} disabled={isPending}>
+              {syncingType === 'products' ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
+              Sync Products Now
             </Button>
           </div>
         )}
@@ -209,9 +213,19 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
           </div>
         </label>
         {s.wc_stock_sync_enabled === 'true' && (
-          <Button size="sm" variant="outline" onClick={() => handleSync('stock')} disabled={isPending}>
-            <ArrowUpFromLine className="h-3 w-3 mr-1" />Push Stock Now
-          </Button>
+          <div className="space-y-3">
+            <label className="flex items-center gap-3 cursor-pointer">
+              <input type="checkbox" checked={s.wc_cogs_sync_enabled === 'true'} onChange={(e) => setS({ ...s, wc_cogs_sync_enabled: e.target.checked ? 'true' : 'false' })} className="rounded border-input" />
+              <div>
+                <span className="text-sm font-medium">Include COGS (Cost of Goods Sold)</span>
+                <p className="text-xs text-muted-foreground">Pushes the next FIFO unit cost to WooCommerce&apos;s native Cost of Goods Sold field</p>
+              </div>
+            </label>
+            <Button size="sm" variant="outline" onClick={() => handleSync('stock')} disabled={isPending}>
+              {syncingType === 'stock' ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowUpFromLine className="h-3 w-3 mr-1" />}
+              Push Stock Now
+            </Button>
+          </div>
         )}
       </Card>
 

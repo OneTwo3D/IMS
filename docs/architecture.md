@@ -118,7 +118,7 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 ### Key Models (30+)
 
 **Core Inventory:**
-- `Product` — all product types, with SKU, pricing, dimensions, weight, stock unit, images
+- `Product` — all product types, with SKU, pricing, dimensions, weight, stock unit, images, HS code, country of origin
 - `ProductOption` — variant options (e.g. Colour, Size) with comma-separated values
 - `ProductComponent` — component list for KIT and BOM products
 - `Warehouse` — locations (STANDARD, QUARANTINE, RESTOCK types)
@@ -163,6 +163,7 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 
 **Auth and Audit:**
 - `User` — with roles (ADMIN, MANAGER, WAREHOUSE, FINANCE, READONLY, SUPPLIER), optional TOTP 2FA, passkey support
+- `Notification` — per-user or broadcast notifications with type (info/success/warning/error), read tracking, and optional action URLs
 - `ActivityLog` — full audit trail with entity type, action, level, tag, and metadata
 
 **Integration:**
@@ -281,8 +282,8 @@ WooCommerce integration is implemented as a modular connector in `lib/connectors
 - **Order import** — via webhook (`/api/webhooks/woocommerce/orders`) or cron polling (`/api/cron/wc-sync`), with FX conversion
 - **Status sync** — bidirectional mapping between WC and IMS statuses (configurable via `WcStatusMapping` with seeded defaults matching WC flowchart)
 - **Refund sync** — creates refund records with credit notes and COGS reversal, via webhook (`/api/webhooks/woocommerce/refunds`)
-- **Product sync** — bidirectional product data sync via webhook (`/api/webhooks/woocommerce/products`)
-- **Stock sync** — IMS to WC, pushed per SKU across sync-enabled warehouses
+- **Product sync** — bidirectional product data sync via webhook (`/api/webhooks/woocommerce/products`), including prices, dimensions, weight, GTIN/EAN (`global_unique_id`), HS code, and country of origin from WC product attributes
+- **Stock sync** — IMS to WC, pushed per SKU across sync-enabled warehouses; optional COGS sync toggle
 - **Tax class mapping** — maps WC tax classes to IMS TaxRate records
 - **Completion flow** — WC completed status triggers auto-allocation, shipment creation with tracking
 - **Webhook security** — HMAC verification using timing-safe comparison (`timingSafeEqual`)

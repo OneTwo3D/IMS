@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import { listProducts, getVariableProducts } from '@/app/actions/products'
+import type { SortField, SortDir } from '@/app/actions/products'
 import { getStockUnitOptions } from '@/app/actions/settings'
 import { ProductFilters } from './product-filters'
 import { ProductTable } from '@/components/inventory/product-table'
@@ -13,6 +14,8 @@ type SearchParams = {
   type?: string
   active?: string
   page?: string
+  sort?: string
+  dir?: string
 }
 
 export default async function InventoryPage({
@@ -29,6 +32,8 @@ export default async function InventoryPage({
       type: sp.type as ProductType | 'ALL' | undefined,
       active: sp.active as 'true' | 'false' | 'all' | undefined,
       page,
+      sort: (sp.sort as SortField) || undefined,
+      dir: (sp.dir as SortDir) || undefined,
     }),
     getVariableProducts(),
     getStockUnitOptions(),
@@ -49,7 +54,7 @@ export default async function InventoryPage({
         total={result.total}
         page={result.page}
         pageSize={result.pageSize}
-        searchParams={{ search: sp.search, type: sp.type, active: sp.active }}
+        searchParams={{ search: sp.search, type: sp.type, active: sp.active, sort: sp.sort, dir: sp.dir }}
       />
     </div>
   )

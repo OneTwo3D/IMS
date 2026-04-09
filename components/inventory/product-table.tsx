@@ -3,12 +3,13 @@
 import { useState, useEffect, useRef, useTransition } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { Download, Columns3, Package } from 'lucide-react'
+import { Download, Columns3, Package, ArrowUp, ArrowDown, ArrowUpDown } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Table, TableHeader, TableBody, TableRow, TableHead, TableCell,
 } from '@/components/ui/table'
+import { PaginationBar } from '@/components/ui/pagination-bar'
 import { CsvImportButton } from './csv-import-button'
 import { importProductsCsv } from '@/app/actions/import'
 import { bulkDeleteProducts, bulkDeactivateProducts } from '@/app/actions/products'
@@ -37,7 +38,8 @@ const TYPE_COLOURS: Record<ProductType, 'default' | 'secondary' | 'outline'> = {
 type ColKey =
   | 'sku' | 'name' | 'type' | 'parentSku' | 'barcode'
   | 'dimensions' | 'weight' | 'salesPriceGbp' | 'salePriceGbp' | 'salesPriceTaxInclusive'
-  | 'totalStock' | 'inventoryValue' | 'variantCount'
+  | 'totalStock' | 'allocatedStock' | 'availableStock' | 'incomingStock'
+  | 'inventoryValue' | 'variantCount'
   | 'active' | 'createdAt' | 'updatedAt'
 
 const ALL_COLUMNS: { key: ColKey; label: string; defaultVisible: boolean }[] = [
@@ -52,12 +54,22 @@ const ALL_COLUMNS: { key: ColKey; label: string; defaultVisible: boolean }[] = [
   { key: 'salePriceGbp',         label: 'Sale Price',         defaultVisible: false },
   { key: 'salesPriceTaxInclusive', label: 'Tax Incl.',        defaultVisible: false },
   { key: 'totalStock',           label: 'Stock',              defaultVisible: true  },
+  { key: 'allocatedStock',       label: 'Allocated',          defaultVisible: false },
+  { key: 'availableStock',       label: 'Available',          defaultVisible: false },
+  { key: 'incomingStock',        label: 'Incoming',           defaultVisible: false },
   { key: 'inventoryValue',       label: 'COGS Value',         defaultVisible: true  },
   { key: 'variantCount',         label: 'Variants',           defaultVisible: false },
   { key: 'active',               label: 'Status',             defaultVisible: true  },
   { key: 'createdAt',            label: 'Created',            defaultVisible: false },
   { key: 'updatedAt',            label: 'Updated',            defaultVisible: false },
 ]
+
+// Map column keys to server-side sort fields (only columns that support server sort)
+const SORTABLE: Partial<Record<ColKey, string>> = {
+  sku: 'sku', name: 'name', type: 'type',
+  salesPriceGbp: 'salesPriceGbp', totalStock: 'totalStock',
+  active: 'active', createdAt: 'createdAt', updatedAt: 'updatedAt',
+}
 
 const STORAGE_KEY = 'ims-product-table-cols'
 
@@ -169,12 +181,33 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
   const visibleCols = ALL_COLUMNS.filter((c) => visible[c.key])
   const totalPages = Math.ceil(total / pageSize)
 
-  function buildPageHref(p: number) {
+  const currentSort = searchParams.sort
+  const currentDir = searchParams.dir ?? 'asc'
+
+  function buildBaseParams() {
     const params = new URLSearchParams()
     if (searchParams.search) params.set('search', searchParams.search)
     if (searchParams.type) params.set('type', searchParams.type)
     if (searchParams.active) params.set('active', searchParams.active)
+    if (searchParams.sort) params.set('sort', searchParams.sort)
+    if (searchParams.dir) params.set('dir', searchParams.dir)
+    return params
+  }
+
+  function buildPageHref(p: number) {
+    const params = buildBaseParams()
     params.set('page', String(p))
+    return `/inventory?${params.toString()}`
+  }
+
+  function buildSortHref(field: string) {
+    const params = new URLSearchParams()
+    if (searchParams.search) params.set('search', searchParams.search)
+    if (searchParams.type) params.set('type', searchParams.type)
+    if (searchParams.active) params.set('active', searchParams.active)
+    params.set('sort', field)
+    params.set('dir', currentSort === field && currentDir === 'asc' ? 'desc' : 'asc')
+    params.set('page', '1')
     return `/inventory?${params.toString()}`
   }
 
@@ -216,15 +249,29 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
       case 'weight':
         return p.weight ? `${p.weight} kg` : '—'
       case 'salesPriceGbp':
+        if (p.type === 'VARIABLE' && p.priceRange) {
+          return p.priceRange.min === p.priceRange.max
+            ? `£${p.priceRange.min}`
+            : `£${p.priceRange.min} – £${p.priceRange.max}`
+        }
         return p.salesPriceGbp ? `£${Number(p.salesPriceGbp).toFixed(2)}` : '—'
       case 'salePriceGbp':
+        if (p.type === 'VARIABLE') return '—'
         return p.salePriceGbp ? `£${Number(p.salePriceGbp).toFixed(2)}` : '—'
       case 'salesPriceTaxInclusive':
         return p.salesPriceTaxInclusive ? 'Yes' : 'No'
       case 'totalStock':
-        if (p.type === 'VARIABLE') return '—'
         if (p.type === 'NON_INVENTORY') return '∞'
         return `${Number(p.totalStock).toLocaleString()} ${p.stockUnit}`
+      case 'allocatedStock':
+        if (p.type === 'NON_INVENTORY') return '—'
+        { const val = Number(p.allocatedStock); return val > 0 ? <span className="text-amber-600">{val.toLocaleString()}</span> : '—' }
+      case 'availableStock':
+        if (p.type === 'NON_INVENTORY') return '∞'
+        { const val = Number(p.availableStock); return <span className={val < 0 ? 'text-destructive' : ''}>{val.toLocaleString()}</span> }
+      case 'incomingStock':
+        if (p.type === 'NON_INVENTORY') return '—'
+        { const val = Number(p.incomingStock); return val > 0 ? <span className="text-blue-600">+{val.toLocaleString()}</span> : '—' }
       case 'inventoryValue':
         if (p.type === 'VARIABLE' || p.type === 'NON_INVENTORY') return '—'
         return `£${Number(p.inventoryValue).toFixed(2)}`
@@ -239,7 +286,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
     }
   }
 
-  const numericCols = new Set<ColKey>(['totalStock', 'inventoryValue', 'salesPriceGbp', 'salePriceGbp', 'variantCount'])
+  const numericCols = new Set<ColKey>(['totalStock', 'allocatedStock', 'availableStock', 'incomingStock', 'inventoryValue', 'salesPriceGbp', 'salePriceGbp', 'variantCount'])
 
   return (
     <div className="space-y-3">
@@ -334,14 +381,28 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
               </TableHead>
               {/* Thumbnail */}
               <TableHead className="w-12 px-2" />
-              {visibleCols.map((c) => (
-                <TableHead
-                  key={c.key}
-                  className={numericCols.has(c.key) ? 'text-right' : undefined}
-                >
-                  {c.label}
-                </TableHead>
-              ))}
+              {visibleCols.map((c) => {
+                const sortKey = SORTABLE[c.key]
+                const isSorted = currentSort === sortKey
+                return (
+                  <TableHead
+                    key={c.key}
+                    className={numericCols.has(c.key) ? 'text-right' : undefined}
+                  >
+                    {sortKey ? (
+                      <Link
+                        href={buildSortHref(sortKey)}
+                        className="inline-flex items-center gap-1 hover:text-foreground"
+                      >
+                        {c.label}
+                        {isSorted
+                          ? (currentDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />)
+                          : <ArrowUpDown className="h-3 w-3 opacity-30" />}
+                      </Link>
+                    ) : c.label}
+                  </TableHead>
+                )
+              })}
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -401,31 +462,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
       </div>
 
       {/* Pagination */}
-      {totalPages > 1 && (
-        <div className="flex items-center justify-between text-sm">
-          <span className="text-muted-foreground">
-            Page {page} of {totalPages}
-          </span>
-          <div className="flex gap-2">
-            {page > 1 && (
-              <Link
-                href={buildPageHref(page - 1)}
-                className={buttonVariants({ variant: 'outline', size: 'sm' })}
-              >
-                Previous
-              </Link>
-            )}
-            {page < totalPages && (
-              <Link
-                href={buildPageHref(page + 1)}
-                className={buttonVariants({ variant: 'outline', size: 'sm' })}
-              >
-                Next
-              </Link>
-            )}
-          </div>
-        </div>
-      )}
+      <PaginationBar page={page} totalPages={totalPages} buildHref={buildPageHref} />
     </div>
   )
 }

@@ -13,6 +13,7 @@ import {
   DialogTitle,
 } from '@/components/ui/dialog'
 import type { ProductFormState } from '@/app/actions/products'
+import { COUNTRY_LIST } from '@/lib/countries'
 
 type VariableProduct = { id: string; sku: string; name: string }
 
@@ -26,6 +27,8 @@ type Props = {
     type?: string
     parentId?: string
     barcode?: string
+    hsCode?: string
+    countryOfOrigin?: string
     weight?: string
     imageUrl?: string | null
     widthCm?: string | null
@@ -65,6 +68,8 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
     type:                 defaultValues?.type                 ?? 'SIMPLE',
     parentId:             defaultValues?.parentId             ?? '',
     barcode:              defaultValues?.barcode              ?? '',
+    hsCode:               defaultValues?.hsCode               ?? '',
+    countryOfOrigin:      defaultValues?.countryOfOrigin      ?? '',
     weight:               defaultValues?.weight               ?? '',
     salesPriceGbp:        defaultValues?.salesPriceGbp        ?? '',
     salePriceGbp:         defaultValues?.salePriceGbp         ?? '',
@@ -196,7 +201,38 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
         />
       </div>
 
-      {/* Pricing */}
+      {/* Customs */}
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-1.5">
+          <Label htmlFor="hsCode">HS Code</Label>
+          <Input
+            id="hsCode"
+            name="hsCode"
+            value={fields.hsCode}
+            onChange={(ev) => set('hsCode', ev.target.value)}
+            placeholder="e.g. 3926.90"
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="countryOfOrigin">Country of Origin</Label>
+          <Select
+            id="countryOfOrigin"
+            name="countryOfOrigin"
+            value={fields.countryOfOrigin}
+            onChange={(ev) => set('countryOfOrigin', ev.target.value)}
+          >
+            <option value="">— Select —</option>
+            {COUNTRY_LIST.map((c) => (
+              <option key={c.code} value={c.code}>{c.name}</option>
+            ))}
+          </Select>
+        </div>
+      </div>
+
+      {/* Pricing — hidden for VARIABLE products (price comes from variants) */}
+      {fields.type === 'VARIABLE' ? (
+        <p className="text-sm text-muted-foreground">Prices are set on individual variants.</p>
+      ) : (
       <div className="space-y-3">
         <div className="grid grid-cols-2 gap-4">
           <div className="space-y-1.5">
@@ -240,6 +276,7 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
           </Label>
         </div>
       </div>
+      )}
 
       {/* Stock unit + behaviour */}
       <div className="grid grid-cols-2 gap-4">

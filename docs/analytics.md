@@ -40,8 +40,17 @@ The inventory report gives you a snapshot of your current stock position:
 
 ## Reorder Forecast
 
-The reorder forecast uses historical demand data to suggest which products need reordering and when. Use this report to:
+The reorder forecast uses historical demand data to suggest which products need reordering and when. Each product row includes a thumbnail image for quick visual identification.
+
+Use this report to:
 
 - Identify products approaching low stock levels
 - Plan purchase orders based on projected demand
 - Avoid stockouts by acting on reorder suggestions early
+
+### Training Data
+
+To improve forecast accuracy, you can import historical sales data:
+
+- **WooCommerce import** — bulk import past WooCommerce orders by date range. A progress indicator shows real-time import status including pages processed and orders imported.
+- **CSV import** — upload a CSV file of historical sales data for products not covered by WooCommerce.

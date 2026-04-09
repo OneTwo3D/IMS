@@ -19,6 +19,7 @@ export type SoLineRow = {
   id: string
   productId: string | null
   sku: string
+  imageUrl: string | null
   description: string
   qty: number
   unitPriceForeign: number  // original price before discount
@@ -249,11 +250,13 @@ function mapLine(l: {
   totalForeign: unknown
   totalGbp: unknown
   cogsGbp: unknown
+  product?: { imageUrl: string | null } | null
 }): SoLineRow {
   return {
     id: l.id,
     productId: l.productId,
     sku: l.sku ?? '',
+    imageUrl: l.product?.imageUrl ?? null,
     description: l.description,
     qty: Number(l.qty),
     unitPriceForeign: Number(l.unitPriceForeign),
@@ -296,6 +299,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
           qty: true, unitPriceForeign: true, unitPriceGbp: true, discountStr: true, discountAmount: true,
           taxForeign: true, taxGbp: true, totalForeign: true, totalGbp: true,
           cogsGbp: true,
+          product: { select: { imageUrl: true } },
         },
       },
       refunds: {

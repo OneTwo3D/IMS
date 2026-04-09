@@ -17,6 +17,7 @@ import {
 import type { ProductRow } from '@/app/actions/products'
 import type { StockLevelEntry } from '@/app/actions/stock'
 import { ProductLink } from '@/components/inventory/product-link'
+import { ProductThumb } from '@/components/inventory/product-thumb'
 
 const STATUS_LABEL: Record<TransferRow['status'], string> = {
   DRAFT: 'Draft',
@@ -222,6 +223,7 @@ function TransferCard({
   stockLevels: StockLevels
   onUpdated: (t: TransferRow) => void
 }) {
+  const imageMap = new Map(products.map((p) => [p.id, p.imageUrl]))
   const [transfer, setTransfer] = useState(initial)
   const [expanded, setExpanded] = useState(false)
   const [editing, setEditing] = useState(false)
@@ -304,13 +306,15 @@ function TransferCard({
             <p className="text-xs text-muted-foreground italic">{transfer.notes}</p>
           )}
           <div className="border border-border rounded-md overflow-hidden">
-            <div className="grid grid-cols-[1fr_auto_auto] gap-3 px-3 py-1.5 bg-muted/30 text-xs font-medium text-muted-foreground border-b border-border">
+            <div className="grid grid-cols-[auto_1fr_auto_auto] gap-3 px-3 py-1.5 bg-muted/30 text-xs font-medium text-muted-foreground border-b border-border">
+              <span className="w-9" />
               <span>Product</span>
               <span className="w-16 text-right">Qty</span>
               <span className="w-16 text-right">Received</span>
             </div>
             {transfer.lines.map((line) => (
-              <div key={line.id} className="grid grid-cols-[1fr_auto_auto] gap-3 px-3 py-1.5 items-center border-b border-border/40 last:border-0 text-sm">
+              <div key={line.id} className="grid grid-cols-[auto_1fr_auto_auto] gap-3 px-3 py-1.5 items-center border-b border-border/40 last:border-0 text-sm">
+                <ProductThumb productId={line.productId} imageUrl={imageMap.get(line.productId) ?? null} name={line.productName} />
                 <div>
                   <ProductLink productId={line.productId} sku={line.sku} name={line.productName} skuClassName="font-mono text-xs font-medium" />
                 </div>

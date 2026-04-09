@@ -22,6 +22,7 @@ export type WcSyncSettings = {
   wc_sync_product_enabled: string
   wc_sync_product_direction: string
   wc_stock_sync_enabled: string
+  wc_cogs_sync_enabled: string
   wc_webhook_secret: string
   last_wc_order_sync_at: string
   last_wc_product_sync_at: string
@@ -30,7 +31,7 @@ export type WcSyncSettings = {
 
 const SYNC_SETTING_KEYS = [
   'wc_sync_enabled', 'wc_sync_order_statuses', 'wc_sync_interval_minutes',
-  'wc_sync_product_enabled', 'wc_sync_product_direction', 'wc_stock_sync_enabled',
+  'wc_sync_product_enabled', 'wc_sync_product_direction', 'wc_stock_sync_enabled', 'wc_cogs_sync_enabled',
   'wc_webhook_secret', 'last_wc_order_sync_at', 'last_wc_product_sync_at', 'last_wc_stock_sync_at',
 ]
 
@@ -41,6 +42,7 @@ const SYNC_DEFAULTS: WcSyncSettings = {
   wc_sync_product_enabled: 'false',
   wc_sync_product_direction: 'from_wc',
   wc_stock_sync_enabled: 'false',
+  wc_cogs_sync_enabled: 'false',
   wc_webhook_secret: '',
   last_wc_order_sync_at: '',
   last_wc_product_sync_at: '',
