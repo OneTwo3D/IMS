@@ -1,15 +1,17 @@
 /**
- * Xero OAuth2 token management for Custom Connections.
+ * Xero OAuth2 token management for standard Web App (authorization_code grant).
  *
- * Custom Connections use client_credentials grant — no user consent screen.
- * The admin enters their Xero app Client ID + Client Secret, and we exchange
- * them for access + refresh tokens directly.
+ * Flow: save credentials → redirect user to Xero consent screen →
+ * Xero redirects back to /api/xero/callback with auth code →
+ * callback exchanges code for access + refresh tokens.
  */
 
 import { db } from '@/lib/db'
 
+const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token'
 const XERO_CONNECTIONS_URL = 'https://api.xero.com/connections'
+const XERO_SCOPES = 'openid profile email offline_access accounting.settings accounting.contacts accounting.invoices accounting.manualjournals accounting.attachments'
 
 type TokenResponse = {
   access_token: string
@@ -44,12 +46,35 @@ export async function getAccessToken(): Promise<{ accessToken: string; tenantId:
 }
 
 /**
- * Initial connection: exchange client_credentials for tokens.
+ * Build the Xero authorization URL. The user's browser is redirected here.
  */
-export async function connect(clientId: string, clientSecret: string): Promise<{ success: boolean; tenantName?: string; error?: string }> {
+export function getAuthorizationUrl(clientId: string, redirectUri: string): string {
+  const params = new URLSearchParams({
+    response_type: 'code',
+    client_id: clientId,
+    redirect_uri: redirectUri,
+    scope: XERO_SCOPES,
+    state: crypto.randomUUID(),
+  })
+  return `${XERO_AUTHORIZE_URL}?${params.toString()}`
+}
+
+/**
+ * Exchange an authorization code for tokens (called from /api/xero/callback).
+ */
+export async function exchangeCodeForTokens(
+  code: string,
+  redirectUri: string,
+): Promise<{ success: boolean; tenantName?: string; error?: string }> {
   try {
-    // Exchange credentials for token
-    const basicAuth = Buffer.from(`${clientId}:${clientSecret}`).toString('base64')
+    const clientId = await db.setting.findUnique({ where: { key: 'xero_client_id' } })
+    const clientSecret = await db.setting.findUnique({ where: { key: 'xero_client_secret' } })
+
+    if (!clientId?.value || !clientSecret?.value) {
+      return { success: false, error: 'Missing Xero credentials' }
+    }
+
+    const basicAuth = Buffer.from(`${clientId.value}:${clientSecret.value}`).toString('base64')
     const tokenRes = await fetch(XERO_TOKEN_URL, {
       method: 'POST',
       headers: {
@@ -57,7 +82,9 @@ export async function connect(clientId: string, clientSecret: string): Promise<{
         'Content-Type': 'application/x-www-form-urlencoded',
       },
       body: new URLSearchParams({
-        grant_type: 'client_credentials',
+        grant_type: 'authorization_code',
+        code,
+        redirect_uri: redirectUri,
       }),
     })
 
@@ -74,7 +101,8 @@ export async function connect(clientId: string, clientSecret: string): Promise<{
     })
 
     if (!connRes.ok) {
-      return { success: false, error: 'Failed to fetch Xero connections' }
+      const connErr = await connRes.text().catch(() => '')
+      return { success: false, error: `Failed to fetch Xero connections (HTTP ${connRes.status}): ${connErr}` }
     }
 
     const connections: XeroConnection[] = await connRes.json()
@@ -117,46 +145,31 @@ export async function connect(clientId: string, clientSecret: string): Promise<{
 }
 
 /**
- * Refresh the access token using stored credentials.
+ * Refresh the access token using the refresh_token grant.
  */
 export async function refreshToken(): Promise<{ accessToken: string; tenantId: string } | null> {
   const token = await db.xeroToken.findFirst()
-  if (!token) return null
+  if (!token?.refreshToken) return null
 
-  // For custom connections, refresh uses client_credentials again
   const clientId = await db.setting.findUnique({ where: { key: 'xero_client_id' } })
   const clientSecret = await db.setting.findUnique({ where: { key: 'xero_client_secret' } })
 
   if (!clientId?.value || !clientSecret?.value) return null
 
   try {
-    let body: URLSearchParams
-    let headers: Record<string, string>
-
-    if (token.refreshToken) {
-      // Use refresh_token grant if available
-      const basicAuth = Buffer.from(`${clientId.value}:${clientSecret.value}`).toString('base64')
-      headers = {
+    const basicAuth = Buffer.from(`${clientId.value}:${clientSecret.value}`).toString('base64')
+    const res = await fetch(XERO_TOKEN_URL, {
+      method: 'POST',
+      headers: {
         'Authorization': `Basic ${basicAuth}`,
         'Content-Type': 'application/x-www-form-urlencoded',
-      }
-      body = new URLSearchParams({
+      },
+      body: new URLSearchParams({
         grant_type: 'refresh_token',
         refresh_token: token.refreshToken,
-      })
-    } else {
-      // Fall back to client_credentials
-      const basicAuth = Buffer.from(`${clientId.value}:${clientSecret.value}`).toString('base64')
-      headers = {
-        'Authorization': `Basic ${basicAuth}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      }
-      body = new URLSearchParams({
-        grant_type: 'client_credentials',
-      })
-    }
+      }),
+    })
 
-    const res = await fetch(XERO_TOKEN_URL, { method: 'POST', headers, body })
     if (!res.ok) return null
 
     const data: TokenResponse = await res.json()

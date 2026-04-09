@@ -1,7 +1,7 @@
 'use client'
 
-import { useState, useTransition } from 'react'
-import { useRouter } from 'next/navigation'
+import { useState, useTransition, useEffect } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, XCircle, Clock } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -28,21 +28,19 @@ const ACCOUNT_FIELDS: { key: keyof XeroSettings; label: string; description: str
   { key: 'xero_sales_account', label: 'Sales Revenue', description: 'Revenue from sales invoices' },
   { key: 'xero_shipping_account', label: 'Shipping Income', description: 'Shipping charges on sales' },
   { key: 'xero_discount_account', label: 'Discounts Given', description: 'Order-level discounts' },
-  { key: 'xero_cogs_account', label: 'Cost of Goods Sold', description: 'COGS on dispatch' },
+  { key: 'xero_purchase_account', label: 'Purchases', description: 'Default account for purchase bills' },
+  { key: 'xero_transit_account', label: 'Stock in Transit', description: 'Goods ordered but not yet received' },
   { key: 'xero_inventory_account', label: 'Inventory Asset', description: 'Stock on hand value' },
-  { key: 'xero_transit_account', label: 'Stock in Transit', description: 'DR side of stock-in-transit journal' },
-  { key: 'xero_transit_credit_account', label: 'Transit Credit', description: 'CR side (e.g. Accrued Purchases)' },
-  { key: 'xero_purchase_account', label: 'Purchases', description: 'Default purchase/bill account' },
+  { key: 'xero_cogs_account', label: 'Cost of Goods Sold', description: 'COGS booked on dispatch' },
 ]
 
 const SYNC_TYPE_TOGGLES: { key: keyof XeroSettings; label: string; description: string }[] = [
   { key: 'xero_sync_sales_invoice', label: 'Sales Invoices', description: 'Push invoices to Xero when generated' },
   { key: 'xero_sync_credit_note', label: 'Credit Notes', description: 'Push credit notes on refund' },
   { key: 'xero_sync_purchase_invoice', label: 'Purchase Bills', description: 'Push supplier bills when PO is invoiced' },
-  { key: 'xero_sync_cogs_journal', label: 'COGS Journals', description: 'Cost of goods sold journal on dispatch' },
+  { key: 'xero_sync_stock_receipt', label: 'Stock Receipts', description: 'Journal: DR Inventory / CR Stock in Transit on goods received' },
+  { key: 'xero_sync_cogs_journal', label: 'COGS Journals', description: 'Journal: DR COGS / CR Inventory on dispatch' },
   { key: 'xero_sync_cogs_reversal', label: 'COGS Reversals', description: 'Reverse COGS on stock returns' },
-  { key: 'xero_sync_stock_in_transit', label: 'Stock in Transit', description: 'Transit journal when PO is sent' },
-  { key: 'xero_sync_stock_receipt', label: 'Stock Receipts', description: 'Receipt journal when goods received' },
   { key: 'xero_sync_inventory_adjustment', label: 'Inventory Adjustments', description: 'Journal for manual stock adjustments' },
 ]
 
@@ -66,6 +64,23 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [accountsMsg, setAccountsMsg] = useState<string | null>(null)
   const [connecting, setConnecting] = useState(false)
   const [syncingAccounts, setSyncingAccounts] = useState(false)
+  const searchParams = useSearchParams()
+
+  // Handle OAuth redirect query params
+  useEffect(() => {
+    const success = searchParams.get('xero_success')
+    const error = searchParams.get('xero_error')
+    if (success) {
+      setConnected(true)
+      setTenantName(success)
+      setConnectMsg(`Connected to ${success}`)
+      // Clean URL
+      window.history.replaceState({}, '', '/sync')
+    } else if (error) {
+      setConnectMsg(`Xero error: ${error}`)
+      window.history.replaceState({}, '', '/sync')
+    }
+  }, [searchParams])
 
   function handleField(key: keyof XeroSettings, value: string) {
     setS(prev => ({ ...prev, [key]: value }))
@@ -81,7 +96,6 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
         xero_sync_purchase_invoice: s.xero_sync_purchase_invoice,
         xero_sync_cogs_journal: s.xero_sync_cogs_journal,
         xero_sync_cogs_reversal: s.xero_sync_cogs_reversal,
-        xero_sync_stock_in_transit: s.xero_sync_stock_in_transit,
         xero_sync_stock_receipt: s.xero_sync_stock_receipt,
         xero_sync_inventory_adjustment: s.xero_sync_inventory_adjustment,
         xero_sync_attach_pdf: s.xero_sync_attach_pdf,
@@ -91,7 +105,6 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
         xero_cogs_account: s.xero_cogs_account,
         xero_inventory_account: s.xero_inventory_account,
         xero_transit_account: s.xero_transit_account,
-        xero_transit_credit_account: s.xero_transit_credit_account,
         xero_purchase_account: s.xero_purchase_account,
       })
       setMsg(result.success ? 'Settings saved.' : `Error: ${result.error}`)
@@ -103,13 +116,11 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     if (!clientId || !clientSecret) { setConnectMsg('Enter Client ID and Client Secret.'); return }
     setConnectMsg(null)
     setConnecting(true)
-    const result = await connectXero(clientId, clientSecret)
+    const result = await connectXero(clientId, clientSecret, window.location.origin)
     setConnecting(false)
-    if (result.success) {
-      setConnected(true)
-      setTenantName(result.tenantName)
-      setConnectMsg(`Connected to ${result.tenantName}`)
-      router.refresh()
+    if (result.success && result.redirectUrl) {
+      setConnectMsg('Redirecting to Xero…')
+      window.location.href = result.redirectUrl
     } else {
       setConnectMsg(`Failed: ${result.error}`)
     }

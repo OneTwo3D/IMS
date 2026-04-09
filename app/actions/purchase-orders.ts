@@ -863,39 +863,6 @@ export async function advancePoStatus(
       metadata: { reference: existing.reference, previousStatus: existing.status, newStatus: targetStatus },
     })
 
-    // Queue Xero stock-in-transit journal when PO is sent: DR Transit / CR Accrued Purchases
-    if (targetStatus === 'PO_SENT') {
-      try {
-        const xeroSettings = await getXeroSettings()
-        const poWithLines = await db.purchaseOrder.findUnique({
-          where: { id },
-          select: { reference: true, lines: { select: { qty: true, unitCostGbp: true, landedUnitCostGbp: true } } },
-        })
-        if (poWithLines) {
-          const totalValue = poWithLines.lines.reduce((sum, l) => {
-            const unitCost = Number(l.landedUnitCostGbp) > 0 ? Number(l.landedUnitCostGbp) : Number(l.unitCostGbp)
-            return sum + Number(l.qty) * unitCost
-          }, 0)
-          if (totalValue > 0) {
-            await queueXeroSync({
-              type: 'STOCK_IN_TRANSIT',
-              referenceType: 'PurchaseOrder',
-              referenceId: id,
-              payload: {
-                date: new Date().toISOString().slice(0, 10),
-                reference: `Transit: ${poWithLines.reference}`,
-                narration: `Stock in transit for PO ${poWithLines.reference}`,
-                lines: [
-                  { accountCode: xeroSettings.xero_transit_account, description: `In transit: ${poWithLines.reference}`, debit: Math.round(totalValue * 100) / 100 },
-                  { accountCode: xeroSettings.xero_transit_credit_account, description: `In transit: ${poWithLines.reference}`, credit: Math.round(totalValue * 100) / 100 },
-                ],
-              },
-            })
-          }
-        }
-      } catch { /* Xero queue errors should never block the main flow */ }
-    }
-
     return { success: true }
   } catch (e) {
     logActivity({

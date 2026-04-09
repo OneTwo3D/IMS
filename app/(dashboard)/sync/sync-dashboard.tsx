@@ -61,7 +61,7 @@ const CONNECTORS: ConnectorDef[] = [
     id: 'xero',
     name: 'Xero',
     description: 'Sync invoices, COGS journals and purchase invoices',
-    logo: '/images/xero-banner.png',
+    logo: '/images/xero.svg',
     category: 'accounting',
     available: true,
   },
@@ -86,7 +86,7 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
       <span className="text-base font-bold tracking-tight">REST API</span>
     </div>
   ),
-  xero: <img src="/images/xero-banner.png" alt="Xero" className="h-8 object-contain" />,
+  xero: <img src="/images/xero.svg" alt="Xero" className="h-8 object-contain" />,
   quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 

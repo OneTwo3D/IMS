@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { auth } from '@/lib/auth'
-import { connect, disconnect, isConnected } from '@/lib/connectors/xero'
+import { getAuthorizationUrl, disconnect, isConnected } from '@/lib/connectors/xero'
 import { syncChartOfAccounts, getXeroTaxRates } from '@/lib/connectors/xero'
 import { processPendingXeroSync } from '@/lib/connectors/xero'
 
@@ -28,7 +28,6 @@ export type XeroSettings = {
   xero_sync_purchase_invoice: string
   xero_sync_cogs_journal: string
   xero_sync_cogs_reversal: string
-  xero_sync_stock_in_transit: string
   xero_sync_stock_receipt: string
   xero_sync_inventory_adjustment: string
   xero_sync_attach_pdf: string
@@ -39,18 +38,17 @@ export type XeroSettings = {
   xero_cogs_account: string
   xero_inventory_account: string
   xero_transit_account: string
-  xero_transit_credit_account: string
   xero_purchase_account: string
 }
 
 const XERO_SETTING_KEYS = [
   'xero_client_id', 'xero_client_secret', 'xero_sync_enabled',
   'xero_sync_sales_invoice', 'xero_sync_credit_note', 'xero_sync_purchase_invoice',
-  'xero_sync_cogs_journal', 'xero_sync_cogs_reversal', 'xero_sync_stock_in_transit',
+  'xero_sync_cogs_journal', 'xero_sync_cogs_reversal',
   'xero_sync_stock_receipt', 'xero_sync_inventory_adjustment', 'xero_sync_attach_pdf',
   'xero_sales_account', 'xero_shipping_account', 'xero_discount_account',
   'xero_cogs_account', 'xero_inventory_account', 'xero_transit_account',
-  'xero_transit_credit_account', 'xero_purchase_account',
+  'xero_purchase_account',
 ]
 
 const XERO_DEFAULTS: XeroSettings = {
@@ -62,7 +60,6 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_sync_purchase_invoice: 'true',
   xero_sync_cogs_journal: 'true',
   xero_sync_cogs_reversal: 'true',
-  xero_sync_stock_in_transit: 'true',
   xero_sync_stock_receipt: 'true',
   xero_sync_inventory_adjustment: 'true',
   xero_sync_attach_pdf: 'true',
@@ -72,7 +69,6 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_cogs_account: '',
   xero_inventory_account: '',
   xero_transit_account: '',
-  xero_transit_credit_account: '',
   xero_purchase_account: '',
 }
 
@@ -83,7 +79,6 @@ const SYNC_TYPE_SETTING: Record<string, keyof XeroSettings> = {
   PURCHASE_INVOICE: 'xero_sync_purchase_invoice',
   COGS_JOURNAL: 'xero_sync_cogs_journal',
   COGS_REVERSAL: 'xero_sync_cogs_reversal',
-  STOCK_IN_TRANSIT: 'xero_sync_stock_in_transit',
   STOCK_RECEIPT: 'xero_sync_stock_receipt',
   INVENTORY_ADJUSTMENT: 'xero_sync_inventory_adjustment',
 }
@@ -155,30 +150,25 @@ export async function getXeroConnectionStatus(): Promise<{
 export async function connectXero(
   clientId: string,
   clientSecret: string,
-): Promise<{ success: boolean; tenantName?: string; error?: string }> {
+  origin: string,
+): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
   try {
     await requireAdmin()
 
-    // Save credentials first
-    await db.$transaction([
+    // Save credentials (never overwrite secret with masked value)
+    const ops = [
       db.setting.upsert({ where: { key: 'xero_client_id' }, create: { key: 'xero_client_id', value: clientId }, update: { value: clientId } }),
-      db.setting.upsert({ where: { key: 'xero_client_secret' }, create: { key: 'xero_client_secret', value: clientSecret }, update: { value: clientSecret } }),
-    ])
-
-    const result = await connect(clientId, clientSecret)
-
-    if (result.success) {
-      logActivity({
-        entityType: 'SYSTEM',
-        action: 'xero_connected',
-        tag: 'sync',
-        description: `Connected to Xero organisation: ${result.tenantName}`,
-        metadata: { tenantName: result.tenantName },
-      })
+    ]
+    if (clientSecret && !clientSecret.includes('****')) {
+      ops.push(db.setting.upsert({ where: { key: 'xero_client_secret' }, create: { key: 'xero_client_secret', value: clientSecret }, update: { value: clientSecret } }))
     }
+    await db.$transaction(ops)
 
-    revalidatePath('/sync')
-    return result
+    // Build Xero authorization URL — user's browser will redirect here
+    const redirectUri = `${origin}/api/xero/callback`
+    const authUrl = getAuthorizationUrl(clientId, redirectUri)
+
+    return { success: true, redirectUrl: authUrl }
   } catch (e) {
     return { success: false, error: String(e) }
   }
