@@ -39,8 +39,15 @@ export type XeroSettings = {
   xero_cogs_account: string
   xero_inventory_account: string
   xero_allocated_inventory_account: string
+  xero_unearned_revenue_account: string
   xero_transit_account: string
   xero_purchase_account: string
+  // Sub-ledger settings
+  xero_daily_batch_enabled: string
+  xero_payment_polling_enabled: string
+  xero_payment_account_map: string  // JSON: {"stripe:GBP":"091","paypal:GBP":"094",...}
+  // Order numbering
+  order_number_prefix: string
 }
 
 const XERO_SETTING_KEYS = [
@@ -51,7 +58,11 @@ const XERO_SETTING_KEYS = [
   'xero_sync_attach_pdf',
   'xero_sales_account', 'xero_shipping_account', 'xero_discount_account',
   'xero_cogs_account', 'xero_inventory_account', 'xero_allocated_inventory_account',
+  'xero_unearned_revenue_account',
   'xero_transit_account', 'xero_purchase_account',
+  'xero_daily_batch_enabled', 'xero_payment_polling_enabled',
+  'xero_payment_account_map',
+  'order_number_prefix',
 ]
 
 const XERO_DEFAULTS: XeroSettings = {
@@ -73,8 +84,13 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_cogs_account: '',
   xero_inventory_account: '',
   xero_allocated_inventory_account: '',
+  xero_unearned_revenue_account: '',
   xero_transit_account: '',
   xero_purchase_account: '',
+  xero_daily_batch_enabled: 'false',
+  xero_payment_polling_enabled: 'false',
+  xero_payment_account_map: '{}',
+  order_number_prefix: '',
 }
 
 /** Map sync type enum → setting key for per-type enable/disable */
@@ -303,7 +319,7 @@ export async function triggerXeroSync(): Promise<{ success: boolean; result?: un
 // ---------------------------------------------------------------------------
 
 export async function queueXeroSync(params: {
-  type: 'SALES_INVOICE' | 'CREDIT_NOTE' | 'COGS_REVERSAL' | 'STOCK_IN_TRANSIT' | 'STOCK_RECEIPT' | 'PURCHASE_INVOICE' | 'COGS_JOURNAL' | 'INVENTORY_ADJUSTMENT' | 'STOCK_ALLOCATION'
+  type: 'SALES_INVOICE' | 'CREDIT_NOTE' | 'COGS_REVERSAL' | 'STOCK_IN_TRANSIT' | 'STOCK_RECEIPT' | 'PURCHASE_INVOICE' | 'COGS_JOURNAL' | 'INVENTORY_ADJUSTMENT' | 'STOCK_ALLOCATION' | 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B' | 'UNEARNED_REV_REVERSAL'
   referenceType: string
   referenceId: string
   payload: Record<string, unknown>
@@ -329,4 +345,41 @@ export async function queueXeroSync(params: {
       payload: payload as never,
     },
   })
+}
+
+// ---------------------------------------------------------------------------
+// Payment account map helpers
+// ---------------------------------------------------------------------------
+
+/** Look up Xero bank account code for a payment method + currency combo */
+export async function lookupPaymentAccount(
+  mapJson: string,
+  paymentMethod: string,
+  currency: string,
+): Promise<string | null> {
+  try {
+    const map = JSON.parse(mapJson) as Record<string, string>
+    // Try exact match first: "stripe:GBP"
+    const exact = map[`${paymentMethod}:${currency}`]
+    if (exact) return exact
+    // Fall back to wildcard: "stripe:*"
+    const wildcard = map[`${paymentMethod}:*`]
+    if (wildcard) return wildcard
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** Get distinct payment method + currency combos from existing orders (for UI pre-population) */
+export async function getPaymentMethodCombos(): Promise<Array<{ paymentMethod: string; currency: string }>> {
+  const rows = await db.salesOrder.findMany({
+    where: { paymentMethod: { not: null } },
+    select: { paymentMethod: true, currency: true },
+    distinct: ['paymentMethod', 'currency'],
+    orderBy: [{ paymentMethod: 'asc' }, { currency: 'asc' }],
+  })
+  return rows
+    .filter((r): r is { paymentMethod: string; currency: string } => !!r.paymentMethod)
+    .map((r) => ({ paymentMethod: r.paymentMethod, currency: r.currency }))
 }

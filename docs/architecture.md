@@ -271,9 +271,19 @@ CSV utilities are in `lib/csv.ts`.
 ## External Integrations
 
 ### Xero
-- Purchase invoice sync — one journal per invoice (DR Inventory Asset, CR Accounts Payable)
-- COGS sync — daily accumulated journal per product (DR COGS, CR Inventory Asset)
-- OAuth 2.0 tokens stored at `XERO_TOKEN_PATH`, refreshed before each API call
+
+Xero integration is implemented as a modular connector in `lib/connectors/xero/`, fully independent of any shopping channel module.
+
+- **Sub-ledger model** — IMS acts as accounting guard; Xero handles invoicing, payments, and bank reconciliation; IMS creates daily correction journals
+- **Sales invoices** — AUTHORISED (WC pre-paid) or DRAFT (manual) invoice created at order time, with automatic Xero payment registration
+- **Purchase bills** — pushed when a PO is invoiced, with optional supplier invoice PDF attachment
+- **Credit notes** — pushed on refund with sub-ledger state-aware reversal journals
+- **Daily batch sync** — nightly cron runs Group A1 (revenue deferral), A2 (inventory reclassification), B (shipment COGS + revenue recognition via FIFO cost layer consumption)
+- **Payment polling** — 15-min cron detects paid invoices (manual orders) and paid bills (POs) via Xero API
+- **Invoice PDF** — downloaded from Xero, saved locally, emailed to customer, download link pushed to WC order
+- **Payment method mapping** — composite `{method}:{currency}` key maps to Xero bank account codes
+- **OAuth 2.0** — tokens stored at `XERO_TOKEN_PATH`, refreshed before each API call
+- **Deep links** — "View in Xero" links on sales order and PO detail pages
 
 ### WooCommerce
 
@@ -293,7 +303,7 @@ WooCommerce integration is implemented as a modular connector in `lib/connectors
 The `/sync` page provides a unified view of all connectors:
 
 - **WooCommerce** — connection settings, order/product/stock sync config, tax mapping, status mapping, sync log
+- **Xero** — OAuth connection, account mapping, transaction type toggles, sub-ledger settings, payment method mapping, sync log
 - **Shopify** — tile shown (coming soon)
-- **Xero** — tile shown (coming soon)
 - **QuickBooks** — tile shown (coming soon)
 - **REST API** — tile with endpoint documentation

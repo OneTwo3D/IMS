@@ -96,11 +96,19 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
       }
     })
 
+    // Read order number prefix setting
+    const prefixSetting = await db.setting.findUnique({ where: { key: 'order_number_prefix' } })
+    const prefix = prefixSetting?.value ?? ''
+    const orderNumber = `${prefix}${wcOrder.number}`
+
     // Create the sales order
     const so = await db.salesOrder.create({
       data: {
         wcOrderId: wcOrder.id,
         wcOrderNumber: wcOrder.number,
+        orderNumber,
+        paymentMethod: wcOrder.payment_method || null,
+        paymentMethodTitle: wcOrder.payment_method_title || null,
         wcCreatedAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created),
         wcUpdatedAt: new Date(wcOrder.date_modified_gmt || wcOrder.date_modified),
         status: imsStatus,
@@ -133,6 +141,43 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
     // Auto-allocate stock
     const { autoAllocateOrder } = await import('@/app/actions/allocation')
     await autoAllocateOrder(so.id)
+
+    // Queue Xero sales invoice (AUTHORISED — WC orders are pre-paid)
+    try {
+      const { queueXeroSync, getXeroSettings } = await import('@/app/actions/xero-sync')
+      const xeroSettings = await getXeroSettings()
+      const fxRateNum = Number(fxRate) || 1
+      const discountGbp = Math.round((orderDiscount.discountAmount / fxRateNum) * 100) / 100
+      await queueXeroSync({
+        type: 'SALES_INVOICE',
+        referenceType: 'SalesOrder',
+        referenceId: so.id,
+        payload: {
+          invoiceNumber: `WC-${wcOrder.number}`,
+          contactName: customerName,
+          contactEmail: wcOrder.billing.email || undefined,
+          date: new Date().toISOString().slice(0, 10),
+          currency,
+          reference: orderNumber,
+          lines: lineData.map(l => ({
+            itemCode: l.sku ?? undefined,
+            description: l.description ?? l.sku ?? 'Item',
+            quantity: l.qty,
+            unitAmount: Math.round((l.unitPriceForeign / fxRateNum) * 10000) / 10000,
+            accountCode: xeroSettings.xero_sales_account,
+          })),
+          shippingAmount: shippingForeign > 0 ? Math.round((shippingForeign / fxRateNum) * 10000) / 10000 : undefined,
+          shippingDescription: 'Shipping',
+          shippingAccountCode: xeroSettings.xero_shipping_account || undefined,
+          discountAmount: discountGbp > 0 ? discountGbp : undefined,
+          discountAccountCode: xeroSettings.xero_discount_account || undefined,
+          _postingMode: 'submitted',
+          _registerPayment: !!wcOrder.date_paid_gmt,
+          _paymentMethod: wcOrder.payment_method || undefined,
+          _paymentDate: wcOrder.date_paid_gmt || undefined,
+        },
+      })
+    } catch { /* Xero queue errors should never block import */ }
 
     // Log sync
     await db.wcSyncLog.create({

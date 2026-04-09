@@ -11,7 +11,8 @@ import { pushSalesInvoice } from './invoices'
 import { pushPurchaseBill } from './bills'
 import { pushCreditNote } from './credit-notes'
 import { pushManualJournal } from './journals'
-import { xeroUploadAttachment } from './api'
+import { xeroUploadAttachment, xeroPost } from './api'
+import { lookupPaymentAccount } from '@/app/actions/xero-sync'
 import type { XeroSyncType } from '@/app/generated/prisma/client'
 
 const MAX_RETRIES = 5
@@ -120,8 +121,8 @@ async function processEntry(
   const postingMode = payload._postingMode
 
   switch (type) {
-    case 'SALES_INVOICE':
-      return pushSalesInvoice({
+    case 'SALES_INVOICE': {
+      const invoiceResult = await pushSalesInvoice({
         invoiceNumber: payload.invoiceNumber as string,
         contactName: payload.contactName as string,
         contactEmail: payload.contactEmail as string | undefined,
@@ -135,7 +136,46 @@ async function processEntry(
         discountAmount: payload.discountAmount as number | undefined,
         discountAccountCode: payload.discountAccountCode as string | undefined,
         reference: payload.reference as string | undefined,
-      }, resolveInvoiceStatus(postingMode)).then(r => ({ success: r.success, externalId: r.invoiceId, error: r.error }))
+      }, resolveInvoiceStatus(postingMode))
+
+      // Register payment in Xero if requested (pre-paid WC orders)
+      if (invoiceResult.success && invoiceResult.invoiceId && payload._registerPayment) {
+        try {
+          const paymentMapSetting = await db.setting.findUnique({ where: { key: 'xero_payment_account_map' } })
+          const paymentMap = paymentMapSetting?.value ?? '{}'
+          const method = payload._paymentMethod as string || ''
+          const currency = payload.currency as string || 'GBP'
+          const accountCode = await lookupPaymentAccount(paymentMap, method, currency)
+
+          if (accountCode) {
+            // Get the invoice total from Xero to register the payment
+            const paymentDate = (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
+            await xeroPost('Payments', {
+              Invoice: { InvoiceID: invoiceResult.invoiceId },
+              Account: { Code: accountCode },
+              Date: paymentDate,
+              Amount: payload.shippingAmount
+                ? (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
+                  + (payload.shippingAmount as number)
+                  - ((payload.discountAmount as number) || 0)
+                : (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
+                  - ((payload.discountAmount as number) || 0),
+            })
+          }
+        } catch (e) {
+          // Payment registration failure is non-critical — invoice was already created
+          logActivity({
+            entityType: 'SYSTEM',
+            action: 'xero_payment_registration_failed',
+            tag: 'sync',
+            level: 'WARNING',
+            description: `Failed to register Xero payment: ${String(e)}`,
+          })
+        }
+      }
+
+      return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, error: invoiceResult.error }
+    }
 
     case 'PURCHASE_INVOICE': {
       const billResult = await pushPurchaseBill({
@@ -181,6 +221,10 @@ async function processEntry(
     case 'STOCK_RECEIPT':
     case 'COGS_REVERSAL':
     case 'STOCK_ALLOCATION':
+    case 'DAILY_BATCH_REVENUE_DEFERRAL':
+    case 'DAILY_BATCH_INVENTORY_ALLOC':
+    case 'DAILY_BATCH_GROUP_B':
+    case 'UNEARNED_REV_REVERSAL':
       return pushManualJournal({
         date: payload.date as string,
         reference: payload.reference as string,
@@ -207,6 +251,28 @@ async function updateBackReference(
         where: { id: referenceId },
         data: { xeroInvoiceId: externalId },
       })
+
+      // Download Xero invoice PDF, save, email, and notify shopping channel
+      try {
+        const { downloadXeroInvoicePdf, saveInvoicePdf } = await import('./invoice-pdf')
+        const pdfBuffer = await downloadXeroInvoicePdf(externalId)
+        if (pdfBuffer) {
+          const pdfPath = await saveInvoicePdf(referenceId, pdfBuffer)
+          await db.salesOrder.update({
+            where: { id: referenceId },
+            data: { invoicePdfPath: pdfPath },
+          })
+
+          // Email the Xero invoice PDF to the customer
+          const { sendXeroInvoiceEmail } = await import('@/app/actions/email')
+          await sendXeroInvoiceEmail(referenceId).catch(() => {})
+
+          // Notify shopping channel (WC pushes order note with download link)
+          await notifyShoppingChannel(referenceId, 'invoice_ready')
+        }
+      } catch {
+        // PDF download/email failure is non-critical
+      }
     } else if (type === 'CREDIT_NOTE' && referenceType === 'SalesOrderRefund') {
       await db.salesOrderRefund.update({
         where: { id: referenceId },
@@ -221,4 +287,23 @@ async function updateBackReference(
   } catch {
     // Non-critical — log entry already marked as SYNCED
   }
+}
+
+/**
+ * Generic shopping channel notification hook.
+ * Each connector registers its own handler. Xero never imports from WC directly.
+ */
+async function notifyShoppingChannel(orderId: string, event: string): Promise<void> {
+  const so = await db.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { wcOrderId: true },
+  })
+
+  // WooCommerce handler
+  if (so?.wcOrderId && event === 'invoice_ready') {
+    const { pushInvoiceNoteToWc } = await import('@/lib/connectors/woocommerce/sync/invoice-note')
+    await pushInvoiceNoteToWc(orderId).catch(() => {})
+  }
+
+  // Future: Shopify handler would go here
 }

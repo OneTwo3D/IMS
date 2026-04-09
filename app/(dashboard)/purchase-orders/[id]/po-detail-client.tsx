@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { Search, X, Plus, Pencil, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Receipt, Upload, Ship } from 'lucide-react'
+import { Search, X, Plus, Pencil, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Receipt, Upload, Ship, ExternalLink } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -1678,6 +1678,16 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                           className="text-blue-600 hover:underline flex items-center gap-1"
                         >
                           <FileText className="h-3 w-3" />PDF
+                        </a>
+                      )}
+                      {inv.xeroInvoiceId && (
+                        <a
+                          href={`https://go.xero.com/AccountsPayable/View.aspx?InvoiceID=${inv.xeroInvoiceId}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="text-blue-600 hover:underline flex items-center gap-1"
+                        >
+                          <ExternalLink className="h-3 w-3" />Xero
                         </a>
                       )}
                     </div>

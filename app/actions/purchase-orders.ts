@@ -432,6 +432,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
           totalGbp: true,
           notes: true,
           supplierInvoiceUrl: true,
+          xeroInvoiceId: true,
           createdAt: true,
           lines: {
             select: {
@@ -538,6 +539,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       totalGbp: Number(inv.totalGbp),
       notes: inv.notes,
       supplierInvoiceUrl: inv.supplierInvoiceUrl,
+      xeroInvoiceId: inv.xeroInvoiceId ?? null,
       createdAt: inv.createdAt.toISOString(),
       lines: inv.lines.map((il) => ({
         id: il.id,
@@ -1336,6 +1338,7 @@ export type InvoiceRow = {
   totalGbp: number
   notes: string | null
   supplierInvoiceUrl: string | null
+  xeroInvoiceId: string | null
   createdAt: string
   lines: {
     id: string
@@ -1454,12 +1457,12 @@ export async function createInvoice(
         referenceType: 'PurchaseOrder',
         referenceId: poId,
         payload: {
-          invoiceNumber: input.invoiceNumber ?? undefined,
+          invoiceNumber: po.reference,  // PO reference becomes Xero bill number
           contactName: supplier?.supplier?.name ?? 'Unknown Supplier',
           date: input.invoiceDate,
           dueDate: input.dueDate ?? undefined,
           currency: supplier?.currency ?? 'GBP',
-          reference: po.reference,
+          reference: input.invoiceNumber ?? undefined,  // Supplier invoice number as Xero reference
           lines: linesWithQty.map(l => ({
             description: `PO ${po.reference} line`,
             quantity: l.qtyBilled,

@@ -38,6 +38,7 @@ export type SoRow = {
   id: string
   wcOrderId: number | null
   wcOrderNumber: string | null
+  orderNumber: string | null
   status: SoStatus
   currency: string
   fxRateToGbp: number
@@ -61,6 +62,7 @@ export type SoRow = {
   discountAmount: number
   invoiceNumber: string | null
   invoicedAt: string | null
+  xeroInvoiceId: string | null
   paidAt: string | null
   notes: string | null
   internalNotes: string | null
@@ -138,6 +140,7 @@ const SO_SELECT = {
   id: true,
   wcOrderId: true,
   wcOrderNumber: true,
+  orderNumber: true,
   status: true,
   currency: true,
   fxRateToGbp: true,
@@ -161,6 +164,7 @@ const SO_SELECT = {
   discountAmount: true,
   invoiceNumber: true,
   invoicedAt: true,
+  xeroInvoiceId: true,
   paidAt: true,
   notes: true,
   internalNotes: true,
@@ -172,6 +176,7 @@ function mapSoRow(so: {
   id: string
   wcOrderId: number | null
   wcOrderNumber: string | null
+  orderNumber: string | null
   status: string
   currency: string
   fxRateToGbp: unknown
@@ -195,6 +200,7 @@ function mapSoRow(so: {
   discountAmount: unknown
   invoiceNumber: string | null
   invoicedAt: Date | null
+  xeroInvoiceId: string | null
   paidAt: Date | null
   notes: string | null
   internalNotes: string | null
@@ -205,6 +211,7 @@ function mapSoRow(so: {
     id: so.id,
     wcOrderId: so.wcOrderId,
     wcOrderNumber: so.wcOrderNumber,
+    orderNumber: so.orderNumber,
     status: so.status as SoStatus,
     currency: so.currency,
     fxRateToGbp: Number(so.fxRateToGbp),
@@ -228,6 +235,7 @@ function mapSoRow(so: {
     discountAmount: Number(so.discountAmount),
     invoiceNumber: so.invoiceNumber,
     invoicedAt: so.invoicedAt?.toISOString() ?? null,
+    xeroInvoiceId: so.xeroInvoiceId,
     paidAt: so.paidAt?.toISOString() ?? null,
     notes: so.notes,
     internalNotes: so.internalNotes,
@@ -445,9 +453,16 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     const grandTotalForeign = subtotalForeign + totalTaxForeign + totalShippingForeign
     const grandTotalGbp = subtotalGbp + totalTaxGbp + totalShippingGbp
 
+    // Generate order number with prefix
+    const prefixSetting = await db.setting.findUnique({ where: { key: 'order_number_prefix' } })
+    const prefix = prefixSetting?.value ?? ''
+    const ref = makeReference()
+    const orderNumber = `${prefix}${ref}`
+
     const so = await db.salesOrder.create({
       data: {
-        wcOrderNumber: makeReference(),
+        wcOrderNumber: ref,
+        orderNumber,
         status: 'DRAFT',
         currency: input.currency,
         fxRateToGbp: fxRate,
@@ -483,6 +498,38 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     const { autoAllocateOrder } = await import('./allocation')
     await autoAllocateOrder(so.id)
 
+    // Queue Xero sales invoice (DRAFT — manual orders have no payment yet)
+    try {
+      const xeroSettings = await getXeroSettings()
+      const discountGbp = Math.round(((input.orderDiscountForeign ?? 0) / fxRate) * 100) / 100
+      await queueXeroSync({
+        type: 'SALES_INVOICE',
+        referenceType: 'SalesOrder',
+        referenceId: so.id,
+        payload: {
+          invoiceNumber: `DRAFT-${ref}`,
+          contactName: input.customerName,
+          contactEmail: input.customerEmail || undefined,
+          date: new Date().toISOString().slice(0, 10),
+          currency: input.currency,
+          reference: orderNumber,
+          lines: lineData.map(l => ({
+            itemCode: l.sku ?? undefined,
+            description: l.description ?? l.sku ?? 'Item',
+            quantity: l.qty,
+            unitAmount: Number(l.unitPriceGbp),
+            accountCode: xeroSettings.xero_sales_account,
+          })),
+          shippingAmount: totalShippingGbp > 0 ? totalShippingGbp : undefined,
+          shippingDescription: 'Shipping',
+          shippingAccountCode: xeroSettings.xero_shipping_account || undefined,
+          discountAmount: discountGbp > 0 ? discountGbp : undefined,
+          discountAccountCode: xeroSettings.xero_discount_account || undefined,
+          _postingMode: 'draft',
+        },
+      })
+    } catch { /* Xero queue errors should never block the main flow */ }
+
     revalidatePath('/sales')
     const mapped = mapSoRow(so)
     logActivity({
@@ -491,8 +538,8 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       action: 'created',
       tag: 'sales',
       level: 'INFO',
-      description: `Created sales order ${mapped.wcOrderNumber}`,
-      metadata: { orderNumber: mapped.wcOrderNumber, totalGbp: mapped.totalGbp, currency: mapped.currency },
+      description: `Created sales order ${mapped.orderNumber ?? mapped.wcOrderNumber}`,
+      metadata: { orderNumber: mapped.orderNumber, totalGbp: mapped.totalGbp, currency: mapped.currency },
     })
     return { success: true, order: mapped }
   } catch (e) {
@@ -692,7 +739,11 @@ export async function createRefund(
     await requireAuth()
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
-      select: { id: true, wcOrderNumber: true, status: true, fxRateToGbp: true, totalGbp: true },
+      select: {
+        id: true, wcOrderNumber: true, orderNumber: true, status: true, fxRateToGbp: true, totalGbp: true,
+        xeroRevenueDeferredDate: true, xeroUnearnedRevenueAmount: true,
+        xeroInventoryAllocatedDate: true, xeroAllocationBatchAmount: true,
+      },
     })
     if (!so) return { success: false, error: 'Order not found' }
 
@@ -819,89 +870,126 @@ export async function createRefund(
       })
     } catch { /* Xero queue errors should never block the main flow */ }
 
-    // Queue Xero COGS reversal or allocation reversal based on shipment state
+    // Queue sub-ledger reversal journals based on state
+    // Scenario 1: paidAt set but xeroRevenueDeferredDate NULL → no journals to reverse
+    // Scenario 2: xeroRevenueDeferredDate set, xeroInventoryAllocatedDate NULL (backorder) → reverse unearned revenue only
+    // Scenario 3: xeroInventoryAllocatedDate set, no shipments journaled → reverse unearned revenue + inventory allocation
+    // Scenario 4: shipments journaled → reverse COGS for shipped portion + unearned for unshipped portion
     try {
       const xeroSettings = await getXeroSettings()
-      const productRefundLines = refundLines.filter(l => l.productId && l.qty > 0)
-      if (productRefundLines.length > 0) {
-        // Check if goods were shipped (COGS already booked) or only allocated
-        const shipments = await db.shipment.findMany({
-          where: { orderId, status: 'SHIPPED' },
-          select: { warehouseId: true, lines: { select: { productId: true, qty: true } } },
+      const orderRef = so.orderNumber ?? so.wcOrderNumber ?? orderId.slice(0, 8)
+
+      if (so.xeroRevenueDeferredDate) {
+        const refundRevenue = Math.round(totalGbp * 100) / 100
+
+        // Check for shipped portions with journals
+        const journaledShipments = await db.shipment.findMany({
+          where: { orderId, xeroShipmentJournalDate: { not: null } },
+          select: {
+            xeroCogsBatchAmount: true,
+            xeroRevenueRecognizedAmount: true,
+            warehouseId: true,
+            lines: { select: { productId: true, qty: true } },
+          },
         })
-        const shippedQty = new Map<string, { qty: number; warehouseId: string }>()
-        for (const s of shipments) {
-          for (const sl of s.lines) {
-            const existing = shippedQty.get(sl.productId) ?? { qty: 0, warehouseId: s.warehouseId }
-            existing.qty += Number(sl.qty)
-            shippedQty.set(sl.productId, existing)
-          }
-        }
 
-        let cogsReversalValue = 0
-        let allocationReversalValue = 0
-
-        for (const l of productRefundLines) {
-          const shipped = shippedQty.get(l.productId!)
-          // Calculate value from cost layers
-          const warehouseId = shipped?.warehouseId ?? returnWarehouseId
-          if (!warehouseId) continue
-          const layers = await db.costLayer.findMany({
-            where: { productId: l.productId!, warehouseId, remainingQty: { gt: 0 } },
-            orderBy: { receivedAt: 'asc' },
-          })
-          let remaining = l.qty
-          let lineValue = 0
-          for (const layer of layers) {
-            if (remaining <= 0) break
-            const consume = Math.min(remaining, Number(layer.remainingQty))
-            lineValue += consume * Number(layer.unitCostGbp)
-            remaining -= consume
+        if (journaledShipments.length > 0) {
+          // Scenario 4: reverse COGS for shipped portion
+          const totalShippedCogs = journaledShipments.reduce((s, sh) => s + Number(sh.xeroCogsBatchAmount ?? 0), 0)
+          if (totalShippedCogs > 0) {
+            await queueXeroSync({
+              type: 'COGS_REVERSAL',
+              referenceType: 'SalesOrder',
+              referenceId: orderId,
+              payload: {
+                date: new Date().toISOString().slice(0, 10),
+                reference: `COGS reversal: ${orderRef}`,
+                narration: `COGS reversal — refund on order ${orderRef}`,
+                lines: [
+                  { accountCode: xeroSettings.xero_inventory_account, description: `COGS reversal: ${orderRef}`, debit: Math.round(totalShippedCogs * 100) / 100 },
+                  { accountCode: xeroSettings.xero_cogs_account, description: `COGS reversal: ${orderRef}`, credit: Math.round(totalShippedCogs * 100) / 100 },
+                ],
+              },
+            })
           }
 
-          if (shipped && shipped.qty >= l.qty) {
-            // Goods were shipped → reverse COGS: DR Inventory / CR COGS
-            cogsReversalValue += lineValue
-          } else {
-            // Goods were allocated but not shipped → reverse allocation: DR Inventory / CR Allocated Inventory
-            allocationReversalValue += lineValue
+          // If there's also an unshipped portion with unearned revenue, reverse that too
+          const totalRecognized = journaledShipments.reduce((s, sh) => s + Number(sh.xeroRevenueRecognizedAmount ?? 0), 0)
+          const unearnedRemaining = Math.round((Number(so.xeroUnearnedRevenueAmount ?? 0) - totalRecognized) * 100) / 100
+          if (unearnedRemaining > 0) {
+            const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = [
+              { accountCode: xeroSettings.xero_unearned_revenue_account, description: `Unearned revenue reversal: ${orderRef}`, debit: unearnedRemaining },
+              { accountCode: xeroSettings.xero_sales_account, description: `Unearned revenue reversal: ${orderRef}`, credit: unearnedRemaining },
+            ]
+            // Also reverse inventory allocation for unshipped portion
+            if (so.xeroInventoryAllocatedDate) {
+              const allocValue = Math.round(Number(so.xeroAllocationBatchAmount ?? 0) * 100) / 100
+              const shippedAllocValue = totalShippedCogs // COGS ≈ allocated cost for shipped items
+              const unshippedAllocValue = Math.round(Math.max(0, allocValue - shippedAllocValue) * 100) / 100
+              if (unshippedAllocValue > 0) {
+                journalLines.push(
+                  { accountCode: xeroSettings.xero_inventory_account, description: `Allocation reversal: ${orderRef}`, debit: unshippedAllocValue },
+                  { accountCode: xeroSettings.xero_allocated_inventory_account, description: `Allocation reversal: ${orderRef}`, credit: unshippedAllocValue },
+                )
+              }
+            }
+            await queueXeroSync({
+              type: 'UNEARNED_REV_REVERSAL',
+              referenceType: 'SalesOrder',
+              referenceId: orderId,
+              payload: {
+                date: new Date().toISOString().slice(0, 10),
+                reference: `Unearned reversal: ${orderRef}`,
+                narration: `Unearned revenue reversal — refund on order ${orderRef}`,
+                lines: journalLines,
+              },
+            })
           }
-        }
-
-        if (cogsReversalValue > 0 && xeroSettings.xero_cogs_account && xeroSettings.xero_inventory_account) {
+        } else if (so.xeroInventoryAllocatedDate) {
+          // Scenario 3: allocated but not shipped — reverse unearned revenue + inventory allocation
+          const allocValue = Math.round(Number(so.xeroAllocationBatchAmount ?? 0) * 100) / 100
+          const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = [
+            { accountCode: xeroSettings.xero_unearned_revenue_account, description: `Unearned revenue reversal: ${orderRef}`, debit: refundRevenue },
+            { accountCode: xeroSettings.xero_sales_account, description: `Unearned revenue reversal: ${orderRef}`, credit: refundRevenue },
+          ]
+          if (allocValue > 0) {
+            journalLines.push(
+              { accountCode: xeroSettings.xero_inventory_account, description: `Allocation reversal: ${orderRef}`, debit: allocValue },
+              { accountCode: xeroSettings.xero_allocated_inventory_account, description: `Allocation reversal: ${orderRef}`, credit: allocValue },
+            )
+          }
           await queueXeroSync({
-            type: 'COGS_REVERSAL',
+            type: 'UNEARNED_REV_REVERSAL',
             referenceType: 'SalesOrder',
             referenceId: orderId,
             payload: {
               date: new Date().toISOString().slice(0, 10),
-              reference: `COGS reversal: ${so.wcOrderNumber}`,
-              narration: `COGS reversal — refund on order ${so.wcOrderNumber}`,
-              lines: [
-                { accountCode: xeroSettings.xero_inventory_account, description: `COGS reversal: ${so.wcOrderNumber}`, debit: Math.round(cogsReversalValue * 100) / 100 },
-                { accountCode: xeroSettings.xero_cogs_account, description: `COGS reversal: ${so.wcOrderNumber}`, credit: Math.round(cogsReversalValue * 100) / 100 },
-              ],
+              reference: `Unearned reversal: ${orderRef}`,
+              narration: `Unearned revenue + allocation reversal — refund on order ${orderRef}`,
+              lines: journalLines,
             },
           })
-        }
-
-        if (allocationReversalValue > 0 && xeroSettings.xero_allocated_inventory_account && xeroSettings.xero_inventory_account) {
+          await db.salesOrder.update({ where: { id: orderId }, data: { xeroRevenueDeferredDate: null, xeroInventoryAllocatedDate: null } })
+        } else {
+          // Scenario 2: backorder — revenue deferred but not allocated — reverse unearned revenue only
           await queueXeroSync({
-            type: 'STOCK_ALLOCATION',
+            type: 'UNEARNED_REV_REVERSAL',
             referenceType: 'SalesOrder',
             referenceId: orderId,
             payload: {
               date: new Date().toISOString().slice(0, 10),
-              reference: `Allocation reversal: ${so.wcOrderNumber}`,
-              narration: `Stock allocation reversed — refund on order ${so.wcOrderNumber}`,
+              reference: `Unearned reversal: ${orderRef}`,
+              narration: `Unearned revenue reversal — refund on backorder ${orderRef}`,
               lines: [
-                { accountCode: xeroSettings.xero_inventory_account, description: `Allocation reversal: ${so.wcOrderNumber}`, debit: Math.round(allocationReversalValue * 100) / 100 },
-                { accountCode: xeroSettings.xero_allocated_inventory_account, description: `Allocation reversal: ${so.wcOrderNumber}`, credit: Math.round(allocationReversalValue * 100) / 100 },
+                { accountCode: xeroSettings.xero_unearned_revenue_account, description: `Unearned revenue reversal: ${orderRef}`, debit: refundRevenue },
+                { accountCode: xeroSettings.xero_sales_account, description: `Unearned revenue reversal: ${orderRef}`, credit: refundRevenue },
               ],
             },
           })
+          await db.salesOrder.update({ where: { id: orderId }, data: { xeroRevenueDeferredDate: null } })
         }
       }
+      // Scenario 1: no xeroRevenueDeferredDate → no sub-ledger journals to reverse
     } catch { /* Xero queue errors should never block the main flow */ }
 
     return { success: true }
@@ -1140,13 +1228,13 @@ export async function generateInvoiceNumber(id: string): Promise<{ success: bool
     await requireAuth()
     // Use a transaction to prevent race conditions on invoice numbering
     const result = await db.$transaction(async (tx) => {
-      const so = await tx.salesOrder.findUnique({ where: { id }, select: { wcOrderNumber: true, invoiceNumber: true } })
+      const so = await tx.salesOrder.findUnique({ where: { id }, select: { wcOrderNumber: true, orderNumber: true, invoiceNumber: true } })
       if (!so) throw new Error('Order not found')
-      if (so.invoiceNumber) return { invoiceNumber: so.invoiceNumber, orderNumber: so.wcOrderNumber }
+      if (so.invoiceNumber) return { invoiceNumber: so.invoiceNumber, orderNumber: so.orderNumber ?? so.wcOrderNumber }
       const count = await tx.salesOrder.count({ where: { invoiceNumber: { not: null } } })
       const invNum = `INV-${new Date().getFullYear()}-${String(count + 1).padStart(5, '0')}`
       await tx.salesOrder.update({ where: { id }, data: { invoiceNumber: invNum, invoicedAt: new Date() } })
-      return { invoiceNumber: invNum, orderNumber: so.wcOrderNumber }
+      return { invoiceNumber: invNum, orderNumber: so.orderNumber ?? so.wcOrderNumber }
     })
     revalidatePath(`/sales/${id}`)
     logActivity({
@@ -1159,50 +1247,7 @@ export async function generateInvoiceNumber(id: string): Promise<{ success: bool
       metadata: { orderNumber: result.orderNumber, invoiceNumber: result.invoiceNumber },
     })
 
-    // Queue Xero sales invoice sync
-    try {
-      const xeroSettings = await getXeroSettings()
-      const fullOrder = await db.salesOrder.findUnique({
-        where: { id },
-        select: {
-          currency: true, shippingGbp: true, discountAmount: true, invoicedAt: true, fxRateToGbp: true,
-          customer: { select: { firstName: true, lastName: true, email: true } },
-          lines: { select: { sku: true, description: true, qty: true, unitPriceGbp: true, totalGbp: true, discountAmount: true } },
-        },
-      })
-      if (fullOrder) {
-        const customerName = fullOrder.customer
-          ? `${fullOrder.customer.firstName} ${fullOrder.customer.lastName}`.trim()
-          : 'Walk-in Customer'
-        const fxRate = Number(fullOrder.fxRateToGbp) || 1
-        const discountGbp = Number(fullOrder.discountAmount) / fxRate
-        await queueXeroSync({
-          type: 'SALES_INVOICE',
-          referenceType: 'SalesOrder',
-          referenceId: id,
-          payload: {
-            invoiceNumber: result.invoiceNumber,
-            contactName: customerName,
-            contactEmail: fullOrder.customer?.email ?? undefined,
-            date: (fullOrder.invoicedAt ?? new Date()).toISOString().slice(0, 10),
-            currency: fullOrder.currency ?? 'GBP',
-            reference: result.orderNumber ?? undefined,
-            lines: fullOrder.lines.map(l => ({
-              itemCode: l.sku ?? undefined,
-              description: l.description ?? l.sku ?? 'Item',
-              quantity: Number(l.qty),
-              unitAmount: Number(l.unitPriceGbp),
-              accountCode: xeroSettings.xero_sales_account,
-            })),
-            shippingAmount: Number(fullOrder.shippingGbp) > 0 ? Number(fullOrder.shippingGbp) : undefined,
-            shippingDescription: 'Shipping',
-            shippingAccountCode: xeroSettings.xero_shipping_account || undefined,
-            discountAmount: discountGbp > 0 ? Math.round(discountGbp * 100) / 100 : undefined,
-            discountAccountCode: xeroSettings.xero_discount_account || undefined,
-          },
-        })
-      }
-    } catch { /* Xero queue errors should never block the main flow */ }
+    // Note: Xero invoice is now created at order creation time (not here)
 
     return { success: true, invoiceNumber: result.invoiceNumber }
   } catch (e) {

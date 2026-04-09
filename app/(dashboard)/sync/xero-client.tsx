@@ -33,6 +33,7 @@ const ACCOUNT_FIELDS: { key: keyof XeroSettings; label: string; description: str
   { key: 'xero_inventory_account', label: 'Inventory Asset', description: 'Stock on hand value' },
   { key: 'xero_allocated_inventory_account', label: 'Allocated Inventory', description: 'Stock allocated to paid orders awaiting dispatch' },
   { key: 'xero_cogs_account', label: 'Cost of Goods Sold', description: 'COGS booked on dispatch' },
+  { key: 'xero_unearned_revenue_account', label: 'Unearned Revenue', description: 'Liability account for revenue deferred until shipment' },
 ]
 
 const SYNC_TYPE_TOGGLES: { key: keyof XeroSettings; label: string; description: string }[] = [
@@ -40,10 +41,8 @@ const SYNC_TYPE_TOGGLES: { key: keyof XeroSettings; label: string; description: 
   { key: 'xero_sync_credit_note', label: 'Credit Notes', description: 'Push credit notes on refund' },
   { key: 'xero_sync_purchase_invoice', label: 'Purchase Bills', description: 'Push supplier bills when PO is invoiced' },
   { key: 'xero_sync_stock_receipt', label: 'Stock Receipts', description: 'Journal: DR Inventory / CR Stock in Transit on goods received' },
-  { key: 'xero_sync_cogs_journal', label: 'COGS Journals', description: 'Journal: DR COGS / CR Inventory on dispatch' },
   { key: 'xero_sync_cogs_reversal', label: 'COGS Reversals', description: 'Reverse COGS on stock returns' },
   { key: 'xero_sync_inventory_adjustment', label: 'Inventory Adjustments', description: 'Journal for manual stock adjustments' },
-  { key: 'xero_sync_stock_allocation', label: 'Stock Allocation', description: 'Journal: DR Allocated Inventory / CR Inventory when stock is allocated to a paid order' },
 ]
 
 const STATUS_BADGE: Record<string, { variant: 'default' | 'secondary' | 'outline' | 'destructive'; label: string }> = {
@@ -110,6 +109,11 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
         xero_allocated_inventory_account: s.xero_allocated_inventory_account,
         xero_transit_account: s.xero_transit_account,
         xero_purchase_account: s.xero_purchase_account,
+        xero_unearned_revenue_account: s.xero_unearned_revenue_account,
+        xero_daily_batch_enabled: s.xero_daily_batch_enabled,
+        xero_payment_polling_enabled: s.xero_payment_polling_enabled,
+        xero_payment_account_map: s.xero_payment_account_map,
+        order_number_prefix: s.order_number_prefix,
       })
       setMsg(result.success ? 'Settings saved.' : `Error: ${result.error}`)
       router.refresh()
@@ -300,6 +304,38 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
             </div>
           </label>
         </div>
+      </Card>
+
+      {/* Sub-Ledger */}
+      <Card className="p-6 space-y-4">
+        <div>
+          <h3 className="text-base font-semibold">Sub-Ledger</h3>
+          <p className="text-xs text-muted-foreground mt-0.5">Daily batch journals for revenue deferral, inventory reclassification, and COGS recognition on shipment.</p>
+        </div>
+        <label className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
+          <input
+            type="checkbox"
+            checked={s.xero_daily_batch_enabled === 'true'}
+            onChange={e => handleField('xero_daily_batch_enabled', e.target.checked ? 'true' : 'false')}
+            className="h-4 w-4 accent-primary mt-0.5"
+          />
+          <div>
+            <span className="text-sm font-medium">Daily Batch Sync</span>
+            <p className="text-[11px] text-muted-foreground">Run nightly batch: Group A1 (revenue deferral), A2 (inventory reclassification), B (shipment COGS + revenue recognition).</p>
+          </div>
+        </label>
+        <label className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
+          <input
+            type="checkbox"
+            checked={s.xero_payment_polling_enabled === 'true'}
+            onChange={e => handleField('xero_payment_polling_enabled', e.target.checked ? 'true' : 'false')}
+            className="h-4 w-4 accent-primary mt-0.5"
+          />
+          <div>
+            <span className="text-sm font-medium">Payment Polling</span>
+            <p className="text-[11px] text-muted-foreground">Poll Xero every 15 minutes for paid invoices (manual orders) and paid bills (purchase orders).</p>
+          </div>
+        </label>
       </Card>
 
       {/* Sync Settings */}

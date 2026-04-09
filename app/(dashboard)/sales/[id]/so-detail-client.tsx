@@ -845,6 +845,16 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
             {so.invoiceNumber}
           </span>
         )}
+        {so.xeroInvoiceId && (
+          <a
+            href={`https://go.xero.com/AccountsReceivable/View.aspx?InvoiceID=${so.xeroInvoiceId}`}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium bg-blue-100 text-blue-800 border-blue-200 dark:bg-blue-900 dark:text-blue-200 hover:bg-blue-200 dark:hover:bg-blue-800 transition-colors"
+          >
+            <ExternalLink className="h-3 w-3" />Xero
+          </a>
+        )}
 
         <div className="flex items-center gap-1.5 ml-auto flex-wrap">
           {/* PDF & Email */}

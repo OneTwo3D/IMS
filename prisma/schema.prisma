@@ -136,6 +136,10 @@ enum XeroSyncType {
   STOCK_RECEIPT
   COGS_REVERSAL
   STOCK_ALLOCATION
+  DAILY_BATCH_REVENUE_DEFERRAL
+  DAILY_BATCH_INVENTORY_ALLOC
+  DAILY_BATCH_GROUP_B
+  UNEARNED_REV_REVERSAL
 }
 
 enum XeroSyncStatus {
@@ -830,6 +834,7 @@ model PurchaseInvoice {
   notes           String?
   supplierInvoiceUrl String? // path to uploaded supplier PDF
   xeroInvoiceId   String?
+  paidAt          DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
@@ -952,6 +957,17 @@ model SalesOrder {
   invoicedAt        DateTime?
   xeroInvoiceId     String?    // Xero invoice ID after sync
   paidAt            DateTime?
+  orderNumber       String?    // IMS order number (prefix + WC number, or manual)
+  paymentMethod     String?    // e.g. "stripe", "paypal", "bacs" — populated by any shopping channel
+  paymentMethodTitle String?   // e.g. "Credit card", "PayPal"
+  invoicePdfPath    String?    // path to saved invoice PDF (generic, set by any accounting module)
+
+  // Xero sub-ledger tracking
+  xeroRevenueDeferredDate    DateTime?              // Set by Group A1 — revenue deferred to Unearned
+  xeroUnearnedRevenueAmount  Decimal?  @db.Decimal(18, 4) // Amount deferred
+  xeroInventoryAllocatedDate DateTime?              // Set by Group A2 — inventory reclassified to Allocated
+  xeroAllocationBatchAmount  Decimal?  @db.Decimal(18, 4) // Cost value reclassified
+
   notes             String?     // customer-visible notes
   internalNotes     String?     // private/staff notes
 
@@ -1396,6 +1412,12 @@ model Shipment {
   trackingNumber  String?
   shippingService String?
   shippedAt       DateTime?
+
+  // Xero sub-ledger tracking
+  xeroShipmentJournalDate     DateTime?
+  xeroCogsBatchAmount         Decimal?  @db.Decimal(18, 4)
+  xeroRevenueRecognizedAmount Decimal?  @db.Decimal(18, 4)
+
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt
 

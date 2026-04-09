@@ -95,6 +95,41 @@ export async function xeroPut<T = unknown>(path: string, body: unknown): Promise
 }
 
 /**
+ * Raw binary GET request (e.g. for PDF download).
+ * Returns the response as a Buffer.
+ */
+export async function xeroGetRaw(
+  path: string,
+  accept: string = 'application/pdf',
+): Promise<{ ok: boolean; status: number; buffer?: Buffer; error?: string }> {
+  const auth = await getAccessToken()
+  if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
+
+  const url = path.startsWith('http') ? path : `${XERO_BASE_URL}/${path}`
+
+  const res = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Authorization': `Bearer ${auth.accessToken}`,
+      'Xero-Tenant-Id': auth.tenantId,
+      'Accept': accept,
+    },
+  })
+
+  if (res.status === 429) {
+    return { ok: false, status: 429, error: 'Rate limited' }
+  }
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => 'Unknown error')
+    return { ok: false, status: res.status, error: `Raw GET failed: ${errText}` }
+  }
+
+  const arrayBuffer = await res.arrayBuffer()
+  return { ok: true, status: res.status, buffer: Buffer.from(arrayBuffer) }
+}
+
+/**
  * Upload a file attachment to a Xero object (invoice, bill, credit note, etc.).
  * Uses the Xero Files API: PUT /api.xro/2.0/{endpoint}/{id}/Attachments/{filename}
  */
