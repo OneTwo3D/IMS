@@ -26,7 +26,6 @@ export type XeroSettings = {
   xero_allocated_inventory_account: string
   xero_unearned_revenue_account: string
   xero_transit_account: string
-  xero_purchase_account: string
   xero_daily_batch_enabled: string
   xero_payment_polling_enabled: string
   xero_payment_account_map: string
@@ -41,7 +40,7 @@ export const XERO_SETTING_KEYS = [
   'xero_sales_account', 'xero_shipping_account', 'xero_discount_account',
   'xero_cogs_account', 'xero_inventory_account', 'xero_allocated_inventory_account',
   'xero_unearned_revenue_account',
-  'xero_transit_account', 'xero_purchase_account',
+  'xero_transit_account',
   'xero_daily_batch_enabled', 'xero_payment_polling_enabled',
   'xero_payment_account_map',
 ]
@@ -67,7 +66,6 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_allocated_inventory_account: '',
   xero_unearned_revenue_account: '',
   xero_transit_account: '',
-  xero_purchase_account: '',
   xero_daily_batch_enabled: 'false',
   xero_payment_polling_enabled: 'false',
   xero_payment_account_map: '{}',

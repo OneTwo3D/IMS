@@ -251,7 +251,6 @@ const REQUIRED_ACCOUNTS: Array<{ key: keyof XeroSettings; label: string }> = [
   { key: 'xero_sales_account', label: 'Sales Revenue' },
   { key: 'xero_shipping_account', label: 'Shipping Income' },
   { key: 'xero_discount_account', label: 'Discounts Given' },
-  { key: 'xero_purchase_account', label: 'Purchases' },
   { key: 'xero_transit_account', label: 'Stock in Transit' },
   { key: 'xero_inventory_account', label: 'Inventory Asset' },
   { key: 'xero_allocated_inventory_account', label: 'Allocated Inventory' },

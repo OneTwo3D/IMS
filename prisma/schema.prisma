@@ -311,11 +311,13 @@ model DocumentTemplate {
   @@map("document_templates")
 }
 
-/// Configurable reasons for stock adjustments, each optionally linked to an accounting account
+/// Configurable reasons for stock adjustments, each optionally linked to an accounting account.
+/// accountCode is connector-agnostic: it is the account code in whichever accounting system
+/// (Xero, QuickBooks, etc.) is currently active.
 model AdjustmentReason {
   id              String   @id @default(cuid())
   name            String
-  accountCode     String?  @map("xero_account_code")
+  accountCode     String?  @map("account_code")
   sortOrder       Int      @default(0)
   active          Boolean  @default(true)
   createdAt       DateTime @default(now())

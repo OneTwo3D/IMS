@@ -6,6 +6,91 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
+import type { Prisma } from '@/app/generated/prisma/client'
+
+// ---------------------------------------------------------------------------
+// Helpers for inventory adjustment accounting journal
+// ---------------------------------------------------------------------------
+
+/**
+ * Compute a unit cost (GBP) for a product from its FIFO cost layers.
+ * Used to value manual stock adjustments (write-offs, shrinkage, stock found)
+ * when queuing the accounting journal. Returns the weighted average of
+ * remaining layers; falls back to 0 if no layers exist.
+ */
+async function getProductUnitCost(
+  tx: Prisma.TransactionClient,
+  productId: string,
+): Promise<number> {
+  const layers = await tx.costLayer.findMany({
+    where: { productId, remainingQty: { gt: 0 } },
+    select: { remainingQty: true, unitCostGbp: true },
+  })
+  let totalQty = 0
+  let totalCost = 0
+  for (const l of layers) {
+    const q = Number(l.remainingQty)
+    totalQty += q
+    totalCost += q * Number(l.unitCostGbp)
+  }
+  return totalQty > 0 ? totalCost / totalQty : 0
+}
+
+/**
+ * Build the journal payload for an inventory adjustment.
+ *
+ *   qty > 0 (stock added, e.g. "stock found"):
+ *     DR Inventory / CR reason.accountCode   — the reason account is a gain
+ *
+ *   qty < 0 (stock removed, e.g. "write-off", "shrinkage"):
+ *     DR reason.accountCode / CR Inventory   — the reason account is an expense
+ *
+ * Returns null when there is nothing to post (no cost, no reason account,
+ * or zero quantity).
+ */
+function buildInventoryAdjustmentJournal(params: {
+  reasonAccountCode: string
+  inventoryAccountCode: string
+  productSku: string
+  productName: string
+  warehouseCode: string
+  warehouseName: string
+  qty: number
+  unitCost: number
+  note: string | null
+}): {
+  date: string
+  reference: string
+  narration: string
+  lines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }>
+} | null {
+  const { reasonAccountCode, inventoryAccountCode, productSku, productName, warehouseCode, warehouseName, qty, unitCost, note } = params
+  if (qty === 0 || unitCost === 0 || !reasonAccountCode || !inventoryAccountCode) return null
+
+  const totalValue = Math.round(Math.abs(qty) * unitCost * 100) / 100
+  if (totalValue === 0) return null
+
+  const date = new Date().toISOString().slice(0, 10)
+  const directionLabel = qty > 0 ? 'increase' : 'decrease'
+  const reference = `Adj: ${productSku} ${qty > 0 ? '+' : ''}${qty} @ ${warehouseCode}`
+  const narration = [
+    `Stock ${directionLabel} — ${productName} @ ${warehouseName}`,
+    note,
+  ].filter(Boolean).join(' — ')
+  const description = `${productSku} ${qty > 0 ? '+' : ''}${qty} @ ${warehouseCode}`
+
+  const lines = qty > 0
+    ? [
+        { accountCode: inventoryAccountCode, description, debit: totalValue },
+        { accountCode: reasonAccountCode, description, credit: totalValue },
+      ]
+    : [
+        { accountCode: reasonAccountCode, description, debit: totalValue },
+        { accountCode: inventoryAccountCode, description, credit: totalValue },
+      ]
+
+  return { date, reference, narration, lines }
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -106,34 +191,36 @@ export async function adjustStock(
       logSku = logProduct?.sku ?? productId
       logWarehouseName = logWarehouse?.name ?? warehouseId
 
-      // Queue accounting sync — prefer reason's account code, fall back to global setting
-      const settings = await getAccountingSettings()
-      const effectiveAccount = accountCode || settings.inventoryAdjustmentAccount || null
-
-      if (effectiveAccount) {
-        const product = await tx.product.findUnique({
-          where: { id: productId },
-          select: { sku: true, name: true },
+      // Queue accounting sync — ONLY if the reason has an account code assigned.
+      // The reason (configured in Settings → Inventory → Stock Adjustment Reasons)
+      // is the single source of truth for the counter-account. There is no global
+      // fallback: an adjustment with no reason account simply posts no journal.
+      if (accountCode) {
+        const settings = await getAccountingSettings()
+        const [product, warehouse, unitCost] = await Promise.all([
+          tx.product.findUnique({ where: { id: productId }, select: { sku: true, name: true } }),
+          tx.warehouse.findUnique({ where: { id: warehouseId }, select: { code: true, name: true } }),
+          getProductUnitCost(tx, productId),
+        ])
+        const journal = buildInventoryAdjustmentJournal({
+          reasonAccountCode: accountCode,
+          inventoryAccountCode: settings.inventoryAccount,
+          productSku: product?.sku ?? productId,
+          productName: product?.name ?? '',
+          warehouseCode: warehouse?.code ?? '',
+          warehouseName: warehouse?.name ?? '',
+          qty: qtyNum,
+          unitCost,
+          note: reasonName,
         })
-        const warehouse = await tx.warehouse.findUnique({
-          where: { id: warehouseId },
-          select: { code: true, name: true },
-        })
-        await queueAccountingSync({
-          type: 'INVENTORY_ADJUSTMENT',
-          referenceType: 'StockMovement',
-          referenceId: productId,
-          payload: {
-            productId,
-            productSku: product?.sku,
-            productName: product?.name,
-            warehouseId,
-            warehouseCode: warehouse?.code,
-            qty: qtyNum,
-            note: reasonName,
-            accountCode: effectiveAccount,
-          },
-        })
+        if (journal) {
+          await queueAccountingSync({
+            type: 'INVENTORY_ADJUSTMENT',
+            referenceType: 'StockMovement',
+            referenceId: productId,
+            payload: journal as unknown as Record<string, unknown>,
+          })
+        }
       }
     })
 
@@ -203,6 +290,9 @@ export async function bulkAdjustStock(
   const reasonMap = new Map(reasons.map((r) => [r.id, r]))
 
   try {
+    // Resolve the inventory account once — same value for every line.
+    const settings = await getAccountingSettings()
+
     await db.$transaction(async (tx) => {
       for (const line of valid) {
         const { productId, warehouseId, reasonId, qty } = line
@@ -229,15 +319,35 @@ export async function bulkAdjustStock(
           update: { quantity: { increment: qty } },
         })
 
-        // Accounting sync: use reason's account code if set
+        // Accounting sync: only queue when the reason has an account code.
+        // Reason accounts are configured in Settings → Inventory → Stock
+        // Adjustment Reasons and are the single source of truth.
         const reasonAccountCode = reason?.accountCode ?? null
         if (reasonAccountCode) {
-          await queueAccountingSync({
-            type: 'INVENTORY_ADJUSTMENT',
-            referenceType: 'StockMovement',
-            referenceId: productId,
-            payload: { productId, warehouseId, qty, note, accountCode: reasonAccountCode },
+          const [product, warehouse, unitCost] = await Promise.all([
+            tx.product.findUnique({ where: { id: productId }, select: { sku: true, name: true } }),
+            tx.warehouse.findUnique({ where: { id: warehouseId }, select: { code: true, name: true } }),
+            getProductUnitCost(tx, productId),
+          ])
+          const journal = buildInventoryAdjustmentJournal({
+            reasonAccountCode,
+            inventoryAccountCode: settings.inventoryAccount,
+            productSku: product?.sku ?? productId,
+            productName: product?.name ?? '',
+            warehouseCode: warehouse?.code ?? '',
+            warehouseName: warehouse?.name ?? '',
+            qty,
+            unitCost,
+            note,
           })
+          if (journal) {
+            await queueAccountingSync({
+              type: 'INVENTORY_ADJUSTMENT',
+              referenceType: 'StockMovement',
+              referenceId: productId,
+              payload: journal as unknown as Record<string, unknown>,
+            })
+          }
         }
       }
     })

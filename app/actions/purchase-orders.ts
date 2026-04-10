@@ -1462,11 +1462,13 @@ export async function createInvoice(
           dueDate: input.dueDate ?? undefined,
           currency: supplierData?.currency ?? 'GBP',
           reference: input.invoiceNumber ?? undefined,
+          // Goods on a PO stay on the balance sheet as Stock-in-Transit until received.
+          // The opposite leg (DR Inventory / CR Transit) is posted on goods receipt.
           lines: linesWithQty.map(l => ({
             description: `PO ${po.reference} line`,
             quantity: l.qtyBilled,
             unitAmount: Math.round((l.unitCostForeign / fxRate) * 10000) / 10000,
-            accountCode: settings.purchaseAccount,
+            accountCode: settings.transitAccount,
             taxType: billTaxType,
           })),
           supplierInvoicePath: input.supplierInvoiceUrl ?? undefined,

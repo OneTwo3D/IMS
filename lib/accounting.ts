@@ -16,8 +16,6 @@ export type AccountingSettings = {
   allocatedInventoryAccount: string
   unearnedRevenueAccount: string
   transitAccount: string
-  purchaseAccount: string
-  inventoryAdjustmentAccount: string
   paymentAccountMap: string
   invoiceUrlTemplate: string
   billUrlTemplate: string
@@ -55,8 +53,6 @@ export async function getAccountingSettings(): Promise<AccountingSettings> {
     allocatedInventoryAccount: xs.xero_allocated_inventory_account,
     unearnedRevenueAccount: xs.xero_unearned_revenue_account,
     transitAccount: xs.xero_transit_account,
-    purchaseAccount: xs.xero_purchase_account,
-    inventoryAdjustmentAccount: xs.xero_purchase_account, // reuse purchase account for adjustments
     paymentAccountMap: xs.xero_payment_account_map,
     invoiceUrlTemplate: invoiceUrlSetting?.value ?? 'https://go.xero.com/AccountsReceivable/View.aspx?InvoiceID={id}',
     billUrlTemplate: billUrlSetting?.value ?? 'https://go.xero.com/AccountsPayable/View.aspx?InvoiceID={id}',
