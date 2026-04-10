@@ -34,19 +34,25 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
   try {
     await requireAdmin()
 
-    // If attempting to enable sync, verify readiness first
+    // Only run the readiness gate when the user is *transitioning* sync from
+    // OFF → ON. If sync is already enabled, allow any save to go through so the
+    // user can edit (or fix) their account mappings without being blocked.
     if (data.xero_sync_enabled === 'true') {
-      const readiness = await getXeroSyncReadiness()
-      if (!readiness.ready) {
-        const reasons: string[] = []
-        if (readiness.notConnected) reasons.push('not connected to Xero')
-        if (readiness.missingAccounts.length > 0) {
-          reasons.push(`missing account mappings (${readiness.missingAccounts.map(a => a.label).join(', ')})`)
+      const currentEnabled = await db.setting.findUnique({ where: { key: 'xero_sync_enabled' } })
+      const isTransitioningOn = currentEnabled?.value !== 'true'
+      if (isTransitioningOn) {
+        const readiness = await getXeroSyncReadiness()
+        if (!readiness.ready) {
+          const reasons: string[] = []
+          if (readiness.notConnected) reasons.push('not connected to Xero')
+          if (readiness.missingAccounts.length > 0) {
+            reasons.push(`missing account mappings (${readiness.missingAccounts.map(a => a.label).join(', ')})`)
+          }
+          if (readiness.missingTaxTypes.length > 0) {
+            reasons.push(`missing Xero tax type on IMS VAT rates (${readiness.missingTaxTypes.map(t => t.name).join(', ')})`)
+          }
+          return { success: false, error: `Cannot enable Xero sync — ${reasons.join('; ')}.` }
         }
-        if (readiness.missingTaxTypes.length > 0) {
-          reasons.push(`missing Xero tax type on IMS VAT rates (${readiness.missingTaxTypes.map(t => t.name).join(', ')})`)
-        }
-        return { success: false, error: `Cannot enable Xero sync — ${reasons.join('; ')}.` }
       }
     }
 
