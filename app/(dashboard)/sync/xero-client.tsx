@@ -33,6 +33,8 @@ type Props = {
    * QuickBooks connector can reuse it unchanged.
    */
   paymentAccountMap: string
+  /** Active currencies from the currency settings screen — populates the currency dropdown in the payment map. */
+  currencies: Array<{ code: string; name: string }>
   readiness: XeroSyncReadiness
 }
 
@@ -80,7 +82,7 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
   return JSON.stringify(map)
 }
 
-export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos, paymentAccountMap, readiness }: Props) {
+export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, readiness }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
@@ -409,16 +411,25 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                     />
                   </td>
                   <td className="px-3 py-1.5">
-                    <Input
+                    <select
+                      className="flex h-8 w-28 rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
                       value={row.currency}
                       onChange={e => {
                         const updated = [...paymentMapRows]
                         updated[i] = { ...row, currency: e.target.value }
                         setPaymentMapRows(updated)
                       }}
-                      placeholder="e.g. GBP or *"
-                      className="h-8 text-xs w-24"
-                    />
+                    >
+                      <option value="">— Select —</option>
+                      <option value="*">Any (*)</option>
+                      {currencies.map(c => (
+                        <option key={c.code} value={c.code}>{c.code}</option>
+                      ))}
+                      {/* If a stored value refers to a currency that's no longer active, still show it so the row isn't silently blanked. */}
+                      {row.currency && row.currency !== '*' && !currencies.some(c => c.code === row.currency) && (
+                        <option value={row.currency}>{row.currency} (inactive)</option>
+                      )}
+                    </select>
                   </td>
                   <td className="px-3 py-1.5">
                     {accounts.length > 0 ? (

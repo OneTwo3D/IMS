@@ -23,6 +23,7 @@ type Props = {
   xeroLogs: XeroSyncLogRow[]
   paymentMethodCombos: Array<{ paymentMethod: string; currency: string }>
   paymentAccountMap: string
+  currencies: Array<{ code: string; name: string }>
   xeroReadiness: XeroSyncReadiness
 }
 
@@ -93,7 +94,7 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 
-export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcLogs, taxRates, wcCredentials, xeroSettings, xeroConnected, xeroTenantName, xeroAccounts, xeroLogs, paymentMethodCombos, paymentAccountMap, xeroReadiness }: Props) {
+export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcLogs, taxRates, wcCredentials, xeroSettings, xeroConnected, xeroTenantName, xeroAccounts, xeroLogs, paymentMethodCombos, paymentAccountMap, currencies, xeroReadiness }: Props) {
   const [activeConnector, setActiveConnector] = useState<string | null>(null)
 
   const wcConnected = !!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secret
@@ -194,6 +195,7 @@ export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcL
           logs={xeroLogs}
           paymentMethodCombos={paymentMethodCombos}
           paymentAccountMap={paymentAccountMap}
+          currencies={currencies}
           readiness={xeroReadiness}
         />
       </div>
