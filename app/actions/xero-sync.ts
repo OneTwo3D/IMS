@@ -163,10 +163,10 @@ export async function syncXeroAccounts(): Promise<{ synced: number; errors: stri
   return result
 }
 
-export async function getXeroAccounts(): Promise<Array<{ id: string; code: string | null; name: string; type: string }>> {
+export async function getXeroAccounts(): Promise<Array<{ id: string; xeroId: string; code: string | null; name: string; type: string }>> {
   return db.xeroAccount.findMany({
     where: { active: true },
-    select: { id: true, code: true, name: true, type: true },
+    select: { id: true, xeroId: true, code: true, name: true, type: true },
     orderBy: [{ code: 'asc' }],
   })
 }

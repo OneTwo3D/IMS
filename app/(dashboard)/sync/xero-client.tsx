@@ -15,7 +15,7 @@ import {
 } from '@/app/actions/xero-sync'
 import { savePaymentAccountMap } from '@/app/actions/accounting'
 
-type XeroAccount = { id: string; code: string | null; name: string; type: string }
+type XeroAccount = { id: string; xeroId: string; code: string | null; name: string; type: string }
 
 type PaymentMapRow = { method: string; currency: string; accountCode: string }
 
@@ -35,6 +35,8 @@ type Props = {
   paymentAccountMap: string
   /** Active currencies from the currency settings screen — populates the currency dropdown in the payment map. */
   currencies: Array<{ code: string; name: string }>
+  /** Active WooCommerce payment gateways — populates the method dropdown/datalist. Free-text still allowed. */
+  wcPaymentGateways: Array<{ id: string; title: string }>
   readiness: XeroSyncReadiness
 }
 
@@ -82,7 +84,7 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
   return JSON.stringify(map)
 }
 
-export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, readiness }: Props) {
+export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, wcPaymentGateways, readiness }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
@@ -383,8 +385,22 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       <Card className="p-6 space-y-4">
         <div>
           <h3 className="text-base font-semibold">Payment Account Mapping</h3>
-          <p className="text-xs text-muted-foreground mt-0.5">Map payment method + currency combinations to Xero bank accounts for automatic payment registration.</p>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            Map payment method + currency combinations to Xero bank accounts for automatic payment registration.
+            Methods suggest active WooCommerce gateways but free-text is allowed.
+          </p>
         </div>
+        {/* Shared datalist of known payment methods (WC active gateways + historical combos). */}
+        <datalist id="payment-method-suggestions">
+          {Array.from(
+            new Map([
+              ...wcPaymentGateways.map(g => [g.id, g.title] as const),
+              ...paymentMethodCombos.map(c => [c.paymentMethod, c.paymentMethod] as const),
+            ]).entries(),
+          ).map(([id, title]) => (
+            <option key={id} value={id}>{title}</option>
+          ))}
+        </datalist>
         <div className="rounded-md border overflow-hidden">
           <table className="w-full text-sm">
             <thead className="bg-muted/50 border-b">
@@ -401,6 +417,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                   <td className="px-3 py-1.5">
                     <Input
                       value={row.method}
+                      list="payment-method-suggestions"
                       onChange={e => {
                         const updated = [...paymentMapRows]
                         updated[i] = { ...row, method: e.target.value }
@@ -433,28 +450,38 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                   </td>
                   <td className="px-3 py-1.5">
                     {accounts.length > 0 ? (
-                      <select
-                        className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                        value={row.accountCode}
-                        onChange={e => {
-                          const updated = [...paymentMapRows]
-                          updated[i] = { ...row, accountCode: e.target.value }
-                          setPaymentMapRows(updated)
-                        }}
-                      >
-                        <option value="">— Select —</option>
-                        {accounts.filter(a => a.type === 'BANK').map(a => (
-                          <option key={a.id} value={a.code ?? ''}>
-                            {a.code} — {a.name}
-                          </option>
-                        ))}
-                        {/* Show all accounts if no BANK type found */}
-                        {accounts.filter(a => a.type === 'BANK').length === 0 && accounts.map(a => (
-                          <option key={a.id} value={a.code ?? ''}>
-                            {a.code} — {a.name}
-                          </option>
-                        ))}
-                      </select>
+                      (() => {
+                        // Filter to BANK accounts, fall back to all if none are classified as BANK.
+                        const bankAccounts = accounts.filter(a => a.type === 'BANK')
+                        const options = bankAccounts.length > 0 ? bankAccounts : accounts
+                        // Stored value is preferentially the Xero UUID (xeroId) but legacy rows
+                        // may still hold a Code. Accept either by matching against both fields.
+                        const storedKnown = options.some(a => a.xeroId === row.accountCode || a.code === row.accountCode)
+                        return (
+                          <select
+                            className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                            value={row.accountCode}
+                            onChange={e => {
+                              const updated = [...paymentMapRows]
+                              updated[i] = { ...row, accountCode: e.target.value }
+                              setPaymentMapRows(updated)
+                            }}
+                          >
+                            <option value="">— Select —</option>
+                            {options.map(a => (
+                              // Use xeroId as the option value — it's always populated and unique,
+                              // avoiding the collision that occurred when BANK accounts had NULL codes.
+                              <option key={a.id} value={a.xeroId}>
+                                {a.code ? `${a.code} — ${a.name}` : a.name}
+                              </option>
+                            ))}
+                            {/* Preserve an unrecognised stored value so legacy mappings aren't silently blanked. */}
+                            {row.accountCode && !storedKnown && (
+                              <option value={row.accountCode}>{row.accountCode} (unknown)</option>
+                            )}
+                          </select>
+                        )
+                      })()
                     ) : (
                       <Input
                         value={row.accountCode}

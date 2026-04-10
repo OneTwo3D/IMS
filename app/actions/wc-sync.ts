@@ -257,6 +257,25 @@ export async function getWcSyncLogs(limit = 50): Promise<SyncLogRow[]> {
 // Manual sync triggers
 // ---------------------------------------------------------------------------
 
+/**
+ * Fetch active (enabled) WooCommerce payment gateways. Used to populate the
+ * payment method dropdown in the accounting integration's payment account
+ * mapping. Returns an empty list if WC is not connected or the call fails —
+ * the UI will simply fall back to free-text entry or historical combos.
+ */
+export async function getWcActivePaymentGateways(): Promise<Array<{ id: string; title: string }>> {
+  try {
+    const { wcFetch } = await import('@/lib/connectors/woocommerce/api')
+    const { data, error } = await wcFetch('/payment_gateways')
+    if (error || !Array.isArray(data)) return []
+    return (data as Array<{ id?: string; title?: string; method_title?: string; enabled?: boolean }>)
+      .filter((g) => g.enabled && typeof g.id === 'string')
+      .map((g) => ({ id: g.id as string, title: g.title || g.method_title || (g.id as string) }))
+  } catch {
+    return []
+  }
+}
+
 export async function triggerManualSync(type: 'orders' | 'products' | 'stock'): Promise<{ success: boolean; result?: unknown; error?: string }> {
   await requireAdmin()
   try {

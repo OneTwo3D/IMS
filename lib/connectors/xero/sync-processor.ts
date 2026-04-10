@@ -140,29 +140,37 @@ async function processEntry(
 
       // Register payment in Xero if requested (pre-paid WC orders).
       // Payment account map is a connector-agnostic setting — the active
-      // accounting connector (Xero here) interprets the account code in its
-      // own chart of accounts.
+      // accounting connector (Xero here) interprets the stored value as
+      // either a Xero UUID (preferred) or a legacy Account Code.
       if (invoiceResult.success && invoiceResult.invoiceId && payload._registerPayment) {
         try {
           const paymentMap = await getPaymentAccountMap()
           const method = payload._paymentMethod as string || ''
           const currency = payload.currency as string || 'GBP'
-          const accountCode = lookupPaymentAccount(paymentMap, method, currency)
+          const stored = lookupPaymentAccount(paymentMap, method, currency)
 
-          if (accountCode) {
-            // Get the invoice total from Xero to register the payment
-            const paymentDate = (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
-            await xeroPost('Payments', {
-              Invoice: { InvoiceID: invoiceResult.invoiceId },
-              Account: { Code: accountCode },
-              Date: paymentDate,
-              Amount: payload.shippingAmount
-                ? (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
-                  + (payload.shippingAmount as number)
-                  - ((payload.discountAmount as number) || 0)
-                : (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
-                  - ((payload.discountAmount as number) || 0),
+          if (stored) {
+            // Resolve stored value to a XeroAccount — match either xeroId (new) or code (legacy).
+            // Bank accounts in Xero may have NULL codes (e.g. Stripe feeds), so we always post
+            // using AccountID, which is guaranteed unique.
+            const account = await db.xeroAccount.findFirst({
+              where: { OR: [{ xeroId: stored }, { code: stored }] },
+              select: { xeroId: true },
             })
+            if (account) {
+              const paymentDate = (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
+              await xeroPost('Payments', {
+                Invoice: { InvoiceID: invoiceResult.invoiceId },
+                Account: { AccountID: account.xeroId },
+                Date: paymentDate,
+                Amount: payload.shippingAmount
+                  ? (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
+                    + (payload.shippingAmount as number)
+                    - ((payload.discountAmount as number) || 0)
+                  : (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
+                    - ((payload.discountAmount as number) || 0),
+              })
+            }
           }
         } catch (e) {
           // Payment registration failure is non-critical — invoice was already created
