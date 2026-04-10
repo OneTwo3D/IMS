@@ -194,7 +194,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   }
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 pb-20">
       {/* Connection */}
       <Card className="p-6 space-y-4">
         <div className="flex items-center justify-between">
@@ -536,17 +536,9 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
           />
           <div>
             <span className="text-sm font-medium">Enable Xero Sync</span>
-            <p className="text-xs text-muted-foreground">When enabled, transactions are queued and synced to Xero automatically via cron.</p>
+            <p className="text-xs text-muted-foreground">When enabled, transactions are queued and synced to Xero automatically via cron. Remember to click <span className="font-medium">Save Settings</span> at the bottom of the page after making changes.</p>
           </div>
         </label>
-
-        <div className="flex items-center gap-3">
-          <Button size="sm" onClick={handleSave} disabled={isPending}>
-            {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : null}
-            Save Settings
-          </Button>
-          {msg && <span className="text-xs text-muted-foreground">{msg}</span>}
-        </div>
 
         <div className="flex items-center gap-3 pt-2 border-t">
           <Button size="sm" variant="outline" onClick={handleManualSync} disabled={isPending || !connected || s.xero_sync_enabled !== 'true'}>
@@ -599,6 +591,23 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
           </div>
         )}
       </Card>
+
+      {/* Sticky Save Bar */}
+      <div className="fixed bottom-0 left-0 right-0 z-40 border-t bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 shadow-lg">
+        <div className="max-w-5xl mx-auto px-6 py-3 flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            {msg ? (
+              <span className={msg.startsWith('Error') ? 'text-destructive' : 'text-green-600 dark:text-green-400'}>{msg}</span>
+            ) : (
+              <span>Changes are not saved until you click Save Settings.</span>
+            )}
+          </div>
+          <Button onClick={handleSave} disabled={isPending}>
+            {isPending ? <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> : null}
+            Save Settings
+          </Button>
+        </div>
+      </div>
     </div>
   )
 }
