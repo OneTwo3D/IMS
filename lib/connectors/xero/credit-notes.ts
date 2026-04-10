@@ -27,6 +27,19 @@ export async function pushCreditNote(
     return { success: false, error: `Contact error: ${contactResult.error}` }
   }
 
+  // Xero mandates TaxType on every line; "NONE" is the no-tax fallback.
+  const DEFAULT_TAX_TYPE = 'NONE'
+
+  // Validate account codes up front.
+  for (const line of data.lines) {
+    if (!line.accountCode) {
+      return {
+        success: false,
+        error: `Line "${line.description}" is missing a sales account code. Configure Account Mapping → Sales Revenue in the Xero integration settings.`,
+      }
+    }
+  }
+
   // Build line items
   const lineItems = data.lines.map((line: InvoiceLine) => {
     const xeroLine: Record<string, unknown> = {
@@ -34,9 +47,9 @@ export async function pushCreditNote(
       Quantity: line.quantity,
       UnitAmount: line.unitAmount,
       AccountCode: line.accountCode,
+      TaxType: line.taxType || DEFAULT_TAX_TYPE,
     }
     if (line.itemCode) xeroLine.ItemCode = line.itemCode
-    if (line.taxType) xeroLine.TaxType = line.taxType
     return xeroLine
   })
 

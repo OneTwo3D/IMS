@@ -27,6 +27,19 @@ export async function pushPurchaseBill(
     return { success: false, error: `Contact error: ${contactResult.error}` }
   }
 
+  // Xero mandates TaxType on every line; "NONE" is the no-tax fallback.
+  const DEFAULT_TAX_TYPE = 'NONE'
+
+  // Validate account codes up front — Xero rejects the whole bill otherwise.
+  for (const line of data.lines) {
+    if (!line.accountCode) {
+      return {
+        success: false,
+        error: `Line "${line.description}" is missing an account code. Configure Account Mapping → Stock in Transit in the Xero integration settings.`,
+      }
+    }
+  }
+
   // Build line items
   const lineItems = data.lines.map((line: InvoiceLine) => {
     const xeroLine: Record<string, unknown> = {
@@ -34,11 +47,14 @@ export async function pushPurchaseBill(
       Quantity: line.quantity,
       UnitAmount: line.unitAmount,
       AccountCode: line.accountCode,
+      TaxType: line.taxType || DEFAULT_TAX_TYPE,
     }
     if (line.itemCode) xeroLine.ItemCode = line.itemCode
-    if (line.taxType) xeroLine.TaxType = line.taxType
     return xeroLine
   })
+
+  // DueDate is mandatory for AUTHORISED bills — fall back to the bill date.
+  const dueDate = data.dueDate || data.date
 
   const invoice: Record<string, unknown> = {
     Type: 'ACCPAY',
@@ -47,9 +63,9 @@ export async function pushPurchaseBill(
     Status: status,
     CurrencyCode: data.currency,
     Date: data.date,
+    DueDate: dueDate,
   }
   if (data.invoiceNumber) invoice.InvoiceNumber = data.invoiceNumber
-  if (data.dueDate) invoice.DueDate = data.dueDate
   if (data.reference) invoice.Reference = data.reference
 
   const res = await xeroPost<XeroInvoiceResponse>('Invoices', invoice)

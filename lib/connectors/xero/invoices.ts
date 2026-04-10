@@ -50,6 +50,24 @@ export async function pushSalesInvoice(
     }
   }
 
+  // Xero requires a TaxType on every line item. "NONE" is the no-tax fallback
+  // for customers/products that carry no VAT, so we default to it whenever the
+  // caller hasn't supplied a specific tax type.
+  const DEFAULT_TAX_TYPE = 'NONE'
+
+  // Validate that every product line has an account code — Xero rejects the
+  // whole invoice with "Account code or ID must be specified" if any line is
+  // missing one. Bail out early with a clear error instead of making a bad
+  // API call.
+  for (const line of data.lines) {
+    if (!line.accountCode) {
+      return {
+        success: false,
+        error: `Line "${line.description}" is missing a sales account code. Configure Account Mapping → Sales Revenue in the Xero integration settings.`,
+      }
+    }
+  }
+
   // Build line items
   const lineItems = data.lines.map((line: InvoiceLine) => {
     const xeroLine: Record<string, unknown> = {
@@ -57,9 +75,9 @@ export async function pushSalesInvoice(
       Quantity: line.quantity,
       UnitAmount: line.unitAmount,
       AccountCode: line.accountCode,
+      TaxType: line.taxType || DEFAULT_TAX_TYPE,
     }
     if (line.itemCode && !droppedItemCodes.has(line.itemCode)) xeroLine.ItemCode = line.itemCode
-    if (line.taxType) xeroLine.TaxType = line.taxType
     if (line.discountRate && line.discountRate > 0) xeroLine.DiscountRate = line.discountRate
     return xeroLine
   })
@@ -71,6 +89,7 @@ export async function pushSalesInvoice(
       Quantity: 1,
       UnitAmount: data.shippingAmount,
       AccountCode: data.shippingAccountCode,
+      TaxType: DEFAULT_TAX_TYPE,
     })
   }
 
@@ -81,19 +100,24 @@ export async function pushSalesInvoice(
       Quantity: 1,
       UnitAmount: -data.discountAmount,
       AccountCode: data.discountAccountCode,
+      TaxType: DEFAULT_TAX_TYPE,
     })
   }
+
+  // DueDate is mandatory for AUTHORISED invoices in Xero. Fall back to the
+  // invoice date (same-day payment) if the caller didn't supply one.
+  const dueDate = data.dueDate || data.date
 
   const invoice: Record<string, unknown> = {
     Type: 'ACCREC',
     Contact: { ContactID: contactResult.contactId },
     InvoiceNumber: data.invoiceNumber,
     Date: data.date,
+    DueDate: dueDate,
     LineItems: lineItems,
     Status: status,
     CurrencyCode: data.currency,
   }
-  if (data.dueDate) invoice.DueDate = data.dueDate
   if (data.reference) invoice.Reference = data.reference
 
   const res = await xeroPost<XeroInvoiceResponse>('Invoices', invoice)
