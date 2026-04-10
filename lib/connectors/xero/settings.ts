@@ -28,7 +28,6 @@ export type XeroSettings = {
   xero_transit_account: string
   xero_daily_batch_enabled: string
   xero_payment_polling_enabled: string
-  xero_payment_account_map: string
 }
 
 export const XERO_SETTING_KEYS = [
@@ -42,7 +41,6 @@ export const XERO_SETTING_KEYS = [
   'xero_unearned_revenue_account',
   'xero_transit_account',
   'xero_daily_batch_enabled', 'xero_payment_polling_enabled',
-  'xero_payment_account_map',
 ]
 
 const XERO_DEFAULTS: XeroSettings = {
@@ -68,7 +66,6 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_transit_account: '',
   xero_daily_batch_enabled: 'false',
   xero_payment_polling_enabled: 'false',
-  xero_payment_account_map: '{}',
 }
 
 export async function getXeroSettings(): Promise<XeroSettings> {
@@ -80,22 +77,4 @@ export async function getXeroSettings(): Promise<XeroSettings> {
     if (v) result[k] = v
   }
   return result
-}
-
-/** Look up bank account code for a payment method + currency combo */
-export function lookupPaymentAccount(
-  mapJson: string,
-  paymentMethod: string,
-  currency: string,
-): string | null {
-  try {
-    const map = JSON.parse(mapJson) as Record<string, string>
-    const exact = map[`${paymentMethod}:${currency}`]
-    if (exact) return exact
-    const wildcard = map[`${paymentMethod}:*`]
-    if (wildcard) return wildcard
-    return null
-  } catch {
-    return null
-  }
 }

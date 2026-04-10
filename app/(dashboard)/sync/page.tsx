@@ -1,13 +1,15 @@
 import type { Metadata } from 'next'
 import { getWcSyncSettings, getWcTaxRateMappings, getWcStatusMappings, getWcSyncLogs, getWcCredentials } from '@/app/actions/wc-sync'
-import { getXeroSettingsMasked, getXeroConnectionStatus, getXeroAccounts, getXeroSyncLogs, getPaymentMethodCombos, getXeroSyncReadiness } from '@/app/actions/xero-sync'
+import { getXeroSettingsMasked, getXeroConnectionStatus, getXeroAccounts, getXeroSyncLogs, getXeroSyncReadiness } from '@/app/actions/xero-sync'
+import { getPaymentMethodCombos } from '@/app/actions/accounting'
+import { getPaymentAccountMap } from '@/lib/accounting'
 import { getTaxRates } from '@/app/actions/settings'
 import { SyncDashboard } from './sync-dashboard'
 
 export const metadata: Metadata = { title: 'Integrations' }
 
 export default async function SyncPage() {
-  const [settings, taxMappings, statusMappings, logs, wcCreds, taxRatesRaw, xeroSettings, xeroStatus, xeroAccounts, xeroLogs, paymentMethodCombos, xeroReadiness] = await Promise.all([
+  const [settings, taxMappings, statusMappings, logs, wcCreds, taxRatesRaw, xeroSettings, xeroStatus, xeroAccounts, xeroLogs, paymentMethodCombos, paymentAccountMap, xeroReadiness] = await Promise.all([
     getWcSyncSettings(),
     getWcTaxRateMappings(),
     getWcStatusMappings(),
@@ -19,6 +21,7 @@ export default async function SyncPage() {
     getXeroAccounts(),
     getXeroSyncLogs(50),
     getPaymentMethodCombos(),
+    getPaymentAccountMap(),
     getXeroSyncReadiness(),
   ])
 
@@ -45,6 +48,7 @@ export default async function SyncPage() {
         xeroAccounts={xeroAccounts}
         xeroLogs={xeroLogs}
         paymentMethodCombos={paymentMethodCombos}
+        paymentAccountMap={paymentAccountMap}
         xeroReadiness={xeroReadiness}
       />
     </div>

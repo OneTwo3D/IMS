@@ -13,6 +13,7 @@ import {
   syncXeroAccounts, triggerXeroSync,
   type XeroSettings, type XeroSyncLogRow, type XeroSyncReadiness,
 } from '@/app/actions/xero-sync'
+import { savePaymentAccountMap } from '@/app/actions/accounting'
 
 type XeroAccount = { id: string; code: string | null; name: string; type: string }
 
@@ -25,6 +26,13 @@ type Props = {
   accounts: XeroAccount[]
   logs: XeroSyncLogRow[]
   paymentMethodCombos: Array<{ paymentMethod: string; currency: string }>
+  /**
+   * Payment method + currency → account code map, stored as a connector-agnostic
+   * setting. The Xero UI lists the bank accounts (because it knows Xero's chart),
+   * but the map itself is persisted via the generic accounting facade so a future
+   * QuickBooks connector can reuse it unchanged.
+   */
+  paymentAccountMap: string
   readiness: XeroSyncReadiness
 }
 
@@ -72,7 +80,7 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
   return JSON.stringify(map)
 }
 
-export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos, readiness }: Props) {
+export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos, paymentAccountMap, readiness }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
@@ -86,7 +94,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [accountsMsg, setAccountsMsg] = useState<string | null>(null)
   const [connecting, setConnecting] = useState(false)
   const [syncingAccounts, setSyncingAccounts] = useState(false)
-  const [paymentMapRows, setPaymentMapRows] = useState<PaymentMapRow[]>(() => parsePaymentMap(init.xero_payment_account_map))
+  const [paymentMapRows, setPaymentMapRows] = useState<PaymentMapRow[]>(() => parsePaymentMap(paymentAccountMap))
   const searchParams = useSearchParams()
 
   // Handle OAuth redirect query params
@@ -112,30 +120,41 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   function handleSave() {
     setMsg(null)
     startTransition(async () => {
-      const result = await saveXeroSettings({
-        xero_sync_enabled: s.xero_sync_enabled,
-        xero_sync_sales_invoice: s.xero_sync_sales_invoice,
-        xero_sync_credit_note: s.xero_sync_credit_note,
-        xero_sync_purchase_invoice: s.xero_sync_purchase_invoice,
-        xero_sync_cogs_journal: s.xero_sync_cogs_journal,
-        xero_sync_cogs_reversal: s.xero_sync_cogs_reversal,
-        xero_sync_stock_receipt: s.xero_sync_stock_receipt,
-        xero_sync_inventory_adjustment: s.xero_sync_inventory_adjustment,
-        xero_sync_stock_allocation: s.xero_sync_stock_allocation,
-        xero_sync_attach_pdf: s.xero_sync_attach_pdf,
-        xero_sales_account: s.xero_sales_account,
-        xero_shipping_account: s.xero_shipping_account,
-        xero_discount_account: s.xero_discount_account,
-        xero_cogs_account: s.xero_cogs_account,
-        xero_inventory_account: s.xero_inventory_account,
-        xero_allocated_inventory_account: s.xero_allocated_inventory_account,
-        xero_transit_account: s.xero_transit_account,
-        xero_unearned_revenue_account: s.xero_unearned_revenue_account,
-        xero_daily_batch_enabled: s.xero_daily_batch_enabled,
-        xero_payment_polling_enabled: s.xero_payment_polling_enabled,
-        xero_payment_account_map: serializePaymentMap(paymentMapRows),
-      })
-      setMsg(result.success ? 'Settings saved.' : `Error: ${result.error}`)
+      // Persist Xero-specific settings and the connector-agnostic payment map
+      // in parallel. The map lives under a generic setting key so it can be
+      // reused by future accounting connectors without a schema change.
+      const [xeroResult, mapResult] = await Promise.all([
+        saveXeroSettings({
+          xero_sync_enabled: s.xero_sync_enabled,
+          xero_sync_sales_invoice: s.xero_sync_sales_invoice,
+          xero_sync_credit_note: s.xero_sync_credit_note,
+          xero_sync_purchase_invoice: s.xero_sync_purchase_invoice,
+          xero_sync_cogs_journal: s.xero_sync_cogs_journal,
+          xero_sync_cogs_reversal: s.xero_sync_cogs_reversal,
+          xero_sync_stock_receipt: s.xero_sync_stock_receipt,
+          xero_sync_inventory_adjustment: s.xero_sync_inventory_adjustment,
+          xero_sync_stock_allocation: s.xero_sync_stock_allocation,
+          xero_sync_attach_pdf: s.xero_sync_attach_pdf,
+          xero_sales_account: s.xero_sales_account,
+          xero_shipping_account: s.xero_shipping_account,
+          xero_discount_account: s.xero_discount_account,
+          xero_cogs_account: s.xero_cogs_account,
+          xero_inventory_account: s.xero_inventory_account,
+          xero_allocated_inventory_account: s.xero_allocated_inventory_account,
+          xero_transit_account: s.xero_transit_account,
+          xero_unearned_revenue_account: s.xero_unearned_revenue_account,
+          xero_daily_batch_enabled: s.xero_daily_batch_enabled,
+          xero_payment_polling_enabled: s.xero_payment_polling_enabled,
+        }),
+        savePaymentAccountMap(serializePaymentMap(paymentMapRows)),
+      ])
+      if (!xeroResult.success) {
+        setMsg(`Error: ${xeroResult.error}`)
+      } else if (!mapResult.success) {
+        setMsg(`Error saving payment map: ${mapResult.error}`)
+      } else {
+        setMsg('Settings saved.')
+      }
       router.refresh()
     })
   }

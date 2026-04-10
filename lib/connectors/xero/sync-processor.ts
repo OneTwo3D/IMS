@@ -12,7 +12,7 @@ import { pushPurchaseBill } from './bills'
 import { pushCreditNote } from './credit-notes'
 import { pushManualJournal } from './journals'
 import { xeroUploadAttachment, xeroPost } from './api'
-import { lookupPaymentAccount } from '@/lib/connectors/xero/settings'
+import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 
 const MAX_RETRIES = 5
@@ -138,14 +138,16 @@ async function processEntry(
         reference: payload.reference as string | undefined,
       }, resolveInvoiceStatus(postingMode))
 
-      // Register payment in Xero if requested (pre-paid WC orders)
+      // Register payment in Xero if requested (pre-paid WC orders).
+      // Payment account map is a connector-agnostic setting — the active
+      // accounting connector (Xero here) interprets the account code in its
+      // own chart of accounts.
       if (invoiceResult.success && invoiceResult.invoiceId && payload._registerPayment) {
         try {
-          const paymentMapSetting = await db.setting.findUnique({ where: { key: 'xero_payment_account_map' } })
-          const paymentMap = paymentMapSetting?.value ?? '{}'
+          const paymentMap = await getPaymentAccountMap()
           const method = payload._paymentMethod as string || ''
           const currency = payload.currency as string || 'GBP'
-          const accountCode = await lookupPaymentAccount(paymentMap, method, currency)
+          const accountCode = lookupPaymentAccount(paymentMap, method, currency)
 
           if (accountCode) {
             // Get the invoice total from Xero to register the payment

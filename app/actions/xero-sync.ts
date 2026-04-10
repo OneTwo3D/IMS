@@ -291,19 +291,3 @@ export async function getXeroSyncReadiness(): Promise<XeroSyncReadiness> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Payment account map helpers
-// ---------------------------------------------------------------------------
-
-/** Get distinct payment method + currency combos from existing orders (for UI pre-population) */
-export async function getPaymentMethodCombos(): Promise<Array<{ paymentMethod: string; currency: string }>> {
-  const rows = await db.salesOrder.findMany({
-    where: { paymentMethod: { not: null } },
-    select: { paymentMethod: true, currency: true },
-    distinct: ['paymentMethod', 'currency'],
-    orderBy: [{ paymentMethod: 'asc' }, { currency: 'asc' }],
-  })
-  return rows
-    .filter((r): r is { paymentMethod: string; currency: string } => !!r.paymentMethod)
-    .map((r) => ({ paymentMethod: r.paymentMethod, currency: r.currency }))
-}

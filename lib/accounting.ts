@@ -36,11 +36,12 @@ export async function getAccountingSettings(): Promise<AccountingSettings> {
   const { getXeroSettings } = await import('@/lib/connectors/xero/settings')
   const xs = await getXeroSettings()
 
-  // Read URL templates from settings, with Xero defaults
+  // Read connector-agnostic settings directly from the core settings table.
   const { db } = await import('@/lib/db')
-  const [invoiceUrlSetting, billUrlSetting] = await Promise.all([
+  const [invoiceUrlSetting, billUrlSetting, paymentMapSetting] = await Promise.all([
     db.setting.findUnique({ where: { key: 'accounting_invoice_url_template' } }),
     db.setting.findUnique({ where: { key: 'accounting_bill_url_template' } }),
+    db.setting.findUnique({ where: { key: 'accounting_payment_account_map' } }),
   ])
 
   return {
@@ -53,10 +54,20 @@ export async function getAccountingSettings(): Promise<AccountingSettings> {
     allocatedInventoryAccount: xs.xero_allocated_inventory_account,
     unearnedRevenueAccount: xs.xero_unearned_revenue_account,
     transitAccount: xs.xero_transit_account,
-    paymentAccountMap: xs.xero_payment_account_map,
+    paymentAccountMap: paymentMapSetting?.value ?? '{}',
     invoiceUrlTemplate: invoiceUrlSetting?.value ?? 'https://go.xero.com/AccountsReceivable/View.aspx?InvoiceID={id}',
     billUrlTemplate: billUrlSetting?.value ?? 'https://go.xero.com/AccountsPayable/View.aspx?InvoiceID={id}',
   }
+}
+
+/**
+ * Fetch just the payment account map JSON. Used by connector sync processors
+ * so they don't have to re-fetch all accounting settings.
+ */
+export async function getPaymentAccountMap(): Promise<string> {
+  const { db } = await import('@/lib/db')
+  const row = await db.setting.findUnique({ where: { key: 'accounting_payment_account_map' } })
+  return row?.value ?? '{}'
 }
 
 export function lookupPaymentAccount(
