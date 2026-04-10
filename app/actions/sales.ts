@@ -129,11 +129,11 @@ export type CreateSoInput = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeReference(): string {
+function makeReference(prefix: string): string {
   const now = new Date()
   const ymd = now.toISOString().slice(0, 10).replace(/-/g, '')
   const rand = Math.random().toString(36).slice(2, 6).toUpperCase()
-  return `SO-${ymd}-${rand}`
+  return `${prefix}${ymd}-${rand}`
 }
 
 const SO_SELECT = {
@@ -453,11 +453,11 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     const grandTotalForeign = subtotalForeign + totalTaxForeign + totalShippingForeign
     const grandTotalGbp = subtotalGbp + totalTaxGbp + totalShippingGbp
 
-    // Generate order number with prefix
-    const prefixSetting = await db.setting.findUnique({ where: { key: 'order_number_prefix' } })
-    const prefix = prefixSetting?.value ?? ''
-    const ref = makeReference()
-    const orderNumber = `${prefix}${ref}`
+    // Generate order number using configured prefix (Settings → Company → Numbering)
+    const { getNumberingFormats } = await import('./company')
+    const numbering = await getNumberingFormats()
+    const ref = makeReference(numbering.so_prefix)
+    const orderNumber = ref
 
     const so = await db.salesOrder.create({
       data: {
@@ -506,9 +506,8 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       const taxRateForAccounting = input.taxRateName
         ? await db.taxRate.findFirst({ where: { name: input.taxRateName, active: true }, select: { accountingTaxType: true } })
         : null
-      // Read configurable manual invoice prefix
-      const manualPrefixSetting = await db.setting.findUnique({ where: { key: 'manual_invoice_prefix' } })
-      const manualPrefix = manualPrefixSetting?.value ?? 'INMA-'
+      // Manual invoice prefix comes from unified numbering settings
+      const manualPrefix = numbering.inv_prefix
       await queueAccountingSync({
         type: 'SALES_INVOICE',
         referenceType: 'SalesOrder',
@@ -770,9 +769,11 @@ export async function createRefund(
     }
     const totalForeign = Math.round(totalGbp * fxRate * 10000) / 10000
 
-    // Generate credit note number
+    // Generate credit note number using configured prefix
+    const { getNumberingFormats } = await import('./company')
+    const numbering = await getNumberingFormats()
     const cnCount = await db.salesOrderRefund.count({ where: { creditNoteNumber: { not: null } } })
-    const creditNoteNumber = `CN-${new Date().getFullYear()}-${String(cnCount + 1).padStart(5, '0')}`
+    const creditNoteNumber = `${numbering.cn_prefix}${new Date().getFullYear()}-${String(cnCount + 1).padStart(5, '0')}`
 
     await db.salesOrderRefund.create({
       data: {

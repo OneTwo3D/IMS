@@ -392,45 +392,78 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
       {tab === 'numbering' && (
         <Card className="p-6">
           <p className="text-sm text-muted-foreground mb-4">
-            Configure prefixes and padding for document numbers. Padding determines the minimum number of digits
-            (e.g. padding 5 → 00001). The year is automatically included.
+            Prefixes used for all document numbers across the system. These are the single source of truth — the
+            accounting and WooCommerce connectors also read from here.
           </p>
-          <div className="space-y-4">
-            {([
-              ['Sales Order', 'so_prefix', 'so_padding', 'SO-2026-00001'],
-              ['Purchase Order', 'po_prefix', 'po_padding', 'PO-20260405-A7X2'],
-              ['Invoice', 'inv_prefix', 'inv_padding', 'INV-2026-00001'],
-              ['Credit Note', 'cn_prefix', 'cn_padding', 'CN-2026-00001'],
-            ] as const).map(([label, prefixKey, padKey, example]) => (
-              <div key={prefixKey} className="flex items-center gap-4">
-                <div className="w-32 text-sm font-medium">{label}</div>
-                <div className="space-y-1">
-                  <Label className="text-xs">Prefix</Label>
-                  <Input
-                    value={num[prefixKey]}
-                    onChange={(e) => setNum((p) => ({ ...p, [prefixKey]: e.target.value }))}
-                    className="h-8 w-28 text-xs font-mono"
-                  />
+          <div className="space-y-3">
+            {(() => {
+              const ymd = new Date().toISOString().slice(0, 10).replace(/-/g, '')
+              const year = new Date().getFullYear()
+              const rows: {
+                label: string
+                key: keyof NumberingFormats
+                description: string
+                example: (prefix: string) => string
+              }[] = [
+                {
+                  label: 'Sales Order',
+                  key: 'so_prefix',
+                  description: 'Manual IMS sales orders',
+                  example: (p) => `${p}${ymd}-A7X2`,
+                },
+                {
+                  label: 'Purchase Order',
+                  key: 'po_prefix',
+                  description: 'Purchase orders to suppliers',
+                  example: (p) => `${p}${ymd}-K3B9`,
+                },
+                {
+                  label: 'Invoice',
+                  key: 'inv_prefix',
+                  description: 'Accounting invoice number for manual sales orders',
+                  example: (p) => `${p}${ymd}-A7X2`,
+                },
+                {
+                  label: 'WC Order',
+                  key: 'wc_order_prefix',
+                  description: 'Prepended to WooCommerce order numbers (leave empty for none)',
+                  example: (p) => `${p}12345`,
+                },
+                {
+                  label: 'WC Invoice',
+                  key: 'wc_inv_prefix',
+                  description: 'Accounting invoice number for WooCommerce orders',
+                  example: (p) => `${p}12345`,
+                },
+                {
+                  label: 'Credit Note',
+                  key: 'cn_prefix',
+                  description: 'Refund / credit note numbers',
+                  example: (p) => `${p}${year}-00001`,
+                },
+              ]
+              return rows.map((r) => (
+                <div key={r.key} className="flex items-center gap-4 py-1.5 border-b border-border/50 last:border-b-0">
+                  <div className="w-32 shrink-0">
+                    <div className="text-sm font-medium">{r.label}</div>
+                    <div className="text-[11px] text-muted-foreground">{r.description}</div>
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs">Prefix</Label>
+                    <Input
+                      value={num[r.key]}
+                      onChange={(e) => setNum((p) => ({ ...p, [r.key]: e.target.value }))}
+                      className="h-8 w-32 text-xs font-mono"
+                      placeholder="—"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs text-muted-foreground">Example</Label>
+                    <p className="text-xs font-mono text-muted-foreground pt-1">{r.example(num[r.key])}</p>
+                  </div>
                 </div>
-                <div className="space-y-1">
-                  <Label className="text-xs">Padding</Label>
-                  <Input
-                    type="number"
-                    min={1}
-                    max={10}
-                    value={num[padKey]}
-                    onChange={(e) => setNum((p) => ({ ...p, [padKey]: e.target.value }))}
-                    className="h-8 w-20 text-xs"
-                  />
-                </div>
-                <div className="space-y-1">
-                  <Label className="text-xs text-muted-foreground">Example</Label>
-                  <p className="text-xs font-mono text-muted-foreground pt-1">
-                    {num[prefixKey]}{new Date().getFullYear()}-{'0'.repeat(Math.max(0, parseInt(num[padKey]) - 1))}1
-                  </p>
-                </div>
-              </div>
-            ))}
+              ))
+            })()}
           </div>
           <div className="mt-4">
             <SaveButton onClick={handleSaveNumbering} pending={isPending} saved={saved === 'numbering'} />

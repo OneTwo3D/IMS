@@ -136,9 +136,6 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
         xero_daily_batch_enabled: s.xero_daily_batch_enabled,
         xero_payment_polling_enabled: s.xero_payment_polling_enabled,
         xero_payment_account_map: serializePaymentMap(paymentMapRows),
-        order_number_prefix: s.order_number_prefix,
-        wc_invoice_prefix: s.wc_invoice_prefix,
-        manual_invoice_prefix: s.manual_invoice_prefix,
       })
       setMsg(result.success ? 'Settings saved.' : `Error: ${result.error}`)
       router.refresh()
@@ -490,44 +487,12 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
         </div>
       </Card>
 
-      {/* Order Settings */}
-      <Card className="p-6 space-y-4">
-        <div>
-          <h3 className="text-base font-semibold">Order Settings</h3>
-          <p className="text-xs text-muted-foreground mt-0.5">Configure how order numbers are generated and displayed.</p>
-        </div>
-        <div className="grid grid-cols-3 gap-4">
-          <div className="space-y-1.5">
-            <Label htmlFor="order_number_prefix">Order Number Prefix</Label>
-            <Input
-              id="order_number_prefix"
-              value={s.order_number_prefix}
-              onChange={e => handleField('order_number_prefix', e.target.value)}
-              placeholder="e.g. OT-"
-            />
-            <p className="text-[11px] text-muted-foreground">Prefix added to WooCommerce order numbers in the IMS. Leave empty for no prefix.</p>
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="wc_invoice_prefix">WC Invoice Prefix</Label>
-            <Input
-              id="wc_invoice_prefix"
-              value={s.wc_invoice_prefix}
-              onChange={e => handleField('wc_invoice_prefix', e.target.value)}
-              placeholder="e.g. INWC-"
-            />
-            <p className="text-[11px] text-muted-foreground">Prefix for invoice numbers on WooCommerce orders (e.g. INWC-12345).</p>
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="manual_invoice_prefix">Manual Invoice Prefix</Label>
-            <Input
-              id="manual_invoice_prefix"
-              value={s.manual_invoice_prefix}
-              onChange={e => handleField('manual_invoice_prefix', e.target.value)}
-              placeholder="e.g. INMA-"
-            />
-            <p className="text-[11px] text-muted-foreground">Prefix for invoice numbers on manually created orders (e.g. INMA-SO-001).</p>
-          </div>
-        </div>
+      {/* Numbering settings pointer */}
+      <Card className="p-4">
+        <p className="text-xs text-muted-foreground">
+          Invoice and order numbering prefixes (including WC order and WC invoice prefixes) are configured in{' '}
+          <a href="/settings/company" className="underline hover:text-foreground">Settings → Company → Numbering</a>.
+        </p>
       </Card>
 
       {/* Sync Settings */}

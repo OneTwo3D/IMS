@@ -30,9 +30,6 @@ export type XeroSettings = {
   xero_daily_batch_enabled: string
   xero_payment_polling_enabled: string
   xero_payment_account_map: string
-  order_number_prefix: string
-  wc_invoice_prefix: string
-  manual_invoice_prefix: string
 }
 
 export const XERO_SETTING_KEYS = [
@@ -47,9 +44,6 @@ export const XERO_SETTING_KEYS = [
   'xero_transit_account', 'xero_purchase_account',
   'xero_daily_batch_enabled', 'xero_payment_polling_enabled',
   'xero_payment_account_map',
-  'order_number_prefix',
-  'wc_invoice_prefix',
-  'manual_invoice_prefix',
 ]
 
 const XERO_DEFAULTS: XeroSettings = {
@@ -77,9 +71,6 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_daily_batch_enabled: 'false',
   xero_payment_polling_enabled: 'false',
   xero_payment_account_map: '{}',
-  order_number_prefix: '',
-  wc_invoice_prefix: 'INWC-',
-  manual_invoice_prefix: 'INMA-',
 }
 
 export async function getXeroSettings(): Promise<XeroSettings> {

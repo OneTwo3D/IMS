@@ -75,38 +75,65 @@ export async function updateLogoUrl(logoUrl: string | null): Promise<{ success: 
 // ---------------------------------------------------------------------------
 // Numbering Formats
 // ---------------------------------------------------------------------------
+//
+// These are the single source of truth for all document number prefixes used
+// across the system. Consumers (sales orders, purchase orders, invoices,
+// credit notes, WooCommerce sync) read these keys directly from the Setting
+// table so the same values apply everywhere.
+//
+// DB keys are stored flat (no 'numbering_' prefix) to make consumption simple.
 
 export type NumberingFormats = {
-  so_prefix: string
-  so_padding: string
-  po_prefix: string
-  po_padding: string
-  inv_prefix: string
-  inv_padding: string
-  cn_prefix: string
-  cn_padding: string
+  so_prefix: string       // Manual IMS sales order references
+  po_prefix: string       // Purchase order references
+  inv_prefix: string      // Manual invoice numbers (accounting connector)
+  wc_order_prefix: string // Prepended to WooCommerce order numbers in IMS
+  wc_inv_prefix: string   // WooCommerce invoice numbers (accounting connector)
+  cn_prefix: string       // Credit note numbers
 }
 
 const NUMBERING_DEFAULTS: NumberingFormats = {
   so_prefix: 'SO-',
-  so_padding: '5',
   po_prefix: 'PO-',
-  po_padding: '5',
   inv_prefix: 'INV-',
-  inv_padding: '5',
+  wc_order_prefix: '',
+  wc_inv_prefix: 'INWC-',
   cn_prefix: 'CN-',
-  cn_padding: '5',
+}
+
+/**
+ * Legacy key migration map. If a new flat key is absent but an old key is
+ * present, we transparently read the old value so upgrading deployments keep
+ * their existing prefixes until the user next saves the Numbering tab.
+ */
+const LEGACY_KEY_MAP: Record<keyof NumberingFormats, string[]> = {
+  so_prefix: ['numbering_so_prefix'],
+  po_prefix: ['numbering_po_prefix'],
+  inv_prefix: ['numbering_inv_prefix', 'manual_invoice_prefix'],
+  wc_order_prefix: ['order_number_prefix'],
+  wc_inv_prefix: ['wc_invoice_prefix'],
+  cn_prefix: ['numbering_cn_prefix'],
 }
 
 export async function getNumberingFormats(): Promise<NumberingFormats> {
   await requireAuth()
-  const keys = Object.keys(NUMBERING_DEFAULTS).map((k) => `numbering_${k}`)
+  const keys: string[] = [
+    ...(Object.keys(NUMBERING_DEFAULTS) as (keyof NumberingFormats)[]),
+    ...Object.values(LEGACY_KEY_MAP).flat(),
+  ]
   const rows = await db.setting.findMany({ where: { key: { in: keys } } })
   const map = new Map(rows.map((r) => [r.key, r.value]))
   const result = { ...NUMBERING_DEFAULTS }
   for (const k of Object.keys(result) as (keyof NumberingFormats)[]) {
-    const v = map.get(`numbering_${k}`)
-    if (v) result[k] = v
+    const direct = map.get(k)
+    if (direct !== undefined) {
+      result[k] = direct
+      continue
+    }
+    for (const legacy of LEGACY_KEY_MAP[k]) {
+      const v = map.get(legacy)
+      if (v !== undefined) { result[k] = v; break }
+    }
   }
   return result
 }
@@ -115,14 +142,15 @@ export async function saveNumberingFormats(data: NumberingFormats): Promise<{ su
   await requireAuth()
   const ops = Object.entries(data).map(([k, v]) =>
     db.setting.upsert({
-      where: { key: `numbering_${k}` },
-      create: { key: `numbering_${k}`, value: v },
+      where: { key: k },
+      create: { key: k, value: v },
       update: { value: v },
     }),
   )
   await db.$transaction(ops)
   logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated document numbering formats' })
   revalidatePath('/settings/company')
+  revalidatePath('/sync')
   return { success: true }
 }
 

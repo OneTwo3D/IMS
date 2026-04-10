@@ -165,11 +165,13 @@ export type ReceiptLineInput = {
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeReference(): string {
+async function makeReference(): Promise<string> {
   const now = new Date()
   const ymd = now.toISOString().slice(0, 10).replace(/-/g, '')
   const rand = Math.random().toString(36).slice(2, 6).toUpperCase()
-  return `PO-${ymd}-${rand}`
+  const { getNumberingFormats } = await import('./company')
+  const { po_prefix } = await getNumberingFormats()
+  return `${po_prefix}${ymd}-${rand}`
 }
 
 function safeFxRate(rate: number): number {
@@ -674,9 +676,10 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
     const grandTotalForeign = subtotalForeign + totalTaxForeign + directFreightForeign
     const grandTotalGbp = subtotalGbp + totalTaxGbp + directFreightGbp
 
+    const poReference = await makeReference()
     const po = await db.purchaseOrder.create({
       data: {
-        reference: makeReference(),
+        reference: poReference,
         type: 'GOODS',
         supplierId: input.supplierId,
         currency: input.currency,
@@ -1538,9 +1541,10 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
     const totalForeign = subtotalForeign + taxForeign
     const totalGbp = subtotalGbp + taxGbp
 
+    const freightReference = await makeReference()
     const po = await db.purchaseOrder.create({
       data: {
-        reference: makeReference(),
+        reference: freightReference,
         type: 'FREIGHT',
         supplierId: input.supplierId,
         currency: input.currency,

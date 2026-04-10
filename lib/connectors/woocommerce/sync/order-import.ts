@@ -101,10 +101,14 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
       }
     })
 
-    // Read order number prefix setting
-    const prefixSetting = await db.setting.findUnique({ where: { key: 'order_number_prefix' } })
-    const prefix = prefixSetting?.value ?? ''
-    const orderNumber = `${prefix}${wcOrder.number}`
+    // Read unified numbering settings (Settings → Company → Numbering)
+    const numberingRows = await db.setting.findMany({
+      where: { key: { in: ['wc_order_prefix', 'wc_inv_prefix', 'order_number_prefix', 'wc_invoice_prefix'] } },
+    })
+    const numberingMap = new Map(numberingRows.map((r) => [r.key, r.value]))
+    const wcOrderPrefix = numberingMap.get('wc_order_prefix') ?? numberingMap.get('order_number_prefix') ?? ''
+    const wcInvPrefix = numberingMap.get('wc_inv_prefix') ?? numberingMap.get('wc_invoice_prefix') ?? 'INWC-'
+    const orderNumber = `${wcOrderPrefix}${wcOrder.number}`
 
     // Create the sales order
     const so = await db.salesOrder.create({
@@ -153,9 +157,6 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
       const settings = await getAccountingSettings()
       const fxRateNum = Number(fxRate) || 1
       const discountGbp = Math.round((orderDiscount.discountAmount / fxRateNum) * 100) / 100
-      // Read configurable WC invoice prefix
-      const wcInvPrefixSetting = await db.setting.findUnique({ where: { key: 'wc_invoice_prefix' } })
-      const wcInvPrefix = wcInvPrefixSetting?.value ?? 'INWC-'
       await queueAccountingSync({
         type: 'SALES_INVOICE',
         referenceType: 'SalesOrder',
