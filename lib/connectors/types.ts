@@ -122,6 +122,12 @@ export type SyncResult = {
 
 export type InvoiceLine = {
   itemCode?: string
+  /**
+   * Product name, used when the item needs to be created in the accounting
+   * system (e.g. first time the SKU is sold through Xero). Falls back to
+   * `description` if omitted.
+   */
+  itemName?: string
   description: string
   quantity: number
   unitAmount: number

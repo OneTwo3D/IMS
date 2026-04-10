@@ -4,6 +4,7 @@
 
 import { xeroPost } from './api'
 import { findOrCreateContact } from './contacts'
+import { findOrCreateItem } from './items'
 import type { InvoiceData, InvoiceLine } from '../types'
 
 type XeroInvoiceResponse = {
@@ -16,6 +17,12 @@ type XeroInvoiceResponse = {
 
 /**
  * Create a sales invoice (ACCREC) in Xero.
+ *
+ * Before posting, any line with an `itemCode` is pre-checked against Xero's
+ * Items endpoint — missing items are auto-created so that invoices for new
+ * products don't fail with "item not found". If item creation fails (e.g.
+ * Xero name collision on a different code) the line still posts, just
+ * without ItemCode, so the invoice itself is not blocked.
  */
 export async function pushSalesInvoice(
   data: InvoiceData,
@@ -27,6 +34,22 @@ export async function pushSalesInvoice(
     return { success: false, error: `Contact error: ${contactResult.error}` }
   }
 
+  // Pre-create any items that don't exist in Xero yet. Deduplicate by code to
+  // avoid redundant API calls when the same SKU appears on multiple lines.
+  const itemCodes = new Set<string>()
+  const droppedItemCodes = new Set<string>()
+  for (const line of data.lines) {
+    if (!line.itemCode || itemCodes.has(line.itemCode)) continue
+    itemCodes.add(line.itemCode)
+    const itemName = line.itemName ?? line.description ?? line.itemCode
+    const result = await findOrCreateItem(line.itemCode, itemName, line.accountCode)
+    if (!result.success) {
+      // Non-fatal: drop the ItemCode from this line and fall back to a plain
+      // description-only line so the invoice still goes through.
+      droppedItemCodes.add(line.itemCode)
+    }
+  }
+
   // Build line items
   const lineItems = data.lines.map((line: InvoiceLine) => {
     const xeroLine: Record<string, unknown> = {
@@ -35,7 +58,7 @@ export async function pushSalesInvoice(
       UnitAmount: line.unitAmount,
       AccountCode: line.accountCode,
     }
-    if (line.itemCode) xeroLine.ItemCode = line.itemCode
+    if (line.itemCode && !droppedItemCodes.has(line.itemCode)) xeroLine.ItemCode = line.itemCode
     if (line.taxType) xeroLine.TaxType = line.taxType
     if (line.discountRate && line.discountRate > 0) xeroLine.DiscountRate = line.discountRate
     return xeroLine
