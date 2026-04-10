@@ -101,13 +101,11 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
       }
     })
 
-    // Read unified numbering settings (Settings → Company → Numbering)
-    const numberingRows = await db.setting.findMany({
-      where: { key: { in: ['wc_order_prefix', 'wc_inv_prefix', 'order_number_prefix', 'wc_invoice_prefix'] } },
-    })
-    const numberingMap = new Map(numberingRows.map((r) => [r.key, r.value]))
-    const wcOrderPrefix = numberingMap.get('wc_order_prefix') ?? numberingMap.get('order_number_prefix') ?? ''
-    const wcInvPrefix = numberingMap.get('wc_inv_prefix') ?? numberingMap.get('wc_invoice_prefix') ?? 'INWC-'
+    // Read unified numbering settings via the shopping connector registry
+    // (Settings → Company → Numbering → Shopping Connectors → WooCommerce)
+    const { getShoppingConnectorPrefixes } = await import('@/lib/connectors/shopping-registry')
+    const { orderPrefix: wcOrderPrefix, invPrefix: wcInvPrefix } =
+      await getShoppingConnectorPrefixes('woocommerce')
     const orderNumber = `${wcOrderPrefix}${wcOrder.number}`
 
     // Create the sales order

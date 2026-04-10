@@ -5,18 +5,20 @@ import {
   getEmailSettings,
   getBrandingColours,
   getDocumentTemplates,
+  getShoppingConnectors,
 } from '@/app/actions/company'
 import { CompanySettingsClient } from './company-client'
 
 export const metadata: Metadata = { title: 'Company Settings' }
 
 export default async function CompanySettingsPage() {
-  const [org, numbering, email, branding, templates] = await Promise.all([
+  const [org, numbering, email, branding, templates, shoppingConnectors] = await Promise.all([
     getOrganisation(),
     getNumberingFormats(),
     getEmailSettings(),
     getBrandingColours(),
     getDocumentTemplates(),
+    getShoppingConnectors(),
   ])
 
   return (
@@ -26,6 +28,7 @@ export default async function CompanySettingsPage() {
       email={email}
       branding={branding}
       templates={templates}
+      shoppingConnectors={shoppingConnectors}
     />
   )
 }

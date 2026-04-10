@@ -76,82 +76,118 @@ export async function updateLogoUrl(logoUrl: string | null): Promise<{ success: 
 // Numbering Formats
 // ---------------------------------------------------------------------------
 //
-// These are the single source of truth for all document number prefixes used
-// across the system. Consumers (sales orders, purchase orders, invoices,
-// credit notes, WooCommerce sync) read these keys directly from the Setting
-// table so the same values apply everywhere.
+// Single source of truth for all document number prefixes used across the
+// system. Consumers (sales orders, purchase orders, invoices, credit notes,
+// and each shopping connector's order import) read these keys directly from
+// the Setting table, so the same values apply everywhere.
 //
-// DB keys are stored flat (no 'numbering_' prefix) to make consumption simple.
+// The structure splits into:
+//   - Core prefixes: SO, PO, Invoice, Credit Note (always present)
+//   - Connector prefixes: one { orderPrefix, invPrefix } pair per supported
+//     shopping connector. Declared in lib/connectors/shopping-registry.ts.
+
+import { SHOPPING_CONNECTORS, type ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
+
+type CoreNumberingKey = 'so_prefix' | 'po_prefix' | 'inv_prefix' | 'cn_prefix'
 
 export type NumberingFormats = {
-  so_prefix: string       // Manual IMS sales order references
-  po_prefix: string       // Purchase order references
-  inv_prefix: string      // Manual invoice numbers (accounting connector)
-  wc_order_prefix: string // Prepended to WooCommerce order numbers in IMS
-  wc_inv_prefix: string   // WooCommerce invoice numbers (accounting connector)
-  cn_prefix: string       // Credit note numbers
+  so_prefix: string   // Manual IMS sales order references
+  po_prefix: string   // Purchase order references
+  inv_prefix: string  // Manual invoice numbers (accounting connector)
+  cn_prefix: string   // Credit note numbers
+  connectors: Record<string, { orderPrefix: string; invPrefix: string }>
 }
 
-const NUMBERING_DEFAULTS: NumberingFormats = {
+const CORE_DEFAULTS: Record<CoreNumberingKey, string> = {
   so_prefix: 'SO-',
   po_prefix: 'PO-',
   inv_prefix: 'INV-',
-  wc_order_prefix: '',
-  wc_inv_prefix: 'INWC-',
   cn_prefix: 'CN-',
 }
 
-/**
- * Legacy key migration map. If a new flat key is absent but an old key is
- * present, we transparently read the old value so upgrading deployments keep
- * their existing prefixes until the user next saves the Numbering tab.
- */
-const LEGACY_KEY_MAP: Record<keyof NumberingFormats, string[]> = {
+/** Legacy Setting keys we transparently read as fallbacks during migration. */
+const CORE_LEGACY_KEYS: Record<CoreNumberingKey, string[]> = {
   so_prefix: ['numbering_so_prefix'],
   po_prefix: ['numbering_po_prefix'],
   inv_prefix: ['numbering_inv_prefix', 'manual_invoice_prefix'],
-  wc_order_prefix: ['order_number_prefix'],
-  wc_inv_prefix: ['wc_invoice_prefix'],
   cn_prefix: ['numbering_cn_prefix'],
 }
 
 export async function getNumberingFormats(): Promise<NumberingFormats> {
   await requireAuth()
+
+  const connectorKeys = SHOPPING_CONNECTORS.flatMap((c) => [
+    c.orderKey, c.invKey,
+    ...(c.legacyOrderKeys ?? []), ...(c.legacyInvKeys ?? []),
+  ])
   const keys: string[] = [
-    ...(Object.keys(NUMBERING_DEFAULTS) as (keyof NumberingFormats)[]),
-    ...Object.values(LEGACY_KEY_MAP).flat(),
+    ...(Object.keys(CORE_DEFAULTS) as CoreNumberingKey[]),
+    ...Object.values(CORE_LEGACY_KEYS).flat(),
+    ...connectorKeys,
   ]
   const rows = await db.setting.findMany({ where: { key: { in: keys } } })
   const map = new Map(rows.map((r) => [r.key, r.value]))
-  const result = { ...NUMBERING_DEFAULTS }
-  for (const k of Object.keys(result) as (keyof NumberingFormats)[]) {
+
+  // Resolve core prefixes with legacy fallback
+  const core: Record<CoreNumberingKey, string> = { ...CORE_DEFAULTS }
+  for (const k of Object.keys(CORE_DEFAULTS) as CoreNumberingKey[]) {
     const direct = map.get(k)
-    if (direct !== undefined) {
-      result[k] = direct
-      continue
-    }
-    for (const legacy of LEGACY_KEY_MAP[k]) {
+    if (direct !== undefined) { core[k] = direct; continue }
+    for (const legacy of CORE_LEGACY_KEYS[k]) {
       const v = map.get(legacy)
-      if (v !== undefined) { result[k] = v; break }
+      if (v !== undefined) { core[k] = v; break }
     }
   }
-  return result
+
+  // Resolve connector prefixes with legacy fallback
+  const connectors: Record<string, { orderPrefix: string; invPrefix: string }> = {}
+  for (const c of SHOPPING_CONNECTORS) {
+    const orderPrefix =
+      map.get(c.orderKey)
+      ?? c.legacyOrderKeys?.map((k) => map.get(k)).find((v) => v !== undefined)
+      ?? c.defaultOrder
+    const invPrefix =
+      map.get(c.invKey)
+      ?? c.legacyInvKeys?.map((k) => map.get(k)).find((v) => v !== undefined)
+      ?? c.defaultInv
+    connectors[c.id] = { orderPrefix, invPrefix }
+  }
+
+  return { ...core, connectors }
 }
 
 export async function saveNumberingFormats(data: NumberingFormats): Promise<{ success: boolean }> {
   await requireAuth()
-  const ops = Object.entries(data).map(([k, v]) =>
-    db.setting.upsert({
-      where: { key: k },
-      create: { key: k, value: v },
-      update: { value: v },
-    }),
+
+  const writes: Array<{ key: string; value: string }> = [
+    { key: 'so_prefix', value: data.so_prefix },
+    { key: 'po_prefix', value: data.po_prefix },
+    { key: 'inv_prefix', value: data.inv_prefix },
+    { key: 'cn_prefix', value: data.cn_prefix },
+  ]
+
+  for (const c of SHOPPING_CONNECTORS) {
+    const cp = data.connectors[c.id]
+    if (!cp) continue
+    writes.push({ key: c.orderKey, value: cp.orderPrefix })
+    writes.push({ key: c.invKey, value: cp.invPrefix })
+  }
+
+  const ops = writes.map((w) =>
+    db.setting.upsert({ where: { key: w.key }, create: { key: w.key, value: w.value }, update: { value: w.value } }),
   )
   await db.$transaction(ops)
   logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated document numbering formats' })
   revalidatePath('/settings/company')
   revalidatePath('/sync')
   return { success: true }
+}
+
+// Re-export so client components can consume the registry via the server action module boundary
+export async function getShoppingConnectors(): Promise<
+  Array<{ id: ShoppingConnectorId; label: string; available: boolean }>
+> {
+  return SHOPPING_CONNECTORS.map((c) => ({ id: c.id, label: c.label, available: c.available }))
 }
 
 // ---------------------------------------------------------------------------

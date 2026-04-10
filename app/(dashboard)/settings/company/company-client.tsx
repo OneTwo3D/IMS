@@ -24,12 +24,15 @@ import {
   type DocumentTemplateData,
 } from '@/app/actions/company'
 
+type ShoppingConnectorSummary = { id: string; label: string; available: boolean }
+
 type Props = {
   org: OrganisationData
   numbering: NumberingFormats
   email: EmailSettings
   branding: BrandingColours
   templates: DocumentTemplateData[]
+  shoppingConnectors: ShoppingConnectorSummary[]
 }
 
 const TABS = [
@@ -52,7 +55,7 @@ const TEMPLATE_LABELS: Record<string, string> = {
   manufacturing_order: 'Manufacturing Order',
 }
 
-export function CompanySettingsClient({ org, numbering, email, branding, templates }: Props) {
+export function CompanySettingsClient({ org, numbering, email, branding, templates, shoppingConnectors }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [tab, setTab] = useState<Tab>('company')
@@ -393,15 +396,18 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
         <Card className="p-6">
           <p className="text-sm text-muted-foreground mb-4">
             Prefixes used for all document numbers across the system. These are the single source of truth — the
-            accounting and WooCommerce connectors also read from here.
+            accounting and shopping connectors read from here.
           </p>
-          <div className="space-y-3">
+
+          {/* Core numbering rows */}
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2">Core Documents</h3>
+          <div className="space-y-1">
             {(() => {
               const ymd = new Date().toISOString().slice(0, 10).replace(/-/g, '')
               const year = new Date().getFullYear()
               const rows: {
                 label: string
-                key: keyof NumberingFormats
+                key: 'so_prefix' | 'po_prefix' | 'inv_prefix' | 'cn_prefix'
                 description: string
                 example: (prefix: string) => string
               }[] = [
@@ -424,18 +430,6 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
                   example: (p) => `${p}${ymd}-A7X2`,
                 },
                 {
-                  label: 'WC Order',
-                  key: 'wc_order_prefix',
-                  description: 'Prepended to WooCommerce order numbers (leave empty for none)',
-                  example: (p) => `${p}12345`,
-                },
-                {
-                  label: 'WC Invoice',
-                  key: 'wc_inv_prefix',
-                  description: 'Accounting invoice number for WooCommerce orders',
-                  example: (p) => `${p}12345`,
-                },
-                {
                   label: 'Credit Note',
                   key: 'cn_prefix',
                   description: 'Refund / credit note numbers',
@@ -444,7 +438,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
               ]
               return rows.map((r) => (
                 <div key={r.key} className="flex items-center gap-4 py-1.5 border-b border-border/50 last:border-b-0">
-                  <div className="w-32 shrink-0">
+                  <div className="w-40 shrink-0">
                     <div className="text-sm font-medium">{r.label}</div>
                     <div className="text-[11px] text-muted-foreground">{r.description}</div>
                   </div>
@@ -465,6 +459,69 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
               ))
             })()}
           </div>
+
+          {/* Per-connector numbering rows */}
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mt-6 mb-2">
+            Shopping Connectors
+          </h3>
+          <p className="text-[11px] text-muted-foreground mb-2">
+            Each connector has its own order and invoice prefix so the origin of an imported order is visible in its number.
+          </p>
+          <div className="space-y-1">
+            {shoppingConnectors.map((c) => {
+              const cp = num.connectors[c.id] ?? { orderPrefix: '', invPrefix: '' }
+              return (
+                <div key={c.id} className="flex items-center gap-4 py-1.5 border-b border-border/50 last:border-b-0">
+                  <div className="w-40 shrink-0">
+                    <div className="text-sm font-medium flex items-center gap-2">
+                      {c.label}
+                      {!c.available && (
+                        <span className="inline-flex items-center rounded-full px-1.5 py-0 text-[10px] font-medium bg-muted text-muted-foreground">
+                          Coming soon
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-[11px] text-muted-foreground">Order and invoice numbers for imported orders</div>
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs">Order Prefix</Label>
+                    <Input
+                      value={cp.orderPrefix}
+                      onChange={(e) =>
+                        setNum((p) => ({
+                          ...p,
+                          connectors: { ...p.connectors, [c.id]: { ...cp, orderPrefix: e.target.value } },
+                        }))
+                      }
+                      className="h-8 w-28 text-xs font-mono"
+                      placeholder="—"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs">Invoice Prefix</Label>
+                    <Input
+                      value={cp.invPrefix}
+                      onChange={(e) =>
+                        setNum((p) => ({
+                          ...p,
+                          connectors: { ...p.connectors, [c.id]: { ...cp, invPrefix: e.target.value } },
+                        }))
+                      }
+                      className="h-8 w-28 text-xs font-mono"
+                      placeholder="—"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <Label className="text-xs text-muted-foreground">Example</Label>
+                    <p className="text-xs font-mono text-muted-foreground pt-1">
+                      {cp.orderPrefix}12345 · {cp.invPrefix}12345
+                    </p>
+                  </div>
+                </div>
+              )
+            })}
+          </div>
+
           <div className="mt-4">
             <SaveButton onClick={handleSaveNumbering} pending={isPending} saved={saved === 'numbering'} />
           </div>
