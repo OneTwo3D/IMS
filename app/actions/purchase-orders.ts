@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth } from '@/lib/auth/server'
-import { queueXeroSync, getXeroSettings } from '@/app/actions/xero-sync'
+import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -432,7 +432,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
           totalGbp: true,
           notes: true,
           supplierInvoiceUrl: true,
-          xeroInvoiceId: true,
+          accountingInvoiceId: true,
           createdAt: true,
           lines: {
             select: {
@@ -539,7 +539,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       totalGbp: Number(inv.totalGbp),
       notes: inv.notes,
       supplierInvoiceUrl: inv.supplierInvoiceUrl,
-      xeroInvoiceId: inv.xeroInvoiceId ?? null,
+      accountingInvoiceId: inv.accountingInvoiceId ?? null,
       createdAt: inv.createdAt.toISOString(),
       lines: inv.lines.map((il) => ({
         id: il.id,
@@ -1069,9 +1069,9 @@ export async function receivePurchaseOrder(
       metadata: { reference: po.reference, lineCount: linesWithQty.length },
     })
 
-    // Queue Xero stock receipt journal: DR Inventory / CR Stock-in-Transit
+    // Queue accounting stock receipt journal: DR Inventory / CR Stock-in-Transit
     try {
-      const xeroSettings = await getXeroSettings()
+      const settings = await getAccountingSettings()
       const totalReceiptValue = linesWithQty.reduce((sum, rl) => {
         const poLine = po.lines.find(l => l.id === rl.poLineId)
         if (!poLine) return sum
@@ -1079,7 +1079,7 @@ export async function receivePurchaseOrder(
         return sum + rl.qtyReceived * unitCost
       }, 0)
       if (totalReceiptValue > 0) {
-        await queueXeroSync({
+        await queueAccountingSync({
           type: 'STOCK_RECEIPT',
           referenceType: 'PurchaseOrder',
           referenceId: id,
@@ -1088,13 +1088,13 @@ export async function receivePurchaseOrder(
             reference: `Receipt: ${po.reference}`,
             narration: `Stock receipt for PO ${po.reference} — ${linesWithQty.length} lines into ${warehouseNamesList}`,
             lines: [
-              { accountCode: xeroSettings.xero_inventory_account, description: `Stock receipt: ${po.reference}`, debit: Math.round(totalReceiptValue * 100) / 100 },
-              { accountCode: xeroSettings.xero_transit_account, description: `Stock receipt: ${po.reference}`, credit: Math.round(totalReceiptValue * 100) / 100 },
+              { accountCode: settings.inventoryAccount, description: `Stock receipt: ${po.reference}`, debit: Math.round(totalReceiptValue * 100) / 100 },
+              { accountCode: settings.transitAccount, description: `Stock receipt: ${po.reference}`, credit: Math.round(totalReceiptValue * 100) / 100 },
             ],
           },
         })
       }
-    } catch { /* Xero queue errors should never block the main flow */ }
+    } catch { /* Accounting queue errors should never block the main flow */ }
 
     return { success: true }
   } catch (e) {
@@ -1338,7 +1338,7 @@ export type InvoiceRow = {
   totalGbp: number
   notes: string | null
   supplierInvoiceUrl: string | null
-  xeroInvoiceId: string | null
+  accountingInvoiceId: string | null
   createdAt: string
   lines: {
     id: string
@@ -1440,41 +1440,36 @@ export async function createInvoice(
       metadata: { reference: po.reference, invoiceNumber: input.invoiceNumber ?? null, lineCount: linesWithQty.length },
     })
 
-    // Queue Xero purchase invoice (bill) sync
+    // Queue accounting purchase invoice (bill) sync
     try {
-      const xeroSettings = await getXeroSettings()
+      const settings = await getAccountingSettings()
       const supplierData = await db.purchaseOrder.findUnique({
         where: { id: poId },
-        select: { supplier: { select: { name: true, taxRate: { select: { xeroTaxType: true } } } }, currency: true },
+        select: { supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true } } } }, currency: true },
       })
-      const poLines = await db.purchaseOrderLine.findMany({
-        where: { id: { in: linesWithQty.map(l => l.poLineId) } },
-        select: { product: { select: { sku: true, name: true } } },
-      })
-      const poLineMap = new Map(poLines.map(l => [l.product?.sku, l.product?.name]))
-      const billTaxType = supplierData?.supplier?.taxRate?.xeroTaxType ?? undefined
-      await queueXeroSync({
+      const billTaxType = supplierData?.supplier?.taxRate?.accountingTaxType ?? undefined
+      await queueAccountingSync({
         type: 'PURCHASE_INVOICE',
         referenceType: 'PurchaseOrder',
         referenceId: poId,
         payload: {
-          invoiceNumber: po.reference,  // PO reference becomes Xero bill number
+          invoiceNumber: po.reference,
           contactName: supplierData?.supplier?.name ?? 'Unknown Supplier',
           date: input.invoiceDate,
           dueDate: input.dueDate ?? undefined,
           currency: supplierData?.currency ?? 'GBP',
-          reference: input.invoiceNumber ?? undefined,  // Supplier invoice number as Xero reference
+          reference: input.invoiceNumber ?? undefined,
           lines: linesWithQty.map(l => ({
             description: `PO ${po.reference} line`,
             quantity: l.qtyBilled,
             unitAmount: Math.round((l.unitCostForeign / fxRate) * 10000) / 10000,
-            accountCode: xeroSettings.xero_purchase_account,
+            accountCode: settings.purchaseAccount,
             taxType: billTaxType,
           })),
           supplierInvoicePath: input.supplierInvoiceUrl ?? undefined,
         },
       })
-    } catch { /* Xero queue errors should never block the main flow */ }
+    } catch { /* Accounting queue errors should never block the main flow */ }
 
     return { success: true }
   } catch (e) {

@@ -4,7 +4,7 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server'
-import { loadInvoicePdf, verifyPdfToken } from '@/lib/connectors/xero/invoice-pdf'
+import { loadInvoicePdf, verifyPdfToken } from '@/lib/invoice-pdf'
 
 export async function GET(
   request: NextRequest,

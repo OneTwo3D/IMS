@@ -1,3 +1,5 @@
+import { readFile } from 'fs/promises'
+import { join } from 'path'
 import { NextResponse } from 'next/server'
 import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
@@ -13,6 +15,20 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     include: { lines: { select: { description: true, sku: true, qty: true, unitPriceForeign: true, discountAmount: true, totalForeign: true, taxForeign: true } } },
   })
   if (!so) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+
+  // Serve Xero-downloaded PDF if available
+  if (so.invoicePdfPath) {
+    try {
+      const pdfPath = join(process.cwd(), 'public', so.invoicePdfPath)
+      const pdfBuffer = await readFile(pdfPath)
+      const invNum = so.invoiceNumber ?? so.wcOrderNumber ?? so.id.slice(0, 8)
+      return new NextResponse(new Uint8Array(pdfBuffer), {
+        headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="Invoice-${invNum}.pdf"` },
+      })
+    } catch {
+      // Fall through to IMS-generated PDF if file not found
+    }
+  }
 
   const branding = await getBranding()
   const tpl = await db.documentTemplate.findUnique({

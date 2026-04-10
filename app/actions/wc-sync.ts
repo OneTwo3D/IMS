@@ -107,45 +107,90 @@ export async function getWcCredentials(): Promise<{ url: string; key: string; se
 }
 
 // ---------------------------------------------------------------------------
-// Tax mappings
+// Tax rate mappings (WC rate id → IMS tax rate)
 // ---------------------------------------------------------------------------
 
-export type TaxMappingRow = {
+export type TaxRateMappingRow = {
   id: string
-  wcTaxClass: string
+  wcTaxRateId: number
+  wcName: string
+  wcCountry: string | null
+  wcRatePct: number
+  wcClass: string | null
   taxRateId: string
   taxRateName: string
 }
 
-export async function getWcTaxMappings(): Promise<TaxMappingRow[]> {
-  const rows = await db.wcTaxMapping.findMany({
+export async function getWcTaxRateMappings(): Promise<TaxRateMappingRow[]> {
+  const rows = await db.wcTaxRateMapping.findMany({
     include: { taxRate: { select: { name: true } } },
-    orderBy: { wcTaxClass: 'asc' },
+    orderBy: [{ wcCountry: 'asc' }, { wcName: 'asc' }],
   })
   return rows.map((r) => ({
     id: r.id,
-    wcTaxClass: r.wcTaxClass,
+    wcTaxRateId: r.wcTaxRateId,
+    wcName: r.wcName,
+    wcCountry: r.wcCountry,
+    wcRatePct: Number(r.wcRatePct),
+    wcClass: r.wcClass,
     taxRateId: r.taxRateId,
     taxRateName: r.taxRate.name,
   }))
 }
 
-export async function upsertWcTaxMapping(wcTaxClass: string, taxRateId: string): Promise<{ success: boolean }> {
+export async function updateWcTaxRateMapping(
+  wcTaxRateId: number,
+  taxRateId: string,
+): Promise<{ success: boolean }> {
   await requireAdmin()
-  await db.wcTaxMapping.upsert({
-    where: { wcTaxClass },
-    create: { wcTaxClass, taxRateId },
-    update: { taxRateId },
+  await db.wcTaxRateMapping.update({
+    where: { wcTaxRateId },
+    data: { taxRateId },
   })
   revalidatePath('/sync')
   return { success: true }
 }
 
-export async function deleteWcTaxMapping(id: string): Promise<{ success: boolean }> {
+export async function deleteWcTaxRateMapping(id: string): Promise<{ success: boolean }> {
   await requireAdmin()
-  await db.wcTaxMapping.delete({ where: { id } })
+  await db.wcTaxRateMapping.delete({ where: { id } })
   revalidatePath('/sync')
   return { success: true }
+}
+
+export async function importWcTaxRatesFromApi(): Promise<{
+  success: boolean
+  importedRates?: number
+  reusedRates?: number
+  mappedRates?: number
+  errors?: string[]
+  error?: string
+}> {
+  try {
+    await requireAdmin()
+    const { importWcTaxRates } = await import('@/lib/connectors/woocommerce/sync/taxes')
+    const result = await importWcTaxRates()
+
+    logActivity({
+      entityType: 'SETTING',
+      tag: 'sync',
+      action: 'wc_tax_rates_imported',
+      description: `Imported ${result.importedRates} new VAT rate(s), reused ${result.reusedRates} existing, mapped ${result.mappedRates} WC tax rate(s) from WooCommerce`,
+      metadata: result as unknown as Record<string, unknown>,
+    })
+
+    revalidatePath('/sync')
+    revalidatePath('/settings/accounting')
+    return {
+      success: true,
+      importedRates: result.importedRates,
+      reusedRates: result.reusedRates,
+      mappedRates: result.mappedRates,
+      errors: result.errors,
+    }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
 }
 
 // ---------------------------------------------------------------------------

@@ -126,7 +126,7 @@ enum ProductionOrderStatus {
   CANCELLED
 }
 
-enum XeroSyncType {
+enum AccountingSyncType {
   PURCHASE_INVOICE
   COGS_JOURNAL
   INVENTORY_ADJUSTMENT
@@ -140,12 +140,16 @@ enum XeroSyncType {
   DAILY_BATCH_INVENTORY_ALLOC
   DAILY_BATCH_GROUP_B
   UNEARNED_REV_REVERSAL
+
+  @@map("XeroSyncType")
 }
 
-enum XeroSyncStatus {
+enum AccountingSyncStatus {
   PENDING
   SYNCED
   FAILED
+
+  @@map("XeroSyncStatus")
 }
 
 enum WcSyncDirection {
@@ -307,11 +311,11 @@ model DocumentTemplate {
   @@map("document_templates")
 }
 
-/// Configurable reasons for stock adjustments, each optionally linked to a Xero account
+/// Configurable reasons for stock adjustments, each optionally linked to an accounting account
 model AdjustmentReason {
   id              String   @id @default(cuid())
   name            String
-  xeroAccountCode String?
+  accountCode     String?  @map("xero_account_code")
   sortOrder       Int      @default(0)
   active          Boolean  @default(true)
   createdAt       DateTime @default(now())
@@ -360,17 +364,17 @@ model TaxRate {
   rate        Decimal  @db.Decimal(5, 4) // e.g. 0.2000 for 20%
   type        TaxType  @default(VAT)
   usedFor     String   @default("BOTH") // SALES, PURCHASE, BOTH
-  xeroTaxType String?  // Xero tax type code e.g. "OUTPUT2", "INPUT2"
+  accountingTaxType String?  @map("xero_tax_type") // Accounting tax type code e.g. "OUTPUT2", "INPUT2"
   countryCode String?  // ISO 3166-1 alpha-2, null = applies globally
   active      Boolean  @default(true)
   isDefault   Boolean  @default(false)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
-  supplierTaxRate Supplier[]
-  orderLines      SalesOrderLine[]
-  poLines         PurchaseOrderLine[]
-  wcTaxMappings   WcTaxMapping[]
+  supplierTaxRate    Supplier[]
+  orderLines         SalesOrderLine[]
+  poLines            PurchaseOrderLine[]
+  wcTaxRateMappings  WcTaxRateMapping[]
 
   @@map("tax_rates")
 }
@@ -833,7 +837,7 @@ model PurchaseInvoice {
   fxRateToGbp     Decimal   @db.Decimal(18, 8)
   notes           String?
   supplierInvoiceUrl String? // path to uploaded supplier PDF
-  xeroInvoiceId   String?
+  accountingInvoiceId String?  @map("xero_invoice_id")
   paidAt          DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
@@ -955,18 +959,18 @@ model SalesOrder {
   discountAmount    Decimal    @db.Decimal(18, 4) @default(0) // computed order discount in foreign currency
   invoiceNumber     String?    // generated invoice reference
   invoicedAt        DateTime?
-  xeroInvoiceId     String?    // Xero invoice ID after sync
+  accountingInvoiceId     String?    @map("xero_invoice_id") // Accounting invoice ID after sync
   paidAt            DateTime?
   orderNumber       String?    // IMS order number (prefix + WC number, or manual)
   paymentMethod     String?    // e.g. "stripe", "paypal", "bacs" — populated by any shopping channel
   paymentMethodTitle String?   // e.g. "Credit card", "PayPal"
   invoicePdfPath    String?    // path to saved invoice PDF (generic, set by any accounting module)
 
-  // Xero sub-ledger tracking
-  xeroRevenueDeferredDate    DateTime?              // Set by Group A1 — revenue deferred to Unearned
-  xeroUnearnedRevenueAmount  Decimal?  @db.Decimal(18, 4) // Amount deferred
-  xeroInventoryAllocatedDate DateTime?              // Set by Group A2 — inventory reclassified to Allocated
-  xeroAllocationBatchAmount  Decimal?  @db.Decimal(18, 4) // Cost value reclassified
+  // Accounting sub-ledger tracking
+  revenueDeferredDate    DateTime?              @map("xero_revenue_deferred_date") // Set by Group A1 — revenue deferred to Unearned
+  unearnedRevenueAmount  Decimal?  @db.Decimal(18, 4) @map("xero_unearned_revenue_amount") // Amount deferred
+  inventoryAllocatedDate DateTime?              @map("xero_inventory_allocated_date") // Set by Group A2 — inventory reclassified to Allocated
+  allocationBatchAmount  Decimal?  @db.Decimal(18, 4) @map("xero_allocation_batch_amount") // Cost value reclassified
 
   notes             String?     // customer-visible notes
   internalNotes     String?     // private/staff notes
@@ -1022,7 +1026,7 @@ model SalesOrderRefund {
   id              String     @id @default(cuid())
   orderId         String
   creditNoteNumber String?   // e.g. "CN-2025-00001"
-  xeroCreditNoteId String?   // Xero credit note ID after sync
+  accountingCreditNoteId String?   @map("xero_credit_note_id") // Accounting credit note ID after sync
   wcRefundId      Int?
   returnWarehouseId String?
   reason          String?
@@ -1251,18 +1255,18 @@ model XeroAccount {
   @@map("xero_accounts")
 }
 
-model XeroSyncLog {
-  id              String        @id @default(cuid())
-  type            XeroSyncType
-  status          XeroSyncStatus @default(PENDING)
-  referenceType   String        // "PurchaseOrder", "CogsEntry", "SalesOrder", etc.
+model AccountingSyncLog {
+  id              String              @id @default(cuid())
+  type            AccountingSyncType
+  status          AccountingSyncStatus @default(PENDING)
+  referenceType   String              // "PurchaseOrder", "CogsEntry", "SalesOrder", etc.
   referenceId     String
   xeroTransactionId String?
-  payload         Json?         // what was sent
+  payload         Json?               // what was sent
   errorMessage    String?
-  retryCount      Int           @default(0)
+  retryCount      Int                 @default(0)
   syncedAt        DateTime?
-  createdAt       DateTime      @default(now())
+  createdAt       DateTime            @default(now())
 
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.
@@ -1312,17 +1316,22 @@ model WcSyncLog {
 // WOOCOMMERCE SYNC MAPPINGS
 // ---------------------------------------------------------------------------
 
-/// Maps WC tax classes (e.g. "standard", "reduced-rate") to IMS TaxRate records
-model WcTaxMapping {
-  id         String   @id @default(cuid())
-  wcTaxClass String   @unique
-  taxRateId  String
-  createdAt  DateTime @default(now())
-  updatedAt  DateTime @updatedAt
+/// Maps individual WC tax rates (by WC rate id) to IMS TaxRate records.
+/// Auto-populated by the "Import from WooCommerce" action in Sync settings.
+model WcTaxRateMapping {
+  id          String   @id @default(cuid())
+  wcTaxRateId Int      @unique
+  wcName      String
+  wcCountry   String?
+  wcRatePct   Decimal  @db.Decimal(7, 4)
+  wcClass     String?
+  taxRateId   String
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
 
-  taxRate    TaxRate  @relation(fields: [taxRateId], references: [id])
+  taxRate     TaxRate  @relation(fields: [taxRateId], references: [id])
 
-  @@map("wc_tax_mappings")
+  @@map("wc_tax_rate_mappings")
 }
 
 /// Maps WC order statuses to IMS SalesOrderStatus values
@@ -1413,10 +1422,10 @@ model Shipment {
   shippingService String?
   shippedAt       DateTime?
 
-  // Xero sub-ledger tracking
-  xeroShipmentJournalDate     DateTime?
-  xeroCogsBatchAmount         Decimal?  @db.Decimal(18, 4)
-  xeroRevenueRecognizedAmount Decimal?  @db.Decimal(18, 4)
+  // Accounting sub-ledger tracking
+  shipmentJournalDate     DateTime?              @map("xero_shipment_journal_date")
+  cogsBatchAmount         Decimal?  @db.Decimal(18, 4) @map("xero_cogs_batch_amount")
+  revenueRecognizedAmount Decimal?  @db.Decimal(18, 4) @map("xero_revenue_recognized_amount")
 
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt

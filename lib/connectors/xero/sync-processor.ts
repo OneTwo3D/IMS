@@ -12,8 +12,8 @@ import { pushPurchaseBill } from './bills'
 import { pushCreditNote } from './credit-notes'
 import { pushManualJournal } from './journals'
 import { xeroUploadAttachment, xeroPost } from './api'
-import { lookupPaymentAccount } from '@/app/actions/xero-sync'
-import type { XeroSyncType } from '@/app/generated/prisma/client'
+import { lookupPaymentAccount } from '@/lib/connectors/xero/settings'
+import type { AccountingSyncType } from '@/app/generated/prisma/client'
 
 const MAX_RETRIES = 5
 const MAX_PER_RUN = 50 // Xero rate limit: 60/min — leave headroom
@@ -30,7 +30,7 @@ type SyncPayload = Record<string, unknown>
 export async function processPendingXeroSync(): Promise<ProcessResult> {
   const result: ProcessResult = { processed: 0, succeeded: 0, failed: 0, skipped: 0 }
 
-  const pending = await db.xeroSyncLog.findMany({
+  const pending = await db.accountingSyncLog.findMany({
     where: {
       status: 'PENDING',
       retryCount: { lt: MAX_RETRIES },
@@ -47,7 +47,7 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
       const syncResult = await processEntry(entry.type, payload)
 
       if (syncResult.success) {
-        await db.xeroSyncLog.update({
+        await db.accountingSyncLog.update({
           where: { id: entry.id },
           data: {
             status: 'SYNCED',
@@ -57,13 +57,13 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
           },
         })
 
-        // Update back-references (e.g. xeroInvoiceId on SalesOrder)
-        await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId)
+        // Update back-references (e.g. accountingInvoiceId on SalesOrder)
+        await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
 
         result.succeeded++
       } else {
         const retryCount = entry.retryCount + 1
-        await db.xeroSyncLog.update({
+        await db.accountingSyncLog.update({
           where: { id: entry.id },
           data: {
             status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
@@ -75,7 +75,7 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
       }
     } catch (e) {
       const retryCount = entry.retryCount + 1
-      await db.xeroSyncLog.update({
+      await db.accountingSyncLog.update({
         where: { id: entry.id },
         data: {
           status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
@@ -88,7 +88,7 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
   }
 
   // Log skipped entries (exceeded max retries)
-  const skippedCount = await db.xeroSyncLog.count({
+  const skippedCount = await db.accountingSyncLog.count({
     where: { status: 'FAILED', retryCount: { gte: MAX_RETRIES } },
   })
   result.skipped = skippedCount
@@ -115,9 +115,9 @@ function resolveJournalStatus(mode: unknown): string {
 }
 
 async function processEntry(
-  type: XeroSyncType,
+  type: AccountingSyncType,
   payload: SyncPayload,
-): Promise<{ success: boolean; externalId?: string; error?: string }> {
+): Promise<{ success: boolean; externalId?: string; invoiceNumber?: string; error?: string }> {
   const postingMode = payload._postingMode
 
   switch (type) {
@@ -174,7 +174,7 @@ async function processEntry(
         }
       }
 
-      return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, error: invoiceResult.error }
+      return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, error: invoiceResult.error }
     }
 
     case 'PURCHASE_INVOICE': {
@@ -238,10 +238,11 @@ async function processEntry(
 }
 
 async function updateBackReference(
-  type: XeroSyncType,
+  type: AccountingSyncType,
   referenceType: string,
   referenceId: string,
   externalId?: string,
+  invoiceNumber?: string,
 ): Promise<void> {
   if (!externalId) return
 
@@ -249,7 +250,11 @@ async function updateBackReference(
     if (type === 'SALES_INVOICE' && referenceType === 'SalesOrder') {
       await db.salesOrder.update({
         where: { id: referenceId },
-        data: { xeroInvoiceId: externalId },
+        data: {
+          accountingInvoiceId: externalId,
+          invoiceNumber: invoiceNumber ?? undefined,
+          invoicedAt: new Date(),
+        },
       })
 
       // Download Xero invoice PDF, save, email, and notify shopping channel
@@ -264,8 +269,8 @@ async function updateBackReference(
           })
 
           // Email the Xero invoice PDF to the customer
-          const { sendXeroInvoiceEmail } = await import('@/app/actions/email')
-          await sendXeroInvoiceEmail(referenceId).catch(() => {})
+          const { sendAccountingInvoiceEmail } = await import('@/app/actions/email')
+          await sendAccountingInvoiceEmail(referenceId).catch(() => {})
 
           // Notify shopping channel (WC pushes order note with download link)
           await notifyShoppingChannel(referenceId, 'invoice_ready')
@@ -276,12 +281,12 @@ async function updateBackReference(
     } else if (type === 'CREDIT_NOTE' && referenceType === 'SalesOrderRefund') {
       await db.salesOrderRefund.update({
         where: { id: referenceId },
-        data: { xeroCreditNoteId: externalId },
+        data: { accountingCreditNoteId: externalId },
       })
     } else if (type === 'PURCHASE_INVOICE' && referenceType === 'PurchaseInvoice') {
       await db.purchaseInvoice.update({
         where: { id: referenceId },
-        data: { xeroInvoiceId: externalId },
+        data: { accountingInvoiceId: externalId },
       })
     }
   } catch {

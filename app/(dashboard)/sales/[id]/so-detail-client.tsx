@@ -2,7 +2,7 @@
 
 import { useState, useTransition, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
-import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Check } from 'lucide-react'
+import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Check, Clock } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -37,6 +37,8 @@ type Props = {
   initialShipments: ShipmentRow[]
   carriers: string[]
   deliveryTrackingEnabled: boolean
+  accountingInvoiceUrlTemplate: string
+  accountingSyncEnabled: boolean
 }
 
 const STATUS_LABELS: Record<SoStatus, string> = {
@@ -706,7 +708,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stockLevels, initialAllocations, initialShipments, carriers, deliveryTrackingEnabled }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stockLevels, initialAllocations, initialShipments, carriers, deliveryTrackingEnabled, accountingInvoiceUrlTemplate, accountingSyncEnabled }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [showShip, setShowShip] = useState(false)
@@ -845,14 +847,14 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
             {so.invoiceNumber}
           </span>
         )}
-        {so.xeroInvoiceId && (
+        {so.accountingInvoiceId && (
           <a
-            href={`https://go.xero.com/AccountsReceivable/View.aspx?InvoiceID=${so.xeroInvoiceId}`}
+            href={accountingInvoiceUrlTemplate.replace('{id}', so.accountingInvoiceId)}
             target="_blank"
             rel="noopener noreferrer"
             className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium bg-blue-100 text-blue-800 border-blue-200 dark:bg-blue-900 dark:text-blue-200 hover:bg-blue-200 dark:hover:bg-blue-800 transition-colors"
           >
-            <ExternalLink className="h-3 w-3" />Xero
+            <ExternalLink className="h-3 w-3" />Accounting
           </a>
         )}
 
@@ -893,10 +895,13 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
           </Button>
 
           {/* Invoice */}
-          {!so.invoiceNumber && (
+          {!so.invoiceNumber && !accountingSyncEnabled && (
             <Button variant="outline" size="sm" onClick={handleGenerateInvoice} disabled={isPending}>
               <FileText className="h-4 w-4 mr-1" />Generate Invoice
             </Button>
+          )}
+          {accountingSyncEnabled && !so.invoiceNumber && !so.accountingInvoiceId && (
+            <span className="inline-flex items-center gap-1 text-xs text-muted-foreground"><Clock className="h-3 w-3" />Invoice pending sync</span>
           )}
 
           {canRefund && (

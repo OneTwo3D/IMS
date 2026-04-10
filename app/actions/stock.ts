@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth } from '@/lib/auth/server'
+import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -57,18 +58,18 @@ export async function adjustStock(
 
   try {
     await db.$transaction(async (tx) => {
-      // Look up reason (name + optional Xero account code)
+      // Look up reason (name + optional accounting account code)
       let reasonName: string | null = note || null
-      let xeroAccountCode: string | null = null
+      let accountCode: string | null = null
 
       if (reasonId) {
         const reason = await tx.adjustmentReason.findUnique({
           where: { id: reasonId },
-          select: { name: true, xeroAccountCode: true },
+          select: { name: true, accountCode: true },
         })
         if (reason) {
           reasonName = note ? `${reason.name}: ${note}` : reason.name
-          xeroAccountCode = reason.xeroAccountCode
+          accountCode = reason.accountCode
         }
       }
 
@@ -105,13 +106,11 @@ export async function adjustStock(
       logSku = logProduct?.sku ?? productId
       logWarehouseName = logWarehouse?.name ?? warehouseId
 
-      // Queue Xero sync — prefer reason's account code, fall back to global setting
-      const effectiveXeroAccount = xeroAccountCode ?? (() => {
-        // Checked below asynchronously — handled outside this closure
-        return null
-      })()
+      // Queue accounting sync — prefer reason's account code, fall back to global setting
+      const settings = await getAccountingSettings()
+      const effectiveAccount = accountCode || settings.inventoryAdjustmentAccount || null
 
-      if (effectiveXeroAccount) {
+      if (effectiveAccount) {
         const product = await tx.product.findUnique({
           where: { id: productId },
           select: { sku: true, name: true },
@@ -120,57 +119,21 @@ export async function adjustStock(
           where: { id: warehouseId },
           select: { code: true, name: true },
         })
-        await tx.xeroSyncLog.create({
-          data: {
-            type: 'INVENTORY_ADJUSTMENT',
-            status: 'PENDING',
-            referenceType: 'StockMovement',
-            referenceId: productId,
-            payload: {
-              productId,
-              productSku: product?.sku,
-              productName: product?.name,
-              warehouseId,
-              warehouseCode: warehouse?.code,
-              qty: qtyNum,
-              note: reasonName,
-              xeroAccountCode: effectiveXeroAccount,
-            },
+        await queueAccountingSync({
+          type: 'INVENTORY_ADJUSTMENT',
+          referenceType: 'StockMovement',
+          referenceId: productId,
+          payload: {
+            productId,
+            productSku: product?.sku,
+            productName: product?.name,
+            warehouseId,
+            warehouseCode: warehouse?.code,
+            qty: qtyNum,
+            note: reasonName,
+            accountCode: effectiveAccount,
           },
         })
-      } else {
-        // Fall back to global xero_inventory_adjustment_account setting
-        const xeroAccountSetting = await tx.setting.findUnique({
-          where: { key: 'xero_inventory_adjustment_account' },
-        })
-        if (xeroAccountSetting) {
-          const product = await tx.product.findUnique({
-            where: { id: productId },
-            select: { sku: true, name: true },
-          })
-          const warehouse = await tx.warehouse.findUnique({
-            where: { id: warehouseId },
-            select: { code: true, name: true },
-          })
-          await tx.xeroSyncLog.create({
-            data: {
-              type: 'INVENTORY_ADJUSTMENT',
-              status: 'PENDING',
-              referenceType: 'StockMovement',
-              referenceId: productId,
-              payload: {
-                productId,
-                productSku: product?.sku,
-                productName: product?.name,
-                warehouseId,
-                warehouseCode: warehouse?.code,
-                qty: qtyNum,
-                note: reasonName,
-                xeroAccountCode: JSON.parse(xeroAccountSetting.value),
-              },
-            },
-          })
-        }
       }
     })
 
@@ -234,7 +197,7 @@ export async function bulkAdjustStock(
   const reasons = reasonIds.length
     ? await db.adjustmentReason.findMany({
         where: { id: { in: reasonIds } },
-        select: { id: true, name: true, xeroAccountCode: true },
+        select: { id: true, name: true, accountCode: true },
       })
     : []
   const reasonMap = new Map(reasons.map((r) => [r.id, r]))
@@ -266,17 +229,14 @@ export async function bulkAdjustStock(
           update: { quantity: { increment: qty } },
         })
 
-        // Xero sync: use reason's account code if set
-        const xeroAccountCode = reason?.xeroAccountCode ?? null
-        if (xeroAccountCode) {
-          await tx.xeroSyncLog.create({
-            data: {
-              type: 'INVENTORY_ADJUSTMENT',
-              status: 'PENDING',
-              referenceType: 'StockMovement',
-              referenceId: productId,
-              payload: { productId, warehouseId, qty, note, xeroAccountCode },
-            },
+        // Accounting sync: use reason's account code if set
+        const reasonAccountCode = reason?.accountCode ?? null
+        if (reasonAccountCode) {
+          await queueAccountingSync({
+            type: 'INVENTORY_ADJUSTMENT',
+            referenceType: 'StockMovement',
+            referenceId: productId,
+            payload: { productId, warehouseId, qty, note, accountCode: reasonAccountCode },
           })
         }
       }
@@ -562,7 +522,7 @@ export async function getAvgCogsMap(): Promise<Record<string, number>> {
 export type AdjustmentReasonOption = {
   id: string
   name: string
-  xeroAccountCode: string | null
+  accountCode: string | null
 }
 
 export async function getActiveAdjustmentReasons(): Promise<AdjustmentReasonOption[]> {
@@ -570,6 +530,6 @@ export async function getActiveAdjustmentReasons(): Promise<AdjustmentReasonOpti
   return db.adjustmentReason.findMany({
     where: { active: true },
     orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
-    select: { id: true, name: true, xeroAccountCode: true },
+    select: { id: true, name: true, accountCode: true },
   })
 }

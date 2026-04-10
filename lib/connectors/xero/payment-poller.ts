@@ -29,11 +29,11 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
   try {
     const unpaidManualOrders = await db.salesOrder.findMany({
       where: {
-        xeroInvoiceId: { not: null },
+        accountingInvoiceId: { not: null },
         paidAt: null,
         wcOrderId: null, // Only manual orders — WC orders already have paidAt
       },
-      select: { id: true, xeroInvoiceId: true, orderNumber: true, wcOrderNumber: true, status: true },
+      select: { id: true, accountingInvoiceId: true, orderNumber: true, wcOrderNumber: true, status: true },
     })
 
     if (unpaidManualOrders.length > 0) {
@@ -47,8 +47,8 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
         const paidIds = new Set(res.data.Invoices.map(i => i.InvoiceID))
 
         for (const order of unpaidManualOrders) {
-          if (order.xeroInvoiceId && paidIds.has(order.xeroInvoiceId)) {
-            const paidInvoice = res.data.Invoices.find(i => i.InvoiceID === order.xeroInvoiceId)
+          if (order.accountingInvoiceId && paidIds.has(order.accountingInvoiceId)) {
+            const paidInvoice = res.data.Invoices.find(i => i.InvoiceID === order.accountingInvoiceId)
             const paidDate = paidInvoice?.FullyPaidOnDate ? new Date(paidInvoice.FullyPaidOnDate) : new Date()
 
             // Update paidAt and advance status if still PENDING_PAYMENT
@@ -88,10 +88,10 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
   try {
     const unpaidBills = await db.purchaseInvoice.findMany({
       where: {
-        xeroInvoiceId: { not: null },
+        accountingInvoiceId: { not: null },
         paidAt: null,
       },
-      select: { id: true, xeroInvoiceId: true, poId: true, po: { select: { reference: true } } },
+      select: { id: true, accountingInvoiceId: true, poId: true, po: { select: { reference: true } } },
     })
 
     if (unpaidBills.length > 0) {
@@ -104,8 +104,8 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
         const paidIds = new Set(res.data.Invoices.map(i => i.InvoiceID))
 
         for (const bill of unpaidBills) {
-          if (bill.xeroInvoiceId && paidIds.has(bill.xeroInvoiceId)) {
-            const paidInvoice = res.data.Invoices.find(i => i.InvoiceID === bill.xeroInvoiceId)
+          if (bill.accountingInvoiceId && paidIds.has(bill.accountingInvoiceId)) {
+            const paidInvoice = res.data.Invoices.find(i => i.InvoiceID === bill.accountingInvoiceId)
             const paidDate = paidInvoice?.FullyPaidOnDate ? new Date(paidInvoice.FullyPaidOnDate) : new Date()
 
             await db.purchaseInvoice.update({

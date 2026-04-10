@@ -7,6 +7,10 @@ import { auth } from '@/lib/auth'
 import { getAuthorizationUrl, disconnect, isConnected } from '@/lib/connectors/xero'
 import { syncChartOfAccounts, getXeroTaxRates } from '@/lib/connectors/xero'
 import { processPendingXeroSync } from '@/lib/connectors/xero'
+import { getXeroSettings, XERO_SETTING_KEYS, type XeroSettings } from '@/lib/connectors/xero/settings'
+
+// Type re-export (allowed in 'use server' files)
+export type { XeroSettings } from '@/lib/connectors/xero/settings'
 
 async function requireAdmin() {
   const session = await auth()
@@ -15,106 +19,8 @@ async function requireAdmin() {
 }
 
 // ---------------------------------------------------------------------------
-// Settings
+// Settings (UI-facing server actions)
 // ---------------------------------------------------------------------------
-
-export type XeroSettings = {
-  xero_client_id: string
-  xero_client_secret: string
-  xero_sync_enabled: string
-  // Per-transaction-type posting mode: 'off' | 'draft' | 'submitted'
-  xero_sync_sales_invoice: string
-  xero_sync_credit_note: string
-  xero_sync_purchase_invoice: string
-  xero_sync_cogs_journal: string
-  xero_sync_cogs_reversal: string
-  xero_sync_stock_receipt: string
-  xero_sync_inventory_adjustment: string
-  xero_sync_attach_pdf: string
-  xero_sync_stock_allocation: string
-  // Account mappings
-  xero_sales_account: string
-  xero_shipping_account: string
-  xero_discount_account: string
-  xero_cogs_account: string
-  xero_inventory_account: string
-  xero_allocated_inventory_account: string
-  xero_unearned_revenue_account: string
-  xero_transit_account: string
-  xero_purchase_account: string
-  // Sub-ledger settings
-  xero_daily_batch_enabled: string
-  xero_payment_polling_enabled: string
-  xero_payment_account_map: string  // JSON: {"stripe:GBP":"091","paypal:GBP":"094",...}
-  // Order numbering
-  order_number_prefix: string
-}
-
-const XERO_SETTING_KEYS = [
-  'xero_client_id', 'xero_client_secret', 'xero_sync_enabled',
-  'xero_sync_sales_invoice', 'xero_sync_credit_note', 'xero_sync_purchase_invoice',
-  'xero_sync_cogs_journal', 'xero_sync_cogs_reversal',
-  'xero_sync_stock_receipt', 'xero_sync_inventory_adjustment', 'xero_sync_stock_allocation',
-  'xero_sync_attach_pdf',
-  'xero_sales_account', 'xero_shipping_account', 'xero_discount_account',
-  'xero_cogs_account', 'xero_inventory_account', 'xero_allocated_inventory_account',
-  'xero_unearned_revenue_account',
-  'xero_transit_account', 'xero_purchase_account',
-  'xero_daily_batch_enabled', 'xero_payment_polling_enabled',
-  'xero_payment_account_map',
-  'order_number_prefix',
-]
-
-const XERO_DEFAULTS: XeroSettings = {
-  xero_client_id: '',
-  xero_client_secret: '',
-  xero_sync_enabled: 'false',
-  xero_sync_sales_invoice: 'submitted',
-  xero_sync_credit_note: 'submitted',
-  xero_sync_purchase_invoice: 'submitted',
-  xero_sync_cogs_journal: 'submitted',
-  xero_sync_cogs_reversal: 'submitted',
-  xero_sync_stock_receipt: 'submitted',
-  xero_sync_inventory_adjustment: 'submitted',
-  xero_sync_stock_allocation: 'submitted',
-  xero_sync_attach_pdf: 'true',
-  xero_sales_account: '',
-  xero_shipping_account: '',
-  xero_discount_account: '',
-  xero_cogs_account: '',
-  xero_inventory_account: '',
-  xero_allocated_inventory_account: '',
-  xero_unearned_revenue_account: '',
-  xero_transit_account: '',
-  xero_purchase_account: '',
-  xero_daily_batch_enabled: 'false',
-  xero_payment_polling_enabled: 'false',
-  xero_payment_account_map: '{}',
-  order_number_prefix: '',
-}
-
-/** Map sync type enum → setting key for per-type enable/disable */
-const SYNC_TYPE_SETTING: Record<string, keyof XeroSettings> = {
-  SALES_INVOICE: 'xero_sync_sales_invoice',
-  CREDIT_NOTE: 'xero_sync_credit_note',
-  PURCHASE_INVOICE: 'xero_sync_purchase_invoice',
-  COGS_JOURNAL: 'xero_sync_cogs_journal',
-  COGS_REVERSAL: 'xero_sync_cogs_reversal',
-  STOCK_RECEIPT: 'xero_sync_stock_receipt',
-  INVENTORY_ADJUSTMENT: 'xero_sync_inventory_adjustment',
-  STOCK_ALLOCATION: 'xero_sync_stock_allocation',
-}
-
-export async function getXeroSettings(): Promise<XeroSettings> {
-  const rows = await db.setting.findMany({ where: { key: { in: XERO_SETTING_KEYS } } })
-  const map = new Map(rows.map((r) => [r.key, r.value]))
-  const result = { ...XERO_DEFAULTS }
-  for (const k of Object.keys(result) as (keyof XeroSettings)[]) {
-    const v = map.get(k)
-    if (v) result[k] = v
-  }
-  return result
-}
 
 export async function getXeroSettingsMasked(): Promise<XeroSettings & { secretMasked: boolean }> {
   const settings = await getXeroSettings()
@@ -127,6 +33,22 @@ export async function getXeroSettingsMasked(): Promise<XeroSettings & { secretMa
 export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ success: boolean; error?: string }> {
   try {
     await requireAdmin()
+
+    // If attempting to enable sync, verify readiness first
+    if (data.xero_sync_enabled === 'true') {
+      const readiness = await getXeroSyncReadiness()
+      if (!readiness.ready) {
+        const reasons: string[] = []
+        if (readiness.notConnected) reasons.push('not connected to Xero')
+        if (readiness.missingAccounts.length > 0) {
+          reasons.push(`missing account mappings (${readiness.missingAccounts.map(a => a.label).join(', ')})`)
+        }
+        if (readiness.missingTaxTypes.length > 0) {
+          reasons.push(`missing Xero tax type on IMS VAT rates (${readiness.missingTaxTypes.map(t => t.name).join(', ')})`)
+        }
+        return { success: false, error: `Cannot enable Xero sync — ${reasons.join('; ')}.` }
+      }
+    }
 
     // Don't overwrite secret with masked value
     const entries = Object.entries(data).filter(([k, v]) => {
@@ -266,7 +188,7 @@ export type XeroSyncLogRow = {
 }
 
 export async function getXeroSyncLogs(limit = 50): Promise<XeroSyncLogRow[]> {
-  const rows = await db.xeroSyncLog.findMany({
+  const rows = await db.accountingSyncLog.findMany({
     orderBy: { createdAt: 'desc' },
     take: limit,
   })
@@ -315,61 +237,58 @@ export async function triggerXeroSync(): Promise<{ success: boolean; result?: un
 }
 
 // ---------------------------------------------------------------------------
-// Helper: Queue a Xero sync entry (used by other actions)
+// Readiness check — validate before allowing Xero sync to be enabled
 // ---------------------------------------------------------------------------
 
-export async function queueXeroSync(params: {
-  type: 'SALES_INVOICE' | 'CREDIT_NOTE' | 'COGS_REVERSAL' | 'STOCK_IN_TRANSIT' | 'STOCK_RECEIPT' | 'PURCHASE_INVOICE' | 'COGS_JOURNAL' | 'INVENTORY_ADJUSTMENT' | 'STOCK_ALLOCATION' | 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B' | 'UNEARNED_REV_REVERSAL'
-  referenceType: string
-  referenceId: string
-  payload: Record<string, unknown>
-}): Promise<void> {
-  // Check if Xero sync is globally enabled
-  const settings = await getXeroSettings()
-  if (settings.xero_sync_enabled !== 'true') return
+export type XeroSyncReadiness = {
+  ready: boolean
+  notConnected: boolean
+  missingAccounts: Array<{ key: string; label: string }>
+  missingTaxTypes: Array<{ id: string; name: string }>
+}
 
-  // Check if this specific sync type is enabled (off = disabled)
-  const settingKey = SYNC_TYPE_SETTING[params.type]
-  const postingMode = settingKey ? settings[settingKey] : 'submitted'
-  if (!postingMode || postingMode === 'off') return
+const REQUIRED_ACCOUNTS: Array<{ key: keyof XeroSettings; label: string }> = [
+  { key: 'xero_sales_account', label: 'Sales Revenue' },
+  { key: 'xero_shipping_account', label: 'Shipping Income' },
+  { key: 'xero_discount_account', label: 'Discounts Given' },
+  { key: 'xero_purchase_account', label: 'Purchases' },
+  { key: 'xero_transit_account', label: 'Stock in Transit' },
+  { key: 'xero_inventory_account', label: 'Inventory Asset' },
+  { key: 'xero_allocated_inventory_account', label: 'Allocated Inventory' },
+  { key: 'xero_cogs_account', label: 'Cost of Goods Sold' },
+  { key: 'xero_unearned_revenue_account', label: 'Unearned Revenue' },
+]
 
-  // Include posting mode in payload so the sync processor can set the correct Xero status
-  const payload = { ...params.payload, _postingMode: postingMode }
+export async function getXeroSyncReadiness(): Promise<XeroSyncReadiness> {
+  const [settings, connStatus, taxRates] = await Promise.all([
+    getXeroSettings(),
+    isConnected(),
+    db.taxRate.findMany({
+      where: { active: true },
+      select: { id: true, name: true, accountingTaxType: true },
+      orderBy: { name: 'asc' },
+    }),
+  ])
 
-  await db.xeroSyncLog.create({
-    data: {
-      type: params.type,
-      status: 'PENDING',
-      referenceType: params.referenceType,
-      referenceId: params.referenceId,
-      payload: payload as never,
-    },
-  })
+  const missingAccounts = REQUIRED_ACCOUNTS
+    .filter(a => !settings[a.key])
+    .map(a => ({ key: a.key as string, label: a.label }))
+
+  const missingTaxTypes = taxRates
+    .filter(r => !r.accountingTaxType)
+    .map(r => ({ id: r.id, name: r.name }))
+
+  return {
+    ready: connStatus.connected && missingAccounts.length === 0 && missingTaxTypes.length === 0,
+    notConnected: !connStatus.connected,
+    missingAccounts,
+    missingTaxTypes,
+  }
 }
 
 // ---------------------------------------------------------------------------
 // Payment account map helpers
 // ---------------------------------------------------------------------------
-
-/** Look up Xero bank account code for a payment method + currency combo */
-export async function lookupPaymentAccount(
-  mapJson: string,
-  paymentMethod: string,
-  currency: string,
-): Promise<string | null> {
-  try {
-    const map = JSON.parse(mapJson) as Record<string, string>
-    // Try exact match first: "stripe:GBP"
-    const exact = map[`${paymentMethod}:${currency}`]
-    if (exact) return exact
-    // Fall back to wildcard: "stripe:*"
-    const wildcard = map[`${paymentMethod}:*`]
-    if (wildcard) return wildcard
-    return null
-  } catch {
-    return null
-  }
-}
 
 /** Get distinct payment method + currency combos from existing orders (for UI pre-population) */
 export async function getPaymentMethodCombos(): Promise<Array<{ paymentMethod: string; currency: string }>> {

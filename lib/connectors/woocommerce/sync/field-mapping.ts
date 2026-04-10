@@ -162,30 +162,43 @@ export function mapWcShipping(order: WcFullOrder): {
 // Tax mapping
 // ---------------------------------------------------------------------------
 
-export async function resolveWcTaxRate(
-  taxClass: string,
-): Promise<{ taxRateId: string | null; taxRateName: string | null; taxRateValue: number; xeroTaxType: string | null }> {
-  const wcClass = taxClass || 'standard'
-  const mapping = await db.wcTaxMapping.findUnique({
-    where: { wcTaxClass: wcClass },
-    include: { taxRate: { select: { id: true, name: true, rate: true, xeroTaxType: true } } },
+type ResolvedTaxRate = {
+  taxRateId: string | null
+  taxRateName: string | null
+  taxRateValue: number
+  accountingTaxType: string | null
+}
+
+async function fallbackDefaultTaxRate(): Promise<ResolvedTaxRate> {
+  const defaultRate = await db.taxRate.findFirst({
+    where: { isDefault: true, active: true },
+    select: { id: true, name: true, rate: true, accountingTaxType: true },
   })
-  if (!mapping) {
-    // Fallback: use default tax rate
-    const defaultRate = await db.taxRate.findFirst({
-      where: { isDefault: true, active: true },
-      select: { id: true, name: true, rate: true, xeroTaxType: true },
-    })
-    if (defaultRate) {
-      return { taxRateId: defaultRate.id, taxRateName: defaultRate.name, taxRateValue: Number(defaultRate.rate), xeroTaxType: defaultRate.xeroTaxType }
+  if (defaultRate) {
+    return {
+      taxRateId: defaultRate.id,
+      taxRateName: defaultRate.name,
+      taxRateValue: Number(defaultRate.rate),
+      accountingTaxType: defaultRate.accountingTaxType,
     }
-    return { taxRateId: null, taxRateName: null, taxRateValue: 0, xeroTaxType: null }
   }
+  return { taxRateId: null, taxRateName: null, taxRateValue: 0, accountingTaxType: null }
+}
+
+export async function resolveWcTaxRateById(wcRateId: number | null | undefined): Promise<ResolvedTaxRate> {
+  if (!wcRateId || !Number.isFinite(wcRateId) || wcRateId <= 0) {
+    return fallbackDefaultTaxRate()
+  }
+  const mapping = await db.wcTaxRateMapping.findUnique({
+    where: { wcTaxRateId: wcRateId },
+    include: { taxRate: { select: { id: true, name: true, rate: true, accountingTaxType: true } } },
+  })
+  if (!mapping) return fallbackDefaultTaxRate()
   return {
     taxRateId: mapping.taxRate.id,
     taxRateName: mapping.taxRate.name,
     taxRateValue: Number(mapping.taxRate.rate),
-    xeroTaxType: mapping.taxRate.xeroTaxType,
+    accountingTaxType: mapping.taxRate.accountingTaxType,
   }
 }
 

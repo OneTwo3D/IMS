@@ -43,6 +43,7 @@ type Props = {
   warehouses: Warehouse[]
   currencies: CurrencyRow[]
   taxRates: TaxRateRow[]
+  accountingBillUrlTemplate: string
 }
 
 const STATUS_LABELS: Record<PoStatus, string> = {
@@ -1165,7 +1166,7 @@ function EditFreightCostsDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates }: Props) {
+export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, accountingBillUrlTemplate }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const po = initialPo
@@ -1680,14 +1681,14 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                           <FileText className="h-3 w-3" />PDF
                         </a>
                       )}
-                      {inv.xeroInvoiceId && (
+                      {inv.accountingInvoiceId && (
                         <a
-                          href={`https://go.xero.com/AccountsPayable/View.aspx?InvoiceID=${inv.xeroInvoiceId}`}
+                          href={accountingBillUrlTemplate.replace('{id}', inv.accountingInvoiceId)}
                           target="_blank"
                           rel="noopener noreferrer"
                           className="text-blue-600 hover:underline flex items-center gap-1"
                         >
-                          <ExternalLink className="h-3 w-3" />Xero
+                          <ExternalLink className="h-3 w-3" />Accounting
                         </a>
                       )}
                     </div>

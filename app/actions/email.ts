@@ -127,10 +127,10 @@ export async function sendInvoiceEmail(orderId: string): Promise<{ success: bool
 }
 
 // ---------------------------------------------------------------------------
-// Send Xero invoice PDF email (called from sync-processor after PDF download)
+// Send accounting invoice PDF email (called from sync-processor after PDF download)
 // ---------------------------------------------------------------------------
 
-export async function sendXeroInvoiceEmail(orderId: string): Promise<{ success: boolean; error?: string }> {
+export async function sendAccountingInvoiceEmail(orderId: string): Promise<{ success: boolean; error?: string }> {
   try {
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
@@ -150,7 +150,7 @@ export async function sendXeroInvoiceEmail(orderId: string): Promise<{ success: 
     if (!so.customerEmail) return { success: false, error: 'No customer email address' }
     if (!so.invoicePdfPath) return { success: false, error: 'No invoice PDF available' }
 
-    const { loadInvoicePdf } = await import('@/lib/connectors/xero/invoice-pdf')
+    const { loadInvoicePdf } = await import('@/lib/invoice-pdf')
     const pdfBuffer = await loadInvoicePdf(orderId)
     if (!pdfBuffer) return { success: false, error: 'Invoice PDF file not found on disk' }
 
@@ -180,8 +180,8 @@ export async function sendXeroInvoiceEmail(orderId: string): Promise<{ success: 
 
     if (result.success) {
       logActivity({
-        entityType: 'SALES_ORDER', entityId: orderId, action: 'xero_invoice_emailed', tag: 'sales', level: 'INFO',
-        description: `Emailed Xero invoice ${ref} to ${so.customerEmail}`,
+        entityType: 'SALES_ORDER', entityId: orderId, action: 'invoice_emailed', tag: 'sales', level: 'INFO',
+        description: `Emailed invoice ${ref} to ${so.customerEmail}`,
       })
     }
 

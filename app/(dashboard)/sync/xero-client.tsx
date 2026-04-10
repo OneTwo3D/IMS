@@ -2,7 +2,7 @@
 
 import { useState, useTransition, useEffect } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, XCircle, Clock, Plus, Trash2 } from 'lucide-react'
+import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, XCircle, Clock, Plus, Trash2, AlertTriangle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -11,7 +11,7 @@ import { Badge } from '@/components/ui/badge'
 import {
   saveXeroSettings, connectXero, disconnectXero,
   syncXeroAccounts, triggerXeroSync,
-  type XeroSettings, type XeroSyncLogRow,
+  type XeroSettings, type XeroSyncLogRow, type XeroSyncReadiness,
 } from '@/app/actions/xero-sync'
 
 type XeroAccount = { id: string; code: string | null; name: string; type: string }
@@ -25,6 +25,7 @@ type Props = {
   accounts: XeroAccount[]
   logs: XeroSyncLogRow[]
   paymentMethodCombos: Array<{ paymentMethod: string; currency: string }>
+  readiness: XeroSyncReadiness
 }
 
 const ACCOUNT_FIELDS: { key: keyof XeroSettings; label: string; description: string }[] = [
@@ -72,7 +73,7 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
   return JSON.stringify(map)
 }
 
-export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos }: Props) {
+export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos, readiness }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
@@ -136,6 +137,8 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
         xero_payment_polling_enabled: s.xero_payment_polling_enabled,
         xero_payment_account_map: serializePaymentMap(paymentMapRows),
         order_number_prefix: s.order_number_prefix,
+        wc_invoice_prefix: s.wc_invoice_prefix,
+        manual_invoice_prefix: s.manual_invoice_prefix,
       })
       setMsg(result.success ? 'Settings saved.' : `Error: ${result.error}`)
       router.refresh()
@@ -493,15 +496,37 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
           <h3 className="text-base font-semibold">Order Settings</h3>
           <p className="text-xs text-muted-foreground mt-0.5">Configure how order numbers are generated and displayed.</p>
         </div>
-        <div className="space-y-1.5 max-w-xs">
-          <Label htmlFor="order_number_prefix">Order Number Prefix</Label>
-          <Input
-            id="order_number_prefix"
-            value={s.order_number_prefix}
-            onChange={e => handleField('order_number_prefix', e.target.value)}
-            placeholder="e.g. OT-"
-          />
-          <p className="text-[11px] text-muted-foreground">Prefix added to WooCommerce order numbers in the IMS. Leave empty for no prefix.</p>
+        <div className="grid grid-cols-3 gap-4">
+          <div className="space-y-1.5">
+            <Label htmlFor="order_number_prefix">Order Number Prefix</Label>
+            <Input
+              id="order_number_prefix"
+              value={s.order_number_prefix}
+              onChange={e => handleField('order_number_prefix', e.target.value)}
+              placeholder="e.g. OT-"
+            />
+            <p className="text-[11px] text-muted-foreground">Prefix added to WooCommerce order numbers in the IMS. Leave empty for no prefix.</p>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="wc_invoice_prefix">WC Invoice Prefix</Label>
+            <Input
+              id="wc_invoice_prefix"
+              value={s.wc_invoice_prefix}
+              onChange={e => handleField('wc_invoice_prefix', e.target.value)}
+              placeholder="e.g. INWC-"
+            />
+            <p className="text-[11px] text-muted-foreground">Prefix for invoice numbers on WooCommerce orders (e.g. INWC-12345).</p>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="manual_invoice_prefix">Manual Invoice Prefix</Label>
+            <Input
+              id="manual_invoice_prefix"
+              value={s.manual_invoice_prefix}
+              onChange={e => handleField('manual_invoice_prefix', e.target.value)}
+              placeholder="e.g. INMA-"
+            />
+            <p className="text-[11px] text-muted-foreground">Prefix for invoice numbers on manually created orders (e.g. INMA-SO-001).</p>
+          </div>
         </div>
       </Card>
 
@@ -509,10 +534,40 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       <Card className="p-6 space-y-4">
         <h3 className="text-base font-semibold">Sync Settings</h3>
 
-        <label className="flex items-center gap-3 cursor-pointer">
+        {/* Readiness panel — only shown when not ready and sync is currently off */}
+        {!readiness.ready && s.xero_sync_enabled !== 'true' && (
+          <div className="rounded-md border border-amber-200 bg-amber-50 dark:border-amber-900/50 dark:bg-amber-950/30 p-3 space-y-2">
+            <div className="flex items-center gap-2 text-sm font-medium text-amber-900 dark:text-amber-200">
+              <AlertTriangle className="h-4 w-4" />
+              Xero sync cannot be enabled yet
+            </div>
+            <ul className="text-xs text-amber-800 dark:text-amber-300 space-y-1 ml-6 list-disc">
+              {readiness.notConnected && (
+                <li>Not connected to Xero — use the Connect button above.</li>
+              )}
+              {readiness.missingAccounts.length > 0 && (
+                <li>
+                  Missing account mapping: {readiness.missingAccounts.map(a => a.label).join(', ')}
+                </li>
+              )}
+              {readiness.missingTaxTypes.length > 0 && (
+                <li>
+                  IMS VAT rates without a Xero tax type:{' '}
+                  {readiness.missingTaxTypes.map(t => t.name).join(', ')}{' '}
+                  <a href="/settings/accounting" className="underline hover:text-amber-900 dark:hover:text-amber-100">
+                    (configure in Settings → Accounting)
+                  </a>
+                </li>
+              )}
+            </ul>
+          </div>
+        )}
+
+        <label className={`flex items-center gap-3 ${readiness.ready || s.xero_sync_enabled === 'true' ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'}`}>
           <input
             type="checkbox"
             checked={s.xero_sync_enabled === 'true'}
+            disabled={!readiness.ready && s.xero_sync_enabled !== 'true'}
             onChange={e => handleField('xero_sync_enabled', e.target.checked ? 'true' : 'false')}
             className="h-4 w-4 accent-primary"
           />

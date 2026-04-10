@@ -8,7 +8,7 @@ import { wcFetch } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems, mapWcOrderDiscount,
-  mapWcShipping, resolveWcTaxRate, extractWcTracking, getFxRateToGbp,
+  mapWcShipping, resolveWcTaxRateById, extractWcTracking, getFxRateToGbp,
 } from './field-mapping'
 
 // ---------------------------------------------------------------------------
@@ -35,9 +35,14 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
     const currency = wcOrder.currency || 'GBP'
     const fxRate = await getFxRateToGbp(currency)
 
-    // Tax
-    const primaryTaxClass = wcOrder.line_items[0]?.tax_class ?? 'standard'
-    const { taxRateName, taxRateValue, xeroTaxType } = await resolveWcTaxRate(primaryTaxClass)
+    // Tax — look up by the WC tax rate id referenced by the order.
+    // Orders include a tax_lines[] summary with rate_id (preferred); fall back
+    // to the first line item's taxes[0].id if no tax_lines are present.
+    const primaryWcRateId =
+      wcOrder.tax_lines?.[0]?.rate_id ??
+      wcOrder.line_items?.[0]?.taxes?.[0]?.id ??
+      null
+    const { taxRateName, taxRateValue, accountingTaxType } = await resolveWcTaxRateById(primaryWcRateId)
     const pricesIncludeVat = wcOrder.prices_include_tax
 
     // Line items
@@ -142,18 +147,21 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
     const { autoAllocateOrder } = await import('@/app/actions/allocation')
     await autoAllocateOrder(so.id)
 
-    // Queue Xero sales invoice (AUTHORISED — WC orders are pre-paid)
+    // Queue accounting sales invoice (AUTHORISED — WC orders are pre-paid)
     try {
-      const { queueXeroSync, getXeroSettings } = await import('@/app/actions/xero-sync')
-      const xeroSettings = await getXeroSettings()
+      const { queueAccountingSync, getAccountingSettings } = await import('@/lib/accounting')
+      const settings = await getAccountingSettings()
       const fxRateNum = Number(fxRate) || 1
       const discountGbp = Math.round((orderDiscount.discountAmount / fxRateNum) * 100) / 100
-      await queueXeroSync({
+      // Read configurable WC invoice prefix
+      const wcInvPrefixSetting = await db.setting.findUnique({ where: { key: 'wc_invoice_prefix' } })
+      const wcInvPrefix = wcInvPrefixSetting?.value ?? 'INWC-'
+      await queueAccountingSync({
         type: 'SALES_INVOICE',
         referenceType: 'SalesOrder',
         referenceId: so.id,
         payload: {
-          invoiceNumber: `WC-${wcOrder.number}`,
+          invoiceNumber: `${wcInvPrefix}${wcOrder.number}`,
           contactName: customerName,
           contactEmail: wcOrder.billing.email || undefined,
           date: new Date().toISOString().slice(0, 10),
@@ -164,21 +172,21 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
             description: l.description ?? l.sku ?? 'Item',
             quantity: l.qty,
             unitAmount: Math.round((l.unitPriceForeign / fxRateNum) * 10000) / 10000,
-            accountCode: xeroSettings.xero_sales_account,
-            taxType: xeroTaxType ?? undefined,
+            accountCode: settings.salesAccount,
+            taxType: accountingTaxType ?? undefined,
           })),
           shippingAmount: shippingForeign > 0 ? Math.round((shippingForeign / fxRateNum) * 10000) / 10000 : undefined,
           shippingDescription: 'Shipping',
-          shippingAccountCode: xeroSettings.xero_shipping_account || undefined,
+          shippingAccountCode: settings.shippingAccount || undefined,
           discountAmount: discountGbp > 0 ? discountGbp : undefined,
-          discountAccountCode: xeroSettings.xero_discount_account || undefined,
+          discountAccountCode: settings.discountAccount || undefined,
           _postingMode: 'submitted',
           _registerPayment: !!wcOrder.date_paid_gmt,
           _paymentMethod: wcOrder.payment_method || undefined,
           _paymentDate: wcOrder.date_paid_gmt || undefined,
         },
       })
-    } catch { /* Xero queue errors should never block import */ }
+    } catch { /* Accounting queue errors should never block import */ }
 
     // Log sync
     await db.wcSyncLog.create({

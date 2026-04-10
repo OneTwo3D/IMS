@@ -15,7 +15,8 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { getXeroSettings, queueXeroSync } from '@/app/actions/xero-sync'
+import { getXeroSettings } from '@/lib/connectors/xero/settings'
+import { queueXeroSync } from '@/lib/connectors/xero/queue'
 
 export async function runDailyBatchSync(): Promise<{
   groupA1: number
@@ -32,8 +33,8 @@ export async function runDailyBatchSync(): Promise<{
     const orders = await db.salesOrder.findMany({
       where: {
         paidAt: { not: null },
-        xeroRevenueDeferredDate: null,
-        xeroInvoiceId: { not: null },
+        revenueDeferredDate: null,
+        accountingInvoiceId: { not: null },
         status: { notIn: ['CANCELLED', 'REFUNDED', 'DRAFT'] },
       },
       select: {
@@ -59,8 +60,8 @@ export async function runDailyBatchSync(): Promise<{
         await db.salesOrder.update({
           where: { id: order.id },
           data: {
-            xeroRevenueDeferredDate: new Date(),
-            xeroUnearnedRevenueAmount: salesValue,
+            revenueDeferredDate: new Date(),
+            unearnedRevenueAmount: salesValue,
           },
         })
       }
@@ -95,8 +96,8 @@ export async function runDailyBatchSync(): Promise<{
   try {
     const orders = await db.salesOrder.findMany({
       where: {
-        xeroRevenueDeferredDate: { not: null },
-        xeroInventoryAllocatedDate: null,
+        revenueDeferredDate: { not: null },
+        inventoryAllocatedDate: null,
         status: { in: ['ALLOCATED', 'PICKING', 'PACKING'] },
       },
       select: {
@@ -145,8 +146,8 @@ export async function runDailyBatchSync(): Promise<{
         await db.salesOrder.update({
           where: { id: order.id },
           data: {
-            xeroInventoryAllocatedDate: new Date(),
-            xeroAllocationBatchAmount: orderCostValue,
+            inventoryAllocatedDate: new Date(),
+            allocationBatchAmount: orderCostValue,
           },
         })
       }
@@ -180,10 +181,10 @@ export async function runDailyBatchSync(): Promise<{
     const shipments = await db.shipment.findMany({
       where: {
         status: 'SHIPPED',
-        xeroShipmentJournalDate: null,
+        shipmentJournalDate: null,
         order: {
-          xeroRevenueDeferredDate: { not: null },
-          xeroInventoryAllocatedDate: { not: null },
+          revenueDeferredDate: { not: null },
+          inventoryAllocatedDate: { not: null },
         },
       },
       select: {
@@ -204,12 +205,12 @@ export async function runDailyBatchSync(): Promise<{
             orderNumber: true,
             wcOrderNumber: true,
             totalGbp: true,
-            xeroUnearnedRevenueAmount: true,
+            unearnedRevenueAmount: true,
             lines: { select: { totalGbp: true } },
             shipments: {
               select: {
                 id: true,
-                xeroRevenueRecognizedAmount: true,
+                revenueRecognizedAmount: true,
                 lines: { select: { line: { select: { totalGbp: true } } } },
               },
             },
@@ -228,7 +229,7 @@ export async function runDailyBatchSync(): Promise<{
         const shipmentLineValue = shipment.lines.reduce((s, l) => s + Number(l.line.totalGbp), 0)
         const orderLineTotal = shipment.order.lines.reduce((s, l) => s + Number(l.totalGbp), 0)
         const revenueProportion = orderLineTotal > 0
-          ? Math.round((shipmentLineValue / orderLineTotal) * Number(shipment.order.xeroUnearnedRevenueAmount ?? orderTotal) * 100) / 100
+          ? Math.round((shipmentLineValue / orderLineTotal) * Number(shipment.order.unearnedRevenueAmount ?? orderTotal) * 100) / 100
           : 0
 
         // COGS: consume FIFO cost layers and decrement remainingQty
@@ -266,9 +267,9 @@ export async function runDailyBatchSync(): Promise<{
         await db.shipment.update({
           where: { id: shipment.id },
           data: {
-            xeroShipmentJournalDate: new Date(),
-            xeroCogsBatchAmount: shipmentCogs,
-            xeroRevenueRecognizedAmount: revenueProportion,
+            shipmentJournalDate: new Date(),
+            cogsBatchAmount: shipmentCogs,
+            revenueRecognizedAmount: revenueProportion,
           },
         })
       }

@@ -4,14 +4,14 @@ import { useState } from 'react'
 import { Card } from '@/components/ui/card'
 import { SyncClient } from './sync-client'
 import { XeroClient } from './xero-client'
-import type { WcSyncSettings, TaxMappingRow, StatusMappingRow, SyncLogRow } from '@/app/actions/wc-sync'
-import type { XeroSettings, XeroSyncLogRow } from '@/app/actions/xero-sync'
+import type { WcSyncSettings, TaxRateMappingRow, StatusMappingRow, SyncLogRow } from '@/app/actions/wc-sync'
+import type { XeroSettings, XeroSyncLogRow, XeroSyncReadiness } from '@/app/actions/xero-sync'
 
 type XeroAccount = { id: string; code: string | null; name: string; type: string }
 
 type Props = {
   wcSettings: WcSyncSettings
-  wcTaxMappings: TaxMappingRow[]
+  wcTaxMappings: TaxRateMappingRow[]
   wcStatusMappings: StatusMappingRow[]
   wcLogs: SyncLogRow[]
   taxRates: { id: string; name: string }[]
@@ -22,6 +22,7 @@ type Props = {
   xeroAccounts: XeroAccount[]
   xeroLogs: XeroSyncLogRow[]
   paymentMethodCombos: Array<{ paymentMethod: string; currency: string }>
+  xeroReadiness: XeroSyncReadiness
 }
 
 type ConnectorDef = {
@@ -91,7 +92,7 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 
-export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcLogs, taxRates, wcCredentials, xeroSettings, xeroConnected, xeroTenantName, xeroAccounts, xeroLogs, paymentMethodCombos }: Props) {
+export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcLogs, taxRates, wcCredentials, xeroSettings, xeroConnected, xeroTenantName, xeroAccounts, xeroLogs, paymentMethodCombos, xeroReadiness }: Props) {
   const [activeConnector, setActiveConnector] = useState<string | null>(null)
 
   const wcConnected = !!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secret
@@ -191,6 +192,7 @@ export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcL
           accounts={xeroAccounts}
           logs={xeroLogs}
           paymentMethodCombos={paymentMethodCombos}
+          readiness={xeroReadiness}
         />
       </div>
     )

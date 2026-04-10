@@ -18,7 +18,7 @@ type Props = { reasons: AdjustmentReason[] }
 // Shared reason form fields (controlled)
 // ---------------------------------------------------------------------------
 
-type FieldState = { name: string; xeroAccountCode: string; sortOrder: number; active: boolean }
+type FieldState = { name: string; accountCode: string; sortOrder: number; active: boolean }
 
 function ReasonFields({
   fields,
@@ -46,10 +46,10 @@ function ReasonFields({
         {error && <p className="text-xs text-destructive">{error}</p>}
       </div>
       <div className="space-y-1 w-36">
-        <Label className="text-xs">Xero Account Code</Label>
+        <Label className="text-xs">Account Code</Label>
         <Input
-          value={fields.xeroAccountCode}
-          onChange={(e) => set('xeroAccountCode', e.target.value)}
+          value={fields.accountCode}
+          onChange={(e) => set('accountCode', e.target.value)}
           placeholder="e.g. 310"
           className="h-7 text-xs"
         />
@@ -93,7 +93,7 @@ function EditForm({
 }) {
   const [fields, setFields] = useState<FieldState>({
     name: reason.name,
-    xeroAccountCode: reason.xeroAccountCode ?? '',
+    accountCode: reason.accountCode ?? '',
     sortOrder: reason.sortOrder,
     active: reason.active,
   })
@@ -174,7 +174,7 @@ function ReasonRow({
     <tr className="border-b border-border last:border-0">
       <td className="py-2 pr-4 text-sm">{reason.name}</td>
       <td className="py-2 pr-4 text-sm font-mono text-muted-foreground">
-        {reason.xeroAccountCode ?? <span className="text-muted-foreground/50">—</span>}
+        {reason.accountCode ?? <span className="text-muted-foreground/50">—</span>}
       </td>
       <td className="py-2 pr-4 text-sm text-center">{reason.sortOrder}</td>
       <td className="py-2 pr-4 text-sm text-center">
@@ -201,7 +201,7 @@ function ReasonRow({
 // Add row
 // ---------------------------------------------------------------------------
 
-const emptyFields: FieldState = { name: '', xeroAccountCode: '', sortOrder: 0, active: true }
+const emptyFields: FieldState = { name: '', accountCode: '', sortOrder: 0, active: true }
 
 function AddReasonRow({ onAdded }: { onAdded: (item: AdjustmentReason) => void }) {
   const [open, setOpen] = useState(false)
@@ -273,7 +273,7 @@ export function AdjustmentReasonsTable({ reasons: initial }: Props) {
       <thead>
         <tr className="border-b border-border text-xs text-muted-foreground">
           <th className="pb-2 text-left font-medium">Reason Name</th>
-          <th className="pb-2 text-left font-medium">Xero Account Code</th>
+          <th className="pb-2 text-left font-medium">Account Code</th>
           <th className="pb-2 text-center font-medium w-24">Sort</th>
           <th className="pb-2 text-center font-medium w-20">Active</th>
           <th className="pb-2 w-20" />

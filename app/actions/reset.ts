@@ -44,7 +44,7 @@ export async function resetDatabase(level: ResetLevel): Promise<{ success: boole
 
       // Sync logs
       await db.wcSyncLog.deleteMany({})
-      await db.xeroSyncLog.deleteMany({})
+      await db.accountingSyncLog.deleteMany({})
       await db.activityLog.deleteMany({})
     }
 

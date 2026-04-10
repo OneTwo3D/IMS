@@ -7,6 +7,7 @@ import { getWarehouses, getStockLevelMap } from '@/app/actions/stock'
 import { getCurrencies } from '@/app/actions/currencies'
 import { getSetting } from '@/app/actions/settings'
 import { getOrderAllocations, getOrderShipments } from '@/app/actions/allocation'
+import { getAccountingSettings } from '@/lib/accounting'
 import { SoDetailClient } from './so-detail-client'
 
 export const metadata: Metadata = { title: 'Sales Order' }
@@ -15,7 +16,7 @@ type Props = { params: Promise<{ id: string }> }
 
 export default async function SalesOrderDetailPage({ params }: Props) {
   const { id } = await params
-  const [so, warehouses, currencies, wcUrl, stockLevels, allocations, shipments, carriersJson, deliveryTrackingEnabled] = await Promise.all([
+  const [so, warehouses, currencies, wcUrl, stockLevels, allocations, shipments, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings] = await Promise.all([
     getSalesOrder(id),
     getWarehouses(),
     getCurrencies(true),
@@ -25,6 +26,8 @@ export default async function SalesOrderDetailPage({ params }: Props) {
     getOrderShipments(id),
     getSetting('shipping_carriers'),
     getSetting('delivery_tracking_enabled'),
+    getSetting('accounting_invoice_url_template'),
+    getAccountingSettings(),
   ])
   const DEFAULT_CARRIERS = ['Royal Mail', 'DPD', 'DHL', 'DHL Express', 'FedEx', 'UPS', 'Hermes / Evri', 'Yodel', 'Amazon Logistics', 'ParcelForce', 'TNT', 'GLS', 'Collect+']
   let carriers: string[] = DEFAULT_CARRIERS
@@ -50,6 +53,8 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         initialShipments={shipments}
         carriers={carriers}
         deliveryTrackingEnabled={deliveryTrackingEnabled === 'true'}
+        accountingInvoiceUrlTemplate={invoiceUrlTemplate ?? 'https://go.xero.com/AccountsReceivable/View.aspx?InvoiceID={id}'}
+        accountingSyncEnabled={accountingSettings.syncEnabled}
       />
     </div>
   )

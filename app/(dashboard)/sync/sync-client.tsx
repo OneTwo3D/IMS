@@ -2,20 +2,20 @@
 
 import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { Loader2, RefreshCw, Check, AlertTriangle, ArrowDownToLine, ArrowUpFromLine, Plus, Trash2 } from 'lucide-react'
+import { Loader2, RefreshCw, Check, AlertTriangle, ArrowDownToLine, ArrowUpFromLine, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card } from '@/components/ui/card'
 import {
-  saveWcSyncSettings, saveWcCredentials, upsertWcTaxMapping, deleteWcTaxMapping, upsertWcStatusMapping,
-  triggerManualSync,
-  type WcSyncSettings, type TaxMappingRow, type StatusMappingRow, type SyncLogRow,
+  saveWcSyncSettings, saveWcCredentials, updateWcTaxRateMapping, deleteWcTaxRateMapping, upsertWcStatusMapping,
+  triggerManualSync, importWcTaxRatesFromApi,
+  type WcSyncSettings, type TaxRateMappingRow, type StatusMappingRow, type SyncLogRow,
 } from '@/app/actions/wc-sync'
 
 type Props = {
   settings: WcSyncSettings
-  taxMappings: TaxMappingRow[]
+  taxMappings: TaxRateMappingRow[]
   statusMappings: StatusMappingRow[]
   logs: SyncLogRow[]
   taxRates: { id: string; name: string }[]
@@ -36,8 +36,8 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   const [saved, setSaved] = useState(false)
   const [syncResult, setSyncResult] = useState<string | null>(null)
   const [syncingType, setSyncingType] = useState<'orders' | 'products' | 'stock' | null>(null)
-  const [newTaxClass, setNewTaxClass] = useState('')
-  const [newTaxRateId, setNewTaxRateId] = useState('')
+  const [importingTax, setImportingTax] = useState(false)
+  const [taxImportMsg, setTaxImportMsg] = useState<string | null>(null)
   const [wcUrl, setWcUrl] = useState(wcCredentials.url)
   const [wcKey, setWcKey] = useState(wcCredentials.key)
   const [wcSecret, setWcSecret] = useState(wcCredentials.secret)
@@ -69,21 +69,45 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
     })
   }
 
-  function handleAddTaxMapping() {
-    if (!newTaxClass.trim() || !newTaxRateId) return
+  function handleChangeTaxMapping(wcTaxRateId: number, taxRateId: string) {
+    if (!taxRateId) return
     startTransition(async () => {
-      await upsertWcTaxMapping(newTaxClass.trim(), newTaxRateId)
-      setNewTaxClass('')
-      setNewTaxRateId('')
+      await updateWcTaxRateMapping(wcTaxRateId, taxRateId)
       router.refresh()
     })
   }
 
   function handleDeleteTaxMapping(id: string) {
     startTransition(async () => {
-      await deleteWcTaxMapping(id)
+      await deleteWcTaxRateMapping(id)
       router.refresh()
     })
+  }
+
+  async function handleImportTaxRates() {
+    setTaxImportMsg(null)
+    setImportingTax(true)
+    const result = await importWcTaxRatesFromApi()
+    setImportingTax(false)
+    if (result.success) {
+      const imported = result.importedRates ?? 0
+      const reused = result.reusedRates ?? 0
+      const mapped = result.mappedRates ?? 0
+      const parts: string[] = []
+      if (imported > 0) {
+        parts.push(`${imported} new IMS rate(s) created`)
+        if (reused > 0) parts.push(`${reused} reused existing`)
+      } else if (reused > 0) {
+        parts.push(`${reused} IMS rate(s) already existed — no new rates created`)
+      } else {
+        parts.push('No tax rates found in WooCommerce')
+      }
+      parts.push(`${mapped} WC rate(s) mapped`)
+      setTaxImportMsg(parts.join(' · '))
+      router.refresh()
+    } else {
+      setTaxImportMsg(`Import failed: ${result.error}`)
+    }
   }
 
   function handleStatusMappingChange(wcStatus: string, imsStatus: string) {
@@ -229,24 +253,50 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
         )}
       </Card>
 
-      {/* Tax Mapping */}
+      {/* Tax Rate Mapping */}
       <Card className="p-6 space-y-4">
-        <h2 className="text-base font-semibold">Tax Class Mapping</h2>
-        <p className="text-xs text-muted-foreground">Map WooCommerce tax classes to IMS tax rates for correct VAT calculation on imported orders.</p>
+        <div className="flex items-start justify-between gap-2">
+          <div>
+            <h2 className="text-base font-semibold">Tax Rate Mapping</h2>
+            <p className="text-xs text-muted-foreground">Each WooCommerce tax rate is linked to an IMS VAT rate. Importing from WooCommerce auto-creates any missing IMS rates with matching names.</p>
+          </div>
+          <Button variant="outline" size="sm" className="h-8 shrink-0" onClick={handleImportTaxRates} disabled={importingTax || !wcConfigured}>
+            {importingTax ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowDownToLine className="h-3 w-3 mr-1" />}
+            Import from WooCommerce
+          </Button>
+        </div>
+        {taxImportMsg && (
+          <p className="text-xs text-muted-foreground">{taxImportMsg}</p>
+        )}
 
-        {taxMappings.length > 0 && (
+        {taxMappings.length > 0 ? (
           <div className="rounded-md border overflow-hidden">
             <table className="w-full text-sm">
               <thead className="bg-muted/50 border-b"><tr>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">WC Tax Class</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">IMS Tax Rate</th>
+                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">WC Rate</th>
+                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Country</th>
+                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Rate</th>
+                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Class</th>
+                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">→ IMS Tax Rate</th>
                 <th className="px-3 py-2 w-10" />
               </tr></thead>
               <tbody className="divide-y">
                 {taxMappings.map((m) => (
                   <tr key={m.id}>
-                    <td className="px-3 py-2 font-mono text-xs">{m.wcTaxClass}</td>
-                    <td className="px-3 py-2">{m.taxRateName}</td>
+                    <td className="px-3 py-2">{m.wcName} <span className="text-muted-foreground text-xs">#{m.wcTaxRateId}</span></td>
+                    <td className="px-3 py-2 font-mono text-xs text-muted-foreground">{m.wcCountry ?? '—'}</td>
+                    <td className="px-3 py-2 text-right font-mono text-xs">{m.wcRatePct.toFixed(2)}%</td>
+                    <td className="px-3 py-2 font-mono text-xs text-muted-foreground">{m.wcClass ?? 'standard'}</td>
+                    <td className="px-3 py-2">
+                      <select
+                        value={m.taxRateId}
+                        onChange={(e) => handleChangeTaxMapping(m.wcTaxRateId, e.target.value)}
+                        className="h-7 rounded-md border border-input bg-background px-2 text-xs w-full max-w-xs"
+                        disabled={isPending}
+                      >
+                        {taxRates.map((r) => (<option key={r.id} value={r.id}>{r.name}</option>))}
+                      </select>
+                    </td>
                     <td className="px-3 py-2">
                       <button type="button" onClick={() => handleDeleteTaxMapping(m.id)} className="text-muted-foreground hover:text-destructive">
                         <Trash2 className="h-3.5 w-3.5" />
@@ -257,18 +307,11 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
               </tbody>
             </table>
           </div>
+        ) : (
+          <p className="text-xs text-muted-foreground italic">
+            No tax rates imported yet. Click &quot;Import from WooCommerce&quot; to fetch and auto-map all WC tax rates.
+          </p>
         )}
-
-        <div className="flex items-center gap-2">
-          <Input value={newTaxClass} onChange={(e) => setNewTaxClass(e.target.value)} placeholder="WC tax class (e.g. standard)" className="h-8 text-sm w-44" />
-          <select value={newTaxRateId} onChange={(e) => setNewTaxRateId(e.target.value)} className="h-8 rounded-md border border-input bg-background px-2 text-sm">
-            <option value="">IMS Tax Rate…</option>
-            {taxRates.map((r) => (<option key={r.id} value={r.id}>{r.name}</option>))}
-          </select>
-          <Button variant="outline" size="sm" className="h-8" onClick={handleAddTaxMapping} disabled={isPending || !newTaxClass || !newTaxRateId}>
-            <Plus className="h-3 w-3 mr-1" />Add
-          </Button>
-        </div>
       </Card>
 
       {/* Status Mapping */}
