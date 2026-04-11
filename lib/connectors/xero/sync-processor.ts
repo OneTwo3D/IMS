@@ -133,8 +133,11 @@ async function processEntry(
         shippingAmount: payload.shippingAmount as number | undefined,
         shippingDescription: payload.shippingDescription as string | undefined,
         shippingAccountCode: payload.shippingAccountCode as string | undefined,
+        shippingTaxType: payload.shippingTaxType as string | undefined,
         discountAmount: payload.discountAmount as number | undefined,
         discountAccountCode: payload.discountAccountCode as string | undefined,
+        discountTaxType: payload.discountTaxType as string | undefined,
+        lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
       }, resolveInvoiceStatus(postingMode))
 
@@ -202,16 +205,71 @@ async function processEntry(
         try {
           const attachEnabled = await db.setting.findUnique({ where: { key: 'xero_sync_attach_pdf' } })
           if (attachEnabled?.value !== 'false') {
-            const pdfPath = join(process.cwd(), 'public', payload.supplierInvoicePath as string)
+            // supplierInvoicePath is `/uploads/invoices/<filename>` — files live at
+            // `{cwd}/uploads/invoices/<filename>` (not under `public/`).
+            const relPath = (payload.supplierInvoicePath as string).replace(/^\/+/, '')
+            const pdfPath = join(process.cwd(), relPath)
             const pdfBuffer = await readFile(pdfPath)
-            const filename = (payload.supplierInvoicePath as string).split('/').pop() ?? 'supplier-invoice.pdf'
-            await xeroUploadAttachment('Invoices', billResult.invoiceId, filename, pdfBuffer, 'application/pdf')
+            const filename = relPath.split('/').pop() ?? 'supplier-invoice.pdf'
+            const uploadRes = await xeroUploadAttachment('Invoices', billResult.invoiceId, filename, pdfBuffer, 'application/pdf')
+            if (!uploadRes.ok) {
+              logActivity({
+                entityType: 'SYSTEM',
+                action: 'xero_attachment_failed',
+                tag: 'sync',
+                level: 'WARNING',
+                description: `Failed to attach supplier invoice PDF to Xero bill ${billResult.invoiceId}: ${uploadRes.error ?? 'unknown error'}`,
+              })
+            }
           }
-        } catch {
+        } catch (e) {
           // Attachment failure is non-critical — bill was already created
+          logActivity({
+            entityType: 'SYSTEM',
+            action: 'xero_attachment_failed',
+            tag: 'sync',
+            level: 'WARNING',
+            description: `Failed to attach supplier invoice PDF to Xero bill ${billResult.invoiceId}: ${String(e)}`,
+          })
         }
       }
       return { success: billResult.success, externalId: billResult.invoiceId, error: billResult.error }
+    }
+
+    case 'BILL_PAYMENT': {
+      // Register a payment in Xero against an existing bill (purchase
+      // invoice). The bill must already have an accountingInvoiceId set.
+      const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
+      const bankAccountId = payload.bankAccountId as string | undefined
+      const amount = payload.amount as number | undefined
+      const paymentDate = (payload.paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
+      if (!accountingInvoiceId || !bankAccountId || amount == null) {
+        return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for BILL_PAYMENT' }
+      }
+      // Resolve bank account — accept either Xero AccountID (preferred) or a legacy account code.
+      const account = await db.xeroAccount.findFirst({
+        where: { OR: [{ xeroId: bankAccountId }, { code: bankAccountId }] },
+        select: { xeroId: true },
+      })
+      if (!account) {
+        return { success: false, error: `Bank account ${bankAccountId} not found in synced Xero chart of accounts` }
+      }
+      try {
+        const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
+          Invoice: { InvoiceID: accountingInvoiceId },
+          Account: { AccountID: account.xeroId },
+          Date: paymentDate,
+          Amount: amount,
+          Reference: (payload.reference as string | undefined) ?? undefined,
+        })
+        if (!paymentRes.ok) {
+          return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
+        }
+        const paymentId = paymentRes.data?.Payments?.[0]?.PaymentID
+        return { success: true, externalId: paymentId }
+      } catch (e) {
+        return { success: false, error: String(e) }
+      }
     }
 
     case 'CREDIT_NOTE':

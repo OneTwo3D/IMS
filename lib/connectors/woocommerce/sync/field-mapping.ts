@@ -86,6 +86,12 @@ export type MappedLine = {
   discountStr: string | null
   wcLineItemId: number
   taxForeign: number
+  /**
+   * WC's own tax rate id for this line (from `line_items[].taxes[0].id`).
+   * Null when the WC payload doesn't include a per-line tax entry — in that
+   * case the IMS resolver is used as a fallback.
+   */
+  wcTaxRateId: number | null
 }
 
 export async function mapWcLineItems(
@@ -106,6 +112,7 @@ export async function mapWcLineItems(
     const unitPrice = qty > 0 ? subtotal / qty : 0
     const lineDiscount = Math.max(0, subtotal - total)
     const tax = parseFloat(item.total_tax) || 0
+    const wcTaxRateId = item.taxes?.[0]?.id ?? null
 
     return {
       productId: item.sku ? (skuMap.get(item.sku.toUpperCase()) ?? null) : null,
@@ -117,6 +124,7 @@ export async function mapWcLineItems(
       discountStr: lineDiscount > 0 ? lineDiscount.toFixed(2) : null,
       wcLineItemId: item.id,
       taxForeign: Math.round(tax * 10000) / 10000,
+      wcTaxRateId: typeof wcTaxRateId === 'number' && wcTaxRateId > 0 ? wcTaxRateId : null,
     }
   })
 }

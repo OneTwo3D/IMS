@@ -6,6 +6,7 @@ import { SyncClient } from './sync-client'
 import { XeroClient } from './xero-client'
 import type { WcSyncSettings, TaxRateMappingRow, StatusMappingRow, SyncLogRow } from '@/app/actions/wc-sync'
 import type { XeroSettings, XeroSyncLogRow, XeroSyncReadiness } from '@/app/actions/xero-sync'
+import type { TaxRateRow } from '@/app/actions/settings'
 
 type XeroAccount = { id: string; xeroId: string; code: string | null; name: string; type: string }
 
@@ -15,6 +16,10 @@ type Props = {
   wcStatusMappings: StatusMappingRow[]
   wcLogs: SyncLogRow[]
   taxRates: { id: string; name: string }[]
+  /** Full IMS VAT rate rows (used by the Xero tax code mapping UI). */
+  imsTaxRates: TaxRateRow[]
+  /** Live Xero tax rates (fetched on page load when connected). */
+  xeroTaxRates: Array<{ taxType: string; name: string; rate: number }>
   wcCredentials: { url: string; key: string; secret: string; secretMasked: boolean }
   xeroSettings: XeroSettings & { secretMasked: boolean }
   xeroConnected: boolean
@@ -96,7 +101,7 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 
-export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcLogs, taxRates, wcCredentials, xeroSettings, xeroConnected, xeroTenantName, xeroAccounts, xeroLogs, paymentMethodCombos, paymentAccountMap, currencies, wcPaymentGateways, xeroReadiness }: Props) {
+export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcLogs, taxRates, imsTaxRates, xeroTaxRates, wcCredentials, xeroSettings, xeroConnected, xeroTenantName, xeroAccounts, xeroLogs, paymentMethodCombos, paymentAccountMap, currencies, wcPaymentGateways, xeroReadiness }: Props) {
   const [activeConnector, setActiveConnector] = useState<string | null>(null)
 
   const wcConnected = !!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secret
@@ -199,6 +204,8 @@ export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcL
           paymentAccountMap={paymentAccountMap}
           currencies={currencies}
           wcPaymentGateways={wcPaymentGateways}
+          imsTaxRates={imsTaxRates}
+          xeroTaxRates={xeroTaxRates}
           readiness={xeroReadiness}
         />
       </div>

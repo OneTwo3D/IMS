@@ -18,6 +18,7 @@ import { createFreightPo } from '@/app/actions/purchase-orders'
 import type { SupplierRow } from '@/app/actions/suppliers'
 import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow } from '@/app/actions/settings'
+import { formatMoney } from '@/lib/utils'
 
 type GoodsPo = { id: string; reference: string; supplierName: string; totalForeign: number; currency: string }
 
@@ -58,8 +59,14 @@ export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onC
   const vatRate = selectedTaxRate?.rate ?? 0
 
   const symbolMap: Record<string, string> = { GBP: '£' }
-  for (const c of currencies) symbolMap[c.code] = c.symbol
+  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { GBP: 'PREFIX' }
+  for (const c of currencies) {
+    symbolMap[c.code] = c.symbol
+    positionMap[c.code] = c.symbolPosition
+  }
   const sym = symbolMap[currency] ?? currency
+  const symPos = positionMap[currency] ?? 'PREFIX'
+  const money = (n: number) => formatMoney(n, sym, symPos)
 
   const rateMap: Record<string, number> = { GBP: 1 }
   for (const c of currencies) if (c.latestRate != null) rateMap[c.code] = c.latestRate
@@ -279,20 +286,20 @@ export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onC
                 <div className="text-sm space-y-1 min-w-56">
                   <div className="flex justify-between text-muted-foreground">
                     <span>Subtotal</span>
-                    <span className="font-mono">{subtotal.toFixed(2)}{sym}</span>
+                    <span className="font-mono">{money(subtotal)}</span>
                   </div>
                   {vatTotal > 0 && (
                     <div className="flex justify-between text-muted-foreground">
                       <span>VAT ({(vatRate * 100).toFixed(0)}%)</span>
-                      <span className="font-mono">{vatTotal.toFixed(2)}{sym}</span>
+                      <span className="font-mono">{money(vatTotal)}</span>
                     </div>
                   )}
                   <div className="flex justify-between font-medium border-t pt-1">
                     <span>Total</span>
                     <span className="font-mono">
-                      {grandTotal.toFixed(2)}{sym}
+                      {money(grandTotal)}
                       {currency !== 'GBP' && (
-                        <span className="text-muted-foreground font-normal ml-2">(£{(grandTotal / fxRate).toFixed(2)})</span>
+                        <span className="text-muted-foreground font-normal ml-2">({formatMoney(grandTotal / fxRate, '£', 'PREFIX')})</span>
                       )}
                     </span>
                   </div>

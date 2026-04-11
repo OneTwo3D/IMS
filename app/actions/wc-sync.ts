@@ -3,12 +3,11 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { auth } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth/server'
 
+// All mutating exports in this file require the `sync` permission.
 async function requireAdmin() {
-  const session = await auth()
-  if (!session?.user?.id || !['ADMIN', 'MANAGER'].includes(session.user.role)) throw new Error('Unauthorized')
-  return session
+  return requirePermission('sync')
 }
 
 // ---------------------------------------------------------------------------

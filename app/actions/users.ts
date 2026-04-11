@@ -4,7 +4,10 @@ import { revalidatePath } from 'next/cache'
 import { hash } from 'bcryptjs'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { auth } from '@/lib/auth'
+import { requireAdmin, requirePermission } from '@/lib/auth/server'
+
+const VALID_ROLES = ['ADMIN', 'MANAGER', 'WAREHOUSE', 'FINANCE', 'READONLY', 'SUPPLIER'] as const
+type ValidRole = typeof VALID_ROLES[number]
 
 export type UserRow = {
   id: string
@@ -20,8 +23,11 @@ export type UserRow = {
 }
 
 export async function getUsers(): Promise<UserRow[]> {
-  const session = await auth()
-  if (!session?.user || session.user.role !== 'ADMIN') return []
+  try {
+    await requireAdmin()
+  } catch {
+    return []
+  }
 
   const users = await db.user.findMany({
     select: {
@@ -54,14 +60,13 @@ export async function createUser(data: {
   supplierId?: string
 }): Promise<{ success: boolean; error?: string }> {
   try {
-    const session = await auth()
-    if (!session?.user || session.user.role !== 'ADMIN') return { success: false, error: 'Unauthorized' }
+    await requireAdmin()
+    await requirePermission('settings.users')
 
     if (!data.name?.trim()) return { success: false, error: 'Name is required' }
     if (!data.email?.trim()) return { success: false, error: 'Email is required' }
     if (!data.password || data.password.length < 8) return { success: false, error: 'Password must be at least 8 characters' }
-    const VALID_ROLES = ['ADMIN', 'MANAGER', 'WAREHOUSE', 'FINANCE', 'READONLY', 'SUPPLIER']
-    if (!VALID_ROLES.includes(data.role)) return { success: false, error: 'Invalid role' }
+    if (!VALID_ROLES.includes(data.role as ValidRole)) return { success: false, error: 'Invalid role' }
 
     const existing = await db.user.findUnique({ where: { email: data.email.trim().toLowerCase() } })
     if (existing) return { success: false, error: 'Email already in use' }
@@ -93,8 +98,40 @@ export async function updateUser(
   data: { name?: string; email?: string; role?: string; supplierId?: string | null; active?: boolean; password?: string },
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    const session = await auth()
-    if (!session?.user || session.user.role !== 'ADMIN') return { success: false, error: 'Unauthorized' }
+    const session = await requireAdmin()
+    await requirePermission('settings.users')
+
+    const target = await db.user.findUnique({
+      where: { id: userId },
+      select: { id: true, role: true, active: true },
+    })
+    if (!target) return { success: false, error: 'User not found' }
+
+    // Validate role if changing
+    if (data.role !== undefined && !VALID_ROLES.includes(data.role as ValidRole)) {
+      return { success: false, error: 'Invalid role' }
+    }
+
+    // Prevent lockout: you can't demote yourself out of ADMIN
+    if (userId === session.user.id && data.role !== undefined && data.role !== 'ADMIN') {
+      return { success: false, error: 'You cannot change your own role away from ADMIN' }
+    }
+    // Prevent lockout: you can't deactivate yourself
+    if (userId === session.user.id && data.active === false) {
+      return { success: false, error: 'You cannot deactivate your own account' }
+    }
+
+    // Prevent demoting the last active ADMIN
+    const demotingAdmin =
+      target.role === 'ADMIN' && data.role !== undefined && data.role !== 'ADMIN'
+    const deactivatingAdmin =
+      target.role === 'ADMIN' && data.active === false
+    if (demotingAdmin || deactivatingAdmin) {
+      const adminCount = await db.user.count({ where: { role: 'ADMIN', active: true } })
+      if (adminCount <= 1) {
+        return { success: false, error: 'At least one active ADMIN must remain' }
+      }
+    }
 
     const updateData: Record<string, unknown> = {}
     if (data.name !== undefined) updateData.name = data.name.trim()

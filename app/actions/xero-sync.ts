@@ -1,5 +1,7 @@
 'use server'
 
+import { requirePermission } from '@/lib/auth/server'
+
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -13,9 +15,7 @@ import { getXeroSettings, XERO_SETTING_KEYS, type XeroSettings } from '@/lib/con
 export type { XeroSettings } from '@/lib/connectors/xero/settings'
 
 async function requireAdmin() {
-  const session = await auth()
-  if (!session?.user?.id || !['ADMIN', 'MANAGER'].includes(session.user.role)) throw new Error('Unauthorized')
-  return session
+  return requirePermission('sync')
 }
 
 // ---------------------------------------------------------------------------

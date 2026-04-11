@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth } from '@/lib/auth/server'
+import { requireAuth, requirePermission } from '@/lib/auth/server'
 import type { ProductionOrderStatus, ProductionOrderType } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -271,7 +271,7 @@ type CreateInput = {
 
 export async function createManufacturingOrder(input: CreateInput): Promise<{ success: boolean; error?: string; id?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('manufacturing')
     // Validate product has BOM components
     const product = await db.product.findUnique({
       where: { id: input.productId },
@@ -356,7 +356,7 @@ export async function updateManufacturingOrderStatus(
   status: ProductionOrderStatus,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('manufacturing')
     const order = await db.productionOrder.findUnique({
       where: { id },
       select: {

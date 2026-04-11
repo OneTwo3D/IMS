@@ -3,8 +3,10 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth } from '@/lib/auth/server'
+import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
+import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
+import type { TaxCategory } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -32,6 +34,12 @@ export type SoLineRow = {
   totalForeign: number
   totalGbp: number
   cogsGbp: number | null
+  /** Per-line tax rate id (resolved from product category + destination). */
+  taxRateId: string | null
+  /** Per-line effective rate percentage (0..1). Falls back to null if no per-line rate. */
+  taxRatePercent: number | null
+  /** Short label for the rate (e.g. "REDUCED 5%"). Null when no per-line rate. */
+  taxRateName: string | null
 }
 
 export type SoRow = {
@@ -50,6 +58,7 @@ export type SoRow = {
   taxRateName: string | null
   taxRatePercent: number | null
   taxForeign: number
+  pricesIncludeVat: boolean
   totalForeign: number
   totalGbp: number
   shipFromWarehouseId: string | null
@@ -99,6 +108,12 @@ export type SoLineInput = {
   description: string
   qty: number
   unitPriceForeign: number
+  /**
+   * Optional manual override of the tax rate for this line. When null/omitted
+   * the server resolves a rate from the product's tax category + destination
+   * country. When set, this rate is used verbatim.
+   */
+  taxRateId?: string | null
 }
 
 export type CreateSoInput = {
@@ -123,6 +138,12 @@ export type CreateSoInput = {
   orderDiscountForeign?: number
   orderDiscountStr?: string
   lines: (SoLineInput & { discountStr?: string; discountAmount?: number })[]
+  /**
+   * When true, the order is saved as a DRAFT and is NOT queued for accounting
+   * sync. Drafts remain editable until finalised (moved to PENDING_PAYMENT,
+   * PROCESSING, etc.) at which point the accounting invoice is queued.
+   */
+  isDraft?: boolean
 }
 
 // ---------------------------------------------------------------------------
@@ -152,6 +173,7 @@ const SO_SELECT = {
   taxRateName: true,
   taxRatePercent: true,
   taxForeign: true,
+  pricesIncludeVat: true,
   totalForeign: true,
   totalGbp: true,
   shipFromWarehouseId: true,
@@ -188,6 +210,7 @@ function mapSoRow(so: {
   taxRateName: string | null
   taxRatePercent: unknown
   taxForeign: unknown
+  pricesIncludeVat: boolean
   totalForeign: unknown
   totalGbp: unknown
   shipFromWarehouseId: string | null
@@ -223,6 +246,7 @@ function mapSoRow(so: {
     taxRateName: so.taxRateName,
     taxRatePercent: so.taxRatePercent != null ? Number(so.taxRatePercent) : null,
     taxForeign: Number(so.taxForeign),
+    pricesIncludeVat: !!so.pricesIncludeVat,
     totalForeign: Number(so.totalForeign),
     totalGbp: Number(so.totalGbp),
     shipFromWarehouseId: so.shipFromWarehouseId,
@@ -259,6 +283,8 @@ function mapLine(l: {
   totalForeign: unknown
   totalGbp: unknown
   cogsGbp: unknown
+  taxRateId?: string | null
+  taxRate?: { id: string; name: string; rate: unknown; taxCategory?: string } | null
   product?: { imageUrl: string | null } | null
 }): SoLineRow {
   return {
@@ -277,6 +303,9 @@ function mapLine(l: {
     totalForeign: Number(l.totalForeign),
     totalGbp: Number(l.totalGbp),
     cogsGbp: l.cogsGbp != null ? Number(l.cogsGbp) : null,
+    taxRateId: l.taxRateId ?? l.taxRate?.id ?? null,
+    taxRatePercent: l.taxRate?.rate != null ? Number(l.taxRate.rate) : null,
+    taxRateName: l.taxRate?.name ?? null,
   }
 }
 
@@ -308,6 +337,8 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
           qty: true, unitPriceForeign: true, unitPriceGbp: true, discountStr: true, discountAmount: true,
           taxForeign: true, taxGbp: true, totalForeign: true, totalGbp: true,
           cogsGbp: true,
+          taxRateId: true,
+          taxRate: { select: { id: true, name: true, rate: true, taxCategory: true } },
           product: { select: { imageUrl: true } },
         },
       },
@@ -369,7 +400,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
 
 export async function createSalesOrder(input: CreateSoInput): Promise<{ success: boolean; order?: SoRow; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.create')
     if (!input.lines.length) return { success: false, error: 'Add at least one line item' }
     if (!input.customerName?.trim()) return { success: false, error: 'Customer name is required' }
     for (const l of input.lines) {
@@ -379,24 +410,142 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
 
     const fxRate = input.fxRateToGbp && input.fxRateToGbp > 0 ? input.fxRateToGbp : 1
     const vatRate = input.taxRateValue ?? 0
-    const inclVat = input.pricesIncludeVat && vatRate > 0
-    let subtotalForeign = 0
-    let subtotalGbp = 0
+    const inclVat = !!input.pricesIncludeVat
+    // Storage convention:
+    //   All *Foreign / *Gbp totals on SalesOrder are NET of tax (subtotal,
+    //   shipping, discount). `taxForeign` holds the total VAT, `totalForeign`
+    //   is the grand total (net + tax). Line rows also store NET totals.
+    //   When pricesIncludeVat is true, unitPriceForeign remains the gross
+    //   user-entered price so the UI can display gross values, but every
+    //   aggregate field is net. The Xero payload reconstructs gross from
+    //   stored net when lineAmountsIncludeTax is true.
+    let linesSubtotalForeign = 0 // sum of line NETs, before order discount
+    let linesSubtotalGbp = 0
     let totalTaxForeign = 0
     let totalTaxGbp = 0
 
-    const lineData = input.lines.map((l) => {
-      const discAmt = l.discountAmount ?? 0
-      const grossLine = l.qty * l.unitPriceForeign - discAmt // original price * qty - discount
-      const netForeign = inclVat ? grossLine / (1 + vatRate) : grossLine
+    const round4 = (n: number) => Math.round(n * 10000) / 10000
+
+    // --- Tax category resolution ---------------------------------------
+    // Load each line's product category + the order default rate so we can
+    // resolve a per-line VAT rate via `(destCountry, category, SALES)`.
+    // Manual overrides (input.lines[i].taxRateId) skip the resolver and use
+    // the rate row directly.
+    const shipAddr = input.shippingAddress as { country?: string | null } | null | undefined
+    const billAddr = input.billingAddress as { country?: string | null } | null | undefined
+    let destCountryRaw: string | null =
+      (shipAddr?.country as string | null | undefined) ??
+      (billAddr?.country as string | null | undefined) ??
+      null
+    if (!destCountryRaw) {
+      try {
+        const { getOrganisation } = await import('./company')
+        const org = await getOrganisation()
+        destCountryRaw = org?.country ?? null
+      } catch { /* Fallback to null — resolver will use order default */ }
+    }
+    // Normalize free-text country values ("United Kingdom", "UK", "gb") to
+    // the lowercase ISO-2 code the resolver compares against.
+    const { toIsoCountryCode } = await import('@/lib/countries')
+    const destCountryIso = toIsoCountryCode(destCountryRaw)
+    const destCountry: string | null = destCountryIso ? destCountryIso.toLowerCase() : (destCountryRaw ? destCountryRaw.toLowerCase() : null)
+
+    const productIds = Array.from(new Set(input.lines.map((l) => l.productId).filter(Boolean)))
+    const productRows = productIds.length
+      ? await db.product.findMany({
+          where: { id: { in: productIds } },
+          select: { id: true, taxCategory: true },
+        })
+      : []
+    const productCategoryById = new Map<string, TaxCategory>(
+      productRows.map((p) => [p.id, p.taxCategory]),
+    )
+
+    // Order-level default for the resolver fallback step
+    const orderDefaultRate = input.taxRateName
+      ? await db.taxRate.findFirst({
+          where: { name: input.taxRateName, active: true },
+          select: { id: true, name: true, rate: true, accountingTaxType: true },
+        })
+      : null
+    const orderDefaultCtx = {
+      id: orderDefaultRate?.id ?? null,
+      name: orderDefaultRate?.name ?? input.taxRateName ?? null,
+      rate: orderDefaultRate ? Number(orderDefaultRate.rate) : vatRate,
+      accountingTaxType: orderDefaultRate?.accountingTaxType ?? null,
+    }
+
+    // Batch-resolve all lines that don't already carry a manual taxRateId.
+    const autoLines = input.lines
+      .map((l, idx) => ({
+        id: String(idx),
+        productCategory: (l.productId && productCategoryById.get(l.productId)) || ('STANDARD' as TaxCategory),
+        override: l.taxRateId ?? null,
+      }))
+      .filter((l) => !l.override)
+    const resolvedMap = await resolveLineTaxRateBatch(autoLines, {
+      destinationCountry: destCountry,
+      usedFor: 'SALES',
+      orderDefault: orderDefaultCtx,
+    })
+
+    // Load any manual override tax rates in one query.
+    const overrideIds = Array.from(
+      new Set(
+        input.lines
+          .map((l) => l.taxRateId)
+          .filter((x): x is string => typeof x === 'string' && x.length > 0),
+      ),
+    )
+    const overrideRows = overrideIds.length
+      ? await db.taxRate.findMany({
+          where: { id: { in: overrideIds } },
+          select: { id: true, name: true, rate: true, accountingTaxType: true },
+        })
+      : []
+    const overrideById = new Map(overrideRows.map((r) => [r.id, r]))
+
+    const lineResolved: ResolvedTaxRate[] = input.lines.map((l, idx) => {
+      if (l.taxRateId) {
+        const row = overrideById.get(l.taxRateId)
+        if (row) {
+          return {
+            taxRateId: row.id,
+            taxRateName: row.name,
+            taxRateValue: Number(row.rate),
+            accountingTaxType: row.accountingTaxType,
+            matched: 'exact',
+            warning: null,
+          }
+        }
+      }
+      return (
+        resolvedMap.get(String(idx)) ?? {
+          taxRateId: orderDefaultCtx.id,
+          taxRateName: orderDefaultCtx.name,
+          taxRateValue: orderDefaultCtx.rate,
+          accountingTaxType: orderDefaultCtx.accountingTaxType,
+          matched: 'fallback',
+          warning: null,
+        }
+      )
+    })
+
+    const lineData = input.lines.map((l, idx) => {
+      const resolved = lineResolved[idx]
+      const lineRate = resolved.taxRateValue
+      const lineInclVat = inclVat && lineRate > 0
+      const discAmt = l.discountAmount ?? 0 // in gross if inclVat, else net
+      const lineGross = l.qty * l.unitPriceForeign - discAmt
+      const netForeign = lineInclVat ? lineGross / (1 + lineRate) : lineGross
       const unitPriceGbp = Math.round((l.unitPriceForeign / fxRate) * 1000000) / 1000000
-      const totalForeign = Math.round(netForeign * 10000) / 10000
-      const totalGbp = Math.round((totalForeign / fxRate) * 10000) / 10000
-      const lineTax = inclVat ? grossLine - netForeign : netForeign * vatRate
-      const lineTaxForeign = Math.round(lineTax * 10000) / 10000
-      const lineTaxGbp = Math.round((lineTaxForeign / fxRate) * 10000) / 10000
-      subtotalForeign += totalForeign
-      subtotalGbp += totalGbp
+      const totalForeign = round4(netForeign)
+      const totalGbp = round4(totalForeign / fxRate)
+      const lineTax = lineInclVat ? lineGross - netForeign : netForeign * lineRate
+      const lineTaxForeign = round4(lineTax)
+      const lineTaxGbp = round4(lineTaxForeign / fxRate)
+      linesSubtotalForeign += totalForeign
+      linesSubtotalGbp += totalGbp
       totalTaxForeign += lineTaxForeign
       totalTaxGbp += lineTaxGbp
       return {
@@ -404,54 +553,71 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
         sku: l.sku,
         description: l.description,
         qty: l.qty,
-        unitPriceForeign: l.unitPriceForeign, // store ORIGINAL price
+        unitPriceForeign: l.unitPriceForeign, // ORIGINAL (gross if inclVat)
         unitPriceGbp,
         discountStr: l.discountStr || null,
         discountAmount: discAmt,
         taxForeign: lineTaxForeign,
         taxGbp: lineTaxGbp,
-        totalForeign,
+        totalForeign, // NET
         totalGbp,
+        taxRateId: resolved.taxRateId,
       }
     })
 
-    // Shipping
-    const shippingForeign = input.shippingForeign ?? 0
-    const shippingGbp = Math.round((shippingForeign / fxRate) * 10000) / 10000
-
-    // Additional fees → add to shipping (stored in shippingForeign)
+    // Shipping (+ fees). Input shippingForeign is gross when inclVat.
+    // Shipping / fees / order discount are always taxed at the order-default
+    // rate (the per-line resolver only applies to line items).
+    const shippingInclVat = inclVat && vatRate > 0
+    const shippingInput = input.shippingForeign ?? 0
     let feesTotalForeign = 0
-    if (input.fees?.length) {
-      for (const f of input.fees) feesTotalForeign += f.amount
-    }
-    const totalShippingForeign = shippingForeign + feesTotalForeign
-    const totalShippingGbp = Math.round((totalShippingForeign / fxRate) * 10000) / 10000
+    if (input.fees?.length) for (const f of input.fees) feesTotalForeign += f.amount
+    const totalShippingInput = shippingInput + feesTotalForeign
+    const shippingNetForeign = shippingInclVat ? totalShippingInput / (1 + vatRate) : totalShippingInput
+    const shippingTaxForeign = shippingInclVat
+      ? totalShippingInput - shippingNetForeign
+      : (vatRate > 0 ? shippingNetForeign * vatRate : 0)
+    const shippingNetForeignR = round4(shippingNetForeign)
+    const shippingTaxForeignR = round4(shippingTaxForeign)
+    const shippingNetGbp = round4(shippingNetForeignR / fxRate)
+    const shippingTaxGbp = round4(shippingTaxForeignR / fxRate)
+    totalTaxForeign += shippingTaxForeignR
+    totalTaxGbp += shippingTaxGbp
 
-    // VAT on shipping/fees
-    if (vatRate > 0) {
-      const shippingTax = inclVat
-        ? totalShippingForeign - totalShippingForeign / (1 + vatRate)
-        : totalShippingForeign * vatRate
-      totalTaxForeign += Math.round(shippingTax * 10000) / 10000
-      totalTaxGbp += Math.round((shippingTax / fxRate) * 10000) / 10000
-    }
+    // Order-level discount — cap at line subtotal (compare in gross when inclVat).
+    const rawOrderDisc = input.orderDiscountForeign ?? 0
+    const linesGrossForCap = shippingInclVat
+      ? linesSubtotalForeign * (1 + vatRate)
+      : linesSubtotalForeign
+    const orderDiscForeign = Math.min(rawOrderDisc, linesGrossForCap)
+    const discNetForeign = shippingInclVat ? orderDiscForeign / (1 + vatRate) : orderDiscForeign
+    const discTaxForeign = shippingInclVat ? orderDiscForeign - discNetForeign : (vatRate > 0 ? discNetForeign * vatRate : 0)
+    const discNetForeignR = round4(discNetForeign)
+    const discTaxForeignR = round4(discTaxForeign)
+    const discNetGbp = round4(discNetForeignR / fxRate)
+    const discTaxGbp = round4(discTaxForeignR / fxRate)
+    totalTaxForeign -= discTaxForeignR
+    totalTaxGbp -= discTaxGbp
 
-    // Order-level discount — cap at subtotal to prevent negative totals
-    const orderDiscForeign = Math.min(input.orderDiscountForeign ?? 0, subtotalForeign)
-    const orderDiscGbp = Math.round((orderDiscForeign / fxRate) * 10000) / 10000
-    // Reduce subtotal by order discount (already net if inclVat)
-    const discNetForeign = inclVat ? orderDiscForeign / (1 + vatRate) : orderDiscForeign
-    const discNetGbp = Math.round((discNetForeign / fxRate) * 10000) / 10000
-    subtotalForeign -= discNetForeign
-    subtotalGbp -= discNetGbp
-    if (vatRate > 0) {
-      const discTax = inclVat ? orderDiscForeign - discNetForeign : discNetForeign * vatRate
-      totalTaxForeign -= Math.round(discTax * 10000) / 10000
-      totalTaxGbp -= Math.round((discTax / fxRate) * 10000) / 10000
-    }
+    // Subtotal stored PRE-discount (sum of line nets) — matches the WC
+    // importer convention so display / accounting code can handle both
+    // sources uniformly.
+    const subtotalForeign = round4(linesSubtotalForeign)
+    const subtotalGbp = round4(linesSubtotalGbp)
+    totalTaxForeign = round4(totalTaxForeign)
+    totalTaxGbp = round4(totalTaxGbp)
 
-    const grandTotalForeign = subtotalForeign + totalTaxForeign + totalShippingForeign
-    const grandTotalGbp = subtotalGbp + totalTaxGbp + totalShippingGbp
+    // Grand total = subtotal (net, pre-discount) − net discount + net
+    // shipping + total tax. Tax already nets the discount VAT above.
+    const grandTotalForeign = round4(subtotalForeign - discNetForeignR + shippingNetForeignR + totalTaxForeign)
+    const grandTotalGbp = round4(subtotalGbp - discNetGbp + shippingNetGbp + totalTaxGbp)
+
+    // Keep locals that downstream Prisma / accounting queue references expect.
+    const totalShippingForeign = shippingNetForeignR
+    const totalShippingGbp = shippingNetGbp
+    // Store the order discount in the same convention as WC import: the raw
+    // user-entered amount (gross when inclVat).
+    const storedDiscountAmount = round4(orderDiscForeign)
 
     // Generate order number using configured prefix (Settings → Company → Numbering)
     const { getNumberingFormats } = await import('./company')
@@ -459,11 +625,15 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     const ref = makeReference(numbering.so_prefix)
     const orderNumber = ref
 
+    // Drafts stay in DRAFT and are NOT queued for accounting sync. When the
+    // order is finalised later (e.g. moved to PENDING_PAYMENT), the invoice
+    // will be queued via updateSalesOrderStatus.
+    const initialStatus = input.isDraft ? 'DRAFT' : 'PENDING_PAYMENT'
     const so = await db.salesOrder.create({
       data: {
         wcOrderNumber: ref,
         orderNumber,
-        status: 'DRAFT',
+        status: initialStatus,
         currency: input.currency,
         fxRateToGbp: fxRate,
         customerId: input.customerId || null,
@@ -477,6 +647,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
         taxRateName: input.taxRateName || null,
         taxRatePercent: vatRate > 0 ? vatRate : null,
         taxForeign: totalTaxForeign,
+        pricesIncludeVat: inclVat,
         totalForeign: grandTotalForeign,
         subtotalGbp,
         shippingGbp: totalShippingGbp,
@@ -486,7 +657,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
         expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null,
         salesRep: input.salesRep || null,
         discountStr: input.orderDiscountStr || null,
-        discountAmount: input.orderDiscountForeign ?? 0,
+        discountAmount: storedDiscountAmount,
         notes: input.notes || null,
         internalNotes: input.internalNotes || null,
         lines: { create: lineData },
@@ -494,48 +665,91 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       select: SO_SELECT,
     })
 
-    // Auto-allocate stock across warehouses
-    const { autoAllocateOrder } = await import('./allocation')
-    await autoAllocateOrder(so.id)
+    // Auto-allocate stock across warehouses. Drafts stay unallocated —
+    // allocation happens when the draft is finalised so the draft can still
+    // be freely edited without holding stock.
+    if (!input.isDraft) {
+      const { autoAllocateOrder } = await import('./allocation')
+      await autoAllocateOrder(so.id)
+    }
 
-    // Queue accounting sales invoice (DRAFT — manual orders have no payment yet)
-    try {
-      const settings = await getAccountingSettings()
-      const discountGbp = Math.round(((input.orderDiscountForeign ?? 0) / fxRate) * 100) / 100
-      // Look up accounting tax type from tax rate name
-      const taxRateForAccounting = input.taxRateName
-        ? await db.taxRate.findFirst({ where: { name: input.taxRateName, active: true }, select: { accountingTaxType: true } })
-        : null
-      // Manual invoice prefix comes from unified numbering settings
-      const manualPrefix = numbering.inv_prefix
-      await queueAccountingSync({
-        type: 'SALES_INVOICE',
-        referenceType: 'SalesOrder',
-        referenceId: so.id,
-        payload: {
-          invoiceNumber: `${manualPrefix}${orderNumber}`,
-          contactName: input.customerName,
-          contactEmail: input.customerEmail || undefined,
-          date: new Date().toISOString().slice(0, 10),
-          currency: input.currency,
-          reference: orderNumber,
-          lines: lineData.map(l => ({
-            itemCode: l.sku ?? undefined,
-            description: l.description ?? l.sku ?? 'Item',
-            quantity: l.qty,
-            unitAmount: Number(l.unitPriceGbp),
-            accountCode: settings.salesAccount,
-            taxType: taxRateForAccounting?.accountingTaxType ?? undefined,
-          })),
-          shippingAmount: totalShippingGbp > 0 ? totalShippingGbp : undefined,
-          shippingDescription: 'Shipping',
-          shippingAccountCode: settings.shippingAccount || undefined,
-          discountAmount: discountGbp > 0 ? discountGbp : undefined,
-          discountAccountCode: settings.discountAccount || undefined,
-          _postingMode: 'draft',
+    // Queue accounting sales invoice (DRAFT — manual orders have no payment yet).
+    // Skipped entirely for DRAFT orders — drafts are not posted to accounting
+    // until they are finalised via updateSalesOrderStatus.
+    if (!input.isDraft) {
+      try {
+        const settings = await getAccountingSettings()
+        // The accounting payload uses a generic `lineAmountsIncludeTax`
+        // flag — each connector maps this to its native convention. When
+        // inclVat, shipping and discount must be sent GROSS. Our DB stores
+        // shipping NET and the raw order discount (gross when inclVat) so
+        // we reconstruct the right values here.
+        const discountGbp = Math.round(((input.orderDiscountForeign ?? 0) / fxRate) * 100) / 100
+        const shippingGrossForeign = shippingInclVat ? totalShippingInput : totalShippingForeign
+        const shippingSendGbp = round4(shippingGrossForeign / fxRate)
+        // Manual invoice prefix comes from unified numbering settings
+        const manualPrefix = numbering.inv_prefix
+        await queueAccountingSync({
+          type: 'SALES_INVOICE',
+          referenceType: 'SalesOrder',
+          referenceId: so.id,
+          payload: {
+            invoiceNumber: `${manualPrefix}${orderNumber}`,
+            contactName: input.customerName,
+            contactEmail: input.customerEmail || undefined,
+            date: new Date().toISOString().slice(0, 10),
+            currency: input.currency,
+            reference: orderNumber,
+            lines: lineData.map((l, idx) => {
+              // Pass the raw per-line discount amount (in GBP) through.
+              // Each accounting connector decides how to represent it
+              // natively (rate vs. amount, sales vs. bill, etc.).
+              const discAmtGbp = Number(l.discountAmount ?? 0) / fxRate
+              return {
+                itemCode: l.sku ?? undefined,
+                description: l.description ?? l.sku ?? 'Item',
+                quantity: l.qty,
+                // unitPriceGbp holds the user-entered price (gross when inclVat)
+                // which matches lineAmountsIncludeTax.
+                unitAmount: Number(l.unitPriceGbp),
+                accountCode: settings.salesAccount,
+                taxType: lineResolved[idx]?.accountingTaxType ?? orderDefaultCtx.accountingTaxType ?? undefined,
+                discountAmount: discAmtGbp > 0 ? Math.round(discAmtGbp * 10000) / 10000 : undefined,
+              }
+            }),
+            shippingAmount: shippingSendGbp > 0 ? shippingSendGbp : undefined,
+            shippingDescription: 'Shipping',
+            shippingAccountCode: settings.shippingAccount || undefined,
+            shippingTaxType: orderDefaultCtx.accountingTaxType ?? undefined,
+            discountAmount: discountGbp > 0 ? discountGbp : undefined,
+            discountAccountCode: settings.discountAccount || undefined,
+            discountTaxType: orderDefaultCtx.accountingTaxType ?? undefined,
+            lineAmountsIncludeTax: inclVat,
+            _postingMode: 'draft',
+          },
+        })
+      } catch { /* Accounting queue errors should never block the main flow */ }
+    }
+
+    // Aggregated warning when any line fell back to the order default.
+    const fallbackLines = lineResolved
+      .map((r, i) => ({ r, sku: input.lines[i].sku, cat: productCategoryById.get(input.lines[i].productId) ?? 'STANDARD' }))
+      .filter((x) => x.r.matched === 'fallback')
+    if (fallbackLines.length > 0) {
+      logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: 'tax_rate_fallback',
+        tag: 'sales',
+        level: 'WARNING',
+        description: `No matching tax rate for ${destCountry?.toUpperCase() ?? 'unknown country'} on ${fallbackLines.length} line(s); used order default.`,
+        metadata: {
+          orderNumber: so.orderNumber,
+          destCountry,
+          lines: fallbackLines.map((x) => ({ sku: x.sku, category: x.cat })),
         },
       })
-    } catch { /* Accounting queue errors should never block the main flow */ }
+    }
 
     revalidatePath('/sales')
     const mapped = mapSoRow(so)
@@ -584,13 +798,130 @@ async function releaseReservedStock(orderId: string, warehouseId: string, lines:
   })
 }
 
+/**
+ * Queue the accounting sales invoice for an existing SalesOrder. Used when a
+ * draft order is finalised (DRAFT → PENDING_PAYMENT / PROCESSING / etc.) — the
+ * invoice was skipped at creation time and must now be sent to Xero.
+ *
+ * Safe to call multiple times: checks `accountingInvoiceId` and bails if the
+ * invoice has already been posted.
+ */
+async function queueSalesInvoiceForOrder(id: string): Promise<void> {
+  const so = await db.salesOrder.findUnique({
+    where: { id },
+    select: {
+      id: true,
+      orderNumber: true,
+      wcOrderNumber: true,
+      currency: true,
+      fxRateToGbp: true,
+      customerName: true,
+      customerEmail: true,
+      shippingForeign: true,
+      shippingGbp: true,
+      taxRateName: true,
+      taxRatePercent: true,
+      pricesIncludeVat: true,
+      discountAmount: true,
+      accountingInvoiceId: true,
+      lines: {
+        select: {
+          sku: true,
+          description: true,
+          qty: true,
+          unitPriceGbp: true,
+          unitPriceForeign: true,
+          discountAmount: true,
+          totalForeign: true,
+          taxRateId: true,
+          taxRate: { select: { accountingTaxType: true } },
+        },
+      },
+    },
+  })
+  if (!so) return
+  if (so.accountingInvoiceId) return // already posted to accounting
+
+  const settings = await getAccountingSettings()
+  if (!settings.syncEnabled) return
+
+  const { getNumberingFormats } = await import('./company')
+  const numbering = await getNumberingFormats()
+  const manualPrefix = numbering.inv_prefix
+  const orderNumber = so.orderNumber ?? so.wcOrderNumber ?? so.id
+
+  const orderDefaultTaxType = so.taxRateName
+    ? (await db.taxRate.findFirst({
+        where: { name: so.taxRateName, active: true },
+        select: { accountingTaxType: true },
+      }))?.accountingTaxType ?? null
+    : null
+
+  const fxRate = Number(so.fxRateToGbp) || 1
+  const vatPct = Number(so.taxRatePercent ?? 0)
+  const lineAmountsIncludeTax = !!so.pricesIncludeVat && vatPct > 0
+
+  // Shipping is stored NET on the SalesOrder. Reconstruct gross when
+  // sending inclusive so Xero calculates the correct tax.
+  const shippingNetGbp = Number(so.shippingGbp ?? 0)
+  const shippingSendGbp = lineAmountsIncludeTax
+    ? Math.round(shippingNetGbp * (1 + vatPct) * 10000) / 10000
+    : shippingNetGbp
+
+  // `discountAmount` is stored in the same inclusive/exclusive convention as
+  // the order (matching WC import), so it can be passed through directly.
+  const discountGbp = Math.round((Number(so.discountAmount ?? 0) / fxRate) * 100) / 100
+
+  await queueAccountingSync({
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: so.id,
+    payload: {
+      invoiceNumber: `${manualPrefix}${orderNumber}`,
+      contactName: so.customerName ?? 'Unknown',
+      contactEmail: so.customerEmail ?? undefined,
+      date: new Date().toISOString().slice(0, 10),
+      currency: so.currency,
+      reference: orderNumber,
+      lines: so.lines.map((l) => {
+        // `discountAmount` on the line is stored in the order's foreign
+        // currency. Pass through in GBP (matching unitAmount's convention)
+        // — the accounting connector decides how to represent it.
+        const qty = Number(l.qty)
+        const discForeign = Number(l.discountAmount ?? 0)
+        const discGbp = discForeign > 0 ? Math.round((discForeign / fxRate) * 10000) / 10000 : 0
+        return {
+          itemCode: l.sku ?? undefined,
+          description: l.description ?? l.sku ?? 'Item',
+          quantity: qty,
+          // unitPriceGbp stores the user-entered price (gross when inclVat),
+          // matching lineAmountsIncludeTax.
+          unitAmount: Number(l.unitPriceGbp),
+          accountCode: settings.salesAccount,
+          taxType: l.taxRate?.accountingTaxType ?? orderDefaultTaxType ?? undefined,
+          discountAmount: discGbp > 0 ? discGbp : undefined,
+        }
+      }),
+      shippingAmount: shippingSendGbp > 0 ? shippingSendGbp : undefined,
+      shippingDescription: 'Shipping',
+      shippingAccountCode: settings.shippingAccount || undefined,
+      shippingTaxType: orderDefaultTaxType ?? undefined,
+      discountAmount: discountGbp > 0 ? discountGbp : undefined,
+      discountAccountCode: settings.discountAccount || undefined,
+      discountTaxType: orderDefaultTaxType ?? undefined,
+      lineAmountsIncludeTax,
+      _postingMode: 'draft',
+    },
+  })
+}
+
 export async function updateSalesOrderStatus(
   id: string,
   targetStatus: SoStatus,
   extra?: { trackingNumber?: string; shipFromWarehouseId?: string },
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.process')
     const so = await db.salesOrder.findUnique({
       where: { id },
       select: { id: true, wcOrderId: true, wcOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { id: true, productId: true, sku: true, qty: true } } },
@@ -694,6 +1025,19 @@ export async function updateSalesOrderStatus(
 
     await db.salesOrder.update({ where: { id }, data })
 
+    // Draft finalisation: when a DRAFT is moved to any non-cancelled status,
+    // allocate stock (skipped at creation) and queue the sales invoice for
+    // accounting sync (also skipped at creation).
+    if (so.status === 'DRAFT' && targetStatus !== 'CANCELLED' && targetStatus !== 'DRAFT') {
+      try {
+        const { autoAllocateOrder } = await import('./allocation')
+        await autoAllocateOrder(id)
+      } catch { /* Allocation failures must not block the status transition */ }
+      try {
+        await queueSalesInvoiceForOrder(id)
+      } catch { /* Accounting queue errors should never block status transitions */ }
+    }
+
     // Auto-generate invoice on ship if configured
     if (targetStatus === 'SHIPPED') {
       const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
@@ -743,7 +1087,7 @@ export async function createRefund(
   returnWarehouseId?: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.refund')
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: {
@@ -1027,7 +1371,7 @@ export async function createRefund(
 
 export async function cloneSalesOrder(id: string): Promise<{ success: boolean; newId?: string; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.create')
     const so = await db.salesOrder.findUnique({
       where: { id },
       include: { lines: true },
@@ -1114,7 +1458,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
 
 export async function deleteSalesOrder(id: string): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.create')
     const so = await db.salesOrder.findUnique({
       where: { id },
       select: { wcOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { productId: true, qty: true } }, _count: { select: { refunds: true, payments: true } } },
@@ -1156,7 +1500,7 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
 
 export async function markSalesOrderPaid(id: string): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.refund')
     const so = await db.salesOrder.findUnique({ where: { id }, select: { wcOrderNumber: true, paidAt: true, invoiceNumber: true } })
     if (!so) return { success: false, error: 'Order not found' }
 
@@ -1206,7 +1550,7 @@ export async function updateSalesOrderNotes(
   internalNotes: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.create')
     const so = await db.salesOrder.update({
       where: { id },
       data: { notes: notes || null, internalNotes: internalNotes || null },
@@ -1239,7 +1583,7 @@ export async function updateSalesOrderNotes(
 
 export async function generateInvoiceNumber(id: string): Promise<{ success: boolean; invoiceNumber?: string; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.process')
     // Use a transaction to prevent race conditions on invoice numbering
     const result = await db.$transaction(async (tx) => {
       const so = await tx.salesOrder.findUnique({ where: { id }, select: { wcOrderNumber: true, orderNumber: true, invoiceNumber: true } })
@@ -1305,7 +1649,7 @@ export async function addPayment(input: {
   paidAt?: string
 }): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.refund')
     if (!input.amount || input.amount <= 0) return { success: false, error: 'Amount must be greater than 0' }
     await db.payment.create({
       data: {
@@ -1369,7 +1713,7 @@ export async function addPayment(input: {
 
 export async function deletePayment(paymentId: string, orderId: string): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.refund')
     await db.payment.delete({ where: { id: paymentId } })
     const so = await db.salesOrder.findUnique({ where: { id: orderId }, select: { wcOrderNumber: true } })
     revalidatePath(`/sales/${orderId}`)

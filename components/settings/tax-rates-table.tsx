@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { Plus, Pencil, X, Check, Loader2, Link2 } from 'lucide-react'
+import { Plus, Pencil, X, Check, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -13,7 +13,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/ui/dialog'
-import { createTaxRate, updateTaxRate, autoLinkXeroTaxRates, type TaxRateRow } from '@/app/actions/settings'
+import { createTaxRate, updateTaxRate, type TaxRateRow, type TaxCategoryValue } from '@/app/actions/settings'
 
 type Props = { taxRates: TaxRateRow[] }
 
@@ -22,6 +22,18 @@ const USED_FOR_LABELS: Record<string, string> = {
   PURCHASE: 'Purchases',
   BOTH: 'Both',
 }
+
+const TAX_CATEGORY_OPTIONS: { value: TaxCategoryValue; label: string }[] = [
+  { value: 'STANDARD', label: 'Standard' },
+  { value: 'REDUCED', label: 'Reduced' },
+  { value: 'SECOND_REDUCED', label: '2nd Reduced' },
+  { value: 'ZERO', label: 'Zero-rated' },
+  { value: 'EXEMPT', label: 'Exempt' },
+]
+
+const TAX_CATEGORY_LABELS: Record<string, string> = Object.fromEntries(
+  TAX_CATEGORY_OPTIONS.map((o) => [o.value, o.label]),
+)
 
 function TaxRateFormDialog({
   rate,
@@ -35,7 +47,8 @@ function TaxRateFormDialog({
   const [name, setName] = useState(rate?.name ?? '')
   const [rateVal, setRateVal] = useState(rate ? (rate.rate * 100).toFixed(2) : '')
   const [usedFor, setUsedFor] = useState(rate?.usedFor ?? 'BOTH')
-  const [accountingTaxType, setAccountingTaxType] = useState(rate?.accountingTaxType ?? '')
+  const [taxCategory, setTaxCategory] = useState<TaxCategoryValue>(rate?.taxCategory ?? 'STANDARD')
+  const [countryCode, setCountryCode] = useState(rate?.countryCode ?? '')
   const [error, setError] = useState('')
 
   function handleSave() {
@@ -43,11 +56,23 @@ function TaxRateFormDialog({
     if (!name.trim()) { setError('Name is required'); return }
     const pct = parseFloat(rateVal)
     if (isNaN(pct) || pct < 0 || pct > 100) { setError('Rate must be between 0 and 100'); return }
+    const trimmedCountry = countryCode.trim()
+    if (trimmedCountry && trimmedCountry.length !== 2) {
+      setError('Country code must be ISO 3166-1 alpha-2 (2 letters), or blank for global')
+      return
+    }
 
     startTransition(async () => {
+      const payload = {
+        name,
+        rate: pct / 100,
+        usedFor,
+        taxCategory,
+        countryCode: trimmedCountry ? trimmedCountry.toLowerCase() : null,
+      }
       const result = rate
-        ? await updateTaxRate(rate.id, { name, rate: pct / 100, usedFor, accountingTaxType })
-        : await createTaxRate({ name, rate: pct / 100, usedFor, accountingTaxType })
+        ? await updateTaxRate(rate.id, payload)
+        : await createTaxRate(payload)
 
       if (result.success) {
         router.refresh()
@@ -96,15 +121,35 @@ function TaxRateFormDialog({
             </div>
           </div>
 
-          <div className="space-y-1.5">
-            <Label>Accounting Tax Type Code</Label>
-            <Input
-              value={accountingTaxType}
-              onChange={(e) => setAccountingTaxType(e.target.value)}
-              placeholder="e.g. OUTPUT2, INPUT2"
-              className="h-9 font-mono"
-            />
-            <p className="text-xs text-muted-foreground">Used when syncing invoices to accounting software</p>
+          <div className="grid grid-cols-2 gap-3">
+            <div className="space-y-1.5">
+              <Label>Tax Category</Label>
+              <select
+                value={taxCategory}
+                onChange={(e) => setTaxCategory(e.target.value as TaxCategoryValue)}
+                className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
+              >
+                {TAX_CATEGORY_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+              <p className="text-xs text-muted-foreground">
+                Matched against the product&apos;s tax category at order time. &ldquo;Exempt&rdquo; vs &ldquo;Zero&rdquo; map to different Xero codes.
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <Label>Country Code</Label>
+              <Input
+                value={countryCode}
+                onChange={(e) => setCountryCode(e.target.value)}
+                placeholder="GB (blank = global)"
+                maxLength={2}
+                className="h-9 font-mono uppercase"
+              />
+              <p className="text-xs text-muted-foreground">
+                ISO 3166-1 alpha-2. Leave blank for global fallback rates (e.g. exports).
+              </p>
+            </div>
           </div>
 
           {error && <p className="text-destructive text-sm">{error}</p>}
@@ -126,32 +171,12 @@ export function TaxRatesTable({ taxRates }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [editing, setEditing] = useState<TaxRateRow | null | undefined>(undefined)
-  const [linking, setLinking] = useState(false)
-  const [linkMsg, setLinkMsg] = useState<string | null>(null)
 
   function handleToggle(rate: TaxRateRow) {
     startTransition(async () => {
       await updateTaxRate(rate.id, { active: !rate.active })
       router.refresh()
     })
-  }
-
-  async function handleAutoLinkXero() {
-    setLinkMsg(null)
-    setLinking(true)
-    const result = await autoLinkXeroTaxRates()
-    setLinking(false)
-    if (!result.success) {
-      setLinkMsg(`Auto-link failed: ${result.error ?? 'unknown error'}`)
-      return
-    }
-    const parts: string[] = []
-    if (result.linked > 0) parts.push(`${result.linked} rate(s) auto-linked to Xero`)
-    if (result.alreadyLinked > 0) parts.push(`${result.alreadyLinked} already linked`)
-    if (result.unmatched.length > 0) parts.push(`${result.unmatched.length} unmatched (${result.unmatched.slice(0, 3).join(', ')}${result.unmatched.length > 3 ? '…' : ''})`)
-    if (parts.length === 0) parts.push(`No IMS rates found (${result.xeroRatesCount} Xero rates available)`)
-    setLinkMsg(parts.join(' · '))
-    router.refresh()
   }
 
   const salesRates = taxRates.filter((r) => r.usedFor === 'SALES' || r.usedFor === 'BOTH')
@@ -172,9 +197,10 @@ export function TaxRatesTable({ taxRates }: Props) {
           <thead className="border-b bg-muted/50">
             <tr>
               <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Name</th>
+              <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Category</th>
+              <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Country</th>
               <th className="px-4 py-2 text-right font-medium text-muted-foreground text-xs">Rate</th>
               {!allBoth && <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Applies To</th>}
-              <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Tax Code</th>
               <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Status</th>
               <th className="w-16" />
             </tr>
@@ -183,9 +209,16 @@ export function TaxRatesTable({ taxRates }: Props) {
             {rates.map((r) => (
               <tr key={r.id} className={`hover:bg-muted/30 ${!r.active ? 'opacity-50' : ''}`}>
                 <td className="px-4 py-2 font-medium">{r.name}</td>
+                <td className="px-4 py-2 text-xs">
+                  <span className="inline-flex items-center rounded-full px-2 py-0.5 font-medium border bg-muted/50">
+                    {TAX_CATEGORY_LABELS[r.taxCategory] ?? r.taxCategory}
+                  </span>
+                </td>
+                <td className="px-4 py-2 font-mono text-xs text-muted-foreground uppercase">
+                  {r.countryCode ?? '—'}
+                </td>
                 <td className="px-4 py-2 text-right font-mono text-xs">{(r.rate * 100).toFixed(2)}%</td>
                 {!allBoth && <td className="px-4 py-2 text-xs text-muted-foreground">{USED_FOR_LABELS[r.usedFor] ?? r.usedFor}</td>}
-                <td className="px-4 py-2 font-mono text-xs text-muted-foreground">{r.accountingTaxType ?? '—'}</td>
                 <td className="px-4 py-2">
                   <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${
                     r.active
@@ -215,19 +248,10 @@ export function TaxRatesTable({ taxRates }: Props) {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between gap-2 flex-wrap">
-        <div className="text-xs text-muted-foreground">
-          {linkMsg && <span>{linkMsg}</span>}
-        </div>
-        <div className="flex items-center gap-2">
-          <Button size="sm" variant="outline" onClick={handleAutoLinkXero} disabled={linking}>
-            {linking ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Link2 className="h-3 w-3 mr-1" />}
-            Auto-link to Xero
-          </Button>
-          <Button size="sm" onClick={() => setEditing(null)}>
-            <Plus className="h-3 w-3 mr-1" />Add VAT Rate
-          </Button>
-        </div>
+      <div className="flex items-center justify-end gap-2 flex-wrap">
+        <Button size="sm" onClick={() => setEditing(null)}>
+          <Plus className="h-3 w-3 mr-1" />Add VAT Rate
+        </Button>
       </div>
 
       {allBoth ? (

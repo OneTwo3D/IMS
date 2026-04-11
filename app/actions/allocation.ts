@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { auth } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth/server'
 
 async function requireAuth() {
   const session = await auth()
@@ -124,7 +125,7 @@ export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]>
 
 export async function autoAllocateOrder(orderId: string): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.process')
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: {
@@ -323,7 +324,7 @@ export async function updateAllocation(
   newQty: number,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.process')
     const alloc = await db.orderAllocation.findUnique({
       where: { id: allocationId },
       include: { line: { select: { qty: true } }, order: { select: { wcOrderNumber: true } } },
@@ -396,7 +397,7 @@ export async function addAllocation(
   qty: number,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.process')
     if (qty <= 0) return { success: false, error: 'Quantity must be positive' }
 
     // Check stock availability
@@ -437,7 +438,7 @@ export async function addAllocation(
 
 export async function deallocateOrder(orderId: string): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.process')
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: { wcOrderNumber: true, status: true },
@@ -490,7 +491,7 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
 
 export async function confirmAllocations(orderId: string): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.process')
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: { wcOrderNumber: true, status: true },
@@ -568,7 +569,7 @@ export async function updateShipmentStatus(
   extra?: { trackingNumber?: string; shippingService?: string },
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('sales.process')
     const shipment = await db.shipment.findUnique({
       where: { id: shipmentId },
       include: {

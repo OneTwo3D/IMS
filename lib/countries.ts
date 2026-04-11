@@ -36,3 +36,58 @@ export function countryName(code: string | null | undefined): string {
   if (!code) return ''
   return COUNTRIES[code.toUpperCase()] ?? code
 }
+
+/** Common aliases & historic spellings → ISO-2 */
+const COUNTRY_ALIASES: Record<string, string> = {
+  'uk': 'GB',
+  'great britain': 'GB',
+  'britain': 'GB',
+  'england': 'GB',
+  'scotland': 'GB',
+  'wales': 'GB',
+  'northern ireland': 'GB',
+  'u.s.': 'US',
+  'u.s.a.': 'US',
+  'usa': 'US',
+  'america': 'US',
+  'united states of america': 'US',
+  'holland': 'NL',
+  'the netherlands': 'NL',
+  'south korea': 'KR',
+  'korea': 'KR',
+  'russia': 'RU',
+  'czech republic': 'CZ',
+  'czechia': 'CZ',
+  'uae': 'AE',
+  'hong kong sar': 'HK',
+}
+
+// Build a reverse lookup once (lower-cased country name → ISO-2 code)
+const NAME_TO_CODE: Record<string, string> = (() => {
+  const m: Record<string, string> = { ...COUNTRY_ALIASES }
+  for (const [code, name] of Object.entries(COUNTRIES)) {
+    m[name.toLowerCase()] = code
+  }
+  return m
+})()
+
+/**
+ * Normalize any user-supplied country value to an ISO-2 code (upper-case),
+ * or return null if the value can't be recognised.
+ *
+ * Accepts:
+ *  - ISO-2 codes ("GB", "gb")
+ *  - Full English names ("United Kingdom")
+ *  - Common aliases ("UK", "USA", "Holland")
+ */
+export function toIsoCountryCode(input: string | null | undefined): string | null {
+  if (!input) return null
+  const trimmed = input.trim()
+  if (!trimmed) return null
+  // Already an ISO-2 code?
+  if (trimmed.length === 2 && COUNTRIES[trimmed.toUpperCase()]) {
+    return trimmed.toUpperCase()
+  }
+  const lower = trimmed.toLowerCase()
+  return NAME_TO_CODE[lower] ?? null
+}

@@ -25,6 +25,7 @@ import type { CurrencyRow } from '@/app/actions/currencies'
 import type { StockLevelEntry } from '@/app/actions/stock'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
+import { formatMoney } from '@/lib/utils'
 
 type WarehouseInfo = { id: string; code: string; name: string }
 type Props = {
@@ -180,10 +181,10 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
             <td className="px-3 py-2">{l.productId ? <ProductLink productId={l.productId} sku={l.sku} name={l.description} /> : l.description}</td>
             <td className="px-3 py-2 text-right tabular-nums">{l.qty}</td>
             <td className="px-3 py-2"><Input type="number" min={0} max={l.qty} step={1} value={l.qtyRefund} onChange={(e) => { const q = Number(e.target.value) || 0; setRefundLines((p) => p.map((rl) => rl.id === l.id ? { ...rl, qtyRefund: q, refundAmount: q * l.unitPriceForeign } : rl)) }} className="h-7 text-sm text-right w-24 ml-auto font-mono" /></td>
-            <td className="px-3 py-2 text-right font-mono text-xs">{l.refundAmount.toFixed(2)}{sym}</td>
+            <td className="px-3 py-2 text-right font-mono text-xs">{formatMoney(l.refundAmount, sym)}</td>
           </tr>))}
         </tbody></table></div>
-        <div className="flex justify-end text-sm font-medium">Total: {totalRefund.toFixed(2)}{sym}</div>
+        <div className="flex justify-end text-sm font-medium">Total: {formatMoney(totalRefund, sym)}</div>
         {error && <p className="text-sm text-destructive">{error}</p>}
       </div>
       <DialogFooter>
@@ -724,8 +725,26 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
   const [shipments, setShipments] = useState<ShipmentRow[]>(initialShipments)
 
   const symbolMap: Record<string, string> = { GBP: '£' }
-  for (const c of currencies) symbolMap[c.code] = c.symbol
+  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { GBP: 'PREFIX' }
+  for (const c of currencies) {
+    symbolMap[c.code] = c.symbol
+    positionMap[c.code] = c.symbolPosition
+  }
   const sym = symbolMap[so.currency] ?? so.currency
+  const symPos = positionMap[so.currency] ?? 'PREFIX'
+  const money = (n: number) => formatMoney(n, sym, symPos)
+
+  // VAT display helpers. All *Foreign totals on SalesOrder are stored NET.
+  // When the order was entered with tax-inclusive prices we display gross
+  // values (net * (1 + rate)) throughout the table so the figures match
+  // what the user typed in. discountAmount is stored in the raw input
+  // convention (gross when inclVat), matching the WC importer.
+  const vatRate = so.taxRatePercent ?? 0
+  const inclVat = so.pricesIncludeVat && vatRate > 0
+  const toGross = (net: number) => inclVat ? net * (1 + vatRate) : net
+  const subtotalDisplay = toGross(so.subtotalForeign)
+  const shippingDisplay = toGross(so.shippingForeign)
+  const discountDisplay = so.discountAmount // already gross in inclVat mode
 
   const hasShipments = shipments.length > 0
   const baseFlow = hasShipments ? STATUS_FLOW_SHIPMENTS : STATUS_FLOW_LEGACY
@@ -900,7 +919,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
               <FileText className="h-4 w-4 mr-1" />Generate Invoice
             </Button>
           )}
-          {accountingSyncEnabled && !so.invoiceNumber && !so.accountingInvoiceId && (
+          {accountingSyncEnabled && !so.invoiceNumber && !so.accountingInvoiceId && so.status !== 'DRAFT' && (
             <span className="inline-flex items-center gap-1 text-xs text-muted-foreground"><Clock className="h-3 w-3" />Invoice pending sync</span>
           )}
 
@@ -1030,6 +1049,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
               <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-16">Qty</th>
               <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-28">Unit Price ({sym})</th>
               <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-24">Discount</th>
+              {vatRate > 0 && <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-20">VAT ({sym})</th>}
               <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-28">Total ({sym})</th>
               {visibleCols.has('cogs') && <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-20">COGS (£)</th>}
               {visibleCols.has('margin') && <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-20">Margin (£)</th>}
@@ -1049,6 +1069,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
               const shipped = ['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) ? line.qty : 0
               const cancelled = so.status === 'CANCELLED' ? line.qty : 0
               const returned = so.refunds?.reduce((s, r) => s + r.lines.filter((rl) => rl.productId === line.productId).reduce((s2, rl) => s2 + rl.qty, 0), 0) ?? 0
+              // In inclVat mode the stored totalForeign is NET — display gross
+              // (user-entered) values so Unit Price, VAT and Total all line up.
+              const lineTotalDisplay = toGross(line.totalForeign)
               return (
                 <tr key={line.id}>
                   <td className="w-12 px-2 py-1">
@@ -1056,11 +1079,21 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
                   </td>
                   <td className="px-4 py-2">{line.productId ? <ProductLink productId={line.productId} sku={line.sku} name={line.description} /> : <span className="text-sm">{line.description}</span>}</td>
                   <td className="px-4 py-2 text-right tabular-nums">{line.qty}</td>
-                  <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">{line.unitPriceForeign.toFixed(2)}</td>
-                  <td className="px-4 py-2 text-right tabular-nums font-mono text-xs text-destructive">{line.discountAmount > 0 ? (line.discountStr ?? `-${line.discountAmount.toFixed(2)}`) : '—'}</td>
-                  <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">{line.totalForeign.toFixed(2)}{sym}</td>
-                  {visibleCols.has('cogs') && <td className="px-4 py-2 text-right tabular-nums font-mono text-xs text-muted-foreground">{cogs > 0 ? `£${cogs.toFixed(2)}` : '—'}</td>}
-                  {visibleCols.has('margin') && <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">{cogs > 0 ? `£${margin.toFixed(2)}` : '—'}</td>}
+                  <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">{formatMoney(line.unitPriceForeign, sym)}</td>
+                  <td className="px-4 py-2 text-right tabular-nums font-mono text-xs text-destructive">{line.discountAmount > 0 ? (line.discountStr ?? formatMoney(-line.discountAmount, sym)) : '—'}</td>
+                  {vatRate > 0 && (
+                    <td className="px-4 py-2 text-right tabular-nums font-mono text-xs text-muted-foreground">
+                      {formatMoney(line.taxForeign, sym)}
+                      {line.taxRatePercent != null && Math.abs(line.taxRatePercent - vatRate) > 0.0001 && (
+                        <span className="ml-1 inline-flex items-center rounded-sm border border-amber-300 bg-amber-50 px-1 py-0 text-[10px] font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
+                          {(line.taxRatePercent * 100).toFixed(line.taxRatePercent * 100 % 1 === 0 ? 0 : 1)}%
+                        </span>
+                      )}
+                    </td>
+                  )}
+                  <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">{formatMoney(lineTotalDisplay, sym)}</td>
+                  {visibleCols.has('cogs') && <td className="px-4 py-2 text-right tabular-nums font-mono text-xs text-muted-foreground">{cogs > 0 ? formatMoney(cogs, '£') : '—'}</td>}
+                  {visibleCols.has('margin') && <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">{cogs > 0 ? formatMoney(margin, '£') : '—'}</td>}
                   {visibleCols.has('marginPct') && <td className="px-4 py-2 text-right tabular-nums text-xs">{cogs > 0 ? `${marginPct.toFixed(1)}%` : '—'}</td>}
                   {visibleCols.has('qtyShipped') && <td className="px-4 py-2 text-right tabular-nums text-xs">{shipped > 0 ? shipped : '—'}</td>}
                   {visibleCols.has('qtyReturned') && <td className="px-4 py-2 text-right tabular-nums text-xs text-orange-600">{returned > 0 ? returned : '—'}</td>}
@@ -1083,11 +1116,51 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
             })}
           </tbody>
           <tfoot className="border-t bg-muted/30 text-sm">
-            <tr><td colSpan={4} className="px-4 py-1.5 text-right text-muted-foreground">Subtotal</td><td className="px-4 py-1.5 text-right tabular-nums font-mono">{so.subtotalForeign.toFixed(2)}{sym}</td></tr>
-            {so.discountAmount > 0 && <tr><td colSpan={4} className="px-4 py-1.5 text-right text-destructive">Order Discount{so.discountStr ? ` (${so.discountStr})` : ''}</td><td className="px-4 py-1.5 text-right tabular-nums font-mono text-destructive">-{so.discountAmount.toFixed(2)}{sym}</td></tr>}
-            {so.shippingForeign > 0 && <tr><td colSpan={4} className="px-4 py-1.5 text-right text-muted-foreground">Shipping{so.shippingService ? ` (${so.shippingService})` : ''}</td><td className="px-4 py-1.5 text-right tabular-nums font-mono">{so.shippingForeign.toFixed(2)}{sym}</td></tr>}
-            {so.taxForeign > 0 && <tr><td colSpan={4} className="px-4 py-1.5 text-right text-muted-foreground">{so.taxRateName ?? 'Tax'}{so.taxRatePercent != null ? ` (${(so.taxRatePercent * 100).toFixed(0)}%)` : ''}</td><td className="px-4 py-1.5 text-right tabular-nums font-mono">{so.taxForeign.toFixed(2)}{sym}</td></tr>}
-            <tr className="border-t"><td colSpan={4} className="px-4 py-2 text-right font-medium text-muted-foreground">Total</td><td className="px-4 py-2 text-right tabular-nums font-mono"><span className="font-semibold">{so.totalForeign.toFixed(2)}{sym}</span>{so.currency !== 'GBP' && <span className="text-muted-foreground font-normal text-xs ml-1">(£{so.totalGbp.toFixed(2)})</span>}</td></tr>
+            {(() => {
+              // Align totals under the Total column. Base cols before Total =
+              // img + Product + Qty + Unit Price + Discount (+ VAT) = 5 or 6.
+              // Add optional columns after Total into the right-hand span.
+              const labelSpan = 5 + (vatRate > 0 ? 1 : 0)
+              const rightSpan = 1
+                + (visibleCols.has('cogs') ? 1 : 0)
+                + (visibleCols.has('margin') ? 1 : 0)
+                + (visibleCols.has('marginPct') ? 1 : 0)
+                + (visibleCols.has('qtyShipped') ? 1 : 0)
+                + (visibleCols.has('qtyReturned') ? 1 : 0)
+                + (visibleCols.has('qtyCancelled') ? 1 : 0)
+                + (visibleCols.has('qtyOnHand') ? 1 : 0)
+              return <>
+                <tr>
+                  <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-muted-foreground">Subtotal</td>
+                  <td colSpan={rightSpan} className="px-4 py-1.5 text-right tabular-nums font-mono">{money(subtotalDisplay)}</td>
+                </tr>
+                {so.discountAmount > 0 && (
+                  <tr>
+                    <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-destructive">Order Discount</td>
+                    <td colSpan={rightSpan} className="px-4 py-1.5 text-right tabular-nums font-mono text-destructive">{money(-discountDisplay)}</td>
+                  </tr>
+                )}
+                {so.shippingForeign > 0 && (
+                  <tr>
+                    <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-muted-foreground">Shipping{so.shippingService ? ` (${so.shippingService})` : ''}</td>
+                    <td colSpan={rightSpan} className="px-4 py-1.5 text-right tabular-nums font-mono">{money(shippingDisplay)}</td>
+                  </tr>
+                )}
+                {so.taxForeign > 0 && (
+                  <tr>
+                    <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-muted-foreground">{so.taxRateName ?? 'Tax'}{so.taxRatePercent != null ? ` (${(so.taxRatePercent * 100).toFixed(0)}%)` : ''}</td>
+                    <td colSpan={rightSpan} className="px-4 py-1.5 text-right tabular-nums font-mono">{money(so.taxForeign)}</td>
+                  </tr>
+                )}
+                <tr className="border-t">
+                  <td colSpan={labelSpan} className="px-4 py-2 text-right font-medium text-muted-foreground">Total</td>
+                  <td colSpan={rightSpan} className="px-4 py-2 text-right tabular-nums font-mono">
+                    <span className="font-semibold">{money(so.totalForeign)}</span>
+                    {so.currency !== 'GBP' && <span className="text-muted-foreground font-normal text-xs ml-1">({formatMoney(so.totalGbp, '£')})</span>}
+                  </td>
+                </tr>
+              </>
+            })()}
           </tfoot>
         </table>
       </div>
@@ -1122,18 +1195,18 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
             </div>
             <div>
               <span className="text-muted-foreground text-xs">Total</span>
-              <p className="font-medium font-mono">{so.totalForeign.toFixed(2)}{sym}</p>
+              <p className="font-medium font-mono">{money(so.totalForeign)}</p>
             </div>
             <div>
               <span className="text-muted-foreground text-xs">Paid</span>
               <p className="font-medium font-mono">
-                {(() => { const invPayments = so.payments.filter((p) => !p.refundId); const paid = invPayments.reduce((s, p) => s + p.amount, 0); return `${paid.toFixed(2)}${sym}` })()}
+                {(() => { const invPayments = so.payments.filter((p) => !p.refundId); const paid = invPayments.reduce((s, p) => s + p.amount, 0); return money(paid) })()}
               </p>
             </div>
             <div>
               <span className="text-muted-foreground text-xs">Balance</span>
               <p className={`font-medium font-mono ${(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0); return so.totalForeign - paid > 0.01 ? 'text-destructive' : 'text-green-600' })()}`}>
-                {(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0); const bal = so.totalForeign - paid; return bal > 0.01 ? `${bal.toFixed(2)}${sym} due` : 'Settled' })()}
+                {(() => { const paid = so.payments.filter((p) => !p.refundId).reduce((s, p) => s + p.amount, 0); const bal = so.totalForeign - paid; return bal > 0.01 ? `${money(bal)} due` : 'Settled' })()}
               </p>
             </div>
           </div>
@@ -1148,7 +1221,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
                     {p.reference && <span className="font-mono text-muted-foreground">{p.reference}</span>}
                   </div>
                   <div className="flex items-center gap-2">
-                    <span className="font-mono font-medium">{p.amount.toFixed(2)}{sym}</span>
+                    <span className="font-mono font-medium">{money(p.amount)}</span>
                     <button type="button" onClick={() => { if (confirm('Delete this payment?')) startTransition(async () => { await deletePayment(p.id, so.id); router.refresh() }) }} className="text-muted-foreground hover:text-destructive">
                       <Trash2 className="h-3 w-3" />
                     </button>
@@ -1179,11 +1252,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
                   {r.creditNoteNumber && <span className="font-mono text-xs font-medium">{r.creditNoteNumber}</span>}
                   <span className="text-muted-foreground text-xs">{new Date(r.refundedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
                 </div>
-                <span className="font-mono font-medium text-destructive">-{r.totalForeign.toFixed(2)}{sym}</span>
+                <span className="font-mono font-medium text-destructive">-{money(r.totalForeign)}</span>
               </div>
               {r.reason && <p className="text-xs"><span className="text-muted-foreground">Reason:</span> {r.reason}</p>}
               <table className="w-full text-xs"><tbody className="divide-y">{r.lines.map((rl) => (
-                <tr key={rl.id}><td className="py-1 pr-4">{rl.description}</td><td className="py-1 pr-4 text-right tabular-nums">{rl.qty}</td><td className="py-1 text-right font-mono">£{rl.totalGbp.toFixed(2)}</td></tr>
+                <tr key={rl.id}><td className="py-1 pr-4">{rl.description}</td><td className="py-1 pr-4 text-right tabular-nums">{rl.qty}</td><td className="py-1 text-right font-mono">{formatMoney(rl.totalGbp, '£', 'PREFIX')}</td></tr>
               ))}</tbody></table>
               {/* Credit note payments */}
               {r.payments.length > 0 && (
@@ -1195,7 +1268,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
                         {p.method && <span className="text-muted-foreground">{p.method}</span>}
                       </div>
                       <div className="flex items-center gap-2">
-                        <span className="font-mono">{p.amount.toFixed(2)}{sym}</span>
+                        <span className="font-mono">{money(p.amount)}</span>
                         <button type="button" onClick={() => { if (confirm('Delete?')) startTransition(async () => { await deletePayment(p.id, so.id); router.refresh() }) }} className="text-muted-foreground hover:text-destructive"><Trash2 className="h-3 w-3" /></button>
                       </div>
                     </div>
@@ -1272,16 +1345,16 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
                       <td className="px-3 py-2 text-right font-mono text-xs">{line.unitPriceForeign.toFixed(2)}</td>
                       <td className="px-3 py-2 text-right font-mono text-xs text-destructive">{line.discountAmount > 0 ? `-${line.discountAmount.toFixed(2)}` : '—'}</td>
                       <td className="px-3 py-2 text-right font-mono text-xs">{line.taxForeign > 0 ? line.taxForeign.toFixed(2) : '—'}</td>
-                      <td className="px-3 py-2 text-right font-mono text-xs">{line.totalForeign.toFixed(2)}{sym}</td>
+                      <td className="px-3 py-2 text-right font-mono text-xs">{money(line.totalForeign)}</td>
                     </tr>
                   ))}
                 </tbody>
                 <tfoot className="border-t bg-muted/30 text-sm">
-                  <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">Subtotal</td><td className="px-3 py-1.5 text-right font-mono">{so.subtotalForeign.toFixed(2)}{sym}</td></tr>
-                  {so.discountAmount > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-destructive">Discount</td><td className="px-3 py-1.5 text-right font-mono text-destructive">-{so.discountAmount.toFixed(2)}{sym}</td></tr>}
-                  {so.shippingForeign > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">Shipping</td><td className="px-3 py-1.5 text-right font-mono">{so.shippingForeign.toFixed(2)}{sym}</td></tr>}
-                  {so.taxForeign > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">{so.taxRateName ?? 'Tax'}{so.taxRatePercent != null ? ` (${(so.taxRatePercent * 100).toFixed(0)}%)` : ''}</td><td className="px-3 py-1.5 text-right font-mono">{so.taxForeign.toFixed(2)}{sym}</td></tr>}
-                  <tr className="border-t"><td colSpan={5} className="px-3 py-2 text-right font-medium">Total</td><td className="px-3 py-2 text-right font-mono font-semibold">{so.totalForeign.toFixed(2)}{sym}{so.currency !== 'GBP' && <span className="text-muted-foreground font-normal text-xs ml-1">(£{so.totalGbp.toFixed(2)})</span>}</td></tr>
+                  <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">Subtotal</td><td className="px-3 py-1.5 text-right font-mono">{money(so.subtotalForeign)}</td></tr>
+                  {so.discountAmount > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-destructive">Discount</td><td className="px-3 py-1.5 text-right font-mono text-destructive">-{money(so.discountAmount)}</td></tr>}
+                  {so.shippingForeign > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">Shipping</td><td className="px-3 py-1.5 text-right font-mono">{money(so.shippingForeign)}</td></tr>}
+                  {so.taxForeign > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">{so.taxRateName ?? 'Tax'}{so.taxRatePercent != null ? ` (${(so.taxRatePercent * 100).toFixed(0)}%)` : ''}</td><td className="px-3 py-1.5 text-right font-mono">{money(so.taxForeign)}</td></tr>}
+                  <tr className="border-t"><td colSpan={5} className="px-3 py-2 text-right font-medium">Total</td><td className="px-3 py-2 text-right font-mono font-semibold">{money(so.totalForeign)}{so.currency !== 'GBP' && <span className="text-muted-foreground font-normal text-xs ml-1">({formatMoney(so.totalGbp, '£', 'PREFIX')})</span>}</td></tr>
                 </tfoot>
               </table>
             </div>
@@ -1297,13 +1370,13 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
                         {r.creditNoteNumber && <span className="font-mono text-xs font-medium">{r.creditNoteNumber}</span>}
                         <span className="text-muted-foreground text-xs">{new Date(r.refundedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
                       </div>
-                      <span className="font-mono font-medium text-destructive">-{r.totalForeign.toFixed(2)}{sym}</span>
+                      <span className="font-mono font-medium text-destructive">-{money(r.totalForeign)}</span>
                     </div>
                     {r.reason && <p className="text-xs text-muted-foreground">{r.reason}</p>}
                     {r.lines.map((rl) => (
                       <div key={rl.id} className="flex justify-between text-xs pl-3">
                         <span>{rl.description} x {rl.qty}</span>
-                        <span className="font-mono text-destructive">-£{rl.totalGbp.toFixed(2)}</span>
+                        <span className="font-mono text-destructive">-{formatMoney(rl.totalGbp, '£', 'PREFIX')}</span>
                       </div>
                     ))}
                   </div>

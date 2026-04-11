@@ -49,7 +49,7 @@ export const authConfig: NextAuthConfig = {
         if (session.name !== undefined) token.name = session.name
         // totpVerified can only be set via a server-issued one-time token
         if (session.totpVerified === true && session._totpToken) {
-          const verified = consumeAuthToken(`totp_verify:${session._totpToken}`)
+          const verified = await consumeAuthToken(`totp_verify:${session._totpToken}`)
           if (verified === token.id) {
             token.totpVerified = true
           }
@@ -138,7 +138,7 @@ export const authConfig: NextAuthConfig = {
         // Verify the one-time auth token from verifyPasskeyAuthentication.
         // This binds the signIn call to a successful WebAuthn verification,
         // preventing direct signIn('passkey', { userId }) without verification.
-        const verifiedUserId = consumeAuthToken(`passkey_auth:${authToken}`)
+        const verifiedUserId = await consumeAuthToken(`passkey_auth:${authToken}`)
         if (!verifiedUserId || verifiedUserId !== userId) return null
 
         const user = await db.user.findUnique({

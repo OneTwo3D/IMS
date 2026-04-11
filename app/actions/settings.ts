@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth } from '@/lib/auth/server'
+import { requireAuth, requirePermission } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Adjustment Reasons
@@ -51,7 +51,7 @@ export type ReasonInput = {
 export async function createAdjustmentReason(
   data: ReasonInput
 ): Promise<ReasonFormState> {
-  await requireAuth()
+  await requirePermission('settings.company')
   const parsed = reasonSchema.safeParse(data)
   if (!parsed.success) {
     return { errors: parsed.error.flatten().fieldErrors }
@@ -75,7 +75,7 @@ export async function updateAdjustmentReason(
   id: string,
   data: ReasonInput
 ): Promise<ReasonFormState> {
-  await requireAuth()
+  await requirePermission('settings.company')
   const parsed = reasonSchema.safeParse(data)
   if (!parsed.success) {
     return { errors: parsed.error.flatten().fieldErrors }
@@ -97,7 +97,7 @@ export async function updateAdjustmentReason(
 }
 
 export async function deleteAdjustmentReason(id: string): Promise<{ error?: string }> {
-  await requireAuth()
+  await requirePermission('settings.company')
   try {
     await db.adjustmentReason.delete({ where: { id } })
     logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted adjustment reason' })
@@ -113,6 +113,8 @@ export async function deleteAdjustmentReason(id: string): Promise<{ error?: stri
 // Tax Rates
 // ---------------------------------------------------------------------------
 
+export type TaxCategoryValue = 'STANDARD' | 'REDUCED' | 'SECOND_REDUCED' | 'ZERO' | 'EXEMPT'
+
 export type TaxRateRow = {
   id: string
   name: string
@@ -120,8 +122,19 @@ export type TaxRateRow = {
   type: string
   usedFor: string
   accountingTaxType: string | null
+  countryCode: string | null
+  taxCategory: TaxCategoryValue
   isDefault: boolean
   active: boolean
+}
+
+const TAX_CATEGORIES: TaxCategoryValue[] = ['STANDARD', 'REDUCED', 'SECOND_REDUCED', 'ZERO', 'EXEMPT']
+
+function normaliseTaxCategory(input: unknown): TaxCategoryValue {
+  if (typeof input === 'string' && (TAX_CATEGORIES as string[]).includes(input)) {
+    return input as TaxCategoryValue
+  }
+  return 'STANDARD'
 }
 
 export async function getTaxRates(activeOnly = true): Promise<TaxRateRow[]> {
@@ -129,7 +142,18 @@ export async function getTaxRates(activeOnly = true): Promise<TaxRateRow[]> {
   const rows = await db.taxRate.findMany({
     where: activeOnly ? { active: true } : undefined,
     orderBy: [{ isDefault: 'desc' }, { name: 'asc' }],
-    select: { id: true, name: true, rate: true, type: true, usedFor: true, accountingTaxType: true, isDefault: true, active: true },
+    select: {
+      id: true,
+      name: true,
+      rate: true,
+      type: true,
+      usedFor: true,
+      accountingTaxType: true,
+      countryCode: true,
+      taxCategory: true,
+      isDefault: true,
+      active: true,
+    },
   })
   return rows.map((r) => ({
     id: r.id,
@@ -138,6 +162,8 @@ export async function getTaxRates(activeOnly = true): Promise<TaxRateRow[]> {
     type: r.type,
     usedFor: r.usedFor,
     accountingTaxType: r.accountingTaxType,
+    countryCode: r.countryCode,
+    taxCategory: r.taxCategory as TaxCategoryValue,
     isDefault: r.isDefault,
     active: r.active,
   }))
@@ -148,8 +174,10 @@ export async function createTaxRate(input: {
   rate: number
   usedFor: string
   accountingTaxType?: string
+  countryCode?: string | null
+  taxCategory?: TaxCategoryValue
 }): Promise<{ success: boolean; error?: string }> {
-  await requireAuth()
+  await requirePermission('settings.company')
   try {
     await db.taxRate.create({
       data: {
@@ -157,6 +185,8 @@ export async function createTaxRate(input: {
         rate: input.rate,
         usedFor: input.usedFor || 'BOTH',
         accountingTaxType: input.accountingTaxType || null,
+        countryCode: input.countryCode ? input.countryCode.toLowerCase() : null,
+        taxCategory: normaliseTaxCategory(input.taxCategory),
       },
     })
     logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created tax rate: ${input.name} (${input.rate}%)` })
@@ -173,9 +203,11 @@ export async function updateTaxRate(id: string, input: {
   rate?: number
   usedFor?: string
   accountingTaxType?: string
+  countryCode?: string | null
+  taxCategory?: TaxCategoryValue
   active?: boolean
 }): Promise<{ success: boolean; error?: string }> {
-  await requireAuth()
+  await requirePermission('settings.company')
   try {
     await db.taxRate.update({
       where: { id },
@@ -184,6 +216,8 @@ export async function updateTaxRate(id: string, input: {
         ...(input.rate !== undefined && { rate: input.rate }),
         ...(input.usedFor !== undefined && { usedFor: input.usedFor }),
         ...(input.accountingTaxType !== undefined && { accountingTaxType: input.accountingTaxType || null }),
+        ...(input.countryCode !== undefined && { countryCode: input.countryCode ? input.countryCode.toLowerCase() : null }),
+        ...(input.taxCategory !== undefined && { taxCategory: normaliseTaxCategory(input.taxCategory) }),
         ...(input.active !== undefined && { active: input.active }),
       },
     })
@@ -210,7 +244,7 @@ export async function autoLinkXeroTaxRates(): Promise<{
   xeroRatesCount: number
   error?: string
 }> {
-  await requireAuth()
+  await requirePermission('settings.company')
   try {
     const { getXeroTaxRates } = await import('@/lib/connectors/xero/accounts')
     const result = await getXeroTaxRates()
@@ -285,7 +319,7 @@ export async function getUsers(): Promise<UserOption[]> {
 }
 
 export async function setSetting(key: string, value: string): Promise<void> {
-  await requireAuth()
+  await requirePermission('settings.company')
   await db.setting.upsert({
     where: { key },
     create: { key, value },
@@ -331,7 +365,7 @@ export async function createPurchaseUnit(input: {
   conversionFactor: number
   stockUnitName: string
 }): Promise<{ success: boolean; error?: string }> {
-  await requireAuth()
+  await requirePermission('settings.company')
   try {
     if (!input.name.trim()) return { success: false, error: 'Name is required' }
     if (!input.abbreviation.trim()) return { success: false, error: 'Abbreviation is required' }
@@ -374,7 +408,7 @@ export async function updatePurchaseUnit(id: string, input: {
   stockUnitName?: string
   active?: boolean
 }): Promise<{ success: boolean; error?: string }> {
-  await requireAuth()
+  await requirePermission('settings.company')
   try {
     await db.purchaseUnit.update({
       where: { id },

@@ -2,10 +2,16 @@
 // Minimal CSV utilities — no dependencies
 // ---------------------------------------------------------------------------
 
+// Characters that trigger formula evaluation in Excel / LibreOffice / Google Sheets
+// when they appear at the start of a cell. We neutralise by prefixing with `'`.
+const FORMULA_PREFIX = /^[=+\-@\t\r]/
+
 /** Escape a single value for CSV output */
 function escapeField(value: unknown): string {
   if (value === null || value === undefined) return ''
-  const str = String(value)
+  let str = String(value)
+  // CSV injection mitigation — see OWASP "Formula Injection".
+  if (FORMULA_PREFIX.test(str)) str = "'" + str
   // Quote if contains comma, quote, newline
   if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
     return '"' + str.replace(/"/g, '""') + '"'

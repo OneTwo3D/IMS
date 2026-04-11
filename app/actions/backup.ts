@@ -2,7 +2,7 @@
 
 import { readdir, stat, unlink } from 'fs/promises'
 import path from 'path'
-import { auth } from '@/lib/auth'
+import { requireAdmin } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 
 const BACKUP_DIR = path.join(process.cwd(), 'backups')
@@ -14,8 +14,11 @@ export type BackupEntry = {
 }
 
 export async function listBackups(): Promise<BackupEntry[]> {
-  const session = await auth()
-  if (!session?.user?.id || session.user.role !== 'ADMIN') return []
+  try {
+    await requireAdmin()
+  } catch {
+    return []
+  }
 
   try {
     const files = await readdir(BACKUP_DIR)
@@ -39,8 +42,11 @@ export async function listBackups(): Promise<BackupEntry[]> {
 }
 
 export async function deleteBackup(filename: string): Promise<{ success: boolean; error?: string }> {
-  const session = await auth()
-  if (!session?.user?.id || session.user.role !== 'ADMIN') return { success: false, error: 'Unauthorized' }
+  try {
+    await requireAdmin()
+  } catch {
+    return { success: false, error: 'Unauthorized' }
+  }
 
   // Prevent path traversal
   const safe = path.basename(filename)

@@ -42,7 +42,7 @@ export function TotpSetup({ enabled }: TotpSetupProps) {
     const res = await fetch('/api/auth/totp-setup', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ code, secret }),
+      body: JSON.stringify({ code }),
     })
     const data = await res.json()
     setLoading(false)

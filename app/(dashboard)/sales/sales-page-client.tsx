@@ -28,9 +28,10 @@ type Props = {
   avgCogs: Record<string, number>
   users: UserOption[]
   currentUserName: string
+  companyHomeCountry?: string | null
 }
 
-export function SalesPageClient({ initialOrders, products, warehouses, currencies, taxRates, customers, stockLevels, avgCogs, users, currentUserName }: Props) {
+export function SalesPageClient({ initialOrders, products, warehouses, currencies, taxRates, customers, stockLevels, avgCogs, users, currentUserName, companyHomeCountry }: Props) {
   const [showCreate, setShowCreate] = useState(false)
 
   const currencySymbols: Record<string, string> = { GBP: '£' }
@@ -58,6 +59,7 @@ export function SalesPageClient({ initialOrders, products, warehouses, currencie
           avgCogs={avgCogs}
           users={users}
           currentUserName={currentUserName}
+          companyHomeCountry={companyHomeCountry}
           onClose={() => setShowCreate(false)}
         />
       )}

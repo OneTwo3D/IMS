@@ -140,6 +140,7 @@ enum AccountingSyncType {
   DAILY_BATCH_INVENTORY_ALLOC
   DAILY_BATCH_GROUP_B
   UNEARNED_REV_REVERSAL
+  BILL_PAYMENT
 
   @@map("XeroSyncType")
 }
@@ -194,6 +195,14 @@ enum TaxType {
   NONE
 }
 
+enum TaxCategory {
+  STANDARD
+  REDUCED
+  SECOND_REDUCED
+  ZERO
+  EXEMPT
+}
+
 enum CurrencyType {
   SALES
   PURCHASE
@@ -213,6 +222,7 @@ model User {
   supplierId     String?   // set when role=SUPPLIER — links to their company
   pictureUrl     String?
   totpSecret     String?   // null = 2FA not enabled
+  pendingTotpSecret String? // staged secret during setup before confirmation
   totpEnabled    Boolean   @default(false)
   active         Boolean   @default(true)
   lastLoginAt    DateTime?
@@ -222,6 +232,7 @@ model User {
   supplier       Supplier? @relation(fields: [supplierId], references: [id])
   activityLogs   ActivityLog[]
   notifications  Notification[]
+  notificationReadReceipts NotificationReadReceipt[]
   sessions       Session[]
   passkeys       Passkey[]
 
@@ -331,16 +342,22 @@ model AdjustmentReason {
 // ---------------------------------------------------------------------------
 
 model Currency {
-  code         String       @id // ISO 4217, e.g. "GBP"
-  name         String
-  symbol       String
-  usedFor      CurrencyType @default(BOTH)
-  active       Boolean      @default(true)
-  createdAt    DateTime     @default(now())
+  code           String             @id // ISO 4217, e.g. "GBP"
+  name           String
+  symbol         String
+  symbolPosition CurrencySymbolPos  @default(PREFIX) // "£23.99" vs "23.99 €"
+  usedFor        CurrencyType       @default(BOTH)
+  active         Boolean            @default(true)
+  createdAt      DateTime           @default(now())
 
-  fxRates      FxRate[]
+  fxRates        FxRate[]
 
   @@map("currencies")
+}
+
+enum CurrencySymbolPos {
+  PREFIX
+  POSTFIX
 }
 
 model FxRate {
@@ -361,23 +378,25 @@ model FxRate {
 // ---------------------------------------------------------------------------
 
 model TaxRate {
-  id          String   @id @default(cuid())
-  name        String   // e.g. "UK Standard Rate"
-  rate        Decimal  @db.Decimal(5, 4) // e.g. 0.2000 for 20%
-  type        TaxType  @default(VAT)
-  usedFor     String   @default("BOTH") // SALES, PURCHASE, BOTH
+  id          String      @id @default(cuid())
+  name        String      // e.g. "UK Standard Rate"
+  rate        Decimal     @db.Decimal(5, 4) // e.g. 0.2000 for 20%
+  type        TaxType     @default(VAT)
+  taxCategory TaxCategory @default(STANDARD)
+  usedFor     String      @default("BOTH") // SALES, PURCHASE, BOTH
   accountingTaxType String?  @map("xero_tax_type") // Accounting tax type code e.g. "OUTPUT2", "INPUT2"
-  countryCode String?  // ISO 3166-1 alpha-2, null = applies globally
-  active      Boolean  @default(true)
-  isDefault   Boolean  @default(false)
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  countryCode String?     // ISO 3166-1 alpha-2, null = applies globally
+  active      Boolean     @default(true)
+  isDefault   Boolean     @default(false)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
 
   supplierTaxRate    Supplier[]
   orderLines         SalesOrderLine[]
   poLines            PurchaseOrderLine[]
   wcTaxRateMappings  WcTaxRateMapping[]
 
+  @@index([countryCode, taxCategory, usedFor])
   @@map("tax_rates")
 }
 
@@ -449,6 +468,9 @@ model Product {
   salesPriceGbp   Decimal?    @db.Decimal(12, 4)   // regular / list price
   salePriceGbp    Decimal?    @db.Decimal(12, 4)   // sale / discounted price
   salesPriceTaxInclusive Boolean @default(false)
+
+  // Tax
+  taxCategory     TaxCategory @default(STANDARD)
 
   // Stock behaviour
   stockUnit       String      @default("pcs")       // display unit for stock levels, e.g. "pcs", "m", "kg"
@@ -625,6 +647,12 @@ model Supplier {
   vatNumber       String?
   accountNumber   String?   // our account ref with supplier
   paymentTermsDays Int?
+  /**
+   * User-entered override for expected delivery time in days. Does NOT
+   * overwrite the computed average — the average is always shown alongside
+   * as read-only info in the supplier form.
+   */
+  manualDeliveryDays Int?
   notes           String?
   active          Boolean   @default(true)
   createdAt       DateTime  @default(now())
@@ -681,6 +709,10 @@ model PurchaseOrder {
   directFreightForeign Decimal        @db.Decimal(18, 4) @default(0)
   directFreightGbp     Decimal        @db.Decimal(18, 4) @default(0)
 
+  // Order-level discount (applied on top of any per-line discounts)
+  discountStr      String?            // user input e.g. "10%" or "50.00"
+  discountAmount   Decimal            @db.Decimal(18, 4) @default(0) // computed order discount in foreign currency, same tax convention as lines
+
   landedCostMethod LandedCostMethod  @default(BY_VALUE)
 
   destinationWarehouseId String?    // where goods will be received (can change before receipt)
@@ -725,13 +757,15 @@ model PurchaseOrderLine {
   qty             Decimal   @db.Decimal(12, 4) // always in stock units
   purchaseUnitId  String?
   purchaseUnitQty Decimal?  @db.Decimal(12, 4) // qty in purchase units (e.g. 2 boxes)
-  unitCostForeign Decimal   @db.Decimal(18, 6)  // cost per purchase unit (or per stock unit if no unit)
-  unitCostGbp     Decimal   @db.Decimal(18, 6)
+  unitCostForeign Decimal   @db.Decimal(18, 6)  // effective net cost per stock unit (post-discount, post-VAT extraction)
+  unitCostGbp     Decimal   @db.Decimal(18, 6)  // effective net cost per stock unit in GBP
+  discountStr     String?   // e.g. "5%" or "2.50" — original user input (display only)
+  discountAmount  Decimal   @db.Decimal(18, 4) @default(0) // line discount amount in foreign currency (same inclusive/exclusive convention as the user-entered unit cost)
   taxRateId       String?
   taxForeign      Decimal   @db.Decimal(18, 4) @default(0)
   taxGbp          Decimal   @db.Decimal(18, 4) @default(0)
-  totalForeign    Decimal   @db.Decimal(18, 4)
-  totalGbp        Decimal   @db.Decimal(18, 4)
+  totalForeign    Decimal   @db.Decimal(18, 4) // net of discount and VAT
+  totalGbp        Decimal   @db.Decimal(18, 4) // net of discount and VAT
   landedUnitCostGbp Decimal @db.Decimal(18, 6) @default(0) // set after landed cost allocation
   qtyReceived     Decimal   @db.Decimal(12, 4) @default(0)
   qtyReturned     Decimal   @db.Decimal(12, 4) @default(0)
@@ -793,6 +827,7 @@ model FreightCostLine {
   sortOrder          Int              @default(0)
 
   po                 PurchaseOrder    @relation(fields: [poId], references: [id])
+  invoiceLines       PurchaseInvoiceLine[]
 
   @@map("freight_cost_lines")
 }
@@ -841,6 +876,9 @@ model PurchaseInvoice {
   supplierInvoiceUrl String? // path to uploaded supplier PDF
   accountingInvoiceId String?  @map("xero_invoice_id")
   paidAt          DateTime?
+  paymentAccountId   String?   // connector account id (e.g. Xero bank AccountID) used to pay this bill
+  paymentAccountName String?   // snapshot of the bank account name at payment time
+  paymentReference   String?   // optional user-entered payment reference
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
@@ -853,15 +891,19 @@ model PurchaseInvoice {
 model PurchaseInvoiceLine {
   id              String    @id @default(cuid())
   invoiceId       String
-  poLineId        String
+  poLineId        String?
+  costLineId      String?
+  description     String?
   qtyBilled       Decimal   @db.Decimal(12, 4)
   unitCostForeign Decimal   @db.Decimal(18, 6)
   totalForeign    Decimal   @db.Decimal(18, 4)
   totalGbp        Decimal   @db.Decimal(18, 4)
 
-  invoice         PurchaseInvoice   @relation(fields: [invoiceId], references: [id])
-  poLine          PurchaseOrderLine @relation(fields: [poLineId], references: [id])
+  invoice         PurchaseInvoice    @relation(fields: [invoiceId], references: [id])
+  poLine          PurchaseOrderLine? @relation(fields: [poLineId], references: [id])
+  costLine        FreightCostLine?   @relation(fields: [costLineId], references: [id])
 
+  @@index([costLineId])
   @@map("purchase_invoice_lines")
 }
 
@@ -943,6 +985,7 @@ model SalesOrder {
   taxRateName       String?          // e.g. "UK Standard Rate"
   taxRatePercent    Decimal?         @db.Decimal(5, 4) // e.g. 0.2000
   taxForeign        Decimal          @db.Decimal(18, 4) @default(0)
+  pricesIncludeVat  Boolean          @default(false) // true when unit prices are tax-inclusive (display as gross)
   totalForeign      Decimal          @db.Decimal(18, 4)
 
   // Totals in GBP
@@ -1383,10 +1426,41 @@ model Notification {
   createdAt DateTime @default(now())
   readAt    DateTime?
 
-  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+  user         User?                    @relation(fields: [userId], references: [id], onDelete: SetNull)
+  readReceipts NotificationReadReceipt[]
 
   @@index([userId, read, createdAt])
   @@map("notifications")
+}
+
+/// Per-user read receipt for notifications.
+/// Broadcast notifications (userId=null) use this table so that marking them
+/// read only affects the calling user, not everyone.
+model NotificationReadReceipt {
+  id             String   @id @default(cuid())
+  notificationId String
+  userId         String
+  readAt         DateTime @default(now())
+
+  notification   Notification @relation(fields: [notificationId], references: [id], onDelete: Cascade)
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([notificationId, userId])
+  @@index([userId])
+  @@map("notification_read_receipts")
+}
+
+/// One-time auth tokens (TOTP challenge, passkey challenge, etc.)
+/// Replaces the in-memory token store with a single-row lookup that survives
+/// next start restarts.
+model OneTimeToken {
+  key       String   @id            // e.g. "passkey_challenge:...", "totp_verify:..."
+  value     String
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([expiresAt])
+  @@map("one_time_tokens")
 }
 
 // ---------------------------------------------------------------------------

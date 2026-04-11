@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth } from '@/lib/auth/server'
+import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
 import type { Prisma } from '@/app/generated/prisma/client'
 
@@ -120,7 +120,7 @@ export async function adjustStock(
   _prev: AdjustmentFormState,
   formData: FormData
 ): Promise<AdjustmentFormState> {
-  await requireAuth()
+  await requirePermission('stock_control.adjust')
   const parsed = adjustSchema.safeParse({
     productId: formData.get('productId'),
     warehouseId: formData.get('warehouseId'),
@@ -272,7 +272,7 @@ export type BulkAdjustFormState = {
 export async function bulkAdjustStock(
   lines: BulkAdjustLine[]
 ): Promise<BulkAdjustFormState> {
-  await requireAuth()
+  await requirePermission('stock_control.adjust')
   const valid = lines.filter((l) => l.qty !== 0 && l.productId && l.warehouseId)
 
   if (valid.length === 0) {
@@ -445,7 +445,7 @@ export async function updateAdjustmentMovement(
   newSignedQty: number,
   newNote: string | null
 ): Promise<UpdateAdjustmentResult> {
-  await requireAuth()
+  await requirePermission('stock_control.adjust')
   if (newSignedQty === 0) {
     return { message: 'Quantity must be non-zero.' }
   }
@@ -531,7 +531,7 @@ export async function fetchWcImage(
   sku: string
 ): Promise<{ imageUrl: string | null; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('stock_control.adjust')
     const urlSetting = await db.setting.findUnique({ where: { key: 'wc_url' } })
     const keySetting = await db.setting.findUnique({ where: { key: 'wc_consumer_key' } })
     const secretSetting = await db.setting.findUnique({ where: { key: 'wc_consumer_secret' } })
@@ -577,7 +577,7 @@ export async function getWarehouses() {
   await requireAuth()
   return db.warehouse.findMany({
     where: { active: true },
-    select: { id: true, code: true, name: true, type: true },
+    select: { id: true, code: true, name: true, type: true, country: true },
     orderBy: { code: 'asc' },
   })
 }

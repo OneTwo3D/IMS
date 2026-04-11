@@ -70,7 +70,7 @@ export function CurrenciesTable({ currencies }: Props) {
 
   // GBP always shown first, then active, then inactive
   const gbp: CurrencyRow = currencies.find((c) => c.code === 'GBP') ?? {
-    code: 'GBP', name: 'British Pound', symbol: '£', active: true, latestRate: 1, rateDate: null,
+    code: 'GBP', name: 'British Pound', symbol: '£', symbolPosition: 'PREFIX', active: true, latestRate: 1, rateDate: null,
   }
   const others = currencies.filter((c) => c.code !== 'GBP')
   const sorted = [gbp, ...others.filter((c) => c.active), ...others.filter((c) => !c.active)]

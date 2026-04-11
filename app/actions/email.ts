@@ -1,11 +1,20 @@
 'use server'
 
 import { auth } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth/server'
 import { db } from '@/lib/db'
 import { sendEmail } from '@/lib/mailer'
 import { renderEmailHtml, type EmailTemplateType } from '@/lib/email-template'
 import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
 import { logActivity } from '@/lib/activity-log'
+import { formatMoney, type SymbolPos } from '@/lib/utils'
+
+async function getCurrencyFormat(code: string): Promise<{ sym: string; symPos: SymbolPos; money: (n: number) => string }> {
+  const row = await db.currency.findUnique({ where: { code } })
+  const sym = row?.symbol ?? (code === 'GBP' ? '£' : code)
+  const symPos: SymbolPos = row?.symbolPosition ?? 'PREFIX'
+  return { sym, symPos, money: (n: number) => formatMoney(n, sym, symPos) }
+}
 
 // ---------------------------------------------------------------------------
 // Send sales order email with PDF attachment
@@ -13,6 +22,7 @@ import { logActivity } from '@/lib/activity-log'
 
 export async function sendSalesOrderEmail(orderId: string): Promise<{ success: boolean; error?: string }> {
   try {
+    await requirePermission('sales.process')
     const session = await auth()
     if (!session?.user?.id) return { success: false, error: 'Unauthorized' }
     const so = await db.salesOrder.findUnique({
@@ -27,7 +37,7 @@ export async function sendSalesOrderEmail(orderId: string): Promise<{ success: b
 
     const branding = await getBranding()
     const ref = so.wcOrderNumber ?? so.id.slice(0, 8)
-    const sym = so.currency === 'GBP' ? '£' : so.currency
+    const { money } = await getCurrencyFormat(so.currency)
 
     // Generate PDF
     const pdfBuffer = await generateSalesOrderPdf(so, branding)
@@ -42,7 +52,7 @@ export async function sendSalesOrderEmail(orderId: string): Promise<{ success: b
       subject: `Order Confirmation ${ref}`,
       bodyLines: [
         `Thank you for your order ${ref}.`,
-        `Please find your order confirmation attached for ${sym}${Number(so.totalForeign).toFixed(2)}.`,
+        `Please find your order confirmation attached for ${money(Number(so.totalForeign))}.`,
         'If you have any questions, please don\'t hesitate to contact us.',
       ],
     }, 'sales_order')
@@ -73,6 +83,7 @@ export async function sendSalesOrderEmail(orderId: string): Promise<{ success: b
 
 export async function sendInvoiceEmail(orderId: string): Promise<{ success: boolean; error?: string }> {
   try {
+    await requirePermission('sales.process')
     const session = await auth()
     if (!session?.user?.id) return { success: false, error: 'Unauthorized' }
     const so = await db.salesOrder.findUnique({
@@ -86,7 +97,7 @@ export async function sendInvoiceEmail(orderId: string): Promise<{ success: bool
     if (!so.invoiceNumber) return { success: false, error: 'No invoice generated yet' }
 
     const branding = await getBranding()
-    const sym = so.currency === 'GBP' ? '£' : so.currency
+    const { money } = await getCurrencyFormat(so.currency)
 
     // Generate PDF
     const pdfBuffer = await generateInvoicePdf(so, branding)
@@ -100,7 +111,7 @@ export async function sendInvoiceEmail(orderId: string): Promise<{ success: bool
       date,
       subject: `Invoice ${so.invoiceNumber}`,
       bodyLines: [
-        `Please find attached your invoice ${so.invoiceNumber} for ${sym}${Number(so.totalForeign).toFixed(2)}.`,
+        `Please find attached your invoice ${so.invoiceNumber} for ${money(Number(so.totalForeign))}.`,
         so.paidAt ? 'This invoice has been marked as paid. Thank you.' : 'Payment is due within 30 days of the invoice date.',
         'If you have any questions regarding this invoice, please don\'t hesitate to contact us.',
       ],
@@ -156,7 +167,7 @@ export async function sendAccountingInvoiceEmail(orderId: string): Promise<{ suc
 
     const branding = await getBranding()
     const ref = so.invoiceNumber ?? so.orderNumber ?? so.wcOrderNumber ?? orderId.slice(0, 8)
-    const sym = so.currency === 'GBP' ? '£' : so.currency
+    const { money } = await getCurrencyFormat(so.currency)
 
     const html = await renderEmailHtml(branding, {
       recipientName: so.customerName ?? 'Customer',
@@ -165,7 +176,7 @@ export async function sendAccountingInvoiceEmail(orderId: string): Promise<{ suc
       date: new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }),
       subject: `Invoice ${ref}`,
       bodyLines: [
-        `Please find attached your invoice ${ref} for ${sym}${Number(so.totalForeign).toFixed(2)}.`,
+        `Please find attached your invoice ${ref} for ${money(Number(so.totalForeign))}.`,
         so.paidAt ? 'This invoice has been paid. Thank you.' : 'Payment is due within 30 days of the invoice date.',
         'If you have any questions regarding this invoice, please don\'t hesitate to contact us.',
       ],
@@ -257,7 +268,7 @@ async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<
     doc.y += 10
   }
 
-  const sym = so.currency === 'GBP' ? '£' : so.currency
+  const { sym, symPos } = await getCurrencyFormat(so.currency)
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
@@ -275,7 +286,7 @@ async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<
   ])
   drawTable(doc, columns, rows, branding)
 
-  drawTotals(doc, so, sym, columns)
+  drawTotals(doc, so, sym, symPos, columns)
 
   // Footer note from template
   if (tpl?.footerNote) {
@@ -333,7 +344,7 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
     doc.y += 8
   }
 
-  const sym = so.currency === 'GBP' ? '£' : so.currency
+  const { sym, symPos } = await getCurrencyFormat(so.currency)
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'Description', width: 230 },
@@ -348,14 +359,14 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
   ])
   drawTable(doc, columns, rows, branding)
 
-  drawTotals(doc, so, sym, columns)
+  drawTotals(doc, so, sym, symPos, columns)
 
   if (so.currency !== 'GBP') {
     const tableRight = 50 + columns.reduce((s, c) => s + c.width, 0)
     const vW = columns[columns.length - 1].width
     const lW = 80
     doc.font('Helvetica').fontSize(8).fillColor('#888')
-      .text(`(GBP equivalent: £${Number(so.totalGbp).toFixed(2)})`, tableRight - vW - lW, doc.y + 3, { width: lW + vW, align: 'right' })
+      .text(`(GBP equivalent: ${formatMoney(Number(so.totalGbp), '£', 'PREFIX')})`, tableRight - vW - lW, doc.y + 3, { width: lW + vW, align: 'right' })
   }
 
   // Footer note from template
@@ -381,7 +392,8 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
   return pdfToBuffer(doc)
 }
 
-function drawTotals(doc: PDFKit.PDFDocument, so: SoForPdf, sym: string, columns: PdfTableColumn[]) {
+function drawTotals(doc: PDFKit.PDFDocument, so: SoForPdf, sym: string, symPos: SymbolPos, columns: PdfTableColumn[]) {
+  const money = (n: number) => formatMoney(n, sym, symPos)
   doc.y += 5
   const tableRight = 50 + columns.reduce((s, c) => s + c.width, 0)
   const vW = columns[columns.length - 1].width
@@ -389,21 +401,21 @@ function drawTotals(doc: PDFKit.PDFDocument, so: SoForPdf, sym: string, columns:
   const lX = tableRight - vW - lW
   doc.font('Helvetica').fontSize(9).fillColor('#666')
   doc.text('Subtotal:', lX, doc.y, { width: lW, align: 'right' })
-  doc.text(`${Number(so.subtotalForeign).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+  doc.text(money(Number(so.subtotalForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
   if (Number(so.discountAmount) > 0) {
     doc.text('Discount:', lX, doc.y, { width: lW, align: 'right' })
-    doc.text(`-${Number(so.discountAmount).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+    doc.text(`-${money(Number(so.discountAmount))}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
   }
   if (Number(so.shippingForeign) > 0) {
     doc.text('Shipping:', lX, doc.y, { width: lW, align: 'right' })
-    doc.text(`${Number(so.shippingForeign).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+    doc.text(money(Number(so.shippingForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
   }
   if (Number(so.taxForeign) > 0) {
     const taxLabel = (so.taxRateName ?? 'Tax') + (so.taxRatePercent != null ? ` (${(Number(so.taxRatePercent) * 100).toFixed(0)}%)` : '') + ':'
     doc.text(taxLabel, lX, doc.y, { width: lW, align: 'right' })
-    doc.text(`${Number(so.taxForeign).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+    doc.text(money(Number(so.taxForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
   }
   doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
   doc.text('Total:', lX, doc.y + 3, { width: lW, align: 'right' })
-  doc.text(`${Number(so.totalForeign).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+  doc.text(money(Number(so.totalForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
 }

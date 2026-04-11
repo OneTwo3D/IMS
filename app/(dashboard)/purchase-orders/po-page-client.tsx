@@ -14,7 +14,7 @@ import { PoListClient } from './po-list-client'
 import { PoFormDialog } from './po-form'
 import { FreightPoDialog } from './freight-po-form'
 
-type Warehouse = { id: string; code: string; name: string }
+type Warehouse = { id: string; code: string; name: string; country?: string | null }
 type GoodsPo = { id: string; reference: string; supplierName: string; totalForeign: number; currency: string }
 
 type Props = {
@@ -26,9 +26,10 @@ type Props = {
   taxRates: TaxRateRow[]
   purchaseUnits: PurchaseUnitRow[]
   goodsPos: GoodsPo[]
+  companyHomeCountry?: string | null
 }
 
-export function PurchaseOrdersClient({ initialPos, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, goodsPos }: Props) {
+export function PurchaseOrdersClient({ initialPos, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, goodsPos, companyHomeCountry }: Props) {
   const [showCreate, setShowCreate] = useState(false)
   const [showFreight, setShowFreight] = useState(false)
 
@@ -60,6 +61,7 @@ export function PurchaseOrdersClient({ initialPos, suppliers, products, warehous
           currencies={currencies}
           taxRates={taxRates}
           purchaseUnits={purchaseUnits}
+          companyHomeCountry={companyHomeCountry}
           onClose={() => setShowCreate(false)}
         />
       )}

@@ -40,12 +40,22 @@ export async function pushPurchaseBill(
     }
   }
 
-  // Build line items
+  // Build line items. Xero ACCPAY (bills) does NOT support DiscountRate at
+  // the line level — so we apply any generic per-line `discountAmount` by
+  // reducing `UnitAmount`. Keeping the Xero-specific handling inside the
+  // connector means callers can pass the same generic `discountAmount` field
+  // regardless of whether the target system is Xero or (future) QuickBooks.
   const lineItems = data.lines.map((line: InvoiceLine) => {
+    let effectiveUnitAmount = line.unitAmount
+    if (line.discountAmount && line.discountAmount > 0 && line.quantity > 0) {
+      const perUnitDiscount = line.discountAmount / line.quantity
+      effectiveUnitAmount = Math.round((line.unitAmount - perUnitDiscount) * 10000) / 10000
+      if (effectiveUnitAmount < 0) effectiveUnitAmount = 0
+    }
     const xeroLine: Record<string, unknown> = {
       Description: line.description,
       Quantity: line.quantity,
-      UnitAmount: line.unitAmount,
+      UnitAmount: effectiveUnitAmount,
       AccountCode: line.accountCode,
       TaxType: line.taxType || DEFAULT_TAX_TYPE,
     }

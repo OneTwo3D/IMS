@@ -5,13 +5,36 @@ import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
 import { ProductType } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth } from '@/lib/auth/server'
+import { requirePermission } from '@/lib/auth/server'
+import type { Permission } from '@/lib/auth/server'
 
 export type ImportResult = {
   created: number
   updated: number
   skipped: number
   errors: string[]
+}
+
+// Hard caps on CSV imports to prevent memory blow-up / DoS via giant files.
+const MAX_IMPORT_BYTES = 10 * 1024 * 1024 // 10 MB
+const MAX_IMPORT_ROWS = 10_000
+
+async function validateImportFile(
+  formData: FormData,
+  permission: Permission,
+): Promise<{ file: File } | { error: string }> {
+  await requirePermission(permission)
+  const file = formData.get('file') as File | null
+  if (!file) return { error: 'No file provided' }
+  if (file.size > MAX_IMPORT_BYTES) {
+    return { error: `File exceeds maximum size (${MAX_IMPORT_BYTES / (1024 * 1024)} MB)` }
+  }
+  return { file }
+}
+
+function capRows<T>(rows: T[]): { rows: T[]; dropped: number } {
+  if (rows.length <= MAX_IMPORT_ROWS) return { rows, dropped: 0 }
+  return { rows: rows.slice(0, MAX_IMPORT_ROWS), dropped: rows.length - MAX_IMPORT_ROWS }
 }
 
 // ---------------------------------------------------------------------------
@@ -21,14 +44,17 @@ export type ImportResult = {
 const VALID_TYPES = new Set<string>(['SIMPLE', 'VARIABLE', 'VARIANT', 'KIT', 'BOM', 'NON_INVENTORY'])
 
 export async function importProductsCsv(formData: FormData): Promise<ImportResult> {
-  await requireAuth()
-  const file = formData.get('file') as File | null
-  if (!file) return { created: 0, updated: 0, skipped: 0, errors: ['No file provided'] }
+  const validated = await validateImportFile(formData, 'inventory.edit')
+  if ('error' in validated) return { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
 
-  const text = await file.text()
-  const rows = parseCsv(text)
+  const text = await validated.file.text()
+  const parsed = parseCsv(text)
+  const { rows, dropped } = capRows(parsed)
 
   const result: ImportResult = { created: 0, updated: 0, skipped: 0, errors: [] }
+  if (dropped > 0) {
+    result.errors.push(`File has more than ${MAX_IMPORT_ROWS} rows — ${dropped} row(s) skipped`)
+  }
 
   // Build parent lookup: sku → id
   const allProducts = await db.product.findMany({ select: { id: true, sku: true } })
@@ -195,14 +221,17 @@ export async function importProductsCsv(formData: FormData): Promise<ImportResul
 // ---------------------------------------------------------------------------
 
 export async function importAdjustmentsCsv(formData: FormData): Promise<ImportResult> {
-  await requireAuth()
-  const file = formData.get('file') as File | null
-  if (!file) return { created: 0, updated: 0, skipped: 0, errors: ['No file provided'] }
+  const validated = await validateImportFile(formData, 'stock_control.adjust')
+  if ('error' in validated) return { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
 
-  const text = await file.text()
-  const rows = parseCsv(text)
+  const text = await validated.file.text()
+  const parsed = parseCsv(text)
+  const { rows, dropped } = capRows(parsed)
 
   const result: ImportResult = { created: 0, updated: 0, skipped: 0, errors: [] }
+  if (dropped > 0) {
+    result.errors.push(`File has more than ${MAX_IMPORT_ROWS} rows — ${dropped} row(s) skipped`)
+  }
 
   // Build lookup maps
   const products = await db.product.findMany({ select: { id: true, sku: true } })
@@ -279,12 +308,15 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<ImportRe
 // ---------------------------------------------------------------------------
 
 export async function importTransfersCsv(formData: FormData): Promise<ImportResult> {
-  await requireAuth()
-  const file = formData.get('file') as File | null
-  if (!file) return { created: 0, updated: 0, skipped: 0, errors: ['No file provided'] }
+  const validated = await validateImportFile(formData, 'stock_control.transfer')
+  if ('error' in validated) return { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
 
-  const rows = parseCsv(await file.text())
+  const parsed = parseCsv(await validated.file.text())
+  const { rows, dropped } = capRows(parsed)
   const result: ImportResult = { created: 0, updated: 0, skipped: 0, errors: [] }
+  if (dropped > 0) {
+    result.errors.push(`File has more than ${MAX_IMPORT_ROWS} rows — ${dropped} row(s) skipped`)
+  }
 
   const products = await db.product.findMany({ select: { id: true, sku: true } })
   const skuToId = new Map(products.map((p) => [p.sku.toUpperCase(), p.id]))
@@ -348,12 +380,15 @@ export async function importTransfersCsv(formData: FormData): Promise<ImportResu
 // ---------------------------------------------------------------------------
 
 export async function importSalesOrdersCsv(formData: FormData): Promise<ImportResult> {
-  await requireAuth()
-  const file = formData.get('file') as File | null
-  if (!file) return { created: 0, updated: 0, skipped: 0, errors: ['No file provided'] }
+  const validated = await validateImportFile(formData, 'sales.create')
+  if ('error' in validated) return { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
 
-  const rows = parseCsv(await file.text())
+  const parsed = parseCsv(await validated.file.text())
+  const { rows, dropped } = capRows(parsed)
   const result: ImportResult = { created: 0, updated: 0, skipped: 0, errors: [] }
+  if (dropped > 0) {
+    result.errors.push(`File has more than ${MAX_IMPORT_ROWS} rows — ${dropped} row(s) skipped`)
+  }
 
   const products = await db.product.findMany({ select: { id: true, sku: true, name: true, salesPriceGbp: true } })
   const skuMap = new Map(products.map((p) => [p.sku.toUpperCase(), p]))
@@ -425,12 +460,15 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<ImportRe
 // ---------------------------------------------------------------------------
 
 export async function importPurchaseOrdersCsv(formData: FormData): Promise<ImportResult> {
-  await requireAuth()
-  const file = formData.get('file') as File | null
-  if (!file) return { created: 0, updated: 0, skipped: 0, errors: ['No file provided'] }
+  const validated = await validateImportFile(formData, 'purchasing.create')
+  if ('error' in validated) return { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
 
-  const rows = parseCsv(await file.text())
+  const parsed = parseCsv(await validated.file.text())
+  const { rows, dropped } = capRows(parsed)
   const result: ImportResult = { created: 0, updated: 0, skipped: 0, errors: [] }
+  if (dropped > 0) {
+    result.errors.push(`File has more than ${MAX_IMPORT_ROWS} rows — ${dropped} row(s) skipped`)
+  }
 
   const products = await db.product.findMany({ select: { id: true, sku: true } })
   const skuMap = new Map(products.map((p) => [p.sku.toUpperCase(), p.id]))

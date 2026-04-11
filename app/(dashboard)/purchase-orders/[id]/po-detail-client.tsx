@@ -1,8 +1,9 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useState, useTransition, useEffect } from 'react'
+import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { Search, X, Plus, Pencil, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Receipt, Upload, Ship, ExternalLink } from 'lucide-react'
+import { Search, X, Plus, Pencil, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Receipt, Upload, Ship, ExternalLink, CreditCard, CheckCircle2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -20,19 +21,23 @@ import {
   receivePurchaseOrder,
   returnPurchaseOrder,
   createInvoice,
-  updatePurchaseOrder,
   updateFreightPoCosts,
-  getSupplierLastPrices,
+  markBillPaid,
+  getBillPaymentAccounts,
   type PoDetail,
   type PoStatus,
   type PoLineRow,
+  type InvoiceRow,
 } from '@/app/actions/purchase-orders'
+import type { AccountingBankAccount } from '@/lib/accounting'
 import type { SupplierRow } from '@/app/actions/suppliers'
 import type { ProductRow } from '@/app/actions/products'
 import type { CurrencyRow } from '@/app/actions/currencies'
-import type { TaxRateRow } from '@/app/actions/settings'
+import type { TaxRateRow, PurchaseUnitRow } from '@/app/actions/settings'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
+import { formatMoney } from '@/lib/utils'
+import { PoFormDialog } from '../po-form'
 
 type Warehouse = { id: string; code: string; name: string }
 
@@ -43,6 +48,8 @@ type Props = {
   warehouses: Warehouse[]
   currencies: CurrencyRow[]
   taxRates: TaxRateRow[]
+  purchaseUnits: PurchaseUnitRow[]
+  companyHomeCountry?: string | null
   accountingBillUrlTemplate: string
 }
 
@@ -429,10 +436,26 @@ type BillLineState = {
   productId: string
   sku: string
   productName: string
+  qty: number
   qtyReceived: number
+  alreadyBilled: number
+  remaining: number
   unitCostForeign: number
   selected: boolean
   qtyBilled: number
+  /** Effective per-line VAT rate (0..1). Falls back to PO-level rate when
+   *  the line has no override. */
+  taxRatePercent: number
+}
+
+type BillCostLineState = {
+  costLineId: string
+  originalDescription: string
+  description: string
+  amountForeign: number
+  vatable: boolean
+  remaining: number
+  selected: boolean
 }
 
 function BillDialog({
@@ -450,22 +473,60 @@ function BillDialog({
   const [error, setError] = useState('')
 
   const symbolMap: Record<string, string> = { GBP: '£' }
-  for (const c of currencies) symbolMap[c.code] = c.symbol
+  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { GBP: 'PREFIX' }
+  for (const c of currencies) {
+    symbolMap[c.code] = c.symbol
+    positionMap[c.code] = c.symbolPosition
+  }
   const billSym = symbolMap[po.currency] ?? po.currency
+  const billSymPos = positionMap[po.currency] ?? 'PREFIX'
+  const billMoney = (n: number) => formatMoney(n, billSym, billSymPos)
 
+  // All PO lines with remaining qty are billable — even if goods haven't been
+  // received yet. Default quantity to the already-received amount when there
+  // is one, otherwise default to the full ordered qty so the supplier can be
+  // billed ahead of (or independently from) receiving — capped at remaining.
   const [billLines, setBillLines] = useState<BillLineState[]>(
     po.lines
-      .filter((l) => l.qtyReceived > 0)
-      .map((l) => ({
-        poLineId: l.id,
-        productId: l.productId,
-        sku: l.sku,
-        productName: l.productName,
-        qtyReceived: l.qtyReceived,
-        unitCostForeign: l.unitCostForeign,
-        selected: true,
-        qtyBilled: l.qtyReceived,
-      })),
+      .filter((l) => l.qty - l.qtyBilled > 0)
+      .map((l) => {
+        const remaining = l.qty - l.qtyBilled
+        const preferred = l.qtyReceived > 0 ? l.qtyReceived : l.qty
+        const qtyBilled = Math.min(preferred, remaining)
+        return {
+          poLineId: l.id,
+          productId: l.productId,
+          sku: l.sku,
+          productName: l.productName,
+          qty: l.qty,
+          qtyReceived: l.qtyReceived,
+          alreadyBilled: l.qtyBilled,
+          remaining,
+          unitCostForeign: l.unitCostForeign,
+          selected: true,
+          qtyBilled,
+          // Per-line tax rate: use the saved per-line rate when set (mixed-VAT
+          // order), otherwise fall back to the order-level PO rate.
+          taxRatePercent: l.taxRatePercent ?? po.taxRatePercent ?? 0,
+        }
+      }),
+  )
+
+  const [billCostLines, setBillCostLines] = useState<BillCostLineState[]>(
+    po.freightCostLines
+      .filter((c) => c.amountForeign - c.amountBilled > 0)
+      .map((c) => {
+        const remaining = c.amountForeign - c.amountBilled
+        return {
+          costLineId: c.id,
+          originalDescription: c.description,
+          description: c.description,
+          amountForeign: remaining,
+          vatable: c.vatable,
+          remaining,
+          selected: false,
+        }
+      }),
   )
 
   // Step 2 fields
@@ -478,7 +539,33 @@ function BillDialog({
   const [uploadName, setUploadName] = useState('')
 
   const selectedLines = billLines.filter((l) => l.selected && l.qtyBilled > 0)
-  const subtotal = selectedLines.reduce((s, l) => s + l.qtyBilled * l.unitCostForeign, 0)
+  const selectedCostLines = billCostLines.filter((l) => l.selected && l.amountForeign > 0)
+  // `unitCostForeign` on a PO line is always NET, so the net line total is
+  // just qty * unitCost. VAT is computed per line off its effective rate so
+  // mixed-VAT bills render a correct breakdown.
+  const productSubtotal = selectedLines.reduce((s, l) => s + l.qtyBilled * l.unitCostForeign, 0)
+  const costSubtotal = selectedCostLines.reduce((s, l) => s + l.amountForeign, 0)
+  const subtotal = productSubtotal + costSubtotal
+  const poRate = po.taxRatePercent ?? 0
+  const vatTotal =
+    selectedLines.reduce((s, l) => s + l.qtyBilled * l.unitCostForeign * l.taxRatePercent, 0)
+    + selectedCostLines.reduce((s, l) => s + (l.vatable ? l.amountForeign * poRate : 0), 0)
+  const grandTotal = subtotal + vatTotal
+  // Build a grouped VAT breakdown so mixed-rate bills show one row per rate.
+  const vatByRate = new Map<number, number>()
+  for (const l of selectedLines) {
+    if (l.taxRatePercent <= 0) continue
+    const lineVat = l.qtyBilled * l.unitCostForeign * l.taxRatePercent
+    vatByRate.set(l.taxRatePercent, (vatByRate.get(l.taxRatePercent) ?? 0) + lineVat)
+  }
+  for (const l of selectedCostLines) {
+    if (!l.vatable || poRate <= 0) continue
+    const lineVat = l.amountForeign * poRate
+    vatByRate.set(poRate, (vatByRate.get(poRate) ?? 0) + lineVat)
+  }
+  const vatBreakdown = Array.from(vatByRate.entries()).sort((a, b) => b[0] - a[0])
+
+  const hasAnySelection = selectedLines.length > 0 || selectedCostLines.length > 0
 
   function toggleLine(poLineId: string) {
     setBillLines((prev) => prev.map((l) => l.poLineId === poLineId ? { ...l, selected: !l.selected } : l))
@@ -486,6 +573,11 @@ function BillDialog({
 
   function toggleAll(checked: boolean) {
     setBillLines((prev) => prev.map((l) => ({ ...l, selected: checked })))
+    setBillCostLines((prev) => prev.map((l) => ({ ...l, selected: checked })))
+  }
+
+  function toggleCostLine(costLineId: string) {
+    setBillCostLines((prev) => prev.map((l) => l.costLineId === costLineId ? { ...l, selected: !l.selected } : l))
   }
 
   async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
@@ -507,7 +599,7 @@ function BillDialog({
 
   function handleConfirm() {
     setError('')
-    if (!selectedLines.length) { setError('Select at least one line'); return }
+    if (!hasAnySelection) { setError('Select at least one line'); return }
     if (!invoiceDate) { setError('Invoice date is required'); return }
 
     startTransition(async () => {
@@ -517,11 +609,20 @@ function BillDialog({
         dueDate: dueDate || undefined,
         notes: notes || undefined,
         supplierInvoiceUrl: supplierInvoiceUrl || undefined,
-        lines: selectedLines.map((l) => ({
-          poLineId: l.poLineId,
-          qtyBilled: l.qtyBilled,
-          unitCostForeign: l.unitCostForeign,
-        })),
+        lines: [
+          ...selectedLines.map((l) => ({
+            kind: 'product' as const,
+            poLineId: l.poLineId,
+            qtyBilled: l.qtyBilled,
+            unitCostForeign: l.unitCostForeign,
+          })),
+          ...selectedCostLines.map((l) => ({
+            kind: 'cost' as const,
+            costLineId: l.costLineId,
+            description: l.description,
+            amountForeign: l.amountForeign,
+          })),
+        ],
       })
       if (result.success) {
         router.refresh()
@@ -544,46 +645,84 @@ function BillDialog({
         {step === 1 && (
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">Select the line items to include in this bill:</p>
-            <div className="rounded-md border overflow-hidden">
-              <table className="w-full text-sm">
-                <thead className="border-b bg-muted/50">
-                  <tr>
-                    <th className="px-3 py-2 w-8">
-                      <input
-                        type="checkbox"
-                        checked={billLines.every((l) => l.selected)}
-                        onChange={(e) => toggleAll(e.target.checked)}
-                        className="rounded border-input"
-                      />
-                    </th>
-                    <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
-                    <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-24">Received</th>
-                    <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-32">Unit Cost ({billSym})</th>
-                    <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-28">Total ({billSym})</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {billLines.map((l) => (
-                    <tr key={l.poLineId} className={l.selected ? '' : 'opacity-40'}>
-                      <td className="px-3 py-2">
+            {billLines.length > 0 && (
+              <div className="rounded-md border overflow-hidden">
+                <table className="w-full text-sm">
+                  <thead className="border-b bg-muted/50">
+                    <tr>
+                      <th className="px-3 py-2 w-8">
                         <input
                           type="checkbox"
-                          checked={l.selected}
-                          onChange={() => toggleLine(l.poLineId)}
+                          checked={billLines.every((l) => l.selected) && billCostLines.every((l) => l.selected)}
+                          onChange={(e) => toggleAll(e.target.checked)}
                           className="rounded border-input"
                         />
-                      </td>
-                      <td className="px-3 py-2">
-                        <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
-                      </td>
-                      <td className="px-3 py-2 text-right tabular-nums">{l.qtyReceived}</td>
-                      <td className="px-3 py-2 text-right font-mono text-xs">{l.unitCostForeign.toFixed(2)}</td>
-                      <td className="px-3 py-2 text-right font-mono text-xs">{(l.qtyReceived * l.unitCostForeign).toFixed(2)}{billSym}</td>
+                      </th>
+                      <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
+                      <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-28">Remaining / Received</th>
+                      <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-32">Unit Cost ({billSym})</th>
+                      <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-28">Total ({billSym})</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                  </thead>
+                  <tbody className="divide-y">
+                    {billLines.map((l) => (
+                      <tr key={l.poLineId} className={l.selected ? '' : 'opacity-40'}>
+                        <td className="px-3 py-2">
+                          <input
+                            type="checkbox"
+                            checked={l.selected}
+                            onChange={() => toggleLine(l.poLineId)}
+                            className="rounded border-input"
+                          />
+                        </td>
+                        <td className="px-3 py-2">
+                          <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
+                        </td>
+                        <td className="px-3 py-2 text-right tabular-nums">
+                          {l.remaining}
+                          <span className="text-muted-foreground"> / {l.qtyReceived}</span>
+                        </td>
+                        <td className="px-3 py-2 text-right font-mono text-xs">{l.unitCostForeign.toFixed(2)}</td>
+                        <td className="px-3 py-2 text-right font-mono text-xs">{billMoney(l.qtyBilled * l.unitCostForeign)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {billCostLines.length > 0 && (
+              <div>
+                <p className="text-xs font-medium text-muted-foreground mb-2">Additional Costs</p>
+                <div className="rounded-md border overflow-hidden">
+                  <table className="w-full text-sm">
+                    <thead className="border-b bg-muted/50">
+                      <tr>
+                        <th className="px-3 py-2 w-8" />
+                        <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Description</th>
+                        <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-32">Remaining ({billSym})</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y">
+                      {billCostLines.map((l) => (
+                        <tr key={l.costLineId} className={l.selected ? '' : 'opacity-40'}>
+                          <td className="px-3 py-2">
+                            <input
+                              type="checkbox"
+                              checked={l.selected}
+                              onChange={() => toggleCostLine(l.costLineId)}
+                              className="rounded border-input"
+                            />
+                          </td>
+                          <td className="px-3 py-2">{l.originalDescription}</td>
+                          <td className="px-3 py-2 text-right font-mono text-xs">{billMoney(l.remaining)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
             {error && <p className="text-sm text-destructive">{error}</p>}
           </div>
         )}
@@ -607,51 +746,109 @@ function BillDialog({
             </div>
 
             {/* Lines with editable qty */}
-            <div className="rounded-md border overflow-hidden">
-              <table className="w-full text-sm">
-                <thead className="border-b bg-muted/50">
-                  <tr>
-                    <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
-                    <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-24">Qty to Bill</th>
-                    <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-32">Unit Cost ({billSym})</th>
-                    <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-28">Total ({billSym})</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {selectedLines.map((l) => (
-                    <tr key={l.poLineId}>
-                      <td className="px-3 py-2">
-                        <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
-                      </td>
-                      <td className="px-3 py-2">
-                        <Input
-                          type="number" min={0} max={l.qtyReceived} step={1}
-                          value={l.qtyBilled}
-                          onChange={(e) => setBillLines((prev) => prev.map((bl) => bl.poLineId === l.poLineId ? { ...bl, qtyBilled: Number(e.target.value) || 0 } : bl))}
-                          className="h-7 text-sm text-right w-24 ml-auto font-mono"
-                        />
-                      </td>
-                      <td className="px-3 py-2">
-                        <Input
-                          type="number" min={0} step={0.01}
-                          value={l.unitCostForeign}
-                          onChange={(e) => setBillLines((prev) => prev.map((bl) => bl.poLineId === l.poLineId ? { ...bl, unitCostForeign: Number(e.target.value) || 0 } : bl))}
-                          className="h-7 text-sm text-right w-32 ml-auto font-mono"
-                        />
-                      </td>
-                      <td className="px-3 py-2 text-right font-mono text-xs">{(l.qtyBilled * l.unitCostForeign).toFixed(2)}{billSym}</td>
+            {selectedLines.length > 0 && (
+              <div className="rounded-md border overflow-hidden">
+                <table className="w-full text-sm">
+                  <thead className="border-b bg-muted/50">
+                    <tr>
+                      <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
+                      <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-24">Qty to Bill</th>
+                      <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-32">Unit Cost ({billSym})</th>
+                      <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-28">Total ({billSym})</th>
                     </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
+                  </thead>
+                  <tbody className="divide-y">
+                    {selectedLines.map((l) => (
+                      <tr key={l.poLineId}>
+                        <td className="px-3 py-2">
+                          <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
+                        </td>
+                        <td className="px-3 py-2">
+                          <Input
+                            type="number" min={0} max={l.remaining} step={1}
+                            value={l.qtyBilled}
+                            onChange={(e) => setBillLines((prev) => prev.map((bl) => bl.poLineId === l.poLineId ? { ...bl, qtyBilled: Number(e.target.value) || 0 } : bl))}
+                            className="h-7 text-sm text-right w-24 ml-auto font-mono"
+                          />
+                        </td>
+                        <td className="px-3 py-2">
+                          <Input
+                            type="number" min={0} step={0.01}
+                            value={l.unitCostForeign}
+                            onChange={(e) => setBillLines((prev) => prev.map((bl) => bl.poLineId === l.poLineId ? { ...bl, unitCostForeign: Number(e.target.value) || 0 } : bl))}
+                            className="h-7 text-sm text-right w-32 ml-auto font-mono"
+                          />
+                        </td>
+                        <td className="px-3 py-2 text-right font-mono text-xs">{billMoney(l.qtyBilled * l.unitCostForeign)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+
+            {selectedCostLines.length > 0 && (
+              <div>
+                <p className="text-xs font-medium text-muted-foreground mb-2">Additional Costs</p>
+                <div className="rounded-md border overflow-hidden">
+                  <table className="w-full text-sm">
+                    <thead className="border-b bg-muted/50">
+                      <tr>
+                        <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Description</th>
+                        <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-32">Amount ({billSym})</th>
+                        <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-28">Total ({billSym})</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y">
+                      {selectedCostLines.map((l) => (
+                        <tr key={l.costLineId}>
+                          <td className="px-3 py-2">
+                            <Input
+                              value={l.description}
+                              onChange={(e) => setBillCostLines((prev) => prev.map((cl) => cl.costLineId === l.costLineId ? { ...cl, description: e.target.value } : cl))}
+                              className="h-7 text-sm"
+                            />
+                          </td>
+                          <td className="px-3 py-2">
+                            <Input
+                              type="number" min={0} max={l.remaining} step={0.01}
+                              value={l.amountForeign}
+                              onChange={(e) => setBillCostLines((prev) => prev.map((cl) => cl.costLineId === l.costLineId ? { ...cl, amountForeign: Number(e.target.value) || 0 } : cl))}
+                              className="h-7 text-sm text-right w-32 ml-auto font-mono"
+                            />
+                          </td>
+                          <td className="px-3 py-2 text-right font-mono text-xs">{billMoney(l.amountForeign)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            )}
 
             {/* Totals */}
             <div className="flex justify-end text-sm">
-              <div className="min-w-48 space-y-1">
+              <div className="min-w-56 space-y-1">
+                <div className="flex justify-between text-muted-foreground">
+                  <span>Subtotal</span>
+                  <span className="font-mono">{billMoney(subtotal)}</span>
+                </div>
+                {vatBreakdown.length === 0 ? (
+                  <div className="flex justify-between text-muted-foreground">
+                    <span>VAT</span>
+                    <span className="font-mono">{billMoney(0)}</span>
+                  </div>
+                ) : (
+                  vatBreakdown.map(([rate, amount]) => (
+                    <div key={rate} className="flex justify-between text-muted-foreground">
+                      <span>VAT @ {(rate * 100).toFixed(rate * 100 % 1 === 0 ? 0 : 1)}%</span>
+                      <span className="font-mono">{billMoney(amount)}</span>
+                    </div>
+                  ))
+                )}
                 <div className="flex justify-between font-medium border-t pt-1">
                   <span>Total</span>
-                  <span className="font-mono">{subtotal.toFixed(2)}{billSym}</span>
+                  <span className="font-mono">{billMoney(grandTotal)}</span>
                 </div>
               </div>
             </div>
@@ -685,7 +882,7 @@ function BillDialog({
             {step === 1 ? 'Cancel' : 'Back'}
           </Button>
           {step === 1 ? (
-            <Button onClick={() => { if (!selectedLines.length) { setError('Select at least one line'); return }; setError(''); setStep(2) }}>
+            <Button onClick={() => { if (!hasAnySelection) { setError('Select at least one line'); return }; setError(''); setStep(2) }}>
               Next
             </Button>
           ) : (
@@ -701,314 +898,157 @@ function BillDialog({
 }
 
 // ---------------------------------------------------------------------------
-// Edit form (inline, replaces lines section)
+// Pay Bill dialog — mark a supplier bill as paid and push payment to Xero
 // ---------------------------------------------------------------------------
 
-function EditPoForm({
+function PayBillDialog({
   po,
-  suppliers,
-  products,
-  warehouses,
-  currencies,
-  onDone,
+  invoice,
+  onClose,
 }: {
   po: PoDetail
-  suppliers: SupplierRow[]
-  products: ProductRow[]
-  warehouses: Warehouse[]
-  currencies: CurrencyRow[]
-  onDone: () => void
+  invoice: InvoiceRow
+  onClose: () => void
 }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [error, setError] = useState('')
+  const [accounts, setAccounts] = useState<AccountingBankAccount[]>([])
+  const [loadingAccounts, setLoadingAccounts] = useState(true)
+  const [bankAccountId, setBankAccountId] = useState('')
+  const [paymentDate, setPaymentDate] = useState(new Date().toISOString().slice(0, 10))
+  const [reference, setReference] = useState(invoice.invoiceNumber ?? '')
 
-  const [supplierId, setSupplierId] = useState(po.supplierId)
-  const [currency, setCurrency] = useState(po.currency)
-  const [fxRate, setFxRate] = useState(po.fxRateToGbp)
-  const [destinationWarehouseId, setDestinationWarehouseId] = useState(po.destinationWarehouseId ?? '')
-  const [supplierRef, setSupplierRef] = useState(po.supplierRef ?? '')
-  const [expectedDelivery, setExpectedDelivery] = useState(
-    po.expectedDelivery ? po.expectedDelivery.slice(0, 10) : '',
-  )
-  const [notes, setNotes] = useState(po.notes ?? '')
-  const [internalNotes, setInternalNotes] = useState(po.internalNotes ?? '')
+  const sym = po.currency === 'GBP' ? '£' : po.currency
+  const money = (n: number) => formatMoney(n, sym, 'PREFIX')
 
-  type LineItem = { key: string; productId: string; sku: string; productName: string; qty: number; unitCostForeign: number }
-  function makeKey() { return Math.random().toString(36).slice(2) }
+  // Load bank accounts on mount
+  useEffect(() => {
+    let cancelled = false
+    getBillPaymentAccounts()
+      .then((list) => {
+        if (cancelled) return
+        setAccounts(list)
+        if (list.length > 0) setBankAccountId(list[0].id)
+        setLoadingAccounts(false)
+      })
+      .catch(() => {
+        if (cancelled) return
+        setError('Failed to load bank accounts. Make sure Xero chart of accounts has been synced.')
+        setLoadingAccounts(false)
+      })
+    return () => { cancelled = true }
+  }, [])
 
-  const [lines, setLines] = useState<LineItem[]>(
-    po.lines.map((l) => ({
-      key: makeKey(),
-      productId: l.productId,
-      sku: l.sku,
-      productName: l.productName,
-      qty: l.qty,
-      unitCostForeign: l.unitCostForeign,
-    })),
-  )
-
-  const [productSearch, setProductSearch] = useState('')
-  const [showSearch, setShowSearch] = useState(false)
-  const [lastPrices, setLastPrices] = useState<Record<string, { lastUnitCost: number }>>({})
-
-  const editSymbolMap: Record<string, string> = { GBP: '£' }
-  for (const c of currencies) editSymbolMap[c.code] = c.symbol
-  const editSym = editSymbolMap[currency] ?? currency
-
-  const rateMap: Record<string, number> = { GBP: 1 }
-  for (const c of currencies) {
-    if (c.latestRate != null) rateMap[c.code] = c.latestRate
-  }
-
-  function setCurrencyAndRate(code: string) {
-    setCurrency(code)
-    if (code === 'GBP') setFxRate(1)
-    else if (rateMap[code]) setFxRate(rateMap[code])
-  }
-
-  async function handleSupplierChange(id: string) {
-    setSupplierId(id)
-    const s = suppliers.find((sup) => sup.id === id)
-    if (s) setCurrencyAndRate(s.currency)
-    if (id) {
-      const prices = await getSupplierLastPrices(id)
-      setLastPrices(prices)
-    }
-  }
-
-  function addProduct(p: ProductRow) {
-    if (lines.some((l) => l.productId === p.id)) return
-    const last = lastPrices[p.id]
-    setLines((prev) => [
-      ...prev,
-      { key: makeKey(), productId: p.id, sku: p.sku, productName: p.name, qty: 1, unitCostForeign: last?.lastUnitCost ?? 0 },
-    ])
-    setProductSearch('')
-    setShowSearch(false)
-  }
-
-  const filteredProducts = products.filter((p) => {
-    if (!productSearch) return true
-    const q = productSearch.toLowerCase()
-    return p.sku.toLowerCase().includes(q) || p.name.toLowerCase().includes(q)
-  }).slice(0, 20)
-
-  const subtotalForeign = lines.reduce((s, l) => s + l.qty * l.unitCostForeign, 0)
-  const subtotalGbp = subtotalForeign / fxRate
-
-  function handleSave() {
+  const handleSubmit = () => {
     setError('')
-    if (!supplierId) { setError('Please select a supplier'); return }
-    if (!lines.length) { setError('Add at least one line'); return }
+    if (!bankAccountId) { setError('Select a bank account'); return }
+    if (!paymentDate) { setError('Payment date is required'); return }
 
     startTransition(async () => {
-      const result = await updatePurchaseOrder(po.id, {
-        supplierId,
-        currency,
-        fxRateToGbp: fxRate,
-        destinationWarehouseId: destinationWarehouseId || undefined,
-        supplierRef: supplierRef || undefined,
-        expectedDelivery: expectedDelivery || undefined,
-        notes: notes || undefined,
-        internalNotes: internalNotes || undefined,
-        lines: lines.map((l, i) => ({
-          productId: l.productId,
-          sku: l.sku,
-          productName: l.productName,
-          qty: l.qty,
-          unitCostForeign: l.unitCostForeign,
-          sortOrder: i,
-        })),
+      const result = await markBillPaid(invoice.id, {
+        bankAccountId,
+        paymentDate,
+        reference: reference || undefined,
       })
       if (result.success) {
         router.refresh()
-        onDone()
+        onClose()
       } else {
-        setError(result.error ?? 'Save failed')
+        setError(result.error ?? 'Failed to mark bill as paid')
       }
     })
   }
 
   return (
-    <div className="space-y-4">
-      <div className="grid grid-cols-2 gap-4">
-        <div className="space-y-1.5">
-          <Label>Supplier</Label>
-          <select
-            value={supplierId}
-            onChange={(e) => handleSupplierChange(e.target.value)}
-            className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
-          >
-            {suppliers.map((s) => <option key={s.id} value={s.id}>{s.name}</option>)}
-          </select>
-        </div>
-        <div className="space-y-1.5">
-          <Label>Currency / FX Rate</Label>
-          <div className="flex gap-2">
-            <select
-              value={currency}
-              onChange={(e) => setCurrencyAndRate(e.target.value)}
-              className="w-28 h-9 rounded-md border border-input bg-background px-3 text-sm font-mono"
-            >
-              <option value="GBP">GBP £</option>
-              {currencies.filter((c) => c.code !== 'GBP').map((c) => (
-                <option key={c.code} value={c.code}>{c.code} {c.symbol}</option>
-              ))}
-            </select>
-            <div className="flex-1 relative">
-              <span className="absolute left-3 top-2 text-xs text-muted-foreground">1 GBP =</span>
-              <Input
-                type="number" min="0.0001" step="0.0001"
-                value={fxRate}
-                onChange={(e) => setFxRate(Number(e.target.value) || 1)}
-                className="pl-16 h-9 font-mono text-sm"
-                disabled={currency === 'GBP'}
-              />
+    <Dialog open onOpenChange={onClose}>
+      <DialogContent className="max-w-md">
+        <DialogHeader>
+          <DialogTitle>Mark Bill as Paid</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div className="rounded-md border p-3 bg-muted/30 text-sm">
+            <div className="flex justify-between">
+              <span className="text-muted-foreground">Bill</span>
+              <span className="font-medium">{invoice.invoiceNumber ?? '(no number)'}</span>
+            </div>
+            <div className="flex justify-between mt-1">
+              <span className="text-muted-foreground">Amount</span>
+              <span className="font-mono font-medium">{money(invoice.totalForeign)}</span>
             </div>
           </div>
-        </div>
-        <div className="space-y-1.5">
-          <Label>Destination Warehouse</Label>
-          <select
-            value={destinationWarehouseId}
-            onChange={(e) => setDestinationWarehouseId(e.target.value)}
-            className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
-          >
-            <option value="">Not specified</option>
-            {warehouses.map((w) => <option key={w.id} value={w.id}>{w.code} — {w.name}</option>)}
-          </select>
-        </div>
-        <div className="space-y-1.5">
-          <Label>Expected Delivery</Label>
-          <Input type="date" value={expectedDelivery} onChange={(e) => setExpectedDelivery(e.target.value)} className="h-9 text-sm" />
-        </div>
-        <div className="space-y-1.5">
-          <Label>Supplier Reference</Label>
-          <Input value={supplierRef} onChange={(e) => setSupplierRef(e.target.value)} className="h-9 text-sm" />
-        </div>
-      </div>
-      <div className="grid grid-cols-2 gap-4">
-        <div className="space-y-1.5">
-          <Label>Notes</Label>
-          <Textarea value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} className="text-sm resize-none" />
-        </div>
-        <div className="space-y-1.5">
-          <Label>Internal Notes</Label>
-          <Textarea value={internalNotes} onChange={(e) => setInternalNotes(e.target.value)} rows={2} className="text-sm resize-none" />
-        </div>
-      </div>
 
-      {/* Lines */}
-      <div className="space-y-2">
-        <h3 className="text-sm font-medium text-muted-foreground">Lines</h3>
-        {lines.length > 0 && (
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b text-muted-foreground text-xs">
-                <th className="pb-2 text-left font-medium">Product</th>
-                <th className="pb-2 text-right font-medium w-24">Qty</th>
-                <th className="pb-2 text-right font-medium w-32">Unit Cost ({editSym})</th>
-                <th className="pb-2 text-right font-medium w-28">Total ({editSym})</th>
-                <th className="w-8" />
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {lines.map((line) => (
-                <tr key={line.key}>
-                  <td className="py-2 pr-3">
-                    <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
-                  </td>
-                  <td className="py-2 pr-3">
-                    <Input
-                      type="number" min="0.0001" step="1"
-                      value={line.qty}
-                      onChange={(e) => setLines((prev) => prev.map((l) => l.key === line.key ? { ...l, qty: Number(e.target.value) || 0 } : l))}
-                      className="h-7 text-sm text-right w-24 ml-auto"
-                    />
-                  </td>
-                  <td className="py-2 pr-3">
-                    <Input
-                      type="number" min="0" step="0.01"
-                      value={line.unitCostForeign}
-                      onChange={(e) => setLines((prev) => prev.map((l) => l.key === line.key ? { ...l, unitCostForeign: Number(e.target.value) || 0 } : l))}
-                      className="h-7 text-sm text-right w-32 ml-auto font-mono"
-                    />
-                  </td>
-                  <td className="py-2 pr-3 text-right font-mono text-xs">
-                    {(line.qty * line.unitCostForeign).toFixed(2)}{editSym}
-                  </td>
-                  <td className="py-2">
-                    <button type="button" onClick={() => setLines((prev) => prev.filter((l) => l.key !== line.key))} className="text-muted-foreground hover:text-destructive">
-                      <X className="h-4 w-4" />
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
+          <div>
+            <Label htmlFor="bank-account" className="text-xs">Bank Account</Label>
+            {loadingAccounts ? (
+              <div className="text-xs text-muted-foreground py-2">Loading accounts...</div>
+            ) : accounts.length === 0 ? (
+              <div className="text-xs text-muted-foreground py-2">
+                No bank accounts found. Sync your accounting chart of accounts first.
+              </div>
+            ) : (
+              <select
+                id="bank-account"
+                value={bankAccountId}
+                onChange={(e) => setBankAccountId(e.target.value)}
+                className="w-full h-9 rounded-md border border-input bg-background px-2 text-sm"
+              >
+                {accounts.map((a) => (
+                  <option key={a.id} value={a.id}>
+                    {a.code ? `${a.code} — ${a.name}` : a.name}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
 
-        <div className="relative">
-          <div className="flex-1 relative">
-            <Search className="absolute left-2.5 top-2 h-4 w-4 text-muted-foreground" />
+          <div>
+            <Label htmlFor="payment-date" className="text-xs">Payment Date</Label>
             <Input
-              placeholder="Search product to add…"
-              value={productSearch}
-              onChange={(e) => { setProductSearch(e.target.value); setShowSearch(true) }}
-              onFocus={() => setShowSearch(true)}
-              className="pl-8 h-8 text-sm"
+              id="payment-date"
+              type="date"
+              value={paymentDate}
+              onChange={(e) => setPaymentDate(e.target.value)}
+              className="h-9 text-sm"
             />
           </div>
-          {showSearch && productSearch && (
-            <div className="absolute z-10 top-9 left-0 right-0 bg-popover border rounded-md shadow-md max-h-48 overflow-y-auto">
-              {filteredProducts.filter((p) => !lines.some((l) => l.productId === p.id)).map((p) => (
-                <button
-                  key={p.id} type="button"
-                  className="w-full flex items-center px-3 py-2 hover:bg-accent text-sm text-left gap-2"
-                  onMouseDown={() => addProduct(p)}
-                >
-                  <span className="font-mono text-xs font-medium">{p.sku}</span>
-                  <span className="text-muted-foreground">{p.name}</span>
-                </button>
-              ))}
+
+          <div>
+            <Label htmlFor="payment-ref" className="text-xs">Reference (optional)</Label>
+            <Input
+              id="payment-ref"
+              value={reference}
+              onChange={(e) => setReference(e.target.value)}
+              placeholder="Payment reference"
+              className="h-9 text-sm"
+            />
+          </div>
+
+          {!invoice.accountingInvoiceId && (
+            <div className="rounded-md border border-yellow-300 bg-yellow-50 dark:bg-yellow-950/30 p-2 text-xs text-yellow-800 dark:text-yellow-200">
+              This bill has not yet been synced to your accounting system. The payment will be
+              recorded locally only — no Xero payment will be posted.
+            </div>
+          )}
+
+          {error && (
+            <div className="rounded-md border border-red-300 bg-red-50 dark:bg-red-950/30 p-2 text-xs text-red-700 dark:text-red-200">
+              {error}
             </div>
           )}
         </div>
-
-        {lines.length > 0 && (
-          <div className="flex justify-end pt-2 text-sm">
-            <div className="space-y-1 min-w-48">
-              <div className="flex justify-between text-muted-foreground">
-                <span>Subtotal</span>
-                <span className="font-mono">{subtotalForeign.toFixed(2)}{editSym}</span>
-              </div>
-              <div className="flex justify-between font-medium border-t pt-1">
-                <span>Total</span>
-                <span className="font-mono">
-                  {subtotalForeign.toFixed(2)}{editSym}
-                  {currency !== 'GBP' && (
-                    <span className="text-muted-foreground font-normal text-xs ml-1">(£{subtotalGbp.toFixed(2)})</span>
-                  )}
-                </span>
-              </div>
-            </div>
-          </div>
-        )}
-      </div>
-
-      {error && <p className="text-sm text-destructive">{error}</p>}
-
-      <div className="flex gap-2 pt-2">
-        <Button onClick={handleSave} disabled={isPending} size="sm">
-          {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
-          Save Changes
-        </Button>
-        <Button variant="outline" size="sm" onClick={onDone} disabled={isPending}>Discard</Button>
-      </div>
-    </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
+          <Button onClick={handleSubmit} disabled={isPending || loadingAccounts || !bankAccountId}>
+            {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <CheckCircle2 className="h-4 w-4 mr-1" />}
+            Mark Paid
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
   )
 }
+
 
 // ---------------------------------------------------------------------------
 // Edit Freight PO Costs dialog
@@ -1036,8 +1076,14 @@ function EditFreightCostsDialog({
   const [error, setError] = useState('')
 
   const symbolMap: Record<string, string> = { GBP: '£' }
-  for (const c of currencies) symbolMap[c.code] = c.symbol
+  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { GBP: 'PREFIX' }
+  for (const c of currencies) {
+    symbolMap[c.code] = c.symbol
+    positionMap[c.code] = c.symbolPosition
+  }
   const fSym = symbolMap[po.currency] ?? po.currency
+  const fSymPos = positionMap[po.currency] ?? 'PREFIX'
+  const fMoney = (n: number) => formatMoney(n, fSym, fSymPos)
 
   // Initialize from existing linked freight data (we get cost lines from linkedFreightPos)
   // For a FREIGHT type PO we need to fetch its own cost lines — but we don't have them directly
@@ -1144,7 +1190,7 @@ function EditFreightCostsDialog({
           </Button>
 
           <div className="flex justify-end text-sm font-medium">
-            <span>Total: {subtotal.toFixed(2)}{fSym}</span>
+            <span>Total: {fMoney(subtotal)}</span>
           </div>
 
           {error && <p className="text-sm text-destructive">{error}</p>}
@@ -1166,15 +1212,21 @@ function EditFreightCostsDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, accountingBillUrlTemplate }: Props) {
+export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, companyHomeCountry, accountingBillUrlTemplate }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const po = initialPo
 
-  // Currency symbol lookup
+  // Currency symbol + position lookup
   const symbolMap: Record<string, string> = { GBP: '£' }
-  for (const c of currencies) symbolMap[c.code] = c.symbol
+  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { GBP: 'PREFIX' }
+  for (const c of currencies) {
+    symbolMap[c.code] = c.symbol
+    positionMap[c.code] = c.symbolPosition
+  }
   const sym = symbolMap[po.currency] ?? po.currency
+  const symPos = positionMap[po.currency] ?? 'PREFIX'
+  const money = (n: number) => formatMoney(n, sym, symPos)
 
   const [editing, setEditing] = useState(false)
   const [showReceive, setShowReceive] = useState(false)
@@ -1184,6 +1236,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const [showReceipts, setShowReceipts] = useState(false)
   const [showReturns, setShowReturns] = useState(false)
   const [showInvoices, setShowInvoices] = useState(false)
+  const [payBillFor, setPayBillFor] = useState<InvoiceRow | null>(null)
   const [error, setError] = useState('')
 
   const canEdit = po.status === 'DRAFT'
@@ -1191,7 +1244,10 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const canAdvance = po.status === 'DRAFT'
   const canReceive = ['PO_SENT', 'RFQ_SENT', 'PARTIALLY_RECEIVED'].includes(po.status)
   const canReturn = ['PO_SENT', 'PARTIALLY_RECEIVED', 'RECEIVED', 'INVOICED', 'PARTIALLY_RETURNED'].includes(po.status)
-  const canBill = ['PO_SENT', 'RFQ_SENT', 'PARTIALLY_RECEIVED', 'RECEIVED', 'PARTIALLY_RETURNED'].includes(po.status)
+  const hasBillableProduct = po.lines.some((l) => l.qty - l.qtyBilled > 0)
+  const hasBillableCost = po.freightCostLines.some((c) => c.amountForeign - c.amountBilled > 0)
+  const hasBillableItems = hasBillableProduct || hasBillableCost
+  const canBill = ['PO_SENT', 'RFQ_SENT', 'PARTIALLY_RECEIVED', 'RECEIVED', 'PARTIALLY_RETURNED'].includes(po.status) && hasBillableItems
   const canCancel = po.status === 'DRAFT'
   const hasRemaining = po.lines.some((l) => l.qtyToReceive > 0)
   const hasReturnable = po.lines.some((l) => l.qtyReceived - l.qtyReturned > 0)
@@ -1323,11 +1379,22 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
       {error && <p className="text-sm text-destructive">{error}</p>}
 
       {/* Header info */}
-      {!editing && (
-        <div className="rounded-md border p-4 grid grid-cols-2 gap-x-8 gap-y-3 text-sm">
+      <div className="rounded-md border p-4 grid grid-cols-2 gap-x-8 gap-y-3 text-sm">
           <div>
             <span className="text-muted-foreground">Supplier</span>
-            <p className="font-medium">{po.supplierName}</p>
+            <p className="font-medium">
+              {po.supplierId ? (
+                <Link
+                  href={`/purchase-orders/suppliers?edit=${po.supplierId}`}
+                  target="_blank"
+                  className="hover:underline decoration-muted-foreground underline-offset-2"
+                >
+                  {po.supplierName}
+                </Link>
+              ) : (
+                po.supplierName
+              )}
+            </p>
             {supplier?.email && <p className="text-xs text-muted-foreground">{supplier.email}</p>}
           </div>
           <div>
@@ -1368,25 +1435,24 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             </div>
           )}
         </div>
-      )}
 
-      {/* Edit form */}
+      {/* Edit dialog — reuses the New PO dialog in edit mode */}
       {editing && (
-        <div className="rounded-md border p-4">
-          <EditPoForm
-            po={po}
-            suppliers={suppliers}
-            products={products}
-            warehouses={warehouses}
-            currencies={currencies}
-            onDone={() => { setEditing(false); router.refresh() }}
-          />
-        </div>
+        <PoFormDialog
+          suppliers={suppliers}
+          products={products}
+          warehouses={warehouses}
+          currencies={currencies}
+          taxRates={taxRates}
+          purchaseUnits={purchaseUnits}
+          companyHomeCountry={companyHomeCountry}
+          existingPo={po}
+          onClose={() => { setEditing(false); router.refresh() }}
+        />
       )}
 
       {/* Lines table */}
-      {!editing && (
-        <div className="rounded-md border overflow-hidden">
+      <div className="rounded-md border overflow-hidden">
           <div className="border-b px-4 py-2 bg-muted/50">
             <h2 className="text-sm font-medium">Order Lines</h2>
           </div>
@@ -1399,6 +1465,9 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                 <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-32">
                   Unit Cost ({sym})
                 </th>
+                {po.lines.some((l) => l.discountAmount > 0) && (
+                  <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-24">Discount</th>
+                )}
                 {po.currency !== 'GBP' && (
                   <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-28">Unit Cost (£)</th>
                 )}
@@ -1429,17 +1498,29 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                     ) : line.qty}
                   </td>
                   <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">{line.unitCostForeign.toFixed(2)}</td>
+                  {po.lines.some((l) => l.discountAmount > 0) && (
+                    <td className="px-4 py-2 text-right tabular-nums font-mono text-xs text-destructive">
+                      {line.discountAmount > 0 ? (line.discountStr ?? formatMoney(-line.discountAmount, sym)) : '—'}
+                    </td>
+                  )}
                   {po.currency !== 'GBP' && (
                     <td className="px-4 py-2 text-right tabular-nums font-mono text-xs text-muted-foreground">
-                      £{line.unitCostGbp.toFixed(2)}
+                      {formatMoney(line.unitCostGbp, '£', 'PREFIX')}
                     </td>
                   )}
                   {po.totalLandedCostGbp > 0 && (
                     <td className="px-4 py-2 text-right tabular-nums font-mono text-xs font-medium">
-                      £{line.grossUnitCostGbp.toFixed(2)}
+                      {formatMoney(line.grossUnitCostGbp, '£', 'PREFIX')}
                     </td>
                   )}
-                  <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">{line.totalForeign.toFixed(2)}{sym}</td>
+                  <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">
+                    {money(line.totalForeign)}
+                    {line.taxRatePercent != null && po.taxRatePercent != null && Math.abs(line.taxRatePercent - po.taxRatePercent) > 0.0001 && (
+                      <span className="ml-1 inline-flex items-center rounded-sm border border-amber-300 bg-amber-50 px-1 py-0 text-[10px] font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
+                        {(line.taxRatePercent * 100).toFixed(line.taxRatePercent * 100 % 1 === 0 ? 0 : 1)}%
+                      </span>
+                    )}
+                  </td>
                   <td className="px-4 py-2 text-right tabular-nums text-green-700 dark:text-green-400">{line.qtyReceived > 0 ? line.qtyReceived : '—'}</td>
                   <td className="px-4 py-2 text-right tabular-nums text-orange-600 dark:text-orange-400">{line.qtyReturned > 0 ? line.qtyReturned : '—'}</td>
                   <td className="px-4 py-2 text-right tabular-nums">{line.qtyRemaining > 0 ? line.qtyRemaining : '—'}</td>
@@ -1447,39 +1528,63 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
               ))}
             </tbody>
             <tfoot className="border-t bg-muted/30 text-sm">
-              <tr>
-                <td colSpan={3 + (po.currency !== 'GBP' ? 1 : 0) + (po.totalLandedCostGbp > 0 ? 1 : 0)} className="px-4 py-1.5 text-right text-muted-foreground">Subtotal</td>
-                <td className="px-4 py-1.5 text-right tabular-nums font-mono">{po.subtotalForeign.toFixed(2)}{sym}</td>
-                <td colSpan={3} />
-              </tr>
-              {po.taxForeign > 0 && (
-                <tr>
-                  <td colSpan={3 + (po.currency !== 'GBP' ? 1 : 0) + (po.totalLandedCostGbp > 0 ? 1 : 0)} className="px-4 py-1.5 text-right text-muted-foreground">{po.taxRateName ?? 'VAT'}{po.taxRatePercent != null ? ` (${(po.taxRatePercent * 100).toFixed(0)}%)` : ''}</td>
-                  <td className="px-4 py-1.5 text-right tabular-nums font-mono">{po.taxForeign.toFixed(2)}{sym}</td>
-                  <td colSpan={3} />
-                </tr>
-              )}
-              {po.directFreightForeign > 0 && (
-                <tr>
-                  <td colSpan={3 + (po.currency !== 'GBP' ? 1 : 0) + (po.totalLandedCostGbp > 0 ? 1 : 0)} className="px-4 py-1.5 text-right text-muted-foreground">Additional Costs</td>
-                  <td className="px-4 py-1.5 text-right tabular-nums font-mono">{po.directFreightForeign.toFixed(2)}{sym}</td>
-                  <td colSpan={3} />
-                </tr>
-              )}
-              <tr className="border-t">
-                <td colSpan={3 + (po.currency !== 'GBP' ? 1 : 0) + (po.totalLandedCostGbp > 0 ? 1 : 0)} className="px-4 py-2 text-right font-medium text-muted-foreground">Total</td>
-                <td className="px-4 py-2 text-right tabular-nums font-mono">
-                  <span className="font-semibold">{po.totalForeign.toFixed(2)}{sym}</span>
-                  {po.currency !== 'GBP' && (
-                    <span className="text-muted-foreground font-normal text-xs ml-1">(£{po.totalGbp.toFixed(2)})</span>
+              {(() => {
+                const hasDiscountCol = po.lines.some((l) => l.discountAmount > 0)
+                const labelSpan = 3 + (hasDiscountCol ? 1 : 0) + (po.currency !== 'GBP' ? 1 : 0) + (po.totalLandedCostGbp > 0 ? 1 : 0)
+                // Total discount = sum of line discounts + order-level
+                // discount. The stored `subtotalForeign` is already
+                // post-discount; we surface the breakdown for clarity.
+                const totalLineDiscounts = po.lines.reduce((s, l) => s + l.discountAmount, 0)
+                const totalAllDiscounts = totalLineDiscounts + po.orderDiscountForeign
+                return <>
+                  <tr>
+                    <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-muted-foreground">Subtotal</td>
+                    <td className="px-4 py-1.5 text-right tabular-nums font-mono">{money(po.subtotalForeign)}</td>
+                    <td colSpan={3} />
+                  </tr>
+                  {totalAllDiscounts > 0 && (
+                    <tr>
+                      <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-destructive">
+                        Total Discount
+                        {totalLineDiscounts > 0 && po.orderDiscountForeign > 0
+                          ? ` (lines: ${money(totalLineDiscounts)} + order: ${money(po.orderDiscountForeign)})`
+                          : po.orderDiscountForeign > 0
+                          ? ' (order)'
+                          : ' (lines)'}
+                      </td>
+                      <td className="px-4 py-1.5 text-right tabular-nums font-mono text-destructive">−{money(totalAllDiscounts)}</td>
+                      <td colSpan={3} />
+                    </tr>
                   )}
-                </td>
-                <td colSpan={3} />
-              </tr>
+                  {po.taxForeign > 0 && (
+                    <tr>
+                      <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-muted-foreground">{po.taxRateName ?? 'VAT'}{po.taxRatePercent != null ? ` (${(po.taxRatePercent * 100).toFixed(0)}%)` : ''}</td>
+                      <td className="px-4 py-1.5 text-right tabular-nums font-mono">{money(po.taxForeign)}</td>
+                      <td colSpan={3} />
+                    </tr>
+                  )}
+                  {po.directFreightForeign > 0 && (
+                    <tr>
+                      <td colSpan={labelSpan} className="px-4 py-1.5 text-right text-muted-foreground">Additional Costs</td>
+                      <td className="px-4 py-1.5 text-right tabular-nums font-mono">{money(po.directFreightForeign)}</td>
+                      <td colSpan={3} />
+                    </tr>
+                  )}
+                  <tr className="border-t">
+                    <td colSpan={labelSpan} className="px-4 py-2 text-right font-medium text-muted-foreground">Total</td>
+                    <td className="px-4 py-2 text-right tabular-nums font-mono">
+                      <span className="font-semibold">{money(po.totalForeign)}</span>
+                      {po.currency !== 'GBP' && (
+                        <span className="text-muted-foreground font-normal text-xs ml-1">({formatMoney(po.totalGbp, '£', 'PREFIX')})</span>
+                      )}
+                    </td>
+                    <td colSpan={3} />
+                  </tr>
+                </>
+              })()}
             </tfoot>
           </table>
         </div>
-      )}
 
       {/* Receipts */}
       {/* Linked Freight / Landed Cost POs */}
@@ -1644,6 +1749,11 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
         <BillDialog po={po} currencies={currencies} onClose={() => setShowBill(false)} />
       )}
 
+      {/* Pay Bill dialog */}
+      {payBillFor && (
+        <PayBillDialog po={po} invoice={payBillFor} onClose={() => setPayBillFor(null)} />
+      )}
+
       {/* Edit Freight Costs dialog */}
       {showEditFreight && (
         <EditFreightCostsDialog po={po} currencies={currencies} onClose={() => setShowEditFreight(false)} />
@@ -1665,12 +1775,21 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
               {po.invoices.map((inv) => (
                 <div key={inv.id} className="px-4 py-3 text-sm space-y-2">
                   <div className="flex items-center justify-between">
-                    <span className="font-medium">
-                      {inv.invoiceNumber ?? 'No invoice number'}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="font-medium">
+                        {inv.invoiceNumber ?? 'No invoice number'}
+                      </span>
+                      {inv.paidAt && (
+                        <span className="inline-flex items-center gap-1 rounded-full border border-green-200 bg-green-50 px-2 py-0.5 text-[10px] font-medium text-green-700 dark:bg-green-900/30 dark:text-green-300 dark:border-green-800">
+                          <CheckCircle2 className="h-3 w-3" />
+                          Paid
+                          {inv.paymentAccountName && ` · ${inv.paymentAccountName}`}
+                        </span>
+                      )}
+                    </div>
                     <div className="flex items-center gap-3 text-xs text-muted-foreground">
                       <span>{new Date(inv.invoiceDate).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
-                      <span className="font-mono font-medium text-foreground">{inv.totalForeign.toFixed(2)}{sym}</span>
+                      <span className="font-mono font-medium text-foreground">{money(inv.totalForeign)}</span>
                       {inv.supplierInvoiceUrl && (
                         <a
                           href={`/api${inv.supplierInvoiceUrl}`}
@@ -1691,18 +1810,40 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                           <ExternalLink className="h-3 w-3" />Accounting
                         </a>
                       )}
+                      {!inv.paidAt && (
+                        <Button
+                          variant="outline"
+                          size="sm"
+                          className="h-6 px-2 text-xs"
+                          onClick={() => setPayBillFor(inv)}
+                          disabled={isPending}
+                        >
+                          <CreditCard className="h-3 w-3 mr-1" />
+                          Mark Paid
+                        </Button>
+                      )}
                     </div>
                   </div>
+                  {inv.paidAt && (
+                    <p className="text-[11px] text-muted-foreground">
+                      Paid {new Date(inv.paidAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+                      {inv.paymentReference ? ` · ref ${inv.paymentReference}` : ''}
+                    </p>
+                  )}
                   {inv.notes && <p className="text-muted-foreground text-xs">{inv.notes}</p>}
                   <table className="w-full text-xs">
                     <tbody className="divide-y">
                       {inv.lines.map((il) => (
                         <tr key={il.id}>
                           <td className="py-1 pr-4">
-                            <ProductLink productId={il.productId} sku={il.sku} name={il.productName} />
+                            {il.poLineId ? (
+                              <ProductLink productId={il.productId} sku={il.sku} name={il.productName} />
+                            ) : (
+                              <span>{il.description}</span>
+                            )}
                           </td>
-                          <td className="py-1 pr-4 text-right tabular-nums">{il.qtyBilled}</td>
-                          <td className="py-1 text-right font-mono">{il.totalForeign.toFixed(2)}{sym}</td>
+                          <td className="py-1 pr-4 text-right tabular-nums">{il.poLineId ? il.qtyBilled : ''}</td>
+                          <td className="py-1 text-right font-mono">{money(il.totalForeign)}</td>
                         </tr>
                       ))}
                     </tbody>

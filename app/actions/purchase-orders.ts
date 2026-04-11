@@ -3,8 +3,10 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth } from '@/lib/auth/server'
-import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
+import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { queueAccountingSync, getAccountingSettings, listAccountingBankAccounts, type AccountingBankAccount } from '@/lib/accounting'
+import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
+import type { TaxCategory } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -22,9 +24,12 @@ export type PoLineRow = {
   qty: number
   unitCostForeign: number
   unitCostGbp: number
+  discountStr: string | null
+  discountAmount: number
   totalForeign: number
   totalGbp: number
   qtyReceived: number
+  qtyBilled: number
   purchaseUnitId: string | null
   purchaseUnitName: string | null
   purchaseUnitStockName: string | null
@@ -34,6 +39,12 @@ export type PoLineRow = {
   qtyToReceive: number  // qty - qtyReceived (still outstanding)
   qtyRemaining: number  // qtyReceived - qtyReturned (net on hand)
   sortOrder: number
+  /** Per-line tax rate id (resolved from product category + destination). */
+  taxRateId: string | null
+  /** Per-line effective rate percentage (0..1). Null when no per-line rate. */
+  taxRatePercent: number | null
+  /** Short label for the rate (e.g. "REDUCED 5%"). Null when no per-line rate. */
+  taxRateName: string | null
 }
 
 export type PoRow = {
@@ -55,6 +66,8 @@ export type PoRow = {
   totalGbp: number
   directFreightForeign: number
   directFreightGbp: number
+  orderDiscountStr: string | null
+  orderDiscountForeign: number
   landedCostMethod: string
   destinationWarehouseId: string | null
   destinationWarehouseName: string | null
@@ -109,7 +122,7 @@ export type PoDetail = PoRow & {
   }[]
   returns: PoReturn[]
   invoices: InvoiceRow[]
-  freightCostLines: { id: string; description: string; amountForeign: number; amountGbp: number; vatable: boolean; distributionMethod: string }[]
+  freightCostLines: { id: string; description: string; amountForeign: number; amountGbp: number; amountBilled: number; vatable: boolean; distributionMethod: string }[]
   linkedFreightPos: {
     linkId: string
     method: string
@@ -134,8 +147,23 @@ export type PoLineInput = {
   qty: number // stock units
   purchaseUnitId?: string
   purchaseUnitQty?: number // qty in purchase units
-  unitCostForeign: number // cost per stock unit (converted from purchase unit cost)
+  unitCostForeign: number // user-entered cost per stock unit (gross if pricesIncludeVat, else net) — pre-discount
   sortOrder?: number
+  /**
+   * Optional manual override of the tax rate for this line. When null/omitted
+   * the server resolves a rate from the product's tax category + destination
+   * warehouse country.
+   */
+  taxRateId?: string | null
+  /** Original user input for the per-line discount, e.g. "5%" or "2.50". */
+  discountStr?: string | null
+  /**
+   * Per-line discount amount in the order's foreign currency, in the same
+   * tax convention as `unitCostForeign` (gross when `pricesIncludeVat`, else
+   * net). Stored as entered; subtracted from the line total before VAT
+   * extraction on the server.
+   */
+  discountAmount?: number
 }
 
 export type CreatePoInput = {
@@ -152,6 +180,14 @@ export type CreatePoInput = {
   taxRateName?: string
   taxRateValue?: number // e.g. 0.20 for 20%
   additionalCosts?: { description: string; amountForeign: number; vatable: boolean; distributionMethod: string }[]
+  /** Original user input for the order-level discount, e.g. "10%" or "50.00". */
+  orderDiscountStr?: string | null
+  /**
+   * Computed order-level discount in the order's foreign currency, in the
+   * same tax convention as line `unitCostForeign` (gross when
+   * `pricesIncludeVat`, else net). Applied after per-line discounts.
+   */
+  orderDiscountForeign?: number
   lines: PoLineInput[]
 }
 
@@ -204,6 +240,8 @@ const PO_SELECT = {
   totalGbp: true,
   directFreightForeign: true,
   directFreightGbp: true,
+  discountStr: true,
+  discountAmount: true,
   landedCostMethod: true,
   destinationWarehouseId: true,
   supplierRef: true,
@@ -222,6 +260,8 @@ const PO_SELECT = {
       qty: true,
       unitCostForeign: true,
       unitCostGbp: true,
+      discountStr: true,
+      discountAmount: true,
       totalForeign: true,
       totalGbp: true,
       purchaseUnitId: true,
@@ -230,6 +270,8 @@ const PO_SELECT = {
       qtyReceived: true,
       qtyReturned: true,
       sortOrder: true,
+      taxRateId: true,
+      taxRate: { select: { id: true, name: true, rate: true, taxCategory: true } },
       product: { select: { sku: true, name: true, imageUrl: true } },
     },
     orderBy: { sortOrder: 'asc' as const },
@@ -255,6 +297,8 @@ function mapPoRow(po: {
   totalGbp: unknown
   directFreightForeign: unknown
   directFreightGbp: unknown
+  discountStr: string | null
+  discountAmount: unknown
   landedCostMethod: string
   destinationWarehouseId: string | null
   supplierRef: string | null
@@ -291,6 +335,8 @@ function mapPoRow(po: {
     totalGbp: Number(po.totalGbp),
     directFreightForeign: Number(po.directFreightForeign),
     directFreightGbp: Number(po.directFreightGbp),
+    orderDiscountStr: po.discountStr,
+    orderDiscountForeign: Number(po.discountAmount ?? 0),
     landedCostMethod: po.landedCostMethod as string,
     destinationWarehouseId: po.destinationWarehouseId,
     destinationWarehouseName: po.destinationWarehouse?.name ?? null,
@@ -315,6 +361,8 @@ function mapLine(l: {
   qty: unknown
   unitCostForeign: unknown
   unitCostGbp: unknown
+  discountStr?: string | null
+  discountAmount?: unknown
   totalForeign: unknown
   totalGbp: unknown
   purchaseUnitId: string | null
@@ -323,6 +371,8 @@ function mapLine(l: {
   qtyReceived: unknown
   qtyReturned: unknown
   sortOrder: number
+  taxRateId?: string | null
+  taxRate?: { id: string; name: string; rate: unknown; taxCategory?: string } | null
   product: { sku: string; name: string; imageUrl: string | null }
 }): PoLineRow {
   const qty = Number(l.qty)
@@ -338,6 +388,8 @@ function mapLine(l: {
     qty,
     unitCostForeign: Number(l.unitCostForeign),
     unitCostGbp: Number(l.unitCostGbp),
+    discountStr: l.discountStr ?? null,
+    discountAmount: Number(l.discountAmount ?? 0),
     totalForeign: Number(l.totalForeign),
     totalGbp: Number(l.totalGbp),
     purchaseUnitId: l.purchaseUnitId,
@@ -346,10 +398,14 @@ function mapLine(l: {
     purchaseUnitQty: l.purchaseUnitQty != null ? Number(l.purchaseUnitQty) : null,
     grossUnitCostGbp: Number(l.unitCostGbp), // overridden by getPurchaseOrder with actual landed cost
     qtyReceived,
+    qtyBilled: 0, // overridden by getPurchaseOrder with sum across invoices
     qtyReturned,
     qtyToReceive: Math.max(0, qty - qtyReceived),
     qtyRemaining: Math.max(0, qtyReceived - qtyReturned),
     sortOrder: l.sortOrder,
+    taxRateId: l.taxRateId ?? l.taxRate?.id ?? null,
+    taxRatePercent: l.taxRate?.rate != null ? Number(l.taxRate.rate) : null,
+    taxRateName: l.taxRate?.name ?? null,
   }
 }
 
@@ -435,11 +491,17 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
           notes: true,
           supplierInvoiceUrl: true,
           accountingInvoiceId: true,
+          paidAt: true,
+          paymentAccountId: true,
+          paymentAccountName: true,
+          paymentReference: true,
           createdAt: true,
           lines: {
             select: {
               id: true,
               poLineId: true,
+              costLineId: true,
+              description: true,
               qtyBilled: true,
               unitCostForeign: true,
               totalForeign: true,
@@ -448,6 +510,11 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
                 select: {
                   productId: true,
                   product: { select: { sku: true, name: true, imageUrl: true } },
+                },
+              },
+              costLine: {
+                select: {
+                  description: true,
                 },
               },
             },
@@ -479,6 +546,22 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
   // Also add direct freight from the PO itself
   totalLandedCostGbp += Number(po.directFreightGbp)
 
+  // Aggregate billed totals across all invoices — used to enforce partial-bill
+  // limits on the next bill and to hide the "Create Bill" action when nothing
+  // is left to bill.
+  const qtyBilledByLine = new Map<string, number>()
+  const amountBilledByCostLine = new Map<string, number>()
+  for (const inv of po.invoices) {
+    for (const il of inv.lines) {
+      if (il.poLineId) {
+        qtyBilledByLine.set(il.poLineId, (qtyBilledByLine.get(il.poLineId) ?? 0) + Number(il.qtyBilled))
+      }
+      if (il.costLineId) {
+        amountBilledByCostLine.set(il.costLineId, (amountBilledByCostLine.get(il.costLineId) ?? 0) + Number(il.totalForeign))
+      }
+    }
+  }
+
   // Calculate landed cost per line (distribute by value for now)
   const poSubtotalGbp = Number(po.subtotalGbp)
   const mappedLines = po.lines.map(mapLine).map((line) => {
@@ -489,7 +572,11 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       const landedForLine = totalLandedCostGbp * lineShare
       landedPerUnit = landedForLine / line.qty
     }
-    return { ...line, grossUnitCostGbp: line.unitCostGbp + landedPerUnit }
+    return {
+      ...line,
+      grossUnitCostGbp: line.unitCostGbp + landedPerUnit,
+      qtyBilled: qtyBilledByLine.get(line.id) ?? 0,
+    }
   })
 
   const row = mapPoRow(po)
@@ -542,24 +629,39 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       notes: inv.notes,
       supplierInvoiceUrl: inv.supplierInvoiceUrl,
       accountingInvoiceId: inv.accountingInvoiceId ?? null,
+      paidAt: inv.paidAt?.toISOString() ?? null,
+      paymentAccountId: inv.paymentAccountId ?? null,
+      paymentAccountName: inv.paymentAccountName ?? null,
+      paymentReference: inv.paymentReference ?? null,
       createdAt: inv.createdAt.toISOString(),
-      lines: inv.lines.map((il) => ({
-        id: il.id,
-        poLineId: il.poLineId,
-        productId: il.poLine.productId,
-        sku: il.poLine.product.sku,
-        productName: il.poLine.product.name,
-        qtyBilled: Number(il.qtyBilled),
-        unitCostForeign: Number(il.unitCostForeign),
-        totalForeign: Number(il.totalForeign),
-        totalGbp: Number(il.totalGbp),
-      })),
+      lines: inv.lines.map((il) => {
+        const isProduct = il.poLineId != null && il.poLine != null
+        const productName = isProduct
+          ? il.poLine!.product.name
+          : il.description ?? il.costLine?.description ?? '—'
+        const sku = isProduct ? il.poLine!.product.sku : '—'
+        const productId = isProduct ? il.poLine!.productId : ''
+        return {
+          id: il.id,
+          poLineId: il.poLineId,
+          costLineId: il.costLineId,
+          productId,
+          sku,
+          productName,
+          description: productName,
+          qtyBilled: Number(il.qtyBilled),
+          unitCostForeign: Number(il.unitCostForeign),
+          totalForeign: Number(il.totalForeign),
+          totalGbp: Number(il.totalGbp),
+        }
+      }),
     })),
     freightCostLines: (po.freightCostLines ?? []).map((cl) => ({
       id: cl.id,
       description: cl.description,
       amountForeign: Number(cl.amountForeign),
       amountGbp: Number(cl.amountGbp),
+      amountBilled: amountBilledByCostLine.get(cl.id) ?? 0,
       vatable: cl.vatable,
       distributionMethod: cl.distributionMethod as string,
     })),
@@ -604,7 +706,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
 
 export async function createPurchaseOrder(input: CreatePoInput): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('purchasing.create')
     if (!input.lines.length) return { success: false, error: 'At least one line is required' }
     // Validate line inputs
     for (const l of input.lines) {
@@ -614,19 +716,144 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
 
     const fxRate = safeFxRate(input.fxRateToGbp || 1)
     const vatRate = input.taxRateValue ?? 0
-    const inclVat = input.pricesIncludeVat && vatRate > 0
+    const inclVat = !!input.pricesIncludeVat
     let subtotalForeign = 0
     let subtotalGbp = 0
     let totalTaxForeign = 0
     let totalTaxGbp = 0
 
+    // --- Tax rate resolution -------------------------------------------
+    // Each line either:
+    //   - has a manual override (`l.taxRateId`) — use that rate
+    //   - is auto-resolved via `(destinationWarehouse.country, productCategory,
+    //     PURCHASE)` against the configured TaxRate rows; falls back to the
+    //     order default if no match.
+
+    // Order-level default rate (used as resolver fallback + for additional
+    // costs / order discount VAT).
+    const orderDefaultRate = input.taxRateId
+      ? await db.taxRate.findUnique({
+          where: { id: input.taxRateId },
+          select: { id: true, name: true, rate: true, accountingTaxType: true },
+        })
+      : input.taxRateName
+      ? await db.taxRate.findFirst({
+          where: { name: input.taxRateName, active: true },
+          select: { id: true, name: true, rate: true, accountingTaxType: true },
+        })
+      : null
+    const orderDefaultCtx = {
+      id: orderDefaultRate?.id ?? null,
+      name: orderDefaultRate?.name ?? input.taxRateName ?? null,
+      rate: orderDefaultRate ? Number(orderDefaultRate.rate) : vatRate,
+      accountingTaxType: orderDefaultRate?.accountingTaxType ?? null,
+    }
+
+    // Destination country: receiving warehouse → company home country.
+    let destCountryRaw: string | null = null
+    if (input.destinationWarehouseId) {
+      const wh = await db.warehouse.findUnique({
+        where: { id: input.destinationWarehouseId },
+        select: { country: true },
+      })
+      destCountryRaw = wh?.country ?? null
+    }
+    if (!destCountryRaw) {
+      try {
+        const { getOrganisation } = await import('./company')
+        const org = await getOrganisation()
+        destCountryRaw = org?.country ?? null
+      } catch { /* fall through to null */ }
+    }
+    const { toIsoCountryCode } = await import('@/lib/countries')
+    const destCountryIso = toIsoCountryCode(destCountryRaw)
+    const destCountry: string | null = destCountryIso
+      ? destCountryIso.toLowerCase()
+      : (destCountryRaw ? destCountryRaw.toLowerCase() : null)
+
+    // Load product categories.
+    const productIdsForTax = Array.from(new Set(input.lines.map((l) => l.productId).filter(Boolean)))
+    const productRows = productIdsForTax.length
+      ? await db.product.findMany({
+          where: { id: { in: productIdsForTax } },
+          select: { id: true, taxCategory: true },
+        })
+      : []
+    const productCategoryById = new Map<string, TaxCategory>(
+      productRows.map((p) => [p.id, p.taxCategory]),
+    )
+
+    // Auto-resolve every line that doesn't have a manual override.
+    const autoLines = input.lines
+      .map((l, idx) => ({
+        id: String(idx),
+        productCategory: (l.productId && productCategoryById.get(l.productId)) || ('STANDARD' as TaxCategory),
+        override: l.taxRateId ?? null,
+      }))
+      .filter((l) => !l.override)
+    const resolvedMap = await resolveLineTaxRateBatch(autoLines, {
+      destinationCountry: destCountry,
+      usedFor: 'PURCHASE',
+      orderDefault: orderDefaultCtx,
+    })
+
+    // Manual overrides → lookup by id in one query.
+    const overrideIds = Array.from(
+      new Set(
+        input.lines
+          .map((l) => l.taxRateId)
+          .filter((x): x is string => typeof x === 'string' && x.length > 0),
+      ),
+    )
+    const overrideRows = overrideIds.length
+      ? await db.taxRate.findMany({
+          where: { id: { in: overrideIds } },
+          select: { id: true, name: true, rate: true, accountingTaxType: true },
+        })
+      : []
+    const overrideById = new Map(overrideRows.map((r) => [r.id, r]))
+
+    const lineResolved: ResolvedTaxRate[] = input.lines.map((l, idx) => {
+      if (l.taxRateId) {
+        const row = overrideById.get(l.taxRateId)
+        if (row) {
+          return {
+            taxRateId: row.id,
+            taxRateName: row.name,
+            taxRateValue: Number(row.rate),
+            accountingTaxType: row.accountingTaxType,
+            matched: 'exact',
+            warning: null,
+          }
+        }
+      }
+      return (
+        resolvedMap.get(String(idx)) ?? {
+          taxRateId: orderDefaultCtx.id,
+          taxRateName: orderDefaultCtx.name,
+          taxRateValue: orderDefaultCtx.rate,
+          accountingTaxType: orderDefaultCtx.accountingTaxType,
+          matched: 'fallback',
+          warning: null,
+        }
+      )
+    })
+
     const lineData = input.lines.map((l, i) => {
+      const resolved = lineResolved[i]
+      const lineRate = resolved.taxRateValue
+      const lineInclVat = inclVat && lineRate > 0
+      // `discountAmount` is in the same tax convention as the user-entered
+      // `unitCostForeign` (gross when inclVat, else net).
+      const discAmt = l.discountAmount ?? 0
+      const grossAfterDisc = Math.max(0, l.qty * l.unitCostForeign - discAmt)
       // If prices include VAT, extract net; otherwise use as-is
-      const netUnitForeign = inclVat ? l.unitCostForeign / (1 + vatRate) : l.unitCostForeign
+      const netLineForeign = lineInclVat ? grossAfterDisc / (1 + lineRate) : grossAfterDisc
+      const netUnitForeign = l.qty > 0 ? netLineForeign / l.qty : 0
       const { unitCostGbp, totalForeign, totalGbp } = calcLineTotals(netUnitForeign, l.qty, fxRate)
-      const lineTaxForeign = inclVat
-        ? Math.round((l.unitCostForeign * l.qty - totalForeign) * 10000) / 10000
-        : Math.round(totalForeign * vatRate * 10000) / 10000
+      const lineTaxForeign = lineInclVat
+        ? Math.round((grossAfterDisc - totalForeign) * 10000) / 10000
+        : Math.round(totalForeign * lineRate * 10000) / 10000
       const lineTaxGbp = Math.round((lineTaxForeign / fxRate) * 10000) / 10000
       subtotalForeign += totalForeign
       subtotalGbp += totalGbp
@@ -640,7 +867,9 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
         purchaseUnitQty: l.purchaseUnitQty ?? null,
         unitCostForeign: netUnitForeign,
         unitCostGbp,
-        taxRateId: input.taxRateId || null,
+        discountStr: l.discountStr || null,
+        discountAmount: discAmt,
+        taxRateId: resolved.taxRateId,
         taxForeign: lineTaxForeign,
         taxGbp: lineTaxGbp,
         totalForeign,
@@ -648,6 +877,38 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
         sortOrder: l.sortOrder ?? i,
       }
     })
+
+    // Order-level discount (applied after per-line discounts, before
+    // additional costs). It's provided in the same tax convention as the
+    // line costs (gross when `pricesIncludeVat`, else net). To keep the
+    // books consistent we split it proportionally across net subtotal and
+    // line tax, so the per-line taxRate totals each drop by the same
+    // percentage. The user input string is stored for re-display only.
+    const orderDiscountForeignInput = Math.max(0, input.orderDiscountForeign ?? 0)
+    let orderDiscountNetForeign = 0
+    let orderDiscountNetGbp = 0
+    let orderDiscountVatForeign = 0
+    let orderDiscountVatGbp = 0
+    if (orderDiscountForeignInput > 0 && subtotalForeign > 0) {
+      // The user enters the discount in the same tax convention as unit
+      // costs. Convert to net + vat using the overall line blend:
+      //   netFrac = subtotalForeign / (subtotalForeign + totalTaxForeign)
+      const grossBase = subtotalForeign + totalTaxForeign
+      const netFrac = grossBase > 0 ? subtotalForeign / grossBase : 1
+      // When prices are entered incl. VAT the input is a gross amount; when
+      // excl. VAT the input is a net amount. Translate to net+vat either
+      // way so both sides of the ledger reduce.
+      const grossDisc = inclVat ? orderDiscountForeignInput : orderDiscountForeignInput / Math.max(netFrac, 0.000001)
+      const cappedGrossDisc = Math.min(grossDisc, grossBase)
+      orderDiscountNetForeign = Math.round(cappedGrossDisc * netFrac * 10000) / 10000
+      orderDiscountVatForeign = Math.round((cappedGrossDisc - orderDiscountNetForeign) * 10000) / 10000
+      orderDiscountNetGbp = Math.round((orderDiscountNetForeign / fxRate) * 10000) / 10000
+      orderDiscountVatGbp = Math.round((orderDiscountVatForeign / fxRate) * 10000) / 10000
+      subtotalForeign = Math.max(0, subtotalForeign - orderDiscountNetForeign)
+      subtotalGbp = Math.max(0, subtotalGbp - orderDiscountNetGbp)
+      totalTaxForeign = Math.max(0, totalTaxForeign - orderDiscountVatForeign)
+      totalTaxGbp = Math.max(0, totalTaxGbp - orderDiscountVatGbp)
+    }
 
     // Additional costs (shipping, fees, etc.) → directFreight fields
     let directFreightForeign = 0
@@ -676,6 +937,21 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
     const grandTotalForeign = subtotalForeign + totalTaxForeign + directFreightForeign
     const grandTotalGbp = subtotalGbp + totalTaxGbp + directFreightGbp
 
+    // Persist each additional cost as its own freightCostLine so the edit
+    // form can prefill and modify them. The aggregate directFreight fields
+    // above are kept in sync for downstream landed-cost math that reads them
+    // directly.
+    const freightCostLineData = (input.additionalCosts ?? [])
+      .filter((ac) => ac.amountForeign > 0)
+      .map((ac, i) => ({
+        description: ac.description || 'Additional cost',
+        amountForeign: ac.amountForeign,
+        amountGbp: Math.round((ac.amountForeign / fxRate) * 10000) / 10000,
+        vatable: ac.vatable,
+        distributionMethod: ac.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
+        sortOrder: i,
+      }))
+
     const poReference = await makeReference()
     const po = await db.purchaseOrder.create({
       data: {
@@ -694,6 +970,8 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
         totalGbp: grandTotalGbp,
         directFreightForeign,
         directFreightGbp,
+        discountStr: input.orderDiscountStr ?? null,
+        discountAmount: orderDiscountForeignInput,
         landedCostMethod: lcMethod,
         destinationWarehouseId: input.destinationWarehouseId || null,
         supplierRef: input.supplierRef || null,
@@ -701,6 +979,9 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
         notes: input.notes || null,
         internalNotes: input.internalNotes || null,
         lines: { create: lineData },
+        ...(freightCostLineData.length > 0 && {
+          freightCostLines: { create: freightCostLineData },
+        }),
       },
       select: PO_SELECT,
     })
@@ -723,6 +1004,32 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       })
     }
 
+    // Aggregated warning when any line fell back to the order default.
+    const fallbackLines = lineResolved
+      .map((r, i) => ({
+        r,
+        sku: input.lines[i].sku,
+        cat:
+          (input.lines[i].productId && productCategoryById.get(input.lines[i].productId)) ||
+          'STANDARD',
+      }))
+      .filter((x) => x.r.matched === 'fallback')
+    if (fallbackLines.length > 0) {
+      logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: po.id,
+        action: 'tax_rate_fallback',
+        tag: 'purchase',
+        level: 'WARNING',
+        description: `No matching purchase tax rate for ${destCountry?.toUpperCase() ?? 'unknown country'} on ${fallbackLines.length} line(s); used order default.`,
+        metadata: {
+          reference: poReference,
+          destCountry,
+          lines: fallbackLines.map((x) => ({ sku: x.sku, category: x.cat })),
+        },
+      })
+    }
+
     revalidatePath('/purchase-orders')
     const mapped = mapPoRow(po)
     logActivity({
@@ -734,6 +1041,7 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       description: `Created PO ${mapped.reference} for ${mapped.supplierName}`,
       metadata: { reference: mapped.reference, supplierId: input.supplierId, currency: input.currency, lineCount: input.lines.length },
     })
+
     return { success: true, po: mapped }
   } catch (e) {
     logActivity({
@@ -754,17 +1062,17 @@ export async function updatePurchaseOrder(
   input: Partial<CreatePoInput>,
 ): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('purchasing.create')
     const existing = await db.purchaseOrder.findUnique({
       where: { id },
-      select: { status: true, fxRateToGbp: true },
+      select: { status: true, fxRateToGbp: true, directFreightForeign: true, directFreightGbp: true },
     })
     if (!existing) return { success: false, error: 'PO not found' }
     if (existing.status !== 'DRAFT') return { success: false, error: 'Only DRAFT POs can be edited' }
 
     const fxRate = input.fxRateToGbp ?? Number(existing.fxRateToGbp)
-    let subtotalForeign: number | undefined
-    let subtotalGbp: number | undefined
+    const inclVat = !!input.pricesIncludeVat
+    const vatRate = input.taxRateValue ?? 0
 
     const updates: Record<string, unknown> = {
       ...(input.supplierId !== undefined && { supplierId: input.supplierId }),
@@ -777,35 +1085,290 @@ export async function updatePurchaseOrder(
       ...(input.internalNotes !== undefined && { internalNotes: input.internalNotes || null }),
     }
 
+    // Order-level tax rate update (always apply when lines are being saved,
+    // because line VAT has to be recomputed in the same pass).
+    if (input.lines || input.taxRateId !== undefined || input.taxRateName !== undefined) {
+      updates.taxRateName = input.taxRateName || null
+      updates.taxRatePercent = vatRate > 0 ? vatRate : null
+    }
+
+    let updateFallbackInfo: {
+      destCountry: string | null
+      lines: { sku: string; category: TaxCategory }[]
+    } | null = null
+
     if (input.lines) {
+      // --- Tax rate resolution (mirror createPurchaseOrder) -------------
+      const orderDefaultRate = input.taxRateId
+        ? await db.taxRate.findUnique({
+            where: { id: input.taxRateId },
+            select: { id: true, name: true, rate: true, accountingTaxType: true },
+          })
+        : input.taxRateName
+        ? await db.taxRate.findFirst({
+            where: { name: input.taxRateName, active: true },
+            select: { id: true, name: true, rate: true, accountingTaxType: true },
+          })
+        : null
+      const orderDefaultCtx = {
+        id: orderDefaultRate?.id ?? null,
+        name: orderDefaultRate?.name ?? input.taxRateName ?? null,
+        rate: orderDefaultRate ? Number(orderDefaultRate.rate) : vatRate,
+        accountingTaxType: orderDefaultRate?.accountingTaxType ?? null,
+      }
+
+      // Destination country: receiving warehouse (use new value when set,
+      // else fall back to the existing PO's warehouse) → company home.
+      let destWarehouseId: string | null | undefined =
+        input.destinationWarehouseId !== undefined
+          ? input.destinationWarehouseId || null
+          : undefined
+      if (destWarehouseId === undefined) {
+        const cur = await db.purchaseOrder.findUnique({
+          where: { id },
+          select: { destinationWarehouseId: true },
+        })
+        destWarehouseId = cur?.destinationWarehouseId ?? null
+      }
+      let destCountryRaw: string | null = null
+      if (destWarehouseId) {
+        const wh = await db.warehouse.findUnique({
+          where: { id: destWarehouseId },
+          select: { country: true },
+        })
+        destCountryRaw = wh?.country ?? null
+      }
+      if (!destCountryRaw) {
+        try {
+          const { getOrganisation } = await import('./company')
+          const org = await getOrganisation()
+          destCountryRaw = org?.country ?? null
+        } catch { /* fall through */ }
+      }
+      const { toIsoCountryCode } = await import('@/lib/countries')
+      const destCountryIso = toIsoCountryCode(destCountryRaw)
+      const destCountry: string | null = destCountryIso
+        ? destCountryIso.toLowerCase()
+        : (destCountryRaw ? destCountryRaw.toLowerCase() : null)
+
+      // Load product categories.
+      const productIdsForTax = Array.from(new Set(input.lines.map((l) => l.productId).filter(Boolean)))
+      const productRows = productIdsForTax.length
+        ? await db.product.findMany({
+            where: { id: { in: productIdsForTax } },
+            select: { id: true, taxCategory: true },
+          })
+        : []
+      const productCategoryById = new Map<string, TaxCategory>(
+        productRows.map((p) => [p.id, p.taxCategory]),
+      )
+
+      // Auto-resolve every line that doesn't have a manual override.
+      const autoLines = input.lines
+        .map((l, idx) => ({
+          id: String(idx),
+          productCategory:
+            (l.productId && productCategoryById.get(l.productId)) || ('STANDARD' as TaxCategory),
+          override: l.taxRateId ?? null,
+        }))
+        .filter((l) => !l.override)
+      const resolvedMap = await resolveLineTaxRateBatch(autoLines, {
+        destinationCountry: destCountry,
+        usedFor: 'PURCHASE',
+        orderDefault: orderDefaultCtx,
+      })
+
+      // Batch-load any per-line manual overrides.
+      const overrideIds = Array.from(
+        new Set(
+          input.lines
+            .map((l) => l.taxRateId)
+            .filter((x): x is string => typeof x === 'string' && x.length > 0),
+        ),
+      )
+      const overrideRows = overrideIds.length
+        ? await db.taxRate.findMany({
+            where: { id: { in: overrideIds } },
+            select: { id: true, name: true, rate: true, accountingTaxType: true },
+          })
+        : []
+      const overrideById = new Map(overrideRows.map((r) => [r.id, r]))
+
+      const lineResolved: ResolvedTaxRate[] = input.lines.map((l, idx) => {
+        if (l.taxRateId) {
+          const row = overrideById.get(l.taxRateId)
+          if (row) {
+            return {
+              taxRateId: row.id,
+              taxRateName: row.name,
+              taxRateValue: Number(row.rate),
+              accountingTaxType: row.accountingTaxType,
+              matched: 'exact',
+              warning: null,
+            }
+          }
+        }
+        return (
+          resolvedMap.get(String(idx)) ?? {
+            taxRateId: orderDefaultCtx.id,
+            taxRateName: orderDefaultCtx.name,
+            taxRateValue: orderDefaultCtx.rate,
+            accountingTaxType: orderDefaultCtx.accountingTaxType,
+            matched: 'fallback',
+            warning: null,
+          }
+        )
+      })
+
+      const fallbackForActivity = lineResolved
+        .map((r, i) => ({
+          r,
+          sku: input.lines![i].sku,
+          cat:
+            (input.lines![i].productId && productCategoryById.get(input.lines![i].productId)) ||
+            ('STANDARD' as TaxCategory),
+        }))
+        .filter((x) => x.r.matched === 'fallback')
+      if (fallbackForActivity.length > 0) {
+        updateFallbackInfo = {
+          destCountry,
+          lines: fallbackForActivity.map((x) => ({ sku: x.sku, category: x.cat })),
+        }
+      }
+
       // Delete existing lines and recreate
       await db.purchaseOrderLine.deleteMany({ where: { poId: id } })
-      subtotalForeign = 0
-      subtotalGbp = 0
+      // Also clear any pre-existing purchase-unit aggregate data on the PO
+      // line level — the edit form currently operates in stock-unit terms
+      // (purchaseUnitId is not edited inline), so we preserve only what
+      // the form sends.
+      let subtotalForeign = 0
+      let subtotalGbp = 0
+      let totalTaxForeign = 0
+      let totalTaxGbp = 0
+
       const lineData = input.lines.map((l, i) => {
-        const { unitCostGbp, totalForeign, totalGbp } = calcLineTotals(l.unitCostForeign, l.qty, fxRate)
-        subtotalForeign! += totalForeign
-        subtotalGbp! += totalGbp
+        const resolved = lineResolved[i]
+        const resolvedId = resolved.taxRateId
+        const lineRate = resolved.taxRateValue
+        const lineInclVat = inclVat && lineRate > 0
+
+        // `unitCostForeign` is the user-entered pre-discount price per unit
+        // (gross when `pricesIncludeVat`, else net). `discountAmount` is in
+        // the same tax convention. Mirrors `createPurchaseOrder` exactly.
+        const discAmt = l.discountAmount ?? 0
+        const grossAfterDisc = Math.max(0, l.qty * l.unitCostForeign - discAmt)
+        const netLineForeign = lineInclVat ? grossAfterDisc / (1 + lineRate) : grossAfterDisc
+        const netUnitForeign = l.qty > 0 ? netLineForeign / l.qty : 0
+        const { unitCostGbp, totalForeign, totalGbp } = calcLineTotals(netUnitForeign, l.qty, fxRate)
+        const lineTaxForeign = lineInclVat
+          ? Math.round((grossAfterDisc - totalForeign) * 10000) / 10000
+          : Math.round(totalForeign * lineRate * 10000) / 10000
+        const lineTaxGbp = Math.round((lineTaxForeign / fxRate) * 10000) / 10000
+        subtotalForeign += totalForeign
+        subtotalGbp += totalGbp
+        totalTaxForeign += lineTaxForeign
+        totalTaxGbp += lineTaxGbp
         return {
           poId: id,
           productId: l.productId,
           description: l.description || null,
           qty: l.qty,
-          unitCostForeign: l.unitCostForeign,
+          purchaseUnitId: l.purchaseUnitId || null,
+          purchaseUnitQty: l.purchaseUnitQty ?? null,
+          unitCostForeign: netUnitForeign,
           unitCostGbp,
-          taxRateId: null,
-          taxForeign: 0,
-          taxGbp: 0,
+          discountStr: l.discountStr ?? null,
+          discountAmount: discAmt,
+          taxRateId: resolvedId,
+          taxForeign: lineTaxForeign,
+          taxGbp: lineTaxGbp,
           totalForeign,
           totalGbp,
           sortOrder: l.sortOrder ?? i,
         }
       })
       await db.purchaseOrderLine.createMany({ data: lineData })
+
+      // Order-level discount (mirrors createPurchaseOrder exactly). Split
+      // proportionally across net subtotal and line VAT using the pre-
+      // discount blend so per-rate totals each drop by the same %. Runs
+      // BEFORE additional-cost VAT is folded in so the discount only
+      // scales the line portion of the order.
+      const orderDiscountForeignInput = Math.max(0, input.orderDiscountForeign ?? 0)
+      if (orderDiscountForeignInput > 0 && subtotalForeign > 0) {
+        const grossBase = subtotalForeign + totalTaxForeign
+        const netFrac = grossBase > 0 ? subtotalForeign / grossBase : 1
+        const grossDisc = inclVat
+          ? orderDiscountForeignInput
+          : orderDiscountForeignInput / Math.max(netFrac, 0.000001)
+        const cappedGrossDisc = Math.min(grossDisc, grossBase)
+        const orderDiscountNetForeign = Math.round(cappedGrossDisc * netFrac * 10000) / 10000
+        const orderDiscountVatForeign = Math.round((cappedGrossDisc - orderDiscountNetForeign) * 10000) / 10000
+        const orderDiscountNetGbp = Math.round((orderDiscountNetForeign / fxRate) * 10000) / 10000
+        const orderDiscountVatGbp = Math.round((orderDiscountVatForeign / fxRate) * 10000) / 10000
+        subtotalForeign = Math.max(0, subtotalForeign - orderDiscountNetForeign)
+        subtotalGbp = Math.max(0, subtotalGbp - orderDiscountNetGbp)
+        totalTaxForeign = Math.max(0, totalTaxForeign - orderDiscountVatForeign)
+        totalTaxGbp = Math.max(0, totalTaxGbp - orderDiscountVatGbp)
+      }
+      updates.discountStr = input.orderDiscountStr ?? null
+      updates.discountAmount = orderDiscountForeignInput
+
+      // Additional costs (shipping, customs, handling, etc.) — mirror
+      // createPurchaseOrder exactly: replace all freightCostLines, rebuild
+      // directFreight aggregates, and fold VAT on vatable costs into the
+      // order tax totals.
+      if (input.additionalCosts !== undefined) {
+        await db.freightCostLine.deleteMany({ where: { poId: id } })
+        let directFreightForeign = 0
+        let additionalCostVatForeign = 0
+        const costLineData = (input.additionalCosts ?? [])
+          .filter((ac) => ac.amountForeign > 0)
+          .map((ac, i) => {
+            directFreightForeign += ac.amountForeign
+            if (ac.vatable && vatRate > 0) {
+              additionalCostVatForeign += Math.round(ac.amountForeign * vatRate * 10000) / 10000
+            }
+            return {
+              poId: id,
+              description: ac.description || 'Additional cost',
+              amountForeign: ac.amountForeign,
+              amountGbp: Math.round((ac.amountForeign / fxRate) * 10000) / 10000,
+              vatable: ac.vatable,
+              distributionMethod: ac.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
+              sortOrder: i,
+            }
+          })
+        if (costLineData.length > 0) {
+          await db.freightCostLine.createMany({ data: costLineData })
+        }
+        const directFreightGbp = Math.round((directFreightForeign / fxRate) * 10000) / 10000
+        const additionalCostVatGbp = Math.round((additionalCostVatForeign / fxRate) * 10000) / 10000
+        totalTaxForeign += additionalCostVatForeign
+        totalTaxGbp += additionalCostVatGbp
+        updates.directFreightForeign = directFreightForeign
+        updates.directFreightGbp = directFreightGbp
+        // Preserve the first cost's distribution method as the PO-level
+        // landedCostMethod (matches createPurchaseOrder behaviour).
+        const firstMethod = (input.additionalCosts ?? []).find((ac) => ac.amountForeign > 0)?.distributionMethod
+        if (firstMethod && ['BY_VALUE', 'BY_WEIGHT', 'BY_QUANTITY', 'EQUAL_SPLIT'].includes(firstMethod)) {
+          updates.landedCostMethod = firstMethod
+        }
+      }
+
+      // directFreight may have been updated above; use the new values
+      // when present, otherwise preserve the existing amounts from the PO.
+      const currentDirectFreightForeign =
+        (updates.directFreightForeign as number | undefined) ?? Number(existing.directFreightForeign)
+      const currentDirectFreightGbp =
+        (updates.directFreightGbp as number | undefined) ?? Number(existing.directFreightGbp)
       updates.subtotalForeign = subtotalForeign
       updates.subtotalGbp = subtotalGbp
-      updates.totalForeign = subtotalForeign
-      updates.totalGbp = subtotalGbp
+      updates.taxForeign = totalTaxForeign
+      updates.taxGbp = totalTaxGbp
+      updates.totalForeign = subtotalForeign + totalTaxForeign + currentDirectFreightForeign
+      updates.totalGbp = subtotalGbp + totalTaxGbp + currentDirectFreightGbp
     }
 
     const po = await db.purchaseOrder.update({
@@ -816,7 +1379,26 @@ export async function updatePurchaseOrder(
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
+    // Dynamic-route pattern form — guaranteed to bust the Router Cache
+    // for the active detail page in Next.js App Router so `router.refresh()`
+    // actually re-fetches fresh data.
+    revalidatePath('/purchase-orders/[id]', 'page')
     const mapped = mapPoRow(po)
+    if (updateFallbackInfo && updateFallbackInfo.lines.length > 0) {
+      logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: id,
+        action: 'tax_rate_fallback',
+        tag: 'purchase',
+        level: 'WARNING',
+        description: `No matching purchase tax rate for ${updateFallbackInfo.destCountry?.toUpperCase() ?? 'unknown country'} on ${updateFallbackInfo.lines.length} line(s); used order default.`,
+        metadata: {
+          reference: mapped.reference,
+          destCountry: updateFallbackInfo.destCountry,
+          lines: updateFallbackInfo.lines,
+        },
+      })
+    }
     logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
@@ -846,7 +1428,7 @@ export async function advancePoStatus(
   targetStatus: 'PO_SENT' | 'RFQ_SENT',
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('purchasing.create')
     const existing = await db.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
     if (!existing) return { success: false, error: 'PO not found' }
 
@@ -889,7 +1471,7 @@ export async function receivePurchaseOrder(
   notes?: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('purchasing.receive')
     const po = await db.purchaseOrder.findUnique({
       where: { id },
       select: {
@@ -1116,7 +1698,7 @@ export async function receivePurchaseOrder(
 
 export async function cancelPurchaseOrder(id: string): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('purchasing.create')
     const existing = await db.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
     if (!existing) return { success: false, error: 'PO not found' }
     if (existing.status !== 'DRAFT') return { success: false, error: 'Only DRAFT POs can be cancelled' }
@@ -1180,7 +1762,7 @@ export async function returnPurchaseOrder(
   notes?: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('purchasing.receive')
     const po = await db.purchaseOrder.findUnique({
       where: { id },
       select: {
@@ -1313,11 +1895,9 @@ export async function returnPurchaseOrder(
 // Billing / Invoicing
 // ---------------------------------------------------------------------------
 
-export type InvoiceLineInput = {
-  poLineId: string
-  qtyBilled: number
-  unitCostForeign: number
-}
+export type InvoiceLineInput =
+  | { kind: 'product'; poLineId: string; qtyBilled: number; unitCostForeign: number }
+  | { kind: 'cost'; costLineId: string; description: string; amountForeign: number }
 
 export type CreateInvoiceInput = {
   invoiceNumber?: string
@@ -1342,13 +1922,19 @@ export type InvoiceRow = {
   notes: string | null
   supplierInvoiceUrl: string | null
   accountingInvoiceId: string | null
+  paidAt: string | null
+  paymentAccountId: string | null
+  paymentAccountName: string | null
+  paymentReference: string | null
   createdAt: string
   lines: {
     id: string
-    poLineId: string
+    poLineId: string | null
+    costLineId: string | null
     productId: string
     sku: string
     productName: string
+    description: string
     qtyBilled: number
     unitCostForeign: number
     totalForeign: number
@@ -1361,7 +1947,7 @@ export async function createInvoice(
   input: CreateInvoiceInput,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('purchasing.invoice')
     const po = await db.purchaseOrder.findUnique({
       where: { id: poId },
       select: {
@@ -1371,24 +1957,93 @@ export async function createInvoice(
         fxRateToGbp: true,
         taxForeign: true,
         subtotalForeign: true,
+        lines: {
+          select: {
+            id: true,
+            qty: true,
+            product: { select: { sku: true } },
+            taxRate: { select: { accountingTaxType: true } },
+          },
+        },
+        freightCostLines: {
+          select: {
+            id: true,
+            description: true,
+            amountForeign: true,
+            vatable: true,
+          },
+        },
       },
     })
     if (!po) return { success: false, error: 'PO not found' }
 
-    const linesWithQty = input.lines.filter((l) => l.qtyBilled > 0)
-    if (!linesWithQty.length) return { success: false, error: 'Select at least one line to bill' }
+    // Split inputs into product vs cost lines.
+    const productInputs = input.lines.filter(
+      (l): l is Extract<InvoiceLineInput, { kind: 'product' }> =>
+        l.kind === 'product' && l.qtyBilled > 0,
+    )
+    const costInputs = input.lines.filter(
+      (l): l is Extract<InvoiceLineInput, { kind: 'cost' }> =>
+        l.kind === 'cost' && l.amountForeign > 0,
+    )
+    if (!productInputs.length && !costInputs.length) {
+      return { success: false, error: 'Select at least one line to bill' }
+    }
+
+    // Load prior billed totals for enforcement.
+    const existing = await db.purchaseInvoiceLine.findMany({
+      where: { invoice: { poId } },
+      select: { poLineId: true, costLineId: true, qtyBilled: true, totalForeign: true },
+    })
+    const alreadyProductByLine = new Map<string, number>()
+    const alreadyCostByLine = new Map<string, number>()
+    for (const el of existing) {
+      if (el.poLineId) {
+        alreadyProductByLine.set(el.poLineId, (alreadyProductByLine.get(el.poLineId) ?? 0) + Number(el.qtyBilled))
+      }
+      if (el.costLineId) {
+        alreadyCostByLine.set(el.costLineId, (alreadyCostByLine.get(el.costLineId) ?? 0) + Number(el.totalForeign))
+      }
+    }
+
+    // Enforce limits + build maps to the underlying PO line rows.
+    const poLineById = new Map(po.lines.map((l) => [l.id, l]))
+    const costLineById = new Map(po.freightCostLines.map((c) => [c.id, c]))
+
+    for (const l of productInputs) {
+      const poLine = poLineById.get(l.poLineId)
+      if (!poLine) return { success: false, error: `Unknown PO line ${l.poLineId}` }
+      const already = alreadyProductByLine.get(l.poLineId) ?? 0
+      if (already + l.qtyBilled > Number(poLine.qty) + 1e-6) {
+        return { success: false, error: `Line ${poLine.product.sku} exceeds remaining qty` }
+      }
+    }
+    for (const l of costInputs) {
+      const costLine = costLineById.get(l.costLineId)
+      if (!costLine) return { success: false, error: `Unknown cost line ${l.costLineId}` }
+      const already = alreadyCostByLine.get(l.costLineId) ?? 0
+      if (already + l.amountForeign > Number(costLine.amountForeign) + 1e-4) {
+        return { success: false, error: `Cost line "${costLine.description}" exceeds remaining amount` }
+      }
+    }
 
     const fxRate = Number(po.fxRateToGbp)
     let subtotalForeign = 0
     let subtotalGbp = 0
+    let taxBaseForeign = 0
 
-    const lineData = linesWithQty.map((l) => {
+    const productLineData = productInputs.map((l) => {
       const totalForeign = Math.round(l.qtyBilled * l.unitCostForeign * 10000) / 10000
       const totalGbp = Math.round((totalForeign / fxRate) * 10000) / 10000
       subtotalForeign += totalForeign
       subtotalGbp += totalGbp
+      // Product lines always contribute to the tax base (the existing
+      // PO-level ratio heuristic is applied across the whole product subtotal).
+      taxBaseForeign += totalForeign
       return {
         poLineId: l.poLineId,
+        costLineId: null,
+        description: null,
         qtyBilled: l.qtyBilled,
         unitCostForeign: l.unitCostForeign,
         totalForeign,
@@ -1396,11 +2051,33 @@ export async function createInvoice(
       }
     })
 
-    // Calculate tax proportion (same ratio as PO)
+    const costLineData = costInputs.map((l) => {
+      const totalForeign = Math.round(l.amountForeign * 10000) / 10000
+      const totalGbp = Math.round((totalForeign / fxRate) * 10000) / 10000
+      subtotalForeign += totalForeign
+      subtotalGbp += totalGbp
+      const costLine = costLineById.get(l.costLineId)!
+      // Only vatable cost lines contribute to the tax base.
+      if (costLine.vatable) taxBaseForeign += totalForeign
+      return {
+        poLineId: null,
+        costLineId: l.costLineId,
+        description: l.description,
+        qtyBilled: 1,
+        unitCostForeign: l.amountForeign,
+        totalForeign,
+        totalGbp,
+      }
+    })
+
+    const lineData = [...productLineData, ...costLineData]
+
+    // Calculate tax proportion (same ratio as PO) — applied only to the portion
+    // of the bill that is actually vatable (product subtotal + vatable cost lines).
     const poSubtotal = Number(po.subtotalForeign)
     const poTax = Number(po.taxForeign)
     const taxRate = poSubtotal > 0 ? poTax / poSubtotal : 0
-    const taxForeign = Math.round(subtotalForeign * taxRate * 10000) / 10000
+    const taxForeign = Math.round(taxBaseForeign * taxRate * 10000) / 10000
     const taxGbp = Math.round((taxForeign / fxRate) * 10000) / 10000
 
     const totalForeign = subtotalForeign + taxForeign
@@ -1440,7 +2117,11 @@ export async function createInvoice(
       tag: 'purchase',
       level: 'INFO',
       description: `Created invoice for PO ${po.reference}`,
-      metadata: { reference: po.reference, invoiceNumber: input.invoiceNumber ?? null, lineCount: linesWithQty.length },
+      metadata: {
+        reference: po.reference,
+        invoiceNumber: input.invoiceNumber ?? null,
+        lineCount: productInputs.length + costInputs.length,
+      },
     })
 
     // Queue accounting purchase invoice (bill) sync
@@ -1450,7 +2131,29 @@ export async function createInvoice(
         where: { id: poId },
         select: { supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true } } } }, currency: true },
       })
-      const billTaxType = supplierData?.supplier?.taxRate?.accountingTaxType ?? undefined
+      const fallbackTaxType = supplierData?.supplier?.taxRate?.accountingTaxType ?? undefined
+      // Look up each billed PO line's per-line tax rate so the accounting
+      // connector gets the correct taxType per line (mixed-VAT orders).
+      const taxTypeByLine = new Map(
+        po.lines.map((r) => [r.id, r.taxRate?.accountingTaxType ?? undefined]),
+      )
+      const productPayloadLines = productInputs.map((l) => ({
+        description: `PO ${po.reference} line`,
+        quantity: l.qtyBilled,
+        unitAmount: Math.round((l.unitCostForeign / fxRate) * 10000) / 10000,
+        accountCode: settings.transitAccount,
+        taxType: taxTypeByLine.get(l.poLineId) ?? fallbackTaxType,
+      }))
+      const costPayloadLines = costInputs.map((l) => {
+        const costLine = costLineById.get(l.costLineId)!
+        return {
+          description: l.description || costLine.description,
+          quantity: 1,
+          unitAmount: Math.round((l.amountForeign / fxRate) * 10000) / 10000,
+          accountCode: settings.transitAccount,
+          taxType: costLine.vatable ? fallbackTaxType : undefined,
+        }
+      })
       await queueAccountingSync({
         type: 'PURCHASE_INVOICE',
         referenceType: 'PurchaseOrder',
@@ -1464,13 +2167,7 @@ export async function createInvoice(
           reference: input.invoiceNumber ?? undefined,
           // Goods on a PO stay on the balance sheet as Stock-in-Transit until received.
           // The opposite leg (DR Inventory / CR Transit) is posted on goods receipt.
-          lines: linesWithQty.map(l => ({
-            description: `PO ${po.reference} line`,
-            quantity: l.qtyBilled,
-            unitAmount: Math.round((l.unitCostForeign / fxRate) * 10000) / 10000,
-            accountCode: settings.transitAccount,
-            taxType: billTaxType,
-          })),
+          lines: [...productPayloadLines, ...costPayloadLines],
           supplierInvoicePath: input.supplierInvoiceUrl ?? undefined,
         },
       })
@@ -1485,6 +2182,121 @@ export async function createInvoice(
       tag: 'purchase',
       level: 'ERROR',
       description: `Failed to create invoice for PO ${poId}: ${String(e)}`,
+      metadata: null,
+    })
+    return { success: false, error: String(e) }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Bill payment (mark a supplier bill as paid + push payment to accounting)
+// ---------------------------------------------------------------------------
+
+export async function getBillPaymentAccounts(): Promise<AccountingBankAccount[]> {
+  await requireAuth()
+  return listAccountingBankAccounts()
+}
+
+export type MarkBillPaidInput = {
+  bankAccountId: string            // connector account id (Xero AccountID)
+  paymentDate: string              // YYYY-MM-DD
+  reference?: string
+  amountForeign?: number           // optional partial payment; defaults to full bill total
+}
+
+export async function markBillPaid(
+  invoiceId: string,
+  input: MarkBillPaidInput,
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    await requirePermission('purchasing.invoice')
+
+    const invoice = await db.purchaseInvoice.findUnique({
+      where: { id: invoiceId },
+      select: {
+        id: true,
+        poId: true,
+        invoiceNumber: true,
+        totalForeign: true,
+        paidAt: true,
+        accountingInvoiceId: true,
+        po: { select: { reference: true, currency: true } },
+      },
+    })
+    if (!invoice) return { success: false, error: 'Bill not found' }
+    if (invoice.paidAt) return { success: false, error: 'Bill is already marked as paid' }
+    if (!input.bankAccountId) return { success: false, error: 'Select a bank account' }
+    if (!input.paymentDate) return { success: false, error: 'Payment date is required' }
+
+    // Resolve bank account name for snapshot (connector-agnostic).
+    const accounts = await listAccountingBankAccounts()
+    const account = accounts.find((a) => a.id === input.bankAccountId)
+    if (!account) return { success: false, error: 'Unknown bank account' }
+
+    const paymentAmount = input.amountForeign ?? Number(invoice.totalForeign)
+
+    await db.purchaseInvoice.update({
+      where: { id: invoiceId },
+      data: {
+        paidAt: new Date(input.paymentDate),
+        paymentAccountId: input.bankAccountId,
+        paymentAccountName: account.name,
+        paymentReference: input.reference || null,
+      },
+    })
+
+    revalidatePath('/purchase-orders')
+    revalidatePath(`/purchase-orders/${invoice.poId}`)
+
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: invoice.poId,
+      action: 'bill_paid',
+      tag: 'purchase',
+      level: 'INFO',
+      description: `Marked bill ${invoice.invoiceNumber ?? '(no number)'} as paid from ${account.name}`,
+      metadata: {
+        reference: invoice.po.reference,
+        invoiceId: invoice.id,
+        bankAccountName: account.name,
+        paymentDate: input.paymentDate,
+        amountForeign: paymentAmount,
+      },
+    })
+
+    // Queue accounting payment sync — only if the bill has actually been
+    // pushed to the accounting connector already (has an external id).
+    // Otherwise the payment would have nothing to attach to; users should
+    // wait for the bill to sync before marking paid.
+    if (invoice.accountingInvoiceId) {
+      try {
+        await queueAccountingSync({
+          type: 'BILL_PAYMENT',
+          referenceType: 'PurchaseInvoice',
+          referenceId: invoice.id,
+          payload: {
+            accountingInvoiceId: invoice.accountingInvoiceId,
+            bankAccountId: input.bankAccountId,
+            paymentDate: input.paymentDate,
+            amount: paymentAmount,
+            currency: invoice.po.currency,
+            reference: input.reference ?? undefined,
+          },
+        })
+      } catch {
+        // Accounting queue errors should never block the main flow.
+      }
+    }
+
+    return { success: true }
+  } catch (e) {
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: invoiceId,
+      action: 'bill_paid',
+      tag: 'purchase',
+      level: 'ERROR',
+      description: `Failed to mark bill ${invoiceId} as paid: ${String(e)}`,
       metadata: null,
     })
     return { success: false, error: String(e) }
@@ -1515,7 +2327,7 @@ export type CreateFreightPoInput = {
 
 export async function createFreightPo(input: CreateFreightPoInput): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('purchasing.create')
     if (!input.costLines.length) return { success: false, error: 'Add at least one cost line' }
     if (!input.primaryPoIds.length) return { success: false, error: 'Link to at least one primary PO' }
 
@@ -1689,7 +2501,7 @@ export async function updateFreightPoCosts(
   taxRateValue?: number,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('purchasing.create')
     const po = await db.purchaseOrder.findUnique({
       where: { id: freightPoId },
       select: { id: true, reference: true, type: true, fxRateToGbp: true },

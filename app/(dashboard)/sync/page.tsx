@@ -1,6 +1,6 @@
 import type { Metadata } from 'next'
 import { getWcSyncSettings, getWcTaxRateMappings, getWcStatusMappings, getWcSyncLogs, getWcCredentials, getWcActivePaymentGateways } from '@/app/actions/wc-sync'
-import { getXeroSettingsMasked, getXeroConnectionStatus, getXeroAccounts, getXeroSyncLogs, getXeroSyncReadiness } from '@/app/actions/xero-sync'
+import { getXeroSettingsMasked, getXeroConnectionStatus, getXeroAccounts, getXeroSyncLogs, getXeroSyncReadiness, fetchXeroTaxRates } from '@/app/actions/xero-sync'
 import { getPaymentMethodCombos } from '@/app/actions/accounting'
 import { getPaymentAccountMap } from '@/lib/accounting'
 import { getTaxRates } from '@/app/actions/settings'
@@ -31,6 +31,10 @@ export default async function SyncPage() {
   const taxRates = taxRatesRaw.map((r: { id: string; name: string }) => ({ id: r.id, name: r.name }))
   const currencies = currenciesRaw.map((c) => ({ code: c.code, name: c.name }))
 
+  // Only hit the Xero Tax Rates API when the connector is live — otherwise
+  // the sync page would pay for a round-trip on every render.
+  const xeroTaxRates = xeroStatus.connected ? await fetchXeroTaxRates().catch(() => []) : []
+
   return (
     <div className="space-y-6 max-w-5xl">
       <div>
@@ -45,6 +49,8 @@ export default async function SyncPage() {
         wcStatusMappings={statusMappings}
         wcLogs={logs}
         taxRates={taxRates}
+        imsTaxRates={taxRatesRaw}
+        xeroTaxRates={xeroTaxRates}
         wcCredentials={wcCreds}
         xeroSettings={xeroSettings}
         xeroConnected={xeroStatus.connected}

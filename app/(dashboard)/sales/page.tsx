@@ -5,13 +5,14 @@ import { getWarehouses, getStockLevelMap, getAvgCogsMap } from '@/app/actions/st
 import { getCurrencies } from '@/app/actions/currencies'
 import { getTaxRates, getUsers } from '@/app/actions/settings'
 import { getCustomers } from '@/app/actions/customers'
+import { getOrganisation } from '@/app/actions/company'
 import { auth } from '@/lib/auth'
 import { SalesPageClient } from './sales-page-client'
 
 export const metadata: Metadata = { title: 'Sales Orders' }
 
 export default async function SalesPage() {
-  const [orders, { products }, warehouses, currencies, taxRates, customers, stockLevels, avgCogs, users, session] = await Promise.all([
+  const [orders, { products }, warehouses, currencies, taxRates, customers, stockLevels, avgCogs, users, session, organisation] = await Promise.all([
     getSalesOrders(),
     listProducts({ pageSize: 1000, type: 'ALL' }),
     getWarehouses(),
@@ -22,6 +23,7 @@ export default async function SalesPage() {
     getAvgCogsMap(),
     getUsers(),
     auth(),
+    getOrganisation(),
   ])
 
   const stockable = products.filter(
@@ -40,6 +42,7 @@ export default async function SalesPage() {
       avgCogs={avgCogs}
       users={users}
       currentUserName={session?.user?.name ?? session?.user?.email ?? ''}
+      companyHomeCountry={organisation.country}
     />
   )
 }

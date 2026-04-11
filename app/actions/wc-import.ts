@@ -8,7 +8,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth } from '@/lib/auth/server'
+import { requireAuth, requirePermission } from '@/lib/auth/server'
 
 export type HistoricalImportProgress = {
   status: 'idle' | 'running' | 'done' | 'error'
@@ -22,7 +22,7 @@ export type HistoricalImportProgress = {
 export async function importHistoricalSalesCsv(
   formData: FormData,
 ): Promise<HistoricalImportProgress> {
-  await requireAuth()
+  await requirePermission('sync')
   const result: HistoricalImportProgress = {
     status: 'running', message: '', ordersProcessed: 0, movementsCreated: 0, skipped: 0, errors: [],
   }

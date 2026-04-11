@@ -10,6 +10,8 @@ import {
   mapWcAddress, upsertCustomer, mapWcLineItems, mapWcOrderDiscount,
   mapWcShipping, resolveWcTaxRateById, extractWcTracking, getFxRateToGbp,
 } from './field-mapping'
+import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
+import type { TaxCategory } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
 // Import a single WC order into IMS
@@ -35,23 +37,98 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
     const currency = wcOrder.currency || 'GBP'
     const fxRate = await getFxRateToGbp(currency)
 
-    // Tax — look up by the WC tax rate id referenced by the order.
-    // Orders include a tax_lines[] summary with rate_id (preferred); fall back
-    // to the first line item's taxes[0].id if no tax_lines are present.
+    // Primary (order-level) tax rate — looked up from the WC tax_lines
+    // summary; this is the "default" rate stored on the order and used for
+    // shipping / discount VAT.
     const primaryWcRateId =
       wcOrder.tax_lines?.[0]?.rate_id ??
       wcOrder.line_items?.[0]?.taxes?.[0]?.id ??
       null
-    const { taxRateName, taxRateValue, accountingTaxType } = await resolveWcTaxRateById(primaryWcRateId)
+    const {
+      taxRateId: orderDefaultTaxRateId,
+      taxRateName,
+      taxRateValue,
+      accountingTaxType,
+    } = await resolveWcTaxRateById(primaryWcRateId)
     const pricesIncludeVat = wcOrder.prices_include_tax
 
-    // Line items
+    // Line items (each one may carry its own wcTaxRateId)
     const mappedLines = await mapWcLineItems(wcOrder.line_items, fxRate)
 
-    // Calculate totals from WC data
-    const subtotalForeign = mappedLines.reduce((s, l) => {
+    // --- Per-line tax resolution --------------------------------------
+    // 1. Where WC sent a per-line tax rate id, trust it (WC computed it
+    //    server-side including shipping-country logic).
+    // 2. Otherwise, fall back to the IMS resolver on (productCategory,
+    //    shippingCountry, SALES).
+    const distinctWcRateIds = Array.from(
+      new Set(mappedLines.map((l) => l.wcTaxRateId).filter((x): x is number => typeof x === 'number')),
+    )
+    const wcResolvedById = new Map<
+      number,
+      { taxRateId: string | null; taxRateName: string | null; taxRateValue: number; accountingTaxType: string | null }
+    >()
+    for (const id of distinctWcRateIds) {
+      wcResolvedById.set(id, await resolveWcTaxRateById(id))
+    }
+
+    // Load product categories for lines that need the resolver fallback.
+    const productIds = Array.from(
+      new Set(mappedLines.map((l) => l.productId).filter((x): x is string => typeof x === 'string')),
+    )
+    const productRows = productIds.length
+      ? await db.product.findMany({
+          where: { id: { in: productIds } },
+          select: { id: true, taxCategory: true },
+        })
+      : []
+    const productCategoryById = new Map<string, TaxCategory>(
+      productRows.map((p) => [p.id, p.taxCategory]),
+    )
+
+    const destCountry = wcOrder.shipping?.country
+      ? wcOrder.shipping.country.toLowerCase()
+      : wcOrder.billing?.country
+      ? wcOrder.billing.country.toLowerCase()
+      : null
+
+    const orderDefaultCtx = {
+      id: orderDefaultTaxRateId,
+      name: taxRateName,
+      rate: taxRateValue,
+      accountingTaxType,
+    }
+    const needsResolver = mappedLines
+      .map((l, idx) => ({
+        id: String(idx),
+        productCategory: (l.productId && productCategoryById.get(l.productId)) || ('STANDARD' as TaxCategory),
+        hasWc: l.wcTaxRateId != null,
+      }))
+      .filter((l) => !l.hasWc)
+    const resolverMap = await resolveLineTaxRateBatch(
+      needsResolver.map((l) => ({ id: l.id, productCategory: l.productCategory })),
+      { destinationCountry: destCountry, usedFor: 'SALES', orderDefault: orderDefaultCtx },
+    )
+
+    const lineTaxResolved = mappedLines.map((l, idx) => {
+      if (l.wcTaxRateId != null) {
+        const wc = wcResolvedById.get(l.wcTaxRateId)
+        if (wc) return wc
+      }
+      return (
+        resolverMap.get(String(idx)) ?? {
+          taxRateId: orderDefaultTaxRateId,
+          taxRateName: taxRateName,
+          taxRateValue: taxRateValue,
+          accountingTaxType: accountingTaxType,
+        }
+      )
+    })
+
+    // Calculate totals from WC data (per-line rates for net extraction)
+    const subtotalForeign = mappedLines.reduce((s, l, idx) => {
+      const rate = lineTaxResolved[idx].taxRateValue
       const lineNet = pricesIncludeVat
-        ? (l.qty * l.unitPriceForeign - l.discountAmount) / (1 + taxRateValue)
+        ? (l.qty * l.unitPriceForeign - l.discountAmount) / (1 + rate)
         : l.qty * l.unitPriceForeign - l.discountAmount
       return s + lineNet
     }, 0)
@@ -74,9 +151,11 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
     const totalGbp = Math.round((totalForeign / fxRate) * 10000) / 10000
 
     // Line data for Prisma
-    const lineData = mappedLines.map((l) => {
+    const lineData = mappedLines.map((l, idx) => {
+      const resolved = lineTaxResolved[idx]
+      const rate = resolved.taxRateValue
       const netForeign = pricesIncludeVat
-        ? (l.qty * l.unitPriceForeign - l.discountAmount) / (1 + taxRateValue)
+        ? (l.qty * l.unitPriceForeign - l.discountAmount) / (1 + rate)
         : l.qty * l.unitPriceForeign - l.discountAmount
       const unitPriceGbp = Math.round((l.unitPriceForeign / fxRate) * 1000000) / 1000000
       const totalLineForeign = Math.round(netForeign * 10000) / 10000
@@ -94,6 +173,7 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
         unitPriceGbp,
         discountStr: l.discountStr,
         discountAmount: l.discountAmount,
+        taxRateId: resolved.taxRateId,
         taxForeign: taxLineForeign,
         taxGbp: taxLineGbp,
         totalForeign: totalLineForeign,
@@ -132,6 +212,7 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
         taxRateName,
         taxRatePercent: taxRateValue > 0 ? taxRateValue : null,
         taxForeign,
+        pricesIncludeVat: !!pricesIncludeVat && taxRateValue > 0,
         totalForeign,
         subtotalGbp,
         shippingGbp,
@@ -154,7 +235,19 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
       const { queueAccountingSync, getAccountingSettings } = await import('@/lib/accounting')
       const settings = await getAccountingSettings()
       const fxRateNum = Number(fxRate) || 1
-      const discountGbp = Math.round((orderDiscount.discountAmount / fxRateNum) * 100) / 100
+      // WC stores shipping_total already NET; line prices may be gross when
+      // the WC store is configured with prices_include_tax. Send everything
+      // to Xero as tax-inclusive when WC was inclusive so gross line prices
+      // are interpreted correctly — shipping is converted to gross first to
+      // stay consistent with the LineAmountTypes flag.
+      const vatMultiplier = 1 + (taxRateValue || 0)
+      const shippingNetGbp = shippingForeign > 0 ? shippingForeign / fxRateNum : 0
+      const shippingSendGbp = pricesIncludeVat ? shippingNetGbp * vatMultiplier : shippingNetGbp
+      // WC coupon discounts in `discount_total` are NET when prices_include_tax
+      // is false, and GROSS when true — mapWcOrderDiscount stores the raw
+      // value so pass it through in the same inclusive/exclusive mode.
+      const discountGbpRaw = orderDiscount.discountAmount / fxRateNum
+      const discountGbp = Math.round(discountGbpRaw * 100) / 100
       await queueAccountingSync({
         type: 'SALES_INVOICE',
         referenceType: 'SalesOrder',
@@ -166,19 +259,22 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
           date: new Date().toISOString().slice(0, 10),
           currency,
           reference: orderNumber,
-          lines: lineData.map(l => ({
+          lines: lineData.map((l, idx) => ({
             itemCode: l.sku ?? undefined,
             description: l.description ?? l.sku ?? 'Item',
             quantity: l.qty,
             unitAmount: Math.round((l.unitPriceForeign / fxRateNum) * 10000) / 10000,
             accountCode: settings.salesAccount,
-            taxType: accountingTaxType ?? undefined,
+            taxType: lineTaxResolved[idx]?.accountingTaxType ?? accountingTaxType ?? undefined,
           })),
-          shippingAmount: shippingForeign > 0 ? Math.round((shippingForeign / fxRateNum) * 10000) / 10000 : undefined,
+          shippingAmount: shippingSendGbp > 0 ? Math.round(shippingSendGbp * 10000) / 10000 : undefined,
           shippingDescription: 'Shipping',
           shippingAccountCode: settings.shippingAccount || undefined,
+          shippingTaxType: accountingTaxType ?? undefined,
           discountAmount: discountGbp > 0 ? discountGbp : undefined,
           discountAccountCode: settings.discountAccount || undefined,
+          discountTaxType: accountingTaxType ?? undefined,
+          lineAmountsIncludeTax: pricesIncludeVat,
           _postingMode: 'submitted',
           _registerPayment: !!wcOrder.date_paid_gmt,
           _paymentMethod: wcOrder.payment_method || undefined,

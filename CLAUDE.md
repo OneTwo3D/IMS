@@ -59,13 +59,15 @@ onetwo3d-ims/
 │   │   ├── inventory/        # Product management, stock levels
 │   │   ├── stock-control/    # Transfers, adjustments, counts
 │   │   ├── sales/            # Orders, shipments, invoices
-│   │   ├── purchases/        # POs, RFQs, suppliers
+│   │   ├── purchase-orders/  # POs, RFQs, suppliers
 │   │   ├── manufacturing/    # Production orders, BOMs
 │   │   ├── sync/             # WooCommerce, Xero integration
 │   │   ├── analytics/        # Reports and forecasting
 │   │   ├── settings/         # Company, users, integrations
 │   │   ├── activity/         # Activity log (audit trail)
-│   │   └── supplier/         # Supplier portal (separate RBAC)
+│   │   ├── profile/          # User profile and preferences
+│   │   ├── supplier/         # Supplier portal (separate RBAC)
+│   │   └── help/             # Help documentation portal
 │   ├── actions/              # Server actions (business logic)
 │   ├── api/
 │   │   ├── auth/             # Authentication endpoints
@@ -73,7 +75,14 @@ onetwo3d-ims/
 │   │   ├── webhooks/         # WooCommerce webhooks
 │   │   ├── export/           # CSV exports
 │   │   ├── import/           # CSV imports
-│   │   └── uploads/          # File uploads
+│   │   ├── invoice/          # Invoice generation & preview
+│   │   ├── sales-order/      # Sales order PDFs
+│   │   ├── rfq/              # RFQ PDF generation
+│   │   ├── manufacturing-order/ # Production order PDFs
+│   │   ├── upload/           # File uploads
+│   │   ├── backup/           # Backup & restore endpoints
+│   │   ├── notifications/    # Notification delivery (email, SMS)
+│   │   └── preview/          # Document preview endpoints
 │   └── generated/prisma/     # Auto-generated Prisma client types
 ├── components/
 │   ├── ui/                   # Shadcn/Base-UI primitives (button, card, etc.)
@@ -84,7 +93,7 @@ onetwo3d-ims/
 │   ├── profile/              # User profile components
 │   └── providers/            # Context providers
 ├── lib/
-│   ├── auth/                 # NextAuth configuration, session helpers
+│   ├── auth/                 # NextAuth.js configuration, session helpers
 │   ├── db.ts                 # Prisma client singleton
 │   ├── permissions.ts        # Role-based access control (RBAC)
 │   ├── activity-log.ts       # Audit trail logging
@@ -93,8 +102,8 @@ onetwo3d-ims/
 │   ├── csv.ts                # CSV parse and export utilities
 │   ├── utils.ts              # Shared utility functions
 │   ├── connectors/           # Integration modules
-│   │   ├── woocommerce/      # WC sync, webhooks, cron
-│   │   └── xero/             # Xero API integration
+│   │   ├── woocommerce/      # WC sync, webhooks, cron, tax mapping
+│   │   └── xero/             # Xero API, sub-ledger sync, reconciliation
 │   └── [service files]       # Email, notifications, tracking
 ├── prisma/
 │   ├── schema.prisma         # Database schema (57 models, full OTI spec)
@@ -120,19 +129,22 @@ onetwo3d-ims/
 
 1. **Core Inventory Module** — Product master data with FIFO costing, multi-warehouse stock tracking, VARIABLE/VARIANT/KIT/BOM product types, and real-time COGS calculation
 
-2. **Order-to-Cash** — Sales order workflow (DRAFT → PENDING → PROCESSING → SHIPPED → COMPLETED), multi-warehouse auto-allocation, shipment management, invoice generation
+2. **Order-to-Cash** — Sales order workflow (DRAFT → PENDING → PROCESSING → SHIPPED → COMPLETED), multi-warehouse auto-allocation, shipment management, invoice generation with payment tracking
 
 3. **Procure-to-Pay** — Purchase order lifecycle with multi-currency FX support, landed cost distribution, RFQ generation, goods receipt with FIFO costing, invoice reconciliation
 
 4. **Manufacturing** — Production orders with component allocation, BOM management, stock movements on completion
 
-5. **Integrations** — Connector modules for WooCommerce (order/stock sync via webhooks), Xero (journal entry posting), QuickBooks (coming soon), REST API
+5. **Integrations** — Connector modules for:
+   - **WooCommerce** — Order/stock sync via webhooks, product sync, tax rate mapping (new)
+   - **Xero** — Journal entry posting, sub-ledger batch sync (new), COGS calculation, reconciliation
+   - **QuickBooks** — Coming soon
 
-6. **Financial** — Multi-currency support with daily FX rates, VAT handling, Xero account mapping, COGS/margin analytics, cash bridge forecasting
+6. **Financial** — Multi-currency support with daily FX rates, VAT handling, Xero account mapping, COGS/margin analytics, cash bridge forecasting, payment account mapping (new)
 
-7. **Administration** — Role-based access (ADMIN, MANAGER, WAREHOUSE, FINANCE, READONLY, SUPPLIER), activity logging, scheduled backups, system settings
+7. **Administration** — Role-based access (ADMIN, MANAGER, WAREHOUSE, FINANCE, READONLY, SUPPLIER), activity logging, scheduled backups, system settings, notifications (new)
 
-**Data Flow:** WooCommerce orders → IMS (allocate stock) → Shipments (track) → Xero (post COGS + accounts)
+**Data Flow:** WooCommerce orders → IMS (allocate stock) → Shipments (track) → Xero sub-ledger (batch sync) → Accounts
 
 ## Database
 
@@ -140,12 +152,12 @@ onetwo3d-ims/
 - Products (Product, ProductVariant, ProductPrice)
 - Inventory (Stock, StockMovement, StockCount, StockTransfer)
 - Sales (SalesOrder, SalesOrderLine, OrderAllocation, Shipment, Invoice, CreditNote)
-- Purchases (PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, SupplierRfq)
-- Financials (TaxRate, Currency, LandedCost, CostLayer)
+- Purchases (PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, SupplierRfq, PurchaseReturn)
+- Financials (TaxRate, Currency, LandedCost, CostLayer, FxRate)
 - Manufacturing (ManufacturingOrder, Bom, BomItem)
-- Integrations (WooCommerceConfig, WooCommerceProduct, XeroMapping)
-- Administration (User, Role, Setting, ActivityLog, AuditTrail)
-- Sync State (WooCommerceSyncJob, XeroSyncLog)
+- Integrations (WooCommerceConfig, WooCommerceProduct, WooCommerceSyncJob, XeroMapping, XeroSyncLog)
+- Administration (User, Role, Setting, ActivityLog, AuditTrail, Notification)
+- Support (DocumentTemplate, AdjustmentReason, PurchaseUnit)
 
 See `@prisma/schema.prisma` for complete schema.
 
@@ -159,6 +171,7 @@ See `@prisma/schema.prisma` for complete schema.
 - API routes: `kebab-case` → `create-order.ts`, `webhook-woocommerce.ts`
 - Utilities: `kebab-case` → `pdf-helpers.ts`, `format-currency.ts`
 - Hooks: `use` + camelCase (in file name) → `useAuth.ts`, `usePermissions.ts`
+- UI components: `lowercase` → `button.tsx`, `dialog.tsx`, `dropdown-menu.tsx`
 - Config files: `kebab-case` → `next.config.ts`, `.env.example`
 
 **Code Naming** (identifiers inside files):
@@ -347,28 +360,80 @@ export async function updateProduct(id: string, input: unknown) {
 
 ## Environment Variables
 
-Copy `.env.example` to `.env` and configure:
+Copy `.env.example` to `.env` and configure. Uses **NextAuth.js v5** variable naming:
+
+### Application & Authentication
+
+| Variable | Required | Description | Example |
+|----------|----------|-------------|---------|
+| `NEXT_PUBLIC_APP_URL` | Yes | Full public app URL (no trailing slash) | `https://ims.yourdomain.com` |
+| `NODE_ENV` | Yes | Environment mode | `production` or `development` |
+| `AUTH_SECRET` | Yes | Encryption key for Auth.js sessions (min 32 chars) | Generate with `openssl rand -base64 32` |
+| `AUTH_URL` | Yes | Auth.js base URL (same as NEXT_PUBLIC_APP_URL) | `https://ims.yourdomain.com` |
+
+### Database
 
 | Variable | Required | Description | Example |
 |----------|----------|-------------|---------|
 | `DATABASE_URL` | Yes | PostgreSQL connection string | `postgresql://user:pass@localhost:5432/oti` |
-| `NEXTAUTH_URL` | Yes | App URL for auth callbacks | `http://localhost:3000` |
-| `NEXTAUTH_SECRET` | Yes | Encryption key for sessions (random string) | `$(openssl rand -base64 32)` |
-| `CRON_SECRET` | Yes | Shared secret for cron endpoints | Any random string |
+
+### WooCommerce Integration
+
+| Variable | Required | Description | Example |
+|----------|----------|-------------|---------|
+| `WC_STORE_URL` | No | WooCommerce store base URL (no trailing slash) | `https://yourstore.com` |
+| `WC_CONSUMER_KEY` | No | WC REST API consumer key | From WC admin → Settings → Advanced → REST API |
+| `WC_CONSUMER_SECRET` | No | WC REST API consumer secret | From WC admin → Settings → Advanced → REST API |
+| `WC_WEBHOOK_SECRET` | No | WC webhook signing key | Any random string (set same in WC webhooks config) |
+| `WC_SYNC_STATUSES` | No | Order statuses to sync (comma-separated) | `processing` (default: on-hold, completed) |
+| `WC_USE_WEBHOOKS` | No | Use webhooks or polling? | `true` (false = polling via cron) |
+| `WC_POLL_INTERVAL_MINUTES` | No | Polling interval when WC_USE_WEBHOOKS=false | `5` |
+
+### Xero Integration (OAuth 2.0)
+
+| Variable | Required | Description | Example |
+|----------|----------|-------------|---------|
+| `XERO_CLIENT_ID` | No | Xero OAuth app client ID | From Xero Developer Portal (app.xero.com) |
+| `XERO_CLIENT_SECRET` | No | Xero OAuth app client secret | From Xero Developer Portal |
+| `XERO_TENANT_ID` | No | Xero tenant/organisation ID (auto-populated after first OAuth) | Retrieved after OAuth flow |
+| `XERO_TOKEN_PATH` | No | Path to store Xero OAuth refresh token (keep outside repo) | `/var/lib/onetwoinventory/xero-token.json` |
+
+### Foreign Exchange Rates
+
+| Variable | Required | Description | Example |
+|----------|----------|-------------|---------|
+| `FX_BASE_CURRENCY` | No | Base currency for all calculations | `GBP` (default) |
+
+Note: FX rates are fetched daily via cron job (`/api/cron/fx-rates`) using free [frankfurter.dev](https://frankfurter.dev) API (ECB data, no API key required).
+
+### Email (SMTP)
+
+| Variable | Required | Description | Example |
+|----------|----------|-------------|---------|
 | `SMTP_HOST` | No | Email server hostname | `smtp.gmail.com` |
 | `SMTP_PORT` | No | Email server port | `587` |
-| `SMTP_USER` | No | Email account username | `noreply@example.com` |
-| `SMTP_PASS` | No | Email account password | `app-specific-password` |
-| `S3_ACCESS_KEY_ID` | No | AWS S3 for backup storage | From AWS IAM |
-| `S3_SECRET_ACCESS_KEY` | No | AWS S3 secret | From AWS IAM |
-| `S3_BUCKET` | No | S3 bucket name | `oti-backups` |
-| `WC_CONSUMER_KEY` | No | WooCommerce API key | From WC admin |
-| `WC_CONSUMER_SECRET` | No | WooCommerce API secret | From WC admin |
-| `WC_WEBHOOK_SECRET` | No | WC webhook signing key | Any secret string |
-| `XERO_CLIENT_ID` | No | Xero app client ID | From Xero app |
-| `XERO_CLIENT_SECRET` | No | Xero app secret | From Xero app |
+| `SMTP_SECURE` | No | Encryption type | `tls`, `ssl`, or `none` |
+| `SMTP_USER` | No | SMTP username | `noreply@company.com` |
+| `SMTP_PASSWORD` | No | SMTP password | App-specific password (not your account password) |
+| `SMTP_FROM_EMAIL` | No | From address on emails | `ims@yourdomain.com` |
+| `SMTP_FROM_NAME` | No | From name on emails | `onetwoInventory` |
 
-See `.env.example` for complete list.
+### File Storage & Uploads
+
+| Variable | Required | Description | Example |
+|----------|----------|-------------|---------|
+| `PDF_TEMP_DIR` | No | Temporary PDF storage directory (must be writable) | `/tmp/onetwoinventory/pdf` |
+| `UPLOAD_MAX_SIZE_MB` | No | Max CSV upload size in MB | `10` |
+| `UPLOAD_TEMP_DIR` | No | Temporary upload directory (must be writable) | `/tmp/onetwoinventory/uploads` |
+
+### Logging
+
+| Variable | Required | Description | Example |
+|----------|----------|-------------|---------|
+| `LOG_LEVEL` | No | Log level | `error`, `warn`, `info`, or `debug` |
+| `LOG_FORMAT` | No | Log format | `json` (production) or `pretty` (development) |
+
+See `.env.example` for complete list and additional settings.
 
 ## Key Modules & Responsibilities
 
@@ -376,13 +441,14 @@ See `.env.example` for complete list.
 |--------|----------|---------|-------|
 | **Product Management** | `app/actions/products.ts`, `components/inventory/` | CRUD for products, variants, BOMs, pricing | Inventory team |
 | **Stock Control** | `app/actions/stock.ts`, `app/(dashboard)/stock-control/` | Adjustments, transfers, counts, movements | Warehouse team |
-| **Sales Orders** | `app/actions/sales-orders.ts`, `app/(dashboard)/sales/` | Order workflow, allocation, shipment, invoicing | Sales team |
-| **Purchase Orders** | `app/actions/purchase-orders.ts`, `app/(dashboard)/purchases/` | PO creation, RFQ, receipt, landed costs | Procurement team |
+| **Sales Orders** | `app/actions/sales.ts`, `app/(dashboard)/sales/` | Order workflow, allocation, shipment, invoicing | Sales team |
+| **Purchase Orders** | `app/actions/purchase-orders.ts`, `app/(dashboard)/purchase-orders/` | PO creation, RFQ, receipt, landed costs | Procurement team |
 | **Manufacturing** | `app/actions/manufacturing.ts`, `app/(dashboard)/manufacturing/` | Production orders, BOM, component allocation | Production team |
-| **WooCommerce Sync** | `lib/connectors/woocommerce/` | Order/product sync, stock sync, webhooks, cron | Dev team |
-| **Xero Integration** | `lib/connectors/xero/` | Journal posting, COGS calculation, reconciliation | Finance team |
+| **WooCommerce Sync** | `lib/connectors/woocommerce/` | Order/product sync, tax mapping, webhooks, cron | Dev team |
+| **Xero Integration** | `lib/connectors/xero/` | Sub-ledger batch sync, journal posting, COGS, reconciliation | Finance team |
 | **Authentication** | `lib/auth/`, `app/(auth)/`, `app/actions/auth.ts` | Login, 2FA, roles, sessions, passkeys | Dev team |
 | **PDF Generation** | `lib/pdf.ts`, `app/api/*/[id]/pdf` | Branded PDFs (order, invoice, RFQ, PO) | Dev team |
+| **Notifications** | `lib/connectors/notifications/`, `app/api/notifications/` | Email delivery, notification history, preferences | Dev team |
 | **Activity Log** | `lib/activity-log.ts`, `app/(dashboard)/activity/` | Audit trail, searchable logs | Compliance team |
 | **Settings** | `app/(dashboard)/settings/`, `app/actions/settings.ts` | Company config, users, integrations, backup | Admin |
 
@@ -419,8 +485,8 @@ Every change must verify:
 - `@docs/configuration.md` — Configuration guide for integrations
 - `@docs/development.md` — Development workflow (branching, PR process)
 - `@docs/deployment.md` — Production deployment procedures
-- `@CLAUDE.md` — This file (product specification in original version)
-- `@AGENTS.md` — Agent configuration for extensibility
+- `@CLAUDE.md` — This file (primary project documentation)
+- `@docs/getting-started.md` — User onboarding and feature overview
 
 ## Git Workflow
 
@@ -458,9 +524,50 @@ npx prisma studio    # Visual DB explorer on localhost:5555
 npm run type-check    # Full TypeScript check
 ```
 
+## Recent Features (Latest Commits)
+
+- **Xero Sub-Ledger Sync:** Batch daily sync of journal entries to Xero with daily GL posting
+- **WooCommerce Tax Rate Mapping:** Automatic tax type mapping from WC to Xero
+- **Payment Account Mapping:** UI for configuring payment method → bank account mapping
+- **Notifications System:** Email notifications for orders, shipments, and sync events
+- **Invoice Delegation:** Support for delegated invoice generation workflows
+
 ## Contact & Support
 
 - **Product Owner:** One Two Enterprises Ltd
 - **Repository:** git@github.com:OneTwo3D/IMS.git
 - **Issues:** Document in activity log + GitHub issues
 - **Questions:** Reference docs first, then contact dev team
+
+
+## Skill Usage Guide
+
+When working on tasks involving these technologies, invoke the corresponding skill:
+
+| Skill | Invoke When |
+|-------|-------------|
+| typescript | Enforces TypeScript strict mode with type safety across all code |
+| node | Executes JavaScript on server with Node.js runtime |
+| react | Manages React components, hooks, and client-side state patterns |
+| postgresql | Manages PostgreSQL schemas and database migrations |
+| prisma | Accesses databases with type-safe Prisma ORM queries |
+| tailwind | Applies utility-first CSS styling with Tailwind CSS |
+| zod | Validates input data with Zod schema definitions |
+| nextauth | Implements authentication with NextAuth.js sessions |
+| shadcn-ui | Implements accessible UI components from Shadcn/UI library |
+| frontend-design | Designs UI with Tailwind CSS, components, and accessibility |
+| nodemailer | Sends SMTP emails through Nodemailer integration |
+| nextjs | Builds full-stack apps with App Router and Server Components |
+| designing-onboarding-paths | Designs onboarding paths, checklists, and first-run UI |
+| writing-release-notes | Drafts release notes tied to shipped features |
+| designing-inapp-guidance | Builds tooltips, tours, and contextual guidance |
+| eslint | Enforces code quality with ESLint configuration |
+| orchestrating-feature-adoption | Plans feature discovery, nudges, and adoption flows |
+| structuring-offer-ladders | Frames plan tiers, value ladders, and upgrade logic |
+| framing-release-stories | Builds launch narratives, assets, and rollout checklists |
+| mapping-user-journeys | Maps in-app journeys and identifies friction points in code |
+| streamlining-signup-steps | Reduces friction in signup and trial activation |
+| accelerating-first-run | Improves onboarding sequence and time-to-value |
+| tuning-landing-journeys | Improves landing page flow, hierarchy, and conversion paths |
+| inspecting-search-coverage | Audits technical and on-page search coverage |
+| adding-structured-signals | Adds structured data for rich results |

@@ -133,7 +133,15 @@ export type InvoiceLine = {
   unitAmount: number
   accountCode: string
   taxType?: string
-  discountRate?: number
+  /**
+   * Per-line discount amount (in the invoice currency, same tax convention
+   * as `unitAmount`). Generic across connectors — each connector decides how
+   * to represent it in its target system:
+   *   - Xero sales invoices (ACCREC) → converted to `DiscountRate` %
+   *   - Xero bills (ACCPAY) → applied by reducing `UnitAmount`
+   *   - QuickBooks → maps to `DiscountRate` / `DiscountAmt`
+   */
+  discountAmount?: number
 }
 
 export type InvoiceData = {
@@ -147,8 +155,26 @@ export type InvoiceData = {
   shippingAmount?: number
   shippingDescription?: string
   shippingAccountCode?: string
+  /**
+   * Tax type for the shipping line. Defaults to the connector's "no tax" code
+   * when omitted, but orders with a VAT rate should pass the matching
+   * accounting tax type so shipping is taxed at the same rate as the products.
+   */
+  shippingTaxType?: string
   discountAmount?: number
   discountAccountCode?: string
+  /**
+   * Tax type for the order-level discount line. Should match the order's tax
+   * rate so the discount reduces the taxable base correctly. Defaults to the
+   * connector's "no tax" code when omitted.
+   */
+  discountTaxType?: string
+  /**
+   * When true, unit amounts on all lines (products, shipping, discount) are
+   * treated as tax-inclusive by the accounting system. Defaults to exclusive.
+   * Each connector maps this to its own native flag.
+   */
+  lineAmountsIncludeTax?: boolean
   reference?: string
 }
 

@@ -5,8 +5,9 @@ import { redirect } from 'next/navigation'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth } from '@/lib/auth/server'
+import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { ProductType } from '@/app/generated/prisma/client'
+import type { TaxCategory } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -28,6 +29,7 @@ export type ProductRow = {
   salePriceGbp: string | null    // sale / discounted price
   priceRange: { min: string; max: string } | null  // for VARIABLE: min–max of variant regular prices
   salesPriceTaxInclusive: boolean
+  taxCategory: TaxCategory
   stockUnit: string
   oversellAllowed: boolean
   active: boolean
@@ -223,6 +225,7 @@ export async function listProducts(params: {
     salePriceGbp: p.salePriceGbp?.toString() ?? null,
     priceRange,
     salesPriceTaxInclusive: p.salesPriceTaxInclusive,
+    taxCategory: p.taxCategory,
     stockUnit: p.stockUnit,
     oversellAllowed: p.oversellAllowed,
     active: p.active,
@@ -406,6 +409,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       return { min: Math.min(...prices).toFixed(2), max: Math.max(...prices).toFixed(2) }
     })() : null,
     salesPriceTaxInclusive: p.salesPriceTaxInclusive,
+    taxCategory: p.taxCategory,
     stockUnit: p.stockUnit,
     oversellAllowed: p.oversellAllowed,
     active: p.active,
@@ -433,6 +437,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       salePriceGbp: v.salePriceGbp?.toString() ?? null,
       priceRange: null,
       salesPriceTaxInclusive: v.salesPriceTaxInclusive,
+      taxCategory: v.taxCategory,
       stockUnit: v.stockUnit,
       oversellAllowed: v.oversellAllowed,
       active: v.active,
@@ -529,6 +534,7 @@ const productSchema = z.object({
   salesPriceGbp: z.string().optional().nullable(),
   salePriceGbp: z.string().optional().nullable(),
   salesPriceTaxInclusive: z.boolean().default(false),
+  taxCategory: z.enum(['STANDARD', 'REDUCED', 'SECOND_REDUCED', 'ZERO', 'EXEMPT']).default('STANDARD'),
   stockUnit: z.string().default('pcs'),
   oversellAllowed: z.boolean().default(true),
   imageUrl: z.string().optional().nullable(),
@@ -547,7 +553,7 @@ export async function createProduct(
   _prev: ProductFormState,
   formData: FormData
 ): Promise<ProductFormState> {
-  await requireAuth()
+  await requirePermission('inventory.edit')
   const raw = {
     sku: formData.get('sku') as string,
     name: formData.get('name') as string,
@@ -561,6 +567,7 @@ export async function createProduct(
     salesPriceGbp: formData.get('salesPriceGbp') as string || null,
     salePriceGbp: formData.get('salePriceGbp') as string || null,
     salesPriceTaxInclusive: formData.get('salesPriceTaxInclusive') === 'on',
+    taxCategory: (formData.get('taxCategory') as string) || 'STANDARD',
     stockUnit: (formData.get('stockUnit') as string) || 'pcs',
     oversellAllowed: formData.get('oversellAllowed') === 'true',
     imageUrl: formData.get('imageUrl') as string || null,
@@ -597,6 +604,7 @@ export async function createProduct(
       salesPriceGbp: data.salesPriceGbp ? data.salesPriceGbp : null,
       salePriceGbp: data.salePriceGbp ? data.salePriceGbp : null,
       salesPriceTaxInclusive: data.salesPriceTaxInclusive,
+      taxCategory: data.taxCategory,
       stockUnit: data.stockUnit,
       oversellAllowed: data.oversellAllowed,
       imageUrl: data.imageUrl || null,
@@ -626,7 +634,7 @@ export async function updateProduct(
   _prev: ProductFormState,
   formData: FormData
 ): Promise<ProductFormState> {
-  await requireAuth()
+  await requirePermission('inventory.edit')
   const raw = {
     sku: formData.get('sku') as string,
     name: formData.get('name') as string,
@@ -640,6 +648,7 @@ export async function updateProduct(
     salesPriceGbp: formData.get('salesPriceGbp') as string || null,
     salePriceGbp: formData.get('salePriceGbp') as string || null,
     salesPriceTaxInclusive: formData.get('salesPriceTaxInclusive') === 'on',
+    taxCategory: (formData.get('taxCategory') as string) || 'STANDARD',
     stockUnit: (formData.get('stockUnit') as string) || 'pcs',
     oversellAllowed: formData.get('oversellAllowed') === 'true',
     imageUrl: formData.get('imageUrl') as string || null,
@@ -677,6 +686,7 @@ export async function updateProduct(
       salesPriceGbp: data.salesPriceGbp ? data.salesPriceGbp : null,
       salePriceGbp: data.salePriceGbp ? data.salePriceGbp : null,
       salesPriceTaxInclusive: data.salesPriceTaxInclusive,
+      taxCategory: data.taxCategory,
       stockUnit: data.stockUnit,
       oversellAllowed: data.oversellAllowed,
       imageUrl: data.imageUrl || null,
@@ -885,7 +895,7 @@ export async function saveProductComponents(
   components: { componentId: string; qty: string }[]
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAuth()
+    await requirePermission('inventory.edit')
     // Check for self-reference
     if (components.some((c) => c.componentId === productId)) {
       return { success: false, error: 'A product cannot be a component of itself' }
@@ -1024,7 +1034,7 @@ export async function saveProductOptions(
   productId: string,
   options: { name: string; values: string }[]
 ): Promise<{ success: boolean }> {
-  await requireAuth()
+  await requirePermission('inventory.edit')
   const _p = await db.product.findUnique({ where: { id: productId }, select: { sku: true } })
   const _sku = _p?.sku ?? productId
   await db.productOption.deleteMany({ where: { productId } })
@@ -1055,7 +1065,7 @@ export async function saveProductOptions(
 export async function generateVariantsFromOptions(
   productId: string
 ): Promise<{ created: number; skipped: number; error?: string }> {
-  await requireAuth()
+  await requirePermission('inventory.edit')
   const [product, options] = await Promise.all([
     db.product.findUnique({
       where: { id: productId },
@@ -1159,7 +1169,7 @@ export async function deleteOrDeactivateVariant(
   id: string,
   forceDeactivate = false
 ): Promise<{ action: 'deleted' | 'deactivated' | 'error'; error?: string }> {
-  await requireAuth()
+  await requirePermission('inventory.edit')
   const product = await db.product.findUnique({
     where: { id },
     select: { type: true, parentId: true },
@@ -1235,7 +1245,7 @@ export async function deleteOrDeactivateVariant(
 export async function bulkDeleteProducts(
   ids: string[]
 ): Promise<{ deleted: number; skipped: { sku: string; reason: string }[] }> {
-  await requireAuth()
+  await requirePermission('inventory.edit')
   const products = await db.product.findMany({
     where: { id: { in: ids } },
     select: { id: true, sku: true },
@@ -1288,7 +1298,7 @@ export async function bulkDeleteProducts(
 export async function bulkDeactivateProducts(
   ids: string[]
 ): Promise<{ deactivated: number }> {
-  await requireAuth()
+  await requirePermission('inventory.edit')
   await db.product.updateMany({
     where: { id: { in: ids } },
     data: { active: false },

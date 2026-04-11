@@ -197,7 +197,17 @@ export async function getPurchaseBills(dateFrom?: string, dateTo?: string): Prom
     select: {
       id: true, invoiceNumber: true, invoiceDate: true, supplierInvoiceUrl: true,
       po: { select: { id: true, reference: true, status: true, supplier: { select: { name: true } } } },
-      lines: { select: { id: true, qtyBilled: true, totalForeign: true, totalGbp: true, poLine: { select: { product: { select: { id: true, sku: true, name: true } } } } } },
+      lines: {
+        select: {
+          id: true,
+          qtyBilled: true,
+          totalForeign: true,
+          totalGbp: true,
+          description: true,
+          poLine: { select: { product: { select: { id: true, sku: true, name: true } } } },
+          costLine: { select: { description: true } },
+        },
+      },
     },
     orderBy: { invoiceDate: 'desc' },
   })
@@ -205,10 +215,15 @@ export async function getPurchaseBills(dateFrom?: string, dateTo?: string): Prom
   const rows: BillRow[] = []
   for (const inv of invoices) {
     for (const l of inv.lines) {
+      const isProduct = l.poLine != null
       rows.push({
         invoiceLineId: l.id, poId: inv.po.id, poReference: inv.po.reference,
         invoiceNumber: inv.invoiceNumber, supplierName: inv.po.supplier.name,
-        sku: l.poLine.product.sku, productName: l.poLine.product.name, productId: l.poLine.product.id,
+        sku: isProduct ? l.poLine!.product.sku : '—',
+        productName: isProduct
+          ? l.poLine!.product.name
+          : l.description ?? l.costLine?.description ?? '—',
+        productId: isProduct ? l.poLine!.product.id : '',
         invoiceDate: inv.invoiceDate.toISOString(),
         qtyBilled: Number(l.qtyBilled),
         totalForeign: Number(l.totalForeign), totalGbp: Number(l.totalGbp),

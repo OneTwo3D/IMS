@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth } from '@/lib/auth/server'
+import { requireAuth, requirePermission } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -13,6 +13,7 @@ export type CurrencyRow = {
   code: string
   name: string
   symbol: string
+  symbolPosition: 'PREFIX' | 'POSTFIX'
   active: boolean
   latestRate: number | null // 1 GBP = X of this currency
   rateDate: string | null
@@ -38,6 +39,7 @@ export async function getCurrencies(activeOnly = true): Promise<CurrencyRow[]> {
     code: c.code,
     name: c.name,
     symbol: c.symbol,
+    symbolPosition: c.symbolPosition,
     active: c.active,
     latestRate: c.fxRates[0] ? Number(c.fxRates[0].rate) : null,
     rateDate: c.fxRates[0]?.fetchedAt?.toISOString() ?? null,
@@ -64,7 +66,7 @@ export async function createCurrency(input: {
   name: string
   symbol: string
 }): Promise<{ success: boolean; error?: string }> {
-  await requireAuth()
+  await requirePermission('settings.company')
   try {
     const code = input.code.toUpperCase().trim()
     if (code.length !== 3) return { success: false, error: 'Currency code must be 3 characters' }
@@ -98,7 +100,7 @@ export async function createCurrency(input: {
 }
 
 export async function toggleCurrency(code: string, active: boolean): Promise<{ success: boolean; error?: string }> {
-  await requireAuth()
+  await requirePermission('settings.company')
   try {
     if (code === 'GBP') return { success: false, error: 'Cannot deactivate base currency' }
     await db.currency.update({ where: { code }, data: { active } })
@@ -142,7 +144,7 @@ async function fetchSingleFxRate(code: string): Promise<number | null> {
 
 /** Fetch FX rates for all active currencies (called daily via cron or on demand) */
 export async function fetchAllFxRates(): Promise<{ success: boolean; updated: string[]; failed: string[]; error?: string }> {
-  await requireAuth()
+  await requirePermission('settings.company')
   try {
     const currencies = await db.currency.findMany({
       where: { active: true, code: { not: 'GBP' } },

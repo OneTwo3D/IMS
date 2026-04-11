@@ -5,7 +5,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth } from '@/lib/auth/server'
+import { requireAuth, requirePermission } from '@/lib/auth/server'
 
 export type AddressData = {
   line1?: string
@@ -95,7 +95,7 @@ export async function getCustomer(id: string): Promise<CustomerRow | null> {
 }
 
 export async function createCustomer(input: CustomerInput): Promise<{ success: boolean; customer?: CustomerRow; error?: string }> {
-  await requireAuth()
+  await requirePermission('sales.create')
   try {
     if (!input.firstName?.trim()) return { success: false, error: 'First name is required' }
     const c = await db.customer.create({
@@ -123,7 +123,7 @@ export async function createCustomer(input: CustomerInput): Promise<{ success: b
 }
 
 export async function updateCustomer(id: string, input: Partial<CustomerInput> & { active?: boolean }): Promise<{ success: boolean; error?: string }> {
-  await requireAuth()
+  await requirePermission('sales.create')
   try {
     await db.customer.update({
       where: { id },
@@ -151,7 +151,7 @@ export async function updateCustomer(id: string, input: Partial<CustomerInput> &
 }
 
 export async function importContactsCsv(formData: FormData): Promise<{ success?: boolean; count?: number; error?: string }> {
-  await requireAuth()
+  await requirePermission('sales.create')
   try {
     const file = formData.get('file') as File
     if (!file) return { error: 'No file' }

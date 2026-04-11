@@ -10,6 +10,7 @@ import { db } from '@/lib/db'
 import { TOTP } from 'otplib'
 import { z } from 'zod'
 import { setAuthToken } from '@/lib/auth/token-store'
+import { checkRateLimit, clearRateLimit } from '@/lib/rate-limit'
 
 const schema = z.object({ code: z.string().length(6) })
 
@@ -17,6 +18,15 @@ export async function POST(request: NextRequest) {
   const session = await auth()
   if (!session?.user?.id) {
     return Response.json({ error: 'Unauthorised' }, { status: 401 })
+  }
+
+  const rlKey = `totp_verify:${session.user.id}`
+  const rl = checkRateLimit(rlKey, 5, 5 * 60_000)
+  if (!rl.allowed) {
+    return Response.json(
+      { error: 'Too many attempts, try again later.' },
+      { status: 429, headers: { 'Retry-After': String(rl.retryAfterSec) } },
+    )
   }
 
   const body = await request.json()
@@ -41,9 +51,12 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: 'Invalid code' }, { status: 400 })
   }
 
+  // Success — clear the rate-limit bucket so the next genuine verify is clean.
+  clearRateLimit(rlKey)
+
   // Generate a one-time token for secure session update
   const totpToken = randomBytes(32).toString('hex')
-  setAuthToken(`totp_verify:${totpToken}`, session.user.id, 60_000) // 60s TTL
+  await setAuthToken(`totp_verify:${totpToken}`, session.user.id, 60_000) // 60s TTL
 
   return Response.json({ success: true, totpToken })
 }

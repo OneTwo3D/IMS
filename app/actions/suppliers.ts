@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth } from '@/lib/auth/server'
+import { requireAuth, requirePermission } from '@/lib/auth/server'
 
 export type SupplierRow = {
   id: string
@@ -25,6 +25,12 @@ export type SupplierRow = {
   vatNumber: string | null
   accountNumber: string | null
   paymentTermsDays: number | null
+  /** User-entered manual override for expected delivery time, in days. */
+  manualDeliveryDays: number | null
+  /** Computed average delivery time in days across completed POs (null if no history). */
+  avgDeliveryDays: number | null
+  /** Number of historical POs the avgDeliveryDays is based on. */
+  avgDeliveryDaysCount: number
   notes: string | null
   active: boolean
 }
@@ -45,6 +51,7 @@ export type SupplierInput = {
   vatNumber?: string
   accountNumber?: string
   paymentTermsDays?: number | null
+  manualDeliveryDays?: number | null
   notes?: string
 }
 
@@ -66,31 +73,36 @@ const SUPPLIER_SELECT = {
   vatNumber: true,
   accountNumber: true,
   paymentTermsDays: true,
+  manualDeliveryDays: true,
   notes: true,
   active: true,
 } as const
 
-function mapSupplier(s: {
-  id: string
-  name: string
-  contactName: string | null
-  email: string | null
-  phone: string | null
-  addressLine1: string | null
-  addressLine2: string | null
-  city: string | null
-  county: string | null
-  postcode: string | null
-  country: string | null
-  currency: string
-  taxRateId: string | null
-  taxRate: { id: string; name: string; rate: unknown } | null
-  vatNumber: string | null
-  accountNumber: string | null
-  paymentTermsDays: number | null
-  notes: string | null
-  active: boolean
-}): SupplierRow {
+function mapSupplier(
+  s: {
+    id: string
+    name: string
+    contactName: string | null
+    email: string | null
+    phone: string | null
+    addressLine1: string | null
+    addressLine2: string | null
+    city: string | null
+    county: string | null
+    postcode: string | null
+    country: string | null
+    currency: string
+    taxRateId: string | null
+    taxRate: { id: string; name: string; rate: unknown } | null
+    vatNumber: string | null
+    accountNumber: string | null
+    paymentTermsDays: number | null
+    manualDeliveryDays: number | null
+    notes: string | null
+    active: boolean
+  },
+  avg: { days: number | null; count: number } = { days: null, count: 0 },
+): SupplierRow {
   return {
     id: s.id,
     name: s.name,
@@ -110,9 +122,45 @@ function mapSupplier(s: {
     vatNumber: s.vatNumber,
     accountNumber: s.accountNumber,
     paymentTermsDays: s.paymentTermsDays,
+    manualDeliveryDays: s.manualDeliveryDays,
+    avgDeliveryDays: avg.days,
+    avgDeliveryDaysCount: avg.count,
     notes: s.notes,
     active: s.active,
   }
+}
+
+/**
+ * Compute average delivery time (days from PO sent/created to received) per
+ * supplier. Uses poSentAt if populated, otherwise createdAt as the start date.
+ * Only includes POs that have been received.
+ */
+async function getAvgDeliveryDaysBySupplier(
+  supplierIds: string[],
+): Promise<Map<string, { days: number; count: number }>> {
+  const result = new Map<string, { days: number; count: number }>()
+  if (supplierIds.length === 0) return result
+  const rows = await db.$queryRaw<
+    { supplierId: string; avgDays: number | null; count: bigint }[]
+  >`
+    SELECT
+      "supplierId",
+      AVG(EXTRACT(EPOCH FROM ("receivedAt" - COALESCE("poSentAt", "createdAt"))) / 86400)::float AS "avgDays",
+      COUNT(*)::bigint AS "count"
+    FROM "purchase_orders"
+    WHERE "receivedAt" IS NOT NULL
+      AND "supplierId" = ANY(${supplierIds}::text[])
+    GROUP BY "supplierId"
+  `
+  for (const r of rows) {
+    if (r.avgDays != null) {
+      result.set(r.supplierId, {
+        days: Math.round(r.avgDays * 10) / 10,
+        count: Number(r.count),
+      })
+    }
+  }
+  return result
 }
 
 export async function getSuppliers(includeInactive = false): Promise<SupplierRow[]> {
@@ -122,17 +170,20 @@ export async function getSuppliers(includeInactive = false): Promise<SupplierRow
     select: SUPPLIER_SELECT,
     orderBy: { name: 'asc' },
   })
-  return rows.map(mapSupplier)
+  const avgMap = await getAvgDeliveryDaysBySupplier(rows.map((r) => r.id))
+  return rows.map((r) => mapSupplier(r, avgMap.get(r.id) ?? { days: null, count: 0 }))
 }
 
 export async function getSupplier(id: string): Promise<SupplierRow | null> {
   await requireAuth()
   const s = await db.supplier.findUnique({ where: { id }, select: SUPPLIER_SELECT })
-  return s ? mapSupplier(s) : null
+  if (!s) return null
+  const avgMap = await getAvgDeliveryDaysBySupplier([id])
+  return mapSupplier(s, avgMap.get(id) ?? { days: null, count: 0 })
 }
 
 export async function createSupplier(input: SupplierInput): Promise<{ success: boolean; supplier?: SupplierRow; error?: string }> {
-  await requireAuth()
+  await requirePermission('purchasing.create')
   try {
     const s = await db.supplier.create({
       data: {
@@ -151,6 +202,7 @@ export async function createSupplier(input: SupplierInput): Promise<{ success: b
         vatNumber: input.vatNumber || null,
         accountNumber: input.accountNumber || null,
         paymentTermsDays: input.paymentTermsDays ?? null,
+        manualDeliveryDays: input.manualDeliveryDays ?? null,
         notes: input.notes || null,
       },
       select: SUPPLIER_SELECT,
@@ -165,7 +217,7 @@ export async function createSupplier(input: SupplierInput): Promise<{ success: b
 }
 
 export async function updateSupplier(id: string, input: Partial<SupplierInput> & { active?: boolean }): Promise<{ success: boolean; supplier?: SupplierRow; error?: string }> {
-  await requireAuth()
+  await requirePermission('purchasing.create')
   try {
     const s = await db.supplier.update({
       where: { id },
@@ -185,6 +237,7 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
         ...(input.vatNumber !== undefined && { vatNumber: input.vatNumber || null }),
         ...(input.accountNumber !== undefined && { accountNumber: input.accountNumber || null }),
         ...(input.paymentTermsDays !== undefined && { paymentTermsDays: input.paymentTermsDays ?? null }),
+        ...(input.manualDeliveryDays !== undefined && { manualDeliveryDays: input.manualDeliveryDays ?? null }),
         ...(input.notes !== undefined && { notes: input.notes || null }),
         ...(input.active !== undefined && { active: input.active }),
       },
@@ -200,7 +253,7 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
 }
 
 export async function importSuppliersCsv(formData: FormData): Promise<{ success?: boolean; count?: number; error?: string }> {
-  await requireAuth()
+  await requirePermission('purchasing.create')
   try {
     const file = formData.get('file') as File
     if (!file) return { error: 'No file' }

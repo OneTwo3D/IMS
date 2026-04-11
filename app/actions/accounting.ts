@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { auth } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Connector-agnostic accounting actions.
@@ -13,14 +13,6 @@ import { auth } from '@/lib/auth'
 // active connector is responsible for interpreting the stored account codes
 // in its own chart of accounts.
 // ---------------------------------------------------------------------------
-
-async function requireAdmin() {
-  const session = await auth()
-  if (!session?.user?.id || !['ADMIN', 'MANAGER'].includes(session.user.role)) {
-    throw new Error('Unauthorized')
-  }
-  return session
-}
 
 /**
  * Save the payment method + currency → bank/clearing account map.
@@ -34,7 +26,7 @@ export async function savePaymentAccountMap(
   mapJson: string,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAdmin()
+    await requirePermission('settings.company')
 
     // Validate it's parseable JSON so we never persist garbage
     try {

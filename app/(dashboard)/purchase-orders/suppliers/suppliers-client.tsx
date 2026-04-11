@@ -1,7 +1,7 @@
 'use client'
 
-import { useState, useTransition } from 'react'
-import { useRouter } from 'next/navigation'
+import { useState, useTransition, useEffect } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { Plus, Pencil, X, Loader2, Check } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -41,6 +41,7 @@ type FormState = {
   vatNumber: string
   accountNumber: string
   paymentTermsDays: string
+  manualDeliveryDays: string
   notes: string
 }
 
@@ -60,6 +61,7 @@ const EMPTY_FORM: FormState = {
   vatNumber: '',
   accountNumber: '',
   paymentTermsDays: '',
+  manualDeliveryDays: '',
   notes: '',
 }
 
@@ -80,6 +82,7 @@ function supplierToForm(s: SupplierRow): FormState {
     vatNumber: s.vatNumber ?? '',
     accountNumber: s.accountNumber ?? '',
     paymentTermsDays: s.paymentTermsDays?.toString() ?? '',
+    manualDeliveryDays: s.manualDeliveryDays?.toString() ?? '',
     notes: s.notes ?? '',
   }
 }
@@ -101,6 +104,7 @@ function formToInput(f: FormState): SupplierInput {
     vatNumber: f.vatNumber || undefined,
     accountNumber: f.accountNumber || undefined,
     paymentTermsDays: f.paymentTermsDays ? parseInt(f.paymentTermsDays) : null,
+    manualDeliveryDays: f.manualDeliveryDays ? parseInt(f.manualDeliveryDays) : null,
     notes: f.notes || undefined,
   }
 }
@@ -253,6 +257,37 @@ function SupplierFormDialog({
           </div>
 
           <div className="space-y-1.5">
+            <Label>Delivery Time (days)</Label>
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Average (from history)</div>
+                <div className="h-9 flex items-center px-3 rounded-md border border-input bg-muted/30 font-mono text-sm">
+                  {supplier && supplier.avgDeliveryDays != null ? (
+                    <span>
+                      {supplier.avgDeliveryDays}d
+                      <span className="text-muted-foreground ml-1.5 text-xs font-sans">
+                        (from {supplier.avgDeliveryDaysCount} PO{supplier.avgDeliveryDaysCount === 1 ? '' : 's'})
+                      </span>
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground text-xs font-sans">No received POs yet</span>
+                  )}
+                </div>
+              </div>
+              <div>
+                <div className="text-xs text-muted-foreground mb-1">Manual override</div>
+                <Input
+                  type="number" min={0}
+                  value={form.manualDeliveryDays}
+                  onChange={(e) => set('manualDeliveryDays', e.target.value)}
+                  className="h-9"
+                  placeholder="e.g. 14"
+                />
+              </div>
+            </div>
+          </div>
+
+          <div className="space-y-1.5">
             <Label>Notes</Label>
             <Textarea value={form.notes} onChange={(e) => set('notes', e.target.value)} rows={2} className="text-sm resize-none" />
           </div>
@@ -274,9 +309,18 @@ function SupplierFormDialog({
 
 export function SuppliersClient({ initialSuppliers, taxRates, currencies }: Props) {
   const router = useRouter()
+  const searchParams = useSearchParams()
   const [isPending, startTransition] = useTransition()
   const [editing, setEditing] = useState<SupplierRow | null | undefined>(undefined)
   const [toggling, setToggling] = useState<string | null>(null)
+
+  // Auto-open edit dialog when navigated with ?edit=<supplierId>
+  useEffect(() => {
+    const editId = searchParams.get('edit')
+    if (!editId) return
+    const match = initialSuppliers.find((s) => s.id === editId)
+    if (match) setEditing(match)
+  }, [searchParams, initialSuppliers])
 
   function handleToggleActive(s: SupplierRow) {
     setToggling(s.id)
@@ -312,6 +356,7 @@ export function SuppliersClient({ initialSuppliers, taxRates, currencies }: Prop
                 <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Currency</th>
                 <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">VAT Rate</th>
                 <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Terms</th>
+                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Delivery</th>
                 <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Status</th>
                 <th className="w-16" />
               </tr>
@@ -329,6 +374,21 @@ export function SuppliersClient({ initialSuppliers, taxRates, currencies }: Prop
                       : <span className="text-muted-foreground">—</span>}
                   </td>
                   <td className="px-4 py-2 text-muted-foreground">{s.paymentTermsDays ? `${s.paymentTermsDays}d` : '—'}</td>
+                  <td className="px-4 py-2 text-xs">
+                    {s.manualDeliveryDays != null ? (
+                      <span>
+                        <span className="font-mono">{s.manualDeliveryDays}d</span>
+                        <span className="text-muted-foreground ml-1">(manual)</span>
+                      </span>
+                    ) : s.avgDeliveryDays != null ? (
+                      <span>
+                        <span className="font-mono">{s.avgDeliveryDays}d</span>
+                        <span className="text-muted-foreground ml-1">(avg of {s.avgDeliveryDaysCount})</span>
+                      </span>
+                    ) : (
+                      <span className="text-muted-foreground">—</span>
+                    )}
+                  </td>
                   <td className="px-4 py-2">
                     <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${
                       s.active

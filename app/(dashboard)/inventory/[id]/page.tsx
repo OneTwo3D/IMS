@@ -133,6 +133,7 @@ export default async function ProductDetailPage({
                 salesPriceGbp: product.salesPriceGbp ?? undefined,
                 salePriceGbp: product.salePriceGbp ?? undefined,
                 salesPriceTaxInclusive: product.salesPriceTaxInclusive,
+                taxCategory: product.taxCategory,
                 stockUnit: product.stockUnit,
                 oversellAllowed: product.oversellAllowed,
                 active: product.active,

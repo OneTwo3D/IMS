@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { Search, X, Plus, Loader2 } from 'lucide-react'
+import { Search, X, Plus, Loader2, AlertTriangle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -15,6 +15,9 @@ import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow, UserOption } from '@/app/actions/settings'
 import type { StockLevelEntry } from '@/app/actions/stock'
 import { ProductLink } from '@/components/inventory/product-link'
+import { formatMoney } from '@/lib/utils'
+import { toIsoCountryCode } from '@/lib/countries'
+import type { TaxCategory } from '@/app/generated/prisma/client'
 
 type Warehouse = { id: string; code: string; name: string }
 
@@ -28,11 +31,90 @@ type Props = {
   avgCogs: Record<string, number>
   users: UserOption[]
   currentUserName: string
+  companyHomeCountry?: string | null
   onClose: () => void
 }
 
-type LineItem = { key: string; productId: string; sku: string; name: string; qty: number; unitPrice: number; discount: string }
+type LineItem = {
+  key: string
+  productId: string
+  sku: string
+  name: string
+  qty: number
+  unitPrice: number
+  discount: string
+  productCategory: TaxCategory
+  taxRateId: string | null
+  taxRateValue: number
+  taxRateName: string | null
+  taxRateWarning: string | null
+  taxRateAutoResolved: boolean
+}
 type FeeLine = { key: string; description: string; amount: number }
+
+type ResolvedRate = {
+  taxRateId: string | null
+  taxRateValue: number
+  taxRateName: string | null
+  warning: string | null
+}
+
+/**
+ * Client-side mirror of lib/tax/resolve-rate.ts `pickTaxRate`. Keep the
+ * algorithm identical — the server re-resolves from the DB so it's
+ * authoritative, but the client needs it for live previews.
+ */
+function resolveRateClientSide(
+  category: TaxCategory,
+  destinationCountry: string | null,
+  rates: TaxRateRow[],
+  usedFor: 'SALES' | 'PURCHASE',
+  orderDefault: { id: string | null; name: string | null; rate: number },
+): ResolvedRate {
+  // Normalize free-text values ("United Kingdom", "UK") to ISO-2
+  const iso = toIsoCountryCode(destinationCountry)
+  const dest = iso ? iso.toLowerCase() : (destinationCountry ? destinationCountry.toLowerCase() : null)
+  const applicable = rates.filter((r) => {
+    if (!r.active) return false
+    const uf = (r.usedFor || 'BOTH').toUpperCase()
+    if (uf === 'BOTH') return true
+    return uf === usedFor
+  })
+
+  // Step 1: exact (country + category)
+  if (dest) {
+    const exact = applicable.find(
+      (r) => r.countryCode != null && r.countryCode.toLowerCase() === dest && r.taxCategory === category,
+    )
+    if (exact) {
+      return { taxRateId: exact.id, taxRateValue: exact.rate, taxRateName: exact.name, warning: null }
+    }
+  }
+
+  // Step 2: country STANDARD — only if product category is STANDARD
+  if (dest && category === 'STANDARD') {
+    const cs = applicable.find(
+      (r) => r.countryCode != null && r.countryCode.toLowerCase() === dest && r.taxCategory === 'STANDARD',
+    )
+    if (cs) {
+      return { taxRateId: cs.id, taxRateValue: cs.rate, taxRateName: cs.name, warning: null }
+    }
+  }
+
+  // Step 3: global rate for the category
+  const g = applicable.find((r) => r.countryCode == null && r.taxCategory === category)
+  if (g) {
+    return { taxRateId: g.id, taxRateValue: g.rate, taxRateName: g.name, warning: null }
+  }
+
+  // Step 4: order default — flagged
+  return {
+    taxRateId: orderDefault.id,
+    taxRateValue: orderDefault.rate,
+    taxRateName: orderDefault.name,
+    warning: `No configured sales rate for ${dest ? dest.toUpperCase() : 'unknown country'} / ${category}. Using order default.`,
+  }
+}
 
 /** Parse a discount string: "10%" → percentage, "5" → absolute value */
 function parseDiscount(input: string, lineTotal: number): number {
@@ -53,7 +135,7 @@ function formatAddr(a: AddressData | null): string {
   return [a.line1, a.line2, a.city, a.postcode, a.country].filter(Boolean).join(', ')
 }
 
-export function SoFormDialog({ products, warehouses, currencies, taxRates, customers, stockLevels, avgCogs, users, currentUserName, onClose }: Props) {
+export function SoFormDialog({ products, warehouses, currencies, taxRates, customers, stockLevels, avgCogs, users, currentUserName, companyHomeCountry, onClose }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
 
@@ -97,9 +179,34 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
   const selectedTaxRate = taxRates.find((t) => t.id === taxRateId)
   const vatRate = selectedTaxRate?.rate ?? 0
 
+  // Destination country: shippingAddress.country → billingAddress.country → home
+  const destCountry =
+    (shippingAddrObj?.country && shippingAddrObj.country.trim()) ||
+    (billingAddrObj?.country && billingAddrObj.country.trim()) ||
+    companyHomeCountry ||
+    null
+
+  const salesRates = taxRates.filter((t) => t.usedFor === 'SALES' || t.usedFor === 'BOTH')
+
+  const orderDefault = {
+    id: taxRateId || null,
+    name: selectedTaxRate?.name ?? null,
+    rate: vatRate,
+  }
+
+  function resolveForCategory(cat: TaxCategory): ResolvedRate {
+    return resolveRateClientSide(cat, destCountry, taxRates, 'SALES', orderDefault)
+  }
+
   const symbolMap: Record<string, string> = { GBP: '£' }
-  for (const c of currencies) symbolMap[c.code] = c.symbol
+  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { GBP: 'PREFIX' }
+  for (const c of currencies) {
+    symbolMap[c.code] = c.symbol
+    positionMap[c.code] = c.symbolPosition
+  }
   const sym = symbolMap[currency] ?? currency
+  const symPos = positionMap[currency] ?? 'PREFIX'
+  const money = (n: number) => formatMoney(n, sym, symPos)
 
   const rateMap: Record<string, number> = { GBP: 1 }
   for (const c of currencies) if (c.latestRate != null) rateMap[c.code] = c.latestRate
@@ -120,6 +227,30 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
       setShippingAddr(formatAddr(c.shippingAddress))
       setBillingAddrObj(c.billingAddress as Record<string, string> | null)
       setShippingAddrObj(c.shippingAddress as Record<string, string> | null)
+      // New shipping country → re-resolve auto lines against the new
+      // destination. Compute the new country inline since state updates
+      // from setShippingAddrObj haven't flushed yet.
+      const newDest =
+        (c.shippingAddress?.country && c.shippingAddress.country.trim()) ||
+        (c.billingAddress?.country && c.billingAddress.country.trim()) ||
+        companyHomeCountry ||
+        null
+      setLines((prev) =>
+        prev.map((l) => {
+          if (!l.taxRateAutoResolved) return l
+          const resolved = resolveRateClientSide(l.productCategory, newDest, taxRates, 'SALES', orderDefault)
+          if (resolved.taxRateValue === l.taxRateValue && resolved.taxRateId === l.taxRateId) {
+            return { ...l, taxRateWarning: resolved.warning }
+          }
+          return rescaleLineForRate(l, resolved.taxRateValue, {
+            taxRateId: resolved.taxRateId,
+            taxRateValue: resolved.taxRateValue,
+            taxRateName: resolved.taxRateName,
+            taxRateWarning: resolved.warning,
+            taxRateAutoResolved: true,
+          })
+        }),
+      )
     }
   }
 
@@ -139,26 +270,188 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
 
   function addProduct(p: ProductRow) {
     if (lines.some((l) => l.productId === p.id)) return
-    const price = p.salesPriceGbp ? Number(p.salesPriceGbp) * (currency === 'GBP' ? 1 : fxRate) : 0
-    setLines((prev) => [...prev, { key: makeKey(), productId: p.id, sku: p.sku, name: p.name, qty: 1, unitPrice: Math.round(price * 100) / 100, discount: '' }])
+    const resolved = resolveForCategory(p.taxCategory)
+    const lineRate = resolved.taxRateValue
+    // DB prices are net OR gross depending on the product's own
+    // salesPriceTaxInclusive flag. Convert using the *resolved* line-level
+    // rate so each line grosses-up with its own VAT.
+    const dbPrice = p.salesPriceGbp ? Number(p.salesPriceGbp) : 0
+    const dbIsGross = !!p.salesPriceTaxInclusive && lineRate > 0
+    const net = dbIsGross ? dbPrice / (1 + lineRate) : dbPrice
+    const display = pricesIncludeVat && lineRate > 0 ? net * (1 + lineRate) : net
+    const priceInCurrency = display * (currency === 'GBP' ? 1 : fxRate)
+    setLines((prev) => [
+      ...prev,
+      {
+        key: makeKey(),
+        productId: p.id,
+        sku: p.sku,
+        name: p.name,
+        qty: 1,
+        unitPrice: Math.round(priceInCurrency * 100) / 100,
+        discount: '',
+        productCategory: p.taxCategory,
+        taxRateId: resolved.taxRateId,
+        taxRateValue: resolved.taxRateValue,
+        taxRateName: resolved.taxRateName,
+        taxRateWarning: resolved.warning,
+        taxRateAutoResolved: true,
+      },
+    ])
     setProductSearch('')
     setShowSearch(false)
+  }
+
+  /**
+   * Manually override the tax rate for a single line. Sets taxRateAutoResolved=false
+   * so subsequent country/default-rate changes don't clobber the user's choice.
+   * Rescales the displayed unit price so the underlying net stays the same.
+   */
+  function setLineTaxRate(lineKey: string, newTaxRateId: string | 'auto') {
+    setLines((prev) =>
+      prev.map((l) => {
+        if (l.key !== lineKey) return l
+        if (newTaxRateId === 'auto') {
+          const resolved = resolveForCategory(l.productCategory)
+          return rescaleLineForRate(l, resolved.taxRateValue, {
+            taxRateId: resolved.taxRateId,
+            taxRateValue: resolved.taxRateValue,
+            taxRateName: resolved.taxRateName,
+            taxRateWarning: resolved.warning,
+            taxRateAutoResolved: true,
+          })
+        }
+        const picked = taxRates.find((t) => t.id === newTaxRateId)
+        if (!picked) return l
+        return rescaleLineForRate(l, picked.rate, {
+          taxRateId: picked.id,
+          taxRateValue: picked.rate,
+          taxRateName: picked.name,
+          taxRateWarning: null,
+          taxRateAutoResolved: false,
+        })
+      }),
+    )
+  }
+
+  /**
+   * Scale a line's displayed unit price when its rate changes, but only
+   * when the form is showing gross prices (so the underlying net stays put).
+   */
+  function rescaleLineForRate(
+    line: LineItem,
+    newRate: number,
+    patch: Partial<LineItem>,
+  ): LineItem {
+    if (!pricesIncludeVat || line.taxRateValue === newRate) {
+      return { ...line, ...patch }
+    }
+    const factor = (1 + newRate) / (1 + line.taxRateValue)
+    return {
+      ...line,
+      ...patch,
+      unitPrice: Math.round(line.unitPrice * factor * 100) / 100,
+    }
+  }
+
+  /**
+   * Re-resolve every auto-resolved line against the current destination
+   * country. Manually-overridden lines are left alone.
+   */
+  function reresolveAutoLines() {
+    setLines((prev) =>
+      prev.map((l) => {
+        if (!l.taxRateAutoResolved) return l
+        const resolved = resolveForCategory(l.productCategory)
+        if (resolved.taxRateValue === l.taxRateValue && resolved.taxRateId === l.taxRateId) {
+          // Still refresh the warning text in case the default rate id changed.
+          return { ...l, taxRateWarning: resolved.warning }
+        }
+        return rescaleLineForRate(l, resolved.taxRateValue, {
+          taxRateId: resolved.taxRateId,
+          taxRateValue: resolved.taxRateValue,
+          taxRateName: resolved.taxRateName,
+          taxRateWarning: resolved.warning,
+          taxRateAutoResolved: true,
+        })
+      }),
+    )
+  }
+
+  // Toggle between "prices include VAT" and "prices exclude VAT". Scales each
+  // line by *its own* rate (lines can now have different rates). Shipping
+  // and fees use the order-level rate.
+  function toggleIncludeVat(checked: boolean) {
+    if (checked !== pricesIncludeVat) {
+      setLines((prev) =>
+        prev.map((l) => {
+          if (l.taxRateValue <= 0) return l
+          const factor = checked ? (1 + l.taxRateValue) : 1 / (1 + l.taxRateValue)
+          return { ...l, unitPrice: Math.round(l.unitPrice * factor * 100) / 100 }
+        }),
+      )
+      if (vatRate > 0) {
+        const factor = checked ? (1 + vatRate) : 1 / (1 + vatRate)
+        setShippingAmount((prev) => Math.round(prev * factor * 100) / 100)
+        setFees((prev) => prev.map((f) => ({ ...f, amount: Math.round(f.amount * factor * 100) / 100 })))
+      }
+    }
+    setPricesIncludeVat(checked)
+  }
+
+  // When the order-level VAT rate changes: re-resolve every auto-resolved
+  // line (since the order default may now feed fallback lines) and scale
+  // shipping/fees by the new default rate.
+  function handleTaxRateChange(newId: string) {
+    const newRate = taxRates.find((t) => t.id === newId)?.rate ?? 0
+    if (pricesIncludeVat && vatRate !== newRate) {
+      const factor = (1 + newRate) / (1 + vatRate)
+      setShippingAmount((prev) => Math.round(prev * factor * 100) / 100)
+      setFees((prev) => prev.map((f) => ({ ...f, amount: Math.round(f.amount * factor * 100) / 100 })))
+    }
+    setTaxRateId(newId)
+    // Defer re-resolve until state settles: use the helper directly with
+    // the new default baked in.
+    const picked = taxRates.find((t) => t.id === newId)
+    const newDefault = { id: newId || null, name: picked?.name ?? null, rate: newRate }
+    setLines((prev) =>
+      prev.map((l) => {
+        if (!l.taxRateAutoResolved) return l
+        const resolved = resolveRateClientSide(l.productCategory, destCountry, taxRates, 'SALES', newDefault)
+        if (resolved.taxRateValue === l.taxRateValue && resolved.taxRateId === l.taxRateId) {
+          return { ...l, taxRateWarning: resolved.warning }
+        }
+        return rescaleLineForRate(l, resolved.taxRateValue, {
+          taxRateId: resolved.taxRateId,
+          taxRateValue: resolved.taxRateValue,
+          taxRateName: resolved.taxRateName,
+          taxRateWarning: resolved.warning,
+          taxRateAutoResolved: true,
+        })
+      }),
+    )
   }
 
   function stockAt(productId: string): StockLevelEntry {
     return stockLevels[productId]?.[warehouseId] ?? { total: 0, available: 0 }
   }
 
-  // Calculations — per line with discount
+  // Calculations — per line with its own VAT rate + discount
   function getLineNet(l: LineItem): number {
     const gross = l.qty * l.unitPrice
     const disc = parseDiscount(l.discount, gross)
     const afterDisc = gross - disc
-    return pricesIncludeVat && vatRate > 0 ? afterDisc / (1 + vatRate) : afterDisc
+    return pricesIncludeVat && l.taxRateValue > 0 ? afterDisc / (1 + l.taxRateValue) : afterDisc
   }
   function getLineGross(l: LineItem): number {
     const gross = l.qty * l.unitPrice
     return gross - parseDiscount(l.discount, gross)
+  }
+  function getLineVat(l: LineItem): number {
+    if (pricesIncludeVat) {
+      return getLineGross(l) - getLineNet(l)
+    }
+    return getLineNet(l) * l.taxRateValue
   }
 
   const linesSubtotalBeforeOrderDisc = lines.reduce((s, l) => s + getLineNet(l), 0)
@@ -167,17 +460,28 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
   const orderDiscountNet = pricesIncludeVat && vatRate > 0 ? orderDiscountAmount / (1 + vatRate) : orderDiscountAmount
 
   const lineSubtotal = linesSubtotalBeforeOrderDisc - orderDiscountNet
-  const lineVat = pricesIncludeVat
-    ? (linesGrossBeforeOrderDisc - orderDiscountAmount) - lineSubtotal
-    : lineSubtotal * vatRate
+  // Line VAT is the sum of each line's own VAT, minus the VAT component of
+  // the order discount (which uses the order-level rate).
+  const rawLineVat = lines.reduce((s, l) => s + getLineVat(l), 0)
+  const orderDiscountVat = pricesIncludeVat
+    ? orderDiscountAmount - orderDiscountNet
+    : (vatRate > 0 ? orderDiscountNet * vatRate : 0)
+  const lineVat = rawLineVat - orderDiscountVat
 
   const feesTotal = fees.reduce((s, f) => s + f.amount, 0)
   const shippingNet = pricesIncludeVat && vatRate > 0 ? shippingAmount / (1 + vatRate) : shippingAmount
-  const shippingVat = shippingAmount - shippingNet
+  const shippingVat = pricesIncludeVat
+    ? shippingAmount - shippingNet
+    : (vatRate > 0 ? shippingNet * vatRate : 0)
   const feesNet = pricesIncludeVat && vatRate > 0 ? feesTotal / (1 + vatRate) : feesTotal
-  const feesVat = feesTotal - feesNet
+  const feesVat = pricesIncludeVat
+    ? feesTotal - feesNet
+    : (vatRate > 0 ? feesNet * vatRate : 0)
   const totalVat = lineVat + shippingVat + feesVat
-  const grandTotal = lineSubtotal + totalVat + shippingNet + feesNet + shippingVat + feesVat
+  // Grand total = net subtotal (post order discount) + net shipping + net
+  // fees + total VAT. Earlier code double-counted shipping/fees VAT by
+  // adding it both via totalVat and separately.
+  const grandTotal = lineSubtotal + shippingNet + feesNet + totalVat
   const totalCogs = lines.reduce((s, l) => s + l.qty * (avgCogs[l.productId] ?? 0), 0)
   const totalLineDiscounts = lines.reduce((s, l) => s + parseDiscount(l.discount, l.qty * l.unitPrice), 0)
   const totalAllDiscounts = totalLineDiscounts + orderDiscountAmount
@@ -188,7 +492,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
     return p.sku.toLowerCase().includes(q) || p.name.toLowerCase().includes(q)
   }).slice(0, 20)
 
-  function handleSubmit() {
+  function handleSubmit(isDraft: boolean = false) {
     setError('')
     if (!customerId && !customerName.trim()) { setError('Select or enter a customer'); return }
     if (!lines.length) { setError('Add at least one product'); return }
@@ -216,6 +520,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
         fees: fees.filter((f) => f.amount > 0).map((f) => ({ description: f.description, amount: f.amount })),
         orderDiscountForeign: orderDiscountAmount,
         orderDiscountStr: orderDiscount || undefined,
+        isDraft,
         lines: lines.map((l) => {
           const gross = l.qty * l.unitPrice
           const disc = parseDiscount(l.discount, gross)
@@ -227,6 +532,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
             unitPriceForeign: l.unitPrice, // original price, NOT discounted
             discountStr: l.discount || undefined,
             discountAmount: disc,
+            taxRateId: l.taxRateAutoResolved ? null : l.taxRateId, // only send explicit overrides
           }
         }),
       })
@@ -306,7 +612,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
               <div className="space-y-1.5">
                 <Label>VAT Rate</Label>
                 <div className="flex items-center gap-3">
-                  <select value={taxRateId} onChange={(e) => setTaxRateId(e.target.value)} className="flex-1 h-9 rounded-md border border-input bg-background px-3 text-sm">
+                  <select value={taxRateId} onChange={(e) => handleTaxRateChange(e.target.value)} className="flex-1 h-9 rounded-md border border-input bg-background px-3 text-sm">
                     <option value="">No VAT</option>
                     {taxRates.filter((t) => t.usedFor === 'SALES' || t.usedFor === 'BOTH').map((t) => (
                       <option key={t.id} value={t.id}>{t.name} ({(t.rate * 100).toFixed(0)}%)</option>
@@ -314,7 +620,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                   </select>
                   {taxRateId && (
                     <label className="flex items-center gap-1.5 text-sm whitespace-nowrap cursor-pointer">
-                      <input type="checkbox" checked={pricesIncludeVat} onChange={(e) => setPricesIncludeVat(e.target.checked)} className="rounded border-input" />
+                      <input type="checkbox" checked={pricesIncludeVat} onChange={(e) => toggleIncludeVat(e.target.checked)} className="rounded border-input" />
                       Incl. VAT
                     </label>
                   )}
@@ -349,15 +655,16 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
               <table className="w-full text-sm">
                 <thead>
                   <tr className="border-b text-muted-foreground text-xs">
-                    <th className="pb-2 text-left font-medium">Product</th>
-                    {warehouseId && <th className="pb-2 text-right font-medium w-20">Available</th>}
-                    <th className="pb-2 text-right font-medium w-16">Qty</th>
-                    <th className="pb-2 text-right font-medium w-28">
-                      Price ({sym}){pricesIncludeVat && vatRate > 0 ? ' incl.' : ''}
+                    <th className="pb-2 pr-3 text-left font-medium">Product</th>
+                    {warehouseId && <th className="pb-2 pr-3 text-center font-medium w-20">Available</th>}
+                    <th className="pb-2 pr-3 text-center font-medium w-16">Qty</th>
+                    <th className="pb-2 pr-3 text-center font-medium w-28">
+                      Price ({sym}){pricesIncludeVat ? ' incl.' : ''}
                     </th>
-                    <th className="pb-2 text-right font-medium w-24">Discount</th>
-                    <th className="pb-2 text-right font-medium w-24">Total ({sym})</th>
-                    <th className="pb-2 text-right font-medium w-20">COGS (£)</th>
+                    <th className="pb-2 pr-3 text-center font-medium w-24">Discount</th>
+                    <th className="pb-2 pr-3 text-center font-medium w-32">VAT</th>
+                    <th className="pb-2 pr-3 text-right font-medium w-24">Total ({sym})</th>
+                    <th className="pb-2 pr-3 text-right font-medium w-20">COGS (£)</th>
                     <th className="w-8" />
                   </tr>
                 </thead>
@@ -392,12 +699,32 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                           <Input
                             value={line.discount}
                             onChange={(e) => setLines((p) => p.map((l) => l.key === line.key ? { ...l, discount: e.target.value } : l))}
-                            placeholder="0 or 10%"
+                            placeholder={`${sym} or %`}
                             className={`h-7 text-sm text-right w-24 ml-auto font-mono ${discAmount > 0 ? 'text-destructive' : ''}`}
                           />
                         </td>
-                        <td className="py-2 pr-3 text-right font-mono text-xs">{lineTotal.toFixed(2)}{sym}</td>
-                        <td className="py-2 pr-3 text-right font-mono text-xs text-muted-foreground">£{cogs.toFixed(2)}</td>
+                        <td className="py-2 pr-3">
+                          <div className="flex items-center justify-end gap-1">
+                            {line.taxRateWarning && (
+                              <span title={line.taxRateWarning} className="text-yellow-600">
+                                <AlertTriangle className="h-3 w-3" />
+                              </span>
+                            )}
+                            <select
+                              value={line.taxRateAutoResolved ? 'auto' : (line.taxRateId ?? '')}
+                              onChange={(e) => setLineTaxRate(line.key, e.target.value as string)}
+                              className="h-7 text-xs rounded-md border border-input bg-background px-1.5 font-mono w-28"
+                              title={line.taxRateWarning ?? `Auto-resolved from ${line.productCategory}`}
+                            >
+                              <option value="auto">Auto {(line.taxRateValue * 100).toFixed(0)}%</option>
+                              {salesRates.map((t) => (
+                                <option key={t.id} value={t.id}>{t.name} ({(t.rate * 100).toFixed(0)}%)</option>
+                              ))}
+                            </select>
+                          </div>
+                        </td>
+                        <td className="py-2 pr-3 text-right font-mono text-xs">{money(lineTotal)}</td>
+                        <td className="py-2 pr-3 text-right font-mono text-xs text-muted-foreground">{formatMoney(cogs, '£')}</td>
                         <td className="py-2">
                           <button type="button" onClick={() => setLines((p) => p.filter((l) => l.key !== line.key))} className="text-muted-foreground hover:text-destructive">
                             <X className="h-4 w-4" />
@@ -429,7 +756,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                         </span>
                         <span className="text-xs text-muted-foreground ml-2 shrink-0">
                           {warehouseId ? `${stock.available} avail` : ''}
-                          {p.salesPriceGbp ? ` · £${Number(p.salesPriceGbp).toFixed(2)}` : ''}
+                          {p.salesPriceGbp ? ` · ${formatMoney(Number(p.salesPriceGbp), '£')}` : ''}
                         </span>
                       </button>
                     )
@@ -485,8 +812,8 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
               <div className="flex justify-end">
                 <div className="text-sm space-y-1 min-w-72">
                   <div className="flex justify-between text-muted-foreground">
-                    <span>Subtotal (net)</span>
-                    <span className="font-mono">{linesSubtotalBeforeOrderDisc.toFixed(2)}{sym}</span>
+                    <span>Subtotal{pricesIncludeVat ? '' : ' (net)'}</span>
+                    <span className="font-mono">{money(linesGrossBeforeOrderDisc)}</span>
                   </div>
                   {/* Order-level discount */}
                   <div className="flex justify-between items-center text-muted-foreground">
@@ -495,58 +822,69 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                       <Input
                         value={orderDiscount}
                         onChange={(e) => setOrderDiscount(e.target.value)}
-                        placeholder="0 or %"
+                        placeholder={`${sym} or %`}
                         className={`h-6 text-xs text-right w-20 font-mono ${orderDiscountAmount > 0 ? 'text-destructive' : ''}`}
                       />
                       {orderDiscountAmount > 0 && (
-                        <span className="font-mono text-destructive text-xs">-{orderDiscountAmount.toFixed(2)}{sym}</span>
+                        <span className="font-mono text-destructive text-xs">{money(-orderDiscountAmount)}</span>
                       )}
                     </div>
                   </div>
-                  {orderDiscountAmount > 0 && (
-                    <div className="flex justify-between text-muted-foreground">
-                      <span>Net after discount</span>
-                      <span className="font-mono">{lineSubtotal.toFixed(2)}{sym}</span>
-                    </div>
-                  )}
                   {totalAllDiscounts > 0 && (
                     <div className="flex justify-between text-destructive text-xs">
-                      <span>Total Discount{totalLineDiscounts > 0 && orderDiscountAmount > 0 ? ` (lines: ${totalLineDiscounts.toFixed(2)}${sym} + order: ${orderDiscountAmount.toFixed(2)}${sym})` : ''}</span>
-                      <span className="font-mono">-{totalAllDiscounts.toFixed(2)}{sym}</span>
+                      <span>Total Discount{totalLineDiscounts > 0 && orderDiscountAmount > 0 ? ` (lines: ${money(totalLineDiscounts)} + order: ${money(orderDiscountAmount)})` : ''}</span>
+                      <span className="font-mono">{money(-totalAllDiscounts)}</span>
                     </div>
                   )}
                   {shippingAmount > 0 && (
                     <div className="flex justify-between text-muted-foreground">
                       <span>Shipping</span>
-                      <span className="font-mono">{shippingAmount.toFixed(2)}{sym}</span>
+                      <span className="font-mono">{money(shippingAmount)}</span>
                     </div>
                   )}
                   {feesTotal > 0 && (
                     <div className="flex justify-between text-muted-foreground">
                       <span>Fees</span>
-                      <span className="font-mono">{feesTotal.toFixed(2)}{sym}</span>
+                      <span className="font-mono">{money(feesTotal)}</span>
                     </div>
                   )}
-                  {totalVat > 0 && (
-                    <div className="flex justify-between text-muted-foreground">
-                      <span>VAT ({(vatRate * 100).toFixed(0)}%){pricesIncludeVat ? ' (extracted)' : ''}</span>
-                      <span className="font-mono">{totalVat.toFixed(2)}{sym}</span>
-                    </div>
-                  )}
+                  {totalVat > 0 && (() => {
+                    // Group line VAT by rate for the totals breakdown.
+                    const byRate = new Map<number, number>()
+                    for (const l of lines) {
+                      const v = getLineVat(l)
+                      if (v === 0) continue
+                      byRate.set(l.taxRateValue, (byRate.get(l.taxRateValue) ?? 0) + v)
+                    }
+                    // Shipping + fees + order-discount VAT lumped with the order default.
+                    const otherVat = shippingVat + feesVat - orderDiscountVat
+                    if (otherVat !== 0) {
+                      byRate.set(vatRate, (byRate.get(vatRate) ?? 0) + otherVat)
+                    }
+                    const rows = Array.from(byRate.entries())
+                      .filter(([, amt]) => Math.abs(amt) > 0.005)
+                      .sort(([a], [b]) => b - a)
+                    return rows.map(([rate, amt]) => (
+                      <div key={rate} className="flex justify-between text-muted-foreground">
+                        <span>VAT @ {(rate * 100).toFixed(0)}%{pricesIncludeVat ? ' (extracted)' : ''}</span>
+                        <span className="font-mono">{money(amt)}</span>
+                      </div>
+                    ))
+                  })()}
                   <div className="flex justify-between font-medium border-t pt-1">
                     <span>Total</span>
                     <span className="font-mono">
-                      {grandTotal.toFixed(2)}{sym}
-                      {currency !== 'GBP' && <span className="text-muted-foreground font-normal ml-2">(£{(grandTotal / fxRate).toFixed(2)})</span>}
+                      {money(grandTotal)}
+                      {currency !== 'GBP' && <span className="text-muted-foreground font-normal ml-2">({formatMoney(grandTotal / fxRate, '£', 'PREFIX')})</span>}
                     </span>
                   </div>
                   <div className="flex justify-between text-muted-foreground border-t pt-1">
                     <span>Est. COGS</span>
-                    <span className="font-mono">£{totalCogs.toFixed(2)}</span>
+                    <span className="font-mono">{formatMoney(totalCogs, '£', 'PREFIX')}</span>
                   </div>
                   <div className="flex justify-between text-muted-foreground">
                     <span>Est. Margin</span>
-                    <span className="font-mono">£{((lineSubtotal / fxRate) - totalCogs).toFixed(2)}</span>
+                    <span className="font-mono">{formatMoney((lineSubtotal / fxRate) - totalCogs, '£', 'PREFIX')}</span>
                   </div>
                 </div>
               </div>
@@ -558,7 +896,11 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-          <Button onClick={handleSubmit} disabled={isPending}>
+          <Button variant="outline" onClick={() => handleSubmit(true)} disabled={isPending}>
+            {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+            Save as Draft
+          </Button>
+          <Button onClick={() => handleSubmit(false)} disabled={isPending}>
             {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
             Create Order
           </Button>

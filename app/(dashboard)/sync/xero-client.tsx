@@ -2,7 +2,7 @@
 
 import { useState, useTransition, useEffect } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, XCircle, Clock, Plus, Trash2, AlertTriangle } from 'lucide-react'
+import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, XCircle, Clock, Plus, Trash2, AlertTriangle, Receipt } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -10,10 +10,11 @@ import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import {
   saveXeroSettings, connectXero, disconnectXero,
-  syncXeroAccounts, triggerXeroSync,
+  syncXeroAccounts, triggerXeroSync, fetchXeroTaxRates,
   type XeroSettings, type XeroSyncLogRow, type XeroSyncReadiness,
 } from '@/app/actions/xero-sync'
 import { savePaymentAccountMap } from '@/app/actions/accounting'
+import { autoLinkXeroTaxRates, updateTaxRate, type TaxRateRow } from '@/app/actions/settings'
 
 type XeroAccount = { id: string; xeroId: string; code: string | null; name: string; type: string }
 
@@ -37,6 +38,10 @@ type Props = {
   currencies: Array<{ code: string; name: string }>
   /** Active WooCommerce payment gateways — populates the method dropdown/datalist. Free-text still allowed. */
   wcPaymentGateways: Array<{ id: string; title: string }>
+  /** IMS VAT rates — the left-hand side of the tax code mapping UI. */
+  imsTaxRates: TaxRateRow[]
+  /** Live Xero tax rates — populates the mapping dropdowns. Empty when not connected. */
+  xeroTaxRates: Array<{ taxType: string; name: string; rate: number }>
   readiness: XeroSyncReadiness
 }
 
@@ -84,7 +89,7 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
   return JSON.stringify(map)
 }
 
-export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, wcPaymentGateways, readiness }: Props) {
+export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, wcPaymentGateways, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
@@ -99,6 +104,15 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [connecting, setConnecting] = useState(false)
   const [syncingAccounts, setSyncingAccounts] = useState(false)
   const [paymentMapRows, setPaymentMapRows] = useState<PaymentMapRow[]>(() => parsePaymentMap(paymentAccountMap))
+  const [xeroTaxRates, setXeroTaxRates] = useState(initXeroTaxRates)
+  // Local view of IMS tax rates so the dropdown reflects changes without a full page refresh.
+  const [taxMappings, setTaxMappings] = useState<Record<string, string | null>>(() =>
+    Object.fromEntries(imsTaxRates.map(r => [r.id, r.accountingTaxType])),
+  )
+  const [taxMapMsg, setTaxMapMsg] = useState<string | null>(null)
+  const [savingTaxId, setSavingTaxId] = useState<string | null>(null)
+  const [refreshingTaxRates, setRefreshingTaxRates] = useState(false)
+  const [autoLinking, setAutoLinking] = useState(false)
   const searchParams = useSearchParams()
 
   // Handle OAuth redirect query params
@@ -190,6 +204,68 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       router.refresh()
     } else {
       setConnectMsg(`Error: ${result.error}`)
+    }
+  }
+
+  async function handleRefreshXeroTaxRates() {
+    setTaxMapMsg(null)
+    setRefreshingTaxRates(true)
+    try {
+      const rates = await fetchXeroTaxRates()
+      setXeroTaxRates(rates)
+      setTaxMapMsg(`Loaded ${rates.length} Xero tax rate(s).`)
+    } catch (e) {
+      setTaxMapMsg(`Failed to fetch Xero tax rates: ${String(e)}`)
+    } finally {
+      setRefreshingTaxRates(false)
+    }
+  }
+
+  async function handleAutoLinkTaxes() {
+    setTaxMapMsg(null)
+    setAutoLinking(true)
+    try {
+      const result = await autoLinkXeroTaxRates()
+      if (!result.success) {
+        setTaxMapMsg(`Auto-link failed: ${result.error ?? 'unknown error'}`)
+        return
+      }
+      // Refresh local state with the newly linked values by re-reading the
+      // linked mapping from the server. Simpler: patch taxMappings for each
+      // IMS rate whose name matches a Xero rate by case-insensitive compare.
+      const xeroByName = new Map(xeroTaxRates.map(x => [x.name.trim().toLowerCase(), x.taxType]))
+      setTaxMappings(prev => {
+        const next = { ...prev }
+        for (const r of imsTaxRates) {
+          if (next[r.id]) continue
+          const match = xeroByName.get(r.name.trim().toLowerCase())
+          if (match) next[r.id] = match
+        }
+        return next
+      })
+      const parts: string[] = []
+      if (result.linked > 0) parts.push(`${result.linked} rate(s) auto-linked`)
+      if (result.alreadyLinked > 0) parts.push(`${result.alreadyLinked} already linked`)
+      if (result.unmatched.length > 0) parts.push(`${result.unmatched.length} unmatched — pick a Xero rate below`)
+      if (parts.length === 0) parts.push(`No IMS rates found (${result.xeroRatesCount} Xero rates available)`)
+      setTaxMapMsg(parts.join(' · '))
+      router.refresh()
+    } finally {
+      setAutoLinking(false)
+    }
+  }
+
+  async function handleTaxMappingChange(rateId: string, taxType: string) {
+    setTaxMapMsg(null)
+    setSavingTaxId(rateId)
+    // Optimistic update — revert on error.
+    const previous = taxMappings[rateId] ?? null
+    setTaxMappings(prev => ({ ...prev, [rateId]: taxType || null }))
+    const result = await updateTaxRate(rateId, { accountingTaxType: taxType })
+    setSavingTaxId(null)
+    if (!result.success) {
+      setTaxMappings(prev => ({ ...prev, [rateId]: previous }))
+      setTaxMapMsg(`Save failed: ${result.error ?? 'unknown error'}`)
     }
   }
 
@@ -305,6 +381,94 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                 <p className="text-[11px] text-muted-foreground">{f.description}</p>
               </div>
             ))}
+          </div>
+        )}
+      </Card>
+
+      {/* VAT Tax Code Mapping */}
+      <Card className="p-6 space-y-4">
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h3 className="text-base font-semibold flex items-center gap-2">
+              <Receipt className="h-4 w-4 text-muted-foreground" />
+              VAT Tax Code Mapping
+            </h3>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Link each IMS VAT rate to a Xero tax code so invoices sync with the correct tax line.
+              Auto-link matches by name; unmatched rates can be assigned manually from the dropdown.
+              VAT rates themselves are managed in <a href="/settings/accounting" className="underline hover:text-foreground">Settings → Accounting</a>.
+            </p>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <Button variant="outline" size="sm" onClick={handleRefreshXeroTaxRates} disabled={refreshingTaxRates || !connected}>
+              {refreshingTaxRates ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
+              Refresh from Xero
+            </Button>
+            <Button variant="outline" size="sm" onClick={handleAutoLinkTaxes} disabled={autoLinking || !connected}>
+              {autoLinking ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Link2 className="h-3 w-3 mr-1" />}
+              Auto-link
+            </Button>
+          </div>
+        </div>
+        {taxMapMsg && <p className="text-xs text-muted-foreground">{taxMapMsg}</p>}
+
+        {!connected ? (
+          <p className="text-sm text-muted-foreground">Connect to Xero to load tax rates.</p>
+        ) : imsTaxRates.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No IMS VAT rates defined.{' '}
+            <a href="/settings/accounting" className="underline hover:text-foreground">Add one in Settings → Accounting</a>.
+          </p>
+        ) : (
+          <div className="rounded-md border overflow-hidden">
+            <table className="w-full text-sm">
+              <thead className="bg-muted/50 border-b">
+                <tr>
+                  <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">IMS VAT Rate</th>
+                  <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Rate</th>
+                  <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Xero Tax Code</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {imsTaxRates.map(r => {
+                  const stored = taxMappings[r.id] ?? ''
+                  const storedKnown = !stored || xeroTaxRates.some(x => x.taxType === stored)
+                  return (
+                    <tr key={r.id}>
+                      <td className="px-3 py-2 font-medium">
+                        {r.name}
+                        {!r.active && <span className="ml-1.5 text-[10px] text-muted-foreground">(inactive)</span>}
+                      </td>
+                      <td className="px-3 py-2 text-right font-mono text-xs text-muted-foreground">
+                        {(r.rate * 100).toFixed(2)}%
+                      </td>
+                      <td className="px-3 py-2">
+                        <div className="flex items-center gap-2">
+                          <select
+                            className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                            value={stored}
+                            onChange={e => handleTaxMappingChange(r.id, e.target.value)}
+                            disabled={savingTaxId === r.id}
+                          >
+                            <option value="">— Not mapped —</option>
+                            {xeroTaxRates.map(x => (
+                              <option key={x.taxType} value={x.taxType}>
+                                {x.name} ({x.rate.toFixed(2)}%) — {x.taxType}
+                              </option>
+                            ))}
+                            {/* Preserve a legacy/unknown value rather than silently blanking it. */}
+                            {!storedKnown && stored && (
+                              <option value={stored}>{stored} (unknown)</option>
+                            )}
+                          </select>
+                          {savingTaxId === r.id && <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />}
+                        </div>
+                      </td>
+                    </tr>
+                  )
+                })}
+              </tbody>
+            </table>
           </div>
         )}
       </Card>
@@ -572,11 +736,9 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
               )}
               {readiness.missingTaxTypes.length > 0 && (
                 <li>
-                  IMS VAT rates without a Xero tax type:{' '}
-                  {readiness.missingTaxTypes.map(t => t.name).join(', ')}{' '}
-                  <a href="/settings/accounting" className="underline hover:text-amber-900 dark:hover:text-amber-100">
-                    (configure in Settings → Accounting)
-                  </a>
+                  IMS VAT rates without a Xero tax code:{' '}
+                  {readiness.missingTaxTypes.map(t => t.name).join(', ')}
+                  {' '}— map them in the VAT Tax Code Mapping card above.
                 </li>
               )}
             </ul>

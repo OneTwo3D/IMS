@@ -37,6 +37,7 @@ type Props = {
     salesPriceGbp?: string
     salePriceGbp?: string
     salesPriceTaxInclusive?: boolean
+    taxCategory?: 'STANDARD' | 'REDUCED' | 'SECOND_REDUCED' | 'ZERO' | 'EXEMPT'
     stockUnit?: string
     oversellAllowed?: boolean
     active?: boolean
@@ -74,6 +75,7 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
     salesPriceGbp:        defaultValues?.salesPriceGbp        ?? '',
     salePriceGbp:         defaultValues?.salePriceGbp         ?? '',
     salesPriceTaxInclusive: defaultValues?.salesPriceTaxInclusive ?? false,
+    taxCategory:          defaultValues?.taxCategory          ?? 'STANDARD',
     stockUnit:            defaultValues?.stockUnit            ?? 'pcs',
     oversellAllowed:      defaultValues?.oversellAllowed      ?? true,
     imageUrl:             defaultValues?.imageUrl             ?? '',
@@ -274,6 +276,24 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
           <Label htmlFor="salesPriceTaxInclusive" className="cursor-pointer">
             Prices are tax-inclusive
           </Label>
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="taxCategory">Tax Category</Label>
+          <Select
+            id="taxCategory"
+            name="taxCategory"
+            value={fields.taxCategory}
+            onChange={(ev) => set('taxCategory', ev.target.value as typeof fields.taxCategory)}
+          >
+            <option value="STANDARD">Standard</option>
+            <option value="REDUCED">Reduced</option>
+            <option value="SECOND_REDUCED">2nd Reduced</option>
+            <option value="ZERO">Zero-rated</option>
+            <option value="EXEMPT">Exempt</option>
+          </Select>
+          <p className="text-xs text-muted-foreground">
+            The effective VAT rate is resolved at order time from this category and the destination country.
+          </p>
         </div>
       </div>
       )}

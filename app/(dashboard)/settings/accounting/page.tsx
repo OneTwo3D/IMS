@@ -45,8 +45,9 @@ export default async function AccountingSettingsPage() {
           <h2 className="text-base font-semibold">VAT Rates</h2>
         </div>
         <p className="text-sm text-muted-foreground mb-4">
-          Define VAT rates for sales and purchases. Each rate can have a Xero tax type code
-          for automatic invoice sync. Rates marked &quot;Both&quot; apply to sales and purchases.
+          Define VAT rates for sales and purchases. Rates marked &quot;Both&quot; apply to sales and purchases.
+          Tax code mapping to Xero is configured on the{' '}
+          <a href="/sync" className="underline hover:text-foreground">Xero connector</a> page.
         </p>
         <TaxRatesTable taxRates={taxRates} />
       </Card>

@@ -1,25 +1,42 @@
 import { NextResponse } from 'next/server'
-import { auth } from '@/lib/auth'
 import { readFile } from 'fs/promises'
 import path from 'path'
+import { requireRole } from '@/lib/auth/server'
+
+const SAFE_FILENAME = /^[a-zA-Z0-9._-]+$/
 
 export async function GET(
   _req: Request,
   { params }: { params: Promise<{ filename: string }> },
 ) {
-  const session = await auth()
-  if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  try {
+    await requireRole('ADMIN', 'FINANCE', 'MANAGER')
+  } catch {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
 
   const { filename } = await params
   const safeName = path.basename(filename)
-  const filepath = path.join(process.cwd(), 'uploads', 'invoices', safeName)
+  if (!SAFE_FILENAME.test(safeName) || !safeName.toLowerCase().endsWith('.pdf')) {
+    return NextResponse.json({ error: 'Invalid file' }, { status: 400 })
+  }
+
+  const invoiceDir = path.join(process.cwd(), 'uploads', 'invoices')
+  const filepath = path.join(invoiceDir, safeName)
+
+  // Path-traversal guard: resolved path must remain under invoiceDir.
+  const resolved = path.resolve(filepath)
+  if (!resolved.startsWith(path.resolve(invoiceDir) + path.sep)) {
+    return NextResponse.json({ error: 'Invalid file' }, { status: 400 })
+  }
 
   try {
-    const buffer = await readFile(filepath)
-    return new NextResponse(buffer, {
+    const buffer = await readFile(resolved)
+    return new NextResponse(new Uint8Array(buffer), {
       headers: {
         'Content-Type': 'application/pdf',
         'Content-Disposition': `inline; filename="${safeName}"`,
+        'X-Content-Type-Options': 'nosniff',
       },
     })
   } catch {

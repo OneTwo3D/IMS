@@ -68,7 +68,10 @@ export async function pushSalesInvoice(
     }
   }
 
-  // Build line items
+  // Build line items. Xero supports `DiscountRate` (a percentage, 0-100) on
+  // sales invoices (ACCREC) — translate the generic per-line `discountAmount`
+  // from the caller into that Xero-specific field here so that only this
+  // connector knows about the target system's discount representation.
   const lineItems = data.lines.map((line: InvoiceLine) => {
     const xeroLine: Record<string, unknown> = {
       Description: line.description,
@@ -78,29 +81,40 @@ export async function pushSalesInvoice(
       TaxType: line.taxType || DEFAULT_TAX_TYPE,
     }
     if (line.itemCode && !droppedItemCodes.has(line.itemCode)) xeroLine.ItemCode = line.itemCode
-    if (line.discountRate && line.discountRate > 0) xeroLine.DiscountRate = line.discountRate
+    if (line.discountAmount && line.discountAmount > 0) {
+      const lineGross = line.unitAmount * line.quantity
+      if (lineGross > 0) {
+        // DiscountRate is a percentage with 2dp precision (Xero rounds).
+        const rate = Math.round((line.discountAmount / lineGross) * 10000) / 100
+        if (rate > 0) xeroLine.DiscountRate = rate
+      }
+    }
     return xeroLine
   })
 
-  // Add shipping as separate line item
+  // Add shipping as separate line item. When the caller supplies a
+  // shippingTaxType (e.g. the order has a VAT rate), use it so shipping is
+  // taxed at the same rate as the products. Otherwise fall back to NONE.
   if (data.shippingAmount && data.shippingAmount > 0 && data.shippingAccountCode) {
     lineItems.push({
       Description: data.shippingDescription ?? 'Shipping',
       Quantity: 1,
       UnitAmount: data.shippingAmount,
       AccountCode: data.shippingAccountCode,
-      TaxType: DEFAULT_TAX_TYPE,
+      TaxType: data.shippingTaxType || DEFAULT_TAX_TYPE,
     })
   }
 
-  // Add order-level discount as negative line item
+  // Add order-level discount as negative line item. Use the caller-supplied
+  // tax type (matching the order's VAT rate) so the discount reduces the
+  // taxable base correctly. Falls back to NONE if omitted.
   if (data.discountAmount && data.discountAmount > 0 && data.discountAccountCode) {
     lineItems.push({
       Description: 'Order discount',
       Quantity: 1,
       UnitAmount: -data.discountAmount,
       AccountCode: data.discountAccountCode,
-      TaxType: DEFAULT_TAX_TYPE,
+      TaxType: data.discountTaxType || DEFAULT_TAX_TYPE,
     })
   }
 
@@ -115,6 +129,10 @@ export async function pushSalesInvoice(
     Date: data.date,
     DueDate: dueDate,
     LineItems: lineItems,
+    // Tell Xero whether the per-line UnitAmount values are tax-inclusive so
+    // it computes the net/tax correctly. IMS stores gross prices when the
+    // user toggles "prices include VAT" on the order.
+    LineAmountTypes: data.lineAmountsIncludeTax ? 'Inclusive' : 'Exclusive',
     Status: status,
     CurrencyCode: data.currency,
   }

@@ -321,6 +321,52 @@ export function drawFooter(doc: PDFKit.PDFDocument, text: string, branding: Bran
 }
 
 /**
+ * Group a set of lines by their effective tax rate and return one row per
+ * distinct rate. Used by PDF routes to render a grouped VAT breakdown when
+ * an order has lines at mixed rates (e.g. 20% on goods, 5% on car seats,
+ * 0% on books).
+ *
+ * `lines` each carry their own `taxRatePercent` (a decimal like 0.20) and
+ * `taxForeign` amount. Rows with a null rate fall into the bucket labelled
+ * by `fallbackLabel` so shipping/fees VAT (tracked on the order, not on
+ * lines) can still be displayed.
+ *
+ * Returns a deterministic order: highest rate first, then zero.
+ */
+export function groupVatBreakdown(
+  lines: { taxRatePercent: number | null; taxForeign: number }[],
+  extra?: { label: string; amount: number }[],
+): { label: string; amount: number }[] {
+  const buckets = new Map<string, { rate: number; amount: number }>()
+  for (const l of lines) {
+    const rate = l.taxRatePercent == null ? 0 : Number(l.taxRatePercent)
+    const amount = Number(l.taxForeign) || 0
+    if (amount === 0 && rate === 0) continue
+    const key = rate.toFixed(4)
+    const cur = buckets.get(key) ?? { rate, amount: 0 }
+    cur.amount += amount
+    buckets.set(key, cur)
+  }
+  if (extra) {
+    for (const e of extra) {
+      if (!e.amount) continue
+      const existing = Array.from(buckets.values())[0]
+      // Fold the extra VAT into the first bucket if one already exists —
+      // otherwise emit it as a standalone row.
+      if (existing) existing.amount += e.amount
+      else buckets.set('extra', { rate: 0, amount: e.amount })
+    }
+  }
+  const rows = Array.from(buckets.values())
+    .sort((a, b) => b.rate - a.rate)
+    .map((b) => ({
+      label: `VAT @ ${(b.rate * 100).toFixed(b.rate === 0 ? 0 : b.rate * 100 % 1 === 0 ? 0 : 1)}%`,
+      amount: Math.round(b.amount * 10000) / 10000,
+    }))
+  return rows
+}
+
+/**
  * Collect a PDFDocument's output into a Buffer
  */
 export function pdfToBuffer(doc: PDFKit.PDFDocument): Promise<Buffer> {

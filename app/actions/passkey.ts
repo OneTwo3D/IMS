@@ -186,7 +186,7 @@ export async function verifyPasskeyAuthentication(
     // Generate a one-time auth token that binds this verification to the signIn call.
     // The passkey Credentials provider will consume this token to prevent replay.
     const authToken = randomBytes(32).toString('hex')
-    setAuthToken(`passkey_auth:${authToken}`, passkey.user.id, 60_000) // 60s TTL
+    await setAuthToken(`passkey_auth:${authToken}`, passkey.user.id, 60_000) // 60s TTL
 
     return {
       success: true,

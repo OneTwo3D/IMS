@@ -1,7 +1,8 @@
 import { NextResponse } from 'next/server'
 import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
-import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
+import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, groupVatBreakdown, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
+import { formatMoney } from '@/lib/utils'
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const session = await auth()
@@ -12,7 +13,12 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     where: { id },
     include: {
       shipFromWarehouse: { select: { name: true } },
-      lines: { select: { description: true, sku: true, qty: true, unitPriceForeign: true, discountAmount: true, totalForeign: true } },
+      lines: {
+        select: {
+          description: true, sku: true, qty: true, unitPriceForeign: true, discountAmount: true, totalForeign: true, taxForeign: true,
+          taxRate: { select: { rate: true } },
+        },
+      },
     },
   })
   if (!so) return NextResponse.json({ error: 'Not found' }, { status: 404 })
@@ -50,7 +56,10 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     doc.y += 10
   }
 
-  const sym = so.currency === 'GBP' ? '£' : so.currency
+  const currencyRow = await db.currency.findUnique({ where: { code: so.currency } })
+  const sym = currencyRow?.symbol ?? (so.currency === 'GBP' ? '£' : so.currency)
+  const symPos: 'PREFIX' | 'POSTFIX' = currencyRow?.symbolPosition ?? 'PREFIX'
+  const money = (n: number) => formatMoney(n, sym, symPos)
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
     { label: 'SKU', width: 70 },
@@ -78,23 +87,38 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   const lX = tableRight - vW - lW
   doc.font('Helvetica').fontSize(9).fillColor('#666')
   doc.text('Subtotal:', lX, doc.y, { width: lW, align: 'right' })
-  doc.text(`${Number(so.subtotalForeign).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+  doc.text(money(Number(so.subtotalForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
   if (Number(so.discountAmount) > 0) {
     doc.text('Discount:', lX, doc.y, { width: lW, align: 'right' })
-    doc.text(`-${Number(so.discountAmount).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+    doc.text(`-${money(Number(so.discountAmount))}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
   }
   if (Number(so.shippingForeign) > 0) {
     doc.text('Shipping:', lX, doc.y, { width: lW, align: 'right' })
-    doc.text(`${Number(so.shippingForeign).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+    doc.text(money(Number(so.shippingForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
   }
   if (Number(so.taxForeign) > 0) {
-    const taxLabel = (so.taxRateName ?? 'Tax') + (so.taxRatePercent != null ? ` (${(Number(so.taxRatePercent) * 100).toFixed(0)}%)` : '') + ':'
-    doc.text(taxLabel, lX, doc.y, { width: lW, align: 'right' })
-    doc.text(`${Number(so.taxForeign).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+    const shippingFeeVat = Math.max(0, Number(so.taxForeign) - so.lines.reduce((s, l) => s + Number(l.taxForeign || 0), 0))
+    const vatBreakdown = groupVatBreakdown(
+      so.lines.map((l) => ({
+        taxRatePercent: l.taxRate?.rate != null ? Number(l.taxRate.rate) : (so.taxRatePercent != null ? Number(so.taxRatePercent) : null),
+        taxForeign: Number(l.taxForeign || 0),
+      })),
+      shippingFeeVat > 0 ? [{ label: 'Shipping/Fees', amount: shippingFeeVat }] : undefined,
+    )
+    if (vatBreakdown.length <= 1) {
+      const taxLabel = (so.taxRateName ?? 'Tax') + (so.taxRatePercent != null ? ` (${(Number(so.taxRatePercent) * 100).toFixed(0)}%)` : '') + ':'
+      doc.text(taxLabel, lX, doc.y, { width: lW, align: 'right' })
+      doc.text(money(Number(so.taxForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+    } else {
+      for (const row of vatBreakdown) {
+        doc.text(`${row.label}:`, lX, doc.y, { width: lW, align: 'right' })
+        doc.text(money(row.amount), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+      }
+    }
   }
   doc.font('Helvetica-Bold').fontSize(10).fillColor('#000')
   doc.text('Total:', lX, doc.y + 3, { width: lW, align: 'right' })
-  doc.text(`${Number(so.totalForeign).toFixed(2)}${sym}`, tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
+  doc.text(money(Number(so.totalForeign)), tableRight - vW, doc.y - doc.currentLineHeight(), { width: vW, align: 'right' })
 
   // Footer note from template
   if (tpl?.footerNote) {

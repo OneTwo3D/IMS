@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth } from '@/lib/auth/server'
+import { requireAuth, requirePermission } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Organisation
@@ -50,7 +50,7 @@ export async function getOrganisation(): Promise<OrganisationData> {
 }
 
 export async function updateOrganisation(data: Partial<OrganisationData>): Promise<{ success: boolean; error?: string }> {
-  await requireAuth()
+  await requirePermission('settings.company')
   try {
     await db.organisation.updateMany({ data })
     logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated company details' })
@@ -64,7 +64,7 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
 }
 
 export async function updateLogoUrl(logoUrl: string | null): Promise<{ success: boolean }> {
-  await requireAuth()
+  await requirePermission('settings.company')
   await db.organisation.updateMany({ data: { logoUrl } })
   logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: logoUrl ? 'Updated company logo' : 'Removed company logo' })
   revalidatePath('/settings')
@@ -157,7 +157,7 @@ export async function getNumberingFormats(): Promise<NumberingFormats> {
 }
 
 export async function saveNumberingFormats(data: NumberingFormats): Promise<{ success: boolean }> {
-  await requireAuth()
+  await requirePermission('settings.company')
 
   const writes: Array<{ key: string; value: string }> = [
     { key: 'so_prefix', value: data.so_prefix },
@@ -239,7 +239,7 @@ export async function getEmailSettings(): Promise<EmailSettings> {
 }
 
 export async function saveEmailSettings(data: EmailSettings): Promise<{ success: boolean }> {
-  await requireAuth()
+  await requirePermission('settings.company')
   const ops = Object.entries(data)
     .filter(([k, v]) => !(k === 'smtp_pass' && v.endsWith('***')))
     .map(([k, v]) =>
@@ -277,7 +277,7 @@ export async function getBrandingColours(): Promise<BrandingColours> {
 }
 
 export async function saveBrandingColours(data: BrandingColours): Promise<{ success: boolean }> {
-  await requireAuth()
+  await requirePermission('settings.company')
   await db.$transaction([
     db.setting.upsert({ where: { key: 'brand_primary_color' }, create: { key: 'brand_primary_color', value: data.primaryColor }, update: { value: data.primaryColor } }),
     db.setting.upsert({ where: { key: 'brand_accent_color' }, create: { key: 'brand_accent_color', value: data.accentColor }, update: { value: data.accentColor } }),
@@ -329,7 +329,7 @@ export async function getDocumentTemplates(): Promise<DocumentTemplateData[]> {
 }
 
 export async function saveDocumentTemplate(data: DocumentTemplateData): Promise<{ success: boolean; error?: string }> {
-  await requireAuth()
+  await requirePermission('settings.company')
   try {
     await db.documentTemplate.upsert({
       where: { type: data.type },

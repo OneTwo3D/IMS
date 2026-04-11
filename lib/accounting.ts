@@ -86,3 +86,23 @@ export function lookupPaymentAccount(
     return null
   }
 }
+
+export type AccountingBankAccount = {
+  id: string       // connector-native account id (Xero AccountID, QuickBooks account id, ...)
+  code: string | null
+  name: string
+}
+
+/**
+ * List bank accounts from the active accounting connector. Used by the
+ * Pay Bill dialog and any other "select a bank account" UI.
+ */
+export async function listAccountingBankAccounts(): Promise<AccountingBankAccount[]> {
+  const { db } = await import('@/lib/db')
+  const accounts = await db.xeroAccount.findMany({
+    where: { active: true, type: 'BANK' },
+    select: { xeroId: true, code: true, name: true },
+    orderBy: [{ name: 'asc' }],
+  })
+  return accounts.map((a) => ({ id: a.xeroId, code: a.code, name: a.name }))
+}

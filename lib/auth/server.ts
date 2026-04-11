@@ -3,6 +3,10 @@
  */
 import { auth } from '@/lib/auth'
 import { redirect } from 'next/navigation'
+import { hasPermission } from '@/lib/permissions'
+import type { Permission } from '@/lib/permissions'
+
+export type { Permission }
 
 export type AuthSession = {
   user: {
@@ -52,6 +56,19 @@ export async function requireRole(...roles: string[]): Promise<AuthSession> {
  */
 export async function requireAdmin(): Promise<AuthSession> {
   return requireRole('ADMIN')
+}
+
+/**
+ * Requires the current user to hold a specific RBAC permission.
+ * Use this on mutating server actions so that non-admin roles can be granted
+ * (or denied) specific capabilities.
+ */
+export async function requirePermission(permission: Permission): Promise<AuthSession> {
+  const session = await requireAuth()
+  if (!hasPermission(session.user.role, permission)) {
+    throw new Error(`Forbidden: missing permission ${permission}`)
+  }
+  return session
 }
 
 /**
