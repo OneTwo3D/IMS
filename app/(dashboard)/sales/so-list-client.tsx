@@ -5,6 +5,7 @@ import Link from 'next/link'
 import type { SoRow, SoStatus } from '@/app/actions/sales'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { ChevronRight, Search } from 'lucide-react'
 
 const STATUS_LABELS: Record<SoStatus, string> = {
@@ -98,60 +99,58 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
       {filtered.length === 0 ? (
         <p className="text-sm text-muted-foreground py-8 text-center">No sales orders found.</p>
       ) : (
-        <div className="rounded-md border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="border-b bg-muted/50">
-              <tr>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Order</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Customer</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Status</th>
-                <th className="px-3 py-2 text-right font-medium text-muted-foreground">Total</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Warehouse</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Created</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Items</th>
-                <th className="w-8" />
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {filtered.map((so) => (
-                <tr key={so.id} className="hover:bg-muted/30 transition-colors">
-                  <td className="px-3 py-2 font-mono text-xs font-medium">
-                    <Link href={`/sales/${so.id}`} className="hover:underline">
-                      {so.wcOrderNumber ?? so.id.slice(0, 8)}
-                    </Link>
-                  </td>
-                  <td className="px-3 py-2">
-                    <div>{so.customerName ?? '—'}</div>
-                    {so.customerEmail && <div className="text-xs text-muted-foreground">{so.customerEmail}</div>}
-                  </td>
-                  <td className="px-3 py-2">
-                    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[so.status]}`}>
-                      {STATUS_LABELS[so.status]}
+        <Table containerClassName="max-h-[calc(100vh-16rem)] rounded-md border" className="min-w-[700px]">
+          <TableHeader className="bg-muted/50">
+            <TableRow>
+              <TableHead>Order</TableHead>
+              <TableHead>Customer</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead className="text-right">Total</TableHead>
+              <TableHead>Warehouse</TableHead>
+              <TableHead>Created</TableHead>
+              <TableHead>Items</TableHead>
+              <TableHead className="w-8" />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {filtered.map((so) => (
+              <TableRow key={so.id}>
+                <TableCell className="font-mono text-xs font-medium">
+                  <Link href={`/sales/${so.id}`} className="hover:underline">
+                    {so.wcOrderNumber ?? so.id.slice(0, 8)}
+                  </Link>
+                </TableCell>
+                <TableCell>
+                  <div>{so.customerName ?? '—'}</div>
+                  {so.customerEmail && <div className="text-xs text-muted-foreground">{so.customerEmail}</div>}
+                </TableCell>
+                <TableCell>
+                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[so.status]}`}>
+                    {STATUS_LABELS[so.status]}
+                  </span>
+                </TableCell>
+                <TableCell className="text-right tabular-nums">
+                  <span className="font-semibold">
+                    {so.totalForeign.toFixed(2)}{sym(so.currency)}
+                  </span>
+                  {so.currency !== 'GBP' && (
+                    <span className="text-muted-foreground text-xs font-normal ml-1">
+                      (£{so.totalGbp.toFixed(2)})
                     </span>
-                  </td>
-                  <td className="px-3 py-2 text-right tabular-nums">
-                    <span className="font-semibold">
-                      {so.totalForeign.toFixed(2)}{sym(so.currency)}
-                    </span>
-                    {so.currency !== 'GBP' && (
-                      <span className="text-muted-foreground text-xs font-normal ml-1">
-                        (£{so.totalGbp.toFixed(2)})
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-3 py-2 text-muted-foreground text-xs">{so.shipFromWarehouseName ?? '—'}</td>
-                  <td className="px-3 py-2 text-muted-foreground text-xs">{timeAgo(so.createdAt)}</td>
-                  <td className="px-3 py-2 text-muted-foreground text-xs">{so.lineCount}</td>
-                  <td className="px-3 py-2">
-                    <Link href={`/sales/${so.id}`}>
-                      <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                    </Link>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+                  )}
+                </TableCell>
+                <TableCell className="text-muted-foreground text-xs">{so.shipFromWarehouseName ?? '—'}</TableCell>
+                <TableCell className="text-muted-foreground text-xs">{timeAgo(so.createdAt)}</TableCell>
+                <TableCell className="text-muted-foreground text-xs">{so.lineCount}</TableCell>
+                <TableCell>
+                  <Link href={`/sales/${so.id}`}>
+                    <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                  </Link>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
       )}
     </div>
   )

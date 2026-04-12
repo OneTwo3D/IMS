@@ -10,6 +10,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   updateManufacturingOrderStatus,
   type ManufacturingOrderDetail as OrderType,
@@ -242,40 +243,38 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
         <h2 className="text-sm font-medium mb-3">
           {isDisassembly ? 'Components Produced' : 'Components Required'}
         </h2>
-        <div className="rounded-md border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="bg-muted/50 border-b">
-                <th className="text-left font-medium px-3 py-2">#</th>
-                <th className="text-left font-medium px-3 py-2 w-12"></th>
-                <th className="text-left font-medium px-3 py-2">SKU</th>
-                <th className="text-left font-medium px-3 py-2">Component</th>
-                <th className="text-left font-medium px-3 py-2">Barcode</th>
-                <th className="text-right font-medium px-3 py-2">Per Unit</th>
-                <th className="text-right font-medium px-3 py-2">Total Qty</th>
-              </tr>
-            </thead>
-            <tbody>
-              {order.components.map((c, i) => (
-                <tr key={c.componentId} className="border-b">
-                  <td className="px-3 py-2 text-muted-foreground">{i + 1}</td>
-                  <td className="px-3 py-2">
-                    <ProductThumb productId={c.componentId} imageUrl={c.componentImageUrl} name={c.componentName} />
-                  </td>
-                  <td className="px-3 py-2 font-mono text-xs">{c.componentSku}</td>
-                  <td className="px-3 py-2">
-                    <Link href={`/inventory/${c.componentId}`} className="hover:underline" target="_blank">
-                      {c.componentName}
-                    </Link>
-                  </td>
-                  <td className="px-3 py-2 text-muted-foreground font-mono text-xs">{c.componentBarcode ?? '—'}</td>
-                  <td className="px-3 py-2 text-right">{c.qtyPerUnit}</td>
-                  <td className="px-3 py-2 text-right font-medium">{c.qtyPerUnit * order.qtyPlanned}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Table className="rounded-md border min-w-[600px]">
+          <TableHeader>
+            <TableRow className="bg-muted/50">
+              <TableHead>#</TableHead>
+              <TableHead className="w-12"></TableHead>
+              <TableHead>SKU</TableHead>
+              <TableHead>Component</TableHead>
+              <TableHead>Barcode</TableHead>
+              <TableHead className="text-right">Per Unit</TableHead>
+              <TableHead className="text-right">Total Qty</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {order.components.map((c, i) => (
+              <TableRow key={c.componentId}>
+                <TableCell className="text-muted-foreground">{i + 1}</TableCell>
+                <TableCell>
+                  <ProductThumb productId={c.componentId} imageUrl={c.componentImageUrl} name={c.componentName} />
+                </TableCell>
+                <TableCell className="font-mono text-xs">{c.componentSku}</TableCell>
+                <TableCell>
+                  <Link href={`/inventory/${c.componentId}`} className="hover:underline" target="_blank">
+                    {c.componentName}
+                  </Link>
+                </TableCell>
+                <TableCell className="text-muted-foreground font-mono text-xs">{c.componentBarcode ?? '—'}</TableCell>
+                <TableCell className="text-right">{c.qtyPerUnit}</TableCell>
+                <TableCell className="text-right font-medium">{c.qtyPerUnit * order.qtyPlanned}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
       </Card>
     </div>
   )

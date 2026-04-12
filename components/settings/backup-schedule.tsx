@@ -49,7 +49,7 @@ export function BackupScheduleSettings({ enabled, retentionDays, maxCount, autoU
         Enable scheduled backups
       </label>
 
-      <div className="grid grid-cols-3 gap-4 max-w-lg">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 max-w-lg">
         <div className="space-y-1.5">
           <Label className="text-xs">Retention (days)</Label>
           <Input type="number" min={1} value={days} onChange={(e) => setDays(e.target.value)} className="h-9" />

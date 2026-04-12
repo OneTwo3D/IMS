@@ -5,6 +5,7 @@ import { ChevronDown, ChevronUp, Pencil, Check, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Card } from '@/components/ui/card'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { updateAdjustmentMovement, type AdjustmentMovementRow } from '@/app/actions/stock'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
@@ -89,115 +90,101 @@ export function AdjustmentHistory({ initialRows }: Props) {
         </button>
       </div>
 
-      {/* Header */}
-      <div className="grid grid-cols-[auto_1fr_1fr_auto_1fr_auto] gap-3 px-4 py-2 bg-muted/20 text-xs font-medium text-muted-foreground border-b border-border">
-        <span className="w-9" />
-        <span>Product</span>
-        <span>Warehouse</span>
-        <span className="w-24 text-right">Qty</span>
-        <span>Reason / Note</span>
-        <span className="w-32 text-right">Date</span>
-      </div>
-
-      {visible.map((row) => {
-        const isEditing = editingId === row.id
-        return (
-          <div
-            key={row.id}
-            className="grid grid-cols-[auto_1fr_1fr_auto_1fr_auto] gap-3 px-4 py-2.5 items-center border-b border-border/50 last:border-0 hover:bg-muted/10 group"
-          >
-            {/* Thumbnail */}
-            <ProductThumb productId={row.productId} imageUrl={row.imageUrl} name={row.productName} />
-            {/* Product */}
-            <div className="min-w-0">
-              <ProductLink productId={row.productId} sku={row.productSku} name={row.productName} skuClassName="font-mono text-xs font-medium" />
-            </div>
-
-            {/* Warehouse */}
-            <span className="text-xs text-muted-foreground">
-              {row.warehouseCode} — {row.warehouseName}
-            </span>
-
-            {/* Qty */}
-            {isEditing ? (
-              <Input
-                type="number"
-                step="1"
-                value={editState?.qty ?? ''}
-                onChange={(e) => setEditState((s) => s ? { ...s, qty: e.target.value } : s)}
-                className={`h-7 w-24 text-right text-xs font-mono ${
-                  Number(editState?.qty) > 0 ? 'text-green-700 dark:text-green-400' :
-                  Number(editState?.qty) < 0 ? 'text-destructive' : ''
-                }`}
-                autoFocus
-              />
-            ) : (
-              <span className={`text-sm font-mono font-medium text-right w-24 ${
-                row.signedQty > 0 ? 'text-green-700 dark:text-green-400' :
-                row.signedQty < 0 ? 'text-destructive' : ''
-              }`}>
-                {row.signedQty > 0 ? `+${row.signedQty}` : row.signedQty}
-              </span>
-            )}
-
-            {/* Note */}
-            {isEditing ? (
-              <div className="flex items-center gap-2">
-                <Input
-                  value={editState?.note ?? ''}
-                  onChange={(e) => setEditState((s) => s ? { ...s, note: e.target.value } : s)}
-                  placeholder="Reason / note"
-                  className="h-7 text-xs"
-                />
-                {editState?.error && (
-                  <span className="text-xs text-destructive whitespace-nowrap">{editState.error}</span>
-                )}
-              </div>
-            ) : (
-              <span className="text-xs text-muted-foreground truncate">{row.note ?? '—'}</span>
-            )}
-
-            {/* Date + actions */}
-            <div className="flex items-center justify-end gap-2 w-32">
-              {isEditing ? (
-                <>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="h-6 w-6 text-green-600"
-                    onClick={() => saveEdit(row.id)}
-                    disabled={editState?.saving}
-                  >
-                    <Check className="h-3.5 w-3.5" />
-                  </Button>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="h-6 w-6"
-                    onClick={cancelEdit}
-                    disabled={editState?.saving}
-                  >
-                    <X className="h-3.5 w-3.5" />
-                  </Button>
-                </>
-              ) : (
-                <>
+      <Table className="min-w-[700px]">
+        <TableHeader className="bg-muted/20">
+          <TableRow>
+            <TableHead className="w-9 text-xs" />
+            <TableHead className="text-xs">Product</TableHead>
+            <TableHead className="text-xs">Warehouse</TableHead>
+            <TableHead className="text-xs text-right w-20">Qty</TableHead>
+            <TableHead className="text-xs">Reason / Note</TableHead>
+            <TableHead className="text-xs text-right">Date</TableHead>
+            <TableHead className="w-8" />
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {visible.map((row) => {
+            const isEditing = editingId === row.id
+            return (
+              <TableRow key={row.id} className="group">
+                <TableCell className="w-9 py-1.5">
+                  <ProductThumb productId={row.productId} imageUrl={row.imageUrl} name={row.productName} />
+                </TableCell>
+                <TableCell className="py-1.5">
+                  <div className="min-w-0 overflow-hidden">
+                    <ProductLink productId={row.productId} sku={row.productSku} name={row.productName} skuClassName="font-mono text-xs font-medium shrink-0" nameClassName="text-xs text-muted-foreground truncate" />
+                  </div>
+                </TableCell>
+                <TableCell className="text-xs text-muted-foreground whitespace-nowrap py-1.5">
+                  {row.warehouseCode} — {row.warehouseName}
+                </TableCell>
+                <TableCell className="text-right w-20 py-1.5">
+                  {isEditing ? (
+                    <Input
+                      type="number"
+                      step="1"
+                      value={editState?.qty ?? ''}
+                      onChange={(e) => setEditState((s) => s ? { ...s, qty: e.target.value } : s)}
+                      className={`h-7 text-right text-xs font-mono ${
+                        Number(editState?.qty) > 0 ? 'text-green-700 dark:text-green-400' :
+                        Number(editState?.qty) < 0 ? 'text-destructive' : ''
+                      }`}
+                      autoFocus
+                    />
+                  ) : (
+                    <span className={`text-sm font-mono font-medium ${
+                      row.signedQty > 0 ? 'text-green-700 dark:text-green-400' :
+                      row.signedQty < 0 ? 'text-destructive' : ''
+                    }`}>
+                      {row.signedQty > 0 ? `+${row.signedQty}` : row.signedQty}
+                    </span>
+                  )}
+                </TableCell>
+                <TableCell className="py-1.5">
+                  {isEditing ? (
+                    <div className="flex items-center gap-2">
+                      <Input
+                        value={editState?.note ?? ''}
+                        onChange={(e) => setEditState((s) => s ? { ...s, note: e.target.value } : s)}
+                        placeholder="Reason / note"
+                        className="h-7 text-xs"
+                      />
+                      {editState?.error && (
+                        <span className="text-xs text-destructive whitespace-nowrap">{editState.error}</span>
+                      )}
+                    </div>
+                  ) : (
+                    <span className="text-xs text-muted-foreground truncate block max-w-[200px]">{row.note ?? '—'}</span>
+                  )}
+                </TableCell>
+                <TableCell className="text-right whitespace-nowrap py-1.5">
                   <span className="text-xs text-muted-foreground">{formatDate(row.createdAt)}</span>
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="h-6 w-6 opacity-0 group-hover:opacity-100 transition-opacity"
-                    onClick={() => startEdit(row)}
-                    title="Edit"
-                  >
-                    <Pencil className="h-3 w-3" />
-                  </Button>
-                </>
-              )}
-            </div>
-          </div>
-        )
-      })}
+                </TableCell>
+                <TableCell className="w-8 py-1.5">
+                  {isEditing ? (
+                    <div className="flex items-center gap-1">
+                      <Button size="icon" variant="ghost" className="h-6 w-6 text-green-600"
+                        onClick={() => saveEdit(row.id)} disabled={editState?.saving}>
+                        <Check className="h-3.5 w-3.5" />
+                      </Button>
+                      <Button size="icon" variant="ghost" className="h-6 w-6"
+                        onClick={cancelEdit} disabled={editState?.saving}>
+                        <X className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  ) : (
+                    <Button size="icon" variant="ghost"
+                      className="h-6 w-6 opacity-0 group-hover:opacity-100 transition-opacity"
+                      onClick={() => startEdit(row)} title="Edit">
+                      <Pencil className="h-3 w-3" />
+                    </Button>
+                  )}
+                </TableCell>
+              </TableRow>
+            )
+          })}
+        </TableBody>
+      </Table>
 
       {collapsed && rows.length > 10 && (
         <div className="px-4 py-2 text-center">

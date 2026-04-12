@@ -315,25 +315,25 @@ export default async function ProductDetailPage({
               ) : (
                 <div className="space-y-0">
                   {/* Header row */}
-                  <div className="grid grid-cols-5 gap-1 text-xs text-muted-foreground pb-1.5 border-b border-border">
+                  <div className="grid grid-cols-3 sm:grid-cols-5 gap-1 text-xs text-muted-foreground pb-1.5 border-b border-border">
                     <span>Warehouse</span>
                     <span className="text-right">On Hand ({product.stockUnit})</span>
-                    <span className="text-right">Allocated</span>
+                    <span className="hidden sm:block text-right">Allocated</span>
                     <span className="text-right">Available</span>
-                    <span className="text-right text-blue-600 dark:text-blue-400">Incoming</span>
+                    <span className="hidden sm:block text-right text-blue-600 dark:text-blue-400">Incoming</span>
                   </div>
 
                   {product.stockByWarehouse.map((s) => {
                     const incoming = Number(s.incomingTransferQty) + Number(s.incomingPoQty)
                     return (
-                      <div key={s.warehouseId} className="grid grid-cols-5 gap-1 py-1.5 text-sm border-b border-border/50 last:border-0">
+                      <div key={s.warehouseId} className="grid grid-cols-3 sm:grid-cols-5 gap-1 py-1.5 text-sm border-b border-border/50 last:border-0">
                         <span className="text-muted-foreground truncate">
                           <span className="font-mono font-medium text-foreground">{s.warehouseCode}</span>
                         </span>
                         <span className="font-mono text-right text-xs">
                           {Number(s.quantity).toLocaleString()}
                         </span>
-                        <span className={`font-mono text-right text-xs ${Number(s.allocatedQty) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground'}`}>
+                        <span className={`hidden sm:block font-mono text-right text-xs ${Number(s.allocatedQty) > 0 ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground'}`}>
                           {Number(s.allocatedQty) > 0 ? (
                             <StockDetailPopup productId={product.id} warehouseId={s.warehouseId} type="allocated">
                               {Number(s.allocatedQty).toLocaleString()}
@@ -343,7 +343,7 @@ export default async function ProductDetailPage({
                         <span className={`font-mono text-right text-xs font-medium ${Number(s.availableQty) < 0 ? 'text-destructive' : ''}`}>
                           {Number(s.availableQty).toLocaleString()}
                         </span>
-                        <span className={`font-mono text-right text-xs ${incoming > 0 ? 'text-blue-600 dark:text-blue-400 font-medium' : 'text-muted-foreground'}`}>
+                        <span className={`hidden sm:block font-mono text-right text-xs ${incoming > 0 ? 'text-blue-600 dark:text-blue-400 font-medium' : 'text-muted-foreground'}`}>
                           {incoming > 0 ? (
                             <StockDetailPopup productId={product.id} warehouseId={s.warehouseId} type="incoming">
                               +{incoming.toLocaleString()}
@@ -355,10 +355,10 @@ export default async function ProductDetailPage({
                   })}
 
                   {/* Totals */}
-                  <div className="grid grid-cols-5 gap-1 pt-2 text-sm font-semibold border-t border-border mt-0.5">
+                  <div className="grid grid-cols-3 sm:grid-cols-5 gap-1 pt-2 text-sm font-semibold border-t border-border mt-0.5">
                     <span>Total</span>
                     <span className="font-mono text-right">{Number(product.totalStock).toLocaleString()}</span>
-                    <span className={`font-mono text-right ${
+                    <span className={`hidden sm:block font-mono text-right ${
                       product.stockByWarehouse.reduce((s, w) => s + Number(w.allocatedQty), 0) > 0
                         ? 'text-amber-600 dark:text-amber-400'
                         : 'text-muted-foreground'
@@ -378,7 +378,7 @@ export default async function ProductDetailPage({
                     {(() => {
                       const totalIncoming = product.stockByWarehouse.reduce((s, w) => s + Number(w.incomingTransferQty) + Number(w.incomingPoQty), 0) + Number(product.incomingPoQty)
                       return (
-                        <span className={`font-mono text-right ${totalIncoming > 0 ? 'text-blue-600 dark:text-blue-400' : 'text-muted-foreground'}`}>
+                        <span className={`hidden sm:block font-mono text-right ${totalIncoming > 0 ? 'text-blue-600 dark:text-blue-400' : 'text-muted-foreground'}`}>
                           {totalIncoming > 0 ? `+${totalIncoming.toLocaleString()}` : '—'}
                         </span>
                       )

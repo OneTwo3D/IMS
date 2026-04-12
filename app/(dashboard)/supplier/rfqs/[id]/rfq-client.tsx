@@ -6,6 +6,7 @@ import { Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { submitSupplierQuote, type SupplierPoRow, type SupplierRfqLine } from '@/app/actions/supplier-portal'
 
 type Props = {
@@ -66,44 +67,46 @@ export function SupplierRfqClient({ po, lines }: Props) {
   return (
     <div className="space-y-6">
       {/* Line items */}
-      <div className="rounded-md border overflow-hidden">
+      <div className="rounded-md border">
         <div className="px-4 py-2 bg-muted/50 border-b">
           <h2 className="text-sm font-medium">Items Requested</h2>
         </div>
-        <table className="w-full text-sm">
-          <thead className="border-b bg-muted/30"><tr>
-            <th className="px-4 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
-            <th className="px-4 py-2 text-left text-xs font-medium text-muted-foreground">SKU</th>
-            <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-24">Qty Requested</th>
-            {canQuote && <>
-              <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-24">Your Qty</th>
-              <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-28">Unit Price ({po.currency})</th>
-              <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-24">Line Total</th>
-            </>}
-          </tr></thead>
-          <tbody className="divide-y">
+        <Table>
+          <TableHeader className="bg-muted/30">
+            <TableRow>
+              <TableHead className="px-4 text-xs">Product</TableHead>
+              <TableHead className="px-4 text-xs">SKU</TableHead>
+              <TableHead className="px-4 text-xs text-right w-24">Qty Requested</TableHead>
+              {canQuote && <>
+                <TableHead className="px-4 text-xs text-right w-24">Your Qty</TableHead>
+                <TableHead className="px-4 text-xs text-right w-28">Unit Price ({po.currency})</TableHead>
+                <TableHead className="px-4 text-xs text-right w-24">Line Total</TableHead>
+              </>}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
             {lines.map((l, i) => {
               const ql = quoteLines[i]
               const lineTotal = (ql?.qty ?? 0) * (ql?.unitPrice ?? 0)
               return (
-                <tr key={l.id}>
-                  <td className="px-4 py-2">{l.productName}</td>
-                  <td className="px-4 py-2 font-mono text-xs text-muted-foreground">{l.productSku}</td>
-                  <td className="px-4 py-2 text-right tabular-nums">{l.qty}</td>
+                <TableRow key={l.id}>
+                  <TableCell className="px-4">{l.productName}</TableCell>
+                  <TableCell className="px-4 font-mono text-xs text-muted-foreground">{l.productSku}</TableCell>
+                  <TableCell className="px-4 text-right tabular-nums">{l.qty}</TableCell>
                   {canQuote && <>
-                    <td className="px-4 py-2">
+                    <TableCell className="px-4">
                       <Input type="number" min={0} value={ql?.qty ?? l.qty} onChange={(e) => updateLine(l.id, 'qty', Number(e.target.value))} className="h-7 w-20 text-xs text-right font-mono ml-auto" />
-                    </td>
-                    <td className="px-4 py-2">
+                    </TableCell>
+                    <TableCell className="px-4">
                       <Input type="number" min={0} step={0.01} value={ql?.unitPrice || ''} onChange={(e) => updateLine(l.id, 'unitPrice', Number(e.target.value))} placeholder="0.00" className="h-7 w-24 text-xs text-right font-mono ml-auto" />
-                    </td>
-                    <td className="px-4 py-2 text-right font-mono text-xs">{lineTotal > 0 ? lineTotal.toFixed(2) : '—'}</td>
+                    </TableCell>
+                    <TableCell className="px-4 text-right font-mono text-xs">{lineTotal > 0 ? lineTotal.toFixed(2) : '—'}</TableCell>
                   </>}
-                </tr>
+                </TableRow>
               )
             })}
-          </tbody>
-        </table>
+          </TableBody>
+        </Table>
       </div>
 
       {/* Quote details */}

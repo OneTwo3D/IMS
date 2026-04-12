@@ -14,6 +14,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/ui/dialog'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createPurchaseOrder, updatePurchaseOrder, getSupplierLastPrices, type PoDetail } from '@/app/actions/purchase-orders'
 import { createSupplier, type SupplierRow } from '@/app/actions/suppliers'
 import type { ProductRow } from '@/app/actions/products'
@@ -660,7 +661,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
 
   return (
     <Dialog open onOpenChange={() => {}}>
-    <DialogContent showCloseButton={false} className="w-[80vw] max-w-[80vw] sm:max-w-[80vw] max-h-[90vh] overflow-y-auto">
+    <DialogContent showCloseButton={false} className="w-[95vw] sm:w-[80vw] max-w-[95vw] sm:max-w-[80vw] max-h-[90vh] overflow-y-auto">
     <DialogHeader>
       <DialogTitle>{isEditMode ? `Edit Purchase Order — ${existingPo?.reference ?? ''}` : 'New Purchase Order'}</DialogTitle>
     </DialogHeader>
@@ -669,7 +670,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
       <div className="rounded-md border p-4 space-y-4">
         <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">PO Details</h2>
 
-        <div className="grid grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div className="space-y-1.5">
             <Label htmlFor="supplier">Supplier *</Label>
             {!showNewSupplier ? (
@@ -798,7 +799,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
           </div>
         </div>
 
-        <div className="grid grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
           <div className="space-y-1.5">
             <Label htmlFor="notes">Notes (visible to supplier)</Label>
             <Textarea id="notes" value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} className="text-sm resize-none" />
@@ -815,111 +816,109 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">Order Lines</h2>
 
         {lines.length > 0 && (
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b text-muted-foreground text-xs">
-                  <th className="pb-2 pr-3 text-left font-medium">Product</th>
-                  {purchaseUnits.length > 0 && <th className="pb-2 pr-3 text-center font-medium w-32">Unit</th>}
-                  <th className="pb-2 pr-3 text-center font-medium w-20">Qty</th>
-                  {purchaseUnits.length > 0 && <th className="pb-2 pr-3 text-center font-medium w-24">Stock Qty</th>}
-                  <th className="pb-2 pr-3 text-center font-medium w-32">
-                    Unit Cost ({sym})
-                    {pricesIncludeVat ? ' incl.' : ''}
-                  </th>
-                  <th className="pb-2 pr-3 text-center font-medium w-24">Discount</th>
-                  <th className="pb-2 pr-3 text-center font-medium w-32">VAT</th>
-                  <th className="pb-2 pr-3 text-right font-medium w-28">Line Total ({sym})</th>
-                  <th className="w-8" />
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {lines.map((line) => {
-                  const netForeign = getLineNet(line)
-                  const stockQty = getStockQty(line)
-                  const unit = unitMap[line.purchaseUnitId]
-                  return (
-                    <tr key={line.key}>
-                      <td className="py-2 pr-3">
-                        <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
-                      </td>
-                      {purchaseUnits.length > 0 && (
-                        <td className="py-2 pr-3">
-                          <select
-                            value={line.purchaseUnitId}
-                            onChange={(e) => updateLine(line.key, 'purchaseUnitId', e.target.value)}
-                            className="h-7 rounded-md border border-input bg-background px-2 text-xs w-32"
-                          >
-                            <option value="">Each (1:1)</option>
-                            {purchaseUnits.map((u) => (
-                              <option key={u.id} value={u.id}>{u.abbreviation} (1:{u.conversionFactor} {u.stockUnitName})</option>
-                            ))}
-                          </select>
-                        </td>
-                      )}
-                      <td className="py-2 pr-3">
-                        <Input
-                          type="number" min="1" step="1" value={line.qty}
-                          onChange={(e) => updateLine(line.key, 'qty', Number(e.target.value) || 0)}
-                          className="h-7 text-sm text-right w-20 ml-auto"
-                        />
-                      </td>
-                      {purchaseUnits.length > 0 && (
-                        <td className="py-2 pr-3 text-right text-xs tabular-nums">
-                          {unit ? (
-                            <span className="text-muted-foreground">{stockQty} {unit?.stockUnitName ?? 'pcs'}</span>
-                          ) : (
-                            <span className="text-muted-foreground">—</span>
-                          )}
-                        </td>
-                      )}
-                      <td className="py-2 pr-3">
-                        <Input
-                          type="number" min="0" step="0.01" value={line.unitCostForeign}
-                          onChange={(e) => updateLine(line.key, 'unitCostForeign', Number(e.target.value) || 0)}
-                          className="h-7 text-sm text-right w-32 ml-auto font-mono"
-                        />
-                      </td>
-                      <td className="py-2 pr-3">
-                        <Input
-                          value={line.discount}
-                          onChange={(e) => setLines((p) => p.map((l) => l.key === line.key ? { ...l, discount: e.target.value } : l))}
-                          placeholder={`${sym} or %`}
-                          className={`h-7 text-sm text-right w-24 ml-auto font-mono ${parseDiscount(line.discount, line.qty * line.unitCostForeign) > 0 ? 'text-destructive' : ''}`}
-                        />
-                      </td>
-                      <td className="py-2 pr-3">
-                        <div className="flex items-center justify-end gap-1">
-                          {line.taxRateWarning && (
-                            <span title={line.taxRateWarning} className="text-yellow-600">
-                              <AlertTriangle className="h-3 w-3" />
-                            </span>
-                          )}
-                          <select
-                            value={line.taxRateAutoResolved ? 'auto' : (line.taxRateId ?? '')}
-                            onChange={(e) => setLineTaxRate(line.key, e.target.value as string)}
-                            className="h-7 text-xs rounded-md border border-input bg-background px-1.5 font-mono w-28"
-                            title={line.taxRateWarning ?? `Auto-resolved from ${line.productCategory}`}
-                          >
-                            <option value="auto">Auto {(line.taxRateValue * 100).toFixed(0)}%</option>
-                            {purchaseRates.map((t) => (
-                              <option key={t.id} value={t.id}>{t.name} ({(t.rate * 100).toFixed(0)}%)</option>
-                            ))}
-                          </select>
-                        </div>
-                      </td>
-                      <td className="py-2 pr-3 text-right font-mono text-xs">{money(netForeign)}</td>
-                      <td className="py-2">
-                        <button type="button" onClick={() => setLines((p) => p.filter((l) => l.key !== line.key))} className="text-muted-foreground hover:text-destructive">
-                          <X className="h-4 w-4" />
-                        </button>
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="text-xs">Product</TableHead>
+                {purchaseUnits.length > 0 && <TableHead className="text-xs text-center w-32">Unit</TableHead>}
+                <TableHead className="text-xs text-center w-20">Qty</TableHead>
+                {purchaseUnits.length > 0 && <TableHead className="text-xs text-center w-24">Stock Qty</TableHead>}
+                <TableHead className="text-xs text-center w-32">
+                  Unit Cost ({sym})
+                  {pricesIncludeVat ? ' incl.' : ''}
+                </TableHead>
+                <TableHead className="text-xs text-center w-24">Discount</TableHead>
+                <TableHead className="text-xs text-center w-32">VAT</TableHead>
+                <TableHead className="text-xs text-right w-28">Line Total ({sym})</TableHead>
+                <TableHead className="w-8" />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {lines.map((line) => {
+                const netForeign = getLineNet(line)
+                const stockQty = getStockQty(line)
+                const unit = unitMap[line.purchaseUnitId]
+                return (
+                  <TableRow key={line.key}>
+                    <TableCell>
+                      <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
+                    </TableCell>
+                    {purchaseUnits.length > 0 && (
+                      <TableCell>
+                        <select
+                          value={line.purchaseUnitId}
+                          onChange={(e) => updateLine(line.key, 'purchaseUnitId', e.target.value)}
+                          className="h-7 rounded-md border border-input bg-background px-2 text-xs w-32"
+                        >
+                          <option value="">Each (1:1)</option>
+                          {purchaseUnits.map((u) => (
+                            <option key={u.id} value={u.id}>{u.abbreviation} (1:{u.conversionFactor} {u.stockUnitName})</option>
+                          ))}
+                        </select>
+                      </TableCell>
+                    )}
+                    <TableCell>
+                      <Input
+                        type="number" min="1" step="1" value={line.qty}
+                        onChange={(e) => updateLine(line.key, 'qty', Number(e.target.value) || 0)}
+                        className="h-7 text-sm text-right w-20 ml-auto"
+                      />
+                    </TableCell>
+                    {purchaseUnits.length > 0 && (
+                      <TableCell className="text-right text-xs tabular-nums">
+                        {unit ? (
+                          <span className="text-muted-foreground">{stockQty} {unit?.stockUnitName ?? 'pcs'}</span>
+                        ) : (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </TableCell>
+                    )}
+                    <TableCell>
+                      <Input
+                        type="number" min="0" step="0.01" value={line.unitCostForeign}
+                        onChange={(e) => updateLine(line.key, 'unitCostForeign', Number(e.target.value) || 0)}
+                        className="h-7 text-sm text-right w-32 ml-auto font-mono"
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <Input
+                        value={line.discount}
+                        onChange={(e) => setLines((p) => p.map((l) => l.key === line.key ? { ...l, discount: e.target.value } : l))}
+                        placeholder={`${sym} or %`}
+                        className={`h-7 text-sm text-right w-24 ml-auto font-mono ${parseDiscount(line.discount, line.qty * line.unitCostForeign) > 0 ? 'text-destructive' : ''}`}
+                      />
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex items-center justify-end gap-1">
+                        {line.taxRateWarning && (
+                          <span title={line.taxRateWarning} className="text-yellow-600">
+                            <AlertTriangle className="h-3 w-3" />
+                          </span>
+                        )}
+                        <select
+                          value={line.taxRateAutoResolved ? 'auto' : (line.taxRateId ?? '')}
+                          onChange={(e) => setLineTaxRate(line.key, e.target.value as string)}
+                          className="h-7 text-xs rounded-md border border-input bg-background px-1.5 font-mono w-28"
+                          title={line.taxRateWarning ?? `Auto-resolved from ${line.productCategory}`}
+                        >
+                          <option value="auto">Auto {(line.taxRateValue * 100).toFixed(0)}%</option>
+                          {purchaseRates.map((t) => (
+                            <option key={t.id} value={t.id}>{t.name} ({(t.rate * 100).toFixed(0)}%)</option>
+                          ))}
+                        </select>
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs">{money(netForeign)}</TableCell>
+                    <TableCell>
+                      <button type="button" onClick={() => setLines((p) => p.filter((l) => l.key !== line.key))} className="text-muted-foreground hover:text-destructive">
+                        <X className="h-4 w-4" />
+                      </button>
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
         )}
 
         {/* Product search */}

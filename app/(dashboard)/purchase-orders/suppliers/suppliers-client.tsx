@@ -14,6 +14,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/ui/dialog'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createSupplier, updateSupplier, importSuppliersCsv, type SupplierRow, type SupplierInput } from '@/app/actions/suppliers'
 import { CsvBar } from '@/components/ui/csv-bar'
 import type { TaxRateRow } from '@/app/actions/settings'
@@ -346,81 +347,79 @@ export function SuppliersClient({ initialSuppliers, taxRates, currencies }: Prop
       {initialSuppliers.length === 0 ? (
         <p className="text-sm text-muted-foreground text-center py-8">No suppliers yet. Add your first supplier.</p>
       ) : (
-        <div className="rounded-md border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="border-b bg-muted/50">
-              <tr>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Name</th>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Contact</th>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Email</th>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Currency</th>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">VAT Rate</th>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Terms</th>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Delivery</th>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Status</th>
-                <th className="w-16" />
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {[...active, ...inactive].map((s) => (
-                <tr key={s.id} className={`hover:bg-muted/30 transition-colors ${!s.active ? 'opacity-50' : ''}`}>
-                  <td className="px-4 py-2 font-medium">{s.name}</td>
-                  <td className="px-4 py-2 text-muted-foreground">{s.contactName ?? '—'}</td>
-                  <td className="px-4 py-2 text-muted-foreground">{s.email ?? '—'}</td>
-                  <td className="px-4 py-2 font-mono text-xs">{s.currency}</td>
-                  <td className="px-4 py-2 text-xs">
-                    {s.taxRateName
-                      ? <span>{s.taxRateName} ({(s.taxRate! * 100).toFixed(0)}%)</span>
-                      : <span className="text-muted-foreground">—</span>}
-                  </td>
-                  <td className="px-4 py-2 text-muted-foreground">{s.paymentTermsDays ? `${s.paymentTermsDays}d` : '—'}</td>
-                  <td className="px-4 py-2 text-xs">
-                    {s.manualDeliveryDays != null ? (
-                      <span>
-                        <span className="font-mono">{s.manualDeliveryDays}d</span>
-                        <span className="text-muted-foreground ml-1">(manual)</span>
-                      </span>
-                    ) : s.avgDeliveryDays != null ? (
-                      <span>
-                        <span className="font-mono">{s.avgDeliveryDays}d</span>
-                        <span className="text-muted-foreground ml-1">(avg of {s.avgDeliveryDaysCount})</span>
-                      </span>
-                    ) : (
-                      <span className="text-muted-foreground">—</span>
-                    )}
-                  </td>
-                  <td className="px-4 py-2">
-                    <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${
-                      s.active
-                        ? 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200'
-                        : 'bg-muted text-muted-foreground border-border'
-                    }`}>
-                      {s.active ? 'Active' : 'Inactive'}
+        <Table className="rounded-md border min-w-[800px]">
+          <TableHeader className="bg-muted/50">
+            <TableRow>
+              <TableHead className="px-4 text-xs">Name</TableHead>
+              <TableHead className="px-4 text-xs">Contact</TableHead>
+              <TableHead className="px-4 text-xs">Email</TableHead>
+              <TableHead className="px-4 text-xs">Currency</TableHead>
+              <TableHead className="px-4 text-xs">VAT Rate</TableHead>
+              <TableHead className="px-4 text-xs">Terms</TableHead>
+              <TableHead className="px-4 text-xs">Delivery</TableHead>
+              <TableHead className="px-4 text-xs">Status</TableHead>
+              <TableHead className="w-16" />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {[...active, ...inactive].map((s) => (
+              <TableRow key={s.id} className={!s.active ? 'opacity-50' : ''}>
+                <TableCell className="px-4 font-medium">{s.name}</TableCell>
+                <TableCell className="px-4 text-muted-foreground">{s.contactName ?? '—'}</TableCell>
+                <TableCell className="px-4 text-muted-foreground">{s.email ?? '—'}</TableCell>
+                <TableCell className="px-4 font-mono text-xs">{s.currency}</TableCell>
+                <TableCell className="px-4 text-xs">
+                  {s.taxRateName
+                    ? <span>{s.taxRateName} ({(s.taxRate! * 100).toFixed(0)}%)</span>
+                    : <span className="text-muted-foreground">—</span>}
+                </TableCell>
+                <TableCell className="px-4 text-muted-foreground">{s.paymentTermsDays ? `${s.paymentTermsDays}d` : '—'}</TableCell>
+                <TableCell className="px-4 text-xs">
+                  {s.manualDeliveryDays != null ? (
+                    <span>
+                      <span className="font-mono">{s.manualDeliveryDays}d</span>
+                      <span className="text-muted-foreground ml-1">(manual)</span>
                     </span>
-                  </td>
-                  <td className="px-4 py-2">
-                    <div className="flex items-center gap-1 justify-end">
-                      <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setEditing(s)}>
-                        <Pencil className="h-3 w-3" />
-                      </Button>
-                      <Button
-                        variant="ghost" size="sm" className="h-7 w-7 p-0"
-                        onClick={() => handleToggleActive(s)}
-                        disabled={toggling === s.id}
-                      >
-                        {toggling === s.id
-                          ? <Loader2 className="h-3 w-3 animate-spin" />
-                          : s.active
-                            ? <X className="h-3 w-3 text-muted-foreground" />
-                            : <Check className="h-3 w-3 text-muted-foreground" />}
-                      </Button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+                  ) : s.avgDeliveryDays != null ? (
+                    <span>
+                      <span className="font-mono">{s.avgDeliveryDays}d</span>
+                      <span className="text-muted-foreground ml-1">(avg of {s.avgDeliveryDaysCount})</span>
+                    </span>
+                  ) : (
+                    <span className="text-muted-foreground">—</span>
+                  )}
+                </TableCell>
+                <TableCell className="px-4">
+                  <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${
+                    s.active
+                      ? 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200'
+                      : 'bg-muted text-muted-foreground border-border'
+                  }`}>
+                    {s.active ? 'Active' : 'Inactive'}
+                  </span>
+                </TableCell>
+                <TableCell className="px-4">
+                  <div className="flex items-center gap-1 justify-end">
+                    <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setEditing(s)}>
+                      <Pencil className="h-3 w-3" />
+                    </Button>
+                    <Button
+                      variant="ghost" size="sm" className="h-7 w-7 p-0"
+                      onClick={() => handleToggleActive(s)}
+                      disabled={toggling === s.id}
+                    >
+                      {toggling === s.id
+                        ? <Loader2 className="h-3 w-3 animate-spin" />
+                        : s.active
+                          ? <X className="h-3 w-3 text-muted-foreground" />
+                          : <Check className="h-3 w-3 text-muted-foreground" />}
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
       )}
 
       {editing !== undefined && (

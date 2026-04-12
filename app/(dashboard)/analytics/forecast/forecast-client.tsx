@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import {
@@ -257,7 +258,7 @@ function SortHeader({ field, label, align, sortField, sortDir, onSort, className
 }) {
   const active = sortField === field
   return (
-    <th className={`px-3 py-2 text-${align} text-xs font-medium text-muted-foreground ${className ?? ''}`}>
+    <TableHead className={`text-${align} text-xs ${className ?? ''}`}>
       <button type="button" className="inline-flex items-center gap-0.5 hover:text-foreground" onClick={() => onSort(field)}>
         {label}
         {active ? (
@@ -266,7 +267,7 @@ function SortHeader({ field, label, align, sortField, sortDir, onSort, className
           <ArrowUpDown className="h-3 w-3 opacity-30" />
         )}
       </button>
-    </th>
+    </TableHead>
   )
 }
 
@@ -377,7 +378,7 @@ export function ForecastClient({ forecasts, settings }: Props) {
       </div>
 
       {/* Summary cards */}
-      <div className="grid grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div className="rounded-md border p-3 text-center">
           <p className="text-2xl font-bold text-destructive">{criticalCount}</p>
           <p className="text-xs text-muted-foreground">Out of Stock</p>
@@ -427,80 +428,78 @@ export function ForecastClient({ forecasts, settings }: Props) {
       {error && <p className="text-sm text-destructive">{error}</p>}
 
       {/* Table */}
-      <div className="rounded-md border overflow-hidden">
-        <table className="w-full text-sm">
-          <thead className="border-b bg-muted/50">
-            <tr>
-              <th className="w-8 px-3 py-2" />
-              <th className="w-12 px-2 py-2" />
-              <SortHeader field="sku" label="Product" align="left" sortField={sortField} sortDir={sortDir} onSort={toggleSort} />
-              <SortHeader field="abcClass" label="ABC" align="left" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-16" />
-              <SortHeader field="urgency" label="Status" align="left" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
-              <SortHeader field="availableStock" label="Stock" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
-              <SortHeader field="avgDailyDemand" label="Daily Demand" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
-              <SortHeader field="demandTrend" label="Trend" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-16" />
-              <SortHeader field="avgLeadTimeDays" label="Lead Time" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
-              <SortHeader field="reorderPoint" label="Reorder Pt" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
-              <SortHeader field="safetyStock" label="Safety" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
-              <SortHeader field="daysUntilStockout" label="Days to S/O" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-24" />
-              <SortHeader field="recommendedOrderQty" label="Order Qty" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
-              <SortHeader field="supplierName" label="Supplier" align="left" sortField={sortField} sortDir={sortDir} onSort={toggleSort} />
-            </tr>
-          </thead>
-          <tbody className="divide-y">
-            {paged.map((f) => (
-              <tr key={f.productId} className={`hover:bg-muted/30 ${f.urgency === 'critical' ? 'bg-red-50 dark:bg-red-950/20' : ''}`}>
-                <td className="px-3 py-2">
-                  {f.supplierId && f.recommendedOrderQty > 0 && (
-                    <input type="checkbox" checked={selected.has(f.productId)} onChange={() => toggleSelect(f.productId)} className="rounded border-input" />
-                  )}
-                </td>
-                <td className="w-12 px-2 py-1">
-                  <ProductThumb productId={f.productId} imageUrl={f.imageUrl} name={f.name} />
-                </td>
-                <td className="px-3 py-2">
-                  <ProductLink productId={f.productId} sku={f.sku} name={f.name} />
-                </td>
-                <td className="px-3 py-2">
-                  <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-bold border ${ABC_CLASS[f.abcClass]}`}>{f.abcClass}</span>
-                </td>
-                <td className="px-3 py-2">
-                  <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium ${URGENCY_CLASS[f.urgency]}`}>
-                    {URGENCY_LABEL[f.urgency]}
-                  </span>
-                </td>
-                <td className="px-3 py-2 text-right tabular-nums text-xs">
-                  <span className={f.availableStock <= 0 ? 'text-destructive font-medium' : ''}>
-                    {f.availableStock} {f.stockUnit}
-                  </span>
-                </td>
-                <td className="px-3 py-2 text-right tabular-nums text-xs">{f.avgDailyDemand.toFixed(1)}</td>
-                <td className="px-3 py-2 text-right text-xs">
-                  {f.demandTrend > 5 ? (
-                    <span className="text-green-600 flex items-center justify-end gap-0.5"><TrendingUp className="h-3 w-3" />{f.demandTrend.toFixed(0)}%</span>
-                  ) : f.demandTrend < -5 ? (
-                    <span className="text-destructive flex items-center justify-end gap-0.5"><TrendingDown className="h-3 w-3" />{f.demandTrend.toFixed(0)}%</span>
-                  ) : (
-                    <span className="text-muted-foreground">—</span>
-                  )}
-                </td>
-                <td className="px-3 py-2 text-right tabular-nums text-xs text-muted-foreground">{f.avgLeadTimeDays}d</td>
-                <td className="px-3 py-2 text-right tabular-nums text-xs">{f.reorderPoint}</td>
-                <td className="px-3 py-2 text-right tabular-nums text-xs text-muted-foreground">{f.safetyStock}</td>
-                <td className="px-3 py-2 text-right tabular-nums text-xs">
-                  <span className={f.daysUntilStockout <= 0 ? 'text-destructive font-bold' : f.daysUntilStockout <= 14 ? 'text-orange-600 font-medium' : ''}>
-                    {f.daysUntilStockout >= 999 ? '—' : `${f.daysUntilStockout}d`}
-                  </span>
-                </td>
-                <td className="px-3 py-2 text-right tabular-nums text-xs font-medium">
-                  {f.recommendedOrderQty > 0 ? f.recommendedOrderQty : '—'}
-                </td>
-                <td className="px-3 py-2 text-xs text-muted-foreground truncate max-w-32">{f.supplierName ?? '—'}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <Table className="rounded-md border min-w-[900px]" containerClassName="max-h-[calc(100vh-20rem)]">
+        <TableHeader className="bg-muted/50">
+          <TableRow>
+            <TableHead className="w-8" />
+            <TableHead className="w-12 px-2" />
+            <SortHeader field="sku" label="Product" align="left" sortField={sortField} sortDir={sortDir} onSort={toggleSort} />
+            <SortHeader field="abcClass" label="ABC" align="left" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-16" />
+            <SortHeader field="urgency" label="Status" align="left" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
+            <SortHeader field="availableStock" label="Stock" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
+            <SortHeader field="avgDailyDemand" label="Daily Demand" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
+            <SortHeader field="demandTrend" label="Trend" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-16" />
+            <SortHeader field="avgLeadTimeDays" label="Lead Time" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
+            <SortHeader field="reorderPoint" label="Reorder Pt" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
+            <SortHeader field="safetyStock" label="Safety" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
+            <SortHeader field="daysUntilStockout" label="Days to S/O" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-24" />
+            <SortHeader field="recommendedOrderQty" label="Order Qty" align="right" sortField={sortField} sortDir={sortDir} onSort={toggleSort} className="w-20" />
+            <SortHeader field="supplierName" label="Supplier" align="left" sortField={sortField} sortDir={sortDir} onSort={toggleSort} />
+          </TableRow>
+        </TableHeader>
+        <TableBody className="divide-y">
+          {paged.map((f) => (
+            <TableRow key={f.productId} className={f.urgency === 'critical' ? 'bg-red-50 dark:bg-red-950/20' : ''}>
+              <TableCell>
+                {f.supplierId && f.recommendedOrderQty > 0 && (
+                  <input type="checkbox" checked={selected.has(f.productId)} onChange={() => toggleSelect(f.productId)} className="rounded border-input" />
+                )}
+              </TableCell>
+              <TableCell className="w-12 px-2 py-1">
+                <ProductThumb productId={f.productId} imageUrl={f.imageUrl} name={f.name} />
+              </TableCell>
+              <TableCell>
+                <ProductLink productId={f.productId} sku={f.sku} name={f.name} />
+              </TableCell>
+              <TableCell>
+                <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-bold border ${ABC_CLASS[f.abcClass]}`}>{f.abcClass}</span>
+              </TableCell>
+              <TableCell>
+                <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium ${URGENCY_CLASS[f.urgency]}`}>
+                  {URGENCY_LABEL[f.urgency]}
+                </span>
+              </TableCell>
+              <TableCell className="text-right tabular-nums text-xs">
+                <span className={f.availableStock <= 0 ? 'text-destructive font-medium' : ''}>
+                  {f.availableStock} {f.stockUnit}
+                </span>
+              </TableCell>
+              <TableCell className="text-right tabular-nums text-xs">{f.avgDailyDemand.toFixed(1)}</TableCell>
+              <TableCell className="text-right text-xs">
+                {f.demandTrend > 5 ? (
+                  <span className="text-green-600 flex items-center justify-end gap-0.5"><TrendingUp className="h-3 w-3" />{f.demandTrend.toFixed(0)}%</span>
+                ) : f.demandTrend < -5 ? (
+                  <span className="text-destructive flex items-center justify-end gap-0.5"><TrendingDown className="h-3 w-3" />{f.demandTrend.toFixed(0)}%</span>
+                ) : (
+                  <span className="text-muted-foreground">—</span>
+                )}
+              </TableCell>
+              <TableCell className="text-right tabular-nums text-xs text-muted-foreground">{f.avgLeadTimeDays}d</TableCell>
+              <TableCell className="text-right tabular-nums text-xs">{f.reorderPoint}</TableCell>
+              <TableCell className="text-right tabular-nums text-xs text-muted-foreground">{f.safetyStock}</TableCell>
+              <TableCell className="text-right tabular-nums text-xs">
+                <span className={f.daysUntilStockout <= 0 ? 'text-destructive font-bold' : f.daysUntilStockout <= 14 ? 'text-orange-600 font-medium' : ''}>
+                  {f.daysUntilStockout >= 999 ? '—' : `${f.daysUntilStockout}d`}
+                </span>
+              </TableCell>
+              <TableCell className="text-right tabular-nums text-xs font-medium">
+                {f.recommendedOrderQty > 0 ? f.recommendedOrderQty : '—'}
+              </TableCell>
+              <TableCell className="text-xs text-muted-foreground truncate max-w-32">{f.supplierName ?? '—'}</TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
 
       {filtered.length === 0 ? (
         <p className="text-sm text-muted-foreground text-center py-8">No products match the current filters.</p>

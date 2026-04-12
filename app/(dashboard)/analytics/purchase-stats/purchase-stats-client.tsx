@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { ProductLink } from '@/components/inventory/product-link'
 import type { PurchaseProductRow, ReceivedGoodsRow, BillRow, SupplierAgingRow, PurchaseDetailRow } from '@/app/actions/purchase-stats'
 import { saveView, type SavedView } from '@/app/actions/sales-stats'
@@ -227,10 +228,10 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
   // Column header component
   function ColHeader({ colKey, label, align }: { colKey: string; label: string; align?: 'right' | 'left' }) {
     return (
-      <th className={`px-3 py-2 text-xs font-medium text-muted-foreground cursor-pointer hover:text-foreground select-none whitespace-nowrap ${align === 'right' ? 'text-right' : 'text-left'}`}
+      <TableHead className={`text-xs cursor-pointer hover:text-foreground select-none ${align === 'right' ? 'text-right' : 'text-left'}`}
         onClick={() => handleSort(colKey)}>
         <span className="inline-flex items-center gap-0.5">{label} <SI c={colKey} /></span>
-      </th>
+      </TableHead>
     )
   }
 
@@ -299,32 +300,30 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
   function GenericTable({ data, tabKey, emptyMsg }: { data: any[]; tabKey: Tab; emptyMsg: string }) {
     const cols = visibleColsMap[tabKey]
     return (
-      <div className="rounded-md border overflow-hidden">
+      <div className="rounded-md border">
         <div className="flex items-center justify-between px-3 py-1.5 bg-muted/30 border-b">
           <span className="text-xs text-muted-foreground">{data.length} rows</span>
         </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead className="border-b bg-muted/50">
-              <tr>
-                {cols.map((key) => {
-                  const f = TAB_FIELDS[tabKey].find((fd) => fd.key === key)
-                  if (!f) return null
-                  return <ColHeader key={key} colKey={key} label={f.label} align={isRightAligned(key) ? 'right' : 'left'} />
-                })}
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {data.map((row, i) => (
-                <tr key={row.id ?? row.receiptLineId ?? row.invoiceLineId ?? row.supplierId ?? `${row.poId}-${row.lineProductId}-${i}`} className="hover:bg-muted/30">
-                  {cols.map((key) => (
-                    <td key={key} className={`px-3 py-2 ${isRightAligned(key) ? 'text-right' : ''}`}>{renderCell(row, key, tabKey)}</td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-20rem)]">
+          <TableHeader className="bg-muted/50">
+            <TableRow>
+              {cols.map((key) => {
+                const f = TAB_FIELDS[tabKey].find((fd) => fd.key === key)
+                if (!f) return null
+                return <ColHeader key={key} colKey={key} label={f.label} align={isRightAligned(key) ? 'right' : 'left'} />
+              })}
+            </TableRow>
+          </TableHeader>
+          <TableBody className="divide-y">
+            {data.map((row, i) => (
+              <TableRow key={row.id ?? row.receiptLineId ?? row.invoiceLineId ?? row.supplierId ?? `${row.poId}-${row.lineProductId}-${i}`}>
+                {cols.map((key) => (
+                  <TableCell key={key} className={isRightAligned(key) ? 'text-right' : ''}>{renderCell(row, key, tabKey)}</TableCell>
+                ))}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
         {data.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">{emptyMsg}</p>}
       </div>
     )
@@ -333,7 +332,7 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
   return (
     <div className="space-y-4">
       <h1 className="text-2xl font-semibold">Purchase Statistics</h1>
-      <div className="grid grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Total Spend</p><p className="text-xl font-bold">{fmtGbp(totalSpend)}</p></div>
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Landed Cost</p><p className="text-xl font-bold">{fmtGbp(totalLanded)}</p></div>
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Qty Ordered</p><p className="text-xl font-bold">{totalOrdered}</p></div>
@@ -352,15 +351,28 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
       </div>
 
       {/* Products */}
-      {tab === 'products' && (<div className="rounded-md border overflow-hidden">
+      {tab === 'products' && (<div className="rounded-md border">
         <div className="px-3 py-1.5 bg-muted/30 border-b text-xs text-muted-foreground">{fp.length} of {products.length} products</div>
-        <div className="overflow-x-auto"><table className="w-full text-sm"><thead className="border-b bg-muted/50"><tr>
-          {visibleCols.map((k) => { const c = colR[k]; return c ? <ColHeader key={k} colKey={k} label={c.label} align={c.align === 'right' ? 'right' : 'left'} /> : null })}</tr></thead>
-          <tbody className="divide-y">{fp.map((r) => (<tr key={r.productId} className="hover:bg-muted/30">
-            {visibleCols.map((k) => { const c = colR[k]; return c ? <td key={k} className={`px-3 py-2 ${c.align === 'right' ? 'text-right' : ''}`}>{c.render(r)}</td> : null })}</tr>))}
-          </tbody><tfoot className="border-t bg-muted/30 font-medium text-sm"><tr>
-            {visibleCols.map((k) => { const c = colR[k]; return <td key={k} className={`px-3 py-2 ${c?.align === 'right' ? 'text-right' : ''}`}>{c?.footer?.() ?? ''}</td> })}</tr></tfoot>
-        </table></div></div>)}
+        <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-22rem)]">
+          <TableHeader className="bg-muted/50">
+            <TableRow>
+              {visibleCols.map((k) => { const c = colR[k]; return c ? <ColHeader key={k} colKey={k} label={c.label} align={c.align === 'right' ? 'right' : 'left'} /> : null })}
+            </TableRow>
+          </TableHeader>
+          <TableBody className="divide-y">
+            {fp.map((r) => (
+              <TableRow key={r.productId}>
+                {visibleCols.map((k) => { const c = colR[k]; return c ? <TableCell key={k} className={c.align === 'right' ? 'text-right' : ''}>{c.render(r)}</TableCell> : null })}
+              </TableRow>
+            ))}
+          </TableBody>
+          <tfoot className="border-t bg-muted/30 font-medium text-sm">
+            <tr>
+              {visibleCols.map((k) => { const c = colR[k]; return <td key={k} className={`px-3 py-2 ${c?.align === 'right' ? 'text-right' : ''}`}>{c?.footer?.() ?? ''}</td> })}
+            </tr>
+          </tfoot>
+        </Table>
+      </div>)}
 
       {/* Other tabs — generic filterable/sortable tables */}
       {tab === 'received' && <GenericTable data={filteredReceived} tabKey="received" emptyMsg="No receipts." />}

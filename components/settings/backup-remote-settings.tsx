@@ -61,8 +61,8 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
         <p className="text-xs text-muted-foreground mb-3">
           Works with AWS S3, MinIO, Backblaze B2, Cloudflare R2, DigitalOcean Spaces, etc.
         </p>
-        <div className="grid grid-cols-2 gap-3 max-w-lg">
-          <div className="space-y-1.5 col-span-2">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-lg">
+          <div className="space-y-1.5 sm:col-span-2">
             <Label className="text-xs">Endpoint (optional — leave blank for AWS S3)</Label>
             <Input value={s3State.endpoint} onChange={(e) => setS3((p) => ({ ...p, endpoint: e.target.value }))} className="h-9" placeholder="https://s3.eu-west-1.amazonaws.com" />
           </div>
@@ -82,7 +82,7 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
             <Label className="text-xs">Secret Key</Label>
             <Input type="password" value={s3State.secretKey} onChange={(e) => setS3((p) => ({ ...p, secretKey: e.target.value }))} className="h-9" autoComplete="off" />
           </div>
-          <div className="space-y-1.5 col-span-2">
+          <div className="space-y-1.5 sm:col-span-2">
             <Label className="text-xs">Path Prefix (optional)</Label>
             <Input value={s3State.prefix} onChange={(e) => setS3((p) => ({ ...p, prefix: e.target.value }))} className="h-9" placeholder="ims/backups" />
           </div>
@@ -106,7 +106,7 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
         <p className="text-xs text-muted-foreground mb-3">
           Supports password and private key (certificate) authentication.
         </p>
-        <div className="grid grid-cols-2 gap-3 max-w-lg">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-lg">
           <div className="space-y-1.5">
             <Label className="text-xs">Host</Label>
             <Input value={sftpState.host} onChange={(e) => setSftp((p) => ({ ...p, host: e.target.value }))} className="h-9" placeholder="backup.example.com" />
@@ -123,7 +123,7 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
             <Label className="text-xs">Password (if not using key)</Label>
             <Input type="password" value={sftpState.password} onChange={(e) => setSftp((p) => ({ ...p, password: e.target.value }))} className="h-9" autoComplete="off" />
           </div>
-          <div className="space-y-1.5 col-span-2">
+          <div className="space-y-1.5 sm:col-span-2">
             <Label className="text-xs">Private Key (PEM format — paste the full key including BEGIN/END lines)</Label>
             <Textarea
               value={sftpState.privateKey}
@@ -132,7 +132,7 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
               placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"
             />
           </div>
-          <div className="space-y-1.5 col-span-2">
+          <div className="space-y-1.5 sm:col-span-2">
             <Label className="text-xs">Remote Path</Label>
             <Input value={sftpState.path} onChange={(e) => setSftp((p) => ({ ...p, path: e.target.value }))} className="h-9" placeholder="/backups/ims" />
           </div>

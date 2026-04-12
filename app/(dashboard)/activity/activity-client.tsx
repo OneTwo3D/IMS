@@ -16,6 +16,7 @@ import {
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { getActivityLogs, type ActivityLogRow } from '@/app/actions/activity-log'
 
 const LEVEL_TABS = [
@@ -204,89 +205,87 @@ export function ActivityClient({ initialRows, initialTotal, availableTags }: Pro
       </div>
 
       {/* Table */}
-      <div className="rounded-lg border overflow-hidden">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b bg-muted/50">
-              <th className="text-left font-medium px-3 py-2 w-8" />
-              <th className="text-left font-medium px-3 py-2 w-40">Time</th>
-              <th className="text-left font-medium px-3 py-2 w-20">Level</th>
-              <th className="text-left font-medium px-3 py-2 w-24">Tag</th>
-              <th className="text-left font-medium px-3 py-2">Description</th>
-              <th className="text-left font-medium px-3 py-2 w-32">User</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length === 0 ? (
-              <tr>
-                <td colSpan={6} className="px-3 py-8 text-center text-muted-foreground">
-                  No activity log entries found.
-                </td>
-              </tr>
-            ) : (
-              rows.map((row) => (
-                <>
-                  <tr
-                    key={row.id}
-                    className={`border-b hover:bg-muted/30 transition-colors cursor-pointer ${LEVEL_ROW_STYLE[row.level] ?? ''}`}
-                    onClick={() => setExpandedId(expandedId === row.id ? null : row.id)}
-                  >
-                    <td className="px-3 py-2">
-                      {row.metadata ? (
-                        expandedId === row.id ? (
-                          <ChevronUp className="h-3.5 w-3.5 text-muted-foreground" />
-                        ) : (
-                          <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
-                        )
-                      ) : null}
-                    </td>
-                    <td className="px-3 py-2 text-muted-foreground whitespace-nowrap">
-                      <span className="flex items-center gap-1.5">
-                        <Clock className="h-3 w-3" />
-                        <span title={formatTime(row.createdAt)}>{relativeTime(row.createdAt)}</span>
-                      </span>
-                    </td>
-                    <td className="px-3 py-2">
-                      <span className="flex items-center gap-1">
-                        {LEVEL_ICON[row.level]}
-                        <span className="text-xs">{row.level}</span>
-                      </span>
-                    </td>
-                    <td className="px-3 py-2">
-                      <Badge variant="secondary" className={`text-xs font-normal capitalize ${TAG_COLOURS[row.tag] ?? ''}`}>
-                        {row.tag}
-                      </Badge>
-                    </td>
-                    <td className="px-3 py-2">{row.description}</td>
-                    <td className="px-3 py-2 text-muted-foreground">{row.userName ?? 'System'}</td>
-                  </tr>
-                  {expandedId === row.id && row.metadata && (
-                    <tr key={`${row.id}-meta`} className="border-b bg-muted/20">
-                      <td />
-                      <td colSpan={5} className="px-3 py-2">
-                        <div className="text-xs space-y-1">
-                          <p className="font-medium text-muted-foreground">Details</p>
-                          <div className="grid grid-cols-2 gap-x-6 gap-y-0.5">
-                            <p><span className="text-muted-foreground">Entity type:</span> {row.entityType.replace(/_/g, ' ').toLowerCase()}</p>
-                            {row.entityId && <p><span className="text-muted-foreground">Entity ID:</span> {row.entityId}</p>}
-                            <p><span className="text-muted-foreground">Action:</span> {row.action}</p>
-                          </div>
-                          {typeof row.metadata === 'object' && row.metadata !== null && Object.keys(row.metadata).length > 0 && (
-                            <div className="mt-1.5">
-                              <p className="font-medium text-muted-foreground mb-0.5">Metadata</p>
-                              <pre className="text-xs bg-muted rounded p-2 overflow-x-auto max-h-40">{JSON.stringify(row.metadata, null, 2)}</pre>
-                            </div>
-                          )}
+      <Table className="rounded-lg border min-w-[600px]">
+        <TableHeader>
+          <TableRow className="bg-muted/50">
+            <TableHead className="w-8" />
+            <TableHead className="w-40">Time</TableHead>
+            <TableHead className="w-20">Level</TableHead>
+            <TableHead className="w-24">Tag</TableHead>
+            <TableHead>Description</TableHead>
+            <TableHead className="w-32">User</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {rows.length === 0 ? (
+            <TableRow>
+              <TableCell colSpan={6} className="py-8 text-center text-muted-foreground">
+                No activity log entries found.
+              </TableCell>
+            </TableRow>
+          ) : (
+            rows.map((row) => (
+              <>
+                <TableRow
+                  key={row.id}
+                  className={`cursor-pointer ${LEVEL_ROW_STYLE[row.level] ?? ''}`}
+                  onClick={() => setExpandedId(expandedId === row.id ? null : row.id)}
+                >
+                  <TableCell>
+                    {row.metadata ? (
+                      expandedId === row.id ? (
+                        <ChevronUp className="h-3.5 w-3.5 text-muted-foreground" />
+                      ) : (
+                        <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+                      )
+                    ) : null}
+                  </TableCell>
+                  <TableCell className="text-muted-foreground whitespace-nowrap">
+                    <span className="flex items-center gap-1.5">
+                      <Clock className="h-3 w-3" />
+                      <span title={formatTime(row.createdAt)}>{relativeTime(row.createdAt)}</span>
+                    </span>
+                  </TableCell>
+                  <TableCell>
+                    <span className="flex items-center gap-1">
+                      {LEVEL_ICON[row.level]}
+                      <span className="text-xs">{row.level}</span>
+                    </span>
+                  </TableCell>
+                  <TableCell>
+                    <Badge variant="secondary" className={`text-xs font-normal capitalize ${TAG_COLOURS[row.tag] ?? ''}`}>
+                      {row.tag}
+                    </Badge>
+                  </TableCell>
+                  <TableCell>{row.description}</TableCell>
+                  <TableCell className="text-muted-foreground">{row.userName ?? 'System'}</TableCell>
+                </TableRow>
+                {expandedId === row.id && row.metadata && (
+                  <TableRow key={`${row.id}-meta`} className="bg-muted/20">
+                    <TableCell />
+                    <TableCell colSpan={5}>
+                      <div className="text-xs space-y-1">
+                        <p className="font-medium text-muted-foreground">Details</p>
+                        <div className="grid grid-cols-2 gap-x-6 gap-y-0.5">
+                          <p><span className="text-muted-foreground">Entity type:</span> {row.entityType.replace(/_/g, ' ').toLowerCase()}</p>
+                          {row.entityId && <p><span className="text-muted-foreground">Entity ID:</span> {row.entityId}</p>}
+                          <p><span className="text-muted-foreground">Action:</span> {row.action}</p>
                         </div>
-                      </td>
-                    </tr>
-                  )}
-                </>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
+                        {typeof row.metadata === 'object' && row.metadata !== null && Object.keys(row.metadata).length > 0 && (
+                          <div className="mt-1.5">
+                            <p className="font-medium text-muted-foreground mb-0.5">Metadata</p>
+                            <pre className="text-xs bg-muted rounded p-2 overflow-x-auto max-h-40">{JSON.stringify(row.metadata, null, 2)}</pre>
+                          </div>
+                        )}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                )}
+              </>
+            ))
+          )}
+        </TableBody>
+      </Table>
 
       {/* Pagination */}
       {totalPages > 1 && (

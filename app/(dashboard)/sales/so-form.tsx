@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createSalesOrder } from '@/app/actions/sales'
 import { createCustomer, type CustomerRow, type AddressData } from '@/app/actions/customers'
 import type { ProductRow } from '@/app/actions/products'
@@ -548,7 +549,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
 
   return (
     <Dialog open onOpenChange={() => {}}>
-      <DialogContent showCloseButton={false} className="w-[80vw] max-w-[80vw] sm:max-w-[80vw] max-h-[90vh] overflow-y-auto">
+      <DialogContent showCloseButton={false} className="w-[95vw] sm:w-[80vw] max-w-[95vw] sm:max-w-[80vw] max-h-[90vh] overflow-y-auto">
         <DialogHeader>
           <DialogTitle>New Sales Order</DialogTitle>
         </DialogHeader>
@@ -557,7 +558,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
           {/* Customer + Order details */}
           <div className="rounded-md border p-4 space-y-4">
             <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">Order Details</h2>
-            <div className="grid grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               {/* Customer */}
               <div className="space-y-1.5">
                 <Label>Customer *</Label>
@@ -637,7 +638,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
             </div>
             {/* Addresses */}
             {customerId && (
-              <div className="grid grid-cols-2 gap-4 pt-2 border-t">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2 border-t">
                 <div className="text-xs">
                   <span className="text-muted-foreground">Billing:</span> {billingAddr || '—'}
                 </div>
@@ -652,23 +653,23 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
           <div className="rounded-md border p-4 space-y-3">
             <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">Line Items</h2>
             {lines.length > 0 && (
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b text-muted-foreground text-xs">
-                    <th className="pb-2 pr-3 text-left font-medium">Product</th>
-                    {warehouseId && <th className="pb-2 pr-3 text-center font-medium w-20">Available</th>}
-                    <th className="pb-2 pr-3 text-center font-medium w-16">Qty</th>
-                    <th className="pb-2 pr-3 text-center font-medium w-28">
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="text-xs">Product</TableHead>
+                    {warehouseId && <TableHead className="text-xs text-center w-20">Available</TableHead>}
+                    <TableHead className="text-xs text-center w-16">Qty</TableHead>
+                    <TableHead className="text-xs text-center w-28">
                       Price ({sym}){pricesIncludeVat ? ' incl.' : ''}
-                    </th>
-                    <th className="pb-2 pr-3 text-center font-medium w-24">Discount</th>
-                    <th className="pb-2 pr-3 text-center font-medium w-32">VAT</th>
-                    <th className="pb-2 pr-3 text-right font-medium w-24">Total ({sym})</th>
-                    <th className="pb-2 pr-3 text-right font-medium w-20">COGS (£)</th>
-                    <th className="w-8" />
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
+                    </TableHead>
+                    <TableHead className="text-xs text-center w-24">Discount</TableHead>
+                    <TableHead className="text-xs text-center w-32">VAT</TableHead>
+                    <TableHead className="text-xs text-right w-24">Total ({sym})</TableHead>
+                    <TableHead className="text-xs text-right w-20">COGS (£)</TableHead>
+                    <TableHead className="w-8" />
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
                   {lines.map((line) => {
                     const stock = stockAt(line.productId)
                     const grossTotal = line.qty * line.unitPrice
@@ -676,34 +677,34 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                     const lineTotal = grossTotal - discAmount
                     const cogs = (avgCogs[line.productId] ?? 0) * line.qty
                     return (
-                      <tr key={line.key}>
-                        <td className="py-2 pr-3">
+                      <TableRow key={line.key}>
+                        <TableCell>
                           <ProductLink productId={line.productId} sku={line.sku} name={line.name} />
-                        </td>
+                        </TableCell>
                         {warehouseId && (
-                          <td className={`py-2 pr-3 text-right text-xs tabular-nums ${stock.available < line.qty ? 'text-destructive font-medium' : 'text-muted-foreground'}`}>
+                          <TableCell className={`text-right text-xs tabular-nums ${stock.available < line.qty ? 'text-destructive font-medium' : 'text-muted-foreground'}`}>
                             {stock.available}
-                          </td>
+                          </TableCell>
                         )}
-                        <td className="py-2 pr-3">
+                        <TableCell>
                           <Input type="number" min="1" step="1" value={line.qty}
                             onChange={(e) => setLines((p) => p.map((l) => l.key === line.key ? { ...l, qty: Number(e.target.value) || 0 } : l))}
                             className="h-7 text-sm text-right w-16 ml-auto" />
-                        </td>
-                        <td className="py-2 pr-3">
+                        </TableCell>
+                        <TableCell>
                           <Input type="number" min="0" step="0.01" value={line.unitPrice}
                             onChange={(e) => setLines((p) => p.map((l) => l.key === line.key ? { ...l, unitPrice: Number(e.target.value) || 0 } : l))}
                             className="h-7 text-sm text-right w-28 ml-auto font-mono" />
-                        </td>
-                        <td className="py-2 pr-3">
+                        </TableCell>
+                        <TableCell>
                           <Input
                             value={line.discount}
                             onChange={(e) => setLines((p) => p.map((l) => l.key === line.key ? { ...l, discount: e.target.value } : l))}
                             placeholder={`${sym} or %`}
                             className={`h-7 text-sm text-right w-24 ml-auto font-mono ${discAmount > 0 ? 'text-destructive' : ''}`}
                           />
-                        </td>
-                        <td className="py-2 pr-3">
+                        </TableCell>
+                        <TableCell>
                           <div className="flex items-center justify-end gap-1">
                             {line.taxRateWarning && (
                               <span title={line.taxRateWarning} className="text-yellow-600">
@@ -722,19 +723,19 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                               ))}
                             </select>
                           </div>
-                        </td>
-                        <td className="py-2 pr-3 text-right font-mono text-xs">{money(lineTotal)}</td>
-                        <td className="py-2 pr-3 text-right font-mono text-xs text-muted-foreground">{formatMoney(cogs, '£')}</td>
-                        <td className="py-2">
+                        </TableCell>
+                        <TableCell className="text-right font-mono text-xs">{money(lineTotal)}</TableCell>
+                        <TableCell className="text-right font-mono text-xs text-muted-foreground">{formatMoney(cogs, '£')}</TableCell>
+                        <TableCell>
                           <button type="button" onClick={() => setLines((p) => p.filter((l) => l.key !== line.key))} className="text-muted-foreground hover:text-destructive">
                             <X className="h-4 w-4" />
                           </button>
-                        </td>
-                      </tr>
+                        </TableCell>
+                      </TableRow>
                     )
                   })}
-                </tbody>
-              </table>
+                </TableBody>
+              </Table>
             )}
             {/* Product search */}
             <div className="relative">

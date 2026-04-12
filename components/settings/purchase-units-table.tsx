@@ -13,6 +13,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/ui/dialog'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createPurchaseUnit, updatePurchaseUnit, type PurchaseUnitRow } from '@/app/actions/settings'
 
 type Props = { units: PurchaseUnitRow[] }
@@ -64,7 +65,7 @@ function PurchaseUnitFormDialog({
             <Label>Name *</Label>
             <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. Box of 100, Roll (1km), Pallet of 48" className="h-9" />
           </div>
-          <div className="grid grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
             <div className="space-y-1.5">
               <Label>Abbreviation *</Label>
               <Input value={abbreviation} onChange={(e) => setAbbreviation(e.target.value)} placeholder="e.g. box, roll, plt" className="h-9 font-mono" />
@@ -128,51 +129,49 @@ export function PurchaseUnitsTable({ units }: Props) {
       {units.length === 0 ? (
         <p className="text-sm text-muted-foreground py-2">No purchase units defined yet.</p>
       ) : (
-        <div className="rounded-md border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="border-b bg-muted/50">
-              <tr>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Name</th>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Abbr.</th>
-                <th className="px-4 py-2 text-right font-medium text-muted-foreground text-xs">Conversion Factor</th>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Example</th>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Status</th>
-                <th className="w-16" />
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {[...active, ...inactive].map((u) => (
-                <tr key={u.id} className={`hover:bg-muted/30 ${!u.active ? 'opacity-50' : ''}`}>
-                  <td className="px-4 py-2 font-medium">{u.name}</td>
-                  <td className="px-4 py-2 font-mono text-xs">{u.abbreviation}</td>
-                  <td className="px-4 py-2 text-right font-mono text-xs">{u.conversionFactor}</td>
-                  <td className="px-4 py-2 text-xs text-muted-foreground">
-                    1 {u.abbreviation} = {u.conversionFactor} {u.stockUnitName}
-                  </td>
-                  <td className="px-4 py-2">
-                    <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${
-                      u.active
-                        ? 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200'
-                        : 'bg-muted text-muted-foreground border-border'
-                    }`}>
-                      {u.active ? 'Active' : 'Inactive'}
-                    </span>
-                  </td>
-                  <td className="px-4 py-2">
-                    <div className="flex items-center gap-1 justify-end">
-                      <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setEditing(u)}>
-                        <Pencil className="h-3 w-3" />
-                      </Button>
-                      <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => handleToggle(u)} disabled={isPending}>
-                        {u.active ? <X className="h-3 w-3 text-muted-foreground" /> : <Check className="h-3 w-3 text-muted-foreground" />}
-                      </Button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Table className="rounded-md border">
+          <TableHeader className="bg-muted/50">
+            <TableRow>
+              <TableHead className="text-xs">Name</TableHead>
+              <TableHead className="text-xs">Abbr.</TableHead>
+              <TableHead className="text-xs text-right">Conversion Factor</TableHead>
+              <TableHead className="text-xs">Example</TableHead>
+              <TableHead className="text-xs">Status</TableHead>
+              <TableHead className="w-16" />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {[...active, ...inactive].map((u) => (
+              <TableRow key={u.id} className={!u.active ? 'opacity-50' : ''}>
+                <TableCell className="font-medium">{u.name}</TableCell>
+                <TableCell className="font-mono text-xs">{u.abbreviation}</TableCell>
+                <TableCell className="text-right font-mono text-xs">{u.conversionFactor}</TableCell>
+                <TableCell className="text-xs text-muted-foreground">
+                  1 {u.abbreviation} = {u.conversionFactor} {u.stockUnitName}
+                </TableCell>
+                <TableCell>
+                  <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${
+                    u.active
+                      ? 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200'
+                      : 'bg-muted text-muted-foreground border-border'
+                  }`}>
+                    {u.active ? 'Active' : 'Inactive'}
+                  </span>
+                </TableCell>
+                <TableCell>
+                  <div className="flex items-center gap-1 justify-end">
+                    <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setEditing(u)}>
+                      <Pencil className="h-3 w-3" />
+                    </Button>
+                    <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => handleToggle(u)} disabled={isPending}>
+                      {u.active ? <X className="h-3 w-3 text-muted-foreground" /> : <Check className="h-3 w-3 text-muted-foreground" />}
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
       )}
 
       {editing !== undefined && (

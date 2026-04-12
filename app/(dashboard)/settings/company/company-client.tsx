@@ -181,7 +181,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
 
   function coField(key: keyof OrganisationData, label: string, opts?: { type?: string; span?: number }) {
     return (
-      <div className={`space-y-1.5 ${opts?.span === 2 ? 'col-span-2' : ''}`}>
+      <div className={`space-y-1.5 ${opts?.span === 2 ? 'sm:col-span-2' : ''}`}>
         <Label className="text-xs">{label}</Label>
         <Input
           type={opts?.type ?? 'text'}
@@ -298,7 +298,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
           </div>
 
           <h3 className="text-sm font-medium mb-3">Company Information</h3>
-          <div className="grid grid-cols-2 gap-3 mb-6">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-6">
             {coField('name', 'Company Name')}
             {coField('legalName', 'Legal Name')}
             {coField('vatNumber', 'VAT Number')}
@@ -306,7 +306,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
           </div>
 
           <h3 className="text-sm font-medium mb-3">Address</h3>
-          <div className="grid grid-cols-2 gap-3 mb-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 mb-4">
             {coField('addressLine1', 'Address Line 1', { span: 2 })}
             {coField('addressLine2', 'Address Line 2', { span: 2 })}
             {coField('city', 'City')}
@@ -316,7 +316,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
           </div>
 
           <h3 className="text-sm font-medium mb-3">Contact</h3>
-          <div className="grid grid-cols-3 gap-3 mb-4">
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 mb-4">
             {coField('phone', 'Phone')}
             {coField('email', 'Email', { type: 'email' })}
             {coField('website', 'Website')}
@@ -332,7 +332,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
           <p className="text-sm text-muted-foreground mb-4">
             These colours are used on PDF documents (invoices, purchase orders, etc).
           </p>
-          <div className="grid grid-cols-2 gap-4 max-w-md">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 max-w-md">
             <div className="space-y-1.5">
               <Label className="text-xs">Primary Colour</Label>
               <div className="flex items-center gap-2">
@@ -534,8 +534,8 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
           <p className="text-sm text-muted-foreground mb-4">
             SMTP settings for sending documents (invoices, POs, RFQs) by email.
           </p>
-          <div className="grid grid-cols-2 gap-3 max-w-lg">
-            <div className="space-y-1.5 col-span-2">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-lg">
+            <div className="space-y-1.5 sm:col-span-2">
               <Label className="text-xs">SMTP Host</Label>
               <Input value={em.smtp_host} onChange={(e) => setEm((p) => ({ ...p, smtp_host: e.target.value }))} className="h-9" placeholder="smtp.example.com" />
             </div>
@@ -563,7 +563,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
               <Label className="text-xs">Password</Label>
               <Input type="password" value={em.smtp_pass} onChange={(e) => setEm((p) => ({ ...p, smtp_pass: e.target.value }))} className="h-9" autoComplete="off" />
             </div>
-            <div className="col-span-2 border-t pt-3 mt-1" />
+            <div className="sm:col-span-2 border-t pt-3 mt-1" />
             <div className="space-y-1.5">
               <Label className="text-xs">From Name</Label>
               <Input value={em.from_name} onChange={(e) => setEm((p) => ({ ...p, from_name: e.target.value }))} className="h-9" placeholder="onetwoInventory" />
@@ -572,12 +572,12 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
               <Label className="text-xs">From Email</Label>
               <Input type="email" value={em.from_email} onChange={(e) => setEm((p) => ({ ...p, from_email: e.target.value }))} className="h-9" placeholder="accounts@example.com" />
             </div>
-            <div className="space-y-1.5 col-span-2">
+            <div className="space-y-1.5 sm:col-span-2">
               <Label className="text-xs">Reply-To</Label>
               <Input type="email" value={em.reply_to} onChange={(e) => setEm((p) => ({ ...p, reply_to: e.target.value }))} className="h-9" placeholder="Optional" />
             </div>
-            <div className="col-span-2 border-t pt-3 mt-1" />
-            <p className="col-span-2 text-xs text-muted-foreground">Department email addresses — shown on documents as the contact for queries.</p>
+            <div className="sm:col-span-2 border-t pt-3 mt-1" />
+            <p className="sm:col-span-2 text-xs text-muted-foreground">Department email addresses — shown on documents as the contact for queries.</p>
             <div className="space-y-1.5">
               <Label className="text-xs">Sales Email</Label>
               <Input type="email" value={em.sales_email} onChange={(e) => setEm((p) => ({ ...p, sales_email: e.target.value }))} className="h-9" placeholder="sales@example.com" />
@@ -588,7 +588,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
               <Input type="email" value={em.purchases_email} onChange={(e) => setEm((p) => ({ ...p, purchases_email: e.target.value }))} className="h-9" placeholder="purchasing@example.com" />
               <p className="text-xs text-muted-foreground">Shown on purchase orders and RFQs</p>
             </div>
-            <div className="space-y-1.5 col-span-2">
+            <div className="space-y-1.5 sm:col-span-2">
               <Label className="text-xs">Support Email</Label>
               <Input type="email" value={em.support_email} onChange={(e) => setEm((p) => ({ ...p, support_email: e.target.value }))} className="h-9" placeholder="support@example.com" />
               <p className="text-xs text-muted-foreground">General support contact</p>
@@ -643,7 +643,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
 
                 {isEditing ? (
                   <div className="space-y-3">
-                    <div className="grid grid-cols-2 gap-3">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       <div className="space-y-1.5">
                         <Label className="text-xs">Header Note</Label>
                         <Textarea
@@ -663,7 +663,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
                         />
                       </div>
                     </div>
-                    <div className="grid grid-cols-2 gap-3">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                       <div className="space-y-1.5">
                         <Label className="text-xs">Terms &amp; Conditions</Label>
                         <Textarea
@@ -734,16 +734,18 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
 
 function SaveButton({ onClick, pending, saved }: { onClick: () => void; pending: boolean; saved: boolean }) {
   return (
-    <div className="flex items-center gap-2">
-      <Button size="sm" onClick={onClick} disabled={pending}>
-        {pending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
-        Save Changes
-      </Button>
-      {saved && (
-        <span className="text-sm text-green-600 flex items-center gap-1">
-          <Check className="h-3 w-3" />Saved
-        </span>
-      )}
+    <div className="sticky bottom-0 z-10 bg-background/95 backdrop-blur border-t py-3 -mx-4 px-4 -mb-4 mt-4">
+      <div className="flex items-center gap-2">
+        <Button size="sm" onClick={onClick} disabled={pending}>
+          {pending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
+          Save Changes
+        </Button>
+        {saved && (
+          <span className="text-sm text-green-600 flex items-center gap-1">
+            <Check className="h-3 w-3" />Saved
+          </span>
+        )}
+      </div>
     </div>
   )
 }

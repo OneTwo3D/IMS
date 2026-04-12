@@ -7,6 +7,7 @@ import { TrendingUp, TrendingDown, Minus, Loader2 } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { ProductLink } from '@/components/inventory/product-link'
 import type { KpiSummary, ChartPoint, TopProduct, RecentOrder, IncomingPO, Period, CompareMode } from '@/app/actions/dashboard'
 import { getDashboardData } from '@/app/actions/dashboard'
@@ -102,71 +103,73 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
   ]
 
   return (
-    <div className="space-y-5">
+    <div className="space-y-4 md:space-y-5">
       {/* Header */}
-      <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Dashboard</h1>
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-2">
+          <h1 className="text-xl sm:text-2xl font-semibold">Dashboard</h1>
           {isPending && <Loader2 className="h-4 w-4 animate-spin text-muted-foreground" />}
-          <select value={period} onChange={(e) => handlePeriodChange(e.target.value as Period)} className="h-8 rounded-md border border-input bg-background px-2 text-xs">
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <select value={period} onChange={(e) => handlePeriodChange(e.target.value as Period)} className="h-8 rounded-md border border-input bg-background px-2 text-xs flex-1 sm:flex-none min-w-0">
             {PERIOD_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
-          {period === 'custom' && (
-            <>
-              <Input type="date" value={customFrom} onChange={(e) => setCustomFrom(e.target.value)} className="h-8 text-xs w-36" />
-              <span className="text-xs text-muted-foreground">to</span>
-              <Input type="date" value={customTo} onChange={(e) => setCustomTo(e.target.value)} className="h-8 text-xs w-36" />
-              <Button size="sm" variant="outline" className="h-8 text-xs" onClick={handleCustomApply}>Apply</Button>
-            </>
-          )}
-          <select value={compare} onChange={(e) => handleCompareChange(e.target.value as CompareMode)} className="h-8 rounded-md border border-input bg-background px-2 text-xs">
+          <select value={compare} onChange={(e) => handleCompareChange(e.target.value as CompareMode)} className="h-8 rounded-md border border-input bg-background px-2 text-xs flex-1 sm:flex-none min-w-0">
             {COMPARE_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
           </select>
+          {period === 'custom' && (
+            <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
+              <Input type="date" value={customFrom} onChange={(e) => setCustomFrom(e.target.value)} className="h-8 text-xs flex-1 sm:w-36 sm:flex-none" />
+              <span className="text-xs text-muted-foreground">to</span>
+              <Input type="date" value={customTo} onChange={(e) => setCustomTo(e.target.value)} className="h-8 text-xs flex-1 sm:w-36 sm:flex-none" />
+              <Button size="sm" variant="outline" className="h-8 text-xs" onClick={handleCustomApply}>Apply</Button>
+            </div>
+          )}
         </div>
       </div>
 
-      {/* KPI cards — 4 across like the reference */}
-      <div className="grid grid-cols-4 gap-4">
-        <Card className="p-4">
+      {/* KPI cards — 2 cols mobile, 4 cols desktop */}
+      <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 sm:gap-4">
+        <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
             <p className="text-xs text-muted-foreground">Gross Sales</p>
             <ChangeBadge current={kpi.grossSalesCurrent} previous={kpi.grossSalesComparison} />
           </div>
-          <p className="text-2xl font-bold mt-1">{fmtGbp(kpi.grossSalesCurrent)}</p>
-          <p className="text-[11px] text-muted-foreground mt-0.5">{kpi.ordersCurrent} orders &middot; avg {fmtGbpFull(kpi.avgOrderValue)}</p>
+          <p className="text-xl sm:text-2xl font-bold mt-1">{fmtGbp(kpi.grossSalesCurrent)}</p>
+          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">{kpi.ordersCurrent} orders &middot; avg {fmtGbpFull(kpi.avgOrderValue)}</p>
         </Card>
-        <Card className="p-4">
+        <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
             <p className="text-xs text-muted-foreground">Net Sales</p>
             <ChangeBadge current={kpi.netSalesCurrent} previous={kpi.netSalesComparison} />
           </div>
-          <p className="text-2xl font-bold mt-1">{fmtGbp(kpi.netSalesCurrent)}</p>
-          <p className="text-[11px] text-muted-foreground mt-0.5">{kpi.discountsCurrent > 0 ? `${fmtGbp(kpi.discountsCurrent)} discounts` : 'No discounts'} &middot; {kpi.refundsCurrent > 0 ? `${fmtGbp(kpi.refundsCurrent)} refunds` : 'No refunds'}</p>
+          <p className="text-xl sm:text-2xl font-bold mt-1">{fmtGbp(kpi.netSalesCurrent)}</p>
+          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">{kpi.discountsCurrent > 0 ? `${fmtGbp(kpi.discountsCurrent)} discounts` : 'No discounts'} &middot; {kpi.refundsCurrent > 0 ? `${fmtGbp(kpi.refundsCurrent)} refunds` : 'No refunds'}</p>
         </Card>
-        <Card className="p-4">
+        <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
             <p className="text-xs text-muted-foreground">COGS</p>
             <ChangeBadge current={kpi.cogsCurrent} previous={kpi.cogsComparison} />
           </div>
-          <p className="text-2xl font-bold mt-1">{fmtGbp(kpi.cogsCurrent)}</p>
-          <p className="text-[11px] text-muted-foreground mt-0.5">Profit: {fmtGbp(kpi.profitCurrent)}</p>
+          <p className="text-xl sm:text-2xl font-bold mt-1">{fmtGbp(kpi.cogsCurrent)}</p>
+          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">Profit: {fmtGbp(kpi.profitCurrent)}</p>
         </Card>
-        <Card className="p-4">
+        <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
             <p className="text-xs text-muted-foreground">Margin %</p>
             <ChangeBadge current={kpi.marginCurrent} previous={kpi.marginComparison} />
           </div>
-          <p className="text-2xl font-bold mt-1">{kpi.marginCurrent}%</p>
-          <p className="text-[11px] text-muted-foreground mt-0.5">Comp: {kpi.marginComparison}%</p>
+          <p className="text-xl sm:text-2xl font-bold mt-1">{kpi.marginCurrent}%</p>
+          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">Comp: {kpi.marginComparison}%</p>
         </Card>
       </div>
 
-      {/* 3 Charts row — Net Sales, COGS, Margin % */}
-      <div className="grid grid-cols-3 gap-4">
+      {/* 3 Charts row — stack on mobile */}
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 sm:gap-4">
         {/* Net Sales — bar (current) + line (comparison) */}
-        <Card className="p-4">
+        <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">Net Sales</h2>
-          <div className="h-56">
+          <div className="h-48 sm:h-56">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
@@ -181,9 +184,9 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         </Card>
 
         {/* COGS — multi-line (current + comparison) */}
-        <Card className="p-4">
+        <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">COGS</h2>
-          <div className="h-56">
+          <div className="h-48 sm:h-56">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
@@ -199,9 +202,9 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         </Card>
 
         {/* Margin % — line (current + comparison) */}
-        <Card className="p-4">
+        <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">Margin %</h2>
-          <div className="h-56">
+          <div className="h-48 sm:h-56">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
@@ -218,11 +221,11 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
       </div>
 
       {/* Bottom row: Cash Bridge, Best Sellers, Incoming POs */}
-      <div className="grid grid-cols-3 gap-4">
+      <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 sm:gap-4">
         {/* Cash Bridge */}
-        <Card className="p-4">
+        <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">Cash Bridge</h2>
-          <div className="h-56">
+          <div className="h-48 sm:h-56">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={bridge} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
@@ -239,7 +242,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         </Card>
 
         {/* Best Sellers */}
-        <Card className="p-4">
+        <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between mb-2">
             <h2 className="text-sm font-semibold">Best Sellers</h2>
             <Link href="/analytics/sales-stats" className="text-xs text-primary hover:underline">View all</Link>
@@ -260,9 +263,9 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         </Card>
 
         {/* Incoming POs */}
-        <Card className="p-4">
+        <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between mb-2">
-            <h2 className="text-sm font-semibold">Incoming Purchase Orders</h2>
+            <h2 className="text-sm font-semibold">Incoming POs</h2>
             <Link href="/purchase-orders" className="text-xs text-primary hover:underline">View all</Link>
           </div>
           <div className="space-y-2.5">
@@ -288,8 +291,8 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         </Card>
       </div>
 
-      {/* Operational KPIs row */}
-      <div className="grid grid-cols-6 gap-3">
+      {/* Operational KPIs row — 2 cols mobile, 3 cols sm, 6 cols lg */}
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-2 sm:gap-3">
         <Card className="p-3 text-center">
           <p className="text-[10px] text-muted-foreground">Open Orders</p>
           <p className="text-lg font-bold">{kpi.pendingSalesOrders}</p>
@@ -323,33 +326,59 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
       </div>
 
       {/* Recent orders */}
-      <Card className="p-4">
+      <Card className="p-3 sm:p-4">
         <div className="flex items-center justify-between mb-2">
           <h2 className="text-sm font-semibold">Recent Orders</h2>
           <Link href="/sales" className="text-xs text-primary hover:underline">View all</Link>
         </div>
-        <table className="w-full text-sm">
-          <thead className="border-b bg-muted/50">
-            <tr>
-              <th className="px-3 py-1.5 text-left text-xs font-medium text-muted-foreground">Order</th>
-              <th className="px-3 py-1.5 text-left text-xs font-medium text-muted-foreground">Customer</th>
-              <th className="px-3 py-1.5 text-right text-xs font-medium text-muted-foreground">Total</th>
-              <th className="px-3 py-1.5 text-left text-xs font-medium text-muted-foreground">Status</th>
-              <th className="px-3 py-1.5 text-left text-xs font-medium text-muted-foreground">Date</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y">
-            {recentOrders.map((o) => (
-              <tr key={o.id} className="hover:bg-muted/30">
-                <td className="px-3 py-1.5 font-mono text-xs"><Link href={`/sales/${o.id}`} className="hover:underline">{o.orderNumber}</Link></td>
-                <td className="px-3 py-1.5 text-xs">{o.customerName}</td>
-                <td className="px-3 py-1.5 text-right tabular-nums text-xs font-mono">{fmtGbpFull(o.totalGbp)}</td>
-                <td className="px-3 py-1.5"><span className={`inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium ${STATUS_COLORS[o.status] ?? 'bg-gray-100 text-gray-700'}`}>{o.status}</span></td>
-                <td className="px-3 py-1.5 text-xs text-muted-foreground">{fmtDateShort(o.createdAt)}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+
+        {/* Desktop table */}
+        <div className="hidden md:block">
+          <Table>
+            <TableHeader className="bg-muted/50">
+              <TableRow>
+                <TableHead className="py-1.5 text-xs">Order</TableHead>
+                <TableHead className="py-1.5 text-xs">Customer</TableHead>
+                <TableHead className="py-1.5 text-xs text-right">Total</TableHead>
+                <TableHead className="py-1.5 text-xs">Status</TableHead>
+                <TableHead className="py-1.5 text-xs">Date</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {recentOrders.map((o) => (
+                <TableRow key={o.id}>
+                  <TableCell className="py-1.5 font-mono text-xs"><Link href={`/sales/${o.id}`} className="hover:underline">{o.orderNumber}</Link></TableCell>
+                  <TableCell className="py-1.5 text-xs">{o.customerName}</TableCell>
+                  <TableCell className="py-1.5 text-right tabular-nums text-xs font-mono">{fmtGbpFull(o.totalGbp)}</TableCell>
+                  <TableCell className="py-1.5"><span className={`inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium ${STATUS_COLORS[o.status] ?? 'bg-gray-100 text-gray-700'}`}>{o.status}</span></TableCell>
+                  <TableCell className="py-1.5 text-xs text-muted-foreground">{fmtDateShort(o.createdAt)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+
+        {/* Mobile card list */}
+        <div className="md:hidden divide-y">
+          {recentOrders.map((o) => (
+            <Link
+              key={o.id}
+              href={`/sales/${o.id}`}
+              className="flex items-start justify-between gap-3 py-2.5 active:bg-muted/30"
+            >
+              <div className="min-w-0 flex-1">
+                <div className="flex items-center gap-2">
+                  <span className="font-mono text-xs font-medium truncate">{o.orderNumber}</span>
+                  <span className={`inline-flex shrink-0 items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium ${STATUS_COLORS[o.status] ?? 'bg-gray-100 text-gray-700'}`}>{o.status}</span>
+                </div>
+                <p className="text-xs text-muted-foreground truncate mt-0.5">{o.customerName}</p>
+                <p className="text-[10px] text-muted-foreground mt-0.5">{fmtDateShort(o.createdAt)}</p>
+              </div>
+              <span className="tabular-nums text-sm font-mono font-medium shrink-0">{fmtGbpFull(o.totalGbp)}</span>
+            </Link>
+          ))}
+        </div>
+
         {recentOrders.length === 0 && <p className="text-center text-sm text-muted-foreground py-4">No orders yet.</p>}
       </Card>
     </div>

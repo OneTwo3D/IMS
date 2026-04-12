@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createUser, updateUser, type UserRow } from '@/app/actions/users'
 
 type SupplierOption = { id: string; name: string }
@@ -96,49 +97,49 @@ export function UsersClient({ users, suppliers }: Props) {
       </div>
 
       {/* Users table */}
-      <div className="rounded-md border overflow-hidden">
-        <table className="w-full text-sm">
-          <thead className="bg-muted/50 border-b"><tr>
-            <th className="px-4 py-2 text-left text-xs font-medium text-muted-foreground">Name</th>
-            <th className="px-4 py-2 text-left text-xs font-medium text-muted-foreground">Email</th>
-            <th className="px-4 py-2 text-left text-xs font-medium text-muted-foreground">Role</th>
-            <th className="px-4 py-2 text-left text-xs font-medium text-muted-foreground">Supplier</th>
-            <th className="px-4 py-2 text-left text-xs font-medium text-muted-foreground">Status</th>
-            <th className="px-4 py-2 text-left text-xs font-medium text-muted-foreground">2FA</th>
-            <th className="px-4 py-2 text-left text-xs font-medium text-muted-foreground">Last Login</th>
-            <th className="px-4 py-2 w-10" />
-          </tr></thead>
-          <tbody className="divide-y">
-            {users.map((u) => (
-              <tr key={u.id} className={!u.active ? 'opacity-50' : ''}>
-                <td className="px-4 py-2 font-medium">{u.name}</td>
-                <td className="px-4 py-2 text-muted-foreground">{u.email}</td>
-                <td className="px-4 py-2">
-                  <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${ROLE_BADGE[u.role] ?? ''}`}>
-                    {u.role}
-                  </span>
-                </td>
-                <td className="px-4 py-2 text-xs text-muted-foreground">{u.supplierName ?? '—'}</td>
-                <td className="px-4 py-2">
-                  {u.active
-                    ? <span className="text-xs text-green-600 font-medium">Active</span>
-                    : <span className="text-xs text-muted-foreground">Inactive</span>
-                  }
-                </td>
-                <td className="px-4 py-2 text-xs">{u.totpEnabled ? '✓' : '—'}</td>
-                <td className="px-4 py-2 text-xs text-muted-foreground">
-                  {u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) : 'Never'}
-                </td>
-                <td className="px-4 py-2">
-                  <button type="button" onClick={() => openEdit(u)} className="text-muted-foreground hover:text-foreground">
-                    <Pencil className="h-3.5 w-3.5" />
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <Table className="rounded-md border min-w-[700px]">
+        <TableHeader className="bg-muted/50">
+          <TableRow>
+            <TableHead className="px-4 text-xs">Name</TableHead>
+            <TableHead className="px-4 text-xs">Email</TableHead>
+            <TableHead className="px-4 text-xs">Role</TableHead>
+            <TableHead className="px-4 text-xs">Supplier</TableHead>
+            <TableHead className="px-4 text-xs">Status</TableHead>
+            <TableHead className="px-4 text-xs">2FA</TableHead>
+            <TableHead className="px-4 text-xs">Last Login</TableHead>
+            <TableHead className="px-4 w-10" />
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {users.map((u) => (
+            <TableRow key={u.id} className={!u.active ? 'opacity-50' : ''}>
+              <TableCell className="px-4 font-medium">{u.name}</TableCell>
+              <TableCell className="px-4 text-muted-foreground">{u.email}</TableCell>
+              <TableCell className="px-4">
+                <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${ROLE_BADGE[u.role] ?? ''}`}>
+                  {u.role}
+                </span>
+              </TableCell>
+              <TableCell className="px-4 text-xs text-muted-foreground">{u.supplierName ?? '—'}</TableCell>
+              <TableCell className="px-4">
+                {u.active
+                  ? <span className="text-xs text-green-600 font-medium">Active</span>
+                  : <span className="text-xs text-muted-foreground">Inactive</span>
+                }
+              </TableCell>
+              <TableCell className="px-4 text-xs">{u.totpEnabled ? '✓' : '—'}</TableCell>
+              <TableCell className="px-4 text-xs text-muted-foreground">
+                {u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) : 'Never'}
+              </TableCell>
+              <TableCell className="px-4">
+                <button type="button" onClick={() => openEdit(u)} className="text-muted-foreground hover:text-foreground">
+                  <Pencil className="h-3.5 w-3.5" />
+                </button>
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
 
       {/* Role descriptions */}
       <div className="rounded-md border p-4 space-y-2">

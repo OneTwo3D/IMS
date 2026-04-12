@@ -2,7 +2,7 @@
 
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
-import { Moon, Sun, LogOut, User, Settings, Bell, CheckCircle2, AlertTriangle, Info, XCircle } from 'lucide-react'
+import { Moon, Sun, LogOut, User, Settings, Bell, CheckCircle2, AlertTriangle, Info, XCircle, Menu } from 'lucide-react'
 import { useTheme } from 'next-themes'
 import { signOut, useSession } from 'next-auth/react'
 import { Button } from '@/components/ui/button'
@@ -12,6 +12,7 @@ interface TopbarProps {
   userName: string
   userEmail: string
   userPictureUrl?: string | null
+  onMenuClick?: () => void
 }
 
 type Notification = {
@@ -48,7 +49,7 @@ function timeAgo(dateStr: string) {
   return `${days}d ago`
 }
 
-export function Topbar({ userName, userEmail, userPictureUrl }: TopbarProps) {
+export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: TopbarProps) {
   const { setTheme, resolvedTheme } = useTheme()
   const router = useRouter()
   const { data: session } = useSession()
@@ -140,9 +141,20 @@ export function Topbar({ userName, userEmail, userPictureUrl }: TopbarProps) {
   }
 
   return (
-    <header className="flex h-14 items-center border-b bg-card px-4">
+    <header className="flex h-14 items-center border-b bg-card px-2 sm:px-4 gap-1">
+      {onMenuClick && (
+        <Button
+          variant="ghost"
+          size="icon"
+          className="md:hidden"
+          onClick={onMenuClick}
+          aria-label="Open navigation"
+        >
+          <Menu className="h-5 w-5" />
+        </Button>
+      )}
       <div className="flex-1" />
-      <span className="text-sm font-semibold text-muted-foreground tracking-wide">One Two Inventory</span>
+      <span className="text-sm font-semibold text-muted-foreground tracking-wide truncate">One Two Inventory</span>
       <div className="flex-1 flex items-center justify-end gap-2" />
 
       {/* Notification bell */}
@@ -163,7 +175,7 @@ export function Topbar({ userName, userEmail, userPictureUrl }: TopbarProps) {
         </Button>
 
         {bellOpen && (
-          <div className="absolute right-0 top-full mt-1 z-50 w-80 rounded-lg border bg-popover text-popover-foreground shadow-lg">
+          <div className="absolute right-0 top-full mt-1 z-50 w-[calc(100vw-2rem)] sm:w-80 rounded-lg border bg-popover text-popover-foreground shadow-lg">
             <div className="flex items-center justify-between px-3 py-2 border-b">
               <span className="text-sm font-medium">Notifications</span>
               {unreadCount > 0 && (
@@ -231,7 +243,7 @@ export function Topbar({ userName, userEmail, userPictureUrl }: TopbarProps) {
         </button>
 
         {open && (
-          <div role="menu" className="absolute right-0 top-full mt-1 z-50 w-52 rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg">
+          <div role="menu" className="absolute right-0 top-full mt-1 z-50 w-[calc(100vw-2rem)] sm:w-52 rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg">
             <div className="px-2 py-1.5">
               <p className="text-sm font-medium leading-none">{userName}</p>
               <p className="text-xs leading-none text-muted-foreground mt-1">{userEmail}</p>

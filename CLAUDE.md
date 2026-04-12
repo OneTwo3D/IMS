@@ -7,11 +7,11 @@ Complete inventory management system with sales, purchasing, stock control, manu
 | Layer | Technology | Version | Purpose |
 |-------|------------|---------|---------|
 | Runtime | Node.js | 18+ | JavaScript execution |
-| Framework | Next.js | 16.2 | Full-stack React with App Router, Server Components, Server Actions |
-| Language | TypeScript | 5.x | Strict type checking throughout |
+| Framework | Next.js | 16.2 | Full-stack React with App Router, Server Components, Server Actions, Turbopack |
+| Language | TypeScript | 5.x | Strict type checking throughout (strict mode enabled) |
 | Database | PostgreSQL | 14+ | Relational database for complex inventory models |
-| ORM | Prisma | 7.6 | Type-safe database access with 57 models |
-| UI Framework | React | 19.2 | Component rendering |
+| ORM | Prisma | 7.6 | Type-safe database access with 59 models |
+| UI Framework | React | 19.2 | Component rendering and state management |
 | UI Components | Shadcn/UI + Base-UI | Latest | Pre-built accessible component library |
 | Styling | Tailwind CSS | 4.x | Utility-first CSS |
 | Authentication | NextAuth.js | 5.0-beta | Session management with TOTP 2FA, Passkey/WebAuthn |
@@ -34,8 +34,8 @@ npm install
 cp .env.example .env          # Edit with your database URL and secrets
 
 # Database setup
-npx prisma migrate deploy     # Apply migrations
-npx prisma generate           # Generate Prisma client
+npx prisma migrate deploy     # Apply all pending migrations
+npx prisma generate           # Generate Prisma client types
 
 # Create initial admin user
 npm run cli -- create-user    # Interactive user creation
@@ -68,45 +68,77 @@ onetwo3d-ims/
 │   │   ├── profile/          # User profile and preferences
 │   │   ├── supplier/         # Supplier portal (separate RBAC)
 │   │   └── help/             # Help documentation portal
-│   ├── actions/              # Server actions (business logic)
-│   ├── api/
-│   │   ├── auth/             # Authentication endpoints
-│   │   ├── cron/             # Scheduled jobs (FX, sync, cleanup)
-│   │   ├── webhooks/         # WooCommerce webhooks
-│   │   ├── export/           # CSV exports
-│   │   ├── import/           # CSV imports
-│   │   ├── invoice/          # Invoice generation & preview
-│   │   ├── sales-order/      # Sales order PDFs
+│   ├── actions/              # Server actions (business logic, 31+ files)
+│   │   ├── products.ts       # Product CRUD, variants, BOMs
+│   │   ├── sales.ts          # Sales order lifecycle, allocation, invoicing
+│   │   ├── purchase-orders.ts # Purchase order workflow
+│   │   ├── stock.ts          # Stock movements, adjustments
+│   │   ├── transfers.ts      # Warehouse transfers
+│   │   ├── manufacturing.ts  # Production orders
+│   │   ├── wc-sync.ts        # WooCommerce order/product sync
+│   │   ├── xero-sync.ts      # Xero integration, journal posting
+│   │   ├── settings.ts       # Company, user, integration settings
+│   │   └── [other actions]   # Email, auth, backup, permissions, etc.
+│   ├── api/                  # API routes and webhooks
+│   │   ├── auth/             # NextAuth routes, TOTP, passkey setup
+│   │   ├── cron/             # Scheduled jobs
+│   │   │   ├── fx-rates      # Daily FX rate fetch (frankfurter.dev)
+│   │   │   ├── wc-sync       # WooCommerce polling sync (if webhooks disabled)
+│   │   │   ├── xero-daily-batch # Daily Xero sub-ledger batch sync
+│   │   │   ├── xero-sync     # Real-time Xero sync (deprecated, use daily-batch)
+│   │   │   ├── xero-payment-poll # Payment status polling from Xero
+│   │   │   ├── delivery-status # Update delivery status on SalesOrders
+│   │   │   ├── activity-cleanup # Archive old activity logs
+│   │   │   └── backup        # Automated database backups
+│   │   ├── webhooks/woocommerce/ # WC order, product, refund webhooks
+│   │   ├── export/           # CSV exports (products, sales, POs, stock, etc.)
+│   │   ├── import/           # CSV imports and historical order import
+│   │   ├── invoice/          # Invoice PDF generation and preview
+│   │   ├── sales-order/      # Sales order confirmation PDF
 │   │   ├── rfq/              # RFQ PDF generation
-│   │   ├── manufacturing-order/ # Production order PDFs
-│   │   ├── upload/           # File uploads
-│   │   ├── backup/           # Backup & restore endpoints
-│   │   ├── notifications/    # Notification delivery (email, SMS)
-│   │   └── preview/          # Document preview endpoints
+│   │   ├── manufacturing-order/ # Production order PDF
+│   │   ├── upload/           # Avatar, logo, invoice PDF uploads
+│   │   ├── uploads/          # Serve uploaded branding/invoice files
+│   │   ├── backup/           # Manual backup creation and restore
+│   │   ├── xero/             # Xero OAuth callback
+│   │   ├── notifications/    # Email notification delivery
+│   │   └── preview/          # Document preview (email templates, documents)
 │   └── generated/prisma/     # Auto-generated Prisma client types
 ├── components/
-│   ├── ui/                   # Shadcn/Base-UI primitives (button, card, etc.)
-│   ├── layout/               # Sidebar, topbar, nav
-│   ├── inventory/            # Product-specific components
-│   ├── settings/             # Settings-specific components
-│   ├── auth/                 # Login/auth components
+│   ├── ui/                   # Shadcn/Base-UI primitives (20+ components)
+│   │   ├── button.tsx, card.tsx, dialog.tsx, dropdown-menu.tsx
+│   │   ├── input.tsx, select.tsx, table.tsx, skeleton.tsx, etc.
+│   ├── layout/               # Sidebar, topbar, navigation, breadcrumbs
+│   ├── inventory/            # Product-specific components (forms, lists)
+│   ├── settings/             # Settings-specific components (forms)
+│   ├── auth/                 # Login/auth/2FA/passkey components
 │   ├── profile/              # User profile components
-│   └── providers/            # Context providers
+│   └── providers/            # Context providers (auth, theme, etc.)
 ├── lib/
 │   ├── auth/                 # NextAuth.js configuration, session helpers
+│   │   ├── config.ts         # NextAuth providers and callbacks
+│   │   ├── server.ts         # requireAuth() helper
 │   ├── db.ts                 # Prisma client singleton
-│   ├── permissions.ts        # Role-based access control (RBAC)
+│   ├── permissions.ts        # Role-based access control (RBAC) helpers
 │   ├── activity-log.ts       # Audit trail logging
 │   ├── mailer.ts             # Nodemailer SMTP configuration
-│   ├── pdf.ts                # PDF generation with branding
+│   ├── pdf.ts                # PDF generation with branding system
 │   ├── csv.ts                # CSV parse and export utilities
 │   ├── utils.ts              # Shared utility functions
 │   ├── connectors/           # Integration modules
-│   │   ├── woocommerce/      # WC sync, webhooks, cron, tax mapping
-│   │   └── xero/             # Xero API, sub-ledger sync, reconciliation
-│   └── [service files]       # Email, notifications, tracking
+│   │   ├── woocommerce/      # WC sync logic, webhooks, tax mapping
+│   │   │   ├── sync.ts       # Order/product sync engine
+│   │   │   ├── webhooks.ts   # Webhook parsing and validation
+│   │   │   ├── tax-mapping.ts # WC tax rate → Xero tax type mapping
+│   │   │   └── api.ts        # WC REST API client
+│   │   └── xero/             # Xero API, journal posting, reconciliation
+│   │       ├── api.ts        # Xero OAuth and API client
+│   │       ├── sync.ts       # Journal entry posting
+│   │       ├── batch.ts      # Daily batch sync logic
+│   │       └── reconciliation.ts # Payment/invoice reconciliation
+│   └── [service files]       # Notifications, FX rates, tracking
 ├── prisma/
-│   ├── schema.prisma         # Database schema (57 models, full OTI spec)
+│   ├── schema.prisma         # Database schema (59 models, full OTI spec)
 │   ├── migrations/           # Migration history
 │   ├── seed.ts               # Database seeding
 │   └── prod-seed/            # Production data fixtures
@@ -125,41 +157,105 @@ onetwo3d-ims/
 
 ## Architecture Overview
 
-**One Two Inventory** is a modular, role-based inventory management platform:
+**One Two Inventory** is a modular, role-based inventory management platform with real-time financial integration:
 
-1. **Core Inventory Module** — Product master data with FIFO costing, multi-warehouse stock tracking, VARIABLE/VARIANT/KIT/BOM product types, and real-time COGS calculation
+### Core Modules
 
-2. **Order-to-Cash** — Sales order workflow (DRAFT → PENDING → PROCESSING → SHIPPED → COMPLETED), multi-warehouse auto-allocation, shipment management, invoice generation with payment tracking
+1. **Inventory Module** — Product master data with:
+   - FIFO costing with multi-layer cost tracking per warehouse
+   - Multi-warehouse stock with available/reserved/on-hand tracking
+   - Product types: SIMPLE, VARIABLE (parent), VARIANT (child), KIT (virtual bundle), BOM (manufactured), NON_INVENTORY (service)
+   - Real-time COGS calculation on stock movements
+   - CSV import/export with BOM and variant support
 
-3. **Procure-to-Pay** — Purchase order lifecycle with multi-currency FX support, landed cost distribution, RFQ generation, goods receipt with FIFO costing, invoice reconciliation
+2. **Order-to-Cash** — Sales order full lifecycle:
+   - Workflow: DRAFT → PENDING_PAYMENT → ON_HOLD → PROCESSING → ALLOCATED → PICKING → PACKING → SHIPPED → COMPLETED/DELIVERED
+   - Multi-warehouse auto-allocation with intelligent allocation rules
+   - Shipment management with tracking
+   - Auto/manual invoice generation (configurable trigger)
+   - Payment tracking against invoices and credit notes
+   - Multi-currency with VAT handling and order/line discounts
+   - PDF generation and email delivery
 
-4. **Manufacturing** — Production orders with component allocation, BOM management, stock movements on completion
+3. **Procure-to-Pay** — Purchase order full lifecycle:
+   - Workflow: DRAFT → RFQ_SENT → PO_SENT → PARTIALLY_RECEIVED → RECEIVED → INVOICED
+   - Multi-currency with live FX rates (frankfurter.dev ECB data)
+   - RFQ PDF generation and supplier management
+   - Goods receipt with FIFO costing integration
+   - Landed cost distribution (by value/weight/quantity/equal split)
+   - Freight/cost POs linked to primary POs
+   - Retrospective landed cost recalculation (updates FIFO layers and COGS)
+   - Supplier returns and billing workflow
 
-5. **Integrations** — Connector modules for:
-   - **WooCommerce** — Order/stock sync via webhooks, product sync, tax rate mapping (new)
-   - **Xero** — Journal entry posting, sub-ledger batch sync (new), COGS calculation, reconciliation
+4. **Manufacturing** — Production order management:
+   - Production order types: ASSEMBLY, DISASSEMBLY
+   - BOM management with component allocation
+   - Stock movements on completion (production receipts)
+   - Links to sales orders for made-to-order workflows
+
+5. **Integrations** — Connector modules for data sync:
+   - **WooCommerce** — Order sync via webhooks (or polling), product sync, tax rate mapping to Xero
+   - **Xero** — Daily batch journal entry posting, sub-ledger sync, COGS calculation, payment reconciliation
    - **QuickBooks** — Coming soon
 
-6. **Financial** — Multi-currency support with daily FX rates, VAT handling, Xero account mapping, COGS/margin analytics, cash bridge forecasting, payment account mapping (new)
+6. **Financial Module** — Multi-currency and reporting:
+   - Daily FX rates auto-fetch from frankfurter.dev (ECB data)
+   - VAT handling (inclusive/exclusive) with named tax rates
+   - Xero account mapping for stock, COGS, and revenue recognition
+   - COGS/margin analytics and reporting
+   - Cash bridge forecasting
+   - Payment account mapping (payment method → bank account)
 
-7. **Administration** — Role-based access (ADMIN, MANAGER, WAREHOUSE, FINANCE, READONLY, SUPPLIER), activity logging, scheduled backups, system settings, notifications (new)
+7. **Administration** — Multi-tenant roles and controls:
+   - 6 RBAC roles: ADMIN, MANAGER, WAREHOUSE, FINANCE, READONLY, SUPPLIER (each with specific permissions)
+   - Activity logging with searchable audit trail
+   - Scheduled backups (local file or SFTP)
+   - System settings (company info, integrations, preferences)
+   - Email notifications for orders, shipments, sync events
 
-**Data Flow:** WooCommerce orders → IMS (allocate stock) → Shipments (track) → Xero sub-ledger (batch sync) → Accounts
+### Data Flow
+
+```
+WooCommerce → IMS (allocate stock, reserve) → Shipments (track)
+  ↓
+Xero sub-ledger (batch sync daily) → Accounts (GL posting)
+  ↓
+FX rates (daily via frankfurter.dev) → Multi-currency conversions
+```
 
 ## Database
 
-**57 Prisma models** covering:
-- Products (Product, ProductVariant, ProductPrice)
-- Inventory (Stock, StockMovement, StockCount, StockTransfer)
-- Sales (SalesOrder, SalesOrderLine, OrderAllocation, Shipment, Invoice, CreditNote)
-- Purchases (PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, SupplierRfq, PurchaseReturn)
-- Financials (TaxRate, Currency, LandedCost, CostLayer, FxRate)
-- Manufacturing (ManufacturingOrder, Bom, BomItem)
-- Integrations (WooCommerceConfig, WooCommerceProduct, WooCommerceSyncJob, XeroMapping, XeroSyncLog)
-- Administration (User, Role, Setting, ActivityLog, AuditTrail, Notification)
-- Support (DocumentTemplate, AdjustmentReason, PurchaseUnit)
+**59 Prisma models** (managed with migrations):
 
-See `@prisma/schema.prisma` for complete schema.
+**Product & Inventory:**
+- Product, ProductVariant, ProductPrice, ProductBundle
+- Stock, StockMovement, StockCount, StockTransfer, CostLayer
+
+**Sales:**
+- SalesOrder, SalesOrderLine, OrderAllocation, Shipment, ShipmentLine
+- Invoice, InvoiceLine, CreditNote, CreditNoteLine, Payment, PaymentAllocation
+
+**Purchases:**
+- PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, PurchaseReceiptLine
+- SupplierRfq, PurchaseReturn, PurchaseReturnLine, Supplier
+
+**Manufacturing:**
+- ManufacturingOrder, ManufacturingOrderLine, Bom, BomItem
+
+**Financials:**
+- TaxRate, Currency, FxRate, LandedCost, CostLine
+- AccountingSync (journal entries, COGS tracking)
+
+**Integrations:**
+- WooCommerceConfig, WooCommerceProduct, WooCommerceSyncJob, WooCommerceTaxMap
+- XeroMapping, XeroSyncLog, XeroPaymentPoll
+
+**Administration:**
+- User, Role, Session (NextAuth)
+- Setting, ActivityLog, AuditTrail, Notification
+- DocumentTemplate, AdjustmentReason, PurchaseUnit, Warehouse
+
+See `@prisma/schema.prisma` for complete schema with relationships and constraints.
 
 ## Development Guidelines
 
@@ -233,9 +329,9 @@ export async function getProduct(id: string) {
 **Server Actions:**
 - Always start with `'use server'` directive
 - Include `await requireAuth()` at the top
-- Use Zod for input validation
+- Use Zod for input validation with explicit schema
 - Call `logActivity()` for all state mutations
-- Use `revalidatePath()` to update UI cache
+- Use `revalidatePath()` or `revalidateTag()` to update UI cache
 
 ```typescript
 // app/actions/products.ts
@@ -321,42 +417,47 @@ export async function updateProduct(id: string, input: unknown) {
 - All forms use modal/dialog style (floating, not separate pages)
 - Use Zod validation in server actions
 - Leverage React's form submission with server actions
+- Include loading states and error handling
 
 ### Error Handling
 
 **API Routes:**
-- Return JSON with status code and error message
+- Return JSON with HTTP status code and error message
 - Log errors to activity log for audit
 - Never expose internal stack traces to client
+- Return 401 for auth, 403 for permission, 400 for validation, 500 for server errors
 
 **Server Actions:**
 - Throw errors; Next.js serializes them to client
 - User-facing errors: throw `new Error('User message')`
-- Always catch database errors and log
+- Always catch database errors and log to activity log
+- Include context in error messages
 
 **Client Side:**
 - Wrap server action calls in try-catch
 - Display user-friendly error messages
 - Log technical errors for debugging
+- Show loading skeletons during async operations
 
 ### Testing
 
-- **No test files in the codebase yet.** TypeScript strict mode + ESLint provide static quality.
+- **No test files in the codebase yet.** TypeScript strict mode + ESLint provide static quality checks.
 - Test manually in development via `npm run dev`
 - Type checking: `npm run type-check`
+- Consider adding tests for critical business logic (FIFO costing, allocations, sync logic)
 
 ## Available Commands
 
 | Command | Description |
 |---------|-------------|
 | `npm run dev` | Start development server (hot reload, localhost:3000) |
-| `npm run build` | Build for production (optimized next.js bundle) |
+| `npm run build` | Build for production (optimized Next.js bundle) |
 | `npm start` | Start production server (requires `npm run build` first) |
-| `npm run lint` | Run ESLint to check code style |
-| `npm run type-check` | Run TypeScript compiler (no emit) to verify types |
+| `npm run lint` | Run ESLint to check code style and quality |
+| `npm run type-check` | Run TypeScript compiler (no emit) to verify all types |
 | `npm run db:seed` | Seed database with initial data (see prisma/seed.ts) |
-| `npm run db:studio` | Open Prisma Studio (visual database explorer) |
-| `npm run cli -- create-user` | Interactive CLI to create admin/staff users |
+| `npm run db:studio` | Open Prisma Studio (visual database explorer on localhost:5555) |
+| `npm run cli -- create-user` | Interactive CLI to create admin/staff/supplier users |
 
 ## Environment Variables
 
@@ -439,18 +540,18 @@ See `.env.example` for complete list and additional settings.
 
 | Module | Location | Purpose | Owner |
 |--------|----------|---------|-------|
-| **Product Management** | `app/actions/products.ts`, `components/inventory/` | CRUD for products, variants, BOMs, pricing | Inventory team |
-| **Stock Control** | `app/actions/stock.ts`, `app/(dashboard)/stock-control/` | Adjustments, transfers, counts, movements | Warehouse team |
-| **Sales Orders** | `app/actions/sales.ts`, `app/(dashboard)/sales/` | Order workflow, allocation, shipment, invoicing | Sales team |
-| **Purchase Orders** | `app/actions/purchase-orders.ts`, `app/(dashboard)/purchase-orders/` | PO creation, RFQ, receipt, landed costs | Procurement team |
-| **Manufacturing** | `app/actions/manufacturing.ts`, `app/(dashboard)/manufacturing/` | Production orders, BOM, component allocation | Production team |
-| **WooCommerce Sync** | `lib/connectors/woocommerce/` | Order/product sync, tax mapping, webhooks, cron | Dev team |
-| **Xero Integration** | `lib/connectors/xero/` | Sub-ledger batch sync, journal posting, COGS, reconciliation | Finance team |
-| **Authentication** | `lib/auth/`, `app/(auth)/`, `app/actions/auth.ts` | Login, 2FA, roles, sessions, passkeys | Dev team |
-| **PDF Generation** | `lib/pdf.ts`, `app/api/*/[id]/pdf` | Branded PDFs (order, invoice, RFQ, PO) | Dev team |
-| **Notifications** | `lib/connectors/notifications/`, `app/api/notifications/` | Email delivery, notification history, preferences | Dev team |
-| **Activity Log** | `lib/activity-log.ts`, `app/(dashboard)/activity/` | Audit trail, searchable logs | Compliance team |
-| **Settings** | `app/(dashboard)/settings/`, `app/actions/settings.ts` | Company config, users, integrations, backup | Admin |
+| **Product Management** | `app/actions/products.ts`, `components/inventory/` | CRUD for products, variants, BOMs, pricing, stock units | Inventory team |
+| **Stock Control** | `app/actions/stock.ts`, `app/(dashboard)/stock-control/` | Adjustments, transfers, counts, movements, audit | Warehouse team |
+| **Sales Orders** | `app/actions/sales.ts`, `app/(dashboard)/sales/` | Order workflow, allocation, shipment, invoicing, credit notes | Sales team |
+| **Purchase Orders** | `app/actions/purchase-orders.ts`, `app/(dashboard)/purchase-orders/` | PO creation, RFQ, receipt, landed costs, returns | Procurement team |
+| **Manufacturing** | `app/actions/manufacturing.ts`, `app/(dashboard)/manufacturing/` | Production orders, BOM, component allocation, output | Production team |
+| **WooCommerce Sync** | `lib/connectors/woocommerce/`, `app/actions/wc-sync.ts` | Order/product sync, tax mapping, webhooks, cron polling | Dev team |
+| **Xero Integration** | `lib/connectors/xero/`, `app/actions/xero-sync.ts` | Sub-ledger batch sync, journal posting, COGS, reconciliation | Finance/Dev team |
+| **Authentication** | `lib/auth/`, `app/(auth)/`, `app/actions/auth.ts` | Login, 2FA, passkeys, roles, sessions, RBAC | Dev team |
+| **PDF Generation** | `lib/pdf.ts`, `app/api/*/[id]/route.ts` | Branded PDFs (order, invoice, RFQ, PO, shipment) | Dev team |
+| **Notifications** | `lib/mailer.ts`, `app/api/notifications/` | Email delivery, notification history, preferences | Dev team |
+| **Activity Log** | `lib/activity-log.ts`, `app/(dashboard)/activity/` | Audit trail, searchable logs, compliance | Compliance team |
+| **Settings** | `app/(dashboard)/settings/`, `app/actions/settings.ts` | Company config, users, integrations, backup, tax rates | Admin |
 
 ## Production Deployment
 
@@ -459,12 +560,18 @@ See `.env.example` for complete list and additional settings.
 **After Code Changes:**
 1. Commit and push to main branch
 2. SSH to production machine
-3. Pull latest code
-4. Run `npm run build`
-5. Restart the application (systemd service or manual restart)
-6. Verify on `http://10.0.3.99:3000`
+3. Pull latest code: `git pull origin main`
+4. Install dependencies (if needed): `npm install`
+5. Build the application: `npm run build`
+6. Restart the service (systemd or manual): `sudo systemctl restart onetwoinventory` or manual restart
+7. Verify on `http://10.0.3.99:3000`
 
-See `@docs/deployment.md` for full deployment guide.
+**Database migrations:**
+- Migrations are applied during `npm run build` via `prisma migrate deploy` in postinstall hook
+- Always review schema.prisma changes before deployment
+- Test migrations on staging first
+
+See `@docs/deployment.md` for full deployment guide including backups, monitoring, and rollback procedures.
 
 ## Security Checklist
 
@@ -473,64 +580,88 @@ Every change must verify:
 - [ ] **Authorization:** Role checks in place (use `checkPermission()`)
 - [ ] **Input Validation:** Zod schema validates all server action inputs
 - [ ] **SQL Injection:** Prisma parameterized queries prevent injection
-- [ ] **XSS:** React auto-escapes, but check dangerouslySetInnerHTML usage
+- [ ] **XSS:** React auto-escapes, but avoid `dangerouslySetInnerHTML`
 - [ ] **CSRF:** NextAuth provides automatic CSRF tokens
 - [ ] **Data Exposure:** No sensitive data (passwords, secrets) in responses
 - [ ] **Cron Security:** Cron endpoints protected by CRON_SECRET header
+- [ ] **File Upload Security:** Validate MIME types, enforce size limits, sanitize filenames
+- [ ] **API Rate Limiting:** Consider rate limiting on public endpoints (webhooks)
+
+## Recent Features (Latest Commits)
+
+- **Xero Sub-Ledger Batch Sync:** Daily batch sync of journal entries to Xero GL (replaces real-time sync for performance)
+- **WooCommerce Tax Rate Mapping:** Automatic tax type mapping from WC to Xero during order sync
+- **Payment Account Mapping:** UI for configuring payment method → bank account mapping for reconciliation
+- **Notifications System:** Email notifications for orders, shipments, and sync events with preference management
+- **Invoice Delegation:** Support for delegated invoice generation workflows (finance team can approve before sending)
+- **Passkey/WebAuthn Support:** FIDO2 passwordless authentication alongside TOTP 2FA
+- **Supplier Portal:** Separate RBAC role for suppliers to view orders and delivery status
 
 ## Documentation References
 
 - `@README.md` — Project overview and quick links
-- `@docs/architecture.md` — Detailed architectural decisions
-- `@docs/configuration.md` — Configuration guide for integrations
-- `@docs/development.md` — Development workflow (branching, PR process)
-- `@docs/deployment.md` — Production deployment procedures
+- `@docs/architecture.md` — Detailed architectural decisions and data flow
+- `@docs/configuration.md` — Integration setup guides (WooCommerce, Xero, SMTP)
+- `@docs/development.md` — Development workflow, branching strategy, PR process
+- `@docs/deployment.md` — Production deployment procedures and monitoring
 - `@CLAUDE.md` — This file (primary project documentation)
 - `@docs/getting-started.md` — User onboarding and feature overview
 
 ## Git Workflow
 
-- **Main branch:** Always production-ready
+- **Main branch:** Always production-ready, reflects live environment
 - **Feature branches:** `feature/description` from main
 - **Bug fix branches:** `fix/description` from main
-- **Commit messages:** Clear, descriptive (e.g., "Add COGS recalculation on landed cost edit")
+- **Commit messages:** Clear and descriptive (e.g., "Add COGS recalculation on landed cost edit")
 - **Push:** Commit + push after completing features
-- **PR:** Not currently used; direct commits to main after testing
+- **PR:** Direct commits to main after local testing (no PR process currently)
 
-See `@docs/development.md` for full workflow.
+See `@docs/development.md` for full workflow details.
 
 ## Debugging Tips
 
 **Check Prisma Schema:**
 ```bash
 npx prisma studio    # Visual DB explorer on localhost:5555
+npx prisma db pull   # Sync schema from database
 ```
 
 **Debug Server Actions:**
-- Add console.log statements
-- Check NextAuth session: `const session = await getServerSession()`
-- Verify role permissions: `checkPermission(session, action)`
+- Add console.log statements (visible in server logs)
+- Check NextAuth session: `const session = await requireAuth()`
+- Verify role permissions: `checkPermission(session, 'action')`
+- Check activity log for errors: `app/(dashboard)/activity/`
 
 **Debug Database Queries:**
 - Enable Prisma debug logs: `DEBUG="prisma:*" npm run dev`
 - Use Prisma Studio to inspect data
+- Check query performance: `PRISMA_SLOW_QUERY_THRESHOLD_MS=500 npm run dev`
+
+**Debug Integrations:**
+- WooCommerce: Check sync job logs in `app/(dashboard)/sync/`
+- Xero: Check sync status and journal entries in `app/(dashboard)/sync/`
+- Check email delivery in SMTP logs or notification history
 
 **Check Environment Variables:**
 - Verify `.env` file exists and is not in `.gitignore`
 - Never commit secrets; use `.env.example` as template
+- Check `NEXT_PUBLIC_*` variables don't contain secrets
 
 **TypeScript Errors:**
 ```bash
-npm run type-check    # Full TypeScript check
+npm run type-check    # Full TypeScript check across entire project
+npm run lint          # ESLint style and quality checks
 ```
 
 ## Recent Features (Latest Commits)
 
-- **Xero Sub-Ledger Sync:** Batch daily sync of journal entries to Xero with daily GL posting
-- **WooCommerce Tax Rate Mapping:** Automatic tax type mapping from WC to Xero
-- **Payment Account Mapping:** UI for configuring payment method → bank account mapping
-- **Notifications System:** Email notifications for orders, shipments, and sync events
-- **Invoice Delegation:** Support for delegated invoice generation workflows
+- **Xero Sub-Ledger Batch Sync:** Daily batch sync of journal entries to Xero GL (replaces real-time sync for performance)
+- **WooCommerce Tax Rate Mapping:** Automatic tax type mapping from WC to Xero during order sync
+- **Payment Account Mapping:** UI for configuring payment method → bank account mapping for reconciliation
+- **Notifications System:** Email notifications for orders, shipments, and sync events with preference management
+- **Invoice Delegation:** Support for delegated invoice generation workflows (finance team can approve before sending)
+- **Passkey/WebAuthn Support:** FIDO2 passwordless authentication alongside TOTP 2FA
+- **Supplier Portal:** Separate RBAC role for suppliers to view orders and delivery status
 
 ## Contact & Support
 
@@ -538,6 +669,39 @@ npm run type-check    # Full TypeScript check
 - **Repository:** git@github.com:OneTwo3D/IMS.git
 - **Issues:** Document in activity log + GitHub issues
 - **Questions:** Reference docs first, then contact dev team
+- **Reporting Bugs:** Include relevant activity log entries and environment details
+
+## Skill Usage Guide
+
+When working on tasks involving these technologies, invoke the corresponding skill:
+
+| Skill | Use When |
+|-------|----------|
+| typescript | Enforcing TypeScript strict mode with type safety across all code |
+| node | Executing JavaScript on server with Node.js runtime |
+| react | Managing React components, hooks, and client-side state patterns |
+| postgresql | Managing PostgreSQL schemas and database migrations |
+| prisma | Accessing databases with type-safe Prisma ORM queries |
+| tailwind | Applying utility-first CSS styling with Tailwind CSS 4.x |
+| zod | Validating input data with Zod schema definitions |
+| nextauth | Implementing authentication with NextAuth.js sessions and RBAC |
+| shadcn-ui | Implementing accessible UI components from Shadcn/UI library |
+| frontend-design | Designing UI with Tailwind CSS, components, and accessibility patterns |
+| nodemailer | Sending SMTP emails through Nodemailer integration |
+| nextjs | Building full-stack apps with App Router and Server Components |
+| designing-onboarding-paths | Designing onboarding paths, checklists, and first-run UI |
+| writing-release-notes | Drafting release notes tied to shipped features |
+| designing-inapp-guidance | Building tooltips, tours, and contextual guidance |
+| eslint | Enforcing code quality with ESLint configuration |
+| orchestrating-feature-adoption | Planning feature discovery, nudges, and adoption flows |
+| structuring-offer-ladders | Framing plan tiers, value ladders, and upgrade logic |
+| framing-release-stories | Building launch narratives, assets, and rollout checklists |
+| mapping-user-journeys | Mapping in-app journeys and identifying friction points in code |
+| streamlining-signup-steps | Reducing friction in signup and trial activation flows |
+| accelerating-first-run | Improving onboarding sequence and time-to-value |
+| tuning-landing-journeys | Improving landing page flow, hierarchy, and conversion paths |
+| inspecting-search-coverage | Auditing technical and on-page search coverage |
+| adding-structured-signals | Adding structured data for rich results |
 
 
 ## Skill Usage Guide
@@ -546,28 +710,6 @@ When working on tasks involving these technologies, invoke the corresponding ski
 
 | Skill | Invoke When |
 |-------|-------------|
-| typescript | Enforces TypeScript strict mode with type safety across all code |
-| node | Executes JavaScript on server with Node.js runtime |
-| react | Manages React components, hooks, and client-side state patterns |
-| postgresql | Manages PostgreSQL schemas and database migrations |
-| prisma | Accesses databases with type-safe Prisma ORM queries |
-| tailwind | Applies utility-first CSS styling with Tailwind CSS |
-| zod | Validates input data with Zod schema definitions |
-| nextauth | Implements authentication with NextAuth.js sessions |
-| shadcn-ui | Implements accessible UI components from Shadcn/UI library |
-| frontend-design | Designs UI with Tailwind CSS, components, and accessibility |
-| nodemailer | Sends SMTP emails through Nodemailer integration |
-| nextjs | Builds full-stack apps with App Router and Server Components |
-| designing-onboarding-paths | Designs onboarding paths, checklists, and first-run UI |
-| writing-release-notes | Drafts release notes tied to shipped features |
-| designing-inapp-guidance | Builds tooltips, tours, and contextual guidance |
-| eslint | Enforces code quality with ESLint configuration |
-| orchestrating-feature-adoption | Plans feature discovery, nudges, and adoption flows |
-| structuring-offer-ladders | Frames plan tiers, value ladders, and upgrade logic |
-| framing-release-stories | Builds launch narratives, assets, and rollout checklists |
-| mapping-user-journeys | Maps in-app journeys and identifies friction points in code |
-| streamlining-signup-steps | Reduces friction in signup and trial activation |
-| accelerating-first-run | Improves onboarding sequence and time-to-value |
-| tuning-landing-journeys | Improves landing page flow, hierarchy, and conversion paths |
-| inspecting-search-coverage | Audits technical and on-page search coverage |
-| adding-structured-signals | Adds structured data for rich results |
+| pdfkit | Generates branded PDF documents with PDFKit for invoices and reports |
+| crafting-page-messaging | Writes conversion-focused messaging for pages and key CTAs |
+| instrumenting-product-metrics | Defines product events, funnels, and activation metrics |

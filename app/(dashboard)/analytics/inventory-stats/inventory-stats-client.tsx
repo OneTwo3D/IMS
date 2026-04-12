@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { ProductLink } from '@/components/inventory/product-link'
 import type { StockOnHandRow, StockMovementRow, StockAllocationRow, ReorderRow } from '@/app/actions/inventory-stats'
 import { saveView, type SavedView } from '@/app/actions/sales-stats'
@@ -224,7 +225,7 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
 
   function SortIcon({ col }: { col: string }) { return sortCol === col ? (sortDir === 'asc' ? <ArrowUp className="h-3 w-3 inline" /> : <ArrowDown className="h-3 w-3 inline" />) : null }
   const TH = ({ col, children, right }: { col: string; children: React.ReactNode; right?: boolean }) => (
-    <th className={`px-3 py-2 text-xs font-medium text-muted-foreground cursor-pointer hover:text-foreground select-none whitespace-nowrap ${right ? 'text-right' : 'text-left'}`} onClick={() => handleSort(col)}>{children} <SortIcon col={col} /></th>
+    <TableHead className={`text-xs cursor-pointer hover:text-foreground select-none ${right ? 'text-right' : 'text-left'}`} onClick={() => handleSort(col)}>{children} <SortIcon col={col} /></TableHead>
   )
 
   // Generic filter + sort for any tab data
@@ -327,7 +328,7 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
     <div className="space-y-4">
       <h1 className="text-2xl font-semibold">Inventory Report</h1>
 
-      <div className="grid grid-cols-4 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Total Quantity</p><p className="text-xl font-bold">{totalQty.toLocaleString()}</p></div>
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Reserved</p><p className="text-xl font-bold text-orange-600">{totalReserved.toLocaleString()}</p></div>
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Available</p><p className="text-xl font-bold">{totalAvailable.toLocaleString()}</p></div>
@@ -350,65 +351,92 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
 
       {/* Stock on Hand */}
       {tab === 'onhand' && (
-        <div className="rounded-md border overflow-hidden">
+        <div className="rounded-md border">
           <div className="px-3 py-1.5 bg-muted/30 border-b text-xs text-muted-foreground">{filteredOnHand.length} of {stockOnHand.length} rows</div>
-          <div className="overflow-x-auto"><table className="w-full text-sm"><thead className="border-b bg-muted/50"><tr>
-            {visibleCols.map((k) => { const c = onhandColR[k]; return c ? <TH key={k} col={k} right={c.align === 'right'}>{c.label}</TH> : null })}
-          </tr></thead><tbody className="divide-y">
-            {filteredOnHand.map((r) => (<tr key={`${r.productId}-${r.warehouseCode}`} className="hover:bg-muted/30">
-              {visibleCols.map((k) => { const c = onhandColR[k]; return c ? <td key={k} className={`px-3 py-2 ${c.align === 'right' ? 'text-right' : ''}`}>{c.render(r)}</td> : null })}
-            </tr>))}
-          </tbody>
-          <tfoot className="border-t bg-muted/30 font-medium text-sm"><tr>
-            {visibleCols.map((k) => { const c = onhandColR[k]; return <td key={k} className={`px-3 py-2 ${c?.align === 'right' ? 'text-right' : ''}`}>{c?.footer?.() ?? ''}</td> })}
-          </tr></tfoot></table></div>
+          <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-22rem)]">
+            <TableHeader className="bg-muted/50">
+              <TableRow>
+                {visibleCols.map((k) => { const c = onhandColR[k]; return c ? <TH key={k} col={k} right={c.align === 'right'}>{c.label}</TH> : null })}
+              </TableRow>
+            </TableHeader>
+            <TableBody className="divide-y">
+              {filteredOnHand.map((r) => (
+                <TableRow key={`${r.productId}-${r.warehouseCode}`}>
+                  {visibleCols.map((k) => { const c = onhandColR[k]; return c ? <TableCell key={k} className={c.align === 'right' ? 'text-right' : ''}>{c.render(r)}</TableCell> : null })}
+                </TableRow>
+              ))}
+            </TableBody>
+            <tfoot className="border-t bg-muted/30 font-medium text-sm">
+              <tr>
+                {visibleCols.map((k) => { const c = onhandColR[k]; return <td key={k} className={`px-3 py-2 ${c?.align === 'right' ? 'text-right' : ''}`}>{c?.footer?.() ?? ''}</td> })}
+              </tr>
+            </tfoot>
+          </Table>
         </div>
       )}
 
       {/* Stock Movements */}
       {tab === 'movements' && (
-        <div className="rounded-md border overflow-hidden">
+        <div className="rounded-md border">
           <div className="px-3 py-1.5 bg-muted/30 border-b text-xs text-muted-foreground">{filteredMovements.length} of {movements.length} rows</div>
-          <div className="overflow-x-auto"><table className="w-full text-sm"><thead className="border-b bg-muted/50"><tr>
-            {visibleCols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
-          </tr></thead><tbody className="divide-y">
-            {filteredMovements.map((m) => (
-              <tr key={m.id} className="hover:bg-muted/30">
-                {visibleCols.map((k) => <td key={k} className={`px-3 py-2 ${fieldAlign(k) === 'right' ? 'text-right' : ''}`}>{renderCell(m, k, 'movements')}</td>)}
-              </tr>))}
-          </tbody></table></div>
+          <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-22rem)]">
+            <TableHeader className="bg-muted/50">
+              <TableRow>
+                {visibleCols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
+              </TableRow>
+            </TableHeader>
+            <TableBody className="divide-y">
+              {filteredMovements.map((m) => (
+                <TableRow key={m.id}>
+                  {visibleCols.map((k) => <TableCell key={k} className={fieldAlign(k) === 'right' ? 'text-right' : ''}>{renderCell(m, k, 'movements')}</TableCell>)}
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
           {movements.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">No movements found.</p>}
         </div>
       )}
 
       {/* Allocations */}
       {tab === 'allocations' && (
-        <div className="rounded-md border overflow-hidden">
+        <div className="rounded-md border">
           <div className="px-3 py-1.5 bg-muted/30 border-b text-xs text-muted-foreground">{filteredAllocations.length} of {allocations.length} rows</div>
-          <div className="overflow-x-auto"><table className="w-full text-sm"><thead className="border-b bg-muted/50"><tr>
-            {visibleCols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
-          </tr></thead><tbody className="divide-y">
-            {filteredAllocations.map((a) => (
-              <tr key={`${a.productId}-${a.warehouseCode}`} className="hover:bg-muted/30">
-                {visibleCols.map((k) => <td key={k} className={`px-3 py-2 ${fieldAlign(k) === 'right' ? 'text-right' : ''}`}>{renderCell(a, k, 'allocations')}</td>)}
-              </tr>))}
-          </tbody></table></div>
+          <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-22rem)]">
+            <TableHeader className="bg-muted/50">
+              <TableRow>
+                {visibleCols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
+              </TableRow>
+            </TableHeader>
+            <TableBody className="divide-y">
+              {filteredAllocations.map((a) => (
+                <TableRow key={`${a.productId}-${a.warehouseCode}`}>
+                  {visibleCols.map((k) => <TableCell key={k} className={fieldAlign(k) === 'right' ? 'text-right' : ''}>{renderCell(a, k, 'allocations')}</TableCell>)}
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
           {allocations.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">No allocations found.</p>}
         </div>
       )}
 
       {/* Reorder */}
       {tab === 'reorder' && (
-        <div className="rounded-md border overflow-hidden">
+        <div className="rounded-md border">
           <div className="px-3 py-1.5 bg-muted/30 border-b text-xs text-muted-foreground">{filteredReorder.length} of {reorder.length} rows</div>
-          <div className="overflow-x-auto"><table className="w-full text-sm"><thead className="border-b bg-muted/50"><tr>
-            {visibleCols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
-          </tr></thead><tbody className="divide-y">
-            {filteredReorder.map((r) => (
-              <tr key={r.productId} className={`hover:bg-muted/30 ${r.availableStock <= 0 ? 'bg-red-50 dark:bg-red-950/20' : ''}`}>
-                {visibleCols.map((k) => <td key={k} className={`px-3 py-2 ${fieldAlign(k) === 'right' ? 'text-right' : ''}`}>{renderCell(r, k, 'reorder')}</td>)}
-              </tr>))}
-          </tbody></table></div>
+          <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-22rem)]">
+            <TableHeader className="bg-muted/50">
+              <TableRow>
+                {visibleCols.map((k) => <TH key={k} col={k} right={fieldAlign(k) === 'right'}>{fieldLabel(k)}</TH>)}
+              </TableRow>
+            </TableHeader>
+            <TableBody className="divide-y">
+              {filteredReorder.map((r) => (
+                <TableRow key={r.productId} className={r.availableStock <= 0 ? 'bg-red-50 dark:bg-red-950/20' : ''}>
+                  {visibleCols.map((k) => <TableCell key={k} className={fieldAlign(k) === 'right' ? 'text-right' : ''}>{renderCell(r, k, 'reorder')}</TableCell>)}
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
           {reorder.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">All products above reorder point.</p>}
         </div>
       )}

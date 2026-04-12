@@ -13,6 +13,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/ui/dialog'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createTaxRate, updateTaxRate, type TaxRateRow, type TaxCategoryValue } from '@/app/actions/settings'
 
 type Props = { taxRates: TaxRateRow[] }
@@ -96,7 +97,7 @@ function TaxRateFormDialog({
             <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. UK Standard Rate" className="h-9" />
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label>Rate (%)</Label>
               <Input
@@ -121,7 +122,7 @@ function TaxRateFormDialog({
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label>Tax Category</Label>
               <select
@@ -192,57 +193,55 @@ export function TaxRatesTable({ taxRates }: Props) {
   function renderTable(rates: TaxRateRow[]) {
     if (rates.length === 0) return <p className="text-sm text-muted-foreground py-2">No rates defined.</p>
     return (
-      <div className="rounded-md border overflow-hidden">
-        <table className="w-full text-sm">
-          <thead className="border-b bg-muted/50">
-            <tr>
-              <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Name</th>
-              <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Category</th>
-              <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Country</th>
-              <th className="px-4 py-2 text-right font-medium text-muted-foreground text-xs">Rate</th>
-              {!allBoth && <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Applies To</th>}
-              <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Status</th>
-              <th className="w-16" />
-            </tr>
-          </thead>
-          <tbody className="divide-y">
-            {rates.map((r) => (
-              <tr key={r.id} className={`hover:bg-muted/30 ${!r.active ? 'opacity-50' : ''}`}>
-                <td className="px-4 py-2 font-medium">{r.name}</td>
-                <td className="px-4 py-2 text-xs">
-                  <span className="inline-flex items-center rounded-full px-2 py-0.5 font-medium border bg-muted/50">
-                    {TAX_CATEGORY_LABELS[r.taxCategory] ?? r.taxCategory}
-                  </span>
-                </td>
-                <td className="px-4 py-2 font-mono text-xs text-muted-foreground uppercase">
-                  {r.countryCode ?? '—'}
-                </td>
-                <td className="px-4 py-2 text-right font-mono text-xs">{(r.rate * 100).toFixed(2)}%</td>
-                {!allBoth && <td className="px-4 py-2 text-xs text-muted-foreground">{USED_FOR_LABELS[r.usedFor] ?? r.usedFor}</td>}
-                <td className="px-4 py-2">
-                  <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${
-                    r.active
-                      ? 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200'
-                      : 'bg-muted text-muted-foreground border-border'
-                  }`}>
-                    {r.active ? 'Active' : 'Inactive'}
-                  </span>
-                </td>
-                <td className="px-4 py-2">
-                  <div className="flex items-center gap-1 justify-end">
-                    <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setEditing(r)}>
-                      <Pencil className="h-3 w-3" />
-                    </Button>
-                    <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => handleToggle(r)} disabled={isPending}>
-                      {r.active ? <X className="h-3 w-3 text-muted-foreground" /> : <Check className="h-3 w-3 text-muted-foreground" />}
-                    </Button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <Table className="rounded-md border">
+        <TableHeader className="bg-muted/50">
+          <TableRow>
+            <TableHead className="text-xs">Name</TableHead>
+            <TableHead className="text-xs">Category</TableHead>
+            <TableHead className="text-xs">Country</TableHead>
+            <TableHead className="text-xs text-right">Rate</TableHead>
+            {!allBoth && <TableHead className="text-xs">Applies To</TableHead>}
+            <TableHead className="text-xs">Status</TableHead>
+            <TableHead className="w-16" />
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {rates.map((r) => (
+            <TableRow key={r.id} className={!r.active ? 'opacity-50' : ''}>
+              <TableCell className="font-medium">{r.name}</TableCell>
+              <TableCell className="text-xs">
+                <span className="inline-flex items-center rounded-full px-2 py-0.5 font-medium border bg-muted/50">
+                  {TAX_CATEGORY_LABELS[r.taxCategory] ?? r.taxCategory}
+                </span>
+              </TableCell>
+              <TableCell className="font-mono text-xs text-muted-foreground uppercase">
+                {r.countryCode ?? '—'}
+              </TableCell>
+              <TableCell className="text-right font-mono text-xs">{(r.rate * 100).toFixed(2)}%</TableCell>
+              {!allBoth && <TableCell className="text-xs text-muted-foreground">{USED_FOR_LABELS[r.usedFor] ?? r.usedFor}</TableCell>}
+              <TableCell>
+                <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${
+                  r.active
+                    ? 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200'
+                    : 'bg-muted text-muted-foreground border-border'
+                }`}>
+                  {r.active ? 'Active' : 'Inactive'}
+                </span>
+              </TableCell>
+              <TableCell>
+                <div className="flex items-center gap-1 justify-end">
+                  <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setEditing(r)}>
+                    <Pencil className="h-3 w-3" />
+                  </Button>
+                  <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => handleToggle(r)} disabled={isPending}>
+                    {r.active ? <X className="h-3 w-3 text-muted-foreground" /> : <Check className="h-3 w-3 text-muted-foreground" />}
+                  </Button>
+                </div>
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
     )
   }
 

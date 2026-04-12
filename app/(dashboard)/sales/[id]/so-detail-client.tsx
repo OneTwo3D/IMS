@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   updateSalesOrderStatus, createRefund, cloneSalesOrder, deleteSalesOrder,
   markSalesOrderPaid, updateSalesOrderNotes, generateInvoiceNumber,
@@ -171,19 +172,19 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
               {warehouses.map((w) => (<option key={w.id} value={w.id}>{w.code} — {w.name}</option>))}
             </select></div>
         </div>
-        <div className="rounded-md border overflow-hidden"><table className="w-full text-sm"><thead className="border-b bg-muted/50"><tr>
-          <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-16">Ordered</th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-24">Refund Qty</th>
-          <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-28">Amount ({sym})</th>
-        </tr></thead><tbody className="divide-y">
-          {refundLines.map((l) => (<tr key={l.id}>
-            <td className="px-3 py-2">{l.productId ? <ProductLink productId={l.productId} sku={l.sku} name={l.description} /> : l.description}</td>
-            <td className="px-3 py-2 text-right tabular-nums">{l.qty}</td>
-            <td className="px-3 py-2"><Input type="number" min={0} max={l.qty} step={1} value={l.qtyRefund} onChange={(e) => { const q = Number(e.target.value) || 0; setRefundLines((p) => p.map((rl) => rl.id === l.id ? { ...rl, qtyRefund: q, refundAmount: q * l.unitPriceForeign } : rl)) }} className="h-7 text-sm text-right w-24 ml-auto font-mono" /></td>
-            <td className="px-3 py-2 text-right font-mono text-xs">{formatMoney(l.refundAmount, sym)}</td>
-          </tr>))}
-        </tbody></table></div>
+        <Table className="rounded-md border"><TableHeader className="bg-muted/50"><TableRow>
+          <TableHead className="text-xs">Product</TableHead>
+          <TableHead className="text-xs text-right w-16">Ordered</TableHead>
+          <TableHead className="text-xs text-right w-24">Refund Qty</TableHead>
+          <TableHead className="text-xs text-right w-28">Amount ({sym})</TableHead>
+        </TableRow></TableHeader><TableBody>
+          {refundLines.map((l) => (<TableRow key={l.id}>
+            <TableCell>{l.productId ? <ProductLink productId={l.productId} sku={l.sku} name={l.description} /> : l.description}</TableCell>
+            <TableCell className="text-right tabular-nums">{l.qty}</TableCell>
+            <TableCell><Input type="number" min={0} max={l.qty} step={1} value={l.qtyRefund} onChange={(e) => { const q = Number(e.target.value) || 0; setRefundLines((p) => p.map((rl) => rl.id === l.id ? { ...rl, qtyRefund: q, refundAmount: q * l.unitPriceForeign } : rl)) }} className="h-7 text-sm text-right w-24 ml-auto font-mono" /></TableCell>
+            <TableCell className="text-right font-mono text-xs">{formatMoney(l.refundAmount, sym)}</TableCell>
+          </TableRow>))}
+        </TableBody></Table>
         <div className="flex justify-end text-sm font-medium">Total: {formatMoney(totalRefund, sym)}</div>
         {error && <p className="text-sm text-destructive">{error}</p>}
       </div>
@@ -378,7 +379,7 @@ function AllocationPanel({
   }
 
   return (
-    <div className="rounded-md border overflow-hidden">
+    <div className="rounded-md border overflow-x-auto">
       <div className="border-b px-4 py-2 bg-muted/50 flex items-center justify-between">
         <h2 className="text-sm font-medium flex items-center gap-2">
           <Warehouse className="h-4 w-4 text-muted-foreground" />
@@ -627,7 +628,7 @@ function ShipmentsPanel({
       {shipments.map((s) => {
         const nextAction = SHIPMENT_FLOW[s.status]
         return (
-          <div key={s.id} className="rounded-md border overflow-hidden">
+          <div key={s.id} className="rounded-md border overflow-x-auto">
             <div className="px-4 py-2 bg-muted/50 flex items-center justify-between">
               <div className="flex items-center gap-2">
                 <Truck className="h-4 w-4 text-muted-foreground" />
@@ -1022,7 +1023,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
       )}
 
       {/* Lines table */}
-      <div className="rounded-md border overflow-hidden">
+      <div className="rounded-md border">
         <div className="border-b px-4 py-2 bg-muted/50 flex items-center justify-between">
           <h2 className="text-sm font-medium">Line Items</h2>
           <div className="relative">
@@ -1041,26 +1042,26 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
             )}
           </div>
         </div>
-        <table className="w-full text-sm">
-          <thead className="border-b bg-muted/30">
-            <tr>
-              <th className="w-12 px-2 py-2" />
-              <th className="px-4 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
-              <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-16">Qty</th>
-              <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-28">Unit Price ({sym})</th>
-              <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-24">Discount</th>
-              {vatRate > 0 && <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-20">VAT ({sym})</th>}
-              <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-28">Total ({sym})</th>
-              {visibleCols.has('cogs') && <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-20">COGS (£)</th>}
-              {visibleCols.has('margin') && <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-20">Margin (£)</th>}
-              {visibleCols.has('marginPct') && <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-16">Margin %</th>}
-              {visibleCols.has('qtyShipped') && <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-16">Shipped</th>}
-              {visibleCols.has('qtyReturned') && <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-16">Returned</th>}
-              {visibleCols.has('qtyCancelled') && <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-16">Cancelled</th>}
-              {visibleCols.has('qtyOnHand') && <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-16">On Hand</th>}
-            </tr>
-          </thead>
-          <tbody className="divide-y">
+        <Table className="min-w-[700px]">
+          <TableHeader className="bg-muted/30">
+            <TableRow>
+              <TableHead className="w-12 px-2" />
+              <TableHead className="px-4 text-xs">Product</TableHead>
+              <TableHead className="px-4 text-xs text-right w-16">Qty</TableHead>
+              <TableHead className="px-4 text-xs text-right w-28">Unit Price ({sym})</TableHead>
+              <TableHead className="px-4 text-xs text-right w-24">Discount</TableHead>
+              {vatRate > 0 && <TableHead className="px-4 text-xs text-right w-20">VAT ({sym})</TableHead>}
+              <TableHead className="px-4 text-xs text-right w-28">Total ({sym})</TableHead>
+              {visibleCols.has('cogs') && <TableHead className="px-4 text-xs text-right w-20">COGS (£)</TableHead>}
+              {visibleCols.has('margin') && <TableHead className="px-4 text-xs text-right w-20">Margin (£)</TableHead>}
+              {visibleCols.has('marginPct') && <TableHead className="px-4 text-xs text-right w-16">Margin %</TableHead>}
+              {visibleCols.has('qtyShipped') && <TableHead className="px-4 text-xs text-right w-16">Shipped</TableHead>}
+              {visibleCols.has('qtyReturned') && <TableHead className="px-4 text-xs text-right w-16">Returned</TableHead>}
+              {visibleCols.has('qtyCancelled') && <TableHead className="px-4 text-xs text-right w-16">Cancelled</TableHead>}
+              {visibleCols.has('qtyOnHand') && <TableHead className="px-4 text-xs text-right w-16">On Hand</TableHead>}
+            </TableRow>
+          </TableHeader>
+          <TableBody>
             {so.lines.map((line) => {
               const cogs = line.cogsGbp ?? 0
               const revenueGbp = line.totalGbp
@@ -1073,48 +1074,48 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
               // (user-entered) values so Unit Price, VAT and Total all line up.
               const lineTotalDisplay = toGross(line.totalForeign)
               return (
-                <tr key={line.id}>
-                  <td className="w-12 px-2 py-1">
+                <TableRow key={line.id}>
+                  <TableCell className="w-12 px-2 py-1">
                     {line.productId && <ProductThumb productId={line.productId} imageUrl={line.imageUrl} name={line.description} />}
-                  </td>
-                  <td className="px-4 py-2">{line.productId ? <ProductLink productId={line.productId} sku={line.sku} name={line.description} /> : <span className="text-sm">{line.description}</span>}</td>
-                  <td className="px-4 py-2 text-right tabular-nums">{line.qty}</td>
-                  <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">{formatMoney(line.unitPriceForeign, sym)}</td>
-                  <td className="px-4 py-2 text-right tabular-nums font-mono text-xs text-destructive">{line.discountAmount > 0 ? (line.discountStr ?? formatMoney(-line.discountAmount, sym)) : '—'}</td>
+                  </TableCell>
+                  <TableCell className="px-4">{line.productId ? <ProductLink productId={line.productId} sku={line.sku} name={line.description} /> : <span className="text-sm">{line.description}</span>}</TableCell>
+                  <TableCell className="px-4 text-right tabular-nums">{line.qty}</TableCell>
+                  <TableCell className="px-4 text-right tabular-nums font-mono text-xs">{formatMoney(line.unitPriceForeign, sym)}</TableCell>
+                  <TableCell className="px-4 text-right tabular-nums font-mono text-xs text-destructive">{line.discountAmount > 0 ? (line.discountStr ?? formatMoney(-line.discountAmount, sym)) : '—'}</TableCell>
                   {vatRate > 0 && (
-                    <td className="px-4 py-2 text-right tabular-nums font-mono text-xs text-muted-foreground">
+                    <TableCell className="px-4 text-right tabular-nums font-mono text-xs text-muted-foreground">
                       {formatMoney(line.taxForeign, sym)}
                       {line.taxRatePercent != null && Math.abs(line.taxRatePercent - vatRate) > 0.0001 && (
                         <span className="ml-1 inline-flex items-center rounded-sm border border-amber-300 bg-amber-50 px-1 py-0 text-[10px] font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
                           {(line.taxRatePercent * 100).toFixed(line.taxRatePercent * 100 % 1 === 0 ? 0 : 1)}%
                         </span>
                       )}
-                    </td>
+                    </TableCell>
                   )}
-                  <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">{formatMoney(lineTotalDisplay, sym)}</td>
-                  {visibleCols.has('cogs') && <td className="px-4 py-2 text-right tabular-nums font-mono text-xs text-muted-foreground">{cogs > 0 ? formatMoney(cogs, '£') : '—'}</td>}
-                  {visibleCols.has('margin') && <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">{cogs > 0 ? formatMoney(margin, '£') : '—'}</td>}
-                  {visibleCols.has('marginPct') && <td className="px-4 py-2 text-right tabular-nums text-xs">{cogs > 0 ? `${marginPct.toFixed(1)}%` : '—'}</td>}
-                  {visibleCols.has('qtyShipped') && <td className="px-4 py-2 text-right tabular-nums text-xs">{shipped > 0 ? shipped : '—'}</td>}
-                  {visibleCols.has('qtyReturned') && <td className="px-4 py-2 text-right tabular-nums text-xs text-orange-600">{returned > 0 ? returned : '—'}</td>}
-                  {visibleCols.has('qtyCancelled') && <td className="px-4 py-2 text-right tabular-nums text-xs text-destructive">{cancelled > 0 ? cancelled : '—'}</td>}
+                  <TableCell className="px-4 text-right tabular-nums font-mono text-xs">{formatMoney(lineTotalDisplay, sym)}</TableCell>
+                  {visibleCols.has('cogs') && <TableCell className="px-4 text-right tabular-nums font-mono text-xs text-muted-foreground">{cogs > 0 ? formatMoney(cogs, '£') : '—'}</TableCell>}
+                  {visibleCols.has('margin') && <TableCell className="px-4 text-right tabular-nums font-mono text-xs">{cogs > 0 ? formatMoney(margin, '£') : '—'}</TableCell>}
+                  {visibleCols.has('marginPct') && <TableCell className="px-4 text-right tabular-nums text-xs">{cogs > 0 ? `${marginPct.toFixed(1)}%` : '—'}</TableCell>}
+                  {visibleCols.has('qtyShipped') && <TableCell className="px-4 text-right tabular-nums text-xs">{shipped > 0 ? shipped : '—'}</TableCell>}
+                  {visibleCols.has('qtyReturned') && <TableCell className="px-4 text-right tabular-nums text-xs text-orange-600">{returned > 0 ? returned : '—'}</TableCell>}
+                  {visibleCols.has('qtyCancelled') && <TableCell className="px-4 text-right tabular-nums text-xs text-destructive">{cancelled > 0 ? cancelled : '—'}</TableCell>}
                   {visibleCols.has('qtyOnHand') && (() => {
-                if (!line.productId) return <td className="px-4 py-2 text-right text-xs text-muted-foreground">—</td>
+                if (!line.productId) return <TableCell className="px-4 text-right text-xs text-muted-foreground">—</TableCell>
                 const whId = so.shipFromWarehouseId
                 if (whId) {
                   const entry = stockLevels[line.productId]?.[whId]
                   const avail = entry ? entry.available : 0
-                  return <td className={`px-4 py-2 text-right tabular-nums text-xs ${avail < line.qty ? 'text-destructive font-medium' : 'text-muted-foreground'}`}>{avail}</td>
+                  return <TableCell className={`px-4 text-right tabular-nums text-xs ${avail < line.qty ? 'text-destructive font-medium' : 'text-muted-foreground'}`}>{avail}</TableCell>
                 }
                 // No warehouse selected — show total across all
                 const entries = stockLevels[line.productId] ?? {}
                 const total = Object.values(entries).reduce((s, e) => s + e.available, 0)
-                return <td className="px-4 py-2 text-right tabular-nums text-xs text-muted-foreground">{total}</td>
+                return <TableCell className="px-4 text-right tabular-nums text-xs text-muted-foreground">{total}</TableCell>
               })()}
-                </tr>
+                </TableRow>
               )
             })}
-          </tbody>
+          </TableBody>
           <tfoot className="border-t bg-muted/30 text-sm">
             {(() => {
               // Align totals under the Total column. Base cols before Total =
@@ -1162,12 +1163,12 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
               </>
             })()}
           </tfoot>
-        </table>
+        </Table>
       </div>
 
       {/* Invoice */}
       {so.invoiceNumber && (
-        <div className="rounded-md border overflow-hidden">
+        <div className="rounded-md border overflow-x-auto">
           <div className="px-4 py-2 bg-muted/50 flex items-center justify-between">
             <div className="flex items-center gap-2 text-sm font-medium">
               <FileText className="h-4 w-4 text-muted-foreground" />
@@ -1240,7 +1241,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
 
       {/* Refunds */}
       {so.refunds.length > 0 && (
-        <div className="rounded-md border overflow-hidden">
+        <div className="rounded-md border overflow-x-auto">
           <button type="button" className="w-full flex items-center justify-between px-4 py-2 bg-muted/50 hover:bg-muted/70 text-sm font-medium" onClick={() => setShowRefunds((v) => !v)}>
             <span>Refunds ({so.refunds.length})</span>
             {showRefunds ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
@@ -1255,9 +1256,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
                 <span className="font-mono font-medium text-destructive">-{money(r.totalForeign)}</span>
               </div>
               {r.reason && <p className="text-xs"><span className="text-muted-foreground">Reason:</span> {r.reason}</p>}
-              <table className="w-full text-xs"><tbody className="divide-y">{r.lines.map((rl) => (
-                <tr key={rl.id}><td className="py-1 pr-4">{rl.description}</td><td className="py-1 pr-4 text-right tabular-nums">{rl.qty}</td><td className="py-1 text-right font-mono">{formatMoney(rl.totalGbp, '£', 'PREFIX')}</td></tr>
-              ))}</tbody></table>
+              <Table className="text-xs"><TableBody>{r.lines.map((rl) => (
+                <TableRow key={rl.id}><TableCell className="py-1 pr-4">{rl.description}</TableCell><TableCell className="py-1 pr-4 text-right tabular-nums">{rl.qty}</TableCell><TableCell className="py-1 text-right font-mono">{formatMoney(rl.totalGbp, '£', 'PREFIX')}</TableCell></TableRow>
+              ))}</TableBody></Table>
               {/* Credit note payments */}
               {r.payments.length > 0 && (
                 <div className="space-y-1 pt-1 border-t">
@@ -1319,45 +1320,43 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
             </div>
 
             {/* Line items */}
-            <div className="rounded-md border overflow-hidden">
-              <table className="w-full text-sm">
-                <thead className="border-b bg-muted/50">
-                  <tr>
-                    <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Description</th>
-                    <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-16">Qty</th>
-                    <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-24">Unit Price</th>
-                    <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-20">Discount</th>
-                    <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-20">Tax</th>
-                    <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-24">Total ({sym})</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y">
-                  {so.lines.map((line) => (
-                    <tr key={line.id}>
-                      <td className="px-3 py-2">
-                        {line.productId ? (
-                          <ProductLink productId={line.productId} sku={line.sku} name={line.description} skuClassName="font-mono text-xs text-muted-foreground" />
-                        ) : (
-                          <>{line.description}{line.sku ? ` (${line.sku})` : ''}</>
-                        )}
-                      </td>
-                      <td className="px-3 py-2 text-right tabular-nums">{line.qty}</td>
-                      <td className="px-3 py-2 text-right font-mono text-xs">{line.unitPriceForeign.toFixed(2)}</td>
-                      <td className="px-3 py-2 text-right font-mono text-xs text-destructive">{line.discountAmount > 0 ? `-${line.discountAmount.toFixed(2)}` : '—'}</td>
-                      <td className="px-3 py-2 text-right font-mono text-xs">{line.taxForeign > 0 ? line.taxForeign.toFixed(2) : '—'}</td>
-                      <td className="px-3 py-2 text-right font-mono text-xs">{money(line.totalForeign)}</td>
-                    </tr>
-                  ))}
-                </tbody>
-                <tfoot className="border-t bg-muted/30 text-sm">
-                  <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">Subtotal</td><td className="px-3 py-1.5 text-right font-mono">{money(so.subtotalForeign)}</td></tr>
-                  {so.discountAmount > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-destructive">Discount</td><td className="px-3 py-1.5 text-right font-mono text-destructive">-{money(so.discountAmount)}</td></tr>}
-                  {so.shippingForeign > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">Shipping</td><td className="px-3 py-1.5 text-right font-mono">{money(so.shippingForeign)}</td></tr>}
-                  {so.taxForeign > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">{so.taxRateName ?? 'Tax'}{so.taxRatePercent != null ? ` (${(so.taxRatePercent * 100).toFixed(0)}%)` : ''}</td><td className="px-3 py-1.5 text-right font-mono">{money(so.taxForeign)}</td></tr>}
-                  <tr className="border-t"><td colSpan={5} className="px-3 py-2 text-right font-medium">Total</td><td className="px-3 py-2 text-right font-mono font-semibold">{money(so.totalForeign)}{so.currency !== 'GBP' && <span className="text-muted-foreground font-normal text-xs ml-1">({formatMoney(so.totalGbp, '£', 'PREFIX')})</span>}</td></tr>
-                </tfoot>
-              </table>
-            </div>
+            <Table className="rounded-md border min-w-[600px]">
+              <TableHeader className="bg-muted/50">
+                <TableRow>
+                  <TableHead className="text-xs">Description</TableHead>
+                  <TableHead className="text-xs text-right w-16">Qty</TableHead>
+                  <TableHead className="text-xs text-right w-24">Unit Price</TableHead>
+                  <TableHead className="text-xs text-right w-20">Discount</TableHead>
+                  <TableHead className="text-xs text-right w-20">Tax</TableHead>
+                  <TableHead className="text-xs text-right w-24">Total ({sym})</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {so.lines.map((line) => (
+                  <TableRow key={line.id}>
+                    <TableCell>
+                      {line.productId ? (
+                        <ProductLink productId={line.productId} sku={line.sku} name={line.description} skuClassName="font-mono text-xs text-muted-foreground" />
+                      ) : (
+                        <>{line.description}{line.sku ? ` (${line.sku})` : ''}</>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">{line.qty}</TableCell>
+                    <TableCell className="text-right font-mono text-xs">{line.unitPriceForeign.toFixed(2)}</TableCell>
+                    <TableCell className="text-right font-mono text-xs text-destructive">{line.discountAmount > 0 ? `-${line.discountAmount.toFixed(2)}` : '—'}</TableCell>
+                    <TableCell className="text-right font-mono text-xs">{line.taxForeign > 0 ? line.taxForeign.toFixed(2) : '—'}</TableCell>
+                    <TableCell className="text-right font-mono text-xs">{money(line.totalForeign)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+              <tfoot className="border-t bg-muted/30 text-sm">
+                <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">Subtotal</td><td className="px-3 py-1.5 text-right font-mono">{money(so.subtotalForeign)}</td></tr>
+                {so.discountAmount > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-destructive">Discount</td><td className="px-3 py-1.5 text-right font-mono text-destructive">-{money(so.discountAmount)}</td></tr>}
+                {so.shippingForeign > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">Shipping</td><td className="px-3 py-1.5 text-right font-mono">{money(so.shippingForeign)}</td></tr>}
+                {so.taxForeign > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">{so.taxRateName ?? 'Tax'}{so.taxRatePercent != null ? ` (${(so.taxRatePercent * 100).toFixed(0)}%)` : ''}</td><td className="px-3 py-1.5 text-right font-mono">{money(so.taxForeign)}</td></tr>}
+                <tr className="border-t"><td colSpan={5} className="px-3 py-2 text-right font-medium">Total</td><td className="px-3 py-2 text-right font-mono font-semibold">{money(so.totalForeign)}{so.currency !== 'GBP' && <span className="text-muted-foreground font-normal text-xs ml-1">({formatMoney(so.totalGbp, '£', 'PREFIX')})</span>}</td></tr>
+              </tfoot>
+            </Table>
 
             {/* Refund credit notes */}
             {so.refunds.length > 0 && (

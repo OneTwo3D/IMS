@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card } from '@/components/ui/card'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   saveWcSyncSettings, saveWcCredentials, updateWcTaxRateMapping, deleteWcTaxRateMapping, upsertWcStatusMapping,
   triggerManualSync, importWcTaxRatesFromApi,
@@ -270,43 +271,43 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
         )}
 
         {taxMappings.length > 0 ? (
-          <div className="rounded-md border overflow-hidden">
-            <table className="w-full text-sm">
-              <thead className="bg-muted/50 border-b"><tr>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">WC Rate</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Country</th>
-                <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Rate</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Class</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">→ IMS Tax Rate</th>
-                <th className="px-3 py-2 w-10" />
-              </tr></thead>
-              <tbody className="divide-y">
-                {taxMappings.map((m) => (
-                  <tr key={m.id}>
-                    <td className="px-3 py-2">{m.wcName} <span className="text-muted-foreground text-xs">#{m.wcTaxRateId}</span></td>
-                    <td className="px-3 py-2 font-mono text-xs text-muted-foreground">{m.wcCountry ?? '—'}</td>
-                    <td className="px-3 py-2 text-right font-mono text-xs">{m.wcRatePct.toFixed(2)}%</td>
-                    <td className="px-3 py-2 font-mono text-xs text-muted-foreground">{m.wcClass ?? 'standard'}</td>
-                    <td className="px-3 py-2">
-                      <select
-                        value={m.taxRateId}
-                        onChange={(e) => handleChangeTaxMapping(m.wcTaxRateId, e.target.value)}
-                        className="h-7 rounded-md border border-input bg-background px-2 text-xs w-full max-w-xs"
-                        disabled={isPending}
-                      >
-                        {taxRates.map((r) => (<option key={r.id} value={r.id}>{r.name}</option>))}
-                      </select>
-                    </td>
-                    <td className="px-3 py-2">
-                      <button type="button" onClick={() => handleDeleteTaxMapping(m.id)} className="text-muted-foreground hover:text-destructive">
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <Table className="rounded-md border min-w-[600px]">
+            <TableHeader className="bg-muted/50">
+              <TableRow>
+                <TableHead className="text-xs">WC Rate</TableHead>
+                <TableHead className="text-xs">Country</TableHead>
+                <TableHead className="text-xs text-right">Rate</TableHead>
+                <TableHead className="text-xs">Class</TableHead>
+                <TableHead className="text-xs">→ IMS Tax Rate</TableHead>
+                <TableHead className="w-10" />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {taxMappings.map((m) => (
+                <TableRow key={m.id}>
+                  <TableCell>{m.wcName} <span className="text-muted-foreground text-xs">#{m.wcTaxRateId}</span></TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground">{m.wcCountry ?? '—'}</TableCell>
+                  <TableCell className="text-right font-mono text-xs">{m.wcRatePct.toFixed(2)}%</TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground">{m.wcClass ?? 'standard'}</TableCell>
+                  <TableCell>
+                    <select
+                      value={m.taxRateId}
+                      onChange={(e) => handleChangeTaxMapping(m.wcTaxRateId, e.target.value)}
+                      className="h-7 rounded-md border border-input bg-background px-2 text-xs w-full max-w-xs"
+                      disabled={isPending}
+                    >
+                      {taxRates.map((r) => (<option key={r.id} value={r.id}>{r.name}</option>))}
+                    </select>
+                  </TableCell>
+                  <TableCell>
+                    <button type="button" onClick={() => handleDeleteTaxMapping(m.id)} className="text-muted-foreground hover:text-destructive">
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
         ) : (
           <p className="text-xs text-muted-foreground italic">
             No tax rates imported yet. Click &quot;Import from WooCommerce&quot; to fetch and auto-map all WC tax rates.
@@ -319,26 +320,26 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
         <h2 className="text-base font-semibold">Status Mapping</h2>
         <p className="text-xs text-muted-foreground">Map WooCommerce order statuses to IMS statuses. Changes are saved automatically.</p>
 
-        <div className="rounded-md border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="bg-muted/50 border-b"><tr>
-              <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">WC Status</th>
-              <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">IMS Status</th>
-            </tr></thead>
-            <tbody className="divide-y">
-              {statusMappings.map((m) => (
-                <tr key={m.id}>
-                  <td className="px-3 py-2 font-mono text-xs">{m.wcStatus}</td>
-                  <td className="px-3 py-2">
-                    <select value={m.imsStatus} onChange={(e) => handleStatusMappingChange(m.wcStatus, e.target.value)} className="h-7 rounded-md border border-input bg-background px-2 text-xs" disabled={isPending}>
-                      {IMS_STATUSES.map((st) => (<option key={st} value={st}>{st}</option>))}
-                    </select>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Table className="rounded-md border">
+          <TableHeader className="bg-muted/50">
+            <TableRow>
+              <TableHead className="text-xs">WC Status</TableHead>
+              <TableHead className="text-xs">IMS Status</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {statusMappings.map((m) => (
+              <TableRow key={m.id}>
+                <TableCell className="font-mono text-xs">{m.wcStatus}</TableCell>
+                <TableCell>
+                  <select value={m.imsStatus} onChange={(e) => handleStatusMappingChange(m.wcStatus, e.target.value)} className="h-7 rounded-md border border-input bg-background px-2 text-xs" disabled={isPending}>
+                    {IMS_STATUSES.map((st) => (<option key={st} value={st}>{st}</option>))}
+                  </select>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
       </Card>
 
       </>}
@@ -358,35 +359,37 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
         {logs.length === 0 ? (
           <p className="text-sm text-muted-foreground">No sync activity yet.</p>
         ) : (
-          <div className="rounded-md border overflow-hidden max-h-80 overflow-y-auto">
-            <table className="w-full text-xs">
-              <thead className="bg-muted/50 border-b sticky top-0"><tr>
-                <th className="px-3 py-1.5 text-left font-medium text-muted-foreground">Time</th>
-                <th className="px-3 py-1.5 text-left font-medium text-muted-foreground">Direction</th>
-                <th className="px-3 py-1.5 text-left font-medium text-muted-foreground">Type</th>
-                <th className="px-3 py-1.5 text-left font-medium text-muted-foreground">WC ID</th>
-                <th className="px-3 py-1.5 text-left font-medium text-muted-foreground">Status</th>
-                <th className="px-3 py-1.5 text-left font-medium text-muted-foreground">Error</th>
-              </tr></thead>
-              <tbody className="divide-y">
+          <div className="rounded-md border max-h-80 overflow-y-auto">
+            <Table className="min-w-[600px]">
+              <TableHeader className="bg-muted/50 sticky top-0">
+                <TableRow>
+                  <TableHead className="text-xs">Time</TableHead>
+                  <TableHead className="text-xs">Direction</TableHead>
+                  <TableHead className="text-xs">Type</TableHead>
+                  <TableHead className="text-xs">WC ID</TableHead>
+                  <TableHead className="text-xs">Status</TableHead>
+                  <TableHead className="text-xs">Error</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {logs.map((l) => (
-                  <tr key={l.id}>
-                    <td className="px-3 py-1.5 text-muted-foreground">{new Date(l.createdAt).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}</td>
-                    <td className="px-3 py-1.5">
+                  <TableRow key={l.id}>
+                    <TableCell className="py-1.5 text-xs text-muted-foreground">{new Date(l.createdAt).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}</TableCell>
+                    <TableCell className="py-1.5 text-xs">
                       {l.direction === 'FROM_WC' ? <span className="text-blue-600">↓ From WC</span> : <span className="text-green-600">↑ To WC</span>}
-                    </td>
-                    <td className="px-3 py-1.5">{l.entityType}</td>
-                    <td className="px-3 py-1.5 font-mono">{l.wcId ?? '—'}</td>
-                    <td className="px-3 py-1.5">
+                    </TableCell>
+                    <TableCell className="py-1.5 text-xs">{l.entityType}</TableCell>
+                    <TableCell className="py-1.5 text-xs font-mono">{l.wcId ?? '—'}</TableCell>
+                    <TableCell className="py-1.5 text-xs">
                       <span className={`inline-flex items-center rounded-full px-1.5 py-0.5 text-xs font-medium ${l.status === 'SYNCED' ? 'bg-green-100 text-green-800' : l.status === 'FAILED' ? 'bg-red-100 text-red-800' : 'bg-yellow-100 text-yellow-800'}`}>
                         {l.status}
                       </span>
-                    </td>
-                    <td className="px-3 py-1.5 text-destructive max-w-40 truncate">{l.errorMessage ?? ''}</td>
-                  </tr>
+                    </TableCell>
+                    <TableCell className="py-1.5 text-xs text-destructive max-w-40 truncate">{l.errorMessage ?? ''}</TableCell>
+                  </TableRow>
                 ))}
-              </tbody>
-            </table>
+              </TableBody>
+            </Table>
           </div>
         )}
       </Card>

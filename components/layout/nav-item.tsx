@@ -12,9 +12,10 @@ interface NavItemProps {
   icon: LucideIcon
   collapsed?: boolean
   badge?: number
+  onNavigate?: () => void
 }
 
-export function NavItem({ href, label, icon: Icon, collapsed, badge }: NavItemProps) {
+export function NavItem({ href, label, icon: Icon, collapsed, badge, onNavigate }: NavItemProps) {
   const pathname = usePathname()
   const isActive = pathname === href || pathname.startsWith(href + '/')
 
@@ -28,7 +29,7 @@ export function NavItem({ href, label, icon: Icon, collapsed, badge }: NavItemPr
   if (collapsed) {
     return (
       <Tooltip>
-        <TooltipTrigger render={<Link href={href} className={linkClass} />}>
+        <TooltipTrigger render={<Link href={href} className={linkClass} onClick={onNavigate} />}>
           <Icon className="h-4 w-4 shrink-0" />
         </TooltipTrigger>
         <TooltipContent side="right">{label}</TooltipContent>
@@ -37,7 +38,7 @@ export function NavItem({ href, label, icon: Icon, collapsed, badge }: NavItemPr
   }
 
   return (
-    <Link href={href} className={linkClass}>
+    <Link href={href} className={linkClass} onClick={onNavigate}>
       <Icon className="h-4 w-4 shrink-0" />
       <span className="truncate">{label}</span>
       {badge != null && badge > 0 && (

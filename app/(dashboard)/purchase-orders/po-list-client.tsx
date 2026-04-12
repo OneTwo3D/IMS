@@ -15,6 +15,7 @@ function timeAgo(iso: string): string {
 }
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { ChevronRight, Search } from 'lucide-react'
 
 const STATUS_LABELS: Record<PoStatus, string> = {
@@ -126,85 +127,83 @@ export function PoListClient({ initialPos, currencySymbols = {} }: Props) {
       {filtered.length === 0 ? (
         <p className="text-sm text-muted-foreground py-8 text-center">No purchase orders found.</p>
       ) : (
-        <div className="rounded-md border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="border-b bg-muted/50">
-              <tr>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Reference</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Supplier</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Status</th>
-                <th className="px-3 py-2 text-right font-medium text-muted-foreground">Total</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Expected</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Created</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Lines</th>
-                <th className="w-8" />
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {filtered.map((po) => (
-                <tr key={po.id} className="hover:bg-muted/30 transition-colors">
-                  <td className="px-3 py-2 font-mono text-xs font-medium">
-                    <Link href={`/purchase-orders/${po.id}`} className="hover:underline">
-                      {po.reference}
-                    </Link>
-                    {po.type === 'FREIGHT' && (
-                      <span className="ml-1.5 inline-flex items-center rounded px-1 py-0.5 text-[10px] font-medium bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200">
-                        LC
-                      </span>
-                    )}
-                  </td>
-                  <td className="px-3 py-2">{po.supplierName}</td>
-                  <td className="px-3 py-2">
-                    <div className="flex flex-wrap gap-1">
-                      <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[po.status]}`}>
-                        {STATUS_LABELS[po.status]}
-                      </span>
-                      {po.isInvoiced && po.status !== 'INVOICED' && (
-                        <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200 border-purple-200">
-                          Invoiced
-                        </span>
-                      )}
-                      {po.isPartiallyReturned && po.status !== 'PARTIALLY_RETURNED' && (
-                        <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200 border-orange-200">
-                          Part. Returned
-                        </span>
-                      )}
-                      {po.isFullyReturned && po.status !== 'RETURNED' && (
-                        <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300 border-gray-200">
-                          Returned
-                        </span>
-                      )}
-                    </div>
-                  </td>
-                  <td className="px-3 py-2 text-right tabular-nums">
-                    <span className="font-semibold">
-                      {po.totalForeign.toFixed(2)}{sym(po.currency)}
+        <Table containerClassName="max-h-[calc(100vh-16rem)] rounded-md border" className="min-w-[700px]">
+          <TableHeader className="bg-muted/50">
+            <TableRow>
+              <TableHead>Reference</TableHead>
+              <TableHead>Supplier</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead className="text-right">Total</TableHead>
+              <TableHead>Expected</TableHead>
+              <TableHead>Created</TableHead>
+              <TableHead>Lines</TableHead>
+              <TableHead className="w-8" />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {filtered.map((po) => (
+              <TableRow key={po.id}>
+                <TableCell className="font-mono text-xs font-medium">
+                  <Link href={`/purchase-orders/${po.id}`} className="hover:underline">
+                    {po.reference}
+                  </Link>
+                  {po.type === 'FREIGHT' && (
+                    <span className="ml-1.5 inline-flex items-center rounded px-1 py-0.5 text-[10px] font-medium bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200">
+                      LC
                     </span>
-                    {po.currency !== 'GBP' && (
-                      <span className="text-muted-foreground text-xs font-normal ml-1">
-                        (£{po.totalGbp.toFixed(2)})
+                  )}
+                </TableCell>
+                <TableCell>{po.supplierName}</TableCell>
+                <TableCell>
+                  <div className="flex flex-wrap gap-1">
+                    <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[po.status]}`}>
+                      {STATUS_LABELS[po.status]}
+                    </span>
+                    {po.isInvoiced && po.status !== 'INVOICED' && (
+                      <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200 border-purple-200">
+                        Invoiced
                       </span>
                     )}
-                  </td>
-                  <td className="px-3 py-2 text-muted-foreground text-xs">
-                    {po.expectedDelivery
-                      ? new Date(po.expectedDelivery).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
-                      : '—'}
-                  </td>
-                  <td className="px-3 py-2 text-muted-foreground text-xs">
-                    {timeAgo(po.createdAt)}
-                  </td>
-                  <td className="px-3 py-2 text-muted-foreground text-xs">{po.lineCount}</td>
-                  <td className="px-3 py-2">
-                    <Link href={`/purchase-orders/${po.id}`}>
-                      <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                    </Link>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+                    {po.isPartiallyReturned && po.status !== 'PARTIALLY_RETURNED' && (
+                      <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200 border-orange-200">
+                        Part. Returned
+                      </span>
+                    )}
+                    {po.isFullyReturned && po.status !== 'RETURNED' && (
+                      <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300 border-gray-200">
+                        Returned
+                      </span>
+                    )}
+                  </div>
+                </TableCell>
+                <TableCell className="text-right tabular-nums">
+                  <span className="font-semibold">
+                    {po.totalForeign.toFixed(2)}{sym(po.currency)}
+                  </span>
+                  {po.currency !== 'GBP' && (
+                    <span className="text-muted-foreground text-xs font-normal ml-1">
+                      (£{po.totalGbp.toFixed(2)})
+                    </span>
+                  )}
+                </TableCell>
+                <TableCell className="text-muted-foreground text-xs">
+                  {po.expectedDelivery
+                    ? new Date(po.expectedDelivery).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+                    : '—'}
+                </TableCell>
+                <TableCell className="text-muted-foreground text-xs">
+                  {timeAgo(po.createdAt)}
+                </TableCell>
+                <TableCell className="text-muted-foreground text-xs">{po.lineCount}</TableCell>
+                <TableCell>
+                  <Link href={`/purchase-orders/${po.id}`}>
+                    <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                  </Link>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
       )}
     </div>
   )

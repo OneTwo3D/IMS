@@ -80,10 +80,13 @@ type SidebarProps = {
   companyName?: string
   logoUrl?: string | null
   userRole?: string
+  onNavigate?: () => void
+  forceExpanded?: boolean
 }
 
-export function Sidebar({ companyName, logoUrl, userRole = 'ADMIN' }: SidebarProps = {}) {
-  const [collapsed, setCollapsed] = useState(false)
+export function Sidebar({ companyName, logoUrl, userRole = 'ADMIN', onNavigate, forceExpanded }: SidebarProps = {}) {
+  const [internalCollapsed, setCollapsed] = useState(false)
+  const collapsed = forceExpanded ? false : internalCollapsed
   const can = (p: Permission) => hasPermission(userRole, p)
   const isSupplier = userRole === 'SUPPLIER'
 
@@ -103,16 +106,20 @@ export function Sidebar({ companyName, logoUrl, userRole = 'ADMIN' }: SidebarPro
         </div>
         <nav className="flex flex-1 flex-col gap-1 overflow-y-auto p-2">
           {SUPPLIER_NAV.map((item) => (
-            <NavItem key={item.href} {...item} collapsed={collapsed} />
+            <NavItem key={item.href} {...item} collapsed={collapsed} onNavigate={onNavigate} />
           ))}
-          <NavItem href="/help" label="Help" icon={HelpCircle} collapsed={collapsed} />
+          <NavItem href="/help" label="Help" icon={HelpCircle} collapsed={collapsed} onNavigate={onNavigate} />
         </nav>
-        <Separator />
-        <div className="p-2">
-          <Button variant="ghost" size="sm" className={cn('w-full', collapsed ? 'justify-center px-0' : 'justify-start')} onClick={() => setCollapsed((c) => !c)} aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
-            {collapsed ? <ChevronRight className="h-4 w-4" /> : <><ChevronLeft className="h-4 w-4 mr-2" /><span className="text-xs">Collapse</span></>}
-          </Button>
-        </div>
+        {!forceExpanded && (
+          <>
+            <Separator />
+            <div className="p-2">
+              <Button variant="ghost" size="sm" className={cn('w-full', collapsed ? 'justify-center px-0' : 'justify-start')} onClick={() => setCollapsed((c) => !c)} aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}>
+                {collapsed ? <ChevronRight className="h-4 w-4" /> : <><ChevronLeft className="h-4 w-4 mr-2" /><span className="text-xs">Collapse</span></>}
+              </Button>
+            </div>
+          </>
+        )}
       </aside>
     )
   }
@@ -141,50 +148,53 @@ export function Sidebar({ companyName, logoUrl, userRole = 'ADMIN' }: SidebarPro
 
       {/* Navigation */}
       <nav className="flex flex-1 flex-col gap-1 overflow-y-auto p-2">
-        {can('dashboard') && <NavItem href="/dashboard" label="Dashboard" icon={LayoutDashboard} collapsed={collapsed} />}
-        {can('inventory') && <NavItem href="/inventory" label="Inventory" icon={Package} collapsed={collapsed} />}
+        {can('dashboard') && <NavItem href="/dashboard" label="Dashboard" icon={LayoutDashboard} collapsed={collapsed} onNavigate={onNavigate} />}
+        {can('inventory') && <NavItem href="/inventory" label="Inventory" icon={Package} collapsed={collapsed} onNavigate={onNavigate} />}
         {can('stock_control') && (
-          <NavGroup label="Stock Control" icon={Warehouse} children={STOCK_CONTROL_CHILDREN} collapsed={collapsed} />
+          <NavGroup label="Stock Control" icon={Warehouse} children={STOCK_CONTROL_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
         {can('purchasing') && (
-          <NavGroup label="Purchases" icon={ShoppingCart} children={PURCHASES_CHILDREN} collapsed={collapsed} />
+          <NavGroup label="Purchases" icon={ShoppingCart} children={PURCHASES_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
         {can('sales') && (
-          <NavGroup label="Sales" icon={TrendingUp} children={SALES_CHILDREN} collapsed={collapsed} />
+          <NavGroup label="Sales" icon={TrendingUp} children={SALES_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
         {can('analytics') && (
-          <NavGroup label="Analytics" icon={BarChart3} children={ANALYTICS_CHILDREN} collapsed={collapsed} />
+          <NavGroup label="Analytics" icon={BarChart3} children={ANALYTICS_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
-        {can('manufacturing') && <NavItem href="/manufacturing" label="Manufacturing" icon={Factory} collapsed={collapsed} />}
-        {can('sync') && <NavItem href="/sync" label="Integrations" icon={RefreshCw} collapsed={collapsed} />}
-        {can('activity_log') && <NavItem href="/activity" label="Activity" icon={ActivitySquare} collapsed={collapsed} />}
-        <NavItem href="/help" label="Help" icon={HelpCircle} collapsed={collapsed} />
+        {can('manufacturing') && <NavItem href="/manufacturing" label="Manufacturing" icon={Factory} collapsed={collapsed} onNavigate={onNavigate} />}
+        {can('sync') && <NavItem href="/sync" label="Integrations" icon={RefreshCw} collapsed={collapsed} onNavigate={onNavigate} />}
+        {can('activity_log') && <NavItem href="/activity" label="Activity" icon={ActivitySquare} collapsed={collapsed} onNavigate={onNavigate} />}
+        <NavItem href="/help" label="Help" icon={HelpCircle} collapsed={collapsed} onNavigate={onNavigate} />
         {can('settings') && (
-          <NavGroup label="Settings" icon={Settings} children={SETTINGS_CHILDREN} collapsed={collapsed} />
+          <NavGroup label="Settings" icon={Settings} children={SETTINGS_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
       </nav>
 
-      <Separator />
-
-      {/* Collapse toggle */}
-      <div className="p-2">
-        <Button
-          variant="ghost"
-          size="sm"
-          className={cn('w-full', collapsed ? 'justify-center px-0' : 'justify-start')}
-          onClick={() => setCollapsed((c) => !c)}
-          aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
-        >
-          {collapsed ? (
-            <ChevronRight className="h-4 w-4" />
-          ) : (
-            <>
-              <ChevronLeft className="h-4 w-4 mr-2" />
-              <span className="text-xs">Collapse</span>
-            </>
-          )}
-        </Button>
-      </div>
+      {!forceExpanded && (
+        <>
+          <Separator />
+          {/* Collapse toggle */}
+          <div className="p-2">
+            <Button
+              variant="ghost"
+              size="sm"
+              className={cn('w-full', collapsed ? 'justify-center px-0' : 'justify-start')}
+              onClick={() => setCollapsed((c) => !c)}
+              aria-label={collapsed ? 'Expand sidebar' : 'Collapse sidebar'}
+            >
+              {collapsed ? (
+                <ChevronRight className="h-4 w-4" />
+              ) : (
+                <>
+                  <ChevronLeft className="h-4 w-4 mr-2" />
+                  <span className="text-xs">Collapse</span>
+                </>
+              )}
+            </Button>
+          </div>
+        </>
+      )}
     </aside>
   )
 }

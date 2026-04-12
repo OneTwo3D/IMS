@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { ProductLink } from '@/components/inventory/product-link'
 import { saveView, deleteView, type SalesStatRow, type SalesStatSummary, type ShipmentRow, type DetailRow, type InvoiceRow, type RefundRow, type CustomerAgingRow, type SavedView } from '@/app/actions/sales-stats'
 
@@ -417,10 +418,10 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
   // Column header renderer
   function ColHeader({ colKey, label, align }: { colKey: string; label: string; align?: 'right' | 'left' }) {
     return (
-      <th className={`px-3 py-2 text-xs font-medium text-muted-foreground cursor-pointer hover:text-foreground select-none whitespace-nowrap ${align === 'right' ? 'text-right' : 'text-left'}`}
+      <TableHead className={`text-xs cursor-pointer hover:text-foreground select-none ${align === 'right' ? 'text-right' : 'text-left'}`}
         onClick={() => handleSort(colKey)}>
         <span className="inline-flex items-center gap-0.5">{label}{sortCol === colKey && (sortDir === 'asc' ? <ArrowUp className="h-3 w-3" /> : <ArrowDown className="h-3 w-3" />)}</span>
-      </th>
+      </TableHead>
     )
   }
 
@@ -519,32 +520,30 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
   function GenericTable({ data, tabKey, emptyMsg }: { data: any[]; tabKey: Tab; emptyMsg: string }) {
     const cols = visibleColsMap[tabKey]
     return (
-      <div className="rounded-md border overflow-hidden">
+      <div className="rounded-md border">
         <div className="flex items-center justify-between px-3 py-1.5 bg-muted/30 border-b">
           <span className="text-xs text-muted-foreground">{data.length} rows</span>
         </div>
-        <div className="overflow-x-auto">
-          <table className="w-full text-sm">
-            <thead className="border-b bg-muted/50">
-              <tr>
-                {cols.map((key) => {
-                  const f = TAB_FIELDS[tabKey].find((fd) => fd.key === key)
-                  if (!f) return null
-                  return <ColHeader key={key} colKey={key} label={f.label} align={isRightAligned(key) ? 'right' : 'left'} />
-                })}
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {data.map((row, i) => (
-                <tr key={row.id ?? row.orderId ?? row.receiptLineId ?? i} className="hover:bg-muted/30">
-                  {cols.map((key) => (
-                    <td key={key} className={`px-3 py-2 ${isRightAligned(key) ? 'text-right' : ''}`}>{renderCell(row, key, tabKey)}</td>
-                  ))}
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-20rem)]">
+          <TableHeader className="bg-muted/50">
+            <TableRow>
+              {cols.map((key) => {
+                const f = TAB_FIELDS[tabKey].find((fd) => fd.key === key)
+                if (!f) return null
+                return <ColHeader key={key} colKey={key} label={f.label} align={isRightAligned(key) ? 'right' : 'left'} />
+              })}
+            </TableRow>
+          </TableHeader>
+          <TableBody className="divide-y">
+            {data.map((row, i) => (
+              <TableRow key={row.id ?? row.orderId ?? row.receiptLineId ?? i}>
+                {cols.map((key) => (
+                  <TableCell key={key} className={isRightAligned(key) ? 'text-right' : ''}>{renderCell(row, key, tabKey)}</TableCell>
+                ))}
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
         {data.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">{emptyMsg}</p>}
       </div>
     )
@@ -557,7 +556,7 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
       </div>
 
       {/* Summary cards */}
-      <div className="grid grid-cols-5 gap-3">
+      <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Net Revenue</p><p className="text-xl font-bold">{fmtGbp(summary.totalNetRevenue)}</p></div>
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">COGS</p><p className="text-xl font-bold">{fmtGbp(summary.totalCogs)}</p></div>
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Gross Profit</p><p className="text-xl font-bold text-green-600">{fmtGbp(summary.totalGrossProfit)}</p></div>
@@ -597,43 +596,41 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
 
       {/* Products tab with dynamic columns + footer */}
       {tab === 'products' && (
-        <div className="rounded-md border overflow-hidden">
+        <div className="rounded-md border">
           <div className="flex items-center justify-between px-3 py-1.5 bg-muted/30 border-b">
             <span className="text-xs text-muted-foreground">{filteredProducts.length} of {rows.length} products</span>
           </div>
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead className="border-b bg-muted/50">
-                <tr>
+          <Table className="min-w-[700px]" containerClassName="max-h-[calc(100vh-22rem)]">
+            <TableHeader className="bg-muted/50">
+              <TableRow>
+                {visibleCols.map((key) => {
+                  const col = productColRenderers[key]
+                  if (!col) return null
+                  return <ColHeader key={key} colKey={key} label={col.label} align={col.align === 'right' ? 'right' : 'left'} />
+                })}
+              </TableRow>
+            </TableHeader>
+            <TableBody className="divide-y">
+              {filteredProducts.map((r) => (
+                <TableRow key={r.productId}>
                   {visibleCols.map((key) => {
                     const col = productColRenderers[key]
                     if (!col) return null
-                    return <ColHeader key={key} colKey={key} label={col.label} align={col.align === 'right' ? 'right' : 'left'} />
+                    return <TableCell key={key} className={col.align === 'right' ? 'text-right' : ''}>{col.render(r)}</TableCell>
                   })}
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {filteredProducts.map((r) => (
-                  <tr key={r.productId} className="hover:bg-muted/30">
-                    {visibleCols.map((key) => {
-                      const col = productColRenderers[key]
-                      if (!col) return null
-                      return <td key={key} className={`px-3 py-2 ${col.align === 'right' ? 'text-right' : ''}`}>{col.render(r)}</td>
-                    })}
-                  </tr>
-                ))}
-              </tbody>
-              <tfoot className="border-t bg-muted/30 text-sm font-medium">
-                <tr>
-                  {visibleCols.map((key) => {
-                    const col = productColRenderers[key]
-                    if (!col) return null
-                    return <td key={key} className={`px-3 py-2 ${col.align === 'right' ? 'text-right' : ''}`}>{col.footer?.() ?? ''}</td>
-                  })}
-                </tr>
-              </tfoot>
-            </table>
-          </div>
+                </TableRow>
+              ))}
+            </TableBody>
+            <tfoot className="border-t bg-muted/30 text-sm font-medium">
+              <tr>
+                {visibleCols.map((key) => {
+                  const col = productColRenderers[key]
+                  if (!col) return null
+                  return <td key={key} className={`px-3 py-2 ${col.align === 'right' ? 'text-right' : ''}`}>{col.footer?.() ?? ''}</td>
+                })}
+              </tr>
+            </tfoot>
+          </Table>
         </div>
       )}
 

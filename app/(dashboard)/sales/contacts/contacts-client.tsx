@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createCustomer, updateCustomer, importContactsCsv, type CustomerRow, type CustomerInput, type AddressData } from '@/app/actions/customers'
 import { CsvBar } from '@/components/ui/csv-bar'
 
@@ -189,43 +190,41 @@ export function ContactsClient({ initialCustomers }: Props) {
       {filtered.length === 0 ? (
         <p className="text-sm text-muted-foreground text-center py-8">No customers found.</p>
       ) : (
-        <div className="rounded-md border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="border-b bg-muted/50">
-              <tr>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Name</th>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Company</th>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Email</th>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Tax Number</th>
-                <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Billing Address</th>
-                <th className="px-4 py-2 text-right font-medium text-muted-foreground text-xs">Orders</th>
-                <th className="w-16" />
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {[...active, ...inactive].map((c) => (
-                <tr key={c.id} className={`hover:bg-muted/30 ${!c.active ? 'opacity-50' : ''}`}>
-                  <td className="px-4 py-2 font-medium">{c.fullName}</td>
-                  <td className="px-4 py-2 text-muted-foreground text-xs">{c.company ?? '—'}</td>
-                  <td className="px-4 py-2 text-muted-foreground text-xs">{c.email ?? '—'}</td>
-                  <td className="px-4 py-2 text-muted-foreground text-xs font-mono">{c.taxNumber ?? '—'}</td>
-                  <td className="px-4 py-2 text-muted-foreground text-xs truncate max-w-40">{formatAddr(c.billingAddress)}</td>
-                  <td className="px-4 py-2 text-right text-xs tabular-nums">{c.orderCount}</td>
-                  <td className="px-4 py-2">
-                    <div className="flex items-center gap-1 justify-end">
-                      <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setEditing(c)}>
-                        <Pencil className="h-3 w-3" />
-                      </Button>
-                      <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => handleToggle(c)} disabled={isPending}>
-                        {c.active ? <X className="h-3 w-3 text-muted-foreground" /> : <Check className="h-3 w-3 text-muted-foreground" />}
-                      </Button>
-                    </div>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
+        <Table className="rounded-md border min-w-[700px]">
+          <TableHeader className="bg-muted/50">
+            <TableRow>
+              <TableHead className="px-4 text-xs">Name</TableHead>
+              <TableHead className="px-4 text-xs">Company</TableHead>
+              <TableHead className="px-4 text-xs">Email</TableHead>
+              <TableHead className="px-4 text-xs">Tax Number</TableHead>
+              <TableHead className="px-4 text-xs">Billing Address</TableHead>
+              <TableHead className="px-4 text-xs text-right">Orders</TableHead>
+              <TableHead className="w-16" />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {[...active, ...inactive].map((c) => (
+              <TableRow key={c.id} className={!c.active ? 'opacity-50' : ''}>
+                <TableCell className="px-4 font-medium">{c.fullName}</TableCell>
+                <TableCell className="px-4 text-muted-foreground text-xs">{c.company ?? '—'}</TableCell>
+                <TableCell className="px-4 text-muted-foreground text-xs">{c.email ?? '—'}</TableCell>
+                <TableCell className="px-4 text-muted-foreground text-xs font-mono">{c.taxNumber ?? '—'}</TableCell>
+                <TableCell className="px-4 text-muted-foreground text-xs truncate max-w-40">{formatAddr(c.billingAddress)}</TableCell>
+                <TableCell className="px-4 text-right text-xs tabular-nums">{c.orderCount}</TableCell>
+                <TableCell className="px-4">
+                  <div className="flex items-center gap-1 justify-end">
+                    <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setEditing(c)}>
+                      <Pencil className="h-3 w-3" />
+                    </Button>
+                    <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => handleToggle(c)} disabled={isPending}>
+                      {c.active ? <X className="h-3 w-3 text-muted-foreground" /> : <Check className="h-3 w-3 text-muted-foreground" />}
+                    </Button>
+                  </div>
+                </TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
       )}
 
       {editing !== undefined && <CustomerFormDialog customer={editing} onClose={() => setEditing(undefined)} />}

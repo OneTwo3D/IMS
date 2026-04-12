@@ -6,6 +6,7 @@ import { Plus, X, Check, RefreshCw, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   createCurrency,
   toggleCurrency,
@@ -128,60 +129,58 @@ export function CurrenciesTable({ currencies }: Props) {
       )}
       {error && <p className="text-sm text-destructive">{error}</p>}
 
-      <div className="rounded-md border overflow-hidden">
-        <table className="w-full text-sm">
-          <thead className="border-b bg-muted/50">
-            <tr>
-              <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Code</th>
-              <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Name</th>
-              <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Symbol</th>
-              <th className="px-4 py-2 text-right font-medium text-muted-foreground text-xs">Rate (1 GBP =)</th>
-              <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Updated</th>
-              <th className="px-4 py-2 text-left font-medium text-muted-foreground text-xs">Status</th>
-              <th className="w-12" />
-            </tr>
-          </thead>
-          <tbody className="divide-y">
-            {sorted.map((c) => (
-              <tr key={c.code} className={`hover:bg-muted/30 ${!c.active ? 'opacity-50' : ''}`}>
-                <td className="px-4 py-2 font-mono font-medium">{c.code}</td>
-                <td className="px-4 py-2">{c.name}</td>
-                <td className="px-4 py-2">{c.symbol}</td>
-                <td className="px-4 py-2 text-right font-mono text-xs">
-                  {c.code === 'GBP' ? '1.0000' : c.latestRate != null ? c.latestRate.toFixed(4) : '—'}
-                </td>
-                <td className="px-4 py-2 text-muted-foreground text-xs">
-                  {c.rateDate
-                    ? new Date(c.rateDate).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
-                    : c.code === 'GBP' ? '—' : 'Never'}
-                </td>
-                <td className="px-4 py-2">
-                  <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${
-                    c.active
-                      ? 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200'
-                      : 'bg-muted text-muted-foreground border-border'
-                  }`}>
-                    {c.active ? 'Active' : 'Inactive'}
-                  </span>
-                </td>
-                <td className="px-4 py-2">
-                  {c.code !== 'GBP' && (
-                    <Button
-                      variant="ghost" size="sm" className="h-7 w-7 p-0"
-                      onClick={() => handleToggle(c)}
-                      disabled={isPending}
-                    >
-                      {c.active
-                        ? <X className="h-3 w-3 text-muted-foreground" />
-                        : <Check className="h-3 w-3 text-muted-foreground" />}
-                    </Button>
-                  )}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <Table className="rounded-md border">
+        <TableHeader className="bg-muted/50">
+          <TableRow>
+            <TableHead className="text-xs">Code</TableHead>
+            <TableHead className="text-xs">Name</TableHead>
+            <TableHead className="text-xs">Symbol</TableHead>
+            <TableHead className="text-xs text-right">Rate (1 GBP =)</TableHead>
+            <TableHead className="text-xs">Updated</TableHead>
+            <TableHead className="text-xs">Status</TableHead>
+            <TableHead className="w-12" />
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {sorted.map((c) => (
+            <TableRow key={c.code} className={!c.active ? 'opacity-50' : ''}>
+              <TableCell className="font-mono font-medium">{c.code}</TableCell>
+              <TableCell>{c.name}</TableCell>
+              <TableCell>{c.symbol}</TableCell>
+              <TableCell className="text-right font-mono text-xs">
+                {c.code === 'GBP' ? '1.0000' : c.latestRate != null ? c.latestRate.toFixed(4) : '—'}
+              </TableCell>
+              <TableCell className="text-muted-foreground text-xs">
+                {c.rateDate
+                  ? new Date(c.rateDate).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+                  : c.code === 'GBP' ? '—' : 'Never'}
+              </TableCell>
+              <TableCell>
+                <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${
+                  c.active
+                    ? 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200'
+                    : 'bg-muted text-muted-foreground border-border'
+                }`}>
+                  {c.active ? 'Active' : 'Inactive'}
+                </span>
+              </TableCell>
+              <TableCell>
+                {c.code !== 'GBP' && (
+                  <Button
+                    variant="ghost" size="sm" className="h-7 w-7 p-0"
+                    onClick={() => handleToggle(c)}
+                    disabled={isPending}
+                  >
+                    {c.active
+                      ? <X className="h-3 w-3 text-muted-foreground" />
+                      : <Check className="h-3 w-3 text-muted-foreground" />}
+                  </Button>
+                )}
+              </TableCell>
+            </TableRow>
+          ))}
+        </TableBody>
+      </Table>
     </div>
   )
 }

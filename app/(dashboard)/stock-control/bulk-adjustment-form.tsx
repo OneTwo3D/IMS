@@ -128,7 +128,8 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
               <p className="text-sm">Search for products above to add them to this adjustment.</p>
             </div>
           ) : (
-            <div className="border border-border rounded-lg overflow-hidden">
+            <div className="border border-border rounded-lg overflow-x-auto">
+              <div className="min-w-[500px]">
               <div className="grid grid-cols-[2fr_1fr_1fr_auto_auto] gap-3 px-3 py-2 bg-muted/50 text-xs font-medium text-muted-foreground border-b border-border">
                 <span>Product</span>
                 <span>Warehouse</span>
@@ -164,6 +165,7 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
                   </Button>
                 </div>
               ))}
+              </div>
             </div>
           )}
 

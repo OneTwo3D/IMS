@@ -323,7 +323,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
             Columns
           </Button>
           {pickerOpen && (
-            <div className="absolute right-0 top-full mt-1 z-50 w-52 rounded-md border border-border bg-popover shadow-md p-2 space-y-1">
+            <div className="absolute right-0 top-full mt-1 z-50 w-[calc(100vw-2rem)] sm:w-52 rounded-md border border-border bg-popover shadow-md p-2 space-y-1">
               {ALL_COLUMNS.map((c) => (
                 <label key={c.key} className="flex items-center gap-2 px-1 py-0.5 text-sm cursor-pointer hover:bg-accent rounded">
                   <input
@@ -364,8 +364,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
       </div>
 
       {/* Table */}
-      <div className="rounded-lg border border-border bg-card overflow-x-auto">
-        <Table>
+        <Table containerClassName="rounded-lg border border-border bg-card max-h-[calc(100vh-16rem)]" className="min-w-[900px]">
           <TableHeader>
             <TableRow>
               {/* Select-all checkbox */}
@@ -459,7 +458,6 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
             )}
           </TableBody>
         </Table>
-      </div>
 
       {/* Pagination */}
       <PaginationBar page={page} totalPages={totalPages} buildHref={buildPageHref} />

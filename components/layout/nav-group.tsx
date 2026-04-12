@@ -18,9 +18,11 @@ interface NavGroupProps {
   icon: LucideIcon
   children: NavChild[]
   collapsed?: boolean
+  onExpand?: () => void
+  onNavigate?: () => void
 }
 
-export function NavGroup({ label, icon: Icon, children, collapsed }: NavGroupProps) {
+export function NavGroup({ label, icon: Icon, children, collapsed, onExpand, onNavigate }: NavGroupProps) {
   const pathname = usePathname()
   const isChildActive = (c: NavChild) =>
     pathname === c.href || (pathname.startsWith(c.href + '/') && !children.some((other) => other.href !== c.href && pathname.startsWith(other.href)))
@@ -44,7 +46,15 @@ export function NavGroup({ label, icon: Icon, children, collapsed }: NavGroupPro
       <Tooltip>
         <TooltipTrigger
           render={
-            <button type="button" className={parentClass} onClick={() => {}} />
+            <button
+              type="button"
+              className={parentClass}
+              onClick={() => {
+                setOpen(true)
+                onExpand?.()
+              }}
+              aria-label={`Expand ${label}`}
+            />
           }
         >
           <Icon className="h-4 w-4 shrink-0" />
@@ -76,6 +86,7 @@ export function NavGroup({ label, icon: Icon, children, collapsed }: NavGroupPro
               <Link
                 key={child.href}
                 href={child.href}
+                onClick={onNavigate}
                 className={cn(
                   'rounded-md px-2 py-1.5 text-sm transition-colors',
                   'hover:bg-accent hover:text-accent-foreground',

@@ -12,6 +12,7 @@ import { Label } from '@/components/ui/label'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import {
@@ -115,12 +116,12 @@ export function ManufacturingClient({ initialRows, initialTotal }: Props) {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
+      <div className="flex items-center justify-between gap-2 flex-wrap">
+        <div className="min-w-0">
           <h1 className="text-2xl font-semibold">Manufacturing</h1>
           <p className="text-sm text-muted-foreground mt-1">{total} order{total !== 1 ? 's' : ''}</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 shrink-0">
           <Button variant="outline" size="sm" onClick={handleExport}>
             <Download className="h-4 w-4 mr-1" />Export
           </Button>
@@ -132,82 +133,86 @@ export function ManufacturingClient({ initialRows, initialTotal }: Props) {
 
       {/* Filters */}
       <div className="flex items-center gap-3 flex-wrap">
-        <div className="relative flex-1 max-w-xs">
+        <div className="relative flex-1 max-w-xs min-w-[180px]">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
           <Input placeholder="Search orders..." value={searchInput} onChange={(e) => setSearchInput(e.target.value)} className="pl-8 h-9" />
         </div>
-        <div className="flex items-center gap-1">
-          <Filter className="h-4 w-4 text-muted-foreground" />
-          {STATUS_OPTIONS.map((s) => (
-            <Button key={s} variant={statusFilter === s ? 'secondary' : 'ghost'} size="sm" className="h-7 text-xs" onClick={() => handleStatusFilter(s)}>
-              {s === 'ALL' ? 'All' : s.replace('_', ' ')}
-            </Button>
-          ))}
-        </div>
-        <div className="flex items-center gap-1">
-          {TYPE_OPTIONS.map((t) => (
-            <Button key={t} variant={typeFilter === t ? 'secondary' : 'ghost'} size="sm" className="h-7 text-xs" onClick={() => handleTypeFilter(t)}>
-              {t === 'ALL' ? 'All Types' : t.charAt(0) + t.slice(1).toLowerCase()}
-            </Button>
-          ))}
+        <div className="flex items-center gap-2">
+          <Filter className="h-4 w-4 text-muted-foreground shrink-0" />
+          <select
+            value={statusFilter}
+            onChange={(e) => handleStatusFilter(e.target.value)}
+            className="h-9 rounded-md border border-input bg-background px-2.5 text-sm"
+          >
+            {STATUS_OPTIONS.map((s) => (
+              <option key={s} value={s}>{s === 'ALL' ? 'All Statuses' : s.replace('_', ' ')}</option>
+            ))}
+          </select>
+          <select
+            value={typeFilter}
+            onChange={(e) => handleTypeFilter(e.target.value)}
+            className="h-9 rounded-md border border-input bg-background px-2.5 text-sm"
+          >
+            {TYPE_OPTIONS.map((t) => (
+              <option key={t} value={t}>{t === 'ALL' ? 'All Types' : t.charAt(0) + t.slice(1).toLowerCase()}</option>
+            ))}
+          </select>
         </div>
       </div>
 
       {/* Table */}
-      <div className="rounded-lg border overflow-hidden">
-        <table className="w-full text-sm">
-          <thead>
-            <tr className="border-b bg-muted/50">
-              <th className="text-left font-medium px-3 py-2">Reference</th>
-              <th className="text-left font-medium px-3 py-2">Type</th>
-              <th className="w-12 px-2 py-2" />
-              <th className="text-left font-medium px-3 py-2">Product</th>
-              <th className="text-left font-medium px-3 py-2">Warehouse</th>
-              <th className="text-left font-medium px-3 py-2">Manufacturer</th>
-              <th className="text-right font-medium px-3 py-2">Planned</th>
-              <th className="text-right font-medium px-3 py-2">Produced</th>
-              <th className="text-left font-medium px-3 py-2">Status</th>
-              <th className="text-left font-medium px-3 py-2">Created</th>
-            </tr>
-          </thead>
-          <tbody>
-            {rows.length === 0 ? (
-              <tr>
-                <td colSpan={10} className="px-3 py-8 text-center text-muted-foreground">
-                  {isPending ? 'Loading...' : 'No manufacturing orders found.'}
-                </td>
-              </tr>
-            ) : (
-              rows.map((r) => (
-                <tr key={r.id} className="border-b hover:bg-muted/30 transition-colors cursor-pointer" onClick={() => router.push(`/manufacturing/${r.id}`)}>
-                  <td className="px-3 py-2 font-mono text-xs">{r.reference}</td>
-                  <td className="px-3 py-2">
-                    <Badge variant="secondary" className="text-xs font-normal">
-                      {r.orderType === 'ASSEMBLY' ? 'Assembly' : 'Disassembly'}
-                    </Badge>
-                  </td>
-                  <td className="w-12 px-2 py-1">
-                    <ProductThumb productId={r.productId} imageUrl={r.productImageUrl} name={r.productName} />
-                  </td>
-                  <td className="px-3 py-2">
-                    <ProductLink productId={r.productId} sku={r.productSku} name={r.productName} skuClassName="font-mono text-xs text-muted-foreground mr-1" />
-                  </td>
-                  <td className="px-3 py-2">{r.warehouseName}</td>
-                  <td className="px-3 py-2 text-muted-foreground">{r.manufacturerName ?? '—'}</td>
-                  <td className="px-3 py-2 text-right">{r.qtyPlanned}</td>
-                  <td className="px-3 py-2 text-right">{r.qtyProduced}</td>
-                  <td className="px-3 py-2">
-                    <Badge variant="secondary" className={`text-xs font-normal ${STATUS_BADGE[r.status] ?? ''}`}>
-                      {r.status.replace('_', ' ')}
-                    </Badge>
-                  </td>
-                  <td className="px-3 py-2 text-muted-foreground text-xs">{fmtDate(r.createdAt)}</td>
-                </tr>
-              ))
-            )}
-          </tbody>
-        </table>
-      </div>
+      <Table className="rounded-lg border min-w-[800px]">
+        <TableHeader>
+          <TableRow className="bg-muted/50">
+            <TableHead>Reference</TableHead>
+            <TableHead>Type</TableHead>
+            <TableHead className="w-12 px-2" />
+            <TableHead>Product</TableHead>
+            <TableHead>Warehouse</TableHead>
+            <TableHead>Manufacturer</TableHead>
+            <TableHead className="text-right">Planned</TableHead>
+            <TableHead className="text-right">Produced</TableHead>
+            <TableHead>Status</TableHead>
+            <TableHead>Created</TableHead>
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {rows.length === 0 ? (
+            <TableRow>
+              <TableCell colSpan={10} className="py-8 text-center text-muted-foreground">
+                {isPending ? 'Loading...' : 'No manufacturing orders found.'}
+              </TableCell>
+            </TableRow>
+          ) : (
+            rows.map((r) => (
+              <TableRow key={r.id} className="cursor-pointer" onClick={() => router.push(`/manufacturing/${r.id}`)}>
+                <TableCell className="font-mono text-xs">{r.reference}</TableCell>
+                <TableCell>
+                  <Badge variant="secondary" className="text-xs font-normal">
+                    {r.orderType === 'ASSEMBLY' ? 'Assembly' : 'Disassembly'}
+                  </Badge>
+                </TableCell>
+                <TableCell className="w-12 px-2 py-1">
+                  <ProductThumb productId={r.productId} imageUrl={r.productImageUrl} name={r.productName} />
+                </TableCell>
+                <TableCell>
+                  <ProductLink productId={r.productId} sku={r.productSku} name={r.productName} skuClassName="font-mono text-xs text-muted-foreground mr-1" />
+                </TableCell>
+                <TableCell>{r.warehouseName}</TableCell>
+                <TableCell className="text-muted-foreground">{r.manufacturerName ?? '—'}</TableCell>
+                <TableCell className="text-right">{r.qtyPlanned}</TableCell>
+                <TableCell className="text-right">{r.qtyProduced}</TableCell>
+                <TableCell>
+                  <Badge variant="secondary" className={`text-xs font-normal ${STATUS_BADGE[r.status] ?? ''}`}>
+                    {r.status.replace('_', ' ')}
+                  </Badge>
+                </TableCell>
+                <TableCell className="text-muted-foreground text-xs">{fmtDate(r.createdAt)}</TableCell>
+              </TableRow>
+            ))
+          )}
+        </TableBody>
+      </Table>
 
       {/* Pagination */}
       {totalPages > 1 && (

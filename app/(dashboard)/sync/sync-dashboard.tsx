@@ -2,6 +2,7 @@
 
 import { useState } from 'react'
 import { Card } from '@/components/ui/card'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { SyncClient } from './sync-client'
 import { XeroClient } from './xero-client'
 import type { WcSyncSettings, TaxRateMappingRow, StatusMappingRow, SyncLogRow } from '@/app/actions/wc-sync'
@@ -150,28 +151,28 @@ export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcL
           <p className="text-sm text-muted-foreground">
             Base URL: <code className="bg-muted px-1.5 py-0.5 rounded text-xs font-mono">{baseUrl}/api/v1</code>
           </p>
-          <div className="rounded-md border overflow-hidden">
-            <table className="w-full text-sm">
-              <thead className="bg-muted/50 border-b"><tr>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground w-20">Method</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Endpoint</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Description</th>
-              </tr></thead>
-              <tbody className="divide-y">
-                {endpoints.map((e, i) => (
-                  <tr key={i}>
-                    <td className="px-3 py-2">
-                      <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-mono font-medium ${e.method === 'GET' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' : e.method === 'POST' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' : 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200'}`}>
-                        {e.method}
-                      </span>
-                    </td>
-                    <td className="px-3 py-2 font-mono text-xs">{e.path}</td>
-                    <td className="px-3 py-2 text-muted-foreground">{e.description}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <Table className="rounded-md border">
+            <TableHeader className="bg-muted/50">
+              <TableRow>
+                <TableHead className="text-xs w-20">Method</TableHead>
+                <TableHead className="text-xs">Endpoint</TableHead>
+                <TableHead className="text-xs">Description</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {endpoints.map((e, i) => (
+                <TableRow key={i}>
+                  <TableCell>
+                    <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-mono font-medium ${e.method === 'GET' ? 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200' : e.method === 'POST' ? 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200' : 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200'}`}>
+                      {e.method}
+                    </span>
+                  </TableCell>
+                  <TableCell className="font-mono text-xs">{e.path}</TableCell>
+                  <TableCell className="text-muted-foreground">{e.description}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
           <p className="text-xs text-muted-foreground">
             All responses return JSON. List endpoints support <code className="bg-muted px-1 rounded">?limit</code> and <code className="bg-muted px-1 rounded">?offset</code> pagination.
             The API is under active development — additional endpoints will be added.

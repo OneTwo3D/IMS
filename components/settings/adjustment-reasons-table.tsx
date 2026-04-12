@@ -5,6 +5,7 @@ import { Pencil, Trash2, Plus, Check, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   createAdjustmentReason,
   updateAdjustmentReason,
@@ -114,8 +115,8 @@ function EditForm({
   }
 
   return (
-    <tr className="border-b border-border last:border-0 bg-muted/30">
-      <td colSpan={5} className="py-3 px-2">
+    <TableRow className="bg-muted/30">
+      <TableCell colSpan={5} className="py-3 px-2">
         <div className="flex gap-2 items-end">
           <ReasonFields fields={fields} onChange={setFields} error={error} />
           <div className="flex gap-1 pb-0.5">
@@ -127,8 +128,8 @@ function EditForm({
             </Button>
           </div>
         </div>
-      </td>
-    </tr>
+      </TableCell>
+    </TableRow>
   )
 }
 
@@ -171,18 +172,18 @@ function ReasonRow({
   }
 
   return (
-    <tr className="border-b border-border last:border-0">
-      <td className="py-2 pr-4 text-sm">{reason.name}</td>
-      <td className="py-2 pr-4 text-sm font-mono text-muted-foreground">
+    <TableRow>
+      <TableCell className="text-sm">{reason.name}</TableCell>
+      <TableCell className="text-sm font-mono text-muted-foreground">
         {reason.accountCode ?? <span className="text-muted-foreground/50">—</span>}
-      </td>
-      <td className="py-2 pr-4 text-sm text-center">{reason.sortOrder}</td>
-      <td className="py-2 pr-4 text-sm text-center">
+      </TableCell>
+      <TableCell className="text-sm text-center">{reason.sortOrder}</TableCell>
+      <TableCell className="text-sm text-center">
         <span className={reason.active ? 'text-green-600' : 'text-muted-foreground'}>
           {reason.active ? 'Yes' : 'No'}
         </span>
-      </td>
-      <td className="py-2 text-right">
+      </TableCell>
+      <TableCell className="text-right">
         <div className="flex items-center justify-end gap-1">
           <Button variant="ghost" size="icon" onClick={() => setEditing(true)} title="Edit">
             <Pencil className="h-3.5 w-3.5" />
@@ -192,8 +193,8 @@ function ReasonRow({
             <Trash2 className="h-3.5 w-3.5" />
           </Button>
         </div>
-      </td>
-    </tr>
+      </TableCell>
+    </TableRow>
   )
 }
 
@@ -231,20 +232,20 @@ function AddReasonRow({ onAdded }: { onAdded: (item: AdjustmentReason) => void }
 
   if (!open) {
     return (
-      <tr>
-        <td colSpan={5} className="pt-3">
+      <TableRow>
+        <TableCell colSpan={5} className="pt-3">
           <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
             <Plus className="h-3.5 w-3.5 mr-1" />
             Add Reason
           </Button>
-        </td>
-      </tr>
+        </TableCell>
+      </TableRow>
     )
   }
 
   return (
-    <tr className="bg-muted/30">
-      <td colSpan={5} className="py-3 px-2">
+    <TableRow className="bg-muted/30">
+      <TableCell colSpan={5} className="py-3 px-2">
         <div className="flex gap-2 items-end">
           <ReasonFields fields={fields} onChange={setFields} error={error} />
           <div className="flex gap-1 pb-0.5">
@@ -256,8 +257,8 @@ function AddReasonRow({ onAdded }: { onAdded: (item: AdjustmentReason) => void }
             </Button>
           </div>
         </div>
-      </td>
-    </tr>
+      </TableCell>
+    </TableRow>
   )
 }
 
@@ -269,23 +270,23 @@ export function AdjustmentReasonsTable({ reasons: initial }: Props) {
   const [reasons, setReasons] = useState(initial)
 
   return (
-    <table className="w-full text-sm">
-      <thead>
-        <tr className="border-b border-border text-xs text-muted-foreground">
-          <th className="pb-2 text-left font-medium">Reason Name</th>
-          <th className="pb-2 text-left font-medium">Account Code</th>
-          <th className="pb-2 text-center font-medium w-24">Sort</th>
-          <th className="pb-2 text-center font-medium w-20">Active</th>
-          <th className="pb-2 w-20" />
-        </tr>
-      </thead>
-      <tbody>
+    <Table>
+      <TableHeader>
+        <TableRow>
+          <TableHead className="text-xs">Reason Name</TableHead>
+          <TableHead className="text-xs">Account Code</TableHead>
+          <TableHead className="text-xs text-center w-24">Sort</TableHead>
+          <TableHead className="text-xs text-center w-20">Active</TableHead>
+          <TableHead className="w-20" />
+        </TableRow>
+      </TableHeader>
+      <TableBody>
         {reasons.length === 0 && (
-          <tr>
-            <td colSpan={5} className="py-4 text-sm text-muted-foreground text-center">
+          <TableRow>
+            <TableCell colSpan={5} className="py-4 text-sm text-muted-foreground text-center">
               No reasons configured yet.
-            </td>
-          </tr>
+            </TableCell>
+          </TableRow>
         )}
         {reasons.map((r) => (
           <ReasonRow
@@ -296,7 +297,7 @@ export function AdjustmentReasonsTable({ reasons: initial }: Props) {
           />
         ))}
         <AddReasonRow onAdded={(item) => setReasons((prev) => [...prev, item])} />
-      </tbody>
-    </table>
+      </TableBody>
+    </Table>
   )
 }

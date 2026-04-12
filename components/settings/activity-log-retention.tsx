@@ -38,7 +38,7 @@ export function ActivityLogRetentionSetting({ infoValue, warningValue, errorValu
       <p className="text-xs text-muted-foreground">
         Set to 0 to keep entries forever. Cleanup runs daily via <code className="text-xs bg-muted px-1 rounded">/api/cron/activity-cleanup</code>.
       </p>
-      <div className="grid grid-cols-3 gap-4 max-w-lg">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 max-w-lg">
         <div className="space-y-1.5">
           <Label className="text-xs">Info (days)</Label>
           <Input type="number" min={0} value={info} onChange={(e) => setInfo(e.target.value)} className="h-9" />

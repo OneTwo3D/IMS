@@ -6,6 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Card } from '@/components/ui/card'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   dispatchTransfer,
   receiveTransfer,
@@ -117,7 +118,7 @@ function EditDraftForm({
 
   return (
     <div className="p-4 space-y-4 border-t border-border bg-muted/10">
-      <div className="grid grid-cols-2 gap-4 max-w-lg">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 max-w-lg">
         <div>
           <p className="text-xs text-muted-foreground mb-1">From</p>
           <Select value={fromId} onChange={(e) => setFromId(e.target.value)} className="h-8 text-xs">
@@ -162,7 +163,8 @@ function EditDraftForm({
 
       {/* Lines */}
       {lines.length > 0 && (
-        <div className="border border-border rounded-md overflow-hidden">
+        <div className="border border-border rounded-md overflow-x-auto">
+          <div className="min-w-[500px]">
           <div className="grid grid-cols-[2fr_auto_auto_auto_auto] gap-2 px-3 py-1.5 bg-muted/30 text-xs font-medium text-muted-foreground border-b border-border">
             <span>Product</span>
             <span className="w-24 text-right">From {warehouses.find((w) => w.id === fromId)?.code ?? ''}</span>
@@ -194,6 +196,7 @@ function EditDraftForm({
               </div>
             )
           })}
+          </div>
         </div>
       )}
 
@@ -254,97 +257,112 @@ function TransferCard({
     else setActionError(res.message ?? 'Failed.')
   }
 
+  const COL_COUNT = 6
+
   return (
-    <div className="border-b border-border/50 last:border-0">
+    <>
       {/* Summary row */}
-      <div className="flex items-center gap-3 px-4 py-3 hover:bg-muted/10 group">
-        <button type="button" className="flex-1 flex items-center gap-3 text-left min-w-0"
-          onClick={() => { setExpanded((v) => !v); setEditing(false) }}>
-          <span className="font-mono text-xs font-medium w-36 shrink-0">{transfer.reference}</span>
-          <span className="text-sm text-muted-foreground truncate flex-1">
-            {transfer.fromWarehouseCode} → {transfer.toWarehouseCode}
-            <span className="ml-2 text-xs">({transfer.lines.length} line{transfer.lines.length !== 1 ? 's' : ''})</span>
-          </span>
-          <span className={`text-xs px-2 py-0.5 rounded-full font-medium shrink-0 ${STATUS_CLASS[transfer.status]}`}>
+      <TableRow className="group cursor-pointer" onClick={() => { setExpanded((v) => !v); setEditing(false) }}>
+        <TableCell className="font-mono text-xs font-medium whitespace-nowrap">{transfer.reference}</TableCell>
+        <TableCell className="text-sm text-muted-foreground whitespace-nowrap">
+          {transfer.fromWarehouseCode} → {transfer.toWarehouseCode}
+          <span className="ml-2 text-xs">({transfer.lines.length} line{transfer.lines.length !== 1 ? 's' : ''})</span>
+        </TableCell>
+        <TableCell>
+          <span className={`text-xs px-2 py-0.5 rounded-full font-medium whitespace-nowrap ${STATUS_CLASS[transfer.status]}`}>
             {STATUS_LABEL[transfer.status]}
           </span>
-          <span className="text-xs text-muted-foreground shrink-0 hidden sm:block">{formatDate(transfer.createdAt)}</span>
-          {expanded ? <ChevronUp className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : <ChevronDown className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />}
-        </button>
-
-        {/* Action buttons */}
-        <div className="flex items-center gap-1 shrink-0">
-          {transfer.status === 'DRAFT' && (
-            <>
-              <Button size="sm" variant="outline" className="h-7 text-xs gap-1" onClick={handleDispatch} disabled={actioning}>
-                <Truck className="h-3 w-3" /> Dispatch
+        </TableCell>
+        <TableCell className="text-xs text-muted-foreground whitespace-nowrap">{formatDate(transfer.createdAt)}</TableCell>
+        <TableCell onClick={(e) => e.stopPropagation()}>
+          <div className="flex items-center gap-1">
+            {transfer.status === 'DRAFT' && (
+              <>
+                <Button size="sm" variant="outline" className="h-7 text-xs gap-1" onClick={handleDispatch} disabled={actioning}>
+                  <Truck className="h-3 w-3" /> Dispatch
+                </Button>
+                <Button size="icon" variant="ghost" className="h-7 w-7 opacity-0 group-hover:opacity-100"
+                  title="Edit" onClick={() => { setEditing((v) => !v); setExpanded(true) }}>
+                  <Pencil className="h-3 w-3" />
+                </Button>
+                <Button size="icon" variant="ghost" className="h-7 w-7 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive"
+                  title="Cancel transfer" onClick={handleCancel} disabled={actioning}>
+                  <Ban className="h-3 w-3" />
+                </Button>
+              </>
+            )}
+            {transfer.status === 'IN_TRANSIT' && (
+              <Button size="sm" variant="outline" className="h-7 text-xs gap-1 text-green-700 border-green-300 hover:bg-green-50 dark:text-green-400 dark:border-green-700 dark:hover:bg-green-950"
+                onClick={handleReceive} disabled={actioning}>
+                <PackageCheck className="h-3 w-3" /> Mark Received
               </Button>
-              <Button size="icon" variant="ghost" className="h-7 w-7 opacity-0 group-hover:opacity-100"
-                title="Edit" onClick={() => { setEditing((v) => !v); setExpanded(true) }}>
-                <Pencil className="h-3 w-3" />
-              </Button>
-              <Button size="icon" variant="ghost" className="h-7 w-7 opacity-0 group-hover:opacity-100 text-muted-foreground hover:text-destructive"
-                title="Cancel transfer" onClick={handleCancel} disabled={actioning}>
-                <Ban className="h-3 w-3" />
-              </Button>
-            </>
-          )}
-          {transfer.status === 'IN_TRANSIT' && (
-            <Button size="sm" variant="outline" className="h-7 text-xs gap-1 text-green-700 border-green-300 hover:bg-green-50 dark:text-green-400 dark:border-green-700 dark:hover:bg-green-950"
-              onClick={handleReceive} disabled={actioning}>
-              <PackageCheck className="h-3 w-3" /> Mark Received
-            </Button>
-          )}
-        </div>
-        {actionError && <p className="text-xs text-destructive shrink-0">{actionError}</p>}
-      </div>
+            )}
+            {actionError && <p className="text-xs text-destructive whitespace-nowrap">{actionError}</p>}
+          </div>
+        </TableCell>
+        <TableCell className="w-8">
+          {expanded ? <ChevronUp className="h-3.5 w-3.5 text-muted-foreground" /> : <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />}
+        </TableCell>
+      </TableRow>
 
       {/* Expanded detail */}
       {expanded && !editing && (
-        <div className="px-4 pb-3 space-y-2 bg-muted/5">
-          {transfer.notes && (
-            <p className="text-xs text-muted-foreground italic">{transfer.notes}</p>
-          )}
-          <div className="border border-border rounded-md overflow-hidden">
-            <div className="grid grid-cols-[auto_1fr_auto_auto] gap-3 px-3 py-1.5 bg-muted/30 text-xs font-medium text-muted-foreground border-b border-border">
-              <span className="w-9" />
-              <span>Product</span>
-              <span className="w-16 text-right">Qty</span>
-              <span className="w-16 text-right">Received</span>
+        <TableRow className="hover:bg-transparent">
+          <TableCell colSpan={COL_COUNT} className="bg-muted/5 p-4">
+            <div className="space-y-2">
+              {transfer.notes && (
+                <p className="text-xs text-muted-foreground italic">{transfer.notes}</p>
+              )}
+              <Table className="rounded-md border min-w-[400px]">
+                <TableHeader className="bg-muted/30">
+                  <TableRow>
+                    <TableHead className="w-9 text-xs" />
+                    <TableHead className="text-xs">Product</TableHead>
+                    <TableHead className="text-xs text-right w-16">Qty</TableHead>
+                    <TableHead className="text-xs text-right w-16">Received</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {transfer.lines.map((line) => (
+                    <TableRow key={line.id}>
+                      <TableCell className="w-9 p-1.5 pl-3"><ProductThumb productId={line.productId} imageUrl={imageMap.get(line.productId) ?? null} name={line.productName} /></TableCell>
+                      <TableCell className="p-1.5">
+                        <ProductLink productId={line.productId} sku={line.sku} name={line.productName} skuClassName="font-mono text-xs font-medium" />
+                      </TableCell>
+                      <TableCell className="font-mono text-xs text-right w-16 p-1.5">{line.qty}</TableCell>
+                      <TableCell className={`font-mono text-xs text-right w-16 p-1.5 ${line.qtyReceived >= line.qty ? 'text-green-600' : 'text-muted-foreground'}`}>
+                        {line.qtyReceived}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+              {transfer.status === 'IN_TRANSIT' && (
+                <p className="text-xs text-blue-600 dark:text-blue-400">
+                  Stock has been booked out of <strong>{transfer.fromWarehouseCode}</strong> and is in transit to <strong>{transfer.toWarehouseCode}</strong>. Not available for sale.
+                </p>
+              )}
             </div>
-            {transfer.lines.map((line) => (
-              <div key={line.id} className="grid grid-cols-[auto_1fr_auto_auto] gap-3 px-3 py-1.5 items-center border-b border-border/40 last:border-0 text-sm">
-                <ProductThumb productId={line.productId} imageUrl={imageMap.get(line.productId) ?? null} name={line.productName} />
-                <div>
-                  <ProductLink productId={line.productId} sku={line.sku} name={line.productName} skuClassName="font-mono text-xs font-medium" />
-                </div>
-                <span className="font-mono text-xs text-right w-16">{line.qty}</span>
-                <span className={`font-mono text-xs text-right w-16 ${line.qtyReceived >= line.qty ? 'text-green-600' : 'text-muted-foreground'}`}>
-                  {line.qtyReceived}
-                </span>
-              </div>
-            ))}
-          </div>
-          {transfer.status === 'IN_TRANSIT' && (
-            <p className="text-xs text-blue-600 dark:text-blue-400">
-              Stock has been booked out of <strong>{transfer.fromWarehouseCode}</strong> and is in transit to <strong>{transfer.toWarehouseCode}</strong>. Not available for sale.
-            </p>
-          )}
-        </div>
+          </TableCell>
+        </TableRow>
       )}
 
       {/* Edit form */}
       {editing && transfer.status === 'DRAFT' && (
-        <EditDraftForm
-          transfer={transfer}
-          warehouses={warehouses}
-          products={products}
-          stockLevels={stockLevels}
-          onSaved={(updated) => { setTransfer(updated); onUpdated(updated); setEditing(false) }}
-          onCancel={() => setEditing(false)}
-        />
+        <TableRow className="hover:bg-transparent">
+          <TableCell colSpan={COL_COUNT} className="p-0">
+            <EditDraftForm
+              transfer={transfer}
+              warehouses={warehouses}
+              products={products}
+              stockLevels={stockLevels}
+              onSaved={(updated) => { setTransfer(updated); onUpdated(updated); setEditing(false) }}
+              onCancel={() => setEditing(false)}
+            />
+          </TableCell>
+        </TableRow>
       )}
-    </div>
+    </>
   )
 }
 
@@ -388,16 +406,30 @@ export function TransferList({ transfers, warehouses, products, stockLevels, onT
         )}
       </div>
 
-      {visible.map((t) => (
-        <TransferCard
-          key={t.id}
-          transfer={t}
-          warehouses={warehouses}
-          products={products}
-          stockLevels={stockLevels}
-          onUpdated={onTransferUpdated}
-        />
-      ))}
+      <Table className="min-w-[700px]">
+        <TableHeader className="bg-muted/20">
+          <TableRow>
+            <TableHead className="text-xs">Reference</TableHead>
+            <TableHead className="text-xs">Route</TableHead>
+            <TableHead className="text-xs">Status</TableHead>
+            <TableHead className="text-xs">Date</TableHead>
+            <TableHead className="text-xs">Actions</TableHead>
+            <TableHead className="w-8" />
+          </TableRow>
+        </TableHeader>
+        <TableBody>
+          {visible.map((t) => (
+            <TransferCard
+              key={t.id}
+              transfer={t}
+              warehouses={warehouses}
+              products={products}
+              stockLevels={stockLevels}
+              onUpdated={onTransferUpdated}
+            />
+          ))}
+        </TableBody>
+      </Table>
 
       {collapsed && transfers.length > 10 && (
         <div className="px-4 py-2 text-center">

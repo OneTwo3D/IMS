@@ -11,6 +11,7 @@ import {
   DialogContent,
   DialogHeader,
   DialogTitle,
+  DialogFooter,
 } from '@/components/ui/dialog'
 import type { ProductFormState } from '@/app/actions/products'
 import { COUNTRY_LIST } from '@/lib/countries'
@@ -117,7 +118,7 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
       </div>
 
       {/* Core fields */}
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div className="space-y-1.5">
           <Label htmlFor="sku">SKU *</Label>
           <Input
@@ -204,7 +205,7 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
       </div>
 
       {/* Customs */}
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
         <div className="space-y-1.5">
           <Label htmlFor="hsCode">HS Code</Label>
           <Input
@@ -236,7 +237,7 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
         <p className="text-sm text-muted-foreground">Prices are set on individual variants.</p>
       ) : (
       <div className="space-y-3">
-        <div className="grid grid-cols-2 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="space-y-1.5">
             <Label htmlFor="salesPriceGbp">Regular Price (GBP)</Label>
             <Input
@@ -299,7 +300,7 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
       )}
 
       {/* Stock unit + behaviour */}
-      <div className="grid grid-cols-2 gap-4">
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
       <div className="space-y-1.5">
         <Label htmlFor="stockUnit">Stock Unit</Label>
         <Select id="stockUnit" name="stockUnit" value={fields.stockUnit} onChange={(ev) => set('stockUnit', ev.target.value)} className="w-32 font-mono">
@@ -348,7 +349,7 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
       {/* Dimensions + Weight */}
       <div className="space-y-1.5">
         <Label className="text-sm font-medium">Dimensions &amp; Weight</Label>
-        <div className="grid grid-cols-4 gap-2">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
           <div className="space-y-1">
             <Label htmlFor="widthCm" className="text-xs text-muted-foreground">Width (cm)</Label>
             <Input id="widthCm" name="widthCm" type="number" step="0.01" min="0"
@@ -377,16 +378,16 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
       </div>
 
       {/* Actions */}
-      <div className="flex gap-3 pt-2">
-        <Button type="submit" disabled={isPending}>
-          {isPending ? 'Saving…' : 'Save Product'}
-        </Button>
+      <DialogFooter>
         {onClose && (
           <Button type="button" variant="outline" onClick={onClose}>
             Cancel
           </Button>
         )}
-      </div>
+        <Button type="submit" disabled={isPending}>
+          {isPending ? 'Saving…' : 'Save Product'}
+        </Button>
+      </DialogFooter>
     </form>
   )
 

@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   saveXeroSettings, connectXero, disconnectXero,
   syncXeroAccounts, triggerXeroSync, fetchXeroTaxRates,
@@ -420,56 +421,54 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
             <a href="/settings/accounting" className="underline hover:text-foreground">Add one in Settings → Accounting</a>.
           </p>
         ) : (
-          <div className="rounded-md border overflow-hidden">
-            <table className="w-full text-sm">
-              <thead className="bg-muted/50 border-b">
-                <tr>
-                  <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">IMS VAT Rate</th>
-                  <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground">Rate</th>
-                  <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Xero Tax Code</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {imsTaxRates.map(r => {
-                  const stored = taxMappings[r.id] ?? ''
-                  const storedKnown = !stored || xeroTaxRates.some(x => x.taxType === stored)
-                  return (
-                    <tr key={r.id}>
-                      <td className="px-3 py-2 font-medium">
-                        {r.name}
-                        {!r.active && <span className="ml-1.5 text-[10px] text-muted-foreground">(inactive)</span>}
-                      </td>
-                      <td className="px-3 py-2 text-right font-mono text-xs text-muted-foreground">
-                        {(r.rate * 100).toFixed(2)}%
-                      </td>
-                      <td className="px-3 py-2">
-                        <div className="flex items-center gap-2">
-                          <select
-                            className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                            value={stored}
-                            onChange={e => handleTaxMappingChange(r.id, e.target.value)}
-                            disabled={savingTaxId === r.id}
-                          >
-                            <option value="">— Not mapped —</option>
-                            {xeroTaxRates.map(x => (
-                              <option key={x.taxType} value={x.taxType}>
-                                {x.name} ({x.rate.toFixed(2)}%) — {x.taxType}
-                              </option>
-                            ))}
-                            {/* Preserve a legacy/unknown value rather than silently blanking it. */}
-                            {!storedKnown && stored && (
-                              <option value={stored}>{stored} (unknown)</option>
-                            )}
-                          </select>
-                          {savingTaxId === r.id && <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />}
-                        </div>
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
+          <Table className="rounded-md border">
+            <TableHeader className="bg-muted/50">
+              <TableRow>
+                <TableHead className="text-xs">IMS VAT Rate</TableHead>
+                <TableHead className="text-xs text-right">Rate</TableHead>
+                <TableHead className="text-xs">Xero Tax Code</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {imsTaxRates.map(r => {
+                const stored = taxMappings[r.id] ?? ''
+                const storedKnown = !stored || xeroTaxRates.some(x => x.taxType === stored)
+                return (
+                  <TableRow key={r.id}>
+                    <TableCell className="font-medium">
+                      {r.name}
+                      {!r.active && <span className="ml-1.5 text-[10px] text-muted-foreground">(inactive)</span>}
+                    </TableCell>
+                    <TableCell className="text-right font-mono text-xs text-muted-foreground">
+                      {(r.rate * 100).toFixed(2)}%
+                    </TableCell>
+                    <TableCell>
+                      <div className="flex items-center gap-2">
+                        <select
+                          className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                          value={stored}
+                          onChange={e => handleTaxMappingChange(r.id, e.target.value)}
+                          disabled={savingTaxId === r.id}
+                        >
+                          <option value="">— Not mapped —</option>
+                          {xeroTaxRates.map(x => (
+                            <option key={x.taxType} value={x.taxType}>
+                              {x.name} ({x.rate.toFixed(2)}%) — {x.taxType}
+                            </option>
+                          ))}
+                          {/* Preserve a legacy/unknown value rather than silently blanking it. */}
+                          {!storedKnown && stored && (
+                            <option value={stored}>{stored} (unknown)</option>
+                          )}
+                        </select>
+                        {savingTaxId === r.id && <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />}
+                      </div>
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
         )}
       </Card>
 
@@ -565,120 +564,118 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
             <option key={id} value={id}>{title}</option>
           ))}
         </datalist>
-        <div className="rounded-md border overflow-hidden">
-          <table className="w-full text-sm">
-            <thead className="bg-muted/50 border-b">
-              <tr>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Payment Method</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Currency</th>
-                <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Xero Bank Account</th>
-                <th className="px-3 py-2 w-10" />
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {paymentMapRows.map((row, i) => (
-                <tr key={i}>
-                  <td className="px-3 py-1.5">
+        <Table className="rounded-md border">
+          <TableHeader className="bg-muted/50">
+            <TableRow>
+              <TableHead className="text-xs">Payment Method</TableHead>
+              <TableHead className="text-xs">Currency</TableHead>
+              <TableHead className="text-xs">Xero Bank Account</TableHead>
+              <TableHead className="w-10" />
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {paymentMapRows.map((row, i) => (
+              <TableRow key={i}>
+                <TableCell className="py-1.5">
+                  <Input
+                    value={row.method}
+                    list="payment-method-suggestions"
+                    onChange={e => {
+                      const updated = [...paymentMapRows]
+                      updated[i] = { ...row, method: e.target.value }
+                      setPaymentMapRows(updated)
+                    }}
+                    placeholder="e.g. stripe"
+                    className="h-8 text-xs"
+                  />
+                </TableCell>
+                <TableCell className="py-1.5">
+                  <select
+                    className="flex h-8 w-28 rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    value={row.currency}
+                    onChange={e => {
+                      const updated = [...paymentMapRows]
+                      updated[i] = { ...row, currency: e.target.value }
+                      setPaymentMapRows(updated)
+                    }}
+                  >
+                    <option value="">— Select —</option>
+                    <option value="*">Any (*)</option>
+                    {currencies.map(c => (
+                      <option key={c.code} value={c.code}>{c.code}</option>
+                    ))}
+                    {/* If a stored value refers to a currency that's no longer active, still show it so the row isn't silently blanked. */}
+                    {row.currency && row.currency !== '*' && !currencies.some(c => c.code === row.currency) && (
+                      <option value={row.currency}>{row.currency} (inactive)</option>
+                    )}
+                  </select>
+                </TableCell>
+                <TableCell className="py-1.5">
+                  {accounts.length > 0 ? (
+                    (() => {
+                      // Filter to BANK accounts, fall back to all if none are classified as BANK.
+                      const bankAccounts = accounts.filter(a => a.type === 'BANK')
+                      const options = bankAccounts.length > 0 ? bankAccounts : accounts
+                      // Stored value is preferentially the Xero UUID (xeroId) but legacy rows
+                      // may still hold a Code. Accept either by matching against both fields.
+                      const storedKnown = options.some(a => a.xeroId === row.accountCode || a.code === row.accountCode)
+                      return (
+                        <select
+                          className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                          value={row.accountCode}
+                          onChange={e => {
+                            const updated = [...paymentMapRows]
+                            updated[i] = { ...row, accountCode: e.target.value }
+                            setPaymentMapRows(updated)
+                          }}
+                        >
+                          <option value="">— Select —</option>
+                          {options.map(a => (
+                            // Use xeroId as the option value — it's always populated and unique,
+                            // avoiding the collision that occurred when BANK accounts had NULL codes.
+                            <option key={a.id} value={a.xeroId}>
+                              {a.code ? `${a.code} — ${a.name}` : a.name}
+                            </option>
+                          ))}
+                          {/* Preserve an unrecognised stored value so legacy mappings aren't silently blanked. */}
+                          {row.accountCode && !storedKnown && (
+                            <option value={row.accountCode}>{row.accountCode} (unknown)</option>
+                          )}
+                        </select>
+                      )
+                    })()
+                  ) : (
                     <Input
-                      value={row.method}
-                      list="payment-method-suggestions"
+                      value={row.accountCode}
                       onChange={e => {
                         const updated = [...paymentMapRows]
-                        updated[i] = { ...row, method: e.target.value }
+                        updated[i] = { ...row, accountCode: e.target.value }
                         setPaymentMapRows(updated)
                       }}
-                      placeholder="e.g. stripe"
+                      placeholder="Account code"
                       className="h-8 text-xs"
                     />
-                  </td>
-                  <td className="px-3 py-1.5">
-                    <select
-                      className="flex h-8 w-28 rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                      value={row.currency}
-                      onChange={e => {
-                        const updated = [...paymentMapRows]
-                        updated[i] = { ...row, currency: e.target.value }
-                        setPaymentMapRows(updated)
-                      }}
-                    >
-                      <option value="">— Select —</option>
-                      <option value="*">Any (*)</option>
-                      {currencies.map(c => (
-                        <option key={c.code} value={c.code}>{c.code}</option>
-                      ))}
-                      {/* If a stored value refers to a currency that's no longer active, still show it so the row isn't silently blanked. */}
-                      {row.currency && row.currency !== '*' && !currencies.some(c => c.code === row.currency) && (
-                        <option value={row.currency}>{row.currency} (inactive)</option>
-                      )}
-                    </select>
-                  </td>
-                  <td className="px-3 py-1.5">
-                    {accounts.length > 0 ? (
-                      (() => {
-                        // Filter to BANK accounts, fall back to all if none are classified as BANK.
-                        const bankAccounts = accounts.filter(a => a.type === 'BANK')
-                        const options = bankAccounts.length > 0 ? bankAccounts : accounts
-                        // Stored value is preferentially the Xero UUID (xeroId) but legacy rows
-                        // may still hold a Code. Accept either by matching against both fields.
-                        const storedKnown = options.some(a => a.xeroId === row.accountCode || a.code === row.accountCode)
-                        return (
-                          <select
-                            className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                            value={row.accountCode}
-                            onChange={e => {
-                              const updated = [...paymentMapRows]
-                              updated[i] = { ...row, accountCode: e.target.value }
-                              setPaymentMapRows(updated)
-                            }}
-                          >
-                            <option value="">— Select —</option>
-                            {options.map(a => (
-                              // Use xeroId as the option value — it's always populated and unique,
-                              // avoiding the collision that occurred when BANK accounts had NULL codes.
-                              <option key={a.id} value={a.xeroId}>
-                                {a.code ? `${a.code} — ${a.name}` : a.name}
-                              </option>
-                            ))}
-                            {/* Preserve an unrecognised stored value so legacy mappings aren't silently blanked. */}
-                            {row.accountCode && !storedKnown && (
-                              <option value={row.accountCode}>{row.accountCode} (unknown)</option>
-                            )}
-                          </select>
-                        )
-                      })()
-                    ) : (
-                      <Input
-                        value={row.accountCode}
-                        onChange={e => {
-                          const updated = [...paymentMapRows]
-                          updated[i] = { ...row, accountCode: e.target.value }
-                          setPaymentMapRows(updated)
-                        }}
-                        placeholder="Account code"
-                        className="h-8 text-xs"
-                      />
-                    )}
-                  </td>
-                  <td className="px-3 py-1.5">
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      className="h-8 w-8 p-0"
-                      onClick={() => setPaymentMapRows(paymentMapRows.filter((_, j) => j !== i))}
-                    >
-                      <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
-                    </Button>
-                  </td>
-                </tr>
-              ))}
-              {paymentMapRows.length === 0 && (
-                <tr>
-                  <td colSpan={4} className="px-3 py-4 text-center text-xs text-muted-foreground">No mappings configured. Add a row or use the pre-populate button below.</td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+                  )}
+                </TableCell>
+                <TableCell className="py-1.5">
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    className="h-8 w-8 p-0"
+                    onClick={() => setPaymentMapRows(paymentMapRows.filter((_, j) => j !== i))}
+                  >
+                    <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
+                  </Button>
+                </TableCell>
+              </TableRow>
+            ))}
+            {paymentMapRows.length === 0 && (
+              <TableRow>
+                <TableCell colSpan={4} className="py-4 text-center text-xs text-muted-foreground">No mappings configured. Add a row or use the pre-populate button below.</TableCell>
+              </TableRow>
+            )}
+          </TableBody>
+        </Table>
         <div className="flex items-center gap-3">
           <Button
             variant="outline"
@@ -774,40 +771,38 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
         {logs.length === 0 ? (
           <p className="text-sm text-muted-foreground">No sync entries yet.</p>
         ) : (
-          <div className="rounded-md border overflow-hidden">
-            <table className="w-full text-sm">
-              <thead className="bg-muted/50 border-b">
-                <tr>
-                  <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Type</th>
-                  <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Status</th>
-                  <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Reference</th>
-                  <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Xero ID</th>
-                  <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Date</th>
-                  <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Error</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {logs.map(log => {
-                  const badge = STATUS_BADGE[log.status] ?? { variant: 'outline' as const, label: log.status }
-                  return (
-                    <tr key={log.id}>
-                      <td className="px-3 py-2 font-mono text-xs">{log.type.replace(/_/g, ' ')}</td>
-                      <td className="px-3 py-2">
-                        <Badge variant={badge.variant} className="text-xs">{badge.label}</Badge>
-                        {log.retryCount > 0 && <span className="ml-1 text-[10px] text-muted-foreground">({log.retryCount})</span>}
-                      </td>
-                      <td className="px-3 py-2 text-xs text-muted-foreground">{log.referenceType}:{log.referenceId.slice(0, 8)}</td>
-                      <td className="px-3 py-2 font-mono text-xs text-muted-foreground">{log.xeroTransactionId?.slice(0, 12) ?? '—'}</td>
-                      <td className="px-3 py-2 text-xs text-muted-foreground">{new Date(log.createdAt).toLocaleString()}</td>
-                      <td className="px-3 py-2 text-xs text-destructive max-w-48 truncate" title={log.errorMessage ?? undefined}>
-                        {log.errorMessage ?? '—'}
-                      </td>
-                    </tr>
-                  )
-                })}
-              </tbody>
-            </table>
-          </div>
+          <Table className="rounded-md border min-w-[600px]">
+            <TableHeader className="bg-muted/50">
+              <TableRow>
+                <TableHead className="text-xs">Type</TableHead>
+                <TableHead className="text-xs">Status</TableHead>
+                <TableHead className="text-xs">Reference</TableHead>
+                <TableHead className="text-xs">Xero ID</TableHead>
+                <TableHead className="text-xs">Date</TableHead>
+                <TableHead className="text-xs">Error</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {logs.map(log => {
+                const badge = STATUS_BADGE[log.status] ?? { variant: 'outline' as const, label: log.status }
+                return (
+                  <TableRow key={log.id}>
+                    <TableCell className="font-mono text-xs">{log.type.replace(/_/g, ' ')}</TableCell>
+                    <TableCell>
+                      <Badge variant={badge.variant} className="text-xs">{badge.label}</Badge>
+                      {log.retryCount > 0 && <span className="ml-1 text-[10px] text-muted-foreground">({log.retryCount})</span>}
+                    </TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{log.referenceType}:{log.referenceId.slice(0, 8)}</TableCell>
+                    <TableCell className="font-mono text-xs text-muted-foreground">{log.xeroTransactionId?.slice(0, 12) ?? '—'}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{new Date(log.createdAt).toLocaleString()}</TableCell>
+                    <TableCell className="text-xs text-destructive max-w-48 truncate" title={log.errorMessage ?? undefined}>
+                      {log.errorMessage ?? '—'}
+                    </TableCell>
+                  </TableRow>
+                )
+              })}
+            </TableBody>
+          </Table>
         )}
       </Card>
 

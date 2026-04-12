@@ -108,7 +108,7 @@ export function TransferFormDialog({ warehouses, products, stockLevels, onCreate
 
         <div className="space-y-5">
           {/* Warehouse selectors */}
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div className="space-y-1.5">
               <Label className="text-sm">From Warehouse</Label>
               <Select value={fromId} onChange={(e) => setFromId(e.target.value)} className="h-9">
@@ -178,7 +178,8 @@ export function TransferFormDialog({ warehouses, products, stockLevels, onCreate
               <p className="text-sm">Search for products above to add them to this transfer.</p>
             </div>
           ) : (
-            <div className="border border-border rounded-lg overflow-hidden">
+            <div className="border border-border rounded-lg overflow-x-auto">
+              <div className="min-w-[500px]">
               <div className="grid grid-cols-[2fr_1fr_1fr_auto_auto] gap-3 px-3 py-2 bg-muted/50 text-xs font-medium text-muted-foreground border-b border-border">
                 <span>Product</span>
                 <span className="text-right">From {warehouses.find((w) => w.id === fromId)?.code ?? ''}</span>
@@ -209,6 +210,7 @@ export function TransferFormDialog({ warehouses, products, stockLevels, onCreate
                   </div>
                 )
               })}
+              </div>
             </div>
           )}
 

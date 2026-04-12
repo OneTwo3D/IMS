@@ -61,7 +61,7 @@ export function DatabaseReset() {
 
   return (
     <div className="space-y-4">
-      <div className="grid grid-cols-3 gap-3">
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         {LEVELS.map((l) => (
           <div key={l.key} className={`rounded-md border p-4 flex flex-col ${l.key === 'full' ? 'border-destructive/50' : ''}`}>
             <h3 className="text-sm font-medium">{l.label}</h3>

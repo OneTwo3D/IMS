@@ -15,6 +15,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from '@/components/ui/dialog'
+import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   advancePoStatus,
   cancelPurchaseOrder,
@@ -168,55 +169,53 @@ function ReceiveDialog({
         </DialogHeader>
 
         <div className="space-y-3">
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b text-muted-foreground text-xs">
-                  <th className="pb-2 text-left font-medium">Product</th>
-                  <th className="pb-2 text-right font-medium w-16">Ordered</th>
-                  <th className="pb-2 text-right font-medium w-20">Received</th>
-                  <th className="pb-2 text-right font-medium w-20">Remaining</th>
-                  <th className="pb-2 text-right font-medium w-24">Receive Now</th>
-                  <th className="pb-2 text-left font-medium pl-3">Warehouse</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {receiptLines.map((l) => (
-                  <tr key={l.poLineId}>
-                    <td className="py-2 pr-3">
-                      <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
-                    </td>
-                    <td className="py-2 pr-3 text-right tabular-nums text-muted-foreground">{l.qtyOrdered}</td>
-                    <td className="py-2 pr-3 text-right tabular-nums text-muted-foreground">{l.qtyAlreadyReceived}</td>
-                    <td className="py-2 pr-3 text-right tabular-nums">{l.qtyRemaining}</td>
-                    <td className="py-2 pr-3">
-                      <Input
-                        type="number"
-                        min={0}
-                        max={l.qtyRemaining}
-                        step={1}
-                        value={l.qtyToReceive}
-                        onChange={(e) => updateLine(l.poLineId, 'qtyToReceive', Number(e.target.value))}
-                        className="h-7 text-sm text-right w-24 ml-auto font-mono"
-                      />
-                    </td>
-                    <td className="py-2 pl-3">
-                      <select
-                        value={l.warehouseId}
-                        onChange={(e) => updateLine(l.poLineId, 'warehouseId', e.target.value)}
-                        className="h-7 rounded-md border border-input bg-background px-2 text-xs w-36"
-                      >
-                        <option value="">Select…</option>
-                        {warehouses.map((w) => (
-                          <option key={w.id} value={w.id}>{w.code} — {w.name}</option>
-                        ))}
-                      </select>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="text-xs">Product</TableHead>
+                <TableHead className="text-xs text-right w-16">Ordered</TableHead>
+                <TableHead className="text-xs text-right w-20">Received</TableHead>
+                <TableHead className="text-xs text-right w-20">Remaining</TableHead>
+                <TableHead className="text-xs text-right w-24">Receive Now</TableHead>
+                <TableHead className="text-xs">Warehouse</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {receiptLines.map((l) => (
+                <TableRow key={l.poLineId}>
+                  <TableCell>
+                    <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums text-muted-foreground">{l.qtyOrdered}</TableCell>
+                  <TableCell className="text-right tabular-nums text-muted-foreground">{l.qtyAlreadyReceived}</TableCell>
+                  <TableCell className="text-right tabular-nums">{l.qtyRemaining}</TableCell>
+                  <TableCell>
+                    <Input
+                      type="number"
+                      min={0}
+                      max={l.qtyRemaining}
+                      step={1}
+                      value={l.qtyToReceive}
+                      onChange={(e) => updateLine(l.poLineId, 'qtyToReceive', Number(e.target.value))}
+                      className="h-7 text-sm text-right w-24 ml-auto font-mono"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <select
+                      value={l.warehouseId}
+                      onChange={(e) => updateLine(l.poLineId, 'warehouseId', e.target.value)}
+                      className="h-7 rounded-md border border-input bg-background px-2 text-xs w-36"
+                    >
+                      <option value="">Select…</option>
+                      {warehouses.map((w) => (
+                        <option key={w.id} value={w.id}>{w.code} — {w.name}</option>
+                      ))}
+                    </select>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
 
           <div className="space-y-1.5">
             <Label htmlFor="receiptNotes">Receipt Notes</Label>
@@ -351,55 +350,53 @@ function ReturnDialog({
             />
           </div>
 
-          <div className="overflow-x-auto">
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b text-muted-foreground text-xs">
-                  <th className="pb-2 text-left font-medium">Product</th>
-                  <th className="pb-2 text-right font-medium w-20">Received</th>
-                  <th className="pb-2 text-right font-medium w-20">Returned</th>
-                  <th className="pb-2 text-right font-medium w-24">Returnable</th>
-                  <th className="pb-2 text-right font-medium w-24">Return Now</th>
-                  <th className="pb-2 text-left font-medium pl-3">From Warehouse</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {returnLines.map((l) => (
-                  <tr key={l.poLineId}>
-                    <td className="py-2 pr-3">
-                      <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
-                    </td>
-                    <td className="py-2 pr-3 text-right tabular-nums text-muted-foreground">{l.qtyReceived}</td>
-                    <td className="py-2 pr-3 text-right tabular-nums text-muted-foreground">{l.qtyAlreadyReturned > 0 ? l.qtyAlreadyReturned : '—'}</td>
-                    <td className="py-2 pr-3 text-right tabular-nums font-medium">{l.netReturnable}</td>
-                    <td className="py-2 pr-3">
-                      <Input
-                        type="number"
-                        min={0}
-                        max={l.netReturnable}
-                        step={1}
-                        value={l.qtyToReturn}
-                        onChange={(e) => updateLine(l.poLineId, 'qtyToReturn', Number(e.target.value))}
-                        className="h-7 text-sm text-right w-24 ml-auto font-mono"
-                      />
-                    </td>
-                    <td className="py-2 pl-3">
-                      <select
-                        value={l.warehouseId}
-                        onChange={(e) => updateLine(l.poLineId, 'warehouseId', e.target.value)}
-                        className="h-7 rounded-md border border-input bg-background px-2 text-xs w-36"
-                      >
-                        <option value="">Select…</option>
-                        {warehouses.map((w) => (
-                          <option key={w.id} value={w.id}>{w.code} — {w.name}</option>
-                        ))}
-                      </select>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead className="text-xs">Product</TableHead>
+                <TableHead className="text-xs text-right w-20">Received</TableHead>
+                <TableHead className="text-xs text-right w-20">Returned</TableHead>
+                <TableHead className="text-xs text-right w-24">Returnable</TableHead>
+                <TableHead className="text-xs text-right w-24">Return Now</TableHead>
+                <TableHead className="text-xs">From Warehouse</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {returnLines.map((l) => (
+                <TableRow key={l.poLineId}>
+                  <TableCell>
+                    <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums text-muted-foreground">{l.qtyReceived}</TableCell>
+                  <TableCell className="text-right tabular-nums text-muted-foreground">{l.qtyAlreadyReturned > 0 ? l.qtyAlreadyReturned : '—'}</TableCell>
+                  <TableCell className="text-right tabular-nums font-medium">{l.netReturnable}</TableCell>
+                  <TableCell>
+                    <Input
+                      type="number"
+                      min={0}
+                      max={l.netReturnable}
+                      step={1}
+                      value={l.qtyToReturn}
+                      onChange={(e) => updateLine(l.poLineId, 'qtyToReturn', Number(e.target.value))}
+                      className="h-7 text-sm text-right w-24 ml-auto font-mono"
+                    />
+                  </TableCell>
+                  <TableCell>
+                    <select
+                      value={l.warehouseId}
+                      onChange={(e) => updateLine(l.poLineId, 'warehouseId', e.target.value)}
+                      className="h-7 rounded-md border border-input bg-background px-2 text-xs w-36"
+                    >
+                      <option value="">Select…</option>
+                      {warehouses.map((w) => (
+                        <option key={w.id} value={w.id}>{w.code} — {w.name}</option>
+                      ))}
+                    </select>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
 
           <div className="space-y-1.5">
             <Label htmlFor="returnNotes">Additional Notes</Label>
@@ -646,81 +643,77 @@ function BillDialog({
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">Select the line items to include in this bill:</p>
             {billLines.length > 0 && (
-              <div className="rounded-md border overflow-hidden">
-                <table className="w-full text-sm">
-                  <thead className="border-b bg-muted/50">
-                    <tr>
-                      <th className="px-3 py-2 w-8">
+              <Table className="rounded-md border">
+                <TableHeader className="bg-muted/50">
+                  <TableRow>
+                    <TableHead className="w-8">
+                      <input
+                        type="checkbox"
+                        checked={billLines.every((l) => l.selected) && billCostLines.every((l) => l.selected)}
+                        onChange={(e) => toggleAll(e.target.checked)}
+                        className="rounded border-input"
+                      />
+                    </TableHead>
+                    <TableHead className="text-xs">Product</TableHead>
+                    <TableHead className="text-xs text-right w-28">Remaining / Received</TableHead>
+                    <TableHead className="text-xs text-right w-32">Unit Cost ({billSym})</TableHead>
+                    <TableHead className="text-xs text-right w-28">Total ({billSym})</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {billLines.map((l) => (
+                    <TableRow key={l.poLineId} className={l.selected ? '' : 'opacity-40'}>
+                      <TableCell>
                         <input
                           type="checkbox"
-                          checked={billLines.every((l) => l.selected) && billCostLines.every((l) => l.selected)}
-                          onChange={(e) => toggleAll(e.target.checked)}
+                          checked={l.selected}
+                          onChange={() => toggleLine(l.poLineId)}
                           className="rounded border-input"
                         />
-                      </th>
-                      <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
-                      <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-28">Remaining / Received</th>
-                      <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-32">Unit Cost ({billSym})</th>
-                      <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-28">Total ({billSym})</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y">
-                    {billLines.map((l) => (
-                      <tr key={l.poLineId} className={l.selected ? '' : 'opacity-40'}>
-                        <td className="px-3 py-2">
-                          <input
-                            type="checkbox"
-                            checked={l.selected}
-                            onChange={() => toggleLine(l.poLineId)}
-                            className="rounded border-input"
-                          />
-                        </td>
-                        <td className="px-3 py-2">
-                          <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
-                        </td>
-                        <td className="px-3 py-2 text-right tabular-nums">
-                          {l.remaining}
-                          <span className="text-muted-foreground"> / {l.qtyReceived}</span>
-                        </td>
-                        <td className="px-3 py-2 text-right font-mono text-xs">{l.unitCostForeign.toFixed(2)}</td>
-                        <td className="px-3 py-2 text-right font-mono text-xs">{billMoney(l.qtyBilled * l.unitCostForeign)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                      </TableCell>
+                      <TableCell>
+                        <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {l.remaining}
+                        <span className="text-muted-foreground"> / {l.qtyReceived}</span>
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-xs">{l.unitCostForeign.toFixed(2)}</TableCell>
+                      <TableCell className="text-right font-mono text-xs">{billMoney(l.qtyBilled * l.unitCostForeign)}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
             )}
 
             {billCostLines.length > 0 && (
               <div>
                 <p className="text-xs font-medium text-muted-foreground mb-2">Additional Costs</p>
-                <div className="rounded-md border overflow-hidden">
-                  <table className="w-full text-sm">
-                    <thead className="border-b bg-muted/50">
-                      <tr>
-                        <th className="px-3 py-2 w-8" />
-                        <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Description</th>
-                        <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-32">Remaining ({billSym})</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y">
-                      {billCostLines.map((l) => (
-                        <tr key={l.costLineId} className={l.selected ? '' : 'opacity-40'}>
-                          <td className="px-3 py-2">
-                            <input
-                              type="checkbox"
-                              checked={l.selected}
-                              onChange={() => toggleCostLine(l.costLineId)}
-                              className="rounded border-input"
-                            />
-                          </td>
-                          <td className="px-3 py-2">{l.originalDescription}</td>
-                          <td className="px-3 py-2 text-right font-mono text-xs">{billMoney(l.remaining)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                <Table className="rounded-md border">
+                  <TableHeader className="bg-muted/50">
+                    <TableRow>
+                      <TableHead className="w-8" />
+                      <TableHead className="text-xs">Description</TableHead>
+                      <TableHead className="text-xs text-right w-32">Remaining ({billSym})</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {billCostLines.map((l) => (
+                      <TableRow key={l.costLineId} className={l.selected ? '' : 'opacity-40'}>
+                        <TableCell>
+                          <input
+                            type="checkbox"
+                            checked={l.selected}
+                            onChange={() => toggleCostLine(l.costLineId)}
+                            className="rounded border-input"
+                          />
+                        </TableCell>
+                        <TableCell>{l.originalDescription}</TableCell>
+                        <TableCell className="text-right font-mono text-xs">{billMoney(l.remaining)}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
               </div>
             )}
             {error && <p className="text-sm text-destructive">{error}</p>}
@@ -747,82 +740,78 @@ function BillDialog({
 
             {/* Lines with editable qty */}
             {selectedLines.length > 0 && (
-              <div className="rounded-md border overflow-hidden">
-                <table className="w-full text-sm">
-                  <thead className="border-b bg-muted/50">
-                    <tr>
-                      <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
-                      <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-24">Qty to Bill</th>
-                      <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-32">Unit Cost ({billSym})</th>
-                      <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-28">Total ({billSym})</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y">
-                    {selectedLines.map((l) => (
-                      <tr key={l.poLineId}>
-                        <td className="px-3 py-2">
-                          <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
-                        </td>
-                        <td className="px-3 py-2">
-                          <Input
-                            type="number" min={0} max={l.remaining} step={1}
-                            value={l.qtyBilled}
-                            onChange={(e) => setBillLines((prev) => prev.map((bl) => bl.poLineId === l.poLineId ? { ...bl, qtyBilled: Number(e.target.value) || 0 } : bl))}
-                            className="h-7 text-sm text-right w-24 ml-auto font-mono"
-                          />
-                        </td>
-                        <td className="px-3 py-2">
-                          <Input
-                            type="number" min={0} step={0.01}
-                            value={l.unitCostForeign}
-                            onChange={(e) => setBillLines((prev) => prev.map((bl) => bl.poLineId === l.poLineId ? { ...bl, unitCostForeign: Number(e.target.value) || 0 } : bl))}
-                            className="h-7 text-sm text-right w-32 ml-auto font-mono"
-                          />
-                        </td>
-                        <td className="px-3 py-2 text-right font-mono text-xs">{billMoney(l.qtyBilled * l.unitCostForeign)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+              <Table className="rounded-md border">
+                <TableHeader className="bg-muted/50">
+                  <TableRow>
+                    <TableHead className="text-xs">Product</TableHead>
+                    <TableHead className="text-xs text-right w-24">Qty to Bill</TableHead>
+                    <TableHead className="text-xs text-right w-32">Unit Cost ({billSym})</TableHead>
+                    <TableHead className="text-xs text-right w-28">Total ({billSym})</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {selectedLines.map((l) => (
+                    <TableRow key={l.poLineId}>
+                      <TableCell>
+                        <ProductLink productId={l.productId} sku={l.sku} name={l.productName} />
+                      </TableCell>
+                      <TableCell>
+                        <Input
+                          type="number" min={0} max={l.remaining} step={1}
+                          value={l.qtyBilled}
+                          onChange={(e) => setBillLines((prev) => prev.map((bl) => bl.poLineId === l.poLineId ? { ...bl, qtyBilled: Number(e.target.value) || 0 } : bl))}
+                          className="h-7 text-sm text-right w-24 ml-auto font-mono"
+                        />
+                      </TableCell>
+                      <TableCell>
+                        <Input
+                          type="number" min={0} step={0.01}
+                          value={l.unitCostForeign}
+                          onChange={(e) => setBillLines((prev) => prev.map((bl) => bl.poLineId === l.poLineId ? { ...bl, unitCostForeign: Number(e.target.value) || 0 } : bl))}
+                          className="h-7 text-sm text-right w-32 ml-auto font-mono"
+                        />
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-xs">{billMoney(l.qtyBilled * l.unitCostForeign)}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
             )}
 
             {selectedCostLines.length > 0 && (
               <div>
                 <p className="text-xs font-medium text-muted-foreground mb-2">Additional Costs</p>
-                <div className="rounded-md border overflow-hidden">
-                  <table className="w-full text-sm">
-                    <thead className="border-b bg-muted/50">
-                      <tr>
-                        <th className="px-3 py-2 text-left text-xs font-medium text-muted-foreground">Description</th>
-                        <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-32">Amount ({billSym})</th>
-                        <th className="px-3 py-2 text-right text-xs font-medium text-muted-foreground w-28">Total ({billSym})</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y">
-                      {selectedCostLines.map((l) => (
-                        <tr key={l.costLineId}>
-                          <td className="px-3 py-2">
-                            <Input
-                              value={l.description}
-                              onChange={(e) => setBillCostLines((prev) => prev.map((cl) => cl.costLineId === l.costLineId ? { ...cl, description: e.target.value } : cl))}
-                              className="h-7 text-sm"
-                            />
-                          </td>
-                          <td className="px-3 py-2">
-                            <Input
-                              type="number" min={0} max={l.remaining} step={0.01}
-                              value={l.amountForeign}
-                              onChange={(e) => setBillCostLines((prev) => prev.map((cl) => cl.costLineId === l.costLineId ? { ...cl, amountForeign: Number(e.target.value) || 0 } : cl))}
-                              className="h-7 text-sm text-right w-32 ml-auto font-mono"
-                            />
-                          </td>
-                          <td className="px-3 py-2 text-right font-mono text-xs">{billMoney(l.amountForeign)}</td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                <Table className="rounded-md border">
+                  <TableHeader className="bg-muted/50">
+                    <TableRow>
+                      <TableHead className="text-xs">Description</TableHead>
+                      <TableHead className="text-xs text-right w-32">Amount ({billSym})</TableHead>
+                      <TableHead className="text-xs text-right w-28">Total ({billSym})</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {selectedCostLines.map((l) => (
+                      <TableRow key={l.costLineId}>
+                        <TableCell>
+                          <Input
+                            value={l.description}
+                            onChange={(e) => setBillCostLines((prev) => prev.map((cl) => cl.costLineId === l.costLineId ? { ...cl, description: e.target.value } : cl))}
+                            className="h-7 text-sm"
+                          />
+                        </TableCell>
+                        <TableCell>
+                          <Input
+                            type="number" min={0} max={l.remaining} step={0.01}
+                            value={l.amountForeign}
+                            onChange={(e) => setBillCostLines((prev) => prev.map((cl) => cl.costLineId === l.costLineId ? { ...cl, amountForeign: Number(e.target.value) || 0 } : cl))}
+                            className="h-7 text-sm text-right w-32 ml-auto font-mono"
+                          />
+                        </TableCell>
+                        <TableCell className="text-right font-mono text-xs">{billMoney(l.amountForeign)}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
               </div>
             )}
 
@@ -1452,81 +1441,81 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
       )}
 
       {/* Lines table */}
-      <div className="rounded-md border overflow-hidden">
+      <div className="rounded-md border">
           <div className="border-b px-4 py-2 bg-muted/50">
             <h2 className="text-sm font-medium">Order Lines</h2>
           </div>
-          <table className="w-full text-sm">
-            <thead className="border-b bg-muted/30">
-              <tr>
-                <th className="w-12 px-2 py-2" />
-                <th className="px-4 py-2 text-left text-xs font-medium text-muted-foreground">Product</th>
-                <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-44">Qty</th>
-                <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-32">
+          <Table className="min-w-[800px]">
+            <TableHeader className="bg-muted/30">
+              <TableRow>
+                <TableHead className="w-12 px-2" />
+                <TableHead className="px-4 text-xs">Product</TableHead>
+                <TableHead className="px-4 text-xs text-right w-44">Qty</TableHead>
+                <TableHead className="px-4 text-xs text-right w-32">
                   Unit Cost ({sym})
-                </th>
+                </TableHead>
                 {po.lines.some((l) => l.discountAmount > 0) && (
-                  <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-24">Discount</th>
+                  <TableHead className="px-4 text-xs text-right w-24">Discount</TableHead>
                 )}
                 {po.currency !== 'GBP' && (
-                  <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-28">Unit Cost (£)</th>
+                  <TableHead className="px-4 text-xs text-right w-28">Unit Cost (£)</TableHead>
                 )}
                 {po.totalLandedCostGbp > 0 && (
-                  <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-28">Gross Cost (£)</th>
+                  <TableHead className="px-4 text-xs text-right w-28">Gross Cost (£)</TableHead>
                 )}
-                <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-28">Total ({sym})</th>
-                <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-20">Received</th>
-                <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-20">Returned</th>
-                <th className="px-4 py-2 text-right text-xs font-medium text-muted-foreground w-20">On Hand</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
+                <TableHead className="px-4 text-xs text-right w-28">Total ({sym})</TableHead>
+                <TableHead className="px-4 text-xs text-right w-20">Received</TableHead>
+                <TableHead className="px-4 text-xs text-right w-20">Returned</TableHead>
+                <TableHead className="px-4 text-xs text-right w-20">On Hand</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
               {po.lines.map((line) => (
-                <tr key={line.id} className={line.qtyRemaining === 0 && line.qtyReturned === 0 ? 'opacity-60' : ''}>
-                  <td className="w-12 px-2 py-1">
+                <TableRow key={line.id} className={line.qtyRemaining === 0 && line.qtyReturned === 0 ? 'opacity-60' : ''}>
+                  <TableCell className="w-12 px-2 py-1">
                     <ProductThumb productId={line.productId} imageUrl={line.imageUrl} name={line.productName} />
-                  </td>
-                  <td className="px-4 py-2">
+                  </TableCell>
+                  <TableCell className="px-4">
                     <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
-                  </td>
-                  <td className="px-4 py-2 text-right tabular-nums whitespace-nowrap">
+                  </TableCell>
+                  <TableCell className="px-4 text-right tabular-nums whitespace-nowrap">
                     {line.purchaseUnitQty != null ? (
                       <span>
                         <span>{line.purchaseUnitQty} {line.purchaseUnitName}</span>
                         <span className="text-muted-foreground text-xs ml-1">({line.qty} {line.purchaseUnitStockName ?? 'pcs'})</span>
                       </span>
                     ) : line.qty}
-                  </td>
-                  <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">{line.unitCostForeign.toFixed(2)}</td>
+                  </TableCell>
+                  <TableCell className="px-4 text-right tabular-nums font-mono text-xs">{line.unitCostForeign.toFixed(2)}</TableCell>
                   {po.lines.some((l) => l.discountAmount > 0) && (
-                    <td className="px-4 py-2 text-right tabular-nums font-mono text-xs text-destructive">
+                    <TableCell className="px-4 text-right tabular-nums font-mono text-xs text-destructive">
                       {line.discountAmount > 0 ? (line.discountStr ?? formatMoney(-line.discountAmount, sym)) : '—'}
-                    </td>
+                    </TableCell>
                   )}
                   {po.currency !== 'GBP' && (
-                    <td className="px-4 py-2 text-right tabular-nums font-mono text-xs text-muted-foreground">
+                    <TableCell className="px-4 text-right tabular-nums font-mono text-xs text-muted-foreground">
                       {formatMoney(line.unitCostGbp, '£', 'PREFIX')}
-                    </td>
+                    </TableCell>
                   )}
                   {po.totalLandedCostGbp > 0 && (
-                    <td className="px-4 py-2 text-right tabular-nums font-mono text-xs font-medium">
+                    <TableCell className="px-4 text-right tabular-nums font-mono text-xs font-medium">
                       {formatMoney(line.grossUnitCostGbp, '£', 'PREFIX')}
-                    </td>
+                    </TableCell>
                   )}
-                  <td className="px-4 py-2 text-right tabular-nums font-mono text-xs">
+                  <TableCell className="px-4 text-right tabular-nums font-mono text-xs">
                     {money(line.totalForeign)}
                     {line.taxRatePercent != null && po.taxRatePercent != null && Math.abs(line.taxRatePercent - po.taxRatePercent) > 0.0001 && (
                       <span className="ml-1 inline-flex items-center rounded-sm border border-amber-300 bg-amber-50 px-1 py-0 text-[10px] font-medium text-amber-900 dark:border-amber-700 dark:bg-amber-950 dark:text-amber-200">
                         {(line.taxRatePercent * 100).toFixed(line.taxRatePercent * 100 % 1 === 0 ? 0 : 1)}%
                       </span>
                     )}
-                  </td>
-                  <td className="px-4 py-2 text-right tabular-nums text-green-700 dark:text-green-400">{line.qtyReceived > 0 ? line.qtyReceived : '—'}</td>
-                  <td className="px-4 py-2 text-right tabular-nums text-orange-600 dark:text-orange-400">{line.qtyReturned > 0 ? line.qtyReturned : '—'}</td>
-                  <td className="px-4 py-2 text-right tabular-nums">{line.qtyRemaining > 0 ? line.qtyRemaining : '—'}</td>
-                </tr>
+                  </TableCell>
+                  <TableCell className="px-4 text-right tabular-nums text-green-700 dark:text-green-400">{line.qtyReceived > 0 ? line.qtyReceived : '—'}</TableCell>
+                  <TableCell className="px-4 text-right tabular-nums text-orange-600 dark:text-orange-400">{line.qtyReturned > 0 ? line.qtyReturned : '—'}</TableCell>
+                  <TableCell className="px-4 text-right tabular-nums">{line.qtyRemaining > 0 ? line.qtyRemaining : '—'}</TableCell>
+                </TableRow>
               ))}
-            </tbody>
+            </TableBody>
             <tfoot className="border-t bg-muted/30 text-sm">
               {(() => {
                 const hasDiscountCol = po.lines.some((l) => l.discountAmount > 0)
@@ -1583,13 +1572,13 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                 </>
               })()}
             </tfoot>
-          </table>
+          </Table>
         </div>
 
       {/* Receipts */}
       {/* Linked Freight / Landed Cost POs */}
       {po.linkedFreightPos.length > 0 && (
-        <div className="rounded-md border overflow-hidden">
+        <div className="rounded-md border overflow-x-auto">
           <div className="px-4 py-2 bg-muted/50 text-sm font-medium flex items-center gap-2">
             <Ship className="h-4 w-4 text-muted-foreground" />
             Linked Landed Cost POs ({po.linkedFreightPos.length})
@@ -1624,7 +1613,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
 
       {/* Linked Primary POs (shown on FREIGHT POs) */}
       {po.linkedPrimaryPos.length > 0 && (
-        <div className="rounded-md border overflow-hidden">
+        <div className="rounded-md border overflow-x-auto">
           <div className="px-4 py-2 bg-muted/50 text-sm font-medium flex items-center gap-2">
             <Ship className="h-4 w-4 text-muted-foreground" />
             Linked Primary POs ({po.linkedPrimaryPos.length})
@@ -1646,7 +1635,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
       )}
 
       {po.receipts.length > 0 && (
-        <div className="rounded-md border overflow-hidden">
+        <div className="rounded-md border overflow-x-auto">
           <button
             type="button"
             className="w-full flex items-center justify-between px-4 py-2 bg-muted/50 hover:bg-muted/70 text-sm font-medium"
@@ -1666,19 +1655,19 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                     </span>
                   </div>
                   {r.notes && <p className="text-muted-foreground text-xs">{r.notes}</p>}
-                  <table className="w-full text-xs">
-                    <tbody className="divide-y">
+                  <Table className="text-xs">
+                    <TableBody>
                       {r.lines.map((rl) => (
-                        <tr key={rl.id}>
-                          <td className="py-1 pr-4">
+                        <TableRow key={rl.id}>
+                          <TableCell className="py-1 pr-4">
                             <ProductLink productId={rl.productId} sku={rl.sku} name={rl.productName} />
-                          </td>
-                          <td className="py-1 pr-4 text-right tabular-nums">{rl.qtyReceived}</td>
-                          <td className="py-1 text-muted-foreground">{rl.warehouseName ?? rl.warehouseId ?? '—'}</td>
-                        </tr>
+                          </TableCell>
+                          <TableCell className="py-1 pr-4 text-right tabular-nums">{rl.qtyReceived}</TableCell>
+                          <TableCell className="py-1 text-muted-foreground">{rl.warehouseName ?? rl.warehouseId ?? '—'}</TableCell>
+                        </TableRow>
                       ))}
-                    </tbody>
-                  </table>
+                    </TableBody>
+                  </Table>
                 </div>
               ))}
             </div>
@@ -1688,7 +1677,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
 
       {/* Returns history */}
       {po.returns.length > 0 && (
-        <div className="rounded-md border overflow-hidden">
+        <div className="rounded-md border overflow-x-auto">
           <button
             type="button"
             className="w-full flex items-center justify-between px-4 py-2 bg-muted/50 hover:bg-muted/70 text-sm font-medium"
@@ -1714,19 +1703,19 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                     </p>
                   )}
                   {r.notes && <p className="text-muted-foreground text-xs">{r.notes}</p>}
-                  <table className="w-full text-xs">
-                    <tbody className="divide-y">
+                  <Table className="text-xs">
+                    <TableBody>
                       {r.lines.map((rl) => (
-                        <tr key={rl.id}>
-                          <td className="py-1 pr-4">
+                        <TableRow key={rl.id}>
+                          <TableCell className="py-1 pr-4">
                             <ProductLink productId={rl.productId} sku={rl.sku} name={rl.productName} />
-                          </td>
-                          <td className="py-1 pr-4 text-right tabular-nums">{rl.qtyReturned}</td>
-                          <td className="py-1 text-muted-foreground">{rl.warehouseId ?? '—'}</td>
-                        </tr>
+                          </TableCell>
+                          <TableCell className="py-1 pr-4 text-right tabular-nums">{rl.qtyReturned}</TableCell>
+                          <TableCell className="py-1 text-muted-foreground">{rl.warehouseId ?? '—'}</TableCell>
+                        </TableRow>
                       ))}
-                    </tbody>
-                  </table>
+                    </TableBody>
+                  </Table>
                 </div>
               ))}
             </div>
@@ -1761,7 +1750,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
 
       {/* Invoices / Bills history */}
       {po.invoices.length > 0 && (
-        <div className="rounded-md border overflow-hidden">
+        <div className="rounded-md border overflow-x-auto">
           <button
             type="button"
             className="w-full flex items-center justify-between px-4 py-2 bg-muted/50 hover:bg-muted/70 text-sm font-medium"
@@ -1831,23 +1820,23 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                     </p>
                   )}
                   {inv.notes && <p className="text-muted-foreground text-xs">{inv.notes}</p>}
-                  <table className="w-full text-xs">
-                    <tbody className="divide-y">
+                  <Table className="text-xs">
+                    <TableBody>
                       {inv.lines.map((il) => (
-                        <tr key={il.id}>
-                          <td className="py-1 pr-4">
+                        <TableRow key={il.id}>
+                          <TableCell className="py-1 pr-4">
                             {il.poLineId ? (
                               <ProductLink productId={il.productId} sku={il.sku} name={il.productName} />
                             ) : (
                               <span>{il.description}</span>
                             )}
-                          </td>
-                          <td className="py-1 pr-4 text-right tabular-nums">{il.poLineId ? il.qtyBilled : ''}</td>
-                          <td className="py-1 text-right font-mono">{money(il.totalForeign)}</td>
-                        </tr>
+                          </TableCell>
+                          <TableCell className="py-1 pr-4 text-right tabular-nums">{il.poLineId ? il.qtyBilled : ''}</TableCell>
+                          <TableCell className="py-1 text-right font-mono">{money(il.totalForeign)}</TableCell>
+                        </TableRow>
                       ))}
-                    </tbody>
-                  </table>
+                    </TableBody>
+                  </Table>
                 </div>
               ))}
             </div>
