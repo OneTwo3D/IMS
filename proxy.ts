@@ -3,17 +3,29 @@ import type { NextRequest } from 'next/server'
 import { auth } from '@/lib/auth'
 
 export async function proxy(request: NextRequest) {
-  const session = await auth()
   const { pathname } = request.nextUrl
 
+  // Public routes — skip auth check entirely
   const isAuthPage = pathname.startsWith('/login') || pathname.startsWith('/2fa')
-  const isApiAuth = pathname.startsWith('/api/auth')
-  const isPublic = isAuthPage || isApiAuth
+  const isApiRoute = pathname.startsWith('/api/')
+  const isPublic = isAuthPage || isApiRoute
 
   if (isPublic) return NextResponse.next()
 
+  // Wrap auth() in try/catch — if JWT is corrupt/expired, redirect to login
+  // instead of showing a generic error page
+  let session
+  try {
+    session = await auth()
+  } catch {
+    const loginUrl = new URL('/login', request.url)
+    loginUrl.searchParams.set('callbackUrl', pathname)
+    return NextResponse.redirect(loginUrl)
+  }
+
   if (!session?.user) {
     const loginUrl = new URL('/login', request.url)
+    loginUrl.searchParams.set('callbackUrl', pathname)
     return NextResponse.redirect(loginUrl)
   }
 
