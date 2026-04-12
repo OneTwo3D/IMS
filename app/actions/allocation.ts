@@ -179,13 +179,29 @@ export async function autoAllocateOrder(orderId: string): Promise<{ success: boo
       prodMap.set(sl.warehouseId, Math.max(0, Number(sl.quantity) - Number(sl.reservedQty)))
     }
 
+    // Fetch qty already committed in non-PENDING shipments (partial fulfillment)
+    const activeShipmentLines = await db.shipmentLine.findMany({
+      where: {
+        shipment: { orderId, status: { not: 'PENDING' } },
+      },
+      select: { lineId: true, qty: true },
+    })
+    const committedByLine = new Map<string, number>()
+    for (const sl of activeShipmentLines) {
+      committedByLine.set(sl.lineId, (committedByLine.get(sl.lineId) ?? 0) + Number(sl.qty))
+    }
+
     // Smart allocation: minimize number of shipments
-    const lines = so.lines.filter((l) => l.productId).map((l) => ({
-      id: l.id,
-      productId: l.productId!,
-      sku: l.sku ?? l.productId!,
-      qty: Number(l.qty),
-    }))
+    // Subtract already-committed qty so we only allocate what's still needed
+    const lines = so.lines.filter((l) => l.productId).map((l) => {
+      const committed = committedByLine.get(l.id) ?? 0
+      return {
+        id: l.id,
+        productId: l.productId!,
+        sku: l.sku ?? l.productId!,
+        qty: Math.max(0, Number(l.qty) - committed),
+      }
+    }).filter((l) => l.qty > 0)
 
     // Step 1: Find which warehouses can fully fulfill each line
     const lineOptions = new Map<string, string[]>() // lineId -> warehouseIds that can fully fulfill
@@ -469,9 +485,14 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
     })
     await db.orderAllocation.deleteMany({ where: { orderId } })
 
-    // Revert to PROCESSING
+    // Revert to PROCESSING — but keep ALLOCATED if active (non-PENDING) shipments exist
     if (so.status === 'ALLOCATED') {
-      await db.salesOrder.update({ where: { id: orderId }, data: { status: 'PROCESSING' } })
+      const activeShipmentCount = await db.shipment.count({
+        where: { orderId, status: { not: 'PENDING' } },
+      })
+      if (activeShipmentCount === 0) {
+        await db.salesOrder.update({ where: { id: orderId }, data: { status: 'PROCESSING' } })
+      }
     }
 
     revalidatePath('/sales')
@@ -511,12 +532,35 @@ export async function confirmAllocations(orderId: string): Promise<{ success: bo
 
     if (!allocs.length) return { success: false, error: 'No allocations to confirm' }
 
+    // Fetch qty already committed in non-PENDING shipments (partial fulfillment)
+    const activeShipmentLines = await db.shipmentLine.findMany({
+      where: {
+        shipment: { orderId, status: { not: 'PENDING' } },
+      },
+      select: { lineId: true, qty: true },
+    })
+    const committedByLine = new Map<string, number>()
+    for (const sl of activeShipmentLines) {
+      committedByLine.set(sl.lineId, (committedByLine.get(sl.lineId) ?? 0) + Number(sl.qty))
+    }
+
+    // Filter allocations: subtract already-committed qty, discard fully covered lines
+    const effectiveAllocs = allocs.map((a) => {
+      const committed = committedByLine.get(a.lineId) ?? 0
+      const effectiveQty = Math.max(0, Number(a.qty) - committed)
+      return { ...a, qty: effectiveQty }
+    }).filter((a) => a.qty > 0)
+
+    if (!effectiveAllocs.length) {
+      return { success: false, error: 'All allocated lines are already covered by active shipments' }
+    }
+
     // Delete existing pending shipments (re-confirm scenario)
     await db.shipment.deleteMany({ where: { orderId, status: 'PENDING' } })
 
-    // Group allocations by warehouse
-    const byWarehouse = new Map<string, typeof allocs>()
-    for (const a of allocs) {
+    // Group effective allocations by warehouse
+    const byWarehouse = new Map<string, typeof effectiveAllocs>()
+    for (const a of effectiveAllocs) {
       const group = byWarehouse.get(a.warehouseId) ?? []
       group.push(a)
       byWarehouse.set(a.warehouseId, group)
@@ -533,7 +577,7 @@ export async function confirmAllocations(orderId: string): Promise<{ success: bo
             create: whAllocs.map((a) => ({
               lineId: a.lineId,
               productId: a.productId,
-              qty: Number(a.qty),
+              qty: a.qty,
             })),
           },
         },

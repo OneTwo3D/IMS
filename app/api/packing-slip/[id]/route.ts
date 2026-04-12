@@ -27,6 +27,14 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       customerName: true,
       shippingAddress: true,
       createdAt: true,
+      lines: {
+        select: {
+          sku: true,
+          description: true,
+          qty: true,
+          product: { select: { sku: true, name: true } },
+        },
+      },
     },
   })
   if (!so) return NextResponse.json({ error: 'Not found' }, { status: 404 })
@@ -43,10 +51,6 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     },
     orderBy: { createdAt: 'asc' },
   })
-
-  if (shipments.length === 0) {
-    return NextResponse.json({ error: 'No shipments found for this order' }, { status: 400 })
-  }
 
   const [branding, tpl] = await Promise.all([
     getBranding(),
@@ -84,23 +88,38 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     { label: 'Packed', width: 50, align: 'center' },
   ]
 
-  const multipleShipments = shipments.length > 1
+  if (shipments.length > 0) {
+    // Shipment-based: one table per shipment
+    const multipleShipments = shipments.length > 1
 
-  for (const shipment of shipments) {
-    if (multipleShipments) {
-      if (doc.y > 720) doc.addPage()
-      doc.font('Helvetica-Bold').fontSize(10).fillColor('#333')
-        .text(`Ship from ${shipment.warehouse.name}`, 50, doc.y)
-      doc.y += 8
+    for (const shipment of shipments) {
+      if (multipleShipments) {
+        if (doc.y > 720) doc.addPage()
+        doc.font('Helvetica-Bold').fontSize(10).fillColor('#333')
+          .text(`Ship from ${shipment.warehouse.name}`, 50, doc.y)
+        doc.y += 8
+      }
+
+      const rows = shipment.lines.map((line, i) => [
+        String(i + 1),
+        line.product.sku,
+        line.product.name,
+        '', // Location — no shelf field in schema yet
+        String(Number(line.qty)),
+        '\u2610', // ☐ ballot box
+      ])
+
+      drawTable(doc, columns, rows, branding)
     }
-
-    const rows = shipment.lines.map((line, i) => [
+  } else {
+    // Legacy flow (no shipments): use order lines directly
+    const rows = so.lines.map((line, i) => [
       String(i + 1),
-      line.product.sku,
-      line.product.name,
-      '', // Location — no shelf field in schema yet
+      line.product?.sku ?? line.sku ?? '',
+      line.product?.name ?? line.description,
+      '',
       String(Number(line.qty)),
-      '\u2610', // ☐ ballot box
+      '\u2610',
     ])
 
     drawTable(doc, columns, rows, branding)

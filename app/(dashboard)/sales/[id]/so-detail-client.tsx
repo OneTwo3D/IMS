@@ -304,13 +304,14 @@ function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, defaultA
 // Allocation Panel
 // ---------------------------------------------------------------------------
 function AllocationPanel({
-  orderId, allocations, lines, warehouses, status, onRefresh,
+  orderId, allocations, lines, warehouses, status, shipments, onRefresh,
 }: {
   orderId: string
   allocations: AllocationRow[]
   lines: { id: string; productId: string | null; sku: string; description: string; qty: number }[]
   warehouses: WarehouseInfo[]
   status: SoStatus
+  shipments: ShipmentRow[]
   onRefresh: () => void
 }) {
   const [isPending, startTransition] = useTransition()
@@ -330,15 +331,27 @@ function AllocationPanel({
     byWarehouse.set(a.warehouseId, group)
   }
 
-  // Find backordered lines (not fully allocated)
+  // Compute qty already committed in non-PENDING shipments
+  const shipmentCommittedByLine = new Map<string, number>()
+  for (const s of shipments) {
+    if (s.status === 'PENDING') continue
+    for (const sl of s.lines) {
+      shipmentCommittedByLine.set(sl.lineId, (shipmentCommittedByLine.get(sl.lineId) ?? 0) + sl.qty)
+    }
+  }
+
+  // Find backordered lines (not fully allocated for remaining qty)
   const allocatedByLine = new Map<string, number>()
   for (const a of allocations) {
     allocatedByLine.set(a.lineId, (allocatedByLine.get(a.lineId) ?? 0) + a.qty)
   }
   const backorderLines = lines.filter((l) => {
     if (!l.productId) return false
+    const committed = shipmentCommittedByLine.get(l.id) ?? 0
+    const remaining = Math.max(0, l.qty - committed)
+    if (remaining <= 0) return false
     const allocated = allocatedByLine.get(l.id) ?? 0
-    return allocated < l.qty
+    return allocated < remaining
   })
 
   function handleDeallocate() {
@@ -496,8 +509,10 @@ function AllocationPanel({
           </div>
           <div className="divide-y">
             {backorderLines.map((l) => {
+              const committed = shipmentCommittedByLine.get(l.id) ?? 0
+              const remaining = Math.max(0, l.qty - committed)
               const allocated = allocatedByLine.get(l.id) ?? 0
-              const short = l.qty - allocated
+              const short = remaining - allocated
               const isAdding = showAddLine === l.id
               return (
                 <div key={l.id} className="px-4 py-2.5 flex items-center gap-3">
@@ -518,7 +533,7 @@ function AllocationPanel({
                   ) : (
                     <div className="flex items-center gap-3">
                       <span className="text-xs text-muted-foreground">
-                        Short <span className="font-mono font-medium text-destructive">{short}</span> of {l.qty}
+                        Short <span className="font-mono font-medium text-destructive">{short}</span> of {remaining}
                       </span>
                       <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">
                         Backorder
@@ -734,8 +749,23 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
   const canCancel = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status)
   const canDelete = ['DRAFT', 'PENDING_PAYMENT'].includes(so.status)
   const canRefund = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'].includes(so.status)
-  // Show allocation panel for PROCESSING/ALLOCATED (and when no shipments yet)
-  const showAllocations = ['PROCESSING', 'ALLOCATED'].includes(so.status) && !hasShipments
+
+  // Compute qty already committed in non-PENDING shipments for partial fulfillment
+  const committedByLine = new Map<string, number>()
+  for (const s of shipments) {
+    if (s.status === 'PENDING') continue
+    for (const l of s.lines) {
+      committedByLine.set(l.lineId, (committedByLine.get(l.lineId) ?? 0) + l.qty)
+    }
+  }
+  const hasUnfulfilledLines = so.lines.some((l) => {
+    if (!l.productId) return false
+    const committed = committedByLine.get(l.id) ?? 0
+    return committed < l.qty
+  })
+
+  // Show allocation panel when PROCESSING/ALLOCATED AND (no shipments OR unfulfilled lines remain)
+  const showAllocations = ['PROCESSING', 'ALLOCATED'].includes(so.status) && (!hasShipments || hasUnfulfilledLines)
   const showShipments = ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) && hasShipments
 
   const refreshAllocations = useCallback(() => {
@@ -908,7 +938,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
                   <FileText className="h-4 w-4 mr-1.5" />Invoice PDF
                 </DropdownMenuItem>
               )}
-              {hasShipments && (
+              {['PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) && (
                 <DropdownMenuItem onClick={() => window.open(`/api/packing-slip/${so.id}`, '_blank')}>
                   <Package className="h-4 w-4 mr-1.5" />Packing Slip
                 </DropdownMenuItem>
@@ -1155,6 +1185,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
           lines={so.lines}
           warehouses={warehouses}
           status={so.status}
+          shipments={shipments}
           onRefresh={() => { refreshAllocations(); router.refresh() }}
         />
       )}

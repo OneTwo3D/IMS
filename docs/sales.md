@@ -53,13 +53,35 @@ Stock allocation determines which warehouse(s) will fulfil each order line. The 
 
 The smart auto-allocation algorithm minimises the number of shipments by consolidating warehouses. It analyses stock availability across all warehouses and assigns lines to as few warehouses as possible.
 
+When re-allocating after a partial shipment, the algorithm only allocates the **remaining unfulfilled quantity** — items already committed to active (non-PENDING) shipments are excluded automatically.
+
 ### Allocation Panel
 
 The order detail page includes an allocation panel that shows:
 
 - **Allocations grouped by warehouse** -- see which warehouse fulfils which lines
-- **Backorder items** -- lines where insufficient stock is available
+- **Backorder items** -- lines where insufficient stock is available (shows remaining qty, not full order qty, when partial shipments exist)
 - **Manual edit** -- override allocations manually if needed
+
+The allocation panel reappears whenever there are unfulfilled order lines, even after some shipments have already been created or shipped. This enables the partial fulfillment workflow described below.
+
+### PICKING Guard
+
+Orders cannot transition to **Picking** status without allocations. If you attempt to start picking on an order that has no stock allocated, the system returns an error: *"Cannot start picking — no products have been allocated. Allocate stock first."* This applies to the legacy (non-shipment) flow only; shipment-level picking is inherently guarded since shipments are created from confirmed allocations.
+
+## Partial Fulfillment
+
+When not all products are in stock, you can ship what's available now and fulfil the rest later:
+
+1. **Allocate** available stock — the system allocates what it can, with backorder lines shown for items that are out of stock
+2. **Confirm allocations** to create shipments for the allocated items
+3. **Ship** those shipments — the order stays at **Allocated** status (not Shipped) because unfulfilled lines remain
+4. **Deallocate** remaining allocations if needed — the order stays at Allocated (not reverted to Processing) because active shipments exist
+5. When new stock arrives, the **allocation panel reappears** for the remaining lines
+6. **Re-allocate** the remaining items and confirm to create new shipments
+7. **Ship** the final shipments — the order auto-transitions to **Shipped** once all shipments are shipped
+
+This flow works seamlessly with the multi-shipment system. Each round of allocation and confirmation creates new shipments without affecting previously shipped items.
 
 ## Multi-Shipment System
 
@@ -125,7 +147,7 @@ Three PDF documents are available for each sales order:
 
 - **Sales Order PDF** — a summary of the order for internal use or to send to the customer
 - **Invoice PDF** — the formal tax invoice, generated manually or automatically
-- **Packing Slip** — a picking/packing checklist showing SKU, product name, location, quantity, and a tick box for each item. Available from the order's ⋮ menu once shipments exist (PICKING status onwards). When an order has multiple shipments from different warehouses, items are grouped by shipment with a section heading per warehouse.
+- **Packing Slip** — a picking/packing checklist showing SKU, product name, location, quantity, and a tick box for each item. Available from the order's ⋮ menu. When an order has multiple shipments from different warehouses, items are grouped by shipment with a section heading per warehouse. For orders without shipments (legacy flow), the packing slip uses the order lines directly.
 
 PDFs use your company branding (logo, colours, and footer) as configured in Settings.
 

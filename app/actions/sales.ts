@@ -978,6 +978,14 @@ export async function updateSalesOrderStatus(
       return { success: false, error: `Cannot transition from ${so.status} to ${targetStatus}` }
     }
 
+    // Guard: cannot start picking without allocations (legacy flow only)
+    if (targetStatus === 'PICKING') {
+      const allocCount = await db.orderAllocation.count({ where: { orderId: id } })
+      if (allocCount === 0) {
+        return { success: false, error: 'Cannot start picking — no products have been allocated. Allocate stock first.' }
+      }
+    }
+
     const data: Record<string, unknown> = { status: targetStatus }
 
     // On SHIPPED: check if shipments exist (new flow) or use legacy single-warehouse flow
