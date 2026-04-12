@@ -728,6 +728,7 @@ model PurchaseOrder {
   rfqSentAt       DateTime?
   poSentAt        DateTime?
 
+  archived        Boolean            @default(false)
   createdAt       DateTime           @default(now())
   updatedAt       DateTime           @updatedAt
 
@@ -952,6 +953,8 @@ model Customer {
   notes           String?
   wcCustomerId    Int?      @unique // WooCommerce customer ID
   active          Boolean   @default(true)
+  archived        Boolean   @default(false)
+  gdprAnonymisedAt DateTime?
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
@@ -1022,6 +1025,7 @@ model SalesOrder {
 
   wcCreatedAt       DateTime?        // order date in WooCommerce
   wcUpdatedAt       DateTime?
+  archived          Boolean          @default(false)
   createdAt         DateTime         @default(now())
   updatedAt         DateTime         @updatedAt
 

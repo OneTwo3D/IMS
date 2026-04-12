@@ -378,16 +378,24 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
       </div>
 
       {/* Actions */}
-      <DialogFooter>
-        {onClose && (
-          <Button type="button" variant="outline" onClick={onClose}>
-            Cancel
+      {inline ? (
+        <div className="sticky bottom-0 z-10 -mx-6 -mb-6 px-6 py-3 bg-background/95 backdrop-blur-sm border-t border-border flex justify-end">
+          <Button type="submit" disabled={isPending}>
+            {isPending ? 'Saving…' : 'Save Product'}
           </Button>
-        )}
-        <Button type="submit" disabled={isPending}>
-          {isPending ? 'Saving…' : 'Save Product'}
-        </Button>
-      </DialogFooter>
+        </div>
+      ) : (
+        <DialogFooter>
+          {onClose && (
+            <Button type="button" variant="outline" onClick={onClose}>
+              Cancel
+            </Button>
+          )}
+          <Button type="submit" disabled={isPending}>
+            {isPending ? 'Saving…' : 'Save Product'}
+          </Button>
+        </DialogFooter>
+      )}
     </form>
   )
 

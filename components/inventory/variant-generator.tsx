@@ -4,6 +4,7 @@ import { useState, useTransition } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
 import { Plus, Trash2, Sparkles, Package } from 'lucide-react'
+import { StockFlowButton } from '@/components/inventory/stock-flow-dialog'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Badge } from '@/components/ui/badge'
@@ -247,16 +248,19 @@ export function VariantGenerator({ productId, initialOptions, variants }: Props)
                     </Badge>
                   </TableCell>
                   <TableCell className="text-right">
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      className="h-7 w-7 text-muted-foreground hover:text-destructive"
-                      title="Delete or deactivate variant"
-                      onClick={() => handleDeleteVariant(v.id, v.sku)}
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </Button>
+                    <div className="flex items-center justify-end gap-0.5">
+                      <StockFlowButton productId={v.id} iconOnly />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className="h-7 w-7 text-muted-foreground hover:text-destructive"
+                        title="Delete or deactivate variant"
+                        onClick={() => handleDeleteVariant(v.id, v.sku)}
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
                   </TableCell>
                 </TableRow>
               ))}

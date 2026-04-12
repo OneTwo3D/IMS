@@ -416,6 +416,7 @@ function mapLine(l: {
 export async function getPurchaseOrders(limit = 200): Promise<PoRow[]> {
   await requireAuth()
   const pos = await db.purchaseOrder.findMany({
+    where: { archived: { not: true } },
     select: PO_SELECT,
     orderBy: { createdAt: 'desc' },
     take: limit,

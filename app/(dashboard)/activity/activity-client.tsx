@@ -151,21 +151,23 @@ export function ActivityClient({ initialRows, initialTotal, availableTags }: Pro
       </div>
 
       {/* Level tabs */}
-      <div className="flex items-center gap-1 border-b">
-        {LEVEL_TABS.map((tab) => (
-          <button
-            key={tab.label}
-            type="button"
-            onClick={() => handleLevelFilter(tab.key)}
-            className={`px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
-              level === tab.key
-                ? 'border-primary text-primary'
-                : 'border-transparent text-muted-foreground hover:text-foreground'
-            }`}
-          >
-            {tab.label}
-          </button>
-        ))}
+      <div className="border-b">
+        <div className="flex items-center gap-1 overflow-x-auto overflow-y-hidden">
+          {LEVEL_TABS.map((tab) => (
+            <button
+              key={tab.label}
+              type="button"
+              onClick={() => handleLevelFilter(tab.key)}
+              className={`shrink-0 px-3 py-2 text-sm font-medium border-b-2 transition-colors -mb-px ${
+                level === tab.key
+                  ? 'border-primary text-primary'
+                  : 'border-transparent text-muted-foreground hover:text-foreground'
+              }`}
+            >
+              {tab.label}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* Filters row */}

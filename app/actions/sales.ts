@@ -6,7 +6,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
-import type { TaxCategory } from '@/app/generated/prisma/client'
+import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -313,9 +313,17 @@ function mapLine(l: {
 // Queries
 // ---------------------------------------------------------------------------
 
-export async function getSalesOrders(limit = 200): Promise<SoRow[]> {
+export async function getSalesOrders(
+  limit = 200,
+  opts?: { includeCompleted?: boolean }
+): Promise<SoRow[]> {
   await requireAuth()
+  const where: Prisma.SalesOrderWhereInput = { archived: { not: true } }
+  if (!opts?.includeCompleted) {
+    where.status = { notIn: ['COMPLETED', 'DELIVERED'] }
+  }
   const orders = await db.salesOrder.findMany({
+    where,
     select: SO_SELECT,
     orderBy: { createdAt: 'desc' },
     take: limit,

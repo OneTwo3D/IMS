@@ -85,8 +85,14 @@ export async function getStockMovements(dateFrom?: string, dateTo?: string, limi
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
 
+  const HISTORICAL_REF_TYPES = ['WcHistorical', 'WcInitialImport', 'CsvHistorical']
+  const baseWhere: Record<string, unknown> = {
+    NOT: { referenceType: { in: HISTORICAL_REF_TYPES } },
+  }
+  if (Object.keys(dateFilter).length) baseWhere.createdAt = dateFilter
+
   const movements = await db.stockMovement.findMany({
-    where: Object.keys(dateFilter).length ? { createdAt: dateFilter } : undefined,
+    where: baseWhere,
     select: {
       id: true, type: true, productId: true, qty: true, note: true, referenceType: true, createdAt: true,
       product: { select: { sku: true, name: true } },

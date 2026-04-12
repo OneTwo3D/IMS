@@ -30,6 +30,7 @@ export type CustomerRow = {
   notes: string | null
   active: boolean
   orderCount: number
+  gdprAnonymisedAt: string | null
 }
 
 export type CustomerInput = {
@@ -56,6 +57,7 @@ function mapCustomer(c: {
   shippingAddress: unknown
   notes: string | null
   active: boolean
+  gdprAnonymisedAt: Date | null
   _count: { salesOrders: number }
 }): CustomerRow {
   return {
@@ -72,13 +74,17 @@ function mapCustomer(c: {
     notes: c.notes,
     active: c.active,
     orderCount: c._count.salesOrders,
+    gdprAnonymisedAt: c.gdprAnonymisedAt?.toISOString() ?? null,
   }
 }
 
 export async function getCustomers(activeOnly = true): Promise<CustomerRow[]> {
   await requireAuth()
   const rows = await db.customer.findMany({
-    where: activeOnly ? { active: true } : undefined,
+    where: {
+      archived: { not: true },
+      ...(activeOnly ? { active: true } : {}),
+    },
     orderBy: [{ lastName: 'asc' }, { firstName: 'asc' }],
     include: { _count: { select: { salesOrders: true } } },
   })
@@ -92,6 +98,78 @@ export async function getCustomer(id: string): Promise<CustomerRow | null> {
     include: { _count: { select: { salesOrders: true } } },
   })
   return c ? mapCustomer(c) : null
+}
+
+export type CustomerOrderRow = {
+  id: string
+  orderNumber: string | null
+  status: string
+  currency: string
+  totalForeign: number
+  totalGbp: number
+  createdAt: string
+  lineCount: number
+}
+
+export type CustomerDetail = CustomerRow & {
+  orders: CustomerOrderRow[]
+  totalTurnoverGbp: number
+  annualTurnoverGbp: Record<string, number>
+}
+
+export async function getCustomerDetail(id: string): Promise<CustomerDetail | null> {
+  await requireAuth()
+  const c = await db.customer.findUnique({
+    where: { id },
+    include: {
+      _count: { select: { salesOrders: true } },
+      salesOrders: {
+        select: {
+          id: true,
+          orderNumber: true,
+          wcOrderNumber: true,
+          status: true,
+          currency: true,
+          totalForeign: true,
+          totalGbp: true,
+          createdAt: true,
+          _count: { select: { lines: true } },
+        },
+        orderBy: { createdAt: 'desc' },
+      },
+    },
+  })
+  if (!c) return null
+
+  const orders: CustomerOrderRow[] = c.salesOrders.map((so) => ({
+    id: so.id,
+    orderNumber: so.orderNumber ?? so.wcOrderNumber ?? so.id.slice(0, 8),
+    status: so.status,
+    currency: so.currency,
+    totalForeign: Number(so.totalForeign),
+    totalGbp: Number(so.totalGbp),
+    createdAt: so.createdAt.toISOString(),
+    lineCount: so._count.lines,
+  }))
+
+  // Exclude cancelled/refunded from turnover calculations
+  const REVENUE_STATUSES = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'])
+  const revenueOrders = orders.filter((o) => REVENUE_STATUSES.has(o.status))
+
+  const totalTurnoverGbp = revenueOrders.reduce((sum, o) => sum + o.totalGbp, 0)
+
+  const annualTurnoverGbp: Record<string, number> = {}
+  for (const o of revenueOrders) {
+    const year = new Date(o.createdAt).getFullYear().toString()
+    annualTurnoverGbp[year] = (annualTurnoverGbp[year] ?? 0) + o.totalGbp
+  }
+
+  return {
+    ...mapCustomer(c),
+    orders,
+    totalTurnoverGbp,
+    annualTurnoverGbp,
+  }
 }
 
 export async function createCustomer(input: CustomerInput): Promise<{ success: boolean; customer?: CustomerRow; error?: string }> {
@@ -182,5 +260,73 @@ export async function importContactsCsv(formData: FormData): Promise<{ success?:
   } catch (e) {
     logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import contacts from CSV: ${String(e)}` })
     return { error: String(e) }
+  }
+}
+
+export async function anonymiseCustomer(customerId: string): Promise<{ success: boolean; error?: string }> {
+  await requirePermission('sync')
+  try {
+    const customer = await db.customer.findUnique({
+      where: { id: customerId },
+      include: { salesOrders: { select: { id: true } } },
+    })
+    if (!customer) return { success: false, error: 'Customer not found' }
+    if (customer.gdprAnonymisedAt) return { success: false, error: 'Customer already anonymised' }
+
+    const customerName = [customer.firstName, customer.lastName].filter(Boolean).join(' ')
+
+    // Anonymise customer record
+    await db.customer.update({
+      where: { id: customerId },
+      data: {
+        firstName: 'GDPR',
+        lastName: 'Anonymised',
+        email: null,
+        phone: null,
+        company: null,
+        taxNumber: null,
+        billingAddress: Prisma.JsonNull,
+        shippingAddress: Prisma.JsonNull,
+        notes: null,
+        wcCustomerId: null,
+        active: false,
+        gdprAnonymisedAt: new Date(),
+      },
+    })
+
+    // Anonymise linked sales orders
+    if (customer.salesOrders.length > 0) {
+      await db.salesOrder.updateMany({
+        where: { customerId },
+        data: {
+          customerName: 'GDPR Anonymised',
+          customerEmail: null,
+          billingAddress: Prisma.JsonNull,
+          shippingAddress: Prisma.JsonNull,
+          notes: null,
+        },
+      })
+    }
+
+    logActivity({
+      entityType: 'CUSTOMER',
+      entityId: customerId,
+      tag: 'sales',
+      action: 'gdpr_anonymised',
+      description: `GDPR anonymised customer: ${customerName} (${customer.salesOrders.length} orders anonymised)`,
+    })
+
+    revalidatePath('/sales/contacts')
+    return { success: true }
+  } catch (e) {
+    logActivity({
+      entityType: 'CUSTOMER',
+      entityId: customerId,
+      tag: 'sales',
+      action: 'gdpr_anonymised',
+      level: 'ERROR',
+      description: `Failed to GDPR anonymise customer: ${String(e)}`,
+    })
+    return { success: false, error: String(e) }
   }
 }

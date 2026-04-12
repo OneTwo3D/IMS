@@ -12,6 +12,7 @@ import { VariantGenerator } from '@/components/inventory/variant-generator'
 import { KitConfigurator } from '@/components/inventory/kit-configurator'
 import { DeleteVariantButton } from '@/components/inventory/delete-variant-button'
 import { WcLinkButton } from '@/components/inventory/wc-link-button'
+import { StockFlowButton } from '@/components/inventory/stock-flow-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
 import { StockDetailPopup } from '@/components/inventory/stock-detail-popups'
@@ -98,6 +99,9 @@ export default async function ProductDetailPage({
           </Badge>
           <Badge variant="secondary">{TYPE_LABELS[product.type]}</Badge>
           {wcLinked && <WcLinkButton sku={product.sku} />}
+          {product.type !== 'VARIABLE' && product.type !== 'NON_INVENTORY' && (
+            <StockFlowButton productId={id} />
+          )}
           {product.type === 'VARIANT' && (
             <DeleteVariantButton
               variantId={id}

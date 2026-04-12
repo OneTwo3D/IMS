@@ -17,7 +17,9 @@ import type { TaxCategory } from '@/app/generated/prisma/client'
 // Import a single WC order into IMS
 // ---------------------------------------------------------------------------
 
-export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: boolean; orderId?: string; error?: string }> {
+export type ImportWcOrderOptions = { skipAccounting?: boolean }
+
+export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<{ success: boolean; orderId?: string; error?: string }> {
   try {
     // Skip if already imported
     const existing = await db.salesOrder.findUnique({ where: { wcOrderId: wcOrder.id } })
@@ -226,11 +228,30 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
       },
     })
 
-    // Auto-allocate stock
-    const { autoAllocateOrder } = await import('@/app/actions/allocation')
-    await autoAllocateOrder(so.id)
+    // Auto-allocate stock (skip for terminal statuses)
+    const TERMINAL_STATUSES = ['CANCELLED', 'REFUNDED']
+    if (!TERMINAL_STATUSES.includes(imsStatus)) {
+      const { autoAllocateOrder } = await import('@/app/actions/allocation')
+      await autoAllocateOrder(so.id)
+    }
 
-    // Queue accounting sales invoice (AUTHORISED — WC orders are pre-paid)
+    // Queue accounting sales invoice — only for PROCESSING orders and when
+    // accounting is not explicitly skipped (e.g. initial import).
+    const shouldInvoice = imsStatus === 'PROCESSING' && !options.skipAccounting
+    if (!shouldInvoice) {
+      // Log sync but skip accounting
+      await db.wcSyncLog.create({
+        data: {
+          direction: 'FROM_WC',
+          entityType: 'ORDER',
+          entityId: so.id,
+          wcId: wcOrder.id,
+          status: 'SYNCED',
+          errorMessage: `Imported as ${imsStatus}${options.skipAccounting ? ' (initial import)' : ''} — skipped accounting sync`,
+        },
+      })
+      return { success: true, orderId: so.id }
+    }
     try {
       const { queueAccountingSync, getAccountingSettings } = await import('@/lib/accounting')
       const settings = await getAccountingSettings()
@@ -328,6 +349,12 @@ export async function importWcOrder(wcOrder: WcFullOrder): Promise<{ success: bo
 export async function syncNewWcOrders(): Promise<SyncResult> {
   const result: SyncResult = { synced: 0, skipped: 0, errors: [] }
 
+  // Guard: initial import must be completed before ongoing sync runs
+  const initialImportSetting = await db.setting.findUnique({ where: { key: 'wc_initial_import_completed' } })
+  if (initialImportSetting?.value !== 'true') {
+    return { synced: 0, skipped: 0, errors: ['Initial order import has not been completed yet. Run the initial import first.'] }
+  }
+
   // Read settings
   const [statusesSetting, lastSyncSetting] = await Promise.all([
     db.setting.findUnique({ where: { key: 'wc_sync_order_statuses' } }),
@@ -339,11 +366,6 @@ export async function syncNewWcOrders(): Promise<SyncResult> {
   catch { statuses = ['processing'] }
 
   const lastSync = lastSyncSetting?.value || null
-
-  // First-time import: fetch all statuses to get the full order history
-  if (!lastSync) {
-    statuses = ['pending', 'processing', 'on-hold', 'completed', 'cancelled', 'refunded', 'failed']
-  }
 
   // Fetch orders page by page
   let page = 1

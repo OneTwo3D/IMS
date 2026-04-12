@@ -19,7 +19,10 @@ export async function resetDatabase(level: ResetLevel): Promise<{ success: boole
       await db.costLayer.deleteMany({})
       await db.stockMovement.deleteMany({})
 
-      // Sales
+      // Sales — shipments and allocations before orders
+      await db.shipmentLine.deleteMany({})
+      await db.shipment.deleteMany({})
+      await db.orderAllocation.deleteMany({})
       await db.salesOrderRefundLine.deleteMany({})
       await db.salesOrderRefund.deleteMany({})
       await db.salesOrderLine.deleteMany({})
@@ -37,10 +40,19 @@ export async function resetDatabase(level: ResetLevel): Promise<{ success: boole
       await db.purchaseOrderLine.deleteMany({})
       await db.purchaseOrder.deleteMany({})
 
+      // Manufacturing
+      await db.productionOrder.deleteMany({})
+
       // Stock
       await db.stockLevel.deleteMany({})
       await db.stockTransferLine.deleteMany({})
       await db.stockTransfer.deleteMany({})
+      await db.stockCountLine.deleteMany({})
+      await db.stockCount.deleteMany({})
+
+      // Notifications
+      await db.notificationReadReceipt.deleteMany({})
+      await db.notification.deleteMany({})
 
       // Sync logs
       await db.wcSyncLog.deleteMany({})
@@ -75,10 +87,15 @@ export async function resetDatabase(level: ResetLevel): Promise<{ success: boole
       await db.currency.deleteMany({})
       await db.taxRate.deleteMany({})
       await db.adjustmentReason.deleteMany({})
+      await db.wcStatusMapping.deleteMany({})
+      await db.wcTaxRateMapping.deleteMany({})
+      await db.xeroAccount.deleteMany({})
+      await db.xeroToken.deleteMany({})
+      await db.documentTemplate.deleteMany({})
       await db.setting.deleteMany({})
       await db.warehouse.deleteMany({})
       await db.organisation.deleteMany({})
-      // Keep users — don't lock yourself out
+      // Keep users, sessions, passkeys — don't lock yourself out
     }
 
     revalidatePath('/')

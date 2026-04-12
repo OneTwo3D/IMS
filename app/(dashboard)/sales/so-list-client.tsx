@@ -1,8 +1,9 @@
 'use client'
 
-import { useState } from 'react'
+import { useState, useTransition } from 'react'
 import Link from 'next/link'
 import type { SoRow, SoStatus } from '@/app/actions/sales'
+import { getSalesOrders } from '@/app/actions/sales'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
@@ -54,12 +55,31 @@ function timeAgo(iso: string): string {
 
 type Props = { initialOrders: SoRow[]; currencySymbols?: Record<string, string> }
 
+const COMPLETED_STATUSES: SoStatus[] = ['COMPLETED', 'DELIVERED']
+
 export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
   const sym = (code: string) => currencySymbols[code] ?? (code === 'GBP' ? '£' : code)
   const [search, setSearch] = useState('')
   const [statusFilter, setStatusFilter] = useState<SoStatus | 'ALL'>('ALL')
+  const [completedOrders, setCompletedOrders] = useState<SoRow[] | null>(null)
+  const [fetching, startFetch] = useTransition()
 
-  const filtered = initialOrders.filter((so) => {
+  function handleStatusFilter(s: SoStatus | 'ALL') {
+    setStatusFilter(s)
+    // Lazy-fetch completed/delivered orders on first request
+    if (COMPLETED_STATUSES.includes(s as SoStatus) && completedOrders === null) {
+      startFetch(async () => {
+        const all = await getSalesOrders(200, { includeCompleted: true })
+        setCompletedOrders(all.filter((o) => COMPLETED_STATUSES.includes(o.status as SoStatus)))
+      })
+    }
+  }
+
+  const orders = COMPLETED_STATUSES.includes(statusFilter as SoStatus)
+    ? (completedOrders ?? [])
+    : initialOrders
+
+  const filtered = orders.filter((so) => {
     if (statusFilter !== 'ALL' && so.status !== statusFilter) return false
     if (search) {
       const q = search.toLowerCase()
@@ -85,18 +105,20 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
           />
         </div>
         <div className="flex flex-wrap gap-1">
-          <Button variant={statusFilter === 'ALL' ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => setStatusFilter('ALL')}>
+          <Button variant={statusFilter === 'ALL' ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => handleStatusFilter('ALL')}>
             All
           </Button>
           {FILTER_STATUSES.map((s) => (
-            <Button key={s} variant={statusFilter === s ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => setStatusFilter(s)}>
+            <Button key={s} variant={statusFilter === s ? 'default' : 'outline'} size="sm" className="h-7 text-xs" onClick={() => handleStatusFilter(s)}>
               {STATUS_LABELS[s]}
             </Button>
           ))}
         </div>
       </div>
 
-      {filtered.length === 0 ? (
+      {fetching && completedOrders === null ? (
+        <p className="text-sm text-muted-foreground py-8 text-center">Loading orders…</p>
+      ) : filtered.length === 0 ? (
         <p className="text-sm text-muted-foreground py-8 text-center">No sales orders found.</p>
       ) : (
         <Table containerClassName="max-h-[calc(100vh-16rem)] rounded-md border" className="min-w-[700px]">

@@ -30,7 +30,7 @@ export default async function InventoryPage({
     listProducts({
       search: sp.search,
       type: sp.type as ProductType | 'ALL' | undefined,
-      active: sp.active as 'true' | 'false' | 'all' | undefined,
+      active: (sp.active ?? 'true') as 'true' | 'false' | 'all',
       page,
       sort: (sp.sort as SortField) || undefined,
       dir: (sp.dir as SortDir) || undefined,
@@ -46,7 +46,7 @@ export default async function InventoryPage({
       <ProductFilters
         search={sp.search}
         type={sp.type}
-        active={sp.active}
+        active={sp.active ?? 'true'}
       />
 
       <ProductTable

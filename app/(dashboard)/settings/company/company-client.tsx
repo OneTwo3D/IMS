@@ -203,25 +203,27 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
       </div>
 
       {/* Tabs */}
-      <div className="flex items-center gap-1 border-b">
-        {TABS.map((t) => {
-          const Icon = t.icon
-          return (
-            <button
-              key={t.key}
-              type="button"
-              onClick={() => setTab(t.key)}
-              className={`flex items-center gap-1.5 px-3 py-2 text-sm font-medium border-b-2 transition-colors ${
-                tab === t.key
-                  ? 'border-primary text-primary'
-                  : 'border-transparent text-muted-foreground hover:text-foreground'
-              }`}
-            >
-              <Icon className="h-3.5 w-3.5" />
-              {t.label}
-            </button>
-          )
-        })}
+      <div className="border-b">
+        <div className="flex items-center gap-1 overflow-x-auto overflow-y-hidden">
+          {TABS.map((t) => {
+            const Icon = t.icon
+            return (
+              <button
+                key={t.key}
+                type="button"
+                onClick={() => setTab(t.key)}
+                className={`shrink-0 flex items-center gap-1.5 px-3 py-2 text-sm font-medium border-b-2 transition-colors -mb-px ${
+                  tab === t.key
+                    ? 'border-primary text-primary'
+                    : 'border-transparent text-muted-foreground hover:text-foreground'
+                }`}
+              >
+                <Icon className="h-3.5 w-3.5" />
+                {t.label}
+              </button>
+            )
+          })}
+        </div>
       </div>
 
       {/* ---- Company Details ---- */}
@@ -229,7 +231,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
         <Card className="p-6">
           {/* Logos */}
           <h3 className="text-sm font-medium mb-3">Logos</h3>
-          <div className="flex items-start gap-6 mb-6">
+          <div className="flex items-start gap-4 sm:gap-6 mb-6">
             {/* Square icon logo */}
             <div className="flex flex-col items-center gap-2">
               <p className="text-xs text-muted-foreground font-medium">Icon Logo</p>
@@ -266,7 +268,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
             {/* Document header logo */}
             <div className="flex flex-col items-center gap-2">
               <p className="text-xs text-muted-foreground font-medium">Document Logo</p>
-              <div className="relative group h-20 w-48 rounded-lg border bg-muted flex items-center justify-center overflow-hidden">
+              <div className="relative group h-16 sm:h-20 w-32 sm:w-48 rounded-lg border bg-muted flex items-center justify-center overflow-hidden">
                 {docLogoUrl ? (
                   // eslint-disable-next-line @next/next/no-img-element
                   <img src={docLogoUrl} alt="Document logo" className="h-full w-full object-contain" />
@@ -401,7 +403,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
 
           {/* Core numbering rows */}
           <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground mb-2">Core Documents</h3>
-          <div className="space-y-1">
+          <div className="space-y-1 overflow-x-auto">
             {(() => {
               const ymd = new Date().toISOString().slice(0, 10).replace(/-/g, '')
               const year = new Date().getFullYear()
@@ -467,7 +469,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
           <p className="text-[11px] text-muted-foreground mb-2">
             Each connector has its own order and invoice prefix so the origin of an imported order is visible in its number.
           </p>
-          <div className="space-y-1">
+          <div className="space-y-1 overflow-x-auto">
             {shoppingConnectors.map((c) => {
               const cp = num.connectors[c.id] ?? { orderPrefix: '', invPrefix: '' }
               return (
@@ -734,8 +736,8 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
 
 function SaveButton({ onClick, pending, saved }: { onClick: () => void; pending: boolean; saved: boolean }) {
   return (
-    <div className="sticky bottom-0 z-10 bg-background/95 backdrop-blur border-t py-3 -mx-4 px-4 -mb-4 mt-4">
-      <div className="flex items-center gap-2">
+    <div className="fixed bottom-4 right-4 sm:bottom-6 sm:right-6 z-50">
+      <div className="flex items-center gap-2 rounded-lg border bg-background/95 backdrop-blur shadow-lg px-4 py-2.5">
         <Button size="sm" onClick={onClick} disabled={pending}>
           {pending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
           Save Changes

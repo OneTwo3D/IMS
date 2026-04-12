@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import { db } from '@/lib/db'
 import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verify'
 import { importWcOrder } from '@/lib/connectors/woocommerce/sync/order-import'
 import { syncWcOrderStatus } from '@/lib/connectors/woocommerce/sync/order-status'
@@ -11,6 +12,13 @@ export async function POST(request: Request) {
 
   if (!(await verifyWcWebhook(body, signature))) {
     return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
+  }
+
+  // Skip webhook-triggered imports if initial import hasn't completed yet —
+  // those orders will be caught by the initial import instead.
+  const initialImportDone = await db.setting.findUnique({ where: { key: 'wc_initial_import_completed' } })
+  if (initialImportDone?.value !== 'true') {
+    return NextResponse.json({ ok: true, skipped: 'initial_import_pending' })
   }
 
   const topic = request.headers.get('x-wc-webhook-topic')

@@ -142,9 +142,8 @@ async function fetchSingleFxRate(code: string): Promise<number | null> {
   }
 }
 
-/** Fetch FX rates for all active currencies (called daily via cron or on demand) */
-export async function fetchAllFxRates(): Promise<{ success: boolean; updated: string[]; failed: string[]; error?: string }> {
-  await requirePermission('settings.company')
+/** Core FX rate fetching logic (no auth — used by cron and the server action) */
+export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; updated: string[]; failed: string[]; error?: string }> {
   try {
     const currencies = await db.currency.findMany({
       where: { active: true, code: { not: 'GBP' } },
@@ -195,4 +194,10 @@ export async function fetchAllFxRates(): Promise<{ success: boolean; updated: st
     logActivity({ entityType: 'SYNC', tag: 'sync', action: 'fx_rates_fetched', level: 'ERROR', description: `Failed to fetch FX rates: ${String(e)}` })
     return { success: false, updated: [], failed: [], error: String(e) }
   }
+}
+
+/** Fetch FX rates for all active currencies (called on demand from UI) */
+export async function fetchAllFxRates(): Promise<{ success: boolean; updated: string[]; failed: string[]; error?: string }> {
+  await requirePermission('settings.company')
+  return fetchAllFxRatesInternal()
 }

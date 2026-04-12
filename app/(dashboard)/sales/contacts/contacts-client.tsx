@@ -2,14 +2,15 @@
 
 import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { Plus, Pencil, X, Check, Loader2, Search } from 'lucide-react'
+import Link from 'next/link'
+import { Plus, Pencil, X, Check, Loader2, Search, ShieldAlert } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
-import { createCustomer, updateCustomer, importContactsCsv, type CustomerRow, type CustomerInput, type AddressData } from '@/app/actions/customers'
+import { createCustomer, updateCustomer, importContactsCsv, anonymiseCustomer, type CustomerRow, type CustomerInput, type AddressData } from '@/app/actions/customers'
 import { CsvBar } from '@/components/ui/csv-bar'
 
 type Props = { initialCustomers: CustomerRow[] }
@@ -149,10 +150,69 @@ function CustomerFormDialog({ customer, onClose }: { customer: CustomerRow | nul
   )
 }
 
+function GdprDialog({ customer, onClose }: { customer: CustomerRow; onClose: () => void }) {
+  const router = useRouter()
+  const [isPending, startTransition] = useTransition()
+  const [confirmation, setConfirmation] = useState('')
+  const [error, setError] = useState('')
+
+  const expectedName = customer.fullName
+  const canConfirm = confirmation === expectedName
+
+  function handleAnonymise() {
+    setError('')
+    startTransition(async () => {
+      const result = await anonymiseCustomer(customer.id)
+      if (result.success) { router.refresh(); onClose() }
+      else setError(result.error ?? 'Anonymisation failed')
+    })
+  }
+
+  return (
+    <Dialog open onOpenChange={() => {}}>
+      <DialogContent showCloseButton={false} className="max-w-md">
+        <DialogHeader>
+          <DialogTitle className="flex items-center gap-2">
+            <ShieldAlert className="h-5 w-5 text-destructive" />
+            GDPR Anonymise Customer
+          </DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4 text-sm">
+          <p className="text-muted-foreground">
+            This will permanently anonymise all personal data for <strong>{customer.fullName}</strong>.
+            This action cannot be undone. Existing invoice PDFs will not be affected.
+          </p>
+          <p className="text-muted-foreground">
+            The following data will be cleared: name, email, phone, company, tax number, billing/shipping addresses, notes, and all linked order customer details.
+          </p>
+          <div className="space-y-1.5">
+            <Label className="text-xs">Type <strong>{expectedName}</strong> to confirm</Label>
+            <Input
+              value={confirmation}
+              onChange={(e) => setConfirmation(e.target.value)}
+              placeholder={expectedName}
+              className="h-9"
+            />
+          </div>
+          {error && <p className="text-destructive text-sm">{error}</p>}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
+          <Button variant="destructive" onClick={handleAnonymise} disabled={isPending || !canConfirm}>
+            {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+            Anonymise
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 export function ContactsClient({ initialCustomers }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [editing, setEditing] = useState<CustomerRow | null | undefined>(undefined)
+  const [gdprTarget, setGdprTarget] = useState<CustomerRow | undefined>(undefined)
   const [search, setSearch] = useState('')
 
   const filtered = initialCustomers.filter((c) => {
@@ -205,7 +265,16 @@ export function ContactsClient({ initialCustomers }: Props) {
           <TableBody>
             {[...active, ...inactive].map((c) => (
               <TableRow key={c.id} className={!c.active ? 'opacity-50' : ''}>
-                <TableCell className="px-4 font-medium">{c.fullName}</TableCell>
+                <TableCell className="px-4 font-medium">
+                  <Link href={`/sales/contacts/${c.id}`} className="text-primary hover:underline" target="_blank">
+                    {c.fullName}
+                  </Link>
+                  {c.gdprAnonymisedAt && (
+                    <span className="ml-2 inline-flex items-center gap-1 text-[10px] font-medium text-orange-600 bg-orange-50 px-1.5 py-0.5 rounded">
+                      <ShieldAlert className="h-3 w-3" />GDPR
+                    </span>
+                  )}
+                </TableCell>
                 <TableCell className="px-4 text-muted-foreground text-xs">{c.company ?? '—'}</TableCell>
                 <TableCell className="px-4 text-muted-foreground text-xs">{c.email ?? '—'}</TableCell>
                 <TableCell className="px-4 text-muted-foreground text-xs font-mono">{c.taxNumber ?? '—'}</TableCell>
@@ -219,6 +288,11 @@ export function ContactsClient({ initialCustomers }: Props) {
                     <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => handleToggle(c)} disabled={isPending}>
                       {c.active ? <X className="h-3 w-3 text-muted-foreground" /> : <Check className="h-3 w-3 text-muted-foreground" />}
                     </Button>
+                    {!c.gdprAnonymisedAt && (
+                      <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setGdprTarget(c)} title="GDPR Anonymise">
+                        <ShieldAlert className="h-3 w-3 text-muted-foreground" />
+                      </Button>
+                    )}
                   </div>
                 </TableCell>
               </TableRow>
@@ -228,6 +302,7 @@ export function ContactsClient({ initialCustomers }: Props) {
       )}
 
       {editing !== undefined && <CustomerFormDialog customer={editing} onClose={() => setEditing(undefined)} />}
+      {gdprTarget && <GdprDialog customer={gdprTarget} onClose={() => setGdprTarget(undefined)} />}
     </div>
   )
 }

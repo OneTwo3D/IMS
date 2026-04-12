@@ -66,7 +66,7 @@ export function ProductFilters({ search, type, active }: Props) {
 
       <Select
         className="w-full sm:w-40"
-        value={active ?? 'all'}
+        value={active ?? 'true'}
         onChange={(e) => update('active', e.target.value === 'all' ? '' : e.target.value)}
       >
         <option value="all">All Status</option>
