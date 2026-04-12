@@ -643,3 +643,92 @@ export async function getActiveAdjustmentReasons(): Promise<AdjustmentReasonOpti
     select: { id: true, name: true, accountCode: true },
   })
 }
+
+// ---------------------------------------------------------------------------
+// Product stock flow (all movement types for a single product)
+// ---------------------------------------------------------------------------
+
+export type StockFlowRow = {
+  id: string
+  type: string
+  fromWarehouse: string | null
+  toWarehouse: string | null
+  signedQty: number
+  note: string | null
+  referenceType: string | null
+  referenceId: string | null
+  createdAt: string
+}
+
+export type StockFlowFilters = {
+  types?: string[]
+  dateFrom?: string
+  dateTo?: string
+}
+
+const INBOUND_TYPES = new Set([
+  'PURCHASE_RECEIPT',
+  'RETURN_INBOUND',
+  'TRANSFER_IN',
+  'PRODUCTION_IN',
+  'KIT_ASSEMBLY_IN',
+  'OPENING_STOCK',
+])
+
+export async function getProductStockFlow(
+  productId: string,
+  filters?: StockFlowFilters,
+  limit = 500
+): Promise<StockFlowRow[]> {
+  await requireAuth()
+
+  const where: Prisma.StockMovementWhereInput = { productId, referenceType: { notIn: ['WcHistorical', 'WcInitialImport', 'CsvHistorical'] } }
+  if (filters?.types?.length) {
+    where.type = { in: filters.types as Prisma.StockMovementWhereInput['type'] extends { in?: infer U } ? U : never } as never
+  }
+  if (filters?.dateFrom || filters?.dateTo) {
+    where.createdAt = {}
+    if (filters.dateFrom) (where.createdAt as Record<string, unknown>).gte = new Date(filters.dateFrom)
+    if (filters.dateTo) (where.createdAt as Record<string, unknown>).lte = new Date(filters.dateTo + 'T23:59:59.999Z')
+  }
+
+  const rows = await db.stockMovement.findMany({
+    where,
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+    select: {
+      id: true,
+      type: true,
+      fromWarehouseId: true,
+      toWarehouseId: true,
+      qty: true,
+      note: true,
+      referenceType: true,
+      referenceId: true,
+      createdAt: true,
+      fromWarehouse: { select: { code: true } },
+      toWarehouse: { select: { code: true } },
+    },
+  })
+
+  return rows.map((r) => {
+    let isInbound: boolean
+    if (r.type === 'ADJUSTMENT') {
+      isInbound = r.toWarehouseId !== null
+    } else {
+      isInbound = INBOUND_TYPES.has(r.type)
+    }
+
+    return {
+      id: r.id,
+      type: r.type,
+      fromWarehouse: r.fromWarehouse?.code ?? null,
+      toWarehouse: r.toWarehouse?.code ?? null,
+      signedQty: isInbound ? Number(r.qty) : -Number(r.qty),
+      note: r.note,
+      referenceType: r.referenceType,
+      referenceId: r.referenceId,
+      createdAt: r.createdAt.toISOString(),
+    }
+  })
+}

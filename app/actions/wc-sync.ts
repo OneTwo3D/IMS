@@ -26,12 +26,14 @@ export type WcSyncSettings = {
   last_wc_order_sync_at: string
   last_wc_product_sync_at: string
   last_wc_stock_sync_at: string
+  wc_initial_import_completed: string
 }
 
 const SYNC_SETTING_KEYS = [
   'wc_sync_enabled', 'wc_sync_order_statuses', 'wc_sync_interval_minutes',
   'wc_sync_product_enabled', 'wc_sync_product_direction', 'wc_stock_sync_enabled', 'wc_cogs_sync_enabled',
   'wc_webhook_secret', 'last_wc_order_sync_at', 'last_wc_product_sync_at', 'last_wc_stock_sync_at',
+  'wc_initial_import_completed',
 ]
 
 const SYNC_DEFAULTS: WcSyncSettings = {
@@ -46,6 +48,7 @@ const SYNC_DEFAULTS: WcSyncSettings = {
   last_wc_order_sync_at: '',
   last_wc_product_sync_at: '',
   last_wc_stock_sync_at: '',
+  wc_initial_import_completed: '',
 }
 
 export async function getWcSyncSettings(): Promise<WcSyncSettings> {

@@ -84,12 +84,14 @@ function SettingsDialog({ settings: initial, onClose }: { settings: ForecastSett
 // ---------------------------------------------------------------------------
 // Training Data dialog
 // ---------------------------------------------------------------------------
-function TrainingDialog({ onClose }: { onClose: () => void }) {
+function TrainingDialog({ settings, onClose }: { settings: ForecastSettings; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [importingType, setImportingType] = useState<'wc' | 'csv' | null>(null)
   const [dateFrom, setDateFrom] = useState('2023-01-01')
   const [dateTo, setDateTo] = useState(new Date().toISOString().slice(0, 10))
+  const [retentionMonths, setRetentionMonths] = useState(settings.retentionMonths)
+  const [retentionSaved, setRetentionSaved] = useState(false)
   const [result, setResult] = useState<{ message: string; isError: boolean } | null>(null)
   const [wcProgress, setWcProgress] = useState<HistoricalImportProgress | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
@@ -231,6 +233,29 @@ function TrainingDialog({ onClose }: { onClose: () => void }) {
             {importingType === 'csv' ? 'Uploading…' : 'Upload CSV'}
             <input type="file" accept=".csv" className="hidden" onChange={handleCsvImport} disabled={isBusy} />
           </label>
+        </div>
+
+        {/* Retention setting */}
+        <div className="rounded-md border p-3 space-y-3">
+          <h3 className="font-medium">Data Retention</h3>
+          <p className="text-xs text-muted-foreground">
+            Historical demand records older than this are automatically purged. Applies to all sources (WooCommerce and CSV).
+          </p>
+          <div className="flex items-end gap-3">
+            <div className="space-y-1">
+              <Label className="text-xs">Retention period (months)</Label>
+              <Input type="number" min={1} max={120} value={retentionMonths} onChange={(e) => { setRetentionMonths(Number(e.target.value)); setRetentionSaved(false) }} className="h-8 text-sm w-24" />
+            </div>
+            <Button size="sm" variant="outline" disabled={isPending || retentionSaved} onClick={() => {
+              startTransition(async () => {
+                await saveForecastSettings({ ...settings, retentionMonths })
+                setRetentionSaved(true)
+                router.refresh()
+              })
+            }}>
+              {retentionSaved ? 'Saved' : 'Save'}
+            </Button>
+          </div>
         </div>
 
         {result && (
@@ -536,7 +561,7 @@ export function ForecastClient({ forecasts, settings }: Props) {
       )}
 
       {showSettings && <SettingsDialog settings={settings} onClose={() => setShowSettings(false)} />}
-      {showTraining && <TrainingDialog onClose={() => setShowTraining(false)} />}
+      {showTraining && <TrainingDialog settings={settings} onClose={() => setShowTraining(false)} />}
     </div>
   )
 }

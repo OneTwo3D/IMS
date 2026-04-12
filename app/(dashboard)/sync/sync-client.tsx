@@ -1,8 +1,8 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useState, useTransition, useEffect, useCallback, useRef } from 'react'
 import { useRouter } from 'next/navigation'
-import { Loader2, RefreshCw, Check, AlertTriangle, ArrowDownToLine, ArrowUpFromLine, Trash2 } from 'lucide-react'
+import { Loader2, RefreshCw, Check, AlertTriangle, ArrowDownToLine, ArrowUpFromLine, Trash2, Download, CheckCircle2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -43,6 +43,75 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   const [wcKey, setWcKey] = useState(wcCredentials.key)
   const [wcSecret, setWcSecret] = useState(wcCredentials.secret)
   const wcConfigured = !!wcUrl && !!wcKey && !!wcSecret
+  const initialImportDone = s.wc_initial_import_completed === 'true'
+
+  // Initial import progress polling
+  type InitialImportProgress = {
+    status: 'idle' | 'running' | 'done' | 'error'
+    message: string
+    activeOrdersImported: number
+    activeOrdersSkipped: number
+    totalOrders: number
+    currentPage: number
+    totalPages: number
+    errors: string[]
+  }
+  const [importProgress, setImportProgress] = useState<InitialImportProgress | null>(null)
+  const [importStarting, setImportStarting] = useState(false)
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  const stopPolling = useCallback(() => {
+    if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
+  }, [])
+
+  const pollProgress = useCallback(async () => {
+    try {
+      const res = await fetch('/api/import/initial-orders')
+      if (res.ok) {
+        const data = await res.json() as InitialImportProgress
+        setImportProgress(data)
+        if (data.status === 'done' || data.status === 'error') {
+          stopPolling()
+          if (data.status === 'done') router.refresh()
+        }
+      }
+    } catch { /* ignore poll errors */ }
+  }, [stopPolling, router])
+
+  const startPolling = useCallback(() => {
+    stopPolling()
+    pollRef.current = setInterval(pollProgress, 2000)
+  }, [pollProgress, stopPolling])
+
+  // Check progress on mount if not completed yet
+  useEffect(() => {
+    if (wcConfigured && !initialImportDone) {
+      pollProgress().then((/* void */) => {
+        // If running, start polling
+      })
+    }
+    return stopPolling
+  }, [wcConfigured, initialImportDone, pollProgress, stopPolling])
+
+  // Start polling when import is running
+  useEffect(() => {
+    if (importProgress?.status === 'running' && !pollRef.current) {
+      startPolling()
+    }
+  }, [importProgress?.status, startPolling])
+
+  async function handleStartInitialImport() {
+    setImportStarting(true)
+    try {
+      const res = await fetch('/api/import/initial-orders', { method: 'POST' })
+      if (res.ok) {
+        setImportProgress({ status: 'running', message: 'Starting\u2026', activeOrdersImported: 0, activeOrdersSkipped: 0, totalOrders: 0, currentPage: 0, totalPages: 0, errors: [] })
+        startPolling()
+      }
+    } finally {
+      setImportStarting(false)
+    }
+  }
 
   function handleSave() {
     setSaved(false)
@@ -150,6 +219,70 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
 
       {/* Sync settings — only show when connected */}
       {wcConfigured && <>
+
+      {/* Import Active Orders */}
+      <Card className="p-6 space-y-4">
+        <h2 className="text-base font-semibold">Import Active Orders</h2>
+        {initialImportDone ? (
+          <div className="flex items-center gap-2 text-green-600">
+            <CheckCircle2 className="h-4 w-4" />
+            <span className="text-sm">Active order import completed</span>
+          </div>
+        ) : importProgress?.status === 'running' ? (
+          <div className="space-y-3">
+            <p className="text-sm text-muted-foreground">{importProgress.message}</p>
+            {importProgress.totalPages > 0 && (
+              <div className="space-y-1">
+                <div className="w-full bg-muted rounded-full h-2 overflow-hidden">
+                  <div
+                    className="bg-primary h-2 rounded-full transition-all duration-300"
+                    style={{ width: `${Math.min(100, (importProgress.currentPage / importProgress.totalPages) * 100)}%` }}
+                  />
+                </div>
+                <p className="text-xs text-muted-foreground">
+                  Page {importProgress.currentPage} / {importProgress.totalPages}
+                </p>
+              </div>
+            )}
+            <div className="flex flex-wrap gap-4 text-xs text-muted-foreground">
+              <span>Imported: {importProgress.activeOrdersImported}</span>
+              <span>Skipped: {importProgress.activeOrdersSkipped}</span>
+              {importProgress.errors.length > 0 && <span className="text-destructive">Errors: {importProgress.errors.length}</span>}
+            </div>
+          </div>
+        ) : importProgress?.status === 'done' ? (
+          <div className="space-y-2">
+            <div className="flex items-center gap-2 text-green-600">
+              <CheckCircle2 className="h-4 w-4" />
+              <span className="text-sm">Import completed</span>
+            </div>
+            <p className="text-xs text-muted-foreground">{importProgress.message}</p>
+          </div>
+        ) : importProgress?.status === 'error' ? (
+          <div className="space-y-2">
+            <div className="flex items-center gap-2 text-destructive">
+              <AlertTriangle className="h-4 w-4" />
+              <span className="text-sm">Import failed</span>
+            </div>
+            <p className="text-xs text-muted-foreground">{importProgress.message}</p>
+            <Button size="sm" onClick={handleStartInitialImport} disabled={importStarting}>
+              {importStarting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
+              Retry Import
+            </Button>
+          </div>
+        ) : (
+          <div className="space-y-3">
+            <p className="text-xs text-muted-foreground">
+              Import active WooCommerce orders (processing, pending, on-hold) as sales orders. This does not create demand data or accounting entries. Historical sales data for forecasting can be imported from the Forecast page.
+            </p>
+            <Button size="sm" onClick={handleStartInitialImport} disabled={importStarting}>
+              {importStarting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Download className="h-3 w-3 mr-1" />}
+              Import Active Orders
+            </Button>
+          </div>
+        )}
+      </Card>
+
       <Card className="p-6 space-y-5">
         <h2 className="text-base font-semibold">Order Sync</h2>
 
@@ -191,10 +324,13 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
         </div>
 
         <div className="flex items-center gap-2">
-          <Button size="sm" onClick={() => handleSync('orders')} disabled={isPending}>
+          <Button size="sm" onClick={() => handleSync('orders')} disabled={isPending || !initialImportDone}>
             {syncingType === 'orders' ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
             Sync Orders Now
           </Button>
+          {!initialImportDone && (
+            <span className="text-xs text-muted-foreground">Complete initial import first</span>
+          )}
           {s.last_wc_order_sync_at && (
             <span className="text-xs text-muted-foreground">Last sync: {new Date(s.last_wc_order_sync_at).toLocaleString('en-GB')}</span>
           )}

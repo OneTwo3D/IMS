@@ -43,6 +43,7 @@ export type ForecastSettings = {
   defaultLeadTimeDays: number   // fallback if no PO history
   reviewPeriodDays: number      // how far back to look for demand
   reorderQtyWeeks: number       // weeks of supply to order
+  retentionMonths: number       // how long to keep historical demand data
 }
 
 // ---------------------------------------------------------------------------
@@ -54,24 +55,40 @@ const DEFAULT_SETTINGS: ForecastSettings = {
   defaultLeadTimeDays: 14,
   reviewPeriodDays: 90,
   reorderQtyWeeks: 8,
+  retentionMonths: 24,
 }
 
 export async function getForecastSettings(): Promise<ForecastSettings> {
   await requireAuth()
-  const row = await db.setting.findUnique({ where: { key: 'forecast_settings' } })
+  const [row, retentionRow] = await Promise.all([
+    db.setting.findUnique({ where: { key: 'forecast_settings' } }),
+    db.setting.findUnique({ where: { key: 'forecast_retention_months' } }),
+  ])
+  let settings = { ...DEFAULT_SETTINGS }
   if (row?.value) {
-    try { return { ...DEFAULT_SETTINGS, ...JSON.parse(row.value) } } catch {}
+    try { settings = { ...settings, ...JSON.parse(row.value) } } catch {}
   }
-  return DEFAULT_SETTINGS
+  if (retentionRow?.value) {
+    settings.retentionMonths = Math.max(1, parseInt(retentionRow.value) || DEFAULT_SETTINGS.retentionMonths)
+  }
+  return settings
 }
 
 export async function saveForecastSettings(settings: ForecastSettings): Promise<void> {
   await requireAuth()
-  await db.setting.upsert({
-    where: { key: 'forecast_settings' },
-    create: { key: 'forecast_settings', value: JSON.stringify(settings) },
-    update: { value: JSON.stringify(settings) },
-  })
+  await db.$transaction([
+    db.setting.upsert({
+      where: { key: 'forecast_settings' },
+      create: { key: 'forecast_settings', value: JSON.stringify(settings) },
+      update: { value: JSON.stringify(settings) },
+    }),
+    // Store retention separately so the purge cron can read it without parsing JSON
+    db.setting.upsert({
+      where: { key: 'forecast_retention_months' },
+      create: { key: 'forecast_retention_months', value: String(settings.retentionMonths) },
+      update: { value: String(settings.retentionMonths) },
+    }),
+  ])
 }
 
 // ---------------------------------------------------------------------------
