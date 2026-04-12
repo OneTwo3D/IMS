@@ -49,6 +49,7 @@ const SYNC_DEFAULTS: WcSyncSettings = {
 }
 
 export async function getWcSyncSettings(): Promise<WcSyncSettings> {
+  await requireAdmin()
   const rows = await db.setting.findMany({ where: { key: { in: SYNC_SETTING_KEYS } } })
   const map = new Map(rows.map((r) => [r.key, r.value]))
   const result = { ...SYNC_DEFAULTS }
@@ -93,6 +94,7 @@ export async function saveWcCredentials(url: string, key: string, secret: string
 }
 
 export async function getWcCredentials(): Promise<{ url: string; key: string; secret: string; secretMasked: boolean }> {
+  await requireAdmin()
   const rows = await db.setting.findMany({ where: { key: { in: ['wc_url', 'wc_consumer_key', 'wc_consumer_secret'] } } })
   const map = new Map(rows.map((r) => [r.key, r.value]))
   const secret = map.get('wc_consumer_secret') ?? ''
@@ -121,6 +123,7 @@ export type TaxRateMappingRow = {
 }
 
 export async function getWcTaxRateMappings(): Promise<TaxRateMappingRow[]> {
+  await requireAdmin()
   const rows = await db.wcTaxRateMapping.findMany({
     include: { taxRate: { select: { name: true } } },
     orderBy: [{ wcCountry: 'asc' }, { wcName: 'asc' }],
@@ -203,6 +206,7 @@ export type StatusMappingRow = {
 }
 
 export async function getWcStatusMappings(): Promise<StatusMappingRow[]> {
+  await requireAdmin()
   const rows = await db.wcStatusMapping.findMany({ orderBy: { wcStatus: 'asc' } })
   return rows.map((r) => ({ id: r.id, wcStatus: r.wcStatus, imsStatus: r.imsStatus }))
 }
@@ -235,6 +239,7 @@ export type SyncLogRow = {
 }
 
 export async function getWcSyncLogs(limit = 50): Promise<SyncLogRow[]> {
+  await requireAdmin()
   const rows = await db.wcSyncLog.findMany({
     orderBy: { createdAt: 'desc' },
     take: limit,
@@ -263,6 +268,7 @@ export async function getWcSyncLogs(limit = 50): Promise<SyncLogRow[]> {
  * the UI will simply fall back to free-text entry or historical combos.
  */
 export async function getWcActivePaymentGateways(): Promise<Array<{ id: string; title: string }>> {
+  await requireAdmin()
   try {
     const { wcFetch } = await import('@/lib/connectors/woocommerce/api')
     const { data, error } = await wcFetch('/payment_gateways')

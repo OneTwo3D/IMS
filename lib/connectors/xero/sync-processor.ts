@@ -336,9 +336,9 @@ async function updateBackReference(
             data: { invoicePdfPath: pdfPath },
           })
 
-          // Email the Xero invoice PDF to the customer
-          const { sendAccountingInvoiceEmail } = await import('@/app/actions/email')
-          await sendAccountingInvoiceEmail(referenceId).catch(() => {})
+          // Email the Xero invoice PDF to the customer (internal call, no auth needed)
+          const { sendAccountingInvoiceEmailInternal } = await import('@/lib/accounting-email')
+          await sendAccountingInvoiceEmailInternal(referenceId).catch(() => {})
 
           // Notify shopping channel (WC pushes order note with download link)
           await notifyShoppingChannel(referenceId, 'invoice_ready')

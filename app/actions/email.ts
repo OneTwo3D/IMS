@@ -138,68 +138,14 @@ export async function sendInvoiceEmail(orderId: string): Promise<{ success: bool
 }
 
 // ---------------------------------------------------------------------------
-// Send accounting invoice PDF email (called from sync-processor after PDF download)
+// Send accounting invoice PDF email (client-callable, requires auth)
+// Internal/cron callers use lib/accounting-email.ts directly.
 // ---------------------------------------------------------------------------
 
 export async function sendAccountingInvoiceEmail(orderId: string): Promise<{ success: boolean; error?: string }> {
-  try {
-    const so = await db.salesOrder.findUnique({
-      where: { id: orderId },
-      select: {
-        customerName: true,
-        customerEmail: true,
-        orderNumber: true,
-        wcOrderNumber: true,
-        invoiceNumber: true,
-        currency: true,
-        totalForeign: true,
-        paidAt: true,
-        invoicePdfPath: true,
-      },
-    })
-    if (!so) return { success: false, error: 'Order not found' }
-    if (!so.customerEmail) return { success: false, error: 'No customer email address' }
-    if (!so.invoicePdfPath) return { success: false, error: 'No invoice PDF available' }
-
-    const { loadInvoicePdf } = await import('@/lib/invoice-pdf')
-    const pdfBuffer = await loadInvoicePdf(orderId)
-    if (!pdfBuffer) return { success: false, error: 'Invoice PDF file not found on disk' }
-
-    const branding = await getBranding()
-    const ref = so.invoiceNumber ?? so.orderNumber ?? so.wcOrderNumber ?? orderId.slice(0, 8)
-    const { money } = await getCurrencyFormat(so.currency)
-
-    const html = await renderEmailHtml(branding, {
-      recipientName: so.customerName ?? 'Customer',
-      recipientEmail: so.customerEmail,
-      reference: ref,
-      date: new Date().toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' }),
-      subject: `Invoice ${ref}`,
-      bodyLines: [
-        `Please find attached your invoice ${ref} for ${money(Number(so.totalForeign))}.`,
-        so.paidAt ? 'This invoice has been paid. Thank you.' : 'Payment is due within 30 days of the invoice date.',
-        'If you have any questions regarding this invoice, please don\'t hesitate to contact us.',
-      ],
-    }, 'invoice')
-
-    const result = await sendEmail({
-      to: so.customerEmail,
-      subject: `Invoice ${ref}`,
-      html,
-      attachments: [{ filename: `Invoice-${ref}.pdf`, content: pdfBuffer }],
-    })
-
-    if (result.success) {
-      logActivity({
-        entityType: 'SALES_ORDER', entityId: orderId, action: 'invoice_emailed', tag: 'sales', level: 'INFO',
-        description: `Emailed invoice ${ref} to ${so.customerEmail}`,
-      })
-    }
-
-    return result
-  } catch (e) {
-    return { success: false, error: String(e) }
-  }
+  await requirePermission('sales.process')
+  const { sendAccountingInvoiceEmailInternal } = await import('@/lib/accounting-email')
+  return sendAccountingInvoiceEmailInternal(orderId)
 }
 
 // ---------------------------------------------------------------------------
