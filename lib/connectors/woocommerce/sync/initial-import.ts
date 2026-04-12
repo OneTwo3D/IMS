@@ -146,7 +146,7 @@ async function runInitialImport(progress: InitialImportProgress) {
           continue
         }
 
-        const importResult = await importWcOrder(order, { skipAccounting: true })
+        const importResult = await importWcOrder(order, { useWcDateAsCreatedAt: true })
         if (importResult.success && importResult.orderId) {
           progress.activeOrdersImported++
         } else if (importResult.success) {

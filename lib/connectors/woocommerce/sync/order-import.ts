@@ -17,7 +17,7 @@ import type { TaxCategory } from '@/app/generated/prisma/client'
 // Import a single WC order into IMS
 // ---------------------------------------------------------------------------
 
-export type ImportWcOrderOptions = { skipAccounting?: boolean }
+export type ImportWcOrderOptions = { skipAccounting?: boolean; useWcDateAsCreatedAt?: boolean }
 
 export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<{ success: boolean; orderId?: string; error?: string }> {
   try {
@@ -200,6 +200,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         paymentMethodTitle: wcOrder.payment_method_title || null,
         wcCreatedAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created),
         wcUpdatedAt: new Date(wcOrder.date_modified_gmt || wcOrder.date_modified),
+        ...(options.useWcDateAsCreatedAt ? { createdAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created) } : {}),
         status: imsStatus,
         currency,
         fxRateToGbp: fxRate,
