@@ -1,19 +1,18 @@
 'use client'
 
-import { useState, useEffect, useRef, useTransition } from 'react'
+import { useState, useEffect, useTransition } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { Download, Columns3, Package, ArrowUp, ArrowDown, ArrowUpDown } from 'lucide-react'
+import { Package, ArrowUp, ArrowDown, ArrowUpDown } from 'lucide-react'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import {
   Table, TableHeader, TableBody, TableRow, TableHead, TableCell,
 } from '@/components/ui/table'
 import { PaginationBar } from '@/components/ui/pagination-bar'
-import { CsvImportButton } from './csv-import-button'
-import { importProductsCsv } from '@/app/actions/import'
 import { bulkDeleteProducts, bulkDeactivateProducts } from '@/app/actions/products'
-import { buttonVariants } from '@/components/ui/button-variants'
+import { ALL_COLUMNS, STORAGE_KEY, COLS_CHANGED_EVENT, defaultVisibility } from '@/components/inventory/product-columns'
+import type { ColKey } from '@/components/inventory/product-columns'
 import type { ProductRow } from '@/app/actions/products'
 import type { ProductType } from '@/app/generated/prisma/client'
 
@@ -35,48 +34,11 @@ const TYPE_COLOURS: Record<ProductType, 'default' | 'secondary' | 'outline'> = {
   NON_INVENTORY: 'outline',
 }
 
-type ColKey =
-  | 'sku' | 'name' | 'type' | 'parentSku' | 'barcode'
-  | 'dimensions' | 'weight' | 'salesPriceGbp' | 'salePriceGbp' | 'salesPriceTaxInclusive'
-  | 'totalStock' | 'allocatedStock' | 'availableStock' | 'incomingStock'
-  | 'inventoryValue' | 'variantCount'
-  | 'active' | 'createdAt' | 'updatedAt'
-
-const ALL_COLUMNS: { key: ColKey; label: string; defaultVisible: boolean }[] = [
-  { key: 'sku',                  label: 'SKU',                defaultVisible: true  },
-  { key: 'name',                 label: 'Name',               defaultVisible: true  },
-  { key: 'type',                 label: 'Type',               defaultVisible: true  },
-  { key: 'parentSku',            label: 'Parent SKU',         defaultVisible: false },
-  { key: 'barcode',              label: 'Barcode',            defaultVisible: false },
-  { key: 'dimensions',           label: 'Dimensions (W×H×D)', defaultVisible: false },
-  { key: 'weight',               label: 'Weight',             defaultVisible: false },
-  { key: 'salesPriceGbp',        label: 'Regular Price',      defaultVisible: true  },
-  { key: 'salePriceGbp',         label: 'Sale Price',         defaultVisible: false },
-  { key: 'salesPriceTaxInclusive', label: 'Tax Incl.',        defaultVisible: false },
-  { key: 'totalStock',           label: 'Stock',              defaultVisible: true  },
-  { key: 'allocatedStock',       label: 'Allocated',          defaultVisible: false },
-  { key: 'availableStock',       label: 'Available',          defaultVisible: false },
-  { key: 'incomingStock',        label: 'Incoming',           defaultVisible: false },
-  { key: 'inventoryValue',       label: 'COGS Value',         defaultVisible: true  },
-  { key: 'variantCount',         label: 'Variants',           defaultVisible: false },
-  { key: 'active',               label: 'Status',             defaultVisible: true  },
-  { key: 'createdAt',            label: 'Created',            defaultVisible: false },
-  { key: 'updatedAt',            label: 'Updated',            defaultVisible: false },
-]
-
 // Map column keys to server-side sort fields (only columns that support server sort)
 const SORTABLE: Partial<Record<ColKey, string>> = {
   sku: 'sku', name: 'name', type: 'type',
   salesPriceGbp: 'salesPriceGbp', totalStock: 'totalStock',
   active: 'active', createdAt: 'createdAt', updatedAt: 'updatedAt',
-}
-
-const STORAGE_KEY = 'ims-product-table-cols'
-
-function defaultVisibility(): Record<ColKey, boolean> {
-  return Object.fromEntries(
-    ALL_COLUMNS.map((c) => [c.key, c.defaultVisible])
-  ) as Record<ColKey, boolean>
 }
 
 type Props = {
@@ -90,8 +52,6 @@ type Props = {
 export function ProductTable({ products, total, page, pageSize, searchParams }: Props) {
   const router = useRouter()
   const [visible, setVisible] = useState<Record<ColKey, boolean>>(defaultVisibility)
-  const [pickerOpen, setPickerOpen] = useState(false)
-  const pickerRef = useRef<HTMLDivElement>(null)
   const [, startTransition] = useTransition()
 
   // Multiselect state
@@ -151,32 +111,18 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
     } catch { setBulkMsg('An unexpected error occurred.'); setBulkPending(false) }
   }
 
-  // Load from localStorage on mount
+  // Load from localStorage on mount + listen for changes from filters column picker
   useEffect(() => {
-    try {
-      const stored = localStorage.getItem(STORAGE_KEY)
-      if (stored) setVisible(JSON.parse(stored))
-    } catch {
-      // ignore
+    function load() {
+      try {
+        const stored = localStorage.getItem(STORAGE_KEY)
+        if (stored) setVisible(JSON.parse(stored))
+      } catch { /* ignore */ }
     }
+    load()
+    window.addEventListener(COLS_CHANGED_EVENT, load)
+    return () => window.removeEventListener(COLS_CHANGED_EVENT, load)
   }, [])
-
-  // Close picker on outside click
-  useEffect(() => {
-    function handler(e: MouseEvent) {
-      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) {
-        setPickerOpen(false)
-      }
-    }
-    if (pickerOpen) document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [pickerOpen])
-
-  function toggleCol(key: ColKey, value: boolean) {
-    const next = { ...visible, [key]: value }
-    setVisible(next)
-    try { localStorage.setItem(STORAGE_KEY, JSON.stringify(next)) } catch { /* noop */ }
-  }
 
   const visibleCols = ALL_COLUMNS.filter((c) => visible[c.key])
   const totalPages = Math.ceil(total / pageSize)
@@ -309,59 +255,6 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
       {!selectedIds.size && bulkMsg && (
         <p className="text-xs text-muted-foreground px-1">{bulkMsg}</p>
       )}
-
-      {/* Toolbar */}
-      <div className="flex flex-wrap items-center gap-2 justify-end">
-        {/* Column visibility picker */}
-        <div className="relative" ref={pickerRef}>
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setPickerOpen((o) => !o)}
-          >
-            <Columns3 className="h-4 w-4 mr-1" />
-            Columns
-          </Button>
-          {pickerOpen && (
-            <div className="absolute right-0 top-full mt-1 z-50 w-[calc(100vw-2rem)] sm:w-52 rounded-md border border-border bg-popover shadow-md p-2 space-y-1">
-              {ALL_COLUMNS.map((c) => (
-                <label key={c.key} className="flex items-center gap-2 px-1 py-0.5 text-sm cursor-pointer hover:bg-accent rounded">
-                  <input
-                    type="checkbox"
-                    checked={!!visible[c.key]}
-                    onChange={(e) => toggleCol(c.key, e.target.checked)}
-                    className="h-3.5 w-3.5 accent-primary"
-                  />
-                  {c.label}
-                </label>
-              ))}
-            </div>
-          )}
-        </div>
-
-        {/* Export */}
-        <a
-          href="/api/export/products?template=1"
-          className={buttonVariants({ variant: 'outline', size: 'sm' })}
-        >
-          <Download className="h-4 w-4 mr-1" />
-          Template
-        </a>
-        <a
-          href="/api/export/products"
-          className={buttonVariants({ variant: 'outline', size: 'sm' })}
-        >
-          <Download className="h-4 w-4 mr-1" />
-          Export CSV
-        </a>
-
-        {/* Import */}
-        <CsvImportButton
-          label="Import CSV"
-          action={importProductsCsv}
-          onDone={() => startTransition(() => router.refresh())}
-        />
-      </div>
 
       {/* Table */}
         <Table containerClassName="rounded-lg border border-border bg-card max-h-[calc(100vh-16rem)]" className="min-w-[900px]">

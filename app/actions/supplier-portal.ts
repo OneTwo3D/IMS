@@ -105,7 +105,7 @@ export async function getSupplierProducts(): Promise<SupplierProductRow[]> {
     select: {
       supplierSku: true,
       product: {
-        select: { id: true, sku: true, name: true, description: true, imageUrl: true, active: true },
+        select: { id: true, sku: true, name: true, description: true, imageUrl: true, parent: { select: { imageUrl: true } }, active: true },
       },
     },
     orderBy: { product: { name: 'asc' } },
@@ -117,7 +117,7 @@ export async function getSupplierProducts(): Promise<SupplierProductRow[]> {
     name: l.product.name,
     description: l.product.description,
     supplierSku: l.supplierSku,
-    imageUrl: l.product.imageUrl,
+    imageUrl: l.product.imageUrl ?? l.product.parent?.imageUrl ?? null,
     active: l.product.active,
   }))
 }

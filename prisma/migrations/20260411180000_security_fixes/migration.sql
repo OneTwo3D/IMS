@@ -16,6 +16,28 @@ CREATE TABLE "one_time_tokens" (
 
 CREATE INDEX "one_time_tokens_expiresAt_idx" ON "one_time_tokens"("expiresAt");
 
+-- notifications (must exist before read_receipts FK)
+CREATE TABLE IF NOT EXISTS "notifications" (
+    "id" TEXT NOT NULL,
+    "userId" TEXT,
+    "type" TEXT NOT NULL,
+    "title" TEXT NOT NULL,
+    "message" TEXT NOT NULL,
+    "actionUrl" TEXT,
+    "read" BOOLEAN NOT NULL DEFAULT false,
+    "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    "readAt" TIMESTAMP(3),
+
+    CONSTRAINT "notifications_pkey" PRIMARY KEY ("id")
+);
+
+CREATE INDEX IF NOT EXISTS "notifications_userId_read_createdAt_idx" ON "notifications"("userId", "read", "createdAt");
+
+DO $$ BEGIN
+  ALTER TABLE "notifications" ADD CONSTRAINT "notifications_userId_fkey" FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+EXCEPTION WHEN duplicate_object THEN NULL;
+END $$;
+
 -- notification_read_receipts
 CREATE TABLE "notification_read_receipts" (
     "id" TEXT NOT NULL,

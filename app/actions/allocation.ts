@@ -60,7 +60,7 @@ export async function getOrderAllocations(orderId: string): Promise<AllocationRo
     where: { orderId },
     include: {
       warehouse: { select: { code: true, name: true } },
-      product: { select: { sku: true, name: true, imageUrl: true } },
+      product: { select: { sku: true, name: true, imageUrl: true, parent: { select: { imageUrl: true } } } },
       line: { select: { qty: true } },
     },
     orderBy: [{ warehouseId: 'asc' }, { createdAt: 'asc' }],
@@ -75,7 +75,7 @@ export async function getOrderAllocations(orderId: string): Promise<AllocationRo
     qty: Number(r.qty),
     productSku: r.product.sku,
     productName: r.product.name,
-    imageUrl: r.product.imageUrl,
+    imageUrl: r.product.imageUrl ?? r.product.parent?.imageUrl ?? null,
     lineQty: Number(r.line.qty),
   }))
 }
@@ -92,7 +92,7 @@ export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]>
       warehouse: { select: { code: true, name: true } },
       lines: {
         include: {
-          product: { select: { sku: true, name: true, imageUrl: true } },
+          product: { select: { sku: true, name: true, imageUrl: true, parent: { select: { imageUrl: true } } } },
         },
       },
     },
@@ -114,7 +114,7 @@ export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]>
       qty: Number(l.qty),
       productSku: l.product.sku,
       productName: l.product.name,
-      imageUrl: l.product.imageUrl,
+      imageUrl: l.product.imageUrl ?? l.product.parent?.imageUrl ?? null,
     })),
   }))
 }
@@ -138,13 +138,19 @@ export async function autoAllocateOrder(orderId: string): Promise<{ success: boo
     })
     if (!so) return { success: false, error: 'Order not found' }
 
-    // Get eligible warehouses: the selected warehouse first, then others available for sale
+    // Get eligible warehouses: the selected warehouse first, then others available for sale.
+    // For WC orders, restrict to WC-synced warehouses to ship from the right locations.
+    const isWcOrder = !!so.wcOrderNumber
     const allWarehouses = await db.warehouse.findMany({
-      where: { active: true, availableForSale: true },
+      where: {
+        active: true,
+        availableForSale: true,
+        ...(isWcOrder ? { syncToWoocommerce: true } : {}),
+      },
       select: { id: true, code: true, name: true, isDefault: true, syncToWoocommerce: true },
       orderBy: { isDefault: 'desc' },
     })
-    if (!allWarehouses.length) return { success: false, error: 'No warehouses available for sale' }
+    if (!allWarehouses.length) return { success: false, error: isWcOrder ? 'No WooCommerce-synced warehouses available for sale' : 'No warehouses available for sale' }
 
     // Order warehouses: selected first, then default, then WC-synced, then rest
     const primaryId = so.shipFromWarehouseId

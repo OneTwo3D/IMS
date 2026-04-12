@@ -242,6 +242,29 @@ export async function triggerXeroSync(): Promise<{ success: boolean; result?: un
   }
 }
 
+export async function retryFailedXeroSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }> {
+  try {
+    await requireAdmin()
+    const where = entryId
+      ? { id: entryId, status: 'FAILED' as const }
+      : { status: 'FAILED' as const }
+    const result = await db.accountingSyncLog.updateMany({
+      where,
+      data: { status: 'PENDING', retryCount: 0, errorMessage: null },
+    })
+    logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_retry_failed',
+      tag: 'sync',
+      description: `Reset ${result.count} failed Xero sync entry/entries for retry`,
+    })
+    revalidatePath('/sync')
+    return { success: true, reset: result.count }
+  } catch (e) {
+    return { success: false, reset: 0, error: String(e) }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Readiness check — validate before allowing Xero sync to be enabled
 // ---------------------------------------------------------------------------

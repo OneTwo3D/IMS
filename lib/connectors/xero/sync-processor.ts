@@ -150,29 +150,62 @@ async function processEntry(
           const paymentMap = await getPaymentAccountMap()
           const method = payload._paymentMethod as string || ''
           const currency = payload.currency as string || 'GBP'
-          const stored = lookupPaymentAccount(paymentMap, method, currency)
 
-          if (stored) {
-            // Resolve stored value to a XeroAccount — match either xeroId (new) or code (legacy).
-            // Bank accounts in Xero may have NULL codes (e.g. Stripe feeds), so we always post
-            // using AccountID, which is guaranteed unique.
-            const account = await db.xeroAccount.findFirst({
-              where: { OR: [{ xeroId: stored }, { code: stored }] },
-              select: { xeroId: true },
+          if (!paymentMap || Object.keys(paymentMap).length === 0) {
+            logActivity({
+              entityType: 'SYSTEM',
+              action: 'xero_payment_skipped',
+              tag: 'sync',
+              level: 'WARNING',
+              description: `Skipped Xero payment registration: no payment account map configured. Go to Settings → Accounting → Payment Account Mapping to set up bank accounts for each payment method.`,
             })
-            if (account) {
-              const paymentDate = (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
-              await xeroPost('Payments', {
-                Invoice: { InvoiceID: invoiceResult.invoiceId },
-                Account: { AccountID: account.xeroId },
-                Date: paymentDate,
-                Amount: payload.shippingAmount
-                  ? (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
-                    + (payload.shippingAmount as number)
-                    - ((payload.discountAmount as number) || 0)
-                  : (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
-                    - ((payload.discountAmount as number) || 0),
+          } else {
+            const stored = lookupPaymentAccount(paymentMap, method, currency)
+
+            if (!stored) {
+              logActivity({
+                entityType: 'SYSTEM',
+                action: 'xero_payment_skipped',
+                tag: 'sync',
+                level: 'WARNING',
+                description: `Skipped Xero payment registration: no bank account mapped for method "${method}" / currency "${currency}". Add a mapping in Settings → Accounting → Payment Account Mapping.`,
               })
+            } else {
+              // Resolve stored value to a XeroAccount — match either xeroId (new) or code (legacy).
+              // Bank accounts in Xero may have NULL codes (e.g. Stripe feeds), so we always post
+              // using AccountID, which is guaranteed unique.
+              const account = await db.xeroAccount.findFirst({
+                where: { OR: [{ xeroId: stored }, { code: stored }] },
+                select: { xeroId: true },
+              })
+              if (!account) {
+                logActivity({
+                  entityType: 'SYSTEM',
+                  action: 'xero_payment_skipped',
+                  tag: 'sync',
+                  level: 'WARNING',
+                  description: `Skipped Xero payment registration: bank account "${stored}" not found in synced Xero chart of accounts. Re-sync accounts from Settings → Accounting → Xero.`,
+                })
+              } else {
+                // Use Xero's computed invoice total (includes tax, discounts, rounding).
+                // Fall back to manual calculation only if total is missing.
+                let amount = invoiceResult.total
+                if (amount == null) {
+                  amount = (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
+                    + ((payload.shippingAmount as number) || 0)
+                    - ((payload.discountAmount as number) || 0)
+                }
+
+                if (amount > 0) {
+                  const paymentDate = (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
+                  await xeroPost('Payments', {
+                    Invoice: { InvoiceID: invoiceResult.invoiceId },
+                    Account: { AccountID: account.xeroId },
+                    Date: paymentDate,
+                    Amount: amount,
+                  })
+                }
+              }
             }
           }
         } catch (e) {

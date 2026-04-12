@@ -25,7 +25,7 @@ import { formatMoney } from '@/lib/utils'
 import { toIsoCountryCode } from '@/lib/countries'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 
-type Warehouse = { id: string; code: string; name: string; country?: string | null }
+type Warehouse = { id: string; code: string; name: string; country?: string | null; contactName?: string | null; email?: string | null; phone?: string | null; addressLine1?: string | null; addressLine2?: string | null; city?: string | null; postcode?: string | null }
 
 type Props = {
   suppliers: SupplierRow[]
@@ -786,6 +786,20 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                 <option key={w.id} value={w.id}>{w.code} — {w.name}</option>
               ))}
             </select>
+            {destWarehouse && (destWarehouse.addressLine1 || destWarehouse.city || destWarehouse.contactName) && (
+              <div className="mt-1.5 rounded-md border border-dashed border-muted-foreground/30 bg-muted/30 px-3 py-2 text-xs text-muted-foreground space-y-0.5">
+                <p className="font-medium text-foreground/70">Delivery Address</p>
+                {destWarehouse.contactName && <p>{destWarehouse.contactName}</p>}
+                {destWarehouse.addressLine1 && <p>{destWarehouse.addressLine1}</p>}
+                {destWarehouse.addressLine2 && <p>{destWarehouse.addressLine2}</p>}
+                {(destWarehouse.city || destWarehouse.postcode) && (
+                  <p>{[destWarehouse.city, destWarehouse.postcode].filter(Boolean).join(', ')}</p>
+                )}
+                {destWarehouse.country && <p>{destWarehouse.country}</p>}
+                {destWarehouse.phone && <p>Tel: {destWarehouse.phone}</p>}
+                {destWarehouse.email && <p>{destWarehouse.email}</p>}
+              </div>
+            )}
           </div>
 
           <div className="space-y-1.5">

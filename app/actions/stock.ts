@@ -410,7 +410,7 @@ export async function getAdjustmentHistory(limit = 200): Promise<AdjustmentMovem
       qty: true,
       note: true,
       createdAt: true,
-      product: { select: { sku: true, name: true, imageUrl: true } },
+      product: { select: { sku: true, name: true, imageUrl: true, parent: { select: { imageUrl: true } } } },
       fromWarehouse: { select: { id: true, code: true, name: true } },
       toWarehouse: { select: { id: true, code: true, name: true } },
     },
@@ -424,7 +424,7 @@ export async function getAdjustmentHistory(limit = 200): Promise<AdjustmentMovem
       productId: r.productId,
       productSku: r.product.sku,
       productName: r.product.name,
-      imageUrl: r.product.imageUrl,
+      imageUrl: r.product.imageUrl ?? r.product.parent?.imageUrl ?? null,
       warehouseId: warehouse?.id ?? '',
       warehouseName: warehouse?.name ?? '',
       warehouseCode: warehouse?.code ?? '',
@@ -577,7 +577,7 @@ export async function getWarehouses() {
   await requireAuth()
   return db.warehouse.findMany({
     where: { active: true },
-    select: { id: true, code: true, name: true, type: true, country: true },
+    select: { id: true, code: true, name: true, type: true, country: true, contactName: true, email: true, phone: true, addressLine1: true, addressLine2: true, city: true, postcode: true },
     orderBy: { code: 'asc' },
   })
 }

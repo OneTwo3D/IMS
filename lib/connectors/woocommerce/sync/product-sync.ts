@@ -331,15 +331,22 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
 export async function syncAllWcProducts(): Promise<SyncResult> {
   const result: SyncResult = { synced: 0, skipped: 0, errors: [] }
 
+  // Only fetch products modified since last sync (incremental)
+  const lastSyncSetting = await db.setting.findUnique({ where: { key: 'last_wc_product_sync_at' } })
+  const modifiedAfter = lastSyncSetting?.value ?? null
+
   let page = 1
   let totalPages = 1
 
   while (page <= totalPages) {
-    const { data, totalPages: tp, error } = await wcFetch('/products', {
+    const params: Record<string, string> = {
       per_page: '100',
       page: String(page),
       status: 'publish',
-    })
+    }
+    if (modifiedAfter) params.modified_after = modifiedAfter
+
+    const { data, totalPages: tp, error } = await wcFetch('/products', params)
     if (error) { result.errors.push(error); break }
 
     totalPages = tp

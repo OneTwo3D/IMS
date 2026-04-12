@@ -30,6 +30,10 @@ export type CustomerRow = {
   notes: string | null
   active: boolean
   orderCount: number
+  lifetimeValueGbp: number
+  currentYearSalesGbp: number
+  lastOrderAt: string | null
+  createdAt: string
   gdprAnonymisedAt: string | null
 }
 
@@ -45,6 +49,8 @@ export type CustomerInput = {
   notes?: string
 }
 
+const REVENUE_STATUSES = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'])
+
 function mapCustomer(c: {
   id: string
   firstName: string
@@ -57,9 +63,17 @@ function mapCustomer(c: {
   shippingAddress: unknown
   notes: string | null
   active: boolean
+  createdAt: Date
   gdprAnonymisedAt: Date | null
   _count: { salesOrders: number }
+  salesOrders?: { status: string; totalGbp: unknown; createdAt: Date }[]
 }): CustomerRow {
+  const currentYear = new Date().getFullYear()
+  const revenueOrders = (c.salesOrders ?? []).filter((o) => REVENUE_STATUSES.has(o.status))
+  const lastOrder = c.salesOrders?.length
+    ? c.salesOrders.reduce((latest, o) => (o.createdAt > latest ? o.createdAt : latest), c.salesOrders[0].createdAt)
+    : null
+
   return {
     id: c.id,
     firstName: c.firstName,
@@ -74,6 +88,12 @@ function mapCustomer(c: {
     notes: c.notes,
     active: c.active,
     orderCount: c._count.salesOrders,
+    lifetimeValueGbp: revenueOrders.reduce((sum, o) => sum + Number(o.totalGbp), 0),
+    currentYearSalesGbp: revenueOrders
+      .filter((o) => o.createdAt.getFullYear() === currentYear)
+      .reduce((sum, o) => sum + Number(o.totalGbp), 0),
+    lastOrderAt: lastOrder?.toISOString() ?? null,
+    createdAt: c.createdAt.toISOString(),
     gdprAnonymisedAt: c.gdprAnonymisedAt?.toISOString() ?? null,
   }
 }
@@ -86,7 +106,12 @@ export async function getCustomers(activeOnly = true): Promise<CustomerRow[]> {
       ...(activeOnly ? { active: true } : {}),
     },
     orderBy: [{ lastName: 'asc' }, { firstName: 'asc' }],
-    include: { _count: { select: { salesOrders: true } } },
+    include: {
+      _count: { select: { salesOrders: true } },
+      salesOrders: {
+        select: { status: true, totalGbp: true, createdAt: true },
+      },
+    },
   })
   return rows.map(mapCustomer)
 }

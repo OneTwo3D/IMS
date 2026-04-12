@@ -11,9 +11,10 @@ import {
   updateAdjustmentReason,
   deleteAdjustmentReason,
   type AdjustmentReason,
+  type AccountCodeOption,
 } from '@/app/actions/settings'
 
-type Props = { reasons: AdjustmentReason[] }
+type Props = { reasons: AdjustmentReason[]; accountCodes: AccountCodeOption[] }
 
 // ---------------------------------------------------------------------------
 // Shared reason form fields (controlled)
@@ -25,10 +26,12 @@ function ReasonFields({
   fields,
   onChange,
   error,
+  accountCodes,
 }: {
   fields: FieldState
   onChange: (f: FieldState) => void
   error?: string
+  accountCodes: AccountCodeOption[]
 }) {
   function set<K extends keyof FieldState>(k: K, v: FieldState[K]) {
     onChange({ ...fields, [k]: v })
@@ -46,14 +49,29 @@ function ReasonFields({
         />
         {error && <p className="text-xs text-destructive">{error}</p>}
       </div>
-      <div className="space-y-1 w-36">
+      <div className="space-y-1 w-48">
         <Label className="text-xs">Account Code</Label>
-        <Input
-          value={fields.accountCode}
-          onChange={(e) => set('accountCode', e.target.value)}
-          placeholder="e.g. 310"
-          className="h-7 text-xs"
-        />
+        {accountCodes.length > 0 ? (
+          <select
+            value={fields.accountCode}
+            onChange={(e) => set('accountCode', e.target.value)}
+            className="h-7 text-xs border border-input rounded-md px-2 w-full bg-background"
+          >
+            <option value="">— None —</option>
+            {accountCodes.map((ac) => (
+              <option key={ac.code} value={ac.code}>
+                {ac.code} — {ac.name}
+              </option>
+            ))}
+          </select>
+        ) : (
+          <Input
+            value={fields.accountCode}
+            onChange={(e) => set('accountCode', e.target.value)}
+            placeholder="e.g. 310"
+            className="h-7 text-xs"
+          />
+        )}
       </div>
       <div className="space-y-1 w-20">
         <Label className="text-xs">Sort Order</Label>
@@ -87,10 +105,12 @@ function EditForm({
   reason,
   onSaved,
   onCancel,
+  accountCodes,
 }: {
   reason: AdjustmentReason
   onSaved: (updated: AdjustmentReason) => void
   onCancel: () => void
+  accountCodes: AccountCodeOption[]
 }) {
   const [fields, setFields] = useState<FieldState>({
     name: reason.name,
@@ -118,7 +138,7 @@ function EditForm({
     <TableRow className="bg-muted/30">
       <TableCell colSpan={5} className="py-3 px-2">
         <div className="flex gap-2 items-end">
-          <ReasonFields fields={fields} onChange={setFields} error={error} />
+          <ReasonFields fields={fields} onChange={setFields} error={error} accountCodes={accountCodes} />
           <div className="flex gap-1 pb-0.5">
             <Button type="button" size="icon" disabled={pending} onClick={handleSave} title="Save" className="h-7 w-7">
               <Check className="h-3.5 w-3.5" />
@@ -141,10 +161,12 @@ function ReasonRow({
   reason,
   onUpdated,
   onDeleted,
+  accountCodes,
 }: {
   reason: AdjustmentReason
   onUpdated: (updated: AdjustmentReason) => void
   onDeleted: (id: string) => void
+  accountCodes: AccountCodeOption[]
 }) {
   const [editing, setEditing] = useState(false)
   const [deleting, setDeleting] = useState(false)
@@ -167,15 +189,20 @@ function ReasonRow({
         reason={reason}
         onSaved={(updated) => { onUpdated(updated); setEditing(false) }}
         onCancel={() => setEditing(false)}
+        accountCodes={accountCodes}
       />
     )
   }
+
+  // Resolve display name for account code
+  const acMatch = reason.accountCode ? accountCodes.find((ac) => ac.code === reason.accountCode) : null
+  const acDisplay = acMatch ? `${acMatch.code} — ${acMatch.name}` : reason.accountCode
 
   return (
     <TableRow>
       <TableCell className="text-sm">{reason.name}</TableCell>
       <TableCell className="text-sm font-mono text-muted-foreground">
-        {reason.accountCode ?? <span className="text-muted-foreground/50">—</span>}
+        {acDisplay ?? <span className="text-muted-foreground/50">—</span>}
       </TableCell>
       <TableCell className="text-sm text-center">{reason.sortOrder}</TableCell>
       <TableCell className="text-sm text-center">
@@ -204,7 +231,7 @@ function ReasonRow({
 
 const emptyFields: FieldState = { name: '', accountCode: '', sortOrder: 0, active: true }
 
-function AddReasonRow({ onAdded }: { onAdded: (item: AdjustmentReason) => void }) {
+function AddReasonRow({ onAdded, accountCodes }: { onAdded: (item: AdjustmentReason) => void; accountCodes: AccountCodeOption[] }) {
   const [open, setOpen] = useState(false)
   const [fields, setFields] = useState<FieldState>(emptyFields)
   const [pending, setPending] = useState(false)
@@ -247,7 +274,7 @@ function AddReasonRow({ onAdded }: { onAdded: (item: AdjustmentReason) => void }
     <TableRow className="bg-muted/30">
       <TableCell colSpan={5} className="py-3 px-2">
         <div className="flex gap-2 items-end">
-          <ReasonFields fields={fields} onChange={setFields} error={error} />
+          <ReasonFields fields={fields} onChange={setFields} error={error} accountCodes={accountCodes} />
           <div className="flex gap-1 pb-0.5">
             <Button type="button" size="icon" disabled={pending} onClick={handleSave} title="Save" className="h-7 w-7">
               <Check className="h-3.5 w-3.5" />
@@ -266,7 +293,7 @@ function AddReasonRow({ onAdded }: { onAdded: (item: AdjustmentReason) => void }
 // Table
 // ---------------------------------------------------------------------------
 
-export function AdjustmentReasonsTable({ reasons: initial }: Props) {
+export function AdjustmentReasonsTable({ reasons: initial, accountCodes }: Props) {
   const [reasons, setReasons] = useState(initial)
 
   return (
@@ -294,9 +321,10 @@ export function AdjustmentReasonsTable({ reasons: initial }: Props) {
             reason={r}
             onUpdated={(updated) => setReasons((prev) => prev.map((x) => (x.id === updated.id ? updated : x)))}
             onDeleted={(id) => setReasons((prev) => prev.filter((x) => x.id !== id))}
+            accountCodes={accountCodes}
           />
         ))}
-        <AddReasonRow onAdded={(item) => setReasons((prev) => [...prev, item])} />
+        <AddReasonRow onAdded={(item) => setReasons((prev) => [...prev, item])} accountCodes={accountCodes} />
       </TableBody>
     </Table>
   )

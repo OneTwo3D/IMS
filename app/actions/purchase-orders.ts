@@ -12,7 +12,7 @@ import type { TaxCategory } from '@/app/generated/prisma/client'
 // Types
 // ---------------------------------------------------------------------------
 
-export type PoStatus = 'DRAFT' | 'RFQ_SENT' | 'PO_SENT' | 'PARTIALLY_RECEIVED' | 'RECEIVED' | 'INVOICED' | 'PARTIALLY_RETURNED' | 'RETURNED' | 'CANCELLED'
+export type PoStatus = 'DRAFT' | 'RFQ_SENT' | 'QUOTE_RECEIVED' | 'PO_SENT' | 'SHIPPED' | 'PARTIALLY_RECEIVED' | 'RECEIVED' | 'CLOSED' | 'INVOICED' | 'PARTIALLY_RETURNED' | 'RETURNED' | 'CANCELLED'
 
 export type PoLineRow = {
   id: string
@@ -83,6 +83,8 @@ export type PoRow = {
   invoiceCount: number
   isPartiallyReturned: boolean
   isFullyReturned: boolean
+  trackingNumber: string | null
+  shippingProvider: string | null
 }
 
 export type PoReturn = {
@@ -244,6 +246,8 @@ const PO_SELECT = {
   discountAmount: true,
   landedCostMethod: true,
   destinationWarehouseId: true,
+  trackingNumber: true,
+  shippingProvider: true,
   supplierRef: true,
   expectedDelivery: true,
   notes: true,
@@ -272,7 +276,7 @@ const PO_SELECT = {
       sortOrder: true,
       taxRateId: true,
       taxRate: { select: { id: true, name: true, rate: true, taxCategory: true } },
-      product: { select: { sku: true, name: true, imageUrl: true } },
+      product: { select: { sku: true, name: true, imageUrl: true, parent: { select: { imageUrl: true } } } },
     },
     orderBy: { sortOrder: 'asc' as const },
   },
@@ -307,6 +311,8 @@ function mapPoRow(po: {
   internalNotes: string | null
   createdAt: Date
   updatedAt: Date
+  trackingNumber: string | null
+  shippingProvider: string | null
   supplier: { name: string }
   destinationWarehouse: { name: string } | null
   lines: { id: string; qtyReceived: unknown; qtyReturned: unknown }[]
@@ -351,6 +357,8 @@ function mapPoRow(po: {
     invoiceCount: po._count.invoices,
     isPartiallyReturned: anyReturned && !allReturned,
     isFullyReturned: allReturned,
+    trackingNumber: po.trackingNumber ?? null,
+    shippingProvider: po.shippingProvider ?? null,
   }
 }
 
@@ -373,7 +381,7 @@ function mapLine(l: {
   sortOrder: number
   taxRateId?: string | null
   taxRate?: { id: string; name: string; rate: unknown; taxCategory?: string } | null
-  product: { sku: string; name: string; imageUrl: string | null }
+  product: { sku: string; name: string; imageUrl: string | null; parent?: { imageUrl: string | null } | null }
 }): PoLineRow {
   const qty = Number(l.qty)
   const qtyReceived = Number(l.qtyReceived)
@@ -383,7 +391,7 @@ function mapLine(l: {
     productId: l.productId,
     sku: l.product.sku,
     productName: l.product.name,
-    imageUrl: l.product.imageUrl,
+    imageUrl: l.product.imageUrl ?? l.product.parent?.imageUrl ?? null,
     description: l.description,
     qty,
     unitCostForeign: Number(l.unitCostForeign),
@@ -445,7 +453,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
               poLine: {
                 select: {
                   productId: true,
-                  product: { select: { sku: true, name: true, imageUrl: true } },
+                  product: { select: { sku: true, name: true, imageUrl: true, parent: { select: { imageUrl: true } } } },
                 },
               },
             },
@@ -469,7 +477,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
               poLine: {
                 select: {
                   productId: true,
-                  product: { select: { sku: true, name: true, imageUrl: true } },
+                  product: { select: { sku: true, name: true, imageUrl: true, parent: { select: { imageUrl: true } } } },
                 },
               },
             },
@@ -510,7 +518,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
               poLine: {
                 select: {
                   productId: true,
-                  product: { select: { sku: true, name: true, imageUrl: true } },
+                  product: { select: { sku: true, name: true, imageUrl: true, parent: { select: { imageUrl: true } } } },
                 },
               },
               costLine: {
@@ -1426,7 +1434,8 @@ export async function updatePurchaseOrder(
 
 export async function advancePoStatus(
   id: string,
-  targetStatus: 'PO_SENT' | 'RFQ_SENT',
+  targetStatus: 'PO_SENT' | 'RFQ_SENT' | 'QUOTE_RECEIVED' | 'SHIPPED' | 'CLOSED',
+  payload?: { trackingNumber?: string; shippingProvider?: string },
 ): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('purchasing.create')
@@ -1437,6 +1446,10 @@ export async function advancePoStatus(
     const data: Record<string, unknown> = { status: targetStatus }
     if (targetStatus === 'RFQ_SENT') data.rfqSentAt = now
     if (targetStatus === 'PO_SENT') data.poSentAt = now
+    if (targetStatus === 'SHIPPED') {
+      if (payload?.trackingNumber) data.trackingNumber = payload.trackingNumber
+      if (payload?.shippingProvider) data.shippingProvider = payload.shippingProvider
+    }
 
     await db.purchaseOrder.update({ where: { id }, data })
     revalidatePath('/purchase-orders')
@@ -1462,6 +1475,39 @@ export async function advancePoStatus(
       description: `Failed to advance PO ${id} status: ${String(e)}`,
       metadata: null,
     })
+    return { success: false, error: String(e) }
+  }
+}
+
+export async function updatePoTracking(
+  id: string,
+  payload: { trackingNumber?: string; shippingProvider?: string },
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    await requirePermission('purchasing.create')
+    const existing = await db.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
+    if (!existing) return { success: false, error: 'PO not found' }
+
+    await db.purchaseOrder.update({
+      where: { id },
+      data: {
+        trackingNumber: payload.trackingNumber ?? null,
+        shippingProvider: payload.shippingProvider ?? null,
+      },
+    })
+    revalidatePath('/purchase-orders')
+    revalidatePath(`/purchase-orders/${id}`)
+    logActivity({
+      entityType: 'PURCHASE_ORDER',
+      entityId: id,
+      action: 'tracking_updated',
+      tag: 'purchase',
+      level: 'INFO',
+      description: `Updated tracking for PO ${existing.reference}: ${payload.shippingProvider ?? '—'} / ${payload.trackingNumber ?? '—'}`,
+      metadata: { reference: existing.reference, ...payload },
+    })
+    return { success: true }
+  } catch (e) {
     return { success: false, error: String(e) }
   }
 }
@@ -1493,7 +1539,7 @@ export async function receivePurchaseOrder(
       },
     })
     if (!po) return { success: false, error: 'PO not found' }
-    if (!['PO_SENT', 'PARTIALLY_RECEIVED', 'RFQ_SENT'].includes(po.status)) {
+    if (!['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RFQ_SENT'].includes(po.status)) {
       return { success: false, error: 'PO cannot be received in its current status' }
     }
 

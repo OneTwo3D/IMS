@@ -9,8 +9,8 @@ import { Textarea } from '@/components/ui/textarea'
 import { setSetting } from '@/app/actions/settings'
 
 type Props = {
-  s3: { endpoint: string; region: string; bucket: string; accessKey: string; secretKey: string; prefix: string }
-  sftp: { host: string; port: string; user: string; password: string; privateKey: string; path: string }
+  s3: { endpoint: string; region: string; bucket: string; accessKey: string; secretKey: string; secretKeyConfigured: boolean; prefix: string }
+  sftp: { host: string; port: string; user: string; password: string; passwordConfigured: boolean; privateKey: string; privateKeyConfigured: boolean; path: string }
 }
 
 export function BackupRemoteSettings({ s3, sftp }: Props) {
@@ -22,30 +22,44 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
 
   function showSaved(key: string) { setSaved(key); setTimeout(() => setSaved(null), 2000) }
 
+  function isMasked(value: string): boolean {
+    return value.includes('****')
+  }
+
   function handleSaveS3() {
     startTransition(async () => {
-      await Promise.all([
+      const ops = [
         setSetting('backup_s3_endpoint', s3State.endpoint),
         setSetting('backup_s3_region', s3State.region),
         setSetting('backup_s3_bucket', s3State.bucket),
         setSetting('backup_s3_access_key', s3State.accessKey),
-        setSetting('backup_s3_secret_key', s3State.secretKey),
         setSetting('backup_s3_prefix', s3State.prefix),
-      ])
+      ]
+      // Only save secret if user replaced the masked value
+      if (!isMasked(s3State.secretKey)) {
+        ops.push(setSetting('backup_s3_secret_key', s3State.secretKey))
+      }
+      await Promise.all(ops)
       showSaved('s3')
     })
   }
 
   function handleSaveSftp() {
     startTransition(async () => {
-      await Promise.all([
+      const ops = [
         setSetting('backup_sftp_host', sftpState.host),
         setSetting('backup_sftp_port', sftpState.port),
         setSetting('backup_sftp_user', sftpState.user),
-        setSetting('backup_sftp_password', sftpState.password),
-        setSetting('backup_sftp_private_key', sftpState.privateKey),
         setSetting('backup_sftp_path', sftpState.path),
-      ])
+      ]
+      // Only save secrets if user replaced the masked values
+      if (!isMasked(sftpState.password)) {
+        ops.push(setSetting('backup_sftp_password', sftpState.password))
+      }
+      if (!isMasked(sftpState.privateKey)) {
+        ops.push(setSetting('backup_sftp_private_key', sftpState.privateKey))
+      }
+      await Promise.all(ops)
       showSaved('sftp')
     })
   }
@@ -80,7 +94,15 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
           </div>
           <div className="space-y-1.5">
             <Label className="text-xs">Secret Key</Label>
-            <Input type="password" value={s3State.secretKey} onChange={(e) => setS3((p) => ({ ...p, secretKey: e.target.value }))} className="h-9" autoComplete="off" />
+            <Input
+              type="password"
+              value={s3State.secretKey}
+              onChange={(e) => setS3((p) => ({ ...p, secretKey: e.target.value }))}
+              onFocus={(e) => { if (isMasked(e.target.value)) setS3((p) => ({ ...p, secretKey: '' })) }}
+              placeholder={s3.secretKeyConfigured ? 'Configured — enter new value to change' : ''}
+              className="h-9"
+              autoComplete="off"
+            />
           </div>
           <div className="space-y-1.5 sm:col-span-2">
             <Label className="text-xs">Path Prefix (optional)</Label>
@@ -121,15 +143,24 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
           </div>
           <div className="space-y-1.5">
             <Label className="text-xs">Password (if not using key)</Label>
-            <Input type="password" value={sftpState.password} onChange={(e) => setSftp((p) => ({ ...p, password: e.target.value }))} className="h-9" autoComplete="off" />
+            <Input
+              type="password"
+              value={sftpState.password}
+              onChange={(e) => setSftp((p) => ({ ...p, password: e.target.value }))}
+              onFocus={(e) => { if (isMasked(e.target.value)) setSftp((p) => ({ ...p, password: '' })) }}
+              placeholder={sftp.passwordConfigured ? 'Configured — enter new value to change' : ''}
+              className="h-9"
+              autoComplete="off"
+            />
           </div>
           <div className="space-y-1.5 sm:col-span-2">
             <Label className="text-xs">Private Key (PEM format — paste the full key including BEGIN/END lines)</Label>
             <Textarea
               value={sftpState.privateKey}
               onChange={(e) => setSftp((p) => ({ ...p, privateKey: e.target.value }))}
+              onFocus={(e) => { if (isMasked(e.currentTarget.value)) setSftp((p) => ({ ...p, privateKey: '' })) }}
               className="text-xs font-mono min-h-[80px]"
-              placeholder="-----BEGIN OPENSSH PRIVATE KEY-----&#10;...&#10;-----END OPENSSH PRIVATE KEY-----"
+              placeholder={sftp.privateKeyConfigured ? 'Configured — paste new key to change' : '-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----'}
             />
           </div>
           <div className="space-y-1.5 sm:col-span-2">

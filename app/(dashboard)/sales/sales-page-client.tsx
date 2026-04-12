@@ -41,12 +41,14 @@ export function SalesPageClient({ initialOrders, products, warehouses, currencie
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Sales Orders</h1>
-        <Button size="sm" onClick={() => setShowCreate(true)}>
-          <Plus className="h-4 w-4 mr-1" />
-          New Order
-        </Button>
+        <div className="flex items-center gap-2">
+          <CsvBar exportUrl="/api/export/sales" templateUrl="/api/export/sales?template=1" importAction={importSalesOrdersCsv} />
+          <Button size="sm" onClick={() => setShowCreate(true)}>
+            <Plus className="h-4 w-4 mr-1" />
+            New Order
+          </Button>
+        </div>
       </div>
-      <CsvBar exportUrl="/api/export/sales" templateUrl="/api/export/sales?template=1" importAction={importSalesOrdersCsv} />
       <SoListClient initialOrders={initialOrders} currencySymbols={currencySymbols} />
       {showCreate && (
         <SoFormDialog

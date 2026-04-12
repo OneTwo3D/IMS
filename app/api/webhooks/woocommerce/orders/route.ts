@@ -9,9 +9,28 @@ import type { WcFullOrder } from '@/lib/connectors/woocommerce/sync/types'
 export async function POST(request: Request) {
   const body = await request.text()
   const signature = request.headers.get('x-wc-webhook-signature')
+  const topic = request.headers.get('x-wc-webhook-topic')
+
+  // WooCommerce sends an unsigned verification ping (no signature, no topic)
+  // when first creating a webhook — accept it so WC considers the URL valid.
+  if (!signature && !topic) {
+    return NextResponse.json({ ok: true, ping: true })
+  }
 
   if (!(await verifyWcWebhook(body, signature))) {
     return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
+  }
+
+  // Record successful webhook receipt so the UI can confirm the webhook is working
+  await db.setting.upsert({
+    where: { key: 'wc_webhook_last_received_at' },
+    create: { key: 'wc_webhook_last_received_at', value: new Date().toISOString() },
+    update: { value: new Date().toISOString() },
+  })
+
+  // WooCommerce sends a signed ping with action.* topic after webhook creation
+  if (topic!.startsWith('action.')) {
+    return NextResponse.json({ ok: true, ping: true })
   }
 
   // Skip webhook-triggered imports if initial import hasn't completed yet —
@@ -21,7 +40,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: true, skipped: 'initial_import_pending' })
   }
 
-  const topic = request.headers.get('x-wc-webhook-topic')
   const wcOrder = JSON.parse(body) as WcFullOrder
 
   if (topic === 'order.created') {

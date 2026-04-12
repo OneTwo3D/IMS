@@ -56,9 +56,12 @@ enum StockMovementType {
 enum PurchaseOrderStatus {
   DRAFT
   RFQ_SENT
+  QUOTE_RECEIVED
   PO_SENT
+  SHIPPED
   PARTIALLY_RECEIVED
   RECEIVED
+  CLOSED
   INVOICED
   PARTIALLY_RETURNED
   RETURNED
@@ -411,6 +414,9 @@ model Warehouse {
   type                  WarehouseType @default(STANDARD)
   availableForSale      Boolean       @default(true)
   syncToWoocommerce     Boolean       @default(false)
+  contactName           String?
+  email                 String?
+  phone                 String?
   addressLine1          String?
   addressLine2          String?
   city                  String?
@@ -716,6 +722,9 @@ model PurchaseOrder {
   landedCostMethod LandedCostMethod  @default(BY_VALUE)
 
   destinationWarehouseId String?    // where goods will be received (can change before receipt)
+
+  trackingNumber  String?
+  shippingProvider String?
 
   notes           String?
   internalNotes   String?

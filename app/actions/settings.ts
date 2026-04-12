@@ -297,6 +297,18 @@ export async function autoLinkXeroTaxRates(): Promise<{
 }
 
 // ---------------------------------------------------------------------------
+// Account Codes (from active accounting integration)
+// ---------------------------------------------------------------------------
+
+export type AccountCodeOption = { code: string; name: string; type: string }
+
+export async function getAccountCodes(): Promise<AccountCodeOption[]> {
+  await requireAuth()
+  const { listAccountCodes } = await import('@/lib/accounting')
+  return listAccountCodes()
+}
+
+// ---------------------------------------------------------------------------
 // Global Settings (key-value)
 // ---------------------------------------------------------------------------
 
@@ -425,6 +437,219 @@ export async function updatePurchaseUnit(id: string, input: {
     return { success: true }
   } catch (e) {
     logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update purchase unit: ${input.name ?? id}` })
+    return { success: false, error: String(e) }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Warehouses
+// ---------------------------------------------------------------------------
+
+export type WarehouseRow = {
+  id: string
+  code: string
+  name: string
+  type: string
+  contactName: string | null
+  email: string | null
+  phone: string | null
+  addressLine1: string | null
+  addressLine2: string | null
+  city: string | null
+  postcode: string | null
+  country: string
+  availableForSale: boolean
+  syncToWoocommerce: boolean
+  isDefault: boolean
+  defaultReturnWarehouse: boolean
+  active: boolean
+}
+
+const warehouseFields = {
+  id: true,
+  code: true,
+  name: true,
+  type: true,
+  contactName: true,
+  email: true,
+  phone: true,
+  addressLine1: true,
+  addressLine2: true,
+  city: true,
+  postcode: true,
+  country: true,
+  availableForSale: true,
+  syncToWoocommerce: true,
+  isDefault: true,
+  defaultReturnWarehouse: true,
+  active: true,
+} as const
+
+export async function getWarehousesForSettings(): Promise<WarehouseRow[]> {
+  await requireAuth()
+  return db.warehouse.findMany({
+    orderBy: [{ isDefault: 'desc' }, { code: 'asc' }],
+    select: warehouseFields,
+  })
+}
+
+const warehouseSchema = z.object({
+  code: z.string().min(1, 'Code is required').max(20),
+  name: z.string().min(1, 'Name is required').max(100),
+  type: z.enum(['STANDARD', 'QUARANTINE', 'RESTOCK']).default('STANDARD'),
+  contactName: z.string().max(100).optional().or(z.literal('')),
+  email: z.string().max(200).optional().or(z.literal('')),
+  phone: z.string().max(50).optional().or(z.literal('')),
+  addressLine1: z.string().max(200).optional().or(z.literal('')),
+  addressLine2: z.string().max(200).optional().or(z.literal('')),
+  city: z.string().max(100).optional().or(z.literal('')),
+  postcode: z.string().max(20).optional().or(z.literal('')),
+  country: z.string().max(10).default('GB'),
+  availableForSale: z.boolean().default(true),
+  syncToWoocommerce: z.boolean().default(false),
+  isDefault: z.boolean().default(false),
+  defaultReturnWarehouse: z.boolean().default(false),
+  active: z.boolean().default(true),
+})
+
+export type WarehouseInput = z.infer<typeof warehouseSchema>
+
+export async function createWarehouse(
+  input: WarehouseInput
+): Promise<{ success: boolean; item?: WarehouseRow; error?: string }> {
+  await requirePermission('settings.company')
+  const parsed = warehouseSchema.safeParse(input)
+  if (!parsed.success) {
+    return { success: false, error: Object.values(parsed.error.flatten().fieldErrors).flat()[0] ?? 'Validation failed' }
+  }
+  const data = parsed.data
+  try {
+    // Enforce unique code
+    const existing = await db.warehouse.findUnique({ where: { code: data.code } })
+    if (existing) return { success: false, error: `Warehouse code "${data.code}" already exists.` }
+
+    // If setting as default, unset others
+    if (data.isDefault) {
+      await db.warehouse.updateMany({ where: { isDefault: true }, data: { isDefault: false } })
+    }
+    if (data.defaultReturnWarehouse) {
+      await db.warehouse.updateMany({ where: { defaultReturnWarehouse: true }, data: { defaultReturnWarehouse: false } })
+    }
+
+    const item = await db.warehouse.create({
+      data: {
+        code: data.code,
+        name: data.name,
+        type: data.type,
+        contactName: data.contactName || null,
+        email: data.email || null,
+        phone: data.phone || null,
+        addressLine1: data.addressLine1 || null,
+        addressLine2: data.addressLine2 || null,
+        city: data.city || null,
+        postcode: data.postcode || null,
+        country: data.country,
+        availableForSale: data.availableForSale,
+        syncToWoocommerce: data.syncToWoocommerce,
+        isDefault: data.isDefault,
+        defaultReturnWarehouse: data.defaultReturnWarehouse,
+        active: data.active,
+      },
+      select: warehouseFields,
+    })
+    logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created warehouse: ${data.code} — ${data.name}` })
+    revalidatePath('/settings', 'layout')
+    return { success: true, item }
+  } catch (e) {
+    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create warehouse: ${data.code}` })
+    return { success: false, error: String(e) }
+  }
+}
+
+export async function updateWarehouse(
+  id: string,
+  input: WarehouseInput
+): Promise<{ success: boolean; item?: WarehouseRow; error?: string }> {
+  await requirePermission('settings.company')
+  const parsed = warehouseSchema.safeParse(input)
+  if (!parsed.success) {
+    return { success: false, error: Object.values(parsed.error.flatten().fieldErrors).flat()[0] ?? 'Validation failed' }
+  }
+  const data = parsed.data
+  try {
+    // Enforce unique code (excluding self)
+    const dup = await db.warehouse.findUnique({ where: { code: data.code } })
+    if (dup && dup.id !== id) return { success: false, error: `Warehouse code "${data.code}" already exists.` }
+
+    // If setting as default, unset others
+    if (data.isDefault) {
+      await db.warehouse.updateMany({ where: { isDefault: true, id: { not: id } }, data: { isDefault: false } })
+    }
+    if (data.defaultReturnWarehouse) {
+      await db.warehouse.updateMany({ where: { defaultReturnWarehouse: true, id: { not: id } }, data: { defaultReturnWarehouse: false } })
+    }
+
+    const item = await db.warehouse.update({
+      where: { id },
+      data: {
+        code: data.code,
+        name: data.name,
+        type: data.type,
+        contactName: data.contactName || null,
+        email: data.email || null,
+        phone: data.phone || null,
+        addressLine1: data.addressLine1 || null,
+        addressLine2: data.addressLine2 || null,
+        city: data.city || null,
+        postcode: data.postcode || null,
+        country: data.country,
+        availableForSale: data.availableForSale,
+        syncToWoocommerce: data.syncToWoocommerce,
+        isDefault: data.isDefault,
+        defaultReturnWarehouse: data.defaultReturnWarehouse,
+        active: data.active,
+      },
+      select: warehouseFields,
+    })
+    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated warehouse: ${data.code} — ${data.name}` })
+    revalidatePath('/settings', 'layout')
+    return { success: true, item }
+  } catch (e) {
+    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update warehouse: ${data.code}` })
+    return { success: false, error: String(e) }
+  }
+}
+
+export async function deleteWarehouse(
+  id: string
+): Promise<{ success: boolean; deactivated?: boolean; error?: string }> {
+  await requirePermission('settings.company')
+  try {
+    // Check for references that prevent hard delete
+    const [stocks, movements, poCount, soCount, allocations] = await Promise.all([
+      db.stockLevel.count({ where: { warehouseId: id } }),
+      db.stockMovement.count({ where: { OR: [{ fromWarehouseId: id }, { toWarehouseId: id }] } }),
+      db.purchaseOrder.count({ where: { destinationWarehouseId: id } }),
+      db.salesOrder.count({ where: { shipFromWarehouseId: id } }),
+      db.orderAllocation.count({ where: { warehouseId: id } }),
+    ])
+
+    const hasData = stocks + movements + poCount + soCount + allocations > 0
+
+    if (hasData) {
+      // Deactivate instead of delete
+      await db.warehouse.update({ where: { id }, data: { active: false } })
+      logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: 'Deactivated warehouse (has associated data)' })
+      revalidatePath('/settings', 'layout')
+      return { success: true, deactivated: true }
+    }
+
+    await db.warehouse.delete({ where: { id } })
+    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted warehouse' })
+    revalidatePath('/settings', 'layout')
+    return { success: true }
+  } catch (e) {
+    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', level: 'ERROR', description: 'Failed to delete warehouse' })
     return { success: false, error: String(e) }
   }
 }

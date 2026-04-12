@@ -14,7 +14,7 @@ import { PoListClient } from './po-list-client'
 import { PoFormDialog } from './po-form'
 import { FreightPoDialog } from './freight-po-form'
 
-type Warehouse = { id: string; code: string; name: string; country?: string | null }
+type Warehouse = { id: string; code: string; name: string; country?: string | null; contactName?: string | null; email?: string | null; phone?: string | null; addressLine1?: string | null; addressLine2?: string | null; city?: string | null; postcode?: string | null }
 type GoodsPo = { id: string; reference: string; supplierName: string; totalForeign: number; currency: string }
 
 type Props = {
@@ -41,6 +41,7 @@ export function PurchaseOrdersClient({ initialPos, suppliers, products, warehous
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Purchase Orders</h1>
         <div className="flex items-center gap-2">
+          <CsvBar exportUrl="/api/export/purchase-orders" templateUrl="/api/export/purchase-orders?template=1" importAction={importPurchaseOrdersCsv} />
           <Button variant="outline" size="sm" onClick={() => setShowFreight(true)}>
             <Ship className="h-4 w-4 mr-1" />
             Landed Cost PO
@@ -51,7 +52,6 @@ export function PurchaseOrdersClient({ initialPos, suppliers, products, warehous
           </Button>
         </div>
       </div>
-      <CsvBar exportUrl="/api/export/purchase-orders" templateUrl="/api/export/purchase-orders?template=1" importAction={importPurchaseOrdersCsv} />
       <PoListClient initialPos={initialPos} currencySymbols={currencySymbols} />
       {showCreate && (
         <PoFormDialog

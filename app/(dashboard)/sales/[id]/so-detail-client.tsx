@@ -2,16 +2,17 @@
 
 import { useState, useTransition, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
-import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Check, Clock } from 'lucide-react'
+import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Check, Clock, EllipsisVertical } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
+import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
 import {
   updateSalesOrderStatus, createRefund, cloneSalesOrder, deleteSalesOrder,
-  markSalesOrderPaid, updateSalesOrderNotes, generateInvoiceNumber,
+  updateSalesOrderNotes, generateInvoiceNumber,
   addPayment, deletePayment,
   type SoDetail, type SoStatus, type PaymentRow,
 } from '@/app/actions/sales'
@@ -27,6 +28,8 @@ import type { StockLevelEntry } from '@/app/actions/stock'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { formatMoney } from '@/lib/utils'
+import { getTrackingUrl } from '@/lib/tracking'
+import { countryName } from '@/lib/countries'
 
 type WarehouseInfo = { id: string; code: string; name: string }
 type Props = {
@@ -232,10 +235,10 @@ function NotesDialog({ order, onClose }: { order: SoDetail; onClose: () => void 
 // ---------------------------------------------------------------------------
 // Add Payment dialog
 // ---------------------------------------------------------------------------
-function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, onClose }: { orderId: string; refundId?: string; creditNoteNumber?: string; currency: string; onClose: () => void }) {
+function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, defaultAmount, onClose }: { orderId: string; refundId?: string; creditNoteNumber?: string; currency: string; defaultAmount?: number; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
-  const [amount, setAmount] = useState('')
+  const [amount, setAmount] = useState(defaultAmount != null && defaultAmount > 0 ? defaultAmount.toFixed(2) : '')
   const [method, setMethod] = useState('')
   const [reference, setReference] = useState('')
   const [notes, setNotes] = useState('')
@@ -556,29 +559,6 @@ const SHIPMENT_FLOW: Record<string, { label: string; target: string }> = {
   PACKED: { label: 'Ship', target: 'SHIPPED' },
 }
 
-const CARRIER_TRACKING_URLS: Record<string, string> = {
-  'Royal Mail': 'https://www.royalmail.com/track-your-item#/tracking-results/',
-  'DPD': 'https://track.dpd.co.uk/parcels/',
-  'DHL': 'https://www.dhl.com/gb-en/home/tracking/tracking-parcel.html?submit=1&tracking-id=',
-  'DHL Express': 'https://www.dhl.com/gb-en/home/tracking/tracking-express.html?submit=1&tracking-id=',
-  'FedEx': 'https://www.fedex.com/fedextrack/?trknbr=',
-  'UPS': 'https://www.ups.com/track?tracknum=',
-  'Hermes / Evri': 'https://www.evri.com/track/parcel/',
-  'Yodel': 'https://www.yodel.co.uk/tracking/',
-  'Amazon Logistics': 'https://track.amazon.co.uk/tracking/',
-  'ParcelForce': 'https://www.parcelforce.com/track-trace?trackNumber=',
-  'TNT': 'https://www.tnt.com/express/en_gb/site/tracking.html?searchType=con&cons=',
-  'GLS': 'https://gls-group.com/GB/en/parcel-tracking?match=',
-  'Collect+': 'https://www.collectplus.co.uk/track/',
-}
-
-function getTrackingUrl(carrier: string | null, trackingNumber: string): string | null {
-  if (!carrier || !trackingNumber) return null
-  const baseUrl = CARRIER_TRACKING_URLS[carrier]
-  if (baseUrl) return baseUrl + encodeURIComponent(trackingNumber)
-  // Fallback: try 17track universal tracker
-  return `https://t.17track.net/en#nums=${encodeURIComponent(trackingNumber)}`
-}
 
 function ShipmentsPanel({
   shipments, warehouses, carriers, deliveryTrackingEnabled, onRefresh,
@@ -809,13 +789,12 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
     })
   }
 
-  function handleMarkPaid() {
-    startTransition(async () => {
-      const result = await markSalesOrderPaid(so.id)
-      if (result.success) router.refresh()
-      else setError(result.error ?? 'Failed')
-    })
-  }
+  // Derive paid status from invoice payments (no manual toggle)
+  const invoicePayments = so.payments.filter((p) => !p.refundId)
+  const totalPaid = invoicePayments.reduce((s, p) => s + p.amount, 0)
+  const invoiceBalance = so.totalForeign - totalPaid
+  const isPaid = so.invoiceNumber != null && invoiceBalance <= 0.01
+  const isPartiallyPaid = so.invoiceNumber != null && totalPaid > 0.01 && invoiceBalance > 0.01
 
   function handleGenerateInvoice() {
     startTransition(async () => {
@@ -857,50 +836,18 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
         <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${STATUS_CLASS[so.status]}`}>
           {STATUS_LABELS[so.status]}
         </span>
-        {so.paidAt && (
+        {isPaid && (
           <span className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200">
             Paid
           </span>
         )}
-        {so.invoiceNumber && (
-          <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-purple-100 text-purple-800 border-purple-200 dark:bg-purple-900 dark:text-purple-200">
-            {so.invoiceNumber}
+        {isPartiallyPaid && (
+          <span className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200">
+            Part. Paid
           </span>
-        )}
-        {so.accountingInvoiceId && (
-          <a
-            href={accountingInvoiceUrlTemplate.replace('{id}', so.accountingInvoiceId)}
-            target="_blank"
-            rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs font-medium bg-blue-100 text-blue-800 border-blue-200 dark:bg-blue-900 dark:text-blue-200 hover:bg-blue-200 dark:hover:bg-blue-800 transition-colors"
-          >
-            <ExternalLink className="h-3 w-3" />Accounting
-          </a>
         )}
 
         <div className="flex items-center gap-1.5 ml-auto flex-wrap">
-          {/* PDF & Email */}
-          <Button variant="outline" size="sm" onClick={() => window.open(`/api/sales-order/${so.id}`, '_blank')}>
-            <FileText className="h-4 w-4 mr-1" />Order PDF
-          </Button>
-          {so.invoiceNumber && (
-            <Button variant="outline" size="sm" onClick={() => window.open(`/api/invoice/${so.id}`, '_blank')}>
-              <FileText className="h-4 w-4 mr-1" />Invoice PDF
-            </Button>
-          )}
-          {so.customerEmail && (
-            <Button variant="outline" size="sm" onClick={handleEmailOrder} disabled={isPending}>
-              {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Mail className="h-4 w-4 mr-1" />}Email
-            </Button>
-          )}
-          {so.invoiceNumber && so.customerEmail && (
-            <Button variant="outline" size="sm" onClick={handleEmailInvoice} disabled={isPending}>
-              {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Mail className="h-4 w-4 mr-1" />}Email Invoice
-            </Button>
-          )}
-
-          <span className="w-px h-5 bg-border mx-0.5" />
-
           {/* Workflow */}
           {nextActions.map((a) => (
             <Button key={a.target} size="sm" onClick={() => handleStatusChange(a.target)} disabled={isPending}>
@@ -908,11 +855,6 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
               {a.label}
             </Button>
           ))}
-
-          {/* Mark Paid */}
-          <Button variant="outline" size="sm" onClick={handleMarkPaid} disabled={isPending}>
-            <CreditCard className="h-4 w-4 mr-1" />{so.paidAt ? 'Unpaid' : 'Mark Paid'}
-          </Button>
 
           {/* Invoice */}
           {!so.invoiceNumber && !accountingSyncEnabled && (
@@ -932,10 +874,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
 
           <span className="w-px h-5 bg-border mx-0.5" />
 
-          {/* Clone / Notes / Delete / WC */}
-          <Button variant="outline" size="sm" onClick={handleClone} disabled={isPending}>
-            <Copy className="h-4 w-4 mr-1" />Clone
-          </Button>
+          {/* Notes / Delete / WC */}
           <Button variant="outline" size="sm" onClick={() => setShowNotes(true)}>
             <Pencil className="h-4 w-4 mr-1" />Notes
           </Button>
@@ -954,6 +893,43 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
               <Trash2 className="h-4 w-4 mr-1" />Delete
             </Button>
           )}
+
+          {/* More actions dropdown (PDF, Email, Clone) */}
+          <DropdownMenu>
+            <DropdownMenuTrigger render={<Button variant="outline" size="sm" />}>
+              <EllipsisVertical className="h-4 w-4" />
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end">
+              <DropdownMenuItem onClick={() => window.open(`/api/sales-order/${so.id}`, '_blank')}>
+                <FileText className="h-4 w-4 mr-1.5" />Order PDF
+              </DropdownMenuItem>
+              {so.invoiceNumber && (
+                <DropdownMenuItem onClick={() => window.open(`/api/invoice/${so.id}`, '_blank')}>
+                  <FileText className="h-4 w-4 mr-1.5" />Invoice PDF
+                </DropdownMenuItem>
+              )}
+              {hasShipments && (
+                <DropdownMenuItem onClick={() => window.open(`/api/packing-slip/${so.id}`, '_blank')}>
+                  <Package className="h-4 w-4 mr-1.5" />Packing Slip
+                </DropdownMenuItem>
+              )}
+              <DropdownMenuSeparator />
+              {so.customerEmail && (
+                <DropdownMenuItem onClick={handleEmailOrder} disabled={isPending}>
+                  <Mail className="h-4 w-4 mr-1.5" />Email Order
+                </DropdownMenuItem>
+              )}
+              {so.invoiceNumber && so.customerEmail && (
+                <DropdownMenuItem onClick={handleEmailInvoice} disabled={isPending}>
+                  <Mail className="h-4 w-4 mr-1.5" />Email Invoice
+                </DropdownMenuItem>
+              )}
+              {so.customerEmail && <DropdownMenuSeparator />}
+              <DropdownMenuItem onClick={handleClone} disabled={isPending}>
+                <Copy className="h-4 w-4 mr-1.5" />Clone
+              </DropdownMenuItem>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
 
@@ -969,8 +945,16 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
         <div>
           <span className="text-muted-foreground">Shipping Address</span>
           {so.shippingAddress ? (
-            <p className="text-xs mt-0.5">{(() => { const a = so.shippingAddress as Record<string, string>; return [a.line1, a.line2, a.city, a.county, a.postcode, a.country].filter(Boolean).join(', ') || '—' })()}</p>
+            <p className="text-xs mt-0.5 flex items-center gap-1 flex-wrap">{(() => { const a = so.shippingAddress as Record<string, string>; const parts = [...[a.line1, a.line2, a.city, a.county, a.postcode].filter(Boolean)]; const countryStr = a.country ? countryName(so.shippingCountryCode) : ''; if (countryStr) parts.push(countryStr); return parts.join(', ') || '—' })()}{so.shippingCountryCode && <img src={`https://flagcdn.com/16x12/${so.shippingCountryCode.toLowerCase()}.png`} alt={so.shippingCountryCode} className="h-3 w-4 object-cover inline-block" />}</p>
           ) : <p className="text-muted-foreground">—</p>}
+        </div>
+        <div>
+          <span className="text-muted-foreground">Source</span>
+          <p className="font-medium flex items-center gap-1.5">
+            {so.wcOrderId ? (
+              <img src="/images/woocommerce.svg" alt="WooCommerce" className="h-4 w-auto" />
+            ) : 'Manual'}
+          </p>
         </div>
         <div>
           <span className="text-muted-foreground">Ship From</span>
@@ -984,6 +968,16 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
           <span className="text-muted-foreground">Currency</span>
           <p className="font-medium">{so.currency} ({sym})</p>
         </div>
+        {so.paymentMethodTitle && (
+          <div>
+            <span className="text-muted-foreground">Payment</span>
+            <p className="font-medium">{so.paymentMethodTitle}</p>
+          </div>
+        )}
+        <div>
+          <span className="text-muted-foreground">Order Date</span>
+          <p className="font-medium">{new Date(so.wcCreatedAt ?? so.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}{', '}{new Date(so.wcCreatedAt ?? so.createdAt).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}</p>
+        </div>
         {so.expectedDelivery && <div><span className="text-muted-foreground">Expected Delivery</span><p className="font-medium">{new Date(so.expectedDelivery).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}</p></div>}
         {so.salesRep && <div><span className="text-muted-foreground">Sales Rep</span><p className="font-medium">{so.salesRep}</p></div>}
         {so.trackingNumber && <div><span className="text-muted-foreground">Tracking</span>{(() => {
@@ -995,32 +989,19 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
           ) : <p className="font-medium font-mono text-xs">{so.trackingNumber}</p>
         })()}</div>}
         {so.shippedAt && <div><span className="text-muted-foreground">Shipped</span><p className="font-medium">{new Date(so.shippedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}</p></div>}
+        <div>
+          <span className="text-muted-foreground">COGS</span>
+          <p className="font-medium font-mono">{so.cogsGbp != null ? `£${so.cogsGbp.toFixed(2)}` : '—'}</p>
+        </div>
+        <div>
+          <span className="text-muted-foreground">Margin</span>
+          <p className={`font-medium font-mono ${so.profitMarginPercent != null ? (so.profitMarginPercent >= 0 ? 'text-green-600' : 'text-red-600') : ''}`}>
+            {so.profitMarginPercent != null ? `${so.profitMarginPercent.toFixed(1)}%` : '—'}
+          </p>
+        </div>
         {so.notes && <div className="col-span-2"><span className="text-muted-foreground">Customer Notes</span><p className="mt-0.5 whitespace-pre-wrap">{so.notes}</p></div>}
         {so.internalNotes && <div className="col-span-2"><span className="text-muted-foreground">Private Notes</span><p className="mt-0.5 whitespace-pre-wrap text-muted-foreground italic">{so.internalNotes}</p></div>}
       </div>
-
-      {/* Allocation Panel */}
-      {showAllocations && (
-        <AllocationPanel
-          orderId={so.id}
-          allocations={allocations}
-          lines={so.lines}
-          warehouses={warehouses}
-          status={so.status}
-          onRefresh={() => { refreshAllocations(); router.refresh() }}
-        />
-      )}
-
-      {/* Shipments Panel */}
-      {showShipments && (
-        <ShipmentsPanel
-          shipments={shipments}
-          warehouses={warehouses}
-          carriers={carriers}
-          deliveryTrackingEnabled={deliveryTrackingEnabled}
-          onRefresh={() => { refreshAllocations(); router.refresh() }}
-        />
-      )}
 
       {/* Lines table */}
       <div className="rounded-md border">
@@ -1166,6 +1147,29 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
         </Table>
       </div>
 
+      {/* Allocation Panel */}
+      {showAllocations && (
+        <AllocationPanel
+          orderId={so.id}
+          allocations={allocations}
+          lines={so.lines}
+          warehouses={warehouses}
+          status={so.status}
+          onRefresh={() => { refreshAllocations(); router.refresh() }}
+        />
+      )}
+
+      {/* Shipments Panel */}
+      {showShipments && (
+        <ShipmentsPanel
+          shipments={shipments}
+          warehouses={warehouses}
+          carriers={carriers}
+          deliveryTrackingEnabled={deliveryTrackingEnabled}
+          onRefresh={() => { refreshAllocations(); router.refresh() }}
+        />
+      )}
+
       {/* Invoice */}
       {so.invoiceNumber && (
         <div className="rounded-md border overflow-x-auto">
@@ -1173,7 +1177,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
             <div className="flex items-center gap-2 text-sm font-medium">
               <FileText className="h-4 w-4 text-muted-foreground" />
               Invoice {so.invoiceNumber}
-              {so.paidAt && <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200">Paid</span>}
+              {isPaid && <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200">Paid</span>}
+              {isPartiallyPaid && <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium bg-amber-100 text-amber-800 border-amber-200 dark:bg-amber-900 dark:text-amber-200">Part. Paid</span>}
             </div>
             <div className="flex items-center gap-1.5">
               <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowInvoice(true)}>
@@ -1185,6 +1190,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
               {so.customerEmail && (
                 <Button variant="outline" size="sm" className="h-7 text-xs" onClick={handleEmailInvoice} disabled={isPending}>
                   <Mail className="h-3 w-3 mr-1" />Email
+                </Button>
+              )}
+              {so.accountingInvoiceId && (
+                <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => window.open(accountingInvoiceUrlTemplate.replace('{id}', so.accountingInvoiceId!), '_blank')}>
+                  <ExternalLink className="h-3 w-3 mr-1" />Accounting
                 </Button>
               )}
             </div>
@@ -1212,29 +1222,32 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
             </div>
           </div>
           {/* Invoice payments */}
-          {so.payments.filter((p) => !p.refundId).length > 0 && (
-            <div className="border-t px-4 py-2 space-y-1">
-              {so.payments.filter((p) => !p.refundId).map((p) => (
-                <div key={p.id} className="flex items-center justify-between text-xs">
-                  <div className="flex items-center gap-2">
-                    <span className="text-muted-foreground">{new Date(p.paidAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
-                    {p.method && <span className="text-muted-foreground">{p.method}</span>}
-                    {p.reference && <span className="font-mono text-muted-foreground">{p.reference}</span>}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <span className="font-mono font-medium">{money(p.amount)}</span>
-                    <button type="button" onClick={() => { if (confirm('Delete this payment?')) startTransition(async () => { await deletePayment(p.id, so.id); router.refresh() }) }} className="text-muted-foreground hover:text-destructive">
-                      <Trash2 className="h-3 w-3" />
-                    </button>
-                  </div>
-                </div>
-              ))}
-            </div>
-          )}
           <div className="border-t px-4 py-2">
-            <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowPayment({})}>
-              <CreditCard className="h-3 w-3 mr-1" />Add Payment
-            </Button>
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-medium">Payments</h3>
+              <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => setShowPayment({})}>
+                <CreditCard className="h-3 w-3 mr-1" />Add Payment
+              </Button>
+            </div>
+            {so.payments.filter((p) => !p.refundId).length > 0 && (
+              <div className="mt-2 space-y-1">
+                {so.payments.filter((p) => !p.refundId).map((p) => (
+                  <div key={p.id} className="flex items-center justify-between text-xs">
+                    <div className="flex items-center gap-2">
+                      <span className="text-muted-foreground">{new Date(p.paidAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}</span>
+                      {p.method && <span className="text-muted-foreground">{p.method}</span>}
+                      {p.reference && <span className="font-mono text-muted-foreground">{p.reference}</span>}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <span className="font-mono font-medium">{money(p.amount)}</span>
+                      <button type="button" onClick={() => { if (confirm('Delete this payment?')) startTransition(async () => { await deletePayment(p.id, so.id); router.refresh() }) }} className="text-muted-foreground hover:text-destructive">
+                        <Trash2 className="h-3 w-3" />
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
         </div>
       )}
@@ -1288,7 +1301,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
       {showShip && <ShipDialog order={so} warehouses={warehouses} carriers={carriers} onClose={() => setShowShip(false)} />}
       {showRefund && <RefundDialog order={so} warehouses={warehouses} sym={sym} onClose={() => setShowRefund(false)} />}
       {showNotes && <NotesDialog order={so} onClose={() => setShowNotes(false)} />}
-      {showPayment && <PaymentDialog orderId={so.id} refundId={showPayment.refundId} creditNoteNumber={showPayment.creditNoteNumber} currency={so.currency} onClose={() => setShowPayment(null)} />}
+      {showPayment && <PaymentDialog orderId={so.id} refundId={showPayment.refundId} creditNoteNumber={showPayment.creditNoteNumber} currency={so.currency} defaultAmount={!showPayment.refundId ? (invoiceBalance > 0.01 ? invoiceBalance : undefined) : undefined} onClose={() => setShowPayment(null)} />}
 
       {/* Invoice detail dialog */}
       {showInvoice && so.invoiceNumber && (
@@ -1307,7 +1320,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
               </div>
               <div>
                 <span className="text-muted-foreground text-xs">Status</span>
-                <p className="font-medium">{so.paidAt ? `Paid ${new Date(so.paidAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}` : 'Unpaid'}</p>
+                <p className="font-medium">{isPaid ? 'Paid' : isPartiallyPaid ? 'Partially Paid' : 'Unpaid'}</p>
               </div>
               <div>
                 <span className="text-muted-foreground text-xs">Customer</span>
@@ -1320,7 +1333,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
             </div>
 
             {/* Line items */}
-            <Table className="rounded-md border min-w-[600px]">
+            <Table containerClassName="rounded-md border overflow-x-auto" className="min-w-[500px]">
               <TableHeader className="bg-muted/50">
                 <TableRow>
                   <TableHead className="text-xs">Description</TableHead>
@@ -1383,14 +1396,14 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
               </div>
             )}
           </div>
-          <DialogFooter>
+          <DialogFooter className="flex-wrap gap-2">
             <Button variant="outline" onClick={() => setShowInvoice(false)}>Close</Button>
             <Button variant="outline" onClick={() => window.open(`/api/invoice/${so.id}`, '_blank')}>
-              <FileText className="h-4 w-4 mr-1" />Print / Download PDF
+              <FileText className="h-4 w-4 mr-1" />PDF
             </Button>
             {so.customerEmail && (
               <Button variant="outline" onClick={handleEmailInvoice} disabled={isPending}>
-                {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Mail className="h-4 w-4 mr-1" />}Email to Customer
+                {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Mail className="h-4 w-4 mr-1" />}Email
               </Button>
             )}
             {canRefund && (

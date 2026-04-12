@@ -121,10 +121,11 @@ Invoices can be generated either manually or automatically. The trigger for auto
 
 ## Documents
 
-Two PDF documents are available for each sales order:
+Three PDF documents are available for each sales order:
 
 - **Sales Order PDF** — a summary of the order for internal use or to send to the customer
 - **Invoice PDF** — the formal tax invoice, generated manually or automatically
+- **Packing Slip** — a picking/packing checklist showing SKU, product name, location, quantity, and a tick box for each item. Available from the order's ⋮ menu once shipments exist (PICKING status onwards). When an order has multiple shipments from different warehouses, items are grouped by shipment with a section heading per warehouse.
 
 PDFs use your company branding (logo, colours, and footer) as configured in Settings.
 

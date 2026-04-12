@@ -134,7 +134,7 @@ export async function generateForecasts(): Promise<ProductForecast[]> {
   const products = await db.product.findMany({
     where: { active: true, type: { notIn: ['VARIABLE', 'NON_INVENTORY'] } },
     select: {
-      id: true, sku: true, name: true, imageUrl: true, stockUnit: true,
+      id: true, sku: true, name: true, imageUrl: true, parent: { select: { imageUrl: true } }, stockUnit: true,
       stockLevels: { select: { quantity: true, reservedQty: true } },
     },
   })
@@ -310,7 +310,7 @@ export async function generateForecasts(): Promise<ProductForecast[]> {
       productId: p.id,
       sku: p.sku,
       name: p.name,
-      imageUrl: p.imageUrl,
+      imageUrl: p.imageUrl ?? p.parent?.imageUrl ?? null,
       stockUnit: p.stockUnit,
       currentStock: totalStock,
       reservedStock,

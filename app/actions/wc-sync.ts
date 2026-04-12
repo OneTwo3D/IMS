@@ -23,6 +23,7 @@ export type WcSyncSettings = {
   wc_stock_sync_enabled: string
   wc_cogs_sync_enabled: string
   wc_webhook_secret: string
+  wc_webhook_last_received_at: string
   last_wc_order_sync_at: string
   last_wc_product_sync_at: string
   last_wc_stock_sync_at: string
@@ -32,7 +33,7 @@ export type WcSyncSettings = {
 const SYNC_SETTING_KEYS = [
   'wc_sync_enabled', 'wc_sync_order_statuses', 'wc_sync_interval_minutes',
   'wc_sync_product_enabled', 'wc_sync_product_direction', 'wc_stock_sync_enabled', 'wc_cogs_sync_enabled',
-  'wc_webhook_secret', 'last_wc_order_sync_at', 'last_wc_product_sync_at', 'last_wc_stock_sync_at',
+  'wc_webhook_secret', 'wc_webhook_last_received_at', 'last_wc_order_sync_at', 'last_wc_product_sync_at', 'last_wc_stock_sync_at',
   'wc_initial_import_completed',
 ]
 
@@ -45,6 +46,7 @@ const SYNC_DEFAULTS: WcSyncSettings = {
   wc_stock_sync_enabled: 'false',
   wc_cogs_sync_enabled: 'false',
   wc_webhook_secret: '',
+  wc_webhook_last_received_at: '',
   last_wc_order_sync_at: '',
   last_wc_product_sync_at: '',
   last_wc_stock_sync_at: '',
@@ -258,6 +260,83 @@ export async function getWcSyncLogs(limit = 50): Promise<SyncLogRow[]> {
     syncedAt: r.syncedAt?.toISOString() ?? null,
     createdAt: r.createdAt.toISOString(),
   }))
+}
+
+// ---------------------------------------------------------------------------
+// Auto-create WooCommerce webhooks
+// ---------------------------------------------------------------------------
+
+const WC_WEBHOOK_DEFS = [
+  { name: 'OTI – Order created',   topic: 'order.created',   path: '/api/webhooks/woocommerce/orders' },
+  { name: 'OTI – Order updated',   topic: 'order.updated',   path: '/api/webhooks/woocommerce/orders' },
+  { name: 'OTI – Product updated', topic: 'product.updated', path: '/api/webhooks/woocommerce/products' },
+] as const
+
+export async function createWcWebhooks(): Promise<{
+  success: boolean
+  created: number
+  existing: number
+  errors: string[]
+}> {
+  await requireAdmin()
+
+  const appUrl = process.env.NEXT_PUBLIC_APP_URL
+  if (!appUrl) return { success: false, created: 0, existing: 0, errors: ['NEXT_PUBLIC_APP_URL is not set'] }
+
+  // Read webhook secret from DB — must exist
+  const secretRow = await db.setting.findUnique({ where: { key: 'wc_webhook_secret' } })
+  if (!secretRow?.value) {
+    return { success: false, created: 0, existing: 0, errors: ['Webhook secret not configured — generate one first'] }
+  }
+  const secret = secretRow.value
+
+  const { wcFetch, wcPost } = await import('@/lib/connectors/woocommerce/api')
+
+  // List existing webhooks to avoid duplicates
+  const { data: existing, error: listError } = await wcFetch('/webhooks', { per_page: '100' })
+  if (listError) return { success: false, created: 0, existing: 0, errors: [listError] }
+
+  const existingWebhooks = Array.isArray(existing) ? existing as Array<{ topic?: string; delivery_url?: string }> : []
+
+  let created = 0
+  let alreadyExist = 0
+  const errors: string[] = []
+
+  for (const def of WC_WEBHOOK_DEFS) {
+    const deliveryUrl = `${appUrl}${def.path}`
+
+    const isDuplicate = existingWebhooks.some(
+      (wh) => wh.topic === def.topic && wh.delivery_url === deliveryUrl,
+    )
+    if (isDuplicate) {
+      alreadyExist++
+      continue
+    }
+
+    const { error } = await wcPost('/webhooks', {
+      name: def.name,
+      topic: def.topic,
+      delivery_url: deliveryUrl,
+      secret,
+      status: 'active',
+    })
+    if (error) {
+      errors.push(`${def.topic}: ${error}`)
+    } else {
+      created++
+    }
+  }
+
+  if (created > 0) {
+    logActivity({
+      entityType: 'SETTING',
+      tag: 'sync',
+      action: 'wc_webhooks_created',
+      description: `Created ${created} WooCommerce webhook(s)${alreadyExist > 0 ? `, ${alreadyExist} already existed` : ''}`,
+    })
+  }
+
+  return { success: errors.length === 0, created, existing: alreadyExist, errors }
 }
 
 // ---------------------------------------------------------------------------

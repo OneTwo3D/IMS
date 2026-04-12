@@ -7,6 +7,7 @@ import {
   drawHeader,
   drawTable,
   drawFooter,
+  drawTemplateNotes,
   pdfToBuffer,
   type PdfTableColumn,
   type Branding,
@@ -31,37 +32,6 @@ const TODAY = () => new Date().toLocaleDateString('en-GB', { day: 'numeric', mon
 
 async function getTemplate(type: string) {
   return db.documentTemplate.findUnique({ where: { type } })
-}
-
-type TemplateFields = { headerNote?: string | null; footerNote?: string | null; termsText?: string | null; customFooter?: string | null; showPaymentTerms?: boolean; paymentTermsText?: string | null }
-
-function drawTemplateNotes(
-  doc: PDFKit.PDFDocument,
-  tpl: TemplateFields | null,
-  position: 'header' | 'footer',
-) {
-  if (!tpl) return
-  if (position === 'header' && tpl.headerNote) {
-    doc.font('Helvetica').fontSize(9).fillColor('#333').text(tpl.headerNote, 50, doc.y, { width: 495 })
-    doc.y += 10
-  }
-  if (position === 'footer') {
-    if (tpl.showPaymentTerms && tpl.paymentTermsText) {
-      doc.font('Helvetica-Bold').fontSize(8).fillColor('#444').text('Payment Terms', 50, doc.y)
-      doc.font('Helvetica').fontSize(8).fillColor('#333').text(tpl.paymentTermsText, 50, doc.y + 2, { width: 495 })
-      doc.y += 10
-    }
-    if (tpl.termsText) {
-      doc.font('Helvetica').fontSize(7).fillColor('#888').text('TERMS & CONDITIONS', 50, doc.y)
-      doc.y += 2
-      doc.font('Helvetica').fontSize(7).fillColor('#666').text(tpl.termsText, 50, doc.y, { width: 495 })
-      doc.y += 10
-    }
-    if (tpl.footerNote) {
-      doc.font('Helvetica').fontSize(8).fillColor('#888').text(tpl.footerNote, 50, doc.y, { width: 495, align: 'center' })
-      doc.y += 6
-    }
-  }
 }
 
 async function generateInvoicePreview(branding: Branding) {

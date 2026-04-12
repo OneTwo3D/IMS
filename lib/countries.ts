@@ -37,6 +37,16 @@ export function countryName(code: string | null | undefined): string {
   return COUNTRIES[code.toUpperCase()] ?? code
 }
 
+/** Convert ISO-2 country code to emoji flag (Regional Indicator Symbol pairs). */
+export function countryFlag(code: string | null | undefined): string {
+  if (!code || code.length !== 2) return ''
+  const upper = code.toUpperCase()
+  return String.fromCodePoint(
+    upper.charCodeAt(0) - 0x41 + 0x1F1E6,
+    upper.charCodeAt(1) - 0x41 + 0x1F1E6,
+  )
+}
+
 /** Common aliases & historic spellings → ISO-2 */
 const COUNTRY_ALIASES: Record<string, string> = {
   'uk': 'GB',

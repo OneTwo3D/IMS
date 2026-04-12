@@ -29,17 +29,18 @@ async function main() {
     },
   })
 
-  // Warehouses
-  const warehouses = [
-    { code: 'EAR2', name: 'Earith 2',    type: 'STANDARD'   as const, availableForSale: true,  syncToWoocommerce: true,  isDefault: true,  defaultReturnWarehouse: false },
-    { code: 'CBG',  name: 'Cambridge',   type: 'STANDARD'   as const, availableForSale: true,  syncToWoocommerce: true,  isDefault: false, defaultReturnWarehouse: false },
-    { code: 'RES',  name: 'Restock',     type: 'RESTOCK'    as const, availableForSale: false, syncToWoocommerce: false, isDefault: false, defaultReturnWarehouse: false },
-    { code: 'QUA',  name: 'Quarantine',  type: 'QUARANTINE' as const, availableForSale: false, syncToWoocommerce: false, isDefault: false, defaultReturnWarehouse: true  },
-  ]
-  for (const wh of warehouses) {
-    await db.warehouse.upsert({ where: { code: wh.code }, update: {}, create: wh })
+  // Warehouses — single default for fresh installs (add more via Settings > Inventory)
+  const defaultWarehouse = {
+    code: 'DEFAULT',
+    name: 'Default',
+    type: 'STANDARD' as const,
+    availableForSale: true,
+    syncToWoocommerce: false,
+    isDefault: true,
+    defaultReturnWarehouse: false,
   }
-  console.log(`  ✓ ${warehouses.length} warehouses`)
+  await db.warehouse.upsert({ where: { code: defaultWarehouse.code }, update: {}, create: defaultWarehouse })
+  console.log('  ✓ Default warehouse')
 
   // Currencies
   const currencies = [

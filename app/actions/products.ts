@@ -107,6 +107,7 @@ export async function listProducts(params: {
             { sku: { contains: params.search, mode: 'insensitive' as const } },
             { name: { contains: params.search, mode: 'insensitive' as const } },
             { barcode: { contains: params.search, mode: 'insensitive' as const } },
+            { variants: { some: { sku: { contains: params.search, mode: 'insensitive' as const } } } },
           ],
         }
       : {}),
@@ -127,10 +128,11 @@ export async function listProducts(params: {
     db.product.findMany({
       where,
       include: {
-        parent: { select: { sku: true } },
+        parent: { select: { sku: true, imageUrl: true } },
         variants: {
           select: {
             id: true,
+            imageUrl: true,
             salesPriceGbp: true,
             salePriceGbp: true,
             stockLevels: { select: { quantity: true, reservedQty: true } },
@@ -220,7 +222,7 @@ export async function listProducts(params: {
     widthCm: p.widthCm?.toString() ?? null,
     heightCm: p.heightCm?.toString() ?? null,
     depthCm: p.depthCm?.toString() ?? null,
-    imageUrl: p.imageUrl ?? null,
+    imageUrl: p.imageUrl ?? p.parent?.imageUrl ?? null,
     salesPriceGbp: p.salesPriceGbp?.toString() ?? null,
     salePriceGbp: p.salePriceGbp?.toString() ?? null,
     priceRange,
@@ -263,7 +265,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     db.product.findUnique({
       where: { id },
       include: {
-        parent: { select: { sku: true } },
+        parent: { select: { sku: true, imageUrl: true } },
         variants: {
           include: { stockLevels: { select: { quantity: true, reservedQty: true } } },
           orderBy: { sku: 'asc' },
@@ -400,7 +402,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     widthCm: p.widthCm?.toString() ?? null,
     heightCm: p.heightCm?.toString() ?? null,
     depthCm: p.depthCm?.toString() ?? null,
-    imageUrl: p.imageUrl ?? null,
+    imageUrl: p.imageUrl ?? p.parent?.imageUrl ?? null,
     salesPriceGbp: p.salesPriceGbp?.toString() ?? null,
     salePriceGbp: p.salePriceGbp?.toString() ?? null,
     priceRange: p.type === 'VARIABLE' && p.variants.length > 0 ? (() => {
@@ -432,7 +434,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       widthCm: v.widthCm?.toString() ?? null,
       heightCm: v.heightCm?.toString() ?? null,
       depthCm: v.depthCm?.toString() ?? null,
-      imageUrl: v.imageUrl ?? null,
+      imageUrl: v.imageUrl ?? p.imageUrl ?? null,
       salesPriceGbp: v.salesPriceGbp?.toString() ?? null,
       salePriceGbp: v.salePriceGbp?.toString() ?? null,
       priceRange: null,

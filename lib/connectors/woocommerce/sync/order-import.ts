@@ -190,6 +190,15 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       await getShoppingConnectorPrefixes('woocommerce')
     const orderNumber = `${wcOrderPrefix}${wcOrder.number}`
 
+    // Find the default WC warehouse — prefer isDefault + syncToWoocommerce,
+    // fall back to any syncToWoocommerce warehouse.
+    const wcWarehouses = await db.warehouse.findMany({
+      where: { active: true, syncToWoocommerce: true },
+      select: { id: true, isDefault: true },
+      orderBy: { isDefault: 'desc' },
+    })
+    const wcDefaultWarehouseId = wcWarehouses[0]?.id ?? null
+
     // Create the sales order
     const so = await db.salesOrder.create({
       data: {
@@ -202,6 +211,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         wcUpdatedAt: new Date(wcOrder.date_modified_gmt || wcOrder.date_modified),
         ...(options.useWcDateAsCreatedAt ? { createdAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created) } : {}),
         status: imsStatus,
+        shipFromWarehouseId: wcDefaultWarehouseId,
         currency,
         fxRateToGbp: fxRate,
         customerId,

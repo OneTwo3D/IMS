@@ -87,6 +87,29 @@ export function lookupPaymentAccount(
   }
 }
 
+export type AccountCode = {
+  code: string
+  name: string
+  type: string
+}
+
+/**
+ * List all account codes from the active accounting integration.
+ * Returns EXPENSE accounts (suitable for stock adjustments, COGS overrides, etc.)
+ * plus any other account types that have a code.
+ */
+export async function listAccountCodes(): Promise<AccountCode[]> {
+  const { db } = await import('@/lib/db')
+  const accounts = await db.xeroAccount.findMany({
+    where: { active: true, code: { not: null } },
+    select: { code: true, name: true, type: true },
+    orderBy: [{ code: 'asc' }],
+  })
+  return accounts
+    .filter((a): a is { code: string; name: string; type: string } => a.code !== null)
+    .map((a) => ({ code: a.code, name: a.name, type: a.type }))
+}
+
 export type AccountingBankAccount = {
   id: string       // connector-native account id (Xero AccountID, QuickBooks account id, ...)
   code: string | null

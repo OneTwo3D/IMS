@@ -1,10 +1,13 @@
 'use client'
 
 import { useRouter, usePathname } from 'next/navigation'
-import { useTransition, useCallback } from 'react'
-import { Search } from 'lucide-react'
+import { useTransition, useCallback, useState, useEffect, useRef } from 'react'
+import { Search, Settings2 } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
+import { Button } from '@/components/ui/button'
+import { ALL_COLUMNS, STORAGE_KEY, COLS_CHANGED_EVENT, defaultVisibility } from '@/components/inventory/product-columns'
+import type { ColKey } from '@/components/inventory/product-columns'
 
 type Props = {
   search?: string
@@ -16,6 +19,37 @@ export function ProductFilters({ search, type, active }: Props) {
   const router = useRouter()
   const pathname = usePathname()
   const [, startTransition] = useTransition()
+
+  // Column picker state
+  const [visible, setVisible] = useState<Record<ColKey, boolean>>(defaultVisibility)
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const pickerRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY)
+      if (stored) setVisible(JSON.parse(stored))
+    } catch { /* ignore */ }
+  }, [])
+
+  useEffect(() => {
+    function handler(e: MouseEvent) {
+      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) {
+        setPickerOpen(false)
+      }
+    }
+    if (pickerOpen) document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [pickerOpen])
+
+  function toggleCol(key: ColKey, value: boolean) {
+    const next = { ...visible, [key]: value }
+    setVisible(next)
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(next))
+      window.dispatchEvent(new Event(COLS_CHANGED_EVENT))
+    } catch { /* noop */ }
+  }
 
   const update = useCallback(
     (key: string, value: string) => {
@@ -33,7 +67,7 @@ export function ProductFilters({ search, type, active }: Props) {
   )
 
   return (
-    <div className="flex flex-wrap gap-3">
+    <div className="flex flex-wrap gap-3 items-center">
       <div className="relative flex-1 min-w-0 sm:min-w-[200px] max-w-sm">
         <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
         <Input
@@ -73,6 +107,27 @@ export function ProductFilters({ search, type, active }: Props) {
         <option value="true">Active only</option>
         <option value="false">Inactive only</option>
       </Select>
+
+      <div className="relative" ref={pickerRef}>
+        <Button variant="outline" size="sm" className="h-8" onClick={() => setPickerOpen((o) => !o)} title="Column settings">
+          <Settings2 className="h-4 w-4" />
+        </Button>
+        {pickerOpen && (
+          <div className="absolute right-0 top-full mt-1 z-50 w-[calc(100vw-2rem)] sm:w-52 rounded-md border border-border bg-popover shadow-md p-2 space-y-1">
+            {ALL_COLUMNS.map((c) => (
+              <label key={c.key} className="flex items-center gap-2 px-1 py-0.5 text-sm cursor-pointer hover:bg-accent rounded">
+                <input
+                  type="checkbox"
+                  checked={!!visible[c.key]}
+                  onChange={(e) => toggleCol(c.key, e.target.checked)}
+                  className="h-3.5 w-3.5 accent-primary"
+                />
+                {c.label}
+              </label>
+            ))}
+          </div>
+        )}
+      </div>
     </div>
   )
 }

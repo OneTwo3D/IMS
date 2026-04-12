@@ -8,6 +8,7 @@ import { getCurrencies } from '@/app/actions/currencies'
 import { getSetting } from '@/app/actions/settings'
 import { getOrderAllocations, getOrderShipments } from '@/app/actions/allocation'
 import { getAccountingSettings } from '@/lib/accounting'
+import { DEFAULT_CARRIERS } from '@/lib/tracking'
 import { SoDetailClient } from './so-detail-client'
 
 export const metadata: Metadata = { title: 'Sales Order' }
@@ -29,7 +30,6 @@ export default async function SalesOrderDetailPage({ params }: Props) {
     getSetting('accounting_invoice_url_template'),
     getAccountingSettings(),
   ])
-  const DEFAULT_CARRIERS = ['Royal Mail', 'DPD', 'DHL', 'DHL Express', 'FedEx', 'UPS', 'Hermes / Evri', 'Yodel', 'Amazon Logistics', 'ParcelForce', 'TNT', 'GLS', 'Collect+']
   let carriers: string[] = DEFAULT_CARRIERS
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
 

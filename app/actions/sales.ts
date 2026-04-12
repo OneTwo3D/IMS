@@ -75,8 +75,13 @@ export type SoRow = {
   paidAt: string | null
   notes: string | null
   internalNotes: string | null
+  shippingCountryCode: string | null
+  paymentMethodTitle: string | null
+  wcCreatedAt: string | null
   createdAt: string
   lineCount: number
+  cogsGbp: number | null
+  profitMarginPercent: number | null
 }
 
 export type SoDetail = SoRow & {
@@ -190,8 +195,12 @@ const SO_SELECT = {
   paidAt: true,
   notes: true,
   internalNotes: true,
+  shippingAddress: true,
+  paymentMethodTitle: true,
+  wcCreatedAt: true,
   createdAt: true,
   _count: { select: { lines: true } },
+  lines: { select: { cogsGbp: true } },
 } as const
 
 function mapSoRow(so: {
@@ -227,9 +236,20 @@ function mapSoRow(so: {
   paidAt: Date | null
   notes: string | null
   internalNotes: string | null
+  shippingAddress: unknown
+  paymentMethodTitle: string | null
+  wcCreatedAt: Date | null
   createdAt: Date
   _count: { lines: number }
+  lines: { cogsGbp: unknown }[]
 }): SoRow {
+  const totalGbp = Number(so.totalGbp)
+  const lineCogs = so.lines.map((l) => l.cogsGbp != null ? Number(l.cogsGbp) : null)
+  const hasAnyCogs = lineCogs.some((c) => c !== null)
+  const cogsGbp = hasAnyCogs ? lineCogs.reduce((s: number, c) => s + (c ?? 0), 0) : null
+  const profitMarginPercent = cogsGbp != null && totalGbp > 0
+    ? ((totalGbp - cogsGbp) / totalGbp) * 100
+    : null
   return {
     id: so.id,
     wcOrderId: so.wcOrderId,
@@ -263,8 +283,13 @@ function mapSoRow(so: {
     paidAt: so.paidAt?.toISOString() ?? null,
     notes: so.notes,
     internalNotes: so.internalNotes,
+    shippingCountryCode: (so.shippingAddress as Record<string, string> | null)?.country?.toUpperCase() || null,
+    paymentMethodTitle: so.paymentMethodTitle,
+    wcCreatedAt: so.wcCreatedAt?.toISOString() ?? null,
     createdAt: so.createdAt.toISOString(),
     lineCount: so._count.lines,
+    cogsGbp,
+    profitMarginPercent,
   }
 }
 
@@ -285,13 +310,13 @@ function mapLine(l: {
   cogsGbp: unknown
   taxRateId?: string | null
   taxRate?: { id: string; name: string; rate: unknown; taxCategory?: string } | null
-  product?: { imageUrl: string | null } | null
+  product?: { imageUrl: string | null; parent?: { imageUrl: string | null } | null } | null
 }): SoLineRow {
   return {
     id: l.id,
     productId: l.productId,
     sku: l.sku ?? '',
-    imageUrl: l.product?.imageUrl ?? null,
+    imageUrl: l.product?.imageUrl ?? l.product?.parent?.imageUrl ?? null,
     description: l.description,
     qty: Number(l.qty),
     unitPriceForeign: Number(l.unitPriceForeign),
@@ -347,7 +372,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
           cogsGbp: true,
           taxRateId: true,
           taxRate: { select: { id: true, name: true, rate: true, taxCategory: true } },
-          product: { select: { imageUrl: true } },
+          product: { select: { imageUrl: true, parent: { select: { imageUrl: true } } } },
         },
       },
       refunds: {
@@ -1046,11 +1071,12 @@ export async function updateSalesOrderStatus(
       } catch { /* Accounting queue errors should never block status transitions */ }
     }
 
-    // Auto-generate invoice on ship if configured
+    // Auto-generate invoice on ship if configured (skip its own log —
+    // the status_changed entry below covers both actions)
     if (targetStatus === 'SHIPPED') {
       const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
       if (trigger?.value === 'on_shipped') {
-        await generateInvoiceNumber(id)
+        await generateInvoiceNumber(id, { skipLog: true })
       }
     }
 
@@ -1518,11 +1544,12 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
       data: { paidAt: markingAsPaid ? new Date() : null },
     })
 
-    // Only auto-generate invoice when transitioning TO paid (not when toggling off)
+    // Only auto-generate invoice when transitioning TO paid (not when toggling off).
+    // Skip its own log — the 'paid' entry below covers both actions.
     if (markingAsPaid && !so.invoiceNumber) {
       const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
       if (trigger?.value === 'on_paid') {
-        await generateInvoiceNumber(id)
+        await generateInvoiceNumber(id, { skipLog: true })
       }
     }
 
@@ -1589,7 +1616,7 @@ export async function updateSalesOrderNotes(
   }
 }
 
-export async function generateInvoiceNumber(id: string): Promise<{ success: boolean; invoiceNumber?: string; error?: string }> {
+export async function generateInvoiceNumber(id: string, options?: { skipLog?: boolean }): Promise<{ success: boolean; invoiceNumber?: string; error?: string }> {
   try {
     await requirePermission('sales.process')
     // Use a transaction to prevent race conditions on invoice numbering
@@ -1603,15 +1630,17 @@ export async function generateInvoiceNumber(id: string): Promise<{ success: bool
       return { invoiceNumber: invNum, orderNumber: so.orderNumber ?? so.wcOrderNumber }
     })
     revalidatePath(`/sales/${id}`)
-    logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: id,
-      action: 'invoice_generated',
-      tag: 'sales',
-      level: 'INFO',
-      description: `Generated invoice number for order ${result.orderNumber}`,
-      metadata: { orderNumber: result.orderNumber, invoiceNumber: result.invoiceNumber },
-    })
+    if (!options?.skipLog) {
+      logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: id,
+        action: 'invoice_generated',
+        tag: 'sales',
+        level: 'INFO',
+        description: `Generated invoice number for order ${result.orderNumber}`,
+        metadata: { orderNumber: result.orderNumber, invoiceNumber: result.invoiceNumber },
+      })
+    }
 
     // Note: Accounting invoice is now created at order creation time (not here)
 
@@ -1686,10 +1715,11 @@ export async function addPayment(input: {
       if (totalPaid >= Number(so.totalGbp)) {
         await db.salesOrder.update({ where: { id: input.orderId }, data: { paidAt: new Date() } })
 
-        // Auto-generate invoice if trigger is on_paid
+        // Auto-generate invoice if trigger is on_paid (skip its own log —
+        // the payment_added entry below covers both actions)
         const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
         if (trigger?.value === 'on_paid') {
-          await generateInvoiceNumber(input.orderId)
+          await generateInvoiceNumber(input.orderId, { skipLog: true })
         }
       }
     }

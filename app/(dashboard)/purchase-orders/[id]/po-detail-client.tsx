@@ -18,6 +18,7 @@ import {
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   advancePoStatus,
+  updatePoTracking,
   cancelPurchaseOrder,
   receivePurchaseOrder,
   returnPurchaseOrder,
@@ -30,6 +31,7 @@ import {
   type PoLineRow,
   type InvoiceRow,
 } from '@/app/actions/purchase-orders'
+import { getTrackingUrl } from '@/lib/tracking'
 import type { AccountingBankAccount } from '@/lib/accounting'
 import type { SupplierRow } from '@/app/actions/suppliers'
 import type { ProductRow } from '@/app/actions/products'
@@ -50,6 +52,7 @@ type Props = {
   currencies: CurrencyRow[]
   taxRates: TaxRateRow[]
   purchaseUnits: PurchaseUnitRow[]
+  carriers: string[]
   companyHomeCountry?: string | null
   accountingBillUrlTemplate: string
 }
@@ -57,9 +60,12 @@ type Props = {
 const STATUS_LABELS: Record<PoStatus, string> = {
   DRAFT: 'Draft',
   RFQ_SENT: 'RFQ Sent',
-  PO_SENT: 'PO Sent',
+  QUOTE_RECEIVED: 'Quote Received',
+  PO_SENT: 'Ordered',
+  SHIPPED: 'Shipped',
   PARTIALLY_RECEIVED: 'Partially Received',
   RECEIVED: 'Received',
+  CLOSED: 'Closed',
   INVOICED: 'Invoiced',
   PARTIALLY_RETURNED: 'Partially Returned',
   RETURNED: 'Returned',
@@ -69,9 +75,12 @@ const STATUS_LABELS: Record<PoStatus, string> = {
 const STATUS_CLASS: Record<PoStatus, string> = {
   DRAFT: 'bg-muted text-muted-foreground border-muted',
   RFQ_SENT: 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200 border-yellow-200',
+  QUOTE_RECEIVED: 'bg-cyan-100 text-cyan-800 dark:bg-cyan-900 dark:text-cyan-200 border-cyan-200',
   PO_SENT: 'bg-blue-100 text-blue-800 dark:bg-blue-900 dark:text-blue-200 border-blue-200',
+  SHIPPED: 'bg-indigo-100 text-indigo-800 dark:bg-indigo-900 dark:text-indigo-200 border-indigo-200',
   PARTIALLY_RECEIVED: 'bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200 border-orange-200',
   RECEIVED: 'bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200 border-green-200',
+  CLOSED: 'bg-emerald-100 text-emerald-800 dark:bg-emerald-900 dark:text-emerald-200 border-emerald-200',
   INVOICED: 'bg-purple-100 text-purple-800 dark:bg-purple-900 dark:text-purple-200 border-purple-200',
   PARTIALLY_RETURNED: 'bg-orange-100 text-orange-800 dark:bg-orange-900 dark:text-orange-200 border-orange-200',
   RETURNED: 'bg-gray-100 text-gray-700 dark:bg-gray-800 dark:text-gray-300 border-gray-200',
@@ -1198,10 +1207,95 @@ function EditFreightCostsDialog({
 }
 
 // ---------------------------------------------------------------------------
+// Ship dialog — enter carrier + tracking number
+// ---------------------------------------------------------------------------
+
+function ShipDialog({
+  poId,
+  carriers,
+  initialProvider,
+  initialTracking,
+  editMode,
+  onClose,
+}: {
+  poId: string
+  carriers: string[]
+  initialProvider?: string | null
+  initialTracking?: string | null
+  editMode?: boolean
+  onClose: () => void
+}) {
+  const router = useRouter()
+  const [isPending, startTransition] = useTransition()
+  const [provider, setProvider] = useState(initialProvider ?? '')
+  const [tracking, setTracking] = useState(initialTracking ?? '')
+  const [error, setError] = useState('')
+
+  function handleConfirm() {
+    setError('')
+    startTransition(async () => {
+      const result = editMode
+        ? await updatePoTracking(poId, { shippingProvider: provider || undefined, trackingNumber: tracking || undefined })
+        : await advancePoStatus(poId, 'SHIPPED', { shippingProvider: provider || undefined, trackingNumber: tracking || undefined })
+      if (result.success) {
+        router.refresh()
+        onClose()
+      } else {
+        setError(result.error ?? 'Failed')
+      }
+    })
+  }
+
+  return (
+    <Dialog open onOpenChange={() => {}}>
+      <DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
+        <DialogHeader>
+          <DialogTitle>{editMode ? 'Edit Tracking Info' : 'Mark as Shipped'}</DialogTitle>
+        </DialogHeader>
+        <div className="space-y-4">
+          <div className="space-y-1.5">
+            <Label htmlFor="shipProvider">Carrier / Shipping Provider</Label>
+            <select
+              id="shipProvider"
+              value={provider}
+              onChange={(e) => setProvider(e.target.value)}
+              className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm shadow-sm"
+            >
+              <option value="">Select carrier…</option>
+              {carriers.map((c) => (
+                <option key={c} value={c}>{c}</option>
+              ))}
+            </select>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="shipTracking">Tracking Number</Label>
+            <Input
+              id="shipTracking"
+              value={tracking}
+              onChange={(e) => setTracking(e.target.value)}
+              placeholder="e.g. 1Z999AA10123456784"
+              className="h-9 text-sm font-mono"
+            />
+          </div>
+          {error && <p className="text-sm text-destructive">{error}</p>}
+        </div>
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
+          <Button onClick={handleConfirm} disabled={isPending}>
+            {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
+            {editMode ? 'Save' : 'Mark Shipped'}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, companyHomeCountry, accountingBillUrlTemplate }: Props) {
+export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingBillUrlTemplate }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const po = initialPo
@@ -1221,6 +1315,8 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const [showReceive, setShowReceive] = useState(false)
   const [showReturn, setShowReturn] = useState(false)
   const [showBill, setShowBill] = useState(false)
+  const [showShip, setShowShip] = useState(false)
+  const [showEditTracking, setShowEditTracking] = useState(false)
   const [showEditFreight, setShowEditFreight] = useState(false)
   const [showReceipts, setShowReceipts] = useState(false)
   const [showReturns, setShowReturns] = useState(false)
@@ -1230,21 +1326,33 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
 
   const canEdit = po.status === 'DRAFT'
   const canRfq = po.status === 'DRAFT' || po.status === 'RFQ_SENT'
-  const canAdvance = po.status === 'DRAFT'
-  const canReceive = ['PO_SENT', 'RFQ_SENT', 'PARTIALLY_RECEIVED'].includes(po.status)
-  const canReturn = ['PO_SENT', 'PARTIALLY_RECEIVED', 'RECEIVED', 'INVOICED', 'PARTIALLY_RETURNED'].includes(po.status)
+  const canAdvanceToQuoteReceived = po.status === 'RFQ_SENT'
+  const canAdvanceToOrdered = po.status === 'DRAFT' || po.status === 'QUOTE_RECEIVED'
+  const canShip = po.status === 'PO_SENT'
+  const canReceive = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'].includes(po.status)
+  const canReturn = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'INVOICED', 'PARTIALLY_RETURNED'].includes(po.status)
+  const canClose = po.status === 'RECEIVED'
   const hasBillableProduct = po.lines.some((l) => l.qty - l.qtyBilled > 0)
   const hasBillableCost = po.freightCostLines.some((c) => c.amountForeign - c.amountBilled > 0)
   const hasBillableItems = hasBillableProduct || hasBillableCost
-  const canBill = ['PO_SENT', 'RFQ_SENT', 'PARTIALLY_RECEIVED', 'RECEIVED', 'PARTIALLY_RETURNED'].includes(po.status) && hasBillableItems
+  const canBill = ['PO_SENT', 'SHIPPED', 'RFQ_SENT', 'PARTIALLY_RECEIVED', 'RECEIVED', 'PARTIALLY_RETURNED'].includes(po.status) && hasBillableItems
   const canCancel = po.status === 'DRAFT'
   const hasRemaining = po.lines.some((l) => l.qtyToReceive > 0)
   const hasReturnable = po.lines.some((l) => l.qtyReceived - l.qtyReturned > 0)
 
-  function handleAdvance() {
+  function handleAdvanceToOrdered() {
     setError('')
     startTransition(async () => {
       const result = await advancePoStatus(po.id, 'PO_SENT')
+      if (result.success) router.refresh()
+      else setError(result.error ?? 'Failed')
+    })
+  }
+
+  function handleAdvanceToQuoteReceived() {
+    setError('')
+    startTransition(async () => {
+      const result = await advancePoStatus(po.id, 'QUOTE_RECEIVED')
       if (result.success) router.refresh()
       else setError(result.error ?? 'Failed')
     })
@@ -1254,6 +1362,16 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
     setError('')
     startTransition(async () => {
       const result = await advancePoStatus(po.id, 'RFQ_SENT')
+      if (result.success) router.refresh()
+      else setError(result.error ?? 'Failed')
+    })
+  }
+
+  function handleClose() {
+    if (!confirm('Close this purchase order? This is a terminal status.')) return
+    setError('')
+    startTransition(async () => {
+      const result = await advancePoStatus(po.id, 'CLOSED')
       if (result.success) router.refresh()
       else setError(result.error ?? 'Failed')
     })
@@ -1331,10 +1449,21 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
               )}
             </>
           )}
-          {canAdvance && !editing && (
-            <Button size="sm" onClick={handleAdvance} disabled={isPending}>
+          {canAdvanceToQuoteReceived && !editing && (
+            <Button variant="secondary" size="sm" onClick={handleAdvanceToQuoteReceived} disabled={isPending}>
+              {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <CheckCircle2 className="h-4 w-4 mr-1" />}
+              Quote Received
+            </Button>
+          )}
+          {canAdvanceToOrdered && !editing && (
+            <Button size="sm" onClick={handleAdvanceToOrdered} disabled={isPending}>
               {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Truck className="h-4 w-4 mr-1" />}
               Confirm &amp; Send PO
+            </Button>
+          )}
+          {canShip && !editing && (
+            <Button variant="secondary" size="sm" onClick={() => setShowShip(true)} disabled={isPending}>
+              <Ship className="h-4 w-4 mr-1" />Mark Shipped
             </Button>
           )}
           {canReceive && hasRemaining && (
@@ -1355,6 +1484,12 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
           {po.type === 'FREIGHT' && po.status !== 'CANCELLED' && (
             <Button variant="outline" size="sm" onClick={() => setShowEditFreight(true)} disabled={isPending}>
               <Pencil className="h-4 w-4 mr-1" />Edit Costs
+            </Button>
+          )}
+          {canClose && !editing && (
+            <Button variant="secondary" size="sm" onClick={handleClose} disabled={isPending}>
+              {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <CheckCircle2 className="h-4 w-4 mr-1" />}
+              Close PO
             </Button>
           )}
           {canCancel && !editing && (
@@ -1409,6 +1544,32 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             <div>
               <span className="text-muted-foreground">Supplier Reference</span>
               <p className="font-medium">{po.supplierRef}</p>
+            </div>
+          )}
+          {(po.shippingProvider || po.trackingNumber) && (
+            <div className="col-span-2">
+              <span className="text-muted-foreground flex items-center gap-1">
+                Tracking
+                {['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED'].includes(po.status) && (
+                  <button onClick={() => setShowEditTracking(true)} className="text-muted-foreground hover:text-foreground">
+                    <Pencil className="h-3 w-3" />
+                  </button>
+                )}
+              </span>
+              <p className="font-medium flex items-center gap-2">
+                {po.shippingProvider && <span>{po.shippingProvider}</span>}
+                {po.trackingNumber && (() => {
+                  const url = getTrackingUrl(po.shippingProvider, po.trackingNumber)
+                  return url ? (
+                    <a href={url} target="_blank" rel="noopener noreferrer" className="font-mono text-xs inline-flex items-center gap-1 text-blue-600 hover:underline dark:text-blue-400">
+                      {po.trackingNumber}
+                      <ExternalLink className="h-3 w-3" />
+                    </a>
+                  ) : (
+                    <span className="font-mono text-xs">{po.trackingNumber}</span>
+                  )
+                })()}
+              </p>
             </div>
           )}
           {po.notes && (
@@ -1721,6 +1882,16 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             </div>
           )}
         </div>
+      )}
+
+      {/* Ship dialog */}
+      {showShip && (
+        <ShipDialog poId={po.id} carriers={carriers} onClose={() => setShowShip(false)} />
+      )}
+
+      {/* Edit tracking dialog */}
+      {showEditTracking && (
+        <ShipDialog poId={po.id} carriers={carriers} initialProvider={po.shippingProvider} initialTracking={po.trackingNumber} editMode onClose={() => setShowEditTracking(false)} />
       )}
 
       {/* Receive dialog */}

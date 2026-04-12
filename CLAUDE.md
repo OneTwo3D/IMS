@@ -94,6 +94,7 @@ onetwo3d-ims/
 │   │   ├── export/           # CSV exports (products, sales, POs, stock, etc.)
 │   │   ├── import/           # CSV imports and historical order import
 │   │   ├── invoice/          # Invoice PDF generation and preview
+│   │   ├── packing-slip/     # Packing slip PDF (picking/packing checklist)
 │   │   ├── sales-order/      # Sales order confirmation PDF
 │   │   ├── rfq/              # RFQ PDF generation
 │   │   ├── manufacturing-order/ # Production order PDF

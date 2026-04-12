@@ -1,8 +1,8 @@
 'use client'
 
-import { useState } from 'react'
 import { Card } from '@/components/ui/card'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
+import { useRouter, useSearchParams } from 'next/navigation'
 import { SyncClient } from './sync-client'
 import { XeroClient } from './xero-client'
 import type { WcSyncSettings, TaxRateMappingRow, StatusMappingRow, SyncLogRow } from '@/app/actions/wc-sync'
@@ -103,7 +103,17 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
 }
 
 export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcLogs, taxRates, imsTaxRates, xeroTaxRates, wcCredentials, xeroSettings, xeroConnected, xeroTenantName, xeroAccounts, xeroLogs, paymentMethodCombos, paymentAccountMap, currencies, wcPaymentGateways, xeroReadiness }: Props) {
-  const [activeConnector, setActiveConnector] = useState<string | null>(null)
+  const router = useRouter()
+  const searchParams = useSearchParams()
+  const activeConnector = searchParams.get('connector')
+
+  function setActiveConnector(id: string | null) {
+    if (id) {
+      router.push(`/sync?connector=${id}`, { scroll: false })
+    } else {
+      router.push('/sync', { scroll: false })
+    }
+  }
 
   const wcConnected = !!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secret
 

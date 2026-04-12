@@ -2,7 +2,7 @@
 
 import { useState, useTransition, useEffect } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, XCircle, Clock, Plus, Trash2, AlertTriangle, Receipt } from 'lucide-react'
+import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, XCircle, Clock, Plus, Trash2, AlertTriangle, Receipt, RotateCcw, ChevronLeft, ChevronRight } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -11,7 +11,7 @@ import { Badge } from '@/components/ui/badge'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   saveXeroSettings, connectXero, disconnectXero,
-  syncXeroAccounts, triggerXeroSync, fetchXeroTaxRates,
+  syncXeroAccounts, triggerXeroSync, fetchXeroTaxRates, retryFailedXeroSync,
   type XeroSettings, type XeroSyncLogRow, type XeroSyncReadiness,
 } from '@/app/actions/xero-sync'
 import { savePaymentAccountMap } from '@/app/actions/accounting'
@@ -28,20 +28,10 @@ type Props = {
   accounts: XeroAccount[]
   logs: XeroSyncLogRow[]
   paymentMethodCombos: Array<{ paymentMethod: string; currency: string }>
-  /**
-   * Payment method + currency → account code map, stored as a connector-agnostic
-   * setting. The Xero UI lists the bank accounts (because it knows Xero's chart),
-   * but the map itself is persisted via the generic accounting facade so a future
-   * QuickBooks connector can reuse it unchanged.
-   */
   paymentAccountMap: string
-  /** Active currencies from the currency settings screen — populates the currency dropdown in the payment map. */
   currencies: Array<{ code: string; name: string }>
-  /** Active WooCommerce payment gateways — populates the method dropdown/datalist. Free-text still allowed. */
   wcPaymentGateways: Array<{ id: string; title: string }>
-  /** IMS VAT rates — the left-hand side of the tax code mapping UI. */
   imsTaxRates: TaxRateRow[]
-  /** Live Xero tax rates — populates the mapping dropdowns. Empty when not connected. */
   xeroTaxRates: Array<{ taxType: string; name: string; rate: number }>
   readiness: XeroSyncReadiness
 }
@@ -71,6 +61,23 @@ const STATUS_BADGE: Record<string, { variant: 'default' | 'secondary' | 'outline
   SYNCED: { variant: 'default', label: 'Synced' },
   FAILED: { variant: 'destructive', label: 'Failed' },
 }
+
+// ---------------------------------------------------------------------------
+// Tabs
+// ---------------------------------------------------------------------------
+
+const XERO_TABS = [
+  { id: 'connection', label: 'Connection' },
+  { id: 'accounts', label: 'Accounts' },
+  { id: 'tax', label: 'Tax' },
+  { id: 'sync', label: 'Sync' },
+] as const
+
+type XeroTabId = (typeof XERO_TABS)[number]['id']
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 function parsePaymentMap(json: string): PaymentMapRow[] {
   try {
@@ -106,7 +113,6 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [syncingAccounts, setSyncingAccounts] = useState(false)
   const [paymentMapRows, setPaymentMapRows] = useState<PaymentMapRow[]>(() => parsePaymentMap(paymentAccountMap))
   const [xeroTaxRates, setXeroTaxRates] = useState(initXeroTaxRates)
-  // Local view of IMS tax rates so the dropdown reflects changes without a full page refresh.
   const [taxMappings, setTaxMappings] = useState<Record<string, string | null>>(() =>
     Object.fromEntries(imsTaxRates.map(r => [r.id, r.accountingTaxType])),
   )
@@ -114,6 +120,11 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [savingTaxId, setSavingTaxId] = useState<string | null>(null)
   const [refreshingTaxRates, setRefreshingTaxRates] = useState(false)
   const [autoLinking, setAutoLinking] = useState(false)
+  const [tab, setTab] = useState<XeroTabId>('connection')
+  const [logPage, setLogPage] = useState(0)
+  const [retryingId, setRetryingId] = useState<string | null>(null)
+  const [retryingAll, setRetryingAll] = useState(false)
+  const [retryMsg, setRetryMsg] = useState<string | null>(null)
   const searchParams = useSearchParams()
 
   // Handle OAuth redirect query params
@@ -124,11 +135,10 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       setConnected(true)
       setTenantName(success)
       setConnectMsg(`Connected to ${success}`)
-      // Clean URL
-      window.history.replaceState({}, '', '/sync')
+      window.history.replaceState({}, '', '/sync?connector=xero')
     } else if (error) {
       setConnectMsg(`Xero error: ${error}`)
-      window.history.replaceState({}, '', '/sync')
+      window.history.replaceState({}, '', '/sync?connector=xero')
     }
   }, [searchParams])
 
@@ -139,9 +149,6 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   function handleSave() {
     setMsg(null)
     startTransition(async () => {
-      // Persist Xero-specific settings and the connector-agnostic payment map
-      // in parallel. The map lives under a generic setting key so it can be
-      // reused by future accounting connectors without a schema change.
       const [xeroResult, mapResult] = await Promise.all([
         saveXeroSettings({
           xero_sync_enabled: s.xero_sync_enabled,
@@ -231,9 +238,6 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
         setTaxMapMsg(`Auto-link failed: ${result.error ?? 'unknown error'}`)
         return
       }
-      // Refresh local state with the newly linked values by re-reading the
-      // linked mapping from the server. Simpler: patch taxMappings for each
-      // IMS rate whose name matches a Xero rate by case-insensitive compare.
       const xeroByName = new Map(xeroTaxRates.map(x => [x.name.trim().toLowerCase(), x.taxType]))
       setTaxMappings(prev => {
         const next = { ...prev }
@@ -259,7 +263,6 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   async function handleTaxMappingChange(rateId: string, taxType: string) {
     setTaxMapMsg(null)
     setSavingTaxId(rateId)
-    // Optimistic update — revert on error.
     const previous = taxMappings[rateId] ?? null
     setTaxMappings(prev => ({ ...prev, [rateId]: taxType || null }))
     const result = await updateTaxRate(rateId, { accountingTaxType: taxType })
@@ -293,535 +296,633 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     })
   }
 
+  async function handleRetryOne(entryId: string) {
+    setRetryMsg(null)
+    setRetryingId(entryId)
+    const result = await retryFailedXeroSync(entryId)
+    setRetryingId(null)
+    if (result.success) {
+      setRetryMsg(`Reset ${result.reset} entry for retry.`)
+      router.refresh()
+    } else {
+      setRetryMsg(`Retry failed: ${result.error}`)
+    }
+  }
+
+  async function handleRetryAll() {
+    setRetryMsg(null)
+    setRetryingAll(true)
+    const result = await retryFailedXeroSync()
+    setRetryingAll(false)
+    if (result.success) {
+      setRetryMsg(`Reset ${result.reset} failed entry/entries for retry.`)
+      router.refresh()
+    } else {
+      setRetryMsg(`Retry failed: ${result.error}`)
+    }
+  }
+
+  const LOG_PAGE_SIZE = 10
+  const logTotalPages = Math.max(1, Math.ceil(logs.length / LOG_PAGE_SIZE))
+  const pagedLogs = logs.slice(logPage * LOG_PAGE_SIZE, (logPage + 1) * LOG_PAGE_SIZE)
+  const hasFailedEntries = logs.some(l => l.status === 'FAILED')
+
+  // Show save bar on tabs with editable content
+  const showSaveBar = tab === 'connection' || tab === 'accounts' || tab === 'sync'
+
   return (
-    <div className="space-y-6 pb-20">
-      {/* Connection */}
-      <Card className="p-6 space-y-4">
-        <div className="flex items-center justify-between">
-          <h3 className="text-base font-semibold">Connection</h3>
-          {connected && (
-            <span className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
-              <CheckCircle2 className="h-3 w-3" />
-              {tenantName || 'Connected'}
-            </span>
-          )}
-        </div>
+    <div className={`space-y-4 ${showSaveBar ? 'pb-20' : ''}`}>
+      {/* Tab bar */}
+      <div className="flex gap-1 border-b border-border">
+        {XERO_TABS.map((t) => (
+          <button
+            key={t.id}
+            type="button"
+            onClick={() => setTab(t.id)}
+            className={`px-3 py-2 text-sm font-medium transition-colors relative ${
+              tab === t.id
+                ? 'text-foreground'
+                : 'text-muted-foreground hover:text-foreground'
+            }`}
+          >
+            {t.label}
+            {tab === t.id && (
+              <span className="absolute inset-x-0 -bottom-px h-0.5 bg-primary rounded-full" />
+            )}
+          </button>
+        ))}
+      </div>
 
-        <div className="grid grid-cols-2 gap-4">
-          <div className="space-y-1.5">
-            <Label htmlFor="xero_client_id">Client ID</Label>
-            <Input
-              id="xero_client_id"
-              value={clientId}
-              onChange={e => setClientId(e.target.value)}
-              placeholder="Your Xero app Client ID"
-            />
+      {/* Connection tab */}
+      {tab === 'connection' && (
+        <Card className="p-6 space-y-4">
+          <div className="flex items-center justify-between">
+            <h3 className="text-base font-semibold">Connection</h3>
+            {connected && (
+              <span className="inline-flex items-center gap-1.5 rounded-full px-2.5 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
+                <CheckCircle2 className="h-3 w-3" />
+                {tenantName || 'Connected'}
+              </span>
+            )}
           </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="xero_client_secret">Client Secret</Label>
-            <Input
-              id="xero_client_secret"
-              type="password"
-              value={clientSecret}
-              onChange={e => setClientSecret(e.target.value)}
-              placeholder="Your Xero app Client Secret"
-            />
-          </div>
-        </div>
 
-        <div className="flex items-center gap-3">
-          {connected ? (
-            <Button variant="outline" size="sm" onClick={handleDisconnect} disabled={connecting}>
-              {connecting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Link2Off className="h-3 w-3 mr-1" />}
-              Disconnect
-            </Button>
-          ) : (
-            <Button size="sm" onClick={handleConnect} disabled={connecting}>
-              {connecting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Link2 className="h-3 w-3 mr-1" />}
-              Connect to Xero
-            </Button>
-          )}
-          {connectMsg && <span className="text-xs text-muted-foreground">{connectMsg}</span>}
-        </div>
-      </Card>
-
-      {/* Account Mapping */}
-      <Card className="p-6 space-y-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <h3 className="text-base font-semibold">Account Mapping</h3>
-            <p className="text-xs text-muted-foreground mt-0.5">Map IMS transactions to your Xero chart of accounts.</p>
-          </div>
-          <Button variant="outline" size="sm" onClick={handleSyncAccounts} disabled={syncingAccounts || !connected}>
-            {syncingAccounts ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
-            Sync Chart of Accounts
-          </Button>
-        </div>
-        {accountsMsg && <p className="text-xs text-muted-foreground">{accountsMsg}</p>}
-
-        {accounts.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No accounts synced yet. Click "Sync Chart of Accounts" to pull your Xero accounts.</p>
-        ) : (
           <div className="grid grid-cols-2 gap-4">
-            {ACCOUNT_FIELDS.map(f => (
-              <div key={f.key} className="space-y-1.5">
-                <Label htmlFor={f.key}>{f.label}</Label>
-                <select
-                  id={f.key}
-                  className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                  value={s[f.key]}
-                  onChange={e => handleField(f.key, e.target.value)}
-                >
-                  <option value="">— Select —</option>
-                  {accounts.map(a => (
-                    <option key={a.id} value={a.code ?? ''}>
-                      {a.code} — {a.name}
-                    </option>
-                  ))}
-                </select>
-                <p className="text-[11px] text-muted-foreground">{f.description}</p>
+            <div className="space-y-1.5">
+              <Label htmlFor="xero_client_id">Client ID</Label>
+              <Input
+                id="xero_client_id"
+                value={clientId}
+                onChange={e => setClientId(e.target.value)}
+                placeholder="Your Xero app Client ID"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="xero_client_secret">Client Secret</Label>
+              <Input
+                id="xero_client_secret"
+                type="password"
+                value={clientSecret}
+                onChange={e => setClientSecret(e.target.value)}
+                placeholder="Your Xero app Client Secret"
+              />
+            </div>
+          </div>
+
+          <div className="flex items-center gap-3">
+            {connected ? (
+              <Button variant="outline" size="sm" onClick={handleDisconnect} disabled={connecting}>
+                {connecting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Link2Off className="h-3 w-3 mr-1" />}
+                Disconnect
+              </Button>
+            ) : (
+              <Button size="sm" onClick={handleConnect} disabled={connecting}>
+                {connecting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Link2 className="h-3 w-3 mr-1" />}
+                Connect to Xero
+              </Button>
+            )}
+            {connectMsg && <span className="text-xs text-muted-foreground">{connectMsg}</span>}
+          </div>
+        </Card>
+      )}
+
+      {/* Accounts tab */}
+      {tab === 'accounts' && (
+        <div className="space-y-6">
+          {/* Account Mapping */}
+          <Card className="p-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <h3 className="text-base font-semibold">Account Mapping</h3>
+                <p className="text-xs text-muted-foreground mt-0.5">Map IMS transactions to your Xero chart of accounts.</p>
               </div>
-            ))}
-          </div>
-        )}
-      </Card>
-
-      {/* VAT Tax Code Mapping */}
-      <Card className="p-6 space-y-4">
-        <div className="flex items-start justify-between gap-3">
-          <div>
-            <h3 className="text-base font-semibold flex items-center gap-2">
-              <Receipt className="h-4 w-4 text-muted-foreground" />
-              VAT Tax Code Mapping
-            </h3>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              Link each IMS VAT rate to a Xero tax code so invoices sync with the correct tax line.
-              Auto-link matches by name; unmatched rates can be assigned manually from the dropdown.
-              VAT rates themselves are managed in <a href="/settings/accounting" className="underline hover:text-foreground">Settings → Accounting</a>.
-            </p>
-          </div>
-          <div className="flex items-center gap-2 shrink-0">
-            <Button variant="outline" size="sm" onClick={handleRefreshXeroTaxRates} disabled={refreshingTaxRates || !connected}>
-              {refreshingTaxRates ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
-              Refresh from Xero
-            </Button>
-            <Button variant="outline" size="sm" onClick={handleAutoLinkTaxes} disabled={autoLinking || !connected}>
-              {autoLinking ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Link2 className="h-3 w-3 mr-1" />}
-              Auto-link
-            </Button>
-          </div>
-        </div>
-        {taxMapMsg && <p className="text-xs text-muted-foreground">{taxMapMsg}</p>}
-
-        {!connected ? (
-          <p className="text-sm text-muted-foreground">Connect to Xero to load tax rates.</p>
-        ) : imsTaxRates.length === 0 ? (
-          <p className="text-sm text-muted-foreground">
-            No IMS VAT rates defined.{' '}
-            <a href="/settings/accounting" className="underline hover:text-foreground">Add one in Settings → Accounting</a>.
-          </p>
-        ) : (
-          <Table className="rounded-md border">
-            <TableHeader className="bg-muted/50">
-              <TableRow>
-                <TableHead className="text-xs">IMS VAT Rate</TableHead>
-                <TableHead className="text-xs text-right">Rate</TableHead>
-                <TableHead className="text-xs">Xero Tax Code</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {imsTaxRates.map(r => {
-                const stored = taxMappings[r.id] ?? ''
-                const storedKnown = !stored || xeroTaxRates.some(x => x.taxType === stored)
-                return (
-                  <TableRow key={r.id}>
-                    <TableCell className="font-medium">
-                      {r.name}
-                      {!r.active && <span className="ml-1.5 text-[10px] text-muted-foreground">(inactive)</span>}
-                    </TableCell>
-                    <TableCell className="text-right font-mono text-xs text-muted-foreground">
-                      {(r.rate * 100).toFixed(2)}%
-                    </TableCell>
-                    <TableCell>
-                      <div className="flex items-center gap-2">
-                        <select
-                          className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                          value={stored}
-                          onChange={e => handleTaxMappingChange(r.id, e.target.value)}
-                          disabled={savingTaxId === r.id}
-                        >
-                          <option value="">— Not mapped —</option>
-                          {xeroTaxRates.map(x => (
-                            <option key={x.taxType} value={x.taxType}>
-                              {x.name} ({x.rate.toFixed(2)}%) — {x.taxType}
-                            </option>
-                          ))}
-                          {/* Preserve a legacy/unknown value rather than silently blanking it. */}
-                          {!storedKnown && stored && (
-                            <option value={stored}>{stored} (unknown)</option>
-                          )}
-                        </select>
-                        {savingTaxId === r.id && <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />}
-                      </div>
-                    </TableCell>
-                  </TableRow>
-                )
-              })}
-            </TableBody>
-          </Table>
-        )}
-      </Card>
-
-      {/* Transaction Types */}
-      <Card className="p-6 space-y-4">
-        <div>
-          <h3 className="text-base font-semibold">Transaction Types</h3>
-          <p className="text-xs text-muted-foreground mt-0.5">Choose which documents and transactions are synced to Xero.</p>
-        </div>
-        <div className="grid grid-cols-2 gap-4">
-          {SYNC_TYPE_TOGGLES.map(t => (
-            <div key={t.key} className="space-y-1.5">
-              <Label htmlFor={t.key}>{t.label}</Label>
-              <select
-                id={t.key}
-                className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                value={s[t.key]}
-                onChange={e => handleField(t.key, e.target.value)}
-              >
-                <option value="off">Off</option>
-                <option value="draft">Draft</option>
-                <option value="submitted">Submitted</option>
-              </select>
-              <p className="text-[11px] text-muted-foreground">{t.description}</p>
+              <Button variant="outline" size="sm" onClick={handleSyncAccounts} disabled={syncingAccounts || !connected}>
+                {syncingAccounts ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
+                Sync Chart of Accounts
+              </Button>
             </div>
-          ))}
-        </div>
-        <div className="border-t pt-3">
-          <label className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
-            <input
-              type="checkbox"
-              checked={s.xero_sync_attach_pdf === 'true'}
-              onChange={e => handleField('xero_sync_attach_pdf', e.target.checked ? 'true' : 'false')}
-              className="h-4 w-4 accent-primary mt-0.5"
-            />
+            {accountsMsg && <p className="text-xs text-muted-foreground">{accountsMsg}</p>}
+
+            {accounts.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No accounts synced yet. Click &quot;Sync Chart of Accounts&quot; to pull your Xero accounts.</p>
+            ) : (
+              <div className="grid grid-cols-2 gap-4">
+                {ACCOUNT_FIELDS.map(f => (
+                  <div key={f.key} className="space-y-1.5">
+                    <Label htmlFor={f.key}>{f.label}</Label>
+                    <select
+                      id={f.key}
+                      className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                      value={s[f.key]}
+                      onChange={e => handleField(f.key, e.target.value)}
+                    >
+                      <option value="">— Select —</option>
+                      {accounts.map(a => (
+                        <option key={a.id} value={a.code ?? ''}>
+                          {a.code} — {a.name}
+                        </option>
+                      ))}
+                    </select>
+                    <p className="text-[11px] text-muted-foreground">{f.description}</p>
+                  </div>
+                ))}
+              </div>
+            )}
+          </Card>
+
+          {/* Payment Account Mapping */}
+          <Card className="p-6 space-y-4">
             <div>
-              <span className="text-sm font-medium">Attach supplier invoice PDFs</span>
-              <p className="text-[11px] text-muted-foreground">When a supplier invoice PDF is uploaded to a PO, attach it to the Xero bill.</p>
+              <h3 className="text-base font-semibold">Payment Account Mapping</h3>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Map payment method + currency combinations to Xero bank accounts for automatic payment registration.
+                Methods suggest active WooCommerce gateways but free-text is allowed.
+              </p>
             </div>
-          </label>
-        </div>
-      </Card>
-
-      {/* Sub-Ledger */}
-      <Card className="p-6 space-y-4">
-        <div>
-          <h3 className="text-base font-semibold">Sub-Ledger</h3>
-          <p className="text-xs text-muted-foreground mt-0.5">Daily batch journals for revenue deferral, inventory reclassification, and COGS recognition on shipment.</p>
-        </div>
-        <label className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
-          <input
-            type="checkbox"
-            checked={s.xero_daily_batch_enabled === 'true'}
-            onChange={e => handleField('xero_daily_batch_enabled', e.target.checked ? 'true' : 'false')}
-            className="h-4 w-4 accent-primary mt-0.5"
-          />
-          <div>
-            <span className="text-sm font-medium">Daily Batch Sync</span>
-            <p className="text-[11px] text-muted-foreground">Run nightly batch: Group A1 (revenue deferral), A2 (inventory reclassification), B (shipment COGS + revenue recognition).</p>
-          </div>
-        </label>
-        <label className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
-          <input
-            type="checkbox"
-            checked={s.xero_payment_polling_enabled === 'true'}
-            onChange={e => handleField('xero_payment_polling_enabled', e.target.checked ? 'true' : 'false')}
-            className="h-4 w-4 accent-primary mt-0.5"
-          />
-          <div>
-            <span className="text-sm font-medium">Payment Polling</span>
-            <p className="text-[11px] text-muted-foreground">Poll Xero every 15 minutes for paid invoices (manual orders) and paid bills (purchase orders).</p>
-          </div>
-        </label>
-      </Card>
-
-      {/* Payment Account Mapping */}
-      <Card className="p-6 space-y-4">
-        <div>
-          <h3 className="text-base font-semibold">Payment Account Mapping</h3>
-          <p className="text-xs text-muted-foreground mt-0.5">
-            Map payment method + currency combinations to Xero bank accounts for automatic payment registration.
-            Methods suggest active WooCommerce gateways but free-text is allowed.
-          </p>
-        </div>
-        {/* Shared datalist of known payment methods (WC active gateways + historical combos). */}
-        <datalist id="payment-method-suggestions">
-          {Array.from(
-            new Map([
-              ...wcPaymentGateways.map(g => [g.id, g.title] as const),
-              ...paymentMethodCombos.map(c => [c.paymentMethod, c.paymentMethod] as const),
-            ]).entries(),
-          ).map(([id, title]) => (
-            <option key={id} value={id}>{title}</option>
-          ))}
-        </datalist>
-        <Table className="rounded-md border">
-          <TableHeader className="bg-muted/50">
-            <TableRow>
-              <TableHead className="text-xs">Payment Method</TableHead>
-              <TableHead className="text-xs">Currency</TableHead>
-              <TableHead className="text-xs">Xero Bank Account</TableHead>
-              <TableHead className="w-10" />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {paymentMapRows.map((row, i) => (
-              <TableRow key={i}>
-                <TableCell className="py-1.5">
-                  <Input
-                    value={row.method}
-                    list="payment-method-suggestions"
-                    onChange={e => {
-                      const updated = [...paymentMapRows]
-                      updated[i] = { ...row, method: e.target.value }
-                      setPaymentMapRows(updated)
-                    }}
-                    placeholder="e.g. stripe"
-                    className="h-8 text-xs"
-                  />
-                </TableCell>
-                <TableCell className="py-1.5">
-                  <select
-                    className="flex h-8 w-28 rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
-                    value={row.currency}
-                    onChange={e => {
-                      const updated = [...paymentMapRows]
-                      updated[i] = { ...row, currency: e.target.value }
-                      setPaymentMapRows(updated)
-                    }}
-                  >
-                    <option value="">— Select —</option>
-                    <option value="*">Any (*)</option>
-                    {currencies.map(c => (
-                      <option key={c.code} value={c.code}>{c.code}</option>
-                    ))}
-                    {/* If a stored value refers to a currency that's no longer active, still show it so the row isn't silently blanked. */}
-                    {row.currency && row.currency !== '*' && !currencies.some(c => c.code === row.currency) && (
-                      <option value={row.currency}>{row.currency} (inactive)</option>
-                    )}
-                  </select>
-                </TableCell>
-                <TableCell className="py-1.5">
-                  {accounts.length > 0 ? (
-                    (() => {
-                      // Filter to BANK accounts, fall back to all if none are classified as BANK.
-                      const bankAccounts = accounts.filter(a => a.type === 'BANK')
-                      const options = bankAccounts.length > 0 ? bankAccounts : accounts
-                      // Stored value is preferentially the Xero UUID (xeroId) but legacy rows
-                      // may still hold a Code. Accept either by matching against both fields.
-                      const storedKnown = options.some(a => a.xeroId === row.accountCode || a.code === row.accountCode)
-                      return (
-                        <select
-                          className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+            <datalist id="payment-method-suggestions">
+              {Array.from(
+                new Map([
+                  ...wcPaymentGateways.map(g => [g.id, g.title] as const),
+                  ...paymentMethodCombos.map(c => [c.paymentMethod, c.paymentMethod] as const),
+                ]).entries(),
+              ).map(([id, title]) => (
+                <option key={id} value={id}>{title}</option>
+              ))}
+            </datalist>
+            <Table className="rounded-md border">
+              <TableHeader className="bg-muted/50">
+                <TableRow>
+                  <TableHead className="text-xs">Payment Method</TableHead>
+                  <TableHead className="text-xs">Currency</TableHead>
+                  <TableHead className="text-xs">Xero Bank Account</TableHead>
+                  <TableHead className="w-10" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {paymentMapRows.map((row, i) => (
+                  <TableRow key={i}>
+                    <TableCell className="py-1.5">
+                      <Input
+                        value={row.method}
+                        list="payment-method-suggestions"
+                        onChange={e => {
+                          const updated = [...paymentMapRows]
+                          updated[i] = { ...row, method: e.target.value }
+                          setPaymentMapRows(updated)
+                        }}
+                        placeholder="e.g. stripe"
+                        className="h-8 text-xs"
+                      />
+                    </TableCell>
+                    <TableCell className="py-1.5">
+                      <select
+                        className="flex h-8 w-28 rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                        value={row.currency}
+                        onChange={e => {
+                          const updated = [...paymentMapRows]
+                          updated[i] = { ...row, currency: e.target.value }
+                          setPaymentMapRows(updated)
+                        }}
+                      >
+                        <option value="">— Select —</option>
+                        <option value="*">Any (*)</option>
+                        {currencies.map(c => (
+                          <option key={c.code} value={c.code}>{c.code}</option>
+                        ))}
+                        {row.currency && row.currency !== '*' && !currencies.some(c => c.code === row.currency) && (
+                          <option value={row.currency}>{row.currency} (inactive)</option>
+                        )}
+                      </select>
+                    </TableCell>
+                    <TableCell className="py-1.5">
+                      {accounts.length > 0 ? (
+                        (() => {
+                          const bankAccounts = accounts.filter(a => a.type === 'BANK')
+                          const options = bankAccounts.length > 0 ? bankAccounts : accounts
+                          const storedKnown = options.some(a => a.xeroId === row.accountCode || a.code === row.accountCode)
+                          return (
+                            <select
+                              className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                              value={row.accountCode}
+                              onChange={e => {
+                                const updated = [...paymentMapRows]
+                                updated[i] = { ...row, accountCode: e.target.value }
+                                setPaymentMapRows(updated)
+                              }}
+                            >
+                              <option value="">— Select —</option>
+                              {options.map(a => (
+                                <option key={a.id} value={a.xeroId}>
+                                  {a.code ? `${a.code} — ${a.name}` : a.name}
+                                </option>
+                              ))}
+                              {row.accountCode && !storedKnown && (
+                                <option value={row.accountCode}>{row.accountCode} (unknown)</option>
+                              )}
+                            </select>
+                          )
+                        })()
+                      ) : (
+                        <Input
                           value={row.accountCode}
                           onChange={e => {
                             const updated = [...paymentMapRows]
                             updated[i] = { ...row, accountCode: e.target.value }
                             setPaymentMapRows(updated)
                           }}
-                        >
-                          <option value="">— Select —</option>
-                          {options.map(a => (
-                            // Use xeroId as the option value — it's always populated and unique,
-                            // avoiding the collision that occurred when BANK accounts had NULL codes.
-                            <option key={a.id} value={a.xeroId}>
-                              {a.code ? `${a.code} — ${a.name}` : a.name}
-                            </option>
-                          ))}
-                          {/* Preserve an unrecognised stored value so legacy mappings aren't silently blanked. */}
-                          {row.accountCode && !storedKnown && (
-                            <option value={row.accountCode}>{row.accountCode} (unknown)</option>
-                          )}
-                        </select>
-                      )
-                    })()
-                  ) : (
-                    <Input
-                      value={row.accountCode}
-                      onChange={e => {
-                        const updated = [...paymentMapRows]
-                        updated[i] = { ...row, accountCode: e.target.value }
-                        setPaymentMapRows(updated)
-                      }}
-                      placeholder="Account code"
-                      className="h-8 text-xs"
-                    />
-                  )}
-                </TableCell>
-                <TableCell className="py-1.5">
-                  <Button
-                    variant="ghost"
-                    size="sm"
-                    className="h-8 w-8 p-0"
-                    onClick={() => setPaymentMapRows(paymentMapRows.filter((_, j) => j !== i))}
-                  >
-                    <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
-                  </Button>
-                </TableCell>
-              </TableRow>
-            ))}
-            {paymentMapRows.length === 0 && (
-              <TableRow>
-                <TableCell colSpan={4} className="py-4 text-center text-xs text-muted-foreground">No mappings configured. Add a row or use the pre-populate button below.</TableCell>
-              </TableRow>
-            )}
-          </TableBody>
-        </Table>
-        <div className="flex items-center gap-3">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => setPaymentMapRows([...paymentMapRows, { method: '', currency: '', accountCode: '' }])}
-          >
-            <Plus className="h-3 w-3 mr-1" />
-            Add Row
-          </Button>
-          {paymentMethodCombos.length > 0 && (
-            <Button
-              variant="outline"
-              size="sm"
-              onClick={() => {
-                const existing = new Set(paymentMapRows.map(r => `${r.method}:${r.currency}`))
-                const newRows = paymentMethodCombos
-                  .filter(c => !existing.has(`${c.paymentMethod}:${c.currency}`))
-                  .map(c => ({ method: c.paymentMethod, currency: c.currency, accountCode: '' }))
-                if (newRows.length > 0) setPaymentMapRows([...paymentMapRows, ...newRows])
-              }}
-            >
-              Pre-populate from Orders
-            </Button>
-          )}
-        </div>
-      </Card>
-
-      {/* Numbering settings pointer */}
-      <Card className="p-4">
-        <p className="text-xs text-muted-foreground">
-          Invoice and order numbering prefixes (including WC order and WC invoice prefixes) are configured in{' '}
-          <a href="/settings/company" className="underline hover:text-foreground">Settings → Company → Numbering</a>.
-        </p>
-      </Card>
-
-      {/* Sync Settings */}
-      <Card className="p-6 space-y-4">
-        <h3 className="text-base font-semibold">Sync Settings</h3>
-
-        {/* Readiness panel — only shown when not ready and sync is currently off */}
-        {!readiness.ready && s.xero_sync_enabled !== 'true' && (
-          <div className="rounded-md border border-amber-200 bg-amber-50 dark:border-amber-900/50 dark:bg-amber-950/30 p-3 space-y-2">
-            <div className="flex items-center gap-2 text-sm font-medium text-amber-900 dark:text-amber-200">
-              <AlertTriangle className="h-4 w-4" />
-              Xero sync cannot be enabled yet
-            </div>
-            <ul className="text-xs text-amber-800 dark:text-amber-300 space-y-1 ml-6 list-disc">
-              {readiness.notConnected && (
-                <li>Not connected to Xero — use the Connect button above.</li>
-              )}
-              {readiness.missingAccounts.length > 0 && (
-                <li>
-                  Missing account mapping: {readiness.missingAccounts.map(a => a.label).join(', ')}
-                </li>
-              )}
-              {readiness.missingTaxTypes.length > 0 && (
-                <li>
-                  IMS VAT rates without a Xero tax code:{' '}
-                  {readiness.missingTaxTypes.map(t => t.name).join(', ')}
-                  {' '}— map them in the VAT Tax Code Mapping card above.
-                </li>
-              )}
-            </ul>
-          </div>
-        )}
-
-        <label className={`flex items-center gap-3 ${readiness.ready || s.xero_sync_enabled === 'true' ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'}`}>
-          <input
-            type="checkbox"
-            checked={s.xero_sync_enabled === 'true'}
-            disabled={!readiness.ready && s.xero_sync_enabled !== 'true'}
-            onChange={e => handleField('xero_sync_enabled', e.target.checked ? 'true' : 'false')}
-            className="h-4 w-4 accent-primary"
-          />
-          <div>
-            <span className="text-sm font-medium">Enable Xero Sync</span>
-            <p className="text-xs text-muted-foreground">When enabled, transactions are queued and synced to Xero automatically via cron. Remember to click <span className="font-medium">Save Settings</span> at the bottom of the page after making changes.</p>
-          </div>
-        </label>
-
-        <div className="flex items-center gap-3 pt-2 border-t">
-          <Button size="sm" variant="outline" onClick={handleManualSync} disabled={isPending || !connected || s.xero_sync_enabled !== 'true'}>
-            {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowUpFromLine className="h-3 w-3 mr-1" />}
-            Process Pending Now
-          </Button>
-          {syncMsg && <span className="text-xs text-muted-foreground">{syncMsg}</span>}
-        </div>
-      </Card>
-
-      {/* Sync Log */}
-      <Card className="p-6 space-y-4">
-        <h3 className="text-base font-semibold">Sync Log</h3>
-        {logs.length === 0 ? (
-          <p className="text-sm text-muted-foreground">No sync entries yet.</p>
-        ) : (
-          <Table className="rounded-md border min-w-[600px]">
-            <TableHeader className="bg-muted/50">
-              <TableRow>
-                <TableHead className="text-xs">Type</TableHead>
-                <TableHead className="text-xs">Status</TableHead>
-                <TableHead className="text-xs">Reference</TableHead>
-                <TableHead className="text-xs">Xero ID</TableHead>
-                <TableHead className="text-xs">Date</TableHead>
-                <TableHead className="text-xs">Error</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {logs.map(log => {
-                const badge = STATUS_BADGE[log.status] ?? { variant: 'outline' as const, label: log.status }
-                return (
-                  <TableRow key={log.id}>
-                    <TableCell className="font-mono text-xs">{log.type.replace(/_/g, ' ')}</TableCell>
-                    <TableCell>
-                      <Badge variant={badge.variant} className="text-xs">{badge.label}</Badge>
-                      {log.retryCount > 0 && <span className="ml-1 text-[10px] text-muted-foreground">({log.retryCount})</span>}
+                          placeholder="Account code"
+                          className="h-8 text-xs"
+                        />
+                      )}
                     </TableCell>
-                    <TableCell className="text-xs text-muted-foreground">{log.referenceType}:{log.referenceId.slice(0, 8)}</TableCell>
-                    <TableCell className="font-mono text-xs text-muted-foreground">{log.xeroTransactionId?.slice(0, 12) ?? '—'}</TableCell>
-                    <TableCell className="text-xs text-muted-foreground">{new Date(log.createdAt).toLocaleString()}</TableCell>
-                    <TableCell className="text-xs text-destructive max-w-48 truncate" title={log.errorMessage ?? undefined}>
-                      {log.errorMessage ?? '—'}
+                    <TableCell className="py-1.5">
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        className="h-8 w-8 p-0"
+                        onClick={() => setPaymentMapRows(paymentMapRows.filter((_, j) => j !== i))}
+                      >
+                        <Trash2 className="h-3.5 w-3.5 text-muted-foreground" />
+                      </Button>
                     </TableCell>
                   </TableRow>
-                )
-              })}
-            </TableBody>
-          </Table>
-        )}
-      </Card>
+                ))}
+                {paymentMapRows.length === 0 && (
+                  <TableRow>
+                    <TableCell colSpan={4} className="py-4 text-center text-xs text-muted-foreground">No mappings configured. Add a row or use the pre-populate button below.</TableCell>
+                  </TableRow>
+                )}
+              </TableBody>
+            </Table>
+            <div className="flex items-center gap-3">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={() => setPaymentMapRows([...paymentMapRows, { method: '', currency: '', accountCode: '' }])}
+              >
+                <Plus className="h-3 w-3 mr-1" />
+                Add Row
+              </Button>
+              {paymentMethodCombos.length > 0 && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    const existing = new Set(paymentMapRows.map(r => `${r.method}:${r.currency}`))
+                    const newRows = paymentMethodCombos
+                      .filter(c => !existing.has(`${c.paymentMethod}:${c.currency}`))
+                      .map(c => ({ method: c.paymentMethod, currency: c.currency, accountCode: '' }))
+                    if (newRows.length > 0) setPaymentMapRows([...paymentMapRows, ...newRows])
+                  }}
+                >
+                  Pre-populate from Orders
+                </Button>
+              )}
+            </div>
+          </Card>
 
-      {/* Sticky Save Bar */}
-      <div className="fixed bottom-0 left-0 right-0 z-40 border-t bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 shadow-lg">
-        <div className="max-w-5xl mx-auto px-6 py-3 flex items-center justify-between gap-3">
-          <div className="flex items-center gap-2 text-xs text-muted-foreground">
-            {msg ? (
-              <span className={msg.startsWith('Error') ? 'text-destructive' : 'text-green-600 dark:text-green-400'}>{msg}</span>
-            ) : (
-              <span>Changes are not saved until you click Save Settings.</span>
-            )}
-          </div>
-          <Button onClick={handleSave} disabled={isPending}>
-            {isPending ? <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> : null}
-            Save Settings
-          </Button>
+          {/* Numbering settings pointer */}
+          <Card className="p-4">
+            <p className="text-xs text-muted-foreground">
+              Invoice and order numbering prefixes (including WC order and WC invoice prefixes) are configured in{' '}
+              <a href="/settings/company" className="underline hover:text-foreground">Settings → Company → Numbering</a>.
+            </p>
+          </Card>
         </div>
-      </div>
+      )}
+
+      {/* Tax tab */}
+      {tab === 'tax' && (
+        <Card className="p-6 space-y-4">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <h3 className="text-base font-semibold flex items-center gap-2">
+                <Receipt className="h-4 w-4 text-muted-foreground" />
+                VAT Tax Code Mapping
+              </h3>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Link each IMS VAT rate to a Xero tax code so invoices sync with the correct tax line.
+                Auto-link matches by name; unmatched rates can be assigned manually from the dropdown.
+                VAT rates themselves are managed in <a href="/settings/accounting" className="underline hover:text-foreground">Settings → Accounting</a>.
+              </p>
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <Button variant="outline" size="sm" onClick={handleRefreshXeroTaxRates} disabled={refreshingTaxRates || !connected}>
+                {refreshingTaxRates ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
+                Refresh from Xero
+              </Button>
+              <Button variant="outline" size="sm" onClick={handleAutoLinkTaxes} disabled={autoLinking || !connected}>
+                {autoLinking ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Link2 className="h-3 w-3 mr-1" />}
+                Auto-link
+              </Button>
+            </div>
+          </div>
+          {taxMapMsg && <p className="text-xs text-muted-foreground">{taxMapMsg}</p>}
+
+          {!connected ? (
+            <p className="text-sm text-muted-foreground">Connect to Xero to load tax rates.</p>
+          ) : imsTaxRates.length === 0 ? (
+            <p className="text-sm text-muted-foreground">
+              No IMS VAT rates defined.{' '}
+              <a href="/settings/accounting" className="underline hover:text-foreground">Add one in Settings → Accounting</a>.
+            </p>
+          ) : (
+            <Table className="rounded-md border">
+              <TableHeader className="bg-muted/50">
+                <TableRow>
+                  <TableHead className="text-xs">IMS VAT Rate</TableHead>
+                  <TableHead className="text-xs text-right">Rate</TableHead>
+                  <TableHead className="text-xs">Xero Tax Code</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {imsTaxRates.map(r => {
+                  const stored = taxMappings[r.id] ?? ''
+                  const storedKnown = !stored || xeroTaxRates.some(x => x.taxType === stored)
+                  return (
+                    <TableRow key={r.id}>
+                      <TableCell className="font-medium">
+                        {r.name}
+                        {!r.active && <span className="ml-1.5 text-[10px] text-muted-foreground">(inactive)</span>}
+                      </TableCell>
+                      <TableCell className="text-right font-mono text-xs text-muted-foreground">
+                        {(r.rate * 100).toFixed(2)}%
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex items-center gap-2">
+                          <select
+                            className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                            value={stored}
+                            onChange={e => handleTaxMappingChange(r.id, e.target.value)}
+                            disabled={savingTaxId === r.id}
+                          >
+                            <option value="">— Not mapped —</option>
+                            {xeroTaxRates.map(x => (
+                              <option key={x.taxType} value={x.taxType}>
+                                {x.name} ({x.rate.toFixed(2)}%) — {x.taxType}
+                              </option>
+                            ))}
+                            {!storedKnown && stored && (
+                              <option value={stored}>{stored} (unknown)</option>
+                            )}
+                          </select>
+                          {savingTaxId === r.id && <Loader2 className="h-3 w-3 animate-spin text-muted-foreground" />}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )
+                })}
+              </TableBody>
+            </Table>
+          )}
+        </Card>
+      )}
+
+      {/* Sync tab */}
+      {tab === 'sync' && (
+        <div className="space-y-6">
+          {/* Enable Xero Sync */}
+          {!readiness.ready && s.xero_sync_enabled !== 'true' && (
+            <div className="rounded-md border border-amber-200 bg-amber-50 dark:border-amber-900/50 dark:bg-amber-950/30 p-3 space-y-2">
+              <div className="flex items-center gap-2 text-sm font-medium text-amber-900 dark:text-amber-200">
+                <AlertTriangle className="h-4 w-4" />
+                Xero sync cannot be enabled yet
+              </div>
+              <ul className="text-xs text-amber-800 dark:text-amber-300 space-y-1 ml-6 list-disc">
+                {readiness.notConnected && (
+                  <li>Not connected to Xero — use the Connect button on the Connection tab.</li>
+                )}
+                {readiness.missingAccounts.length > 0 && (
+                  <li>
+                    Missing account mapping: {readiness.missingAccounts.map(a => a.label).join(', ')}
+                  </li>
+                )}
+                {readiness.missingTaxTypes.length > 0 && (
+                  <li>
+                    IMS VAT rates without a Xero tax code:{' '}
+                    {readiness.missingTaxTypes.map(t => t.name).join(', ')}
+                    {' '}— map them on the Tax tab.
+                  </li>
+                )}
+              </ul>
+            </div>
+          )}
+
+          <label className={`flex items-center gap-3 ${readiness.ready || s.xero_sync_enabled === 'true' ? 'cursor-pointer' : 'cursor-not-allowed opacity-60'}`}>
+            <input
+              type="checkbox"
+              checked={s.xero_sync_enabled === 'true'}
+              disabled={!readiness.ready && s.xero_sync_enabled !== 'true'}
+              onChange={e => handleField('xero_sync_enabled', e.target.checked ? 'true' : 'false')}
+              className="h-4 w-4 accent-primary"
+            />
+            <div>
+              <span className="text-sm font-medium">Enable Xero Sync</span>
+              <p className="text-xs text-muted-foreground">When enabled, transactions are queued and synced to Xero automatically via cron.</p>
+            </div>
+          </label>
+
+          {/* Transaction Types */}
+          <Card className="p-6 space-y-4">
+            <div>
+              <h3 className="text-base font-semibold">Transaction Types</h3>
+              <p className="text-xs text-muted-foreground mt-0.5">Choose which documents and transactions are synced to Xero.</p>
+            </div>
+            <div className="grid grid-cols-2 gap-4">
+              {SYNC_TYPE_TOGGLES.map(t => (
+                <div key={t.key} className="space-y-1.5">
+                  <Label htmlFor={t.key}>{t.label}</Label>
+                  <select
+                    id={t.key}
+                    className="flex h-9 w-full rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
+                    value={s[t.key]}
+                    onChange={e => handleField(t.key, e.target.value)}
+                  >
+                    <option value="off">Off</option>
+                    <option value="draft">Draft</option>
+                    <option value="submitted">Submitted</option>
+                  </select>
+                  <p className="text-[11px] text-muted-foreground">{t.description}</p>
+                </div>
+              ))}
+            </div>
+            <div className="border-t pt-3">
+              <label className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
+                <input
+                  type="checkbox"
+                  checked={s.xero_sync_attach_pdf === 'true'}
+                  onChange={e => handleField('xero_sync_attach_pdf', e.target.checked ? 'true' : 'false')}
+                  className="h-4 w-4 accent-primary mt-0.5"
+                />
+                <div>
+                  <span className="text-sm font-medium">Attach supplier invoice PDFs</span>
+                  <p className="text-[11px] text-muted-foreground">When a supplier invoice PDF is uploaded to a PO, attach it to the Xero bill.</p>
+                </div>
+              </label>
+            </div>
+          </Card>
+
+          {/* Sub-Ledger */}
+          <Card className="p-6 space-y-4">
+            <div>
+              <h3 className="text-base font-semibold">Sub-Ledger</h3>
+              <p className="text-xs text-muted-foreground mt-0.5">Daily batch journals for revenue deferral, inventory reclassification, and COGS recognition on shipment.</p>
+            </div>
+            <label className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
+              <input
+                type="checkbox"
+                checked={s.xero_daily_batch_enabled === 'true'}
+                onChange={e => handleField('xero_daily_batch_enabled', e.target.checked ? 'true' : 'false')}
+                className="h-4 w-4 accent-primary mt-0.5"
+              />
+              <div>
+                <span className="text-sm font-medium">Daily Batch Sync</span>
+                <p className="text-[11px] text-muted-foreground">Run nightly batch: Group A1 (revenue deferral), A2 (inventory reclassification), B (shipment COGS + revenue recognition).</p>
+              </div>
+            </label>
+            <label className="flex items-start gap-3 cursor-pointer p-2 rounded-md hover:bg-muted/50">
+              <input
+                type="checkbox"
+                checked={s.xero_payment_polling_enabled === 'true'}
+                onChange={e => handleField('xero_payment_polling_enabled', e.target.checked ? 'true' : 'false')}
+                className="h-4 w-4 accent-primary mt-0.5"
+              />
+              <div>
+                <span className="text-sm font-medium">Payment Polling</span>
+                <p className="text-[11px] text-muted-foreground">Poll Xero every 15 minutes for paid invoices (manual orders) and paid bills (purchase orders).</p>
+              </div>
+            </label>
+          </Card>
+
+          {/* Sync Log */}
+          <Card className="p-6 space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-base font-semibold">Sync Log</h3>
+              <div className="flex items-center gap-2">
+                {hasFailedEntries && (
+                  <Button variant="outline" size="sm" onClick={handleRetryAll} disabled={retryingAll}>
+                    {retryingAll ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RotateCcw className="h-3 w-3 mr-1" />}
+                    Retry All Failed
+                  </Button>
+                )}
+                <Button size="sm" variant="outline" onClick={handleManualSync} disabled={isPending || !connected || s.xero_sync_enabled !== 'true'}>
+                  {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowUpFromLine className="h-3 w-3 mr-1" />}
+                  Process Pending Now
+                </Button>
+              </div>
+            </div>
+            {syncMsg && <p className="text-xs text-muted-foreground">{syncMsg}</p>}
+            {retryMsg && <p className="text-xs text-muted-foreground">{retryMsg}</p>}
+            {logs.length === 0 ? (
+              <p className="text-sm text-muted-foreground">No sync entries yet.</p>
+            ) : (
+              <>
+                <Table className="rounded-md border min-w-[600px]">
+                  <TableHeader className="bg-muted/50">
+                    <TableRow>
+                      <TableHead className="text-xs">Type</TableHead>
+                      <TableHead className="text-xs">Status</TableHead>
+                      <TableHead className="text-xs">Reference</TableHead>
+                      <TableHead className="text-xs">Xero ID</TableHead>
+                      <TableHead className="text-xs">Date</TableHead>
+                      <TableHead className="text-xs">Error</TableHead>
+                      <TableHead className="w-10" />
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {pagedLogs.map(log => {
+                      const badge = STATUS_BADGE[log.status] ?? { variant: 'outline' as const, label: log.status }
+                      return (
+                        <TableRow key={log.id}>
+                          <TableCell className="font-mono text-xs">{log.type.replace(/_/g, ' ')}</TableCell>
+                          <TableCell>
+                            <Badge variant={badge.variant} className="text-xs">{badge.label}</Badge>
+                            {log.retryCount > 0 && <span className="ml-1 text-[10px] text-muted-foreground">({log.retryCount})</span>}
+                          </TableCell>
+                          <TableCell className="text-xs text-muted-foreground">{log.referenceType}:{log.referenceId.slice(0, 8)}</TableCell>
+                          <TableCell className="font-mono text-xs text-muted-foreground">{log.xeroTransactionId?.slice(0, 12) ?? '—'}</TableCell>
+                          <TableCell className="text-xs text-muted-foreground">{new Date(log.createdAt).toLocaleString()}</TableCell>
+                          <TableCell className="text-xs text-destructive max-w-48 truncate" title={log.errorMessage ?? undefined}>
+                            {log.errorMessage ?? '—'}
+                          </TableCell>
+                          <TableCell>
+                            {log.status === 'FAILED' && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-7 w-7 p-0"
+                                title="Retry this entry"
+                                onClick={() => handleRetryOne(log.id)}
+                                disabled={retryingId === log.id}
+                              >
+                                {retryingId === log.id ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
+                              </Button>
+                            )}
+                          </TableCell>
+                        </TableRow>
+                      )
+                    })}
+                  </TableBody>
+                </Table>
+                {logTotalPages > 1 && (
+                  <div className="flex items-center justify-between pt-1">
+                    <p className="text-xs text-muted-foreground">
+                      Showing {logPage * LOG_PAGE_SIZE + 1}–{Math.min((logPage + 1) * LOG_PAGE_SIZE, logs.length)} of {logs.length}
+                    </p>
+                    <div className="flex items-center gap-1">
+                      <Button variant="outline" size="sm" className="h-7 w-7 p-0" disabled={logPage === 0} onClick={() => setLogPage(logPage - 1)}>
+                        <ChevronLeft className="h-3.5 w-3.5" />
+                      </Button>
+                      <span className="text-xs text-muted-foreground px-2">{logPage + 1} / {logTotalPages}</span>
+                      <Button variant="outline" size="sm" className="h-7 w-7 p-0" disabled={logPage >= logTotalPages - 1} onClick={() => setLogPage(logPage + 1)}>
+                        <ChevronRight className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+          </Card>
+        </div>
+      )}
+
+      {/* Sticky Save Bar — shown on tabs with editable content */}
+      {showSaveBar && (
+        <div className="fixed bottom-0 left-0 right-0 z-40 border-t bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 shadow-lg">
+          <div className="max-w-5xl mx-auto px-6 py-3 flex items-center justify-between gap-3">
+            <div className="flex items-center gap-2 text-xs text-muted-foreground">
+              {msg ? (
+                <span className={msg.startsWith('Error') ? 'text-destructive' : 'text-green-600 dark:text-green-400'}>{msg}</span>
+              ) : (
+                <span>Changes are not saved until you click Save Settings.</span>
+              )}
+            </div>
+            <Button onClick={handleSave} disabled={isPending}>
+              {isPending ? <Loader2 className="h-4 w-4 mr-1.5 animate-spin" /> : null}
+              Save Settings
+            </Button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

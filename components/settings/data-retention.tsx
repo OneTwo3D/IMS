@@ -56,10 +56,10 @@ export function DataRetentionSetting({
       <p className="text-xs text-muted-foreground">
         Set to 0 to keep records forever. Financial records (orders, customers) are soft-archived — hidden from lists but accessible via direct link. Operational data (movements, sync logs) is permanently deleted. Cleanup runs daily via <code className="text-xs bg-muted px-1 rounded">/api/cron/activity-cleanup</code>.
       </p>
-      <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-5 gap-4 max-w-3xl">
+      <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-5 gap-x-4 max-w-3xl">
         {FIELDS.map((f) => (
-          <div key={f.key} className="space-y-1.5">
-            <Label className="text-xs">{f.label} (months)</Label>
+          <div key={f.key} className="grid grid-rows-subgrid row-span-3 gap-0">
+            <Label className="text-xs self-end pb-1">{f.label} (months)</Label>
             <Input
               type="number"
               min={0}
@@ -67,7 +67,7 @@ export function DataRetentionSetting({
               onChange={(e) => setValues((v) => ({ ...v, [f.stateKey]: e.target.value }))}
               className="h-9"
             />
-            <p className="text-[10px] text-muted-foreground leading-tight">{f.hint}</p>
+            <p className="text-[10px] text-muted-foreground leading-tight pt-1.5 pb-3">{f.hint}</p>
           </div>
         ))}
       </div>

@@ -1,9 +1,9 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useState, useTransition, useEffect, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
-import { Plus, Pencil, X, Check, Loader2, Search, ShieldAlert } from 'lucide-react'
+import { Plus, Pencil, X, Check, Loader2, Search, ShieldAlert, Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -13,7 +13,54 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { createCustomer, updateCustomer, importContactsCsv, anonymiseCustomer, type CustomerRow, type CustomerInput, type AddressData } from '@/app/actions/customers'
 import { CsvBar } from '@/components/ui/csv-bar'
 
-type Props = { initialCustomers: CustomerRow[] }
+// ---------------------------------------------------------------------------
+// Column definitions
+// ---------------------------------------------------------------------------
+
+type ColKey = 'name' | 'company' | 'email' | 'phone' | 'taxNumber' | 'billingAddress' | 'shippingAddress' | 'orders' | 'lifetimeValue' | 'currentYearSales' | 'lastOrder' | 'status' | 'created' | 'notes'
+
+const CURRENT_YEAR = new Date().getFullYear()
+
+const ALL_COLUMNS: { key: ColKey; label: string; defaultVisible: boolean; align?: 'right' }[] = [
+  { key: 'name', label: 'Name', defaultVisible: true },
+  { key: 'company', label: 'Company', defaultVisible: true },
+  { key: 'email', label: 'Email', defaultVisible: true },
+  { key: 'phone', label: 'Phone', defaultVisible: false },
+  { key: 'taxNumber', label: 'Tax Number', defaultVisible: true },
+  { key: 'billingAddress', label: 'Billing Address', defaultVisible: true },
+  { key: 'shippingAddress', label: 'Shipping Address', defaultVisible: false },
+  { key: 'orders', label: 'Orders', defaultVisible: true, align: 'right' },
+  { key: 'lifetimeValue', label: 'Lifetime Value', defaultVisible: true, align: 'right' },
+  { key: 'currentYearSales', label: `${CURRENT_YEAR} Sales`, defaultVisible: true, align: 'right' },
+  { key: 'lastOrder', label: 'Last Order', defaultVisible: false },
+  { key: 'status', label: 'Status', defaultVisible: false },
+  { key: 'created', label: 'Created', defaultVisible: false },
+  { key: 'notes', label: 'Notes', defaultVisible: false },
+]
+
+const LS_KEY = 'customer-list-cols'
+
+function defaultVisibility(): Record<ColKey, boolean> {
+  return Object.fromEntries(ALL_COLUMNS.map((c) => [c.key, c.defaultVisible])) as Record<ColKey, boolean>
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function formatAddr(a: AddressData | null): string {
+  if (!a) return '—'
+  return [a.line1, a.line2, a.city, a.postcode, a.country].filter(Boolean).join(', ') || '—'
+}
+
+function fmtDate(iso: string | null): string {
+  if (!iso) return '—'
+  return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
+}
+
+// ---------------------------------------------------------------------------
+// Address Fields (shared by form)
+// ---------------------------------------------------------------------------
 
 function AddressFields({ label, value, onChange, disabled }: { label: string; value: AddressData; onChange: (v: AddressData) => void; disabled?: boolean }) {
   function set(field: keyof AddressData, val: string) { onChange({ ...value, [field]: val }) }
@@ -32,10 +79,9 @@ function AddressFields({ label, value, onChange, disabled }: { label: string; va
   )
 }
 
-function formatAddr(a: AddressData | null): string {
-  if (!a) return '—'
-  return [a.line1, a.line2, a.city, a.postcode, a.country].filter(Boolean).join(', ') || '—'
-}
+// ---------------------------------------------------------------------------
+// Customer Form Dialog
+// ---------------------------------------------------------------------------
 
 function CustomerFormDialog({ customer, onClose }: { customer: CustomerRow | null; onClose: () => void }) {
   const router = useRouter()
@@ -150,6 +196,10 @@ function CustomerFormDialog({ customer, onClose }: { customer: CustomerRow | nul
   )
 }
 
+// ---------------------------------------------------------------------------
+// GDPR Dialog
+// ---------------------------------------------------------------------------
+
 function GdprDialog({ customer, onClose }: { customer: CustomerRow; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -208,12 +258,46 @@ function GdprDialog({ customer, onClose }: { customer: CustomerRow; onClose: () 
   )
 }
 
+// ---------------------------------------------------------------------------
+// Main Component
+// ---------------------------------------------------------------------------
+
+type Props = { initialCustomers: CustomerRow[] }
+
 export function ContactsClient({ initialCustomers }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [editing, setEditing] = useState<CustomerRow | null | undefined>(undefined)
   const [gdprTarget, setGdprTarget] = useState<CustomerRow | undefined>(undefined)
   const [search, setSearch] = useState('')
+
+  // Column visibility
+  const [visible, setVisible] = useState<Record<ColKey, boolean>>(defaultVisibility)
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const pickerRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    try {
+      const stored = localStorage.getItem(LS_KEY)
+      if (stored) setVisible(JSON.parse(stored))
+    } catch { /* ignore */ }
+  }, [])
+
+  useEffect(() => {
+    function handler(e: MouseEvent) {
+      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) setPickerOpen(false)
+    }
+    if (pickerOpen) document.addEventListener('mousedown', handler)
+    return () => document.removeEventListener('mousedown', handler)
+  }, [pickerOpen])
+
+  function toggleCol(key: ColKey, value: boolean) {
+    const next = { ...visible, [key]: value }
+    setVisible(next)
+    try { localStorage.setItem(LS_KEY, JSON.stringify(next)) } catch { /* noop */ }
+  }
+
+  const visibleCols = ALL_COLUMNS.filter((c) => visible[c.key])
 
   const filtered = initialCustomers.filter((c) => {
     if (!search) return true
@@ -231,55 +315,110 @@ export function ContactsClient({ initialCustomers }: Props) {
     })
   }
 
+  function renderCell(c: CustomerRow, key: ColKey) {
+    switch (key) {
+      case 'name':
+        return (
+          <>
+            <Link href={`/sales/contacts/${c.id}`} className="text-primary hover:underline" target="_blank">
+              {c.fullName}
+            </Link>
+            {c.gdprAnonymisedAt && (
+              <span className="ml-2 inline-flex items-center gap-1 text-[10px] font-medium text-orange-600 bg-orange-50 px-1.5 py-0.5 rounded">
+                <ShieldAlert className="h-3 w-3" />GDPR
+              </span>
+            )}
+          </>
+        )
+      case 'company': return c.company ?? '—'
+      case 'email': return c.email ?? '—'
+      case 'phone': return c.phone ?? '—'
+      case 'taxNumber': return c.taxNumber ? <span className="font-mono">{c.taxNumber}</span> : '—'
+      case 'billingAddress': return formatAddr(c.billingAddress)
+      case 'shippingAddress': return formatAddr(c.shippingAddress)
+      case 'orders': return c.orderCount
+      case 'lifetimeValue': return c.lifetimeValueGbp > 0 ? `£${c.lifetimeValueGbp.toFixed(2)}` : '—'
+      case 'currentYearSales': return c.currentYearSalesGbp > 0 ? `£${c.currentYearSalesGbp.toFixed(2)}` : '—'
+      case 'lastOrder': return fmtDate(c.lastOrderAt)
+      case 'status':
+        return (
+          <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${
+            c.active
+              ? 'bg-green-100 text-green-800 border-green-200 dark:bg-green-900 dark:text-green-200'
+              : 'bg-muted text-muted-foreground border-border'
+          }`}>
+            {c.active ? 'Active' : 'Inactive'}
+          </span>
+        )
+      case 'created': return fmtDate(c.createdAt)
+      case 'notes': return c.notes ? <span className="truncate max-w-40 block">{c.notes}</span> : '—'
+    }
+  }
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Customers</h1>
-        <Button size="sm" onClick={() => setEditing(null)}>
-          <Plus className="h-4 w-4 mr-1" />New Customer
-        </Button>
+        <div className="flex items-center gap-2">
+          <CsvBar exportUrl="/api/export/contacts" templateUrl="/api/export/contacts?template=1" importAction={importContactsCsv} />
+          <Button size="sm" onClick={() => setEditing(null)}>
+            <Plus className="h-4 w-4 mr-1" />New Customer
+          </Button>
+        </div>
       </div>
 
-      <CsvBar exportUrl="/api/export/contacts" templateUrl="/api/export/contacts?template=1" importAction={importContactsCsv} />
-
-      <div className="relative max-w-xs">
-        <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
-        <Input placeholder="Search customers…" value={search} onChange={(e) => setSearch(e.target.value)} className="pl-8 h-8 text-sm" />
+      <div className="flex flex-wrap items-center gap-2">
+        <div className="relative flex-1 min-w-48 max-w-xs">
+          <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
+          <Input placeholder="Search customers…" value={search} onChange={(e) => setSearch(e.target.value)} className="pl-8 h-8 text-sm" />
+        </div>
+        <div className="relative" ref={pickerRef}>
+          <Button variant="outline" size="sm" className="h-8" onClick={() => setPickerOpen((o) => !o)} title="Column settings">
+            <Settings2 className="h-4 w-4" />
+          </Button>
+          {pickerOpen && (
+            <div className="absolute right-0 top-full mt-1 z-50 w-[calc(100vw-2rem)] sm:w-52 rounded-md border border-border bg-popover shadow-md p-2 space-y-1">
+              {ALL_COLUMNS.map((col) => (
+                <label key={col.key} className="flex items-center gap-2 px-1 py-0.5 text-sm cursor-pointer hover:bg-accent rounded">
+                  <input
+                    type="checkbox"
+                    checked={!!visible[col.key]}
+                    onChange={(e) => toggleCol(col.key, e.target.checked)}
+                    className="h-3.5 w-3.5 accent-primary"
+                  />
+                  {col.label}
+                </label>
+              ))}
+            </div>
+          )}
+        </div>
       </div>
 
       {filtered.length === 0 ? (
         <p className="text-sm text-muted-foreground text-center py-8">No customers found.</p>
       ) : (
-        <Table className="rounded-md border min-w-[700px]">
+        <Table containerClassName="rounded-md border max-h-[calc(100vh-16rem)]" className="min-w-[700px]">
           <TableHeader className="bg-muted/50">
             <TableRow>
-              <TableHead className="px-4 text-xs">Name</TableHead>
-              <TableHead className="px-4 text-xs">Company</TableHead>
-              <TableHead className="px-4 text-xs">Email</TableHead>
-              <TableHead className="px-4 text-xs">Tax Number</TableHead>
-              <TableHead className="px-4 text-xs">Billing Address</TableHead>
-              <TableHead className="px-4 text-xs text-right">Orders</TableHead>
+              {visibleCols.map((col) => (
+                <TableHead key={col.key} className={`px-4 text-xs${col.align === 'right' ? ' text-right' : ''}`}>
+                  {col.label}
+                </TableHead>
+              ))}
               <TableHead className="w-16" />
             </TableRow>
           </TableHeader>
           <TableBody>
             {[...active, ...inactive].map((c) => (
               <TableRow key={c.id} className={!c.active ? 'opacity-50' : ''}>
-                <TableCell className="px-4 font-medium">
-                  <Link href={`/sales/contacts/${c.id}`} className="text-primary hover:underline" target="_blank">
-                    {c.fullName}
-                  </Link>
-                  {c.gdprAnonymisedAt && (
-                    <span className="ml-2 inline-flex items-center gap-1 text-[10px] font-medium text-orange-600 bg-orange-50 px-1.5 py-0.5 rounded">
-                      <ShieldAlert className="h-3 w-3" />GDPR
-                    </span>
-                  )}
-                </TableCell>
-                <TableCell className="px-4 text-muted-foreground text-xs">{c.company ?? '—'}</TableCell>
-                <TableCell className="px-4 text-muted-foreground text-xs">{c.email ?? '—'}</TableCell>
-                <TableCell className="px-4 text-muted-foreground text-xs font-mono">{c.taxNumber ?? '—'}</TableCell>
-                <TableCell className="px-4 text-muted-foreground text-xs truncate max-w-40">{formatAddr(c.billingAddress)}</TableCell>
-                <TableCell className="px-4 text-right text-xs tabular-nums">{c.orderCount}</TableCell>
+                {visibleCols.map((col) => (
+                  <TableCell
+                    key={col.key}
+                    className={`px-4${col.align === 'right' ? ' text-right tabular-nums' : ''} text-xs${col.key === 'name' ? ' font-medium' : ' text-muted-foreground'}${col.key === 'billingAddress' || col.key === 'shippingAddress' ? ' truncate max-w-40' : ''}`}
+                  >
+                    {renderCell(c, col.key)}
+                  </TableCell>
+                ))}
                 <TableCell className="px-4">
                   <div className="flex items-center gap-1 justify-end">
                     <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setEditing(c)}>

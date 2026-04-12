@@ -36,12 +36,14 @@ export function TransfersClient({ warehouses, products, initialTransfers, stockL
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Warehouse Transfers</h1>
-        <Button size="sm" onClick={() => setShowCreate(true)}>
-          <Plus className="h-4 w-4 mr-1" />
-          New Transfer
-        </Button>
+        <div className="flex items-center gap-2">
+          <CsvBar exportUrl="/api/export/transfers" templateUrl="/api/export/transfers?template=1" importAction={importTransfersCsv} />
+          <Button size="sm" onClick={() => setShowCreate(true)}>
+            <Plus className="h-4 w-4 mr-1" />
+            New Transfer
+          </Button>
+        </div>
       </div>
-      <CsvBar exportUrl="/api/export/transfers" templateUrl="/api/export/transfers?template=1" importAction={importTransfersCsv} />
       <TransferList
         transfers={transfers}
         warehouses={warehouses}

@@ -1,0 +1,45 @@
+import { registerCronJobs } from '@/lib/cron-registry'
+
+registerCronJobs([
+  {
+    slug: 'backup',
+    settingKey: 'backup',
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'Database Backup',
+    description: 'Creates a scheduled PostgreSQL database backup and purges old files.',
+    defaultSchedule: '0 1 * * *',
+    defaultEnabled: false,
+    legacyEnabledKey: 'backup_schedule_enabled',
+  },
+  {
+    slug: 'activity-cleanup',
+    settingKey: 'activity_cleanup',
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'Activity Log Cleanup',
+    description: 'Archives old activity log entries based on retention settings.',
+    defaultSchedule: '0 3 * * *',
+    defaultEnabled: true,
+  },
+  {
+    slug: 'fx-rates',
+    settingKey: 'fx_rates',
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'FX Rate Update',
+    description: 'Fetches daily exchange rates from the ECB via frankfurter.dev.',
+    defaultSchedule: '0 7 * * *',
+    defaultEnabled: true,
+  },
+  {
+    slug: 'delivery-status',
+    settingKey: 'delivery_status',
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'Delivery Status Check',
+    description: 'Polls carrier APIs for delivery status updates on shipped orders.',
+    defaultSchedule: '*/30 * * * *',
+    defaultEnabled: true,
+  },
+])
