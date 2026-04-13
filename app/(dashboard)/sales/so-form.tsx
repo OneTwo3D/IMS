@@ -534,7 +534,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
           {/* Customer + Order details */}
           <div className="rounded-md border p-4 space-y-4">
             <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">Order Details</h2>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
               {/* Customer */}
               <div className="space-y-1.5">
                 <Label>Customer *</Label>

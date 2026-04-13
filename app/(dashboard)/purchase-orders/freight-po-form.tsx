@@ -134,7 +134,7 @@ export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onC
           {/* Header */}
           <div className="rounded-md border p-4 space-y-4">
             <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">Freight / Landed Cost Details</h2>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
               <div className="space-y-1.5">
                 <Label>Supplier (e.g. FedEx, DHL) *</Label>
                 <select
