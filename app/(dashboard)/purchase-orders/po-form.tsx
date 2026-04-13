@@ -670,7 +670,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
       <div className="rounded-md border p-4 space-y-4">
         <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">PO Details</h2>
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="space-y-1.5">
             <Label htmlFor="supplier">Supplier *</Label>
             {!showNewSupplier ? (
@@ -813,7 +813,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
           </div>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
           <div className="space-y-1.5">
             <Label htmlFor="notes">Notes (visible to supplier)</Label>
             <Textarea id="notes" value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} className="text-sm resize-none" />

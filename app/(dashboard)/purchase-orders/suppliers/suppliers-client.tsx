@@ -162,7 +162,7 @@ function SupplierFormDialog({
             <Input value={form.name} onChange={(e) => set('name', e.target.value)} className="h-9" />
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label>Contact Name</Label>
               <Input value={form.contactName} onChange={(e) => set('contactName', e.target.value)} className="h-9" />
@@ -190,7 +190,7 @@ function SupplierFormDialog({
             </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label>Default VAT Rate</Label>
               <select
@@ -221,7 +221,7 @@ function SupplierFormDialog({
             <Input value={form.addressLine2} onChange={(e) => set('addressLine2', e.target.value)} className="h-9" />
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
             <div className="space-y-1.5">
               <Label>City</Label>
               <Input value={form.city} onChange={(e) => set('city', e.target.value)} className="h-9" />
@@ -236,7 +236,7 @@ function SupplierFormDialog({
             </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label>Country</Label>
               <Input value={form.country} onChange={(e) => set('country', e.target.value)} className="h-9" placeholder="United Kingdom" />
@@ -259,7 +259,7 @@ function SupplierFormDialog({
 
           <div className="space-y-1.5">
             <Label>Delivery Time (days)</Label>
-            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               <div>
                 <div className="text-xs text-muted-foreground mb-1">Average (from history)</div>
                 <div className="h-9 flex items-center px-3 rounded-md border border-input bg-muted/30 font-mono text-sm">

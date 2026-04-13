@@ -108,7 +108,7 @@ export function TransferFormDialog({ warehouses, products, stockLevels, onCreate
 
         <div className="space-y-5">
           {/* Warehouse selectors */}
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div className="space-y-1.5">
               <Label className="text-sm">From Warehouse</Label>
               <Select value={fromId} onChange={(e) => setFromId(e.target.value)} className="h-9">

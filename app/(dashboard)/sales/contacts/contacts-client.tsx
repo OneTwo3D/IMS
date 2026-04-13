@@ -69,7 +69,7 @@ function AddressFields({ label, value, onChange, disabled }: { label: string; va
       <Label className="text-xs font-medium text-muted-foreground uppercase">{label}</Label>
       <Input value={value.line1 ?? ''} onChange={(e) => set('line1', e.target.value)} placeholder="Address line 1" className="h-8 text-sm" disabled={disabled} />
       <Input value={value.line2 ?? ''} onChange={(e) => set('line2', e.target.value)} placeholder="Address line 2" className="h-8 text-sm" disabled={disabled} />
-      <div className="grid grid-cols-3 gap-2">
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-2">
         <Input value={value.city ?? ''} onChange={(e) => set('city', e.target.value)} placeholder="City" className="h-8 text-sm" disabled={disabled} />
         <Input value={value.county ?? ''} onChange={(e) => set('county', e.target.value)} placeholder="County" className="h-8 text-sm" disabled={disabled} />
         <Input value={value.postcode ?? ''} onChange={(e) => set('postcode', e.target.value)} placeholder="Postcode" className="h-8 text-sm" disabled={disabled} />
@@ -133,7 +133,7 @@ function CustomerFormDialog({ customer, onClose }: { customer: CustomerRow | nul
           <DialogTitle>{customer ? 'Edit Customer' : 'New Customer'}</DialogTitle>
         </DialogHeader>
         <div className="space-y-4 text-sm">
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label>First Name *</Label>
               <Input value={firstName} onChange={(e) => setFirstName(e.target.value)} className="h-9" />
@@ -160,7 +160,7 @@ function CustomerFormDialog({ customer, onClose }: { customer: CustomerRow | nul
             </div>
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <AddressFields label="Billing Address" value={billing} onChange={handleBillingChange} />
             <div>
               <div className="flex items-center justify-between mb-2">

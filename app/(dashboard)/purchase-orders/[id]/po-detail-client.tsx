@@ -731,7 +731,7 @@ function BillDialog({
         {step === 2 && (
           <div className="space-y-4">
             {/* Invoice details */}
-            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
               <div className="space-y-1.5">
                 <Label>Invoice Number</Label>
                 <Input value={invoiceNumber} onChange={(e) => setInvoiceNumber(e.target.value)} placeholder="Supplier's invoice #" className="h-9 text-sm" />
@@ -1504,7 +1504,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
       {error && <p className="text-sm text-destructive">{error}</p>}
 
       {/* Header info */}
-      <div className="rounded-md border p-4 grid grid-cols-2 gap-x-8 gap-y-3 text-sm">
+      <div className="rounded-md border p-4 grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">
           <div>
             <span className="text-muted-foreground">Supplier</span>
             <p className="font-medium">
