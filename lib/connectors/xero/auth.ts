@@ -7,8 +7,11 @@
  */
 
 import { db } from '@/lib/db'
+import { setAuthToken, consumeAuthToken } from '@/lib/auth/token-store'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
+const XERO_OAUTH_STATE_PREFIX = 'xero_oauth_state:'
+const XERO_OAUTH_STATE_TTL_MS = 10 * 60 * 1000 // 10 minutes
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token'
 const XERO_CONNECTIONS_URL = 'https://api.xero.com/connections'
 const XERO_SCOPES = 'openid profile email offline_access accounting.settings accounting.contacts accounting.invoices accounting.manualjournals accounting.attachments'
@@ -47,16 +50,37 @@ export async function getAccessToken(): Promise<{ accessToken: string; tenantId:
 
 /**
  * Build the Xero authorization URL. The user's browser is redirected here.
+ *
+ * SECURITY: generates a random `state` parameter bound to the initiating user
+ * and persists it server-side with a short TTL. The callback MUST re-verify
+ * the returned state via `consumeXeroOAuthState` before exchanging the code,
+ * preventing CSRF / mix-up attacks on the Xero tenant binding.
  */
-export function getAuthorizationUrl(clientId: string, redirectUri: string): string {
+export async function getAuthorizationUrl(
+  clientId: string,
+  redirectUri: string,
+  initiatorUserId: string,
+): Promise<string> {
+  const state = crypto.randomUUID()
+  await setAuthToken(`${XERO_OAUTH_STATE_PREFIX}${state}`, initiatorUserId, XERO_OAUTH_STATE_TTL_MS)
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: clientId,
     redirect_uri: redirectUri,
     scope: XERO_SCOPES,
-    state: crypto.randomUUID(),
+    state,
   })
   return `${XERO_AUTHORIZE_URL}?${params.toString()}`
+}
+
+/**
+ * Validate and consume a previously issued Xero OAuth state token.
+ * Returns the initiating user ID on success, or null if the state is missing,
+ * expired, or already consumed. Tokens are single-use.
+ */
+export async function consumeXeroOAuthState(state: string): Promise<string | null> {
+  if (!state) return null
+  return consumeAuthToken(`${XERO_OAUTH_STATE_PREFIX}${state}`)
 }
 
 /**

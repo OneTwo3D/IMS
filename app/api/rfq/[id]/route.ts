@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { auth } from '@/lib/auth'
+import { hasPermission } from '@/lib/permissions'
 import { db } from '@/lib/db'
 import {
   getBranding,
@@ -18,7 +19,22 @@ export async function GET(
   const session = await auth()
   if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
+  const isSupplier = session.user.role === 'SUPPLIER'
+  if (!isSupplier && !hasPermission(session.user.role, 'purchasing')) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  }
+
   const { id } = await params
+
+  // Suppliers may only access RFQs owned by their own supplier record.
+  if (isSupplier) {
+    if (!session.user.supplierId) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    const owned = await db.purchaseOrder.findFirst({
+      where: { id, supplierId: session.user.supplierId },
+      select: { id: true },
+    })
+    if (!owned) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  }
 
   const po = await db.purchaseOrder.findUnique({
     where: { id },

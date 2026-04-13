@@ -102,7 +102,7 @@ export async function connectXero(
   origin: string,
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
   try {
-    await requireAdmin()
+    const session = await requireAdmin()
 
     // Save credentials (never overwrite secret with masked value)
     const ops = [
@@ -113,9 +113,11 @@ export async function connectXero(
     }
     await db.$transaction(ops)
 
-    // Build Xero authorization URL — user's browser will redirect here
+    // Build Xero authorization URL — user's browser will redirect here.
+    // `state` is persisted server-side bound to the initiating user and
+    // validated in the callback (CSRF / mix-up protection).
     const redirectUri = `${origin}/api/xero/callback`
-    const authUrl = getAuthorizationUrl(clientId, redirectUri)
+    const authUrl = await getAuthorizationUrl(clientId, redirectUri, session.user.id)
 
     return { success: true, redirectUrl: authUrl }
   } catch (e) {

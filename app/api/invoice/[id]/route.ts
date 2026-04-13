@@ -2,6 +2,7 @@ import { readFile } from 'fs/promises'
 import { join } from 'path'
 import { NextResponse } from 'next/server'
 import { auth } from '@/lib/auth'
+import { hasPermission } from '@/lib/permissions'
 import { db } from '@/lib/db'
 import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, groupVatBreakdown, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
 import { formatMoney } from '@/lib/utils'
@@ -9,6 +10,7 @@ import { formatMoney } from '@/lib/utils'
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const session = await auth()
   if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  if (!hasPermission(session.user.role, 'sales')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
   const { id } = await params
   const so = await db.salesOrder.findUnique({

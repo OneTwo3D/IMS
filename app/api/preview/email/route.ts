@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { auth } from '@/lib/auth'
+import { hasPermission } from '@/lib/permissions'
 import { getBranding } from '@/lib/pdf'
 import { renderEmailHtml, getSampleEmailData, type EmailTemplateType } from '@/lib/email-template'
 
@@ -8,6 +9,7 @@ const VALID_TYPES: EmailTemplateType[] = ['invoice', 'sales_order', 'purchase_or
 export async function GET(req: NextRequest) {
   const session = await auth()
   if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  if (!hasPermission(session.user.role, 'settings')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
   const type = req.nextUrl.searchParams.get('type') as EmailTemplateType | null
   if (!type || !VALID_TYPES.includes(type)) return NextResponse.json({ error: 'Invalid type' }, { status: 400 })
