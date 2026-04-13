@@ -670,7 +670,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
       <div className="rounded-md border p-4 space-y-4">
         <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">PO Details</h2>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 *:min-w-0">
           <div className="space-y-1.5">
             <Label htmlFor="supplier">Supplier *</Label>
             {!showNewSupplier ? (
@@ -679,15 +679,15 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                   id="supplier"
                   value={supplierId}
                   onChange={(e) => handleSupplierChange(e.target.value)}
-                  className="flex-1 h-9 rounded-md border border-input bg-background px-3 text-sm"
+                  className="flex-1 min-w-0 h-9 rounded-md border border-input bg-background px-3 text-sm"
                 >
                   <option value="">Select supplier…</option>
                   {allSuppliers.map((s) => (
                     <option key={s.id} value={s.id}>{s.name}</option>
                   ))}
                 </select>
-                <Button type="button" variant="outline" size="sm" className="h-9 shrink-0" onClick={() => setShowNewSupplier(true)}>
-                  <Plus className="h-3 w-3 mr-1" />New
+                <Button type="button" variant="outline" size="icon" className="h-9 w-9 shrink-0" onClick={() => setShowNewSupplier(true)} title="New supplier">
+                  <Plus className="h-4 w-4" />
                 </Button>
               </div>
             ) : (
@@ -813,7 +813,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
           </div>
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 *:min-w-0">
           <div className="space-y-1.5">
             <Label htmlFor="notes">Notes (visible to supplier)</Label>
             <Textarea id="notes" value={notes} onChange={(e) => setNotes(e.target.value)} rows={2} className="text-sm resize-none" />

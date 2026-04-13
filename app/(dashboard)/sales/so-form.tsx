@@ -534,23 +534,23 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
           {/* Customer + Order details */}
           <div className="rounded-md border p-4 space-y-4">
             <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">Order Details</h2>
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 *:min-w-0">
               {/* Customer */}
               <div className="space-y-1.5">
                 <Label>Customer *</Label>
                 {!showNewCustomer ? (
                   <div className="flex gap-1.5">
-                    <select value={customerId} onChange={(e) => handleCustomerChange(e.target.value)} className="flex-1 h-9 rounded-md border border-input bg-background px-3 text-sm">
+                    <select value={customerId} onChange={(e) => handleCustomerChange(e.target.value)} className="flex-1 min-w-0 h-9 rounded-md border border-input bg-background px-3 text-sm">
                       <option value="">Select customer…</option>
                       {allCustomers.map((c) => (<option key={c.id} value={c.id}>{c.fullName}{c.company ? ` (${c.company})` : ''}</option>))}
                     </select>
-                    <Button type="button" variant="outline" size="sm" className="h-9 shrink-0" onClick={() => setShowNewCustomer(true)}>
-                      <Plus className="h-3 w-3 mr-1" />New
+                    <Button type="button" variant="outline" size="icon" className="h-9 w-9 shrink-0" onClick={() => setShowNewCustomer(true)} title="New customer">
+                      <Plus className="h-4 w-4" />
                     </Button>
                   </div>
                 ) : (
                   <div className="flex gap-1.5">
-                    <Input placeholder="Customer name" value={newCustName} onChange={(e) => setNewCustName(e.target.value)} className="flex-1 h-9 text-sm" autoFocus
+                    <Input placeholder="Customer name" value={newCustName} onChange={(e) => setNewCustName(e.target.value)} className="flex-1 min-w-0 h-9 text-sm" autoFocus
                       onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); handleCreateCustomer() } }} />
                     <Button type="button" size="sm" className="h-9" onClick={handleCreateCustomer} disabled={creatingCust || !newCustName.trim()}>
                       {creatingCust ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Add'}
@@ -560,13 +560,15 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                 )}
               </div>
               <div className="space-y-1.5">
-                <Label>Currency / FX Rate</Label>
+                <Label>Currency{currency !== 'GBP' ? ' / FX Rate' : ''}</Label>
                 <div className="flex gap-2">
-                  <select value={currency} onChange={(e) => setCurrencyAndRate(e.target.value)} className="w-28 h-9 rounded-md border border-input bg-background px-3 text-sm font-mono">
+                  <select value={currency} onChange={(e) => setCurrencyAndRate(e.target.value)} className={`${currency === 'GBP' ? 'w-full' : 'w-28'} h-9 rounded-md border border-input bg-background px-3 text-sm font-mono`}>
                     <option value="GBP">GBP £</option>
                     {currencies.filter((c) => c.code !== 'GBP').map((c) => (<option key={c.code} value={c.code}>{c.code} {c.symbol}</option>))}
                   </select>
-                  <Input type="number" min="0.0001" step="0.0001" value={fxRate} onChange={(e) => setFxRate(Number(e.target.value) || 1)} className="flex-1 h-9 font-mono text-sm" disabled={currency === 'GBP'} />
+                  {currency !== 'GBP' && (
+                    <Input type="number" min="0.0001" step="0.0001" value={fxRate} onChange={(e) => setFxRate(Number(e.target.value) || 1)} className="flex-1 min-w-0 h-9 font-mono text-sm" />
+                  )}
                 </div>
               </div>
               <div className="space-y-1.5">
