@@ -288,7 +288,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           invoiceNumber: `${wcInvPrefix}${wcOrder.number}`,
           contactName: customerName,
           contactEmail: wcOrder.billing.email || undefined,
-          date: new Date().toISOString().slice(0, 10),
+          date: new Date(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),
           currency,
           reference: orderNumber,
           lines: lineData.map((l, idx) => ({

@@ -544,11 +544,19 @@ export async function confirmAllocations(orderId: string): Promise<{ success: bo
       committedByLine.set(sl.lineId, (committedByLine.get(sl.lineId) ?? 0) + Number(sl.qty))
     }
 
-    // Filter allocations: subtract already-committed qty, discard fully covered lines
+    // Subtract already-committed qty per line, draining across allocation rows
+    // in order so that split allocations (e.g. [6,4] with 3 committed) become
+    // [3,4] rather than the incorrect [3,1] that per-row subtraction produces.
+    const remainingByLine = new Map<string, number>()
+    for (const [lineId, committed] of committedByLine) {
+      remainingByLine.set(lineId, committed)
+    }
     const effectiveAllocs = allocs.map((a) => {
-      const committed = committedByLine.get(a.lineId) ?? 0
-      const effectiveQty = Math.max(0, Number(a.qty) - committed)
-      return { ...a, qty: effectiveQty }
+      const remaining = remainingByLine.get(a.lineId) ?? 0
+      const allocQty = Number(a.qty)
+      const drain = Math.min(remaining, allocQty)
+      remainingByLine.set(a.lineId, remaining - drain)
+      return { ...a, qty: allocQty - drain }
     }).filter((a) => a.qty > 0)
 
     if (!effectiveAllocs.length) {
