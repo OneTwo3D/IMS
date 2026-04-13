@@ -591,7 +591,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
               <div className="space-y-1.5">
                 <Label>VAT Rate</Label>
                 <div className="flex items-center gap-3">
-                  <select value={taxRateId} onChange={(e) => handleTaxRateChange(e.target.value)} className="flex-1 h-9 rounded-md border border-input bg-background px-3 text-sm">
+                  <select value={taxRateId} onChange={(e) => handleTaxRateChange(e.target.value)} className="flex-1 min-w-0 h-9 rounded-md border border-input bg-background px-3 text-sm">
                     <option value="">No VAT</option>
                     {taxRates.filter((t) => t.usedFor === 'SALES' || t.usedFor === 'BOTH').map((t) => (
                       <option key={t.id} value={t.id}>{t.name} ({(t.rate * 100).toFixed(0)}%)</option>

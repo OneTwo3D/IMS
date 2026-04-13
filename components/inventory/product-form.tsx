@@ -350,7 +350,7 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
       {/* Dimensions + Weight */}
       <div className="space-y-1.5">
         <Label className="text-sm font-medium">Dimensions &amp; Weight</Label>
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+        <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 *:min-w-0">
           <div className="space-y-1">
             <Label htmlFor="widthCm" className="text-xs text-muted-foreground">Width (cm)</Label>
             <Input id="widthCm" name="widthCm" type="number" step="0.01" min="0"
