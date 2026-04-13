@@ -175,10 +175,9 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
                   const Icon = TYPE_ICON[n.type] || Info
                   const color = TYPE_COLOR[n.type] || 'text-muted-foreground'
                   return (
-                    <button
+                    <DropdownMenuItem
                       key={n.id}
-                      type="button"
-                      className={`flex w-full gap-2.5 px-3 py-2.5 text-left hover:bg-accent transition-colors ${!n.read ? 'bg-accent/40' : ''} ${n.actionUrl ? 'cursor-pointer' : 'cursor-default'}`}
+                      className={`flex items-start gap-2.5 px-3 py-2.5 ${!n.read ? 'bg-accent/40' : ''}`}
                       onClick={() => handleNotificationClick(n)}
                     >
                       <Icon className={`h-4 w-4 mt-0.5 shrink-0 ${color}`} />
@@ -188,7 +187,7 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
                         <p className="text-[10px] text-muted-foreground mt-1">{timeAgo(n.createdAt)}</p>
                       </div>
                       {!n.read && <span className="mt-1.5 h-2 w-2 shrink-0 rounded-full bg-primary" />}
-                    </button>
+                    </DropdownMenuItem>
                   )
                 })
               )}

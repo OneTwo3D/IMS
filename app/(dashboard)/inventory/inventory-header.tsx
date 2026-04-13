@@ -2,7 +2,7 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { Plus, Download, Upload } from 'lucide-react'
+import { Plus, Download } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { buttonVariants } from '@/components/ui/button-variants'
 import { CsvImportButton } from '@/components/inventory/csv-import-button'
@@ -70,7 +70,7 @@ export function InventoryHeader({ total, variableProducts, stockUnitOptions }: P
             href="/api/export/products"
             className={buttonVariants({ variant: 'outline', size: 'sm', className: 'w-full' })}
           >
-            <Upload className="h-4 w-4 mr-1" />Export CSV
+            <Download className="h-4 w-4 mr-1" />Export CSV
           </a>
         </div>
       </div>

@@ -1,11 +1,17 @@
 'use client'
 
 import { useRouter, usePathname } from 'next/navigation'
-import { useTransition, useCallback, useState, useEffect, useRef } from 'react'
+import { useTransition, useCallback, useState, useEffect } from 'react'
 import { Search, Settings2 } from 'lucide-react'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Button } from '@/components/ui/button'
+import {
+  DropdownMenu,
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 import { ALL_COLUMNS, STORAGE_KEY, COLS_CHANGED_EVENT, defaultVisibility } from '@/components/inventory/product-columns'
 import type { ColKey } from '@/components/inventory/product-columns'
 
@@ -18,7 +24,7 @@ type Props = {
 export function ProductFilters({ search, type, active }: Props) {
   const router = useRouter()
   const pathname = usePathname()
-  const [, startTransition] = useTransition()
+  const [isPending, startTransition] = useTransition()
 
   // Column picker state (lazy init from localStorage)
   const [visible, setVisible] = useState<Record<ColKey, boolean>>(() => {
@@ -29,18 +35,7 @@ export function ProductFilters({ search, type, active }: Props) {
     } catch { /* ignore */ }
     return defaultVisibility
   })
-  const [pickerOpen, setPickerOpen] = useState(false)
-  const pickerRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
-    function handler(e: MouseEvent) {
-      if (pickerRef.current && !pickerRef.current.contains(e.target as Node)) {
-        setPickerOpen(false)
-      }
-    }
-    if (pickerOpen) document.addEventListener('mousedown', handler)
-    return () => document.removeEventListener('mousedown', handler)
-  }, [pickerOpen])
+  const [searchValue, setSearchValue] = useState(() => search ?? '')
 
   function toggleCol(key: ColKey, value: boolean) {
     const next = { ...visible, [key]: value }
@@ -66,6 +61,18 @@ export function ProductFilters({ search, type, active }: Props) {
     [router, pathname, search, type, active]
   )
 
+  useEffect(() => {
+    const nextSearch = searchValue.trim()
+    const currentSearch = search ?? ''
+    if (nextSearch === currentSearch) return
+
+    const timer = window.setTimeout(() => {
+      update('search', nextSearch)
+    }, 300)
+
+    return () => window.clearTimeout(timer)
+  }, [searchValue, search, update])
+
   return (
     <div className="flex flex-wrap gap-3 items-end">
       <div className="relative flex-1 min-w-0 sm:min-w-[200px] max-w-sm">
@@ -75,16 +82,13 @@ export function ProductFilters({ search, type, active }: Props) {
           id="inventory-search"
           className="pl-8"
           placeholder="Search SKU, name, barcode…"
-          defaultValue={search}
-          onChange={(e) => {
-            const val = e.target.value
-            clearTimeout((window as { _searchTimer?: ReturnType<typeof setTimeout> })._searchTimer)
-            ;(window as { _searchTimer?: ReturnType<typeof setTimeout> })._searchTimer = setTimeout(
-              () => update('search', val),
-              300
-            )
-          }}
+          value={searchValue}
+          onChange={(e) => setSearchValue(e.target.value)}
+          aria-describedby="inventory-search-status"
         />
+        <span id="inventory-search-status" className="sr-only" aria-live="polite">
+          {isPending ? 'Updating product filters' : 'Product filters up to date'}
+        </span>
       </div>
       <div className="w-full sm:w-44">
         <label htmlFor="inventory-type" className="sr-only">Filter by product type</label>
@@ -117,35 +121,34 @@ export function ProductFilters({ search, type, active }: Props) {
         </Select>
       </div>
 
-      <div className="relative" ref={pickerRef}>
-        <Button
-          variant="outline"
-          size="sm"
-          className="h-8"
-          onClick={() => setPickerOpen((o) => !o)}
-          title="Column settings"
-          aria-label="Column settings"
-          aria-haspopup="dialog"
-          aria-expanded={pickerOpen}
-        >
-          <Settings2 className="h-4 w-4" />
-          <span className="sm:hidden">Columns</span>
-        </Button>
-        {pickerOpen && (
-          <div className="absolute right-0 top-full mt-1 z-50 w-[calc(100vw-2rem)] sm:w-52 rounded-md border border-border bg-popover shadow-md p-2 space-y-1">
+      <div className="hidden sm:block">
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            render={
+              <Button
+                variant="outline"
+                size="sm"
+                className="h-8"
+                aria-label="Column settings"
+              />
+            }
+          >
+            <Settings2 className="h-4 w-4" />
+            Columns
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="w-56">
             {ALL_COLUMNS.map((c) => (
-              <label key={c.key} className="flex items-center gap-2 px-1 py-0.5 text-sm cursor-pointer hover:bg-accent rounded">
-                <input
-                  type="checkbox"
-                  checked={!!visible[c.key]}
-                  onChange={(e) => toggleCol(c.key, e.target.checked)}
-                  className="h-3.5 w-3.5 accent-primary"
-                />
+              <DropdownMenuCheckboxItem
+                key={c.key}
+                checked={!!visible[c.key]}
+                closeOnClick={false}
+                onCheckedChange={(checked) => toggleCol(c.key, Boolean(checked))}
+              >
                 {c.label}
-              </label>
+              </DropdownMenuCheckboxItem>
             ))}
-          </div>
-        )}
+          </DropdownMenuContent>
+        </DropdownMenu>
       </div>
     </div>
   )
