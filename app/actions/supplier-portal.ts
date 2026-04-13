@@ -149,7 +149,7 @@ export async function getSupplierRfqDetail(poId: string): Promise<{
       _count: { select: { lines: true } },
       lines: {
         select: {
-          id: true, qty: true,
+          id: true, qty: true, productId: true,
           product: { select: { sku: true, name: true } },
         },
         orderBy: { sortOrder: 'asc' },
@@ -164,12 +164,6 @@ export async function getSupplierRfqDetail(poId: string): Promise<{
     select: { productId: true, supplierSku: true },
   })
   const spMap = new Map(supplierProducts.map((sp) => [sp.productId, sp.supplierSku]))
-
-  // Look up product IDs from lines
-  const lineProductIds = po.lines.map((l) => {
-    // We need productId but it's not in our select — let me get it
-    return l.id
-  })
 
   return {
     po: {
@@ -187,7 +181,7 @@ export async function getSupplierRfqDetail(poId: string): Promise<{
       productSku: l.product.sku,
       productName: l.product.name,
       qty: Number(l.qty),
-      supplierSku: null, // will be resolved below
+      supplierSku: spMap.get(l.productId) ?? null,
     })),
   }
 }
@@ -229,6 +223,7 @@ export async function submitSupplierQuote(
     // Update each line with supplier's quoted price and quantity
     for (const line of data.lines) {
       if (line.unitPrice < 0) continue
+      if (!line.qty || line.qty <= 0) continue
       // Verify line belongs to this PO (prevent cross-PO manipulation)
       const poLine = await db.purchaseOrderLine.findFirst({ where: { id: line.lineId, poId } })
       if (!poLine) continue

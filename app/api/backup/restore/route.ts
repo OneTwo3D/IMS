@@ -33,8 +33,8 @@ export async function POST(req: NextRequest) {
 
   if (file) {
     // Uploaded file
-    if (!file.name.endsWith('.sql') && !file.name.endsWith('.dump')) {
-      return NextResponse.json({ error: 'Invalid file type. Use .sql or .dump files.' }, { status: 400 })
+    if (!file.name.endsWith('.sql')) {
+      return NextResponse.json({ error: 'Invalid file type. Only plain SQL (.sql) backups are supported. PostgreSQL custom-format .dump files require pg_restore and are not supported.' }, { status: 400 })
     }
     await mkdir(BACKUP_DIR, { recursive: true })
     restorePath = path.join(BACKUP_DIR, `restore-upload-${Date.now()}.sql`)

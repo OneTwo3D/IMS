@@ -117,7 +117,6 @@ function StockFlowDialog({ productId, onClose }: { productId: string; onClose: (
   const [page, setPage] = useState(0)
 
   const filtered = useMemo(() => {
-    setPage(0)
     return rows.filter((r) => {
       if (!activeTypes.has(r.type)) return false
       if (dateFrom && r.createdAt < dateFrom) return false
@@ -125,6 +124,9 @@ function StockFlowDialog({ productId, onClose }: { productId: string; onClose: (
       return true
     })
   }, [rows, activeTypes, dateFrom, dateTo])
+
+  // Reset to page 0 when filters change (outside render, in an effect)
+  useEffect(() => { setPage(0) }, [activeTypes, dateFrom, dateTo])
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
   const paged = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)

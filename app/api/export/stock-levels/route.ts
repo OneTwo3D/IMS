@@ -2,12 +2,14 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { toCsv, csvResponse } from '@/lib/csv'
 import { auth } from '@/lib/auth'
+import { hasPermission } from '@/lib/permissions'
 
 const HEADERS = ['sku', 'productName', 'type', 'stockUnit', 'warehouse', 'quantity', 'reserved', 'available']
 
 export async function GET(req: NextRequest) {
   const session = await auth()
   if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  if (!hasPermission(session.user.role, 'inventory')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
   const warehouseIds = req.nextUrl.searchParams.get('warehouses')?.split(',').filter(Boolean)
   const excludeBundles = req.nextUrl.searchParams.get('excludeBundles') === '1'

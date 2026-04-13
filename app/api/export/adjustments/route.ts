@@ -1,6 +1,7 @@
 import { db } from '@/lib/db'
 import { toCsv, csvResponse } from '@/lib/csv'
 import { auth } from '@/lib/auth'
+import { hasPermission } from '@/lib/permissions'
 
 const HEADERS = ['date', 'sku', 'productName', 'warehouse', 'qty', 'direction', 'note']
 const TEMPLATE_HEADERS = ['sku', 'warehouseCode', 'qty', 'note']
@@ -8,6 +9,7 @@ const TEMPLATE_HEADERS = ['sku', 'warehouseCode', 'qty', 'note']
 export async function GET(req: Request) {
   const session = await auth()
   if (!session?.user) return new Response('Unauthorized', { status: 401 })
+  if (!hasPermission(session.user.role, 'stock_control')) return new Response('Forbidden', { status: 403 })
 
   const url = new URL(req.url)
   const templateOnly = url.searchParams.get('template') === '1'

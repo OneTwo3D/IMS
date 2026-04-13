@@ -5,10 +5,12 @@ import { getStockOnHand, getStockMovements, getStockAllocations, getReorderInven
 import { generateForecasts } from '@/app/actions/forecasting'
 import { toCsv, csvResponse } from '@/lib/csv'
 import { auth } from '@/lib/auth'
+import { hasPermission } from '@/lib/permissions'
 
 export async function GET(req: NextRequest) {
   const session = await auth()
   if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  if (!hasPermission(session.user.role, 'analytics')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
   const type = req.nextUrl.searchParams.get('type') ?? 'products'
   const dateFrom = req.nextUrl.searchParams.get('from') ?? undefined

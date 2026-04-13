@@ -2,12 +2,14 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { toCsv, csvResponse } from '@/lib/csv'
 import { auth } from '@/lib/auth'
+import { hasPermission } from '@/lib/permissions'
 
 const HEADERS = ['firstName', 'lastName', 'email', 'phone', 'company', 'taxNumber', 'billing_line1', 'billing_line2', 'billing_city', 'billing_county', 'billing_postcode', 'billing_country', 'shipping_line1', 'shipping_line2', 'shipping_city', 'shipping_county', 'shipping_postcode', 'shipping_country', 'notes']
 
 export async function GET(req: NextRequest) {
   const session = await auth()
   if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  if (!hasPermission(session.user.role, 'sales')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
   const template = req.nextUrl.searchParams.get('template')
 
