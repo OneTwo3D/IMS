@@ -4,6 +4,10 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
+import {
+  WC_SYNC_ADVISORY_LOCK_KEY,
+  WC_SETTINGS_VERSION_KEY,
+} from '@/lib/connectors/woocommerce/sync-lock'
 
 // All mutating exports in this file require the `sync` permission.
 async function requireAdmin() {
@@ -82,20 +86,173 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
 // WC connection credentials
 // ---------------------------------------------------------------------------
 
-export async function saveWcCredentials(url: string, key: string, secret: string): Promise<{ success: boolean }> {
+/**
+ * Save WooCommerce credentials.
+ *
+ * Cache-integrity contract: `Product.wcProductId` is an id against one
+ * specific WooCommerce installation. Changing the store URL or the
+ * consumer key means cached mappings may now point at unrelated
+ * products on a different catalog. Rather than trying to detect
+ * store identity from inside the sync path (which historically
+ * collapsed into false "same store" decisions or flushed on routine
+ * catalog edits), invalidation is enforced HERE, atomically with the
+ * credentials write: if the effective url/key/secret changes, we
+ * null every `wcProductId` in the same transaction that writes the
+ * new values. The next sync re-resolves via SKU lookup against the
+ * new store.
+ *
+ * Concurrency contract with in-flight stock syncs: a rebind must not
+ * race a concurrently running `pushStockToWc`. The whole write
+ * (credentials + cache wipe + version bump) runs inside a transaction
+ * that first takes `pg_advisory_xact_lock(WC_SYNC_ADVISORY_LOCK_KEY)`.
+ * `pushStockToWc` takes the same advisory lock when it snapshots its
+ * credentials at start-of-run and again for every wcProductId write.
+ * Whichever side commits first wins cleanly: a persist that races us
+ * and loses the lock will, on the far side, observe the new
+ * `wc_settings_version` and abort its write before any old-store id
+ * can land on top of the wiped cache.
+ *
+ * Manual DB edits to these settings outside this action are explicitly
+ * out of scope — operators that rewrite the settings table directly
+ * must also call `resetWcProductIdCache()` (or click the "Reset cached
+ * product IDs" button) to flush the cache.
+ */
+export async function saveWcCredentials(url: string, key: string, secret: string): Promise<{ success: boolean; wipedMappings: number }> {
   await requireAdmin()
-  const ops = [
-    db.setting.upsert({ where: { key: 'wc_url' }, create: { key: 'wc_url', value: url }, update: { value: url } }),
-    db.setting.upsert({ where: { key: 'wc_consumer_key' }, create: { key: 'wc_consumer_key', value: key }, update: { value: key } }),
-  ]
-  // Only update secret if it's not the masked value (contains no asterisks)
-  if (secret && !secret.includes('*')) {
-    ops.push(db.setting.upsert({ where: { key: 'wc_consumer_secret' }, create: { key: 'wc_consumer_secret', value: secret }, update: { value: secret } }))
-  }
-  await db.$transaction(ops)
-  await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated WooCommerce connection credentials' })
+
+  const incomingSecretIsMasked = !!secret && secret.includes('*')
+
+  const saveOutcome = await db.$transaction(async (tx) => {
+    // Serialize against in-flight stock syncs. See the concurrency
+    // contract in this function's doc comment.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
+
+    // Read the current values UNDER the advisory lock so the rebind
+    // decision and the write are based on the same serialized view.
+    const existing = await tx.setting.findMany({
+      where: { key: { in: ['wc_url', 'wc_consumer_key', 'wc_consumer_secret'] } },
+    })
+    const existingMap = new Map(existing.map((s) => [s.key, s.value]))
+    const prevUrl = existingMap.get('wc_url') ?? ''
+    const prevKey = existingMap.get('wc_consumer_key') ?? ''
+    const prevSecret = existingMap.get('wc_consumer_secret') ?? ''
+    const effectiveSecret = incomingSecretIsMasked ? prevSecret : secret
+
+    // "Rebind" = any of the three effective values actually differs from
+    // what's already stored. A no-op save (operator opened the form and
+    // clicked Save without touching fields) leaves everything equal and
+    // does NOT wipe the cache. The masked-secret passthrough is handled
+    // above so a re-save with the masked placeholder is NOT seen as a
+    // secret change.
+    const isRebind =
+      url !== prevUrl || key !== prevKey || effectiveSecret !== prevSecret
+
+    await tx.setting.upsert({
+      where: { key: 'wc_url' },
+      create: { key: 'wc_url', value: url },
+      update: { value: url },
+    })
+    await tx.setting.upsert({
+      where: { key: 'wc_consumer_key' },
+      create: { key: 'wc_consumer_key', value: key },
+      update: { value: key },
+    })
+    if (secret && !incomingSecretIsMasked) {
+      await tx.setting.upsert({
+        where: { key: 'wc_consumer_secret' },
+        create: { key: 'wc_consumer_secret', value: secret },
+        update: { value: secret },
+      })
+    }
+
+    if (!isRebind) {
+      return { isRebind, wipedMappings: 0 }
+    }
+
+    // Bump the settings version. Any stock sync that snapshotted the
+    // old value will observe this bump on its next persist attempt
+    // (also advisory-lock-guarded) and abort instead of writing.
+    const currentVersion = await tx.setting.findUnique({
+      where: { key: WC_SETTINGS_VERSION_KEY },
+    })
+    const nextVersion = String(
+      (Number.parseInt(currentVersion?.value ?? '0', 10) || 0) + 1,
+    )
+    await tx.setting.upsert({
+      where: { key: WC_SETTINGS_VERSION_KEY },
+      create: { key: WC_SETTINGS_VERSION_KEY, value: nextVersion },
+      update: { value: nextVersion },
+    })
+
+    // Wipe the cache in the same transaction. A crash between the
+    // credentials write and the wipe would otherwise leave the cache
+    // pointing at an ambiguous store.
+    const wiped = await tx.product.updateMany({
+      where: { wcProductId: { not: null } },
+      data: { wcProductId: null },
+    })
+    return { isRebind, wipedMappings: wiped.count }
+  })
+
+  await logActivity({
+    entityType: 'SETTING',
+    tag: 'settings',
+    action: 'updated',
+    description: saveOutcome.isRebind
+      ? `Updated WooCommerce connection credentials — cleared ${saveOutcome.wipedMappings} cached wcProductId mapping(s)`
+      : 'Updated WooCommerce connection credentials (no change detected, cache preserved)',
+    metadata: { isRebind: saveOutcome.isRebind, wipedMappings: saveOutcome.wipedMappings },
+  })
   revalidatePath('/sync')
-  return { success: true }
+  return { success: true, wipedMappings: saveOutcome.wipedMappings }
+}
+
+/**
+ * Operator-invoked nuclear reset of the `wcProductId` cache.
+ *
+ * Intended for recovery after out-of-band settings edits (manual DB
+ * writes, fixture loads, backup restores) that `saveWcCredentials`
+ * never saw and therefore could not auto-wipe. Also serves as a
+ * panic button if an operator suspects the cache is corrupted for
+ * any other reason.
+ *
+ * Nullifies every non-null `Product.wcProductId` in one update,
+ * writes an activity log entry, and revalidates `/sync` so the UI
+ * reflects the reset.
+ */
+export async function resetWcProductIdCache(): Promise<{ success: boolean; wipedMappings: number }> {
+  await requireAdmin()
+  // Serialize with in-flight stock syncs and bump the version so any
+  // snapshotted run aborts on its next persist attempt — same contract
+  // as `saveWcCredentials`, minus the credentials writes themselves.
+  const wipedCount = await db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
+    const currentVersion = await tx.setting.findUnique({
+      where: { key: WC_SETTINGS_VERSION_KEY },
+    })
+    const nextVersion = String(
+      (Number.parseInt(currentVersion?.value ?? '0', 10) || 0) + 1,
+    )
+    await tx.setting.upsert({
+      where: { key: WC_SETTINGS_VERSION_KEY },
+      create: { key: WC_SETTINGS_VERSION_KEY, value: nextVersion },
+      update: { value: nextVersion },
+    })
+    const cleared = await tx.product.updateMany({
+      where: { wcProductId: { not: null } },
+      data: { wcProductId: null },
+    })
+    return cleared.count
+  })
+  await logActivity({
+    entityType: 'SETTING',
+    tag: 'settings',
+    action: 'updated',
+    description: `Operator reset — cleared ${wipedCount} cached wcProductId mapping(s)`,
+    metadata: { wipedMappings: wipedCount },
+  })
+  revalidatePath('/sync')
+  return { success: true, wipedMappings: wipedCount }
 }
 
 export async function getWcCredentials(): Promise<{ url: string; key: string; secret: string; secretMasked: boolean }> {

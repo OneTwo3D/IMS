@@ -470,6 +470,11 @@ model Product {
   // Media
   imageUrl        String?     // primary image URL (can be imported from WooCommerce)
 
+  // WooCommerce mapping — resolved once via SKU lookup then persisted for O(1) sync.
+  // BigInt because WooCommerce/WordPress object IDs are unbounded by the
+  // signed-32-bit range; a long-lived store can easily cross 2^31.
+  wcProductId     BigInt?     @unique
+
   // Pricing (GBP)
   salesPriceGbp   Decimal?    @db.Decimal(12, 4)   // regular / list price
   salePriceGbp    Decimal?    @db.Decimal(12, 4)   // sale / discounted price

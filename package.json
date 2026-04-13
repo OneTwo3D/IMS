@@ -13,6 +13,9 @@
     "db:studio": "prisma studio",
     "cli": "tsx scripts/cli.ts",
     "e2e": "playwright test",
+    "e2e:external": "playwright test --grep @external",
+    "e2e:wc": "playwright test --grep @wc",
+    "e2e:xero": "playwright test --grep @xero",
     "e2e:headed": "playwright test --headed",
     "e2e:ui": "playwright test --ui"
   },
