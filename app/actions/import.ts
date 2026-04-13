@@ -429,7 +429,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<ImportRe
       const ref = `SO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
       const so = await db.salesOrder.create({
         data: {
-          wcOrderNumber: ref, status: 'DRAFT', currency: g.currency, fxRateToGbp: 1,
+          orderNumber: ref, status: 'DRAFT', currency: g.currency, fxRateToGbp: 1,
           customerName: g.customerName, subtotalForeign, shippingForeign: 0, taxForeign: 0,
           totalForeign: subtotalForeign, subtotalGbp: subtotalForeign, shippingGbp: 0, taxGbp: 0, totalGbp: subtotalForeign,
           notes: g.notes || null,

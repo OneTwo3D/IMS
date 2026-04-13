@@ -130,6 +130,8 @@ export async function autoAllocateOrder(orderId: string): Promise<{ success: boo
       where: { id: orderId },
       select: {
         id: true,
+        orderNumber: true,
+        wcOrderId: true,
         wcOrderNumber: true,
         status: true,
         shipFromWarehouseId: true,
@@ -140,7 +142,9 @@ export async function autoAllocateOrder(orderId: string): Promise<{ success: boo
 
     // Get eligible warehouses: the selected warehouse first, then others available for sale.
     // For WC orders, restrict to WC-synced warehouses to ship from the right locations.
-    const isWcOrder = !!so.wcOrderNumber
+    // Use wcOrderId (not wcOrderNumber) — manual orders may have orderNumber but no WC provenance.
+    const isWcOrder = so.wcOrderId != null
+    const orderRef = so.orderNumber ?? so.wcOrderNumber ?? so.id.slice(0, 8)
     const allWarehouses = await db.warehouse.findMany({
       where: {
         active: true,
@@ -332,9 +336,9 @@ export async function autoAllocateOrder(orderId: string): Promise<{ success: boo
       tag: 'sales',
       level: allocations.length > 0 ? 'INFO' : 'WARNING',
       description: allocations.length > 0
-        ? `Auto-allocated stock for order ${so.wcOrderNumber} — ${allocations.length} allocation(s)`
-        : `No stock available to allocate for order ${so.wcOrderNumber}`,
-      metadata: { orderNumber: so.wcOrderNumber, allocations: allocations.length },
+        ? `Auto-allocated stock for order ${orderRef} — ${allocations.length} allocation(s)`
+        : `No stock available to allocate for order ${orderRef}`,
+      metadata: { orderNumber: orderRef, isWcOrder, shipFromWarehouseId: so.shipFromWarehouseId, allocations: allocations.length },
     })
     if (allocations.length === 0) {
       return { success: false, error: 'No stock available for allocation' }
@@ -358,7 +362,7 @@ export async function updateAllocation(
     await requirePermission('sales.process')
     const alloc = await db.orderAllocation.findUnique({
       where: { id: allocationId },
-      include: { line: { select: { qty: true } }, order: { select: { wcOrderNumber: true } } },
+      include: { line: { select: { qty: true } }, order: { select: { orderNumber: true, wcOrderNumber: true } } },
     })
     if (!alloc) return { success: false, error: 'Allocation not found' }
     if (newQty < 0) return { success: false, error: 'Quantity cannot be negative' }
@@ -407,7 +411,7 @@ export async function updateAllocation(
       action: 'allocation_updated',
       tag: 'sales',
       level: 'INFO',
-      description: `Updated allocation for order ${alloc.order.wcOrderNumber}`,
+      description: `Updated allocation for order ${alloc.order.orderNumber ?? alloc.order.wcOrderNumber}`,
       metadata: { allocationId, newWarehouseId, newQty },
     })
     return { success: true }
@@ -472,7 +476,7 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
     await requirePermission('sales.process')
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
-      select: { wcOrderNumber: true, status: true },
+      select: { orderNumber: true, wcOrderNumber: true, status: true },
     })
     if (!so) return { success: false, error: 'Order not found' }
 
@@ -512,8 +516,8 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
       action: 'deallocated',
       tag: 'sales',
       level: 'INFO',
-      description: `Deallocated stock for order ${so.wcOrderNumber}`,
-      metadata: { orderNumber: so.wcOrderNumber },
+      description: `Deallocated stock for order ${so.orderNumber ?? so.wcOrderNumber}`,
+      metadata: { orderNumber: so.orderNumber ?? so.wcOrderNumber },
     })
     return { success: true }
   } catch (e) {
@@ -530,7 +534,7 @@ export async function confirmAllocations(orderId: string): Promise<{ success: bo
     await requirePermission('sales.process')
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
-      select: { wcOrderNumber: true, status: true },
+      select: { orderNumber: true, wcOrderNumber: true, status: true },
     })
     if (!so) return { success: false, error: 'Order not found' }
 
@@ -617,8 +621,8 @@ export async function confirmAllocations(orderId: string): Promise<{ success: bo
       action: 'allocations_confirmed',
       tag: 'sales',
       level: 'INFO',
-      description: `Confirmed allocations for order ${so.wcOrderNumber} — ${byWarehouse.size} shipment(s) created`,
-      metadata: { orderNumber: so.wcOrderNumber, shipmentCount: byWarehouse.size },
+      description: `Confirmed allocations for order ${so.orderNumber ?? so.wcOrderNumber} — ${byWarehouse.size} shipment(s) created`,
+      metadata: { orderNumber: so.orderNumber ?? so.wcOrderNumber, shipmentCount: byWarehouse.size },
     })
     return { success: true }
   } catch (e) {
@@ -640,7 +644,7 @@ export async function updateShipmentStatus(
     const shipment = await db.shipment.findUnique({
       where: { id: shipmentId },
       include: {
-        order: { select: { id: true, wcOrderNumber: true, status: true } },
+        order: { select: { id: true, orderNumber: true, wcOrderNumber: true, status: true } },
         lines: { select: { lineId: true, productId: true, qty: true, product: { select: { sku: true } } } },
         warehouse: { select: { code: true } },
       },
@@ -695,8 +699,8 @@ export async function updateShipmentStatus(
           action: 'dispatched',
           tag: 'stock',
           level: 'INFO',
-          description: `Dispatched ${qty} units of SKU ${line.product.sku} from ${shipment.warehouse.code} for order ${shipment.order.wcOrderNumber}`,
-          metadata: { sku: line.product.sku, productId: line.productId, qty, orderNumber: shipment.order.wcOrderNumber, warehouseId: shipment.warehouseId },
+          description: `Dispatched ${qty} units of SKU ${line.product.sku} from ${shipment.warehouse.code} for order ${shipment.order.orderNumber ?? shipment.order.wcOrderNumber}`,
+          metadata: { sku: line.product.sku, productId: line.productId, qty, orderNumber: shipment.order.orderNumber ?? shipment.order.wcOrderNumber, warehouseId: shipment.warehouseId },
         })
       }
 
@@ -750,7 +754,7 @@ export async function updateShipmentStatus(
       action: 'shipment_status_changed',
       tag: 'sales',
       level: 'INFO',
-      description: `Shipment from ${shipment.warehouse.code} for order ${shipment.order.wcOrderNumber} → ${targetStatus}`,
+      description: `Shipment from ${shipment.warehouse.code} for order ${shipment.order.orderNumber ?? shipment.order.wcOrderNumber} → ${targetStatus}`,
       metadata: { shipmentId, warehouseCode: shipment.warehouse.code, previousStatus: shipment.status, newStatus: targetStatus },
     })
     return { success: true }
