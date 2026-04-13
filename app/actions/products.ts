@@ -617,7 +617,7 @@ export async function createProduct(
     },
   })
 
-  logActivity({
+  await logActivity({
     entityType: 'PRODUCT',
     entityId: null,
     action: 'created',
@@ -699,7 +699,7 @@ export async function updateProduct(
     },
   })
 
-  logActivity({
+  await logActivity({
     entityType: 'PRODUCT',
     entityId: id,
     action: 'updated',
@@ -923,7 +923,7 @@ export async function saveProductComponents(
         })),
       })
     }
-    logActivity({
+    await logActivity({
       entityType: 'PRODUCT',
       entityId: productId,
       action: 'updated',
@@ -937,7 +937,7 @@ export async function saveProductComponents(
     return { success: true }
   } catch (e: unknown) {
     const errorMsg = e instanceof Error ? e.message : 'Failed to save components'
-    logActivity({
+    await logActivity({
       entityType: 'PRODUCT',
       entityId: productId,
       action: 'updated',
@@ -1050,7 +1050,7 @@ export async function saveProductOptions(
       })),
     })
   }
-  logActivity({
+  await logActivity({
     entityType: 'PRODUCT',
     entityId: productId,
     action: 'updated',
@@ -1077,7 +1077,7 @@ export async function generateVariantsFromOptions(
   ])
 
   if (!product || product.type !== 'VARIABLE') {
-    logActivity({
+    await logActivity({
       entityType: 'PRODUCT',
       entityId: productId,
       action: 'created',
@@ -1089,7 +1089,7 @@ export async function generateVariantsFromOptions(
     return { created: 0, skipped: 0, error: 'Product not found or not VARIABLE type' }
   }
   if (options.length === 0) {
-    logActivity({
+    await logActivity({
       entityType: 'PRODUCT',
       entityId: productId,
       action: 'created',
@@ -1153,7 +1153,7 @@ export async function generateVariantsFromOptions(
     created++
   }
 
-  logActivity({
+  await logActivity({
     entityType: 'PRODUCT',
     entityId: productId,
     action: 'created',
@@ -1177,7 +1177,7 @@ export async function deleteOrDeactivateVariant(
     select: { type: true, parentId: true },
   })
   if (!product || product.type !== 'VARIANT') {
-    logActivity({
+    await logActivity({
       entityType: 'PRODUCT',
       entityId: id,
       action: 'deleted',
@@ -1208,7 +1208,7 @@ export async function deleteOrDeactivateVariant(
     await db.supplierProduct.deleteMany({ where: { productId: id } })
     await db.product.delete({ where: { id } })
 
-    logActivity({
+    await logActivity({
       entityType: 'PRODUCT',
       entityId: id,
       action: 'deleted',
@@ -1224,7 +1224,7 @@ export async function deleteOrDeactivateVariant(
   } else {
     await db.product.update({ where: { id }, data: { active: false } })
 
-    logActivity({
+    await logActivity({
       entityType: 'PRODUCT',
       entityId: id,
       action: 'deactivated',
@@ -1283,7 +1283,7 @@ export async function bulkDeleteProducts(
     deleted++
   }
 
-  logActivity({
+  await logActivity({
     entityType: 'PRODUCT',
     entityId: null,
     action: 'bulk_deleted',
@@ -1305,7 +1305,7 @@ export async function bulkDeactivateProducts(
     where: { id: { in: ids } },
     data: { active: false },
   })
-  logActivity({
+  await logActivity({
     entityType: 'PRODUCT',
     entityId: null,
     action: 'bulk_deactivated',

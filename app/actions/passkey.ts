@@ -106,7 +106,7 @@ export async function verifyPasskeyRegistration(
       },
     })
 
-    logActivity({ entityType: 'USER', tag: 'auth', action: 'passkey_registered', description: `Registered passkey: ${name || 'Passkey'}` })
+    await logActivity({ entityType: 'USER', tag: 'auth', action: 'passkey_registered', description: `Registered passkey: ${name || 'Passkey'}` })
     return { success: true }
   } catch (e) {
     console.error('Passkey registration error:', e)
@@ -227,7 +227,7 @@ export async function renamePasskey(id: string, name: string) {
     where: { id, userId: session.user.id },
     data: { name },
   })
-  logActivity({ entityType: 'USER', tag: 'auth', action: 'passkey_renamed', description: `Renamed passkey to: ${name}` })
+  await logActivity({ entityType: 'USER', tag: 'auth', action: 'passkey_renamed', description: `Renamed passkey to: ${name}` })
   return { success: true }
 }
 
@@ -238,6 +238,6 @@ export async function deletePasskey(id: string) {
   await db.passkey.deleteMany({
     where: { id, userId: session.user.id },
   })
-  logActivity({ entityType: 'USER', tag: 'auth', action: 'passkey_deleted', description: 'Deleted a passkey' })
+  await logActivity({ entityType: 'USER', tag: 'auth', action: 'passkey_deleted', description: 'Deleted a passkey' })
   return { success: true }
 }

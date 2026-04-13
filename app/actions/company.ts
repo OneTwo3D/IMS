@@ -53,12 +53,12 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
   await requirePermission('settings.company')
   try {
     await db.organisation.updateMany({ data })
-    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated company details' })
+    await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated company details' })
     revalidatePath('/settings')
     revalidatePath('/settings/company')
     return { success: true }
   } catch (e) {
-    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update company details: ${e}` })
+    await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update company details: ${e}` })
     return { success: false, error: 'Failed to update company details.' }
   }
 }
@@ -66,7 +66,7 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
 export async function updateLogoUrl(logoUrl: string | null): Promise<{ success: boolean }> {
   await requirePermission('settings.company')
   await db.organisation.updateMany({ data: { logoUrl } })
-  logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: logoUrl ? 'Updated company logo' : 'Removed company logo' })
+  await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: logoUrl ? 'Updated company logo' : 'Removed company logo' })
   revalidatePath('/settings')
   revalidatePath('/settings/company')
   return { success: true }
@@ -177,7 +177,7 @@ export async function saveNumberingFormats(data: NumberingFormats): Promise<{ su
     db.setting.upsert({ where: { key: w.key }, create: { key: w.key, value: w.value }, update: { value: w.value } }),
   )
   await db.$transaction(ops)
-  logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated document numbering formats' })
+  await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated document numbering formats' })
   revalidatePath('/settings/company')
   revalidatePath('/sync')
   return { success: true }
@@ -250,7 +250,7 @@ export async function saveEmailSettings(data: EmailSettings): Promise<{ success:
       }),
     )
   await db.$transaction(ops)
-  logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated email/SMTP settings' })
+  await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated email/SMTP settings' })
   revalidatePath('/settings/company')
   return { success: true }
 }
@@ -282,7 +282,7 @@ export async function saveBrandingColours(data: BrandingColours): Promise<{ succ
     db.setting.upsert({ where: { key: 'brand_primary_color' }, create: { key: 'brand_primary_color', value: data.primaryColor }, update: { value: data.primaryColor } }),
     db.setting.upsert({ where: { key: 'brand_accent_color' }, create: { key: 'brand_accent_color', value: data.accentColor }, update: { value: data.accentColor } }),
   ])
-  logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated branding colours' })
+  await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated branding colours' })
   revalidatePath('/settings/company')
   return { success: true }
 }
@@ -356,7 +356,7 @@ export async function saveDocumentTemplate(data: DocumentTemplateData): Promise<
       },
     })
     const label = data.type.replace(/_/g, ' ')
-    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: `Updated ${label} document template` })
+    await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: `Updated ${label} document template` })
     revalidatePath('/settings/company')
     return { success: true }
   } catch (e) {

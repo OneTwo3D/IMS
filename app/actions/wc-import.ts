@@ -72,12 +72,12 @@ export async function importHistoricalSalesCsv(
     result.status = 'done'
     result.message = `Created ${result.movementsCreated} demand records from CSV. Skipped ${result.skipped}.`
     revalidatePath('/analytics')
-    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.movementsCreated} historical sales from CSV` })
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.movementsCreated} historical sales from CSV` })
     return result
   } catch (e) {
     result.status = 'error'
     result.message = String(e)
-    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import historical sales from CSV: ${String(e)}` })
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import historical sales from CSV: ${String(e)}` })
     return result
   }
 }

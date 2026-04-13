@@ -321,7 +321,7 @@ export async function autoAllocateOrder(orderId: string): Promise<{ success: boo
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
       action: 'allocated',
@@ -392,7 +392,7 @@ export async function updateAllocation(
     }
 
     revalidatePath(`/sales/${alloc.orderId}`)
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: alloc.orderId,
       action: 'allocation_updated',
@@ -497,7 +497,7 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
       action: 'deallocated',
@@ -602,7 +602,7 @@ export async function confirmAllocations(orderId: string): Promise<{ success: bo
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
       action: 'allocations_confirmed',
@@ -680,7 +680,7 @@ export async function updateShipmentStatus(
             referenceId: shipment.orderId,
           },
         })
-        logActivity({
+        await logActivity({
           entityType: 'STOCK_ADJUSTMENT',
           entityId: line.productId,
           action: 'dispatched',
@@ -735,7 +735,7 @@ export async function updateShipmentStatus(
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${shipment.orderId}`)
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: shipment.orderId,
       action: 'shipment_status_changed',

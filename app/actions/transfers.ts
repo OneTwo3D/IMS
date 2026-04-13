@@ -186,7 +186,7 @@ export async function createTransfer(
     revalidatePath('/stock-control/transfers')
 
     const mapped = await mapRow(transfer)
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: transfer.id,
       action: 'created',
@@ -198,7 +198,7 @@ export async function createTransfer(
   } catch (e) {
     console.error(e)
 
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_TRANSFER',
       action: 'created',
       tag: 'stock',
@@ -258,7 +258,7 @@ export async function updateTransferDraft(
     const updated = await db.stockTransfer.findUniqueOrThrow({ where: { id }, select: TRANSFER_SELECT })
     revalidatePath('/stock-control/transfers')
 
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: id,
       action: 'updated',
@@ -270,7 +270,7 @@ export async function updateTransferDraft(
   } catch (e) {
     console.error(e)
 
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: id,
       action: 'updated',
@@ -346,14 +346,14 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
       where: { id },
       select: { reference: true, fromWarehouse: { select: { name: true } }, toWarehouse: { select: { name: true } }, lines: { select: { id: true } } },
     })
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: id,
       action: 'dispatched',
       tag: 'stock',
       description: `Dispatched transfer from ${dispatched?.fromWarehouse.name ?? id} to ${dispatched?.toWarehouse.name ?? id}`,
     })
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_ADJUSTMENT',
       entityId: id,
       action: 'transfer_out',
@@ -366,7 +366,7 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
     console.error(e)
     const msg = e instanceof Error ? e.message : 'Failed to dispatch transfer.'
 
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: id,
       action: 'dispatched',
@@ -433,14 +433,14 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
       where: { id },
       select: { reference: true, toWarehouse: { select: { name: true } }, lines: { select: { id: true } } },
     })
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: id,
       action: 'received',
       tag: 'stock',
       description: `Received transfer at ${received?.toWarehouse.name ?? id}`,
     })
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_ADJUSTMENT',
       entityId: id,
       action: 'transfer_in',
@@ -453,7 +453,7 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
     console.error(e)
     const msg = e instanceof Error ? e.message : 'Failed to receive transfer.'
 
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: id,
       action: 'received',
@@ -480,7 +480,7 @@ export async function cancelTransfer(id: string): Promise<TransferResult> {
     await db.stockTransfer.update({ where: { id }, data: { status: 'CANCELLED' } })
     revalidatePath('/stock-control/transfers')
 
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: id,
       action: 'cancelled',
@@ -492,7 +492,7 @@ export async function cancelTransfer(id: string): Promise<TransferResult> {
   } catch (e) {
     console.error(e)
 
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: id,
       action: 'cancelled',

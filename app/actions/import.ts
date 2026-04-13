@@ -209,9 +209,9 @@ export async function importProductsCsv(formData: FormData): Promise<ImportResul
 
   revalidatePath('/inventory')
   if (result.errors.length > 0 && result.created === 0 && result.updated === 0) {
-    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import products from CSV: ${result.errors[0]}` })
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import products from CSV: ${result.errors[0]}` })
   } else {
-    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} products, updated ${result.updated} from CSV` })
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} products, updated ${result.updated} from CSV` })
   }
   return result
 }
@@ -296,9 +296,9 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<ImportRe
   revalidatePath('/stock-control')
   revalidatePath('/inventory')
   if (result.created > 0) {
-    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} stock adjustments from CSV` })
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} stock adjustments from CSV` })
   } else if (result.errors.length > 0) {
-    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import stock adjustments from CSV: ${result.errors[0]}` })
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import stock adjustments from CSV: ${result.errors[0]}` })
   }
   return result
 }
@@ -368,9 +368,9 @@ export async function importTransfersCsv(formData: FormData): Promise<ImportResu
 
   revalidatePath('/stock-control/transfers')
   if (result.created > 0) {
-    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} transfers from CSV` })
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} transfers from CSV` })
   } else if (result.errors.length > 0) {
-    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import transfers from CSV: ${result.errors[0]}` })
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import transfers from CSV: ${result.errors[0]}` })
   }
   return result
 }
@@ -448,9 +448,9 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<ImportRe
 
   revalidatePath('/sales')
   if (result.created > 0) {
-    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} sales orders from CSV` })
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} sales orders from CSV` })
   } else if (result.errors.length > 0) {
-    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import sales orders from CSV: ${result.errors[0]}` })
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import sales orders from CSV: ${result.errors[0]}` })
   }
   return result
 }
@@ -527,9 +527,9 @@ export async function importPurchaseOrdersCsv(formData: FormData): Promise<Impor
 
   revalidatePath('/purchase-orders')
   if (result.created > 0) {
-    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} purchase orders from CSV` })
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} purchase orders from CSV` })
   } else if (result.errors.length > 0) {
-    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import purchase orders from CSV: ${result.errors[0]}` })
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import purchase orders from CSV: ${result.errors[0]}` })
   }
   return result
 }

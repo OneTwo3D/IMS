@@ -65,7 +65,7 @@ export async function sendSalesOrderEmail(orderId: string): Promise<{ success: b
     })
 
     if (result.success) {
-      logActivity({
+      await logActivity({
         entityType: 'SALES_ORDER', entityId: orderId, action: 'emailed', tag: 'sales', level: 'INFO',
         description: `Emailed order confirmation ${ref} to ${so.customerEmail}`,
       })
@@ -125,7 +125,7 @@ export async function sendInvoiceEmail(orderId: string): Promise<{ success: bool
     })
 
     if (result.success) {
-      logActivity({
+      await logActivity({
         entityType: 'SALES_ORDER', entityId: orderId, action: 'invoice_emailed', tag: 'sales', level: 'INFO',
         description: `Emailed invoice ${so.invoiceNumber} to ${so.customerEmail}`,
       })

@@ -277,7 +277,7 @@ export async function submitSupplierQuote(
 
     revalidatePath('/supplier/rfqs')
     revalidatePath('/supplier/orders')
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER', entityId: poId, action: 'supplier_quoted', tag: 'purchase', level: 'INFO',
       description: `Supplier submitted quote for ${po.reference} — ref: ${data.supplierRef}`,
       metadata: { supplierRef: data.supplierRef, shippingCost: data.shippingCost },
@@ -315,7 +315,7 @@ export async function submitProductEdit(
       })
     }
 
-    logActivity({
+    await logActivity({
       entityType: 'PRODUCT', entityId: productId, action: 'supplier_edit_proposed', tag: 'inventory', level: 'INFO',
       description: `Supplier proposed edits for SKU ${link.product.sku}`,
       metadata: { supplierId: ctx.supplierId, proposedChanges: data },

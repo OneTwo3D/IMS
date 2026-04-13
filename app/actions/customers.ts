@@ -217,10 +217,10 @@ export async function createCustomer(input: CustomerInput): Promise<{ success: b
     })
     revalidatePath('/sales/contacts')
     revalidatePath('/sales')
-    logActivity({ entityType: 'CUSTOMER', entityId: c.id, tag: 'sales', action: 'created', description: `Created customer: ${[input.firstName, input.lastName].filter(Boolean).join(' ')}` })
+    await logActivity({ entityType: 'CUSTOMER', entityId: c.id, tag: 'sales', action: 'created', description: `Created customer: ${[input.firstName, input.lastName].filter(Boolean).join(' ')}` })
     return { success: true, customer: mapCustomer(c) }
   } catch (e) {
-    logActivity({ entityType: 'CUSTOMER', tag: 'sales', action: 'created', level: 'ERROR', description: `Failed to create customer: ${String(e)}` })
+    await logActivity({ entityType: 'CUSTOMER', tag: 'sales', action: 'created', level: 'ERROR', description: `Failed to create customer: ${String(e)}` })
     return { success: false, error: String(e) }
   }
 }
@@ -245,10 +245,10 @@ export async function updateCustomer(id: string, input: Partial<CustomerInput> &
     })
     revalidatePath('/sales/contacts')
     revalidatePath('/sales')
-    logActivity({ entityType: 'CUSTOMER', entityId: id, tag: 'sales', action: 'updated', description: `Updated customer: ${input.firstName ?? ''}${input.lastName ? ' ' + input.lastName : ''}`.trim() })
+    await logActivity({ entityType: 'CUSTOMER', entityId: id, tag: 'sales', action: 'updated', description: `Updated customer: ${input.firstName ?? ''}${input.lastName ? ' ' + input.lastName : ''}`.trim() })
     return { success: true }
   } catch (e) {
-    logActivity({ entityType: 'CUSTOMER', entityId: id, tag: 'sales', action: 'updated', level: 'ERROR', description: `Failed to update customer: ${String(e)}` })
+    await logActivity({ entityType: 'CUSTOMER', entityId: id, tag: 'sales', action: 'updated', level: 'ERROR', description: `Failed to update customer: ${String(e)}` })
     return { success: false, error: String(e) }
   }
 }
@@ -280,10 +280,10 @@ export async function importContactsCsv(formData: FormData): Promise<{ success?:
       count++
     }
     revalidatePath('/sales/contacts')
-    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${count} contacts from CSV` })
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${count} contacts from CSV` })
     return { success: true, count }
   } catch (e) {
-    logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import contacts from CSV: ${String(e)}` })
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import contacts from CSV: ${String(e)}` })
     return { error: String(e) }
   }
 }
@@ -333,7 +333,7 @@ export async function anonymiseCustomer(customerId: string): Promise<{ success: 
       })
     }
 
-    logActivity({
+    await logActivity({
       entityType: 'CUSTOMER',
       entityId: customerId,
       tag: 'sales',
@@ -344,7 +344,7 @@ export async function anonymiseCustomer(customerId: string): Promise<{ success: 
     revalidatePath('/sales/contacts')
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'CUSTOMER',
       entityId: customerId,
       tag: 'sales',

@@ -62,11 +62,11 @@ export async function createAdjustmentReason(
       data: { name, accountCode: accountCode || null, sortOrder, active },
       select: { id: true, name: true, accountCode: true, sortOrder: true, active: true },
     })
-    logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created adjustment reason: ${name}` })
+    await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created adjustment reason: ${name}` })
     revalidatePath('/settings', 'layout')
     return { success: true, item }
   } catch {
-    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create adjustment reason: ${name}` })
+    await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create adjustment reason: ${name}` })
     return { message: 'Failed to create reason.' }
   }
 }
@@ -87,11 +87,11 @@ export async function updateAdjustmentReason(
       data: { name, accountCode: accountCode || null, sortOrder, active },
       select: { id: true, name: true, accountCode: true, sortOrder: true, active: true },
     })
-    logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'updated', description: `Updated adjustment reason: ${name}` })
+    await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'updated', description: `Updated adjustment reason: ${name}` })
     revalidatePath('/settings', 'layout')
     return { success: true, item }
   } catch {
-    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update adjustment reason: ${name}` })
+    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update adjustment reason: ${name}` })
     return { message: 'Failed to update reason.' }
   }
 }
@@ -100,11 +100,11 @@ export async function deleteAdjustmentReason(id: string): Promise<{ error?: stri
   await requirePermission('settings.company')
   try {
     await db.adjustmentReason.delete({ where: { id } })
-    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted adjustment reason' })
+    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted adjustment reason' })
     revalidatePath('/settings', 'layout')
     return {}
   } catch {
-    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', level: 'ERROR', description: 'Failed to delete adjustment reason' })
+    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', level: 'ERROR', description: 'Failed to delete adjustment reason' })
     return { error: 'Failed to delete reason.' }
   }
 }
@@ -189,11 +189,11 @@ export async function createTaxRate(input: {
         taxCategory: normaliseTaxCategory(input.taxCategory),
       },
     })
-    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created tax rate: ${input.name} (${input.rate}%)` })
+    await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created tax rate: ${input.name} (${input.rate}%)` })
     revalidatePath('/settings', 'layout')
     return { success: true }
   } catch (e) {
-    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create tax rate: ${input.name}` })
+    await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create tax rate: ${input.name}` })
     return { success: false, error: String(e) }
   }
 }
@@ -221,11 +221,11 @@ export async function updateTaxRate(id: string, input: {
         ...(input.active !== undefined && { active: input.active }),
       },
     })
-    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated tax rate: ${input.name ?? id}` })
+    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated tax rate: ${input.name ?? id}` })
     revalidatePath('/settings', 'layout')
     return { success: true }
   } catch (e) {
-    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update tax rate: ${input.name ?? id}` })
+    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update tax rate: ${input.name ?? id}` })
     return { success: false, error: String(e) }
   }
 }
@@ -276,7 +276,7 @@ export async function autoLinkXeroTaxRates(): Promise<{
       linked++
     }
 
-    logActivity({
+    await logActivity({
       entityType: 'SETTING',
       tag: 'settings',
       action: 'xero_tax_rates_linked',
@@ -337,7 +337,7 @@ export async function setSetting(key: string, value: string): Promise<void> {
     create: { key, value },
     update: { value },
   })
-  logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: `Updated setting: ${key}` })
+  await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: `Updated setting: ${key}` })
   revalidatePath('/settings', 'layout')
 }
 
@@ -390,11 +390,11 @@ export async function createPurchaseUnit(input: {
         stockUnitName: input.stockUnitName || 'pcs',
       },
     })
-    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created purchase unit: ${input.name}` })
+    await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', description: `Created purchase unit: ${input.name}` })
     revalidatePath('/settings', 'layout')
     return { success: true }
   } catch (e) {
-    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create purchase unit: ${input.name}` })
+    await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create purchase unit: ${input.name}` })
     return { success: false, error: String(e) }
   }
 }
@@ -432,11 +432,11 @@ export async function updatePurchaseUnit(id: string, input: {
         ...(input.active !== undefined && { active: input.active }),
       },
     })
-    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated purchase unit: ${input.name ?? id}` })
+    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated purchase unit: ${input.name ?? id}` })
     revalidatePath('/settings', 'layout')
     return { success: true }
   } catch (e) {
-    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update purchase unit: ${input.name ?? id}` })
+    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update purchase unit: ${input.name ?? id}` })
     return { success: false, error: String(e) }
   }
 }
@@ -557,11 +557,11 @@ export async function createWarehouse(
       },
       select: warehouseFields,
     })
-    logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created warehouse: ${data.code} — ${data.name}` })
+    await logActivity({ entityType: 'SETTING', entityId: item.id, tag: 'settings', action: 'created', description: `Created warehouse: ${data.code} — ${data.name}` })
     revalidatePath('/settings', 'layout')
     return { success: true, item }
   } catch (e) {
-    logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create warehouse: ${data.code}` })
+    await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'created', level: 'ERROR', description: `Failed to create warehouse: ${data.code}` })
     return { success: false, error: String(e) }
   }
 }
@@ -611,11 +611,11 @@ export async function updateWarehouse(
       },
       select: warehouseFields,
     })
-    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated warehouse: ${data.code} — ${data.name}` })
+    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated warehouse: ${data.code} — ${data.name}` })
     revalidatePath('/settings', 'layout')
     return { success: true, item }
   } catch (e) {
-    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update warehouse: ${data.code}` })
+    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update warehouse: ${data.code}` })
     return { success: false, error: String(e) }
   }
 }
@@ -639,17 +639,17 @@ export async function deleteWarehouse(
     if (hasData) {
       // Deactivate instead of delete
       await db.warehouse.update({ where: { id }, data: { active: false } })
-      logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: 'Deactivated warehouse (has associated data)' })
+      await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: 'Deactivated warehouse (has associated data)' })
       revalidatePath('/settings', 'layout')
       return { success: true, deactivated: true }
     }
 
     await db.warehouse.delete({ where: { id } })
-    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted warehouse' })
+    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', description: 'Deleted warehouse' })
     revalidatePath('/settings', 'layout')
     return { success: true }
   } catch (e) {
-    logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', level: 'ERROR', description: 'Failed to delete warehouse' })
+    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'deleted', level: 'ERROR', description: 'Failed to delete warehouse' })
     return { success: false, error: String(e) }
   }
 }

@@ -14,7 +14,7 @@ type LogParams = {
 }
 
 /**
- * Log an activity. Call fire-and-forget (no await needed) in most cases.
+ * Log an activity. Always await to avoid concurrent-query warnings.
  * Silently swallows errors to never break the caller.
  */
 export async function logActivity(params: LogParams) {

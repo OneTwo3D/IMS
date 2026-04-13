@@ -1024,7 +1024,7 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       }))
       .filter((x) => x.r.matched === 'fallback')
     if (fallbackLines.length > 0) {
-      logActivity({
+      await logActivity({
         entityType: 'PURCHASE_ORDER',
         entityId: po.id,
         action: 'tax_rate_fallback',
@@ -1041,7 +1041,7 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
 
     revalidatePath('/purchase-orders')
     const mapped = mapPoRow(po)
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: mapped.id,
       action: 'created',
@@ -1053,7 +1053,7 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
 
     return { success: true, po: mapped }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: null,
       action: 'created',
@@ -1394,7 +1394,7 @@ export async function updatePurchaseOrder(
     revalidatePath('/purchase-orders/[id]', 'page')
     const mapped = mapPoRow(po)
     if (updateFallbackInfo && updateFallbackInfo.lines.length > 0) {
-      logActivity({
+      await logActivity({
         entityType: 'PURCHASE_ORDER',
         entityId: id,
         action: 'tax_rate_fallback',
@@ -1408,7 +1408,7 @@ export async function updatePurchaseOrder(
         },
       })
     }
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'updated',
@@ -1419,7 +1419,7 @@ export async function updatePurchaseOrder(
     })
     return { success: true, po: mapped }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'updated',
@@ -1454,7 +1454,7 @@ export async function advancePoStatus(
     await db.purchaseOrder.update({ where: { id }, data })
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'status_changed',
@@ -1466,7 +1466,7 @@ export async function advancePoStatus(
 
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'status_changed',
@@ -1497,7 +1497,7 @@ export async function updatePoTracking(
     })
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'tracking_updated',
@@ -1674,7 +1674,7 @@ export async function receivePurchaseOrder(
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'received',
@@ -1691,7 +1691,7 @@ export async function receivePurchaseOrder(
     })
     const whNameMap = Object.fromEntries(receiptWarehouseNames.map((w) => [w.id, w.name]))
     const warehouseNamesList = [...new Set(linesWithQty.map((rl) => whNameMap[rl.warehouseId] ?? rl.warehouseId))].join(', ')
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_ADJUSTMENT',
       entityId: id,
       action: 'purchase_receipt',
@@ -1730,7 +1730,7 @@ export async function receivePurchaseOrder(
 
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'received',
@@ -1753,7 +1753,7 @@ export async function cancelPurchaseOrder(id: string): Promise<{ success: boolea
     await db.purchaseOrder.update({ where: { id }, data: { status: 'CANCELLED' } })
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'cancelled',
@@ -1764,7 +1764,7 @@ export async function cancelPurchaseOrder(id: string): Promise<{ success: boolea
     })
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'cancelled',
@@ -1902,7 +1902,7 @@ export async function returnPurchaseOrder(
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'returned',
@@ -1913,7 +1913,7 @@ export async function returnPurchaseOrder(
     })
 
     // Log stock movement for the return
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_ADJUSTMENT',
       entityId: id,
       action: 'purchase_return',
@@ -1925,7 +1925,7 @@ export async function returnPurchaseOrder(
 
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'returned',
@@ -2157,7 +2157,7 @@ export async function createInvoice(
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${poId}`)
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: poId,
       action: 'invoiced',
@@ -2222,7 +2222,7 @@ export async function createInvoice(
 
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: poId,
       action: 'invoiced',
@@ -2295,7 +2295,7 @@ export async function markBillPaid(
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${invoice.poId}`)
 
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: invoice.poId,
       action: 'bill_paid',
@@ -2337,7 +2337,7 @@ export async function markBillPaid(
 
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: invoiceId,
       action: 'bill_paid',
@@ -2437,7 +2437,7 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
     }
     revalidatePath('/purchase-orders')
     const mapped = mapPoRow(po)
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: mapped.id,
       action: 'created',
@@ -2448,7 +2448,7 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
     })
     return { success: true, po: mapped }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: null,
       action: 'created',
@@ -2604,7 +2604,7 @@ export async function updateFreightPoCosts(
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${freightPoId}`)
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: freightPoId,
       action: 'updated',
@@ -2615,7 +2615,7 @@ export async function updateFreightPoCosts(
     })
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: freightPoId,
       action: 'updated',

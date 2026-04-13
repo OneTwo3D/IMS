@@ -83,7 +83,7 @@ export async function createUser(data: {
     })
 
     revalidatePath('/settings/users')
-    logActivity({
+    await logActivity({
       entityType: 'USER', action: 'created', tag: 'auth', level: 'INFO',
       description: `Created user ${data.name} (${data.email}) with role ${data.role}`,
     })
@@ -146,7 +146,7 @@ export async function updateUser(
     await db.user.update({ where: { id: userId }, data: updateData })
 
     revalidatePath('/settings/users')
-    logActivity({
+    await logActivity({
       entityType: 'USER', entityId: userId, action: 'updated', tag: 'auth', level: 'INFO',
       description: `Updated user ${data.name ?? userId}`,
     })

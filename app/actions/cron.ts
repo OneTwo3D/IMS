@@ -113,14 +113,14 @@ export async function syncCrontab(): Promise<{ success: boolean; error?: string 
   })
 
   if (result.success) {
-    logActivity({
+    await logActivity({
       entityType: 'SYSTEM',
       tag: 'system',
       action: 'crontab_sync',
       description: 'Crontab synced from scheduled jobs settings',
     })
   } else {
-    logActivity({
+    await logActivity({
       entityType: 'SYSTEM',
       tag: 'system',
       action: 'crontab_sync',

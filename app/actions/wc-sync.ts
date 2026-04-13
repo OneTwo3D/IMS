@@ -73,7 +73,7 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
       db.setting.upsert({ where: { key: k }, create: { key: k, value: v }, update: { value: v } }),
     )
   await db.$transaction(ops)
-  logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated WooCommerce sync settings' })
+  await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated WooCommerce sync settings' })
   revalidatePath('/sync')
   return { success: true }
 }
@@ -93,7 +93,7 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     ops.push(db.setting.upsert({ where: { key: 'wc_consumer_secret' }, create: { key: 'wc_consumer_secret', value: secret }, update: { value: secret } }))
   }
   await db.$transaction(ops)
-  logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated WooCommerce connection credentials' })
+  await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated WooCommerce connection credentials' })
   revalidatePath('/sync')
   return { success: true }
 }
@@ -178,7 +178,7 @@ export async function importWcTaxRatesFromApi(): Promise<{
     const { importWcTaxRates } = await import('@/lib/connectors/woocommerce/sync/taxes')
     const result = await importWcTaxRates()
 
-    logActivity({
+    await logActivity({
       entityType: 'SETTING',
       tag: 'sync',
       action: 'wc_tax_rates_imported',
@@ -328,7 +328,7 @@ export async function createWcWebhooks(): Promise<{
   }
 
   if (created > 0) {
-    logActivity({
+    await logActivity({
       entityType: 'SETTING',
       tag: 'sync',
       action: 'wc_webhooks_created',

@@ -769,7 +769,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       .map((r, i) => ({ r, sku: input.lines[i].sku, cat: productCategoryById.get(input.lines[i].productId) ?? 'STANDARD' }))
       .filter((x) => x.r.matched === 'fallback')
     if (fallbackLines.length > 0) {
-      logActivity({
+      await logActivity({
         entityType: 'SALES_ORDER',
         entityId: so.id,
         action: 'tax_rate_fallback',
@@ -786,7 +786,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
 
     revalidatePath('/sales')
     const mapped = mapSoRow(so)
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: so.id,
       action: 'created',
@@ -797,7 +797,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     })
     return { success: true, order: mapped }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: null,
       action: 'created',
@@ -820,7 +820,7 @@ async function releaseReservedStock(orderId: string, warehouseId: string, lines:
       data: { reservedQty: { decrement: qty } },
     })
   }
-  logActivity({
+  await logActivity({
     entityType: 'STOCK_ADJUSTMENT',
     entityId: orderId,
     action: 'reservation_released',
@@ -1039,7 +1039,7 @@ export async function updateSalesOrderStatus(
             where: { productId: line.productId, warehouseId },
             data: { quantity: { decrement: qty } },
           })
-          logActivity({
+          await logActivity({
             entityType: 'STOCK_ADJUSTMENT',
             entityId: line.productId,
             action: 'dispatched',
@@ -1090,7 +1090,7 @@ export async function updateSalesOrderStatus(
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${id}`)
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
       action: 'status_changed',
@@ -1109,7 +1109,7 @@ export async function updateSalesOrderStatus(
 
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
       action: 'status_changed',
@@ -1201,7 +1201,7 @@ export async function createRefund(
           create: { productId: l.productId, warehouseId: returnWarehouseId, quantity: l.qty, reservedQty: 0 },
           update: { quantity: { increment: l.qty } },
         })
-        logActivity({
+        await logActivity({
           entityType: 'STOCK_ADJUSTMENT',
           entityId: l.productId,
           action: 'return_inbound',
@@ -1224,7 +1224,7 @@ export async function createRefund(
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
       action: 'refunded',
@@ -1394,7 +1394,7 @@ export async function createRefund(
 
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
       action: 'refunded',
@@ -1474,7 +1474,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     await autoAllocateOrder(clone.id)
 
     revalidatePath('/sales')
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: clone.id,
       action: 'cloned',
@@ -1485,7 +1485,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
     })
     return { success: true, newId: clone.id }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
       action: 'cloned',
@@ -1516,7 +1516,7 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
     await db.salesOrderLine.deleteMany({ where: { orderId: id } })
     await db.salesOrder.delete({ where: { id } })
     revalidatePath('/sales')
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
       action: 'deleted',
@@ -1527,7 +1527,7 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
     })
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
       action: 'deleted',
@@ -1563,7 +1563,7 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${id}`)
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
       action: 'paid',
@@ -1574,7 +1574,7 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
     })
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
       action: 'paid',
@@ -1600,7 +1600,7 @@ export async function updateSalesOrderNotes(
       select: { wcOrderNumber: true },
     })
     revalidatePath(`/sales/${id}`)
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
       action: 'updated',
@@ -1611,7 +1611,7 @@ export async function updateSalesOrderNotes(
     })
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
       action: 'updated',
@@ -1639,7 +1639,7 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
     })
     revalidatePath(`/sales/${id}`)
     if (!options?.skipLog) {
-      logActivity({
+      await logActivity({
         entityType: 'SALES_ORDER',
         entityId: id,
         action: 'invoice_generated',
@@ -1654,7 +1654,7 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
 
     return { success: true, invoiceNumber: result.invoiceNumber }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
       action: 'invoice_generated',
@@ -1733,7 +1733,7 @@ export async function addPayment(input: {
     }
 
     revalidatePath(`/sales/${input.orderId}`)
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: input.orderId,
       action: 'payment_added',
@@ -1744,7 +1744,7 @@ export async function addPayment(input: {
     })
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: input.orderId,
       action: 'payment_added',
@@ -1763,7 +1763,7 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
     await db.payment.delete({ where: { id: paymentId } })
     const so = await db.salesOrder.findUnique({ where: { id: orderId }, select: { wcOrderNumber: true } })
     revalidatePath(`/sales/${orderId}`)
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
       action: 'payment_deleted',
@@ -1774,7 +1774,7 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
     })
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
       action: 'payment_deleted',

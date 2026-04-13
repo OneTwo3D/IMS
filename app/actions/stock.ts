@@ -227,7 +227,7 @@ export async function adjustStock(
     revalidatePath(`/inventory/${productId}`)
     revalidatePath('/stock-control')
 
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_ADJUSTMENT',
       entityId: productId,
       action: 'adjusted',
@@ -239,7 +239,7 @@ export async function adjustStock(
   } catch (e) {
     console.error(e)
 
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_ADJUSTMENT',
       entityId: productId,
       action: 'adjusted',
@@ -355,7 +355,7 @@ export async function bulkAdjustStock(
     revalidatePath('/stock-control')
     revalidatePath('/inventory')
 
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_ADJUSTMENT',
       action: 'bulk_adjusted',
       tag: 'stock',
@@ -366,7 +366,7 @@ export async function bulkAdjustStock(
   } catch (e) {
     console.error(e)
 
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_ADJUSTMENT',
       action: 'bulk_adjusted',
       tag: 'stock',
@@ -498,7 +498,7 @@ export async function updateAdjustmentMovement(
     revalidatePath('/stock-control')
     revalidatePath('/inventory')
 
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_ADJUSTMENT',
       entityId: id,
       action: 'adjustment_updated',
@@ -510,7 +510,7 @@ export async function updateAdjustmentMovement(
   } catch (e) {
     console.error(e)
 
-    logActivity({
+    await logActivity({
       entityType: 'STOCK_ADJUSTMENT',
       entityId: id,
       action: 'adjustment_updated',

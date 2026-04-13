@@ -54,7 +54,7 @@ export async function deleteBackup(filename: string): Promise<{ success: boolean
 
   try {
     await unlink(path.join(BACKUP_DIR, safe))
-    logActivity({
+    await logActivity({
       entityType: 'SYSTEM',
       tag: 'system',
       action: 'backup_deleted',

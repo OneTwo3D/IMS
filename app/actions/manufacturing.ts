@@ -324,7 +324,7 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
       },
     })
 
-    logActivity({
+    await logActivity({
       entityType: 'PRODUCTION_ORDER',
       entityId: order.id,
       tag: 'manufacturing',
@@ -336,7 +336,7 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
     revalidatePath('/manufacturing')
     return { success: true, id: order.id }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'PRODUCTION_ORDER',
       tag: 'manufacturing',
       action: 'created',
@@ -494,7 +494,7 @@ export async function updateManufacturingOrderStatus(
       if (isAssembly) {
         for (const comp of order.outputProduct.productComponents) {
           const totalQty = Number(comp.qty) * qtyPlanned
-          logActivity({
+          await logActivity({
             entityType: 'STOCK_ADJUSTMENT',
             entityId: comp.componentId,
             tag: 'stock',
@@ -503,7 +503,7 @@ export async function updateManufacturingOrderStatus(
             metadata: { movementType: 'PRODUCTION_OUT', qty: totalQty, warehouseId: order.warehouseId, moReference: order.reference },
           })
         }
-        logActivity({
+        await logActivity({
           entityType: 'STOCK_ADJUSTMENT',
           entityId: order.outputProductId,
           tag: 'stock',
@@ -512,7 +512,7 @@ export async function updateManufacturingOrderStatus(
           metadata: { movementType: 'PRODUCTION_IN', qty: qtyPlanned, warehouseId: order.warehouseId, moReference: order.reference },
         })
       } else {
-        logActivity({
+        await logActivity({
           entityType: 'STOCK_ADJUSTMENT',
           entityId: order.outputProductId,
           tag: 'stock',
@@ -522,7 +522,7 @@ export async function updateManufacturingOrderStatus(
         })
         for (const comp of order.outputProduct.productComponents) {
           const totalQty = Number(comp.qty) * qtyPlanned
-          logActivity({
+          await logActivity({
             entityType: 'STOCK_ADJUSTMENT',
             entityId: comp.componentId,
             tag: 'stock',
@@ -589,7 +589,7 @@ export async function updateManufacturingOrderStatus(
       if (isAssembly) {
         for (const comp of order.outputProduct.productComponents) {
           const totalQty = Number(comp.qty) * qtyPlanned
-          logActivity({
+          await logActivity({
             entityType: 'STOCK_ADJUSTMENT',
             entityId: comp.componentId,
             tag: 'stock',
@@ -599,7 +599,7 @@ export async function updateManufacturingOrderStatus(
           })
         }
       } else {
-        logActivity({
+        await logActivity({
           entityType: 'STOCK_ADJUSTMENT',
           entityId: order.outputProductId,
           tag: 'stock',
@@ -629,7 +629,7 @@ export async function updateManufacturingOrderStatus(
       })
 
       // Log reservation release
-      logActivity({
+      await logActivity({
         entityType: 'STOCK_ADJUSTMENT',
         entityId: id,
         tag: 'stock',
@@ -646,7 +646,7 @@ export async function updateManufacturingOrderStatus(
       ? `Completed ${order.reference} — ${isAssembly ? 'assembled' : 'disassembled'} ${qtyPlanned} units of ${order.outputProduct.sku}, stock updated`
       : `Updated ${order.reference} status to ${status}`
 
-    logActivity({
+    await logActivity({
       entityType: 'PRODUCTION_ORDER',
       entityId: id,
       tag: 'manufacturing',
@@ -661,7 +661,7 @@ export async function updateManufacturingOrderStatus(
     revalidatePath('/stock-control')
     return { success: true }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'PRODUCTION_ORDER',
       entityId: id,
       tag: 'manufacturing',

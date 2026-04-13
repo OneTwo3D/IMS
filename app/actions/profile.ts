@@ -19,7 +19,7 @@ export async function updateProfile(data: { name: string; email: string }): Prom
 
   await db.user.update({ where: { id: userId }, data: { name: data.name.trim(), email: data.email.trim().toLowerCase() } })
   revalidatePath('/profile')
-  logActivity({ entityType: 'USER', entityId: userId, tag: 'auth', action: 'updated', description: 'Updated profile' })
+  await logActivity({ entityType: 'USER', entityId: userId, tag: 'auth', action: 'updated', description: 'Updated profile' })
   return { success: true }
 }
 
@@ -37,7 +37,7 @@ export async function changePassword(data: { currentPassword: string; newPasswor
 
   const passwordHash = await bcrypt.hash(data.newPassword, 12)
   await db.user.update({ where: { id: userId }, data: { passwordHash } })
-  logActivity({ entityType: 'USER', entityId: userId, tag: 'auth', action: 'password_changed', description: 'Changed password' })
+  await logActivity({ entityType: 'USER', entityId: userId, tag: 'auth', action: 'password_changed', description: 'Changed password' })
   return { success: true }
 }
 
@@ -45,7 +45,7 @@ export async function updatePictureUrl(pictureUrl: string | null): Promise<{ suc
   const session = await requireAuth()
   await db.user.update({ where: { id: session.user.id }, data: { pictureUrl } })
   revalidatePath('/profile')
-  logActivity({ entityType: 'USER', entityId: session.user.id, tag: 'auth', action: 'updated', description: 'Updated profile picture' })
+  await logActivity({ entityType: 'USER', entityId: session.user.id, tag: 'auth', action: 'updated', description: 'Updated profile picture' })
   return { success: true }
 }
 

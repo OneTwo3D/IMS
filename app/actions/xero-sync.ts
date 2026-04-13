@@ -71,7 +71,7 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
     )
     await db.$transaction(ops)
 
-    logActivity({
+    await logActivity({
       entityType: 'SYSTEM',
       action: 'xero_settings_updated',
       tag: 'sync',
@@ -128,7 +128,7 @@ export async function disconnectXero(): Promise<{ success: boolean; error?: stri
     await requireAdmin()
     await disconnect()
 
-    logActivity({
+    await logActivity({
       entityType: 'SYSTEM',
       action: 'xero_disconnected',
       tag: 'sync',
@@ -150,7 +150,7 @@ export async function syncXeroAccounts(): Promise<{ synced: number; errors: stri
   await requireAdmin()
   const result = await syncChartOfAccounts()
 
-  logActivity({
+  await logActivity({
     entityType: 'SYSTEM',
     action: 'xero_accounts_synced',
     tag: 'sync',
@@ -226,7 +226,7 @@ export async function triggerXeroSync(): Promise<{ success: boolean; result?: un
 
     const result = await processPendingXeroSync()
 
-    logActivity({
+    await logActivity({
       entityType: 'SYSTEM',
       action: 'xero_manual_sync',
       tag: 'sync',
@@ -251,7 +251,7 @@ export async function retryFailedXeroSync(entryId?: string): Promise<{ success: 
       where,
       data: { status: 'PENDING', retryCount: 0, errorMessage: null },
     })
-    logActivity({
+    await logActivity({
       entityType: 'SYSTEM',
       action: 'xero_retry_failed',
       tag: 'sync',
