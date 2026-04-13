@@ -6,7 +6,7 @@ Complete inventory management system with sales, purchasing, stock control, manu
 
 | Layer | Technology | Version | Purpose |
 |-------|------------|---------|---------|
-| Runtime | Node.js | 18+ | JavaScript execution |
+| Runtime | Node.js | 22+ | JavaScript execution |
 | Framework | Next.js | 16.2 | Full-stack React with App Router, Server Components, Server Actions, Turbopack |
 | Language | TypeScript | 5.x | Strict type checking throughout (strict mode enabled) |
 | Database | PostgreSQL | 14+ | Relational database for complex inventory models |
@@ -23,7 +23,7 @@ Complete inventory management system with sales, purchasing, stock control, manu
 
 ```bash
 # Prerequisites
-- Node.js 18+ installed
+- Node.js 22+ installed
 - PostgreSQL 14+ database running
 - Environment variables configured (.env)
 

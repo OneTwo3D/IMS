@@ -8,7 +8,7 @@
 #
 # What this script does:
 #   1. Checks prerequisites and OS compatibility
-#   2. Installs Node.js 20 (via NodeSource)
+#   2. Installs Node.js 22 (via NodeSource)
 #   3. Installs and configures PostgreSQL
 #   4. Installs nginx
 #   5. Installs PM2 process manager
@@ -56,7 +56,7 @@ DATA_DIR="/var/lib/${APP_NAME}"
 LOG_DIR="/var/log/${APP_NAME}"
 BACKUP_DIR="${DATA_DIR}/backups"
 NGINX_CONF="/etc/nginx/sites-available/${APP_NAME}"
-NODE_VERSION="20"
+NODE_VERSION="22"
 
 NON_INTERACTIVE=false
 [[ "${1:-}" == "--non-interactive" ]] && NON_INTERACTIVE=true

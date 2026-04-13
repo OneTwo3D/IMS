@@ -20,7 +20,7 @@ bash scripts/install.sh
 The script performs the following steps:
 
 1. **Pre-flight checks** — verifies root access, detects the OS, and checks internet connectivity
-2. **Installs Node.js 20** via NodeSource
+2. **Installs Node.js 22** via NodeSource
 3. **Installs and configures PostgreSQL** — creates the database and user
 4. **Installs nginx**
 5. **Installs PM2** globally for process management
