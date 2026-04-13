@@ -60,7 +60,7 @@ const STATUS_LABELS: Record<PoStatus, string> = {
   DRAFT: 'Draft',
   RFQ_SENT: 'RFQ Sent',
   QUOTE_RECEIVED: 'Quote Received',
-  PO_SENT: 'Ordered',
+  PO_SENT: 'PO Sent',
   SHIPPED: 'Shipped',
   PARTIALLY_RECEIVED: 'Partially Received',
   RECEIVED: 'Received',
@@ -177,7 +177,7 @@ function ReceiveDialog({
         </DialogHeader>
 
         <div className="space-y-3">
-          <Table>
+          <Table className="min-w-[600px]">
             <TableHeader>
               <TableRow>
                 <TableHead className="text-xs">Product</TableHead>
@@ -358,7 +358,7 @@ function ReturnDialog({
             />
           </div>
 
-          <Table>
+          <Table className="min-w-[600px]">
             <TableHeader>
               <TableRow>
                 <TableHead className="text-xs">Product</TableHead>
@@ -651,7 +651,7 @@ function BillDialog({
           <div className="space-y-4">
             <p className="text-sm text-muted-foreground">Select the line items to include in this bill:</p>
             {billLines.length > 0 && (
-              <Table className="rounded-md border">
+              <Table className="rounded-md border min-w-[500px]">
                 <TableHeader className="bg-muted/50">
                   <TableRow>
                     <TableHead className="w-8">
@@ -731,7 +731,7 @@ function BillDialog({
         {step === 2 && (
           <div className="space-y-4">
             {/* Invoice details */}
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <div className="space-y-1.5">
                 <Label>Invoice Number</Label>
                 <Input value={invoiceNumber} onChange={(e) => setInvoiceNumber(e.target.value)} placeholder="Supplier's invoice #" className="h-9 text-sm" />
@@ -1139,42 +1139,44 @@ function EditFreightCostsDialog({
 
           <div className="space-y-2">
             {costLines.map((cl) => (
-              <div key={cl.key} className="flex items-center gap-2">
+              <div key={cl.key} className="flex flex-wrap items-center gap-2">
                 <Input
                   placeholder="Description"
                   value={cl.description}
                   onChange={(e) => setCostLines((p) => p.map((c) => c.key === cl.key ? { ...c, description: e.target.value } : c))}
-                  className="flex-1 h-8 text-sm"
+                  className="flex-1 min-w-[140px] h-8 text-sm"
                 />
-                <Input
-                  type="number" min="0" step="0.01"
-                  value={cl.amountForeign}
-                  onChange={(e) => setCostLines((p) => p.map((c) => c.key === cl.key ? { ...c, amountForeign: Number(e.target.value) || 0 } : c))}
-                  className="w-28 h-8 text-sm text-right font-mono"
-                />
-                <span className="text-xs text-muted-foreground w-8 shrink-0">{fSym}</span>
-                <label className="flex items-center gap-1 text-xs whitespace-nowrap cursor-pointer shrink-0">
-                  <input
-                    type="checkbox"
-                    checked={cl.vatable}
-                    onChange={(e) => setCostLines((p) => p.map((c) => c.key === cl.key ? { ...c, vatable: e.target.checked } : c))}
-                    className="rounded border-input"
+                <div className="flex items-center gap-2">
+                  <Input
+                    type="number" min="0" step="0.01"
+                    value={cl.amountForeign}
+                    onChange={(e) => setCostLines((p) => p.map((c) => c.key === cl.key ? { ...c, amountForeign: Number(e.target.value) || 0 } : c))}
+                    className="w-28 h-8 text-sm text-right font-mono"
                   />
-                  VAT
-                </label>
-                <select
-                  value={cl.distributionMethod}
-                  onChange={(e) => setCostLines((p) => p.map((c) => c.key === cl.key ? { ...c, distributionMethod: e.target.value } : c))}
-                  className="h-8 rounded-md border border-input bg-background px-2 text-xs w-32 shrink-0"
-                >
-                  <option value="BY_VALUE">By Value</option>
-                  <option value="BY_QUANTITY">By Quantity</option>
-                  <option value="BY_WEIGHT">By Weight</option>
-                  <option value="EQUAL_SPLIT">Equal Split</option>
-                </select>
-                <button type="button" onClick={() => setCostLines((p) => p.filter((c) => c.key !== cl.key))} className="text-muted-foreground hover:text-destructive shrink-0">
-                  <X className="h-4 w-4" />
-                </button>
+                  <span className="text-xs text-muted-foreground w-8 shrink-0">{fSym}</span>
+                  <label className="flex items-center gap-1 text-xs whitespace-nowrap cursor-pointer shrink-0">
+                    <input
+                      type="checkbox"
+                      checked={cl.vatable}
+                      onChange={(e) => setCostLines((p) => p.map((c) => c.key === cl.key ? { ...c, vatable: e.target.checked } : c))}
+                      className="rounded border-input"
+                    />
+                    VAT
+                  </label>
+                  <select
+                    value={cl.distributionMethod}
+                    onChange={(e) => setCostLines((p) => p.map((c) => c.key === cl.key ? { ...c, distributionMethod: e.target.value } : c))}
+                    className="h-8 rounded-md border border-input bg-background px-2 text-xs w-32 shrink-0"
+                  >
+                    <option value="BY_VALUE">By Value</option>
+                    <option value="BY_QUANTITY">By Quantity</option>
+                    <option value="BY_WEIGHT">By Weight</option>
+                    <option value="EQUAL_SPLIT">Equal Split</option>
+                  </select>
+                  <button type="button" onClick={() => setCostLines((p) => p.filter((c) => c.key !== cl.key))} className="text-muted-foreground hover:text-destructive shrink-0">
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
               </div>
             ))}
           </div>

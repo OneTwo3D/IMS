@@ -29,7 +29,7 @@ const STATUS_LABELS: Record<PoStatus, string> = {
   DRAFT: 'Draft',
   RFQ_SENT: 'RFQ Sent',
   QUOTE_RECEIVED: 'Quote Received',
-  PO_SENT: 'Ordered',
+  PO_SENT: 'PO Sent',
   SHIPPED: 'Shipped',
   PARTIALLY_RECEIVED: 'Part. Received',
   RECEIVED: 'Received',
