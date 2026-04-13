@@ -4,6 +4,7 @@ import { addStockAdjustment, createSimpleProduct } from './helpers'
 const FULFILLMENT_WAREHOUSE_LABEL = 'CBG — Cambridge'
 const FULFILLMENT_WAREHOUSE_CODE = 'CBG'
 const allocatedStatus = /^(Allocated)$/
+const shippedStatus = /^(Shipped)$/
 
 test('processes a sales order through allocation and shipment', async ({ page }) => {
   const product = await createSimpleProduct(page, { price: '18.50' })
@@ -46,5 +47,5 @@ test('processes a sales order through allocation and shipment', async ({ page })
   await shipDialog.getByRole('button', { name: /confirm shipment/i }).click()
   await expect(shipDialog).toBeHidden()
 
-  await expect(page.getByText('Shipped', { exact: false })).toBeVisible()
+  await expect(page.getByText(shippedStatus).first()).toBeVisible()
 })

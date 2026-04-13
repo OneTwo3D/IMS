@@ -33,9 +33,12 @@ export async function createSimpleProduct(page: Page, opts?: {
   await page.waitForURL(/\/inventory/)
   const searchInput = page.getByPlaceholder(/search sku, name, barcode/i)
   await searchInput.fill(sku)
-  await page.getByRole('link', { name: sku, exact: true }).waitFor()
+  const productLink = page.getByRole('link', { name: sku, exact: true })
+  await productLink.waitFor()
+  const productHref = await productLink.getAttribute('href')
+  const productId = productHref?.split('/').pop()
 
-  return { sku, name, price }
+  return { sku, name, price, productHref, productId }
 }
 
 export async function addStockAdjustment(page: Page, sku: string, qty: number, warehouseCode?: string) {
@@ -60,4 +63,39 @@ export async function addStockAdjustment(page: Page, sku: string, qty: number, w
 
   await dialog.getByText(/1 adjustment saved\./i).waitFor()
   await dialog.waitFor({ state: 'hidden' })
+}
+
+export async function createDraftSalesOrder(
+  page: Page,
+  opts: {
+    sku: string
+    warehouseLabel?: string
+  },
+) {
+  await page.goto('/sales')
+  const newOrderButton = page.getByRole('button', { name: /new order/i })
+  const dialog = page.getByRole('dialog', { name: 'New Sales Order' })
+  await newOrderButton.click()
+  if (!(await dialog.isVisible())) {
+    await newOrderButton.click()
+  }
+  await dialog.getByRole('heading', { name: 'New Sales Order' }).waitFor()
+
+  const customerSelect = dialog.locator('select').first()
+  const customerName = ((await customerSelect.locator('option').nth(1).textContent()) ?? '').trim()
+  await customerSelect.selectOption({ index: 1 })
+
+  if (opts.warehouseLabel) {
+    await dialog.getByText('Ship From Warehouse').locator('..').locator('select').selectOption({ label: opts.warehouseLabel })
+  }
+
+  await dialog.getByPlaceholder(/search product to add/i).fill(opts.sku)
+  await dialog.getByRole('button', { name: new RegExp(opts.sku) }).first().click()
+  await dialog.getByRole('button', { name: /save as draft/i }).click()
+
+  await page.waitForURL(/\/sales\/.+/)
+  return {
+    customerName,
+    orderUrl: page.url(),
+  }
 }

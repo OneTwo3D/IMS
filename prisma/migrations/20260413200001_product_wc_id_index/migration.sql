@@ -1,0 +1,33 @@
+-- Build the unique index on products.wcProductId CONCURRENTLY so the
+-- index creation does NOT take an exclusive lock on the `products`
+-- table for its entire duration. Products is on the hot inventory
+-- path (stock levels, order allocation, WC sync); a blocking CREATE
+-- INDEX would stall order processing on a non-trivial catalog.
+--
+-- NO `IF NOT EXISTS`: the sync code's collision-safety depends on this
+-- index being UNIQUE and VALID. If a prior run of this migration failed
+-- mid-build, Postgres leaves an INVALID index at the same name.
+-- `CREATE UNIQUE INDEX CONCURRENTLY IF NOT EXISTS` would silently no-op
+-- against that INVALID leftover, and the application would start relying
+-- on uniqueness that isn't actually enforced. Failing loudly on retry is
+-- the correct behavior — see the operator remediation below.
+--
+-- Prisma executes this file's single statement without wrapping it in an
+-- outer transaction; CREATE INDEX CONCURRENTLY cannot run inside a
+-- transaction block. A post-build validity check is enforced by the
+-- follow-up migration 20260413200002_product_wc_id_index_validate so a
+-- partially-built (INVALID) index cannot slip through unnoticed.
+--
+-- Operator remediation if this migration fails partway and leaves an
+-- INVALID index behind, blocking re-run:
+--   psql "$DATABASE_URL" -c 'DROP INDEX IF EXISTS "products_wcProductId_key";'
+--   npx prisma migrate deploy
+--
+-- If your Prisma version wraps migrations in an outer transaction and
+-- this fails with "CREATE INDEX CONCURRENTLY cannot run inside a
+-- transaction block", run the index build manually and mark applied:
+--   psql "$DATABASE_URL" -c 'CREATE UNIQUE INDEX CONCURRENTLY "products_wcProductId_key" ON "products"("wcProductId");'
+--   npx prisma migrate resolve --applied 20260413200001_product_wc_id_index
+
+CREATE UNIQUE INDEX CONCURRENTLY "products_wcProductId_key"
+  ON "products"("wcProductId");

@@ -10,7 +10,7 @@ import { Card } from '@/components/ui/card'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   saveWcSyncSettings, saveWcCredentials, updateWcTaxRateMapping, deleteWcTaxRateMapping, upsertWcStatusMapping,
-  triggerManualSync, importWcTaxRatesFromApi, createWcWebhooks,
+  triggerManualSync, importWcTaxRatesFromApi, createWcWebhooks, resetWcProductIdCache,
   type WcSyncSettings, type TaxRateMappingRow, type StatusMappingRow, type SyncLogRow,
 } from '@/app/actions/wc-sync'
 
@@ -29,6 +29,54 @@ const IMS_STATUSES = [
 ]
 
 const WC_STATUSES = ['pending', 'failed', 'on-hold', 'processing', 'completed', 'cancelled', 'refunded']
+
+function formatSyncResult(
+  type: 'orders' | 'products' | 'stock',
+  result: unknown,
+): { text: string; isError: boolean } {
+  if (!result || typeof result !== 'object') {
+    return { text: `${type} sync completed`, isError: false }
+  }
+  const r = result as Record<string, unknown>
+
+  if (type === 'stock') {
+    const message = typeof r.message === 'string' ? r.message : ''
+    const synced = Number(r.synced ?? 0)
+    const matched = Number(r.matched ?? 0)
+    const unmatched = Number(r.unmatched ?? 0)
+    const candidates = Number(r.candidates ?? 0)
+    const pushed = r.pushed === true
+    const errors = Array.isArray(r.errors) ? (r.errors as string[]) : []
+    const unmatchedSample = Array.isArray(r.unmatchedSkuSample) ? (r.unmatchedSkuSample as string[]) : []
+
+    // A stock push is a FAILURE when either of these holds:
+    //   (a) the result carries any entries in `errors` — stock-sync only
+    //       populates this array on real faults (transport/auth/batch
+    //       rejections, preflight aborts, persistence collisions, stale-
+    //       mapping clears), never on benign no-op paths;
+    //   (b) it had work to do (`candidates > 0`) but `pushed === false`,
+    //       meaning nothing was POSTed to WooCommerce.
+    // The benign no-op paths — sync disabled, no syncing warehouses, no
+    // stocked SKUs — set `candidates === 0` and leave `errors` empty, so
+    // they still render as neutral/info, not as errors.
+    const isError = errors.length > 0 || (!pushed && candidates > 0)
+
+    const prefix = isError ? 'Stock sync failed' : null
+    const parts: string[] = [
+      `${synced} synced`,
+      `${matched} matched`,
+      `${unmatched} unmatched`,
+      `(${candidates} candidate${candidates === 1 ? '' : 's'})`,
+    ]
+    if (message) parts.unshift(message)
+    if (unmatchedSample.length > 0) parts.push(`unmatched SKUs: ${unmatchedSample.join(', ')}`)
+    if (errors.length > 0) parts.push(`errors: ${errors.join('; ')}`)
+    const text = prefix ? `${prefix} — ${parts.join(' · ')}` : parts.join(' · ')
+    return { text, isError }
+  }
+
+  return { text: `${type} sync completed: ${JSON.stringify(result)}`, isError: false }
+}
 
 // ---------------------------------------------------------------------------
 // Tabs
@@ -211,7 +259,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
   const [saved, setSaved] = useState(false)
-  const [syncResult, setSyncResult] = useState<string | null>(null)
+  const [syncResult, setSyncResult] = useState<{ text: string; isError: boolean } | null>(null)
   const [syncingType, setSyncingType] = useState<'orders' | 'products' | 'stock' | null>(null)
   const [importingTax, setImportingTax] = useState(false)
   const [taxImportMsg, setTaxImportMsg] = useState<string | null>(null)
@@ -309,11 +357,27 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
       const result = await triggerManualSync(type)
       setSyncingType(null)
       if (result.success) {
-        setSyncResult(`${type} sync completed: ${JSON.stringify(result.result)}`)
+        // formatSyncResult inspects the payload for in-band failure
+        // signals (errors[], pushed=false + candidates>0) and flips
+        // `isError` accordingly. A resolved server-action call with a
+        // failed push is NOT a UI success.
+        setSyncResult(formatSyncResult(type, result.result))
         router.refresh()
       } else {
-        setSyncResult(`Error: ${result.error}`)
+        setSyncResult({ text: `Error: ${result.error}`, isError: true })
       }
+    })
+  }
+
+  function handleResetWcIdCache() {
+    setSyncResult(null)
+    startTransition(async () => {
+      const result = await resetWcProductIdCache()
+      setSyncResult({
+        text: `Reset cached WC product IDs — ${result.wipedMappings} mapping(s) cleared`,
+        isError: false,
+      })
+      router.refresh()
     })
   }
 
@@ -404,7 +468,13 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
           <div className="grid grid-cols-1 gap-3 max-w-lg">
             <div className="space-y-1.5">
               <Label>Store URL</Label>
-              <Input value={wcUrl} onChange={(e) => setWcUrl(e.target.value)} placeholder="https://yourstore.com" className="h-9 text-sm font-mono" />
+              <Input
+                data-testid="wc-url-input"
+                value={wcUrl}
+                onChange={(e) => setWcUrl(e.target.value)}
+                placeholder="https://yourstore.com"
+                className="h-9 text-sm font-mono"
+              />
             </div>
             <div className="space-y-1.5">
               <Label>Consumer Key</Label>
@@ -561,7 +631,15 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
               {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save Settings
             </Button>
             {saved && <span className="text-sm text-green-600 flex items-center gap-1"><Check className="h-3 w-3" />Saved</span>}
-            {syncResult && <span className="text-xs text-muted-foreground ml-2">{syncResult}</span>}
+            {syncResult && (
+              <span
+                data-testid="sync-result"
+                data-sync-status={syncResult.isError ? 'error' : 'ok'}
+                className={`text-xs ml-2 ${syncResult.isError ? 'text-red-600 font-medium' : 'text-muted-foreground'}`}
+              >
+                {syncResult.text}
+              </span>
+            )}
           </div>
         </div>
       )}
@@ -614,10 +692,23 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
                     <p className="text-xs text-muted-foreground">Pushes the next FIFO unit cost to WooCommerce&apos;s native Cost of Goods Sold field</p>
                   </div>
                 </label>
-                <Button size="sm" variant="outline" onClick={() => handleSync('stock')} disabled={isPending}>
-                  {syncingType === 'stock' ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowUpFromLine className="h-3 w-3 mr-1" />}
-                  Push Stock Now
-                </Button>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <Button size="sm" variant="outline" onClick={() => handleSync('stock')} disabled={isPending}>
+                    {syncingType === 'stock' ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowUpFromLine className="h-3 w-3 mr-1" />}
+                    Push Stock Now
+                  </Button>
+                  <Button
+                    data-testid="reset-wc-id-cache"
+                    size="sm"
+                    variant="outline"
+                    onClick={handleResetWcIdCache}
+                    disabled={isPending}
+                    title="Clear every cached WooCommerce product ID. Use after restoring a DB or manually editing WC settings — the next sync will re-resolve SKUs against the live store."
+                  >
+                    <Trash2 className="h-3 w-3 mr-1" />
+                    Reset cached IDs
+                  </Button>
+                </div>
               </div>
             )}
           </Card>
@@ -628,7 +719,15 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
               {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save Settings
             </Button>
             {saved && <span className="text-sm text-green-600 flex items-center gap-1"><Check className="h-3 w-3" />Saved</span>}
-            {syncResult && <span className="text-xs text-muted-foreground ml-2">{syncResult}</span>}
+            {syncResult && (
+              <span
+                data-testid="sync-result"
+                data-sync-status={syncResult.isError ? 'error' : 'ok'}
+                className={`text-xs ml-2 ${syncResult.isError ? 'text-red-600 font-medium' : 'text-muted-foreground'}`}
+              >
+                {syncResult.text}
+              </span>
+            )}
           </div>
         </div>
       )}

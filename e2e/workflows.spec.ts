@@ -41,9 +41,13 @@ test.describe('workflow coverage', () => {
 
     await page.goto('/sales')
     await expect(page.getByRole('heading', { name: 'Sales Orders' })).toBeVisible()
-    await page.getByRole('button', { name: /new order/i }).click()
-
     const dialog = page.getByRole('dialog', { name: 'New Sales Order' })
+    const newOrderButton = page.getByRole('button', { name: /new order/i })
+    await expect(newOrderButton).toBeVisible()
+    await newOrderButton.click()
+    if (!(await dialog.isVisible())) {
+      await newOrderButton.click()
+    }
     await dialog.getByRole('heading', { name: 'New Sales Order' }).waitFor()
 
     const customerSelect = dialog.locator('select').first()

@@ -223,3 +223,18 @@ export type SyncResult = {
   skipped: number
   errors: string[]
 }
+
+export type StockSyncResult = SyncResult & {
+  /** Products with stocked warehouses that are candidates for sync. */
+  candidates: number
+  /** Candidates whose wcProductId is known (either pre-stored or resolved this run). */
+  matched: number
+  /** Candidates whose SKU was not found in WooCommerce. */
+  unmatched: number
+  /** Whether any batch POST to WC actually succeeded. */
+  pushed: boolean
+  /** Short message explaining the outcome (for UI display). */
+  message: string
+  /** Up to 10 SKUs that could not be matched in WC — shown to operators. */
+  unmatchedSkuSample: string[]
+}
