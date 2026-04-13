@@ -311,12 +311,16 @@ export async function autoAllocateOrder(orderId: string): Promise<{ success: boo
       })
     }
 
-    // Update order status — ensure we go through PROCESSING before ALLOCATED
-    if (['DRAFT', 'PENDING_PAYMENT'].includes(so.status)) {
-      // Transition through PROCESSING first, then to ALLOCATED
-      await db.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
-    } else if (so.status === 'PROCESSING') {
-      await db.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
+    // Only promote to ALLOCATED when at least one allocation was created.
+    // Without this guard, orders with no available stock (e.g. warehouse
+    // filtered out by syncToWoocommerce flag) would be marked ALLOCATED
+    // with zero allocation rows.
+    if (allocations.length > 0) {
+      if (['DRAFT', 'PENDING_PAYMENT'].includes(so.status)) {
+        await db.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
+      } else if (so.status === 'PROCESSING') {
+        await db.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
+      }
     }
 
     revalidatePath('/sales')
@@ -324,12 +328,17 @@ export async function autoAllocateOrder(orderId: string): Promise<{ success: boo
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
-      action: 'allocated',
+      action: allocations.length > 0 ? 'allocated' : 'allocation_failed',
       tag: 'sales',
-      level: 'INFO',
-      description: `Auto-allocated stock for order ${so.wcOrderNumber} — ${allocations.length} allocation(s)`,
+      level: allocations.length > 0 ? 'INFO' : 'WARNING',
+      description: allocations.length > 0
+        ? `Auto-allocated stock for order ${so.wcOrderNumber} — ${allocations.length} allocation(s)`
+        : `No stock available to allocate for order ${so.wcOrderNumber}`,
       metadata: { orderNumber: so.wcOrderNumber, allocations: allocations.length },
     })
+    if (allocations.length === 0) {
+      return { success: false, error: 'No stock available for allocation' }
+    }
     return { success: true }
   } catch (e) {
     return { success: false, error: String(e) }

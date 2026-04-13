@@ -1,0 +1,5 @@
+export const E2E_ADMIN_EMAIL = 'admin@example.com'
+export const E2E_ADMIN_PASSWORD = 'changeme123'
+export const E2E_SUPPLIER_EMAIL = 'supplier@example.com'
+export const E2E_SUPPLIER_PASSWORD = 'changeme123'
+export const E2E_SUPPLIER_ID = 'e2e-supplier'

@@ -169,7 +169,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         {/* Net Sales — bar (current) + line (comparison) */}
         <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">Net Sales</h2>
-          <div className="h-48 sm:h-56">
+          <div className="h-48 sm:h-56 min-w-0">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
@@ -186,7 +186,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         {/* COGS — multi-line (current + comparison) */}
         <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">COGS</h2>
-          <div className="h-48 sm:h-56">
+          <div className="h-48 sm:h-56 min-w-0">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
@@ -204,7 +204,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         {/* Margin % — line (current + comparison) */}
         <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">Margin %</h2>
-          <div className="h-48 sm:h-56">
+          <div className="h-48 sm:h-56 min-w-0">
             <ResponsiveContainer width="100%" height="100%">
               <LineChart data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
@@ -225,7 +225,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         {/* Cash Bridge */}
         <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">Cash Bridge</h2>
-          <div className="h-48 sm:h-56">
+          <div className="h-48 sm:h-56 min-w-0">
             <ResponsiveContainer width="100%" height="100%">
               <BarChart data={bridge} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />

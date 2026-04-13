@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition, useCallback } from 'react'
+import { useState, useTransition, useCallback, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Check, Clock, EllipsisVertical } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -720,6 +720,12 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
   const [error, setError] = useState('')
   const [allocations, setAllocations] = useState<AllocationRow[]>(initialAllocations)
   const [shipments, setShipments] = useState<ShipmentRow[]>(initialShipments)
+
+  // Sync client state from server props when router.refresh() delivers fresh data.
+  // This eliminates the race between refreshAllocations() and router.refresh() —
+  // whichever completes last, state ends up correct.
+  useEffect(() => { setAllocations(initialAllocations) }, [initialAllocations])
+  useEffect(() => { setShipments(initialShipments) }, [initialShipments])
 
   const symbolMap: Record<string, string> = { GBP: '£' }
   const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { GBP: 'PREFIX' }
