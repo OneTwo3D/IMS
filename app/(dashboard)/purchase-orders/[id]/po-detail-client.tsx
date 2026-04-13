@@ -640,7 +640,7 @@ function BillDialog({
 
   return (
     <Dialog open onOpenChange={() => {}}>
-      <DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl max-h-[90vh] overflow-y-auto">
+      <DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>
             {step === 1 ? 'Create Bill — Select Items' : 'Create Bill — Review & Confirm'}
@@ -1127,7 +1127,7 @@ function EditFreightCostsDialog({
 
   return (
     <Dialog open onOpenChange={() => {}}>
-      <DialogContent showCloseButton={false} className="max-w-2xl sm:max-w-2xl max-h-[90vh] overflow-y-auto">
+      <DialogContent showCloseButton={false} className="max-w-2xl sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>Edit Landed Costs — {po.reference}</DialogTitle>
         </DialogHeader>

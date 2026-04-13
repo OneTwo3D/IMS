@@ -661,7 +661,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
 
   return (
     <Dialog open onOpenChange={() => {}}>
-    <DialogContent showCloseButton={false} className="w-[95vw] sm:w-[80vw] max-w-[95vw] sm:max-w-[80vw] max-h-[90vh] overflow-y-auto">
+    <DialogContent showCloseButton={false} className="w-[95vw] sm:w-[80vw] max-w-[95vw] sm:max-w-[80vw]">
     <DialogHeader>
       <DialogTitle>{isEditMode ? `Edit Purchase Order — ${existingPo?.reference ?? ''}` : 'New Purchase Order'}</DialogTitle>
     </DialogHeader>
@@ -830,7 +830,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">Order Lines</h2>
 
         {lines.length > 0 && (
-          <Table>
+          <Table className="min-w-[800px]">
             <TableHeader>
               <TableRow>
                 <TableHead className="text-xs">Product</TableHead>
@@ -992,42 +992,44 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         {additionalCosts.length > 0 && (
           <div className="space-y-2">
             {additionalCosts.map((ac) => (
-              <div key={ac.key} className="flex items-center gap-2">
+              <div key={ac.key} className="flex flex-wrap items-center gap-2">
                 <Input
                   placeholder="Description (e.g. Shipping)"
                   value={ac.description}
                   onChange={(e) => setAdditionalCosts((prev) => prev.map((c) => c.key === ac.key ? { ...c, description: e.target.value } : c))}
-                  className="flex-1 h-8 text-sm"
+                  className="flex-1 min-w-[140px] h-8 text-sm"
                 />
-                <Input
-                  type="number" min="0" step="0.01"
-                  value={ac.amountForeign}
-                  onChange={(e) => setAdditionalCosts((prev) => prev.map((c) => c.key === ac.key ? { ...c, amountForeign: Number(e.target.value) || 0 } : c))}
-                  className="w-28 h-8 text-sm text-right font-mono"
-                />
-                <span className="text-xs text-muted-foreground w-8 shrink-0">{sym}</span>
-                <label className="flex items-center gap-1 text-xs whitespace-nowrap cursor-pointer shrink-0">
-                  <input
-                    type="checkbox"
-                    checked={ac.vatable}
-                    onChange={(e) => setAdditionalCosts((prev) => prev.map((c) => c.key === ac.key ? { ...c, vatable: e.target.checked } : c))}
-                    className="rounded border-input"
+                <div className="flex items-center gap-2">
+                  <Input
+                    type="number" min="0" step="0.01"
+                    value={ac.amountForeign}
+                    onChange={(e) => setAdditionalCosts((prev) => prev.map((c) => c.key === ac.key ? { ...c, amountForeign: Number(e.target.value) || 0 } : c))}
+                    className="w-28 h-8 text-sm text-right font-mono"
                   />
-                  VAT
-                </label>
-                <select
-                  value={ac.distributionMethod}
-                  onChange={(e) => setAdditionalCosts((prev) => prev.map((c) => c.key === ac.key ? { ...c, distributionMethod: e.target.value } : c))}
-                  className="h-8 rounded-md border border-input bg-background px-2 text-xs w-32 shrink-0"
-                >
-                  <option value="BY_VALUE">By Value</option>
-                  <option value="BY_QUANTITY">By Quantity</option>
-                  <option value="BY_WEIGHT">By Weight</option>
-                  <option value="EQUAL_SPLIT">Equal Split</option>
-                </select>
-                <button type="button" onClick={() => setAdditionalCosts((p) => p.filter((c) => c.key !== ac.key))} className="text-muted-foreground hover:text-destructive shrink-0">
-                  <X className="h-4 w-4" />
-                </button>
+                  <span className="text-xs text-muted-foreground w-8 shrink-0">{sym}</span>
+                  <label className="flex items-center gap-1 text-xs whitespace-nowrap cursor-pointer shrink-0">
+                    <input
+                      type="checkbox"
+                      checked={ac.vatable}
+                      onChange={(e) => setAdditionalCosts((prev) => prev.map((c) => c.key === ac.key ? { ...c, vatable: e.target.checked } : c))}
+                      className="rounded border-input"
+                    />
+                    VAT
+                  </label>
+                  <select
+                    value={ac.distributionMethod}
+                    onChange={(e) => setAdditionalCosts((prev) => prev.map((c) => c.key === ac.key ? { ...c, distributionMethod: e.target.value } : c))}
+                    className="h-8 rounded-md border border-input bg-background px-2 text-xs w-32 shrink-0"
+                  >
+                    <option value="BY_VALUE">By Value</option>
+                    <option value="BY_QUANTITY">By Quantity</option>
+                    <option value="BY_WEIGHT">By Weight</option>
+                    <option value="EQUAL_SPLIT">Equal Split</option>
+                  </select>
+                  <button type="button" onClick={() => setAdditionalCosts((p) => p.filter((c) => c.key !== ac.key))} className="text-muted-foreground hover:text-destructive shrink-0">
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
               </div>
             ))}
           </div>
@@ -1037,8 +1039,8 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
       {/* Totals */}
       {lines.length > 0 && (
         <div className="rounded-md border p-4">
-          <div className="flex justify-end">
-            <div className="text-sm space-y-1 min-w-72">
+          <div className="flex sm:justify-end">
+            <div className="text-sm space-y-1 w-full sm:min-w-72 sm:w-auto">
               <div className="flex justify-between text-muted-foreground">
                 <span>Subtotal{pricesIncludeVat ? '' : ' (net)'}</span>
                 <span className="font-mono">{money(lineSubtotalPreOrderDisc)}</span>

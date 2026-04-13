@@ -525,7 +525,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
 
   return (
     <Dialog open onOpenChange={() => {}}>
-      <DialogContent showCloseButton={false} className="w-[95vw] sm:w-[80vw] max-w-[95vw] sm:max-w-[80vw] max-h-[90vh] overflow-y-auto">
+      <DialogContent showCloseButton={false} className="w-[95vw] sm:w-[80vw] max-w-[95vw] sm:max-w-[80vw]">
         <DialogHeader>
           <DialogTitle>New Sales Order</DialogTitle>
         </DialogHeader>
@@ -629,7 +629,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
           <div className="rounded-md border p-4 space-y-3">
             <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">Line Items</h2>
             {lines.length > 0 && (
-              <Table>
+              <Table className="min-w-[800px]">
                 <TableHeader>
                   <TableRow>
                     <TableHead className="text-xs">Product</TableHead>
@@ -746,36 +746,40 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
           {/* Shipping & Fees */}
           <div className="rounded-md border p-4 space-y-3">
             <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">Shipping & Fees</h2>
-            <div className="flex items-center gap-3">
-              <Label className="w-24 shrink-0 text-sm">Shipping</Label>
+            <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+              <Label className="w-full sm:w-24 shrink-0 text-sm">Shipping</Label>
               <Input
                 value={shippingService}
                 onChange={(e) => setShippingService(e.target.value)}
                 placeholder="e.g. Royal Mail, DPD Next Day"
-                className="flex-1 h-8 text-sm"
+                className="flex-1 min-w-[140px] h-8 text-sm"
               />
-              <Input type="number" min="0" step="0.01" value={shippingAmount}
-                onChange={(e) => setShippingAmount(Number(e.target.value) || 0)}
-                className="w-28 h-8 text-sm text-right font-mono" />
-              <span className="text-xs text-muted-foreground shrink-0">{sym}</span>
-              {taxRateId && (
-                <span className="text-xs text-muted-foreground shrink-0">
-                  {pricesIncludeVat ? 'incl.' : 'excl.'} VAT
-                </span>
-              )}
+              <div className="flex items-center gap-2">
+                <Input type="number" min="0" step="0.01" value={shippingAmount}
+                  onChange={(e) => setShippingAmount(Number(e.target.value) || 0)}
+                  className="w-28 h-8 text-sm text-right font-mono" />
+                <span className="text-xs text-muted-foreground shrink-0">{sym}</span>
+                {taxRateId && (
+                  <span className="text-xs text-muted-foreground shrink-0">
+                    {pricesIncludeVat ? 'incl.' : 'excl.'} VAT
+                  </span>
+                )}
+              </div>
             </div>
             {fees.map((f) => (
-              <div key={f.key} className="flex items-center gap-2">
+              <div key={f.key} className="flex flex-wrap items-center gap-2">
                 <Input placeholder="Fee description" value={f.description}
                   onChange={(e) => setFees((p) => p.map((ff) => ff.key === f.key ? { ...ff, description: e.target.value } : ff))}
-                  className="flex-1 h-8 text-sm" />
-                <Input type="number" min="0" step="0.01" value={f.amount}
-                  onChange={(e) => setFees((p) => p.map((ff) => ff.key === f.key ? { ...ff, amount: Number(e.target.value) || 0 } : ff))}
-                  className="w-28 h-8 text-sm text-right font-mono" />
-                <span className="text-xs text-muted-foreground w-8">{sym}</span>
-                <button type="button" onClick={() => setFees((p) => p.filter((ff) => ff.key !== f.key))} className="text-muted-foreground hover:text-destructive">
-                  <X className="h-4 w-4" />
-                </button>
+                  className="flex-1 min-w-[140px] h-8 text-sm" />
+                <div className="flex items-center gap-2">
+                  <Input type="number" min="0" step="0.01" value={f.amount}
+                    onChange={(e) => setFees((p) => p.map((ff) => ff.key === f.key ? { ...ff, amount: Number(e.target.value) || 0 } : ff))}
+                    className="w-28 h-8 text-sm text-right font-mono" />
+                  <span className="text-xs text-muted-foreground w-8">{sym}</span>
+                  <button type="button" onClick={() => setFees((p) => p.filter((ff) => ff.key !== f.key))} className="text-muted-foreground hover:text-destructive">
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
               </div>
             ))}
             <Button variant="outline" size="sm" onClick={() => setFees((p) => [...p, { key: makeKey(), description: '', amount: 0 }])}>
@@ -786,8 +790,8 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
           {/* Totals */}
           {lines.length > 0 && (
             <div className="rounded-md border p-4">
-              <div className="flex justify-end">
-                <div className="text-sm space-y-1 min-w-72">
+              <div className="flex sm:justify-end">
+                <div className="text-sm space-y-1 w-full sm:min-w-72 sm:w-auto">
                   <div className="flex justify-between text-muted-foreground">
                     <span>Subtotal{pricesIncludeVat ? '' : ' (net)'}</span>
                     <span className="font-mono">{money(linesGrossBeforeOrderDisc)}</span>

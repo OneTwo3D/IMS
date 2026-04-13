@@ -101,7 +101,7 @@ export function TransferFormDialog({ warehouses, products, stockLevels, onCreate
 
   return (
     <Dialog open onOpenChange={() => {}}>
-      <DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl max-h-[90vh] overflow-y-auto">
+      <DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>New Stock Transfer</DialogTitle>
         </DialogHeader>

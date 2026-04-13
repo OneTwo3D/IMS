@@ -164,10 +164,10 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
     })
   }
   return (
-    <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl max-h-[90vh] overflow-y-auto">
+    <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl">
       <DialogHeader><DialogTitle>Process Refund</DialogTitle></DialogHeader>
       <div className="space-y-4">
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div className="space-y-1.5"><Label>Reason *</Label><Input value={reason} onChange={(e) => setReason(e.target.value)} placeholder="e.g. Customer request" className="h-9 text-sm" /></div>
           <div className="space-y-1.5"><Label>Return to Warehouse</Label>
             <select value={returnWhId} onChange={(e) => setReturnWhId(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
@@ -259,7 +259,7 @@ function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, defaultA
     <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
       <DialogHeader><DialogTitle>Add Payment{creditNoteNumber ? ` — ${creditNoteNumber}` : ''}</DialogTitle></DialogHeader>
       <div className="space-y-3 text-sm">
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           <div className="space-y-1.5">
             <Label>Amount ({currency}) *</Label>
             <Input type="number" min="0.01" step="0.01" value={amount} onChange={(e) => setAmount(e.target.value)} className="h-9 font-mono" />
@@ -1335,11 +1335,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
 
       {/* Invoice detail dialog */}
       {showInvoice && so.invoiceNumber && (
-        <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl max-h-[90vh] overflow-y-auto">
+        <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl">
           <DialogHeader><DialogTitle>Invoice {so.invoiceNumber}</DialogTitle></DialogHeader>
           <div className="space-y-4">
             {/* Invoice header */}
-            <div className="grid grid-cols-3 gap-4 text-sm">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4 text-sm">
               <div>
                 <span className="text-muted-foreground text-xs">Invoice Number</span>
                 <p className="font-medium font-mono">{so.invoiceNumber}</p>
@@ -1356,7 +1356,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
                 <span className="text-muted-foreground text-xs">Customer</span>
                 <p className="font-medium">{so.customerName ?? '—'}</p>
               </div>
-              <div className="col-span-2">
+              <div className="sm:col-span-2">
                 <span className="text-muted-foreground text-xs">Billing Address</span>
                 <p className="text-xs mt-0.5">{so.billingAddress ? (() => { const a = so.billingAddress as Record<string, string>; return [a.line1, a.line2, a.city, a.county, a.postcode, a.country].filter(Boolean).join(', ') || '—' })() : '—'}</p>
               </div>

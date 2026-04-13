@@ -128,12 +128,12 @@ function CustomerFormDialog({ customer, onClose }: { customer: CustomerRow | nul
 
   return (
     <Dialog open onOpenChange={() => {}}>
-      <DialogContent showCloseButton={false} className="max-w-2xl sm:max-w-2xl max-h-[90vh] overflow-y-auto">
+      <DialogContent showCloseButton={false} className="max-w-2xl sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle>{customer ? 'Edit Customer' : 'New Customer'}</DialogTitle>
         </DialogHeader>
         <div className="space-y-4 text-sm">
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label>First Name *</Label>
               <Input value={firstName} onChange={(e) => setFirstName(e.target.value)} className="h-9" />
@@ -160,7 +160,7 @@ function CustomerFormDialog({ customer, onClose }: { customer: CustomerRow | nul
             </div>
           </div>
 
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <AddressFields label="Billing Address" value={billing} onChange={handleBillingChange} />
             <div>
               <div className="flex items-center justify-between mb-2">

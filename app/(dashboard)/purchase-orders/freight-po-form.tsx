@@ -125,7 +125,7 @@ export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onC
 
   return (
     <Dialog open onOpenChange={() => {}}>
-      <DialogContent showCloseButton={false} className="w-[80vw] max-w-[80vw] sm:max-w-[80vw] max-h-[90vh] overflow-y-auto">
+      <DialogContent showCloseButton={false} className="w-[95vw] sm:w-[80vw] max-w-[95vw] sm:max-w-[80vw]">
         <DialogHeader>
           <DialogTitle>New Landed Cost PO</DialogTitle>
         </DialogHeader>
@@ -134,7 +134,7 @@ export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onC
           {/* Header */}
           <div className="rounded-md border p-4 space-y-4">
             <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">Freight / Landed Cost Details</h2>
-            <div className="grid grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div className="space-y-1.5">
                 <Label>Supplier (e.g. FedEx, DHL) *</Label>
                 <select
@@ -239,42 +239,44 @@ export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onC
             ) : (
               <div className="space-y-2">
                 {costLines.map((cl) => (
-                  <div key={cl.key} className="flex items-center gap-2">
+                  <div key={cl.key} className="flex flex-wrap items-center gap-2">
                     <Input
                       placeholder="Description (e.g. Shipping, Customs, Insurance)"
                       value={cl.description}
                       onChange={(e) => setCostLines((p) => p.map((c) => c.key === cl.key ? { ...c, description: e.target.value } : c))}
-                      className="flex-1 h-8 text-sm"
+                      className="flex-1 min-w-[140px] h-8 text-sm"
                     />
-                    <Input
-                      type="number" min="0" step="0.01"
-                      value={cl.amountForeign}
-                      onChange={(e) => setCostLines((p) => p.map((c) => c.key === cl.key ? { ...c, amountForeign: Number(e.target.value) || 0 } : c))}
-                      className="w-28 h-8 text-sm text-right font-mono"
-                    />
-                    <span className="text-xs text-muted-foreground w-8 shrink-0">{sym}</span>
-                    <label className="flex items-center gap-1 text-xs whitespace-nowrap cursor-pointer shrink-0">
-                      <input
-                        type="checkbox"
-                        checked={cl.vatable}
-                        onChange={(e) => setCostLines((p) => p.map((c) => c.key === cl.key ? { ...c, vatable: e.target.checked } : c))}
-                        className="rounded border-input"
+                    <div className="flex items-center gap-2">
+                      <Input
+                        type="number" min="0" step="0.01"
+                        value={cl.amountForeign}
+                        onChange={(e) => setCostLines((p) => p.map((c) => c.key === cl.key ? { ...c, amountForeign: Number(e.target.value) || 0 } : c))}
+                        className="w-28 h-8 text-sm text-right font-mono"
                       />
-                      VAT
-                    </label>
-                    <select
-                      value={cl.distributionMethod}
-                      onChange={(e) => setCostLines((p) => p.map((c) => c.key === cl.key ? { ...c, distributionMethod: e.target.value } : c))}
-                      className="h-8 rounded-md border border-input bg-background px-2 text-xs w-32 shrink-0"
-                    >
-                      <option value="BY_VALUE">By Value</option>
-                      <option value="BY_QUANTITY">By Quantity</option>
-                      <option value="BY_WEIGHT">By Weight</option>
-                      <option value="EQUAL_SPLIT">Equal Split</option>
-                    </select>
-                    <button type="button" onClick={() => setCostLines((p) => p.filter((c) => c.key !== cl.key))} className="text-muted-foreground hover:text-destructive shrink-0">
-                      <X className="h-4 w-4" />
-                    </button>
+                      <span className="text-xs text-muted-foreground w-8 shrink-0">{sym}</span>
+                      <label className="flex items-center gap-1 text-xs whitespace-nowrap cursor-pointer shrink-0">
+                        <input
+                          type="checkbox"
+                          checked={cl.vatable}
+                          onChange={(e) => setCostLines((p) => p.map((c) => c.key === cl.key ? { ...c, vatable: e.target.checked } : c))}
+                          className="rounded border-input"
+                        />
+                        VAT
+                      </label>
+                      <select
+                        value={cl.distributionMethod}
+                        onChange={(e) => setCostLines((p) => p.map((c) => c.key === cl.key ? { ...c, distributionMethod: e.target.value } : c))}
+                        className="h-8 rounded-md border border-input bg-background px-2 text-xs w-32 shrink-0"
+                      >
+                        <option value="BY_VALUE">By Value</option>
+                        <option value="BY_QUANTITY">By Quantity</option>
+                        <option value="BY_WEIGHT">By Weight</option>
+                        <option value="EQUAL_SPLIT">Equal Split</option>
+                      </select>
+                      <button type="button" onClick={() => setCostLines((p) => p.filter((c) => c.key !== cl.key))} className="text-muted-foreground hover:text-destructive shrink-0">
+                        <X className="h-4 w-4" />
+                      </button>
+                    </div>
                   </div>
                 ))}
               </div>
@@ -282,8 +284,8 @@ export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onC
 
             {/* Totals */}
             {costLines.length > 0 && (
-              <div className="flex justify-end border-t pt-3">
-                <div className="text-sm space-y-1 min-w-56">
+              <div className="flex sm:justify-end border-t pt-3">
+                <div className="text-sm space-y-1 w-full sm:min-w-56 sm:w-auto">
                   <div className="flex justify-between text-muted-foreground">
                     <span>Subtotal</span>
                     <span className="font-mono">{money(subtotal)}</span>

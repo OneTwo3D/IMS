@@ -360,7 +360,7 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
 
   return (
     <Dialog open onOpenChange={() => {}}>
-      <DialogContent showCloseButton={false} className="max-w-2xl sm:max-w-2xl max-h-[90vh] overflow-y-auto">
+      <DialogContent showCloseButton={false} className="max-w-2xl sm:max-w-2xl">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <Factory className="h-5 w-5" />
@@ -446,7 +446,7 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
             </div>
 
             {/* Warehouse + Manufacturer */}
-            <div className="grid grid-cols-2 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
               <div className="space-y-1.5">
                 <Label className="text-xs">Warehouse</Label>
                 <select
@@ -532,7 +532,7 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
             )}
 
             {/* Quantity + Date */}
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
               <div className="space-y-1.5">
                 <Label className="text-xs">Quantity</Label>
                 <Input

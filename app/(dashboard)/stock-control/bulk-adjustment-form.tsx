@@ -86,7 +86,7 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
 
   return (
     <Dialog open onOpenChange={() => {}}>
-      <DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl max-h-[90vh] overflow-y-auto">
+      <DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>New Stock Adjustment</DialogTitle>
         </DialogHeader>
