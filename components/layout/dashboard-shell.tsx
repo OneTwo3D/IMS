@@ -1,7 +1,6 @@
 'use client'
 
-import { useState, useEffect } from 'react'
-import { usePathname } from 'next/navigation'
+import { useState } from 'react'
 import { Sidebar } from './sidebar'
 import { Topbar } from './topbar'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
@@ -26,13 +25,6 @@ export function DashboardShell({
   children,
 }: DashboardShellProps) {
   const [mobileOpen, setMobileOpen] = useState(false)
-  const pathname = usePathname()
-
-  useEffect(() => {
-    if (!mobileOpen) return
-    const frame = requestAnimationFrame(() => setMobileOpen(false))
-    return () => cancelAnimationFrame(frame)
-  }, [pathname, mobileOpen])
 
   return (
     <div className="flex h-screen overflow-hidden">
