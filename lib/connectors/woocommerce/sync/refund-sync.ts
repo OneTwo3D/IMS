@@ -5,7 +5,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { wcFetch } from '../api'
-import type { WcRefund, WcFullOrder } from './types'
+import type { WcRefund } from './types'
 
 export async function syncWcRefund(
   wcOrderId: number,

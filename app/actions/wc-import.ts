@@ -8,7 +8,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requirePermission } from '@/lib/auth/server'
 
 export type HistoricalImportProgress = {
   status: 'idle' | 'running' | 'done' | 'error'

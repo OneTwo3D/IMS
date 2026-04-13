@@ -271,17 +271,17 @@ export function ContactsClient({ initialCustomers }: Props) {
   const [gdprTarget, setGdprTarget] = useState<CustomerRow | undefined>(undefined)
   const [search, setSearch] = useState('')
 
-  // Column visibility
-  const [visible, setVisible] = useState<Record<ColKey, boolean>>(defaultVisibility)
-  const [pickerOpen, setPickerOpen] = useState(false)
-  const pickerRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
+  // Column visibility (lazy init from localStorage)
+  const [visible, setVisible] = useState<Record<ColKey, boolean>>(() => {
+    if (typeof window === 'undefined') return defaultVisibility
     try {
       const stored = localStorage.getItem(LS_KEY)
-      if (stored) setVisible(JSON.parse(stored))
+      if (stored) return JSON.parse(stored)
     } catch { /* ignore */ }
-  }, [])
+    return defaultVisibility
+  })
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const pickerRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     function handler(e: MouseEvent) {

@@ -24,11 +24,6 @@ import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { hasPermission, type Permission } from '@/lib/permissions'
 
-const NAV_ITEMS_TOP = [
-  { href: '/dashboard',       label: 'Dashboard',       icon: LayoutDashboard },
-  { href: '/inventory',       label: 'Inventory',        icon: Package },
-]
-
 const STOCK_CONTROL_CHILDREN = [
   { href: '/stock-control/stock-adjustments', label: 'Stock Adjustments' },
   { href: '/stock-control/transfers',  label: 'Warehouse Transfers' },
@@ -62,13 +57,6 @@ const SETTINGS_CHILDREN = [
   { href: '/settings/system',      label: 'System' },
 ]
 
-const NAV_ITEMS_BOTTOM = [
-  { href: '/manufacturing',   label: 'Manufacturing',    icon: Factory },
-  { href: '/sync',            label: 'Sync',             icon: RefreshCw },
-  { href: '/activity',        label: 'Activity',         icon: ActivitySquare },
-  { href: '/help',            label: 'Help',             icon: HelpCircle },
-]
-
 // Supplier-specific navigation
 const SUPPLIER_NAV = [
   { href: '/supplier/rfqs',     label: 'RFQs',         icon: ShoppingCart },
@@ -97,6 +85,7 @@ export function Sidebar({ companyName, logoUrl, userRole = 'ADMIN', onNavigate, 
         <div className={cn('flex h-14 items-center border-b px-3', collapsed && 'justify-center')}>
           <Link href="/supplier/rfqs" className="flex items-center gap-2 font-semibold">
             {logoUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
               <img src={logoUrl} alt="" className="h-7 w-7 shrink-0 rounded-md object-contain" />
             ) : (
               <span className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md bg-primary text-primary-foreground text-xs font-bold">12</span>
@@ -151,23 +140,23 @@ export function Sidebar({ companyName, logoUrl, userRole = 'ADMIN', onNavigate, 
         {can('dashboard') && <NavItem href="/dashboard" label="Dashboard" icon={LayoutDashboard} collapsed={collapsed} onNavigate={onNavigate} />}
         {can('inventory') && <NavItem href="/inventory" label="Inventory" icon={Package} collapsed={collapsed} onNavigate={onNavigate} />}
         {can('stock_control') && (
-          <NavGroup label="Stock Control" icon={Warehouse} children={STOCK_CONTROL_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
+          <NavGroup label="Stock Control" icon={Warehouse} items={STOCK_CONTROL_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
         {can('purchasing') && (
-          <NavGroup label="Purchases" icon={ShoppingCart} children={PURCHASES_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
+          <NavGroup label="Purchases" icon={ShoppingCart} items={PURCHASES_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
         {can('sales') && (
-          <NavGroup label="Sales" icon={TrendingUp} children={SALES_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
+          <NavGroup label="Sales" icon={TrendingUp} items={SALES_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
         {can('analytics') && (
-          <NavGroup label="Analytics" icon={BarChart3} children={ANALYTICS_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
+          <NavGroup label="Analytics" icon={BarChart3} items={ANALYTICS_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
         {can('manufacturing') && <NavItem href="/manufacturing" label="Manufacturing" icon={Factory} collapsed={collapsed} onNavigate={onNavigate} />}
         {can('sync') && <NavItem href="/sync" label="Integrations" icon={RefreshCw} collapsed={collapsed} onNavigate={onNavigate} />}
         {can('activity_log') && <NavItem href="/activity" label="Activity" icon={ActivitySquare} collapsed={collapsed} onNavigate={onNavigate} />}
         <NavItem href="/help" label="Help" icon={HelpCircle} collapsed={collapsed} onNavigate={onNavigate} />
         {can('settings') && (
-          <NavGroup label="Settings" icon={Settings} children={SETTINGS_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
+          <NavGroup label="Settings" icon={Settings} items={SETTINGS_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
       </nav>
 

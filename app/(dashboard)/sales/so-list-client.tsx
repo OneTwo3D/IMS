@@ -175,7 +175,7 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
     setPickerDraft((prev) => {
       const n = new Set(prev)
       if (FIXED_COLS.includes(key)) return n
-      n.has(key) ? n.delete(key) : n.add(key)
+      if (n.has(key)) n.delete(key); else n.add(key)
       return n
     })
   }
@@ -183,7 +183,7 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
   function toggleStatus(s: SoStatus) {
     setStatusFilters((prev) => {
       const n = new Set(prev)
-      n.has(s) ? n.delete(s) : n.add(s)
+      if (n.has(s)) n.delete(s); else n.add(s)
       return n
     })
     // Lazy-fetch completed/delivered on first request
@@ -261,7 +261,8 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
         return (
           <TableCell key={key} className="text-xs">
             {so.wcOrderId
-              ? <img src="/images/woocommerce.svg" alt="WC" className="h-3.5 w-auto" title="WooCommerce" />
+              ? /* eslint-disable-next-line @next/next/no-img-element */
+              <img src="/images/woocommerce.svg" alt="WC" className="h-3.5 w-auto" title="WooCommerce" />
               : <span className="text-muted-foreground">Manual</span>}
           </TableCell>
         )
@@ -270,6 +271,7 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
           <TableCell key={key} className="text-xs">
             {so.shippingCountryCode ? (
               <span className="inline-flex items-center gap-1">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={`https://flagcdn.com/16x12/${so.shippingCountryCode.toLowerCase()}.png`}
                   alt={so.shippingCountryCode}

@@ -3,7 +3,7 @@
 import { useState, useTransition, useRef } from 'react'
 import { useRouter } from 'next/navigation'
 import {
-  Building2, Palette, Hash, Mail, FileText, Upload, Loader2, Check, X, Trash2, Camera, Eye, ExternalLink,
+  Building2, Palette, Hash, Mail, FileText, Upload, Loader2, Check, Trash2, Camera, Eye,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'

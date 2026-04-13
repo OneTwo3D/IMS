@@ -4,7 +4,7 @@ import { useState, useTransition, useEffect, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import {
   Search, Plus, Download, Filter, ChevronLeft, ChevronRight,
-  Factory, AlertTriangle, Loader2, Check, X,
+  Factory, AlertTriangle, Loader2, X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -282,30 +282,42 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
     }).catch(() => { setLoading(false) })
   }, [])
 
-  // When product or warehouse changes, recalculate stock
+  // Reset stock info when deps change (render-time state adjustment)
+  const [prevStockDeps, setPrevStockDeps] = useState({ product: selectedProduct, warehouse: warehouseId, type: orderType })
+  if (
+    selectedProduct !== prevStockDeps.product ||
+    warehouseId !== prevStockDeps.warehouse ||
+    orderType !== prevStockDeps.type
+  ) {
+    setPrevStockDeps({ product: selectedProduct, warehouse: warehouseId, type: orderType })
+    setMaxUnits(null)
+    setComponentStocks([])
+    if (selectedProduct && warehouseId) setLoadingStock(true)
+  }
+
+  // Fetch stock data asynchronously
   useEffect(() => {
-    if (!selectedProduct || !warehouseId) {
-      setMaxUnits(null)
-      setComponentStocks([])
-      return
-    }
-    setLoadingStock(true)
+    if (!selectedProduct || !warehouseId) return
+    let cancelled = false
     if (orderType === 'ASSEMBLY') {
       Promise.all([
         getMaxAssembly(selectedProduct.id, warehouseId),
         getComponentStock(selectedProduct.id, warehouseId),
       ]).then(([max, stocks]) => {
+        if (cancelled) return
         setMaxUnits(max)
         setComponentStocks(stocks)
         setLoadingStock(false)
-      }).catch(() => { setLoadingStock(false) })
+      }).catch(() => { if (!cancelled) setLoadingStock(false) })
     } else {
       getDisassemblyStock(selectedProduct.id, warehouseId).then((max) => {
+        if (cancelled) return
         setMaxUnits(max)
         setComponentStocks([])
         setLoadingStock(false)
-      }).catch(() => { setLoadingStock(false) })
+      }).catch(() => { if (!cancelled) setLoadingStock(false) })
     }
+    return () => { cancelled = true }
   }, [selectedProduct, warehouseId, orderType])
 
   // When product changes, preselect last manufacturer

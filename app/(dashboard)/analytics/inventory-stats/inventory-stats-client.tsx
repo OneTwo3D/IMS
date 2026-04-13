@@ -1,8 +1,7 @@
 'use client'
 
-import { useState, useMemo, useTransition } from 'react'
+import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import Link from 'next/link'
 import { Filter, X, Plus, ArrowUp, ArrowDown, Download, Settings2, Save, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -169,7 +168,7 @@ function FilterDialog({ fields, rules, onApply, onClose }: { fields: FieldDef[];
 // ---------------------------------------------------------------------------
 function ColumnPickerDialog({ fields, visible, onApply, onClose }: { fields: FieldDef[]; visible: string[]; onApply: (c: string[]) => void; onClose: () => void }) {
   const [local, setLocal] = useState<Set<string>>(new Set(visible))
-  function toggle(key: string) { setLocal((prev) => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n }) }
+  function toggle(key: string) { setLocal((prev) => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n }) }
   return (<Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-sm sm:max-w-sm"><DialogHeader><DialogTitle>Columns</DialogTitle></DialogHeader>
     <div className="space-y-1 max-h-80 overflow-y-auto">{fields.map((f) => (
       <label key={f.key} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-muted rounded px-2 py-1"><input type="checkbox" checked={local.has(f.key)} onChange={() => toggle(f.key)} className="rounded border-input" />{f.label}</label>
@@ -196,7 +195,6 @@ const MOVEMENT_LABELS: Record<string, string> = {
 }
 
 export function InventoryStatsClient({ stockOnHand, movements, allocations, reorder, savedViews }: Props) {
-  const router = useRouter(); const [isPending, startTransition] = useTransition()
   const [tab, setTab] = useState<Tab>('onhand')
   const [filterRules, setFilterRules] = useState<FilterRule[]>([])
   const [visibleColsMap, setVisibleColsMap] = useState<Record<Tab, string[]>>({ ...DEFAULT_COLS })
@@ -248,10 +246,10 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
   }
 
   // Filtered data per tab
-  const filteredOnHand = useMemo(() => filterAndSort(stockOnHand), [stockOnHand, filterRules, sortCol, sortDir])
-  const filteredMovements = useMemo(() => filterAndSort(movements), [movements, filterRules, sortCol, sortDir])
-  const filteredAllocations = useMemo(() => filterAndSort(allocations), [allocations, filterRules, sortCol, sortDir])
-  const filteredReorder = useMemo(() => filterAndSort(reorder), [reorder, filterRules, sortCol, sortDir])
+  const filteredOnHand = filterAndSort(stockOnHand)
+  const filteredMovements = filterAndSort(movements)
+  const filteredAllocations = filterAndSort(allocations)
+  const filteredReorder = filterAndSort(reorder)
 
   const totalQty = stockOnHand.reduce((s, r) => s + r.quantity, 0)
   const totalReserved = stockOnHand.reduce((s, r) => s + r.reservedQty, 0)

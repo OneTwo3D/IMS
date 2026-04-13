@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo, useTransition } from 'react'
+import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { Filter, X, Plus, ArrowUp, ArrowDown, Download, Settings2, Save, Loader2, FileText } from 'lucide-react'
@@ -132,7 +132,7 @@ function FilterDialog({ fields, rules, onApply, onClose }: { fields: FieldDef[];
 function ColumnPickerDialog({ fields, visible, onApply, onClose }: { fields: FieldDef[]; visible: string[]; onApply: (c: string[]) => void; onClose: () => void }) {
   const [s, setS] = useState<Set<string>>(new Set(visible))
   return (<Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-sm sm:max-w-sm"><DialogHeader><DialogTitle>Columns</DialogTitle></DialogHeader>
-    <div className="space-y-1 max-h-80 overflow-y-auto">{fields.map((f) => (<label key={f.key} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-muted rounded px-2 py-1"><input type="checkbox" checked={s.has(f.key)} onChange={() => setS((p) => { const n = new Set(p); n.has(f.key) ? n.delete(f.key) : n.add(f.key); return n })} className="rounded border-input" />{f.label}</label>))}</div>
+    <div className="space-y-1 max-h-80 overflow-y-auto">{fields.map((f) => (<label key={f.key} className="flex items-center gap-2 text-sm cursor-pointer hover:bg-muted rounded px-2 py-1"><input type="checkbox" checked={s.has(f.key)} onChange={() => setS((p) => { const n = new Set(p); if (n.has(f.key)) n.delete(f.key); else n.add(f.key); return n })} className="rounded border-input" />{f.label}</label>))}</div>
     <DialogFooter><Button variant="outline" onClick={onClose}>Cancel</Button><Button onClick={() => { onApply(Array.from(s)); onClose() }}>Apply</Button></DialogFooter>
   </DialogContent></Dialog>)
 }
@@ -146,7 +146,6 @@ function SaveViewDialog({ tab, columns, filters, onClose }: { tab: string; colum
 }
 
 export function PurchaseStatsClient({ products, received, bills, aging, details, savedViews }: Props) {
-  const router = useRouter(); const [isPending, startTransition] = useTransition()
   const [tab, setTab] = useState<Tab>('products')
   const [filterRules, setFilterRules] = useState<FilterRule[]>([])
   const [showFilter, setShowFilter] = useState(false); const [showColPicker, setShowColPicker] = useState(false); const [showSaveView, setShowSaveView] = useState(false)
@@ -192,11 +191,11 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
     return result
   }
 
-  const fp = useMemo(() => filterAndSort(products), [products, filterRules, sortCol, sortDir])
-  const filteredReceived = useMemo(() => filterAndSort(received), [received, filterRules, sortCol, sortDir])
-  const filteredBills = useMemo(() => filterAndSort(bills), [bills, filterRules, sortCol, sortDir])
-  const filteredAging = useMemo(() => filterAndSort(aging), [aging, filterRules, sortCol, sortDir])
-  const filteredDetails = useMemo(() => filterAndSort(details), [details, filterRules, sortCol, sortDir])
+  const fp = filterAndSort(products)
+  const filteredReceived = filterAndSort(received)
+  const filteredBills = filterAndSort(bills)
+  const filteredAging = filterAndSort(aging)
+  const filteredDetails = filterAndSort(details)
 
   const SI = ({ c }: { c: string }) => sortCol === c ? (sortDir === 'asc' ? <ArrowUp className="h-3 w-3 inline" /> : <ArrowDown className="h-3 w-3 inline" />) : null
 
@@ -295,9 +294,9 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
     return <span className="text-xs">{String(v)}</span>
   }
 
-  // Generic table for non-product tabs
+  // Render helper for non-product tabs (not a component — avoids re-creation during render)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  function GenericTable({ data, tabKey, emptyMsg }: { data: any[]; tabKey: Tab; emptyMsg: string }) {
+  function renderGenericTable(data: any[], tabKey: Tab, emptyMsg: string) {
     const cols = visibleColsMap[tabKey]
     return (
       <div className="rounded-md border">
@@ -377,10 +376,10 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
       </div>)}
 
       {/* Other tabs — generic filterable/sortable tables */}
-      {tab === 'received' && <GenericTable data={filteredReceived} tabKey="received" emptyMsg="No receipts." />}
-      {tab === 'bills' && <GenericTable data={filteredBills} tabKey="bills" emptyMsg="No bills." />}
-      {tab === 'aging' && <GenericTable data={filteredAging} tabKey="aging" emptyMsg="No data." />}
-      {tab === 'details' && <GenericTable data={filteredDetails} tabKey="details" emptyMsg="No POs." />}
+      {tab === 'received' && renderGenericTable(filteredReceived, 'received', 'No receipts.')}
+      {tab === 'bills' && renderGenericTable(filteredBills, 'bills', 'No bills.')}
+      {tab === 'aging' && renderGenericTable(filteredAging, 'aging', 'No data.')}
+      {tab === 'details' && renderGenericTable(filteredDetails, 'details', 'No POs.')}
 
       {showFilter && <FilterDialog fields={fields} rules={filterRules} onApply={setFilterRules} onClose={() => setShowFilter(false)} />}
       {showColPicker && <ColumnPickerDialog fields={fields} visible={visibleCols} onApply={setVisibleCols} onClose={() => setShowColPicker(false)} />}

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition, useEffect } from 'react'
+import { useState, useTransition } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { Plus, Pencil, X, Loader2, Check } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -311,17 +311,21 @@ function SupplierFormDialog({
 export function SuppliersClient({ initialSuppliers, taxRates, currencies }: Props) {
   const router = useRouter()
   const searchParams = useSearchParams()
-  const [isPending, startTransition] = useTransition()
+  const [, startTransition] = useTransition()
   const [editing, setEditing] = useState<SupplierRow | null | undefined>(undefined)
   const [toggling, setToggling] = useState<string | null>(null)
 
-  // Auto-open edit dialog when navigated with ?edit=<supplierId>
-  useEffect(() => {
-    const editId = searchParams.get('edit')
-    if (!editId) return
+  // Auto-open edit dialog when navigated with ?edit=<supplierId> (render-time)
+  const editId = searchParams.get('edit')
+  const [prevEditId, setPrevEditId] = useState<string | null>(null)
+  if (editId && editId !== prevEditId) {
+    setPrevEditId(editId)
     const match = initialSuppliers.find((s) => s.id === editId)
     if (match) setEditing(match)
-  }, [searchParams, initialSuppliers])
+  }
+  if (!editId && prevEditId) {
+    setPrevEditId(null)
+  }
 
   function handleToggleActive(s: SupplierRow) {
     setToggling(s.id)

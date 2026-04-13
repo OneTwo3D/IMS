@@ -204,6 +204,7 @@ export function VariantGenerator({ productId, initialOptions, variants }: Props)
                   <TableCell className="w-12 px-2 py-1">
                     <Link href={`/inventory/${v.id}`} className="block">
                       {v.imageUrl ? (
+                        /* eslint-disable-next-line @next/next/no-img-element */
                         <img src={v.imageUrl} alt={v.name} className="h-8 w-8 rounded object-cover border border-border bg-muted" />
                       ) : (
                         <span className="flex h-8 w-8 items-center justify-center rounded border border-border bg-muted text-muted-foreground">

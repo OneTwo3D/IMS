@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { Loader2, Plus, Pencil, Shield, ShieldCheck, User, Factory, Eye, BarChart3, Warehouse } from 'lucide-react'
+import { Loader2, Plus, Pencil, Shield, ShieldCheck, Factory, Eye, BarChart3, Warehouse } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'

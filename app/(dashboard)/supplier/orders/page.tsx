@@ -1,6 +1,5 @@
 import type { Metadata } from 'next'
 import { redirect } from 'next/navigation'
-import Link from 'next/link'
 import { requireAuth } from '@/lib/auth/server'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { getSupplierOrders } from '@/app/actions/supplier-portal'

@@ -129,7 +129,7 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
     if (wcProduct.type === 'variable' && wcProduct.variations?.length > 0) {
       const parent = await db.product.findFirst({ where: { sku: wcProduct.sku } })
       if (parent) {
-        await syncVariations(wcProduct.id, parent.id, wcProduct.name, wcProduct.attributes)
+        await syncVariations(wcProduct.id, parent.id, wcProduct.name)
       }
     }
 
@@ -193,7 +193,6 @@ async function syncVariations(
   wcParentId: number,
   imsParentId: string,
   parentName: string,
-  parentAttributes: WcFullProduct['attributes'],
 ) {
   let page = 1
   let totalPages = 1

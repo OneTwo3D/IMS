@@ -96,7 +96,8 @@ export type MappedLine = {
 
 export async function mapWcLineItems(
   lineItems: WcLineItem[],
-  fxRate: number,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  _fxRate: number,
 ): Promise<MappedLine[]> {
   // Build SKU→product lookup
   const skus = lineItems.map((l) => l.sku).filter(Boolean)

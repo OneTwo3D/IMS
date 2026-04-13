@@ -9,7 +9,7 @@
 
 import { db } from '@/lib/db'
 import { sendEmail } from '@/lib/mailer'
-import { renderEmailHtml, type EmailTemplateType } from '@/lib/email-template'
+import { renderEmailHtml } from '@/lib/email-template'
 import { getBranding } from '@/lib/pdf'
 import { formatMoney, type SymbolPos } from '@/lib/utils'
 import { logActivity } from '@/lib/activity-log'

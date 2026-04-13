@@ -67,14 +67,6 @@ function hexToRgb(hex: string): [number, number, number] {
   return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)]
 }
 
-/** Returns white or black text depending on background luminance */
-function contrastText(bgHex: string): string {
-  const [r, g, b] = hexToRgb(bgHex)
-  // Relative luminance (sRGB)
-  const luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
-  return luminance > 0.55 ? '#000000' : '#ffffff'
-}
-
 export type PdfTableColumn = {
   label: string
   width: number       // in points

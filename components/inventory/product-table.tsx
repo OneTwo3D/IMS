@@ -74,7 +74,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
   function toggleSelect(id: string) {
     setSelectedIds((prev) => {
       const next = new Set(prev)
-      next.has(id) ? next.delete(id) : next.add(id)
+      if (next.has(id)) next.delete(id); else next.add(id)
       return next
     })
   }
@@ -324,6 +324,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
                   <TableCell className="w-12 px-2 py-1">
                     <Link href={`/inventory/${p.id}`} className="block">
                       {p.imageUrl ? (
+                        /* eslint-disable-next-line @next/next/no-img-element */
                         <img
                           src={p.imageUrl}
                           alt={p.name}

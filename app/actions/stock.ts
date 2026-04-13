@@ -562,7 +562,7 @@ export async function fetchWcImage(
     const imageUrl = product.images?.[0]?.src ?? product.image?.src ?? null
 
     return { imageUrl }
-  } catch (e) {
+  } catch {
     return { imageUrl: null, error: 'Failed to fetch from WooCommerce' }
   }
 }

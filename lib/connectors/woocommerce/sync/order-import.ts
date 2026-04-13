@@ -8,7 +8,7 @@ import { wcFetch } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems, mapWcOrderDiscount,
-  mapWcShipping, resolveWcTaxRateById, extractWcTracking, getFxRateToGbp,
+  mapWcShipping, resolveWcTaxRateById, getFxRateToGbp,
 } from './field-mapping'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
 import type { TaxCategory } from '@/app/generated/prisma/client'

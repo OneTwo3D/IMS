@@ -26,11 +26,13 @@ export function DashboardShell({
 }: DashboardShellProps) {
   const [mobileOpen, setMobileOpen] = useState(false)
   const pathname = usePathname()
+  const [prevPathname, setPrevPathname] = useState(pathname)
 
-  // Close mobile drawer on route change
-  useEffect(() => {
-    setMobileOpen(false)
-  }, [pathname])
+  // Close mobile drawer on route change (render-time state adjustment)
+  if (prevPathname !== pathname) {
+    setPrevPathname(pathname)
+    if (mobileOpen) setMobileOpen(false)
+  }
 
   // Prevent body scroll when drawer is open
   useEffect(() => {

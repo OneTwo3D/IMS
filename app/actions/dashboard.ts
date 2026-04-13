@@ -168,7 +168,7 @@ export async function getDashboardData(
   // Fetch all data needed — go back far enough to cover comparison range
   const fetchFrom = new Date(Math.min(compFrom.getTime(), periodFrom.getTime(), now.getTime() - 2 * 365 * 86400000))
 
-  const [orders, products, openPOs, pendingSales, refundData, costLayers, incomingPOData, allRecent] = await Promise.all([
+  const [orders, products, openPOs, pendingSales, , costLayers, incomingPOData, allRecent] = await Promise.all([
     db.salesOrder.findMany({
       where: { status: { in: COMPLETED_STATUSES }, createdAt: { gte: fetchFrom } },
       select: {

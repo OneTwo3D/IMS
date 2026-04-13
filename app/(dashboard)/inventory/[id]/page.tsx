@@ -1,4 +1,3 @@
-import type { Metadata } from 'next'
 import Link from 'next/link'
 import { notFound } from 'next/navigation'
 import { ChevronRight, Package, Layers, SlidersHorizontal } from 'lucide-react'
@@ -185,6 +184,7 @@ export default async function ProductDetailPage({
           {product.imageUrl && (
             <Card className="p-3">
               <div className="w-full max-h-56 rounded-md border border-border overflow-hidden bg-muted flex items-center justify-center">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
                 <img
                   src={product.imageUrl}
                   alt={product.name}

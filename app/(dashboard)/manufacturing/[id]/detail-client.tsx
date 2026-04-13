@@ -223,6 +223,7 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
         <Link href={`/inventory/${order.productId}`} target="_blank" className="block">
           <Card className="p-4 flex flex-col items-center justify-center h-full">
             {order.productImageUrl ? (
+              // eslint-disable-next-line @next/next/no-img-element
               <img
                 src={order.productImageUrl}
                 alt={order.productName}

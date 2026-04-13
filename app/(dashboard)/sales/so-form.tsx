@@ -355,30 +355,6 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
     }
   }
 
-  /**
-   * Re-resolve every auto-resolved line against the current destination
-   * country. Manually-overridden lines are left alone.
-   */
-  function reresolveAutoLines() {
-    setLines((prev) =>
-      prev.map((l) => {
-        if (!l.taxRateAutoResolved) return l
-        const resolved = resolveForCategory(l.productCategory)
-        if (resolved.taxRateValue === l.taxRateValue && resolved.taxRateId === l.taxRateId) {
-          // Still refresh the warning text in case the default rate id changed.
-          return { ...l, taxRateWarning: resolved.warning }
-        }
-        return rescaleLineForRate(l, resolved.taxRateValue, {
-          taxRateId: resolved.taxRateId,
-          taxRateValue: resolved.taxRateValue,
-          taxRateName: resolved.taxRateName,
-          taxRateWarning: resolved.warning,
-          taxRateAutoResolved: true,
-        })
-      }),
-    )
-  }
-
   // Toggle between "prices include VAT" and "prices exclude VAT". Scales each
   // line by *its own* rate (lines can now have different rates). Shipping
   // and fees use the order-level rate.

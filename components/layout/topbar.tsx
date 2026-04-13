@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useEffect, useCallback } from 'react'
+import { useState, useRef, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { Moon, Sun, LogOut, User, Settings, Bell, CheckCircle2, AlertTriangle, Info, XCircle, Menu } from 'lucide-react'
 import { useTheme } from 'next-themes'
@@ -92,23 +92,24 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
     return () => document.removeEventListener('mousedown', handleClick)
   }, [bellOpen])
 
-  // Fetch notifications
-  const fetchNotifications = useCallback(async () => {
-    try {
-      const res = await fetch('/api/notifications')
-      if (!res.ok) return
-      const data = await res.json()
-      setNotifications(data.notifications)
-      setUnreadCount(data.unreadCount)
-    } catch { /* ignore */ }
-  }, [])
-
-  // Poll every 30 seconds
+  // Poll notifications every 30 seconds
   useEffect(() => {
-    fetchNotifications()
-    const interval = setInterval(fetchNotifications, 30000)
-    return () => clearInterval(interval)
-  }, [fetchNotifications])
+    let cancelled = false
+    async function poll() {
+      try {
+        const res = await fetch('/api/notifications')
+        if (!res.ok || cancelled) return
+        const data = await res.json()
+        if (!cancelled) {
+          setNotifications(data.notifications)
+          setUnreadCount(data.unreadCount)
+        }
+      } catch { /* ignore */ }
+    }
+    poll()
+    const interval = setInterval(poll, 30000)
+    return () => { cancelled = true; clearInterval(interval) }
+  }, [])
 
   async function markAllRead() {
     try {

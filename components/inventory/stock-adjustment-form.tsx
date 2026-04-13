@@ -6,7 +6,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
-import { adjustStock, type AdjustmentFormState, type AdjustmentReasonOption } from '@/app/actions/stock'
+import { adjustStock, type AdjustmentReasonOption } from '@/app/actions/stock'
 
 type Warehouse = { id: string; code: string; name: string; type: string }
 
@@ -25,18 +25,26 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
     {}
   )
   const [successMsg, setSuccessMsg] = useState('')
+  const [prevSuccess, setPrevSuccess] = useState<boolean | undefined>(undefined)
 
+  // Show success message immediately (render-time state adjustment)
+  if (state.success && !prevSuccess) {
+    setPrevSuccess(true)
+    setSuccessMsg('Adjustment saved.')
+  }
+  if (!state.success && prevSuccess) {
+    setPrevSuccess(undefined)
+  }
+
+  // Handle side effects (router refresh + delayed form reset)
   useEffect(() => {
-    if (state.success) {
-      router.refresh()
-      setSuccessMsg('Adjustment saved.')
-      // Reset form after a brief flash, allowing another adjustment
-      const t = setTimeout(() => {
-        setFormKey((k) => k + 1)
-        setSuccessMsg('')
-      }, 1500)
-      return () => clearTimeout(t)
-    }
+    if (!state.success) return
+    router.refresh()
+    const t = setTimeout(() => {
+      setFormKey((k) => k + 1)
+      setSuccessMsg('')
+    }, 1500)
+    return () => clearTimeout(t)
   }, [state.success, router])
 
   const hasReasons = reasons.length > 0

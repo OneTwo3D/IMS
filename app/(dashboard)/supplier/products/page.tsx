@@ -35,6 +35,7 @@ export default async function SupplierProductsPage() {
               <TableRow key={p.id}>
                 <TableCell className="px-4">
                   {p.imageUrl ? (
+                    /* eslint-disable-next-line @next/next/no-img-element */
                     <img src={p.imageUrl} alt="" className="w-8 h-8 rounded object-cover" />
                   ) : (
                     <div className="w-8 h-8 rounded bg-muted" />

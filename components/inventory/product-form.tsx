@@ -336,6 +336,7 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
         />
         {fields.imageUrl && (
           <div className="mt-2 w-24 h-24 rounded-lg border border-border overflow-hidden bg-muted">
+            {/* eslint-disable-next-line @next/next/no-img-element */}
             <img
               src={fields.imageUrl}
               alt="Product"

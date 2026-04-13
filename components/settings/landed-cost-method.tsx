@@ -4,7 +4,6 @@ import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import { Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { Label } from '@/components/ui/label'
 import { setSetting } from '@/app/actions/settings'
 
 const METHODS = [

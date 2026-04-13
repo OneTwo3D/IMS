@@ -2,7 +2,7 @@
 
 import { useState, useEffect, useRef, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { AlertTriangle, ArrowDown, ArrowUp, ArrowUpDown, Minus, Settings2, ShoppingCart, Loader2, TrendingUp, TrendingDown, Package, Download, ChevronLeft, ChevronRight } from 'lucide-react'
+import { ArrowDown, ArrowUp, ArrowUpDown, Settings2, ShoppingCart, Loader2, TrendingUp, TrendingDown, Package, Download, ChevronLeft, ChevronRight } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -31,13 +31,10 @@ const ABC_CLASS: Record<string, string> = {
   B: 'bg-slate-100 text-slate-700 border-slate-200',
   C: 'bg-gray-100 text-gray-600 border-gray-200',
 }
-const TIER_LABEL: Record<string, string> = { new: 'New', established: 'Established', mature: 'Mature' }
-
 function SettingsDialog({ settings: initial, onClose }: { settings: ForecastSettings; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(initial)
-  const [error, setError] = useState('')
 
   function handleSave() {
     startTransition(async () => {
@@ -71,7 +68,6 @@ function SettingsDialog({ settings: initial, onClose }: { settings: ForecastSett
           <Input type="number" min={1} max={52} value={s.reorderQtyWeeks} onChange={(e) => setS({ ...s, reorderQtyWeeks: Number(e.target.value) })} className="h-9" />
           <p className="text-xs text-muted-foreground">How many weeks of forecasted demand to order.</p>
         </div>
-        {error && <p className="text-destructive text-sm">{error}</p>}
       </div>
       <DialogFooter>
         <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
@@ -96,20 +92,6 @@ function TrainingDialog({ settings, onClose }: { settings: ForecastSettings; onC
   const [wcProgress, setWcProgress] = useState<HistoricalImportProgress | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
 
-  // Poll for WC import progress
-  useEffect(() => {
-    // Check if a job is already running on mount
-    fetch('/api/import/historical-orders').then((r) => r.json()).then((p: HistoricalImportProgress) => {
-      if (p.status === 'running') {
-        setImportingType('wc')
-        setWcProgress(p)
-        startPolling()
-      }
-    }).catch(() => {})
-
-    return () => { if (pollRef.current) clearInterval(pollRef.current) }
-  }, [])
-
   function startPolling() {
     if (pollRef.current) clearInterval(pollRef.current)
     pollRef.current = setInterval(async () => {
@@ -128,6 +110,20 @@ function TrainingDialog({ settings, onClose }: { settings: ForecastSettings; onC
     }, 2000)
   }
 
+  // Check if a WC import job is already running on mount
+  useEffect(() => {
+    fetch('/api/import/historical-orders').then((r) => r.json()).then((p: HistoricalImportProgress) => {
+      if (p.status === 'running') {
+        setImportingType('wc')
+        setWcProgress(p)
+        startPolling()
+      }
+    }).catch(() => {})
+
+    return () => { if (pollRef.current) clearInterval(pollRef.current) }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
   async function handleWcImport() {
     setResult(null)
     setWcProgress(null)
@@ -139,7 +135,6 @@ function TrainingDialog({ settings, onClose }: { settings: ForecastSettings; onC
         body: JSON.stringify({ dateFrom, dateTo }),
       })
       if (!res.ok) {
-        const text = await res.text()
         setResult({ message: `Server error: ${res.status}`, isError: true })
         setImportingType(null)
         return
@@ -353,7 +348,7 @@ export function ForecastClient({ forecasts, settings }: Props) {
   const needsReorder = forecasts.filter((f) => f.urgency === 'critical' || f.urgency === 'low')
 
   function toggleSelect(id: string) {
-    setSelected((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n })
+    setSelected((prev) => { const n = new Set(prev); if (n.has(id)) n.delete(id); else n.add(id); return n })
   }
   function selectAllNeedingReorder() {
     setSelected(new Set(needsReorder.filter((f) => f.supplierId).map((f) => f.productId)))

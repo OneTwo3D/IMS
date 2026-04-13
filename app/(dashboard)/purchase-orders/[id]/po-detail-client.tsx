@@ -3,7 +3,7 @@
 import { useState, useTransition, useEffect } from 'react'
 import Link from 'next/link'
 import { useRouter } from 'next/navigation'
-import { Search, X, Plus, Pencil, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Receipt, Upload, Ship, ExternalLink, CreditCard, CheckCircle2 } from 'lucide-react'
+import { X, Plus, Pencil, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Receipt, Upload, Ship, ExternalLink, CreditCard, CheckCircle2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -28,7 +28,6 @@ import {
   getBillPaymentAccounts,
   type PoDetail,
   type PoStatus,
-  type PoLineRow,
   type InvoiceRow,
 } from '@/app/actions/purchase-orders'
 import { getTrackingUrl } from '@/lib/tracking'

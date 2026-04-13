@@ -14,7 +14,7 @@ import {
   updateSalesOrderStatus, createRefund, cloneSalesOrder, deleteSalesOrder,
   updateSalesOrderNotes, generateInvoiceNumber,
   addPayment, deletePayment,
-  type SoDetail, type SoStatus, type PaymentRow,
+  type SoDetail, type SoStatus,
 } from '@/app/actions/sales'
 import { sendSalesOrderEmail, sendInvoiceEmail } from '@/app/actions/email'
 import {
@@ -456,6 +456,7 @@ function AllocationPanel({
               return (
                 <div key={a.id} className="px-4 py-2.5 flex items-center gap-3">
                   {a.imageUrl ? (
+                    /* eslint-disable-next-line @next/next/no-img-element */
                     <img src={a.imageUrl} alt="" className="w-8 h-8 rounded object-cover shrink-0" />
                   ) : (
                     <div className="w-8 h-8 rounded bg-muted shrink-0" />
@@ -576,10 +577,9 @@ const SHIPMENT_FLOW: Record<string, { label: string; target: string }> = {
 
 
 function ShipmentsPanel({
-  shipments, warehouses, carriers, deliveryTrackingEnabled, onRefresh,
+  shipments, carriers, deliveryTrackingEnabled, onRefresh,
 }: {
   shipments: ShipmentRow[]
-  warehouses: WarehouseInfo[]
   carriers: string[]
   deliveryTrackingEnabled: boolean
   onRefresh: () => void
@@ -655,6 +655,7 @@ function ShipmentsPanel({
               {s.lines.map((l) => (
                 <div key={l.id} className="px-4 py-2 flex items-center gap-3">
                   {l.imageUrl ? (
+                    /* eslint-disable-next-line @next/next/no-img-element */
                     <img src={l.imageUrl} alt="" className="w-8 h-8 rounded object-cover shrink-0" />
                   ) : (
                     <div className="w-8 h-8 rounded bg-muted shrink-0" />
@@ -835,7 +836,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
   }
 
   function toggleCol(col: OptCol) {
-    setVisibleCols((prev) => { const n = new Set(prev); n.has(col) ? n.delete(col) : n.add(col); return n })
+    setVisibleCols((prev) => { const n = new Set(prev); if (n.has(col)) n.delete(col); else n.add(col); return n })
   }
 
   function handleEmailOrder() {
@@ -855,9 +856,6 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
       else setError(result.error ?? 'Failed to send email')
     })
   }
-
-  // COGS per line (approximate from totalGbp)
-  const fxRate = so.fxRateToGbp || 1
 
   return (
     <div className="space-y-4 max-w-5xl">
@@ -975,6 +973,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
         <div>
           <span className="text-muted-foreground">Shipping Address</span>
           {so.shippingAddress ? (
+            /* eslint-disable-next-line @next/next/no-img-element */
             <p className="text-xs mt-0.5 flex items-center gap-1 flex-wrap">{(() => { const a = so.shippingAddress as Record<string, string>; const parts = [...[a.line1, a.line2, a.city, a.county, a.postcode].filter(Boolean)]; const countryStr = a.country ? countryName(so.shippingCountryCode) : ''; if (countryStr) parts.push(countryStr); return parts.join(', ') || '—' })()}{so.shippingCountryCode && <img src={`https://flagcdn.com/16x12/${so.shippingCountryCode.toLowerCase()}.png`} alt={so.shippingCountryCode} className="h-3 w-4 object-cover inline-block" />}</p>
           ) : <p className="text-muted-foreground">—</p>}
         </div>
@@ -982,6 +981,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
           <span className="text-muted-foreground">Source</span>
           <p className="font-medium flex items-center gap-1.5">
             {so.wcOrderId ? (
+              // eslint-disable-next-line @next/next/no-img-element
               <img src="/images/woocommerce.svg" alt="WooCommerce" className="h-4 w-auto" />
             ) : 'Manual'}
           </p>
@@ -1194,7 +1194,6 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
       {showShipments && (
         <ShipmentsPanel
           shipments={shipments}
-          warehouses={warehouses}
           carriers={carriers}
           deliveryTrackingEnabled={deliveryTrackingEnabled}
           onRefresh={() => { refreshAllocations(); router.refresh() }}

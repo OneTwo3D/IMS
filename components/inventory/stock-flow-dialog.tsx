@@ -125,8 +125,7 @@ function StockFlowDialog({ productId, onClose }: { productId: string; onClose: (
     })
   }, [rows, activeTypes, dateFrom, dateTo])
 
-  // Reset to page 0 when filters change (outside render, in an effect)
-  useEffect(() => { setPage(0) }, [activeTypes, dateFrom, dateTo])
+  // (page is reset in filter change handlers below)
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
   const paged = filtered.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
@@ -138,12 +137,14 @@ function StockFlowDialog({ productId, onClose }: { productId: string; onClose: (
       else next.add(type)
       return next
     })
+    setPage(0)
   }
 
   function clearFilters() {
     setActiveTypes(new Set(ALL_TYPES))
     setDateFrom('')
     setDateTo('')
+    setPage(0)
   }
 
   const hasFilters = activeTypes.size < ALL_TYPES.length || dateFrom || dateTo
@@ -162,7 +163,7 @@ function StockFlowDialog({ productId, onClose }: { productId: string; onClose: (
           <Input
             type="date"
             value={dateFrom}
-            onChange={(e) => setDateFrom(e.target.value)}
+            onChange={(e) => { setDateFrom(e.target.value); setPage(0) }}
             className="w-36 h-7 text-xs"
             aria-label="Date from"
           />
@@ -170,7 +171,7 @@ function StockFlowDialog({ productId, onClose }: { productId: string; onClose: (
           <Input
             type="date"
             value={dateTo}
-            onChange={(e) => setDateTo(e.target.value)}
+            onChange={(e) => { setDateTo(e.target.value); setPage(0) }}
             className="w-36 h-7 text-xs"
             aria-label="Date to"
           />

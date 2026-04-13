@@ -5,7 +5,6 @@
  */
 
 import { NextResponse } from 'next/server'
-import { headers } from 'next/headers'
 import { exchangeCodeForTokens } from '@/lib/connectors/xero/auth'
 import { logActivity } from '@/lib/activity-log'
 

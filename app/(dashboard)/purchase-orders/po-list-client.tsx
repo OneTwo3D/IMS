@@ -143,7 +143,7 @@ export function PoListClient({ initialPos, currencySymbols = {} }: Props) {
   function toggleStatus(s: PoStatus) {
     setStatusFilters((prev) => {
       const n = new Set(prev)
-      n.has(s) ? n.delete(s) : n.add(s)
+      if (n.has(s)) n.delete(s); else n.add(s)
       return n
     })
   }
@@ -173,7 +173,7 @@ export function PoListClient({ initialPos, currencySymbols = {} }: Props) {
     setPickerDraft((prev) => {
       const n = new Set(prev)
       if (FIXED_COLS.includes(key)) return n
-      n.has(key) ? n.delete(key) : n.add(key)
+      if (n.has(key)) n.delete(key); else n.add(key)
       return n
     })
   }

@@ -1,7 +1,7 @@
 'use client'
 
 import Link from 'next/link'
-import { useState, useEffect } from 'react'
+import { useState } from 'react'
 import { usePathname } from 'next/navigation'
 import { ChevronDown } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -16,23 +16,28 @@ interface NavChild {
 interface NavGroupProps {
   label: string
   icon: LucideIcon
-  children: NavChild[]
+  items: NavChild[]
   collapsed?: boolean
   onExpand?: () => void
   onNavigate?: () => void
 }
 
-export function NavGroup({ label, icon: Icon, children, collapsed, onExpand, onNavigate }: NavGroupProps) {
+export function NavGroup({ label, icon: Icon, items, collapsed, onExpand, onNavigate }: NavGroupProps) {
   const pathname = usePathname()
   const isChildActive = (c: NavChild) =>
-    pathname === c.href || (pathname.startsWith(c.href + '/') && !children.some((other) => other.href !== c.href && pathname.startsWith(other.href)))
-  const isAnyChildActive = children.some(isChildActive)
+    pathname === c.href || (pathname.startsWith(c.href + '/') && !items.some((other) => other.href !== c.href && pathname.startsWith(other.href)))
+  const isAnyChildActive = items.some(isChildActive)
   const [open, setOpen] = useState(isAnyChildActive)
+  const [prevActive, setPrevActive] = useState(isAnyChildActive)
 
-  // Auto-open when navigating to a child route
-  useEffect(() => {
-    if (isAnyChildActive) setOpen(true)
-  }, [isAnyChildActive])
+  // Auto-open when navigating to a child route (render-time state adjustment)
+  if (isAnyChildActive && !prevActive) {
+    setPrevActive(true)
+    setOpen(true)
+  }
+  if (!isAnyChildActive && prevActive) {
+    setPrevActive(false)
+  }
 
   const parentClass = cn(
     'flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer select-none',
@@ -80,7 +85,7 @@ export function NavGroup({ label, icon: Icon, children, collapsed, onExpand, onN
 
       {open && (
         <div className="ml-4 mt-0.5 flex flex-col gap-0.5 border-l border-border pl-3">
-          {children.map((child) => {
+          {items.map((child) => {
             const isActive = isChildActive(child)
             return (
               <Link

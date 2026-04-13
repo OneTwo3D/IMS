@@ -2,7 +2,7 @@
 
 import { useState, useTransition, useRef } from 'react'
 import { useRouter } from 'next/navigation'
-import { Camera, Loader2, Check, X, KeyRound, User, Mail, Shield } from 'lucide-react'
+import { Camera, Loader2, Check, X, KeyRound, User, Shield } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'

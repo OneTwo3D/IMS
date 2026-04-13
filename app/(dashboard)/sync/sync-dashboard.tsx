@@ -88,7 +88,9 @@ const CONNECTORS: ConnectorDef[] = [
 ]
 
 const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
+  // eslint-disable-next-line @next/next/no-img-element
   woocommerce: <img src="/images/woocommerce.svg" alt="WooCommerce" className="h-8 object-contain" />,
+  // eslint-disable-next-line @next/next/no-img-element
   shopify: <img src="/images/shopify-banner.png" alt="Shopify" className="h-8 object-contain" />,
   'rest-api': (
     <div className="h-8 flex items-center gap-2">
@@ -98,7 +100,9 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
       <span className="text-base font-bold tracking-tight">REST API</span>
     </div>
   ),
+  // eslint-disable-next-line @next/next/no-img-element
   xero: <img src="/images/xero.svg" alt="Xero" className="h-8 object-contain" />,
+  // eslint-disable-next-line @next/next/no-img-element
   quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 

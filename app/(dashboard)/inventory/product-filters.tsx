@@ -20,17 +20,17 @@ export function ProductFilters({ search, type, active }: Props) {
   const pathname = usePathname()
   const [, startTransition] = useTransition()
 
-  // Column picker state
-  const [visible, setVisible] = useState<Record<ColKey, boolean>>(defaultVisibility)
-  const [pickerOpen, setPickerOpen] = useState(false)
-  const pickerRef = useRef<HTMLDivElement>(null)
-
-  useEffect(() => {
+  // Column picker state (lazy init from localStorage)
+  const [visible, setVisible] = useState<Record<ColKey, boolean>>(() => {
+    if (typeof window === 'undefined') return defaultVisibility
     try {
       const stored = localStorage.getItem(STORAGE_KEY)
-      if (stored) setVisible(JSON.parse(stored))
+      if (stored) return JSON.parse(stored)
     } catch { /* ignore */ }
-  }, [])
+    return defaultVisibility
+  })
+  const [pickerOpen, setPickerOpen] = useState(false)
+  const pickerRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     function handler(e: MouseEvent) {

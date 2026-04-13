@@ -11,6 +11,7 @@ export function ProductThumb({ productId, imageUrl, name }: ProductThumbProps) {
   return (
     <Link href={`/inventory/${productId}`} target="_blank" className="block shrink-0" onClick={(e) => e.stopPropagation()}>
       {imageUrl ? (
+        /* eslint-disable-next-line @next/next/no-img-element */
         <img
           src={imageUrl}
           alt={name ?? ''}

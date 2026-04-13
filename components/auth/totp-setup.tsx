@@ -18,7 +18,7 @@ interface TotpSetupProps {
 export function TotpSetup({ enabled }: TotpSetupProps) {
   const [step, setStep] = useState<Step>('idle')
   const [qrDataUrl, setQrDataUrl] = useState('')
-  const [secret, setSecret] = useState('')
+  const [, setSecret] = useState('')
   const [code, setCode] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)

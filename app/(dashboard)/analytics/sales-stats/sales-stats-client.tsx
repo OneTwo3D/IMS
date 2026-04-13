@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useMemo, useTransition } from 'react'
+import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { Filter, X, Plus, ArrowUp, ArrowDown, Settings2, Save, Loader2, Download } from 'lucide-react'
@@ -10,7 +10,7 @@ import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { ProductLink } from '@/components/inventory/product-link'
-import { saveView, deleteView, type SalesStatRow, type SalesStatSummary, type ShipmentRow, type DetailRow, type InvoiceRow, type RefundRow, type CustomerAgingRow, type SavedView } from '@/app/actions/sales-stats'
+import { saveView, type SalesStatRow, type SalesStatSummary, type ShipmentRow, type DetailRow, type InvoiceRow, type RefundRow, type CustomerAgingRow, type SavedView } from '@/app/actions/sales-stats'
 
 type Tab = 'products' | 'shipments' | 'details' | 'invoices' | 'refunds' | 'aging'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -282,7 +282,7 @@ function FilterDialog({ fields, rules, onApply, onClose }: { fields: FieldDef[];
 // ---------------------------------------------------------------------------
 function ColumnPickerDialog({ fields, visible, onApply, onClose }: { fields: FieldDef[]; visible: string[]; onApply: (cols: string[]) => void; onClose: () => void }) {
   const [local, setLocal] = useState<Set<string>>(new Set(visible))
-  function toggle(key: string) { setLocal((prev) => { const n = new Set(prev); n.has(key) ? n.delete(key) : n.add(key); return n }) }
+  function toggle(key: string) { setLocal((prev) => { const n = new Set(prev); if (n.has(key)) n.delete(key); else n.add(key); return n }) }
   return (
     <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-sm sm:max-w-sm">
       <DialogHeader><DialogTitle>Columns</DialogTitle></DialogHeader>
@@ -349,8 +349,6 @@ function StatusBadge({ status }: { status: string }) {
 // Main
 // ---------------------------------------------------------------------------
 export function SalesStatsClient({ productStats, shipments, details, invoices, refunds, aging, savedViews }: Props) {
-  const router = useRouter()
-  const [isPending, startTransition] = useTransition()
   const [tab, setTab] = useState<Tab>('products')
   const [filterRules, setFilterRules] = useState<FilterRule[]>([])
   const [visibleColsMap, setVisibleColsMap] = useState<Record<Tab, string[]>>({ ...DEFAULT_COLS })
@@ -384,10 +382,6 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
     setFilterRules(view.filters.map((f) => ({ ...f, id: makeId() })))
   }
 
-  function handleDeleteView(viewId: string) {
-    startTransition(async () => { await deleteView(viewId); router.refresh() })
-  }
-
   // Generic filter + sort for any tab data
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   function filterAndSort<T extends Record<string, any>>(data: T[]): T[] {
@@ -408,12 +402,12 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
   }
 
   // Filtered data per tab
-  const filteredProducts = useMemo(() => filterAndSort(rows), [rows, filterRules, sortCol, sortDir])
-  const filteredShipments = useMemo(() => filterAndSort(shipments), [shipments, filterRules, sortCol, sortDir])
-  const filteredDetails = useMemo(() => filterAndSort(details), [details, filterRules, sortCol, sortDir])
-  const filteredInvoices = useMemo(() => filterAndSort(invoices), [invoices, filterRules, sortCol, sortDir])
-  const filteredRefunds = useMemo(() => filterAndSort(refunds), [refunds, filterRules, sortCol, sortDir])
-  const filteredAging = useMemo(() => filterAndSort(aging), [aging, filterRules, sortCol, sortDir])
+  const filteredProducts = filterAndSort(rows)
+  const filteredShipments = filterAndSort(shipments)
+  const filteredDetails = filterAndSort(details)
+  const filteredInvoices = filterAndSort(invoices)
+  const filteredRefunds = filterAndSort(refunds)
+  const filteredAging = filterAndSort(aging)
 
   // Column header renderer
   function ColHeader({ colKey, label, align }: { colKey: string; label: string; align?: 'right' | 'left' }) {
@@ -515,9 +509,9 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
     return false
   }
 
-  // Generic table for non-product tabs
+  // Render helper for non-product tabs (not a component — avoids re-creation during render)
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  function GenericTable({ data, tabKey, emptyMsg }: { data: any[]; tabKey: Tab; emptyMsg: string }) {
+  function renderGenericTable(data: any[], tabKey: Tab, emptyMsg: string) {
     const cols = visibleColsMap[tabKey]
     return (
       <div className="rounded-md border">
@@ -637,11 +631,11 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
       )}
 
       {/* Other tabs — generic filterable/sortable tables */}
-      {tab === 'shipments' && <GenericTable data={filteredShipments} tabKey="shipments" emptyMsg="No shipments found." />}
-      {tab === 'details' && <GenericTable data={filteredDetails} tabKey="details" emptyMsg="No details found." />}
-      {tab === 'invoices' && <GenericTable data={filteredInvoices} tabKey="invoices" emptyMsg="No invoices found." />}
-      {tab === 'refunds' && <GenericTable data={filteredRefunds} tabKey="refunds" emptyMsg="No refunds found." />}
-      {tab === 'aging' && <GenericTable data={filteredAging} tabKey="aging" emptyMsg="No invoice data found." />}
+      {tab === 'shipments' && renderGenericTable(filteredShipments, 'shipments', 'No shipments found.')}
+      {tab === 'details' && renderGenericTable(filteredDetails, 'details', 'No details found.')}
+      {tab === 'invoices' && renderGenericTable(filteredInvoices, 'invoices', 'No invoices found.')}
+      {tab === 'refunds' && renderGenericTable(filteredRefunds, 'refunds', 'No refunds found.')}
+      {tab === 'aging' && renderGenericTable(filteredAging, 'aging', 'No invoice data found.')}
 
       {/* Dialogs */}
       {showFilterDialog && <FilterDialog fields={fields} rules={filterRules} onApply={setFilterRules} onClose={() => setShowFilterDialog(false)} />}
