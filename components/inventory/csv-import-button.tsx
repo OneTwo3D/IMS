@@ -9,9 +9,10 @@ type Props = {
   label?: string
   action: (formData: FormData) => Promise<ImportResult>
   onDone?: () => void
+  compact?: boolean
 }
 
-export function CsvImportButton({ label = 'Import CSV', action, onDone }: Props) {
+export function CsvImportButton({ label = 'Import CSV', action, onDone, compact = false }: Props) {
   const inputRef = useRef<HTMLInputElement>(null)
   const [result, setResult] = useState<ImportResult | null>(null)
   const [isPending, startTransition] = useTransition()
@@ -45,6 +46,7 @@ export function CsvImportButton({ label = 'Import CSV', action, onDone }: Props)
         size="sm"
         disabled={isPending}
         onClick={() => inputRef.current?.click()}
+        className={compact ? 'w-full' : undefined}
       >
         <Upload className="h-4 w-4 mr-1" />
         {isPending ? 'Importing…' : label}

@@ -67,10 +67,12 @@ export function ProductFilters({ search, type, active }: Props) {
   )
 
   return (
-    <div className="flex flex-wrap gap-3 items-center">
+    <div className="flex flex-wrap gap-3 items-end">
       <div className="relative flex-1 min-w-0 sm:min-w-[200px] max-w-sm">
+        <label htmlFor="inventory-search" className="sr-only">Search products</label>
         <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground pointer-events-none" />
         <Input
+          id="inventory-search"
           className="pl-8"
           placeholder="Search SKU, name, barcode…"
           defaultValue={search}
@@ -84,33 +86,50 @@ export function ProductFilters({ search, type, active }: Props) {
           }}
         />
       </div>
+      <div className="w-full sm:w-44">
+        <label htmlFor="inventory-type" className="sr-only">Filter by product type</label>
+        <Select
+          id="inventory-type"
+          className="w-full"
+          value={type ?? 'ALL'}
+          onChange={(e) => update('type', e.target.value === 'ALL' ? '' : e.target.value)}
+        >
+          <option value="ALL">All Types</option>
+          <option value="SIMPLE">Simple</option>
+          <option value="VARIABLE">Variable</option>
+          <option value="KIT">Kit / Bundle</option>
+          <option value="BOM">Bill of Materials</option>
+          <option value="NON_INVENTORY">Non-Inventory</option>
+        </Select>
+      </div>
 
-      <Select
-        className="w-full sm:w-44"
-        value={type ?? 'ALL'}
-        onChange={(e) => update('type', e.target.value === 'ALL' ? '' : e.target.value)}
-      >
-        <option value="ALL">All Types</option>
-        <option value="SIMPLE">Simple</option>
-        <option value="VARIABLE">Variable</option>
-        <option value="KIT">Kit / Bundle</option>
-        <option value="BOM">Bill of Materials</option>
-        <option value="NON_INVENTORY">Non-Inventory</option>
-      </Select>
-
-      <Select
-        className="w-full sm:w-40"
-        value={active ?? 'true'}
-        onChange={(e) => update('active', e.target.value === 'all' ? '' : e.target.value)}
-      >
-        <option value="all">All Status</option>
-        <option value="true">Active only</option>
-        <option value="false">Inactive only</option>
-      </Select>
+      <div className="w-full sm:w-40">
+        <label htmlFor="inventory-status" className="sr-only">Filter by product status</label>
+        <Select
+          id="inventory-status"
+          className="w-full"
+          value={active ?? 'true'}
+          onChange={(e) => update('active', e.target.value === 'all' ? '' : e.target.value)}
+        >
+          <option value="all">All Status</option>
+          <option value="true">Active only</option>
+          <option value="false">Inactive only</option>
+        </Select>
+      </div>
 
       <div className="relative" ref={pickerRef}>
-        <Button variant="outline" size="sm" className="h-8" onClick={() => setPickerOpen((o) => !o)} title="Column settings">
+        <Button
+          variant="outline"
+          size="sm"
+          className="h-8"
+          onClick={() => setPickerOpen((o) => !o)}
+          title="Column settings"
+          aria-label="Column settings"
+          aria-haspopup="dialog"
+          aria-expanded={pickerOpen}
+        >
           <Settings2 className="h-4 w-4" />
+          <span className="sm:hidden">Columns</span>
         </Button>
         {pickerOpen && (
           <div className="absolute right-0 top-full mt-1 z-50 w-[calc(100vw-2rem)] sm:w-52 rounded-md border border-border bg-popover shadow-md p-2 space-y-1">

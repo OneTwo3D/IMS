@@ -1,12 +1,19 @@
 'use client'
 
-import { useState, useRef, useEffect } from 'react'
+import { useState, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import { Moon, Sun, LogOut, User, Settings, Bell, CheckCircle2, AlertTriangle, Info, XCircle, Menu } from 'lucide-react'
 import { useTheme } from 'next-themes'
 import { signOut, useSession } from 'next-auth/react'
 import { Button } from '@/components/ui/button'
 import { Avatar, AvatarImage, AvatarFallback } from '@/components/ui/avatar'
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger,
+} from '@/components/ui/dropdown-menu'
 
 interface TopbarProps {
   userName: string
@@ -53,12 +60,6 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
   const { setTheme, resolvedTheme } = useTheme()
   const router = useRouter()
   const { data: session } = useSession()
-  const [open, setOpen] = useState(false)
-  const menuRef = useRef<HTMLDivElement>(null)
-
-  // Notification state
-  const [bellOpen, setBellOpen] = useState(false)
-  const bellRef = useRef<HTMLDivElement>(null)
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [unreadCount, setUnreadCount] = useState(0)
 
@@ -71,26 +72,6 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
     .join('')
     .toUpperCase()
     .slice(0, 2)
-
-  // Outside-click for user menu
-  useEffect(() => {
-    if (!open) return
-    function handleClick(e: MouseEvent) {
-      if (menuRef.current && !menuRef.current.contains(e.target as Node)) setOpen(false)
-    }
-    document.addEventListener('mousedown', handleClick)
-    return () => document.removeEventListener('mousedown', handleClick)
-  }, [open])
-
-  // Outside-click for bell dropdown
-  useEffect(() => {
-    if (!bellOpen) return
-    function handleClick(e: MouseEvent) {
-      if (bellRef.current && !bellRef.current.contains(e.target as Node)) setBellOpen(false)
-    }
-    document.addEventListener('mousedown', handleClick)
-    return () => document.removeEventListener('mousedown', handleClick)
-  }, [bellOpen])
 
   // Poll notifications every 30 seconds
   useEffect(() => {
@@ -136,7 +117,6 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
       } catch { /* ignore */ }
     }
     if (n.actionUrl) {
-      setBellOpen(false)
       router.push(n.actionUrl)
     }
   }
@@ -155,17 +135,16 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
         </Button>
       )}
       <div className="flex-1" />
-      <span className="text-sm font-semibold text-muted-foreground tracking-wide truncate">One Two Inventory</span>
-      <div className="flex-1 flex items-center justify-end gap-2" />
+      <span className="hidden truncate text-sm font-semibold tracking-wide text-muted-foreground min-[420px]:block">
+        One Two Inventory
+      </span>
+      <div className="flex flex-1 items-center justify-end gap-2" />
 
-      {/* Notification bell */}
-      <div className="relative" ref={bellRef}>
-        <Button
-          variant="ghost"
-          size="icon"
-          onClick={() => setBellOpen((v) => !v)}
-          aria-label="Notifications"
-          className="relative"
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <Button variant="ghost" size="icon" aria-label="Notifications" className="relative" />
+          }
         >
           <Bell className="h-4 w-4" />
           {unreadCount > 0 && (
@@ -173,17 +152,16 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
               {unreadCount > 99 ? '99+' : unreadCount}
             </span>
           )}
-        </Button>
-
-        {bellOpen && (
-          <div className="absolute right-0 top-full mt-1 z-50 w-[calc(100vw-2rem)] sm:w-80 rounded-lg border bg-popover text-popover-foreground shadow-lg">
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-[calc(100vw-2rem)] min-w-0 sm:w-80 p-0">
+          <div className="rounded-lg border bg-popover text-popover-foreground shadow-lg">
             <div className="flex items-center justify-between px-3 py-2 border-b">
               <span className="text-sm font-medium">Notifications</span>
               {unreadCount > 0 && (
                 <button
                   type="button"
                   className="text-xs text-primary hover:underline"
-                  onClick={markAllRead}
+                    onClick={markAllRead}
                 >
                   Mark all as read
                 </button>
@@ -216,8 +194,8 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
               )}
             </div>
           </div>
-        )}
-      </div>
+        </DropdownMenuContent>
+      </DropdownMenu>
 
       <Button
         variant="ghost"
@@ -229,55 +207,42 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
         <Moon className="absolute h-4 w-4 rotate-90 scale-0 transition-all dark:rotate-0 dark:scale-100" />
       </Button>
 
-      <div className="relative" ref={menuRef}>
-        <button
-          type="button"
-          onClick={() => setOpen((v) => !v)}
-          className="rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          aria-label="User menu"
-          aria-expanded={open}
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <button
+              type="button"
+              className="rounded-full focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+              aria-label="User menu"
+            />
+          }
         >
           <Avatar className="h-8 w-8">
             {pictureUrl && <AvatarImage src={pictureUrl} alt={userName} />}
             <AvatarFallback className="text-xs">{initials}</AvatarFallback>
           </Avatar>
-        </button>
-
-        {open && (
-          <div role="menu" className="absolute right-0 top-full mt-1 z-50 w-[calc(100vw-2rem)] sm:w-52 rounded-lg border bg-popover p-1 text-popover-foreground shadow-lg">
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end" className="w-[calc(100vw-2rem)] min-w-0 sm:w-52 p-1">
             <div className="px-2 py-1.5">
               <p className="text-sm font-medium leading-none">{userName}</p>
               <p className="text-xs leading-none text-muted-foreground mt-1">{userEmail}</p>
             </div>
-            <div className="h-px bg-border my-1" />
-            <button
-              type="button"
-              className="flex w-full items-center rounded-md px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground transition-colors"
-              onClick={() => { setOpen(false); router.push('/profile') }}
-            >
+            <DropdownMenuSeparator />
+            <DropdownMenuItem onClick={() => router.push('/profile')}>
               <User className="mr-2 h-4 w-4" />
               Profile &amp; 2FA
-            </button>
-            <button
-              type="button"
-              className="flex w-full items-center rounded-md px-2 py-1.5 text-sm hover:bg-accent hover:text-accent-foreground transition-colors"
-              onClick={() => { setOpen(false); router.push('/settings') }}
-            >
+            </DropdownMenuItem>
+            <DropdownMenuItem onClick={() => router.push('/settings')}>
               <Settings className="mr-2 h-4 w-4" />
               Settings
-            </button>
-            <div className="h-px bg-border my-1" />
-            <button
-              type="button"
-              className="flex w-full items-center rounded-md px-2 py-1.5 text-sm text-destructive hover:bg-destructive/10 transition-colors"
-              onClick={() => signOut({ callbackUrl: '/login' })}
-            >
+            </DropdownMenuItem>
+            <DropdownMenuSeparator />
+            <DropdownMenuItem variant="destructive" onClick={() => signOut({ callbackUrl: '/login' })}>
               <LogOut className="mr-2 h-4 w-4" />
               Sign out
-            </button>
-          </div>
-        )}
-      </div>
+            </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
     </header>
   )
 }

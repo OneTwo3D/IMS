@@ -256,7 +256,106 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
         <p className="text-xs text-muted-foreground px-1">{bulkMsg}</p>
       )}
 
-      {/* Table */}
+      {/* Mobile list */}
+      <div className="space-y-3 md:hidden">
+        <div className="flex items-center justify-between rounded-lg border border-border bg-card px-3 py-2 text-sm">
+          <label className="flex items-center gap-2 font-medium">
+            <input
+              type="checkbox"
+              checked={allSelected}
+              ref={(el) => { if (el) el.indeterminate = someSelected && !allSelected }}
+              onChange={toggleSelectAll}
+              className="h-4 w-4 accent-primary cursor-pointer"
+              aria-label="Select all products on this page"
+            />
+            Select page
+          </label>
+          <span className="text-xs text-muted-foreground">{products.length} shown</span>
+        </div>
+
+        {products.length === 0 ? (
+          <div className="rounded-lg border border-border bg-card px-4 py-10 text-center text-muted-foreground">
+            No products found.{' '}
+            <Link href="/inventory/new" className="text-primary hover:underline">
+              Add one
+            </Link>
+          </div>
+        ) : (
+          products.map((p) => (
+            <div key={p.id} className="rounded-lg border border-border bg-card p-3 shadow-sm">
+              <div className="flex items-start gap-3">
+                <input
+                  type="checkbox"
+                  checked={selectedIds.has(p.id)}
+                  onChange={() => toggleSelect(p.id)}
+                  className="mt-2 h-4 w-4 shrink-0 accent-primary cursor-pointer"
+                  aria-label={`Select ${p.sku}`}
+                />
+                <Link href={`/inventory/${p.id}`} className="shrink-0">
+                  {p.imageUrl ? (
+                    /* eslint-disable-next-line @next/next/no-img-element */
+                    <img
+                      src={p.imageUrl}
+                      alt={p.name}
+                      width={44}
+                      height={44}
+                      className="h-11 w-11 rounded object-cover border border-border bg-muted"
+                    />
+                  ) : (
+                    <span className="flex h-11 w-11 items-center justify-center rounded border border-border bg-muted text-muted-foreground">
+                      <Package className="h-4 w-4" />
+                    </span>
+                  )}
+                </Link>
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <Link href={`/inventory/${p.id}`} className="font-mono text-sm font-medium text-primary hover:underline break-all">
+                        {p.sku}
+                      </Link>
+                      <p className="mt-1 text-sm font-medium leading-tight text-foreground">
+                        {p.name}
+                      </p>
+                    </div>
+                    <div className="flex flex-wrap gap-2">
+                      <Badge variant={TYPE_COLOURS[p.type]}>{TYPE_LABELS[p.type]}</Badge>
+                      <Badge variant={p.active ? 'default' : 'outline'}>{p.active ? 'Active' : 'Inactive'}</Badge>
+                    </div>
+                  </div>
+
+                  {(p.parentSku || (p.type === 'VARIABLE' && p.variantCount > 0)) && (
+                    <p className="mt-2 text-xs text-muted-foreground">
+                      {p.parentSku ? `Parent: ${p.parentSku}` : `${p.variantCount} variant${p.variantCount !== 1 ? 's' : ''}`}
+                    </p>
+                  )}
+
+                  <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
+                    <div className="rounded-md bg-muted/50 px-2.5 py-2">
+                      <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Price</p>
+                      <p className="mt-1 font-medium">{renderCell(p, 'salesPriceGbp')}</p>
+                    </div>
+                    <div className="rounded-md bg-muted/50 px-2.5 py-2">
+                      <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Stock</p>
+                      <p className="mt-1 font-medium">{renderCell(p, 'totalStock')}</p>
+                    </div>
+                    <div className="rounded-md bg-muted/50 px-2.5 py-2">
+                      <p className="text-[11px] uppercase tracking-wide text-muted-foreground">COGS Value</p>
+                      <p className="mt-1 font-medium">{renderCell(p, 'inventoryValue')}</p>
+                    </div>
+                    <div className="rounded-md bg-muted/50 px-2.5 py-2">
+                      <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Updated</p>
+                      <p className="mt-1 font-medium">{renderCell(p, 'updatedAt')}</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ))
+        )}
+      </div>
+
+      {/* Desktop table */}
+      <div className="hidden md:block">
         <Table containerClassName="rounded-lg border border-border bg-card max-h-[calc(100vh-16rem)]" className="min-w-[900px]">
           <TableHeader>
             <TableRow>
@@ -352,6 +451,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
             )}
           </TableBody>
         </Table>
+      </div>
 
       {/* Pagination */}
       <PaginationBar page={page} totalPages={totalPages} buildHref={buildPageHref} />

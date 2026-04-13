@@ -4,6 +4,7 @@ import { useState, useEffect } from 'react'
 import { usePathname } from 'next/navigation'
 import { Sidebar } from './sidebar'
 import { Topbar } from './topbar'
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 
 interface DashboardShellProps {
   companyName?: string
@@ -26,25 +27,12 @@ export function DashboardShell({
 }: DashboardShellProps) {
   const [mobileOpen, setMobileOpen] = useState(false)
   const pathname = usePathname()
-  const [prevPathname, setPrevPathname] = useState(pathname)
 
-  // Close mobile drawer on route change (render-time state adjustment)
-  if (prevPathname !== pathname) {
-    setPrevPathname(pathname)
-    if (mobileOpen) setMobileOpen(false)
-  }
-
-  // Prevent body scroll when drawer is open
   useEffect(() => {
-    if (mobileOpen) {
-      document.body.style.overflow = 'hidden'
-    } else {
-      document.body.style.overflow = ''
-    }
-    return () => {
-      document.body.style.overflow = ''
-    }
-  }, [mobileOpen])
+    if (!mobileOpen) return
+    const frame = requestAnimationFrame(() => setMobileOpen(false))
+    return () => cancelAnimationFrame(frame)
+  }, [pathname, mobileOpen])
 
   return (
     <div className="flex h-screen overflow-hidden">
@@ -53,15 +41,12 @@ export function DashboardShell({
         <Sidebar companyName={companyName} logoUrl={logoUrl} userRole={userRole} />
       </div>
 
-      {/* Mobile drawer */}
-      {mobileOpen && (
-        <div className="fixed inset-0 z-50 md:hidden" role="dialog" aria-modal="true">
-          <div
-            className="absolute inset-0 bg-black/50"
-            onClick={() => setMobileOpen(false)}
-            aria-label="Close navigation"
-          />
-          <div className="absolute inset-y-0 left-0 w-56 shadow-xl animate-in slide-in-from-left duration-200">
+      <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
+        <SheetContent side="left" className="w-72 max-w-[85vw] p-0 md:hidden">
+          <SheetHeader className="sr-only">
+            <SheetTitle>Navigation</SheetTitle>
+          </SheetHeader>
+          <div className="h-full">
             <Sidebar
               companyName={companyName}
               logoUrl={logoUrl}
@@ -70,8 +55,8 @@ export function DashboardShell({
               forceExpanded
             />
           </div>
-        </div>
-      )}
+        </SheetContent>
+      </Sheet>
 
       <div className="flex flex-1 flex-col overflow-hidden min-w-0">
         <Topbar

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useEffect, useState, useSyncExternalStore, useTransition } from 'react'
 import Link from 'next/link'
 import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, Cell, ReferenceLine } from 'recharts'
 import { TrendingUp, TrendingDown, Minus, Loader2 } from 'lucide-react'
@@ -62,8 +62,36 @@ const COMPARE_OPTIONS: { value: CompareMode; label: string }[] = [
   { value: 'previous_fy', label: 'vs Previous FY' },
 ]
 
+function MobileChartFrame({
+  children,
+}: {
+  children: (width: number) => React.ReactNode
+}) {
+  const [node, setNode] = useState<HTMLDivElement | null>(null)
+  const [width, setWidth] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (!node) return
+
+    const update = () => setWidth(Math.floor(node.getBoundingClientRect().width))
+    update()
+
+    const observer = new ResizeObserver(() => update())
+    observer.observe(node)
+
+    return () => observer.disconnect()
+  }, [node])
+
+  return (
+    <div ref={setNode} className="min-h-56 w-full overflow-hidden">
+      {width && width >= 200 ? children(width) : <div className="h-56 w-full rounded-md bg-muted/30" />}
+    </div>
+  )
+}
+
 export function DashboardClient({ kpi: initKpi, chartData: initChart, topProducts: initTop, recentOrders, incomingPOs, periodLabel: initPL, compLabel: initCL, initialPeriod, initialCompare }: Props) {
   const [isPending, startTransition] = useTransition()
+  const [isNarrow, setIsNarrow] = useState<boolean | null>(null)
   const [period, setPeriod] = useState<Period>(initialPeriod)
   const [compare, setCompare] = useState<CompareMode>(initialCompare)
   const [customFrom, setCustomFrom] = useState('')
@@ -73,6 +101,20 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
   const [topProducts, setTopProducts] = useState(initTop)
   const [periodLabel, setPeriodLabel] = useState(initPL)
   const [compLabel, setCompLabel] = useState(initCL)
+
+  const chartsReady = useSyncExternalStore(
+    () => () => {},
+    () => true,
+    () => false,
+  )
+
+  useEffect(() => {
+    const media = window.matchMedia('(max-width: 639px)')
+    const sync = () => setIsNarrow(media.matches)
+    sync()
+    media.addEventListener('change', sync)
+    return () => media.removeEventListener('change', sync)
+  }, [])
 
   function refresh(p: Period, c: CompareMode, cf?: string, ct?: string) {
     startTransition(async () => {
@@ -88,9 +130,28 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
 
   // Chart axis config
   const xInterval = chartData.length > 30 ? 4 : chartData.length > 14 ? 2 : 0
+  const mobileXInterval = chartData.length > 14 ? 3 : chartData.length > 7 ? 1 : 0
   const xAngle = chartData.length > 14 ? -45 : 0
   const xAnchor = chartData.length > 14 ? 'end' as const : 'middle' as const
   const xHeight = chartData.length > 14 ? 50 : 30
+
+  function renderResponsiveChart(render: () => React.ReactNode, className = 'h-56 sm:h-56') {
+    return (
+      <div className={`${className} min-h-56 min-w-0`}>
+        {chartsReady ? (
+          <ResponsiveContainer width="99%" height="100%" minHeight={224} debounce={50}>
+            {render()}
+          </ResponsiveContainer>
+        ) : (
+          <div className="h-full w-full rounded-md bg-muted/30" />
+        )}
+      </div>
+    )
+  }
+
+  function renderChartPlaceholder() {
+    return <div className="h-56 w-full rounded-md bg-muted/30" />
+  }
 
   // Cash bridge data
   const bridge = [
@@ -169,8 +230,20 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         {/* Net Sales — bar (current) + line (comparison) */}
         <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">Net Sales</h2>
-          <div className="h-48 sm:h-56 min-w-0">
-            <ResponsiveContainer width="100%" height="100%">
+          {isNarrow === null ? renderChartPlaceholder() : isNarrow ? (
+            <MobileChartFrame>
+              {(chartWidth) => (
+                <BarChart width={chartWidth} height={224} data={chartData} margin={{ top: 5, right: 8, left: 0, bottom: 5 }}>
+                  <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+                  <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={mobileXInterval} angle={0} textAnchor="middle" height={30} />
+                  <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={36} />
+                  <Tooltip formatter={(value, name) => [fmtGbpFull(Number(value)), name === 'netSales' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
+                  <Bar dataKey="netSales" fill="hsl(221, 83%, 53%)" radius={[2, 2, 0, 0]} name="netSales" />
+                  <Line type="monotone" dataKey="compNetSales" stroke="hsl(0, 0%, 65%)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="compNetSales" />
+                </BarChart>
+              )}
+            </MobileChartFrame>
+          ) : renderResponsiveChart(() => (
               <BarChart data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                 <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={xInterval} angle={xAngle} textAnchor={xAnchor} height={xHeight} />
@@ -179,44 +252,67 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                 <Bar dataKey="netSales" fill="hsl(221, 83%, 53%)" radius={[2, 2, 0, 0]} name="netSales" />
                 <Line type="monotone" dataKey="compNetSales" stroke="hsl(0, 0%, 65%)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="compNetSales" />
               </BarChart>
-            </ResponsiveContainer>
-          </div>
+          ))}
         </Card>
 
         {/* COGS — multi-line (current + comparison) */}
         <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">COGS</h2>
-          <div className="h-48 sm:h-56 min-w-0">
-            <ResponsiveContainer width="100%" height="100%">
+          {isNarrow === null ? renderChartPlaceholder() : isNarrow ? (
+            <MobileChartFrame>
+              {(chartWidth) => (
+                <LineChart width={chartWidth} height={224} data={chartData} margin={{ top: 5, right: 8, left: 0, bottom: 5 }}>
+                  <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+                  <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={mobileXInterval} angle={0} textAnchor="middle" height={30} />
+                  <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={36} />
+                  <Tooltip formatter={(value, name) => [fmtGbpFull(Number(value)), name === 'cogs' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
+                  <Legend formatter={(v) => v === 'cogs' ? periodLabel : compLabel} wrapperStyle={{ fontSize: 11 }} />
+                  <Line type="monotone" dataKey="cogs" stroke="hsl(0, 72%, 51%)" strokeWidth={2} dot={{ r: 2 }} name="cogs" />
+                  <Line type="monotone" dataKey="compCogs" stroke="hsl(0, 0%, 65%)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="compCogs" />
+                </LineChart>
+              )}
+            </MobileChartFrame>
+          ) : renderResponsiveChart(() => (
               <LineChart data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                 <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={xInterval} angle={xAngle} textAnchor={xAnchor} height={xHeight} />
                 <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={40} />
                 <Tooltip formatter={(value, name) => [fmtGbpFull(Number(value)), name === 'cogs' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
-                <Legend formatter={(v) => v === 'cogs' ? periodLabel : compLabel} />
+                <Legend formatter={(v) => v === 'cogs' ? periodLabel : compLabel} wrapperStyle={{ fontSize: 11 }} />
                 <Line type="monotone" dataKey="cogs" stroke="hsl(0, 72%, 51%)" strokeWidth={2} dot={{ r: 2 }} name="cogs" />
                 <Line type="monotone" dataKey="compCogs" stroke="hsl(0, 0%, 65%)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="compCogs" />
               </LineChart>
-            </ResponsiveContainer>
-          </div>
+          ))}
         </Card>
 
         {/* Margin % — line (current + comparison) */}
         <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">Margin %</h2>
-          <div className="h-48 sm:h-56 min-w-0">
-            <ResponsiveContainer width="100%" height="100%">
+          {isNarrow === null ? renderChartPlaceholder() : isNarrow ? (
+            <MobileChartFrame>
+              {(chartWidth) => (
+                <LineChart width={chartWidth} height={224} data={chartData} margin={{ top: 5, right: 8, left: 0, bottom: 5 }}>
+                  <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+                  <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={mobileXInterval} angle={0} textAnchor="middle" height={30} />
+                  <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => `${v}%`} width={36} domain={[0, 100]} />
+                  <Tooltip formatter={(value, name) => [`${Number(value).toFixed(1)}%`, name === 'marginPct' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
+                  <Legend formatter={(v) => v === 'marginPct' ? periodLabel : compLabel} wrapperStyle={{ fontSize: 11 }} />
+                  <Line type="monotone" dataKey="marginPct" stroke="hsl(142, 71%, 45%)" strokeWidth={2} dot={{ r: 2 }} name="marginPct" />
+                  <Line type="monotone" dataKey="compMarginPct" stroke="hsl(0, 0%, 65%)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="compMarginPct" />
+                </LineChart>
+              )}
+            </MobileChartFrame>
+          ) : renderResponsiveChart(() => (
               <LineChart data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                 <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={xInterval} angle={xAngle} textAnchor={xAnchor} height={xHeight} />
                 <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => `${v}%`} width={40} domain={[0, 100]} />
                 <Tooltip formatter={(value, name) => [`${Number(value).toFixed(1)}%`, name === 'marginPct' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
-                <Legend formatter={(v) => v === 'marginPct' ? periodLabel : compLabel} />
+                <Legend formatter={(v) => v === 'marginPct' ? periodLabel : compLabel} wrapperStyle={{ fontSize: 11 }} />
                 <Line type="monotone" dataKey="marginPct" stroke="hsl(142, 71%, 45%)" strokeWidth={2} dot={{ r: 2 }} name="marginPct" />
                 <Line type="monotone" dataKey="compMarginPct" stroke="hsl(0, 0%, 65%)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="compMarginPct" />
               </LineChart>
-            </ResponsiveContainer>
-          </div>
+          ))}
         </Card>
       </div>
 
@@ -225,11 +321,25 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         {/* Cash Bridge */}
         <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">Cash Bridge</h2>
-          <div className="h-48 sm:h-56 min-w-0">
-            <ResponsiveContainer width="100%" height="100%">
+          {isNarrow === null ? renderChartPlaceholder() : isNarrow ? (
+            <MobileChartFrame>
+              {(chartWidth) => (
+                <BarChart width={chartWidth} height={224} data={bridge} margin={{ top: 5, right: 8, left: 0, bottom: 5 }}>
+                  <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
+                  <XAxis dataKey="name" tick={{ fontSize: 9 }} interval={0} />
+                  <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : v < -1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={40} />
+                  <Tooltip formatter={(value) => [fmtGbpFull(Math.abs(Number(value))), '']} contentStyle={{ fontSize: 11 }} />
+                  <ReferenceLine y={0} stroke="hsl(0, 0%, 70%)" />
+                  <Bar dataKey="value" radius={[3, 3, 0, 0]}>
+                    {bridge.map((entry, i) => <Cell key={i} fill={entry.fill} />)}
+                  </Bar>
+                </BarChart>
+              )}
+            </MobileChartFrame>
+          ) : renderResponsiveChart(() => (
               <BarChart data={bridge} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
-                <XAxis dataKey="name" tick={{ fontSize: 9 }} />
+                <XAxis dataKey="name" tick={{ fontSize: 9 }} interval={0} />
                 <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : v < -1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={45} />
                 <Tooltip formatter={(value) => [fmtGbpFull(Math.abs(Number(value))), '']} contentStyle={{ fontSize: 11 }} />
                 <ReferenceLine y={0} stroke="hsl(0, 0%, 70%)" />
@@ -237,8 +347,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                   {bridge.map((entry, i) => <Cell key={i} fill={entry.fill} />)}
                 </Bar>
               </BarChart>
-            </ResponsiveContainer>
-          </div>
+          ))}
         </Card>
 
         {/* Best Sellers */}
