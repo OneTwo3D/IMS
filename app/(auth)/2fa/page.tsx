@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { TotpForm } from '@/components/auth/totp-form'
 
 export const metadata: Metadata = { title: 'Two-Factor Authentication' }
+export const dynamic = 'force-dynamic'
 
 export default async function TwoFactorPage() {
   const org = await db.organisation.findFirst({ select: { name: true, logoUrl: true } })

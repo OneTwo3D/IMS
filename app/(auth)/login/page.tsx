@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { LoginForm } from '@/components/auth/login-form'
 
 export const metadata: Metadata = { title: 'Sign In' }
+export const dynamic = 'force-dynamic'
 
 export default async function LoginPage() {
   const org = await db.organisation.findFirst({ select: { name: true, logoUrl: true } })
