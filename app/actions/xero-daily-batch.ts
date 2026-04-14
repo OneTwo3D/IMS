@@ -166,8 +166,16 @@ async function computePreview(): Promise<DailyBatchPreview> {
 
   const a2OrdersComputed: DailyBatchPreviewOrder[] = []
   let a2Total = 0
+  const a2Snapshot = await buildPreviewLayerSnapshot(
+    a2OrdersRaw.flatMap((order) =>
+      order.allocations.map((alloc) => ({
+        productId: alloc.productId,
+        warehouseId: alloc.warehouseId,
+      })),
+    ),
+  )
   for (const order of a2OrdersRaw) {
-    const cost = await computeFifoCost(order.allocations)
+    const cost = computeFifoCostFromSnapshot(a2Snapshot, order.allocations)
     a2Total += cost
     a2OrdersComputed.push({
       id: order.id,
@@ -202,7 +210,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
         select: {
           productId: true,
           qty: true,
-          line: { select: { totalGbp: true } },
+          line: { select: { qty: true, totalGbp: true } },
         },
       },
       order: {
@@ -221,6 +229,14 @@ async function computePreview(): Promise<DailyBatchPreview> {
   const bShipmentsComputed: DailyBatchPreviewShipment[] = []
   let bRevenue = 0
   let bCogs = 0
+  const bSnapshot = await buildPreviewLayerSnapshot(
+    bShipments.flatMap((shipment) =>
+      shipment.lines.map((line) => ({
+        productId: line.productId,
+        warehouseId: shipment.warehouseId,
+      })),
+    ),
+  )
 
   for (const shipment of bShipments) {
     const orderLineTotal = shipment.order.lines.reduce(
@@ -228,7 +244,12 @@ async function computePreview(): Promise<DailyBatchPreview> {
       0,
     )
     const shipmentLineValue = shipment.lines.reduce(
-      (s, l) => s + Number(l.line.totalGbp),
+      (s, l) => {
+        const lineQty = Number(l.line.qty)
+        const shippedQty = Number(l.qty)
+        if (lineQty <= 0 || shippedQty <= 0) return s
+        return s + (Number(l.line.totalGbp) * shippedQty) / lineQty
+      },
       0,
     )
     const deferredBase = Number(
@@ -243,7 +264,8 @@ async function computePreview(): Promise<DailyBatchPreview> {
     // therefore reuse the same layer depth — which is an acceptable, and
     // documented, preview approximation. The real batch runs exclusively
     // and will consume layers atomically.
-    const cogs = await computeFifoCost(
+    const cogs = computeFifoCostFromSnapshot(
+      bSnapshot,
       shipment.lines.map((l) => ({
         productId: l.productId,
         warehouseId: shipment.warehouseId,
@@ -283,43 +305,45 @@ async function computePreview(): Promise<DailyBatchPreview> {
  * Sum FIFO cost for a set of allocation-like rows. Reads cost layers but
  * never mutates them — this is a preview helper only.
  */
-async function computeFifoCost(
-  rows: Array<{ productId: string; warehouseId: string; qty: number | { toString(): string } }>,
-): Promise<number> {
-  if (rows.length === 0) return 0
+type PreviewLayerSnapshot = Map<string, Array<{ remainingQty: number; unitCostGbp: number }>>
 
-  // Batch layer lookup: one query per (product, warehouse) tuple. Kept
-  // sequential to avoid hammering the pool on a wide batch.
+async function buildPreviewLayerSnapshot(
+  rows: Array<{ productId: string; warehouseId: string }>,
+): Promise<PreviewLayerSnapshot> {
+  const snapshot: PreviewLayerSnapshot = new Map()
+  const keys = new Set(rows.map((row) => `${row.productId}|${row.warehouseId}`))
+
+  for (const key of keys) {
+    const [productId, warehouseId] = key.split('|')
+    const layers = await db.costLayer.findMany({
+      where: {
+        productId,
+        warehouseId,
+        remainingQty: { gt: 0 },
+      },
+      orderBy: { receivedAt: 'asc' },
+      select: { remainingQty: true, unitCostGbp: true },
+    })
+    snapshot.set(
+      key,
+      layers.map((layer) => ({
+        remainingQty: Number(layer.remainingQty),
+        unitCostGbp: Number(layer.unitCostGbp),
+      })),
+    )
+  }
+
+  return snapshot
+}
+
+function computeFifoCostFromSnapshot(
+  snapshot: PreviewLayerSnapshot,
+  rows: Array<{ productId: string; warehouseId: string; qty: number | { toString(): string } }>,
+): number {
   let total = 0
-  const seen = new Set<string>()
-  const layersCache = new Map<
-    string,
-    Array<{ remainingQty: number; unitCostGbp: number }>
-  >()
 
   for (const row of rows) {
-    const key = `${row.productId}|${row.warehouseId}`
-    if (!seen.has(key)) {
-      seen.add(key)
-      const layers = await db.costLayer.findMany({
-        where: {
-          productId: row.productId,
-          warehouseId: row.warehouseId,
-          remainingQty: { gt: 0 },
-        },
-        orderBy: { receivedAt: 'asc' },
-        select: { remainingQty: true, unitCostGbp: true },
-      })
-      layersCache.set(
-        key,
-        layers.map((l) => ({
-          remainingQty: Number(l.remainingQty),
-          unitCostGbp: Number(l.unitCostGbp),
-        })),
-      )
-    }
-
-    const layers = layersCache.get(key) ?? []
+    const layers = snapshot.get(`${row.productId}|${row.warehouseId}`) ?? []
     let remaining = Number(row.qty)
     for (const layer of layers) {
       if (remaining <= 0) break
