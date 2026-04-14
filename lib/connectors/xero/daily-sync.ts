@@ -17,6 +17,13 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getXeroSettings } from '@/lib/connectors/xero/settings'
 import type { Prisma } from '@/app/generated/prisma/client'
+import {
+  parseCostLayerSnapshot,
+  reduceSnapshotByCostLayer,
+  sumCostLayerSnapshot,
+  takeFromSnapshotEntries,
+  type CostLayerSnapshotEntry,
+} from '@/lib/cost-layer-snapshots'
 
 type MutableLayer = {
   id: string
@@ -71,22 +78,26 @@ async function buildLayerSnapshot(
   return snapshot
 }
 
-function consumeSnapshotCost(
+function consumeSnapshotLayers(
   snapshot: LayerSnapshot,
   productId: string,
   warehouseId: string,
   qty: number,
   trackDecrements?: Map<string, number>,
-): number {
+): CostLayerSnapshotEntry[] {
   const layers = snapshot.get(makeLayerKey(productId, warehouseId)) ?? []
   let remaining = qty
-  let total = 0
+  const consumed: CostLayerSnapshotEntry[] = []
 
   for (const layer of layers) {
     if (remaining <= 0) break
     const take = Math.min(remaining, layer.remainingQty)
     if (take <= 0) continue
-    total += take * layer.unitCostGbp
+    consumed.push({
+      costLayerId: layer.id,
+      qty: take,
+      unitCostGbp: layer.unitCostGbp,
+    })
     layer.remainingQty -= take
     remaining -= take
     if (trackDecrements) {
@@ -94,7 +105,7 @@ function consumeSnapshotCost(
     }
   }
 
-  return total
+  return consumed
 }
 
 async function createPendingSyncLog(
@@ -116,6 +127,21 @@ async function createPendingSyncLog(
   })
 }
 
+async function resetFailedDailyBatchLogs(): Promise<void> {
+  await db.accountingSyncLog.updateMany({
+    where: {
+      type: { in: ['DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B'] },
+      status: 'FAILED',
+    },
+    data: {
+      status: 'PENDING',
+      retryCount: 0,
+      errorMessage: null,
+      processingStartedAt: null,
+    },
+  })
+}
+
 export async function runDailyBatchSync(): Promise<{
   groupA1: number
   groupA2: number
@@ -129,6 +155,8 @@ export async function runDailyBatchSync(): Promise<{
   if (settings.xero_sync_enabled !== 'true') {
     return result
   }
+
+  await resetFailedDailyBatchLogs()
 
   // --- Group A1: Revenue Deferral ---
   try {
@@ -144,9 +172,7 @@ export async function runDailyBatchSync(): Promise<{
         orderNumber: true,
         wcOrderNumber: true,
         totalGbp: true,
-        lines: {
-          select: { totalGbp: true },
-        },
+        taxGbp: true,
       },
     })
 
@@ -155,7 +181,7 @@ export async function runDailyBatchSync(): Promise<{
       const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = []
 
       for (const order of orders) {
-        const salesValue = round2(Number(order.totalGbp))
+        const salesValue = round2(Number(order.totalGbp) - Number(order.taxGbp))
         totalRevenueDeferred += salesValue
       }
 
@@ -182,7 +208,7 @@ export async function runDailyBatchSync(): Promise<{
         }
 
         for (const order of orders) {
-          const salesValue = round2(Number(order.totalGbp))
+          const salesValue = round2(Number(order.totalGbp) - Number(order.taxGbp))
           await tx.salesOrder.update({
             where: { id: order.id },
             data: {
@@ -214,6 +240,7 @@ export async function runDailyBatchSync(): Promise<{
         wcOrderNumber: true,
         allocations: {
           select: {
+            id: true,
             productId: true,
             warehouseId: true,
             qty: true,
@@ -234,17 +261,20 @@ export async function runDailyBatchSync(): Promise<{
           ),
         )
         const orderValues = new Map<string, number>()
+        const allocationSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
 
         for (const order of orders) {
           let orderCostValue = 0
 
           for (const alloc of order.allocations) {
-            orderCostValue += consumeSnapshotCost(
+            const allocationSnapshot = consumeSnapshotLayers(
               snapshot,
               alloc.productId,
               alloc.warehouseId,
               Number(alloc.qty),
             )
+            allocationSnapshots.set(alloc.id, allocationSnapshot)
+            orderCostValue += sumCostLayerSnapshot(allocationSnapshot)
           }
 
           orderCostValue = round2(orderCostValue)
@@ -270,6 +300,14 @@ export async function runDailyBatchSync(): Promise<{
         }
 
         for (const order of orders) {
+          for (const alloc of order.allocations) {
+            await tx.orderAllocation.update({
+              where: { id: alloc.id },
+              data: {
+                costLayerSnapshot: (allocationSnapshots.get(alloc.id) ?? []) as never,
+              },
+            })
+          }
           await tx.salesOrder.update({
             where: { id: order.id },
             data: {
@@ -305,6 +343,8 @@ export async function runDailyBatchSync(): Promise<{
         createdAt: true,
         lines: {
           select: {
+            id: true,
+            lineId: true,
             productId: true,
             qty: true,
             line: {
@@ -336,17 +376,75 @@ export async function runDailyBatchSync(): Promise<{
     if (shipments.length > 0) {
       let totalRevenue = 0
       let totalCogs = 0
-      const snapshot = await buildLayerSnapshot(
-        shipments.flatMap((shipment) =>
-          shipment.lines.map((line) => ({
-            productId: line.productId,
-            warehouseId: shipment.warehouseId,
-          })),
-        ),
-      )
       const layerDecrements = new Map<string, number>()
       const shipmentResults = new Map<string, { revenue: number; cogs: number }>()
+      const shipmentSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
       const shipmentsByOrder = new Map<string, typeof shipments>()
+      const orderIds = Array.from(new Set(shipments.map((shipment) => shipment.orderId)))
+
+      const [orderAllocations, priorShipmentLines, priorRefundLines] = await Promise.all([
+        db.orderAllocation.findMany({
+          where: { orderId: { in: orderIds } },
+          select: {
+            id: true,
+            orderId: true,
+            lineId: true,
+            warehouseId: true,
+            costLayerSnapshot: true,
+          },
+        }),
+        db.shipmentLine.findMany({
+          where: {
+            shipment: {
+              orderId: { in: orderIds },
+              shipmentJournalDate: { not: null },
+            },
+          },
+          select: {
+            costLayerSnapshot: true,
+          },
+        }),
+        db.salesOrderRefundLine.findMany({
+          where: {
+            refund: {
+              orderId: { in: orderIds },
+            },
+          },
+          select: {
+            costLayerSnapshot: true,
+          },
+        }),
+      ])
+
+      const allocationAvailability = new Map<string, CostLayerSnapshotEntry[]>()
+      for (const allocation of orderAllocations) {
+        allocationAvailability.set(
+          allocation.id,
+          parseCostLayerSnapshot(allocation.costLayerSnapshot),
+        )
+      }
+
+      for (const priorShipmentLine of priorShipmentLines) {
+        for (const entry of parseCostLayerSnapshot(priorShipmentLine.costLayerSnapshot)) {
+          if (!entry.orderAllocationId) continue
+          const available = allocationAvailability.get(entry.orderAllocationId) ?? []
+          allocationAvailability.set(
+            entry.orderAllocationId,
+            reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
+          )
+        }
+      }
+
+      for (const priorRefundLine of priorRefundLines) {
+        for (const entry of parseCostLayerSnapshot(priorRefundLine.costLayerSnapshot)) {
+          if (entry.source !== 'allocation' || !entry.orderAllocationId) continue
+          const available = allocationAvailability.get(entry.orderAllocationId) ?? []
+          allocationAvailability.set(
+            entry.orderAllocationId,
+            reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
+          )
+        }
+      }
 
       for (const shipment of shipments) {
         const existing = shipmentsByOrder.get(shipment.orderId) ?? []
@@ -356,8 +454,7 @@ export async function runDailyBatchSync(): Promise<{
 
       for (const [, orderShipments] of shipmentsByOrder) {
         const firstShipment = orderShipments[0]
-        const orderTotal = Number(firstShipment.order.totalGbp)
-        const deferredBase = Number(firstShipment.order.unearnedRevenueAmount ?? orderTotal)
+        const deferredBase = Number(firstShipment.order.unearnedRevenueAmount ?? firstShipment.order.totalGbp)
         const orderLineTotal = firstShipment.order.lines.reduce((sum, line) => sum + Number(line.totalGbp), 0)
         const recognizedPreviously = firstShipment.order.shipments.reduce((sum, shipment) => (
           shipment.shipmentJournalDate ? sum + Number(shipment.revenueRecognizedAmount ?? 0) : sum
@@ -389,22 +486,54 @@ export async function runDailyBatchSync(): Promise<{
 
           // COGS: consume FIFO cost layers and track layer decrements so the
           // inventory mutation is committed atomically with the sync log row.
-          let shipmentCogs = 0
+          const shipmentCostSnapshot: CostLayerSnapshotEntry[] = []
           for (const sl of shipment.lines) {
-            shipmentCogs += consumeSnapshotCost(
-              snapshot,
-              sl.productId,
-              shipment.warehouseId,
-              Number(sl.qty),
-              layerDecrements,
-            )
+            let remainingQty = Number(sl.qty)
+            const matchingAllocations = orderAllocations.filter((allocation) => (
+              allocation.orderId === shipment.orderId
+              && allocation.lineId === sl.lineId
+              && allocation.warehouseId === shipment.warehouseId
+            ))
+
+            for (const allocation of matchingAllocations) {
+              if (remainingQty <= 0) break
+              const availableEntries = allocationAvailability.get(allocation.id) ?? []
+              const consumed = takeFromSnapshotEntries(availableEntries, remainingQty, {
+                orderAllocationId: allocation.id,
+                shipmentLineId: sl.id,
+                source: 'shipment',
+              })
+              shipmentCostSnapshot.push(...consumed.taken)
+              remainingQty = consumed.remainingQty
+              allocationAvailability.set(
+                allocation.id,
+                reduceSnapshotByCostLayer(
+                  availableEntries,
+                  consumed.taken.map((entry) => ({ costLayerId: entry.costLayerId, qty: entry.qty })),
+                ),
+              )
+            }
+
+            if (remainingQty > 0.0000001) {
+              throw new Error(`Missing allocated cost layers for shipment line ${sl.id}`)
+            }
           }
 
-          shipmentCogs = round2(shipmentCogs)
+          for (const entry of shipmentCostSnapshot) {
+            layerDecrements.set(entry.costLayerId, (layerDecrements.get(entry.costLayerId) ?? 0) + entry.qty)
+          }
+
+          const shipmentCogs = round2(sumCostLayerSnapshot(shipmentCostSnapshot))
           totalRevenue += revenueProportion
           totalCogs += shipmentCogs
           runningRevenue += revenueProportion
           shipmentResults.set(shipment.id, { revenue: revenueProportion, cogs: shipmentCogs })
+          for (const sl of shipment.lines) {
+            shipmentSnapshots.set(
+              sl.id,
+              shipmentCostSnapshot.filter((entry) => entry.shipmentLineId === sl.id),
+            )
+          }
         }
       }
 
@@ -441,6 +570,14 @@ export async function runDailyBatchSync(): Promise<{
 
         for (const shipment of shipments) {
           const resultForShipment = shipmentResults.get(shipment.id) ?? { revenue: 0, cogs: 0 }
+          for (const line of shipment.lines) {
+            await tx.shipmentLine.update({
+              where: { id: line.id },
+              data: {
+                costLayerSnapshot: (shipmentSnapshots.get(line.id) ?? []) as never,
+              },
+            })
+          }
           await tx.shipment.update({
             where: { id: shipment.id },
             data: {

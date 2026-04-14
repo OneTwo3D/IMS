@@ -251,7 +251,7 @@ export async function retryFailedXeroSync(entryId?: string): Promise<{ success: 
       : { status: 'FAILED' as const }
     const result = await db.accountingSyncLog.updateMany({
       where,
-      data: { status: 'PENDING', retryCount: 0, errorMessage: null },
+      data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null },
     })
     await logActivity({
       entityType: 'SYSTEM',
@@ -314,4 +314,3 @@ export async function getXeroSyncReadiness(): Promise<XeroSyncReadiness> {
     missingTaxTypes,
   }
 }
-

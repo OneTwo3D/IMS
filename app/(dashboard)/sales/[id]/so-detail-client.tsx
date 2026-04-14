@@ -192,8 +192,8 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
         {error && <p className="text-sm text-destructive">{error}</p>}
       </div>
       <DialogFooter>
-        <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-        <Button onClick={handleConfirm} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Confirm Refund</Button>
+        <Button type="button" variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
+        <Button type="button" onClick={handleConfirm} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Confirm Refund</Button>
       </DialogFooter>
     </DialogContent></Dialog>
   )
@@ -901,7 +901,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
           )}
 
           {canRefund && (
-            <Button variant="outline" size="sm" onClick={() => setShowRefund(true)} disabled={isPending}>
+            <Button type="button" variant="outline" size="sm" onClick={() => setShowRefund(true)} disabled={isPending}>
               <Undo2 className="h-4 w-4 mr-1" />Refund
             </Button>
           )}

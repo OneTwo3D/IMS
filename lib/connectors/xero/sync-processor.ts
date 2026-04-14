@@ -17,6 +17,7 @@ import type { AccountingSyncType } from '@/app/generated/prisma/client'
 
 const MAX_RETRIES = 5
 const MAX_PER_RUN = 50 // Xero rate limit: 60/min — leave headroom
+const CLAIM_STALE_MS = 15 * 60 * 1000
 
 type ProcessResult = {
   processed: number
@@ -29,10 +30,17 @@ type SyncPayload = Record<string, unknown>
 
 export async function processPendingXeroSync(): Promise<ProcessResult> {
   const result: ProcessResult = { processed: 0, succeeded: 0, failed: 0, skipped: 0 }
+  const staleClaimCutoff = new Date(Date.now() - CLAIM_STALE_MS)
 
   const pending = await db.accountingSyncLog.findMany({
     where: {
-      status: 'PENDING',
+      OR: [
+        { status: 'PENDING' },
+        {
+          status: 'PROCESSING',
+          processingStartedAt: { lt: staleClaimCutoff },
+        },
+      ],
       retryCount: { lt: MAX_RETRIES },
     },
     orderBy: { createdAt: 'asc' },
@@ -40,6 +48,25 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
   })
 
   for (const entry of pending) {
+    const claim = await db.accountingSyncLog.updateMany({
+      where: {
+        id: entry.id,
+        retryCount: { lt: MAX_RETRIES },
+        OR: [
+          { status: 'PENDING' },
+          {
+            status: 'PROCESSING',
+            processingStartedAt: { lt: staleClaimCutoff },
+          },
+        ],
+      },
+      data: {
+        status: 'PROCESSING',
+        processingStartedAt: new Date(),
+      },
+    })
+    if (claim.count === 0) continue
+
     result.processed++
     const payload = (entry.payload ?? {}) as SyncPayload
 
@@ -54,6 +81,7 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
             xeroTransactionId: syncResult.externalId ?? null,
             syncedAt: new Date(),
             errorMessage: null,
+            processingStartedAt: null,
           },
         })
 
@@ -69,6 +97,7 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
             status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
             retryCount,
             errorMessage: syncResult.error ?? 'Unknown error',
+            processingStartedAt: null,
           },
         })
         result.failed++
@@ -81,6 +110,7 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
           status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
           retryCount,
           errorMessage: String(e),
+          processingStartedAt: null,
         },
       })
       result.failed++

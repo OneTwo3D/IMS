@@ -64,6 +64,7 @@ const SYNC_TYPE_TOGGLES: { key: keyof XeroSettings; label: string; description: 
 
 const STATUS_BADGE: Record<string, { variant: 'default' | 'secondary' | 'outline' | 'destructive'; label: string }> = {
   PENDING: { variant: 'outline', label: 'Pending' },
+  PROCESSING: { variant: 'secondary', label: 'Processing' },
   SYNCED: { variant: 'default', label: 'Synced' },
   FAILED: { variant: 'destructive', label: 'Failed' },
 }
@@ -1240,7 +1241,7 @@ function PreviewShipmentList({ shipments }: { shipments: DailyBatchPreview['grou
 
 function HistoryStatusBadge({ entries }: { entries: Array<{ status: string }> }) {
   const anyFailed = entries.some((e) => e.status === 'FAILED')
-  const anyPending = entries.some((e) => e.status === 'PENDING')
+  const anyPending = entries.some((e) => e.status === 'PENDING' || e.status === 'PROCESSING')
   if (anyFailed) return <Badge variant="destructive" className="text-[10px]">Failed</Badge>
   if (anyPending) return <Badge variant="outline" className="text-[10px]">Pending</Badge>
   return <Badge variant="default" className="text-[10px]">Synced</Badge>

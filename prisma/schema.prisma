@@ -156,6 +156,7 @@ enum AccountingSyncType {
 
 enum AccountingSyncStatus {
   PENDING
+  PROCESSING
   SYNCED
   FAILED
 
@@ -1135,6 +1136,7 @@ model SalesOrderRefundLine {
   qty             Decimal          @db.Decimal(12, 4)
   unitPriceGbp    Decimal          @db.Decimal(18, 6)
   totalGbp        Decimal          @db.Decimal(18, 4)
+  costLayerSnapshot Json?
 
   refund          SalesOrderRefund @relation(fields: [refundId], references: [id])
   product         Product?         @relation(fields: [productId], references: [id])
@@ -1349,6 +1351,7 @@ model AccountingSyncLog {
   payload         Json?               // what was sent
   errorMessage    String?
   retryCount      Int                 @default(0)
+  processingStartedAt DateTime?
   syncedAt        DateTime?
   createdAt       DateTime            @default(now())
 
@@ -1357,6 +1360,7 @@ model AccountingSyncLog {
 
   @@index([referenceType, referenceId])
   @@index([status, createdAt])
+  @@index([status, processingStartedAt])
   @@map("xero_sync_logs")
 }
 
@@ -1552,6 +1556,7 @@ model OrderAllocation {
   productId   String
   warehouseId String
   qty         Decimal  @db.Decimal(12, 4)
+  costLayerSnapshot Json?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
@@ -1598,6 +1603,7 @@ model ShipmentLine {
   lineId      String
   productId   String
   qty         Decimal  @db.Decimal(12, 4)
+  costLayerSnapshot Json?
 
   shipment    Shipment       @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
   line        SalesOrderLine @relation(fields: [lineId], references: [id])

@@ -8,6 +8,13 @@ import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
+import {
+  parseCostLayerSnapshot,
+  reduceSnapshotByCostLayer,
+  sumCostLayerSnapshot,
+  takeFromSnapshotEntries,
+  type CostLayerSnapshotEntry,
+} from '@/lib/cost-layer-snapshots'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -901,14 +908,14 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
 
   // Shipping is stored NET on the SalesOrder. Reconstruct gross when
   // sending inclusive so Xero calculates the correct tax.
-  const shippingNetGbp = Number(so.shippingGbp ?? 0)
-  const shippingSendGbp = lineAmountsIncludeTax
-    ? Math.round(shippingNetGbp * (1 + vatPct) * 10000) / 10000
-    : shippingNetGbp
+  const shippingNetForeign = Number(so.shippingForeign ?? 0)
+  const shippingSendForeign = lineAmountsIncludeTax
+    ? Math.round(shippingNetForeign * (1 + vatPct) * 10000) / 10000
+    : shippingNetForeign
 
   // `discountAmount` is stored in the same inclusive/exclusive convention as
   // the order (matching WC import), so it can be passed through directly.
-  const discountGbp = Math.round((Number(so.discountAmount ?? 0) / fxRate) * 100) / 100
+  const discountForeign = Math.round(Number(so.discountAmount ?? 0) * 100) / 100
 
   await queueAccountingSync({
     type: 'SALES_INVOICE',
@@ -922,29 +929,23 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       currency: so.currency,
       reference: orderNumber,
       lines: so.lines.map((l) => {
-        // `discountAmount` on the line is stored in the order's foreign
-        // currency. Pass through in GBP (matching unitAmount's convention)
-        // — the accounting connector decides how to represent it.
         const qty = Number(l.qty)
         const discForeign = Number(l.discountAmount ?? 0)
-        const discGbp = discForeign > 0 ? Math.round((discForeign / fxRate) * 10000) / 10000 : 0
         return {
           itemCode: l.sku ?? undefined,
           description: l.description ?? l.sku ?? 'Item',
           quantity: qty,
-          // unitPriceGbp stores the user-entered price (gross when inclVat),
-          // matching lineAmountsIncludeTax.
-          unitAmount: Number(l.unitPriceGbp),
+          unitAmount: Number(l.unitPriceForeign),
           accountCode: settings.salesAccount,
           taxType: l.taxRate?.accountingTaxType ?? orderDefaultTaxType ?? undefined,
-          discountAmount: discGbp > 0 ? discGbp : undefined,
+          discountAmount: discForeign > 0 ? discForeign : undefined,
         }
       }),
-      shippingAmount: shippingSendGbp > 0 ? shippingSendGbp : undefined,
+      shippingAmount: shippingSendForeign > 0 ? shippingSendForeign : undefined,
       shippingDescription: 'Shipping',
       shippingAccountCode: settings.shippingAccount || undefined,
       shippingTaxType: orderDefaultTaxType ?? undefined,
-      discountAmount: discountGbp > 0 ? discountGbp : undefined,
+      discountAmount: discountForeign > 0 ? discountForeign : undefined,
       discountAccountCode: settings.discountAccount || undefined,
       discountTaxType: orderDefaultTaxType ?? undefined,
       lineAmountsIncludeTax,
@@ -1150,6 +1151,7 @@ export async function createRefund(
       where: { id: orderId },
       select: {
         id: true, wcOrderNumber: true, orderNumber: true, status: true, fxRateToGbp: true, totalGbp: true,
+        taxRatePercent: true, pricesIncludeVat: true,
         revenueDeferredDate: true, unearnedRevenueAmount: true,
         inventoryAllocatedDate: true, allocationBatchAmount: true,
       },
@@ -1185,18 +1187,45 @@ export async function createRefund(
         totalForeign,
         totalGbp,
         returnWarehouseId: returnWarehouseId || null,
-        lines: {
-          create: refundLines.map((l) => ({
-            productId: l.productId,
-            description: l.description,
-            qty: l.qty,
-            unitPriceGbp: l.qty > 0 ? l.totalGbp / l.qty : 0,
-            totalGbp: l.totalGbp,
-          })),
-        },
       },
       select: { id: true },
     })
+    const createdRefundLines: Array<{
+      id: string
+      productId: string | null
+      description: string
+      qty: number
+      unitPriceGbp: number
+      totalGbp: number
+    }> = []
+    for (const refundLine of refundLines) {
+      const createdLine = await db.salesOrderRefundLine.create({
+        data: {
+          refundId: createdRefund.id,
+          productId: refundLine.productId,
+          description: refundLine.description,
+          qty: refundLine.qty,
+          unitPriceGbp: refundLine.qty > 0 ? refundLine.totalGbp / refundLine.qty : 0,
+          totalGbp: refundLine.totalGbp,
+        },
+        select: {
+          id: true,
+          productId: true,
+          description: true,
+          qty: true,
+          unitPriceGbp: true,
+          totalGbp: true,
+        },
+      })
+      createdRefundLines.push({
+        id: createdLine.id,
+        productId: createdLine.productId,
+        description: createdLine.description,
+        qty: Number(createdLine.qty),
+        unitPriceGbp: Number(createdLine.unitPriceGbp),
+        totalGbp: Number(createdLine.totalGbp),
+      })
+    }
 
     // Return stock if warehouse specified
     if (returnWarehouseId) {
@@ -1286,10 +1315,12 @@ export async function createRefund(
           date: new Date().toISOString().slice(0, 10),
           currency: orderForCN?.currency ?? 'GBP',
           reference: so.wcOrderNumber ?? undefined,
-          lines: refundLines.map(l => ({
+          lines: createdRefundLines.map((l) => ({
             description: l.description || 'Refund line',
             quantity: l.qty > 0 ? l.qty : 1,
-            unitAmount: l.qty > 0 ? l.totalGbp / l.qty : l.totalGbp,
+            unitAmount: orderForCN?.currency === 'GBP'
+              ? (l.qty > 0 ? l.unitPriceGbp : l.totalGbp)
+              : Math.round((l.qty > 0 ? l.unitPriceGbp : l.totalGbp) * fxRate * 10000) / 10000,
             accountCode: settings.salesAccount,
             taxType: cnTaxRate?.accountingTaxType ?? undefined,
           })),
@@ -1307,10 +1338,26 @@ export async function createRefund(
       const orderRef = so.orderNumber ?? so.wcOrderNumber ?? orderId.slice(0, 8)
 
       if (so.revenueDeferredDate) {
-        const refundRevenue = Math.round(totalGbp * 100) / 100
+        const vatPct = Number(so.taxRatePercent ?? 0)
+        const pricesIncludeVat = !!so.pricesIncludeVat && vatPct > 0
+        const toNetRevenue = (grossAmountGbp: number): number => (
+          pricesIncludeVat
+            ? Math.round((grossAmountGbp / (1 + vatPct)) * 100) / 100
+            : Math.round(grossAmountGbp * 100) / 100
+        )
+
+        const refundRevenue = Math.round(createdRefundLines.reduce((sum, line) => sum + toNetRevenue(line.totalGbp), 0) * 100) / 100
         const orderAccounting = await db.salesOrder.findUnique({
           where: { id: orderId },
           select: {
+            allocations: {
+              select: {
+                id: true,
+                lineId: true,
+                warehouseId: true,
+                costLayerSnapshot: true,
+              },
+            },
             lines: {
               select: {
                 id: true,
@@ -1327,8 +1374,10 @@ export async function createRefund(
                 cogsBatchAmount: true,
                 lines: {
                   select: {
+                    id: true,
                     lineId: true,
                     qty: true,
+                    costLayerSnapshot: true,
                   },
                 },
               },
@@ -1338,11 +1387,13 @@ export async function createRefund(
               select: {
                 lines: {
                   select: {
+                    id: true,
                     productId: true,
                     description: true,
                     qty: true,
                     totalGbp: true,
                     unitPriceGbp: true,
+                    costLayerSnapshot: true,
                   },
                 },
               },
@@ -1355,7 +1406,7 @@ export async function createRefund(
             referenceType: 'SalesOrder',
             referenceId: orderId,
             type: { in: ['COGS_REVERSAL', 'UNEARNED_REV_REVERSAL'] },
-            status: { in: ['PENDING', 'SYNCED'] },
+            status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
           },
           select: { type: true, payload: true },
         })
@@ -1371,15 +1422,9 @@ export async function createRefund(
           ), 0)
         }
 
-        const priorCogsReversed = priorReversals
-          .filter((row) => row.type === 'COGS_REVERSAL')
-          .reduce((sum, row) => sum + extractPayloadAmount(row.payload, settings.inventoryAccount), 0)
         const priorUnearnedReversed = priorReversals
           .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
           .reduce((sum, row) => sum + extractPayloadAmount(row.payload, settings.unearnedRevenueAccount), 0)
-        const priorAllocationReversed = priorReversals
-          .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
-          .reduce((sum, row) => sum + extractPayloadAmount(row.payload, settings.inventoryAccount), 0)
 
         const lineContexts = (orderAccounting?.lines ?? []).map((line) => ({
           id: line.id,
@@ -1405,15 +1450,32 @@ export async function createRefund(
           remainingShipped: Map<string, number>,
           remainingUnshipped: Map<string, number>,
           refundLine: { productId: string | null; description: string; qty: number; totalGbp: number; unitPriceGbp?: number | null },
-        ): { shippedRevenue: number; unshippedRevenue: number; assignedRevenue: number } {
+        ): {
+          shippedRevenue: number
+          unshippedRevenue: number
+          assignedRevenue: number
+          shippedQty: number
+          unshippedQty: number
+          lineAllocations: Array<{ lineId: string; shippedQty: number; unshippedQty: number }>
+        } {
           if (!refundLine.productId || refundLine.qty <= 0) {
-            return { shippedRevenue: 0, unshippedRevenue: 0, assignedRevenue: 0 }
+            return {
+              shippedRevenue: 0,
+              unshippedRevenue: 0,
+              assignedRevenue: 0,
+              shippedQty: 0,
+              unshippedQty: 0,
+              lineAllocations: [],
+            }
           }
 
           let remainingQty = refundLine.qty
           let shippedRevenue = 0
           let unshippedRevenue = 0
           let assignedRevenue = 0
+          let shippedQty = 0
+          let unshippedQty = 0
+          const lineAllocations: Array<{ lineId: string; shippedQty: number; unshippedQty: number }> = []
           const refundUnitPrice = refundLine.unitPriceGbp != null
             ? Number(refundLine.unitPriceGbp)
             : (refundLine.qty > 0 ? refundLine.totalGbp / refundLine.qty : null)
@@ -1443,9 +1505,11 @@ export async function createRefund(
             if (shippedTake > 0) {
               const shippedValue = unitRevenue * shippedTake
               shippedRevenue += shippedValue
+              shippedQty += shippedTake
               assignedRevenue += shippedValue
               remainingQty -= shippedTake
               remainingShipped.set(line.id, shippedQtyAvailable - shippedTake)
+              lineAllocations.push({ lineId: line.id, shippedQty: shippedTake, unshippedQty: 0 })
             }
 
             const unshippedQtyAvailable = remainingUnshipped.get(line.id) ?? 0
@@ -1453,13 +1517,15 @@ export async function createRefund(
             if (unshippedTake > 0) {
               const unshippedValue = unitRevenue * unshippedTake
               unshippedRevenue += unshippedValue
+              unshippedQty += unshippedTake
               assignedRevenue += unshippedValue
               remainingQty -= unshippedTake
               remainingUnshipped.set(line.id, unshippedQtyAvailable - unshippedTake)
+              lineAllocations.push({ lineId: line.id, shippedQty: 0, unshippedQty: unshippedTake })
             }
           }
 
-          return { shippedRevenue, unshippedRevenue, assignedRevenue }
+          return { shippedRevenue, unshippedRevenue, assignedRevenue, shippedQty, unshippedQty, lineAllocations }
         }
 
         const shippedQtyByLine = new Map<string, number>()
@@ -1513,10 +1579,118 @@ export async function createRefund(
         let shippedQtyRevenue = 0
         let unshippedQtyRevenue = 0
         let nonQtyRevenue = 0
+        const refundLayerSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
+        const shipmentLineAvailability = new Map<string, CostLayerSnapshotEntry[]>()
+        const allocationAvailability = new Map<string, CostLayerSnapshotEntry[]>()
 
-        for (const refundLine of refundLines) {
+        for (const shipment of orderAccounting?.shipments ?? []) {
+          for (const shipmentLine of shipment.lines) {
+            shipmentLineAvailability.set(
+              shipmentLine.id,
+              parseCostLayerSnapshot(shipmentLine.costLayerSnapshot),
+            )
+          }
+        }
+
+        for (const allocation of orderAccounting?.allocations ?? []) {
+          allocationAvailability.set(
+            allocation.id,
+            parseCostLayerSnapshot(allocation.costLayerSnapshot),
+          )
+        }
+
+        for (const shipment of orderAccounting?.shipments ?? []) {
+          for (const shipmentLine of shipment.lines) {
+            for (const entry of parseCostLayerSnapshot(shipmentLine.costLayerSnapshot)) {
+              if (!entry.orderAllocationId) continue
+              const available = allocationAvailability.get(entry.orderAllocationId) ?? []
+              allocationAvailability.set(
+                entry.orderAllocationId,
+                reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
+              )
+            }
+          }
+        }
+
+        for (const priorRefund of orderAccounting?.refunds ?? []) {
+          for (const priorRefundLine of priorRefund.lines) {
+            for (const entry of parseCostLayerSnapshot(priorRefundLine.costLayerSnapshot)) {
+              if (entry.source === 'shipment' && entry.shipmentLineId) {
+                const available = shipmentLineAvailability.get(entry.shipmentLineId) ?? []
+                shipmentLineAvailability.set(
+                  entry.shipmentLineId,
+                  reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
+                )
+              }
+              if (entry.source === 'allocation' && entry.orderAllocationId) {
+                const available = allocationAvailability.get(entry.orderAllocationId) ?? []
+                allocationAvailability.set(
+                  entry.orderAllocationId,
+                  reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
+                )
+              }
+            }
+          }
+        }
+
+        const consumeShipmentCostForLine = (lineId: string, qty: number): CostLayerSnapshotEntry[] => {
+          let remainingQty = qty
+          const consumed: CostLayerSnapshotEntry[] = []
+          for (const shipment of orderAccounting?.shipments ?? []) {
+            for (const shipmentLine of shipment.lines) {
+              if (shipmentLine.lineId !== lineId || remainingQty <= 0) continue
+              const available = shipmentLineAvailability.get(shipmentLine.id) ?? []
+              const taken = takeFromSnapshotEntries(available, remainingQty, {
+                shipmentLineId: shipmentLine.id,
+                source: 'shipment',
+              })
+              consumed.push(...taken.taken)
+              remainingQty = taken.remainingQty
+              shipmentLineAvailability.set(
+                shipmentLine.id,
+                reduceSnapshotByCostLayer(
+                  available,
+                  taken.taken.map((entry) => ({ costLayerId: entry.costLayerId, qty: entry.qty })),
+                ),
+              )
+            }
+          }
+          if (remainingQty > 0.0000001) {
+            throw new Error(`Missing shipped FIFO history for refunded line ${lineId}`)
+          }
+          return consumed
+        }
+
+        const consumeAllocationCostForLine = (lineId: string, qty: number): CostLayerSnapshotEntry[] => {
+          let remainingQty = qty
+          const consumed: CostLayerSnapshotEntry[] = []
+          for (const allocation of orderAccounting?.allocations ?? []) {
+            if (allocation.lineId !== lineId || remainingQty <= 0) continue
+            const available = allocationAvailability.get(allocation.id) ?? []
+            const taken = takeFromSnapshotEntries(available, remainingQty, {
+              orderAllocationId: allocation.id,
+              source: 'allocation',
+            })
+            consumed.push(...taken.taken)
+            remainingQty = taken.remainingQty
+            allocationAvailability.set(
+              allocation.id,
+              reduceSnapshotByCostLayer(
+                available,
+                taken.taken.map((entry) => ({ costLayerId: entry.costLayerId, qty: entry.qty })),
+              ),
+            )
+          }
+          if (remainingQty > 0.0000001) {
+            throw new Error(`Missing allocated FIFO history for refunded line ${lineId}`)
+          }
+          return consumed
+        }
+
+        for (const refundLine of createdRefundLines) {
+          const refundLineNet = toNetRevenue(refundLine.totalGbp)
           if (!refundLine.productId || refundLine.qty <= 0) {
-            nonQtyRevenue += refundLine.totalGbp
+            nonQtyRevenue += refundLineNet
             continue
           }
 
@@ -1529,7 +1703,17 @@ export async function createRefund(
           shippedQtyRevenue += allocation.shippedRevenue
           unshippedQtyRevenue += allocation.unshippedRevenue
 
-          nonQtyRevenue += Math.max(0, refundLine.totalGbp - allocation.assignedRevenue)
+          const costSnapshot: CostLayerSnapshotEntry[] = []
+          for (const lineAllocation of allocation.lineAllocations) {
+            if (lineAllocation.shippedQty > 0) {
+              costSnapshot.push(...consumeShipmentCostForLine(lineAllocation.lineId, lineAllocation.shippedQty))
+            }
+            if (lineAllocation.unshippedQty > 0) {
+              costSnapshot.push(...consumeAllocationCostForLine(lineAllocation.lineId, lineAllocation.unshippedQty))
+            }
+          }
+          refundLayerSnapshots.set(refundLine.id, costSnapshot)
+          nonQtyRevenue += Math.max(0, refundLineNet - allocation.assignedRevenue)
         }
 
         const componentTotal = shippedQtyRevenue + unshippedQtyRevenue + nonQtyRevenue
@@ -1538,34 +1722,49 @@ export async function createRefund(
           nonQtyRevenue += roundingDelta
         }
 
-        const remainingShippedCogs = Math.round(Math.max(0, totalShippedCogs - priorCogsReversed) * 100) / 100
+        for (const refundLine of createdRefundLines) {
+          const costSnapshot = refundLayerSnapshots.get(refundLine.id) ?? []
+          await db.salesOrderRefundLine.update({
+            where: { id: refundLine.id },
+            data: {
+              costLayerSnapshot: costSnapshot as never,
+            },
+          })
+
+          if (!returnWarehouseId || !refundLine.productId) continue
+
+          for (const entry of costSnapshot) {
+            await db.costLayer.create({
+              data: {
+                productId: refundLine.productId,
+                warehouseId: returnWarehouseId,
+                receivedQty: entry.qty,
+                remainingQty: entry.qty,
+                unitCostGbp: entry.unitCostGbp,
+              },
+            })
+          }
+        }
+
         const remainingUnearned = Math.round(Math.max(
           0,
           Number(so.unearnedRevenueAmount ?? 0) - totalRecognized - priorUnearnedReversed,
         ) * 100) / 100
-        const remainingAllocated = Math.round(Math.max(
-          0,
-          Number(so.allocationBatchAmount ?? 0) - totalShippedCogs - priorAllocationReversed,
-        ) * 100) / 100
+        const shipmentRefundSnapshot = createdRefundLines.flatMap((line) => (
+          (refundLayerSnapshots.get(line.id) ?? []).filter((entry) => entry.source === 'shipment')
+        ))
+        const allocationRefundSnapshot = createdRefundLines.flatMap((line) => (
+          (refundLayerSnapshots.get(line.id) ?? []).filter((entry) => entry.source === 'allocation')
+        ))
 
-        const cogsReversal = shippedProductRevenueBase > 0
-          ? Math.min(
-              remainingShippedCogs,
-              Math.round((remainingShippedCogs * (shippedQtyRevenue / shippedProductRevenueBase)) * 100) / 100,
-            )
-          : 0
+        const cogsReversal = Math.round(sumCostLayerSnapshot(shipmentRefundSnapshot) * 100) / 100
 
         const unearnedReversal = Math.min(
           remainingUnearned,
           Math.round((unshippedQtyRevenue + nonQtyRevenue) * 100) / 100,
         )
 
-        const allocationReversal = unshippedProductRevenueBase > 0
-          ? Math.min(
-              remainingAllocated,
-              Math.round((remainingAllocated * (unshippedQtyRevenue / unshippedProductRevenueBase)) * 100) / 100,
-            )
-          : 0
+        const allocationReversal = Math.round(sumCostLayerSnapshot(allocationRefundSnapshot) * 100) / 100
 
         if (cogsReversal > 0) {
           await queueAccountingSync({
