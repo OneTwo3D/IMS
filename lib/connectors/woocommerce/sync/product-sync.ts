@@ -293,25 +293,20 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
     const product = await db.product.findUnique({
       where: { id: productId },
       select: {
+        id: true,
         sku: true,
         name: true,
         description: true,
         salesPriceGbp: true,
         salePriceGbp: true,
         barcode: true,
+        type: true,
+        wcProductId: true,
         lifecycleStatus: true,
+        parent: { select: { sku: true, wcProductId: true } },
       },
     })
     if (!product?.sku) return { success: false, error: 'Product has no SKU' }
-
-    // Find WC product by SKU
-    const { data, error } = await wcFetch('/products', { sku: product.sku, per_page: '1' })
-    if (error) return { success: false, error }
-
-    const wcProducts = data as WcFullProduct[]
-    if (!wcProducts.length) return { success: false, error: `No WC product found for SKU ${product.sku}` }
-
-    const wcProductId = wcProducts[0].id
 
     // Push updates
     const updateData: Record<string, unknown> = { name: product.name }
@@ -325,7 +320,45 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
       updateData.global_unique_id = product.barcode
     }
 
-    const { error: putError } = await wcPut(`/products/${wcProductId}`, updateData)
+    let wcProductId: number
+    let putPath: string
+
+    if (product.type === 'VARIANT') {
+      const parentWcId = product.parent?.wcProductId != null ? Number(product.parent.wcProductId) : null
+      if (!parentWcId || !product.parent?.sku) {
+        return { success: false, error: `Variant ${product.sku} is missing a WooCommerce parent mapping` }
+      }
+
+      let variationId = product.wcProductId != null ? Number(product.wcProductId) : null
+      if (!variationId) {
+        const { data, error } = await wcFetch(`/products/${parentWcId}/variations`, { sku: product.sku, per_page: '100' })
+        if (error) return { success: false, error }
+        const variations = data as WcVariation[]
+        const matches = variations.filter((variation) => variation.sku === product.sku)
+        if (matches.length !== 1) {
+          return { success: false, error: `Expected exactly one WooCommerce variation for SKU ${product.sku} under ${product.parent.sku}` }
+        }
+        variationId = matches[0].id
+        await db.product.update({
+          where: { id: product.id },
+          data: { wcProductId: BigInt(variationId) },
+        })
+      }
+
+      wcProductId = variationId
+      putPath = `/products/${parentWcId}/variations/${variationId}`
+    } else {
+      const { data, error } = await wcFetch('/products', { sku: product.sku, per_page: '1' })
+      if (error) return { success: false, error }
+
+      const wcProducts = data as WcFullProduct[]
+      if (!wcProducts.length) return { success: false, error: `No WC product found for SKU ${product.sku}` }
+
+      wcProductId = wcProducts[0].id
+      putPath = `/products/${wcProductId}`
+    }
+
+    const { error: putError } = await wcPut(putPath, updateData)
     if (putError) return { success: false, error: putError }
 
     await db.wcSyncLog.create({

@@ -2,6 +2,7 @@
 
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth/server'
+import { OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -132,7 +133,7 @@ export async function generateForecasts(): Promise<ProductForecast[]> {
 
   // 1. Get all stockable products with current stock levels
   const products = await db.product.findMany({
-    where: { active: true, type: { notIn: ['VARIABLE', 'NON_INVENTORY'] } },
+    where: { lifecycleStatus: { in: OPERATIONAL_PRODUCT_STATUSES }, type: { notIn: ['VARIABLE', 'NON_INVENTORY'] } },
     select: {
       id: true, sku: true, name: true, imageUrl: true, parent: { select: { imageUrl: true } }, stockUnit: true,
       stockLevels: { select: { quantity: true, reservedQty: true } },
