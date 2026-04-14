@@ -5,11 +5,13 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { wcFetch, wcPut } from '../api'
+import { WC_SETTINGS_VERSION_KEY, WC_SYNC_ADVISORY_LOCK_KEY } from '../sync-lock'
 import {
   deriveLegacyActiveFromLifecycleStatus,
   deriveLifecycleStatusFromWooStatus,
   deriveWooStatusFromLifecycleStatus,
 } from '@/lib/products/lifecycle'
+import type { Prisma } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
 
 // ---------------------------------------------------------------------------
@@ -46,6 +48,42 @@ function getWcAttribute(
   const targets = names.map(normalise)
   const attr = attrs.find((a) => targets.includes(normalise(a.name)))
   return attr?.options?.[0] ?? null
+}
+
+async function getWcSettingsVersionSnapshot(): Promise<string> {
+  return db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
+    const row = await tx.setting.findUnique({ where: { key: WC_SETTINGS_VERSION_KEY } })
+    return row?.value ?? '0'
+  })
+}
+
+async function persistMappingIfVersionMatches(
+  productId: string,
+  wcId: number,
+  expectedVersion: string,
+): Promise<
+  | { ok: true }
+  | { ok: false; reason: 'version_changed' }
+  | { ok: false; reason: 'error'; error: string }
+> {
+  try {
+    return await db.$transaction(async (tx: Prisma.TransactionClient) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
+      const row = await tx.setting.findUnique({ where: { key: WC_SETTINGS_VERSION_KEY } })
+      const currentVersion = row?.value ?? '0'
+      if (currentVersion !== expectedVersion) {
+        return { ok: false as const, reason: 'version_changed' as const }
+      }
+      await tx.product.update({
+        where: { id: productId },
+        data: { wcProductId: BigInt(wcId) },
+      })
+      return { ok: true as const }
+    })
+  } catch (error) {
+    return { ok: false as const, reason: 'error' as const, error: String(error) }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -290,6 +328,7 @@ async function syncVariations(
 
 export async function pushImsProductToWc(productId: string): Promise<{ success: boolean; error?: string }> {
   try {
+    const syncVersion = await getWcSettingsVersionSnapshot()
     const product = await db.product.findUnique({
       where: { id: productId },
       select: {
@@ -339,22 +378,61 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
           return { success: false, error: `Expected exactly one WooCommerce variation for SKU ${product.sku} under ${product.parent.sku}` }
         }
         variationId = matches[0].id
-        await db.product.update({
-          where: { id: product.id },
-          data: { wcProductId: BigInt(variationId) },
-        })
+        const persisted = await persistMappingIfVersionMatches(product.id, variationId, syncVersion)
+        if (!persisted.ok) {
+          return {
+            success: false,
+            error: persisted.reason === 'version_changed'
+              ? `WooCommerce settings changed while resolving ${product.sku}`
+              : persisted.error,
+          }
+        }
+      } else {
+        const { data, error } = await wcFetch(`/products/${parentWcId}/variations/${variationId}`)
+        if (error) return { success: false, error }
+        const variation = data as WcVariation
+        if (variation.sku !== product.sku) {
+          return { success: false, error: `Cached WooCommerce variation ${variationId} no longer matches SKU ${product.sku}` }
+        }
       }
 
       wcProductId = variationId
       putPath = `/products/${parentWcId}/variations/${variationId}`
     } else {
-      const { data, error } = await wcFetch('/products', { sku: product.sku, per_page: '1' })
-      if (error) return { success: false, error }
+      let resolvedId = product.wcProductId != null ? Number(product.wcProductId) : null
+      if (resolvedId != null) {
+        const { data, error } = await wcFetch(`/products/${resolvedId}`)
+        if (error) return { success: false, error }
+        const wcProduct = data as WcFullProduct
+        if (wcProduct.sku !== product.sku) {
+          return { success: false, error: `Cached WooCommerce product ${resolvedId} no longer matches SKU ${product.sku}` }
+        }
+      } else {
+        const { data, error } = await wcFetch('/products', { sku: product.sku, per_page: '2' })
+        if (error) return { success: false, error }
 
-      const wcProducts = data as WcFullProduct[]
-      if (!wcProducts.length) return { success: false, error: `No WC product found for SKU ${product.sku}` }
+        const wcProducts = (data as WcFullProduct[]).filter((wcProduct) => wcProduct.sku === product.sku)
+        if (wcProducts.length !== 1) {
+          return {
+            success: false,
+            error: wcProducts.length === 0
+              ? `No WC product found for SKU ${product.sku}`
+              : `Ambiguous WC products found for SKU ${product.sku}`,
+          }
+        }
+        resolvedId = wcProducts[0].id
+        const persisted = await persistMappingIfVersionMatches(product.id, resolvedId, syncVersion)
+        if (!persisted.ok) {
+          return {
+            success: false,
+            error: persisted.reason === 'version_changed'
+              ? `WooCommerce settings changed while resolving ${product.sku}`
+              : persisted.error,
+          }
+        }
+      }
 
-      wcProductId = wcProducts[0].id
+      wcProductId = resolvedId
       putPath = `/products/${wcProductId}`
     }
 

@@ -1283,6 +1283,17 @@ export async function deleteOrDeactivateVariant(
       metadata: { parentId: product.parentId },
     })
 
+    try {
+      await pushImsProductToWc(id)
+    } catch (syncError) {
+      console.error(syncError)
+    }
+    try {
+      await enqueueAndProcessImmediateWcStockSync([id], 'IMS_CHANGE')
+    } catch (syncError) {
+      console.error(syncError)
+    }
+
     if (product.parentId) revalidatePath(`/inventory/${product.parentId}`)
     revalidatePath(`/inventory/${id}`)
     return { action: 'deactivated' }
@@ -1363,6 +1374,18 @@ export async function bulkDeactivateProducts(
     description: `Bulk deactivated ${ids.length} products`,
     metadata: { count: ids.length },
   })
+
+  const syncTargets = [...new Set(ids)]
+  const productSyncResults = await Promise.allSettled(syncTargets.map(async (id) => pushImsProductToWc(id)))
+  for (const result of productSyncResults) {
+    if (result.status === 'rejected') console.error(result.reason)
+    else if (!result.value.success && result.value.error) console.error(result.value.error)
+  }
+  try {
+    await enqueueAndProcessImmediateWcStockSync(syncTargets, 'IMS_CHANGE')
+  } catch (syncError) {
+    console.error(syncError)
+  }
 
   revalidatePath('/inventory')
   return { deactivated: ids.length }
