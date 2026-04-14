@@ -293,6 +293,7 @@ export async function runDailyBatchSync(): Promise<{
         status: 'SHIPPED',
         shipmentJournalDate: null,
         order: {
+          status: { not: 'REFUNDED' },
           revenueDeferredDate: { not: null },
           inventoryAllocatedDate: { not: null },
         },
