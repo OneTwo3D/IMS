@@ -3,6 +3,19 @@ import { redirect } from 'next/navigation'
 import { requireAuth } from '@/lib/auth/server'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { getSupplierProducts } from '@/app/actions/supplier-portal'
+import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
+
+const STATUS_LABELS: Record<ProductLifecycleStatus, string> = {
+  ACTIVE: 'Active',
+  NOT_FOR_SALE: 'Not for sale',
+  ARCHIVED: 'Archived',
+}
+
+const STATUS_CLASSES: Record<ProductLifecycleStatus, string> = {
+  ACTIVE: 'text-green-600',
+  NOT_FOR_SALE: 'text-amber-600',
+  ARCHIVED: 'text-muted-foreground',
+}
 
 export const metadata: Metadata = { title: 'My Products — Supplier Portal' }
 
@@ -45,10 +58,7 @@ export default async function SupplierProductsPage() {
                 <TableCell className="px-4">{p.name}</TableCell>
                 <TableCell className="px-4 font-mono text-xs text-muted-foreground">{p.supplierSku ?? '—'}</TableCell>
                 <TableCell className="px-4">
-                  {p.active
-                    ? <span className="text-xs text-green-600">Active</span>
-                    : <span className="text-xs text-muted-foreground">Inactive</span>
-                  }
+                  <span className={`text-xs ${STATUS_CLASSES[p.lifecycleStatus]}`}>{STATUS_LABELS[p.lifecycleStatus]}</span>
                 </TableCell>
               </TableRow>
             ))}

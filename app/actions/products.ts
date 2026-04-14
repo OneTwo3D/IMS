@@ -6,8 +6,14 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { ProductType } from '@/app/generated/prisma/client'
-import type { TaxCategory } from '@/app/generated/prisma/client'
+import {
+  COMPONENT_PRODUCT_STATUSES,
+  deriveLegacyActiveFromLifecycleStatus,
+  deriveLifecycleStatusFromLegacyActive,
+} from '@/lib/products/lifecycle'
+import type { ProductLifecycleStatus, TaxCategory } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -33,6 +39,7 @@ export type ProductRow = {
   stockUnit: string
   oversellAllowed: boolean
   active: boolean
+  lifecycleStatus: ProductLifecycleStatus
   variantCount: number
   totalStock: string
   allocatedStock: string    // sum of reservedQty across all warehouses
@@ -88,6 +95,7 @@ export async function listProducts(params: {
   search?: string
   type?: ProductType | 'ALL'
   active?: 'true' | 'false' | 'all'
+  lifecycleStatus?: ProductLifecycleStatus | 'ALL'
   page?: number
   pageSize?: number
   sort?: SortField
@@ -117,10 +125,12 @@ export async function listProducts(params: {
       : params.type
       ? { type: params.type as ProductType }
       : { type: { not: 'VARIANT' as const } }),
-    ...(params.active === 'true'
-      ? { active: true }
+    ...(params.lifecycleStatus && params.lifecycleStatus !== 'ALL'
+      ? { lifecycleStatus: params.lifecycleStatus }
+      : params.active === 'true'
+      ? { lifecycleStatus: { in: COMPONENT_PRODUCT_STATUSES } }
       : params.active === 'false'
-      ? { active: false }
+      ? { lifecycleStatus: 'ARCHIVED' as const }
       : {}),
   }
 
@@ -231,6 +241,7 @@ export async function listProducts(params: {
     stockUnit: p.stockUnit,
     oversellAllowed: p.oversellAllowed,
     active: p.active,
+    lifecycleStatus: p.lifecycleStatus,
     variantCount: p.variants.length,
     totalStock: totalStock.toFixed(2),
     allocatedStock: allocatedStock.toFixed(2),
@@ -415,6 +426,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     stockUnit: p.stockUnit,
     oversellAllowed: p.oversellAllowed,
     active: p.active,
+    lifecycleStatus: p.lifecycleStatus,
     variantCount: p.variants.length,
     totalStock: totalStockQty.toFixed(2),
     allocatedStock: totalAllocated.toFixed(2),
@@ -443,6 +455,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       stockUnit: v.stockUnit,
       oversellAllowed: v.oversellAllowed,
       active: v.active,
+      lifecycleStatus: v.lifecycleStatus,
       variantCount: 0,
       totalStock: v.stockLevels
         .reduce((sum, s) => sum + Number(s.quantity), 0)
@@ -513,7 +526,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
 export async function getVariableProducts() {
   await requireAuth()
   return db.product.findMany({
-    where: { type: 'VARIABLE', active: true },
+    where: { type: 'VARIABLE', lifecycleStatus: { in: COMPONENT_PRODUCT_STATUSES } },
     select: { id: true, sku: true, name: true },
     orderBy: { sku: 'asc' },
   })
@@ -544,6 +557,7 @@ const productSchema = z.object({
   heightCm: z.string().optional().nullable(),
   depthCm: z.string().optional().nullable(),
   active: z.boolean().default(true),
+  lifecycleStatus: z.enum(['ACTIVE', 'NOT_FOR_SALE', 'ARCHIVED']).default('ACTIVE'),
 })
 
 export type ProductFormState = {
@@ -577,6 +591,7 @@ export async function createProduct(
     heightCm: formData.get('heightCm') as string || null,
     depthCm: formData.get('depthCm') as string || null,
     active: formData.get('active') !== 'false',
+    lifecycleStatus: (formData.get('lifecycleStatus') as string) || deriveLifecycleStatusFromLegacyActive(formData.get('active') !== 'false'),
   }
 
   const parsed = productSchema.safeParse(raw)
@@ -592,7 +607,7 @@ export async function createProduct(
     return { errors: { sku: ['SKU already exists'] } }
   }
 
-  await db.product.create({
+  const created = await db.product.create({
     data: {
       sku: data.sku,
       name: data.name,
@@ -613,7 +628,8 @@ export async function createProduct(
       widthCm: data.widthCm || null,
       heightCm: data.heightCm || null,
       depthCm: data.depthCm || null,
-      active: data.active,
+      active: deriveLegacyActiveFromLifecycleStatus(data.lifecycleStatus),
+      lifecycleStatus: data.lifecycleStatus,
     },
   })
 
@@ -626,6 +642,19 @@ export async function createProduct(
     description: `Created product ${data.sku} — ${data.name}`,
     metadata: { sku: data.sku, name: data.name, type: data.type },
   })
+
+  try {
+    await pushProductMetadata(created.id)
+  } catch (syncError) {
+    console.error(syncError)
+  }
+  try {
+    await enqueueStockSync([created.id], 'IMS_CHANGE', {
+      force: data.lifecycleStatus === 'ARCHIVED',
+    })
+  } catch (syncError) {
+    console.error(syncError)
+  }
 
   revalidatePath('/inventory')
   redirect('/inventory')
@@ -658,6 +687,7 @@ export async function updateProduct(
     heightCm: formData.get('heightCm') as string || null,
     depthCm: formData.get('depthCm') as string || null,
     active: formData.get('active') !== 'false',
+    lifecycleStatus: (formData.get('lifecycleStatus') as string) || deriveLifecycleStatusFromLegacyActive(formData.get('active') !== 'false'),
   }
 
   const parsed = productSchema.safeParse(raw)
@@ -695,7 +725,8 @@ export async function updateProduct(
       widthCm: data.widthCm || null,
       heightCm: data.heightCm || null,
       depthCm: data.depthCm || null,
-      active: data.active,
+      active: deriveLegacyActiveFromLifecycleStatus(data.lifecycleStatus),
+      lifecycleStatus: data.lifecycleStatus,
     },
   })
 
@@ -708,6 +739,19 @@ export async function updateProduct(
     description: `Updated product ${data.sku} — ${data.name}`,
     metadata: { sku: data.sku, name: data.name, type: data.type },
   })
+
+  try {
+    await pushProductMetadata(id)
+  } catch (syncError) {
+    console.error(syncError)
+  }
+  try {
+    await enqueueStockSync([id], 'IMS_CHANGE', {
+      force: data.lifecycleStatus === 'ARCHIVED',
+    })
+  } catch (syncError) {
+    console.error(syncError)
+  }
 
   revalidatePath('/inventory')
   revalidatePath(`/inventory/${id}`)
@@ -1126,6 +1170,7 @@ export async function generateVariantsFromOptions(
   let nextNum = highestNum + 1
   let created = 0
   let skipped = 0
+  const createdVariantIds: string[] = []
 
   for (const combo of combinations) {
     const sku = `${product.sku}-${String(nextNum).padStart(2, '0')}`
@@ -1137,19 +1182,21 @@ export async function generateVariantsFromOptions(
       continue
     }
 
-    await db.product.create({
+    const createdVariant = await db.product.create({
       data: {
         sku,
         name,
         type: 'VARIANT',
         parentId: productId,
         active: true,
+        lifecycleStatus: 'ACTIVE',
         weight:   product.weight   ?? undefined,
         widthCm:  product.widthCm  ?? undefined,
         heightCm: product.heightCm ?? undefined,
         depthCm:  product.depthCm  ?? undefined,
       },
     })
+    createdVariantIds.push(createdVariant.id)
     created++
   }
 
@@ -1162,6 +1209,19 @@ export async function generateVariantsFromOptions(
     description: `Generated ${created} variants for SKU ${product.sku}`,
     metadata: { created, skipped },
   })
+
+  for (const variantId of createdVariantIds) {
+    try {
+      await pushProductMetadata(variantId)
+    } catch (syncError) {
+      console.error(syncError)
+    }
+    try {
+      await enqueueStockSync([variantId], 'IMS_CHANGE')
+    } catch (syncError) {
+      console.error(syncError)
+    }
+  }
 
   revalidatePath(`/inventory/${productId}`)
   return { created, skipped }
@@ -1222,7 +1282,10 @@ export async function deleteOrDeactivateVariant(
     revalidatePath('/inventory')
     return { action: 'deleted' }
   } else {
-    await db.product.update({ where: { id }, data: { active: false } })
+    await db.product.update({
+      where: { id },
+      data: { active: true, lifecycleStatus: 'NOT_FOR_SALE' },
+    })
 
     await logActivity({
       entityType: 'PRODUCT',
@@ -1233,6 +1296,17 @@ export async function deleteOrDeactivateVariant(
       description: `Deactivated variant ${id}`,
       metadata: { parentId: product.parentId },
     })
+
+    try {
+      await pushProductMetadata(id)
+    } catch (syncError) {
+      console.error(syncError)
+    }
+    try {
+      await enqueueStockSync([id], 'IMS_CHANGE')
+    } catch (syncError) {
+      console.error(syncError)
+    }
 
     if (product.parentId) revalidatePath(`/inventory/${product.parentId}`)
     revalidatePath(`/inventory/${id}`)
@@ -1303,7 +1377,7 @@ export async function bulkDeactivateProducts(
   await requirePermission('inventory.edit')
   await db.product.updateMany({
     where: { id: { in: ids } },
-    data: { active: false },
+    data: { active: true, lifecycleStatus: 'NOT_FOR_SALE' },
   })
   await logActivity({
     entityType: 'PRODUCT',
@@ -1314,6 +1388,18 @@ export async function bulkDeactivateProducts(
     description: `Bulk deactivated ${ids.length} products`,
     metadata: { count: ids.length },
   })
+
+  const syncTargets = [...new Set(ids)]
+  const productSyncResults = await Promise.allSettled(syncTargets.map(async (id) => pushProductMetadata(id)))
+  for (const result of productSyncResults) {
+    if (result.status === 'rejected') console.error(result.reason)
+    else if (!result.value.success && result.value.error) console.error(result.value.error)
+  }
+  try {
+    await enqueueStockSync(syncTargets, 'IMS_CHANGE')
+  } catch (syncError) {
+    console.error(syncError)
+  }
 
   revalidatePath('/inventory')
   return { deactivated: ids.length }

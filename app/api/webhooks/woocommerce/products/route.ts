@@ -1,7 +1,13 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verify'
 import { syncWcProductToIms } from '@/lib/connectors/woocommerce/sync/product-sync'
+import {
+  enqueueAndProcessImmediateWcStockSync,
+  recordIncomingWcWebhook,
+  shouldSuppressWcWebhookEcho,
+} from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
 import type { WcFullProduct } from '@/lib/connectors/woocommerce/sync/types'
 
 export async function POST(request: Request) {
@@ -30,7 +36,53 @@ export async function POST(request: Request) {
     return NextResponse.json({ ok: true, ping: true })
   }
 
-  const wcProduct = JSON.parse(body) as WcFullProduct
-  await syncWcProductToIms(wcProduct)
+  const payload = JSON.parse(body) as Partial<WcFullProduct> & { stock_quantity?: number | null }
+
+  if (
+    typeof payload.id === 'number'
+    && typeof payload.sku === 'string'
+    && typeof payload.type === 'string'
+    && typeof payload.name === 'string'
+    && typeof payload.status === 'string'
+  ) {
+    await syncWcProductToIms(payload as WcFullProduct)
+  }
+
+  if (typeof payload.id === 'number' && Object.prototype.hasOwnProperty.call(payload, 'stock_quantity')) {
+    const product = await db.product.findFirst({
+      where: { wcProductId: BigInt(payload.id) },
+      select: { id: true, sku: true },
+    })
+    if (product) {
+      const qty = typeof payload.stock_quantity === 'number'
+        ? Math.floor(payload.stock_quantity)
+        : null
+      await recordIncomingWcWebhook(product.id, qty)
+      const suppressed = await shouldSuppressWcWebhookEcho(product.id, qty)
+      if (!suppressed) {
+        try {
+          await enqueueAndProcessImmediateWcStockSync(
+            [product.id],
+            'WC_WEBHOOK',
+            { force: true, webhookQty: qty },
+          )
+        } catch (error) {
+          await logActivity({
+            entityType: 'SYNC',
+            action: 'wc_stock_webhook',
+            tag: 'sync',
+            level: 'WARNING',
+            description: `WooCommerce stock webhook correction failed for ${product.sku}`,
+            metadata: {
+              productId: product.id,
+              wcId: payload.id,
+              error: error instanceof Error ? error.message : String(error),
+            },
+          })
+        }
+      }
+    }
+  }
+
   return NextResponse.json({ ok: true })
 }

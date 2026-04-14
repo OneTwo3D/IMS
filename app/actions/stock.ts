@@ -6,6 +6,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
+import { enqueueStockSync } from '@/lib/shopping'
 import type { Prisma } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -226,6 +227,11 @@ export async function adjustStock(
 
     revalidatePath(`/inventory/${productId}`)
     revalidatePath('/stock-control')
+    try {
+      await enqueueStockSync([productId], 'IMS_CHANGE')
+    } catch (syncError) {
+      console.error(syncError)
+    }
 
     await logActivity({
       entityType: 'STOCK_ADJUSTMENT',
@@ -354,6 +360,14 @@ export async function bulkAdjustStock(
 
     revalidatePath('/stock-control')
     revalidatePath('/inventory')
+    try {
+      await enqueueStockSync(
+        [...new Set(valid.map((line) => line.productId))],
+        'IMS_CHANGE',
+      )
+    } catch (syncError) {
+      console.error(syncError)
+    }
 
     await logActivity({
       entityType: 'STOCK_ADJUSTMENT',
@@ -497,6 +511,17 @@ export async function updateAdjustmentMovement(
 
     revalidatePath('/stock-control')
     revalidatePath('/inventory')
+    try {
+      const movement = await db.stockMovement.findUnique({
+        where: { id },
+        select: { productId: true },
+      })
+      if (movement?.productId) {
+        await enqueueStockSync([movement.productId], 'IMS_CHANGE')
+      }
+    } catch (syncError) {
+      console.error(syncError)
+    }
 
     await logActivity({
       entityType: 'STOCK_ADJUSTMENT',

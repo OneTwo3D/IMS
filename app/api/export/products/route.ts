@@ -7,7 +7,7 @@ const HEADERS = [
   'sku', 'name', 'description', 'type', 'parentSku', 'barcode',
   'weight', 'widthCm', 'heightCm', 'depthCm',
   'salesPriceGbp', 'salePriceGbp', 'salesPriceTaxInclusive',
-  'stockUnit', 'oversellAllowed', 'imageUrl', 'active',
+  'stockUnit', 'oversellAllowed', 'imageUrl', 'active', 'lifecycleStatus',
   'components',
   'totalStock', 'inventoryValue',
 ]
@@ -16,7 +16,7 @@ const TEMPLATE_HEADERS = [
   'sku', 'name', 'description', 'type', 'parentSku', 'barcode',
   'weight', 'widthCm', 'heightCm', 'depthCm',
   'salesPriceGbp', 'salePriceGbp', 'salesPriceTaxInclusive',
-  'stockUnit', 'oversellAllowed', 'imageUrl', 'active',
+  'stockUnit', 'oversellAllowed', 'imageUrl', 'active', 'lifecycleStatus',
   'components',
 ]
 
@@ -32,12 +32,12 @@ export async function GET(req: Request) {
     // Add example rows for each type
     const lines = [
       TEMPLATE_HEADERS.join(','),
-      '"WIDGET-001","Widget","A simple widget","SIMPLE","","1234567890123","0.5","10","5","3","9.99","7.99","TRUE","pcs","TRUE","",""',
-      '"TSHIRT","T-Shirt Parent","Variable product with sizes","VARIABLE","","","0.2","","","","19.99","","TRUE","pcs","TRUE","",""',
-      '"TSHIRT-S","T-Shirt Small","Size S variant","VARIANT","TSHIRT","","0.2","","","","19.99","","TRUE","pcs","TRUE","",""',
-      '"TSHIRT-M","T-Shirt Medium","Size M variant","VARIANT","TSHIRT","","0.2","","","","19.99","","TRUE","pcs","TRUE","",""',
-      '"BUNDLE-01","Starter Kit","A kit/bundle product","KIT","","","","","","","29.99","","TRUE","pcs","TRUE","","WIDGET-001:2;TSHIRT-S:1"',
-      '"BOM-01","Assembled Widget","A manufactured product","BOM","","","","","","","15.99","","TRUE","pcs","TRUE","","WIDGET-001:3"',
+      '"WIDGET-001","Widget","A simple widget","SIMPLE","","1234567890123","0.5","10","5","3","9.99","7.99","TRUE","pcs","TRUE","","TRUE","ACTIVE",""',
+      '"TSHIRT","T-Shirt Parent","Variable product with sizes","VARIABLE","","","0.2","","","","19.99","","TRUE","pcs","TRUE","","TRUE","ACTIVE",""',
+      '"TSHIRT-S","T-Shirt Small","Size S variant","VARIANT","TSHIRT","","0.2","","","","19.99","","TRUE","pcs","TRUE","","TRUE","ACTIVE",""',
+      '"TSHIRT-M","T-Shirt Medium","Size M variant","VARIANT","TSHIRT","","0.2","","","","19.99","","TRUE","pcs","TRUE","","TRUE","ACTIVE",""',
+      '"BUNDLE-01","Starter Kit","A kit/bundle product","KIT","","","","","","","29.99","","TRUE","pcs","TRUE","","TRUE","ACTIVE","WIDGET-001:2;TSHIRT-S:1"',
+      '"BOM-01","Assembled Widget","A manufactured product","BOM","","","","","","","15.99","","TRUE","pcs","TRUE","","TRUE","ACTIVE","WIDGET-001:3"',
     ]
     return csvResponse(lines.join('\r\n'), 'products-import-template.csv')
   }
@@ -82,6 +82,7 @@ export async function GET(req: Request) {
       oversellAllowed: p.oversellAllowed ? 'TRUE' : 'FALSE',
       imageUrl: p.imageUrl ?? '',
       active: p.active ? 'TRUE' : 'FALSE',
+      lifecycleStatus: p.lifecycleStatus,
       components: componentsStr,
       totalStock: p.stockLevels.reduce((s, sl) => s + Number(sl.quantity), 0).toFixed(2),
       inventoryValue: p.costLayers

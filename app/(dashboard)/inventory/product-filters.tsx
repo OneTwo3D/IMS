@@ -18,10 +18,10 @@ import type { ColKey } from '@/components/inventory/product-columns'
 type Props = {
   search?: string
   type?: string
-  active?: string
+  lifecycleStatus?: string
 }
 
-export function ProductFilters({ search, type, active }: Props) {
+export function ProductFilters({ search, type, lifecycleStatus }: Props) {
   const router = useRouter()
   const pathname = usePathname()
   const [isPending, startTransition] = useTransition()
@@ -51,14 +51,14 @@ export function ProductFilters({ search, type, active }: Props) {
       const params = new URLSearchParams()
       if (key !== 'search' && search) params.set('search', search)
       if (key !== 'type' && type) params.set('type', type)
-      if (key !== 'active' && active) params.set('active', active)
+      if (key !== 'lifecycleStatus' && lifecycleStatus && lifecycleStatus !== 'ALL') params.set('lifecycleStatus', lifecycleStatus)
       if (value) params.set(key, value)
       // reset page on filter change
       startTransition(() => {
         router.push(`${pathname}?${params.toString()}`)
       })
     },
-    [router, pathname, search, type, active]
+    [router, pathname, search, type, lifecycleStatus]
   )
 
   useEffect(() => {
@@ -112,12 +112,13 @@ export function ProductFilters({ search, type, active }: Props) {
         <Select
           id="inventory-status"
           className="w-full"
-          value={active ?? 'true'}
-          onChange={(e) => update('active', e.target.value === 'all' ? '' : e.target.value)}
+          value={lifecycleStatus ?? 'ALL'}
+          onChange={(e) => update('lifecycleStatus', e.target.value === 'ALL' ? '' : e.target.value)}
         >
-          <option value="all">All Status</option>
-          <option value="true">Active only</option>
-          <option value="false">Inactive only</option>
+          <option value="ALL">All Status</option>
+          <option value="ACTIVE">Active</option>
+          <option value="NOT_FOR_SALE">Not for sale</option>
+          <option value="ARCHIVED">Archived</option>
         </Select>
       </div>
 

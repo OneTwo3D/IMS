@@ -5,6 +5,8 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
+import { enqueueStockSync } from '@/lib/shopping'
+import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
 
@@ -487,9 +489,13 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     const productRows = productIds.length
       ? await db.product.findMany({
           where: { id: { in: productIds } },
-          select: { id: true, taxCategory: true },
+          select: { id: true, taxCategory: true, lifecycleStatus: true },
         })
       : []
+    const invalidSalesProduct = productRows.find((p) => !isSellableProductStatus(p.lifecycleStatus))
+    if (invalidSalesProduct) {
+      return { success: false, error: 'Only active products can be sold on sales orders' }
+    }
     const productCategoryById = new Map<string, TaxCategory>(
       productRows.map((p) => [p.id, p.taxCategory]),
     )
@@ -1106,6 +1112,17 @@ export async function updateSalesOrderStatus(
       )
     }
 
+    if (targetStatus === 'SHIPPED') {
+      try {
+        await enqueueStockSync(
+          so.lines.map((line) => line.productId).filter((value): value is string => !!value),
+          'IMS_CHANGE',
+        )
+      } catch (syncError) {
+        console.error(syncError)
+      }
+    }
+
     return { success: true }
   } catch (e) {
     await logActivity({
@@ -1160,7 +1177,7 @@ export async function createRefund(
     const cnCount = await db.salesOrderRefund.count({ where: { creditNoteNumber: { not: null } } })
     const creditNoteNumber = `${numbering.cn_prefix}${new Date().getFullYear()}-${String(cnCount + 1).padStart(5, '0')}`
 
-    await db.salesOrderRefund.create({
+    const createdRefund = await db.salesOrderRefund.create({
       data: {
         orderId,
         creditNoteNumber,
@@ -1178,6 +1195,7 @@ export async function createRefund(
           })),
         },
       },
+      select: { id: true },
     })
 
     // Return stock if warehouse specified
@@ -1232,6 +1250,16 @@ export async function createRefund(
       description: `Created refund for order ${so.orderNumber ?? so.wcOrderNumber} — £${totalGbp.toFixed(2)}`,
       metadata: { orderNumber: so.orderNumber ?? so.wcOrderNumber, totalGbp, creditNoteNumber, reason },
     })
+    if (returnWarehouseId) {
+      try {
+        await enqueueStockSync(
+          refundLines.map((line) => line.productId).filter((value): value is string => !!value),
+          'IMS_CHANGE',
+        )
+      } catch (syncError) {
+        console.error(syncError)
+      }
+    }
 
     // Queue accounting credit note sync
     try {
@@ -1250,7 +1278,7 @@ export async function createRefund(
       await queueAccountingSync({
         type: 'CREDIT_NOTE',
         referenceType: 'SalesOrderRefund',
-        referenceId: orderId,
+        referenceId: createdRefund.id,
         payload: {
           creditNoteNumber,
           contactName: cnContactName,
@@ -1280,112 +1308,225 @@ export async function createRefund(
 
       if (so.revenueDeferredDate) {
         const refundRevenue = Math.round(totalGbp * 100) / 100
-
-        // Check for shipped portions with journals
-        const journaledShipments = await db.shipment.findMany({
-          where: { orderId, shipmentJournalDate: { not: null } },
+        const orderAccounting = await db.salesOrder.findUnique({
+          where: { id: orderId },
           select: {
-            cogsBatchAmount: true,
-            revenueRecognizedAmount: true,
-            warehouseId: true,
-            lines: { select: { productId: true, qty: true } },
+            lines: {
+              select: {
+                id: true,
+                productId: true,
+                description: true,
+                qty: true,
+                totalGbp: true,
+              },
+            },
+            shipments: {
+              where: { shipmentJournalDate: { not: null } },
+              select: {
+                revenueRecognizedAmount: true,
+                cogsBatchAmount: true,
+                lines: {
+                  select: {
+                    lineId: true,
+                    qty: true,
+                  },
+                },
+              },
+            },
           },
         })
 
-        if (journaledShipments.length > 0) {
-          // Scenario 4: reverse COGS for shipped portion
-          const totalShippedCogs = journaledShipments.reduce((s, sh) => s + Number(sh.cogsBatchAmount ?? 0), 0)
-          if (totalShippedCogs > 0) {
-            await queueAccountingSync({
-              type: 'COGS_REVERSAL',
-              referenceType: 'SalesOrder',
-              referenceId: orderId,
-              payload: {
-                date: new Date().toISOString().slice(0, 10),
-                reference: `COGS reversal: ${orderRef}`,
-                narration: `COGS reversal — refund on order ${orderRef}`,
-                lines: [
-                  { accountCode: settings.inventoryAccount, description: `COGS reversal: ${orderRef}`, debit: Math.round(totalShippedCogs * 100) / 100 },
-                  { accountCode: settings.cogsAccount, description: `COGS reversal: ${orderRef}`, credit: Math.round(totalShippedCogs * 100) / 100 },
-                ],
-              },
-            })
-          }
+        const priorReversals = await db.accountingSyncLog.findMany({
+          where: {
+            referenceType: 'SalesOrder',
+            referenceId: orderId,
+            type: { in: ['COGS_REVERSAL', 'UNEARNED_REV_REVERSAL'] },
+            status: { in: ['PENDING', 'SYNCED'] },
+          },
+          select: { type: true, payload: true },
+        })
 
-          // If there's also an unshipped portion with unearned revenue, reverse that too
-          const totalRecognized = journaledShipments.reduce((s, sh) => s + Number(sh.revenueRecognizedAmount ?? 0), 0)
-          const unearnedRemaining = Math.round((Number(so.unearnedRevenueAmount ?? 0) - totalRecognized) * 100) / 100
-          if (unearnedRemaining > 0) {
-            const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = [
-              { accountCode: settings.unearnedRevenueAccount, description: `Unearned revenue reversal: ${orderRef}`, debit: unearnedRemaining },
-              { accountCode: settings.salesAccount, description: `Unearned revenue reversal: ${orderRef}`, credit: unearnedRemaining },
-            ]
-            // Also reverse inventory allocation for unshipped portion
-            if (so.inventoryAllocatedDate) {
-              const allocValue = Math.round(Number(so.allocationBatchAmount ?? 0) * 100) / 100
-              const shippedAllocValue = totalShippedCogs // COGS ≈ allocated cost for shipped items
-              const unshippedAllocValue = Math.round(Math.max(0, allocValue - shippedAllocValue) * 100) / 100
-              if (unshippedAllocValue > 0) {
-                journalLines.push(
-                  { accountCode: settings.inventoryAccount, description: `Allocation reversal: ${orderRef}`, debit: unshippedAllocValue },
-                  { accountCode: settings.allocatedInventoryAccount, description: `Allocation reversal: ${orderRef}`, credit: unshippedAllocValue },
-                )
-              }
-            }
-            await queueAccountingSync({
-              type: 'UNEARNED_REV_REVERSAL',
-              referenceType: 'SalesOrder',
-              referenceId: orderId,
-              payload: {
-                date: new Date().toISOString().slice(0, 10),
-                reference: `Unearned reversal: ${orderRef}`,
-                narration: `Unearned revenue reversal — refund on order ${orderRef}`,
-                lines: journalLines,
-              },
-            })
-          }
-        } else if (so.inventoryAllocatedDate) {
-          // Scenario 3: allocated but not shipped — reverse unearned revenue + inventory allocation
-          const allocValue = Math.round(Number(so.allocationBatchAmount ?? 0) * 100) / 100
-          const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = [
-            { accountCode: settings.unearnedRevenueAccount, description: `Unearned revenue reversal: ${orderRef}`, debit: refundRevenue },
-            { accountCode: settings.salesAccount, description: `Unearned revenue reversal: ${orderRef}`, credit: refundRevenue },
-          ]
-          if (allocValue > 0) {
-            journalLines.push(
-              { accountCode: settings.inventoryAccount, description: `Allocation reversal: ${orderRef}`, debit: allocValue },
-              { accountCode: settings.allocatedInventoryAccount, description: `Allocation reversal: ${orderRef}`, credit: allocValue },
+        const extractPayloadAmount = (
+          payload: unknown,
+          accountCode: string,
+        ): number => {
+          const linesPayload = (payload as { lines?: Array<{ accountCode?: string; debit?: number; credit?: number }> } | null)?.lines
+          if (!Array.isArray(linesPayload)) return 0
+          return linesPayload.reduce((sum, line) => (
+            line.accountCode === accountCode ? sum + Number(line.debit ?? 0) : sum
+          ), 0)
+        }
+
+        const priorCogsReversed = priorReversals
+          .filter((row) => row.type === 'COGS_REVERSAL')
+          .reduce((sum, row) => sum + extractPayloadAmount(row.payload, settings.inventoryAccount), 0)
+        const priorUnearnedReversed = priorReversals
+          .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
+          .reduce((sum, row) => sum + extractPayloadAmount(row.payload, settings.unearnedRevenueAccount), 0)
+        const priorAllocationReversed = priorReversals
+          .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
+          .reduce((sum, row) => sum + extractPayloadAmount(row.payload, settings.inventoryAccount), 0)
+
+        const lineContexts = (orderAccounting?.lines ?? []).map((line) => ({
+          id: line.id,
+          productId: line.productId,
+          description: line.description,
+          qty: Number(line.qty),
+          totalGbp: Number(line.totalGbp),
+        }))
+
+        const shippedQtyByLine = new Map<string, number>()
+        let totalRecognized = 0
+        let totalShippedCogs = 0
+
+        for (const shipment of orderAccounting?.shipments ?? []) {
+          totalRecognized += Number(shipment.revenueRecognizedAmount ?? 0)
+          totalShippedCogs += Number(shipment.cogsBatchAmount ?? 0)
+          for (const line of shipment.lines) {
+            shippedQtyByLine.set(
+              line.lineId,
+              (shippedQtyByLine.get(line.lineId) ?? 0) + Number(line.qty),
             )
           }
+        }
+
+        const remainingShippedQtyByLine = new Map<string, number>()
+        const remainingUnshippedQtyByLine = new Map<string, number>()
+        let shippedProductRevenueBase = 0
+        let unshippedProductRevenueBase = 0
+
+        for (const line of lineContexts) {
+          const shippedQty = Math.min(line.qty, shippedQtyByLine.get(line.id) ?? 0)
+          const unshippedQty = Math.max(0, line.qty - shippedQty)
+          remainingShippedQtyByLine.set(line.id, shippedQty)
+          remainingUnshippedQtyByLine.set(line.id, unshippedQty)
+          if (line.qty > 0) {
+            shippedProductRevenueBase += (line.totalGbp * shippedQty) / line.qty
+            unshippedProductRevenueBase += (line.totalGbp * unshippedQty) / line.qty
+          }
+        }
+
+        let shippedQtyRevenue = 0
+        let unshippedQtyRevenue = 0
+        let nonQtyRevenue = 0
+
+        for (const refundLine of refundLines) {
+          if (!refundLine.productId || refundLine.qty <= 0) {
+            nonQtyRevenue += refundLine.totalGbp
+            continue
+          }
+
+          let remainingQty = refundLine.qty
+          let assignedRevenue = 0
+          const matchingLines = lineContexts.filter((line) => line.productId === refundLine.productId)
+
+          for (const line of matchingLines) {
+            if (remainingQty <= 0 || line.qty <= 0) break
+
+            const unitRevenue = line.totalGbp / line.qty
+            const shippedQtyAvailable = remainingShippedQtyByLine.get(line.id) ?? 0
+            const shippedTake = Math.min(remainingQty, shippedQtyAvailable)
+            if (shippedTake > 0) {
+              shippedQtyRevenue += unitRevenue * shippedTake
+              assignedRevenue += unitRevenue * shippedTake
+              remainingQty -= shippedTake
+              remainingShippedQtyByLine.set(line.id, shippedQtyAvailable - shippedTake)
+            }
+
+            const unshippedQtyAvailable = remainingUnshippedQtyByLine.get(line.id) ?? 0
+            const unshippedTake = Math.min(remainingQty, unshippedQtyAvailable)
+            if (unshippedTake > 0) {
+              unshippedQtyRevenue += unitRevenue * unshippedTake
+              assignedRevenue += unitRevenue * unshippedTake
+              remainingQty -= unshippedTake
+              remainingUnshippedQtyByLine.set(line.id, unshippedQtyAvailable - unshippedTake)
+            }
+          }
+
+          nonQtyRevenue += Math.max(0, refundLine.totalGbp - assignedRevenue)
+        }
+
+        const componentTotal = shippedQtyRevenue + unshippedQtyRevenue + nonQtyRevenue
+        const roundingDelta = Math.round((refundRevenue - componentTotal) * 100) / 100
+        if (roundingDelta > 0) {
+          nonQtyRevenue += roundingDelta
+        }
+
+        const remainingShippedCogs = Math.round(Math.max(0, totalShippedCogs - priorCogsReversed) * 100) / 100
+        const remainingUnearned = Math.round(Math.max(
+          0,
+          Number(so.unearnedRevenueAmount ?? 0) - totalRecognized - priorUnearnedReversed,
+        ) * 100) / 100
+        const remainingAllocated = Math.round(Math.max(
+          0,
+          Number(so.allocationBatchAmount ?? 0) - totalShippedCogs - priorAllocationReversed,
+        ) * 100) / 100
+
+        const cogsReversal = shippedProductRevenueBase > 0
+          ? Math.min(
+              remainingShippedCogs,
+              Math.round((remainingShippedCogs * (shippedQtyRevenue / shippedProductRevenueBase)) * 100) / 100,
+            )
+          : 0
+
+        const unearnedReversal = Math.min(
+          remainingUnearned,
+          Math.round((unshippedQtyRevenue + nonQtyRevenue) * 100) / 100,
+        )
+
+        const allocationReversal = unshippedProductRevenueBase > 0
+          ? Math.min(
+              remainingAllocated,
+              Math.round((remainingAllocated * (unshippedQtyRevenue / unshippedProductRevenueBase)) * 100) / 100,
+            )
+          : 0
+
+        if (cogsReversal > 0) {
           await queueAccountingSync({
-            type: 'UNEARNED_REV_REVERSAL',
+            type: 'COGS_REVERSAL',
             referenceType: 'SalesOrder',
             referenceId: orderId,
             payload: {
               date: new Date().toISOString().slice(0, 10),
-              reference: `Unearned reversal: ${orderRef}`,
-              narration: `Unearned revenue + allocation reversal — refund on order ${orderRef}`,
-              lines: journalLines,
-            },
-          })
-          await db.salesOrder.update({ where: { id: orderId }, data: { revenueDeferredDate: null, inventoryAllocatedDate: null } })
-        } else {
-          // Scenario 2: backorder — revenue deferred but not allocated — reverse unearned revenue only
-          await queueAccountingSync({
-            type: 'UNEARNED_REV_REVERSAL',
-            referenceType: 'SalesOrder',
-            referenceId: orderId,
-            payload: {
-              date: new Date().toISOString().slice(0, 10),
-              reference: `Unearned reversal: ${orderRef}`,
-              narration: `Unearned revenue reversal — refund on backorder ${orderRef}`,
+              reference: `COGS reversal: ${orderRef}`,
+              narration: `COGS reversal — refund on order ${orderRef}`,
               lines: [
-                { accountCode: settings.unearnedRevenueAccount, description: `Unearned revenue reversal: ${orderRef}`, debit: refundRevenue },
-                { accountCode: settings.salesAccount, description: `Unearned revenue reversal: ${orderRef}`, credit: refundRevenue },
+                { accountCode: settings.inventoryAccount, description: `COGS reversal: ${orderRef}`, debit: cogsReversal },
+                { accountCode: settings.cogsAccount, description: `COGS reversal: ${orderRef}`, credit: cogsReversal },
               ],
             },
           })
-          await db.salesOrder.update({ where: { id: orderId }, data: { revenueDeferredDate: null } })
+        }
+
+        const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = []
+        if (unearnedReversal > 0) {
+          journalLines.push(
+            { accountCode: settings.unearnedRevenueAccount, description: `Unearned revenue reversal: ${orderRef}`, debit: unearnedReversal },
+            { accountCode: settings.salesAccount, description: `Unearned revenue reversal: ${orderRef}`, credit: unearnedReversal },
+          )
+        }
+        if (allocationReversal > 0) {
+          journalLines.push(
+            { accountCode: settings.inventoryAccount, description: `Allocation reversal: ${orderRef}`, debit: allocationReversal },
+            { accountCode: settings.allocatedInventoryAccount, description: `Allocation reversal: ${orderRef}`, credit: allocationReversal },
+          )
+        }
+
+        if (journalLines.length > 0) {
+          const hasInventoryReversal = allocationReversal > 0
+          await queueAccountingSync({
+            type: 'UNEARNED_REV_REVERSAL',
+            referenceType: 'SalesOrder',
+            referenceId: orderId,
+            payload: {
+              date: new Date().toISOString().slice(0, 10),
+              reference: `Unearned reversal: ${orderRef}`,
+              narration: hasInventoryReversal
+                ? `Unearned revenue + allocation reversal — refund on order ${orderRef}`
+                : `Unearned revenue reversal — refund on order ${orderRef}`,
+              lines: journalLines,
+            },
+          })
         }
       }
       // Scenario 1: no revenueDeferredDate → no sub-ledger journals to reverse

@@ -5,6 +5,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { auth } from '@/lib/auth'
 import { requirePermission } from '@/lib/auth/server'
+import { enqueueStockSync } from '@/lib/shopping'
 
 async function requireAuth() {
   const session = await auth()
@@ -343,6 +344,14 @@ export async function autoAllocateOrder(orderId: string): Promise<{ success: boo
     if (allocations.length === 0) {
       return { success: false, error: 'No stock available for allocation' }
     }
+    try {
+      await enqueueStockSync(
+        [...new Set(allocations.map((alloc) => alloc.productId))],
+        'IMS_CHANGE',
+      )
+    } catch (syncError) {
+      console.error(syncError)
+    }
     return { success: true }
   } catch (e) {
     return { success: false, error: String(e) }
@@ -414,6 +423,11 @@ export async function updateAllocation(
       description: `Updated allocation for order ${alloc.order.orderNumber ?? alloc.order.wcOrderNumber}`,
       metadata: { allocationId, newWarehouseId, newQty },
     })
+    try {
+      await enqueueStockSync([alloc.productId], 'IMS_CHANGE')
+    } catch (syncError) {
+      console.error(syncError)
+    }
     return { success: true }
   } catch (e) {
     return { success: false, error: String(e) }
@@ -461,6 +475,11 @@ export async function addAllocation(
     })
 
     revalidatePath(`/sales/${orderId}`)
+    try {
+      await enqueueStockSync([productId], 'IMS_CHANGE')
+    } catch (syncError) {
+      console.error(syncError)
+    }
     return { success: true }
   } catch (e) {
     return { success: false, error: String(e) }
@@ -519,6 +538,14 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
       description: `Deallocated stock for order ${so.orderNumber ?? so.wcOrderNumber}`,
       metadata: { orderNumber: so.orderNumber ?? so.wcOrderNumber },
     })
+    try {
+      await enqueueStockSync(
+        [...new Set(allocs.map((alloc) => alloc.productId))],
+        'IMS_CHANGE',
+      )
+    } catch (syncError) {
+      console.error(syncError)
+    }
     return { success: true }
   } catch (e) {
     return { success: false, error: String(e) }
@@ -757,6 +784,16 @@ export async function updateShipmentStatus(
       description: `Shipment from ${shipment.warehouse.code} for order ${shipment.order.orderNumber ?? shipment.order.wcOrderNumber} → ${targetStatus}`,
       metadata: { shipmentId, warehouseCode: shipment.warehouse.code, previousStatus: shipment.status, newStatus: targetStatus },
     })
+    if (targetStatus === 'SHIPPED') {
+      try {
+        await enqueueStockSync(
+          [...new Set(shipment.lines.map((line) => line.productId))],
+          'IMS_CHANGE',
+        )
+      } catch (syncError) {
+        console.error(syncError)
+      }
+    }
     return { success: true }
   } catch (e) {
     return { success: false, error: String(e) }

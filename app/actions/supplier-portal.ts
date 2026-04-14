@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { auth } from '@/lib/auth'
 import { logActivity } from '@/lib/activity-log'
+import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
 // Auth helper — get supplier ID from session
@@ -93,7 +94,7 @@ export type SupplierProductRow = {
   description: string | null
   supplierSku: string | null
   imageUrl: string | null
-  active: boolean
+  lifecycleStatus: ProductLifecycleStatus
 }
 
 export async function getSupplierProducts(): Promise<SupplierProductRow[]> {
@@ -105,7 +106,7 @@ export async function getSupplierProducts(): Promise<SupplierProductRow[]> {
     select: {
       supplierSku: true,
       product: {
-        select: { id: true, sku: true, name: true, description: true, imageUrl: true, parent: { select: { imageUrl: true } }, active: true },
+        select: { id: true, sku: true, name: true, description: true, imageUrl: true, parent: { select: { imageUrl: true } }, lifecycleStatus: true },
       },
     },
     orderBy: { product: { name: 'asc' } },
@@ -118,7 +119,7 @@ export async function getSupplierProducts(): Promise<SupplierProductRow[]> {
     description: l.product.description,
     supplierSku: l.supplierSku,
     imageUrl: l.product.imageUrl ?? l.product.parent?.imageUrl ?? null,
-    active: l.product.active,
+    lifecycleStatus: l.product.lifecycleStatus,
   }))
 }
 

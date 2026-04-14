@@ -13,6 +13,7 @@ import {
 } from '@/components/ui/table'
 import { saveProductOptions, generateVariantsFromOptions, deleteOrDeactivateVariant } from '@/app/actions/products'
 import type { ProductOptionRow, ProductRow } from '@/app/actions/products'
+import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 
 type Option = { name: string; values: string }
 
@@ -24,6 +25,16 @@ type Props = {
 
 export function VariantGenerator({ productId, initialOptions, variants }: Props) {
   const router = useRouter()
+  const statusLabels: Record<ProductLifecycleStatus, string> = {
+    ACTIVE: 'Active',
+    NOT_FOR_SALE: 'Not for sale',
+    ARCHIVED: 'Archived',
+  }
+  const statusVariants: Record<ProductLifecycleStatus, 'default' | 'secondary' | 'outline'> = {
+    ACTIVE: 'default',
+    NOT_FOR_SALE: 'secondary',
+    ARCHIVED: 'outline',
+  }
   const [options, setOptions] = useState<Option[]>(
     initialOptions.length > 0
       ? initialOptions.map((o) => ({ name: o.name, values: o.values }))
@@ -244,8 +255,8 @@ export function VariantGenerator({ productId, initialOptions, variants }: Props)
                     {v.salesPriceGbp ? `£${Number(v.salesPriceGbp).toFixed(2)}` : '—'}
                   </TableCell>
                   <TableCell>
-                    <Badge variant={v.active ? 'default' : 'outline'} className="text-xs">
-                      {v.active ? 'Active' : 'Inactive'}
+                    <Badge variant={statusVariants[v.lifecycleStatus]} className="text-xs">
+                      {statusLabels[v.lifecycleStatus]}
                     </Badge>
                   </TableCell>
                   <TableCell className="text-right">

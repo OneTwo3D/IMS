@@ -3,7 +3,7 @@ import { verifyCron } from '@/lib/cron-auth'
 import { db } from '@/lib/db'
 import { syncNewWcOrders } from '@/lib/connectors/woocommerce/sync/order-import'
 import { syncAllWcProducts } from '@/lib/connectors/woocommerce/sync/product-sync'
-import { pushStockToWc } from '@/lib/connectors/woocommerce/sync/stock-sync'
+import { processQueuedWcStockSyncJobs } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
 
 // Called by cron: curl http://localhost:3000/api/cron/wc-sync
 export async function GET(request: Request) {
@@ -29,8 +29,9 @@ export async function GET(request: Request) {
     }
   }
 
-  // Stock sync (if enabled)
-  results.stock = await pushStockToWc()
+  // Immediate stock updates are event-driven now. This cron only drains any
+  // failed or delayed retries left in the durable queue.
+  results.stockQueue = await processQueuedWcStockSyncJobs({ limit: 25 })
 
   return NextResponse.json(results)
 }

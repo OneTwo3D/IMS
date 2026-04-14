@@ -43,6 +43,10 @@ import {
   WC_SETTINGS_VERSION_KEY,
 } from '../sync-lock'
 import type { ConnectorCredentials } from '../../types'
+import {
+  shouldForceWooZeroStock,
+  WOO_STOCK_SYNC_PRODUCT_STATUSES,
+} from '@/lib/products/lifecycle'
 import type { WcFullProduct, StockSyncResult, WcVariation } from './types'
 
 const SKU_LOOKUP_CONCURRENCY = 8
@@ -50,6 +54,7 @@ const WC_BATCH_SIZE = 100
 const PREFLIGHT_PAGE_SIZE = 100
 const WC_PUSH_BATCH_TX_TIMEOUT_MS = 15000
 const WC_VARIATION_BATCH_SIZE = 100
+const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
 
 /**
  * `wcFetch` uses bare `fetch(...)` + `AbortSignal.timeout(...)` with no
@@ -259,9 +264,53 @@ type CandidateProduct = {
   id: string
   sku: string
   type: 'SIMPLE' | 'VARIANT' | 'KIT' | 'BOM'
+  lifecycleStatus: 'ACTIVE' | 'NOT_FOR_SALE' | 'ARCHIVED'
   wcProductId: bigint | null
   parent: { sku: string } | null
-  productComponents: { componentId: string; qty: Prisma.Decimal }[]
+  productComponents: {
+    componentId: string
+    qty: Prisma.Decimal
+    component: {
+      type: 'SIMPLE' | 'VARIABLE' | 'VARIANT' | 'KIT' | 'BOM' | 'NON_INVENTORY'
+      lifecycleStatus: 'ACTIVE' | 'NOT_FOR_SALE' | 'ARCHIVED'
+    }
+  }[]
+}
+
+type PushStockOptions = {
+  productIds?: string[]
+  forceProductIds?: string[]
+  forceAll?: boolean
+  source?: string
+}
+
+async function persistSuccessfulPushState(
+  tx: Prisma.TransactionClient,
+  entries: Array<PushEntry | VariantPushEntry>,
+): Promise<void> {
+  const pushedAt = new Date()
+  for (const entry of entries) {
+    await tx.stockSyncState.upsert({
+      where: {
+        connector_productId: {
+          connector: WC_STOCK_SYNC_CONNECTOR,
+          productId: entry.productId,
+        },
+      },
+      create: {
+        connector: WC_STOCK_SYNC_CONNECTOR,
+        productId: entry.productId,
+        lastPushedQty: entry.payload.stock_quantity,
+        lastPushedAt: pushedAt,
+        lastPushedRemoteId: String(entry.wcId),
+      },
+      update: {
+        lastPushedQty: entry.payload.stock_quantity,
+        lastPushedAt: pushedAt,
+        lastPushedRemoteId: String(entry.wcId),
+      },
+    })
+  }
 }
 
 type WcBatchUpdateItem = {
@@ -369,6 +418,8 @@ async function pushBatchWithFence(
       })
     }
 
+    await persistSuccessfulPushState(tx, outcome.successEntries)
+
     return { status: 'ok' as const, outcome }
   }, {
     timeout: WC_PUSH_BATCH_TX_TIMEOUT_MS,
@@ -383,11 +434,14 @@ function emptyResult(message: string): StockSyncResult {
   }
 }
 
-export async function pushStockToWc(): Promise<StockSyncResult> {
+export async function pushStockToWc(options?: PushStockOptions): Promise<StockSyncResult> {
   const enabled = await db.setting.findUnique({ where: { key: 'wc_stock_sync_enabled' } })
   if (enabled?.value !== 'true') {
     return emptyResult('Stock sync is disabled in settings')
   }
+  const scopedProductIds = options?.productIds ? [...new Set(options.productIds)] : null
+  const forceProductIds = new Set(options?.forceProductIds ?? [])
+  const forceAll = options?.forceAll === true
 
   // Cross-store safety note:
   //
@@ -402,9 +456,13 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
   // whole cache) and too strict (empty or slow endpoints fail-close
   // every run). Explicit rebind is simpler and predictable.
   //
-  // The safety net WITHIN this path is still: SKU-level preflight
+  // The safety net WITHIN this path is still SKU-level preflight
   // validation against live WC products (below), which refuses to
-  // push when a cached id now carries a different SKU.
+  // persist local success/log state when a cached id now carries a
+  // different SKU. Because the outbound WC POST now happens outside
+  // the advisory-lock transaction, a credentials rebind can still
+  // race between the precheck and the remote write; that trade-off is
+  // intentional so slow Woo responses do not pin a DB transaction.
 
   // Pin this run to a single credentials + settings-version snapshot.
   // Every WC API call below uses `creds`; every wcProductId write is
@@ -428,9 +486,27 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
   }
 
   const whIds = warehouses.map((w) => w.id)
+  const scopedComponentIds = scopedProductIds
+    ? [
+        ...new Set(
+          (
+            await db.productComponent.findMany({
+              where: { productId: { in: scopedProductIds } },
+              select: { componentId: true },
+            })
+          ).map((row) => row.componentId),
+        ),
+      ]
+    : []
+  const scopedStockProductIds = scopedProductIds
+    ? [...new Set([...scopedProductIds, ...scopedComponentIds])]
+    : null
 
   const stockLevels = await db.stockLevel.findMany({
-    where: { warehouseId: { in: whIds } },
+    where: {
+      warehouseId: { in: whIds },
+      ...(scopedStockProductIds ? { productId: { in: scopedStockProductIds } } : {}),
+    },
     select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
   })
 
@@ -450,38 +526,79 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
   const physicalProductIds = [...new Set(stockLevels.map((sl) => sl.productId))]
   const rawProducts = await db.product.findMany({
     where: {
-      active: true,
+      lifecycleStatus: { in: WOO_STOCK_SYNC_PRODUCT_STATUSES },
       sku: { not: '' },
-      OR: [
-        { id: { in: physicalProductIds } },
-        { type: 'KIT', productComponents: { some: {} } },
-      ],
+      ...(scopedProductIds
+        ? {
+            OR: [
+              { id: { in: scopedProductIds } },
+              {
+                type: 'KIT',
+                productComponents: { some: { componentId: { in: scopedProductIds } } },
+              },
+            ],
+          }
+        : {
+            OR: [
+              { id: { in: physicalProductIds } },
+              { type: 'KIT', productComponents: { some: {} } },
+            ],
+          }),
     },
     select: {
       id: true,
       sku: true,
       type: true,
+      lifecycleStatus: true,
       wcProductId: true,
       parent: { select: { sku: true } },
-      productComponents: { select: { componentId: true, qty: true } },
+      productComponents: {
+        select: {
+          componentId: true,
+          qty: true,
+          component: { select: { type: true, lifecycleStatus: true } },
+        },
+      },
     },
   })
   const products = rawProducts.filter(
     (p): p is CandidateProduct => p.type !== 'VARIABLE' && p.type !== 'NON_INVENTORY',
   )
-  const availableByProduct = new Map<string, number>()
-  for (const product of products) {
-    const available = product.type === 'KIT'
-      ? computeKitAvailability(product.productComponents, whIds, stockByProductWarehouse)
-      : (stockByProduct.get(product.id) ?? 0)
-    availableByProduct.set(product.id, available)
-  }
-
   const result: StockSyncResult = {
     synced: 0, skipped: 0, errors: [],
     candidates: products.length, matched: 0, unmatched: 0,
     pushed: false, message: '', unmatchedSkuSample: [],
   }
+  const productById = new Map(products.map((product) => [product.id, product]))
+  const availableByProduct = new Map<string, number>()
+  const kitAvailabilityMemo = new Map<string, number>()
+  const kitAvailabilityErrors = new Set<string>()
+  for (const product of products) {
+    const available = product.type === 'KIT'
+      ? computeKitAvailability(
+          product,
+          whIds,
+          stockByProductWarehouse,
+          productById,
+          kitAvailabilityMemo,
+          new Set<string>(),
+          result.errors,
+          kitAvailabilityErrors,
+        )
+      : (stockByProduct.get(product.id) ?? 0)
+    availableByProduct.set(product.id, available)
+  }
+
+  const previousStates = await db.stockSyncState.findMany({
+    where: {
+      connector: WC_STOCK_SYNC_CONNECTOR,
+      productId: { in: products.map((product) => product.id) },
+    },
+    select: { productId: true, lastPushedQty: true, lastPushedRemoteId: true },
+  })
+  const previousStateByProductId = new Map(
+    previousStates.map((state) => [state.productId, state]),
+  )
 
   if (products.length === 0) {
     result.message = 'No stocked products with SKUs to sync'
@@ -767,7 +884,9 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
       if (!result.errors.some((m) => m.includes(product.id))) result.skipped++
       continue
     }
-    const available = availableByProduct.get(product.id) ?? 0
+    const available = shouldForceWooZeroStock(product.lifecycleStatus)
+      ? 0
+      : (availableByProduct.get(product.id) ?? 0)
     const payload: PushEntry['payload'] = {
       id: target.wcId,
       stock_quantity: Math.floor(available),
@@ -778,22 +897,44 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
       payload.cost_of_goods_sold = { values: [{ defined_value: cogs.toFixed(2) }] }
     }
     if (product.type === 'VARIANT' && target.parentWcId != null) {
-      variantPushEntries.push({
+      const entry: VariantPushEntry = {
         productId: product.id,
         sku: product.sku,
         wcId: target.wcId,
         parentWcId: target.parentWcId,
         payload,
-      })
+      }
+      const prev = previousStateByProductId.get(product.id)
+      if (
+        !forceAll
+        && !forceProductIds.has(product.id)
+        && prev?.lastPushedQty === entry.payload.stock_quantity
+        && prev.lastPushedRemoteId != null
+        && prev.lastPushedRemoteId === String(entry.wcId)
+      ) {
+        continue
+      }
+      variantPushEntries.push(entry)
     } else {
-      pushEntries.push({ productId: product.id, sku: product.sku, wcId: target.wcId, payload })
+      const entry: PushEntry = { productId: product.id, sku: product.sku, wcId: target.wcId, payload }
+      const prev = previousStateByProductId.get(product.id)
+      if (
+        !forceAll
+        && !forceProductIds.has(product.id)
+        && prev?.lastPushedQty === entry.payload.stock_quantity
+        && prev.lastPushedRemoteId != null
+        && prev.lastPushedRemoteId === String(entry.wcId)
+      ) {
+        continue
+      }
+      pushEntries.push(entry)
     }
   }
 
   if (pushEntries.length === 0 && variantPushEntries.length === 0) {
     const reason = result.errors.length > 0
       ? 'errors during preflight/resolution'
-      : 'no WooCommerce-matched products'
+      : 'no changed WooCommerce-matched products'
     result.message = `0 synced — ${reason}`
     await recordAttempt()
     await logActivity({
@@ -1144,27 +1285,59 @@ async function recordAttempt() {
 }
 
 function computeKitAvailability(
-  components: CandidateProduct['productComponents'],
+  product: CandidateProduct,
   warehouseIds: string[],
   stockByProductWarehouse: Map<string, Map<string, number>>,
+  productById: Map<string, CandidateProduct>,
+  memo: Map<string, number>,
+  stack: Set<string>,
+  errors: string[],
+  seenCycleErrors: Set<string>,
 ): number {
-  if (components.length === 0) return 0
+  if (memo.has(product.id)) return memo.get(product.id) ?? 0
+  if (product.productComponents.length === 0) {
+    memo.set(product.id, 0)
+    return 0
+  }
+  if (stack.has(product.id)) {
+    const cycleKey = [...stack, product.id].join(' -> ')
+    if (!seenCycleErrors.has(cycleKey)) {
+      errors.push(`KIT cycle detected: ${cycleKey}`)
+      seenCycleErrors.add(cycleKey)
+    }
+    memo.set(product.id, 0)
+    return 0
+  }
+
+  stack.add(product.id)
 
   let total = 0
   for (const warehouseId of warehouseIds) {
     let kitsInWarehouse = Infinity
-    for (const component of components) {
+    for (const component of product.productComponents) {
       const required = Number(component.qty)
       if (required <= 0) {
         kitsInWarehouse = 0
         break
       }
-      const available = Math.max(0, stockByProductWarehouse.get(component.componentId)?.get(warehouseId) ?? 0)
+      if (component.component.lifecycleStatus === 'ARCHIVED') {
+        kitsInWarehouse = 0
+        break
+      }
+      let available = Math.max(0, stockByProductWarehouse.get(component.componentId)?.get(warehouseId) ?? 0)
+      if (component.component.type === 'KIT') {
+        const nested = productById.get(component.componentId)
+        available = nested
+          ? computeKitAvailability(nested, [warehouseId], stockByProductWarehouse, productById, memo, stack, errors, seenCycleErrors)
+          : 0
+      }
       kitsInWarehouse = Math.min(kitsInWarehouse, Math.floor(available / required))
     }
     total += kitsInWarehouse === Infinity ? 0 : kitsInWarehouse
   }
 
+  stack.delete(product.id)
+  memo.set(product.id, total)
   return total
 }
 
@@ -1339,6 +1512,8 @@ async function pushVariantBatchWithFence(
       })
     }
 
+    await persistSuccessfulPushState(tx, outcome.successEntries)
+
     return {
       status: 'ok' as const,
       outcome,
@@ -1439,13 +1614,18 @@ async function resolveSkusInParallel(
           const matches = bySku.get(product.sku) ?? []
           if (matches.length === 1 && typeof matches[0]?.id === 'number') {
             resolved.set(product.sku, { wcId: matches[0].id, parentWcId })
+            continue
+          }
+          if (matches.length > 1) {
+            errors.push({
+              sku: product.sku,
+              error: `ambiguous — WooCommerce returned ${matches.length}+ variations sharing this SKU under parent ${parentSku}`,
+            })
           }
         }
         continue
       }
 
-      totalAttempts--
-      totalAttempts++
       const variationLookup = await safeWcFetch(
         `/products/${parentWcId}/variations`,
         { per_page: '100' },

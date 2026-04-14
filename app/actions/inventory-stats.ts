@@ -2,6 +2,7 @@
 
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth/server'
+import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
 // Stock on Hand
@@ -14,7 +15,7 @@ export type StockOnHandRow = {
   type: string
   stockUnit: string
   barcode: string | null
-  active: boolean
+  lifecycleStatus: ProductLifecycleStatus
   warehouseCode: string
   warehouseName: string
   quantity: number
@@ -27,7 +28,7 @@ export async function getStockOnHand(): Promise<StockOnHandRow[]> {
   await requireAuth()
   const levels = await db.stockLevel.findMany({
     include: {
-      product: { select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, active: true } },
+      product: { select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, lifecycleStatus: true } },
       warehouse: { select: { code: true, name: true } },
     },
     orderBy: [{ product: { sku: 'asc' } }, { warehouse: { code: 'asc' } }],
@@ -51,7 +52,7 @@ export async function getStockOnHand(): Promise<StockOnHandRow[]> {
     type: l.product.type,
     stockUnit: l.product.stockUnit,
     barcode: l.product.barcode,
-    active: l.product.active,
+    lifecycleStatus: l.product.lifecycleStatus,
     warehouseCode: l.warehouse.code,
     warehouseName: l.warehouse.name,
     quantity: Number(l.quantity),

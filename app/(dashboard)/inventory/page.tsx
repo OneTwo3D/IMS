@@ -5,14 +5,14 @@ import { getStockUnitOptions } from '@/app/actions/settings'
 import { ProductFilters } from './product-filters'
 import { ProductTable } from '@/components/inventory/product-table'
 import { InventoryHeader } from './inventory-header'
-import type { ProductType } from '@/app/generated/prisma/client'
+import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
 
 export const metadata: Metadata = { title: 'Inventory' }
 
 type SearchParams = {
   search?: string
   type?: string
-  active?: string
+  lifecycleStatus?: string
   page?: string
   sort?: string
   dir?: string
@@ -30,7 +30,7 @@ export default async function InventoryPage({
     listProducts({
       search: sp.search,
       type: sp.type as ProductType | 'ALL' | undefined,
-      active: (sp.active ?? 'true') as 'true' | 'false' | 'all',
+      lifecycleStatus: sp.lifecycleStatus as ProductLifecycleStatus | 'ALL' | undefined,
       page,
       sort: (sp.sort as SortField) || undefined,
       dir: (sp.dir as SortDir) || undefined,
@@ -46,7 +46,7 @@ export default async function InventoryPage({
       <ProductFilters
         search={sp.search}
         type={sp.type}
-        active={sp.active ?? 'true'}
+        lifecycleStatus={sp.lifecycleStatus ?? 'ALL'}
       />
 
       <ProductTable
@@ -54,7 +54,7 @@ export default async function InventoryPage({
         total={result.total}
         page={result.page}
         pageSize={result.pageSize}
-        searchParams={{ search: sp.search, type: sp.type, active: sp.active, sort: sp.sort, dir: sp.dir }}
+        searchParams={{ search: sp.search, type: sp.type, lifecycleStatus: sp.lifecycleStatus, sort: sp.sort, dir: sp.dir }}
       />
     </div>
   )

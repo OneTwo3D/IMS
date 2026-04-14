@@ -33,6 +33,12 @@ enum ProductType {
   NON_INVENTORY // service / fee — unlimited, not tracked
 }
 
+enum ProductLifecycleStatus {
+  ACTIVE
+  NOT_FOR_SALE
+  ARCHIVED
+}
+
 enum WarehouseType {
   STANDARD
   QUARANTINE
@@ -164,6 +170,18 @@ enum WcSyncDirection {
 enum WcSyncStatus {
   PENDING
   SYNCED
+  FAILED
+}
+
+enum StockSyncReason {
+  IMS_CHANGE
+  WC_WEBHOOK
+  DAILY_RECONCILIATION
+  MANUAL
+}
+
+enum StockSyncJobStatus {
+  PENDING
   FAILED
 }
 
@@ -455,6 +473,7 @@ model Product {
   name            String
   description     String?
   type            ProductType @default(SIMPLE)
+  lifecycleStatus ProductLifecycleStatus @default(ACTIVE)
   parentId        String?     // set for VARIANT products
   barcode         String?
   hsCode          String?
@@ -524,6 +543,8 @@ model Product {
 
   orderAllocations OrderAllocation[]
   shipmentLines    ShipmentLine[]
+  stockSyncStates  StockSyncState[]
+  stockSyncJobs    StockSyncJob[]
 
   @@index([parentId])
   @@map("products")
@@ -1373,6 +1394,44 @@ model WcSyncLog {
 
   @@index([entityType, entityId])
   @@map("wc_sync_logs")
+}
+
+model StockSyncState {
+  connector        String
+  productId        String
+  lastPushedQty    Int?
+  lastPushedAt     DateTime?
+  lastPushedRemoteId String?
+  lastWebhookQty   Int?
+  lastWebhookAt    DateTime?
+  lastCorrectedAt  DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  product          Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([connector, productId])
+  @@map("stock_sync_states")
+}
+
+model StockSyncJob {
+  connector   String
+  productId   String
+  reason      StockSyncReason    @default(IMS_CHANGE)
+  status      StockSyncJobStatus @default(PENDING)
+  force       Boolean            @default(false)
+  webhookQty  Int?
+  attempts    Int                @default(0)
+  lastError   String?
+  availableAt DateTime           @default(now())
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  product     Product            @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([connector, productId])
+  @@index([connector, status, availableAt])
+  @@map("stock_sync_jobs")
 }
 
 // ---------------------------------------------------------------------------
