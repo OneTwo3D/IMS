@@ -1333,6 +1333,20 @@ export async function createRefund(
                 },
               },
             },
+            refunds: {
+              where: { id: { not: createdRefund.id } },
+              select: {
+                lines: {
+                  select: {
+                    productId: true,
+                    description: true,
+                    qty: true,
+                    totalGbp: true,
+                    unitPriceGbp: true,
+                  },
+                },
+              },
+            },
           },
         })
 
@@ -1375,6 +1389,79 @@ export async function createRefund(
           totalGbp: Number(line.totalGbp),
         }))
 
+        function priceMatches(unitRevenue: number, candidateUnitPrice: number | null): boolean {
+          if (candidateUnitPrice == null) return false
+          return Math.abs(unitRevenue - candidateUnitPrice) < 0.0001
+        }
+
+        function consumeRefundLineQuantity(
+          lineStates: Array<{
+            id: string
+            productId: string | null
+            description: string
+            qty: number
+            totalGbp: number
+          }>,
+          remainingShipped: Map<string, number>,
+          remainingUnshipped: Map<string, number>,
+          refundLine: { productId: string | null; description: string; qty: number; totalGbp: number; unitPriceGbp?: number | null },
+        ): { shippedRevenue: number; unshippedRevenue: number; assignedRevenue: number } {
+          if (!refundLine.productId || refundLine.qty <= 0) {
+            return { shippedRevenue: 0, unshippedRevenue: 0, assignedRevenue: 0 }
+          }
+
+          let remainingQty = refundLine.qty
+          let shippedRevenue = 0
+          let unshippedRevenue = 0
+          let assignedRevenue = 0
+          const refundUnitPrice = refundLine.unitPriceGbp != null
+            ? Number(refundLine.unitPriceGbp)
+            : (refundLine.qty > 0 ? refundLine.totalGbp / refundLine.qty : null)
+
+          const matchingLines = lineStates
+            .filter((line) => line.productId === refundLine.productId)
+            .sort((a, b) => {
+              const aUnitRevenue = a.qty > 0 ? a.totalGbp / a.qty : 0
+              const bUnitRevenue = b.qty > 0 ? b.totalGbp / b.qty : 0
+              const aPriceMatch = priceMatches(aUnitRevenue, refundUnitPrice)
+              const bPriceMatch = priceMatches(bUnitRevenue, refundUnitPrice)
+              if (aPriceMatch !== bPriceMatch) return aPriceMatch ? -1 : 1
+
+              const aDescMatch = a.description === refundLine.description
+              const bDescMatch = b.description === refundLine.description
+              if (aDescMatch !== bDescMatch) return aDescMatch ? -1 : 1
+
+              return 0
+            })
+
+          for (const line of matchingLines) {
+            if (remainingQty <= 0 || line.qty <= 0) break
+
+            const unitRevenue = line.totalGbp / line.qty
+            const shippedQtyAvailable = remainingShipped.get(line.id) ?? 0
+            const shippedTake = Math.min(remainingQty, shippedQtyAvailable)
+            if (shippedTake > 0) {
+              const shippedValue = unitRevenue * shippedTake
+              shippedRevenue += shippedValue
+              assignedRevenue += shippedValue
+              remainingQty -= shippedTake
+              remainingShipped.set(line.id, shippedQtyAvailable - shippedTake)
+            }
+
+            const unshippedQtyAvailable = remainingUnshipped.get(line.id) ?? 0
+            const unshippedTake = Math.min(remainingQty, unshippedQtyAvailable)
+            if (unshippedTake > 0) {
+              const unshippedValue = unitRevenue * unshippedTake
+              unshippedRevenue += unshippedValue
+              assignedRevenue += unshippedValue
+              remainingQty -= unshippedTake
+              remainingUnshipped.set(line.id, unshippedQtyAvailable - unshippedTake)
+            }
+          }
+
+          return { shippedRevenue, unshippedRevenue, assignedRevenue }
+        }
+
         const shippedQtyByLine = new Map<string, number>()
         let totalRecognized = 0
         let totalShippedCogs = 0
@@ -1406,6 +1493,23 @@ export async function createRefund(
           }
         }
 
+        for (const priorRefund of orderAccounting?.refunds ?? []) {
+          for (const priorRefundLine of priorRefund.lines) {
+            consumeRefundLineQuantity(
+              lineContexts,
+              remainingShippedQtyByLine,
+              remainingUnshippedQtyByLine,
+              {
+                productId: priorRefundLine.productId,
+                description: priorRefundLine.description,
+                qty: Number(priorRefundLine.qty),
+                totalGbp: Number(priorRefundLine.totalGbp),
+                unitPriceGbp: Number(priorRefundLine.unitPriceGbp),
+              },
+            )
+          }
+        }
+
         let shippedQtyRevenue = 0
         let unshippedQtyRevenue = 0
         let nonQtyRevenue = 0
@@ -1416,34 +1520,16 @@ export async function createRefund(
             continue
           }
 
-          let remainingQty = refundLine.qty
-          let assignedRevenue = 0
-          const matchingLines = lineContexts.filter((line) => line.productId === refundLine.productId)
+          const allocation = consumeRefundLineQuantity(
+            lineContexts,
+            remainingShippedQtyByLine,
+            remainingUnshippedQtyByLine,
+            refundLine,
+          )
+          shippedQtyRevenue += allocation.shippedRevenue
+          unshippedQtyRevenue += allocation.unshippedRevenue
 
-          for (const line of matchingLines) {
-            if (remainingQty <= 0 || line.qty <= 0) break
-
-            const unitRevenue = line.totalGbp / line.qty
-            const shippedQtyAvailable = remainingShippedQtyByLine.get(line.id) ?? 0
-            const shippedTake = Math.min(remainingQty, shippedQtyAvailable)
-            if (shippedTake > 0) {
-              shippedQtyRevenue += unitRevenue * shippedTake
-              assignedRevenue += unitRevenue * shippedTake
-              remainingQty -= shippedTake
-              remainingShippedQtyByLine.set(line.id, shippedQtyAvailable - shippedTake)
-            }
-
-            const unshippedQtyAvailable = remainingUnshippedQtyByLine.get(line.id) ?? 0
-            const unshippedTake = Math.min(remainingQty, unshippedQtyAvailable)
-            if (unshippedTake > 0) {
-              unshippedQtyRevenue += unitRevenue * unshippedTake
-              assignedRevenue += unitRevenue * unshippedTake
-              remainingQty -= unshippedTake
-              remainingUnshippedQtyByLine.set(line.id, unshippedQtyAvailable - unshippedTake)
-            }
-          }
-
-          nonQtyRevenue += Math.max(0, refundLine.totalGbp - assignedRevenue)
+          nonQtyRevenue += Math.max(0, refundLine.totalGbp - allocation.assignedRevenue)
         }
 
         const componentTotal = shippedQtyRevenue + unshippedQtyRevenue + nonQtyRevenue
@@ -1525,6 +1611,16 @@ export async function createRefund(
                 ? `Unearned revenue + allocation reversal — refund on order ${orderRef}`
                 : `Unearned revenue reversal — refund on order ${orderRef}`,
               lines: journalLines,
+            },
+          })
+        }
+
+        if (newStatus === 'REFUNDED') {
+          await db.salesOrder.update({
+            where: { id: orderId },
+            data: {
+              revenueDeferredDate: null,
+              inventoryAllocatedDate: null,
             },
           })
         }

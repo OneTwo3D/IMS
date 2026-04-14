@@ -198,6 +198,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
       status: 'SHIPPED',
       shipmentJournalDate: null,
       order: {
+        status: { not: 'REFUNDED' },
         revenueDeferredDate: { not: null },
         inventoryAllocatedDate: { not: null },
       },

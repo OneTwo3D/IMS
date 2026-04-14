@@ -548,7 +548,9 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
     await new Promise((resolve) => setTimeout(resolve, 300))
     expect(rebindCommitted).toBe(false)
 
-    state.releaseBatchResponse?.()
+    const releaseBatchResponse = state.releaseBatchResponse as (() => void) | null
+    if (!releaseBatchResponse) throw new Error('Expected releaseBatchResponse to be set before continuing')
+    releaseBatchResponse()
 
     await syncPromise
     await rebindPromise

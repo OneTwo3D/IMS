@@ -223,35 +223,35 @@ export async function runDailyBatchSync(): Promise<{
     })
 
     if (orders.length > 0) {
-      let totalAllocatedValue = 0
-      const snapshot = await buildLayerSnapshot(
-        orders.flatMap((order) =>
-          order.allocations.map((alloc) => ({
-            productId: alloc.productId,
-            warehouseId: alloc.warehouseId,
-          })),
-        ),
-      )
-      const orderValues = new Map<string, number>()
+      await db.$transaction(async (tx) => {
+        let totalAllocatedValue = 0
+        const snapshot = await buildLayerSnapshot(
+          orders.flatMap((order) =>
+            order.allocations.map((alloc) => ({
+              productId: alloc.productId,
+              warehouseId: alloc.warehouseId,
+            })),
+          ),
+        )
+        const orderValues = new Map<string, number>()
 
-      for (const order of orders) {
-        let orderCostValue = 0
+        for (const order of orders) {
+          let orderCostValue = 0
 
-        for (const alloc of order.allocations) {
-          orderCostValue += consumeSnapshotCost(
-            snapshot,
-            alloc.productId,
-            alloc.warehouseId,
-            Number(alloc.qty),
-          )
+          for (const alloc of order.allocations) {
+            orderCostValue += consumeSnapshotCost(
+              snapshot,
+              alloc.productId,
+              alloc.warehouseId,
+              Number(alloc.qty),
+            )
+          }
+
+          orderCostValue = round2(orderCostValue)
+          totalAllocatedValue += orderCostValue
+          orderValues.set(order.id, orderCostValue)
         }
 
-        orderCostValue = round2(orderCostValue)
-        totalAllocatedValue += orderCostValue
-        orderValues.set(order.id, orderCostValue)
-      }
-
-      await db.$transaction(async (tx) => {
         if (totalAllocatedValue > 0) {
           await createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_INVENTORY_ALLOC',
@@ -293,6 +293,7 @@ export async function runDailyBatchSync(): Promise<{
         status: 'SHIPPED',
         shipmentJournalDate: null,
         order: {
+          status: { not: 'REFUNDED' },
           revenueDeferredDate: { not: null },
           inventoryAllocatedDate: { not: null },
         },

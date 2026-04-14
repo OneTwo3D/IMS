@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test'
+import type { Page } from '@playwright/test'
 import { addStockAdjustment, createDraftSalesOrder, createSimpleProduct } from './helpers'
 
 const DEFAULT_WAREHOUSE_LABEL = 'DEFAULT — Default'
@@ -6,11 +7,11 @@ const DEFAULT_WAREHOUSE_CODE = 'DEFAULT'
 const CBG_WAREHOUSE_LABEL = 'CBG — Cambridge'
 const CBG_WAREHOUSE_CODE = 'CBG'
 
-async function openMoreActions(page: Parameters<typeof test>[0]['page']) {
+async function openMoreActions(page: Page) {
   await page.locator('button[aria-haspopup="menu"]').last().click()
 }
 
-async function createShippedSalesOrder(page: Parameters<typeof test>[0]['page']) {
+async function createShippedSalesOrder(page: Page) {
   const product = await createSimpleProduct(page, { price: '21.00' })
   await addStockAdjustment(page, product.sku, 4, CBG_WAREHOUSE_CODE)
   await createDraftSalesOrder(page, { sku: product.sku, warehouseLabel: CBG_WAREHOUSE_LABEL })
