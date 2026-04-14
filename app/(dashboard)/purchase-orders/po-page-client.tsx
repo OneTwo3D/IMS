@@ -38,15 +38,15 @@ export function PurchaseOrdersClient({ initialPos, suppliers, products, warehous
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <h1 className="text-2xl font-semibold">Purchase Orders</h1>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <CsvBar exportUrl="/api/export/purchase-orders" templateUrl="/api/export/purchase-orders?template=1" importAction={importPurchaseOrdersCsv} />
           <Button variant="outline" size="sm" onClick={() => setShowFreight(true)}>
             <Ship className="h-4 w-4 mr-1" />
             Landed Cost PO
           </Button>
-          <Button size="sm" onClick={() => setShowCreate(true)}>
+          <Button size="sm" onClick={() => setShowCreate(true)} className="sm:w-auto">
             <Plus className="h-4 w-4 mr-1" />
             New PO
           </Button>

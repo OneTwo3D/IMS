@@ -36,6 +36,13 @@ export function StockAdjustmentsClient({ warehouses, products, reasons, history 
             exportUrl="/api/export/adjustments"
             templateUrl="/api/export/adjustments?template=1"
             importAction={importAdjustmentsCsv}
+            mobileMenuItems={[
+              {
+                label: 'Stock Levels',
+                href: '/api/export/stock-levels',
+                icon: Download,
+              },
+            ]}
             extraButtons={
               <a href="/api/export/stock-levels" className="inline-flex items-center gap-1 rounded-md border border-input bg-background px-2.5 h-7 text-xs font-medium hover:bg-muted transition-colors">
                 <Download className="h-3 w-3" />

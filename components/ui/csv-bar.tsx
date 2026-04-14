@@ -6,14 +6,21 @@ import { Download, Upload, Loader2, Ellipsis } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 
+type MobileMenuItem = {
+  label: string
+  href: string
+  icon?: React.ComponentType<{ className?: string }>
+}
+
 type Props = {
   exportUrl: string
   templateUrl: string
   importAction?: (formData: FormData) => Promise<{ success?: boolean; count?: number; created?: number; updated?: number; error?: string; message?: string; errors?: string[] }>
   extraButtons?: React.ReactNode
+  mobileMenuItems?: MobileMenuItem[]
 }
 
-export function CsvBar({ exportUrl, templateUrl, importAction, extraButtons }: Props) {
+export function CsvBar({ exportUrl, templateUrl, importAction, extraButtons, mobileMenuItems = [] }: Props) {
   const router = useRouter()
   const [importing, setImporting] = useState(false)
   const [importResult, setImportResult] = useState<{ message?: string; error?: string } | null>(null)
@@ -63,6 +70,7 @@ export function CsvBar({ exportUrl, templateUrl, importAction, extraButtons }: P
             Import CSV
           </button>
         )}
+        {extraButtons}
       </div>
 
       <div className="sm:hidden">
@@ -82,6 +90,15 @@ export function CsvBar({ exportUrl, templateUrl, importAction, extraButtons }: P
               <Download className="mr-2 h-4 w-4" />
               Export CSV
             </DropdownMenuItem>
+            {mobileMenuItems.map((item) => {
+              const Icon = item.icon ?? Download
+              return (
+                <DropdownMenuItem key={item.href} onClick={() => window.location.assign(item.href)}>
+                  <Icon className="mr-2 h-4 w-4" />
+                  {item.label}
+                </DropdownMenuItem>
+              )
+            })}
             {importAction && (
               <DropdownMenuItem onClick={() => fileRef.current?.click()} disabled={importing}>
                 {importing ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <Upload className="mr-2 h-4 w-4" />}
@@ -92,7 +109,6 @@ export function CsvBar({ exportUrl, templateUrl, importAction, extraButtons }: P
         </DropdownMenu>
       </div>
 
-      {extraButtons}
       {importResult?.message && <span className="text-xs text-green-600">{importResult.message}</span>}
       {importResult?.error && <span className="text-xs text-destructive">{importResult.error}</span>}
     </div>
