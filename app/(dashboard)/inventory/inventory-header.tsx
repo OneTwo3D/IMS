@@ -2,11 +2,12 @@
 
 import { useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { Plus, Download } from 'lucide-react'
+import { Plus, Download, Ellipsis } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { buttonVariants } from '@/components/ui/button-variants'
 import { CsvImportButton } from '@/components/inventory/csv-import-button'
 import { ProductForm } from '@/components/inventory/product-form'
+import { DropdownMenu, DropdownMenuContent, DropdownMenuItem, DropdownMenuTrigger } from '@/components/ui/dropdown-menu'
 import { createProduct } from '@/app/actions/products'
 import { importProductsCsv } from '@/app/actions/import'
 
@@ -52,26 +53,32 @@ export function InventoryHeader({ total, variableProducts, stockUnitOptions }: P
             Add Product
           </Button>
 
-          <CsvImportButton
-            label="Import CSV"
-            action={importProductsCsv}
-            onDone={() => router.refresh()}
-            compact
-          />
-
-          <a
-            href="/api/export/products?template=1"
-            className={buttonVariants({ variant: 'outline', size: 'sm', className: 'w-full' })}
-          >
-            <Download className="h-4 w-4 mr-1" />Template
-          </a>
-
-          <a
-            href="/api/export/products"
-            className={buttonVariants({ variant: 'outline', size: 'sm', className: 'w-full' })}
-          >
-            <Download className="h-4 w-4 mr-1" />Export CSV
-          </a>
+          <DropdownMenu>
+            <DropdownMenuTrigger
+              render={<Button variant="outline" size="sm" className="w-full" aria-label="CSV actions" />}
+            >
+              <Ellipsis className="h-4 w-4 mr-1" />
+              CSV
+            </DropdownMenuTrigger>
+            <DropdownMenuContent align="end" className="w-48">
+              <DropdownMenuItem onClick={() => window.location.assign('/api/export/products?template=1')}>
+                <Download className="mr-2 h-4 w-4" />
+                Template
+              </DropdownMenuItem>
+              <DropdownMenuItem onClick={() => window.location.assign('/api/export/products')}>
+                <Download className="mr-2 h-4 w-4" />
+                Export CSV
+              </DropdownMenuItem>
+              <div className="px-1 py-1">
+                <CsvImportButton
+                  label="Import CSV"
+                  action={importProductsCsv}
+                  onDone={() => router.refresh()}
+                  compact
+                />
+              </div>
+            </DropdownMenuContent>
+          </DropdownMenu>
         </div>
       </div>
       {showCreate && (
