@@ -7,6 +7,7 @@ import { SyncClient } from './sync-client'
 import { XeroClient } from './xero-client'
 import type { WcSyncSettings, TaxRateMappingRow, StatusMappingRow, SyncLogRow } from '@/app/actions/wc-sync'
 import type { XeroSettings, XeroSyncLogRow, XeroSyncReadiness } from '@/app/actions/xero-sync'
+import type { DailyBatchPreview, DailyBatchHistoryDay } from '@/app/actions/xero-daily-batch'
 import type { TaxRateRow } from '@/app/actions/settings'
 
 type XeroAccount = { id: string; xeroId: string; code: string | null; name: string; type: string }
@@ -33,6 +34,8 @@ type Props = {
   /** Active WooCommerce payment gateways — used to populate the method dropdown in Xero payment mapping. */
   wcPaymentGateways: Array<{ id: string; title: string }>
   xeroReadiness: XeroSyncReadiness
+  dailyBatchPreview: DailyBatchPreview
+  dailyBatchHistory: DailyBatchHistoryDay[]
 }
 
 type ConnectorDef = {
@@ -106,7 +109,7 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 
-export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcLogs, taxRates, imsTaxRates, xeroTaxRates, wcCredentials, xeroSettings, xeroConnected, xeroTenantName, xeroAccounts, xeroLogs, paymentMethodCombos, paymentAccountMap, currencies, wcPaymentGateways, xeroReadiness }: Props) {
+export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcLogs, taxRates, imsTaxRates, xeroTaxRates, wcCredentials, xeroSettings, xeroConnected, xeroTenantName, xeroAccounts, xeroLogs, paymentMethodCombos, paymentAccountMap, currencies, wcPaymentGateways, xeroReadiness, dailyBatchPreview, dailyBatchHistory }: Props) {
   const router = useRouter()
   const searchParams = useSearchParams()
   const activeConnector = searchParams.get('connector')
@@ -222,6 +225,8 @@ export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcL
           imsTaxRates={imsTaxRates}
           xeroTaxRates={xeroTaxRates}
           readiness={xeroReadiness}
+          dailyBatchPreview={dailyBatchPreview}
+          dailyBatchHistory={dailyBatchHistory}
         />
       </div>
     )

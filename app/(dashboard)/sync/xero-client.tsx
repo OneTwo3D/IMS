@@ -2,7 +2,7 @@
 
 import { useState, useTransition, useEffect } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, Plus, Trash2, AlertTriangle, Receipt, RotateCcw, ChevronLeft, ChevronRight } from 'lucide-react'
+import { RefreshCw, Loader2, Link2, Link2Off, ArrowUpFromLine, CheckCircle2, Plus, Trash2, AlertTriangle, Receipt, RotateCcw, ChevronLeft, ChevronRight, ChevronDown } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -14,6 +14,10 @@ import {
   syncXeroAccounts, triggerXeroSync, fetchXeroTaxRates, retryFailedXeroSync,
   type XeroSettings, type XeroSyncLogRow, type XeroSyncReadiness,
 } from '@/app/actions/xero-sync'
+import {
+  refreshXeroDailyBatchPreview,
+  type DailyBatchPreview, type DailyBatchHistoryDay,
+} from '@/app/actions/xero-daily-batch'
 import { savePaymentAccountMap } from '@/app/actions/accounting'
 import { autoLinkXeroTaxRates, updateTaxRate, type TaxRateRow } from '@/app/actions/settings'
 
@@ -34,6 +38,8 @@ type Props = {
   imsTaxRates: TaxRateRow[]
   xeroTaxRates: Array<{ taxType: string; name: string; rate: number }>
   readiness: XeroSyncReadiness
+  dailyBatchPreview: DailyBatchPreview
+  dailyBatchHistory: DailyBatchHistoryDay[]
 }
 
 const ACCOUNT_FIELDS: { key: keyof XeroSettings; label: string; description: string }[] = [
@@ -71,6 +77,7 @@ const XERO_TABS = [
   { id: 'accounts', label: 'Accounts' },
   { id: 'tax', label: 'Tax' },
   { id: 'sync', label: 'Sync' },
+  { id: 'daily-batch', label: 'Daily Batch' },
 ] as const
 
 type XeroTabId = (typeof XERO_TABS)[number]['id']
@@ -97,7 +104,7 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
   return JSON.stringify(map)
 }
 
-export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, wcPaymentGateways, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness }: Props) {
+export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, wcPaymentGateways, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
@@ -905,6 +912,10 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
         </div>
       )}
 
+      {tab === 'daily-batch' && (
+        <DailyBatchPanel initialPreview={initPreview} history={dailyBatchHistory} />
+      )}
+
       {/* Sticky Save Bar — shown on tabs with editable content */}
       {showSaveBar && (
         <div className="fixed bottom-0 left-0 right-0 z-40 border-t bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/80 shadow-lg">
@@ -922,6 +933,369 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
             </Button>
           </div>
         </div>
+      )}
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Daily Batch panel — preview & history of the Xero sub-ledger daily post
+// ---------------------------------------------------------------------------
+
+function formatGbp(n: number): string {
+  return n.toLocaleString('en-GB', { style: 'currency', currency: 'GBP' })
+}
+
+function formatRelative(iso: string): string {
+  const d = new Date(iso)
+  return d.toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })
+}
+
+function DailyBatchPanel({
+  initialPreview,
+  history,
+}: {
+  initialPreview: DailyBatchPreview
+  history: DailyBatchHistoryDay[]
+}) {
+  const [preview, setPreview] = useState(initialPreview)
+  const [refreshing, setRefreshing] = useState(false)
+  const [expandedDates, setExpandedDates] = useState<Set<string>>(new Set())
+
+  async function handleRefresh() {
+    setRefreshing(true)
+    try {
+      const next = await refreshXeroDailyBatchPreview()
+      setPreview(next)
+    } finally {
+      setRefreshing(false)
+    }
+  }
+
+  function toggleDate(date: string) {
+    setExpandedDates((prev) => {
+      const next = new Set(prev)
+      if (next.has(date)) next.delete(date)
+      else next.add(date)
+      return next
+    })
+  }
+
+  const previewTotal =
+    preview.groupA1.totalRevenue +
+    preview.groupA2.totalCost +
+    preview.groupB.totalRevenue +
+    preview.groupB.totalCogs
+
+  return (
+    <div className="space-y-6">
+      <Card className="p-5">
+        <div className="flex items-start justify-between gap-4 mb-4">
+          <div>
+            <h3 className="text-sm font-semibold">Pending — next batch run</h3>
+            <p className="text-xs text-muted-foreground mt-0.5">
+              Live view of what the daily batch will post to Xero when it next runs. Cached for 60s — click refresh for an immediate recompute.
+            </p>
+          </div>
+          <div className="flex items-center gap-3">
+            <span className="text-xs text-muted-foreground whitespace-nowrap">
+              {preview.cachedFor > 0
+                ? `Cached • refreshes in ${preview.cachedFor}s`
+                : 'Fresh'}
+            </span>
+            <Button variant="outline" size="sm" onClick={handleRefresh} disabled={refreshing}>
+              {refreshing ? <Loader2 className="h-3.5 w-3.5 mr-1.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5 mr-1.5" />}
+              Refresh
+            </Button>
+          </div>
+        </div>
+
+        {previewTotal === 0 && preview.groupA1.orderCount === 0 && preview.groupA2.orderCount === 0 && preview.groupB.shipmentCount === 0 ? (
+          <div className="text-center py-8 text-sm text-muted-foreground">
+            Nothing pending. The next batch run will post no journals.
+          </div>
+        ) : (
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+            <PreviewGroupCard
+              title="A1 — Revenue Deferral"
+              subtitle="DR Sales / CR Unearned Revenue"
+              count={preview.groupA1.orderCount}
+              unit="order"
+              debit={preview.groupA1.totalRevenue}
+            />
+            <PreviewGroupCard
+              title="A2 — Inventory Reclassification"
+              subtitle="DR Allocated Inventory / CR Inventory"
+              count={preview.groupA2.orderCount}
+              unit="order"
+              debit={preview.groupA2.totalCost}
+            />
+            <PreviewGroupCard
+              title="B — Shipment Revenue + COGS"
+              subtitle="DR Unearned / CR Sales + DR COGS / CR Allocated"
+              count={preview.groupB.shipmentCount}
+              unit="shipment"
+              debit={preview.groupB.totalRevenue + preview.groupB.totalCogs}
+              splits={[
+                { label: 'Revenue recognised', amount: preview.groupB.totalRevenue },
+                { label: 'COGS matched', amount: preview.groupB.totalCogs },
+              ]}
+            />
+          </div>
+        )}
+
+        {preview.groupA1.orders.length > 0 && (
+          <PreviewOrderList
+            title="A1 contributing orders"
+            rows={preview.groupA1.orders.map((o) => ({
+              id: o.id, label: o.wcOrderNumber ?? o.orderNumber, amount: o.amount,
+            }))}
+          />
+        )}
+        {preview.groupA2.orders.length > 0 && (
+          <PreviewOrderList
+            title="A2 contributing orders"
+            rows={preview.groupA2.orders.map((o) => ({
+              id: o.id, label: o.wcOrderNumber ?? o.orderNumber, amount: o.amount,
+            }))}
+          />
+        )}
+        {preview.groupB.shipments.length > 0 && (
+          <PreviewShipmentList shipments={preview.groupB.shipments} />
+        )}
+      </Card>
+
+      <Card className="p-5">
+        <div className="mb-4">
+          <h3 className="text-sm font-semibold">History</h3>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            Prior daily batch runs for the last 30 days. Click a day to see the posted journal lines.
+          </p>
+        </div>
+
+        {history.length === 0 ? (
+          <div className="text-center py-8 text-sm text-muted-foreground">
+            No daily batch runs recorded in the last 30 days.
+          </div>
+        ) : (
+          <div className="space-y-2">
+            {history.map((day) => {
+              const expanded = expandedDates.has(day.date)
+              const entries = [day.a1, day.a2, day.b].filter(
+                (e): e is NonNullable<typeof e> => e !== null,
+              )
+              const dayTotal = entries.reduce((s, e) => s + e.totalDebit, 0)
+              return (
+                <div key={day.date} className="border rounded-md">
+                  <button
+                    type="button"
+                    className="w-full flex items-center justify-between gap-3 px-3 py-2 text-left hover:bg-muted/40"
+                    onClick={() => toggleDate(day.date)}
+                  >
+                    <div className="flex items-center gap-3">
+                      {expanded
+                        ? <ChevronDown className="h-4 w-4 text-muted-foreground" />
+                        : <ChevronRight className="h-4 w-4 text-muted-foreground" />}
+                      <span className="text-sm font-medium">{day.date}</span>
+                      <span className="text-xs text-muted-foreground">
+                        {entries.length} journal{entries.length === 1 ? '' : 's'}
+                      </span>
+                    </div>
+                    <div className="flex items-center gap-3">
+                      <HistoryStatusBadge entries={entries} />
+                      <span className="text-sm font-mono">{formatGbp(dayTotal)}</span>
+                    </div>
+                  </button>
+                  {expanded && (
+                    <div className="border-t divide-y">
+                      {day.a1 && <HistoryEntryRow label="A1 — Revenue Deferral" entry={day.a1} />}
+                      {day.a2 && <HistoryEntryRow label="A2 — Inventory Reclassification" entry={day.a2} />}
+                      {day.b && <HistoryEntryRow label="B — Shipment Revenue + COGS" entry={day.b} />}
+                    </div>
+                  )}
+                </div>
+              )
+            })}
+          </div>
+        )}
+      </Card>
+    </div>
+  )
+}
+
+function PreviewGroupCard({
+  title, subtitle, count, unit, debit, splits,
+}: {
+  title: string
+  subtitle: string
+  count: number
+  unit: string
+  debit: number
+  splits?: Array<{ label: string; amount: number }>
+}) {
+  return (
+    <div className="rounded-md border p-4">
+      <p className="text-xs font-semibold">{title}</p>
+      <p className="text-[11px] text-muted-foreground font-mono mt-0.5">{subtitle}</p>
+      <div className="mt-3 text-2xl font-semibold">{formatGbp(debit)}</div>
+      <p className="text-xs text-muted-foreground mt-0.5">
+        {count} {unit}{count === 1 ? '' : 's'}
+      </p>
+      {splits && splits.length > 0 && (
+        <div className="mt-3 pt-3 border-t space-y-1">
+          {splits.map((s) => (
+            <div key={s.label} className="flex items-center justify-between text-xs">
+              <span className="text-muted-foreground">{s.label}</span>
+              <span className="font-mono">{formatGbp(s.amount)}</span>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function PreviewOrderList({
+  title, rows,
+}: {
+  title: string
+  rows: Array<{ id: string; label: string; amount: number }>
+}) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="mt-4 border-t pt-3">
+      <button
+        type="button"
+        className="flex items-center gap-2 text-xs font-medium text-muted-foreground hover:text-foreground"
+        onClick={() => setOpen((p) => !p)}
+      >
+        {open
+          ? <ChevronDown className="h-3.5 w-3.5" />
+          : <ChevronRight className="h-3.5 w-3.5" />}
+        {title} ({rows.length})
+      </button>
+      {open && (
+        <div className="mt-2 max-h-64 overflow-y-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Order</TableHead>
+                <TableHead className="text-right">Amount</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {rows.map((r) => (
+                <TableRow key={r.id}>
+                  <TableCell className="font-mono text-xs">{r.label}</TableCell>
+                  <TableCell className="text-right font-mono text-xs">{formatGbp(r.amount)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function PreviewShipmentList({ shipments }: { shipments: DailyBatchPreview['groupB']['shipments'] }) {
+  const [open, setOpen] = useState(false)
+  return (
+    <div className="mt-4 border-t pt-3">
+      <button
+        type="button"
+        className="flex items-center gap-2 text-xs font-medium text-muted-foreground hover:text-foreground"
+        onClick={() => setOpen((p) => !p)}
+      >
+        {open
+          ? <ChevronDown className="h-3.5 w-3.5" />
+          : <ChevronRight className="h-3.5 w-3.5" />}
+        B contributing shipments ({shipments.length})
+      </button>
+      {open && (
+        <div className="mt-2 max-h-64 overflow-y-auto">
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Order</TableHead>
+                <TableHead className="text-right">Revenue</TableHead>
+                <TableHead className="text-right">COGS</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {shipments.map((s) => (
+                <TableRow key={s.id}>
+                  <TableCell className="font-mono text-xs">{s.wcOrderNumber ?? s.orderNumber}</TableCell>
+                  <TableCell className="text-right font-mono text-xs">{formatGbp(s.revenue)}</TableCell>
+                  <TableCell className="text-right font-mono text-xs">{formatGbp(s.cogs)}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function HistoryStatusBadge({ entries }: { entries: Array<{ status: string }> }) {
+  const anyFailed = entries.some((e) => e.status === 'FAILED')
+  const anyPending = entries.some((e) => e.status === 'PENDING')
+  if (anyFailed) return <Badge variant="destructive" className="text-[10px]">Failed</Badge>
+  if (anyPending) return <Badge variant="outline" className="text-[10px]">Pending</Badge>
+  return <Badge variant="default" className="text-[10px]">Synced</Badge>
+}
+
+function HistoryEntryRow({
+  label, entry,
+}: {
+  label: string
+  entry: NonNullable<DailyBatchHistoryDay['a1']>
+}) {
+  return (
+    <div className="px-3 py-3 space-y-2">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="text-xs font-semibold">{label}</p>
+          <p className="text-[11px] text-muted-foreground truncate">{entry.narration}</p>
+          <p className="text-[10px] text-muted-foreground mt-0.5">
+            Created {formatRelative(entry.createdAt)}
+            {entry.syncedAt ? ` · Synced ${formatRelative(entry.syncedAt)}` : ''}
+          </p>
+        </div>
+        <div className="text-right shrink-0">
+          <div className="text-sm font-mono">{formatGbp(entry.totalDebit)}</div>
+          <div className="text-[10px] mt-0.5">
+            {STATUS_BADGE[entry.status]?.label ?? entry.status}
+          </div>
+        </div>
+      </div>
+      {entry.errorMessage && (
+        <div className="text-[11px] text-destructive">
+          Error (attempt {entry.retryCount}): {entry.errorMessage}
+        </div>
+      )}
+      {entry.lines.length > 0 && (
+        <Table>
+          <TableHeader>
+            <TableRow>
+              <TableHead className="h-7 text-[10px]">Account</TableHead>
+              <TableHead className="h-7 text-[10px]">Description</TableHead>
+              <TableHead className="h-7 text-[10px] text-right">Debit</TableHead>
+              <TableHead className="h-7 text-[10px] text-right">Credit</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {entry.lines.map((l, idx) => (
+              <TableRow key={idx}>
+                <TableCell className="font-mono text-[11px] py-1.5">{l.accountCode || '—'}</TableCell>
+                <TableCell className="text-[11px] py-1.5">{l.description}</TableCell>
+                <TableCell className="text-right font-mono text-[11px] py-1.5">{l.debit > 0 ? formatGbp(l.debit) : ''}</TableCell>
+                <TableCell className="text-right font-mono text-[11px] py-1.5">{l.credit > 0 ? formatGbp(l.credit) : ''}</TableCell>
+              </TableRow>
+            ))}
+          </TableBody>
+        </Table>
       )}
     </div>
   )
