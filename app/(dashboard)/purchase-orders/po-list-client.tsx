@@ -8,6 +8,7 @@ import { Input } from '@/components/ui/input'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuSeparator, DropdownMenuCheckboxItem } from '@/components/ui/dropdown-menu'
+import { MobileRecordCard, MobileRecordField, MobileRecordList, ResponsiveTableLayout } from '@/components/ui/mobile-records'
 import { ChevronRight, Search, Settings2, Filter } from 'lucide-react'
 
 function timeAgo(iso: string): string {
@@ -346,7 +347,7 @@ export function PoListClient({ initialPos, currencySymbols = {} }: Props) {
             </DropdownMenuCheckboxItem>
           </DropdownMenuContent>
         </DropdownMenu>
-        <Button variant="outline" size="sm" className="h-8" onClick={openColPicker} title="Column settings">
+        <Button variant="outline" size="sm" className="hidden h-8 md:inline-flex" onClick={openColPicker} title="Column settings">
           <Settings2 className="h-4 w-4" />
         </Button>
       </div>
@@ -355,30 +356,87 @@ export function PoListClient({ initialPos, currencySymbols = {} }: Props) {
       {filtered.length === 0 ? (
         <p className="text-sm text-muted-foreground py-8 text-center">No purchase orders found.</p>
       ) : (
-        <Table containerClassName="max-h-[calc(100vh-16rem)] rounded-md border" className="min-w-[700px]">
-          <TableHeader className="bg-muted/50">
-            <TableRow>
-              {visCols.map((c) => (
-                <TableHead key={c.key} className={c.align === 'right' ? 'text-right' : undefined}>
-                  {c.label}
-                </TableHead>
-              ))}
-              <TableHead className="w-8" />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {filtered.map((po) => (
-              <TableRow key={po.id}>
-                {visCols.map((c) => renderCell(c.key, po))}
-                <TableCell>
-                  <Link href={`/purchase-orders/${po.id}`}>
-                    <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                  </Link>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+        <ResponsiveTableLayout
+          mobile={(
+            <MobileRecordList>
+              {filtered.map((po) => {
+                const invoice = invoiceStatusBadge(po)
+                return (
+                  <MobileRecordCard key={po.id}>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <Link href={`/purchase-orders/${po.id}`} className="font-mono text-sm font-medium text-primary hover:underline">
+                          {po.reference}
+                        </Link>
+                        <p className="mt-1 text-sm font-medium leading-tight">{po.supplierName}</p>
+                        {po.supplierRef && (
+                          <p className="mt-0.5 text-xs text-muted-foreground font-mono">{po.supplierRef}</p>
+                        )}
+                      </div>
+                      <div className="flex flex-col items-end gap-2">
+                        <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[po.status]}`}>
+                          {STATUS_LABELS[po.status]}
+                        </span>
+                        <span className="text-sm font-semibold tabular-nums">
+                          {po.totalForeign.toFixed(2)}{sym(po.currency)}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 grid grid-cols-2 gap-2">
+                      <MobileRecordField label="Expected" value={fmtDate(po.expectedDelivery)} />
+                      <MobileRecordField label="Created" value={timeAgo(po.createdAt)} />
+                      <MobileRecordField label="Warehouse" value={po.destinationWarehouseName ?? '—'} />
+                      <MobileRecordField label="Lines" value={po.lineCount} />
+                    </div>
+
+                    <div className="mt-3 flex items-center justify-between gap-3 border-t border-border pt-3">
+                      <div className="min-w-0 text-xs text-muted-foreground">
+                        <span>{po.type === 'FREIGHT' ? 'Freight / Landed Cost' : 'Goods order'}</span>
+                        {invoice && (
+                          <>
+                            <span className="mx-1.5">·</span>
+                            <span>{invoice.label}</span>
+                          </>
+                        )}
+                      </div>
+                      <Link href={`/purchase-orders/${po.id}`} className="inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline">
+                        View
+                        <ChevronRight className="h-4 w-4" />
+                      </Link>
+                    </div>
+                  </MobileRecordCard>
+                )
+              })}
+            </MobileRecordList>
+          )}
+          desktop={(
+            <Table containerClassName="max-h-[calc(100vh-16rem)] rounded-md border" className="min-w-[700px]">
+              <TableHeader className="bg-muted/50">
+                <TableRow>
+                  {visCols.map((c) => (
+                    <TableHead key={c.key} className={c.align === 'right' ? 'text-right' : undefined}>
+                      {c.label}
+                    </TableHead>
+                  ))}
+                  <TableHead className="w-8" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {filtered.map((po) => (
+                  <TableRow key={po.id}>
+                    {visCols.map((c) => renderCell(c.key, po))}
+                    <TableCell>
+                      <Link href={`/purchase-orders/${po.id}`}>
+                        <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                      </Link>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        />
       )}
 
       {/* Column picker dialog */}

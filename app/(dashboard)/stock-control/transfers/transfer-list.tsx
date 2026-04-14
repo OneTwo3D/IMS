@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Card } from '@/components/ui/card'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
+import { MobileRecordCard, MobileRecordField, MobileRecordList, ResponsiveTableLayout } from '@/components/ui/mobile-records'
 import {
   dispatchTransfer,
   receiveTransfer,
@@ -406,30 +407,48 @@ export function TransferList({ transfers, warehouses, products, stockLevels, onT
         )}
       </div>
 
-      <Table className="min-w-[700px]">
-        <TableHeader className="bg-muted/20">
-          <TableRow>
-            <TableHead className="text-xs">Reference</TableHead>
-            <TableHead className="text-xs">Route</TableHead>
-            <TableHead className="text-xs">Status</TableHead>
-            <TableHead className="text-xs">Date</TableHead>
-            <TableHead className="text-xs">Actions</TableHead>
-            <TableHead className="w-8" />
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {visible.map((t) => (
-            <TransferCard
-              key={t.id}
-              transfer={t}
-              warehouses={warehouses}
-              products={products}
-              stockLevels={stockLevels}
-              onUpdated={onTransferUpdated}
-            />
-          ))}
-        </TableBody>
-      </Table>
+      <ResponsiveTableLayout
+        mobile={(
+          <MobileRecordList className="p-3">
+            {visible.map((transfer) => (
+              <MobileTransferCard
+                key={transfer.id}
+                transfer={transfer}
+                warehouses={warehouses}
+                products={products}
+                stockLevels={stockLevels}
+                onUpdated={onTransferUpdated}
+              />
+            ))}
+          </MobileRecordList>
+        )}
+        desktop={(
+          <Table className="min-w-[700px]">
+            <TableHeader className="bg-muted/20">
+              <TableRow>
+                <TableHead className="text-xs">Reference</TableHead>
+                <TableHead className="text-xs">Route</TableHead>
+                <TableHead className="text-xs">Status</TableHead>
+                <TableHead className="text-xs">Date</TableHead>
+                <TableHead className="text-xs">Actions</TableHead>
+                <TableHead className="w-8" />
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {visible.map((t) => (
+                <TransferCard
+                  key={t.id}
+                  transfer={t}
+                  warehouses={warehouses}
+                  products={products}
+                  stockLevels={stockLevels}
+                  onUpdated={onTransferUpdated}
+                />
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      />
 
       {collapsed && transfers.length > 10 && (
         <div className="px-4 py-2 text-center">
@@ -440,5 +459,138 @@ export function TransferList({ transfers, warehouses, products, stockLevels, onT
         </div>
       )}
     </Card>
+  )
+}
+
+function MobileTransferCard({
+  transfer: initial,
+  warehouses,
+  products,
+  stockLevels,
+  onUpdated,
+}: {
+  transfer: TransferRow
+  warehouses: Warehouse[]
+  products: ProductRow[]
+  stockLevels: StockLevels
+  onUpdated: (t: TransferRow) => void
+}) {
+  const imageMap = new Map(products.map((p) => [p.id, p.imageUrl]))
+  const [transfer, setTransfer] = useState(initial)
+  const [expanded, setExpanded] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const [actioning, setActioning] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
+
+  async function handleDispatch() {
+    setActioning(true); setActionError(null)
+    const res = await dispatchTransfer(transfer.id)
+    setActioning(false)
+    if (res.success) {
+      const next = { ...transfer, status: 'IN_TRANSIT' as const }
+      setTransfer(next)
+      onUpdated(next)
+    } else setActionError(res.message ?? 'Failed.')
+  }
+
+  async function handleReceive() {
+    setActioning(true); setActionError(null)
+    const res = await receiveTransfer(transfer.id)
+    setActioning(false)
+    if (res.success) {
+      const next = { ...transfer, status: 'RECEIVED' as const }
+      setTransfer(next)
+      onUpdated(next)
+    } else setActionError(res.message ?? 'Failed.')
+  }
+
+  async function handleCancel() {
+    setActioning(true); setActionError(null)
+    const res = await cancelTransfer(transfer.id)
+    setActioning(false)
+    if (res.success) {
+      const next = { ...transfer, status: 'CANCELLED' as const }
+      setTransfer(next)
+      onUpdated(next)
+    } else setActionError(res.message ?? 'Failed.')
+  }
+
+  return (
+    <MobileRecordCard>
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <p className="font-mono text-sm font-medium">{transfer.reference}</p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            {transfer.fromWarehouseCode} → {transfer.toWarehouseCode}
+          </p>
+        </div>
+        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[transfer.status]}`}>
+          {STATUS_LABEL[transfer.status]}
+        </span>
+      </div>
+
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <MobileRecordField label="Date" value={formatDate(transfer.createdAt)} />
+        <MobileRecordField label="Lines" value={`${transfer.lines.length}`} />
+      </div>
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        {transfer.status === 'DRAFT' && (
+          <>
+            <Button size="sm" variant="outline" className="h-8 text-xs gap-1" onClick={handleDispatch} disabled={actioning}>
+              <Truck className="h-3 w-3" /> Dispatch
+            </Button>
+            <Button size="sm" variant="outline" className="h-8 text-xs gap-1" onClick={() => { setEditing((v) => !v); setExpanded(true) }}>
+              <Pencil className="h-3 w-3" /> Edit
+            </Button>
+            <Button size="sm" variant="ghost" className="h-8 text-xs text-destructive" onClick={handleCancel} disabled={actioning}>
+              <Ban className="h-3 w-3" /> Cancel
+            </Button>
+          </>
+        )}
+        {transfer.status === 'IN_TRANSIT' && (
+          <Button size="sm" variant="outline" className="h-8 text-xs gap-1 text-green-700 border-green-300 hover:bg-green-50 dark:text-green-400 dark:border-green-700 dark:hover:bg-green-950" onClick={handleReceive} disabled={actioning}>
+            <PackageCheck className="h-3 w-3" /> Mark Received
+          </Button>
+        )}
+        <Button size="sm" variant="ghost" className="h-8 text-xs" onClick={() => { setExpanded((v) => !v); if (editing) setEditing(false) }}>
+          {expanded ? <ChevronUp className="h-3.5 w-3.5 mr-1" /> : <ChevronDown className="h-3.5 w-3.5 mr-1" />}
+          {expanded ? 'Hide Lines' : 'Show Lines'}
+        </Button>
+      </div>
+
+      {actionError && <p className="mt-2 text-xs text-destructive">{actionError}</p>}
+
+      {expanded && !editing && (
+        <div className="mt-3 space-y-2 border-t border-border pt-3">
+          {transfer.notes && <p className="text-xs text-muted-foreground italic">{transfer.notes}</p>}
+          {transfer.lines.map((line) => (
+            <div key={line.id} className="flex items-center gap-3 rounded-md bg-muted/40 px-2.5 py-2">
+              <ProductThumb productId={line.productId} imageUrl={imageMap.get(line.productId) ?? null} name={line.productName} />
+              <div className="min-w-0 flex-1">
+                <ProductLink productId={line.productId} sku={line.sku} name={line.productName} skuClassName="font-mono text-xs font-medium" />
+              </div>
+              <div className="text-right text-xs font-mono">
+                <div>{line.qty}</div>
+                <div className={line.qtyReceived >= line.qty ? 'text-green-600' : 'text-muted-foreground'}>{line.qtyReceived} rec</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {editing && transfer.status === 'DRAFT' && (
+        <div className="mt-3 border-t border-border pt-3">
+          <EditDraftForm
+            transfer={transfer}
+            warehouses={warehouses}
+            products={products}
+            stockLevels={stockLevels}
+            onSaved={(updated) => { setTransfer(updated); onUpdated(updated); setEditing(false) }}
+            onCancel={() => setEditing(false)}
+          />
+        </div>
+      )}
+    </MobileRecordCard>
   )
 }

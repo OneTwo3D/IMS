@@ -9,6 +9,7 @@ import { Input } from '@/components/ui/input'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuCheckboxItem } from '@/components/ui/dropdown-menu'
+import { MobileRecordCard, MobileRecordField, MobileRecordList, ResponsiveTableLayout } from '@/components/ui/mobile-records'
 import { ChevronRight, Search, Settings2, Filter } from 'lucide-react'
 import { countryName } from '@/lib/countries'
 
@@ -353,7 +354,7 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
             ))}
           </DropdownMenuContent>
         </DropdownMenu>
-        <Button variant="outline" size="sm" className="h-8" onClick={openColPicker} title="Column settings">
+        <Button variant="outline" size="sm" className="hidden h-8 md:inline-flex" onClick={openColPicker} title="Column settings">
           <Settings2 className="h-4 w-4" />
         </Button>
       </div>
@@ -363,30 +364,83 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
       ) : filtered.length === 0 ? (
         <p className="text-sm text-muted-foreground py-8 text-center">No sales orders found.</p>
       ) : (
-        <Table containerClassName="max-h-[calc(100vh-16rem)] rounded-md border" className="min-w-[700px]">
-          <TableHeader className="bg-muted/50">
-            <TableRow>
-              {visCols.map((c) => (
-                <TableHead key={c.key} className={c.align === 'right' ? 'text-right' : undefined}>
-                  {c.label}
-                </TableHead>
-              ))}
-              <TableHead className="w-8" />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {filtered.map((so) => (
-              <TableRow key={so.id}>
-                {visCols.map((c) => renderCell(c.key, so))}
-                <TableCell>
-                  <Link href={`/sales/${so.id}`}>
-                    <ChevronRight className="h-4 w-4 text-muted-foreground" />
-                  </Link>
-                </TableCell>
-              </TableRow>
-            ))}
-          </TableBody>
-        </Table>
+        <ResponsiveTableLayout
+          mobile={(
+            <MobileRecordList>
+              {filtered.map((so) => {
+                const invoice = invoiceStatus(so)
+                return (
+                  <MobileRecordCard key={so.id}>
+                    <div className="flex items-start justify-between gap-3">
+                      <div className="min-w-0 flex-1">
+                        <Link href={`/sales/${so.id}`} className="font-mono text-sm font-medium text-primary hover:underline">
+                          {so.wcOrderNumber ?? so.id.slice(0, 8)}
+                        </Link>
+                        <p className="mt-1 text-sm font-medium leading-tight">{so.customerName ?? '—'}</p>
+                        {so.customerEmail && (
+                          <p className="mt-0.5 text-xs text-muted-foreground break-all">{so.customerEmail}</p>
+                        )}
+                      </div>
+                      <div className="flex flex-col items-end gap-2">
+                        <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[so.status]}`}>
+                          {STATUS_LABELS[so.status]}
+                        </span>
+                        <span className="text-sm font-semibold tabular-nums">
+                          {so.totalForeign.toFixed(2)}{sym(so.currency)}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="mt-3 grid grid-cols-2 gap-2">
+                      <MobileRecordField label="Warehouse" value={so.shipFromWarehouseName ?? '—'} />
+                      <MobileRecordField label="Created" value={timeAgo(so.createdAt)} />
+                      <MobileRecordField label="Items" value={so.lineCount} />
+                      <MobileRecordField label="Invoice" value={invoice.label} />
+                    </div>
+
+                    <div className="mt-3 flex items-center justify-between gap-3 border-t border-border pt-3">
+                      <div className="min-w-0 text-xs text-muted-foreground">
+                        <span>{so.shippingCountryCode ? countryName(so.shippingCountryCode) : 'No country'}</span>
+                        <span className="mx-1.5">·</span>
+                        <span>{stockStatus(so.status)}</span>
+                      </div>
+                      <Link href={`/sales/${so.id}`} className="inline-flex items-center gap-1 text-sm font-medium text-primary hover:underline">
+                        View
+                        <ChevronRight className="h-4 w-4" />
+                      </Link>
+                    </div>
+                  </MobileRecordCard>
+                )
+              })}
+            </MobileRecordList>
+          )}
+          desktop={(
+            <Table containerClassName="max-h-[calc(100vh-16rem)] rounded-md border" className="min-w-[700px]">
+              <TableHeader className="bg-muted/50">
+                <TableRow>
+                  {visCols.map((c) => (
+                    <TableHead key={c.key} className={c.align === 'right' ? 'text-right' : undefined}>
+                      {c.label}
+                    </TableHead>
+                  ))}
+                  <TableHead className="w-8" />
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {filtered.map((so) => (
+                  <TableRow key={so.id}>
+                    {visCols.map((c) => renderCell(c.key, so))}
+                    <TableCell>
+                      <Link href={`/sales/${so.id}`}>
+                        <ChevronRight className="h-4 w-4 text-muted-foreground" />
+                      </Link>
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          )}
+        />
       )}
 
       {/* Column picker dialog */}
