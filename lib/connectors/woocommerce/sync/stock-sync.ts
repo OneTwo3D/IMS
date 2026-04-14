@@ -43,11 +43,13 @@ import {
   WC_SETTINGS_VERSION_KEY,
 } from '../sync-lock'
 import type { ConnectorCredentials } from '../../types'
-import type { WcFullProduct, StockSyncResult } from './types'
+import type { WcFullProduct, StockSyncResult, WcVariation } from './types'
 
 const SKU_LOOKUP_CONCURRENCY = 8
 const WC_BATCH_SIZE = 100
 const PREFLIGHT_PAGE_SIZE = 100
+const WC_PUSH_BATCH_TX_TIMEOUT_MS = 15000
+const WC_VARIATION_BATCH_SIZE = 100
 
 /**
  * `wcFetch` uses bare `fetch(...)` + `AbortSignal.timeout(...)` with no
@@ -244,6 +246,24 @@ type PushEntry = {
   }
 }
 
+type VariantPushEntry = PushEntry & {
+  parentWcId: number
+}
+
+type EffectiveTarget = {
+  wcId: number
+  parentWcId?: number
+}
+
+type CandidateProduct = {
+  id: string
+  sku: string
+  type: 'SIMPLE' | 'VARIANT' | 'KIT' | 'BOM'
+  wcProductId: bigint | null
+  parent: { sku: string } | null
+  productComponents: { componentId: string; qty: Prisma.Decimal }[]
+}
+
 type WcBatchUpdateItem = {
   id: number
   sku?: string
@@ -300,12 +320,8 @@ async function pushBatchWithFence(
   | { status: 'batch_error'; error: string }
   | { status: 'ok'; outcome: BatchReconcileOutcome }
 > {
-  return db.$transaction(async (tx) => {
-    // Hold the same advisory lock across the version check, outbound POST,
-    // and any cache invalidation so a credential rebind cannot commit in the
-    // narrow window between "version still matches" and request dispatch.
+  const precheck = await db.$transaction(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
-
     const versionRow = await tx.setting.findUnique({
       where: { key: WC_SETTINGS_VERSION_KEY },
     })
@@ -313,15 +329,31 @@ async function pushBatchWithFence(
     if (currentVersion !== expectedVersion) {
       return { status: 'version_changed' as const, currentVersion }
     }
+    return { status: 'ok' as const }
+  }, {
+    timeout: WC_PUSH_BATCH_TX_TIMEOUT_MS,
+  })
+  if (precheck.status === 'version_changed') {
+    return precheck
+  }
 
-    const { data, error } = await safeWcPost('/products/batch', {
-      update: batch.map((e) => e.payload),
-    }, creds)
+  const { data, error } = await safeWcPost('/products/batch', {
+    update: batch.map((e) => e.payload),
+  }, creds)
 
-    if (error) {
-      return { status: 'batch_error' as const, error }
+  if (error) {
+    return { status: 'batch_error' as const, error }
+  }
+
+  return db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
+    const versionRow = await tx.setting.findUnique({
+      where: { key: WC_SETTINGS_VERSION_KEY },
+    })
+    const currentVersion = versionRow?.value ?? '0'
+    if (currentVersion !== expectedVersion) {
+      return { status: 'version_changed' as const, currentVersion }
     }
-
     const outcome = await reconcileBatchResponse(tx, batch, data)
 
     for (const entry of outcome.successEntries) {
@@ -338,6 +370,8 @@ async function pushBatchWithFence(
     }
 
     return { status: 'ok' as const, outcome }
+  }, {
+    timeout: WC_PUSH_BATCH_TX_TIMEOUT_MS,
   })
 }
 
@@ -397,23 +431,51 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
 
   const stockLevels = await db.stockLevel.findMany({
     where: { warehouseId: { in: whIds } },
-    select: { productId: true, quantity: true, reservedQty: true },
+    select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
   })
 
   const stockByProduct = new Map<string, number>()
+  const stockByProductWarehouse = new Map<string, Map<string, number>>()
   for (const sl of stockLevels) {
     const available = Math.max(0, Number(sl.quantity) - Number(sl.reservedQty))
     stockByProduct.set(sl.productId, (stockByProduct.get(sl.productId) ?? 0) + available)
+    const byWarehouse = stockByProductWarehouse.get(sl.productId) ?? new Map<string, number>()
+    byWarehouse.set(sl.warehouseId, available)
+    stockByProductWarehouse.set(sl.productId, byWarehouse)
   }
 
   const cogsSetting = await db.setting.findUnique({ where: { key: 'wc_cogs_sync_enabled' } })
   const cogsSyncEnabled = cogsSetting?.value === 'true'
 
-  const productIds = [...stockByProduct.keys()]
-  const products = await db.product.findMany({
-    where: { id: { in: productIds }, sku: { not: '' } },
-    select: { id: true, sku: true, wcProductId: true },
+  const physicalProductIds = [...new Set(stockLevels.map((sl) => sl.productId))]
+  const rawProducts = await db.product.findMany({
+    where: {
+      active: true,
+      sku: { not: '' },
+      OR: [
+        { id: { in: physicalProductIds } },
+        { type: 'KIT', productComponents: { some: {} } },
+      ],
+    },
+    select: {
+      id: true,
+      sku: true,
+      type: true,
+      wcProductId: true,
+      parent: { select: { sku: true } },
+      productComponents: { select: { componentId: true, qty: true } },
+    },
   })
+  const products = rawProducts.filter(
+    (p): p is CandidateProduct => p.type !== 'VARIABLE' && p.type !== 'NON_INVENTORY',
+  )
+  const availableByProduct = new Map<string, number>()
+  for (const product of products) {
+    const available = product.type === 'KIT'
+      ? computeKitAvailability(product.productComponents, whIds, stockByProductWarehouse)
+      : (stockByProduct.get(product.id) ?? 0)
+    availableByProduct.set(product.id, available)
+  }
 
   const result: StockSyncResult = {
     synced: 0, skipped: 0, errors: [],
@@ -437,13 +499,15 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
   // any realistic WC post id, so we downcast to `number` at the Prisma read
   // boundary and keep the rest of the sync pipeline in `number` for easy
   // JSON serialization, Map keying, and comparison with the WC response.
-  const effectiveWcId = new Map<string, number>()
+  const effectiveTargets = new Map<string, EffectiveTarget>()
   for (const p of products) {
-    if (p.wcProductId != null) effectiveWcId.set(p.id, Number(p.wcProductId))
+    if (p.wcProductId != null && p.type !== 'VARIANT') {
+      effectiveTargets.set(p.id, { wcId: Number(p.wcProductId) })
+    }
   }
 
   // -------- SKU resolution for uncached products --------
-  const needsResolution = products.filter((p) => p.wcProductId == null)
+  const needsResolution = products.filter((p) => p.wcProductId == null || p.type === 'VARIANT')
   const unmatchedSkus: string[] = []
 
   // Set to `true` by any caller that observes a version bump and wants
@@ -455,7 +519,7 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
 
   if (needsResolution.length > 0) {
     const { resolved, errors: lookupErrors, totalAttempts, failedAttempts } =
-      await resolveSkusInParallel(needsResolution.map((p) => p.sku), creds)
+      await resolveSkusInParallel(needsResolution, creds)
 
     // If every single lookup call failed, treat as a WC outage — bail hard.
     if (totalAttempts > 0 && failedAttempts === totalAttempts) {
@@ -483,9 +547,9 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
     }
 
     for (const p of needsResolution) {
-      if (failedLookupSkus.has(p.sku)) continue // transient error — not a real miss
-      const wcId = resolved.get(p.sku)
-      if (wcId == null) {
+      if (failedLookupSkus.has(p.sku)) continue
+      const target = resolved.get(p.sku)
+      if (target == null) {
         unmatchedSkus.push(p.sku)
         continue
       }
@@ -500,9 +564,9 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
       // this sync started, the write refuses and we stop resolving
       // further products — anything we'd write would target a store
       // we're no longer connected to.
-      const outcome = await persistMappingIfVersionMatches(p.id, wcId, syncVersion)
+      const outcome = await persistMappingIfVersionMatches(p.id, target.wcId, syncVersion)
       if (outcome.ok) {
-        effectiveWcId.set(p.id, wcId)
+        effectiveTargets.set(p.id, target)
       } else if (outcome.reason === 'version_changed') {
         versionBumpedMidRun = true
         result.errors.push(
@@ -511,7 +575,7 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
         break
       } else {
         result.errors.push(
-          `wcProductId collision: could not persist ${wcId} for IMS product ${p.id} (SKU ${p.sku}): ${outcome.error}`,
+          `wcProductId collision: could not persist ${target.wcId} for IMS product ${p.id} (SKU ${p.sku}): ${outcome.error}`,
         )
       }
     }
@@ -533,29 +597,25 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
 
   // -------- In-memory collision dedupe --------
   const wcIdUsers = new Map<number, string[]>()
-  for (const [pid, wcId] of effectiveWcId) {
-    const list = wcIdUsers.get(wcId) ?? []
+  for (const [pid, target] of effectiveTargets) {
+    const list = wcIdUsers.get(target.wcId) ?? []
     list.push(pid)
-    wcIdUsers.set(wcId, list)
+    wcIdUsers.set(target.wcId, list)
   }
   for (const [wcId, pids] of wcIdUsers) {
     if (pids.length > 1) {
       result.errors.push(
         `wcProductId ${wcId} is mapped to ${pids.length} IMS products (${pids.join(', ')}); skipping all to avoid overwrite`,
       )
-      for (const pid of pids) effectiveWcId.delete(pid)
+      for (const pid of pids) effectiveTargets.delete(pid)
     }
   }
 
   // -------- Preflight: validate cached ids against live WC catalog --------
-  // For every id currently in effectiveWcId we fetch the live WC product and
-  // confirm its SKU still matches what we expect. Drifted ids are cleared
-  // BEFORE we ever build a push payload.
   const skuByProduct = new Map(products.map((p) => [p.id, p.sku]))
-  const preflightIds = [...new Set(effectiveWcId.values())]
-  if (preflightIds.length > 0) {
-    const { verified, checkedIds, outageDetected, preflightErrors } =
-      await preflightCachedIds(preflightIds, creds)
+  if (effectiveTargets.size > 0) {
+    const { verifiedByProductId, checkedProductIds, outageDetected, preflightErrors } =
+      await preflightEffectiveTargets(products, effectiveTargets, creds)
 
     if (outageDetected) {
       result.errors.push(...preflightErrors.map((e) => `preflight failure: ${e}`))
@@ -582,12 +642,13 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
     // because its page errored out is *unknown*, not *deleted*, and must
     // NOT be cleared — otherwise a single transient transport failure can
     // wipe every wcProductId on that page.
-    for (const [pid, wcId] of [...effectiveWcId.entries()]) {
+    for (const [pid, target] of [...effectiveTargets.entries()]) {
       const expectedSku = skuByProduct.get(pid)
-      const actualSku = verified.get(wcId)
+      const wcId = target.wcId
+      const actualSku = verifiedByProductId.get(pid)
 
       if (actualSku === undefined) {
-        if (checkedIds.has(wcId)) {
+        if (checkedProductIds.has(pid)) {
           const invalidation = await invalidateMappingIfVersionMatches(
             { productId: pid, sku: expectedSku ?? '', wcId },
             syncVersion,
@@ -628,7 +689,7 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
             `preflight incomplete for IMS ${pid} (SKU ${expectedSku ?? '?'}, WC ${wcId}): page fetch failed, mapping preserved for next run`,
           )
         }
-        effectiveWcId.delete(pid)
+        effectiveTargets.delete(pid)
         if (versionBumpedMidRun) break
         continue
       }
@@ -665,7 +726,7 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
         } else {
           result.errors.push(`Failed to clear stale wcProductId for ${pid}: ${invalidation.error}`)
         }
-        effectiveWcId.delete(pid)
+        effectiveTargets.delete(pid)
         if (versionBumpedMidRun) break
       }
     }
@@ -673,7 +734,7 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
 
   // -------- Count matched/unmatched from final effective state --------
   for (const p of products) {
-    if (effectiveWcId.has(p.id)) result.matched++
+    if (effectiveTargets.has(p.id)) result.matched++
     else if (!result.errors.some((msg) => msg.includes(`SKU ${p.sku}`))) {
       // Only count as "unmatched" if there wasn't a lookup/drift error for this SKU.
       // Those are counted as errors, not catalog mismatches.
@@ -685,7 +746,7 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
   const cogsByProduct = new Map<string, number>()
   if (cogsSyncEnabled) {
     for (const product of products) {
-      if (!effectiveWcId.has(product.id)) continue
+      if (!effectiveTargets.has(product.id)) continue
       const oldestLayer = await db.costLayer.findFirst({
         where: { productId: product.id, remainingQty: { gt: 0 } },
         orderBy: { receivedAt: 'asc' },
@@ -699,15 +760,16 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
 
   // -------- Build push entries --------
   const pushEntries: PushEntry[] = []
+  const variantPushEntries: VariantPushEntry[] = []
   for (const product of products) {
-    const wcId = effectiveWcId.get(product.id)
-    if (wcId == null) {
+    const target = effectiveTargets.get(product.id)
+    if (target == null) {
       if (!result.errors.some((m) => m.includes(product.id))) result.skipped++
       continue
     }
-    const available = stockByProduct.get(product.id) ?? 0
+    const available = availableByProduct.get(product.id) ?? 0
     const payload: PushEntry['payload'] = {
-      id: wcId,
+      id: target.wcId,
       stock_quantity: Math.floor(available),
       manage_stock: true,
     }
@@ -715,10 +777,20 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
     if (cogs !== undefined) {
       payload.cost_of_goods_sold = { values: [{ defined_value: cogs.toFixed(2) }] }
     }
-    pushEntries.push({ productId: product.id, sku: product.sku, wcId, payload })
+    if (product.type === 'VARIANT' && target.parentWcId != null) {
+      variantPushEntries.push({
+        productId: product.id,
+        sku: product.sku,
+        wcId: target.wcId,
+        parentWcId: target.parentWcId,
+        payload,
+      })
+    } else {
+      pushEntries.push({ productId: product.id, sku: product.sku, wcId: target.wcId, payload })
+    }
   }
 
-  if (pushEntries.length === 0) {
+  if (pushEntries.length === 0 && variantPushEntries.length === 0) {
     const reason = result.errors.length > 0
       ? 'errors during preflight/resolution'
       : 'no WooCommerce-matched products'
@@ -763,6 +835,7 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
         description: `Stock sync aborted mid-push: WC settings version changed (${syncVersion} → ${batchOutcome.currentVersion})`,
         metadata: { remaining, pushedBeforeAbort: result.synced },
       })
+      versionBumpedMidRun = true
       break
     }
 
@@ -786,6 +859,60 @@ export async function pushStockToWc(): Promise<StockSyncResult> {
           reason: invalidation.reason,
         },
       })
+    }
+  }
+
+  if (!versionBumpedMidRun) {
+    const byParent = new Map<number, VariantPushEntry[]>()
+    for (const entry of variantPushEntries) {
+      const list = byParent.get(entry.parentWcId) ?? []
+      list.push(entry)
+      byParent.set(entry.parentWcId, list)
+    }
+
+    let processedVariantEntries = 0
+    for (const group of byParent.values()) {
+      for (let i = 0; i < group.length; i += WC_VARIATION_BATCH_SIZE) {
+        const batch = group.slice(i, i + WC_VARIATION_BATCH_SIZE)
+        const outcome = await pushVariantBatchWithFence(batch, creds, syncVersion)
+        if (outcome.status === 'version_changed') {
+          const remaining = variantPushEntries.length - processedVariantEntries
+          result.errors.push(
+            `WooCommerce credentials were rebound mid-run — aborted ${remaining} remaining variation push(es) to avoid pushing to a disconnected store`,
+          )
+          await logActivity({
+            entityType: 'SYNC', action: 'stock_sync', tag: 'sync', level: 'WARNING',
+            description: `Stock sync aborted mid-variation-push: WC settings version changed (${syncVersion} → ${outcome.currentVersion})`,
+            metadata: { remaining, pushedBeforeAbort: result.synced },
+          })
+          versionBumpedMidRun = true
+          break
+        }
+        if (outcome.status === 'push_error') {
+          result.errors.push(`variation batch push ${batch[0]?.parentWcId ?? 'unknown'}: ${outcome.error}`)
+          processedVariantEntries += batch.length
+          continue
+        }
+
+        if (outcome.outcome.successEntries.length > 0) result.pushed = true
+        result.synced += outcome.outcome.successEntries.length
+        result.skipped += outcome.outcome.skipped
+        result.errors.push(...outcome.outcome.errors)
+
+        for (const invalidation of outcome.outcome.invalidations) {
+          await logActivity({
+            entityType: 'SYNC', action: 'stock_sync', tag: 'sync', level: 'WARNING',
+            description: `Cleared stale WooCommerce mapping for SKU ${invalidation.sku}`,
+            metadata: {
+              productId: invalidation.productId,
+              wcId: invalidation.wcId,
+              reason: invalidation.reason,
+            },
+          })
+        }
+        processedVariantEntries += batch.length
+      }
+      if (versionBumpedMidRun) break
     }
   }
 
@@ -841,6 +968,8 @@ async function preflightCachedIds(
   checkedIds: Set<number>
   outageDetected: boolean
   preflightErrors: string[]
+  attempts: number
+  failedAttempts: number
 }> {
   const verified = new Map<number, string>()
   const checkedIds = new Set<number>()
@@ -875,6 +1004,8 @@ async function preflightCachedIds(
     checkedIds,
     outageDetected: pages > 0 && failedPages === pages,
     preflightErrors,
+    attempts: pages,
+    failedAttempts: failedPages,
   }
 }
 
@@ -1012,6 +1143,211 @@ async function recordAttempt() {
   })
 }
 
+function computeKitAvailability(
+  components: CandidateProduct['productComponents'],
+  warehouseIds: string[],
+  stockByProductWarehouse: Map<string, Map<string, number>>,
+): number {
+  if (components.length === 0) return 0
+
+  let total = 0
+  for (const warehouseId of warehouseIds) {
+    let kitsInWarehouse = Infinity
+    for (const component of components) {
+      const required = Number(component.qty)
+      if (required <= 0) {
+        kitsInWarehouse = 0
+        break
+      }
+      const available = Math.max(0, stockByProductWarehouse.get(component.componentId)?.get(warehouseId) ?? 0)
+      kitsInWarehouse = Math.min(kitsInWarehouse, Math.floor(available / required))
+    }
+    total += kitsInWarehouse === Infinity ? 0 : kitsInWarehouse
+  }
+
+  return total
+}
+
+async function preflightEffectiveTargets(
+  products: CandidateProduct[],
+  effectiveTargets: Map<string, EffectiveTarget>,
+  creds: ConnectorCredentials,
+): Promise<{
+  verifiedByProductId: Map<string, string>
+  checkedProductIds: Set<string>
+  outageDetected: boolean
+  preflightErrors: string[]
+}> {
+  const productById = new Map(products.map((product) => [product.id, product]))
+  const verifiedByProductId = new Map<string, string>()
+  const checkedProductIds = new Set<string>()
+  const preflightErrors: string[] = []
+
+  let totalAttempts = 0
+  let failedAttempts = 0
+
+  const standardEntries: { productId: string; wcId: number }[] = []
+  const variantEntries: { productId: string; wcId: number; parentWcId: number }[] = []
+  for (const [productId, target] of effectiveTargets) {
+    const product = productById.get(productId)
+    if (!product) continue
+    if (product.type === 'VARIANT' && target.parentWcId != null) {
+      variantEntries.push({ productId, wcId: target.wcId, parentWcId: target.parentWcId })
+    } else {
+      standardEntries.push({ productId, wcId: target.wcId })
+    }
+  }
+
+  if (standardEntries.length > 0) {
+    const standard = await preflightCachedIds(
+      [...new Set(standardEntries.map((entry) => entry.wcId))],
+      creds,
+    )
+    totalAttempts += standard.attempts
+    failedAttempts += standard.failedAttempts
+    preflightErrors.push(...standard.preflightErrors)
+
+    const productIdsByWcId = new Map<number, string[]>()
+    for (const entry of standardEntries) {
+      const list = productIdsByWcId.get(entry.wcId) ?? []
+      list.push(entry.productId)
+      productIdsByWcId.set(entry.wcId, list)
+    }
+
+    for (const [wcId, productIds] of productIdsByWcId) {
+      if (standard.checkedIds.has(wcId)) {
+        for (const productId of productIds) checkedProductIds.add(productId)
+      }
+      const sku = standard.verified.get(wcId)
+      if (sku !== undefined) {
+        for (const productId of productIds) verifiedByProductId.set(productId, sku)
+      }
+    }
+  }
+
+  const variantEntriesByParent = new Map<number, typeof variantEntries>()
+  for (const entry of variantEntries) {
+    const list = variantEntriesByParent.get(entry.parentWcId) ?? []
+    list.push(entry)
+    variantEntriesByParent.set(entry.parentWcId, list)
+  }
+
+  for (const [parentWcId, entries] of variantEntriesByParent) {
+    for (let i = 0; i < entries.length; i += PREFLIGHT_PAGE_SIZE) {
+      totalAttempts++
+      const batch = entries.slice(i, i + PREFLIGHT_PAGE_SIZE)
+      const ids = batch.map((entry) => entry.wcId)
+      const { data, error } = await safeWcFetch(
+        `/products/${parentWcId}/variations`,
+        { include: ids.join(','), per_page: String(PREFLIGHT_PAGE_SIZE) },
+        creds,
+      )
+      if (error) {
+        failedAttempts++
+        const sampleSku = productById.get(batch[0]?.productId ?? '')?.sku ?? String(parentWcId)
+        preflightErrors.push(`variant group ${sampleSku}: ${error}`)
+        continue
+      }
+
+      const variations = Array.isArray(data) ? (data as WcVariation[]) : []
+      const verifiedByWcId = new Map<number, string>()
+      for (const variation of variations) {
+        if (typeof variation.id === 'number' && typeof variation.sku === 'string') {
+          verifiedByWcId.set(variation.id, variation.sku)
+        }
+      }
+
+      for (const entry of batch) {
+        checkedProductIds.add(entry.productId)
+        const sku = verifiedByWcId.get(entry.wcId)
+        if (sku !== undefined) {
+          verifiedByProductId.set(entry.productId, sku)
+        }
+      }
+    }
+  }
+
+  return {
+    verifiedByProductId,
+    checkedProductIds,
+    outageDetected: totalAttempts > 0 && failedAttempts === totalAttempts,
+    preflightErrors,
+  }
+}
+
+async function pushVariantBatchWithFence(
+  entries: VariantPushEntry[],
+  creds: ConnectorCredentials,
+  expectedVersion: string,
+): Promise<
+  | { status: 'version_changed'; currentVersion: string }
+  | { status: 'push_error'; error: string }
+  | { status: 'ok'; outcome: BatchReconcileOutcome }
+> {
+  const parentWcId = entries[0]?.parentWcId
+  if (parentWcId == null) {
+    return { status: 'push_error', error: 'variant batch missing parent Woo id' }
+  }
+
+  const precheck = await db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
+    const versionRow = await tx.setting.findUnique({
+      where: { key: WC_SETTINGS_VERSION_KEY },
+    })
+    const currentVersion = versionRow?.value ?? '0'
+    if (currentVersion !== expectedVersion) {
+      return { status: 'version_changed' as const, currentVersion }
+    }
+    return { status: 'ok' as const }
+  }, {
+    timeout: WC_PUSH_BATCH_TX_TIMEOUT_MS,
+  })
+  if (precheck.status === 'version_changed') {
+    return precheck
+  }
+
+  const { data, error } = await safeWcPost(
+    `/products/${parentWcId}/variations/batch`,
+    { update: entries.map((entry) => entry.payload) },
+    creds,
+  )
+  if (error) {
+    return { status: 'push_error' as const, error }
+  }
+
+  return db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
+    const versionRow = await tx.setting.findUnique({
+      where: { key: WC_SETTINGS_VERSION_KEY },
+    })
+    const currentVersion = versionRow?.value ?? '0'
+    if (currentVersion !== expectedVersion) {
+      return { status: 'version_changed' as const, currentVersion }
+    }
+    const outcome = await reconcileBatchResponse(tx, entries, data)
+
+    for (const entry of outcome.successEntries) {
+      await tx.wcSyncLog.create({
+        data: {
+          direction: 'TO_WC',
+          status: 'SYNCED',
+          entityType: 'StockLevel',
+          wcId: entry.wcId,
+          payload: JSON.parse(JSON.stringify({ stock_quantity: entry.payload.stock_quantity })),
+          syncedAt: new Date(),
+        },
+      })
+    }
+
+    return {
+      status: 'ok' as const,
+      outcome,
+    }
+  }, {
+    timeout: WC_PUSH_BATCH_TX_TIMEOUT_MS,
+  })
+}
+
 /**
  * Resolve SKUs → WC product ids with bounded parallelism.
  * Returns both resolved ids and any transport errors so the caller can
@@ -1030,24 +1366,129 @@ async function recordAttempt() {
  * bail-out.
  */
 async function resolveSkusInParallel(
-  skus: string[],
+  products: CandidateProduct[],
   creds: ConnectorCredentials,
 ): Promise<{
-  resolved: Map<string, number>
+  resolved: Map<string, EffectiveTarget>
   errors: { sku: string; error: string }[]
   totalAttempts: number
   failedAttempts: number
 }> {
-  const resolved = new Map<string, number>()
+  const resolved = new Map<string, EffectiveTarget>()
   const errors: { sku: string; error: string }[] = []
-  let cursor = 0
   let totalAttempts = 0
   let failedAttempts = 0
 
+  const variants = products.filter((product) => product.type === 'VARIANT')
+  const standardProducts = products.filter((product) => product.type !== 'VARIANT')
+
+  const variantGroups = new Map<string, CandidateProduct[]>()
+  for (const product of variants) {
+    const parentSku = product.parent?.sku
+    if (!parentSku) {
+      errors.push({ sku: product.sku, error: 'variant has no parent SKU in IMS; cannot resolve Woo variation id' })
+      continue
+    }
+    const list = variantGroups.get(parentSku) ?? []
+    list.push(product)
+    variantGroups.set(parentSku, list)
+  }
+
+  for (const [parentSku, group] of variantGroups) {
+    totalAttempts++
+    const parentLookup = await safeWcFetch('/products', { sku: parentSku, per_page: '2' }, creds)
+    if (parentLookup.error) {
+      failedAttempts++
+      for (const product of group) {
+        errors.push({ sku: product.sku, error: `parent SKU ${parentSku}: ${parentLookup.error}` })
+      }
+      continue
+    }
+    const parents = (parentLookup.data as WcFullProduct[] | null) ?? []
+    if (parents.length === 0) continue
+    if (parents.length > 1) {
+      for (const product of group) {
+        errors.push({
+          sku: product.sku,
+          error: `ambiguous parent SKU ${parentSku} — WooCommerce returned ${parents.length}+ products`,
+        })
+      }
+      continue
+    }
+
+    const parentWcId = parents[0]?.id
+    if (typeof parentWcId !== 'number') continue
+
+    for (let i = 0; i < group.length; i += WC_VARIATION_BATCH_SIZE) {
+      const batch = group.slice(i, i + WC_VARIATION_BATCH_SIZE)
+      totalAttempts++
+      const lookup = await safeWcFetch(
+        `/products/${parentWcId}/variations`,
+        { per_page: String(WC_VARIATION_BATCH_SIZE), include: batch.map((product) => product.wcProductId != null ? Number(product.wcProductId) : 0).filter((id) => id > 0).join(',') },
+        creds,
+      )
+
+      if (!lookup.error && Array.isArray(lookup.data) && batch.every((product) => product.wcProductId != null)) {
+        const bySku = new Map<string, WcVariation[]>()
+        for (const variation of lookup.data as WcVariation[]) {
+          const list = bySku.get(variation.sku) ?? []
+          list.push(variation)
+          bySku.set(variation.sku, list)
+        }
+        for (const product of batch) {
+          const matches = bySku.get(product.sku) ?? []
+          if (matches.length === 1 && typeof matches[0]?.id === 'number') {
+            resolved.set(product.sku, { wcId: matches[0].id, parentWcId })
+          }
+        }
+        continue
+      }
+
+      totalAttempts--
+      totalAttempts++
+      const variationLookup = await safeWcFetch(
+        `/products/${parentWcId}/variations`,
+        { per_page: '100' },
+        creds,
+      )
+      if (variationLookup.error) {
+        failedAttempts++
+        for (const product of batch) {
+          errors.push({ sku: product.sku, error: variationLookup.error })
+        }
+        continue
+      }
+      const variations = (variationLookup.data as WcVariation[] | null) ?? []
+      const bySku = new Map<string, WcVariation[]>()
+      for (const variation of variations) {
+        const list = bySku.get(variation.sku) ?? []
+        list.push(variation)
+        bySku.set(variation.sku, list)
+      }
+      for (const product of batch) {
+        const matches = bySku.get(product.sku) ?? []
+        if (matches.length === 0) continue
+        if (matches.length > 1) {
+          errors.push({
+            sku: product.sku,
+            error: `ambiguous — WooCommerce returned ${matches.length}+ variations sharing this SKU under parent ${parentSku}`,
+          })
+          continue
+        }
+        const variationId = matches[0]?.id
+        if (typeof variationId === 'number') {
+          resolved.set(product.sku, { wcId: variationId, parentWcId })
+        }
+      }
+    }
+  }
+
+  let cursor = 0
   async function worker() {
-    while (cursor < skus.length) {
+    while (cursor < standardProducts.length) {
       const idx = cursor++
-      const sku = skus[idx]
+      const product = standardProducts[idx]
+      const sku = product.sku
       totalAttempts++
       const { data, error } = await safeWcFetch('/products', { sku, per_page: '2' }, creds)
       if (error) {
@@ -1056,7 +1497,7 @@ async function resolveSkusInParallel(
         continue
       }
       const wcProducts = (data as WcFullProduct[] | null) ?? []
-      if (wcProducts.length === 0) continue // genuine miss — caller treats as unmatched
+      if (wcProducts.length === 0) continue
       if (wcProducts.length > 1) {
         errors.push({
           sku,
@@ -1066,13 +1507,13 @@ async function resolveSkusInParallel(
       }
       const wcId = wcProducts[0]?.id
       if (typeof wcId === 'number') {
-        resolved.set(sku, wcId)
+        resolved.set(sku, { wcId })
       }
     }
   }
 
   const workers = Array.from(
-    { length: Math.min(SKU_LOOKUP_CONCURRENCY, skus.length) },
+    { length: Math.min(SKU_LOOKUP_CONCURRENCY, standardProducts.length) },
     () => worker(),
   )
   await Promise.all(workers)

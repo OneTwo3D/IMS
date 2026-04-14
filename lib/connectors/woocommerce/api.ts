@@ -64,7 +64,7 @@ export async function wcPost(
     method: 'POST',
     headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(120000),
   })
 
   if (!res.ok) return { data: null, error: `WC API POST error: ${res.status} ${res.statusText}` }
@@ -84,7 +84,7 @@ export async function wcPut(
     method: 'PUT',
     headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(30000),
+    signal: AbortSignal.timeout(120000),
   })
 
   if (!res.ok) return { data: null, error: `WC API PUT error: ${res.status} ${res.statusText}` }
