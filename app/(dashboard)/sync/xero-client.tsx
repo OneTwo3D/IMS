@@ -1048,7 +1048,7 @@ function DailyBatchPanel({
           <PreviewOrderList
             title="A1 contributing orders"
             rows={preview.groupA1.orders.map((o) => ({
-              id: o.id, label: o.wcOrderNumber ?? o.orderNumber, amount: o.amount,
+              id: o.id, label: o.wcOrderNumber ?? o.orderNumber ?? o.id.slice(0, 8), amount: o.amount,
             }))}
           />
         )}
@@ -1056,7 +1056,7 @@ function DailyBatchPanel({
           <PreviewOrderList
             title="A2 contributing orders"
             rows={preview.groupA2.orders.map((o) => ({
-              id: o.id, label: o.wcOrderNumber ?? o.orderNumber, amount: o.amount,
+              id: o.id, label: o.wcOrderNumber ?? o.orderNumber ?? o.id.slice(0, 8), amount: o.amount,
             }))}
           />
         )}
@@ -1225,7 +1225,7 @@ function PreviewShipmentList({ shipments }: { shipments: DailyBatchPreview['grou
             <TableBody>
               {shipments.map((s) => (
                 <TableRow key={s.id}>
-                  <TableCell className="font-mono text-xs">{s.wcOrderNumber ?? s.orderNumber}</TableCell>
+                  <TableCell className="font-mono text-xs">{s.wcOrderNumber ?? s.orderNumber ?? s.orderId.slice(0, 8)}</TableCell>
                   <TableCell className="text-right font-mono text-xs">{formatGbp(s.revenue)}</TableCell>
                   <TableCell className="text-right font-mono text-xs">{formatGbp(s.cogs)}</TableCell>
                 </TableRow>

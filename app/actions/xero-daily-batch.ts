@@ -23,7 +23,7 @@ import { requirePermission } from '@/lib/auth/server'
 
 export type DailyBatchPreviewOrder = {
   id: string
-  orderNumber: string
+  orderNumber: string | null
   wcOrderNumber: string | null
   amount: number
 }
@@ -31,7 +31,7 @@ export type DailyBatchPreviewOrder = {
 export type DailyBatchPreviewShipment = {
   id: string
   orderId: string
-  orderNumber: string
+  orderNumber: string | null
   wcOrderNumber: string | null
   revenue: number
   cogs: number
