@@ -20,20 +20,34 @@ export async function pushManualJournal(
   entry: JournalEntry,
   status: string = 'POSTED',
 ): Promise<{ success: boolean; journalId?: string; error?: string }> {
-  const journalLines = entry.lines.map((line: JournalLine) => {
-    const xeroLine: Record<string, unknown> = {
-      AccountCode: line.accountCode,
-      Description: line.description,
-    }
-    if (line.debit && line.debit > 0) xeroLine.DebitAmount = line.debit
-    if (line.credit && line.credit > 0) xeroLine.CreditAmount = line.credit
-    if (line.taxType) xeroLine.TaxType = line.taxType
-    return xeroLine
-  })
+  // Xero Manual Journal lines use a single signed `LineAmount` field
+  // (positive = debit, negative = credit). DebitAmount/CreditAmount are
+  // not accepted on ManualJournals — Xero rejects the payload with
+  // "The LineAmount field is mandatory". See:
+  // https://developer.xero.com/documentation/api/accounting/manualjournals
+  const journalLines = entry.lines
+    .map((line: JournalLine) => {
+      const debit = Number(line.debit ?? 0)
+      const credit = Number(line.credit ?? 0)
+      const signed = debit - credit
+      if (signed === 0) return null // skip zero lines — Xero would reject them
+      const xeroLine: Record<string, unknown> = {
+        LineAmount: Math.round(signed * 100) / 100,
+        AccountCode: line.accountCode,
+        Description: line.description,
+      }
+      if (line.taxType) xeroLine.TaxType = line.taxType
+      return xeroLine
+    })
+    .filter((l): l is Record<string, unknown> => l !== null)
 
-  // Validate debits = credits
-  const totalDebits = entry.lines.reduce((s, l) => s + (l.debit ?? 0), 0)
-  const totalCredits = entry.lines.reduce((s, l) => s + (l.credit ?? 0), 0)
+  if (journalLines.length === 0) {
+    return { success: false, error: 'Journal has no non-zero lines' }
+  }
+
+  // Validate debits = credits (sum of signed LineAmounts must be zero)
+  const totalDebits = entry.lines.reduce((s, l) => s + Number(l.debit ?? 0), 0)
+  const totalCredits = entry.lines.reduce((s, l) => s + Number(l.credit ?? 0), 0)
   if (Math.abs(totalDebits - totalCredits) > 0.01) {
     return { success: false, error: `Journal unbalanced: debits=${totalDebits}, credits=${totalCredits}` }
   }
