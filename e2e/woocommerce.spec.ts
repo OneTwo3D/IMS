@@ -1,13 +1,14 @@
 import { expect, test } from '@playwright/test'
+import type { Page } from '@playwright/test'
 
 const wcEnabled = process.env.E2E_WC_ENABLED === 'true'
 
-async function openWooCommerceConnector(page: Parameters<typeof test>[0]['page']) {
+async function openWooCommerceConnector(page: Page) {
   await page.goto('/sync?connector=woocommerce')
   await expect(page.getByRole('heading', { name: 'WooCommerce Connector' })).toBeVisible()
 }
 
-async function ensureWcProductAndStockSyncEnabled(page: Parameters<typeof test>[0]['page']) {
+async function ensureWcProductAndStockSyncEnabled(page: Page) {
   await page.getByRole('button', { name: 'Products' }).click()
 
   const productCheckbox = page.locator('input[type="checkbox"]').nth(0)

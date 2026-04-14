@@ -1,11 +1,12 @@
 import { expect, test } from '@playwright/test'
+import type { Page } from '@playwright/test'
 import { addStockAdjustment, createDraftSalesOrder, createSimpleProduct } from './helpers'
 
 const xeroEnabled = process.env.E2E_XERO_ENABLED === 'true'
 const XERO_WAREHOUSE_LABEL = 'CBG — Cambridge'
 const XERO_WAREHOUSE_CODE = 'CBG'
 
-async function createShippedOrderWithPendingAccounting(page: Parameters<typeof test>[0]['page']) {
+async function createShippedOrderWithPendingAccounting(page: Page) {
   const product = await createSimpleProduct(page, { price: '23.00' })
   await addStockAdjustment(page, product.sku, 3, XERO_WAREHOUSE_CODE)
   await createDraftSalesOrder(page, { sku: product.sku, warehouseLabel: XERO_WAREHOUSE_LABEL })
@@ -36,12 +37,12 @@ async function createShippedOrderWithPendingAccounting(page: Parameters<typeof t
   return { orderId }
 }
 
-async function openXeroConnector(page: Parameters<typeof test>[0]['page']) {
+async function openXeroConnector(page: Page) {
   await page.goto('/sync?connector=xero')
   await expect(page.getByRole('heading', { name: 'Xero Connector' })).toBeVisible()
 }
 
-async function processPendingXeroSync(page: Parameters<typeof test>[0]['page']) {
+async function processPendingXeroSync(page: Page) {
   await openXeroConnector(page)
   await page.getByRole('button', { name: 'Sync' }).click()
 
@@ -54,7 +55,7 @@ async function processPendingXeroSync(page: Parameters<typeof test>[0]['page']) 
 }
 
 async function expectXeroLogRow(
-  page: Parameters<typeof test>[0]['page'],
+  page: Page,
   typeText: string,
   referenceIdPrefix: string,
 ) {
@@ -62,7 +63,7 @@ async function expectXeroLogRow(
   await expect(row).toBeVisible({ timeout: 30000 })
 }
 
-async function createReceivedPoWithBill(page: Parameters<typeof test>[0]['page']) {
+async function createReceivedPoWithBill(page: Page) {
   const product = await createSimpleProduct(page, { price: '18.00' })
 
   await page.goto('/purchase-orders')
