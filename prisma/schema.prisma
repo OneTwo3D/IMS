@@ -173,14 +173,14 @@ enum WcSyncStatus {
   FAILED
 }
 
-enum WcStockSyncReason {
+enum StockSyncReason {
   IMS_CHANGE
   WC_WEBHOOK
   DAILY_RECONCILIATION
   MANUAL
 }
 
-enum WcStockSyncJobStatus {
+enum StockSyncJobStatus {
   PENDING
   FAILED
 }
@@ -543,8 +543,8 @@ model Product {
 
   orderAllocations OrderAllocation[]
   shipmentLines    ShipmentLine[]
-  wcStockSyncState WcStockSyncState?
-  wcStockSyncJob   WcStockSyncJob?
+  stockSyncStates  StockSyncState[]
+  stockSyncJobs    StockSyncJob[]
 
   @@index([parentId])
   @@map("products")
@@ -1396,38 +1396,42 @@ model WcSyncLog {
   @@map("wc_sync_logs")
 }
 
-model WcStockSyncState {
-  productId       String   @id
-  lastPushedQty   Int?
-  lastPushedAt    DateTime?
-  lastPushedWcId  BigInt?
-  lastWebhookQty  Int?
-  lastWebhookAt   DateTime?
-  lastCorrectedAt DateTime?
-  createdAt       DateTime @default(now())
-  updatedAt       DateTime @updatedAt
+model StockSyncState {
+  connector        String
+  productId        String
+  lastPushedQty    Int?
+  lastPushedAt     DateTime?
+  lastPushedRemoteId String?
+  lastWebhookQty   Int?
+  lastWebhookAt    DateTime?
+  lastCorrectedAt  DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
 
-  product         Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+  product          Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
 
-  @@map("wc_stock_sync_states")
+  @@id([connector, productId])
+  @@map("stock_sync_states")
 }
 
-model WcStockSyncJob {
-  productId    String               @id
-  reason       WcStockSyncReason    @default(IMS_CHANGE)
-  status       WcStockSyncJobStatus @default(PENDING)
-  force        Boolean              @default(false)
-  webhookQty   Int?
-  attempts     Int                  @default(0)
-  lastError    String?
-  availableAt  DateTime             @default(now())
-  createdAt    DateTime             @default(now())
-  updatedAt    DateTime             @updatedAt
+model StockSyncJob {
+  connector   String
+  productId   String
+  reason      StockSyncReason    @default(IMS_CHANGE)
+  status      StockSyncJobStatus @default(PENDING)
+  force       Boolean            @default(false)
+  webhookQty  Int?
+  attempts    Int                @default(0)
+  lastError   String?
+  availableAt DateTime           @default(now())
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
 
-  product      Product              @relation(fields: [productId], references: [id], onDelete: Cascade)
+  product     Product            @relation(fields: [productId], references: [id], onDelete: Cascade)
 
-  @@index([status, availableAt])
-  @@map("wc_stock_sync_jobs")
+  @@id([connector, productId])
+  @@index([connector, status, availableAt])
+  @@map("stock_sync_jobs")
 }
 
 // ---------------------------------------------------------------------------

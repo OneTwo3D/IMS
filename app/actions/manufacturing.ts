@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
-import { enqueueAndProcessImmediateWcStockSync } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
+import { enqueueStockSync } from '@/lib/shopping'
 import { COMPONENT_PRODUCT_STATUSES, OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import type { ProductionOrderStatus, ProductionOrderType } from '@/app/generated/prisma/client'
 
@@ -669,7 +669,7 @@ export async function updateManufacturingOrderStatus(
     revalidatePath('/inventory')
     revalidatePath('/stock-control')
     try {
-      await enqueueAndProcessImmediateWcStockSync(
+      await enqueueStockSync(
         [
           order.outputProductId,
           ...order.outputProduct.productComponents.map((comp) => comp.componentId),

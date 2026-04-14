@@ -6,8 +6,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
-import { pushImsProductToWc } from '@/lib/connectors/woocommerce/sync/product-sync'
-import { enqueueAndProcessImmediateWcStockSync } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
+import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { ProductType } from '@/app/generated/prisma/client'
 import {
   COMPONENT_PRODUCT_STATUSES,
@@ -645,12 +644,12 @@ export async function createProduct(
   })
 
   try {
-    await pushImsProductToWc(created.id)
+    await pushProductMetadata(created.id)
   } catch (syncError) {
     console.error(syncError)
   }
   try {
-    await enqueueAndProcessImmediateWcStockSync([created.id], 'IMS_CHANGE', {
+    await enqueueStockSync([created.id], 'IMS_CHANGE', {
       force: data.lifecycleStatus === 'ARCHIVED',
     })
   } catch (syncError) {
@@ -742,12 +741,12 @@ export async function updateProduct(
   })
 
   try {
-    await pushImsProductToWc(id)
+    await pushProductMetadata(id)
   } catch (syncError) {
     console.error(syncError)
   }
   try {
-    await enqueueAndProcessImmediateWcStockSync([id], 'IMS_CHANGE', {
+    await enqueueStockSync([id], 'IMS_CHANGE', {
       force: data.lifecycleStatus === 'ARCHIVED',
     })
   } catch (syncError) {
@@ -1284,12 +1283,12 @@ export async function deleteOrDeactivateVariant(
     })
 
     try {
-      await pushImsProductToWc(id)
+      await pushProductMetadata(id)
     } catch (syncError) {
       console.error(syncError)
     }
     try {
-      await enqueueAndProcessImmediateWcStockSync([id], 'IMS_CHANGE')
+      await enqueueStockSync([id], 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
     }
@@ -1376,13 +1375,13 @@ export async function bulkDeactivateProducts(
   })
 
   const syncTargets = [...new Set(ids)]
-  const productSyncResults = await Promise.allSettled(syncTargets.map(async (id) => pushImsProductToWc(id)))
+  const productSyncResults = await Promise.allSettled(syncTargets.map(async (id) => pushProductMetadata(id)))
   for (const result of productSyncResults) {
     if (result.status === 'rejected') console.error(result.reason)
     else if (!result.value.success && result.value.error) console.error(result.value.error)
   }
   try {
-    await enqueueAndProcessImmediateWcStockSync(syncTargets, 'IMS_CHANGE')
+    await enqueueStockSync(syncTargets, 'IMS_CHANGE')
   } catch (syncError) {
     console.error(syncError)
   }

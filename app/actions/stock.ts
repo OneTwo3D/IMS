@@ -6,7 +6,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
-import { enqueueAndProcessImmediateWcStockSync } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
+import { enqueueStockSync } from '@/lib/shopping'
 import type { Prisma } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -228,7 +228,7 @@ export async function adjustStock(
     revalidatePath(`/inventory/${productId}`)
     revalidatePath('/stock-control')
     try {
-      await enqueueAndProcessImmediateWcStockSync([productId], 'IMS_CHANGE')
+      await enqueueStockSync([productId], 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
     }
@@ -361,7 +361,7 @@ export async function bulkAdjustStock(
     revalidatePath('/stock-control')
     revalidatePath('/inventory')
     try {
-      await enqueueAndProcessImmediateWcStockSync(
+      await enqueueStockSync(
         [...new Set(valid.map((line) => line.productId))],
         'IMS_CHANGE',
       )
@@ -517,7 +517,7 @@ export async function updateAdjustmentMovement(
         select: { productId: true },
       })
       if (movement?.productId) {
-        await enqueueAndProcessImmediateWcStockSync([movement.productId], 'IMS_CHANGE')
+        await enqueueStockSync([movement.productId], 'IMS_CHANGE')
       }
     } catch (syncError) {
       console.error(syncError)

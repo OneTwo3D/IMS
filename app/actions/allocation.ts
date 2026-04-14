@@ -5,7 +5,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { auth } from '@/lib/auth'
 import { requirePermission } from '@/lib/auth/server'
-import { enqueueAndProcessImmediateWcStockSync } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
+import { enqueueStockSync } from '@/lib/shopping'
 
 async function requireAuth() {
   const session = await auth()
@@ -345,7 +345,7 @@ export async function autoAllocateOrder(orderId: string): Promise<{ success: boo
       return { success: false, error: 'No stock available for allocation' }
     }
     try {
-      await enqueueAndProcessImmediateWcStockSync(
+      await enqueueStockSync(
         [...new Set(allocations.map((alloc) => alloc.productId))],
         'IMS_CHANGE',
       )
@@ -424,7 +424,7 @@ export async function updateAllocation(
       metadata: { allocationId, newWarehouseId, newQty },
     })
     try {
-      await enqueueAndProcessImmediateWcStockSync([alloc.productId], 'IMS_CHANGE')
+      await enqueueStockSync([alloc.productId], 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
     }
@@ -476,7 +476,7 @@ export async function addAllocation(
 
     revalidatePath(`/sales/${orderId}`)
     try {
-      await enqueueAndProcessImmediateWcStockSync([productId], 'IMS_CHANGE')
+      await enqueueStockSync([productId], 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
     }
@@ -539,7 +539,7 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
       metadata: { orderNumber: so.orderNumber ?? so.wcOrderNumber },
     })
     try {
-      await enqueueAndProcessImmediateWcStockSync(
+      await enqueueStockSync(
         [...new Set(allocs.map((alloc) => alloc.productId))],
         'IMS_CHANGE',
       )
@@ -786,7 +786,7 @@ export async function updateShipmentStatus(
     })
     if (targetStatus === 'SHIPPED') {
       try {
-        await enqueueAndProcessImmediateWcStockSync(
+        await enqueueStockSync(
           [...new Set(shipment.lines.map((line) => line.productId))],
           'IMS_CHANGE',
         )

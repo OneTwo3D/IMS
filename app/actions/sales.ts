@@ -5,7 +5,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
-import { enqueueAndProcessImmediateWcStockSync } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
+import { enqueueStockSync } from '@/lib/shopping'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
@@ -1114,7 +1114,7 @@ export async function updateSalesOrderStatus(
 
     if (targetStatus === 'SHIPPED') {
       try {
-        await enqueueAndProcessImmediateWcStockSync(
+        await enqueueStockSync(
           so.lines.map((line) => line.productId).filter((value): value is string => !!value),
           'IMS_CHANGE',
         )
@@ -1252,7 +1252,7 @@ export async function createRefund(
     })
     if (returnWarehouseId) {
       try {
-        await enqueueAndProcessImmediateWcStockSync(
+        await enqueueStockSync(
           refundLines.map((line) => line.productId).filter((value): value is string => !!value),
           'IMS_CHANGE',
         )

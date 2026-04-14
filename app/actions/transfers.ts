@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
-import { enqueueAndProcessImmediateWcStockSync } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
+import { enqueueStockSync } from '@/lib/shopping'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 
 // ---------------------------------------------------------------------------
@@ -381,7 +381,7 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
         where: { transferId: id },
         select: { productId: true },
       })
-      await enqueueAndProcessImmediateWcStockSync(
+      await enqueueStockSync(
         [...new Set(transferProducts.map((line) => line.productId))],
         'IMS_CHANGE',
       )
@@ -480,7 +480,7 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
         where: { transferId: id },
         select: { productId: true },
       })
-      await enqueueAndProcessImmediateWcStockSync(
+      await enqueueStockSync(
         [...new Set(transferProducts.map((line) => line.productId))],
         'IMS_CHANGE',
       )

@@ -54,6 +54,7 @@ const WC_BATCH_SIZE = 100
 const PREFLIGHT_PAGE_SIZE = 100
 const WC_PUSH_BATCH_TX_TIMEOUT_MS = 15000
 const WC_VARIATION_BATCH_SIZE = 100
+const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
 
 /**
  * `wcFetch` uses bare `fetch(...)` + `AbortSignal.timeout(...)` with no
@@ -289,18 +290,24 @@ async function persistSuccessfulPushState(
 ): Promise<void> {
   const pushedAt = new Date()
   for (const entry of entries) {
-    await tx.wcStockSyncState.upsert({
-      where: { productId: entry.productId },
+    await tx.stockSyncState.upsert({
+      where: {
+        connector_productId: {
+          connector: WC_STOCK_SYNC_CONNECTOR,
+          productId: entry.productId,
+        },
+      },
       create: {
+        connector: WC_STOCK_SYNC_CONNECTOR,
         productId: entry.productId,
         lastPushedQty: entry.payload.stock_quantity,
         lastPushedAt: pushedAt,
-        lastPushedWcId: BigInt(entry.wcId),
+        lastPushedRemoteId: String(entry.wcId),
       },
       update: {
         lastPushedQty: entry.payload.stock_quantity,
         lastPushedAt: pushedAt,
-        lastPushedWcId: BigInt(entry.wcId),
+        lastPushedRemoteId: String(entry.wcId),
       },
     })
   }
@@ -582,9 +589,12 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     availableByProduct.set(product.id, available)
   }
 
-  const previousStates = await db.wcStockSyncState.findMany({
-    where: { productId: { in: products.map((product) => product.id) } },
-    select: { productId: true, lastPushedQty: true, lastPushedWcId: true },
+  const previousStates = await db.stockSyncState.findMany({
+    where: {
+      connector: WC_STOCK_SYNC_CONNECTOR,
+      productId: { in: products.map((product) => product.id) },
+    },
+    select: { productId: true, lastPushedQty: true, lastPushedRemoteId: true },
   })
   const previousStateByProductId = new Map(
     previousStates.map((state) => [state.productId, state]),
@@ -899,8 +909,8 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         !forceAll
         && !forceProductIds.has(product.id)
         && prev?.lastPushedQty === entry.payload.stock_quantity
-        && prev.lastPushedWcId != null
-        && Number(prev.lastPushedWcId) === entry.wcId
+        && prev.lastPushedRemoteId != null
+        && prev.lastPushedRemoteId === String(entry.wcId)
       ) {
         continue
       }
@@ -912,8 +922,8 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         !forceAll
         && !forceProductIds.has(product.id)
         && prev?.lastPushedQty === entry.payload.stock_quantity
-        && prev.lastPushedWcId != null
-        && Number(prev.lastPushedWcId) === entry.wcId
+        && prev.lastPushedRemoteId != null
+        && prev.lastPushedRemoteId === String(entry.wcId)
       ) {
         continue
       }
@@ -1307,6 +1317,10 @@ function computeKitAvailability(
     for (const component of product.productComponents) {
       const required = Number(component.qty)
       if (required <= 0) {
+        kitsInWarehouse = 0
+        break
+      }
+      if (component.component.lifecycleStatus === 'ARCHIVED') {
         kitsInWarehouse = 0
         break
       }

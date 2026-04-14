@@ -2,9 +2,10 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { COMPONENT_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { pushStockToWc } from './stock-sync'
-import type { WcStockSyncReason } from '@/app/generated/prisma/enums'
+import type { StockSyncReason } from '@/app/generated/prisma/enums'
 
 const WEBHOOK_ECHO_WINDOW_MS = 10 * 60 * 1000
+const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
 
 async function expandDependentKitIds(productIds: string[]): Promise<string[]> {
   if (productIds.length === 0) return []
@@ -27,16 +28,22 @@ async function expandProductScope(productIds: string[]): Promise<string[]> {
 
 export async function enqueueWcStockSyncJobs(
   productIds: string[],
-  reason: WcStockSyncReason,
+  reason: StockSyncReason,
   options?: { force?: boolean; webhookQty?: number | null },
 ): Promise<string[]> {
   const scope = await expandProductScope(productIds)
   const now = new Date()
 
   for (const productId of scope) {
-    await db.wcStockSyncJob.upsert({
-      where: { productId },
+    await db.stockSyncJob.upsert({
+      where: {
+        connector_productId: {
+          connector: WC_STOCK_SYNC_CONNECTOR,
+          productId,
+        },
+      },
       create: {
+        connector: WC_STOCK_SYNC_CONNECTOR,
         productId,
         reason,
         status: 'PENDING',
@@ -66,8 +73,9 @@ export async function processQueuedWcStockSyncJobs(options?: {
 }): Promise<{ processed: number; synced: number; failed: number; errors: string[] }> {
   const limit = options?.limit ?? 25
   const productIds = options?.productIds ? [...new Set(options.productIds)] : undefined
-  const jobs = await db.wcStockSyncJob.findMany({
+  const jobs = await db.stockSyncJob.findMany({
     where: {
+      connector: WC_STOCK_SYNC_CONNECTOR,
       ...(productIds ? { productId: { in: productIds } } : {}),
       availableAt: { lte: new Date() },
     },
@@ -77,7 +85,7 @@ export async function processQueuedWcStockSyncJobs(options?: {
 
   const summary = { processed: 0, synced: 0, failed: 0, errors: [] as string[] }
 
-  function shouldRetainJob(result: { synced: number; errors: string[]; message: string }, job: { force: boolean; reason: WcStockSyncReason }) {
+  function shouldRetainJob(result: { synced: number; errors: string[]; message: string }, job: { force: boolean; reason: StockSyncReason }) {
     if (result.errors.length > 0 && result.synced === 0) return true
     if (job.force && result.synced === 0) return true
     if (job.reason === 'WC_WEBHOOK' && result.synced === 0) return true
@@ -106,8 +114,13 @@ export async function processQueuedWcStockSyncJobs(options?: {
       if (shouldRetainJob(result, job)) {
         const nextAttempts = job.attempts + 1
         const nextAvailableAt = new Date(Date.now() + Math.min(nextAttempts, 12) * 5 * 60 * 1000)
-        await db.wcStockSyncJob.update({
-          where: { productId: job.productId },
+        await db.stockSyncJob.update({
+          where: {
+            connector_productId: {
+              connector: WC_STOCK_SYNC_CONNECTOR,
+              productId: job.productId,
+            },
+          },
           data: {
             status: 'FAILED',
             attempts: nextAttempts,
@@ -120,11 +133,27 @@ export async function processQueuedWcStockSyncJobs(options?: {
         continue
       }
 
-      await db.wcStockSyncJob.delete({ where: { productId: job.productId } })
+      await db.stockSyncJob.delete({
+        where: {
+          connector_productId: {
+            connector: WC_STOCK_SYNC_CONNECTOR,
+            productId: job.productId,
+          },
+        },
+      })
       if (job.reason === 'DAILY_RECONCILIATION') {
-        await db.wcStockSyncState.upsert({
-          where: { productId: job.productId },
-          create: { productId: job.productId, lastCorrectedAt: new Date() },
+        await db.stockSyncState.upsert({
+          where: {
+            connector_productId: {
+              connector: WC_STOCK_SYNC_CONNECTOR,
+              productId: job.productId,
+            },
+          },
+          create: {
+            connector: WC_STOCK_SYNC_CONNECTOR,
+            productId: job.productId,
+            lastCorrectedAt: new Date(),
+          },
           update: { lastCorrectedAt: new Date() },
         })
       }
@@ -133,8 +162,13 @@ export async function processQueuedWcStockSyncJobs(options?: {
       const message = error instanceof Error ? error.message : String(error)
       const nextAttempts = job.attempts + 1
       const nextAvailableAt = new Date(Date.now() + Math.min(nextAttempts, 12) * 5 * 60 * 1000)
-      await db.wcStockSyncJob.update({
-        where: { productId: job.productId },
+      await db.stockSyncJob.update({
+        where: {
+          connector_productId: {
+            connector: WC_STOCK_SYNC_CONNECTOR,
+            productId: job.productId,
+          },
+        },
         data: {
           status: 'FAILED',
           attempts: nextAttempts,
@@ -152,7 +186,7 @@ export async function processQueuedWcStockSyncJobs(options?: {
 
 export async function enqueueAndProcessImmediateWcStockSync(
   productIds: string[],
-  reason: Extract<WcStockSyncReason, 'IMS_CHANGE' | 'WC_WEBHOOK' | 'MANUAL'>,
+  reason: Extract<StockSyncReason, 'IMS_CHANGE' | 'WC_WEBHOOK' | 'MANUAL'>,
   options?: { force?: boolean; webhookQty?: number | null },
 ): Promise<void> {
   const scope = await enqueueWcStockSyncJobs(productIds, reason, options)
@@ -175,9 +209,15 @@ export async function enqueueAndProcessImmediateWcStockSync(
 }
 
 export async function recordIncomingWcWebhook(productId: string, qty: number | null): Promise<void> {
-  await db.wcStockSyncState.upsert({
-    where: { productId },
+  await db.stockSyncState.upsert({
+    where: {
+      connector_productId: {
+        connector: WC_STOCK_SYNC_CONNECTOR,
+        productId,
+      },
+    },
     create: {
+      connector: WC_STOCK_SYNC_CONNECTOR,
       productId,
       lastWebhookQty: qty,
       lastWebhookAt: new Date(),
@@ -190,8 +230,13 @@ export async function recordIncomingWcWebhook(productId: string, qty: number | n
 }
 
 export async function shouldSuppressWcWebhookEcho(productId: string, qty: number | null): Promise<boolean> {
-  const state = await db.wcStockSyncState.findUnique({
-    where: { productId },
+  const state = await db.stockSyncState.findUnique({
+    where: {
+      connector_productId: {
+        connector: WC_STOCK_SYNC_CONNECTOR,
+        productId,
+      },
+    },
     select: { lastPushedAt: true, lastPushedQty: true },
   })
   if (!state?.lastPushedAt) return false

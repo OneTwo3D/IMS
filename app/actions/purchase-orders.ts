@@ -5,7 +5,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings, listAccountingBankAccounts, type AccountingBankAccount } from '@/lib/accounting'
-import { enqueueAndProcessImmediateWcStockSync } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
+import { enqueueStockSync } from '@/lib/shopping'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import type { TaxCategory } from '@/app/generated/prisma/client'
@@ -1739,7 +1739,7 @@ export async function receivePurchaseOrder(
     } catch { /* Accounting queue errors should never block the main flow */ }
 
     try {
-      await enqueueAndProcessImmediateWcStockSync(
+      await enqueueStockSync(
         [
           ...new Set(
             linesWithQty
