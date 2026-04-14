@@ -241,7 +241,7 @@ async function processEntry(
             // supplierInvoicePath is `/uploads/invoices/<filename>` — files live at
             // `{cwd}/uploads/invoices/<filename>` (not under `public/`).
             const relPath = (payload.supplierInvoicePath as string).replace(/^\/+/, '')
-            const pdfPath = join(process.cwd(), relPath)
+            const pdfPath = join(/* turbopackIgnore: true */ process.cwd(), relPath)
             const pdfBuffer = await readFile(pdfPath)
             const filename = relPath.split('/').pop() ?? 'supplier-invoice.pdf'
             const uploadRes = await xeroUploadAttachment('Invoices', billResult.invoiceId, filename, pdfBuffer, 'application/pdf')
