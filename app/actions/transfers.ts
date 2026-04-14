@@ -4,6 +4,8 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { enqueueAndProcessImmediateWcStockSync } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
+import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -152,6 +154,13 @@ export async function createTransfer(
   if (validLines.length === 0) {
     return { message: 'Add at least one product with a quantity.' }
   }
+  const transferProducts = await db.product.findMany({
+    where: { id: { in: [...new Set(validLines.map((line) => line.productId))] } },
+    select: { lifecycleStatus: true },
+  })
+  if (transferProducts.some((product) => !isOperationalProductStatus(product.lifecycleStatus))) {
+    return { message: 'Archived products cannot be transferred.' }
+  }
 
   try {
     // Validate stock availability at source warehouse
@@ -228,6 +237,13 @@ export async function updateTransferDraft(
   const validLines = lines.filter((l) => l.qty > 0 && l.productId)
   if (validLines.length === 0) {
     return { message: 'Add at least one product with a quantity.' }
+  }
+  const transferProducts = await db.product.findMany({
+    where: { id: { in: [...new Set(validLines.map((line) => line.productId))] } },
+    select: { lifecycleStatus: true },
+  })
+  if (transferProducts.some((product) => !isOperationalProductStatus(product.lifecycleStatus))) {
+    return { message: 'Archived products cannot be transferred.' }
   }
 
   try {
@@ -360,6 +376,18 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
       tag: 'stock',
       description: `Transfer ${dispatched?.reference ?? id}: dispatched ${dispatched?.lines.length ?? 0} items from ${dispatched?.fromWarehouse.name ?? id}`,
     })
+    try {
+      const transferProducts = await db.stockTransferLine.findMany({
+        where: { transferId: id },
+        select: { productId: true },
+      })
+      await enqueueAndProcessImmediateWcStockSync(
+        [...new Set(transferProducts.map((line) => line.productId))],
+        'IMS_CHANGE',
+      )
+    } catch (syncError) {
+      console.error(syncError)
+    }
 
     return { success: true }
   } catch (e: unknown) {
@@ -447,6 +475,18 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
       tag: 'stock',
       description: `Transfer ${received?.reference ?? id}: received ${received?.lines.length ?? 0} items at ${received?.toWarehouse.name ?? id}`,
     })
+    try {
+      const transferProducts = await db.stockTransferLine.findMany({
+        where: { transferId: id },
+        select: { productId: true },
+      })
+      await enqueueAndProcessImmediateWcStockSync(
+        [...new Set(transferProducts.map((line) => line.productId))],
+        'IMS_CHANGE',
+      )
+    } catch (syncError) {
+      console.error(syncError)
+    }
 
     return { success: true }
   } catch (e: unknown) {

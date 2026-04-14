@@ -14,7 +14,7 @@ import { bulkDeleteProducts, bulkDeactivateProducts } from '@/app/actions/produc
 import { ALL_COLUMNS, STORAGE_KEY, COLS_CHANGED_EVENT, defaultVisibility } from '@/components/inventory/product-columns'
 import type { ColKey } from '@/components/inventory/product-columns'
 import type { ProductRow } from '@/app/actions/products'
-import type { ProductType } from '@/app/generated/prisma/client'
+import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
 
 const TYPE_LABELS: Record<ProductType, string> = {
   SIMPLE: 'Simple',
@@ -47,6 +47,18 @@ type Props = {
   page: number
   pageSize: number
   searchParams: Record<string, string | undefined>
+}
+
+const STATUS_LABELS: Record<ProductLifecycleStatus, string> = {
+  ACTIVE: 'Active',
+  NOT_FOR_SALE: 'Not for sale',
+  ARCHIVED: 'Archived',
+}
+
+const STATUS_VARIANTS: Record<ProductLifecycleStatus, 'default' | 'secondary' | 'outline'> = {
+  ACTIVE: 'default',
+  NOT_FOR_SALE: 'secondary',
+  ARCHIVED: 'outline',
 }
 
 export function ProductTable({ products, total, page, pageSize, searchParams }: Props) {
@@ -134,7 +146,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
     const params = new URLSearchParams()
     if (searchParams.search) params.set('search', searchParams.search)
     if (searchParams.type) params.set('type', searchParams.type)
-    if (searchParams.active) params.set('active', searchParams.active)
+    if (searchParams.lifecycleStatus) params.set('lifecycleStatus', searchParams.lifecycleStatus)
     if (searchParams.sort) params.set('sort', searchParams.sort)
     if (searchParams.dir) params.set('dir', searchParams.dir)
     return params
@@ -150,7 +162,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
     const params = new URLSearchParams()
     if (searchParams.search) params.set('search', searchParams.search)
     if (searchParams.type) params.set('type', searchParams.type)
-    if (searchParams.active) params.set('active', searchParams.active)
+    if (searchParams.lifecycleStatus) params.set('lifecycleStatus', searchParams.lifecycleStatus)
     params.set('sort', field)
     params.set('dir', currentSort === field && currentDir === 'asc' ? 'desc' : 'asc')
     params.set('page', '1')
@@ -224,7 +236,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
       case 'variantCount':
         return p.variantCount > 0 ? p.variantCount : '—'
       case 'active':
-        return <Badge variant={p.active ? 'default' : 'outline'}>{p.active ? 'Active' : 'Inactive'}</Badge>
+        return <Badge variant={STATUS_VARIANTS[p.lifecycleStatus]}>{STATUS_LABELS[p.lifecycleStatus]}</Badge>
       case 'createdAt':
         return p.createdAt.toLocaleDateString()
       case 'updatedAt':
@@ -319,7 +331,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
                     </div>
                     <div className="flex flex-wrap gap-2">
                       <Badge variant={TYPE_COLOURS[p.type]}>{TYPE_LABELS[p.type]}</Badge>
-                      <Badge variant={p.active ? 'default' : 'outline'}>{p.active ? 'Active' : 'Inactive'}</Badge>
+                      <Badge variant={STATUS_VARIANTS[p.lifecycleStatus]}>{STATUS_LABELS[p.lifecycleStatus]}</Badge>
                     </div>
                   </div>
 

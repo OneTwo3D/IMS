@@ -5,6 +5,8 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings, listAccountingBankAccounts, type AccountingBankAccount } from '@/lib/accounting'
+import { enqueueAndProcessImmediateWcStockSync } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
+import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 
@@ -785,9 +787,13 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
     const productRows = productIdsForTax.length
       ? await db.product.findMany({
           where: { id: { in: productIdsForTax } },
-          select: { id: true, taxCategory: true },
+          select: { id: true, taxCategory: true, lifecycleStatus: true },
         })
       : []
+    const archivedProduct = productRows.find((p) => !isOperationalProductStatus(p.lifecycleStatus))
+    if (archivedProduct) {
+      return { success: false, error: 'Archived products cannot be added to new purchase orders' }
+    }
     const productCategoryById = new Map<string, TaxCategory>(
       productRows.map((p) => [p.id, p.taxCategory]),
     )
@@ -1165,9 +1171,13 @@ export async function updatePurchaseOrder(
       const productRows = productIdsForTax.length
         ? await db.product.findMany({
             where: { id: { in: productIdsForTax } },
-            select: { id: true, taxCategory: true },
+            select: { id: true, taxCategory: true, lifecycleStatus: true },
           })
         : []
+      const archivedProduct = productRows.find((p) => !isOperationalProductStatus(p.lifecycleStatus))
+      if (archivedProduct) {
+        return { success: false, error: 'Archived products cannot be added to purchase orders' }
+      }
       const productCategoryById = new Map<string, TaxCategory>(
         productRows.map((p) => [p.id, p.taxCategory]),
       )
@@ -1727,6 +1737,21 @@ export async function receivePurchaseOrder(
         })
       }
     } catch { /* Accounting queue errors should never block the main flow */ }
+
+    try {
+      await enqueueAndProcessImmediateWcStockSync(
+        [
+          ...new Set(
+            linesWithQty
+              .map((rl) => po.lines.find((line) => line.id === rl.poLineId)?.productId)
+              .filter((value): value is string => !!value),
+          ),
+        ],
+        'IMS_CHANGE',
+      )
+    } catch (syncError) {
+      console.error(syncError)
+    }
 
     return { success: true }
   } catch (e) {

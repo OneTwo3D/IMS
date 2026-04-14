@@ -180,7 +180,7 @@ export async function getDashboardData(
       orderBy: { createdAt: 'desc' },
     }),
     db.product.findMany({
-      select: { id: true, active: true, stockLevels: { select: { quantity: true, reservedQty: true } } },
+      select: { id: true, lifecycleStatus: true, stockLevels: { select: { quantity: true, reservedQty: true } } },
     }),
     db.purchaseOrder.findMany({
       where: { type: 'GOODS', status: { in: ['PO_SENT', 'PARTIALLY_RECEIVED', 'RFQ_SENT'] } },
@@ -261,7 +261,7 @@ export async function getDashboardData(
     cogsComparison: r2(comp.cogs),
     marginComparison: comp.net > 0 ? Math.round(((comp.net - comp.cogs) / comp.net) * 1000) / 10 : 0,
     totalProducts: products.length,
-    activeProducts: products.filter((p) => p.active).length,
+    activeProducts: products.filter((p) => p.lifecycleStatus === 'ACTIVE').length,
     inventoryValue: r2(inventoryValue),
     openPurchaseOrders: openPOs.length,
     openPOValue: r2(openPOs.reduce((s, po) => s + Number(po.totalGbp), 0)),
@@ -273,7 +273,7 @@ export async function getDashboardData(
   }
 
   for (const p of products) {
-    if (!p.active) continue
+    if (p.lifecycleStatus !== 'ACTIVE') continue
     const totalStock = p.stockLevels.reduce((s, sl) => s + Number(sl.quantity), 0)
     const available = p.stockLevels.reduce((s, sl) => s + Number(sl.quantity) - Number(sl.reservedQty), 0)
     if (totalStock <= 0) kpi.outOfStockCount++

@@ -15,7 +15,7 @@ import { StockFlowButton } from '@/components/inventory/stock-flow-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
 import { StockDetailPopup } from '@/components/inventory/stock-detail-popups'
-import type { ProductType } from '@/app/generated/prisma/client'
+import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
 
 const TYPE_LABELS: Record<ProductType, string> = {
   SIMPLE: 'Simple',
@@ -24,6 +24,18 @@ const TYPE_LABELS: Record<ProductType, string> = {
   KIT: 'Kit / Bundle',
   BOM: 'Bill of Materials',
   NON_INVENTORY: 'Non-Inventory',
+}
+
+const STATUS_LABELS: Record<ProductLifecycleStatus, string> = {
+  ACTIVE: 'Active',
+  NOT_FOR_SALE: 'Not for sale',
+  ARCHIVED: 'Archived',
+}
+
+const STATUS_VARIANTS: Record<ProductLifecycleStatus, 'default' | 'secondary' | 'outline'> = {
+  ACTIVE: 'default',
+  NOT_FOR_SALE: 'secondary',
+  ARCHIVED: 'outline',
 }
 
 export async function generateMetadata({ params }: { params: Promise<{ id: string }> }) {
@@ -66,7 +78,7 @@ export default async function ProductDetailPage({
   // For the kit configurator: all stockable products (not self, not VARIABLE, not NON_INVENTORY)
   const allSimpleProducts = isKitOrBom
     ? await db.product.findMany({
-        where: { active: true, type: { notIn: ['VARIABLE', 'NON_INVENTORY'] }, NOT: { id } },
+        where: { lifecycleStatus: { in: ['ACTIVE', 'NOT_FOR_SALE'] }, type: { notIn: ['VARIABLE', 'NON_INVENTORY'] }, NOT: { id } },
         select: { id: true, sku: true, name: true },
         orderBy: { sku: 'asc' },
       })
@@ -93,8 +105,8 @@ export default async function ProductDetailPage({
         </nav>
         <div className="flex items-center gap-3 flex-wrap">
           <h1 className="text-2xl font-semibold">{product.name}</h1>
-          <Badge variant={product.active ? 'default' : 'outline'}>
-            {product.active ? 'Active' : 'Inactive'}
+          <Badge variant={STATUS_VARIANTS[product.lifecycleStatus]}>
+            {STATUS_LABELS[product.lifecycleStatus]}
           </Badge>
           <Badge variant="secondary">{TYPE_LABELS[product.type]}</Badge>
           {wcLinked && <WcLinkButton sku={product.sku} />}
@@ -140,6 +152,7 @@ export default async function ProductDetailPage({
                 stockUnit: product.stockUnit,
                 oversellAllowed: product.oversellAllowed,
                 active: product.active,
+                lifecycleStatus: product.lifecycleStatus,
               }}
               stockUnitOptions={stockUnitOptions}
               inline
@@ -211,7 +224,7 @@ export default async function ProductDetailPage({
                   </div>
                   <div className="flex justify-between">
                     <span className="text-muted-foreground">Active</span>
-                    <span className="font-mono">{product.variants.filter((v) => v.active).length}</span>
+                    <span className="font-mono">{product.variants.filter((v) => v.lifecycleStatus === 'ACTIVE').length}</span>
                   </div>
                   <div className="flex justify-between border-t border-border pt-1.5 mt-1">
                     <span className="text-muted-foreground">Total stock</span>

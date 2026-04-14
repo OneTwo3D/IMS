@@ -42,6 +42,7 @@ type Props = {
     stockUnit?: string
     oversellAllowed?: boolean
     active?: boolean
+    lifecycleStatus?: 'ACTIVE' | 'NOT_FOR_SALE' | 'ARCHIVED'
   }
   stockUnitOptions?: string[]
   onClose?: () => void
@@ -83,7 +84,7 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
     widthCm:              defaultValues?.widthCm              ?? '',
     heightCm:             defaultValues?.heightCm             ?? '',
     depthCm:              defaultValues?.depthCm              ?? '',
-    active:               defaultValues?.active               ?? true,
+    lifecycleStatus:      defaultValues?.lifecycleStatus      ?? (defaultValues?.active === false ? 'ARCHIVED' : 'ACTIVE'),
   })
 
 
@@ -103,18 +104,27 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
         <p className="text-sm text-destructive">{state.message}</p>
       )}
 
-      {/* Active — top of form */}
-      <div className="flex items-center gap-2">
-        <input
-          type="checkbox"
-          id="active"
-          name="active"
-          value="true"
-          checked={fields.active}
-          onChange={(ev) => set('active', ev.target.checked)}
-          className="h-4 w-4"
-        />
-        <Label htmlFor="active" className="cursor-pointer">Active</Label>
+      <input
+        type="hidden"
+        name="active"
+        value={fields.lifecycleStatus === 'ARCHIVED' ? 'false' : 'true'}
+      />
+
+      <div className="space-y-1.5">
+        <Label htmlFor="lifecycleStatus">Status</Label>
+        <Select
+          id="lifecycleStatus"
+          name="lifecycleStatus"
+          value={fields.lifecycleStatus}
+          onChange={(ev) => set('lifecycleStatus', ev.target.value as typeof fields.lifecycleStatus)}
+        >
+          <option value="ACTIVE">Active</option>
+          <option value="NOT_FOR_SALE">Not for sale</option>
+          <option value="ARCHIVED">Archived</option>
+        </Select>
+        <p className="text-xs text-muted-foreground">
+          Active products can be sold. Not for sale products stay operational for purchasing, transfers, manufacturing, and kit components. Archived products are retired and removed from new operational flows.
+        </p>
       </div>
 
       {/* Core fields */}

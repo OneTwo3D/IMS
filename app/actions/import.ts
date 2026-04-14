@@ -6,6 +6,7 @@ import { parseCsv } from '@/lib/csv'
 import { ProductType } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
+import { deriveLegacyActiveFromLifecycleStatus, deriveLifecycleStatusFromLegacyActive } from '@/lib/products/lifecycle'
 import type { Permission } from '@/lib/auth/server'
 
 export type ImportResult = {
@@ -100,6 +101,11 @@ export async function importProductsCsv(formData: FormData): Promise<ImportResul
       }
     }
 
+    const lifecycleStatusRaw = row['lifecycleStatus']?.trim() || row['lifecyclestatus']?.trim() || null
+    const lifecycleStatus = lifecycleStatusRaw === 'ACTIVE' || lifecycleStatusRaw === 'NOT_FOR_SALE' || lifecycleStatusRaw === 'ARCHIVED'
+      ? lifecycleStatusRaw
+      : deriveLifecycleStatusFromLegacyActive((row['active'] ?? 'TRUE').trim().toUpperCase() !== 'FALSE')
+
     const data = {
       name,
       description: row['description']?.trim() || null,
@@ -116,7 +122,8 @@ export async function importProductsCsv(formData: FormData): Promise<ImportResul
       stockUnit: row['stockUnit']?.trim() || row['stockunit']?.trim() || 'pcs',
       oversellAllowed: (row['oversellAllowed'] ?? row['oversellallowed'] ?? 'TRUE').trim().toUpperCase() !== 'FALSE',
       imageUrl: row['imageUrl']?.trim() || row['imageurl']?.trim() || null,
-      active: (row['active'] ?? 'TRUE').trim().toUpperCase() !== 'FALSE',
+      active: deriveLegacyActiveFromLifecycleStatus(lifecycleStatus),
+      lifecycleStatus,
     }
 
     try {

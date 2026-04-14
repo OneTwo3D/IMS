@@ -14,7 +14,7 @@ export const metadata: Metadata = { title: 'Sales Orders' }
 export default async function SalesPage() {
   const [orders, { products }, warehouses, currencies, taxRates, customers, stockLevels, avgCogs, users, session, organisation] = await Promise.all([
     getSalesOrders(),
-    listProducts({ pageSize: 1000, type: 'ALL' }),
+    listProducts({ pageSize: 1000, type: 'ALL', lifecycleStatus: 'ACTIVE' }),
     getWarehouses(),
     getCurrencies(true),
     getTaxRates(),

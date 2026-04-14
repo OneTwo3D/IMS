@@ -21,7 +21,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
   const [po, suppliers, productsResult, warehouses, currencies, taxRates, purchaseUnits, billUrlTemplate, organisation, carriersJson] = await Promise.all([
     getPurchaseOrder(id),
     getSuppliers(),
-    listProducts({ pageSize: 1000, type: 'ALL' }),
+    listProducts({ pageSize: 1000, type: 'ALL', active: 'true' }),
     getWarehouses(),
     getCurrencies(true),
     getTaxRates(),

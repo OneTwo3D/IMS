@@ -5,6 +5,11 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { wcFetch, wcPut } from '../api'
+import {
+  deriveLegacyActiveFromLifecycleStatus,
+  deriveLifecycleStatusFromWooStatus,
+  deriveWooStatusFromLifecycleStatus,
+} from '@/lib/products/lifecycle'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
 
 // ---------------------------------------------------------------------------
@@ -70,6 +75,9 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
 
     // Product type mapping
     const productType = wcProduct.type === 'variable' ? 'VARIABLE' : 'SIMPLE'
+    const existingLifecycleStatus = existing?.lifecycleStatus ?? null
+    const lifecycleStatus = deriveLifecycleStatusFromWooStatus(wcProduct.status, existingLifecycleStatus)
+    const active = deriveLegacyActiveFromLifecycleStatus(lifecycleStatus)
 
     if (existing) {
       // Build update data — always sync these fields
@@ -81,7 +89,8 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
         depthCm: depthCm ?? existing.depthCm,
         widthCm: widthCm ?? existing.widthCm,
         heightCm: heightCm ?? existing.heightCm,
-        active: wcProduct.status === 'publish',
+        active,
+        lifecycleStatus,
         type: productType,
       }
 
@@ -117,7 +126,8 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
           heightCm,
           salesPriceGbp: productType === 'VARIABLE' ? null : salesPriceGbp,
           salePriceGbp: productType === 'VARIABLE' ? null : salePriceGbp,
-          active: wcProduct.status === 'publish',
+          active,
+          lifecycleStatus,
           type: productType,
           hsCode: hsCodeAttr,
           countryOfOrigin: originAttr,
@@ -235,7 +245,10 @@ async function syncVariations(
           depthCm: depthCm ?? existing.depthCm,
           widthCm: widthCm ?? existing.widthCm,
           heightCm: heightCm ?? existing.heightCm,
-          active: v.status === 'publish',
+          active: deriveLegacyActiveFromLifecycleStatus(
+            deriveLifecycleStatusFromWooStatus(v.status, existing.lifecycleStatus),
+          ),
+          lifecycleStatus: deriveLifecycleStatusFromWooStatus(v.status, existing.lifecycleStatus),
           type: 'VARIANT',
           parentId: imsParentId,
         }
@@ -258,7 +271,8 @@ async function syncVariations(
             heightCm,
             salesPriceGbp,
             salePriceGbp,
-            active: v.status === 'publish',
+            active: deriveLegacyActiveFromLifecycleStatus(deriveLifecycleStatusFromWooStatus(v.status)),
+            lifecycleStatus: deriveLifecycleStatusFromWooStatus(v.status),
             type: 'VARIANT',
             parentId: imsParentId,
           },
@@ -278,7 +292,15 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
   try {
     const product = await db.product.findUnique({
       where: { id: productId },
-      select: { sku: true, name: true, description: true, salesPriceGbp: true, salePriceGbp: true, barcode: true },
+      select: {
+        sku: true,
+        name: true,
+        description: true,
+        salesPriceGbp: true,
+        salePriceGbp: true,
+        barcode: true,
+        lifecycleStatus: true,
+      },
     })
     if (!product?.sku) return { success: false, error: 'Product has no SKU' }
 
@@ -293,6 +315,7 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
 
     // Push updates
     const updateData: Record<string, unknown> = { name: product.name }
+    updateData.status = deriveWooStatusFromLifecycleStatus(product.lifecycleStatus)
     if (product.description) updateData.description = product.description
     if (product.salesPriceGbp) updateData.regular_price = String(Number(product.salesPriceGbp))
     if (product.salePriceGbp) updateData.sale_price = String(Number(product.salePriceGbp))
@@ -341,7 +364,7 @@ export async function syncAllWcProducts(): Promise<SyncResult> {
     const params: Record<string, string> = {
       per_page: '100',
       page: String(page),
-      status: 'publish',
+      status: 'any',
     }
     if (modifiedAfter) params.modified_after = modifiedAfter
 

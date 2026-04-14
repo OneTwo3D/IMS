@@ -4,6 +4,8 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { enqueueAndProcessImmediateWcStockSync } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
+import { COMPONENT_PRODUCT_STATUSES, OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import type { ProductionOrderStatus, ProductionOrderType } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -134,7 +136,7 @@ export async function getManufacturingOrders(filters: ListFilters = {}) {
 export async function getBomProducts(): Promise<BomProduct[]> {
   await requireAuth()
   const products = await db.product.findMany({
-    where: { type: 'BOM', active: true },
+    where: { type: 'BOM', lifecycleStatus: { in: OPERATIONAL_PRODUCT_STATUSES } },
     select: {
       id: true,
       sku: true,
@@ -193,17 +195,22 @@ export async function getComponentStock(
   const product = await db.product.findUnique({
     where: { id: productId },
     select: {
+      lifecycleStatus: true,
       productComponents: {
         select: {
           componentId: true,
           qty: true,
+          component: { select: { lifecycleStatus: true } },
         },
       },
     },
   })
   if (!product) return []
+  if (!OPERATIONAL_PRODUCT_STATUSES.includes(product.lifecycleStatus)) return []
 
-  const componentIds = product.productComponents.map((c) => c.componentId)
+  const componentIds = product.productComponents
+    .filter((c) => COMPONENT_PRODUCT_STATUSES.includes(c.component.lifecycleStatus))
+    .map((c) => c.componentId)
   const stockLevels = await db.stockLevel.findMany({
     where: { productId: { in: componentIds }, warehouseId },
     select: { productId: true, quantity: true, reservedQty: true },
@@ -211,7 +218,9 @@ export async function getComponentStock(
 
   const stockMap = new Map(stockLevels.map((s) => [s.productId, Number(s.quantity) - Number(s.reservedQty)]))
 
-  return product.productComponents.map((c) => ({
+  return product.productComponents
+    .filter((c) => COMPONENT_PRODUCT_STATUSES.includes(c.component.lifecycleStatus))
+    .map((c) => ({
     componentId: c.componentId,
     available: stockMap.get(c.componentId) ?? 0,
     needed: Number(c.qty),
@@ -659,6 +668,17 @@ export async function updateManufacturingOrderStatus(
     revalidatePath(`/manufacturing/${id}`)
     revalidatePath('/inventory')
     revalidatePath('/stock-control')
+    try {
+      await enqueueAndProcessImmediateWcStockSync(
+        [
+          order.outputProductId,
+          ...order.outputProduct.productComponents.map((comp) => comp.componentId),
+        ],
+        'IMS_CHANGE',
+      )
+    } catch (syncError) {
+      console.error(syncError)
+    }
     return { success: true }
   } catch (e) {
     await logActivity({

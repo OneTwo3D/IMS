@@ -535,7 +535,7 @@ export async function triggerManualSync(type: 'orders' | 'products' | 'stock'): 
     }
     if (type === 'stock') {
       const { pushStockToWc } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
-      const result = await pushStockToWc()
+      const result = await pushStockToWc({ forceAll: true, source: 'MANUAL' })
       return { success: true, result }
     }
     return { success: false, error: 'Unknown sync type' }

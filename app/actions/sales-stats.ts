@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth/server'
+import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
 // Products tab (line-level)
@@ -15,7 +16,7 @@ export type SalesStatRow = {
   type: string
   stockUnit: string
   barcode: string | null
-  active: boolean
+  lifecycleStatus: ProductLifecycleStatus
   currentStock: number
   reservedQty: number
   availableStock: number
@@ -67,7 +68,7 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
   })
 
   const products = await db.product.findMany({
-    select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, weight: true, salesPriceGbp: true, active: true,
+    select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, weight: true, salesPriceGbp: true, lifecycleStatus: true,
       stockLevels: { select: { quantity: true, reservedQty: true } } },
   })
   const productInfo = new Map(products.map((p) => [p.id, p]))
@@ -81,7 +82,7 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
         productMap.set(pid, {
           productId: pid, sku: info?.sku ?? line.sku ?? '', name: info?.name ?? line.description,
           type: info?.type ?? 'SIMPLE', stockUnit: info?.stockUnit ?? 'pcs', barcode: info?.barcode ?? null,
-          active: info?.active ?? true,
+          lifecycleStatus: info?.lifecycleStatus ?? 'ACTIVE',
           currentStock: info?.stockLevels.reduce((s, sl) => s + Number(sl.quantity), 0) ?? 0,
           reservedQty: info?.stockLevels.reduce((s, sl) => s + Number(sl.reservedQty), 0) ?? 0,
           availableStock: info ? info.stockLevels.reduce((s, sl) => s + Number(sl.quantity) - Number(sl.reservedQty), 0) : 0,

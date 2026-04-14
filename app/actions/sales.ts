@@ -5,6 +5,8 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
+import { enqueueAndProcessImmediateWcStockSync } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
+import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
 
@@ -487,9 +489,13 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     const productRows = productIds.length
       ? await db.product.findMany({
           where: { id: { in: productIds } },
-          select: { id: true, taxCategory: true },
+          select: { id: true, taxCategory: true, lifecycleStatus: true },
         })
       : []
+    const invalidSalesProduct = productRows.find((p) => !isSellableProductStatus(p.lifecycleStatus))
+    if (invalidSalesProduct) {
+      return { success: false, error: 'Only active products can be sold on sales orders' }
+    }
     const productCategoryById = new Map<string, TaxCategory>(
       productRows.map((p) => [p.id, p.taxCategory]),
     )
@@ -1106,6 +1112,17 @@ export async function updateSalesOrderStatus(
       )
     }
 
+    if (targetStatus === 'SHIPPED') {
+      try {
+        await enqueueAndProcessImmediateWcStockSync(
+          so.lines.map((line) => line.productId).filter((value): value is string => !!value),
+          'IMS_CHANGE',
+        )
+      } catch (syncError) {
+        console.error(syncError)
+      }
+    }
+
     return { success: true }
   } catch (e) {
     await logActivity({
@@ -1232,6 +1249,16 @@ export async function createRefund(
       description: `Created refund for order ${so.orderNumber ?? so.wcOrderNumber} — £${totalGbp.toFixed(2)}`,
       metadata: { orderNumber: so.orderNumber ?? so.wcOrderNumber, totalGbp, creditNoteNumber, reason },
     })
+    if (returnWarehouseId) {
+      try {
+        await enqueueAndProcessImmediateWcStockSync(
+          refundLines.map((line) => line.productId).filter((value): value is string => !!value),
+          'IMS_CHANGE',
+        )
+      } catch (syncError) {
+        console.error(syncError)
+      }
+    }
 
     // Queue accounting credit note sync
     try {

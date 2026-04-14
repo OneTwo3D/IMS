@@ -22,7 +22,7 @@ export async function GET(req: NextRequest) {
       const { rows } = await getProductSalesStats(dateFrom, dateTo)
       const data = rows.map((r) => ({
         sku: r.sku, name: r.name, type: r.type, stockUnit: r.stockUnit,
-        barcode: r.barcode, active: r.active ? 'TRUE' : 'FALSE',
+        barcode: r.barcode, lifecycleStatus: r.lifecycleStatus,
         qtySold: r.qtySold, qtyRefunded: r.qtyRefunded, netQty: r.netQty,
         grossRevenue: r.grossRevenue.toFixed(2), discounts: r.discounts.toFixed(2),
         refunds: r.refunds.toFixed(2), netRevenue: r.netRevenue.toFixed(2),
@@ -31,7 +31,7 @@ export async function GET(req: NextRequest) {
         avgOrderValue: r.avgOrderValue.toFixed(2),
         salesPrice: r.salesPrice?.toFixed(2) ?? '', weight: r.weight ?? '',
       }))
-      const headers = ['sku', 'name', 'type', 'stockUnit', 'barcode', 'active', 'qtySold', 'qtyRefunded', 'netQty', 'grossRevenue', 'discounts', 'refunds', 'netRevenue', 'cogs', 'grossProfit', 'marginPct', 'orderCount', 'avgOrderValue', 'salesPrice', 'weight']
+      const headers = ['sku', 'name', 'type', 'stockUnit', 'barcode', 'lifecycleStatus', 'qtySold', 'qtyRefunded', 'netQty', 'grossRevenue', 'discounts', 'refunds', 'netRevenue', 'cogs', 'grossProfit', 'marginPct', 'orderCount', 'avgOrderValue', 'salesPrice', 'weight']
       return csvResponse(toCsv(data, headers), `sales-stats-products-${date}.csv`)
     }
 
