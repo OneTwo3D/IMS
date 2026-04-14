@@ -6,6 +6,7 @@ import type { StockSyncReason } from '@/app/generated/prisma/enums'
 
 const WEBHOOK_ECHO_WINDOW_MS = 10 * 60 * 1000
 const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
+const JOB_CLAIM_WINDOW_MS = 10 * 60 * 1000
 
 async function expandDependentKitIds(productIds: string[]): Promise<string[]> {
   if (productIds.length === 0) return []
@@ -103,6 +104,21 @@ export async function processQueuedWcStockSyncJobs(options?: {
   }
 
   for (const job of jobs) {
+    const claimCutoff = new Date()
+    const claimUntil = new Date(claimCutoff.getTime() + JOB_CLAIM_WINDOW_MS)
+    const claimed = await db.stockSyncJob.updateMany({
+      where: {
+        connector: WC_STOCK_SYNC_CONNECTOR,
+        productId: job.productId,
+        updatedAt: job.updatedAt,
+        availableAt: { lte: claimCutoff },
+      },
+      data: {
+        availableAt: claimUntil,
+      },
+    })
+    if (claimed.count === 0) continue
+
     summary.processed++
     try {
       const result = await pushStockToWc({

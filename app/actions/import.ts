@@ -6,6 +6,7 @@ import { parseCsv } from '@/lib/csv'
 import { ProductType } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
+import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { deriveLegacyActiveFromLifecycleStatus, deriveLifecycleStatusFromLegacyActive } from '@/lib/products/lifecycle'
 import type { Permission } from '@/lib/auth/server'
 
@@ -63,6 +64,7 @@ export async function importProductsCsv(formData: FormData): Promise<ImportResul
 
   // Track rows with components to process in second pass
   const componentRows: { lineNum: number; sku: string; components: string }[] = []
+  const touchedProducts: Array<{ id: string; lifecycleStatus: 'ACTIVE' | 'NOT_FOR_SALE' | 'ARCHIVED' }> = []
 
   // Pass 1: Create/update non-VARIANT products first, then VARIANTs
   // Sort rows so parents come before children
@@ -130,10 +132,12 @@ export async function importProductsCsv(formData: FormData): Promise<ImportResul
       const existing = skuToId.get(sku)
       if (existing) {
         await db.product.update({ where: { id: existing }, data })
+        touchedProducts.push({ id: existing, lifecycleStatus })
         result.updated++
       } else {
         const created = await db.product.create({ data: { sku, ...data } })
         skuToId.set(sku, created.id)
+        touchedProducts.push({ id: created.id, lifecycleStatus })
         result.created++
       }
 
@@ -207,10 +211,36 @@ export async function importProductsCsv(formData: FormData): Promise<ImportResul
             sortOrder: i,
           })),
         })
+        const product = touchedProducts.find((entry) => entry.id === productId)
+        if (!product) {
+          const lifecycleRow = await db.product.findUnique({
+            where: { id: productId },
+            select: { lifecycleStatus: true },
+          })
+          if (lifecycleRow) {
+            touchedProducts.push({ id: productId, lifecycleStatus: lifecycleRow.lifecycleStatus })
+          }
+        }
       } catch (e: unknown) {
         const msg = e instanceof Error ? e.message : String(e)
         result.errors.push(`Components for ${cr.sku}: ${msg}`)
       }
+    }
+  }
+
+  const syncTargets = [...new Map(touchedProducts.map((entry) => [entry.id, entry])).values()]
+  for (const target of syncTargets) {
+    try {
+      await pushProductMetadata(target.id)
+    } catch (syncError) {
+      console.error(syncError)
+    }
+    try {
+      await enqueueStockSync([target.id], 'IMS_CHANGE', {
+        force: target.lifecycleStatus === 'ARCHIVED',
+      })
+    } catch (syncError) {
+      console.error(syncError)
     }
   }
 

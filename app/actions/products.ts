@@ -1170,6 +1170,7 @@ export async function generateVariantsFromOptions(
   let nextNum = highestNum + 1
   let created = 0
   let skipped = 0
+  const createdVariantIds: string[] = []
 
   for (const combo of combinations) {
     const sku = `${product.sku}-${String(nextNum).padStart(2, '0')}`
@@ -1181,7 +1182,7 @@ export async function generateVariantsFromOptions(
       continue
     }
 
-    await db.product.create({
+    const createdVariant = await db.product.create({
       data: {
         sku,
         name,
@@ -1195,6 +1196,7 @@ export async function generateVariantsFromOptions(
         depthCm:  product.depthCm  ?? undefined,
       },
     })
+    createdVariantIds.push(createdVariant.id)
     created++
   }
 
@@ -1207,6 +1209,19 @@ export async function generateVariantsFromOptions(
     description: `Generated ${created} variants for SKU ${product.sku}`,
     metadata: { created, skipped },
   })
+
+  for (const variantId of createdVariantIds) {
+    try {
+      await pushProductMetadata(variantId)
+    } catch (syncError) {
+      console.error(syncError)
+    }
+    try {
+      await enqueueStockSync([variantId], 'IMS_CHANGE')
+    } catch (syncError) {
+      console.error(syncError)
+    }
+  }
 
   revalidatePath(`/inventory/${productId}`)
   return { created, skipped }
