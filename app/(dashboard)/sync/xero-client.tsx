@@ -1252,6 +1252,27 @@ function HistoryEntryRow({
   label: string
   entry: NonNullable<DailyBatchHistoryDay['a1']>
 }) {
+  const router = useRouter()
+  const [retrying, setRetrying] = useState(false)
+  const [retryMsg, setRetryMsg] = useState<string | null>(null)
+  const canRetry = entry.status === 'FAILED' || (entry.status === 'PENDING' && entry.retryCount > 0)
+
+  async function handleRetry() {
+    setRetryMsg(null)
+    setRetrying(true)
+    try {
+      const res = await retryFailedXeroSync(entry.id)
+      if (res.success) {
+        setRetryMsg(`Reset ${res.reset} entry — will retry on next sync cycle`)
+        router.refresh()
+      } else {
+        setRetryMsg(`Error: ${res.error}`)
+      }
+    } finally {
+      setRetrying(false)
+    }
+  }
+
   return (
     <div className="px-3 py-3 space-y-2">
       <div className="flex items-start justify-between gap-3">
@@ -1263,16 +1284,36 @@ function HistoryEntryRow({
             {entry.syncedAt ? ` · Synced ${formatRelative(entry.syncedAt)}` : ''}
           </p>
         </div>
-        <div className="text-right shrink-0">
-          <div className="text-sm font-mono">{formatGbp(entry.totalDebit)}</div>
-          <div className="text-[10px] mt-0.5">
-            {STATUS_BADGE[entry.status]?.label ?? entry.status}
+        <div className="text-right shrink-0 flex items-start gap-2">
+          <div>
+            <div className="text-sm font-mono">{formatGbp(entry.totalDebit)}</div>
+            <div className="text-[10px] mt-0.5">
+              {STATUS_BADGE[entry.status]?.label ?? entry.status}
+            </div>
           </div>
+          {canRetry && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="h-7 w-7 p-0"
+              title="Reset retries and re-queue"
+              onClick={handleRetry}
+              disabled={retrying}
+            >
+              {retrying ? <Loader2 className="h-3 w-3 animate-spin" /> : <RotateCcw className="h-3 w-3" />}
+            </Button>
+          )}
         </div>
       </div>
       {entry.errorMessage && (
         <div className="text-[11px] text-destructive">
           Error (attempt {entry.retryCount}): {entry.errorMessage}
+        </div>
+      )}
+      {retryMsg && (
+        <div className={`text-[11px] ${retryMsg.startsWith('Error') ? 'text-destructive' : 'text-green-600 dark:text-green-400'}`}>
+          {retryMsg}
         </div>
       )}
       {entry.lines.length > 0 && (
