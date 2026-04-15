@@ -1,4 +1,3 @@
-import { cache } from 'react'
 import { db } from '@/lib/db'
 import type { CurrencySymbolPos } from '@/app/generated/prisma/enums'
 
@@ -23,23 +22,29 @@ export function getFallbackCurrencyMeta(code: string): { name: string; symbol: s
   return FALLBACK_CURRENCY_META[code] ?? { name: code, symbol: code, symbolPosition: 'PREFIX' }
 }
 
-export const getBaseCurrencyCode = cache(async (): Promise<string> => {
+export async function getBaseCurrencyCode(): Promise<string> {
   const org = await db.organisation.findFirst({ select: { baseCurrency: true } })
   return org?.baseCurrency ?? DEFAULT_BASE_CURRENCY
-})
+}
 
-export const getBaseCurrencyDisplay = cache(async (): Promise<BaseCurrencyDisplay> => {
+export async function getBaseCurrencyDisplay(): Promise<BaseCurrencyDisplay> {
   const code = await getBaseCurrencyCode()
   const row = await db.currency.findUnique({
     where: { code },
     select: { symbol: true, symbolPosition: true },
   })
-  if (row) return { code, symbol: row.symbol, symbolPosition: row.symbolPosition }
   const fallback = getFallbackCurrencyMeta(code)
+  if (row) {
+    return {
+      code,
+      symbol: row.symbol || fallback.symbol,
+      symbolPosition: row.symbolPosition || fallback.symbolPosition,
+    }
+  }
   return { code, symbol: fallback.symbol, symbolPosition: fallback.symbolPosition }
-})
+}
 
-export const isBaseCurrencyLocked = cache(async (): Promise<boolean> => {
+export async function isBaseCurrencyLocked(): Promise<boolean> {
   const [setting, counts] = await Promise.all([
     db.setting.findUnique({ where: { key: 'base_currency_locked' }, select: { value: true } }),
     Promise.all([
@@ -53,4 +58,4 @@ export const isBaseCurrencyLocked = cache(async (): Promise<boolean> => {
   ])
   if (setting?.value === 'true') return true
   return counts.some((count) => count > 0)
-})
+}

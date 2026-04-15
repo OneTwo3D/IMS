@@ -15,6 +15,18 @@ export function cn(...inputs: ClassValue[]) {
 export type SymbolPos = 'PREFIX' | 'POSTFIX'
 
 const FALLBACK_POSTFIX = new Set(['€', 'kr', 'zł', 'Kč', 'Ft', 'лв', 'kn'])
+const CANONICAL_POSITIONS = new Map<string, SymbolPos>([
+  ['£', 'PREFIX'],
+  ['$', 'PREFIX'],
+  ['C$', 'PREFIX'],
+  ['€', 'POSTFIX'],
+  ['kr', 'POSTFIX'],
+  ['zł', 'POSTFIX'],
+  ['Kč', 'POSTFIX'],
+  ['Ft', 'POSTFIX'],
+  ['лв', 'POSTFIX'],
+  ['kn', 'POSTFIX'],
+])
 
 /**
  * Format a numeric amount with its currency symbol in the correct position.
@@ -37,7 +49,7 @@ export function formatMoney(
 ): string {
   const abs = Math.abs(amount).toFixed(digits)
   const sign = amount < 0 ? '-' : ''
-  const pos: SymbolPos = position ?? (FALLBACK_POSTFIX.has(symbol) ? 'POSTFIX' : 'PREFIX')
+  const pos: SymbolPos = CANONICAL_POSITIONS.get(symbol) ?? position ?? (FALLBACK_POSTFIX.has(symbol) ? 'POSTFIX' : 'PREFIX')
   if (pos === 'POSTFIX') return `${sign}${abs}${symbol}`
   return `${sign}${symbol}${abs}`
 }
