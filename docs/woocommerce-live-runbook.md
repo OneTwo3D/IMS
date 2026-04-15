@@ -95,6 +95,7 @@ Use this only to validate the backup path, not as the primary success criterion.
 Expected result:
 
 - backup reconciliation behaves as a safety net, not the main sync mechanism
+- if live order webhooks were skipped during the initial-import window, the first reconcile after initial import completion backfills them
 
 ## Evidence to capture
 

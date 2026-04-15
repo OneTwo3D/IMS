@@ -132,6 +132,12 @@ For WooCommerce specifically:
 - real-time order/product intake should come from webhooks
 - `/api/cron/wc-reconcile` is the daily backup reconcile path for orders/products and also runs the stock catch-up plus queued retry drain
 
+Authentication note:
+
+- login and TOTP throttling are currently in-process only
+- this deployment assumes a single application instance/LXC
+- if you add a second web instance or separate worker handling auth routes, move rate limiting to shared storage such as Redis before doing so
+
 
 ## Updating
 

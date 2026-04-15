@@ -1,5 +1,6 @@
 import nodemailer from 'nodemailer'
-import { db } from '@/lib/db'
+import { z } from 'zod'
+import { getSettingValues } from '@/lib/settings-store'
 
 type EmailOptions = {
   to: string
@@ -8,10 +9,30 @@ type EmailOptions = {
   attachments?: { filename: string; content: Buffer; contentType?: string }[]
 }
 
+type SendEmailResult = {
+  success: boolean
+  error?: string
+  permanent?: boolean
+  invalidRecipient?: boolean
+}
+
+const emailSchema = z.email()
+
+function validateEmailAddress(value: string, label: string): string {
+  const parsed = emailSchema.safeParse(value.trim())
+  if (!parsed.success) {
+    throw new Error(`Invalid ${label} email address.`)
+  }
+  return parsed.data
+}
+
+function sanitizeDisplayName(value: string): string {
+  return value.replace(/[\r\n"]/g, ' ').replace(/\s+/g, ' ').trim()
+}
+
 async function getSmtpSettings() {
   const keys = ['email_smtp_host', 'email_smtp_port', 'email_smtp_user', 'email_smtp_pass', 'email_smtp_secure', 'email_from_name', 'email_from_email', 'email_reply_to']
-  const rows = await db.setting.findMany({ where: { key: { in: keys } } })
-  const map = new Map(rows.map((r) => [r.key, r.value]))
+  const map = await getSettingValues(keys)
   return {
     host: map.get('email_smtp_host') ?? '',
     port: parseInt(map.get('email_smtp_port') ?? '587'),
@@ -24,12 +45,17 @@ async function getSmtpSettings() {
   }
 }
 
-export async function sendEmail(opts: EmailOptions): Promise<{ success: boolean; error?: string }> {
+export async function sendEmail(opts: EmailOptions): Promise<SendEmailResult> {
   try {
     const smtp = await getSmtpSettings()
     if (!smtp.host || !smtp.fromEmail) {
       return { success: false, error: 'SMTP not configured. Go to Settings → Company → Email/SMTP.' }
     }
+
+    const fromEmail = validateEmailAddress(smtp.fromEmail, 'from')
+    const toEmail = validateEmailAddress(opts.to, 'to')
+    const replyToEmail = smtp.replyTo ? validateEmailAddress(smtp.replyTo, 'reply-to') : undefined
+    const fromName = sanitizeDisplayName(smtp.fromName)
 
     const transport = nodemailer.createTransport({
       host: smtp.host,
@@ -40,9 +66,9 @@ export async function sendEmail(opts: EmailOptions): Promise<{ success: boolean;
     })
 
     await transport.sendMail({
-      from: smtp.fromName ? `"${smtp.fromName}" <${smtp.fromEmail}>` : smtp.fromEmail,
-      replyTo: smtp.replyTo || undefined,
-      to: opts.to,
+      from: fromName ? { name: fromName, address: fromEmail } : fromEmail,
+      replyTo: replyToEmail,
+      to: toEmail,
       subject: opts.subject,
       html: opts.html,
       attachments: opts.attachments?.map((a) => ({
@@ -54,6 +80,25 @@ export async function sendEmail(opts: EmailOptions): Promise<{ success: boolean;
 
     return { success: true }
   } catch (e) {
-    return { success: false, error: String(e) }
+    const error = e as {
+      code?: string
+      responseCode?: number
+      command?: string
+      message?: string
+    }
+    const message = String(e)
+    const responseCode = typeof error.responseCode === 'number' ? error.responseCode : null
+    const code = error.code ?? ''
+    const invalidRecipient =
+      responseCode === 550
+      || responseCode === 551
+      || responseCode === 553
+      || responseCode === 554
+      || code === 'EENVELOPE'
+      || /recipient|mailbox unavailable|user unknown|no such user|invalid recipient/i.test(message)
+    const permanent =
+      invalidRecipient
+      || (responseCode !== null && responseCode >= 500 && responseCode < 600)
+    return { success: false, error: message, permanent, invalidRecipient }
   }
 }

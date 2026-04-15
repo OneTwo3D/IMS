@@ -5,8 +5,11 @@ import path from 'path'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { verifyCron } from '@/lib/cron-auth'
+import { getBackupDir } from '@/lib/backup-storage'
+import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
+import { uploadBackupToTarget } from '@/lib/backup-remote'
 
-const BACKUP_DIR = path.join(process.cwd(), 'backups')
+const BACKUP_DIR = getBackupDir()
 
 async function getSetting(key: string): Promise<string> {
   const row = await db.setting.findUnique({ where: { key } })
@@ -27,6 +30,8 @@ function getDbConfig() {
 export async function GET(request: Request) {
   const cronErr = verifyCron(request)
   if (cronErr) return cronErr
+  const maintenance = await getMaintenanceModeResponse('cron')
+  if (maintenance) return maintenance
   const enabled = await getSetting('backup_schedule_enabled')
   if (enabled !== 'true') {
     return NextResponse.json({ skipped: true, reason: 'Scheduled backups disabled' })
@@ -45,9 +50,9 @@ export async function GET(request: Request) {
   // Create backup (using execFile to prevent command injection)
   const created = await new Promise<boolean>((resolve) => {
     const args = ['-h', dbConf.host, '-p', dbConf.port, '-U', dbConf.user, '-d', dbConf.database, '--no-owner', '--no-acl', '-F', 'p', '-f', filePath]
-    execFile('pg_dump', args, { timeout: 120000, env: { ...process.env, PGPASSWORD: dbConf.password } }, (error) => {
+    execFile('pg_dump', args, { timeout: 120000, env: { ...process.env, PGPASSWORD: dbConf.password } }, async (error) => {
       if (error) {
-        logActivity({ entityType: 'SYSTEM', tag: 'system', action: 'scheduled_backup', level: 'ERROR', description: `Scheduled backup failed: ${error.message}` })
+        await logActivity({ entityType: 'SYSTEM', tag: 'system', action: 'scheduled_backup', level: 'ERROR', description: `Scheduled backup failed: ${error.message}` })
         resolve(false)
       } else {
         resolve(true)
@@ -62,14 +67,16 @@ export async function GET(request: Request) {
   let uploaded = false
   if (autoUploadTarget === 's3' || autoUploadTarget === 'sftp') {
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_APP_URL}/api/backup/upload-remote`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename, target: autoUploadTarget }),
+      await uploadBackupToTarget(filePath, filename, autoUploadTarget)
+      uploaded = true
+    } catch (error) {
+      await logActivity({
+        entityType: 'SYSTEM',
+        tag: 'system',
+        action: 'scheduled_backup',
+        level: 'WARNING',
+        description: `Scheduled backup created but remote upload to ${autoUploadTarget} failed: ${String(error)}`,
       })
-      uploaded = res.ok
-    } catch {
-      logActivity({ entityType: 'SYSTEM', tag: 'system', action: 'scheduled_backup', level: 'WARNING', description: `Scheduled backup created but remote upload to ${autoUploadTarget} failed` })
     }
   }
 
@@ -96,7 +103,7 @@ export async function GET(request: Request) {
     }
   } catch { /* ignore cleanup errors */ }
 
-  logActivity({
+  await logActivity({
     entityType: 'SYSTEM',
     tag: 'system',
     action: 'scheduled_backup',

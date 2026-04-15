@@ -36,6 +36,7 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { decryptSecret } from '@/lib/secrets'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { wcFetch, wcPost } from '../api'
 import {
@@ -132,7 +133,7 @@ async function snapshotSyncContext(): Promise<{
     const secret = map.get('wc_consumer_secret')
     const syncVersion = map.get(WC_SETTINGS_VERSION_KEY) ?? '0'
     const creds: ConnectorCredentials | null = url && key && secret
-      ? { url: url.replace(/\/$/, ''), key, secret }
+      ? { url: url.replace(/\/$/, ''), key, secret: decryptSecret(secret) }
       : null
     return { creds, syncVersion }
   })

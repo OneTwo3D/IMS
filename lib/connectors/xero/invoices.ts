@@ -29,10 +29,10 @@ type XeroInvoiceResponse = {
 export async function pushSalesInvoice(
   data: InvoiceData,
   status: string = 'AUTHORISED',
-  opts?: { idempotencyKey?: string },
+  opts?: { idempotencyKey?: string; customerId?: string },
 ): Promise<{ success: boolean; invoiceId?: string; invoiceNumber?: string; total?: number; error?: string }> {
   // Find or create the contact
-  const contactResult = await findOrCreateContact(data.contactName, data.contactEmail)
+  const contactResult = await findOrCreateContact(data.contactName, data.contactEmail, false, { customerId: opts?.customerId })
   if (!contactResult.success || !contactResult.contactId) {
     return { success: false, error: `Contact error: ${contactResult.error}` }
   }

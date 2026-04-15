@@ -13,7 +13,7 @@ import { logActivity } from '@/lib/activity-log'
  * Push an invoice download note to the WC order (customer-visible).
  * Also pushes an accounting invoice link as an admin-only note.
  */
-export async function pushInvoiceNoteToWc(orderId: string): Promise<void> {
+export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: boolean; error?: string }> {
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
     select: {
@@ -25,10 +25,11 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<void> {
       invoicePdfPath: true,
     },
   })
-  if (!so?.wcOrderId) return
+  if (!so?.wcOrderId) return { success: true }
 
   const ref = so.invoiceNumber ?? so.orderNumber ?? so.wcOrderNumber ?? orderId.slice(0, 8)
   const appUrl = (process.env.NEXT_PUBLIC_APP_URL || '').replace(/\/$/, '')
+  let failure: string | null = null
 
   // Build absolute download URL
   const downloadUrl = so.invoicePdfPath ? `${appUrl}${getInvoiceDownloadUrl(orderId)}` : null
@@ -52,10 +53,11 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<void> {
         customer_note: true,
       })
     } catch (e) {
-      logActivity({
+      await logActivity({
         entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_invoice_note_failed', tag: 'sync', level: 'WARNING',
         description: `Failed to push invoice note to WC order #${so.wcOrderId}: ${String(e)}`,
       })
+      failure = `Failed to push customer invoice note to WooCommerce: ${String(e)}`
     }
   }
 
@@ -80,10 +82,16 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<void> {
     try {
       await wcPut(`orders/${so.wcOrderId}`, { meta_data: metaData })
     } catch (e) {
-      logActivity({
+      await logActivity({
         entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_order_meta_failed', tag: 'sync', level: 'WARNING',
         description: `Failed to store invoice meta on WC order #${so.wcOrderId}: ${String(e)}`,
       })
+      if (!failure) {
+        failure = `Failed to store invoice metadata on WooCommerce order: ${String(e)}`
+      }
     }
   }
+
+  if (failure) return { success: false, error: failure }
+  return { success: true }
 }

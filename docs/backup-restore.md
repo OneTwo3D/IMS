@@ -27,6 +27,8 @@ You can restore from:
 
 Restoring overwrites all current data. To confirm, you must type **RESTORE** into the confirmation field. This safeguard prevents accidental restores.
 
+The restore API also enforces this confirmation server-side, requires a short-lived one-time confirmation code emailed to the authenticated admin address, and only accepts plain `.sql` files from the configured backup directory or an uploaded `.sql` file for that request.
+
 ## Remote Storage
 
 Backups can be uploaded to remote storage for off-site protection. Two storage types are supported.
@@ -63,9 +65,10 @@ Upload backups to a remote server via SFTP:
 | **Username** | The login username |
 | **Password** | Password authentication (if used) |
 | **Private key** | PEM-format private key for certificate-based authentication |
+| **Host fingerprint** | Required SSH host fingerprint used to pin the SFTP server identity |
 | **Remote path** | The directory on the remote server where backups are stored |
 
-Both password and private key (PEM format) authentication are supported for SFTP connections.
+Both password and private key (PEM format) authentication are supported for SFTP connections. Host fingerprint pinning is required; uploads fail if the server presents a different SSH host key.
 
 ## Per-Backup Actions
 

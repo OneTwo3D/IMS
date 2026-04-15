@@ -45,6 +45,7 @@ next-env.d.ts
 
 /app/generated/prisma
 /uploads
+/backups
 /data
 /.claude
 /playwright-report

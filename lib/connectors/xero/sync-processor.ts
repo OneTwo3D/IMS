@@ -18,6 +18,8 @@ import type { AccountingSyncType } from '@/app/generated/prisma/client'
 const MAX_RETRIES = 5
 const MAX_PER_RUN = 50 // Xero rate limit: 60/min — leave headroom
 const CLAIM_STALE_MS = 15 * 60 * 1000
+const RATE_LIMIT_BACKOFF_BASE_MS = 60_000
+const RATE_LIMIT_BACKOFF_MAX_MS = 15 * 60_000
 
 type ProcessResult = {
   processed: number
@@ -27,9 +29,55 @@ type ProcessResult = {
 }
 
 type SyncPayload = Record<string, unknown>
+type FollowUpSyncType = 'INVOICE_PAYMENT' | 'BILL_ATTACHMENT' | 'INVOICE_PDF' | 'INVOICE_EMAIL' | 'WC_INVOICE_NOTE'
 
 function buildXeroIdempotencyKey(entryId: string, operation: string): string {
   return `ims-${operation}-${entryId}`
+}
+
+function getRateLimitBackoffMs(retryCount: number, message: string): number {
+  const hinted = message.match(/retry after (\d+)ms/i)
+  const hintedMs = hinted ? Number.parseInt(hinted[1] ?? '0', 10) : 0
+  const exponential = Math.min(RATE_LIMIT_BACKOFF_BASE_MS * 2 ** retryCount, RATE_LIMIT_BACKOFF_MAX_MS)
+  return Math.max(hintedMs, exponential)
+}
+
+function isRateLimitError(message: string): boolean {
+  return /rate limit|rate limited|http 429|status 429/i.test(message)
+}
+
+async function hasExistingSyncLog(
+  type: AccountingSyncType,
+  referenceType: string,
+  referenceId: string,
+): Promise<boolean> {
+  const count = await db.accountingSyncLog.count({
+    where: {
+      type,
+      referenceType,
+      referenceId,
+      status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+    },
+  })
+  return count > 0
+}
+
+async function enqueueFollowUpSyncLog(
+  type: FollowUpSyncType,
+  referenceType: string,
+  referenceId: string,
+  payload: SyncPayload,
+): Promise<void> {
+  if (await hasExistingSyncLog(type, referenceType, referenceId)) return
+  await db.accountingSyncLog.create({
+    data: {
+      type,
+      status: 'PENDING',
+      referenceType,
+      referenceId,
+      payload: payload as never,
+    },
+  })
 }
 
 export async function processPendingXeroSync(): Promise<ProcessResult> {
@@ -39,7 +87,13 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
   const pending = await db.accountingSyncLog.findMany({
     where: {
       OR: [
-        { status: 'PENDING' },
+        {
+          status: 'PENDING',
+          OR: [
+            { processingStartedAt: null },
+            { processingStartedAt: { lte: new Date() } },
+          ],
+        },
         {
           status: 'PROCESSING',
           processingStartedAt: { lt: staleClaimCutoff },
@@ -57,7 +111,13 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
         id: entry.id,
         retryCount: { lt: MAX_RETRIES },
         OR: [
-          { status: 'PENDING' },
+          {
+            status: 'PENDING',
+            OR: [
+              { processingStartedAt: null },
+              { processingStartedAt: { lte: new Date() } },
+            ],
+          },
           {
             status: 'PROCESSING',
             processingStartedAt: { lt: staleClaimCutoff },
@@ -75,7 +135,7 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
     const payload = (entry.payload ?? {}) as SyncPayload
 
     try {
-      const syncResult = await processEntry(entry.id, entry.type, payload)
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload)
 
       if (syncResult.success) {
         await db.accountingSyncLog.update({
@@ -91,8 +151,45 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
 
         // Update back-references (e.g. accountingInvoiceId on SalesOrder)
         await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
+        await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
 
         result.succeeded++
+      } else {
+        const errorMessage = syncResult.error ?? 'Unknown error'
+        if (isRateLimitError(errorMessage)) {
+          await db.accountingSyncLog.update({
+            where: { id: entry.id },
+            data: {
+              status: 'PENDING',
+              errorMessage,
+              processingStartedAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
+            },
+          })
+        } else {
+          const retryCount = entry.retryCount + 1
+          await db.accountingSyncLog.update({
+            where: { id: entry.id },
+            data: {
+              status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
+              retryCount,
+              errorMessage,
+              processingStartedAt: null,
+            },
+          })
+        }
+        result.failed++
+      }
+    } catch (e) {
+      const errorMessage = String(e)
+      if (isRateLimitError(errorMessage)) {
+        await db.accountingSyncLog.update({
+          where: { id: entry.id },
+          data: {
+            status: 'PENDING',
+            errorMessage,
+            processingStartedAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
+          },
+        })
       } else {
         const retryCount = entry.retryCount + 1
         await db.accountingSyncLog.update({
@@ -100,23 +197,11 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
           data: {
             status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
             retryCount,
-            errorMessage: syncResult.error ?? 'Unknown error',
+            errorMessage,
             processingStartedAt: null,
           },
         })
-        result.failed++
       }
-    } catch (e) {
-      const retryCount = entry.retryCount + 1
-      await db.accountingSyncLog.update({
-        where: { id: entry.id },
-        data: {
-          status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
-          retryCount,
-          errorMessage: String(e),
-          processingStartedAt: null,
-        },
-      })
       result.failed++
     }
   }
@@ -128,7 +213,7 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
   result.skipped = skippedCount
 
   if (result.processed > 0) {
-    logActivity({
+    await logActivity({
       entityType: 'SYSTEM',
       action: 'xero_sync_batch',
       tag: 'sync',
@@ -151,12 +236,20 @@ function resolveJournalStatus(mode: unknown): string {
 async function processEntry(
   entryId: string,
   type: AccountingSyncType,
+  referenceType: string,
+  referenceId: string,
   payload: SyncPayload,
 ): Promise<{ success: boolean; externalId?: string; invoiceNumber?: string; error?: string }> {
   const postingMode = payload._postingMode
 
   switch (type) {
     case 'SALES_INVOICE': {
+      const customerId = referenceType === 'SalesOrder'
+        ? (await db.salesOrder.findUnique({
+            where: { id: referenceId },
+            select: { customerId: true },
+          }).catch(() => null))?.customerId ?? undefined
+        : undefined
       const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice')
       const invoiceResult = await pushSalesInvoice({
         invoiceNumber: payload.invoiceNumber as string,
@@ -175,91 +268,17 @@ async function processEntry(
         discountTaxType: payload.discountTaxType as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey })
-
-      // Register payment in Xero if requested (pre-paid WC orders).
-      // Payment account map is a connector-agnostic setting — the active
-      // accounting connector (Xero here) interprets the stored value as
-      // either a Xero UUID (preferred) or a legacy Account Code.
-      if (invoiceResult.success && invoiceResult.invoiceId && payload._registerPayment) {
-        try {
-          const paymentMap = await getPaymentAccountMap()
-          const method = payload._paymentMethod as string || ''
-          const currency = payload.currency as string || 'GBP'
-
-          if (!paymentMap || Object.keys(paymentMap).length === 0) {
-            logActivity({
-              entityType: 'SYSTEM',
-              action: 'xero_payment_skipped',
-              tag: 'sync',
-              level: 'WARNING',
-              description: `Skipped Xero payment registration: no payment account map configured. Go to Settings → Accounting → Payment Account Mapping to set up bank accounts for each payment method.`,
-            })
-          } else {
-            const stored = lookupPaymentAccount(paymentMap, method, currency)
-
-            if (!stored) {
-              logActivity({
-                entityType: 'SYSTEM',
-                action: 'xero_payment_skipped',
-                tag: 'sync',
-                level: 'WARNING',
-                description: `Skipped Xero payment registration: no bank account mapped for method "${method}" / currency "${currency}". Add a mapping in Settings → Accounting → Payment Account Mapping.`,
-              })
-            } else {
-              // Resolve stored value to a XeroAccount — match either xeroId (new) or code (legacy).
-              // Bank accounts in Xero may have NULL codes (e.g. Stripe feeds), so we always post
-              // using AccountID, which is guaranteed unique.
-              const account = await db.xeroAccount.findFirst({
-                where: { OR: [{ xeroId: stored }, { code: stored }] },
-                select: { xeroId: true },
-              })
-              if (!account) {
-                logActivity({
-                  entityType: 'SYSTEM',
-                  action: 'xero_payment_skipped',
-                  tag: 'sync',
-                  level: 'WARNING',
-                  description: `Skipped Xero payment registration: bank account "${stored}" not found in synced Xero chart of accounts. Re-sync accounts from Settings → Accounting → Xero.`,
-                })
-              } else {
-                // Use Xero's computed invoice total (includes tax, discounts, rounding).
-                // Fall back to manual calculation only if total is missing.
-                let amount = invoiceResult.total
-                if (amount == null) {
-                  amount = (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
-                    + ((payload.shippingAmount as number) || 0)
-                    - ((payload.discountAmount as number) || 0)
-                }
-
-                if (amount > 0) {
-                  const paymentDate = (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
-                  await xeroPost('Payments', {
-                    Invoice: { InvoiceID: invoiceResult.invoiceId },
-                    Account: { AccountID: account.xeroId },
-                    Date: paymentDate,
-                    Amount: amount,
-                  }, { idempotencyKey: buildXeroIdempotencyKey(entryId, 'invoice-payment') })
-                }
-              }
-            }
-          }
-        } catch (e) {
-          // Payment registration failure is non-critical — invoice was already created
-          logActivity({
-            entityType: 'SYSTEM',
-            action: 'xero_payment_registration_failed',
-            tag: 'sync',
-            level: 'WARNING',
-            description: `Failed to register Xero payment: ${String(e)}`,
-          })
-        }
-      }
-
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId })
       return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, error: invoiceResult.error }
     }
 
     case 'PURCHASE_INVOICE': {
+      const supplier = referenceType === 'PurchaseOrder'
+        ? await db.purchaseOrder.findUnique({
+            where: { id: referenceId },
+            select: { supplierId: true, supplier: { select: { email: true } } },
+          }).catch(() => null)
+        : null
       const billIdempotencyKey = buildXeroIdempotencyKey(entryId, 'bill')
       const billResult = await pushPurchaseBill({
         invoiceNumber: payload.invoiceNumber as string | undefined,
@@ -269,41 +288,102 @@ async function processEntry(
         currency: payload.currency as string,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: billIdempotencyKey })
-      // Attach supplier invoice PDF if available and setting enabled
-      if (billResult.success && billResult.invoiceId && payload.supplierInvoicePath) {
-        try {
-          const attachEnabled = await db.setting.findUnique({ where: { key: 'xero_sync_attach_pdf' } })
-          if (attachEnabled?.value !== 'false') {
-            // supplierInvoicePath is `/uploads/invoices/<filename>` — files live at
-            // `{cwd}/uploads/invoices/<filename>` (not under `public/`).
-            const relPath = (payload.supplierInvoicePath as string).replace(/^\/+/, '')
-            const pdfPath = join(/* turbopackIgnore: true */ process.cwd(), relPath)
-            const pdfBuffer = await readFile(pdfPath)
-            const filename = relPath.split('/').pop() ?? 'supplier-invoice.pdf'
-            const uploadRes = await xeroUploadAttachment('Invoices', billResult.invoiceId, filename, pdfBuffer, 'application/pdf')
-            if (!uploadRes.ok) {
-              logActivity({
-                entityType: 'SYSTEM',
-                action: 'xero_attachment_failed',
-                tag: 'sync',
-                level: 'WARNING',
-                description: `Failed to attach supplier invoice PDF to Xero bill ${billResult.invoiceId}: ${uploadRes.error ?? 'unknown error'}`,
-              })
-            }
-          }
-        } catch (e) {
-          // Attachment failure is non-critical — bill was already created
-          logActivity({
-            entityType: 'SYSTEM',
-            action: 'xero_attachment_failed',
-            tag: 'sync',
-            level: 'WARNING',
-            description: `Failed to attach supplier invoice PDF to Xero bill ${billResult.invoiceId}: ${String(e)}`,
-          })
-        }
-      }
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: billIdempotencyKey, supplierId: supplier?.supplierId, supplierEmail: supplier?.supplier.email ?? undefined })
       return { success: billResult.success, externalId: billResult.invoiceId, error: billResult.error }
+    }
+
+    case 'INVOICE_PAYMENT': {
+      const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
+      const bankAccountId = payload.bankAccountId as string | undefined
+      const amount = payload.amount as number | undefined
+      const paymentDate = (payload.paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10)
+      if (!accountingInvoiceId || !bankAccountId || amount == null) {
+        return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for INVOICE_PAYMENT' }
+      }
+      const account = await db.xeroAccount.findFirst({
+        where: { OR: [{ xeroId: bankAccountId }, { code: bankAccountId }] },
+        select: { xeroId: true },
+      })
+      if (!account) {
+        return { success: false, error: `Bank account ${bankAccountId} not found in synced Xero chart of accounts` }
+      }
+      try {
+        const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
+          Invoice: { InvoiceID: accountingInvoiceId },
+          Account: { AccountID: account.xeroId },
+          Date: paymentDate,
+          Amount: amount,
+        }, { idempotencyKey: buildXeroIdempotencyKey(entryId, 'invoice-payment') })
+        if (!paymentRes.ok) {
+          return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
+        }
+        const paymentId = paymentRes.data?.Payments?.[0]?.PaymentID
+        return { success: true, externalId: paymentId }
+      } catch (e) {
+        return { success: false, error: String(e) }
+      }
+    }
+
+    case 'BILL_ATTACHMENT': {
+      const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
+      const supplierInvoicePath = payload.supplierInvoicePath as string | undefined
+      if (!accountingInvoiceId || !supplierInvoicePath) {
+        return { success: false, error: 'Missing accountingInvoiceId or supplierInvoicePath for BILL_ATTACHMENT' }
+      }
+      const attachEnabled = await db.setting.findUnique({ where: { key: 'xero_sync_attach_pdf' } })
+      if (attachEnabled?.value === 'false') {
+        return { success: true }
+      }
+      try {
+        const relPath = supplierInvoicePath.replace(/^\/+/, '')
+        const pdfPath = join(/* turbopackIgnore: true */ process.cwd(), relPath)
+        const pdfBuffer = await readFile(pdfPath)
+        const filename = relPath.split('/').pop() ?? 'supplier-invoice.pdf'
+        const uploadRes = await xeroUploadAttachment('Invoices', accountingInvoiceId, filename, pdfBuffer, 'application/pdf')
+        if (!uploadRes.ok) {
+          return { success: false, error: uploadRes.error ?? 'Failed to attach supplier invoice PDF' }
+        }
+        return { success: true }
+      } catch (e) {
+        return { success: false, error: String(e) }
+      }
+    }
+
+    case 'INVOICE_PDF': {
+      const accountingInvoiceId = payload.accountingInvoiceId as string | undefined
+      const orderId = payload.referenceId as string | undefined
+      if (!accountingInvoiceId || !orderId) {
+        return { success: false, error: 'Missing accountingInvoiceId or referenceId for INVOICE_PDF' }
+      }
+      try {
+        const { downloadXeroInvoicePdf, saveInvoicePdf } = await import('./invoice-pdf')
+        const pdfBuffer = await downloadXeroInvoicePdf(accountingInvoiceId)
+        if (!pdfBuffer) return { success: false, error: 'Failed to download Xero invoice PDF' }
+        const pdfPath = await saveInvoicePdf(orderId, pdfBuffer)
+        await db.salesOrder.update({
+          where: { id: orderId },
+          data: { invoicePdfPath: pdfPath },
+        })
+        return { success: true }
+      } catch (e) {
+        return { success: false, error: String(e) }
+      }
+    }
+
+    case 'INVOICE_EMAIL': {
+      const orderId = payload.referenceId as string | undefined
+      if (!orderId) return { success: false, error: 'Missing referenceId for INVOICE_EMAIL' }
+      const { sendAccountingInvoiceEmailInternal } = await import('@/lib/accounting-email')
+      const emailResult = await sendAccountingInvoiceEmailInternal(orderId)
+      return emailResult.success ? { success: true } : { success: false, error: emailResult.error ?? 'Failed to email invoice' }
+    }
+
+    case 'WC_INVOICE_NOTE': {
+      const orderId = payload.referenceId as string | undefined
+      if (!orderId) return { success: false, error: 'Missing referenceId for WC_INVOICE_NOTE' }
+      const { pushInvoiceNoteToWc } = await import('@/lib/connectors/woocommerce/sync/invoice-note')
+      const wcResult = await pushInvoiceNoteToWc(orderId)
+      return wcResult.success ? { success: true } : { success: false, error: wcResult.error ?? 'Failed to notify WooCommerce about invoice' }
     }
 
     case 'BILL_PAYMENT': {
@@ -342,7 +422,13 @@ async function processEntry(
       }
     }
 
-    case 'CREDIT_NOTE':
+    case 'CREDIT_NOTE': {
+      const creditCustomerId = referenceType === 'SalesOrderRefund'
+        ? (await db.salesOrderRefund.findUnique({
+            where: { id: referenceId },
+            select: { order: { select: { customerId: true } } },
+          }).catch(() => null))?.order.customerId ?? undefined
+        : undefined
       return pushCreditNote({
         creditNoteNumber: payload.creditNoteNumber as string,
         contactName: payload.contactName as string,
@@ -351,7 +437,8 @@ async function processEntry(
         currency: payload.currency as string,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
-      }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note') }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
+    }
 
     case 'COGS_JOURNAL':
     case 'INVENTORY_ADJUSTMENT':
@@ -394,28 +481,6 @@ async function updateBackReference(
           invoicedAt: new Date(),
         },
       })
-
-      // Download Xero invoice PDF, save, email, and notify shopping channel
-      try {
-        const { downloadXeroInvoicePdf, saveInvoicePdf } = await import('./invoice-pdf')
-        const pdfBuffer = await downloadXeroInvoicePdf(externalId)
-        if (pdfBuffer) {
-          const pdfPath = await saveInvoicePdf(referenceId, pdfBuffer)
-          await db.salesOrder.update({
-            where: { id: referenceId },
-            data: { invoicePdfPath: pdfPath },
-          })
-
-          // Email the Xero invoice PDF to the customer (internal call, no auth needed)
-          const { sendAccountingInvoiceEmailInternal } = await import('@/lib/accounting-email')
-          await sendAccountingInvoiceEmailInternal(referenceId).catch(() => {})
-
-          // Notify shopping channel (WC pushes order note with download link)
-          await notifyShoppingChannel(referenceId, 'invoice_ready')
-        }
-      } catch {
-        // PDF download/email failure is non-critical
-      }
     } else if (type === 'CREDIT_NOTE' && referenceType === 'SalesOrderRefund') {
       await db.salesOrderRefund.update({
         where: { id: referenceId },
@@ -432,21 +497,115 @@ async function updateBackReference(
   }
 }
 
-/**
- * Generic shopping channel notification hook.
- * Each connector registers its own handler. Xero never imports from WC directly.
- */
-async function notifyShoppingChannel(orderId: string, event: string): Promise<void> {
-  const so = await db.salesOrder.findUnique({
-    where: { id: orderId },
-    select: { wcOrderId: true },
-  })
+async function enqueueSalesInvoiceFollowUps(
+  entryId: string,
+  referenceType: string,
+  referenceId: string,
+  payload: SyncPayload,
+  syncResult: { externalId?: string; invoiceNumber?: string },
+): Promise<void> {
+  if (referenceType !== 'SalesOrder' || !syncResult.externalId) return
 
-  // WooCommerce handler
-  if (so?.wcOrderId && event === 'invoice_ready') {
-    const { pushInvoiceNoteToWc } = await import('@/lib/connectors/woocommerce/sync/invoice-note')
-    await pushInvoiceNoteToWc(orderId).catch(() => {})
+  if (payload._registerPayment) {
+    const paymentMap = await getPaymentAccountMap()
+    const method = payload._paymentMethod as string || ''
+    const currency = payload.currency as string || 'GBP'
+
+    if (!paymentMap || Object.keys(paymentMap).length === 0) {
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'xero_payment_skipped',
+        tag: 'sync',
+        level: 'WARNING',
+        description: 'Skipped Xero payment registration: no payment account map configured. Go to Settings → Accounting → Payment Account Mapping to set up bank accounts for each payment method.',
+      })
+    } else {
+      const stored = lookupPaymentAccount(paymentMap, method, currency)
+      if (!stored) {
+        await logActivity({
+          entityType: 'SYSTEM',
+          action: 'xero_payment_skipped',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `Skipped Xero payment registration: no bank account mapped for method "${method}" / currency "${currency}". Add a mapping in Settings → Accounting → Payment Account Mapping.`,
+        })
+      } else {
+        let amount = payload._paymentAmount as number | undefined
+        if (amount == null && typeof payload._paymentAmount === 'string') {
+          amount = Number(payload._paymentAmount)
+        }
+        if (amount == null) {
+          amount = (payload.lines as Array<{ quantity: number; unitAmount: number }>).reduce((s, l) => s + l.quantity * l.unitAmount, 0)
+            + ((payload.shippingAmount as number) || 0)
+            - ((payload.discountAmount as number) || 0)
+        }
+
+        if (amount > 0) {
+          await enqueueFollowUpSyncLog('INVOICE_PAYMENT', referenceType, referenceId, {
+            accountingInvoiceId: syncResult.externalId,
+            bankAccountId: stored,
+            amount,
+            paymentDate: (payload._paymentDate as string)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
+            currency,
+            method,
+            sourceEntryId: entryId,
+          })
+        }
+      }
+    }
   }
 
-  // Future: Shopify handler would go here
+  await enqueueFollowUpSyncLog('INVOICE_PDF', referenceType, referenceId, {
+    accountingInvoiceId: syncResult.externalId,
+    referenceId,
+    invoiceNumber: syncResult.invoiceNumber,
+    sourceEntryId: entryId,
+  })
+}
+
+async function enqueuePurchaseInvoiceFollowUps(
+  entryId: string,
+  referenceType: string,
+  referenceId: string,
+  payload: SyncPayload,
+  syncResult: { externalId?: string },
+): Promise<void> {
+  if (referenceType !== 'PurchaseInvoice' || !syncResult.externalId || !payload.supplierInvoicePath) return
+  await enqueueFollowUpSyncLog('BILL_ATTACHMENT', referenceType, referenceId, {
+    accountingInvoiceId: syncResult.externalId,
+    supplierInvoicePath: payload.supplierInvoicePath,
+    sourceEntryId: entryId,
+  })
+}
+
+async function enqueueFollowUps(
+  entryId: string,
+  type: AccountingSyncType,
+  referenceType: string,
+  referenceId: string,
+  payload: SyncPayload,
+  syncResult: { externalId?: string; invoiceNumber?: string },
+): Promise<void> {
+  if (type === 'SALES_INVOICE') {
+    await enqueueSalesInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
+    return
+  }
+
+  if (type === 'PURCHASE_INVOICE') {
+    await enqueuePurchaseInvoiceFollowUps(entryId, referenceType, referenceId, payload, syncResult)
+    return
+  }
+
+  if (type === 'INVOICE_PDF' && referenceType === 'SalesOrder') {
+    const order = await db.salesOrder.findUnique({
+      where: { id: referenceId },
+      select: { customerEmail: true, wcOrderId: true },
+    })
+    if (order?.customerEmail) {
+      await enqueueFollowUpSyncLog('INVOICE_EMAIL', referenceType, referenceId, { referenceId, sourceEntryId: entryId })
+    }
+    if (order?.wcOrderId) {
+      await enqueueFollowUpSyncLog('WC_INVOICE_NOTE', referenceType, referenceId, { referenceId, sourceEntryId: entryId })
+    }
+  }
 }

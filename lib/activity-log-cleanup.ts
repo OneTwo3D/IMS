@@ -5,6 +5,7 @@ const DEFAULTS: Record<string, number> = {
   WARNING: 60,
   ERROR: 90,
 }
+const DELETE_BATCH_SIZE = 10_000
 
 async function getSetting(key: string): Promise<string | null> {
   const row = await db.setting.findUnique({ where: { key } })
@@ -36,10 +37,26 @@ export async function purgeExpiredActivityLogs() {
   for (const [level, days] of Object.entries(retention)) {
     if (days <= 0) continue // 0 = keep forever
     const cutoff = new Date(now - days * 24 * 60 * 60 * 1000)
-    const { count } = await db.activityLog.deleteMany({
-      where: { level: level as 'INFO' | 'WARNING' | 'ERROR', createdAt: { lt: cutoff } },
-    })
-    totalDeleted += count
+    for (;;) {
+      const rows = await db.$queryRaw<Array<{ count: number }>>`
+        WITH deleted AS (
+          DELETE FROM "activity_logs"
+          WHERE id IN (
+            SELECT id
+            FROM "activity_logs"
+            WHERE level = ${level}::"ActivityLogLevel"
+              AND "createdAt" < ${cutoff}
+            ORDER BY "createdAt" ASC
+            LIMIT ${DELETE_BATCH_SIZE}
+          )
+          RETURNING 1
+        )
+        SELECT COUNT(*)::int AS count FROM deleted
+      `
+      const batchDeleted = rows[0]?.count ?? 0
+      totalDeleted += batchDeleted
+      if (batchDeleted < DELETE_BATCH_SIZE) break
+    }
   }
 
   return { totalDeleted, retention }

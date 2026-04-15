@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verify'
 import { syncWcProductToIms } from '@/lib/connectors/woocommerce/sync/product-sync'
 import {
@@ -11,6 +12,9 @@ import {
 import type { WcFullProduct } from '@/lib/connectors/woocommerce/sync/types'
 
 export async function POST(request: Request) {
+  const maintenance = await getMaintenanceModeResponse('webhook')
+  if (maintenance) return maintenance
+
   const body = await request.text()
   const signature = request.headers.get('x-wc-webhook-signature')
   const topic = request.headers.get('x-wc-webhook-topic')

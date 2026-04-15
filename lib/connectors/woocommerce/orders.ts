@@ -209,9 +209,10 @@ async function runImport(dateFrom: string, dateTo: string, progress: HistoricalI
     progress.message = parts.join(' ')
     await saveProgress(progress)
 
-    logActivity({
+    await logActivity({
       entityType: 'IMPORT', tag: 'import', action: 'imported',
       description: `Imported ${progress.ordersProcessed} historical WC orders, ${progress.movementsCreated} demand records`,
+      resolveUser: false,
     })
 
     notify({
@@ -226,9 +227,10 @@ async function runImport(dateFrom: string, dateTo: string, progress: HistoricalI
     progress.errors.push(String(e))
     await saveProgress(progress)
 
-    logActivity({
+    await logActivity({
       entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR',
       description: `Failed to import historical WC orders: ${String(e)}`,
+      resolveUser: false,
     })
 
     notify({

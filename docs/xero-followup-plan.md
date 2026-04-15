@@ -1,141 +1,251 @@
 # Xero Follow-Up Plan
 
-Date: 2026-04-14
-Branch baseline: `main` at commit `e207543`
+Date: 2026-04-15
+Branch baseline: `main`
 
 ## Goal
 
-Close the remaining review items after the Xero batch-accounting and refund FIFO fixes already merged in `e207543`.
+Close the remaining Xero follow-up work and finish the accounting connector boundary so Xero can be disabled or replaced by another accounting connector, such as QuickBooks, without changing non-connector code.
+
+## Outcome Target
+
+The main program should depend only on connector-agnostic accounting interfaces.
+
+That means:
+- core business flows queue and inspect accounting work through generic accounting APIs
+- shared UI renders generic accounting integration state, external-document links, and readiness/errors
+- cron and OAuth/webhook ingress go through generic accounting connector entrypoints
+- connector-specific settings keys, token models, route details, payload shaping, and API semantics stay inside the connector implementation
+
+Replacing Xero with QuickBooks should require:
+- adding a QuickBooks connector implementation
+- selecting/configuring the active accounting connector
+- optionally migrating connector-owned persisted data
+
+It should not require editing sales, purchasing, stock, settings, dashboard, or other core app code.
 
 ## Current status
 
-Already fixed:
-- Revenue deferral and recognition now use net revenue instead of gross-with-VAT.
-- Foreign-currency invoice and credit-note line amounts now use order currency amounts.
-- Refund COGS and allocation reversals now use persisted historical FIFO snapshots.
-- A2 and B now persist allocation/shipment FIFO history.
-- Returned stock can recreate cost layers from refund snapshots.
-- Xero sync logs now use a `PROCESSING` claim step to reduce double-post risk.
-- Failed daily-batch logs are automatically reset for reprocessing.
-- Seeded E2E coverage exists for mixed shipped/unshipped refund reversal and return-stock layer recreation.
+Already in the right direction:
+- [lib/accounting.ts](../lib/accounting.ts) exists as a generic facade for queuing accounting sync and reading some accounting settings.
+- Core sync queue writes already go through generic `AccountingSyncLog` rows rather than Xero-only sync-log types.
+- Core document/PDF storage has some connector-neutral shaping already, for example [lib/invoice-pdf.ts](../lib/invoice-pdf.ts).
+- The architecture docs already describe the intended future shape: accounting connectors under `lib/connectors/`.
 
-Still open / partial:
-- VAT liability posting is not implemented yet.
-- Xero idempotency header is not implemented yet.
-- Failed-log recovery still relies on requeue logic rather than a stricter `SYNCED`-driven completeness model.
-- Preview COGS still mutates/consumes the preview snapshot in a way that can surprise operators.
+Not replaceable enough yet:
+- `lib/accounting.ts` still delegates directly to Xero internals and returns Xero-shaped defaults, account fields, and account-list storage.
+- app actions are Xero-specific (`app/actions/xero-sync.ts`, `app/actions/xero-daily-batch.ts`) rather than generic accounting-integration actions.
+- the integrations dashboard and client components are wired to Xero concepts, Xero settings, Xero account lists, and Xero tax rates.
+- cron endpoints are named and implemented as Xero-specific routes (`/api/cron/xero-sync`, `/api/cron/xero-daily-batch`, `/api/cron/xero-payment-poll`).
+- the OAuth callback is Xero-specific (`/api/xero/callback`) and redirects with Xero-specific query params.
+- tax-rate linking in settings calls Xero APIs directly.
+- page-level invoice/bill link defaults still assume Xero URL formats.
+- generic account/bank-account listing still reads from `db.xeroAccount` directly.
+
+## Current boundary leaks
+
+### 1. Generic accounting facade still has Xero-specific internals
+
+Examples:
+- `queueAccountingSync()` imports `queueXeroSync`
+- `getAccountingSettings()` imports `getXeroSettings()` and maps `xero_*` fields
+- `listAccountCodes()` and `listAccountingBankAccounts()` read `db.xeroAccount` directly
+- default invoice/bill URL templates still point to `go.xero.com`
+
+Impact:
+- any new connector would require changes in `lib/accounting.ts`, which should instead be the stable app-facing contract.
+
+### 2. App-facing integration actions are Xero-specific
+
+Examples:
+- `app/actions/xero-sync.ts`
+- `app/actions/xero-daily-batch.ts`
+- `app/actions/settings.ts` direct `autoLinkXeroTaxRates()`
+
+Impact:
+- the app layer currently knows about Xero credentials, Xero readiness rules, Xero tax types, Xero account sync, Xero manual sync, and Xero retry behavior.
+- replacing the connector would require touching non-connector action files and the dashboard page/client that consume them.
+
+### 3. Integration UI is Xero-shaped rather than connector-shaped
+
+Examples:
+- `app/(dashboard)/sync/page.tsx`
+- `app/(dashboard)/sync/sync-dashboard.tsx`
+- `app/(dashboard)/sync/xero-client.tsx`
+
+Impact:
+- the UI knows about Xero tabs, Xero client ID/secret, Xero tenant name, Xero account IDs, Xero tax codes, and Xero-specific toggle labels.
+- QuickBooks support would currently require editing shared dashboard code instead of plugging in a connector-owned UI surface or metadata contract.
+
+### 4. Cron and OAuth ingress are Xero-specific app routes
+
+Examples:
+- `/api/cron/xero-sync`
+- `/api/cron/xero-daily-batch`
+- `/api/cron/xero-payment-poll`
+- `/api/xero/callback`
+
+Impact:
+- route naming and enablement logic are coupled to Xero.
+- a new accounting connector would currently require new app-level route handlers rather than plugging into a generic accounting ingress layer.
+
+### 5. Generic settings and page flows still expose Xero-specific concepts
+
+Examples:
+- tax-rate auto-linking is Xero-specific
+- sales and purchase pages rely on accounting URL templates whose defaults are Xero deep links
+- purchase order payment UI still describes Xero-specific behavior
+
+Impact:
+- user-facing app code still assumes the active accounting connector is Xero.
+
+### 6. Persistence model remains connector-specific in places
+
+Examples:
+- `db.xeroAccount`
+- `db.xeroToken`
+- `xeroTransactionId` fields and Xero-specific naming in action return types/UI models
+
+Impact:
+- some schema-level connector specificity is acceptable during migration, but non-connector code should not be reading those tables/fields directly.
+- generic selectors/view models are needed so the app can remain connector-neutral even if the database is not fully normalized yet.
 
 ## Work items
 
-### 1. Add explicit VAT liability posting
+### 1. Freeze the generic accounting connector contract
 
-Problem:
-- Revenue is now net, but VAT still is not posted to a dedicated liability account in the daily-batch/sub-ledger flow.
-
-Required changes:
-- Add a new Xero/accounting setting for output VAT liability account.
-- Extend settings UI and validation so the account is required when Xero sync is enabled.
-- Decide exact posting model:
-  - Preferred: keep A1/B on net revenue only, and post VAT separately when the invoice event crystallises the tax.
-  - Alternative: add paired deferral/release VAT journals if that better matches the intended sub-ledger architecture.
-- Update journal builders so VAT never lands in sales or unearned revenue accounts.
-- Add targeted test coverage for VAT-bearing orders and zero-tax orders.
-
-Questions to resolve:
-- Should VAT post at invoice creation, at payment, or as part of A1?
-- Should shipping VAT be treated identically to product VAT in the same liability posting?
-
-Definition of done:
-- A VAT-bearing order creates a tax liability posting to the configured tax account.
-- Sales/unearned revenue balances remain net of tax.
-- Automated coverage asserts the expected account codes and amounts.
-
-### 2. Add Xero idempotency key support
-
-Problem:
-- The `PROCESSING` claim step fixes the main race, but Xero still has no request-level idempotency safeguard.
+Status: open
 
 Required changes:
-- Extend the Xero API client to send `Idempotency-Key` where supported.
-- Derive the key from `accountingSyncLog.id` or another immutable sync-log identifier.
-- Confirm which Xero endpoints in use support the header and apply it consistently.
-- Add logging so duplicate retries are diagnosable.
+- expand `lib/accounting.ts` into the stable app-facing boundary for all accounting connectors
+- centralize active accounting connector resolution there
+- expose connector-agnostic capabilities for:
+  - queueing accounting sync work
+  - reading connector status/readiness
+  - reading integration settings summary
+  - listing accounts and bank accounts
+  - listing tax codes
+  - external invoice/bill link generation
+  - retry/manual sync operations
+  - any batch-preview/history surfaces that must remain app-facing
 
 Definition of done:
-- Replaying the same sync-log post uses the same idempotency key.
-- Client code documents which endpoints are covered and which are not.
+- non-connector business logic imports only from `lib/accounting.ts` or another explicitly generic accounting boundary.
+- `lib/accounting.ts` no longer imports Xero-specific functions directly as its public behavior contract.
 
-### 3. Tighten failed-sync completeness model
+### 2. Replace Xero-specific integration actions with generic accounting actions
 
-Problem:
-- Daily-batch rows now requeue automatically, but source-row completeness is still inferred from date flags plus reset logic.
+Status: open
 
 Required changes:
-- Review whether source-row eligibility should instead derive from successful sync-log state.
-- Evaluate one of these approaches:
-  - Option A: keep current date flags but add a reconciliation job that recreates or resets orphaned logs more explicitly.
-  - Option B: gate A1/A2/B eligibility on matching `SYNCED` logs rather than only source-row dates.
-- Document the intended operational model so Finance can understand retry/recovery behavior.
-
-Recommendation:
-- Start with Option A unless Option B can be introduced without destabilizing the current flow.
+- replace `app/actions/xero-sync.ts` with generic accounting integration actions
+- move Xero-specific credential handling, readiness checks, account sync, tax-code fetch, manual sync, and retry logic behind connector-owned adapters
+- replace `app/actions/xero-daily-batch.ts` with either:
+  - generic accounting batch actions, if daily batch is meant to remain a core accounting concept, or
+  - connector-owned admin actions, if daily batch is a Xero-specific implementation detail
+- move `autoLinkXeroTaxRates()` behind a generic accounting tax-code linking action or connector capability
 
 Definition of done:
-- There is a deterministic recovery path for every failed daily-batch row.
-- We can explain exactly why an eligible source row will not be silently skipped forever.
+- shared app actions no longer expose Xero-specific types, names, or settings keys.
+- adding QuickBooks does not require cloning and renaming app actions.
 
-### 4. Fix preview-batch FIFO behavior
+### 3. Generalize the accounting integrations dashboard
 
-Problem:
-- Preview mode still behaves differently enough from posting mode that operators can be surprised.
+Status: open
 
 Required changes:
-- Review preview snapshot handling in `app/actions/xero-daily-batch.ts`.
-- Either:
-  - make preview mirror posting logic more closely, or
-  - clearly label preview as non-binding / approximate in the UI.
-- Add a small regression test if practical.
+- refactor `/sync` accounting surfaces so shared dashboard code consumes generic connector descriptors and generic accounting integration data
+- either:
+  - move Xero-specific UI into a connector-owned rendered section, or
+  - define a generic UI schema/metadata contract that connectors provide
+- remove Xero-specific prop shapes such as Xero account rows, tenant names, tax rates, and sync-log naming from shared dashboard code
+- keep connector branding/logo selection data-driven rather than hard-wired through shared logic
 
 Definition of done:
-- Preview results are either operationally trustworthy or explicitly marked as indicative only.
+- shared dashboard/page code does not import Xero-specific action types or components.
+- the Xero UI is mounted as connector-specific content behind a generic accounting dashboard surface.
 
-## Suggested order
+### 4. Generalize accounting cron and callback ingress
 
-1. VAT liability posting
-2. Xero idempotency key
-3. Failed-sync completeness hardening
-4. Preview-batch behavior cleanup
+Status: open
+
+Required changes:
+- replace `/api/cron/xero-sync`, `/api/cron/xero-daily-batch`, and `/api/cron/xero-payment-poll` app routes with generic accounting cron entrypoints or connector registration-driven cron handlers
+- move enablement checks and connector-specific execution logic behind the accounting connector boundary
+- replace `/api/xero/callback` with a generic accounting OAuth callback entrypoint or connector-scoped registration model
+- avoid Xero-specific redirect query params in shared UI routing
+
+Definition of done:
+- adding a new accounting connector does not require adding new Xero-style top-level app routes.
+- cron/auth callback behavior is selected by the active accounting connector rather than hard-coded route names.
+
+### 5. Remove Xero-specific reads from generic settings and page flows
+
+Status: open
+
+Required changes:
+- replace direct Xero tax-rate linking in `app/actions/settings.ts` with generic accounting tax-code linking
+- stop relying on Xero deep-link defaults in sales/purchase page code
+- replace Xero-specific wording in generic operational flows with connector-neutral wording
+- ensure PO payment/account selectors consume generic accounting bank-account interfaces only
+
+Definition of done:
+- core settings, sales, purchasing, and stock pages do not mention or depend on Xero-specific concepts unless they are inside a connector-owned UI section.
+
+### 6. Hide connector-specific persistence behind generic selectors/view models
+
+Status: open
+
+Required changes:
+- stop reading `db.xeroAccount`, `db.xeroToken`, and `xeroTransactionId` directly from non-connector code
+- add generic repository/helpers/view models for:
+  - external account lists
+  - connector connection state
+  - connector sync logs
+  - external transaction IDs
+- where schema renames are too invasive for now, treat existing Xero tables/columns as adapter-owned persistence behind generic APIs
+
+Definition of done:
+- non-connector code can stay unchanged even if the backing accounting connector storage changes from Xero tables to QuickBooks tables.
+
+### 7. Preserve and extend accounting correctness work under the new boundary
+
+Status: open
+
+The remaining functional/accounting items still matter, but they should now be implemented through the generic accounting boundary:
+- VAT liability posting
+- request idempotency support
+- failed-sync completeness hardening
+- preview/daily-batch behavior cleanup
+
+Guidance:
+- do not add more Xero-specific app-layer coupling while implementing those fixes
+- if daily-batch remains a Xero-only concept, keep its operational UI and logic connector-owned
+- if daily-batch is intended to become a generic accounting sub-ledger concept, rename and model it generically before adding more features
+
+## Recommended order
+
+1. Freeze the generic accounting contract in `lib/accounting.ts`
+2. Replace Xero-specific account/bank-account/tax-code access with generic accounting selectors
+3. Move Xero-specific app actions behind generic accounting integration actions
+4. Refactor the `/sync` accounting dashboard to mount connector-owned content through a generic shell
+5. Generalize cron and OAuth callback ingress
+6. Sweep remaining page/settings wording and link-generation leaks
+7. Continue VAT/idempotency/completeness/daily-batch fixes only through the generic boundary
+
+## Acceptance criteria
+
+- no non-connector code imports from `lib/connectors/xero/**`, except a single generic bootstrap/registration layer if one remains necessary
+- no non-connector code reads `xero_*` settings directly
+- no non-connector code reads `db.xeroAccount` or `db.xeroToken` directly
+- shared UI does not use Xero-specific component names or types for generic accounting surfaces
+- cron and OAuth entrypoints are connector-agnostic
+- sales, purchasing, stock, and settings flows continue to work without assuming Xero-specific URLs, tax concepts, or route names
+- QuickBooks support can be added by implementing the connector contract rather than rewriting app code
 
 ## Suggested next-session starting checklist
 
 1. Re-read `docs/xero-followup-plan.md`.
-2. Inspect current Xero settings model and decide where the VAT liability account should live.
-3. Confirm the intended tax crystallisation point with the business/accounting owner.
-4. Implement VAT posting first, because it is the largest remaining accounting gap.
-
-## Additional follow-up
-
-### 5. Move WooCommerce sync to webhook/on-demand first, cron as backup
-
-Problem:
-- The current WooCommerce sync cron still handles primary order import and product polling on a 5-minute schedule.
-- Desired architecture is webhook/on-demand first, with cron acting only as reconciliation/backup.
-
-Required changes:
-- Move WooCommerce order import to webhook-first processing instead of relying on the polling cron as the primary path.
-- Review whether any remaining IMS -> WC actions still depend on polling instead of immediate push.
-- Keep a scheduled reconciliation path, but reduce it to backup behavior, ideally daily.
-- Audit the current `wc-sync` cron responsibilities and split them into:
-  - primary real-time webhook/on-demand flows
-  - backup reconciliation flows
-- Confirm how missed webhooks, retries, and duplicate event handling will be managed once order import becomes webhook-first.
-
-Questions to resolve:
-- Should WC order webhook processing import immediately on `order.created` / `order.updated`, or queue durable jobs first?
-- Which parts of WC product sync still need polling when webhooks are configured and reliable?
-- Should stock retry draining stay frequent, or move to its own lightweight retry worker/cron?
-
-Definition of done:
-- WooCommerce order import is webhook-first.
-- The existing frequent `wc-sync` cron is no longer needed for normal operations.
-- A backup reconciliation cron remains in place, likely daily, to catch missed events and drift.
+2. Start with `lib/accounting.ts`, because it is the intended stable contract and still leaks Xero heavily.
+3. Decide whether daily batch is a generic accounting capability or a Xero-specific implementation detail.
+4. After the accounting contract is frozen, move account/tax-code access and dashboard actions onto that generic surface before adding more accounting features.

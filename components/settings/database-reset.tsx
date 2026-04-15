@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
-import { resetDatabase, type ResetLevel } from '@/app/actions/reset'
+import { resetDatabase, sendDatabaseResetCode, type ResetLevel } from '@/app/actions/reset'
 
 const LEVELS: { key: ResetLevel; label: string; description: string; items: string[] }[] = [
   {
@@ -36,21 +36,41 @@ export function DatabaseReset() {
   const [showDialog, setShowDialog] = useState(false)
   const [selectedLevel, setSelectedLevel] = useState<ResetLevel | null>(null)
   const [confirmation, setConfirmation] = useState('')
+  const [emailCode, setEmailCode] = useState('')
+  const [codeStatus, setCodeStatus] = useState<string | null>(null)
+  const [sendingCode, setSendingCode] = useState(false)
   const [result, setResult] = useState<{ message: string; isError: boolean } | null>(null)
 
   const level = LEVELS.find((l) => l.key === selectedLevel)
   const confirmText = selectedLevel === 'full' ? 'RESET EVERYTHING' : selectedLevel === 'products' ? 'RESET PRODUCTS' : 'RESET TRANSACTIONS'
   const isConfirmed = confirmation === confirmText
 
+  async function handleSendCode() {
+    setSendingCode(true)
+    setCodeStatus(null)
+    try {
+      const r = await sendDatabaseResetCode()
+      if (r.success) {
+        setCodeStatus(`Confirmation code emailed to ${r.email}.`)
+      } else {
+        setCodeStatus(r.error ?? 'Failed to send confirmation code.')
+      }
+    } finally {
+      setSendingCode(false)
+    }
+  }
+
   function handleReset() {
-    if (!selectedLevel || !isConfirmed) return
+    if (!selectedLevel || !isConfirmed || emailCode.trim().length < 6) return
     setResult(null)
     startTransition(async () => {
-      const r = await resetDatabase(selectedLevel)
+      const r = await resetDatabase(selectedLevel, emailCode.trim().toUpperCase())
       if (r.success) {
         setResult({ message: 'Database has been reset successfully.', isError: false })
         setShowDialog(false)
         setConfirmation('')
+        setEmailCode('')
+        setCodeStatus(null)
         setSelectedLevel(null)
         router.refresh()
       } else {
@@ -74,7 +94,15 @@ export function DatabaseReset() {
                 variant={l.key === 'full' ? 'destructive' : 'outline'}
                 size="sm"
                 className="w-full"
-                onClick={() => { setSelectedLevel(l.key); setShowDialog(true); setConfirmation(''); setResult(null) }}
+                onClick={() => {
+                  setSelectedLevel(l.key)
+                  setShowDialog(true)
+                  setConfirmation('')
+                  setEmailCode('')
+                  setCodeStatus(null)
+                  setResult(null)
+                  void handleSendCode()
+                }}
               >
                 {l.label}
               </Button>
@@ -111,10 +139,27 @@ export function DatabaseReset() {
                   autoFocus
                 />
               </div>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <Label>Email confirmation code</Label>
+                  <Button type="button" variant="outline" size="sm" onClick={() => void handleSendCode()} disabled={sendingCode || isPending}>
+                    {sendingCode ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Resend code'}
+                  </Button>
+                </div>
+                <Input
+                  value={emailCode}
+                  onChange={(e) => setEmailCode(e.target.value.replace(/[^a-fA-F0-9]/g, '').slice(0, 8).toUpperCase())}
+                  placeholder="Email code"
+                  className="h-9 font-mono text-sm tracking-[0.3em]"
+                />
+                {codeStatus && (
+                  <p className="text-xs text-muted-foreground">{codeStatus}</p>
+                )}
+              </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => { setShowDialog(false); setConfirmation('') }} disabled={isPending}>Cancel</Button>
-              <Button variant="destructive" onClick={handleReset} disabled={isPending || !isConfirmed}>
+              <Button variant="outline" onClick={() => { setShowDialog(false); setConfirmation(''); setEmailCode(''); setCodeStatus(null) }} disabled={isPending}>Cancel</Button>
+              <Button variant="destructive" onClick={handleReset} disabled={isPending || !isConfirmed || emailCode.trim().length < 6}>
                 {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
                 Confirm Reset
               </Button>

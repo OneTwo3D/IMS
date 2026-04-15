@@ -4,6 +4,8 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { decryptSecret } from '@/lib/secrets'
+import { getSettingValue } from '@/lib/settings-store'
 import { wcFetch, wcPut } from '../api'
 import { WC_SETTINGS_VERSION_KEY, WC_SYNC_ADVISORY_LOCK_KEY } from '../sync-lock'
 import type { ConnectorCredentials } from '../../types'
@@ -70,7 +72,7 @@ async function snapshotProductSyncContext(): Promise<{
     const secret = map.get('wc_consumer_secret')
     const syncVersion = map.get(WC_SETTINGS_VERSION_KEY) ?? '0'
     const creds: ConnectorCredentials | null = url && key && secret
-      ? { url: url.replace(/\/$/, ''), key, secret }
+      ? { url: url.replace(/\/$/, ''), key, secret: decryptSecret(secret) }
       : null
     return { creds, syncVersion }
   })
@@ -557,9 +559,10 @@ export async function syncAllWcProducts(
   })
 
   if (result.synced > 0) {
-    logActivity({
+    await logActivity({
       entityType: 'SYNC', action: 'product_sync', tag: 'sync', level: 'INFO',
       description: `WC product ${mode === 'poll' ? 'poll' : 'reconciliation'}: ${result.synced} synced, ${result.skipped} skipped`,
+      resolveUser: false,
     })
   }
 
@@ -567,11 +570,11 @@ export async function syncAllWcProducts(
 }
 export async function isWcProductWebhookPrimaryActive(): Promise<boolean> {
   const [secret, lastReceived] = await Promise.all([
-    db.setting.findUnique({ where: { key: 'wc_webhook_secret' } }),
+    getSettingValue('wc_webhook_secret'),
     db.setting.findUnique({ where: { key: 'wc_product_webhook_last_received_at' } }),
   ])
 
-  if (!secret?.value || !lastReceived?.value) return false
+  if (!secret || !lastReceived?.value) return false
   const ts = Date.parse(lastReceived.value)
   if (!Number.isFinite(ts)) return false
   return (Date.now() - ts) <= WEBHOOK_PRIMARY_FRESH_MS

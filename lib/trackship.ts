@@ -36,13 +36,14 @@ export async function queryTrackShip(apiKey: string, trackingNumber: string, car
       }),
     })
     if (!res.ok) {
-      logActivity({
+      await logActivity({
         entityType: 'SYSTEM',
         action: 'trackship_error',
         tag: 'sync',
         level: 'ERROR',
         description: `TrackShip API error: ${res.status} ${res.statusText}`,
         metadata: { trackingNumber, carrier, status: res.status },
+        resolveUser: false,
       })
       return null
     }
@@ -56,13 +57,14 @@ export async function queryTrackShip(apiKey: string, trackingNumber: string, car
       last_event_time: data.last_event_time,
     }
   } catch (e) {
-    logActivity({
+    await logActivity({
       entityType: 'SYSTEM',
       action: 'trackship_error',
       tag: 'sync',
       level: 'ERROR',
       description: `TrackShip API request failed: ${String(e)}`,
       metadata: { trackingNumber, carrier },
+      resolveUser: false,
     })
     return null
   }
@@ -146,7 +148,7 @@ export async function checkDeliveryStatus(): Promise<{ checked: number; delivere
         data: { status: 'DELIVERED' },
       })
       delivered++
-      logActivity({
+      await logActivity({
         entityType: 'SALES_ORDER',
         entityId: order.id,
         action: 'delivered',
@@ -154,6 +156,7 @@ export async function checkDeliveryStatus(): Promise<{ checked: number; delivere
         level: 'INFO',
         description: `Order ${order.wcOrderNumber} marked as delivered via ${source}`,
         metadata: { orderNumber: order.wcOrderNumber, source },
+        resolveUser: false,
       })
     }
   }

@@ -19,16 +19,18 @@ import { pushSalesInvoice } from './invoices'
 import { pushPurchaseBill } from './bills'
 import { pushCreditNote } from './credit-notes'
 import { pushManualJournal } from './journals'
-import { db } from '@/lib/db'
+import { getSettingValue } from '@/lib/settings-store'
 
 export class XeroConnector implements AccountingConnector {
   readonly id = 'xero'
   readonly name = 'Xero'
 
   async isConfigured(): Promise<boolean> {
-    const clientId = await db.setting.findUnique({ where: { key: 'xero_client_id' } })
-    const clientSecret = await db.setting.findUnique({ where: { key: 'xero_client_secret' } })
-    return !!(clientId?.value && clientSecret?.value)
+    const [clientId, clientSecret] = await Promise.all([
+      getSettingValue('xero_client_id'),
+      getSettingValue('xero_client_secret'),
+    ])
+    return !!(clientId && clientSecret)
   }
 
   async isConnected(): Promise<boolean> {

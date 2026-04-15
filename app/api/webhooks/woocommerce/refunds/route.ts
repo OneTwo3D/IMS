@@ -2,9 +2,13 @@ import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verify'
 import { syncWcRefund } from '@/lib/connectors/woocommerce/sync/refund-sync'
+import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import type { WcRefund } from '@/lib/connectors/woocommerce/sync/types'
 
 export async function POST(request: Request) {
+  const maintenance = await getMaintenanceModeResponse('webhook')
+  if (maintenance) return maintenance
+
   const body = await request.text()
   const signature = request.headers.get('x-wc-webhook-signature')
   const topic = request.headers.get('x-wc-webhook-topic')

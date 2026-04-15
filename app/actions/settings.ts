@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 
 // ---------------------------------------------------------------------------
 // Adjustment Reasons
@@ -314,8 +315,7 @@ export async function getAccountCodes(): Promise<AccountCodeOption[]> {
 
 export async function getSetting(key: string): Promise<string | null> {
   await requireAuth()
-  const row = await db.setting.findUnique({ where: { key } })
-  return row?.value ?? null
+  return getSettingValue(key)
 }
 
 export type UserOption = { id: string; name: string; email: string }
@@ -334,8 +334,8 @@ export async function setSetting(key: string, value: string): Promise<void> {
   await requirePermission('settings.company')
   await db.setting.upsert({
     where: { key },
-    create: { key, value },
-    update: { value },
+    create: { key, value: serializeSettingValue(key, value) },
+    update: { value: serializeSettingValue(key, value) },
   })
   await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: `Updated setting: ${key}` })
   revalidatePath('/settings', 'layout')

@@ -3,15 +3,15 @@
  */
 
 import { createHmac, timingSafeEqual } from 'crypto'
-import { db } from '@/lib/db'
+import { getSettingValue } from '@/lib/settings-store'
 
 export async function verifyWcWebhook(body: string, signature: string | null): Promise<boolean> {
   if (!signature) return false
 
-  const secretSetting = await db.setting.findUnique({ where: { key: 'wc_webhook_secret' } })
-  if (!secretSetting?.value) return false
+  const secret = await getSettingValue('wc_webhook_secret')
+  if (!secret) return false
 
-  const expected = createHmac('sha256', secretSetting.value).update(body).digest('base64')
+  const expected = createHmac('sha256', secret).update(body).digest('base64')
   const sigBuf = Buffer.from(signature)
   const expBuf = Buffer.from(expected)
   if (sigBuf.length !== expBuf.length) return false

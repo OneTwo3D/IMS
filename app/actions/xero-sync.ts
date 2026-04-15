@@ -9,6 +9,7 @@ import { getAuthorizationUrl, disconnect, isConnected } from '@/lib/connectors/x
 import { syncChartOfAccounts, getXeroTaxRates } from '@/lib/connectors/xero'
 import { processPendingXeroSync } from '@/lib/connectors/xero'
 import { getXeroSettings, XERO_SETTING_KEYS, type XeroSettings } from '@/lib/connectors/xero/settings'
+import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 
 // Type re-export (allowed in 'use server' files)
 export type { XeroSettings } from '@/lib/connectors/xero/settings'
@@ -37,8 +38,8 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
     // OFF → ON. If sync is already enabled, allow any save to go through so the
     // user can edit (or fix) their account mappings without being blocked.
     if (data.xero_sync_enabled === 'true') {
-      const currentEnabled = await db.setting.findUnique({ where: { key: 'xero_sync_enabled' } })
-      const isTransitioningOn = currentEnabled?.value !== 'true'
+      const currentEnabled = await getSettingValue('xero_sync_enabled')
+      const isTransitioningOn = currentEnabled !== 'true'
       if (isTransitioningOn) {
         const readiness = await getXeroSyncReadiness()
         if (!readiness.ready) {
@@ -65,8 +66,8 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
     const ops = entries.map(([k, v]) =>
       db.setting.upsert({
         where: { key: k },
-        create: { key: k, value: v ?? '' },
-        update: { value: v ?? '' },
+        create: { key: k, value: serializeSettingValue(k, v ?? '') },
+        update: { value: serializeSettingValue(k, v ?? '') },
       }),
     )
     await db.$transaction(ops)
@@ -106,10 +107,10 @@ export async function connectXero(
 
     // Save credentials (never overwrite secret with masked value)
     const ops = [
-      db.setting.upsert({ where: { key: 'xero_client_id' }, create: { key: 'xero_client_id', value: clientId }, update: { value: clientId } }),
+      db.setting.upsert({ where: { key: 'xero_client_id' }, create: { key: 'xero_client_id', value: serializeSettingValue('xero_client_id', clientId) }, update: { value: serializeSettingValue('xero_client_id', clientId) } }),
     ]
     if (clientSecret && !clientSecret.includes('****')) {
-      ops.push(db.setting.upsert({ where: { key: 'xero_client_secret' }, create: { key: 'xero_client_secret', value: clientSecret }, update: { value: clientSecret } }))
+      ops.push(db.setting.upsert({ where: { key: 'xero_client_secret' }, create: { key: 'xero_client_secret', value: serializeSettingValue('xero_client_secret', clientSecret) }, update: { value: serializeSettingValue('xero_client_secret', clientSecret) } }))
     }
     await db.$transaction(ops)
 

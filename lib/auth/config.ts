@@ -4,11 +4,14 @@ import bcrypt from 'bcryptjs'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { consumeAuthToken } from '@/lib/auth/token-store'
+import { checkRateLimit, clearRateLimit } from '@/lib/rate-limit'
 
 const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
 })
+
+const DUMMY_BCRYPT_HASH = '$2b$12$Q7QxTQqR0p6vJY9Yx1m8JOkjH3J0mD6G4jY6YtV2v0mL4YvM1gM9S'
 
 export const authConfig: NextAuthConfig = {
   trustHost: true,
@@ -85,9 +88,14 @@ export const authConfig: NextAuthConfig = {
   providers: [
     Credentials({
       id: 'credentials',
-      async authorize(credentials) {
+      async authorize(credentials, request) {
         const parsed = loginSchema.safeParse(credentials)
         if (!parsed.success) return null
+
+        const forwardedFor = request?.headers?.get('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown'
+        const rlKey = `login:${parsed.data.email.toLowerCase()}:${forwardedFor}`
+        const rl = checkRateLimit(rlKey, 10, 15 * 60_000)
+        if (!rl.allowed) return null
 
         const user = await db.user.findUnique({
           where: { email: parsed.data.email },
@@ -104,13 +112,14 @@ export const authConfig: NextAuthConfig = {
           },
         })
 
-        if (!user || !user.active) return null
-
+        const passwordHash = user?.passwordHash ?? DUMMY_BCRYPT_HASH
         const passwordMatch = await bcrypt.compare(
           parsed.data.password,
-          user.passwordHash,
+          passwordHash,
         )
-        if (!passwordMatch) return null
+        if (!user || !user.active || !passwordMatch) return null
+
+        clearRateLimit(rlKey)
 
         return {
           id: user.id,

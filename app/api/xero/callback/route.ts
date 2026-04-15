@@ -49,7 +49,7 @@ export async function GET(request: Request) {
     const result = await exchangeCodeForTokens(code, redirectUri)
 
     if (result.success) {
-      logActivity({
+      await logActivity({
         entityType: 'SYSTEM',
         entityId: initiatorUserId,
         action: 'xero_connected',

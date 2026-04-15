@@ -19,6 +19,10 @@ type XeroItemResponse = {
   }>
 }
 
+function escapeXeroWhereValue(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+}
+
 /**
  * Find a Xero item by code (SKU), or create one if not found.
  *
@@ -35,7 +39,8 @@ export async function findOrCreateItem(
   if (!code) return { success: false, error: 'Item code is required' }
 
   // Search by code
-  const res = await xeroGet<XeroItemResponse>(`Items?where=Code=="${encodeURIComponent(code)}"`)
+  const where = `Items?where=${encodeURIComponent(`Code=="${escapeXeroWhereValue(code)}"`)}`
+  const res = await xeroGet<XeroItemResponse>(where)
 
   if (res.ok && res.data?.Items?.length) {
     return { success: true, itemId: res.data.Items[0].ItemID }
@@ -53,6 +58,12 @@ export async function findOrCreateItem(
   if (purchaseAccountCode) item.PurchaseDetails = { AccountCode: purchaseAccountCode }
 
   const createRes = await xeroPost<XeroItemResponse>('Items', item)
+  if ((!createRes.ok || !createRes.data?.Items?.length) && /already exists|has already been used|code already exists/i.test(createRes.error ?? '')) {
+    const retryRes = await xeroGet<XeroItemResponse>(where)
+    if (retryRes.ok && retryRes.data?.Items?.length) {
+      return { success: true, itemId: retryRes.data.Items[0].ItemID }
+    }
+  }
   if (!createRes.ok || !createRes.data?.Items?.length) {
     return { success: false, error: createRes.error ?? 'Failed to create item' }
   }

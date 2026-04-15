@@ -7,7 +7,11 @@
  */
 
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 import { setAuthToken, consumeAuthToken } from '@/lib/auth/token-store'
+import { notify } from '@/lib/notifications'
+import { decryptSecret, encryptSecret, hasEncryptionKey, isEncryptedValue } from '@/lib/secrets'
+import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
 const XERO_OAUTH_STATE_PREFIX = 'xero_oauth_state:'
@@ -30,16 +34,122 @@ type XeroConnection = {
   tenantType: string
 }
 
+type StoredXeroToken = {
+  id: string
+  accessToken: string
+  refreshToken: string | null
+  expiresAt: Date
+  tenantId: string
+  tenantName: string | null
+}
+
+const XERO_EXPECTED_TENANT_KEY = 'xero_expected_tenant_id'
+const REFRESH_EARLY_MS = 2 * 60 * 1000
+
+let refreshInFlight: Promise<{ accessToken: string; tenantId: string } | null> | null = null
+
+function buildBasicAuth(clientId: string, clientSecret: string): string {
+  return Buffer.from(`${clientId}:${clientSecret}`).toString('base64')
+}
+
+async function readStoredToken(): Promise<StoredXeroToken | null> {
+  const row = await db.xeroToken.findFirst()
+  if (!row) return null
+
+  const accessToken = decryptSecret(row.accessToken)
+  const refreshToken = row.refreshToken ? decryptSecret(row.refreshToken) : null
+
+  if (hasEncryptionKey() && (!isEncryptedValue(row.accessToken) || (row.refreshToken && !isEncryptedValue(row.refreshToken)))) {
+    try {
+      await db.xeroToken.update({
+        where: { id: row.id },
+        data: {
+          accessToken: encryptSecret(accessToken),
+          refreshToken: refreshToken ? encryptSecret(refreshToken) : null,
+        },
+      })
+    } catch {
+      // Best-effort migration only.
+    }
+  }
+
+  return {
+    id: row.id,
+    accessToken,
+    refreshToken,
+    expiresAt: row.expiresAt,
+    tenantId: row.tenantId,
+    tenantName: row.tenantName,
+  }
+}
+
+async function upsertStoredToken(params: {
+  accessToken: string
+  refreshToken: string | null
+  expiresAt: Date
+  tenantId: string
+  tenantName: string | null
+}): Promise<void> {
+  const existing = await db.xeroToken.findFirst({ select: { id: true } })
+  const data = {
+    accessToken: encryptSecret(params.accessToken),
+    refreshToken: params.refreshToken ? encryptSecret(params.refreshToken) : null,
+    expiresAt: params.expiresAt,
+    tenantId: params.tenantId,
+    tenantName: params.tenantName,
+  }
+
+  if (existing) {
+    await db.xeroToken.update({ where: { id: existing.id }, data })
+  } else {
+    await db.xeroToken.create({ data })
+  }
+}
+
+async function getExpectedTenantId(): Promise<string | null> {
+  const token = await db.xeroToken.findFirst({ select: { tenantId: true } })
+  const stored = await getSettingValue(XERO_EXPECTED_TENANT_KEY)
+  return stored ?? token?.tenantId ?? null
+}
+
+async function pinTenantId(tenantId: string): Promise<void> {
+  await db.setting.upsert({
+    where: { key: XERO_EXPECTED_TENANT_KEY },
+    create: { key: XERO_EXPECTED_TENANT_KEY, value: serializeSettingValue(XERO_EXPECTED_TENANT_KEY, tenantId) },
+    update: { value: serializeSettingValue(XERO_EXPECTED_TENANT_KEY, tenantId) },
+  })
+}
+
+function selectTenantConnection(connections: XeroConnection[], expectedTenantId: string | null) {
+  if (!expectedTenantId) return connections[0] ?? null
+  return connections.find((conn) => conn.tenantId === expectedTenantId) ?? null
+}
+
+async function logRefreshFailure(reason: string): Promise<void> {
+  await logActivity({
+    entityType: 'SYSTEM',
+    tag: 'sync',
+    action: 'xero_refresh_failed',
+    level: 'ERROR',
+    description: reason,
+  })
+  await notify({
+    type: 'error',
+    title: 'Xero connection needs attention',
+    message: reason,
+    actionUrl: '/sync',
+  })
+}
+
 /**
  * Get a valid access token. Auto-refreshes if expired.
  * Returns null if not connected.
  */
 export async function getAccessToken(): Promise<{ accessToken: string; tenantId: string } | null> {
-  const token = await db.xeroToken.findFirst()
+  const token = await readStoredToken()
   if (!token) return null
 
-  // If token expires in less than 2 minutes, refresh it
-  if (token.expiresAt < new Date(Date.now() + 2 * 60 * 1000)) {
+  if (token.expiresAt < new Date(Date.now() + REFRESH_EARLY_MS)) {
     const refreshed = await refreshToken()
     if (!refreshed) return null
     return { accessToken: refreshed.accessToken, tenantId: refreshed.tenantId }
@@ -91,14 +201,16 @@ export async function exchangeCodeForTokens(
   redirectUri: string,
 ): Promise<{ success: boolean; tenantName?: string; error?: string }> {
   try {
-    const clientId = await db.setting.findUnique({ where: { key: 'xero_client_id' } })
-    const clientSecret = await db.setting.findUnique({ where: { key: 'xero_client_secret' } })
+    const [clientId, clientSecret] = await Promise.all([
+      getSettingValue('xero_client_id'),
+      getSettingValue('xero_client_secret'),
+    ])
 
-    if (!clientId?.value || !clientSecret?.value) {
+    if (!clientId || !clientSecret) {
       return { success: false, error: 'Missing Xero credentials' }
     }
 
-    const basicAuth = Buffer.from(`${clientId.value}:${clientSecret.value}`).toString('base64')
+    const basicAuth = buildBasicAuth(clientId, clientSecret)
     const tokenRes = await fetch(XERO_TOKEN_URL, {
       method: 'POST',
       headers: {
@@ -134,33 +246,26 @@ export async function exchangeCodeForTokens(
       return { success: false, error: 'No Xero organisations found for this app' }
     }
 
-    const conn = connections[0]
-    const expiresAt = new Date(Date.now() + tokenData.expires_in * 1000)
-
-    // Upsert token (only one row)
-    const existing = await db.xeroToken.findFirst()
-    if (existing) {
-      await db.xeroToken.update({
-        where: { id: existing.id },
-        data: {
-          accessToken: tokenData.access_token,
-          refreshToken: tokenData.refresh_token ?? null,
-          expiresAt,
-          tenantId: conn.tenantId,
-          tenantName: conn.tenantName,
-        },
-      })
-    } else {
-      await db.xeroToken.create({
-        data: {
-          accessToken: tokenData.access_token,
-          refreshToken: tokenData.refresh_token ?? null,
-          expiresAt,
-          tenantId: conn.tenantId,
-          tenantName: conn.tenantName,
-        },
-      })
+    const expectedTenantId = await getExpectedTenantId()
+    const conn = selectTenantConnection(connections, expectedTenantId)
+    if (!conn) {
+      return {
+        success: false,
+        error: expectedTenantId
+          ? `Connected Xero organisation does not match the pinned tenant (${expectedTenantId}). Reconnect to the expected organisation or clear the tenant binding before switching.`
+          : 'Unable to resolve a Xero organisation for this app.',
+      }
     }
+
+    const expiresAt = new Date(Date.now() + tokenData.expires_in * 1000)
+    await upsertStoredToken({
+      accessToken: tokenData.access_token,
+      refreshToken: tokenData.refresh_token ?? null,
+      expiresAt,
+      tenantId: conn.tenantId,
+      tenantName: conn.tenantName,
+    })
+    await pinTenantId(conn.tenantId)
 
     return { success: true, tenantName: conn.tenantName }
   } catch (e) {
@@ -172,45 +277,67 @@ export async function exchangeCodeForTokens(
  * Refresh the access token using the refresh_token grant.
  */
 export async function refreshToken(): Promise<{ accessToken: string; tenantId: string } | null> {
-  const token = await db.xeroToken.findFirst()
-  if (!token?.refreshToken) return null
+  if (refreshInFlight) return refreshInFlight
 
-  const clientId = await db.setting.findUnique({ where: { key: 'xero_client_id' } })
-  const clientSecret = await db.setting.findUnique({ where: { key: 'xero_client_secret' } })
+  refreshInFlight = (async () => {
+    const token = await readStoredToken()
+    if (!token?.refreshToken) return null
 
-  if (!clientId?.value || !clientSecret?.value) return null
+    if (token.expiresAt >= new Date(Date.now() + REFRESH_EARLY_MS)) {
+      return { accessToken: token.accessToken, tenantId: token.tenantId }
+    }
 
-  try {
-    const basicAuth = Buffer.from(`${clientId.value}:${clientSecret.value}`).toString('base64')
-    const res = await fetch(XERO_TOKEN_URL, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Basic ${basicAuth}`,
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
-      body: new URLSearchParams({
-        grant_type: 'refresh_token',
-        refresh_token: token.refreshToken,
-      }),
-    })
+    const [clientId, clientSecret] = await Promise.all([
+      getSettingValue('xero_client_id'),
+      getSettingValue('xero_client_secret'),
+    ])
 
-    if (!res.ok) return null
+    if (!clientId || !clientSecret) {
+      await logRefreshFailure('Xero token refresh failed because client credentials are missing.')
+      return null
+    }
 
-    const data: TokenResponse = await res.json()
-    const expiresAt = new Date(Date.now() + data.expires_in * 1000)
+    try {
+      const res = await fetch(XERO_TOKEN_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Basic ${buildBasicAuth(clientId, clientSecret)}`,
+          'Content-Type': 'application/x-www-form-urlencoded',
+        },
+        body: new URLSearchParams({
+          grant_type: 'refresh_token',
+          refresh_token: token.refreshToken,
+        }),
+      })
 
-    await db.xeroToken.update({
-      where: { id: token.id },
-      data: {
+      if (!res.ok) {
+        const errorBody = await res.text().catch(() => '')
+        await logRefreshFailure(`Xero token refresh failed (HTTP ${res.status}): ${errorBody || 'Unknown error'}`)
+        return null
+      }
+
+      const data: TokenResponse = await res.json()
+      const expiresAt = new Date(Date.now() + data.expires_in * 1000)
+
+      await upsertStoredToken({
         accessToken: data.access_token,
         refreshToken: data.refresh_token ?? token.refreshToken,
         expiresAt,
-      },
-    })
+        tenantId: token.tenantId,
+        tenantName: token.tenantName,
+      })
 
-    return { accessToken: data.access_token, tenantId: token.tenantId }
-  } catch {
-    return null
+      return { accessToken: data.access_token, tenantId: token.tenantId }
+    } catch (error) {
+      await logRefreshFailure(`Xero token refresh failed: ${String(error)}`)
+      return null
+    }
+  })()
+
+  try {
+    return await refreshInFlight
+  } finally {
+    refreshInFlight = null
   }
 }
 
@@ -218,14 +345,17 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
  * Disconnect from Xero — clears stored token.
  */
 export async function disconnect(): Promise<void> {
-  await db.xeroToken.deleteMany()
+  await db.$transaction([
+    db.xeroToken.deleteMany(),
+    db.setting.deleteMany({ where: { key: XERO_EXPECTED_TENANT_KEY } }),
+  ])
 }
 
 /**
  * Check if Xero is connected (token exists).
  */
 export async function isConnected(): Promise<{ connected: boolean; tenantName?: string }> {
-  const token = await db.xeroToken.findFirst({ select: { tenantName: true, expiresAt: true } })
+  const token = await readStoredToken()
   if (!token) return { connected: false }
   return { connected: true, tenantName: token.tenantName ?? undefined }
 }

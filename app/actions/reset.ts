@@ -4,12 +4,43 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAdmin } from '@/lib/auth/server'
+import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/destructive-action-confirm'
 
 export type ResetLevel = 'transactions' | 'products' | 'full'
 
-export async function resetDatabase(level: ResetLevel): Promise<{ success: boolean; error?: string }> {
+export async function sendDatabaseResetCode(): Promise<{ success: boolean; email?: string; expiresInSec?: number; error?: string }> {
   try {
-    await requireAdmin()
+    const session = await requireAdmin()
+    const email = session.user.email
+    const issued = await issueDestructiveActionCode({
+      purpose: 'database_reset',
+      userId: session.user.id,
+      email,
+      subject: 'Database reset confirmation code',
+      intro: 'A database reset was requested from the onetwoInventory Settings page.',
+    })
+    if (!issued.success) return { success: false, error: issued.error }
+    return { success: true, email: issued.email, expiresInSec: issued.expiresInSec }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+export async function resetDatabase(level: ResetLevel, confirmationCode: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    const session = await requireAdmin()
+    if (!confirmationCode || confirmationCode.trim().length < 6) {
+      return { success: false, error: 'Email confirmation code is required.' }
+    }
+    const confirmed = await consumeDestructiveActionCode({
+      purpose: 'database_reset',
+      token: confirmationCode,
+      userId: session.user.id,
+    })
+    if (!confirmed) {
+      return { success: false, error: 'Email confirmation code is invalid or expired.' }
+    }
+
     // Level 1: Transactions only (orders, POs, stock movements, invoices, payments)
     // Keeps products, warehouses, suppliers, customers, settings
     if (level === 'transactions' || level === 'products' || level === 'full') {

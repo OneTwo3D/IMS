@@ -1,20 +1,33 @@
-/**
- * WooCommerce REST API client.
- */
-
-import { db } from '@/lib/db'
+import { getSettingValues } from '@/lib/settings-store'
 import type { ConnectorCredentials } from '../types'
+import { validateWooCommerceBaseUrl } from './url-safety'
+
+async function readErrorDetails(res: Response): Promise<string> {
+  const contentType = res.headers.get('content-type') ?? ''
+  try {
+    if (contentType.includes('application/json')) {
+      const body = await res.json() as { code?: string; message?: string }
+      return [body.code, body.message].filter(Boolean).join(': ') || JSON.stringify(body)
+    }
+    return (await res.text()).slice(0, 500)
+  } catch {
+    return res.statusText
+  }
+}
 
 export async function getWcCredentials(): Promise<ConnectorCredentials | null> {
-  const settings = await db.setting.findMany({
-    where: { key: { in: ['wc_url', 'wc_consumer_key', 'wc_consumer_secret'] } },
-  })
-  const map = new Map(settings.map((s) => [s.key, s.value]))
+  const map = await getSettingValues(['wc_url', 'wc_consumer_key', 'wc_consumer_secret'])
   const url = map.get('wc_url')
   const key = map.get('wc_consumer_key')
   const secret = map.get('wc_consumer_secret')
   if (!url || !key || !secret) return null
-  return { url: url.replace(/\/$/, ''), key, secret }
+
+  const validated = validateWooCommerceBaseUrl(url)
+  if (!validated.ok) {
+    throw new Error(validated.error)
+  }
+
+  return { url: validated.normalizedUrl, key, secret }
 }
 
 export async function wcFetch(
@@ -37,7 +50,8 @@ export async function wcFetch(
   })
 
   if (!res.ok) {
-    return { data: null, totalPages: 0, totalItems: 0, error: `WC API error: ${res.status} ${res.statusText}` }
+    const detail = await readErrorDetails(res)
+    return { data: null, totalPages: 0, totalItems: 0, error: `WC API error: ${res.status} ${detail}` }
   }
 
   const contentType = res.headers.get('content-type') ?? ''
@@ -67,7 +81,10 @@ export async function wcPost(
     signal: AbortSignal.timeout(120000),
   })
 
-  if (!res.ok) return { data: null, error: `WC API POST error: ${res.status} ${res.statusText}` }
+  if (!res.ok) {
+    const detail = await readErrorDetails(res)
+    return { data: null, error: `WC API POST error: ${res.status} ${detail}` }
+  }
   return { data: await res.json() }
 }
 
@@ -87,6 +104,9 @@ export async function wcPut(
     signal: AbortSignal.timeout(120000),
   })
 
-  if (!res.ok) return { data: null, error: `WC API PUT error: ${res.status} ${res.statusText}` }
+  if (!res.ok) {
+    const detail = await readErrorDetails(res)
+    return { data: null, error: `WC API PUT error: ${res.status} ${detail}` }
+  }
   return { data: await res.json() }
 }

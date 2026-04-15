@@ -3,7 +3,7 @@
  * Moved from app/actions/xero-sync.ts — these are internal utilities, not server actions.
  */
 
-import { db } from '@/lib/db'
+import { getSettingValues } from '@/lib/settings-store'
 
 export type XeroSettings = {
   xero_client_id: string
@@ -69,8 +69,7 @@ const XERO_DEFAULTS: XeroSettings = {
 }
 
 export async function getXeroSettings(): Promise<XeroSettings> {
-  const rows = await db.setting.findMany({ where: { key: { in: XERO_SETTING_KEYS } } })
-  const map = new Map(rows.map((r) => [r.key, r.value]))
+  const map = await getSettingValues(XERO_SETTING_KEYS)
   const result = { ...XERO_DEFAULTS }
   for (const k of Object.keys(result) as (keyof XeroSettings)[]) {
     const v = map.get(k)

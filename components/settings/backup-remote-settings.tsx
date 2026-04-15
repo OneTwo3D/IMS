@@ -10,7 +10,7 @@ import { setSetting } from '@/app/actions/settings'
 
 type Props = {
   s3: { endpoint: string; region: string; bucket: string; accessKey: string; secretKey: string; secretKeyConfigured: boolean; prefix: string }
-  sftp: { host: string; port: string; user: string; password: string; passwordConfigured: boolean; privateKey: string; privateKeyConfigured: boolean; path: string }
+  sftp: { host: string; port: string; user: string; password: string; passwordConfigured: boolean; privateKey: string; privateKeyConfigured: boolean; hostFingerprint: string; path: string }
 }
 
 export function BackupRemoteSettings({ s3, sftp }: Props) {
@@ -26,7 +26,29 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
     return value.includes('****')
   }
 
+  function hasCustomS3Endpoint(endpoint: string): boolean {
+    return endpoint.trim().length > 0
+  }
+
+  function hasChangedSftpTarget(): boolean {
+    return (
+      sftpState.host.trim() !== sftp.host.trim() ||
+      sftpState.port.trim() !== sftp.port.trim() ||
+      sftpState.user.trim() !== sftp.user.trim() ||
+      sftpState.hostFingerprint.trim() !== sftp.hostFingerprint.trim()
+    )
+  }
+
   function handleSaveS3() {
+    if (
+      hasCustomS3Endpoint(s3State.endpoint) &&
+      !window.confirm(
+        `This will send backups to the custom S3 endpoint:\n\n${s3State.endpoint.trim()}\n\nOnly continue if you trust this storage target and intend to use a non-AWS endpoint.`,
+      )
+    ) {
+      return
+    }
+
     startTransition(async () => {
       const ops = [
         setSetting('backup_s3_endpoint', s3State.endpoint),
@@ -45,11 +67,21 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
   }
 
   function handleSaveSftp() {
+    if (
+      hasChangedSftpTarget() &&
+      !window.confirm(
+        `This will change the SFTP backup target to:\n\nHost: ${sftpState.host.trim() || '(empty)'}\nPort: ${sftpState.port.trim() || '22'}\nUser: ${sftpState.user.trim() || '(empty)'}\nFingerprint: ${sftpState.hostFingerprint.trim() || '(empty)'}\n\nOnly continue if this is the intended backup server.`,
+      )
+    ) {
+      return
+    }
+
     startTransition(async () => {
       const ops = [
         setSetting('backup_sftp_host', sftpState.host),
         setSetting('backup_sftp_port', sftpState.port),
         setSetting('backup_sftp_user', sftpState.user),
+        setSetting('backup_sftp_host_fingerprint', sftpState.hostFingerprint),
         setSetting('backup_sftp_path', sftpState.path),
       ]
       // Only save secrets if user replaced the masked values
@@ -74,6 +106,9 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
         </div>
         <p className="text-xs text-muted-foreground mb-3">
           Works with AWS S3, MinIO, Backblaze B2, Cloudflare R2, DigitalOcean Spaces, etc.
+        </p>
+        <p className="text-[11px] text-amber-700 mb-3">
+          Saving a custom endpoint sends backups to that remote storage target. Confirm the hostname before using anything other than default AWS S3.
         </p>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-lg">
           <div className="space-y-1.5 sm:col-span-2">
@@ -128,6 +163,9 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
         <p className="text-xs text-muted-foreground mb-3">
           Supports password and private key (certificate) authentication.
         </p>
+        <p className="text-[11px] text-amber-700 mb-3">
+          Changing the SFTP host or fingerprint changes where production backups are sent. Verify both values before saving.
+        </p>
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 max-w-lg">
           <div className="space-y-1.5">
             <Label className="text-xs">Host</Label>
@@ -162,6 +200,19 @@ export function BackupRemoteSettings({ s3, sftp }: Props) {
               className="text-xs font-mono min-h-[80px]"
               placeholder={sftp.privateKeyConfigured ? 'Configured — paste new key to change' : '-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----'}
             />
+          </div>
+          <div className="space-y-1.5 sm:col-span-2">
+            <Label className="text-xs">Host Fingerprint</Label>
+            <Input
+              value={sftpState.hostFingerprint}
+              onChange={(e) => setSftp((p) => ({ ...p, hostFingerprint: e.target.value }))}
+              className="h-9 font-mono text-xs"
+              placeholder="SHA256:base64fingerprint or md5 hex"
+              autoComplete="off"
+            />
+            <p className="text-[11px] text-muted-foreground">
+              Required. Pins the SFTP server identity and rejects wrong-host or MITM connections.
+            </p>
           </div>
           <div className="space-y-1.5 sm:col-span-2">
             <Label className="text-xs">Remote Path</Label>

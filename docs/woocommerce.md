@@ -194,6 +194,8 @@ What it does:
 2. Reconciles products if product webhooks are not active or the daily backup reconcile is due
 3. Runs the daily stock catch-up by draining queued retry jobs and force-pushing current stock
 
+Order reconcile also backfills orders that were intentionally skipped while `wc_initial_import_completed` was not yet `true`. The reconcile path uses its own `last_wc_order_reconcile_at` cursor, so the first reconcile after initial import completion can import those missed live orders.
+
 The cron endpoints require a `CRON_SECRET` header for security. See the [Installation guide](installation.md) for cron setup instructions.
 
 For a repeatable live verification checklist, see the [WooCommerce live verification runbook](woocommerce-live-runbook.md).

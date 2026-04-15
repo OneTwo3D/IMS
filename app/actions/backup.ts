@@ -4,8 +4,9 @@ import { readdir, stat, unlink } from 'fs/promises'
 import path from 'path'
 import { requireAdmin } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
+import { getBackupDir } from '@/lib/backup-storage'
 
-const BACKUP_DIR = path.join(process.cwd(), 'backups')
+const BACKUP_DIR = getBackupDir()
 
 export type BackupEntry = {
   filename: string

@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { getWcCredentials as getConnectorWcCredentials } from '@/lib/connectors/woocommerce/api'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
 import type { Prisma } from '@/app/generated/prisma/client'
@@ -557,20 +558,12 @@ export async function fetchWcImage(
 ): Promise<{ imageUrl: string | null; error?: string }> {
   try {
     await requirePermission('stock_control.adjust')
-    const urlSetting = await db.setting.findUnique({ where: { key: 'wc_url' } })
-    const keySetting = await db.setting.findUnique({ where: { key: 'wc_consumer_key' } })
-    const secretSetting = await db.setting.findUnique({ where: { key: 'wc_consumer_secret' } })
-
-    if (!urlSetting || !keySetting || !secretSetting) {
+    const credentials = await getConnectorWcCredentials()
+    if (!credentials) {
       return { imageUrl: null, error: 'WooCommerce not configured in Settings' }
     }
-
-    const wcUrl = JSON.parse(urlSetting.value)
-    const key = JSON.parse(keySetting.value)
-    const secret = JSON.parse(secretSetting.value)
-    const auth = Buffer.from(`${key}:${secret}`).toString('base64')
-
-    const endpoint = `${wcUrl}/wp-json/wc/v3/products?sku=${encodeURIComponent(sku)}&per_page=1`
+    const auth = Buffer.from(`${credentials.key}:${credentials.secret}`).toString('base64')
+    const endpoint = `${credentials.url}/wp-json/wc/v3/products?sku=${encodeURIComponent(sku)}&per_page=1`
 
     const res = await fetch(endpoint, {
       headers: { Authorization: `Basic ${auth}` },

@@ -1,12 +1,15 @@
 import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { db } from '@/lib/db'
+import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { processPendingXeroSync } from '@/lib/connectors/xero/sync-processor'
 
 // Called by cron every 5 minutes
 export async function GET(request: Request) {
   const cronErr = verifyCron(request)
   if (cronErr) return cronErr
+  const maintenance = await getMaintenanceModeResponse('cron')
+  if (maintenance) return maintenance
 
   // Check if sync is enabled
   const enabled = await db.setting.findUnique({ where: { key: 'xero_sync_enabled' } })

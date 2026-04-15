@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { getSettingValues, serializeSettingValue } from '@/lib/settings-store'
 
 // ---------------------------------------------------------------------------
 // Organisation
@@ -225,8 +226,7 @@ const EMAIL_DEFAULTS: EmailSettings = {
 export async function getEmailSettings(): Promise<EmailSettings> {
   await requireAuth()
   const keys = Object.keys(EMAIL_DEFAULTS).map((k) => `email_${k}`)
-  const rows = await db.setting.findMany({ where: { key: { in: keys } } })
-  const map = new Map(rows.map((r) => [r.key, r.value]))
+  const map = await getSettingValues(keys)
   const result = { ...EMAIL_DEFAULTS }
   for (const k of Object.keys(result) as (keyof EmailSettings)[]) {
     const v = map.get(`email_${k}`)
@@ -245,8 +245,8 @@ export async function saveEmailSettings(data: EmailSettings): Promise<{ success:
     .map(([k, v]) =>
       db.setting.upsert({
         where: { key: `email_${k}` },
-        create: { key: `email_${k}`, value: v },
-        update: { value: v },
+        create: { key: `email_${k}`, value: serializeSettingValue(`email_${k}`, v) },
+        update: { value: serializeSettingValue(`email_${k}`, v) },
       }),
     )
   await db.$transaction(ops)

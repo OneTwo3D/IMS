@@ -4,6 +4,9 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
+import { decryptSecret } from '@/lib/secrets'
+import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/settings-store'
+import { validateWooCommerceBaseUrl } from '@/lib/connectors/woocommerce/url-safety'
 import {
   WC_SYNC_ADVISORY_LOCK_KEY,
   WC_SETTINGS_VERSION_KEY,
@@ -68,8 +71,7 @@ const SYNC_DEFAULTS: WcSyncSettings = {
 
 export async function getWcSyncSettings(): Promise<WcSyncSettings> {
   await requireAdmin()
-  const rows = await db.setting.findMany({ where: { key: { in: SYNC_SETTING_KEYS } } })
-  const map = new Map(rows.map((r) => [r.key, r.value]))
+  const map = await getSettingValues(SYNC_SETTING_KEYS)
   const result = { ...SYNC_DEFAULTS }
   for (const k of Object.keys(result) as (keyof WcSyncSettings)[]) {
     const v = map.get(k)
@@ -83,7 +85,11 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
   const ops = Object.entries(data)
     .filter(([k]) => SYNC_SETTING_KEYS.includes(k))
     .map(([k, v]) =>
-      db.setting.upsert({ where: { key: k }, create: { key: k, value: v }, update: { value: v } }),
+      db.setting.upsert({
+        where: { key: k },
+        create: { key: k, value: serializeSettingValue(k, v ?? '') },
+        update: { value: serializeSettingValue(k, v ?? '') },
+      }),
     )
   await db.$transaction(ops)
   await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated WooCommerce sync settings' })
@@ -126,8 +132,13 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
  * must also call `resetWcProductIdCache()` (or click the "Reset cached
  * product IDs" button) to flush the cache.
  */
-export async function saveWcCredentials(url: string, key: string, secret: string): Promise<{ success: boolean; wipedMappings: number }> {
+export async function saveWcCredentials(url: string, key: string, secret: string): Promise<{ success: boolean; wipedMappings: number; error?: string }> {
   await requireAdmin()
+
+  const validatedUrl = validateWooCommerceBaseUrl(url)
+  if (!validatedUrl.ok) {
+    return { success: false, wipedMappings: 0, error: validatedUrl.error }
+  }
 
   const incomingSecretIsMasked = !!secret && secret.includes('*')
 
@@ -144,7 +155,9 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     const existingMap = new Map(existing.map((s) => [s.key, s.value]))
     const prevUrl = existingMap.get('wc_url') ?? ''
     const prevKey = existingMap.get('wc_consumer_key') ?? ''
-    const prevSecret = existingMap.get('wc_consumer_secret') ?? ''
+    const prevSecret = existingMap.get('wc_consumer_secret')
+      ? decryptSecret(existingMap.get('wc_consumer_secret')!)
+      : ''
     const effectiveSecret = incomingSecretIsMasked ? prevSecret : secret
 
     // "Rebind" = any of the three effective values actually differs from
@@ -154,12 +167,12 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     // above so a re-save with the masked placeholder is NOT seen as a
     // secret change.
     const isRebind =
-      url !== prevUrl || key !== prevKey || effectiveSecret !== prevSecret
+      validatedUrl.normalizedUrl !== prevUrl || key !== prevKey || effectiveSecret !== prevSecret
 
     await tx.setting.upsert({
       where: { key: 'wc_url' },
-      create: { key: 'wc_url', value: url },
-      update: { value: url },
+      create: { key: 'wc_url', value: validatedUrl.normalizedUrl },
+      update: { value: validatedUrl.normalizedUrl },
     })
     await tx.setting.upsert({
       where: { key: 'wc_consumer_key' },
@@ -169,8 +182,8 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     if (secret && !incomingSecretIsMasked) {
       await tx.setting.upsert({
         where: { key: 'wc_consumer_secret' },
-        create: { key: 'wc_consumer_secret', value: secret },
-        update: { value: secret },
+        create: { key: 'wc_consumer_secret', value: serializeSettingValue('wc_consumer_secret', secret) },
+        update: { value: serializeSettingValue('wc_consumer_secret', secret) },
       })
     }
 
@@ -266,8 +279,7 @@ export async function resetWcProductIdCache(): Promise<{ success: boolean; wiped
 
 export async function getWcCredentials(): Promise<{ url: string; key: string; secret: string; secretMasked: boolean }> {
   await requireAdmin()
-  const rows = await db.setting.findMany({ where: { key: { in: ['wc_url', 'wc_consumer_key', 'wc_consumer_secret'] } } })
-  const map = new Map(rows.map((r) => [r.key, r.value]))
+  const map = await getSettingValues(['wc_url', 'wc_consumer_key', 'wc_consumer_secret'])
   const secret = map.get('wc_consumer_secret') ?? ''
   return {
     url: map.get('wc_url') ?? '',
@@ -449,12 +461,10 @@ export async function createWcWebhooks(): Promise<{
   const appUrl = process.env.NEXT_PUBLIC_APP_URL
   if (!appUrl) return { success: false, created: 0, existing: 0, errors: ['NEXT_PUBLIC_APP_URL is not set'] }
 
-  // Read webhook secret from DB — must exist
-  const secretRow = await db.setting.findUnique({ where: { key: 'wc_webhook_secret' } })
-  if (!secretRow?.value) {
+  const secret = await getSettingValue('wc_webhook_secret')
+  if (!secret) {
     return { success: false, created: 0, existing: 0, errors: ['Webhook secret not configured — generate one first'] }
   }
-  const secret = secretRow.value
 
   const { wcFetch, wcPost } = await import('@/lib/connectors/woocommerce/api')
 

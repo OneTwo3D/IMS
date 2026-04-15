@@ -34,6 +34,9 @@ export function BackupRestore() {
   const [showRestore, setShowRestore] = useState<{ filename: string } | null>(null)
   const [showUploadRestore, setShowUploadRestore] = useState(false)
   const [restoreConfirm, setRestoreConfirm] = useState('')
+  const [restoreToken, setRestoreToken] = useState('')
+  const [restoreTokenStatus, setRestoreTokenStatus] = useState<string | null>(null)
+  const [sendingRestoreToken, setSendingRestoreToken] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
 
   const refreshList = () => listBackups().then(setBackups)
@@ -67,19 +70,41 @@ export function BackupRestore() {
     }
   }
 
+  async function sendRestoreTokenEmail() {
+    setSendingRestoreToken(true)
+    setRestoreTokenStatus(null)
+    try {
+      const res = await fetch('/api/backup/restore')
+      const data = await res.json()
+      if (res.ok) {
+        setRestoreTokenStatus(`Confirmation code emailed to ${data.email}.`)
+      } else {
+        setRestoreTokenStatus(data.error ?? 'Failed to send confirmation email.')
+      }
+    } catch {
+      setRestoreTokenStatus('Failed to send confirmation email.')
+    } finally {
+      setSendingRestoreToken(false)
+    }
+  }
+
   async function handleRestore(filename: string) {
-    if (restoreConfirm !== 'RESTORE') return
+    if (restoreConfirm !== 'RESTORE' || restoreToken.trim().length < 6) return
     setRestoring(true)
     setMsg(null)
     try {
       const formData = new FormData()
       formData.append('filename', filename)
+      formData.append('confirm', restoreConfirm)
+      formData.append('restoreToken', restoreToken.trim().toUpperCase())
       const res = await fetch('/api/backup/restore', { method: 'POST', body: formData })
       const data = await res.json()
       if (res.ok) {
         setMsg({ text: 'Database restored successfully. Please refresh.', isError: false })
         setShowRestore(null)
         setRestoreConfirm('')
+        setRestoreToken('')
+        setRestoreTokenStatus(null)
         router.refresh()
       } else {
         setMsg({ text: data.error ?? 'Restore failed.', isError: true })
@@ -94,18 +119,22 @@ export function BackupRestore() {
   async function handleUploadRestore(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0]
     if (!file) return
-    if (restoreConfirm !== 'RESTORE') return
+    if (restoreConfirm !== 'RESTORE' || restoreToken.trim().length < 6) return
     setRestoring(true)
     setMsg(null)
     try {
       const formData = new FormData()
       formData.append('file', file)
+      formData.append('confirm', restoreConfirm)
+      formData.append('restoreToken', restoreToken.trim().toUpperCase())
       const res = await fetch('/api/backup/restore', { method: 'POST', body: formData })
       const data = await res.json()
       if (res.ok) {
         setMsg({ text: 'Database restored from uploaded file. Please refresh.', isError: false })
         setShowUploadRestore(false)
         setRestoreConfirm('')
+        setRestoreToken('')
+        setRestoreTokenStatus(null)
         router.refresh()
       } else {
         setMsg({ text: data.error ?? 'Restore failed.', isError: true })
@@ -154,7 +183,16 @@ export function BackupRestore() {
           {creating ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <Download className="h-4 w-4 mr-1" />}
           Create Backup
         </Button>
-        <Button variant="outline" size="sm" onClick={() => { setShowUploadRestore(true); setRestoreConfirm('') }}>
+        <Button
+          variant="outline"
+          size="sm"
+          onClick={() => {
+            setShowUploadRestore(true)
+            setRestoreConfirm('')
+            setRestoreToken('')
+            void sendRestoreTokenEmail()
+          }}
+        >
           <Upload className="h-4 w-4 mr-1" />
           Restore from File
         </Button>
@@ -210,7 +248,12 @@ export function BackupRestore() {
                   variant="ghost"
                   size="sm"
                   className="h-7 text-xs"
-                  onClick={() => { setShowRestore({ filename: b.filename }); setRestoreConfirm('') }}
+                  onClick={() => {
+                    setShowRestore({ filename: b.filename })
+                    setRestoreConfirm('')
+                    setRestoreToken('')
+                    void sendRestoreTokenEmail()
+                  }}
                   title="Restore this backup"
                 >
                   <RefreshCw className="h-3 w-3" />
@@ -256,10 +299,27 @@ export function BackupRestore() {
                   autoFocus
                 />
               </div>
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <Label>Email confirmation code</Label>
+                  <Button type="button" variant="outline" size="sm" onClick={() => void sendRestoreTokenEmail()} disabled={sendingRestoreToken || restoring}>
+                    {sendingRestoreToken ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Resend code'}
+                  </Button>
+                </div>
+                <Input
+                  value={restoreToken}
+                  onChange={(e) => setRestoreToken(e.target.value.replace(/[^a-fA-F0-9]/g, '').slice(0, 8).toUpperCase())}
+                  placeholder="Email code"
+                  className="h-9 font-mono text-sm tracking-[0.3em]"
+                />
+                {restoreTokenStatus && (
+                  <p className="text-xs text-muted-foreground">{restoreTokenStatus}</p>
+                )}
+              </div>
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => setShowRestore(null)} disabled={restoring}>Cancel</Button>
-              <Button variant="destructive" onClick={() => handleRestore(showRestore.filename)} disabled={restoring || restoreConfirm !== 'RESTORE'}>
+              <Button variant="outline" onClick={() => { setShowRestore(null); setRestoreToken(''); setRestoreTokenStatus(null) }} disabled={restoring}>Cancel</Button>
+              <Button variant="destructive" onClick={() => handleRestore(showRestore.filename)} disabled={restoring || restoreConfirm !== 'RESTORE' || restoreToken.trim().length < 6}>
                 {restoring && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
                 Confirm Restore
               </Button>
@@ -293,13 +353,30 @@ export function BackupRestore() {
                   autoFocus
                 />
               </div>
-              {restoreConfirm === 'RESTORE' && (
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between gap-2">
+                  <Label>Email confirmation code</Label>
+                  <Button type="button" variant="outline" size="sm" onClick={() => void sendRestoreTokenEmail()} disabled={sendingRestoreToken || restoring}>
+                    {sendingRestoreToken ? <Loader2 className="h-3 w-3 animate-spin" /> : 'Resend code'}
+                  </Button>
+                </div>
+                <Input
+                  value={restoreToken}
+                  onChange={(e) => setRestoreToken(e.target.value.replace(/[^a-fA-F0-9]/g, '').slice(0, 8).toUpperCase())}
+                  placeholder="Email code"
+                  className="h-9 font-mono text-sm tracking-[0.3em]"
+                />
+                {restoreTokenStatus && (
+                  <p className="text-xs text-muted-foreground">{restoreTokenStatus}</p>
+                )}
+              </div>
+              {restoreConfirm === 'RESTORE' && restoreToken.trim().length >= 6 && (
                 <div className="space-y-1.5">
                   <Label>Select backup file</Label>
                   <Input
                     ref={fileRef}
                     type="file"
-                    accept=".sql,.dump"
+                    accept=".sql"
                     onChange={handleUploadRestore}
                     disabled={restoring}
                     className="h-9"
@@ -308,7 +385,7 @@ export function BackupRestore() {
               )}
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => setShowUploadRestore(false)} disabled={restoring}>Cancel</Button>
+              <Button variant="outline" onClick={() => { setShowUploadRestore(false); setRestoreToken(''); setRestoreTokenStatus(null) }} disabled={restoring}>Cancel</Button>
               {restoring && <Loader2 className="h-4 w-4 animate-spin" />}
             </DialogFooter>
           </DialogContent>

@@ -1,11 +1,14 @@
 import { NextResponse } from 'next/server'
 import { execFile } from 'child_process'
-import { mkdir, readFile } from 'fs/promises'
+import { createReadStream } from 'fs'
+import { mkdir } from 'fs/promises'
 import path from 'path'
-import { auth } from '@/lib/auth'
+import { Readable } from 'stream'
 import { logActivity } from '@/lib/activity-log'
+import { requireApiAdmin } from '@/lib/auth/server'
+import { getBackupDir } from '@/lib/backup-storage'
 
-const BACKUP_DIR = path.join(process.cwd(), 'backups')
+const BACKUP_DIR = getBackupDir()
 
 function getDbConfig() {
   const url = new URL(process.env.DATABASE_URL!)
@@ -19,10 +22,8 @@ function getDbConfig() {
 }
 
 export async function POST() {
-  const session = await auth()
-  if (!session?.user?.id || (session.user as { role?: string }).role !== 'ADMIN') {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 403 })
-  }
+  const session = await requireApiAdmin()
+  if (session instanceof NextResponse) return session
 
   const db = getDbConfig()
   const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
@@ -35,7 +36,7 @@ export async function POST() {
     const args = ['-h', db.host, '-p', db.port, '-U', db.user, '-d', db.database, '--no-owner', '--no-acl', '-F', 'p', '-f', filePath]
     execFile('pg_dump', args, { timeout: 120000, env: { ...process.env, PGPASSWORD: db.password } }, async (error) => {
       if (error) {
-        logActivity({
+        await logActivity({
           entityType: 'SYSTEM',
           tag: 'system',
           action: 'backup_created',
@@ -46,7 +47,7 @@ export async function POST() {
         return
       }
 
-      logActivity({
+      await logActivity({
         entityType: 'SYSTEM',
         tag: 'system',
         action: 'backup_created',
@@ -54,9 +55,9 @@ export async function POST() {
       })
 
       try {
-        const buffer = await readFile(filePath)
+        const stream = Readable.toWeb(createReadStream(filePath)) as unknown as BodyInit
         resolve(
-          new NextResponse(buffer, {
+          new NextResponse(stream, {
             headers: {
               'Content-Type': 'application/sql',
               'Content-Disposition': `attachment; filename="${filename}"`,

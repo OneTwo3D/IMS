@@ -6,9 +6,13 @@ import { syncWcOrderStatus } from '@/lib/connectors/woocommerce/sync/order-statu
 import { syncRefundsForOrder } from '@/lib/connectors/woocommerce/sync/refund-sync'
 import { shouldSuppressWcOrderWebhookEcho } from '@/lib/connectors/woocommerce/sync/order-webhook-echo'
 import { logActivity } from '@/lib/activity-log'
+import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import type { WcFullOrder } from '@/lib/connectors/woocommerce/sync/types'
 
 export async function POST(request: Request) {
+  const maintenance = await getMaintenanceModeResponse('webhook')
+  if (maintenance) return maintenance
+
   const body = await request.text()
   const signature = request.headers.get('x-wc-webhook-signature')
   const topic = request.headers.get('x-wc-webhook-topic')

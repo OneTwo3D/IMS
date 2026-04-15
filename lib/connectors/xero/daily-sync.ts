@@ -16,7 +16,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getXeroSettings } from '@/lib/connectors/xero/settings'
-import type { Prisma } from '@/app/generated/prisma/client'
+import { Prisma } from '@/app/generated/prisma/client'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
@@ -39,6 +39,8 @@ type JournalLinePayload = {
   debit?: number
   credit?: number
 }
+
+const XERO_DAILY_BATCH_LOCK_KEY = 4_112_208_031
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100
@@ -125,6 +127,16 @@ async function createPendingSyncLog(
       payload: params.payload as never,
     },
   })
+}
+
+async function lockCostLayers(
+  tx: Prisma.TransactionClient,
+  ids: string[],
+): Promise<void> {
+  if (ids.length === 0) return
+  await tx.$queryRaw(
+    Prisma.sql`SELECT id FROM "cost_layers" WHERE id IN (${Prisma.join(ids)}) FOR UPDATE`,
+  )
 }
 
 async function resetFailedDailyBatchLogs(): Promise<void> {
@@ -293,15 +305,24 @@ export async function runDailyBatchSync(): Promise<{
   errors: string[]
 }> {
   const result = { groupA1: 0, groupA2: 0, groupB: 0, errors: [] as string[] }
-  const settings = await getXeroSettings()
-  const today = new Date().toISOString().slice(0, 10)
-
-  if (settings.xero_sync_enabled !== 'true') {
+  const lockRows = await db.$queryRaw<Array<{ locked: boolean }>>`
+    SELECT pg_try_advisory_lock(${XERO_DAILY_BATCH_LOCK_KEY}) AS locked
+  `
+  if (!lockRows[0]?.locked) {
+    result.errors.push('Daily batch already running')
     return result
   }
 
-  await resetFailedDailyBatchLogs()
-  await recreateMissingDailyBatchLogs(settings)
+  try {
+    const settings = await getXeroSettings()
+    const today = new Date().toISOString().slice(0, 10)
+
+    if (settings.xero_sync_enabled !== 'true') {
+      return result
+    }
+
+    await resetFailedDailyBatchLogs()
+    await recreateMissingDailyBatchLogs(settings)
 
   // --- Group A1: Revenue Deferral ---
   try {
@@ -473,54 +494,58 @@ export async function runDailyBatchSync(): Promise<{
 
   // --- Group B: Shipment Revenue Recognition + COGS ---
   try {
-    const shipments = await db.shipment.findMany({
-      where: {
-        status: 'SHIPPED',
-        shipmentJournalDate: null,
-        order: {
-          status: { not: 'REFUNDED' },
-          revenueDeferredDate: { not: null },
-          inventoryAllocatedDate: { not: null },
-        },
-      },
-      select: {
-        id: true,
-        orderId: true,
-        warehouseId: true,
-        createdAt: true,
-        lines: {
-          select: {
-            id: true,
-            lineId: true,
-            productId: true,
-            qty: true,
-            line: {
-              select: { id: true, qty: true, totalGbp: true },
-            },
+    const groupBCount = await db.$transaction(async (tx) => {
+      const shipments = await tx.shipment.findMany({
+        where: {
+          status: 'SHIPPED',
+          shipmentJournalDate: null,
+          order: {
+            status: { not: 'REFUNDED' },
+            revenueDeferredDate: { not: null },
+            inventoryAllocatedDate: { not: null },
           },
         },
-        order: {
-          select: {
-            orderNumber: true,
-            wcOrderNumber: true,
-            status: true,
-            totalGbp: true,
-            unearnedRevenueAmount: true,
-            lines: { select: { totalGbp: true } },
-            shipments: {
-              select: {
-                id: true,
-                shipmentJournalDate: true,
-                revenueRecognizedAmount: true,
+        select: {
+          id: true,
+          orderId: true,
+          warehouseId: true,
+          createdAt: true,
+          lines: {
+            select: {
+              id: true,
+              lineId: true,
+              productId: true,
+              qty: true,
+              line: {
+                select: { id: true, qty: true, totalGbp: true },
+              },
+            },
+          },
+          order: {
+            select: {
+              orderNumber: true,
+              wcOrderNumber: true,
+              status: true,
+              totalGbp: true,
+              unearnedRevenueAmount: true,
+              lines: { select: { totalGbp: true } },
+              shipments: {
+                select: {
+                  id: true,
+                  shipmentJournalDate: true,
+                  revenueRecognizedAmount: true,
+                },
               },
             },
           },
         },
-      },
-      orderBy: { createdAt: 'asc' },
-    })
+        orderBy: { createdAt: 'asc' },
+      })
 
-    if (shipments.length > 0) {
+      if (shipments.length === 0) {
+        return 0
+      }
+
       let totalRevenue = 0
       let totalCogs = 0
       const layerDecrements = new Map<string, number>()
@@ -530,7 +555,7 @@ export async function runDailyBatchSync(): Promise<{
       const orderIds = Array.from(new Set(shipments.map((shipment) => shipment.orderId)))
 
       const [orderAllocations, priorShipmentLines, priorRefundLines] = await Promise.all([
-        db.orderAllocation.findMany({
+        tx.orderAllocation.findMany({
           where: { orderId: { in: orderIds } },
           select: {
             id: true,
@@ -540,7 +565,7 @@ export async function runDailyBatchSync(): Promise<{
             costLayerSnapshot: true,
           },
         }),
-        db.shipmentLine.findMany({
+        tx.shipmentLine.findMany({
           where: {
             shipment: {
               orderId: { in: orderIds },
@@ -551,7 +576,7 @@ export async function runDailyBatchSync(): Promise<{
             costLayerSnapshot: true,
           },
         }),
-        db.salesOrderRefundLine.findMany({
+        tx.salesOrderRefundLine.findMany({
           where: {
             refund: {
               orderId: { in: orderIds },
@@ -562,6 +587,13 @@ export async function runDailyBatchSync(): Promise<{
           },
         }),
       ])
+
+      const referencedCostLayerIds = Array.from(new Set(
+        orderAllocations.flatMap((allocation) => (
+          parseCostLayerSnapshot(allocation.costLayerSnapshot).map((entry) => entry.costLayerId)
+        )),
+      ))
+      await lockCostLayers(tx, referencedCostLayerIds)
 
       const allocationAvailability = new Map<string, CostLayerSnapshotEntry[]>()
       for (const allocation of orderAllocations) {
@@ -700,66 +732,71 @@ export async function runDailyBatchSync(): Promise<{
         )
       }
 
-      await db.$transaction(async (tx) => {
-        if (journalLines.length > 0) {
-          await createPendingSyncLog(tx, {
-            type: 'DAILY_BATCH_GROUP_B',
-            referenceId: `B-${today}`,
-            payload: {
-              date: today,
-              reference: `Shipment COGS ${today}`,
-              narration: `Daily shipment batch: ${shipments.length} shipment(s), revenue £${totalRevenue.toFixed(2)}, COGS £${totalCogs.toFixed(2)}`,
-              lines: journalLines,
-              _postingMode: 'submitted',
-            },
-          })
-        }
+      if (journalLines.length > 0) {
+        await createPendingSyncLog(tx, {
+          type: 'DAILY_BATCH_GROUP_B',
+          referenceId: `B-${today}`,
+          payload: {
+            date: today,
+            reference: `Shipment COGS ${today}`,
+            narration: `Daily shipment batch: ${shipments.length} shipment(s), revenue £${totalRevenue.toFixed(2)}, COGS £${totalCogs.toFixed(2)}`,
+            lines: journalLines,
+            _postingMode: 'submitted',
+          },
+        })
+      }
 
-        for (const shipment of shipments) {
-          const resultForShipment = shipmentResults.get(shipment.id) ?? { revenue: 0, cogs: 0 }
-          for (const line of shipment.lines) {
-            await tx.shipmentLine.update({
-              where: { id: line.id },
-              data: {
-                costLayerSnapshot: (shipmentSnapshots.get(line.id) ?? []) as never,
-              },
-            })
-          }
-          await tx.shipment.update({
-            where: { id: shipment.id },
+      for (const shipment of shipments) {
+        const resultForShipment = shipmentResults.get(shipment.id) ?? { revenue: 0, cogs: 0 }
+        for (const line of shipment.lines) {
+          await tx.shipmentLine.update({
+            where: { id: line.id },
             data: {
-              shipmentJournalDate: new Date(),
-              cogsBatchAmount: resultForShipment.cogs,
-              revenueRecognizedAmount: resultForShipment.revenue,
+              costLayerSnapshot: (shipmentSnapshots.get(line.id) ?? []) as never,
             },
           })
         }
+        await tx.shipment.update({
+          where: { id: shipment.id },
+          data: {
+            shipmentJournalDate: new Date(),
+            cogsBatchAmount: resultForShipment.cogs,
+            revenueRecognizedAmount: resultForShipment.revenue,
+          },
+        })
+      }
 
-        for (const [layerId, decrement] of layerDecrements) {
-          await tx.costLayer.update({
-            where: { id: layerId },
-            data: { remainingQty: { decrement } },
-          })
-        }
-      })
+      for (const [layerId, decrement] of layerDecrements) {
+        await tx.costLayer.update({
+          where: { id: layerId },
+          data: { remainingQty: { decrement } },
+        })
+      }
 
-      result.groupB = shipments.length
+      return shipments.length
+    })
+    if (groupBCount > 0) {
+      result.groupB = groupBCount
     }
   } catch (e) {
     result.errors.push(`Group B error: ${String(e)}`)
   }
 
-  // Log summary
-  if (result.groupA1 > 0 || result.groupA2 > 0 || result.groupB > 0) {
-    logActivity({
-      entityType: 'SYSTEM',
-      action: 'xero_daily_batch',
-      tag: 'sync',
-      level: 'INFO',
-      description: `Daily batch: A1=${result.groupA1} deferred, A2=${result.groupA2} allocated, B=${result.groupB} shipped`,
-      metadata: result,
-    })
-  }
+    // Log summary
+    if (result.groupA1 > 0 || result.groupA2 > 0 || result.groupB > 0) {
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'xero_daily_batch',
+        tag: 'sync',
+        level: 'INFO',
+        description: `Daily batch: A1=${result.groupA1} deferred, A2=${result.groupA2} allocated, B=${result.groupB} shipped`,
+        metadata: result,
+        resolveUser: false,
+      })
+    }
 
-  return result
+    return result
+  } finally {
+    await db.$executeRaw`SELECT pg_advisory_unlock(${XERO_DAILY_BATCH_LOCK_KEY})`
+  }
 }

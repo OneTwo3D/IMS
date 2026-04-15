@@ -131,7 +131,7 @@ function maskSecret(value: string | null | undefined): { masked: string; hasValu
 async function loadStorage() {
   const [
     s3Endpoint, s3Region, s3Bucket, s3AccessKey, s3SecretKey, s3Prefix,
-    sftpHost, sftpPort, sftpUser, sftpPassword, sftpKey, sftpPath,
+    sftpHost, sftpPort, sftpUser, sftpPassword, sftpKey, sftpFingerprint, sftpPath,
   ] = await Promise.all([
     getSetting('backup_s3_endpoint'),
     getSetting('backup_s3_region'),
@@ -144,6 +144,7 @@ async function loadStorage() {
     getSetting('backup_sftp_user'),
     getSetting('backup_sftp_password'),
     getSetting('backup_sftp_private_key'),
+    getSetting('backup_sftp_host_fingerprint'),
     getSetting('backup_sftp_path'),
   ])
 
@@ -169,6 +170,7 @@ async function loadStorage() {
       passwordConfigured: sftpPasswordMasked.hasValue,
       privateKey: sftpKeyMasked.masked,
       privateKeyConfigured: sftpKeyMasked.hasValue,
+      hostFingerprint: sftpFingerprint ?? '',
       path: sftpPath ?? '',
     },
   }

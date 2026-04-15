@@ -5,6 +5,12 @@
 import { getAccessToken } from './auth'
 
 const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
+const XERO_MAX_RETRIES = 3
+const XERO_MINUTE_LIMIT = 55
+const XERO_DAY_LIMIT = 4900
+
+const minuteBuckets = new Map<string, number[]>()
+const dayBuckets = new Map<string, number[]>()
 
 export type XeroApiError = {
   StatusCode: number
@@ -21,6 +27,68 @@ export type XeroResponse<T = unknown> = {
   status: number
   data?: T
   error?: string
+}
+
+function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+function pushRequestTimestamp(bucket: Map<string, number[]>, key: string, now: number, windowMs: number) {
+  const cutoff = now - windowMs
+  const values = (bucket.get(key) ?? []).filter((ts) => ts >= cutoff)
+  values.push(now)
+  bucket.set(key, values)
+}
+
+async function waitForBudget(tenantId: string) {
+  while (true) {
+    const now = Date.now()
+    const minute = (minuteBuckets.get(tenantId) ?? []).filter((ts) => ts >= now - 60_000)
+    const day = (dayBuckets.get(tenantId) ?? []).filter((ts) => ts >= now - 86_400_000)
+    minuteBuckets.set(tenantId, minute)
+    dayBuckets.set(tenantId, day)
+
+    const minuteWait = minute.length >= XERO_MINUTE_LIMIT ? 60_000 - (now - minute[0]) : 0
+    const dayWait = day.length >= XERO_DAY_LIMIT ? 86_400_000 - (now - day[0]) : 0
+    const waitMs = Math.max(minuteWait, dayWait)
+    if (waitMs <= 0) return
+    await sleep(waitMs)
+  }
+}
+
+function noteRequest(tenantId: string) {
+  const now = Date.now()
+  pushRequestTimestamp(minuteBuckets, tenantId, now, 60_000)
+  pushRequestTimestamp(dayBuckets, tenantId, now, 86_400_000)
+}
+
+function parseRetryAfterMs(value: string | null): number {
+  if (!value) return 0
+  const seconds = Number.parseInt(value, 10)
+  if (Number.isFinite(seconds)) return Math.max(0, seconds * 1000)
+  const absolute = Date.parse(value)
+  return Number.isFinite(absolute) ? Math.max(0, absolute - Date.now()) : 0
+}
+
+async function performRequest(auth: { accessToken: string; tenantId: string }, init: RequestInit, url: string) {
+  let lastRateLimitMs = 0
+
+  for (let attempt = 0; attempt <= XERO_MAX_RETRIES; attempt++) {
+    await waitForBudget(auth.tenantId)
+    noteRequest(auth.tenantId)
+
+    const res = await fetch(url, init)
+    if (res.status !== 429) return res
+
+    lastRateLimitMs = Math.max(parseRetryAfterMs(res.headers.get('Retry-After')), 1000 * 2 ** attempt)
+    if (attempt === XERO_MAX_RETRIES) {
+      return { ok: false, status: 429, text: async () => `Rate limited after retries; retry after ${lastRateLimitMs}ms` } as Response
+    }
+
+    await sleep(lastRateLimitMs)
+  }
+
+  return { ok: false, status: 429, text: async () => `Rate limited after retries; retry after ${lastRateLimitMs}ms` } as Response
 }
 
 async function xeroFetch<T = unknown>(
@@ -50,13 +118,9 @@ async function xeroFetch<T = unknown>(
     init.body = JSON.stringify(body)
   }
 
-  const res = await fetch(url, init)
-
-  // Rate limit handling
+  const res = await performRequest(auth, init, url)
   if (res.status === 429) {
-    const retryAfter = res.headers.get('Retry-After')
-    const waitMs = retryAfter ? parseInt(retryAfter) * 1000 : 60_000
-    return { ok: false, status: 429, error: `Rate limited — retry after ${waitMs}ms` }
+    return { ok: false, status: 429, error: await res.text().catch(() => 'Rate limited') }
   }
 
   if (!res.ok) {
@@ -119,17 +183,17 @@ export async function xeroGetRaw(
 
   const url = path.startsWith('http') ? path : `${XERO_BASE_URL}/${path}`
 
-  const res = await fetch(url, {
+  const res = await performRequest(auth, {
     method: 'GET',
     headers: {
       'Authorization': `Bearer ${auth.accessToken}`,
       'Xero-Tenant-Id': auth.tenantId,
       'Accept': accept,
     },
-  })
+  }, url)
 
   if (res.status === 429) {
-    return { ok: false, status: 429, error: 'Rate limited' }
+    return { ok: false, status: 429, error: await res.text().catch(() => 'Rate limited') }
   }
 
   if (!res.ok) {
@@ -157,7 +221,7 @@ export async function xeroUploadAttachment(
 
   const url = `${XERO_BASE_URL}/${endpoint}/${objectId}/Attachments/${encodeURIComponent(filename)}`
 
-  const res = await fetch(url, {
+  const res = await performRequest(auth, {
     method: 'PUT',
     headers: {
       'Authorization': `Bearer ${auth.accessToken}`,
@@ -166,10 +230,10 @@ export async function xeroUploadAttachment(
       'Content-Length': String(fileBuffer.length),
     },
     body: new Uint8Array(fileBuffer),
-  })
+  }, url)
 
   if (res.status === 429) {
-    return { ok: false, status: 429, error: 'Rate limited' }
+    return { ok: false, status: 429, error: await res.text().catch(() => 'Rate limited') }
   }
 
   if (!res.ok) {

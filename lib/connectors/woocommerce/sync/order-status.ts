@@ -4,6 +4,7 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
 import { wcPut } from '../api'
 import type { WcFullOrder } from './types'
 
@@ -42,12 +43,14 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success
     const { applySalesOrderStatusTransition } = await import('@/app/actions/sales')
     const result = await applySalesOrderStatusTransition(so.id, targetStatus as never, undefined, {
       pushStatusToWooCommerce: false,
+      internalBypassToken: INTERNAL_STATUS_TRANSITION_BYPASS,
     })
 
     if (!result.success) {
-      logActivity({
+      await logActivity({
         entityType: 'SALES_ORDER', entityId: so.id, action: 'status_sync_failed', tag: 'sync', level: 'WARNING',
         description: `Could not sync WC status ${wcOrder.status} → ${targetStatus} for order #${so.wcOrderNumber}: ${result.error}`,
+        resolveUser: false,
       })
     }
 
@@ -82,9 +85,10 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
     const { error } = await wcPut(`/orders/${so.wcOrderId}`, { status: wcStatus })
 
     if (error) {
-      logActivity({
+      await logActivity({
         entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_push_failed', tag: 'sync', level: 'WARNING',
         description: `Failed to push status ${newStatus} → ${wcStatus} to WC order #${so.wcOrderNumber}: ${error}`,
+        resolveUser: false,
       })
       return
     }
@@ -101,9 +105,10 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
       },
     })
 
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_status_pushed', tag: 'sync', level: 'INFO',
       description: `Pushed status ${wcStatus} to WC order #${so.wcOrderNumber}`,
+      resolveUser: false,
     })
   } catch {
     // Fire-and-forget — don't break the IMS flow

@@ -4,14 +4,17 @@ import { purgeExpiredActivityLogs } from '@/lib/activity-log-cleanup'
 import { purgeExpiredDemandHistory } from '@/lib/connectors/woocommerce/sync/initial-import'
 import { purgeExpiredData } from '@/lib/data-retention'
 import { logActivity } from '@/lib/activity-log'
+import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 
 export async function GET(request: Request) {
   const err = verifyCron(request)
   if (err) return err
+  const maintenance = await getMaintenanceModeResponse('cron')
+  if (maintenance) return maintenance
   const { totalDeleted, retention } = await purgeExpiredActivityLogs()
 
   if (totalDeleted > 0) {
-    logActivity({
+    await logActivity({
       entityType: 'SYSTEM',
       action: 'cleanup',
       tag: 'system',

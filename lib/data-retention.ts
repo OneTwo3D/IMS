@@ -133,12 +133,13 @@ export async function purgeExpiredData(): Promise<{
   if (customersArchived > 0) parts.push(`${customersArchived} customers archived`)
 
   if (parts.length > 0) {
-    logActivity({
+    await logActivity({
       entityType: 'SYSTEM',
       action: 'cleanup',
       tag: 'system',
       description: `Data retention cleanup: ${parts.join(', ')}`,
       metadata: { syncLogsDeleted, stockMovementsDeleted, salesOrdersArchived, purchaseOrdersArchived, customersArchived },
+      resolveUser: false,
     })
   }
 

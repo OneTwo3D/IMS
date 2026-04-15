@@ -11,6 +11,7 @@ import { verify } from 'otplib'
 import { z } from 'zod'
 import { setAuthToken } from '@/lib/auth/token-store'
 import { checkRateLimit, clearRateLimit } from '@/lib/rate-limit'
+import { readTotpSecrets } from '@/lib/totp-secrets'
 
 const schema = z.object({ code: z.string().length(6) })
 
@@ -37,14 +38,14 @@ export async function POST(request: NextRequest) {
 
   const user = await db.user.findUnique({
     where: { id: session.user.id },
-    select: { totpSecret: true, totpEnabled: true },
+    select: { totpEnabled: true },
   })
-
-  if (!user?.totpEnabled || !user.totpSecret) {
+  const secrets = await readTotpSecrets(session.user.id)
+  if (!user?.totpEnabled || !secrets?.totpSecret) {
     return Response.json({ error: '2FA not enabled' }, { status: 400 })
   }
 
-  const result = await verify({ secret: user.totpSecret, token: parsed.data.code })
+  const result = await verify({ secret: secrets.totpSecret, token: parsed.data.code })
 
   if (!result.valid) {
     return Response.json({ error: 'Invalid code' }, { status: 400 })
