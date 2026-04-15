@@ -5,7 +5,13 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { useRouter, useSearchParams } from 'next/navigation'
 import { SyncClient } from './sync-client'
 import { XeroClient } from './xero-client'
-import type { WcSyncSettings, TaxRateMappingRow, StatusMappingRow, SyncLogRow } from '@/app/actions/wc-sync'
+import type {
+  ShoppingConnectorCredentials,
+  ShoppingStatusMappingRow,
+  ShoppingSyncLogRow,
+  ShoppingSyncSettings,
+  ShoppingTaxRateMappingRow,
+} from '@/app/actions/shopping-sync'
 import type { XeroSettings, XeroSyncLogRow, XeroSyncReadiness } from '@/app/actions/xero-sync'
 import type { DailyBatchPreview, DailyBatchHistoryDay } from '@/app/actions/xero-daily-batch'
 import type { TaxRateRow } from '@/app/actions/settings'
@@ -13,16 +19,16 @@ import type { TaxRateRow } from '@/app/actions/settings'
 type XeroAccount = { id: string; xeroId: string; code: string | null; name: string; type: string }
 
 type Props = {
-  wcSettings: WcSyncSettings
-  wcTaxMappings: TaxRateMappingRow[]
-  wcStatusMappings: StatusMappingRow[]
-  wcLogs: SyncLogRow[]
+  shoppingSettings: ShoppingSyncSettings
+  shoppingTaxMappings: ShoppingTaxRateMappingRow[]
+  shoppingStatusMappings: ShoppingStatusMappingRow[]
+  shoppingLogs: ShoppingSyncLogRow[]
   taxRates: { id: string; name: string }[]
   /** Full IMS VAT rate rows (used by the Xero tax code mapping UI). */
   imsTaxRates: TaxRateRow[]
   /** Live Xero tax rates (fetched on page load when connected). */
   xeroTaxRates: Array<{ taxType: string; name: string; rate: number }>
-  wcCredentials: { url: string; key: string; secret: string; secretMasked: boolean }
+  shoppingCredentials: ShoppingConnectorCredentials
   xeroSettings: XeroSettings & { secretMasked: boolean }
   xeroConnected: boolean
   xeroTenantName?: string
@@ -31,8 +37,8 @@ type Props = {
   paymentMethodCombos: Array<{ paymentMethod: string; currency: string }>
   paymentAccountMap: string
   currencies: Array<{ code: string; name: string }>
-  /** Active WooCommerce payment gateways — used to populate the method dropdown in Xero payment mapping. */
-  wcPaymentGateways: Array<{ id: string; title: string }>
+  /** Active shopping connector payment methods — used to populate the method dropdown in Xero payment mapping. */
+  shoppingPaymentMethods: Array<{ id: string; title: string }>
   xeroReadiness: XeroSyncReadiness
   dailyBatchPreview: DailyBatchPreview
   dailyBatchHistory: DailyBatchHistoryDay[]
@@ -109,7 +115,7 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 
-export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcLogs, taxRates, imsTaxRates, xeroTaxRates, wcCredentials, xeroSettings, xeroConnected, xeroTenantName, xeroAccounts, xeroLogs, paymentMethodCombos, paymentAccountMap, currencies, wcPaymentGateways, xeroReadiness, dailyBatchPreview, dailyBatchHistory }: Props) {
+export function SyncDashboard({ shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, taxRates, imsTaxRates, xeroTaxRates, shoppingCredentials, xeroSettings, xeroConnected, xeroTenantName, xeroAccounts, xeroLogs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, xeroReadiness, dailyBatchPreview, dailyBatchHistory }: Props) {
   const router = useRouter()
   const searchParams = useSearchParams()
   const activeConnector = searchParams.get('connector')
@@ -122,7 +128,7 @@ export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcL
     }
   }
 
-  const wcConnected = !!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secret
+  const shoppingConnected = !!shoppingCredentials.url && !!shoppingCredentials.key && !!shoppingCredentials.secret
 
   if (activeConnector === 'rest-api') {
     const baseUrl = typeof window !== 'undefined' ? window.location.origin : ''
@@ -221,7 +227,7 @@ export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcL
           paymentMethodCombos={paymentMethodCombos}
           paymentAccountMap={paymentAccountMap}
           currencies={currencies}
-          wcPaymentGateways={wcPaymentGateways}
+          shoppingPaymentMethods={shoppingPaymentMethods}
           imsTaxRates={imsTaxRates}
           xeroTaxRates={xeroTaxRates}
           readiness={xeroReadiness}
@@ -241,17 +247,17 @@ export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcL
         <div className="flex items-center gap-3 mb-2">
           {CONNECTOR_LOGOS.woocommerce}
           <div>
-            <h2 className="text-lg font-semibold">WooCommerce Connector</h2>
+            <h2 className="text-lg font-semibold">Shopping Connector</h2>
             <p className="text-xs text-muted-foreground">Sync orders, products and stock levels</p>
           </div>
         </div>
         <SyncClient
-          settings={wcSettings}
-          taxMappings={wcTaxMappings}
-          statusMappings={wcStatusMappings}
-          logs={wcLogs}
+          settings={shoppingSettings}
+          taxMappings={shoppingTaxMappings}
+          statusMappings={shoppingStatusMappings}
+          logs={shoppingLogs}
           taxRates={taxRates}
-          wcCredentials={wcCredentials}
+          shoppingCredentials={shoppingCredentials}
         />
       </div>
     )
@@ -271,7 +277,7 @@ export function SyncDashboard({ wcSettings, wcTaxMappings, wcStatusMappings, wcL
             >
               <div className="flex items-center justify-between">
                 {CONNECTOR_LOGOS[c.id]}
-                {c.id === 'woocommerce' && wcConnected && (
+                {c.id === 'woocommerce' && shoppingConnected && (
                   <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
                     Connected
                   </span>

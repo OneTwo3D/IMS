@@ -152,7 +152,7 @@ export async function getCustomerDetail(id: string): Promise<CustomerDetail | nu
         select: {
           id: true,
           orderNumber: true,
-          wcOrderNumber: true,
+          externalOrderNumber: true,
           status: true,
           currency: true,
           totalForeign: true,
@@ -168,7 +168,7 @@ export async function getCustomerDetail(id: string): Promise<CustomerDetail | nu
 
   const orders: CustomerOrderRow[] = c.salesOrders.map((so) => ({
     id: so.id,
-    orderNumber: so.orderNumber ?? so.wcOrderNumber ?? so.id.slice(0, 8),
+    orderNumber: so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8),
     status: so.status,
     currency: so.currency,
     totalForeign: Number(so.totalForeign),
@@ -313,7 +313,7 @@ export async function anonymiseCustomer(customerId: string): Promise<{ success: 
         billingAddress: Prisma.JsonNull,
         shippingAddress: Prisma.JsonNull,
         notes: null,
-        wcCustomerId: null,
+        externalCustomerId: null,
         active: false,
         gdprAnonymisedAt: new Date(),
       },

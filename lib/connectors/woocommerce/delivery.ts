@@ -2,16 +2,17 @@
  * WooCommerce delivery status — reads from WC order meta (AST + TrackShip plugin).
  */
 
+import { db } from '@/lib/db'
 import { getWcCredentials } from './api'
 import type { DeliveryStatus } from '../types'
 
-export async function getWcDeliveryStatus(wcOrderId: number): Promise<DeliveryStatus | null> {
+export async function getWcDeliveryStatus(externalOrderId: number): Promise<DeliveryStatus | null> {
   try {
     const creds = await getWcCredentials()
     if (!creds) return null
 
     const auth = Buffer.from(`${creds.key}:${creds.secret}`).toString('base64')
-    const res = await fetch(`${creds.url}/wp-json/wc/v3/orders/${wcOrderId}`, {
+    const res = await fetch(`${creds.url}/wp-json/wc/v3/orders/${externalOrderId}`, {
       headers: { Authorization: `Basic ${auth}` },
       signal: AbortSignal.timeout(15000),
     })
@@ -36,7 +37,7 @@ export async function getWcDeliveryStatus(wcOrderId: number): Promise<DeliverySt
     if (!status) return null
 
     return {
-      externalOrderId: wcOrderId,
+      externalOrderId: externalOrderId,
       status,
       trackingNumber,
       carrier,
@@ -44,4 +45,14 @@ export async function getWcDeliveryStatus(wcOrderId: number): Promise<DeliverySt
   } catch {
     return null
   }
+}
+
+export async function getWcDeliveryStatusForSalesOrder(orderId: string): Promise<DeliveryStatus | null> {
+  const order = await db.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { externalOrderId: true },
+  })
+
+  if (!order?.externalOrderId) return null
+  return getWcDeliveryStatus(order.externalOrderId)
 }

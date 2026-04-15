@@ -1,4 +1,4 @@
--- Add wcProductId on products for O(1) WooCommerce stock sync.
+-- Add externalProductId on products for O(1) WooCommerce stock sync.
 -- Resolved once via SKU lookup and persisted so subsequent sync runs do
 -- not re-query WC by SKU for every product.
 --
@@ -15,4 +15,4 @@
 -- are not blocked for the duration of the index build.
 
 ALTER TABLE "products"
-  ADD COLUMN "wcProductId" BIGINT;
+  ADD COLUMN "externalProductId" BIGINT;

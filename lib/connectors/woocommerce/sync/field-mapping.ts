@@ -27,7 +27,7 @@ export function mapWcAddress(a: WcAddress) {
 export function mapWcCustomer(order: WcFullOrder) {
   const b = order.billing
   return {
-    wcCustomerId: order.customer_id > 0 ? order.customer_id : null,
+    externalCustomerId: order.customer_id > 0 ? order.customer_id : null,
     firstName: b.first_name || order.shipping.first_name || '',
     lastName: b.last_name || order.shipping.last_name || '',
     email: b.email || null,
@@ -41,8 +41,8 @@ export async function upsertCustomer(order: WcFullOrder): Promise<string | null>
   if (!cust.firstName && !cust.lastName && !cust.email) return null
 
   // Try to find by WC customer ID first, then by email
-  let existing = cust.wcCustomerId
-    ? await db.customer.findUnique({ where: { wcCustomerId: cust.wcCustomerId } })
+  let existing = cust.externalCustomerId
+    ? await db.customer.findUnique({ where: { externalCustomerId: cust.externalCustomerId } })
     : null
   if (!existing && cust.email) {
     existing = await db.customer.findFirst({ where: { email: cust.email } })
@@ -50,8 +50,8 @@ export async function upsertCustomer(order: WcFullOrder): Promise<string | null>
 
   if (existing) {
     // Update if WC customer ID was missing
-    if (cust.wcCustomerId && !existing.wcCustomerId) {
-      await db.customer.update({ where: { id: existing.id }, data: { wcCustomerId: cust.wcCustomerId } })
+    if (cust.externalCustomerId && !existing.externalCustomerId) {
+      await db.customer.update({ where: { id: existing.id }, data: { externalCustomerId: cust.externalCustomerId } })
     }
     return existing.id
   }
@@ -59,7 +59,7 @@ export async function upsertCustomer(order: WcFullOrder): Promise<string | null>
   // Create new customer
   const created = await db.customer.create({
     data: {
-      wcCustomerId: cust.wcCustomerId,
+      externalCustomerId: cust.externalCustomerId,
       firstName: cust.firstName,
       lastName: cust.lastName,
       email: cust.email,
@@ -84,14 +84,14 @@ export type MappedLine = {
   unitPriceForeign: number
   discountAmount: number
   discountStr: string | null
-  wcLineItemId: number
+  externalLineItemId: number
   taxForeign: number
   /**
    * WC's own tax rate id for this line (from `line_items[].taxes[0].id`).
    * Null when the WC payload doesn't include a per-line tax entry — in that
    * case the IMS resolver is used as a fallback.
    */
-  wcTaxRateId: number | null
+  externalTaxRateId: number | null
 }
 
 export async function mapWcLineItems(
@@ -113,7 +113,7 @@ export async function mapWcLineItems(
     const unitPrice = qty > 0 ? subtotal / qty : 0
     const lineDiscount = Math.max(0, subtotal - total)
     const tax = parseFloat(item.total_tax) || 0
-    const wcTaxRateId = item.taxes?.[0]?.id ?? null
+    const externalTaxRateId = item.taxes?.[0]?.id ?? null
 
     return {
       productId: item.sku ? (skuMap.get(item.sku.toUpperCase()) ?? null) : null,
@@ -123,9 +123,9 @@ export async function mapWcLineItems(
       unitPriceForeign: Math.round(unitPrice * 1000000) / 1000000,
       discountAmount: Math.round(lineDiscount * 10000) / 10000,
       discountStr: lineDiscount > 0 ? lineDiscount.toFixed(2) : null,
-      wcLineItemId: item.id,
+      externalLineItemId: item.id,
       taxForeign: Math.round(tax * 10000) / 10000,
-      wcTaxRateId: typeof wcTaxRateId === 'number' && wcTaxRateId > 0 ? wcTaxRateId : null,
+      externalTaxRateId: typeof externalTaxRateId === 'number' && externalTaxRateId > 0 ? externalTaxRateId : null,
     }
   })
 }
@@ -198,8 +198,8 @@ export async function resolveWcTaxRateById(wcRateId: number | null | undefined):
   if (!wcRateId || !Number.isFinite(wcRateId) || wcRateId <= 0) {
     return fallbackDefaultTaxRate()
   }
-  const mapping = await db.wcTaxRateMapping.findUnique({
-    where: { wcTaxRateId: wcRateId },
+  const mapping = await db.shoppingTaxRateMapping.findUnique({
+    where: { externalTaxRateId: wcRateId },
     include: { taxRate: { select: { id: true, name: true, rate: true, accountingTaxType: true } } },
   })
   if (!mapping) return fallbackDefaultTaxRate()

@@ -459,7 +459,7 @@ export type WarehouseRow = {
   postcode: string | null
   country: string
   availableForSale: boolean
-  syncToWoocommerce: boolean
+  syncToStore: boolean
   isDefault: boolean
   defaultReturnWarehouse: boolean
   active: boolean
@@ -479,7 +479,7 @@ const warehouseFields = {
   postcode: true,
   country: true,
   availableForSale: true,
-  syncToWoocommerce: true,
+  syncToStore: true,
   isDefault: true,
   defaultReturnWarehouse: true,
   active: true,
@@ -506,7 +506,7 @@ const warehouseSchema = z.object({
   postcode: z.string().max(20).optional().or(z.literal('')),
   country: z.string().max(10).default('GB'),
   availableForSale: z.boolean().default(true),
-  syncToWoocommerce: z.boolean().default(false),
+  syncToStore: z.boolean().default(false),
   isDefault: z.boolean().default(false),
   defaultReturnWarehouse: z.boolean().default(false),
   active: z.boolean().default(true),
@@ -550,7 +550,7 @@ export async function createWarehouse(
         postcode: data.postcode || null,
         country: data.country,
         availableForSale: data.availableForSale,
-        syncToWoocommerce: data.syncToWoocommerce,
+        syncToStore: data.syncToStore,
         isDefault: data.isDefault,
         defaultReturnWarehouse: data.defaultReturnWarehouse,
         active: data.active,
@@ -604,7 +604,7 @@ export async function updateWarehouse(
         postcode: data.postcode || null,
         country: data.country,
         availableForSale: data.availableForSale,
-        syncToWoocommerce: data.syncToWoocommerce,
+        syncToStore: data.syncToStore,
         isDefault: data.isDefault,
         defaultReturnWarehouse: data.defaultReturnWarehouse,
         active: data.active,

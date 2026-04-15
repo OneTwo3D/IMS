@@ -97,17 +97,17 @@ function trackingItemsEqual(left: WcTrackingItem[], right: WcTrackingItem[]): bo
 }
 
 async function buildOutboundTracking(orderId: string): Promise<{
-  wcOrderId: number | null
+  externalOrderId: number | null
   orderNumber: string | null
-  wcOrderNumber: string | null
+  externalOrderNumber: string | null
   items: WcTrackingItem[]
 }> {
   const order = await db.salesOrder.findUnique({
     where: { id: orderId },
     select: {
-      wcOrderId: true,
+      externalOrderId: true,
       orderNumber: true,
-      wcOrderNumber: true,
+      externalOrderNumber: true,
       trackingNumber: true,
       shippingService: true,
       shippedAt: true,
@@ -125,7 +125,7 @@ async function buildOutboundTracking(orderId: string): Promise<{
   })
 
   if (!order) {
-    return { wcOrderId: null, orderNumber: null, wcOrderNumber: null, items: [] }
+    return { externalOrderId: null, orderNumber: null, externalOrderNumber: null, items: [] }
   }
 
   const shipmentRows: TrackingSourceRow[] = order.shipments
@@ -146,28 +146,28 @@ async function buildOutboundTracking(orderId: string): Promise<{
 
   const items = dedupeTrackingRows([...shipmentRows, ...fallbackRows]).map(toWcTrackingItem)
   return {
-    wcOrderId: order.wcOrderId ?? null,
+    externalOrderId: order.externalOrderId ?? null,
     orderNumber: order.orderNumber ?? null,
-    wcOrderNumber: order.wcOrderNumber ?? null,
+    externalOrderNumber: order.externalOrderNumber ?? null,
     items,
   }
 }
 
 export async function pushImsTrackingToWc(orderId: string): Promise<{ success: boolean; skipped?: boolean; error?: string }> {
   const outbound = await buildOutboundTracking(orderId)
-  if (!outbound.wcOrderId) return { success: true, skipped: true }
+  if (!outbound.externalOrderId) return { success: true, skipped: true }
   if (outbound.items.length === 0) return { success: true, skipped: true }
 
   try {
-    const currentOrder = await wcFetch(`/orders/${outbound.wcOrderId}`)
+    const currentOrder = await wcFetch(`/orders/${outbound.externalOrderId}`)
     if (currentOrder.error) {
-      await db.wcSyncLog.create({
+      await db.shoppingSyncLog.create({
         data: {
-          direction: 'TO_WC',
+          direction: 'TO_CONNECTOR',
           status: 'FAILED',
           entityType: 'SalesOrder',
           entityId: orderId,
-          wcId: outbound.wcOrderId,
+          externalId: outbound.externalOrderId,
           payload: JSON.parse(JSON.stringify({ meta_key: '_wc_shipment_tracking_items', items: outbound.items })),
           errorMessage: currentOrder.error,
         },
@@ -178,8 +178,8 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
         action: 'wc_tracking_push_failed',
         tag: 'sync',
         level: 'WARNING',
-        description: `Failed to load WooCommerce order #${outbound.wcOrderNumber ?? outbound.wcOrderId} before tracking sync`,
-        metadata: { wcOrderId: outbound.wcOrderId, error: currentOrder.error },
+        description: `Failed to load WooCommerce order #${outbound.externalOrderNumber ?? outbound.externalOrderId} before tracking sync`,
+        metadata: { externalOrderId: outbound.externalOrderId, error: currentOrder.error },
       })
       return { success: false, error: currentOrder.error }
     }
@@ -195,18 +195,18 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
       ? { id: existingMeta.id, key: existingMeta.key, value: outbound.items }
       : { key: '_wc_shipment_tracking_items', value: outbound.items }
 
-    const update = await wcPut(`/orders/${outbound.wcOrderId}`, {
+    const update = await wcPut(`/orders/${outbound.externalOrderId}`, {
       meta_data: [metaPatch],
     })
 
     if (update.error) {
-      await db.wcSyncLog.create({
+      await db.shoppingSyncLog.create({
         data: {
-          direction: 'TO_WC',
+          direction: 'TO_CONNECTOR',
           status: 'FAILED',
           entityType: 'SalesOrder',
           entityId: orderId,
-          wcId: outbound.wcOrderId,
+          externalId: outbound.externalOrderId,
           payload: JSON.parse(JSON.stringify({ meta_key: '_wc_shipment_tracking_items', items: outbound.items })),
           errorMessage: update.error,
         },
@@ -217,19 +217,19 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
         action: 'wc_tracking_push_failed',
         tag: 'sync',
         level: 'WARNING',
-        description: `Failed to push tracking to WooCommerce order #${outbound.wcOrderNumber ?? outbound.wcOrderId}`,
-        metadata: { wcOrderId: outbound.wcOrderId, error: update.error, trackingCount: outbound.items.length },
+        description: `Failed to push tracking to WooCommerce order #${outbound.externalOrderNumber ?? outbound.externalOrderId}`,
+        metadata: { externalOrderId: outbound.externalOrderId, error: update.error, trackingCount: outbound.items.length },
       })
       return { success: false, error: update.error }
     }
 
-    await db.wcSyncLog.create({
+    await db.shoppingSyncLog.create({
       data: {
-        direction: 'TO_WC',
+        direction: 'TO_CONNECTOR',
         status: 'SYNCED',
         entityType: 'SalesOrder',
         entityId: orderId,
-        wcId: outbound.wcOrderId,
+        externalId: outbound.externalOrderId,
         payload: JSON.parse(JSON.stringify({ meta_key: '_wc_shipment_tracking_items', items: outbound.items })),
         syncedAt: new Date(),
       },
@@ -241,9 +241,9 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
       action: 'wc_tracking_pushed',
       tag: 'sync',
       level: 'INFO',
-      description: `Pushed ${outbound.items.length} tracking entr${outbound.items.length === 1 ? 'y' : 'ies'} to WooCommerce order #${outbound.wcOrderNumber ?? outbound.wcOrderId}`,
+      description: `Pushed ${outbound.items.length} tracking entr${outbound.items.length === 1 ? 'y' : 'ies'} to WooCommerce order #${outbound.externalOrderNumber ?? outbound.externalOrderId}`,
       metadata: {
-        wcOrderId: outbound.wcOrderId,
+        externalOrderId: outbound.externalOrderId,
         trackingCount: outbound.items.length,
         trackingNumbers: outbound.items.map((item) => item.tracking_number),
       },
@@ -252,13 +252,13 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
     return { success: true }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error)
-    await db.wcSyncLog.create({
+    await db.shoppingSyncLog.create({
       data: {
-        direction: 'TO_WC',
+        direction: 'TO_CONNECTOR',
         status: 'FAILED',
         entityType: 'SalesOrder',
         entityId: orderId,
-        wcId: outbound.wcOrderId,
+        externalId: outbound.externalOrderId,
         payload: JSON.parse(JSON.stringify({ meta_key: '_wc_shipment_tracking_items', items: outbound.items })),
         errorMessage: message,
       },
@@ -269,8 +269,8 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
       action: 'wc_tracking_push_failed',
       tag: 'sync',
       level: 'WARNING',
-      description: `WooCommerce tracking sync failed for order #${outbound.wcOrderNumber ?? outbound.wcOrderId}`,
-      metadata: { wcOrderId: outbound.wcOrderId, error: message },
+      description: `WooCommerce tracking sync failed for order #${outbound.externalOrderNumber ?? outbound.externalOrderId}`,
+      metadata: { externalOrderId: outbound.externalOrderId, error: message },
     })
     return { success: false, error: message }
   }

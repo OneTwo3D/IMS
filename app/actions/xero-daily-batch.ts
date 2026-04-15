@@ -2,6 +2,7 @@
 
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
+import { getSalesOrderReference } from '@/lib/sales-order-display'
 
 /**
  * Preview & history for the Xero daily batch sub-ledger.
@@ -23,16 +24,14 @@ import { requirePermission } from '@/lib/auth/server'
 
 export type DailyBatchPreviewOrder = {
   id: string
-  orderNumber: string | null
-  wcOrderNumber: string | null
+  displayOrderNumber: string
   amount: number
 }
 
 export type DailyBatchPreviewShipment = {
   id: string
   orderId: string
-  orderNumber: string | null
-  wcOrderNumber: string | null
+  displayOrderNumber: string
   revenue: number
   cogs: number
 }
@@ -129,7 +128,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
     select: {
       id: true,
       orderNumber: true,
-      wcOrderNumber: true,
+      externalOrderNumber: true,
       totalGbp: true,
       taxGbp: true,
     },
@@ -141,8 +140,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
     totalRevenue: round2(a1Orders.reduce((s, o) => s + (Number(o.totalGbp) - Number(o.taxGbp)), 0)),
     orders: a1Orders.slice(0, 200).map((o) => ({
       id: o.id,
-      orderNumber: o.orderNumber,
-      wcOrderNumber: o.wcOrderNumber,
+      displayOrderNumber: getSalesOrderReference(o),
       amount: round2(Number(o.totalGbp)),
     })),
   }
@@ -158,7 +156,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
     select: {
       id: true,
       orderNumber: true,
-      wcOrderNumber: true,
+      externalOrderNumber: true,
       allocations: {
         select: { productId: true, warehouseId: true, qty: true },
       },
@@ -180,8 +178,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
     a2Total += cost
     a2OrdersComputed.push({
       id: order.id,
-      orderNumber: order.orderNumber,
-      wcOrderNumber: order.wcOrderNumber,
+      displayOrderNumber: getSalesOrderReference(order),
       amount: round2(cost),
     })
   }
@@ -218,7 +215,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
       order: {
         select: {
           orderNumber: true,
-          wcOrderNumber: true,
+          externalOrderNumber: true,
           totalGbp: true,
           unearnedRevenueAmount: true,
           lines: { select: { totalGbp: true } },
@@ -280,8 +277,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
     bShipmentsComputed.push({
       id: shipment.id,
       orderId: shipment.orderId,
-      orderNumber: shipment.order.orderNumber,
-      wcOrderNumber: shipment.order.wcOrderNumber,
+      displayOrderNumber: getSalesOrderReference({ id: shipment.orderId, ...shipment.order }),
       revenue: revenueProportion,
       cogs: round2(cogs),
     })

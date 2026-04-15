@@ -23,7 +23,18 @@ import {
 
 type Props = { warehouses: WarehouseRow[] }
 
-const EMPTY: WarehouseInput = {
+type WarehouseFormFields = Omit<WarehouseInput, 'syncToStore'> & {
+  syncToStore: boolean
+}
+
+function toWarehouseInput(fields: WarehouseFormFields): WarehouseInput {
+  return {
+    ...fields,
+    syncToStore: fields.syncToStore,
+  }
+}
+
+const EMPTY: WarehouseFormFields = {
   code: '',
   name: '',
   type: 'STANDARD',
@@ -36,13 +47,13 @@ const EMPTY: WarehouseInput = {
   postcode: '',
   country: 'GB',
   availableForSale: true,
-  syncToWoocommerce: false,
+  syncToStore: false,
   isDefault: false,
   defaultReturnWarehouse: false,
   active: true,
 }
 
-function toInput(w: WarehouseRow): WarehouseInput {
+function toInput(w: WarehouseRow): WarehouseFormFields {
   return {
     code: w.code,
     name: w.name,
@@ -56,7 +67,7 @@ function toInput(w: WarehouseRow): WarehouseInput {
     postcode: w.postcode ?? '',
     country: w.country,
     availableForSale: w.availableForSale,
-    syncToWoocommerce: w.syncToWoocommerce,
+    syncToStore: w.syncToStore,
     isDefault: w.isDefault,
     defaultReturnWarehouse: w.defaultReturnWarehouse,
     active: w.active,
@@ -77,14 +88,14 @@ function WarehouseDialog({
   open: boolean
   onOpenChange: (open: boolean) => void
   editingId: string | null
-  initial: WarehouseInput
+  initial: WarehouseFormFields
   onSaved: (item: WarehouseRow, isNew: boolean) => void
 }) {
-  const [fields, setFields] = useState<WarehouseInput>(initial)
+  const [fields, setFields] = useState<WarehouseFormFields>(initial)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState('')
 
-  function set<K extends keyof WarehouseInput>(k: K, v: WarehouseInput[K]) {
+  function set<K extends keyof WarehouseFormFields>(k: K, v: WarehouseFormFields[K]) {
     setFields((f) => ({ ...f, [k]: v }))
   }
 
@@ -95,8 +106,8 @@ function WarehouseDialog({
     setError('')
     try {
       const result = editingId
-        ? await updateWarehouse(editingId, fields)
-        : await createWarehouse(fields)
+        ? await updateWarehouse(editingId, toWarehouseInput(fields))
+        : await createWarehouse(toWarehouseInput(fields))
       if (result.success && result.item) {
         onSaved(result.item, !editingId)
         onOpenChange(false)
@@ -200,8 +211,8 @@ function WarehouseDialog({
                 Available for Sale
               </label>
               <label className="flex items-center gap-2 text-sm">
-                <input type="checkbox" checked={fields.syncToWoocommerce} onChange={(e) => set('syncToWoocommerce', e.target.checked)} className="rounded" />
-                Sync to WooCommerce
+                <input type="checkbox" checked={fields.syncToStore} onChange={(e) => set('syncToStore', e.target.checked)} className="rounded" />
+                Sync to Store
               </label>
               <label className="flex items-center gap-2 text-sm">
                 <input type="checkbox" checked={fields.isDefault} onChange={(e) => set('isDefault', e.target.checked)} className="rounded" />
@@ -241,7 +252,7 @@ export function WarehousesTable({ warehouses: initial }: Props) {
   const [warehouses, setWarehouses] = useState(initial)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
-  const [dialogInit, setDialogInit] = useState<WarehouseInput>(EMPTY)
+  const [dialogInit, setDialogInit] = useState<WarehouseFormFields>(EMPTY)
   const [deletingId, setDeletingId] = useState<string | null>(null)
 
   function openAdd() {
@@ -318,7 +329,7 @@ export function WarehousesTable({ warehouses: initial }: Props) {
             <TableHead className="text-xs">Contact</TableHead>
             <TableHead className="text-xs">City</TableHead>
             <TableHead className="text-xs text-center">Default</TableHead>
-            <TableHead className="text-xs text-center">WC Sync</TableHead>
+            <TableHead className="text-xs text-center">Store Sync</TableHead>
             <TableHead className="text-xs text-center">Active</TableHead>
             <TableHead className="w-20" />
           </TableRow>
@@ -343,8 +354,8 @@ export function WarehousesTable({ warehouses: initial }: Props) {
                 {w.defaultReturnWarehouse && <span className="text-blue-600 ml-1" title="Default return warehouse">R</span>}
               </TableCell>
               <TableCell className="text-sm text-center">
-                <span className={w.syncToWoocommerce ? 'text-green-600' : 'text-muted-foreground/50'}>
-                  {w.syncToWoocommerce ? 'Yes' : '—'}
+                <span className={w.syncToStore ? 'text-green-600' : 'text-muted-foreground/50'}>
+                  {w.syncToStore ? 'Yes' : '—'}
                 </span>
               </TableCell>
               <TableCell className="text-sm text-center">

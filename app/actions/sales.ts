@@ -10,6 +10,7 @@ import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
+import { getSalesOrderReference } from '@/lib/sales-order-display'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
@@ -57,9 +58,13 @@ export type SoLineRow = {
 
 export type SoRow = {
   id: string
-  wcOrderId: number | null
-  wcOrderNumber: string | null
+  externalOrderId: number | null
+  externalOrderNumber: string | null
   orderNumber: string | null
+  displayOrderNumber: string
+  sourceLabel: string
+  hasExternalSource: boolean
+  externalOrderDate: string | null
   status: SoStatus
   currency: string
   fxRateToGbp: number
@@ -90,7 +95,7 @@ export type SoRow = {
   internalNotes: string | null
   shippingCountryCode: string | null
   paymentMethodTitle: string | null
-  wcCreatedAt: string | null
+  externalCreatedAt: string | null
   createdAt: string
   lineCount: number
   cogsGbp: number | null
@@ -177,8 +182,8 @@ function makeReference(prefix: string): string {
 
 const SO_SELECT = {
   id: true,
-  wcOrderId: true,
-  wcOrderNumber: true,
+  externalOrderId: true,
+  externalOrderNumber: true,
   orderNumber: true,
   status: true,
   currency: true,
@@ -210,7 +215,7 @@ const SO_SELECT = {
   internalNotes: true,
   shippingAddress: true,
   paymentMethodTitle: true,
-  wcCreatedAt: true,
+  externalCreatedAt: true,
   createdAt: true,
   _count: { select: { lines: true } },
   lines: { select: { cogsGbp: true } },
@@ -218,8 +223,8 @@ const SO_SELECT = {
 
 function mapSoRow(so: {
   id: string
-  wcOrderId: number | null
-  wcOrderNumber: string | null
+  externalOrderId: number | null
+  externalOrderNumber: string | null
   orderNumber: string | null
   status: string
   currency: string
@@ -251,7 +256,7 @@ function mapSoRow(so: {
   internalNotes: string | null
   shippingAddress: unknown
   paymentMethodTitle: string | null
-  wcCreatedAt: Date | null
+  externalCreatedAt: Date | null
   createdAt: Date
   _count: { lines: number }
   lines: { cogsGbp: unknown }[]
@@ -263,11 +268,16 @@ function mapSoRow(so: {
   const profitMarginPercent = cogsGbp != null && totalGbp > 0
     ? ((totalGbp - cogsGbp) / totalGbp) * 100
     : null
+  const hasExternalSource = !!so.externalOrderId
   return {
     id: so.id,
-    wcOrderId: so.wcOrderId,
-    wcOrderNumber: so.wcOrderNumber,
+    externalOrderId: so.externalOrderId,
+    externalOrderNumber: so.externalOrderNumber,
     orderNumber: so.orderNumber,
+    displayOrderNumber: so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8),
+    sourceLabel: hasExternalSource ? 'Store' : 'Manual',
+    hasExternalSource,
+    externalOrderDate: so.externalCreatedAt?.toISOString() ?? null,
     status: so.status as SoStatus,
     currency: so.currency,
     fxRateToGbp: Number(so.fxRateToGbp),
@@ -298,7 +308,7 @@ function mapSoRow(so: {
     internalNotes: so.internalNotes,
     shippingCountryCode: (so.shippingAddress as Record<string, string> | null)?.country?.toUpperCase() || null,
     paymentMethodTitle: so.paymentMethodTitle,
-    wcCreatedAt: so.wcCreatedAt?.toISOString() ?? null,
+    externalCreatedAt: so.externalCreatedAt?.toISOString() ?? null,
     createdAt: so.createdAt.toISOString(),
     lineCount: so._count.lines,
     cogsGbp,
@@ -808,8 +818,8 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       action: 'created',
       tag: 'sales',
       level: 'INFO',
-      description: `Created sales order ${mapped.orderNumber ?? mapped.wcOrderNumber}`,
-      metadata: { orderNumber: mapped.orderNumber, totalGbp: mapped.totalGbp, currency: mapped.currency },
+      description: `Created sales order ${mapped.displayOrderNumber}`,
+      metadata: { orderNumber: mapped.displayOrderNumber, totalGbp: mapped.totalGbp, currency: mapped.currency },
     })
     return { success: true, order: mapped }
   } catch (e) {
@@ -861,7 +871,7 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
     select: {
       id: true,
       orderNumber: true,
-      wcOrderNumber: true,
+      externalOrderNumber: true,
       currency: true,
       fxRateToGbp: true,
       customerName: true,
@@ -897,7 +907,7 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
   const { getNumberingFormats } = await import('./company')
   const numbering = await getNumberingFormats()
   const manualPrefix = numbering.inv_prefix
-  const orderNumber = so.orderNumber ?? so.wcOrderNumber ?? so.id
+  const orderNumber = getSalesOrderReference(so)
 
   const orderDefaultTaxType = so.taxRateName
     ? (await db.taxRate.findFirst({
@@ -981,7 +991,7 @@ export async function applySalesOrderStatusTransition(
     }
     const so = await db.salesOrder.findUnique({
       where: { id },
-      select: { id: true, orderNumber: true, wcOrderId: true, wcOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { id: true, productId: true, sku: true, qty: true } } },
+      select: { id: true, orderNumber: true, externalOrderId: true, externalOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { id: true, productId: true, sku: true, qty: true } } },
     })
     if (!so) return { success: false, error: 'Order not found' }
 
@@ -1143,28 +1153,30 @@ export async function applySalesOrderStatusTransition(
       })
     }
     for (const entry of dispatchLogs) {
+      const orderRef = getSalesOrderReference(so)
       await logActivity({
         entityType: 'STOCK_ADJUSTMENT',
         entityId: entry.productId,
         action: 'dispatched',
         tag: 'stock',
         level: 'INFO',
-        description: `Dispatched ${entry.qty} units of SKU ${entry.sku ?? entry.productId} for order ${so.orderNumber ?? so.wcOrderNumber}`,
-        metadata: { sku: entry.sku, productId: entry.productId, qty: entry.qty, orderNumber: so.orderNumber ?? so.wcOrderNumber, warehouseId: entry.warehouseId },
+        description: `Dispatched ${entry.qty} units of SKU ${entry.sku ?? entry.productId} for order ${orderRef}`,
+        metadata: { sku: entry.sku, productId: entry.productId, qty: entry.qty, orderNumber: orderRef, warehouseId: entry.warehouseId },
       })
     }
+    const statusOrderRef = getSalesOrderReference(so)
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
       action: 'status_changed',
       tag: 'sales',
       level: 'INFO',
-      description: `Updated sales order ${so.orderNumber ?? so.wcOrderNumber} status to ${targetStatus}`,
-      metadata: { orderNumber: so.orderNumber ?? so.wcOrderNumber, previousStatus: so.status, newStatus: targetStatus },
+      description: `Updated sales order ${statusOrderRef} status to ${targetStatus}`,
+      metadata: { orderNumber: statusOrderRef, previousStatus: so.status, newStatus: targetStatus },
     })
 
     // Push status to WooCommerce (fire-and-forget)
-    if ((options?.pushStatusToWooCommerce ?? true) && so.wcOrderId) {
+    if ((options?.pushStatusToWooCommerce ?? true) && so.externalOrderId) {
       import('@/lib/connectors/woocommerce/sync/order-status').then((m) =>
         m.pushImsStatusToWc(id, targetStatus as never).catch(() => {}),
       )
@@ -1215,7 +1227,7 @@ export async function createRefund(
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: {
-        id: true, wcOrderNumber: true, orderNumber: true, status: true, fxRateToGbp: true, totalGbp: true,
+        id: true, externalOrderNumber: true, orderNumber: true, status: true, fxRateToGbp: true, totalGbp: true,
         taxRatePercent: true, pricesIncludeVat: true,
         revenueDeferredDate: true, unearnedRevenueAmount: true,
         inventoryAllocatedDate: true, allocationBatchAmount: true,
@@ -1248,7 +1260,7 @@ export async function createRefund(
       data: {
         orderId,
         creditNoteNumber,
-        wcRefundId: options?.externalRefundId ?? null,
+        externalRefundId: options?.externalRefundId ?? null,
         reason: reason || null,
         totalForeign,
         totalGbp,
@@ -1295,6 +1307,7 @@ export async function createRefund(
 
     // Return stock if warehouse specified
     if (returnWarehouseId) {
+      const orderRef = getSalesOrderReference(so)
       for (const l of refundLines) {
         if (!l.productId) continue
         await db.stockMovement.create({
@@ -1319,8 +1332,8 @@ export async function createRefund(
           action: 'return_inbound',
           tag: 'stock',
           level: 'INFO',
-          description: `Returned ${l.qty} units of ${l.description} to warehouse ${returnWarehouseId} for refund on order ${so.orderNumber ?? so.wcOrderNumber}`,
-          metadata: { productId: l.productId, qty: l.qty, orderNumber: so.orderNumber ?? so.wcOrderNumber, warehouseId: returnWarehouseId },
+          description: `Returned ${l.qty} units of ${l.description} to warehouse ${returnWarehouseId} for refund on order ${orderRef}`,
+          metadata: { productId: l.productId, qty: l.qty, orderNumber: orderRef, warehouseId: returnWarehouseId },
         })
       }
     }
@@ -1336,14 +1349,15 @@ export async function createRefund(
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
+    const refundOrderRef = getSalesOrderReference(so)
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
       action: 'refunded',
       tag: 'sales',
       level: 'INFO',
-      description: `Created refund for order ${so.orderNumber ?? so.wcOrderNumber} — £${totalGbp.toFixed(2)}`,
-      metadata: { orderNumber: so.orderNumber ?? so.wcOrderNumber, totalGbp, creditNoteNumber, reason },
+      description: `Created refund for order ${refundOrderRef} — £${totalGbp.toFixed(2)}`,
+      metadata: { orderNumber: refundOrderRef, totalGbp, creditNoteNumber, reason },
     })
     if (returnWarehouseId) {
       try {
@@ -1380,7 +1394,7 @@ export async function createRefund(
           contactEmail: orderForCN?.customer?.email ?? undefined,
           date: new Date().toISOString().slice(0, 10),
           currency: orderForCN?.currency ?? 'GBP',
-          reference: so.wcOrderNumber ?? undefined,
+          reference: so.externalOrderNumber ?? undefined,
           lines: createdRefundLines.map((l) => ({
             description: l.description || 'Refund line',
             quantity: l.qty > 0 ? l.qty : 1,
@@ -1401,7 +1415,7 @@ export async function createRefund(
     // Scenario 4: shipments journaled → reverse COGS for shipped portion + unearned for unshipped portion
     try {
       const settings = await getAccountingSettings()
-      const orderRef = so.orderNumber ?? so.wcOrderNumber ?? orderId.slice(0, 8)
+      const orderRef = getSalesOrderReference(so)
 
       if (so.revenueDeferredDate) {
         const vatPct = Number(so.taxRatePercent ?? 0)
@@ -1990,8 +2004,8 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
       action: 'cloned',
       tag: 'sales',
       level: 'INFO',
-      description: `Cloned sales order ${so.orderNumber ?? so.wcOrderNumber}`,
-      metadata: { sourceOrderId: id, sourceOrderNumber: so.orderNumber ?? so.wcOrderNumber, newOrderNumber: ref },
+      description: `Cloned sales order ${getSalesOrderReference(so)}`,
+      metadata: { sourceOrderId: id, sourceOrderNumber: getSalesOrderReference(so), newOrderNumber: ref },
     })
     return { success: true, newId: clone.id }
   } catch (e) {
@@ -2013,7 +2027,7 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
     await requirePermission('sales.create')
     const so = await db.salesOrder.findUnique({
       where: { id },
-      select: { orderNumber: true, wcOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { productId: true, qty: true } }, _count: { select: { refunds: true, payments: true } } },
+      select: { orderNumber: true, externalOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { productId: true, qty: true } }, _count: { select: { refunds: true, payments: true } } },
     })
     if (!so) return { success: false, error: 'Order not found' }
     if (!['DRAFT', 'PENDING_PAYMENT', 'ALLOCATED'].includes(so.status)) return { success: false, error: 'Only draft, pending payment, or allocated orders can be deleted' }
@@ -2032,8 +2046,8 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
       action: 'deleted',
       tag: 'sales',
       level: 'INFO',
-      description: `Deleted sales order ${so.orderNumber ?? so.wcOrderNumber}`,
-      metadata: { orderNumber: so.orderNumber ?? so.wcOrderNumber },
+      description: `Deleted sales order ${getSalesOrderReference({ id, ...so })}`,
+      metadata: { orderNumber: getSalesOrderReference({ id, ...so }) },
     })
     return { success: true }
   } catch (e) {
@@ -2053,7 +2067,7 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
 export async function markSalesOrderPaid(id: string): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('sales.refund')
-    const so = await db.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, wcOrderNumber: true, paidAt: true, invoiceNumber: true } })
+    const so = await db.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, externalOrderNumber: true, paidAt: true, invoiceNumber: true } })
     if (!so) return { success: false, error: 'Order not found' }
 
     const markingAsPaid = !so.paidAt // transitioning from unpaid to paid
@@ -2079,8 +2093,8 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
       action: 'paid',
       tag: 'sales',
       level: 'INFO',
-      description: `Marked sales order ${so.orderNumber ?? so.wcOrderNumber} as paid`,
-      metadata: { orderNumber: so.orderNumber ?? so.wcOrderNumber, markingAsPaid },
+      description: `Marked sales order ${getSalesOrderReference({ id, ...so })} as paid`,
+      metadata: { orderNumber: getSalesOrderReference({ id, ...so }), markingAsPaid },
     })
     return { success: true }
   } catch (e) {
@@ -2107,7 +2121,7 @@ export async function updateSalesOrderNotes(
     const so = await db.salesOrder.update({
       where: { id },
       data: { notes: notes || null, internalNotes: internalNotes || null },
-      select: { orderNumber: true, wcOrderNumber: true },
+      select: { orderNumber: true, externalOrderNumber: true },
     })
     revalidatePath(`/sales/${id}`)
     await logActivity({
@@ -2116,8 +2130,8 @@ export async function updateSalesOrderNotes(
       action: 'updated',
       tag: 'sales',
       level: 'INFO',
-      description: `Updated notes for order ${so.orderNumber ?? so.wcOrderNumber}`,
-      metadata: { orderNumber: so.orderNumber ?? so.wcOrderNumber },
+      description: `Updated notes for order ${getSalesOrderReference({ id, ...so })}`,
+      metadata: { orderNumber: getSalesOrderReference({ id, ...so }) },
     })
     return { success: true }
   } catch (e) {
@@ -2139,13 +2153,13 @@ export async function generateInvoiceNumber(id: string, options?: { skipLog?: bo
     await requirePermission('sales.process')
     // Use a transaction to prevent race conditions on invoice numbering
     const result = await db.$transaction(async (tx) => {
-      const so = await tx.salesOrder.findUnique({ where: { id }, select: { wcOrderNumber: true, orderNumber: true, invoiceNumber: true } })
+      const so = await tx.salesOrder.findUnique({ where: { id }, select: { externalOrderNumber: true, orderNumber: true, invoiceNumber: true } })
       if (!so) throw new Error('Order not found')
-      if (so.invoiceNumber) return { invoiceNumber: so.invoiceNumber, orderNumber: so.orderNumber ?? so.wcOrderNumber }
+      if (so.invoiceNumber) return { invoiceNumber: so.invoiceNumber, orderNumber: getSalesOrderReference({ id, ...so }) }
       const count = await tx.salesOrder.count({ where: { invoiceNumber: { not: null } } })
       const invNum = `INV-${new Date().getFullYear()}-${String(count + 1).padStart(5, '0')}`
       await tx.salesOrder.update({ where: { id }, data: { invoiceNumber: invNum, invoicedAt: new Date() } })
-      return { invoiceNumber: invNum, orderNumber: so.orderNumber ?? so.wcOrderNumber }
+      return { invoiceNumber: invNum, orderNumber: getSalesOrderReference({ id, ...so }) }
     })
     revalidatePath(`/sales/${id}`)
     if (!options?.skipLog) {
@@ -2222,7 +2236,7 @@ export async function addPayment(input: {
     // Auto-set paidAt on the order if invoice total is fully paid
     const so = await db.salesOrder.findUnique({
       where: { id: input.orderId },
-      select: { orderNumber: true, wcOrderNumber: true, totalGbp: true, paidAt: true },
+      select: { orderNumber: true, externalOrderNumber: true, totalGbp: true, paidAt: true },
     })
     if (so && !so.paidAt) {
       const payments = await db.payment.findMany({
@@ -2249,8 +2263,8 @@ export async function addPayment(input: {
       action: 'payment_added',
       tag: 'sales',
       level: 'INFO',
-      description: `Added £${input.amount.toFixed(2)} payment to order ${so?.orderNumber ?? so?.wcOrderNumber ?? input.orderId}`,
-      metadata: { orderNumber: so?.orderNumber ?? so?.wcOrderNumber, amount: input.amount, currency: input.currency, method: input.method },
+      description: `Added £${input.amount.toFixed(2)} payment to order ${so ? getSalesOrderReference({ id: input.orderId, ...so }) : input.orderId}`,
+      metadata: { orderNumber: so ? getSalesOrderReference({ id: input.orderId, ...so }) : input.orderId, amount: input.amount, currency: input.currency, method: input.method },
     })
     return { success: true }
   } catch (e) {
@@ -2271,7 +2285,7 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
   try {
     await requirePermission('sales.refund')
     await db.payment.delete({ where: { id: paymentId } })
-    const so = await db.salesOrder.findUnique({ where: { id: orderId }, select: { orderNumber: true, wcOrderNumber: true } })
+    const so = await db.salesOrder.findUnique({ where: { id: orderId }, select: { orderNumber: true, externalOrderNumber: true } })
     revalidatePath(`/sales/${orderId}`)
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -2279,8 +2293,8 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
       action: 'payment_deleted',
       tag: 'sales',
       level: 'INFO',
-      description: `Deleted payment from order ${so?.orderNumber ?? so?.wcOrderNumber ?? orderId}`,
-      metadata: { orderNumber: so?.orderNumber ?? so?.wcOrderNumber, paymentId },
+      description: `Deleted payment from order ${so ? getSalesOrderReference({ id: orderId, ...so }) : orderId}`,
+      metadata: { orderNumber: so ? getSalesOrderReference({ id: orderId, ...so }) : orderId, paymentId },
     })
     return { success: true }
   } catch (e) {

@@ -4,7 +4,7 @@
  * Covered scenarios:
  *
  *   1. Drift detection
- *      An IMS product has a cached `wcProductId` that no longer belongs
+ *      An IMS product has a cached `externalProductId` that no longer belongs
  *      to it in WooCommerce (the WC product was deleted/recreated or
  *      its id was re-used for a different SKU). Without a preflight
  *      check, the stock push would overwrite the wrong product's stock
@@ -21,7 +21,7 @@
  *
  *   3. Credentials rebind wipes the cache
  *      Changing `wc_url` via the Save Settings button must clear
- *      every cached `wcProductId`. Cross-store stock-corruption
+ *      every cached `externalProductId`. Cross-store stock-corruption
  *      protection lives at the credentials save boundary, not inside
  *      the sync path, so this is the regression test for that
  *      transition.
@@ -246,10 +246,10 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
 
     const defaultWarehouse = await db.warehouse.findUnique({ where: { code: 'DEFAULT' } })
     if (!defaultWarehouse) throw new Error('DEFAULT warehouse missing — run db:seed:e2e')
-    savedWarehouseSyncFlag = defaultWarehouse.syncToWoocommerce
+    savedWarehouseSyncFlag = defaultWarehouse.syncToStore
     await db.warehouse.update({
       where: { code: 'DEFAULT' },
-      data: { syncToWoocommerce: true },
+      data: { syncToStore: true },
     })
 
     // --- Drift test fixture (test 1) ---
@@ -257,7 +257,7 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
       data: {
         sku: EXPECTED_SKU,
         name: 'Drift regression product',
-        wcProductId: BigInt(FAKE_WC_PRODUCT_ID), // intentionally stale; column is BIGINT
+        externalProductId: BigInt(FAKE_WC_PRODUCT_ID), // intentionally stale; column is BIGINT
       },
       select: { id: true },
     })
@@ -277,7 +277,7 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
       data: {
         sku: PROBE_SKU,
         name: 'Preflight-abort probe product',
-        wcProductId: BigInt(PROBE_WC_PRODUCT_ID),
+        externalProductId: BigInt(PROBE_WC_PRODUCT_ID),
       },
       select: { id: true },
     })
@@ -304,7 +304,7 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
       data: {
         sku: REBIND_SKU,
         name: 'Credentials rebind product',
-        wcProductId: BigInt(REBIND_WC_PRODUCT_ID),
+        externalProductId: BigInt(REBIND_WC_PRODUCT_ID),
       },
       select: { id: true },
     })
@@ -317,7 +317,7 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
       data: {
         sku: BATCH_FENCE_SKU,
         name: 'Batch fence regression product',
-        wcProductId: BigInt(BATCH_FENCE_WC_PRODUCT_ID),
+        externalProductId: BigInt(BATCH_FENCE_WC_PRODUCT_ID),
       },
       select: { id: true },
     })
@@ -358,7 +358,7 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
       if (savedWarehouseSyncFlag !== null) {
         await db.warehouse.update({
           where: { code: 'DEFAULT' },
-          data: { syncToWoocommerce: savedWarehouseSyncFlag },
+          data: { syncToStore: savedWarehouseSyncFlag },
         })
       }
       for (const { key, value } of savedSettings) {
@@ -391,7 +391,7 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
     await pushButton.click()
   }
 
-  test('preflight blocks stock push when cached wcProductId drifts and clears the mapping', async ({ page }) => {
+  test('preflight blocks stock push when cached externalProductId drifts and clears the mapping', async ({ page }) => {
     // Sanity: the fake WC has a DIFFERENT sku at the cached id.
     expect(state.products.get(FAKE_WC_PRODUCT_ID)?.sku).toBe(DRIFTED_SKU)
     expect(DRIFTED_SKU).not.toBe(EXPECTED_SKU)
@@ -416,12 +416,12 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
     const pushedIds = recorder.batchPosts.flatMap((p) => (p.update ?? []).map((u) => u.id))
     expect(pushedIds).not.toContain(FAKE_WC_PRODUCT_ID)
 
-    // --- Assertion 3: DB cleared the stale wcProductId so next run re-resolves ---
+    // --- Assertion 3: DB cleared the stale externalProductId so next run re-resolves ---
     const driftAfter = await db.product.findUnique({
       where: { id: driftProductId! },
-      select: { wcProductId: true },
+      select: { externalProductId: true },
     })
-    expect(driftAfter?.wcProductId).toBeNull()
+    expect(driftAfter?.externalProductId).toBeNull()
   })
 
   test('preflight abort surfaces as a UI error, not a neutral success', async ({ page }) => {
@@ -451,26 +451,26 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
       // of drift, not on transport failures.
       const probeAfter = await db.product.findUnique({
         where: { id: probeProductId! },
-        select: { wcProductId: true },
+        select: { externalProductId: true },
       })
-      expect(probeAfter?.wcProductId).toBe(BigInt(PROBE_WC_PRODUCT_ID))
+      expect(probeAfter?.externalProductId).toBe(BigInt(PROBE_WC_PRODUCT_ID))
     } finally {
       state.preflightBroken = false
     }
   })
 
-  test('changing WC credentials via Save Settings wipes cached wcProductId mappings', async ({ page }) => {
+  test('changing WC credentials via Save Settings wipes cached externalProductId mappings', async ({ page }) => {
     // Before: rebindProduct has a valid-looking cached mapping.
     const before = await db.product.findUnique({
       where: { id: rebindProductId! },
-      select: { wcProductId: true },
+      select: { externalProductId: true },
     })
-    expect(before?.wcProductId).toBe(BigInt(REBIND_WC_PRODUCT_ID))
+    expect(before?.externalProductId).toBe(BigInt(REBIND_WC_PRODUCT_ID))
 
     // Navigate to Connection tab and bump `wc_url` by appending a
     // path segment. The server action `saveWcCredentials` compares
     // incoming values against what's currently in the DB and nulls
-    // every `wcProductId` in the same transaction when it sees a
+    // every `externalProductId` in the same transaction when it sees a
     // real change.
     await page.goto('/sync?connector=woocommerce')
     await expect(page.getByRole('heading', { name: 'WooCommerce Connector' })).toBeVisible()
@@ -488,18 +488,18 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
     // After: rebindProduct's cached id must be null.
     const after = await db.product.findUnique({
       where: { id: rebindProductId! },
-      select: { wcProductId: true },
+      select: { externalProductId: true },
     })
-    expect(after?.wcProductId).toBeNull()
+    expect(after?.externalProductId).toBeNull()
 
     // probeProduct (still cached because test 2's preflight failure
     // is NOT a rebind) must ALSO have been wiped now — saveWcCredentials
     // issues a global updateMany, not a per-product filter.
     const probe = await db.product.findUnique({
       where: { id: probeProductId! },
-      select: { wcProductId: true },
+      select: { externalProductId: true },
     })
-    expect(probe?.wcProductId).toBeNull()
+    expect(probe?.externalProductId).toBeNull()
 
     // Restore the original URL so subsequent runs and other WC
     // specs see a working connector pointing at the fake server.
@@ -513,7 +513,7 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
 
     await db.product.update({
       where: { id: batchFenceProductId! },
-      data: { wcProductId: BigInt(BATCH_FENCE_WC_PRODUCT_ID) },
+      data: { externalProductId: BigInt(BATCH_FENCE_WC_PRODUCT_ID) },
     })
 
     const syncPromise = pushStockToWc()
@@ -539,7 +539,7 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
       })
       await tx.product.update({
         where: { id: batchFenceProductId! },
-        data: { wcProductId: BigInt(REBOUND_BATCH_WC_PRODUCT_ID) },
+        data: { externalProductId: BigInt(REBOUND_BATCH_WC_PRODUCT_ID) },
       })
     }).then(() => {
       rebindCommitted = true
@@ -557,9 +557,9 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
 
     const productAfter = await db.product.findUnique({
       where: { id: batchFenceProductId! },
-      select: { wcProductId: true },
+      select: { externalProductId: true },
     })
-    expect(productAfter?.wcProductId).toBe(BigInt(REBOUND_BATCH_WC_PRODUCT_ID))
+    expect(productAfter?.externalProductId).toBe(BigInt(REBOUND_BATCH_WC_PRODUCT_ID))
 
     state.pauseBatchResponse = false
     state.releaseBatchResponse = null

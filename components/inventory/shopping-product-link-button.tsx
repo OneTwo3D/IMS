@@ -3,9 +3,9 @@
 import { useState } from 'react'
 import { ExternalLink } from 'lucide-react'
 import { Button } from '@/components/ui/button'
-import { fetchWcProductUrl } from '@/lib/connectors/woocommerce/products'
+import { fetchShoppingProductLink } from '@/app/actions/shopping'
 
-export function WcLinkButton({ sku }: { sku: string }) {
+export function ShoppingProductLinkButton({ sku }: { sku: string }) {
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -13,14 +13,17 @@ export function WcLinkButton({ sku }: { sku: string }) {
     setLoading(true)
     setError(null)
     try {
-      const result = await fetchWcProductUrl(sku)
+      const result = await fetchShoppingProductLink(sku)
       setLoading(false)
-      if (result.error || !result.permalink) {
-        setError(result.error ?? 'No permalink found')
+      if (result.error || !result.link?.url) {
+        setError(result.error ?? 'No external product link found')
         return
       }
-      window.open(result.permalink, '_blank', 'noopener,noreferrer')
-    } catch { setError('An unexpected error occurred.'); setLoading(false) }
+      window.open(result.link.url, '_blank', 'noopener,noreferrer')
+    } catch {
+      setError('An unexpected error occurred.')
+      setLoading(false)
+    }
   }
 
   return (
@@ -31,10 +34,10 @@ export function WcLinkButton({ sku }: { sku: string }) {
         size="sm"
         onClick={handleClick}
         disabled={loading}
-        title="Open product on WooCommerce"
+        title="Open product in shopping connector"
       >
         <ExternalLink className="h-3.5 w-3.5 mr-1.5" />
-        {loading ? 'Loading…' : 'View on WooCommerce'}
+        {loading ? 'Loading…' : 'View in Store'}
       </Button>
       {error && <p className="text-xs text-destructive">{error}</p>}
     </div>

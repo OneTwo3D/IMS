@@ -82,11 +82,11 @@ test.describe('@external @wc WooCommerce stock sync by product type', () => {
     test.setTimeout(240000)
 
     const baseRow = psql(`
-      select id, sku, type, coalesce("parentId", ''), coalesce("wcProductId"::text, '')
+      select id, sku, type, coalesce("parentId", ''), coalesce("externalProductId"::text, '')
       from products
       where type = 'SIMPLE'
         and active = true
-        and "wcProductId" is not null
+        and "externalProductId" is not null
         and not exists (
           select 1 from product_components pc where pc."productId" = products.id
         )
@@ -97,7 +97,7 @@ test.describe('@external @wc WooCommerce stock sync by product type', () => {
     if (!baseProductId || !baseWcProductId) throw new Error('No mapped SIMPLE Woo product found for product-type checks')
 
     const variantRow = psql(`
-      select v.id, v.sku, coalesce(v."wcProductId"::text, '')
+      select v.id, v.sku, coalesce(v."externalProductId"::text, '')
       from products v
       join products p on p.id = v."parentId"
       where v.type = 'VARIANT'
@@ -110,7 +110,7 @@ test.describe('@external @wc WooCommerce stock sync by product type', () => {
     const [variantProductId, , variantOriginalWcProductId] = variantRow.split('|')
     if (!variantProductId) throw new Error('No local VARIANT product found for product-type checks')
 
-    const warehouseFlags = parseRows(psql(`select id, "syncToWoocommerce"::text from warehouses order by id;`))
+    const warehouseFlags = parseRows(psql(`select id, "syncToStore"::text from warehouses order by id;`))
     const tempWarehouseExists = psql(`select count(*) from warehouses where id = '${TEMP_WAREHOUSE_ID}';`) === '1'
     const baseOriginalComponents = parseRows(psql(`
       select id, "componentId", qty::text, "sortOrder"::text
@@ -124,7 +124,7 @@ test.describe('@external @wc WooCommerce stock sync by product type', () => {
 
     psql(`
       insert into warehouses (
-        id, code, name, type, "availableForSale", "syncToWoocommerce",
+        id, code, name, type, "availableForSale", "syncToStore",
         country, "isDefault", "defaultReturnWarehouse", active, "createdAt", "updatedAt"
       ) values (
         '${TEMP_WAREHOUSE_ID}', '${TEMP_WAREHOUSE_CODE}', 'Woo Type Test', 'STANDARD', true, true,
@@ -134,7 +134,7 @@ test.describe('@external @wc WooCommerce stock sync by product type', () => {
       set code = excluded.code,
           name = excluded.name,
           "availableForSale" = true,
-          "syncToWoocommerce" = true,
+          "syncToStore" = true,
           active = true,
           "updatedAt" = now();
     `)
@@ -155,8 +155,8 @@ test.describe('@external @wc WooCommerce stock sync by product type', () => {
           "updatedAt" = now();
     `)
 
-    psql(`update warehouses set "syncToWoocommerce" = false;`)
-    psql(`update warehouses set "syncToWoocommerce" = true where id = '${TEMP_WAREHOUSE_ID}';`)
+    psql(`update warehouses set "syncToStore" = false;`)
+    psql(`update warehouses set "syncToStore" = true where id = '${TEMP_WAREHOUSE_ID}';`)
 
     try {
       await openWooCommerceConnector(page)
@@ -174,7 +174,7 @@ test.describe('@external @wc WooCommerce stock sync by product type', () => {
         `)
         psql(`
           update products
-          set "wcProductId" = ${variantOriginalWcProductId ? variantOriginalWcProductId : 'null'},
+          set "externalProductId" = ${variantOriginalWcProductId ? variantOriginalWcProductId : 'null'},
               "updatedAt" = now()
           where id = '${variantProductId}';
         `)
@@ -189,11 +189,11 @@ test.describe('@external @wc WooCommerce stock sync by product type', () => {
       `)
       const simpleRun = await runStockPush(page)
       const simpleLogId = psql(`
-        select id from wc_sync_logs
+        select id from shopping_sync_logs
         where "entityType" = 'StockLevel'
-          and direction = 'TO_WC'
+          and direction = 'TO_CONNECTOR'
           and status = 'SYNCED'
-          and "wcId" = ${baseWcProductId}
+          and "externalId" = ${baseWcProductId}
           and "createdAt" > '${escapeSql(simpleRun.startedAt)}'::timestamp
         order by "createdAt" desc
         limit 1;
@@ -209,7 +209,7 @@ test.describe('@external @wc WooCommerce stock sync by product type', () => {
       resetState()
       psql(`
         update products
-        set "wcProductId" = null,
+        set "externalProductId" = null,
             "updatedAt" = now()
         where id = '${variantProductId}';
       `)
@@ -221,17 +221,17 @@ test.describe('@external @wc WooCommerce stock sync by product type', () => {
       `)
       const variantRun = await runStockPush(page)
       const variantWcProductId = psql(`
-        select coalesce("wcProductId"::text, '')
+        select coalesce("externalProductId"::text, '')
         from products
         where id = '${variantProductId}';
       `)
       const variantLogId = variantWcProductId
         ? psql(`
-          select id from wc_sync_logs
+          select id from shopping_sync_logs
           where "entityType" = 'StockLevel'
-            and direction = 'TO_WC'
+            and direction = 'TO_CONNECTOR'
             and status = 'SYNCED'
-            and "wcId" = ${variantWcProductId}
+            and "externalId" = ${variantWcProductId}
             and "createdAt" > '${escapeSql(variantRun.startedAt)}'::timestamp
           order by "createdAt" desc
           limit 1;
@@ -243,8 +243,8 @@ test.describe('@external @wc WooCommerce stock sync by product type', () => {
         status: variantRun.status,
         text: variantRun.text,
         detail: variantLogId
-          ? `created StockLevel log ${variantLogId} via wcProductId ${variantWcProductId}`
-          : (variantWcProductId ? `resolved wcProductId ${variantWcProductId} but no fresh StockLevel log` : 'wcProductId stayed null after push'),
+          ? `created StockLevel log ${variantLogId} via externalProductId ${variantWcProductId}`
+          : (variantWcProductId ? `resolved externalProductId ${variantWcProductId} but no fresh StockLevel log` : 'externalProductId stayed null after push'),
       })
 
       resetState()
@@ -269,11 +269,11 @@ test.describe('@external @wc WooCommerce stock sync by product type', () => {
       `)
       const kitRun = await runStockPush(page)
       const kitLogId = psql(`
-        select id from wc_sync_logs
+        select id from shopping_sync_logs
         where "entityType" = 'StockLevel'
-          and direction = 'TO_WC'
+          and direction = 'TO_CONNECTOR'
           and status = 'SYNCED'
-          and "wcId" = ${baseWcProductId}
+          and "externalId" = ${baseWcProductId}
           and "createdAt" > '${escapeSql(kitRun.startedAt)}'::timestamp
         order by "createdAt" desc
         limit 1;
@@ -302,11 +302,11 @@ test.describe('@external @wc WooCommerce stock sync by product type', () => {
       `)
       const bomRun = await runStockPush(page)
       const bomLogId = psql(`
-        select id from wc_sync_logs
+        select id from shopping_sync_logs
         where "entityType" = 'StockLevel'
-          and direction = 'TO_WC'
+          and direction = 'TO_CONNECTOR'
           and status = 'SYNCED'
-          and "wcId" = ${baseWcProductId}
+          and "externalId" = ${baseWcProductId}
           and "createdAt" > '${escapeSql(bomRun.startedAt)}'::timestamp
         order by "createdAt" desc
         limit 1;
@@ -345,14 +345,14 @@ test.describe('@external @wc WooCommerce stock sync by product type', () => {
       `)
       psql(`
         update products
-        set "wcProductId" = ${variantOriginalWcProductId ? variantOriginalWcProductId : 'null'},
+        set "externalProductId" = ${variantOriginalWcProductId ? variantOriginalWcProductId : 'null'},
             "updatedAt" = now()
         where id = '${variantProductId}';
       `)
       for (const [warehouseId, syncFlag] of warehouseFlags) {
         psql(`
           update warehouses
-          set "syncToWoocommerce" = ${syncFlag === 'true' ? 'true' : 'false'}
+          set "syncToStore" = ${syncFlag === 'true' ? 'true' : 'false'}
           where id = '${warehouseId}';
         `)
       }

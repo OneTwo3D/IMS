@@ -19,7 +19,7 @@ Use this runbook for scoped stage/live WooCommerce verification after connector 
 3. If stage webhook delivery stalls, force only the generated action for that product update.
 4. In IMS:
    - open **Sync → WooCommerce → Sync Log**
-   - confirm a recent `FROM_WC` product sync entry exists
+   - confirm a recent `FROM_CONNECTOR` product sync entry exists
    - open the product in Inventory and verify the expected fields changed
 
 Expected result:
@@ -54,12 +54,12 @@ Expected result:
 4. In WooCommerce:
    - refresh the product edit screen or fetch the product via REST
    - verify the edited fields match IMS
-5. In IMS **Sync Log**, confirm a recent `TO_WC` product sync entry exists.
+5. In IMS **Sync Log**, confirm a recent `TO_CONNECTOR` product sync entry exists.
 
 Expected result:
 
 - WooCommerce reflects the IMS product metadata change
-- a `TO_WC` product sync record exists in IMS
+- a `TO_CONNECTOR` product sync record exists in IMS
 
 ## 4. IMS → WC tracking push
 
@@ -73,7 +73,7 @@ Expected result:
    - inspect `_wc_shipment_tracking_items`
    - verify the tracking number and carrier match the latest IMS values
 7. In IMS:
-   - confirm a recent `TO_WC` `SalesOrder` sync log entry exists for tracking push
+   - confirm a recent `TO_CONNECTOR` `SalesOrder` sync log entry exists for tracking push
    - confirm no duplicate IMS order/shipment mutation was caused by the reflected WC webhook
 
 Expected result:

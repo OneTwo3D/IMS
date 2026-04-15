@@ -9,25 +9,25 @@ import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import type { WcRefund } from './types'
 
 export async function syncWcRefund(
-  wcOrderId: number,
+  externalOrderId: number,
   wcRefund: WcRefund,
 ): Promise<{ success: boolean; error?: string }> {
   try {
     // Find the IMS order
     const so = await db.salesOrder.findUnique({
-      where: { wcOrderId },
+      where: { externalOrderId },
       select: {
         id: true,
-        wcOrderNumber: true,
+        externalOrderNumber: true,
         fxRateToGbp: true,
         totalGbp: true,
-        lines: { select: { id: true, productId: true, wcLineItemId: true, description: true, qty: true, totalGbp: true } },
+        lines: { select: { id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalGbp: true } },
       },
     })
-    if (!so) return { success: false, error: `IMS order not found for WC order ${wcOrderId}` }
+    if (!so) return { success: false, error: `IMS order not found for WC order ${externalOrderId}` }
 
     // Check if already processed
-    const existing = await db.salesOrderRefund.findFirst({ where: { wcRefundId: wcRefund.id } })
+    const existing = await db.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id } })
     if (existing) return { success: true } // already synced
 
     const fxRate = Number(so.fxRateToGbp) || 1
@@ -46,8 +46,8 @@ export async function syncWcRefund(
         const qty = Math.abs(rl.quantity)
         if (qty === 0) continue
 
-        // Match by wcLineItemId
-        const imsLine = so.lines.find((l) => l.wcLineItemId === rl.id)
+        // Match by externalLineItemId
+        const imsLine = so.lines.find((l) => l.externalLineItemId === rl.id)
         const refundTotal = Math.abs(parseFloat(rl.total) || 0)
         const refundGbp = Math.round((refundTotal / fxRate) * 10000) / 10000
 
@@ -90,13 +90,13 @@ export async function syncWcRefund(
     )
 
     if (!result.success) {
-      await db.wcSyncLog.create({
+      await db.shoppingSyncLog.create({
         data: {
-          direction: 'FROM_WC',
+          direction: 'FROM_CONNECTOR',
           status: 'FAILED',
           entityType: 'SalesOrder',
           entityId: so.id,
-          wcId: wcRefund.id,
+          externalId: wcRefund.id,
           errorMessage: result.error,
           syncedAt: new Date(),
         },
@@ -104,13 +104,13 @@ export async function syncWcRefund(
       return { success: false, error: result.error }
     }
 
-    await db.wcSyncLog.create({
+    await db.shoppingSyncLog.create({
       data: {
-        direction: 'FROM_WC',
+        direction: 'FROM_CONNECTOR',
         status: 'SYNCED',
         entityType: 'SalesOrder',
         entityId: so.id,
-        wcId: wcRefund.id,
+        externalId: wcRefund.id,
         syncedAt: new Date(),
       },
     })
@@ -121,8 +121,8 @@ export async function syncWcRefund(
       action: 'refund_synced',
       tag: 'sync',
       level: 'INFO',
-      description: `Synced WC refund for order #${so.wcOrderNumber} — ${refundAmountForeign.toFixed(2)} ${hasQtyRefund ? '(with restock)' : '(monetary only)'}`,
-      metadata: { wcRefundId: wcRefund.id, amount: refundAmountForeign, hasRestock: hasQtyRefund },
+      description: `Synced WC refund for order #${so.externalOrderNumber} — ${refundAmountForeign.toFixed(2)} ${hasQtyRefund ? '(with restock)' : '(monetary only)'}`,
+      metadata: { externalRefundId: wcRefund.id, amount: refundAmountForeign, hasRestock: hasQtyRefund },
       resolveUser: false,
     })
 
@@ -135,9 +135,9 @@ export async function syncWcRefund(
 /**
  * Check for new refunds on synced orders and process them.
  */
-export async function syncRefundsForOrder(wcOrderId: number): Promise<number> {
+export async function syncRefundsForOrder(externalOrderId: number): Promise<number> {
   // Fetch refunds from WC
-  const { data, error } = await wcFetch(`/orders/${wcOrderId}/refunds`)
+  const { data, error } = await wcFetch(`/orders/${externalOrderId}/refunds`)
   if (error || !data) return 0
 
   const refunds = data as WcRefund[]
@@ -145,10 +145,10 @@ export async function syncRefundsForOrder(wcOrderId: number): Promise<number> {
 
   for (const refund of refunds) {
     // Check if already synced
-    const exists = await db.salesOrderRefund.findFirst({ where: { wcRefundId: refund.id } })
+    const exists = await db.salesOrderRefund.findFirst({ where: { externalRefundId: refund.id } })
     if (exists) continue
 
-    const result = await syncWcRefund(wcOrderId, refund)
+    const result = await syncWcRefund(externalOrderId, refund)
     if (result.success) synced++
   }
 

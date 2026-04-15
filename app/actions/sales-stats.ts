@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth/server'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
+import { getSalesOrderReference } from '@/lib/sales-order-display'
 
 // ---------------------------------------------------------------------------
 // Products tab (line-level)
@@ -167,7 +168,7 @@ export async function getShipments(dateFrom?: string, dateTo?: string): Promise<
   const orders = await db.salesOrder.findMany({
     where: { shippedAt: { not: null, ...(Object.keys(dateFilter).length ? dateFilter : {}) } },
     select: {
-      id: true, wcOrderNumber: true, customerName: true, salesRep: true, shippedAt: true,
+      id: true, orderNumber: true, externalOrderNumber: true, customerName: true, salesRep: true, shippedAt: true,
       trackingNumber: true, shippingService: true, shipFromWarehouse: { select: { code: true } },
       lines: { select: { productId: true, sku: true, description: true, qty: true, totalGbp: true, product: { select: { barcode: true } } } },
     },
@@ -178,7 +179,7 @@ export async function getShipments(dateFrom?: string, dateTo?: string): Promise<
   for (const o of orders) {
     for (const l of o.lines) {
       rows.push({
-        orderId: o.id, orderNumber: o.wcOrderNumber ?? o.id.slice(0, 8),
+        orderId: o.id, orderNumber: getSalesOrderReference(o),
         shipmentNumber: o.trackingNumber, sku: l.sku ?? '', productName: l.description,
         productId: l.productId, barcode: l.product?.barcode ?? null,
         customerName: o.customerName ?? '—', salesRep: o.salesRep,
@@ -221,7 +222,7 @@ export async function getDetails(dateFrom?: string, dateTo?: string): Promise<De
   const orders = await db.salesOrder.findMany({
     where: Object.keys(dateFilter).length ? { createdAt: dateFilter } : undefined,
     select: {
-      id: true, wcOrderNumber: true, status: true, customerName: true, customerEmail: true, salesRep: true, createdAt: true,
+      id: true, orderNumber: true, externalOrderNumber: true, status: true, customerName: true, customerEmail: true, salesRep: true, createdAt: true,
       lines: { select: { productId: true, sku: true, description: true, qty: true, totalGbp: true, product: { select: { barcode: true, type: true } } } },
     },
     orderBy: { createdAt: 'desc' },
@@ -231,7 +232,7 @@ export async function getDetails(dateFrom?: string, dateTo?: string): Promise<De
   for (const o of orders) {
     for (const l of o.lines) {
       rows.push({
-        orderId: o.id, orderNumber: o.wcOrderNumber ?? o.id.slice(0, 8),
+        orderId: o.id, orderNumber: getSalesOrderReference(o),
         productId: l.productId, sku: l.sku ?? '', productName: l.description,
         barcode: l.product?.barcode ?? null, type: l.product?.type ?? null,
         customerName: o.customerName ?? '—', customerEmail: o.customerEmail,
@@ -273,7 +274,7 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
   const orders = await db.salesOrder.findMany({
     where: { invoiceNumber: { not: null }, ...(Object.keys(dateFilter).length ? { invoicedAt: dateFilter } : {}) },
     select: {
-      id: true, wcOrderNumber: true, invoiceNumber: true, customerName: true, salesRep: true,
+      id: true, orderNumber: true, externalOrderNumber: true, invoiceNumber: true, customerName: true, salesRep: true,
       invoicedAt: true, status: true, totalGbp: true, paidAt: true,
       lines: { select: { productId: true, sku: true, description: true, qty: true, totalGbp: true } },
       payments: { where: { refundId: null }, select: { amount: true } },
@@ -287,7 +288,7 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
     const balance = Math.round((Number(o.totalGbp) - paid) * 100) / 100
     for (const l of o.lines) {
       rows.push({
-        orderId: o.id, orderNumber: o.wcOrderNumber ?? o.id.slice(0, 8),
+        orderId: o.id, orderNumber: getSalesOrderReference(o),
         invoiceNumber: o.invoiceNumber!, productId: l.productId, sku: l.sku ?? '',
         productName: l.description, customerName: o.customerName ?? '—', salesRep: o.salesRep,
         invoicedAt: o.invoicedAt!.toISOString(), status: o.status,
@@ -330,7 +331,7 @@ export async function getRefundStats(dateFrom?: string, dateTo?: string): Promis
     where: Object.keys(dateFilter).length ? { refundedAt: dateFilter } : undefined,
     select: {
       id: true, creditNoteNumber: true, reason: true, totalGbp: true, refundedAt: true,
-      order: { select: { id: true, wcOrderNumber: true, customerName: true, salesRep: true, totalGbp: true } },
+      order: { select: { id: true, orderNumber: true, externalOrderNumber: true, customerName: true, salesRep: true, totalGbp: true } },
       lines: { select: { id: true, productId: true, description: true, qty: true, totalGbp: true } },
     },
     orderBy: { refundedAt: 'desc' },
@@ -342,7 +343,7 @@ export async function getRefundStats(dateFrom?: string, dateTo?: string): Promis
     for (const l of r.lines) {
       const lineTotal = Number(l.totalGbp)
       rows.push({
-        id: l.id, orderId: r.order.id, orderNumber: r.order.wcOrderNumber ?? r.order.id.slice(0, 8),
+        id: l.id, orderId: r.order.id, orderNumber: getSalesOrderReference(r.order),
         creditNoteNumber: r.creditNoteNumber, productId: l.productId,
         sku: '', productName: l.description,
         customerName: r.order.customerName ?? '—', salesRep: r.order.salesRep,
@@ -384,7 +385,7 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
   const orders = await db.salesOrder.findMany({
     where: { invoiceNumber: { not: null } },
     select: {
-      id: true, wcOrderNumber: true, customerId: true, customerName: true, salesRep: true,
+      id: true, orderNumber: true, externalOrderNumber: true, customerId: true, customerName: true, salesRep: true,
       currency: true, totalGbp: true, invoicedAt: true, paidAt: true, createdAt: true,
       shipFromWarehouse: { select: { code: true } },
       payments: { where: { refundId: null }, select: { amount: true } },
@@ -408,7 +409,7 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
       else o0 = balance
     }
     return {
-      orderId: o.id, orderNumber: o.wcOrderNumber ?? o.id.slice(0, 8),
+      orderId: o.id, orderNumber: getSalesOrderReference(o),
       customerId: o.customerId ?? '', customerName: o.customerName ?? '—',
       salesRep: o.salesRep, warehouse: o.shipFromWarehouse?.code ?? null,
       createdAt: o.createdAt.toISOString(), currency: o.currency,

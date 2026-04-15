@@ -1,13 +1,13 @@
 /**
  * IMS → WooCommerce stock level sync.
- * Pushes available stock from warehouses with syncToWoocommerce=true.
+ * Pushes available stock from warehouses with syncToStore=true.
  *
- * SKU resolution is cached on Product.wcProductId. First run resolves
+ * SKU resolution is cached on Product.externalProductId. First run resolves
  * unknown SKUs in bounded-parallel batches and persists the mapping;
  * subsequent runs are O(1) lookups by stored id.
  *
  * Drift handling (two lines of defence):
- *   1. Preflight — before any POST, cached wcProductIds are validated in
+ *   1. Preflight — before any POST, cached externalProductIds are validated in
  *      bulk against the live WooCommerce catalog. Any id whose WC product
  *      no longer carries the expected SKU (deletion/recreation, id reuse,
  *      admin edit) is cleared and excluded from this run. Nothing is ever
@@ -27,7 +27,7 @@
  *
  * Concurrency-safety with credential rebinds: every WC API call in this
  * module uses a credentials snapshot taken at the start of the run, and
- * every wcProductId write is persisted inside a transaction that holds
+ * every externalProductId write is persisted inside a transaction that holds
  * a shared advisory lock and re-checks `wc_settings_version`. If an
  * operator rebinds credentials or resets the cache mid-run, the version
  * check fires and the sync aborts cleanly instead of writing old-store
@@ -140,7 +140,7 @@ async function snapshotSyncContext(): Promise<{
 }
 
 /**
- * Persist a resolved wcProductId, but only if the global settings
+ * Persist a resolved externalProductId, but only if the global settings
  * version still matches the value captured at sync start. Run inside
  * a transaction that holds the advisory lock so it is serialized
  * against any concurrent `saveWcCredentials` or `resetWcProductIdCache`.
@@ -152,12 +152,12 @@ async function snapshotSyncContext(): Promise<{
  *                                writes
  *   - reason:'error'           — db.update failed (most commonly a
  *                                unique-constraint collision on
- *                                wcProductId — two IMS products
+ *                                externalProductId — two IMS products
  *                                resolving to the same WC id)
  */
 async function persistMappingIfVersionMatches(
   productId: string,
-  wcId: number,
+  externalId: number,
   expectedVersion: string,
 ): Promise<
   | { ok: true }
@@ -174,7 +174,7 @@ async function persistMappingIfVersionMatches(
       }
       await tx.product.update({
         where: { id: productId },
-        data: { wcProductId: BigInt(wcId) },
+        data: { externalProductId: BigInt(externalId) },
       })
       return { ok: true as const }
     })
@@ -186,7 +186,7 @@ async function persistMappingIfVersionMatches(
 type MappingInvalidationLog = {
   productId: string
   sku: string
-  wcId: number
+  externalId: number
   reason: string
 }
 
@@ -197,7 +197,7 @@ type MappingInvalidationOutcome =
   | { status: 'error'; error: string }
 
 async function invalidateMappingIfVersionMatches(
-  entry: { productId: string; sku: string; wcId: number },
+  entry: { productId: string; sku: string; externalId: number },
   expectedVersion: string,
   reason: string,
 ): Promise<MappingInvalidationOutcome> {
@@ -212,25 +212,25 @@ async function invalidateMappingIfVersionMatches(
 
       const product = await tx.product.findUnique({
         where: { id: entry.productId },
-        select: { wcProductId: true },
+        select: { externalProductId: true },
       })
-      if (product?.wcProductId !== BigInt(entry.wcId)) {
+      if (product?.externalProductId !== BigInt(entry.externalId)) {
         return {
           status: 'mapping_changed' as const,
-          currentWcId: product?.wcProductId ?? null,
+          currentWcId: product?.externalProductId ?? null,
         }
       }
 
       await tx.product.update({
         where: { id: entry.productId },
-        data: { wcProductId: null },
+        data: { externalProductId: null },
       })
       return {
         status: 'cleared' as const,
         log: {
           productId: entry.productId,
           sku: entry.sku,
-          wcId: entry.wcId,
+          externalId: entry.externalId,
           reason,
         },
       }
@@ -243,7 +243,7 @@ async function invalidateMappingIfVersionMatches(
 type PushEntry = {
   productId: string
   sku: string
-  wcId: number
+  externalId: number
   payload: {
     id: number
     stock_quantity: number
@@ -257,7 +257,7 @@ type VariantPushEntry = PushEntry & {
 }
 
 type EffectiveTarget = {
-  wcId: number
+  externalId: number
   parentWcId?: number
 }
 
@@ -266,7 +266,7 @@ type CandidateProduct = {
   sku: string
   type: 'SIMPLE' | 'VARIANT' | 'KIT' | 'BOM'
   lifecycleStatus: 'ACTIVE' | 'NOT_FOR_SALE' | 'ARCHIVED'
-  wcProductId: bigint | null
+  externalProductId: bigint | null
   parent: { sku: string } | null
   productComponents: {
     componentId: string
@@ -303,12 +303,12 @@ async function persistSuccessfulPushState(
         productId: entry.productId,
         lastPushedQty: entry.payload.stock_quantity,
         lastPushedAt: pushedAt,
-        lastPushedRemoteId: String(entry.wcId),
+        lastPushedRemoteId: String(entry.externalId),
       },
       update: {
         lastPushedQty: entry.payload.stock_quantity,
         lastPushedAt: pushedAt,
-        lastPushedRemoteId: String(entry.wcId),
+        lastPushedRemoteId: String(entry.externalId),
       },
     })
   }
@@ -329,7 +329,7 @@ type BatchReconcileOutcome = {
 
 async function invalidateMappingInLockedTx(
   tx: Prisma.TransactionClient,
-  entry: { productId: string; sku: string; wcId: number },
+  entry: { productId: string; sku: string; externalId: number },
   reason: string,
 ): Promise<
   | { status: 'cleared'; log: MappingInvalidationLog }
@@ -337,25 +337,25 @@ async function invalidateMappingInLockedTx(
 > {
   const product = await tx.product.findUnique({
     where: { id: entry.productId },
-    select: { wcProductId: true },
+    select: { externalProductId: true },
   })
-  if (product?.wcProductId !== BigInt(entry.wcId)) {
+  if (product?.externalProductId !== BigInt(entry.externalId)) {
     return {
       status: 'mapping_changed',
-      currentWcId: product?.wcProductId ?? null,
+      currentWcId: product?.externalProductId ?? null,
     }
   }
 
   await tx.product.update({
     where: { id: entry.productId },
-    data: { wcProductId: null },
+    data: { externalProductId: null },
   })
   return {
     status: 'cleared',
     log: {
       productId: entry.productId,
       sku: entry.sku,
-      wcId: entry.wcId,
+      externalId: entry.externalId,
       reason,
     },
   }
@@ -407,12 +407,12 @@ async function pushBatchWithFence(
     const outcome = await reconcileBatchResponse(tx, batch, data)
 
     for (const entry of outcome.successEntries) {
-      await tx.wcSyncLog.create({
+      await tx.shoppingSyncLog.create({
         data: {
-          direction: 'TO_WC',
+          direction: 'TO_CONNECTOR',
           status: 'SYNCED',
           entityType: 'StockLevel',
-          wcId: entry.wcId,
+          externalId: entry.externalId,
           payload: JSON.parse(JSON.stringify({ stock_quantity: entry.payload.stock_quantity })),
           syncedAt: new Date(),
         },
@@ -446,7 +446,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
 
   // Cross-store safety note:
   //
-  // `Product.wcProductId` is a per-product id that is only meaningful
+  // `Product.externalProductId` is a per-product id that is only meaningful
   // against the WooCommerce installation it was resolved from. We do
   // NOT attempt to auto-detect "the store moved" from inside the sync
   // path. Instead, cache invalidation is enforced at the credentials
@@ -466,7 +466,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // intentional so slow Woo responses do not pin a DB transaction.
 
   // Pin this run to a single credentials + settings-version snapshot.
-  // Every WC API call below uses `creds`; every wcProductId write is
+  // Every WC API call below uses `creds`; every externalProductId write is
   // gated on `syncVersion`. A concurrent rebind/reset bumps the
   // version inside the same advisory-locked transaction that wipes
   // the cache, so either (a) we see the new version here and never
@@ -479,11 +479,11 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   }
 
   const warehouses = await db.warehouse.findMany({
-    where: { syncToWoocommerce: true, active: true },
+    where: { syncToStore: true, active: true },
     select: { id: true },
   })
   if (!warehouses.length) {
-    return emptyResult('No warehouses flagged syncToWoocommerce')
+    return emptyResult('No warehouses flagged syncToStore')
   }
 
   const whIds = warehouses.map((w) => w.id)
@@ -551,7 +551,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       sku: true,
       type: true,
       lifecycleStatus: true,
-      wcProductId: true,
+      externalProductId: true,
       parent: { select: { sku: true } },
       productComponents: {
         select: {
@@ -607,11 +607,11 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     return result
   }
 
-  // Local mutable view — tracks which products have a usable wcProductId
+  // Local mutable view — tracks which products have a usable externalProductId
   // for this run. Only populated after successful persistence or pre-existing
   // DB value; further pruned by preflight validation.
   //
-  // wcProductId is stored as BIGINT (Prisma BigInt) to cover WC/WordPress
+  // externalProductId is stored as BIGINT (Prisma BigInt) to cover WC/WordPress
   // post ids beyond the signed-32-bit range. WC REST responses return the
   // id as a JS `number`, and Number.MAX_SAFE_INTEGER (2^53-1) is well above
   // any realistic WC post id, so we downcast to `number` at the Prisma read
@@ -619,13 +619,13 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // JSON serialization, Map keying, and comparison with the WC response.
   const effectiveTargets = new Map<string, EffectiveTarget>()
   for (const p of products) {
-    if (p.wcProductId != null && p.type !== 'VARIANT') {
-      effectiveTargets.set(p.id, { wcId: Number(p.wcProductId) })
+    if (p.externalProductId != null && p.type !== 'VARIANT') {
+      effectiveTargets.set(p.id, { externalId: Number(p.externalProductId) })
     }
   }
 
   // -------- SKU resolution for uncached products --------
-  const needsResolution = products.filter((p) => p.wcProductId == null || p.type === 'VARIANT')
+  const needsResolution = products.filter((p) => p.externalProductId == null || p.type === 'VARIANT')
   const unmatchedSkus: string[] = []
 
   // Set to `true` by any caller that observes a version bump and wants
@@ -676,13 +676,13 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       // IMS products push to the same WC product.
       //
       // The persist is guarded by `persistMappingIfVersionMatches`:
-      // the wcProductId write lives in a transaction that takes the
+      // the externalProductId write lives in a transaction that takes the
       // shared advisory lock and re-checks `wc_settings_version`. If
       // an operator has rebound credentials or reset the cache since
       // this sync started, the write refuses and we stop resolving
       // further products — anything we'd write would target a store
       // we're no longer connected to.
-      const outcome = await persistMappingIfVersionMatches(p.id, target.wcId, syncVersion)
+      const outcome = await persistMappingIfVersionMatches(p.id, target.externalId, syncVersion)
       if (outcome.ok) {
         effectiveTargets.set(p.id, target)
       } else if (outcome.reason === 'version_changed') {
@@ -693,7 +693,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         break
       } else {
         result.errors.push(
-          `wcProductId collision: could not persist ${target.wcId} for IMS product ${p.id} (SKU ${p.sku}): ${outcome.error}`,
+          `externalProductId collision: could not persist ${target.externalId} for IMS product ${p.id} (SKU ${p.sku}): ${outcome.error}`,
         )
       }
     }
@@ -714,16 +714,16 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   }
 
   // -------- In-memory collision dedupe --------
-  const wcIdUsers = new Map<number, string[]>()
+  const externalIdUsers = new Map<number, string[]>()
   for (const [pid, target] of effectiveTargets) {
-    const list = wcIdUsers.get(target.wcId) ?? []
+    const list = externalIdUsers.get(target.externalId) ?? []
     list.push(pid)
-    wcIdUsers.set(target.wcId, list)
+    externalIdUsers.set(target.externalId, list)
   }
-  for (const [wcId, pids] of wcIdUsers) {
+  for (const [externalId, pids] of externalIdUsers) {
     if (pids.length > 1) {
       result.errors.push(
-        `wcProductId ${wcId} is mapped to ${pids.length} IMS products (${pids.join(', ')}); skipping all to avoid overwrite`,
+        `externalProductId ${externalId} is mapped to ${pids.length} IMS products (${pids.join(', ')}); skipping all to avoid overwrite`,
       )
       for (const pid of pids) effectiveTargets.delete(pid)
     }
@@ -759,52 +759,52 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     // preflight page returned successfully). An id missing from `verified`
     // because its page errored out is *unknown*, not *deleted*, and must
     // NOT be cleared — otherwise a single transient transport failure can
-    // wipe every wcProductId on that page.
+    // wipe every externalProductId on that page.
     for (const [pid, target] of [...effectiveTargets.entries()]) {
       const expectedSku = skuByProduct.get(pid)
-      const wcId = target.wcId
+      const externalId = target.externalId
       const actualSku = verifiedByProductId.get(pid)
 
       if (actualSku === undefined) {
         if (checkedProductIds.has(pid)) {
           const invalidation = await invalidateMappingIfVersionMatches(
-            { productId: pid, sku: expectedSku ?? '', wcId },
+            { productId: pid, sku: expectedSku ?? '', externalId },
             syncVersion,
-            `WC product ${wcId} not found in preflight response (likely deleted)`,
+            `WC product ${externalId} not found in preflight response (likely deleted)`,
           )
           if (invalidation.status === 'cleared') {
             result.skipped++
             result.errors.push(
-              `Stale WC mapping for SKU ${expectedSku ?? ''} (IMS ${pid}, WC ${wcId}): ${invalidation.log.reason} — cleared for re-resolution`,
+              `Stale WC mapping for SKU ${expectedSku ?? ''} (IMS ${pid}, WC ${externalId}): ${invalidation.log.reason} — cleared for re-resolution`,
             )
             await logActivity({
               entityType: 'SYNC', action: 'stock_sync', tag: 'sync', level: 'WARNING',
               description: `Cleared stale WooCommerce mapping for SKU ${invalidation.log.sku}`,
               metadata: {
                 productId: invalidation.log.productId,
-                wcId: invalidation.log.wcId,
+                externalId: invalidation.log.externalId,
                 reason: invalidation.log.reason,
               },
             })
           } else if (invalidation.status === 'version_changed') {
             versionBumpedMidRun = true
             result.errors.push(
-              `WooCommerce credentials were rebound while invalidating stale mapping for SKU ${expectedSku ?? ''} (IMS ${pid}, WC ${wcId}); preserved current mapping`,
+              `WooCommerce credentials were rebound while invalidating stale mapping for SKU ${expectedSku ?? ''} (IMS ${pid}, WC ${externalId}); preserved current mapping`,
             )
           } else if (invalidation.status === 'mapping_changed') {
             result.skipped++
             result.errors.push(
-              `Stale WC mapping for SKU ${expectedSku ?? ''} (IMS ${pid}, WC ${wcId}) was not cleared because the product now points at WC ${invalidation.currentWcId == null ? 'null' : String(invalidation.currentWcId)} in the database`,
+              `Stale WC mapping for SKU ${expectedSku ?? ''} (IMS ${pid}, WC ${externalId}) was not cleared because the product now points at WC ${invalidation.currentWcId == null ? 'null' : String(invalidation.currentWcId)} in the database`,
             )
           } else {
-            result.errors.push(`Failed to clear stale wcProductId for ${pid}: ${invalidation.error}`)
+            result.errors.push(`Failed to clear stale externalProductId for ${pid}: ${invalidation.error}`)
           }
         } else {
           // Page containing this id failed preflight — we don't know the
           // current state. Skip for this run but keep the cached mapping
           // so the next run can re-verify without permanent data loss.
           result.errors.push(
-            `preflight incomplete for IMS ${pid} (SKU ${expectedSku ?? '?'}, WC ${wcId}): page fetch failed, mapping preserved for next run`,
+            `preflight incomplete for IMS ${pid} (SKU ${expectedSku ?? '?'}, WC ${externalId}): page fetch failed, mapping preserved for next run`,
           )
         }
         effectiveTargets.delete(pid)
@@ -813,36 +813,36 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       }
       if (expectedSku && actualSku !== expectedSku) {
         const invalidation = await invalidateMappingIfVersionMatches(
-          { productId: pid, sku: expectedSku, wcId },
+          { productId: pid, sku: expectedSku, externalId },
           syncVersion,
-          `preflight: WC id ${wcId} now has SKU "${actualSku}" (expected "${expectedSku}")`,
+          `preflight: WC id ${externalId} now has SKU "${actualSku}" (expected "${expectedSku}")`,
         )
         if (invalidation.status === 'cleared') {
           result.skipped++
           result.errors.push(
-            `Stale WC mapping for SKU ${expectedSku} (IMS ${pid}, WC ${wcId}): ${invalidation.log.reason} — cleared for re-resolution`,
+            `Stale WC mapping for SKU ${expectedSku} (IMS ${pid}, WC ${externalId}): ${invalidation.log.reason} — cleared for re-resolution`,
           )
           await logActivity({
             entityType: 'SYNC', action: 'stock_sync', tag: 'sync', level: 'WARNING',
             description: `Cleared stale WooCommerce mapping for SKU ${invalidation.log.sku}`,
             metadata: {
               productId: invalidation.log.productId,
-              wcId: invalidation.log.wcId,
+              externalId: invalidation.log.externalId,
               reason: invalidation.log.reason,
             },
           })
         } else if (invalidation.status === 'version_changed') {
           versionBumpedMidRun = true
           result.errors.push(
-            `WooCommerce credentials were rebound while invalidating stale mapping for SKU ${expectedSku} (IMS ${pid}, WC ${wcId}); preserved current mapping`,
+            `WooCommerce credentials were rebound while invalidating stale mapping for SKU ${expectedSku} (IMS ${pid}, WC ${externalId}); preserved current mapping`,
           )
         } else if (invalidation.status === 'mapping_changed') {
           result.skipped++
           result.errors.push(
-            `Stale WC mapping for SKU ${expectedSku} (IMS ${pid}, WC ${wcId}) was not cleared because the product now points at WC ${invalidation.currentWcId == null ? 'null' : String(invalidation.currentWcId)} in the database`,
+            `Stale WC mapping for SKU ${expectedSku} (IMS ${pid}, WC ${externalId}) was not cleared because the product now points at WC ${invalidation.currentWcId == null ? 'null' : String(invalidation.currentWcId)} in the database`,
           )
         } else {
-          result.errors.push(`Failed to clear stale wcProductId for ${pid}: ${invalidation.error}`)
+          result.errors.push(`Failed to clear stale externalProductId for ${pid}: ${invalidation.error}`)
         }
         effectiveTargets.delete(pid)
         if (versionBumpedMidRun) break
@@ -889,7 +889,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       ? 0
       : (availableByProduct.get(product.id) ?? 0)
     const payload: PushEntry['payload'] = {
-      id: target.wcId,
+      id: target.externalId,
       stock_quantity: Math.floor(available),
       manage_stock: true,
     }
@@ -901,7 +901,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       const entry: VariantPushEntry = {
         productId: product.id,
         sku: product.sku,
-        wcId: target.wcId,
+        externalId: target.externalId,
         parentWcId: target.parentWcId,
         payload,
       }
@@ -911,20 +911,20 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         && !forceProductIds.has(product.id)
         && prev?.lastPushedQty === entry.payload.stock_quantity
         && prev.lastPushedRemoteId != null
-        && prev.lastPushedRemoteId === String(entry.wcId)
+        && prev.lastPushedRemoteId === String(entry.externalId)
       ) {
         continue
       }
       variantPushEntries.push(entry)
     } else {
-      const entry: PushEntry = { productId: product.id, sku: product.sku, wcId: target.wcId, payload }
+      const entry: PushEntry = { productId: product.id, sku: product.sku, externalId: target.externalId, payload }
       const prev = previousStateByProductId.get(product.id)
       if (
         !forceAll
         && !forceProductIds.has(product.id)
         && prev?.lastPushedQty === entry.payload.stock_quantity
         && prev.lastPushedRemoteId != null
-        && prev.lastPushedRemoteId === String(entry.wcId)
+        && prev.lastPushedRemoteId === String(entry.externalId)
       ) {
         continue
       }
@@ -997,7 +997,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         description: `Cleared stale WooCommerce mapping for SKU ${invalidation.sku}`,
         metadata: {
           productId: invalidation.productId,
-          wcId: invalidation.wcId,
+          externalId: invalidation.externalId,
           reason: invalidation.reason,
         },
       })
@@ -1047,7 +1047,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
             description: `Cleared stale WooCommerce mapping for SKU ${invalidation.sku}`,
             metadata: {
               productId: invalidation.productId,
-              wcId: invalidation.wcId,
+              externalId: invalidation.externalId,
               reason: invalidation.reason,
             },
           })
@@ -1091,7 +1091,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
  * request per 100 ids — vastly cheaper than per-SKU lookups.
  *
  * Returns:
- *   - verified: Map<wcId, currentSku> for every id WC returned in a
+ *   - verified: Map<externalId, currentSku> for every id WC returned in a
  *     successfully-fetched page
  *   - checkedIds: set of ids whose page actually completed successfully.
  *     The caller MUST use this to distinguish "id missing because WC
@@ -1154,7 +1154,7 @@ async function preflightCachedIds(
 // WooCommerce REST error codes that positively prove the id no longer
 // points to a real product. Anything outside this set (validation errors,
 // plugin rejections, permission errors, etc.) is a sync failure, NOT drift —
-// clearing `wcProductId` in those cases would destroy valid local state for
+// clearing `externalProductId` in those cases would destroy valid local state for
 // an unrelated transient problem.
 //
 // `woocommerce_rest_cannot_view` is deliberately NOT in this list: it is
@@ -1204,14 +1204,14 @@ async function reconcileBatchResponse(
   let skipped = 0
 
   for (const entry of batch) {
-    const item = byId.get(entry.wcId)
+    const item = byId.get(entry.externalId)
 
     // Missing from response: batch APIs very occasionally drop items on
     // partial failures / plugin interference. Report as a push failure but
     // keep the cached mapping — we don't know it's stale.
     if (!item) {
       errors.push(
-        `Push failed for SKU ${entry.sku} (IMS ${entry.productId}, WC ${entry.wcId}): item missing from batch response (mapping preserved)`,
+        `Push failed for SKU ${entry.sku} (IMS ${entry.productId}, WC ${entry.externalId}): item missing from batch response (mapping preserved)`,
       )
       skipped++
       continue
@@ -1226,22 +1226,22 @@ async function reconcileBatchResponse(
         const invalidation = await invalidateMappingInLockedTx(
           tx,
           entry,
-          `WC returned "${code}" for id ${entry.wcId} — product no longer exists`,
+          `WC returned "${code}" for id ${entry.externalId} — product no longer exists`,
         )
         if (invalidation.status === 'cleared') {
           invalidations.push(invalidation.log)
           errors.push(
-            `Stale WC mapping for SKU ${entry.sku} (IMS ${entry.productId}, WC ${entry.wcId}): ${invalidation.log.reason} — cleared for re-resolution`,
+            `Stale WC mapping for SKU ${entry.sku} (IMS ${entry.productId}, WC ${entry.externalId}): ${invalidation.log.reason} — cleared for re-resolution`,
           )
         } else {
           errors.push(
-            `Stale WC mapping for SKU ${entry.sku} (IMS ${entry.productId}, WC ${entry.wcId}) was not cleared because the product now points at WC ${invalidation.currentWcId == null ? 'null' : String(invalidation.currentWcId)} in the database`,
+            `Stale WC mapping for SKU ${entry.sku} (IMS ${entry.productId}, WC ${entry.externalId}) was not cleared because the product now points at WC ${invalidation.currentWcId == null ? 'null' : String(invalidation.currentWcId)} in the database`,
           )
         }
         skipped++
       } else {
         errors.push(
-          `Push failed for SKU ${entry.sku} (IMS ${entry.productId}, WC ${entry.wcId}): ${item.error.message ?? code ?? 'unknown error'} (mapping preserved)`,
+          `Push failed for SKU ${entry.sku} (IMS ${entry.productId}, WC ${entry.externalId}): ${item.error.message ?? code ?? 'unknown error'} (mapping preserved)`,
         )
         skipped++
       }
@@ -1254,16 +1254,16 @@ async function reconcileBatchResponse(
       const invalidation = await invalidateMappingInLockedTx(
         tx,
         entry,
-        `post-push drift: WC id ${entry.wcId} now maps to SKU "${item.sku}" (expected "${entry.sku}")`,
+        `post-push drift: WC id ${entry.externalId} now maps to SKU "${item.sku}" (expected "${entry.sku}")`,
       )
       if (invalidation.status === 'cleared') {
         invalidations.push(invalidation.log)
         errors.push(
-          `Stale WC mapping for SKU ${entry.sku} (IMS ${entry.productId}, WC ${entry.wcId}): ${invalidation.log.reason} — cleared for re-resolution`,
+          `Stale WC mapping for SKU ${entry.sku} (IMS ${entry.productId}, WC ${entry.externalId}): ${invalidation.log.reason} — cleared for re-resolution`,
         )
       } else {
         errors.push(
-          `Stale WC mapping for SKU ${entry.sku} (IMS ${entry.productId}, WC ${entry.wcId}) was not cleared because the product now points at WC ${invalidation.currentWcId == null ? 'null' : String(invalidation.currentWcId)} in the database`,
+          `Stale WC mapping for SKU ${entry.sku} (IMS ${entry.productId}, WC ${entry.externalId}) was not cleared because the product now points at WC ${invalidation.currentWcId == null ? 'null' : String(invalidation.currentWcId)} in the database`,
         )
       }
       skipped++
@@ -1360,21 +1360,21 @@ async function preflightEffectiveTargets(
   let totalAttempts = 0
   let failedAttempts = 0
 
-  const standardEntries: { productId: string; wcId: number }[] = []
-  const variantEntries: { productId: string; wcId: number; parentWcId: number }[] = []
+  const standardEntries: { productId: string; externalId: number }[] = []
+  const variantEntries: { productId: string; externalId: number; parentWcId: number }[] = []
   for (const [productId, target] of effectiveTargets) {
     const product = productById.get(productId)
     if (!product) continue
     if (product.type === 'VARIANT' && target.parentWcId != null) {
-      variantEntries.push({ productId, wcId: target.wcId, parentWcId: target.parentWcId })
+      variantEntries.push({ productId, externalId: target.externalId, parentWcId: target.parentWcId })
     } else {
-      standardEntries.push({ productId, wcId: target.wcId })
+      standardEntries.push({ productId, externalId: target.externalId })
     }
   }
 
   if (standardEntries.length > 0) {
     const standard = await preflightCachedIds(
-      [...new Set(standardEntries.map((entry) => entry.wcId))],
+      [...new Set(standardEntries.map((entry) => entry.externalId))],
       creds,
     )
     totalAttempts += standard.attempts
@@ -1383,16 +1383,16 @@ async function preflightEffectiveTargets(
 
     const productIdsByWcId = new Map<number, string[]>()
     for (const entry of standardEntries) {
-      const list = productIdsByWcId.get(entry.wcId) ?? []
+      const list = productIdsByWcId.get(entry.externalId) ?? []
       list.push(entry.productId)
-      productIdsByWcId.set(entry.wcId, list)
+      productIdsByWcId.set(entry.externalId, list)
     }
 
-    for (const [wcId, productIds] of productIdsByWcId) {
-      if (standard.checkedIds.has(wcId)) {
+    for (const [externalId, productIds] of productIdsByWcId) {
+      if (standard.checkedIds.has(externalId)) {
         for (const productId of productIds) checkedProductIds.add(productId)
       }
-      const sku = standard.verified.get(wcId)
+      const sku = standard.verified.get(externalId)
       if (sku !== undefined) {
         for (const productId of productIds) verifiedByProductId.set(productId, sku)
       }
@@ -1410,7 +1410,7 @@ async function preflightEffectiveTargets(
     for (let i = 0; i < entries.length; i += PREFLIGHT_PAGE_SIZE) {
       totalAttempts++
       const batch = entries.slice(i, i + PREFLIGHT_PAGE_SIZE)
-      const ids = batch.map((entry) => entry.wcId)
+      const ids = batch.map((entry) => entry.externalId)
       const { data, error } = await safeWcFetch(
         `/products/${parentWcId}/variations`,
         { include: ids.join(','), per_page: String(PREFLIGHT_PAGE_SIZE) },
@@ -1433,7 +1433,7 @@ async function preflightEffectiveTargets(
 
       for (const entry of batch) {
         checkedProductIds.add(entry.productId)
-        const sku = verifiedByWcId.get(entry.wcId)
+        const sku = verifiedByWcId.get(entry.externalId)
         if (sku !== undefined) {
           verifiedByProductId.set(entry.productId, sku)
         }
@@ -1501,12 +1501,12 @@ async function pushVariantBatchWithFence(
     const outcome = await reconcileBatchResponse(tx, entries, data)
 
     for (const entry of outcome.successEntries) {
-      await tx.wcSyncLog.create({
+      await tx.shoppingSyncLog.create({
         data: {
-          direction: 'TO_WC',
+          direction: 'TO_CONNECTOR',
           status: 'SYNCED',
           entityType: 'StockLevel',
-          wcId: entry.wcId,
+          externalId: entry.externalId,
           payload: JSON.parse(JSON.stringify({ stock_quantity: entry.payload.stock_quantity })),
           syncedAt: new Date(),
         },
@@ -1600,11 +1600,11 @@ async function resolveSkusInParallel(
       totalAttempts++
       const lookup = await safeWcFetch(
         `/products/${parentWcId}/variations`,
-        { per_page: String(WC_VARIATION_BATCH_SIZE), include: batch.map((product) => product.wcProductId != null ? Number(product.wcProductId) : 0).filter((id) => id > 0).join(',') },
+        { per_page: String(WC_VARIATION_BATCH_SIZE), include: batch.map((product) => product.externalProductId != null ? Number(product.externalProductId) : 0).filter((id) => id > 0).join(',') },
         creds,
       )
 
-      if (!lookup.error && Array.isArray(lookup.data) && batch.every((product) => product.wcProductId != null)) {
+      if (!lookup.error && Array.isArray(lookup.data) && batch.every((product) => product.externalProductId != null)) {
         const bySku = new Map<string, WcVariation[]>()
         for (const variation of lookup.data as WcVariation[]) {
           const list = bySku.get(variation.sku) ?? []
@@ -1614,7 +1614,7 @@ async function resolveSkusInParallel(
         for (const product of batch) {
           const matches = bySku.get(product.sku) ?? []
           if (matches.length === 1 && typeof matches[0]?.id === 'number') {
-            resolved.set(product.sku, { wcId: matches[0].id, parentWcId })
+            resolved.set(product.sku, { externalId: matches[0].id, parentWcId })
             continue
           }
           if (matches.length > 1) {
@@ -1658,7 +1658,7 @@ async function resolveSkusInParallel(
         }
         const variationId = matches[0]?.id
         if (typeof variationId === 'number') {
-          resolved.set(product.sku, { wcId: variationId, parentWcId })
+          resolved.set(product.sku, { externalId: variationId, parentWcId })
         }
       }
     }
@@ -1686,9 +1686,9 @@ async function resolveSkusInParallel(
         })
         continue
       }
-      const wcId = wcProducts[0]?.id
-      if (typeof wcId === 'number') {
-        resolved.set(sku, { wcId })
+      const externalId = wcProducts[0]?.id
+      if (typeof externalId === 'number') {
+        resolved.set(sku, { externalId })
       }
     }
   }

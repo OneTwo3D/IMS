@@ -4,7 +4,7 @@ import { extractWcTracking } from './field-mapping'
 
 const ORDER_WEBHOOK_ECHO_WINDOW_MS = 10 * 60 * 1000
 
-type WcSyncLogPayload = {
+type ShoppingSyncLogPayload = {
   status?: unknown
   meta_key?: unknown
   items?: unknown
@@ -48,10 +48,10 @@ export async function shouldSuppressWcOrderWebhookEcho(wcOrder: WcFullOrder): Pr
   reason?: 'status_echo' | 'tracking_echo'
 }> {
   const recentSince = new Date(Date.now() - ORDER_WEBHOOK_ECHO_WINDOW_MS)
-  const recentLogs = await db.wcSyncLog.findMany({
+  const recentLogs = await db.shoppingSyncLog.findMany({
     where: {
-      direction: 'TO_WC',
-      wcId: wcOrder.id,
+      direction: 'TO_CONNECTOR',
+      externalId: wcOrder.id,
       entityType: 'SalesOrder',
       createdAt: { gte: recentSince },
     },
@@ -63,7 +63,7 @@ export async function shouldSuppressWcOrderWebhookEcho(wcOrder: WcFullOrder): Pr
   const inboundTracking = comparableInboundTracking(wcOrder)
 
   for (const entry of recentLogs) {
-    const payload = (entry.payload ?? {}) as WcSyncLogPayload
+    const payload = (entry.payload ?? {}) as ShoppingSyncLogPayload
 
     if (typeof payload.status === 'string' && payload.status === wcOrder.status) {
       return { suppress: true, reason: 'status_echo' }

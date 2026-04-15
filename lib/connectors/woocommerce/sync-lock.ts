@@ -2,7 +2,7 @@
  * Coordination primitives shared between WooCommerce credential
  * mutations and in-flight stock syncs.
  *
- * The stock-sync path persists resolved `Product.wcProductId` values
+ * The stock-sync path persists resolved `Product.externalProductId` values
  * incrementally across many `await`s. Without serialization, a
  * concurrent `saveWcCredentials` / `resetWcProductIdCache` could run
  * between a sync reading the version and writing a product row,
@@ -11,7 +11,7 @@
  * Two primitives make that race impossible:
  *
  *   1. A Postgres transaction-scoped advisory lock, taken by BOTH the
- *      credential-mutation path and every wcProductId write inside the
+ *      credential-mutation path and every externalProductId write inside the
  *      stock sync. Holders are serialized; the lock auto-releases on
  *      transaction commit or rollback.
  *

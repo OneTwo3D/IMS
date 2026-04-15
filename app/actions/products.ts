@@ -1264,7 +1264,7 @@ export async function deleteOrDeactivateVariant(
 
     // Clean up auxiliary records before deletion
     await db.stockLevel.deleteMany({ where: { productId: id } })
-    await db.wcSyncLog.deleteMany({ where: { entityType: 'Product', entityId: id } })
+    await db.shoppingSyncLog.deleteMany({ where: { entityType: 'Product', entityId: id } })
     await db.supplierProduct.deleteMany({ where: { productId: id } })
     await db.product.delete({ where: { id } })
 
@@ -1350,7 +1350,7 @@ export async function bulkDeleteProducts(
     }
 
     await db.stockLevel.deleteMany({ where: { productId: product.id } })
-    await db.wcSyncLog.deleteMany({ where: { entityType: 'Product', entityId: product.id } })
+    await db.shoppingSyncLog.deleteMany({ where: { entityType: 'Product', entityId: product.id } })
     await db.supplierProduct.deleteMany({ where: { productId: product.id } })
     await db.productOption.deleteMany({ where: { productId: product.id } })
     await db.product.delete({ where: { id: product.id } })
@@ -1431,7 +1431,7 @@ export async function getAllocationDetails(productId: string, warehouseId: strin
       },
       select: {
         qty: true,
-        order: { select: { id: true, wcOrderNumber: true, status: true } },
+        order: { select: { id: true, externalOrderNumber: true, status: true } },
       },
     }),
     // Manufacturing orders reserving this product (as component for assembly, or as output for disassembly)
@@ -1476,7 +1476,7 @@ export async function getAllocationDetails(productId: string, warehouseId: strin
     results.push({
       type: 'sales_order',
       id: alloc.order.id,
-      reference: alloc.order.wcOrderNumber ?? alloc.order.id.slice(0, 8),
+      reference: alloc.order.externalOrderNumber ?? alloc.order.id.slice(0, 8),
       qty: Number(alloc.qty),
       status: alloc.order.status,
     })

@@ -30,7 +30,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     where: { type: 'sales_order' },
     select: { headerNote: true, footerNote: true, termsText: true, customFooter: true, showPaymentTerms: true, paymentTermsText: true },
   })
-  const { doc } = createPdfDocument({ title: `Order ${so.wcOrderNumber}` })
+  const { doc } = createPdfDocument({ title: `Order ${so.externalOrderNumber}` })
   const date = so.createdAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
 
   const shipAddr = so.shippingAddress as Record<string, string> | null
@@ -38,7 +38,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 
   await drawHeader(doc, branding, {
     title: 'Sales Order',
-    reference: so.wcOrderNumber ?? so.id.slice(0, 8),
+    reference: so.externalOrderNumber ?? so.id.slice(0, 8),
     date,
     recipient: { name: so.customerName ?? 'Customer', address: recipientAddr, email: so.customerEmail },
   })
@@ -150,6 +150,6 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   drawFooter(doc, 'Thank you for your order.', branding, { customFooter: tpl?.customFooter, contactEmail: branding.salesEmail })
   const buffer = await pdfToBuffer(doc)
   return new NextResponse(new Uint8Array(buffer), {
-    headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="Order-${so.wcOrderNumber}.pdf"` },
+    headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="Order-${so.externalOrderNumber}.pdf"` },
   })
 }

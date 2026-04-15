@@ -1,4 +1,4 @@
--- Build the unique index on products.wcProductId CONCURRENTLY so the
+-- Build the unique index on products.externalProductId CONCURRENTLY so the
 -- index creation does NOT take an exclusive lock on the `products`
 -- table for its entire duration. Products is on the hot inventory
 -- path (stock levels, order allocation, WC sync); a blocking CREATE
@@ -20,14 +20,14 @@
 --
 -- Operator remediation if this migration fails partway and leaves an
 -- INVALID index behind, blocking re-run:
---   psql "$DATABASE_URL" -c 'DROP INDEX IF EXISTS "products_wcProductId_key";'
+--   psql "$DATABASE_URL" -c 'DROP INDEX IF EXISTS "products_externalProductId_key";'
 --   npx prisma migrate deploy
 --
 -- If your Prisma version wraps migrations in an outer transaction and
 -- this fails with "CREATE INDEX CONCURRENTLY cannot run inside a
 -- transaction block", run the index build manually and mark applied:
---   psql "$DATABASE_URL" -c 'CREATE UNIQUE INDEX CONCURRENTLY "products_wcProductId_key" ON "products"("wcProductId");'
+--   psql "$DATABASE_URL" -c 'CREATE UNIQUE INDEX CONCURRENTLY "products_externalProductId_key" ON "products"("externalProductId");'
 --   npx prisma migrate resolve --applied 20260413200001_product_wc_id_index
 
-CREATE UNIQUE INDEX CONCURRENTLY "products_wcProductId_key"
-  ON "products"("wcProductId");
+CREATE UNIQUE INDEX CONCURRENTLY "products_externalProductId_key"
+  ON "products"("externalProductId");

@@ -42,11 +42,11 @@ export async function isWcOrderWebhookPrimaryActive(): Promise<boolean> {
 export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<{ success: boolean; orderId?: string; error?: string }> {
   try {
     // Skip if already imported
-    const existing = await db.salesOrder.findUnique({ where: { wcOrderId: wcOrder.id } })
+    const existing = await db.salesOrder.findUnique({ where: { externalOrderId: wcOrder.id } })
     if (existing) return { success: true, orderId: existing.id }
 
     // Resolve IMS status from WC status
-    const statusMapping = await db.wcStatusMapping.findUnique({ where: { wcStatus: wcOrder.status } })
+    const statusMapping = await db.shoppingStatusMapping.findUnique({ where: { externalStatus: wcOrder.status } })
     const imsStatus = statusMapping?.imsStatus ?? 'PROCESSING'
 
     // Customer
@@ -74,7 +74,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     } = await resolveWcTaxRateById(primaryWcRateId)
     const pricesIncludeVat = wcOrder.prices_include_tax
 
-    // Line items (each one may carry its own wcTaxRateId)
+    // Line items (each one may carry its own externalTaxRateId)
     const mappedLines = await mapWcLineItems(wcOrder.line_items, fxRate)
 
     // --- Per-line tax resolution --------------------------------------
@@ -83,7 +83,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     // 2. Otherwise, fall back to the IMS resolver on (productCategory,
     //    shippingCountry, SALES).
     const distinctWcRateIds = Array.from(
-      new Set(mappedLines.map((l) => l.wcTaxRateId).filter((x): x is number => typeof x === 'number')),
+      new Set(mappedLines.map((l) => l.externalTaxRateId).filter((x): x is number => typeof x === 'number')),
     )
     const wcResolvedById = new Map<
       number,
@@ -123,7 +123,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       .map((l, idx) => ({
         id: String(idx),
         productCategory: (l.productId && productCategoryById.get(l.productId)) || ('STANDARD' as TaxCategory),
-        hasWc: l.wcTaxRateId != null,
+        hasWc: l.externalTaxRateId != null,
       }))
       .filter((l) => !l.hasWc)
     const resolverMap = await resolveLineTaxRateBatch(
@@ -132,8 +132,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     )
 
     const lineTaxResolved = mappedLines.map((l, idx) => {
-      if (l.wcTaxRateId != null) {
-        const wc = wcResolvedById.get(l.wcTaxRateId)
+      if (l.externalTaxRateId != null) {
+        const wc = wcResolvedById.get(l.externalTaxRateId)
         if (wc) return wc
       }
       return (
@@ -187,7 +187,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
 
       return {
         productId: l.productId,
-        wcLineItemId: l.wcLineItemId,
+        externalLineItemId: l.externalLineItemId,
         sku: l.sku,
         description: l.description,
         qty: l.qty,
@@ -210,10 +210,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       await getShoppingConnectorPrefixes('woocommerce')
     const orderNumber = `${wcOrderPrefix}${wcOrder.number}`
 
-    // Find the default WC warehouse — prefer isDefault + syncToWoocommerce,
-    // fall back to any syncToWoocommerce warehouse.
+    // Find the default WC warehouse — prefer isDefault + syncToStore,
+    // fall back to any syncToStore warehouse.
     const wcWarehouses = await db.warehouse.findMany({
-      where: { active: true, syncToWoocommerce: true },
+      where: { active: true, syncToStore: true },
       select: { id: true, isDefault: true },
       orderBy: { isDefault: 'desc' },
     })
@@ -224,13 +224,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     try {
       so = await db.salesOrder.create({
         data: {
-          wcOrderId: wcOrder.id,
-          wcOrderNumber: wcOrder.number,
+          externalOrderId: wcOrder.id,
+          externalOrderNumber: wcOrder.number,
           orderNumber,
           paymentMethod: wcOrder.payment_method || null,
           paymentMethodTitle: wcOrder.payment_method_title || null,
-          wcCreatedAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created),
-          wcUpdatedAt: new Date(wcOrder.date_modified_gmt || wcOrder.date_modified),
+          externalCreatedAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created),
+          externalUpdatedAt: new Date(wcOrder.date_modified_gmt || wcOrder.date_modified),
           ...(options.useWcDateAsCreatedAt ? { createdAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created) } : {}),
           status: imsStatus,
           shipFromWarehouseId: wcDefaultWarehouseId,
@@ -262,7 +262,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       })
     } catch (error) {
       if (!isUniqueConstraintError(error)) throw error
-      const concurrent = await db.salesOrder.findUnique({ where: { wcOrderId: wcOrder.id } })
+      const concurrent = await db.salesOrder.findUnique({ where: { externalOrderId: wcOrder.id } })
       if (concurrent) return { success: true, orderId: concurrent.id }
       throw error
     }
@@ -279,12 +279,12 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const shouldInvoice = imsStatus === 'PROCESSING' && !options.skipAccounting
     if (!shouldInvoice) {
       // Log sync but skip accounting
-      await db.wcSyncLog.create({
+      await db.shoppingSyncLog.create({
         data: {
-          direction: 'FROM_WC',
+          direction: 'FROM_CONNECTOR',
           entityType: 'ORDER',
           entityId: so.id,
-          wcId: wcOrder.id,
+          externalId: wcOrder.id,
           status: 'SYNCED',
           errorMessage: `Imported as ${imsStatus}${options.skipAccounting ? ' (initial import)' : ''} — skipped accounting sync`,
         },
@@ -344,13 +344,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     } catch { /* Accounting queue errors should never block import */ }
 
     // Log sync
-    await db.wcSyncLog.create({
+    await db.shoppingSyncLog.create({
       data: {
-        direction: 'FROM_WC',
+        direction: 'FROM_CONNECTOR',
         status: 'SYNCED',
         entityType: 'SalesOrder',
         entityId: so.id,
-        wcId: wcOrder.id,
+        externalId: wcOrder.id,
         syncedAt: new Date(),
       },
     })
@@ -362,18 +362,18 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       tag: 'sync',
       level: 'INFO',
       description: `Imported WC order #${wcOrder.number} (${currency} ${totalForeign.toFixed(2)})`,
-      metadata: { wcOrderId: wcOrder.id, wcNumber: wcOrder.number, currency, total: totalForeign },
+      metadata: { externalOrderId: wcOrder.id, wcNumber: wcOrder.number, currency, total: totalForeign },
       resolveUser: false,
     })
 
     return { success: true, orderId: so.id }
   } catch (e) {
-    await db.wcSyncLog.create({
+    await db.shoppingSyncLog.create({
       data: {
-        direction: 'FROM_WC',
+        direction: 'FROM_CONNECTOR',
         status: 'FAILED',
         entityType: 'SalesOrder',
-        wcId: wcOrder.id,
+        externalId: wcOrder.id,
         errorMessage: String(e),
         syncedAt: new Date(),
       },

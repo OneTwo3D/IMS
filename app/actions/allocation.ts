@@ -140,8 +140,8 @@ export async function autoAllocateOrder(
       select: {
         id: true,
         orderNumber: true,
-        wcOrderId: true,
-        wcOrderNumber: true,
+        externalOrderId: true,
+        externalOrderNumber: true,
         status: true,
         shipFromWarehouseId: true,
         lines: { select: { id: true, productId: true, qty: true, sku: true } },
@@ -151,16 +151,16 @@ export async function autoAllocateOrder(
 
     // Get eligible warehouses: the selected warehouse first, then others available for sale.
     // For WC orders, restrict to WC-synced warehouses to ship from the right locations.
-    // Use wcOrderId (not wcOrderNumber) — manual orders may have orderNumber but no WC provenance.
-    const isWcOrder = so.wcOrderId != null
-    const orderRef = so.orderNumber ?? so.wcOrderNumber ?? so.id.slice(0, 8)
+    // Use externalOrderId (not externalOrderNumber) — manual orders may have orderNumber but no WC provenance.
+    const isWcOrder = so.externalOrderId != null
+    const orderRef = so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
     const allWarehouses = await db.warehouse.findMany({
       where: {
         active: true,
         availableForSale: true,
-        ...(isWcOrder ? { syncToWoocommerce: true } : {}),
+        ...(isWcOrder ? { syncToStore: true } : {}),
       },
-      select: { id: true, code: true, name: true, isDefault: true, syncToWoocommerce: true },
+      select: { id: true, code: true, name: true, isDefault: true, syncToStore: true },
       orderBy: { isDefault: 'desc' },
     })
     if (!allWarehouses.length) return { success: false, error: isWcOrder ? 'No WooCommerce-synced warehouses available for sale' : 'No warehouses available for sale' }
@@ -172,8 +172,8 @@ export async function autoAllocateOrder(
       if (b.id === primaryId) return 1
       if (a.isDefault && !b.isDefault) return -1
       if (!a.isDefault && b.isDefault) return 1
-      if (a.syncToWoocommerce && !b.syncToWoocommerce) return -1
-      if (!a.syncToWoocommerce && b.syncToWoocommerce) return 1
+      if (a.syncToStore && !b.syncToStore) return -1
+      if (!a.syncToStore && b.syncToStore) return 1
       return 0
     })
 
@@ -365,7 +365,7 @@ export async function updateAllocation(
     await requirePermission('sales.process')
     const alloc = await db.orderAllocation.findUnique({
       where: { id: allocationId },
-      include: { line: { select: { qty: true } }, order: { select: { orderNumber: true, wcOrderNumber: true } } },
+      include: { line: { select: { qty: true } }, order: { select: { orderNumber: true, externalOrderNumber: true } } },
     })
     if (!alloc) return { success: false, error: 'Allocation not found' }
     if (newQty < 0) return { success: false, error: 'Quantity cannot be negative' }
@@ -412,7 +412,7 @@ export async function updateAllocation(
       action: 'allocation_updated',
       tag: 'sales',
       level: 'INFO',
-      description: `Updated allocation for order ${alloc.order.orderNumber ?? alloc.order.wcOrderNumber}`,
+      description: `Updated allocation for order ${alloc.order.orderNumber ?? alloc.order.externalOrderNumber}`,
       metadata: { allocationId, newWarehouseId, newQty },
     })
     try {
@@ -493,7 +493,7 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
     await requirePermission('sales.process')
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
-      select: { orderNumber: true, wcOrderNumber: true, status: true },
+      select: { orderNumber: true, externalOrderNumber: true, status: true },
     })
     if (!so) return { success: false, error: 'Order not found' }
 
@@ -535,8 +535,8 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
       action: 'deallocated',
       tag: 'sales',
       level: 'INFO',
-      description: `Deallocated stock for order ${so.orderNumber ?? so.wcOrderNumber}`,
-      metadata: { orderNumber: so.orderNumber ?? so.wcOrderNumber },
+      description: `Deallocated stock for order ${so.orderNumber ?? so.externalOrderNumber}`,
+      metadata: { orderNumber: so.orderNumber ?? so.externalOrderNumber },
     })
     try {
       await enqueueStockSync(
@@ -566,7 +566,7 @@ export async function confirmAllocations(
     }
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
-      select: { orderNumber: true, wcOrderNumber: true, status: true },
+      select: { orderNumber: true, externalOrderNumber: true, status: true },
     })
     if (!so) return { success: false, error: 'Order not found' }
 
@@ -653,8 +653,8 @@ export async function confirmAllocations(
       action: 'allocations_confirmed',
       tag: 'sales',
       level: 'INFO',
-      description: `Confirmed allocations for order ${so.orderNumber ?? so.wcOrderNumber} — ${byWarehouse.size} shipment(s) created`,
-      metadata: { orderNumber: so.orderNumber ?? so.wcOrderNumber, shipmentCount: byWarehouse.size },
+      description: `Confirmed allocations for order ${so.orderNumber ?? so.externalOrderNumber} — ${byWarehouse.size} shipment(s) created`,
+      metadata: { orderNumber: so.orderNumber ?? so.externalOrderNumber, shipmentCount: byWarehouse.size },
     })
     return { success: true }
   } catch (e) {
@@ -679,7 +679,7 @@ export async function updateShipmentStatus(
     const shipment = await db.shipment.findUnique({
       where: { id: shipmentId },
       include: {
-        order: { select: { id: true, orderNumber: true, wcOrderNumber: true, status: true } },
+        order: { select: { id: true, orderNumber: true, externalOrderNumber: true, status: true } },
         lines: { select: { lineId: true, productId: true, qty: true, product: { select: { sku: true } } } },
         warehouse: { select: { code: true } },
       },
@@ -734,8 +734,8 @@ export async function updateShipmentStatus(
           action: 'dispatched',
           tag: 'stock',
           level: 'INFO',
-          description: `Dispatched ${qty} units of SKU ${line.product.sku} from ${shipment.warehouse.code} for order ${shipment.order.orderNumber ?? shipment.order.wcOrderNumber}`,
-          metadata: { sku: line.product.sku, productId: line.productId, qty, orderNumber: shipment.order.orderNumber ?? shipment.order.wcOrderNumber, warehouseId: shipment.warehouseId },
+          description: `Dispatched ${qty} units of SKU ${line.product.sku} from ${shipment.warehouse.code} for order ${shipment.order.orderNumber ?? shipment.order.externalOrderNumber}`,
+          metadata: { sku: line.product.sku, productId: line.productId, qty, orderNumber: shipment.order.orderNumber ?? shipment.order.externalOrderNumber, warehouseId: shipment.warehouseId },
         })
       }
 
@@ -789,7 +789,7 @@ export async function updateShipmentStatus(
       action: 'shipment_status_changed',
       tag: 'sales',
       level: 'INFO',
-      description: `Shipment from ${shipment.warehouse.code} for order ${shipment.order.orderNumber ?? shipment.order.wcOrderNumber} → ${targetStatus}`,
+      description: `Shipment from ${shipment.warehouse.code} for order ${shipment.order.orderNumber ?? shipment.order.externalOrderNumber} → ${targetStatus}`,
       metadata: { shipmentId, warehouseCode: shipment.warehouse.code, previousStatus: shipment.status, newStatus: targetStatus },
     })
     if (targetStatus === 'SHIPPED') {
@@ -822,7 +822,7 @@ export async function updateShipmentTracking(
     const shipment = await db.shipment.findUnique({
       where: { id: shipmentId },
       include: {
-        order: { select: { id: true, orderNumber: true, wcOrderNumber: true } },
+        order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
         warehouse: { select: { code: true } },
       },
     })
@@ -866,7 +866,7 @@ export async function updateShipmentTracking(
       action: 'shipment_tracking_updated',
       tag: 'sales',
       level: 'INFO',
-      description: `Updated tracking for shipment from ${shipment.warehouse.code} on order ${shipment.order.orderNumber ?? shipment.order.wcOrderNumber}`,
+      description: `Updated tracking for shipment from ${shipment.warehouse.code} on order ${shipment.order.orderNumber ?? shipment.order.externalOrderNumber}`,
       metadata: {
         shipmentId,
         warehouseCode: shipment.warehouse.code,

@@ -120,21 +120,21 @@ test.describe('@external @wc WooCommerce integration', () => {
     await syncProductsButton.click()
     await expect(page.getByText(/products sync completed:/i)).toBeVisible({ timeout: 120000 })
 
-    const productRow = psql(`select p.id || '|' || p.sku || '|' || coalesce(p."wcProductId"::text, '')
+    const productRow = psql(`select p.id || '|' || p.sku || '|' || coalesce(p."externalProductId"::text, '')
       from products p
-      join wc_sync_logs l on l."entityId" = p.id
-      where l.direction = 'FROM_WC'
+      join shopping_sync_logs l on l."entityId" = p.id
+      where l.direction = 'FROM_CONNECTOR'
         and l.status = 'SYNCED'
         and l."entityType" = 'Product'
         and p.active = true
         and p.type not in ('VARIABLE', 'KIT', 'NON_INVENTORY')
-        and p."wcProductId" is not null
+        and p."externalProductId" is not null
       order by l."createdAt" desc
       limit 1;`)
-    const [productId, productSku, wcProductId] = productRow.split('|')
-    if (!productId || !productSku || !wcProductId) throw new Error('No Woo-linked simple product found for tracking test')
+    const [productId, productSku, externalProductId] = productRow.split('|')
+    if (!productId || !productSku || !externalProductId) throw new Error('No Woo-linked simple product found for tracking test')
 
-    const warehouseRow = psql(`select code from warehouses where active = true and "syncToWoocommerce" = true order by "isDefault" desc, code asc limit 1;`)
+    const warehouseRow = psql(`select code from warehouses where active = true and "syncToStore" = true order by "isDefault" desc, code asc limit 1;`)
     if (!warehouseRow) throw new Error('No sync-enabled warehouse available for WooCommerce order fulfillment test')
     await addStockAdjustment(page, productSku, 3, warehouseRow)
 
@@ -163,7 +163,7 @@ test.describe('@external @wc WooCommerce integration', () => {
           postcode: 'CB1 1AA',
           country: 'GB',
         },
-        line_items: [{ product_id: Number(wcProductId), quantity: 1 }],
+        line_items: [{ product_id: Number(externalProductId), quantity: 1 }],
       }),
     }) as { id: number; number: string }
 
@@ -179,7 +179,7 @@ test.describe('@external @wc WooCommerce integration', () => {
     }
 
     const orderId = await expect.poll(() => (
-      psql(`select id from sales_orders where "wcOrderId" = ${createdOrder.id} limit 1;`)
+      psql(`select id from sales_orders where "externalOrderId" = ${createdOrder.id} limit 1;`)
     ), {
       timeout: 120000,
     })
@@ -242,11 +242,11 @@ test.describe('@external @wc WooCommerce integration', () => {
     }))
 
     await expect.poll(() => (
-      psql(`select id from wc_sync_logs
+      psql(`select id from shopping_sync_logs
         where "entityType" = 'SalesOrder'
-          and direction = 'TO_WC'
+          and direction = 'TO_CONNECTOR'
           and status = 'SYNCED'
-          and "wcId" = ${createdOrder.id}
+          and "externalId" = ${createdOrder.id}
           and payload::text like '%_wc_shipment_tracking_items%'
           and payload::text like '%' || ${sqlString(updatedTracking)} || '%'
         order by "createdAt" desc
@@ -256,7 +256,7 @@ test.describe('@external @wc WooCommerce integration', () => {
     }).not.toEqual('')
   })
 
-  test.fixme('runs a live WooCommerce stock push and records TO_WC sync activity', async () => {
+  test.fixme('runs a live WooCommerce stock push and records TO_CONNECTOR sync activity', async () => {
     test.fail(true, 'The demo WooCommerce connector does not currently surface a stable completion signal for Push Stock Now in Playwright runs.')
   })
 })

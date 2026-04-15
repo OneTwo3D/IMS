@@ -104,7 +104,7 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
 /**
  * Save WooCommerce credentials.
  *
- * Cache-integrity contract: `Product.wcProductId` is an id against one
+ * Cache-integrity contract: `Product.externalProductId` is an id against one
  * specific WooCommerce installation. Changing the store URL or the
  * consumer key means cached mappings may now point at unrelated
  * products on a different catalog. Rather than trying to detect
@@ -112,7 +112,7 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
  * collapsed into false "same store" decisions or flushed on routine
  * catalog edits), invalidation is enforced HERE, atomically with the
  * credentials write: if the effective url/key/secret changes, we
- * null every `wcProductId` in the same transaction that writes the
+ * null every `externalProductId` in the same transaction that writes the
  * new values. The next sync re-resolves via SKU lookup against the
  * new store.
  *
@@ -121,7 +121,7 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
  * (credentials + cache wipe + version bump) runs inside a transaction
  * that first takes `pg_advisory_xact_lock(WC_SYNC_ADVISORY_LOCK_KEY)`.
  * `pushStockToWc` takes the same advisory lock when it snapshots its
- * credentials at start-of-run and again for every wcProductId write.
+ * credentials at start-of-run and again for every externalProductId write.
  * Whichever side commits first wins cleanly: a persist that races us
  * and loses the lock will, on the far side, observe the new
  * `wc_settings_version` and abort its write before any old-store id
@@ -210,8 +210,8 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     // credentials write and the wipe would otherwise leave the cache
     // pointing at an ambiguous store.
     const wiped = await tx.product.updateMany({
-      where: { wcProductId: { not: null } },
-      data: { wcProductId: null },
+      where: { externalProductId: { not: null } },
+      data: { externalProductId: null },
     })
     return { isRebind, wipedMappings: wiped.count }
   })
@@ -221,7 +221,7 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     tag: 'settings',
     action: 'updated',
     description: saveOutcome.isRebind
-      ? `Updated WooCommerce connection credentials — cleared ${saveOutcome.wipedMappings} cached wcProductId mapping(s)`
+      ? `Updated WooCommerce connection credentials — cleared ${saveOutcome.wipedMappings} cached externalProductId mapping(s)`
       : 'Updated WooCommerce connection credentials (no change detected, cache preserved)',
     metadata: { isRebind: saveOutcome.isRebind, wipedMappings: saveOutcome.wipedMappings },
   })
@@ -230,7 +230,7 @@ export async function saveWcCredentials(url: string, key: string, secret: string
 }
 
 /**
- * Operator-invoked nuclear reset of the `wcProductId` cache.
+ * Operator-invoked nuclear reset of the `externalProductId` cache.
  *
  * Intended for recovery after out-of-band settings edits (manual DB
  * writes, fixture loads, backup restores) that `saveWcCredentials`
@@ -238,7 +238,7 @@ export async function saveWcCredentials(url: string, key: string, secret: string
  * panic button if an operator suspects the cache is corrupted for
  * any other reason.
  *
- * Nullifies every non-null `Product.wcProductId` in one update,
+ * Nullifies every non-null `Product.externalProductId` in one update,
  * writes an activity log entry, and revalidates `/sync` so the UI
  * reflects the reset.
  */
@@ -261,8 +261,8 @@ export async function resetWcProductIdCache(): Promise<{ success: boolean; wiped
       update: { value: nextVersion },
     })
     const cleared = await tx.product.updateMany({
-      where: { wcProductId: { not: null } },
-      data: { wcProductId: null },
+      where: { externalProductId: { not: null } },
+      data: { externalProductId: null },
     })
     return cleared.count
   })
@@ -270,7 +270,7 @@ export async function resetWcProductIdCache(): Promise<{ success: boolean; wiped
     entityType: 'SETTING',
     tag: 'settings',
     action: 'updated',
-    description: `Operator reset — cleared ${wipedCount} cached wcProductId mapping(s)`,
+    description: `Operator reset — cleared ${wipedCount} cached externalProductId mapping(s)`,
     metadata: { wipedMappings: wipedCount },
   })
   revalidatePath('/sync')
@@ -296,49 +296,49 @@ export async function getWcCredentials(): Promise<{ url: string; key: string; se
 
 export type TaxRateMappingRow = {
   id: string
-  wcTaxRateId: number
-  wcName: string
-  wcCountry: string | null
-  wcRatePct: number
-  wcClass: string | null
+  externalTaxRateId: number
+  externalName: string
+  externalCountry: string | null
+  externalRatePct: number
+  externalClass: string | null
   taxRateId: string
   taxRateName: string
 }
 
-export async function getWcTaxRateMappings(): Promise<TaxRateMappingRow[]> {
+export async function getShoppingTaxRateMappings(): Promise<TaxRateMappingRow[]> {
   await requireAdmin()
-  const rows = await db.wcTaxRateMapping.findMany({
+  const rows = await db.shoppingTaxRateMapping.findMany({
     include: { taxRate: { select: { name: true } } },
-    orderBy: [{ wcCountry: 'asc' }, { wcName: 'asc' }],
+    orderBy: [{ externalCountry: 'asc' }, { externalName: 'asc' }],
   })
   return rows.map((r) => ({
     id: r.id,
-    wcTaxRateId: r.wcTaxRateId,
-    wcName: r.wcName,
-    wcCountry: r.wcCountry,
-    wcRatePct: Number(r.wcRatePct),
-    wcClass: r.wcClass,
+    externalTaxRateId: r.externalTaxRateId,
+    externalName: r.externalName,
+    externalCountry: r.externalCountry,
+    externalRatePct: Number(r.externalRatePct),
+    externalClass: r.externalClass,
     taxRateId: r.taxRateId,
     taxRateName: r.taxRate.name,
   }))
 }
 
-export async function updateWcTaxRateMapping(
-  wcTaxRateId: number,
+export async function updateShoppingTaxRateMapping(
+  externalTaxRateId: number,
   taxRateId: string,
 ): Promise<{ success: boolean }> {
   await requireAdmin()
-  await db.wcTaxRateMapping.update({
-    where: { wcTaxRateId },
+  await db.shoppingTaxRateMapping.update({
+    where: { externalTaxRateId },
     data: { taxRateId },
   })
   revalidatePath('/sync')
   return { success: true }
 }
 
-export async function deleteWcTaxRateMapping(id: string): Promise<{ success: boolean }> {
+export async function deleteShoppingTaxRateMapping(id: string): Promise<{ success: boolean }> {
   await requireAdmin()
-  await db.wcTaxRateMapping.delete({ where: { id } })
+  await db.shoppingTaxRateMapping.delete({ where: { id } })
   revalidatePath('/sync')
   return { success: true }
 }
@@ -384,21 +384,21 @@ export async function importWcTaxRatesFromApi(): Promise<{
 
 export type StatusMappingRow = {
   id: string
-  wcStatus: string
+  externalStatus: string
   imsStatus: string
 }
 
-export async function getWcStatusMappings(): Promise<StatusMappingRow[]> {
+export async function getShoppingStatusMappings(): Promise<StatusMappingRow[]> {
   await requireAdmin()
-  const rows = await db.wcStatusMapping.findMany({ orderBy: { wcStatus: 'asc' } })
-  return rows.map((r) => ({ id: r.id, wcStatus: r.wcStatus, imsStatus: r.imsStatus }))
+  const rows = await db.shoppingStatusMapping.findMany({ orderBy: { externalStatus: 'asc' } })
+  return rows.map((r) => ({ id: r.id, externalStatus: r.externalStatus, imsStatus: r.imsStatus }))
 }
 
-export async function upsertWcStatusMapping(wcStatus: string, imsStatus: string): Promise<{ success: boolean }> {
+export async function upsertShoppingStatusMapping(externalStatus: string, imsStatus: string): Promise<{ success: boolean }> {
   await requireAdmin()
-  await db.wcStatusMapping.upsert({
-    where: { wcStatus },
-    create: { wcStatus, imsStatus: imsStatus as never },
+  await db.shoppingStatusMapping.upsert({
+    where: { externalStatus },
+    create: { externalStatus, imsStatus: imsStatus as never },
     update: { imsStatus: imsStatus as never },
   })
   revalidatePath('/sync')
@@ -415,15 +415,15 @@ export type SyncLogRow = {
   status: string
   entityType: string
   entityId: string | null
-  wcId: number | null
+  externalId: number | null
   errorMessage: string | null
   syncedAt: string | null
   createdAt: string
 }
 
-export async function getWcSyncLogs(limit = 50): Promise<SyncLogRow[]> {
+export async function getShoppingSyncLogs(limit = 50): Promise<SyncLogRow[]> {
   await requireAdmin()
-  const rows = await db.wcSyncLog.findMany({
+  const rows = await db.shoppingSyncLog.findMany({
     orderBy: { createdAt: 'desc' },
     take: limit,
   })
@@ -433,7 +433,7 @@ export async function getWcSyncLogs(limit = 50): Promise<SyncLogRow[]> {
     status: r.status,
     entityType: r.entityType,
     entityId: r.entityId,
-    wcId: r.wcId,
+    externalId: r.externalId,
     errorMessage: r.errorMessage,
     syncedAt: r.syncedAt?.toISOString() ?? null,
     createdAt: r.createdAt.toISOString(),
@@ -445,9 +445,9 @@ export async function getWcSyncLogs(limit = 50): Promise<SyncLogRow[]> {
 // ---------------------------------------------------------------------------
 
 const WC_WEBHOOK_DEFS = [
-  { name: 'OTI – Order created',   topic: 'order.created',   path: '/api/webhooks/woocommerce/orders' },
-  { name: 'OTI – Order updated',   topic: 'order.updated',   path: '/api/webhooks/woocommerce/orders' },
-  { name: 'OTI – Product updated', topic: 'product.updated', path: '/api/webhooks/woocommerce/products' },
+  { name: 'OTI – Order created',   topic: 'order.created',   path: '/api/webhooks/shopping/orders' },
+  { name: 'OTI – Order updated',   topic: 'order.updated',   path: '/api/webhooks/shopping/orders' },
+  { name: 'OTI – Product updated', topic: 'product.updated', path: '/api/webhooks/shopping/products' },
 ] as const
 
 export async function createWcWebhooks(): Promise<{

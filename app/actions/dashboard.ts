@@ -3,6 +3,7 @@
 import { db } from '@/lib/db'
 import { getSetting } from '@/app/actions/settings'
 import { requireAuth } from '@/lib/auth/server'
+import { getSalesOrderReference } from '@/lib/sales-order-display'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -172,7 +173,7 @@ export async function getDashboardData(
     db.salesOrder.findMany({
       where: { status: { in: COMPLETED_STATUSES }, createdAt: { gte: fetchFrom } },
       select: {
-        id: true, wcOrderNumber: true, customerName: true, status: true, createdAt: true,
+        id: true, externalOrderNumber: true, customerName: true, status: true, createdAt: true,
         totalGbp: true, subtotalGbp: true, shippingGbp: true, discountAmount: true, fxRateToGbp: true,
         lines: { select: { cogsGbp: true, qty: true, totalGbp: true, discountAmount: true, productId: true, sku: true, description: true } },
         refunds: { select: { totalGbp: true } },
@@ -213,7 +214,7 @@ export async function getDashboardData(
     db.salesOrder.findMany({
       orderBy: { createdAt: 'desc' },
       take: 10,
-      select: { id: true, wcOrderNumber: true, customerName: true, totalGbp: true, status: true, createdAt: true },
+      select: { id: true, orderNumber: true, externalOrderNumber: true, customerName: true, totalGbp: true, status: true, createdAt: true },
     }),
   ])
 
@@ -372,7 +373,7 @@ export async function getDashboardData(
   // ---------------------------------------------------------------------------
   const recentOrders: RecentOrder[] = allRecent.map((o) => ({
     id: o.id,
-    orderNumber: o.wcOrderNumber ?? o.id.slice(0, 8),
+    orderNumber: getSalesOrderReference(o),
     customerName: o.customerName ?? '—',
     totalGbp: Number(o.totalGbp),
     status: o.status,

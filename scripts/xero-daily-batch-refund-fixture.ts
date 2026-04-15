@@ -71,7 +71,7 @@ async function seed() {
       name: 'Default',
       type: 'STANDARD',
       availableForSale: true,
-      syncToWoocommerce: false,
+      syncToStore: false,
       isDefault: true,
       active: true,
     },

@@ -95,6 +95,14 @@ Implemented:
 
 Status: open
 
+Progress as of 2026-04-15:
+- `lib/shopping.ts` now exposes generic active-connector, delivery-status, and external-link accessors for non-connector code.
+- `lib/trackship.ts` no longer imports WooCommerce delivery helpers directly and no longer reads WooCommerce settings.
+- inventory and sales-order dashboard UI now use generic shopping-link surfaces instead of WooCommerce-specific link helpers or direct `wc_url` reads.
+- the integrations page/dashboard now depends on a generic shopping sync action surface instead of importing the WooCommerce app-facing action module directly.
+- shopping webhook ingress now has a generic `/api/webhooks/shopping/[resource]` entrypoint, with WooCommerce-specific request handling moved into the WooCommerce connector.
+- remaining work is concentrated in the integrations admin surface, webhook ingress routing, and the final sweep of Woo-specific page/model bindings.
+
 Target architecture:
 - non-connector code should know only about a generic shopping connector interface and the currently active shopping connector
 - shopping-specific operations should be exposed through app-facing connector-agnostic facades
@@ -102,11 +110,8 @@ Target architecture:
 - replacing WooCommerce with Shopify should require adding a Shopify connector implementation and changing connector selection/configuration only, not editing core business logic, routes, or shared UI
 
 Current boundary leaks to remove:
-- `lib/trackship.ts` directly imports WooCommerce delivery helpers and reads WooCommerce settings
-- shared/product UI still imports WooCommerce-specific helpers for external product links
-- the integrations action layer and integrations page are hard-wired to WooCommerce concepts instead of going through a generic shopping integration surface
-- app routes are still named and structured as WooCommerce-specific webhook entrypoints
 - some page/UI code still reads `wc_*` settings or `wc*` fields directly rather than consuming generic external-connector view models
+- some operational copy and schema-bound admin settings still use WooCommerce-specific naming even where the app-facing surface is now generic
 
 Planned refactor phases:
 
@@ -120,28 +125,49 @@ Phase 1: Define the generic shopping interface
   - inbound webhook dispatch
 - centralize active shopping connector resolution in one place
 
+Status: completed for delivery-status and external-link surfaces; integration summary and inbound webhook dispatch remain for later phases
+
 Phase 2: Move delivery tracking status behind the connector facade
 - remove direct WooCommerce imports from `lib/trackship.ts`
 - replace WooCommerce-specific settings reads there with connector-agnostic delivery-status access
 - keep TrackShip direct mode as a separate carrier-tracking source, but make the shopping-platform mode call only the generic shopping interface
+
+Status: completed
 
 Phase 3: Replace direct WooCommerce UI helpers with generic external-link helpers
 - replace `WcLinkButton` and sales-order Woo admin link handling with generic shopping connector link actions/components
 - stop reading `wc_url` directly in page code
 - expose connector-provided external destination labels and URLs through the generic shopping facade
 
+Status: completed for inventory product links and sales-order admin links
+
 Phase 4: Generalize the shopping integrations admin surface
 - replace `app/actions/wc-sync.ts` as the app-facing surface with generic shopping integration actions
 - move WooCommerce-specific credential storage, webhook setup, and sync diagnostics behind connector-owned adapters
 - keep the dashboard page generic, with connector-provided sections/details rendered from connector metadata
+
+Status: in progress
+Implemented:
+- app-facing integrations page/dashboard imports now flow through `app/actions/shopping-sync.ts`
+- Xero-side shopping payment method suggestions now also come through the generic shopping integrations surface
+Remaining:
+- connector-owned metadata/sections still need to replace some WooCommerce-specific copy and settings semantics in the shopping tab UI
 
 Phase 5: Generalize inbound webhook routing
 - replace WooCommerce-specific app route assumptions with a generic shopping webhook entrypoint or connector registration layer
 - keep signature verification, topic parsing, and payload mapping inside the connector implementation
 - ensure the app router does not need new top-level business logic when a new shopping connector is added
 
+Status: in progress
+Implemented:
+- generic shopping webhook route: `/api/webhooks/shopping/[resource]`
+- WooCommerce webhook verification and request handling moved into `lib/connectors/woocommerce/webhooks.ts`
+- the old WooCommerce-specific app routes were removed because the app is not yet in production use
+Remaining:
+- finish moving webhook setup/config metadata behind connector-owned admin descriptors where appropriate
+
 Phase 6: Remove remaining Woo-specific reads from shared pages and models
-- audit app pages/components for direct reads of `wc_*` settings, `wcSyncLog`, `wcOrderId`, `wcOrderNumber`, and similar connector-specific state
+- audit app pages/components for direct reads of `wc_*` settings, `shoppingSyncLog`, `externalOrderId`, `externalOrderNumber`, and similar connector-specific state
 - replace them with generic external-sync state/view helpers where possible
 - where persistent schema fields remain Woo-specific for migration reasons, keep them behind generic selectors/view models so page code does not bind to WooCommerce names
 
@@ -155,19 +181,16 @@ Acceptance criteria for this refactor:
 ## Suggested order
 
 Recommended next implementation order:
-1. Define and freeze the generic shopping connector contract in `lib/shopping.ts`
-2. Refactor `lib/trackship.ts` to remove direct WooCommerce knowledge
-3. Replace WooCommerce-specific product/order link UI with generic external-link helpers
-4. Introduce generic shopping integration actions and adapt the integrations dashboard to them
-5. Generalize shopping webhook ingress so new connectors do not require app-level Woo-specific routes
-6. Sweep remaining page/component leaks and tighten test coverage around the generic contract
+1. Sweep remaining page/component/model `wc_*` and `wc*` bindings behind generic selectors/view models
+2. Move remaining shopping-tab copy/metadata setup behind connector-owned descriptors
+3. Tighten test coverage around the generic shopping contract and webhook ingress
 
 ## Suggested next-session starting checklist
 
 1. Re-read `docs/WC-followup-plan.md`.
-2. Start with the `lib/trackship.ts` boundary leak, because it is the clearest non-UI core violation.
-3. After the delivery-status facade exists, replace WooCommerce-specific external link helpers in sales/inventory UI.
-4. Then move the integrations dashboard/actions and webhook ingress onto generic shopping connector surfaces.
+2. Start with the remaining `wc_*`/`wc*` page/model bindings, because the main app-facing sync and webhook surfaces are now genericized.
+3. Then move any remaining shopping-tab connector copy/setup metadata behind connector-owned descriptors.
+4. Finish by adding coverage around the generic shopping contract and the generic webhook ingress.
 
 ## Session continuation code
 
@@ -180,7 +203,7 @@ Goal:
 - make WooCommerce fully replaceable by another shopping connector without changing non-connector code
 
 Current highest-priority leak:
-- lib/trackship.ts still imports WooCommerce delivery helpers directly and reads WooCommerce settings
+- some page and view-model code still reads or labels connector state in WooCommerce-specific terms instead of consuming generic shopping selectors/descriptors
 
 Required approach:
 - keep non-connector code dependent only on generic shopping interfaces
@@ -188,10 +211,9 @@ Required approach:
 - do not introduce new wc_* reads or direct imports from lib/connectors/woocommerce outside the generic shopping boundary
 
 Suggested order:
-1. expand lib/shopping.ts with a generic delivery-status/external-link interface as needed
-2. refactor lib/trackship.ts to use that interface
-3. replace WooCommerce-specific external link helpers in sales/inventory UI
-4. then move shopping integration actions/dashboard and webhook ingress onto generic surfaces
+1. sweep remaining page/component `wc_*` and `wc*` bindings behind generic selectors/view models
+2. move the rest of the shopping integrations tab copy/setup metadata behind connector-owned descriptors
+3. add or update coverage for the generic shopping contract and generic webhook ingress
 
 Acceptance criteria:
 - no non-connector code imports from lib/connectors/woocommerce/** except a generic bootstrap/registration layer if still needed

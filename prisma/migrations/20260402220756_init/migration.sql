@@ -38,10 +38,10 @@ CREATE TYPE "XeroSyncType" AS ENUM ('PURCHASE_INVOICE', 'COGS_JOURNAL');
 CREATE TYPE "XeroSyncStatus" AS ENUM ('PENDING', 'SYNCED', 'FAILED');
 
 -- CreateEnum
-CREATE TYPE "WcSyncDirection" AS ENUM ('TO_WC', 'FROM_WC');
+CREATE TYPE "ShoppingSyncDirection" AS ENUM ('TO_CONNECTOR', 'FROM_CONNECTOR');
 
 -- CreateEnum
-CREATE TYPE "WcSyncStatus" AS ENUM ('PENDING', 'SYNCED', 'FAILED');
+CREATE TYPE "ShoppingSyncStatus" AS ENUM ('PENDING', 'SYNCED', 'FAILED');
 
 -- CreateEnum
 CREATE TYPE "ActivityEntityType" AS ENUM ('USER', 'PRODUCT', 'WAREHOUSE', 'SUPPLIER', 'PURCHASE_ORDER', 'SALES_ORDER', 'STOCK_TRANSFER', 'STOCK_COUNT', 'PRODUCTION_ORDER', 'SETTING', 'IMPORT');
@@ -160,7 +160,7 @@ CREATE TABLE "warehouses" (
     "name" TEXT NOT NULL,
     "type" "WarehouseType" NOT NULL DEFAULT 'STANDARD',
     "availableForSale" BOOLEAN NOT NULL DEFAULT true,
-    "syncToWoocommerce" BOOLEAN NOT NULL DEFAULT false,
+    "syncToStore" BOOLEAN NOT NULL DEFAULT false,
     "addressLine1" TEXT,
     "addressLine2" TEXT,
     "city" TEXT,
@@ -186,7 +186,7 @@ CREATE TABLE "products" (
     "barcode" TEXT,
     "weight" DECIMAL(10,4),
     "active" BOOLEAN NOT NULL DEFAULT true,
-    "wcProductId" INTEGER,
+    "externalProductId" INTEGER,
     "wcVariantId" INTEGER,
     "salesPriceGbp" DECIMAL(12,4),
     "salesPriceTaxInclusive" BOOLEAN NOT NULL DEFAULT false,
@@ -425,8 +425,8 @@ CREATE TABLE "purchase_return_lines" (
 -- CreateTable
 CREATE TABLE "sales_orders" (
     "id" TEXT NOT NULL,
-    "wcOrderId" INTEGER,
-    "wcOrderNumber" TEXT,
+    "externalOrderId" INTEGER,
+    "externalOrderNumber" TEXT,
     "status" "SalesOrderStatus" NOT NULL DEFAULT 'PENDING',
     "currency" TEXT NOT NULL DEFAULT 'GBP',
     "fxRateToGbp" DECIMAL(18,8) NOT NULL DEFAULT 1,
@@ -447,8 +447,8 @@ CREATE TABLE "sales_orders" (
     "trackingNumber" TEXT,
     "notes" TEXT,
     "internalNotes" TEXT,
-    "wcCreatedAt" TIMESTAMP(3),
-    "wcUpdatedAt" TIMESTAMP(3),
+    "externalCreatedAt" TIMESTAMP(3),
+    "externalUpdatedAt" TIMESTAMP(3),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
@@ -460,7 +460,7 @@ CREATE TABLE "sales_order_lines" (
     "id" TEXT NOT NULL,
     "orderId" TEXT NOT NULL,
     "productId" TEXT,
-    "wcLineItemId" INTEGER,
+    "externalLineItemId" INTEGER,
     "description" TEXT NOT NULL,
     "sku" TEXT,
     "qty" DECIMAL(12,4) NOT NULL,
@@ -480,7 +480,7 @@ CREATE TABLE "sales_order_lines" (
 CREATE TABLE "sales_order_refunds" (
     "id" TEXT NOT NULL,
     "orderId" TEXT NOT NULL,
-    "wcRefundId" INTEGER,
+    "externalRefundId" INTEGER,
     "returnWarehouseId" TEXT,
     "reason" TEXT,
     "totalForeign" DECIMAL(18,4) NOT NULL,
@@ -661,19 +661,19 @@ CREATE TABLE "xero_sync_logs" (
 );
 
 -- CreateTable
-CREATE TABLE "wc_sync_logs" (
+CREATE TABLE "shopping_sync_logs" (
     "id" TEXT NOT NULL,
-    "direction" "WcSyncDirection" NOT NULL,
-    "status" "WcSyncStatus" NOT NULL DEFAULT 'PENDING',
+    "direction" "ShoppingSyncDirection" NOT NULL,
+    "status" "ShoppingSyncStatus" NOT NULL DEFAULT 'PENDING',
     "entityType" TEXT NOT NULL,
     "entityId" TEXT,
-    "wcId" INTEGER,
+    "externalId" INTEGER,
     "payload" JSONB,
     "errorMessage" TEXT,
     "syncedAt" TIMESTAMP(3),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-    CONSTRAINT "wc_sync_logs_pkey" PRIMARY KEY ("id")
+    CONSTRAINT "shopping_sync_logs_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -710,7 +710,7 @@ CREATE UNIQUE INDEX "products_sku_key" ON "products"("sku");
 CREATE INDEX "products_parentId_idx" ON "products"("parentId");
 
 -- CreateIndex
-CREATE INDEX "products_wcProductId_idx" ON "products"("wcProductId");
+CREATE INDEX "products_externalProductId_idx" ON "products"("externalProductId");
 
 -- CreateIndex
 CREATE INDEX "products_wcVariantId_idx" ON "products"("wcVariantId");
@@ -737,10 +737,10 @@ CREATE UNIQUE INDEX "purchase_orders_reference_key" ON "purchase_orders"("refere
 CREATE UNIQUE INDEX "landed_cost_links_primaryPoId_freightPoId_key" ON "landed_cost_links"("primaryPoId", "freightPoId");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "sales_orders_wcOrderId_key" ON "sales_orders"("wcOrderId");
+CREATE UNIQUE INDEX "sales_orders_externalOrderId_key" ON "sales_orders"("externalOrderId");
 
 -- CreateIndex
-CREATE INDEX "sales_orders_wcOrderId_idx" ON "sales_orders"("wcOrderId");
+CREATE INDEX "sales_orders_externalOrderId_idx" ON "sales_orders"("externalOrderId");
 
 -- CreateIndex
 CREATE INDEX "sales_orders_status_idx" ON "sales_orders"("status");
@@ -761,7 +761,7 @@ CREATE UNIQUE INDEX "xero_accounts_xeroId_key" ON "xero_accounts"("xeroId");
 CREATE INDEX "xero_sync_logs_referenceType_referenceId_idx" ON "xero_sync_logs"("referenceType", "referenceId");
 
 -- CreateIndex
-CREATE INDEX "wc_sync_logs_entityType_entityId_idx" ON "wc_sync_logs"("entityType", "entityId");
+CREATE INDEX "shopping_sync_logs_entityType_entityId_idx" ON "shopping_sync_logs"("entityType", "entityId");
 
 -- CreateIndex
 CREATE INDEX "activity_logs_entityType_entityId_idx" ON "activity_logs"("entityType", "entityId");
@@ -929,10 +929,10 @@ ALTER TABLE "xero_sync_logs" ADD CONSTRAINT "xero_sync_po" FOREIGN KEY ("referen
 ALTER TABLE "xero_sync_logs" ADD CONSTRAINT "xero_sync_cogs" FOREIGN KEY ("referenceId") REFERENCES "cogs_entries"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "wc_sync_logs" ADD CONSTRAINT "wc_sync_product" FOREIGN KEY ("entityId") REFERENCES "products"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE "shopping_sync_logs" ADD CONSTRAINT "wc_sync_product" FOREIGN KEY ("entityId") REFERENCES "products"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "wc_sync_logs" ADD CONSTRAINT "wc_sync_order" FOREIGN KEY ("entityId") REFERENCES "sales_orders"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+ALTER TABLE "shopping_sync_logs" ADD CONSTRAINT "wc_sync_order" FOREIGN KEY ("entityId") REFERENCES "sales_orders"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "activity_logs" ADD CONSTRAINT "activity_logs_userId_fkey" FOREIGN KEY ("userId") REFERENCES "users"("id") ON DELETE SET NULL ON UPDATE CASCADE;

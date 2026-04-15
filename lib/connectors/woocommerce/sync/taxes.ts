@@ -3,7 +3,7 @@
  *
  * For every unique WC tax rate we:
  *   1. Create (or reuse) an IMS TaxRate with the same name + percentage.
- *   2. Upsert a WcTaxRateMapping row linking the WC rate id to the IMS rate.
+ *   2. Upsert a ShoppingTaxRateMapping row linking the WC rate id to the IMS rate.
  *
  * This gives us a 1:1 mapping keyed on the WC rate id, which is what
  * WooCommerce order line items actually reference (line.taxes[].id).
@@ -63,7 +63,7 @@ export async function importWcTaxRates(): Promise<ImportWcTaxResult> {
   let mappedRates = 0
 
   // Walk every WC rate, ensure a matching IMS TaxRate exists (deduped by name),
-  // then upsert the WcTaxRateMapping row.
+  // then upsert the ShoppingTaxRateMapping row.
   const nameToImsId = new Map<string, string>()
 
   for (const wcRate of rates) {
@@ -99,21 +99,21 @@ export async function importWcTaxRates(): Promise<ImportWcTaxResult> {
 
     // 2. Upsert the WC rate id → IMS tax rate mapping.
     const ratePct = parseFloat(wcRate.rate) || 0
-    await db.wcTaxRateMapping.upsert({
-      where: { wcTaxRateId: wcRate.id },
+    await db.shoppingTaxRateMapping.upsert({
+      where: { externalTaxRateId: wcRate.id },
       create: {
-        wcTaxRateId: wcRate.id,
-        wcName: name,
-        wcCountry: wcRate.country || null,
-        wcRatePct: ratePct.toFixed(4),
-        wcClass: wcRate.class || null,
+        externalTaxRateId: wcRate.id,
+        externalName: name,
+        externalCountry: wcRate.country || null,
+        externalRatePct: ratePct.toFixed(4),
+        externalClass: wcRate.class || null,
         taxRateId: imsTaxRateId,
       },
       update: {
-        wcName: name,
-        wcCountry: wcRate.country || null,
-        wcRatePct: ratePct.toFixed(4),
-        wcClass: wcRate.class || null,
+        externalName: name,
+        externalCountry: wcRate.country || null,
+        externalRatePct: ratePct.toFixed(4),
+        externalClass: wcRate.class || null,
         taxRateId: imsTaxRateId,
       },
     })

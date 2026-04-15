@@ -36,7 +36,7 @@ type Props = {
   order: SoDetail
   warehouses: WarehouseInfo[]
   currencies: CurrencyRow[]
-  wcUrl?: string
+  externalOrderLink?: { label: string; url: string }
   stockLevels: Record<string, Record<string, StockLevelEntry>>
   initialAllocations: AllocationRow[]
   initialShipments: ShipmentRow[]
@@ -726,7 +726,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stockLevels, initialAllocations, initialShipments, carriers, deliveryTrackingEnabled, accountingInvoiceUrlTemplate, accountingSyncEnabled }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLink, stockLevels, initialAllocations, initialShipments, carriers, deliveryTrackingEnabled, accountingInvoiceUrlTemplate, accountingSyncEnabled }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [showShip, setShowShip] = useState(false)
@@ -932,9 +932,9 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
           <Button variant="outline" size="sm" onClick={() => setShowNotes(true)}>
             <Pencil className="h-4 w-4 mr-1" />Notes
           </Button>
-          {so.wcOrderId && wcUrl && (
-            <Button variant="outline" size="sm" onClick={() => window.open(`${wcUrl}/wp-admin/post.php?post=${so.wcOrderId}&action=edit`, '_blank')}>
-              <ExternalLink className="h-4 w-4 mr-1" />WooCommerce
+          {externalOrderLink && (
+            <Button variant="outline" size="sm" onClick={() => window.open(externalOrderLink.url, '_blank')}>
+              <ExternalLink className="h-4 w-4 mr-1" />{externalOrderLink.label}
             </Button>
           )}
           {canCancel && (
@@ -1005,12 +1005,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
         </div>
         <div>
           <span className="text-muted-foreground">Source</span>
-          <p className="font-medium flex items-center gap-1.5">
-            {so.wcOrderId ? (
-              // eslint-disable-next-line @next/next/no-img-element
-              <img src="/images/woocommerce.svg" alt="WooCommerce" className="h-4 w-auto" />
-            ) : 'Manual'}
-          </p>
+          <p className="font-medium">{so.sourceLabel}</p>
         </div>
         <div>
           <span className="text-muted-foreground">Ship From</span>
@@ -1032,7 +1027,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, wcUrl, stock
         )}
         <div>
           <span className="text-muted-foreground">Order Date</span>
-          <p className="font-medium">{new Date(so.wcCreatedAt ?? so.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}{', '}{new Date(so.wcCreatedAt ?? so.createdAt).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}</p>
+          <p className="font-medium">{new Date(so.externalOrderDate ?? so.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}{', '}{new Date(so.externalOrderDate ?? so.createdAt).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })}</p>
         </div>
         {so.expectedDelivery && <div><span className="text-muted-foreground">Expected Delivery</span><p className="font-medium">{new Date(so.expectedDelivery).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}</p></div>}
         {so.salesRep && <div><span className="text-muted-foreground">Sales Rep</span><p className="font-medium">{so.salesRep}</p></div>}

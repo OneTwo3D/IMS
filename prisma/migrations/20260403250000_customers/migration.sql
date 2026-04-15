@@ -7,7 +7,7 @@ CREATE TABLE "customers" (
     "billingAddress" JSONB,
     "shippingAddress" JSONB,
     "notes" TEXT,
-    "wcCustomerId" INTEGER,
+    "externalCustomerId" INTEGER,
     "active" BOOLEAN NOT NULL DEFAULT true,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
@@ -15,7 +15,7 @@ CREATE TABLE "customers" (
     CONSTRAINT "customers_pkey" PRIMARY KEY ("id")
 );
 
-CREATE UNIQUE INDEX "customers_wcCustomerId_key" ON "customers"("wcCustomerId");
+CREATE UNIQUE INDEX "customers_externalCustomerId_key" ON "customers"("externalCustomerId");
 
 ALTER TABLE "sales_orders" ADD COLUMN "customerId" TEXT;
 ALTER TABLE "sales_orders" ADD CONSTRAINT "sales_orders_customerId_fkey" FOREIGN KEY ("customerId") REFERENCES "customers"("id") ON DELETE SET NULL ON UPDATE CASCADE;

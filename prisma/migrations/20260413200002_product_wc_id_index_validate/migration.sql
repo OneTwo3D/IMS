@@ -1,4 +1,4 @@
--- Post-build validity check for products_wcProductId_key.
+-- Post-build validity check for products_externalProductId_key.
 --
 -- The previous migration creates the unique index with CONCURRENTLY.
 -- Concurrent index builds can leave the index in an INVALID state if
@@ -23,23 +23,23 @@ BEGIN
     INTO v_oid, v_valid, v_unique
   FROM pg_class c
   JOIN pg_index i ON i.indexrelid = c.oid
-  WHERE c.relname = 'products_wcProductId_key'
+  WHERE c.relname = 'products_externalProductId_key'
     AND c.relnamespace = (
       SELECT oid FROM pg_namespace WHERE nspname = current_schema()
     );
 
   IF v_oid IS NULL THEN
     RAISE EXCEPTION
-      'products_wcProductId_key does not exist. The preceding CONCURRENTLY build failed or was rolled back. Remediate per 20260413200001_product_wc_id_index.';
+      'products_externalProductId_key does not exist. The preceding CONCURRENTLY build failed or was rolled back. Remediate per 20260413200001_product_wc_id_index.';
   END IF;
 
   IF NOT v_unique THEN
     RAISE EXCEPTION
-      'products_wcProductId_key exists but is NOT unique. WooCommerce stock-sync collision safety depends on a unique constraint; aborting.';
+      'products_externalProductId_key exists but is NOT unique. WooCommerce stock-sync collision safety depends on a unique constraint; aborting.';
   END IF;
 
   IF NOT v_valid THEN
     RAISE EXCEPTION
-      'products_wcProductId_key exists but is INVALID. A prior CONCURRENTLY build was interrupted or hit a duplicate. Drop the invalid index and rerun migration 20260413200001_product_wc_id_index: DROP INDEX IF EXISTS "products_wcProductId_key";';
+      'products_externalProductId_key exists but is INVALID. A prior CONCURRENTLY build was interrupted or hit a duplicate. Drop the invalid index and rerun migration 20260413200001_product_wc_id_index: DROP INDEX IF EXISTS "products_externalProductId_key";';
   END IF;
 END $$;

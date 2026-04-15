@@ -60,7 +60,7 @@ export async function purgeExpiredData(): Promise<{
   if (syncMonths > 0) {
     const cutoff = monthsAgo(syncMonths)
     const [wc, acct] = await Promise.all([
-      db.wcSyncLog.deleteMany({ where: { createdAt: { lt: cutoff } } }),
+      db.shoppingSyncLog.deleteMany({ where: { createdAt: { lt: cutoff } } }),
       db.accountingSyncLog.deleteMany({ where: { createdAt: { lt: cutoff } } }),
     ])
     syncLogsDeleted = wc.count + acct.count

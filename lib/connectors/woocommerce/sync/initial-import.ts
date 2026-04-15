@@ -97,12 +97,12 @@ async function runInitialImport(progress: InitialImportProgress) {
     progress.message = 'Importing active orders\u2026'
     await saveProgress(progress)
 
-    // Deduplication: pre-load existing wcOrderIds from SalesOrder
+    // Deduplication: pre-load existing externalOrderIds from SalesOrder
     const existingOrders = await db.salesOrder.findMany({
-      where: { wcOrderId: { not: null } },
-      select: { wcOrderId: true },
+      where: { externalOrderId: { not: null } },
+      select: { externalOrderId: true },
     })
-    const importedOrderIds = new Set(existingOrders.map((o) => o.wcOrderId))
+    const importedOrderIds = new Set(existingOrders.map((o) => o.externalOrderId))
 
     let page = 1
     let totalPages = 1

@@ -50,10 +50,10 @@ test.describe('@external @wc WooCommerce existing-product stock push', () => {
   test('syncs a Woo product into IMS, adds stock, then pushes stock back to Woo', async ({ page }) => {
     test.setTimeout(180000)
 
-    const previousWarehouseFlag = psql(`select "syncToWoocommerce"::text from warehouses where code = 'DEFAULT' limit 1;`)
+    const previousWarehouseFlag = psql(`select "syncToStore"::text from warehouses where code = 'DEFAULT' limit 1;`)
     if (!previousWarehouseFlag) throw new Error('DEFAULT warehouse missing')
 
-    psql(`update warehouses set "syncToWoocommerce" = true where code = 'DEFAULT';`)
+    psql(`update warehouses set "syncToStore" = true where code = 'DEFAULT';`)
 
     try {
       await openWooCommerceConnector(page)
@@ -69,8 +69,8 @@ test.describe('@external @wc WooCommerce existing-product stock push', () => {
 
       const productRow = psql(`select p.id || '|' || p.sku || '|' || replace(p.name, '|', '/')
         from products p
-        join wc_sync_logs l on l."entityId" = p.id
-        where l.direction = 'FROM_WC'
+        join shopping_sync_logs l on l."entityId" = p.id
+        where l.direction = 'FROM_CONNECTOR'
           and l.status = 'SYNCED'
           and l."entityType" = 'Product'
           and p.active = true
@@ -107,16 +107,16 @@ test.describe('@external @wc WooCommerce existing-product stock push', () => {
       await expect(syncResult).not.toHaveAttribute('data-sync-status', 'error')
       await expect(syncResult).toContainText(/synced|candidate|matched/i, { timeout: 120000 })
 
-      const wcProductId = psql(`select coalesce("wcProductId"::text, '') from products where id = '${productId}' limit 1;`)
-      if (!wcProductId) throw new Error(`Selected Woo-linked product ${productSku} (${productId}) is missing wcProductId after sync`)
+      const externalProductId = psql(`select coalesce("externalProductId"::text, '') from products where id = '${productId}' limit 1;`)
+      if (!externalProductId) throw new Error(`Selected Woo-linked product ${productSku} (${productId}) is missing externalProductId after sync`)
 
       await expect.poll(() => (
-        psql(`select id from wc_sync_logs where "entityType" = 'StockLevel' and "wcId" = ${wcProductId} and direction = 'TO_WC' and status = 'SYNCED' order by "createdAt" desc limit 1;`)
+        psql(`select id from shopping_sync_logs where "entityType" = 'StockLevel' and "externalId" = ${externalProductId} and direction = 'TO_CONNECTOR' and status = 'SYNCED' order by "createdAt" desc limit 1;`)
       ), {
         timeout: 120000,
       }).not.toEqual('')
     } finally {
-      psql(`update warehouses set "syncToWoocommerce" = ${previousWarehouseFlag === 'true' ? 'true' : 'false'} where code = 'DEFAULT';`)
+      psql(`update warehouses set "syncToStore" = ${previousWarehouseFlag === 'true' ? 'true' : 'false'} where code = 'DEFAULT';`)
     }
   })
 })

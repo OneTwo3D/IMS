@@ -34,7 +34,7 @@ type Props = {
   paymentMethodCombos: Array<{ paymentMethod: string; currency: string }>
   paymentAccountMap: string
   currencies: Array<{ code: string; name: string }>
-  wcPaymentGateways: Array<{ id: string; title: string }>
+  shoppingPaymentMethods: Array<{ id: string; title: string }>
   imsTaxRates: TaxRateRow[]
   xeroTaxRates: Array<{ taxType: string; name: string; rate: number }>
   readiness: XeroSyncReadiness
@@ -105,7 +105,7 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
   return JSON.stringify(map)
 }
 
-export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, wcPaymentGateways, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: Props) {
+export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
@@ -469,7 +469,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
             <datalist id="payment-method-suggestions">
               {Array.from(
                 new Map([
-                  ...wcPaymentGateways.map(g => [g.id, g.title] as const),
+                  ...shoppingPaymentMethods.map(g => [g.id, g.title] as const),
                   ...paymentMethodCombos.map(c => [c.paymentMethod, c.paymentMethod] as const),
                 ]).entries(),
               ).map(([id, title]) => (
@@ -1052,7 +1052,7 @@ function DailyBatchPanel({
           <PreviewOrderList
             title="A1 contributing orders"
             rows={preview.groupA1.orders.map((o) => ({
-              id: o.id, label: o.wcOrderNumber ?? o.orderNumber ?? o.id.slice(0, 8), amount: o.amount,
+              id: o.id, label: o.displayOrderNumber, amount: o.amount,
             }))}
           />
         )}
@@ -1060,7 +1060,7 @@ function DailyBatchPanel({
           <PreviewOrderList
             title="A2 contributing orders"
             rows={preview.groupA2.orders.map((o) => ({
-              id: o.id, label: o.wcOrderNumber ?? o.orderNumber ?? o.id.slice(0, 8), amount: o.amount,
+              id: o.id, label: o.displayOrderNumber, amount: o.amount,
             }))}
           />
         )}
@@ -1229,7 +1229,7 @@ function PreviewShipmentList({ shipments }: { shipments: DailyBatchPreview['grou
             <TableBody>
               {shipments.map((s) => (
                 <TableRow key={s.id}>
-                  <TableCell className="font-mono text-xs">{s.wcOrderNumber ?? s.orderNumber ?? s.orderId.slice(0, 8)}</TableCell>
+                  <TableCell className="font-mono text-xs">{s.displayOrderNumber}</TableCell>
                   <TableCell className="text-right font-mono text-xs">{formatGbp(s.revenue)}</TableCell>
                   <TableCell className="text-right font-mono text-xs">{formatGbp(s.cogs)}</TableCell>
                 </TableRow>

@@ -172,9 +172,9 @@ The plugin is compatible with WooCommerce High-Performance Order Storage (HPOS).
 
 The **Sync Log** tab shows the last 100 synchronisation events. Each entry includes:
 
-- **Direction** — From WC (import) or To WC (push)
+- **Direction** — From store (import) or To store (push)
 - **Type** — ORDER, Product, or StockLevel
-- **WC ID** — the WooCommerce entity ID
+- **External ID** — the storefront entity ID
 - **Status** — SYNCED, FAILED, or SKIPPED
 - **Error** — details if the sync failed
 

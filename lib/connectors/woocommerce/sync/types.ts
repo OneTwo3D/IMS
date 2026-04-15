@@ -227,7 +227,7 @@ export type SyncResult = {
 export type StockSyncResult = SyncResult & {
   /** Products with stocked warehouses that are candidates for sync. */
   candidates: number
-  /** Candidates whose wcProductId is known (either pre-stored or resolved this run). */
+  /** Candidates whose externalProductId is known (either pre-stored or resolved this run). */
   matched: number
   /** Candidates whose SKU was not found in WooCommerce. */
   unmatched: number

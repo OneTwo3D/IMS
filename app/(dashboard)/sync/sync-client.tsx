@@ -9,18 +9,29 @@ import { Label } from '@/components/ui/label'
 import { Card } from '@/components/ui/card'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
-  saveWcSyncSettings, saveWcCredentials, updateWcTaxRateMapping, deleteWcTaxRateMapping, upsertWcStatusMapping,
-  triggerManualSync, importWcTaxRatesFromApi, createWcWebhooks, resetWcProductIdCache,
-  type WcSyncSettings, type TaxRateMappingRow, type StatusMappingRow, type SyncLogRow,
-} from '@/app/actions/wc-sync'
+  createShoppingWebhooks,
+  deleteShoppingTaxRateMapping,
+  importShoppingTaxRatesFromApi,
+  resetShoppingProductIdCache,
+  saveShoppingConnectorCredentials,
+  saveShoppingSyncSettings,
+  triggerShoppingManualSync,
+  updateShoppingTaxRateMapping,
+  upsertShoppingStatusMapping,
+  type ShoppingConnectorCredentials,
+  type ShoppingStatusMappingRow,
+  type ShoppingSyncLogRow,
+  type ShoppingSyncSettings,
+  type ShoppingTaxRateMappingRow,
+} from '@/app/actions/shopping-sync'
 
 type Props = {
-  settings: WcSyncSettings
-  taxMappings: TaxRateMappingRow[]
-  statusMappings: StatusMappingRow[]
-  logs: SyncLogRow[]
+  settings: ShoppingSyncSettings
+  taxMappings: ShoppingTaxRateMappingRow[]
+  statusMappings: ShoppingStatusMappingRow[]
+  logs: ShoppingSyncLogRow[]
   taxRates: { id: string; name: string }[]
-  wcCredentials: { url: string; key: string; secret: string; secretMasked: boolean }
+  shoppingCredentials: ShoppingConnectorCredentials
 }
 
 const IMS_STATUSES = [
@@ -143,7 +154,7 @@ function WebhookSecretField({
     setWebhookResult(null)
     setWebhookError(false)
     try {
-      const result = await createWcWebhooks()
+      const result = await createShoppingWebhooks()
       if (result.success) {
         const parts: string[] = []
         if (result.created > 0) parts.push(`Created ${result.created} webhook(s)`)
@@ -183,9 +194,9 @@ function WebhookSecretField({
         <table className="text-xs w-full max-w-lg">
           <thead><tr className="text-left"><th className="pr-3 pb-0.5 font-medium">Topic</th><th className="pr-3 pb-0.5 font-medium">Delivery URL</th></tr></thead>
           <tbody>
-            <tr><td className="pr-3 py-0.5">Order created</td><td className="py-0.5"><code className="bg-muted px-1 rounded">/api/webhooks/woocommerce/orders</code></td></tr>
-            <tr><td className="pr-3 py-0.5">Order updated</td><td className="py-0.5"><code className="bg-muted px-1 rounded">/api/webhooks/woocommerce/orders</code></td></tr>
-            <tr><td className="pr-3 py-0.5">Product updated</td><td className="py-0.5"><code className="bg-muted px-1 rounded">/api/webhooks/woocommerce/products</code></td></tr>
+            <tr><td className="pr-3 py-0.5">Order created</td><td className="py-0.5"><code className="bg-muted px-1 rounded">/api/webhooks/shopping/orders</code></td></tr>
+            <tr><td className="pr-3 py-0.5">Order updated</td><td className="py-0.5"><code className="bg-muted px-1 rounded">/api/webhooks/shopping/orders</code></td></tr>
+            <tr><td className="pr-3 py-0.5">Product updated</td><td className="py-0.5"><code className="bg-muted px-1 rounded">/api/webhooks/shopping/products</code></td></tr>
           </tbody>
         </table>
         <p>Use the same secret for all webhooks. The product webhook is only needed if product sync is enabled. Refunds are handled automatically via order updates.</p>
@@ -248,13 +259,13 @@ function WebhookSecretField({
       )}
 
       <p className="text-xs text-muted-foreground">
-        Webhook URL: <code className="bg-muted px-1 rounded">/api/webhooks/woocommerce/orders</code>
+        Webhook URL: <code className="bg-muted px-1 rounded">/api/webhooks/shopping/orders</code>
       </p>
     </div>
   )
 }
 
-export function SyncClient({ settings: init, taxMappings, statusMappings, logs, taxRates, wcCredentials }: Props) {
+export function SyncClient({ settings: init, taxMappings, statusMappings, logs, taxRates, shoppingCredentials }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
@@ -263,9 +274,9 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   const [syncingType, setSyncingType] = useState<'orders' | 'products' | 'stock' | null>(null)
   const [importingTax, setImportingTax] = useState(false)
   const [taxImportMsg, setTaxImportMsg] = useState<string | null>(null)
-  const [wcUrl, setWcUrl] = useState(wcCredentials.url)
-  const [wcKey, setWcKey] = useState(wcCredentials.key)
-  const [wcSecret, setWcSecret] = useState(wcCredentials.secret)
+  const [wcUrl, setWcUrl] = useState(shoppingCredentials.url)
+  const [wcKey, setWcKey] = useState(shoppingCredentials.key)
+  const [wcSecret, setWcSecret] = useState(shoppingCredentials.secret)
   const wcConfigured = !!wcUrl && !!wcKey && !!wcSecret
   const initialImportDone = s.wc_initial_import_completed === 'true'
   const orderWebhookActive = (() => {
@@ -351,8 +362,8 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   function handleSave() {
     setSaved(false)
     startTransition(async () => {
-      await saveWcCredentials(wcUrl.trim(), wcKey.trim(), wcSecret.trim())
-      await saveWcSyncSettings(s)
+      await saveShoppingConnectorCredentials(wcUrl.trim(), wcKey.trim(), wcSecret.trim())
+      await saveShoppingSyncSettings(s)
       router.refresh()
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
@@ -363,7 +374,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
     setSyncResult(null)
     setSyncingType(type)
     startTransition(async () => {
-      const result = await triggerManualSync(type)
+      const result = await triggerShoppingManualSync(type)
       setSyncingType(null)
       if (result.success) {
         // formatSyncResult inspects the payload for in-band failure
@@ -381,7 +392,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   function handleResetWcIdCache() {
     setSyncResult(null)
     startTransition(async () => {
-      const result = await resetWcProductIdCache()
+      const result = await resetShoppingProductIdCache()
       setSyncResult({
         text: `Reset cached WC product IDs — ${result.wipedMappings} mapping(s) cleared`,
         isError: false,
@@ -390,17 +401,17 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
     })
   }
 
-  function handleChangeTaxMapping(wcTaxRateId: number, taxRateId: string) {
+  function handleChangeTaxMapping(externalTaxRateId: number, taxRateId: string) {
     if (!taxRateId) return
     startTransition(async () => {
-      await updateWcTaxRateMapping(wcTaxRateId, taxRateId)
+      await updateShoppingTaxRateMapping(externalTaxRateId, taxRateId)
       router.refresh()
     })
   }
 
   function handleDeleteTaxMapping(id: string) {
     startTransition(async () => {
-      await deleteWcTaxRateMapping(id)
+      await deleteShoppingTaxRateMapping(id)
       router.refresh()
     })
   }
@@ -408,7 +419,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   async function handleImportTaxRates() {
     setTaxImportMsg(null)
     setImportingTax(true)
-    const result = await importWcTaxRatesFromApi()
+    const result = await importShoppingTaxRatesFromApi()
     setImportingTax(false)
     if (result.success) {
       const imported = result.importedRates ?? 0
@@ -431,9 +442,9 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
     }
   }
 
-  function handleStatusMappingChange(wcStatus: string, imsStatus: string) {
+  function handleStatusMappingChange(externalStatus: string, imsStatus: string) {
     startTransition(async () => {
-      await upsertWcStatusMapping(wcStatus, imsStatus)
+      await upsertShoppingStatusMapping(externalStatus, imsStatus)
       router.refresh()
     })
   }
@@ -616,7 +627,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
               onChange={(v) => setS({ ...s, wc_webhook_secret: v })}
               hadSecretOnLoad={!!init.wc_webhook_secret}
               onSave={async (secret) => {
-                await saveWcSyncSettings({ wc_webhook_secret: secret })
+                await saveShoppingSyncSettings({ wc_webhook_secret: secret })
               }}
             />
 
@@ -701,7 +712,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
               <input type="checkbox" checked={s.wc_stock_sync_enabled === 'true'} onChange={(e) => setS({ ...s, wc_stock_sync_enabled: e.target.checked ? 'true' : 'false' })} className="rounded border-input" />
               <div>
                 <span className="text-sm font-medium">Push stock levels to WooCommerce</span>
-                <p className="text-xs text-muted-foreground">Syncs available stock from warehouses with &ldquo;Sync to WooCommerce&rdquo; enabled</p>
+                <p className="text-xs text-muted-foreground">Syncs available stock from warehouses with store sync enabled</p>
               </div>
             </label>
             {s.wc_stock_sync_enabled === 'true' && (
@@ -763,7 +774,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
             </div>
             <Button variant="outline" size="sm" className="h-8 shrink-0" onClick={handleImportTaxRates} disabled={importingTax || !wcConfigured}>
               {importingTax ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowDownToLine className="h-3 w-3 mr-1" />}
-              Import from WooCommerce
+              Import from Store
             </Button>
           </div>
           {taxImportMsg && (
@@ -785,14 +796,14 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
               <TableBody>
                 {taxMappings.map((m) => (
                   <TableRow key={m.id}>
-                    <TableCell>{m.wcName} <span className="text-muted-foreground text-xs">#{m.wcTaxRateId}</span></TableCell>
-                    <TableCell className="font-mono text-xs text-muted-foreground">{m.wcCountry ?? '—'}</TableCell>
-                    <TableCell className="text-right font-mono text-xs">{m.wcRatePct.toFixed(2)}%</TableCell>
-                    <TableCell className="font-mono text-xs text-muted-foreground">{m.wcClass ?? 'standard'}</TableCell>
+                    <TableCell>{m.externalName} <span className="text-muted-foreground text-xs">#{m.externalTaxRateId}</span></TableCell>
+                    <TableCell className="font-mono text-xs text-muted-foreground">{m.externalCountry ?? '—'}</TableCell>
+                    <TableCell className="text-right font-mono text-xs">{m.externalRatePct.toFixed(2)}%</TableCell>
+                    <TableCell className="font-mono text-xs text-muted-foreground">{m.externalClass ?? 'standard'}</TableCell>
                     <TableCell>
                       <select
                         value={m.taxRateId}
-                        onChange={(e) => handleChangeTaxMapping(m.wcTaxRateId, e.target.value)}
+                        onChange={(e) => handleChangeTaxMapping(m.externalTaxRateId, e.target.value)}
                         className="h-7 rounded-md border border-input bg-background px-2 text-xs w-full max-w-xs"
                         disabled={isPending}
                       >
@@ -810,7 +821,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
             </Table>
           ) : (
             <p className="text-xs text-muted-foreground italic">
-              No tax rates imported yet. Click &quot;Import from WooCommerce&quot; to fetch and auto-map all WC tax rates.
+              No tax rates imported yet. Click &quot;Import from Store&quot; to fetch and auto-map external tax rates.
             </p>
           )}
         </Card>
@@ -832,9 +843,9 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
             <TableBody>
               {statusMappings.map((m) => (
                 <TableRow key={m.id}>
-                  <TableCell className="font-mono text-xs">{m.wcStatus}</TableCell>
+                  <TableCell className="font-mono text-xs">{m.externalStatus}</TableCell>
                   <TableCell>
-                    <select value={m.imsStatus} onChange={(e) => handleStatusMappingChange(m.wcStatus, e.target.value)} className="h-7 rounded-md border border-input bg-background px-2 text-xs" disabled={isPending}>
+                    <select value={m.imsStatus} onChange={(e) => handleStatusMappingChange(m.externalStatus, e.target.value)} className="h-7 rounded-md border border-input bg-background px-2 text-xs" disabled={isPending}>
                       {IMS_STATUSES.map((st) => (<option key={st} value={st}>{st}</option>))}
                     </select>
                   </TableCell>
@@ -859,7 +870,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
                     <TableHead className="text-xs">Time</TableHead>
                     <TableHead className="text-xs">Direction</TableHead>
                     <TableHead className="text-xs">Type</TableHead>
-                    <TableHead className="text-xs">WC ID</TableHead>
+                    <TableHead className="text-xs">External ID</TableHead>
                     <TableHead className="text-xs">Status</TableHead>
                     <TableHead className="text-xs">Error</TableHead>
                   </TableRow>
@@ -869,10 +880,10 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
                     <TableRow key={l.id}>
                       <TableCell className="py-1.5 text-xs text-muted-foreground">{new Date(l.createdAt).toLocaleString('en-GB', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' })}</TableCell>
                       <TableCell className="py-1.5 text-xs">
-                        {l.direction === 'FROM_WC' ? <span className="text-blue-600">↓ From WC</span> : <span className="text-green-600">↑ To WC</span>}
+                        {l.direction === 'FROM_CONNECTOR' ? <span className="text-blue-600">↓ From Store</span> : <span className="text-green-600">↑ To Store</span>}
                       </TableCell>
                       <TableCell className="py-1.5 text-xs">{l.entityType}</TableCell>
-                      <TableCell className="py-1.5 text-xs font-mono">{l.wcId ?? '—'}</TableCell>
+                      <TableCell className="py-1.5 text-xs font-mono">{l.externalId ?? '—'}</TableCell>
                       <TableCell className="py-1.5 text-xs">
                         <span className={`inline-flex items-center rounded-full px-1.5 py-0.5 text-xs font-medium ${l.status === 'SYNCED' ? 'bg-green-100 text-green-800' : l.status === 'FAILED' ? 'bg-red-100 text-red-800' : 'bg-yellow-100 text-yellow-800'}`}>
                           {l.status}

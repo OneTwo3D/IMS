@@ -35,7 +35,7 @@ async function main() {
     name: 'Default',
     type: 'STANDARD' as const,
     availableForSale: true,
-    syncToWoocommerce: false,
+    syncToStore: false,
     isDefault: true,
     defaultReturnWarehouse: false,
   }

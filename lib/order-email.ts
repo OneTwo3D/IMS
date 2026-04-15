@@ -18,7 +18,7 @@ type QueueEmailData = { to: string; subject: string; reference: string }
 
 type SoForPdf = {
   id: string
-  wcOrderNumber: string | null
+  externalOrderNumber: string | null
   orderNumber?: string | null
   currency: string
   customerName: string | null
@@ -87,14 +87,14 @@ async function getSalesOrderEmailOrder(orderId: string): Promise<SoForPdf | null
 
 async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<typeof getBranding>>): Promise<Buffer> {
   const tpl = await getTemplate('sales_order')
-  const { doc } = createPdfDocument({ title: `Order ${so.wcOrderNumber}` })
+  const { doc } = createPdfDocument({ title: `Order ${so.externalOrderNumber}` })
   const date = so.createdAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
   const shipAddr = so.shippingAddress as Record<string, string> | null
   const recipientAddr = shipAddr ? [shipAddr.line1, shipAddr.line2, shipAddr.city, shipAddr.postcode, shipAddr.country].filter(Boolean).join('\n') : ''
 
   await drawHeader(doc, branding, {
     title: 'Sales Order',
-    reference: so.wcOrderNumber ?? so.id.slice(0, 8),
+    reference: so.externalOrderNumber ?? so.id.slice(0, 8),
     date,
     recipient: { name: so.customerName ?? 'Customer', address: recipientAddr, email: so.customerEmail },
   })
@@ -160,7 +160,7 @@ async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<
 
 async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typeof getBranding>>): Promise<Buffer> {
   const tpl = await getTemplate('invoice')
-  const invNum = so.invoiceNumber ?? so.wcOrderNumber ?? so.id.slice(0, 8)
+  const invNum = so.invoiceNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
   const { doc } = createPdfDocument({ title: `Invoice ${invNum}` })
   const billAddr = so.billingAddress as Record<string, string> | null
   const recipientAddr = billAddr ? [billAddr.line1, billAddr.line2, billAddr.city, billAddr.postcode, billAddr.country].filter(Boolean).join('\n') : ''
@@ -264,7 +264,7 @@ async function buildSalesOrderConfirmationEmail(orderId: string): Promise<Prepar
   if (!so.customerEmail) throw new Error('No customer email address')
 
   const branding = await getBranding()
-  const ref = so.wcOrderNumber ?? so.id.slice(0, 8)
+  const ref = so.externalOrderNumber ?? so.id.slice(0, 8)
   const { money } = await getCurrencyFormat(so.currency)
   const pdfBuffer = await generateSalesOrderPdf(so, branding)
   const date = so.createdAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
@@ -295,7 +295,7 @@ async function buildInvoiceEmail(orderId: string, options?: { accountingPdf?: bo
   if (!so.customerEmail) throw new Error('No customer email address')
 
   const branding = await getBranding()
-  const ref = so.invoiceNumber ?? so.orderNumber ?? so.wcOrderNumber ?? orderId.slice(0, 8)
+  const ref = so.invoiceNumber ?? so.orderNumber ?? so.externalOrderNumber ?? orderId.slice(0, 8)
   const { money } = await getCurrencyFormat(so.currency)
   const pdfBuffer = options?.accountingPdf
     ? await loadInvoicePdf(orderId)
@@ -328,11 +328,11 @@ async function buildInvoiceEmail(orderId: string, options?: { accountingPdf?: bo
 export async function getSalesOrderConfirmationQueueData(orderId: string): Promise<QueueEmailData> {
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
-    select: { id: true, wcOrderNumber: true, customerEmail: true },
+    select: { id: true, externalOrderNumber: true, customerEmail: true },
   })
   if (!so) throw new Error('Order not found')
   if (!so.customerEmail) throw new Error('No customer email address')
-  const ref = so.wcOrderNumber ?? so.id.slice(0, 8)
+  const ref = so.externalOrderNumber ?? so.id.slice(0, 8)
   return { to: so.customerEmail, subject: `Order Confirmation ${ref}`, reference: ref }
 }
 
@@ -350,12 +350,12 @@ export async function getInvoiceQueueData(orderId: string): Promise<QueueEmailDa
 export async function getAccountingInvoiceQueueData(orderId: string): Promise<QueueEmailData> {
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
-    select: { id: true, orderNumber: true, wcOrderNumber: true, invoiceNumber: true, customerEmail: true, invoicePdfPath: true },
+    select: { id: true, orderNumber: true, externalOrderNumber: true, invoiceNumber: true, customerEmail: true, invoicePdfPath: true },
   })
   if (!so) throw new Error('Order not found')
   if (!so.customerEmail) throw new Error('No customer email address')
   if (!so.invoicePdfPath) throw new Error('No invoice PDF available')
-  const ref = so.invoiceNumber ?? so.orderNumber ?? so.wcOrderNumber ?? orderId.slice(0, 8)
+  const ref = so.invoiceNumber ?? so.orderNumber ?? so.externalOrderNumber ?? orderId.slice(0, 8)
   return { to: so.customerEmail, subject: `Invoice ${ref}`, reference: ref }
 }
 

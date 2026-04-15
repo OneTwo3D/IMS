@@ -26,15 +26,15 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
   const lastPollSetting = await db.setting.findUnique({ where: { key: 'xero_last_payment_poll' } })
   const lastPoll = lastPollSetting?.value || new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
 
-  // --- Sales invoices (manual orders only — no wcOrderId) ---
+  // --- Sales invoices (manual orders only — no externalOrderId) ---
   try {
     const unpaidManualOrders = await db.salesOrder.findMany({
       where: {
         accountingInvoiceId: { not: null },
         paidAt: null,
-        wcOrderId: null, // Only manual orders — WC orders already have paidAt
+        externalOrderId: null, // Only manual orders — WC orders already have paidAt
       },
-      select: { id: true, accountingInvoiceId: true, orderNumber: true, wcOrderNumber: true, status: true },
+      select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true },
     })
 
     if (unpaidManualOrders.length > 0) {
@@ -75,7 +75,7 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
               action: 'payment_detected',
               tag: 'sync',
               level: 'INFO',
-              description: `Payment detected via Xero for order ${order.orderNumber ?? order.wcOrderNumber}`,
+              description: `Payment detected via Xero for order ${order.orderNumber ?? order.externalOrderNumber}`,
               resolveUser: false,
             })
           }

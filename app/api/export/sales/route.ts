@@ -20,7 +20,7 @@ export async function GET(req: NextRequest) {
     take: 5000,
   })
   const data = rows.map((r) => ({
-    orderNumber: r.wcOrderNumber, status: r.status, customerName: r.customerName, customerEmail: r.customerEmail,
+    orderNumber: r.externalOrderNumber, status: r.status, customerName: r.customerName, customerEmail: r.customerEmail,
     currency: r.currency, subtotal: Number(r.subtotalForeign).toFixed(2), shipping: Number(r.shippingForeign).toFixed(2),
     tax: Number(r.taxForeign).toFixed(2), total: Number(r.totalForeign).toFixed(2), totalGbp: Number(r.totalGbp).toFixed(2),
     warehouse: r.shipFromWarehouse?.code, salesRep: r.salesRep,

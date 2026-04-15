@@ -2,12 +2,13 @@
  * TrackShip API integration for delivery tracking.
  *
  * Two modes:
- * 1. "woocommerce" — poll WC order meta for delivery status (WC has AST + TrackShip)
+ * 1. "shopping_connector" — poll the active shopping connector for delivery status
  * 2. "trackship" — query TrackShip API directly
  */
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { getOrderDeliveryStatus } from '@/lib/shopping'
 
 // ---------------------------------------------------------------------------
 // TrackShip API (direct)
@@ -70,26 +71,19 @@ export async function queryTrackShip(apiKey: string, trackingNumber: string, car
   }
 }
 
-// ---------------------------------------------------------------------------
-// WooCommerce AST delivery status — delegated to WC connector
-// ---------------------------------------------------------------------------
-
-// Import from WooCommerce connector module
-import { getWcDeliveryStatus } from '@/lib/connectors/woocommerce/delivery'
-
-// ---------------------------------------------------------------------------
 // Check delivery status for all shipped orders
 // ---------------------------------------------------------------------------
 
 export async function checkDeliveryStatus(): Promise<{ checked: number; delivered: number }> {
   const settings = await db.setting.findMany({
-    where: { key: { in: ['delivery_tracking_enabled', 'delivery_tracking_source', 'trackship_api_key', 'wc_url', 'wc_key', 'wc_secret'] } },
+    where: { key: { in: ['delivery_tracking_enabled', 'delivery_tracking_source', 'trackship_api_key'] } },
   })
   const settingsMap = new Map(settings.map((s) => [s.key, s.value]))
 
   if (settingsMap.get('delivery_tracking_enabled') !== 'true') return { checked: 0, delivered: 0 }
 
-  const source = settingsMap.get('delivery_tracking_source') ?? 'trackship'
+  const deliverySource = settingsMap.get('delivery_tracking_source') ?? 'trackship'
+  const useShoppingConnector = deliverySource === 'woocommerce' || deliverySource === 'shopping_connector'
 
   // Find shipped orders with tracking numbers
   const shippedOrders = await db.salesOrder.findMany({
@@ -99,8 +93,7 @@ export async function checkDeliveryStatus(): Promise<{ checked: number; delivere
     },
     select: {
       id: true,
-      wcOrderId: true,
-      wcOrderNumber: true,
+      externalOrderNumber: true,
       trackingNumber: true,
       shippingService: true,
       shipments: {
@@ -116,12 +109,11 @@ export async function checkDeliveryStatus(): Promise<{ checked: number; delivere
   for (const order of shippedOrders) {
     let isDelivered = false
 
-    if (source === 'woocommerce' && order.wcOrderId) {
-      // Query WooCommerce connector for delivery status
-      const result = await getWcDeliveryStatus(order.wcOrderId)
+    if (useShoppingConnector) {
+      const result = await getOrderDeliveryStatus(order.id)
       if (result?.status === 'delivered') isDelivered = true
       checked++
-    } else if (source === 'trackship') {
+    } else if (deliverySource === 'trackship') {
       // Query TrackShip API directly for each shipment tracking number
       const apiKey = settingsMap.get('trackship_api_key')
       if (!apiKey) continue
@@ -148,14 +140,15 @@ export async function checkDeliveryStatus(): Promise<{ checked: number; delivere
         data: { status: 'DELIVERED' },
       })
       delivered++
+      const resolvedSource = useShoppingConnector ? 'shopping_connector' : 'trackship'
       await logActivity({
         entityType: 'SALES_ORDER',
         entityId: order.id,
         action: 'delivered',
         tag: 'sales',
         level: 'INFO',
-        description: `Order ${order.wcOrderNumber} marked as delivered via ${source}`,
-        metadata: { orderNumber: order.wcOrderNumber, source },
+        description: `Order ${order.externalOrderNumber} marked as delivered via ${resolvedSource}`,
+        metadata: { orderNumber: order.externalOrderNumber, source: resolvedSource },
         resolveUser: false,
       })
     }

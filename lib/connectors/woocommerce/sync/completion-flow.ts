@@ -15,7 +15,7 @@ import { extractWcTracking } from './field-mapping'
 export async function processWcCompletion(orderId: string, wcOrder: WcFullOrder): Promise<void> {
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
-    select: { id: true, wcOrderNumber: true, status: true },
+    select: { id: true, externalOrderNumber: true, status: true },
   })
   if (!so) return
 
@@ -84,8 +84,8 @@ export async function processWcCompletion(orderId: string, wcOrder: WcFullOrder)
 
   await logActivity({
     entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_completion_processed', tag: 'sync', level: 'INFO',
-    description: `Processed WC completion for order #${so.wcOrderNumber} — ${shipments.length} shipment(s) shipped`,
-    metadata: { wcOrderId: wcOrder.id, shipmentsProcessed: shipments.length, trackingEntries: wcTracking.length },
+    description: `Processed WC completion for order #${so.externalOrderNumber} — ${shipments.length} shipment(s) shipped`,
+    metadata: { externalOrderId: wcOrder.id, shipmentsProcessed: shipments.length, trackingEntries: wcTracking.length },
     resolveUser: false,
   })
 }

@@ -206,7 +206,7 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
     if (search) {
       const q = search.toLowerCase()
       return (
-        (so.wcOrderNumber ?? '').toLowerCase().includes(q) ||
+        so.displayOrderNumber.toLowerCase().includes(q) ||
         (so.customerName ?? '').toLowerCase().includes(q) ||
         (so.customerEmail ?? '').toLowerCase().includes(q)
       )
@@ -224,7 +224,7 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
         return (
           <TableCell key={key} className="font-mono text-xs font-medium">
             <Link href={`/sales/${so.id}`} className="hover:underline">
-              {so.wcOrderNumber ?? so.id.slice(0, 8)}
+              {so.displayOrderNumber}
             </Link>
           </TableCell>
         )
@@ -261,10 +261,7 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
       case 'source':
         return (
           <TableCell key={key} className="text-xs">
-            {so.wcOrderId
-              ? /* eslint-disable-next-line @next/next/no-img-element */
-              <img src="/images/woocommerce.svg" alt="WC" className="h-3.5 w-auto" title="WooCommerce" />
-              : <span className="text-muted-foreground">Manual</span>}
+            <span className="text-muted-foreground">{so.sourceLabel}</span>
           </TableCell>
         )
       case 'country':
@@ -288,7 +285,7 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
       case 'shipping':
         return <TableCell key={key} className="text-muted-foreground text-xs">{so.shippingService ?? '—'}</TableCell>
       case 'orderDate':
-        return <TableCell key={key} className="text-muted-foreground text-xs">{fmtDate(so.wcCreatedAt ?? so.createdAt)}</TableCell>
+        return <TableCell key={key} className="text-muted-foreground text-xs">{fmtDate(so.externalOrderDate ?? so.createdAt)}</TableCell>
       case 'shippedDate':
         return <TableCell key={key} className="text-muted-foreground text-xs">{fmtDate(so.shippedAt)}</TableCell>
       case 'deliveredDate':
@@ -374,7 +371,7 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
                     <div className="flex items-start justify-between gap-3">
                       <div className="min-w-0 flex-1">
                         <Link href={`/sales/${so.id}`} className="font-mono text-sm font-medium text-primary hover:underline">
-                          {so.wcOrderNumber ?? so.id.slice(0, 8)}
+                          {so.displayOrderNumber}
                         </Link>
                         <p className="mt-1 text-sm font-medium leading-tight">{so.customerName ?? '—'}</p>
                         {so.customerEmail && (

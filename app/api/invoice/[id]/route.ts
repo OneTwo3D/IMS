@@ -31,7 +31,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     try {
       const pdfPath = join(process.cwd(), 'public', so.invoicePdfPath)
       const pdfBuffer = await readFile(pdfPath)
-      const invNum = so.invoiceNumber ?? so.wcOrderNumber ?? so.id.slice(0, 8)
+      const invNum = so.invoiceNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
       return new NextResponse(new Uint8Array(pdfBuffer), {
         headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="Invoice-${invNum}.pdf"` },
       })
@@ -45,7 +45,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     where: { type: 'invoice' },
     select: { headerNote: true, footerNote: true, termsText: true, customFooter: true, showPaymentTerms: true, paymentTermsText: true },
   })
-  const invNum = so.invoiceNumber ?? so.wcOrderNumber ?? so.id.slice(0, 8)
+  const invNum = so.invoiceNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
   const { doc } = createPdfDocument({ title: `Invoice ${invNum}` })
 
   const billAddr = so.billingAddress as Record<string, string> | null

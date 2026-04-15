@@ -97,7 +97,7 @@ async function ensureWcSettingsVersionMatches(expectedVersion: string): Promise<
 
 async function persistMappingIfVersionMatches(
   productId: string,
-  wcId: number,
+  externalId: number,
   expectedVersion: string,
 ): Promise<
   | { ok: true }
@@ -114,7 +114,7 @@ async function persistMappingIfVersionMatches(
       }
       await tx.product.update({
         where: { id: productId },
-        data: { wcProductId: BigInt(wcId) },
+        data: { externalProductId: BigInt(externalId) },
       })
       return { ok: true as const }
     })
@@ -243,25 +243,25 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
       }
     }
 
-    await db.wcSyncLog.create({
+    await db.shoppingSyncLog.create({
       data: {
-        direction: 'FROM_WC',
+        direction: 'FROM_CONNECTOR',
         status: 'SYNCED',
         entityType: 'Product',
         entityId: existing?.id,
-        wcId: wcProduct.id,
+        externalId: wcProduct.id,
         syncedAt: new Date(),
       },
     })
 
     return { success: true }
   } catch (e) {
-    await db.wcSyncLog.create({
+    await db.shoppingSyncLog.create({
       data: {
-        direction: 'FROM_WC',
+        direction: 'FROM_CONNECTOR',
         status: 'FAILED',
         entityType: 'Product',
-        wcId: wcProduct.id,
+        externalId: wcProduct.id,
         errorMessage: String(e),
         syncedAt: new Date(),
       },
@@ -380,9 +380,9 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
         salePriceGbp: true,
         barcode: true,
         type: true,
-        wcProductId: true,
+        externalProductId: true,
         lifecycleStatus: true,
-        parent: { select: { sku: true, wcProductId: true } },
+        parent: { select: { sku: true, externalProductId: true } },
       },
     })
     if (!product?.sku) return { success: false, error: 'Product has no SKU' }
@@ -399,16 +399,16 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
       updateData.global_unique_id = product.barcode
     }
 
-    let wcProductId: number
+    let externalProductId: number
     let putPath: string
 
     if (product.type === 'VARIANT') {
-      const parentWcId = product.parent?.wcProductId != null ? Number(product.parent.wcProductId) : null
+      const parentWcId = product.parent?.externalProductId != null ? Number(product.parent.externalProductId) : null
       if (!parentWcId || !product.parent?.sku) {
         return { success: false, error: `Variant ${product.sku} is missing a WooCommerce parent mapping` }
       }
 
-      let variationId = product.wcProductId != null ? Number(product.wcProductId) : null
+      let variationId = product.externalProductId != null ? Number(product.externalProductId) : null
       if (!variationId) {
         const { data, error } = await wcFetch(
           `/products/${parentWcId}/variations`,
@@ -440,10 +440,10 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
         }
       }
 
-      wcProductId = variationId
+      externalProductId = variationId
       putPath = `/products/${parentWcId}/variations/${variationId}`
     } else {
-      let resolvedId = product.wcProductId != null ? Number(product.wcProductId) : null
+      let resolvedId = product.externalProductId != null ? Number(product.externalProductId) : null
       if (resolvedId != null) {
         const { data, error } = await wcFetch(`/products/${resolvedId}`, {}, creds)
         if (error) return { success: false, error }
@@ -476,8 +476,8 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
         }
       }
 
-      wcProductId = resolvedId
-      putPath = `/products/${wcProductId}`
+      externalProductId = resolvedId
+      putPath = `/products/${externalProductId}`
     }
 
     const versionCheck = await ensureWcSettingsVersionMatches(syncVersion)
@@ -491,13 +491,13 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
     const { error: putError } = await wcPut(putPath, updateData, creds)
     if (putError) return { success: false, error: putError }
 
-    await db.wcSyncLog.create({
+    await db.shoppingSyncLog.create({
       data: {
-        direction: 'TO_WC',
+        direction: 'TO_CONNECTOR',
         status: 'SYNCED',
         entityType: 'Product',
         entityId: productId,
-        wcId: wcProductId,
+        externalId: externalProductId,
         payload: JSON.parse(JSON.stringify(updateData)),
         syncedAt: new Date(),
       },

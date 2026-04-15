@@ -4,22 +4,22 @@
 
 DROP TABLE IF EXISTS "wc_tax_mappings";
 
-CREATE TABLE "wc_tax_rate_mappings" (
+CREATE TABLE "shopping_tax_rate_mappings" (
     "id" TEXT NOT NULL,
-    "wcTaxRateId" INTEGER NOT NULL,
-    "wcName" TEXT NOT NULL,
-    "wcCountry" TEXT,
-    "wcRatePct" DECIMAL(7,4) NOT NULL,
-    "wcClass" TEXT,
+    "externalTaxRateId" INTEGER NOT NULL,
+    "externalName" TEXT NOT NULL,
+    "externalCountry" TEXT,
+    "externalRatePct" DECIMAL(7,4) NOT NULL,
+    "externalClass" TEXT,
     "taxRateId" TEXT NOT NULL,
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
     "updatedAt" TIMESTAMP(3) NOT NULL,
 
-    CONSTRAINT "wc_tax_rate_mappings_pkey" PRIMARY KEY ("id")
+    CONSTRAINT "shopping_tax_rate_mappings_pkey" PRIMARY KEY ("id")
 );
 
-CREATE UNIQUE INDEX "wc_tax_rate_mappings_wcTaxRateId_key" ON "wc_tax_rate_mappings"("wcTaxRateId");
+CREATE UNIQUE INDEX "shopping_tax_rate_mappings_externalTaxRateId_key" ON "shopping_tax_rate_mappings"("externalTaxRateId");
 
-ALTER TABLE "wc_tax_rate_mappings"
-    ADD CONSTRAINT "wc_tax_rate_mappings_taxRateId_fkey"
+ALTER TABLE "shopping_tax_rate_mappings"
+    ADD CONSTRAINT "shopping_tax_rate_mappings_taxRateId_fkey"
     FOREIGN KEY ("taxRateId") REFERENCES "tax_rates"("id") ON DELETE RESTRICT ON UPDATE CASCADE;

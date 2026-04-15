@@ -599,12 +599,12 @@ async function enqueueFollowUps(
   if (type === 'INVOICE_PDF' && referenceType === 'SalesOrder') {
     const order = await db.salesOrder.findUnique({
       where: { id: referenceId },
-      select: { customerEmail: true, wcOrderId: true },
+      select: { customerEmail: true, externalOrderId: true },
     })
     if (order?.customerEmail) {
       await enqueueFollowUpSyncLog('INVOICE_EMAIL', referenceType, referenceId, { referenceId, sourceEntryId: entryId })
     }
-    if (order?.wcOrderId) {
+    if (order?.externalOrderId) {
       await enqueueFollowUpSyncLog('WC_INVOICE_NOTE', referenceType, referenceId, { referenceId, sourceEntryId: entryId })
     }
   }

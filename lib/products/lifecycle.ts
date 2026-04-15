@@ -38,10 +38,10 @@ export function deriveLegacyActiveFromLifecycleStatus(status: ProductLifecycleSt
 }
 
 export function deriveLifecycleStatusFromWooStatus(
-  wcStatus: string,
+  externalStatus: string,
   currentStatus?: ProductLifecycleStatus | null,
 ): ProductLifecycleStatus {
-  if (wcStatus === 'publish') return 'ACTIVE'
+  if (externalStatus === 'publish') return 'ACTIVE'
   if (currentStatus === 'ARCHIVED') return 'ARCHIVED'
   return 'NOT_FOR_SALE'
 }

@@ -1,5 +1,12 @@
 import type { Metadata } from 'next'
-import { getWcSyncSettings, getWcTaxRateMappings, getWcStatusMappings, getWcSyncLogs, getWcCredentials, getWcActivePaymentGateways } from '@/app/actions/wc-sync'
+import {
+  getShoppingConnectorCredentials,
+  getShoppingConnectorPaymentMethods,
+  getShoppingStatusMappings,
+  getShoppingSyncLogs,
+  getShoppingSyncSettings,
+  getShoppingTaxRateMappings,
+} from '@/app/actions/shopping-sync'
 import { getXeroSettingsMasked, getXeroConnectionStatus, getXeroAccounts, getXeroSyncLogs, getXeroSyncReadiness, fetchXeroTaxRates } from '@/app/actions/xero-sync'
 import { getXeroDailyBatchPreview, getXeroDailyBatchHistory } from '@/app/actions/xero-daily-batch'
 import { getPaymentMethodCombos } from '@/app/actions/accounting'
@@ -11,12 +18,12 @@ import { SyncDashboard } from './sync-dashboard'
 export const metadata: Metadata = { title: 'Integrations' }
 
 export default async function SyncPage() {
-  const [settings, taxMappings, statusMappings, logs, wcCreds, taxRatesRaw, xeroSettings, xeroStatus, xeroAccounts, xeroLogs, paymentMethodCombos, paymentAccountMap, xeroReadiness, currenciesRaw, wcPaymentGateways, dailyBatchPreview, dailyBatchHistory] = await Promise.all([
-    getWcSyncSettings(),
-    getWcTaxRateMappings(),
-    getWcStatusMappings(),
-    getWcSyncLogs(100),
-    getWcCredentials(),
+  const [shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, shoppingCredentials, taxRatesRaw, xeroSettings, xeroStatus, xeroAccounts, xeroLogs, paymentMethodCombos, paymentAccountMap, xeroReadiness, currenciesRaw, shoppingPaymentMethods, dailyBatchPreview, dailyBatchHistory] = await Promise.all([
+    getShoppingSyncSettings(),
+    getShoppingTaxRateMappings(),
+    getShoppingStatusMappings(),
+    getShoppingSyncLogs(100),
+    getShoppingConnectorCredentials(),
     getTaxRates(),
     getXeroSettingsMasked(),
     getXeroConnectionStatus(),
@@ -26,7 +33,7 @@ export default async function SyncPage() {
     getPaymentAccountMap(),
     getXeroSyncReadiness(),
     getCurrencies(true),
-    getWcActivePaymentGateways(),
+    getShoppingConnectorPaymentMethods(),
     getXeroDailyBatchPreview(),
     getXeroDailyBatchHistory(30),
   ])
@@ -47,14 +54,14 @@ export default async function SyncPage() {
         </p>
       </div>
       <SyncDashboard
-        wcSettings={settings}
-        wcTaxMappings={taxMappings}
-        wcStatusMappings={statusMappings}
-        wcLogs={logs}
+        shoppingSettings={shoppingSettings}
+        shoppingTaxMappings={shoppingTaxMappings}
+        shoppingStatusMappings={shoppingStatusMappings}
+        shoppingLogs={shoppingLogs}
         taxRates={taxRates}
         imsTaxRates={taxRatesRaw}
         xeroTaxRates={xeroTaxRates}
-        wcCredentials={wcCreds}
+        shoppingCredentials={shoppingCredentials}
         xeroSettings={xeroSettings}
         xeroConnected={xeroStatus.connected}
         xeroTenantName={xeroStatus.tenantName}
@@ -63,7 +70,7 @@ export default async function SyncPage() {
         paymentMethodCombos={paymentMethodCombos}
         paymentAccountMap={paymentAccountMap}
         currencies={currencies}
-        wcPaymentGateways={wcPaymentGateways}
+        shoppingPaymentMethods={shoppingPaymentMethods}
         xeroReadiness={xeroReadiness}
         dailyBatchPreview={dailyBatchPreview}
         dailyBatchHistory={dailyBatchHistory}

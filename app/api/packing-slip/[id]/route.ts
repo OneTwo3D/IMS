@@ -25,7 +25,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     select: {
       id: true,
       orderNumber: true,
-      wcOrderNumber: true,
+      externalOrderNumber: true,
       customerName: true,
       shippingAddress: true,
       createdAt: true,
@@ -62,7 +62,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     }),
   ])
 
-  const orderNum = so.orderNumber ?? so.wcOrderNumber ?? so.id.slice(0, 8)
+  const orderNum = so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
   const { doc } = createPdfDocument({ title: `Packing Slip ${orderNum}` })
 
   // Build recipient from shipping address

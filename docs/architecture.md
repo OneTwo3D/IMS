@@ -185,7 +185,7 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 | Manufacturing | `manufacturing.ts` | `/api/manufacturing-order/[id]` |
 | Settings | `settings.ts`, `company.ts`, `currencies.ts` | `/api/cron/fx-rates` |
 | Import | `import.ts`, `wc-import.ts` | `/api/import/` |
-| Integrations | `wc-sync.ts` | `/api/webhooks/woocommerce/orders`, `/api/webhooks/woocommerce/refunds`, `/api/webhooks/woocommerce/products`, `/api/cron/wc-reconcile`, `/api/cron/delivery-status` |
+| Integrations | `wc-sync.ts` | `/api/webhooks/shopping/orders`, `/api/webhooks/shopping/refunds`, `/api/webhooks/shopping/products`, `/api/cron/wc-reconcile`, `/api/cron/delivery-status` |
 | Auth | `profile.ts`, `passkey.ts`, `users.ts` | `/api/auth/[...nextauth]`, `/api/auth/totp`, `/api/auth/totp-setup` |
 | Dashboard | `dashboard.ts` | — |
 | Analytics | `sales-stats.ts`, `purchase-stats.ts`, `inventory-stats.ts`, `forecasting.ts` | — |
@@ -289,10 +289,10 @@ Xero integration is implemented as a modular connector in `lib/connectors/xero/`
 
 WooCommerce integration is implemented as a modular connector in `lib/connectors/woocommerce/`, following the shared `ShoppingConnector` and `AccountingConnector` interfaces.
 
-- **Order import** — webhook-first via `/api/webhooks/woocommerce/orders`, with `/api/cron/wc-reconcile` as backup reconciliation
+- **Order import** — webhook-first via `/api/webhooks/shopping/orders`, with `/api/cron/wc-reconcile` as backup reconciliation
 - **Status sync** — bidirectional mapping between WC and IMS statuses (configurable via `WcStatusMapping` with seeded defaults matching WC flowchart)
-- **Refund sync** — creates refund records with credit notes and COGS reversal, via webhook (`/api/webhooks/woocommerce/refunds`)
-- **Product sync** — bidirectional product data sync via webhook (`/api/webhooks/woocommerce/products`), including prices, dimensions, weight, GTIN/EAN (`global_unique_id`), HS code, and country of origin from WC product attributes
+- **Refund sync** — creates refund records with credit notes and COGS reversal, via webhook (`/api/webhooks/shopping/refunds`)
+- **Product sync** — bidirectional product data sync via webhook (`/api/webhooks/shopping/products`), including prices, dimensions, weight, GTIN/EAN (`global_unique_id`), HS code, and country of origin from WC product attributes
 - **Stock sync** — IMS to WC, pushed immediately from IMS changes with daily forced stock catch-up and queued retry draining in the reconcile cron; optional COGS sync toggle
 - **Tax class mapping** — maps WC tax classes to IMS TaxRate records
 - **Completion flow** — WC completed status triggers auto-allocation, shipment creation with tracking

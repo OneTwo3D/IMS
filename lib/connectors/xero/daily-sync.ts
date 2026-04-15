@@ -336,7 +336,7 @@ export async function runDailyBatchSync(): Promise<{
       select: {
         id: true,
         orderNumber: true,
-        wcOrderNumber: true,
+        externalOrderNumber: true,
         totalGbp: true,
         taxGbp: true,
       },
@@ -405,7 +405,7 @@ export async function runDailyBatchSync(): Promise<{
       select: {
         id: true,
         orderNumber: true,
-        wcOrderNumber: true,
+        externalOrderNumber: true,
         allocations: {
           select: {
             id: true,
@@ -524,7 +524,7 @@ export async function runDailyBatchSync(): Promise<{
           order: {
             select: {
               orderNumber: true,
-              wcOrderNumber: true,
+              externalOrderNumber: true,
               status: true,
               totalGbp: true,
               unearnedRevenueAmount: true,

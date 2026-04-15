@@ -10,12 +10,13 @@ import { StockAdjustmentForm } from '@/components/inventory/stock-adjustment-for
 import { VariantGenerator } from '@/components/inventory/variant-generator'
 import { KitConfigurator } from '@/components/inventory/kit-configurator'
 import { DeleteVariantButton } from '@/components/inventory/delete-variant-button'
-import { WcLinkButton } from '@/components/inventory/wc-link-button'
+import { ShoppingProductLinkButton } from '@/components/inventory/shopping-product-link-button'
 import { StockFlowButton } from '@/components/inventory/stock-flow-dialog'
 import { Badge } from '@/components/ui/badge'
 import { Card } from '@/components/ui/card'
 import { StockDetailPopup } from '@/components/inventory/stock-detail-popups'
 import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
+import { hasExternalProductLink } from '@/lib/shopping'
 
 const TYPE_LABELS: Record<ProductType, string> = {
   SIMPLE: 'Simple',
@@ -70,10 +71,7 @@ export default async function ProductDetailPage({
     product.type === 'KIT' ? getKitStock(id) : Promise.resolve([]),
   ])
 
-  // Check if product is linked to WooCommerce
-  const wcLinked = await db.wcSyncLog.count({
-    where: { entityType: 'Product', entityId: id, status: 'SYNCED' },
-  }) > 0
+  const hasStoreLink = await hasExternalProductLink(id)
 
   // For the kit configurator: all stockable products (not self, not VARIABLE, not NON_INVENTORY)
   const allSimpleProducts = isKitOrBom
@@ -109,7 +107,7 @@ export default async function ProductDetailPage({
             {STATUS_LABELS[product.lifecycleStatus]}
           </Badge>
           <Badge variant="secondary">{TYPE_LABELS[product.type]}</Badge>
-          {wcLinked && <WcLinkButton sku={product.sku} />}
+          {hasStoreLink && <ShoppingProductLinkButton sku={product.sku} />}
           {product.type !== 'VARIABLE' && product.type !== 'NON_INVENTORY' && (
             <StockFlowButton productId={id} />
           )}
