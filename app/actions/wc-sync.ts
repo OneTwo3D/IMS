@@ -9,6 +9,7 @@ import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/
 import { validateWooCommerceBaseUrl } from '@/lib/connectors/woocommerce/url-safety'
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { getPublicAppUrl } from '@/lib/public-app-url'
 import {
   WC_SYNC_ADVISORY_LOCK_KEY,
   WC_SETTINGS_VERSION_KEY,
@@ -520,8 +521,8 @@ export async function createWcWebhooks(): Promise<{
 }> {
   await requireAdmin()
 
-  const appUrl = process.env.NEXT_PUBLIC_APP_URL
-  if (!appUrl) return { success: false, created: 0, existing: 0, errors: ['NEXT_PUBLIC_APP_URL is not set'] }
+  const appUrl = await getPublicAppUrl()
+  if (!appUrl) return { success: false, created: 0, existing: 0, errors: ['Public app URL is not configured'] }
 
   const secret = await getSettingValue('wc_webhook_secret')
   if (!secret) {

@@ -134,11 +134,17 @@ function landedCostLabel(method: string): string {
 // Component
 // ---------------------------------------------------------------------------
 
-type Props = { initialPos: PoRow[]; currencySymbols?: Record<string, string> }
+type Props = {
+  initialPos: PoRow[]
+  currencySymbols?: Record<string, string>
+  currencyPositions?: Record<string, 'PREFIX' | 'POSTFIX'>
+}
 
-export function PoListClient({ initialPos, currencySymbols = {} }: Props) {
+export function PoListClient({ initialPos, currencySymbols = {}, currencyPositions = {} }: Props) {
   const baseCurrency = useBaseCurrency()
   const sym = (code: string) => currencySymbols[code] ?? (code === baseCurrency.code ? baseCurrency.symbol : code)
+  const symPos = (code: string) => currencyPositions[code] ?? (code === baseCurrency.code ? baseCurrency.symbolPosition : undefined)
+  const fmtForeign = (value: number, code: string) => formatMoney(value, sym(code), symPos(code))
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const [search, setSearch] = useState('')
   const [statusFilters, setStatusFilters] = useState<Set<PoStatus>>(new Set())
@@ -247,7 +253,7 @@ export function PoListClient({ initialPos, currencySymbols = {} }: Props) {
       case 'total':
         return (
           <TableCell key={key} className="text-right tabular-nums">
-            <span className="font-semibold">{po.totalForeign.toFixed(2)}{sym(po.currency)}</span>
+            <span className="font-semibold">{fmtForeign(po.totalForeign, po.currency)}</span>
             {po.currency !== baseCurrency.code && (
               <span className="text-muted-foreground text-xs font-normal ml-1">({fmtBase(po.totalBase)})</span>
             )}
@@ -274,17 +280,17 @@ export function PoListClient({ initialPos, currencySymbols = {} }: Props) {
       case 'warehouse':
         return <TableCell key={key} className="text-muted-foreground text-xs">{po.destinationWarehouseName ?? '—'}</TableCell>
       case 'subtotal':
-        return <TableCell key={key} className="text-right tabular-nums text-xs">{po.subtotalForeign.toFixed(2)}{sym(po.currency)}</TableCell>
+        return <TableCell key={key} className="text-right tabular-nums text-xs">{fmtForeign(po.subtotalForeign, po.currency)}</TableCell>
       case 'tax':
         return (
           <TableCell key={key} className="text-right tabular-nums text-xs">
-            {po.taxForeign > 0 ? `${po.taxForeign.toFixed(2)}${sym(po.currency)}` : '—'}
+            {po.taxForeign > 0 ? fmtForeign(po.taxForeign, po.currency) : '—'}
           </TableCell>
         )
       case 'freight':
         return (
           <TableCell key={key} className="text-right tabular-nums text-xs">
-            {po.directFreightForeign > 0 ? `${po.directFreightForeign.toFixed(2)}${sym(po.currency)}` : '—'}
+            {po.directFreightForeign > 0 ? fmtForeign(po.directFreightForeign, po.currency) : '—'}
           </TableCell>
         )
       case 'discount':
@@ -382,7 +388,7 @@ export function PoListClient({ initialPos, currencySymbols = {} }: Props) {
                           {STATUS_LABELS[po.status]}
                         </span>
                         <span className="text-sm font-semibold tabular-nums">
-                          {po.totalForeign.toFixed(2)}{sym(po.currency)}
+                          {fmtForeign(po.totalForeign, po.currency)}
                         </span>
                       </div>
                     </div>

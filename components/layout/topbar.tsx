@@ -121,6 +121,11 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
     }
   }
 
+  function handleSignOut() {
+    const callbackUrl = typeof window === 'undefined' ? '/login' : `${window.location.origin}/login`
+    void signOut({ callbackUrl })
+  }
+
   return (
     <header className="flex h-14 items-center border-b bg-card px-2 sm:px-4 gap-1">
       {onMenuClick && (
@@ -236,7 +241,7 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
               Settings
             </DropdownMenuItem>
             <DropdownMenuSeparator />
-            <DropdownMenuItem variant="destructive" onClick={() => signOut({ callbackUrl: '/login' })}>
+            <DropdownMenuItem variant="destructive" onClick={handleSignOut}>
               <LogOut className="mr-2 h-4 w-4" />
               Sign out
             </DropdownMenuItem>

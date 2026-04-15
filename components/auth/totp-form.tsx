@@ -17,6 +17,11 @@ export function TotpForm() {
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
 
+  function handleSignOut() {
+    const callbackUrl = typeof window === 'undefined' ? '/login' : `${window.location.origin}/login`
+    void signOut({ callbackUrl })
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     setError('')
@@ -80,7 +85,7 @@ export function TotpForm() {
           variant="ghost"
           size="sm"
           className="text-xs text-muted-foreground"
-          onClick={() => signOut({ callbackUrl: '/login' })}
+          onClick={handleSignOut}
         >
           Sign out and use a different account
         </Button>

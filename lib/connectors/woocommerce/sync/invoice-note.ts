@@ -8,6 +8,7 @@ import { wcPost, wcPut } from '../api'
 import { getInvoiceDownloadUrl } from '@/lib/invoice-pdf'
 import { getAccountingSettings } from '@/lib/accounting'
 import { logActivity } from '@/lib/activity-log'
+import { getPublicAppUrl } from '@/lib/public-app-url'
 
 /**
  * Push an invoice download note to the WC order (customer-visible).
@@ -28,7 +29,7 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
   if (!so?.externalOrderId) return { success: true }
 
   const ref = so.invoiceNumber ?? so.orderNumber ?? so.externalOrderNumber ?? orderId.slice(0, 8)
-  const appUrl = (process.env.NEXT_PUBLIC_APP_URL || '').replace(/\/$/, '')
+  const appUrl = (await getPublicAppUrl())?.replace(/\/$/, '') ?? ''
   let failure: string | null = null
 
   // Build absolute download URL

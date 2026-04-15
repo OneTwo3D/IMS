@@ -10,12 +10,13 @@ import { syncCrontab } from '@/app/actions/cron'
 
 type Props = {
   currentValue: string
-  source: 'settings' | 'env' | 'none'
+  source: 'settings' | 'none'
+  suggestedValue?: string
 }
 
-export function PublicAppUrlSettings({ currentValue, source }: Props) {
+export function PublicAppUrlSettings({ currentValue, source, suggestedValue }: Props) {
   const [isPending, startTransition] = useTransition()
-  const [value, setValue] = useState(currentValue)
+  const [value, setValue] = useState(currentValue || suggestedValue || '')
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
 
@@ -63,6 +64,11 @@ export function PublicAppUrlSettings({ currentValue, source }: Props) {
         Configure the public base URL used for external callbacks and generated cron targets.
         {' '}Current source: <span className="font-medium">{source}</span>.
       </p>
+      {!currentValue && suggestedValue && (
+        <p className="text-xs text-muted-foreground">
+          Suggested from this request: <span className="font-medium">{suggestedValue}</span>
+        </p>
+      )}
       <div className="max-w-xl space-y-1.5">
         <Label className="text-xs">Public App URL</Label>
         <Input

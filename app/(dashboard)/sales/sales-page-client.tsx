@@ -37,7 +37,9 @@ export function SalesPageClient({ initialOrders, products, warehouses, currencie
   const [showCreate, setShowCreate] = useState(false)
 
   const currencySymbols: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
+  const currencyPositions: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
   for (const c of currencies) currencySymbols[c.code] = c.symbol
+  for (const c of currencies) currencyPositions[c.code] = c.symbolPosition
 
   return (
     <div className="space-y-4">
@@ -51,7 +53,7 @@ export function SalesPageClient({ initialOrders, products, warehouses, currencie
           </Button>
         </div>
       </div>
-      <SoListClient initialOrders={initialOrders} currencySymbols={currencySymbols} />
+      <SoListClient initialOrders={initialOrders} currencySymbols={currencySymbols} currencyPositions={currencyPositions} />
       {showCreate && (
         <SoFormDialog
           products={products}

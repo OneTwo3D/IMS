@@ -36,7 +36,9 @@ export function PurchaseOrdersClient({ initialPos, suppliers, products, warehous
   const [showFreight, setShowFreight] = useState(false)
 
   const currencySymbols: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
+  const currencyPositions: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
   for (const c of currencies) currencySymbols[c.code] = c.symbol
+  for (const c of currencies) currencyPositions[c.code] = c.symbolPosition
 
   return (
     <div className="space-y-4">
@@ -54,7 +56,7 @@ export function PurchaseOrdersClient({ initialPos, suppliers, products, warehous
           </Button>
         </div>
       </div>
-      <PoListClient initialPos={initialPos} currencySymbols={currencySymbols} />
+      <PoListClient initialPos={initialPos} currencySymbols={currencySymbols} currencyPositions={currencyPositions} />
       {showCreate && (
         <PoFormDialog
           suppliers={suppliers}

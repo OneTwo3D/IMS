@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import Link from 'next/link'
+import { headers } from 'next/headers'
 import { ActivitySquare, Archive, Plug, RotateCcw, Timer } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Card } from '@/components/ui/card'
@@ -13,7 +14,7 @@ import { PublicAppUrlSettings } from '@/components/settings/public-app-url-setti
 import type { CronJobState } from '@/components/settings/cron-jobs-settings'
 import { getAllCronJobs } from '@/lib/cron-jobs'
 import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
-import { getPublicAppUrlInfo } from '@/lib/public-app-url'
+import { detectPublicAppUrlFromHeaders, getPublicAppUrlInfo } from '@/lib/public-app-url'
 
 export const metadata: Metadata = { title: 'System Settings' }
 
@@ -34,6 +35,14 @@ export default async function SystemSettingsPage({
   const params = await searchParams
   const raw = typeof params.tab === 'string' ? params.tab : undefined
   const activeTab: Tab = TABS.some((t) => t.key === raw) ? (raw as Tab) : 'scheduler'
+  const headerList = activeTab === 'scheduler' ? await headers() : null
+  const suggestedPublicAppUrl = activeTab === 'scheduler'
+    ? detectPublicAppUrlFromHeaders({
+        forwardedHost: headerList?.get('x-forwarded-host'),
+        forwardedProto: headerList?.get('x-forwarded-proto'),
+        host: headerList?.get('host'),
+      })
+    : null
 
   // Only fetch data needed for the active tab
   const [pluginState, publicAppUrl, cronJobs, retentionData] = await Promise.all([
@@ -94,6 +103,7 @@ export default async function SystemSettingsPage({
             <PublicAppUrlSettings
               currentValue={publicAppUrl?.value ?? ''}
               source={publicAppUrl?.source ?? 'none'}
+              suggestedValue={!publicAppUrl?.value ? (suggestedPublicAppUrl ?? '') : ''}
             />
           </Card>
           <Card className="p-6">

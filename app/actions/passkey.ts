@@ -15,12 +15,21 @@ import { db } from '@/lib/db'
 import { auth } from '@/lib/auth'
 import { logActivity } from '@/lib/activity-log'
 import { consumeAuthToken, setAuthToken } from '@/lib/auth/token-store'
+import { getPublicAppUrl } from '@/lib/public-app-url'
 
 const RP_NAME = 'onetwoInventory'
-const RP_ID = process.env.NEXT_PUBLIC_APP_URL
-  ? new URL(process.env.NEXT_PUBLIC_APP_URL).hostname
-  : 'localhost'
-const ORIGIN = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000'
+
+async function getPasskeyOriginConfig(): Promise<{ rpId: string; origin: string } | { error: string }> {
+  const publicAppUrl = await getPublicAppUrl()
+  if (!publicAppUrl) return { error: 'Public app URL is not configured.' }
+
+  try {
+    const parsed = new URL(publicAppUrl)
+    return { rpId: parsed.hostname, origin: publicAppUrl }
+  } catch {
+    return { error: 'Public app URL is invalid.' }
+  }
+}
 
 async function setChallenge(key: string, challenge: string) {
   await setAuthToken(`passkey_challenge:${key}`, challenge, 5 * 60 * 1000)
@@ -35,6 +44,8 @@ async function getChallenge(key: string): Promise<string | null> {
 export async function getPasskeyRegistrationOptions() {
   const session = await auth()
   if (!session?.user?.id) return { error: 'Unauthorized' }
+  const originConfig = await getPasskeyOriginConfig()
+  if ('error' in originConfig) return { error: originConfig.error }
 
   const user = await db.user.findUnique({
     where: { id: session.user.id },
@@ -44,7 +55,7 @@ export async function getPasskeyRegistrationOptions() {
 
   const options = await generateRegistrationOptions({
     rpName: RP_NAME,
-    rpID: RP_ID,
+    rpID: originConfig.rpId,
     userID: new TextEncoder().encode(user.id),
     userName: user.email,
     userDisplayName: user.name,
@@ -69,6 +80,8 @@ export async function verifyPasskeyRegistration(
 ) {
   const session = await auth()
   if (!session?.user?.id) return { error: 'Unauthorized' }
+  const originConfig = await getPasskeyOriginConfig()
+  if ('error' in originConfig) return { error: originConfig.error }
 
   const challenge = await getChallenge(`reg:${session.user.id}`)
   if (!challenge) return { error: 'Challenge expired. Please try again.' }
@@ -77,8 +90,8 @@ export async function verifyPasskeyRegistration(
     const verification = await verifyRegistrationResponse({
       response,
       expectedChallenge: challenge,
-      expectedOrigin: ORIGIN,
-      expectedRPID: RP_ID,
+      expectedOrigin: originConfig.origin,
+      expectedRPID: originConfig.rpId,
     })
 
     if (!verification.verified || !verification.registrationInfo) {
@@ -109,10 +122,12 @@ export async function verifyPasskeyRegistration(
 // --- Authentication ---
 
 export async function getPasskeyAuthenticationOptions(email?: string) {
+  const originConfig = await getPasskeyOriginConfig()
+  if ('error' in originConfig) return { error: originConfig.error }
   const challengeKey = email ? `auth:${email}` : `auth:discoverable`
 
   const options = await generateAuthenticationOptions({
-    rpID: RP_ID,
+    rpID: originConfig.rpId,
     userVerification: 'preferred',
   })
 
@@ -125,6 +140,8 @@ export async function verifyPasskeyAuthentication(
   response: AuthenticationResponseJSON,
   challengeKey: string,
 ) {
+  const originConfig = await getPasskeyOriginConfig()
+  if ('error' in originConfig) return { error: originConfig.error }
   const challenge = await getChallenge(challengeKey)
   if (!challenge) return { error: 'Challenge expired. Please try again.' }
 
@@ -142,8 +159,8 @@ export async function verifyPasskeyAuthentication(
     const verification = await verifyAuthenticationResponse({
       response,
       expectedChallenge: challenge,
-      expectedOrigin: ORIGIN,
-      expectedRPID: RP_ID,
+      expectedOrigin: originConfig.origin,
+      expectedRPID: originConfig.rpId,
       credential: {
         id: passkey.credentialId,
         publicKey: passkey.credentialPublicKey,

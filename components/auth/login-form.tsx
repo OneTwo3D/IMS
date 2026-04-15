@@ -51,13 +51,18 @@ export function LoginForm() {
 
     try {
       // Get authentication options (discoverable credential — no email needed)
-      const { options, challengeKey } = await getPasskeyAuthenticationOptions()
+      const authOptions = await getPasskeyAuthenticationOptions()
+      if ('error' in authOptions) {
+        setError(authOptions.error ?? 'Passkey authentication failed.')
+        setPasskeyLoading(false)
+        return
+      }
 
       // Prompt the browser/OS passkey dialog
-      const credential = await startAuthentication({ optionsJSON: options })
+      const credential = await startAuthentication({ optionsJSON: authOptions.options })
 
       // Verify on server
-      const result = await verifyPasskeyAuthentication(credential, challengeKey)
+      const result = await verifyPasskeyAuthentication(credential, authOptions.challengeKey)
 
       if (result.error) {
         setError(result.error)

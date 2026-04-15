@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
 import type { Branding } from '@/lib/pdf'
+import { getPublicAppUrl } from '@/lib/public-app-url'
 
 export type EmailTemplateType = 'invoice' | 'sales_order' | 'purchase_order' | 'rfq' | 'credit_note' | 'packing_slip' | 'manufacturing_order'
 
@@ -118,11 +119,12 @@ export async function renderEmailHtml(
   // Fetch email settings for from name
   const fromSetting = await db.setting.findUnique({ where: { key: 'email_from_name' } })
   const fromName = fromSetting?.value || branding.companyName
+  const publicAppUrl = (await getPublicAppUrl())?.replace(/\/$/, '') ?? ''
 
   const logoHtml = branding.documentLogoUrl
-    ? `<img src="${process.env.NEXT_PUBLIC_APP_URL}${branding.documentLogoUrl}" alt="${branding.companyName}" style="max-height:50px;max-width:200px;margin-bottom:16px;" />`
+    ? `<img src="${publicAppUrl}${branding.documentLogoUrl}" alt="${branding.companyName}" style="max-height:50px;max-width:200px;margin-bottom:16px;" />`
     : branding.logoUrl
-      ? `<img src="${process.env.NEXT_PUBLIC_APP_URL}${branding.logoUrl}" alt="${branding.companyName}" style="max-height:40px;max-width:40px;margin-bottom:16px;" />`
+      ? `<img src="${publicAppUrl}${branding.logoUrl}" alt="${branding.companyName}" style="max-height:40px;max-width:40px;margin-bottom:16px;" />`
       : ''
 
   const bodyHtml = data.bodyLines.map((l) => `<p style="margin:0 0 12px;color:#333;font-size:15px;line-height:1.5;">${escapeHtml(l)}</p>`).join('\n')

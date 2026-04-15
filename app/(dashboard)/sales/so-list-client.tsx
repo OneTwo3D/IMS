@@ -141,13 +141,19 @@ function stockStatus(status: SoStatus): string {
 // Component
 // ---------------------------------------------------------------------------
 
-type Props = { initialOrders: SoRow[]; currencySymbols?: Record<string, string> }
+type Props = {
+  initialOrders: SoRow[]
+  currencySymbols?: Record<string, string>
+  currencyPositions?: Record<string, 'PREFIX' | 'POSTFIX'>
+}
 
 const COMPLETED_STATUSES: SoStatus[] = ['COMPLETED', 'DELIVERED']
 
-export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
+export function SoListClient({ initialOrders, currencySymbols = {}, currencyPositions = {} }: Props) {
   const baseCurrency = useBaseCurrency()
   const sym = (code: string) => currencySymbols[code] ?? (code === baseCurrency.code ? baseCurrency.symbol : code)
+  const symPos = (code: string) => currencyPositions[code] ?? (code === baseCurrency.code ? baseCurrency.symbolPosition : undefined)
+  const fmtForeign = (value: number, code: string) => formatMoney(value, sym(code), symPos(code))
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const [search, setSearch] = useState('')
   const [statusFilters, setStatusFilters] = useState<Set<SoStatus>>(new Set())
@@ -250,7 +256,7 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
       case 'total':
         return (
           <TableCell key={key} className="text-right tabular-nums">
-            <span className="font-semibold">{so.totalForeign.toFixed(2)}{sym(so.currency)}</span>
+            <span className="font-semibold">{fmtForeign(so.totalForeign, so.currency)}</span>
             {so.currency !== baseCurrency.code && (
               <span className="text-muted-foreground text-xs font-normal ml-1">({fmtBase(so.totalBase)})</span>
             )}
@@ -387,7 +393,7 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
                           {STATUS_LABELS[so.status]}
                         </span>
                         <span className="text-sm font-semibold tabular-nums">
-                          {so.totalForeign.toFixed(2)}{sym(so.currency)}
+                          {fmtForeign(so.totalForeign, so.currency)}
                         </span>
                       </div>
                     </div>
