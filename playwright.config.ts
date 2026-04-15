@@ -14,7 +14,7 @@ const baseURL = process.env.E2E_BASE_URL ?? `http://127.0.0.1:${PORT}`
 // `wc-isolated` project AFTER the main chromium project has fully
 // completed. Add new WC-setting-mutating specs here, not to the
 // main project.
-const WC_ISOLATED_SPECS = /(?:stock-sync-drift|woocommerce)\.spec\.ts/
+const ISOLATED_SPECS = /(?:stock-sync-drift|woocommerce|security-workflows)\.spec\.ts/
 
 export default defineConfig({
   testDir: './e2e',
@@ -43,7 +43,7 @@ export default defineConfig({
       dependencies: ['setup'],
       // Keep WC-setting-mutating specs out of the parallel pool. They
       // run later in `wc-isolated` with serialized ordering.
-      testIgnore: WC_ISOLATED_SPECS,
+      testIgnore: ISOLATED_SPECS,
     },
     {
       // WooCommerce-setting-mutating specs. Runs strictly after
@@ -60,7 +60,7 @@ export default defineConfig({
       },
       dependencies: ['setup', 'chromium'],
       fullyParallel: false,
-      testMatch: WC_ISOLATED_SPECS,
+      testMatch: ISOLATED_SPECS,
     },
   ],
   webServer: {

@@ -7,7 +7,7 @@
 import { NextRequest } from 'next/server'
 import { requireAuth } from '@/lib/auth/server'
 import { db } from '@/lib/db'
-import { TOTP } from 'otplib'
+import { generateSecret, generateURI, verify } from 'otplib'
 import QRCode from 'qrcode'
 import { z } from 'zod'
 
@@ -17,8 +17,8 @@ const disableSchema = z.object({ code: z.string().length(6) })
 export async function GET() {
   const session = await requireAuth()
 
-  const secret = new TOTP().generateSecret()
-  const otpAuthUrl = new TOTP({ secret, label: session.user.email, issuer: 'onetwoInventory' }).toURI()
+  const secret = generateSecret()
+  const otpAuthUrl = generateURI({ secret, label: session.user.email, issuer: 'onetwoInventory' })
   const qrDataUrl = await QRCode.toDataURL(otpAuthUrl)
 
   // Stage the secret server-side so POST can use it without trusting the client.
@@ -47,7 +47,7 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: 'No pending 2FA setup — start again' }, { status: 400 })
   }
 
-  const result = await new TOTP({ secret: user.pendingTotpSecret }).verify(parsed.data.code)
+  const result = await verify({ secret: user.pendingTotpSecret, token: parsed.data.code })
   if (!result.valid) {
     return Response.json({ error: 'Invalid code — please try again' }, { status: 400 })
   }
@@ -81,7 +81,7 @@ export async function DELETE(request: NextRequest) {
     return Response.json({ error: '2FA not enabled' }, { status: 400 })
   }
 
-  const result = await new TOTP({ secret: user.totpSecret }).verify(parsed.data.code)
+  const result = await verify({ secret: user.totpSecret, token: parsed.data.code })
   if (!result.valid) {
     return Response.json({ error: 'Invalid code' }, { status: 400 })
   }

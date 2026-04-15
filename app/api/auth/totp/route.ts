@@ -7,7 +7,7 @@ import { randomBytes } from 'crypto'
 import { NextRequest } from 'next/server'
 import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
-import { TOTP } from 'otplib'
+import { verify } from 'otplib'
 import { z } from 'zod'
 import { setAuthToken } from '@/lib/auth/token-store'
 import { checkRateLimit, clearRateLimit } from '@/lib/rate-limit'
@@ -44,8 +44,7 @@ export async function POST(request: NextRequest) {
     return Response.json({ error: '2FA not enabled' }, { status: 400 })
   }
 
-  const totp = new TOTP({ secret: user.totpSecret })
-  const result = await totp.verify(parsed.data.code)
+  const result = await verify({ secret: user.totpSecret, token: parsed.data.code })
 
   if (!result.valid) {
     return Response.json({ error: 'Invalid code' }, { status: 400 })

@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition, useCallback, useEffect } from 'react'
+import { Fragment, useState, useTransition, useCallback, useEffect } from 'react'
 import {
   Search,
   Filter,
@@ -227,9 +227,8 @@ export function ActivityClient({ initialRows, initialTotal, availableTags }: Pro
             </TableRow>
           ) : (
             rows.map((row) => (
-              <>
+              <Fragment key={row.id}>
                 <TableRow
-                  key={row.id}
                   className={`cursor-pointer ${LEVEL_ROW_STYLE[row.level] ?? ''}`}
                   onClick={() => setExpandedId(expandedId === row.id ? null : row.id)}
                 >
@@ -262,8 +261,8 @@ export function ActivityClient({ initialRows, initialTotal, availableTags }: Pro
                   <TableCell>{row.description}</TableCell>
                   <TableCell className="text-muted-foreground">{row.userName ?? 'System'}</TableCell>
                 </TableRow>
-                {expandedId === row.id && row.metadata && (
-                  <TableRow key={`${row.id}-meta`} className="bg-muted/20">
+                {expandedId === row.id && row.metadata != null && (
+                  <TableRow className="bg-muted/20">
                     <TableCell />
                     <TableCell colSpan={5}>
                       <div className="text-xs space-y-1">
@@ -283,7 +282,7 @@ export function ActivityClient({ initialRows, initialTotal, availableTags }: Pro
                     </TableCell>
                   </TableRow>
                 )}
-              </>
+              </Fragment>
             ))
           )}
         </TableBody>

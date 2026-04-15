@@ -9,6 +9,7 @@ const WORKFLOW_OPTIONS = [
     baseSpecs: [
       'e2e/sales-management.spec.ts',
       'e2e/sales-fulfillment.spec.ts',
+      'e2e/navigation-detail.spec.ts',
       'e2e/regressions.spec.ts',
     ],
     integrationSpecs: [
@@ -57,6 +58,10 @@ const WORKFLOW_OPTIONS = [
     label: 'Configuration Changes Workflow',
     baseSpecs: [
       'e2e/admin-workflows.spec.ts',
+      'e2e/backup-notifications.spec.ts',
+      'e2e/navigation-detail.spec.ts',
+      'e2e/route-coverage.spec.ts',
+      'e2e/security-workflows.spec.ts',
     ],
     integrationSpecs: [
       'e2e/stock-sync-drift.spec.ts',

@@ -1,8 +1,8 @@
 'use client'
 
-import { useEffect, useState, useSyncExternalStore, useTransition } from 'react'
+import { useEffect, useState, useTransition } from 'react'
 import Link from 'next/link'
-import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend, Cell, ReferenceLine } from 'recharts'
+import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, Legend, Cell, ReferenceLine } from 'recharts'
 import { TrendingUp, TrendingDown, Minus, Loader2 } from 'lucide-react'
 import { Card } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
@@ -89,6 +89,43 @@ function MobileChartFrame({
   )
 }
 
+function DesktopChartFrame({
+  children,
+  className = 'h-56 sm:h-56',
+}: {
+  children: (width: number) => React.ReactNode
+  className?: string
+}) {
+  const [node, setNode] = useState<HTMLDivElement | null>(null)
+  const [width, setWidth] = useState<number | null>(null)
+
+  useEffect(() => {
+    if (!node) return
+
+    const update = () => {
+      const rect = node.getBoundingClientRect()
+      setWidth(rect.width >= 200 && rect.height >= 200 ? Math.floor(rect.width) : null)
+    }
+
+    update()
+
+    const observer = new ResizeObserver(() => update())
+    observer.observe(node)
+
+    return () => observer.disconnect()
+  }, [node])
+
+  return (
+    <div ref={setNode} className={`${className} min-h-56 min-w-0`}>
+      {width ? (
+        children(width)
+      ) : (
+        <div className="h-full w-full rounded-md bg-muted/30" />
+      )}
+    </div>
+  )
+}
+
 export function DashboardClient({ kpi: initKpi, chartData: initChart, topProducts: initTop, recentOrders, incomingPOs, periodLabel: initPL, compLabel: initCL, initialPeriod, initialCompare }: Props) {
   const [isPending, startTransition] = useTransition()
   const [isNarrow, setIsNarrow] = useState<boolean | null>(null)
@@ -101,12 +138,6 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
   const [topProducts, setTopProducts] = useState(initTop)
   const [periodLabel, setPeriodLabel] = useState(initPL)
   const [compLabel, setCompLabel] = useState(initCL)
-
-  const chartsReady = useSyncExternalStore(
-    () => () => {},
-    () => true,
-    () => false,
-  )
 
   useEffect(() => {
     const media = window.matchMedia('(max-width: 639px)')
@@ -135,17 +166,11 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
   const xAnchor = chartData.length > 14 ? 'end' as const : 'middle' as const
   const xHeight = chartData.length > 14 ? 50 : 30
 
-  function renderResponsiveChart(render: () => React.ReactNode, className = 'h-56 sm:h-56') {
+  function renderResponsiveChart(render: (width: number) => React.ReactNode, className = 'h-56 sm:h-56') {
     return (
-      <div className={`${className} min-h-56 min-w-0`}>
-        {chartsReady ? (
-          <ResponsiveContainer width="99%" height="100%" minHeight={224} debounce={50}>
-            {render()}
-          </ResponsiveContainer>
-        ) : (
-          <div className="h-full w-full rounded-md bg-muted/30" />
-        )}
-      </div>
+      <DesktopChartFrame className={className}>
+        {render}
+      </DesktopChartFrame>
     )
   }
 
@@ -243,8 +268,8 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                 </BarChart>
               )}
             </MobileChartFrame>
-          ) : renderResponsiveChart(() => (
-              <BarChart data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
+          ) : renderResponsiveChart((chartWidth) => (
+              <BarChart width={chartWidth} height={224} data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                 <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={xInterval} angle={xAngle} textAnchor={xAnchor} height={xHeight} />
                 <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={40} />
@@ -272,8 +297,8 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                 </LineChart>
               )}
             </MobileChartFrame>
-          ) : renderResponsiveChart(() => (
-              <LineChart data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
+          ) : renderResponsiveChart((chartWidth) => (
+              <LineChart width={chartWidth} height={224} data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                 <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={xInterval} angle={xAngle} textAnchor={xAnchor} height={xHeight} />
                 <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={40} />
@@ -302,8 +327,8 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                 </LineChart>
               )}
             </MobileChartFrame>
-          ) : renderResponsiveChart(() => (
-              <LineChart data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
+          ) : renderResponsiveChart((chartWidth) => (
+              <LineChart width={chartWidth} height={224} data={chartData} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                 <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={xInterval} angle={xAngle} textAnchor={xAnchor} height={xHeight} />
                 <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => `${v}%`} width={40} domain={[0, 100]} />
@@ -336,8 +361,8 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                 </BarChart>
               )}
             </MobileChartFrame>
-          ) : renderResponsiveChart(() => (
-              <BarChart data={bridge} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
+          ) : renderResponsiveChart((chartWidth) => (
+              <BarChart width={chartWidth} height={224} data={bridge} margin={{ top: 5, right: 5, left: 0, bottom: 5 }}>
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                 <XAxis dataKey="name" tick={{ fontSize: 9 }} interval={0} />
                 <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : v < -1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={45} />
