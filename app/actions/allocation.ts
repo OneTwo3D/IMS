@@ -5,7 +5,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { auth } from '@/lib/auth'
 import { requirePermission } from '@/lib/auth/server'
-import { enqueueStockSync } from '@/lib/shopping'
+import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 
 async function requireAuth() {
   const session = await auth()
@@ -786,6 +786,11 @@ export async function updateShipmentStatus(
     })
     if (targetStatus === 'SHIPPED') {
       try {
+        await pushOrderDeliveryMetadata(shipment.orderId)
+      } catch (syncError) {
+        console.error(syncError)
+      }
+      try {
         await enqueueStockSync(
           [...new Set(shipment.lines.map((line) => line.productId))],
           'IMS_CHANGE',
@@ -797,5 +802,79 @@ export async function updateShipmentStatus(
     return { success: true }
   } catch (e) {
     return { success: false, error: String(e) }
+  }
+}
+
+export async function updateShipmentTracking(
+  shipmentId: string,
+  payload: { trackingNumber?: string; shippingService?: string },
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    await requirePermission('sales.process')
+    const shipment = await db.shipment.findUnique({
+      where: { id: shipmentId },
+      include: {
+        order: { select: { id: true, orderNumber: true, wcOrderNumber: true } },
+        warehouse: { select: { code: true } },
+      },
+    })
+    if (!shipment) return { success: false, error: 'Shipment not found' }
+    if (shipment.status !== 'SHIPPED') {
+      return { success: false, error: 'Only shipped shipments can have tracking edited' }
+    }
+
+    const trackingNumber = payload.trackingNumber?.trim() || null
+    const shippingService = payload.shippingService?.trim() || null
+
+    await db.shipment.update({
+      where: { id: shipmentId },
+      data: {
+        trackingNumber,
+        shippingService,
+      },
+    })
+
+    const shippedShipments = await db.shipment.findMany({
+      where: { orderId: shipment.orderId, status: 'SHIPPED' },
+      select: { trackingNumber: true },
+    })
+    const trackingNumbers = shippedShipments
+      .map((row) => row.trackingNumber)
+      .filter(Boolean)
+      .join(', ')
+
+    await db.salesOrder.update({
+      where: { id: shipment.orderId },
+      data: {
+        trackingNumber: trackingNumbers || null,
+      },
+    })
+
+    revalidatePath('/sales')
+    revalidatePath(`/sales/${shipment.orderId}`)
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: shipment.orderId,
+      action: 'shipment_tracking_updated',
+      tag: 'sales',
+      level: 'INFO',
+      description: `Updated tracking for shipment from ${shipment.warehouse.code} on order ${shipment.order.orderNumber ?? shipment.order.wcOrderNumber}`,
+      metadata: {
+        shipmentId,
+        warehouseCode: shipment.warehouse.code,
+        trackingNumber,
+        shippingService,
+      },
+    })
+
+    try {
+      await pushOrderDeliveryMetadata(shipment.orderId)
+    } catch (syncError) {
+      console.error(syncError)
+    }
+
+    return { success: true }
+  } catch (error) {
+    return { success: false, error: String(error) }
   }
 }

@@ -1,4 +1,8 @@
 import { defineConfig, devices } from '@playwright/test'
+import { config as loadDotenv } from 'dotenv'
+
+loadDotenv({ path: '.env.local', override: false })
+loadDotenv({ path: '.env', override: false })
 
 const PORT = Number(process.env.E2E_PORT ?? 3001)
 const baseURL = process.env.E2E_BASE_URL ?? `http://127.0.0.1:${PORT}`

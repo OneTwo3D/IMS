@@ -567,7 +567,7 @@ CRON_LINES=(
 success "Cron jobs configured:"
 echo "  - 02:00 Daily scheduled backup (if enabled in settings)"
 echo "  - 03:00 Activity log cleanup"
-echo "  - Every 5 min WooCommerce sync polling"
+echo "  - 04:00 WooCommerce backup reconciliation and stock retry drain"
 echo "  - Every 15 min Delivery status polling"
 echo "  - 06:00 FX rate update"
 

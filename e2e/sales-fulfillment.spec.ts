@@ -5,8 +5,12 @@ const FULFILLMENT_WAREHOUSE_LABEL = 'CBG — Cambridge'
 const FULFILLMENT_WAREHOUSE_CODE = 'CBG'
 const allocatedStatus = /^(Allocated)$/
 const shippedStatus = /^(Shipped)$/
+const INITIAL_TRACKING = 'E2E-TRACK-INITIAL-001'
+const UPDATED_TRACKING = 'E2E-TRACK-UPDATED-002'
+const INITIAL_CARRIER = 'Royal Mail'
+const UPDATED_CARRIER = 'DHL'
 
-test('processes a sales order through allocation and shipment', async ({ page }) => {
+test('processes a sales order through shipment and tracking edit', async ({ page }) => {
   const product = await createSimpleProduct(page, { price: '18.50' })
   await addStockAdjustment(page, product.sku, 5, FULFILLMENT_WAREHOUSE_CODE)
 
@@ -44,8 +48,24 @@ test('processes a sales order through allocation and shipment', async ({ page })
 
   await page.getByRole('button', { name: /^Ship$/ }).click()
   const shipDialog = page.getByRole('dialog', { name: 'Ship Parcel' })
+  await expect(shipDialog).toBeVisible()
+  await shipDialog.locator('select').selectOption({ label: INITIAL_CARRIER })
+  await shipDialog.locator('input').fill(INITIAL_TRACKING)
   await shipDialog.getByRole('button', { name: /confirm shipment/i }).click()
   await expect(shipDialog).toBeHidden()
 
   await expect(page.getByText(shippedStatus).first()).toBeVisible()
+  await expect(page.getByText(`#${INITIAL_TRACKING}`)).toBeVisible()
+
+  await page.getByRole('button', { name: /edit tracking/i }).click()
+  const editDialog = page.getByRole('dialog', { name: 'Edit Tracking' })
+  await expect(editDialog).toBeVisible()
+  await expect(editDialog.locator('input')).toHaveValue(INITIAL_TRACKING)
+  await editDialog.locator('select').selectOption({ label: UPDATED_CARRIER })
+  await editDialog.locator('input').fill(UPDATED_TRACKING)
+  await editDialog.getByRole('button', { name: /save tracking/i }).click()
+  await expect(editDialog).toBeHidden()
+
+  await expect(page.getByText(`#${UPDATED_TRACKING}`)).toBeVisible()
+  await expect(page.getByText(`#${INITIAL_TRACKING}`)).toHaveCount(0)
 })

@@ -121,11 +121,17 @@ Five scheduled tasks are configured automatically:
 |---|---|---|
 | 02:00 | `/api/cron/backup` | Scheduled backup (if enabled in settings) with retention and remote upload |
 | 03:00 | `/api/cron/activity-cleanup` | Purge activity log entries past their retention period |
-| Every 5 min | `/api/cron/wc-sync` | Poll WooCommerce for order, product, and stock changes |
+| 04:00 | `/api/cron/wc-reconcile` | WooCommerce backup reconciliation for orders/products plus stock retry draining |
 | Every 15 min | `/api/cron/delivery-status` | Poll delivery tracking providers for shipment status updates |
 | 06:00 | `/api/cron/fx-rates` | Fetch latest exchange rates from frankfurter.dev |
 
 All cron jobs run under the `imsapp` user and call the application's API endpoints via `curl`. Cron endpoints require the `CRON_SECRET` header or a request from localhost for security.
+
+For WooCommerce specifically:
+
+- real-time order/product intake should come from webhooks
+- `/api/cron/wc-reconcile` is the backup reconcile path and retry drain
+- `/api/cron/wc-sync` should be treated as a legacy compatibility route only
 
 
 ## Updating

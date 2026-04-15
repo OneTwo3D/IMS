@@ -4,6 +4,8 @@ import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verif
 import { importWcOrder } from '@/lib/connectors/woocommerce/sync/order-import'
 import { syncWcOrderStatus } from '@/lib/connectors/woocommerce/sync/order-status'
 import { syncRefundsForOrder } from '@/lib/connectors/woocommerce/sync/refund-sync'
+import { shouldSuppressWcOrderWebhookEcho } from '@/lib/connectors/woocommerce/sync/order-webhook-echo'
+import { logActivity } from '@/lib/activity-log'
 import type { WcFullOrder } from '@/lib/connectors/woocommerce/sync/types'
 
 export async function POST(request: Request) {
@@ -53,6 +55,24 @@ export async function POST(request: Request) {
   if (topic === 'order.created') {
     await importWcOrder(wcOrder)
   } else if (topic === 'order.updated') {
+    const suppressed = await shouldSuppressWcOrderWebhookEcho(wcOrder)
+    if (suppressed.suppress) {
+      await logActivity({
+        entityType: 'SYNC',
+        action: 'wc_order_webhook_suppressed',
+        tag: 'sync',
+        level: 'INFO',
+        description: `Suppressed WooCommerce order webhook echo for WC order #${wcOrder.number}`,
+        metadata: {
+          wcOrderId: wcOrder.id,
+          reason: suppressed.reason,
+          topic,
+          status: wcOrder.status,
+        },
+      })
+      return NextResponse.json({ ok: true, suppressed: suppressed.reason })
+    }
+
     // Try import first (in case order wasn't synced yet)
     await importWcOrder(wcOrder)
     // Then sync status

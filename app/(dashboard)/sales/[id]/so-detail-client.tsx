@@ -20,7 +20,7 @@ import { sendSalesOrderEmail, sendInvoiceEmail } from '@/app/actions/email'
 import {
   autoAllocateOrder, getOrderAllocations, getOrderShipments,
   deallocateOrder, confirmAllocations, updateAllocation, addAllocation,
-  updateShipmentStatus,
+  updateShipmentStatus, updateShipmentTracking,
   type AllocationRow, type ShipmentRow,
 } from '@/app/actions/allocation'
 import type { CurrencyRow } from '@/app/actions/currencies'
@@ -586,6 +586,7 @@ function ShipmentsPanel({
 }) {
   const [isPending, startTransition] = useTransition()
   const [shipDialogId, setShipDialogId] = useState<string | null>(null)
+  const [editingShipmentId, setEditingShipmentId] = useState<string | null>(null)
   const [tracking, setTracking] = useState('')
   const [service, setService] = useState('')
   const [error, setError] = useState('')
@@ -593,6 +594,7 @@ function ShipmentsPanel({
   function handleAdvance(shipmentId: string, target: string) {
     if (target === 'SHIPPED') {
       setShipDialogId(shipmentId)
+      setEditingShipmentId(null)
       setTracking('')
       setService('')
       return
@@ -608,13 +610,26 @@ function ShipmentsPanel({
   function handleShip(shipmentId: string) {
     setError('')
     startTransition(async () => {
-      const result = await updateShipmentStatus(shipmentId, 'SHIPPED', {
-        trackingNumber: tracking || undefined,
-        shippingService: service || undefined,
-      })
-      if (result.success) { setShipDialogId(null); onRefresh() }
+      const result = editingShipmentId === shipmentId
+        ? await updateShipmentTracking(shipmentId, {
+            trackingNumber: tracking || undefined,
+            shippingService: service || undefined,
+          })
+        : await updateShipmentStatus(shipmentId, 'SHIPPED', {
+            trackingNumber: tracking || undefined,
+            shippingService: service || undefined,
+          })
+      if (result.success) { setShipDialogId(null); setEditingShipmentId(null); onRefresh() }
       else setError(result.error ?? 'Failed')
     })
+  }
+
+  function handleEditTracking(shipment: ShipmentRow) {
+    setError('')
+    setShipDialogId(shipment.id)
+    setEditingShipmentId(shipment.id)
+    setTracking(shipment.trackingNumber ?? '')
+    setService(shipment.shippingService ?? '')
   }
 
   return (
@@ -649,6 +664,11 @@ function ShipmentsPanel({
                     {nextAction.label}
                   </Button>
                 )}
+                {s.status === 'SHIPPED' && (
+                  <Button variant="outline" size="sm" className="h-7 text-xs" onClick={() => handleEditTracking(s)} disabled={isPending}>
+                    Edit Tracking
+                  </Button>
+                )}
               </div>
             </div>
             <div className="divide-y">
@@ -675,7 +695,7 @@ function ShipmentsPanel({
       {shipDialogId && (
         <Dialog open onOpenChange={() => {}}>
           <DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
-            <DialogHeader><DialogTitle>Ship Parcel</DialogTitle></DialogHeader>
+            <DialogHeader><DialogTitle>{editingShipmentId === shipDialogId ? 'Edit Tracking' : 'Ship Parcel'}</DialogTitle></DialogHeader>
             <div className="space-y-4">
               <div className="space-y-1.5">
                 <Label>Carrier</Label>
@@ -691,9 +711,9 @@ function ShipmentsPanel({
               {error && <p className="text-sm text-destructive">{error}</p>}
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => setShipDialogId(null)} disabled={isPending}>Cancel</Button>
+              <Button variant="outline" onClick={() => { setShipDialogId(null); setEditingShipmentId(null) }} disabled={isPending}>Cancel</Button>
               <Button onClick={() => handleShip(shipDialogId)} disabled={isPending}>
-                {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Confirm Shipment
+                {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}{editingShipmentId === shipDialogId ? 'Save Tracking' : 'Confirm Shipment'}
               </Button>
             </DialogFooter>
           </DialogContent>

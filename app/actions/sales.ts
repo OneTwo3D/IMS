@@ -5,7 +5,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
-import { enqueueStockSync } from '@/lib/shopping'
+import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import {
@@ -1128,6 +1128,11 @@ export async function applySalesOrderStatusTransition(
     }
 
     if (targetStatus === 'SHIPPED') {
+      try {
+        await pushOrderDeliveryMetadata(id)
+      } catch (syncError) {
+        console.error(syncError)
+      }
       try {
         await enqueueStockSync(
           so.lines.map((line) => line.productId).filter((value): value is string => !!value),

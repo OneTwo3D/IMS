@@ -8,6 +8,7 @@ import type { StockSyncReason } from '@/app/generated/prisma/enums'
 type ActiveShoppingConnector = 'woocommerce'
 
 export type PushProductMetadataResult = { success: boolean; error?: string }
+export type PushOrderDeliveryMetadataResult = { success: boolean; skipped?: boolean; error?: string }
 
 async function getActiveShoppingConnector(): Promise<ActiveShoppingConnector | null> {
   const { db } = await import('@/lib/db')
@@ -43,6 +44,18 @@ export async function pushProductMetadata(productId: string): Promise<PushProduc
     case 'woocommerce': {
       const { pushImsProductToWc } = await import('@/lib/connectors/woocommerce/sync/product-sync')
       return pushImsProductToWc(productId)
+    }
+  }
+}
+
+export async function pushOrderDeliveryMetadata(orderId: string): Promise<PushOrderDeliveryMetadataResult> {
+  const connector = await getActiveShoppingConnector()
+  if (!connector) return { success: false, error: 'No shopping connector configured' }
+
+  switch (connector) {
+    case 'woocommerce': {
+      const { pushImsTrackingToWc } = await import('@/lib/connectors/woocommerce/sync/tracking-sync')
+      return pushImsTrackingToWc(orderId)
     }
   }
 }

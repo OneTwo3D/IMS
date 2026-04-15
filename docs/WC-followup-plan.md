@@ -24,10 +24,18 @@ Known operational caveat:
 - The stage WooCommerce Action Scheduler is not auto-draining webhook delivery jobs reliably, so live validation currently requires forcing only the relevant generated action IDs. This is a stage/store infrastructure issue, not an IMS webhook-handler issue.
 
 Still open / partial:
-- IMS does not yet push tracking metadata back to WooCommerce.
 - Stock sync still uses its own immediate push + retry-drain model rather than a documented webhook-first narrative across all sync categories.
 - Backup reconciliation behavior exists, but the cron split and naming can still be clarified further.
-- There is no dedicated live E2E coverage for outbound tracking sync because that connector behavior is not implemented yet.
+- Documentation still needs to be aligned everywhere to the webhook-first + daily reconcile cron model.
+- A manual live stage runbook still needs to exist alongside the automated coverage.
+
+Closed in follow-up work after this plan was written:
+- IMS now pushes tracking metadata back to WooCommerce by writing AST-compatible `_wc_shipment_tracking_items` order meta through the WooCommerce connector.
+- Tracking writes are triggered both when a shipment is first shipped and when shipped-shipment tracking is edited later in IMS.
+- Tracking/status echo suppression now exists on WooCommerce order webhooks, so IMS-originated reflected writes are logged and skipped rather than re-mutating IMS orders.
+- Automated coverage now exists for:
+  - shipment tracking add/edit inside IMS, and
+  - live WooCommerce tracking push verification via the external Playwright suite.
 
 ## Work items
 
@@ -129,15 +137,14 @@ Definition of done:
 
 ## Suggested order
 
-1. Outbound IMS → WooCommerce tracking sync
-2. Tracking/stock echo suppression hardening
-3. Cron-shape cleanup and operator model
-4. Live/automated E2E expansion
-5. Connector-boundary cleanup where needed
+1. Cron-shape cleanup and operator model
+2. Live/manual verification runbook
+3. Stock-sync narrative cleanup where needed
+4. Connector-boundary cleanup where needed
 
 ## Suggested next-session starting checklist
 
 1. Re-read `docs/WC-followup-plan.md`.
-2. Identify the exact WooCommerce tracking plugin/API used on stage/live.
-3. Inspect how tracking data is currently stored on WooCommerce orders.
-4. Implement outbound tracking sync first, because it is the largest remaining functional gap proven by live testing.
+2. Confirm the operator-facing docs all point to `/api/cron/wc-reconcile`, not `/api/cron/wc-sync`, except where legacy compatibility is explicitly mentioned.
+3. Keep the stage live runbook in sync with the external Playwright coverage as webhook/store behavior evolves.
+4. Revisit whether stock retry draining should eventually move behind a more generic connector-owned job name once Shopify support starts.

@@ -77,6 +77,22 @@ The **Status Mapping** tab controls how WooCommerce statuses translate to One Tw
 
 Other IMS status changes are not pushed back to WooCommerce.
 
+### Tracking Sync (IMS to WC)
+
+Shipment tracking is pushed back to WooCommerce when:
+
+- a shipment is first shipped in IMS, or
+- tracking on an already-shipped shipment is edited later in IMS
+
+The WooCommerce connector writes AST-compatible order meta to `_wc_shipment_tracking_items`, matching the same tracking source that IMS already reads inbound for completion and delivery-status flows.
+
+Behavior notes:
+
+- Tracking is pushed per shipped shipment where shipment records exist
+- Legacy non-shipment orders fall back to the order-level tracking fields
+- Re-saving the same tracking is idempotent and does not intentionally create duplicate upstream entries
+- Reflected WooCommerce `order.updated` webhooks from IMS-originated status/tracking pushes are explicitly suppressed
+
 ## Product Sync
 
 The **Products** tab controls bidirectional product synchronisation.
@@ -110,7 +126,7 @@ Stock levels are pushed from One Two Inventory to WooCommerce. Enable this in th
 - **Include COGS** — optionally pushes the oldest FIFO cost layer unit cost to WooCommerce's native COGS field (requires WooCommerce 9.2+ or the WC COGS plugin)
 - Stock is pushed in batches of 100 products via the WC batch API
 
-Use **Push Stock Now** for an immediate sync, or let the cron job handle it automatically.
+Use **Push Stock Now** for an immediate sync. Regular stock retries are drained by the WooCommerce reconcile cron; stock is not primarily driven by cron polling anymore.
 
 ## Tax Rates
 
@@ -164,15 +180,27 @@ The **Sync Log** tab shows the last 100 synchronisation events. Each entry inclu
 
 Use this log to troubleshoot sync issues and verify that orders and products are flowing correctly.
 
-## Cron Job
+## Cron Jobs
 
-If webhooks are not used (or as a fallback alongside webhooks), the system polls WooCommerce on a schedule via the `/api/cron/wc-sync` endpoint. This endpoint:
+WooCommerce is now webhook-first. Scheduled jobs exist for backup reconciliation and retry draining, not as the primary intake path.
 
-1. Imports new and updated orders (incremental, using a last-synced watermark)
-2. Syncs products if product sync is enabled
-3. Pushes stock levels if stock sync is enabled
+### Primary scheduled endpoint
 
-The endpoint requires a `CRON_SECRET` header for security. See the [Installation guide](installation.md) for cron setup instructions.
+Use `/api/cron/wc-reconcile` as the scheduled WooCommerce endpoint. By default it should run roughly daily.
+
+What it does:
+
+1. Reconciles orders if order webhooks are not active or the daily backup reconcile is due
+2. Reconciles products if product webhooks are not active or the daily backup reconcile is due
+3. Drains queued stock retry jobs
+
+### Legacy compatibility endpoint
+
+`/api/cron/wc-sync` still exists as a compatibility route, but it simply forwards to the reconcile logic and returns a note that `/api/cron/wc-reconcile` is the replacement. New installs and current operator docs should use `/api/cron/wc-reconcile`.
+
+The cron endpoints require a `CRON_SECRET` header for security. See the [Installation guide](installation.md) for cron setup instructions.
+
+For a repeatable live verification checklist, see the [WooCommerce live verification runbook](woocommerce-live-runbook.md).
 
 ## Historical Order Import (Forecasting)
 
