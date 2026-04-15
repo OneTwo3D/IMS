@@ -90,7 +90,7 @@ Use this only to validate the backup path, not as the primary success criterion.
 2. Confirm it:
    - reconciles orders/products only when due or when webhook-primary mode is inactive
    - drains queued stock retry jobs
-3. Confirm operators are not relying on `/api/cron/wc-sync` except for legacy compatibility.
+   - force-pushes a current stock catch-up snapshot when the daily stock reconcile is due
 
 Expected result:
 

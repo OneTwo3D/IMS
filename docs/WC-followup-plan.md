@@ -7,6 +7,20 @@ Branch baseline: `main`
 
 Close the remaining WooCommerce follow-up items after the webhook-first shift for orders and products, while keeping the shopping connector boundary replaceable for a future Shopify connector.
 
+## Outcome
+
+Status as of 2026-04-15:
+- The originally planned follow-up implementation work is complete.
+- WooCommerce order and product intake is webhook-first.
+- `/api/cron/wc-reconcile` is the documented backup reconcile endpoint and also drains queued stock retry jobs.
+- `/api/cron/wc-reconcile` is the only remaining daily WooCommerce catch-up endpoint.
+- IMS now pushes tracking metadata back to WooCommerce and suppresses reflected webhook echoes.
+- Live verification documentation and automated Playwright coverage both exist.
+
+What remains is strategic cleanup rather than missing functionality:
+- decide whether stock retry draining should eventually move to a more generic connector-owned job name when Shopify work starts
+- keep watching for WooCommerce-specific assumptions leaking outside the connector boundary during future changes
+
 ## Current status
 
 Already fixed:
@@ -23,11 +37,11 @@ Already fixed:
 Known operational caveat:
 - The stage WooCommerce Action Scheduler is not auto-draining webhook delivery jobs reliably, so live validation currently requires forcing only the relevant generated action IDs. This is a stage/store infrastructure issue, not an IMS webhook-handler issue.
 
-Still open / partial:
-- Stock sync still uses its own immediate push + retry-drain model rather than a documented webhook-first narrative across all sync categories.
-- Backup reconciliation behavior exists, but the cron split and naming can still be clarified further.
-- Documentation still needs to be aligned everywhere to the webhook-first + daily reconcile cron model.
-- A manual live stage runbook still needs to exist alongside the automated coverage.
+Current intended operating model:
+- Orders: webhook-first inbound sync, with daily backup reconciliation
+- Products: webhook-first inbound sync, with daily backup reconciliation
+- Stock: immediate IMS-originated outbound push with queued retry draining and forced daily catch-up inside `/api/cron/wc-reconcile`
+- Tracking: immediate IMS-originated outbound push with webhook echo suppression
 
 Closed in follow-up work after this plan was written:
 - IMS now pushes tracking metadata back to WooCommerce by writing AST-compatible `_wc_shipment_tracking_items` order meta through the WooCommerce connector.
@@ -41,110 +55,61 @@ Closed in follow-up work after this plan was written:
 
 ### 1. Implement outbound IMS → WooCommerce tracking sync
 
-Problem:
-- IMS can store shipment/order tracking, but the WooCommerce connector currently only pushes order status outbound.
-- WooCommerce tracking is only read inbound from order meta; there is no outbound write path.
+Status: closed
 
-Required changes:
-- Decide the target integration shape:
-  - write the shipment-tracking plugin meta directly, or
-  - call a dedicated plugin/API endpoint if one exists on the store.
-- Add a WooCommerce connector function for tracking writes.
-- Trigger it from the IMS shipment/order shipping flow when tracking is added or changed.
-- Ensure idempotent updates so re-saving tracking does not create duplicate tracking entries upstream.
-- Add activity/wc sync logs so failed tracking pushes are diagnosable.
-
-Questions to resolve:
-- Which stage/live WooCommerce tracking plugin is the system of record?
-- Does the store expect one tracking entry per shipment or one per order?
-- Should carrier normalization happen in IMS or in the WooCommerce connector layer?
-
-Definition of done:
-- Adding or editing tracking in IMS writes the expected tracking data to the linked WooCommerce order.
-- Repeating the same update is safe.
-- Failures are visible in logs and recoverable.
+Implemented:
+- tracking writes go through the shopping connector boundary
+- WooCommerce-specific payload shaping stays inside `lib/connectors/woocommerce`
+- writes are idempotent and logged
+- shipment-create and shipment-edit flows both trigger outbound tracking sync
 
 ### 2. Harden echo suppression for tracking and stock-adjacent webhook loops
 
-Problem:
-- Product stock webhook suppression exists, but outbound tracking sync will create a new loop risk once implemented.
+Status: closed
 
-Required changes:
-- Reuse or extend the current webhook echo-suppression strategy for tracking writes.
-- Document which webhook topics are authoritative inbound signals versus reflections of IMS-originated pushes.
-- Verify that outbound writes do not cause duplicate shipment/order mutations inside IMS.
-
-Definition of done:
-- IMS-originated tracking pushes do not bounce back into duplicate IMS updates.
-- Suppression behavior is explicit and observable.
+Implemented:
+- order webhook echo suppression now covers IMS-originated status and tracking reflections
+- suppression events are logged rather than silently ignored
+- automated coverage exists for the main tracking path
 
 ### 3. Clarify the final WooCommerce cron shape
 
-Problem:
-- The architecture is now webhook-first, but operators still need a crisp mental model for what the remaining WooCommerce cron jobs do.
+Status: closed
 
-Required changes:
-- Review the remaining WooCommerce-related cron endpoints and responsibilities:
-  - order/product reconciliation
-  - stock retry draining
-  - any other WooCommerce-specific maintenance
-- Decide whether `wc-sync` compatibility can be removed entirely after rollout.
-- Keep backup reconciliation infrequent by default, ideally daily.
-- Keep stock retry draining separate if it still needs a higher-frequency worker cadence.
-
-Definition of done:
-- There is a clear split between:
-  - real-time webhook/on-demand sync
-  - backup reconciliation
-  - retry draining / maintenance
-- Cron naming and settings copy match that model exactly.
+Current model:
+- real-time inbound order/product changes come from WooCommerce webhooks
+- `/api/cron/wc-reconcile` performs backup reconciliation and owns the daily stock catch-up plus queued retry draining
+- `/api/cron/delivery-status` remains separate for carrier polling
 
 ### 4. Expand live and automated E2E coverage
 
-Problem:
-- Live scoped validation was done manually and proved key paths, but it is not yet captured as a repeatable test plan.
+Status: closed
 
-Required changes:
-- Add a documented manual runbook for live scoped stage tests:
-  - create/update product in WC and force only the generated IMS webhook
-  - create/update order in WC and force only the generated IMS webhook
-  - push product metadata from IMS to WC and verify the stage product
-  - once implemented, add IMS → WC tracking verification
-- Add automated test coverage where practical for:
-  - WC webhook status updates
-  - product metadata push
-  - tracking push
-
-Definition of done:
-- We have both:
-  - an operator-friendly live verification checklist, and
-  - regression coverage for the non-live connector logic.
+Implemented:
+- `docs/woocommerce-live-runbook.md` captures the operator-facing live verification checklist
+- Playwright coverage now covers shipment tracking edit flow and live WooCommerce tracking push verification
+- route and admin coverage were expanded so the selector-driven E2E harness reaches more integration-facing surfaces
 
 ### 5. Preserve connector replaceability for future Shopify support
 
-Problem:
-- WooCommerce-specific logic is still reasonably contained, but future changes could easily leak connector-specific assumptions back into core flows.
+Status: substantially closed, with ongoing hygiene expected
 
-Required changes:
-- Keep core app code importing shopping behavior through `lib/shopping.ts` or equivalent connector facades.
-- Avoid adding WooCommerce-specific meta formats or REST payload assumptions directly in generic sales/inventory actions.
-- When implementing tracking push, keep the core event as “update external delivery metadata” and leave WooCommerce-specific payload shape inside the connector module.
-- Document any remaining places where WooCommerce types still leak across the boundary and clean them up incrementally.
-
-Definition of done:
-- New WooCommerce work does not make Shopify replacement harder.
-- Connector-specific payloads stay inside `lib/connectors/woocommerce`.
+Current stance:
+- core flows should continue to import shopping behavior through `lib/shopping.ts`
+- WooCommerce payload/meta shaping should continue to stay inside `lib/connectors/woocommerce`
+- future connector work should treat this as an ongoing guardrail, not a new dedicated follow-up project
 
 ## Suggested order
 
+Completed order:
 1. Cron-shape cleanup and operator model
 2. Live/manual verification runbook
-3. Stock-sync narrative cleanup where needed
-4. Connector-boundary cleanup where needed
+3. Stock and tracking narrative cleanup
+4. Connector-boundary preservation during implementation
 
 ## Suggested next-session starting checklist
 
 1. Re-read `docs/WC-followup-plan.md`.
-2. Confirm the operator-facing docs all point to `/api/cron/wc-reconcile`, not `/api/cron/wc-sync`, except where legacy compatibility is explicitly mentioned.
+2. Confirm the operator-facing docs continue to point only to `/api/cron/wc-reconcile` for WooCommerce daily catch-up.
 3. Keep the stage live runbook in sync with the external Playwright coverage as webhook/store behavior evolves.
 4. Revisit whether stock retry draining should eventually move behind a more generic connector-owned job name once Shopify support starts.

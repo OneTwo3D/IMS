@@ -126,7 +126,7 @@ Stock levels are pushed from One Two Inventory to WooCommerce. Enable this in th
 - **Include COGS** — optionally pushes the oldest FIFO cost layer unit cost to WooCommerce's native COGS field (requires WooCommerce 9.2+ or the WC COGS plugin)
 - Stock is pushed in batches of 100 products via the WC batch API
 
-Use **Push Stock Now** for an immediate sync. Regular stock retries are drained by the WooCommerce reconcile cron; stock is not primarily driven by cron polling anymore.
+Use **Push Stock Now** for an immediate sync. Stock is still primarily event-driven from IMS changes, but the daily WooCommerce reconcile job also performs a forced stock catch-up and drains queued retry jobs as a safety net.
 
 ## Tax Rates
 
@@ -192,11 +192,7 @@ What it does:
 
 1. Reconciles orders if order webhooks are not active or the daily backup reconcile is due
 2. Reconciles products if product webhooks are not active or the daily backup reconcile is due
-3. Drains queued stock retry jobs
-
-### Legacy compatibility endpoint
-
-`/api/cron/wc-sync` still exists as a compatibility route, but it simply forwards to the reconcile logic and returns a note that `/api/cron/wc-reconcile` is the replacement. New installs and current operator docs should use `/api/cron/wc-reconcile`.
+3. Runs the daily stock catch-up by draining queued retry jobs and force-pushing current stock
 
 The cron endpoints require a `CRON_SECRET` header for security. See the [Installation guide](installation.md) for cron setup instructions.
 

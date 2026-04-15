@@ -130,8 +130,7 @@ All cron jobs run under the `imsapp` user and call the application's API endpoin
 For WooCommerce specifically:
 
 - real-time order/product intake should come from webhooks
-- `/api/cron/wc-reconcile` is the backup reconcile path and retry drain
-- `/api/cron/wc-sync` should be treated as a legacy compatibility route only
+- `/api/cron/wc-reconcile` is the daily backup reconcile path for orders/products and also runs the stock catch-up plus queued retry drain
 
 
 ## Updating

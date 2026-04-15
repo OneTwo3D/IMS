@@ -6,7 +6,7 @@
 // ---------------------------------------------------------------------------
 
 export type CronJobDef = {
-  slug: string            // URL path segment: 'backup', 'wc-sync'
+  slug: string            // URL path segment: 'backup', 'wc-reconcile'
   settingKey: string      // underscore form for Setting keys: 'backup', 'wc_sync'
   module: string          // free-form module id: 'system', 'woocommerce', 'xero'
   moduleLabel: string     // display name: 'System', 'WooCommerce', 'Xero'
