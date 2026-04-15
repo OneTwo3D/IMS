@@ -1,6 +1,7 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
+import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { auth } from '@/lib/auth'
@@ -9,6 +10,32 @@ import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
+
+async function lockSalesOrder(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+): Promise<void> {
+  await tx.$queryRaw(
+    Prisma.sql`SELECT id FROM "sales_orders" WHERE id = ${orderId} FOR UPDATE`,
+  )
+}
+
+async function lockStockLevels(
+  tx: Prisma.TransactionClient,
+  productIds: string[],
+  warehouseIds: string[],
+): Promise<void> {
+  if (productIds.length === 0 || warehouseIds.length === 0) return
+  await tx.$queryRaw(
+    Prisma.sql`
+      SELECT id
+      FROM "stock_levels"
+      WHERE "productId" IN (${Prisma.join(productIds)})
+        AND "warehouseId" IN (${Prisma.join(warehouseIds)})
+      FOR UPDATE
+    `,
+  )
+}
 
 async function requireAuth() {
   const session = await auth()
@@ -177,117 +204,103 @@ export async function autoAllocateOrder(
       return 0
     })
 
-    // Get stock levels for all products across all warehouses
     const productIds = so.lines.filter((l) => l.productId).map((l) => l.productId!)
-    const stockLevels = await db.stockLevel.findMany({
-      where: { productId: { in: productIds }, warehouseId: { in: sorted.map((w) => w.id) } },
-      select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
-    })
+    const allocations = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      await lockStockLevels(tx, productIds, sorted.map((warehouse) => warehouse.id))
 
-    // Build available stock map: productId -> warehouseId -> available
-    const stockMap = new Map<string, Map<string, number>>()
-    for (const sl of stockLevels) {
-      let prodMap = stockMap.get(sl.productId)
-      if (!prodMap) { prodMap = new Map(); stockMap.set(sl.productId, prodMap) }
-      prodMap.set(sl.warehouseId, Math.max(0, Number(sl.quantity) - Number(sl.reservedQty)))
-    }
+      const stockLevels = await tx.stockLevel.findMany({
+        where: { productId: { in: productIds }, warehouseId: { in: sorted.map((w) => w.id) } },
+        select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
+      })
 
-    // Fetch qty already committed in non-PENDING shipments (partial fulfillment)
-    const activeShipmentLines = await db.shipmentLine.findMany({
-      where: {
-        shipment: { orderId, status: { not: 'PENDING' } },
-      },
-      select: { lineId: true, qty: true },
-    })
-    const committedByLine = new Map<string, number>()
-    for (const sl of activeShipmentLines) {
-      committedByLine.set(sl.lineId, (committedByLine.get(sl.lineId) ?? 0) + Number(sl.qty))
-    }
-
-    // Smart allocation: minimize number of shipments
-    // Subtract already-committed qty so we only allocate what's still needed
-    const lines = so.lines.filter((l) => l.productId).map((l) => {
-      const committed = committedByLine.get(l.id) ?? 0
-      return {
-        id: l.id,
-        productId: l.productId!,
-        sku: l.sku ?? l.productId!,
-        qty: Math.max(0, Number(l.qty) - committed),
+      const stockMap = new Map<string, Map<string, number>>()
+      for (const sl of stockLevels) {
+        let prodMap = stockMap.get(sl.productId)
+        if (!prodMap) { prodMap = new Map(); stockMap.set(sl.productId, prodMap) }
+        prodMap.set(sl.warehouseId, Math.max(0, Number(sl.quantity) - Number(sl.reservedQty)))
       }
-    }).filter((l) => l.qty > 0)
 
-    // Step 1: Find which warehouses can fully fulfill each line
-    const lineOptions = new Map<string, string[]>() // lineId -> warehouseIds that can fully fulfill
-    for (const line of lines) {
-      const options: string[] = []
-      for (const wh of sorted) {
-        const avail = stockMap.get(line.productId)?.get(wh.id) ?? 0
-        if (avail >= line.qty) options.push(wh.id)
+      const activeShipmentLines = await tx.shipmentLine.findMany({
+        where: {
+          shipment: { orderId, status: { not: 'PENDING' } },
+        },
+        select: { lineId: true, qty: true },
+      })
+      const committedByLine = new Map<string, number>()
+      for (const sl of activeShipmentLines) {
+        committedByLine.set(sl.lineId, (committedByLine.get(sl.lineId) ?? 0) + Number(sl.qty))
       }
-      lineOptions.set(line.id, options)
-    }
 
-    // Step 2: Find forced warehouses (lines with only one option)
-    const forcedWarehouses = new Set<string>()
-    for (const [, options] of lineOptions) {
-      if (options.length === 1) forcedWarehouses.add(options[0])
-    }
-
-    // Step 3: Allocate using intelligent grouping
-    const allocations: { lineId: string; productId: string; warehouseId: string; qty: number }[] = []
-    const tempStock = new Map<string, Map<string, number>>()
-    // Deep copy stock map for tracking during allocation
-    for (const [pid, whMap] of stockMap) {
-      const copy = new Map<string, number>()
-      for (const [wid, q] of whMap) copy.set(wid, q)
-      tempStock.set(pid, copy)
-    }
-
-    for (const line of lines) {
-      const options = lineOptions.get(line.id) ?? []
-      let bestWh: string | null = null
-      let remaining = line.qty
-
-      if (options.length > 0) {
-        // Prefer a warehouse that's already forced (to minimize shipment count)
-        const forcedOption = options.find((w) => forcedWarehouses.has(w))
-        if (forcedOption) {
-          bestWh = forcedOption
-        } else {
-          // Prefer primary/default warehouse
-          bestWh = options[0]
+      const lines = so.lines.filter((l) => l.productId).map((l) => {
+        const committed = committedByLine.get(l.id) ?? 0
+        return {
+          id: l.id,
+          productId: l.productId!,
+          sku: l.sku ?? l.productId!,
+          qty: Math.max(0, Number(l.qty) - committed),
         }
-      }
+      }).filter((l) => l.qty > 0)
 
-      if (bestWh) {
-        const avail = tempStock.get(line.productId)?.get(bestWh) ?? 0
-        const allocQty = Math.min(remaining, avail)
-        if (allocQty > 0) {
-          allocations.push({ lineId: line.id, productId: line.productId, warehouseId: bestWh, qty: allocQty })
-          const prodMap = tempStock.get(line.productId)!
-          prodMap.set(bestWh, avail - allocQty)
-          remaining -= allocQty
-        }
-      }
-
-      // If not fully allocated, try other warehouses
-      if (remaining > 0) {
+      const lineOptions = new Map<string, string[]>()
+      for (const line of lines) {
+        const options: string[] = []
         for (const wh of sorted) {
-          if (remaining <= 0) break
-          if (bestWh && wh.id === bestWh) continue // already tried
-          const avail = tempStock.get(line.productId)?.get(wh.id) ?? 0
-          if (avail <= 0) continue
+          const avail = stockMap.get(line.productId)?.get(wh.id) ?? 0
+          if (avail >= line.qty) options.push(wh.id)
+        }
+        lineOptions.set(line.id, options)
+      }
+
+      const forcedWarehouses = new Set<string>()
+      for (const [, options] of lineOptions) {
+        if (options.length === 1) forcedWarehouses.add(options[0])
+      }
+
+      const nextAllocations: { lineId: string; productId: string; warehouseId: string; qty: number }[] = []
+      const tempStock = new Map<string, Map<string, number>>()
+      for (const [pid, whMap] of stockMap) {
+        const copy = new Map<string, number>()
+        for (const [wid, q] of whMap) copy.set(wid, q)
+        tempStock.set(pid, copy)
+      }
+
+      for (const line of lines) {
+        const options = lineOptions.get(line.id) ?? []
+        let bestWh: string | null = null
+        let remaining = line.qty
+
+        if (options.length > 0) {
+          const forcedOption = options.find((w) => forcedWarehouses.has(w))
+          bestWh = forcedOption ?? options[0]
+        }
+
+        if (bestWh) {
+          const avail = tempStock.get(line.productId)?.get(bestWh) ?? 0
           const allocQty = Math.min(remaining, avail)
-          allocations.push({ lineId: line.id, productId: line.productId, warehouseId: wh.id, qty: allocQty })
-          const prodMap = tempStock.get(line.productId)!
-          prodMap.set(wh.id, avail - allocQty)
-          remaining -= allocQty
+          if (allocQty > 0) {
+            nextAllocations.push({ lineId: line.id, productId: line.productId, warehouseId: bestWh, qty: allocQty })
+            const prodMap = tempStock.get(line.productId)!
+            prodMap.set(bestWh, avail - allocQty)
+            remaining -= allocQty
+          }
+        }
+
+        if (remaining > 0) {
+          for (const wh of sorted) {
+            if (remaining <= 0) break
+            if (bestWh && wh.id === bestWh) continue
+            const avail = tempStock.get(line.productId)?.get(wh.id) ?? 0
+            if (avail <= 0) continue
+            const allocQty = Math.min(remaining, avail)
+            nextAllocations.push({ lineId: line.id, productId: line.productId, warehouseId: wh.id, qty: allocQty })
+            const prodMap = tempStock.get(line.productId)!
+            prodMap.set(wh.id, avail - allocQty)
+            remaining -= allocQty
+          }
         }
       }
-      // If still remaining > 0, it's backordered (no allocation record for that qty)
-    }
 
-    await db.$transaction(async (tx) => {
       const existingAllocs = await tx.orderAllocation.findMany({
         where: { orderId },
         select: { productId: true, warehouseId: true, qty: true },
@@ -300,7 +313,7 @@ export async function autoAllocateOrder(
       }
       await tx.orderAllocation.deleteMany({ where: { orderId } })
 
-      for (const alloc of allocations) {
+      for (const alloc of nextAllocations) {
         await tx.orderAllocation.create({
           data: {
             orderId,
@@ -317,9 +330,10 @@ export async function autoAllocateOrder(
         })
       }
 
-      if (allocations.length > 0 && ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING'].includes(so.status)) {
+      if (nextAllocations.length > 0 && ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING'].includes(so.status)) {
         await tx.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
       }
+      return nextAllocations
     }, STOCK_TX_OPTIONS)
 
     revalidatePath('/sales')
@@ -371,20 +385,26 @@ export async function updateAllocation(
     if (newQty < 0) return { success: false, error: 'Quantity cannot be negative' }
 
     // Check available stock in new warehouse
-    if (newQty > 0) {
-      const sl = await db.stockLevel.findUnique({
-        where: { productId_warehouseId: { productId: alloc.productId, warehouseId: newWarehouseId } },
-        select: { quantity: true, reservedQty: true },
-      })
-      const currentAvail = Math.max(0, Number(sl?.quantity ?? 0) - Number(sl?.reservedQty ?? 0))
-      // If same warehouse, add back current allocation
-      const adjustment = (newWarehouseId === alloc.warehouseId) ? Number(alloc.qty) : 0
-      if (newQty > currentAvail + adjustment) {
-        return { success: false, error: `Only ${currentAvail + adjustment} available in this warehouse` }
-      }
-    }
+    const availabilityError = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, alloc.orderId)
+      await lockStockLevels(
+        tx,
+        [alloc.productId],
+        Array.from(new Set([alloc.warehouseId, newWarehouseId])),
+      )
 
-    await db.$transaction(async (tx) => {
+      if (newQty > 0) {
+        const sl = await tx.stockLevel.findUnique({
+          where: { productId_warehouseId: { productId: alloc.productId, warehouseId: newWarehouseId } },
+          select: { quantity: true, reservedQty: true },
+        })
+        const currentAvail = Math.max(0, Number(sl?.quantity ?? 0) - Number(sl?.reservedQty ?? 0))
+        const adjustment = (newWarehouseId === alloc.warehouseId) ? Number(alloc.qty) : 0
+        if (newQty > currentAvail + adjustment) {
+          return `Only ${currentAvail + adjustment} available in this warehouse`
+        }
+      }
+
       await tx.stockLevel.updateMany({
         where: { productId: alloc.productId, warehouseId: alloc.warehouseId },
         data: { reservedQty: { decrement: Number(alloc.qty) } },
@@ -403,7 +423,9 @@ export async function updateAllocation(
           update: { reservedQty: { increment: newQty } },
         })
       }
+      return null
     }, STOCK_TX_OPTIONS)
+    if (availabilityError) return { success: false, error: availabilityError }
 
     revalidatePath(`/sales/${alloc.orderId}`)
     await logActivity({
@@ -441,15 +463,17 @@ export async function addAllocation(
     await requirePermission('sales.process')
     if (qty <= 0) return { success: false, error: 'Quantity must be positive' }
 
-    // Check stock availability
-    const sl = await db.stockLevel.findUnique({
-      where: { productId_warehouseId: { productId, warehouseId } },
-      select: { quantity: true, reservedQty: true },
-    })
-    const avail = Math.max(0, Number(sl?.quantity ?? 0) - Number(sl?.reservedQty ?? 0))
-    if (qty > avail) return { success: false, error: `Only ${avail} available` }
+    const availabilityError = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      await lockStockLevels(tx, [productId], [warehouseId])
 
-    await db.$transaction(async (tx) => {
+      const sl = await tx.stockLevel.findUnique({
+        where: { productId_warehouseId: { productId, warehouseId } },
+        select: { quantity: true, reservedQty: true },
+      })
+      const avail = Math.max(0, Number(sl?.quantity ?? 0) - Number(sl?.reservedQty ?? 0))
+      if (qty > avail) return `Only ${avail} available`
+
       const existing = await tx.orderAllocation.findUnique({
         where: { lineId_warehouseId: { lineId, warehouseId } },
       })
@@ -470,7 +494,9 @@ export async function addAllocation(
         create: { productId, warehouseId, quantity: 0, reservedQty: qty },
         update: { reservedQty: { increment: qty } },
       })
+      return null
     }, STOCK_TX_OPTIONS)
+    if (availabilityError) return { success: false, error: availabilityError }
 
     revalidatePath(`/sales/${orderId}`)
     try {
@@ -498,10 +524,16 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
     if (!so) return { success: false, error: 'Order not found' }
 
     const allocs = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
       const currentAllocs = await tx.orderAllocation.findMany({
         where: { orderId },
         select: { productId: true, warehouseId: true, qty: true },
       })
+      await lockStockLevels(
+        tx,
+        [...new Set(currentAllocs.map((alloc) => alloc.productId))],
+        [...new Set(currentAllocs.map((alloc) => alloc.warehouseId))],
+      )
 
       for (const alloc of currentAllocs) {
         await tx.stockLevel.updateMany({
@@ -704,30 +736,39 @@ export async function updateShipmentStatus(
     if (targetStatus === 'SHIPPED') {
       data.shippedAt = new Date()
 
+      await db.$transaction(async (tx) => {
+        await lockSalesOrder(tx, shipment.orderId)
+        await lockStockLevels(
+          tx,
+          [...new Set(shipment.lines.map((line) => line.productId))],
+          [shipment.warehouseId],
+        )
+        for (const line of shipment.lines) {
+          const qty = Number(line.qty)
+          await tx.stockLevel.updateMany({
+            where: { productId: line.productId, warehouseId: shipment.warehouseId },
+            data: { reservedQty: { decrement: qty } },
+          })
+          await tx.stockLevel.updateMany({
+            where: { productId: line.productId, warehouseId: shipment.warehouseId },
+            data: { quantity: { decrement: qty } },
+          })
+          await tx.stockMovement.create({
+            data: {
+              type: 'SALE_DISPATCH',
+              productId: line.productId,
+              fromWarehouseId: shipment.warehouseId,
+              qty,
+              note: `Dispatched for order — shipment from ${shipment.warehouse.code}`,
+              referenceType: 'SalesOrder',
+              referenceId: shipment.orderId,
+            },
+          })
+        }
+      }, STOCK_TX_OPTIONS)
+
       for (const line of shipment.lines) {
         const qty = Number(line.qty)
-        // Release reservation
-        await db.stockLevel.updateMany({
-          where: { productId: line.productId, warehouseId: shipment.warehouseId },
-          data: { reservedQty: { decrement: qty } },
-        })
-        // Decrement actual stock
-        await db.stockLevel.updateMany({
-          where: { productId: line.productId, warehouseId: shipment.warehouseId },
-          data: { quantity: { decrement: qty } },
-        })
-        // Create stock movement
-        await db.stockMovement.create({
-          data: {
-            type: 'SALE_DISPATCH',
-            productId: line.productId,
-            fromWarehouseId: shipment.warehouseId,
-            qty,
-            note: `Dispatched for order — shipment from ${shipment.warehouse.code}`,
-            referenceType: 'SalesOrder',
-            referenceId: shipment.orderId,
-          },
-        })
         await logActivity({
           entityType: 'STOCK_ADJUSTMENT',
           entityId: line.productId,
@@ -738,7 +779,6 @@ export async function updateShipmentStatus(
           metadata: { sku: line.product.sku, productId: line.productId, qty, orderNumber: shipment.order.orderNumber ?? shipment.order.externalOrderNumber, warehouseId: shipment.warehouseId },
         })
       }
-
     }
 
     // Persist the shipment status change FIRST, before checking order-level status

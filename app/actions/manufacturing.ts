@@ -360,6 +360,16 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
 // Status changes
 // ---------------------------------------------------------------------------
 
+async function lockCostLayers(
+  tx: Prisma.TransactionClient,
+  ids: string[],
+): Promise<void> {
+  if (ids.length === 0) return
+  await tx.$queryRaw(
+    Prisma.sql`SELECT id FROM "cost_layers" WHERE id IN (${Prisma.join(ids)}) FOR UPDATE`,
+  )
+}
+
 async function consumeFifoLayers(
   tx: Prisma.TransactionClient,
   productId: string,
@@ -369,7 +379,7 @@ async function consumeFifoLayers(
   let remaining = new Prisma.Decimal(qty)
   let totalCostBase = new Prisma.Decimal(0)
 
-  const layers = await tx.costLayer.findMany({
+  const candidateLayers = await tx.costLayer.findMany({
     where: {
       productId,
       warehouseId,
@@ -382,6 +392,21 @@ async function consumeFifoLayers(
     },
     orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
   })
+  await lockCostLayers(tx, candidateLayers.map((layer) => layer.id))
+
+  const layers = candidateLayers.length === 0
+    ? []
+    : await tx.costLayer.findMany({
+        where: {
+          id: { in: candidateLayers.map((layer) => layer.id) },
+        },
+        select: {
+          id: true,
+          remainingQty: true,
+          unitCostBase: true,
+        },
+        orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
+      })
 
   for (const layer of layers) {
     if (remaining.lte(0)) break

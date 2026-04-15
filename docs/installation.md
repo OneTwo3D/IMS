@@ -138,6 +138,8 @@ Authentication note:
 - login and TOTP throttling are currently in-process only
 - this deployment assumes a single application instance/LXC
 - if you add a second web instance or separate worker handling auth routes, move rate limiting to shared storage such as Redis before doing so
+- if you deploy behind OpenLiteSpeed or another upstream proxy, strip/replace incoming `X-Forwarded-For` before proxying to the app tier
+- set `TRUSTED_PROXY_IPS` / `TRUSTED_PROXY_CIDRS` so the app can walk the forwarded chain from right to left and ignore internal proxy hops
 
 
 ## Updating

@@ -19,9 +19,19 @@ import {
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
-import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
+import { Prisma, type TaxCategory } from '@/app/generated/prisma/client'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
+
+async function lockCostLayers(
+  tx: Prisma.TransactionClient,
+  ids: string[],
+): Promise<void> {
+  if (ids.length === 0) return
+  await tx.$queryRaw(
+    Prisma.sql`SELECT id FROM "cost_layers" WHERE id IN (${Prisma.join(ids)}) FOR UPDATE`,
+  )
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1431,282 +1441,272 @@ export async function createRefund(
         )
 
         const refundRevenue = Math.round(createdRefundLines.reduce((sum, line) => sum + toNetRevenue(line.totalBase), 0) * 100) / 100
-        const orderAccounting = await db.salesOrder.findUnique({
-          where: { id: orderId },
-          select: {
-            allocations: {
-              select: {
-                id: true,
-                lineId: true,
-                warehouseId: true,
-                costLayerSnapshot: true,
+        const reversalAmounts = await db.$transaction(async (tx) => {
+          const orderAccounting = await tx.salesOrder.findUnique({
+            where: { id: orderId },
+            select: {
+              allocations: {
+                select: {
+                  id: true,
+                  lineId: true,
+                  warehouseId: true,
+                  costLayerSnapshot: true,
+                },
               },
-            },
-            lines: {
-              select: {
-                id: true,
-                productId: true,
-                description: true,
-                qty: true,
-                totalBase: true,
+              lines: {
+                select: {
+                  id: true,
+                  productId: true,
+                  description: true,
+                  qty: true,
+                  totalBase: true,
+                },
               },
-            },
-            shipments: {
-              where: { shipmentJournalDate: { not: null } },
-              select: {
-                revenueRecognizedAmount: true,
-                cogsBatchAmount: true,
-                lines: {
-                  select: {
-                    id: true,
-                    lineId: true,
-                    qty: true,
-                    costLayerSnapshot: true,
+              shipments: {
+                where: { shipmentJournalDate: { not: null } },
+                select: {
+                  revenueRecognizedAmount: true,
+                  cogsBatchAmount: true,
+                  lines: {
+                    select: {
+                      id: true,
+                      lineId: true,
+                      qty: true,
+                      costLayerSnapshot: true,
+                    },
+                  },
+                },
+              },
+              refunds: {
+                where: { id: { not: createdRefund.id } },
+                select: {
+                  lines: {
+                    select: {
+                      id: true,
+                      productId: true,
+                      description: true,
+                      qty: true,
+                      totalBase: true,
+                      unitPriceBase: true,
+                      costLayerSnapshot: true,
+                    },
                   },
                 },
               },
             },
-            refunds: {
-              where: { id: { not: createdRefund.id } },
-              select: {
-                lines: {
-                  select: {
-                    id: true,
-                    productId: true,
-                    description: true,
-                    qty: true,
-                    totalBase: true,
-                    unitPriceBase: true,
-                    costLayerSnapshot: true,
-                  },
-                },
-              },
+          })
+
+          const priorReversals = await tx.accountingSyncLog.findMany({
+            where: {
+              referenceType: 'SalesOrder',
+              referenceId: orderId,
+              type: { in: ['COGS_REVERSAL', 'UNEARNED_REV_REVERSAL'] },
+              status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
             },
-          },
-        })
+            select: { type: true, payload: true },
+          })
 
-        const priorReversals = await db.accountingSyncLog.findMany({
-          where: {
-            referenceType: 'SalesOrder',
-            referenceId: orderId,
-            type: { in: ['COGS_REVERSAL', 'UNEARNED_REV_REVERSAL'] },
-            status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
-          },
-          select: { type: true, payload: true },
-        })
+          const referencedCostLayerIds = Array.from(new Set([
+            ...(orderAccounting?.allocations ?? []).flatMap((allocation) => (
+              parseCostLayerSnapshot(allocation.costLayerSnapshot).map((entry) => entry.costLayerId)
+            )),
+            ...(orderAccounting?.shipments ?? []).flatMap((shipment) => (
+              shipment.lines.flatMap((line) => (
+                parseCostLayerSnapshot(line.costLayerSnapshot).map((entry) => entry.costLayerId)
+              ))
+            )),
+            ...(orderAccounting?.refunds ?? []).flatMap((refund) => (
+              refund.lines.flatMap((line) => (
+                parseCostLayerSnapshot(line.costLayerSnapshot).map((entry) => entry.costLayerId)
+              ))
+            )),
+          ]))
+          await lockCostLayers(tx, referencedCostLayerIds)
 
-        const extractPayloadAmount = (
-          payload: unknown,
-          accountCode: string,
-        ): number => {
-          const linesPayload = (payload as { lines?: Array<{ accountCode?: string; debit?: number; credit?: number }> } | null)?.lines
-          if (!Array.isArray(linesPayload)) return 0
-          return linesPayload.reduce((sum, line) => (
-            line.accountCode === accountCode ? sum + Number(line.debit ?? 0) : sum
-          ), 0)
-        }
-
-        const priorUnearnedReversed = priorReversals
-          .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
-          .reduce((sum, row) => sum + extractPayloadAmount(row.payload, settings.unearnedRevenueAccount), 0)
-
-        const lineContexts = (orderAccounting?.lines ?? []).map((line) => ({
-          id: line.id,
-          productId: line.productId,
-          description: line.description,
-          qty: Number(line.qty),
-          totalBase: Number(line.totalBase),
-        }))
-
-        function priceMatches(unitRevenue: number, candidateUnitPrice: number | null): boolean {
-          if (candidateUnitPrice == null) return false
-          return Math.abs(unitRevenue - candidateUnitPrice) < 0.0001
-        }
-
-        function consumeRefundLineQuantity(
-          lineStates: Array<{
-            id: string
-            productId: string | null
-            description: string
-            qty: number
-            totalBase: number
-          }>,
-          remainingShipped: Map<string, number>,
-          remainingUnshipped: Map<string, number>,
-          refundLine: { productId: string | null; description: string; qty: number; totalBase: number; unitPriceBase?: number | null },
-        ): {
-          shippedRevenue: number
-          unshippedRevenue: number
-          assignedRevenue: number
-          shippedQty: number
-          unshippedQty: number
-          lineAllocations: Array<{ lineId: string; shippedQty: number; unshippedQty: number }>
-        } {
-          if (!refundLine.productId || refundLine.qty <= 0) {
-            return {
-              shippedRevenue: 0,
-              unshippedRevenue: 0,
-              assignedRevenue: 0,
-              shippedQty: 0,
-              unshippedQty: 0,
-              lineAllocations: [],
-            }
+          const extractPayloadAmount = (
+            payload: unknown,
+            accountCode: string,
+          ): number => {
+            const linesPayload = (payload as { lines?: Array<{ accountCode?: string; debit?: number; credit?: number }> } | null)?.lines
+            if (!Array.isArray(linesPayload)) return 0
+            return linesPayload.reduce((sum, line) => (
+              line.accountCode === accountCode ? sum + Number(line.debit ?? 0) : sum
+            ), 0)
           }
 
-          let remainingQty = refundLine.qty
-          let shippedRevenue = 0
-          let unshippedRevenue = 0
-          let assignedRevenue = 0
-          let shippedQty = 0
-          let unshippedQty = 0
-          const lineAllocations: Array<{ lineId: string; shippedQty: number; unshippedQty: number }> = []
-          const refundUnitPrice = refundLine.unitPriceBase != null
-            ? Number(refundLine.unitPriceBase)
-            : (refundLine.qty > 0 ? refundLine.totalBase / refundLine.qty : null)
+          const priorUnearnedReversed = priorReversals
+            .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
+            .reduce((sum, row) => sum + extractPayloadAmount(row.payload, settings.unearnedRevenueAccount), 0)
 
-          const matchingLines = lineStates
-            .filter((line) => line.productId === refundLine.productId)
-            .sort((a, b) => {
-              const aUnitRevenue = a.qty > 0 ? a.totalBase / a.qty : 0
-              const bUnitRevenue = b.qty > 0 ? b.totalBase / b.qty : 0
-              const aPriceMatch = priceMatches(aUnitRevenue, refundUnitPrice)
-              const bPriceMatch = priceMatches(bUnitRevenue, refundUnitPrice)
-              if (aPriceMatch !== bPriceMatch) return aPriceMatch ? -1 : 1
+          const lineContexts = (orderAccounting?.lines ?? []).map((line) => ({
+            id: line.id,
+            productId: line.productId,
+            description: line.description,
+            qty: Number(line.qty),
+            totalBase: Number(line.totalBase),
+          }))
 
-              const aDescMatch = a.description === refundLine.description
-              const bDescMatch = b.description === refundLine.description
-              if (aDescMatch !== bDescMatch) return aDescMatch ? -1 : 1
+          function priceMatches(unitRevenue: number, candidateUnitPrice: number | null): boolean {
+            if (candidateUnitPrice == null) return false
+            return Math.abs(unitRevenue - candidateUnitPrice) < 0.0001
+          }
 
-              return 0
-            })
-
-          for (const line of matchingLines) {
-            if (remainingQty <= 0 || line.qty <= 0) break
-
-            const unitRevenue = line.totalBase / line.qty
-            const shippedQtyAvailable = remainingShipped.get(line.id) ?? 0
-            const shippedTake = Math.min(remainingQty, shippedQtyAvailable)
-            if (shippedTake > 0) {
-              const shippedValue = unitRevenue * shippedTake
-              shippedRevenue += shippedValue
-              shippedQty += shippedTake
-              assignedRevenue += shippedValue
-              remainingQty -= shippedTake
-              remainingShipped.set(line.id, shippedQtyAvailable - shippedTake)
-              lineAllocations.push({ lineId: line.id, shippedQty: shippedTake, unshippedQty: 0 })
+          function consumeRefundLineQuantity(
+            lineStates: Array<{
+              id: string
+              productId: string | null
+              description: string
+              qty: number
+              totalBase: number
+            }>,
+            remainingShipped: Map<string, number>,
+            remainingUnshipped: Map<string, number>,
+            refundLine: { productId: string | null; description: string; qty: number; totalBase: number; unitPriceBase?: number | null },
+          ): {
+            shippedRevenue: number
+            unshippedRevenue: number
+            assignedRevenue: number
+            shippedQty: number
+            unshippedQty: number
+            lineAllocations: Array<{ lineId: string; shippedQty: number; unshippedQty: number }>
+          } {
+            if (!refundLine.productId || refundLine.qty <= 0) {
+              return {
+                shippedRevenue: 0,
+                unshippedRevenue: 0,
+                assignedRevenue: 0,
+                shippedQty: 0,
+                unshippedQty: 0,
+                lineAllocations: [],
+              }
             }
 
-            const unshippedQtyAvailable = remainingUnshipped.get(line.id) ?? 0
-            const unshippedTake = Math.min(remainingQty, unshippedQtyAvailable)
-            if (unshippedTake > 0) {
-              const unshippedValue = unitRevenue * unshippedTake
-              unshippedRevenue += unshippedValue
-              unshippedQty += unshippedTake
-              assignedRevenue += unshippedValue
-              remainingQty -= unshippedTake
-              remainingUnshipped.set(line.id, unshippedQtyAvailable - unshippedTake)
-              lineAllocations.push({ lineId: line.id, shippedQty: 0, unshippedQty: unshippedTake })
+            let remainingQty = refundLine.qty
+            let shippedRevenue = 0
+            let unshippedRevenue = 0
+            let assignedRevenue = 0
+            let shippedQty = 0
+            let unshippedQty = 0
+            const lineAllocations: Array<{ lineId: string; shippedQty: number; unshippedQty: number }> = []
+            const refundUnitPrice = refundLine.unitPriceBase != null
+              ? Number(refundLine.unitPriceBase)
+              : (refundLine.qty > 0 ? refundLine.totalBase / refundLine.qty : null)
+
+            const matchingLines = lineStates
+              .filter((line) => line.productId === refundLine.productId)
+              .sort((a, b) => {
+                const aUnitRevenue = a.qty > 0 ? a.totalBase / a.qty : 0
+                const bUnitRevenue = b.qty > 0 ? b.totalBase / b.qty : 0
+                const aPriceMatch = priceMatches(aUnitRevenue, refundUnitPrice)
+                const bPriceMatch = priceMatches(bUnitRevenue, refundUnitPrice)
+                if (aPriceMatch !== bPriceMatch) return aPriceMatch ? -1 : 1
+
+                const aDescMatch = a.description === refundLine.description
+                const bDescMatch = b.description === refundLine.description
+                if (aDescMatch !== bDescMatch) return aDescMatch ? -1 : 1
+
+                return 0
+              })
+
+            for (const line of matchingLines) {
+              if (remainingQty <= 0 || line.qty <= 0) break
+
+              const unitRevenue = line.totalBase / line.qty
+              const shippedQtyAvailable = remainingShipped.get(line.id) ?? 0
+              const shippedTake = Math.min(remainingQty, shippedQtyAvailable)
+              if (shippedTake > 0) {
+                const shippedValue = unitRevenue * shippedTake
+                shippedRevenue += shippedValue
+                shippedQty += shippedTake
+                assignedRevenue += shippedValue
+                remainingQty -= shippedTake
+                remainingShipped.set(line.id, shippedQtyAvailable - shippedTake)
+                lineAllocations.push({ lineId: line.id, shippedQty: shippedTake, unshippedQty: 0 })
+              }
+
+              const unshippedQtyAvailable = remainingUnshipped.get(line.id) ?? 0
+              const unshippedTake = Math.min(remainingQty, unshippedQtyAvailable)
+              if (unshippedTake > 0) {
+                const unshippedValue = unitRevenue * unshippedTake
+                unshippedRevenue += unshippedValue
+                unshippedQty += unshippedTake
+                assignedRevenue += unshippedValue
+                remainingQty -= unshippedTake
+                remainingUnshipped.set(line.id, unshippedQtyAvailable - unshippedTake)
+                lineAllocations.push({ lineId: line.id, shippedQty: 0, unshippedQty: unshippedTake })
+              }
             }
+
+            return { shippedRevenue, unshippedRevenue, assignedRevenue, shippedQty, unshippedQty, lineAllocations }
           }
 
-          return { shippedRevenue, unshippedRevenue, assignedRevenue, shippedQty, unshippedQty, lineAllocations }
-        }
+          const shippedQtyByLine = new Map<string, number>()
+          let totalRecognized = 0
 
-        const shippedQtyByLine = new Map<string, number>()
-        let totalRecognized = 0
-        let totalShippedCogs = 0
-
-        for (const shipment of orderAccounting?.shipments ?? []) {
-          totalRecognized += Number(shipment.revenueRecognizedAmount ?? 0)
-          totalShippedCogs += Number(shipment.cogsBatchAmount ?? 0)
-          for (const line of shipment.lines) {
-            shippedQtyByLine.set(
-              line.lineId,
-              (shippedQtyByLine.get(line.lineId) ?? 0) + Number(line.qty),
-            )
-          }
-        }
-
-        const remainingShippedQtyByLine = new Map<string, number>()
-        const remainingUnshippedQtyByLine = new Map<string, number>()
-        let shippedProductRevenueBase = 0
-        let unshippedProductRevenueBase = 0
-
-        for (const line of lineContexts) {
-          const shippedQty = Math.min(line.qty, shippedQtyByLine.get(line.id) ?? 0)
-          const unshippedQty = Math.max(0, line.qty - shippedQty)
-          remainingShippedQtyByLine.set(line.id, shippedQty)
-          remainingUnshippedQtyByLine.set(line.id, unshippedQty)
-          if (line.qty > 0) {
-            shippedProductRevenueBase += (line.totalBase * shippedQty) / line.qty
-            unshippedProductRevenueBase += (line.totalBase * unshippedQty) / line.qty
-          }
-        }
-
-        for (const priorRefund of orderAccounting?.refunds ?? []) {
-          for (const priorRefundLine of priorRefund.lines) {
-            consumeRefundLineQuantity(
-              lineContexts,
-              remainingShippedQtyByLine,
-              remainingUnshippedQtyByLine,
-              {
-                productId: priorRefundLine.productId,
-                description: priorRefundLine.description,
-                qty: Number(priorRefundLine.qty),
-                totalBase: Number(priorRefundLine.totalBase),
-                unitPriceBase: Number(priorRefundLine.unitPriceBase),
-              },
-            )
-          }
-        }
-
-        let shippedQtyRevenue = 0
-        let unshippedQtyRevenue = 0
-        let nonQtyRevenue = 0
-        const refundLayerSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
-        const shipmentLineAvailability = new Map<string, CostLayerSnapshotEntry[]>()
-        const allocationAvailability = new Map<string, CostLayerSnapshotEntry[]>()
-
-        for (const shipment of orderAccounting?.shipments ?? []) {
-          for (const shipmentLine of shipment.lines) {
-            shipmentLineAvailability.set(
-              shipmentLine.id,
-              parseCostLayerSnapshot(shipmentLine.costLayerSnapshot),
-            )
-          }
-        }
-
-        for (const allocation of orderAccounting?.allocations ?? []) {
-          allocationAvailability.set(
-            allocation.id,
-            parseCostLayerSnapshot(allocation.costLayerSnapshot),
-          )
-        }
-
-        for (const shipment of orderAccounting?.shipments ?? []) {
-          for (const shipmentLine of shipment.lines) {
-            for (const entry of parseCostLayerSnapshot(shipmentLine.costLayerSnapshot)) {
-              if (!entry.orderAllocationId) continue
-              const available = allocationAvailability.get(entry.orderAllocationId) ?? []
-              allocationAvailability.set(
-                entry.orderAllocationId,
-                reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
+          for (const shipment of orderAccounting?.shipments ?? []) {
+            totalRecognized += Number(shipment.revenueRecognizedAmount ?? 0)
+            for (const line of shipment.lines) {
+              shippedQtyByLine.set(
+                line.lineId,
+                (shippedQtyByLine.get(line.lineId) ?? 0) + Number(line.qty),
               )
             }
           }
-        }
 
-        for (const priorRefund of orderAccounting?.refunds ?? []) {
-          for (const priorRefundLine of priorRefund.lines) {
-            for (const entry of parseCostLayerSnapshot(priorRefundLine.costLayerSnapshot)) {
-              if (entry.source === 'shipment' && entry.shipmentLineId) {
-                const available = shipmentLineAvailability.get(entry.shipmentLineId) ?? []
-                shipmentLineAvailability.set(
-                  entry.shipmentLineId,
-                  reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
-                )
-              }
-              if (entry.source === 'allocation' && entry.orderAllocationId) {
+          const remainingShippedQtyByLine = new Map<string, number>()
+          const remainingUnshippedQtyByLine = new Map<string, number>()
+
+          for (const line of lineContexts) {
+            const shippedQty = Math.min(line.qty, shippedQtyByLine.get(line.id) ?? 0)
+            const unshippedQty = Math.max(0, line.qty - shippedQty)
+            remainingShippedQtyByLine.set(line.id, shippedQty)
+            remainingUnshippedQtyByLine.set(line.id, unshippedQty)
+          }
+
+          for (const priorRefund of orderAccounting?.refunds ?? []) {
+            for (const priorRefundLine of priorRefund.lines) {
+              consumeRefundLineQuantity(
+                lineContexts,
+                remainingShippedQtyByLine,
+                remainingUnshippedQtyByLine,
+                {
+                  productId: priorRefundLine.productId,
+                  description: priorRefundLine.description,
+                  qty: Number(priorRefundLine.qty),
+                  totalBase: Number(priorRefundLine.totalBase),
+                  unitPriceBase: Number(priorRefundLine.unitPriceBase),
+                },
+              )
+            }
+          }
+
+          let shippedQtyRevenue = 0
+          let unshippedQtyRevenue = 0
+          let nonQtyRevenue = 0
+          const refundLayerSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
+          const shipmentLineAvailability = new Map<string, CostLayerSnapshotEntry[]>()
+          const allocationAvailability = new Map<string, CostLayerSnapshotEntry[]>()
+
+          for (const shipment of orderAccounting?.shipments ?? []) {
+            for (const shipmentLine of shipment.lines) {
+              shipmentLineAvailability.set(
+                shipmentLine.id,
+                parseCostLayerSnapshot(shipmentLine.costLayerSnapshot),
+              )
+            }
+          }
+
+          for (const allocation of orderAccounting?.allocations ?? []) {
+            allocationAvailability.set(
+              allocation.id,
+              parseCostLayerSnapshot(allocation.costLayerSnapshot),
+            )
+          }
+
+          for (const shipment of orderAccounting?.shipments ?? []) {
+            for (const shipmentLine of shipment.lines) {
+              for (const entry of parseCostLayerSnapshot(shipmentLine.costLayerSnapshot)) {
+                if (!entry.orderAllocationId) continue
                 const available = allocationAvailability.get(entry.orderAllocationId) ?? []
                 allocationAvailability.set(
                   entry.orderAllocationId,
@@ -1715,142 +1715,163 @@ export async function createRefund(
               }
             }
           }
-        }
 
-        const consumeShipmentCostForLine = (lineId: string, qty: number): CostLayerSnapshotEntry[] => {
-          let remainingQty = qty
-          const consumed: CostLayerSnapshotEntry[] = []
-          for (const shipment of orderAccounting?.shipments ?? []) {
-            for (const shipmentLine of shipment.lines) {
-              if (shipmentLine.lineId !== lineId || remainingQty <= 0) continue
-              const available = shipmentLineAvailability.get(shipmentLine.id) ?? []
+          for (const priorRefund of orderAccounting?.refunds ?? []) {
+            for (const priorRefundLine of priorRefund.lines) {
+              for (const entry of parseCostLayerSnapshot(priorRefundLine.costLayerSnapshot)) {
+                if (entry.source === 'shipment' && entry.shipmentLineId) {
+                  const available = shipmentLineAvailability.get(entry.shipmentLineId) ?? []
+                  shipmentLineAvailability.set(
+                    entry.shipmentLineId,
+                    reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
+                  )
+                }
+                if (entry.source === 'allocation' && entry.orderAllocationId) {
+                  const available = allocationAvailability.get(entry.orderAllocationId) ?? []
+                  allocationAvailability.set(
+                    entry.orderAllocationId,
+                    reduceSnapshotByCostLayer(available, [{ costLayerId: entry.costLayerId, qty: entry.qty }]),
+                  )
+                }
+              }
+            }
+          }
+
+          const consumeShipmentCostForLine = (lineId: string, qty: number): CostLayerSnapshotEntry[] => {
+            let remainingQty = qty
+            const consumed: CostLayerSnapshotEntry[] = []
+            for (const shipment of orderAccounting?.shipments ?? []) {
+              for (const shipmentLine of shipment.lines) {
+                if (shipmentLine.lineId !== lineId || remainingQty <= 0) continue
+                const available = shipmentLineAvailability.get(shipmentLine.id) ?? []
+                const taken = takeFromSnapshotEntries(available, remainingQty, {
+                  shipmentLineId: shipmentLine.id,
+                  source: 'shipment',
+                })
+                consumed.push(...taken.taken)
+                remainingQty = taken.remainingQty
+                shipmentLineAvailability.set(
+                  shipmentLine.id,
+                  reduceSnapshotByCostLayer(
+                    available,
+                    taken.taken.map((entry) => ({ costLayerId: entry.costLayerId, qty: entry.qty })),
+                  ),
+                )
+              }
+            }
+            if (remainingQty > 0.0000001) {
+              throw new Error(`Missing shipped FIFO history for refunded line ${lineId}`)
+            }
+            return consumed
+          }
+
+          const consumeAllocationCostForLine = (lineId: string, qty: number): CostLayerSnapshotEntry[] => {
+            let remainingQty = qty
+            const consumed: CostLayerSnapshotEntry[] = []
+            for (const allocation of orderAccounting?.allocations ?? []) {
+              if (allocation.lineId !== lineId || remainingQty <= 0) continue
+              const available = allocationAvailability.get(allocation.id) ?? []
               const taken = takeFromSnapshotEntries(available, remainingQty, {
-                shipmentLineId: shipmentLine.id,
-                source: 'shipment',
+                orderAllocationId: allocation.id,
+                source: 'allocation',
               })
               consumed.push(...taken.taken)
               remainingQty = taken.remainingQty
-              shipmentLineAvailability.set(
-                shipmentLine.id,
+              allocationAvailability.set(
+                allocation.id,
                 reduceSnapshotByCostLayer(
                   available,
                   taken.taken.map((entry) => ({ costLayerId: entry.costLayerId, qty: entry.qty })),
                 ),
               )
             }
+            if (remainingQty > 0.0000001) {
+              throw new Error(`Missing allocated FIFO history for refunded line ${lineId}`)
+            }
+            return consumed
           }
-          if (remainingQty > 0.0000001) {
-            throw new Error(`Missing shipped FIFO history for refunded line ${lineId}`)
-          }
-          return consumed
-        }
 
-        const consumeAllocationCostForLine = (lineId: string, qty: number): CostLayerSnapshotEntry[] => {
-          let remainingQty = qty
-          const consumed: CostLayerSnapshotEntry[] = []
-          for (const allocation of orderAccounting?.allocations ?? []) {
-            if (allocation.lineId !== lineId || remainingQty <= 0) continue
-            const available = allocationAvailability.get(allocation.id) ?? []
-            const taken = takeFromSnapshotEntries(available, remainingQty, {
-              orderAllocationId: allocation.id,
-              source: 'allocation',
-            })
-            consumed.push(...taken.taken)
-            remainingQty = taken.remainingQty
-            allocationAvailability.set(
-              allocation.id,
-              reduceSnapshotByCostLayer(
-                available,
-                taken.taken.map((entry) => ({ costLayerId: entry.costLayerId, qty: entry.qty })),
-              ),
+          for (const refundLine of createdRefundLines) {
+            const refundLineNet = toNetRevenue(refundLine.totalBase)
+            if (!refundLine.productId || refundLine.qty <= 0) {
+              nonQtyRevenue += refundLineNet
+              continue
+            }
+
+            const allocation = consumeRefundLineQuantity(
+              lineContexts,
+              remainingShippedQtyByLine,
+              remainingUnshippedQtyByLine,
+              refundLine,
             )
-          }
-          if (remainingQty > 0.0000001) {
-            throw new Error(`Missing allocated FIFO history for refunded line ${lineId}`)
-          }
-          return consumed
-        }
+            shippedQtyRevenue += allocation.shippedRevenue
+            unshippedQtyRevenue += allocation.unshippedRevenue
 
-        for (const refundLine of createdRefundLines) {
-          const refundLineNet = toNetRevenue(refundLine.totalBase)
-          if (!refundLine.productId || refundLine.qty <= 0) {
-            nonQtyRevenue += refundLineNet
-            continue
-          }
-
-          const allocation = consumeRefundLineQuantity(
-            lineContexts,
-            remainingShippedQtyByLine,
-            remainingUnshippedQtyByLine,
-            refundLine,
-          )
-          shippedQtyRevenue += allocation.shippedRevenue
-          unshippedQtyRevenue += allocation.unshippedRevenue
-
-          const costSnapshot: CostLayerSnapshotEntry[] = []
-          for (const lineAllocation of allocation.lineAllocations) {
-            if (lineAllocation.shippedQty > 0) {
-              costSnapshot.push(...consumeShipmentCostForLine(lineAllocation.lineId, lineAllocation.shippedQty))
+            const costSnapshot: CostLayerSnapshotEntry[] = []
+            for (const lineAllocation of allocation.lineAllocations) {
+              if (lineAllocation.shippedQty > 0) {
+                costSnapshot.push(...consumeShipmentCostForLine(lineAllocation.lineId, lineAllocation.shippedQty))
+              }
+              if (lineAllocation.unshippedQty > 0) {
+                costSnapshot.push(...consumeAllocationCostForLine(lineAllocation.lineId, lineAllocation.unshippedQty))
+              }
             }
-            if (lineAllocation.unshippedQty > 0) {
-              costSnapshot.push(...consumeAllocationCostForLine(lineAllocation.lineId, lineAllocation.unshippedQty))
-            }
+            refundLayerSnapshots.set(refundLine.id, costSnapshot)
+            nonQtyRevenue += Math.max(0, refundLineNet - allocation.assignedRevenue)
           }
-          refundLayerSnapshots.set(refundLine.id, costSnapshot)
-          nonQtyRevenue += Math.max(0, refundLineNet - allocation.assignedRevenue)
-        }
 
-        const componentTotal = shippedQtyRevenue + unshippedQtyRevenue + nonQtyRevenue
-        const roundingDelta = Math.round((refundRevenue - componentTotal) * 100) / 100
-        if (roundingDelta > 0) {
-          nonQtyRevenue += roundingDelta
-        }
+          const componentTotal = shippedQtyRevenue + unshippedQtyRevenue + nonQtyRevenue
+          const roundingDelta = Math.round((refundRevenue - componentTotal) * 100) / 100
+          if (roundingDelta > 0) {
+            nonQtyRevenue += roundingDelta
+          }
 
-        for (const refundLine of createdRefundLines) {
-          const costSnapshot = refundLayerSnapshots.get(refundLine.id) ?? []
-          await db.salesOrderRefundLine.update({
-            where: { id: refundLine.id },
-            data: {
-              costLayerSnapshot: costSnapshot as never,
-            },
-          })
-
-          if (!returnWarehouseId || !refundLine.productId) continue
-
-          for (const entry of costSnapshot) {
-            await db.costLayer.create({
+          for (const refundLine of createdRefundLines) {
+            const costSnapshot = refundLayerSnapshots.get(refundLine.id) ?? []
+            await tx.salesOrderRefundLine.update({
+              where: { id: refundLine.id },
               data: {
-                productId: refundLine.productId,
-                warehouseId: returnWarehouseId,
-                receivedQty: entry.qty,
-                remainingQty: entry.qty,
-                unitCostBase: entry.unitCostBase,
+                costLayerSnapshot: costSnapshot as never,
               },
             })
+
+            if (!returnWarehouseId || !refundLine.productId) continue
+
+            for (const entry of costSnapshot) {
+              await tx.costLayer.create({
+                data: {
+                  productId: refundLine.productId,
+                  warehouseId: returnWarehouseId,
+                  receivedQty: entry.qty,
+                  remainingQty: entry.qty,
+                  unitCostBase: entry.unitCostBase,
+                },
+              })
+            }
           }
-        }
 
-        const remainingUnearned = Math.round(Math.max(
-          0,
-          Number(so.unearnedRevenueAmount ?? 0) - totalRecognized - priorUnearnedReversed,
-        ) * 100) / 100
-        const shipmentRefundSnapshot = createdRefundLines.flatMap((line) => (
-          (refundLayerSnapshots.get(line.id) ?? []).filter((entry) => entry.source === 'shipment')
-        ))
-        const allocationRefundSnapshot = createdRefundLines.flatMap((line) => (
-          (refundLayerSnapshots.get(line.id) ?? []).filter((entry) => entry.source === 'allocation')
-        ))
+          const remainingUnearned = Math.round(Math.max(
+            0,
+            Number(so.unearnedRevenueAmount ?? 0) - totalRecognized - priorUnearnedReversed,
+          ) * 100) / 100
+          const shipmentRefundSnapshot = createdRefundLines.flatMap((line) => (
+            (refundLayerSnapshots.get(line.id) ?? []).filter((entry) => entry.source === 'shipment')
+          ))
+          const allocationRefundSnapshot = createdRefundLines.flatMap((line) => (
+            (refundLayerSnapshots.get(line.id) ?? []).filter((entry) => entry.source === 'allocation')
+          ))
 
-        const cogsReversal = Math.round(sumCostLayerSnapshot(shipmentRefundSnapshot) * 100) / 100
+          return {
+            cogsReversal: Math.round(sumCostLayerSnapshot(shipmentRefundSnapshot) * 100) / 100,
+            unearnedReversal: Math.min(
+              remainingUnearned,
+              Math.round((unshippedQtyRevenue + nonQtyRevenue) * 100) / 100,
+            ),
+            allocationReversal: Math.round(sumCostLayerSnapshot(allocationRefundSnapshot) * 100) / 100,
+          }
+        }, STOCK_TX_OPTIONS)
 
-        const unearnedReversal = Math.min(
-          remainingUnearned,
-          Math.round((unshippedQtyRevenue + nonQtyRevenue) * 100) / 100,
-        )
-
-        const allocationReversal = Math.round(sumCostLayerSnapshot(allocationRefundSnapshot) * 100) / 100
-
-        if (cogsReversal > 0) {
+        if (reversalAmounts.cogsReversal > 0) {
           await queueAccountingSync({
             type: 'COGS_REVERSAL',
             referenceType: 'SalesOrder',
@@ -1860,29 +1881,29 @@ export async function createRefund(
               reference: `COGS reversal: ${orderRef}`,
               narration: `COGS reversal — refund on order ${orderRef}`,
               lines: [
-                { accountCode: settings.inventoryAccount, description: `COGS reversal: ${orderRef}`, debit: cogsReversal },
-                { accountCode: settings.cogsAccount, description: `COGS reversal: ${orderRef}`, credit: cogsReversal },
+                { accountCode: settings.inventoryAccount, description: `COGS reversal: ${orderRef}`, debit: reversalAmounts.cogsReversal },
+                { accountCode: settings.cogsAccount, description: `COGS reversal: ${orderRef}`, credit: reversalAmounts.cogsReversal },
               ],
             },
           })
         }
 
         const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = []
-        if (unearnedReversal > 0) {
+        if (reversalAmounts.unearnedReversal > 0) {
           journalLines.push(
-            { accountCode: settings.unearnedRevenueAccount, description: `Unearned revenue reversal: ${orderRef}`, debit: unearnedReversal },
-            { accountCode: settings.salesAccount, description: `Unearned revenue reversal: ${orderRef}`, credit: unearnedReversal },
+            { accountCode: settings.unearnedRevenueAccount, description: `Unearned revenue reversal: ${orderRef}`, debit: reversalAmounts.unearnedReversal },
+            { accountCode: settings.salesAccount, description: `Unearned revenue reversal: ${orderRef}`, credit: reversalAmounts.unearnedReversal },
           )
         }
-        if (allocationReversal > 0) {
+        if (reversalAmounts.allocationReversal > 0) {
           journalLines.push(
-            { accountCode: settings.inventoryAccount, description: `Allocation reversal: ${orderRef}`, debit: allocationReversal },
-            { accountCode: settings.allocatedInventoryAccount, description: `Allocation reversal: ${orderRef}`, credit: allocationReversal },
+            { accountCode: settings.inventoryAccount, description: `Allocation reversal: ${orderRef}`, debit: reversalAmounts.allocationReversal },
+            { accountCode: settings.allocatedInventoryAccount, description: `Allocation reversal: ${orderRef}`, credit: reversalAmounts.allocationReversal },
           )
         }
 
         if (journalLines.length > 0) {
-          const hasInventoryReversal = allocationReversal > 0
+          const hasInventoryReversal = reversalAmounts.allocationReversal > 0
           await queueAccountingSync({
             type: 'UNEARNED_REV_REVERSAL',
             referenceType: 'SalesOrder',

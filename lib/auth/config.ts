@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { consumeAuthToken } from '@/lib/auth/token-store'
 import { checkRateLimit, clearRateLimit } from '@/lib/rate-limit'
+import { getClientIp } from '@/lib/request-ip'
 
 const loginSchema = z.object({
   email: z.string().email(),
@@ -92,8 +93,8 @@ export const authConfig: NextAuthConfig = {
         const parsed = loginSchema.safeParse(credentials)
         if (!parsed.success) return null
 
-        const forwardedFor = request?.headers?.get('x-forwarded-for')?.split(',')[0]?.trim() ?? 'unknown'
-        const rlKey = `login:${parsed.data.email.toLowerCase()}:${forwardedFor}`
+        const clientIp = getClientIp(request.headers) ?? 'unknown'
+        const rlKey = `login:${parsed.data.email.toLowerCase()}:${clientIp}`
         const rl = checkRateLimit(rlKey, 10, 15 * 60_000)
         if (!rl.allowed) return null
 
