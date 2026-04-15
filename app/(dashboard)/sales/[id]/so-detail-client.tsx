@@ -42,6 +42,7 @@ type Props = {
   initialShipments: ShipmentRow[]
   carriers: string[]
   deliveryTrackingEnabled: boolean
+  accountingAvailable: boolean
   accountingInvoiceUrlTemplate: string
   accountingSyncEnabled: boolean
 }
@@ -726,7 +727,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLink, stockLevels, initialAllocations, initialShipments, carriers, deliveryTrackingEnabled, accountingInvoiceUrlTemplate, accountingSyncEnabled }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLink, stockLevels, initialAllocations, initialShipments, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [showShip, setShowShip] = useState(false)
@@ -911,12 +912,12 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           ))}
 
           {/* Invoice */}
-          {!so.invoiceNumber && !accountingSyncEnabled && (
+          {accountingAvailable && !so.invoiceNumber && !accountingSyncEnabled && (
             <Button variant="outline" size="sm" onClick={handleGenerateInvoice} disabled={isPending}>
               <FileText className="h-4 w-4 mr-1" />Generate Invoice
             </Button>
           )}
-          {accountingSyncEnabled && !so.invoiceNumber && !so.accountingInvoiceId && so.status !== 'DRAFT' && (
+          {accountingAvailable && accountingSyncEnabled && !so.invoiceNumber && !so.accountingInvoiceId && so.status !== 'DRAFT' && (
             <span className="inline-flex items-center gap-1 text-xs text-muted-foreground"><Clock className="h-3 w-3" />Invoice pending sync</span>
           )}
 
@@ -957,7 +958,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               <DropdownMenuItem onClick={() => window.open(`/api/sales-order/${so.id}`, '_blank')}>
                 <FileText className="h-4 w-4 mr-1.5" />Order PDF
               </DropdownMenuItem>
-              {so.invoiceNumber && (
+              {accountingAvailable && so.invoiceNumber && (
                 <DropdownMenuItem onClick={() => window.open(`/api/invoice/${so.id}`, '_blank')}>
                   <FileText className="h-4 w-4 mr-1.5" />Invoice PDF
                 </DropdownMenuItem>
@@ -973,7 +974,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   <Mail className="h-4 w-4 mr-1.5" />Email Order
                 </DropdownMenuItem>
               )}
-              {so.invoiceNumber && so.customerEmail && (
+              {accountingAvailable && so.invoiceNumber && so.customerEmail && (
                 <DropdownMenuItem onClick={handleEmailInvoice} disabled={isPending}>
                   <Mail className="h-4 w-4 mr-1.5" />Email Invoice
                 </DropdownMenuItem>
@@ -1222,7 +1223,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
       )}
 
       {/* Invoice */}
-      {so.invoiceNumber && (
+      {accountingAvailable && so.invoiceNumber && (
         <div className="rounded-md border overflow-x-auto">
           <div className="px-4 py-2 bg-muted/50 flex items-center justify-between">
             <div className="flex items-center gap-2 text-sm font-medium">
@@ -1324,7 +1325,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                 <TableRow key={rl.id}><TableCell className="py-1 pr-4">{rl.description}</TableCell><TableCell className="py-1 pr-4 text-right tabular-nums">{rl.qty}</TableCell><TableCell className="py-1 text-right font-mono">{formatMoney(rl.totalGbp, '£', 'PREFIX')}</TableCell></TableRow>
               ))}</TableBody></Table>
               {/* Credit note payments */}
-              {r.payments.length > 0 && (
+              {accountingAvailable && r.payments.length > 0 && (
                 <div className="space-y-1 pt-1 border-t">
                   {r.payments.map((p) => (
                     <div key={p.id} className="flex items-center justify-between text-xs">
@@ -1340,9 +1341,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   ))}
                 </div>
               )}
-              <Button variant="outline" size="sm" className="h-6 text-xs mt-1" onClick={() => setShowPayment({ refundId: r.id, creditNoteNumber: r.creditNoteNumber ?? undefined })}>
-                <CreditCard className="h-3 w-3 mr-1" />Add Payment
-              </Button>
+              {accountingAvailable && (
+                <Button variant="outline" size="sm" className="h-6 text-xs mt-1" onClick={() => setShowPayment({ refundId: r.id, creditNoteNumber: r.creditNoteNumber ?? undefined })}>
+                  <CreditCard className="h-3 w-3 mr-1" />Add Payment
+                </Button>
+              )}
             </div>
           ))}</div>}
         </div>
@@ -1352,10 +1355,10 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
       {showShip && <ShipDialog order={so} warehouses={warehouses} carriers={carriers} onClose={() => setShowShip(false)} />}
       {showRefund && <RefundDialog order={so} warehouses={warehouses} sym={sym} onClose={() => setShowRefund(false)} />}
       {showNotes && <NotesDialog order={so} onClose={() => setShowNotes(false)} />}
-      {showPayment && <PaymentDialog orderId={so.id} refundId={showPayment.refundId} creditNoteNumber={showPayment.creditNoteNumber} currency={so.currency} defaultAmount={!showPayment.refundId ? (invoiceBalance > 0.01 ? invoiceBalance : undefined) : undefined} onClose={() => setShowPayment(null)} />}
+      {accountingAvailable && showPayment && <PaymentDialog orderId={so.id} refundId={showPayment.refundId} creditNoteNumber={showPayment.creditNoteNumber} currency={so.currency} defaultAmount={!showPayment.refundId ? (invoiceBalance > 0.01 ? invoiceBalance : undefined) : undefined} onClose={() => setShowPayment(null)} />}
 
       {/* Invoice detail dialog */}
-      {showInvoice && so.invoiceNumber && (
+      {accountingAvailable && showInvoice && so.invoiceNumber && (
         <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl">
           <DialogHeader><DialogTitle>Invoice {so.invoiceNumber}</DialogTitle></DialogHeader>
           <div className="space-y-4">

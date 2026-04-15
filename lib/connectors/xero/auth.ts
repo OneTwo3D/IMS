@@ -2,7 +2,7 @@
  * Xero OAuth2 token management for standard Web App (authorization_code grant).
  *
  * Flow: save credentials → redirect user to Xero consent screen →
- * Xero redirects back to /api/xero/callback with auth code →
+ * Xero redirects back to /api/accounting/callback with auth code →
  * callback exchanges code for access + refresh tokens.
  */
 
@@ -34,7 +34,7 @@ type XeroConnection = {
   tenantType: string
 }
 
-type StoredXeroToken = {
+type StoredAccountingToken = {
   id: string
   accessToken: string
   refreshToken: string | null
@@ -52,8 +52,8 @@ function buildBasicAuth(clientId: string, clientSecret: string): string {
   return Buffer.from(`${clientId}:${clientSecret}`).toString('base64')
 }
 
-async function readStoredToken(): Promise<StoredXeroToken | null> {
-  const row = await db.xeroToken.findFirst()
+async function readStoredToken(): Promise<StoredAccountingToken | null> {
+  const row = await db.accountingToken.findFirst()
   if (!row) return null
 
   const accessToken = decryptSecret(row.accessToken)
@@ -61,7 +61,7 @@ async function readStoredToken(): Promise<StoredXeroToken | null> {
 
   if (hasEncryptionKey() && (!isEncryptedValue(row.accessToken) || (row.refreshToken && !isEncryptedValue(row.refreshToken)))) {
     try {
-      await db.xeroToken.update({
+      await db.accountingToken.update({
         where: { id: row.id },
         data: {
           accessToken: encryptSecret(accessToken),
@@ -90,7 +90,7 @@ async function upsertStoredToken(params: {
   tenantId: string
   tenantName: string | null
 }): Promise<void> {
-  const existing = await db.xeroToken.findFirst({ select: { id: true } })
+  const existing = await db.accountingToken.findFirst({ select: { id: true } })
   const data = {
     accessToken: encryptSecret(params.accessToken),
     refreshToken: params.refreshToken ? encryptSecret(params.refreshToken) : null,
@@ -100,14 +100,14 @@ async function upsertStoredToken(params: {
   }
 
   if (existing) {
-    await db.xeroToken.update({ where: { id: existing.id }, data })
+    await db.accountingToken.update({ where: { id: existing.id }, data })
   } else {
-    await db.xeroToken.create({ data })
+    await db.accountingToken.create({ data })
   }
 }
 
 async function getExpectedTenantId(): Promise<string | null> {
-  const token = await db.xeroToken.findFirst({ select: { tenantId: true } })
+  const token = await db.accountingToken.findFirst({ select: { tenantId: true } })
   const stored = await getSettingValue(XERO_EXPECTED_TENANT_KEY)
   return stored ?? token?.tenantId ?? null
 }
@@ -194,7 +194,7 @@ export async function consumeXeroOAuthState(state: string): Promise<string | nul
 }
 
 /**
- * Exchange an authorization code for tokens (called from /api/xero/callback).
+ * Exchange an authorization code for tokens (called from /api/accounting/callback).
  */
 export async function exchangeCodeForTokens(
   code: string,
@@ -346,7 +346,7 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
  */
 export async function disconnect(): Promise<void> {
   await db.$transaction([
-    db.xeroToken.deleteMany(),
+    db.accountingToken.deleteMany(),
     db.setting.deleteMany({ where: { key: XERO_EXPECTED_TENANT_KEY } }),
   ])
 }

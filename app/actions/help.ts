@@ -25,7 +25,7 @@ const TITLE_MAP: Record<string, string> = {
   'user-management': 'User Management & Security',
   'documents-email': 'Documents & Email',
   'activity-log': 'Activity Log',
-  'xero-sync': 'Xero Accounting Sync',
+  'xero-sync': 'Accounting Sync',
   'installation': 'Installation & Deployment',
   'architecture': 'Architecture',
 }

@@ -46,16 +46,18 @@ const ANALYTICS_CHILDREN = [
   { href: '/analytics/forecast',        label: 'Reorder Forecast' },
 ]
 
-const SETTINGS_CHILDREN = [
-  { href: '/settings/company',     label: 'Company' },
-  { href: '/settings/inventory',   label: 'Inventory' },
-  { href: '/settings/sales',       label: 'Sales' },
-  { href: '/settings/purchasing',  label: 'Purchasing' },
-  { href: '/settings/accounting',  label: 'Accounting' },
-  { href: '/settings/users',       label: 'Users' },
-  { href: '/settings/backup',      label: 'Backup & Restore' },
-  { href: '/settings/system',      label: 'System' },
-]
+function getSettingsChildren(accountingIntegrationEnabled: boolean) {
+  return [
+    { href: '/settings/company', label: 'Company' },
+    { href: '/settings/inventory', label: 'Inventory' },
+    { href: '/settings/sales', label: 'Sales' },
+    { href: '/settings/purchasing', label: 'Purchasing' },
+    ...(accountingIntegrationEnabled ? [{ href: '/settings/accounting', label: 'Accounting' }] : []),
+    { href: '/settings/users', label: 'Users' },
+    { href: '/settings/backup', label: 'Backup & Restore' },
+    { href: '/settings/system', label: 'System' },
+  ]
+}
 
 // Supplier-specific navigation
 const SUPPLIER_NAV = [
@@ -68,15 +70,27 @@ type SidebarProps = {
   companyName?: string
   logoUrl?: string | null
   userRole?: string
+  shoppingIntegrationEnabled: boolean
+  accountingIntegrationEnabled: boolean
   onNavigate?: () => void
   forceExpanded?: boolean
 }
 
-export function Sidebar({ companyName, logoUrl, userRole = 'ADMIN', onNavigate, forceExpanded }: SidebarProps = {}) {
+export function Sidebar({
+  companyName,
+  logoUrl,
+  userRole = 'ADMIN',
+  shoppingIntegrationEnabled,
+  accountingIntegrationEnabled,
+  onNavigate,
+  forceExpanded,
+}: SidebarProps) {
   const [internalCollapsed, setCollapsed] = useState(false)
   const collapsed = forceExpanded ? false : internalCollapsed
   const can = (p: Permission) => hasPermission(userRole, p)
   const isSupplier = userRole === 'SUPPLIER'
+  const settingsChildren = getSettingsChildren(accountingIntegrationEnabled)
+  const showIntegrations = shoppingIntegrationEnabled || accountingIntegrationEnabled
 
   // Supplier gets a completely different navigation
   if (isSupplier) {
@@ -152,11 +166,11 @@ export function Sidebar({ companyName, logoUrl, userRole = 'ADMIN', onNavigate, 
           <NavGroup label="Analytics" icon={BarChart3} items={ANALYTICS_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
         {can('manufacturing') && <NavItem href="/manufacturing" label="Manufacturing" icon={Factory} collapsed={collapsed} onNavigate={onNavigate} />}
-        {can('sync') && <NavItem href="/sync" label="Integrations" icon={RefreshCw} collapsed={collapsed} onNavigate={onNavigate} />}
+        {can('sync') && showIntegrations && <NavItem href="/sync" label="Integrations" icon={RefreshCw} collapsed={collapsed} onNavigate={onNavigate} />}
         {can('activity_log') && <NavItem href="/activity" label="Activity" icon={ActivitySquare} collapsed={collapsed} onNavigate={onNavigate} />}
         <NavItem href="/help" label="Help" icon={HelpCircle} collapsed={collapsed} onNavigate={onNavigate} />
         {can('settings') && (
-          <NavGroup label="Settings" icon={Settings} items={SETTINGS_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
+          <NavGroup label="Settings" icon={Settings} items={settingsChildren} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
       </nav>
 

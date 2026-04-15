@@ -10,39 +10,48 @@ import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
-  saveXeroSettings, connectXero, disconnectXero,
-  syncXeroAccounts, triggerXeroSync, fetchXeroTaxRates, retryFailedXeroSync,
-  type XeroSettings, type XeroSyncLogRow, type XeroSyncReadiness,
-} from '@/app/actions/xero-sync'
+  autoLinkAccountingTaxRates,
+  connectAccountingConnector,
+  disconnectAccountingConnector,
+  fetchAccountingTaxRates,
+  retryFailedAccountingSync,
+  saveAccountingSettings,
+  syncAccountingAccounts,
+  triggerAccountingSync,
+  type AccountingConnectorSettings,
+  type AccountingSyncLogRow,
+  type AccountingSyncReadiness,
+} from '@/app/actions/accounting-sync'
 import {
-  refreshXeroDailyBatchPreview,
-  type DailyBatchPreview, type DailyBatchHistoryDay,
-} from '@/app/actions/xero-daily-batch'
+  refreshAccountingBatchPreview,
+  type AccountingBatchPreview,
+  type AccountingBatchHistoryDay,
+} from '@/app/actions/accounting-batch'
 import { savePaymentAccountMap } from '@/app/actions/accounting'
-import { autoLinkXeroTaxRates, updateTaxRate, type TaxRateRow } from '@/app/actions/settings'
+import { updateTaxRate, type TaxRateRow } from '@/app/actions/settings'
 
-type XeroAccount = { id: string; xeroId: string; code: string | null; name: string; type: string }
+type AccountingAccount = { id: string; externalAccountId: string; code: string | null; name: string; type: string }
 
 type PaymentMapRow = { method: string; currency: string; accountCode: string }
 
 type Props = {
-  settings: XeroSettings & { secretMasked: boolean }
+  settings: AccountingConnectorSettings & { secretMasked: boolean }
   connected: boolean
   tenantName?: string
-  accounts: XeroAccount[]
-  logs: XeroSyncLogRow[]
+  accounts: AccountingAccount[]
+  logs: AccountingSyncLogRow[]
   paymentMethodCombos: Array<{ paymentMethod: string; currency: string }>
   paymentAccountMap: string
   currencies: Array<{ code: string; name: string }>
   shoppingPaymentMethods: Array<{ id: string; title: string }>
   imsTaxRates: TaxRateRow[]
   xeroTaxRates: Array<{ taxType: string; name: string; rate: number }>
-  readiness: XeroSyncReadiness
-  dailyBatchPreview: DailyBatchPreview
-  dailyBatchHistory: DailyBatchHistoryDay[]
+  readiness: AccountingSyncReadiness
+  dailyBatchPreview: AccountingBatchPreview
+  dailyBatchHistory: AccountingBatchHistoryDay[]
 }
 
-const ACCOUNT_FIELDS: { key: keyof XeroSettings; label: string; description: string }[] = [
+const ACCOUNT_FIELDS: { key: keyof AccountingConnectorSettings; label: string; description: string }[] = [
   { key: 'xero_sales_account', label: 'Sales Revenue', description: 'Revenue from sales invoices' },
   { key: 'xero_shipping_account', label: 'Shipping Income', description: 'Shipping charges on sales' },
   { key: 'xero_discount_account', label: 'Discounts Given', description: 'Order-level discounts' },
@@ -53,7 +62,7 @@ const ACCOUNT_FIELDS: { key: keyof XeroSettings; label: string; description: str
   { key: 'xero_unearned_revenue_account', label: 'Unearned Revenue', description: 'Liability account for revenue deferred until shipment' },
 ]
 
-const SYNC_TYPE_TOGGLES: { key: keyof XeroSettings; label: string; description: string }[] = [
+const SYNC_TYPE_TOGGLES: { key: keyof AccountingConnectorSettings; label: string; description: string }[] = [
   { key: 'xero_sync_sales_invoice', label: 'Sales Invoices', description: 'Push invoices to Xero when generated' },
   { key: 'xero_sync_credit_note', label: 'Credit Notes', description: 'Push credit notes on refund' },
   { key: 'xero_sync_purchase_invoice', label: 'Purchase Bills', description: 'Push supplier bills when PO is invoiced' },
@@ -137,8 +146,8 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
 
   // Handle OAuth redirect query params
   useEffect(() => {
-    const success = searchParams.get('xero_success')
-    const error = searchParams.get('xero_error')
+    const success = searchParams.get('accounting_success')
+    const error = searchParams.get('accounting_error')
     if (success) {
       setConnected(true)
       setTenantName(success)
@@ -150,7 +159,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     }
   }, [searchParams])
 
-  function handleField(key: keyof XeroSettings, value: string) {
+  function handleField(key: keyof AccountingConnectorSettings, value: string) {
     setS(prev => ({ ...prev, [key]: value }))
   }
 
@@ -158,7 +167,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     setMsg(null)
     startTransition(async () => {
       const [xeroResult, mapResult] = await Promise.all([
-        saveXeroSettings({
+        saveAccountingSettings({
           xero_sync_enabled: s.xero_sync_enabled,
           xero_sync_sales_invoice: s.xero_sync_sales_invoice,
           xero_sync_credit_note: s.xero_sync_credit_note,
@@ -197,7 +206,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     if (!clientId || !clientSecret) { setConnectMsg('Enter Client ID and Client Secret.'); return }
     setConnectMsg(null)
     setConnecting(true)
-    const result = await connectXero(clientId, clientSecret, window.location.origin)
+    const result = await connectAccountingConnector(clientId, clientSecret, window.location.origin)
     setConnecting(false)
     if (result.success && result.redirectUrl) {
       setConnectMsg('Redirecting to Xero…')
@@ -211,7 +220,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     if (!confirm('Disconnect from Xero? Pending sync entries will not be processed until reconnected.')) return
     setConnectMsg(null)
     setConnecting(true)
-    const result = await disconnectXero()
+    const result = await disconnectAccountingConnector()
     setConnecting(false)
     if (result.success) {
       setConnected(false)
@@ -227,7 +236,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     setTaxMapMsg(null)
     setRefreshingTaxRates(true)
     try {
-      const rates = await fetchXeroTaxRates()
+      const rates = await fetchAccountingTaxRates()
       setXeroTaxRates(rates)
       setTaxMapMsg(`Loaded ${rates.length} Xero tax rate(s).`)
     } catch (e) {
@@ -241,7 +250,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     setTaxMapMsg(null)
     setAutoLinking(true)
     try {
-      const result = await autoLinkXeroTaxRates()
+      const result = await autoLinkAccountingTaxRates()
       if (!result.success) {
         setTaxMapMsg(`Auto-link failed: ${result.error ?? 'unknown error'}`)
         return
@@ -260,7 +269,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       if (result.linked > 0) parts.push(`${result.linked} rate(s) auto-linked`)
       if (result.alreadyLinked > 0) parts.push(`${result.alreadyLinked} already linked`)
       if (result.unmatched.length > 0) parts.push(`${result.unmatched.length} unmatched — pick a Xero rate below`)
-      if (parts.length === 0) parts.push(`No IMS rates found (${result.xeroRatesCount} Xero rates available)`)
+      if (parts.length === 0) parts.push(`No IMS rates found (${result.externalRatesCount} accounting rates available)`)
       setTaxMapMsg(parts.join(' · '))
       router.refresh()
     } finally {
@@ -284,7 +293,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   async function handleSyncAccounts() {
     setAccountsMsg(null)
     setSyncingAccounts(true)
-    const result = await syncXeroAccounts()
+    const result = await syncAccountingAccounts()
     setSyncingAccounts(false)
     setAccountsMsg(`Synced ${result.synced} accounts.${result.errors.length > 0 ? ` Errors: ${result.errors.join(', ')}` : ''}`)
     router.refresh()
@@ -293,7 +302,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   function handleManualSync() {
     setSyncMsg(null)
     startTransition(async () => {
-      const result = await triggerXeroSync()
+      const result = await triggerAccountingSync()
       if (result.success) {
         const r = result.result as { succeeded?: number; failed?: number } | undefined
         setSyncMsg(`Sync complete: ${r?.succeeded ?? 0} synced, ${r?.failed ?? 0} failed.`)
@@ -307,7 +316,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   async function handleRetryOne(entryId: string) {
     setRetryMsg(null)
     setRetryingId(entryId)
-    const result = await retryFailedXeroSync(entryId)
+    const result = await retryFailedAccountingSync(entryId)
     setRetryingId(null)
     if (result.success) {
       setRetryMsg(`Reset ${result.reset} entry for retry.`)
@@ -320,7 +329,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   async function handleRetryAll() {
     setRetryMsg(null)
     setRetryingAll(true)
-    const result = await retryFailedXeroSync()
+    const result = await retryFailedAccountingSync()
     setRetryingAll(false)
     if (result.success) {
       setRetryMsg(`Reset ${result.reset} failed entry/entries for retry.`)
@@ -526,7 +535,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                         (() => {
                           const bankAccounts = accounts.filter(a => a.type === 'BANK')
                           const options = bankAccounts.length > 0 ? bankAccounts : accounts
-                          const storedKnown = options.some(a => a.xeroId === row.accountCode || a.code === row.accountCode)
+                          const storedKnown = options.some(a => a.externalAccountId === row.accountCode || a.code === row.accountCode)
                           return (
                             <select
                               className="flex h-8 w-full rounded-md border border-input bg-transparent px-2 py-1 text-xs shadow-sm transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring"
@@ -539,7 +548,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                             >
                               <option value="">— Select —</option>
                               {options.map(a => (
-                                <option key={a.id} value={a.xeroId}>
+                                <option key={a.id} value={a.externalAccountId}>
                                   {a.code ? `${a.code} — ${a.name}` : a.name}
                                 </option>
                               ))}
@@ -850,7 +859,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                       <TableHead className="text-xs">Type</TableHead>
                       <TableHead className="text-xs">Status</TableHead>
                       <TableHead className="text-xs">Reference</TableHead>
-                      <TableHead className="text-xs">Xero ID</TableHead>
+                      <TableHead className="text-xs">External ID</TableHead>
                       <TableHead className="text-xs">Date</TableHead>
                       <TableHead className="text-xs">Error</TableHead>
                       <TableHead className="w-10" />
@@ -867,7 +876,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                             {log.retryCount > 0 && <span className="ml-1 text-[10px] text-muted-foreground">({log.retryCount})</span>}
                           </TableCell>
                           <TableCell className="text-xs text-muted-foreground">{log.referenceType}:{log.referenceId.slice(0, 8)}</TableCell>
-                          <TableCell className="font-mono text-xs text-muted-foreground">{log.xeroTransactionId?.slice(0, 12) ?? '—'}</TableCell>
+                          <TableCell className="font-mono text-xs text-muted-foreground">{log.externalTransactionId?.slice(0, 12) ?? '—'}</TableCell>
                           <TableCell className="text-xs text-muted-foreground">{new Date(log.createdAt).toLocaleString()}</TableCell>
                           <TableCell className="text-xs text-destructive max-w-48 truncate" title={log.errorMessage ?? undefined}>
                             {log.errorMessage ?? '—'}
@@ -940,7 +949,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
 }
 
 // ---------------------------------------------------------------------------
-// Daily Batch panel — preview & history of the Xero sub-ledger daily post
+// Daily Batch panel — preview & history of the accounting sub-ledger daily post
 // ---------------------------------------------------------------------------
 
 function formatGbp(n: number): string {
@@ -956,8 +965,8 @@ function DailyBatchPanel({
   initialPreview,
   history,
 }: {
-  initialPreview: DailyBatchPreview
-  history: DailyBatchHistoryDay[]
+  initialPreview: AccountingBatchPreview
+  history: AccountingBatchHistoryDay[]
 }) {
   const [preview, setPreview] = useState(initialPreview)
   const [refreshing, setRefreshing] = useState(false)
@@ -966,7 +975,7 @@ function DailyBatchPanel({
   async function handleRefresh() {
     setRefreshing(true)
     try {
-      const next = await refreshXeroDailyBatchPreview()
+      const next = await refreshAccountingBatchPreview()
       setPreview(next)
     } finally {
       setRefreshing(false)
@@ -1202,7 +1211,7 @@ function PreviewOrderList({
   )
 }
 
-function PreviewShipmentList({ shipments }: { shipments: DailyBatchPreview['groupB']['shipments'] }) {
+function PreviewShipmentList({ shipments }: { shipments: AccountingBatchPreview['groupB']['shipments'] }) {
   const [open, setOpen] = useState(false)
   return (
     <div className="mt-4 border-t pt-3">
@@ -1254,7 +1263,7 @@ function HistoryEntryRow({
   label, entry,
 }: {
   label: string
-  entry: NonNullable<DailyBatchHistoryDay['a1']>
+  entry: NonNullable<AccountingBatchHistoryDay['a1']>
 }) {
   const router = useRouter()
   const [retrying, setRetrying] = useState(false)
@@ -1265,7 +1274,7 @@ function HistoryEntryRow({
     setRetryMsg(null)
     setRetrying(true)
     try {
-      const res = await retryFailedXeroSync(entry.id)
+      const res = await retryFailedAccountingSync(entry.id)
       if (res.success) {
         setRetryMsg(`Reset ${res.reset} entry — will retry on next sync cycle`)
         router.refresh()

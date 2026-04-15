@@ -32,10 +32,10 @@ CREATE TYPE "StockCountStatus" AS ENUM ('DRAFT', 'IN_PROGRESS', 'COMPLETED', 'CA
 CREATE TYPE "ProductionOrderStatus" AS ENUM ('DRAFT', 'IN_PROGRESS', 'COMPLETED', 'CANCELLED');
 
 -- CreateEnum
-CREATE TYPE "XeroSyncType" AS ENUM ('PURCHASE_INVOICE', 'COGS_JOURNAL');
+CREATE TYPE "AccountingSyncType" AS ENUM ('PURCHASE_INVOICE', 'COGS_JOURNAL');
 
 -- CreateEnum
-CREATE TYPE "XeroSyncStatus" AS ENUM ('PENDING', 'SYNCED', 'FAILED');
+CREATE TYPE "AccountingSyncStatus" AS ENUM ('PENDING', 'SYNCED', 'FAILED');
 
 -- CreateEnum
 CREATE TYPE "ShoppingSyncDirection" AS ENUM ('TO_CONNECTOR', 'FROM_CONNECTOR');
@@ -631,9 +631,9 @@ CREATE TABLE "production_orders" (
 );
 
 -- CreateTable
-CREATE TABLE "xero_accounts" (
+CREATE TABLE "accounting_accounts" (
     "id" TEXT NOT NULL,
-    "xeroId" TEXT NOT NULL,
+    "externalAccountId" TEXT NOT NULL,
     "code" TEXT,
     "name" TEXT NOT NULL,
     "type" TEXT NOT NULL,
@@ -641,23 +641,23 @@ CREATE TABLE "xero_accounts" (
     "active" BOOLEAN NOT NULL DEFAULT true,
     "syncedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-    CONSTRAINT "xero_accounts_pkey" PRIMARY KEY ("id")
+    CONSTRAINT "accounting_accounts_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
-CREATE TABLE "xero_sync_logs" (
+CREATE TABLE "accounting_sync_logs" (
     "id" TEXT NOT NULL,
-    "type" "XeroSyncType" NOT NULL,
-    "status" "XeroSyncStatus" NOT NULL DEFAULT 'PENDING',
+    "type" "AccountingSyncType" NOT NULL,
+    "status" "AccountingSyncStatus" NOT NULL DEFAULT 'PENDING',
     "referenceType" TEXT NOT NULL,
     "referenceId" TEXT NOT NULL,
-    "xeroTransactionId" TEXT,
+    "externalTransactionId" TEXT,
     "payload" JSONB,
     "errorMessage" TEXT,
     "syncedAt" TIMESTAMP(3),
     "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
-    CONSTRAINT "xero_sync_logs_pkey" PRIMARY KEY ("id")
+    CONSTRAINT "accounting_sync_logs_pkey" PRIMARY KEY ("id")
 );
 
 -- CreateTable
@@ -755,10 +755,10 @@ CREATE UNIQUE INDEX "stock_counts_reference_key" ON "stock_counts"("reference");
 CREATE UNIQUE INDEX "production_orders_reference_key" ON "production_orders"("reference");
 
 -- CreateIndex
-CREATE UNIQUE INDEX "xero_accounts_xeroId_key" ON "xero_accounts"("xeroId");
+CREATE UNIQUE INDEX "accounting_accounts_externalAccountId_key" ON "accounting_accounts"("externalAccountId");
 
 -- CreateIndex
-CREATE INDEX "xero_sync_logs_referenceType_referenceId_idx" ON "xero_sync_logs"("referenceType", "referenceId");
+CREATE INDEX "accounting_sync_logs_referenceType_referenceId_idx" ON "accounting_sync_logs"("referenceType", "referenceId");
 
 -- CreateIndex
 CREATE INDEX "shopping_sync_logs_entityType_entityId_idx" ON "shopping_sync_logs"("entityType", "entityId");
@@ -923,10 +923,10 @@ ALTER TABLE "production_orders" ADD CONSTRAINT "production_orders_outputProductI
 ALTER TABLE "production_orders" ADD CONSTRAINT "production_orders_warehouseId_fkey" FOREIGN KEY ("warehouseId") REFERENCES "warehouses"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "xero_sync_logs" ADD CONSTRAINT "xero_sync_po" FOREIGN KEY ("referenceId") REFERENCES "purchase_orders"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "accounting_sync_logs" ADD CONSTRAINT "xero_sync_po" FOREIGN KEY ("referenceId") REFERENCES "purchase_orders"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
-ALTER TABLE "xero_sync_logs" ADD CONSTRAINT "xero_sync_cogs" FOREIGN KEY ("referenceId") REFERENCES "cogs_entries"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
+ALTER TABLE "accounting_sync_logs" ADD CONSTRAINT "xero_sync_cogs" FOREIGN KEY ("referenceId") REFERENCES "cogs_entries"("id") ON DELETE RESTRICT ON UPDATE CASCADE;
 
 -- AddForeignKey
 ALTER TABLE "shopping_sync_logs" ADD CONSTRAINT "wc_sync_product" FOREIGN KEY ("entityId") REFERENCES "products"("id") ON DELETE SET NULL ON UPDATE CASCADE;

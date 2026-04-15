@@ -26,16 +26,28 @@ const DEFAULT_CARRIERS = [
 
 type Props = {
   enabled: boolean
-  source: string // 'woocommerce' | 'trackship'
+  source: string // 'shopping_connector' | 'woocommerce' | 'trackship'
   apiKey: string
   carriers: string[]
+  allowShoppingConnectorSource: boolean
 }
 
-export function DeliveryTrackingSettings({ enabled: initEnabled, source: initSource, apiKey: initApiKey, carriers: initCarriers }: Props) {
+export function DeliveryTrackingSettings({
+  enabled: initEnabled,
+  source: initSource,
+  apiKey: initApiKey,
+  carriers: initCarriers,
+  allowShoppingConnectorSource,
+}: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
+  const normalizedInitialSource = initSource === 'woocommerce' ? 'shopping_connector' : initSource
   const [enabled, setEnabled] = useState(initEnabled)
-  const [source, setSource] = useState(initSource || 'woocommerce')
+  const [source, setSource] = useState(
+    !allowShoppingConnectorSource && normalizedInitialSource !== 'trackship'
+      ? 'trackship'
+      : normalizedInitialSource || (allowShoppingConnectorSource ? 'shopping_connector' : 'trackship'),
+  )
   const [apiKey, setApiKey] = useState(initApiKey)
   const [carriers, setCarriers] = useState<string[]>(initCarriers.length > 0 ? initCarriers : DEFAULT_CARRIERS)
   const [newCarrier, setNewCarrier] = useState('')
@@ -55,8 +67,11 @@ export function DeliveryTrackingSettings({ enabled: initEnabled, source: initSou
   function handleSave() {
     setSaved(false)
     startTransition(async () => {
+      const resolvedSource = allowShoppingConnectorSource
+        ? source
+        : 'trackship'
       await setSetting('delivery_tracking_enabled', enabled ? 'true' : 'false')
-      await setSetting('delivery_tracking_source', source)
+      await setSetting('delivery_tracking_source', resolvedSource)
       await setSetting('trackship_api_key', apiKey)
       await setSetting('shipping_carriers', JSON.stringify(carriers))
       router.refresh()
@@ -89,22 +104,30 @@ export function DeliveryTrackingSettings({ enabled: initEnabled, source: initSou
           <div className="space-y-2">
             <Label>Delivery Status Source</Label>
             <div className="space-y-2">
-              <label className="flex items-start gap-3 cursor-pointer">
-                <input type="radio" name="trackingSource" value="woocommerce" checked={source === 'woocommerce'} onChange={() => setSource('woocommerce')} className="mt-0.5" />
-                <div>
-                  <span className="text-sm font-medium">Import from WooCommerce</span>
-                  <p className="text-xs text-muted-foreground">
-                    Read delivery status from WooCommerce order meta (requires Advanced Shipment Tracking + TrackShip plugin on WC).
-                    Avoids duplicate API lookups if WooCommerce already queries TrackShip.
-                  </p>
-                </div>
-              </label>
+              {allowShoppingConnectorSource && (
+                <label className="flex items-start gap-3 cursor-pointer">
+                  <input
+                    type="radio"
+                    name="trackingSource"
+                    value="shopping_connector"
+                    checked={source === 'shopping_connector'}
+                    onChange={() => setSource('shopping_connector')}
+                    className="mt-0.5"
+                  />
+                  <div>
+                    <span className="text-sm font-medium">Import from shopping connector</span>
+                    <p className="text-xs text-muted-foreground">
+                      Read delivery status from the active shopping connector instead of calling TrackShip directly.
+                    </p>
+                  </div>
+                </label>
+              )}
               <label className="flex items-start gap-3 cursor-pointer">
                 <input type="radio" name="trackingSource" value="trackship" checked={source === 'trackship'} onChange={() => setSource('trackship')} className="mt-0.5" />
                 <div>
                   <span className="text-sm font-medium">TrackShip API (direct)</span>
                   <p className="text-xs text-muted-foreground">
-                    Query TrackShip API directly from this system. Use this if WooCommerce is not connected or does not have TrackShip.
+                    Query TrackShip API directly from this system. Use this when no shopping connector is enabled or when it does not provide delivery status.
                   </p>
                 </div>
               </label>

@@ -117,7 +117,7 @@ export async function connectXero(
     // Build Xero authorization URL — user's browser will redirect here.
     // `state` is persisted server-side bound to the initiating user and
     // validated in the callback (CSRF / mix-up protection).
-    const redirectUri = `${origin}/api/xero/callback`
+    const redirectUri = `${origin}/api/accounting/callback`
     const authUrl = await getAuthorizationUrl(clientId, redirectUri, session.user.id)
 
     return { success: true, redirectUrl: authUrl }
@@ -149,13 +149,13 @@ export async function disconnectXero(): Promise<{ success: boolean; error?: stri
 // Accounts
 // ---------------------------------------------------------------------------
 
-export async function syncXeroAccounts(): Promise<{ synced: number; errors: string[] }> {
+export async function syncAccountingAccounts(): Promise<{ synced: number; errors: string[] }> {
   await requireAdmin()
   const result = await syncChartOfAccounts()
 
   await logActivity({
     entityType: 'SYSTEM',
-    action: 'xero_accounts_synced',
+    action: 'accounting_accounts_synced',
     tag: 'sync',
     description: `Synced ${result.synced} accounts from Xero`,
     metadata: result,
@@ -165,10 +165,10 @@ export async function syncXeroAccounts(): Promise<{ synced: number; errors: stri
   return result
 }
 
-export async function getXeroAccounts(): Promise<Array<{ id: string; xeroId: string; code: string | null; name: string; type: string }>> {
-  return db.xeroAccount.findMany({
+export async function getAccountingAccounts(): Promise<Array<{ id: string; externalAccountId: string; code: string | null; name: string; type: string }>> {
+  return db.accountingAccount.findMany({
     where: { active: true },
-    select: { id: true, xeroId: true, code: true, name: true, type: true },
+    select: { id: true, externalAccountId: true, code: true, name: true, type: true },
     orderBy: [{ code: 'asc' }],
   })
 }
@@ -188,7 +188,7 @@ export type XeroSyncLogRow = {
   status: string
   referenceType: string
   referenceId: string
-  xeroTransactionId: string | null
+  externalTransactionId: string | null
   errorMessage: string | null
   retryCount: number
   syncedAt: string | null
@@ -206,7 +206,7 @@ export async function getXeroSyncLogs(limit = 50): Promise<XeroSyncLogRow[]> {
     status: r.status,
     referenceType: r.referenceType,
     referenceId: r.referenceId,
-    xeroTransactionId: r.xeroTransactionId,
+    externalTransactionId: r.externalTransactionId,
     errorMessage: r.errorMessage,
     retryCount: r.retryCount,
     syncedAt: r.syncedAt?.toISOString() ?? null,

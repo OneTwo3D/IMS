@@ -36,17 +36,17 @@ async function getStoredContactId(ref?: ContactRef): Promise<string | null> {
   if (ref?.customerId) {
     const row = await db.customer.findUnique({
       where: { id: ref.customerId },
-      select: { xeroContactId: true },
+      select: { accountingContactId: true },
     })
-    return row?.xeroContactId ?? null
+    return row?.accountingContactId ?? null
   }
 
   if (ref?.supplierId) {
     const row = await db.supplier.findUnique({
       where: { id: ref.supplierId },
-      select: { xeroContactId: true },
+      select: { accountingContactId: true },
     })
-    return row?.xeroContactId ?? null
+    return row?.accountingContactId ?? null
   }
 
   return null
@@ -57,12 +57,12 @@ async function storeContactId(contactId: string, ref?: ContactRef): Promise<void
   if (ref?.customerId) {
     await db.customer.update({
       where: { id: ref.customerId },
-      data: { xeroContactId: contactId },
+      data: { accountingContactId: contactId },
     }).catch(() => {})
   } else if (ref?.supplierId) {
     await db.supplier.update({
       where: { id: ref.supplierId },
-      data: { xeroContactId: contactId },
+      data: { accountingContactId: contactId },
     }).catch(() => {})
   }
 }

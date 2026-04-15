@@ -4,14 +4,16 @@ import { Card } from '@/components/ui/card'
 import { getAdjustmentReasons, getWarehousesForSettings, getAccountCodes } from '@/app/actions/settings'
 import { AdjustmentReasonsTable } from '@/components/settings/adjustment-reasons-table'
 import { WarehousesTable } from '@/components/settings/warehouses-table'
+import { getIntegrationPluginState } from '@/lib/integration-plugins'
 
 export const metadata: Metadata = { title: 'Inventory Settings' }
 
 export default async function InventorySettingsPage() {
+  const pluginState = await getIntegrationPluginState()
   const [reasons, warehouses, accountCodes] = await Promise.all([
     getAdjustmentReasons(),
     getWarehousesForSettings(),
-    getAccountCodes(),
+    pluginState.xero ? getAccountCodes() : Promise.resolve([]),
   ])
 
   return (
@@ -22,7 +24,7 @@ export default async function InventorySettingsPage() {
       </div>
 
       <Card className="p-6">
-        <WarehousesTable warehouses={warehouses} />
+        <WarehousesTable warehouses={warehouses} showStoreSync={pluginState.woocommerce} />
       </Card>
 
       <Card className="p-6">
@@ -31,11 +33,12 @@ export default async function InventorySettingsPage() {
           <h2 className="text-base font-semibold">Stock Adjustment Reasons</h2>
         </div>
         <p className="text-sm text-muted-foreground mb-4">
-          Define selectable reasons for stock adjustments. Each reason can be linked to an
-          account code from your accounting integration — when set, adjustments using that
-          reason will post to that account instead of the default inventory adjustment account.
+          Define selectable reasons for stock adjustments.
+          {pluginState.xero ? (
+            <> Each reason can be linked to an account code from your accounting integration so adjustments can post to a specific account.</>
+          ) : null}
         </p>
-        <AdjustmentReasonsTable reasons={reasons} accountCodes={accountCodes} />
+        <AdjustmentReasonsTable reasons={reasons} accountCodes={accountCodes} showAccountCode={pluginState.xero} />
       </Card>
     </div>
   )

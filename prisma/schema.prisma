@@ -156,7 +156,7 @@ enum AccountingSyncType {
   UNEARNED_REV_REVERSAL
   BILL_PAYMENT
 
-  @@map("XeroSyncType")
+  @@map("AccountingSyncType")
 }
 
 enum AccountingSyncStatus {
@@ -165,7 +165,7 @@ enum AccountingSyncStatus {
   SYNCED
   FAILED
 
-  @@map("XeroSyncStatus")
+  @@map("AccountingSyncStatus")
 }
 
 enum ShoppingSyncDirection {
@@ -418,7 +418,7 @@ model TaxRate {
   type        TaxType     @default(VAT)
   taxCategory TaxCategory @default(STANDARD)
   usedFor     String      @default("BOTH") // SALES, PURCHASE, BOTH
-  accountingTaxType String?  @map("xero_tax_type") // Accounting tax type code e.g. "OUTPUT2", "INPUT2"
+  accountingTaxType String?  @map("accounting_tax_type") // Accounting tax type code e.g. "OUTPUT2", "INPUT2"
   countryCode String?     // ISO 3166-1 alpha-2, null = applies globally
   active      Boolean     @default(true)
   isDefault   Boolean     @default(false)
@@ -678,7 +678,7 @@ model StockMovement {
 model Supplier {
   id              String    @id @default(cuid())
   name            String
-  xeroContactId   String?   @unique
+  accountingContactId String?   @unique
   contactName     String?
   email           String?
   phone           String?
@@ -924,7 +924,7 @@ model PurchaseInvoice {
   fxRateToGbp     Decimal   @db.Decimal(18, 8)
   notes           String?
   supplierInvoiceUrl String? // path to uploaded supplier PDF
-  accountingInvoiceId String?  @map("xero_invoice_id")
+  accountingInvoiceId String?  @map("accounting_invoice_id")
   paidAt          DateTime?
   paymentAccountId   String?   // connector account id (e.g. Xero bank AccountID) used to pay this bill
   paymentAccountName String?   // snapshot of the bank account name at payment time
@@ -993,7 +993,7 @@ model Customer {
   id              String    @id @default(cuid())
   firstName       String
   lastName        String
-  xeroContactId   String?   @unique
+  accountingContactId String?   @unique
   email           String?
   phone           String?
   company         String?
@@ -1057,7 +1057,7 @@ model SalesOrder {
   discountAmount    Decimal    @db.Decimal(18, 4) @default(0) // computed order discount in foreign currency
   invoiceNumber     String?    // generated invoice reference
   invoicedAt        DateTime?
-  accountingInvoiceId     String?    @map("xero_invoice_id") // Accounting invoice ID after sync
+  accountingInvoiceId     String?    @map("accounting_invoice_id") // Accounting invoice ID after sync
   paidAt            DateTime?
   orderNumber       String?    // IMS order number (prefix + WC number, or manual)
   paymentMethod     String?    // e.g. "stripe", "paypal", "bacs" — populated by any shopping channel
@@ -1065,10 +1065,10 @@ model SalesOrder {
   invoicePdfPath    String?    // path to saved invoice PDF (generic, set by any accounting module)
 
   // Accounting sub-ledger tracking
-  revenueDeferredDate    DateTime?              @map("xero_revenue_deferred_date") // Set by Group A1 — revenue deferred to Unearned
-  unearnedRevenueAmount  Decimal?  @db.Decimal(18, 4) @map("xero_unearned_revenue_amount") // Amount deferred
-  inventoryAllocatedDate DateTime?              @map("xero_inventory_allocated_date") // Set by Group A2 — inventory reclassified to Allocated
-  allocationBatchAmount  Decimal?  @db.Decimal(18, 4) @map("xero_allocation_batch_amount") // Cost value reclassified
+  revenueDeferredDate    DateTime?              @map("accounting_revenue_deferred_date") // Set by Group A1 — revenue deferred to Unearned
+  unearnedRevenueAmount  Decimal?  @db.Decimal(18, 4) @map("accounting_unearned_revenue_amount") // Amount deferred
+  inventoryAllocatedDate DateTime?              @map("accounting_inventory_allocated_date") // Set by Group A2 — inventory reclassified to Allocated
+  allocationBatchAmount  Decimal?  @db.Decimal(18, 4) @map("accounting_allocation_batch_amount") // Cost value reclassified
 
   notes             String?     // customer-visible notes
   internalNotes     String?     // private/staff notes
@@ -1125,7 +1125,7 @@ model SalesOrderRefund {
   id              String     @id @default(cuid())
   orderId         String
   creditNoteNumber String?   // e.g. "CN-2025-00001"
-  accountingCreditNoteId String?   @map("xero_credit_note_id") // Accounting credit note ID after sync
+  accountingCreditNoteId String?   @map("accounting_credit_note_id") // Accounting credit note ID after sync
   externalRefundId Int?
   returnWarehouseId String?
   reason          String?
@@ -1343,9 +1343,9 @@ model ProductionOrder {
 // XERO SYNC
 // ---------------------------------------------------------------------------
 
-model XeroAccount {
+model AccountingAccount {
   id          String   @id @default(cuid())
-  xeroId      String   @unique // Xero's account ID (UUID)
+  externalAccountId String   @unique // Connector account ID
   code        String?
   name        String
   type        String   // EXPENSE, REVENUE, ASSET, etc.
@@ -1353,7 +1353,7 @@ model XeroAccount {
   active      Boolean  @default(true)
   syncedAt    DateTime @default(now())
 
-  @@map("xero_accounts")
+  @@map("accounting_accounts")
 }
 
 model AccountingSyncLog {
@@ -1362,7 +1362,7 @@ model AccountingSyncLog {
   status          AccountingSyncStatus @default(PENDING)
   referenceType   String              // "PurchaseOrder", "CogsEntry", "SalesOrder", etc.
   referenceId     String
-  xeroTransactionId String?
+  externalTransactionId String?
   payload         Json?               // what was sent
   errorMessage    String?
   retryCount      Int                 @default(0)
@@ -1376,10 +1376,10 @@ model AccountingSyncLog {
   @@index([referenceType, referenceId])
   @@index([status, createdAt])
   @@index([status, processingStartedAt])
-  @@map("xero_sync_logs")
+  @@map("accounting_sync_logs")
 }
 
-model XeroToken {
+model AccountingToken {
   id            String   @id @default(cuid())
   accessToken   String
   refreshToken  String?
@@ -1389,7 +1389,7 @@ model XeroToken {
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
-  @@map("xero_tokens")
+  @@map("accounting_tokens")
 }
 
 // ---------------------------------------------------------------------------
@@ -1632,9 +1632,9 @@ model Shipment {
   shippedAt       DateTime?
 
   // Accounting sub-ledger tracking
-  shipmentJournalDate     DateTime?              @map("xero_shipment_journal_date")
-  cogsBatchAmount         Decimal?  @db.Decimal(18, 4) @map("xero_cogs_batch_amount")
-  revenueRecognizedAmount Decimal?  @db.Decimal(18, 4) @map("xero_revenue_recognized_amount")
+  shipmentJournalDate     DateTime?              @map("accounting_shipment_journal_date")
+  cogsBatchAmount         Decimal?  @db.Decimal(18, 4) @map("accounting_cogs_batch_amount")
+  revenueRecognizedAmount Decimal?  @db.Decimal(18, 4) @map("accounting_revenue_recognized_amount")
 
   createdAt       DateTime       @default(now())
   updatedAt       DateTime       @updatedAt

@@ -14,7 +14,7 @@ import {
   type AccountCodeOption,
 } from '@/app/actions/settings'
 
-type Props = { reasons: AdjustmentReason[]; accountCodes: AccountCodeOption[] }
+type Props = { reasons: AdjustmentReason[]; accountCodes: AccountCodeOption[]; showAccountCode?: boolean }
 
 // ---------------------------------------------------------------------------
 // Shared reason form fields (controlled)
@@ -27,17 +27,19 @@ function ReasonFields({
   onChange,
   error,
   accountCodes,
+  showAccountCode,
 }: {
   fields: FieldState
   onChange: (f: FieldState) => void
   error?: string
   accountCodes: AccountCodeOption[]
+  showAccountCode: boolean
 }) {
   function set<K extends keyof FieldState>(k: K, v: FieldState[K]) {
     onChange({ ...fields, [k]: v })
   }
   return (
-    <div className="grid grid-cols-[1fr_auto_auto_auto] gap-2 items-end flex-1">
+    <div className={`grid gap-2 items-end flex-1 ${showAccountCode ? 'grid-cols-[1fr_auto_auto_auto]' : 'grid-cols-[1fr_auto_auto]'}`}>
       <div className="space-y-1 min-w-0">
         <Label className="text-xs">Name *</Label>
         <Input
@@ -49,30 +51,32 @@ function ReasonFields({
         />
         {error && <p className="text-xs text-destructive">{error}</p>}
       </div>
-      <div className="space-y-1 w-48">
-        <Label className="text-xs">Account Code</Label>
-        {accountCodes.length > 0 ? (
-          <select
-            value={fields.accountCode}
-            onChange={(e) => set('accountCode', e.target.value)}
-            className="h-7 text-xs border border-input rounded-md px-2 w-full bg-background"
-          >
-            <option value="">— None —</option>
-            {accountCodes.map((ac) => (
-              <option key={ac.code} value={ac.code}>
-                {ac.code} — {ac.name}
-              </option>
-            ))}
-          </select>
-        ) : (
-          <Input
-            value={fields.accountCode}
-            onChange={(e) => set('accountCode', e.target.value)}
-            placeholder="e.g. 310"
-            className="h-7 text-xs"
-          />
-        )}
-      </div>
+      {showAccountCode && (
+        <div className="space-y-1 w-48">
+          <Label className="text-xs">Account Code</Label>
+          {accountCodes.length > 0 ? (
+            <select
+              value={fields.accountCode}
+              onChange={(e) => set('accountCode', e.target.value)}
+              className="h-7 text-xs border border-input rounded-md px-2 w-full bg-background"
+            >
+              <option value="">— None —</option>
+              {accountCodes.map((ac) => (
+                <option key={ac.code} value={ac.code}>
+                  {ac.code} — {ac.name}
+                </option>
+              ))}
+            </select>
+          ) : (
+            <Input
+              value={fields.accountCode}
+              onChange={(e) => set('accountCode', e.target.value)}
+              placeholder="e.g. 310"
+              className="h-7 text-xs"
+            />
+          )}
+        </div>
+      )}
       <div className="space-y-1 w-20">
         <Label className="text-xs">Sort Order</Label>
         <Input
@@ -106,11 +110,13 @@ function EditForm({
   onSaved,
   onCancel,
   accountCodes,
+  showAccountCode,
 }: {
   reason: AdjustmentReason
   onSaved: (updated: AdjustmentReason) => void
   onCancel: () => void
   accountCodes: AccountCodeOption[]
+  showAccountCode: boolean
 }) {
   const [fields, setFields] = useState<FieldState>({
     name: reason.name,
@@ -136,9 +142,9 @@ function EditForm({
 
   return (
     <TableRow className="bg-muted/30">
-      <TableCell colSpan={5} className="py-3 px-2">
+      <TableCell colSpan={showAccountCode ? 5 : 4} className="py-3 px-2">
         <div className="flex gap-2 items-end">
-          <ReasonFields fields={fields} onChange={setFields} error={error} accountCodes={accountCodes} />
+          <ReasonFields fields={fields} onChange={setFields} error={error} accountCodes={accountCodes} showAccountCode={showAccountCode} />
           <div className="flex gap-1 pb-0.5">
             <Button type="button" size="icon" disabled={pending} onClick={handleSave} title="Save" className="h-7 w-7">
               <Check className="h-3.5 w-3.5" />
@@ -162,11 +168,13 @@ function ReasonRow({
   onUpdated,
   onDeleted,
   accountCodes,
+  showAccountCode,
 }: {
   reason: AdjustmentReason
   onUpdated: (updated: AdjustmentReason) => void
   onDeleted: (id: string) => void
   accountCodes: AccountCodeOption[]
+  showAccountCode: boolean
 }) {
   const [editing, setEditing] = useState(false)
   const [deleting, setDeleting] = useState(false)
@@ -190,6 +198,7 @@ function ReasonRow({
         onSaved={(updated) => { onUpdated(updated); setEditing(false) }}
         onCancel={() => setEditing(false)}
         accountCodes={accountCodes}
+        showAccountCode={showAccountCode}
       />
     )
   }
@@ -201,9 +210,11 @@ function ReasonRow({
   return (
     <TableRow>
       <TableCell className="text-sm">{reason.name}</TableCell>
-      <TableCell className="text-sm font-mono text-muted-foreground">
-        {acDisplay ?? <span className="text-muted-foreground/50">—</span>}
-      </TableCell>
+      {showAccountCode && (
+        <TableCell className="text-sm font-mono text-muted-foreground">
+          {acDisplay ?? <span className="text-muted-foreground/50">—</span>}
+        </TableCell>
+      )}
       <TableCell className="text-sm text-center">{reason.sortOrder}</TableCell>
       <TableCell className="text-sm text-center">
         <span className={reason.active ? 'text-green-600' : 'text-muted-foreground'}>
@@ -231,7 +242,15 @@ function ReasonRow({
 
 const emptyFields: FieldState = { name: '', accountCode: '', sortOrder: 0, active: true }
 
-function AddReasonRow({ onAdded, accountCodes }: { onAdded: (item: AdjustmentReason) => void; accountCodes: AccountCodeOption[] }) {
+function AddReasonRow({
+  onAdded,
+  accountCodes,
+  showAccountCode,
+}: {
+  onAdded: (item: AdjustmentReason) => void
+  accountCodes: AccountCodeOption[]
+  showAccountCode: boolean
+}) {
   const [open, setOpen] = useState(false)
   const [fields, setFields] = useState<FieldState>(emptyFields)
   const [pending, setPending] = useState(false)
@@ -260,7 +279,7 @@ function AddReasonRow({ onAdded, accountCodes }: { onAdded: (item: AdjustmentRea
   if (!open) {
     return (
       <TableRow>
-        <TableCell colSpan={5} className="pt-3">
+        <TableCell colSpan={showAccountCode ? 5 : 4} className="pt-3">
           <Button variant="outline" size="sm" onClick={() => setOpen(true)}>
             <Plus className="h-3.5 w-3.5 mr-1" />
             Add Reason
@@ -272,9 +291,9 @@ function AddReasonRow({ onAdded, accountCodes }: { onAdded: (item: AdjustmentRea
 
   return (
     <TableRow className="bg-muted/30">
-      <TableCell colSpan={5} className="py-3 px-2">
+      <TableCell colSpan={showAccountCode ? 5 : 4} className="py-3 px-2">
         <div className="flex gap-2 items-end">
-          <ReasonFields fields={fields} onChange={setFields} error={error} accountCodes={accountCodes} />
+          <ReasonFields fields={fields} onChange={setFields} error={error} accountCodes={accountCodes} showAccountCode={showAccountCode} />
           <div className="flex gap-1 pb-0.5">
             <Button type="button" size="icon" disabled={pending} onClick={handleSave} title="Save" className="h-7 w-7">
               <Check className="h-3.5 w-3.5" />
@@ -293,7 +312,7 @@ function AddReasonRow({ onAdded, accountCodes }: { onAdded: (item: AdjustmentRea
 // Table
 // ---------------------------------------------------------------------------
 
-export function AdjustmentReasonsTable({ reasons: initial, accountCodes }: Props) {
+export function AdjustmentReasonsTable({ reasons: initial, accountCodes, showAccountCode = true }: Props) {
   const [reasons, setReasons] = useState(initial)
 
   return (
@@ -301,7 +320,7 @@ export function AdjustmentReasonsTable({ reasons: initial, accountCodes }: Props
       <TableHeader>
         <TableRow>
           <TableHead className="text-xs">Reason Name</TableHead>
-          <TableHead className="text-xs">Account Code</TableHead>
+          {showAccountCode && <TableHead className="text-xs">Account Code</TableHead>}
           <TableHead className="text-xs text-center w-24">Sort</TableHead>
           <TableHead className="text-xs text-center w-20">Active</TableHead>
           <TableHead className="w-20" />
@@ -310,7 +329,7 @@ export function AdjustmentReasonsTable({ reasons: initial, accountCodes }: Props
       <TableBody>
         {reasons.length === 0 && (
           <TableRow>
-            <TableCell colSpan={5} className="py-4 text-sm text-muted-foreground text-center">
+            <TableCell colSpan={showAccountCode ? 5 : 4} className="py-4 text-sm text-muted-foreground text-center">
               No reasons configured yet.
             </TableCell>
           </TableRow>
@@ -322,9 +341,10 @@ export function AdjustmentReasonsTable({ reasons: initial, accountCodes }: Props
             onUpdated={(updated) => setReasons((prev) => prev.map((x) => (x.id === updated.id ? updated : x)))}
             onDeleted={(id) => setReasons((prev) => prev.filter((x) => x.id !== id))}
             accountCodes={accountCodes}
+            showAccountCode={showAccountCode}
           />
         ))}
-        <AddReasonRow onAdded={(item) => setReasons((prev) => [...prev, item])} accountCodes={accountCodes} />
+        <AddReasonRow onAdded={(item) => setReasons((prev) => [...prev, item])} accountCodes={accountCodes} showAccountCode={showAccountCode} />
       </TableBody>
     </Table>
   )

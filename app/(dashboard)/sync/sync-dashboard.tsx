@@ -12,36 +12,41 @@ import type {
   ShoppingSyncSettings,
   ShoppingTaxRateMappingRow,
 } from '@/app/actions/shopping-sync'
-import type { XeroSettings, XeroSyncLogRow, XeroSyncReadiness } from '@/app/actions/xero-sync'
-import type { DailyBatchPreview, DailyBatchHistoryDay } from '@/app/actions/xero-daily-batch'
+import type {
+  AccountingAccountRow,
+  AccountingConnectorSettings,
+  AccountingSyncLogRow,
+  AccountingSyncReadiness,
+} from '@/app/actions/accounting-sync'
+import type { AccountingBatchHistoryDay, AccountingBatchPreview } from '@/app/actions/accounting-batch'
 import type { TaxRateRow } from '@/app/actions/settings'
-
-type XeroAccount = { id: string; xeroId: string; code: string | null; name: string; type: string }
+import type { IntegrationPluginState } from '@/lib/integration-plugins'
 
 type Props = {
+  pluginState: IntegrationPluginState
   shoppingSettings: ShoppingSyncSettings
   shoppingTaxMappings: ShoppingTaxRateMappingRow[]
   shoppingStatusMappings: ShoppingStatusMappingRow[]
   shoppingLogs: ShoppingSyncLogRow[]
   taxRates: { id: string; name: string }[]
-  /** Full IMS VAT rate rows (used by the Xero tax code mapping UI). */
+  /** Full IMS VAT rate rows (used by the accounting tax code mapping UI). */
   imsTaxRates: TaxRateRow[]
-  /** Live Xero tax rates (fetched on page load when connected). */
-  xeroTaxRates: Array<{ taxType: string; name: string; rate: number }>
+  /** Live accounting tax rates (fetched on page load when connected). */
+  accountingTaxRates: Array<{ taxType: string; name: string; rate: number }>
   shoppingCredentials: ShoppingConnectorCredentials
-  xeroSettings: XeroSettings & { secretMasked: boolean }
-  xeroConnected: boolean
-  xeroTenantName?: string
-  xeroAccounts: XeroAccount[]
-  xeroLogs: XeroSyncLogRow[]
+  accountingSettings: AccountingConnectorSettings & { secretMasked: boolean }
+  accountingConnected: boolean
+  accountingTenantName?: string
+  accountingAccounts: AccountingAccountRow[]
+  accountingLogs: AccountingSyncLogRow[]
   paymentMethodCombos: Array<{ paymentMethod: string; currency: string }>
   paymentAccountMap: string
   currencies: Array<{ code: string; name: string }>
-  /** Active shopping connector payment methods — used to populate the method dropdown in Xero payment mapping. */
+  /** Active shopping connector payment methods — used to populate the method dropdown in accounting payment mapping. */
   shoppingPaymentMethods: Array<{ id: string; title: string }>
-  xeroReadiness: XeroSyncReadiness
-  dailyBatchPreview: DailyBatchPreview
-  dailyBatchHistory: DailyBatchHistoryDay[]
+  accountingReadiness: AccountingSyncReadiness
+  accountingBatchPreview: AccountingBatchPreview
+  accountingBatchHistory: AccountingBatchHistoryDay[]
 }
 
 type ConnectorDef = {
@@ -115,10 +120,17 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 
-export function SyncDashboard({ shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, taxRates, imsTaxRates, xeroTaxRates, shoppingCredentials, xeroSettings, xeroConnected, xeroTenantName, xeroAccounts, xeroLogs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, xeroReadiness, dailyBatchPreview, dailyBatchHistory }: Props) {
+export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, taxRates, imsTaxRates, accountingTaxRates, shoppingCredentials, accountingSettings, accountingConnected, accountingTenantName, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, accountingReadiness, accountingBatchPreview, accountingBatchHistory }: Props) {
   const router = useRouter()
   const searchParams = useSearchParams()
-  const activeConnector = searchParams.get('connector')
+  const requestedConnector = searchParams.get('connector')
+  const activeConnector = (
+    requestedConnector === 'woocommerce' && !pluginState.woocommerce
+  ) || (
+    requestedConnector === 'xero' && !pluginState.xero
+  )
+    ? null
+    : requestedConnector
 
   function setActiveConnector(id: string | null) {
     if (id) {
@@ -128,7 +140,12 @@ export function SyncDashboard({ shoppingSettings, shoppingTaxMappings, shoppingS
     }
   }
 
-  const shoppingConnected = !!shoppingCredentials.url && !!shoppingCredentials.key && !!shoppingCredentials.secret
+  const shoppingConnected = pluginState.woocommerce && !!shoppingCredentials.url && !!shoppingCredentials.key && !!shoppingCredentials.secret
+  const visibleConnectors = CONNECTORS.filter((connector) => {
+    if (connector.id === 'woocommerce') return pluginState.woocommerce
+    if (connector.id === 'xero') return pluginState.xero
+    return true
+  })
 
   if (activeConnector === 'rest-api') {
     const baseUrl = typeof window !== 'undefined' ? window.location.origin : ''
@@ -219,20 +236,20 @@ export function SyncDashboard({ shoppingSettings, shoppingTaxMappings, shoppingS
           </div>
         </div>
         <XeroClient
-          settings={xeroSettings}
-          connected={xeroConnected}
-          tenantName={xeroTenantName}
-          accounts={xeroAccounts}
-          logs={xeroLogs}
+          settings={accountingSettings}
+          connected={accountingConnected}
+          tenantName={accountingTenantName}
+          accounts={accountingAccounts}
+          logs={accountingLogs}
           paymentMethodCombos={paymentMethodCombos}
           paymentAccountMap={paymentAccountMap}
           currencies={currencies}
           shoppingPaymentMethods={shoppingPaymentMethods}
           imsTaxRates={imsTaxRates}
-          xeroTaxRates={xeroTaxRates}
-          readiness={xeroReadiness}
-          dailyBatchPreview={dailyBatchPreview}
-          dailyBatchHistory={dailyBatchHistory}
+          xeroTaxRates={accountingTaxRates}
+          readiness={accountingReadiness}
+          dailyBatchPreview={accountingBatchPreview}
+          dailyBatchHistory={accountingBatchHistory}
         />
       </div>
     )
@@ -269,7 +286,7 @@ export function SyncDashboard({ shoppingSettings, shoppingTaxMappings, shoppingS
       <div>
         <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide mb-3">Shopping Platforms</h2>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {CONNECTORS.filter((c) => c.category === 'shopping').map((c) => (
+          {visibleConnectors.filter((c) => c.category === 'shopping').map((c) => (
             <Card
               key={c.id}
               className={`p-5 space-y-3 transition-colors ${c.available ? 'cursor-pointer hover:border-primary/50' : 'opacity-50'}`}
@@ -298,7 +315,7 @@ export function SyncDashboard({ shoppingSettings, shoppingTaxMappings, shoppingS
       <div>
         <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide mb-3">Accounting</h2>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-          {CONNECTORS.filter((c) => c.category === 'accounting').map((c) => (
+          {visibleConnectors.filter((c) => c.category === 'accounting').map((c) => (
             <Card
               key={c.id}
               className={`p-5 space-y-3 transition-colors ${c.available ? 'cursor-pointer hover:border-primary/50' : 'opacity-50'}`}
@@ -306,7 +323,7 @@ export function SyncDashboard({ shoppingSettings, shoppingTaxMappings, shoppingS
             >
               <div className="flex items-center justify-between">
                 {CONNECTOR_LOGOS[c.id]}
-                {c.id === 'xero' && xeroConnected && (
+                {c.id === 'xero' && accountingConnected && (
                   <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
                     Connected
                   </span>

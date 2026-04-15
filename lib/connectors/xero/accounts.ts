@@ -1,11 +1,11 @@
 /**
- * Sync Xero Chart of Accounts → local XeroAccount table.
+ * Sync Xero Chart of Accounts → local AccountingAccount table.
  */
 
 import { db } from '@/lib/db'
 import { xeroGet } from './api'
 
-type XeroAccountResponse = {
+type AccountingAccountResponse = {
   Accounts: Array<{
     AccountID: string
     Code: string
@@ -18,10 +18,10 @@ type XeroAccountResponse = {
 }
 
 /**
- * Pull the full chart of accounts from Xero and upsert into XeroAccount.
+ * Pull the full chart of accounts from Xero and upsert into AccountingAccount.
  */
 export async function syncChartOfAccounts(): Promise<{ synced: number; errors: string[] }> {
-  const res = await xeroGet<XeroAccountResponse>('Accounts')
+  const res = await xeroGet<AccountingAccountResponse>('Accounts')
   if (!res.ok || !res.data) {
     return { synced: 0, errors: [res.error ?? 'Failed to fetch accounts'] }
   }
@@ -31,10 +31,10 @@ export async function syncChartOfAccounts(): Promise<{ synced: number; errors: s
 
   for (const acc of res.data.Accounts) {
     try {
-      await db.xeroAccount.upsert({
-        where: { xeroId: acc.AccountID },
+      await db.accountingAccount.upsert({
+        where: { externalAccountId: acc.AccountID },
         create: {
-          xeroId: acc.AccountID,
+          externalAccountId: acc.AccountID,
           code: acc.Code ?? null,
           name: acc.Name,
           type: acc.Type,
@@ -58,13 +58,33 @@ export async function syncChartOfAccounts(): Promise<{ synced: number; errors: s
   }
 
   // Deactivate accounts that no longer exist in Xero
-  const xeroIds = res.data.Accounts.map(a => a.AccountID)
-  await db.xeroAccount.updateMany({
-    where: { xeroId: { notIn: xeroIds } },
+  const externalAccountIds = res.data.Accounts.map(a => a.AccountID)
+  await db.accountingAccount.updateMany({
+    where: { externalAccountId: { notIn: externalAccountIds } },
     data: { active: false },
   })
 
   return { synced, errors }
+}
+
+export async function listStoredAccounts(): Promise<Array<{ code: string; name: string; type: string }>> {
+  const accounts = await db.accountingAccount.findMany({
+    where: { active: true, code: { not: null } },
+    select: { code: true, name: true, type: true },
+    orderBy: [{ code: 'asc' }],
+  })
+  return accounts
+    .filter((a): a is { code: string; name: string; type: string } => a.code !== null)
+    .map((a) => ({ code: a.code, name: a.name, type: a.type }))
+}
+
+export async function listStoredBankAccounts(): Promise<Array<{ id: string; code: string | null; name: string }>> {
+  const accounts = await db.accountingAccount.findMany({
+    where: { active: true, type: 'BANK' },
+    select: { externalAccountId: true, code: true, name: true },
+    orderBy: [{ name: 'asc' }],
+  })
+  return accounts.map((a) => ({ id: a.externalAccountId, code: a.code, name: a.name }))
 }
 
 /**

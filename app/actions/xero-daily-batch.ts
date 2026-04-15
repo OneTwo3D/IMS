@@ -72,7 +72,7 @@ export type DailyBatchHistoryEntry = {
   totalDebit: number
   createdAt: string
   syncedAt: string | null
-  xeroTransactionId: string | null
+  externalTransactionId: string | null
   errorMessage: string | null
   retryCount: number
   lines: Array<{ accountCode: string; description: string; debit: number; credit: number }>
@@ -422,7 +422,7 @@ export async function getXeroDailyBatchHistory(
       totalDebit,
       createdAt: row.createdAt.toISOString(),
       syncedAt: row.syncedAt?.toISOString() ?? null,
-      xeroTransactionId: row.xeroTransactionId,
+      externalTransactionId: row.externalTransactionId,
       errorMessage: row.errorMessage,
       retryCount: row.retryCount,
       lines,

@@ -167,7 +167,7 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 - `ActivityLog` — full audit trail with entity type, action, level, tag, and metadata
 
 **Integration:**
-- `XeroAccount`, `XeroSyncLog` — Xero chart of accounts and sync status
+- `AccountingAccount`, `AccountingSyncLog` — accounting connector account cache and sync status
 - `WcSyncLog` — WooCommerce sync log
 - `WcStatusMapping` — bidirectional WC-to-IMS status mapping (with seeded defaults)
 - `WcTaxClassMapping` — WC tax class to IMS TaxRate mapping

@@ -12,6 +12,8 @@ interface DashboardShellProps {
   userName: string
   userEmail: string
   userPictureUrl?: string | null
+  shoppingIntegrationEnabled: boolean
+  accountingIntegrationEnabled: boolean
   children: React.ReactNode
 }
 
@@ -22,6 +24,8 @@ export function DashboardShell({
   userName,
   userEmail,
   userPictureUrl,
+  shoppingIntegrationEnabled,
+  accountingIntegrationEnabled,
   children,
 }: DashboardShellProps) {
   const [mobileOpen, setMobileOpen] = useState(false)
@@ -30,7 +34,13 @@ export function DashboardShell({
     <div className="flex h-screen overflow-hidden">
       {/* Desktop sidebar */}
       <div className="hidden md:flex">
-        <Sidebar companyName={companyName} logoUrl={logoUrl} userRole={userRole} />
+        <Sidebar
+          companyName={companyName}
+          logoUrl={logoUrl}
+          userRole={userRole}
+          shoppingIntegrationEnabled={shoppingIntegrationEnabled}
+          accountingIntegrationEnabled={accountingIntegrationEnabled}
+        />
       </div>
 
       <Sheet open={mobileOpen} onOpenChange={setMobileOpen}>
@@ -43,6 +53,8 @@ export function DashboardShell({
               companyName={companyName}
               logoUrl={logoUrl}
               userRole={userRole}
+              shoppingIntegrationEnabled={shoppingIntegrationEnabled}
+              accountingIntegrationEnabled={accountingIntegrationEnabled}
               onNavigate={() => setMobileOpen(false)}
               forceExpanded
             />

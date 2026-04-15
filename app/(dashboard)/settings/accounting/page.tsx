@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import Link from 'next/link'
+import { redirect } from 'next/navigation'
 import { CalendarDays, Receipt, Coins, RefreshCw } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Card } from '@/components/ui/card'
@@ -9,6 +10,7 @@ import { FinancialYearStartSetting } from '@/components/settings/financial-year-
 import { TaxRatesTable } from '@/components/settings/tax-rates-table'
 import { CurrenciesTable } from '@/components/settings/currencies-table'
 import { FxScheduleSettings } from '@/components/settings/fx-schedule'
+import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
 export const metadata: Metadata = { title: 'Accounting Settings' }
 
@@ -25,6 +27,10 @@ export default async function AccountingSettingsPage({
 }: {
   searchParams: Promise<Record<string, string | string[] | undefined>>
 }) {
+  if (!(await isIntegrationPluginEnabled('xero'))) {
+    redirect('/settings/system?tab=plugins')
+  }
+
   const params = await searchParams
   const raw = typeof params.tab === 'string' ? params.tab : undefined
   const activeTab: Tab = TABS.some((t) => t.key === raw) ? (raw as Tab) : 'financial-year'
@@ -78,8 +84,8 @@ export default async function AccountingSettingsPage({
         <Card className="p-6">
           <p className="text-sm text-muted-foreground mb-4">
             Define VAT rates for sales and purchases. Rates marked &quot;Both&quot; apply to sales and purchases.
-            Tax code mapping to Xero is configured on the{' '}
-            <a href="/sync" className="underline hover:text-foreground">Xero connector</a> page.
+            {' '}Tax code mapping to the accounting connector is configured on the{' '}
+            <a href="/sync?connector=xero" className="underline hover:text-foreground">accounting connector</a> page.
           </p>
           <TaxRatesTable taxRates={taxData.taxRates} />
         </Card>

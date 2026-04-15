@@ -33,14 +33,17 @@ Already in the right direction:
 - The architecture docs already describe the intended future shape: accounting connectors under `lib/connectors/`.
 
 Not replaceable enough yet:
-- `lib/accounting.ts` still delegates directly to Xero internals and returns Xero-shaped defaults, account fields, and account-list storage.
-- app actions are Xero-specific (`app/actions/xero-sync.ts`, `app/actions/xero-daily-batch.ts`) rather than generic accounting-integration actions.
-- the integrations dashboard and client components are wired to Xero concepts, Xero settings, Xero account lists, and Xero tax rates.
-- cron endpoints are named and implemented as Xero-specific routes (`/api/cron/xero-sync`, `/api/cron/xero-daily-batch`, `/api/cron/xero-payment-poll`).
-- the OAuth callback is Xero-specific (`/api/xero/callback`) and redirects with Xero-specific query params.
+- the integrations dashboard still mounts a Xero-owned UI component and retains some Xero-specific copy/toggle keys in that connector-owned section.
+- connector-owned action implementations still live in `app/actions/xero-sync.ts` and `app/actions/xero-daily-batch.ts`, although shared app code now consumes generic wrappers.
 - tax-rate linking in settings calls Xero APIs directly.
-- page-level invoice/bill link defaults still assume Xero URL formats.
-- generic account/bank-account listing still reads from `db.xeroAccount` directly.
+- some connector-owned persistence still uses `xero_*` tables/columns, which is acceptable for now as long as non-connector code stays behind generic selectors.
+
+Recently completed:
+- shared app code now uses generic accounting actions via `app/actions/accounting-sync.ts` and `app/actions/accounting-batch.ts`
+- `/sync` page and shared dashboard props now consume generic accounting data instead of importing Xero-specific action types
+- cron ingress now runs through `/api/cron/accounting-sync`, `/api/cron/accounting-daily-batch`, and `/api/cron/accounting-payment-poll`
+- OAuth callback ingress now runs through `/api/accounting/callback` with generic `accounting_success` / `accounting_error` UI query params
+- `lib/accounting.ts` now resolves the active accounting connector and uses connector-owned selectors for stored accounts/bank accounts
 
 ## Current boundary leaks
 
@@ -49,7 +52,7 @@ Not replaceable enough yet:
 Examples:
 - `queueAccountingSync()` imports `queueXeroSync`
 - `getAccountingSettings()` imports `getXeroSettings()` and maps `xero_*` fields
-- `listAccountCodes()` and `listAccountingBankAccounts()` read `db.xeroAccount` directly
+- `listAccountCodes()` and `listAccountingBankAccounts()` read `db.accountingAccount` directly
 - default invoice/bill URL templates still point to `go.xero.com`
 
 Impact:
@@ -80,10 +83,10 @@ Impact:
 ### 4. Cron and OAuth ingress are Xero-specific app routes
 
 Examples:
-- `/api/cron/xero-sync`
-- `/api/cron/xero-daily-batch`
-- `/api/cron/xero-payment-poll`
-- `/api/xero/callback`
+- `/api/cron/accounting-sync`
+- `/api/cron/accounting-daily-batch`
+- `/api/cron/accounting-payment-poll`
+- `/api/accounting/callback`
 
 Impact:
 - route naming and enablement logic are coupled to Xero.
@@ -102,9 +105,9 @@ Impact:
 ### 6. Persistence model remains connector-specific in places
 
 Examples:
-- `db.xeroAccount`
-- `db.xeroToken`
-- `xeroTransactionId` fields and Xero-specific naming in action return types/UI models
+- `db.accountingAccount`
+- `db.accountingToken`
+- `externalTransactionId` fields and Xero-specific naming in action return types/UI models
 
 Impact:
 - some schema-level connector specificity is acceptable during migration, but non-connector code should not be reading those tables/fields directly.
@@ -114,7 +117,7 @@ Impact:
 
 ### 1. Freeze the generic accounting connector contract
 
-Status: open
+Status: in progress
 
 Required changes:
 - expand `lib/accounting.ts` into the stable app-facing boundary for all accounting connectors
@@ -135,7 +138,7 @@ Definition of done:
 
 ### 2. Replace Xero-specific integration actions with generic accounting actions
 
-Status: open
+Status: in progress
 
 Required changes:
 - replace `app/actions/xero-sync.ts` with generic accounting integration actions
@@ -151,7 +154,7 @@ Definition of done:
 
 ### 3. Generalize the accounting integrations dashboard
 
-Status: open
+Status: in progress
 
 Required changes:
 - refactor `/sync` accounting surfaces so shared dashboard code consumes generic connector descriptors and generic accounting integration data
@@ -167,12 +170,12 @@ Definition of done:
 
 ### 4. Generalize accounting cron and callback ingress
 
-Status: open
+Status: completed
 
 Required changes:
-- replace `/api/cron/xero-sync`, `/api/cron/xero-daily-batch`, and `/api/cron/xero-payment-poll` app routes with generic accounting cron entrypoints or connector registration-driven cron handlers
+- replace Xero-named app cron routes with generic accounting cron entrypoints or connector registration-driven cron handlers
 - move enablement checks and connector-specific execution logic behind the accounting connector boundary
-- replace `/api/xero/callback` with a generic accounting OAuth callback entrypoint or connector-scoped registration model
+- replace the Xero-named OAuth callback with a generic accounting OAuth callback entrypoint or connector-scoped registration model
 - avoid Xero-specific redirect query params in shared UI routing
 
 Definition of done:
@@ -197,7 +200,7 @@ Definition of done:
 Status: open
 
 Required changes:
-- stop reading `db.xeroAccount`, `db.xeroToken`, and `xeroTransactionId` directly from non-connector code
+- stop reading `db.accountingAccount`, `db.accountingToken`, and `externalTransactionId` directly from non-connector code
 - add generic repository/helpers/view models for:
   - external account lists
   - connector connection state
@@ -237,7 +240,7 @@ Guidance:
 
 - no non-connector code imports from `lib/connectors/xero/**`, except a single generic bootstrap/registration layer if one remains necessary
 - no non-connector code reads `xero_*` settings directly
-- no non-connector code reads `db.xeroAccount` or `db.xeroToken` directly
+- no non-connector code reads `db.accountingAccount` or `db.accountingToken` directly
 - shared UI does not use Xero-specific component names or types for generic accounting surfaces
 - cron and OAuth entrypoints are connector-agnostic
 - sales, purchasing, stock, and settings flows continue to work without assuming Xero-specific URLs, tax concepts, or route names

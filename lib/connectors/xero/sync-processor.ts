@@ -142,7 +142,7 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
           where: { id: entry.id },
           data: {
             status: 'SYNCED',
-            xeroTransactionId: syncResult.externalId ?? null,
+            externalTransactionId: syncResult.externalId ?? null,
             syncedAt: new Date(),
             errorMessage: null,
             processingStartedAt: null,
@@ -300,9 +300,9 @@ async function processEntry(
       if (!accountingInvoiceId || !bankAccountId || amount == null) {
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for INVOICE_PAYMENT' }
       }
-      const account = await db.xeroAccount.findFirst({
-        where: { OR: [{ xeroId: bankAccountId }, { code: bankAccountId }] },
-        select: { xeroId: true },
+      const account = await db.accountingAccount.findFirst({
+        where: { OR: [{ externalAccountId: bankAccountId }, { code: bankAccountId }] },
+        select: { externalAccountId: true },
       })
       if (!account) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced Xero chart of accounts` }
@@ -310,7 +310,7 @@ async function processEntry(
       try {
         const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
           Invoice: { InvoiceID: accountingInvoiceId },
-          Account: { AccountID: account.xeroId },
+          Account: { AccountID: account.externalAccountId },
           Date: paymentDate,
           Amount: amount,
         }, { idempotencyKey: buildXeroIdempotencyKey(entryId, 'invoice-payment') })
@@ -397,9 +397,9 @@ async function processEntry(
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for BILL_PAYMENT' }
       }
       // Resolve bank account — accept either Xero AccountID (preferred) or a legacy account code.
-      const account = await db.xeroAccount.findFirst({
-        where: { OR: [{ xeroId: bankAccountId }, { code: bankAccountId }] },
-        select: { xeroId: true },
+      const account = await db.accountingAccount.findFirst({
+        where: { OR: [{ externalAccountId: bankAccountId }, { code: bankAccountId }] },
+        select: { externalAccountId: true },
       })
       if (!account) {
         return { success: false, error: `Bank account ${bankAccountId} not found in synced Xero chart of accounts` }
@@ -407,7 +407,7 @@ async function processEntry(
       try {
         const paymentRes = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
           Invoice: { InvoiceID: accountingInvoiceId },
-          Account: { AccountID: account.xeroId },
+          Account: { AccountID: account.externalAccountId },
           Date: paymentDate,
           Amount: amount,
           Reference: (payload.reference as string | undefined) ?? undefined,

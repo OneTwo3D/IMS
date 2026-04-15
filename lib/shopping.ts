@@ -5,6 +5,7 @@
 
 import type { StockSyncReason } from '@/app/generated/prisma/enums'
 import type { DeliveryStatus } from '@/lib/connectors/types'
+import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
 type ActiveShoppingConnector = 'woocommerce'
 
@@ -21,6 +22,8 @@ export type ShoppingExternalLink = {
 export type ShoppingProductLinkResult = { link: ShoppingExternalLink | null; error?: string }
 
 async function getActiveShoppingConnector(): Promise<ActiveShoppingConnector | null> {
+  if (!(await isIntegrationPluginEnabled('woocommerce'))) return null
+
   const { db } = await import('@/lib/db')
   const [url, key, secret] = await Promise.all([
     db.setting.findUnique({ where: { key: 'wc_url' } }),

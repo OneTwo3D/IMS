@@ -1,6 +1,6 @@
 import type { Metadata } from 'next'
 import Link from 'next/link'
-import { ActivitySquare, Archive, RotateCcw, Timer } from 'lucide-react'
+import { ActivitySquare, Archive, Plug, RotateCcw, Timer } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Card } from '@/components/ui/card'
 import { getSetting } from '@/app/actions/settings'
@@ -8,12 +8,15 @@ import { ActivityLogRetentionSetting } from '@/components/settings/activity-log-
 import { DataRetentionSetting } from '@/components/settings/data-retention'
 import { DatabaseReset } from '@/components/settings/database-reset'
 import { CronJobsSettings } from '@/components/settings/cron-jobs-settings'
+import { IntegrationPluginsSettings } from '@/components/settings/integration-plugins-settings'
 import type { CronJobState } from '@/components/settings/cron-jobs-settings'
 import { getAllCronJobs } from '@/lib/cron-jobs'
+import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
 
 export const metadata: Metadata = { title: 'System Settings' }
 
 const TABS = [
+  { key: 'plugins', label: 'Plugins', icon: Plug },
   { key: 'scheduler', label: 'Scheduler', icon: Timer },
   { key: 'retention', label: 'Data Retention', icon: Archive },
   { key: 'reset', label: 'Database Reset', icon: RotateCcw },
@@ -31,7 +34,8 @@ export default async function SystemSettingsPage({
   const activeTab: Tab = TABS.some((t) => t.key === raw) ? (raw as Tab) : 'scheduler'
 
   // Only fetch data needed for the active tab
-  const [cronJobs, retentionData] = await Promise.all([
+  const [pluginState, cronJobs, retentionData] = await Promise.all([
+    activeTab === 'plugins' || activeTab === 'scheduler' ? getIntegrationPluginState() : null,
     activeTab === 'scheduler' ? loadCronJobs() : null,
     activeTab === 'retention' ? loadRetentionData() : null,
   ])
@@ -65,14 +69,23 @@ export default async function SystemSettingsPage({
         })}
       </div>
 
+      {activeTab === 'plugins' && pluginState && (
+        <Card className="p-6">
+          <p className="text-sm text-muted-foreground mb-4">
+            Disable connector plugins without deleting their saved credentials or mappings. Disabled plugins are hidden from shared menus and their webhook or scheduler entry points stop running until re-enabled.
+          </p>
+          <IntegrationPluginsSettings
+            woocommerceEnabled={pluginState.woocommerce}
+            xeroEnabled={pluginState.xero}
+          />
+        </Card>
+      )}
+
       {activeTab === 'scheduler' && cronJobs && (
         <Card className="p-6">
           <p className="text-sm text-muted-foreground mb-4">
             Enable or disable cron jobs and set their frequency. Changes are applied to the
             system crontab when you save.
-          </p>
-          <p className="text-sm text-muted-foreground mb-4">
-            WooCommerce is now webhook-first for order and product intake. The WooCommerce scheduler entry is a backup reconciliation job and should normally run daily rather than every few minutes.
           </p>
           <CronJobsSettings jobs={cronJobs} />
         </Card>
@@ -138,7 +151,9 @@ export default async function SystemSettingsPage({
 // ---------------------------------------------------------------------------
 
 async function loadCronJobs(): Promise<CronJobState[]> {
+  const pluginState = await getIntegrationPluginState()
   const allJobs = getAllCronJobs()
+    .filter((job) => isIntegrationModuleVisible(job.module, pluginState))
   const cronSettingKeys = allJobs.flatMap((j) => [
     `cron_${j.settingKey}_enabled`,
     `cron_${j.settingKey}_schedule`,

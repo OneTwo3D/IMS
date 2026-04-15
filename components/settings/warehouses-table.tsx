@@ -21,7 +21,7 @@ import {
   type WarehouseInput,
 } from '@/app/actions/settings'
 
-type Props = { warehouses: WarehouseRow[] }
+type Props = { warehouses: WarehouseRow[]; showStoreSync?: boolean }
 
 type WarehouseFormFields = Omit<WarehouseInput, 'syncToStore'> & {
   syncToStore: boolean
@@ -84,12 +84,14 @@ function WarehouseDialog({
   editingId,
   initial,
   onSaved,
+  showStoreSync,
 }: {
   open: boolean
   onOpenChange: (open: boolean) => void
   editingId: string | null
   initial: WarehouseFormFields
   onSaved: (item: WarehouseRow, isNew: boolean) => void
+  showStoreSync: boolean
 }) {
   const [fields, setFields] = useState<WarehouseFormFields>(initial)
   const [pending, setPending] = useState(false)
@@ -210,10 +212,12 @@ function WarehouseDialog({
                 <input type="checkbox" checked={fields.availableForSale} onChange={(e) => set('availableForSale', e.target.checked)} className="rounded" />
                 Available for Sale
               </label>
-              <label className="flex items-center gap-2 text-sm">
-                <input type="checkbox" checked={fields.syncToStore} onChange={(e) => set('syncToStore', e.target.checked)} className="rounded" />
-                Sync to Store
-              </label>
+              {showStoreSync && (
+                <label className="flex items-center gap-2 text-sm">
+                  <input type="checkbox" checked={fields.syncToStore} onChange={(e) => set('syncToStore', e.target.checked)} className="rounded" />
+                  Sync to Store
+                </label>
+              )}
               <label className="flex items-center gap-2 text-sm">
                 <input type="checkbox" checked={fields.isDefault} onChange={(e) => set('isDefault', e.target.checked)} className="rounded" />
                 Default Warehouse
@@ -248,7 +252,7 @@ function WarehouseDialog({
 // Table
 // ---------------------------------------------------------------------------
 
-export function WarehousesTable({ warehouses: initial }: Props) {
+export function WarehousesTable({ warehouses: initial, showStoreSync = true }: Props) {
   const [warehouses, setWarehouses] = useState(initial)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -329,7 +333,7 @@ export function WarehousesTable({ warehouses: initial }: Props) {
             <TableHead className="text-xs">Contact</TableHead>
             <TableHead className="text-xs">City</TableHead>
             <TableHead className="text-xs text-center">Default</TableHead>
-            <TableHead className="text-xs text-center">Store Sync</TableHead>
+            {showStoreSync && <TableHead className="text-xs text-center">Store Sync</TableHead>}
             <TableHead className="text-xs text-center">Active</TableHead>
             <TableHead className="w-20" />
           </TableRow>
@@ -337,7 +341,7 @@ export function WarehousesTable({ warehouses: initial }: Props) {
         <TableBody>
           {warehouses.length === 0 && (
             <TableRow>
-              <TableCell colSpan={9} className="py-4 text-sm text-muted-foreground text-center">
+              <TableCell colSpan={showStoreSync ? 9 : 8} className="py-4 text-sm text-muted-foreground text-center">
                 No warehouses configured.
               </TableCell>
             </TableRow>
@@ -353,11 +357,13 @@ export function WarehousesTable({ warehouses: initial }: Props) {
                 {w.isDefault && <span className="text-green-600">Yes</span>}
                 {w.defaultReturnWarehouse && <span className="text-blue-600 ml-1" title="Default return warehouse">R</span>}
               </TableCell>
-              <TableCell className="text-sm text-center">
-                <span className={w.syncToStore ? 'text-green-600' : 'text-muted-foreground/50'}>
-                  {w.syncToStore ? 'Yes' : '—'}
-                </span>
-              </TableCell>
+              {showStoreSync && (
+                <TableCell className="text-sm text-center">
+                  <span className={w.syncToStore ? 'text-green-600' : 'text-muted-foreground/50'}>
+                    {w.syncToStore ? 'Yes' : '—'}
+                  </span>
+                </TableCell>
+              )}
               <TableCell className="text-sm text-center">
                 <span className={w.active ? 'text-green-600' : 'text-muted-foreground'}>
                   {w.active ? 'Yes' : 'No'}
@@ -386,6 +392,7 @@ export function WarehousesTable({ warehouses: initial }: Props) {
         editingId={editingId}
         initial={dialogInit}
         onSaved={handleSaved}
+        showStoreSync={showStoreSync}
       />
     </>
   )

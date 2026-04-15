@@ -3,6 +3,7 @@ import { verifyCron } from '@/lib/cron-auth'
 import { db } from '@/lib/db'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runWcReconcile } from '@/lib/connectors/woocommerce/sync/reconcile'
+import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
 // Called by cron: curl http://localhost:3000/api/cron/wc-reconcile
 export async function GET(request: Request) {
@@ -10,6 +11,9 @@ export async function GET(request: Request) {
   if (cronErr) return cronErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
+  if (!(await isIntegrationPluginEnabled('woocommerce'))) {
+    return NextResponse.json({ skipped: true, reason: 'Shopping plugin disabled' })
+  }
 
   const enabled = await db.setting.findUnique({ where: { key: 'wc_sync_enabled' } })
   if (enabled?.value !== 'true') {

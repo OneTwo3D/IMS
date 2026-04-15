@@ -135,7 +135,7 @@ function TaxRateFormDialog({
                 ))}
               </select>
               <p className="text-xs text-muted-foreground">
-                Matched against the product&apos;s tax category at order time. &ldquo;Exempt&rdquo; vs &ldquo;Zero&rdquo; map to different Xero codes.
+                Matched against the product&apos;s tax category at order time. &ldquo;Exempt&rdquo; vs &ldquo;Zero&rdquo; map to different accounting tax codes.
               </p>
             </div>
             <div className="space-y-1.5">

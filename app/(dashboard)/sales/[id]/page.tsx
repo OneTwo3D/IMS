@@ -10,6 +10,7 @@ import { getOrderAllocations, getOrderShipments } from '@/app/actions/allocation
 import { getAccountingSettings } from '@/lib/accounting'
 import { DEFAULT_CARRIERS } from '@/lib/tracking'
 import { getSalesOrderAdminLink } from '@/lib/shopping'
+import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { SoDetailClient } from './so-detail-client'
 
 export const metadata: Metadata = { title: 'Sales Order' }
@@ -18,7 +19,7 @@ type Props = { params: Promise<{ id: string }> }
 
 export default async function SalesOrderDetailPage({ params }: Props) {
   const { id } = await params
-  const [so, warehouses, currencies, externalOrderLink, stockLevels, allocations, shipments, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings] = await Promise.all([
+  const [so, warehouses, currencies, externalOrderLink, stockLevels, allocations, shipments, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable] = await Promise.all([
     getSalesOrder(id),
     getWarehouses(),
     getCurrencies(true),
@@ -30,6 +31,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
     getSetting('delivery_tracking_enabled'),
     getSetting('accounting_invoice_url_template'),
     getAccountingSettings(),
+    isIntegrationPluginEnabled('xero'),
   ])
   let carriers: string[] = DEFAULT_CARRIERS
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
@@ -54,8 +56,9 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         initialShipments={shipments}
         carriers={carriers}
         deliveryTrackingEnabled={deliveryTrackingEnabled === 'true'}
-        accountingInvoiceUrlTemplate={invoiceUrlTemplate ?? 'https://go.xero.com/AccountsReceivable/View.aspx?InvoiceID={id}'}
-        accountingSyncEnabled={accountingSettings.syncEnabled}
+        accountingAvailable={accountingAvailable}
+        accountingInvoiceUrlTemplate={invoiceUrlTemplate ?? accountingSettings.invoiceUrlTemplate}
+        accountingSyncEnabled={accountingAvailable && accountingSettings.syncEnabled}
       />
     </div>
   )

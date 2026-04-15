@@ -9,6 +9,8 @@ import { getWarehouses } from '@/app/actions/stock'
 import { getCurrencies } from '@/app/actions/currencies'
 import { getTaxRates, getPurchaseUnits, getSetting } from '@/app/actions/settings'
 import { getOrganisation } from '@/app/actions/company'
+import { getAccountingSettings } from '@/lib/accounting'
+import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { DEFAULT_CARRIERS } from '@/lib/tracking'
 import { PoDetailClient } from './po-detail-client'
 
@@ -18,7 +20,7 @@ type Props = { params: Promise<{ id: string }> }
 
 export default async function PurchaseOrderDetailPage({ params }: Props) {
   const { id } = await params
-  const [po, suppliers, productsResult, warehouses, currencies, taxRates, purchaseUnits, billUrlTemplate, organisation, carriersJson] = await Promise.all([
+  const [po, suppliers, productsResult, warehouses, currencies, taxRates, purchaseUnits, billUrlTemplate, organisation, carriersJson, accountingSettings, accountingAvailable] = await Promise.all([
     getPurchaseOrder(id),
     getSuppliers(),
     listProducts({ pageSize: 1000, type: 'ALL', active: 'true' }),
@@ -29,6 +31,8 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
     getSetting('accounting_bill_url_template'),
     getOrganisation(),
     getSetting('shipping_carriers'),
+    getAccountingSettings(),
+    isIntegrationPluginEnabled('xero'),
   ])
 
   if (!po) notFound()
@@ -48,7 +52,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
         </Link>
         <h1 className="text-2xl font-semibold font-mono">{po.reference}</h1>
       </div>
-      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} accountingBillUrlTemplate={billUrlTemplate ?? 'https://go.xero.com/AccountsPayable/View.aspx?InvoiceID={id}'} />
+      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} />
     </div>
   )
 }

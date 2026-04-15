@@ -6,6 +6,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
 import { getAllCronJobs } from '@/lib/cron-jobs'
+import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
 
 // Strict cron expression validation: 5 fields, only digits / * / , / - / /
 const CRON_RE = /^(\*|(\*\/)?[0-9]+([,-][0-9]+)*)( (\*|(\*\/)?[0-9]+([,-][0-9]+)*)){4}$/
@@ -23,7 +24,8 @@ export async function syncCrontab(): Promise<{ success: boolean; error?: string 
   }
 
   const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000'
-  const jobs = getAllCronJobs()
+  const pluginState = await getIntegrationPluginState()
+  const jobs = getAllCronJobs().filter((job) => isIntegrationModuleVisible(job.module, pluginState))
 
   // Read enabled/schedule settings for every registered job, plus legacy keys
   const settingKeys = jobs.flatMap((j) => [

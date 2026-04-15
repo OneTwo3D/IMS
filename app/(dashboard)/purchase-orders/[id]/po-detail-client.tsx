@@ -53,6 +53,7 @@ type Props = {
   purchaseUnits: PurchaseUnitRow[]
   carriers: string[]
   companyHomeCountry?: string | null
+  accountingAvailable: boolean
   accountingBillUrlTemplate: string
 }
 
@@ -895,7 +896,7 @@ function BillDialog({
 }
 
 // ---------------------------------------------------------------------------
-// Pay Bill dialog — mark a supplier bill as paid and push payment to Xero
+// Pay Bill dialog — mark a supplier bill as paid and push payment to the accounting connector
 // ---------------------------------------------------------------------------
 
 function PayBillDialog({
@@ -931,7 +932,7 @@ function PayBillDialog({
       })
       .catch(() => {
         if (cancelled) return
-        setError('Failed to load bank accounts. Make sure Xero chart of accounts has been synced.')
+        setError('Failed to load bank accounts. Make sure the accounting chart of accounts has been synced.')
         setLoadingAccounts(false)
       })
     return () => { cancelled = true }
@@ -1024,7 +1025,7 @@ function PayBillDialog({
           {!invoice.accountingInvoiceId && (
             <div className="rounded-md border border-yellow-300 bg-yellow-50 dark:bg-yellow-950/30 p-2 text-xs text-yellow-800 dark:text-yellow-200">
               This bill has not yet been synced to your accounting system. The payment will be
-              recorded locally only — no Xero payment will be posted.
+              recorded locally only — no external payment will be posted.
             </div>
           )}
 
@@ -1296,7 +1297,7 @@ function ShipDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingBillUrlTemplate }: Props) {
+export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const po = initialPo
@@ -1477,7 +1478,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
               <Undo2 className="h-4 w-4 mr-1" />Return Items
             </Button>
           )}
-          {canBill && (
+          {accountingAvailable && canBill && (
             <Button variant="outline" size="sm" onClick={() => setShowBill(true)} disabled={isPending}>
               <Receipt className="h-4 w-4 mr-1" />Create Bill
             </Button>
@@ -1906,12 +1907,12 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
       )}
 
       {/* Bill dialog */}
-      {showBill && (
+      {accountingAvailable && showBill && (
         <BillDialog po={po} currencies={currencies} onClose={() => setShowBill(false)} />
       )}
 
       {/* Pay Bill dialog */}
-      {payBillFor && (
+      {accountingAvailable && payBillFor && (
         <PayBillDialog po={po} invoice={payBillFor} onClose={() => setPayBillFor(null)} />
       )}
 
@@ -1921,7 +1922,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
       )}
 
       {/* Invoices / Bills history */}
-      {po.invoices.length > 0 && (
+      {accountingAvailable && po.invoices.length > 0 && (
         <div className="rounded-md border overflow-x-auto">
           <button
             type="button"

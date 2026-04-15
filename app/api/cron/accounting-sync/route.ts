@@ -3,24 +3,25 @@ import { verifyCron } from '@/lib/cron-auth'
 import { db } from '@/lib/db'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { processPendingXeroSync } from '@/lib/connectors/xero/sync-processor'
+import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
-// Called by cron every 5 minutes
 export async function GET(request: Request) {
   const cronErr = verifyCron(request)
   if (cronErr) return cronErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
-
-  // Check if sync is enabled
-  const enabled = await db.setting.findUnique({ where: { key: 'xero_sync_enabled' } })
-  if (enabled?.value !== 'true') {
-    return NextResponse.json({ skipped: true, reason: 'Xero sync disabled' })
+  if (!(await isIntegrationPluginEnabled('xero'))) {
+    return NextResponse.json({ skipped: true, reason: 'Accounting plugin disabled' })
   }
 
-  // Check if connected
-  const token = await db.xeroToken.findFirst({ select: { id: true } })
+  const enabled = await db.setting.findUnique({ where: { key: 'xero_sync_enabled' } })
+  if (enabled?.value !== 'true') {
+    return NextResponse.json({ skipped: true, reason: 'Accounting sync disabled' })
+  }
+
+  const token = await db.accountingToken.findFirst({ select: { id: true } })
   if (!token) {
-    return NextResponse.json({ skipped: true, reason: 'Xero not connected' })
+    return NextResponse.json({ skipped: true, reason: 'Accounting connector not connected' })
   }
 
   const result = await processPendingXeroSync()
