@@ -79,6 +79,11 @@ export function CronJobsSettings({ jobs: initial }: Props) {
         <div key={group.module}>
           {groupIdx > 0 && <div className="border-t mb-4" />}
           <h3 className="text-sm font-medium text-muted-foreground mb-3">{group.moduleLabel}</h3>
+          {group.module === 'woocommerce' && (
+            <p className="text-xs text-muted-foreground mb-3">
+              WooCommerce sync is webhook-first. Keep this job enabled as a backup reconciler, but prefer a daily schedule unless you have a specific recovery need.
+            </p>
+          )}
           <div className="space-y-3">
             {group.jobs.map((job) => (
               <div

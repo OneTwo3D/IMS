@@ -20,6 +20,7 @@ type XeroCreditNoteResponse = {
 export async function pushCreditNote(
   data: CreditNoteData,
   status: string = 'AUTHORISED',
+  opts?: { idempotencyKey?: string },
 ): Promise<{ success: boolean; creditNoteId?: string; error?: string }> {
   // Find or create the contact
   const contactResult = await findOrCreateContact(data.contactName, data.contactEmail)
@@ -64,7 +65,7 @@ export async function pushCreditNote(
   }
   if (data.reference) creditNote.Reference = data.reference
 
-  const res = await xeroPost<XeroCreditNoteResponse>('CreditNotes', creditNote)
+  const res = await xeroPost<XeroCreditNoteResponse>('CreditNotes', creditNote, opts)
   if (!res.ok || !res.data?.CreditNotes?.length) {
     return { success: false, error: res.error ?? 'Failed to create credit note' }
   }

@@ -142,6 +142,150 @@ async function resetFailedDailyBatchLogs(): Promise<void> {
   })
 }
 
+type DailyBatchLogType = 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B'
+
+async function hasLiveDailyBatchLog(type: DailyBatchLogType, referenceId: string): Promise<boolean> {
+  const count = await db.accountingSyncLog.count({
+    where: {
+      type,
+      referenceId,
+      status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+    },
+  })
+  return count > 0
+}
+
+async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof getXeroSettings>>): Promise<void> {
+  const orphanA1Orders = await db.salesOrder.findMany({
+    where: { revenueDeferredDate: { not: null } },
+    select: { revenueDeferredDate: true, unearnedRevenueAmount: true },
+  })
+  const orphanA2Orders = await db.salesOrder.findMany({
+    where: { inventoryAllocatedDate: { not: null } },
+    select: { inventoryAllocatedDate: true, allocationBatchAmount: true },
+  })
+  const orphanBShipments = await db.shipment.findMany({
+    where: { shipmentJournalDate: { not: null } },
+    select: { shipmentJournalDate: true, revenueRecognizedAmount: true, cogsBatchAmount: true },
+  })
+
+  const a1ByDate = new Map<string, { orderCount: number; total: number }>()
+  for (const order of orphanA1Orders) {
+    const stagedAt = order.revenueDeferredDate
+    if (!stagedAt) continue
+    const key = stagedAt.toISOString().slice(0, 10)
+    const existing = a1ByDate.get(key) ?? { orderCount: 0, total: 0 }
+    existing.orderCount += 1
+    existing.total += Number(order.unearnedRevenueAmount ?? 0)
+    a1ByDate.set(key, existing)
+  }
+
+  const a2ByDate = new Map<string, { orderCount: number; total: number }>()
+  for (const order of orphanA2Orders) {
+    const stagedAt = order.inventoryAllocatedDate
+    if (!stagedAt) continue
+    const key = stagedAt.toISOString().slice(0, 10)
+    const existing = a2ByDate.get(key) ?? { orderCount: 0, total: 0 }
+    existing.orderCount += 1
+    existing.total += Number(order.allocationBatchAmount ?? 0)
+    a2ByDate.set(key, existing)
+  }
+
+  const bByDate = new Map<string, { shipmentCount: number; revenue: number; cogs: number }>()
+  for (const shipment of orphanBShipments) {
+    const stagedAt = shipment.shipmentJournalDate
+    if (!stagedAt) continue
+    const key = stagedAt.toISOString().slice(0, 10)
+    const existing = bByDate.get(key) ?? { shipmentCount: 0, revenue: 0, cogs: 0 }
+    existing.shipmentCount += 1
+    existing.revenue += Number(shipment.revenueRecognizedAmount ?? 0)
+    existing.cogs += Number(shipment.cogsBatchAmount ?? 0)
+    bByDate.set(key, existing)
+  }
+
+  for (const [date, summary] of a1ByDate) {
+    const referenceId = `A1-${date}`
+    if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_REVENUE_DEFERRAL', referenceId)) continue
+    await db.accountingSyncLog.create({
+      data: {
+        type: 'DAILY_BATCH_REVENUE_DEFERRAL',
+        status: 'PENDING',
+        referenceType: 'DailyBatch',
+        referenceId,
+        payload: {
+          date,
+          reference: `Revenue Deferral ${date}`,
+          narration: `Recreated revenue deferral batch: ${summary.orderCount} order(s), £${round2(summary.total).toFixed(2)}`,
+          lines: [
+            { accountCode: settings.xero_sales_account, description: `Daily revenue deferral — ${summary.orderCount} order(s)`, debit: round2(summary.total) },
+            { accountCode: settings.xero_unearned_revenue_account, description: `Daily revenue deferral — ${summary.orderCount} order(s)`, credit: round2(summary.total) },
+          ],
+          _postingMode: 'submitted',
+          _recreatedFromStage: true,
+        } as never,
+      },
+    })
+  }
+
+  for (const [date, summary] of a2ByDate) {
+    const referenceId = `A2-${date}`
+    if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_INVENTORY_ALLOC', referenceId)) continue
+    await db.accountingSyncLog.create({
+      data: {
+        type: 'DAILY_BATCH_INVENTORY_ALLOC',
+        status: 'PENDING',
+        referenceType: 'DailyBatch',
+        referenceId,
+        payload: {
+          date,
+          reference: `Inventory Allocation ${date}`,
+          narration: `Recreated inventory allocation batch: ${summary.orderCount} order(s), £${round2(summary.total).toFixed(2)}`,
+          lines: [
+            { accountCode: settings.xero_allocated_inventory_account, description: `Daily inventory allocation — ${summary.orderCount} order(s)`, debit: round2(summary.total) },
+            { accountCode: settings.xero_inventory_account, description: `Daily inventory allocation — ${summary.orderCount} order(s)`, credit: round2(summary.total) },
+          ],
+          _postingMode: 'submitted',
+          _recreatedFromStage: true,
+        } as never,
+      },
+    })
+  }
+
+  for (const [date, summary] of bByDate) {
+    const referenceId = `B-${date}`
+    if ((summary.revenue <= 0 && summary.cogs <= 0) || await hasLiveDailyBatchLog('DAILY_BATCH_GROUP_B', referenceId)) continue
+    const lines: JournalLinePayload[] = []
+    if (round2(summary.revenue) > 0) {
+      lines.push(
+        { accountCode: settings.xero_unearned_revenue_account, description: `Revenue recognition — ${summary.shipmentCount} shipment(s)`, debit: round2(summary.revenue) },
+        { accountCode: settings.xero_sales_account, description: `Revenue recognition — ${summary.shipmentCount} shipment(s)`, credit: round2(summary.revenue) },
+      )
+    }
+    if (round2(summary.cogs) > 0) {
+      lines.push(
+        { accountCode: settings.xero_cogs_account, description: `COGS — ${summary.shipmentCount} shipment(s)`, debit: round2(summary.cogs) },
+        { accountCode: settings.xero_allocated_inventory_account, description: `COGS — ${summary.shipmentCount} shipment(s)`, credit: round2(summary.cogs) },
+      )
+    }
+    await db.accountingSyncLog.create({
+      data: {
+        type: 'DAILY_BATCH_GROUP_B',
+        status: 'PENDING',
+        referenceType: 'DailyBatch',
+        referenceId,
+        payload: {
+          date,
+          reference: `Shipment COGS ${date}`,
+          narration: `Recreated shipment batch: ${summary.shipmentCount} shipment(s), revenue £${round2(summary.revenue).toFixed(2)}, COGS £${round2(summary.cogs).toFixed(2)}`,
+          lines,
+          _postingMode: 'submitted',
+          _recreatedFromStage: true,
+        } as never,
+      },
+    })
+  }
+}
+
 export async function runDailyBatchSync(): Promise<{
   groupA1: number
   groupA2: number
@@ -157,6 +301,7 @@ export async function runDailyBatchSync(): Promise<{
   }
 
   await resetFailedDailyBatchLogs()
+  await recreateMissingDailyBatchLogs(settings)
 
   // --- Group A1: Revenue Deferral ---
   try {
@@ -185,6 +330,8 @@ export async function runDailyBatchSync(): Promise<{
         totalRevenueDeferred += salesValue
       }
 
+      totalRevenueDeferred = round2(totalRevenueDeferred)
+
       if (totalRevenueDeferred > 0) {
         journalLines.push(
           { accountCode: settings.xero_sales_account, description: `Daily revenue deferral — ${orders.length} order(s)`, debit: totalRevenueDeferred },
@@ -193,7 +340,7 @@ export async function runDailyBatchSync(): Promise<{
       }
 
       await db.$transaction(async (tx) => {
-        if (totalRevenueDeferred > 0) {
+        if (journalLines.length > 0) {
           await createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_REVENUE_DEFERRAL',
             referenceId: `A1-${today}`,

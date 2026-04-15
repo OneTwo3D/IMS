@@ -28,8 +28,12 @@ export type WcSyncSettings = {
   wc_cogs_sync_enabled: string
   wc_webhook_secret: string
   wc_webhook_last_received_at: string
+  wc_order_webhook_last_received_at: string
+  wc_product_webhook_last_received_at: string
   last_wc_order_sync_at: string
+  last_wc_order_reconcile_at: string
   last_wc_product_sync_at: string
+  last_wc_product_reconcile_at: string
   last_wc_stock_sync_at: string
   wc_initial_import_completed: string
 }
@@ -37,7 +41,8 @@ export type WcSyncSettings = {
 const SYNC_SETTING_KEYS = [
   'wc_sync_enabled', 'wc_sync_order_statuses', 'wc_sync_interval_minutes',
   'wc_sync_product_enabled', 'wc_sync_product_direction', 'wc_stock_sync_enabled', 'wc_cogs_sync_enabled',
-  'wc_webhook_secret', 'wc_webhook_last_received_at', 'last_wc_order_sync_at', 'last_wc_product_sync_at', 'last_wc_stock_sync_at',
+  'wc_webhook_secret', 'wc_webhook_last_received_at', 'wc_order_webhook_last_received_at', 'wc_product_webhook_last_received_at',
+  'last_wc_order_sync_at', 'last_wc_order_reconcile_at', 'last_wc_product_sync_at', 'last_wc_product_reconcile_at', 'last_wc_stock_sync_at',
   'wc_initial_import_completed',
 ]
 
@@ -51,8 +56,12 @@ const SYNC_DEFAULTS: WcSyncSettings = {
   wc_cogs_sync_enabled: 'false',
   wc_webhook_secret: '',
   wc_webhook_last_received_at: '',
+  wc_order_webhook_last_received_at: '',
+  wc_product_webhook_last_received_at: '',
   last_wc_order_sync_at: '',
+  last_wc_order_reconcile_at: '',
   last_wc_product_sync_at: '',
+  last_wc_product_reconcile_at: '',
   last_wc_stock_sync_at: '',
   wc_initial_import_completed: '',
 }
@@ -525,12 +534,12 @@ export async function triggerManualSync(type: 'orders' | 'products' | 'stock'): 
   try {
     if (type === 'orders') {
       const { syncNewWcOrders } = await import('@/lib/connectors/woocommerce/sync/order-import')
-      const result = await syncNewWcOrders()
+      const result = await syncNewWcOrders({ mode: 'manual_reconcile' })
       return { success: true, result }
     }
     if (type === 'products') {
       const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
-      const result = await syncAllWcProducts()
+      const result = await syncAllWcProducts({ mode: 'manual_reconcile' })
       return { success: true, result }
     }
     if (type === 'stock') {

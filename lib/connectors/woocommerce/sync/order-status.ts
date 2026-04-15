@@ -39,8 +39,10 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success
     if (wcOrder.status === 'refunded') return { success: true }
 
     // Standard status update
-    const { updateSalesOrderStatus } = await import('@/app/actions/sales')
-    const result = await updateSalesOrderStatus(so.id, targetStatus as never)
+    const { applySalesOrderStatusTransition } = await import('@/app/actions/sales')
+    const result = await applySalesOrderStatusTransition(so.id, targetStatus as never, undefined, {
+      pushStatusToWooCommerce: false,
+    })
 
     if (!result.success) {
       logActivity({

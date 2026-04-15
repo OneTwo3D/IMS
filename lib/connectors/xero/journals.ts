@@ -19,6 +19,7 @@ type XeroManualJournalResponse = {
 export async function pushManualJournal(
   entry: JournalEntry,
   status: string = 'POSTED',
+  opts?: { idempotencyKey?: string },
 ): Promise<{ success: boolean; journalId?: string; error?: string }> {
   // Xero Manual Journal lines use a single signed `LineAmount` field
   // (positive = debit, negative = credit). DebitAmount/CreditAmount are
@@ -59,7 +60,7 @@ export async function pushManualJournal(
     Status: status,
   }
 
-  const res = await xeroPost<XeroManualJournalResponse>('ManualJournals', journal)
+  const res = await xeroPost<XeroManualJournalResponse>('ManualJournals', journal, opts)
   if (!res.ok || !res.data?.ManualJournals?.length) {
     return { success: false, error: res.error ?? 'Failed to create manual journal' }
   }

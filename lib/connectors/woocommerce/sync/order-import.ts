@@ -19,6 +19,20 @@ import type { TaxCategory } from '@/app/generated/prisma/client'
 
 export type ImportWcOrderOptions = { skipAccounting?: boolean; useWcDateAsCreatedAt?: boolean }
 
+const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
+
+export async function isWcOrderWebhookPrimaryActive(): Promise<boolean> {
+  const [secret, lastReceived] = await Promise.all([
+    db.setting.findUnique({ where: { key: 'wc_webhook_secret' } }),
+    db.setting.findUnique({ where: { key: 'wc_order_webhook_last_received_at' } }),
+  ])
+
+  if (!secret?.value || !lastReceived?.value) return false
+  const ts = Date.parse(lastReceived.value)
+  if (!Number.isFinite(ts)) return false
+  return (Date.now() - ts) <= WEBHOOK_PRIMARY_FRESH_MS
+}
+
 export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<{ success: boolean; orderId?: string; error?: string }> {
   try {
     // Skip if already imported
@@ -357,8 +371,12 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
 // Sync all new/updated WC orders
 // ---------------------------------------------------------------------------
 
-export async function syncNewWcOrders(): Promise<SyncResult> {
+export async function syncNewWcOrders(
+  opts: { mode?: 'poll' | 'reconcile' | 'manual_reconcile' } = {},
+): Promise<SyncResult> {
   const result: SyncResult = { synced: 0, skipped: 0, errors: [] }
+  const mode = opts.mode ?? 'poll'
+  const cursorKey = mode === 'poll' ? 'last_wc_order_sync_at' : 'last_wc_order_reconcile_at'
 
   // Guard: initial import must be completed before ongoing sync runs
   const initialImportSetting = await db.setting.findUnique({ where: { key: 'wc_initial_import_completed' } })
@@ -369,7 +387,7 @@ export async function syncNewWcOrders(): Promise<SyncResult> {
   // Read settings
   const [statusesSetting, lastSyncSetting] = await Promise.all([
     db.setting.findUnique({ where: { key: 'wc_sync_order_statuses' } }),
-    db.setting.findUnique({ where: { key: 'last_wc_order_sync_at' } }),
+    db.setting.findUnique({ where: { key: cursorKey } }),
   ])
 
   let statuses: string[]
@@ -413,8 +431,8 @@ export async function syncNewWcOrders(): Promise<SyncResult> {
 
   // Update last sync timestamp
   await db.setting.upsert({
-    where: { key: 'last_wc_order_sync_at' },
-    create: { key: 'last_wc_order_sync_at', value: new Date().toISOString() },
+    where: { key: cursorKey },
+    create: { key: cursorKey, value: new Date().toISOString() },
     update: { value: new Date().toISOString() },
   })
 
@@ -424,7 +442,7 @@ export async function syncNewWcOrders(): Promise<SyncResult> {
       action: 'order_sync',
       tag: 'sync',
       level: 'INFO',
-      description: `WC order sync: ${result.synced} imported, ${result.skipped} skipped, ${result.errors.length} errors`,
+      description: `WC order ${mode === 'poll' ? 'poll' : 'reconciliation'}: ${result.synced} imported, ${result.skipped} skipped, ${result.errors.length} errors`,
     })
   }
 

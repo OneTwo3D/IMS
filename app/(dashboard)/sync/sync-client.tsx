@@ -268,7 +268,16 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   const [wcSecret, setWcSecret] = useState(wcCredentials.secret)
   const wcConfigured = !!wcUrl && !!wcKey && !!wcSecret
   const initialImportDone = s.wc_initial_import_completed === 'true'
-  const webhookActive = !!s.wc_webhook_secret && !!s.wc_webhook_last_received_at
+  const orderWebhookActive = (() => {
+    if (!s.wc_webhook_secret || !s.wc_order_webhook_last_received_at) return false
+    const receivedAt = Date.parse(s.wc_order_webhook_last_received_at)
+    return Number.isFinite(receivedAt) && (Date.now() - receivedAt) <= 24 * 60 * 60 * 1000
+  })()
+  const productWebhookActive = (() => {
+    if (!s.wc_webhook_secret || !s.wc_product_webhook_last_received_at) return false
+    const receivedAt = Date.parse(s.wc_product_webhook_last_received_at)
+    return Number.isFinite(receivedAt) && (Date.now() - receivedAt) <= 24 * 60 * 60 * 1000
+  })()
   const [tab, setTab] = useState<TabId>('connection')
 
   // Initial import progress polling
@@ -591,13 +600,13 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
                 </div>
               </div>
               <div className="space-y-1.5">
-                <Label className={webhookActive ? 'text-muted-foreground' : ''}>Polling interval (minutes)</Label>
-                <Input type="number" min={1} value={s.wc_sync_interval_minutes} onChange={(e) => setS({ ...s, wc_sync_interval_minutes: e.target.value })} className="h-9 text-sm w-24" disabled={webhookActive} />
-                {webhookActive && (
-                  <p className="text-xs text-muted-foreground">Polling is disabled — orders are received in real-time via webhook (last received: {new Date(s.wc_webhook_last_received_at).toLocaleString('en-GB')}).</p>
+                <Label className={orderWebhookActive ? 'text-muted-foreground' : ''}>Polling interval (minutes)</Label>
+                <Input type="number" min={1} value={s.wc_sync_interval_minutes} onChange={(e) => setS({ ...s, wc_sync_interval_minutes: e.target.value })} className="h-9 text-sm w-24" disabled={orderWebhookActive} />
+                {orderWebhookActive && (
+                  <p className="text-xs text-muted-foreground">Primary order polling is disabled — orders are received in real-time via webhook (last received: {new Date(s.wc_order_webhook_last_received_at).toLocaleString('en-GB')}). Cron now acts only as backup reconciliation, roughly daily.</p>
                 )}
-                {s.wc_webhook_secret && !webhookActive && (
-                  <p className="text-xs text-amber-600">Webhook secret is set but no webhook has been received yet — polling is still active.</p>
+                {s.wc_webhook_secret && !orderWebhookActive && (
+                  <p className="text-xs text-amber-600">Webhook secret is set but no recent order webhook has been received — polling reconciliation is still active.</p>
                 )}
               </div>
             </div>
@@ -620,7 +629,10 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
                 <span className="text-xs text-muted-foreground">Complete initial import first</span>
               )}
               {s.last_wc_order_sync_at && (
-                <span className="text-xs text-muted-foreground">Last sync: {new Date(s.last_wc_order_sync_at).toLocaleString('en-GB')}</span>
+                <span className="text-xs text-muted-foreground">Last order intake: {new Date(s.last_wc_order_sync_at).toLocaleString('en-GB')}</span>
+              )}
+              {s.last_wc_order_reconcile_at && (
+                <span className="text-xs text-muted-foreground">Last reconcile: {new Date(s.last_wc_order_reconcile_at).toLocaleString('en-GB')}</span>
               )}
             </div>
           </Card>
@@ -669,6 +681,15 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
                   {syncingType === 'products' ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
                   Sync Products Now
                 </Button>
+                {productWebhookActive && (
+                  <p className="text-xs text-muted-foreground">Primary product polling is disabled — products are updated via webhook (last received: {new Date(s.wc_product_webhook_last_received_at).toLocaleString('en-GB')}). Cron only runs backup reconciliation.</p>
+                )}
+                {s.last_wc_product_sync_at && (
+                  <p className="text-xs text-muted-foreground">Last product intake: {new Date(s.last_wc_product_sync_at).toLocaleString('en-GB')}</p>
+                )}
+                {s.last_wc_product_reconcile_at && (
+                  <p className="text-xs text-muted-foreground">Last product reconcile: {new Date(s.last_wc_product_reconcile_at).toLocaleString('en-GB')}</p>
+                )}
               </div>
             )}
           </Card>

@@ -959,8 +959,22 @@ export async function updateSalesOrderStatus(
   targetStatus: SoStatus,
   extra?: { trackingNumber?: string; shipFromWarehouseId?: string },
 ): Promise<{ success: boolean; error?: string }> {
+  return applySalesOrderStatusTransition(id, targetStatus, extra, {
+    requireProcessPermission: true,
+    pushStatusToWooCommerce: true,
+  })
+}
+
+export async function applySalesOrderStatusTransition(
+  id: string,
+  targetStatus: SoStatus,
+  extra?: { trackingNumber?: string; shipFromWarehouseId?: string },
+  options?: { requireProcessPermission?: boolean; pushStatusToWooCommerce?: boolean },
+): Promise<{ success: boolean; error?: string }> {
   try {
-    await requirePermission('sales.process')
+    if (options?.requireProcessPermission ?? false) {
+      await requirePermission('sales.process')
+    }
     const so = await db.salesOrder.findUnique({
       where: { id },
       select: { id: true, orderNumber: true, wcOrderId: true, wcOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { id: true, productId: true, sku: true, qty: true } } },
@@ -1107,7 +1121,7 @@ export async function updateSalesOrderStatus(
     })
 
     // Push status to WooCommerce (fire-and-forget)
-    if (so.wcOrderId) {
+    if ((options?.pushStatusToWooCommerce ?? true) && so.wcOrderId) {
       import('@/lib/connectors/woocommerce/sync/order-status').then((m) =>
         m.pushImsStatusToWc(id, targetStatus as never).catch(() => {}),
       )

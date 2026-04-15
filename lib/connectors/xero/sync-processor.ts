@@ -28,6 +28,10 @@ type ProcessResult = {
 
 type SyncPayload = Record<string, unknown>
 
+function buildXeroIdempotencyKey(entryId: string, operation: string): string {
+  return `ims-${operation}-${entryId}`
+}
+
 export async function processPendingXeroSync(): Promise<ProcessResult> {
   const result: ProcessResult = { processed: 0, succeeded: 0, failed: 0, skipped: 0 }
   const staleClaimCutoff = new Date(Date.now() - CLAIM_STALE_MS)
@@ -71,7 +75,7 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
     const payload = (entry.payload ?? {}) as SyncPayload
 
     try {
-      const syncResult = await processEntry(entry.type, payload)
+      const syncResult = await processEntry(entry.id, entry.type, payload)
 
       if (syncResult.success) {
         await db.accountingSyncLog.update({
@@ -145,6 +149,7 @@ function resolveJournalStatus(mode: unknown): string {
 }
 
 async function processEntry(
+  entryId: string,
   type: AccountingSyncType,
   payload: SyncPayload,
 ): Promise<{ success: boolean; externalId?: string; invoiceNumber?: string; error?: string }> {
@@ -152,6 +157,7 @@ async function processEntry(
 
   switch (type) {
     case 'SALES_INVOICE': {
+      const invoiceIdempotencyKey = buildXeroIdempotencyKey(entryId, 'invoice')
       const invoiceResult = await pushSalesInvoice({
         invoiceNumber: payload.invoiceNumber as string,
         contactName: payload.contactName as string,
@@ -169,7 +175,7 @@ async function processEntry(
         discountTaxType: payload.discountTaxType as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
-      }, resolveInvoiceStatus(postingMode))
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey })
 
       // Register payment in Xero if requested (pre-paid WC orders).
       // Payment account map is a connector-agnostic setting — the active
@@ -233,7 +239,7 @@ async function processEntry(
                     Account: { AccountID: account.xeroId },
                     Date: paymentDate,
                     Amount: amount,
-                  })
+                  }, { idempotencyKey: buildXeroIdempotencyKey(entryId, 'invoice-payment') })
                 }
               }
             }
@@ -254,6 +260,7 @@ async function processEntry(
     }
 
     case 'PURCHASE_INVOICE': {
+      const billIdempotencyKey = buildXeroIdempotencyKey(entryId, 'bill')
       const billResult = await pushPurchaseBill({
         invoiceNumber: payload.invoiceNumber as string | undefined,
         contactName: payload.contactName as string,
@@ -262,7 +269,7 @@ async function processEntry(
         currency: payload.currency as string,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
-      }, resolveInvoiceStatus(postingMode))
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: billIdempotencyKey })
       // Attach supplier invoice PDF if available and setting enabled
       if (billResult.success && billResult.invoiceId && payload.supplierInvoicePath) {
         try {
@@ -324,7 +331,7 @@ async function processEntry(
           Date: paymentDate,
           Amount: amount,
           Reference: (payload.reference as string | undefined) ?? undefined,
-        })
+        }, { idempotencyKey: buildXeroIdempotencyKey(entryId, 'bill-payment') })
         if (!paymentRes.ok) {
           return { success: false, error: paymentRes.error ?? 'Failed to post Xero payment' }
         }
@@ -344,7 +351,7 @@ async function processEntry(
         currency: payload.currency as string,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
-      }, resolveInvoiceStatus(postingMode)).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
+      }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note') }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
 
     case 'COGS_JOURNAL':
     case 'INVENTORY_ADJUSTMENT':
@@ -361,7 +368,7 @@ async function processEntry(
         reference: payload.reference as string,
         narration: payload.narration as string,
         lines: payload.lines as Array<{ accountCode: string; description: string; debit?: number; credit?: number; taxType?: string }>,
-      }, resolveJournalStatus(postingMode)).then(r => ({ success: r.success, externalId: r.journalId, error: r.error }))
+      }, resolveJournalStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'manual-journal') }).then(r => ({ success: r.success, externalId: r.journalId, error: r.error }))
 
     default:
       return { success: false, error: `Unknown sync type: ${type}` }

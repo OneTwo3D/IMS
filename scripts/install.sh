@@ -553,7 +553,7 @@ CRON_LINES=(
   "0 6 * * * curl -fsS http://localhost:${APP_PORT}/api/cron/fx-rates > /dev/null 2>&1"
   "0 3 * * * curl -fsS http://localhost:${APP_PORT}/api/cron/activity-cleanup > /dev/null 2>&1"
   "0 2 * * * curl -fsS http://localhost:${APP_PORT}/api/cron/backup > /dev/null 2>&1"
-  "*/5 * * * * curl -fsS http://localhost:${APP_PORT}/api/cron/wc-sync > /dev/null 2>&1"
+  "0 4 * * * curl -fsS http://localhost:${APP_PORT}/api/cron/wc-reconcile > /dev/null 2>&1"
   "*/15 * * * * curl -fsS http://localhost:${APP_PORT}/api/cron/delivery-status > /dev/null 2>&1"
 )
 

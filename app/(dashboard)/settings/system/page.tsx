@@ -71,6 +71,9 @@ export default async function SystemSettingsPage({
             Enable or disable cron jobs and set their frequency. Changes are applied to the
             system crontab when you save.
           </p>
+          <p className="text-sm text-muted-foreground mb-4">
+            WooCommerce is now webhook-first for order and product intake. The WooCommerce scheduler entry is a backup reconciliation job and should normally run daily rather than every few minutes.
+          </p>
           <CronJobsSettings jobs={cronJobs} />
         </Card>
       )}

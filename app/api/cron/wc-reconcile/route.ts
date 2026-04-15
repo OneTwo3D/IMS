@@ -3,7 +3,7 @@ import { verifyCron } from '@/lib/cron-auth'
 import { db } from '@/lib/db'
 import { runWcReconcile } from '@/lib/connectors/woocommerce/sync/reconcile'
 
-// Legacy compatibility route. New installs should use /api/cron/wc-reconcile.
+// Called by cron: curl http://localhost:3000/api/cron/wc-reconcile
 export async function GET(request: Request) {
   const cronErr = verifyCron(request)
   if (cronErr) return cronErr
@@ -13,9 +13,5 @@ export async function GET(request: Request) {
     return NextResponse.json({ skipped: true, reason: 'WC sync disabled' })
   }
 
-  return NextResponse.json({
-    legacy: true,
-    replacement: '/api/cron/wc-reconcile',
-    ...(await runWcReconcile()),
-  })
+  return NextResponse.json(await runWcReconcile())
 }

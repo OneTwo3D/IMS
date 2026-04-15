@@ -22,11 +22,19 @@ export async function POST(request: Request) {
   }
 
   // Record successful webhook receipt so the UI can confirm the webhook is working
-  await db.setting.upsert({
-    where: { key: 'wc_webhook_last_received_at' },
-    create: { key: 'wc_webhook_last_received_at', value: new Date().toISOString() },
-    update: { value: new Date().toISOString() },
-  })
+  const receivedAt = new Date().toISOString()
+  await Promise.all([
+    db.setting.upsert({
+      where: { key: 'wc_webhook_last_received_at' },
+      create: { key: 'wc_webhook_last_received_at', value: receivedAt },
+      update: { value: receivedAt },
+    }),
+    db.setting.upsert({
+      where: { key: 'wc_order_webhook_last_received_at' },
+      create: { key: 'wc_order_webhook_last_received_at', value: receivedAt },
+      update: { value: receivedAt },
+    }),
+  ])
 
   // WooCommerce sends a signed ping with action.* topic after webhook creation
   if (topic!.startsWith('action.')) {
@@ -52,6 +60,12 @@ export async function POST(request: Request) {
     // Check for new refunds
     await syncRefundsForOrder(wcOrder.id)
   }
+
+  await db.setting.upsert({
+    where: { key: 'last_wc_order_sync_at' },
+    create: { key: 'last_wc_order_sync_at', value: new Date().toISOString() },
+    update: { value: new Date().toISOString() },
+  })
 
   return NextResponse.json({ ok: true })
 }

@@ -25,11 +25,19 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
   }
 
-  await db.setting.upsert({
-    where: { key: 'wc_webhook_last_received_at' },
-    create: { key: 'wc_webhook_last_received_at', value: new Date().toISOString() },
-    update: { value: new Date().toISOString() },
-  })
+  const receivedAt = new Date().toISOString()
+  await Promise.all([
+    db.setting.upsert({
+      where: { key: 'wc_webhook_last_received_at' },
+      create: { key: 'wc_webhook_last_received_at', value: receivedAt },
+      update: { value: receivedAt },
+    }),
+    db.setting.upsert({
+      where: { key: 'wc_product_webhook_last_received_at' },
+      create: { key: 'wc_product_webhook_last_received_at', value: receivedAt },
+      update: { value: receivedAt },
+    }),
+  ])
 
   // WooCommerce sends a signed ping with action.* topic after webhook creation
   if (topic!.startsWith('action.')) {
@@ -37,15 +45,51 @@ export async function POST(request: Request) {
   }
 
   const payload = JSON.parse(body) as Partial<WcFullProduct> & { stock_quantity?: number | null }
-
-  if (
+  const canSyncProduct =
     typeof payload.id === 'number'
     && typeof payload.sku === 'string'
     && typeof payload.type === 'string'
     && typeof payload.name === 'string'
     && typeof payload.status === 'string'
-  ) {
-    await syncWcProductToIms(payload as WcFullProduct)
+
+  if (canSyncProduct) {
+    const result = await syncWcProductToIms(payload as WcFullProduct)
+    if (result.success) {
+      await db.setting.upsert({
+        where: { key: 'last_wc_product_sync_at' },
+        create: { key: 'last_wc_product_sync_at', value: new Date().toISOString() },
+        update: { value: new Date().toISOString() },
+      })
+    } else {
+      await logActivity({
+        entityType: 'SYNC',
+        action: 'wc_product_webhook',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `WooCommerce product webhook import failed for ${payload.sku}`,
+        metadata: {
+          wcId: payload.id,
+          sku: payload.sku,
+          error: result.error ?? 'Unknown product sync error',
+        },
+      })
+    }
+  } else if (typeof payload.id === 'number') {
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_product_webhook',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `WooCommerce product webhook payload skipped for WC product ${payload.id}`,
+      metadata: {
+        wcId: payload.id,
+        skuType: typeof payload.sku,
+        typeType: typeof payload.type,
+        nameType: typeof payload.name,
+        statusType: typeof payload.status,
+        payloadKeys: Object.keys(payload).sort(),
+      },
+    })
   }
 
   if (typeof payload.id === 'number' && Object.prototype.hasOwnProperty.call(payload, 'stock_quantity')) {

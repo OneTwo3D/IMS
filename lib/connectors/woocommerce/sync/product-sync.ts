@@ -15,6 +15,8 @@ import {
 import type { Prisma } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
 
+const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -509,11 +511,15 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
 // Bulk product sync (WC → IMS)
 // ---------------------------------------------------------------------------
 
-export async function syncAllWcProducts(): Promise<SyncResult> {
+export async function syncAllWcProducts(
+  opts: { mode?: 'poll' | 'reconcile' | 'manual_reconcile' } = {},
+): Promise<SyncResult> {
   const result: SyncResult = { synced: 0, skipped: 0, errors: [] }
+  const mode = opts.mode ?? 'poll'
+  const cursorKey = mode === 'poll' ? 'last_wc_product_sync_at' : 'last_wc_product_reconcile_at'
 
   // Only fetch products modified since last sync (incremental)
-  const lastSyncSetting = await db.setting.findUnique({ where: { key: 'last_wc_product_sync_at' } })
+  const lastSyncSetting = await db.setting.findUnique({ where: { key: cursorKey } })
   const modifiedAfter = lastSyncSetting?.value ?? null
 
   let page = 1
@@ -545,17 +551,28 @@ export async function syncAllWcProducts(): Promise<SyncResult> {
 
   // Update last sync timestamp
   await db.setting.upsert({
-    where: { key: 'last_wc_product_sync_at' },
-    create: { key: 'last_wc_product_sync_at', value: new Date().toISOString() },
+    where: { key: cursorKey },
+    create: { key: cursorKey, value: new Date().toISOString() },
     update: { value: new Date().toISOString() },
   })
 
   if (result.synced > 0) {
     logActivity({
       entityType: 'SYNC', action: 'product_sync', tag: 'sync', level: 'INFO',
-      description: `WC product sync: ${result.synced} synced, ${result.skipped} skipped`,
+      description: `WC product ${mode === 'poll' ? 'poll' : 'reconciliation'}: ${result.synced} synced, ${result.skipped} skipped`,
     })
   }
 
   return result
+}
+export async function isWcProductWebhookPrimaryActive(): Promise<boolean> {
+  const [secret, lastReceived] = await Promise.all([
+    db.setting.findUnique({ where: { key: 'wc_webhook_secret' } }),
+    db.setting.findUnique({ where: { key: 'wc_product_webhook_last_received_at' } }),
+  ])
+
+  if (!secret?.value || !lastReceived?.value) return false
+  const ts = Date.parse(lastReceived.value)
+  if (!Number.isFinite(ts)) return false
+  return (Date.now() - ts) <= WEBHOOK_PRIMARY_FRESH_MS
 }

@@ -27,6 +27,7 @@ async function xeroFetch<T = unknown>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
   body?: unknown,
+  opts?: { idempotencyKey?: string },
 ): Promise<XeroResponse<T>> {
   const auth = await getAccessToken()
   if (!auth) return { ok: false, status: 0, error: 'Not connected to Xero' }
@@ -37,6 +38,9 @@ async function xeroFetch<T = unknown>(
     'Authorization': `Bearer ${auth.accessToken}`,
     'Xero-Tenant-Id': auth.tenantId,
     'Accept': 'application/json',
+  }
+  if (opts?.idempotencyKey && method !== 'GET') {
+    headers['Idempotency-Key'] = opts.idempotencyKey
   }
 
   const init: RequestInit = { method, headers }
@@ -86,12 +90,20 @@ export async function xeroGet<T = unknown>(path: string): Promise<XeroResponse<T
   return xeroFetch<T>('GET', path)
 }
 
-export async function xeroPost<T = unknown>(path: string, body: unknown): Promise<XeroResponse<T>> {
-  return xeroFetch<T>('POST', path, body)
+export async function xeroPost<T = unknown>(
+  path: string,
+  body: unknown,
+  opts?: { idempotencyKey?: string },
+): Promise<XeroResponse<T>> {
+  return xeroFetch<T>('POST', path, body, opts)
 }
 
-export async function xeroPut<T = unknown>(path: string, body: unknown): Promise<XeroResponse<T>> {
-  return xeroFetch<T>('PUT', path, body)
+export async function xeroPut<T = unknown>(
+  path: string,
+  body: unknown,
+  opts?: { idempotencyKey?: string },
+): Promise<XeroResponse<T>> {
+  return xeroFetch<T>('PUT', path, body, opts)
 }
 
 /**

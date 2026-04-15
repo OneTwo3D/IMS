@@ -20,6 +20,7 @@ type XeroInvoiceResponse = {
 export async function pushPurchaseBill(
   data: BillData,
   status: string = 'AUTHORISED',
+  opts?: { idempotencyKey?: string },
 ): Promise<{ success: boolean; invoiceId?: string; error?: string }> {
   // Find or create the supplier contact
   const contactResult = await findOrCreateContact(data.contactName, undefined, true)
@@ -78,7 +79,7 @@ export async function pushPurchaseBill(
   if (data.invoiceNumber) invoice.InvoiceNumber = data.invoiceNumber
   if (data.reference) invoice.Reference = data.reference
 
-  const res = await xeroPost<XeroInvoiceResponse>('Invoices', invoice)
+  const res = await xeroPost<XeroInvoiceResponse>('Invoices', invoice, opts)
   if (!res.ok || !res.data?.Invoices?.length) {
     return { success: false, error: res.error ?? 'Failed to create bill' }
   }

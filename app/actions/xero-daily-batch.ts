@@ -131,13 +131,14 @@ async function computePreview(): Promise<DailyBatchPreview> {
       orderNumber: true,
       wcOrderNumber: true,
       totalGbp: true,
+      taxGbp: true,
     },
     orderBy: { paidAt: 'asc' },
   })
 
   const a1 = {
     orderCount: a1Orders.length,
-    totalRevenue: round2(a1Orders.reduce((s, o) => s + Number(o.totalGbp), 0)),
+    totalRevenue: round2(a1Orders.reduce((s, o) => s + (Number(o.totalGbp) - Number(o.taxGbp)), 0)),
     orders: a1Orders.slice(0, 200).map((o) => ({
       id: o.id,
       orderNumber: o.orderNumber,

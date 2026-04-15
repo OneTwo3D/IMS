@@ -2,13 +2,14 @@ import { registerCronJobs } from '@/lib/cron-registry'
 
 registerCronJobs([
   {
-    slug: 'wc-sync',
-    settingKey: 'wc_sync',
+    slug: 'wc-reconcile',
+    settingKey: 'wc_reconcile',
     module: 'woocommerce',
     moduleLabel: 'WooCommerce',
-    label: 'WooCommerce Sync',
-    description: 'Polls WooCommerce for new/updated orders and products.',
-    defaultSchedule: '*/5 * * * *',
+    label: 'WooCommerce Reconcile',
+    description: 'Runs WooCommerce backup reconciliation for orders/products and drains queued stock retries after webhook-first sync.',
+    defaultSchedule: '0 4 * * *',
     defaultEnabled: true,
+    legacyEnabledKey: 'cron_wc_sync_enabled',
   },
 ])

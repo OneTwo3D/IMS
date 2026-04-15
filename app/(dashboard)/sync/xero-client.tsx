@@ -997,6 +997,9 @@ function DailyBatchPanel({
             <p className="text-xs text-muted-foreground mt-0.5">
               Live view of what the daily batch will post to Xero when it next runs. Cached for 60s — click refresh for an immediate recompute.
             </p>
+            <p className="text-xs text-amber-700 mt-1">
+              Group B preview COGS remains indicative only. It does not reserve FIFO layers and may differ from the posted batch if stock moves before the cron runs.
+            </p>
           </div>
           <div className="flex items-center gap-3">
             <span className="text-xs text-muted-foreground whitespace-nowrap">
