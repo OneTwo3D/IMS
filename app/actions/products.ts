@@ -31,8 +31,8 @@ export type ProductRow = {
   heightCm: string | null
   depthCm: string | null
   imageUrl: string | null
-  salesPriceGbp: string | null   // regular / list price
-  salePriceGbp: string | null    // sale / discounted price
+  salesPriceBase: string | null   // regular / list price
+  salePriceBase: string | null    // sale / discounted price
   priceRange: { min: string; max: string } | null  // for VARIABLE: min–max of variant regular prices
   salesPriceTaxInclusive: boolean
   taxCategory: TaxCategory
@@ -45,7 +45,7 @@ export type ProductRow = {
   allocatedStock: string    // sum of reservedQty across all warehouses
   availableStock: string    // totalStock - allocatedStock
   incomingStock: string     // in-transit transfers + open PO lines
-  inventoryValue: string  // sum of remainingQty * unitCostGbp
+  inventoryValue: string  // sum of remainingQty * unitCostBase
   createdAt: Date
   updatedAt: Date
 }
@@ -71,7 +71,7 @@ export type ProductDetail = ProductRow & {
     incomingPoQty: string        // open PO lines destined for this warehouse
   }[]
   incomingPoQty: string    // open PO lines with no warehouse assigned yet (unassigned)
-  costLayers: { id: string; receivedAt: Date; receivedQty: string; remainingQty: string; unitCostGbp: string }[]
+  costLayers: { id: string; receivedAt: Date; receivedQty: string; remainingQty: string; unitCostBase: string }[]
 }
 
 export type ProductListResult = {
@@ -85,11 +85,11 @@ export type ProductListResult = {
 // Queries
 // ---------------------------------------------------------------------------
 
-export type SortField = 'sku' | 'name' | 'type' | 'salesPriceGbp' | 'totalStock' | 'active' | 'createdAt' | 'updatedAt'
+export type SortField = 'sku' | 'name' | 'type' | 'salesPriceBase' | 'totalStock' | 'active' | 'createdAt' | 'updatedAt'
 export type SortDir = 'asc' | 'desc'
 
 // Fields that can be sorted directly in the DB query
-const DB_SORT_FIELDS = new Set(['sku', 'name', 'type', 'salesPriceGbp', 'active', 'createdAt', 'updatedAt'])
+const DB_SORT_FIELDS = new Set(['sku', 'name', 'type', 'salesPriceBase', 'active', 'createdAt', 'updatedAt'])
 
 export async function listProducts(params: {
   search?: string
@@ -143,15 +143,15 @@ export async function listProducts(params: {
           select: {
             id: true,
             imageUrl: true,
-            salesPriceGbp: true,
-            salePriceGbp: true,
+            salesPriceBase: true,
+            salePriceBase: true,
             stockLevels: { select: { quantity: true, reservedQty: true } },
           },
         },
         stockLevels: { select: { quantity: true, reservedQty: true } },
         costLayers: {
           where: { remainingQty: { gt: 0 } },
-          select: { remainingQty: true, unitCostGbp: true },
+          select: { remainingQty: true, unitCostBase: true },
         },
       },
       orderBy: isComputedSort ? { sku: 'asc' } : { [sortField]: sortDir },
@@ -199,7 +199,7 @@ export async function listProducts(params: {
     // Compute variant price range for VARIABLE products
     let priceRange: { min: string; max: string } | null = null
     if (p.type === 'VARIABLE' && p.variants.length > 0) {
-      const prices = p.variants.map((v) => Number(v.salesPriceGbp)).filter((n) => n > 0)
+      const prices = p.variants.map((v) => Number(v.salesPriceBase)).filter((n) => n > 0)
       if (prices.length) {
         priceRange = { min: Math.min(...prices).toFixed(2), max: Math.max(...prices).toFixed(2) }
       }
@@ -233,8 +233,8 @@ export async function listProducts(params: {
     heightCm: p.heightCm?.toString() ?? null,
     depthCm: p.depthCm?.toString() ?? null,
     imageUrl: p.imageUrl ?? p.parent?.imageUrl ?? null,
-    salesPriceGbp: p.salesPriceGbp?.toString() ?? null,
-    salePriceGbp: p.salePriceGbp?.toString() ?? null,
+    salesPriceBase: p.salesPriceBase?.toString() ?? null,
+    salePriceBase: p.salePriceBase?.toString() ?? null,
     priceRange,
     salesPriceTaxInclusive: p.salesPriceTaxInclusive,
     taxCategory: p.taxCategory,
@@ -248,7 +248,7 @@ export async function listProducts(params: {
     availableStock: availableStock.toFixed(2),
     incomingStock: incomingStock.toFixed(2),
     inventoryValue: p.costLayers
-      .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostGbp), 0)
+      .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostBase), 0)
       .toFixed(2),
     createdAt: p.createdAt,
     updatedAt: p.updatedAt,
@@ -390,12 +390,12 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
 
   // For KIT/BOM: compute unit cost from components; BOM also uses actual stock
   const isKitOrBom = p.type === 'KIT' || p.type === 'BOM'
-  const kitUnitCost = isKitOrBom ? await computeKitUnitCostGbp(p.id) : 0
+  const kitUnitCostBase = isKitOrBom ? await computeKitUnitCostBase(p.id) : 0
   const fifoInventoryValue = p.costLayers
-    .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostGbp), 0)
+    .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostBase), 0)
   const totalStockQty = p.stockLevels.reduce((sum, s) => sum + Number(s.quantity), 0)
   const inventoryValue = isKitOrBom
-    ? (p.type === 'BOM' ? kitUnitCost * totalStockQty : kitUnitCost).toFixed(2)
+    ? (p.type === 'BOM' ? kitUnitCostBase * totalStockQty : kitUnitCostBase).toFixed(2)
     : fifoInventoryValue.toFixed(2)
 
   return {
@@ -414,10 +414,10 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     heightCm: p.heightCm?.toString() ?? null,
     depthCm: p.depthCm?.toString() ?? null,
     imageUrl: p.imageUrl ?? p.parent?.imageUrl ?? null,
-    salesPriceGbp: p.salesPriceGbp?.toString() ?? null,
-    salePriceGbp: p.salePriceGbp?.toString() ?? null,
+    salesPriceBase: p.salesPriceBase?.toString() ?? null,
+    salePriceBase: p.salePriceBase?.toString() ?? null,
     priceRange: p.type === 'VARIABLE' && p.variants.length > 0 ? (() => {
-      const prices = p.variants.map((v) => Number(v.salesPriceGbp)).filter((n) => n > 0)
+      const prices = p.variants.map((v) => Number(v.salesPriceBase)).filter((n) => n > 0)
       if (!prices.length) return null
       return { min: Math.min(...prices).toFixed(2), max: Math.max(...prices).toFixed(2) }
     })() : null,
@@ -447,8 +447,8 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       heightCm: v.heightCm?.toString() ?? null,
       depthCm: v.depthCm?.toString() ?? null,
       imageUrl: v.imageUrl ?? p.imageUrl ?? null,
-      salesPriceGbp: v.salesPriceGbp?.toString() ?? null,
-      salePriceGbp: v.salePriceGbp?.toString() ?? null,
+      salesPriceBase: v.salesPriceBase?.toString() ?? null,
+      salePriceBase: v.salePriceBase?.toString() ?? null,
       priceRange: null,
       salesPriceTaxInclusive: v.salesPriceTaxInclusive,
       taxCategory: v.taxCategory,
@@ -517,7 +517,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       receivedAt: c.receivedAt,
       receivedQty: c.receivedQty.toString(),
       remainingQty: c.remainingQty.toString(),
-      unitCostGbp: c.unitCostGbp.toString(),
+      unitCostBase: c.unitCostBase.toString(),
     })),
 
   }
@@ -546,8 +546,8 @@ const productSchema = z.object({
   hsCode: z.string().optional().nullable(),
   countryOfOrigin: z.string().max(2).optional().nullable(),
   weight: z.string().optional().nullable(),
-  salesPriceGbp: z.string().optional().nullable(),
-  salePriceGbp: z.string().optional().nullable(),
+  salesPriceBase: z.string().optional().nullable(),
+  salePriceBase: z.string().optional().nullable(),
   salesPriceTaxInclusive: z.boolean().default(false),
   taxCategory: z.enum(['STANDARD', 'REDUCED', 'SECOND_REDUCED', 'ZERO', 'EXEMPT']).default('STANDARD'),
   stockUnit: z.string().default('pcs'),
@@ -580,8 +580,8 @@ export async function createProduct(
     hsCode: formData.get('hsCode') as string || null,
     countryOfOrigin: formData.get('countryOfOrigin') as string || null,
     weight: formData.get('weight') as string || null,
-    salesPriceGbp: formData.get('salesPriceGbp') as string || null,
-    salePriceGbp: formData.get('salePriceGbp') as string || null,
+    salesPriceBase: formData.get('salesPriceBase') as string || null,
+    salePriceBase: formData.get('salePriceBase') as string || null,
     salesPriceTaxInclusive: formData.get('salesPriceTaxInclusive') === 'on',
     taxCategory: (formData.get('taxCategory') as string) || 'STANDARD',
     stockUnit: (formData.get('stockUnit') as string) || 'pcs',
@@ -618,8 +618,8 @@ export async function createProduct(
       hsCode: data.hsCode || null,
       countryOfOrigin: data.countryOfOrigin || null,
       weight: data.weight ? data.weight : null,
-      salesPriceGbp: data.salesPriceGbp ? data.salesPriceGbp : null,
-      salePriceGbp: data.salePriceGbp ? data.salePriceGbp : null,
+      salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
+      salePriceBase: data.salePriceBase ? data.salePriceBase : null,
       salesPriceTaxInclusive: data.salesPriceTaxInclusive,
       taxCategory: data.taxCategory,
       stockUnit: data.stockUnit,
@@ -676,8 +676,8 @@ export async function updateProduct(
     hsCode: formData.get('hsCode') as string || null,
     countryOfOrigin: formData.get('countryOfOrigin') as string || null,
     weight: formData.get('weight') as string || null,
-    salesPriceGbp: formData.get('salesPriceGbp') as string || null,
-    salePriceGbp: formData.get('salePriceGbp') as string || null,
+    salesPriceBase: formData.get('salesPriceBase') as string || null,
+    salePriceBase: formData.get('salePriceBase') as string || null,
     salesPriceTaxInclusive: formData.get('salesPriceTaxInclusive') === 'on',
     taxCategory: (formData.get('taxCategory') as string) || 'STANDARD',
     stockUnit: (formData.get('stockUnit') as string) || 'pcs',
@@ -715,8 +715,8 @@ export async function updateProduct(
       hsCode: data.hsCode || null,
       countryOfOrigin: data.countryOfOrigin || null,
       weight: data.weight ? data.weight : null,
-      salesPriceGbp: data.salesPriceGbp ? data.salesPriceGbp : null,
-      salePriceGbp: data.salePriceGbp ? data.salePriceGbp : null,
+      salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
+      salePriceBase: data.salePriceBase ? data.salePriceBase : null,
       salesPriceTaxInclusive: data.salesPriceTaxInclusive,
       taxCategory: data.taxCategory,
       stockUnit: data.stockUnit,
@@ -769,7 +769,7 @@ export type ProductSupplierRow = {
   lastUnitCost: string   // in supplier currency, formatted
   currency: string
   currencySymbol: string
-  gbpEquivalent: string | null  // null = no FX rate stored
+  baseEquivalent: string | null  // null = no FX rate stored
   fxRate: string | null         // 1 GBP = fxRate currency units
   fxFetchedAt: Date | null
   updatedAt: Date
@@ -812,17 +812,17 @@ export async function getProductSuppliers(productId: string): Promise<ProductSup
   return rows.map((r) => {
     const cost = Number(r.lastUnitCost)
 
-    let gbpEquivalent: string | null = null
+    let baseEquivalent: string | null = null
     let fxRate: string | null = null
     let fxFetchedAt: Date | null = null
 
     if (r.currency === 'GBP') {
-      gbpEquivalent = cost.toFixed(2)
+      baseEquivalent = cost.toFixed(2)
       fxRate = '1'
     } else {
       const fx = fxMap.get(r.currency)
       if (fx) {
-        gbpEquivalent = (cost / fx.rate).toFixed(2)
+        baseEquivalent = (cost / fx.rate).toFixed(2)
         fxRate = fx.rate.toFixed(4)
         fxFetchedAt = fx.fetchedAt
       }
@@ -835,7 +835,7 @@ export async function getProductSuppliers(productId: string): Promise<ProductSup
       lastUnitCost: cost.toFixed(2),
       currency: r.currency,
       currencySymbol: symbolMap.get(r.currency) ?? r.currency,
-      gbpEquivalent,
+      baseEquivalent,
       fxRate,
       fxFetchedAt,
       updatedAt: r.updatedAt,
@@ -847,7 +847,7 @@ export async function getProductSuppliers(productId: string): Promise<ProductSup
 // Kit/BOM COGS helper — unit cost of one assembled kit/BOM based on components
 // ---------------------------------------------------------------------------
 
-async function computeKitUnitCostGbp(productId: string): Promise<number> {
+async function computeKitUnitCostBase(productId: string): Promise<number> {
   const components = await db.productComponent.findMany({
     where: { productId },
     select: {
@@ -856,7 +856,7 @@ async function computeKitUnitCostGbp(productId: string): Promise<number> {
         select: {
           costLayers: {
             where: { remainingQty: { gt: 0 } },
-            select: { remainingQty: true, unitCostGbp: true },
+            select: { remainingQty: true, unitCostBase: true },
           },
         },
       },
@@ -868,7 +868,7 @@ async function computeKitUnitCostGbp(productId: string): Promise<number> {
     const layers = comp.component.costLayers
     const totalRemaining = layers.reduce((s, l) => s + Number(l.remainingQty), 0)
     const avgCost = totalRemaining > 0
-      ? layers.reduce((s, l) => s + Number(l.remainingQty) * Number(l.unitCostGbp), 0) / totalRemaining
+      ? layers.reduce((s, l) => s + Number(l.remainingQty) * Number(l.unitCostBase), 0) / totalRemaining
       : 0
     total += Number(comp.qty) * avgCost
   }

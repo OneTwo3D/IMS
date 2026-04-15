@@ -37,12 +37,12 @@ export async function getStockOnHand(): Promise<StockOnHandRow[]> {
   // Get FIFO cost layers for valuation
   const costLayers = await db.costLayer.findMany({
     where: { remainingQty: { gt: 0 } },
-    select: { productId: true, warehouseId: true, remainingQty: true, unitCostGbp: true },
+    select: { productId: true, warehouseId: true, remainingQty: true, unitCostBase: true },
   })
   const valueMap = new Map<string, number>()
   for (const cl of costLayers) {
     const key = `${cl.productId}:${cl.warehouseId}`
-    valueMap.set(key, (valueMap.get(key) ?? 0) + Number(cl.remainingQty) * Number(cl.unitCostGbp))
+    valueMap.set(key, (valueMap.get(key) ?? 0) + Number(cl.remainingQty) * Number(cl.unitCostBase))
   }
 
   return levels.map((l) => ({

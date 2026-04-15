@@ -16,9 +16,10 @@ import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow, UserOption } from '@/app/actions/settings'
 import type { StockLevelEntry } from '@/app/actions/stock'
 import { ProductLink } from '@/components/inventory/product-link'
-import { formatMoney } from '@/lib/utils'
+import { formatMoney, formatMoneyCode } from '@/lib/utils'
 import { toIsoCountryCode } from '@/lib/countries'
 import type { TaxCategory } from '@/app/generated/prisma/client'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 
 type Warehouse = { id: string; code: string; name: string }
 
@@ -139,6 +140,7 @@ function formatAddr(a: AddressData | null): string {
 export function SoFormDialog({ products, warehouses, currencies, taxRates, customers, stockLevels, avgCogs, users, currentUserName, companyHomeCountry, onClose }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
+  const baseCurrency = useBaseCurrency()
 
   // Customer
   const [allCustomers, setAllCustomers] = useState(customers)
@@ -154,7 +156,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
   const [shippingAddrObj, setShippingAddrObj] = useState<Record<string, string> | null>(null)
 
   // Order
-  const [currency, setCurrency] = useState('GBP')
+  const [currency, setCurrency] = useState(baseCurrency.code)
   const [fxRate, setFxRate] = useState(1)
   const [warehouseId, setWarehouseId] = useState(warehouses[0]?.id ?? '')
   const [expectedDelivery, setExpectedDelivery] = useState('')
@@ -199,8 +201,8 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
     return resolveRateClientSide(cat, destCountry, taxRates, 'SALES', orderDefault)
   }
 
-  const symbolMap: Record<string, string> = { GBP: '£' }
-  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { GBP: 'PREFIX' }
+  const symbolMap: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
+  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
   for (const c of currencies) {
     symbolMap[c.code] = c.symbol
     positionMap[c.code] = c.symbolPosition
@@ -209,12 +211,12 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
   const symPos = positionMap[currency] ?? 'PREFIX'
   const money = (n: number) => formatMoney(n, sym, symPos)
 
-  const rateMap: Record<string, number> = { GBP: 1 }
+  const rateMap: Record<string, number> = { [baseCurrency.code]: 1 }
   for (const c of currencies) if (c.latestRate != null) rateMap[c.code] = c.latestRate
 
   function setCurrencyAndRate(code: string) {
     setCurrency(code)
-    if (code === 'GBP') setFxRate(1)
+    if (code === baseCurrency.code) setFxRate(1)
     else if (rateMap[code]) setFxRate(rateMap[code])
   }
 
@@ -276,11 +278,11 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
     // DB prices are net OR gross depending on the product's own
     // salesPriceTaxInclusive flag. Convert using the *resolved* line-level
     // rate so each line grosses-up with its own VAT.
-    const dbPrice = p.salesPriceGbp ? Number(p.salesPriceGbp) : 0
+    const dbPrice = p.salesPriceBase ? Number(p.salesPriceBase) : 0
     const dbIsGross = !!p.salesPriceTaxInclusive && lineRate > 0
     const net = dbIsGross ? dbPrice / (1 + lineRate) : dbPrice
     const display = pricesIncludeVat && lineRate > 0 ? net * (1 + lineRate) : net
-    const priceInCurrency = display * (currency === 'GBP' ? 1 : fxRate)
+    const priceInCurrency = display * (currency === baseCurrency.code ? 1 : fxRate)
     setLines((prev) => [
       ...prev,
       {
@@ -483,7 +485,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
         shippingAddress: shippingAddrObj ?? undefined,
         customerEmail: customerEmail || undefined,
         currency,
-        fxRateToGbp: fxRate,
+        fxRateToBase: fxRate,
         shipFromWarehouseId: warehouseId || undefined,
         expectedDelivery: expectedDelivery || undefined,
         salesRep: salesRep || undefined,
@@ -560,13 +562,13 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                 )}
               </div>
               <div className="space-y-1.5">
-                <Label>Currency{currency !== 'GBP' ? ' / FX Rate' : ''}</Label>
+                <Label>Currency{currency !== baseCurrency.code ? ' / FX Rate' : ''}</Label>
                 <div className="flex gap-2">
-                  <select value={currency} onChange={(e) => setCurrencyAndRate(e.target.value)} className={`${currency === 'GBP' ? 'w-full' : 'w-28'} h-9 rounded-md border border-input bg-background px-3 text-sm font-mono`}>
-                    <option value="GBP">GBP £</option>
-                    {currencies.filter((c) => c.code !== 'GBP').map((c) => (<option key={c.code} value={c.code}>{c.code} {c.symbol}</option>))}
+                  <select value={currency} onChange={(e) => setCurrencyAndRate(e.target.value)} className={`${currency === baseCurrency.code ? 'w-full' : 'w-28'} h-9 rounded-md border border-input bg-background px-3 text-sm font-mono`}>
+                    <option value={baseCurrency.code}>{baseCurrency.code} {baseCurrency.symbol}</option>
+                    {currencies.filter((c) => c.code !== baseCurrency.code).map((c) => (<option key={c.code} value={c.code}>{c.code} {c.symbol}</option>))}
                   </select>
-                  {currency !== 'GBP' && (
+                  {currency !== baseCurrency.code && (
                     <Input type="number" min="0.0001" step="0.0001" value={fxRate} onChange={(e) => setFxRate(Number(e.target.value) || 1)} className="flex-1 min-w-0 h-9 font-mono text-sm" />
                   )}
                 </div>
@@ -643,7 +645,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                     <TableHead className="text-xs text-center w-24">Discount</TableHead>
                     <TableHead className="text-xs text-center w-32">VAT</TableHead>
                     <TableHead className="text-xs text-right w-24">Total ({sym})</TableHead>
-                    <TableHead className="text-xs text-right w-20">COGS (£)</TableHead>
+                    <TableHead className="text-xs text-right w-20">COGS ({baseCurrency.code})</TableHead>
                     <TableHead className="w-8" />
                   </TableRow>
                 </TableHeader>
@@ -703,7 +705,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                           </div>
                         </TableCell>
                         <TableCell className="text-right font-mono text-xs">{money(lineTotal)}</TableCell>
-                        <TableCell className="text-right font-mono text-xs text-muted-foreground">{formatMoney(cogs, '£')}</TableCell>
+                        <TableCell className="text-right font-mono text-xs text-muted-foreground">{formatMoney(cogs, baseCurrency.symbol, baseCurrency.symbolPosition)}</TableCell>
                         <TableCell>
                           <button type="button" onClick={() => setLines((p) => p.filter((l) => l.key !== line.key))} className="text-muted-foreground hover:text-destructive">
                             <X className="h-4 w-4" />
@@ -735,7 +737,7 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                         </span>
                         <span className="text-xs text-muted-foreground ml-2 shrink-0">
                           {warehouseId ? `${stock.available} avail` : ''}
-                          {p.salesPriceGbp ? ` · ${formatMoney(Number(p.salesPriceGbp), '£')}` : ''}
+                          {p.salesPriceBase ? ` · ${formatMoney(Number(p.salesPriceBase), baseCurrency.symbol, baseCurrency.symbolPosition)}` : ''}
                         </span>
                       </button>
                     )
@@ -858,16 +860,16 @@ export function SoFormDialog({ products, warehouses, currencies, taxRates, custo
                     <span>Total</span>
                     <span className="font-mono">
                       {money(grandTotal)}
-                      {currency !== 'GBP' && <span className="text-muted-foreground font-normal ml-2">({formatMoney(grandTotal / fxRate, '£', 'PREFIX')})</span>}
+                      {currency !== baseCurrency.code && <span className="text-muted-foreground font-normal ml-2">({formatMoney(grandTotal / fxRate, baseCurrency.symbol, baseCurrency.symbolPosition)})</span>}
                     </span>
                   </div>
                   <div className="flex justify-between text-muted-foreground border-t pt-1">
                     <span>Est. COGS</span>
-                    <span className="font-mono">{formatMoney(totalCogs, '£', 'PREFIX')}</span>
+                    <span className="font-mono">{formatMoney(totalCogs, baseCurrency.symbol, baseCurrency.symbolPosition)}</span>
                   </div>
                   <div className="flex justify-between text-muted-foreground">
                     <span>Est. Margin</span>
-                    <span className="font-mono">{formatMoney((lineSubtotal / fxRate) - totalCogs, '£', 'PREFIX')}</span>
+                    <span className="font-mono">{formatMoney((lineSubtotal / fxRate) - totalCogs, baseCurrency.symbol, baseCurrency.symbolPosition)}</span>
                   </div>
                 </div>
               </div>

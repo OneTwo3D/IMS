@@ -8,7 +8,7 @@ const db = new PrismaClient({ adapter })
 type SnapshotEntry = {
   costLayerId: string
   qty: number
-  unitCostGbp: number
+  unitCostBase: number
   orderAllocationId?: string
   shipmentLineId?: string
   source?: string
@@ -26,7 +26,7 @@ function parseSnapshot(value: unknown): SnapshotEntry[] {
     parsed.push({
       costLayerId,
       qty,
-      unitCostGbp: Number(row.unitCostGbp ?? 0),
+      unitCostBase: Number(row.unitCostBase ?? 0),
       orderAllocationId: row.orderAllocationId ? String(row.orderAllocationId) : undefined,
       shipmentLineId: row.shipmentLineId ? String(row.shipmentLineId) : undefined,
       source: row.source ? String(row.source) : undefined,
@@ -105,7 +105,7 @@ async function seed() {
       name: `Xero Refund Fixture ${suffix}`,
       type: 'SIMPLE',
       lifecycleStatus: 'ACTIVE',
-      salesPriceGbp: 12,
+      salesPriceBase: 12,
       salesPriceTaxInclusive: true,
       taxCategory: 'STANDARD',
       stockUnit: 'pcs',
@@ -129,7 +129,7 @@ async function seed() {
       warehouseId: warehouse.id,
       receivedQty: 5,
       remainingQty: 5,
-      unitCostGbp: 4,
+      unitCostBase: 4,
       receivedAt: new Date(now.getTime() - 60_000),
       isOpeningStock: true,
     },
@@ -140,7 +140,7 @@ async function seed() {
       orderNumber: `SO-E2E-XERO-${suffix}`,
       status: 'ALLOCATED',
       currency: 'GBP',
-      fxRateToGbp: 1,
+      fxRateToBase: 1,
       customerId: customer.id,
       customerName: `${customer.firstName} ${customer.lastName}`,
       customerEmail: customer.email,
@@ -153,10 +153,10 @@ async function seed() {
       taxForeign: 4,
       pricesIncludeVat: true,
       totalForeign: 24,
-      subtotalGbp: 20,
-      shippingGbp: 0,
-      taxGbp: 4,
-      totalGbp: 24,
+      subtotalBase: 20,
+      shippingBase: 0,
+      taxBase: 4,
+      totalBase: 24,
       shipFromWarehouseId: warehouse.id,
       invoiceNumber: `INV-E2E-XERO-${suffix}`,
       invoicedAt: now,
@@ -170,13 +170,13 @@ async function seed() {
             description: product.name,
             qty: 2,
             unitPriceForeign: 12,
-            unitPriceGbp: 12,
+            unitPriceBase: 12,
             discountAmount: 0,
             taxRateId: taxRate.id,
             taxForeign: 4,
-            taxGbp: 4,
+            taxBase: 4,
             totalForeign: 20,
-            totalGbp: 20,
+            totalBase: 20,
           },
         ],
       },
@@ -334,7 +334,7 @@ async function inspect(orderId: string, allocationId: string, shipmentLineId: st
           id: true,
           receivedQty: true,
           remainingQty: true,
-          unitCostGbp: true,
+          unitCostBase: true,
           receivedAt: true,
         },
         orderBy: { receivedAt: 'asc' },
@@ -354,7 +354,7 @@ async function inspect(orderId: string, allocationId: string, shipmentLineId: st
       id: layer.id,
       receivedQty: Number(layer.receivedQty),
       remainingQty: Number(layer.remainingQty),
-      unitCostGbp: Number(layer.unitCostGbp),
+      unitCostBase: Number(layer.unitCostBase),
     })),
     costLayerId,
   }))

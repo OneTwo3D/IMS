@@ -15,6 +15,8 @@ import { ALL_COLUMNS, STORAGE_KEY, COLS_CHANGED_EVENT, defaultVisibility } from 
 import type { ColKey } from '@/components/inventory/product-columns'
 import type { ProductRow } from '@/app/actions/products'
 import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { formatMoney } from '@/lib/utils'
 
 const TYPE_LABELS: Record<ProductType, string> = {
   SIMPLE: 'Simple',
@@ -37,7 +39,7 @@ const TYPE_COLOURS: Record<ProductType, 'default' | 'secondary' | 'outline'> = {
 // Map column keys to server-side sort fields (only columns that support server sort)
 const SORTABLE: Partial<Record<ColKey, string>> = {
   sku: 'sku', name: 'name', type: 'type',
-  salesPriceGbp: 'salesPriceGbp', totalStock: 'totalStock',
+  salesPriceBase: 'salesPriceBase', totalStock: 'totalStock',
   active: 'active', createdAt: 'createdAt', updatedAt: 'updatedAt',
 }
 
@@ -62,6 +64,8 @@ const STATUS_VARIANTS: Record<ProductLifecycleStatus, 'default' | 'secondary' | 
 }
 
 export function ProductTable({ products, total, page, pageSize, searchParams }: Props) {
+  const baseCurrency = useBaseCurrency()
+  const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const router = useRouter()
   const [visible, setVisible] = useState<Record<ColKey, boolean>>(defaultVisibility)
   const [, startTransition] = useTransition()
@@ -206,16 +210,16 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
       }
       case 'weight':
         return p.weight ? `${p.weight} kg` : '—'
-      case 'salesPriceGbp':
+      case 'salesPriceBase':
         if (p.type === 'VARIABLE' && p.priceRange) {
           return p.priceRange.min === p.priceRange.max
-            ? `£${p.priceRange.min}`
-            : `£${p.priceRange.min} – £${p.priceRange.max}`
+            ? fmtBase(Number(p.priceRange.min))
+            : `${fmtBase(Number(p.priceRange.min))} – ${fmtBase(Number(p.priceRange.max))}`
         }
-        return p.salesPriceGbp ? `£${Number(p.salesPriceGbp).toFixed(2)}` : '—'
-      case 'salePriceGbp':
+        return p.salesPriceBase ? fmtBase(Number(p.salesPriceBase)) : '—'
+      case 'salePriceBase':
         if (p.type === 'VARIABLE') return '—'
-        return p.salePriceGbp ? `£${Number(p.salePriceGbp).toFixed(2)}` : '—'
+        return p.salePriceBase ? fmtBase(Number(p.salePriceBase)) : '—'
       case 'salesPriceTaxInclusive':
         return p.salesPriceTaxInclusive ? 'Yes' : 'No'
       case 'totalStock':
@@ -232,7 +236,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
         { const val = Number(p.incomingStock); return val > 0 ? <span className="text-blue-600">+{val.toLocaleString()}</span> : '—' }
       case 'inventoryValue':
         if (p.type === 'VARIABLE' || p.type === 'NON_INVENTORY') return '—'
-        return `£${Number(p.inventoryValue).toFixed(2)}`
+        return fmtBase(Number(p.inventoryValue))
       case 'variantCount':
         return p.variantCount > 0 ? p.variantCount : '—'
       case 'active':
@@ -244,7 +248,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
     }
   }
 
-  const numericCols = new Set<ColKey>(['totalStock', 'allocatedStock', 'availableStock', 'incomingStock', 'inventoryValue', 'salesPriceGbp', 'salePriceGbp', 'variantCount'])
+  const numericCols = new Set<ColKey>(['totalStock', 'allocatedStock', 'availableStock', 'incomingStock', 'inventoryValue', 'salesPriceBase', 'salePriceBase', 'variantCount'])
 
   return (
     <div className="space-y-3">
@@ -344,7 +348,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
                   <div className="mt-3 grid grid-cols-2 gap-2 text-sm">
                     <div className="rounded-md bg-muted/50 px-2.5 py-2">
                       <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Price</p>
-                      <p className="mt-1 font-medium">{renderCell(p, 'salesPriceGbp')}</p>
+                      <p className="mt-1 font-medium">{renderCell(p, 'salesPriceBase')}</p>
                     </div>
                     <div className="rounded-md bg-muted/50 px-2.5 py-2">
                       <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Stock</p>

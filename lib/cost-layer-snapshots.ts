@@ -3,7 +3,7 @@ export type CostLayerSnapshotSource = 'allocation' | 'shipment'
 export type CostLayerSnapshotEntry = {
   costLayerId: string
   qty: number
-  unitCostGbp: number
+  unitCostBase: number
   orderAllocationId?: string
   shipmentLineId?: string
   source?: CostLayerSnapshotSource
@@ -21,12 +21,12 @@ export function parseCostLayerSnapshot(value: unknown): CostLayerSnapshotEntry[]
     const row = entry as Record<string, unknown>
     const costLayerId = typeof row.costLayerId === 'string' ? row.costLayerId : ''
     const qty = Number(row.qty)
-    const unitCostGbp = Number(row.unitCostGbp)
-    if (!costLayerId || qty <= 0 || !Number.isFinite(unitCostGbp)) return []
+    const unitCostBase = Number(row.unitCostBase)
+    if (!costLayerId || qty <= 0 || !Number.isFinite(unitCostBase)) return []
     return [{
       costLayerId,
       qty,
-      unitCostGbp,
+      unitCostBase,
       orderAllocationId: typeof row.orderAllocationId === 'string' ? row.orderAllocationId : undefined,
       shipmentLineId: typeof row.shipmentLineId === 'string' ? row.shipmentLineId : undefined,
       source: isSnapshotSource(row.source) ? row.source : undefined,
@@ -35,7 +35,7 @@ export function parseCostLayerSnapshot(value: unknown): CostLayerSnapshotEntry[]
 }
 
 export function sumCostLayerSnapshot(entries: CostLayerSnapshotEntry[]): number {
-  return entries.reduce((sum, entry) => sum + entry.qty * entry.unitCostGbp, 0)
+  return entries.reduce((sum, entry) => sum + entry.qty * entry.unitCostBase, 0)
 }
 
 export function reduceSnapshotByCostLayer(
@@ -74,7 +74,7 @@ export function takeFromSnapshotEntries(
     taken.push({
       costLayerId: entry.costLayerId,
       qty: take,
-      unitCostGbp: entry.unitCostGbp,
+      unitCostBase: entry.unitCostBase,
       orderAllocationId: decorate?.orderAllocationId ?? entry.orderAllocationId,
       shipmentLineId: decorate?.shipmentLineId ?? entry.shipmentLineId,
       source: decorate?.source ?? entry.source,

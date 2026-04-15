@@ -10,6 +10,7 @@ import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow, PurchaseUnitRow } from '@/app/actions/settings'
 import { CsvBar } from '@/components/ui/csv-bar'
 import { importPurchaseOrdersCsv } from '@/app/actions/import'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { PoListClient } from './po-list-client'
 import { PoFormDialog } from './po-form'
 import { FreightPoDialog } from './freight-po-form'
@@ -30,10 +31,11 @@ type Props = {
 }
 
 export function PurchaseOrdersClient({ initialPos, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, goodsPos, companyHomeCountry }: Props) {
+  const baseCurrency = useBaseCurrency()
   const [showCreate, setShowCreate] = useState(false)
   const [showFreight, setShowFreight] = useState(false)
 
-  const currencySymbols: Record<string, string> = { GBP: '£' }
+  const currencySymbols: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
   for (const c of currencies) currencySymbols[c.code] = c.symbol
 
   return (

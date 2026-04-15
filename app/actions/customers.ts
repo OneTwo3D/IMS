@@ -30,8 +30,8 @@ export type CustomerRow = {
   notes: string | null
   active: boolean
   orderCount: number
-  lifetimeValueGbp: number
-  currentYearSalesGbp: number
+  lifetimeValueBase: number
+  currentYearSalesBase: number
   lastOrderAt: string | null
   createdAt: string
   gdprAnonymisedAt: string | null
@@ -66,7 +66,7 @@ function mapCustomer(c: {
   createdAt: Date
   gdprAnonymisedAt: Date | null
   _count: { salesOrders: number }
-  salesOrders?: { status: string; totalGbp: unknown; createdAt: Date }[]
+  salesOrders?: { status: string; totalBase: unknown; createdAt: Date }[]
 }): CustomerRow {
   const currentYear = new Date().getFullYear()
   const revenueOrders = (c.salesOrders ?? []).filter((o) => REVENUE_STATUSES.has(o.status))
@@ -88,10 +88,10 @@ function mapCustomer(c: {
     notes: c.notes,
     active: c.active,
     orderCount: c._count.salesOrders,
-    lifetimeValueGbp: revenueOrders.reduce((sum, o) => sum + Number(o.totalGbp), 0),
-    currentYearSalesGbp: revenueOrders
+    lifetimeValueBase: revenueOrders.reduce((sum, o) => sum + Number(o.totalBase), 0),
+    currentYearSalesBase: revenueOrders
       .filter((o) => o.createdAt.getFullYear() === currentYear)
-      .reduce((sum, o) => sum + Number(o.totalGbp), 0),
+      .reduce((sum, o) => sum + Number(o.totalBase), 0),
     lastOrderAt: lastOrder?.toISOString() ?? null,
     createdAt: c.createdAt.toISOString(),
     gdprAnonymisedAt: c.gdprAnonymisedAt?.toISOString() ?? null,
@@ -109,7 +109,7 @@ export async function getCustomers(activeOnly = true): Promise<CustomerRow[]> {
     include: {
       _count: { select: { salesOrders: true } },
       salesOrders: {
-        select: { status: true, totalGbp: true, createdAt: true },
+        select: { status: true, totalBase: true, createdAt: true },
       },
     },
   })
@@ -131,15 +131,15 @@ export type CustomerOrderRow = {
   status: string
   currency: string
   totalForeign: number
-  totalGbp: number
+  totalBase: number
   createdAt: string
   lineCount: number
 }
 
 export type CustomerDetail = CustomerRow & {
   orders: CustomerOrderRow[]
-  totalTurnoverGbp: number
-  annualTurnoverGbp: Record<string, number>
+  totalTurnoverBase: number
+  annualTurnoverBase: Record<string, number>
 }
 
 export async function getCustomerDetail(id: string): Promise<CustomerDetail | null> {
@@ -156,7 +156,7 @@ export async function getCustomerDetail(id: string): Promise<CustomerDetail | nu
           status: true,
           currency: true,
           totalForeign: true,
-          totalGbp: true,
+          totalBase: true,
           createdAt: true,
           _count: { select: { lines: true } },
         },
@@ -172,7 +172,7 @@ export async function getCustomerDetail(id: string): Promise<CustomerDetail | nu
     status: so.status,
     currency: so.currency,
     totalForeign: Number(so.totalForeign),
-    totalGbp: Number(so.totalGbp),
+    totalBase: Number(so.totalBase),
     createdAt: so.createdAt.toISOString(),
     lineCount: so._count.lines,
   }))
@@ -181,19 +181,19 @@ export async function getCustomerDetail(id: string): Promise<CustomerDetail | nu
   const REVENUE_STATUSES = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'])
   const revenueOrders = orders.filter((o) => REVENUE_STATUSES.has(o.status))
 
-  const totalTurnoverGbp = revenueOrders.reduce((sum, o) => sum + o.totalGbp, 0)
+  const totalTurnoverBase = revenueOrders.reduce((sum, o) => sum + o.totalBase, 0)
 
-  const annualTurnoverGbp: Record<string, number> = {}
+  const annualTurnoverBase: Record<string, number> = {}
   for (const o of revenueOrders) {
     const year = new Date(o.createdAt).getFullYear().toString()
-    annualTurnoverGbp[year] = (annualTurnoverGbp[year] ?? 0) + o.totalGbp
+    annualTurnoverBase[year] = (annualTurnoverBase[year] ?? 0) + o.totalBase
   }
 
   return {
     ...mapCustomer(c),
     orders,
-    totalTurnoverGbp,
-    annualTurnoverGbp,
+    totalTurnoverBase,
+    annualTurnoverBase,
   }
 }
 

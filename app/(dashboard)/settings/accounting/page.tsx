@@ -100,8 +100,8 @@ export default async function AccountingSettingsPage({
             </div>
             <p className="text-sm text-muted-foreground mb-4">
               Define currencies used for purchasing. FX rates are fetched daily from the ECB
-              via the <code className="text-xs">/api/cron/fx-rates</code> endpoint. GBP is always the
-              base currency and cannot be removed.
+              via the <code className="text-xs">/api/cron/fx-rates</code> endpoint. The selected base
+              currency is locked after setup and cannot be removed.
             </p>
             <CurrenciesTable currencies={currencyData.currencies} />
           </Card>

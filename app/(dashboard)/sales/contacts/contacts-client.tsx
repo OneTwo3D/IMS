@@ -12,6 +12,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createCustomer, updateCustomer, importContactsCsv, anonymiseCustomer, type CustomerRow, type CustomerInput, type AddressData } from '@/app/actions/customers'
 import { CsvBar } from '@/components/ui/csv-bar'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { formatMoney } from '@/lib/utils'
 
 // ---------------------------------------------------------------------------
 // Column definitions
@@ -265,6 +267,8 @@ function GdprDialog({ customer, onClose }: { customer: CustomerRow; onClose: () 
 type Props = { initialCustomers: CustomerRow[] }
 
 export function ContactsClient({ initialCustomers }: Props) {
+  const baseCurrency = useBaseCurrency()
+  const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [editing, setEditing] = useState<CustomerRow | null | undefined>(undefined)
@@ -337,8 +341,8 @@ export function ContactsClient({ initialCustomers }: Props) {
       case 'billingAddress': return formatAddr(c.billingAddress)
       case 'shippingAddress': return formatAddr(c.shippingAddress)
       case 'orders': return c.orderCount
-      case 'lifetimeValue': return c.lifetimeValueGbp > 0 ? `£${c.lifetimeValueGbp.toFixed(2)}` : '—'
-      case 'currentYearSales': return c.currentYearSalesGbp > 0 ? `£${c.currentYearSalesGbp.toFixed(2)}` : '—'
+      case 'lifetimeValue': return c.lifetimeValueBase > 0 ? fmtBase(c.lifetimeValueBase) : '—'
+      case 'currentYearSales': return c.currentYearSalesBase > 0 ? fmtBase(c.currentYearSalesBase) : '—'
       case 'lastOrder': return fmtDate(c.lastOrderAt)
       case 'status':
         return (

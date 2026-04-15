@@ -12,12 +12,14 @@ import { setAuthToken, consumeAuthToken } from '@/lib/auth/token-store'
 import { notify } from '@/lib/notifications'
 import { decryptSecret, encryptSecret, hasEncryptionKey, isEncryptedValue } from '@/lib/secrets'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
 const XERO_OAUTH_STATE_PREFIX = 'xero_oauth_state:'
 const XERO_OAUTH_STATE_TTL_MS = 10 * 60 * 1000 // 10 minutes
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token'
 const XERO_CONNECTIONS_URL = 'https://api.xero.com/connections'
+const XERO_ORGANISATION_URL = 'https://api.xero.com/api.xro/2.0/Organisation'
 const XERO_SCOPES = 'openid profile email offline_access accounting.settings accounting.contacts accounting.invoices accounting.manualjournals accounting.attachments'
 
 type TokenResponse = {
@@ -123,6 +125,26 @@ async function pinTenantId(tenantId: string): Promise<void> {
 function selectTenantConnection(connections: XeroConnection[], expectedTenantId: string | null) {
   if (!expectedTenantId) return connections[0] ?? null
   return connections.find((conn) => conn.tenantId === expectedTenantId) ?? null
+}
+
+async function fetchOrganisationBaseCurrency(accessToken: string, tenantId: string): Promise<string | null> {
+  const res = await fetch(XERO_ORGANISATION_URL, {
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,
+      'Xero-Tenant-Id': tenantId,
+      'Accept': 'application/json',
+    },
+  })
+  if (!res.ok) return null
+  const data = await res.json() as Record<string, unknown>
+  const organisations =
+    (Array.isArray(data.Organisations) ? data.Organisations : null)
+    ?? (Array.isArray(data.Organisation) ? data.Organisation : null)
+    ?? []
+  const first = organisations[0]
+  if (!first || typeof first !== 'object') return null
+  const baseCurrency = (first as Record<string, unknown>).BaseCurrency
+  return typeof baseCurrency === 'string' && baseCurrency ? baseCurrency.toUpperCase() : null
 }
 
 async function logRefreshFailure(reason: string): Promise<void> {
@@ -254,6 +276,17 @@ export async function exchangeCodeForTokens(
         error: expectedTenantId
           ? `Connected Xero organisation does not match the pinned tenant (${expectedTenantId}). Reconnect to the expected organisation or clear the tenant binding before switching.`
           : 'Unable to resolve a Xero organisation for this app.',
+      }
+    }
+
+    const [organisationBaseCurrency, imsBaseCurrency] = await Promise.all([
+      fetchOrganisationBaseCurrency(tokenData.access_token, conn.tenantId),
+      getBaseCurrencyCode(),
+    ])
+    if (organisationBaseCurrency && organisationBaseCurrency !== imsBaseCurrency) {
+      return {
+        success: false,
+        error: `Xero organisation base currency (${organisationBaseCurrency}) must match the IMS base currency (${imsBaseCurrency}).`,
       }
     }
 

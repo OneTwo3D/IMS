@@ -365,9 +365,9 @@ async function consumeFifoLayers(
   productId: string,
   warehouseId: string,
   qty: number,
-): Promise<{ totalCostGbp: Prisma.Decimal }> {
+): Promise<{ totalCostBase: Prisma.Decimal }> {
   let remaining = new Prisma.Decimal(qty)
-  let totalCostGbp = new Prisma.Decimal(0)
+  let totalCostBase = new Prisma.Decimal(0)
 
   const layers = await tx.costLayer.findMany({
     where: {
@@ -378,7 +378,7 @@ async function consumeFifoLayers(
     select: {
       id: true,
       remainingQty: true,
-      unitCostGbp: true,
+      unitCostBase: true,
     },
     orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
   })
@@ -392,7 +392,7 @@ async function consumeFifoLayers(
       where: { id: layer.id },
       data: { remainingQty: { decrement: takeQty } },
     })
-    totalCostGbp = totalCostGbp.add(takeQty.mul(layer.unitCostGbp))
+    totalCostBase = totalCostBase.add(takeQty.mul(layer.unitCostBase))
     remaining = remaining.sub(takeQty)
   }
 
@@ -400,7 +400,7 @@ async function consumeFifoLayers(
     throw new Error(`Insufficient FIFO stock for product ${productId} in warehouse ${warehouseId}`)
   }
 
-  return { totalCostGbp }
+  return { totalCostBase }
 }
 
 async function assertStockAvailable(
@@ -458,12 +458,12 @@ export async function updateManufacturingOrderStatus(
 
         if (isAssembly) {
           // ASSEMBLY: deduct components (and release reservation), add output product
-          let totalAssemblyCostGbp = new Prisma.Decimal(0)
+          let totalAssemblyCostBase = new Prisma.Decimal(0)
           for (const comp of components) {
             const totalQty = Number(comp.qty) * qtyPlanned
             await assertStockAvailable(tx, comp.componentId, order.warehouseId, totalQty)
             const consumed = await consumeFifoLayers(tx, comp.componentId, order.warehouseId, totalQty)
-            totalAssemblyCostGbp = totalAssemblyCostGbp.add(consumed.totalCostGbp)
+            totalAssemblyCostBase = totalAssemblyCostBase.add(consumed.totalCostBase)
 
             // Deduct component stock + release reservation if was in progress
             await tx.stockLevel.update({
@@ -500,7 +500,7 @@ export async function updateManufacturingOrderStatus(
               warehouseId: order.warehouseId,
               receivedQty: qtyPlanned,
               remainingQty: qtyPlanned,
-              unitCostGbp: totalAssemblyCostGbp.div(new Prisma.Decimal(qtyPlanned)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP),
+              unitCostBase: totalAssemblyCostBase.div(new Prisma.Decimal(qtyPlanned)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP),
               isOpeningStock: false,
             },
           })
@@ -523,7 +523,7 @@ export async function updateManufacturingOrderStatus(
           const recoveredCost = await consumeFifoLayers(tx, order.outputProductId, order.warehouseId, qtyPlanned)
           const totalRecoveredUnits = components.reduce((sum, item) => sum + Number(item.qty) * qtyPlanned, 0)
           const recoveredUnitCost = totalRecoveredUnits > 0
-            ? recoveredCost.totalCostGbp.div(new Prisma.Decimal(totalRecoveredUnits)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+            ? recoveredCost.totalCostBase.div(new Prisma.Decimal(totalRecoveredUnits)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
             : new Prisma.Decimal(0)
           await tx.stockLevel.update({
             where: { productId_warehouseId: { productId: order.outputProductId, warehouseId: order.warehouseId } },
@@ -559,7 +559,7 @@ export async function updateManufacturingOrderStatus(
                 warehouseId: order.warehouseId,
                 receivedQty: totalQty,
                 remainingQty: totalQty,
-                unitCostGbp: recoveredUnitCost,
+                unitCostBase: recoveredUnitCost,
                 isOpeningStock: false,
               },
             })

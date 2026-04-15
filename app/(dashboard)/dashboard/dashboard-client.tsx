@@ -11,6 +11,8 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { ProductLink } from '@/components/inventory/product-link'
 import type { KpiSummary, ChartPoint, TopProduct, RecentOrder, IncomingPO, Period, CompareMode } from '@/app/actions/dashboard'
 import { getDashboardData } from '@/app/actions/dashboard'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { formatCompactMoney, formatMoney } from '@/lib/utils'
 
 type Props = {
   kpi: KpiSummary; chartData: ChartPoint[]; topProducts: TopProduct[]
@@ -18,12 +20,6 @@ type Props = {
   periodLabel: string; compLabel: string; initialPeriod: Period; initialCompare: CompareMode
 }
 
-function fmtGbp(v: number): string {
-  if (Math.abs(v) >= 1_000_000) return `£${(v / 1_000_000).toFixed(1)}M`
-  if (Math.abs(v) >= 1_000) return `£${(v / 1_000).toFixed(1)}K`
-  return `£${v.toFixed(2)}`
-}
-function fmtGbpFull(v: number): string { return `£${v.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` }
 function fmtDateShort(iso: string): string { return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) }
 
 function ChangeBadge({ current, previous }: { current: number; previous: number }) {
@@ -127,6 +123,9 @@ function DesktopChartFrame({
 }
 
 export function DashboardClient({ kpi: initKpi, chartData: initChart, topProducts: initTop, recentOrders, incomingPOs, periodLabel: initPL, compLabel: initCL, initialPeriod, initialCompare }: Props) {
+  const baseCurrency = useBaseCurrency()
+  const fmtBase = (value: number) => formatCompactMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
+  const fmtBaseFull = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const [isPending, startTransition] = useTransition()
   const [isNarrow, setIsNarrow] = useState<boolean | null>(null)
   const [period, setPeriod] = useState<Period>(initialPeriod)
@@ -221,24 +220,24 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
             <p className="text-xs text-muted-foreground">Gross Sales</p>
             <ChangeBadge current={kpi.grossSalesCurrent} previous={kpi.grossSalesComparison} />
           </div>
-          <p className="text-xl sm:text-2xl font-bold mt-1">{fmtGbp(kpi.grossSalesCurrent)}</p>
-          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">{kpi.ordersCurrent} orders &middot; avg {fmtGbpFull(kpi.avgOrderValue)}</p>
+          <p className="text-xl sm:text-2xl font-bold mt-1">{fmtBase(kpi.grossSalesCurrent)}</p>
+          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">{kpi.ordersCurrent} orders &middot; avg {fmtBaseFull(kpi.avgOrderValue)}</p>
         </Card>
         <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
             <p className="text-xs text-muted-foreground">Net Sales</p>
             <ChangeBadge current={kpi.netSalesCurrent} previous={kpi.netSalesComparison} />
           </div>
-          <p className="text-xl sm:text-2xl font-bold mt-1">{fmtGbp(kpi.netSalesCurrent)}</p>
-          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">{kpi.discountsCurrent > 0 ? `${fmtGbp(kpi.discountsCurrent)} discounts` : 'No discounts'} &middot; {kpi.refundsCurrent > 0 ? `${fmtGbp(kpi.refundsCurrent)} refunds` : 'No refunds'}</p>
+          <p className="text-xl sm:text-2xl font-bold mt-1">{fmtBase(kpi.netSalesCurrent)}</p>
+          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">{kpi.discountsCurrent > 0 ? `${fmtBase(kpi.discountsCurrent)} discounts` : 'No discounts'} &middot; {kpi.refundsCurrent > 0 ? `${fmtBase(kpi.refundsCurrent)} refunds` : 'No refunds'}</p>
         </Card>
         <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
             <p className="text-xs text-muted-foreground">COGS</p>
             <ChangeBadge current={kpi.cogsCurrent} previous={kpi.cogsComparison} />
           </div>
-          <p className="text-xl sm:text-2xl font-bold mt-1">{fmtGbp(kpi.cogsCurrent)}</p>
-          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">Profit: {fmtGbp(kpi.profitCurrent)}</p>
+          <p className="text-xl sm:text-2xl font-bold mt-1">{fmtBase(kpi.cogsCurrent)}</p>
+          <p className="text-[11px] text-muted-foreground mt-0.5 truncate">Profit: {fmtBase(kpi.profitCurrent)}</p>
         </Card>
         <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
@@ -262,7 +261,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                   <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                   <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={mobileXInterval} angle={0} textAnchor="middle" height={30} />
                   <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={36} />
-                  <Tooltip formatter={(value, name) => [fmtGbpFull(Number(value)), name === 'netSales' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
+                  <Tooltip formatter={(value, name) => [fmtBaseFull(Number(value)), name === 'netSales' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
                   <Bar dataKey="netSales" fill="hsl(221, 83%, 53%)" radius={[2, 2, 0, 0]} name="netSales" />
                   <Line type="monotone" dataKey="compNetSales" stroke="hsl(0, 0%, 65%)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="compNetSales" />
                 </BarChart>
@@ -273,7 +272,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                 <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={xInterval} angle={xAngle} textAnchor={xAnchor} height={xHeight} />
                 <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={40} />
-                <Tooltip formatter={(value, name) => [fmtGbpFull(Number(value)), name === 'netSales' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
+                <Tooltip formatter={(value, name) => [fmtBaseFull(Number(value)), name === 'netSales' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
                 <Bar dataKey="netSales" fill="hsl(221, 83%, 53%)" radius={[2, 2, 0, 0]} name="netSales" />
                 <Line type="monotone" dataKey="compNetSales" stroke="hsl(0, 0%, 65%)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="compNetSales" />
               </BarChart>
@@ -290,7 +289,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                   <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                   <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={mobileXInterval} angle={0} textAnchor="middle" height={30} />
                   <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={36} />
-                  <Tooltip formatter={(value, name) => [fmtGbpFull(Number(value)), name === 'cogs' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
+                  <Tooltip formatter={(value, name) => [fmtBaseFull(Number(value)), name === 'cogs' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
                   <Legend formatter={(v) => v === 'cogs' ? periodLabel : compLabel} wrapperStyle={{ fontSize: 11 }} />
                   <Line type="monotone" dataKey="cogs" stroke="hsl(0, 72%, 51%)" strokeWidth={2} dot={{ r: 2 }} name="cogs" />
                   <Line type="monotone" dataKey="compCogs" stroke="hsl(0, 0%, 65%)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="compCogs" />
@@ -302,7 +301,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                 <XAxis dataKey="label" tick={{ fontSize: 9 }} interval={xInterval} angle={xAngle} textAnchor={xAnchor} height={xHeight} />
                 <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={40} />
-                <Tooltip formatter={(value, name) => [fmtGbpFull(Number(value)), name === 'cogs' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
+                <Tooltip formatter={(value, name) => [fmtBaseFull(Number(value)), name === 'cogs' ? periodLabel : compLabel]} contentStyle={{ fontSize: 11 }} />
                 <Legend formatter={(v) => v === 'cogs' ? periodLabel : compLabel} wrapperStyle={{ fontSize: 11 }} />
                 <Line type="monotone" dataKey="cogs" stroke="hsl(0, 72%, 51%)" strokeWidth={2} dot={{ r: 2 }} name="cogs" />
                 <Line type="monotone" dataKey="compCogs" stroke="hsl(0, 0%, 65%)" strokeWidth={1.5} strokeDasharray="4 3" dot={false} name="compCogs" />
@@ -353,7 +352,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                   <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                   <XAxis dataKey="name" tick={{ fontSize: 9 }} interval={0} />
                   <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : v < -1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={40} />
-                  <Tooltip formatter={(value) => [fmtGbpFull(Math.abs(Number(value))), '']} contentStyle={{ fontSize: 11 }} />
+                  <Tooltip formatter={(value) => [fmtBaseFull(Math.abs(Number(value))), '']} contentStyle={{ fontSize: 11 }} />
                   <ReferenceLine y={0} stroke="hsl(0, 0%, 70%)" />
                   <Bar dataKey="value" radius={[3, 3, 0, 0]}>
                     {bridge.map((entry, i) => <Cell key={i} fill={entry.fill} />)}
@@ -366,7 +365,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                 <CartesianGrid strokeDasharray="3 3" className="stroke-muted" />
                 <XAxis dataKey="name" tick={{ fontSize: 9 }} interval={0} />
                 <YAxis tick={{ fontSize: 9 }} tickFormatter={(v) => v >= 1000 ? `${(v / 1000).toFixed(0)}K` : v < -1000 ? `${(v / 1000).toFixed(0)}K` : `${v}`} width={45} />
-                <Tooltip formatter={(value) => [fmtGbpFull(Math.abs(Number(value))), '']} contentStyle={{ fontSize: 11 }} />
+                <Tooltip formatter={(value) => [fmtBaseFull(Math.abs(Number(value))), '']} contentStyle={{ fontSize: 11 }} />
                 <ReferenceLine y={0} stroke="hsl(0, 0%, 70%)" />
                 <Bar dataKey="value" radius={[3, 3, 0, 0]}>
                   {bridge.map((entry, i) => <Cell key={i} fill={entry.fill} />)}
@@ -389,7 +388,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                   <ProductLink productId={p.productId} sku={p.sku} name={p.name} />
                   <p className="text-[10px] text-muted-foreground">{p.qtySold} sold &middot; {p.marginPct}% margin</p>
                 </div>
-                <span className="tabular-nums text-sm font-mono font-medium shrink-0">{fmtGbpFull(p.netRevenue)}</span>
+                <span className="tabular-nums text-sm font-mono font-medium shrink-0">{fmtBaseFull(p.netRevenue)}</span>
               </div>
             ))}
             {topProducts.length === 0 && <p className="text-center text-sm text-muted-foreground py-6">No sales data.</p>}
@@ -410,7 +409,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                   <p className="text-[10px] text-muted-foreground truncate">{po.supplierName} &middot; {po.lineCount} lines</p>
                 </div>
                 <div className="text-right shrink-0">
-                  <span className="tabular-nums text-sm font-mono font-medium">{fmtGbpFull(po.totalGbp)}</span>
+                  <span className="tabular-nums text-sm font-mono font-medium">{fmtBaseFull(po.totalBase)}</span>
                   <p className="text-[10px] text-muted-foreground">
                     {po.expectedDelivery ? (() => {
                       const daysAway = Math.round((new Date(po.expectedDelivery).getTime() - Date.now()) / 86400000)
@@ -430,16 +429,16 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         <Card className="p-3 text-center">
           <p className="text-[10px] text-muted-foreground">Open Orders</p>
           <p className="text-lg font-bold">{kpi.pendingSalesOrders}</p>
-          <p className="text-[10px] text-muted-foreground">{fmtGbp(kpi.pendingSalesValue)}</p>
+          <p className="text-[10px] text-muted-foreground">{fmtBase(kpi.pendingSalesValue)}</p>
         </Card>
         <Card className="p-3 text-center">
           <p className="text-[10px] text-muted-foreground">Open POs</p>
           <p className="text-lg font-bold">{kpi.openPurchaseOrders}</p>
-          <p className="text-[10px] text-muted-foreground">{fmtGbp(kpi.openPOValue)}</p>
+          <p className="text-[10px] text-muted-foreground">{fmtBase(kpi.openPOValue)}</p>
         </Card>
         <Card className="p-3 text-center">
           <p className="text-[10px] text-muted-foreground">Inventory Value</p>
-          <p className="text-lg font-bold">{fmtGbp(kpi.inventoryValue)}</p>
+          <p className="text-lg font-bold">{fmtBase(kpi.inventoryValue)}</p>
           <p className="text-[10px] text-muted-foreground">{kpi.activeProducts} active</p>
         </Card>
         <Card className="p-3 text-center">
@@ -449,13 +448,13 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         </Card>
         <Card className="p-3 text-center">
           <p className="text-[10px] text-muted-foreground">Shipping</p>
-          <p className="text-lg font-bold">{fmtGbp(kpi.shippingCurrent)}</p>
+          <p className="text-lg font-bold">{fmtBase(kpi.shippingCurrent)}</p>
           <p className="text-[10px] text-muted-foreground">{periodLabel}</p>
         </Card>
         <Card className="p-3 text-center">
           <p className="text-[10px] text-muted-foreground">Comp. Orders</p>
           <p className="text-lg font-bold">{kpi.ordersComparison}</p>
-          <p className="text-[10px] text-muted-foreground">{fmtGbp(kpi.netSalesComparison)}</p>
+          <p className="text-[10px] text-muted-foreground">{fmtBase(kpi.netSalesComparison)}</p>
         </Card>
       </div>
 
@@ -483,7 +482,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                 <TableRow key={o.id}>
                   <TableCell className="py-1.5 font-mono text-xs"><Link href={`/sales/${o.id}`} className="hover:underline">{o.orderNumber}</Link></TableCell>
                   <TableCell className="py-1.5 text-xs">{o.customerName}</TableCell>
-                  <TableCell className="py-1.5 text-right tabular-nums text-xs font-mono">{fmtGbpFull(o.totalGbp)}</TableCell>
+                  <TableCell className="py-1.5 text-right tabular-nums text-xs font-mono">{fmtBaseFull(o.totalBase)}</TableCell>
                   <TableCell className="py-1.5"><span className={`inline-flex items-center rounded-full px-1.5 py-0.5 text-[10px] font-medium ${STATUS_COLORS[o.status] ?? 'bg-gray-100 text-gray-700'}`}>{o.status}</span></TableCell>
                   <TableCell className="py-1.5 text-xs text-muted-foreground">{fmtDateShort(o.createdAt)}</TableCell>
                 </TableRow>
@@ -508,7 +507,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                 <p className="text-xs text-muted-foreground truncate mt-0.5">{o.customerName}</p>
                 <p className="text-[10px] text-muted-foreground mt-0.5">{fmtDateShort(o.createdAt)}</p>
               </div>
-              <span className="tabular-nums text-sm font-mono font-medium shrink-0">{fmtGbpFull(o.totalGbp)}</span>
+              <span className="tabular-nums text-sm font-mono font-medium shrink-0">{fmtBaseFull(o.totalBase)}</span>
             </Link>
           ))}
         </div>

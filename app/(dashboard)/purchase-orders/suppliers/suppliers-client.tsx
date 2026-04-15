@@ -19,6 +19,7 @@ import { createSupplier, updateSupplier, importSuppliersCsv, type SupplierRow, t
 import { CsvBar } from '@/components/ui/csv-bar'
 import type { TaxRateRow } from '@/app/actions/settings'
 import type { CurrencyRow } from '@/app/actions/currencies'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 
 type Props = {
   initialSuppliers: SupplierRow[]
@@ -57,13 +58,17 @@ const EMPTY_FORM: FormState = {
   county: '',
   postcode: '',
   country: '',
-  currency: 'GBP',
+  currency: '',
   taxRateId: '',
   vatNumber: '',
   accountNumber: '',
   paymentTermsDays: '',
   manualDeliveryDays: '',
   notes: '',
+}
+
+function buildEmptyForm(baseCurrencyCode: string): FormState {
+  return { ...EMPTY_FORM, currency: baseCurrencyCode }
 }
 
 function supplierToForm(s: SupplierRow): FormState {
@@ -100,7 +105,7 @@ function formToInput(f: FormState): SupplierInput {
     county: f.county || undefined,
     postcode: f.postcode || undefined,
     country: f.country || undefined,
-    currency: f.currency || 'GBP',
+    currency: f.currency,
     taxRateId: f.taxRateId || null,
     vatNumber: f.vatNumber || undefined,
     accountNumber: f.accountNumber || undefined,
@@ -114,16 +119,20 @@ function SupplierFormDialog({
   supplier,
   taxRates,
   currencies,
+  baseCurrencyCode,
+  baseCurrencySymbol,
   onClose,
 }: {
   supplier: SupplierRow | null
   taxRates: TaxRateRow[]
   currencies: CurrencyRow[]
+  baseCurrencyCode: string
+  baseCurrencySymbol: string
   onClose: () => void
 }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
-  const [form, setForm] = useState<FormState>(supplier ? supplierToForm(supplier) : EMPTY_FORM)
+  const [form, setForm] = useState<FormState>(supplier ? supplierToForm(supplier) : buildEmptyForm(baseCurrencyCode))
   const [error, setError] = useState('')
 
   function set(field: keyof FormState, value: string) {
@@ -182,8 +191,8 @@ function SupplierFormDialog({
                 onChange={(e) => set('currency', e.target.value)}
                 className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm font-mono"
               >
-                <option value="GBP">GBP £</option>
-                {currencies.filter((c) => c.code !== 'GBP').map((c) => (
+                <option value={baseCurrencyCode}>{baseCurrencyCode} {baseCurrencySymbol}</option>
+                {currencies.filter((c) => c.code !== baseCurrencyCode).map((c) => (
                   <option key={c.code} value={c.code}>{c.code} {c.symbol}</option>
                 ))}
               </select>
@@ -309,6 +318,7 @@ function SupplierFormDialog({
 }
 
 export function SuppliersClient({ initialSuppliers, taxRates, currencies }: Props) {
+  const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const searchParams = useSearchParams()
   const [, startTransition] = useTransition()
@@ -431,6 +441,8 @@ export function SuppliersClient({ initialSuppliers, taxRates, currencies }: Prop
           supplier={editing}
           taxRates={taxRates}
           currencies={currencies}
+          baseCurrencyCode={baseCurrency.code}
+          baseCurrencySymbol={baseCurrency.symbol}
           onClose={() => setEditing(undefined)}
         />
       )}

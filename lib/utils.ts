@@ -41,3 +41,62 @@ export function formatMoney(
   if (pos === 'POSTFIX') return `${sign}${abs}${symbol}`
   return `${sign}${symbol}${abs}`
 }
+
+export function formatMoneyCode(
+  amount: number,
+  currencyCode: string,
+  options?: {
+    locale?: string
+    minimumFractionDigits?: number
+    maximumFractionDigits?: number
+    notation?: 'standard' | 'compact'
+  },
+): string {
+  const formatter = new Intl.NumberFormat(options?.locale ?? 'en-GB', {
+    style: 'currency',
+    currency: currencyCode,
+    currencyDisplay: 'narrowSymbol',
+    minimumFractionDigits: options?.minimumFractionDigits,
+    maximumFractionDigits: options?.maximumFractionDigits,
+    notation: options?.notation,
+  })
+  return formatter.format(amount)
+}
+
+export function formatCompactMoneyCode(
+  amount: number,
+  currencyCode: string,
+  options?: {
+    locale?: string
+    maximumFractionDigits?: number
+  },
+): string {
+  return formatMoneyCode(amount, currencyCode, {
+    locale: options?.locale,
+    notation: 'compact',
+    maximumFractionDigits: options?.maximumFractionDigits ?? 1,
+  })
+}
+
+export function formatCompactMoney(
+  amount: number,
+  symbol: string,
+  position?: SymbolPos,
+  maximumFractionDigits: number = 1,
+): string {
+  const abs = Math.abs(amount)
+  let value = abs
+  let suffix = ''
+  if (abs >= 1_000_000) {
+    value = abs / 1_000_000
+    suffix = 'M'
+  } else if (abs >= 1_000) {
+    value = abs / 1_000
+    suffix = 'K'
+  }
+  const digits = suffix ? maximumFractionDigits : 2
+  const formatted = formatMoney(value, symbol, position, digits)
+  const sign = amount < 0 ? '-' : ''
+  const unsigned = formatted.startsWith('-') ? formatted.slice(1) : formatted
+  return `${sign}${unsigned}${suffix}`
+}

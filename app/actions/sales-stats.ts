@@ -62,14 +62,14 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
   const orders = await db.salesOrder.findMany({
     where: { status: { in: ['SHIPPED', 'COMPLETED', 'PARTIALLY_REFUNDED', 'REFUNDED'] }, ...(hasDateFilter ? { createdAt: dateFilter } : {}) },
     select: {
-      id: true, totalGbp: true, discountAmount: true, fxRateToGbp: true, customerName: true, salesRep: true,
-      lines: { select: { productId: true, sku: true, description: true, qty: true, totalGbp: true, discountAmount: true, cogsGbp: true } },
-      refunds: { select: { totalGbp: true, lines: { select: { productId: true, qty: true, totalGbp: true } } } },
+      id: true, totalBase: true, discountAmount: true, fxRateToBase: true, customerName: true, salesRep: true,
+      lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true } },
+      refunds: { select: { totalBase: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
     },
   })
 
   const products = await db.product.findMany({
-    select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, weight: true, salesPriceGbp: true, lifecycleStatus: true,
+    select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, weight: true, salesPriceBase: true, lifecycleStatus: true,
       stockLevels: { select: { quantity: true, reservedQty: true } } },
   })
   const productInfo = new Map(products.map((p) => [p.id, p]))
@@ -88,7 +88,7 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
           reservedQty: info?.stockLevels.reduce((s, sl) => s + Number(sl.reservedQty), 0) ?? 0,
           availableStock: info ? info.stockLevels.reduce((s, sl) => s + Number(sl.quantity) - Number(sl.reservedQty), 0) : 0,
           customerName: order.customerName, salesRep: order.salesRep,
-          salesPrice: info?.salesPriceGbp ? Number(info.salesPriceGbp) : null,
+          salesPrice: info?.salesPriceBase ? Number(info.salesPriceBase) : null,
           weight: info?.weight ? Number(info.weight) : null,
           qtySold: 0, qtyRefunded: 0, netQty: 0, grossRevenue: 0, discounts: 0, refunds: 0,
           netRevenue: 0, cogs: 0, grossProfit: 0, marginPct: 0, orderCount: 0, avgOrderValue: 0,
@@ -96,16 +96,16 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
       }
       const row = productMap.get(pid)!
       row.qtySold += Number(line.qty)
-      row.grossRevenue += Number(line.totalGbp) + Number(line.discountAmount) / Number(order.fxRateToGbp || 1)
-      row.discounts += Number(line.discountAmount) / Number(order.fxRateToGbp || 1)
-      row.cogs += Number(line.cogsGbp ?? 0)
+      row.grossRevenue += Number(line.totalBase) + Number(line.discountAmount) / Number(order.fxRateToBase || 1)
+      row.discounts += Number(line.discountAmount) / Number(order.fxRateToBase || 1)
+      row.cogs += Number(line.cogsBase ?? 0)
       row.orderCount++
     }
     for (const refund of order.refunds) {
       for (const rl of refund.lines) {
         if (!rl.productId) continue
         const row = productMap.get(rl.productId)
-        if (row) { row.qtyRefunded += Number(rl.qty); row.refunds += Number(rl.totalGbp) }
+        if (row) { row.qtyRefunded += Number(rl.qty); row.refunds += Number(rl.totalBase) }
       }
     }
   }
@@ -156,7 +156,7 @@ export type ShipmentRow = {
   trackingNumber: string | null
   warehouse: string | null
   qty: number
-  totalGbp: number
+  totalBase: number
 }
 
 export async function getShipments(dateFrom?: string, dateTo?: string): Promise<ShipmentRow[]> {
@@ -170,7 +170,7 @@ export async function getShipments(dateFrom?: string, dateTo?: string): Promise<
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, customerName: true, salesRep: true, shippedAt: true,
       trackingNumber: true, shippingService: true, shipFromWarehouse: { select: { code: true } },
-      lines: { select: { productId: true, sku: true, description: true, qty: true, totalGbp: true, product: { select: { barcode: true } } } },
+      lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true, product: { select: { barcode: true } } } },
     },
     orderBy: { shippedAt: 'desc' },
   })
@@ -185,7 +185,7 @@ export async function getShipments(dateFrom?: string, dateTo?: string): Promise<
         customerName: o.customerName ?? '—', salesRep: o.salesRep,
         shippedAt: o.shippedAt!.toISOString(), shippingService: o.shippingService,
         trackingNumber: o.trackingNumber, warehouse: o.shipFromWarehouse?.code ?? null,
-        qty: Number(l.qty), totalGbp: Number(l.totalGbp),
+        qty: Number(l.qty), totalBase: Number(l.totalBase),
       })
     }
   }
@@ -209,7 +209,7 @@ export type DetailRow = {
   salesRep: string | null
   status: string
   qty: number
-  totalGbp: number
+  totalBase: number
   createdAt: string
 }
 
@@ -223,7 +223,7 @@ export async function getDetails(dateFrom?: string, dateTo?: string): Promise<De
     where: Object.keys(dateFilter).length ? { createdAt: dateFilter } : undefined,
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, status: true, customerName: true, customerEmail: true, salesRep: true, createdAt: true,
-      lines: { select: { productId: true, sku: true, description: true, qty: true, totalGbp: true, product: { select: { barcode: true, type: true } } } },
+      lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true, product: { select: { barcode: true, type: true } } } },
     },
     orderBy: { createdAt: 'desc' },
   })
@@ -237,7 +237,7 @@ export async function getDetails(dateFrom?: string, dateTo?: string): Promise<De
         barcode: l.product?.barcode ?? null, type: l.product?.type ?? null,
         customerName: o.customerName ?? '—', customerEmail: o.customerEmail,
         salesRep: o.salesRep, status: o.status,
-        qty: Number(l.qty), totalGbp: Number(l.totalGbp), createdAt: o.createdAt.toISOString(),
+        qty: Number(l.qty), totalBase: Number(l.totalBase), createdAt: o.createdAt.toISOString(),
       })
     }
   }
@@ -260,7 +260,7 @@ export type InvoiceRow = {
   invoicedAt: string
   status: string
   qty: number
-  totalGbp: number
+  totalBase: number
   paidAt: string | null
   balance: number
 }
@@ -275,8 +275,8 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
     where: { invoiceNumber: { not: null }, ...(Object.keys(dateFilter).length ? { invoicedAt: dateFilter } : {}) },
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, invoiceNumber: true, customerName: true, salesRep: true,
-      invoicedAt: true, status: true, totalGbp: true, paidAt: true,
-      lines: { select: { productId: true, sku: true, description: true, qty: true, totalGbp: true } },
+      invoicedAt: true, status: true, totalBase: true, paidAt: true,
+      lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true } },
       payments: { where: { refundId: null }, select: { amount: true } },
     },
     orderBy: { invoicedAt: 'desc' },
@@ -285,14 +285,14 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
   const rows: InvoiceRow[] = []
   for (const o of orders) {
     const paid = o.payments.reduce((s, p) => s + Number(p.amount), 0)
-    const balance = Math.round((Number(o.totalGbp) - paid) * 100) / 100
+    const balance = Math.round((Number(o.totalBase) - paid) * 100) / 100
     for (const l of o.lines) {
       rows.push({
         orderId: o.id, orderNumber: getSalesOrderReference(o),
         invoiceNumber: o.invoiceNumber!, productId: l.productId, sku: l.sku ?? '',
         productName: l.description, customerName: o.customerName ?? '—', salesRep: o.salesRep,
         invoicedAt: o.invoicedAt!.toISOString(), status: o.status,
-        qty: Number(l.qty), totalGbp: Number(l.totalGbp),
+        qty: Number(l.qty), totalBase: Number(l.totalBase),
         paidAt: o.paidAt?.toISOString() ?? null, balance,
       })
     }
@@ -317,7 +317,7 @@ export type RefundRow = {
   reason: string | null
   refundedAt: string
   qty: number
-  totalGbp: number
+  totalBase: number
   pctOfSale: number
 }
 
@@ -330,25 +330,25 @@ export async function getRefundStats(dateFrom?: string, dateTo?: string): Promis
   const refunds = await db.salesOrderRefund.findMany({
     where: Object.keys(dateFilter).length ? { refundedAt: dateFilter } : undefined,
     select: {
-      id: true, creditNoteNumber: true, reason: true, totalGbp: true, refundedAt: true,
-      order: { select: { id: true, orderNumber: true, externalOrderNumber: true, customerName: true, salesRep: true, totalGbp: true } },
-      lines: { select: { id: true, productId: true, description: true, qty: true, totalGbp: true } },
+      id: true, creditNoteNumber: true, reason: true, totalBase: true, refundedAt: true,
+      order: { select: { id: true, orderNumber: true, externalOrderNumber: true, customerName: true, salesRep: true, totalBase: true } },
+      lines: { select: { id: true, productId: true, description: true, qty: true, totalBase: true } },
     },
     orderBy: { refundedAt: 'desc' },
   })
 
   const rows: RefundRow[] = []
   for (const r of refunds) {
-    const orderTotal = Number(r.order.totalGbp)
+    const orderTotal = Number(r.order.totalBase)
     for (const l of r.lines) {
-      const lineTotal = Number(l.totalGbp)
+      const lineTotal = Number(l.totalBase)
       rows.push({
         id: l.id, orderId: r.order.id, orderNumber: getSalesOrderReference(r.order),
         creditNoteNumber: r.creditNoteNumber, productId: l.productId,
         sku: '', productName: l.description,
         customerName: r.order.customerName ?? '—', salesRep: r.order.salesRep,
         reason: r.reason, refundedAt: r.refundedAt.toISOString(),
-        qty: Number(l.qty), totalGbp: lineTotal,
+        qty: Number(l.qty), totalBase: lineTotal,
         pctOfSale: orderTotal > 0 ? Math.round((lineTotal / orderTotal) * 1000) / 10 : 0,
       })
     }
@@ -386,19 +386,19 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
     where: { invoiceNumber: { not: null } },
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, customerId: true, customerName: true, salesRep: true,
-      currency: true, totalGbp: true, invoicedAt: true, paidAt: true, createdAt: true,
+      currency: true, totalBase: true, invoicedAt: true, paidAt: true, createdAt: true,
       shipFromWarehouse: { select: { code: true } },
       payments: { where: { refundId: null }, select: { amount: true } },
-      refunds: { select: { totalGbp: true } },
+      refunds: { select: { totalBase: true } },
     },
     orderBy: { createdAt: 'desc' },
   })
 
   const now = Date.now()
   return orders.map((o) => {
-    const total = Number(o.totalGbp)
+    const total = Number(o.totalBase)
     const paid = o.payments.reduce((s, p) => s + Number(p.amount), 0)
-    const refundsTotal = o.refunds.reduce((s, r) => s + Number(r.totalGbp), 0)
+    const refundsTotal = o.refunds.reduce((s, r) => s + Number(r.totalBase), 0)
     const balance = Math.max(0, total - paid)
     const ageDays = o.invoicedAt ? Math.round((now - o.invoicedAt.getTime()) / 86400000) : 0
     let o0 = 0, o31 = 0, o61 = 0, o91 = 0

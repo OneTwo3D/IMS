@@ -6,7 +6,7 @@ import { hasPermission } from '@/lib/permissions'
 const HEADERS = [
   'sku', 'name', 'description', 'type', 'parentSku', 'barcode',
   'weight', 'widthCm', 'heightCm', 'depthCm',
-  'salesPriceGbp', 'salePriceGbp', 'salesPriceTaxInclusive',
+  'salesPriceBase', 'salePriceBase', 'salesPriceTaxInclusive',
   'stockUnit', 'oversellAllowed', 'imageUrl', 'active', 'lifecycleStatus',
   'components',
   'totalStock', 'inventoryValue',
@@ -15,7 +15,7 @@ const HEADERS = [
 const TEMPLATE_HEADERS = [
   'sku', 'name', 'description', 'type', 'parentSku', 'barcode',
   'weight', 'widthCm', 'heightCm', 'depthCm',
-  'salesPriceGbp', 'salePriceGbp', 'salesPriceTaxInclusive',
+  'salesPriceBase', 'salePriceBase', 'salesPriceTaxInclusive',
   'stockUnit', 'oversellAllowed', 'imageUrl', 'active', 'lifecycleStatus',
   'components',
 ]
@@ -48,7 +48,7 @@ export async function GET(req: Request) {
       stockLevels: { select: { quantity: true } },
       costLayers: {
         where: { remainingQty: { gt: 0 } },
-        select: { remainingQty: true, unitCostGbp: true },
+        select: { remainingQty: true, unitCostBase: true },
       },
       productComponents: {
         select: { qty: true, component: { select: { sku: true } } },
@@ -75,8 +75,8 @@ export async function GET(req: Request) {
       widthCm: p.widthCm?.toString() ?? '',
       heightCm: p.heightCm?.toString() ?? '',
       depthCm: p.depthCm?.toString() ?? '',
-      salesPriceGbp: p.salesPriceGbp?.toString() ?? '',
-      salePriceGbp: p.salePriceGbp?.toString() ?? '',
+      salesPriceBase: p.salesPriceBase?.toString() ?? '',
+      salePriceBase: p.salePriceBase?.toString() ?? '',
       salesPriceTaxInclusive: p.salesPriceTaxInclusive ? 'TRUE' : 'FALSE',
       stockUnit: p.stockUnit,
       oversellAllowed: p.oversellAllowed ? 'TRUE' : 'FALSE',
@@ -86,7 +86,7 @@ export async function GET(req: Request) {
       components: componentsStr,
       totalStock: p.stockLevels.reduce((s, sl) => s + Number(sl.quantity), 0).toFixed(2),
       inventoryValue: p.costLayers
-        .reduce((s, c) => s + Number(c.remainingQty) * Number(c.unitCostGbp), 0)
+        .reduce((s, c) => s + Number(c.remainingQty) * Number(c.unitCostBase), 0)
         .toFixed(2),
     }
   })

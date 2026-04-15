@@ -136,7 +136,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
 
   if (so.currency !== 'GBP') {
     doc.font('Helvetica').fontSize(8).fillColor('#888')
-      .text(`(GBP equivalent: ${formatMoney(Number(so.totalGbp), '£', 'PREFIX')})`, lX, doc.y + 3, { width: lW + vW, align: 'right' })
+      .text(`(GBP equivalent: ${formatMoney(Number(so.totalBase), '£', 'PREFIX')})`, lX, doc.y + 3, { width: lW + vW, align: 'right' })
   }
 
   // Footer note from template

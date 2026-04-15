@@ -22,6 +22,7 @@ import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow, PurchaseUnitRow } from '@/app/actions/settings'
 import { ProductLink } from '@/components/inventory/product-link'
 import { formatMoney } from '@/lib/utils'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { toIsoCountryCode } from '@/lib/countries'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 
@@ -156,6 +157,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const isEditMode = !!existingPo
+  const baseCurrency = useBaseCurrency()
 
   // When editing, match the saved order's tax rate by id (fall back to name
   // matching for legacy rows that pre-date taxRateId on lines).
@@ -169,8 +171,8 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
 
   // Header state — prefilled from existingPo when editing
   const [supplierId, setSupplierId] = useState(existingPo?.supplierId ?? '')
-  const [currency, setCurrency] = useState(existingPo?.currency ?? 'GBP')
-  const [fxRate, setFxRate] = useState(existingPo?.fxRateToGbp ?? 1)
+  const [currency, setCurrency] = useState(existingPo?.currency ?? baseCurrency.code)
+  const [fxRate, setFxRate] = useState(existingPo?.fxRateToBase ?? 1)
   const [destinationWarehouseId, setDestinationWarehouseId] = useState(existingPo?.destinationWarehouseId ?? '')
   const [supplierRef, setSupplierRef] = useState(existingPo?.supplierRef ?? '')
   const [expectedDelivery, setExpectedDelivery] = useState(
@@ -278,7 +280,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   const [allSuppliers, setAllSuppliers] = useState(suppliers)
   const [showNewSupplier, setShowNewSupplier] = useState(false)
   const [newSupplierName, setNewSupplierName] = useState('')
-  const [newSupplierCurrency, setNewSupplierCurrency] = useState('GBP')
+  const [newSupplierCurrency, setNewSupplierCurrency] = useState(baseCurrency.code)
   const [creatingSup, setCreatingSup] = useState(false)
 
   async function handleCreateSupplier() {
@@ -291,7 +293,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
       handleSupplierChange(result.supplier.id)
       setShowNewSupplier(false)
       setNewSupplierName('')
-      setNewSupplierCurrency('GBP')
+      setNewSupplierCurrency(baseCurrency.code)
     }
   }
 
@@ -317,9 +319,9 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
     return resolveRateClientSide(cat, destCountry, taxRates, 'PURCHASE', orderDefault)
   }
 
-  // Currency symbol + position lookup (GBP → £ PREFIX, EUR → € POSTFIX, etc.)
-  const symbolMap: Record<string, string> = { GBP: '£' }
-  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { GBP: 'PREFIX' }
+  // Currency symbol + position lookup
+  const symbolMap: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
+  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
   for (const c of currencies) {
     symbolMap[c.code] = c.symbol
     positionMap[c.code] = c.symbolPosition
@@ -329,14 +331,14 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   const money = (n: number) => formatMoney(n, sym, symPos)
 
   // Build rate lookup
-  const rateMap: Record<string, number> = { GBP: 1 }
+  const rateMap: Record<string, number> = { [baseCurrency.code]: 1 }
   for (const c of currencies) {
     if (c.latestRate != null) rateMap[c.code] = c.latestRate
   }
 
   function setCurrencyAndRate(code: string) {
     setCurrency(code)
-    if (code === 'GBP') setFxRate(1)
+    if (code === baseCurrency.code) setFxRate(1)
     else if (rateMap[code]) setFxRate(rateMap[code])
   }
 
@@ -575,7 +577,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   const additionalCostVat = additionalCosts.reduce((sum, ac) => ac.vatable && vatRate > 0 ? sum + ac.amountForeign * vatRate : sum, 0)
   const additionalCostTotal = additionalCostNet + additionalCostVat
   const grandTotalForeign = lineSubtotalForeign + taxTotalForeign + additionalCostTotal
-  const grandTotalGbp = grandTotalForeign / fxRate
+  const grandTotalBase = grandTotalForeign / fxRate
 
   const filteredProducts = products.filter((p) => {
     if (!productSearch) return true
@@ -591,7 +593,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
     const payload = {
       supplierId,
       currency,
-      fxRateToGbp: fxRate,
+      fxRateToBase: fxRate,
       destinationWarehouseId: destinationWarehouseId || undefined,
       supplierRef: supplierRef || undefined,
       expectedDelivery: expectedDelivery || undefined,
@@ -705,8 +707,8 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                   onChange={(e) => setNewSupplierCurrency(e.target.value)}
                   className="w-24 h-9 rounded-md border border-input bg-background px-2 text-sm font-mono"
                 >
-                  <option value="GBP">GBP</option>
-                  {currencies.filter((c) => c.code !== 'GBP').map((c) => (
+                  <option value={baseCurrency.code}>{baseCurrency.code}</option>
+                  {currencies.filter((c) => c.code !== baseCurrency.code).map((c) => (
                     <option key={c.code} value={c.code}>{c.code}</option>
                   ))}
                 </select>
@@ -728,19 +730,19 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                 onChange={(e) => setCurrencyAndRate(e.target.value)}
                 className="w-28 h-9 rounded-md border border-input bg-background px-3 text-sm font-mono"
               >
-                <option value="GBP">GBP £</option>
-                {currencies.filter((c) => c.code !== 'GBP').map((c) => (
+                <option value={baseCurrency.code}>{baseCurrency.code} {baseCurrency.symbol}</option>
+                {currencies.filter((c) => c.code !== baseCurrency.code).map((c) => (
                   <option key={c.code} value={c.code}>{c.code} {c.symbol}</option>
                 ))}
               </select>
               <div className="flex-1 relative">
-                <span className="absolute left-3 top-2 text-xs text-muted-foreground">1 GBP =</span>
+                <span className="absolute left-3 top-2 text-xs text-muted-foreground">1 {baseCurrency.code} =</span>
                 <Input
                   type="number" min="0.0001" step="0.0001"
                   value={fxRate}
                   onChange={(e) => setFxRate(Number(e.target.value) || 1)}
                   className="pl-16 h-9 font-mono text-sm"
-                  disabled={currency === 'GBP'}
+                  disabled={currency === baseCurrency.code}
                 />
               </div>
             </div>
@@ -1113,8 +1115,8 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                 <span>Total</span>
                 <span className="font-mono">
                   {money(grandTotalForeign)}
-                  {currency !== 'GBP' && (
-                    <span className="text-muted-foreground font-normal ml-2">({formatMoney(grandTotalGbp, '£', 'PREFIX')})</span>
+                  {currency !== baseCurrency.code && (
+                    <span className="text-muted-foreground font-normal ml-2">({formatMoney(grandTotalBase, baseCurrency.symbol, baseCurrency.symbolPosition)})</span>
                   )}
                 </span>
               </div>

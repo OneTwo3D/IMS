@@ -9,6 +9,7 @@ import { requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { deriveLegacyActiveFromLifecycleStatus, deriveLifecycleStatusFromLegacyActive } from '@/lib/products/lifecycle'
 import type { Permission } from '@/lib/auth/server'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 
 export type ImportResult = {
   created: number
@@ -118,8 +119,8 @@ export async function importProductsCsv(formData: FormData): Promise<ImportResul
       widthCm: row['widthCm']?.trim() || row['widthcm']?.trim() || null,
       heightCm: row['heightCm']?.trim() || row['heightcm']?.trim() || null,
       depthCm: row['depthCm']?.trim() || row['depthcm']?.trim() || null,
-      salesPriceGbp: row['salesPriceGbp']?.trim() || row['salespricegbp']?.trim() || null,
-      salePriceGbp: row['salePriceGbp']?.trim() || row['salepricegbp']?.trim() || null,
+      salesPriceBase: row['salesPriceBase']?.trim() || row['salespricegbp']?.trim() || null,
+      salePriceBase: row['salePriceBase']?.trim() || row['salepricegbp']?.trim() || null,
       salesPriceTaxInclusive: (row['salesPriceTaxInclusive'] ?? row['salespricetaxinclusive'] ?? '').trim().toUpperCase() === 'TRUE',
       stockUnit: row['stockUnit']?.trim() || row['stockunit']?.trim() || 'pcs',
       oversellAllowed: (row['oversellAllowed'] ?? row['oversellallowed'] ?? 'TRUE').trim().toUpperCase() !== 'FALSE',
@@ -419,6 +420,7 @@ export async function importTransfersCsv(formData: FormData): Promise<ImportResu
 export async function importSalesOrdersCsv(formData: FormData): Promise<ImportResult> {
   const validated = await validateImportFile(formData, 'sales.create')
   if ('error' in validated) return { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
+  const baseCurrency = await getBaseCurrencyCode()
 
   const parsed = parseCsv(await validated.file.text())
   const { rows, dropped } = capRows(parsed)
@@ -427,7 +429,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<ImportRe
     result.errors.push(`File has more than ${MAX_IMPORT_ROWS} rows — ${dropped} row(s) skipped`)
   }
 
-  const products = await db.product.findMany({ select: { id: true, sku: true, name: true, salesPriceGbp: true } })
+  const products = await db.product.findMany({ select: { id: true, sku: true, name: true, salesPriceBase: true } })
   const skuMap = new Map(products.map((p) => [p.sku.toUpperCase(), p]))
 
   // Group rows by customerName to create one order per customer
@@ -447,8 +449,8 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<ImportRe
     const product = skuMap.get(sku.toUpperCase())
     if (!product) { result.errors.push(`Row ${lineNum}: SKU "${sku}" not found`); result.skipped++; continue }
 
-    const price = unitPrice || (product.salesPriceGbp ? Number(product.salesPriceGbp) : 0)
-    const currency = (row['currency'] ?? 'GBP').trim()
+    const price = unitPrice || (product.salesPriceBase ? Number(product.salesPriceBase) : 0)
+    const currency = (row['currency'] ?? baseCurrency).trim()
 
     const key = customerName
     if (!groups.has(key)) groups.set(key, { customerName, currency, notes: row['notes'] ?? '', lines: [] })
@@ -461,14 +463,14 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<ImportRe
       const lineData = g.lines.map((l) => {
         const total = l.qty * l.unitPrice
         subtotalForeign += total
-        return { productId: l.productId, sku: l.sku, description: l.description, qty: l.qty, unitPriceForeign: l.unitPrice, unitPriceGbp: l.unitPrice, taxForeign: 0, taxGbp: 0, totalForeign: total, totalGbp: total }
+        return { productId: l.productId, sku: l.sku, description: l.description, qty: l.qty, unitPriceForeign: l.unitPrice, unitPriceBase: l.unitPrice, taxForeign: 0, taxBase: 0, totalForeign: total, totalBase: total }
       })
       const ref = `SO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
       const so = await db.salesOrder.create({
         data: {
-          orderNumber: ref, status: 'DRAFT', currency: g.currency, fxRateToGbp: 1,
+          orderNumber: ref, status: 'DRAFT', currency: g.currency, fxRateToBase: 1,
           customerName: g.customerName, subtotalForeign, shippingForeign: 0, taxForeign: 0,
-          totalForeign: subtotalForeign, subtotalGbp: subtotalForeign, shippingGbp: 0, taxGbp: 0, totalGbp: subtotalForeign,
+          totalForeign: subtotalForeign, subtotalBase: subtotalForeign, shippingBase: 0, taxBase: 0, totalBase: subtotalForeign,
           notes: g.notes || null,
           lines: { create: lineData },
         },
@@ -499,6 +501,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<ImportRe
 export async function importPurchaseOrdersCsv(formData: FormData): Promise<ImportResult> {
   const validated = await validateImportFile(formData, 'purchasing.create')
   if ('error' in validated) return { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
+  const baseCurrency = await getBaseCurrencyCode()
 
   const parsed = parseCsv(await validated.file.text())
   const { rows, dropped } = capRows(parsed)
@@ -531,7 +534,7 @@ export async function importPurchaseOrdersCsv(formData: FormData): Promise<Impor
     const productId = skuMap.get(sku.toUpperCase())
     if (!productId) { result.errors.push(`Row ${lineNum}: SKU "${sku}" not found`); result.skipped++; continue }
 
-    const currency = (row['currency'] ?? supplier.currency ?? 'GBP').trim()
+    const currency = (row['currency'] ?? supplier.currency ?? baseCurrency).trim()
     const key = supplierName.toUpperCase()
     if (!groups.has(key)) groups.set(key, { supplierId: supplier.id, currency, notes: row['notes'] ?? '', lines: [] })
     groups.get(key)!.lines.push({ productId, qty, unitCostForeign: unitCost })
@@ -543,14 +546,14 @@ export async function importPurchaseOrdersCsv(formData: FormData): Promise<Impor
       const lineData = g.lines.map((l, i) => {
         const total = l.qty * l.unitCostForeign
         subtotalForeign += total
-        return { productId: l.productId, qty: l.qty, unitCostForeign: l.unitCostForeign, unitCostGbp: l.unitCostForeign, taxForeign: 0, taxGbp: 0, totalForeign: total, totalGbp: total, sortOrder: i }
+        return { productId: l.productId, qty: l.qty, unitCostForeign: l.unitCostForeign, unitCostBase: l.unitCostForeign, taxForeign: 0, taxBase: 0, totalForeign: total, totalBase: total, sortOrder: i }
       })
       const ref = `PO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
       await db.purchaseOrder.create({
         data: {
-          reference: ref, type: 'GOODS', supplierId: g.supplierId, currency: g.currency, fxRateToGbp: 1,
-          subtotalForeign, subtotalGbp: subtotalForeign, taxForeign: 0, taxGbp: 0,
-          totalForeign: subtotalForeign, totalGbp: subtotalForeign,
+          reference: ref, type: 'GOODS', supplierId: g.supplierId, currency: g.currency, fxRateToBase: 1,
+          subtotalForeign, subtotalBase: subtotalForeign, taxForeign: 0, taxBase: 0,
+          totalForeign: subtotalForeign, totalBase: subtotalForeign,
           notes: g.notes || null,
           lines: { create: lineData },
         },

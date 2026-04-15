@@ -129,19 +129,19 @@ async function computePreview(): Promise<DailyBatchPreview> {
       id: true,
       orderNumber: true,
       externalOrderNumber: true,
-      totalGbp: true,
-      taxGbp: true,
+      totalBase: true,
+      taxBase: true,
     },
     orderBy: { paidAt: 'asc' },
   })
 
   const a1 = {
     orderCount: a1Orders.length,
-    totalRevenue: round2(a1Orders.reduce((s, o) => s + (Number(o.totalGbp) - Number(o.taxGbp)), 0)),
+    totalRevenue: round2(a1Orders.reduce((s, o) => s + (Number(o.totalBase) - Number(o.taxBase)), 0)),
     orders: a1Orders.slice(0, 200).map((o) => ({
       id: o.id,
       displayOrderNumber: getSalesOrderReference(o),
-      amount: round2(Number(o.totalGbp)),
+      amount: round2(Number(o.totalBase)),
     })),
   }
 
@@ -209,16 +209,16 @@ async function computePreview(): Promise<DailyBatchPreview> {
         select: {
           productId: true,
           qty: true,
-          line: { select: { qty: true, totalGbp: true } },
+          line: { select: { qty: true, totalBase: true } },
         },
       },
       order: {
         select: {
           orderNumber: true,
           externalOrderNumber: true,
-          totalGbp: true,
+          totalBase: true,
           unearnedRevenueAmount: true,
-          lines: { select: { totalGbp: true } },
+          lines: { select: { totalBase: true } },
         },
       },
     },
@@ -239,7 +239,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
 
   for (const shipment of bShipments) {
     const orderLineTotal = shipment.order.lines.reduce(
-      (s, l) => s + Number(l.totalGbp),
+      (s, l) => s + Number(l.totalBase),
       0,
     )
     const shipmentLineValue = shipment.lines.reduce(
@@ -247,12 +247,12 @@ async function computePreview(): Promise<DailyBatchPreview> {
         const lineQty = Number(l.line.qty)
         const shippedQty = Number(l.qty)
         if (lineQty <= 0 || shippedQty <= 0) return s
-        return s + (Number(l.line.totalGbp) * shippedQty) / lineQty
+        return s + (Number(l.line.totalBase) * shippedQty) / lineQty
       },
       0,
     )
     const deferredBase = Number(
-      shipment.order.unearnedRevenueAmount ?? shipment.order.totalGbp,
+      shipment.order.unearnedRevenueAmount ?? shipment.order.totalBase,
     )
     const revenueProportion = orderLineTotal > 0
       ? round2((shipmentLineValue / orderLineTotal) * deferredBase)
@@ -303,7 +303,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
  * Sum FIFO cost for a set of allocation-like rows. Reads cost layers but
  * never mutates them — this is a preview helper only.
  */
-type PreviewLayerSnapshot = Map<string, Array<{ remainingQty: number; unitCostGbp: number }>>
+type PreviewLayerSnapshot = Map<string, Array<{ remainingQty: number; unitCostBase: number }>>
 
 async function buildPreviewLayerSnapshot(
   rows: Array<{ productId: string; warehouseId: string }>,
@@ -320,13 +320,13 @@ async function buildPreviewLayerSnapshot(
         remainingQty: { gt: 0 },
       },
       orderBy: { receivedAt: 'asc' },
-      select: { remainingQty: true, unitCostGbp: true },
+      select: { remainingQty: true, unitCostBase: true },
     })
     snapshot.set(
       key,
       layers.map((layer) => ({
         remainingQty: Number(layer.remainingQty),
-        unitCostGbp: Number(layer.unitCostGbp),
+        unitCostBase: Number(layer.unitCostBase),
       })),
     )
   }
@@ -346,7 +346,7 @@ function computeFifoCostFromSnapshot(
     for (const layer of layers) {
       if (remaining <= 0) break
       const take = Math.min(remaining, layer.remainingQty)
-      total += take * layer.unitCostGbp
+      total += take * layer.unitCostBase
       layer.remainingQty -= take
       remaining -= take
     }

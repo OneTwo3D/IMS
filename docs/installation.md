@@ -45,6 +45,8 @@ The installer asks for the following values during setup. Press Enter to accept 
 - **Domain name** — the hostname for your installation (e.g. `ims.yourdomain.com`)
 - **Internal port** — the port the app listens on (default: `3000`)
 
+After installation, sign in and set the organisation base currency in **Settings > Company** before entering live transactional data. The base currency is intended to be set once for a new system. Changing it later requires a database reset.
+
 ### Database
 - **Install PostgreSQL** — install on this server, or connect to an external database
 - **Database name** (default: `one_two_inventory`)
@@ -183,7 +185,7 @@ Key variables in the `.env` file:
 | `WC_WEBHOOK_SECRET` | Secret for verifying WooCommerce webhooks |
 | `XERO_CLIENT_ID` | Xero OAuth client ID |
 | `XERO_CLIENT_SECRET` | Xero OAuth client secret |
-| `FX_BASE_CURRENCY` | Base currency for exchange rates (default: `GBP`) |
+| `FX_BASE_CURRENCY` | Installer/default base currency seed for first-run setup. In normal use, the live system base currency is set once in **Settings > Company**. |
 | `PDF_TEMP_DIR` | Temporary directory for PDF generation |
 | `BACKUP_DIR` | Local backup storage directory |
 | `UPLOAD_MAX_SIZE_MB` | Maximum upload file size in MB (default: `10`) |
@@ -192,6 +194,20 @@ Key variables in the `.env` file:
 | `SMTP_PORT` | SMTP server port |
 | `SMTP_USER` | SMTP authentication username |
 | `SMTP_PASS` | SMTP authentication password |
+
+## Base Currency
+
+One Two Inventory stores foreign-currency transaction values alongside converted values in the organisation's base currency.
+
+- Set the base currency once in **Settings > Company** during initial setup
+- After transactional data exists, changing the base currency is blocked in the UI
+- To use a different base currency later, reset the database and configure the system again from a clean state
+- Base-currency amounts throughout the UI use the configured currency's symbol and symbol position, so currencies that render as prefixes or suffixes display correctly
+
+If you use external connectors:
+
+- **WooCommerce** may accept orders in many transaction currencies, but the store's configured currency must match the IMS base currency before the shopping connector can be enabled
+- **Xero** must use the same organisation base currency as the IMS before the accounting connector can be authorised or enabled
 
 
 ## Reverse Proxy

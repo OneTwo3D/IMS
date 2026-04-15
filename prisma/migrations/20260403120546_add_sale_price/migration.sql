@@ -1,2 +1,2 @@
 -- AlterTable
-ALTER TABLE "products" ADD COLUMN     "salePriceGbp" DECIMAL(12,4);
+ALTER TABLE "products" ADD COLUMN     "salePriceBase" DECIMAL(12,4);

@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode, getFallbackCurrencyMeta } from '@/lib/base-currency'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -15,6 +16,7 @@ export type CurrencyRow = {
   symbol: string
   symbolPosition: 'PREFIX' | 'POSTFIX'
   active: boolean
+  isBaseCurrency: boolean
   latestRate: number | null // 1 GBP = X of this currency
   rateDate: string | null
 }
@@ -25,32 +27,50 @@ export type CurrencyRow = {
 
 export async function getCurrencies(activeOnly = true): Promise<CurrencyRow[]> {
   await requireAuth()
+  const baseCurrency = await getBaseCurrencyCode()
   const rows = await db.currency.findMany({
     where: activeOnly ? { active: true } : undefined,
     orderBy: { code: 'asc' },
     include: {
       fxRates: {
+        where: { fromCurrency: baseCurrency },
         orderBy: { fetchedAt: 'desc' },
         take: 1,
       },
     },
   })
-  return rows.map((c) => ({
+  const mapped: CurrencyRow[] = rows.map((c) => ({
     code: c.code,
     name: c.name,
     symbol: c.symbol,
     symbolPosition: c.symbolPosition,
     active: c.active,
+    isBaseCurrency: c.code === baseCurrency,
     latestRate: c.fxRates[0] ? Number(c.fxRates[0].rate) : null,
     rateDate: c.fxRates[0]?.fetchedAt?.toISOString() ?? null,
   }))
+  if (!mapped.some((c) => c.code === baseCurrency)) {
+    const fallback = getFallbackCurrencyMeta(baseCurrency)
+    mapped.unshift({
+      code: baseCurrency,
+      name: fallback.name,
+      symbol: fallback.symbol,
+      symbolPosition: fallback.symbolPosition,
+      active: true,
+      isBaseCurrency: true,
+      latestRate: 1,
+      rateDate: null,
+    })
+  }
+  return mapped
 }
 
-/** Returns map: { EUR: 1.17, USD: 1.27, ... } */
+/** Returns map: { BASE: 1, EUR: 1.17, USD: 1.27, ... } */
 export async function getCurrencyRateMap(): Promise<Record<string, number>> {
   await requireAuth()
+  const baseCurrency = await getBaseCurrencyCode()
   const currencies = await getCurrencies(true)
-  const map: Record<string, number> = { GBP: 1 }
+  const map: Record<string, number> = { [baseCurrency]: 1 }
   for (const c of currencies) {
     if (c.latestRate != null) map[c.code] = c.latestRate
   }
@@ -102,7 +122,8 @@ export async function createCurrency(input: {
 export async function toggleCurrency(code: string, active: boolean): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
   try {
-    if (code === 'GBP') return { success: false, error: 'Cannot deactivate base currency' }
+    const baseCurrency = await getBaseCurrencyCode()
+    if (code === baseCurrency) return { success: false, error: 'Cannot deactivate base currency' }
     await db.currency.update({ where: { code }, data: { active } })
     await logActivity({ entityType: 'CURRENCY', entityId: code, tag: 'settings', action: 'updated', description: `Toggled currency ${code} ${active ? 'on' : 'off'}` })
     revalidatePath('/settings')
@@ -120,11 +141,12 @@ export async function toggleCurrency(code: string, active: boolean): Promise<{ s
 /** Fetch FX rate for a single currency from exchangerate.host (free, no key) */
 async function fetchSingleFxRate(code: string): Promise<number | null> {
   try {
+    const baseCurrency = await getBaseCurrencyCode()
     // Use frankfurter.dev (free, no API key required, ECB data)
     const safeCode = encodeURIComponent(code)
     let rate: number | null = null
     for (let attempt = 1; attempt <= 3; attempt++) {
-      const res = await fetch(`https://api.frankfurter.dev/v1/latest?base=GBP&symbols=${safeCode}`, {
+      const res = await fetch(`https://api.frankfurter.dev/v1/latest?base=${encodeURIComponent(baseCurrency)}&symbols=${safeCode}`, {
         signal: AbortSignal.timeout(10000),
       })
       if (res.ok) {
@@ -141,7 +163,7 @@ async function fetchSingleFxRate(code: string): Promise<number | null> {
 
     await db.fxRate.create({
       data: {
-        fromCurrency: 'GBP',
+        fromCurrency: baseCurrency,
         toCurrency: code,
         rate,
       },
@@ -155,8 +177,9 @@ async function fetchSingleFxRate(code: string): Promise<number | null> {
 /** Core FX rate fetching logic (no auth — used by cron and the server action) */
 export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; updated: string[]; failed: string[]; error?: string }> {
   try {
+    const baseCurrency = await getBaseCurrencyCode()
     const currencies = await db.currency.findMany({
-      where: { active: true, code: { not: 'GBP' } },
+      where: { active: true, code: { not: baseCurrency } },
       select: { code: true },
     })
 
@@ -167,7 +190,7 @@ export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; upd
 
     let res: Response | null = null
     for (let attempt = 1; attempt <= 3; attempt++) {
-      res = await fetch(`https://api.frankfurter.dev/v1/latest?base=GBP&symbols=${symbols}`, {
+      res = await fetch(`https://api.frankfurter.dev/v1/latest?base=${encodeURIComponent(baseCurrency)}&symbols=${symbols}`, {
         signal: AbortSignal.timeout(15000),
       }).catch(() => null)
       if (res?.ok) break
@@ -195,7 +218,7 @@ export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; upd
       const rate = rates[code]
       if (typeof rate === 'number' && rate > 0) {
         await db.fxRate.create({
-          data: { fromCurrency: 'GBP', toCurrency: code, rate },
+          data: { fromCurrency: baseCurrency, toCurrency: code, rate },
         })
         updated.push(code)
       } else {

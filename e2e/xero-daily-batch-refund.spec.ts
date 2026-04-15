@@ -21,7 +21,7 @@ type InspectResult = {
   allocationSnapshot: Array<Record<string, unknown>>
   shipmentSnapshot: Array<Record<string, unknown>>
   refundSnapshot: Array<Record<string, unknown>>
-  replacementLayers: Array<{ id: string; receivedQty: number; remainingQty: number; unitCostGbp: number }>
+  replacementLayers: Array<{ id: string; receivedQty: number; remainingQty: number; unitCostBase: number }>
   orderLogs: Array<{ type: string; payload: { lines?: Array<{ description?: string; debit?: number }> } }>
   refundLogId: string | null
   costLayerId: string
@@ -98,7 +98,7 @@ test.describe('xero daily batch refund verification', () => {
       expect.objectContaining({
         costLayerId: seeded.costLayerId,
         qty: 2,
-        unitCostGbp: 4,
+        unitCostBase: 4,
       }),
     ])
 
@@ -106,7 +106,7 @@ test.describe('xero daily batch refund verification', () => {
       expect.objectContaining({
         costLayerId: seeded.costLayerId,
         qty: 1,
-        unitCostGbp: 4,
+        unitCostBase: 4,
         orderAllocationId: seeded.allocationId,
         shipmentLineId: seeded.shipmentLineId,
         source: 'shipment',
@@ -118,14 +118,14 @@ test.describe('xero daily batch refund verification', () => {
         expect.objectContaining({
           costLayerId: seeded.costLayerId,
           qty: 1,
-          unitCostGbp: 4,
+          unitCostBase: 4,
           shipmentLineId: seeded.shipmentLineId,
           source: 'shipment',
         }),
         expect.objectContaining({
           costLayerId: seeded.costLayerId,
           qty: 1,
-          unitCostGbp: 4,
+          unitCostBase: 4,
           orderAllocationId: seeded.allocationId,
           source: 'allocation',
         }),
@@ -174,8 +174,8 @@ test.describe('xero daily batch refund verification', () => {
 
     expect(inspected.replacementLayers).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ receivedQty: 1, remainingQty: 1, unitCostGbp: 4 }),
-        expect.objectContaining({ receivedQty: 1, remainingQty: 1, unitCostGbp: 4 }),
+        expect.objectContaining({ receivedQty: 1, remainingQty: 1, unitCostBase: 4 }),
+        expect.objectContaining({ receivedQty: 1, remainingQty: 1, unitCostBase: 4 }),
       ]),
     )
     expect(inspected.replacementLayers).toHaveLength(2)

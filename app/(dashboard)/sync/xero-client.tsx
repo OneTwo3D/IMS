@@ -952,7 +952,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
 // Daily Batch panel — preview & history of the accounting sub-ledger daily post
 // ---------------------------------------------------------------------------
 
-function formatGbp(n: number): string {
+function formatBase(n: number): string {
   return n.toLocaleString('en-GB', { style: 'currency', currency: 'GBP' })
 }
 
@@ -1116,7 +1116,7 @@ function DailyBatchPanel({
                     </div>
                     <div className="flex items-center gap-3">
                       <HistoryStatusBadge entries={entries} />
-                      <span className="text-sm font-mono">{formatGbp(dayTotal)}</span>
+                      <span className="text-sm font-mono">{formatBase(dayTotal)}</span>
                     </div>
                   </button>
                   {expanded && (
@@ -1150,7 +1150,7 @@ function PreviewGroupCard({
     <div className="rounded-md border p-4">
       <p className="text-xs font-semibold">{title}</p>
       <p className="text-[11px] text-muted-foreground font-mono mt-0.5">{subtitle}</p>
-      <div className="mt-3 text-2xl font-semibold">{formatGbp(debit)}</div>
+      <div className="mt-3 text-2xl font-semibold">{formatBase(debit)}</div>
       <p className="text-xs text-muted-foreground mt-0.5">
         {count} {unit}{count === 1 ? '' : 's'}
       </p>
@@ -1159,7 +1159,7 @@ function PreviewGroupCard({
           {splits.map((s) => (
             <div key={s.label} className="flex items-center justify-between text-xs">
               <span className="text-muted-foreground">{s.label}</span>
-              <span className="font-mono">{formatGbp(s.amount)}</span>
+              <span className="font-mono">{formatBase(s.amount)}</span>
             </div>
           ))}
         </div>
@@ -1200,7 +1200,7 @@ function PreviewOrderList({
               {rows.map((r) => (
                 <TableRow key={r.id}>
                   <TableCell className="font-mono text-xs">{r.label}</TableCell>
-                  <TableCell className="text-right font-mono text-xs">{formatGbp(r.amount)}</TableCell>
+                  <TableCell className="text-right font-mono text-xs">{formatBase(r.amount)}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
@@ -1239,8 +1239,8 @@ function PreviewShipmentList({ shipments }: { shipments: AccountingBatchPreview[
               {shipments.map((s) => (
                 <TableRow key={s.id}>
                   <TableCell className="font-mono text-xs">{s.displayOrderNumber}</TableCell>
-                  <TableCell className="text-right font-mono text-xs">{formatGbp(s.revenue)}</TableCell>
-                  <TableCell className="text-right font-mono text-xs">{formatGbp(s.cogs)}</TableCell>
+                  <TableCell className="text-right font-mono text-xs">{formatBase(s.revenue)}</TableCell>
+                  <TableCell className="text-right font-mono text-xs">{formatBase(s.cogs)}</TableCell>
                 </TableRow>
               ))}
             </TableBody>
@@ -1299,7 +1299,7 @@ function HistoryEntryRow({
         </div>
         <div className="text-right shrink-0 flex items-start gap-2">
           <div>
-            <div className="text-sm font-mono">{formatGbp(entry.totalDebit)}</div>
+            <div className="text-sm font-mono">{formatBase(entry.totalDebit)}</div>
             <div className="text-[10px] mt-0.5">
               {STATUS_BADGE[entry.status]?.label ?? entry.status}
             </div>
@@ -1344,8 +1344,8 @@ function HistoryEntryRow({
               <TableRow key={idx}>
                 <TableCell className="font-mono text-[11px] py-1.5">{l.accountCode || '—'}</TableCell>
                 <TableCell className="text-[11px] py-1.5">{l.description}</TableCell>
-                <TableCell className="text-right font-mono text-[11px] py-1.5">{l.debit > 0 ? formatGbp(l.debit) : ''}</TableCell>
-                <TableCell className="text-right font-mono text-[11px] py-1.5">{l.credit > 0 ? formatGbp(l.credit) : ''}</TableCell>
+                <TableCell className="text-right font-mono text-[11px] py-1.5">{l.debit > 0 ? formatBase(l.debit) : ''}</TableCell>
+                <TableCell className="text-right font-mono text-[11px] py-1.5">{l.credit > 0 ? formatBase(l.credit) : ''}</TableCell>
               </TableRow>
             ))}
           </TableBody>

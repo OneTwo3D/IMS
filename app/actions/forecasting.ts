@@ -189,12 +189,12 @@ export async function generateForecasts(): Promise<ProductForecast[]> {
   // 5. Total revenue by product for ABC classification
   const salesLines = await db.salesOrderLine.findMany({
     where: { order: { status: { in: ['SHIPPED', 'COMPLETED'] } } },
-    select: { productId: true, totalGbp: true },
+    select: { productId: true, totalBase: true },
   })
   const revenueByProduct = new Map<string, number>()
   for (const sl of salesLines) {
     if (!sl.productId) continue
-    revenueByProduct.set(sl.productId, (revenueByProduct.get(sl.productId) ?? 0) + Number(sl.totalGbp))
+    revenueByProduct.set(sl.productId, (revenueByProduct.get(sl.productId) ?? 0) + Number(sl.totalBase))
   }
   const totalRevenue = Array.from(revenueByProduct.values()).reduce((s, v) => s + v, 0)
 
@@ -387,10 +387,10 @@ export async function createReorderPOs(
           productId: item.productId,
           qty: item.recommendedOrderQty,
           unitCostForeign: unitCost,
-          unitCostGbp: unitCost, // approximate — will be recalculated with FX
-          taxForeign: 0, taxGbp: 0,
+          unitCostBase: unitCost, // approximate — will be recalculated with FX
+          taxForeign: 0, taxBase: 0,
           totalForeign: total,
-          totalGbp: total,
+          totalBase: total,
           sortOrder: i,
         }
       })
@@ -401,12 +401,12 @@ export async function createReorderPOs(
           type: 'GOODS',
           supplierId,
           currency,
-          fxRateToGbp: 1, // user can update FX rate on the PO
+          fxRateToBase: 1, // user can update FX rate on the PO
           subtotalForeign: subtotal,
-          subtotalGbp: subtotal,
-          taxForeign: 0, taxGbp: 0,
+          subtotalBase: subtotal,
+          taxForeign: 0, taxBase: 0,
           totalForeign: subtotal,
-          totalGbp: subtotal,
+          totalBase: subtotal,
           notes: 'Auto-generated from reorder forecast',
           lines: { create: lineData },
         },

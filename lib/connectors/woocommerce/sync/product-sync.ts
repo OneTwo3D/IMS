@@ -135,8 +135,8 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
 
     // --- Shared field extraction ---
     const description = stripHtml(wcProduct.short_description || wcProduct.description || '')
-    const salesPriceGbp = parseNum(wcProduct.regular_price)
-    const salePriceGbp = parseNum(wcProduct.sale_price)
+    const salesPriceBase = parseNum(wcProduct.regular_price)
+    const salePriceBase = parseNum(wcProduct.sale_price)
     const weight = parseNum(wcProduct.weight)
     const depthCm = parseNum(wcProduct.dimensions?.length)   // WC "length" = depth
     const widthCm = parseNum(wcProduct.dimensions?.width)
@@ -171,11 +171,11 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
 
       // Prices — only set on non-VARIABLE products (VARIABLE shows min-max from variants)
       if (productType !== 'VARIABLE') {
-        if (salesPriceGbp !== null) updateData.salesPriceGbp = salesPriceGbp
-        if (salePriceGbp !== null) updateData.salePriceGbp = salePriceGbp
+        if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
+        if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
       } else {
-        updateData.salesPriceGbp = null
-        updateData.salePriceGbp = null
+        updateData.salesPriceBase = null
+        updateData.salePriceBase = null
       }
 
       // GTIN — only set if IMS field is currently null/empty
@@ -199,8 +199,8 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
           depthCm,
           widthCm,
           heightCm,
-          salesPriceGbp: productType === 'VARIABLE' ? null : salesPriceGbp,
-          salePriceGbp: productType === 'VARIABLE' ? null : salePriceGbp,
+          salesPriceBase: productType === 'VARIABLE' ? null : salesPriceBase,
+          salePriceBase: productType === 'VARIABLE' ? null : salePriceBase,
           active,
           lifecycleStatus,
           type: productType,
@@ -300,8 +300,8 @@ async function syncVariations(
       const variantName = attrSuffix ? `${parentName} — ${attrSuffix}` : parentName
 
       const description = stripHtml(v.description || '')
-      const salesPriceGbp = parseNum(v.regular_price)
-      const salePriceGbp = parseNum(v.sale_price)
+      const salesPriceBase = parseNum(v.regular_price)
+      const salePriceBase = parseNum(v.sale_price)
       const weight = parseNum(v.weight)
       const depthCm = parseNum(v.dimensions?.length)
       const widthCm = parseNum(v.dimensions?.width)
@@ -327,8 +327,8 @@ async function syncVariations(
           type: 'VARIANT',
           parentId: imsParentId,
         }
-        if (salesPriceGbp !== null) updateData.salesPriceGbp = salesPriceGbp
-        if (salePriceGbp !== null) updateData.salePriceGbp = salePriceGbp
+        if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
+        if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
         if (gtin && !existing.barcode) updateData.barcode = gtin
 
         await db.product.update({ where: { id: existing.id }, data: updateData })
@@ -344,8 +344,8 @@ async function syncVariations(
             depthCm,
             widthCm,
             heightCm,
-            salesPriceGbp,
-            salePriceGbp,
+            salesPriceBase,
+            salePriceBase,
             active: deriveLegacyActiveFromLifecycleStatus(deriveLifecycleStatusFromWooStatus(v.status)),
             lifecycleStatus: deriveLifecycleStatusFromWooStatus(v.status),
             type: 'VARIANT',
@@ -376,8 +376,8 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
         sku: true,
         name: true,
         description: true,
-        salesPriceGbp: true,
-        salePriceGbp: true,
+        salesPriceBase: true,
+        salePriceBase: true,
         barcode: true,
         type: true,
         externalProductId: true,
@@ -391,8 +391,8 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
     const updateData: Record<string, unknown> = { name: product.name }
     updateData.status = deriveWooStatusFromLifecycleStatus(product.lifecycleStatus)
     if (product.description) updateData.description = product.description
-    if (product.salesPriceGbp) updateData.regular_price = String(Number(product.salesPriceGbp))
-    if (product.salePriceGbp) updateData.sale_price = String(Number(product.salePriceGbp))
+    if (product.salesPriceBase) updateData.regular_price = String(Number(product.salesPriceBase))
+    if (product.salePriceBase) updateData.sale_price = String(Number(product.salePriceBase))
 
     // Only send global_unique_id if barcode is purely numeric (WC only accepts numbers)
     if (product.barcode && /^\d+$/.test(product.barcode)) {

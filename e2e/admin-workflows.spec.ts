@@ -14,7 +14,7 @@ test.describe('admin workflows', () => {
     const suffix = uniqueSuffix()
     const sku = `000-E2E-CSV-${suffix}`
     const csv = [
-      'sku,name,type,salesPriceGbp,stockUnit',
+      'sku,name,type,salesPriceBase,stockUnit',
       `${sku},CSV Imported Product,SIMPLE,9.95,pcs`,
     ].join('\n')
 
@@ -99,7 +99,7 @@ test.describe('admin workflows', () => {
     const compB = `000-E2E-COMP-B-${suffix}`
     const bomSku = `000-E2E-BOM-${suffix}`
     const csv = [
-      'sku,name,type,salesPriceGbp,stockUnit,components',
+      'sku,name,type,salesPriceBase,stockUnit,components',
       `${compA},E2E Component A,SIMPLE,2.00,pcs,`,
       `${compB},E2E Component B,SIMPLE,3.00,pcs,`,
       `${bomSku},E2E BOM ${suffix},BOM,10.00,pcs,${compA}:2;${compB}:1`,

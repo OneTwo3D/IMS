@@ -63,14 +63,14 @@ export type IncomingPO = {
   id: string
   reference: string
   supplierName: string
-  totalGbp: number
+  totalBase: number
   status: string
   expectedDelivery: string | null
   createdAt: string
   lineCount: number
 }
 
-export type RecentOrder = { id: string; orderNumber: string; customerName: string; totalGbp: number; status: string; createdAt: string }
+export type RecentOrder = { id: string; orderNumber: string; customerName: string; totalBase: number; status: string; createdAt: string }
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -174,9 +174,9 @@ export async function getDashboardData(
       where: { status: { in: COMPLETED_STATUSES }, createdAt: { gte: fetchFrom } },
       select: {
         id: true, externalOrderNumber: true, customerName: true, status: true, createdAt: true,
-        totalGbp: true, subtotalGbp: true, shippingGbp: true, discountAmount: true, fxRateToGbp: true,
-        lines: { select: { cogsGbp: true, qty: true, totalGbp: true, discountAmount: true, productId: true, sku: true, description: true } },
-        refunds: { select: { totalGbp: true } },
+        totalBase: true, subtotalBase: true, shippingBase: true, discountAmount: true, fxRateToBase: true,
+        lines: { select: { cogsBase: true, qty: true, totalBase: true, discountAmount: true, productId: true, sku: true, description: true } },
+        refunds: { select: { totalBase: true } },
       },
       orderBy: { createdAt: 'desc' },
     }),
@@ -185,25 +185,25 @@ export async function getDashboardData(
     }),
     db.purchaseOrder.findMany({
       where: { type: 'GOODS', status: { in: ['PO_SENT', 'PARTIALLY_RECEIVED', 'RFQ_SENT'] } },
-      select: { totalGbp: true },
+      select: { totalBase: true },
     }),
     db.salesOrder.findMany({
       where: { status: { in: ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'] } },
-      select: { totalGbp: true },
+      select: { totalBase: true },
     }),
     db.salesOrderRefund.findMany({
       where: { refundedAt: { gte: periodFrom, lte: periodTo } },
-      select: { totalGbp: true },
+      select: { totalBase: true },
     }),
     db.costLayer.findMany({
       where: { remainingQty: { gt: 0 } },
-      select: { remainingQty: true, unitCostGbp: true },
+      select: { remainingQty: true, unitCostBase: true },
     }),
     // Next 5 incoming purchase orders
     db.purchaseOrder.findMany({
       where: { type: 'GOODS', status: { in: ['PO_SENT', 'PARTIALLY_RECEIVED'] } },
       select: {
-        id: true, reference: true, status: true, totalGbp: true, expectedDelivery: true, createdAt: true,
+        id: true, reference: true, status: true, totalBase: true, expectedDelivery: true, createdAt: true,
         supplier: { select: { name: true } },
         lines: { select: { id: true } },
       },
@@ -214,11 +214,11 @@ export async function getDashboardData(
     db.salesOrder.findMany({
       orderBy: { createdAt: 'desc' },
       take: 10,
-      select: { id: true, orderNumber: true, externalOrderNumber: true, customerName: true, totalGbp: true, status: true, createdAt: true },
+      select: { id: true, orderNumber: true, externalOrderNumber: true, customerName: true, totalBase: true, status: true, createdAt: true },
     }),
   ])
 
-  const inventoryValue = costLayers.reduce((s, cl) => s + Number(cl.remainingQty) * Number(cl.unitCostGbp), 0)
+  const inventoryValue = costLayers.reduce((s, cl) => s + Number(cl.remainingQty) * Number(cl.unitCostBase), 0)
 
   // Period helpers
   function ordersInRange(from: Date, to: Date) { return orders.filter((o) => o.createdAt >= from && o.createdAt <= to) }
@@ -227,13 +227,13 @@ export async function getDashboardData(
   function aggregate(list: typeof orders): OrderAgg {
     let gross = 0, discounts = 0, refunds = 0, cogs = 0, shipping = 0
     for (const o of list) {
-      const lineTotal = o.lines.reduce((s, l) => s + Number(l.totalGbp), 0)
-      const lineDisc = o.lines.reduce((s, l) => s + Number(l.discountAmount ?? 0), 0) / Number(o.fxRateToGbp || 1)
+      const lineTotal = o.lines.reduce((s, l) => s + Number(l.totalBase), 0)
+      const lineDisc = o.lines.reduce((s, l) => s + Number(l.discountAmount ?? 0), 0) / Number(o.fxRateToBase || 1)
       gross += lineTotal + lineDisc
       discounts += lineDisc
-      refunds += o.refunds.reduce((s, r) => s + Number(r.totalGbp), 0)
-      cogs += o.lines.reduce((s, l) => s + Number(l.cogsGbp ?? 0), 0)
-      shipping += Number(o.shippingGbp ?? 0)
+      refunds += o.refunds.reduce((s, r) => s + Number(r.totalBase), 0)
+      cogs += o.lines.reduce((s, l) => s + Number(l.cogsBase ?? 0), 0)
+      shipping += Number(o.shippingBase ?? 0)
     }
     const net = gross - discounts - refunds
     return { gross, discounts, refunds, net, cogs, shipping }
@@ -265,9 +265,9 @@ export async function getDashboardData(
     activeProducts: products.filter((p) => p.lifecycleStatus === 'ACTIVE').length,
     inventoryValue: r2(inventoryValue),
     openPurchaseOrders: openPOs.length,
-    openPOValue: r2(openPOs.reduce((s, po) => s + Number(po.totalGbp), 0)),
+    openPOValue: r2(openPOs.reduce((s, po) => s + Number(po.totalBase), 0)),
     pendingSalesOrders: pendingSales.length,
-    pendingSalesValue: r2(pendingSales.reduce((s, so) => s + Number(so.totalGbp), 0)),
+    pendingSalesValue: r2(pendingSales.reduce((s, so) => s + Number(so.totalBase), 0)),
     avgOrderValue: currentOrders.length > 0 ? r2(cur.net / currentOrders.length) : 0,
     lowStockCount: 0,
     outOfStockCount: 0,
@@ -344,9 +344,9 @@ export async function getDashboardData(
         productMap.set(l.productId, { productId: l.productId, sku: l.sku ?? '', name: l.description, netRevenue: 0, qtySold: 0, marginPct: 0, totalCogs: 0 })
       }
       const row = productMap.get(l.productId)!
-      row.netRevenue += Number(l.totalGbp)
+      row.netRevenue += Number(l.totalBase)
       row.qtySold += Number(l.qty)
-      row.totalCogs += Number(l.cogsGbp ?? 0)
+      row.totalCogs += Number(l.cogsBase ?? 0)
     }
   }
   const topProducts = Array.from(productMap.values())
@@ -361,7 +361,7 @@ export async function getDashboardData(
     id: po.id,
     reference: po.reference,
     supplierName: po.supplier.name,
-    totalGbp: Number(po.totalGbp),
+    totalBase: Number(po.totalBase),
     status: po.status,
     expectedDelivery: po.expectedDelivery?.toISOString() ?? null,
     createdAt: po.createdAt.toISOString(),
@@ -375,7 +375,7 @@ export async function getDashboardData(
     id: o.id,
     orderNumber: getSalesOrderReference(o),
     customerName: o.customerName ?? '—',
-    totalGbp: Number(o.totalGbp),
+    totalBase: Number(o.totalBase),
     status: o.status,
     createdAt: o.createdAt.toISOString(),
   }))

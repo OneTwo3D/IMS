@@ -19,9 +19,9 @@ export async function syncWcRefund(
       select: {
         id: true,
         externalOrderNumber: true,
-        fxRateToGbp: true,
-        totalGbp: true,
-        lines: { select: { id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalGbp: true } },
+        fxRateToBase: true,
+        totalBase: true,
+        lines: { select: { id: true, productId: true, externalLineItemId: true, description: true, qty: true, totalBase: true } },
       },
     })
     if (!so) return { success: false, error: `IMS order not found for WC order ${externalOrderId}` }
@@ -30,7 +30,7 @@ export async function syncWcRefund(
     const existing = await db.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id } })
     if (existing) return { success: true } // already synced
 
-    const fxRate = Number(so.fxRateToGbp) || 1
+    const fxRate = Number(so.fxRateToBase) || 1
     const refundAmountForeign = Math.abs(parseFloat(wcRefund.amount) || 0)
 
     // Determine if restock is needed
@@ -38,7 +38,7 @@ export async function syncWcRefund(
     const hasQtyRefund = wcRefund.line_items.some((l) => Math.abs(l.quantity) > 0)
 
     // Map refund lines
-    const refundLines: { productId: string | null; description: string; qty: number; totalGbp: number }[] = []
+    const refundLines: { productId: string | null; description: string; qty: number; totalBase: number }[] = []
 
     if (wcRefund.line_items.length > 0 && hasQtyRefund) {
       // Line-item refund with quantities
@@ -55,7 +55,7 @@ export async function syncWcRefund(
           productId: imsLine?.productId ?? null,
           description: rl.name || imsLine?.description || 'Refund item',
           qty,
-          totalGbp: refundGbp,
+          totalBase: refundGbp,
         })
       }
     } else {
@@ -65,7 +65,7 @@ export async function syncWcRefund(
         productId: null,
         description: wcRefund.reason || 'WooCommerce refund',
         qty: 0,
-        totalGbp: Math.round((refundAmountForeign / fxRate) * 10000) / 10000,
+        totalBase: Math.round((refundAmountForeign / fxRate) * 10000) / 10000,
       })
     }
 
@@ -83,7 +83,7 @@ export async function syncWcRefund(
     const { createRefund } = await import('@/app/actions/sales')
     const result = await createRefund(
       so.id,
-      refundLines.filter((l) => l.qty > 0 || l.totalGbp > 0),
+      refundLines.filter((l) => l.qty > 0 || l.totalBase > 0),
       wcRefund.reason || 'WooCommerce refund',
       returnWarehouseId,
       { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id },

@@ -90,10 +90,10 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 
 **FIFO COGS** — Each goods receipt (purchase receive or opening stock) creates a `CostLayer` with a unit cost and remaining quantity. When stock is consumed (sale dispatch, adjustment, etc.), cost layers are consumed oldest-first per product per warehouse, creating `CogsEntry` records.
 
-**Multi-currency** — Every monetary record stores both foreign-currency and GBP amounts:
+**Multi-currency** — Every monetary record stores both foreign-currency and base-currency amounts:
 - `*Foreign` fields: amount in the transaction currency
-- `*Gbp` fields: GBP equivalent at the time of transaction
-- `fxRateToGbp`: the exchange rate used
+- `*Base` fields: value in the organisation base currency at the time of transaction
+- `fxRateToBase`: the exchange rate used
 
 **Landed costs** — A freight PO (`type = FREIGHT`) is linked to a goods PO via `LandedCostLink`. When the goods PO is received, landed costs are distributed across cost layers. Distribution methods: by value, by weight, by quantity, or equal split.
 

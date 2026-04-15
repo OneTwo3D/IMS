@@ -11,6 +11,8 @@ One Two Inventory integrates with Xero to keep your accounting records in sync. 
 5. Map each IMS transaction type to the correct Xero account (see Account Mapping below)
 6. Enable **Xero Sync** and save settings
 
+Before connection or sync can be enabled, the Xero organisation base currency must match the IMS base currency configured in **Settings > Company**.
+
 ## Account Mapping
 
 | IMS Account | Xero Account Type | Purpose |
@@ -258,10 +260,10 @@ When an order or purchase invoice has been synced to Xero, a **View in Xero** li
 
 The IMS maps payment methods to Xero bank accounts using a composite key of `{method}:{currency}`. This allows different bank accounts for different payment processors and currencies:
 
-- `stripe:GBP` → Stripe GBP clearing account
+- `stripe:BASE` → Stripe clearing account in the IMS/Xero base currency
 - `stripe:EUR` → Stripe EUR clearing account
-- `paypal:GBP` → PayPal GBP account
-- `bacs:GBP` → Business bank account
+- `paypal:BASE` → PayPal account in the IMS/Xero base currency
+- `bank-transfer:BASE` → Primary bank account in the IMS/Xero base currency
 
 Configure this mapping in **Integrations → Xero → Payment Account Mapping**.
 

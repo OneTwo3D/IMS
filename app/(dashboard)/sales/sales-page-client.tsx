@@ -12,6 +12,7 @@ import type { StockLevelEntry } from '@/app/actions/stock'
 import type { UserOption } from '@/app/actions/settings'
 import { CsvBar } from '@/components/ui/csv-bar'
 import { importSalesOrdersCsv } from '@/app/actions/import'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { SoListClient } from './so-list-client'
 import { SoFormDialog } from './so-form'
 
@@ -32,9 +33,10 @@ type Props = {
 }
 
 export function SalesPageClient({ initialOrders, products, warehouses, currencies, taxRates, customers, stockLevels, avgCogs, users, currentUserName, companyHomeCountry }: Props) {
+  const baseCurrency = useBaseCurrency()
   const [showCreate, setShowCreate] = useState(false)
 
-  const currencySymbols: Record<string, string> = { GBP: '£' }
+  const currencySymbols: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
   for (const c of currencies) currencySymbols[c.code] = c.symbol
 
   return (

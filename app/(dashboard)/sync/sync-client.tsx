@@ -362,9 +362,18 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   function handleSave() {
     setSaved(false)
     startTransition(async () => {
-      await saveShoppingConnectorCredentials(wcUrl.trim(), wcKey.trim(), wcSecret.trim())
-      await saveShoppingSyncSettings(s)
+      const credentialResult = await saveShoppingConnectorCredentials(wcUrl.trim(), wcKey.trim(), wcSecret.trim())
+      if (!credentialResult.success) {
+        setSyncResult({ text: `Error: ${credentialResult.error ?? 'Failed to save connector settings.'}`, isError: true })
+        return
+      }
+      const settingsResult = await saveShoppingSyncSettings(s)
+      if (!settingsResult.success) {
+        setSyncResult({ text: `Error: ${settingsResult.error ?? 'Failed to save sync settings.'}`, isError: true })
+        return
+      }
       router.refresh()
+      setSyncResult(null)
       setSaved(true)
       setTimeout(() => setSaved(false), 2000)
     })

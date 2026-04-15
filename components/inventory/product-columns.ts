@@ -1,6 +1,6 @@
 export type ColKey =
   | 'sku' | 'name' | 'type' | 'parentSku' | 'barcode'
-  | 'dimensions' | 'weight' | 'salesPriceGbp' | 'salePriceGbp' | 'salesPriceTaxInclusive'
+  | 'dimensions' | 'weight' | 'salesPriceBase' | 'salePriceBase' | 'salesPriceTaxInclusive'
   | 'totalStock' | 'allocatedStock' | 'availableStock' | 'incomingStock'
   | 'inventoryValue' | 'variantCount'
   | 'active' | 'createdAt' | 'updatedAt'
@@ -13,8 +13,8 @@ export const ALL_COLUMNS: { key: ColKey; label: string; defaultVisible: boolean 
   { key: 'barcode',              label: 'Barcode',            defaultVisible: false },
   { key: 'dimensions',           label: 'Dimensions (W×H×D)', defaultVisible: false },
   { key: 'weight',               label: 'Weight',             defaultVisible: false },
-  { key: 'salesPriceGbp',        label: 'Regular Price',      defaultVisible: true  },
-  { key: 'salePriceGbp',         label: 'Sale Price',         defaultVisible: false },
+  { key: 'salesPriceBase',        label: 'Regular Price',      defaultVisible: true  },
+  { key: 'salePriceBase',         label: 'Sale Price',         defaultVisible: false },
   { key: 'salesPriceTaxInclusive', label: 'Tax Incl.',        defaultVisible: false },
   { key: 'totalStock',           label: 'Stock',              defaultVisible: true  },
   { key: 'allocatedStock',       label: 'Allocated',          defaultVisible: false },

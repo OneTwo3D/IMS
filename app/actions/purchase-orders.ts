@@ -8,6 +8,7 @@ import { queueAccountingSync, getAccountingSettings, listAccountingBankAccounts,
 import { enqueueStockSync } from '@/lib/shopping'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { Prisma, type TaxCategory } from '@/app/generated/prisma/client'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -27,11 +28,11 @@ export type PoLineRow = {
   description: string | null
   qty: number
   unitCostForeign: number
-  unitCostGbp: number
+  unitCostBase: number
   discountStr: string | null
   discountAmount: number
   totalForeign: number
-  totalGbp: number
+  totalBase: number
   qtyReceived: number
   qtyBilled: number
   purchaseUnitId: string | null
@@ -39,7 +40,7 @@ export type PoLineRow = {
   purchaseUnitStockName: string | null
   purchaseUnitQty: number | null
   qtyReturned: number
-  grossUnitCostGbp: number // unitCostGbp + landed cost per unit
+  grossUnitCostBase: number // unitCostBase + landed cost per unit
   qtyToReceive: number  // qty - qtyReceived (still outstanding)
   qtyRemaining: number  // qtyReceived - qtyReturned (net on hand)
   sortOrder: number
@@ -59,17 +60,17 @@ export type PoRow = {
   supplierId: string
   supplierName: string
   currency: string
-  fxRateToGbp: number
+  fxRateToBase: number
   subtotalForeign: number
-  subtotalGbp: number
+  subtotalBase: number
   taxRateName: string | null
   taxRatePercent: number | null
   taxForeign: number
-  taxGbp: number
+  taxBase: number
   totalForeign: number
-  totalGbp: number
+  totalBase: number
   directFreightForeign: number
-  directFreightGbp: number
+  directFreightBase: number
   orderDiscountStr: string | null
   orderDiscountForeign: number
   landedCostMethod: string
@@ -128,7 +129,7 @@ export type PoDetail = PoRow & {
   }[]
   returns: PoReturn[]
   invoices: InvoiceRow[]
-  freightCostLines: { id: string; description: string; amountForeign: number; amountGbp: number; amountBilled: number; vatable: boolean; distributionMethod: string }[]
+  freightCostLines: { id: string; description: string; amountForeign: number; amountBase: number; amountBilled: number; vatable: boolean; distributionMethod: string }[]
   linkedFreightPos: {
     linkId: string
     method: string
@@ -137,12 +138,12 @@ export type PoDetail = PoRow & {
       reference: string
       supplierName: string
       totalForeign: number
-      totalGbp: number
-      costLines: { description: string; amountGbp: number; distributionMethod: string }[]
+      totalBase: number
+      costLines: { description: string; amountBase: number; distributionMethod: string }[]
     }
   }[]
-  totalLandedCostGbp: number
-  linkedPrimaryPos: { id: string; reference: string; supplierName: string; totalGbp: number }[]
+  totalLandedCostBase: number
+  linkedPrimaryPos: { id: string; reference: string; supplierName: string; totalBase: number }[]
 }
 
 export type PoLineInput = {
@@ -175,7 +176,7 @@ export type PoLineInput = {
 export type CreatePoInput = {
   supplierId: string
   currency: string
-  fxRateToGbp: number
+  fxRateToBase: number
   destinationWarehouseId?: string
   supplierRef?: string
   expectedDelivery?: string
@@ -223,9 +224,9 @@ function safeFxRate(rate: number): number {
 function calcLineTotals(unitCostForeign: number, qty: number, fxRate: number) {
   const rate = safeFxRate(fxRate)
   const totalForeign = Math.round(unitCostForeign * qty * 10000) / 10000
-  const unitCostGbp = Math.round((unitCostForeign / rate) * 1000000) / 1000000
-  const totalGbp = Math.round((totalForeign / rate) * 10000) / 10000
-  return { unitCostGbp, totalForeign, totalGbp }
+  const unitCostBase = Math.round((unitCostForeign / rate) * 1000000) / 1000000
+  const totalBase = Math.round((totalForeign / rate) * 10000) / 10000
+  return { unitCostBase, totalForeign, totalBase }
 }
 
 const PO_SELECT = {
@@ -235,17 +236,17 @@ const PO_SELECT = {
   status: true,
   supplierId: true,
   currency: true,
-  fxRateToGbp: true,
+  fxRateToBase: true,
   subtotalForeign: true,
-  subtotalGbp: true,
+  subtotalBase: true,
   taxRateName: true,
   taxRatePercent: true,
   taxForeign: true,
-  taxGbp: true,
+  taxBase: true,
   totalForeign: true,
-  totalGbp: true,
+  totalBase: true,
   directFreightForeign: true,
-  directFreightGbp: true,
+  directFreightBase: true,
   discountStr: true,
   discountAmount: true,
   landedCostMethod: true,
@@ -267,11 +268,11 @@ const PO_SELECT = {
       description: true,
       qty: true,
       unitCostForeign: true,
-      unitCostGbp: true,
+      unitCostBase: true,
       discountStr: true,
       discountAmount: true,
       totalForeign: true,
-      totalGbp: true,
+      totalBase: true,
       purchaseUnitId: true,
       purchaseUnitQty: true,
       purchaseUnit: { select: { name: true, abbreviation: true, conversionFactor: true, stockUnitName: true } },
@@ -294,17 +295,17 @@ function mapPoRow(po: {
   status: string
   supplierId: string
   currency: string
-  fxRateToGbp: unknown
+  fxRateToBase: unknown
   subtotalForeign: unknown
-  subtotalGbp: unknown
+  subtotalBase: unknown
   taxRateName: string | null
   taxRatePercent: unknown
   taxForeign: unknown
-  taxGbp: unknown
+  taxBase: unknown
   totalForeign: unknown
-  totalGbp: unknown
+  totalBase: unknown
   directFreightForeign: unknown
-  directFreightGbp: unknown
+  directFreightBase: unknown
   discountStr: string | null
   discountAmount: unknown
   landedCostMethod: string
@@ -334,17 +335,17 @@ function mapPoRow(po: {
     supplierId: po.supplierId,
     supplierName: po.supplier.name,
     currency: po.currency,
-    fxRateToGbp: Number(po.fxRateToGbp),
+    fxRateToBase: Number(po.fxRateToBase),
     subtotalForeign: Number(po.subtotalForeign),
-    subtotalGbp: Number(po.subtotalGbp),
+    subtotalBase: Number(po.subtotalBase),
     taxRateName: po.taxRateName,
     taxRatePercent: po.taxRatePercent != null ? Number(po.taxRatePercent) : null,
     taxForeign: Number(po.taxForeign),
-    taxGbp: Number(po.taxGbp),
+    taxBase: Number(po.taxBase),
     totalForeign: Number(po.totalForeign),
-    totalGbp: Number(po.totalGbp),
+    totalBase: Number(po.totalBase),
     directFreightForeign: Number(po.directFreightForeign),
-    directFreightGbp: Number(po.directFreightGbp),
+    directFreightBase: Number(po.directFreightBase),
     orderDiscountStr: po.discountStr,
     orderDiscountForeign: Number(po.discountAmount ?? 0),
     landedCostMethod: po.landedCostMethod as string,
@@ -372,11 +373,11 @@ function mapLine(l: {
   description: string | null
   qty: unknown
   unitCostForeign: unknown
-  unitCostGbp: unknown
+  unitCostBase: unknown
   discountStr?: string | null
   discountAmount?: unknown
   totalForeign: unknown
-  totalGbp: unknown
+  totalBase: unknown
   purchaseUnitId: string | null
   purchaseUnitQty: unknown
   purchaseUnit: { name: string; abbreviation: string; conversionFactor: unknown; stockUnitName: string } | null
@@ -399,16 +400,16 @@ function mapLine(l: {
     description: l.description,
     qty,
     unitCostForeign: Number(l.unitCostForeign),
-    unitCostGbp: Number(l.unitCostGbp),
+    unitCostBase: Number(l.unitCostBase),
     discountStr: l.discountStr ?? null,
     discountAmount: Number(l.discountAmount ?? 0),
     totalForeign: Number(l.totalForeign),
-    totalGbp: Number(l.totalGbp),
+    totalBase: Number(l.totalBase),
     purchaseUnitId: l.purchaseUnitId,
     purchaseUnitName: l.purchaseUnit ? l.purchaseUnit.abbreviation : null,
     purchaseUnitStockName: l.purchaseUnit?.stockUnitName ?? null,
     purchaseUnitQty: l.purchaseUnitQty != null ? Number(l.purchaseUnitQty) : null,
-    grossUnitCostGbp: Number(l.unitCostGbp), // overridden by getPurchaseOrder with actual landed cost
+    grossUnitCostBase: Number(l.unitCostBase), // overridden by getPurchaseOrder with actual landed cost
     qtyReceived,
     qtyBilled: 0, // overridden by getPurchaseOrder with sum across invoices
     qtyReturned,
@@ -496,11 +497,11 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
           invoiceDate: true,
           dueDate: true,
           subtotalForeign: true,
-          subtotalGbp: true,
+          subtotalBase: true,
           taxForeign: true,
-          taxGbp: true,
+          taxBase: true,
           totalForeign: true,
-          totalGbp: true,
+          totalBase: true,
           notes: true,
           supplierInvoiceUrl: true,
           accountingInvoiceId: true,
@@ -518,7 +519,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
               qtyBilled: true,
               unitCostForeign: true,
               totalForeign: true,
-              totalGbp: true,
+              totalBase: true,
               poLine: {
                 select: {
                   productId: true,
@@ -540,7 +541,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
           id: true,
           description: true,
           amountForeign: true,
-          amountGbp: true,
+          amountBase: true,
           vatable: true,
           distributionMethod: true,
         },
@@ -552,12 +553,12 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
 
   // Fetch linked freight POs for landed cost calculation
   const freightLinks = await getLinkedFreightPos(id)
-  let totalLandedCostGbp = 0
+  let totalLandedCostBase = 0
   for (const fl of freightLinks) {
-    totalLandedCostGbp += fl.freightPo.totalGbp
+    totalLandedCostBase += fl.freightPo.totalBase
   }
   // Also add direct freight from the PO itself
-  totalLandedCostGbp += Number(po.directFreightGbp)
+  totalLandedCostBase += Number(po.directFreightBase)
 
   // Aggregate billed totals across all invoices — used to enforce partial-bill
   // limits on the next bill and to hide the "Create Bill" action when nothing
@@ -576,18 +577,18 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
   }
 
   // Calculate landed cost per line (distribute by value for now)
-  const poSubtotalGbp = Number(po.subtotalGbp)
+  const poSubtotalBase = Number(po.subtotalBase)
   const mappedLines = po.lines.map(mapLine).map((line) => {
     let landedPerUnit = 0
-    if (totalLandedCostGbp > 0 && poSubtotalGbp > 0 && line.qty > 0) {
+    if (totalLandedCostBase > 0 && poSubtotalBase > 0 && line.qty > 0) {
       // BY_VALUE distribution: proportional to line value
-      const lineShare = line.totalGbp / poSubtotalGbp
-      const landedForLine = totalLandedCostGbp * lineShare
+      const lineShare = line.totalBase / poSubtotalBase
+      const landedForLine = totalLandedCostBase * lineShare
       landedPerUnit = landedForLine / line.qty
     }
     return {
       ...line,
-      grossUnitCostGbp: line.unitCostGbp + landedPerUnit,
+      grossUnitCostBase: line.unitCostBase + landedPerUnit,
       qtyBilled: qtyBilledByLine.get(line.id) ?? 0,
     }
   })
@@ -634,11 +635,11 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       invoiceDate: inv.invoiceDate.toISOString(),
       dueDate: inv.dueDate?.toISOString() ?? null,
       subtotalForeign: Number(inv.subtotalForeign),
-      subtotalGbp: Number(inv.subtotalGbp),
+      subtotalBase: Number(inv.subtotalBase),
       taxForeign: Number(inv.taxForeign),
-      taxGbp: Number(inv.taxGbp),
+      taxBase: Number(inv.taxBase),
       totalForeign: Number(inv.totalForeign),
-      totalGbp: Number(inv.totalGbp),
+      totalBase: Number(inv.totalBase),
       notes: inv.notes,
       supplierInvoiceUrl: inv.supplierInvoiceUrl,
       accountingInvoiceId: inv.accountingInvoiceId ?? null,
@@ -665,7 +666,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
           qtyBilled: Number(il.qtyBilled),
           unitCostForeign: Number(il.unitCostForeign),
           totalForeign: Number(il.totalForeign),
-          totalGbp: Number(il.totalGbp),
+          totalBase: Number(il.totalBase),
         }
       }),
     })),
@@ -673,7 +674,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       id: cl.id,
       description: cl.description,
       amountForeign: Number(cl.amountForeign),
-      amountGbp: Number(cl.amountGbp),
+      amountBase: Number(cl.amountBase),
       amountBilled: amountBilledByCostLine.get(cl.id) ?? 0,
       vatable: cl.vatable,
       distributionMethod: cl.distributionMethod as string,
@@ -686,28 +687,28 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
         reference: fl.freightPo.reference,
         supplierName: fl.freightPo.supplierName,
         totalForeign: fl.freightPo.totalForeign,
-        totalGbp: fl.freightPo.totalGbp,
+        totalBase: fl.freightPo.totalBase,
         costLines: fl.freightPo.costLines.map((cl) => ({
           description: cl.description,
-          amountGbp: cl.amountGbp,
+          amountBase: cl.amountBase,
           distributionMethod: cl.distributionMethod,
         })),
       },
     })),
-    totalLandedCostGbp,
+    totalLandedCostBase,
     linkedPrimaryPos: await (async () => {
       // For FREIGHT POs: show which primary POs this is linked to
       const primaryLinks = await db.landedCostLink.findMany({
         where: { freightPoId: id },
         select: {
-          primaryPO: { select: { id: true, reference: true, totalGbp: true, supplier: { select: { name: true } } } },
+          primaryPO: { select: { id: true, reference: true, totalBase: true, supplier: { select: { name: true } } } },
         },
       })
       return primaryLinks.map((l) => ({
         id: l.primaryPO.id,
         reference: l.primaryPO.reference,
         supplierName: l.primaryPO.supplier.name,
-        totalGbp: Number(l.primaryPO.totalGbp),
+        totalBase: Number(l.primaryPO.totalBase),
       }))
     })(),
   }
@@ -727,13 +728,13 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       if (l.unitCostForeign < 0) return { success: false, error: `Negative cost for ${l.sku}` }
     }
 
-    const fxRate = safeFxRate(input.fxRateToGbp || 1)
+    const fxRate = safeFxRate(input.fxRateToBase || 1)
     const vatRate = input.taxRateValue ?? 0
     const inclVat = !!input.pricesIncludeVat
     let subtotalForeign = 0
-    let subtotalGbp = 0
+    let subtotalBase = 0
     let totalTaxForeign = 0
-    let totalTaxGbp = 0
+    let totalTaxBase = 0
 
     // --- Tax rate resolution -------------------------------------------
     // Each line either:
@@ -867,15 +868,15 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       // If prices include VAT, extract net; otherwise use as-is
       const netLineForeign = lineInclVat ? grossAfterDisc / (1 + lineRate) : grossAfterDisc
       const netUnitForeign = l.qty > 0 ? netLineForeign / l.qty : 0
-      const { unitCostGbp, totalForeign, totalGbp } = calcLineTotals(netUnitForeign, l.qty, fxRate)
+      const { unitCostBase, totalForeign, totalBase } = calcLineTotals(netUnitForeign, l.qty, fxRate)
       const lineTaxForeign = lineInclVat
         ? Math.round((grossAfterDisc - totalForeign) * 10000) / 10000
         : Math.round(totalForeign * lineRate * 10000) / 10000
-      const lineTaxGbp = Math.round((lineTaxForeign / fxRate) * 10000) / 10000
+      const lineTaxBase = Math.round((lineTaxForeign / fxRate) * 10000) / 10000
       subtotalForeign += totalForeign
-      subtotalGbp += totalGbp
+      subtotalBase += totalBase
       totalTaxForeign += lineTaxForeign
-      totalTaxGbp += lineTaxGbp
+      totalTaxBase += lineTaxBase
       return {
         productId: l.productId,
         description: l.description || null,
@@ -883,14 +884,14 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
         purchaseUnitId: l.purchaseUnitId || null,
         purchaseUnitQty: l.purchaseUnitQty ?? null,
         unitCostForeign: netUnitForeign,
-        unitCostGbp,
+        unitCostBase,
         discountStr: l.discountStr || null,
         discountAmount: discAmt,
         taxRateId: resolved.taxRateId,
         taxForeign: lineTaxForeign,
-        taxGbp: lineTaxGbp,
+        taxBase: lineTaxBase,
         totalForeign,
-        totalGbp,
+        totalBase,
         sortOrder: l.sortOrder ?? i,
       }
     })
@@ -903,9 +904,9 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
     // percentage. The user input string is stored for re-display only.
     const orderDiscountForeignInput = Math.max(0, input.orderDiscountForeign ?? 0)
     let orderDiscountNetForeign = 0
-    let orderDiscountNetGbp = 0
+    let orderDiscountNetBase = 0
     let orderDiscountVatForeign = 0
-    let orderDiscountVatGbp = 0
+    let orderDiscountVatBase = 0
     if (orderDiscountForeignInput > 0 && subtotalForeign > 0) {
       // The user enters the discount in the same tax convention as unit
       // costs. Convert to net + vat using the overall line blend:
@@ -919,19 +920,19 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       const cappedGrossDisc = Math.min(grossDisc, grossBase)
       orderDiscountNetForeign = Math.round(cappedGrossDisc * netFrac * 10000) / 10000
       orderDiscountVatForeign = Math.round((cappedGrossDisc - orderDiscountNetForeign) * 10000) / 10000
-      orderDiscountNetGbp = Math.round((orderDiscountNetForeign / fxRate) * 10000) / 10000
-      orderDiscountVatGbp = Math.round((orderDiscountVatForeign / fxRate) * 10000) / 10000
+      orderDiscountNetBase = Math.round((orderDiscountNetForeign / fxRate) * 10000) / 10000
+      orderDiscountVatBase = Math.round((orderDiscountVatForeign / fxRate) * 10000) / 10000
       subtotalForeign = Math.max(0, subtotalForeign - orderDiscountNetForeign)
-      subtotalGbp = Math.max(0, subtotalGbp - orderDiscountNetGbp)
+      subtotalBase = Math.max(0, subtotalBase - orderDiscountNetBase)
       totalTaxForeign = Math.max(0, totalTaxForeign - orderDiscountVatForeign)
-      totalTaxGbp = Math.max(0, totalTaxGbp - orderDiscountVatGbp)
+      totalTaxBase = Math.max(0, totalTaxBase - orderDiscountVatBase)
     }
 
     // Additional costs (shipping, fees, etc.) → directFreight fields
     let directFreightForeign = 0
-    let directFreightGbp = 0
+    let directFreightBase = 0
     let additionalCostVatForeign = 0
-    let additionalCostVatGbp = 0
+    let additionalCostVatBase = 0
     if (input.additionalCosts?.length) {
       for (const ac of input.additionalCosts) {
         directFreightForeign += ac.amountForeign
@@ -939,10 +940,10 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
           additionalCostVatForeign += Math.round(ac.amountForeign * vatRate * 10000) / 10000
         }
       }
-      directFreightGbp = Math.round((directFreightForeign / fxRate) * 10000) / 10000
-      additionalCostVatGbp = Math.round((additionalCostVatForeign / fxRate) * 10000) / 10000
+      directFreightBase = Math.round((directFreightForeign / fxRate) * 10000) / 10000
+      additionalCostVatBase = Math.round((additionalCostVatForeign / fxRate) * 10000) / 10000
       totalTaxForeign += additionalCostVatForeign
-      totalTaxGbp += additionalCostVatGbp
+      totalTaxBase += additionalCostVatBase
     }
 
     // Use the first additional cost's distribution method, or BY_VALUE as default
@@ -952,7 +953,7 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       : 'BY_VALUE') as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT'
 
     const grandTotalForeign = subtotalForeign + totalTaxForeign + directFreightForeign
-    const grandTotalGbp = subtotalGbp + totalTaxGbp + directFreightGbp
+    const grandTotalBase = subtotalBase + totalTaxBase + directFreightBase
 
     // Persist each additional cost as its own freightCostLine so the edit
     // form can prefill and modify them. The aggregate directFreight fields
@@ -963,7 +964,7 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       .map((ac, i) => ({
         description: ac.description || 'Additional cost',
         amountForeign: ac.amountForeign,
-        amountGbp: Math.round((ac.amountForeign / fxRate) * 10000) / 10000,
+        amountBase: Math.round((ac.amountForeign / fxRate) * 10000) / 10000,
         vatable: ac.vatable,
         distributionMethod: ac.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
         sortOrder: i,
@@ -976,17 +977,17 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
         type: 'GOODS',
         supplierId: input.supplierId,
         currency: input.currency,
-        fxRateToGbp: fxRate,
+        fxRateToBase: fxRate,
         subtotalForeign,
-        subtotalGbp,
+        subtotalBase,
         taxRateName: input.taxRateName || null,
         taxRatePercent: vatRate > 0 ? vatRate : null,
         taxForeign: totalTaxForeign,
-        taxGbp: totalTaxGbp,
+        taxBase: totalTaxBase,
         totalForeign: grandTotalForeign,
-        totalGbp: grandTotalGbp,
+        totalBase: grandTotalBase,
         directFreightForeign,
-        directFreightGbp,
+        directFreightBase,
         discountStr: input.orderDiscountStr ?? null,
         discountAmount: orderDiscountForeignInput,
         landedCostMethod: lcMethod,
@@ -1082,19 +1083,19 @@ export async function updatePurchaseOrder(
     await requirePermission('purchasing.create')
     const existing = await db.purchaseOrder.findUnique({
       where: { id },
-      select: { status: true, fxRateToGbp: true, directFreightForeign: true, directFreightGbp: true },
+      select: { status: true, fxRateToBase: true, directFreightForeign: true, directFreightBase: true },
     })
     if (!existing) return { success: false, error: 'PO not found' }
     if (existing.status !== 'DRAFT') return { success: false, error: 'Only DRAFT POs can be edited' }
 
-    const fxRate = input.fxRateToGbp ?? Number(existing.fxRateToGbp)
+    const fxRate = input.fxRateToBase ?? Number(existing.fxRateToBase)
     const inclVat = !!input.pricesIncludeVat
     const vatRate = input.taxRateValue ?? 0
 
     const updates: Record<string, unknown> = {
       ...(input.supplierId !== undefined && { supplierId: input.supplierId }),
       ...(input.currency !== undefined && { currency: input.currency }),
-      ...(input.fxRateToGbp !== undefined && { fxRateToGbp: input.fxRateToGbp }),
+      ...(input.fxRateToBase !== undefined && { fxRateToBase: input.fxRateToBase }),
       ...(input.destinationWarehouseId !== undefined && { destinationWarehouseId: input.destinationWarehouseId || null }),
       ...(input.supplierRef !== undefined && { supplierRef: input.supplierRef || null }),
       ...(input.expectedDelivery !== undefined && { expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null }),
@@ -1264,9 +1265,9 @@ export async function updatePurchaseOrder(
       // (purchaseUnitId is not edited inline), so we preserve only what
       // the form sends.
       let subtotalForeign = 0
-      let subtotalGbp = 0
+      let subtotalBase = 0
       let totalTaxForeign = 0
-      let totalTaxGbp = 0
+      let totalTaxBase = 0
 
       const lineData = input.lines.map((l, i) => {
         const resolved = lineResolved[i]
@@ -1281,15 +1282,15 @@ export async function updatePurchaseOrder(
         const grossAfterDisc = Math.max(0, l.qty * l.unitCostForeign - discAmt)
         const netLineForeign = lineInclVat ? grossAfterDisc / (1 + lineRate) : grossAfterDisc
         const netUnitForeign = l.qty > 0 ? netLineForeign / l.qty : 0
-        const { unitCostGbp, totalForeign, totalGbp } = calcLineTotals(netUnitForeign, l.qty, fxRate)
+        const { unitCostBase, totalForeign, totalBase } = calcLineTotals(netUnitForeign, l.qty, fxRate)
         const lineTaxForeign = lineInclVat
           ? Math.round((grossAfterDisc - totalForeign) * 10000) / 10000
           : Math.round(totalForeign * lineRate * 10000) / 10000
-        const lineTaxGbp = Math.round((lineTaxForeign / fxRate) * 10000) / 10000
+        const lineTaxBase = Math.round((lineTaxForeign / fxRate) * 10000) / 10000
         subtotalForeign += totalForeign
-        subtotalGbp += totalGbp
+        subtotalBase += totalBase
         totalTaxForeign += lineTaxForeign
-        totalTaxGbp += lineTaxGbp
+        totalTaxBase += lineTaxBase
         return {
           poId: id,
           productId: l.productId,
@@ -1298,14 +1299,14 @@ export async function updatePurchaseOrder(
           purchaseUnitId: l.purchaseUnitId || null,
           purchaseUnitQty: l.purchaseUnitQty ?? null,
           unitCostForeign: netUnitForeign,
-          unitCostGbp,
+          unitCostBase,
           discountStr: l.discountStr ?? null,
           discountAmount: discAmt,
           taxRateId: resolvedId,
           taxForeign: lineTaxForeign,
-          taxGbp: lineTaxGbp,
+          taxBase: lineTaxBase,
           totalForeign,
-          totalGbp,
+          totalBase,
           sortOrder: l.sortOrder ?? i,
         }
       })
@@ -1326,12 +1327,12 @@ export async function updatePurchaseOrder(
         const cappedGrossDisc = Math.min(grossDisc, grossBase)
         const orderDiscountNetForeign = Math.round(cappedGrossDisc * netFrac * 10000) / 10000
         const orderDiscountVatForeign = Math.round((cappedGrossDisc - orderDiscountNetForeign) * 10000) / 10000
-        const orderDiscountNetGbp = Math.round((orderDiscountNetForeign / fxRate) * 10000) / 10000
-        const orderDiscountVatGbp = Math.round((orderDiscountVatForeign / fxRate) * 10000) / 10000
+        const orderDiscountNetBase = Math.round((orderDiscountNetForeign / fxRate) * 10000) / 10000
+        const orderDiscountVatBase = Math.round((orderDiscountVatForeign / fxRate) * 10000) / 10000
         subtotalForeign = Math.max(0, subtotalForeign - orderDiscountNetForeign)
-        subtotalGbp = Math.max(0, subtotalGbp - orderDiscountNetGbp)
+        subtotalBase = Math.max(0, subtotalBase - orderDiscountNetBase)
         totalTaxForeign = Math.max(0, totalTaxForeign - orderDiscountVatForeign)
-        totalTaxGbp = Math.max(0, totalTaxGbp - orderDiscountVatGbp)
+        totalTaxBase = Math.max(0, totalTaxBase - orderDiscountVatBase)
       }
       updates.discountStr = input.orderDiscountStr ?? null
       updates.discountAmount = orderDiscountForeignInput
@@ -1355,7 +1356,7 @@ export async function updatePurchaseOrder(
               poId: id,
               description: ac.description || 'Additional cost',
               amountForeign: ac.amountForeign,
-              amountGbp: Math.round((ac.amountForeign / fxRate) * 10000) / 10000,
+              amountBase: Math.round((ac.amountForeign / fxRate) * 10000) / 10000,
               vatable: ac.vatable,
               distributionMethod: ac.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
               sortOrder: i,
@@ -1364,12 +1365,12 @@ export async function updatePurchaseOrder(
         if (costLineData.length > 0) {
           await db.freightCostLine.createMany({ data: costLineData })
         }
-        const directFreightGbp = Math.round((directFreightForeign / fxRate) * 10000) / 10000
-        const additionalCostVatGbp = Math.round((additionalCostVatForeign / fxRate) * 10000) / 10000
+        const directFreightBase = Math.round((directFreightForeign / fxRate) * 10000) / 10000
+        const additionalCostVatBase = Math.round((additionalCostVatForeign / fxRate) * 10000) / 10000
         totalTaxForeign += additionalCostVatForeign
-        totalTaxGbp += additionalCostVatGbp
+        totalTaxBase += additionalCostVatBase
         updates.directFreightForeign = directFreightForeign
-        updates.directFreightGbp = directFreightGbp
+        updates.directFreightBase = directFreightBase
         // Preserve the first cost's distribution method as the PO-level
         // landedCostMethod (matches createPurchaseOrder behaviour).
         const firstMethod = (input.additionalCosts ?? []).find((ac) => ac.amountForeign > 0)?.distributionMethod
@@ -1382,14 +1383,14 @@ export async function updatePurchaseOrder(
       // when present, otherwise preserve the existing amounts from the PO.
       const currentDirectFreightForeign =
         (updates.directFreightForeign as number | undefined) ?? Number(existing.directFreightForeign)
-      const currentDirectFreightGbp =
-        (updates.directFreightGbp as number | undefined) ?? Number(existing.directFreightGbp)
+      const currentDirectFreightBase =
+        (updates.directFreightBase as number | undefined) ?? Number(existing.directFreightBase)
       updates.subtotalForeign = subtotalForeign
-      updates.subtotalGbp = subtotalGbp
+      updates.subtotalBase = subtotalBase
       updates.taxForeign = totalTaxForeign
-      updates.taxGbp = totalTaxGbp
+      updates.taxBase = totalTaxBase
       updates.totalForeign = subtotalForeign + totalTaxForeign + currentDirectFreightForeign
-      updates.totalGbp = subtotalGbp + totalTaxGbp + currentDirectFreightGbp
+      updates.totalBase = subtotalBase + totalTaxBase + currentDirectFreightBase
     }
 
     const po = await db.purchaseOrder.update({
@@ -1537,15 +1538,15 @@ export async function receivePurchaseOrder(
         id: true,
         reference: true,
         status: true,
-        fxRateToGbp: true,
+        fxRateToBase: true,
         lines: {
           select: {
             id: true,
             productId: true,
             qty: true,
             qtyReceived: true,
-            unitCostGbp: true,
-            landedUnitCostGbp: true,
+            unitCostBase: true,
+            landedUnitCostBase: true,
           },
         },
       },
@@ -1590,9 +1591,9 @@ export async function receivePurchaseOrder(
         const poLine = po.lines.find((l) => l.id === rl.poLineId)
         if (!poLine) continue
 
-        const unitCostGbp = Number(poLine.landedUnitCostGbp) > 0
-          ? Number(poLine.landedUnitCostGbp)
-          : Number(poLine.unitCostGbp)
+        const unitCostBase = Number(poLine.landedUnitCostBase) > 0
+          ? Number(poLine.landedUnitCostBase)
+          : Number(poLine.unitCostBase)
 
         await tx.stockMovement.create({
           data: {
@@ -1612,7 +1613,7 @@ export async function receivePurchaseOrder(
             warehouseId: rl.warehouseId,
             receivedQty: rl.qtyReceived,
             remainingQty: rl.qtyReceived,
-            unitCostGbp,
+            unitCostBase,
             poLineId: poLine.id,
             isOpeningStock: false,
           },
@@ -1718,7 +1719,7 @@ export async function receivePurchaseOrder(
       const totalReceiptValue = linesWithQty.reduce((sum, rl) => {
         const poLine = po.lines.find(l => l.id === rl.poLineId)
         if (!poLine) return sum
-        const unitCost = Number(poLine.landedUnitCostGbp) > 0 ? Number(poLine.landedUnitCostGbp) : Number(poLine.unitCostGbp)
+        const unitCost = Number(poLine.landedUnitCostBase) > 0 ? Number(poLine.landedUnitCostBase) : Number(poLine.unitCostBase)
         return sum + rl.qtyReceived * unitCost
       }, 0)
       if (totalReceiptValue > 0) {
@@ -1982,11 +1983,11 @@ export type InvoiceRow = {
   invoiceDate: string
   dueDate: string | null
   subtotalForeign: number
-  subtotalGbp: number
+  subtotalBase: number
   taxForeign: number
-  taxGbp: number
+  taxBase: number
   totalForeign: number
-  totalGbp: number
+  totalBase: number
   notes: string | null
   supplierInvoiceUrl: string | null
   accountingInvoiceId: string | null
@@ -2006,7 +2007,7 @@ export type InvoiceRow = {
     qtyBilled: number
     unitCostForeign: number
     totalForeign: number
-    totalGbp: number
+    totalBase: number
   }[]
 }
 
@@ -2022,7 +2023,7 @@ export async function createInvoice(
         id: true,
         reference: true,
         status: true,
-        fxRateToGbp: true,
+        fxRateToBase: true,
         taxForeign: true,
         subtotalForeign: true,
         lines: {
@@ -2095,16 +2096,16 @@ export async function createInvoice(
       }
     }
 
-    const fxRate = Number(po.fxRateToGbp)
+    const fxRate = Number(po.fxRateToBase)
     let subtotalForeign = 0
-    let subtotalGbp = 0
+    let subtotalBase = 0
     let taxBaseForeign = 0
 
     const productLineData = productInputs.map((l) => {
       const totalForeign = Math.round(l.qtyBilled * l.unitCostForeign * 10000) / 10000
-      const totalGbp = Math.round((totalForeign / fxRate) * 10000) / 10000
+      const totalBase = Math.round((totalForeign / fxRate) * 10000) / 10000
       subtotalForeign += totalForeign
-      subtotalGbp += totalGbp
+      subtotalBase += totalBase
       // Product lines always contribute to the tax base (the existing
       // PO-level ratio heuristic is applied across the whole product subtotal).
       taxBaseForeign += totalForeign
@@ -2115,15 +2116,15 @@ export async function createInvoice(
         qtyBilled: l.qtyBilled,
         unitCostForeign: l.unitCostForeign,
         totalForeign,
-        totalGbp,
+        totalBase,
       }
     })
 
     const costLineData = costInputs.map((l) => {
       const totalForeign = Math.round(l.amountForeign * 10000) / 10000
-      const totalGbp = Math.round((totalForeign / fxRate) * 10000) / 10000
+      const totalBase = Math.round((totalForeign / fxRate) * 10000) / 10000
       subtotalForeign += totalForeign
-      subtotalGbp += totalGbp
+      subtotalBase += totalBase
       const costLine = costLineById.get(l.costLineId)!
       // Only vatable cost lines contribute to the tax base.
       if (costLine.vatable) taxBaseForeign += totalForeign
@@ -2134,7 +2135,7 @@ export async function createInvoice(
         qtyBilled: 1,
         unitCostForeign: l.amountForeign,
         totalForeign,
-        totalGbp,
+        totalBase,
       }
     })
 
@@ -2146,10 +2147,10 @@ export async function createInvoice(
     const poTax = Number(po.taxForeign)
     const taxRate = poSubtotal > 0 ? poTax / poSubtotal : 0
     const taxForeign = Math.round(taxBaseForeign * taxRate * 10000) / 10000
-    const taxGbp = Math.round((taxForeign / fxRate) * 10000) / 10000
+    const taxBase = Math.round((taxForeign / fxRate) * 10000) / 10000
 
     const totalForeign = subtotalForeign + taxForeign
-    const totalGbp = subtotalGbp + taxGbp
+    const totalBase = subtotalBase + taxBase
 
     await db.purchaseInvoice.create({
       data: {
@@ -2158,12 +2159,12 @@ export async function createInvoice(
         invoiceDate: new Date(input.invoiceDate),
         dueDate: input.dueDate ? new Date(input.dueDate) : null,
         subtotalForeign,
-        subtotalGbp,
+        subtotalBase,
         taxForeign,
-        taxGbp,
+        taxBase,
         totalForeign,
-        totalGbp,
-        fxRateToGbp: fxRate,
+        totalBase,
+        fxRateToBase: fxRate,
         notes: input.notes || null,
         supplierInvoiceUrl: input.supplierInvoiceUrl || null,
         lines: { create: lineData },
@@ -2194,11 +2195,14 @@ export async function createInvoice(
 
     // Queue accounting purchase invoice (bill) sync
     try {
-      const settings = await getAccountingSettings()
-      const supplierData = await db.purchaseOrder.findUnique({
-        where: { id: poId },
-        select: { supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true } } } }, currency: true },
-      })
+      const [settings, supplierData, baseCurrency] = await Promise.all([
+        getAccountingSettings(),
+        db.purchaseOrder.findUnique({
+          where: { id: poId },
+          select: { supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true } } } }, currency: true },
+        }),
+        getBaseCurrencyCode(),
+      ])
       const fallbackTaxType = supplierData?.supplier?.taxRate?.accountingTaxType ?? undefined
       // Look up each billed PO line's per-line tax rate so the accounting
       // connector gets the correct taxType per line (mixed-VAT orders).
@@ -2231,7 +2235,7 @@ export async function createInvoice(
           contactName: supplierData?.supplier?.name ?? 'Unknown Supplier',
           date: input.invoiceDate,
           dueDate: input.dueDate ?? undefined,
-          currency: supplierData?.currency ?? 'GBP',
+          currency: supplierData?.currency ?? baseCurrency,
           reference: input.invoiceNumber ?? undefined,
           // Goods on a PO stay on the balance sheet as Stock-in-Transit until received.
           // The opposite leg (DR Inventory / CR Transit) is posted on goods receipt.
@@ -2385,7 +2389,7 @@ export type FreightCostLineInput = {
 export type CreateFreightPoInput = {
   supplierId: string
   currency: string
-  fxRateToGbp: number
+  fxRateToBase: number
   primaryPoIds: string[]
   supplierRef?: string
   notes?: string
@@ -2399,29 +2403,29 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
     if (!input.costLines.length) return { success: false, error: 'Add at least one cost line' }
     if (!input.primaryPoIds.length) return { success: false, error: 'Link to at least one primary PO' }
 
-    const fxRate = input.fxRateToGbp || 1
+    const fxRate = input.fxRateToBase || 1
     const vatRate = input.taxRateValue ?? 0
 
     let subtotalForeign = 0
     let taxForeign = 0
     const costLineData = input.costLines.map((cl, i) => {
-      const amountGbp = Math.round((cl.amountForeign / fxRate) * 10000) / 10000
+      const amountBase = Math.round((cl.amountForeign / fxRate) * 10000) / 10000
       subtotalForeign += cl.amountForeign
       if (cl.vatable && vatRate > 0) taxForeign += Math.round(cl.amountForeign * vatRate * 10000) / 10000
       return {
         description: cl.description,
         amountForeign: cl.amountForeign,
-        amountGbp,
+        amountBase,
         vatable: cl.vatable,
         distributionMethod: cl.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
         sortOrder: i,
       }
     })
 
-    const subtotalGbp = Math.round((subtotalForeign / fxRate) * 10000) / 10000
-    const taxGbp = Math.round((taxForeign / fxRate) * 10000) / 10000
+    const subtotalBase = Math.round((subtotalForeign / fxRate) * 10000) / 10000
+    const taxBase = Math.round((taxForeign / fxRate) * 10000) / 10000
     const totalForeign = subtotalForeign + taxForeign
-    const totalGbp = subtotalGbp + taxGbp
+    const totalBase = subtotalBase + taxBase
 
     const freightReference = await makeReference()
     const po = await db.purchaseOrder.create({
@@ -2430,15 +2434,15 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
         type: 'FREIGHT',
         supplierId: input.supplierId,
         currency: input.currency,
-        fxRateToGbp: fxRate,
+        fxRateToBase: fxRate,
         subtotalForeign,
-        subtotalGbp,
+        subtotalBase,
         taxForeign,
-        taxGbp,
+        taxBase,
         totalForeign,
-        totalGbp,
+        totalBase,
         directFreightForeign: subtotalForeign,
-        directFreightGbp: subtotalGbp,
+        directFreightBase: subtotalBase,
         supplierRef: input.supplierRef || null,
         notes: input.notes || null,
         freightCostLines: { create: costLineData },
@@ -2496,16 +2500,16 @@ export async function getLinkedFreightPos(primaryPoId: string) {
           reference: true,
           status: true,
           currency: true,
-          fxRateToGbp: true,
+          fxRateToBase: true,
           totalForeign: true,
-          totalGbp: true,
+          totalBase: true,
           supplier: { select: { name: true } },
           freightCostLines: {
             select: {
               id: true,
               description: true,
               amountForeign: true,
-              amountGbp: true,
+              amountBase: true,
               distributionMethod: true,
               vatable: true,
             },
@@ -2525,12 +2529,12 @@ export async function getLinkedFreightPos(primaryPoId: string) {
       currency: l.freightPO.currency,
       supplierName: l.freightPO.supplier.name,
       totalForeign: Number(l.freightPO.totalForeign),
-      totalGbp: Number(l.freightPO.totalGbp),
+      totalBase: Number(l.freightPO.totalBase),
       costLines: l.freightPO.freightCostLines.map((cl) => ({
         id: cl.id,
         description: cl.description,
         amountForeign: Number(cl.amountForeign),
-        amountGbp: Number(cl.amountGbp),
+        amountBase: Number(cl.amountBase),
         distributionMethod: cl.distributionMethod,
         vatable: cl.vatable,
       })),
@@ -2573,12 +2577,12 @@ export async function updateFreightPoCosts(
     const { reference, revalidatePrimaryPoIds } = await db.$transaction(async (tx) => {
       const po = await tx.purchaseOrder.findUnique({
         where: { id: freightPoId },
-        select: { id: true, reference: true, type: true, fxRateToGbp: true },
+        select: { id: true, reference: true, type: true, fxRateToBase: true },
       })
       if (!po) throw new Error('PO not found')
       if (po.type !== 'FREIGHT') throw new Error('Not a freight PO')
 
-      const fxRate = new Prisma.Decimal(po.fxRateToGbp)
+      const fxRate = new Prisma.Decimal(po.fxRateToBase)
       const vatRate = new Prisma.Decimal(taxRateValue ?? 0)
 
       await tx.freightCostLine.deleteMany({ where: { poId: freightPoId } })
@@ -2587,7 +2591,7 @@ export async function updateFreightPoCosts(
       let taxForeign = new Prisma.Decimal(0)
       const lineData = costLines.map((cl, i) => {
         const amountForeign = new Prisma.Decimal(cl.amountForeign)
-        const amountGbp = amountForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
+        const amountBase = amountForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
         subtotalForeign = subtotalForeign.add(amountForeign)
         if (cl.vatable && vatRate.gt(0)) {
           taxForeign = taxForeign.add(amountForeign.mul(vatRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP))
@@ -2596,7 +2600,7 @@ export async function updateFreightPoCosts(
           poId: freightPoId,
           description: cl.description,
           amountForeign,
-          amountGbp,
+          amountBase,
           vatable: cl.vatable,
           distributionMethod: cl.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
           sortOrder: i,
@@ -2606,22 +2610,22 @@ export async function updateFreightPoCosts(
         await tx.freightCostLine.createMany({ data: lineData })
       }
 
-      const subtotalGbp = subtotalForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
-      const taxGbp = taxForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
+      const subtotalBase = subtotalForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
+      const taxBase = taxForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
       const totalForeign = subtotalForeign.add(taxForeign)
-      const totalGbp = subtotalGbp.add(taxGbp)
+      const totalBase = subtotalBase.add(taxBase)
 
       await tx.purchaseOrder.update({
         where: { id: freightPoId },
         data: {
           subtotalForeign,
-          subtotalGbp,
+          subtotalBase,
           taxForeign,
-          taxGbp,
+          taxBase,
           totalForeign,
-          totalGbp,
+          totalBase,
           directFreightForeign: subtotalForeign,
-          directFreightGbp: subtotalGbp,
+          directFreightBase: subtotalBase,
         },
       })
 
@@ -2665,7 +2669,7 @@ function decimal(value: Prisma.Decimal | number | string | null | undefined): Pr
 function computeDistributionBase(
   line: {
     qty: Prisma.Decimal
-    totalGbp: Prisma.Decimal
+    totalBase: Prisma.Decimal
     product: { weight: Prisma.Decimal | null }
   },
   method: 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
@@ -2679,13 +2683,13 @@ function computeDistributionBase(
       return new Prisma.Decimal(1)
     case 'BY_VALUE':
     default:
-      return decimal(line.totalGbp)
+      return decimal(line.totalBase)
   }
 }
 
 /**
  * Recalculate landed cost on all primary POs linked to this freight PO.
- * Updates PO line `landedUnitCostGbp`, CostLayer `unitCostGbp`, and CogsEntry costs.
+ * Updates PO line `landedUnitCostBase`, CostLayer `unitCostBase`, and CogsEntry costs.
  */
 async function recalculateLandedCosts(
   tx: Prisma.TransactionClient,
@@ -2707,14 +2711,14 @@ async function recalculateLandedCosts(
       select: {
         id: true,
         status: true,
-        subtotalGbp: true,
-        directFreightGbp: true,
+        subtotalBase: true,
+        directFreightBase: true,
         lines: {
           select: {
             id: true,
             qty: true,
-            unitCostGbp: true,
-            totalGbp: true,
+            unitCostBase: true,
+            totalBase: true,
             product: { select: { weight: true } },
             costLayers: {
               select: {
@@ -2742,7 +2746,7 @@ async function recalculateLandedCosts(
         freightPO: {
           select: {
             freightCostLines: {
-              select: { amountGbp: true, distributionMethod: true },
+              select: { amountBase: true, distributionMethod: true },
             },
           },
         },
@@ -2769,9 +2773,9 @@ async function recalculateLandedCosts(
           for (const entry of bases) entry.base = new Prisma.Decimal(1)
         }
 
-        const amountGbp = decimal(freightCostLine.amountGbp)
+        const amountBase = decimal(freightCostLine.amountBase)
         for (const entry of bases) {
-          const share = amountGbp.mul(entry.base).div(basisTotal)
+          const share = amountBase.mul(entry.base).div(basisTotal)
           landedByLine.set(entry.lineId, decimal(landedByLine.get(entry.lineId)).add(share))
         }
       }
@@ -2781,20 +2785,20 @@ async function recalculateLandedCosts(
       const lineQty = decimal(line.qty)
       if (lineQty.lte(0)) continue
 
-      const baseUnitCostGbp = decimal(line.unitCostGbp)
+      const baseUnitCostBase = decimal(line.unitCostBase)
       const landedForLine = decimal(landedByLine.get(line.id))
       const landedPerUnit = landedForLine.div(lineQty)
-      const grossUnitCostGbp = baseUnitCostGbp.add(landedPerUnit).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+      const grossUnitCostBase = baseUnitCostBase.add(landedPerUnit).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
 
       await tx.purchaseOrderLine.update({
         where: { id: line.id },
-        data: { landedUnitCostGbp: grossUnitCostGbp },
+        data: { landedUnitCostBase: grossUnitCostBase },
       })
 
       for (const cl of line.costLayers) {
         await tx.costLayer.update({
           where: { id: cl.id },
-          data: { unitCostGbp: grossUnitCostGbp },
+          data: { unitCostBase: grossUnitCostBase },
         })
       }
     }

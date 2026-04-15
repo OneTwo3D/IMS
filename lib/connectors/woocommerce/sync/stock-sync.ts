@@ -868,10 +868,10 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       const oldestLayer = await db.costLayer.findFirst({
         where: { productId: product.id, remainingQty: { gt: 0 } },
         orderBy: { receivedAt: 'asc' },
-        select: { unitCostGbp: true },
+        select: { unitCostBase: true },
       })
       if (oldestLayer) {
-        cogsByProduct.set(product.id, Number(oldestLayer.unitCostGbp))
+        cogsByProduct.set(product.id, Number(oldestLayer.unitCostBase))
       }
     }
   }

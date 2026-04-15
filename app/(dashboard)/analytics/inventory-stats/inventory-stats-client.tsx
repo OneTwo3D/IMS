@@ -11,6 +11,8 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { ProductLink } from '@/components/inventory/product-link'
 import type { StockOnHandRow, StockMovementRow, StockAllocationRow, ReorderRow } from '@/app/actions/inventory-stats'
 import { saveView, type SavedView } from '@/app/actions/sales-stats'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { formatMoney } from '@/lib/utils'
 
 type Tab = 'onhand' | 'movements' | 'allocations' | 'reorder'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -32,7 +34,6 @@ const TABS: { key: Tab; label: string }[] = [
   { key: 'reorder', label: 'Reorder Inventory' },
 ]
 
-function fmtGbp(v: number): string { return `£${v.toFixed(2)}` }
 function fmtDate(iso: string): string { return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) }
 function makeId() { return Math.random().toString(36).slice(2, 8) }
 
@@ -49,7 +50,7 @@ const ONHAND_FIELDS: FieldDef[] = [
   { key: 'quantity', label: 'Quantity', type: 'number' },
   { key: 'reservedQty', label: 'Reserved', type: 'number' },
   { key: 'available', label: 'Available', type: 'number' },
-  { key: 'inventoryValue', label: 'Value (£)', type: 'number' },
+  { key: 'inventoryValue', label: 'Value', type: 'number' },
   { key: 'stockUnit', label: 'Stock Unit', type: 'text' },
 ]
 
@@ -195,6 +196,8 @@ const MOVEMENT_LABELS: Record<string, string> = {
 }
 
 export function InventoryStatsClient({ stockOnHand, movements, allocations, reorder, savedViews }: Props) {
+  const baseCurrency = useBaseCurrency()
+  const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const [tab, setTab] = useState<Tab>('onhand')
   const [filterRules, setFilterRules] = useState<FilterRule[]>([])
   const [visibleColsMap, setVisibleColsMap] = useState<Record<Tab, string[]>>({ ...DEFAULT_COLS })
@@ -268,7 +271,7 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
     quantity: { label: 'Quantity', align: 'right', render: (r) => <span className="tabular-nums text-xs">{r.quantity}</span>, footer: () => <span className="tabular-nums">{totalQty}</span> },
     reservedQty: { label: 'Reserved', align: 'right', render: (r) => <span className={`tabular-nums text-xs ${r.reservedQty > 0 ? 'text-orange-600' : 'text-muted-foreground'}`}>{r.reservedQty > 0 ? r.reservedQty : '—'}</span>, footer: () => <span className="tabular-nums text-orange-600">{totalReserved}</span> },
     available: { label: 'Available', align: 'right', render: (r) => <span className={`tabular-nums text-xs font-medium ${r.available <= 0 ? 'text-destructive' : ''}`}>{r.available}</span>, footer: () => <span className="tabular-nums">{totalAvailable}</span> },
-    inventoryValue: { label: 'Value (£)', align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{r.inventoryValue > 0 ? fmtGbp(r.inventoryValue) : '—'}</span>, footer: () => <span className="tabular-nums font-mono">{fmtGbp(totalValue)}</span> },
+    inventoryValue: { label: `Value (${baseCurrency.code})`, align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{r.inventoryValue > 0 ? fmtBase(r.inventoryValue) : '—'}</span>, footer: () => <span className="tabular-nums font-mono">{fmtBase(totalValue)}</span> },
   }
 
   // Generic cell renderer for non-onhand tabs
@@ -330,7 +333,7 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Total Quantity</p><p className="text-xl font-bold">{totalQty.toLocaleString()}</p></div>
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Reserved</p><p className="text-xl font-bold text-orange-600">{totalReserved.toLocaleString()}</p></div>
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Available</p><p className="text-xl font-bold">{totalAvailable.toLocaleString()}</p></div>
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Inventory Value</p><p className="text-xl font-bold">{fmtGbp(totalValue)}</p></div>
+        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Inventory Value</p><p className="text-xl font-bold">{fmtBase(totalValue)}</p></div>
       </div>
 
       <div className="border-b">

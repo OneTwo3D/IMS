@@ -23,7 +23,9 @@ Use the credentials provided by your administrator. If you are the first user, f
 
 ### 2. Set Up Company Details
 
-Navigate to **Settings > Company** and enter your business name, address, currency, and financial year start date.
+Navigate to **Settings > Company** and enter your business name, address, base currency, and financial year start date.
+
+Set the base currency carefully. It becomes the system's reporting and valuation currency and is intended to be chosen once for a fresh installation. Changing it later requires a database reset.
 
 ### 3. Configure Warehouses
 

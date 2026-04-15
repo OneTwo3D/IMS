@@ -69,12 +69,9 @@ export function CurrenciesTable({ currencies }: Props) {
     })
   }
 
-  // GBP always shown first, then active, then inactive
-  const gbp: CurrencyRow = currencies.find((c) => c.code === 'GBP') ?? {
-    code: 'GBP', name: 'British Pound', symbol: '£', symbolPosition: 'PREFIX', active: true, latestRate: 1, rateDate: null,
-  }
-  const others = currencies.filter((c) => c.code !== 'GBP')
-  const sorted = [gbp, ...others.filter((c) => c.active), ...others.filter((c) => !c.active)]
+  const base = currencies.find((c) => c.isBaseCurrency) ?? currencies[0]
+  const others = currencies.filter((c) => c.code !== base?.code)
+  const sorted = base ? [base, ...others.filter((c) => c.active), ...others.filter((c) => !c.active)] : currencies
 
   return (
     <div className="space-y-3">
@@ -135,7 +132,7 @@ export function CurrenciesTable({ currencies }: Props) {
             <TableHead className="text-xs">Code</TableHead>
             <TableHead className="text-xs">Name</TableHead>
             <TableHead className="text-xs">Symbol</TableHead>
-            <TableHead className="text-xs text-right">Rate (1 GBP =)</TableHead>
+            <TableHead className="text-xs text-right">Rate (1 {base?.code ?? 'BASE'} =)</TableHead>
             <TableHead className="text-xs">Updated</TableHead>
             <TableHead className="text-xs">Status</TableHead>
             <TableHead className="w-12" />
@@ -148,12 +145,12 @@ export function CurrenciesTable({ currencies }: Props) {
               <TableCell>{c.name}</TableCell>
               <TableCell>{c.symbol}</TableCell>
               <TableCell className="text-right font-mono text-xs">
-                {c.code === 'GBP' ? '1.0000' : c.latestRate != null ? c.latestRate.toFixed(4) : '—'}
+                {c.isBaseCurrency ? '1.0000' : c.latestRate != null ? c.latestRate.toFixed(4) : '—'}
               </TableCell>
               <TableCell className="text-muted-foreground text-xs">
                 {c.rateDate
                   ? new Date(c.rateDate).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
-                  : c.code === 'GBP' ? '—' : 'Never'}
+                  : c.isBaseCurrency ? '—' : 'Never'}
               </TableCell>
               <TableCell>
                 <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium border ${
@@ -165,7 +162,7 @@ export function CurrenciesTable({ currencies }: Props) {
                 </span>
               </TableCell>
               <TableCell>
-                {c.code !== 'GBP' && (
+                {!c.isBaseCurrency && (
                   <Button
                     variant="ghost" size="sm" className="h-7 w-7 p-0"
                     onClick={() => handleToggle(c)}

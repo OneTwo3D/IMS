@@ -42,7 +42,7 @@ export async function getShoppingSyncSettings(): Promise<ShoppingSyncSettings> {
   return getWcSyncSettings()
 }
 
-export async function saveShoppingSyncSettings(data: Partial<ShoppingSyncSettings>): Promise<{ success: boolean }> {
+export async function saveShoppingSyncSettings(data: Partial<ShoppingSyncSettings>): Promise<{ success: boolean; error?: string }> {
   return saveWcSyncSettings(data)
 }
 

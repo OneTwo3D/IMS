@@ -28,7 +28,7 @@ import {
 type MutableLayer = {
   id: string
   remainingQty: number
-  unitCostGbp: number
+  unitCostBase: number
 }
 
 type LayerSnapshot = Map<string, MutableLayer[]>
@@ -65,14 +65,14 @@ async function buildLayerSnapshot(
         remainingQty: { gt: 0 },
       },
       orderBy: { receivedAt: 'asc' },
-      select: { id: true, remainingQty: true, unitCostGbp: true },
+      select: { id: true, remainingQty: true, unitCostBase: true },
     })
     snapshot.set(
       key,
       layers.map((layer) => ({
         id: layer.id,
         remainingQty: Number(layer.remainingQty),
-        unitCostGbp: Number(layer.unitCostGbp),
+        unitCostBase: Number(layer.unitCostBase),
       })),
     )
   }
@@ -98,7 +98,7 @@ function consumeSnapshotLayers(
     consumed.push({
       costLayerId: layer.id,
       qty: take,
-      unitCostGbp: layer.unitCostGbp,
+      unitCostBase: layer.unitCostBase,
     })
     layer.remainingQty -= take
     remaining -= take
@@ -337,8 +337,8 @@ export async function runDailyBatchSync(): Promise<{
         id: true,
         orderNumber: true,
         externalOrderNumber: true,
-        totalGbp: true,
-        taxGbp: true,
+        totalBase: true,
+        taxBase: true,
       },
     })
 
@@ -347,7 +347,7 @@ export async function runDailyBatchSync(): Promise<{
       const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = []
 
       for (const order of orders) {
-        const salesValue = round2(Number(order.totalGbp) - Number(order.taxGbp))
+        const salesValue = round2(Number(order.totalBase) - Number(order.taxBase))
         totalRevenueDeferred += salesValue
       }
 
@@ -376,7 +376,7 @@ export async function runDailyBatchSync(): Promise<{
         }
 
         for (const order of orders) {
-          const salesValue = round2(Number(order.totalGbp) - Number(order.taxGbp))
+          const salesValue = round2(Number(order.totalBase) - Number(order.taxBase))
           await tx.salesOrder.update({
             where: { id: order.id },
             data: {
@@ -517,7 +517,7 @@ export async function runDailyBatchSync(): Promise<{
               productId: true,
               qty: true,
               line: {
-                select: { id: true, qty: true, totalGbp: true },
+                select: { id: true, qty: true, totalBase: true },
               },
             },
           },
@@ -526,9 +526,9 @@ export async function runDailyBatchSync(): Promise<{
               orderNumber: true,
               externalOrderNumber: true,
               status: true,
-              totalGbp: true,
+              totalBase: true,
               unearnedRevenueAmount: true,
-              lines: { select: { totalGbp: true } },
+              lines: { select: { totalBase: true } },
               shipments: {
                 select: {
                   id: true,
@@ -633,8 +633,8 @@ export async function runDailyBatchSync(): Promise<{
 
       for (const [, orderShipments] of shipmentsByOrder) {
         const firstShipment = orderShipments[0]
-        const deferredBase = Number(firstShipment.order.unearnedRevenueAmount ?? firstShipment.order.totalGbp)
-        const orderLineTotal = firstShipment.order.lines.reduce((sum, line) => sum + Number(line.totalGbp), 0)
+        const deferredBase = Number(firstShipment.order.unearnedRevenueAmount ?? firstShipment.order.totalBase)
+        const orderLineTotal = firstShipment.order.lines.reduce((sum, line) => sum + Number(line.totalBase), 0)
         const recognizedPreviously = firstShipment.order.shipments.reduce((sum, shipment) => (
           shipment.shipmentJournalDate ? sum + Number(shipment.revenueRecognizedAmount ?? 0) : sum
         ), 0)
@@ -647,7 +647,7 @@ export async function runDailyBatchSync(): Promise<{
             const lineQty = Number(line.line.qty)
             const shippedQty = Number(line.qty)
             if (lineQty <= 0 || shippedQty <= 0) return sum
-            return sum + (Number(line.line.totalGbp) * shippedQty) / lineQty
+            return sum + (Number(line.line.totalBase) * shippedQty) / lineQty
           }, 0)
 
           let revenueProportion = orderLineTotal > 0

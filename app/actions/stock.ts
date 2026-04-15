@@ -26,14 +26,14 @@ async function getProductUnitCost(
 ): Promise<number> {
   const layers = await tx.costLayer.findMany({
     where: { productId, remainingQty: { gt: 0 } },
-    select: { remainingQty: true, unitCostGbp: true },
+    select: { remainingQty: true, unitCostBase: true },
   })
   let totalQty = 0
   let totalCost = 0
   for (const l of layers) {
     const q = Number(l.remainingQty)
     totalQty += q
-    totalCost += q * Number(l.unitCostGbp)
+    totalCost += q * Number(l.unitCostBase)
   }
   return totalQty > 0 ? totalCost / totalQty : 0
 }
@@ -626,12 +626,12 @@ export async function getAvgCogsMap(): Promise<Record<string, number>> {
   await requireAuth()
   const layers = await db.costLayer.findMany({
     where: { remainingQty: { gt: 0 } },
-    select: { productId: true, remainingQty: true, unitCostGbp: true },
+    select: { productId: true, remainingQty: true, unitCostBase: true },
   })
   const totals: Record<string, { cost: number; qty: number }> = {}
   for (const l of layers) {
     const qty = Number(l.remainingQty)
-    const cost = Number(l.unitCostGbp)
+    const cost = Number(l.unitCostBase)
     if (!totals[l.productId]) totals[l.productId] = { cost: 0, qty: 0 }
     totals[l.productId].cost += qty * cost
     totals[l.productId].qty += qty

@@ -4,7 +4,7 @@ import { toCsv, csvResponse } from '@/lib/csv'
 import { auth } from '@/lib/auth'
 import { hasPermission } from '@/lib/permissions'
 
-const HEADERS = ['reference', 'type', 'status', 'supplier', 'currency', 'fxRate', 'subtotal', 'tax', 'total', 'totalGbp', 'warehouse', 'expectedDelivery', 'supplierRef', 'sku', 'productName', 'qty', 'unitCostForeign', 'unitCostGbp', 'lineTotal', 'qtyReceived', 'qtyReturned', 'notes']
+const HEADERS = ['reference', 'type', 'status', 'supplier', 'currency', 'fxRate', 'subtotal', 'tax', 'total', 'totalBase', 'warehouse', 'expectedDelivery', 'supplierRef', 'sku', 'productName', 'qty', 'unitCostForeign', 'unitCostBase', 'lineTotal', 'qtyReceived', 'qtyReturned', 'notes']
 
 export async function GET(req: NextRequest) {
   const session = await auth()
@@ -19,7 +19,7 @@ export async function GET(req: NextRequest) {
     include: {
       supplier: { select: { name: true } },
       destinationWarehouse: { select: { code: true } },
-      lines: { select: { qty: true, unitCostForeign: true, unitCostGbp: true, totalForeign: true, qtyReceived: true, qtyReturned: true, product: { select: { sku: true, name: true } } } },
+      lines: { select: { qty: true, unitCostForeign: true, unitCostBase: true, totalForeign: true, qtyReceived: true, qtyReturned: true, product: { select: { sku: true, name: true } } } },
     },
     take: 5000,
   })
@@ -28,11 +28,11 @@ export async function GET(req: NextRequest) {
     for (const l of po.lines) {
       data.push({
         reference: po.reference, type: po.type, status: po.status, supplier: po.supplier.name,
-        currency: po.currency, fxRate: Number(po.fxRateToGbp), subtotal: Number(po.subtotalForeign).toFixed(2),
-        tax: Number(po.taxForeign).toFixed(2), total: Number(po.totalForeign).toFixed(2), totalGbp: Number(po.totalGbp).toFixed(2),
+        currency: po.currency, fxRate: Number(po.fxRateToBase), subtotal: Number(po.subtotalForeign).toFixed(2),
+        tax: Number(po.taxForeign).toFixed(2), total: Number(po.totalForeign).toFixed(2), totalBase: Number(po.totalBase).toFixed(2),
         warehouse: po.destinationWarehouse?.code, expectedDelivery: po.expectedDelivery?.toISOString().slice(0, 10),
         supplierRef: po.supplierRef, sku: l.product.sku, productName: l.product.name,
-        qty: Number(l.qty), unitCostForeign: Number(l.unitCostForeign).toFixed(4), unitCostGbp: Number(l.unitCostGbp).toFixed(4),
+        qty: Number(l.qty), unitCostForeign: Number(l.unitCostForeign).toFixed(4), unitCostBase: Number(l.unitCostBase).toFixed(4),
         lineTotal: Number(l.totalForeign).toFixed(2), qtyReceived: Number(l.qtyReceived), qtyReturned: Number(l.qtyReturned),
         notes: po.notes,
       })

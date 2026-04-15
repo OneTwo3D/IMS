@@ -15,6 +15,7 @@ import {
 } from '@/components/ui/dialog'
 import type { ProductFormState } from '@/app/actions/products'
 import { COUNTRY_LIST } from '@/lib/countries'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 
 type VariableProduct = { id: string; sku: string; name: string }
 
@@ -35,8 +36,8 @@ type Props = {
     widthCm?: string | null
     heightCm?: string | null
     depthCm?: string | null
-    salesPriceGbp?: string
-    salePriceGbp?: string
+    salesPriceBase?: string
+    salePriceBase?: string
     salesPriceTaxInclusive?: boolean
     taxCategory?: 'STANDARD' | 'REDUCED' | 'SECOND_REDUCED' | 'ZERO' | 'EXEMPT'
     stockUnit?: string
@@ -61,6 +62,7 @@ const PRODUCT_TYPES_BASE = [
 ]
 
 export function ProductForm({ action, variableProducts, defaultValues, stockUnitOptions, onClose, title, inline }: Props) {
+  const baseCurrency = useBaseCurrency()
   const [state, formAction, isPending] = useActionState(action, {})
 
   // All fields are controlled so values survive a failed server-action submission
@@ -74,8 +76,8 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
     hsCode:               defaultValues?.hsCode               ?? '',
     countryOfOrigin:      defaultValues?.countryOfOrigin      ?? '',
     weight:               defaultValues?.weight               ?? '',
-    salesPriceGbp:        defaultValues?.salesPriceGbp        ?? '',
-    salePriceGbp:         defaultValues?.salePriceGbp         ?? '',
+    salesPriceBase:        defaultValues?.salesPriceBase        ?? '',
+    salePriceBase:         defaultValues?.salePriceBase         ?? '',
     salesPriceTaxInclusive: defaultValues?.salesPriceTaxInclusive ?? false,
     taxCategory:          defaultValues?.taxCategory          ?? 'STANDARD',
     stockUnit:            defaultValues?.stockUnit            ?? 'pcs',
@@ -249,28 +251,28 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
       <div className="space-y-3">
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
           <div className="space-y-1.5">
-            <Label htmlFor="salesPriceGbp">Regular Price (GBP)</Label>
+            <Label htmlFor="salesPriceBase">Regular Price ({baseCurrency.code})</Label>
             <Input
-              id="salesPriceGbp"
-              name="salesPriceGbp"
+              id="salesPriceBase"
+              name="salesPriceBase"
               type="number"
               step="0.0001"
               min="0"
-              value={fields.salesPriceGbp}
-              onChange={(ev) => set('salesPriceGbp', ev.target.value)}
+              value={fields.salesPriceBase}
+              onChange={(ev) => set('salesPriceBase', ev.target.value)}
               placeholder="0.00"
             />
           </div>
           <div className="space-y-1.5">
-            <Label htmlFor="salePriceGbp">Sale Price (GBP)</Label>
+            <Label htmlFor="salePriceBase">Sale Price ({baseCurrency.code})</Label>
             <Input
-              id="salePriceGbp"
-              name="salePriceGbp"
+              id="salePriceBase"
+              name="salePriceBase"
               type="number"
               step="0.0001"
               min="0"
-              value={fields.salePriceGbp}
-              onChange={(ev) => set('salePriceGbp', ev.target.value)}
+              value={fields.salePriceBase}
+              onChange={(ev) => set('salePriceBase', ev.target.value)}
               placeholder="0.00"
             />
           </div>

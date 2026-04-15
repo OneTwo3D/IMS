@@ -27,6 +27,7 @@ import type { CurrencyRow } from '@/app/actions/currencies'
 import type { StockLevelEntry } from '@/app/actions/stock'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { formatMoney } from '@/lib/utils'
 import { getTrackingUrl } from '@/lib/tracking'
 import { countryName } from '@/lib/countries'
@@ -91,8 +92,8 @@ const STATUS_FLOW_LEGACY: Record<string, { label: string; icon: typeof Truck; ta
 // Optional columns for the line items table
 type OptCol = 'cogs' | 'margin' | 'marginPct' | 'qtyOnHand' | 'qtyReturned' | 'qtyCancelled' | 'qtyShipped'
 const OPT_COLUMNS: { key: OptCol; label: string }[] = [
-  { key: 'cogs', label: 'COGS (£)' },
-  { key: 'margin', label: 'Margin (£)' },
+  { key: 'cogs', label: 'COGS' },
+  { key: 'margin', label: 'Margin' },
   { key: 'marginPct', label: 'Margin %' },
   { key: 'qtyOnHand', label: 'Qty on Hand' },
   { key: 'qtyReturned', label: 'Qty Returned' },
@@ -160,7 +161,7 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
     if (!toRefund.length) { setError('Select at least one line'); return }
     if (!reason.trim()) { setError('Reason is required'); return }
     startTransition(async () => {
-      const result = await createRefund(order.id, toRefund.map((l) => ({ productId: l.productId, description: l.description, qty: l.qtyRefund, totalGbp: l.refundAmount / (order.fxRateToGbp || 1) })), reason, returnWhId || undefined)
+      const result = await createRefund(order.id, toRefund.map((l) => ({ productId: l.productId, description: l.description, qty: l.qtyRefund, totalBase: l.refundAmount / (order.fxRateToBase || 1) })), reason, returnWhId || undefined)
       if (result.success) { router.refresh(); onClose() } else setError(result.error ?? 'Failed')
     })
   }
@@ -728,6 +729,7 @@ function ShipmentsPanel({
 // Main detail
 // ---------------------------------------------------------------------------
 export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLink, stockLevels, initialAllocations, initialShipments, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled }: Props) {
+  const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [showShip, setShowShip] = useState(false)
@@ -748,8 +750,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   useEffect(() => { setAllocations(initialAllocations) }, [initialAllocations])
   useEffect(() => { setShipments(initialShipments) }, [initialShipments])
 
-  const symbolMap: Record<string, string> = { GBP: '£' }
-  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { GBP: 'PREFIX' }
+  const symbolMap: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
+  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
   for (const c of currencies) {
     symbolMap[c.code] = c.symbol
     positionMap[c.code] = c.symbolPosition
@@ -757,6 +759,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const sym = symbolMap[so.currency] ?? so.currency
   const symPos = positionMap[so.currency] ?? 'PREFIX'
   const money = (n: number) => formatMoney(n, sym, symPos)
+  const baseMoney = (n: number) => formatMoney(n, baseCurrency.symbol, baseCurrency.symbolPosition)
 
   // VAT display helpers. All *Foreign totals on SalesOrder are stored NET.
   // When the order was entered with tax-inclusive prices we display gross
@@ -1043,7 +1046,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
         {so.shippedAt && <div><span className="text-muted-foreground">Shipped</span><p className="font-medium">{new Date(so.shippedAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })}</p></div>}
         <div>
           <span className="text-muted-foreground">COGS</span>
-          <p className="font-medium font-mono">{so.cogsGbp != null ? `£${so.cogsGbp.toFixed(2)}` : '—'}</p>
+          <p className="font-medium font-mono">{so.cogsBase != null ? baseMoney(so.cogsBase) : '—'}</p>
         </div>
         <div>
           <span className="text-muted-foreground">Margin</span>
@@ -1085,8 +1088,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               <TableHead className="px-4 text-xs text-right w-24">Discount</TableHead>
               {vatRate > 0 && <TableHead className="px-4 text-xs text-right w-20">VAT ({sym})</TableHead>}
               <TableHead className="px-4 text-xs text-right w-28">Total ({sym})</TableHead>
-              {visibleCols.has('cogs') && <TableHead className="px-4 text-xs text-right w-20">COGS (£)</TableHead>}
-              {visibleCols.has('margin') && <TableHead className="px-4 text-xs text-right w-20">Margin (£)</TableHead>}
+              {visibleCols.has('cogs') && <TableHead className="px-4 text-xs text-right w-20">COGS ({baseCurrency.code})</TableHead>}
+              {visibleCols.has('margin') && <TableHead className="px-4 text-xs text-right w-20">Margin ({baseCurrency.code})</TableHead>}
               {visibleCols.has('marginPct') && <TableHead className="px-4 text-xs text-right w-16">Margin %</TableHead>}
               {visibleCols.has('qtyShipped') && <TableHead className="px-4 text-xs text-right w-16">Shipped</TableHead>}
               {visibleCols.has('qtyReturned') && <TableHead className="px-4 text-xs text-right w-16">Returned</TableHead>}
@@ -1096,10 +1099,10 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           </TableHeader>
           <TableBody>
             {so.lines.map((line) => {
-              const cogs = line.cogsGbp ?? 0
-              const revenueGbp = line.totalGbp
-              const margin = revenueGbp - cogs
-              const marginPct = revenueGbp > 0 ? (margin / revenueGbp) * 100 : 0
+              const cogs = line.cogsBase ?? 0
+              const revenueBase = line.totalBase
+              const margin = revenueBase - cogs
+              const marginPct = revenueBase > 0 ? (margin / revenueBase) * 100 : 0
               const shipped = ['SHIPPED', 'COMPLETED', 'DELIVERED'].includes(so.status) ? line.qty : 0
               const cancelled = so.status === 'CANCELLED' ? line.qty : 0
               const returned = so.refunds?.reduce((s, r) => s + r.lines.filter((rl) => rl.productId === line.productId).reduce((s2, rl) => s2 + rl.qty, 0), 0) ?? 0
@@ -1126,8 +1129,8 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                     </TableCell>
                   )}
                   <TableCell className="px-4 text-right tabular-nums font-mono text-xs">{formatMoney(lineTotalDisplay, sym)}</TableCell>
-                  {visibleCols.has('cogs') && <TableCell className="px-4 text-right tabular-nums font-mono text-xs text-muted-foreground">{cogs > 0 ? formatMoney(cogs, '£') : '—'}</TableCell>}
-                  {visibleCols.has('margin') && <TableCell className="px-4 text-right tabular-nums font-mono text-xs">{cogs > 0 ? formatMoney(margin, '£') : '—'}</TableCell>}
+                  {visibleCols.has('cogs') && <TableCell className="px-4 text-right tabular-nums font-mono text-xs text-muted-foreground">{cogs > 0 ? baseMoney(cogs) : '—'}</TableCell>}
+                  {visibleCols.has('margin') && <TableCell className="px-4 text-right tabular-nums font-mono text-xs">{cogs > 0 ? baseMoney(margin) : '—'}</TableCell>}
                   {visibleCols.has('marginPct') && <TableCell className="px-4 text-right tabular-nums text-xs">{cogs > 0 ? `${marginPct.toFixed(1)}%` : '—'}</TableCell>}
                   {visibleCols.has('qtyShipped') && <TableCell className="px-4 text-right tabular-nums text-xs">{shipped > 0 ? shipped : '—'}</TableCell>}
                   {visibleCols.has('qtyReturned') && <TableCell className="px-4 text-right tabular-nums text-xs text-orange-600">{returned > 0 ? returned : '—'}</TableCell>}
@@ -1190,7 +1193,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   <td colSpan={labelSpan} className="px-4 py-2 text-right font-medium text-muted-foreground">Total</td>
                   <td colSpan={rightSpan} className="px-4 py-2 text-right tabular-nums font-mono">
                     <span className="font-semibold">{money(so.totalForeign)}</span>
-                    {so.currency !== 'GBP' && <span className="text-muted-foreground font-normal text-xs ml-1">({formatMoney(so.totalGbp, '£')})</span>}
+                    {so.currency !== baseCurrency.code && <span className="text-muted-foreground font-normal text-xs ml-1">({baseMoney(so.totalBase)})</span>}
                   </td>
                 </tr>
               </>
@@ -1322,7 +1325,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               </div>
               {r.reason && <p className="text-xs"><span className="text-muted-foreground">Reason:</span> {r.reason}</p>}
               <Table className="text-xs"><TableBody>{r.lines.map((rl) => (
-                <TableRow key={rl.id}><TableCell className="py-1 pr-4">{rl.description}</TableCell><TableCell className="py-1 pr-4 text-right tabular-nums">{rl.qty}</TableCell><TableCell className="py-1 text-right font-mono">{formatMoney(rl.totalGbp, '£', 'PREFIX')}</TableCell></TableRow>
+                <TableRow key={rl.id}><TableCell className="py-1 pr-4">{rl.description}</TableCell><TableCell className="py-1 pr-4 text-right tabular-nums">{rl.qty}</TableCell><TableCell className="py-1 text-right font-mono">{baseMoney(rl.totalBase)}</TableCell></TableRow>
               ))}</TableBody></Table>
               {/* Credit note payments */}
               {accountingAvailable && r.payments.length > 0 && (
@@ -1421,7 +1424,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                 {so.discountAmount > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-destructive">Discount</td><td className="px-3 py-1.5 text-right font-mono text-destructive">-{money(so.discountAmount)}</td></tr>}
                 {so.shippingForeign > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">Shipping</td><td className="px-3 py-1.5 text-right font-mono">{money(so.shippingForeign)}</td></tr>}
                 {so.taxForeign > 0 && <tr><td colSpan={5} className="px-3 py-1.5 text-right text-muted-foreground">{so.taxRateName ?? 'Tax'}{so.taxRatePercent != null ? ` (${(so.taxRatePercent * 100).toFixed(0)}%)` : ''}</td><td className="px-3 py-1.5 text-right font-mono">{money(so.taxForeign)}</td></tr>}
-                <tr className="border-t"><td colSpan={5} className="px-3 py-2 text-right font-medium">Total</td><td className="px-3 py-2 text-right font-mono font-semibold">{money(so.totalForeign)}{so.currency !== 'GBP' && <span className="text-muted-foreground font-normal text-xs ml-1">({formatMoney(so.totalGbp, '£', 'PREFIX')})</span>}</td></tr>
+                <tr className="border-t"><td colSpan={5} className="px-3 py-2 text-right font-medium">Total</td><td className="px-3 py-2 text-right font-mono font-semibold">{money(so.totalForeign)}{so.currency !== baseCurrency.code && <span className="text-muted-foreground font-normal text-xs ml-1">({baseMoney(so.totalBase)})</span>}</td></tr>
               </tfoot>
             </Table>
 
@@ -1442,7 +1445,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                     {r.lines.map((rl) => (
                       <div key={rl.id} className="flex justify-between text-xs pl-3">
                         <span>{rl.description} x {rl.qty}</span>
-                        <span className="font-mono text-destructive">-{formatMoney(rl.totalGbp, '£', 'PREFIX')}</span>
+                        <span className="font-mono text-destructive">-{baseMoney(rl.totalBase)}</span>
                       </div>
                     ))}
                   </div>

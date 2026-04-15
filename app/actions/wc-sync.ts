@@ -7,6 +7,8 @@ import { requirePermission } from '@/lib/auth/server'
 import { decryptSecret } from '@/lib/secrets'
 import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/settings-store'
 import { validateWooCommerceBaseUrl } from '@/lib/connectors/woocommerce/url-safety'
+import { wcFetch } from '@/lib/connectors/woocommerce/api'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 import {
   WC_SYNC_ADVISORY_LOCK_KEY,
   WC_SETTINGS_VERSION_KEY,
@@ -80,8 +82,57 @@ export async function getWcSyncSettings(): Promise<WcSyncSettings> {
   return result
 }
 
-export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise<{ success: boolean }> {
+function extractWooStoreCurrency(data: unknown): string | null {
+  if (Array.isArray(data)) {
+    for (const row of data) {
+      if (!row || typeof row !== 'object') continue
+      const id = typeof (row as { id?: unknown }).id === 'string' ? (row as { id: string }).id : null
+      const value = typeof (row as { value?: unknown }).value === 'string' ? (row as { value: string }).value : null
+      if (id && value && (id === 'woocommerce_currency' || id === 'currency')) return value.toUpperCase()
+    }
+  }
+  if (data && typeof data === 'object') {
+    const obj = data as Record<string, unknown>
+    const direct = obj.currency
+    if (typeof direct === 'string' && direct) return direct.toUpperCase()
+    const settings = obj.settings
+    if (settings && typeof settings === 'object') {
+      const general = (settings as Record<string, unknown>).general
+      if (general && typeof general === 'object') {
+        const currency = (general as Record<string, unknown>).currency
+        if (typeof currency === 'string' && currency) return currency.toUpperCase()
+      }
+    }
+    const environment = obj.environment
+    if (environment && typeof environment === 'object') {
+      const currency = (environment as Record<string, unknown>).currency
+      if (typeof currency === 'string' && currency) return currency.toUpperCase()
+    }
+  }
+  return null
+}
+
+async function validateWooStoreBaseCurrency(credentials?: { url: string; key: string; secret: string } | null): Promise<{ ok: true; storeCurrency: string; baseCurrency: string } | { ok: false; error: string }> {
+  const baseCurrency = await getBaseCurrencyCode()
+  const general = await wcFetch('/settings/general', {}, credentials ?? undefined)
+  const generalCurrency = general.error ? null : extractWooStoreCurrency(general.data)
+  const status = generalCurrency ? null : await wcFetch('/system_status', {}, credentials ?? undefined)
+  const storeCurrency = generalCurrency ?? (status?.error ? null : extractWooStoreCurrency(status?.data))
+  if (!storeCurrency) {
+    return { ok: false, error: 'Could not determine the WooCommerce store currency from the API.' }
+  }
+  if (storeCurrency !== baseCurrency) {
+    return { ok: false, error: `WooCommerce store currency (${storeCurrency}) must match the IMS base currency (${baseCurrency}).` }
+  }
+  return { ok: true, storeCurrency, baseCurrency }
+}
+
+export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise<{ success: boolean; error?: string }> {
   await requireAdmin()
+  if (data.wc_sync_enabled === 'true') {
+    const validation = await validateWooStoreBaseCurrency()
+    if (!validation.ok) return { success: false, error: validation.error }
+  }
   const ops = Object.entries(data)
     .filter(([k]) => SYNC_SETTING_KEYS.includes(k))
     .map(([k, v]) =>
@@ -141,6 +192,17 @@ export async function saveWcCredentials(url: string, key: string, secret: string
   }
 
   const incomingSecretIsMasked = !!secret && secret.includes('*')
+  const currentSecret = incomingSecretIsMasked
+    ? await getSettingValue('wc_consumer_secret')
+    : secret
+  const currencyValidation = await validateWooStoreBaseCurrency({
+    url: validatedUrl.normalizedUrl,
+    key,
+    secret: currentSecret ?? '',
+  })
+  if (!currencyValidation.ok) {
+    return { success: false, wipedMappings: 0, error: currencyValidation.error }
+  }
 
   const saveOutcome = await db.$transaction(async (tx) => {
     // Serialize against in-flight stock syncs. See the concurrency

@@ -3,7 +3,7 @@ CREATE TABLE "freight_cost_lines" (
     "poId" TEXT NOT NULL,
     "description" TEXT NOT NULL,
     "amountForeign" DECIMAL(18,4) NOT NULL,
-    "amountGbp" DECIMAL(18,4) NOT NULL,
+    "amountBase" DECIMAL(18,4) NOT NULL,
     "vatable" BOOLEAN NOT NULL DEFAULT false,
     "distributionMethod" "LandedCostMethod" NOT NULL DEFAULT 'BY_VALUE',
     "sortOrder" INTEGER NOT NULL DEFAULT 0,

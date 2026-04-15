@@ -15,6 +15,8 @@ One Two Inventory connects to your WooCommerce store to automatically import ord
 Once connected, a green "Connected" badge appears and the remaining tabs become available.
 
 > **Note:** The consumer secret is masked after saving. To change it, enter the full new value — the system detects and ignores the masked placeholder.
+>
+> **Base currency check:** the WooCommerce store currency must match the IMS base currency before credentials or sync settings can be enabled. Order currencies may still vary per transaction; the IMS converts them into its own base currency for reporting and valuation.
 
 ## Order Sync
 
@@ -43,7 +45,7 @@ With the initial import complete, new and updated WooCommerce orders are importe
 
 - A new sales order is created with all line items, prices, discounts, shipping, and tax
 - The customer is matched by WooCommerce customer ID or email, or created if new
-- Multi-currency orders are converted to GBP using the current exchange rate
+- Multi-currency orders are converted to the IMS base currency using the current exchange rate
 - Tax rates are resolved using the tax rate mappings you configure (see Tax Rates below)
 - The order number uses your configured WooCommerce prefix (e.g. `WC-1234`, set in Settings > Company > Document Numbering)
 - Stock is auto-allocated from warehouses marked **Sync to Store**

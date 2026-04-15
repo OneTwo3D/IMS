@@ -12,6 +12,8 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { ProductLink } from '@/components/inventory/product-link'
 import type { PurchaseProductRow, ReceivedGoodsRow, BillRow, SupplierAgingRow, PurchaseDetailRow } from '@/app/actions/purchase-stats'
 import { saveView, type SavedView } from '@/app/actions/sales-stats'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { formatMoney } from '@/lib/utils'
 
 type Tab = 'products' | 'received' | 'bills' | 'aging' | 'details'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -24,7 +26,6 @@ const TABS: { key: Tab; label: string }[] = [
   { key: 'bills', label: 'Bills' }, { key: 'aging', label: 'Supplier Aging' }, { key: 'details', label: 'Details' },
 ]
 
-function fmtGbp(v: number): string { return `£${v.toFixed(2)}` }
 function fmtDate(iso: string): string { return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) }
 function makeId() { return Math.random().toString(36).slice(2, 8) }
 
@@ -36,9 +37,9 @@ const PRODUCT_FIELDS: FieldDef[] = [
   { key: 'type', label: 'Product Type', type: 'select', options: ['SIMPLE', 'VARIANT', 'KIT', 'BOM'] },
   { key: 'barcode', label: 'Barcode', type: 'text' }, { key: 'supplierName', label: 'Supplier', type: 'text' },
   { key: 'qtyOrdered', label: 'Qty Ordered', type: 'number' }, { key: 'qtyReceived', label: 'Qty Received', type: 'number' },
-  { key: 'totalGbp', label: 'Total (£)', type: 'number' }, { key: 'avgUnitCostGbp', label: 'Avg Unit Cost', type: 'number' },
+  { key: 'totalBase', label: 'Total', type: 'number' }, { key: 'avgUnitCostBase', label: 'Avg Unit Cost', type: 'number' },
   { key: 'incomingQty', label: 'Incoming', type: 'number' }, { key: 'poCount', label: 'PO Count', type: 'number' },
-  { key: 'createdAt', label: 'Created At', type: 'text' }, { key: 'landedCostGbp', label: 'Landed Cost (£)', type: 'number' },
+  { key: 'createdAt', label: 'Created At', type: 'text' }, { key: 'landedCostBase', label: 'Landed Cost', type: 'number' },
   { key: 'netQty', label: 'Net Qty', type: 'number' }, { key: 'stockUnit', label: 'Unit', type: 'text' },
   { key: 'supplierCount', label: 'Suppliers', type: 'number' }, { key: 'qtyReturned', label: 'Qty Returned', type: 'number' },
 ]
@@ -48,8 +49,8 @@ const RECEIVED_FIELDS: FieldDef[] = [
   { key: 'supplierName', label: 'Supplier', type: 'text' }, { key: 'grnReference', label: 'GRN', type: 'text' },
   { key: 'sku', label: 'SKU', type: 'text' }, { key: 'warehouseCode', label: 'Warehouse', type: 'text' },
   { key: 'qtyReceived', label: 'Qty', type: 'number' }, { key: 'status', label: 'Status', type: 'text' },
-  { key: 'totalGbp', label: 'Amount (£)', type: 'number' }, { key: 'landedUnitCostGbp', label: 'Landed Cost', type: 'number' },
-  { key: 'unitCostGbp', label: 'Unit Cost (£)', type: 'number' }, { key: 'receivedAt', label: 'Received', type: 'text' },
+  { key: 'totalBase', label: 'Amount', type: 'number' }, { key: 'landedUnitCostBase', label: 'Landed Cost', type: 'number' },
+  { key: 'unitCostBase', label: 'Unit Cost', type: 'number' }, { key: 'receivedAt', label: 'Received', type: 'text' },
 ]
 
 const BILL_FIELDS: FieldDef[] = [
@@ -57,7 +58,7 @@ const BILL_FIELDS: FieldDef[] = [
   { key: 'invoiceNumber', label: 'Bill #', type: 'text' }, { key: 'productName', label: 'Product', type: 'text' },
   { key: 'sku', label: 'SKU', type: 'text' }, { key: 'qtyBilled', label: 'Qty', type: 'number' },
   { key: 'invoiceDate', label: 'Date', type: 'text' }, { key: 'status', label: 'Status', type: 'text' },
-  { key: 'totalForeign', label: 'Foreign', type: 'number' }, { key: 'totalGbp', label: 'Amount (£)', type: 'number' },
+  { key: 'totalForeign', label: 'Foreign', type: 'number' }, { key: 'totalBase', label: 'Amount', type: 'number' },
   { key: 'supplierInvoiceUrl', label: 'PDF', type: 'text' },
 ]
 
@@ -76,7 +77,7 @@ const DETAIL_FIELDS: FieldDef[] = [
   { key: 'sku', label: 'SKU', type: 'text' }, { key: 'barcode', label: 'Barcode', type: 'text' },
   { key: 'type', label: 'Type', type: 'text' }, { key: 'supplierName', label: 'Supplier', type: 'text' },
   { key: 'status', label: 'Status', type: 'text' }, { key: 'qty', label: 'Qty', type: 'number' },
-  { key: 'totalGbp', label: 'Total (£)', type: 'number' }, { key: 'createdAt', label: 'Created', type: 'text' },
+  { key: 'totalBase', label: 'Total', type: 'number' }, { key: 'createdAt', label: 'Created', type: 'text' },
   { key: 'currency', label: 'Currency', type: 'text' }, { key: 'unitCostForeign', label: 'Unit Cost (Foreign)', type: 'number' },
   { key: 'totalForeign', label: 'Total (Foreign)', type: 'number' },
 ]
@@ -90,11 +91,11 @@ const TAB_FIELDS: Record<Tab, FieldDef[]> = {
 }
 
 const DEFAULT_COLS: Record<Tab, string[]> = {
-  products: ['sku', 'name', 'type', 'barcode', 'supplierName', 'qtyOrdered', 'qtyReceived', 'totalGbp', 'avgUnitCostGbp', 'incomingQty', 'poCount', 'createdAt'],
-  received: ['productName', 'poReference', 'supplierName', 'grnReference', 'sku', 'warehouseCode', 'qtyReceived', 'status', 'totalGbp', 'landedUnitCostGbp', 'unitCostGbp', 'receivedAt'],
-  bills: ['poReference', 'supplierName', 'invoiceNumber', 'productName', 'sku', 'qtyBilled', 'invoiceDate', 'status', 'totalForeign', 'totalGbp', 'supplierInvoiceUrl'],
+  products: ['sku', 'name', 'type', 'barcode', 'supplierName', 'qtyOrdered', 'qtyReceived', 'totalBase', 'avgUnitCostBase', 'incomingQty', 'poCount', 'createdAt'],
+  received: ['productName', 'poReference', 'supplierName', 'grnReference', 'sku', 'warehouseCode', 'qtyReceived', 'status', 'totalBase', 'landedUnitCostBase', 'unitCostBase', 'receivedAt'],
+  bills: ['poReference', 'supplierName', 'invoiceNumber', 'productName', 'sku', 'qtyBilled', 'invoiceDate', 'status', 'totalForeign', 'totalBase', 'supplierInvoiceUrl'],
   aging: ['supplierName', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'dueAmount', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus'],
-  details: ['productName', 'reference', 'sku', 'barcode', 'type', 'supplierName', 'status', 'qty', 'totalGbp', 'createdAt'],
+  details: ['productName', 'reference', 'sku', 'barcode', 'type', 'supplierName', 'status', 'qty', 'totalBase', 'createdAt'],
 }
 
 // ---------------------------------------------------------------------------
@@ -146,11 +147,14 @@ function SaveViewDialog({ tab, columns, filters, onClose }: { tab: string; colum
 }
 
 export function PurchaseStatsClient({ products, received, bills, aging, details, savedViews }: Props) {
+  const baseCurrency = useBaseCurrency()
+  const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
+  const moneyLabel = (label: string) => `${label} (${baseCurrency.code})`
   const [tab, setTab] = useState<Tab>('products')
   const [filterRules, setFilterRules] = useState<FilterRule[]>([])
   const [showFilter, setShowFilter] = useState(false); const [showColPicker, setShowColPicker] = useState(false); const [showSaveView, setShowSaveView] = useState(false)
   const [visibleColsMap, setVisibleColsMap] = useState<Record<Tab, string[]>>({ ...DEFAULT_COLS })
-  const [sortCol, setSortCol] = useState<string | null>('totalGbp'); const [sortDir, setSortDir] = useState<SortDir>('desc')
+  const [sortCol, setSortCol] = useState<string | null>('totalBase'); const [sortDir, setSortDir] = useState<SortDir>('desc')
 
   const fields = TAB_FIELDS[tab]
   const visibleCols = visibleColsMap[tab]
@@ -199,8 +203,8 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
 
   const SI = ({ c }: { c: string }) => sortCol === c ? (sortDir === 'asc' ? <ArrowUp className="h-3 w-3 inline" /> : <ArrowDown className="h-3 w-3 inline" />) : null
 
-  const totalSpend = products.reduce((s, r) => s + r.totalGbp, 0)
-  const totalLanded = products.reduce((s, r) => s + r.landedCostGbp, 0)
+  const totalSpend = products.reduce((s, r) => s + r.totalBase, 0)
+  const totalLanded = products.reduce((s, r) => s + r.landedCostBase, 0)
   const totalOrdered = products.reduce((s, r) => s + r.qtyOrdered, 0)
   const totalReceived = products.reduce((s, r) => s + r.qtyReceived, 0)
 
@@ -215,9 +219,9 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
     qtyReceived: { label: 'Received', align: 'right', render: (r) => <span className="tabular-nums text-xs text-green-600">{r.qtyReceived}</span>, footer: () => <span className="tabular-nums text-green-600">{totalReceived}</span> },
     qtyReturned: { label: 'Returned', align: 'right', render: (r) => <span className="tabular-nums text-xs text-orange-600">{r.qtyReturned > 0 ? r.qtyReturned : '—'}</span> },
     netQty: { label: 'Net Qty', align: 'right', render: (r) => <span className="tabular-nums text-xs font-medium">{r.netQty}</span> },
-    totalGbp: { label: 'Total (£)', align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{fmtGbp(r.totalGbp)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtGbp(totalSpend)}</span> },
-    landedCostGbp: { label: 'Landed (£)', align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.landedCostGbp > 0 ? fmtGbp(r.landedCostGbp) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-muted-foreground">{fmtGbp(totalLanded)}</span> },
-    avgUnitCostGbp: { label: 'Avg Cost (£)', align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{fmtGbp(r.avgUnitCostGbp)}</span> },
+    totalBase: { label: moneyLabel('Total'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{fmtBase(r.totalBase)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtBase(totalSpend)}</span> },
+    landedCostBase: { label: moneyLabel('Landed'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.landedCostBase > 0 ? fmtBase(r.landedCostBase) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-muted-foreground">{fmtBase(totalLanded)}</span> },
+    avgUnitCostBase: { label: moneyLabel('Avg Cost'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{fmtBase(r.avgUnitCostBase)}</span> },
     incomingQty: { label: 'Incoming', align: 'right', render: (r) => <span className={`tabular-nums text-xs ${r.incomingQty > 0 ? 'text-blue-600 font-medium' : 'text-muted-foreground'}`}>{r.incomingQty > 0 ? r.incomingQty : '—'}</span> },
     supplierCount: { label: 'Suppliers', align: 'right', render: (r) => <span className="tabular-nums text-xs text-muted-foreground">{r.supplierCount}</span> },
     poCount: { label: 'POs', align: 'right', render: (r) => <span className="tabular-nums text-xs text-muted-foreground">{r.poCount}</span> },
@@ -237,7 +241,7 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
   function isRightAligned(key: string): boolean {
     const f = fields.find((fd) => fd.key === key)
     if (f?.type === 'number') return true
-    if (['totalGbp', 'totalForeign', 'qtyReceived', 'qtyBilled', 'unitCostGbp', 'landedUnitCostGbp', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'dueAmount', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus', 'qty', 'unitCostForeign'].includes(key)) return true
+    if (['totalBase', 'totalForeign', 'qtyReceived', 'qtyBilled', 'unitCostBase', 'landedUnitCostBase', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'dueAmount', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus', 'qty', 'unitCostForeign'].includes(key)) return true
     return false
   }
 
@@ -250,9 +254,9 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
       if (key === 'productName') return <ProductLink productId={row.productId} sku={row.sku} name={row.productName} />
       if (key === 'poReference') return <Link href={`/purchase-orders/${row.poId}`} className="hover:underline font-mono text-xs">{row.poReference}</Link>
       if (key === 'status') return <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium bg-green-100 text-green-800 border-green-200">{v}</span>
-      if (key === 'totalGbp') return <span className="tabular-nums text-xs font-mono">{fmtGbp(v)}</span>
-      if (key === 'landedUnitCostGbp') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtGbp(v) : '—'}</span>
-      if (key === 'unitCostGbp') return <span className="tabular-nums text-xs font-mono">{fmtGbp(v)}</span>
+      if (key === 'totalBase') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
+      if (key === 'landedUnitCostBase') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'unitCostBase') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
       if (key === 'qtyReceived') return <span className="tabular-nums text-xs font-medium">{v}</span>
       if (key === 'receivedAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
     }
@@ -261,29 +265,29 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
       if (key === 'poReference') return <Link href={`/purchase-orders/${row.poId}`} className="hover:underline font-mono text-xs">{row.poReference}</Link>
       if (key === 'status') return <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium bg-muted">{v}</span>
       if (key === 'totalForeign') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{Number(v).toFixed(2)}</span>
-      if (key === 'totalGbp') return <span className="tabular-nums text-xs font-mono">{fmtGbp(v)}</span>
+      if (key === 'totalBase') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
       if (key === 'invoiceDate') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
       if (key === 'qtyBilled') return <span className="tabular-nums text-xs">{v}</span>
       if (key === 'supplierInvoiceUrl') return v ? <a href={`/api${v}`} target="_blank" rel="noopener" className="text-blue-600 hover:underline text-xs flex items-center gap-0.5"><FileText className="h-3 w-3" />View</a> : null
     }
     if (tabKey === 'aging') {
-      if (key === 'grossAmount' || key === 'netAmount' || key === 'totalAmount') return <span className="tabular-nums text-xs font-mono font-medium">{fmtGbp(v)}</span>
-      if (key === 'discounts') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtGbp(v) : '—'}</span>
-      if (key === 'refunds') return <span className="tabular-nums text-xs font-mono text-orange-600">{v > 0 ? fmtGbp(v) : '—'}</span>
-      if (key === 'landedCosts' || key === 'tax') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtGbp(v) : '—'}</span>
-      if (key === 'billedAmount') return <span className="tabular-nums text-xs font-mono">{fmtGbp(v)}</span>
-      if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`}>{v > 0 ? fmtGbp(v) : '—'}</span>
-      if (key === 'overdue0_30') return <span className="tabular-nums text-xs font-mono">{v > 0 ? fmtGbp(v) : '—'}</span>
-      if (key === 'overdue31_60') return <span className="tabular-nums text-xs font-mono">{v > 0 ? fmtGbp(v) : '—'}</span>
-      if (key === 'overdue61_90') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-orange-600' : ''}`}>{v > 0 ? fmtGbp(v) : '—'}</span>
-      if (key === 'overdue91plus') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`}>{v > 0 ? fmtGbp(v) : '—'}</span>
+      if (key === 'grossAmount' || key === 'netAmount' || key === 'totalAmount') return <span className="tabular-nums text-xs font-mono font-medium">{fmtBase(v)}</span>
+      if (key === 'discounts') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'refunds') return <span className="tabular-nums text-xs font-mono text-orange-600">{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'landedCosts' || key === 'tax') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'billedAmount') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
+      if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'overdue0_30') return <span className="tabular-nums text-xs font-mono">{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'overdue31_60') return <span className="tabular-nums text-xs font-mono">{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'overdue61_90') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-orange-600' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'overdue91plus') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>
       if (key === 'supplierName') return <span className="font-medium whitespace-nowrap text-xs">{v}</span>
     }
     if (tabKey === 'details') {
       if (key === 'productName') return <ProductLink productId={row.lineProductId} sku={row.sku} name={row.productName} />
       if (key === 'reference') return <Link href={`/purchase-orders/${row.poId}`} className="hover:underline font-mono text-xs">{row.reference}</Link>
       if (key === 'status') return <span className="inline-flex items-center rounded-full border px-2 py-0.5 text-[10px] font-medium bg-muted">{v}</span>
-      if (key === 'totalGbp') return <span className="tabular-nums text-xs font-mono">{fmtGbp(v)}</span>
+      if (key === 'totalBase') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
       if (key === 'qty') return <span className="tabular-nums text-xs">{v}</span>
       if (key === 'createdAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
     }
@@ -332,8 +336,8 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
     <div className="space-y-4">
       <h1 className="text-2xl font-semibold">Purchase Statistics</h1>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Total Spend</p><p className="text-xl font-bold">{fmtGbp(totalSpend)}</p></div>
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Landed Cost</p><p className="text-xl font-bold">{fmtGbp(totalLanded)}</p></div>
+        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Total Spend</p><p className="text-xl font-bold">{fmtBase(totalSpend)}</p></div>
+        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Landed Cost</p><p className="text-xl font-bold">{fmtBase(totalLanded)}</p></div>
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Qty Ordered</p><p className="text-xl font-bold">{totalOrdered}</p></div>
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Qty Received</p><p className="text-xl font-bold">{totalReceived}</p></div>
       </div>

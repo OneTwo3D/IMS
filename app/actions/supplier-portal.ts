@@ -229,11 +229,11 @@ export async function submitSupplierQuote(
 
     const po = await db.purchaseOrder.findFirst({
       where: { id: poId, supplierId: ctx.supplierId, status: { in: ['DRAFT', 'RFQ_SENT'] } },
-      select: { id: true, reference: true, currency: true, fxRateToGbp: true },
+      select: { id: true, reference: true, currency: true, fxRateToBase: true },
     })
     if (!po) return { success: false, error: 'RFQ not found or not accessible' }
 
-    const fxRate = Number(po.fxRateToGbp) || 1
+    const fxRate = Number(po.fxRateToBase) || 1
 
     await db.$transaction(async (tx) => {
       for (const line of data.lines) {
@@ -244,42 +244,42 @@ export async function submitSupplierQuote(
         if (!poLine) continue
 
         const totalForeign = line.qty * line.unitPrice
-        const unitCostGbp = Math.round((line.unitPrice / fxRate) * 1000000) / 1000000
-        const totalGbp = Math.round((totalForeign / fxRate) * 10000) / 10000
+        const unitCostBase = Math.round((line.unitPrice / fxRate) * 1000000) / 1000000
+        const totalBase = Math.round((totalForeign / fxRate) * 10000) / 10000
 
         await tx.purchaseOrderLine.update({
           where: { id: line.lineId },
           data: {
             qty: line.qty,
             unitCostForeign: line.unitPrice,
-            unitCostGbp,
+            unitCostBase,
             totalForeign,
-            totalGbp,
+            totalBase,
           },
         })
       }
 
       const updatedLines = await tx.purchaseOrderLine.findMany({
         where: { poId },
-        select: { totalForeign: true, totalGbp: true, taxForeign: true, taxGbp: true },
+        select: { totalForeign: true, totalBase: true, taxForeign: true, taxBase: true },
       })
       const subtotalForeign = updatedLines.reduce((s, l) => s + Number(l.totalForeign), 0)
-      const subtotalGbp = updatedLines.reduce((s, l) => s + Number(l.totalGbp), 0)
+      const subtotalBase = updatedLines.reduce((s, l) => s + Number(l.totalBase), 0)
       const taxForeign = updatedLines.reduce((s, l) => s + Number(l.taxForeign), 0)
-      const taxGbp = updatedLines.reduce((s, l) => s + Number(l.taxGbp), 0)
-      const shippingGbp = Math.round((data.shippingCost / fxRate) * 10000) / 10000
+      const taxBase = updatedLines.reduce((s, l) => s + Number(l.taxBase), 0)
+      const shippingBase = Math.round((data.shippingCost / fxRate) * 10000) / 10000
 
       await tx.purchaseOrder.update({
         where: { id: poId },
         data: {
           subtotalForeign,
-          subtotalGbp,
+          subtotalBase,
           taxForeign,
-          taxGbp,
+          taxBase,
           totalForeign: subtotalForeign + taxForeign + data.shippingCost,
-          totalGbp: subtotalGbp + taxGbp + shippingGbp,
+          totalBase: subtotalBase + taxBase + shippingBase,
           directFreightForeign: data.shippingCost,
-          directFreightGbp: shippingGbp,
+          directFreightBase: shippingBase,
           supplierRef,
           expectedDelivery: data.expectedDelivery ? new Date(data.expectedDelivery) : null,
           notes: data.shippingMethod ? `Shipping: ${data.shippingMethod}` : undefined,

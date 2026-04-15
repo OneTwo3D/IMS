@@ -5,6 +5,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { getSettingValues, serializeSettingValue } from '@/lib/settings-store'
+import { DEFAULT_BASE_CURRENCY, getFallbackCurrencyMeta, isBaseCurrencyLocked } from '@/lib/base-currency'
 
 // ---------------------------------------------------------------------------
 // Organisation
@@ -26,6 +27,7 @@ export type OrganisationData = {
   website: string | null
   logoUrl: string | null
   documentLogoUrl: string | null
+  baseCurrency: string
 }
 
 export async function getOrganisation(): Promise<OrganisationData> {
@@ -47,16 +49,56 @@ export async function getOrganisation(): Promise<OrganisationData> {
     website: org?.website ?? null,
     logoUrl: org?.logoUrl ?? null,
     documentLogoUrl: org?.documentLogoUrl ?? null,
+    baseCurrency: org?.baseCurrency ?? DEFAULT_BASE_CURRENCY,
   }
+}
+
+export async function getBaseCurrencySettings(): Promise<{ locked: boolean }> {
+  await requireAuth()
+  return { locked: await isBaseCurrencyLocked() }
 }
 
 export async function updateOrganisation(data: Partial<OrganisationData>): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
   try {
-    await db.organisation.updateMany({ data })
+    const updateData = { ...data }
+
+    if (updateData.baseCurrency) {
+      const locked = await isBaseCurrencyLocked()
+      if (locked) {
+        return { success: false, error: 'Base currency is locked after setup. Reset the database to change it.' }
+      }
+      const code = updateData.baseCurrency.toUpperCase().trim()
+      const existing = await db.currency.findUnique({ where: { code } })
+      if (!existing) {
+        const fallback = getFallbackCurrencyMeta(code)
+        await db.currency.create({
+          data: {
+            code,
+            name: fallback.name,
+            symbol: fallback.symbol,
+            symbolPosition: fallback.symbolPosition,
+            active: true,
+          },
+        })
+      } else if (!existing.active) {
+        await db.currency.update({ where: { code }, data: { active: true } })
+      }
+      updateData.baseCurrency = code
+    }
+
+    await db.organisation.updateMany({ data: updateData })
+    if (updateData.baseCurrency) {
+      await db.setting.upsert({
+        where: { key: 'base_currency_locked' },
+        create: { key: 'base_currency_locked', value: 'true' },
+        update: { value: 'true' },
+      })
+    }
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated company details' })
     revalidatePath('/settings')
     revalidatePath('/settings/company')
+    revalidatePath('/settings/accounting')
     return { success: true }
   } catch (e) {
     await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update company details: ${e}` })

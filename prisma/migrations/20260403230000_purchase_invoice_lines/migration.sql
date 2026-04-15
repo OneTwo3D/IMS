@@ -1,8 +1,8 @@
 -- Add new fields to purchase_invoices
 ALTER TABLE "purchase_invoices" ADD COLUMN "subtotalForeign" DECIMAL(18,4) NOT NULL DEFAULT 0;
-ALTER TABLE "purchase_invoices" ADD COLUMN "subtotalGbp" DECIMAL(18,4) NOT NULL DEFAULT 0;
+ALTER TABLE "purchase_invoices" ADD COLUMN "subtotalBase" DECIMAL(18,4) NOT NULL DEFAULT 0;
 ALTER TABLE "purchase_invoices" ADD COLUMN "taxForeign" DECIMAL(18,4) NOT NULL DEFAULT 0;
-ALTER TABLE "purchase_invoices" ADD COLUMN "taxGbp" DECIMAL(18,4) NOT NULL DEFAULT 0;
+ALTER TABLE "purchase_invoices" ADD COLUMN "taxBase" DECIMAL(18,4) NOT NULL DEFAULT 0;
 ALTER TABLE "purchase_invoices" ADD COLUMN "supplierInvoiceUrl" TEXT;
 
 -- Purchase invoice lines table
@@ -13,7 +13,7 @@ CREATE TABLE "purchase_invoice_lines" (
     "qtyBilled" DECIMAL(12,4) NOT NULL,
     "unitCostForeign" DECIMAL(18,6) NOT NULL,
     "totalForeign" DECIMAL(18,4) NOT NULL,
-    "totalGbp" DECIMAL(18,4) NOT NULL,
+    "totalBase" DECIMAL(18,4) NOT NULL,
 
     CONSTRAINT "purchase_invoice_lines_pkey" PRIMARY KEY ("id")
 );

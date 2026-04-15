@@ -19,6 +19,7 @@ import type { SupplierRow } from '@/app/actions/suppliers'
 import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow } from '@/app/actions/settings'
 import { formatMoney } from '@/lib/utils'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 
 type GoodsPo = { id: string; reference: string; supplierName: string; totalForeign: number; currency: string }
 
@@ -43,9 +44,10 @@ function makeKey() { return Math.random().toString(36).slice(2) }
 export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onClose }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
+  const baseCurrency = useBaseCurrency()
 
   const [supplierId, setSupplierId] = useState('')
-  const [currency, setCurrency] = useState('GBP')
+  const [currency, setCurrency] = useState(baseCurrency.code)
   const [fxRate, setFxRate] = useState(1)
   const [supplierRef, setSupplierRef] = useState('')
   const [notes, setNotes] = useState('')
@@ -58,8 +60,8 @@ export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onC
   const selectedTaxRate = taxRates.find((t) => t.id === taxRateId)
   const vatRate = selectedTaxRate?.rate ?? 0
 
-  const symbolMap: Record<string, string> = { GBP: '£' }
-  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { GBP: 'PREFIX' }
+  const symbolMap: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
+  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
   for (const c of currencies) {
     symbolMap[c.code] = c.symbol
     positionMap[c.code] = c.symbolPosition
@@ -68,12 +70,12 @@ export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onC
   const symPos = positionMap[currency] ?? 'PREFIX'
   const money = (n: number) => formatMoney(n, sym, symPos)
 
-  const rateMap: Record<string, number> = { GBP: 1 }
+  const rateMap: Record<string, number> = { [baseCurrency.code]: 1 }
   for (const c of currencies) if (c.latestRate != null) rateMap[c.code] = c.latestRate
 
   function setCurrencyAndRate(code: string) {
     setCurrency(code)
-    if (code === 'GBP') setFxRate(1)
+    if (code === baseCurrency.code) setFxRate(1)
     else if (rateMap[code]) setFxRate(rateMap[code])
   }
 
@@ -101,7 +103,7 @@ export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onC
       const result = await createFreightPo({
         supplierId,
         currency,
-        fxRateToGbp: fxRate,
+        fxRateToBase: fxRate,
         primaryPoIds: selectedPoIds,
         supplierRef: supplierRef || undefined,
         notes: notes || undefined,
@@ -156,19 +158,19 @@ export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onC
                     onChange={(e) => setCurrencyAndRate(e.target.value)}
                     className="w-28 h-9 rounded-md border border-input bg-background px-3 text-sm font-mono"
                   >
-                    <option value="GBP">GBP £</option>
-                    {currencies.filter((c) => c.code !== 'GBP').map((c) => (
+                    <option value={baseCurrency.code}>{baseCurrency.code} {baseCurrency.symbol}</option>
+                    {currencies.filter((c) => c.code !== baseCurrency.code).map((c) => (
                       <option key={c.code} value={c.code}>{c.code} {c.symbol}</option>
                     ))}
                   </select>
                   <div className="flex-1 relative">
-                    <span className="absolute left-3 top-2 text-xs text-muted-foreground">1 GBP =</span>
+                    <span className="absolute left-3 top-2 text-xs text-muted-foreground">1 {baseCurrency.code} =</span>
                     <Input
                       type="number" min="0.0001" step="0.0001"
                       value={fxRate}
                       onChange={(e) => setFxRate(Number(e.target.value) || 1)}
                       className="pl-16 h-9 font-mono text-sm"
-                      disabled={currency === 'GBP'}
+                      disabled={currency === baseCurrency.code}
                     />
                   </div>
                 </div>
@@ -300,8 +302,8 @@ export function FreightPoDialog({ suppliers, currencies, taxRates, goodsPos, onC
                     <span>Total</span>
                     <span className="font-mono">
                       {money(grandTotal)}
-                      {currency !== 'GBP' && (
-                        <span className="text-muted-foreground font-normal ml-2">({formatMoney(grandTotal / fxRate, '£', 'PREFIX')})</span>
+                      {currency !== baseCurrency.code && (
+                        <span className="text-muted-foreground font-normal ml-2">({formatMoney(grandTotal / fxRate, baseCurrency.symbol, baseCurrency.symbolPosition)})</span>
                       )}
                     </span>
                   </div>

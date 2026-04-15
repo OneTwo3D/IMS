@@ -32,7 +32,7 @@ type SoForPdf = {
   taxRateName: string | null
   taxRatePercent: unknown
   totalForeign: unknown
-  totalGbp: unknown
+  totalBase: unknown
   discountAmount: unknown
   invoiceNumber: string | null
   invoicedAt: Date | null
@@ -209,7 +209,7 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
     const vW = columns[columns.length - 1].width
     const lW = 80
     doc.font('Helvetica').fontSize(8).fillColor('#888')
-      .text(`(GBP equivalent: ${formatMoney(Number(so.totalGbp), '£', 'PREFIX')})`, tableRight - vW - lW, doc.y + 3, { width: lW + vW, align: 'right' })
+      .text(`(GBP equivalent: ${formatMoney(Number(so.totalBase), '£', 'PREFIX')})`, tableRight - vW - lW, doc.y + 3, { width: lW + vW, align: 'right' })
   }
 
   if (tpl?.footerNote) {

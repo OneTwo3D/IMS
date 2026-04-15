@@ -11,6 +11,7 @@ import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
@@ -40,14 +41,14 @@ export type SoLineRow = {
   description: string
   qty: number
   unitPriceForeign: number  // original price before discount
-  unitPriceGbp: number
+  unitPriceBase: number
   discountStr: string | null
   discountAmount: number
   taxForeign: number
-  taxGbp: number
+  taxBase: number
   totalForeign: number
-  totalGbp: number
-  cogsGbp: number | null
+  totalBase: number
+  cogsBase: number | null
   /** Per-line tax rate id (resolved from product category + destination). */
   taxRateId: string | null
   /** Per-line effective rate percentage (0..1). Falls back to null if no per-line rate. */
@@ -67,7 +68,7 @@ export type SoRow = {
   externalOrderDate: string | null
   status: SoStatus
   currency: string
-  fxRateToGbp: number
+  fxRateToBase: number
   customerName: string | null
   customerEmail: string | null
   subtotalForeign: number
@@ -78,7 +79,7 @@ export type SoRow = {
   taxForeign: number
   pricesIncludeVat: boolean
   totalForeign: number
-  totalGbp: number
+  totalBase: number
   shipFromWarehouseId: string | null
   shipFromWarehouseName: string | null
   expectedDelivery: string | null
@@ -98,7 +99,7 @@ export type SoRow = {
   externalCreatedAt: string | null
   createdAt: string
   lineCount: number
-  cogsGbp: number | null
+  cogsBase: number | null
   profitMarginPercent: number | null
 }
 
@@ -111,7 +112,7 @@ export type SoDetail = SoRow & {
     creditNoteNumber: string | null
     reason: string | null
     totalForeign: number
-    totalGbp: number
+    totalBase: number
     refundedAt: string
     payments: PaymentRow[]
     lines: {
@@ -119,7 +120,7 @@ export type SoDetail = SoRow & {
       productId: string | null
       description: string
       qty: number
-      totalGbp: number
+      totalBase: number
     }[]
   }[]
   payments: PaymentRow[]
@@ -146,7 +147,7 @@ export type CreateSoInput = {
   billingAddress?: unknown
   shippingAddress?: unknown
   currency: string
-  fxRateToGbp: number
+  fxRateToBase: number
   shipFromWarehouseId?: string
   expectedDelivery?: string
   salesRep?: string
@@ -187,7 +188,7 @@ const SO_SELECT = {
   orderNumber: true,
   status: true,
   currency: true,
-  fxRateToGbp: true,
+  fxRateToBase: true,
   customerName: true,
   customerEmail: true,
   subtotalForeign: true,
@@ -198,7 +199,7 @@ const SO_SELECT = {
   taxForeign: true,
   pricesIncludeVat: true,
   totalForeign: true,
-  totalGbp: true,
+  totalBase: true,
   shipFromWarehouseId: true,
   shipFromWarehouse: { select: { name: true } },
   expectedDelivery: true,
@@ -218,7 +219,7 @@ const SO_SELECT = {
   externalCreatedAt: true,
   createdAt: true,
   _count: { select: { lines: true } },
-  lines: { select: { cogsGbp: true } },
+  lines: { select: { cogsBase: true } },
 } as const
 
 function mapSoRow(so: {
@@ -228,7 +229,7 @@ function mapSoRow(so: {
   orderNumber: string | null
   status: string
   currency: string
-  fxRateToGbp: unknown
+  fxRateToBase: unknown
   customerName: string | null
   customerEmail: string | null
   subtotalForeign: unknown
@@ -239,7 +240,7 @@ function mapSoRow(so: {
   taxForeign: unknown
   pricesIncludeVat: boolean
   totalForeign: unknown
-  totalGbp: unknown
+  totalBase: unknown
   shipFromWarehouseId: string | null
   shipFromWarehouse: { name: string } | null
   expectedDelivery: Date | null
@@ -259,14 +260,14 @@ function mapSoRow(so: {
   externalCreatedAt: Date | null
   createdAt: Date
   _count: { lines: number }
-  lines: { cogsGbp: unknown }[]
+  lines: { cogsBase: unknown }[]
 }): SoRow {
-  const totalGbp = Number(so.totalGbp)
-  const lineCogs = so.lines.map((l) => l.cogsGbp != null ? Number(l.cogsGbp) : null)
+  const totalBase = Number(so.totalBase)
+  const lineCogs = so.lines.map((l) => l.cogsBase != null ? Number(l.cogsBase) : null)
   const hasAnyCogs = lineCogs.some((c) => c !== null)
-  const cogsGbp = hasAnyCogs ? lineCogs.reduce((s: number, c) => s + (c ?? 0), 0) : null
-  const profitMarginPercent = cogsGbp != null && totalGbp > 0
-    ? ((totalGbp - cogsGbp) / totalGbp) * 100
+  const cogsBase = hasAnyCogs ? lineCogs.reduce((s: number, c) => s + (c ?? 0), 0) : null
+  const profitMarginPercent = cogsBase != null && totalBase > 0
+    ? ((totalBase - cogsBase) / totalBase) * 100
     : null
   const hasExternalSource = !!so.externalOrderId
   return {
@@ -280,7 +281,7 @@ function mapSoRow(so: {
     externalOrderDate: so.externalCreatedAt?.toISOString() ?? null,
     status: so.status as SoStatus,
     currency: so.currency,
-    fxRateToGbp: Number(so.fxRateToGbp),
+    fxRateToBase: Number(so.fxRateToBase),
     customerName: so.customerName,
     customerEmail: so.customerEmail,
     subtotalForeign: Number(so.subtotalForeign),
@@ -291,7 +292,7 @@ function mapSoRow(so: {
     taxForeign: Number(so.taxForeign),
     pricesIncludeVat: !!so.pricesIncludeVat,
     totalForeign: Number(so.totalForeign),
-    totalGbp: Number(so.totalGbp),
+    totalBase: Number(so.totalBase),
     shipFromWarehouseId: so.shipFromWarehouseId,
     shipFromWarehouseName: so.shipFromWarehouse?.name ?? null,
     expectedDelivery: so.expectedDelivery?.toISOString() ?? null,
@@ -311,7 +312,7 @@ function mapSoRow(so: {
     externalCreatedAt: so.externalCreatedAt?.toISOString() ?? null,
     createdAt: so.createdAt.toISOString(),
     lineCount: so._count.lines,
-    cogsGbp,
+    cogsBase,
     profitMarginPercent,
   }
 }
@@ -323,14 +324,14 @@ function mapLine(l: {
   description: string
   qty: unknown
   unitPriceForeign: unknown
-  unitPriceGbp: unknown
+  unitPriceBase: unknown
   discountStr: string | null
   discountAmount: unknown
   taxForeign: unknown
-  taxGbp: unknown
+  taxBase: unknown
   totalForeign: unknown
-  totalGbp: unknown
-  cogsGbp: unknown
+  totalBase: unknown
+  cogsBase: unknown
   taxRateId?: string | null
   taxRate?: { id: string; name: string; rate: unknown; taxCategory?: string } | null
   product?: { imageUrl: string | null; parent?: { imageUrl: string | null } | null } | null
@@ -343,14 +344,14 @@ function mapLine(l: {
     description: l.description,
     qty: Number(l.qty),
     unitPriceForeign: Number(l.unitPriceForeign),
-    unitPriceGbp: Number(l.unitPriceGbp),
+    unitPriceBase: Number(l.unitPriceBase),
     discountStr: l.discountStr ?? null,
     discountAmount: Number(l.discountAmount ?? 0),
     taxForeign: Number(l.taxForeign),
-    taxGbp: Number(l.taxGbp),
+    taxBase: Number(l.taxBase),
     totalForeign: Number(l.totalForeign),
-    totalGbp: Number(l.totalGbp),
-    cogsGbp: l.cogsGbp != null ? Number(l.cogsGbp) : null,
+    totalBase: Number(l.totalBase),
+    cogsBase: l.cogsBase != null ? Number(l.cogsBase) : null,
     taxRateId: l.taxRateId ?? l.taxRate?.id ?? null,
     taxRatePercent: l.taxRate?.rate != null ? Number(l.taxRate.rate) : null,
     taxRateName: l.taxRate?.name ?? null,
@@ -390,9 +391,9 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
       lines: {
         select: {
           id: true, productId: true, sku: true, description: true,
-          qty: true, unitPriceForeign: true, unitPriceGbp: true, discountStr: true, discountAmount: true,
-          taxForeign: true, taxGbp: true, totalForeign: true, totalGbp: true,
-          cogsGbp: true,
+          qty: true, unitPriceForeign: true, unitPriceBase: true, discountStr: true, discountAmount: true,
+          taxForeign: true, taxBase: true, totalForeign: true, totalBase: true,
+          cogsBase: true,
           taxRateId: true,
           taxRate: { select: { id: true, name: true, rate: true, taxCategory: true } },
           product: { select: { imageUrl: true, parent: { select: { imageUrl: true } } } },
@@ -400,9 +401,9 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
       },
       refunds: {
         select: {
-          id: true, creditNoteNumber: true, reason: true, totalForeign: true, totalGbp: true, refundedAt: true,
+          id: true, creditNoteNumber: true, reason: true, totalForeign: true, totalBase: true, refundedAt: true,
           lines: {
-            select: { id: true, productId: true, description: true, qty: true, totalGbp: true },
+            select: { id: true, productId: true, description: true, qty: true, totalBase: true },
           },
           payments: {
             select: { id: true, amount: true, currency: true, method: true, reference: true, notes: true, paidAt: true },
@@ -429,7 +430,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
       creditNoteNumber: r.creditNoteNumber,
       reason: r.reason,
       totalForeign: Number(r.totalForeign),
-      totalGbp: Number(r.totalGbp),
+      totalBase: Number(r.totalBase),
       refundedAt: r.refundedAt.toISOString(),
       payments: (r.payments ?? []).map((p) => ({
         id: p.id, refundId: r.id, creditNoteNumber: r.creditNoteNumber,
@@ -440,7 +441,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
         productId: rl.productId,
         description: rl.description,
         qty: Number(rl.qty),
-        totalGbp: Number(rl.totalGbp),
+        totalBase: Number(rl.totalBase),
       })),
     })),
     payments: so.payments.map((p) => ({
@@ -464,7 +465,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       if (l.unitPriceForeign < 0) return { success: false, error: `Negative price for ${l.sku}` }
     }
 
-    const fxRate = input.fxRateToGbp && input.fxRateToGbp > 0 ? input.fxRateToGbp : 1
+    const fxRate = input.fxRateToBase && input.fxRateToBase > 0 ? input.fxRateToBase : 1
     const vatRate = input.taxRateValue ?? 0
     const inclVat = !!input.pricesIncludeVat
     // Storage convention:
@@ -476,9 +477,9 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     //   aggregate field is net. The Xero payload reconstructs gross from
     //   stored net when lineAmountsIncludeTax is true.
     let linesSubtotalForeign = 0 // sum of line NETs, before order discount
-    let linesSubtotalGbp = 0
+    let linesSubtotalBase = 0
     let totalTaxForeign = 0
-    let totalTaxGbp = 0
+    let totalTaxBase = 0
 
     const round4 = (n: number) => Math.round(n * 10000) / 10000
 
@@ -598,29 +599,29 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       const discAmt = l.discountAmount ?? 0 // in gross if inclVat, else net
       const lineGross = l.qty * l.unitPriceForeign - discAmt
       const netForeign = lineInclVat ? lineGross / (1 + lineRate) : lineGross
-      const unitPriceGbp = Math.round((l.unitPriceForeign / fxRate) * 1000000) / 1000000
+      const unitPriceBase = Math.round((l.unitPriceForeign / fxRate) * 1000000) / 1000000
       const totalForeign = round4(netForeign)
-      const totalGbp = round4(totalForeign / fxRate)
+      const totalBase = round4(totalForeign / fxRate)
       const lineTax = lineInclVat ? lineGross - netForeign : netForeign * lineRate
       const lineTaxForeign = round4(lineTax)
-      const lineTaxGbp = round4(lineTaxForeign / fxRate)
+      const lineTaxBase = round4(lineTaxForeign / fxRate)
       linesSubtotalForeign += totalForeign
-      linesSubtotalGbp += totalGbp
+      linesSubtotalBase += totalBase
       totalTaxForeign += lineTaxForeign
-      totalTaxGbp += lineTaxGbp
+      totalTaxBase += lineTaxBase
       return {
         productId: l.productId,
         sku: l.sku,
         description: l.description,
         qty: l.qty,
         unitPriceForeign: l.unitPriceForeign, // ORIGINAL (gross if inclVat)
-        unitPriceGbp,
+        unitPriceBase,
         discountStr: l.discountStr || null,
         discountAmount: discAmt,
         taxForeign: lineTaxForeign,
-        taxGbp: lineTaxGbp,
+        taxBase: lineTaxBase,
         totalForeign, // NET
-        totalGbp,
+        totalBase,
         taxRateId: resolved.taxRateId,
       }
     })
@@ -639,10 +640,10 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       : (vatRate > 0 ? shippingNetForeign * vatRate : 0)
     const shippingNetForeignR = round4(shippingNetForeign)
     const shippingTaxForeignR = round4(shippingTaxForeign)
-    const shippingNetGbp = round4(shippingNetForeignR / fxRate)
-    const shippingTaxGbp = round4(shippingTaxForeignR / fxRate)
+    const shippingNetBase = round4(shippingNetForeignR / fxRate)
+    const shippingTaxBase = round4(shippingTaxForeignR / fxRate)
     totalTaxForeign += shippingTaxForeignR
-    totalTaxGbp += shippingTaxGbp
+    totalTaxBase += shippingTaxBase
 
     // Order-level discount — cap at line subtotal (compare in gross when inclVat).
     const rawOrderDisc = input.orderDiscountForeign ?? 0
@@ -654,27 +655,27 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     const discTaxForeign = shippingInclVat ? orderDiscForeign - discNetForeign : (vatRate > 0 ? discNetForeign * vatRate : 0)
     const discNetForeignR = round4(discNetForeign)
     const discTaxForeignR = round4(discTaxForeign)
-    const discNetGbp = round4(discNetForeignR / fxRate)
-    const discTaxGbp = round4(discTaxForeignR / fxRate)
+    const discNetBase = round4(discNetForeignR / fxRate)
+    const discTaxBase = round4(discTaxForeignR / fxRate)
     totalTaxForeign -= discTaxForeignR
-    totalTaxGbp -= discTaxGbp
+    totalTaxBase -= discTaxBase
 
     // Subtotal stored PRE-discount (sum of line nets) — matches the WC
     // importer convention so display / accounting code can handle both
     // sources uniformly.
     const subtotalForeign = round4(linesSubtotalForeign)
-    const subtotalGbp = round4(linesSubtotalGbp)
+    const subtotalBase = round4(linesSubtotalBase)
     totalTaxForeign = round4(totalTaxForeign)
-    totalTaxGbp = round4(totalTaxGbp)
+    totalTaxBase = round4(totalTaxBase)
 
     // Grand total = subtotal (net, pre-discount) − net discount + net
     // shipping + total tax. Tax already nets the discount VAT above.
     const grandTotalForeign = round4(subtotalForeign - discNetForeignR + shippingNetForeignR + totalTaxForeign)
-    const grandTotalGbp = round4(subtotalGbp - discNetGbp + shippingNetGbp + totalTaxGbp)
+    const grandTotalBase = round4(subtotalBase - discNetBase + shippingNetBase + totalTaxBase)
 
     // Keep locals that downstream Prisma / accounting queue references expect.
     const totalShippingForeign = shippingNetForeignR
-    const totalShippingGbp = shippingNetGbp
+    const totalShippingBase = shippingNetBase
     // Store the order discount in the same convention as WC import: the raw
     // user-entered amount (gross when inclVat).
     const storedDiscountAmount = round4(orderDiscForeign)
@@ -694,7 +695,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
         orderNumber,
         status: initialStatus,
         currency: input.currency,
-        fxRateToGbp: fxRate,
+        fxRateToBase: fxRate,
         customerId: input.customerId || null,
         customerName: input.customerName,
         customerEmail: input.customerEmail || null,
@@ -708,10 +709,10 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
         taxForeign: totalTaxForeign,
         pricesIncludeVat: inclVat,
         totalForeign: grandTotalForeign,
-        subtotalGbp,
-        shippingGbp: totalShippingGbp,
-        taxGbp: totalTaxGbp,
-        totalGbp: grandTotalGbp,
+        subtotalBase,
+        shippingBase: totalShippingBase,
+        taxBase: totalTaxBase,
+        totalBase: grandTotalBase,
         shipFromWarehouseId: input.shipFromWarehouseId || null,
         expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null,
         salesRep: input.salesRep || null,
@@ -737,15 +738,15 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     // until they are finalised via updateSalesOrderStatus.
     if (!input.isDraft) {
       try {
-        const settings = await getAccountingSettings()
+        const [settings, baseCurrency] = await Promise.all([getAccountingSettings(), getBaseCurrencyCode()])
         // The accounting payload uses a generic `lineAmountsIncludeTax`
         // flag — each connector maps this to its native convention. When
         // inclVat, shipping and discount must be sent GROSS. Our DB stores
         // shipping NET and the raw order discount (gross when inclVat) so
         // we reconstruct the right values here.
-        const discountGbp = Math.round(((input.orderDiscountForeign ?? 0) / fxRate) * 100) / 100
+        const discountBase = Math.round(((input.orderDiscountForeign ?? 0) / fxRate) * 100) / 100
         const shippingGrossForeign = shippingInclVat ? totalShippingInput : totalShippingForeign
-        const shippingSendGbp = round4(shippingGrossForeign / fxRate)
+        const shippingSendBase = round4(shippingGrossForeign / fxRate)
         // Manual invoice prefix comes from unified numbering settings
         const manualPrefix = numbering.inv_prefix
         await queueAccountingSync({
@@ -763,24 +764,24 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
               // Pass the raw per-line discount amount (in GBP) through.
               // Each accounting connector decides how to represent it
               // natively (rate vs. amount, sales vs. bill, etc.).
-              const discAmtGbp = Number(l.discountAmount ?? 0) / fxRate
+              const discAmtBase = Number(l.discountAmount ?? 0) / fxRate
               return {
                 itemCode: l.sku ?? undefined,
                 description: l.description ?? l.sku ?? 'Item',
                 quantity: l.qty,
-                // unitPriceGbp holds the user-entered price (gross when inclVat)
+                // unitPriceBase holds the user-entered price (gross when inclVat)
                 // which matches lineAmountsIncludeTax.
-                unitAmount: Number(l.unitPriceGbp),
+                unitAmount: Number(l.unitPriceBase),
                 accountCode: settings.salesAccount,
                 taxType: lineResolved[idx]?.accountingTaxType ?? orderDefaultCtx.accountingTaxType ?? undefined,
-                discountAmount: discAmtGbp > 0 ? Math.round(discAmtGbp * 10000) / 10000 : undefined,
+                discountAmount: discAmtBase > 0 ? Math.round(discAmtBase * 10000) / 10000 : undefined,
               }
             }),
-            shippingAmount: shippingSendGbp > 0 ? shippingSendGbp : undefined,
+            shippingAmount: shippingSendBase > 0 ? shippingSendBase : undefined,
             shippingDescription: 'Shipping',
             shippingAccountCode: settings.shippingAccount || undefined,
             shippingTaxType: orderDefaultCtx.accountingTaxType ?? undefined,
-            discountAmount: discountGbp > 0 ? discountGbp : undefined,
+            discountAmount: discountBase > 0 ? discountBase : undefined,
             discountAccountCode: settings.discountAccount || undefined,
             discountTaxType: orderDefaultCtx.accountingTaxType ?? undefined,
             lineAmountsIncludeTax: inclVat,
@@ -819,7 +820,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       tag: 'sales',
       level: 'INFO',
       description: `Created sales order ${mapped.displayOrderNumber}`,
-      metadata: { orderNumber: mapped.displayOrderNumber, totalGbp: mapped.totalGbp, currency: mapped.currency },
+      metadata: { orderNumber: mapped.displayOrderNumber, totalBase: mapped.totalBase, currency: mapped.currency },
     })
     return { success: true, order: mapped }
   } catch (e) {
@@ -873,11 +874,11 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       orderNumber: true,
       externalOrderNumber: true,
       currency: true,
-      fxRateToGbp: true,
+      fxRateToBase: true,
       customerName: true,
       customerEmail: true,
       shippingForeign: true,
-      shippingGbp: true,
+      shippingBase: true,
       taxRateName: true,
       taxRatePercent: true,
       pricesIncludeVat: true,
@@ -888,7 +889,7 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
           sku: true,
           description: true,
           qty: true,
-          unitPriceGbp: true,
+          unitPriceBase: true,
           unitPriceForeign: true,
           discountAmount: true,
           totalForeign: true,
@@ -916,7 +917,7 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       }))?.accountingTaxType ?? null
     : null
 
-  const fxRate = Number(so.fxRateToGbp) || 1
+  const fxRate = Number(so.fxRateToBase) || 1
   const vatPct = Number(so.taxRatePercent ?? 0)
   const lineAmountsIncludeTax = !!so.pricesIncludeVat && vatPct > 0
 
@@ -1215,7 +1216,7 @@ export async function applySalesOrderStatusTransition(
 
 export async function createRefund(
   orderId: string,
-  lines: { productId: string | null; description: string; qty: number; totalGbp: number }[],
+  lines: { productId: string | null; description: string; qty: number; totalBase: number }[],
   reason: string,
   returnWarehouseId?: string,
   options?: { internalBypassToken?: symbol; externalRefundId?: number },
@@ -1227,7 +1228,7 @@ export async function createRefund(
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: {
-        id: true, externalOrderNumber: true, orderNumber: true, status: true, fxRateToGbp: true, totalGbp: true,
+        id: true, externalOrderNumber: true, orderNumber: true, status: true, fxRateToBase: true, totalBase: true,
         taxRatePercent: true, pricesIncludeVat: true,
         revenueDeferredDate: true, unearnedRevenueAmount: true,
         inventoryAllocatedDate: true, allocationBatchAmount: true,
@@ -1235,20 +1236,20 @@ export async function createRefund(
     })
     if (!so) return { success: false, error: 'Order not found' }
 
-    // Accept lines with qty > 0 (item refund) or totalGbp > 0 (monetary-only refund)
-    const refundLines = lines.filter((l) => l.qty > 0 || l.totalGbp > 0)
+    // Accept lines with qty > 0 (item refund) or totalBase > 0 (monetary-only refund)
+    const refundLines = lines.filter((l) => l.qty > 0 || l.totalBase > 0)
     if (!refundLines.length) return { success: false, error: 'Select at least one line to refund' }
 
-    const fxRate = Number(so.fxRateToGbp) || 1
-    const totalGbp = refundLines.reduce((s, l) => s + l.totalGbp, 0)
+    const fxRate = Number(so.fxRateToBase) || 1
+    const totalBase = refundLines.reduce((s, l) => s + l.totalBase, 0)
 
     // Validate refund doesn't exceed order total
-    const existingRefunds = await db.salesOrderRefund.findMany({ where: { orderId }, select: { totalGbp: true } })
-    const previouslyRefunded = existingRefunds.reduce((s, r) => s + Number(r.totalGbp), 0)
-    if (totalGbp + previouslyRefunded > Number(so.totalGbp) * 1.001) { // small tolerance for rounding
+    const existingRefunds = await db.salesOrderRefund.findMany({ where: { orderId }, select: { totalBase: true } })
+    const previouslyRefunded = existingRefunds.reduce((s, r) => s + Number(r.totalBase), 0)
+    if (totalBase + previouslyRefunded > Number(so.totalBase) * 1.001) { // small tolerance for rounding
       return { success: false, error: 'Refund total would exceed order total' }
     }
-    const totalForeign = Math.round(totalGbp * fxRate * 10000) / 10000
+    const totalForeign = Math.round(totalBase * fxRate * 10000) / 10000
 
     // Generate credit note number using configured prefix
     const { getNumberingFormats } = await import('./company')
@@ -1263,7 +1264,7 @@ export async function createRefund(
         externalRefundId: options?.externalRefundId ?? null,
         reason: reason || null,
         totalForeign,
-        totalGbp,
+        totalBase,
         returnWarehouseId: returnWarehouseId || null,
       },
       select: { id: true },
@@ -1273,8 +1274,8 @@ export async function createRefund(
       productId: string | null
       description: string
       qty: number
-      unitPriceGbp: number
-      totalGbp: number
+      unitPriceBase: number
+      totalBase: number
     }> = []
     for (const refundLine of refundLines) {
       const createdLine = await db.salesOrderRefundLine.create({
@@ -1283,16 +1284,16 @@ export async function createRefund(
           productId: refundLine.productId,
           description: refundLine.description,
           qty: refundLine.qty,
-          unitPriceGbp: refundLine.qty > 0 ? refundLine.totalGbp / refundLine.qty : 0,
-          totalGbp: refundLine.totalGbp,
+          unitPriceBase: refundLine.qty > 0 ? refundLine.totalBase / refundLine.qty : 0,
+          totalBase: refundLine.totalBase,
         },
         select: {
           id: true,
           productId: true,
           description: true,
           qty: true,
-          unitPriceGbp: true,
-          totalGbp: true,
+          unitPriceBase: true,
+          totalBase: true,
         },
       })
       createdRefundLines.push({
@@ -1300,8 +1301,8 @@ export async function createRefund(
         productId: createdLine.productId,
         description: createdLine.description,
         qty: Number(createdLine.qty),
-        unitPriceGbp: Number(createdLine.unitPriceGbp),
-        totalGbp: Number(createdLine.totalGbp),
+        unitPriceBase: Number(createdLine.unitPriceBase),
+        totalBase: Number(createdLine.totalBase),
       })
     }
 
@@ -1339,8 +1340,8 @@ export async function createRefund(
     }
 
     // Update order status based on total refunded vs order total
-    const totalRefundedNow = previouslyRefunded + totalGbp
-    const orderTotal = Number(so.totalGbp)
+    const totalRefundedNow = previouslyRefunded + totalBase
+    const orderTotal = Number(so.totalBase)
     const newStatus = totalRefundedNow >= orderTotal * 0.999 ? 'REFUNDED' : 'PARTIALLY_REFUNDED'
     await db.salesOrder.update({
       where: { id: orderId },
@@ -1356,8 +1357,8 @@ export async function createRefund(
       action: 'refunded',
       tag: 'sales',
       level: 'INFO',
-      description: `Created refund for order ${refundOrderRef} — £${totalGbp.toFixed(2)}`,
-      metadata: { orderNumber: refundOrderRef, totalGbp, creditNoteNumber, reason },
+      description: `Created refund for order ${refundOrderRef} — £${totalBase.toFixed(2)}`,
+      metadata: { orderNumber: refundOrderRef, totalBase, creditNoteNumber, reason },
     })
     if (returnWarehouseId) {
       try {
@@ -1372,11 +1373,14 @@ export async function createRefund(
 
     // Queue accounting credit note sync
     try {
-      const settings = await getAccountingSettings()
-      const orderForCN = await db.salesOrder.findUnique({
-        where: { id: orderId },
-        select: { customer: { select: { firstName: true, lastName: true, email: true } }, currency: true, taxRateName: true },
-      })
+      const [settings, orderForCN, baseCurrency] = await Promise.all([
+        getAccountingSettings(),
+        db.salesOrder.findUnique({
+          where: { id: orderId },
+          select: { customer: { select: { firstName: true, lastName: true, email: true } }, currency: true, taxRateName: true },
+        }),
+        getBaseCurrencyCode(),
+      ])
       const cnContactName = orderForCN?.customer
         ? `${orderForCN.customer.firstName} ${orderForCN.customer.lastName}`.trim()
         : 'Walk-in Customer'
@@ -1393,14 +1397,14 @@ export async function createRefund(
           contactName: cnContactName,
           contactEmail: orderForCN?.customer?.email ?? undefined,
           date: new Date().toISOString().slice(0, 10),
-          currency: orderForCN?.currency ?? 'GBP',
+          currency: orderForCN?.currency ?? baseCurrency,
           reference: so.externalOrderNumber ?? undefined,
           lines: createdRefundLines.map((l) => ({
             description: l.description || 'Refund line',
             quantity: l.qty > 0 ? l.qty : 1,
-            unitAmount: orderForCN?.currency === 'GBP'
-              ? (l.qty > 0 ? l.unitPriceGbp : l.totalGbp)
-              : Math.round((l.qty > 0 ? l.unitPriceGbp : l.totalGbp) * fxRate * 10000) / 10000,
+            unitAmount: orderForCN?.currency === baseCurrency
+              ? (l.qty > 0 ? l.unitPriceBase : l.totalBase)
+              : Math.round((l.qty > 0 ? l.unitPriceBase : l.totalBase) * fxRate * 10000) / 10000,
             accountCode: settings.salesAccount,
             taxType: cnTaxRate?.accountingTaxType ?? undefined,
           })),
@@ -1420,13 +1424,13 @@ export async function createRefund(
       if (so.revenueDeferredDate) {
         const vatPct = Number(so.taxRatePercent ?? 0)
         const pricesIncludeVat = !!so.pricesIncludeVat && vatPct > 0
-        const toNetRevenue = (grossAmountGbp: number): number => (
+        const toNetRevenue = (grossAmountBase: number): number => (
           pricesIncludeVat
-            ? Math.round((grossAmountGbp / (1 + vatPct)) * 100) / 100
-            : Math.round(grossAmountGbp * 100) / 100
+            ? Math.round((grossAmountBase / (1 + vatPct)) * 100) / 100
+            : Math.round(grossAmountBase * 100) / 100
         )
 
-        const refundRevenue = Math.round(createdRefundLines.reduce((sum, line) => sum + toNetRevenue(line.totalGbp), 0) * 100) / 100
+        const refundRevenue = Math.round(createdRefundLines.reduce((sum, line) => sum + toNetRevenue(line.totalBase), 0) * 100) / 100
         const orderAccounting = await db.salesOrder.findUnique({
           where: { id: orderId },
           select: {
@@ -1444,7 +1448,7 @@ export async function createRefund(
                 productId: true,
                 description: true,
                 qty: true,
-                totalGbp: true,
+                totalBase: true,
               },
             },
             shipments: {
@@ -1471,8 +1475,8 @@ export async function createRefund(
                     productId: true,
                     description: true,
                     qty: true,
-                    totalGbp: true,
-                    unitPriceGbp: true,
+                    totalBase: true,
+                    unitPriceBase: true,
                     costLayerSnapshot: true,
                   },
                 },
@@ -1511,7 +1515,7 @@ export async function createRefund(
           productId: line.productId,
           description: line.description,
           qty: Number(line.qty),
-          totalGbp: Number(line.totalGbp),
+          totalBase: Number(line.totalBase),
         }))
 
         function priceMatches(unitRevenue: number, candidateUnitPrice: number | null): boolean {
@@ -1525,11 +1529,11 @@ export async function createRefund(
             productId: string | null
             description: string
             qty: number
-            totalGbp: number
+            totalBase: number
           }>,
           remainingShipped: Map<string, number>,
           remainingUnshipped: Map<string, number>,
-          refundLine: { productId: string | null; description: string; qty: number; totalGbp: number; unitPriceGbp?: number | null },
+          refundLine: { productId: string | null; description: string; qty: number; totalBase: number; unitPriceBase?: number | null },
         ): {
           shippedRevenue: number
           unshippedRevenue: number
@@ -1556,15 +1560,15 @@ export async function createRefund(
           let shippedQty = 0
           let unshippedQty = 0
           const lineAllocations: Array<{ lineId: string; shippedQty: number; unshippedQty: number }> = []
-          const refundUnitPrice = refundLine.unitPriceGbp != null
-            ? Number(refundLine.unitPriceGbp)
-            : (refundLine.qty > 0 ? refundLine.totalGbp / refundLine.qty : null)
+          const refundUnitPrice = refundLine.unitPriceBase != null
+            ? Number(refundLine.unitPriceBase)
+            : (refundLine.qty > 0 ? refundLine.totalBase / refundLine.qty : null)
 
           const matchingLines = lineStates
             .filter((line) => line.productId === refundLine.productId)
             .sort((a, b) => {
-              const aUnitRevenue = a.qty > 0 ? a.totalGbp / a.qty : 0
-              const bUnitRevenue = b.qty > 0 ? b.totalGbp / b.qty : 0
+              const aUnitRevenue = a.qty > 0 ? a.totalBase / a.qty : 0
+              const bUnitRevenue = b.qty > 0 ? b.totalBase / b.qty : 0
               const aPriceMatch = priceMatches(aUnitRevenue, refundUnitPrice)
               const bPriceMatch = priceMatches(bUnitRevenue, refundUnitPrice)
               if (aPriceMatch !== bPriceMatch) return aPriceMatch ? -1 : 1
@@ -1579,7 +1583,7 @@ export async function createRefund(
           for (const line of matchingLines) {
             if (remainingQty <= 0 || line.qty <= 0) break
 
-            const unitRevenue = line.totalGbp / line.qty
+            const unitRevenue = line.totalBase / line.qty
             const shippedQtyAvailable = remainingShipped.get(line.id) ?? 0
             const shippedTake = Math.min(remainingQty, shippedQtyAvailable)
             if (shippedTake > 0) {
@@ -1634,8 +1638,8 @@ export async function createRefund(
           remainingShippedQtyByLine.set(line.id, shippedQty)
           remainingUnshippedQtyByLine.set(line.id, unshippedQty)
           if (line.qty > 0) {
-            shippedProductRevenueBase += (line.totalGbp * shippedQty) / line.qty
-            unshippedProductRevenueBase += (line.totalGbp * unshippedQty) / line.qty
+            shippedProductRevenueBase += (line.totalBase * shippedQty) / line.qty
+            unshippedProductRevenueBase += (line.totalBase * unshippedQty) / line.qty
           }
         }
 
@@ -1649,8 +1653,8 @@ export async function createRefund(
                 productId: priorRefundLine.productId,
                 description: priorRefundLine.description,
                 qty: Number(priorRefundLine.qty),
-                totalGbp: Number(priorRefundLine.totalGbp),
-                unitPriceGbp: Number(priorRefundLine.unitPriceGbp),
+                totalBase: Number(priorRefundLine.totalBase),
+                unitPriceBase: Number(priorRefundLine.unitPriceBase),
               },
             )
           }
@@ -1768,7 +1772,7 @@ export async function createRefund(
         }
 
         for (const refundLine of createdRefundLines) {
-          const refundLineNet = toNetRevenue(refundLine.totalGbp)
+          const refundLineNet = toNetRevenue(refundLine.totalBase)
           if (!refundLine.productId || refundLine.qty <= 0) {
             nonQtyRevenue += refundLineNet
             continue
@@ -1820,7 +1824,7 @@ export async function createRefund(
                 warehouseId: returnWarehouseId,
                 receivedQty: entry.qty,
                 remainingQty: entry.qty,
-                unitCostGbp: entry.unitCostGbp,
+                unitCostBase: entry.unitCostBase,
               },
             })
           }
@@ -1950,7 +1954,7 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
         orderNumber: ref,
         status: 'DRAFT',
         currency: so.currency,
-        fxRateToGbp: so.fxRateToGbp,
+        fxRateToBase: so.fxRateToBase,
         customerId: so.customerId,
         customerName: so.customerName,
         customerEmail: so.customerEmail,
@@ -1961,10 +1965,10 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
         shippingForeign: so.shippingForeign,
         taxForeign: so.taxForeign,
         totalForeign: so.totalForeign,
-        subtotalGbp: so.subtotalGbp,
-        shippingGbp: so.shippingGbp,
-        taxGbp: so.taxGbp,
-        totalGbp: so.totalGbp,
+        subtotalBase: so.subtotalBase,
+        shippingBase: so.shippingBase,
+        taxBase: so.taxBase,
+        totalBase: so.totalBase,
         shipFromWarehouseId: so.shipFromWarehouseId,
         salesRep: so.salesRep,
         discountStr: so.discountStr,
@@ -1980,14 +1984,14 @@ export async function cloneSalesOrder(id: string): Promise<{ success: boolean; n
             description: l.description,
             qty: l.qty,
             unitPriceForeign: l.unitPriceForeign,
-            unitPriceGbp: l.unitPriceGbp,
+            unitPriceBase: l.unitPriceBase,
             discountStr: l.discountStr,
             discountAmount: l.discountAmount,
             taxRateId: l.taxRateId,
             taxForeign: l.taxForeign,
-            taxGbp: l.taxGbp,
+            taxBase: l.taxBase,
             totalForeign: l.totalForeign,
-            totalGbp: l.totalGbp,
+            totalBase: l.totalBase,
           })),
         },
       },
@@ -2236,7 +2240,7 @@ export async function addPayment(input: {
     // Auto-set paidAt on the order if invoice total is fully paid
     const so = await db.salesOrder.findUnique({
       where: { id: input.orderId },
-      select: { orderNumber: true, externalOrderNumber: true, totalGbp: true, paidAt: true },
+      select: { orderNumber: true, externalOrderNumber: true, totalBase: true, paidAt: true },
     })
     if (so && !so.paidAt) {
       const payments = await db.payment.findMany({
@@ -2244,7 +2248,7 @@ export async function addPayment(input: {
         select: { amount: true },
       })
       const totalPaid = payments.reduce((s, p) => s + Number(p.amount), 0)
-      if (totalPaid >= Number(so.totalGbp)) {
+      if (totalPaid >= Number(so.totalBase)) {
         await db.salesOrder.update({ where: { id: input.orderId }, data: { paidAt: new Date() } })
 
         // Auto-generate invoice if trigger is on_paid (skip its own log —

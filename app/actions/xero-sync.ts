@@ -11,6 +11,8 @@ import { processPendingXeroSync } from '@/lib/connectors/xero'
 import { getXeroSettings, XERO_SETTING_KEYS, type XeroSettings } from '@/lib/connectors/xero/settings'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { xeroGet } from '@/lib/connectors/xero/api'
 
 // Type re-export (allowed in 'use server' files)
 export type { XeroSettings } from '@/lib/connectors/xero/settings'
@@ -42,6 +44,18 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
       const currentEnabled = await getSettingValue('xero_sync_enabled')
       const isTransitioningOn = currentEnabled !== 'true'
       if (isTransitioningOn) {
+        const [imsBaseCurrency, orgRes] = await Promise.all([
+          getBaseCurrencyCode(),
+          xeroGet<{ Organisations?: Array<{ BaseCurrency?: string }>; Organisation?: Array<{ BaseCurrency?: string }> }>('Organisation'),
+        ])
+        const organisations = orgRes.data?.Organisations ?? orgRes.data?.Organisation ?? []
+        const xeroBaseCurrency = organisations[0]?.BaseCurrency?.toUpperCase() ?? null
+        if (!orgRes.ok || !xeroBaseCurrency) {
+          return { success: false, error: 'Cannot enable Xero sync because the connected organisation base currency could not be determined.' }
+        }
+        if (xeroBaseCurrency !== imsBaseCurrency) {
+          return { success: false, error: `Cannot enable Xero sync because the Xero organisation base currency (${xeroBaseCurrency}) does not match the IMS base currency (${imsBaseCurrency}).` }
+        }
         const readiness = await getXeroSyncReadiness()
         if (!readiness.ready) {
           const reasons: string[] = []

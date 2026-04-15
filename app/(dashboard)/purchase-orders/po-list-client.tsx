@@ -10,6 +10,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuSeparator, DropdownMenuCheckboxItem } from '@/components/ui/dropdown-menu'
 import { MobileRecordCard, MobileRecordField, MobileRecordList, ResponsiveTableLayout } from '@/components/ui/mobile-records'
 import { ChevronRight, Search, Settings2, Filter } from 'lucide-react'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { formatMoney } from '@/lib/utils'
 
 function timeAgo(iso: string): string {
   const diff = Date.now() - new Date(iso).getTime()
@@ -135,7 +137,9 @@ function landedCostLabel(method: string): string {
 type Props = { initialPos: PoRow[]; currencySymbols?: Record<string, string> }
 
 export function PoListClient({ initialPos, currencySymbols = {} }: Props) {
-  const sym = (code: string) => currencySymbols[code] ?? (code === 'GBP' ? '£' : code)
+  const baseCurrency = useBaseCurrency()
+  const sym = (code: string) => currencySymbols[code] ?? (code === baseCurrency.code ? baseCurrency.symbol : code)
+  const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const [search, setSearch] = useState('')
   const [statusFilters, setStatusFilters] = useState<Set<PoStatus>>(new Set())
   const [invoicedFilter, setInvoicedFilter] = useState(false)
@@ -244,8 +248,8 @@ export function PoListClient({ initialPos, currencySymbols = {} }: Props) {
         return (
           <TableCell key={key} className="text-right tabular-nums">
             <span className="font-semibold">{po.totalForeign.toFixed(2)}{sym(po.currency)}</span>
-            {po.currency !== 'GBP' && (
-              <span className="text-muted-foreground text-xs font-normal ml-1">(£{po.totalGbp.toFixed(2)})</span>
+            {po.currency !== baseCurrency.code && (
+              <span className="text-muted-foreground text-xs font-normal ml-1">({fmtBase(po.totalBase)})</span>
             )}
           </TableCell>
         )

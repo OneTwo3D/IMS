@@ -14,6 +14,8 @@ import {
 import { saveProductOptions, generateVariantsFromOptions, deleteOrDeactivateVariant } from '@/app/actions/products'
 import type { ProductOptionRow, ProductRow } from '@/app/actions/products'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { formatMoney } from '@/lib/utils'
 
 type Option = { name: string; values: string }
 
@@ -24,6 +26,8 @@ type Props = {
 }
 
 export function VariantGenerator({ productId, initialOptions, variants }: Props) {
+  const baseCurrency = useBaseCurrency()
+  const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const router = useRouter()
   const statusLabels: Record<ProductLifecycleStatus, string> = {
     ACTIVE: 'Active',
@@ -252,7 +256,7 @@ export function VariantGenerator({ productId, initialOptions, variants }: Props)
                       : '—'}
                   </TableCell>
                   <TableCell className="text-right font-mono text-sm">
-                    {v.salesPriceGbp ? `£${Number(v.salesPriceGbp).toFixed(2)}` : '—'}
+                    {v.salesPriceBase ? fmtBase(Number(v.salesPriceBase)) : '—'}
                   </TableCell>
                   <TableCell>
                     <Badge variant={statusVariants[v.lifecycleStatus]} className="text-xs">

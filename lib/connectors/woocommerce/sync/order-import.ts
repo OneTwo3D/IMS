@@ -167,10 +167,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const totalForeign = parseFloat(wcOrder.total) || 0
 
     // GBP conversions
-    const subtotalGbp = Math.round((subtotalForeign / fxRate) * 10000) / 10000
-    const shippingGbp = Math.round((shippingForeign / fxRate) * 10000) / 10000
-    const taxGbp = Math.round((taxForeign / fxRate) * 10000) / 10000
-    const totalGbp = Math.round((totalForeign / fxRate) * 10000) / 10000
+    const subtotalBase = Math.round((subtotalForeign / fxRate) * 10000) / 10000
+    const shippingBase = Math.round((shippingForeign / fxRate) * 10000) / 10000
+    const taxBase = Math.round((taxForeign / fxRate) * 10000) / 10000
+    const totalBase = Math.round((totalForeign / fxRate) * 10000) / 10000
 
     // Line data for Prisma
     const lineData = mappedLines.map((l, idx) => {
@@ -179,7 +179,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       const netForeign = pricesIncludeVat
         ? (l.qty * l.unitPriceForeign - l.discountAmount) / (1 + rate)
         : l.qty * l.unitPriceForeign - l.discountAmount
-      const unitPriceGbp = Math.round((l.unitPriceForeign / fxRate) * 1000000) / 1000000
+      const unitPriceBase = Math.round((l.unitPriceForeign / fxRate) * 1000000) / 1000000
       const totalLineForeign = Math.round(netForeign * 10000) / 10000
       const totalLineGbp = Math.round((totalLineForeign / fxRate) * 10000) / 10000
       const taxLineForeign = l.taxForeign
@@ -192,14 +192,14 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         description: l.description,
         qty: l.qty,
         unitPriceForeign: l.unitPriceForeign,
-        unitPriceGbp,
+        unitPriceBase,
         discountStr: l.discountStr,
         discountAmount: l.discountAmount,
         taxRateId: resolved.taxRateId,
         taxForeign: taxLineForeign,
-        taxGbp: taxLineGbp,
+        taxBase: taxLineGbp,
         totalForeign: totalLineForeign,
-        totalGbp: totalLineGbp,
+        totalBase: totalLineGbp,
       }
     })
 
@@ -235,7 +235,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           status: imsStatus,
           shipFromWarehouseId: wcDefaultWarehouseId,
           currency,
-          fxRateToGbp: fxRate,
+          fxRateToBase: fxRate,
           customerId,
           customerName,
           customerEmail: wcOrder.billing.email || null,
@@ -249,10 +249,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           taxForeign,
           pricesIncludeVat: !!pricesIncludeVat && taxRateValue > 0,
           totalForeign,
-          subtotalGbp,
-          shippingGbp,
-          taxGbp,
-          totalGbp,
+          subtotalBase,
+          shippingBase,
+          taxBase,
+          totalBase,
           discountStr: orderDiscount.discountStr,
           discountAmount: orderDiscount.discountAmount,
           notes: wcOrder.customer_note || null,

@@ -240,7 +240,7 @@ export async function getFxRateToGbp(currency: string): Promise<number> {
     orderBy: { fetchedAt: 'desc' },
     select: { rate: true },
   })
-  // fxRateToGbp in the SalesOrder means: foreign / fxRate = GBP
-  // So if 1 GBP = 1.15 EUR, fxRateToGbp = 1.15
+  // fxRateToBase in the SalesOrder means: foreign / fxRate = GBP
+  // So if 1 GBP = 1.15 EUR, fxRateToBase = 1.15
   return rate ? Number(rate.rate) : 1
 }

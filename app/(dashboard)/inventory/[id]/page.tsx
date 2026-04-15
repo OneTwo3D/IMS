@@ -17,6 +17,8 @@ import { Card } from '@/components/ui/card'
 import { StockDetailPopup } from '@/components/inventory/stock-detail-popups'
 import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
 import { hasExternalProductLink } from '@/lib/shopping'
+import { getBaseCurrencyDisplay } from '@/lib/base-currency'
+import { formatMoney } from '@/lib/utils'
 
 const TYPE_LABELS: Record<ProductType, string> = {
   SIMPLE: 'Simple',
@@ -59,6 +61,8 @@ export default async function ProductDetailPage({
     getActiveAdjustmentReasons(),
     getStockUnitOptions(),
   ])
+  const baseCurrency = await getBaseCurrencyDisplay()
+  const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
 
   if (!product) notFound()
 
@@ -143,8 +147,8 @@ export default async function ProductDetailPage({
                 widthCm: product.widthCm,
                 heightCm: product.heightCm,
                 depthCm: product.depthCm,
-                salesPriceGbp: product.salesPriceGbp ?? undefined,
-                salePriceGbp: product.salePriceGbp ?? undefined,
+                salesPriceBase: product.salesPriceBase ?? undefined,
+                salePriceBase: product.salePriceBase ?? undefined,
                 salesPriceTaxInclusive: product.salesPriceTaxInclusive,
                 taxCategory: product.taxCategory,
                 stockUnit: product.stockUnit,
@@ -300,7 +304,7 @@ export default async function ProductDetailPage({
               {Number(product.inventoryValue) > 0 && (
                 <div className="mt-3 pt-3 border-t border-border flex justify-between text-sm">
                   <span className="text-muted-foreground">Unit COGS (components)</span>
-                  <span className="font-mono font-semibold">£{Number(product.inventoryValue).toFixed(2)}</span>
+                  <span className="font-mono font-semibold">{fmtBase(Number(product.inventoryValue))}</span>
                 </div>
               )}
               <p className="text-xs text-muted-foreground mt-2">
@@ -404,13 +408,13 @@ export default async function ProductDetailPage({
                   <div className="pt-2 mt-1 border-t border-border space-y-1">
                     <div className="flex justify-between items-center text-sm">
                       <span className="text-muted-foreground">COGS Value</span>
-                      <span className="font-mono font-semibold">£{Number(product.inventoryValue).toFixed(2)}</span>
+                      <span className="font-mono font-semibold">{fmtBase(Number(product.inventoryValue))}</span>
                     </div>
                     <div className="flex justify-between items-center text-sm">
                       <span className="text-muted-foreground">Avg Unit Cost</span>
                       <span className="font-mono">
                         {Number(product.totalStock) > 0
-                          ? `£${(Number(product.inventoryValue) / Number(product.totalStock)).toFixed(2)}`
+                          ? fmtBase(Number(product.inventoryValue) / Number(product.totalStock))
                           : '—'}
                       </span>
                     </div>
@@ -446,7 +450,7 @@ export default async function ProductDetailPage({
                         <span className="text-muted-foreground">
                           {new Date(c.receivedAt).toLocaleDateString('en-GB')}
                         </span>
-                        <span className="font-mono">£{Number(c.unitCostGbp).toFixed(2)}</span>
+                        <span className="font-mono">{fmtBase(Number(c.unitCostBase))}</span>
                       </div>
                       <div className="text-xs text-muted-foreground">
                         {Number(c.remainingQty).toLocaleString()} remaining of{' '}
@@ -481,9 +485,9 @@ export default async function ProductDetailPage({
                       <span className="font-mono font-medium">
                         {s.lastUnitCost}{s.currencySymbol}
                       </span>
-                      {s.gbpEquivalent && s.currency !== 'GBP' && (
+                      {s.baseEquivalent && s.currency !== baseCurrency.code && (
                         <span className="font-mono text-muted-foreground text-xs">
-                          (£{s.gbpEquivalent})
+                          ({fmtBase(Number(s.baseEquivalent))})
                           {s.fxRate && (
                             <span className="ml-1 opacity-60">
                               @ {s.fxRate}
@@ -491,11 +495,11 @@ export default async function ProductDetailPage({
                           )}
                         </span>
                       )}
-                      {s.currency === 'GBP' && (
-                        <span className="font-mono text-muted-foreground text-xs">£{s.gbpEquivalent}</span>
+                      {s.currency === baseCurrency.code && (
+                        <span className="font-mono text-muted-foreground text-xs">{fmtBase(Number(s.baseEquivalent))}</span>
                       )}
                     </div>
-                    {s.fxFetchedAt && s.currency !== 'GBP' && (
+                    {s.fxFetchedAt && s.currency !== baseCurrency.code && (
                       <div className="text-xs text-muted-foreground opacity-60">
                         Rate as of {s.fxFetchedAt.toLocaleDateString('en-GB')}
                       </div>

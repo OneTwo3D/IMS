@@ -38,6 +38,7 @@ import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow, PurchaseUnitRow } from '@/app/actions/settings'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { formatMoney } from '@/lib/utils'
 import { PoFormDialog } from '../po-form'
 
@@ -473,13 +474,14 @@ function BillDialog({
   currencies: CurrencyRow[]
   onClose: () => void
 }) {
+  const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [step, setStep] = useState<1 | 2>(1)
   const [error, setError] = useState('')
 
-  const symbolMap: Record<string, string> = { GBP: '£' }
-  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { GBP: 'PREFIX' }
+  const symbolMap: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
+  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
   for (const c of currencies) {
     symbolMap[c.code] = c.symbol
     positionMap[c.code] = c.symbolPosition
@@ -908,6 +910,7 @@ function PayBillDialog({
   invoice: InvoiceRow
   onClose: () => void
 }) {
+  const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [error, setError] = useState('')
@@ -917,8 +920,9 @@ function PayBillDialog({
   const [paymentDate, setPaymentDate] = useState(new Date().toISOString().slice(0, 10))
   const [reference, setReference] = useState(invoice.invoiceNumber ?? '')
 
-  const sym = po.currency === 'GBP' ? '£' : po.currency
-  const money = (n: number) => formatMoney(n, sym, 'PREFIX')
+  const sym = po.currency === baseCurrency.code ? baseCurrency.symbol : po.currency
+  const symPos = po.currency === baseCurrency.code ? baseCurrency.symbolPosition : 'PREFIX'
+  const money = (n: number) => formatMoney(n, sym, symPos)
 
   // Load bank accounts on mount
   useEffect(() => {
@@ -1069,12 +1073,13 @@ function EditFreightCostsDialog({
   currencies: CurrencyRow[]
   onClose: () => void
 }) {
+  const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [error, setError] = useState('')
 
-  const symbolMap: Record<string, string> = { GBP: '£' }
-  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { GBP: 'PREFIX' }
+  const symbolMap: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
+  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
   for (const c of currencies) {
     symbolMap[c.code] = c.symbol
     positionMap[c.code] = c.symbolPosition
@@ -1298,13 +1303,14 @@ function ShipDialog({
 // ---------------------------------------------------------------------------
 
 export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate }: Props) {
+  const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const po = initialPo
 
   // Currency symbol + position lookup
-  const symbolMap: Record<string, string> = { GBP: '£' }
-  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { GBP: 'PREFIX' }
+  const symbolMap: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
+  const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
   for (const c of currencies) {
     symbolMap[c.code] = c.symbol
     positionMap[c.code] = c.symbolPosition
@@ -1312,6 +1318,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const sym = symbolMap[po.currency] ?? po.currency
   const symPos = positionMap[po.currency] ?? 'PREFIX'
   const money = (n: number) => formatMoney(n, sym, symPos)
+  const baseMoney = (n: number) => formatMoney(n, baseCurrency.symbol, baseCurrency.symbolPosition)
 
   const [editing, setEditing] = useState(false)
   const [showReceive, setShowReceive] = useState(false)
@@ -1531,7 +1538,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             <span className="text-muted-foreground">Currency</span>
             <p className="font-medium">
               {po.currency} ({sym})
-              {po.currency !== 'GBP' && <span className="text-muted-foreground ml-1 text-xs">1 GBP = {po.fxRateToGbp} {sym}</span>}
+              {po.currency !== baseCurrency.code && <span className="text-muted-foreground ml-1 text-xs">1 {baseCurrency.code} = {po.fxRateToBase} {sym}</span>}
             </p>
           </div>
           <div>
@@ -1620,10 +1627,10 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                 {po.lines.some((l) => l.discountAmount > 0) && (
                   <TableHead className="px-4 text-xs text-right w-24">Discount</TableHead>
                 )}
-                {po.currency !== 'GBP' && (
+                {po.currency !== baseCurrency.code && (
                   <TableHead className="px-4 text-xs text-right w-28">Unit Cost (£)</TableHead>
                 )}
-                {po.totalLandedCostGbp > 0 && (
+                {po.totalLandedCostBase > 0 && (
                   <TableHead className="px-4 text-xs text-right w-28">Gross Cost (£)</TableHead>
                 )}
                 <TableHead className="px-4 text-xs text-right w-28">Total ({sym})</TableHead>
@@ -1655,14 +1662,14 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                       {line.discountAmount > 0 ? (line.discountStr ?? formatMoney(-line.discountAmount, sym)) : '—'}
                     </TableCell>
                   )}
-                  {po.currency !== 'GBP' && (
+                  {po.currency !== baseCurrency.code && (
                     <TableCell className="px-4 text-right tabular-nums font-mono text-xs text-muted-foreground">
-                      {formatMoney(line.unitCostGbp, '£', 'PREFIX')}
+                      {baseMoney(line.unitCostBase)}
                     </TableCell>
                   )}
-                  {po.totalLandedCostGbp > 0 && (
+                  {po.totalLandedCostBase > 0 && (
                     <TableCell className="px-4 text-right tabular-nums font-mono text-xs font-medium">
-                      {formatMoney(line.grossUnitCostGbp, '£', 'PREFIX')}
+                      {baseMoney(line.grossUnitCostBase)}
                     </TableCell>
                   )}
                   <TableCell className="px-4 text-right tabular-nums font-mono text-xs">
@@ -1682,7 +1689,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             <tfoot className="border-t bg-muted/30 text-sm">
               {(() => {
                 const hasDiscountCol = po.lines.some((l) => l.discountAmount > 0)
-                const labelSpan = 3 + (hasDiscountCol ? 1 : 0) + (po.currency !== 'GBP' ? 1 : 0) + (po.totalLandedCostGbp > 0 ? 1 : 0)
+                const labelSpan = 3 + (hasDiscountCol ? 1 : 0) + (po.currency !== baseCurrency.code ? 1 : 0) + (po.totalLandedCostBase > 0 ? 1 : 0)
                 // Total discount = sum of line discounts + order-level
                 // discount. The stored `subtotalForeign` is already
                 // post-discount; we surface the breakdown for clarity.
@@ -1726,8 +1733,8 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                     <td colSpan={labelSpan} className="px-4 py-2 text-right font-medium text-muted-foreground">Total</td>
                     <td className="px-4 py-2 text-right tabular-nums font-mono">
                       <span className="font-semibold">{money(po.totalForeign)}</span>
-                      {po.currency !== 'GBP' && (
-                        <span className="text-muted-foreground font-normal text-xs ml-1">({formatMoney(po.totalGbp, '£', 'PREFIX')})</span>
+                      {po.currency !== baseCurrency.code && (
+                        <span className="text-muted-foreground font-normal text-xs ml-1">({baseMoney(po.totalBase)})</span>
                       )}
                     </td>
                     <td colSpan={3} />
@@ -1746,7 +1753,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
             <Ship className="h-4 w-4 text-muted-foreground" />
             Linked Landed Cost POs ({po.linkedFreightPos.length})
             <span className="ml-auto text-xs text-muted-foreground font-normal">
-              Total landed cost: £{po.totalLandedCostGbp.toFixed(2)}
+              Total landed cost: {baseMoney(po.totalLandedCostBase)}
             </span>
           </div>
           <div className="divide-y">
@@ -1758,14 +1765,14 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                   </a>
                   <div className="flex items-center gap-3 text-xs">
                     <span className="text-muted-foreground">{fl.freightPo.supplierName}</span>
-                    <span className="font-mono font-medium">£{fl.freightPo.totalGbp.toFixed(2)}</span>
+                    <span className="font-mono font-medium">{baseMoney(fl.freightPo.totalBase)}</span>
                     <span className="text-muted-foreground">({fl.method})</span>
                   </div>
                 </div>
                 {fl.freightPo.costLines.map((cl, i) => (
                   <div key={i} className="flex items-center justify-between text-xs text-muted-foreground pl-4">
                     <span>{cl.description}</span>
-                    <span className="font-mono">£{cl.amountGbp.toFixed(2)}</span>
+                    <span className="font-mono">{baseMoney(cl.amountBase)}</span>
                   </div>
                 ))}
               </div>
@@ -1789,7 +1796,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
                 </a>
                 <div className="flex items-center gap-3 text-xs">
                   <span className="text-muted-foreground">{pp.supplierName}</span>
-                  <span className="font-mono font-medium">£{pp.totalGbp.toFixed(2)}</span>
+                  <span className="font-mono font-medium">{baseMoney(pp.totalBase)}</span>
                 </div>
               </div>
             ))}

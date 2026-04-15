@@ -11,6 +11,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuCheckboxItem } from '@/components/ui/dropdown-menu'
 import { MobileRecordCard, MobileRecordField, MobileRecordList, ResponsiveTableLayout } from '@/components/ui/mobile-records'
 import { ChevronRight, Search, Settings2, Filter } from 'lucide-react'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { formatMoney } from '@/lib/utils'
 import { countryName } from '@/lib/countries'
 
 const STATUS_LABELS: Record<SoStatus, string> = {
@@ -144,7 +146,9 @@ type Props = { initialOrders: SoRow[]; currencySymbols?: Record<string, string> 
 const COMPLETED_STATUSES: SoStatus[] = ['COMPLETED', 'DELIVERED']
 
 export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
-  const sym = (code: string) => currencySymbols[code] ?? (code === 'GBP' ? '£' : code)
+  const baseCurrency = useBaseCurrency()
+  const sym = (code: string) => currencySymbols[code] ?? (code === baseCurrency.code ? baseCurrency.symbol : code)
+  const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const [search, setSearch] = useState('')
   const [statusFilters, setStatusFilters] = useState<Set<SoStatus>>(new Set())
   const [completedOrders, setCompletedOrders] = useState<SoRow[] | null>(null)
@@ -247,8 +251,8 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
         return (
           <TableCell key={key} className="text-right tabular-nums">
             <span className="font-semibold">{so.totalForeign.toFixed(2)}{sym(so.currency)}</span>
-            {so.currency !== 'GBP' && (
-              <span className="text-muted-foreground text-xs font-normal ml-1">(£{so.totalGbp.toFixed(2)})</span>
+            {so.currency !== baseCurrency.code && (
+              <span className="text-muted-foreground text-xs font-normal ml-1">({fmtBase(so.totalBase)})</span>
             )}
           </TableCell>
         )
@@ -309,7 +313,7 @@ export function SoListClient({ initialOrders, currencySymbols = {} }: Props) {
       case 'cogs':
         return (
           <TableCell key={key} className="text-right tabular-nums text-xs">
-            {so.cogsGbp != null ? `£${so.cogsGbp.toFixed(2)}` : '—'}
+            {so.cogsBase != null ? fmtBase(so.cogsBase) : '—'}
           </TableCell>
         )
       case 'profit': {

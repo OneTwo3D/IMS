@@ -11,6 +11,8 @@ import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { anonymiseCustomer, type CustomerDetail, type AddressData } from '@/app/actions/customers'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { formatMoney } from '@/lib/utils'
 
 const STATUS_LABELS: Record<string, string> = {
   DRAFT: 'Draft',
@@ -43,8 +45,6 @@ const STATUS_CLASS: Record<string, string> = {
   REFUNDED: 'bg-red-100 text-red-800 border-red-200 dark:bg-red-900 dark:text-red-200',
   PARTIALLY_REFUNDED: 'bg-orange-100 text-orange-800 border-orange-200 dark:bg-orange-900 dark:text-orange-200',
 }
-
-function fmtGbp(v: number): string { return `£${v.toLocaleString('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}` }
 
 function fmtDate(iso: string): string {
   return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })
@@ -116,6 +116,8 @@ function GdprDialog({ customer, onClose }: { customer: CustomerDetail; onClose: 
 type Props = { customer: CustomerDetail }
 
 export function CustomerDetailClient({ customer }: Props) {
+  const baseCurrency = useBaseCurrency()
+  const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const [showGdpr, setShowGdpr] = useState(false)
 
   const currentYear = new Date().getFullYear()
@@ -187,17 +189,17 @@ export function CustomerDetailClient({ customer }: Props) {
 
         {/* Turnover */}
         <Card className="p-5">
-          <h2 className="text-sm font-semibold mb-3">Turnover (GBP)</h2>
+          <h2 className="text-sm font-semibold mb-3">Turnover ({baseCurrency.code})</h2>
           <div className="space-y-2">
             <div className="flex justify-between items-baseline">
               <span className="text-xs text-muted-foreground">All time</span>
-              <span className="text-lg font-semibold tabular-nums">{fmtGbp(customer.totalTurnoverGbp)}</span>
+              <span className="text-lg font-semibold tabular-nums">{fmtBase(customer.totalTurnoverBase)}</span>
             </div>
             <div className="border-t pt-2 space-y-1">
               {recentYears.map((year) => (
                 <div key={year} className="flex justify-between items-baseline">
                   <span className="text-xs text-muted-foreground">{year}</span>
-                  <span className="text-sm font-medium tabular-nums">{fmtGbp(customer.annualTurnoverGbp[year] ?? 0)}</span>
+                  <span className="text-sm font-medium tabular-nums">{fmtBase(customer.annualTurnoverBase[year] ?? 0)}</span>
                 </div>
               ))}
             </div>
@@ -219,7 +221,7 @@ export function CustomerDetailClient({ customer }: Props) {
                 <TableHead className="px-4 text-xs">Status</TableHead>
                 <TableHead className="px-4 text-xs text-right">Lines</TableHead>
                 <TableHead className="px-4 text-xs text-right">Total</TableHead>
-                <TableHead className="px-4 text-xs text-right">GBP</TableHead>
+                <TableHead className="px-4 text-xs text-right">{baseCurrency.code}</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -238,9 +240,9 @@ export function CustomerDetailClient({ customer }: Props) {
                   </TableCell>
                   <TableCell className="px-4 text-right text-xs tabular-nums">{o.lineCount}</TableCell>
                   <TableCell className="px-4 text-right text-xs tabular-nums">
-                    {o.currency !== 'GBP' ? `${o.currency} ${o.totalForeign.toFixed(2)}` : fmtGbp(o.totalForeign)}
+                    {o.currency !== baseCurrency.code ? `${o.currency} ${o.totalForeign.toFixed(2)}` : fmtBase(o.totalForeign)}
                   </TableCell>
-                  <TableCell className="px-4 text-right text-xs tabular-nums font-medium">{fmtGbp(o.totalGbp)}</TableCell>
+                  <TableCell className="px-4 text-right text-xs tabular-nums font-medium">{fmtBase(o.totalBase)}</TableCell>
                 </TableRow>
               ))}
             </TableBody>

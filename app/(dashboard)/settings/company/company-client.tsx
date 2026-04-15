@@ -23,16 +23,19 @@ import {
   type BrandingColours,
   type DocumentTemplateData,
 } from '@/app/actions/company'
+import type { CurrencyRow } from '@/app/actions/currencies'
 
 type ShoppingConnectorSummary = { id: string; label: string; available: boolean }
 
 type Props = {
   org: OrganisationData
+  baseCurrencyLocked: boolean
   numbering: NumberingFormats
   email: EmailSettings
   branding: BrandingColours
   templates: DocumentTemplateData[]
   shoppingConnectors: ShoppingConnectorSummary[]
+  currencies: CurrencyRow[]
 }
 
 const TABS = [
@@ -55,7 +58,7 @@ const TEMPLATE_LABELS: Record<string, string> = {
   manufacturing_order: 'Manufacturing Order',
 }
 
-export function CompanySettingsClient({ org, numbering, email, branding, templates, shoppingConnectors }: Props) {
+export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, email, branding, templates, shoppingConnectors, currencies }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [tab, setTab] = useState<Tab>('company')
@@ -93,6 +96,7 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
     startTransition(async () => {
       const result = await updateOrganisation(co)
       if (result.success) showSaved('company')
+      else if (result.error) alert(result.error)
     })
   }
 
@@ -305,6 +309,27 @@ export function CompanySettingsClient({ org, numbering, email, branding, templat
             {coField('legalName', 'Legal Name')}
             {coField('vatNumber', 'VAT Number')}
             {coField('companyNumber', 'Company Number')}
+            <div className="space-y-1.5">
+              <Label className="text-xs">Base Currency</Label>
+              <select
+                value={co.baseCurrency}
+                onChange={(e) => setCo((p) => ({ ...p, baseCurrency: e.target.value }))}
+                className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm font-mono"
+                disabled={baseCurrencyLocked}
+              >
+                {currencies
+                  .filter((c) => c.active)
+                  .sort((a, b) => a.code.localeCompare(b.code))
+                  .map((c) => (
+                    <option key={c.code} value={c.code}>{c.code} {c.symbol}</option>
+                  ))}
+              </select>
+              <p className="text-xs text-muted-foreground">
+                {baseCurrencyLocked
+                  ? 'Base currency is locked. Reset the database to change it.'
+                  : 'Set this once during setup. Saving it locks the base currency for this database.'}
+              </p>
+            </div>
           </div>
 
           <h3 className="text-sm font-medium mb-3">Address</h3>

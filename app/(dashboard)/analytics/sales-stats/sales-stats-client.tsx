@@ -11,6 +11,8 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { ProductLink } from '@/components/inventory/product-link'
 import { saveView, type SalesStatRow, type SalesStatSummary, type ShipmentRow, type DetailRow, type InvoiceRow, type RefundRow, type CustomerAgingRow, type SavedView } from '@/app/actions/sales-stats'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { formatMoney } from '@/lib/utils'
 
 type Tab = 'products' | 'shipments' | 'details' | 'invoices' | 'refunds' | 'aging'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -36,7 +38,6 @@ const TABS: { key: Tab; label: string }[] = [
   { key: 'aging', label: 'Customer Aging' },
 ]
 
-function fmtGbp(v: number): string { return `£${v.toFixed(2)}` }
 function fmtDate(iso: string): string { return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' }) }
 function makeId() { return Math.random().toString(36).slice(2, 8) }
 
@@ -53,16 +54,16 @@ const PRODUCT_FIELDS: FieldDef[] = [
   { key: 'qtySold', label: 'Qty Sold', type: 'number' },
   { key: 'qtyRefunded', label: 'Qty Refunded', type: 'number' },
   { key: 'netQty', label: 'Net Qty', type: 'number' },
-  { key: 'grossRevenue', label: 'Gross Revenue (£)', type: 'number' },
-  { key: 'discounts', label: 'Discounts (£)', type: 'number' },
-  { key: 'refunds', label: 'Refunds (£)', type: 'number' },
-  { key: 'netRevenue', label: 'Net Revenue (£)', type: 'number' },
-  { key: 'cogs', label: 'COGS (£)', type: 'number' },
-  { key: 'grossProfit', label: 'Gross Profit (£)', type: 'number' },
+  { key: 'grossRevenue', label: 'Gross Revenue', type: 'number' },
+  { key: 'discounts', label: 'Discounts', type: 'number' },
+  { key: 'refunds', label: 'Refunds', type: 'number' },
+  { key: 'netRevenue', label: 'Net Revenue', type: 'number' },
+  { key: 'cogs', label: 'COGS', type: 'number' },
+  { key: 'grossProfit', label: 'Gross Profit', type: 'number' },
   { key: 'marginPct', label: 'Margin %', type: 'number' },
   { key: 'orderCount', label: 'Order Count', type: 'number' },
-  { key: 'avgOrderValue', label: 'Avg Order Value (£)', type: 'number' },
-  { key: 'salesPrice', label: 'Sales Price (£)', type: 'number' },
+  { key: 'avgOrderValue', label: 'Avg Order Value', type: 'number' },
+  { key: 'salesPrice', label: 'Sales Price', type: 'number' },
   { key: 'weight', label: 'Weight (kg)', type: 'number' },
   { key: 'currentStock', label: 'Qty on Hand', type: 'number' },
   { key: 'reservedQty', label: 'Qty Allocated', type: 'number' },
@@ -81,7 +82,7 @@ const SHIPMENT_FIELDS: FieldDef[] = [
   { key: 'shippingService', label: 'Service', type: 'text' },
   { key: 'shippedAt', label: 'Date', type: 'text' },
   { key: 'warehouse', label: 'Warehouse', type: 'text' },
-  { key: 'totalGbp', label: 'Total (£)', type: 'number' },
+  { key: 'totalBase', label: 'Total', type: 'number' },
 ]
 
 const DETAIL_FIELDS: FieldDef[] = [
@@ -92,7 +93,7 @@ const DETAIL_FIELDS: FieldDef[] = [
   { key: 'salesRep', label: 'Sales Rep', type: 'text' },
   { key: 'status', label: 'Status', type: 'select', options: ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED', 'REFUNDED', 'CANCELLED'] },
   { key: 'qty', label: 'Qty', type: 'number' },
-  { key: 'totalGbp', label: 'Total (£)', type: 'number' },
+  { key: 'totalBase', label: 'Total', type: 'number' },
   { key: 'createdAt', label: 'Created', type: 'text' },
   { key: 'orderNumber', label: 'Order', type: 'text' },
   { key: 'type', label: 'Product Type', type: 'text' },
@@ -109,8 +110,8 @@ const INVOICE_FIELDS: FieldDef[] = [
   { key: 'salesRep', label: 'Sales Rep', type: 'text' },
   { key: 'status', label: 'Status', type: 'select', options: ['Paid', 'Unpaid'] },
   { key: 'qty', label: 'Qty', type: 'number' },
-  { key: 'totalGbp', label: 'Total (£)', type: 'number' },
-  { key: 'balance', label: 'Balance (£)', type: 'number' },
+  { key: 'totalBase', label: 'Total', type: 'number' },
+  { key: 'balance', label: 'Balance', type: 'number' },
 ]
 
 const REFUND_FIELDS: FieldDef[] = [
@@ -120,7 +121,7 @@ const REFUND_FIELDS: FieldDef[] = [
   { key: 'refundedAt', label: 'Date', type: 'text' },
   { key: 'salesRep', label: 'Sales Rep', type: 'text' },
   { key: 'qty', label: 'Qty', type: 'number' },
-  { key: 'totalGbp', label: 'Total (£)', type: 'number' },
+  { key: 'totalBase', label: 'Total', type: 'number' },
   { key: 'pctOfSale', label: '% of Sale', type: 'number' },
   { key: 'reason', label: 'Reason', type: 'text' },
   { key: 'customerName', label: 'Customer', type: 'text' },
@@ -132,15 +133,15 @@ const AGING_FIELDS: FieldDef[] = [
   { key: 'salesRep', label: 'Sales Rep', type: 'text' },
   { key: 'warehouse', label: 'Warehouse', type: 'text' },
   { key: 'createdAt', label: 'Date', type: 'text' },
-  { key: 'salesTotal', label: 'Sales (£)', type: 'number' },
-  { key: 'refundsTotal', label: 'Refunds (£)', type: 'number' },
-  { key: 'netTotal', label: 'Net Total (£)', type: 'number' },
-  { key: 'dueAmount', label: 'Due (£)', type: 'number' },
+  { key: 'salesTotal', label: 'Sales', type: 'number' },
+  { key: 'refundsTotal', label: 'Refunds', type: 'number' },
+  { key: 'netTotal', label: 'Net Total', type: 'number' },
+  { key: 'dueAmount', label: 'Due', type: 'number' },
   { key: 'avgDso', label: 'Avg DSO', type: 'number' },
-  { key: 'overdue0_30', label: '0-30d (£)', type: 'number' },
-  { key: 'overdue31_60', label: '31-60d (£)', type: 'number' },
-  { key: 'overdue61_90', label: '61-90d (£)', type: 'number' },
-  { key: 'overdue91plus', label: '91d+ (£)', type: 'number' },
+  { key: 'overdue0_30', label: '0-30d', type: 'number' },
+  { key: 'overdue31_60', label: '31-60d', type: 'number' },
+  { key: 'overdue61_90', label: '61-90d', type: 'number' },
+  { key: 'overdue91plus', label: '91d+', type: 'number' },
 ]
 
 const TAB_FIELDS: Record<Tab, FieldDef[]> = {
@@ -155,9 +156,9 @@ const TAB_FIELDS: Record<Tab, FieldDef[]> = {
 const DEFAULT_COLS: Record<Tab, string[]> = {
   products: ['sku', 'name', 'qtySold', 'netQty', 'grossRevenue', 'discounts', 'netRevenue', 'cogs', 'grossProfit', 'marginPct', 'orderCount'],
   shipments: ['productName', 'orderNumber', 'trackingNumber', 'sku', 'barcode', 'customerName', 'salesRep', 'qty', 'shippingService', 'shippedAt'],
-  details: ['productName', 'sku', 'barcode', 'customerName', 'salesRep', 'status', 'qty', 'totalGbp', 'createdAt'],
-  invoices: ['productName', 'orderNumber', 'invoiceNumber', 'invoicedAt', 'sku', 'customerName', 'salesRep', 'status', 'totalGbp'],
-  refunds: ['productName', 'orderNumber', 'creditNoteNumber', 'refundedAt', 'salesRep', 'qty', 'totalGbp', 'pctOfSale', 'reason'],
+  details: ['productName', 'sku', 'barcode', 'customerName', 'salesRep', 'status', 'qty', 'totalBase', 'createdAt'],
+  invoices: ['productName', 'orderNumber', 'invoiceNumber', 'invoicedAt', 'sku', 'customerName', 'salesRep', 'status', 'totalBase'],
+  refunds: ['productName', 'orderNumber', 'creditNoteNumber', 'refundedAt', 'salesRep', 'qty', 'totalBase', 'pctOfSale', 'reason'],
   aging: ['orderNumber', 'customerName', 'salesRep', 'warehouse', 'createdAt', 'salesTotal', 'refundsTotal', 'netTotal', 'dueAmount', 'avgDso', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus'],
 }
 
@@ -349,6 +350,9 @@ function StatusBadge({ status }: { status: string }) {
 // Main
 // ---------------------------------------------------------------------------
 export function SalesStatsClient({ productStats, shipments, details, invoices, refunds, aging, savedViews }: Props) {
+  const baseCurrency = useBaseCurrency()
+  const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
+  const moneyLabel = (label: string) => `${label} (${baseCurrency.code})`
   const [tab, setTab] = useState<Tab>('products')
   const [filterRules, setFilterRules] = useState<FilterRule[]>([])
   const [visibleColsMap, setVisibleColsMap] = useState<Record<Tab, string[]>>({ ...DEFAULT_COLS })
@@ -430,16 +434,16 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
     qtySold: { label: 'Sold', align: 'right', render: (r) => <span className="tabular-nums text-xs">{r.qtySold}</span>, footer: () => <span className="tabular-nums">{summary.totalQtySold}</span> },
     qtyRefunded: { label: 'Refunded', align: 'right', render: (r) => <span className="tabular-nums text-xs text-orange-600">{r.qtyRefunded > 0 ? r.qtyRefunded : '—'}</span> },
     netQty: { label: 'Net Qty', align: 'right', render: (r) => <span className="tabular-nums text-xs font-medium">{r.netQty}</span> },
-    grossRevenue: { label: 'Gross Rev', align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{fmtGbp(r.grossRevenue)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtGbp(summary.totalGrossRevenue)}</span> },
-    discounts: { label: 'Discounts', align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-destructive">{r.discounts > 0 ? fmtGbp(r.discounts) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-destructive">{fmtGbp(summary.totalDiscounts)}</span> },
-    refunds: { label: 'Refunds', align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-orange-600">{r.refunds > 0 ? fmtGbp(r.refunds) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-orange-600">{fmtGbp(summary.totalRefunds)}</span> },
-    netRevenue: { label: 'Net Revenue', align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono font-medium">{fmtGbp(r.netRevenue)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtGbp(summary.totalNetRevenue)}</span> },
-    cogs: { label: 'COGS', align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.cogs > 0 ? fmtGbp(r.cogs) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-muted-foreground">{fmtGbp(summary.totalCogs)}</span> },
-    grossProfit: { label: 'Profit', align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono ${r.grossProfit >= 0 ? 'text-green-600' : 'text-destructive'}`}>{fmtGbp(r.grossProfit)}</span>, footer: () => <span className="tabular-nums font-mono text-green-600">{fmtGbp(summary.totalGrossProfit)}</span> },
+    grossRevenue: { label: moneyLabel('Gross Rev'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{fmtBase(r.grossRevenue)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtBase(summary.totalGrossRevenue)}</span> },
+    discounts: { label: moneyLabel('Discounts'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-destructive">{r.discounts > 0 ? fmtBase(r.discounts) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-destructive">{fmtBase(summary.totalDiscounts)}</span> },
+    refunds: { label: moneyLabel('Refunds'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-orange-600">{r.refunds > 0 ? fmtBase(r.refunds) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-orange-600">{fmtBase(summary.totalRefunds)}</span> },
+    netRevenue: { label: moneyLabel('Net Revenue'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono font-medium">{fmtBase(r.netRevenue)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtBase(summary.totalNetRevenue)}</span> },
+    cogs: { label: moneyLabel('COGS'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.cogs > 0 ? fmtBase(r.cogs) : '—'}</span>, footer: () => <span className="tabular-nums font-mono text-muted-foreground">{fmtBase(summary.totalCogs)}</span> },
+    grossProfit: { label: moneyLabel('Profit'), align: 'right', render: (r) => <span className={`tabular-nums text-xs font-mono ${r.grossProfit >= 0 ? 'text-green-600' : 'text-destructive'}`}>{fmtBase(r.grossProfit)}</span>, footer: () => <span className="tabular-nums font-mono text-green-600">{fmtBase(summary.totalGrossProfit)}</span> },
     marginPct: { label: 'Margin', align: 'right', render: (r) => <span className={`tabular-nums text-xs ${r.marginPct < 0 ? 'text-destructive' : ''}`}>{r.marginPct}%</span>, footer: () => <span className="tabular-nums">{summary.avgMarginPct}%</span> },
     orderCount: { label: 'Orders', align: 'right', render: (r) => <span className="tabular-nums text-xs text-muted-foreground">{r.orderCount}</span>, footer: () => <span className="tabular-nums text-muted-foreground">{summary.totalOrders}</span> },
-    avgOrderValue: { label: 'Avg Order', align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{fmtGbp(r.avgOrderValue)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtGbp(summary.avgOrderValue)}</span> },
-    salesPrice: { label: 'List Price', align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{r.salesPrice != null ? fmtGbp(r.salesPrice) : '—'}</span> },
+    avgOrderValue: { label: moneyLabel('Avg Order'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{fmtBase(r.avgOrderValue)}</span>, footer: () => <span className="tabular-nums font-mono">{fmtBase(summary.avgOrderValue)}</span> },
+    salesPrice: { label: moneyLabel('List Price'), align: 'right', render: (r) => <span className="tabular-nums text-xs font-mono">{r.salesPrice != null ? fmtBase(r.salesPrice) : '—'}</span> },
     weight: { label: 'Weight', align: 'right', render: (r) => <span className="tabular-nums text-xs">{r.weight != null ? `${r.weight}kg` : '—'}</span> },
     currentStock: { label: 'On Hand', align: 'right', render: (r) => <span className="tabular-nums text-xs">{r.currentStock}</span> },
     reservedQty: { label: 'Allocated', align: 'right', render: (r) => <span className={`tabular-nums text-xs ${r.reservedQty > 0 ? 'text-orange-600' : 'text-muted-foreground'}`}>{r.reservedQty > 0 ? r.reservedQty : '—'}</span> },
@@ -456,14 +460,14 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
       if (key === 'productName') return row.productId ? <ProductLink productId={row.productId} sku="" name={row.productName} /> : <span className="truncate max-w-40 block text-xs">{row.productName}</span>
       if (key === 'orderNumber') return <Link href={`/sales/${row.orderId}`} className="hover:underline font-mono text-xs">{row.orderNumber}</Link>
       if (key === 'shippedAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
-      if (key === 'totalGbp') return <span className="tabular-nums text-xs font-mono">{fmtGbp(v)}</span>
+      if (key === 'totalBase') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
       if (key === 'qty') return <span className="tabular-nums text-xs">{v}</span>
     }
     if (tabKey === 'details') {
       if (key === 'productName') return row.productId ? <ProductLink productId={row.productId} sku="" name={row.productName} /> : <span className="truncate max-w-40 block text-xs">{row.productName}</span>
       if (key === 'orderNumber') return <Link href={`/sales/${row.orderId}`} className="hover:underline font-mono text-xs">{row.orderNumber}</Link>
       if (key === 'status') return <StatusBadge status={v} />
-      if (key === 'totalGbp') return <span className="tabular-nums text-xs font-mono">{fmtGbp(v)}</span>
+      if (key === 'totalBase') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
       if (key === 'qty') return <span className="tabular-nums text-xs">{v}</span>
       if (key === 'createdAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
     }
@@ -472,28 +476,28 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
       if (key === 'orderNumber') return <Link href={`/sales/${row.orderId}`} className="hover:underline font-mono text-xs">{row.orderNumber}</Link>
       if (key === 'invoicedAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
       if (key === 'status') return row.paidAt ? <StatusBadge status="Paid" /> : <StatusBadge status="Unpaid" />
-      if (key === 'totalGbp' || key === 'balance') return <span className="tabular-nums text-xs font-mono">{fmtGbp(v)}</span>
+      if (key === 'totalBase' || key === 'balance') return <span className="tabular-nums text-xs font-mono">{fmtBase(v)}</span>
       if (key === 'qty') return <span className="tabular-nums text-xs">{v}</span>
     }
     if (tabKey === 'refunds') {
       if (key === 'productName') return row.productId ? <ProductLink productId={row.productId} sku="" name={row.productName} /> : <span className="truncate max-w-40 block text-xs">{row.productName}</span>
       if (key === 'orderNumber') return <Link href={`/sales/${row.orderId}`} className="hover:underline font-mono text-xs">{row.orderNumber}</Link>
       if (key === 'refundedAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
-      if (key === 'totalGbp') return <span className="tabular-nums text-xs font-mono text-destructive">{fmtGbp(v)}</span>
+      if (key === 'totalBase') return <span className="tabular-nums text-xs font-mono text-destructive">{fmtBase(v)}</span>
       if (key === 'pctOfSale') return <span className="tabular-nums text-xs text-muted-foreground">{v}%</span>
       if (key === 'qty') return <span className="tabular-nums text-xs">{v}</span>
     }
     if (tabKey === 'aging') {
       if (key === 'orderNumber') return <Link href={`/sales/${row.orderId}`} className="hover:underline font-mono text-xs">{row.orderNumber}</Link>
       if (key === 'createdAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
-      if (key === 'salesTotal' || key === 'netTotal') return <span className="tabular-nums text-xs font-mono font-medium">{fmtGbp(v)}</span>
-      if (key === 'refundsTotal') return <span className="tabular-nums text-xs font-mono text-orange-600">{v > 0 ? fmtGbp(v) : '—'}</span>
-      if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0.01 ? 'text-orange-600 font-medium' : ''}`}>{v > 0.01 ? fmtGbp(v) : '—'}</span>
+      if (key === 'salesTotal' || key === 'netTotal') return <span className="tabular-nums text-xs font-mono font-medium">{fmtBase(v)}</span>
+      if (key === 'refundsTotal') return <span className="tabular-nums text-xs font-mono text-orange-600">{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0.01 ? 'text-orange-600 font-medium' : ''}`}>{v > 0.01 ? fmtBase(v) : '—'}</span>
       if (key === 'avgDso') return <span className="tabular-nums text-xs text-muted-foreground">{v > 0 ? `${v}d` : '—'}</span>
-      if (key === 'overdue0_30') return <span className="tabular-nums text-xs font-mono">{v > 0 ? fmtGbp(v) : '—'}</span>
-      if (key === 'overdue31_60') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-orange-600' : ''}`}>{v > 0 ? fmtGbp(v) : '—'}</span>
-      if (key === 'overdue61_90') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-orange-600 font-medium' : ''}`}>{v > 0 ? fmtGbp(v) : '—'}</span>
-      if (key === 'overdue91plus') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`}>{v > 0 ? fmtGbp(v) : '—'}</span>
+      if (key === 'overdue0_30') return <span className="tabular-nums text-xs font-mono">{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'overdue31_60') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-orange-600' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'overdue61_90') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-orange-600 font-medium' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>
+      if (key === 'overdue91plus') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>
     }
 
     // Default
@@ -505,7 +509,7 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
   function isRightAligned(key: string): boolean {
     const f = fields.find((fd) => fd.key === key)
     if (f?.type === 'number') return true
-    if (['totalGbp', 'balance', 'qty', 'salesTotal', 'refundsTotal', 'netTotal', 'dueAmount', 'avgDso', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus', 'pctOfSale'].includes(key)) return true
+    if (['totalBase', 'balance', 'qty', 'salesTotal', 'refundsTotal', 'netTotal', 'dueAmount', 'avgDso', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus', 'pctOfSale'].includes(key)) return true
     return false
   }
 
@@ -551,9 +555,9 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
 
       {/* Summary cards */}
       <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-5 gap-3">
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Net Revenue</p><p className="text-xl font-bold">{fmtGbp(summary.totalNetRevenue)}</p></div>
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">COGS</p><p className="text-xl font-bold">{fmtGbp(summary.totalCogs)}</p></div>
-        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Gross Profit</p><p className="text-xl font-bold text-green-600">{fmtGbp(summary.totalGrossProfit)}</p></div>
+        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Net Revenue</p><p className="text-xl font-bold">{fmtBase(summary.totalNetRevenue)}</p></div>
+        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">COGS</p><p className="text-xl font-bold">{fmtBase(summary.totalCogs)}</p></div>
+        <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Gross Profit</p><p className="text-xl font-bold text-green-600">{fmtBase(summary.totalGrossProfit)}</p></div>
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Avg Margin</p><p className="text-xl font-bold">{summary.avgMarginPct}%</p></div>
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Orders / Qty</p><p className="text-xl font-bold">{summary.totalOrders} / {summary.totalQtySold}</p></div>
       </div>

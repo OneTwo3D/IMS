@@ -5,6 +5,7 @@ import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 
 export type SupplierRow = {
   id: string
@@ -185,6 +186,7 @@ export async function getSupplier(id: string): Promise<SupplierRow | null> {
 export async function createSupplier(input: SupplierInput): Promise<{ success: boolean; supplier?: SupplierRow; error?: string }> {
   await requirePermission('purchasing.create')
   try {
+    const baseCurrency = await getBaseCurrencyCode()
     const s = await db.supplier.create({
       data: {
         name: input.name,
@@ -197,7 +199,7 @@ export async function createSupplier(input: SupplierInput): Promise<{ success: b
         county: input.county || null,
         postcode: input.postcode || null,
         country: input.country || null,
-        currency: input.currency || 'GBP',
+        currency: input.currency || baseCurrency,
         taxRateId: input.taxRateId || null,
         vatNumber: input.vatNumber || null,
         accountNumber: input.accountNumber || null,
@@ -255,6 +257,7 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
 export async function importSuppliersCsv(formData: FormData): Promise<{ success?: boolean; count?: number; error?: string }> {
   await requirePermission('purchasing.create')
   try {
+    const baseCurrency = await getBaseCurrencyCode()
     const file = formData.get('file') as File
     if (!file) return { error: 'No file' }
     const rows = parseCsv(await file.text())
@@ -265,7 +268,7 @@ export async function importSuppliersCsv(formData: FormData): Promise<{ success?
       await db.supplier.create({
         data: {
           name, contactName: r.contactName || null, email: r.email || null, phone: r.phone || null,
-          currency: r.currency || 'GBP', vatNumber: r.vatNumber || null, accountNumber: r.accountNumber || null,
+          currency: r.currency || baseCurrency, vatNumber: r.vatNumber || null, accountNumber: r.accountNumber || null,
           paymentTermsDays: r.paymentTermsDays ? parseInt(r.paymentTermsDays) : null,
           addressLine1: r.addressLine1 || null, addressLine2: r.addressLine2 || null,
           city: r.city || null, county: r.county || null, postcode: r.postcode || null, country: r.country || null,
