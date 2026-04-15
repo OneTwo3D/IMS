@@ -9,9 +9,11 @@ import { DataRetentionSetting } from '@/components/settings/data-retention'
 import { DatabaseReset } from '@/components/settings/database-reset'
 import { CronJobsSettings } from '@/components/settings/cron-jobs-settings'
 import { IntegrationPluginsSettings } from '@/components/settings/integration-plugins-settings'
+import { PublicAppUrlSettings } from '@/components/settings/public-app-url-settings'
 import type { CronJobState } from '@/components/settings/cron-jobs-settings'
 import { getAllCronJobs } from '@/lib/cron-jobs'
 import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
+import { getPublicAppUrlInfo } from '@/lib/public-app-url'
 
 export const metadata: Metadata = { title: 'System Settings' }
 
@@ -34,8 +36,9 @@ export default async function SystemSettingsPage({
   const activeTab: Tab = TABS.some((t) => t.key === raw) ? (raw as Tab) : 'scheduler'
 
   // Only fetch data needed for the active tab
-  const [pluginState, cronJobs, retentionData] = await Promise.all([
+  const [pluginState, publicAppUrl, cronJobs, retentionData] = await Promise.all([
     activeTab === 'plugins' || activeTab === 'scheduler' ? getIntegrationPluginState() : null,
+    activeTab === 'scheduler' ? getPublicAppUrlInfo() : null,
     activeTab === 'scheduler' ? loadCronJobs() : null,
     activeTab === 'retention' ? loadRetentionData() : null,
   ])
@@ -82,13 +85,25 @@ export default async function SystemSettingsPage({
       )}
 
       {activeTab === 'scheduler' && cronJobs && (
-        <Card className="p-6">
-          <p className="text-sm text-muted-foreground mb-4">
-            Enable or disable cron jobs and set their frequency. Changes are applied to the
-            system crontab when you save.
-          </p>
-          <CronJobsSettings jobs={cronJobs} />
-        </Card>
+        <div className="space-y-6">
+          <Card className="p-6">
+            <div className="flex items-center gap-2 mb-4">
+              <Timer className="h-4 w-4 text-muted-foreground" />
+              <h2 className="text-base font-semibold">Public URL</h2>
+            </div>
+            <PublicAppUrlSettings
+              currentValue={publicAppUrl?.value ?? ''}
+              source={publicAppUrl?.source ?? 'none'}
+            />
+          </Card>
+          <Card className="p-6">
+            <p className="text-sm text-muted-foreground mb-4">
+              Enable or disable cron jobs and set their frequency. Changes are applied to the
+              system crontab when you save.
+            </p>
+            <CronJobsSettings jobs={cronJobs} />
+          </Card>
+        </div>
       )}
 
       {activeTab === 'retention' && retentionData && (

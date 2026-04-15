@@ -319,6 +319,7 @@ fi
 header "Writing .env configuration"
 
 AUTH_SECRET="$(openssl rand -base64 32)"
+ENCRYPTION_KEY="$(openssl rand -base64 32)"
 CRON_SECRET="$(openssl rand -hex 32)"
 
 cat > "${APP_DIR}/.env" <<EOF
@@ -327,6 +328,7 @@ cat > "${APP_DIR}/.env" <<EOF
 NEXT_PUBLIC_APP_URL=https://${APP_DOMAIN}
 NODE_ENV=production
 AUTH_SECRET=${AUTH_SECRET}
+ENCRYPTION_KEY=${ENCRYPTION_KEY}
 AUTH_URL=https://${APP_DOMAIN}
 
 DATABASE_URL=${DATABASE_URL}
@@ -352,6 +354,7 @@ CRON_SECRET=${CRON_SECRET}
 FX_BASE_CURRENCY=GBP
 
 PDF_TEMP_DIR=/tmp/${APP_NAME}/pdf
+BACKUP_DIR=${BACKUP_DIR}
 UPLOAD_MAX_SIZE_MB=10
 UPLOAD_TEMP_DIR=/tmp/${APP_NAME}/uploads
 

@@ -4,7 +4,7 @@ import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { checkDeliveryStatus } from '@/lib/trackship'
 
 export async function GET(request: Request) {
-  const cronErr = verifyCron(request)
+  const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance

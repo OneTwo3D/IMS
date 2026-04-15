@@ -25,7 +25,7 @@ To create a new order manually:
 
 When WooCommerce sync is configured, orders are imported automatically into the system. These orders display a **WooCommerce link** that takes you directly to the order in your WC admin panel. This link only appears for orders that were synced from WooCommerce (i.e. those with a WC Order ID).
 
-WooCommerce orders follow the full completion flow: when WC marks an order as completed, the system auto-allocates stock and creates shipments with tracking information. See the **WooCommerce Integration** guide for details on sync configuration.
+WooCommerce orders follow the full completion flow: when WC marks an order as completed, the system auto-allocates stock and creates shipments with tracking information. See the **WooCommerce Integration** help page for details on sync configuration.
 
 ## Order Statuses
 

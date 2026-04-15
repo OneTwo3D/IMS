@@ -6,7 +6,7 @@ import { processPendingXeroSync } from '@/lib/connectors/xero/sync-processor'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
 export async function GET(request: Request) {
-  const cronErr = verifyCron(request)
+  const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance

@@ -7,7 +7,7 @@ import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
 // Called by cron: curl http://localhost:3000/api/cron/wc-reconcile
 export async function GET(request: Request) {
-  const cronErr = verifyCron(request)
+  const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance

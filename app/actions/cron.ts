@@ -6,7 +6,9 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
 import { getAllCronJobs } from '@/lib/cron-jobs'
+import { getCronSecret } from '@/lib/cron-secret'
 import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
+import { getPublicAppUrl } from '@/lib/public-app-url'
 
 // Strict cron expression validation: 5 fields, only digits / * / , / - / /
 const CRON_RE = /^(\*|(\*\/)?[0-9]+([,-][0-9]+)*)( (\*|(\*\/)?[0-9]+([,-][0-9]+)*)){4}$/
@@ -18,12 +20,15 @@ const CRON_RE = /^(\*|(\*\/)?[0-9]+([,-][0-9]+)*)( (\*|(\*\/)?[0-9]+([,-][0-9]+)
 export async function syncCrontab(): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
 
-  const secret = process.env.CRON_SECRET
+  const secret = await getCronSecret()
   if (!secret) {
-    return { success: false, error: 'CRON_SECRET env var is not configured.' }
+    return { success: false, error: 'Cron secret is not configured.' }
   }
 
-  const baseUrl = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000'
+  const baseUrl = await getPublicAppUrl()
+  if (!baseUrl) {
+    return { success: false, error: 'Public app URL is not configured.' }
+  }
   const pluginState = await getIntegrationPluginState()
   const jobs = getAllCronJobs().filter((job) => isIntegrationModuleVisible(job.module, pluginState))
 

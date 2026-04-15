@@ -197,9 +197,9 @@ What it does:
 
 Order reconcile also backfills orders that were intentionally skipped while `wc_initial_import_completed` was not yet `true`. The reconcile path uses its own `last_wc_order_reconcile_at` cursor, so the first reconcile after initial import completion can import those missed live orders.
 
-The cron endpoints require a `CRON_SECRET` header for security. See the [Installation guide](installation.md) for cron setup instructions.
+The cron endpoints require a `CRON_SECRET` header for security. Cron setup is typically handled by your administrator during deployment.
 
-For a repeatable live verification checklist, see the [WooCommerce live verification runbook](woocommerce-live-runbook.md).
+Live verification runbooks are internal administrator documentation and are not part of the in-app help.
 
 ## Historical Order Import (Forecasting)
 

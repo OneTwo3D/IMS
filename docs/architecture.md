@@ -57,7 +57,8 @@
 | `lib/connectors/` | External system connectors (WooCommerce, with interfaces for Shopify, Xero, QuickBooks) |
 | `lib/connectors/woocommerce/` | WooCommerce connector module — order import, status sync, refund sync, product sync, stock sync |
 | `prisma/` | Database schema, migrations, and seed data |
-| `docs/` | User-facing documentation (rendered in the app) |
+| `help-docs/` | User-facing help articles rendered in the app |
+| `docs/` | Internal/admin/reference documentation kept in git only, plus repo copies of the user help docs |
 | `scripts/` | Installation and maintenance scripts |
 | `public/uploads/` | User-uploaded files (branding, avatars) |
 

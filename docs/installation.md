@@ -3,7 +3,7 @@
 ## Prerequisites
 
 - **Operating system**: Debian 11/12 or Ubuntu 22.04/24.04 (tested in LXC containers)
-- **Node.js**: Version 20 or later (installed automatically by the install script)
+- **Node.js**: Version 22 (installed automatically by the install script)
 - **PostgreSQL**: Version 14 or later (installed automatically, or provide an external connection)
 - **nginx**: Used as the reverse proxy (installed automatically)
 - **Internet access**: Required during installation for downloading packages
@@ -74,12 +74,11 @@ The installer asks for the following values during setup. Press Enter to accept 
 |---|---|
 | `/opt/one-two-inventory` | Application root directory |
 | `/opt/one-two-inventory/.env` | Environment configuration (chmod 600) |
-| `/opt/one-two-inventory/backups` | Local backup files |
+| `/var/lib/one-two-inventory/backups` | Runtime backup storage directory used by backup create/restore/upload flows |
 | `/opt/one-two-inventory/uploads` | Uploaded files (invoices, etc.) |
 | `/opt/one-two-inventory/public/uploads/branding` | Logo and branding images |
 | `/opt/one-two-inventory/public/uploads/avatars` | User avatar images |
 | `/var/lib/one-two-inventory` | Persistent data directory |
-| `/var/lib/one-two-inventory/xero` | Xero OAuth token storage |
 | `/var/log/one-two-inventory` | Application logs |
 
 
@@ -173,6 +172,7 @@ Key variables in the `.env` file:
 | `NEXT_PUBLIC_APP_URL` | Public URL of the application (e.g. `https://ims.yourdomain.com`) |
 | `NODE_ENV` | Set to `production` for deployment |
 | `AUTH_SECRET` | Secret key for signing session tokens (auto-generated) |
+| `ENCRYPTION_KEY` | Key used to encrypt sensitive values stored in the database (auto-generated) |
 | `AUTH_URL` | Authentication callback URL (same as app URL) |
 | `DATABASE_URL` | PostgreSQL connection string |
 | `REDIS_URL` | Redis connection URL |
@@ -183,13 +183,12 @@ Key variables in the `.env` file:
 | `WC_WEBHOOK_SECRET` | Secret for verifying WooCommerce webhooks |
 | `XERO_CLIENT_ID` | Xero OAuth client ID |
 | `XERO_CLIENT_SECRET` | Xero OAuth client secret |
-| `XERO_TENANT_ID` | Xero organisation tenant ID |
-| `XERO_TOKEN_PATH` | Path to Xero token JSON file |
 | `FX_BASE_CURRENCY` | Base currency for exchange rates (default: `GBP`) |
 | `PDF_TEMP_DIR` | Temporary directory for PDF generation |
+| `BACKUP_DIR` | Local backup storage directory |
 | `UPLOAD_MAX_SIZE_MB` | Maximum upload file size in MB (default: `10`) |
 | `CRON_SECRET` | Shared secret for authenticating cron endpoint requests |
-| `SMTP_HOST` | SMTP server hostname (can also be configured in Settings) |
+| `SMTP_HOST` | SMTP server hostname if you choose to manage mail via env rather than app settings |
 | `SMTP_PORT` | SMTP server port |
 | `SMTP_USER` | SMTP authentication username |
 | `SMTP_PASS` | SMTP authentication password |

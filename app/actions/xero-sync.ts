@@ -9,6 +9,7 @@ import { getAuthorizationUrl, disconnect, isConnected } from '@/lib/connectors/x
 import { syncChartOfAccounts, getXeroTaxRates } from '@/lib/connectors/xero'
 import { processPendingXeroSync } from '@/lib/connectors/xero'
 import { getXeroSettings, XERO_SETTING_KEYS, type XeroSettings } from '@/lib/connectors/xero/settings'
+import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 
 // Type re-export (allowed in 'use server' files)
@@ -100,7 +101,7 @@ export async function getXeroConnectionStatus(): Promise<{
 export async function connectXero(
   clientId: string,
   clientSecret: string,
-  origin: string,
+  _origin: string,
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
   try {
     const session = await requireAdmin()
@@ -117,7 +118,11 @@ export async function connectXero(
     // Build Xero authorization URL — user's browser will redirect here.
     // `state` is persisted server-side bound to the initiating user and
     // validated in the callback (CSRF / mix-up protection).
-    const redirectUri = `${origin}/api/accounting/callback`
+    const publicAppUrl = await getPublicAppUrl()
+    if (!publicAppUrl) {
+      return { success: false, error: 'Public app URL is not configured.' }
+    }
+    const redirectUri = `${publicAppUrl}/api/accounting/callback`
     const authUrl = await getAuthorizationUrl(clientId, redirectUri, session.user.id)
 
     return { success: true, redirectUrl: authUrl }

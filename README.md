@@ -106,9 +106,10 @@ scripts/
 ## Documentation
 
 - [Architecture](docs/architecture.md)
-- [Configuration](docs/configuration.md)
-- [Development](docs/development.md)
-- [Deployment](docs/deployment.md)
+- [Installation & Deployment](docs/installation.md)
+- [WooCommerce Integration](docs/woocommerce.md)
+- [Xero Accounting Sync](docs/xero-sync.md)
+- [In-App Help Docs](help-docs/README.md)
 
 ## License
 

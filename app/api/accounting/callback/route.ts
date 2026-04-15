@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { exchangeCodeForTokens, consumeXeroOAuthState } from '@/lib/connectors/xero/auth'
 import { logActivity } from '@/lib/activity-log'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { getPublicAppUrl } from '@/lib/public-app-url'
 
 function getExternalOrigin(request: Request): string {
   const fwdProto = (request.headers.get('x-forwarded-proto') ?? 'https').split(',')[0].trim()
@@ -46,7 +47,8 @@ export async function GET(request: Request) {
   }
 
   try {
-    const redirectUri = `${origin}/api/accounting/callback`
+    const publicAppUrl = await getPublicAppUrl()
+    const redirectUri = `${(publicAppUrl ?? origin).replace(/\/+$/, '')}/api/accounting/callback`
     const result = await exchangeCodeForTokens(code, redirectUri)
 
     if (result.success) {

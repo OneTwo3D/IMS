@@ -4,7 +4,7 @@ import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { fetchAllFxRatesInternal } from '@/app/actions/currencies'
 
 export async function GET(request: Request) {
-  const err = verifyCron(request)
+  const err = await verifyCron(request)
   if (err) return err
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance

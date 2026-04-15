@@ -28,7 +28,7 @@ function getDbConfig() {
 }
 
 export async function GET(request: Request) {
-  const cronErr = verifyCron(request)
+  const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance

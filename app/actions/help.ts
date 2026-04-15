@@ -1,6 +1,6 @@
 'use server'
 
-import { readFile, readdir } from 'fs/promises'
+import { access, readFile } from 'fs/promises'
 import path from 'path'
 
 export type HelpDoc = {
@@ -9,74 +9,52 @@ export type HelpDoc = {
   content: string
 }
 
-const DOCS_DIR = path.join(process.cwd(), 'docs')
+const DOCS_DIR = path.join(process.cwd(), 'help-docs')
 
-const TITLE_MAP: Record<string, string> = {
-  'getting-started': 'Getting Started',
-  'dashboard': 'Dashboard',
-  'inventory': 'Inventory Management',
-  'stock-control': 'Stock Control',
-  'purchasing': 'Purchasing',
-  'sales': 'Sales Orders',
-  'manufacturing': 'Manufacturing',
-  'analytics': 'Analytics & Reports',
-  'settings': 'Settings',
-  'backup-restore': 'Backup & Restore',
-  'user-management': 'User Management & Security',
-  'documents-email': 'Documents & Email',
-  'activity-log': 'Activity Log',
-  'xero-sync': 'Accounting Sync',
-  'installation': 'Installation & Deployment',
-  'architecture': 'Architecture',
-}
+const HELP_DOCS = [
+  { slug: 'getting-started', title: 'Getting Started' },
+  { slug: 'dashboard', title: 'Dashboard' },
+  { slug: 'inventory', title: 'Inventory Management' },
+  { slug: 'stock-control', title: 'Stock Control' },
+  { slug: 'purchasing', title: 'Purchasing' },
+  { slug: 'sales', title: 'Sales Orders' },
+  { slug: 'manufacturing', title: 'Manufacturing' },
+  { slug: 'analytics', title: 'Analytics & Reports' },
+  { slug: 'settings', title: 'Settings' },
+  { slug: 'user-management', title: 'User Management & Security' },
+  { slug: 'documents-email', title: 'Documents & Email' },
+  { slug: 'activity-log', title: 'Activity Log' },
+  { slug: 'woocommerce', title: 'WooCommerce Integration' },
+  { slug: 'xero-sync', title: 'Xero Accounting Sync' },
+] as const
 
-const DOC_ORDER = [
-  'getting-started',
-  'dashboard',
-  'inventory',
-  'stock-control',
-  'purchasing',
-  'sales',
-  'manufacturing',
-  'analytics',
-  'settings',
-  'backup-restore',
-  'user-management',
-  'documents-email',
-  'activity-log',
-  'xero-sync',
-  'installation',
-  'architecture',
-]
+const HELP_SLUGS = new Set(HELP_DOCS.map((doc) => doc.slug))
 
 function extractTitle(content: string, slug: string): string {
   const match = content.match(/^#\s+(.+)$/m)
-  return match?.[1] ?? TITLE_MAP[slug] ?? slug
+  return match?.[1] ?? HELP_DOCS.find((doc) => doc.slug === slug)?.title ?? slug
 }
 
 export async function getHelpDocs(): Promise<{ slug: string; title: string }[]> {
-  try {
-    const files = await readdir(DOCS_DIR)
-    const docs = files
-      .filter((f) => f.endsWith('.md'))
-      .map((f) => {
-        const slug = f.replace('.md', '')
-        return { slug, title: TITLE_MAP[slug] ?? slug }
-      })
-      .sort((a, b) => {
-        const ai = DOC_ORDER.indexOf(a.slug)
-        const bi = DOC_ORDER.indexOf(b.slug)
-        return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi)
-      })
-    return docs
-  } catch {
-    return []
-  }
+  const docs = await Promise.all(
+    HELP_DOCS.map(async (doc) => {
+      try {
+        await access(path.join(DOCS_DIR, `${doc.slug}.md`))
+        return doc
+      } catch {
+        return null
+      }
+    }),
+  )
+  return docs.filter(Boolean) as { slug: string; title: string }[]
 }
 
 export async function getHelpDoc(slug: string): Promise<HelpDoc | null> {
   try {
     const safeName = slug.replace(/[^a-zA-Z0-9-]/g, '')
+    if (!HELP_SLUGS.has(safeName as (typeof HELP_DOCS)[number]['slug'])) {
+      return null
+    }
     const filePath = path.join(DOCS_DIR, `${safeName}.md`)
     const content = await readFile(filePath, 'utf-8')
     return {
