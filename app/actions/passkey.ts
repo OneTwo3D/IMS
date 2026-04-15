@@ -14,7 +14,7 @@ import { randomBytes } from 'crypto'
 import { db } from '@/lib/db'
 import { auth } from '@/lib/auth'
 import { logActivity } from '@/lib/activity-log'
-import { setAuthToken } from '@/lib/auth/token-store'
+import { consumeAuthToken, setAuthToken } from '@/lib/auth/token-store'
 
 const RP_NAME = 'onetwoInventory'
 const RP_ID = process.env.NEXT_PUBLIC_APP_URL
@@ -22,20 +22,12 @@ const RP_ID = process.env.NEXT_PUBLIC_APP_URL
   : 'localhost'
 const ORIGIN = process.env.NEXT_PUBLIC_APP_URL ?? 'http://localhost:3000'
 
-// In-memory challenge store (short-lived, per-request)
-// In production with multiple instances, use Redis. For single-instance this is fine.
-const challengeStore = new Map<string, { challenge: string; expires: number }>()
-
-function setChallenge(key: string, challenge: string) {
-  challengeStore.set(key, { challenge, expires: Date.now() + 5 * 60 * 1000 })
+async function setChallenge(key: string, challenge: string) {
+  await setAuthToken(`passkey_challenge:${key}`, challenge, 5 * 60 * 1000)
 }
 
-function getChallenge(key: string): string | null {
-  const entry = challengeStore.get(key)
-  if (!entry) return null
-  challengeStore.delete(key)
-  if (Date.now() > entry.expires) return null
-  return entry.challenge
+async function getChallenge(key: string): Promise<string | null> {
+  return consumeAuthToken(`passkey_challenge:${key}`)
 }
 
 // --- Registration ---
@@ -66,7 +58,7 @@ export async function getPasskeyRegistrationOptions() {
     },
   })
 
-  setChallenge(`reg:${user.id}`, options.challenge)
+  await setChallenge(`reg:${user.id}`, options.challenge)
 
   return { options }
 }
@@ -78,7 +70,7 @@ export async function verifyPasskeyRegistration(
   const session = await auth()
   if (!session?.user?.id) return { error: 'Unauthorized' }
 
-  const challenge = getChallenge(`reg:${session.user.id}`)
+  const challenge = await getChallenge(`reg:${session.user.id}`)
   if (!challenge) return { error: 'Challenge expired. Please try again.' }
 
   try {
@@ -117,28 +109,14 @@ export async function verifyPasskeyRegistration(
 // --- Authentication ---
 
 export async function getPasskeyAuthenticationOptions(email?: string) {
-  const allowCredentials: { id: string }[] = []
   const challengeKey = email ? `auth:${email}` : `auth:discoverable`
-
-  if (email) {
-    const user = await db.user.findUnique({
-      where: { email },
-      select: { passkeys: { select: { credentialId: true, transports: true } } },
-    })
-    if (user?.passkeys.length) {
-      for (const p of user.passkeys) {
-        allowCredentials.push({ id: p.credentialId })
-      }
-    }
-  }
 
   const options = await generateAuthenticationOptions({
     rpID: RP_ID,
-    allowCredentials: allowCredentials.length > 0 ? allowCredentials : undefined,
     userVerification: 'preferred',
   })
 
-  setChallenge(challengeKey, options.challenge)
+  await setChallenge(challengeKey, options.challenge)
 
   return { options, challengeKey }
 }
@@ -147,7 +125,7 @@ export async function verifyPasskeyAuthentication(
   response: AuthenticationResponseJSON,
   challengeKey: string,
 ) {
-  const challenge = getChallenge(challengeKey)
+  const challenge = await getChallenge(challengeKey)
   if (!challenge) return { error: 'Challenge expired. Please try again.' }
 
   // Find the passkey by credential ID

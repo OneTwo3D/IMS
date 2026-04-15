@@ -8,6 +8,7 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import type { WcFullOrder } from './types'
 import { extractWcTracking } from './field-mapping'
 
@@ -22,14 +23,14 @@ export async function processWcCompletion(orderId: string, wcOrder: WcFullOrder)
   const allocCount = await db.orderAllocation.count({ where: { orderId } })
   if (allocCount === 0) {
     const { autoAllocateOrder } = await import('@/app/actions/allocation')
-    await autoAllocateOrder(orderId)
+    await autoAllocateOrder(orderId, { internalBypassToken: INTERNAL_ACTION_BYPASS })
   }
 
   // Step 2: Create shipments if none exist
   const shipmentCount = await db.shipment.count({ where: { orderId } })
   if (shipmentCount === 0) {
     const { confirmAllocations } = await import('@/app/actions/allocation')
-    await confirmAllocations(orderId)
+    await confirmAllocations(orderId, { internalBypassToken: INTERNAL_ACTION_BYPASS })
   }
 
   // Step 3: Extract tracking from WC order meta
@@ -61,12 +62,14 @@ export async function processWcCompletion(orderId: string, wcOrder: WcFullOrder)
         shipment.id,
         target,
         target === 'SHIPPED' ? extra : undefined,
+        { internalBypassToken: INTERNAL_ACTION_BYPASS },
       )
       if (!result.success) {
-        logActivity({
+        await logActivity({
           entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_completion_error', tag: 'sync', level: 'WARNING',
           description: `WC completion flow: failed to transition shipment to ${target}: ${result.error}`,
           metadata: { shipmentId: shipment.id, target, error: result.error },
+          resolveUser: false,
         })
         break // stop this shipment, try next
       }
@@ -79,9 +82,10 @@ export async function processWcCompletion(orderId: string, wcOrder: WcFullOrder)
     await db.salesOrder.update({ where: { id: orderId }, data: { status: 'COMPLETED' } })
   }
 
-  logActivity({
+  await logActivity({
     entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_completion_processed', tag: 'sync', level: 'INFO',
     description: `Processed WC completion for order #${so.wcOrderNumber} — ${shipments.length} shipment(s) shipped`,
     metadata: { wcOrderId: wcOrder.id, shipmentsProcessed: shipments.length, trackingEntries: wcTracking.length },
+    resolveUser: false,
   })
 }

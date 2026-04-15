@@ -6,7 +6,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
 import { COMPONENT_PRODUCT_STATUSES, OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
-import type { ProductionOrderStatus, ProductionOrderType } from '@/app/generated/prisma/client'
+import { Prisma, type ProductionOrderStatus, type ProductionOrderType } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -360,6 +360,64 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
 // Status changes
 // ---------------------------------------------------------------------------
 
+async function consumeFifoLayers(
+  tx: Prisma.TransactionClient,
+  productId: string,
+  warehouseId: string,
+  qty: number,
+): Promise<{ totalCostGbp: Prisma.Decimal }> {
+  let remaining = new Prisma.Decimal(qty)
+  let totalCostGbp = new Prisma.Decimal(0)
+
+  const layers = await tx.costLayer.findMany({
+    where: {
+      productId,
+      warehouseId,
+      remainingQty: { gt: 0 },
+    },
+    select: {
+      id: true,
+      remainingQty: true,
+      unitCostGbp: true,
+    },
+    orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
+  })
+
+  for (const layer of layers) {
+    if (remaining.lte(0)) break
+    const layerRemaining = new Prisma.Decimal(layer.remainingQty)
+    const takeQty = layerRemaining.lessThan(remaining) ? layerRemaining : remaining
+    if (takeQty.lte(0)) continue
+    await tx.costLayer.update({
+      where: { id: layer.id },
+      data: { remainingQty: { decrement: takeQty } },
+    })
+    totalCostGbp = totalCostGbp.add(takeQty.mul(layer.unitCostGbp))
+    remaining = remaining.sub(takeQty)
+  }
+
+  if (remaining.gt(0)) {
+    throw new Error(`Insufficient FIFO stock for product ${productId} in warehouse ${warehouseId}`)
+  }
+
+  return { totalCostGbp }
+}
+
+async function assertStockAvailable(
+  tx: Prisma.TransactionClient,
+  productId: string,
+  warehouseId: string,
+  qty: number,
+) {
+  const stock = await tx.stockLevel.findUnique({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    select: { quantity: true },
+  })
+  if (!stock || Number(stock.quantity) < qty) {
+    throw new Error(`Insufficient stock for product ${productId} in warehouse ${warehouseId}`)
+  }
+}
+
 export async function updateManufacturingOrderStatus(
   id: string,
   status: ProductionOrderStatus,
@@ -400,14 +458,17 @@ export async function updateManufacturingOrderStatus(
 
         if (isAssembly) {
           // ASSEMBLY: deduct components (and release reservation), add output product
+          let totalAssemblyCostGbp = new Prisma.Decimal(0)
           for (const comp of components) {
             const totalQty = Number(comp.qty) * qtyPlanned
+            await assertStockAvailable(tx, comp.componentId, order.warehouseId, totalQty)
+            const consumed = await consumeFifoLayers(tx, comp.componentId, order.warehouseId, totalQty)
+            totalAssemblyCostGbp = totalAssemblyCostGbp.add(consumed.totalCostGbp)
 
             // Deduct component stock + release reservation if was in progress
-            await tx.stockLevel.upsert({
+            await tx.stockLevel.update({
               where: { productId_warehouseId: { productId: comp.componentId, warehouseId: order.warehouseId } },
-              create: { productId: comp.componentId, warehouseId: order.warehouseId, quantity: -totalQty },
-              update: {
+              data: {
                 quantity: { decrement: totalQty },
                 ...(wasInProgress ? { reservedQty: { decrement: totalQty } } : {}),
               },
@@ -433,6 +494,16 @@ export async function updateManufacturingOrderStatus(
             create: { productId: order.outputProductId, warehouseId: order.warehouseId, quantity: qtyPlanned },
             update: { quantity: { increment: qtyPlanned } },
           })
+          await tx.costLayer.create({
+            data: {
+              productId: order.outputProductId,
+              warehouseId: order.warehouseId,
+              receivedQty: qtyPlanned,
+              remainingQty: qtyPlanned,
+              unitCostGbp: totalAssemblyCostGbp.div(new Prisma.Decimal(qtyPlanned)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP),
+              isOpeningStock: false,
+            },
+          })
 
           // Record PRODUCTION_IN movement
           await tx.stockMovement.create({
@@ -448,10 +519,15 @@ export async function updateManufacturingOrderStatus(
           })
         } else {
           // DISASSEMBLY: deduct output product (and release reservation), add components
-          await tx.stockLevel.upsert({
+          await assertStockAvailable(tx, order.outputProductId, order.warehouseId, qtyPlanned)
+          const recoveredCost = await consumeFifoLayers(tx, order.outputProductId, order.warehouseId, qtyPlanned)
+          const totalRecoveredUnits = components.reduce((sum, item) => sum + Number(item.qty) * qtyPlanned, 0)
+          const recoveredUnitCost = totalRecoveredUnits > 0
+            ? recoveredCost.totalCostGbp.div(new Prisma.Decimal(totalRecoveredUnits)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+            : new Prisma.Decimal(0)
+          await tx.stockLevel.update({
             where: { productId_warehouseId: { productId: order.outputProductId, warehouseId: order.warehouseId } },
-            create: { productId: order.outputProductId, warehouseId: order.warehouseId, quantity: -qtyPlanned },
-            update: {
+            data: {
               quantity: { decrement: qtyPlanned },
               ...(wasInProgress ? { reservedQty: { decrement: qtyPlanned } } : {}),
             },
@@ -476,6 +552,16 @@ export async function updateManufacturingOrderStatus(
               where: { productId_warehouseId: { productId: comp.componentId, warehouseId: order.warehouseId } },
               create: { productId: comp.componentId, warehouseId: order.warehouseId, quantity: totalQty },
               update: { quantity: { increment: totalQty } },
+            })
+            await tx.costLayer.create({
+              data: {
+                productId: comp.componentId,
+                warehouseId: order.warehouseId,
+                receivedQty: totalQty,
+                remainingQty: totalQty,
+                unitCostGbp: recoveredUnitCost,
+                isOpeningStock: false,
+              },
             })
 
             await tx.stockMovement.create({

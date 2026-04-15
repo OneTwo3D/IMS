@@ -5,6 +5,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { wcFetch } from '../api'
+import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import type { WcRefund } from './types'
 
 export async function syncWcRefund(
@@ -85,6 +86,7 @@ export async function syncWcRefund(
       refundLines.filter((l) => l.qty > 0 || l.totalGbp > 0),
       wcRefund.reason || 'WooCommerce refund',
       returnWarehouseId,
+      { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id },
     )
 
     if (!result.success) {
@@ -102,18 +104,6 @@ export async function syncWcRefund(
       return { success: false, error: result.error }
     }
 
-    // Update the refund with wcRefundId
-    const latestRefund = await db.salesOrderRefund.findFirst({
-      where: { orderId: so.id },
-      orderBy: { createdAt: 'desc' },
-    })
-    if (latestRefund) {
-      await db.salesOrderRefund.update({
-        where: { id: latestRefund.id },
-        data: { wcRefundId: wcRefund.id },
-      })
-    }
-
     await db.wcSyncLog.create({
       data: {
         direction: 'FROM_WC',
@@ -125,7 +115,7 @@ export async function syncWcRefund(
       },
     })
 
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: so.id,
       action: 'refund_synced',
@@ -133,6 +123,7 @@ export async function syncWcRefund(
       level: 'INFO',
       description: `Synced WC refund for order #${so.wcOrderNumber} — ${refundAmountForeign.toFixed(2)} ${hasQtyRefund ? '(with restock)' : '(monetary only)'}`,
       metadata: { wcRefundId: wcRefund.id, amount: refundAmountForeign, hasRestock: hasQtyRefund },
+      resolveUser: false,
     })
 
     return { success: true }

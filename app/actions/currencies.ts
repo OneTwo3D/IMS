@@ -121,13 +121,23 @@ export async function toggleCurrency(code: string, active: boolean): Promise<{ s
 async function fetchSingleFxRate(code: string): Promise<number | null> {
   try {
     // Use frankfurter.dev (free, no API key required, ECB data)
-    const res = await fetch(`https://api.frankfurter.dev/v1/latest?base=GBP&symbols=${code}`, {
-      signal: AbortSignal.timeout(10000),
-    })
-    if (!res.ok) return null
-    const data = await res.json()
-    const rate = data?.rates?.[code]
-    if (typeof rate !== 'number' || rate <= 0) return null
+    const safeCode = encodeURIComponent(code)
+    let rate: number | null = null
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const res = await fetch(`https://api.frankfurter.dev/v1/latest?base=GBP&symbols=${safeCode}`, {
+        signal: AbortSignal.timeout(10000),
+      })
+      if (res.ok) {
+        const data = await res.json()
+        const maybeRate = data?.rates?.[code]
+        if (typeof maybeRate === 'number' && maybeRate > 0) {
+          rate = maybeRate
+          break
+        }
+      }
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 1000))
+    }
+    if (rate === null) return null
 
     await db.fxRate.create({
       data: {
@@ -153,14 +163,27 @@ export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; upd
     if (!currencies.length) return { success: true, updated: [], failed: [] }
 
     const codes = currencies.map((c) => c.code)
-    const symbols = codes.join(',')
+    const symbols = encodeURIComponent(codes.join(','))
 
-    const res = await fetch(`https://api.frankfurter.dev/v1/latest?base=GBP&symbols=${symbols}`, {
-      signal: AbortSignal.timeout(15000),
-    })
+    let res: Response | null = null
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      res = await fetch(`https://api.frankfurter.dev/v1/latest?base=GBP&symbols=${symbols}`, {
+        signal: AbortSignal.timeout(15000),
+      }).catch(() => null)
+      if (res?.ok) break
+      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 1500))
+    }
 
-    if (!res.ok) {
-      return { success: false, updated: [], failed: codes, error: `API returned ${res.status}` }
+    if (!res?.ok) {
+      await logActivity({
+        entityType: 'SYNC',
+        tag: 'sync',
+        action: 'fx_rates_fetched',
+        level: 'WARNING',
+        description: `FX rate refresh failed; existing rates remain in use for ${codes.length} currencies`,
+        metadata: { failed: codes, status: res?.status ?? null },
+      })
+      return { success: false, updated: [], failed: codes, error: `API returned ${res?.status ?? 'no response'}` }
     }
 
     const data = await res.json()

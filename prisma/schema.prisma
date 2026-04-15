@@ -140,6 +140,11 @@ enum AccountingSyncType {
   COGS_JOURNAL
   INVENTORY_ADJUSTMENT
   SALES_INVOICE
+  INVOICE_PAYMENT
+  BILL_ATTACHMENT
+  INVOICE_PDF
+  INVOICE_EMAIL
+  WC_INVOICE_NOTE
   CREDIT_NOTE
   STOCK_IN_TRANSIT
   STOCK_RECEIPT
@@ -209,6 +214,13 @@ enum ActivityLogLevel {
   INFO
   WARNING
   ERROR
+}
+
+enum EmailOutboxStatus {
+  PENDING
+  PROCESSING
+  SENT
+  FAILED
 }
 
 enum TaxType {
@@ -666,6 +678,7 @@ model StockMovement {
 model Supplier {
   id              String    @id @default(cuid())
   name            String
+  xeroContactId   String?   @unique
   contactName     String?
   email           String?
   phone           String?
@@ -980,6 +993,7 @@ model Customer {
   id              String    @id @default(cuid())
   firstName       String
   lastName        String
+  xeroContactId   String?   @unique
   email           String?
   phone           String?
   company         String?
@@ -1125,6 +1139,7 @@ model SalesOrderRefund {
   lines           SalesOrderRefundLine[]
   payments        Payment[]
 
+  @@unique([wcRefundId])
   @@map("sales_order_refunds")
 }
 
@@ -1493,6 +1508,7 @@ model ActivityLog {
   @@index([createdAt])
   @@index([tag])
   @@index([level])
+  @@index([level, createdAt])
   @@map("activity_logs")
 }
 
@@ -1529,6 +1545,41 @@ model NotificationReadReceipt {
   @@unique([notificationId, userId])
   @@index([userId])
   @@map("notification_read_receipts")
+}
+
+model EmailOutbox {
+  id                  String           @id @default(cuid())
+  kind                String
+  toEmail             String
+  subject             String
+  html                String
+  attachments         Json?
+  referenceType       String?
+  referenceId         String?
+  status              EmailOutboxStatus @default(PENDING)
+  attempts            Int              @default(0)
+  lastError           String?
+  availableAt         DateTime         @default(now())
+  processingStartedAt DateTime?
+  sentAt              DateTime?
+  createdAt           DateTime         @default(now())
+  updatedAt           DateTime         @updatedAt
+
+  @@index([status, availableAt])
+  @@index([referenceType, referenceId])
+  @@map("email_outbox")
+}
+
+model EmailSuppression {
+  id         String   @id @default(cuid())
+  email      String   @unique
+  reason     String
+  source     String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  lastHitAt  DateTime @default(now())
+
+  @@map("email_suppressions")
 }
 
 /// One-time auth tokens (TOTP challenge, passkey challenge, etc.)

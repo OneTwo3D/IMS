@@ -5,7 +5,10 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { auth } from '@/lib/auth'
 import { requirePermission } from '@/lib/auth/server'
+import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
+
+const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
 async function requireAuth() {
   const session = await auth()
@@ -124,9 +127,14 @@ export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]>
 // Smart auto-allocation algorithm
 // ---------------------------------------------------------------------------
 
-export async function autoAllocateOrder(orderId: string): Promise<{ success: boolean; error?: string }> {
+export async function autoAllocateOrder(
+  orderId: string,
+  options?: { internalBypassToken?: symbol },
+): Promise<{ success: boolean; error?: string }> {
   try {
-    await requirePermission('sales.process')
+    if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
+      await requirePermission('sales.process')
+    }
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: {
@@ -279,54 +287,40 @@ export async function autoAllocateOrder(orderId: string): Promise<{ success: boo
       // If still remaining > 0, it's backordered (no allocation record for that qty)
     }
 
-    // Clear existing allocations and reservations
-    const existingAllocs = await db.orderAllocation.findMany({
-      where: { orderId },
-      select: { productId: true, warehouseId: true, qty: true },
-    })
-    for (const alloc of existingAllocs) {
-      await db.stockLevel.updateMany({
-        where: { productId: alloc.productId, warehouseId: alloc.warehouseId },
-        data: { reservedQty: { decrement: Number(alloc.qty) } },
+    await db.$transaction(async (tx) => {
+      const existingAllocs = await tx.orderAllocation.findMany({
+        where: { orderId },
+        select: { productId: true, warehouseId: true, qty: true },
       })
-    }
-    await db.orderAllocation.deleteMany({ where: { orderId } })
-
-    // Also release old-style shipFromWarehouse reservation
-    if (so.shipFromWarehouseId) {
-      // Already handled above via existing allocations, but for legacy orders:
-      // We don't double-decrement since old orders might not have allocations
-    }
-
-    // Create new allocations and reserve stock
-    for (const alloc of allocations) {
-      await db.orderAllocation.create({
-        data: {
-          orderId,
-          lineId: alloc.lineId,
-          productId: alloc.productId,
-          warehouseId: alloc.warehouseId,
-          qty: alloc.qty,
-        },
-      })
-      await db.stockLevel.upsert({
-        where: { productId_warehouseId: { productId: alloc.productId, warehouseId: alloc.warehouseId } },
-        create: { productId: alloc.productId, warehouseId: alloc.warehouseId, quantity: 0, reservedQty: alloc.qty },
-        update: { reservedQty: { increment: alloc.qty } },
-      })
-    }
-
-    // Only promote to ALLOCATED when at least one allocation was created.
-    // Without this guard, orders with no available stock (e.g. warehouse
-    // filtered out by syncToWoocommerce flag) would be marked ALLOCATED
-    // with zero allocation rows.
-    if (allocations.length > 0) {
-      if (['DRAFT', 'PENDING_PAYMENT'].includes(so.status)) {
-        await db.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
-      } else if (so.status === 'PROCESSING') {
-        await db.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
+      for (const alloc of existingAllocs) {
+        await tx.stockLevel.updateMany({
+          where: { productId: alloc.productId, warehouseId: alloc.warehouseId },
+          data: { reservedQty: { decrement: Number(alloc.qty) } },
+        })
       }
-    }
+      await tx.orderAllocation.deleteMany({ where: { orderId } })
+
+      for (const alloc of allocations) {
+        await tx.orderAllocation.create({
+          data: {
+            orderId,
+            lineId: alloc.lineId,
+            productId: alloc.productId,
+            warehouseId: alloc.warehouseId,
+            qty: alloc.qty,
+          },
+        })
+        await tx.stockLevel.upsert({
+          where: { productId_warehouseId: { productId: alloc.productId, warehouseId: alloc.warehouseId } },
+          create: { productId: alloc.productId, warehouseId: alloc.warehouseId, quantity: 0, reservedQty: alloc.qty },
+          update: { reservedQty: { increment: alloc.qty } },
+        })
+      }
+
+      if (allocations.length > 0 && ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING'].includes(so.status)) {
+        await tx.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
+      }
+    }, STOCK_TX_OPTIONS)
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
@@ -390,28 +384,26 @@ export async function updateAllocation(
       }
     }
 
-    // Release old reservation
-    await db.stockLevel.updateMany({
-      where: { productId: alloc.productId, warehouseId: alloc.warehouseId },
-      data: { reservedQty: { decrement: Number(alloc.qty) } },
-    })
+    await db.$transaction(async (tx) => {
+      await tx.stockLevel.updateMany({
+        where: { productId: alloc.productId, warehouseId: alloc.warehouseId },
+        data: { reservedQty: { decrement: Number(alloc.qty) } },
+      })
 
-    if (newQty === 0) {
-      // Remove the allocation
-      await db.orderAllocation.delete({ where: { id: allocationId } })
-    } else {
-      // Update allocation
-      await db.orderAllocation.update({
-        where: { id: allocationId },
-        data: { warehouseId: newWarehouseId, qty: newQty },
-      })
-      // Reserve new stock
-      await db.stockLevel.upsert({
-        where: { productId_warehouseId: { productId: alloc.productId, warehouseId: newWarehouseId } },
-        create: { productId: alloc.productId, warehouseId: newWarehouseId, quantity: 0, reservedQty: newQty },
-        update: { reservedQty: { increment: newQty } },
-      })
-    }
+      if (newQty === 0) {
+        await tx.orderAllocation.delete({ where: { id: allocationId } })
+      } else {
+        await tx.orderAllocation.update({
+          where: { id: allocationId },
+          data: { warehouseId: newWarehouseId, qty: newQty },
+        })
+        await tx.stockLevel.upsert({
+          where: { productId_warehouseId: { productId: alloc.productId, warehouseId: newWarehouseId } },
+          create: { productId: alloc.productId, warehouseId: newWarehouseId, quantity: 0, reservedQty: newQty },
+          update: { reservedQty: { increment: newQty } },
+        })
+      }
+    }, STOCK_TX_OPTIONS)
 
     revalidatePath(`/sales/${alloc.orderId}`)
     await logActivity({
@@ -457,22 +449,28 @@ export async function addAllocation(
     const avail = Math.max(0, Number(sl?.quantity ?? 0) - Number(sl?.reservedQty ?? 0))
     if (qty > avail) return { success: false, error: `Only ${avail} available` }
 
-    // Check if allocation already exists for this line+warehouse
-    const existing = await db.orderAllocation.findUnique({
-      where: { lineId_warehouseId: { lineId, warehouseId } },
-    })
-    if (existing) {
-      return updateAllocation(existing.id, warehouseId, Number(existing.qty) + qty)
-    }
+    await db.$transaction(async (tx) => {
+      const existing = await tx.orderAllocation.findUnique({
+        where: { lineId_warehouseId: { lineId, warehouseId } },
+      })
 
-    await db.orderAllocation.create({
-      data: { orderId, lineId, productId, warehouseId, qty },
-    })
-    await db.stockLevel.upsert({
-      where: { productId_warehouseId: { productId, warehouseId } },
-      create: { productId, warehouseId, quantity: 0, reservedQty: qty },
-      update: { reservedQty: { increment: qty } },
-    })
+      if (existing) {
+        await tx.orderAllocation.update({
+          where: { id: existing.id },
+          data: { qty: Number(existing.qty) + qty },
+        })
+      } else {
+        await tx.orderAllocation.create({
+          data: { orderId, lineId, productId, warehouseId, qty },
+        })
+      }
+
+      await tx.stockLevel.upsert({
+        where: { productId_warehouseId: { productId, warehouseId } },
+        create: { productId, warehouseId, quantity: 0, reservedQty: qty },
+        update: { reservedQty: { increment: qty } },
+      })
+    }, STOCK_TX_OPTIONS)
 
     revalidatePath(`/sales/${orderId}`)
     try {
@@ -499,33 +497,35 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
     })
     if (!so) return { success: false, error: 'Order not found' }
 
-    const allocs = await db.orderAllocation.findMany({
-      where: { orderId },
-      select: { productId: true, warehouseId: true, qty: true },
-    })
-
-    for (const alloc of allocs) {
-      await db.stockLevel.updateMany({
-        where: { productId: alloc.productId, warehouseId: alloc.warehouseId },
-        data: { reservedQty: { decrement: Number(alloc.qty) } },
+    const allocs = await db.$transaction(async (tx) => {
+      const currentAllocs = await tx.orderAllocation.findMany({
+        where: { orderId },
+        select: { productId: true, warehouseId: true, qty: true },
       })
-    }
-    // Clamp reservedQty to zero to prevent negative values from stale data
-    await db.stockLevel.updateMany({
-      where: { reservedQty: { lt: 0 } },
-      data: { reservedQty: 0 },
-    })
-    await db.orderAllocation.deleteMany({ where: { orderId } })
 
-    // Revert to PROCESSING — but keep ALLOCATED if active (non-PENDING) shipments exist
-    if (so.status === 'ALLOCATED') {
-      const activeShipmentCount = await db.shipment.count({
-        where: { orderId, status: { not: 'PENDING' } },
-      })
-      if (activeShipmentCount === 0) {
-        await db.salesOrder.update({ where: { id: orderId }, data: { status: 'PROCESSING' } })
+      for (const alloc of currentAllocs) {
+        await tx.stockLevel.updateMany({
+          where: { productId: alloc.productId, warehouseId: alloc.warehouseId },
+          data: { reservedQty: { decrement: Number(alloc.qty) } },
+        })
       }
-    }
+      await tx.stockLevel.updateMany({
+        where: { reservedQty: { lt: 0 } },
+        data: { reservedQty: 0 },
+      })
+      await tx.orderAllocation.deleteMany({ where: { orderId } })
+
+      if (so.status === 'ALLOCATED') {
+        const activeShipmentCount = await tx.shipment.count({
+          where: { orderId, status: { not: 'PENDING' } },
+        })
+        if (activeShipmentCount === 0) {
+          await tx.salesOrder.update({ where: { id: orderId }, data: { status: 'PROCESSING' } })
+        }
+      }
+
+      return currentAllocs
+    }, STOCK_TX_OPTIONS)
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
@@ -556,9 +556,14 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
 // Confirm allocations — generates shipments per warehouse
 // ---------------------------------------------------------------------------
 
-export async function confirmAllocations(orderId: string): Promise<{ success: boolean; error?: string }> {
+export async function confirmAllocations(
+  orderId: string,
+  options?: { internalBypassToken?: symbol },
+): Promise<{ success: boolean; error?: string }> {
   try {
-    await requirePermission('sales.process')
+    if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
+      await requirePermission('sales.process')
+    }
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: { orderNumber: true, wcOrderNumber: true, status: true },
@@ -665,9 +670,12 @@ export async function updateShipmentStatus(
   shipmentId: string,
   targetStatus: string,
   extra?: { trackingNumber?: string; shippingService?: string },
+  options?: { internalBypassToken?: symbol },
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requirePermission('sales.process')
+    if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
+      await requirePermission('sales.process')
+    }
     const shipment = await db.shipment.findUnique({
       where: { id: shipmentId },
       include: {

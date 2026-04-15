@@ -4,6 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { auth } from '@/lib/auth'
 import { logActivity } from '@/lib/activity-log'
+import { checkRateLimit } from '@/lib/rate-limit'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -14,6 +15,15 @@ async function requireSupplier(): Promise<{ userId: string; supplierId: string }
   const session = await auth()
   if (!session?.user || session.user.role !== 'SUPPLIER' || !session.user.supplierId) return null
   return { userId: session.user.id, supplierId: session.user.supplierId }
+}
+
+function sanitizeSupplierRef(value: string): string {
+  return value
+    .replace(/[\u0000-\u001f\u007f]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/[<>]/g, '')
+    .trim()
+    .slice(0, 120)
 }
 
 // ---------------------------------------------------------------------------
@@ -210,8 +220,12 @@ export async function submitSupplierQuote(
   try {
     const ctx = await requireSupplier()
     if (!ctx) return { success: false, error: 'Unauthorized' }
+    const rl = checkRateLimit(`supplier-quote:${ctx.supplierId}`, 20, 5 * 60_000)
+    if (!rl.allowed) return { success: false, error: `Too many quote updates. Try again in ${rl.retryAfterSec}s.` }
 
     if (data.shippingCost < 0) return { success: false, error: 'Shipping cost cannot be negative' }
+    const supplierRef = sanitizeSupplierRef(data.supplierRef)
+    if (!supplierRef) return { success: false, error: 'Supplier reference is required' }
 
     const po = await db.purchaseOrder.findFirst({
       where: { id: poId, supplierId: ctx.supplierId, status: { in: ['DRAFT', 'RFQ_SENT'] } },
@@ -221,67 +235,67 @@ export async function submitSupplierQuote(
 
     const fxRate = Number(po.fxRateToGbp) || 1
 
-    // Update each line with supplier's quoted price and quantity
-    for (const line of data.lines) {
-      if (line.unitPrice < 0) continue
-      if (!line.qty || line.qty <= 0) continue
-      // Verify line belongs to this PO (prevent cross-PO manipulation)
-      const poLine = await db.purchaseOrderLine.findFirst({ where: { id: line.lineId, poId } })
-      if (!poLine) continue
+    await db.$transaction(async (tx) => {
+      for (const line of data.lines) {
+        if (line.unitPrice < 0) continue
+        if (!line.qty || line.qty <= 0) continue
+        // Verify line belongs to this PO (prevent cross-PO manipulation)
+        const poLine = await tx.purchaseOrderLine.findFirst({ where: { id: line.lineId, poId } })
+        if (!poLine) continue
 
-      const totalForeign = line.qty * line.unitPrice
-      const unitCostGbp = Math.round((line.unitPrice / fxRate) * 1000000) / 1000000
-      const totalGbp = Math.round((totalForeign / fxRate) * 10000) / 10000
+        const totalForeign = line.qty * line.unitPrice
+        const unitCostGbp = Math.round((line.unitPrice / fxRate) * 1000000) / 1000000
+        const totalGbp = Math.round((totalForeign / fxRate) * 10000) / 10000
 
-      await db.purchaseOrderLine.update({
-        where: { id: line.lineId },
+        await tx.purchaseOrderLine.update({
+          where: { id: line.lineId },
+          data: {
+            qty: line.qty,
+            unitCostForeign: line.unitPrice,
+            unitCostGbp,
+            totalForeign,
+            totalGbp,
+          },
+        })
+      }
+
+      const updatedLines = await tx.purchaseOrderLine.findMany({
+        where: { poId },
+        select: { totalForeign: true, totalGbp: true, taxForeign: true, taxGbp: true },
+      })
+      const subtotalForeign = updatedLines.reduce((s, l) => s + Number(l.totalForeign), 0)
+      const subtotalGbp = updatedLines.reduce((s, l) => s + Number(l.totalGbp), 0)
+      const taxForeign = updatedLines.reduce((s, l) => s + Number(l.taxForeign), 0)
+      const taxGbp = updatedLines.reduce((s, l) => s + Number(l.taxGbp), 0)
+      const shippingGbp = Math.round((data.shippingCost / fxRate) * 10000) / 10000
+
+      await tx.purchaseOrder.update({
+        where: { id: poId },
         data: {
-          qty: line.qty,
-          unitCostForeign: line.unitPrice,
-          unitCostGbp,
-          totalForeign,
-          totalGbp,
+          subtotalForeign,
+          subtotalGbp,
+          taxForeign,
+          taxGbp,
+          totalForeign: subtotalForeign + taxForeign + data.shippingCost,
+          totalGbp: subtotalGbp + taxGbp + shippingGbp,
+          directFreightForeign: data.shippingCost,
+          directFreightGbp: shippingGbp,
+          supplierRef,
+          expectedDelivery: data.expectedDelivery ? new Date(data.expectedDelivery) : null,
+          notes: data.shippingMethod ? `Shipping: ${data.shippingMethod}` : undefined,
+          // Admin review is still required before a binding PO is sent.
+          status: 'QUOTE_RECEIVED',
+          poSentAt: null,
         },
       })
-    }
-
-    // Recalculate PO totals
-    const updatedLines = await db.purchaseOrderLine.findMany({
-      where: { poId },
-      select: { totalForeign: true, totalGbp: true, taxForeign: true, taxGbp: true },
-    })
-    const subtotalForeign = updatedLines.reduce((s, l) => s + Number(l.totalForeign), 0)
-    const subtotalGbp = updatedLines.reduce((s, l) => s + Number(l.totalGbp), 0)
-    const taxForeign = updatedLines.reduce((s, l) => s + Number(l.taxForeign), 0)
-    const taxGbp = updatedLines.reduce((s, l) => s + Number(l.taxGbp), 0)
-    const shippingGbp = Math.round((data.shippingCost / fxRate) * 10000) / 10000
-
-    await db.purchaseOrder.update({
-      where: { id: poId },
-      data: {
-        subtotalForeign,
-        subtotalGbp,
-        taxForeign,
-        taxGbp,
-        totalForeign: subtotalForeign + taxForeign + data.shippingCost,
-        totalGbp: subtotalGbp + taxGbp + shippingGbp,
-        directFreightForeign: data.shippingCost,
-        directFreightGbp: shippingGbp,
-        supplierRef: data.supplierRef || null,
-        expectedDelivery: data.expectedDelivery ? new Date(data.expectedDelivery) : null,
-        notes: data.shippingMethod ? `Shipping: ${data.shippingMethod}` : undefined,
-        // Move to PO_SENT status (supplier has quoted)
-        status: 'PO_SENT',
-        poSentAt: new Date(),
-      },
     })
 
     revalidatePath('/supplier/rfqs')
     revalidatePath('/supplier/orders')
     await logActivity({
       entityType: 'PURCHASE_ORDER', entityId: poId, action: 'supplier_quoted', tag: 'purchase', level: 'INFO',
-      description: `Supplier submitted quote for ${po.reference} — ref: ${data.supplierRef}`,
-      metadata: { supplierRef: data.supplierRef, shippingCost: data.shippingCost },
+      description: `Supplier submitted quote for ${po.reference} — ref: ${supplierRef}`,
+      metadata: { supplierRef, shippingCost: data.shippingCost },
     })
     return { success: true }
   } catch (e) {

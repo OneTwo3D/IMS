@@ -8,7 +8,9 @@ import { queueAccountingSync, getAccountingSettings, listAccountingBankAccounts,
 import { enqueueStockSync } from '@/lib/shopping'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
-import type { TaxCategory } from '@/app/generated/prisma/client'
+import { Prisma, type TaxCategory } from '@/app/generated/prisma/client'
+
+const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1567,123 +1569,122 @@ export async function receivePurchaseOrder(
       }
     }
 
-    // Create receipt
     const receiptRef = `RCP-${po.reference}-${Date.now().toString(36).toUpperCase()}`
-    await db.purchaseReceipt.create({
-      data: {
-        poId: id,
-        reference: receiptRef,
-        notes: notes || null,
-        lines: {
-          create: linesWithQty.map((rl) => ({
-            poLineId: rl.poLineId,
-            qtyReceived: rl.qtyReceived,
-            warehouseId: rl.warehouseId || null,
-          })),
-        },
-      },
-    })
-
-    // Process each receipt line: update stock, create movement + cost layer
-    for (const rl of linesWithQty) {
-      const poLine = po.lines.find((l) => l.id === rl.poLineId)
-      if (!poLine) continue
-
-      const unitCostGbp = Number(poLine.landedUnitCostGbp) > 0
-        ? Number(poLine.landedUnitCostGbp)
-        : Number(poLine.unitCostGbp)
-
-      // Create stock movement
-      await db.stockMovement.create({
+    const freightPoIdsToRevalidate = await db.$transaction(async (tx) => {
+      await tx.purchaseReceipt.create({
         data: {
-          type: 'PURCHASE_RECEIPT',
-          productId: poLine.productId,
-          toWarehouseId: rl.warehouseId,
-          qty: rl.qtyReceived,
-          note: `Received against ${po.reference}`,
-          referenceType: 'PurchaseOrder',
-          referenceId: id,
-        },
-      })
-
-      // Create FIFO cost layer
-      await db.costLayer.create({
-        data: {
-          productId: poLine.productId,
-          warehouseId: rl.warehouseId,
-          receivedQty: rl.qtyReceived,
-          remainingQty: rl.qtyReceived,
-          unitCostGbp,
-          poLineId: poLine.id,
-          isOpeningStock: false,
-        },
-      })
-
-      // Update stock level
-      await db.stockLevel.upsert({
-        where: {
-          productId_warehouseId: {
-            productId: poLine.productId,
-            warehouseId: rl.warehouseId,
+          poId: id,
+          reference: receiptRef,
+          notes: notes || null,
+          lines: {
+            create: linesWithQty.map((rl) => ({
+              poLineId: rl.poLineId,
+              qtyReceived: rl.qtyReceived,
+              warehouseId: rl.warehouseId || null,
+            })),
           },
         },
-        create: {
-          productId: poLine.productId,
-          warehouseId: rl.warehouseId,
-          quantity: rl.qtyReceived,
-          reservedQty: 0,
-        },
-        update: {
-          quantity: { increment: rl.qtyReceived },
-        },
       })
 
-      // Update PO line qtyReceived
-      await db.purchaseOrderLine.update({
-        where: { id: rl.poLineId },
-        data: { qtyReceived: { increment: rl.qtyReceived } },
-      })
-    }
+      for (const rl of linesWithQty) {
+        const poLine = po.lines.find((l) => l.id === rl.poLineId)
+        if (!poLine) continue
 
-    // Determine new PO status
-    const updatedLines = await db.purchaseOrderLine.findMany({
-      where: { poId: id },
-      select: { qty: true, qtyReceived: true },
-    })
-    const allReceived = updatedLines.every((l) => Number(l.qtyReceived) >= Number(l.qty))
+        const unitCostGbp = Number(poLine.landedUnitCostGbp) > 0
+          ? Number(poLine.landedUnitCostGbp)
+          : Number(poLine.unitCostGbp)
 
-    const newStatus = allReceived ? 'RECEIVED' : 'PARTIALLY_RECEIVED'
-    await db.purchaseOrder.update({
-      where: { id },
-      data: {
-        status: newStatus,
-        ...(allReceived && { receivedAt: new Date() }),
-      },
-    })
-
-    // Auto-mark linked freight POs as received when all their primary POs are received
-    if (allReceived) {
-      const freightLinks = await db.landedCostLink.findMany({
-        where: { primaryPoId: id },
-        select: { freightPoId: true },
-      })
-      for (const fl of freightLinks) {
-        const allLinks = await db.landedCostLink.findMany({
-          where: { freightPoId: fl.freightPoId },
-          select: { primaryPO: { select: { status: true } } },
+        await tx.stockMovement.create({
+          data: {
+            type: 'PURCHASE_RECEIPT',
+            productId: poLine.productId,
+            toWarehouseId: rl.warehouseId,
+            qty: rl.qtyReceived,
+            note: `Received against ${po.reference}`,
+            referenceType: 'PurchaseOrder',
+            referenceId: id,
+          },
         })
-        if (allLinks.every((l) => l.primaryPO.status === 'RECEIVED')) {
-          await db.purchaseOrder.update({
-            where: { id: fl.freightPoId },
-            data: { status: 'RECEIVED', receivedAt: new Date() },
+
+        await tx.costLayer.create({
+          data: {
+            productId: poLine.productId,
+            warehouseId: rl.warehouseId,
+            receivedQty: rl.qtyReceived,
+            remainingQty: rl.qtyReceived,
+            unitCostGbp,
+            poLineId: poLine.id,
+            isOpeningStock: false,
+          },
+        })
+
+        await tx.stockLevel.upsert({
+          where: {
+            productId_warehouseId: {
+              productId: poLine.productId,
+              warehouseId: rl.warehouseId,
+            },
+          },
+          create: {
+            productId: poLine.productId,
+            warehouseId: rl.warehouseId,
+            quantity: rl.qtyReceived,
+            reservedQty: 0,
+          },
+          update: {
+            quantity: { increment: rl.qtyReceived },
+          },
+        })
+
+        await tx.purchaseOrderLine.update({
+          where: { id: rl.poLineId },
+          data: { qtyReceived: { increment: rl.qtyReceived } },
+        })
+      }
+
+      const updatedLines = await tx.purchaseOrderLine.findMany({
+        where: { poId: id },
+        select: { qty: true, qtyReceived: true },
+      })
+      const allReceived = updatedLines.every((line) => Number(line.qtyReceived) >= Number(line.qty))
+      const newStatus = allReceived ? 'RECEIVED' : 'PARTIALLY_RECEIVED'
+      await tx.purchaseOrder.update({
+        where: { id },
+        data: {
+          status: newStatus,
+          ...(allReceived && { receivedAt: new Date() }),
+        },
+      })
+
+      const freightPoIds: string[] = []
+      if (allReceived) {
+        const freightLinks = await tx.landedCostLink.findMany({
+          where: { primaryPoId: id },
+          select: { freightPoId: true },
+        })
+        for (const fl of freightLinks) {
+          const allLinks = await tx.landedCostLink.findMany({
+            where: { freightPoId: fl.freightPoId },
+            select: { primaryPO: { select: { status: true } } },
           })
-          revalidatePath(`/purchase-orders/${fl.freightPoId}`)
+          if (allLinks.every((link) => link.primaryPO.status === 'RECEIVED')) {
+            await tx.purchaseOrder.update({
+              where: { id: fl.freightPoId },
+              data: { status: 'RECEIVED', receivedAt: new Date() },
+            })
+            freightPoIds.push(fl.freightPoId)
+          }
         }
       }
-    }
+
+      return { allReceived, newStatus, freightPoIds }
+    }, STOCK_TX_OPTIONS)
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
+    for (const freightPoId of freightPoIdsToRevalidate.freightPoIds) {
+      revalidatePath(`/purchase-orders/${freightPoId}`)
+    }
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
@@ -1691,7 +1692,7 @@ export async function receivePurchaseOrder(
       tag: 'purchase',
       level: 'INFO',
       description: `Received PO ${po.reference} (${linesWithQty.length} lines)`,
-      metadata: { reference: po.reference, lineCount: linesWithQty.length, newStatus },
+      metadata: { reference: po.reference, lineCount: linesWithQty.length, newStatus: freightPoIdsToRevalidate.newStatus },
     })
 
     // Log stock movement for the receipt
@@ -1879,51 +1880,46 @@ export async function returnPurchaseOrder(
     }
 
     const returnRef = `RTN-${po.reference}-${Date.now().toString(36).toUpperCase()}`
-    await db.purchaseReturn.create({
-      data: {
-        poId: id,
-        reference: returnRef,
-        reason: reason || null,
-        notes: notes || null,
-        lines: {
-          create: linesWithQty.map((rl) => ({
-            poLineId: rl.poLineId,
-            qtyReturned: rl.qtyReturned,
-            warehouseId: rl.warehouseId || null,
-          })),
-        },
-      },
-    })
-
-    // Process each line: decrement stock, create stock movement, update qtyReturned
-    for (const rl of linesWithQty) {
-      const poLine = po.lines.find((l) => l.id === rl.poLineId)!
-
-      // Stock movement: stock leaves our warehouse (fromWarehouseId set, toWarehouseId null)
-      await db.stockMovement.create({
+    await db.$transaction(async (tx) => {
+      await tx.purchaseReturn.create({
         data: {
-          type: 'ADJUSTMENT',
-          productId: poLine.productId,
-          fromWarehouseId: rl.warehouseId,
-          qty: rl.qtyReturned,
-          note: `Return to supplier against ${po.reference}${reason ? ` — ${reason}` : ''}`,
-          referenceType: 'PurchaseReturn',
-          referenceId: id,
+          poId: id,
+          reference: returnRef,
+          reason: reason || null,
+          notes: notes || null,
+          lines: {
+            create: linesWithQty.map((rl) => ({
+              poLineId: rl.poLineId,
+              qtyReturned: rl.qtyReturned,
+              warehouseId: rl.warehouseId || null,
+            })),
+          },
         },
       })
 
-      // Decrement stock level
-      await db.stockLevel.updateMany({
-        where: { productId: poLine.productId, warehouseId: rl.warehouseId },
-        data: { quantity: { decrement: rl.qtyReturned } },
-      })
-
-      // Update PO line qtyReturned
-      await db.purchaseOrderLine.update({
-        where: { id: rl.poLineId },
-        data: { qtyReturned: { increment: rl.qtyReturned } },
-      })
-    }
+      for (const rl of linesWithQty) {
+        const poLine = po.lines.find((l) => l.id === rl.poLineId)!
+        await tx.stockMovement.create({
+          data: {
+            type: 'ADJUSTMENT',
+            productId: poLine.productId,
+            fromWarehouseId: rl.warehouseId,
+            qty: rl.qtyReturned,
+            note: `Return to supplier against ${po.reference}${reason ? ` — ${reason}` : ''}`,
+            referenceType: 'PurchaseReturn',
+            referenceId: id,
+          },
+        })
+        await tx.stockLevel.updateMany({
+          where: { productId: poLine.productId, warehouseId: rl.warehouseId },
+          data: { quantity: { decrement: rl.qtyReturned } },
+        })
+        await tx.purchaseOrderLine.update({
+          where: { id: rl.poLineId },
+          data: { qtyReturned: { increment: rl.qtyReturned } },
+        })
+      }
+    }, STOCK_TX_OPTIONS)
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
@@ -2574,69 +2570,78 @@ export async function updateFreightPoCosts(
 ): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('purchasing.create')
-    const po = await db.purchaseOrder.findUnique({
-      where: { id: freightPoId },
-      select: { id: true, reference: true, type: true, fxRateToGbp: true },
-    })
-    if (!po) return { success: false, error: 'PO not found' }
-    if (po.type !== 'FREIGHT') return { success: false, error: 'Not a freight PO' }
+    const { reference, revalidatePrimaryPoIds } = await db.$transaction(async (tx) => {
+      const po = await tx.purchaseOrder.findUnique({
+        where: { id: freightPoId },
+        select: { id: true, reference: true, type: true, fxRateToGbp: true },
+      })
+      if (!po) throw new Error('PO not found')
+      if (po.type !== 'FREIGHT') throw new Error('Not a freight PO')
 
-    const fxRate = Number(po.fxRateToGbp)
-    const vatRate = taxRateValue ?? 0
+      const fxRate = new Prisma.Decimal(po.fxRateToGbp)
+      const vatRate = new Prisma.Decimal(taxRateValue ?? 0)
 
-    // Delete old cost lines and recreate
-    await db.freightCostLine.deleteMany({ where: { poId: freightPoId } })
+      await tx.freightCostLine.deleteMany({ where: { poId: freightPoId } })
 
-    let subtotalForeign = 0
-    let taxForeign = 0
-    const lineData = costLines.map((cl, i) => {
-      const amountGbp = Math.round((cl.amountForeign / fxRate) * 10000) / 10000
-      subtotalForeign += cl.amountForeign
-      if (cl.vatable && vatRate > 0) taxForeign += Math.round(cl.amountForeign * vatRate * 10000) / 10000
-      return {
-        poId: freightPoId,
-        description: cl.description,
-        amountForeign: cl.amountForeign,
-        amountGbp,
-        vatable: cl.vatable,
-        distributionMethod: cl.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
-        sortOrder: i,
+      let subtotalForeign = new Prisma.Decimal(0)
+      let taxForeign = new Prisma.Decimal(0)
+      const lineData = costLines.map((cl, i) => {
+        const amountForeign = new Prisma.Decimal(cl.amountForeign)
+        const amountGbp = amountForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
+        subtotalForeign = subtotalForeign.add(amountForeign)
+        if (cl.vatable && vatRate.gt(0)) {
+          taxForeign = taxForeign.add(amountForeign.mul(vatRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP))
+        }
+        return {
+          poId: freightPoId,
+          description: cl.description,
+          amountForeign,
+          amountGbp,
+          vatable: cl.vatable,
+          distributionMethod: cl.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
+          sortOrder: i,
+        }
+      })
+      if (lineData.length > 0) {
+        await tx.freightCostLine.createMany({ data: lineData })
       }
-    })
-    await db.freightCostLine.createMany({ data: lineData })
 
-    const subtotalGbp = Math.round((subtotalForeign / fxRate) * 10000) / 10000
-    const taxGbp = Math.round((taxForeign / fxRate) * 10000) / 10000
-    const totalForeign = subtotalForeign + taxForeign
-    const totalGbp = subtotalGbp + taxGbp
+      const subtotalGbp = subtotalForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
+      const taxGbp = taxForeign.div(fxRate).toDecimalPlaces(4, Prisma.Decimal.ROUND_HALF_UP)
+      const totalForeign = subtotalForeign.add(taxForeign)
+      const totalGbp = subtotalGbp.add(taxGbp)
 
-    await db.purchaseOrder.update({
-      where: { id: freightPoId },
-      data: {
-        subtotalForeign,
-        subtotalGbp,
-        taxForeign,
-        taxGbp,
-        totalForeign,
-        totalGbp,
-        directFreightForeign: subtotalForeign,
-        directFreightGbp: subtotalGbp,
-      },
-    })
+      await tx.purchaseOrder.update({
+        where: { id: freightPoId },
+        data: {
+          subtotalForeign,
+          subtotalGbp,
+          taxForeign,
+          taxGbp,
+          totalForeign,
+          totalGbp,
+          directFreightForeign: subtotalForeign,
+          directFreightGbp: subtotalGbp,
+        },
+      })
 
-    // Recalculate landed costs on all linked primary POs
-    await recalculateLandedCosts(freightPoId)
+      const revalidatePrimaryPoIds = await recalculateLandedCosts(tx, freightPoId)
+      return { reference: po.reference, revalidatePrimaryPoIds }
+    }, STOCK_TX_OPTIONS)
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${freightPoId}`)
+    for (const primaryPoId of revalidatePrimaryPoIds) {
+      revalidatePath(`/purchase-orders/${primaryPoId}`)
+    }
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: freightPoId,
       action: 'updated',
       tag: 'purchase',
       level: 'INFO',
-      description: `Updated freight costs for PO ${po.reference}`,
-      metadata: { reference: po.reference, costLineCount: costLines.length },
+      description: `Updated freight costs for PO ${reference}`,
+      metadata: { reference, costLineCount: costLines.length },
     })
     return { success: true }
   } catch (e) {
@@ -2653,25 +2658,55 @@ export async function updateFreightPoCosts(
   }
 }
 
+function decimal(value: Prisma.Decimal | number | string | null | undefined): Prisma.Decimal {
+  return new Prisma.Decimal(value ?? 0)
+}
+
+function computeDistributionBase(
+  line: {
+    qty: Prisma.Decimal
+    totalGbp: Prisma.Decimal
+    product: { weight: Prisma.Decimal | null }
+  },
+  method: 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
+): Prisma.Decimal {
+  switch (method) {
+    case 'BY_WEIGHT':
+      return decimal(line.product.weight).mul(line.qty)
+    case 'BY_QUANTITY':
+      return decimal(line.qty)
+    case 'EQUAL_SPLIT':
+      return new Prisma.Decimal(1)
+    case 'BY_VALUE':
+    default:
+      return decimal(line.totalGbp)
+  }
+}
+
 /**
  * Recalculate landed cost on all primary POs linked to this freight PO.
  * Updates PO line `landedUnitCostGbp`, CostLayer `unitCostGbp`, and CogsEntry costs.
  */
-async function recalculateLandedCosts(freightPoId: string) {
+async function recalculateLandedCosts(
+  tx: Prisma.TransactionClient,
+  freightPoId: string,
+): Promise<string[]> {
   // Find all primary POs linked to this freight PO
-  const links = await db.landedCostLink.findMany({
+  const links = await tx.landedCostLink.findMany({
     where: { freightPoId },
     select: { primaryPoId: true },
   })
+  const revalidatePrimaryPoIds: string[] = []
 
   for (const link of links) {
     const primaryPoId = link.primaryPoId
 
     // Get the primary PO with its lines
-    const primaryPo = await db.purchaseOrder.findUnique({
+    const primaryPo = await tx.purchaseOrder.findUnique({
       where: { id: primaryPoId },
       select: {
         id: true,
+        status: true,
         subtotalGbp: true,
         directFreightGbp: true,
         lines: {
@@ -2680,11 +2715,11 @@ async function recalculateLandedCosts(freightPoId: string) {
             qty: true,
             unitCostGbp: true,
             totalGbp: true,
+            product: { select: { weight: true } },
             costLayers: {
               select: {
                 id: true,
-                unitCostGbp: true,
-                cogsEntries: { select: { id: true, qty: true } },
+                cogsEntries: { select: { id: true } },
               },
             },
           },
@@ -2692,60 +2727,78 @@ async function recalculateLandedCosts(freightPoId: string) {
       },
     })
     if (!primaryPo) continue
+    if (primaryPo.status === 'CLOSED' || primaryPo.status === 'INVOICED') {
+      throw new Error(`Cannot recalculate landed costs for ${primaryPoId}: purchase order is in a locked status`)
+    }
 
-    // Calculate total landed cost for this primary PO from ALL linked freight POs
-    const allLinks = await db.landedCostLink.findMany({
+    const hasConsumedStock = primaryPo.lines.some((line) => line.costLayers.some((cl) => cl.cogsEntries.length > 0))
+    if (hasConsumedStock) {
+      throw new Error(`Cannot recalculate landed costs for ${primaryPoId}: stock from this PO has already been consumed`)
+    }
+
+    const allLinks = await tx.landedCostLink.findMany({
       where: { primaryPoId },
       select: {
-        freightPO: { select: { totalGbp: true } },
+        freightPO: {
+          select: {
+            freightCostLines: {
+              select: { amountGbp: true, distributionMethod: true },
+            },
+          },
+        },
       },
     })
-    const totalFreightGbp = allLinks.reduce((s, l) => s + Number(l.freightPO.totalGbp), 0)
-      + Number(primaryPo.directFreightGbp)
-
-    const poSubtotalGbp = Number(primaryPo.subtotalGbp)
-
-    // Distribute landed cost to each line and update
+    const landedByLine = new Map<string, Prisma.Decimal>()
     for (const line of primaryPo.lines) {
-      const lineQty = Number(line.qty)
-      const lineTotalGbp = Number(line.totalGbp)
-      const baseUnitCostGbp = Number(line.unitCostGbp)
+      landedByLine.set(line.id, new Prisma.Decimal(0))
+    }
 
-      if (lineQty <= 0 || poSubtotalGbp <= 0) continue
+    const eligibleLines = primaryPo.lines.filter((line) => decimal(line.qty).gt(0))
+    for (const linkRow of allLinks) {
+      for (const freightCostLine of linkRow.freightPO.freightCostLines) {
+        const method = freightCostLine.distributionMethod
+        const bases = eligibleLines.map((line) => ({
+          lineId: line.id,
+          base: computeDistributionBase(line, method),
+        }))
+        let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
 
-      // BY_VALUE distribution
-      const lineShare = lineTotalGbp / poSubtotalGbp
-      const landedForLine = totalFreightGbp * lineShare
-      const landedPerUnit = landedForLine / lineQty
-      const grossUnitCostGbp = baseUnitCostGbp + landedPerUnit
+        if (basisTotal.lte(0)) {
+          const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
+          basisTotal = equalBase
+          for (const entry of bases) entry.base = new Prisma.Decimal(1)
+        }
 
-      // Update PO line landed cost
-      await db.purchaseOrderLine.update({
-        where: { id: line.id },
-        data: { landedUnitCostGbp: grossUnitCostGbp },
-      })
-
-      // Update cost layers linked to this PO line
-      for (const cl of line.costLayers) {
-        await db.costLayer.update({
-          where: { id: cl.id },
-          data: { unitCostGbp: grossUnitCostGbp },
-        })
-
-        // Update any COGS entries that consumed from this layer
-        for (const ce of cl.cogsEntries) {
-          const ceQty = Number(ce.qty)
-          await db.cogsEntry.update({
-            where: { id: ce.id },
-            data: {
-              unitCostGbp: grossUnitCostGbp,
-              totalCostGbp: Math.round(ceQty * grossUnitCostGbp * 1000000) / 1000000,
-            },
-          })
+        const amountGbp = decimal(freightCostLine.amountGbp)
+        for (const entry of bases) {
+          const share = amountGbp.mul(entry.base).div(basisTotal)
+          landedByLine.set(entry.lineId, decimal(landedByLine.get(entry.lineId)).add(share))
         }
       }
     }
 
-    revalidatePath(`/purchase-orders/${primaryPoId}`)
+    for (const line of primaryPo.lines) {
+      const lineQty = decimal(line.qty)
+      if (lineQty.lte(0)) continue
+
+      const baseUnitCostGbp = decimal(line.unitCostGbp)
+      const landedForLine = decimal(landedByLine.get(line.id))
+      const landedPerUnit = landedForLine.div(lineQty)
+      const grossUnitCostGbp = baseUnitCostGbp.add(landedPerUnit).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+
+      await tx.purchaseOrderLine.update({
+        where: { id: line.id },
+        data: { landedUnitCostGbp: grossUnitCostGbp },
+      })
+
+      for (const cl of line.costLayers) {
+        await tx.costLayer.update({
+          where: { id: cl.id },
+          data: { unitCostGbp: grossUnitCostGbp },
+        })
+      }
+    }
+    revalidatePrimaryPoIds.push(primaryPoId)
   }
+  return revalidatePrimaryPoIds
 }

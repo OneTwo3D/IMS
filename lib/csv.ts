@@ -30,16 +30,15 @@ export function toCsv(rows: Record<string, unknown>[], headers: string[]): strin
 
 /** Parse CSV text into an array of objects keyed by header row */
 export function parseCsv(text: string): Record<string, string>[] {
-  const lines = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n')
-  if (lines.length < 2) return []
+  const rows = parseRows(text)
+  if (rows.length < 2) return []
 
-  const headers = parseRow(lines[0])
+  const headers = rows[0]
   const results: Record<string, string>[] = []
 
-  for (let i = 1; i < lines.length; i++) {
-    const line = lines[i].trim()
-    if (!line) continue
-    const values = parseRow(line)
+  for (let i = 1; i < rows.length; i++) {
+    const values = rows[i]
+    if (values.every((value) => value.trim() === '')) continue
     const obj: Record<string, string> = {}
     headers.forEach((h, idx) => {
       obj[h.trim()] = values[idx]?.trim() ?? ''
@@ -50,15 +49,17 @@ export function parseCsv(text: string): Record<string, string>[] {
   return results
 }
 
-function parseRow(line: string): string[] {
-  const fields: string[] = []
+function parseRows(text: string): string[][] {
+  const input = text.replace(/\r\n/g, '\n').replace(/\r/g, '\n')
+  const rows: string[][] = []
+  let fields: string[] = []
   let current = ''
   let inQuotes = false
 
-  for (let i = 0; i < line.length; i++) {
-    const ch = line[i]
+  for (let i = 0; i < input.length; i++) {
+    const ch = input[i]
     if (ch === '"') {
-      if (inQuotes && line[i + 1] === '"') {
+      if (inQuotes && input[i + 1] === '"') {
         current += '"'
         i++
       } else {
@@ -67,12 +68,18 @@ function parseRow(line: string): string[] {
     } else if (ch === ',' && !inQuotes) {
       fields.push(current)
       current = ''
+    } else if (ch === '\n' && !inQuotes) {
+      fields.push(current)
+      rows.push(fields)
+      fields = []
+      current = ''
     } else {
       current += ch
     }
   }
   fields.push(current)
-  return fields
+  rows.push(fields)
+  return rows
 }
 
 /** Build a Response that triggers a file download */

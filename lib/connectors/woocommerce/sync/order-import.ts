@@ -10,8 +10,10 @@ import {
   mapWcAddress, upsertCustomer, mapWcLineItems, mapWcOrderDiscount,
   mapWcShipping, resolveWcTaxRateById, getFxRateToGbp,
 } from './field-mapping'
+import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
 import type { TaxCategory } from '@/app/generated/prisma/client'
+import { getSettingValue } from '@/lib/settings-store'
 
 // ---------------------------------------------------------------------------
 // Import a single WC order into IMS
@@ -21,13 +23,17 @@ export type ImportWcOrderOptions = { skipAccounting?: boolean; useWcDateAsCreate
 
 const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
 
+function isUniqueConstraintError(error: unknown): error is { code: string } {
+  return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: string }).code === 'P2002'
+}
+
 export async function isWcOrderWebhookPrimaryActive(): Promise<boolean> {
   const [secret, lastReceived] = await Promise.all([
-    db.setting.findUnique({ where: { key: 'wc_webhook_secret' } }),
+    getSettingValue('wc_webhook_secret'),
     db.setting.findUnique({ where: { key: 'wc_order_webhook_last_received_at' } }),
   ])
 
-  if (!secret?.value || !lastReceived?.value) return false
+  if (!secret || !lastReceived?.value) return false
   const ts = Date.parse(lastReceived.value)
   if (!Number.isFinite(ts)) return false
   return (Date.now() - ts) <= WEBHOOK_PRIMARY_FRESH_MS
@@ -214,50 +220,58 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const wcDefaultWarehouseId = wcWarehouses[0]?.id ?? null
 
     // Create the sales order
-    const so = await db.salesOrder.create({
-      data: {
-        wcOrderId: wcOrder.id,
-        wcOrderNumber: wcOrder.number,
-        orderNumber,
-        paymentMethod: wcOrder.payment_method || null,
-        paymentMethodTitle: wcOrder.payment_method_title || null,
-        wcCreatedAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created),
-        wcUpdatedAt: new Date(wcOrder.date_modified_gmt || wcOrder.date_modified),
-        ...(options.useWcDateAsCreatedAt ? { createdAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created) } : {}),
-        status: imsStatus,
-        shipFromWarehouseId: wcDefaultWarehouseId,
-        currency,
-        fxRateToGbp: fxRate,
-        customerId,
-        customerName,
-        customerEmail: wcOrder.billing.email || null,
-        billingAddress: mapWcAddress(wcOrder.billing),
-        shippingAddress: mapWcAddress(wcOrder.shipping),
-        subtotalForeign,
-        shippingService: shipping.shippingService,
-        shippingForeign,
-        taxRateName,
-        taxRatePercent: taxRateValue > 0 ? taxRateValue : null,
-        taxForeign,
-        pricesIncludeVat: !!pricesIncludeVat && taxRateValue > 0,
-        totalForeign,
-        subtotalGbp,
-        shippingGbp,
-        taxGbp,
-        totalGbp,
-        discountStr: orderDiscount.discountStr,
-        discountAmount: orderDiscount.discountAmount,
-        notes: wcOrder.customer_note || null,
-        paidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : null,
-        lines: { create: lineData },
-      },
-    })
+    let so
+    try {
+      so = await db.salesOrder.create({
+        data: {
+          wcOrderId: wcOrder.id,
+          wcOrderNumber: wcOrder.number,
+          orderNumber,
+          paymentMethod: wcOrder.payment_method || null,
+          paymentMethodTitle: wcOrder.payment_method_title || null,
+          wcCreatedAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created),
+          wcUpdatedAt: new Date(wcOrder.date_modified_gmt || wcOrder.date_modified),
+          ...(options.useWcDateAsCreatedAt ? { createdAt: new Date(wcOrder.date_created_gmt || wcOrder.date_created) } : {}),
+          status: imsStatus,
+          shipFromWarehouseId: wcDefaultWarehouseId,
+          currency,
+          fxRateToGbp: fxRate,
+          customerId,
+          customerName,
+          customerEmail: wcOrder.billing.email || null,
+          billingAddress: mapWcAddress(wcOrder.billing),
+          shippingAddress: mapWcAddress(wcOrder.shipping),
+          subtotalForeign,
+          shippingService: shipping.shippingService,
+          shippingForeign,
+          taxRateName,
+          taxRatePercent: taxRateValue > 0 ? taxRateValue : null,
+          taxForeign,
+          pricesIncludeVat: !!pricesIncludeVat && taxRateValue > 0,
+          totalForeign,
+          subtotalGbp,
+          shippingGbp,
+          taxGbp,
+          totalGbp,
+          discountStr: orderDiscount.discountStr,
+          discountAmount: orderDiscount.discountAmount,
+          notes: wcOrder.customer_note || null,
+          paidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : null,
+          lines: { create: lineData },
+        },
+      })
+    } catch (error) {
+      if (!isUniqueConstraintError(error)) throw error
+      const concurrent = await db.salesOrder.findUnique({ where: { wcOrderId: wcOrder.id } })
+      if (concurrent) return { success: true, orderId: concurrent.id }
+      throw error
+    }
 
     // Auto-allocate stock (skip for terminal statuses)
     const TERMINAL_STATUSES = ['CANCELLED', 'REFUNDED']
     if (!TERMINAL_STATUSES.includes(imsStatus)) {
       const { autoAllocateOrder } = await import('@/app/actions/allocation')
-      await autoAllocateOrder(so.id)
+      await autoAllocateOrder(so.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
     }
 
     // Queue accounting sales invoice — only for PROCESSING orders and when
@@ -341,7 +355,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       },
     })
 
-    logActivity({
+    await logActivity({
       entityType: 'SALES_ORDER',
       entityId: so.id,
       action: 'imported',
@@ -349,6 +363,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       level: 'INFO',
       description: `Imported WC order #${wcOrder.number} (${currency} ${totalForeign.toFixed(2)})`,
       metadata: { wcOrderId: wcOrder.id, wcNumber: wcOrder.number, currency, total: totalForeign },
+      resolveUser: false,
     })
 
     return { success: true, orderId: so.id }
@@ -437,12 +452,13 @@ export async function syncNewWcOrders(
   })
 
   if (result.synced > 0) {
-    logActivity({
+    await logActivity({
       entityType: 'SYNC',
       action: 'order_sync',
       tag: 'sync',
       level: 'INFO',
       description: `WC order ${mode === 'poll' ? 'poll' : 'reconciliation'}: ${result.synced} imported, ${result.skipped} skipped, ${result.errors.length} errors`,
+      resolveUser: false,
     })
   }
 

@@ -36,8 +36,14 @@ export async function setAuthToken(
 export async function consumeAuthToken(key: string): Promise<string | null> {
   const entry = await db.oneTimeToken.findUnique({ where: { key } })
   if (!entry) return null
-  // Best-effort consume: delete first so a concurrent caller can't re-use it.
-  await db.oneTimeToken.delete({ where: { key } }).catch(() => null)
-  if (entry.expiresAt.getTime() < Date.now()) return null
+  if (entry.expiresAt.getTime() < Date.now()) {
+    await db.oneTimeToken.delete({ where: { key } }).catch(() => null)
+    return null
+  }
+  try {
+    await db.oneTimeToken.delete({ where: { key } })
+  } catch {
+    return null
+  }
   return entry.value
 }

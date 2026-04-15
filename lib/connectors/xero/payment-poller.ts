@@ -7,6 +7,7 @@
 import { db } from '@/lib/db'
 import { xeroGet } from './api'
 import { logActivity } from '@/lib/activity-log'
+import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 
 type XeroInvoice = {
   InvoiceID: string
@@ -63,18 +64,19 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
             if (order.status === 'PENDING_PAYMENT') {
               try {
                 const { autoAllocateOrder } = await import('@/app/actions/allocation')
-                await autoAllocateOrder(order.id)
+                await autoAllocateOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
               } catch { /* Non-critical */ }
             }
 
             result.salesPaid++
-            logActivity({
+            await logActivity({
               entityType: 'SALES_ORDER',
               entityId: order.id,
               action: 'payment_detected',
               tag: 'sync',
               level: 'INFO',
               description: `Payment detected via Xero for order ${order.orderNumber ?? order.wcOrderNumber}`,
+              resolveUser: false,
             })
           }
         }
@@ -114,13 +116,14 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
             })
 
             result.billsPaid++
-            logActivity({
+            await logActivity({
               entityType: 'PURCHASE_ORDER',
               entityId: bill.poId,
               action: 'bill_payment_detected',
               tag: 'sync',
               level: 'INFO',
               description: `Bill payment detected via Xero for PO ${bill.po.reference}`,
+              resolveUser: false,
             })
           }
         }
@@ -138,13 +141,14 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
   })
 
   if (result.salesPaid > 0 || result.billsPaid > 0) {
-    logActivity({
+    await logActivity({
       entityType: 'SYSTEM',
       action: 'xero_payment_poll',
       tag: 'sync',
       level: 'INFO',
       description: `Payment poll: ${result.salesPaid} sales, ${result.billsPaid} bills detected`,
       metadata: result,
+      resolveUser: false,
     })
   }
 

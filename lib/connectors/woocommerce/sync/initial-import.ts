@@ -7,6 +7,7 @@
  * Skips failed, cancelled, and refunded orders entirely.
  */
 
+import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { notify } from '@/lib/notifications'
@@ -79,13 +80,12 @@ export async function startInitialImport(): Promise<void> {
   }
   await saveProgress(progress)
 
-  // Fire and forget
-  runInitialImport(progress).catch(async (e) => {
+  after(() => runInitialImport(progress).catch(async (e) => {
     progress.status = 'error'
     progress.message = String(e)
     progress.errors.push(String(e))
     await saveProgress(progress)
-  })
+  }))
 }
 
 // ---------------------------------------------------------------------------
@@ -184,11 +184,12 @@ async function runInitialImport(progress: InitialImportProgress) {
     progress.message = parts.join(' \u00b7 ')
     await saveProgress(progress)
 
-    logActivity({
+    await logActivity({
       entityType: 'IMPORT',
       tag: 'import',
       action: 'imported',
       description: `Active WC order import complete: ${progress.message}`,
+      resolveUser: false,
     })
 
     notify({
@@ -203,12 +204,13 @@ async function runInitialImport(progress: InitialImportProgress) {
     progress.errors.push(String(e))
     await saveProgress(progress)
 
-    logActivity({
+    await logActivity({
       entityType: 'IMPORT',
       tag: 'import',
       action: 'imported',
       level: 'ERROR',
       description: `Active WC order import failed: ${String(e)}`,
+      resolveUser: false,
     })
 
     notify({
@@ -242,12 +244,13 @@ export async function purgeExpiredDemandHistory(): Promise<number> {
   })
 
   if (deleted.count > 0) {
-    logActivity({
+    await logActivity({
       entityType: 'SYSTEM',
       action: 'cleanup',
       tag: 'system',
       description: `Purged ${deleted.count} expired demand history records (older than ${retentionMonths} months)`,
       metadata: { deletedCount: deleted.count },
+      resolveUser: false,
     })
   }
 

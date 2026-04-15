@@ -1,0 +1,2 @@
+export const INTERNAL_ACTION_BYPASS = Symbol('INTERNAL_ACTION_BYPASS')
+

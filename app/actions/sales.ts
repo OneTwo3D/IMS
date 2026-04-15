@@ -5,9 +5,11 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
+import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
+import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
@@ -16,6 +18,8 @@ import {
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
 import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
+
+const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
 // ---------------------------------------------------------------------------
 // Types
@@ -960,7 +964,6 @@ export async function updateSalesOrderStatus(
   extra?: { trackingNumber?: string; shipFromWarehouseId?: string },
 ): Promise<{ success: boolean; error?: string }> {
   return applySalesOrderStatusTransition(id, targetStatus, extra, {
-    requireProcessPermission: true,
     pushStatusToWooCommerce: true,
   })
 }
@@ -969,10 +972,11 @@ export async function applySalesOrderStatusTransition(
   id: string,
   targetStatus: SoStatus,
   extra?: { trackingNumber?: string; shipFromWarehouseId?: string },
-  options?: { requireProcessPermission?: boolean; pushStatusToWooCommerce?: boolean },
+  options?: { pushStatusToWooCommerce?: boolean; internalBypassToken?: symbol },
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    if (options?.requireProcessPermission ?? false) {
+    const bypassPermission = options?.internalBypassToken === INTERNAL_STATUS_TRANSITION_BYPASS
+    if (!bypassPermission) {
       await requirePermission('sales.process')
     }
     const so = await db.salesOrder.findUnique({
@@ -1007,6 +1011,9 @@ export async function applySalesOrderStatusTransition(
     }
 
     const data: Record<string, unknown> = { status: targetStatus }
+    let orderUpdated = false
+    let releasedLegacyReservations = false
+    const dispatchLogs: Array<{ productId: string; sku: string | null; qty: number; warehouseId: string }> = []
 
     // On SHIPPED: check if shipments exist (new flow) or use legacy single-warehouse flow
     if (targetStatus === 'SHIPPED') {
@@ -1028,47 +1035,56 @@ export async function applySalesOrderStatusTransition(
         if (extra?.trackingNumber) data.trackingNumber = extra.trackingNumber
         if (extra?.shipFromWarehouseId) data.shipFromWarehouseId = extra.shipFromWarehouseId
 
-        // Release allocations
-        const allocs = await db.orderAllocation.findMany({ where: { orderId: id } })
-        if (allocs.length > 0) {
-          for (const alloc of allocs) {
-            await db.stockLevel.updateMany({
-              where: { productId: alloc.productId, warehouseId: alloc.warehouseId },
-              data: { reservedQty: { decrement: Number(alloc.qty) } },
+        await db.$transaction(async (tx) => {
+          const allocs = await tx.orderAllocation.findMany({ where: { orderId: id } })
+          if (allocs.length > 0) {
+            for (const alloc of allocs) {
+              await tx.stockLevel.updateMany({
+                where: { productId: alloc.productId, warehouseId: alloc.warehouseId },
+                data: { reservedQty: { decrement: Number(alloc.qty) } },
+              })
+            }
+          } else if (so.shipFromWarehouseId) {
+            releasedLegacyReservations = true
+            for (const line of so.lines) {
+              if (!line.productId) continue
+              const qty = Number(line.qty)
+              await tx.stockLevel.updateMany({
+                where: { productId: line.productId, warehouseId },
+                data: { reservedQty: { decrement: qty } },
+              })
+            }
+          }
+
+          for (const line of so.lines) {
+            if (!line.productId) continue
+            const qty = Number(line.qty)
+            await tx.stockMovement.create({
+              data: {
+                type: 'SALE_DISPATCH',
+                productId: line.productId,
+                fromWarehouseId: warehouseId,
+                qty,
+                note: `Dispatched for order`,
+                referenceType: 'SalesOrder',
+                referenceId: id,
+              },
+            })
+            await tx.stockLevel.updateMany({
+              where: { productId: line.productId, warehouseId },
+              data: { quantity: { decrement: qty } },
+            })
+            dispatchLogs.push({
+              productId: line.productId,
+              sku: line.sku ?? null,
+              qty,
+              warehouseId,
             })
           }
-        } else if (so.shipFromWarehouseId) {
-          await releaseReservedStock(id, warehouseId, so.lines)
-        }
 
-        for (const line of so.lines) {
-          if (!line.productId) continue
-          const qty = Number(line.qty)
-          await db.stockMovement.create({
-            data: {
-              type: 'SALE_DISPATCH',
-              productId: line.productId,
-              fromWarehouseId: warehouseId,
-              qty,
-              note: `Dispatched for order`,
-              referenceType: 'SalesOrder',
-              referenceId: id,
-            },
-          })
-          await db.stockLevel.updateMany({
-            where: { productId: line.productId, warehouseId },
-            data: { quantity: { decrement: qty } },
-          })
-          await logActivity({
-            entityType: 'STOCK_ADJUSTMENT',
-            entityId: line.productId,
-            action: 'dispatched',
-            tag: 'stock',
-            level: 'INFO',
-            description: `Dispatched ${qty} units of SKU ${line.sku ?? line.productId} for order ${so.orderNumber ?? so.wcOrderNumber}`,
-            metadata: { sku: line.sku, productId: line.productId, qty, orderNumber: so.orderNumber ?? so.wcOrderNumber, warehouseId },
-          })
-        }
+          await tx.salesOrder.update({ where: { id }, data })
+        }, STOCK_TX_OPTIONS)
+        orderUpdated = true
       }
     }
 
@@ -1080,11 +1096,16 @@ export async function applySalesOrderStatusTransition(
     if (targetStatus === 'CANCELLED') {
       const { deallocateOrder } = await import('./allocation')
       await deallocateOrder(id)
-      // Also delete any pending shipments
-      await db.shipment.deleteMany({ where: { orderId: id, status: { in: ['PENDING', 'PICKING', 'PACKED'] as const } } })
+      await db.$transaction(async (tx) => {
+        await tx.shipment.deleteMany({ where: { orderId: id, status: { in: ['PENDING', 'PICKING', 'PACKED'] as const } } })
+        await tx.salesOrder.update({ where: { id }, data })
+      }, STOCK_TX_OPTIONS)
+      orderUpdated = true
     }
 
-    await db.salesOrder.update({ where: { id }, data })
+    if (!orderUpdated) {
+      await db.salesOrder.update({ where: { id }, data })
+    }
 
     // Draft finalisation: when a DRAFT is moved to any non-cancelled status,
     // allocate stock (skipped at creation) and queue the sales invoice for
@@ -1110,6 +1131,28 @@ export async function applySalesOrderStatusTransition(
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${id}`)
+    if (releasedLegacyReservations) {
+      await logActivity({
+        entityType: 'STOCK_ADJUSTMENT',
+        entityId: id,
+        action: 'reservation_released',
+        tag: 'stock',
+        level: 'INFO',
+        description: `Released reserved stock for order ${id}`,
+        metadata: { orderId: id, warehouseId: extra?.shipFromWarehouseId || so.shipFromWarehouseId },
+      })
+    }
+    for (const entry of dispatchLogs) {
+      await logActivity({
+        entityType: 'STOCK_ADJUSTMENT',
+        entityId: entry.productId,
+        action: 'dispatched',
+        tag: 'stock',
+        level: 'INFO',
+        description: `Dispatched ${entry.qty} units of SKU ${entry.sku ?? entry.productId} for order ${so.orderNumber ?? so.wcOrderNumber}`,
+        metadata: { sku: entry.sku, productId: entry.productId, qty: entry.qty, orderNumber: so.orderNumber ?? so.wcOrderNumber, warehouseId: entry.warehouseId },
+      })
+    }
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
@@ -1163,9 +1206,12 @@ export async function createRefund(
   lines: { productId: string | null; description: string; qty: number; totalGbp: number }[],
   reason: string,
   returnWarehouseId?: string,
+  options?: { internalBypassToken?: symbol; externalRefundId?: number },
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requirePermission('sales.refund')
+    if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
+      await requirePermission('sales.refund')
+    }
     const so = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: {
@@ -1202,6 +1248,7 @@ export async function createRefund(
       data: {
         orderId,
         creditNoteNumber,
+        wcRefundId: options?.externalRefundId ?? null,
         reason: reason || null,
         totalForeign,
         totalGbp,
@@ -1848,6 +1895,15 @@ export async function createRefund(
 
     return { success: true }
   } catch (e) {
+    if (
+      options?.externalRefundId &&
+      typeof e === 'object' &&
+      e !== null &&
+      'code' in e &&
+      (e as { code?: string }).code === 'P2002'
+    ) {
+      return { success: true }
+    }
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
