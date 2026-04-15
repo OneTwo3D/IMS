@@ -296,7 +296,7 @@ export function PoListClient({ initialPos, currencySymbols = {}, currencyPositio
       case 'discount':
         return (
           <TableCell key={key} className="text-right tabular-nums text-xs text-destructive">
-            {po.orderDiscountForeign > 0 ? `-${po.orderDiscountForeign.toFixed(2)}` : '—'}
+            {po.orderDiscountForeign > 0 ? fmtForeign(-po.orderDiscountForeign, po.currency) : '—'}
           </TableCell>
         )
       case 'landedCost':
