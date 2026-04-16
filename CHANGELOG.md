@@ -4,7 +4,7 @@ This repository uses an `x.y.z` release scheme.
 
 - Increment `x` for breaking changes.
 - Increment `y` for user-facing non-breaking changes.
-- Increment `z` for backend-only non-breaking changes.
+- Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
 ## 1.2.0 - 2026-04-16
 
@@ -28,9 +28,9 @@ This repository uses an `x.y.z` release scheme.
 
 ### Technical
 
-- Bumped the tracked release metadata and package version for the 1.1 non-breaking release.
+- Bumped the tracked release metadata and package version for the 1.1.0 non-breaking release.
 
-## 1.0 - 2026-04-16
+## 1.0.0 - 2026-04-16
 
 ### User-facing
 

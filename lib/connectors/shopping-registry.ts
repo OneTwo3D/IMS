@@ -52,7 +52,7 @@ export const SHOPPING_CONNECTORS: readonly ShoppingConnectorDef[] = [
     invKey: 'shopify_inv_prefix',
     defaultOrder: '',
     defaultInv: 'INSH-',
-    available: false,
+    available: true,
   },
 ] as const
 

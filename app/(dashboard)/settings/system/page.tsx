@@ -130,7 +130,7 @@ export default async function SystemSettingsPage({
               <div>
                 <p className="text-sm font-medium">Versioning policy</p>
                 <p className="mt-2 text-sm text-muted-foreground">
-                  Releases follow an x.y scheme. Increment x for breaking changes. Increment y for non-breaking changes.
+                  Releases follow an x.y.z scheme. Increment x for breaking changes, y for user-facing non-breaking changes, and z for backend-only non-breaking changes with no direct user impact.
                 </p>
               </div>
             </div>

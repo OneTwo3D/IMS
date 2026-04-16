@@ -4,8 +4,11 @@ import { Card } from '@/components/ui/card'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { SyncClient } from './sync-client'
+import { ShopifySyncClient } from './shopify-sync-client'
 import { XeroClient } from './xero-client'
 import type {
+  ShopifyConnectorCredentials,
+  ShopifySyncSettings,
   ShoppingConnectorCredentials,
   ShoppingStatusMappingRow,
   ShoppingSyncLogRow,
@@ -34,6 +37,9 @@ type Props = {
   /** Live accounting tax rates (fetched on page load when connected). */
   accountingTaxRates: Array<{ taxType: string; name: string; rate: number }>
   shoppingCredentials: ShoppingConnectorCredentials
+  shopifySettings: ShopifySyncSettings
+  shopifyCredentials: ShopifyConnectorCredentials
+  shopifyLogs: ShoppingSyncLogRow[]
   accountingSettings: AccountingConnectorSettings & { secretMasked: boolean }
   accountingConnected: boolean
   accountingTenantName?: string
@@ -73,7 +79,7 @@ const CONNECTORS: ConnectorDef[] = [
     description: 'Sync orders, products and stock with Shopify',
     logo: '/images/shopify-banner.png',
     category: 'shopping',
-    available: false,
+    available: true,
   },
   {
     id: 'rest-api',
@@ -120,7 +126,7 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
   quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 
-export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, taxRates, imsTaxRates, accountingTaxRates, shoppingCredentials, accountingSettings, accountingConnected, accountingTenantName, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, accountingReadiness, accountingBatchPreview, accountingBatchHistory }: Props) {
+export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, taxRates, imsTaxRates, accountingTaxRates, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, accountingSettings, accountingConnected, accountingTenantName, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, accountingReadiness, accountingBatchPreview, accountingBatchHistory }: Props) {
   const router = useRouter()
   const searchParams = useSearchParams()
   const requestedConnector = searchParams.get('connector')
@@ -144,7 +150,8 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
     }
   }
 
-  const shoppingConnected = pluginState.woocommerce && !!shoppingCredentials.url && !!shoppingCredentials.key && !!shoppingCredentials.secret
+  const woocommerceConnected = pluginState.woocommerce && !!shoppingCredentials.url && !!shoppingCredentials.key && !!shoppingCredentials.secret
+  const shopifyConnected = pluginState.shopify && !!shopifyCredentials.storeDomain && !!shopifyCredentials.adminApiAccessToken
   const visibleConnectors = CONNECTORS.filter((connector) => {
     if (connector.id === 'woocommerce') return pluginState.woocommerce
     if (connector.id === 'shopify') return pluginState.shopify
@@ -304,15 +311,14 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
           {CONNECTOR_LOGOS.shopify}
           <div>
             <h2 className="text-lg font-semibold">Shopify Connector</h2>
-            <p className="text-xs text-muted-foreground">Groundwork is in place; connector implementation is still empty.</p>
+            <p className="text-xs text-muted-foreground">Configure Shopify credentials, webhook verification, and stock sync.</p>
           </div>
         </div>
-        <Card className="p-6">
-          <p className="text-sm text-muted-foreground">
-            Shopify now exists as a first-class shopping connector slot in the schema, plugin state, and shared connector registries.
-            The module skeleton is present, but webhook intake, order import, product sync, stock sync, and delivery integration are not implemented yet.
-          </p>
-        </Card>
+        <ShopifySyncClient
+          settings={shopifySettings}
+          credentials={shopifyCredentials}
+          logs={shopifyLogs}
+        />
       </div>
     )
   }
@@ -356,7 +362,12 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
             >
               <div className="flex items-center justify-between">
                 {CONNECTOR_LOGOS[c.id]}
-                {c.id === 'woocommerce' && shoppingConnected && (
+                {c.id === 'woocommerce' && woocommerceConnected && (
+                  <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
+                    Connected
+                  </span>
+                )}
+                {c.id === 'shopify' && shopifyConnected && (
                   <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
                     Connected
                   </span>

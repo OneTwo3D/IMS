@@ -1,5 +1,6 @@
 'use server'
 
+import { revalidatePath } from 'next/cache'
 import {
   createWcWebhooks,
   deleteShoppingTaxRateMapping as deleteShoppingTaxRateMappingImpl,
@@ -21,7 +22,12 @@ import {
   type TaxRateMappingRow,
   type WcSyncSettings,
 } from '@/app/actions/wc-sync'
-import { getActiveShoppingConnectorInfo } from '@/lib/shopping'
+import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
+import { requirePermission } from '@/lib/auth/server'
+import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/settings-store'
+import { getActiveShoppingConnectorInfo, syncShoppingConnectorStock } from '@/lib/shopping'
+import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 
 export type ShoppingSyncSettings = WcSyncSettings
 export type ShoppingTaxRateMappingRow = TaxRateMappingRow
@@ -32,6 +38,57 @@ export type ShoppingConnectorCredentials = {
   key: string
   secret: string
   secretMasked: boolean
+}
+export type ShopifySyncSettings = {
+  shopify_sync_enabled: string
+}
+export type ShopifyConnectorCredentials = {
+  storeDomain: string
+  adminApiAccessToken: string
+  accessTokenMasked: boolean
+  webhookSecret: string
+  webhookSecretMasked: boolean
+}
+
+const SHOPIFY_SYNC_SETTING_KEYS = ['shopify_sync_enabled'] as const
+const SHOPIFY_SYNC_DEFAULTS: ShopifySyncSettings = {
+  shopify_sync_enabled: 'false',
+}
+
+async function requireShoppingAdmin() {
+  return requirePermission('sync')
+}
+
+function maskSecret(value: string, visibleChars = 7): string {
+  if (!value) return ''
+  if (value.length <= visibleChars) return '*'.repeat(value.length)
+  return `${value.slice(0, visibleChars)}${'*'.repeat(Math.max(0, value.length - visibleChars))}`
+}
+
+function mapSyncLogRows(
+  rows: Array<{
+    id: string
+    direction: string
+    status: string
+    entityType: string
+    entityId: string | null
+    externalId: string | null
+    errorMessage: string | null
+    syncedAt: Date | null
+    createdAt: Date
+  }>,
+): ShoppingSyncLogRow[] {
+  return rows.map((row) => ({
+    id: row.id,
+    direction: row.direction,
+    status: row.status,
+    entityType: row.entityType,
+    entityId: row.entityId,
+    externalId: row.externalId,
+    errorMessage: row.errorMessage,
+    syncedAt: row.syncedAt?.toISOString() ?? null,
+    createdAt: row.createdAt.toISOString(),
+  }))
 }
 
 export async function getShoppingIntegrationConnector() {
@@ -96,4 +153,165 @@ export async function getShoppingConnectorPaymentMethods(): Promise<Array<{ id: 
 
 export async function triggerShoppingManualSync(type: 'orders' | 'products' | 'stock') {
   return triggerManualSync(type)
+}
+
+export async function getShopifySyncSettings(): Promise<ShopifySyncSettings> {
+  await requireShoppingAdmin()
+  const map = await getSettingValues([...SHOPIFY_SYNC_SETTING_KEYS])
+  const result = { ...SHOPIFY_SYNC_DEFAULTS }
+  for (const key of Object.keys(result) as (keyof ShopifySyncSettings)[]) {
+    const value = map.get(key)
+    if (value) result[key] = value
+  }
+  return result
+}
+
+export async function saveShopifySyncSettings(data: Partial<ShopifySyncSettings>): Promise<{ success: boolean; error?: string }> {
+  await requireShoppingAdmin()
+  const operations = Object.entries(data)
+    .filter(([key]) => SHOPIFY_SYNC_SETTING_KEYS.includes(key as (typeof SHOPIFY_SYNC_SETTING_KEYS)[number]))
+    .map(([key, value]) => (
+      db.setting.upsert({
+        where: { key },
+        create: { key, value: serializeSettingValue(key, value ?? '') },
+        update: { value: serializeSettingValue(key, value ?? '') },
+      })
+    ))
+
+  if (operations.length > 0) {
+    await db.$transaction(operations)
+    await logActivity({
+      entityType: 'SETTING',
+      tag: 'settings',
+      action: 'updated',
+      description: 'Updated Shopify sync settings',
+      metadata: { keys: Object.keys(data) },
+    })
+    revalidatePath('/sync')
+  }
+
+  return { success: true }
+}
+
+export async function getShopifyConnectorCredentials(): Promise<ShopifyConnectorCredentials> {
+  await requireShoppingAdmin()
+  const map = await getSettingValues([
+    'shopify_store_domain',
+    'shopify_admin_api_access_token',
+    'shopify_webhook_secret',
+  ])
+
+  const adminApiAccessToken = map.get('shopify_admin_api_access_token') ?? ''
+  const webhookSecret = map.get('shopify_webhook_secret') ?? ''
+
+  return {
+    storeDomain: map.get('shopify_store_domain') ?? '',
+    adminApiAccessToken: maskSecret(adminApiAccessToken),
+    accessTokenMasked: !!adminApiAccessToken,
+    webhookSecret: maskSecret(webhookSecret),
+    webhookSecretMasked: !!webhookSecret,
+  }
+}
+
+export async function saveShopifyConnectorCredentials(
+  storeDomain: string,
+  adminApiAccessToken: string,
+  webhookSecret: string,
+): Promise<{ success: boolean; error?: string }> {
+  await requireShoppingAdmin()
+
+  const trimmedDomain = storeDomain.trim()
+  if (!trimmedDomain) {
+    return { success: false, error: 'Store domain is required' }
+  }
+
+  const incomingTokenIsMasked = !!adminApiAccessToken && adminApiAccessToken.includes('*')
+  const incomingWebhookSecretIsMasked = !!webhookSecret && webhookSecret.includes('*')
+
+  const [currentToken, currentWebhookSecret] = await Promise.all([
+    incomingTokenIsMasked ? getSettingValue('shopify_admin_api_access_token') : Promise.resolve(adminApiAccessToken),
+    incomingWebhookSecretIsMasked ? getSettingValue('shopify_webhook_secret') : Promise.resolve(webhookSecret),
+  ])
+
+  const nextToken = (currentToken ?? '').trim()
+  if (!nextToken) {
+    return { success: false, error: 'Admin API access token is required' }
+  }
+
+  await db.$transaction([
+    db.setting.upsert({
+      where: { key: 'shopify_store_domain' },
+      create: { key: 'shopify_store_domain', value: trimmedDomain },
+      update: { value: trimmedDomain },
+    }),
+    db.setting.upsert({
+      where: { key: 'shopify_admin_api_access_token' },
+      create: {
+        key: 'shopify_admin_api_access_token',
+        value: serializeSettingValue('shopify_admin_api_access_token', nextToken),
+      },
+      update: {
+        value: serializeSettingValue('shopify_admin_api_access_token', nextToken),
+      },
+    }),
+    db.setting.upsert({
+      where: { key: 'shopify_webhook_secret' },
+      create: {
+        key: 'shopify_webhook_secret',
+        value: serializeSettingValue('shopify_webhook_secret', (currentWebhookSecret ?? '').trim()),
+      },
+      update: {
+        value: serializeSettingValue('shopify_webhook_secret', (currentWebhookSecret ?? '').trim()),
+      },
+    }),
+  ])
+
+  await logActivity({
+    entityType: 'SETTING',
+    tag: 'settings',
+    action: 'updated',
+    description: 'Updated Shopify connector credentials',
+    metadata: { storeDomain: trimmedDomain },
+  })
+
+  revalidatePath('/sync')
+  return { success: true }
+}
+
+export async function getShopifySyncLogs(limit = 50): Promise<ShoppingSyncLogRow[]> {
+  await requireShoppingAdmin()
+  const rows = await db.shoppingSyncLog.findMany({
+    where: { connector: 'shopify' },
+    orderBy: { createdAt: 'desc' },
+    take: limit,
+  })
+  return mapSyncLogRows(rows)
+}
+
+export async function triggerShopifyManualSync(
+  type: 'orders' | 'products' | 'stock',
+): Promise<{ success: boolean; result?: unknown; error?: string }> {
+  await requireShoppingAdmin()
+
+  if (type !== 'stock') {
+    return {
+      success: false,
+      error: 'Shopify manual order and product sync are not wired yet',
+    }
+  }
+
+  try {
+    const result = await syncShoppingConnectorStock('shopify')
+    return { success: true, result }
+  } catch (error) {
+    return { success: false, error: String(error) }
+  }
+}
+
+export async function getShoppingSyncLogsForConnector(
+  connector: ShoppingConnectorId,
+  limit = 50,
+): Promise<ShoppingSyncLogRow[]> {
+  if (connector === 'shopify') return getShopifySyncLogs(limit)
+  return getShoppingSyncLogs(limit)
 }

@@ -3,6 +3,9 @@ import { redirect } from 'next/navigation'
 import {
   getShoppingConnectorCredentials,
   getShoppingConnectorPaymentMethods,
+  getShopifyConnectorCredentials,
+  getShopifySyncLogs,
+  getShopifySyncSettings,
   getShoppingStatusMappings,
   getShoppingSyncLogs,
   getShoppingSyncSettings,
@@ -32,12 +35,23 @@ export default async function SyncPage() {
     redirect('/settings/system?tab=plugins')
   }
 
-  const [shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, shoppingCredentials, taxRatesRaw, accountingSettings, accountingStatus, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, accountingReadiness, currenciesRaw, shoppingPaymentMethods, accountingBatchPreview, accountingBatchHistory] = await Promise.all([
+  const [shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, taxRatesRaw, accountingSettings, accountingStatus, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, accountingReadiness, currenciesRaw, shoppingPaymentMethods, accountingBatchPreview, accountingBatchHistory] = await Promise.all([
     getShoppingSyncSettings(),
     getShoppingTaxRateMappings(),
     getShoppingStatusMappings(),
     getShoppingSyncLogs(100),
     getShoppingConnectorCredentials(),
+    pluginState.shopify ? getShopifySyncSettings() : Promise.resolve({ shopify_sync_enabled: 'false' }),
+    pluginState.shopify
+      ? getShopifyConnectorCredentials()
+      : Promise.resolve({
+          storeDomain: '',
+          adminApiAccessToken: '',
+          accessTokenMasked: false,
+          webhookSecret: '',
+          webhookSecretMasked: false,
+        }),
+    pluginState.shopify ? getShopifySyncLogs(100) : Promise.resolve([]),
     getTaxRates(),
     getAccountingSettingsMasked(),
     getAccountingConnectionStatus(),
@@ -79,6 +93,9 @@ export default async function SyncPage() {
         imsTaxRates={taxRatesRaw}
         accountingTaxRates={accountingTaxRates}
         shoppingCredentials={shoppingCredentials}
+        shopifySettings={shopifySettings}
+        shopifyCredentials={shopifyCredentials}
+        shopifyLogs={shopifyLogs}
         accountingSettings={accountingSettings}
         accountingConnected={accountingStatus.connected}
         accountingTenantName={accountingStatus.tenantName}
