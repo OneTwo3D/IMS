@@ -56,6 +56,8 @@ export SMTP_PASS=...
 export SMTP_SECURE=tls
 export SMTP_FROM_NAME='One Two Inventory'
 export SMTP_REPLY_TO=support@onetwoinventory.com
+export NEXT_PUBLIC_TURNSTILE_SITE_KEY=...
+export TURNSTILE_SECRET_KEY=...
 export GIT_REPO_URL=git@github.com:your-org/onetwoinventory.git
 export GIT_BRANCH=main
 export GIT_DEPLOY_KEY_ENABLED=y
@@ -122,4 +124,5 @@ bash scripts/provision-ims-tenant.sh
 - `REDIS_KEY_PREFIX` defaults to `TENANT_SLUG` and is written into the tenant `.env` so Redis-backed features can namespace keys per tenant.
 - `PROXY_TYPE=ols` uses the OpenLiteSpeed configuration branch. `PROXY_TYPE=nginx` uses an nginx vhost plus `certbot --nginx`.
 - The install step stores `public_app_url` and SMTP settings in the IMS settings table so the fresh instance has its public URL and outbound mail defaults from the start.
+- `NEXT_PUBLIC_TURNSTILE_SITE_KEY` and `TURNSTILE_SECRET_KEY` are passed through to the tenant `.env`. Leave them blank to keep password login Turnstile disabled on that tenant.
 - The OpenLiteSpeed automation assumes listener names `Default` and `SSL`. Override them if your host uses different listener names.
