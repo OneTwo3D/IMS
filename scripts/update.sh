@@ -111,7 +111,7 @@ fi
 if ! $SKIP_BUILD; then
   header "Installing dependencies"
 
-  sudo -u "${APP_USER}" npm ci --prefix "${APP_DIR}" --omit=dev 2>&1 | \
+  sudo -u "${APP_USER}" npm ci --prefix "${APP_DIR}" 2>&1 | \
     grep -v "^npm warn" || true
   success "Dependencies updated."
 fi

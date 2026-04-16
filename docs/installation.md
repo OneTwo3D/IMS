@@ -22,19 +22,22 @@ The script performs the following steps:
 1. **Pre-flight checks** — verifies root access, detects the OS, and checks internet connectivity
 2. **Installs Node.js 22** via NodeSource
 3. **Installs and configures PostgreSQL** — creates the database and user
-4. **Installs nginx**
+4. **Installs nginx**, `fail2ban`, and automatic security updates
 5. **Installs PM2** globally for process management
 6. **Prompts for configuration** values (see below)
 7. **Creates the app system user** (`imsapp`)
 8. **Deploys the application** — clones from git or copies from a local directory
 9. **Installs npm dependencies** and builds the Next.js application
 10. **Runs database migrations** via Prisma
-11. **Configures PM2** with an ecosystem file and registers it with systemd
-12. **Configures nginx** as a reverse proxy
-13. **Sets up cron jobs** for scheduled tasks
-14. **Prints a post-install summary** with next steps
+11. **Optionally seeds public URL, SMTP settings, and a default admin user**
+12. **Configures PM2** with an ecosystem file and registers it with systemd
+13. **Configures nginx** as a reverse proxy
+14. **Enables fail2ban and unattended security updates**
+15. **Sets up cron jobs** for scheduled tasks
+16. **Prints a post-install summary** with next steps
 
 For unattended installation, use `--non-interactive` and set configuration values as environment variables.
+For full Proxmox + Cloudflare + OpenLiteSpeed tenant rollout, see [Automated Tenant Provisioning](tenant-provisioning.md).
 
 
 ## Configuration Prompts
@@ -44,6 +47,8 @@ The installer asks for the following values during setup. Press Enter to accept 
 ### Application
 - **Domain name** — the hostname for your installation (e.g. `ims.yourdomain.com`)
 - **Internal port** — the port the app listens on (default: `3000`)
+- **Default admin name/email/password** — optional bootstrap admin user for unattended installs
+- **Notification email** — optional recipient for the bootstrap credentials email
 
 After installation, sign in and set the organisation base currency in **Settings > Company** before entering live transactional data. The base currency is intended to be set once for a new system. Changing it later requires a database reset.
 
@@ -56,6 +61,7 @@ After installation, sign in and set the organisation base currency in **Settings
 ### Redis
 - **Redis URL** (default: `redis://localhost:6379`)
 - **Redis password** — leave blank if not required
+- **Redis key prefix** — optional namespace for Redis-backed features
 
 ### WooCommerce (Optional)
 - Store URL, consumer key, consumer secret, webhook secret
@@ -64,6 +70,11 @@ After installation, sign in and set the organisation base currency in **Settings
 ### Xero (Optional)
 - Client ID and client secret
 - Can be configured later in Settings
+
+### Outbound Email (Optional)
+- SMTP host, port, username, password, transport security
+- From name, from email, reply-to
+- Required if you want the installer to email the generated login details automatically
 
 ### nginx & SSL
 - **Configure nginx** — set up the reverse proxy (default: yes)
@@ -181,6 +192,7 @@ Key variables in the `.env` file:
 | `DATABASE_URL` | PostgreSQL connection string |
 | `REDIS_URL` | Redis connection URL |
 | `REDIS_PASSWORD` | Redis password (if required) |
+| `REDIS_KEY_PREFIX` | Optional Redis namespace prefix for tenant- or instance-scoped keys |
 | `WC_STORE_URL` | WooCommerce store URL |
 | `WC_CONSUMER_KEY` | WooCommerce API consumer key |
 | `WC_CONSUMER_SECRET` | WooCommerce API consumer secret |
@@ -219,9 +231,18 @@ The installer generates an nginx configuration at `/etc/nginx/sites-available/on
 - Upstream connection to the Next.js process on the configured port
 - WebSocket support for hot-reload (development) and real-time features
 - Security headers (X-Frame-Options, X-Content-Type-Options, X-XSS-Protection, Referrer-Policy)
+- Additional hardening headers (Permissions-Policy, COOP, CORP) and `server_tokens off`
 - Client upload limit of 20 MB
 - Extended timeouts for long-running requests (PDF generation, imports)
 - Dedicated location block for webhook endpoints
+
+## Host Security
+
+The installer also applies low-risk host hardening:
+
+- **fail2ban** enabled for `sshd` and, when nginx is configured, nginx auth/bad-bot jails
+- **unattended-upgrades** enabled for security and updates repositories
+- Existing active **ufw** setups are updated to allow ports `80` and `443`
 
 
 ## SSL
