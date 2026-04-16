@@ -12,6 +12,20 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '1.1',
+    date: '2026-04-16',
+    title: 'Visible app version in System Settings',
+    summary: 'Added the current release number directly to the System Settings header for faster support and deployment verification.',
+    userMessage: 'System Settings now shows the current app version directly in the page header.',
+    userHighlights: [
+      'Added a visible version badge to the System Settings header.',
+      'Kept the Releases tab as the place for fuller release history and notes.',
+    ],
+    technicalHighlights: [
+      'Bumped the application release to 1.1 and recorded it in the repo changelog.',
+    ],
+  },
+  {
     version: '1.0',
     date: '2026-04-16',
     title: 'Release tracking and operational hardening',

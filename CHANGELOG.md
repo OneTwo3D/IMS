@@ -5,6 +5,16 @@ This repository uses an `x.y` release scheme.
 - Increment `x` for breaking changes.
 - Increment `y` for non-breaking changes.
 
+## 1.1 - 2026-04-16
+
+### User-facing
+
+- Added the current app version as a visible badge in System Settings.
+
+### Technical
+
+- Bumped the tracked release metadata and package version for the 1.1 non-breaking release.
+
 ## 1.0 - 2026-04-16
 
 ### User-facing
