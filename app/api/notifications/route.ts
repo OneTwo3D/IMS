@@ -3,10 +3,16 @@ import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
 import { ensureCurrentReleaseNotification } from '@/lib/releases'
 
+function jsonNoStore(body: unknown, init?: ResponseInit) {
+  const headers = new Headers(init?.headers)
+  headers.set('Cache-Control', 'no-store')
+  return NextResponse.json(body, { ...init, headers })
+}
+
 // GET — fetch notifications for current user (+ broadcasts with per-user read state)
 export async function GET() {
   const session = await auth()
-  if (!session?.user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  if (!session?.user) return jsonNoStore({ error: 'Unauthorized' }, { status: 401 })
 
   const userId = session.user.id!
 
@@ -43,13 +49,13 @@ export async function GET() {
   ])
   const unreadCount = ownedUnread + Math.max(0, totalBroadcasts - totalReceipts)
 
-  return NextResponse.json({ notifications, unreadCount })
+  return jsonNoStore({ notifications, unreadCount })
 }
 
 // PATCH — mark notification(s) as read for the current user
 export async function PATCH(req: NextRequest) {
   const session = await auth()
-  if (!session?.user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  if (!session?.user) return jsonNoStore({ error: 'Unauthorized' }, { status: 401 })
 
   const userId = session.user.id!
   const body = await req.json()
@@ -71,14 +77,14 @@ export async function PATCH(req: NextRequest) {
         skipDuplicates: true,
       })
     }
-    return NextResponse.json({ ok: true })
+    return jsonNoStore({ ok: true })
   }
 
   if (Array.isArray(body.ids) && body.ids.length > 0) {
     // Validate the requested IDs belong to this user or are broadcasts.
     const ids = body.ids.filter((x: unknown): x is string => typeof x === 'string')
     if (ids.length === 0) {
-      return NextResponse.json({ error: 'Invalid ids' }, { status: 400 })
+      return jsonNoStore({ error: 'Invalid ids' }, { status: 400 })
     }
     const rows = await db.notification.findMany({
       where: { id: { in: ids }, OR: [{ userId }, { userId: null }] },
@@ -99,8 +105,8 @@ export async function PATCH(req: NextRequest) {
         skipDuplicates: true,
       })
     }
-    return NextResponse.json({ ok: true })
+    return jsonNoStore({ ok: true })
   }
 
-  return NextResponse.json({ error: 'Provide { ids: [...] } or { all: true }' }, { status: 400 })
+  return jsonNoStore({ error: 'Provide { ids: [...] } or { all: true }' }, { status: 400 })
 }

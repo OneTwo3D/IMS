@@ -1,0 +1,20 @@
+[Unit]
+Description=IMS Stage Development Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/ims/onetwo3d-ims-isolated
+EnvironmentFile=-/root/ims/onetwo3d-ims-isolated/.env.local
+Environment=NODE_ENV=development
+Environment=NEXT_PUBLIC_APP_URL=https://ims-stage.onetwo3d.co.uk
+Environment=AUTH_URL=https://ims-stage.onetwo3d.co.uk
+Environment=PORT=3000
+Environment=HOSTNAME=0.0.0.0
+ExecStart=/usr/bin/npm run dev -- --hostname 0.0.0.0 --port 3000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

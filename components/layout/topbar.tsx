@@ -14,6 +14,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 
 interface TopbarProps {
   userName: string
@@ -62,6 +63,7 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
   const { data: session } = useSession()
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [unreadCount, setUnreadCount] = useState(0)
+  const [selectedNotification, setSelectedNotification] = useState<Notification | null>(null)
 
   // Prefer client-side session pictureUrl (updates instantly after upload)
   const pictureUrl = (session?.user as { pictureUrl?: string | null } | undefined)?.pictureUrl ?? userPictureUrl
@@ -73,18 +75,25 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
     .toUpperCase()
     .slice(0, 2)
 
+  async function loadNotifications() {
+    const res = await fetch('/api/notifications', { cache: 'no-store' })
+    if (!res.ok) throw new Error('Failed to load notifications')
+    const data = await res.json()
+    setNotifications(data.notifications)
+    setUnreadCount(data.unreadCount)
+  }
+
   // Poll notifications every 30 seconds
   useEffect(() => {
     let cancelled = false
     async function poll() {
       try {
-        const res = await fetch('/api/notifications')
+        const res = await fetch('/api/notifications', { cache: 'no-store' })
         if (!res.ok || cancelled) return
         const data = await res.json()
-        if (!cancelled) {
-          setNotifications(data.notifications)
-          setUnreadCount(data.unreadCount)
-        }
+        if (cancelled) return
+        setNotifications(data.notifications)
+        setUnreadCount(data.unreadCount)
       } catch { /* ignore */ }
     }
     poll()
@@ -94,31 +103,40 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
 
   async function markAllRead() {
     try {
-      await fetch('/api/notifications', {
+      const res = await fetch('/api/notifications', {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ all: true }),
+        cache: 'no-store',
       })
-      setNotifications((prev) => prev.map((n) => ({ ...n, read: true })))
-      setUnreadCount(0)
+      if (!res.ok) return
+      await loadNotifications()
     } catch { /* ignore */ }
   }
 
   async function handleNotificationClick(n: Notification) {
     if (!n.read) {
       try {
-        await fetch('/api/notifications', {
+        const res = await fetch('/api/notifications', {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ ids: [n.id] }),
+          cache: 'no-store',
         })
-        setNotifications((prev) => prev.map((x) => x.id === n.id ? { ...x, read: true } : x))
-        setUnreadCount((c) => Math.max(0, c - 1))
+        if (!res.ok) return
+        await loadNotifications()
+        setSelectedNotification({ ...n, read: true })
+        return
       } catch { /* ignore */ }
     }
-    if (n.actionUrl) {
-      router.push(n.actionUrl)
-    }
+    setSelectedNotification(n)
+  }
+
+  function openNotificationAction() {
+    if (!selectedNotification?.actionUrl) return
+    const actionUrl = selectedNotification.actionUrl
+    setSelectedNotification(null)
+    router.push(actionUrl)
   }
 
   function handleSignOut() {
@@ -200,6 +218,29 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
           </div>
         </DropdownMenuContent>
       </DropdownMenu>
+
+      <Dialog open={selectedNotification !== null} onOpenChange={(open) => { if (!open) setSelectedNotification(null) }}>
+        <DialogContent className="max-w-lg sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>{selectedNotification?.title ?? 'Notification'}</DialogTitle>
+            <DialogDescription className="text-xs">
+              {selectedNotification ? new Date(selectedNotification.createdAt).toLocaleString() : ''}
+            </DialogDescription>
+          </DialogHeader>
+          <div className="space-y-3">
+            <p className="whitespace-pre-wrap text-sm leading-6 text-foreground">
+              {selectedNotification?.message}
+            </p>
+          </div>
+          <DialogFooter showCloseButton>
+            {selectedNotification?.actionUrl && (
+              <Button onClick={openNotificationAction}>
+                Open related page
+              </Button>
+            )}
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
 
       <Button
         variant="ghost"
