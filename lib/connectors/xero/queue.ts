@@ -35,6 +35,7 @@ export async function queueXeroSync(params: {
 
   await db.accountingSyncLog.create({
     data: {
+      connector: 'xero',
       type: params.type,
       status: 'PENDING',
       referenceType: params.referenceType,

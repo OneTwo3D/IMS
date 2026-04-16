@@ -194,9 +194,9 @@ function WebhookSecretField({
         <table className="text-xs w-full max-w-lg">
           <thead><tr className="text-left"><th className="pr-3 pb-0.5 font-medium">Topic</th><th className="pr-3 pb-0.5 font-medium">Delivery URL</th></tr></thead>
           <tbody>
-            <tr><td className="pr-3 py-0.5">Order created</td><td className="py-0.5"><code className="bg-muted px-1 rounded">/api/webhooks/shopping/orders</code></td></tr>
-            <tr><td className="pr-3 py-0.5">Order updated</td><td className="py-0.5"><code className="bg-muted px-1 rounded">/api/webhooks/shopping/orders</code></td></tr>
-            <tr><td className="pr-3 py-0.5">Product updated</td><td className="py-0.5"><code className="bg-muted px-1 rounded">/api/webhooks/shopping/products</code></td></tr>
+            <tr><td className="pr-3 py-0.5">Order created</td><td className="py-0.5"><code className="bg-muted px-1 rounded">/api/webhooks/shopping/woocommerce/orders</code></td></tr>
+            <tr><td className="pr-3 py-0.5">Order updated</td><td className="py-0.5"><code className="bg-muted px-1 rounded">/api/webhooks/shopping/woocommerce/orders</code></td></tr>
+            <tr><td className="pr-3 py-0.5">Product updated</td><td className="py-0.5"><code className="bg-muted px-1 rounded">/api/webhooks/shopping/woocommerce/products</code></td></tr>
           </tbody>
         </table>
         <p>Use the same secret for all webhooks. The product webhook is only needed if product sync is enabled. Refunds are handled automatically via order updates.</p>
@@ -259,7 +259,7 @@ function WebhookSecretField({
       )}
 
       <p className="text-xs text-muted-foreground">
-        Webhook URL: <code className="bg-muted px-1 rounded">/api/webhooks/shopping/orders</code>
+        Webhook URL: <code className="bg-muted px-1 rounded">/api/webhooks/shopping/woocommerce/orders</code>
       </p>
     </div>
   )
@@ -410,7 +410,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
     })
   }
 
-  function handleChangeTaxMapping(externalTaxRateId: number, taxRateId: string) {
+  function handleChangeTaxMapping(externalTaxRateId: string, taxRateId: string) {
     if (!taxRateId) return
     startTransition(async () => {
       await updateShoppingTaxRateMapping(externalTaxRateId, taxRateId)

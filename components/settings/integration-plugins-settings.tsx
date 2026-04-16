@@ -9,16 +9,22 @@ import { syncCrontab } from '@/app/actions/cron'
 
 type Props = {
   woocommerceEnabled: boolean
+  shopifyEnabled: boolean
   xeroEnabled: boolean
+  quickbooksEnabled: boolean
 }
 
 export function IntegrationPluginsSettings({
   woocommerceEnabled: initialWooCommerceEnabled,
+  shopifyEnabled: initialShopifyEnabled,
   xeroEnabled: initialXeroEnabled,
+  quickbooksEnabled: initialQuickBooksEnabled,
 }: Props) {
   const [isPending, startTransition] = useTransition()
   const [woocommerceEnabled, setWooCommerceEnabled] = useState(initialWooCommerceEnabled)
+  const [shopifyEnabled, setShopifyEnabled] = useState(initialShopifyEnabled)
   const [xeroEnabled, setXeroEnabled] = useState(initialXeroEnabled)
+  const [quickbooksEnabled, setQuickBooksEnabled] = useState(initialQuickBooksEnabled)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
 
@@ -30,7 +36,9 @@ export function IntegrationPluginsSettings({
       try {
         await Promise.all([
           setSetting('plugin_woocommerce_enabled', String(woocommerceEnabled)),
+          setSetting('plugin_shopify_enabled', String(shopifyEnabled)),
           setSetting('plugin_xero_enabled', String(xeroEnabled)),
+          setSetting('plugin_quickbooks_enabled', String(quickbooksEnabled)),
         ])
 
         const result = await syncCrontab()
@@ -60,11 +68,31 @@ export function IntegrationPluginsSettings({
       </label>
 
       <label className="flex items-start gap-3 cursor-pointer">
+        <Switch checked={shopifyEnabled} onCheckedChange={setShopifyEnabled} />
+        <div>
+          <div className="text-sm font-medium">Shopify plugin</div>
+          <p className="text-xs text-muted-foreground">
+            Reserves the shopping connector slot, settings, and sync/dashboard wiring for Shopify.
+          </p>
+        </div>
+      </label>
+
+      <label className="flex items-start gap-3 cursor-pointer">
         <Switch checked={xeroEnabled} onCheckedChange={setXeroEnabled} />
         <div>
           <div className="text-sm font-medium">Xero plugin</div>
           <p className="text-xs text-muted-foreground">
             Enables the accounting connector, callback flow, sync UI, and accounting scheduler jobs backed by Xero.
+          </p>
+        </div>
+      </label>
+
+      <label className="flex items-start gap-3 cursor-pointer">
+        <Switch checked={quickbooksEnabled} onCheckedChange={setQuickBooksEnabled} />
+        <div>
+          <div className="text-sm font-medium">QuickBooks plugin</div>
+          <p className="text-xs text-muted-foreground">
+            Reserves the accounting connector slot, settings, and sync/dashboard wiring for QuickBooks.
           </p>
         </div>
       </label>

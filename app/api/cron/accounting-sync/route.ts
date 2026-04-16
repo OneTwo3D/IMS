@@ -19,7 +19,7 @@ export async function GET(request: Request) {
     return NextResponse.json({ skipped: true, reason: 'Accounting sync disabled' })
   }
 
-  const token = await db.accountingToken.findFirst({ select: { id: true } })
+  const token = await db.accountingToken.findFirst({ where: { connector: 'xero' }, select: { id: true } })
   if (!token) {
     return NextResponse.json({ skipped: true, reason: 'Accounting connector not connected' })
   }

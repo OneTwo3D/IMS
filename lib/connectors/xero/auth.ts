@@ -15,6 +15,7 @@ import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
+const XERO_CONNECTOR = 'xero'
 const XERO_OAUTH_STATE_PREFIX = 'xero_oauth_state:'
 const XERO_OAUTH_STATE_TTL_MS = 10 * 60 * 1000 // 10 minutes
 const XERO_TOKEN_URL = 'https://identity.xero.com/connect/token'
@@ -55,7 +56,7 @@ function buildBasicAuth(clientId: string, clientSecret: string): string {
 }
 
 async function readStoredToken(): Promise<StoredAccountingToken | null> {
-  const row = await db.accountingToken.findFirst()
+  const row = await db.accountingToken.findUnique({ where: { connector: XERO_CONNECTOR } })
   if (!row) return null
 
   const accessToken = decryptSecret(row.accessToken)
@@ -64,7 +65,7 @@ async function readStoredToken(): Promise<StoredAccountingToken | null> {
   if (hasEncryptionKey() && (!isEncryptedValue(row.accessToken) || (row.refreshToken && !isEncryptedValue(row.refreshToken)))) {
     try {
       await db.accountingToken.update({
-        where: { id: row.id },
+        where: { connector: XERO_CONNECTOR },
         data: {
           accessToken: encryptSecret(accessToken),
           refreshToken: refreshToken ? encryptSecret(refreshToken) : null,
@@ -92,24 +93,26 @@ async function upsertStoredToken(params: {
   tenantId: string
   tenantName: string | null
 }): Promise<void> {
-  const existing = await db.accountingToken.findFirst({ select: { id: true } })
   const data = {
+    connector: XERO_CONNECTOR,
     accessToken: encryptSecret(params.accessToken),
     refreshToken: params.refreshToken ? encryptSecret(params.refreshToken) : null,
     expiresAt: params.expiresAt,
     tenantId: params.tenantId,
     tenantName: params.tenantName,
   }
-
-  if (existing) {
-    await db.accountingToken.update({ where: { id: existing.id }, data })
-  } else {
-    await db.accountingToken.create({ data })
-  }
+  await db.accountingToken.upsert({
+    where: { connector: XERO_CONNECTOR },
+    create: data,
+    update: data,
+  })
 }
 
 async function getExpectedTenantId(): Promise<string | null> {
-  const token = await db.accountingToken.findFirst({ select: { tenantId: true } })
+  const token = await db.accountingToken.findUnique({
+    where: { connector: XERO_CONNECTOR },
+    select: { tenantId: true },
+  })
   const stored = await getSettingValue(XERO_EXPECTED_TENANT_KEY)
   return stored ?? token?.tenantId ?? null
 }
@@ -379,7 +382,7 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
  */
 export async function disconnect(): Promise<void> {
   await db.$transaction([
-    db.accountingToken.deleteMany(),
+    db.accountingToken.deleteMany({ where: { connector: XERO_CONNECTOR } }),
     db.setting.deleteMany({ where: { key: XERO_EXPECTED_TENANT_KEY } }),
   ])
 }

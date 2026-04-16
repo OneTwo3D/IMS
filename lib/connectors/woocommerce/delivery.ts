@@ -48,11 +48,11 @@ export async function getWcDeliveryStatus(externalOrderId: number): Promise<Deli
 }
 
 export async function getWcDeliveryStatusForSalesOrder(orderId: string): Promise<DeliveryStatus | null> {
-  const order = await db.salesOrder.findUnique({
-    where: { id: orderId },
+  const link = await db.shoppingOrderLink.findFirst({
+    where: { connector: 'woocommerce', orderId },
     select: { externalOrderId: true },
   })
 
-  if (!order?.externalOrderId) return null
-  return getWcDeliveryStatus(order.externalOrderId)
+  if (!link?.externalOrderId) return null
+  return getWcDeliveryStatus(Number(link.externalOrderId))
 }

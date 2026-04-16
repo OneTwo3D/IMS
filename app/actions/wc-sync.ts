@@ -359,7 +359,7 @@ export async function getWcCredentials(): Promise<{ url: string; key: string; se
 
 export type TaxRateMappingRow = {
   id: string
-  externalTaxRateId: number
+  externalTaxRateId: string
   externalName: string
   externalCountry: string | null
   externalRatePct: number
@@ -371,6 +371,7 @@ export type TaxRateMappingRow = {
 export async function getShoppingTaxRateMappings(): Promise<TaxRateMappingRow[]> {
   await requireAdmin()
   const rows = await db.shoppingTaxRateMapping.findMany({
+    where: { connector: 'woocommerce' },
     include: { taxRate: { select: { name: true } } },
     orderBy: [{ externalCountry: 'asc' }, { externalName: 'asc' }],
   })
@@ -387,12 +388,17 @@ export async function getShoppingTaxRateMappings(): Promise<TaxRateMappingRow[]>
 }
 
 export async function updateShoppingTaxRateMapping(
-  externalTaxRateId: number,
+  externalTaxRateId: string,
   taxRateId: string,
 ): Promise<{ success: boolean }> {
   await requireAdmin()
   await db.shoppingTaxRateMapping.update({
-    where: { externalTaxRateId },
+    where: {
+      connector_externalTaxRateId: {
+        connector: 'woocommerce',
+        externalTaxRateId,
+      },
+    },
     data: { taxRateId },
   })
   revalidatePath('/sync')
@@ -453,15 +459,23 @@ export type StatusMappingRow = {
 
 export async function getShoppingStatusMappings(): Promise<StatusMappingRow[]> {
   await requireAdmin()
-  const rows = await db.shoppingStatusMapping.findMany({ orderBy: { externalStatus: 'asc' } })
+  const rows = await db.shoppingStatusMapping.findMany({
+    where: { connector: 'woocommerce' },
+    orderBy: { externalStatus: 'asc' },
+  })
   return rows.map((r) => ({ id: r.id, externalStatus: r.externalStatus, imsStatus: r.imsStatus }))
 }
 
 export async function upsertShoppingStatusMapping(externalStatus: string, imsStatus: string): Promise<{ success: boolean }> {
   await requireAdmin()
   await db.shoppingStatusMapping.upsert({
-    where: { externalStatus },
-    create: { externalStatus, imsStatus: imsStatus as never },
+    where: {
+      connector_externalStatus: {
+        connector: 'woocommerce',
+        externalStatus,
+      },
+    },
+    create: { connector: 'woocommerce', externalStatus, imsStatus: imsStatus as never },
     update: { imsStatus: imsStatus as never },
   })
   revalidatePath('/sync')
@@ -478,7 +492,7 @@ export type SyncLogRow = {
   status: string
   entityType: string
   entityId: string | null
-  externalId: number | null
+  externalId: string | null
   errorMessage: string | null
   syncedAt: string | null
   createdAt: string
@@ -487,6 +501,7 @@ export type SyncLogRow = {
 export async function getShoppingSyncLogs(limit = 50): Promise<SyncLogRow[]> {
   await requireAdmin()
   const rows = await db.shoppingSyncLog.findMany({
+    where: { connector: 'woocommerce' },
     orderBy: { createdAt: 'desc' },
     take: limit,
   })
@@ -508,9 +523,9 @@ export async function getShoppingSyncLogs(limit = 50): Promise<SyncLogRow[]> {
 // ---------------------------------------------------------------------------
 
 const WC_WEBHOOK_DEFS = [
-  { name: 'OTI – Order created',   topic: 'order.created',   path: '/api/webhooks/shopping/orders' },
-  { name: 'OTI – Order updated',   topic: 'order.updated',   path: '/api/webhooks/shopping/orders' },
-  { name: 'OTI – Product updated', topic: 'product.updated', path: '/api/webhooks/shopping/products' },
+  { name: 'OTI – Order created',   topic: 'order.created',   path: '/api/webhooks/shopping/woocommerce/orders' },
+  { name: 'OTI – Order updated',   topic: 'order.updated',   path: '/api/webhooks/shopping/woocommerce/orders' },
+  { name: 'OTI – Product updated', topic: 'product.updated', path: '/api/webhooks/shopping/woocommerce/products' },
 ] as const
 
 export async function createWcWebhooks(): Promise<{

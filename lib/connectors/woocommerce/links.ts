@@ -32,22 +32,22 @@ export async function getWcProductExternalLink(sku: string): Promise<ShoppingPro
 }
 
 export async function getWcSalesOrderAdminLink(orderId: string): Promise<ShoppingExternalLink | null> {
-  const [order, creds] = await Promise.all([
-    db.salesOrder.findUnique({
-      where: { id: orderId },
+  const [link, creds] = await Promise.all([
+    db.shoppingOrderLink.findFirst({
+      where: { connector: 'woocommerce', orderId },
       select: { externalOrderId: true },
     }),
     getWcCredentials(),
   ])
 
-  if (!order?.externalOrderId || !creds) return null
+  if (!link?.externalOrderId || !creds) return null
 
-  return createWcLink(`${creds.url}/wp-admin/post.php?post=${order.externalOrderId}&action=edit`, 'WooCommerce')
+  return createWcLink(`${creds.url}/wp-admin/post.php?post=${link.externalOrderId}&action=edit`, 'WooCommerce')
 }
 
 export async function hasWcProductExternalLink(productId: string): Promise<boolean> {
   const count = await db.shoppingSyncLog.count({
-    where: { entityType: 'Product', entityId: productId, status: 'SYNCED' },
+    where: { connector: 'woocommerce', entityType: 'Product', entityId: productId, status: 'SYNCED' },
   })
   return count > 0
 }

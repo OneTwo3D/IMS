@@ -14,8 +14,15 @@ export async function syncWcRefund(
 ): Promise<{ success: boolean; error?: string }> {
   try {
     // Find the IMS order
-    const so = await db.salesOrder.findUnique({
-      where: { externalOrderId },
+    const so = await db.salesOrder.findFirst({
+      where: {
+        shoppingLinks: {
+          some: {
+            connector: 'woocommerce',
+            externalOrderId: String(externalOrderId),
+          },
+        },
+      },
       select: {
         id: true,
         externalOrderNumber: true,
@@ -96,7 +103,7 @@ export async function syncWcRefund(
           status: 'FAILED',
           entityType: 'SalesOrder',
           entityId: so.id,
-          externalId: wcRefund.id,
+          externalId: String(wcRefund.id),
           errorMessage: result.error,
           syncedAt: new Date(),
         },
@@ -110,7 +117,7 @@ export async function syncWcRefund(
         status: 'SYNCED',
         entityType: 'SalesOrder',
         entityId: so.id,
-        externalId: wcRefund.id,
+        externalId: String(wcRefund.id),
         syncedAt: new Date(),
       },
     })

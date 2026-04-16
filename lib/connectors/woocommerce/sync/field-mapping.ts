@@ -42,16 +42,36 @@ export async function upsertCustomer(order: WcFullOrder): Promise<string | null>
 
   // Try to find by WC customer ID first, then by email
   let existing = cust.externalCustomerId
-    ? await db.customer.findUnique({ where: { externalCustomerId: cust.externalCustomerId } })
+    ? await db.customer.findFirst({
+        where: {
+          shoppingLinks: {
+            some: {
+              connector: 'woocommerce',
+              externalCustomerId: String(cust.externalCustomerId),
+            },
+          },
+        },
+      })
     : null
   if (!existing && cust.email) {
     existing = await db.customer.findFirst({ where: { email: cust.email } })
   }
 
   if (existing) {
-    // Update if WC customer ID was missing
-    if (cust.externalCustomerId && !existing.externalCustomerId) {
-      await db.customer.update({ where: { id: existing.id }, data: { externalCustomerId: cust.externalCustomerId } })
+    if (cust.externalCustomerId) {
+      const existingLink = await db.shoppingCustomerLink.findFirst({
+        where: { connector: 'woocommerce', customerId: existing.id },
+        select: { id: true },
+      })
+      if (!existingLink) {
+        await db.shoppingCustomerLink.create({
+          data: {
+            connector: 'woocommerce',
+            customerId: existing.id,
+            externalCustomerId: String(cust.externalCustomerId),
+          },
+        })
+      }
     }
     return existing.id
   }
@@ -59,7 +79,6 @@ export async function upsertCustomer(order: WcFullOrder): Promise<string | null>
   // Create new customer
   const created = await db.customer.create({
     data: {
-      externalCustomerId: cust.externalCustomerId,
       firstName: cust.firstName,
       lastName: cust.lastName,
       email: cust.email,
@@ -67,6 +86,16 @@ export async function upsertCustomer(order: WcFullOrder): Promise<string | null>
       company: cust.company,
       billingAddress: mapWcAddress(order.billing),
       shippingAddress: mapWcAddress(order.shipping),
+      ...(cust.externalCustomerId
+        ? {
+            shoppingLinks: {
+              create: {
+                connector: 'woocommerce',
+                externalCustomerId: String(cust.externalCustomerId),
+              },
+            },
+          }
+        : {}),
     },
   })
   return created.id
@@ -199,7 +228,12 @@ export async function resolveWcTaxRateById(wcRateId: number | null | undefined):
     return fallbackDefaultTaxRate()
   }
   const mapping = await db.shoppingTaxRateMapping.findUnique({
-    where: { externalTaxRateId: wcRateId },
+    where: {
+      connector_externalTaxRateId: {
+        connector: 'woocommerce',
+        externalTaxRateId: String(wcRateId),
+      },
+    },
     include: { taxRate: { select: { id: true, name: true, rate: true, accountingTaxType: true } } },
   })
   if (!mapping) return fallbackDefaultTaxRate()

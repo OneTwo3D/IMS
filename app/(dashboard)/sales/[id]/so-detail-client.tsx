@@ -37,7 +37,7 @@ type Props = {
   order: SoDetail
   warehouses: WarehouseInfo[]
   currencies: CurrencyRow[]
-  externalOrderLink?: { label: string; url: string }
+  externalOrderLinks?: Array<{ label: string; url: string }>
   stockLevels: Record<string, Record<string, StockLevelEntry>>
   initialAllocations: AllocationRow[]
   initialShipments: ShipmentRow[]
@@ -728,7 +728,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLink, stockLevels, initialAllocations, initialShipments, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, stockLevels, initialAllocations, initialShipments, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled }: Props) {
   const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -936,11 +936,11 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           <Button variant="outline" size="sm" onClick={() => setShowNotes(true)}>
             <Pencil className="h-4 w-4 mr-1" />Notes
           </Button>
-          {externalOrderLink && (
-            <Button variant="outline" size="sm" onClick={() => window.open(externalOrderLink.url, '_blank')}>
-              <ExternalLink className="h-4 w-4 mr-1" />{externalOrderLink.label}
+          {externalOrderLinks?.map((link) => (
+            <Button key={link.url} variant="outline" size="sm" onClick={() => window.open(link.url, '_blank')}>
+              <ExternalLink className="h-4 w-4 mr-1" />{link.label}
             </Button>
-          )}
+          ))}
           {canCancel && (
             <Button variant="outline" size="sm" className="text-destructive hover:text-destructive" onClick={handleCancel} disabled={isPending}>
               <Ban className="h-4 w-4 mr-1" />Cancel

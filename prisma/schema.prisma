@@ -558,6 +558,7 @@ model Product {
   shipmentLines    ShipmentLine[]
   stockSyncStates  StockSyncState[]
   stockSyncJobs    StockSyncJob[]
+  shoppingLinks    ShoppingProductLink[]
 
   @@index([parentId])
   @@map("products")
@@ -1009,6 +1010,7 @@ model Customer {
   updatedAt       DateTime  @updatedAt
 
   salesOrders     SalesOrder[]
+  shoppingLinks   ShoppingCustomerLink[]
 
   @@map("customers")
 }
@@ -1086,6 +1088,7 @@ model SalesOrder {
   payments          Payment[]
   allocations       OrderAllocation[]
   shipments         Shipment[]
+  shoppingLinks     ShoppingOrderLink[]
 
   @@index([externalOrderId])
   @@index([status])
@@ -1344,51 +1347,58 @@ model ProductionOrder {
 // ---------------------------------------------------------------------------
 
 model AccountingAccount {
-  id          String   @id @default(cuid())
-  externalAccountId String   @unique // Connector account ID
-  code        String?
-  name        String
-  type        String   // EXPENSE, REVENUE, ASSET, etc.
-  taxType     String?
-  active      Boolean  @default(true)
-  syncedAt    DateTime @default(now())
+  id                String   @id @default(cuid())
+  connector         String   @default("xero")
+  externalAccountId String   // Connector account ID
+  code              String?
+  name              String
+  type              String   // EXPENSE, REVENUE, ASSET, etc.
+  taxType           String?
+  active            Boolean  @default(true)
+  syncedAt          DateTime @default(now())
 
+  @@unique([connector, externalAccountId])
+  @@index([connector, active, code])
   @@map("accounting_accounts")
 }
 
 model AccountingSyncLog {
-  id              String              @id @default(cuid())
-  type            AccountingSyncType
-  status          AccountingSyncStatus @default(PENDING)
-  referenceType   String              // "PurchaseOrder", "CogsEntry", "SalesOrder", etc.
-  referenceId     String
+  id                    String               @id @default(cuid())
+  connector             String               @default("xero")
+  type                  AccountingSyncType
+  status                AccountingSyncStatus @default(PENDING)
+  referenceType         String // "PurchaseOrder", "CogsEntry", "SalesOrder", etc.
+  referenceId           String
   externalTransactionId String?
-  payload         Json?               // what was sent
-  errorMessage    String?
-  retryCount      Int                 @default(0)
-  processingStartedAt DateTime?
-  syncedAt        DateTime?
-  createdAt       DateTime            @default(now())
+  payload               Json? // what was sent
+  errorMessage          String?
+  retryCount            Int                  @default(0)
+  processingStartedAt   DateTime?
+  syncedAt              DateTime?
+  createdAt             DateTime             @default(now())
 
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.
 
-  @@index([referenceType, referenceId])
-  @@index([status, createdAt])
-  @@index([status, processingStartedAt])
+  @@index([connector, referenceType, referenceId])
+  @@index([connector, status, createdAt])
+  @@index([connector, status, processingStartedAt])
   @@map("accounting_sync_logs")
 }
 
 model AccountingToken {
-  id            String   @id @default(cuid())
-  accessToken   String
-  refreshToken  String?
-  expiresAt     DateTime
-  tenantId      String
-  tenantName    String?
-  createdAt     DateTime @default(now())
-  updatedAt     DateTime @updatedAt
+  id           String   @id @default(cuid())
+  connector    String   @default("xero")
+  accessToken  String
+  refreshToken String?
+  expiresAt    DateTime
+  tenantId     String
+  tenantName   String?
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
 
+  @@unique([connector])
+  @@unique([connector, tenantId])
   @@map("accounting_tokens")
 }
 
@@ -1397,21 +1407,23 @@ model AccountingToken {
 // ---------------------------------------------------------------------------
 
 model ShoppingSyncLog {
-  id            String        @id @default(cuid())
-  direction     ShoppingSyncDirection
-  status        ShoppingSyncStatus  @default(PENDING)
-  entityType    String        // "Product", "SalesOrder", "StockLevel"
-  entityId      String?
-  externalId    Int?
-  payload       Json?
-  errorMessage  String?
-  syncedAt      DateTime?
-  createdAt     DateTime      @default(now())
+  id           String                @id @default(cuid())
+  connector    String                @default("woocommerce")
+  direction    ShoppingSyncDirection
+  status       ShoppingSyncStatus    @default(PENDING)
+  entityType   String // "Product", "SalesOrder", "StockLevel"
+  entityId     String?
+  externalId   String?
+  payload      Json?
+  errorMessage String?
+  syncedAt     DateTime?
+  createdAt    DateTime              @default(now())
 
   // Polymorphic reference: use entityType + entityId for application-level lookups.
   // No FK constraints — entityId may point to Product or SalesOrder based on entityType.
 
-  @@index([entityType, entityId])
+  @@index([connector, entityType, entityId])
+  @@index([connector, externalId, createdAt])
   @@map("shopping_sync_logs")
 }
 
@@ -1460,30 +1472,90 @@ model StockSyncJob {
 /// Maps individual WC tax rates (by WC rate id) to IMS TaxRate records.
 /// Auto-populated by the "Import from WooCommerce" action in Sync settings.
 model ShoppingTaxRateMapping {
-  id          String   @id @default(cuid())
-  externalTaxRateId Int      @unique
-  externalName String
+  id                String   @id @default(cuid())
+  connector         String   @default("woocommerce")
+  externalTaxRateId String
+  externalName      String
   externalCountry String?
-  externalRatePct Decimal  @db.Decimal(7, 4)
-  externalClass String?
-  taxRateId   String
-  createdAt   DateTime @default(now())
-  updatedAt   DateTime @updatedAt
+  externalRatePct   Decimal  @db.Decimal(7, 4)
+  externalClass     String?
+  taxRateId         String
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
 
-  taxRate     TaxRate  @relation(fields: [taxRateId], references: [id])
+  taxRate TaxRate @relation(fields: [taxRateId], references: [id])
 
+  @@unique([connector, externalTaxRateId])
+  @@index([connector, externalName])
   @@map("shopping_tax_rate_mappings")
 }
 
 /// Maps WC order statuses to IMS SalesOrderStatus values
 model ShoppingStatusMapping {
-  id        String           @id @default(cuid())
-  externalStatus String      @unique
-  imsStatus SalesOrderStatus
-  createdAt DateTime         @default(now())
-  updatedAt DateTime         @updatedAt
+  id             String           @id @default(cuid())
+  connector      String           @default("woocommerce")
+  externalStatus String
+  imsStatus      SalesOrderStatus
+  createdAt      DateTime         @default(now())
+  updatedAt      DateTime         @updatedAt
 
+  @@unique([connector, externalStatus])
+  @@index([connector, imsStatus])
   @@map("shopping_status_mappings")
+}
+
+model ShoppingProductLink {
+  id                String   @id @default(cuid())
+  productId         String
+  connector         String
+  externalProductId String
+  externalParentId  String?
+  metadata          Json?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([connector, externalProductId])
+  @@unique([connector, productId])
+  @@index([productId])
+  @@map("shopping_product_links")
+}
+
+model ShoppingCustomerLink {
+  id                 String   @id @default(cuid())
+  customerId         String
+  connector          String
+  externalCustomerId String
+  metadata           Json?
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+
+  @@unique([connector, externalCustomerId])
+  @@unique([connector, customerId])
+  @@index([customerId])
+  @@map("shopping_customer_links")
+}
+
+model ShoppingOrderLink {
+  id                  String   @id @default(cuid())
+  orderId             String
+  connector           String
+  externalOrderId     String
+  externalOrderNumber String?
+  metadata            Json?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+
+  order SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([connector, externalOrderId])
+  @@unique([connector, orderId])
+  @@index([connector, externalOrderNumber])
+  @@index([orderId])
+  @@map("shopping_order_links")
 }
 
 // ---------------------------------------------------------------------------

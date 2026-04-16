@@ -62,7 +62,7 @@ export async function getShoppingTaxRateMappings(): Promise<ShoppingTaxRateMappi
   return getShoppingTaxRateMappingsImpl()
 }
 
-export async function updateShoppingTaxRateMapping(externalTaxRateId: number, taxRateId: string) {
+export async function updateShoppingTaxRateMapping(externalTaxRateId: string, taxRateId: string) {
   return updateShoppingTaxRateMappingImpl(externalTaxRateId, taxRateId)
 }
 

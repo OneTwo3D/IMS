@@ -5,6 +5,8 @@
 import { db } from '@/lib/db'
 import { xeroGet } from './api'
 
+const XERO_CONNECTOR = 'xero'
+
 type AccountingAccountResponse = {
   Accounts: Array<{
     AccountID: string
@@ -32,8 +34,14 @@ export async function syncChartOfAccounts(): Promise<{ synced: number; errors: s
   for (const acc of res.data.Accounts) {
     try {
       await db.accountingAccount.upsert({
-        where: { externalAccountId: acc.AccountID },
+        where: {
+          connector_externalAccountId: {
+            connector: XERO_CONNECTOR,
+            externalAccountId: acc.AccountID,
+          },
+        },
         create: {
+          connector: XERO_CONNECTOR,
           externalAccountId: acc.AccountID,
           code: acc.Code ?? null,
           name: acc.Name,
@@ -60,7 +68,7 @@ export async function syncChartOfAccounts(): Promise<{ synced: number; errors: s
   // Deactivate accounts that no longer exist in Xero
   const externalAccountIds = res.data.Accounts.map(a => a.AccountID)
   await db.accountingAccount.updateMany({
-    where: { externalAccountId: { notIn: externalAccountIds } },
+    where: { connector: XERO_CONNECTOR, externalAccountId: { notIn: externalAccountIds } },
     data: { active: false },
   })
 
@@ -69,7 +77,7 @@ export async function syncChartOfAccounts(): Promise<{ synced: number; errors: s
 
 export async function listStoredAccounts(): Promise<Array<{ code: string; name: string; type: string }>> {
   const accounts = await db.accountingAccount.findMany({
-    where: { active: true, code: { not: null } },
+    where: { connector: XERO_CONNECTOR, active: true, code: { not: null } },
     select: { code: true, name: true, type: true },
     orderBy: [{ code: 'asc' }],
   })
@@ -80,7 +88,7 @@ export async function listStoredAccounts(): Promise<Array<{ code: string; name: 
 
 export async function listStoredBankAccounts(): Promise<Array<{ id: string; code: string | null; name: string }>> {
   const accounts = await db.accountingAccount.findMany({
-    where: { active: true, type: 'BANK' },
+    where: { connector: XERO_CONNECTOR, active: true, type: 'BANK' },
     select: { externalAccountId: true, code: true, name: true },
     orderBy: [{ name: 'asc' }],
   })

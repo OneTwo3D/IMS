@@ -186,7 +186,7 @@ export async function syncAccountingAccounts(): Promise<{ synced: number; errors
 
 export async function getAccountingAccounts(): Promise<Array<{ id: string; externalAccountId: string; code: string | null; name: string; type: string }>> {
   return db.accountingAccount.findMany({
-    where: { active: true },
+    where: { connector: 'xero', active: true },
     select: { id: true, externalAccountId: true, code: true, name: true, type: true },
     orderBy: [{ code: 'asc' }],
   })
@@ -216,6 +216,7 @@ export type XeroSyncLogRow = {
 
 export async function getXeroSyncLogs(limit = 50): Promise<XeroSyncLogRow[]> {
   const rows = await db.accountingSyncLog.findMany({
+    where: { connector: 'xero' },
     orderBy: { createdAt: 'desc' },
     take: limit,
   })
@@ -267,8 +268,8 @@ export async function retryFailedXeroSync(entryId?: string): Promise<{ success: 
   try {
     await requireAdmin()
     const where = entryId
-      ? { id: entryId, status: 'FAILED' as const }
-      : { status: 'FAILED' as const }
+      ? { id: entryId, connector: 'xero', status: 'FAILED' as const }
+      : { connector: 'xero', status: 'FAILED' as const }
     const result = await db.accountingSyncLog.updateMany({
       where,
       data: { status: 'PENDING', retryCount: 0, errorMessage: null, processingStartedAt: null },

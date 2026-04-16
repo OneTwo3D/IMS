@@ -50,8 +50,9 @@ export async function shouldSuppressWcOrderWebhookEcho(wcOrder: WcFullOrder): Pr
   const recentSince = new Date(Date.now() - ORDER_WEBHOOK_ECHO_WINDOW_MS)
   const recentLogs = await db.shoppingSyncLog.findMany({
     where: {
+      connector: 'woocommerce',
       direction: 'TO_CONNECTOR',
-      externalId: wcOrder.id,
+      externalId: String(wcOrder.id),
       entityType: 'SalesOrder',
       createdAt: { gte: recentSince },
     },

@@ -20,6 +20,7 @@ const MAX_PER_RUN = 50 // Xero rate limit: 60/min — leave headroom
 const CLAIM_STALE_MS = 15 * 60 * 1000
 const RATE_LIMIT_BACKOFF_BASE_MS = 60_000
 const RATE_LIMIT_BACKOFF_MAX_MS = 15 * 60_000
+const XERO_CONNECTOR = 'xero'
 
 type ProcessResult = {
   processed: number
@@ -53,6 +54,7 @@ async function hasExistingSyncLog(
 ): Promise<boolean> {
   const count = await db.accountingSyncLog.count({
     where: {
+      connector: XERO_CONNECTOR,
       type,
       referenceType,
       referenceId,
@@ -71,6 +73,7 @@ async function enqueueFollowUpSyncLog(
   if (await hasExistingSyncLog(type, referenceType, referenceId)) return
   await db.accountingSyncLog.create({
     data: {
+      connector: XERO_CONNECTOR,
       type,
       status: 'PENDING',
       referenceType,
@@ -86,6 +89,7 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
 
   const pending = await db.accountingSyncLog.findMany({
     where: {
+      connector: XERO_CONNECTOR,
       OR: [
         {
           status: 'PENDING',
@@ -109,6 +113,7 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
     const claim = await db.accountingSyncLog.updateMany({
       where: {
         id: entry.id,
+        connector: XERO_CONNECTOR,
         retryCount: { lt: MAX_RETRIES },
         OR: [
           {
@@ -208,7 +213,7 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
 
   // Log skipped entries (exceeded max retries)
   const skippedCount = await db.accountingSyncLog.count({
-    where: { status: 'FAILED', retryCount: { gte: MAX_RETRIES } },
+    where: { connector: XERO_CONNECTOR, status: 'FAILED', retryCount: { gte: MAX_RETRIES } },
   })
   result.skipped = skippedCount
 
@@ -301,7 +306,7 @@ async function processEntry(
         return { success: false, error: 'Missing accountingInvoiceId, bankAccountId, or amount for INVOICE_PAYMENT' }
       }
       const account = await db.accountingAccount.findFirst({
-        where: { OR: [{ externalAccountId: bankAccountId }, { code: bankAccountId }] },
+        where: { connector: XERO_CONNECTOR, OR: [{ externalAccountId: bankAccountId }, { code: bankAccountId }] },
         select: { externalAccountId: true },
       })
       if (!account) {
@@ -398,7 +403,7 @@ async function processEntry(
       }
       // Resolve bank account — accept either Xero AccountID (preferred) or a legacy account code.
       const account = await db.accountingAccount.findFirst({
-        where: { OR: [{ externalAccountId: bankAccountId }, { code: bankAccountId }] },
+        where: { connector: XERO_CONNECTOR, OR: [{ externalAccountId: bankAccountId }, { code: bankAccountId }] },
         select: { externalAccountId: true },
       })
       if (!account) {

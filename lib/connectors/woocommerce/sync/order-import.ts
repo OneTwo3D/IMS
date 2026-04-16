@@ -42,11 +42,27 @@ export async function isWcOrderWebhookPrimaryActive(): Promise<boolean> {
 export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<{ success: boolean; orderId?: string; error?: string }> {
   try {
     // Skip if already imported
-    const existing = await db.salesOrder.findUnique({ where: { externalOrderId: wcOrder.id } })
+    const existing = await db.salesOrder.findFirst({
+      where: {
+        shoppingLinks: {
+          some: {
+            connector: 'woocommerce',
+            externalOrderId: String(wcOrder.id),
+          },
+        },
+      },
+    })
     if (existing) return { success: true, orderId: existing.id }
 
     // Resolve IMS status from WC status
-    const statusMapping = await db.shoppingStatusMapping.findUnique({ where: { externalStatus: wcOrder.status } })
+    const statusMapping = await db.shoppingStatusMapping.findUnique({
+      where: {
+        connector_externalStatus: {
+          connector: 'woocommerce',
+          externalStatus: wcOrder.status,
+        },
+      },
+    })
     const imsStatus = statusMapping?.imsStatus ?? 'PROCESSING'
 
     // Customer
@@ -257,12 +273,28 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           discountAmount: orderDiscount.discountAmount,
           notes: wcOrder.customer_note || null,
           paidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : null,
+          shoppingLinks: {
+            create: {
+              connector: 'woocommerce',
+              externalOrderId: String(wcOrder.id),
+              externalOrderNumber: wcOrder.number,
+            },
+          },
           lines: { create: lineData },
         },
       })
     } catch (error) {
       if (!isUniqueConstraintError(error)) throw error
-      const concurrent = await db.salesOrder.findUnique({ where: { externalOrderId: wcOrder.id } })
+      const concurrent = await db.salesOrder.findFirst({
+        where: {
+          shoppingLinks: {
+            some: {
+              connector: 'woocommerce',
+              externalOrderId: String(wcOrder.id),
+            },
+          },
+        },
+      })
       if (concurrent) return { success: true, orderId: concurrent.id }
       throw error
     }
@@ -284,7 +316,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           direction: 'FROM_CONNECTOR',
           entityType: 'ORDER',
           entityId: so.id,
-          externalId: wcOrder.id,
+          externalId: String(wcOrder.id),
           status: 'SYNCED',
           errorMessage: `Imported as ${imsStatus}${options.skipAccounting ? ' (initial import)' : ''} — skipped accounting sync`,
         },
@@ -350,7 +382,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         status: 'SYNCED',
         entityType: 'SalesOrder',
         entityId: so.id,
-        externalId: wcOrder.id,
+        externalId: String(wcOrder.id),
         syncedAt: new Date(),
       },
     })
@@ -373,7 +405,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         direction: 'FROM_CONNECTOR',
         status: 'FAILED',
         entityType: 'SalesOrder',
-        externalId: wcOrder.id,
+        externalId: String(wcOrder.id),
         errorMessage: String(e),
         syncedAt: new Date(),
       },

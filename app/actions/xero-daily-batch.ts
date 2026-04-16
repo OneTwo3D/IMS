@@ -373,6 +373,7 @@ export async function getXeroDailyBatchHistory(
 
   const rows = await db.accountingSyncLog.findMany({
     where: {
+      connector: 'xero',
       type: {
         in: [
           'DAILY_BATCH_REVENUE_DEFERRAL',

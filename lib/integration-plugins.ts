@@ -1,17 +1,21 @@
 import { getSettingValues } from '@/lib/settings-store'
 
-export type IntegrationPluginId = 'woocommerce' | 'xero'
+export type IntegrationPluginId = 'woocommerce' | 'shopify' | 'xero' | 'quickbooks'
 
 const PLUGIN_SETTING_KEYS = {
   woocommerce: 'plugin_woocommerce_enabled',
+  shopify: 'plugin_shopify_enabled',
   xero: 'plugin_xero_enabled',
+  quickbooks: 'plugin_quickbooks_enabled',
 } as const
 
 export type IntegrationPluginState = Record<IntegrationPluginId, boolean>
 
 const DEFAULT_PLUGIN_STATE: IntegrationPluginState = {
   woocommerce: false,
+  shopify: false,
   xero: false,
+  quickbooks: false,
 }
 
 function parseEnabled(value: string | undefined): boolean {
@@ -24,7 +28,9 @@ export async function getIntegrationPluginState(): Promise<IntegrationPluginStat
 
   return {
     woocommerce: parseEnabled(values.get(PLUGIN_SETTING_KEYS.woocommerce)),
+    shopify: parseEnabled(values.get(PLUGIN_SETTING_KEYS.shopify)),
     xero: parseEnabled(values.get(PLUGIN_SETTING_KEYS.xero)),
+    quickbooks: parseEnabled(values.get(PLUGIN_SETTING_KEYS.quickbooks)),
   }
 }
 
@@ -40,8 +46,10 @@ export function isIntegrationModuleVisible(
   switch (module) {
     case 'woocommerce':
       return state.woocommerce
+    case 'shopify':
+      return state.shopify
     case 'accounting':
-      return state.xero
+      return state.xero || state.quickbooks
     default:
       return true
   }

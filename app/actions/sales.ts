@@ -1498,6 +1498,7 @@ export async function createRefund(
 
           const priorReversals = await tx.accountingSyncLog.findMany({
             where: {
+              connector: 'xero',
               referenceType: 'SalesOrder',
               referenceId: orderId,
               type: { in: ['COGS_REVERSAL', 'UNEARNED_REV_REVERSAL'] },

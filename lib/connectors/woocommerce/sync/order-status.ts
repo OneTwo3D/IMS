@@ -23,7 +23,14 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success
     if (!so) return { success: false, error: `Order not found for WC #${wcOrder.id}` }
 
     // Resolve IMS status
-    const mapping = await db.shoppingStatusMapping.findUnique({ where: { externalStatus: wcOrder.status } })
+    const mapping = await db.shoppingStatusMapping.findUnique({
+      where: {
+        connector_externalStatus: {
+          connector: 'woocommerce',
+          externalStatus: wcOrder.status,
+        },
+      },
+    })
     if (!mapping) return { success: true } // no mapping = ignore this status
 
     const targetStatus = mapping.imsStatus
@@ -99,7 +106,7 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
         status: 'SYNCED',
         entityType: 'SalesOrder',
         entityId: orderId,
-        externalId: so.externalOrderId,
+        externalId: so.externalOrderId != null ? String(so.externalOrderId) : null,
         payload: JSON.parse(JSON.stringify({ status: externalStatus })),
         syncedAt: new Date(),
       },

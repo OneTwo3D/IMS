@@ -41,6 +41,7 @@ type JournalLinePayload = {
 }
 
 const XERO_DAILY_BATCH_LOCK_KEY = 4_112_208_031
+const XERO_CONNECTOR = 'xero'
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100
@@ -120,6 +121,7 @@ async function createPendingSyncLog(
 ): Promise<void> {
   await tx.accountingSyncLog.create({
     data: {
+      connector: XERO_CONNECTOR,
       type: params.type,
       status: 'PENDING',
       referenceType: 'DailyBatch',
@@ -142,6 +144,7 @@ async function lockCostLayers(
 async function resetFailedDailyBatchLogs(): Promise<void> {
   await db.accountingSyncLog.updateMany({
     where: {
+      connector: XERO_CONNECTOR,
       type: { in: ['DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B'] },
       status: 'FAILED',
     },
@@ -159,6 +162,7 @@ type DailyBatchLogType = 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY
 async function hasLiveDailyBatchLog(type: DailyBatchLogType, referenceId: string): Promise<boolean> {
   const count = await db.accountingSyncLog.count({
     where: {
+      connector: XERO_CONNECTOR,
       type,
       referenceId,
       status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
@@ -220,6 +224,7 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
     if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_REVENUE_DEFERRAL', referenceId)) continue
     await db.accountingSyncLog.create({
       data: {
+        connector: XERO_CONNECTOR,
         type: 'DAILY_BATCH_REVENUE_DEFERRAL',
         status: 'PENDING',
         referenceType: 'DailyBatch',
@@ -244,6 +249,7 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
     if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_INVENTORY_ALLOC', referenceId)) continue
     await db.accountingSyncLog.create({
       data: {
+        connector: XERO_CONNECTOR,
         type: 'DAILY_BATCH_INVENTORY_ALLOC',
         status: 'PENDING',
         referenceType: 'DailyBatch',
@@ -281,6 +287,7 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
     }
     await db.accountingSyncLog.create({
       data: {
+        connector: XERO_CONNECTOR,
         type: 'DAILY_BATCH_GROUP_B',
         status: 'PENDING',
         referenceType: 'DailyBatch',

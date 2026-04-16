@@ -127,7 +127,11 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
   const activeConnector = (
     requestedConnector === 'woocommerce' && !pluginState.woocommerce
   ) || (
+    requestedConnector === 'shopify' && !pluginState.shopify
+  ) || (
     requestedConnector === 'xero' && !pluginState.xero
+  ) || (
+    requestedConnector === 'quickbooks' && !pluginState.quickbooks
   )
     ? null
     : requestedConnector
@@ -143,7 +147,9 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
   const shoppingConnected = pluginState.woocommerce && !!shoppingCredentials.url && !!shoppingCredentials.key && !!shoppingCredentials.secret
   const visibleConnectors = CONNECTORS.filter((connector) => {
     if (connector.id === 'woocommerce') return pluginState.woocommerce
+    if (connector.id === 'shopify') return pluginState.shopify
     if (connector.id === 'xero') return pluginState.xero
+    if (connector.id === 'quickbooks') return pluginState.quickbooks
     return true
   })
 
@@ -251,6 +257,52 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
           dailyBatchPreview={accountingBatchPreview}
           dailyBatchHistory={accountingBatchHistory}
         />
+      </div>
+    )
+  }
+
+  if (activeConnector === 'quickbooks') {
+    return (
+      <div className="space-y-4">
+        <button type="button" onClick={() => setActiveConnector(null)} className="text-sm text-muted-foreground hover:text-foreground flex items-center gap-1">
+          ← Back to Integrations
+        </button>
+        <div className="flex items-center gap-3 mb-2">
+          {CONNECTOR_LOGOS.quickbooks}
+          <div>
+            <h2 className="text-lg font-semibold">QuickBooks Connector</h2>
+            <p className="text-xs text-muted-foreground">Groundwork is in place; connector implementation is still empty.</p>
+          </div>
+        </div>
+        <Card className="p-6">
+          <p className="text-sm text-muted-foreground">
+            QuickBooks now exists as a first-class accounting connector slot in the schema, plugin state, and shared connector registries.
+            The module skeleton is present, but OAuth, account sync, tax mapping, and transaction posting are not implemented yet.
+          </p>
+        </Card>
+      </div>
+    )
+  }
+
+  if (activeConnector === 'shopify') {
+    return (
+      <div className="space-y-4">
+        <button type="button" onClick={() => setActiveConnector(null)} className="text-sm text-muted-foreground hover:text-foreground flex items-center gap-1">
+          ← Back to Integrations
+        </button>
+        <div className="flex items-center gap-3 mb-2">
+          {CONNECTOR_LOGOS.shopify}
+          <div>
+            <h2 className="text-lg font-semibold">Shopify Connector</h2>
+            <p className="text-xs text-muted-foreground">Groundwork is in place; connector implementation is still empty.</p>
+          </div>
+        </div>
+        <Card className="p-6">
+          <p className="text-sm text-muted-foreground">
+            Shopify now exists as a first-class shopping connector slot in the schema, plugin state, and shared connector registries.
+            The module skeleton is present, but webhook intake, order import, product sync, stock sync, and delivery integration are not implemented yet.
+          </p>
+        </Card>
       </div>
     )
   }

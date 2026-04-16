@@ -88,7 +88,9 @@ export default async function SystemSettingsPage({
           </p>
           <IntegrationPluginsSettings
             woocommerceEnabled={pluginState.woocommerce}
+            shopifyEnabled={pluginState.shopify}
             xeroEnabled={pluginState.xero}
+            quickbooksEnabled={pluginState.quickbooks}
           />
         </Card>
       )}

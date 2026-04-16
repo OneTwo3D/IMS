@@ -9,7 +9,7 @@ import { getSetting } from '@/app/actions/settings'
 import { getOrderAllocations, getOrderShipments } from '@/app/actions/allocation'
 import { getAccountingSettings } from '@/lib/accounting'
 import { DEFAULT_CARRIERS } from '@/lib/tracking'
-import { getSalesOrderAdminLink } from '@/lib/shopping'
+import { getSalesOrderAdminLinks } from '@/lib/shopping'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { SoDetailClient } from './so-detail-client'
 
@@ -19,11 +19,11 @@ type Props = { params: Promise<{ id: string }> }
 
 export default async function SalesOrderDetailPage({ params }: Props) {
   const { id } = await params
-  const [so, warehouses, currencies, externalOrderLink, stockLevels, allocations, shipments, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable] = await Promise.all([
+  const [so, warehouses, currencies, externalOrderLinks, stockLevels, allocations, shipments, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable] = await Promise.all([
     getSalesOrder(id),
     getWarehouses(),
     getCurrencies(true),
-    getSalesOrderAdminLink(id),
+    getSalesOrderAdminLinks(id),
     getStockLevelMap(),
     getOrderAllocations(id),
     getOrderShipments(id),
@@ -50,7 +50,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         order={so}
         warehouses={warehouses}
         currencies={currencies}
-        externalOrderLink={externalOrderLink ?? undefined}
+        externalOrderLinks={externalOrderLinks}
         stockLevels={stockLevels}
         initialAllocations={allocations}
         initialShipments={shipments}

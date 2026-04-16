@@ -1,7 +1,5 @@
 /**
  * Generic accounting facade — core code imports ONLY from here, never from connector modules.
- * Today it resolves the active connector to Xero, but the app-facing contract
- * remains connector-agnostic.
  */
 
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
@@ -23,8 +21,8 @@ export type AccountingSettings = {
 }
 
 type AccountingConnectorInfo = {
-  id: 'xero'
-  name: 'Xero'
+  id: 'xero' | 'quickbooks'
+  name: 'Xero' | 'QuickBooks'
 }
 
 const DEFAULT_ACCOUNTING_SETTINGS: AccountingSettings = {
@@ -43,13 +41,18 @@ const DEFAULT_ACCOUNTING_SETTINGS: AccountingSettings = {
 }
 
 async function getActiveAccountingConnectorId(): Promise<AccountingConnectorInfo['id'] | null> {
-  return (await isIntegrationPluginEnabled('xero')) ? 'xero' : null
+  if (await isIntegrationPluginEnabled('xero')) return 'xero'
+  if (await isIntegrationPluginEnabled('quickbooks')) return 'quickbooks'
+  return null
 }
 
 export async function getActiveAccountingConnectorInfo(): Promise<AccountingConnectorInfo | null> {
   const connector = await getActiveAccountingConnectorId()
   if (!connector) return null
-  return { id: connector, name: 'Xero' }
+  return {
+    id: connector,
+    name: connector === 'xero' ? 'Xero' : 'QuickBooks',
+  }
 }
 
 export async function queueAccountingSync(params: {
@@ -65,6 +68,10 @@ export async function queueAccountingSync(params: {
     case 'xero': {
       const { queueXeroSync } = await import('@/lib/connectors/xero/queue')
       return queueXeroSync(params)
+    }
+    case 'quickbooks': {
+      const { queueQuickBooksSync } = await import('@/lib/connectors/quickbooks/queue')
+      return queueQuickBooksSync(params)
     }
   }
 }
@@ -107,6 +114,13 @@ export async function getAccountingSettings(): Promise<AccountingSettings> {
         billUrlTemplate: billUrlSetting?.value ?? '',
       }
     }
+    case 'quickbooks':
+      return {
+        ...DEFAULT_ACCOUNTING_SETTINGS,
+        paymentAccountMap: paymentMapSetting?.value ?? '{}',
+        invoiceUrlTemplate: invoiceUrlSetting?.value ?? '',
+        billUrlTemplate: billUrlSetting?.value ?? '',
+      }
   }
 }
 
@@ -157,6 +171,10 @@ export async function listAccountCodes(): Promise<AccountCode[]> {
       const { listStoredAccounts } = await import('@/lib/connectors/xero/accounts')
       return listStoredAccounts()
     }
+    case 'quickbooks': {
+      const { listStoredAccounts } = await import('@/lib/connectors/quickbooks/accounts')
+      return listStoredAccounts()
+    }
   }
 }
 
@@ -177,6 +195,10 @@ export async function listAccountingBankAccounts(): Promise<AccountingBankAccoun
   switch (connector) {
     case 'xero': {
       const { listStoredBankAccounts } = await import('@/lib/connectors/xero/accounts')
+      return listStoredBankAccounts()
+    }
+    case 'quickbooks': {
+      const { listStoredBankAccounts } = await import('@/lib/connectors/quickbooks/accounts')
       return listStoredBankAccounts()
     }
   }

@@ -100,9 +100,15 @@ export async function importWcTaxRates(): Promise<ImportWcTaxResult> {
     // 2. Upsert the WC rate id → IMS tax rate mapping.
     const ratePct = parseFloat(wcRate.rate) || 0
     await db.shoppingTaxRateMapping.upsert({
-      where: { externalTaxRateId: wcRate.id },
+      where: {
+        connector_externalTaxRateId: {
+          connector: 'woocommerce',
+          externalTaxRateId: String(wcRate.id),
+        },
+      },
       create: {
-        externalTaxRateId: wcRate.id,
+        connector: 'woocommerce',
+        externalTaxRateId: String(wcRate.id),
         externalName: name,
         externalCountry: wcRate.country || null,
         externalRatePct: ratePct.toFixed(4),

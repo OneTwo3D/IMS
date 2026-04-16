@@ -105,12 +105,15 @@ async function buildOutboundTracking(orderId: string): Promise<{
   const order = await db.salesOrder.findUnique({
     where: { id: orderId },
     select: {
-      externalOrderId: true,
       orderNumber: true,
-      externalOrderNumber: true,
       trackingNumber: true,
       shippingService: true,
       shippedAt: true,
+      shoppingLinks: {
+        where: { connector: 'woocommerce' },
+        select: { externalOrderId: true, externalOrderNumber: true },
+        take: 1,
+      },
       shipments: {
         where: { status: 'SHIPPED' },
         select: {
@@ -145,10 +148,11 @@ async function buildOutboundTracking(orderId: string): Promise<{
     : []
 
   const items = dedupeTrackingRows([...shipmentRows, ...fallbackRows]).map(toWcTrackingItem)
+  const wcLink = order.shoppingLinks[0]
   return {
-    externalOrderId: order.externalOrderId ?? null,
+    externalOrderId: wcLink?.externalOrderId ? Number(wcLink.externalOrderId) : null,
     orderNumber: order.orderNumber ?? null,
-    externalOrderNumber: order.externalOrderNumber ?? null,
+    externalOrderNumber: wcLink?.externalOrderNumber ?? null,
     items,
   }
 }
@@ -167,7 +171,7 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
           status: 'FAILED',
           entityType: 'SalesOrder',
           entityId: orderId,
-          externalId: outbound.externalOrderId,
+          externalId: String(outbound.externalOrderId),
           payload: JSON.parse(JSON.stringify({ meta_key: '_wc_shipment_tracking_items', items: outbound.items })),
           errorMessage: currentOrder.error,
         },
@@ -206,7 +210,7 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
           status: 'FAILED',
           entityType: 'SalesOrder',
           entityId: orderId,
-          externalId: outbound.externalOrderId,
+          externalId: String(outbound.externalOrderId),
           payload: JSON.parse(JSON.stringify({ meta_key: '_wc_shipment_tracking_items', items: outbound.items })),
           errorMessage: update.error,
         },
@@ -229,7 +233,7 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
         status: 'SYNCED',
         entityType: 'SalesOrder',
         entityId: orderId,
-        externalId: outbound.externalOrderId,
+        externalId: String(outbound.externalOrderId),
         payload: JSON.parse(JSON.stringify({ meta_key: '_wc_shipment_tracking_items', items: outbound.items })),
         syncedAt: new Date(),
       },
@@ -258,7 +262,7 @@ export async function pushImsTrackingToWc(orderId: string): Promise<{ success: b
         status: 'FAILED',
         entityType: 'SalesOrder',
         entityId: orderId,
-        externalId: outbound.externalOrderId,
+        externalId: String(outbound.externalOrderId),
         payload: JSON.parse(JSON.stringify({ meta_key: '_wc_shipment_tracking_items', items: outbound.items })),
         errorMessage: message,
       },

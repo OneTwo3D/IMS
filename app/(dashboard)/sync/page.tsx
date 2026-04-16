@@ -28,7 +28,7 @@ export const metadata: Metadata = { title: 'Integrations' }
 
 export default async function SyncPage() {
   const pluginState = await getIntegrationPluginState()
-  if (!pluginState.woocommerce && !pluginState.xero) {
+  if (!pluginState.woocommerce && !pluginState.shopify && !pluginState.xero && !pluginState.quickbooks) {
     redirect('/settings/system?tab=plugins')
   }
 
