@@ -180,6 +180,12 @@ if ! $SKIP_BUILD; then
   run_as_user "${APP_USER}" npm ci --include=dev --prefix "${APP_DIR}" 2>&1 | \
     grep -v "^npm warn" || true
   success "Dependencies updated."
+
+  header "Generating Prisma client"
+
+  run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" \
+    npx prisma generate --schema "${APP_DIR}/prisma/schema.prisma"
+  success "Prisma client generated."
 fi
 
 # ---------------------------------------------------------------------------
