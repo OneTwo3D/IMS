@@ -6,6 +6,18 @@ This repository uses an `x.y.z` release scheme.
 - Increment `y` for user-facing non-breaking changes.
 - Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
+## 1.3.0 - 2026-04-16
+
+### User-facing
+
+- Added a Shopify connector screen in Integrations for credential setup, webhook-secret management, manual stock sync, and Shopify sync log visibility.
+- Added Shopify product and order admin links in the IMS where Shopify matches can be resolved safely.
+
+### Technical
+
+- Implemented the first real Shopify connector layer and connected it to the shared shopping facade and integrations UI.
+- Added duplicate-SKU safety checks, retry-safe webhook rejection for unimplemented Shopify webhooks, and persisted Shopify sync attempts into the shared sync log.
+
 ## 1.2.0 - 2026-04-16
 
 ### User-facing

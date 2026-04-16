@@ -12,7 +12,38 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
-    version: '1.1',
+    version: '1.3.0',
+    date: '2026-04-16',
+    title: 'Shopify integration setup and stock sync',
+    summary: 'Integrations now includes a real Shopify connector screen with credential setup, manual stock sync, and connector-aware sync visibility.',
+    userMessage: 'Shopify can now be configured in Integrations, with manual stock sync, sync logs, and Shopify link support where matches are resolved safely.',
+    userHighlights: [
+      'Added a Shopify connector screen in Integrations for credentials and webhook-secret setup.',
+      'Added manual Shopify stock sync and visible Shopify sync log history.',
+      'Added Shopify product and sales-order admin links where the IMS can resolve a safe Shopify match.',
+    ],
+    technicalHighlights: [
+      'Implemented the first real Shopify connector layer and shared shopping-facade wiring.',
+      'Added duplicate-SKU safeguards, webhook retry-safe rejection, and Shopify sync log persistence.',
+    ],
+  },
+  {
+    version: '1.2.0',
+    date: '2026-04-16',
+    title: 'QuickBooks Online accounting connector',
+    summary: 'QuickBooks Online is now available alongside Xero, with end-to-end accounting sync and OAuth setup in Integrations.',
+    userMessage: 'QuickBooks Online can now be connected in Integrations and used for accounting sync alongside Xero.',
+    userHighlights: [
+      'Added QuickBooks Online as a fully available accounting connector.',
+      'Added QuickBooks setup and selection in the Integrations dashboard.',
+    ],
+    technicalHighlights: [
+      'Implemented the full QuickBooks connector, including OAuth, account sync, transaction sync, and payment polling.',
+      'Updated the accounting facade, OAuth callback, and cron routes to dispatch to the active accounting connector.',
+    ],
+  },
+  {
+    version: '1.1.0',
     date: '2026-04-16',
     title: 'Visible app version in System Settings',
     summary: 'Added the current release number directly to the System Settings header for faster support and deployment verification.',
@@ -22,11 +53,11 @@ export const RELEASES: AppRelease[] = [
       'Kept the Releases tab as the place for fuller release history and notes.',
     ],
     technicalHighlights: [
-      'Bumped the application release to 1.1 and recorded it in the repo changelog.',
+      'Bumped the application release to 1.1.0 and recorded it in the repo changelog.',
     ],
   },
   {
-    version: '1.0',
+    version: '1.0.0',
     date: '2026-04-16',
     title: 'Release tracking and operational hardening',
     summary: 'Introduced repo-backed release versioning, user-visible release notes, deployment hardening, and health checks.',
