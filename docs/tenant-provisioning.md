@@ -15,7 +15,7 @@
 - the selected proxy host is managed over SSH
 - for `PROXY_TYPE=ols`, OpenLiteSpeed uses `/usr/local/lsws/conf/httpd_config.conf`
 - for `PROXY_TYPE=ols`, HTTP and HTTPS listeners already exist
-- the target git branch is reachable from the new container
+- if `DEPLOY_SOURCE_MODE=git`, the target git branch is reachable from the new container
 - the machine running the script has `ssh`, `scp`, `curl`, `jq`, `dig`, `git`, and `openssl`
 - if `POSTGRES_MODE=external`, the machine running the script also needs `psql`
 
@@ -58,6 +58,10 @@ export SMTP_FROM_NAME='One Two Inventory'
 export SMTP_REPLY_TO=support@onetwoinventory.com
 export GIT_REPO_URL=git@github.com:your-org/onetwoinventory.git
 export GIT_BRANCH=main
+export GIT_DEPLOY_KEY_ENABLED=y
+export GITHUB_DEPLOY_KEY_TOKEN=...
+export GITHUB_REPO_OWNER=your-org
+export GITHUB_REPO_NAME=onetwoinventory
 export APP_PORT=3000
 export INSTALL_SSHD=y
 export SSH_AUTHORIZED_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... you@example'
@@ -105,6 +109,8 @@ bash scripts/provision-ims-tenant.sh
 
 - The installer now runs `npm ci` with dev dependencies because Prisma and the operational bootstrap tooling require them during deployment.
 - If you do not set `DEFAULT_ADMIN_PASSWORD`, the provisioner generates one for that run and uses it in the email.
+- With `GIT_DEPLOY_KEY_ENABLED=y`, the installer generates a unique per-instance SSH deploy key inside the LXC, registers it against the private GitHub repo via API, and uses that same key for the initial clone and future updates.
+- The GitHub token should have permission to manage deploy keys on the target repository. A repo-scoped administration token is sufficient.
 - If `LXC_HOSTNAME` is blank, the container hostname defaults to `TENANT_SLUG`.
 - `LXC_IP_CIDR` lets you assign a static container IP instead of using DHCP.
 - `RESUME_ONLY=y` skips LXC creation entirely and only reconciles install, DNS, and proxy setup for an already-existing container ID.

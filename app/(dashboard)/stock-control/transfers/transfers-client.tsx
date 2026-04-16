@@ -1,8 +1,10 @@
 'use client'
 
 import { useState } from 'react'
+import Link from 'next/link'
 import { Plus } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { Card } from '@/components/ui/card'
 import { CsvBar } from '@/components/ui/csv-bar'
 import { importTransfersCsv } from '@/app/actions/import'
 import { TransferFormDialog } from './transfer-form'
@@ -23,6 +25,8 @@ type Props = {
 export function TransfersClient({ warehouses, products, initialTransfers, stockLevels }: Props) {
   const [transfers, setTransfers] = useState(initialTransfers)
   const [showCreate, setShowCreate] = useState(false)
+  const warehouseCount = warehouses.length
+  const canCreateTransfer = warehouseCount >= 2
 
   function handleCreated(t: TransferRow) {
     setTransfers((prev) => [t, ...prev])
@@ -38,12 +42,30 @@ export function TransfersClient({ warehouses, products, initialTransfers, stockL
         <h1 className="text-2xl font-semibold">Warehouse Transfers</h1>
         <div className="flex items-center gap-2">
           <CsvBar exportUrl="/api/export/transfers" templateUrl="/api/export/transfers?template=1" importAction={importTransfersCsv} />
-          <Button size="sm" onClick={() => setShowCreate(true)}>
+          <Button
+            size="sm"
+            onClick={() => setShowCreate(true)}
+            disabled={!canCreateTransfer}
+            title={!canCreateTransfer ? 'At least two active warehouses are required to create transfers.' : undefined}
+          >
             <Plus className="h-4 w-4 mr-1" />
             New Transfer
           </Button>
         </div>
       </div>
+      {!canCreateTransfer && (
+        <Card className="p-4">
+          <p className="text-sm text-muted-foreground">
+            {warehouseCount === 0
+              ? 'Warehouse transfers are unavailable because no warehouses are configured yet.'
+              : 'Warehouse transfers require at least two active warehouses.'}{' '}
+            <Link href="/settings/inventory" className="text-primary hover:underline">
+              Configure warehouses in Inventory Settings
+            </Link>
+            .
+          </p>
+        </Card>
+      )}
       <TransferList
         transfers={transfers}
         warehouses={warehouses}
@@ -51,7 +73,7 @@ export function TransfersClient({ warehouses, products, initialTransfers, stockL
         stockLevels={stockLevels}
         onTransferUpdated={handleUpdated}
       />
-      {showCreate && (
+      {showCreate && canCreateTransfer && (
         <TransferFormDialog
           warehouses={warehouses}
           products={products}

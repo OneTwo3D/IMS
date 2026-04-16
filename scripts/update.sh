@@ -32,11 +32,23 @@ header() {
 
 [[ $EUID -ne 0 ]] && die "Run as root: sudo bash update.sh"
 
-APP_NAME="onetwoinventory"
+run_as_user() {
+  local user="$1"
+  shift
+  if command -v runuser >/dev/null 2>&1; then
+    runuser -u "$user" -- "$@"
+  elif command -v sudo >/dev/null 2>&1; then
+    sudo -u "$user" "$@"
+  else
+    su -s /bin/bash -c "$(printf '%q ' "$@")" "$user"
+  fi
+}
+
+APP_NAME="one-two-inventory"
 APP_USER="imsapp"
 APP_DIR="/opt/${APP_NAME}"
-LOG_DIR="/var/log/${APP_NAME}"
 BACKUP_DIR="/var/backups/${APP_NAME}"
+DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"
 
 NO_GIT=false
 SKIP_BUILD=false
@@ -59,6 +71,9 @@ done
 
 # Load env for DATABASE_URL
 set -a; source "${APP_DIR}/.env"; set +a
+if [[ -f "${DEPLOY_META_FILE}" ]]; then
+  set -a; source "${DEPLOY_META_FILE}"; set +a
+fi
 
 START_TIME=$(date +%s)
 
@@ -84,24 +99,55 @@ info "Old pre-update backups pruned (keeping last 10)."
 if ! $NO_GIT; then
   header "Pulling latest code from git"
 
-  [[ -d "${APP_DIR}/.git" ]] || die "Not a git repository. Use --no-git to skip."
+  if [[ -d "${APP_DIR}/.git" ]]; then
+    CURRENT_COMMIT="$(run_as_user "${APP_USER}" git -C "${APP_DIR}" rev-parse HEAD)"
+    CURRENT_BRANCH="$(run_as_user "${APP_USER}" git -C "${APP_DIR}" rev-parse --abbrev-ref HEAD)"
+    info "Current commit: ${CURRENT_COMMIT:0:8}"
 
-  CURRENT_COMMIT=$(sudo -u "${APP_USER}" git -C "${APP_DIR}" rev-parse HEAD)
-  info "Current commit: ${CURRENT_COMMIT:0:8}"
+    run_as_user "${APP_USER}" git -C "${APP_DIR}" fetch origin
+    run_as_user "${APP_USER}" git -C "${APP_DIR}" reset --hard "origin/${CURRENT_BRANCH}"
 
-  sudo -u "${APP_USER}" git -C "${APP_DIR}" fetch origin
-  sudo -u "${APP_USER}" git -C "${APP_DIR}" reset --hard "origin/$(git -C "${APP_DIR}" rev-parse --abbrev-ref HEAD)"
+    NEW_COMMIT="$(run_as_user "${APP_USER}" git -C "${APP_DIR}" rev-parse HEAD)"
+    info "Updated to:     ${NEW_COMMIT:0:8}"
 
-  NEW_COMMIT=$(sudo -u "${APP_USER}" git -C "${APP_DIR}" rev-parse HEAD)
-  info "Updated to:     ${NEW_COMMIT:0:8}"
-
-  if [[ "$CURRENT_COMMIT" == "$NEW_COMMIT" ]]; then
-    warn "Already up to date. Continuing anyway (migrations/restart may still be needed)."
+    if [[ "$CURRENT_COMMIT" == "$NEW_COMMIT" ]]; then
+      warn "Already up to date. Continuing anyway (migrations/restart may still be needed)."
+    else
+      echo ""
+      info "Changes in this update:"
+      run_as_user "${APP_USER}" git -C "${APP_DIR}" log \
+        --oneline "${CURRENT_COMMIT}..${NEW_COMMIT}" | head -20
+    fi
   else
-    echo ""
-    info "Changes in this update:"
-    sudo -u "${APP_USER}" git -C "${APP_DIR}" log \
-      --oneline "${CURRENT_COMMIT}..${NEW_COMMIT}" | head -20
+    [[ -n "${GIT_REPO_URL:-}" ]] || die "No git checkout and no GIT_REPO_URL in ${DEPLOY_META_FILE}. Use --no-git to skip."
+    GIT_BRANCH="${GIT_BRANCH:-main}"
+
+    TMP_CLONE_DIR="$(mktemp -d -t ims-update.XXXXXX)"
+    TMP_CLONE_WORKTREE="${TMP_CLONE_DIR}/repo"
+    chown "${APP_USER}:${APP_USER}" "${TMP_CLONE_DIR}"
+    CURRENT_COMMIT="none"
+
+    info "Cloning ${GIT_REPO_URL} (${GIT_BRANCH}) into a temporary worktree..."
+    run_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
+      "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
+    NEW_COMMIT="$(run_as_user "${APP_USER}" git -C "${TMP_CLONE_WORKTREE}" rev-parse HEAD)"
+    info "Fetched commit: ${NEW_COMMIT:0:8}"
+
+    rsync -a --delete \
+      --exclude='.git' \
+      --exclude='node_modules' \
+      --exclude='.next' \
+      --exclude='.env' \
+      --exclude='.env.local' \
+      --exclude='backups' \
+      --exclude='uploads' \
+      --exclude='public/uploads' \
+      "${TMP_CLONE_WORKTREE%/}/" "${APP_DIR}/"
+    rm -rf "${APP_DIR}/.git"
+    cp -a "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
+    chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
+    rm -rf "${TMP_CLONE_DIR}"
+    success "Repository synced into existing app directory."
   fi
 fi
 
@@ -111,7 +157,7 @@ fi
 if ! $SKIP_BUILD; then
   header "Installing dependencies"
 
-  sudo -u "${APP_USER}" npm ci --prefix "${APP_DIR}" 2>&1 | \
+  run_as_user "${APP_USER}" npm ci --prefix "${APP_DIR}" 2>&1 | \
     grep -v "^npm warn" || true
   success "Dependencies updated."
 fi
@@ -122,9 +168,15 @@ fi
 header "Running database migrations"
 
 cd "${APP_DIR}"
-sudo -u "${APP_USER}" DATABASE_URL="${DATABASE_URL}" \
+run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" \
   npx prisma migrate deploy --schema prisma/schema.prisma
 success "Migrations applied."
+
+header "Validating database schema"
+
+run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" \
+  npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code >/dev/null
+success "Database schema matches prisma/schema.prisma."
 
 # ---------------------------------------------------------------------------
 # 5. Build
@@ -132,7 +184,7 @@ success "Migrations applied."
 if ! $SKIP_BUILD; then
   header "Building Next.js application"
 
-  sudo -u "${APP_USER}" npm run build --prefix "${APP_DIR}"
+  run_as_user "${APP_USER}" npm run build --prefix "${APP_DIR}"
   success "Build complete."
 fi
 
@@ -141,10 +193,8 @@ fi
 # ---------------------------------------------------------------------------
 header "Restarting application"
 
-pm2 restart "${APP_NAME}"        2>/dev/null || pm2 start "${APP_DIR}/ecosystem.config.js" --only "${APP_NAME}"
-pm2 restart "${APP_NAME}-worker" 2>/dev/null || pm2 start "${APP_DIR}/ecosystem.config.js" --only "${APP_NAME}-worker"
-pm2 save
-success "Processes restarted."
+systemctl restart "${APP_NAME}.service"
+success "Application service restarted."
 
 # ---------------------------------------------------------------------------
 # 7. Health check
@@ -158,15 +208,14 @@ if curl -fsS --max-time 10 "http://127.0.0.1:${APP_PORT}/api/health" > /dev/null
   success "Health check passed — app is responding."
 else
   warn "Health check failed or /api/health not yet implemented."
-  warn "Check logs: pm2 logs ${APP_NAME}"
+  warn "Check logs: journalctl -u ${APP_NAME}.service -n 100"
 fi
 
 END_TIME=$(date +%s)
 ELAPSED=$((END_TIME - START_TIME))
 
 header "Update complete (${ELAPSED}s)"
-echo -e "  ${BOLD}pm2 status${RESET}           — check process health"
-echo -e "  ${BOLD}pm2 logs ${APP_NAME}${RESET}  — view live logs"
-echo -e "  ${BOLD}pm2 logs ${APP_NAME}-worker${RESET}  — view worker logs"
+echo -e "  ${BOLD}systemctl status ${APP_NAME}.service${RESET}  — check service health"
+echo -e "  ${BOLD}journalctl -u ${APP_NAME}.service -f${RESET}  — view live logs"
 echo ""
 echo -e "${GREEN}Done.${RESET}"

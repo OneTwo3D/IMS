@@ -1,6 +1,8 @@
 /**
- * Development seed — creates default warehouses, currencies, tax rates,
- * organisation record, and a test admin user.
+ * Seed core app data for a fresh database.
+ *
+ * By default this creates organisation, warehouse, currency, and tax records.
+ * A demo admin user is only created when SEED_TEST_ADMIN=true.
  *
  * Run with: npm run db:seed
  */
@@ -14,6 +16,7 @@ const db = new PrismaClient({ adapter })
 
 async function main() {
   console.log('Seeding database...')
+  const seedTestAdmin = process.env.SEED_TEST_ADMIN === 'true'
 
   // Organisation
   await db.organisation.upsert({
@@ -69,23 +72,24 @@ async function main() {
   }
   console.log(`  ✓ ${taxRates.length} tax rates`)
 
-  // Admin user
-  const adminEmail = 'admin@example.com'
-  const existing = await db.user.findUnique({ where: { email: adminEmail } })
-  if (!existing) {
-    const passwordHash = await bcrypt.hash('changeme123', 12)
-    await db.user.create({
-      data: {
-        email: adminEmail,
-        name: 'Admin',
-        passwordHash,
-        role: 'ADMIN',
-        active: true,
-      },
-    })
-    console.log(`  ✓ Admin user: ${adminEmail} / changeme123`)
-  } else {
-    console.log(`  ✓ Admin user already exists (${adminEmail})`)
+  if (seedTestAdmin) {
+    const adminEmail = 'admin@example.com'
+    const existing = await db.user.findUnique({ where: { email: adminEmail } })
+    if (!existing) {
+      const passwordHash = await bcrypt.hash('changeme123', 12)
+      await db.user.create({
+        data: {
+          email: adminEmail,
+          name: 'Admin',
+          passwordHash,
+          role: 'ADMIN',
+          active: true,
+        },
+      })
+      console.log(`  ✓ Admin user: ${adminEmail} / changeme123`)
+    } else {
+      console.log(`  ✓ Admin user already exists (${adminEmail})`)
+    }
   }
 
   console.log('Seed complete.')

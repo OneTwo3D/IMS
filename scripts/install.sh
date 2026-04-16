@@ -50,6 +50,47 @@ run_as_user() {
   fi
 }
 
+github_api() {
+  local method="$1" path="$2" payload="${3:-}"
+  local response_file status
+  response_file="$(mktemp -t ims-github.XXXXXX)"
+  if [[ -n "${payload}" ]]; then
+    status="$(curl -sS -o "${response_file}" -w '%{http_code}' \
+      -X "${method}" \
+      -H "Authorization: Bearer ${GITHUB_DEPLOY_KEY_TOKEN}" \
+      -H "Accept: application/vnd.github+json" \
+      -H "Content-Type: application/json" \
+      --data "${payload}" \
+      "https://api.github.com${path}")"
+  else
+    status="$(curl -sS -o "${response_file}" -w '%{http_code}' \
+      -X "${method}" \
+      -H "Authorization: Bearer ${GITHUB_DEPLOY_KEY_TOKEN}" \
+      -H "Accept: application/vnd.github+json" \
+      "https://api.github.com${path}")"
+  fi
+  if [[ ! "${status}" =~ ^2 ]]; then
+    cat "${response_file}" >&2
+    rm -f "${response_file}"
+    die "GitHub API request failed (${method} ${path}) with status ${status}."
+  fi
+  cat "${response_file}"
+  rm -f "${response_file}"
+}
+
+derive_github_repo_ref() {
+  local url="$1" repo_ref=""
+  if [[ "${url}" =~ ^git@github\.com:([^/]+/[^/]+?)(\.git)?$ ]]; then
+    repo_ref="${BASH_REMATCH[1]}"
+  elif [[ "${url}" =~ ^https://github\.com/([^/]+/[^/]+?)(\.git)?$ ]]; then
+    repo_ref="${BASH_REMATCH[1]}"
+  fi
+  repo_ref="${repo_ref%.git}"
+  if [[ -n "${repo_ref}" ]]; then
+    printf '%s\n' "${repo_ref}"
+  fi
+}
+
 header() {
   echo ""
   echo -e "${BOLD}${BLUE}============================================================================${RESET}"
@@ -154,6 +195,18 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
 else
   prompt LOCAL_SOURCE_DIR "Path to local app directory (will be copied)" "/root/ims/onetwoinventory"
 fi
+prompt_yn GIT_DEPLOY_KEY_ENABLED "Configure a per-instance GitHub deploy key for private repo updates?" "n"
+if [[ "${GIT_DEPLOY_KEY_ENABLED}" == "y" ]]; then
+  if [[ "${INSTALL_FROM_GIT}" != "y" ]]; then
+    prompt GIT_REPO_URL "Git repository URL for future updates" "git@github.com:yourorg/one-two-inventory.git"
+    prompt GIT_BRANCH "Branch for future updates" "main"
+  fi
+  prompt GITHUB_DEPLOY_KEY_TOKEN "GitHub token with deploy-key admin access" "" "secret"
+  DEFAULT_REPO_REF="$(derive_github_repo_ref "${GIT_REPO_URL:-}")"
+  prompt GITHUB_REPO_OWNER "GitHub repo owner/org" "${DEFAULT_REPO_REF%%/*}"
+  prompt GITHUB_REPO_NAME "GitHub repo name" "${DEFAULT_REPO_REF##*/}"
+  prompt GITHUB_DEPLOY_KEY_TITLE "Deploy key title" "$(hostname -s)-${APP_NAME}"
+fi
 
 echo ""
 info "--- Application ---"
@@ -247,6 +300,7 @@ apt-get update -qq
 apt-get install -y -qq \
   curl wget gnupg2 ca-certificates lsb-release \
   git build-essential \
+  jq openssh-client \
   rsync \
   nginx \
   fail2ban \
@@ -407,6 +461,69 @@ chown -R "${APP_USER}:${APP_USER}" "${DATA_DIR}" "${LOG_DIR}"
 
 success "Directories created."
 
+if [[ "${GIT_DEPLOY_KEY_ENABLED:-n}" == "y" ]]; then
+  header "Configuring GitHub deploy key"
+
+  [[ -n "${GIT_REPO_URL:-}" ]] || die "GIT_REPO_URL is required when GIT_DEPLOY_KEY_ENABLED=y."
+  [[ -n "${GITHUB_DEPLOY_KEY_TOKEN:-}" ]] || die "GITHUB_DEPLOY_KEY_TOKEN is required when GIT_DEPLOY_KEY_ENABLED=y."
+  [[ -n "${GITHUB_REPO_OWNER:-}" ]] || die "GITHUB_REPO_OWNER is required when GIT_DEPLOY_KEY_ENABLED=y."
+  [[ -n "${GITHUB_REPO_NAME:-}" ]] || die "GITHUB_REPO_NAME is required when GIT_DEPLOY_KEY_ENABLED=y."
+
+  SSH_DIR="${APP_DIR}/.ssh"
+  KEY_PATH="${SSH_DIR}/id_ed25519"
+  KNOWN_HOSTS="${SSH_DIR}/known_hosts"
+  SSH_CONFIG="${SSH_DIR}/config"
+  mkdir -p "${SSH_DIR}"
+  chown -R "${APP_USER}:${APP_USER}" "${SSH_DIR}"
+  chmod 700 "${SSH_DIR}"
+
+  if [[ ! -f "${KEY_PATH}" ]]; then
+    run_as_user "${APP_USER}" ssh-keygen -q -t ed25519 -N "" -C "${GITHUB_DEPLOY_KEY_TITLE}" -f "${KEY_PATH}"
+    success "Generated deploy key at ${KEY_PATH}."
+  else
+    info "Reusing existing deploy key at ${KEY_PATH}."
+  fi
+
+  ssh-keyscan -H github.com > "${KNOWN_HOSTS}.tmp" 2>/dev/null
+  mv "${KNOWN_HOSTS}.tmp" "${KNOWN_HOSTS}"
+  chmod 600 "${KNOWN_HOSTS}"
+
+  cat > "${SSH_CONFIG}" <<EOF
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile ${KEY_PATH}
+  IdentitiesOnly yes
+  StrictHostKeyChecking yes
+  UserKnownHostsFile ${KNOWN_HOSTS}
+EOF
+  chmod 600 "${SSH_CONFIG}"
+  chown "${APP_USER}:${APP_USER}" "${KNOWN_HOSTS}" "${SSH_CONFIG}"
+
+  DEPLOY_PUBLIC_KEY="$(<"${KEY_PATH}.pub")"
+  EXISTING_KEYS_JSON="$(github_api GET "/repos/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/keys")"
+  EXISTING_KEY_ID="$(jq -r --arg key "${DEPLOY_PUBLIC_KEY}" '.[] | select(.key == $key) | .id' <<<"${EXISTING_KEYS_JSON}" | head -n 1)"
+  TITLE_KEY_ID="$(jq -r --arg title "${GITHUB_DEPLOY_KEY_TITLE}" '.[] | select(.title == $title) | .id' <<<"${EXISTING_KEYS_JSON}" | head -n 1)"
+
+  if [[ -n "${EXISTING_KEY_ID}" ]]; then
+    info "GitHub deploy key already registered on ${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}."
+  else
+    if [[ -n "${TITLE_KEY_ID}" ]]; then
+      info "Replacing existing GitHub deploy key titled ${GITHUB_DEPLOY_KEY_TITLE}."
+      github_api DELETE "/repos/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/keys/${TITLE_KEY_ID}" >/dev/null
+    fi
+    GITHUB_PAYLOAD="$(jq -nc \
+      --arg title "${GITHUB_DEPLOY_KEY_TITLE}" \
+      --arg key "${DEPLOY_PUBLIC_KEY}" \
+      '{title:$title,key:$key,read_only:true}')"
+    github_api POST "/repos/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/keys" "${GITHUB_PAYLOAD}" >/dev/null
+    success "Registered deploy key on GitHub."
+  fi
+
+  run_as_user "${APP_USER}" git ls-remote --heads "${GIT_REPO_URL}" "${GIT_BRANCH:-main}" >/dev/null
+  success "Verified Git access to ${GIT_REPO_URL}."
+fi
+
 # ---------------------------------------------------------------------------
 # 9. Deploy application code
 # ---------------------------------------------------------------------------
@@ -451,7 +568,31 @@ else
   rm -f "${APP_DIR}/.env.local"
   chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
   success "Files copied."
+
+  if [[ "${GIT_DEPLOY_KEY_ENABLED:-n}" == "y" && -n "${GIT_REPO_URL:-}" ]]; then
+    info "Attaching git metadata for future updates..."
+    TMP_CLONE_DIR="$(mktemp -d -t oti-gitmeta.XXXXXX)"
+    TMP_CLONE_WORKTREE="${TMP_CLONE_DIR}/repo"
+    chown "${APP_USER}:${APP_USER}" "${TMP_CLONE_DIR}"
+    run_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
+      "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
+    rm -rf "${APP_DIR}/.git"
+    cp -a "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
+    chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}/.git"
+    rm -rf "${TMP_CLONE_DIR}"
+    success "Git metadata attached."
+  fi
 fi
+
+DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"
+cat > "${DEPLOY_META_FILE}" <<EOF
+INSTALL_FROM_GIT=${INSTALL_FROM_GIT}
+GIT_REPO_URL=${GIT_REPO_URL:-}
+GIT_BRANCH=${GIT_BRANCH:-}
+GIT_DEPLOY_KEY_ENABLED=${GIT_DEPLOY_KEY_ENABLED:-n}
+EOF
+chown "${APP_USER}:${APP_USER}" "${DEPLOY_META_FILE}"
+chmod 600 "${DEPLOY_META_FILE}"
 
 # ---------------------------------------------------------------------------
 # 10. Write .env file
@@ -526,10 +667,17 @@ run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" \
   npx prisma migrate deploy --schema prisma/schema.prisma
 success "Database migrations applied."
 
-header "Seeding database"
+header "Validating database schema"
 
 run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" \
-  npx prisma db seed 2>/dev/null || warn "Seeding skipped (may already be seeded)."
+  npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code >/dev/null
+success "Database schema matches prisma/schema.prisma."
+
+header "Seeding database"
+
+run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" SEED_TEST_ADMIN="false" \
+  npm run db:seed --prefix "${APP_DIR}"
+success "Database seed applied."
 
 if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}" || -n "${APP_DOMAIN}" ]]; then
   header "Bootstrapping default admin"

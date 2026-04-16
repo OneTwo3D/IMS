@@ -59,6 +59,10 @@ if ! $SKIP_MIGRATE; then
   info "Applying Prisma migrations..."
   npx prisma migrate deploy --schema prisma/schema.prisma
   ok "Migrations up to date."
+
+  info "Validating database schema..."
+  npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code >/dev/null
+  ok "Database schema matches prisma/schema.prisma."
 fi
 
 # ---------------------------------------------------------------------------

@@ -218,6 +218,10 @@ GIT_REPO_URL="${GIT_REPO_URL:-$(git -C "${REPO_DIR}" config --get remote.origin.
 GIT_BRANCH="${GIT_BRANCH:-$(git -C "${REPO_DIR}" rev-parse --abbrev-ref HEAD)}"
 DEPLOY_SOURCE_MODE="${DEPLOY_SOURCE_MODE:-git}"
 LOCAL_SOURCE_DIR="${LOCAL_SOURCE_DIR:-${REPO_DIR}}"
+GIT_DEPLOY_KEY_ENABLED="${GIT_DEPLOY_KEY_ENABLED:-n}"
+GITHUB_DEPLOY_KEY_TOKEN="${GITHUB_DEPLOY_KEY_TOKEN:-}"
+GITHUB_REPO_OWNER="${GITHUB_REPO_OWNER:-}"
+GITHUB_REPO_NAME="${GITHUB_REPO_NAME:-}"
 case "${DEPLOY_SOURCE_MODE}" in
   git)
     [[ -n "${GIT_REPO_URL}" ]] || die "GIT_REPO_URL is required when DEPLOY_SOURCE_MODE=git and the repo has no origin remote."
@@ -229,6 +233,11 @@ case "${DEPLOY_SOURCE_MODE}" in
     die "DEPLOY_SOURCE_MODE must be 'git' or 'local'."
     ;;
 esac
+if [[ "${GIT_DEPLOY_KEY_ENABLED}" == "y" ]]; then
+  require_env GITHUB_DEPLOY_KEY_TOKEN
+  require_env GITHUB_REPO_OWNER
+  require_env GITHUB_REPO_NAME
+fi
 
 LXC_HOSTNAME="${LXC_HOSTNAME:-${TENANT_SLUG}}"
 LXC_ID="${LXC_ID:-$(next_proxmox_vmid)}"
@@ -292,6 +301,7 @@ REMOTE_HELPER_SCRIPT="/tmp/ims-provision-instance-${TENANT_SLUG}.mjs"
 REMOTE_ENV_FILE="/tmp/ims-install-${TENANT_SLUG}.env"
 REMOTE_SOURCE_TARBALL="/tmp/ims-source-${TENANT_SLUG}.tar.gz"
 REMOTE_SOURCE_DIR="/root/ims-source-${TENANT_SLUG}"
+GITHUB_DEPLOY_KEY_TITLE="${GITHUB_DEPLOY_KEY_TITLE:-ims-${TENANT_SLUG}-${LXC_ID}}"
 
 touch "${INSTALL_ENV_FILE}"
 if [[ "${DEPLOY_SOURCE_MODE}" == "git" ]]; then
@@ -304,6 +314,11 @@ else
 fi
 append_env_line "${INSTALL_ENV_FILE}" APP_DOMAIN "${DOMAIN}"
 append_env_line "${INSTALL_ENV_FILE}" APP_PORT "${APP_PORT}"
+append_env_line "${INSTALL_ENV_FILE}" GIT_DEPLOY_KEY_ENABLED "${GIT_DEPLOY_KEY_ENABLED}"
+append_env_line "${INSTALL_ENV_FILE}" GITHUB_DEPLOY_KEY_TOKEN "${GITHUB_DEPLOY_KEY_TOKEN}"
+append_env_line "${INSTALL_ENV_FILE}" GITHUB_REPO_OWNER "${GITHUB_REPO_OWNER}"
+append_env_line "${INSTALL_ENV_FILE}" GITHUB_REPO_NAME "${GITHUB_REPO_NAME}"
+append_env_line "${INSTALL_ENV_FILE}" GITHUB_DEPLOY_KEY_TITLE "${GITHUB_DEPLOY_KEY_TITLE}"
 append_env_line "${INSTALL_ENV_FILE}" INSTALL_SSHD "${INSTALL_SSHD}"
 append_env_line "${INSTALL_ENV_FILE}" SSH_AUTHORIZED_KEY "${SSH_AUTHORIZED_KEY}"
 append_env_line "${INSTALL_ENV_FILE}" INSTALL_POSTGRES "${INSTALL_POSTGRES}"
@@ -495,6 +510,7 @@ else
   ssh_proxmox "pct exec ${LXC_ID} -- bash -lc 'set -a && source /root/ims-install.env && set +a && /root/install.sh --non-interactive'"
   success "IMS installed in LXC ${LXC_ID}."
 fi
+ssh_proxmox "pct exec ${LXC_ID} -- rm -f /root/ims-install.env /root/provision-instance.mjs /root/install.sh" >/dev/null 2>&1 || true
 
 info "Upserting Cloudflare DNS for ${DOMAIN} -> ${PROXY_PUBLIC_IP}."
 CF_LOOKUP="$(cf_request GET "/zones/${CLOUDFLARE_ZONE_ID}/dns_records?type=A&name=${DOMAIN}")"
