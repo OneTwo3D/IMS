@@ -155,6 +155,7 @@ if ! $NO_GIT; then
 
     rsync -a --delete \
       --exclude='.git' \
+      --exclude='.deploy-meta' \
       --exclude='node_modules' \
       --exclude='.next' \
       --exclude='.env' \
