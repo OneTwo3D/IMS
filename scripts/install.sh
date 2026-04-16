@@ -91,6 +91,27 @@ derive_github_repo_ref() {
   fi
 }
 
+git_repo_uses_ssh() {
+  local url="$1"
+  [[ "${url}" =~ ^git@github\.com: ]] || [[ "${url}" =~ ^ssh://git@github\.com/ ]]
+}
+
+run_git_as_user() {
+  local user="$1"
+  shift
+
+  if [[ "${GIT_DEPLOY_KEY_ENABLED:-n}" == "y" ]]; then
+    [[ -f "${DEPLOY_SSH_KEY_PATH}" ]] || die "Missing deploy key: ${DEPLOY_SSH_KEY_PATH}"
+    [[ -f "${DEPLOY_SSH_KNOWN_HOSTS}" ]] || die "Missing deploy known_hosts: ${DEPLOY_SSH_KNOWN_HOSTS}"
+
+    run_as_user "${user}" env \
+      "GIT_SSH_COMMAND=ssh -i ${DEPLOY_SSH_KEY_PATH} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${DEPLOY_SSH_KNOWN_HOSTS}" \
+      "$@"
+  else
+    run_as_user "${user}" "$@"
+  fi
+}
+
 header() {
   echo ""
   echo -e "${BOLD}${BLUE}============================================================================${RESET}"
@@ -110,6 +131,9 @@ LOG_DIR="/var/log/${APP_NAME}"
 BACKUP_DIR="${DATA_DIR}/backups"
 NGINX_CONF="/etc/nginx/sites-available/${APP_NAME}"
 NODE_VERSION="22"
+DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
+DEPLOY_SSH_KEY_PATH="${DEPLOY_SSH_DIR}/id_ed25519"
+DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
 
 NON_INTERACTIVE=false
 [[ "${1:-}" == "--non-interactive" ]] && NON_INTERACTIVE=true
@@ -201,6 +225,7 @@ if [[ "${GIT_DEPLOY_KEY_ENABLED}" == "y" ]]; then
     prompt GIT_REPO_URL "Git repository URL for future updates" "git@github.com:yourorg/one-two-inventory.git"
     prompt GIT_BRANCH "Branch for future updates" "main"
   fi
+  git_repo_uses_ssh "${GIT_REPO_URL}" || die "GIT_REPO_URL must use the GitHub SSH form when GIT_DEPLOY_KEY_ENABLED=y."
   prompt GITHUB_DEPLOY_KEY_TOKEN "GitHub token with deploy-key admin access" "" "secret"
   DEFAULT_REPO_REF="$(derive_github_repo_ref "${GIT_REPO_URL:-}")"
   prompt GITHUB_REPO_OWNER "GitHub repo owner/org" "${DEFAULT_REPO_REF%%/*}"
@@ -468,39 +493,25 @@ if [[ "${GIT_DEPLOY_KEY_ENABLED:-n}" == "y" ]]; then
   [[ -n "${GITHUB_DEPLOY_KEY_TOKEN:-}" ]] || die "GITHUB_DEPLOY_KEY_TOKEN is required when GIT_DEPLOY_KEY_ENABLED=y."
   [[ -n "${GITHUB_REPO_OWNER:-}" ]] || die "GITHUB_REPO_OWNER is required when GIT_DEPLOY_KEY_ENABLED=y."
   [[ -n "${GITHUB_REPO_NAME:-}" ]] || die "GITHUB_REPO_NAME is required when GIT_DEPLOY_KEY_ENABLED=y."
+  git_repo_uses_ssh "${GIT_REPO_URL}" || die "GIT_REPO_URL must use the GitHub SSH form when GIT_DEPLOY_KEY_ENABLED=y."
 
-  SSH_DIR="${APP_DIR}/.ssh"
-  KEY_PATH="${SSH_DIR}/id_ed25519"
-  KNOWN_HOSTS="${SSH_DIR}/known_hosts"
-  SSH_CONFIG="${SSH_DIR}/config"
-  mkdir -p "${SSH_DIR}"
-  chown -R "${APP_USER}:${APP_USER}" "${SSH_DIR}"
-  chmod 700 "${SSH_DIR}"
+  mkdir -p "${DEPLOY_SSH_DIR}"
+  chown -R "${APP_USER}:${APP_USER}" "${DEPLOY_SSH_DIR}"
+  chmod 700 "${DEPLOY_SSH_DIR}"
 
-  if [[ ! -f "${KEY_PATH}" ]]; then
-    run_as_user "${APP_USER}" ssh-keygen -q -t ed25519 -N "" -C "${GITHUB_DEPLOY_KEY_TITLE}" -f "${KEY_PATH}"
-    success "Generated deploy key at ${KEY_PATH}."
+  if [[ ! -f "${DEPLOY_SSH_KEY_PATH}" ]]; then
+    run_as_user "${APP_USER}" ssh-keygen -q -t ed25519 -N "" -C "${GITHUB_DEPLOY_KEY_TITLE}" -f "${DEPLOY_SSH_KEY_PATH}"
+    success "Generated deploy key at ${DEPLOY_SSH_KEY_PATH}."
   else
-    info "Reusing existing deploy key at ${KEY_PATH}."
+    info "Reusing existing deploy key at ${DEPLOY_SSH_KEY_PATH}."
   fi
 
-  ssh-keyscan -H github.com > "${KNOWN_HOSTS}.tmp" 2>/dev/null
-  mv "${KNOWN_HOSTS}.tmp" "${KNOWN_HOSTS}"
-  chmod 600 "${KNOWN_HOSTS}"
+  ssh-keyscan -H github.com > "${DEPLOY_SSH_KNOWN_HOSTS}.tmp" 2>/dev/null
+  mv "${DEPLOY_SSH_KNOWN_HOSTS}.tmp" "${DEPLOY_SSH_KNOWN_HOSTS}"
+  chmod 600 "${DEPLOY_SSH_KNOWN_HOSTS}"
+  chown "${APP_USER}:${APP_USER}" "${DEPLOY_SSH_KNOWN_HOSTS}"
 
-  cat > "${SSH_CONFIG}" <<EOF
-Host github.com
-  HostName github.com
-  User git
-  IdentityFile ${KEY_PATH}
-  IdentitiesOnly yes
-  StrictHostKeyChecking yes
-  UserKnownHostsFile ${KNOWN_HOSTS}
-EOF
-  chmod 600 "${SSH_CONFIG}"
-  chown "${APP_USER}:${APP_USER}" "${KNOWN_HOSTS}" "${SSH_CONFIG}"
-
-  DEPLOY_PUBLIC_KEY="$(<"${KEY_PATH}.pub")"
+  DEPLOY_PUBLIC_KEY="$(<"${DEPLOY_SSH_KEY_PATH}.pub")"
   EXISTING_KEYS_JSON="$(github_api GET "/repos/${GITHUB_REPO_OWNER}/${GITHUB_REPO_NAME}/keys")"
   EXISTING_KEY_ID="$(jq -r --arg key "${DEPLOY_PUBLIC_KEY}" '.[] | select(.key == $key) | .id' <<<"${EXISTING_KEYS_JSON}" | head -n 1)"
   TITLE_KEY_ID="$(jq -r --arg title "${GITHUB_DEPLOY_KEY_TITLE}" '.[] | select(.title == $title) | .id' <<<"${EXISTING_KEYS_JSON}" | head -n 1)"
@@ -520,7 +531,7 @@ EOF
     success "Registered deploy key on GitHub."
   fi
 
-  run_as_user "${APP_USER}" git ls-remote --heads "${GIT_REPO_URL}" "${GIT_BRANCH:-main}" >/dev/null
+  run_git_as_user "${APP_USER}" git ls-remote --heads "${GIT_REPO_URL}" "${GIT_BRANCH:-main}" >/dev/null
   success "Verified Git access to ${GIT_REPO_URL}."
 fi
 
@@ -532,26 +543,33 @@ header "Deploying application"
 if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
   if [[ -d "${APP_DIR}/.git" ]]; then
     info "Repository already exists — pulling latest..."
-    run_as_user "${APP_USER}" git -C "${APP_DIR}" fetch origin
-    run_as_user "${APP_USER}" git -C "${APP_DIR}" reset --hard "origin/${GIT_BRANCH}"
+    run_git_as_user "${APP_USER}" git -C "${APP_DIR}" fetch origin
+    run_git_as_user "${APP_USER}" git -C "${APP_DIR}" reset --hard "origin/${GIT_BRANCH}"
     success "Repository updated."
   elif [[ -d "${APP_DIR}" ]] && [[ -n "$(find "${APP_DIR}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
     info "App directory exists but is not a git checkout — syncing fresh code into place..."
     TMP_CLONE_DIR="$(mktemp -d -t oti-sync.XXXXXX)"
     TMP_CLONE_WORKTREE="${TMP_CLONE_DIR}/repo"
     chown "${APP_USER}:${APP_USER}" "${TMP_CLONE_DIR}"
-    run_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
+    run_git_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
       "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
     rsync -a --delete \
       --exclude='.git' \
+      --exclude='.deploy-meta' \
+      --exclude='.env' \
       --exclude='.env.local' \
+      --exclude='backups' \
+      --exclude='uploads' \
+      --exclude='public/uploads' \
       "${TMP_CLONE_WORKTREE%/}/" "${APP_DIR}/"
+    rm -rf "${APP_DIR}/.git"
+    cp -a "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
     chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
     rm -rf "${TMP_CLONE_DIR}"
     success "Repository synced into existing directory."
   else
     info "Cloning ${GIT_REPO_URL} (branch: ${GIT_BRANCH})..."
-    run_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
+    run_git_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
       "${GIT_REPO_URL}" "${APP_DIR}"
     success "Repository cloned."
   fi
@@ -564,6 +582,8 @@ else
     --exclude='.env' \
     --exclude='.env.local' \
     --exclude='backups' \
+    --exclude='uploads' \
+    --exclude='public/uploads' \
     "${LOCAL_SOURCE_DIR%/}/" "${APP_DIR}/"
   rm -f "${APP_DIR}/.env.local"
   chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
@@ -574,7 +594,7 @@ else
     TMP_CLONE_DIR="$(mktemp -d -t oti-gitmeta.XXXXXX)"
     TMP_CLONE_WORKTREE="${TMP_CLONE_DIR}/repo"
     chown "${APP_USER}:${APP_USER}" "${TMP_CLONE_DIR}"
-    run_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
+    run_git_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
       "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
     rm -rf "${APP_DIR}/.git"
     cp -a "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
@@ -656,7 +676,7 @@ success ".env written to ${APP_DIR}/.env"
 # ---------------------------------------------------------------------------
 header "Installing npm dependencies"
 
-run_as_user "${APP_USER}" npm ci --prefix "${APP_DIR}" 2>&1 | \
+run_as_user "${APP_USER}" npm ci --include=dev --prefix "${APP_DIR}" 2>&1 | \
   grep -v "^npm warn" || true
 success "Dependencies installed."
 

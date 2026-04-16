@@ -44,11 +44,31 @@ run_as_user() {
   fi
 }
 
+run_git_as_user() {
+  local user="$1"
+  shift
+
+  if [[ "${GIT_DEPLOY_KEY_ENABLED:-n}" == "y" ]]; then
+    [[ -f "${DEPLOY_SSH_KEY_PATH}" ]] || die "Missing deploy key: ${DEPLOY_SSH_KEY_PATH}"
+    [[ -f "${DEPLOY_SSH_KNOWN_HOSTS}" ]] || die "Missing deploy known_hosts: ${DEPLOY_SSH_KNOWN_HOSTS}"
+
+    run_as_user "${user}" env \
+      "GIT_SSH_COMMAND=ssh -i ${DEPLOY_SSH_KEY_PATH} -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=${DEPLOY_SSH_KNOWN_HOSTS}" \
+      "$@"
+  else
+    run_as_user "${user}" "$@"
+  fi
+}
+
 APP_NAME="one-two-inventory"
 APP_USER="imsapp"
 APP_DIR="/opt/${APP_NAME}"
+DATA_DIR="/var/lib/${APP_NAME}"
 BACKUP_DIR="/var/backups/${APP_NAME}"
 DEPLOY_META_FILE="${APP_DIR}/.deploy-meta"
+DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
+DEPLOY_SSH_KEY_PATH="${DEPLOY_SSH_DIR}/id_ed25519"
+DEPLOY_SSH_KNOWN_HOSTS="${DEPLOY_SSH_DIR}/known_hosts"
 
 NO_GIT=false
 SKIP_BUILD=false
@@ -100,14 +120,14 @@ if ! $NO_GIT; then
   header "Pulling latest code from git"
 
   if [[ -d "${APP_DIR}/.git" ]]; then
-    CURRENT_COMMIT="$(run_as_user "${APP_USER}" git -C "${APP_DIR}" rev-parse HEAD)"
-    CURRENT_BRANCH="$(run_as_user "${APP_USER}" git -C "${APP_DIR}" rev-parse --abbrev-ref HEAD)"
+    CURRENT_COMMIT="$(run_git_as_user "${APP_USER}" git -C "${APP_DIR}" rev-parse HEAD)"
+    CURRENT_BRANCH="$(run_git_as_user "${APP_USER}" git -C "${APP_DIR}" rev-parse --abbrev-ref HEAD)"
     info "Current commit: ${CURRENT_COMMIT:0:8}"
 
-    run_as_user "${APP_USER}" git -C "${APP_DIR}" fetch origin
-    run_as_user "${APP_USER}" git -C "${APP_DIR}" reset --hard "origin/${CURRENT_BRANCH}"
+    run_git_as_user "${APP_USER}" git -C "${APP_DIR}" fetch origin
+    run_git_as_user "${APP_USER}" git -C "${APP_DIR}" reset --hard "origin/${CURRENT_BRANCH}"
 
-    NEW_COMMIT="$(run_as_user "${APP_USER}" git -C "${APP_DIR}" rev-parse HEAD)"
+    NEW_COMMIT="$(run_git_as_user "${APP_USER}" git -C "${APP_DIR}" rev-parse HEAD)"
     info "Updated to:     ${NEW_COMMIT:0:8}"
 
     if [[ "$CURRENT_COMMIT" == "$NEW_COMMIT" ]]; then
@@ -115,7 +135,7 @@ if ! $NO_GIT; then
     else
       echo ""
       info "Changes in this update:"
-      run_as_user "${APP_USER}" git -C "${APP_DIR}" log \
+      run_git_as_user "${APP_USER}" git -C "${APP_DIR}" log \
         --oneline "${CURRENT_COMMIT}..${NEW_COMMIT}" | head -20
     fi
   else
@@ -128,9 +148,9 @@ if ! $NO_GIT; then
     CURRENT_COMMIT="none"
 
     info "Cloning ${GIT_REPO_URL} (${GIT_BRANCH}) into a temporary worktree..."
-    run_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
+    run_git_as_user "${APP_USER}" git clone --branch "${GIT_BRANCH}" --depth 1 \
       "${GIT_REPO_URL}" "${TMP_CLONE_WORKTREE}"
-    NEW_COMMIT="$(run_as_user "${APP_USER}" git -C "${TMP_CLONE_WORKTREE}" rev-parse HEAD)"
+    NEW_COMMIT="$(run_git_as_user "${APP_USER}" git -C "${TMP_CLONE_WORKTREE}" rev-parse HEAD)"
     info "Fetched commit: ${NEW_COMMIT:0:8}"
 
     rsync -a --delete \
@@ -157,7 +177,7 @@ fi
 if ! $SKIP_BUILD; then
   header "Installing dependencies"
 
-  run_as_user "${APP_USER}" npm ci --prefix "${APP_DIR}" 2>&1 | \
+  run_as_user "${APP_USER}" npm ci --include=dev --prefix "${APP_DIR}" 2>&1 | \
     grep -v "^npm warn" || true
   success "Dependencies updated."
 fi

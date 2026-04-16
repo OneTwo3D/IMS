@@ -64,6 +64,11 @@ random_secret() {
   openssl rand -base64 24 | tr -d '\n' | tr '/+' 'AB' | cut -c1-24
 }
 
+git_repo_uses_ssh() {
+  local url="$1"
+  [[ "${url}" =~ ^git@github\.com: ]] || [[ "${url}" =~ ^ssh://git@github\.com/ ]]
+}
+
 cf_request() {
   local method="$1" path="$2" data="${3:-}"
   if [[ -n "$data" ]]; then
@@ -237,6 +242,7 @@ if [[ "${GIT_DEPLOY_KEY_ENABLED}" == "y" ]]; then
   require_env GITHUB_DEPLOY_KEY_TOKEN
   require_env GITHUB_REPO_OWNER
   require_env GITHUB_REPO_NAME
+  git_repo_uses_ssh "${GIT_REPO_URL}" || die "GIT_REPO_URL must use the GitHub SSH form when GIT_DEPLOY_KEY_ENABLED=y."
 fi
 
 LXC_HOSTNAME="${LXC_HOSTNAME:-${TENANT_SLUG}}"
