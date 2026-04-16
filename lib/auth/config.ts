@@ -6,6 +6,7 @@ import { db } from '@/lib/db'
 import { consumeAuthToken } from '@/lib/auth/token-store'
 import { checkRateLimit, clearRateLimit } from '@/lib/rate-limit'
 import { getClientIp } from '@/lib/request-ip'
+import { isTurnstileEnabled, verifyTurnstileToken } from '@/lib/turnstile'
 
 const loginSchema = z.object({
   email: z.string().email(),
@@ -94,6 +95,14 @@ export const authConfig: NextAuthConfig = {
         if (!parsed.success) return null
 
         const clientIp = getClientIp(request.headers) ?? 'unknown'
+        if (isTurnstileEnabled()) {
+          const turnstileToken = typeof credentials?.turnstileToken === 'string'
+            ? credentials.turnstileToken
+            : null
+          const turnstileVerified = await verifyTurnstileToken(turnstileToken, request.headers)
+          if (!turnstileVerified) return null
+        }
+
         const rlKey = `login:${parsed.data.email.toLowerCase()}:${clientIp}`
         const rl = checkRateLimit(rlKey, 10, 15 * 60_000)
         if (!rl.allowed) return null

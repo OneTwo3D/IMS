@@ -1,6 +1,7 @@
 import type { Metadata } from 'next'
 import { db } from '@/lib/db'
 import { LoginForm } from '@/components/auth/login-form'
+import { getTurnstileSiteKey, isTurnstileEnabled } from '@/lib/turnstile'
 
 export const metadata: Metadata = { title: 'Sign In' }
 export const dynamic = 'force-dynamic'
@@ -8,6 +9,7 @@ export const dynamic = 'force-dynamic'
 export default async function LoginPage() {
   const org = await db.organisation.findFirst({ select: { name: true, logoUrl: true } })
   const companyName = org?.name || 'IMS'
+  const turnstileSiteKey = isTurnstileEnabled() ? getTurnstileSiteKey() : null
 
   return (
     <div className="flex flex-col gap-6">
@@ -23,7 +25,7 @@ export default async function LoginPage() {
         <h1 className="text-2xl font-semibold">One Two Inventory</h1>
         <p className="mt-1 text-sm text-muted-foreground">Sign in to your account</p>
       </div>
-      <LoginForm />
+      <LoginForm turnstileSiteKey={turnstileSiteKey} />
     </div>
   )
 }

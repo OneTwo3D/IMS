@@ -1,7 +1,8 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
+import Script from 'next/script'
 import { signIn } from 'next-auth/react'
 import { startAuthentication } from '@simplewebauthn/browser'
 import { Button } from '@/components/ui/button'
@@ -15,26 +16,90 @@ import {
   verifyPasskeyAuthentication,
 } from '@/app/actions/passkey'
 
-export function LoginForm() {
+declare global {
+  interface Window {
+    turnstile?: {
+      render: (
+        container: HTMLElement,
+        options: {
+          sitekey: string
+          callback?: (token: string) => void
+          'expired-callback'?: () => void
+          'error-callback'?: () => void
+          theme?: 'light' | 'dark' | 'auto'
+        },
+      ) => string
+      reset: (widgetId?: string) => void
+    }
+  }
+}
+
+type LoginFormProps = {
+  turnstileSiteKey?: string | null
+}
+
+export function LoginForm({ turnstileSiteKey }: LoginFormProps) {
   const router = useRouter()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [error, setError] = useState('')
   const [loading, setLoading] = useState(false)
   const [passkeyLoading, setPasskeyLoading] = useState(false)
+  const [turnstileToken, setTurnstileToken] = useState('')
+  const [turnstileLoaded, setTurnstileLoaded] = useState(false)
+  const turnstileContainerRef = useRef<HTMLDivElement | null>(null)
+  const turnstileWidgetIdRef = useRef<string | null>(null)
+
+  const turnstileEnabled = !!turnstileSiteKey
+
+  useEffect(() => {
+    if (!turnstileEnabled || !turnstileLoaded || !window.turnstile || !turnstileContainerRef.current) return
+    if (turnstileWidgetIdRef.current) return
+
+    turnstileWidgetIdRef.current = window.turnstile.render(turnstileContainerRef.current, {
+      sitekey: turnstileSiteKey,
+      theme: 'auto',
+      callback: (token) => {
+        setTurnstileToken(token)
+        setError('')
+      },
+      'expired-callback': () => {
+        setTurnstileToken('')
+      },
+      'error-callback': () => {
+        setTurnstileToken('')
+      },
+    })
+  }, [turnstileEnabled, turnstileLoaded, turnstileSiteKey])
+
+  function resetTurnstile() {
+    if (!turnstileEnabled) return
+    setTurnstileToken('')
+    if (window.turnstile && turnstileWidgetIdRef.current) {
+      window.turnstile.reset(turnstileWidgetIdRef.current)
+    }
+  }
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
     setError('')
+
+    if (turnstileEnabled && !turnstileToken) {
+      setError('Please complete the verification check.')
+      return
+    }
+
     setLoading(true)
 
     const result = await signIn('credentials', {
       email,
       password,
+      turnstileToken,
       redirect: false,
     })
 
     setLoading(false)
+    resetTurnstile()
 
     if (result?.error) {
       setError('Invalid email or password.')
@@ -100,6 +165,14 @@ export function LoginForm() {
   return (
     <Card>
       <CardContent className="pt-6">
+        {turnstileEnabled && (
+          <Script
+            src="https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit"
+            strategy="afterInteractive"
+            onLoad={() => setTurnstileLoaded(true)}
+          />
+        )}
+
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
           {error && (
             <Alert variant="destructive" className="text-sm py-2 px-3">
@@ -132,6 +205,12 @@ export function LoginForm() {
               placeholder="••••••••"
             />
           </div>
+
+          {turnstileEnabled && (
+            <div className="flex flex-col gap-1.5">
+              <div ref={turnstileContainerRef} />
+            </div>
+          )}
 
           <Button type="submit" disabled={loading || passkeyLoading} className="w-full">
             {loading && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
