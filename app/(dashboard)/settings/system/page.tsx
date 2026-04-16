@@ -57,7 +57,12 @@ export default async function SystemSettingsPage({
   return (
     <div className="space-y-6 max-w-4xl">
       <div>
-        <h1 className="text-2xl font-semibold">System Settings</h1>
+        <div className="flex items-center gap-3">
+          <h1 className="text-2xl font-semibold">System Settings</h1>
+          <span className="inline-flex items-center rounded-full border px-2.5 py-0.5 text-xs font-medium text-muted-foreground">
+            v{CURRENT_RELEASE.version}
+          </span>
+        </div>
         <p className="mt-1 text-sm text-muted-foreground">Scheduled jobs, data retention, and database management.</p>
       </div>
 
