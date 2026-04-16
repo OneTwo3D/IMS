@@ -2,7 +2,6 @@ import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { db } from '@/lib/db'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import { pollXeroPayments } from '@/lib/connectors/xero/payment-poller'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
 export async function GET(request: Request) {
@@ -10,20 +9,30 @@ export async function GET(request: Request) {
   if (cronErr) return cronErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
-  if (!(await isIntegrationPluginEnabled('xero'))) {
-    return NextResponse.json({ skipped: true, reason: 'Accounting plugin disabled' })
+
+  if (await isIntegrationPluginEnabled('xero')) {
+    const [pollingEnabled, syncEnabled] = await Promise.all([
+      db.setting.findUnique({ where: { key: 'xero_payment_polling_enabled' } }),
+      db.setting.findUnique({ where: { key: 'xero_sync_enabled' } }),
+    ])
+    if (pollingEnabled?.value !== 'true') return NextResponse.json({ skipped: true, reason: 'Xero payment polling disabled' })
+    if (syncEnabled?.value !== 'true') return NextResponse.json({ skipped: true, reason: 'Xero sync disabled' })
+    const { pollXeroPayments } = await import('@/lib/connectors/xero/payment-poller')
+    const result = await pollXeroPayments()
+    return NextResponse.json(result)
   }
 
-  const enabled = await db.setting.findUnique({ where: { key: 'xero_payment_polling_enabled' } })
-  if (enabled?.value !== 'true') {
-    return NextResponse.json({ skipped: true, reason: 'Accounting payment polling disabled' })
+  if (await isIntegrationPluginEnabled('quickbooks')) {
+    const [pollingEnabled, syncEnabled] = await Promise.all([
+      db.setting.findUnique({ where: { key: 'quickbooks_payment_polling_enabled' } }),
+      db.setting.findUnique({ where: { key: 'quickbooks_sync_enabled' } }),
+    ])
+    if (pollingEnabled?.value !== 'true') return NextResponse.json({ skipped: true, reason: 'QuickBooks payment polling disabled' })
+    if (syncEnabled?.value !== 'true') return NextResponse.json({ skipped: true, reason: 'QuickBooks sync disabled' })
+    const { pollQuickBooksPayments } = await import('@/lib/connectors/quickbooks/payment-poller')
+    const result = await pollQuickBooksPayments()
+    return NextResponse.json(result)
   }
 
-  const syncEnabled = await db.setting.findUnique({ where: { key: 'xero_sync_enabled' } })
-  if (syncEnabled?.value !== 'true') {
-    return NextResponse.json({ skipped: true, reason: 'Accounting sync disabled' })
-  }
-
-  const result = await pollXeroPayments()
-  return NextResponse.json(result)
+  return NextResponse.json({ skipped: true, reason: 'No accounting plugin enabled' })
 }

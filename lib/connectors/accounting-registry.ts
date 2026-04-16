@@ -15,7 +15,7 @@ export const ACCOUNTING_CONNECTORS: readonly AccountingConnectorDef[] = [
   {
     id: 'quickbooks',
     label: 'QuickBooks',
-    available: false,
+    available: true,
   },
 ] as const
 

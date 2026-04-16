@@ -1,11 +1,26 @@
 # Changelog
 
-This repository uses an `x.y` release scheme.
+This repository uses an `x.y.z` release scheme.
 
 - Increment `x` for breaking changes.
-- Increment `y` for non-breaking changes.
+- Increment `y` for user-facing non-breaking changes.
+- Increment `z` for backend-only non-breaking changes.
 
-## 1.1 - 2026-04-16
+## 1.2.0 - 2026-04-16
+
+### User-facing
+
+- Added QuickBooks Online as a fully available accounting connector (OAuth, chart of accounts sync, invoices, bills, credit memos, journal entries, payment polling, daily batch sub-ledger sync).
+- QuickBooks is now selectable in the Integrations dashboard alongside Xero.
+
+### Technical
+
+- Full QuickBooks connector module (16 files): OAuth 2.0 with Intuit, HTTP client with rate limiting, split Customer/Vendor contacts, NonInventory items, idempotent sync processor, payment poller with checkpoint-on-success-only.
+- Accounting facade, server actions, OAuth callback, and all cron routes now dispatch to the active accounting connector (Xero or QuickBooks).
+- Fixed sync processor idempotency: external writes are no longer replayed after partial follow-up failures.
+- Fixed stale contact IDs cleared on disconnect to prevent cross-tenant reuse.
+
+## 1.1.0 - 2026-04-16
 
 ### User-facing
 

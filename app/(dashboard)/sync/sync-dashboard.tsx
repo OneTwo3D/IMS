@@ -97,7 +97,7 @@ const CONNECTORS: ConnectorDef[] = [
     description: 'Sync invoices, COGS journals and purchase invoices',
     logo: '/images/qb-logo-stacked.svg',
     category: 'accounting',
-    available: false,
+    available: true,
   },
 ]
 
@@ -271,15 +271,25 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
           {CONNECTOR_LOGOS.quickbooks}
           <div>
             <h2 className="text-lg font-semibold">QuickBooks Connector</h2>
-            <p className="text-xs text-muted-foreground">Groundwork is in place; connector implementation is still empty.</p>
+            <p className="text-xs text-muted-foreground">Sync invoices, journals, and bills to QuickBooks</p>
           </div>
         </div>
-        <Card className="p-6">
-          <p className="text-sm text-muted-foreground">
-            QuickBooks now exists as a first-class accounting connector slot in the schema, plugin state, and shared connector registries.
-            The module skeleton is present, but OAuth, account sync, tax mapping, and transaction posting are not implemented yet.
-          </p>
-        </Card>
+        <XeroClient
+          settings={accountingSettings}
+          connected={accountingConnected}
+          tenantName={accountingTenantName}
+          accounts={accountingAccounts}
+          logs={accountingLogs}
+          paymentMethodCombos={paymentMethodCombos}
+          paymentAccountMap={paymentAccountMap}
+          currencies={currencies}
+          shoppingPaymentMethods={shoppingPaymentMethods}
+          imsTaxRates={imsTaxRates}
+          xeroTaxRates={accountingTaxRates}
+          readiness={accountingReadiness}
+          dailyBatchPreview={accountingBatchPreview}
+          dailyBatchHistory={accountingBatchHistory}
+        />
       </div>
     )
   }
@@ -375,7 +385,7 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
             >
               <div className="flex items-center justify-between">
                 {CONNECTOR_LOGOS[c.id]}
-                {c.id === 'xero' && accountingConnected && (
+                {(c.id === 'xero' || c.id === 'quickbooks') && accountingConnected && (
                   <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
                     Connected
                   </span>

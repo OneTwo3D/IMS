@@ -2,7 +2,6 @@ import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { db } from '@/lib/db'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import { runDailyBatchSync } from '@/lib/connectors/xero/daily-sync'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
 export async function GET(request: Request) {
@@ -10,20 +9,30 @@ export async function GET(request: Request) {
   if (cronErr) return cronErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
-  if (!(await isIntegrationPluginEnabled('xero'))) {
-    return NextResponse.json({ skipped: true, reason: 'Accounting plugin disabled' })
+
+  if (await isIntegrationPluginEnabled('xero')) {
+    const [batchEnabled, syncEnabled] = await Promise.all([
+      db.setting.findUnique({ where: { key: 'xero_daily_batch_enabled' } }),
+      db.setting.findUnique({ where: { key: 'xero_sync_enabled' } }),
+    ])
+    if (batchEnabled?.value !== 'true') return NextResponse.json({ skipped: true, reason: 'Xero daily batch disabled' })
+    if (syncEnabled?.value !== 'true') return NextResponse.json({ skipped: true, reason: 'Xero sync disabled' })
+    const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')
+    const result = await runDailyBatchSync()
+    return NextResponse.json(result)
   }
 
-  const batchEnabled = await db.setting.findUnique({ where: { key: 'xero_daily_batch_enabled' } })
-  if (batchEnabled?.value !== 'true') {
-    return NextResponse.json({ skipped: true, reason: 'Accounting daily batch disabled' })
+  if (await isIntegrationPluginEnabled('quickbooks')) {
+    const [batchEnabled, syncEnabled] = await Promise.all([
+      db.setting.findUnique({ where: { key: 'quickbooks_daily_batch_enabled' } }),
+      db.setting.findUnique({ where: { key: 'quickbooks_sync_enabled' } }),
+    ])
+    if (batchEnabled?.value !== 'true') return NextResponse.json({ skipped: true, reason: 'QuickBooks daily batch disabled' })
+    if (syncEnabled?.value !== 'true') return NextResponse.json({ skipped: true, reason: 'QuickBooks sync disabled' })
+    const { runDailyBatchSync } = await import('@/lib/connectors/quickbooks/daily-sync')
+    const result = await runDailyBatchSync()
+    return NextResponse.json(result)
   }
 
-  const syncEnabled = await db.setting.findUnique({ where: { key: 'xero_sync_enabled' } })
-  if (syncEnabled?.value !== 'true') {
-    return NextResponse.json({ skipped: true, reason: 'Accounting sync disabled' })
-  }
-
-  const result = await runDailyBatchSync()
-  return NextResponse.json(result)
+  return NextResponse.json({ skipped: true, reason: 'No accounting plugin enabled' })
 }

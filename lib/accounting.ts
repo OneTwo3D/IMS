@@ -114,13 +114,24 @@ export async function getAccountingSettings(): Promise<AccountingSettings> {
         billUrlTemplate: billUrlSetting?.value ?? '',
       }
     }
-    case 'quickbooks':
+    case 'quickbooks': {
+      const { getQuickBooksSettings } = await import('@/lib/connectors/quickbooks/settings')
+      const qs = await getQuickBooksSettings()
       return {
-        ...DEFAULT_ACCOUNTING_SETTINGS,
+        syncEnabled: qs.quickbooks_sync_enabled === 'true',
+        salesAccount: qs.quickbooks_sales_account,
+        shippingAccount: qs.quickbooks_shipping_account,
+        discountAccount: qs.quickbooks_discount_account,
+        cogsAccount: qs.quickbooks_cogs_account,
+        inventoryAccount: qs.quickbooks_inventory_account,
+        allocatedInventoryAccount: qs.quickbooks_allocated_inventory_account,
+        unearnedRevenueAccount: qs.quickbooks_unearned_revenue_account,
+        transitAccount: qs.quickbooks_transit_account,
         paymentAccountMap: paymentMapSetting?.value ?? '{}',
         invoiceUrlTemplate: invoiceUrlSetting?.value ?? '',
         billUrlTemplate: billUrlSetting?.value ?? '',
       }
+    }
   }
 }
 
