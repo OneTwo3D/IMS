@@ -1,7 +1,7 @@
 import type { Metadata } from 'next'
 import Link from 'next/link'
 import { headers } from 'next/headers'
-import { ActivitySquare, Archive, Plug, RotateCcw, Timer } from 'lucide-react'
+import { ActivitySquare, Archive, Plug, RotateCcw, ScrollText, Timer } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Card } from '@/components/ui/card'
 import { getSetting } from '@/app/actions/settings'
@@ -15,10 +15,12 @@ import type { CronJobState } from '@/components/settings/cron-jobs-settings'
 import { getAllCronJobs } from '@/lib/cron-jobs'
 import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
 import { detectPublicAppUrlFromHeaders, getPublicAppUrlInfo } from '@/lib/public-app-url'
+import { CURRENT_RELEASE, RELEASES } from '@/lib/releases'
 
 export const metadata: Metadata = { title: 'System Settings' }
 
 const TABS = [
+  { key: 'releases', label: 'Releases', icon: ScrollText },
   { key: 'plugins', label: 'Plugins', icon: Plug },
   { key: 'scheduler', label: 'Scheduler', icon: Timer },
   { key: 'retention', label: 'Data Retention', icon: Archive },
@@ -34,7 +36,7 @@ export default async function SystemSettingsPage({
 }) {
   const params = await searchParams
   const raw = typeof params.tab === 'string' ? params.tab : undefined
-  const activeTab: Tab = TABS.some((t) => t.key === raw) ? (raw as Tab) : 'scheduler'
+  const activeTab: Tab = TABS.some((t) => t.key === raw) ? (raw as Tab) : 'releases'
   const headerList = activeTab === 'scheduler' ? await headers() : null
   const suggestedPublicAppUrl = activeTab === 'scheduler'
     ? detectPublicAppUrlFromHeaders({
@@ -93,6 +95,61 @@ export default async function SystemSettingsPage({
             quickbooksEnabled={pluginState.quickbooks}
           />
         </Card>
+      )}
+
+      {activeTab === 'releases' && (
+        <div className="space-y-6">
+          <Card className="p-6">
+            <div className="flex items-center gap-2 mb-4">
+              <ScrollText className="h-4 w-4 text-muted-foreground" />
+              <h2 className="text-base font-semibold">Current Release</h2>
+            </div>
+            <div className="space-y-3">
+              <div>
+                <p className="text-lg font-semibold">
+                  Version {CURRENT_RELEASE.version}
+                </p>
+                <p className="text-sm text-muted-foreground">
+                  {CURRENT_RELEASE.title} · {CURRENT_RELEASE.date}
+                </p>
+              </div>
+              <p className="text-sm text-muted-foreground">{CURRENT_RELEASE.summary}</p>
+              <div>
+                <p className="text-sm font-medium">User-facing changes</p>
+                <ul className="mt-2 space-y-1 text-sm text-muted-foreground">
+                  {CURRENT_RELEASE.userHighlights.map((item) => (
+                    <li key={item}>- {item}</li>
+                  ))}
+                </ul>
+              </div>
+              <div>
+                <p className="text-sm font-medium">Versioning policy</p>
+                <p className="mt-2 text-sm text-muted-foreground">
+                  Releases follow an x.y scheme. Increment x for breaking changes. Increment y for non-breaking changes.
+                </p>
+              </div>
+            </div>
+          </Card>
+
+          <Card className="p-6">
+            <div className="flex items-center gap-2 mb-4">
+              <ScrollText className="h-4 w-4 text-muted-foreground" />
+              <h2 className="text-base font-semibold">Release History</h2>
+            </div>
+            <div className="space-y-4">
+              {RELEASES.map((release) => (
+                <div key={release.version} className="rounded-lg border p-4">
+                  <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                    <p className="font-medium">Version {release.version}</p>
+                    <span className="text-sm text-muted-foreground">{release.date}</span>
+                  </div>
+                  <p className="mt-1 text-sm text-muted-foreground">{release.title}</p>
+                  <p className="mt-3 text-sm">{release.userMessage}</p>
+                </div>
+              ))}
+            </div>
+          </Card>
+        </div>
       )}
 
       {activeTab === 'scheduler' && cronJobs && (

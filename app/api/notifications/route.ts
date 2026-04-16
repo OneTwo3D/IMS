@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
+import { ensureCurrentReleaseNotification } from '@/lib/releases'
 
 // GET — fetch notifications for current user (+ broadcasts with per-user read state)
 export async function GET() {
@@ -8,6 +9,8 @@ export async function GET() {
   if (!session?.user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
 
   const userId = session.user.id!
+
+  await ensureCurrentReleaseNotification()
 
   // Load both user-owned and broadcast rows (latest 50).
   const rows = await db.notification.findMany({
