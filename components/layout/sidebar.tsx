@@ -40,10 +40,11 @@ const SALES_CHILDREN = [
 ]
 
 const ANALYTICS_CHILDREN = [
-  { href: '/analytics/sales-stats',     label: 'Sales Statistics' },
-  { href: '/analytics/purchase-stats',  label: 'Purchase Statistics' },
-  { href: '/analytics/inventory-stats', label: 'Inventory Report' },
-  { href: '/analytics/forecast',        label: 'Reorder Forecast' },
+  { href: '/analytics/sales-stats',            label: 'Sales Statistics' },
+  { href: '/analytics/purchase-stats',         label: 'Purchase Statistics' },
+  { href: '/analytics/product-profitability',  label: 'Product Profitability' },
+  { href: '/analytics/inventory-stats',        label: 'Inventory Report' },
+  { href: '/analytics/forecast',               label: 'Reorder Forecast' },
 ]
 
 function getSettingsChildren(accountingIntegrationEnabled: boolean) {
