@@ -18,6 +18,8 @@ import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { formatMoney } from '@/lib/utils'
 
+const dateFormatter = new Intl.DateTimeFormat('en-GB')
+
 const TYPE_LABELS: Record<ProductType, string> = {
   SIMPLE: 'Simple',
   VARIABLE: 'Variable',
@@ -242,9 +244,9 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
       case 'active':
         return <Badge variant={STATUS_VARIANTS[p.lifecycleStatus]}>{STATUS_LABELS[p.lifecycleStatus]}</Badge>
       case 'createdAt':
-        return p.createdAt.toLocaleDateString()
+        return dateFormatter.format(p.createdAt)
       case 'updatedAt':
-        return p.updatedAt.toLocaleDateString()
+        return dateFormatter.format(p.updatedAt)
     }
   }
 
