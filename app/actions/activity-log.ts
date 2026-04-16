@@ -1,7 +1,7 @@
 'use server'
 
 import { db } from '@/lib/db'
-import { auth } from '@/lib/auth'
+import { requirePermission } from '@/lib/auth/server'
 import type { ActivityLogLevel } from '@/app/generated/prisma/client'
 
 export type ActivityLogRow = {
@@ -27,8 +27,7 @@ type Filters = {
 }
 
 export async function getActivityLogs(filters: Filters = {}) {
-  const session = await auth()
-  if (!session?.user?.id) return { rows: [], total: 0 }
+  await requirePermission('activity_log')
 
   const { search, tag, level, page = 1, pageSize = 50 } = filters
 
@@ -87,8 +86,7 @@ export async function getActivityLogs(filters: Filters = {}) {
 }
 
 export async function getActivityTags() {
-  const session = await auth()
-  if (!session?.user?.id) return []
+  await requirePermission('activity_log')
 
   const result = await db.activityLog.findMany({
     select: { tag: true },

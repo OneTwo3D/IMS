@@ -1,7 +1,7 @@
 'use client'
 
 import Link from 'next/link'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { usePathname } from 'next/navigation'
 import { ChevronDown } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -28,16 +28,15 @@ export function NavGroup({ label, icon: Icon, items, collapsed, onExpand, onNavi
     pathname === c.href || (pathname.startsWith(c.href + '/') && !items.some((other) => other.href !== c.href && pathname.startsWith(other.href)))
   const isAnyChildActive = items.some(isChildActive)
   const [open, setOpen] = useState(isAnyChildActive)
-  const [prevActive, setPrevActive] = useState(isAnyChildActive)
+  const prevActive = useRef(isAnyChildActive)
 
-  // Auto-open when navigating to a child route (render-time state adjustment)
-  if (isAnyChildActive && !prevActive) {
-    setPrevActive(true)
-    setOpen(true)
-  }
-  if (!isAnyChildActive && prevActive) {
-    setPrevActive(false)
-  }
+  // Auto-open when navigating to a child route
+  useEffect(() => {
+    if (isAnyChildActive && !prevActive.current) {
+      setOpen(true)
+    }
+    prevActive.current = isAnyChildActive
+  }, [isAnyChildActive])
 
   const parentClass = cn(
     'flex items-center gap-3 rounded-md px-3 py-2 text-sm font-medium transition-colors cursor-pointer select-none',

@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { requireAuth } from '@/lib/auth/server'
+import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 
@@ -448,12 +449,25 @@ export async function saveView(view: SavedView): Promise<void> {
   const existing = views.findIndex((v) => v.id === view.id)
   if (existing >= 0) views[existing] = view; else views.push(view)
   await db.setting.upsert({ where: { key: 'sales_stats_views' }, create: { key: 'sales_stats_views', value: JSON.stringify(views) }, update: { value: JSON.stringify(views) } })
+  await logActivity({
+    entityType: 'SETTING',
+    tag: 'analytics',
+    action: existing >= 0 ? 'updated' : 'created',
+    description: `${existing >= 0 ? 'Updated' : 'Created'} sales stats view: ${view.name}`,
+  })
   revalidatePath('/analytics/sales-stats')
 }
 
 export async function deleteView(viewId: string): Promise<void> {
   await requireAuth()
   const views = await getSavedViews()
+  const deleted = views.find((v) => v.id === viewId)
   await db.setting.upsert({ where: { key: 'sales_stats_views' }, create: { key: 'sales_stats_views', value: JSON.stringify(views.filter((v) => v.id !== viewId)) }, update: { value: JSON.stringify(views.filter((v) => v.id !== viewId)) } })
+  await logActivity({
+    entityType: 'SETTING',
+    tag: 'analytics',
+    action: 'deleted',
+    description: `Deleted sales stats view: ${deleted?.name ?? viewId}`,
+  })
   revalidatePath('/analytics/sales-stats')
 }

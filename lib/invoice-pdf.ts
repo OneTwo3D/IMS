@@ -9,7 +9,14 @@ import { join } from 'path'
 import { createHmac } from 'crypto'
 
 const PDF_DIR = join(process.cwd(), 'data', 'invoices')
-const SIGNING_SECRET = process.env.NEXTAUTH_SECRET || process.env.AUTH_SECRET || 'invoice-pdf-secret'
+
+function getSigningSecret(): string {
+  const secret = process.env.NEXTAUTH_SECRET || process.env.AUTH_SECRET
+  if (!secret) {
+    throw new Error('AUTH_SECRET (or NEXTAUTH_SECRET) must be set — invoice PDF token signing requires a secret')
+  }
+  return secret
+}
 
 /** Get the file path for a saved invoice PDF */
 export function getInvoicePdfPath(orderId: string): string {
@@ -27,7 +34,7 @@ export async function loadInvoicePdf(orderId: string): Promise<Buffer | null> {
 
 /** Generate an HMAC-signed token for public PDF download */
 export function signPdfToken(orderId: string): string {
-  return createHmac('sha256', SIGNING_SECRET).update(orderId).digest('hex')
+  return createHmac('sha256', getSigningSecret()).update(orderId).digest('hex')
 }
 
 /** Verify an HMAC-signed token */

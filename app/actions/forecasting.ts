@@ -1,7 +1,8 @@
 'use server'
 
 import { db } from '@/lib/db'
-import { requireAuth } from '@/lib/auth/server'
+import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { logActivity } from '@/lib/activity-log'
 import { OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 
 // ---------------------------------------------------------------------------
@@ -76,7 +77,7 @@ export async function getForecastSettings(): Promise<ForecastSettings> {
 }
 
 export async function saveForecastSettings(settings: ForecastSettings): Promise<void> {
-  await requireAuth()
+  await requirePermission('analytics')
   await db.$transaction([
     db.setting.upsert({
       where: { key: 'forecast_settings' },
@@ -90,6 +91,13 @@ export async function saveForecastSettings(settings: ForecastSettings): Promise<
       update: { value: String(settings.retentionMonths) },
     }),
   ])
+  await logActivity({
+    entityType: 'SETTING',
+    tag: 'analytics',
+    action: 'updated',
+    description: 'Updated forecast settings',
+    metadata: settings,
+  })
 }
 
 // ---------------------------------------------------------------------------
@@ -350,7 +358,7 @@ export async function generateForecasts(): Promise<ProductForecast[]> {
 export async function createReorderPOs(
   productIds: string[],
 ): Promise<{ success: boolean; poCount: number; error?: string }> {
-  await requireAuth()
+  await requirePermission('purchasing.create')
   try {
     const forecasts = await generateForecasts()
     const selected = forecasts.filter((f) => productIds.includes(f.productId) && f.supplierId)
@@ -413,6 +421,14 @@ export async function createReorderPOs(
       })
       poCount++
     }
+
+    await logActivity({
+      entityType: 'PURCHASE_ORDER',
+      tag: 'purchasing',
+      action: 'created',
+      description: `Auto-generated ${poCount} reorder PO(s) from forecast`,
+      metadata: { poCount, productIds },
+    })
 
     return { success: true, poCount }
   } catch (e) {

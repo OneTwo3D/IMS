@@ -4,6 +4,7 @@ import path from 'path'
 import sharp from 'sharp'
 import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 
 // MIME → extension. Only formats we trust sharp to safely decode and re-encode.
 const MIME_TO_EXT: Record<string, string> = {
@@ -70,6 +71,14 @@ export async function POST(req: NextRequest) {
 
   const pictureUrl = `/uploads/avatars/${filename}?t=${Date.now()}`
   await db.user.update({ where: { id: session.user.id }, data: { pictureUrl } })
+
+  await logActivity({
+    entityType: 'USER',
+    entityId: session.user.id,
+    tag: 'profile',
+    action: 'updated',
+    description: 'Updated profile avatar',
+  })
 
   return NextResponse.json({ pictureUrl })
 }

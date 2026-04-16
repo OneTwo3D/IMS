@@ -7,6 +7,7 @@
 import { NextRequest } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 import { generateSecret, generateURI, verify } from 'otplib'
 import QRCode from 'qrcode'
 import { z } from 'zod'
@@ -61,6 +62,14 @@ export async function POST(request: NextRequest) {
     },
   })
 
+  await logActivity({
+    entityType: 'USER',
+    entityId: session.user.id,
+    tag: 'auth',
+    action: 'updated',
+    description: 'Enabled two-factor authentication (TOTP)',
+  })
+
   return Response.json({ success: true })
 }
 
@@ -87,6 +96,14 @@ export async function DELETE(request: NextRequest) {
   await db.user.update({
     where: { id: session.user.id },
     data: { totpSecret: null, totpEnabled: false, pendingTotpSecret: null },
+  })
+
+  await logActivity({
+    entityType: 'USER',
+    entityId: session.user.id,
+    tag: 'auth',
+    action: 'updated',
+    description: 'Disabled two-factor authentication (TOTP)',
   })
 
   return Response.json({ success: true })

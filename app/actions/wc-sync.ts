@@ -192,13 +192,17 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     return { success: false, wipedMappings: 0, error: validatedUrl.error }
   }
 
+  const incomingKeyIsMasked = !!key && key.includes('*')
+  const currentKey = incomingKeyIsMasked
+    ? await getSettingValue('wc_consumer_key')
+    : key
   const incomingSecretIsMasked = !!secret && secret.includes('*')
   const currentSecret = incomingSecretIsMasked
     ? await getSettingValue('wc_consumer_secret')
     : secret
   const currencyValidation = await validateWooStoreBaseCurrency({
     url: validatedUrl.normalizedUrl,
-    key,
+    key: currentKey ?? '',
     secret: currentSecret ?? '',
   })
   if (!currencyValidation.ok) {
@@ -221,27 +225,29 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     const prevSecret = existingMap.get('wc_consumer_secret')
       ? decryptSecret(existingMap.get('wc_consumer_secret')!)
       : ''
+    const effectiveKey = incomingKeyIsMasked ? prevKey : key
     const effectiveSecret = incomingSecretIsMasked ? prevSecret : secret
 
     // "Rebind" = any of the three effective values actually differs from
     // what's already stored. A no-op save (operator opened the form and
     // clicked Save without touching fields) leaves everything equal and
-    // does NOT wipe the cache. The masked-secret passthrough is handled
-    // above so a re-save with the masked placeholder is NOT seen as a
-    // secret change.
+    // does NOT wipe the cache. The masked credential passthrough is handled
+    // above so a re-save with masked placeholders is NOT seen as a change.
     const isRebind =
-      validatedUrl.normalizedUrl !== prevUrl || key !== prevKey || effectiveSecret !== prevSecret
+      validatedUrl.normalizedUrl !== prevUrl || effectiveKey !== prevKey || effectiveSecret !== prevSecret
 
     await tx.setting.upsert({
       where: { key: 'wc_url' },
       create: { key: 'wc_url', value: validatedUrl.normalizedUrl },
       update: { value: validatedUrl.normalizedUrl },
     })
-    await tx.setting.upsert({
-      where: { key: 'wc_consumer_key' },
-      create: { key: 'wc_consumer_key', value: key },
-      update: { value: key },
-    })
+    if (key && !incomingKeyIsMasked) {
+      await tx.setting.upsert({
+        where: { key: 'wc_consumer_key' },
+        create: { key: 'wc_consumer_key', value: key },
+        update: { value: key },
+      })
+    }
     if (secret && !incomingSecretIsMasked) {
       await tx.setting.upsert({
         where: { key: 'wc_consumer_secret' },
@@ -343,11 +349,12 @@ export async function resetWcProductIdCache(): Promise<{ success: boolean; wiped
 export async function getWcCredentials(): Promise<{ url: string; key: string; secret: string; secretMasked: boolean }> {
   await requireAdmin()
   const map = await getSettingValues(['wc_url', 'wc_consumer_key', 'wc_consumer_secret'])
+  const key = map.get('wc_consumer_key') ?? ''
   const secret = map.get('wc_consumer_secret') ?? ''
   return {
     url: map.get('wc_url') ?? '',
-    key: map.get('wc_consumer_key') ?? '',
-    // Never send full secret to client — mask it
+    // Never send full credentials to client — mask them
+    key: key ? `${key.slice(0, 7)}${'*'.repeat(Math.max(0, key.length - 7))}` : '',
     secret: secret ? `${secret.slice(0, 7)}${'*'.repeat(Math.max(0, secret.length - 7))}` : '',
     secretMasked: !!secret,
   }

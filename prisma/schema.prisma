@@ -285,6 +285,7 @@ model Passkey {
 
   user                User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@index([userId])
   @@map("passkeys")
 }
 
@@ -297,6 +298,7 @@ model Session {
 
   user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
+  @@index([userId])
   @@map("sessions")
 }
 
@@ -831,6 +833,8 @@ model PurchaseOrderLine {
   invoiceLines    PurchaseInvoiceLine[]
   costLayers      CostLayer[]
 
+  @@index([poId])
+  @@index([productId])
   @@map("purchase_order_lines")
 }
 
@@ -907,6 +911,8 @@ model PurchaseReceiptLine {
   receipt     PurchaseReceipt   @relation(fields: [receiptId], references: [id])
   poLine      PurchaseOrderLine @relation(fields: [poLineId], references: [id])
 
+  @@index([receiptId])
+  @@index([poLineId])
   @@map("purchase_receipt_lines")
 }
 
@@ -936,6 +942,7 @@ model PurchaseInvoice {
   po              PurchaseOrder @relation(fields: [poId], references: [id])
   lines           PurchaseInvoiceLine[]
 
+  @@index([poId])
   @@map("purchase_invoices")
 }
 
@@ -954,6 +961,8 @@ model PurchaseInvoiceLine {
   poLine          PurchaseOrderLine? @relation(fields: [poLineId], references: [id])
   costLine        FreightCostLine?   @relation(fields: [costLineId], references: [id])
 
+  @@index([invoiceId])
+  @@index([poLineId])
   @@index([costLineId])
   @@map("purchase_invoice_lines")
 }
@@ -983,6 +992,8 @@ model PurchaseReturnLine {
   return      PurchaseReturn    @relation(fields: [returnId], references: [id])
   poLine      PurchaseOrderLine @relation(fields: [poLineId], references: [id])
 
+  @@index([returnId])
+  @@index([poLineId])
   @@map("purchase_return_lines")
 }
 
@@ -1121,6 +1132,8 @@ model SalesOrderLine {
   allocations     OrderAllocation[]
   shipmentLines   ShipmentLine[]
 
+  @@index([orderId])
+  @@index([productId])
   @@map("sales_order_lines")
 }
 
@@ -1143,6 +1156,7 @@ model SalesOrderRefund {
   payments        Payment[]
 
   @@unique([externalRefundId])
+  @@index([orderId])
   @@map("sales_order_refunds")
 }
 
@@ -1159,6 +1173,8 @@ model SalesOrderRefundLine {
   refund          SalesOrderRefund @relation(fields: [refundId], references: [id])
   product         Product?         @relation(fields: [productId], references: [id])
 
+  @@index([refundId])
+  @@index([productId])
   @@map("sales_order_refund_lines")
 }
 
@@ -1178,6 +1194,8 @@ model Payment {
   order           SalesOrder       @relation(fields: [orderId], references: [id])
   refund          SalesOrderRefund? @relation(fields: [refundId], references: [id])
 
+  @@index([orderId])
+  @@index([refundId])
   @@map("payments")
 }
 
@@ -1201,6 +1219,8 @@ model StockTransfer {
   toWarehouse     Warehouse           @relation("TransferTo", fields: [toWarehouseId], references: [id])
   lines           StockTransferLine[]
 
+  @@index([fromWarehouseId])
+  @@index([toWarehouseId])
   @@map("stock_transfers")
 }
 
@@ -1215,6 +1235,7 @@ model StockTransferLine {
 
   transfer    StockTransfer @relation(fields: [transferId], references: [id])
 
+  @@index([transferId])
   @@map("stock_transfer_lines")
 }
 
@@ -1232,6 +1253,7 @@ model StockCount {
   warehouse   Warehouse        @relation(fields: [warehouseId], references: [id])
   lines       StockCountLine[]
 
+  @@index([warehouseId])
   @@map("stock_counts")
 }
 
@@ -1247,6 +1269,8 @@ model StockCountLine {
 
   count           StockCount @relation(fields: [countId], references: [id])
 
+  @@index([countId])
+  @@index([productId])
   @@map("stock_count_lines")
 }
 
@@ -1282,6 +1306,9 @@ model BomItem {
   parentProduct Product @relation("BomParent", fields: [parentProductId], references: [id])
   component     Product @relation("BomComponent", fields: [componentProductId], references: [id])
 
+  @@index([bomId])
+  @@index([parentProductId])
+  @@index([componentProductId])
   @@map("bom_items")
 }
 
@@ -1311,6 +1338,9 @@ model KitItem {
   parentProduct   Product @relation("KitParent", fields: [parentProductId], references: [id])
   component       Product @relation("KitItemComponent", fields: [componentProductId], references: [id])
 
+  @@index([kitId])
+  @@index([parentProductId])
+  @@index([componentProductId])
   @@map("kit_items")
 }
 

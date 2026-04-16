@@ -1327,24 +1327,32 @@ export async function bulkDeleteProducts(
     select: { id: true, sku: true },
   })
 
+  // Batch all existence checks in parallel instead of per-product N+1
+  const [movementHits, orderLineHits, poLineHits, costLayerHits, returnLineHits, variantHits] = await Promise.all([
+    db.stockMovement.groupBy({ by: ['productId'], where: { productId: { in: ids } }, _count: true }),
+    db.salesOrderLine.groupBy({ by: ['productId'], where: { productId: { in: ids } }, _count: true }),
+    db.purchaseOrderLine.groupBy({ by: ['productId'], where: { productId: { in: ids } }, _count: true }),
+    db.costLayer.groupBy({ by: ['productId'], where: { productId: { in: ids } }, _count: true }),
+    db.salesOrderRefundLine.groupBy({ by: ['productId'], where: { productId: { in: ids } }, _count: true }),
+    db.product.groupBy({ by: ['parentId'], where: { parentId: { in: ids } }, _count: true }),
+  ])
+
+  const hasMovements = new Set(movementHits.map((r) => r.productId))
+  const hasOrderLines = new Set(orderLineHits.map((r) => r.productId))
+  const hasPoLines = new Set(poLineHits.map((r) => r.productId))
+  const hasCostLayers = new Set(costLayerHits.map((r) => r.productId))
+  const hasReturnLines = new Set(returnLineHits.map((r) => r.productId))
+  const hasVariants = new Set(variantHits.map((r) => r.parentId).filter(Boolean))
+
   let deleted = 0
   const skipped: { sku: string; reason: string }[] = []
 
   for (const product of products) {
-    const [movements, orderLines, poLines, costLayers, returnLines, variantCount] = await Promise.all([
-      db.stockMovement.count({ where: { productId: product.id } }),
-      db.salesOrderLine.count({ where: { productId: product.id } }),
-      db.purchaseOrderLine.count({ where: { productId: product.id } }),
-      db.costLayer.count({ where: { productId: product.id } }),
-      db.salesOrderRefundLine.count({ where: { productId: product.id } }),
-      db.product.count({ where: { parentId: product.id } }),
-    ])
-
-    if (variantCount > 0) {
+    if (hasVariants.has(product.id)) {
       skipped.push({ sku: product.sku, reason: 'has variants' })
       continue
     }
-    if (movements > 0 || orderLines > 0 || poLines > 0 || costLayers > 0 || returnLines > 0) {
+    if (hasMovements.has(product.id) || hasOrderLines.has(product.id) || hasPoLines.has(product.id) || hasCostLayers.has(product.id) || hasReturnLines.has(product.id)) {
       skipped.push({ sku: product.sku, reason: 'has activity' })
       continue
     }
