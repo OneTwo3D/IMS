@@ -109,7 +109,13 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
     if (!toRefund.length) { setError('Select at least one line'); return }
     if (!reason.trim()) { setError('Reason is required'); return }
     startTransition(async () => {
-      const result = await createRefund(order.id, toRefund.map((l) => ({ productId: l.productId, description: l.description, qty: l.qtyRefund, totalBase: l.refundAmount / (order.fxRateToBase || 1) })), reason, returnWhId || undefined)
+      const result = await createRefund(order.id, toRefund.map((l) => ({
+        lineId: l.id,
+        productId: l.productId,
+        description: l.description,
+        qty: l.qtyRefund,
+        totalBase: l.refundAmount / (order.fxRateToBase || 1),
+      })), reason, returnWhId || undefined)
       if (result.success) { router.refresh(); onClose() } else setError(result.error ?? 'Failed')
     })
   }
@@ -408,7 +414,11 @@ function AllocationPanel({
           <div className="divide-y">
             {allocs.map((a) => {
               const isEditing = editingId === a.id
-              const factor = requirementsByLine.get(a.lineId)?.find((row) => row.productId === a.productId)?.factor ?? 1
+              const lineRequirements = requirementsByLine.get(a.lineId) ?? []
+              const factor = lineRequirements.find((row) => row.productId === a.productId)?.factor ?? 1
+              const isComponentDrivenLine = lineRequirements.length !== 1
+                || lineRequirements[0]?.productId !== a.productId
+                || Math.abs((lineRequirements[0]?.factor ?? 1) - 1) > 0.000001
               const covered = factor > 0 ? a.qty / factor : 0
               return (
                 <div key={a.id} className="px-4 py-2.5 flex items-center gap-3">
@@ -441,7 +451,12 @@ function AllocationPanel({
                           <span> · Covers <span className="font-mono font-medium text-foreground">{covered}</span> / {a.lineQty}</span>
                         )}
                       </span>
-                      {['PROCESSING', 'ALLOCATED'].includes(status) && (
+                      {isComponentDrivenLine && (
+                        <span className="text-xs text-muted-foreground">
+                          Use Deallocate/Re-Allocate to rebalance bundle components
+                        </span>
+                      )}
+                      {['PROCESSING', 'ALLOCATED'].includes(status) && !isComponentDrivenLine && (
                         <button type="button" className="text-xs text-primary hover:underline" onClick={() => { setEditingId(a.id); setEditWhId(a.warehouseId); setEditQty(String(a.qty)) }}>
                           Change
                         </button>

@@ -7,10 +7,6 @@ import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
-import {
-  expandFulfillmentRequirements,
-  loadFulfillmentProductGraph,
-} from '@/lib/products/kit-fulfillment'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
@@ -43,6 +39,14 @@ type RefundReturnRow = {
   unitCostBase?: number
 }
 
+type RefundRequestLine = {
+  lineId?: string | null
+  productId: string | null
+  description: string
+  qty: number
+  totalBase: number
+}
+
 function aggregateRefundReturnRows(
   rows: RefundReturnRow[],
 ): RefundReturnRow[] {
@@ -62,18 +66,95 @@ function aggregateRefundReturnRows(
 }
 
 async function buildRefundFallbackReturnRows(
-  lines: Array<{ productId: string | null; qty: number }>,
+  orderId: string,
+  lines: RefundRequestLine[],
 ): Promise<RefundReturnRow[]> {
-  const productIds = lines.map((line) => line.productId).filter((value): value is string => !!value)
-  if (productIds.length === 0) return []
+  const order = await db.salesOrder.findUnique({
+    where: { id: orderId },
+    select: {
+      lines: {
+        select: {
+          id: true,
+          productId: true,
+          description: true,
+          qty: true,
+        },
+      },
+      allocations: {
+        select: {
+          lineId: true,
+          productId: true,
+          qty: true,
+        },
+      },
+      shipments: {
+        where: { status: { not: 'PENDING' } },
+        select: {
+          lines: {
+            select: {
+              lineId: true,
+              productId: true,
+              qty: true,
+            },
+          },
+        },
+      },
+    },
+  })
+  if (!order) return []
 
-  const graph = await loadFulfillmentProductGraph(db, productIds)
+  const lineById = new Map(order.lines.map((line) => [line.id, line]))
+  const lineCandidatesByProduct = new Map<string, typeof order.lines>()
+  for (const line of order.lines) {
+    if (!line.productId) continue
+    const existing = lineCandidatesByProduct.get(line.productId) ?? []
+    existing.push(line)
+    lineCandidatesByProduct.set(line.productId, existing)
+  }
+
+  const sourceRowsByLine = new Map<string, Map<string, number>>()
+  const addSourceQty = (lineId: string, productId: string, qty: number) => {
+    if (!Number.isFinite(qty) || qty <= 0) return
+    const byProduct = sourceRowsByLine.get(lineId) ?? new Map<string, number>()
+    byProduct.set(productId, (byProduct.get(productId) ?? 0) + qty)
+    sourceRowsByLine.set(lineId, byProduct)
+  }
+
+  for (const allocation of order.allocations) {
+    addSourceQty(allocation.lineId, allocation.productId, Number(allocation.qty))
+  }
+  for (const shipment of order.shipments) {
+    for (const line of shipment.lines) {
+      const existing = sourceRowsByLine.get(line.lineId)
+      if (existing && existing.size > 0) continue
+      addSourceQty(line.lineId, line.productId, Number(line.qty))
+    }
+  }
+
   return lines.flatMap((line) => {
     if (!line.productId || line.qty <= 0) return []
-    return [...expandFulfillmentRequirements(line.productId, line.qty, graph).entries()].map(([productId, qty]) => ({
-      productId,
-      qty,
-    }))
+
+    const sourceLine = line.lineId
+      ? lineById.get(line.lineId) ?? null
+      : (lineCandidatesByProduct.get(line.productId) ?? []).find((candidate) => candidate.description === line.description)
+        ?? (lineCandidatesByProduct.get(line.productId) ?? [])[0]
+        ?? null
+
+    if (!sourceLine) {
+      return [{ productId: line.productId, qty: line.qty }]
+    }
+
+    const sourceRows = sourceRowsByLine.get(sourceLine.id)
+    const sourceLineQty = Number(sourceLine.qty)
+    if (!sourceRows || sourceRows.size === 0 || !Number.isFinite(sourceLineQty) || sourceLineQty <= 0) {
+      return [{ productId: sourceLine.productId ?? line.productId, qty: line.qty }]
+    }
+
+    return [...sourceRows.entries()].flatMap(([productId, totalQty]) => {
+      const perUnitQty = totalQty / sourceLineQty
+      if (!Number.isFinite(perUnitQty) || perUnitQty <= 0) return []
+      return [{ productId, qty: perUnitQty * line.qty }]
+    })
   })
 }
 
@@ -1222,7 +1303,7 @@ export async function applySalesOrderStatusTransition(
 
 export async function createRefund(
   orderId: string,
-  lines: { productId: string | null; description: string; qty: number; totalBase: number }[],
+  lines: RefundRequestLine[],
   reason: string,
   returnWarehouseId?: string,
   options?: { internalBypassToken?: symbol; externalRefundId?: number },
@@ -1898,12 +1979,7 @@ export async function createRefund(
       const snapshotRows: RefundReturnRow[] = snapshotReturnRows ?? []
       const returnRows = snapshotRows.length > 0
         ? snapshotRows
-        : await buildRefundFallbackReturnRows(
-            refundLines.map((line) => ({
-              productId: line.productId,
-              qty: line.qty,
-            })),
-          )
+        : await buildRefundFallbackReturnRows(orderId, refundLines)
 
       const returnedProductIds = await applyRefundReturnStock(
         orderId,

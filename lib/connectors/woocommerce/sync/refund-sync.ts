@@ -45,7 +45,7 @@ export async function syncWcRefund(
     const hasQtyRefund = wcRefund.line_items.some((l) => Math.abs(l.quantity) > 0)
 
     // Map refund lines
-    const refundLines: { productId: string | null; description: string; qty: number; totalBase: number }[] = []
+    const refundLines: { lineId?: string; productId: string | null; description: string; qty: number; totalBase: number }[] = []
 
     if (wcRefund.line_items.length > 0 && hasQtyRefund) {
       // Line-item refund with quantities
@@ -59,6 +59,7 @@ export async function syncWcRefund(
         const refundGbp = Math.round((refundTotal / fxRate) * 10000) / 10000
 
         refundLines.push({
+          lineId: imsLine?.id,
           productId: imsLine?.productId ?? null,
           description: rl.name || imsLine?.description || 'Refund item',
           qty,

@@ -26,6 +26,7 @@ type ResolvedOrder = {
 }
 
 export async function resolveOrderForExternalFulfillment(
+  source: ExternalFulfillmentSource,
   lookup: ExternalFulfillmentLookup,
 ): Promise<ResolvedOrder | null> {
   if ('orderId' in lookup) {
@@ -36,17 +37,35 @@ export async function resolveOrderForExternalFulfillment(
   }
 
   if ('externalOrderId' in lookup) {
-    return db.salesOrder.findUnique({
-      where: { externalOrderId: lookup.externalOrderId },
-      select: { id: true, orderNumber: true, externalOrderNumber: true, status: true },
+    const link = await db.shoppingOrderLink.findUnique({
+      where: {
+        connector_externalOrderId: {
+          connector: source,
+          externalOrderId: String(lookup.externalOrderId),
+        },
+      },
+      select: {
+        order: {
+          select: { id: true, orderNumber: true, externalOrderNumber: true, status: true },
+        },
+      },
     })
+    return link?.order ?? null
   }
 
   if ('externalOrderNumber' in lookup) {
-    return db.salesOrder.findFirst({
-      where: { externalOrderNumber: lookup.externalOrderNumber },
-      select: { id: true, orderNumber: true, externalOrderNumber: true, status: true },
+    const link = await db.shoppingOrderLink.findFirst({
+      where: {
+        connector: source,
+        externalOrderNumber: lookup.externalOrderNumber,
+      },
+      select: {
+        order: {
+          select: { id: true, orderNumber: true, externalOrderNumber: true, status: true },
+        },
+      },
     })
+    return link?.order ?? null
   }
 
   return db.salesOrder.findFirst({
@@ -69,7 +88,7 @@ function statusesToApply(
 export async function applyExternalFulfillmentUpdate(
   update: ExternalFulfillmentUpdate,
 ): Promise<{ success: boolean; error?: string }> {
-  const order = await resolveOrderForExternalFulfillment(update.lookup)
+  const order = await resolveOrderForExternalFulfillment(update.source, update.lookup)
   if (!order) {
     return { success: false, error: 'Order not found for external fulfillment update' }
   }

@@ -9,6 +9,7 @@ import { requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 import {
+  calculateFulfillmentCoverage,
   calculateCoverageByLine,
   requirementsMapToRows,
   type FulfillmentRequirement,
@@ -21,6 +22,7 @@ import {
 } from '@/lib/products/kit-fulfillment'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
+const ALLOCATION_EPSILON = 0.000001
 
 async function lockSalesOrder(
   tx: Prisma.TransactionClient,
@@ -139,6 +141,122 @@ function mergeAllocationRows(
   }
 
   return [...merged.values()].filter((row) => row.qty > 0)
+}
+
+async function validateAllocationIntegrity(
+  client: Prisma.TransactionClient | typeof db,
+  orderId: string,
+  lineIds?: string[],
+): Promise<string | null> {
+  const lines = await client.salesOrderLine.findMany({
+    where: {
+      orderId,
+      productId: { not: null },
+      ...(lineIds?.length ? { id: { in: lineIds } } : {}),
+    },
+    select: {
+      id: true,
+      productId: true,
+      qty: true,
+      sku: true,
+      description: true,
+    },
+  })
+  if (lines.length === 0) return null
+
+  const graph = await loadFulfillmentProductGraph(
+    client,
+    lines.map((line) => line.productId!).filter(Boolean),
+  )
+  const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
+  for (const line of lines) {
+    requirementsByLine.set(
+      line.id,
+      requirementsMapToRows(expandFulfillmentRequirements(line.productId!, 1, graph)),
+    )
+  }
+
+  const [allocations, activeShipmentLines] = await Promise.all([
+    client.orderAllocation.findMany({
+      where: {
+        orderId,
+        ...(lineIds?.length ? { lineId: { in: lineIds } } : {}),
+      },
+      select: {
+        lineId: true,
+        productId: true,
+        warehouseId: true,
+        qty: true,
+      },
+    }),
+    client.shipmentLine.findMany({
+      where: {
+        shipment: { orderId, status: { not: 'PENDING' } },
+        ...(lineIds?.length ? { lineId: { in: lineIds } } : {}),
+      },
+      select: {
+        lineId: true,
+        productId: true,
+        qty: true,
+      },
+    }),
+  ])
+
+  const committedByLine = calculateCoverageByLine(
+    requirementsByLine,
+    activeShipmentLines.map((line) => ({
+      lineId: line.lineId,
+      productId: line.productId,
+      qty: Number(line.qty),
+    })),
+  )
+
+  for (const line of lines) {
+    const requirements = requirementsByLine.get(line.id) ?? []
+    if (requirements.length === 0) continue
+
+    const requiredProductIds = new Set(requirements.map((requirement) => requirement.productId))
+    const lineAllocations = allocations.filter((allocation) => allocation.lineId === line.id)
+    const byWarehouse = new Map<string, Map<string, number>>()
+
+    for (const allocation of lineAllocations) {
+      const quantities = byWarehouse.get(allocation.warehouseId) ?? new Map<string, number>()
+      quantities.set(allocation.productId, (quantities.get(allocation.productId) ?? 0) + Number(allocation.qty))
+      byWarehouse.set(allocation.warehouseId, quantities)
+    }
+
+    let allocatedCoverage = 0
+    for (const [warehouseId, quantities] of byWarehouse) {
+      const coverage = calculateFulfillmentCoverage(requirements, quantities)
+      if (coverage <= ALLOCATION_EPSILON) {
+        return `Allocation for sales line ${line.sku ?? line.description} in warehouse ${warehouseId} does not contain a complete component set`
+      }
+
+      for (const requirement of requirements) {
+        const actualQty = quantities.get(requirement.productId) ?? 0
+        const expectedQty = coverage * requirement.factor
+        if (Math.abs(actualQty - expectedQty) > ALLOCATION_EPSILON) {
+          return `Allocation for sales line ${line.sku ?? line.description} in warehouse ${warehouseId} must keep bundle components in matching quantities`
+        }
+      }
+
+      for (const productId of quantities.keys()) {
+        if (!requiredProductIds.has(productId)) {
+          return `Allocation for sales line ${line.sku ?? line.description} contains an unexpected component`
+        }
+      }
+
+      allocatedCoverage += coverage
+    }
+
+    const committedCoverage = committedByLine.get(line.id) ?? 0
+    const remainingQty = Math.max(0, Number(line.qty) - committedCoverage)
+    if (allocatedCoverage - remainingQty > ALLOCATION_EPSILON) {
+      return `Allocation for sales line ${line.sku ?? line.description} exceeds the remaining quantity to fulfill`
+    }
+  }
+
+  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -539,8 +657,7 @@ export async function updateAllocation(
     if (!alloc) return { success: false, error: 'Allocation not found' }
     if (newQty < 0) return { success: false, error: 'Quantity cannot be negative' }
 
-    // Check available stock in new warehouse
-    const availabilityError = await db.$transaction(async (tx) => {
+    await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, alloc.orderId)
       await lockStockLevels(tx, [alloc.productId], Array.from(new Set([alloc.warehouseId, newWarehouseId])))
 
@@ -553,7 +670,7 @@ export async function updateAllocation(
         + (alloc.warehouseId === newWarehouseId ? Number(alloc.qty) : 0)
 
       if (newQty > effectiveAvailable) {
-        return `Only ${effectiveAvailable} available in this warehouse`
+        throw new Error(`Only ${effectiveAvailable} available in this warehouse`)
       }
 
       await applyAllocationReservationDelta(tx, [{
@@ -594,9 +711,10 @@ export async function updateAllocation(
           qty: newQty,
         }], 'reserve')
       }
-      return null
+
+      const integrityError = await validateAllocationIntegrity(tx, alloc.orderId, [alloc.lineId])
+      if (integrityError) throw new Error(integrityError)
     }, STOCK_TX_OPTIONS)
-    if (availabilityError) return { success: false, error: availabilityError }
 
     revalidatePath(`/sales/${alloc.orderId}`)
     await logActivity({
@@ -615,7 +733,8 @@ export async function updateAllocation(
     }
     return { success: true }
   } catch (e) {
-    return { success: false, error: String(e) }
+    const message = e instanceof Error ? e.message : String(e)
+    return { success: false, error: message }
   }
 }
 
@@ -634,7 +753,7 @@ export async function addAllocation(
     await requirePermission('sales.process')
     if (qty <= 0) return { success: false, error: 'Quantity must be positive' }
 
-    const availabilityError = await db.$transaction(async (tx) => {
+    await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
       const graph = await loadFulfillmentProductGraph(tx, [productId])
       const leafProductIds = listFulfillmentLeafProductIds([productId], graph)
@@ -646,7 +765,7 @@ export async function addAllocation(
       })
       const stockMap = buildAvailableStockMap(stockLevels)
       const avail = getFulfillmentAvailableQty(productId, warehouseId, graph, stockMap)
-      if (qty > avail) return `Only ${avail} available`
+      if (qty > avail) throw new Error(`Only ${avail} available`)
 
       for (const [leafProductId, requiredQty] of expandFulfillmentRequirements(productId, qty, graph)) {
         const existing = await tx.orderAllocation.findUnique({
@@ -680,9 +799,10 @@ export async function addAllocation(
         })),
         'reserve',
       )
-      return null
+
+      const integrityError = await validateAllocationIntegrity(tx, orderId, [lineId])
+      if (integrityError) throw new Error(integrityError)
     }, STOCK_TX_OPTIONS)
-    if (availabilityError) return { success: false, error: availabilityError }
 
     revalidatePath(`/sales/${orderId}`)
     try {
@@ -694,7 +814,8 @@ export async function addAllocation(
     }
     return { success: true }
   } catch (e) {
-    return { success: false, error: String(e) }
+    const message = e instanceof Error ? e.message : String(e)
+    return { success: false, error: message }
   }
 }
 
@@ -824,6 +945,11 @@ export async function confirmAllocations(
 
     if (!effectiveAllocs.length) {
       return { success: false, error: 'All allocated lines are already covered by active shipments' }
+    }
+
+    const integrityError = await validateAllocationIntegrity(db, orderId)
+    if (integrityError) {
+      return { success: false, error: integrityError }
     }
 
     // Delete existing pending shipments (re-confirm scenario)

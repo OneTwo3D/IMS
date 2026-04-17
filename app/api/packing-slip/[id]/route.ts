@@ -12,6 +12,7 @@ import {
   pdfToBuffer,
   type PdfTableColumn,
 } from '@/lib/pdf'
+import { expandFulfillmentRequirements, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const session = await auth()
@@ -31,6 +32,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       createdAt: true,
       lines: {
         select: {
+          productId: true,
           sku: true,
           description: true,
           qty: true,
@@ -114,15 +116,49 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
       drawTable(doc, columns, rows, branding)
     }
   } else {
-    // Legacy flow (no shipments): use order lines directly
-    const rows = so.lines.map((line, i) => [
-      String(i + 1),
-      line.product?.sku ?? line.sku ?? '',
-      line.product?.name ?? line.description,
-      '',
-      String(Number(line.qty)),
-      '\u2610',
-    ])
+    const productIds = so.lines.map((line) => line.productId).filter((value): value is string => !!value)
+    const graph = await loadFulfillmentProductGraph(db, productIds)
+    type PackingSlipRow = { productId?: string; sku: string; name: string; qty: number }
+
+    const expandedRows: PackingSlipRow[] = so.lines.flatMap((line) => {
+      if (!line.productId) {
+        return [{
+          sku: line.product?.sku ?? line.sku ?? '',
+          name: line.product?.name ?? line.description,
+          qty: Number(line.qty),
+        }]
+      }
+
+      return [...expandFulfillmentRequirements(line.productId, Number(line.qty), graph).entries()].map(([productId, qty]) => ({
+        sku: '',
+        name: line.description,
+        productId,
+        qty,
+      }))
+    })
+
+    const leafProductIds = expandedRows
+      .map((row) => row.productId ?? null)
+      .filter((value): value is string => !!value)
+    const leafProducts = leafProductIds.length > 0
+      ? await db.product.findMany({
+          where: { id: { in: [...new Set(leafProductIds)] } },
+          select: { id: true, sku: true, name: true },
+        })
+      : []
+    const leafProductById = new Map(leafProducts.map((product) => [product.id, product]))
+
+    const rows = expandedRows.map((row, i) => {
+      const product = row.productId ? leafProductById.get(row.productId) : null
+      return [
+        String(i + 1),
+        product?.sku ?? row.sku,
+        product?.name ?? row.name,
+        '',
+        String(row.qty),
+        '\u2610',
+      ]
+    })
 
     drawTable(doc, columns, rows, branding)
   }
