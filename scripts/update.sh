@@ -182,15 +182,19 @@ if ! $SKIP_BUILD; then
     grep -v "^npm warn" || true
   success "Dependencies updated."
 
-  header "Generating Prisma client"
-
-  run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" \
-    npx prisma generate --schema "${APP_DIR}/prisma/schema.prisma"
-  success "Prisma client generated."
 fi
 
 # ---------------------------------------------------------------------------
-# 4. Run database migrations
+# 4. Generate Prisma client
+# ---------------------------------------------------------------------------
+header "Generating Prisma client"
+
+run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" \
+  npx prisma generate --schema "${APP_DIR}/prisma/schema.prisma"
+success "Prisma client generated."
+
+# ---------------------------------------------------------------------------
+# 5. Run database migrations
 # ---------------------------------------------------------------------------
 header "Running database migrations"
 
@@ -206,7 +210,7 @@ run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" \
 success "Database schema matches prisma/schema.prisma."
 
 # ---------------------------------------------------------------------------
-# 5. Build
+# 6. Build
 # ---------------------------------------------------------------------------
 if ! $SKIP_BUILD; then
   header "Building Next.js application"
@@ -216,7 +220,7 @@ if ! $SKIP_BUILD; then
 fi
 
 # ---------------------------------------------------------------------------
-# 6. Restart processes
+# 7. Restart processes
 # ---------------------------------------------------------------------------
 header "Restarting application"
 

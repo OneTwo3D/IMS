@@ -278,6 +278,10 @@ type CandidateProduct = {
   }[]
 }
 
+function isVariationCandidate(product: Pick<CandidateProduct, 'parent'>): boolean {
+  return product.parent != null
+}
+
 type PushStockOptions = {
   productIds?: string[]
   forceProductIds?: string[]
@@ -619,13 +623,13 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // JSON serialization, Map keying, and comparison with the WC response.
   const effectiveTargets = new Map<string, EffectiveTarget>()
   for (const p of products) {
-    if (p.externalProductId != null && p.type !== 'VARIANT') {
+    if (p.externalProductId != null && !isVariationCandidate(p)) {
       effectiveTargets.set(p.id, { externalId: Number(p.externalProductId) })
     }
   }
 
   // -------- SKU resolution for uncached products --------
-  const needsResolution = products.filter((p) => p.externalProductId == null || p.type === 'VARIANT')
+  const needsResolution = products.filter((p) => p.externalProductId == null || isVariationCandidate(p))
   const unmatchedSkus: string[] = []
 
   // Set to `true` by any caller that observes a version bump and wants
@@ -897,7 +901,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     if (cogs !== undefined) {
       payload.cost_of_goods_sold = { values: [{ defined_value: cogs.toFixed(2) }] }
     }
-    if (product.type === 'VARIANT' && target.parentWcId != null) {
+    if (isVariationCandidate(product) && target.parentWcId != null) {
       const entry: VariantPushEntry = {
         productId: product.id,
         sku: product.sku,
@@ -1365,7 +1369,7 @@ async function preflightEffectiveTargets(
   for (const [productId, target] of effectiveTargets) {
     const product = productById.get(productId)
     if (!product) continue
-    if (product.type === 'VARIANT' && target.parentWcId != null) {
+    if (isVariationCandidate(product) && target.parentWcId != null) {
       variantEntries.push({ productId, externalId: target.externalId, parentWcId: target.parentWcId })
     } else {
       standardEntries.push({ productId, externalId: target.externalId })
@@ -1555,8 +1559,8 @@ async function resolveSkusInParallel(
   let totalAttempts = 0
   let failedAttempts = 0
 
-  const variants = products.filter((product) => product.type === 'VARIANT')
-  const standardProducts = products.filter((product) => product.type !== 'VARIANT')
+  const variants = products.filter((product) => isVariationCandidate(product))
+  const standardProducts = products.filter((product) => !isVariationCandidate(product))
 
   const variantGroups = new Map<string, CandidateProduct[]>()
   for (const product of variants) {

@@ -190,7 +190,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
         return (
           <>
             <span className="font-medium">{p.name}</span>
-            {p.type === 'VARIANT' && p.parentSku && (
+            {p.parentSku && (
               <span className="ml-1 text-xs text-muted-foreground">↳ {p.parentSku}</span>
             )}
             {p.type === 'VARIABLE' && p.variantCount > 0 && (

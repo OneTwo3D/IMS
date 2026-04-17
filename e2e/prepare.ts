@@ -1,4 +1,4 @@
-import 'dotenv/config'
+import { config as loadDotenv } from 'dotenv'
 import bcrypt from 'bcryptjs'
 import { PrismaPg } from '@prisma/adapter-pg'
 import { PrismaClient } from '../app/generated/prisma/client'
@@ -9,6 +9,9 @@ import {
   E2E_SUPPLIER_ID,
   E2E_SUPPLIER_PASSWORD,
 } from './test-data'
+
+loadDotenv({ path: '.env.local', override: false })
+loadDotenv({ path: '.env', override: false })
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! })
 const db = new PrismaClient({ adapter })

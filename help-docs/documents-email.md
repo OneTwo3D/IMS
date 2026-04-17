@@ -37,7 +37,7 @@ All PDF routes now correctly load and render the full set of template fields:
 |---|---|
 | Sales Order | Order confirmation for customers |
 | Invoice | Customer invoice with auto-generated number |
-| Packing Slip | Picking/packing checklist with SKU, product name, location, quantity, and a tick box per line. Available from the sales order detail page when shipments exist (PICKING status onwards). Groups items by shipment when an order has multiple shipments from different warehouses. |
+| Packing Slip | Picking/packing checklist with SKU, product name, location, quantity, and a tick box per line. Available from the sales order detail page. Groups items by shipment when an order has multiple shipments from different warehouses. If shipments have not yet been created, it falls back to the sales order lines. |
 | Credit Note | Generated from refunds |
 | Purchase Order | Includes product barcode/EAN column |
 | RFQ (Request for Quotation) | Purchase order without prices; includes barcode/EAN |

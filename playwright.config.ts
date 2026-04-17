@@ -5,7 +5,8 @@ loadDotenv({ path: '.env.local', override: false })
 loadDotenv({ path: '.env', override: false })
 
 const PORT = Number(process.env.E2E_PORT ?? 3001)
-const baseURL = process.env.E2E_BASE_URL ?? `http://127.0.0.1:${PORT}`
+const baseURL = process.env.E2E_BASE_URL ?? `http://localhost:${PORT}`
+const webServerURL = `${baseURL.replace(/\/$/, '')}/login`
 
 // Specs that mutate shared WooCommerce integration settings
 // (wc_url / wc_consumer_key / wc_stock_sync_enabled / warehouse sync
@@ -14,7 +15,7 @@ const baseURL = process.env.E2E_BASE_URL ?? `http://127.0.0.1:${PORT}`
 // `wc-isolated` project AFTER the main chromium project has fully
 // completed. Add new WC-setting-mutating specs here, not to the
 // main project.
-const ISOLATED_SPECS = /(?:stock-sync-drift|woocommerce|security-workflows)\.spec\.ts/
+const ISOLATED_SPECS = /(?:stock-sync-drift|woocommerce(?:-[\w-]+)?|security-workflows)\.spec\.ts/
 
 export default defineConfig({
   testDir: './e2e',
@@ -64,8 +65,8 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: `npm run db:seed:e2e && npm run dev -- --hostname 127.0.0.1 --port ${PORT}`,
-    url: baseURL,
+    command: `npm run db:seed:e2e && npm run dev -- --hostname 0.0.0.0 --port ${PORT}`,
+    url: webServerURL,
     reuseExistingServer: !process.env.CI,
     timeout: 120000,
     env: {

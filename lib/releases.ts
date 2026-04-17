@@ -12,6 +12,22 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '1.3.1',
+    date: '2026-04-17',
+    title: 'Bundle fulfillment hardening and help consolidation',
+    summary: 'Bundle and BOM handling now uses stronger fulfillment safeguards, mirrored help files are centralized, and duplicate component configurations are flagged before they proliferate.',
+    userMessage: 'Bundle and BOM workflows are safer: duplicate component setups are flagged, help content is unified, and stock/accounting behavior is documented more clearly.',
+    userHighlights: [
+      'Added warnings when a bundle or BOM matches the exact component makeup of an existing bundle or BOM.',
+      'Expanded bundle, BOM, shipment-only fulfillment, and refund guidance across the in-app help.',
+      'Unified mirrored help content so the app and repo share one maintained source of truth.',
+    ],
+    technicalHighlights: [
+      'Added component-signature matching for KIT/BOM configuration warnings and enforced barcode uniqueness in the database and product flows.',
+      'Added bundle fulfillment coverage and component-allocation migration work, plus live WC-to-Xero bundle refund E2E coverage.',
+    ],
+  },
+  {
     version: '1.3.0',
     date: '2026-04-16',
     title: 'Shopify integration setup and stock sync',

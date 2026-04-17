@@ -2,6 +2,8 @@
 
 Manufacturing orders let you assemble finished products from their components or disassemble products back into components. Only products configured as BOM (Bill of Materials) items with defined components can be used.
 
+BOM products can be either standalone SKUs or BOM child variants under a Variable parent. Manufacturing always runs against the BOM SKU itself, not the Variable parent.
+
 ## Manufacturing Order List
 
 The list view shows all manufacturing orders with search and filtering options:
@@ -14,7 +16,7 @@ The list view shows all manufacturing orders with search and filtering options:
 ## Creating a Manufacturing Order
 
 1. Click **New Manufacturing Order**
-2. **Search for a product** — only BOM-type products with components are shown
+2. **Search for a product** — only BOM-type products with components are shown, including BOM variants
 3. **Select a warehouse** where stock will be consumed from and produced into
 4. Choose the order type:
 

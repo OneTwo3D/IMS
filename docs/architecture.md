@@ -112,9 +112,17 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 | `SIMPLE` | Standalone product | Yes | No |
 | `VARIABLE` | Parent grouping for variants | No | No |
 | `VARIANT` | Child of a VARIABLE parent, own SKU | Yes | No |
-| `KIT` | Virtual bundle — components deducted on sale | Calculated | Yes |
-| `BOM` | Manufactured product — stock exists after production | Yes | Yes |
+| `KIT` | Virtual bundle — components deducted on sale; can also sit under a VARIABLE parent as a bundle variant | Calculated | Yes |
+| `BOM` | Manufactured product — stock exists after production; can also sit under a VARIABLE parent as a BOM variant | Yes | Yes |
 | `NON_INVENTORY` | Service or fee — not stock-tracked | No | No |
+
+Transform rules:
+
+- `VARIABLE` remains a pure parent and cannot be transformed through the standard editor.
+- `NON_INVENTORY` cannot be transformed through the standard editor.
+- `SIMPLE`, `VARIANT`, `KIT`, and `BOM` can be transformed only when the product has no attached stock or open operational records.
+- Blockers include stock on hand, reserved stock, open sales order lines, open purchase order lines, open production orders, and open transfer lines.
+- This prevents converting bundles or BOMs back to simple products while operational state is still attached.
 
 ### Key Models (30+)
 

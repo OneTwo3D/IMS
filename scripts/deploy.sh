@@ -53,7 +53,16 @@ cd "$APP_DIR"
 START_TS=$(date +%s)
 
 # ---------------------------------------------------------------------------
-# 1. Run database migrations
+# 1. Generate Prisma client
+# ---------------------------------------------------------------------------
+if ! $SKIP_MIGRATE; then
+  info "Generating Prisma client..."
+  npx prisma generate --schema prisma/schema.prisma
+  ok "Prisma client generated."
+fi
+
+# ---------------------------------------------------------------------------
+# 2. Run database migrations
 # ---------------------------------------------------------------------------
 if ! $SKIP_MIGRATE; then
   info "Applying Prisma migrations..."
@@ -66,7 +75,7 @@ if ! $SKIP_MIGRATE; then
 fi
 
 # ---------------------------------------------------------------------------
-# 2. Build
+# 3. Build
 # ---------------------------------------------------------------------------
 if ! $SKIP_BUILD; then
   info "Building Next.js app..."

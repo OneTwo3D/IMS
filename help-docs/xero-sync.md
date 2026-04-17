@@ -197,6 +197,10 @@ An order is split across two warehouses. Each shipment is processed independentl
 | Shipment 2 ships | Warehouse B portion | — |
 | Daily batch B | Remaining revenue + COGS | Remaining DR Unearned / CR Sales + DR COGS / CR Allocated |
 
+### Bundle / Kit note
+
+For Kit / Bundle sales, the accounting flow still follows the shipment rows. COGS is derived from the underlying component cost layers consumed by the shipment lines, and refunds reverse those component-level COGS entries when stock is returned.
+
 ## Refund Handling
 
 Refunds create a Xero credit note in all cases. Additional reversal journals depend on how far the order progressed through the sub-ledger:

@@ -11,6 +11,52 @@ Prepare the codebase for:
 
 This groundwork should leave WooCommerce and Xero functional during development, but the design target is the final generic model, not a legacy-preserving intermediate.
 
+## Future Plan Items
+
+### Mintsoft integration
+
+Add a future Mintsoft WMS connector as an optional integration plugin with no further core fulfillment rewiring required.
+
+Design target:
+
+- Mintsoft links to IMS sales orders by the WooCommerce order number / external order reference.
+- Mintsoft can poll and translate warehouse statuses such as awaiting picking, picking started, picked, packed, and despatched.
+- Mintsoft does not dispatch stock directly in bespoke connector code. Instead it calls the shared external-fulfillment entry point used by WooCommerce completion handling.
+- The core app remains shipment-first:
+  - sales orders are the commercial layer
+  - shipments are the fulfillment layer
+  - stock movement only happens from shipment lines
+- The legacy direct order-level shipping path is removed from the target design. External systems must drive shipment status, not order status.
+- When the Mintsoft plugin is disabled, none of the core fulfillment code needs to change.
+
+Current shared fulfillment contract:
+
+```ts
+type ExternalFulfillmentSource = 'woocommerce' | 'shopify' | 'mintsoft'
+type ExternalShipmentStatus = 'PENDING' | 'PICKING' | 'PACKED' | 'SHIPPED'
+
+type ExternalFulfillmentLookup =
+  | { orderId: string }
+  | { externalOrderId: number }
+  | { externalOrderNumber: string }
+  | { orderNumber: string }
+
+type ExternalFulfillmentUpdate = {
+  source: ExternalFulfillmentSource
+  lookup: ExternalFulfillmentLookup
+  targetShipmentStatus: ExternalShipmentStatus
+  tracking?: Array<{ trackingNumber: string; shippingService?: string | null }>
+}
+```
+
+Behavioral expectations for the Mintsoft plugin:
+
+- resolve the IMS order through the shared lookup rules rather than a Mintsoft-only link table
+- request shipment progression via `applyExternalFulfillmentUpdate(...)`
+- allow the shared layer to auto-allocate and create shipments if they do not exist yet
+- pass despatch tracking in the `tracking` payload instead of writing shipment rows directly
+- stay idempotent when the same warehouse status is received multiple times
+
 ## Constraints
 
 - The system is not live yet, so schema and internal variable breaks are acceptable if they move the codebase to the correct long-term shape.

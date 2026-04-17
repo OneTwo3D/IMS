@@ -27,7 +27,7 @@ export default async function SalesPage() {
   ])
 
   const stockable = products.filter(
-    (p) => !['VARIABLE', 'NON_INVENTORY', 'KIT'].includes(p.type),
+    (p) => !['VARIABLE', 'NON_INVENTORY'].includes(p.type),
   )
 
   return (

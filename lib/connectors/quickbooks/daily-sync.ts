@@ -24,6 +24,8 @@ import {
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
+import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
+import { expandFulfillmentRequirements, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
 type MutableLayer = {
   id: string
@@ -524,7 +526,7 @@ export async function runDailyBatchSync(): Promise<{
               productId: true,
               qty: true,
               line: {
-                select: { id: true, qty: true, totalBase: true },
+                select: { id: true, productId: true, qty: true, totalBase: true },
               },
             },
           },
@@ -535,7 +537,7 @@ export async function runDailyBatchSync(): Promise<{
               status: true,
               totalBase: true,
               unearnedRevenueAmount: true,
-              lines: { select: { totalBase: true } },
+              lines: { select: { id: true, productId: true, qty: true, totalBase: true } },
               shipments: {
                 select: {
                   id: true,
@@ -568,6 +570,7 @@ export async function runDailyBatchSync(): Promise<{
             id: true,
             orderId: true,
             lineId: true,
+            productId: true,
             warehouseId: true,
             costLayerSnapshot: true,
           },
@@ -601,6 +604,14 @@ export async function runDailyBatchSync(): Promise<{
         )),
       ))
       await lockCostLayers(tx, referencedCostLayerIds)
+      const graph = await loadFulfillmentProductGraph(
+        tx,
+        Array.from(new Set(
+          shipments.flatMap((shipment) => (
+            shipment.order.lines.map((line) => line.productId).filter((value): value is string => !!value)
+          )),
+        )),
+      )
 
       const allocationAvailability = new Map<string, CostLayerSnapshotEntry[]>()
       for (const allocation of orderAllocations) {
@@ -642,6 +653,15 @@ export async function runDailyBatchSync(): Promise<{
         const firstShipment = orderShipments[0]
         const deferredBase = Number(firstShipment.order.unearnedRevenueAmount ?? firstShipment.order.totalBase)
         const orderLineTotal = firstShipment.order.lines.reduce((sum, line) => sum + Number(line.totalBase), 0)
+        const requirementsByLine = new Map(
+          firstShipment.order.lines
+            .filter((line) => !!line.productId)
+            .map((line) => [
+              line.id,
+              requirementsMapToRows(expandFulfillmentRequirements(line.productId!, 1, graph)),
+            ]),
+        )
+        const orderLineById = new Map(firstShipment.order.lines.map((line) => [line.id, line]))
         const recognizedPreviously = firstShipment.order.shipments.reduce((sum, shipment) => (
           shipment.shipmentJournalDate ? sum + Number(shipment.revenueRecognizedAmount ?? 0) : sum
         ), 0)
@@ -650,11 +670,19 @@ export async function runDailyBatchSync(): Promise<{
 
         for (let index = 0; index < orderShipments.length; index++) {
           const shipment = orderShipments[index]
-          const shipmentLineValue = shipment.lines.reduce((sum, line) => {
-            const lineQty = Number(line.line.qty)
-            const shippedQty = Number(line.qty)
-            if (lineQty <= 0 || shippedQty <= 0) return sum
-            return sum + (Number(line.line.totalBase) * shippedQty) / lineQty
+          const shippedCoverageByLine = calculateCoverageByLine(
+            requirementsByLine,
+            shipment.lines.map((line) => ({
+              lineId: line.lineId,
+              productId: line.productId,
+              qty: Number(line.qty),
+            })),
+          )
+          const shipmentLineValue = [...shippedCoverageByLine.entries()].reduce((sum, [lineId, coveredQty]) => {
+            const line = orderLineById.get(lineId)
+            const lineQty = Number(line?.qty ?? 0)
+            if (!line || lineQty <= 0 || coveredQty <= 0) return sum
+            return sum + (Number(line.totalBase) * Math.min(coveredQty, lineQty)) / lineQty
           }, 0)
 
           let revenueProportion = orderLineTotal > 0
@@ -678,6 +706,7 @@ export async function runDailyBatchSync(): Promise<{
             const matchingAllocations = orderAllocations.filter((allocation) => (
               allocation.orderId === shipment.orderId
               && allocation.lineId === sl.lineId
+              && allocation.productId === sl.productId
               && allocation.warehouseId === shipment.warehouseId
             ))
 

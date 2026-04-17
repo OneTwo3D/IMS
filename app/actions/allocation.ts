@@ -8,6 +8,17 @@ import { auth } from '@/lib/auth'
 import { requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
+import {
+  calculateCoverageByLine,
+  requirementsMapToRows,
+  type FulfillmentRequirement,
+} from '@/lib/products/fulfillment-coverage'
+import {
+  expandFulfillmentRequirements,
+  getFulfillmentAvailableQty,
+  listFulfillmentLeafProductIds,
+  loadFulfillmentProductGraph,
+} from '@/lib/products/kit-fulfillment'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -43,6 +54,93 @@ async function requireAuth() {
   return session
 }
 
+function buildAvailableStockMap(
+  rows: Array<{ productId: string; warehouseId: string; quantity: unknown; reservedQty: unknown }>,
+): Map<string, Map<string, number>> {
+  const stockMap = new Map<string, Map<string, number>>()
+  for (const row of rows) {
+    let byWarehouse = stockMap.get(row.productId)
+    if (!byWarehouse) {
+      byWarehouse = new Map<string, number>()
+      stockMap.set(row.productId, byWarehouse)
+    }
+    byWarehouse.set(
+      row.warehouseId,
+      Math.max(0, Number(row.quantity) - Number(row.reservedQty)),
+    )
+  }
+  return stockMap
+}
+
+function cloneAvailableStockMap(
+  stockMap: Map<string, Map<string, number>>,
+): Map<string, Map<string, number>> {
+  const copy = new Map<string, Map<string, number>>()
+  for (const [productId, byWarehouse] of stockMap) {
+    copy.set(productId, new Map(byWarehouse))
+  }
+  return copy
+}
+
+function applyRequirementDeltaToAvailableMap(
+  stockMap: Map<string, Map<string, number>>,
+  requirements: Map<string, number>,
+  warehouseId: string,
+  direction: 'reserve' | 'release',
+) {
+  for (const [productId, qty] of requirements) {
+    const byWarehouse = stockMap.get(productId) ?? new Map<string, number>()
+    const current = byWarehouse.get(warehouseId) ?? 0
+    byWarehouse.set(
+      warehouseId,
+      direction === 'reserve' ? current - qty : current + qty,
+    )
+    stockMap.set(productId, byWarehouse)
+  }
+}
+
+async function applyAllocationReservationDelta(
+  tx: Prisma.TransactionClient,
+  rows: Array<{ productId: string; warehouseId: string; qty: number }>,
+  direction: 'reserve' | 'release',
+) {
+  for (const row of rows) {
+    const qty = Number(row.qty)
+    if (qty <= 0) continue
+    if (direction === 'reserve') {
+      await tx.stockLevel.upsert({
+        where: { productId_warehouseId: { productId: row.productId, warehouseId: row.warehouseId } },
+        create: { productId: row.productId, warehouseId: row.warehouseId, quantity: 0, reservedQty: qty },
+        update: { reservedQty: { increment: qty } },
+      })
+      continue
+    }
+
+    await tx.stockLevel.updateMany({
+      where: { productId: row.productId, warehouseId: row.warehouseId },
+      data: { reservedQty: { decrement: qty } },
+    })
+  }
+}
+
+function mergeAllocationRows(
+  rows: Array<{ lineId: string; productId: string; warehouseId: string; qty: number }>,
+): Array<{ lineId: string; productId: string; warehouseId: string; qty: number }> {
+  const merged = new Map<string, { lineId: string; productId: string; warehouseId: string; qty: number }>()
+
+  for (const row of rows) {
+    const key = `${row.lineId}|${row.warehouseId}|${row.productId}`
+    const existing = merged.get(key)
+    if (existing) {
+      existing.qty += row.qty
+      continue
+    }
+    merged.set(key, { ...row })
+  }
+
+  return [...merged.values()].filter((row) => row.qty > 0)
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -51,6 +149,8 @@ export type AllocationRow = {
   id: string
   lineId: string
   productId: string
+  lineSku: string | null
+  lineDescription: string
   warehouseId: string
   warehouseCode: string
   warehouseName: string
@@ -74,11 +174,18 @@ export type ShipmentRow = {
     id: string
     lineId: string
     productId: string
+    lineSku: string | null
+    lineDescription: string
     qty: number
     productSku: string
     productName: string
     imageUrl: string | null
   }[]
+}
+
+export type FulfillmentRequirementRow = {
+  lineId: string
+  requirements: FulfillmentRequirement[]
 }
 
 // ---------------------------------------------------------------------------
@@ -92,7 +199,7 @@ export async function getOrderAllocations(orderId: string): Promise<AllocationRo
     include: {
       warehouse: { select: { code: true, name: true } },
       product: { select: { sku: true, name: true, imageUrl: true, parent: { select: { imageUrl: true } } } },
-      line: { select: { qty: true } },
+      line: { select: { qty: true, sku: true, description: true } },
     },
     orderBy: [{ warehouseId: 'asc' }, { createdAt: 'asc' }],
   })
@@ -100,6 +207,8 @@ export async function getOrderAllocations(orderId: string): Promise<AllocationRo
     id: r.id,
     lineId: r.lineId,
     productId: r.productId,
+    lineSku: r.line.sku,
+    lineDescription: r.line.description,
     warehouseId: r.warehouseId,
     warehouseCode: r.warehouse.code,
     warehouseName: r.warehouse.name,
@@ -124,6 +233,7 @@ export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]>
       lines: {
         include: {
           product: { select: { sku: true, name: true, imageUrl: true, parent: { select: { imageUrl: true } } } },
+          line: { select: { sku: true, description: true } },
         },
       },
     },
@@ -142,11 +252,36 @@ export async function getOrderShipments(orderId: string): Promise<ShipmentRow[]>
       id: l.id,
       lineId: l.lineId,
       productId: l.productId,
+      lineSku: l.line.sku,
+      lineDescription: l.line.description,
       qty: Number(l.qty),
       productSku: l.product.sku,
       productName: l.product.name,
       imageUrl: l.product.imageUrl ?? l.product.parent?.imageUrl ?? null,
     })),
+  }))
+}
+
+export async function getOrderFulfillmentRequirements(
+  orderId: string,
+): Promise<FulfillmentRequirementRow[]> {
+  await requireAuth()
+
+  const lines = await db.salesOrderLine.findMany({
+    where: { orderId, productId: { not: null } },
+    select: { id: true, productId: true },
+  })
+
+  const graph = await loadFulfillmentProductGraph(
+    db,
+    lines.map((line) => line.productId!).filter(Boolean),
+  )
+
+  return lines.map((line) => ({
+    lineId: line.id,
+    requirements: requirementsMapToRows(
+      expandFulfillmentRequirements(line.productId!, 1, graph),
+    ),
   }))
 }
 
@@ -205,32 +340,41 @@ export async function autoAllocateOrder(
     })
 
     const productIds = so.lines.filter((l) => l.productId).map((l) => l.productId!)
-    const allocations = await db.$transaction(async (tx) => {
+    const allocationResult = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
-      await lockStockLevels(tx, productIds, sorted.map((warehouse) => warehouse.id))
+      const graph = await loadFulfillmentProductGraph(tx, productIds)
+      const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
+      for (const line of so.lines) {
+        if (!line.productId) continue
+        requirementsByLine.set(
+          line.id,
+          requirementsMapToRows(expandFulfillmentRequirements(line.productId, 1, graph)),
+        )
+      }
+      const leafProductIds = listFulfillmentLeafProductIds(productIds, graph)
+      await lockStockLevels(tx, leafProductIds, sorted.map((warehouse) => warehouse.id))
 
       const stockLevels = await tx.stockLevel.findMany({
-        where: { productId: { in: productIds }, warehouseId: { in: sorted.map((w) => w.id) } },
+        where: { productId: { in: leafProductIds }, warehouseId: { in: sorted.map((w) => w.id) } },
         select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
       })
 
-      const stockMap = new Map<string, Map<string, number>>()
-      for (const sl of stockLevels) {
-        let prodMap = stockMap.get(sl.productId)
-        if (!prodMap) { prodMap = new Map(); stockMap.set(sl.productId, prodMap) }
-        prodMap.set(sl.warehouseId, Math.max(0, Number(sl.quantity) - Number(sl.reservedQty)))
-      }
+      const stockMap = buildAvailableStockMap(stockLevels)
 
       const activeShipmentLines = await tx.shipmentLine.findMany({
         where: {
           shipment: { orderId, status: { not: 'PENDING' } },
         },
-        select: { lineId: true, qty: true },
+        select: { lineId: true, productId: true, qty: true },
       })
-      const committedByLine = new Map<string, number>()
-      for (const sl of activeShipmentLines) {
-        committedByLine.set(sl.lineId, (committedByLine.get(sl.lineId) ?? 0) + Number(sl.qty))
-      }
+      const committedByLine = calculateCoverageByLine(
+        requirementsByLine,
+        activeShipmentLines.map((line) => ({
+          lineId: line.lineId,
+          productId: line.productId,
+          qty: Number(line.qty),
+        })),
+      )
 
       const lines = so.lines.filter((l) => l.productId).map((l) => {
         const committed = committedByLine.get(l.id) ?? 0
@@ -246,7 +390,7 @@ export async function autoAllocateOrder(
       for (const line of lines) {
         const options: string[] = []
         for (const wh of sorted) {
-          const avail = stockMap.get(line.productId)?.get(wh.id) ?? 0
+          const avail = getFulfillmentAvailableQty(line.productId, wh.id, graph, stockMap)
           if (avail >= line.qty) options.push(wh.id)
         }
         lineOptions.set(line.id, options)
@@ -257,13 +401,8 @@ export async function autoAllocateOrder(
         if (options.length === 1) forcedWarehouses.add(options[0])
       }
 
-      const nextAllocations: { lineId: string; productId: string; warehouseId: string; qty: number }[] = []
-      const tempStock = new Map<string, Map<string, number>>()
-      for (const [pid, whMap] of stockMap) {
-        const copy = new Map<string, number>()
-        for (const [wid, q] of whMap) copy.set(wid, q)
-        tempStock.set(pid, copy)
-      }
+      const nextAllocationRows: Array<{ lineId: string; productId: string; warehouseId: string; qty: number }> = []
+      const tempStock = cloneAvailableStockMap(stockMap)
 
       for (const line of lines) {
         const options = lineOptions.get(line.id) ?? []
@@ -276,12 +415,13 @@ export async function autoAllocateOrder(
         }
 
         if (bestWh) {
-          const avail = tempStock.get(line.productId)?.get(bestWh) ?? 0
+          const avail = getFulfillmentAvailableQty(line.productId, bestWh, graph, tempStock)
           const allocQty = Math.min(remaining, avail)
           if (allocQty > 0) {
-            nextAllocations.push({ lineId: line.id, productId: line.productId, warehouseId: bestWh, qty: allocQty })
-            const prodMap = tempStock.get(line.productId)!
-            prodMap.set(bestWh, avail - allocQty)
+            for (const [productId, qty] of expandFulfillmentRequirements(line.productId, allocQty, graph)) {
+              nextAllocationRows.push({ lineId: line.id, productId, warehouseId: bestWh, qty })
+            }
+            applyRequirementDeltaToAvailableMap(tempStock, expandFulfillmentRequirements(line.productId, allocQty, graph), bestWh, 'reserve')
             remaining -= allocQty
           }
         }
@@ -290,27 +430,32 @@ export async function autoAllocateOrder(
           for (const wh of sorted) {
             if (remaining <= 0) break
             if (bestWh && wh.id === bestWh) continue
-            const avail = tempStock.get(line.productId)?.get(wh.id) ?? 0
+            const avail = getFulfillmentAvailableQty(line.productId, wh.id, graph, tempStock)
             if (avail <= 0) continue
             const allocQty = Math.min(remaining, avail)
-            nextAllocations.push({ lineId: line.id, productId: line.productId, warehouseId: wh.id, qty: allocQty })
-            const prodMap = tempStock.get(line.productId)!
-            prodMap.set(wh.id, avail - allocQty)
+            for (const [productId, qty] of expandFulfillmentRequirements(line.productId, allocQty, graph)) {
+              nextAllocationRows.push({ lineId: line.id, productId, warehouseId: wh.id, qty })
+            }
+            applyRequirementDeltaToAvailableMap(tempStock, expandFulfillmentRequirements(line.productId, allocQty, graph), wh.id, 'reserve')
             remaining -= allocQty
           }
         }
       }
 
+      const nextAllocations = mergeAllocationRows(nextAllocationRows)
       const existingAllocs = await tx.orderAllocation.findMany({
         where: { orderId },
-        select: { productId: true, warehouseId: true, qty: true },
+        select: { lineId: true, productId: true, warehouseId: true, qty: true },
       })
-      for (const alloc of existingAllocs) {
-        await tx.stockLevel.updateMany({
-          where: { productId: alloc.productId, warehouseId: alloc.warehouseId },
-          data: { reservedQty: { decrement: Number(alloc.qty) } },
-        })
-      }
+      await applyAllocationReservationDelta(
+        tx,
+        existingAllocs.map((alloc) => ({
+          productId: alloc.productId,
+          warehouseId: alloc.warehouseId,
+          qty: Number(alloc.qty),
+        })),
+        'release',
+      )
       await tx.orderAllocation.deleteMany({ where: { orderId } })
 
       for (const alloc of nextAllocations) {
@@ -323,17 +468,27 @@ export async function autoAllocateOrder(
             qty: alloc.qty,
           },
         })
-        await tx.stockLevel.upsert({
-          where: { productId_warehouseId: { productId: alloc.productId, warehouseId: alloc.warehouseId } },
-          create: { productId: alloc.productId, warehouseId: alloc.warehouseId, quantity: 0, reservedQty: alloc.qty },
-          update: { reservedQty: { increment: alloc.qty } },
-        })
       }
+      await applyAllocationReservationDelta(
+        tx,
+        nextAllocations.map((alloc) => ({
+          productId: alloc.productId,
+          warehouseId: alloc.warehouseId,
+          qty: alloc.qty,
+        })),
+        'reserve',
+      )
 
       if (nextAllocations.length > 0 && ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING'].includes(so.status)) {
         await tx.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
       }
-      return nextAllocations
+      return {
+        nextAllocations,
+        syncProductIds: [...new Set([
+          ...existingAllocs.map((alloc) => alloc.productId),
+          ...nextAllocations.map((alloc) => alloc.productId),
+        ])],
+      }
     }, STOCK_TX_OPTIONS)
 
     revalidatePath('/sales')
@@ -341,20 +496,20 @@ export async function autoAllocateOrder(
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
-      action: allocations.length > 0 ? 'allocated' : 'allocation_failed',
+      action: allocationResult.nextAllocations.length > 0 ? 'allocated' : 'allocation_failed',
       tag: 'sales',
-      level: allocations.length > 0 ? 'INFO' : 'WARNING',
-      description: allocations.length > 0
-        ? `Auto-allocated stock for order ${orderRef} — ${allocations.length} allocation(s)`
+      level: allocationResult.nextAllocations.length > 0 ? 'INFO' : 'WARNING',
+      description: allocationResult.nextAllocations.length > 0
+        ? `Auto-allocated stock for order ${orderRef} — ${allocationResult.nextAllocations.length} allocation(s)`
         : `No stock available to allocate for order ${orderRef}`,
-      metadata: { orderNumber: orderRef, isWcOrder, shipFromWarehouseId: so.shipFromWarehouseId, allocations: allocations.length },
+      metadata: { orderNumber: orderRef, isWcOrder, shipFromWarehouseId: so.shipFromWarehouseId, allocations: allocationResult.nextAllocations.length },
     })
-    if (allocations.length === 0) {
+    if (allocationResult.nextAllocations.length === 0) {
       return { success: false, error: 'No stock available for allocation' }
     }
     try {
       await enqueueStockSync(
-        [...new Set(allocations.map((alloc) => alloc.productId))],
+        allocationResult.syncProductIds,
         'IMS_CHANGE',
       )
     } catch (syncError) {
@@ -387,41 +542,57 @@ export async function updateAllocation(
     // Check available stock in new warehouse
     const availabilityError = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, alloc.orderId)
-      await lockStockLevels(
-        tx,
-        [alloc.productId],
-        Array.from(new Set([alloc.warehouseId, newWarehouseId])),
-      )
+      await lockStockLevels(tx, [alloc.productId], Array.from(new Set([alloc.warehouseId, newWarehouseId])))
 
-      if (newQty > 0) {
-        const sl = await tx.stockLevel.findUnique({
-          where: { productId_warehouseId: { productId: alloc.productId, warehouseId: newWarehouseId } },
-          select: { quantity: true, reservedQty: true },
-        })
-        const currentAvail = Math.max(0, Number(sl?.quantity ?? 0) - Number(sl?.reservedQty ?? 0))
-        const adjustment = (newWarehouseId === alloc.warehouseId) ? Number(alloc.qty) : 0
-        if (newQty > currentAvail + adjustment) {
-          return `Only ${currentAvail + adjustment} available in this warehouse`
-        }
+      const stockLevels = await tx.stockLevel.findMany({
+        where: { productId: alloc.productId, warehouseId: { in: Array.from(new Set([alloc.warehouseId, newWarehouseId])) } },
+        select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
+      })
+      const stockMap = buildAvailableStockMap(stockLevels).get(alloc.productId) ?? new Map<string, number>()
+      const effectiveAvailable = (stockMap.get(newWarehouseId) ?? 0)
+        + (alloc.warehouseId === newWarehouseId ? Number(alloc.qty) : 0)
+
+      if (newQty > effectiveAvailable) {
+        return `Only ${effectiveAvailable} available in this warehouse`
       }
 
-      await tx.stockLevel.updateMany({
-        where: { productId: alloc.productId, warehouseId: alloc.warehouseId },
-        data: { reservedQty: { decrement: Number(alloc.qty) } },
-      })
+      await applyAllocationReservationDelta(tx, [{
+        productId: alloc.productId,
+        warehouseId: alloc.warehouseId,
+        qty: Number(alloc.qty),
+      }], 'release')
 
       if (newQty === 0) {
         await tx.orderAllocation.delete({ where: { id: allocationId } })
       } else {
-        await tx.orderAllocation.update({
-          where: { id: allocationId },
-          data: { warehouseId: newWarehouseId, qty: newQty },
+        const mergeTarget = await tx.orderAllocation.findUnique({
+          where: {
+            lineId_warehouseId_productId: {
+              lineId: alloc.lineId,
+              warehouseId: newWarehouseId,
+              productId: alloc.productId,
+            },
+          },
         })
-        await tx.stockLevel.upsert({
-          where: { productId_warehouseId: { productId: alloc.productId, warehouseId: newWarehouseId } },
-          create: { productId: alloc.productId, warehouseId: newWarehouseId, quantity: 0, reservedQty: newQty },
-          update: { reservedQty: { increment: newQty } },
-        })
+
+        if (mergeTarget && mergeTarget.id !== allocationId) {
+          await tx.orderAllocation.update({
+            where: { id: mergeTarget.id },
+            data: { qty: Number(mergeTarget.qty) + newQty },
+          })
+          await tx.orderAllocation.delete({ where: { id: allocationId } })
+        } else {
+          await tx.orderAllocation.update({
+            where: { id: allocationId },
+            data: { warehouseId: newWarehouseId, qty: newQty },
+          })
+        }
+
+        await applyAllocationReservationDelta(tx, [{
+          productId: alloc.productId,
+          warehouseId: newWarehouseId,
+          qty: newQty,
+        }], 'reserve')
       }
       return null
     }, STOCK_TX_OPTIONS)
@@ -465,42 +636,59 @@ export async function addAllocation(
 
     const availabilityError = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
-      await lockStockLevels(tx, [productId], [warehouseId])
+      const graph = await loadFulfillmentProductGraph(tx, [productId])
+      const leafProductIds = listFulfillmentLeafProductIds([productId], graph)
+      await lockStockLevels(tx, leafProductIds, [warehouseId])
 
-      const sl = await tx.stockLevel.findUnique({
-        where: { productId_warehouseId: { productId, warehouseId } },
-        select: { quantity: true, reservedQty: true },
+      const stockLevels = await tx.stockLevel.findMany({
+        where: { productId: { in: leafProductIds }, warehouseId: { in: [warehouseId] } },
+        select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
       })
-      const avail = Math.max(0, Number(sl?.quantity ?? 0) - Number(sl?.reservedQty ?? 0))
+      const stockMap = buildAvailableStockMap(stockLevels)
+      const avail = getFulfillmentAvailableQty(productId, warehouseId, graph, stockMap)
       if (qty > avail) return `Only ${avail} available`
 
-      const existing = await tx.orderAllocation.findUnique({
-        where: { lineId_warehouseId: { lineId, warehouseId } },
-      })
+      for (const [leafProductId, requiredQty] of expandFulfillmentRequirements(productId, qty, graph)) {
+        const existing = await tx.orderAllocation.findUnique({
+          where: {
+            lineId_warehouseId_productId: {
+              lineId,
+              warehouseId,
+              productId: leafProductId,
+            },
+          },
+        })
 
-      if (existing) {
-        await tx.orderAllocation.update({
-          where: { id: existing.id },
-          data: { qty: Number(existing.qty) + qty },
-        })
-      } else {
-        await tx.orderAllocation.create({
-          data: { orderId, lineId, productId, warehouseId, qty },
-        })
+        if (existing) {
+          await tx.orderAllocation.update({
+            where: { id: existing.id },
+            data: { qty: Number(existing.qty) + requiredQty },
+          })
+        } else {
+          await tx.orderAllocation.create({
+            data: { orderId, lineId, productId: leafProductId, warehouseId, qty: requiredQty },
+          })
+        }
       }
 
-      await tx.stockLevel.upsert({
-        where: { productId_warehouseId: { productId, warehouseId } },
-        create: { productId, warehouseId, quantity: 0, reservedQty: qty },
-        update: { reservedQty: { increment: qty } },
-      })
+      await applyAllocationReservationDelta(
+        tx,
+        [...expandFulfillmentRequirements(productId, qty, graph).entries()].map(([leafProductId, requiredQty]) => ({
+          productId: leafProductId,
+          warehouseId,
+          qty: requiredQty,
+        })),
+        'reserve',
+      )
       return null
     }, STOCK_TX_OPTIONS)
     if (availabilityError) return { success: false, error: availabilityError }
 
     revalidatePath(`/sales/${orderId}`)
     try {
-      await enqueueStockSync([productId], 'IMS_CHANGE')
+      const graph = await loadFulfillmentProductGraph(db, [productId])
+      const syncTargets = [...new Set(listFulfillmentLeafProductIds([productId], graph))]
+      await enqueueStockSync(syncTargets, 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
     }
@@ -527,20 +715,24 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
       await lockSalesOrder(tx, orderId)
       const currentAllocs = await tx.orderAllocation.findMany({
         where: { orderId },
-        select: { productId: true, warehouseId: true, qty: true },
+        select: { lineId: true, productId: true, warehouseId: true, qty: true },
       })
+      const leafProductIds = [...new Set(currentAllocs.map((alloc) => alloc.productId))]
       await lockStockLevels(
         tx,
-        [...new Set(currentAllocs.map((alloc) => alloc.productId))],
+        leafProductIds,
         [...new Set(currentAllocs.map((alloc) => alloc.warehouseId))],
       )
 
-      for (const alloc of currentAllocs) {
-        await tx.stockLevel.updateMany({
-          where: { productId: alloc.productId, warehouseId: alloc.warehouseId },
-          data: { reservedQty: { decrement: Number(alloc.qty) } },
-        })
-      }
+      await applyAllocationReservationDelta(
+        tx,
+        currentAllocs.map((alloc) => ({
+          productId: alloc.productId,
+          warehouseId: alloc.warehouseId,
+          qty: Number(alloc.qty),
+        })),
+        'release',
+      )
       await tx.stockLevel.updateMany({
         where: { reservedQty: { lt: 0 } },
         data: { reservedQty: 0 },
@@ -571,10 +763,8 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
       metadata: { orderNumber: so.orderNumber ?? so.externalOrderNumber },
     })
     try {
-      await enqueueStockSync(
-        [...new Set(allocs.map((alloc) => alloc.productId))],
-        'IMS_CHANGE',
-      )
+      const syncTargets = [...new Set(allocs.map((alloc) => alloc.productId))]
+      await enqueueStockSync(syncTargets, 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
     }
@@ -614,27 +804,23 @@ export async function confirmAllocations(
       where: {
         shipment: { orderId, status: { not: 'PENDING' } },
       },
-      select: { lineId: true, qty: true },
+      select: { lineId: true, productId: true, shipment: { select: { warehouseId: true } }, qty: true },
     })
-    const committedByLine = new Map<string, number>()
-    for (const sl of activeShipmentLines) {
-      committedByLine.set(sl.lineId, (committedByLine.get(sl.lineId) ?? 0) + Number(sl.qty))
+    const committedByAllocationKey = new Map<string, number>()
+    for (const shipmentLine of activeShipmentLines) {
+      const key = `${shipmentLine.lineId}|${shipmentLine.shipment.warehouseId}|${shipmentLine.productId}`
+      committedByAllocationKey.set(
+        key,
+        (committedByAllocationKey.get(key) ?? 0) + Number(shipmentLine.qty),
+      )
     }
 
-    // Subtract already-committed qty per line, draining across allocation rows
-    // in order so that split allocations (e.g. [6,4] with 3 committed) become
-    // [3,4] rather than the incorrect [3,1] that per-row subtraction produces.
-    const remainingByLine = new Map<string, number>()
-    for (const [lineId, committed] of committedByLine) {
-      remainingByLine.set(lineId, committed)
-    }
-    const effectiveAllocs = allocs.map((a) => {
-      const remaining = remainingByLine.get(a.lineId) ?? 0
-      const allocQty = Number(a.qty)
-      const drain = Math.min(remaining, allocQty)
-      remainingByLine.set(a.lineId, remaining - drain)
-      return { ...a, qty: allocQty - drain }
-    }).filter((a) => a.qty > 0)
+    const effectiveAllocs = allocs.map((alloc) => {
+      const key = `${alloc.lineId}|${alloc.warehouseId}|${alloc.productId}`
+      const committed = committedByAllocationKey.get(key) ?? 0
+      const effectiveQty = Math.max(0, Number(alloc.qty) - committed)
+      return { ...alloc, qty: effectiveQty }
+    }).filter((alloc) => alloc.qty > 0)
 
     if (!effectiveAllocs.length) {
       return { success: false, error: 'All allocated lines are already covered by active shipments' }

@@ -6,4 +6,4 @@ This directory contains the user-facing help articles shown inside the applicati
 - Do not add architecture notes, deployment instructions, connector runbooks, or other internal/admin material here.
 - Internal and technical documentation belongs in `docs/`.
 
-The same user manuals may also exist in `docs/` so the repository keeps a git-only copy alongside internal reference material.
+The overlapping user manuals in `docs/` should be symlinks back to this directory so there is only one maintained copy of each article.

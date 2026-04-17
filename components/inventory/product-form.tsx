@@ -51,15 +51,16 @@ type Props = {
   inline?: boolean
 }
 
-// Variant type is only selectable when editing an existing variant.
-// New variants are created via the parent product's variant generator.
-const PRODUCT_TYPES_BASE = [
+const PRODUCT_TYPES = [
   { value: 'SIMPLE', label: 'Simple' },
   { value: 'VARIABLE', label: 'Variable (parent)' },
+  { value: 'VARIANT', label: 'Variant (child)' },
   { value: 'KIT', label: 'Kit / Bundle (virtual)' },
   { value: 'BOM', label: 'Bill of Materials (manufactured)' },
   { value: 'NON_INVENTORY', label: 'Non-Inventory (service / fee)' },
 ]
+
+const CHILD_PRODUCT_TYPES = new Set(['VARIANT', 'KIT', 'BOM'])
 
 export function ProductForm({ action, variableProducts, defaultValues, stockUnitOptions, onClose, title, inline }: Props) {
   const baseCurrency = useBaseCurrency()
@@ -93,10 +94,6 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
   function set<K extends keyof typeof fields>(key: K, value: (typeof fields)[K]) {
     setFields((prev) => ({ ...prev, [key]: value }))
   }
-
-  const typeOptions = fields.type === 'VARIANT'
-    ? [{ value: 'VARIANT', label: 'Variant (child)' }, ...PRODUCT_TYPES_BASE]
-    : PRODUCT_TYPES_BASE
 
   const e = state.errors ?? {}
 
@@ -153,10 +150,11 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
             value={fields.type}
             onChange={(ev) => set('type', ev.target.value)}
           >
-            {typeOptions.map((t) => (
+            {PRODUCT_TYPES.map((t) => (
               <option key={t.value} value={t.value}>{t.label}</option>
             ))}
           </Select>
+          {e.type && <p className="text-xs text-destructive">{e.type[0]}</p>}
         </div>
       </div>
 
@@ -186,8 +184,8 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
         />
       </div>
 
-      {/* Parent selector — only relevant when editing an existing VARIANT */}
-      {fields.type === 'VARIANT' && (
+      {/* Child selector — simple variants, bundle variants, and BOM variants live under a variable parent */}
+      {CHILD_PRODUCT_TYPES.has(fields.type) && (
         <div className="space-y-1.5">
           <Label htmlFor="parentId">Parent Product</Label>
           <Select
@@ -201,6 +199,12 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
               <option key={p.id} value={p.id}>{p.sku} — {p.name}</option>
             ))}
           </Select>
+          <p className="text-xs text-muted-foreground">
+            {fields.type === 'VARIANT'
+              ? 'Simple variants must stay attached to a variable parent.'
+              : 'Leave blank for a standalone product, or select a variable parent to make this a child variant.'}
+          </p>
+          {e.parentId && <p className="text-xs text-destructive">{e.parentId[0]}</p>}
         </div>
       )}
 

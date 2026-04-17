@@ -1,0 +1,147 @@
+import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
+import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
+
+export type ExternalFulfillmentSource = 'woocommerce' | 'shopify' | 'mintsoft'
+export type ExternalShipmentStatus = 'PENDING' | 'PICKING' | 'PACKED' | 'SHIPPED'
+
+export type ExternalFulfillmentLookup =
+  | { orderId: string }
+  | { externalOrderId: number }
+  | { externalOrderNumber: string }
+  | { orderNumber: string }
+
+export type ExternalFulfillmentUpdate = {
+  source: ExternalFulfillmentSource
+  lookup: ExternalFulfillmentLookup
+  targetShipmentStatus: ExternalShipmentStatus
+  tracking?: Array<{ trackingNumber: string; shippingService?: string | null }>
+}
+
+type ResolvedOrder = {
+  id: string
+  orderNumber: string | null
+  externalOrderNumber: string | null
+  status: string
+}
+
+export async function resolveOrderForExternalFulfillment(
+  lookup: ExternalFulfillmentLookup,
+): Promise<ResolvedOrder | null> {
+  if ('orderId' in lookup) {
+    return db.salesOrder.findUnique({
+      where: { id: lookup.orderId },
+      select: { id: true, orderNumber: true, externalOrderNumber: true, status: true },
+    })
+  }
+
+  if ('externalOrderId' in lookup) {
+    return db.salesOrder.findUnique({
+      where: { externalOrderId: lookup.externalOrderId },
+      select: { id: true, orderNumber: true, externalOrderNumber: true, status: true },
+    })
+  }
+
+  if ('externalOrderNumber' in lookup) {
+    return db.salesOrder.findFirst({
+      where: { externalOrderNumber: lookup.externalOrderNumber },
+      select: { id: true, orderNumber: true, externalOrderNumber: true, status: true },
+    })
+  }
+
+  return db.salesOrder.findFirst({
+    where: { orderNumber: lookup.orderNumber },
+    select: { id: true, orderNumber: true, externalOrderNumber: true, status: true },
+  })
+}
+
+function statusesToApply(
+  currentStatus: ExternalShipmentStatus,
+  targetStatus: ExternalShipmentStatus,
+): ExternalShipmentStatus[] {
+  const flow: ExternalShipmentStatus[] = ['PENDING', 'PICKING', 'PACKED', 'SHIPPED']
+  const start = flow.indexOf(currentStatus)
+  const end = flow.indexOf(targetStatus)
+  if (start === -1 || end === -1 || end <= start) return []
+  return flow.slice(start + 1, end + 1)
+}
+
+export async function applyExternalFulfillmentUpdate(
+  update: ExternalFulfillmentUpdate,
+): Promise<{ success: boolean; error?: string }> {
+  const order = await resolveOrderForExternalFulfillment(update.lookup)
+  if (!order) {
+    return { success: false, error: 'Order not found for external fulfillment update' }
+  }
+
+  const { autoAllocateOrder, confirmAllocations, updateShipmentStatus } = await import('@/app/actions/allocation')
+
+  const allocationCount = await db.orderAllocation.count({ where: { orderId: order.id } })
+  if (allocationCount === 0) {
+    const result = await autoAllocateOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
+    if (!result.success) {
+      return { success: false, error: result.error ?? 'Auto-allocation failed' }
+    }
+  }
+
+  const shipmentCount = await db.shipment.count({ where: { orderId: order.id } })
+  if (shipmentCount === 0) {
+    const result = await confirmAllocations(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
+    if (!result.success) {
+      return { success: false, error: result.error ?? 'Shipment creation failed' }
+    }
+  }
+
+  const shipments = await db.shipment.findMany({
+    where: { orderId: order.id, status: { not: update.targetShipmentStatus } },
+    select: { id: true, status: true },
+    orderBy: { createdAt: 'asc' },
+  })
+
+  for (let index = 0; index < shipments.length; index++) {
+    const shipment = shipments[index]
+    const transitions = statusesToApply(shipment.status as ExternalShipmentStatus, update.targetShipmentStatus)
+    const tracking = update.tracking?.[index] ?? update.tracking?.[0]
+
+    for (const target of transitions) {
+      const result = await updateShipmentStatus(
+        shipment.id,
+        target,
+        target === 'SHIPPED' && tracking
+          ? {
+              trackingNumber: tracking.trackingNumber,
+              shippingService: tracking.shippingService ?? undefined,
+            }
+          : undefined,
+        { internalBypassToken: INTERNAL_ACTION_BYPASS },
+      )
+
+      if (!result.success) {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: order.id,
+          action: 'external_fulfillment_failed',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `${update.source} fulfillment update failed at ${target} for order ${order.externalOrderNumber ?? order.orderNumber ?? order.id}`,
+          metadata: { source: update.source, shipmentId: shipment.id, target, error: result.error },
+          resolveUser: false,
+        })
+        return { success: false, error: result.error ?? `Failed to update shipment to ${target}` }
+      }
+    }
+  }
+
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: order.id,
+    action: 'external_fulfillment_applied',
+    tag: 'sync',
+    level: 'INFO',
+    description: `Applied ${update.source} fulfillment update to ${update.targetShipmentStatus} for order ${order.externalOrderNumber ?? order.orderNumber ?? order.id}`,
+    metadata: { source: update.source, targetShipmentStatus: update.targetShipmentStatus, shipmentsProcessed: shipments.length },
+    resolveUser: false,
+  })
+
+  return { success: true }
+}

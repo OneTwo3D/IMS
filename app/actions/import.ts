@@ -8,6 +8,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { deriveLegacyActiveFromLifecycleStatus, deriveLifecycleStatusFromLegacyActive } from '@/lib/products/lifecycle'
+import { validateProductStructureChange } from '@/lib/products/type-transforms'
 import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 
@@ -60,8 +61,16 @@ export async function importProductsCsv(formData: FormData): Promise<ImportResul
   }
 
   // Build parent lookup: sku → id
-  const allProducts = await db.product.findMany({ select: { id: true, sku: true } })
+  const allProducts = await db.product.findMany({ select: { id: true, sku: true, barcode: true } })
   const skuToId = new Map(allProducts.map((p) => [p.sku, p.id]))
+  const barcodeToId = new Map(
+    allProducts
+      .filter((product) => product.barcode)
+      .map((product) => [product.barcode as string, product.id]),
+  )
+  const productIdToBarcode = new Map(
+    allProducts.map((product) => [product.id, product.barcode ?? null]),
+  )
 
   // Track rows with components to process in second pass
   const componentRows: { lineNum: number; sku: string; components: string }[] = []
@@ -95,10 +104,10 @@ export async function importProductsCsv(formData: FormData): Promise<ImportResul
     // Resolve parent for VARIANTs
     const parentSku = row['parentSku']?.trim() || row['parentsku']?.trim() || null
     let parentId: string | null = null
-    if (type === 'VARIANT' && parentSku) {
+    if (parentSku) {
       parentId = skuToId.get(parentSku) ?? null
       if (!parentId) {
-        result.errors.push(`Row ${lineNum}: parent SKU "${parentSku}" not found — ensure VARIABLE parent is listed before its variants`)
+        result.errors.push(`Row ${lineNum}: parent SKU "${parentSku}" not found — ensure the VARIABLE parent is listed before its child products`)
         result.skipped++
         continue
       }
@@ -131,13 +140,73 @@ export async function importProductsCsv(formData: FormData): Promise<ImportResul
 
     try {
       const existing = skuToId.get(sku)
+      if (data.barcode) {
+        const barcodeOwner = barcodeToId.get(data.barcode)
+        if (barcodeOwner && barcodeOwner !== existing) {
+          result.errors.push(`Row ${lineNum} (${sku}): barcode "${data.barcode}" is already in use`)
+          result.skipped++
+          continue
+        }
+      }
+
       if (existing) {
-        await db.product.update({ where: { id: existing }, data })
+        const structureValidation = await validateProductStructureChange({
+          productId: existing,
+          type: data.type,
+          parentId: data.parentId,
+        })
+        if (!structureValidation.ok) {
+          result.errors.push(`Row ${lineNum} (${sku}): ${structureValidation.message}`)
+          result.skipped++
+          continue
+        }
+
+        await db.$transaction(async (tx) => {
+          await tx.product.update({
+            where: { id: existing },
+            data: {
+              ...data,
+              parentId: structureValidation.normalizedParentId,
+              ...(structureValidation.clearExternalMapping ? { externalProductId: null } : {}),
+            },
+          })
+          if (structureValidation.clearComponents) {
+            await tx.productComponent.deleteMany({ where: { productId: existing } })
+          }
+        })
+        const previousBarcode = productIdToBarcode.get(existing) ?? null
+        if (previousBarcode && previousBarcode !== data.barcode) {
+          barcodeToId.delete(previousBarcode)
+        }
+        if (data.barcode) {
+          barcodeToId.set(data.barcode, existing)
+        }
+        productIdToBarcode.set(existing, data.barcode)
         touchedProducts.push({ id: existing, lifecycleStatus })
         result.updated++
       } else {
-        const created = await db.product.create({ data: { sku, ...data } })
+        const structureValidation = await validateProductStructureChange({
+          type: data.type,
+          parentId: data.parentId,
+        })
+        if (!structureValidation.ok) {
+          result.errors.push(`Row ${lineNum} (${sku}): ${structureValidation.message}`)
+          result.skipped++
+          continue
+        }
+
+        const created = await db.product.create({
+          data: {
+            sku,
+            ...data,
+            parentId: structureValidation.normalizedParentId,
+          },
+        })
         skuToId.set(sku, created.id)
+        if (data.barcode) {
+          barcodeToId.set(data.barcode, created.id)
+        }
+        productIdToBarcode.set(created.id, data.barcode)
         touchedProducts.push({ id: created.id, lifecycleStatus })
         result.created++
       }

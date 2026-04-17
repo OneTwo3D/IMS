@@ -490,7 +490,7 @@ model Product {
   type            ProductType @default(SIMPLE)
   lifecycleStatus ProductLifecycleStatus @default(ACTIVE)
   parentId        String?     // set for VARIANT products
-  barcode         String?
+  barcode         String?     @unique
   hsCode          String?
   countryOfOrigin String?     // 2-letter ISO code
   weight          Decimal?    @db.Decimal(10, 4) // kg, for landed cost by weight
@@ -1718,7 +1718,7 @@ model OrderAllocation {
   product     Product        @relation(fields: [productId], references: [id])
   warehouse   Warehouse      @relation(fields: [warehouseId], references: [id])
 
-  @@unique([lineId, warehouseId])
+  @@unique([lineId, warehouseId, productId])
   @@index([orderId])
   @@map("order_allocations")
 }

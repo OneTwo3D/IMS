@@ -74,8 +74,8 @@ The sidebar organises the system into sections:
 | **Simple** | A standalone product with its own SKU and stock level. |
 | **Variable** | A parent product that holds shared details. It is not stocked directly -- its variants are. |
 | **Variant** | A child of a Variable product representing a specific option combination (e.g. size/colour). Tracked and sold individually. |
-| **Kit** | A bundle of existing products sold as one unit. Kit stock is calculated from its components -- no separate stock is held. |
-| **BOM** (Bill of Materials) | A product that is manufactured from components. Components are consumed and finished goods are produced via build orders. |
+| **Kit** | A bundle of existing products sold as one unit. Kit stock is calculated from its components -- no separate stock is held. Kits can be standalone SKUs or child variants under a Variable parent. |
+| **BOM** (Bill of Materials) | A product that is manufactured from components. Components are consumed and finished goods are produced via build orders. BOMs can be standalone SKUs or child variants under a Variable parent. |
 | **Non-Inventory** | A product tracked for sales and purchasing but not counted in stock (e.g. services, digital goods). |
 
 ### Warehouses

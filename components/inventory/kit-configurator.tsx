@@ -2,10 +2,16 @@
 
 import { useState, useRef, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
-import { Plus, Trash2, Save, Search, X } from 'lucide-react'
+import { Plus, Trash2, Save, Search, X, AlertTriangle } from 'lucide-react'
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { saveProductComponents, type ProductComponentRow } from '@/app/actions/products'
+import {
+  checkProductComponentDuplicates,
+  saveProductComponents,
+  type ProductComponentDuplicateMatch,
+  type ProductComponentRow,
+} from '@/app/actions/products'
 
 type SimpleProduct = { id: string; sku: string; name: string }
 
@@ -32,6 +38,7 @@ export function KitConfigurator({ productId, productType, initialComponents, all
   const [nextKey, setNextKey] = useState(initialComponents.length)
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState('')
+  const [duplicateWarnings, setDuplicateWarnings] = useState<ProductComponentDuplicateMatch[]>([])
 
   const isBom = productType === 'BOM'
   const options = allProducts.filter((p) => p.id !== productId)
@@ -50,17 +57,48 @@ export function KitConfigurator({ productId, productType, initialComponents, all
     setLines((prev) => prev.map((l) => (l.key === key ? { ...l, [field]: value } : l)))
   }
 
+  const validLines = lines.filter((line) => line.componentId && Number(line.qty) > 0)
+
+  useEffect(() => {
+    let cancelled = false
+    const timer = setTimeout(async () => {
+      if (validLines.length === 0) {
+        setDuplicateWarnings([])
+        return
+      }
+
+      try {
+        const result = await checkProductComponentDuplicates(
+          productId,
+          validLines.map((line) => ({ componentId: line.componentId, qty: line.qty })),
+        )
+        if (!cancelled) {
+          setDuplicateWarnings(result.matches)
+        }
+      } catch {
+        if (!cancelled) {
+          setDuplicateWarnings([])
+        }
+      }
+    }, 250)
+
+    return () => {
+      cancelled = true
+      clearTimeout(timer)
+    }
+  }, [productId, lines])
+
   async function handleSave() {
-    const valid = lines.filter((l) => l.componentId && Number(l.qty) > 0)
     setSaving(true)
     setMessage('')
     try {
       const result = await saveProductComponents(
         productId,
-        valid.map((l) => ({ componentId: l.componentId, qty: l.qty }))
+        validLines.map((line) => ({ componentId: line.componentId, qty: line.qty })),
       )
       setSaving(false)
       if (result.success) {
+        setDuplicateWarnings(result.warnings ?? [])
         setMessage('Saved.')
         router.refresh()
         setTimeout(() => setMessage(''), 2000)
@@ -81,6 +119,28 @@ export function KitConfigurator({ productId, productType, initialComponents, all
   return (
     <div className="space-y-3">
       <p className="text-xs text-muted-foreground">{hint}</p>
+
+      {duplicateWarnings.length > 0 && (
+        <Alert className="border-amber-200 bg-amber-50 text-amber-950 dark:border-amber-900 dark:bg-amber-950 dark:text-amber-100">
+          <AlertTriangle className="h-4 w-4 text-amber-700 dark:text-amber-300" />
+          <AlertTitle>Duplicate component configuration</AlertTitle>
+          <AlertDescription className="text-amber-900 dark:text-amber-200">
+            This {isBom ? 'BOM' : 'bundle'} has the same component list and quantities as:
+            <ul className="mt-2 list-disc pl-5">
+              {duplicateWarnings.map((match) => (
+                <li key={match.productId}>
+                  <span className="font-medium">{match.sku}</span>
+                  {' — '}
+                  {match.name}
+                  {' '}
+                  <span className="text-xs uppercase tracking-wide">({match.type})</span>
+                  {match.parentSku ? ` under ${match.parentSku}` : ''}
+                </li>
+              ))}
+            </ul>
+          </AlertDescription>
+        </Alert>
+      )}
 
       {lines.length === 0 && (
         <p className="text-sm text-muted-foreground italic">No components added yet.</p>

@@ -7,6 +7,10 @@ import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
+import {
+  expandFulfillmentRequirements,
+  loadFulfillmentProductGraph,
+} from '@/lib/products/kit-fulfillment'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
@@ -31,6 +35,110 @@ async function lockCostLayers(
   await tx.$queryRaw(
     Prisma.sql`SELECT id FROM "cost_layers" WHERE id IN (${Prisma.join(ids)}) FOR UPDATE`,
   )
+}
+
+type RefundReturnRow = {
+  productId: string
+  qty: number
+  unitCostBase?: number
+}
+
+function aggregateRefundReturnRows(
+  rows: RefundReturnRow[],
+): RefundReturnRow[] {
+  const aggregated = new Map<string, RefundReturnRow>()
+
+  for (const row of rows) {
+    if (!row.productId || !Number.isFinite(row.qty) || row.qty <= 0) continue
+    const existing = aggregated.get(row.productId)
+    if (existing) {
+      existing.qty += row.qty
+      continue
+    }
+    aggregated.set(row.productId, { ...row })
+  }
+
+  return [...aggregated.values()]
+}
+
+async function buildRefundFallbackReturnRows(
+  lines: Array<{ productId: string | null; qty: number }>,
+): Promise<RefundReturnRow[]> {
+  const productIds = lines.map((line) => line.productId).filter((value): value is string => !!value)
+  if (productIds.length === 0) return []
+
+  const graph = await loadFulfillmentProductGraph(db, productIds)
+  return lines.flatMap((line) => {
+    if (!line.productId || line.qty <= 0) return []
+    return [...expandFulfillmentRequirements(line.productId, line.qty, graph).entries()].map(([productId, qty]) => ({
+      productId,
+      qty,
+    }))
+  })
+}
+
+async function applyRefundReturnStock(
+  orderId: string,
+  orderRef: string,
+  warehouseId: string,
+  rows: RefundReturnRow[],
+): Promise<string[]> {
+  const aggregatedRows = aggregateRefundReturnRows(rows)
+  if (aggregatedRows.length === 0) return []
+
+  await db.$transaction(async (tx) => {
+    for (const row of aggregatedRows) {
+      await tx.stockMovement.create({
+        data: {
+          type: 'RETURN_INBOUND',
+          productId: row.productId,
+          toWarehouseId: warehouseId,
+          qty: row.qty,
+          note: 'Refund return',
+          referenceType: 'SalesOrder',
+          referenceId: orderId,
+        },
+      })
+      await tx.stockLevel.upsert({
+        where: { productId_warehouseId: { productId: row.productId, warehouseId } },
+        create: { productId: row.productId, warehouseId, quantity: row.qty, reservedQty: 0 },
+        update: { quantity: { increment: row.qty } },
+      })
+    }
+
+    for (const row of rows) {
+      if (!Number.isFinite(row.unitCostBase) || row.unitCostBase == null || row.qty <= 0) continue
+      await tx.costLayer.create({
+        data: {
+          productId: row.productId,
+          warehouseId,
+          receivedQty: row.qty,
+          remainingQty: row.qty,
+          unitCostBase: row.unitCostBase,
+        },
+      })
+    }
+  }, STOCK_TX_OPTIONS)
+
+  const returnedProducts = await db.product.findMany({
+    where: { id: { in: aggregatedRows.map((row) => row.productId) } },
+    select: { id: true, sku: true },
+  })
+  const skuByProductId = new Map(returnedProducts.map((product) => [product.id, product.sku]))
+
+  for (const row of aggregatedRows) {
+    await logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      entityId: row.productId,
+      action: 'return_inbound',
+      tag: 'stock',
+      level: 'INFO',
+      description: `Returned ${row.qty} units of SKU ${skuByProductId.get(row.productId) ?? row.productId} to warehouse ${warehouseId} for refund on order ${orderRef}`,
+      metadata: { productId: row.productId, qty: row.qty, orderNumber: orderRef, warehouseId },
+    })
+  }
+
+  return aggregatedRows.map((row) => row.productId)
 }
 
 // ---------------------------------------------------------------------------
@@ -847,27 +955,6 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
   }
 }
 
-/** Release reserved stock for all lines of an order */
-async function releaseReservedStock(orderId: string, warehouseId: string, lines: { productId: string | null; qty: unknown }[]) {
-  for (const line of lines) {
-    if (!line.productId) continue
-    const qty = Number(line.qty)
-    await db.stockLevel.updateMany({
-      where: { productId: line.productId, warehouseId },
-      data: { reservedQty: { decrement: qty } },
-    })
-  }
-  await logActivity({
-    entityType: 'STOCK_ADJUSTMENT',
-    entityId: orderId,
-    action: 'reservation_released',
-    tag: 'stock',
-    level: 'INFO',
-    description: `Released reserved stock for order ${orderId}`,
-    metadata: { orderId, warehouseId },
-  })
-}
-
 /**
  * Queue the accounting sales invoice for an existing SalesOrder. Used when a
  * draft order is finalised (DRAFT → PENDING_PAYMENT / PROCESSING / etc.) — the
@@ -1023,7 +1110,7 @@ export async function applySalesOrderStatusTransition(
       return { success: false, error: `Cannot transition from ${so.status} to ${targetStatus}` }
     }
 
-    // Guard: cannot start picking without allocations (legacy flow only)
+    // Guard: cannot start picking without allocations
     if (targetStatus === 'PICKING') {
       const allocCount = await db.orderAllocation.count({ where: { orderId: id } })
       if (allocCount === 0) {
@@ -1033,80 +1120,20 @@ export async function applySalesOrderStatusTransition(
 
     const data: Record<string, unknown> = { status: targetStatus }
     let orderUpdated = false
-    let releasedLegacyReservations = false
-    const dispatchLogs: Array<{ productId: string; sku: string | null; qty: number; warehouseId: string }> = []
 
-    // On SHIPPED: check if shipments exist (new flow) or use legacy single-warehouse flow
+    // On SHIPPED: orders must already have shipment rows, and all of them must
+    // be shipped through the shipment workflow.
     if (targetStatus === 'SHIPPED') {
       const shipmentCount = await db.shipment.count({ where: { orderId: id } })
-      if (shipmentCount > 0) {
-        // New multi-shipment flow — shipping is handled per-shipment via updateShipmentStatus
-        // This direct SHIPPED transition should only happen when all shipments are already shipped
-        const unshipped = await db.shipment.count({ where: { orderId: id, status: { not: 'SHIPPED' } } })
-        if (unshipped > 0) {
-          return { success: false, error: 'Ship individual shipments first — not all shipments are shipped yet' }
-        }
-        data.shippedAt = new Date()
-        if (extra?.trackingNumber) data.trackingNumber = extra.trackingNumber
-      } else {
-        // Legacy single-warehouse flow
-        const warehouseId = extra?.shipFromWarehouseId || so.shipFromWarehouseId
-        if (!warehouseId) return { success: false, error: 'A warehouse must be selected before shipping' }
-        data.shippedAt = new Date()
-        if (extra?.trackingNumber) data.trackingNumber = extra.trackingNumber
-        if (extra?.shipFromWarehouseId) data.shipFromWarehouseId = extra.shipFromWarehouseId
-
-        await db.$transaction(async (tx) => {
-          const allocs = await tx.orderAllocation.findMany({ where: { orderId: id } })
-          if (allocs.length > 0) {
-            for (const alloc of allocs) {
-              await tx.stockLevel.updateMany({
-                where: { productId: alloc.productId, warehouseId: alloc.warehouseId },
-                data: { reservedQty: { decrement: Number(alloc.qty) } },
-              })
-            }
-          } else if (so.shipFromWarehouseId) {
-            releasedLegacyReservations = true
-            for (const line of so.lines) {
-              if (!line.productId) continue
-              const qty = Number(line.qty)
-              await tx.stockLevel.updateMany({
-                where: { productId: line.productId, warehouseId },
-                data: { reservedQty: { decrement: qty } },
-              })
-            }
-          }
-
-          for (const line of so.lines) {
-            if (!line.productId) continue
-            const qty = Number(line.qty)
-            await tx.stockMovement.create({
-              data: {
-                type: 'SALE_DISPATCH',
-                productId: line.productId,
-                fromWarehouseId: warehouseId,
-                qty,
-                note: `Dispatched for order`,
-                referenceType: 'SalesOrder',
-                referenceId: id,
-              },
-            })
-            await tx.stockLevel.updateMany({
-              where: { productId: line.productId, warehouseId },
-              data: { quantity: { decrement: qty } },
-            })
-            dispatchLogs.push({
-              productId: line.productId,
-              sku: line.sku ?? null,
-              qty,
-              warehouseId,
-            })
-          }
-
-          await tx.salesOrder.update({ where: { id }, data })
-        }, STOCK_TX_OPTIONS)
-        orderUpdated = true
+      if (shipmentCount === 0) {
+        return { success: false, error: 'Shipments are required before an order can be marked as shipped' }
       }
+      const unshipped = await db.shipment.count({ where: { orderId: id, status: { not: 'SHIPPED' } } })
+      if (unshipped > 0) {
+        return { success: false, error: 'Ship individual shipments first — not all shipments are shipped yet' }
+      }
+      data.shippedAt = new Date()
+      if (extra?.trackingNumber) data.trackingNumber = extra.trackingNumber
     }
 
     if (targetStatus === 'CANCELLED' && so.status === 'SHIPPED') {
@@ -1152,29 +1179,6 @@ export async function applySalesOrderStatusTransition(
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${id}`)
-    if (releasedLegacyReservations) {
-      await logActivity({
-        entityType: 'STOCK_ADJUSTMENT',
-        entityId: id,
-        action: 'reservation_released',
-        tag: 'stock',
-        level: 'INFO',
-        description: `Released reserved stock for order ${id}`,
-        metadata: { orderId: id, warehouseId: extra?.shipFromWarehouseId || so.shipFromWarehouseId },
-      })
-    }
-    for (const entry of dispatchLogs) {
-      const orderRef = getSalesOrderReference(so)
-      await logActivity({
-        entityType: 'STOCK_ADJUSTMENT',
-        entityId: entry.productId,
-        action: 'dispatched',
-        tag: 'stock',
-        level: 'INFO',
-        description: `Dispatched ${entry.qty} units of SKU ${entry.sku ?? entry.productId} for order ${orderRef}`,
-        metadata: { sku: entry.sku, productId: entry.productId, qty: entry.qty, orderNumber: orderRef, warehouseId: entry.warehouseId },
-      })
-    }
     const statusOrderRef = getSalesOrderReference(so)
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -1196,14 +1200,6 @@ export async function applySalesOrderStatusTransition(
     if (targetStatus === 'SHIPPED') {
       try {
         await pushOrderDeliveryMetadata(id)
-      } catch (syncError) {
-        console.error(syncError)
-      }
-      try {
-        await enqueueStockSync(
-          so.lines.map((line) => line.productId).filter((value): value is string => !!value),
-          'IMS_CHANGE',
-        )
       } catch (syncError) {
         console.error(syncError)
       }
@@ -1316,39 +1312,6 @@ export async function createRefund(
       })
     }
 
-    // Return stock if warehouse specified
-    if (returnWarehouseId) {
-      const orderRef = getSalesOrderReference(so)
-      for (const l of refundLines) {
-        if (!l.productId) continue
-        await db.stockMovement.create({
-          data: {
-            type: 'RETURN_INBOUND',
-            productId: l.productId,
-            toWarehouseId: returnWarehouseId,
-            qty: l.qty,
-            note: `Refund return`,
-            referenceType: 'SalesOrder',
-            referenceId: orderId,
-          },
-        })
-        await db.stockLevel.upsert({
-          where: { productId_warehouseId: { productId: l.productId, warehouseId: returnWarehouseId } },
-          create: { productId: l.productId, warehouseId: returnWarehouseId, quantity: l.qty, reservedQty: 0 },
-          update: { quantity: { increment: l.qty } },
-        })
-        await logActivity({
-          entityType: 'STOCK_ADJUSTMENT',
-          entityId: l.productId,
-          action: 'return_inbound',
-          tag: 'stock',
-          level: 'INFO',
-          description: `Returned ${l.qty} units of ${l.description} to warehouse ${returnWarehouseId} for refund on order ${orderRef}`,
-          metadata: { productId: l.productId, qty: l.qty, orderNumber: orderRef, warehouseId: returnWarehouseId },
-        })
-      }
-    }
-
     // Update order status based on total refunded vs order total
     const totalRefundedNow = previouslyRefunded + totalBase
     const orderTotal = Number(so.totalBase)
@@ -1370,16 +1333,6 @@ export async function createRefund(
       description: `Created refund for order ${refundOrderRef} — £${totalBase.toFixed(2)}`,
       metadata: { orderNumber: refundOrderRef, totalBase, creditNoteNumber, reason },
     })
-    if (returnWarehouseId) {
-      try {
-        await enqueueStockSync(
-          refundLines.map((line) => line.productId).filter((value): value is string => !!value),
-          'IMS_CHANGE',
-        )
-      } catch (syncError) {
-        console.error(syncError)
-      }
-    }
 
     // Queue accounting credit note sync
     try {
@@ -1427,6 +1380,7 @@ export async function createRefund(
     // Scenario 2: revenueDeferredDate set, inventoryAllocatedDate NULL (backorder) → reverse unearned revenue only
     // Scenario 3: inventoryAllocatedDate set, no shipments journaled → reverse unearned revenue + inventory allocation
     // Scenario 4: shipments journaled → reverse COGS for shipped portion + unearned for unshipped portion
+    let snapshotReturnRows: RefundReturnRow[] | null = null
     try {
       const settings = await getAccountingSettings()
       const orderRef = getSalesOrderReference(so)
@@ -1523,6 +1477,13 @@ export async function createRefund(
             )),
           ]))
           await lockCostLayers(tx, referencedCostLayerIds)
+          const referencedCostLayers = referencedCostLayerIds.length > 0
+            ? await tx.costLayer.findMany({
+                where: { id: { in: referencedCostLayerIds } },
+                select: { id: true, productId: true },
+              })
+            : []
+          const productIdByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, layer.productId]))
 
           const extractPayloadAmount = (
             payload: unknown,
@@ -1835,20 +1796,20 @@ export async function createRefund(
                 costLayerSnapshot: costSnapshot as never,
               },
             })
+          }
 
-            if (!returnWarehouseId || !refundLine.productId) continue
-
-            for (const entry of costSnapshot) {
-              await tx.costLayer.create({
-                data: {
-                  productId: refundLine.productId,
-                  warehouseId: returnWarehouseId,
-                  receivedQty: entry.qty,
-                  remainingQty: entry.qty,
+          if (returnWarehouseId) {
+            snapshotReturnRows = createdRefundLines.flatMap((refundLine) => (
+              (refundLayerSnapshots.get(refundLine.id) ?? []).flatMap((entry) => {
+                const productId = productIdByCostLayerId.get(entry.costLayerId)
+                if (!productId) return []
+                return [{
+                  productId,
+                  qty: entry.qty,
                   unitCostBase: entry.unitCostBase,
-                },
+                }]
               })
-            }
+            ))
           }
 
           const remainingUnearned = Math.round(Math.max(
@@ -1932,6 +1893,36 @@ export async function createRefund(
       }
       // Scenario 1: no revenueDeferredDate → no sub-ledger journals to reverse
     } catch { /* Accounting queue errors should never block the main flow */ }
+
+    if (returnWarehouseId) {
+      const snapshotRows: RefundReturnRow[] = snapshotReturnRows ?? []
+      const returnRows = snapshotRows.length > 0
+        ? snapshotRows
+        : await buildRefundFallbackReturnRows(
+            refundLines.map((line) => ({
+              productId: line.productId,
+              qty: line.qty,
+            })),
+          )
+
+      const returnedProductIds = await applyRefundReturnStock(
+        orderId,
+        refundOrderRef,
+        returnWarehouseId,
+        returnRows,
+      )
+
+      if (returnedProductIds.length > 0) {
+        try {
+          await enqueueStockSync(
+            [...new Set(returnedProductIds)],
+            'IMS_CHANGE',
+          )
+        } catch (syncError) {
+          console.error(syncError)
+        }
+      }
+    }
 
     return { success: true }
   } catch (e) {

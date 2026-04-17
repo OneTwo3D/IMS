@@ -402,7 +402,7 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
     let externalProductId: number
     let putPath: string
 
-    if (product.type === 'VARIANT') {
+    if (product.parent?.sku) {
       const parentWcId = product.parent?.externalProductId != null ? Number(product.parent.externalProductId) : null
       if (!parentWcId || !product.parent?.sku) {
         return { success: false, error: `Variant ${product.sku} is missing a WooCommerce parent mapping` }

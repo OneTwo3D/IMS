@@ -12,6 +12,9 @@ Found at **Settings > Company**, this is where you configure your organisation's
 - **VAT number** and **company number**
 - **Address** (used on documents and invoices)
 - **Contact information**
+- **Base currency** — set this once during initial setup. After live data exists, changing it requires a database reset.
+
+Base-currency amounts throughout the app use the configured currency's display style, including whether the symbol appears before or after the amount.
 
 ### Logos
 
@@ -123,9 +126,11 @@ This section only appears when an accounting plugin is enabled.
 - **Currencies & FX rates** — add currencies and manage exchange rates
 - **FX rate schedule** — enable automatic exchange rate updates, set the update interval, or trigger an immediate update with the **Update Now** button
 
+The organisation base currency is not changed here. It is defined in **Settings > Company** and is treated as a one-time setup choice for a live system.
+
 ## Backup & Restore
 
-Full system backup and restore functionality. See the [Backup & Restore](backup-restore.md) guide for details.
+Full system backup and restore functionality is available for administrator-led backups and restores.
 
 ## User Management
 
@@ -143,3 +148,5 @@ Manage user accounts and roles from **Settings > Users**. See the [User Manageme
   - **Full reset** — returns the system to a blank state
 
 All reset options require a typed confirmation to prevent accidental data loss.
+
+If you need to change the organisation base currency after setup, use a database reset and reconfigure the system from scratch.

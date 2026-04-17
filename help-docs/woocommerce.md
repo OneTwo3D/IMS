@@ -52,6 +52,8 @@ With the initial import complete, new and updated WooCommerce orders are importe
 
 **WooCommerce "completed" orders** receive special handling: the system auto-allocates stock, creates shipments, applies any tracking information from the WC order meta (AST plugin), and transitions the shipments through to Shipped status.
 
+This uses the same shared external-fulfillment path that future WMS plugins will use. WooCommerce does not bypass the IMS shipment model or dispatch stock directly at order level.
+
 ### Webhooks (Recommended)
 
 Webhooks deliver order changes to One Two Inventory in real-time, rather than waiting for the next poll. To set up:
@@ -92,7 +94,7 @@ The WooCommerce connector writes AST-compatible order meta to `_wc_shipment_trac
 Behavior notes:
 
 - Tracking is pushed per shipped shipment where shipment records exist
-- Legacy non-shipment orders fall back to the order-level tracking fields
+- Current fulfillment is shipment-based. Historical order-level tracking fallback exists only for older records that pre-date shipment rows.
 - Re-saving the same tracking is idempotent and does not intentionally create duplicate upstream entries
 - Reflected WooCommerce `order.updated` webhooks from IMS-originated status/tracking pushes are explicitly suppressed
 
@@ -199,9 +201,7 @@ What it does:
 
 Order reconcile also backfills orders that were intentionally skipped while `wc_initial_import_completed` was not yet `true`. The reconcile path uses its own `last_wc_order_reconcile_at` cursor, so the first reconcile after initial import completion can import those missed live orders.
 
-The cron endpoints require a `CRON_SECRET` header for security. Cron setup is typically handled by your administrator during deployment.
-
-Live verification runbooks are internal administrator documentation and are not part of the in-app help.
+The cron endpoints require a `CRON_SECRET` header for security. Cron setup is usually handled by your administrator during deployment.
 
 ## Historical Order Import (Forecasting)
 

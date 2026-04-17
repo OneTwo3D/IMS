@@ -2,7 +2,7 @@
 
 import { useState, useTransition, useCallback, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
-import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Check, Clock, EllipsisVertical } from 'lucide-react'
+import { Package, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronRight, Loader2, FileText, Mail, Copy, Trash2, ExternalLink, CreditCard, Pencil, Settings2, Warehouse, AlertTriangle, Clock, EllipsisVertical } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -21,13 +21,14 @@ import {
   autoAllocateOrder, getOrderAllocations, getOrderShipments,
   deallocateOrder, confirmAllocations, updateAllocation, addAllocation,
   updateShipmentStatus, updateShipmentTracking,
-  type AllocationRow, type ShipmentRow,
+  type AllocationRow, type FulfillmentRequirementRow, type ShipmentRow,
 } from '@/app/actions/allocation'
 import type { CurrencyRow } from '@/app/actions/currencies'
 import type { StockLevelEntry } from '@/app/actions/stock'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { calculateCoverageByLine } from '@/lib/products/fulfillment-coverage'
 import { formatMoney } from '@/lib/utils'
 import { getTrackingUrl } from '@/lib/tracking'
 import { countryName } from '@/lib/countries'
@@ -41,6 +42,7 @@ type Props = {
   stockLevels: Record<string, Record<string, StockLevelEntry>>
   initialAllocations: AllocationRow[]
   initialShipments: ShipmentRow[]
+  fulfillmentRequirements: FulfillmentRequirementRow[]
   carriers: string[]
   deliveryTrackingEnabled: boolean
   accountingAvailable: boolean
@@ -77,17 +79,6 @@ const STATUS_FLOW_SHIPMENTS: Record<string, { label: string; icon: typeof Truck;
   SHIPPED: [{ label: 'Complete', icon: PackageCheck, target: 'COMPLETED' }],
   COMPLETED: [{ label: 'Delivered', icon: PackageCheck, target: 'DELIVERED' }],
 }
-// Status flow for orders WITHOUT shipments (legacy / simple flow)
-const STATUS_FLOW_LEGACY: Record<string, { label: string; icon: typeof Truck; target: SoStatus }[]> = {
-  DRAFT: [{ label: 'Process', icon: Package, target: 'PROCESSING' }],
-  PENDING_PAYMENT: [{ label: 'Process', icon: Package, target: 'PROCESSING' }],
-  PROCESSING: [{ label: 'Allocate', icon: Package, target: 'ALLOCATED' }],
-  ALLOCATED: [{ label: 'Start Picking', icon: Package, target: 'PICKING' }],
-  PICKING: [{ label: 'Mark Packed', icon: PackageCheck, target: 'PACKING' }],
-  PACKING: [{ label: 'Ship', icon: Truck, target: 'SHIPPED' }],
-  SHIPPED: [{ label: 'Complete', icon: PackageCheck, target: 'COMPLETED' }],
-  COMPLETED: [{ label: 'Delivered', icon: PackageCheck, target: 'DELIVERED' }],
-}
 
 // Optional columns for the line items table
 type OptCol = 'cogs' | 'margin' | 'marginPct' | 'qtyOnHand' | 'qtyReturned' | 'qtyCancelled' | 'qtyShipped'
@@ -100,49 +91,6 @@ const OPT_COLUMNS: { key: OptCol; label: string }[] = [
   { key: 'qtyCancelled', label: 'Qty Cancelled' },
   { key: 'qtyShipped', label: 'Qty Shipped' },
 ]
-
-// ---------------------------------------------------------------------------
-// Ship dialog
-// ---------------------------------------------------------------------------
-function ShipDialog({ order, warehouses, carriers, onClose }: { order: SoDetail; warehouses: WarehouseInfo[]; carriers: string[]; onClose: () => void }) {
-  const router = useRouter()
-  const [isPending, startTransition] = useTransition()
-  const [tracking, setTracking] = useState('')
-  const [carrier, setCarrier] = useState(order.shippingService ?? '')
-  const [whId, setWhId] = useState(order.shipFromWarehouseId ?? warehouses[0]?.id ?? '')
-  const [error, setError] = useState('')
-  function handleShip() {
-    setError('')
-    if (!whId) { setError('Select a warehouse'); return }
-    startTransition(async () => {
-      const result = await updateSalesOrderStatus(order.id, 'SHIPPED', { trackingNumber: tracking || undefined, shipFromWarehouseId: whId })
-      if (result.success) { router.refresh(); onClose() } else setError(result.error ?? 'Failed')
-    })
-  }
-  return (
-    <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
-      <DialogHeader><DialogTitle>Ship Order</DialogTitle></DialogHeader>
-      <div className="space-y-4">
-        <div className="space-y-1.5"><Label>Ship From Warehouse *</Label>
-          <select value={whId} onChange={(e) => setWhId(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
-            {warehouses.map((w) => (<option key={w.id} value={w.id}>{w.code} — {w.name}</option>))}
-          </select></div>
-        <div className="space-y-1.5"><Label>Carrier</Label>
-          <select value={carrier} onChange={(e) => setCarrier(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
-            <option value="">Select carrier...</option>
-            {carriers.map((c) => (<option key={c} value={c}>{c}</option>))}
-          </select></div>
-        <div className="space-y-1.5"><Label>Tracking Number</Label>
-          <Input value={tracking} onChange={(e) => setTracking(e.target.value)} placeholder="Optional" className="h-9 text-sm font-mono" /></div>
-        {error && <p className="text-sm text-destructive">{error}</p>}
-      </div>
-      <DialogFooter>
-        <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-        <Button onClick={handleShip} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Confirm Shipment</Button>
-      </DialogFooter>
-    </DialogContent></Dialog>
-  )
-}
 
 // ---------------------------------------------------------------------------
 // Refund dialog
@@ -306,7 +254,7 @@ function PaymentDialog({ orderId, refundId, creditNoteNumber, currency, defaultA
 // Allocation Panel
 // ---------------------------------------------------------------------------
 function AllocationPanel({
-  orderId, allocations, lines, warehouses, status, shipments, onRefresh,
+  orderId, allocations, lines, warehouses, status, shipments, requirementsByLine, onRefresh,
 }: {
   orderId: string
   allocations: AllocationRow[]
@@ -314,6 +262,7 @@ function AllocationPanel({
   warehouses: WarehouseInfo[]
   status: SoStatus
   shipments: ShipmentRow[]
+  requirementsByLine: Map<string, FulfillmentRequirementRow['requirements']>
   onRefresh: () => void
 }) {
   const [isPending, startTransition] = useTransition()
@@ -334,19 +283,26 @@ function AllocationPanel({
   }
 
   // Compute qty already committed in non-PENDING shipments
-  const shipmentCommittedByLine = new Map<string, number>()
-  for (const s of shipments) {
-    if (s.status === 'PENDING') continue
-    for (const sl of s.lines) {
-      shipmentCommittedByLine.set(sl.lineId, (shipmentCommittedByLine.get(sl.lineId) ?? 0) + sl.qty)
-    }
-  }
+  const shipmentCommittedByLine = calculateCoverageByLine(
+    requirementsByLine,
+    shipments
+      .filter((shipment) => shipment.status !== 'PENDING')
+      .flatMap((shipment) => shipment.lines.map((line) => ({
+        lineId: line.lineId,
+        productId: line.productId,
+        qty: line.qty,
+      }))),
+  )
 
   // Find backordered lines (not fully allocated for remaining qty)
-  const allocatedByLine = new Map<string, number>()
-  for (const a of allocations) {
-    allocatedByLine.set(a.lineId, (allocatedByLine.get(a.lineId) ?? 0) + a.qty)
-  }
+  const allocatedByLine = calculateCoverageByLine(
+    requirementsByLine,
+    allocations.map((allocation) => ({
+      lineId: allocation.lineId,
+      productId: allocation.productId,
+      qty: allocation.qty,
+    })),
+  )
   const backorderLines = lines.filter((l) => {
     if (!l.productId) return false
     const committed = shipmentCommittedByLine.get(l.id) ?? 0
@@ -452,9 +408,8 @@ function AllocationPanel({
           <div className="divide-y">
             {allocs.map((a) => {
               const isEditing = editingId === a.id
-              const allocated = a.qty
-              const ordered = a.lineQty
-              const isFull = allocated >= ordered
+              const factor = requirementsByLine.get(a.lineId)?.find((row) => row.productId === a.productId)?.factor ?? 1
+              const covered = factor > 0 ? a.qty / factor : 0
               return (
                 <div key={a.id} className="px-4 py-2.5 flex items-center gap-3">
                   {a.imageUrl ? (
@@ -465,6 +420,9 @@ function AllocationPanel({
                   )}
                   <div className="flex-1 min-w-0">
                     <ProductLink productId={a.productId} sku={a.productSku} name={a.productName} />
+                    {a.lineSku && a.lineSku !== a.productSku && (
+                      <p className="text-xs text-muted-foreground">For sales line {a.lineSku}</p>
+                    )}
                   </div>
                   {isEditing ? (
                     <div className="flex items-center gap-2">
@@ -478,17 +436,11 @@ function AllocationPanel({
                   ) : (
                     <div className="flex items-center gap-3">
                       <span className="text-xs text-muted-foreground">
-                        Allocated Stock <span className="font-mono font-medium text-foreground">{allocated}</span> / {ordered}
+                        Component qty <span className="font-mono font-medium text-foreground">{a.qty}</span>
+                        {factor > 0 && (
+                          <span> · Covers <span className="font-mono font-medium text-foreground">{covered}</span> / {a.lineQty}</span>
+                        )}
                       </span>
-                      {isFull ? (
-                        <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
-                          <Check className="h-3 w-3 mr-0.5" />Full
-                        </span>
-                      ) : (
-                        <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200">
-                          Partial
-                        </span>
-                      )}
                       {['PROCESSING', 'ALLOCATED'].includes(status) && (
                         <button type="button" className="text-xs text-primary hover:underline" onClick={() => { setEditingId(a.id); setEditWhId(a.warehouseId); setEditQty(String(a.qty)) }}>
                           Change
@@ -684,6 +636,9 @@ function ShipmentsPanel({
                   )}
                   <div className="flex-1 min-w-0">
                     <ProductLink productId={l.productId} sku={l.productSku} name={l.productName} />
+                    {l.lineSku && l.lineSku !== l.productSku && (
+                      <p className="text-xs text-muted-foreground">For sales line {l.lineSku}</p>
+                    )}
                   </div>
                   <span className="text-xs text-muted-foreground tabular-nums">Qty: <span className="font-mono font-medium text-foreground">{l.qty}</span></span>
                 </div>
@@ -728,11 +683,10 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, stockLevels, initialAllocations, initialShipments, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled }: Props) {
   const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
-  const [showShip, setShowShip] = useState(false)
   const [showRefund, setShowRefund] = useState(false)
   const [showNotes, setShowNotes] = useState(false)
   const [showRefunds, setShowRefunds] = useState(false)
@@ -743,6 +697,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const [error, setError] = useState('')
   const [allocations, setAllocations] = useState<AllocationRow[]>(initialAllocations)
   const [shipments, setShipments] = useState<ShipmentRow[]>(initialShipments)
+  const requirementsByLine = new Map(fulfillmentRequirements.map((row) => [row.lineId, row.requirements]))
 
   // Sync client state from server props when router.refresh() delivers fresh data.
   // This eliminates the race between refreshAllocations() and router.refresh() —
@@ -774,21 +729,23 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const discountDisplay = so.discountAmount // already gross in inclVat mode
 
   const hasShipments = shipments.length > 0
-  const baseFlow = hasShipments ? STATUS_FLOW_SHIPMENTS : STATUS_FLOW_LEGACY
   // Filter out Delivered action if delivery tracking is not enabled
-  const nextActions = (baseFlow[so.status] ?? []).filter((a) => a.target !== 'DELIVERED' || deliveryTrackingEnabled)
+  const nextActions = (STATUS_FLOW_SHIPMENTS[so.status] ?? []).filter((a) => a.target !== 'DELIVERED' || deliveryTrackingEnabled)
   const canCancel = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status)
   const canDelete = ['DRAFT', 'PENDING_PAYMENT'].includes(so.status)
   const canRefund = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'].includes(so.status)
 
   // Compute qty already committed in non-PENDING shipments for partial fulfillment
-  const committedByLine = new Map<string, number>()
-  for (const s of shipments) {
-    if (s.status === 'PENDING') continue
-    for (const l of s.lines) {
-      committedByLine.set(l.lineId, (committedByLine.get(l.lineId) ?? 0) + l.qty)
-    }
-  }
+  const committedByLine = calculateCoverageByLine(
+    requirementsByLine,
+    shipments
+      .filter((shipment) => shipment.status !== 'PENDING')
+      .flatMap((shipment) => shipment.lines.map((line) => ({
+        lineId: line.lineId,
+        productId: line.productId,
+        qty: line.qty,
+      }))),
+  )
   const hasUnfulfilledLines = so.lines.some((l) => {
     if (!l.productId) return false
     const committed = committedByLine.get(l.id) ?? 0
@@ -805,7 +762,6 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   }, [so.id])
 
   function handleStatusChange(target: SoStatus) {
-    if (target === 'SHIPPED') { setShowShip(true); return }
     if (target === 'ALLOCATED') {
       setError('')
       startTransition(async () => {
@@ -1211,6 +1167,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
           warehouses={warehouses}
           status={so.status}
           shipments={shipments}
+          requirementsByLine={requirementsByLine}
           onRefresh={() => { refreshAllocations(); router.refresh() }}
         />
       )}
@@ -1355,7 +1312,6 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
       )}
 
       {/* Dialogs */}
-      {showShip && <ShipDialog order={so} warehouses={warehouses} carriers={carriers} onClose={() => setShowShip(false)} />}
       {showRefund && <RefundDialog order={so} warehouses={warehouses} sym={sym} onClose={() => setShowRefund(false)} />}
       {showNotes && <NotesDialog order={so} onClose={() => setShowNotes(false)} />}
       {accountingAvailable && showPayment && <PaymentDialog orderId={so.id} refundId={showPayment.refundId} creditNoteNumber={showPayment.creditNoteNumber} currency={so.currency} defaultAmount={!showPayment.refundId ? (invoiceBalance > 0.01 ? invoiceBalance : undefined) : undefined} onClose={() => setShowPayment(null)} />}

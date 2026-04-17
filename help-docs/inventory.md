@@ -68,15 +68,27 @@ A standard product with its own stock. Most physical goods are Simple products.
 
 ### Variable
 
-A parent product that defines shared attributes (e.g. a T-Shirt). It is not stocked or sold directly. Instead, it holds **options** (such as Size and Colour) that are used to generate **Variants**.
+A parent product that defines shared attributes (e.g. a T-Shirt). It is not stocked or sold directly. Instead, it holds **options** (such as Size and Colour) that are used to generate child SKUs.
 
 ### Variant
 
 A child of a Variable product representing one specific combination of options (e.g. T-Shirt / Large / Blue). Each variant has its own SKU, stock levels, and pricing. Variants are what you actually buy, sell, and count.
 
+Variable parents can now have three kinds of child SKU:
+
+- **Variant** — a normal stocked child
+- **Kit / Bundle** — a virtual child made from components
+- **BOM** — a manufactured child with its own finished stock
+
 ### Kit
 
 A bundle of component products sold as a single unit. Kit stock is not held independently -- it is **calculated** from the available stock of its components across each warehouse. When a Kit is sold, each component's stock is allocated individually.
+
+Bundle handling is component-driven:
+
+- kit availability is calculated per warehouse from the limiting component
+- nested kits are expanded to their leaf components for fulfillment coverage
+- allocations, shipment lines, dispatch, refunds, and stock returns all operate on the underlying components rather than on virtual kit stock
 
 To set up a Kit, use the component search to add products and specify the quantity of each component required per Kit.
 
@@ -97,6 +109,23 @@ Click any product to open its detail page. From here you can:
 
 - **Edit details** -- Update any of the product fields.
 - **View stock levels** -- See on hand, allocated, available, and incoming quantities per warehouse.
+
+### Product Type Changes
+
+Simple, Variant, Kit, and BOM products can be transformed through the standard editor, but only when they are structurally safe to change.
+
+The system blocks a type change if the product still has any of the following attached:
+
+- stock on hand
+- reserved stock
+- open sales order lines
+- open purchase order lines
+- open manufacturing orders
+- open stock transfer lines
+
+This is especially important when changing a Bundle or BOM back to a Simple product. Clear the attached stock and operational documents first, then change the type.
+
+Variable parents and Non-Inventory products cannot be converted through the standard product editor.
 
 
 ## Stock Levels
@@ -126,14 +155,18 @@ This information is used to pre-fill prices when creating new purchase orders.
 
 ## Variable Products -- Options and Variants
 
-When editing a Variable product, you define **options** (e.g. Size with values S, M, L and Colour with values Red, Blue). The system can then **generate variants** for every combination automatically. Each generated variant inherits the parent's details and can be customised individually.
+When editing a Variable product, you define **options** (e.g. Size with values S, M, L and Colour with values Red, Blue). The system can then **generate variants** for every combination automatically. Each generated child SKU inherits the parent's details and can be customised individually.
 
-The variant table on a Variable product's detail page shows each variant with its thumbnail, SKU, name, stock, allocated, available, incoming, price, and status. Click any variant's SKU to open its detail page.
+The child table on a Variable product's detail page shows each variant with its thumbnail, SKU, name, stock, allocated, available, incoming, price, and status. Click any child SKU to open its detail page.
+
+For advanced catalogues, a Variable parent can mix normal variants with bundle variants and BOM variants. The parent remains a grouping layer only; stock and fulfillment behavior always comes from the child SKU type.
 
 
 ## Kit Products -- Component Stock
 
 On a Kit product's detail page, the stock section shows the **calculated available quantity** per warehouse. This is the maximum number of Kits that can be assembled from the components currently in stock at that warehouse.
+
+When a kit contains another kit as a component, the system expands that structure automatically and still calculates the final shippable quantity from the underlying stockable items.
 
 
 ## BOM Products -- Manufactured Stock

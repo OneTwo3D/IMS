@@ -27,14 +27,15 @@ Inventory Management System — built with Next.js 16, TypeScript, Prisma 7, Pos
 - Supplier management with default currency, tax rate, and payment terms
 
 ### Sales
-- Sales orders with full workflow (Pending > Processing > Picking > Packed > Shipped > Completed)
+- Sales orders with shipment-first fulfillment and shipment status progression (`PENDING > PICKING > PACKED > SHIPPED`)
 - Multi-currency with VAT, line/order discounts (% or absolute), shipping fees
 - Customer contacts with billing/shipping addresses and tax numbers
-- Stock reservation on order creation, release on ship/cancel
+- Component-aware stock allocation for kits / bundles, including bundle refunds and COGS reversal support
+- Stock reservation on allocation, release on ship/cancel/refund
 - Invoice generation (manual, auto on ship, or auto on paid — configurable)
 - Payment tracking against invoices and credit notes
 - Automatic credit note numbers on refund
-- Order and invoice PDF generation, email (mailto)
+- Order and invoice PDF generation, SMTP email, and packing slips
 - Clone, delete (pending only), column picker (COGS, margin, qty on hand, etc.)
 - Sales representative assignment, delivery dates
 

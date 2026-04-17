@@ -94,7 +94,7 @@ export default async function ProductDetailPage({
       <div>
         <nav className="flex items-center gap-1 text-sm text-muted-foreground mb-2">
           <Link href="/inventory" className="hover:text-foreground">Inventory</Link>
-          {product.type === 'VARIANT' && product.parentId && product.parentSku && (
+          {product.parentId && product.parentSku && (
             <>
               <ChevronRight className="h-4 w-4" />
               <Link href={`/inventory/${product.parentId}`} className="hover:text-foreground">
@@ -115,7 +115,7 @@ export default async function ProductDetailPage({
           {product.type !== 'VARIABLE' && product.type !== 'NON_INVENTORY' && (
             <StockFlowButton productId={id} />
           )}
-          {product.type === 'VARIANT' && (
+          {product.parentId && (
             <DeleteVariantButton
               variantId={id}
               variantSku={product.sku}
@@ -138,7 +138,7 @@ export default async function ProductDetailPage({
                 name: product.name,
                 description: product.description ?? undefined,
                 type: product.type,
-                parentId: variableProducts.find((v) => v.sku === product.parentSku)?.id,
+                parentId: product.parentId ?? undefined,
                 barcode: product.barcode ?? undefined,
                 hsCode: product.hsCode ?? undefined,
                 countryOfOrigin: product.countryOfOrigin ?? undefined,

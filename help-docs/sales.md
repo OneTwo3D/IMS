@@ -25,7 +25,7 @@ To create a new order manually:
 
 When WooCommerce sync is configured, orders are imported automatically into the system. These orders display a **WooCommerce link** that takes you directly to the order in your WC admin panel. This link only appears for orders that were synced from WooCommerce (i.e. those with a WC Order ID).
 
-WooCommerce orders follow the full completion flow: when WC marks an order as completed, the system auto-allocates stock and creates shipments with tracking information. See the **WooCommerce Integration** help page for details on sync configuration.
+WooCommerce orders always enter the IMS as **Processing**. When WooCommerce marks an order as **completed**, the IMS treats that as the external dispatch signal: it auto-allocates stock, creates shipment rows if needed, advances those shipments through the internal `PICKING -> PACKED -> SHIPPED` workflow, and stores any tracking information received from WooCommerce. See the **WooCommerce Integration** guide for details on sync configuration.
 
 ## Order Statuses
 
@@ -55,6 +55,8 @@ The smart auto-allocation algorithm minimises the number of shipments by consoli
 
 When re-allocating after a partial shipment, the algorithm only allocates the **remaining unfulfilled quantity** — items already committed to active (non-PENDING) shipments are excluded automatically.
 
+For Kit / Bundle products, allocation works from the underlying components rather than the virtual parent SKU. Bundle quantities are expanded into their component requirements, and shipment lines are created for those component rows.
+
 ### Allocation Panel
 
 The order detail page includes an allocation panel that shows:
@@ -65,9 +67,15 @@ The order detail page includes an allocation panel that shows:
 
 The allocation panel reappears whenever there are unfulfilled order lines, even after some shipments have already been created or shipped. This enables the partial fulfillment workflow described below.
 
-### PICKING Guard
+### Shipment-Only Fulfillment
 
-Orders cannot transition to **Picking** status without allocations. If you attempt to start picking on an order that has no stock allocated, the system returns an error: *"Cannot start picking — no products have been allocated. Allocate stock first."* This applies to the legacy (non-shipment) flow only; shipment-level picking is inherently guarded since shipments are created from confirmed allocations.
+The IMS no longer supports direct order-level dispatch. Orders must be fulfilled through shipment rows:
+
+- allocate stock
+- confirm allocations to create shipments
+- progress each shipment through `PENDING -> PICKING -> PACKED -> SHIPPED`
+
+This same shipment workflow is used for both manual fulfillment and external fulfillment signals coming from storefront or WMS integrations.
 
 ## Partial Fulfillment
 
@@ -124,6 +132,8 @@ To process a refund:
 
 Returned stock is added back into the selected warehouse's inventory automatically.
 
+For Kit / Bundle sales, refunds reverse the component-level stock movements. Returned stock, FIFO cost restoration, and shipment reversal all happen against the underlying component products.
+
 ## Payments
 
 You can record payments against a sales order:
@@ -147,7 +157,7 @@ Three PDF documents are available for each sales order:
 
 - **Sales Order PDF** — a summary of the order for internal use or to send to the customer
 - **Invoice PDF** — the formal tax invoice, generated manually or automatically
-- **Packing Slip** — a picking/packing checklist showing SKU, product name, location, quantity, and a tick box for each item. Available from the order's ⋮ menu. When an order has multiple shipments from different warehouses, items are grouped by shipment with a section heading per warehouse. For orders without shipments (legacy flow), the packing slip uses the order lines directly.
+- **Packing Slip** — a picking/packing checklist showing SKU, product name, location, quantity, and a tick box for each item. Available from the order's ⋮ menu. When an order has multiple shipments from different warehouses, items are grouped by shipment with a section heading per warehouse. If shipments have not yet been created, the packing slip falls back to the sales order lines.
 
 PDFs use your company branding (logo, colours, and footer) as configured in Settings.
 

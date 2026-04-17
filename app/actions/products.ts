@@ -7,12 +7,15 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
-import { ProductType } from '@/app/generated/prisma/client'
+import { Prisma, ProductType } from '@/app/generated/prisma/client'
 import {
   COMPONENT_PRODUCT_STATUSES,
   deriveLegacyActiveFromLifecycleStatus,
   deriveLifecycleStatusFromLegacyActive,
 } from '@/lib/products/lifecycle'
+import {
+  validateProductStructureChange,
+} from '@/lib/products/type-transforms'
 import type { ProductLifecycleStatus, TaxCategory } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -124,7 +127,7 @@ export async function listProducts(params: {
       ? {}
       : params.type
       ? { type: params.type as ProductType }
-      : { type: { not: 'VARIANT' as const } }),
+      : { parentId: null }),
     ...(params.lifecycleStatus && params.lifecycleStatus !== 'ALL'
       ? { lifecycleStatus: params.lifecycleStatus }
       : params.active === 'true'
@@ -571,12 +574,12 @@ export async function createProduct(
 ): Promise<ProductFormState> {
   await requirePermission('inventory.edit')
   const raw = {
-    sku: formData.get('sku') as string,
+    sku: ((formData.get('sku') as string) || '').trim(),
     name: formData.get('name') as string,
     description: formData.get('description') as string || undefined,
     type: formData.get('type') as string,
     parentId: formData.get('parentId') as string || null,
-    barcode: formData.get('barcode') as string || null,
+    barcode: ((formData.get('barcode') as string) || '').trim() || null,
     hsCode: formData.get('hsCode') as string || null,
     countryOfOrigin: formData.get('countryOfOrigin') as string || null,
     weight: formData.get('weight') as string || null,
@@ -607,13 +610,28 @@ export async function createProduct(
     return { errors: { sku: ['SKU already exists'] } }
   }
 
+  if (data.barcode) {
+    const existingBarcode = await db.product.findFirst({ where: { barcode: data.barcode } })
+    if (existingBarcode) {
+      return { errors: { barcode: ['Barcode already exists'] } }
+    }
+  }
+
+  const structureValidation = await validateProductStructureChange({
+    type: data.type,
+    parentId: data.parentId,
+  })
+  if (!structureValidation.ok) {
+    return { errors: structureValidation.fieldErrors, message: structureValidation.message }
+  }
+
   const created = await db.product.create({
     data: {
       sku: data.sku,
       name: data.name,
       description: data.description || null,
       type: data.type,
-      parentId: data.parentId || null,
+      parentId: structureValidation.normalizedParentId,
       barcode: data.barcode || null,
       hsCode: data.hsCode || null,
       countryOfOrigin: data.countryOfOrigin || null,
@@ -667,12 +685,12 @@ export async function updateProduct(
 ): Promise<ProductFormState> {
   await requirePermission('inventory.edit')
   const raw = {
-    sku: formData.get('sku') as string,
+    sku: ((formData.get('sku') as string) || '').trim(),
     name: formData.get('name') as string,
     description: formData.get('description') as string || undefined,
     type: formData.get('type') as string,
     parentId: formData.get('parentId') as string || null,
-    barcode: formData.get('barcode') as string || null,
+    barcode: ((formData.get('barcode') as string) || '').trim() || null,
     hsCode: formData.get('hsCode') as string || null,
     countryOfOrigin: formData.get('countryOfOrigin') as string || null,
     weight: formData.get('weight') as string || null,
@@ -703,31 +721,54 @@ export async function updateProduct(
     return { errors: { sku: ['SKU already in use by another product'] } }
   }
 
-  await db.product.update({
-    where: { id },
-    data: {
-      sku: data.sku,
-      name: data.name,
-      description: data.description || null,
-      type: data.type,
-      parentId: data.parentId || null,
-      barcode: data.barcode || null,
-      hsCode: data.hsCode || null,
-      countryOfOrigin: data.countryOfOrigin || null,
-      weight: data.weight ? data.weight : null,
-      salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
-      salePriceBase: data.salePriceBase ? data.salePriceBase : null,
-      salesPriceTaxInclusive: data.salesPriceTaxInclusive,
-      taxCategory: data.taxCategory,
-      stockUnit: data.stockUnit,
-      oversellAllowed: data.oversellAllowed,
-      imageUrl: data.imageUrl || null,
-      widthCm: data.widthCm || null,
-      heightCm: data.heightCm || null,
-      depthCm: data.depthCm || null,
-      active: deriveLegacyActiveFromLifecycleStatus(data.lifecycleStatus),
-      lifecycleStatus: data.lifecycleStatus,
-    },
+  if (data.barcode) {
+    const existingBarcode = await db.product.findFirst({ where: { barcode: data.barcode, NOT: { id } } })
+    if (existingBarcode) {
+      return { errors: { barcode: ['Barcode already in use by another product'] } }
+    }
+  }
+
+  const structureValidation = await validateProductStructureChange({
+    productId: id,
+    type: data.type,
+    parentId: data.parentId,
+  })
+  if (!structureValidation.ok) {
+    return { errors: structureValidation.fieldErrors, message: structureValidation.message }
+  }
+
+  await db.$transaction(async (tx) => {
+    await tx.product.update({
+      where: { id },
+      data: {
+        sku: data.sku,
+        name: data.name,
+        description: data.description || null,
+        type: data.type,
+        parentId: structureValidation.normalizedParentId,
+        barcode: data.barcode || null,
+        hsCode: data.hsCode || null,
+        countryOfOrigin: data.countryOfOrigin || null,
+        weight: data.weight ? data.weight : null,
+        salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
+        salePriceBase: data.salePriceBase ? data.salePriceBase : null,
+        salesPriceTaxInclusive: data.salesPriceTaxInclusive,
+        taxCategory: data.taxCategory,
+        stockUnit: data.stockUnit,
+        oversellAllowed: data.oversellAllowed,
+        imageUrl: data.imageUrl || null,
+        widthCm: data.widthCm || null,
+        heightCm: data.heightCm || null,
+        depthCm: data.depthCm || null,
+        active: deriveLegacyActiveFromLifecycleStatus(data.lifecycleStatus),
+        lifecycleStatus: data.lifecycleStatus,
+        ...(structureValidation.clearExternalMapping ? { externalProductId: null } : {}),
+      },
+    })
+
+    if (structureValidation.clearComponents) {
+      await tx.productComponent.deleteMany({ where: { productId: id } })
+    }
   })
 
   await logActivity({
@@ -888,6 +929,97 @@ export type ProductComponentRow = {
   sortOrder: number
 }
 
+export type ProductComponentDuplicateMatch = {
+  productId: string
+  sku: string
+  name: string
+  type: 'KIT' | 'BOM'
+  parentSku: string | null
+}
+
+type ProductComponentInput = {
+  componentId: string
+  qty: string | number
+}
+
+function normalizeProductComponentList(components: ProductComponentInput[]): Array<{ componentId: string; qty: string }> {
+  const totals = new Map<string, Prisma.Decimal>()
+
+  for (const component of components) {
+    const componentId = component.componentId.trim()
+    if (!componentId) continue
+
+    let qty: Prisma.Decimal
+    try {
+      qty = new Prisma.Decimal(component.qty)
+    } catch {
+      continue
+    }
+
+    if (qty.lte(0)) continue
+    const existing = totals.get(componentId)
+    totals.set(componentId, existing ? existing.plus(qty) : qty)
+  }
+
+  return [...totals.entries()]
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([componentId, qty]) => ({
+      componentId,
+      qty: qty.toString(),
+    }))
+}
+
+function buildProductComponentSignature(components: Array<{ componentId: string; qty: string }>): string {
+  return components.map((component) => `${component.componentId}:${component.qty}`).join('|')
+}
+
+async function findMatchingProductComponentConfigurations(
+  productId: string,
+  components: ProductComponentInput[],
+): Promise<ProductComponentDuplicateMatch[]> {
+  const normalized = normalizeProductComponentList(components)
+  if (normalized.length === 0) return []
+
+  const targetSignature = buildProductComponentSignature(normalized)
+
+  const candidates = await db.product.findMany({
+    where: {
+      id: { not: productId },
+      type: { in: ['KIT', 'BOM'] },
+      productComponents: { some: {} },
+    },
+    select: {
+      id: true,
+      sku: true,
+      name: true,
+      type: true,
+      parent: { select: { sku: true } },
+      productComponents: {
+        select: { componentId: true, qty: true },
+      },
+    },
+    orderBy: { sku: 'asc' },
+  })
+
+  return candidates
+    .filter((candidate) => {
+      const candidateSignature = buildProductComponentSignature(
+        normalizeProductComponentList(candidate.productComponents.map((component) => ({
+          componentId: component.componentId,
+          qty: component.qty.toString(),
+        }))),
+      )
+      return candidateSignature === targetSignature
+    })
+    .map((candidate) => ({
+      productId: candidate.id,
+      sku: candidate.sku,
+      name: candidate.name,
+      type: candidate.type as 'KIT' | 'BOM',
+      parentSku: candidate.parent?.sku ?? null,
+    }))
+}
+
 export async function getProductComponents(productId: string): Promise<ProductComponentRow[]> {
   await requireAuth()
   const rows = await db.productComponent.findMany({
@@ -903,6 +1035,16 @@ export async function getProductComponents(productId: string): Promise<ProductCo
     qty: r.qty.toString(),
     sortOrder: r.sortOrder,
   }))
+}
+
+export async function checkProductComponentDuplicates(
+  productId: string,
+  components: ProductComponentInput[],
+): Promise<{ matches: ProductComponentDuplicateMatch[] }> {
+  await requirePermission('inventory.edit')
+  return {
+    matches: await findMatchingProductComponentConfigurations(productId, components),
+  }
 }
 
 /**
@@ -939,7 +1081,7 @@ async function detectComponentCycle(
 export async function saveProductComponents(
   productId: string,
   components: { componentId: string; qty: string }[]
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; warnings?: ProductComponentDuplicateMatch[] }> {
   try {
     await requirePermission('inventory.edit')
     // Check for self-reference
@@ -967,6 +1109,7 @@ export async function saveProductComponents(
         })),
       })
     }
+    const warnings = await findMatchingProductComponentConfigurations(productId, components)
     await logActivity({
       entityType: 'PRODUCT',
       entityId: productId,
@@ -974,11 +1117,11 @@ export async function saveProductComponents(
       tag: 'manufacturing',
       level: 'INFO',
       description: `Updated BOM/kit components for SKU ${_sku}`,
-      metadata: { componentCount: components.length },
+      metadata: { componentCount: components.length, duplicateComponentMatches: warnings.length },
     })
 
     revalidatePath(`/inventory/${productId}`)
-    return { success: true }
+    return { success: true, warnings }
   } catch (e: unknown) {
     const errorMsg = e instanceof Error ? e.message : 'Failed to save components'
     await logActivity({
@@ -1236,17 +1379,17 @@ export async function deleteOrDeactivateVariant(
     where: { id },
     select: { type: true, parentId: true },
   })
-  if (!product || product.type !== 'VARIANT') {
+  if (!product || !product.parentId) {
     await logActivity({
       entityType: 'PRODUCT',
       entityId: id,
       action: 'deleted',
       tag: 'inventory',
       level: 'ERROR',
-      description: `Failed to delete/deactivate variant ${id}: not a variant product`,
+      description: `Failed to delete/deactivate variant ${id}: not a child product`,
       metadata: null,
     })
-    return { action: 'error', error: 'Not a variant product' }
+    return { action: 'error', error: 'Not a child product' }
   }
 
   if (!forceDeactivate) {
