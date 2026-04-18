@@ -120,7 +120,13 @@ export async function applyExternalFulfillmentUpdate(
   for (let index = 0; index < shipments.length; index++) {
     const shipment = shipments[index]
     const transitions = statusesToApply(shipment.status as ExternalShipmentStatus, update.targetShipmentStatus)
-    const tracking = update.tracking?.[index] ?? update.tracking?.[0]
+    // Use matched tracking entry for this shipment; only fall back to the
+    // first entry when the array has exactly one element (single tracking
+    // number for all shipments). When there are multiple tracking entries
+    // but fewer than shipments, leave unmatched shipments without tracking
+    // rather than silently reusing an arbitrary entry.
+    const tracking = update.tracking?.[index]
+      ?? (update.tracking?.length === 1 ? update.tracking[0] : undefined)
 
     for (const target of transitions) {
       const result = await updateShipmentStatus(

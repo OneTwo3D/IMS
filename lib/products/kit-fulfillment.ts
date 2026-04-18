@@ -72,7 +72,16 @@ export function expandFulfillmentRequirements(
   function visit(currentProductId: string, currentQty: number, stack: Set<string>) {
     if (!Number.isFinite(currentQty) || currentQty <= 0) return
     const node = graph.get(currentProductId)
-    if (!node || node.type !== 'KIT' || node.productComponents.length === 0) {
+    if (!node) {
+      // Product referenced as a component but not loaded in the graph —
+      // possible orphaned component reference or data inconsistency.
+      // Treat as a leaf (accumulate to totals) but log a warning so ops
+      // can investigate rather than silently masking the issue.
+      console.warn(`[kit-fulfillment] Product ${currentProductId} referenced as component but not found in graph — treating as leaf`)
+      totals.set(currentProductId, (totals.get(currentProductId) ?? 0) + currentQty)
+      return
+    }
+    if (node.type !== 'KIT' || node.productComponents.length === 0) {
       totals.set(currentProductId, (totals.get(currentProductId) ?? 0) + currentQty)
       return
     }

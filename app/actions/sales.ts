@@ -99,9 +99,29 @@ async function buildRefundFallbackReturnRows(
           },
         },
       },
+      // Load prior refund lines to subtract already-returned quantities
+      refunds: {
+        select: {
+          lines: {
+            select: { productId: true, qty: true },
+          },
+        },
+      },
     },
   })
   if (!order) return []
+
+  // Compute already-returned qty per product across all prior refunds
+  const priorReturnedByProduct = new Map<string, number>()
+  for (const refund of order.refunds) {
+    for (const rl of refund.lines) {
+      if (!rl.productId) continue
+      priorReturnedByProduct.set(
+        rl.productId,
+        (priorReturnedByProduct.get(rl.productId) ?? 0) + Number(rl.qty),
+      )
+    }
+  }
 
   const lineById = new Map(order.lines.map((line) => [line.id, line]))
   const lineCandidatesByProduct = new Map<string, typeof order.lines>()
@@ -131,6 +151,9 @@ async function buildRefundFallbackReturnRows(
     }
   }
 
+  // Track how much remaining returnable qty each product has after prior refunds
+  const remainingReturnable = new Map<string, number>()
+
   return lines.flatMap((line) => {
     if (!line.productId || line.qty <= 0) return []
 
@@ -153,7 +176,18 @@ async function buildRefundFallbackReturnRows(
     return [...sourceRows.entries()].flatMap(([productId, totalQty]) => {
       const perUnitQty = totalQty / sourceLineQty
       if (!Number.isFinite(perUnitQty) || perUnitQty <= 0) return []
-      return [{ productId, qty: perUnitQty * line.qty }]
+      const rawReturnQty = perUnitQty * line.qty
+
+      // Cap return qty against what's still returnable (total dispatched − prior returns)
+      if (!remainingReturnable.has(productId)) {
+        remainingReturnable.set(productId, totalQty - (priorReturnedByProduct.get(productId) ?? 0))
+      }
+      const available = Math.max(0, remainingReturnable.get(productId) ?? 0)
+      const cappedQty = Math.min(rawReturnQty, available)
+      remainingReturnable.set(productId, available - cappedQty)
+
+      if (cappedQty <= 0) return []
+      return [{ productId, qty: cappedQty }]
     })
   })
 }
@@ -1312,95 +1346,144 @@ export async function createRefund(
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.refund')
     }
-    const so = await db.salesOrder.findUnique({
-      where: { id: orderId },
-      select: {
-        id: true, externalOrderNumber: true, orderNumber: true, status: true, fxRateToBase: true, totalBase: true,
-        taxRatePercent: true, pricesIncludeVat: true,
-        revenueDeferredDate: true, unearnedRevenueAmount: true,
-        inventoryAllocatedDate: true, allocationBatchAmount: true,
-      },
-    })
-    if (!so) return { success: false, error: 'Order not found' }
-
     // Accept lines with qty > 0 (item refund) or totalBase > 0 (monetary-only refund)
     const refundLines = lines.filter((l) => l.qty > 0 || l.totalBase > 0)
     if (!refundLines.length) return { success: false, error: 'Select at least one line to refund' }
 
-    const fxRate = Number(so.fxRateToBase) || 1
     const totalBase = refundLines.reduce((s, l) => s + l.totalBase, 0)
 
-    // Validate refund doesn't exceed order total
-    const existingRefunds = await db.salesOrderRefund.findMany({ where: { orderId }, select: { totalBase: true } })
-    const previouslyRefunded = existingRefunds.reduce((s, r) => s + Number(r.totalBase), 0)
-    if (totalBase + previouslyRefunded > Number(so.totalBase) * 1.001) { // small tolerance for rounding
-      return { success: false, error: 'Refund total would exceed order total' }
-    }
-    const totalForeign = Math.round(totalBase * fxRate * 10000) / 10000
-
-    // Generate credit note number using configured prefix
+    // --- Atomic refund creation ------------------------------------------
+    // Lock the SO row first to serialize concurrent refund requests (double-
+    // click, duplicate webhook, concurrent operators). All validation,
+    // refund creation, line insertion, and status update happen inside a
+    // single transaction so the read-check-write race on cumulative totals
+    // and per-line quantities is eliminated.
     const { getNumberingFormats } = await import('./company')
     const numbering = await getNumberingFormats()
-    const cnCount = await db.salesOrderRefund.count({ where: { creditNoteNumber: { not: null } } })
-    const creditNoteNumber = `${numbering.cn_prefix}${new Date().getFullYear()}-${String(cnCount + 1).padStart(5, '0')}`
 
-    const createdRefund = await db.salesOrderRefund.create({
-      data: {
-        orderId,
-        creditNoteNumber,
-        externalRefundId: options?.externalRefundId ?? null,
-        reason: reason || null,
-        totalForeign,
-        totalBase,
-        returnWarehouseId: returnWarehouseId || null,
-      },
-      select: { id: true },
-    })
-    const createdRefundLines: Array<{
-      id: string
-      productId: string | null
-      description: string
-      qty: number
-      unitPriceBase: number
-      totalBase: number
-    }> = []
-    for (const refundLine of refundLines) {
-      const createdLine = await db.salesOrderRefundLine.create({
-        data: {
-          refundId: createdRefund.id,
-          productId: refundLine.productId,
-          description: refundLine.description,
-          qty: refundLine.qty,
-          unitPriceBase: refundLine.qty > 0 ? refundLine.totalBase / refundLine.qty : 0,
-          totalBase: refundLine.totalBase,
-        },
-        select: {
-          id: true,
-          productId: true,
-          description: true,
-          qty: true,
-          unitPriceBase: true,
-          totalBase: true,
-        },
-      })
-      createdRefundLines.push({
-        id: createdLine.id,
-        productId: createdLine.productId,
-        description: createdLine.description,
-        qty: Number(createdLine.qty),
-        unitPriceBase: Number(createdLine.unitPriceBase),
-        totalBase: Number(createdLine.totalBase),
-      })
+    type CreatedRefundLine = {
+      id: string; productId: string | null; description: string
+      qty: number; unitPriceBase: number; totalBase: number
     }
 
-    // Update order status based on total refunded vs order total
-    const totalRefundedNow = previouslyRefunded + totalBase
-    const orderTotal = Number(so.totalBase)
-    const newStatus = totalRefundedNow >= orderTotal * 0.999 ? 'REFUNDED' : 'PARTIALLY_REFUNDED'
-    await db.salesOrder.update({
-      where: { id: orderId },
-      data: { status: newStatus },
+    const txResult = await db.$transaction(async (tx) => {
+      // Lock the sales order row — prevents concurrent refund creation
+      await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+
+      const so = await tx.salesOrder.findUnique({
+        where: { id: orderId },
+        select: {
+          id: true, externalOrderNumber: true, orderNumber: true, status: true,
+          fxRateToBase: true, totalBase: true,
+          taxRatePercent: true, pricesIncludeVat: true,
+          revenueDeferredDate: true, unearnedRevenueAmount: true,
+          inventoryAllocatedDate: true, allocationBatchAmount: true,
+          lines: { select: { id: true, productId: true, qty: true } },
+        },
+      })
+      if (!so) return { error: 'Order not found' }
+
+      const fxRate = Number(so.fxRateToBase) || 1
+
+      // Validate total refund doesn't exceed order total
+      const existingRefunds = await tx.salesOrderRefund.findMany({
+        where: { orderId },
+        select: { totalBase: true },
+      })
+      const previouslyRefunded = existingRefunds.reduce((s, r) => s + Number(r.totalBase), 0)
+      if (totalBase + previouslyRefunded > Number(so.totalBase) * 1.001) {
+        return { error: 'Refund total would exceed order total' }
+      }
+
+      // Validate per-line qty doesn't exceed remaining refundable qty
+      const existingRefundLines = await tx.salesOrderRefundLine.findMany({
+        where: { refund: { orderId } },
+        select: { productId: true, qty: true },
+      })
+      const refundedQtyByProduct = new Map<string, number>()
+      for (const rl of existingRefundLines) {
+        if (!rl.productId) continue
+        refundedQtyByProduct.set(rl.productId, (refundedQtyByProduct.get(rl.productId) ?? 0) + Number(rl.qty))
+      }
+      const originalQtyByProduct = new Map<string, number>()
+      for (const sl of so.lines) {
+        if (!sl.productId) continue
+        originalQtyByProduct.set(sl.productId, (originalQtyByProduct.get(sl.productId) ?? 0) + Number(sl.qty))
+      }
+      // Validate per-line qty and block individual kit component refunds.
+      // Refund lines must target the SO-line product (the kit), not a
+      // component product that only appears in allocations/shipments.
+      // Allowing component-level refunds would break kit ratio integrity.
+      const soLineProductIds = new Set(
+        so.lines.map((sl) => sl.productId).filter((pid): pid is string => pid != null),
+      )
+      for (const rl of refundLines) {
+        if (!rl.productId || rl.qty <= 0) continue
+        // Skip external refunds (WC may send component-level data we must accept)
+        if (!options?.externalRefundId && !soLineProductIds.has(rl.productId)) {
+          return {
+            error: `Product ${rl.productId} is a kit component, not a sales line product. ` +
+              'Refund the kit product instead — component stock will be returned proportionally.',
+          }
+        }
+        const originalQty = originalQtyByProduct.get(rl.productId) ?? 0
+        const alreadyRefunded = refundedQtyByProduct.get(rl.productId) ?? 0
+        const remainingRefundable = originalQty - alreadyRefunded
+        if (rl.qty > remainingRefundable + 0.001) {
+          return { error: `Refund qty ${rl.qty} for product ${rl.productId} exceeds remaining refundable qty ${remainingRefundable.toFixed(2)}` }
+        }
+      }
+
+      const totalForeign = Math.round(totalBase * fxRate * 10000) / 10000
+      const cnCount = await tx.salesOrderRefund.count({ where: { creditNoteNumber: { not: null } } })
+      const creditNoteNumber = `${numbering.cn_prefix}${new Date().getFullYear()}-${String(cnCount + 1).padStart(5, '0')}`
+
+      const createdRefund = await tx.salesOrderRefund.create({
+        data: {
+          orderId,
+          creditNoteNumber,
+          externalRefundId: options?.externalRefundId ?? null,
+          reason: reason || null,
+          totalForeign,
+          totalBase,
+          returnWarehouseId: returnWarehouseId || null,
+        },
+        select: { id: true },
+      })
+
+      const createdRefundLines: CreatedRefundLine[] = []
+      for (const refundLine of refundLines) {
+        const createdLine = await tx.salesOrderRefundLine.create({
+          data: {
+            refundId: createdRefund.id,
+            productId: refundLine.productId,
+            description: refundLine.description,
+            qty: refundLine.qty,
+            unitPriceBase: refundLine.qty > 0 ? refundLine.totalBase / refundLine.qty : 0,
+            totalBase: refundLine.totalBase,
+          },
+          select: { id: true, productId: true, description: true, qty: true, unitPriceBase: true, totalBase: true },
+        })
+        createdRefundLines.push({
+          id: createdLine.id, productId: createdLine.productId,
+          description: createdLine.description,
+          qty: Number(createdLine.qty), unitPriceBase: Number(createdLine.unitPriceBase),
+          totalBase: Number(createdLine.totalBase),
+        })
+      }
+
+      // Update order status
+      const totalRefundedNow = previouslyRefunded + totalBase
+      const orderTotal = Number(so.totalBase)
+      const newStatus = totalRefundedNow >= orderTotal * 0.999 ? 'REFUNDED' : 'PARTIALLY_REFUNDED'
+      await tx.salesOrder.update({ where: { id: orderId }, data: { status: newStatus } })
+
+      return { so, fxRate, createdRefund, createdRefundLines, previouslyRefunded, creditNoteNumber, newStatus }
     })
+
+    if ('error' in txResult) return { success: false, error: txResult.error }
+
+    const { so, fxRate, createdRefund, createdRefundLines, creditNoteNumber, newStatus } = txResult
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)

@@ -24,6 +24,55 @@ import {
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 const ALLOCATION_EPSILON = 0.000001
 
+/**
+ * If the daily batch A2 has already staged this order's allocations for
+ * accounting (inventoryAllocatedDate is set), any subsequent allocation
+ * edit would orphan the FIFO snapshots that Group B and refund reversals
+ * depend on. Reset the accounting flags so A2 re-runs for this order on
+ * the next daily batch, re-snapshotting the updated allocations.
+ *
+ * Safe to call unconditionally — no-ops when inventoryAllocatedDate is null.
+ * Must run inside the same transaction as the allocation mutation.
+ */
+async function resetAllocationAccountingIfStaged(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+): Promise<void> {
+  const so = await tx.salesOrder.findUnique({
+    where: { id: orderId },
+    select: { inventoryAllocatedDate: true },
+  })
+  if (!so?.inventoryAllocatedDate) return
+
+  // Check if any shipments have already been journaled — if so, we
+  // cannot simply reset because Group B has already consumed the
+  // snapshots. Block the edit instead.
+  const journaledShipment = await tx.shipment.findFirst({
+    where: { orderId, shipmentJournalDate: { not: null } },
+    select: { id: true },
+  })
+  if (journaledShipment) {
+    throw new Error(
+      'Cannot modify allocations after shipments have been posted to accounting. ' +
+      'Process a refund instead, or contact finance to reverse the journal entries first.',
+    )
+  }
+
+  await tx.salesOrder.update({
+    where: { id: orderId },
+    data: {
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: null,
+    },
+  })
+  // Clear cost layer snapshots on all allocations for this order so A2
+  // rebuilds them from scratch.
+  await tx.orderAllocation.updateMany({
+    where: { orderId },
+    data: { costLayerSnapshot: Prisma.DbNull },
+  })
+}
+
 async function lockSalesOrder(
   tx: Prisma.TransactionClient,
   orderId: string,
@@ -251,7 +300,7 @@ async function validateAllocationIntegrity(
 
     const committedCoverage = committedByLine.get(line.id) ?? 0
     const remainingQty = Math.max(0, Number(line.qty) - committedCoverage)
-    if (allocatedCoverage - remainingQty > ALLOCATION_EPSILON) {
+    if (Math.abs(allocatedCoverage - remainingQty) > ALLOCATION_EPSILON && allocatedCoverage > remainingQty) {
       return `Allocation for sales line ${line.sku ?? line.description} exceeds the remaining quantity to fulfill`
     }
   }
@@ -460,6 +509,7 @@ export async function autoAllocateOrder(
     const productIds = so.lines.filter((l) => l.productId).map((l) => l.productId!)
     const allocationResult = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
+      await resetAllocationAccountingIfStaged(tx, orderId)
       const graph = await loadFulfillmentProductGraph(tx, productIds)
       const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
       for (const line of so.lines) {
@@ -659,6 +709,7 @@ export async function updateAllocation(
 
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, alloc.orderId)
+      await resetAllocationAccountingIfStaged(tx, alloc.orderId)
       await lockStockLevels(tx, [alloc.productId], Array.from(new Set([alloc.warehouseId, newWarehouseId])))
 
       const stockLevels = await tx.stockLevel.findMany({
@@ -755,6 +806,7 @@ export async function addAllocation(
 
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
+      await resetAllocationAccountingIfStaged(tx, orderId)
       const graph = await loadFulfillmentProductGraph(tx, [productId])
       const leafProductIds = listFulfillmentLeafProductIds([productId], graph)
       await lockStockLevels(tx, leafProductIds, [warehouseId])
@@ -1044,12 +1096,30 @@ export async function updateShipmentStatus(
     if (extra?.trackingNumber) data.trackingNumber = extra.trackingNumber
     if (extra?.shippingService) data.shippingService = extra.shippingService
 
-    // On SHIPPED: dispatch stock
+    // On SHIPPED: dispatch stock atomically with the status change.
+    // The status update MUST happen inside the same transaction as the
+    // stock mutation so two concurrent calls (duplicate webhook, retry,
+    // double-click) cannot both observe PACKED, both pass validation,
+    // and both decrement stock. The conditional update ensures already-
+    // shipped shipments are treated as a no-op.
     if (targetStatus === 'SHIPPED') {
       data.shippedAt = new Date()
 
-      await db.$transaction(async (tx) => {
+      const dispatched = await db.$transaction(async (tx) => {
         await lockSalesOrder(tx, shipment.orderId)
+        // Re-check status under lock — another caller may have shipped it
+        // between our initial read and this transaction.
+        const locked = await tx.shipment.findUnique({
+          where: { id: shipmentId },
+          select: { status: true },
+        })
+        if (locked?.status !== shipment.status) {
+          return false // already transitioned — no-op
+        }
+
+        // Persist shipment status change inside the tx
+        await tx.shipment.update({ where: { id: shipmentId }, data })
+
         await lockStockLevels(
           tx,
           [...new Set(shipment.lines.map((line) => line.productId))],
@@ -1077,7 +1147,12 @@ export async function updateShipmentStatus(
             },
           })
         }
+        return true
       }, STOCK_TX_OPTIONS)
+
+      if (!dispatched) {
+        return { success: true } // idempotent — already shipped
+      }
 
       for (const line of shipment.lines) {
         const qty = Number(line.qty)
@@ -1091,10 +1166,10 @@ export async function updateShipmentStatus(
           metadata: { sku: line.product.sku, productId: line.productId, qty, orderNumber: shipment.order.orderNumber ?? shipment.order.externalOrderNumber, warehouseId: shipment.warehouseId },
         })
       }
+    } else {
+      // Non-SHIPPED transitions: simple status update
+      await db.shipment.update({ where: { id: shipmentId }, data })
     }
-
-    // Persist the shipment status change FIRST, before checking order-level status
-    await db.shipment.update({ where: { id: shipmentId }, data })
 
     // After persisting, check if ALL shipments for this order are now shipped
     if (targetStatus === 'SHIPPED') {
