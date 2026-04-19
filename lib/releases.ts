@@ -12,6 +12,22 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '1.5.0',
+    date: '2026-04-19',
+    title: 'Onboarding company-step flow cleanup',
+    summary: 'The onboarding wizard now uses a single Next action on Company Details, which saves the form and advances without a redundant separate save button.',
+    userMessage: 'The Company Details step in onboarding is simpler: Next now saves your details and moves you forward in one action.',
+    userHighlights: [
+      'Removed the separate Save Company Details button from onboarding.',
+      'Made Next save the company details step and advance in one click.',
+      'Added coverage for the Company Details Next flow in end-to-end tests.',
+    ],
+    technicalHighlights: [
+      'Moved the company-step save trigger behind the shared onboarding navigation so the footer action can persist state before changing steps.',
+      'Bumped the visible release version and release notes for the onboarding flow change.',
+    ],
+  },
+  {
     version: '1.4.1',
     date: '2026-04-19',
     title: 'Deployment script hotfix',
