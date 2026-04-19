@@ -1,0 +1,73 @@
+name: Schema Guardrails
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/schema-guardrails.yml"
+      - ".github/pull_request_template.md"
+      - "docs/development.md"
+      - "package.json"
+      - "prisma/**"
+      - "scripts/check-prisma-drift.mjs"
+      - "scripts/check-prisma-schema-scope.mjs"
+      - "scripts/deploy.sh"
+      - "scripts/install.sh"
+      - "scripts/update.sh"
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - ".github/workflows/schema-guardrails.yml"
+      - "docs/development.md"
+      - "package.json"
+      - "prisma/**"
+      - "scripts/check-prisma-drift.mjs"
+      - "scripts/check-prisma-schema-scope.mjs"
+      - "scripts/deploy.sh"
+      - "scripts/install.sh"
+      - "scripts/update.sh"
+
+jobs:
+  migration-scope:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Verify migration/schema parity in the PR diff
+        run: node scripts/check-prisma-schema-scope.mjs "origin/${{ github.base_ref }}" HEAD
+
+  fresh-db-drift:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ims_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ims_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ims_ci?schema=public
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate --schema prisma/schema.prisma
+      - run: npx prisma migrate deploy --schema prisma/schema.prisma
+      - name: Verify deployed database matches prisma/schema.prisma
+        run: node scripts/check-prisma-drift.mjs

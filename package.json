@@ -14,6 +14,8 @@
     "db:seed": "tsx prisma/seed.ts",
     "db:seed:e2e": "tsx e2e/prepare.ts",
     "db:studio": "prisma studio",
+    "db:schema:drift": "node scripts/check-prisma-drift.mjs",
+    "db:schema:scope": "node scripts/check-prisma-schema-scope.mjs",
     "cli": "tsx scripts/cli.ts",
     "e2e": "playwright test",
     "e2e:select": "node scripts/e2e-select.mjs",

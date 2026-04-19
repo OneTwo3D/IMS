@@ -206,7 +206,7 @@ success "Migrations applied."
 header "Validating database schema"
 
 run_as_user "${APP_USER}" env DATABASE_URL="${DATABASE_URL}" \
-  npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code >/dev/null
+  node "${APP_DIR}/scripts/check-prisma-drift.mjs"
 success "Database schema matches prisma/schema.prisma."
 
 # ---------------------------------------------------------------------------

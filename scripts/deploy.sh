@@ -70,7 +70,7 @@ if ! $SKIP_MIGRATE; then
   ok "Migrations up to date."
 
   info "Validating database schema..."
-  npx prisma migrate diff --from-config-datasource --to-schema prisma/schema.prisma --exit-code >/dev/null
+  node scripts/check-prisma-drift.mjs
   ok "Database schema matches prisma/schema.prisma."
 fi
 
