@@ -108,16 +108,17 @@ export async function connectAccountingConnector(
   clientId: string,
   clientSecret: string,
   origin: string,
+  returnPath?: string,
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
   const connector = await getActiveConnector()
   switch (connector) {
     case 'quickbooks': {
       const { connectQuickBooks } = await import('@/app/actions/quickbooks-sync')
-      return connectQuickBooks(clientId, clientSecret, origin)
+      return connectQuickBooks(clientId, clientSecret, origin, returnPath)
     }
     default: {
       const { connectXero } = await import('@/app/actions/xero-sync')
-      return connectXero(clientId, clientSecret, origin)
+      return connectXero(clientId, clientSecret, origin, returnPath)
     }
   }
 }

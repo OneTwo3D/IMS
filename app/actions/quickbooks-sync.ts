@@ -102,6 +102,7 @@ export async function connectQuickBooks(
   clientId: string,
   clientSecret: string,
   origin: string,
+  returnPath?: string,
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
   try {
     void origin
@@ -121,7 +122,7 @@ export async function connectQuickBooks(
       return { success: false, error: 'Public app URL is not configured.' }
     }
     const redirectUri = `${publicAppUrl}/api/accounting/callback`
-    const authUrl = await getAuthorizationUrl(clientId, redirectUri, session.user.id)
+    const authUrl = await getAuthorizationUrl(clientId, redirectUri, session.user.id, returnPath)
 
     return { success: true, redirectUrl: authUrl }
   } catch (e) {

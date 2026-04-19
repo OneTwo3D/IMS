@@ -1,6 +1,7 @@
 'use client'
 
-import { useState, useTransition, useRef } from 'react'
+import { useEffect, useState, useTransition, useRef } from 'react'
+import { useRouter } from 'next/navigation'
 import { Building2, Camera, Loader2, Upload, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -13,6 +14,7 @@ type Props = {
 }
 
 export function CompanyStep({ org: initialOrg, onSaved }: Props) {
+  const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [co, setCo] = useState(initialOrg)
   const [logoUrl, setLogoUrl] = useState(initialOrg.logoUrl)
@@ -20,6 +22,11 @@ export function CompanyStep({ org: initialOrg, onSaved }: Props) {
   const [error, setError] = useState('')
   const [saved, setSaved] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    setCo(initialOrg)
+    setLogoUrl(initialOrg.logoUrl)
+  }, [initialOrg])
 
   function field(key: keyof OrganisationData, label: string, opts?: { type?: string; span?: number }) {
     return (
@@ -65,6 +72,7 @@ export function CompanyStep({ org: initialOrg, onSaved }: Props) {
         return
       }
       setSaved(true)
+      router.refresh()
       onSaved()
       setTimeout(() => setSaved(false), 2000)
     })

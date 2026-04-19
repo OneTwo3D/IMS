@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import {
   ArrowLeft, ArrowRight, Building2, Check, CheckCircle2, Coins, ExternalLink,
@@ -43,6 +43,8 @@ type Props = {
   initialStep: number
   org: OrganisationData
   baseCurrencyLocked: boolean
+  companyConfigured: boolean
+  currencyConfigured: boolean
   currencies: CurrencyRow[]
   taxRates: TaxRateRow[]
   warehouses: WarehouseRow[]
@@ -59,6 +61,8 @@ export function OnboardingClient({
   initialStep,
   org,
   baseCurrencyLocked,
+  companyConfigured: initialCompanyConfigured,
+  currencyConfigured: initialCurrencyConfigured,
   currencies,
   taxRates,
   warehouses,
@@ -79,18 +83,53 @@ export function OnboardingClient({
     return set
   })
   const [plugins, setPlugins] = useState(initialPluginState)
+  const [companyConfigured, setCompanyConfigured] = useState(initialCompanyConfigured)
+  const [currencyConfigured, setCurrencyConfigured] = useState(initialCurrencyConfigured)
   const [finishing, setFinishing] = useState(false)
+  const [finishError, setFinishError] = useState('')
   const [stockImported, setStockImported] = useState(false)
 
   const currentStepDef = STEPS[step]
   const isFirst = step === 0
   const isLast = step === STEPS.length - 1
 
+  useEffect(() => {
+    setPlugins(initialPluginState)
+  }, [initialPluginState])
+
+  useEffect(() => {
+    setCompanyConfigured(initialCompanyConfigured)
+  }, [initialCompanyConfigured])
+
+  useEffect(() => {
+    setCurrencyConfigured(initialCurrencyConfigured)
+  }, [initialCurrencyConfigured])
+
   function markComplete(key: string) {
     setCompletedSteps((prev) => new Set(prev).add(key))
   }
 
+  function isStepReady(index: number) {
+    const key = STEPS[index]?.key
+    if (key === 'company') return companyConfigured
+    if (key === 'currency') return currencyConfigured
+    return true
+  }
+
+  function canAdvanceFromCurrentStep() {
+    return isStepReady(step)
+  }
+
+  function canAccessStep(index: number) {
+    if (index === step) return true
+    if (index < step) return true
+    if (index === step + 1) return canAdvanceFromCurrentStep()
+    return STEPS.slice(0, index).every((_, priorIndex) => completedSteps.has(STEPS[priorIndex].key))
+  }
+
   async function goTo(index: number) {
+    if (!canAccessStep(index)) return
+
     // Mark current step as visited
     markComplete(STEPS[step].key)
     setStep(index)
@@ -107,8 +146,14 @@ export function OnboardingClient({
 
   async function handleFinish() {
     setFinishing(true)
+    setFinishError('')
+    const result = await completeOnboarding()
+    if (!result.success) {
+      setFinishError(result.error ?? 'Failed to complete onboarding.')
+      setFinishing(false)
+      return
+    }
     markComplete('done')
-    await completeOnboarding()
     router.push('/dashboard')
   }
 
@@ -125,6 +170,7 @@ export function OnboardingClient({
               steps={STEPS}
               currentStep={step}
               completedSteps={completedSteps}
+              isStepAccessible={canAccessStep}
               onStepClick={goTo}
             />
           </div>
@@ -161,7 +207,10 @@ export function OnboardingClient({
             {step === 1 && (
               <CompanyStep
                 org={org}
-                onSaved={() => markComplete('company')}
+                onSaved={() => {
+                  setCompanyConfigured(true)
+                  markComplete('company')
+                }}
               />
             )}
 
@@ -172,7 +221,10 @@ export function OnboardingClient({
                 baseCurrencyLocked={baseCurrencyLocked}
                 currencies={currencies}
                 financialYearStart={financialYearStart}
-                onSaved={() => markComplete('currency')}
+                onSaved={() => {
+                  setCurrencyConfigured(true)
+                  markComplete('currency')
+                }}
               />
             )}
 
@@ -333,6 +385,8 @@ export function OnboardingClient({
                   </div>
                 )}
 
+                {finishError && <p className="text-sm text-destructive">{finishError}</p>}
+
                 <Button onClick={handleFinish} disabled={finishing} size="lg">
                   {finishing ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
                   Go to Dashboard
@@ -355,7 +409,7 @@ export function OnboardingClient({
                     Skip
                   </Button>
                 )}
-                <Button onClick={handleNext} disabled={isLast}>
+                <Button onClick={handleNext} disabled={isLast || !canAdvanceFromCurrentStep()}>
                   Next
                   <ArrowRight className="h-4 w-4 ml-2" />
                 </Button>

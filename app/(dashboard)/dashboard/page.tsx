@@ -1,7 +1,7 @@
 import type { Metadata } from 'next'
 import { getDashboardData } from '@/app/actions/dashboard'
 import { auth } from '@/lib/auth'
-import { isOnboardingComplete, isOnboardingDismissed } from '@/app/actions/onboarding'
+import { shouldShowOnboardingBanner } from '@/app/actions/onboarding'
 import { DashboardClient } from './dashboard-client'
 
 export const metadata: Metadata = { title: 'Dashboard' }
@@ -20,11 +20,7 @@ export default async function Page() {
   // Show onboarding banner only for admins who haven't completed or dismissed it
   let showOnboardingBanner = false
   if (session?.user?.role === 'ADMIN') {
-    const [complete, dismissed] = await Promise.all([
-      isOnboardingComplete(),
-      isOnboardingDismissed(),
-    ])
-    showOnboardingBanner = !complete && !dismissed
+    showOnboardingBanner = await shouldShowOnboardingBanner()
   }
 
   return (

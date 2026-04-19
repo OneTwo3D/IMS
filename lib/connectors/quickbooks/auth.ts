@@ -40,6 +40,11 @@ type StoredAccountingToken = {
   tenantName: string | null
 }
 
+type OAuthStatePayload = {
+  initiatorUserId: string
+  returnPath: string | null
+}
+
 let refreshInFlight: Promise<{ accessToken: string; realmId: string } | null> | null = null
 
 function buildBasicAuth(clientId: string, clientSecret: string): string {
@@ -196,9 +201,14 @@ export async function getAuthorizationUrl(
   clientId: string,
   redirectUri: string,
   initiatorUserId: string,
+  returnPath?: string,
 ): Promise<string> {
   const state = crypto.randomUUID()
-  await setAuthToken(`${QBO_OAUTH_STATE_PREFIX}${state}`, initiatorUserId, QBO_OAUTH_STATE_TTL_MS)
+  const payload: OAuthStatePayload = {
+    initiatorUserId,
+    returnPath: returnPath && returnPath.startsWith('/') ? returnPath : null,
+  }
+  await setAuthToken(`${QBO_OAUTH_STATE_PREFIX}${state}`, JSON.stringify(payload), QBO_OAUTH_STATE_TTL_MS)
   const params = new URLSearchParams({
     response_type: 'code',
     client_id: clientId,
@@ -213,9 +223,20 @@ export async function getAuthorizationUrl(
  * Validate and consume a previously issued QuickBooks OAuth state token.
  * Returns the initiating user ID on success, or null if invalid/expired/consumed.
  */
-export async function consumeQuickBooksOAuthState(state: string): Promise<string | null> {
+export async function consumeQuickBooksOAuthState(state: string): Promise<OAuthStatePayload | null> {
   if (!state) return null
-  return consumeAuthToken(`${QBO_OAUTH_STATE_PREFIX}${state}`)
+  const value = await consumeAuthToken(`${QBO_OAUTH_STATE_PREFIX}${state}`)
+  if (!value) return null
+  try {
+    const parsed = JSON.parse(value) as Partial<OAuthStatePayload>
+    if (typeof parsed.initiatorUserId !== 'string' || !parsed.initiatorUserId) return null
+    return {
+      initiatorUserId: parsed.initiatorUserId,
+      returnPath: typeof parsed.returnPath === 'string' && parsed.returnPath.startsWith('/') ? parsed.returnPath : null,
+    }
+  } catch {
+    return { initiatorUserId: value, returnPath: null }
+  }
 }
 
 /**

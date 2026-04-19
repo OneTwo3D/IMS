@@ -14,15 +14,17 @@ type Props = {
   steps: StepDef[]
   currentStep: number
   completedSteps: Set<string>
+  isStepAccessible: (index: number) => boolean
   onStepClick: (index: number) => void
 }
 
-export function WizardStepper({ steps, currentStep, completedSteps, onStepClick }: Props) {
+export function WizardStepper({ steps, currentStep, completedSteps, isStepAccessible, onStepClick }: Props) {
   return (
     <nav className="flex flex-col gap-1" aria-label="Setup progress">
       {steps.map((step, i) => {
         const isActive = i === currentStep
         const isComplete = completedSteps.has(step.key)
+        const isAccessible = isStepAccessible(i)
         const Icon = step.icon
 
         return (
@@ -30,13 +32,16 @@ export function WizardStepper({ steps, currentStep, completedSteps, onStepClick 
             key={step.key}
             type="button"
             onClick={() => onStepClick(i)}
+            disabled={!isAccessible}
             className={cn(
               'flex items-center gap-3 rounded-lg px-3 py-2.5 text-left text-sm transition-colors',
               isActive
                 ? 'bg-primary/10 text-primary font-medium'
                 : isComplete
                   ? 'text-muted-foreground hover:bg-muted/50'
-                  : 'text-muted-foreground/60 hover:bg-muted/50',
+                  : isAccessible
+                    ? 'text-muted-foreground/60 hover:bg-muted/50'
+                    : 'cursor-not-allowed text-muted-foreground/40',
             )}
           >
             <span

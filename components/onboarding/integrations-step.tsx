@@ -1,6 +1,7 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useEffect, useState, useTransition } from 'react'
+import { useRouter } from 'next/navigation'
 import { Check, ExternalLink, Loader2, ShoppingCart, Store, BookOpen, Calculator } from 'lucide-react'
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
@@ -8,10 +9,9 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card } from '@/components/ui/card'
 import { Switch } from '@/components/ui/switch'
-import { setSetting } from '@/app/actions/settings'
-import { syncCrontab } from '@/app/actions/cron'
 import { saveShoppingConnectorCredentials, saveShopifyConnectorCredentials } from '@/app/actions/shopping-sync'
 import { connectAccountingConnector, saveAccountingSettings } from '@/app/actions/accounting-sync'
+import { saveOnboardingPluginState } from '@/app/actions/onboarding'
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
 import type { ShoppingConnectorCredentials, ShopifyConnectorCredentials } from '@/app/actions/shopping-sync'
 import type { AccountingConnectionStatus, AccountingConnectorSettingsMasked } from '@/app/actions/accounting-sync'
@@ -33,6 +33,7 @@ export function IntegrationsStep({
   accountingStatus: initialAccountingStatus,
   onPluginStateChange,
 }: Props) {
+  const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [plugins, setPlugins] = useState(initialPluginState)
   const [pluginsSaved, setPluginsSaved] = useState(false)
@@ -53,8 +54,39 @@ export function IntegrationsStep({
   // Accounting credentials
   const [acClientId, setAcClientId] = useState(initialAccountingSettings.client_id ?? initialAccountingSettings.xero_client_id ?? initialAccountingSettings.quickbooks_client_id ?? '')
   const [acClientSecret, setAcClientSecret] = useState(initialAccountingSettings.secretMasked ? '' : (initialAccountingSettings.client_secret ?? ''))
-  const [accountingStatus] = useState(initialAccountingStatus)
+  const accountingStatus = initialAccountingStatus
   const [acSaved, setAcSaved] = useState(false)
+
+  useEffect(() => {
+    setPlugins(initialPluginState)
+  }, [initialPluginState])
+
+  useEffect(() => {
+    setWcUrl(initialWcCreds.url)
+    setWcKey(initialWcCreds.key)
+    setWcSecret(initialWcCreds.secretMasked ? '' : initialWcCreds.secret)
+  }, [initialWcCreds])
+
+  useEffect(() => {
+    setShopifyDomain(initialShopifyCreds.storeDomain)
+    setShopifyToken(initialShopifyCreds.accessTokenMasked ? '' : initialShopifyCreds.adminApiAccessToken)
+    setShopifyWebhookSecret(initialShopifyCreds.webhookSecretMasked ? '' : initialShopifyCreds.webhookSecret)
+  }, [initialShopifyCreds])
+
+  useEffect(() => {
+    setAcClientId(initialAccountingSettings.client_id ?? initialAccountingSettings.xero_client_id ?? initialAccountingSettings.quickbooks_client_id ?? '')
+    setAcClientSecret(initialAccountingSettings.secretMasked ? '' : (initialAccountingSettings.client_secret ?? ''))
+  }, [initialAccountingSettings])
+
+  async function persistPlugins(nextPlugins = plugins) {
+    const result = await saveOnboardingPluginState(nextPlugins)
+    if (!result.success) {
+      setError(result.error ?? 'Failed to save plugin settings')
+      return false
+    }
+    onPluginStateChange(nextPlugins)
+    return true
+  }
 
   function togglePlugin(key: keyof IntegrationPluginState, value: boolean) {
     setPlugins((prev) => {
@@ -75,19 +107,12 @@ export function IntegrationsStep({
     setPluginsSaved(false)
     startTransition(async () => {
       try {
-        await Promise.all([
-          setSetting('plugin_woocommerce_enabled', String(plugins.woocommerce)),
-          setSetting('plugin_shopify_enabled', String(plugins.shopify)),
-          setSetting('plugin_xero_enabled', String(plugins.xero)),
-          setSetting('plugin_quickbooks_enabled', String(plugins.quickbooks)),
-        ])
-        const result = await syncCrontab()
-        if (!result.success) {
-          setError(result.error ?? 'Failed to apply scheduler changes')
+        const ok = await persistPlugins(plugins)
+        if (!ok) {
           return
         }
-        onPluginStateChange(plugins)
         setPluginsSaved(true)
+        router.refresh()
         setTimeout(() => setPluginsSaved(false), 2000)
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to save')
@@ -100,8 +125,15 @@ export function IntegrationsStep({
     setWcSaved(false)
     startTransition(async () => {
       try {
-        await saveShoppingConnectorCredentials(wcUrl, wcKey, wcSecret)
+        const pluginsPersisted = await persistPlugins(plugins)
+        if (!pluginsPersisted) return
+        const result = await saveShoppingConnectorCredentials(wcUrl, wcKey, wcSecret)
+        if (!result.success) {
+          setError(result.error ?? 'Failed to save WooCommerce credentials')
+          return
+        }
         setWcSaved(true)
+        router.refresh()
         setTimeout(() => setWcSaved(false), 2000)
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to save WooCommerce credentials')
@@ -114,12 +146,15 @@ export function IntegrationsStep({
     setShopifySaved(false)
     startTransition(async () => {
       try {
+        const pluginsPersisted = await persistPlugins(plugins)
+        if (!pluginsPersisted) return
         const result = await saveShopifyConnectorCredentials(shopifyDomain, shopifyToken, shopifyWebhookSecret)
         if (!result.success) {
           setError(result.error ?? 'Failed to save Shopify credentials')
           return
         }
         setShopifySaved(true)
+        router.refresh()
         setTimeout(() => setShopifySaved(false), 2000)
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to save Shopify credentials')
@@ -131,6 +166,9 @@ export function IntegrationsStep({
     setError('')
     startTransition(async () => {
       try {
+        const pluginsPersisted = await persistPlugins(plugins)
+        if (!pluginsPersisted) return
+
         // Save credentials first
         const connector = plugins.quickbooks ? 'quickbooks' : 'xero'
         const settingsData: Record<string, string> = {}
@@ -150,10 +188,8 @@ export function IntegrationsStep({
 
         // Initiate OAuth — redirects to external login
         const origin = window.location.origin
-        const result = await connectAccountingConnector(acClientId, acClientSecret, origin)
+        const result = await connectAccountingConnector(acClientId, acClientSecret, origin, '/onboarding')
         if (result.redirectUrl) {
-          // Store a flag so the OAuth callback redirects back to /onboarding
-          await setSetting('onboarding_oauth_pending', 'true')
           window.location.href = result.redirectUrl
         } else if (result.error) {
           setError(result.error)
