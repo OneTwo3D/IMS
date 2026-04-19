@@ -12,12 +12,14 @@ import { ProductLink } from '@/components/inventory/product-link'
 import type { KpiSummary, ChartPoint, TopProduct, RecentOrder, IncomingPO, Period, CompareMode } from '@/app/actions/dashboard'
 import { getDashboardData } from '@/app/actions/dashboard'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { OnboardingBanner } from '@/components/layout/onboarding-banner'
 import { formatCompactMoney, formatMoney } from '@/lib/utils'
 
 type Props = {
   kpi: KpiSummary; chartData: ChartPoint[]; topProducts: TopProduct[]
   recentOrders: RecentOrder[]; incomingPOs: IncomingPO[]
   periodLabel: string; compLabel: string; initialPeriod: Period; initialCompare: CompareMode
+  showOnboardingBanner?: boolean
 }
 
 function fmtDateShort(iso: string): string { return new Date(iso).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) }
@@ -122,7 +124,7 @@ function DesktopChartFrame({
   )
 }
 
-export function DashboardClient({ kpi: initKpi, chartData: initChart, topProducts: initTop, recentOrders, incomingPOs, periodLabel: initPL, compLabel: initCL, initialPeriod, initialCompare }: Props) {
+export function DashboardClient({ kpi: initKpi, chartData: initChart, topProducts: initTop, recentOrders, incomingPOs, periodLabel: initPL, compLabel: initCL, initialPeriod, initialCompare, showOnboardingBanner }: Props) {
   const baseCurrency = useBaseCurrency()
   const fmtBase = (value: number) => formatCompactMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const fmtBaseFull = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
@@ -189,6 +191,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
 
   return (
     <div className="space-y-4 md:space-y-5">
+      {showOnboardingBanner && <OnboardingBanner />}
       {/* Header */}
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex items-center gap-2">

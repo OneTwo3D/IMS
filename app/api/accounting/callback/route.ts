@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { logActivity } from '@/lib/activity-log'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { getPublicAppUrl } from '@/lib/public-app-url'
+import { getSettingValue } from '@/lib/settings-store'
 
 function getExternalOrigin(request: Request): string {
   const fwdProto = (request.headers.get('x-forwarded-proto') ?? 'https').split(',')[0].trim()
@@ -10,8 +11,11 @@ function getExternalOrigin(request: Request): string {
   return new URL(request.url).origin
 }
 
-function redirectWithStatus(origin: string, connector: string, params: Record<string, string>) {
-  const url = new URL(`/sync?connector=${connector}`, origin)
+async function redirectWithStatus(origin: string, connector: string, params: Record<string, string>) {
+  // If the OAuth flow was initiated from the onboarding wizard, redirect back there
+  const onboardingPending = await getSettingValue('onboarding_oauth_pending')
+  const basePath = onboardingPending === 'true' ? '/onboarding' : `/sync?connector=${connector}`
+  const url = new URL(basePath, origin)
   for (const [key, value] of Object.entries(params)) {
     url.searchParams.set(key, value)
   }
@@ -34,22 +38,22 @@ export async function GET(request: Request) {
   const connector = isQuickBooks ? 'quickbooks' : 'xero'
 
   if (connector === 'xero' && !(await isIntegrationPluginEnabled('xero'))) {
-    return redirectWithStatus(origin, connector, { accounting_error: 'Accounting plugin is disabled' })
+    return await redirectWithStatus(origin, connector, { accounting_error: 'Accounting plugin is disabled' })
   }
   if (connector === 'quickbooks' && !(await isIntegrationPluginEnabled('quickbooks'))) {
-    return redirectWithStatus(origin, connector, { accounting_error: 'Accounting plugin is disabled' })
+    return await redirectWithStatus(origin, connector, { accounting_error: 'Accounting plugin is disabled' })
   }
 
   if (error) {
-    return redirectWithStatus(origin, connector, { accounting_error: error })
+    return await redirectWithStatus(origin, connector, { accounting_error: error })
   }
 
   if (!code) {
-    return redirectWithStatus(origin, connector, { accounting_error: 'No authorization code' })
+    return await redirectWithStatus(origin, connector, { accounting_error: 'No authorization code' })
   }
 
   if (!state) {
-    return redirectWithStatus(origin, connector, { accounting_error: 'Missing OAuth state' })
+    return await redirectWithStatus(origin, connector, { accounting_error: 'Missing OAuth state' })
   }
 
   try {
@@ -60,10 +64,10 @@ export async function GET(request: Request) {
       const { consumeQuickBooksOAuthState, exchangeCodeForTokens } = await import('@/lib/connectors/quickbooks/auth')
       const initiatorUserId = await consumeQuickBooksOAuthState(state)
       if (!initiatorUserId) {
-        return redirectWithStatus(origin, connector, { accounting_error: 'Invalid or expired OAuth state' })
+        return await redirectWithStatus(origin, connector, { accounting_error: 'Invalid or expired OAuth state' })
       }
       if (!realmId) {
-        return redirectWithStatus(origin, connector, { accounting_error: 'Missing realmId in QuickBooks callback' })
+        return await redirectWithStatus(origin, connector, { accounting_error: 'Missing realmId in QuickBooks callback' })
       }
       const result = await exchangeCodeForTokens(code, realmId, redirectUri)
       if (result.success) {
@@ -75,16 +79,16 @@ export async function GET(request: Request) {
           description: `Connected accounting company: ${result.tenantName}`,
           metadata: { connector: 'quickbooks', tenantName: result.tenantName, initiatorUserId },
         })
-        return redirectWithStatus(origin, connector, { accounting_success: result.tenantName ?? 'Connected' })
+        return await redirectWithStatus(origin, connector, { accounting_success: result.tenantName ?? 'Connected' })
       }
-      return redirectWithStatus(origin, connector, { accounting_error: result.error ?? 'Unknown error' })
+      return await redirectWithStatus(origin, connector, { accounting_error: result.error ?? 'Unknown error' })
     }
 
     // Xero flow
     const { consumeXeroOAuthState, exchangeCodeForTokens } = await import('@/lib/connectors/xero/auth')
     const initiatorUserId = await consumeXeroOAuthState(state)
     if (!initiatorUserId) {
-      return redirectWithStatus(origin, connector, { accounting_error: 'Invalid or expired OAuth state' })
+      return await redirectWithStatus(origin, connector, { accounting_error: 'Invalid or expired OAuth state' })
     }
     const result = await exchangeCodeForTokens(code, redirectUri)
     if (result.success) {
@@ -96,10 +100,10 @@ export async function GET(request: Request) {
         description: `Connected accounting organisation: ${result.tenantName}`,
         metadata: { connector: 'xero', tenantName: result.tenantName, initiatorUserId },
       })
-      return redirectWithStatus(origin, connector, { accounting_success: result.tenantName ?? 'Connected' })
+      return await redirectWithStatus(origin, connector, { accounting_success: result.tenantName ?? 'Connected' })
     }
-    return redirectWithStatus(origin, connector, { accounting_error: result.error ?? 'Unknown error' })
+    return await redirectWithStatus(origin, connector, { accounting_error: result.error ?? 'Unknown error' })
   } catch (e) {
-    return redirectWithStatus(origin, connector, { accounting_error: String(e) })
+    return await redirectWithStatus(origin, connector, { accounting_error: String(e) })
   }
 }
