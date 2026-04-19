@@ -649,8 +649,14 @@ export async function runDailyBatchSync(): Promise<{
         shipmentsByOrder.set(shipment.orderId, existing)
       }
 
-      for (const [, orderShipments] of shipmentsByOrder) {
+      for (const [orderId, orderShipments] of shipmentsByOrder) {
         const firstShipment = orderShipments[0]
+        // Wrap per-order processing so a single order with a COGS gap
+        // (e.g. cross-warehouse allocation mismatch, missing cost layers)
+        // is skipped with an error log instead of aborting the entire
+        // daily batch and rolling back every other order's revenue
+        // recognition and COGS posting.
+        try {
         const deferredBase = Number(firstShipment.order.unearnedRevenueAmount ?? firstShipment.order.totalBase)
         const orderLineTotal = firstShipment.order.lines.reduce((sum, line) => sum + Number(line.totalBase), 0)
         const requirementsByLine = new Map(
@@ -748,6 +754,22 @@ export async function runDailyBatchSync(): Promise<{
               sl.id,
               shipmentCostSnapshot.filter((entry) => entry.shipmentLineId === sl.id),
             )
+          }
+        }
+        } catch (orderError) {
+          // Per-order failure: skip this order, log the error, continue
+          // with remaining orders so the batch isn't blocked by one bad order.
+          const orderRef = firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8)
+          result.errors.push(`Group B order ${orderRef}: ${String(orderError)}`)
+          // Remove any partially-accumulated results for this order's shipments
+          for (const s of orderShipments) {
+            const sr = shipmentResults.get(s.id)
+            if (sr) {
+              totalRevenue -= sr.revenue
+              totalCogs -= sr.cogs
+              shipmentResults.delete(s.id)
+            }
+            for (const sl of s.lines) shipmentSnapshots.delete(sl.id)
           }
         }
       }

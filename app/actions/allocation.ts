@@ -886,6 +886,7 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
 
     const allocs = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
+      await resetAllocationAccountingIfStaged(tx, orderId)
       const currentAllocs = await tx.orderAllocation.findMany({
         where: { orderId },
         select: { lineId: true, productId: true, warehouseId: true, qty: true },
@@ -1059,6 +1060,65 @@ export async function confirmAllocations(
 }
 
 // ---------------------------------------------------------------------------
+// Post-shipment reconciliation — idempotent, safe to re-run on retries.
+// Checks whether all shipments for the order are shipped, advances order
+// status, aggregates tracking numbers, and triggers auto-invoicing.
+// ---------------------------------------------------------------------------
+
+type ShipmentContext = {
+  orderId: string
+  lines: Array<{ productId: string }>
+  warehouse: { code: string }
+  order: { orderNumber: string | null; externalOrderNumber: string | null }
+}
+
+async function reconcileOrderAfterShipment(
+  shipment: ShipmentContext,
+  extra?: { trackingNumber?: string; shippingService?: string },
+): Promise<void> {
+  const allShipments = await db.shipment.findMany({
+    where: { orderId: shipment.orderId },
+    select: { id: true, status: true },
+  })
+  const allShipped = allShipments.every((s) => s.status === 'SHIPPED')
+
+  if (allShipped) {
+    const shippedShipments = await db.shipment.findMany({
+      where: { orderId: shipment.orderId },
+      select: { trackingNumber: true },
+    })
+    const trackingNumbers = shippedShipments
+      .map((s) => s.trackingNumber)
+      .filter(Boolean)
+      .join(', ')
+
+    // Only advance if order is not already in a terminal state
+    const currentOrder = await db.salesOrder.findUnique({
+      where: { id: shipment.orderId },
+      select: { status: true },
+    })
+    if (currentOrder && !['SHIPPED', 'COMPLETED', 'DELIVERED', 'REFUNDED', 'CANCELLED'].includes(currentOrder.status)) {
+      await db.salesOrder.update({
+        where: { id: shipment.orderId },
+        data: {
+          status: 'SHIPPED',
+          shippedAt: new Date(),
+          trackingNumber: trackingNumbers || (extra?.trackingNumber ?? null),
+        },
+      })
+    }
+
+    // Auto-generate invoice on ship if configured (idempotent — checks
+    // if invoice already exists inside generateInvoiceNumber)
+    const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
+    if (trigger?.value === 'on_shipped') {
+      const { generateInvoiceNumber } = await import('./sales')
+      await generateInvoiceNumber(shipment.orderId)
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Update shipment (tracking, status)
 // ---------------------------------------------------------------------------
 
@@ -1081,6 +1141,17 @@ export async function updateShipmentStatus(
       },
     })
     if (!shipment) return { success: false, error: 'Shipment not found' }
+
+    // Idempotent: if the shipment is already at the target status, re-run
+    // the post-commit reconciliation (order status, tracking, invoice,
+    // delivery metadata, stock sync) which may have been missed on a prior
+    // attempt that committed the tx but crashed before finishing side-effects.
+    if (shipment.status === targetStatus) {
+      if (targetStatus === 'SHIPPED') {
+        await reconcileOrderAfterShipment(shipment, extra)
+      }
+      return { success: true }
+    }
 
     const VALID: Record<string, string[]> = {
       PENDING: ['PICKING'],
@@ -1171,41 +1242,8 @@ export async function updateShipmentStatus(
       await db.shipment.update({ where: { id: shipmentId }, data })
     }
 
-    // After persisting, check if ALL shipments for this order are now shipped
     if (targetStatus === 'SHIPPED') {
-      const allShipments = await db.shipment.findMany({
-        where: { orderId: shipment.orderId },
-        select: { id: true, status: true },
-      })
-      const allShipped = allShipments.every((s) => s.status === 'SHIPPED')
-
-      if (allShipped) {
-        // Collect all tracking numbers
-        const shippedShipments = await db.shipment.findMany({
-          where: { orderId: shipment.orderId },
-          select: { trackingNumber: true },
-        })
-        const trackingNumbers = shippedShipments
-          .map((s) => s.trackingNumber)
-          .filter(Boolean)
-          .join(', ')
-
-        await db.salesOrder.update({
-          where: { id: shipment.orderId },
-          data: {
-            status: 'SHIPPED',
-            shippedAt: new Date(),
-            trackingNumber: trackingNumbers || (extra?.trackingNumber ?? null),
-          },
-        })
-
-        // Auto-generate invoice on ship if configured
-        const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
-        if (trigger?.value === 'on_shipped') {
-          const { generateInvoiceNumber } = await import('./sales')
-          await generateInvoiceNumber(shipment.orderId)
-        }
-      }
+      await reconcileOrderAfterShipment(shipment, extra)
     }
 
     revalidatePath('/sales')

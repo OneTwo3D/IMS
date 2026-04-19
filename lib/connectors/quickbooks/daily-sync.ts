@@ -649,8 +649,9 @@ export async function runDailyBatchSync(): Promise<{
         shipmentsByOrder.set(shipment.orderId, existing)
       }
 
-      for (const [, orderShipments] of shipmentsByOrder) {
+      for (const [orderId, orderShipments] of shipmentsByOrder) {
         const firstShipment = orderShipments[0]
+        try {
         const deferredBase = Number(firstShipment.order.unearnedRevenueAmount ?? firstShipment.order.totalBase)
         const orderLineTotal = firstShipment.order.lines.reduce((sum, line) => sum + Number(line.totalBase), 0)
         const requirementsByLine = new Map(
@@ -748,6 +749,19 @@ export async function runDailyBatchSync(): Promise<{
               sl.id,
               shipmentCostSnapshot.filter((entry) => entry.shipmentLineId === sl.id),
             )
+          }
+        }
+        } catch (orderError) {
+          const orderRef = firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8)
+          result.errors.push(`Group B order ${orderRef}: ${String(orderError)}`)
+          for (const s of orderShipments) {
+            const sr = shipmentResults.get(s.id)
+            if (sr) {
+              totalRevenue -= sr.revenue
+              totalCogs -= sr.cogs
+              shipmentResults.delete(s.id)
+            }
+            for (const sl of s.lines) shipmentSnapshots.delete(sl.id)
           }
         }
       }

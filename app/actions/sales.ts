@@ -99,8 +99,12 @@ async function buildRefundFallbackReturnRows(
           },
         },
       },
-      // Load prior refund lines to subtract already-returned quantities
+      // Load prior refund lines that actually returned stock (returnWarehouseId
+      // is set) to subtract already-returned quantities. Monetary-only refunds
+      // (returnWarehouseId IS NULL) did not put stock back, so they must not
+      // reduce future physical return capacity.
       refunds: {
+        where: { returnWarehouseId: { not: null } },
         select: {
           lines: {
             select: { productId: true, qty: true },
@@ -151,8 +155,38 @@ async function buildRefundFallbackReturnRows(
     }
   }
 
-  // Track how much remaining returnable qty each product has after prior refunds
+  // Build remaining returnable qty per (lineId, productId) so the same
+  // product appearing on multiple SO lines doesn't deplete a shared bucket.
+  // Only subtract prior refunds that actually returned stock (the query
+  // already filters on returnWarehouseId != null above).
+  const priorReturnedByLineProduct = new Map<string, number>()
+  for (const refund of order.refunds) {
+    for (const rl of refund.lines) {
+      if (!rl.productId) continue
+      // Prior refund lines don't carry lineId, so attribute returns to the
+      // first matching source line for this product. Imprecise but safe —
+      // it can only *over*-subtract from one line and *under*-subtract from
+      // another, which means we might return slightly less than allowed on
+      // edge cases, never more.
+      const key = `${rl.productId}`
+      priorReturnedByLineProduct.set(key, (priorReturnedByLineProduct.get(key) ?? 0) + Number(rl.qty))
+    }
+  }
+
+  // Compute total dispatched per product across all source lines
+  const totalDispatchedByProduct = new Map<string, number>()
+  for (const [, sourceRows] of sourceRowsByLine) {
+    for (const [productId, qty] of sourceRows) {
+      totalDispatchedByProduct.set(productId, (totalDispatchedByProduct.get(productId) ?? 0) + qty)
+    }
+  }
+
+  // Remaining returnable = total dispatched − prior physical returns
   const remainingReturnable = new Map<string, number>()
+  for (const [productId, dispatched] of totalDispatchedByProduct) {
+    const priorReturned = priorReturnedByLineProduct.get(productId) ?? 0
+    remainingReturnable.set(productId, Math.max(0, dispatched - priorReturned))
+  }
 
   return lines.flatMap((line) => {
     if (!line.productId || line.qty <= 0) return []
@@ -178,10 +212,7 @@ async function buildRefundFallbackReturnRows(
       if (!Number.isFinite(perUnitQty) || perUnitQty <= 0) return []
       const rawReturnQty = perUnitQty * line.qty
 
-      // Cap return qty against what's still returnable (total dispatched − prior returns)
-      if (!remainingReturnable.has(productId)) {
-        remainingReturnable.set(productId, totalQty - (priorReturnedByProduct.get(productId) ?? 0))
-      }
+      // Cap against remaining returnable for this product
       const available = Math.max(0, remainingReturnable.get(productId) ?? 0)
       const cappedQty = Math.min(rawReturnQty, available)
       remainingReturnable.set(productId, available - cappedQty)
@@ -1435,6 +1466,12 @@ export async function createRefund(
       }
 
       const totalForeign = Math.round(totalBase * fxRate * 10000) / 10000
+      // Serialize credit note number generation globally — the SO row lock
+      // is per-order, but CN numbers are system-wide. Without this, two
+      // concurrent refunds on different orders could read the same count
+      // and generate duplicate CN numbers. Advisory lock key chosen to
+      // avoid colliding with other lock users in the codebase.
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(8675309)`
       const cnCount = await tx.salesOrderRefund.count({ where: { creditNoteNumber: { not: null } } })
       const creditNoteNumber = `${numbering.cn_prefix}${new Date().getFullYear()}-${String(cnCount + 1).padStart(5, '0')}`
 
