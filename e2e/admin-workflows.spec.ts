@@ -1,5 +1,5 @@
 import { expect, test, type Page } from '@playwright/test'
-import { addStockAdjustment, signIn, uniqueSuffix } from './helpers'
+import { addStockAdjustment, createSimpleProduct, signIn, uniqueSuffix } from './helpers'
 
 function csvFile(contents: string) {
   return {
@@ -26,6 +26,54 @@ async function approveCsvImport(page: Page) {
   await expect(resultDialog).toBeVisible({ timeout: 20000 })
   await resultDialog.getByRole('button', { name: 'Close' }).first().click()
   await expect(resultDialog).toBeHidden()
+}
+
+async function createUserFromSettings(
+  page: Page,
+  options: {
+    name: string
+    email: string
+    password: string
+    role: string
+  },
+) {
+  await page.goto('/settings/users')
+  await page.getByRole('button', { name: /add user/i }).click()
+
+  const dialog = page.getByRole('dialog', { name: 'Add User' })
+  await dialog.locator('input').nth(0).fill(options.name)
+  await dialog.locator('input').nth(1).fill(options.email)
+  await dialog.locator('input').nth(2).fill(options.password)
+  await dialog.locator('select').first().selectOption(options.role)
+  await dialog.getByRole('button', { name: /create user/i }).click()
+  await expect(dialog).toBeHidden()
+  await expect(page.getByRole('row').filter({ hasText: options.email }).first()).toContainText(options.role)
+}
+
+async function createDraftSalesOrderForRep(
+  page: Page,
+  options: {
+    sku: string
+    salesRepName: string
+  },
+) {
+  await page.goto('/sales')
+  const dialog = page.getByRole('dialog', { name: 'New Sales Order' })
+  const newOrderButton = page.getByRole('button', { name: /new order/i })
+  await newOrderButton.click()
+  if (!(await dialog.isVisible())) {
+    await newOrderButton.click()
+  }
+  await dialog.getByRole('heading', { name: 'New Sales Order' }).waitFor()
+
+  await dialog.locator('select').first().selectOption({ index: 1 })
+  await dialog.getByText('Sales Representative').locator('..').locator('select').selectOption({ label: options.salesRepName })
+  await dialog.getByPlaceholder(/search product to add/i).fill(options.sku)
+  await dialog.getByRole('button', { name: new RegExp(options.sku) }).first().click()
+  await dialog.getByRole('button', { name: /save as draft/i }).click()
+
+  await page.waitForURL(/\/sales\/.+/)
+  return page.url()
 }
 
 test.describe('admin workflows', () => {
@@ -130,6 +178,75 @@ test.describe('admin workflows', () => {
     await reloginPage.goto('/profile')
     await expect(reloginPage.locator('input:not([type="file"])').nth(0)).toHaveValue(updatedName)
     await reloginPage.close()
+  })
+
+  test('prevents removing admin access from the only admin user', async ({ page }) => {
+    await page.goto('/settings/users')
+
+    const adminRow = page.getByRole('row').filter({ hasText: 'admin@example.com' }).first()
+    await expect(adminRow).toBeVisible()
+    await adminRow.getByRole('button').click()
+
+    const editDialog = page.getByRole('dialog', { name: 'Edit User' })
+    await expect(editDialog).toBeVisible()
+
+    await editDialog.locator('select').first().selectOption('READONLY')
+    await editDialog.getByRole('button', { name: /save changes/i }).click()
+    await expect(editDialog.getByText(/cannot change your own role away from admin/i)).toBeVisible()
+
+    await editDialog.locator('select').first().selectOption('ADMIN')
+    await editDialog.getByRole('checkbox').uncheck()
+    await editDialog.getByRole('button', { name: /save changes/i }).click()
+    await expect(editDialog.getByText(/cannot deactivate your own account/i)).toBeVisible()
+
+    await editDialog.getByRole('button', { name: 'Cancel' }).click()
+    await expect(editDialog).toBeHidden()
+  })
+
+  test('deletes users while keeping or reassigning sales rep history', async ({ page }) => {
+    const suffix = uniqueSuffix()
+    const keepName = `Keep Rep ${suffix}`
+    const keepEmail = `keep.rep.${suffix}@example.com`
+    const transferName = `Transfer Rep ${suffix}`
+    const transferEmail = `transfer.rep.${suffix}@example.com`
+    const recipientName = `Recipient Rep ${suffix}`
+    const recipientEmail = `recipient.rep.${suffix}@example.com`
+    const password = 'changeme123'
+
+    await createUserFromSettings(page, { name: keepName, email: keepEmail, password, role: 'READONLY' })
+    await createUserFromSettings(page, { name: transferName, email: transferEmail, password, role: 'READONLY' })
+    await createUserFromSettings(page, { name: recipientName, email: recipientEmail, password, role: 'MANAGER' })
+
+    const product = await createSimpleProduct(page, { price: '18.50' })
+    const keepOrderUrl = await createDraftSalesOrderForRep(page, { sku: product.sku, salesRepName: keepName })
+    const transferOrderUrl = await createDraftSalesOrderForRep(page, { sku: product.sku, salesRepName: transferName })
+
+    await page.goto('/settings/users')
+    const keepRow = page.getByRole('row').filter({ hasText: keepEmail }).first()
+    await keepRow.getByRole('button', { name: `Delete ${keepEmail}` }).click()
+
+    const deleteDialog = page.getByRole('dialog', { name: 'Delete User' })
+    await expect(deleteDialog).toContainText(`Historical sales orders will continue to show ${keepName}`)
+    await deleteDialog.getByRole('button', { name: /delete user/i }).click()
+    await expect(deleteDialog).toBeHidden()
+    await expect(page.getByRole('row').filter({ hasText: keepEmail })).toHaveCount(0)
+
+    await page.goto(keepOrderUrl)
+    await expect(page.getByText(keepName, { exact: true })).toBeVisible()
+
+    await page.goto('/settings/users')
+    const transferRow = page.getByRole('row').filter({ hasText: transferEmail }).first()
+    await transferRow.getByRole('button', { name: `Delete ${transferEmail}` }).click()
+
+    const transferDialog = page.getByRole('dialog', { name: 'Delete User' })
+    await transferDialog.getByLabel(/Reassign existing sales orders/i).check()
+    await transferDialog.locator('select').first().selectOption({ label: `${recipientName} — ${recipientEmail} (MANAGER)` })
+    await transferDialog.getByRole('button', { name: /delete user/i }).click()
+    await expect(transferDialog).toBeHidden()
+    await expect(page.getByRole('row').filter({ hasText: transferEmail })).toHaveCount(0)
+
+    await page.goto(transferOrderUrl)
+    await expect(page.getByText(recipientName, { exact: true })).toBeVisible()
   })
 
   test('creates and completes a manufacturing order from an imported BOM product', async ({ page }) => {

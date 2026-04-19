@@ -2,13 +2,13 @@
 
 import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { Loader2, Plus, Pencil, Shield, ShieldCheck, Factory, Eye, BarChart3, Warehouse } from 'lucide-react'
+import { Loader2, Plus, Pencil, Shield, ShieldCheck, Factory, Eye, BarChart3, Warehouse, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
-import { createUser, updateUser, type UserRow } from '@/app/actions/users'
+import { createUser, deleteUser, updateUser, type UserRow } from '@/app/actions/users'
 
 type SupplierOption = { id: string; name: string }
 type Props = { users: UserRow[]; suppliers: SupplierOption[] }
@@ -36,6 +36,7 @@ export function UsersClient({ users, suppliers }: Props) {
   const [isPending, startTransition] = useTransition()
   const [showCreate, setShowCreate] = useState(false)
   const [editUser, setEditUser] = useState<UserRow | null>(null)
+  const [deleteTarget, setDeleteTarget] = useState<UserRow | null>(null)
 
   // Create form
   const [name, setName] = useState('')
@@ -53,6 +54,9 @@ export function UsersClient({ users, suppliers }: Props) {
   const [editPassword, setEditPassword] = useState('')
   const [editActive, setEditActive] = useState(true)
   const [editError, setEditError] = useState('')
+  const [deleteSalesOrderMode, setDeleteSalesOrderMode] = useState<'keep_text' | 'transfer_user'>('keep_text')
+  const [deleteTransferToUserId, setDeleteTransferToUserId] = useState('')
+  const [deleteError, setDeleteError] = useState('')
 
   function openCreate() {
     setName(''); setEmail(''); setPassword(''); setRole('WAREHOUSE'); setSupplierId(''); setError('')
@@ -63,6 +67,14 @@ export function UsersClient({ users, suppliers }: Props) {
     setEditName(u.name); setEditEmail(u.email); setEditRole(u.role)
     setEditSupplierId(u.supplierId ?? ''); setEditPassword(''); setEditActive(u.active); setEditError('')
     setEditUser(u)
+  }
+
+  function openDelete(u: UserRow) {
+    const firstTransferTarget = users.find((candidate) => candidate.id !== u.id && candidate.active)
+    setDeleteSalesOrderMode('keep_text')
+    setDeleteTransferToUserId(firstTransferTarget?.id ?? '')
+    setDeleteError('')
+    setDeleteTarget(u)
   }
 
   function handleCreate() {
@@ -88,6 +100,23 @@ export function UsersClient({ users, suppliers }: Props) {
       else setEditError(result.error ?? 'Failed')
     })
   }
+
+  function handleDelete() {
+    if (!deleteTarget) return
+    setDeleteError('')
+    startTransition(async () => {
+      const result = await deleteUser(deleteTarget.id, {
+        salesOrderMode: deleteSalesOrderMode,
+        transferToUserId: deleteSalesOrderMode === 'transfer_user' ? deleteTransferToUserId : undefined,
+      })
+      if (result.success) { setDeleteTarget(null); router.refresh() }
+      else setDeleteError(result.error ?? 'Failed')
+    })
+  }
+
+  const transferOptions = deleteTarget
+    ? users.filter((user) => user.id !== deleteTarget.id && user.active)
+    : []
 
   return (
     <div className="space-y-4">
@@ -132,9 +161,14 @@ export function UsersClient({ users, suppliers }: Props) {
                 {u.lastLoginAt ? new Date(u.lastLoginAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' }) : 'Never'}
               </TableCell>
               <TableCell className="px-4">
-                <button type="button" onClick={() => openEdit(u)} className="text-muted-foreground hover:text-foreground">
-                  <Pencil className="h-3.5 w-3.5" />
-                </button>
+                <div className="flex items-center justify-end gap-1">
+                  <button type="button" onClick={() => openEdit(u)} className="text-muted-foreground hover:text-foreground" aria-label={`Edit ${u.email}`}>
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                  <button type="button" onClick={() => openDelete(u)} className="text-destructive/80 hover:text-destructive" aria-label={`Delete ${u.email}`}>
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
               </TableCell>
             </TableRow>
           ))}
@@ -221,6 +255,86 @@ export function UsersClient({ users, suppliers }: Props) {
           <DialogFooter>
             <Button variant="outline" onClick={() => setEditUser(null)} disabled={isPending}>Cancel</Button>
             <Button onClick={handleUpdate} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save Changes</Button>
+          </DialogFooter>
+        </DialogContent></Dialog>
+      )}
+
+      {/* Delete dialog */}
+      {deleteTarget && (
+        <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
+          <DialogHeader><DialogTitle className="text-destructive">Delete User</DialogTitle></DialogHeader>
+          <div className="space-y-3">
+            <div className="rounded-md border border-destructive/50 bg-destructive/5 p-3 text-sm">
+              <p className="font-medium text-destructive">This action is irreversible.</p>
+              <p className="mt-1">
+                Delete <span className="font-medium">{deleteTarget.name}</span> and choose how their existing sales orders should be handled.
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <Label>Sales Orders</Label>
+              <label className="flex items-start gap-2 rounded-md border p-3 text-sm cursor-pointer">
+                <input
+                  type="radio"
+                  name="delete-sales-order-mode"
+                  value="keep_text"
+                  checked={deleteSalesOrderMode === 'keep_text'}
+                  onChange={() => setDeleteSalesOrderMode('keep_text')}
+                  className="mt-0.5"
+                />
+                <span>Keep the deleted user&apos;s name as plain text on existing sales orders.</span>
+              </label>
+              <label className="flex items-start gap-2 rounded-md border p-3 text-sm cursor-pointer">
+                <input
+                  type="radio"
+                  name="delete-sales-order-mode"
+                  value="transfer_user"
+                  checked={deleteSalesOrderMode === 'transfer_user'}
+                  onChange={() => setDeleteSalesOrderMode('transfer_user')}
+                  className="mt-0.5"
+                />
+                <span>Reassign existing sales orders to another active user.</span>
+              </label>
+            </div>
+            {deleteSalesOrderMode === 'transfer_user' && (
+              <div className="space-y-1.5">
+                <Label>Transfer Sales Orders To *</Label>
+                <select
+                  value={deleteTransferToUserId}
+                  onChange={(e) => setDeleteTransferToUserId(e.target.value)}
+                  disabled={transferOptions.length === 0}
+                  className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
+                >
+                  <option value="">Select user…</option>
+                  {transferOptions.map((user) => (
+                    <option key={user.id} value={user.id}>{user.name} — {user.email} ({user.role})</option>
+                  ))}
+                </select>
+                {transferOptions.length === 0 && (
+                  <p className="text-sm text-destructive">No other active user is available to receive transferred sales orders.</p>
+                )}
+              </div>
+            )}
+            {deleteSalesOrderMode === 'keep_text' && (
+              <p className="text-sm text-muted-foreground">
+                Historical sales orders will continue to show {deleteTarget.name} as text after the user account is deleted.
+              </p>
+            )}
+            {deleteSalesOrderMode === 'transfer_user' && transferOptions.length > 0 && (
+              <p className="text-sm text-muted-foreground">
+                Existing sales orders assigned to {deleteTarget.name} will be reassigned before the account is deleted.
+              </p>
+            )}
+            {deleteError && <p className="text-sm text-destructive">{deleteError}</p>}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setDeleteTarget(null)} disabled={isPending}>Cancel</Button>
+            <Button
+              variant="destructive"
+              onClick={handleDelete}
+              disabled={isPending || (deleteSalesOrderMode === 'transfer_user' && (!deleteTransferToUserId || transferOptions.length === 0))}
+            >
+              {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Delete User
+            </Button>
           </DialogFooter>
         </DialogContent></Dialog>
       )}
