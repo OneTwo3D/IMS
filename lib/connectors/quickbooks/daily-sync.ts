@@ -16,6 +16,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getQuickBooksSettings } from '@/lib/connectors/quickbooks/settings'
+import { normalizeOrderDiscountBase } from '@/lib/sales-currency'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
   parseCostLayerSnapshot,
@@ -47,6 +48,16 @@ const QBO_CONNECTOR = 'quickbooks'
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100
+}
+
+function normalizeDeferredDiscountBase(order: {
+  fxRateToBase: Prisma.Decimal | number | null
+  discountAmount: Prisma.Decimal | number | null
+  pricesIncludeVat: boolean
+  taxRatePercent: Prisma.Decimal | number | null
+  shoppingLinks?: Array<{ connector: string }>
+}): number {
+  return normalizeOrderDiscountBase(order)
 }
 
 function makeLayerKey(productId: string, warehouseId: string): string {
@@ -352,6 +363,9 @@ export async function runDailyBatchSync(): Promise<{
         discountAmount: true,
         pricesIncludeVat: true,
         taxRatePercent: true,
+        shoppingLinks: {
+          select: { connector: true },
+        },
       },
     })
 
@@ -360,11 +374,7 @@ export async function runDailyBatchSync(): Promise<{
       const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = []
 
       for (const order of orders) {
-        const fxRate = Number(order.fxRateToBase) || 1
-        const discountBaseRaw = Number(order.discountAmount ?? 0) / fxRate
-        const discountBase = order.pricesIncludeVat && Number(order.taxRatePercent ?? 0) > 0
-          ? discountBaseRaw / (1 + Number(order.taxRatePercent))
-          : discountBaseRaw
+        const discountBase = normalizeDeferredDiscountBase(order)
         const salesValue = round2(Number(order.subtotalBase) + Number(order.shippingBase ?? 0) - discountBase)
         totalRevenueDeferred += salesValue
       }
@@ -394,11 +404,7 @@ export async function runDailyBatchSync(): Promise<{
         }
 
         for (const order of orders) {
-          const fxRate = Number(order.fxRateToBase) || 1
-          const discountBaseRaw = Number(order.discountAmount ?? 0) / fxRate
-          const discountBase = order.pricesIncludeVat && Number(order.taxRatePercent ?? 0) > 0
-            ? discountBaseRaw / (1 + Number(order.taxRatePercent))
-            : discountBaseRaw
+          const discountBase = normalizeDeferredDiscountBase(order)
           const salesValue = round2(Number(order.subtotalBase) + Number(order.shippingBase ?? 0) - discountBase)
           await tx.salesOrder.update({
             where: { id: order.id },

@@ -40,8 +40,8 @@ type AdjustmentInspect = {
 
 function runFixture(args: string[]): string {
   return execFileSync(
-    'node',
-    ['--experimental-strip-types', 'scripts/cogs-e2e-fixture.ts', ...args],
+    'npx',
+    ['tsx', 'scripts/cogs-e2e-fixture.ts', ...args],
     {
       cwd: process.cwd(),
       env: process.env,

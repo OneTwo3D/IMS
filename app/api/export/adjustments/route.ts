@@ -1,10 +1,11 @@
 import { db } from '@/lib/db'
-import { toCsv, csvResponse } from '@/lib/csv'
+import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
 import { auth } from '@/lib/auth'
 import { hasPermission } from '@/lib/permissions'
 
-const HEADERS = ['date', 'sku', 'productName', 'warehouse', 'qty', 'direction', 'note']
+const HEADERS = ['sku', 'warehouseCode', 'qty', 'note']
 const TEMPLATE_HEADERS = ['sku', 'warehouseCode', 'qty', 'note']
+const REQUIRED_HEADERS = ['sku', 'warehouseCode', 'qty']
 
 export async function GET(req: Request) {
   const session = await auth()
@@ -15,7 +16,7 @@ export async function GET(req: Request) {
   const templateOnly = url.searchParams.get('template') === '1'
 
   if (templateOnly) {
-    return csvResponse(TEMPLATE_HEADERS.join(',') + '\r\n', 'adjustments-import-template.csv')
+    return csvResponse(buildTemplateCsv(TEMPLATE_HEADERS, REQUIRED_HEADERS), 'adjustments-import-template.csv')
   }
 
   const movements = await db.stockMovement.findMany({
@@ -35,12 +36,9 @@ export async function GET(req: Request) {
       ? m.toWarehouse
       : m.fromWarehouse
     return {
-      date: m.createdAt.toISOString(),
       sku: m.product.sku,
-      productName: m.product.name,
-      warehouse: warehouse ? `${warehouse.code} — ${warehouse.name}` : '',
-      qty: m.qty.toString(),
-      direction: isAddition ? 'ADD' : 'REMOVE',
+      warehouseCode: warehouse?.code ?? '',
+      qty: String(isAddition ? Number(m.qty) : -Number(m.qty)),
       note: m.note ?? '',
     }
   })

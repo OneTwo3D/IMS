@@ -16,6 +16,12 @@ const webServerURL = `${baseURL.replace(/\/$/, '')}/login`
 // completed. Add new WC-setting-mutating specs here, not to the
 // main project.
 const ISOLATED_SPECS = /(?:stock-sync-drift|woocommerce(?:-[\w-]+)?|security-workflows)\.spec\.ts/
+// CSV import/export round-trip coverage mutates shared inventory,
+// costing, and transfer state across multiple domains. Keep these
+// specs out of the main parallel pool so fixture scripts and the dev
+// server are not contending across workers.
+const CSV_SERIAL_SPECS = /(?:csv-import-workflows|csv-roundtrip-exports)\.spec\.ts/
+const CHROMIUM_PARALLEL_IGNORE = new RegExp(`${ISOLATED_SPECS.source}|${CSV_SERIAL_SPECS.source}`)
 
 export default defineConfig({
   testDir: './e2e',
@@ -44,7 +50,7 @@ export default defineConfig({
       dependencies: ['setup'],
       // Keep WC-setting-mutating specs out of the parallel pool. They
       // run later in `wc-isolated` with serialized ordering.
-      testIgnore: ISOLATED_SPECS,
+      testIgnore: CHROMIUM_PARALLEL_IGNORE,
     },
     {
       // WooCommerce-setting-mutating specs. Runs strictly after
@@ -62,6 +68,22 @@ export default defineConfig({
       dependencies: ['setup', 'chromium'],
       fullyParallel: false,
       testMatch: ISOLATED_SPECS,
+    },
+    {
+      // Shared-state CSV import/export coverage. These tests create
+      // products, orders, adjustments, and transfers, then validate
+      // exported rows against direct database fixtures. Running them
+      // in their own serialized phase avoids parallel worker races and
+      // transient dev-server network errors.
+      name: 'csv-isolated',
+      use: {
+        ...devices['Desktop Chrome'],
+        storageState: 'e2e/.auth/admin.json',
+      },
+      dependencies: ['setup', 'chromium'],
+      fullyParallel: false,
+      workers: 1,
+      testMatch: CSV_SERIAL_SPECS,
     },
   ],
   webServer: {

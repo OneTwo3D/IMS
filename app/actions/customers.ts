@@ -6,6 +6,15 @@ import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import {
+  createCsvImportExecutionResult,
+  createCsvImportPreviewResult,
+  getCsvImportMode,
+  type CsvImportActionResult,
+} from '@/lib/csv-import'
+
+const MAX_IMPORT_BYTES = 10 * 1024 * 1024
+const MAX_IMPORT_ROWS = 10_000
 
 export type AddressData = {
   line1?: string
@@ -47,6 +56,27 @@ export type CustomerInput = {
   billingAddress?: AddressData
   shippingAddress?: AddressData
   notes?: string
+}
+
+function hasCsvValue(row: Record<string, string>, key: string): boolean {
+  return typeof row[key] === 'string' && row[key].trim().length > 0
+}
+
+function mergeImportedAddress(
+  row: Record<string, string>,
+  prefix: 'billing' | 'shipping',
+  existing: AddressData | null | undefined,
+): AddressData | undefined {
+  const merged: AddressData = { ...(existing ?? {}) }
+  let touched = false
+  for (const field of ['line1', 'line2', 'city', 'county', 'postcode', 'country'] as const) {
+    const key = `${prefix}_${field}`
+    if (hasCsvValue(row, key)) {
+      merged[field] = row[key].trim()
+      touched = true
+    }
+  }
+  return touched ? merged : undefined
 }
 
 const REVENUE_STATUSES = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'])
@@ -253,38 +283,171 @@ export async function updateCustomer(id: string, input: Partial<CustomerInput> &
   }
 }
 
-export async function importContactsCsv(formData: FormData): Promise<{ success?: boolean; count?: number; error?: string }> {
+export async function importContactsCsv(formData: FormData): Promise<CsvImportActionResult> {
+  const mode = getCsvImportMode(formData)
+  const preview = mode === 'preview'
   await requirePermission('sales.create')
   try {
     const file = formData.get('file') as File
-    if (!file) return { error: 'No file' }
+    if (!file) {
+      return preview
+        ? createCsvImportPreviewResult({ totalRows: 0, created: 0, updated: 0, errorCount: 1, errors: ['No file'], error: 'No file' })
+        : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: ['No file'], error: 'No file', success: false })
+    }
+    if (file.size > MAX_IMPORT_BYTES) {
+      const error = `File exceeds maximum size (${MAX_IMPORT_BYTES / (1024 * 1024)} MB)`
+      return preview
+        ? createCsvImportPreviewResult({ totalRows: 0, created: 0, updated: 0, errorCount: 1, errors: [error], error })
+        : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: [error], error, success: false })
+    }
     const text = await file.text()
-    const rows = parseCsv(text)
-    let count = 0
-    for (const r of rows) {
-      const firstName = r.firstName || r.firstname || r['first name'] || ''
-      if (!firstName) continue
-      await db.customer.create({
-        data: {
-          firstName,
-          lastName: r.lastName || r.lastname || r['last name'] || '',
-          email: r.email || null,
-          phone: r.phone || null,
-          company: r.company || null,
-          taxNumber: r.taxNumber || r.taxnumber || r['tax number'] || null,
-          billingAddress: { line1: r.billing_line1, line2: r.billing_line2, city: r.billing_city, county: r.billing_county, postcode: r.billing_postcode, country: r.billing_country },
-          shippingAddress: { line1: r.shipping_line1, line2: r.shipping_line2, city: r.shipping_city, county: r.shipping_county, postcode: r.shipping_postcode, country: r.shipping_country },
-          notes: r.notes || null,
-        },
+    const parsed = parseCsv(text)
+    const rows = parsed.slice(0, MAX_IMPORT_ROWS)
+    const dropped = parsed.length - rows.length
+    const customers = await db.customer.findMany({
+      select: {
+        id: true,
+        email: true,
+        firstName: true,
+        lastName: true,
+        company: true,
+        billingAddress: true,
+        shippingAddress: true,
+      },
+    })
+    const byId = new Map(customers.map((customer) => [customer.id, customer]))
+    const byEmail = new Map<string, typeof customers>()
+    const byIdentity = new Map<string, typeof customers>()
+    for (const customer of customers) {
+      if (customer.email) {
+        const key = customer.email.trim().toLowerCase()
+        byEmail.set(key, [...(byEmail.get(key) ?? []), customer])
+      }
+      const identityKey = [customer.firstName, customer.lastName, customer.company ?? '']
+        .map((part) => part.trim().toLowerCase())
+        .join('|')
+      byIdentity.set(identityKey, [...(byIdentity.get(identityKey) ?? []), customer])
+    }
+
+    let created = 0
+    let updated = 0
+    let skipped = 0
+    const errors: string[] = []
+    if (dropped > 0) {
+      errors.push(`File has more than ${MAX_IMPORT_ROWS} rows — ${dropped} row(s) skipped`)
+    }
+
+    for (let index = 0; index < rows.length; index++) {
+      const r = rows[index]
+      const lineNum = index + 2
+      const customerId = r.customerId?.trim() || ''
+      const firstName = (r.firstName || r.firstname || r['first name'] || '').trim()
+      const lastName = (r.lastName || r.lastname || r['last name'] || '').trim()
+      const email = (r.email || '').trim()
+      const company = (r.company || '').trim()
+
+      let existing = customerId ? (byId.get(customerId) ?? null) : null
+      if (!existing && email) {
+        const emailMatches = byEmail.get(email.toLowerCase()) ?? []
+        if (emailMatches.length === 1) existing = emailMatches[0]
+        else if (emailMatches.length > 1) {
+          errors.push(`Row ${lineNum}: email "${email}" matches multiple contacts`)
+          skipped++
+          continue
+        }
+      }
+      if (!existing) {
+        const identityMatches = byIdentity.get([firstName, lastName, company].map((part) => part.toLowerCase()).join('|')) ?? []
+        if (identityMatches.length === 1) existing = identityMatches[0]
+        else if (identityMatches.length > 1) {
+          errors.push(`Row ${lineNum}: contact name matches multiple records`)
+          skipped++
+          continue
+        }
+      }
+
+      if (!firstName && !existing) {
+        errors.push(`Row ${lineNum}: missing firstName or no existing contact match`)
+        skipped++
+        continue
+      }
+
+      try {
+        if (existing) {
+          const billingAddress = mergeImportedAddress(r, 'billing', existing.billingAddress as AddressData | null)
+          const shippingAddress = mergeImportedAddress(r, 'shipping', existing.shippingAddress as AddressData | null)
+          if (!preview) {
+            await db.customer.update({
+              where: { id: existing.id },
+              data: {
+                ...(firstName ? { firstName } : {}),
+                ...(lastName ? { lastName } : {}),
+                ...(email ? { email } : {}),
+                ...(r.phone?.trim() ? { phone: r.phone.trim() } : {}),
+                ...(company ? { company } : {}),
+                ...(r.taxNumber?.trim() || r.taxnumber?.trim() || r['tax number']?.trim() ? { taxNumber: (r.taxNumber || r.taxnumber || r['tax number']).trim() } : {}),
+                ...(billingAddress ? { billingAddress } : {}),
+                ...(shippingAddress ? { shippingAddress } : {}),
+                ...(r.notes?.trim() ? { notes: r.notes.trim() } : {}),
+              },
+            })
+          }
+          updated++
+        } else {
+          if (!preview) {
+            await db.customer.create({
+              data: {
+                firstName,
+                lastName,
+                email: email || null,
+                phone: r.phone?.trim() || null,
+                company: company || null,
+                taxNumber: (r.taxNumber || r.taxnumber || r['tax number'] || '').trim() || null,
+                billingAddress: mergeImportedAddress(r, 'billing', null) ?? Prisma.JsonNull,
+                shippingAddress: mergeImportedAddress(r, 'shipping', null) ?? Prisma.JsonNull,
+                notes: r.notes?.trim() || null,
+              },
+            })
+          }
+          created++
+        }
+      } catch (error) {
+        errors.push(`Row ${lineNum}: ${String(error)}`)
+        skipped++
+      }
+    }
+    if (preview) {
+      return createCsvImportPreviewResult({
+        totalRows: parsed.length,
+        created,
+        updated,
+        errorCount: skipped + dropped,
+        errors,
       })
-      count++
     }
     revalidatePath('/sales/contacts')
-    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${count} contacts from CSV` })
-    return { success: true, count }
+    await logActivity({
+      entityType: 'IMPORT',
+      tag: 'import',
+      action: 'imported',
+      level: errors.length && created === 0 && updated === 0 ? 'ERROR' : (errors.length ? 'WARNING' : 'INFO'),
+      description: errors.length
+        ? `Imported ${created} contacts, updated ${updated} from CSV with warnings: ${errors[0]}`
+        : `Imported ${created} contacts, updated ${updated} from CSV`,
+    })
+    return createCsvImportExecutionResult({
+      created,
+      updated,
+      skipped,
+      errors,
+      error: created === 0 && updated === 0 && errors.length > 0 ? errors[0] : undefined,
+    })
   } catch (e) {
     await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import contacts from CSV: ${String(e)}` })
-    return { error: String(e) }
+    const error = String(e)
+    return preview
+      ? createCsvImportPreviewResult({ totalRows: 0, created: 0, updated: 0, errorCount: 1, errors: [error], error })
+      : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: [error], error, success: false })
   }
 }
 

@@ -1,7 +1,7 @@
 import 'dotenv/config'
 import { db } from '../lib/db/index.ts'
 import { importWcOrder } from '../lib/connectors/woocommerce/sync/order-import.ts'
-import type { WcFullOrder } from '../lib/connectors/woocommerce/sync/types.ts'
+import type { WcFullOrder, WcRefund } from '../lib/connectors/woocommerce/sync/types.ts'
 
 function uniqueSuffix() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -373,18 +373,100 @@ async function inspectCreditNoteScenario(orderId: string) {
     : null
 
   const payload = creditNoteLog?.payload as {
-    lines?: Array<{ description?: string; quantity?: number; unitAmount?: number; taxType?: string }>
+    lines?: Array<{ description?: string; quantity?: number; unitAmount?: number; taxType?: string; accountCode?: string }>
+    lineAmountsIncludeTax?: boolean
   } | null
 
   console.log(JSON.stringify({
+    lineAmountsIncludeTax: typeof payload?.lineAmountsIncludeTax === 'boolean' ? payload.lineAmountsIncludeTax : null,
     lines: Array.isArray(payload?.lines)
       ? payload.lines.map((line) => ({
           description: line.description ?? null,
           quantity: Number(line.quantity ?? 0),
           unitAmount: Number(line.unitAmount ?? 0),
           taxType: line.taxType ?? null,
+          accountCode: line.accountCode ?? null,
         }))
       : [],
+  }))
+}
+
+async function syncWcShippingRefundScenario() {
+  const suffix = uniqueSuffix()
+  await seedAccountingSettings()
+  await upsertSetting('wc_webhook_secret', 'e2e-webhook-secret')
+  await upsertSetting('wc_initial_import_completed', 'true')
+  const warehouse = await ensureDefaultWarehouse()
+  const customer = await db.customer.create({
+    data: {
+      firstName: 'Shipping',
+      lastName: `Refund ${suffix}`,
+      email: `shipping-refund-${suffix}@example.com`,
+      active: true,
+    },
+  })
+
+  const externalOrderId = Math.floor(Date.now() / 1000)
+  const order = await db.salesOrder.create({
+    data: {
+      orderNumber: `SO-WC-SHIPPING-${suffix}`,
+      externalOrderNumber: `WC-SHIPPING-${suffix}`,
+      status: 'SHIPPED',
+      currency: 'GBP',
+      fxRateToBase: 1,
+      customerId: customer.id,
+      customerName: `${customer.firstName} ${customer.lastName}`,
+      customerEmail: customer.email,
+      billingAddress: { country: 'GB' } as never,
+      shippingAddress: { country: 'GB' } as never,
+      subtotalForeign: 20,
+      shippingForeign: 10,
+      taxForeign: 6,
+      pricesIncludeVat: false,
+      totalForeign: 36,
+      subtotalBase: 20,
+      shippingBase: 10,
+      taxBase: 6,
+      totalBase: 36,
+      shipFromWarehouseId: warehouse.id,
+      shippedAt: new Date(),
+      shoppingLinks: {
+        create: {
+          connector: 'woocommerce',
+          externalOrderId: String(externalOrderId),
+          externalOrderNumber: `WC-SHIPPING-${suffix}`,
+        },
+      },
+    },
+  })
+
+  const wcRefund: WcRefund = {
+    id: externalOrderId + 1,
+    parent_id: externalOrderId,
+    date_created: new Date().toISOString(),
+    date_created_gmt: new Date().toISOString(),
+    amount: '10.00',
+    reason: 'Shipping refunded',
+    refunded_by: 1,
+    refunded_payment: true,
+    meta_data: [],
+    line_items: [],
+    shipping_lines: [
+      {
+        id: externalOrderId + 2,
+        method_title: 'Tracked 24',
+        method_id: 'flat_rate',
+        total: '10.00',
+        total_tax: '0.00',
+        taxes: [],
+      },
+    ],
+  }
+
+  console.log(JSON.stringify({
+    orderId: order.id,
+    webhookSecret: 'e2e-webhook-secret',
+    webhookBody: JSON.stringify(wcRefund),
   }))
 }
 
@@ -918,6 +1000,49 @@ async function seedDailyBatchDiscountScenario() {
   }))
 }
 
+async function seedUnpaidDailyBatchOrder() {
+  const suffix = uniqueSuffix()
+  await seedAccountingSettings()
+
+  const customer = await db.customer.create({
+    data: {
+      firstName: 'Unpaid',
+      lastName: `Batch ${suffix}`,
+      email: `unpaid-batch-${suffix}@example.com`,
+      active: true,
+    },
+  })
+
+  const order = await db.salesOrder.create({
+    data: {
+      orderNumber: `SO-UNPAID-BATCH-${suffix}`,
+      status: 'PROCESSING',
+      currency: 'GBP',
+      fxRateToBase: 1,
+      customerId: customer.id,
+      customerName: `${customer.firstName} ${customer.lastName}`,
+      customerEmail: customer.email,
+      subtotalForeign: 50,
+      shippingForeign: 0,
+      taxForeign: 10,
+      pricesIncludeVat: false,
+      totalForeign: 60,
+      subtotalBase: 50,
+      shippingBase: 0,
+      taxBase: 10,
+      totalBase: 60,
+      discountAmount: 0,
+      taxRatePercent: 0.2,
+      paidAt: null,
+      accountingInvoiceId: `unpaid-${suffix}`,
+    },
+  })
+
+  console.log(JSON.stringify({
+    unpaidOrderId: order.id,
+  }))
+}
+
 async function runDailyBatchDiscountScenario() {
   const { runDailyBatchSync } = await import('../lib/connectors/xero/daily-sync.ts')
   const result = await runDailyBatchSync()
@@ -955,6 +1080,9 @@ async function main() {
     case 'seed-mixed-rate-refund':
       await seedMixedRateRefundScenario()
       break
+    case 'sync-wc-shipping-refund':
+      await syncWcShippingRefundScenario()
+      break
     case 'inspect-fx-refund':
       if (!args[0]) throw new Error('inspect-fx-refund requires <orderId>')
       await inspectFxRefundScenario(args[0])
@@ -980,6 +1108,9 @@ async function main() {
     case 'seed-daily-batch-discounts':
       await seedDailyBatchDiscountScenario()
       break
+    case 'seed-unpaid-daily-batch-order':
+      await seedUnpaidDailyBatchOrder()
+      break
     case 'run-daily-batch-discounts':
       await runDailyBatchDiscountScenario()
       break
@@ -990,7 +1121,7 @@ async function main() {
     default:
       throw new Error(
         'usage: tsx scripts/commerce-accounting-e2e-fixture.ts ' +
-        '<seed-manual-fx-order-ui|seed-fx-refund|seed-mixed-rate-refund|inspect-fx-refund|inspect-credit-note|import-wc-fee-order|inspect-wc-fee-order|inspect-sales-invoice|import-wc-discount-order|seed-daily-batch-discounts|run-daily-batch-discounts|inspect-daily-batch-discounts> [...]',
+        '<seed-manual-fx-order-ui|seed-fx-refund|seed-mixed-rate-refund|sync-wc-shipping-refund|inspect-fx-refund|inspect-credit-note|import-wc-fee-order|inspect-wc-fee-order|inspect-sales-invoice|import-wc-discount-order|seed-daily-batch-discounts|seed-unpaid-daily-batch-order|run-daily-batch-discounts|inspect-daily-batch-discounts> [...]',
       )
   }
 }

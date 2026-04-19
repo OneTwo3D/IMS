@@ -4,6 +4,7 @@ import { db } from '@/lib/db'
 import { getSetting } from '@/app/actions/settings'
 import { requirePermission } from '@/lib/auth/server'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
+import { normalizeLineDiscountBase, normalizeOrderDiscountBase } from '@/lib/sales-currency'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -174,7 +175,8 @@ export async function getDashboardData(
       where: { status: { in: COMPLETED_STATUSES }, createdAt: { gte: fetchFrom } },
       select: {
         id: true, externalOrderNumber: true, customerName: true, status: true, createdAt: true,
-        totalBase: true, subtotalBase: true, shippingBase: true, discountAmount: true, fxRateToBase: true,
+        totalBase: true, subtotalBase: true, shippingBase: true, discountAmount: true, fxRateToBase: true, pricesIncludeVat: true, taxRatePercent: true,
+        shoppingLinks: { select: { connector: true } },
         lines: { select: { cogsBase: true, qty: true, totalBase: true, discountAmount: true, productId: true, sku: true, description: true } },
         refunds: { select: { totalBase: true } },
       },
@@ -228,9 +230,10 @@ export async function getDashboardData(
     let gross = 0, discounts = 0, refunds = 0, cogs = 0, shipping = 0
     for (const o of list) {
       const lineTotal = o.lines.reduce((s, l) => s + Number(l.totalBase), 0)
-      const lineDisc = o.lines.reduce((s, l) => s + Number(l.discountAmount ?? 0), 0) / Number(o.fxRateToBase || 1)
-      gross += lineTotal + lineDisc
-      discounts += lineDisc
+      const lineDisc = o.lines.reduce((sum, line) => sum + normalizeLineDiscountBase(o, line.discountAmount), 0)
+      const orderDisc = normalizeOrderDiscountBase(o)
+      gross += lineTotal + lineDisc + orderDisc
+      discounts += lineDisc + orderDisc
       refunds += o.refunds.reduce((s, r) => s + Number(r.totalBase), 0)
       cogs += o.lines.reduce((s, l) => s + Number(l.cogsBase ?? 0), 0)
       shipping += Number(o.shippingBase ?? 0)

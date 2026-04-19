@@ -39,6 +39,17 @@ function uniqueSuffix() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 }
 
+function getAppBaseUrl(): string {
+  return process.env.E2E_BASE_URL ?? 'http://localhost:3000'
+}
+
+function getCronHeaders(): HeadersInit | undefined {
+  if (!process.env.CRON_SECRET) return undefined
+  return {
+    Authorization: `Bearer ${process.env.CRON_SECRET}`,
+  }
+}
+
 async function upsertSetting(key: string, value: string) {
   await db.setting.upsert({
     where: { key },
@@ -219,7 +230,9 @@ async function seed() {
     },
   })
 
-  const response = await fetch('http://127.0.0.1:3001/api/cron/xero-daily-batch')
+  const response = await fetch(`${getAppBaseUrl()}/api/cron/accounting-daily-batch`, {
+    headers: getCronHeaders(),
+  })
   if (!response.ok) {
     throw new Error(`daily batch request failed: ${response.status} ${await response.text()}`)
   }

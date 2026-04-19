@@ -6,6 +6,15 @@ import { parseCsv } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import {
+  createCsvImportExecutionResult,
+  createCsvImportPreviewResult,
+  getCsvImportMode,
+  type CsvImportActionResult,
+} from '@/lib/csv-import'
+
+const MAX_IMPORT_BYTES = 10 * 1024 * 1024
+const MAX_IMPORT_ROWS = 10_000
 
 export type SupplierRow = {
   id: string
@@ -54,6 +63,10 @@ export type SupplierInput = {
   paymentTermsDays?: number | null
   manualDeliveryDays?: number | null
   notes?: string
+}
+
+function hasCsvValue(row: Record<string, string>, key: string): boolean {
+  return typeof row[key] === 'string' && row[key].trim().length > 0
 }
 
 const SUPPLIER_SELECT = {
@@ -254,34 +267,149 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
   }
 }
 
-export async function importSuppliersCsv(formData: FormData): Promise<{ success?: boolean; count?: number; error?: string }> {
+export async function importSuppliersCsv(formData: FormData): Promise<CsvImportActionResult> {
+  const mode = getCsvImportMode(formData)
+  const preview = mode === 'preview'
   await requirePermission('purchasing.create')
   try {
     const baseCurrency = await getBaseCurrencyCode()
     const file = formData.get('file') as File
-    if (!file) return { error: 'No file' }
-    const rows = parseCsv(await file.text())
-    let count = 0
-    for (const r of rows) {
-      const name = r.name || r.Name || ''
-      if (!name) continue
-      await db.supplier.create({
-        data: {
-          name, contactName: r.contactName || null, email: r.email || null, phone: r.phone || null,
-          currency: r.currency || baseCurrency, vatNumber: r.vatNumber || null, accountNumber: r.accountNumber || null,
-          paymentTermsDays: r.paymentTermsDays ? parseInt(r.paymentTermsDays) : null,
-          addressLine1: r.addressLine1 || null, addressLine2: r.addressLine2 || null,
-          city: r.city || null, county: r.county || null, postcode: r.postcode || null, country: r.country || null,
-          notes: r.notes || null,
-        },
+    if (!file) {
+      return preview
+        ? createCsvImportPreviewResult({ totalRows: 0, created: 0, updated: 0, errorCount: 1, errors: ['No file'], error: 'No file' })
+        : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: ['No file'], error: 'No file', success: false })
+    }
+    if (file.size > MAX_IMPORT_BYTES) {
+      const error = `File exceeds maximum size (${MAX_IMPORT_BYTES / (1024 * 1024)} MB)`
+      return preview
+        ? createCsvImportPreviewResult({ totalRows: 0, created: 0, updated: 0, errorCount: 1, errors: [error], error })
+        : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: [error], error, success: false })
+    }
+    const parsed = parseCsv(await file.text())
+    const rows = parsed.slice(0, MAX_IMPORT_ROWS)
+    const dropped = parsed.length - rows.length
+    const suppliers = await db.supplier.findMany({
+      select: { id: true, name: true },
+    })
+    const byId = new Map(suppliers.map((supplier) => [supplier.id, supplier]))
+    const byName = new Map<string, typeof suppliers>()
+    for (const supplier of suppliers) {
+      const key = supplier.name.trim().toLowerCase()
+      byName.set(key, [...(byName.get(key) ?? []), supplier])
+    }
+
+    let created = 0
+    let updated = 0
+    let skipped = 0
+    const errors: string[] = []
+    if (dropped > 0) {
+      errors.push(`File has more than ${MAX_IMPORT_ROWS} rows — ${dropped} row(s) skipped`)
+    }
+    for (let index = 0; index < rows.length; index++) {
+      const r = rows[index]
+      const lineNum = index + 2
+      const supplierId = r.supplierId?.trim() || ''
+      const name = (r.name || r.Name || '').trim()
+      let existing = supplierId ? (byId.get(supplierId) ?? null) : null
+      if (!existing && name) {
+        const matches = byName.get(name.toLowerCase()) ?? []
+        if (matches.length === 1) existing = matches[0]
+        else if (matches.length > 1) {
+          errors.push(`Row ${lineNum}: supplier name "${name}" matches multiple suppliers`)
+          skipped++
+          continue
+        }
+      }
+      if (!name && !existing) {
+        errors.push(`Row ${lineNum}: missing supplier name or no existing supplier match`)
+        skipped++
+        continue
+      }
+      try {
+        if (existing) {
+          if (!preview) {
+            await db.supplier.update({
+              where: { id: existing.id },
+              data: {
+                ...(name ? { name } : {}),
+                ...(r.contactName?.trim() ? { contactName: r.contactName.trim() } : {}),
+                ...(r.email?.trim() ? { email: r.email.trim() } : {}),
+                ...(r.phone?.trim() ? { phone: r.phone.trim() } : {}),
+                ...(r.currency?.trim() ? { currency: r.currency.trim().toUpperCase() } : {}),
+                ...(r.vatNumber?.trim() ? { vatNumber: r.vatNumber.trim() } : {}),
+                ...(r.accountNumber?.trim() ? { accountNumber: r.accountNumber.trim() } : {}),
+                ...(hasCsvValue(r, 'paymentTermsDays') ? { paymentTermsDays: parseInt(r.paymentTermsDays, 10) } : {}),
+                ...(r.addressLine1?.trim() ? { addressLine1: r.addressLine1.trim() } : {}),
+                ...(r.addressLine2?.trim() ? { addressLine2: r.addressLine2.trim() } : {}),
+                ...(r.city?.trim() ? { city: r.city.trim() } : {}),
+                ...(r.county?.trim() ? { county: r.county.trim() } : {}),
+                ...(r.postcode?.trim() ? { postcode: r.postcode.trim() } : {}),
+                ...(r.country?.trim() ? { country: r.country.trim() } : {}),
+                ...(r.notes?.trim() ? { notes: r.notes.trim() } : {}),
+              },
+            })
+          }
+          updated++
+        } else {
+          if (!preview) {
+            await db.supplier.create({
+              data: {
+                name,
+                contactName: r.contactName?.trim() || null,
+                email: r.email?.trim() || null,
+                phone: r.phone?.trim() || null,
+                currency: r.currency?.trim() || baseCurrency,
+                vatNumber: r.vatNumber?.trim() || null,
+                accountNumber: r.accountNumber?.trim() || null,
+                paymentTermsDays: r.paymentTermsDays ? parseInt(r.paymentTermsDays, 10) : null,
+                addressLine1: r.addressLine1?.trim() || null,
+                addressLine2: r.addressLine2?.trim() || null,
+                city: r.city?.trim() || null,
+                county: r.county?.trim() || null,
+                postcode: r.postcode?.trim() || null,
+                country: r.country?.trim() || null,
+                notes: r.notes?.trim() || null,
+              },
+            })
+          }
+          created++
+        }
+      } catch (error) {
+        errors.push(`Row ${lineNum}: ${String(error)}`)
+        skipped++
+      }
+    }
+    if (preview) {
+      return createCsvImportPreviewResult({
+        totalRows: parsed.length,
+        created,
+        updated,
+        errorCount: skipped + dropped,
+        errors,
       })
-      count++
     }
     revalidatePath('/purchase-orders/suppliers')
-    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${count} suppliers from CSV` })
-    return { success: true, count }
+    await logActivity({
+      entityType: 'IMPORT',
+      tag: 'import',
+      action: 'imported',
+      level: errors.length && created === 0 && updated === 0 ? 'ERROR' : (errors.length ? 'WARNING' : 'INFO'),
+      description: errors.length
+        ? `Imported ${created} suppliers, updated ${updated} from CSV with warnings: ${errors[0]}`
+        : `Imported ${created} suppliers, updated ${updated} from CSV`,
+    })
+    return createCsvImportExecutionResult({
+      created,
+      updated,
+      skipped,
+      errors,
+      error: created === 0 && updated === 0 && errors.length > 0 ? errors[0] : undefined,
+    })
   } catch (e) {
     await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import suppliers from CSV: ${String(e)}` })
-    return { error: String(e) }
+    const error = String(e)
+    return preview
+      ? createCsvImportPreviewResult({ totalRows: 0, created: 0, updated: 0, errorCount: 1, errors: [error], error })
+      : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: [error], error, success: false })
   }
 }

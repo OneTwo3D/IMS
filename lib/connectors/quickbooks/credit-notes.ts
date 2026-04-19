@@ -50,6 +50,7 @@ export async function pushCreditMemo(
       CustomerRef: { value: contactResult.contactId },
       TxnDate: data.date,
       Line: lines,
+      GlobalTaxCalculation: data.lineAmountsIncludeTax ? 'TaxInclusive' : 'TaxExclusive',
     }
 
     if (data.creditNoteNumber) body.DocNumber = data.creditNoteNumber

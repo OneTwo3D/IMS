@@ -16,6 +16,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getXeroSettings } from '@/lib/connectors/xero/settings'
+import { normalizeOrderDiscountBase } from '@/lib/sales-currency'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
   parseCostLayerSnapshot,
@@ -56,14 +57,7 @@ function normalizeDeferredDiscountBase(order: {
   taxRatePercent: Prisma.Decimal | number | null
   shoppingLinks?: Array<{ connector: string }>
 }): number {
-  const fxRate = Number(order.fxRateToBase) || 1
-  const discountBaseRaw = Number(order.discountAmount ?? 0) / fxRate
-  const vatPct = Number(order.taxRatePercent ?? 0)
-  const isWooCommerceOrder = !!order.shoppingLinks?.some((link) => link.connector === 'woocommerce')
-
-  if (isWooCommerceOrder) return discountBaseRaw
-  if (order.pricesIncludeVat && vatPct > 0) return discountBaseRaw / (1 + vatPct)
-  return discountBaseRaw
+  return normalizeOrderDiscountBase(order)
 }
 
 function makeLayerKey(productId: string, warehouseId: string): string {

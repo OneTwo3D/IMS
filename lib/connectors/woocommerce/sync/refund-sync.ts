@@ -52,6 +52,7 @@ export async function syncWcRefund(
       qty: number
       totalForeign?: number
       totalBase: number
+      lineKind?: 'sale' | 'shipping'
     }[] = []
 
     if (wcRefund.line_items.length > 0 && hasQtyRefund) {
@@ -72,17 +73,32 @@ export async function syncWcRefund(
           qty,
           totalForeign: refundTotal,
           totalBase: refundGbp,
+          lineKind: 'sale',
         })
       }
-    } else {
-      // Monetary-only refund (no line items or all qty=0)
-      // Create a single refund line with the full amount
+    }
+
+    for (const shippingLine of wcRefund.shipping_lines ?? []) {
+      const shippingRefundTotal = Math.abs(parseFloat(shippingLine.total) || 0)
+      if (shippingRefundTotal <= 0.000001) continue
+      refundLines.push({
+        productId: null,
+        description: shippingLine.method_title || 'Shipping refund',
+        qty: 0,
+        totalForeign: Math.round(shippingRefundTotal * 10000) / 10000,
+        totalBase: Math.round((shippingRefundTotal / fxRate) * 10000) / 10000,
+        lineKind: 'shipping',
+      })
+    }
+
+    if (refundLines.length === 0) {
       refundLines.push({
         productId: null,
         description: wcRefund.reason || 'WooCommerce refund',
         qty: 0,
-        totalForeign: refundAmountForeign,
+        totalForeign: Math.round(refundAmountForeign * 10000) / 10000,
         totalBase: Math.round((refundAmountForeign / fxRate) * 10000) / 10000,
+        lineKind: 'sale',
       })
     }
 

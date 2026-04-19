@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process'
+import { createHmac } from 'node:crypto'
 import { expect, test, type Page } from '@playwright/test'
 import { createSimpleProduct } from './helpers'
 
@@ -23,11 +24,13 @@ type FxRefundInspect = {
 }
 
 type CreditNoteInspect = {
+  lineAmountsIncludeTax: boolean | null
   lines: Array<{
     description: string | null
     quantity: number
     unitAmount: number
     taxType: string | null
+    accountCode: string | null
   }>
 }
 
@@ -101,6 +104,16 @@ type DailyBatchDiscountInspect = Array<{
   unearnedRevenueAmount: number
   revenueDeferred: boolean
 }>
+
+type UnpaidDailyBatchSeed = {
+  unpaidOrderId: string
+}
+
+type ShippingRefundWebhookSeed = {
+  orderId: string
+  webhookSecret: string
+  webhookBody: string
+}
 
 function runFixture(args: string[]): string {
   return execFileSync(
@@ -222,8 +235,34 @@ test.describe.serial('connector and accounting regressions', () => {
     await expect(refundDialog).toBeHidden()
 
     const inspected = parseJsonLine<CreditNoteInspect>(runFixture(['inspect-credit-note', seeded.orderId]))
+    expect(inspected.lineAmountsIncludeTax).toBe(false)
     expect(inspected.lines).toHaveLength(2)
     expect(inspected.lines.map((line) => line.taxType)).toEqual(seeded.expectedTaxTypes)
+  })
+
+  test('books refunded WooCommerce shipping lines against the shipping account', async ({ page }) => {
+    const seeded = parseJsonLine<ShippingRefundWebhookSeed>(runFixture(['sync-wc-shipping-refund']))
+    const signature = createHmac('sha256', seeded.webhookSecret).update(seeded.webhookBody).digest('base64')
+    const response = await page.request.post('/api/webhooks/shopping/woocommerce/orders', {
+      data: seeded.webhookBody,
+      headers: {
+        'content-type': 'application/json',
+        'x-wc-webhook-topic': 'refund.created',
+        'x-wc-webhook-signature': signature,
+      },
+    })
+    expect(response.ok()).toBe(true)
+
+    const inspected = parseJsonLine<CreditNoteInspect>(runFixture(['inspect-credit-note', seeded.orderId]))
+
+    expect(inspected.lineAmountsIncludeTax).toBe(false)
+    expect(inspected.lines).toEqual([
+      expect.objectContaining({
+        quantity: 1,
+        unitAmount: 10,
+        accountCode: '210',
+      }),
+    ])
   })
 
   test('imports WooCommerce fee lines separately from shipping and preserves fee tax', async ({ page }) => {
@@ -275,8 +314,9 @@ test.describe.serial('connector and accounting regressions', () => {
   test('daily revenue deferral uses source-correct discount treatment for manual and WooCommerce orders', async () => {
     const seeded = parseJsonLine<DailyBatchDiscountSeed>(runFixture(['seed-daily-batch-discounts']))
 
-    const batchRun = runFixture(['run-daily-batch-discounts'])
-    expect(batchRun).toContain('"groupA1":2')
+    const batchRun = parseJsonLine<{ groupA1: number; errors: string[] }>(runFixture(['run-daily-batch-discounts']))
+    expect(batchRun.errors).toEqual([])
+    expect(batchRun.groupA1).toBeGreaterThanOrEqual(2)
 
     const inspected = parseJsonLine<DailyBatchDiscountInspect>(runFixture([
       'inspect-daily-batch-discounts',
@@ -297,6 +337,26 @@ test.describe.serial('connector and accounting regressions', () => {
       expect.objectContaining({
         revenueDeferred: true,
         unearnedRevenueAmount: 76,
+      }),
+    )
+  })
+
+  test('daily revenue deferral skips unpaid orders', async () => {
+    const seeded = parseJsonLine<UnpaidDailyBatchSeed>(runFixture(['seed-unpaid-daily-batch-order']))
+
+    runFixture(['run-daily-batch-discounts'])
+
+    const inspected = parseJsonLine<DailyBatchDiscountInspect>(runFixture([
+      'inspect-daily-batch-discounts',
+      seeded.unpaidOrderId,
+      seeded.unpaidOrderId,
+    ]))
+
+    expect(inspected[0]).toEqual(
+      expect.objectContaining({
+        id: seeded.unpaidOrderId,
+        revenueDeferred: false,
+        unearnedRevenueAmount: 0,
       }),
     )
   })

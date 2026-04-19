@@ -195,6 +195,12 @@ export type CreditNoteData = {
   date: string
   currency: string
   lines: InvoiceLine[]
+  /**
+   * When true, unit amounts are tax-inclusive in the accounting system.
+   * Refund lines in IMS are currently stored net, so callers usually pass
+   * false/omit this. The flag exists to avoid hard-coding one mode.
+   */
+  lineAmountsIncludeTax?: boolean
   reference?: string
 }
 

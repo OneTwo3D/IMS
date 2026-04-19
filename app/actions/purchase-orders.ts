@@ -1798,6 +1798,12 @@ export async function receivePurchaseOrder(
           where: { primaryPoId: id },
           select: { freightPoId: true },
         })
+        if (freightLinks.length > 0) {
+          await tx.landedCostLink.updateMany({
+            where: { primaryPoId: id },
+            data: { allocated: true },
+          })
+        }
         for (const fl of freightLinks) {
           const allLinks = await tx.landedCostLink.findMany({
             where: { freightPoId: fl.freightPoId },
@@ -2860,6 +2866,10 @@ function normalizeLandedCostMethod(
     : 'BY_VALUE') as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT'
 }
 
+function warnWeightFallback(context: string) {
+  console.warn(`${context}: BY_WEIGHT landed-cost allocation fell back to equal split because every eligible line had zero weight`)
+}
+
 function computeGrossUnitCostBaseByLine(params: {
   lines: PendingGrossCostLine[]
   directCostLines?: PendingGrossCostLineSource[]
@@ -2893,6 +2903,7 @@ function computeGrossUnitCostBaseByLine(params: {
     }))
     let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
     if (basisTotal.lte(0)) {
+      if (method === 'BY_WEIGHT') warnWeightFallback('computeGrossUnitCostBaseByLine')
       basisTotal = new Prisma.Decimal(eligibleLines.length || 1)
       for (const entry of bases) entry.base = new Prisma.Decimal(1)
     }
@@ -3087,6 +3098,7 @@ async function recalculateLandedCosts(
       let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
 
       if (basisTotal.lte(0)) {
+        if (method === 'BY_WEIGHT') warnWeightFallback(`recalculateLandedCosts:${primaryPo.reference}`)
         const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
         basisTotal = equalBase
         for (const entry of bases) entry.base = new Prisma.Decimal(1)
@@ -3109,6 +3121,7 @@ async function recalculateLandedCosts(
         let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
 
         if (basisTotal.lte(0)) {
+          if (method === 'BY_WEIGHT') warnWeightFallback(`recalculateLandedCosts:${primaryPo.reference}:linked`)
           const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
           basisTotal = equalBase
           for (const entry of bases) entry.base = new Prisma.Decimal(1)
@@ -3192,6 +3205,11 @@ async function recalculateLandedCosts(
         totalDelta: Math.round(totalInventoryDelta * 100) / 100,
       })
     }
+
+    await tx.landedCostLink.updateMany({
+      where: { primaryPoId, freightPoId },
+      data: { allocated: true },
+    })
   }
   return result
 }
@@ -3254,6 +3272,7 @@ async function recalculateDirectLandedCosts(
     }))
     let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
     if (basisTotal.lte(0)) {
+      if (method === 'BY_WEIGHT') warnWeightFallback(`recalculateDirectLandedCosts:${po.reference}`)
       basisTotal = new Prisma.Decimal(eligibleLines.length || 1)
       for (const entry of bases) entry.base = new Prisma.Decimal(1)
     }

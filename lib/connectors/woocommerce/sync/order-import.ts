@@ -10,6 +10,7 @@ import {
   mapWcAddress, upsertCustomer, mapWcLineItems, mapWcOrderDiscount,
   mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp,
 } from './field-mapping'
+import { syncRefundsForOrder } from './refund-sync'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
 import type { TaxCategory } from '@/app/generated/prisma/client'
@@ -144,7 +145,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const needsResolver = mappedLines
       .map((l, idx) => ({
         id: String(idx),
-        productCategory: (l.productId && productCategoryById.get(l.productId)) || ('STANDARD' as TaxCategory),
+        productCategory: (l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory),
         hasWc: l.externalTaxRateId != null,
       }))
       .filter((l) => !l.hasWc)
@@ -454,6 +455,9 @@ export async function syncNewWcOrders(
   let statuses: string[]
   try { statuses = statusesSetting?.value ? JSON.parse(statusesSetting.value) : ['processing'] }
   catch { statuses = ['processing'] }
+  if (mode !== 'poll' && !statuses.includes('completed')) {
+    statuses = [...statuses, 'completed']
+  }
 
   const lastSync = lastSyncSetting?.value || null
 
@@ -480,6 +484,9 @@ export async function syncNewWcOrders(
     for (const order of orders) {
       const importResult = await importWcOrder(order)
       if (importResult.success) {
+        if (mode !== 'poll') {
+          await syncRefundsForOrder(order.id)
+        }
         if (importResult.orderId) result.synced++
         else result.skipped++
       } else {

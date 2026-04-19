@@ -57,6 +57,12 @@ export type SupplierOption = {
   name: string
 }
 
+type ComponentStockRow = {
+  componentId: string
+  available: number
+  needed: number
+}
+
 // ---------------------------------------------------------------------------
 // List / Filter
 // ---------------------------------------------------------------------------
@@ -193,11 +199,10 @@ export async function getSuppliers(): Promise<SupplierOption[]> {
 }
 
 /** Get available stock for components in a specific warehouse */
-export async function getComponentStock(
+async function loadComponentStock(
   productId: string,
   warehouseId: string,
-): Promise<{ componentId: string; available: number; needed: number }[]> {
-  await requireAuth()
+): Promise<ComponentStockRow[]> {
   const product = await db.product.findUnique({
     where: { id: productId },
     select: {
@@ -227,10 +232,18 @@ export async function getComponentStock(
   return product.productComponents
     .filter((c) => COMPONENT_PRODUCT_STATUSES.includes(c.component.lifecycleStatus))
     .map((c) => ({
-    componentId: c.componentId,
-    available: stockMap.get(c.componentId) ?? 0,
-    needed: Number(c.qty),
-  }))
+      componentId: c.componentId,
+      available: stockMap.get(c.componentId) ?? 0,
+      needed: Number(c.qty),
+    }))
+}
+
+export async function getComponentStock(
+  productId: string,
+  warehouseId: string,
+): Promise<ComponentStockRow[]> {
+  await requireAuth()
+  return loadComponentStock(productId, warehouseId)
 }
 
 /** Max units that can be assembled from available stock */
@@ -412,18 +425,21 @@ async function buildDisassemblyRecoveryPlan(
   const historicalQtyByComponent = new Map<string, number>()
   const historicalCostByComponent = new Map<string, Prisma.Decimal>()
   let residualCostBase = new Prisma.Decimal(0)
+  let usedLegacyFallback = false
 
   for (const recoveredLayer of recoveredLayers) {
     const layerDetail = layerDetailById.get(recoveredLayer.costLayerId)
     const entryCostBase = new Prisma.Decimal(recoveredLayer.qty * recoveredLayer.unitCostBase)
 
     if (!layerDetail || layerDetail.sourceLines.length === 0) {
+      usedLegacyFallback = true
       residualCostBase = residualCostBase.add(entryCostBase)
       continue
     }
 
     const receivedQty = Number(layerDetail.receivedQty)
     if (!Number.isFinite(receivedQty) || receivedQty <= 0) {
+      usedLegacyFallback = true
       residualCostBase = residualCostBase.add(entryCostBase)
       continue
     }
@@ -477,6 +493,12 @@ async function buildDisassemblyRecoveryPlan(
 
   const totalResidualBasis = residualBasis.reduce((sum, component) => sum + component.basis, 0)
   const fallbackResidualBasis = residualBasis.reduce((sum, component) => sum + component.totalQty, 0)
+  if (usedLegacyFallback && residualCostBase.abs().gt(0.000001)) {
+    console.warn(
+      `Disassembly recovery used average-cost fallback for ${recoveredLayers.length} recovered layer(s) ` +
+      `because historical source-line provenance was incomplete.`,
+    )
+  }
 
   return residualBasis
     .filter((component) => component.totalQty > 0)
@@ -757,12 +779,8 @@ export async function updateManufacturingOrderStatus(
       const qtyPlanned = Number(orderPreview.qtyPlanned)
       // Check stock sufficiency before starting
       if (isAssembly) {
-        const componentIds = orderPreview.outputProduct.productComponents.map((c) => c.componentId)
-        const levels = await db.stockLevel.findMany({
-          where: { productId: { in: componentIds }, warehouseId: orderPreview.warehouseId },
-          select: { productId: true, quantity: true, reservedQty: true },
-        })
-        const stockMap = new Map(levels.map((l) => [l.productId, Number(l.quantity) - Number(l.reservedQty)]))
+        const componentStock = await loadComponentStock(orderPreview.outputProductId, orderPreview.warehouseId)
+        const stockMap = new Map(componentStock.map((stock) => [stock.componentId, stock.available]))
         const insufficient: string[] = []
         for (const comp of orderPreview.outputProduct.productComponents) {
           const needed = Number(comp.qty) * qtyPlanned

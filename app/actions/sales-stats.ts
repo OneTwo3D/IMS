@@ -6,6 +6,7 @@ import { requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
+import { normalizeLineDiscountBase, normalizeOrderDiscountBase } from '@/lib/sales-currency'
 
 // ---------------------------------------------------------------------------
 // Products tab (line-level)
@@ -63,7 +64,8 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
   const orders = await db.salesOrder.findMany({
     where: { status: { in: ['SHIPPED', 'COMPLETED', 'PARTIALLY_REFUNDED', 'REFUNDED'] }, ...(hasDateFilter ? { createdAt: dateFilter } : {}) },
     select: {
-      id: true, totalBase: true, discountAmount: true, fxRateToBase: true, customerName: true, salesRep: true,
+      id: true, totalBase: true, discountAmount: true, fxRateToBase: true, pricesIncludeVat: true, taxRatePercent: true, customerName: true, salesRep: true,
+      shoppingLinks: { select: { connector: true } },
       lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true } },
       refunds: { select: { totalBase: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
     },
@@ -77,6 +79,8 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
   const productMap = new Map<string, SalesStatRow>()
 
   for (const order of orders) {
+    const orderLineTotal = order.lines.reduce((sum, line) => sum + Number(line.totalBase), 0)
+    const orderDiscountBase = normalizeOrderDiscountBase(order)
     for (const line of order.lines) {
       if (!line.productId) continue
       const pid = line.productId; const info = productInfo.get(pid)
@@ -96,9 +100,15 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
         })
       }
       const row = productMap.get(pid)!
+      const lineDiscountBase = normalizeLineDiscountBase(order, line.discountAmount)
       row.qtySold += Number(line.qty)
-      row.grossRevenue += Number(line.totalBase) + Number(line.discountAmount) / Number(order.fxRateToBase || 1)
-      row.discounts += Number(line.discountAmount) / Number(order.fxRateToBase || 1)
+      row.grossRevenue += Number(line.totalBase) + lineDiscountBase
+      row.discounts += lineDiscountBase
+      if (orderDiscountBase > 0 && orderLineTotal > 0) {
+        const allocatedOrderDiscount = orderDiscountBase * (Number(line.totalBase) / orderLineTotal)
+        row.grossRevenue += allocatedOrderDiscount
+        row.discounts += allocatedOrderDiscount
+      }
       row.cogs += Number(line.cogsBase ?? 0)
       row.orderCount++
     }

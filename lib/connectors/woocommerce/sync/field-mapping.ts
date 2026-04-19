@@ -3,6 +3,7 @@
  */
 
 import { db } from '@/lib/db'
+import type { TaxCategory } from '@/app/generated/prisma/client'
 import type { WcAddress, WcFullOrder, WcLineItem, WcCouponLine, WcFeeLine } from './types'
 
 // ---------------------------------------------------------------------------
@@ -122,6 +123,17 @@ export type MappedLine = {
    */
   externalTaxRateId: number | null
   externalLineItemId: number | null
+  taxCategoryFallback?: TaxCategory
+}
+
+function mapWcTaxClassToCategory(taxClass: string | null | undefined): TaxCategory {
+  const normalized = (taxClass ?? '').trim().toLowerCase()
+  if (!normalized) return 'STANDARD'
+  if (normalized === 'zero-rate' || normalized === 'zero') return 'ZERO'
+  if (normalized === 'reduced-rate' || normalized === 'reduced') return 'REDUCED'
+  if (normalized === 'second-reduced-rate' || normalized === 'second-reduced') return 'SECOND_REDUCED'
+  if (normalized === 'exempt' || normalized === 'exemption') return 'EXEMPT'
+  return 'STANDARD'
 }
 
 export async function mapWcLineItems(
@@ -180,6 +192,7 @@ export function mapWcFeeLines(feeLines: WcFeeLine[]): MappedLine[] {
         forceNoTax: tax <= 0.000001 && !externalTaxRateId,
         externalTaxRateId: typeof externalTaxRateId === 'number' && externalTaxRateId > 0 ? externalTaxRateId : null,
         externalLineItemId: null,
+        taxCategoryFallback: mapWcTaxClassToCategory(feeLine.tax_class),
       }
     })
   return mapped.filter((line): line is MappedLine => line !== null)

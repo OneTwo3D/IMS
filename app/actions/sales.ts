@@ -49,6 +49,7 @@ type RefundRequestLine = {
   qty: number
   totalForeign?: number | null
   totalBase: number
+  lineKind?: 'sale' | 'shipping'
 }
 
 function aggregateRefundReturnRows(
@@ -1355,6 +1356,7 @@ export async function createRefund(
     type CreatedRefundLine = {
       id: string; lineId: string | null; productId: string | null; description: string
       qty: number; unitPriceForeign: number; unitPriceBase: number; totalForeign: number; totalBase: number
+      lineKind: 'sale' | 'shipping'
     }
 
     const txResult = await db.$transaction(async (tx) => {
@@ -1483,6 +1485,7 @@ export async function createRefund(
           unitPriceBase: Number(createdLine.unitPriceBase),
           totalForeign: Number(createdLine.totalForeign),
           totalBase: Number(createdLine.totalBase),
+          lineKind: refundLine.lineKind === 'shipping' ? 'shipping' : 'sale',
         })
       }
 
@@ -1559,9 +1562,12 @@ export async function createRefund(
             unitAmount: orderForCN?.currency === baseCurrency
               ? (l.qty > 0 ? l.unitPriceBase : l.totalBase)
               : (l.qty > 0 ? l.unitPriceForeign : l.totalForeign),
-            accountCode: settings.salesAccount,
+            accountCode: l.lineKind === 'shipping'
+              ? (settings.shippingAccount || settings.salesAccount)
+              : settings.salesAccount,
             taxType: (l.lineId ? taxTypeBySalesLineId.get(l.lineId) : undefined) ?? cnTaxRate?.accountingTaxType ?? undefined,
           })),
+          lineAmountsIncludeTax: false,
         },
       })
     } catch { /* Accounting queue errors should never block the main flow */ }
@@ -2425,6 +2431,19 @@ export async function addPayment(input: {
   try {
     await requirePermission('sales.refund')
     if (!input.amount || input.amount <= 0) return { success: false, error: 'Amount must be greater than 0' }
+    const so = await db.salesOrder.findUnique({
+      where: { id: input.orderId },
+      select: {
+        orderNumber: true,
+        externalOrderNumber: true,
+        currency: true,
+        totalForeign: true,
+        paidAt: true,
+      },
+    })
+    if (so && input.currency !== so.currency) {
+      return { success: false, error: `Payment currency must match order currency (${so.currency})` }
+    }
     await db.payment.create({
       data: {
         orderId: input.orderId,
@@ -2439,17 +2458,16 @@ export async function addPayment(input: {
     })
 
     // Auto-set paidAt on the order if invoice total is fully paid
-    const so = await db.salesOrder.findUnique({
-      where: { id: input.orderId },
-      select: { orderNumber: true, externalOrderNumber: true, totalBase: true, paidAt: true },
-    })
     if (so && !so.paidAt) {
       const payments = await db.payment.findMany({
         where: { orderId: input.orderId, refundId: null },
-        select: { amount: true },
+        select: { amount: true, currency: true },
       })
-      const totalPaid = payments.reduce((s, p) => s + Number(p.amount), 0)
-      if (totalPaid >= Number(so.totalBase)) {
+      const totalPaid = payments.reduce((sum, payment) => {
+        if (payment.currency !== so.currency) return sum
+        return sum + Number(payment.amount)
+      }, 0)
+      if (totalPaid >= Number(so.totalForeign)) {
         await db.salesOrder.update({ where: { id: input.orderId }, data: { paidAt: new Date() } })
 
         // Auto-generate invoice if trigger is on_paid (skip its own log —
@@ -2468,7 +2486,7 @@ export async function addPayment(input: {
       action: 'payment_added',
       tag: 'sales',
       level: 'INFO',
-      description: `Added £${input.amount.toFixed(2)} payment to order ${so ? getSalesOrderReference({ id: input.orderId, ...so }) : input.orderId}`,
+      description: `Added ${input.currency} ${input.amount.toFixed(2)} payment to order ${so ? getSalesOrderReference({ id: input.orderId, ...so }) : input.orderId}`,
       metadata: { orderNumber: so ? getSalesOrderReference({ id: input.orderId, ...so }) : input.orderId, amount: input.amount, currency: input.currency, method: input.method },
     })
     return { success: true }

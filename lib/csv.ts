@@ -5,13 +5,16 @@
 // Characters that trigger formula evaluation in Excel / LibreOffice / Google Sheets
 // when they appear at the start of a cell. We neutralise by prefixing with `'`.
 const FORMULA_PREFIX = /^[=+\-@\t\r]/
+const NUMERIC_LITERAL = /^-?\d+(?:\.\d+)?$/
 
 /** Escape a single value for CSV output */
 function escapeField(value: unknown): string {
   if (value === null || value === undefined) return ''
   let str = String(value)
   // CSV injection mitigation — see OWASP "Formula Injection".
-  if (FORMULA_PREFIX.test(str)) str = "'" + str
+  // Preserve plain numeric literals so exported quantity/currency fields
+  // remain re-importable without carrying a leading apostrophe.
+  if (FORMULA_PREFIX.test(str) && !NUMERIC_LITERAL.test(str)) str = "'" + str
   // Quote if contains comma, quote, newline
   if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
     return '"' + str.replace(/"/g, '""') + '"'
@@ -28,6 +31,22 @@ export function toCsv(rows: Record<string, unknown>[], headers: string[]): strin
   return lines.join('\r\n')
 }
 
+export function buildTemplateCsv(
+  headers: string[],
+  requiredHeaders: string[],
+  exampleRows: Array<Record<string, unknown>> = [],
+): string {
+  const markerRow = headers.map((header, index) => {
+    if (index === 0) return '# REQUIRED'
+    return requiredHeaders.includes(header) ? 'REQUIRED' : 'OPTIONAL'
+  })
+  const lines = [headers.join(','), markerRow.map(escapeField).join(',')]
+  for (const row of exampleRows) {
+    lines.push(headers.map((header) => escapeField(row[header])).join(','))
+  }
+  return lines.join('\r\n')
+}
+
 /** Parse CSV text into an array of objects keyed by header row */
 export function parseCsv(text: string): Record<string, string>[] {
   const rows = parseRows(text)
@@ -39,6 +58,10 @@ export function parseCsv(text: string): Record<string, string>[] {
   for (let i = 1; i < rows.length; i++) {
     const values = rows[i]
     if (values.every((value) => value.trim() === '')) continue
+    const firstNonEmpty = values.find((value) => value.trim().length > 0)?.trim() ?? ''
+    // Allow templates to carry guidance rows such as "# REQUIRED" without
+    // turning them into imported records.
+    if (firstNonEmpty.startsWith('#')) continue
     const obj: Record<string, string> = {}
     headers.forEach((h, idx) => {
       obj[h.trim()] = values[idx]?.trim() ?? ''

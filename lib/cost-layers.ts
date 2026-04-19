@@ -231,8 +231,15 @@ export async function copyCostLayerSourceLinesProportionally(
   const sourceReceivedQty = Number(sourceLayer.receivedQty)
   if (!Number.isFinite(sourceReceivedQty) || sourceReceivedQty <= 0) return 0
 
-  const ratio = Math.min(1, copiedQty / sourceReceivedQty)
+  const rawRatio = copiedQty / sourceReceivedQty
+  const ratio = Math.min(1, rawRatio)
   if (ratio <= 0) return 0
+  if (rawRatio > 1.000001) {
+    console.warn(
+      `copyCostLayerSourceLinesProportionally capped ratio at 1 for ${fromCostLayerId} -> ${toCostLayerId} ` +
+      `(copiedQty=${copiedQty}, sourceReceivedQty=${sourceReceivedQty})`,
+    )
+  }
 
   return addCostLayerSourceLines(
     tx,

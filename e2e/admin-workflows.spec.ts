@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test'
+import { expect, test, type Page } from '@playwright/test'
 import { addStockAdjustment, signIn, uniqueSuffix } from './helpers'
 
 function csvFile(contents: string) {
@@ -7,6 +7,25 @@ function csvFile(contents: string) {
     mimeType: 'text/csv',
     buffer: Buffer.from(contents, 'utf8'),
   }
+}
+
+async function uploadCsvForReview(page: Page, csv: string) {
+  const chooserPromise = page.waitForEvent('filechooser')
+  await page.getByRole('button', { name: 'Import CSV' }).first().click()
+  const chooser = await chooserPromise
+  await chooser.setFiles(csvFile(csv))
+  const reviewDialog = page.getByRole('dialog', { name: 'Review CSV Import' })
+  await expect(reviewDialog).toBeVisible({ timeout: 20000 })
+  return reviewDialog
+}
+
+async function approveCsvImport(page: Page) {
+  const reviewDialog = page.getByRole('dialog', { name: 'Review CSV Import' })
+  await reviewDialog.getByRole('button', { name: /^Import /i }).click()
+  const resultDialog = page.getByRole('dialog', { name: /Import (Complete|Completed With Issues|Failed)/ })
+  await expect(resultDialog).toBeVisible({ timeout: 20000 })
+  await resultDialog.getByRole('button', { name: 'Close' }).first().click()
+  await expect(resultDialog).toBeHidden()
 }
 
 test.describe('admin workflows', () => {
@@ -19,8 +38,12 @@ test.describe('admin workflows', () => {
     ].join('\n')
 
     await page.goto('/inventory')
-    await page.locator('input[type="file"]').setInputFiles(csvFile(csv))
-    await expect(page.getByText('+1 created')).toBeVisible()
+    const reviewDialog = await uploadCsvForReview(page, csv)
+    await expect(reviewDialog).toContainText('CSV Records')
+    await expect(reviewDialog).toContainText('Will Create')
+    await expect(reviewDialog).toContainText('Errors')
+    await expect(reviewDialog.getByRole('button', { name: 'Import 1 Record' })).toBeVisible()
+    await approveCsvImport(page)
 
     const search = page.getByPlaceholder(/search sku, name, barcode/i)
     await search.fill(sku)
@@ -106,8 +129,9 @@ test.describe('admin workflows', () => {
     ].join('\n')
 
     await page.goto('/inventory')
-    await page.locator('input[type="file"]').setInputFiles(csvFile(csv))
-    await expect(page.getByText('+3 created')).toBeVisible()
+    const reviewDialog = await uploadCsvForReview(page, csv)
+    await expect(reviewDialog.getByRole('button', { name: 'Import 3 Records' })).toBeVisible()
+    await approveCsvImport(page)
 
     await addStockAdjustment(page, compA, 10, 'DEFAULT')
     await addStockAdjustment(page, compB, 5, 'DEFAULT')

@@ -39,8 +39,8 @@ type InspectResult = {
 
 function runFixture(args: string[]): string {
   return execFileSync(
-    'node',
-    ['--experimental-strip-types', 'scripts/landed-cost-e2e-fixture.ts', ...args],
+    'npx',
+    ['tsx', 'scripts/landed-cost-e2e-fixture.ts', ...args],
     {
       cwd: process.cwd(),
       env: process.env,

@@ -458,7 +458,7 @@ async function main() {
     }
     default:
       throw new Error(
-        'usage: node --experimental-strip-types scripts/landed-cost-e2e-fixture.ts ' +
+        'usage: tsx scripts/landed-cost-e2e-fixture.ts ' +
         '<seed|inspect> [...]',
       )
   }

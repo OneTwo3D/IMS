@@ -150,6 +150,7 @@ export type WcRefund = {
   refunded_payment: boolean
   meta_data: WcMeta[]
   line_items: WcRefundLineItem[]
+  shipping_lines?: WcShippingLine[]
 }
 
 export type WcFullProduct = {

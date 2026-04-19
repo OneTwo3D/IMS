@@ -382,7 +382,7 @@ async function main() {
       break
     default:
       throw new Error(
-        'usage: node --experimental-strip-types scripts/cogs-e2e-fixture.ts ' +
+        'usage: tsx scripts/cogs-e2e-fixture.ts ' +
         '<seed-dispatch|inspect-dispatch|seed-adjustment-safe|seed-adjustment-blocked|inspect-adjustment> [...]',
       )
   }

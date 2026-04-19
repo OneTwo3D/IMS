@@ -105,6 +105,133 @@ export type AdjustmentFormState = {
   success?: boolean
 }
 
+export type ApplyStockAdjustmentInput = {
+  tx: Prisma.TransactionClient
+  productId: string
+  warehouseId: string
+  qty: number
+  reasonId?: string
+  note?: string | null
+}
+
+export type AppliedStockAdjustment = {
+  movementId: string
+  productSku: string
+  warehouseName: string
+}
+
+export async function applyStockAdjustment({
+  tx,
+  productId,
+  warehouseId,
+  qty,
+  reasonId,
+  note,
+}: ApplyStockAdjustmentInput): Promise<AppliedStockAdjustment> {
+  const isAddition = qty > 0
+  const absQty = Math.abs(qty).toString()
+
+  let reasonName: string | null = note || null
+  let accountCode: string | null = null
+
+  if (reasonId) {
+    const reason = await tx.adjustmentReason.findUnique({
+      where: { id: reasonId },
+      select: { name: true, accountCode: true },
+    })
+    if (reason) {
+      reasonName = note ? `${reason.name}: ${note}` : reason.name
+      accountCode = reason.accountCode
+    }
+  }
+
+  const movement = await tx.stockMovement.create({
+    data: {
+      type: 'ADJUSTMENT',
+      productId,
+      fromWarehouseId: isAddition ? null : warehouseId,
+      toWarehouseId: isAddition ? warehouseId : null,
+      qty: absQty,
+      note: reasonName,
+    },
+  })
+
+  await tx.stockLevel.upsert({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    create: {
+      productId,
+      warehouseId,
+      quantity: isAddition ? absQty : `-${absQty}`,
+    },
+    update: {
+      quantity: {
+        increment: qty,
+      },
+    },
+  })
+
+  if (isAddition) {
+    const avgCost = await getAverageUnitCost(tx, productId, warehouseId)
+    await createCostLayer(tx, {
+      productId,
+      warehouseId,
+      qty: Math.abs(qty),
+      unitCostBase: avgCost,
+      receivedAt: movement.createdAt,
+      isOpeningStock: false,
+      adjustmentMovementId: movement.id,
+    })
+  } else {
+    const { consumed } = await consumeFifoLayers(tx, productId, warehouseId, Math.abs(qty))
+    if (consumed.length > 0) {
+      await tx.cogsEntry.createMany({
+        data: consumed.map((entry) => ({
+          costLayerId: entry.costLayerId,
+          movementId: movement.id,
+          qty: entry.qty,
+          unitCostBase: entry.unitCostBase,
+          totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+        })),
+      })
+    }
+  }
+
+  const [product, warehouse] = await Promise.all([
+    tx.product.findUnique({ where: { id: productId }, select: { sku: true, name: true } }),
+    tx.warehouse.findUnique({ where: { id: warehouseId }, select: { code: true, name: true } }),
+  ])
+
+  if (accountCode) {
+    const settings = await getAccountingSettings()
+    const unitCost = await getProductUnitCost(tx, productId)
+    const journal = buildInventoryAdjustmentJournal({
+      reasonAccountCode: accountCode,
+      inventoryAccountCode: settings.inventoryAccount,
+      productSku: product?.sku ?? productId,
+      productName: product?.name ?? '',
+      warehouseCode: warehouse?.code ?? '',
+      warehouseName: warehouse?.name ?? '',
+      qty,
+      unitCost,
+      note: reasonName,
+    })
+    if (journal) {
+      await queueAccountingSync({
+        type: 'INVENTORY_ADJUSTMENT',
+        referenceType: 'StockMovement',
+        referenceId: movement.id,
+        payload: journal as unknown as Record<string, unknown>,
+      })
+    }
+  }
+
+  return {
+    movementId: movement.id,
+    productSku: product?.sku ?? productId,
+    warehouseName: warehouse?.name ?? warehouseId,
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Single product adjustment
 // ---------------------------------------------------------------------------
@@ -138,124 +265,22 @@ export async function adjustStock(
 
   const { productId, warehouseId, qty, reasonId, note } = parsed.data
   const qtyNum = Number(qty)
-  const isAddition = qtyNum > 0
-  const absQty = Math.abs(qtyNum).toString()
 
   let logSku = ''
   let logWarehouseName = ''
 
   try {
     await db.$transaction(async (tx) => {
-      // Look up reason (name + optional accounting account code)
-      let reasonName: string | null = note || null
-      let accountCode: string | null = null
-
-      if (reasonId) {
-        const reason = await tx.adjustmentReason.findUnique({
-          where: { id: reasonId },
-          select: { name: true, accountCode: true },
-        })
-        if (reason) {
-          reasonName = note ? `${reason.name}: ${note}` : reason.name
-          accountCode = reason.accountCode
-        }
-      }
-
-      // Create stock movement
-      const movement = await tx.stockMovement.create({
-        data: {
-          type: 'ADJUSTMENT',
-          productId,
-          fromWarehouseId: isAddition ? null : warehouseId,
-          toWarehouseId: isAddition ? warehouseId : null,
-          qty: absQty,
-          note: reasonName,
-        },
+      const applied = await applyStockAdjustment({
+        tx,
+        productId,
+        warehouseId,
+        qty: qtyNum,
+        reasonId,
+        note,
       })
-
-      // Upsert stock level
-      await tx.stockLevel.upsert({
-        where: { productId_warehouseId: { productId, warehouseId } },
-        create: {
-          productId,
-          warehouseId,
-          quantity: isAddition ? absQty : `-${absQty}`,
-        },
-        update: {
-          quantity: {
-            increment: qtyNum,
-          },
-        },
-      })
-
-      // Maintain FIFO cost layers so valuation stays in sync with stock levels.
-      // Negative adjustments consume layers oldest-first (same as sale dispatch).
-      // Positive adjustments create a new layer at the current average unit cost.
-      if (isAddition) {
-        const avgCost = await getAverageUnitCost(tx, productId, warehouseId)
-        await createCostLayer(tx, {
-          productId,
-          warehouseId,
-          qty: Math.abs(qtyNum),
-          unitCostBase: avgCost,
-          receivedAt: movement.createdAt,
-          isOpeningStock: false,
-          adjustmentMovementId: movement.id,
-        })
-      } else {
-        // Tolerant consume — adjustment may exceed available FIFO layers
-        // (e.g. legacy stock with no layers). Shortfall is accepted.
-        const { consumed } = await consumeFifoLayers(tx, productId, warehouseId, Math.abs(qtyNum))
-        if (consumed.length > 0) {
-          await tx.cogsEntry.createMany({
-            data: consumed.map((entry) => ({
-              costLayerId: entry.costLayerId,
-              movementId: movement.id,
-              qty: entry.qty,
-              unitCostBase: entry.unitCostBase,
-              totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
-            })),
-          })
-        }
-      }
-
-      // Capture info for activity log
-      const logProduct = await tx.product.findUnique({ where: { id: productId }, select: { sku: true } })
-      const logWarehouse = await tx.warehouse.findUnique({ where: { id: warehouseId }, select: { name: true } })
-      logSku = logProduct?.sku ?? productId
-      logWarehouseName = logWarehouse?.name ?? warehouseId
-
-      // Queue accounting sync — ONLY if the reason has an account code assigned.
-      // The reason (configured in Settings → Inventory → Stock Adjustment Reasons)
-      // is the single source of truth for the counter-account. There is no global
-      // fallback: an adjustment with no reason account simply posts no journal.
-      if (accountCode) {
-        const settings = await getAccountingSettings()
-        const [product, warehouse, unitCost] = await Promise.all([
-          tx.product.findUnique({ where: { id: productId }, select: { sku: true, name: true } }),
-          tx.warehouse.findUnique({ where: { id: warehouseId }, select: { code: true, name: true } }),
-          getProductUnitCost(tx, productId),
-        ])
-        const journal = buildInventoryAdjustmentJournal({
-          reasonAccountCode: accountCode,
-          inventoryAccountCode: settings.inventoryAccount,
-          productSku: product?.sku ?? productId,
-          productName: product?.name ?? '',
-          warehouseCode: warehouse?.code ?? '',
-          warehouseName: warehouse?.name ?? '',
-          qty: qtyNum,
-          unitCost,
-          note: reasonName,
-        })
-        if (journal) {
-          await queueAccountingSync({
-            type: 'INVENTORY_ADJUSTMENT',
-            referenceType: 'StockMovement',
-            referenceId: movement.id,
-            payload: journal as unknown as Record<string, unknown>,
-          })
-        }
-      }
+      logSku = applied.productSku
+      logWarehouseName = applied.warehouseName
     })
 
     revalidatePath(`/inventory/${productId}`)
@@ -329,82 +354,17 @@ export async function bulkAdjustStock(
   const reasonMap = new Map(reasons.map((r) => [r.id, r]))
 
   try {
-    // Resolve the inventory account once — same value for every line.
-    const settings = await getAccountingSettings()
-
     await db.$transaction(async (tx) => {
       for (const line of valid) {
-        const { productId, warehouseId, reasonId, qty } = line
-        const isAddition = qty > 0
-        const absQty = Math.abs(qty).toString()
-
-        const reason = reasonId ? reasonMap.get(reasonId) : null
-        const note = reason?.name ?? null
-
-        await tx.stockMovement.create({
-          data: {
-            type: 'ADJUSTMENT',
-            productId,
-            fromWarehouseId: isAddition ? null : warehouseId,
-            toWarehouseId: isAddition ? warehouseId : null,
-            qty: absQty,
-            note,
-          },
+        const reason = line.reasonId ? reasonMap.get(line.reasonId) : null
+        await applyStockAdjustment({
+          tx,
+          productId: line.productId,
+          warehouseId: line.warehouseId,
+          qty: line.qty,
+          reasonId: line.reasonId,
+          note: reason?.name ?? null,
         })
-
-        await tx.stockLevel.upsert({
-          where: { productId_warehouseId: { productId, warehouseId } },
-          create: { productId, warehouseId, quantity: isAddition ? absQty : `-${absQty}` },
-          update: { quantity: { increment: qty } },
-        })
-
-        // FIFO layer bookkeeping — same logic as single adjustStock
-        if (isAddition) {
-          const avgCost = await getAverageUnitCost(tx, productId, warehouseId)
-          await tx.costLayer.create({
-            data: {
-              productId,
-              warehouseId,
-              receivedQty: Math.abs(qty),
-              remainingQty: Math.abs(qty),
-              unitCostBase: Math.round(avgCost * 1000000) / 1000000,
-              isOpeningStock: false,
-            },
-          })
-        } else {
-          await consumeFifoLayers(tx, productId, warehouseId, Math.abs(qty))
-        }
-
-        // Accounting sync: only queue when the reason has an account code.
-        // Reason accounts are configured in Settings → Inventory → Stock
-        // Adjustment Reasons and are the single source of truth.
-        const reasonAccountCode = reason?.accountCode ?? null
-        if (reasonAccountCode) {
-          const [product, warehouse, unitCost] = await Promise.all([
-            tx.product.findUnique({ where: { id: productId }, select: { sku: true, name: true } }),
-            tx.warehouse.findUnique({ where: { id: warehouseId }, select: { code: true, name: true } }),
-            getProductUnitCost(tx, productId),
-          ])
-          const journal = buildInventoryAdjustmentJournal({
-            reasonAccountCode,
-            inventoryAccountCode: settings.inventoryAccount,
-            productSku: product?.sku ?? productId,
-            productName: product?.name ?? '',
-            warehouseCode: warehouse?.code ?? '',
-            warehouseName: warehouse?.name ?? '',
-            qty,
-            unitCost,
-            note,
-          })
-          if (journal) {
-            await queueAccountingSync({
-              type: 'INVENTORY_ADJUSTMENT',
-              referenceType: 'StockMovement',
-              referenceId: productId,
-              payload: journal as unknown as Record<string, unknown>,
-            })
-          }
-        }
       }
     })
 

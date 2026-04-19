@@ -1,9 +1,10 @@
 import { db } from '@/lib/db'
-import { toCsv, csvResponse } from '@/lib/csv'
+import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
 import { auth } from '@/lib/auth'
 import { hasPermission } from '@/lib/permissions'
 
 const HEADERS = [
+  'productId', 'parentProductId',
   'sku', 'name', 'description', 'type', 'parentSku', 'barcode',
   'weight', 'widthCm', 'heightCm', 'depthCm',
   'salesPriceBase', 'salePriceBase', 'salesPriceTaxInclusive',
@@ -13,12 +14,14 @@ const HEADERS = [
 ]
 
 const TEMPLATE_HEADERS = [
+  'productId', 'parentProductId',
   'sku', 'name', 'description', 'type', 'parentSku', 'barcode',
   'weight', 'widthCm', 'heightCm', 'depthCm',
   'salesPriceBase', 'salePriceBase', 'salesPriceTaxInclusive',
   'stockUnit', 'oversellAllowed', 'imageUrl', 'active', 'lifecycleStatus',
   'components',
 ]
+const REQUIRED_HEADERS = ['sku', 'name']
 
 export async function GET(req: Request) {
   const session = await auth()
@@ -30,16 +33,14 @@ export async function GET(req: Request) {
 
   if (templateOnly) {
     // Add example rows for each type
-    const lines = [
-      TEMPLATE_HEADERS.join(','),
-      '"WIDGET-001","Widget","A simple widget","SIMPLE","","1234567890123","0.5","10","5","3","9.99","7.99","TRUE","pcs","TRUE","","TRUE","ACTIVE",""',
-      '"TSHIRT","T-Shirt Parent","Variable product with sizes","VARIABLE","","","0.2","","","","19.99","","TRUE","pcs","TRUE","","TRUE","ACTIVE",""',
-      '"TSHIRT-S","T-Shirt Small","Size S variant","VARIANT","TSHIRT","","0.2","","","","19.99","","TRUE","pcs","TRUE","","TRUE","ACTIVE",""',
-      '"TSHIRT-M","T-Shirt Medium","Size M variant","VARIANT","TSHIRT","","0.2","","","","19.99","","TRUE","pcs","TRUE","","TRUE","ACTIVE",""',
-      '"BUNDLE-01","Starter Kit","A kit/bundle product","KIT","","","","","","","29.99","","TRUE","pcs","TRUE","","TRUE","ACTIVE","WIDGET-001:2;TSHIRT-S:1"',
-      '"BOM-01","Assembled Widget","A manufactured product","BOM","","","","","","","15.99","","TRUE","pcs","TRUE","","TRUE","ACTIVE","WIDGET-001:3"',
-    ]
-    return csvResponse(lines.join('\r\n'), 'products-import-template.csv')
+    return csvResponse(buildTemplateCsv(TEMPLATE_HEADERS, REQUIRED_HEADERS, [
+      { sku: 'WIDGET-001', name: 'Widget', description: 'A simple widget', type: 'SIMPLE', barcode: '1234567890123', weight: '0.5', widthCm: '10', heightCm: '5', depthCm: '3', salesPriceBase: '9.99', salePriceBase: '7.99', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
+      { sku: 'TSHIRT', name: 'T-Shirt Parent', description: 'Variable product with sizes', type: 'VARIABLE', barcode: '', weight: '0.2', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '19.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
+      { sku: 'TSHIRT-S', name: 'T-Shirt Small', description: 'Size S variant', type: 'VARIANT', parentSku: 'TSHIRT', barcode: '', weight: '0.2', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '19.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
+      { sku: 'TSHIRT-M', name: 'T-Shirt Medium', description: 'Size M variant', type: 'VARIANT', parentSku: 'TSHIRT', barcode: '', weight: '0.2', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '19.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
+      { sku: 'BUNDLE-01', name: 'Starter Kit', description: 'A kit/bundle product', type: 'KIT', parentSku: '', barcode: '', weight: '', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '29.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: 'WIDGET-001:2;TSHIRT-S:1' },
+      { sku: 'BOM-01', name: 'Assembled Widget', description: 'A manufactured product', type: 'BOM', parentSku: '', barcode: '', weight: '', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '15.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: 'WIDGET-001:3' },
+    ]), 'products-import-template.csv')
   }
 
   const products = await db.product.findMany({
@@ -65,6 +66,8 @@ export async function GET(req: Request) {
       .join(';')
 
     return {
+      productId: p.id,
+      parentProductId: p.parentId ?? '',
       sku: p.sku,
       name: p.name,
       description: p.description ?? '',

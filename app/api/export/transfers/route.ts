@@ -1,10 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { toCsv, csvResponse } from '@/lib/csv'
+import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
 import { auth } from '@/lib/auth'
 import { hasPermission } from '@/lib/permissions'
 
-const HEADERS = ['reference', 'status', 'fromWarehouse', 'toWarehouse', 'createdAt', 'dispatchedAt', 'completedAt', 'sku', 'productName', 'qty', 'qtyReceived', 'notes']
+const HEADERS = ['transferKey', 'fromWarehouseCode', 'toWarehouseCode', 'status', 'sku', 'qty', 'notes']
+const REQUIRED_HEADERS = ['fromWarehouseCode', 'toWarehouseCode', 'status', 'sku', 'qty']
 
 export async function GET(req: NextRequest) {
   const session = await auth()
@@ -12,7 +13,7 @@ export async function GET(req: NextRequest) {
   if (!hasPermission(session.user.role, 'stock_control')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
   if (req.nextUrl.searchParams.get('template')) {
-    return csvResponse(['fromWarehouseCode', 'toWarehouseCode', 'sku', 'qty', 'notes'].join(',') + '\r\n', 'transfers-template.csv')
+    return csvResponse(buildTemplateCsv(HEADERS, REQUIRED_HEADERS), 'transfers-template.csv')
   }
   const rows = await db.stockTransfer.findMany({
     orderBy: { createdAt: 'desc' },
@@ -27,10 +28,13 @@ export async function GET(req: NextRequest) {
   for (const t of rows) {
     for (const l of t.lines) {
       data.push({
-        reference: t.reference, status: t.status, fromWarehouse: t.fromWarehouse.code, toWarehouse: t.toWarehouse.code,
-        createdAt: t.createdAt.toISOString().slice(0, 10), dispatchedAt: t.dispatchedAt?.toISOString().slice(0, 10),
-        completedAt: t.completedAt?.toISOString().slice(0, 10), sku: l.sku, productName: l.productName,
-        qty: Number(l.qty), qtyReceived: Number(l.qtyReceived), notes: t.notes,
+        transferKey: t.reference,
+        fromWarehouseCode: t.fromWarehouse.code,
+        toWarehouseCode: t.toWarehouse.code,
+        status: t.status,
+        sku: l.sku,
+        qty: Number(l.qty),
+        notes: t.notes ?? '',
       })
     }
   }

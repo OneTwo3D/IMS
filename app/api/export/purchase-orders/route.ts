@@ -1,10 +1,31 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { toCsv, csvResponse } from '@/lib/csv'
+import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
 import { auth } from '@/lib/auth'
 import { hasPermission } from '@/lib/permissions'
 
-const HEADERS = ['reference', 'type', 'status', 'supplier', 'currency', 'fxRate', 'subtotal', 'tax', 'total', 'totalBase', 'warehouse', 'expectedDelivery', 'supplierRef', 'sku', 'productName', 'qty', 'unitCostForeign', 'unitCostBase', 'lineTotal', 'qtyReceived', 'qtyReturned', 'notes']
+const HEADERS = [
+  'orderKey',
+  'supplierName',
+  'currency',
+  'fxRateToBase',
+  'destinationWarehouseCode',
+  'sku',
+  'qty',
+  'unitCostForeign',
+  'lineDiscountForeign',
+  'lineDiscountStr',
+  'taxRateName',
+  'taxRateValue',
+  'orderTaxRateName',
+  'orderTaxRateValue',
+  'pricesIncludeVat',
+  'supplierRef',
+  'expectedDelivery',
+  'orderDiscountForeign',
+  'notes',
+]
+const REQUIRED_HEADERS = ['supplierName', 'sku', 'qty', 'unitCostForeign']
 
 export async function GET(req: NextRequest) {
   const session = await auth()
@@ -12,14 +33,23 @@ export async function GET(req: NextRequest) {
   if (!hasPermission(session.user.role, 'purchasing')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
   if (req.nextUrl.searchParams.get('template')) {
-    return csvResponse(['supplierName', 'currency', 'sku', 'qty', 'unitCostForeign', 'notes'].join(',') + '\r\n', 'purchase-orders-template.csv')
+    return csvResponse(buildTemplateCsv(HEADERS, REQUIRED_HEADERS), 'purchase-orders-template.csv')
   }
   const rows = await db.purchaseOrder.findMany({
     orderBy: { createdAt: 'desc' },
     include: {
       supplier: { select: { name: true } },
       destinationWarehouse: { select: { code: true } },
-      lines: { select: { qty: true, unitCostForeign: true, unitCostBase: true, totalForeign: true, qtyReceived: true, qtyReturned: true, product: { select: { sku: true, name: true } } } },
+      lines: {
+        select: {
+          qty: true,
+          unitCostForeign: true,
+          discountAmount: true,
+          discountStr: true,
+          taxRate: { select: { name: true, rate: true } },
+          product: { select: { sku: true } },
+        },
+      },
     },
     take: 5000,
   })
@@ -27,14 +57,27 @@ export async function GET(req: NextRequest) {
   for (const po of rows) {
     for (const l of po.lines) {
       data.push({
-        reference: po.reference, type: po.type, status: po.status, supplier: po.supplier.name,
-        currency: po.currency, fxRate: Number(po.fxRateToBase), subtotal: Number(po.subtotalForeign).toFixed(2),
-        tax: Number(po.taxForeign).toFixed(2), total: Number(po.totalForeign).toFixed(2), totalBase: Number(po.totalBase).toFixed(2),
-        warehouse: po.destinationWarehouse?.code, expectedDelivery: po.expectedDelivery?.toISOString().slice(0, 10),
-        supplierRef: po.supplierRef, sku: l.product.sku, productName: l.product.name,
-        qty: Number(l.qty), unitCostForeign: Number(l.unitCostForeign).toFixed(4), unitCostBase: Number(l.unitCostBase).toFixed(4),
-        lineTotal: Number(l.totalForeign).toFixed(2), qtyReceived: Number(l.qtyReceived), qtyReturned: Number(l.qtyReturned),
-        notes: po.notes,
+        orderKey: po.reference,
+        supplierName: po.supplier.name,
+        currency: po.currency,
+        fxRateToBase: Number(po.fxRateToBase).toFixed(8),
+        destinationWarehouseCode: po.destinationWarehouse?.code ?? '',
+        sku: l.product.sku,
+        qty: Number(l.qty),
+        unitCostForeign: Number(l.unitCostForeign).toFixed(6),
+        lineDiscountForeign: Number(l.discountAmount ?? 0).toFixed(4),
+        lineDiscountStr: l.discountStr ?? '',
+        taxRateName: l.taxRate?.name ?? '',
+        taxRateValue: l.taxRate ? Number(l.taxRate.rate).toFixed(4) : '',
+        orderTaxRateName: po.taxRateName ?? '',
+        orderTaxRateValue: po.taxRatePercent != null ? Number(po.taxRatePercent).toFixed(4) : '',
+        // Purchase orders do not persist the original entry convention, only
+        // the effective net unit cost. Export the round-trip value in net form.
+        pricesIncludeVat: 'FALSE',
+        supplierRef: po.supplierRef ?? '',
+        expectedDelivery: po.expectedDelivery?.toISOString().slice(0, 10),
+        orderDiscountForeign: Number(po.discountAmount ?? 0).toFixed(4),
+        notes: po.notes ?? '',
       })
     }
   }
