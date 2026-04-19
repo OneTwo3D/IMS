@@ -62,13 +62,14 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
   await requirePermission('settings.company')
   try {
     const updateData = { ...data }
+    const existingOrg = await db.organisation.findFirst({ select: { baseCurrency: true } })
 
     if (updateData.baseCurrency) {
+      const code = updateData.baseCurrency.toUpperCase().trim()
       const locked = await isBaseCurrencyLocked()
-      if (locked) {
+      if (locked && code !== (existingOrg?.baseCurrency ?? DEFAULT_BASE_CURRENCY)) {
         return { success: false, error: 'Base currency is locked after setup. Reset the database to change it.' }
       }
-      const code = updateData.baseCurrency.toUpperCase().trim()
       const existing = await db.currency.findUnique({ where: { code } })
       if (!existing) {
         const fallback = getFallbackCurrencyMeta(code)
