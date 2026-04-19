@@ -150,7 +150,8 @@ export async function createTransfer(
   fromWarehouseId: string,
   toWarehouseId: string,
   lines: TransferLine[],
-  notes?: string
+  notes?: string,
+  reference?: string,
 ): Promise<TransferResult> {
   await requirePermission('stock_control.transfer')
   if (fromWarehouseId === toWarehouseId) {
@@ -159,6 +160,15 @@ export async function createTransfer(
   const validLines = lines.filter((l) => l.qty > 0 && l.productId)
   if (validLines.length === 0) {
     return { message: 'Add at least one product with a quantity.' }
+  }
+  if (reference?.trim()) {
+    const existing = await db.stockTransfer.findUnique({
+      where: { reference: reference.trim() },
+      select: { id: true },
+    })
+    if (existing) {
+      return { message: `Transfer ${reference.trim()} already exists.` }
+    }
   }
   const transferProducts = await db.product.findMany({
     where: { id: { in: [...new Set(validLines.map((line) => line.productId))] } },
@@ -183,7 +193,7 @@ export async function createTransfer(
 
     const transfer = await db.stockTransfer.create({
       data: {
-        reference: makeReference(),
+        reference: reference || makeReference(),
         fromWarehouseId,
         toWarehouseId,
         notes: notes || null,

@@ -416,6 +416,7 @@ export type SoLineInput = {
 }
 
 export type CreateSoInput = {
+  externalOrderNumber?: string
   customerId?: string
   customerName: string
   customerEmail?: string
@@ -739,6 +740,13 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       if (l.qty <= 0) return { success: false, error: `Invalid qty for ${l.sku}` }
       if (l.unitPriceForeign < 0) return { success: false, error: `Negative price for ${l.sku}` }
     }
+    if (input.externalOrderNumber?.trim()) {
+      const existing = await db.salesOrder.findFirst({
+        where: { externalOrderNumber: input.externalOrderNumber.trim() },
+        select: { id: true },
+      })
+      if (existing) return { success: false, error: `Order ${input.externalOrderNumber.trim()} already exists` }
+    }
 
     const fxRate = input.fxRateToBase && input.fxRateToBase > 0 ? input.fxRateToBase : 1
     const vatRate = input.taxRateValue ?? 0
@@ -967,6 +975,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     const initialStatus = input.isDraft ? 'DRAFT' : 'PENDING_PAYMENT'
     const so = await db.salesOrder.create({
       data: {
+        externalOrderNumber: input.externalOrderNumber || null,
         orderNumber,
         status: initialStatus,
         currency: input.currency,

@@ -7,6 +7,7 @@ const CONTACT_HEADERS = ['customerId', 'firstName', 'lastName', 'email', 'phone'
 const SUPPLIER_HEADERS = ['supplierId', 'name', 'contactName', 'email', 'phone', 'currency', 'vatNumber', 'accountNumber', 'paymentTermsDays', 'addressLine1', 'addressLine2', 'city', 'county', 'postcode', 'country', 'notes']
 const PRODUCT_EXPORT_HEADERS = ['productId', 'parentProductId', 'sku', 'name', 'description', 'type', 'parentSku', 'barcode', 'weight', 'widthCm', 'heightCm', 'depthCm', 'salesPriceBase', 'salePriceBase', 'salesPriceTaxInclusive', 'stockUnit', 'oversellAllowed', 'imageUrl', 'active', 'lifecycleStatus', 'components', 'totalStock', 'inventoryValue']
 const PRODUCT_IMPORT_HEADERS = PRODUCT_EXPORT_HEADERS.slice(0, -2)
+const STOCK_LEVEL_HEADERS = ['sku', 'warehouseCode', 'qty', 'unitCostBase', 'productName', 'type', 'stockUnit', 'warehouseName', 'reserved', 'available', 'inventoryValueBase']
 
 function csvFile(contents: string) {
   return {
@@ -44,6 +45,7 @@ function tryRunFixture(args: string[]): string {
 }
 
 async function uploadCsv(page: Page, csv: string) {
+  await expect(page.getByRole('button', { name: 'Import CSV' }).first()).toBeVisible()
   const chooserPromise = page.waitForEvent('filechooser')
   await page.getByRole('button', { name: 'Import CSV' }).first().click()
   const chooser = await chooserPromise
@@ -174,6 +176,39 @@ test.describe.serial('CSV round-trip exports', () => {
     expect(inspected.salePriceBase).toBe(18)
     expect(inspected.salesPriceTaxInclusive).toBe(true)
     expect(inspected.description).toBe('Original description')
+  })
+
+  test('stock-level export supports warehouse filters, bundle exclusion, and opening-stock cost columns', async ({ page }) => {
+    const seeded = parseJsonLine<{
+      defaultWarehouseId: string
+      defaultWarehouseCode: string
+      secondWarehouseId: string
+      secondWarehouseCode: string
+      simpleSku: string
+      bomSku: string
+    }>(runFixture(['seed-stock-level-export-source']))
+
+    await page.goto('/stock-control/stock-adjustments')
+    const exported = await fetchCsv(
+      page,
+      `/api/export/stock-levels?warehouses=${seeded.defaultWarehouseId}&includeBundles=0`,
+    )
+    expect(exported.split('\n')[0]?.trim()).toBe(STOCK_LEVEL_HEADERS.join(','))
+
+    const rows = parseCsv(exported)
+    expect(rows).toContainEqual(
+      expect.objectContaining({
+        sku: seeded.simpleSku,
+        warehouseCode: seeded.defaultWarehouseCode,
+        qty: '5',
+        unitCostBase: '4.500000',
+        reserved: '1',
+        available: '4',
+        inventoryValueBase: '22.50',
+      }),
+    )
+    expect(rows.some((row) => row.sku === seeded.bomSku)).toBe(false)
+    expect(rows.some((row) => row.warehouseCode === seeded.secondWarehouseCode)).toBe(false)
   })
 
   test('operational export routes emit importer-compatible round-trip headers and values', async ({ page }) => {

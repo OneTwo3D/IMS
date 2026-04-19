@@ -11,15 +11,18 @@ function toNumber(value: NumericLike): number {
   return Number(value ?? 0)
 }
 
+function isWooCommerceOrder(order: DiscountOrderContext): boolean {
+  return !!order.shoppingLinks?.some((link) => link.connector === 'woocommerce')
+}
+
 export function normalizeOrderDiscountBase(
   order: DiscountOrderContext & { discountAmount: NumericLike },
 ): number {
   const fxRate = toNumber(order.fxRateToBase) || 1
   const discountBaseRaw = toNumber(order.discountAmount) / fxRate
   const vatPct = toNumber(order.taxRatePercent)
-  const isWooCommerceOrder = !!order.shoppingLinks?.some((link) => link.connector === 'woocommerce')
 
-  if (isWooCommerceOrder) return discountBaseRaw
+  if (isWooCommerceOrder(order)) return discountBaseRaw
   if (order.pricesIncludeVat && vatPct > 0) return discountBaseRaw / (1 + vatPct)
   return discountBaseRaw
 }
@@ -32,6 +35,7 @@ export function normalizeLineDiscountBase(
   const discountBaseRaw = toNumber(discountAmount) / fxRate
   const vatPct = toNumber(order.taxRatePercent)
 
+  if (isWooCommerceOrder(order)) return discountBaseRaw
   if (order.pricesIncludeVat && vatPct > 0) return discountBaseRaw / (1 + vatPct)
   return discountBaseRaw
 }

@@ -431,20 +431,28 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
     // Parse "SKU1:qty;SKU2:qty" format
     const parts = cr.components.split(';').map((s) => s.trim()).filter(Boolean)
     const components: { componentId: string; qty: number }[] = []
+    let hasComponentError = false
 
     for (const part of parts) {
       const [compSku, qtyStr] = part.split(':').map((s) => s.trim())
       const componentId = skuToId.get(compSku)
       if (!componentId) {
         result.errors.push(`Row ${cr.lineNum}: component SKU "${compSku}" not found`)
+        hasComponentError = true
         continue
       }
       const qty = parseFloat(qtyStr ?? '1')
       if (isNaN(qty) || qty <= 0) {
         result.errors.push(`Row ${cr.lineNum}: invalid qty for component "${compSku}"`)
+        hasComponentError = true
         continue
       }
       components.push({ componentId, qty })
+    }
+
+    if (hasComponentError) {
+      result.errors.push(`Row ${cr.lineNum}: ${cr.sku} components were not updated because one or more component values were invalid`)
+      continue
     }
 
     if (components.length > 0) {
@@ -473,14 +481,16 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
 
       try {
         if (!preview) {
-          await db.productComponent.deleteMany({ where: { productId } })
-          await db.productComponent.createMany({
-            data: components.map((c, i) => ({
-              productId,
-              componentId: c.componentId,
-              qty: c.qty,
-              sortOrder: i,
-            })),
+          await db.$transaction(async (tx) => {
+            await tx.productComponent.deleteMany({ where: { productId } })
+            await tx.productComponent.createMany({
+              data: components.map((c, i) => ({
+                productId,
+                componentId: c.componentId,
+                qty: c.qty,
+                sortOrder: i,
+              })),
+            })
           })
           const product = touchedProducts.find((entry) => entry.id === productId)
           if (!product) {
@@ -621,6 +631,230 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImpor
 }
 
 // ---------------------------------------------------------------------------
+// Opening stock CSV import
+// ---------------------------------------------------------------------------
+
+export async function importOpeningStockCsv(formData: FormData): Promise<CsvImportActionResult> {
+  const mode = getCsvImportMode(formData)
+  const preview = mode === 'preview'
+  const validated = await validateImportFile(formData, 'stock_control.adjust')
+  if ('error' in validated) {
+    const result = { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
+    return preview
+      ? buildImportPreviewResult(0, result, 0, validated.error)
+      : createCsvImportExecutionResult({ ...result, error: validated.error, success: false })
+  }
+
+  const text = await validated.file.text()
+  const parsed = parseCsv(text)
+  const { rows, dropped } = capRows(parsed)
+
+  const result: ImportResult = { created: 0, updated: 0, skipped: 0, errors: [] }
+  if (dropped > 0) {
+    result.errors.push(`File has more than ${MAX_IMPORT_ROWS} rows — ${dropped} row(s) skipped`)
+  }
+
+  const products = await db.product.findMany({
+    select: { id: true, sku: true, type: true },
+  })
+  const skuToProduct = new Map(products.map((product) => [product.sku.toUpperCase(), product]))
+
+  const warehouses = await db.warehouse.findMany({
+    select: { id: true, code: true },
+  })
+  const codeToWarehouseId = new Map(warehouses.map((warehouse) => [warehouse.code.toUpperCase(), warehouse.id]))
+
+  const stagedRows: Array<{
+    lineNum: number
+    sku: string
+    warehouseCode: string
+    productId: string
+    warehouseId: string
+    qty: number
+    unitCostBase: number
+    note: string | null
+  }> = []
+  const seenPairs = new Set<string>()
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i]
+    const lineNum = i + 2
+
+    const sku = readCsvValue(row, 'sku').trim().toUpperCase()
+    const warehouseCode = readCsvValue(row, 'warehouseCode', 'warehouse').trim().toUpperCase()
+    const qty = parseOptionalNumber(readCsvValue(row, 'qty', 'quantity'))
+    const unitCostBase = parseOptionalNumber(readCsvValue(row, 'unitCostBase', 'avgUnitCostBase', 'averageUnitCostBase'))
+    const note = readCsvValue(row, 'note').trim() || null
+
+    if (!sku) { result.errors.push(`Row ${lineNum}: missing sku`); result.skipped++; continue }
+    if (!warehouseCode) { result.errors.push(`Row ${lineNum}: missing warehouseCode`); result.skipped++; continue }
+    if (qty === null || qty <= 0) { result.errors.push(`Row ${lineNum}: qty must be greater than zero`); result.skipped++; continue }
+    if (unitCostBase === null || unitCostBase < 0) {
+      result.errors.push(`Row ${lineNum}: unitCostBase must be zero or greater`)
+      result.skipped++
+      continue
+    }
+
+    const product = skuToProduct.get(sku)
+    if (!product) { result.errors.push(`Row ${lineNum}: SKU "${sku}" not found`); result.skipped++; continue }
+    if (product.type === ProductType.VARIABLE || product.type === ProductType.NON_INVENTORY || product.type === ProductType.KIT) {
+      result.errors.push(`Row ${lineNum}: SKU "${sku}" cannot receive opening stock`)
+      result.skipped++
+      continue
+    }
+
+    const warehouseId = codeToWarehouseId.get(warehouseCode)
+    if (!warehouseId) { result.errors.push(`Row ${lineNum}: warehouse "${warehouseCode}" not found`); result.skipped++; continue }
+
+    const pairKey = `${product.id}:${warehouseId}`
+    if (seenPairs.has(pairKey)) {
+      result.errors.push(`Row ${lineNum}: duplicate opening stock row for SKU "${sku}" in warehouse "${warehouseCode}"`)
+      result.skipped++
+      continue
+    }
+    seenPairs.add(pairKey)
+
+    stagedRows.push({
+      lineNum,
+      sku,
+      warehouseCode,
+      productId: product.id,
+      warehouseId,
+      qty,
+      unitCostBase,
+      note,
+    })
+  }
+
+  const candidateProductIds = Array.from(new Set(stagedRows.map((row) => row.productId)))
+  const candidateWarehouseIds = Array.from(new Set(stagedRows.map((row) => row.warehouseId)))
+
+  const [existingStockLevels, existingCostLayers, existingMovements] = candidateProductIds.length > 0 && candidateWarehouseIds.length > 0
+    ? await Promise.all([
+        db.stockLevel.findMany({
+          where: {
+            productId: { in: candidateProductIds },
+            warehouseId: { in: candidateWarehouseIds },
+          },
+          select: {
+            productId: true,
+            warehouseId: true,
+            quantity: true,
+            reservedQty: true,
+          },
+        }),
+        db.costLayer.findMany({
+          where: {
+            productId: { in: candidateProductIds },
+            warehouseId: { in: candidateWarehouseIds },
+          },
+          select: {
+            productId: true,
+            warehouseId: true,
+          },
+        }),
+        db.stockMovement.findMany({
+          where: {
+            productId: { in: candidateProductIds },
+            OR: [
+              { toWarehouseId: { in: candidateWarehouseIds } },
+              { fromWarehouseId: { in: candidateWarehouseIds } },
+            ],
+          },
+          select: {
+            productId: true,
+            toWarehouseId: true,
+            fromWarehouseId: true,
+          },
+        }),
+      ])
+    : [[], [], []]
+
+  const existingStockLevelByPair = new Map<string, { quantity: number; reservedQty: number }>(
+    existingStockLevels.map((level) => [
+      `${level.productId}:${level.warehouseId}`,
+      {
+        quantity: Number(level.quantity),
+        reservedQty: Number(level.reservedQty),
+      },
+    ]),
+  )
+  const existingCostLayerPairs = new Set(
+    existingCostLayers.map((layer) => `${layer.productId}:${layer.warehouseId}`),
+  )
+  const existingMovementPairs = new Set<string>()
+  for (const movement of existingMovements) {
+    if (movement.toWarehouseId) existingMovementPairs.add(`${movement.productId}:${movement.toWarehouseId}`)
+    if (movement.fromWarehouseId) existingMovementPairs.add(`${movement.productId}:${movement.fromWarehouseId}`)
+  }
+
+  const touchedProductIds = new Set<string>()
+  const { applyOpeningStock } = await import('./stock')
+
+  for (const row of stagedRows) {
+    const pairKey = `${row.productId}:${row.warehouseId}`
+    const existingLevel = existingStockLevelByPair.get(pairKey)
+    const hasNonZeroStock = existingLevel
+      ? Math.abs(existingLevel.quantity) > 0.0001 || Math.abs(existingLevel.reservedQty) > 0.0001
+      : false
+    const hasHistory = hasNonZeroStock || existingCostLayerPairs.has(pairKey) || existingMovementPairs.has(pairKey)
+
+    if (hasHistory) {
+      result.errors.push(`Row ${row.lineNum} (${row.sku} @ ${row.warehouseCode}): opening stock can only be imported into an empty warehouse record`)
+      result.skipped++
+      continue
+    }
+
+    try {
+      if (!preview) {
+        await db.$transaction(async (tx) => {
+          await applyOpeningStock({
+            tx,
+            productId: row.productId,
+            warehouseId: row.warehouseId,
+            qty: row.qty,
+            unitCostBase: row.unitCostBase,
+            note: row.note,
+          })
+        })
+      }
+      result.created++
+      touchedProductIds.add(row.productId)
+      existingMovementPairs.add(pairKey)
+      existingCostLayerPairs.add(pairKey)
+      existingStockLevelByPair.set(pairKey, {
+        quantity: row.qty,
+        reservedQty: 0,
+      })
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e)
+      result.errors.push(`Row ${row.lineNum} (${row.sku}): ${msg}`)
+      result.skipped++
+    }
+  }
+
+  if (preview) {
+    return buildImportPreviewResult(rows.length + dropped, result, dropped)
+  }
+
+  revalidatePath('/stock-control')
+  revalidatePath('/inventory')
+  if (touchedProductIds.size > 0) {
+    try {
+      await enqueueStockSync(Array.from(touchedProductIds), 'IMS_CHANGE')
+    } catch (syncError) {
+      console.error(syncError)
+    }
+  }
+  if (result.created > 0) {
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', description: `Imported ${result.created} opening stock row(s) from CSV` })
+  } else if (result.errors.length > 0) {
+    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import opening stock from CSV: ${result.errors[0]}` })
+  }
+  return createCsvImportExecutionResult(result)
+}
+
+// ---------------------------------------------------------------------------
 // Warehouse Transfers CSV import
 // ---------------------------------------------------------------------------
 
@@ -653,6 +887,7 @@ export async function importTransfersCsv(formData: FormData): Promise<CsvImportA
     toId: string
     notes: string
     status: 'DRAFT' | 'IN_TRANSIT' | 'RECEIVED'
+    importKey?: string
     invalid: boolean
     lines: { productId: string; sku: string; productName: string; qty: number }[]
   }>()
@@ -685,7 +920,7 @@ export async function importTransfersCsv(formData: FormData): Promise<CsvImportA
     const key = transferKey || `${fromId}:${toId}:${notes}`
     const existing = groups.get(key)
     if (!existing) {
-      groups.set(key, { fromId, toId, notes, status, invalid: false, lines: [] })
+      groups.set(key, { fromId, toId, notes, status, importKey: transferKey || undefined, invalid: false, lines: [] })
     } else if (
       existing.fromId !== fromId ||
       existing.toId !== toId ||
@@ -700,14 +935,37 @@ export async function importTransfersCsv(formData: FormData): Promise<CsvImportA
     groups.get(key)!.lines.push({ productId: product.id, sku, productName: product.name, qty })
   }
 
+  const explicitTransferKeys = Array.from(
+    new Set(
+      Array.from(groups.values())
+        .map((group) => group.importKey)
+        .filter((key): key is string => typeof key === 'string' && key.length > 0),
+    ),
+  )
+  const existingTransferRefs = explicitTransferKeys.length
+    ? new Set(
+        (
+          await db.stockTransfer.findMany({
+            where: { reference: { in: explicitTransferKeys } },
+            select: { reference: true },
+          })
+        ).map((transfer) => transfer.reference),
+      )
+    : new Set<string>()
+
   for (const g of groups.values()) {
     if (g.invalid) {
       result.skipped += g.lines.length
       continue
     }
+    if (g.importKey && existingTransferRefs.has(g.importKey)) {
+      result.errors.push(`Transfer "${g.importKey}" already exists — skipping duplicate import`)
+      result.skipped += g.lines.length
+      continue
+    }
     try {
       if (!preview) {
-        const created = await createTransfer(g.fromId, g.toId, g.lines, g.notes || undefined)
+        const created = await createTransfer(g.fromId, g.toId, g.lines, g.notes || undefined, g.importKey)
         if (!created.success || !created.transfer) {
           throw new Error(created.message || 'Failed to create transfer')
         }
@@ -725,6 +983,7 @@ export async function importTransfersCsv(formData: FormData): Promise<CsvImportA
         }
       }
       result.created += g.lines.length
+      if (g.importKey) existingTransferRefs.add(g.importKey)
     } catch (e: unknown) {
       result.errors.push(String(e))
       result.skipped += g.lines.length
@@ -783,6 +1042,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
   const groups = new Map<string, {
     customerName: string
     customerEmail?: string
+    importKey?: string
     currency: string
     fxRateToBase: number
     notes?: string
@@ -831,7 +1091,8 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
       continue
     }
 
-    const key = readCsvValue(row, 'orderKey', 'orderkey', 'orderNumber', 'ordernumber').trim() || `row-${lineNum}`
+    const explicitKey = readCsvValue(row, 'orderKey', 'orderkey', 'orderNumber', 'ordernumber').trim()
+    const key = explicitKey || `row-${lineNum}`
     const lineTaxRateName = readCsvValue(row, 'taxRateName', 'taxrate', 'taxRate').trim() || undefined
     const lineTaxRateValue = normalizeTaxRateValue(parseOptionalNumber(readCsvValue(row, 'taxRateValue', 'taxratevalue')))
     const orderTaxRateName = readCsvValue(row, 'orderTaxRateName', 'ordertaxratename').trim() || lineTaxRateName
@@ -848,6 +1109,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
     const groupCandidate = {
       customerName,
       customerEmail: readCsvValue(row, 'customerEmail', 'customeremail').trim() || undefined,
+      importKey: explicitKey || undefined,
       currency,
       fxRateToBase: fxRateResolved.fxRate,
       notes: readCsvValue(row, 'notes').trim() || undefined,
@@ -901,14 +1163,41 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
     })
   }
 
-  for (const g of groups.values()) {
+  const explicitSalesKeys = Array.from(
+    new Set(
+      Array.from(groups.entries())
+        .map(([groupKey, group]) => group.importKey ?? groupKey)
+        .filter((key) => !key.startsWith('row-')),
+    ),
+  )
+  const existingSalesOrderKeys = explicitSalesKeys.length
+    ? new Set(
+        (
+          await db.salesOrder.findMany({
+            where: { externalOrderNumber: { in: explicitSalesKeys } },
+            select: { externalOrderNumber: true },
+          })
+        )
+          .map((order) => order.externalOrderNumber)
+          .filter((value): value is string => typeof value === 'string' && value.length > 0),
+      )
+    : new Set<string>()
+
+  for (const [groupKey, g] of groups.entries()) {
     if (g.invalid) {
+      result.skipped += g.lines.length
+      continue
+    }
+    const importKey = g.importKey ?? (groupKey.startsWith('row-') ? undefined : groupKey)
+    if (importKey && existingSalesOrderKeys.has(importKey)) {
+      result.errors.push(`Sales order "${importKey}" already exists — skipping duplicate import`)
       result.skipped += g.lines.length
       continue
     }
     try {
       if (!preview) {
         const created = await createSalesOrder({
+          externalOrderNumber: importKey,
           customerName: g.customerName,
           customerEmail: g.customerEmail,
           currency: g.currency,
@@ -932,6 +1221,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
         await autoAllocateOrder(created.order.id)
       }
       result.created += g.lines.length
+      if (importKey) existingSalesOrderKeys.add(importKey)
     } catch (e: unknown) {
       result.errors.push(String(e))
       result.skipped += g.lines.length
@@ -989,6 +1279,7 @@ export async function importPurchaseOrdersCsv(formData: FormData): Promise<CsvIm
   const { createPurchaseOrder } = await import('./purchase-orders')
 
   const groups = new Map<string, {
+    importKey?: string
     supplierId: string
     currency: string
     fxRateToBase: number
@@ -1038,7 +1329,8 @@ export async function importPurchaseOrdersCsv(formData: FormData): Promise<CsvIm
       continue
     }
 
-    const key = readCsvValue(row, 'orderKey', 'purchaseOrderKey', 'orderkey', 'reference').trim() || `row-${lineNum}`
+    const explicitKey = readCsvValue(row, 'orderKey', 'purchaseOrderKey', 'orderkey', 'reference').trim()
+    const key = explicitKey || `row-${lineNum}`
     const lineTaxRateName = readCsvValue(row, 'taxRateName', 'taxrate', 'taxRate').trim() || undefined
     const lineTaxRateValue = normalizeTaxRateValue(parseOptionalNumber(readCsvValue(row, 'taxRateValue', 'taxratevalue')))
     const orderTaxRateName = readCsvValue(row, 'orderTaxRateName', 'ordertaxratename').trim() || lineTaxRateName
@@ -1052,6 +1344,7 @@ export async function importPurchaseOrdersCsv(formData: FormData): Promise<CsvIm
     }
 
     const groupCandidate = {
+      importKey: explicitKey || undefined,
       supplierId: supplier.id,
       currency,
       fxRateToBase: fxRateResolved.fxRate,
@@ -1101,14 +1394,39 @@ export async function importPurchaseOrdersCsv(formData: FormData): Promise<CsvIm
     })
   }
 
-  for (const g of groups.values()) {
+  const explicitPoKeys = Array.from(
+    new Set(
+      Array.from(groups.entries())
+        .map(([groupKey, group]) => group.importKey ?? groupKey)
+        .filter((key) => !key.startsWith('row-')),
+    ),
+  )
+  const existingPoRefs = explicitPoKeys.length
+    ? new Set(
+        (
+          await db.purchaseOrder.findMany({
+            where: { reference: { in: explicitPoKeys } },
+            select: { reference: true },
+          })
+        ).map((po) => po.reference),
+      )
+    : new Set<string>()
+
+  for (const [groupKey, g] of groups.entries()) {
     if (g.invalid) {
+      result.skipped += g.lines.length
+      continue
+    }
+    const importKey = g.importKey ?? (groupKey.startsWith('row-') ? undefined : groupKey)
+    if (importKey && existingPoRefs.has(importKey)) {
+      result.errors.push(`Purchase order "${importKey}" already exists — skipping duplicate import`)
       result.skipped += g.lines.length
       continue
     }
     try {
       if (!preview) {
         const created = await createPurchaseOrder({
+          reference: importKey,
           supplierId: g.supplierId,
           currency: g.currency,
           fxRateToBase: g.fxRateToBase,
@@ -1130,6 +1448,7 @@ export async function importPurchaseOrdersCsv(formData: FormData): Promise<CsvIm
         }
       }
       result.created += g.lines.length
+      if (importKey) existingPoRefs.add(importKey)
     } catch (e: unknown) {
       result.errors.push(String(e))
       result.skipped += g.lines.length

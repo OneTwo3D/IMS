@@ -102,6 +102,28 @@ export async function syncWcRefund(
       })
     }
 
+    const mappedRefundTotalForeign = Math.round(
+      refundLines.reduce((sum, line) => sum + Math.abs(Number(line.totalForeign ?? 0)), 0) * 10000,
+    ) / 10000
+    if (refundLines.length > 0 && Math.abs(mappedRefundTotalForeign - refundAmountForeign) > 0.01) {
+      const error = `WooCommerce refund ${wcRefund.id} amount mismatch: mapped ${mappedRefundTotalForeign.toFixed(2)} but refund total is ${refundAmountForeign.toFixed(2)}`
+      await db.shoppingSyncLog.create({
+        data: {
+          direction: 'FROM_CONNECTOR',
+          status: 'FAILED',
+          entityType: 'SalesOrder',
+          entityId: so.id,
+          externalId: String(wcRefund.id),
+          errorMessage: error,
+          syncedAt: new Date(),
+        },
+      })
+      return {
+        success: false,
+        error,
+      }
+    }
+
     // Find return warehouse (default return warehouse)
     let returnWarehouseId: string | undefined
     if (hasQtyRefund) {

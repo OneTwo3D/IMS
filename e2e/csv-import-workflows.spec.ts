@@ -37,22 +37,29 @@ function parseJsonLine<T>(output: string): T {
   return JSON.parse(json) as T
 }
 
-async function uploadCsv(page: Page, csv: string) {
-  const chooserPromise = page.waitForEvent('filechooser')
-  await page.getByRole('button', { name: 'Import CSV' }).first().click()
-  const chooser = await chooserPromise
-  await chooser.setFiles(csvFile(csv))
+async function uploadCsv(page: Page, csv: string, inputIndex = 0) {
+  await expect(page.getByRole('button', { name: 'Import CSV' }).first()).toBeVisible()
+  await page.locator('input[type="file"][accept=".csv,text/csv"]').nth(inputIndex).setInputFiles(csvFile(csv))
   await expect(page.getByRole('dialog', { name: 'Review CSV Import' })).toBeVisible({ timeout: 20000 })
 }
 
-async function uploadCsvAndWaitForResult(page: Page, csv: string) {
-  await uploadCsv(page, csv)
+async function uploadCsvAndWaitForResult(page: Page, csv: string, inputIndex = 0) {
+  await uploadCsv(page, csv, inputIndex)
   const reviewDialog = page.getByRole('dialog', { name: 'Review CSV Import' })
   await reviewDialog.getByRole('button', { name: /^Import /i }).click()
   const resultDialog = page.getByRole('dialog', { name: /Import (Complete|Completed With Issues|Failed)/ })
   await expect(resultDialog).toBeVisible({ timeout: 20000 })
   await resultDialog.getByRole('button', { name: 'Close' }).first().click()
   await expect(resultDialog).toBeHidden()
+}
+
+async function uploadCsvAndExpectPreviewError(page: Page, csv: string, errorMessage: RegExp | string, inputIndex = 0) {
+  await uploadCsv(page, csv, inputIndex)
+  const reviewDialog = page.getByRole('dialog', { name: 'Review CSV Import' })
+  await expect(reviewDialog.getByText(errorMessage)).toBeVisible()
+  await expect(reviewDialog.getByRole('button', { name: /^Import 0 Records$/i })).toBeDisabled()
+  await reviewDialog.getByRole('button', { name: 'Cancel' }).click()
+  await expect(reviewDialog).toBeHidden()
 }
 
 async function shipCurrentOrder(page: Page) {
@@ -79,9 +86,10 @@ test.describe.serial('CSV import workflows', () => {
     const product = await createSimpleProduct(page, { price: '30.00' })
     const customerName = `CSV FX Customer ${Date.now()}`
     const note = `fx-sales-import-${Date.now()}`
+    const orderKey = `SO-FX-${Date.now()}`
     const csv = [
       'orderKey,customerName,currency,fxRateToBase,sku,qty,unitPriceForeign,pricesIncludeVat,notes',
-      `SO-FX-1,${customerName},EUR,1.25,${product.sku},2,25,false,${note}`,
+      `${orderKey},${customerName},EUR,1.25,${product.sku},2,25,false,${note}`,
     ].join('\n')
 
     await page.goto('/sales')
@@ -120,6 +128,10 @@ test.describe.serial('CSV import workflows', () => {
         totalBase: 40,
       }),
     ])
+
+    await uploadCsvAndExpectPreviewError(page, csv, new RegExp(`Sales order \"${orderKey}\" already exists`))
+    const duplicateSales = parseJsonLine<{ count: number }>(runFixture(['count-sales-imports', note]))
+    expect(duplicateSales.count).toBe(1)
   })
 
   test('imports a foreign-currency purchase order and received stock flows into shipment COGS', async ({ page }) => {
@@ -127,9 +139,10 @@ test.describe.serial('CSV import workflows', () => {
     runFixture(['ensure-supplier'])
 
     const note = `csv-po-${Date.now()}`
+    const orderKey = `PO-FX-${Date.now()}`
     const csv = [
       'orderKey,supplierName,currency,fxRateToBase,destinationWarehouseCode,sku,qty,unitCostForeign,pricesIncludeVat,notes',
-      `PO-FX-1,E2E Supplier,USD,1.25,DEFAULT,${product.sku},3,10,false,${note}`,
+      `${orderKey},E2E Supplier,USD,1.25,DEFAULT,${product.sku},3,10,false,${note}`,
     ].join('\n')
 
     await page.goto('/purchase-orders')
@@ -168,6 +181,10 @@ test.describe.serial('CSV import workflows', () => {
         totalBase: 24,
       }),
     ])
+
+    await uploadCsvAndExpectPreviewError(page, csv, new RegExp(`Purchase order \"${orderKey}\" already exists`))
+    const duplicatePurchaseOrders = parseJsonLine<{ count: number }>(runFixture(['count-purchase-imports', note]))
+    expect(duplicatePurchaseOrders.count).toBe(1)
 
     await page.goto(`/purchase-orders/${importedPo.id}`)
     await page.getByRole('button', { name: /confirm & send po/i }).click()
@@ -243,12 +260,58 @@ test.describe.serial('CSV import workflows', () => {
     )
   })
 
+  test('imports opening stock per warehouse with an opening cost layer', async ({ page }) => {
+    const product = await createSimpleProduct(page, { price: '18.00' })
+    const note = `csv-opening-${Date.now()}`
+    const csv = [
+      'sku,warehouseCode,qty,unitCostBase,note',
+      `${product.sku},DEFAULT,7,3.5,${note}`,
+    ].join('\n')
+
+    await page.goto('/stock-control/stock-adjustments')
+    await uploadCsvAndWaitForResult(page, csv, 1)
+    await expect
+      .poll(() => tryRunFixture(['inspect-opening-stock-import', product.sku, 'DEFAULT']), { timeout: 20000 })
+      .toContain('"movementType":"OPENING_STOCK"')
+
+    const inspected = parseJsonLine<{
+      movementType: string
+      movementQty: number
+      note: string | null
+      stockQty: number | null
+      reservedQty: number | null
+      layers: Array<{ receivedQty: number; remainingQty: number; unitCostBase: number; isOpeningStock: boolean }>
+    }>(runFixture(['inspect-opening-stock-import', product.sku, 'DEFAULT']))
+
+    expect(inspected.movementType).toBe('OPENING_STOCK')
+    expect(inspected.movementQty).toBe(7)
+    expect(inspected.note).toBe(note)
+    expect(inspected.stockQty).toBe(7)
+    expect(inspected.reservedQty).toBe(0)
+    expect(inspected.layers).toEqual([
+      expect.objectContaining({
+        receivedQty: 7,
+        remainingQty: 7,
+        unitCostBase: 3.5,
+        isOpeningStock: true,
+      }),
+    ])
+
+    await uploadCsvAndExpectPreviewError(
+      page,
+      csv,
+      new RegExp(`opening stock can only be imported into an empty warehouse record`, 'i'),
+      1,
+    )
+  })
+
   test('imports a received transfer and preserves stock plus destination layer cost', async ({ page }) => {
     const seeded = parseJsonLine<{ sku: string; fromWarehouseCode: string; toWarehouseCode: string }>(runFixture(['seed-transfer-source']))
     const note = `csv-transfer-${Date.now()}`
+    const transferKey = `TRF-E2E-${Date.now()}`
     const csv = [
       'transferKey,fromWarehouseCode,toWarehouseCode,status,sku,qty,notes',
-      `TRF-E2E-1,${seeded.fromWarehouseCode},${seeded.toWarehouseCode},RECEIVED,${seeded.sku},2,${note}`,
+      `${transferKey},${seeded.fromWarehouseCode},${seeded.toWarehouseCode},RECEIVED,${seeded.sku},2,${note}`,
     ].join('\n')
 
     await page.goto('/stock-control/transfers')
@@ -285,5 +348,9 @@ test.describe.serial('CSV import workflows', () => {
         unitCostBase: 6,
       }),
     )
+
+    await uploadCsvAndExpectPreviewError(page, csv, new RegExp(`Transfer \"${transferKey}\" already exists`))
+    const duplicateTransfers = parseJsonLine<{ count: number }>(runFixture(['count-transfer-imports', note]))
+    expect(duplicateTransfers.count).toBe(1)
   })
 })

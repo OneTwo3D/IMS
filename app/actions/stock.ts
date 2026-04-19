@@ -120,6 +120,15 @@ export type AppliedStockAdjustment = {
   warehouseName: string
 }
 
+export type ApplyOpeningStockInput = {
+  tx: Prisma.TransactionClient
+  productId: string
+  warehouseId: string
+  qty: number
+  unitCostBase: number
+  note?: string | null
+}
+
 export async function applyStockAdjustment({
   tx,
   productId,
@@ -224,6 +233,67 @@ export async function applyStockAdjustment({
       })
     }
   }
+
+  return {
+    movementId: movement.id,
+    productSku: product?.sku ?? productId,
+    warehouseName: warehouse?.name ?? warehouseId,
+  }
+}
+
+export async function applyOpeningStock({
+  tx,
+  productId,
+  warehouseId,
+  qty,
+  unitCostBase,
+  note,
+}: ApplyOpeningStockInput): Promise<AppliedStockAdjustment> {
+  if (!Number.isFinite(qty) || qty <= 0) {
+    throw new Error('Opening stock quantity must be greater than zero')
+  }
+  if (!Number.isFinite(unitCostBase) || unitCostBase < 0) {
+    throw new Error('Opening stock unit cost must be zero or greater')
+  }
+
+  const movement = await tx.stockMovement.create({
+    data: {
+      type: 'OPENING_STOCK',
+      productId,
+      toWarehouseId: warehouseId,
+      qty,
+      note: note || null,
+    },
+  })
+
+  await tx.stockLevel.upsert({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    create: {
+      productId,
+      warehouseId,
+      quantity: qty,
+    },
+    update: {
+      quantity: {
+        increment: qty,
+      },
+    },
+  })
+
+  await createCostLayer(tx, {
+    productId,
+    warehouseId,
+    qty,
+    unitCostBase,
+    receivedAt: movement.createdAt,
+    isOpeningStock: true,
+    adjustmentMovementId: movement.id,
+  })
+
+  const [product, warehouse] = await Promise.all([
+    tx.product.findUnique({ where: { id: productId }, select: { sku: true } }),
+    tx.warehouse.findUnique({ where: { id: warehouseId }, select: { name: true } }),
+  ])
 
   return {
     movementId: movement.id,

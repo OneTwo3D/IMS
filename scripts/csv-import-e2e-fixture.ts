@@ -228,6 +228,13 @@ async function inspectSalesImport(note: string) {
   }))
 }
 
+async function countSalesImports(note: string) {
+  const count = await db.salesOrder.count({
+    where: { notes: note },
+  })
+  console.log(JSON.stringify({ count }))
+}
+
 async function inspectPurchaseImport(note: string) {
   const po = await db.purchaseOrder.findFirstOrThrow({
     where: { notes: note },
@@ -272,6 +279,13 @@ async function inspectPurchaseImport(note: string) {
       totalBase: Number(line.totalBase),
     })),
   }))
+}
+
+async function countPurchaseImports(note: string) {
+  const count = await db.purchaseOrder.count({
+    where: { notes: note },
+  })
+  console.log(JSON.stringify({ count }))
 }
 
 async function inspectShipmentCogs(orderId: string) {
@@ -353,6 +367,177 @@ async function seedTransferSource() {
   }))
 }
 
+async function seedStockLevelExportSource() {
+  const suffix = uniqueSuffix()
+  const [defaultWarehouse, secondWarehouse] = await Promise.all([
+    ensureDefaultWarehouse(),
+    ensureSecondWarehouse(),
+  ])
+
+  const [simpleProduct, bomProduct] = await Promise.all([
+    db.product.create({
+      data: {
+        sku: `E2E-STOCK-LEVEL-${suffix}`,
+        name: `Stock Level ${suffix}`,
+        type: 'SIMPLE',
+        lifecycleStatus: 'ACTIVE',
+        salesPriceBase: 10,
+        salesPriceTaxInclusive: false,
+        taxCategory: 'STANDARD',
+        stockUnit: 'pcs',
+        oversellAllowed: false,
+        active: true,
+      },
+      select: { id: true, sku: true },
+    }),
+    db.product.create({
+      data: {
+        sku: `E2E-STOCK-BOM-${suffix}`,
+        name: `Stock BOM ${suffix}`,
+        type: 'BOM',
+        lifecycleStatus: 'ACTIVE',
+        salesPriceBase: 20,
+        salesPriceTaxInclusive: false,
+        taxCategory: 'STANDARD',
+        stockUnit: 'pcs',
+        oversellAllowed: false,
+        active: true,
+      },
+      select: { id: true, sku: true },
+    }),
+  ])
+
+  await db.stockLevel.createMany({
+    data: [
+      {
+        productId: simpleProduct.id,
+        warehouseId: defaultWarehouse.id,
+        quantity: 5,
+        reservedQty: 1,
+      },
+      {
+        productId: simpleProduct.id,
+        warehouseId: secondWarehouse.id,
+        quantity: 3,
+        reservedQty: 0,
+      },
+      {
+        productId: bomProduct.id,
+        warehouseId: defaultWarehouse.id,
+        quantity: 2,
+        reservedQty: 0,
+      },
+    ],
+  })
+
+  await db.costLayer.createMany({
+    data: [
+      {
+        productId: simpleProduct.id,
+        warehouseId: defaultWarehouse.id,
+        receivedQty: 5,
+        remainingQty: 5,
+        unitCostBase: 4.5,
+        receivedAt: new Date(Date.now() - 120_000),
+        isOpeningStock: true,
+      },
+      {
+        productId: simpleProduct.id,
+        warehouseId: secondWarehouse.id,
+        receivedQty: 3,
+        remainingQty: 3,
+        unitCostBase: 7,
+        receivedAt: new Date(Date.now() - 60_000),
+        isOpeningStock: true,
+      },
+      {
+        productId: bomProduct.id,
+        warehouseId: defaultWarehouse.id,
+        receivedQty: 2,
+        remainingQty: 2,
+        unitCostBase: 9,
+        receivedAt: new Date(Date.now() - 30_000),
+        isOpeningStock: true,
+      },
+    ],
+  })
+
+  console.log(JSON.stringify({
+    defaultWarehouseId: defaultWarehouse.id,
+    defaultWarehouseCode: defaultWarehouse.code,
+    secondWarehouseId: secondWarehouse.id,
+    secondWarehouseCode: secondWarehouse.code,
+    simpleSku: simpleProduct.sku,
+    bomSku: bomProduct.sku,
+  }))
+}
+
+async function inspectOpeningStockImport(sku: string, warehouseCode: string) {
+  const product = await db.product.findFirstOrThrow({
+    where: { sku },
+    select: { id: true },
+  })
+  const warehouse = await db.warehouse.findUniqueOrThrow({
+    where: { code: warehouseCode },
+    select: { id: true },
+  })
+
+  const [movement, stockLevel, layers] = await Promise.all([
+    db.stockMovement.findFirstOrThrow({
+      where: {
+        productId: product.id,
+        toWarehouseId: warehouse.id,
+        type: 'OPENING_STOCK',
+      },
+      orderBy: { createdAt: 'desc' },
+      select: {
+        type: true,
+        qty: true,
+        note: true,
+      },
+    }),
+    db.stockLevel.findUnique({
+      where: {
+        productId_warehouseId: {
+          productId: product.id,
+          warehouseId: warehouse.id,
+        },
+      },
+      select: {
+        quantity: true,
+        reservedQty: true,
+      },
+    }),
+    db.costLayer.findMany({
+      where: {
+        productId: product.id,
+        warehouseId: warehouse.id,
+      },
+      select: {
+        receivedQty: true,
+        remainingQty: true,
+        unitCostBase: true,
+        isOpeningStock: true,
+      },
+      orderBy: { receivedAt: 'asc' },
+    }),
+  ])
+
+  console.log(JSON.stringify({
+    movementType: movement.type,
+    movementQty: Number(movement.qty),
+    note: movement.note,
+    stockQty: stockLevel ? Number(stockLevel.quantity) : null,
+    reservedQty: stockLevel ? Number(stockLevel.reservedQty) : null,
+    layers: layers.map((layer) => ({
+      receivedQty: Number(layer.receivedQty),
+      remainingQty: Number(layer.remainingQty),
+      unitCostBase: Number(layer.unitCostBase),
+      isOpeningStock: layer.isOpeningStock,
+    })),
+  }))
+}
+
 async function inspectTransferImport(sku: string, notes: string) {
   const product = await db.product.findFirstOrThrow({
     where: { sku },
@@ -405,6 +590,13 @@ async function inspectTransferImport(sku: string, notes: string) {
       unitCostBase: Number(layer.unitCostBase),
     })),
   }))
+}
+
+async function countTransferImports(note: string) {
+  const count = await db.stockTransfer.count({
+    where: { notes: note },
+  })
+  console.log(JSON.stringify({ count }))
 }
 
 async function seedProductRoundtrip() {
@@ -582,8 +774,14 @@ async function main() {
     case 'inspect-sales-import':
       await inspectSalesImport(args[0]!)
       break
+    case 'count-sales-imports':
+      await countSalesImports(args[0]!)
+      break
     case 'inspect-purchase-import':
       await inspectPurchaseImport(args[0]!)
+      break
+    case 'count-purchase-imports':
+      await countPurchaseImports(args[0]!)
       break
     case 'inspect-shipment-cogs':
       await inspectShipmentCogs(args[0]!)
@@ -593,6 +791,15 @@ async function main() {
       break
     case 'inspect-transfer-import':
       await inspectTransferImport(args[0]!, args[1]!)
+      break
+    case 'count-transfer-imports':
+      await countTransferImports(args[0]!)
+      break
+    case 'seed-stock-level-export-source':
+      await seedStockLevelExportSource()
+      break
+    case 'inspect-opening-stock-import':
+      await inspectOpeningStockImport(args[0]!, args[1]!)
       break
     case 'seed-product-roundtrip':
       await seedProductRoundtrip()

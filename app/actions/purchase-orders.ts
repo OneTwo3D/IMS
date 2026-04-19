@@ -180,6 +180,7 @@ export type PoLineInput = {
 }
 
 export type CreatePoInput = {
+  reference?: string
   supplierId: string
   currency: string
   fxRateToBase: number
@@ -741,6 +742,13 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
   try {
     await requirePermission('purchasing.create')
     if (!input.lines.length) return { success: false, error: 'At least one line is required' }
+    if (input.reference?.trim()) {
+      const existing = await db.purchaseOrder.findUnique({
+        where: { reference: input.reference.trim() },
+        select: { id: true },
+      })
+      if (existing) return { success: false, error: `Purchase order ${input.reference.trim()} already exists` }
+    }
     // Validate line inputs
     for (const l of input.lines) {
       if (l.qty <= 0) return { success: false, error: `Invalid qty for ${l.sku}` }
@@ -989,7 +997,7 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
         sortOrder: i,
       }))
 
-    const poReference = await makeReference()
+    const poReference = input.reference || await makeReference()
     const po = await db.purchaseOrder.create({
       data: {
         reference: poReference,
