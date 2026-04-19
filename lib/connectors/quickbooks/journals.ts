@@ -19,9 +19,10 @@ type QboJournalEntry = {
  */
 export async function pushJournalEntry(
   entry: JournalEntry,
-  _status?: string,
+  status?: string,
 ): Promise<{ success: boolean; journalId?: string; error?: string }> {
   try {
+    void status
     // Filter out zero-amount lines
     const activeLines = entry.lines.filter((line) => {
       const debit = Number(line.debit ?? 0)

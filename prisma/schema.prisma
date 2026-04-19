@@ -623,15 +623,18 @@ model CostLayer {
   unitCostBase     Decimal   @db.Decimal(18, 6) // landed cost per unit in GBP
   receivedAt      DateTime  @default(now())
   poLineId        String?   // link back to the PO line that created this layer
+  adjustmentMovementId String? @map("adjustment_movement_id")
   isOpeningStock  Boolean   @default(false)
 
   product         Product   @relation(fields: [productId], references: [id])
   warehouse       Warehouse @relation(fields: [warehouseId], references: [id])
   poLine          PurchaseOrderLine? @relation(fields: [poLineId], references: [id])
+  adjustmentMovement StockMovement? @relation("AdjustmentMovementLayer", fields: [adjustmentMovementId], references: [id])
 
   cogsEntries     CogsEntry[]
 
   @@index([productId, warehouseId, receivedAt])
+  @@index([adjustmentMovementId])
   @@map("cost_layers")
 }
 
@@ -667,6 +670,7 @@ model StockMovement {
   fromWarehouse   Warehouse?        @relation("MovementFromWarehouse", fields: [fromWarehouseId], references: [id])
   toWarehouse     Warehouse?        @relation("MovementToWarehouse", fields: [toWarehouseId], references: [id])
 
+  adjustmentLayers CostLayer[]      @relation("AdjustmentMovementLayer")
   cogsEntries     CogsEntry[]
 
   @@index([productId])

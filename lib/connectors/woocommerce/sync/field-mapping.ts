@@ -187,12 +187,16 @@ export function mapWcShipping(order: WcFullOrder): {
   shippingForeign: number
 } {
   const totalShipping = parseFloat(order.shipping_total) || 0
-  const shippingTax = parseFloat(order.shipping_tax) || 0
-  const methodTitle = order.shipping_lines[0]?.method_title ?? null
+  const totalFees = order.fee_lines.reduce((sum, feeLine) => sum + (parseFloat(feeLine.total) || 0), 0)
+  const labels = [
+    order.shipping_lines[0]?.method_title ?? null,
+    ...order.fee_lines.map((feeLine) => feeLine.name || null),
+  ].filter((value): value is string => !!value)
+  const methodTitle = labels.length > 0 ? labels.join(' + ') : null
 
   return {
     shippingService: methodTitle,
-    shippingForeign: Math.round((totalShipping + shippingTax) * 10000) / 10000,
+    shippingForeign: Math.round((totalShipping + totalFees) * 10000) / 10000,
   }
 }
 

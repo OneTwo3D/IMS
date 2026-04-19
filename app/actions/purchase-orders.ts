@@ -6,7 +6,11 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings, listAccountingBankAccounts, type AccountingBankAccount } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
-import { updateSnapshotsForCostLayerChange } from '@/lib/cost-layers'
+import {
+  refreshSalesOrderLineCogsForCostLayerChange,
+  refreshShipmentCogsForCostLayerChange,
+  updateSnapshotsForCostLayerChange,
+} from '@/lib/cost-layers'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -578,74 +582,31 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
     }
   }
 
-  // Calculate landed cost per line using each cost line's configured
-  // distribution method (BY_VALUE, BY_WEIGHT, BY_QUANTITY, EQUAL_SPLIT).
-  // If the PO has already been received and landedUnitCostBase is set on
-  // the PO lines (by recalculateLandedCosts), use that directly — it's
-  // the authoritative value that matches the cost layers. Otherwise
-  // compute from the cost line distribution for display purposes.
-  const eligiblePoLines = po.lines.filter((l) => Number(l.qty) > 0)
-  const landedByLineId = new Map<string, number>()
-
-  // Collect all cost lines: direct (on this PO) + linked freight POs
-  type CostLineSource = { amountBase: number; distributionMethod: string }
-  const allCostLines: CostLineSource[] = [
-    ...po.freightCostLines.map((fcl) => ({
-      amountBase: Number(fcl.amountBase),
-      distributionMethod: fcl.distributionMethod,
+  const grossUnitCostBaseByLine = computeGrossUnitCostBaseByLine({
+    lines: po.lines.map((line) => ({
+      id: line.id,
+      qty: line.qty,
+      unitCostBase: line.unitCostBase,
+      totalBase: line.totalBase,
+      landedUnitCostBase: line.landedUnitCostBase,
+      weight: line.product?.weight ?? null,
     })),
-  ]
-  // Freight PO costs are already included in totalLandedCostBase but
-  // we need their distribution methods. For simplicity, attribute
-  // linked freight PO totals as BY_VALUE (the default) since the
-  // per-cost-line detail lives on the freight PO, not here.
-  const directFreightBase = po.freightCostLines.reduce((s, fcl) => s + Number(fcl.amountBase), 0)
-  const linkedFreightBase = totalLandedCostBase - directFreightBase
-  if (linkedFreightBase > 0) {
-    allCostLines.push({ amountBase: linkedFreightBase, distributionMethod: 'BY_VALUE' })
-  }
-
-  for (const line of eligiblePoLines) {
-    landedByLineId.set(line.id, 0)
-  }
-
-  for (const cl of allCostLines) {
-    if (cl.amountBase <= 0) continue
-    const bases = eligiblePoLines.map((line) => ({
-      lineId: line.id,
-      base: computeDistributionBase(
-        { qty: line.qty, totalBase: line.totalBase, product: { weight: line.product?.weight ?? null } },
-        cl.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
-      ),
-    }))
-    let basisTotal = bases.reduce((sum, e) => sum.add(e.base), new Prisma.Decimal(0))
-    if (basisTotal.lte(0)) {
-      basisTotal = new Prisma.Decimal(eligiblePoLines.length || 1)
-      for (const e of bases) e.base = new Prisma.Decimal(1)
-    }
-    for (const e of bases) {
-      const share = new Prisma.Decimal(cl.amountBase).mul(e.base).div(basisTotal).toNumber()
-      landedByLineId.set(e.lineId, (landedByLineId.get(e.lineId) ?? 0) + share)
-    }
-  }
+    directCostLines: po.freightCostLines.map((costLine) => ({
+      amountBase: costLine.amountBase,
+      distributionMethod: costLine.distributionMethod,
+    })),
+    linkedCostLines: freightLinks.flatMap((link) => (
+      link.freightPo.costLines.map((costLine) => ({
+        amountBase: costLine.amountBase,
+        distributionMethod: costLine.distributionMethod,
+      }))
+    )),
+  })
 
   const mappedLines = po.lines.map(mapLine).map((line) => {
-    // Prefer the authoritative landedUnitCostBase from recalculateLandedCosts
-    // if it's been computed (post-receipt). Fall back to display computation.
-    const poLine = po.lines.find((l) => l.id === line.id)
-    const hasAuthoritative = poLine?.landedUnitCostBase != null && Number(poLine.landedUnitCostBase) > 0
-    let grossUnitCostBase: number
-    if (hasAuthoritative) {
-      grossUnitCostBase = Number(poLine!.landedUnitCostBase)
-    } else if (line.qty > 0) {
-      const landedForLine = landedByLineId.get(line.id) ?? 0
-      grossUnitCostBase = line.unitCostBase + landedForLine / line.qty
-    } else {
-      grossUnitCostBase = line.unitCostBase
-    }
     return {
       ...line,
-      grossUnitCostBase,
+      grossUnitCostBase: grossUnitCostBaseByLine.get(line.id) ?? line.unitCostBase,
       qtyBilled: qtyBilledByLine.get(line.id) ?? 0,
     }
   })
@@ -1650,6 +1611,22 @@ export async function receivePurchaseOrder(
             qtyReceived: true,
             unitCostBase: true,
             landedUnitCostBase: true,
+            totalBase: true,
+            product: { select: { weight: true } },
+          },
+        },
+        freightCostLines: {
+          select: { amountBase: true, distributionMethod: true },
+        },
+        landedCostLinks: {
+          select: {
+            freightPO: {
+              select: {
+                freightCostLines: {
+                  select: { amountBase: true, distributionMethod: true },
+                },
+              },
+            },
           },
         },
       },
@@ -1674,17 +1651,68 @@ export async function receivePurchaseOrder(
     }
 
     const receiptRef = `RCP-${po.reference}-${Date.now().toString(36).toUpperCase()}`
-    const freightPoIdsToRevalidate = await db.$transaction(async (tx) => {
+    const receiptResult = await db.$transaction(async (tx) => {
       // Lock the PO row to prevent concurrent receipts from over-receiving
       await tx.$executeRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
 
+      const currentPo = await tx.purchaseOrder.findUnique({
+        where: { id },
+        select: {
+          reference: true,
+          lines: {
+            select: {
+              id: true,
+              productId: true,
+              qty: true,
+              qtyReceived: true,
+              unitCostBase: true,
+              landedUnitCostBase: true,
+              totalBase: true,
+              product: { select: { weight: true } },
+            },
+          },
+          freightCostLines: {
+            select: { amountBase: true, distributionMethod: true },
+          },
+          landedCostLinks: {
+            select: {
+              freightPO: {
+                select: {
+                  freightCostLines: {
+                    select: { amountBase: true, distributionMethod: true },
+                  },
+                },
+              },
+            },
+          },
+        },
+      })
+      if (!currentPo) throw new Error('PO not found')
+
+      const grossUnitCostBaseByLine = computeGrossUnitCostBaseByLine({
+        lines: currentPo.lines.map((line) => ({
+          id: line.id,
+          qty: line.qty,
+          unitCostBase: line.unitCostBase,
+          totalBase: line.totalBase,
+          landedUnitCostBase: line.landedUnitCostBase,
+          weight: line.product?.weight ?? null,
+        })),
+        directCostLines: currentPo.freightCostLines.map((costLine) => ({
+          amountBase: costLine.amountBase,
+          distributionMethod: costLine.distributionMethod,
+        })),
+        linkedCostLines: currentPo.landedCostLinks.flatMap((link) => (
+          link.freightPO.freightCostLines.map((costLine) => ({
+            amountBase: costLine.amountBase,
+            distributionMethod: costLine.distributionMethod,
+          }))
+        )),
+      })
+
       // Re-validate outstanding qty under lock — the pre-tx check used a
       // stale snapshot that concurrent receipts could have advanced past.
-      const lockedLines = await tx.purchaseOrderLine.findMany({
-        where: { poId: id },
-        select: { id: true, qty: true, qtyReceived: true },
-      })
-      const lockedLineMap = new Map(lockedLines.map((l) => [l.id, l]))
+      const lockedLineMap = new Map(currentPo.lines.map((line) => [line.id, line]))
       for (const rl of linesWithQty) {
         const poLine = lockedLineMap.get(rl.poLineId)
         if (!poLine) throw new Error('Invalid PO line')
@@ -1709,13 +1737,13 @@ export async function receivePurchaseOrder(
         },
       })
 
+      let totalReceiptValue = 0
       for (const rl of linesWithQty) {
-        const poLine = po.lines.find((l) => l.id === rl.poLineId)
+        const poLine = currentPo.lines.find((l) => l.id === rl.poLineId)
         if (!poLine) continue
 
-        const unitCostBase = Number(poLine.landedUnitCostBase) > 0
-          ? Number(poLine.landedUnitCostBase)
-          : Number(poLine.unitCostBase)
+        const unitCostBase = grossUnitCostBaseByLine.get(poLine.id) ?? Number(poLine.unitCostBase)
+        totalReceiptValue += rl.qtyReceived * unitCostBase
 
         await tx.stockMovement.create({
           data: {
@@ -1723,7 +1751,7 @@ export async function receivePurchaseOrder(
             productId: poLine.productId,
             toWarehouseId: rl.warehouseId,
             qty: rl.qtyReceived,
-            note: `Received against ${po.reference}`,
+            note: `Received against ${currentPo.reference}`,
             referenceType: 'PurchaseOrder',
             referenceId: id,
           },
@@ -1800,12 +1828,12 @@ export async function receivePurchaseOrder(
         }
       }
 
-      return { allReceived, newStatus, freightPoIds }
+      return { allReceived, newStatus, freightPoIds, totalReceiptValue }
     }, STOCK_TX_OPTIONS)
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
-    for (const freightPoId of freightPoIdsToRevalidate.freightPoIds) {
+    for (const freightPoId of receiptResult.freightPoIds) {
       revalidatePath(`/purchase-orders/${freightPoId}`)
     }
     await logActivity({
@@ -1815,7 +1843,7 @@ export async function receivePurchaseOrder(
       tag: 'purchase',
       level: 'INFO',
       description: `Received PO ${po.reference} (${linesWithQty.length} lines)`,
-      metadata: { reference: po.reference, lineCount: linesWithQty.length, newStatus: freightPoIdsToRevalidate.newStatus },
+      metadata: { reference: po.reference, lineCount: linesWithQty.length, newStatus: receiptResult.newStatus },
     })
 
     // Log stock movement for the receipt
@@ -1838,12 +1866,7 @@ export async function receivePurchaseOrder(
     // Queue accounting stock receipt journal: DR Inventory / CR Stock-in-Transit
     try {
       const settings = await getAccountingSettings()
-      const totalReceiptValue = linesWithQty.reduce((sum, rl) => {
-        const poLine = po.lines.find(l => l.id === rl.poLineId)
-        if (!poLine) return sum
-        const unitCost = Number(poLine.landedUnitCostBase) > 0 ? Number(poLine.landedUnitCostBase) : Number(poLine.unitCostBase)
-        return sum + rl.qtyReceived * unitCost
-      }, 0)
+      const totalReceiptValue = receiptResult.totalReceiptValue
       if (totalReceiptValue > 0) {
         await queueAccountingSync({
           type: 'STOCK_RECEIPT',
@@ -2334,7 +2357,7 @@ export async function createInvoice(
       const productPayloadLines = productInputs.map((l) => ({
         description: `PO ${po.reference} line`,
         quantity: l.qtyBilled,
-        unitAmount: Math.round((l.unitCostForeign / fxRate) * 10000) / 10000,
+        unitAmount: Math.round(l.unitCostForeign * 10000) / 10000,
         accountCode: settings.transitAccount,
         taxType: taxTypeByLine.get(l.poLineId) ?? fallbackTaxType,
       }))
@@ -2343,7 +2366,7 @@ export async function createInvoice(
         return {
           description: l.description || costLine.description,
           quantity: 1,
-          unitAmount: Math.round((l.amountForeign / fxRate) * 10000) / 10000,
+          unitAmount: Math.round(l.amountForeign * 10000) / 10000,
           accountCode: settings.transitAccount,
           taxType: costLine.vatable ? fallbackTaxType : undefined,
         }
@@ -2863,6 +2886,92 @@ function computeDistributionBase(
   }
 }
 
+type PendingGrossCostLine = {
+  id: string
+  qty: Prisma.Decimal | number | string
+  unitCostBase: Prisma.Decimal | number | string
+  totalBase: Prisma.Decimal | number | string
+  landedUnitCostBase?: Prisma.Decimal | number | string | null
+  weight?: Prisma.Decimal | number | string | null
+}
+
+type PendingGrossCostLineSource = {
+  amountBase: Prisma.Decimal | number | string
+  distributionMethod: string | null | undefined
+}
+
+function normalizeLandedCostMethod(
+  method: string | null | undefined,
+): 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT' {
+  return (['BY_VALUE', 'BY_WEIGHT', 'BY_QUANTITY', 'EQUAL_SPLIT'].includes(method ?? '')
+    ? method
+    : 'BY_VALUE') as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT'
+}
+
+function computeGrossUnitCostBaseByLine(params: {
+  lines: PendingGrossCostLine[]
+  directCostLines?: PendingGrossCostLineSource[]
+  linkedCostLines?: PendingGrossCostLineSource[]
+}): Map<string, number> {
+  const eligibleLines = params.lines.filter((line) => decimal(line.qty).gt(0))
+  const landedByLine = new Map<string, Prisma.Decimal>()
+  for (const line of eligibleLines) {
+    landedByLine.set(line.id, new Prisma.Decimal(0))
+  }
+
+  const allCostLines = [
+    ...(params.directCostLines ?? []),
+    ...(params.linkedCostLines ?? []),
+  ]
+
+  for (const costLine of allCostLines) {
+    const amountBase = decimal(costLine.amountBase)
+    if (amountBase.lte(0)) continue
+    const method = normalizeLandedCostMethod(costLine.distributionMethod)
+    const bases = eligibleLines.map((line) => ({
+      lineId: line.id,
+      base: computeDistributionBase(
+        {
+          qty: decimal(line.qty),
+          totalBase: decimal(line.totalBase),
+          product: { weight: decimal(line.weight) },
+        },
+        method,
+      ),
+    }))
+    let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
+    if (basisTotal.lte(0)) {
+      basisTotal = new Prisma.Decimal(eligibleLines.length || 1)
+      for (const entry of bases) entry.base = new Prisma.Decimal(1)
+    }
+    for (const entry of bases) {
+      const share = amountBase.mul(entry.base).div(basisTotal)
+      landedByLine.set(entry.lineId, decimal(landedByLine.get(entry.lineId)).add(share))
+    }
+  }
+
+  const grossByLine = new Map<string, number>()
+  for (const line of params.lines) {
+    if (decimal(line.landedUnitCostBase).gt(0)) {
+      grossByLine.set(line.id, decimal(line.landedUnitCostBase).toNumber())
+      continue
+    }
+    if (decimal(line.qty).lte(0)) {
+      grossByLine.set(line.id, decimal(line.unitCostBase).toNumber())
+      continue
+    }
+    grossByLine.set(
+      line.id,
+      decimal(line.unitCostBase)
+        .add(decimal(landedByLine.get(line.id)).div(decimal(line.qty)))
+        .toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+        .toNumber(),
+    )
+  }
+
+  return grossByLine
+}
+
 /**
  * Recalculate landed cost on all primary POs linked to this freight PO.
  * Updates PO line `landedUnitCostBase`, CostLayer `unitCostBase`, and CogsEntry costs.
@@ -3008,6 +3117,8 @@ async function recalculateLandedCosts(
         // corrected cost, not the stale pre-adjustment value.
         if (Math.abs(costDelta) > 0.000001) {
           await updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase.toNumber())
+          await refreshShipmentCogsForCostLayerChange(tx, cl.id)
+          await refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
         }
       }
     }
@@ -3121,6 +3232,8 @@ async function recalculateDirectLandedCosts(
 
       if (Math.abs(costDelta) > 0.000001) {
         await updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase.toNumber())
+        await refreshShipmentCogsForCostLayerChange(tx, cl.id)
+        await refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
       }
     }
   }

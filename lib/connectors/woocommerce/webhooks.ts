@@ -55,6 +55,19 @@ async function handleOrderWebhook(body: string, topic: string | null) {
     return NextResponse.json({ ok: true, skipped: 'initial_import_pending' })
   }
 
+  if (topic === 'refund.created') {
+    const wcRefund = JSON.parse(body) as WcRefund
+    if (typeof wcRefund.parent_id === 'number') {
+      await syncWcRefund(wcRefund.parent_id, wcRefund)
+    }
+    await db.setting.upsert({
+      where: { key: 'last_wc_order_sync_at' },
+      create: { key: 'last_wc_order_sync_at', value: new Date().toISOString() },
+      update: { value: new Date().toISOString() },
+    })
+    return NextResponse.json({ ok: true })
+  }
+
   const wcOrder = JSON.parse(body) as WcFullOrder
 
   if (topic === 'order.created') {

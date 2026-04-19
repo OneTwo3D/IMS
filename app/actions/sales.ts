@@ -37,6 +37,7 @@ type RefundReturnRow = {
   productId: string
   qty: number
   unitCostBase?: number
+  poLineId?: string | null
 }
 
 type RefundRequestLine = {
@@ -261,6 +262,7 @@ async function applyRefundReturnStock(
           receivedQty: row.qty,
           remainingQty: row.qty,
           unitCostBase: row.unitCostBase,
+          poLineId: row.poLineId ?? null,
         },
       })
     }
@@ -1002,7 +1004,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     // until they are finalised via updateSalesOrderStatus.
     if (!input.isDraft) {
       try {
-        const [settings, baseCurrency] = await Promise.all([getAccountingSettings(), getBaseCurrencyCode()])
+        const settings = await getAccountingSettings()
         // The accounting payload uses a generic `lineAmountsIncludeTax`
         // flag — each connector maps this to its native convention. When
         // inclVat, shipping and discount must be sent GROSS. Our DB stores
@@ -1160,7 +1162,6 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       }))?.accountingTaxType ?? null
     : null
 
-  const fxRate = Number(so.fxRateToBase) || 1
   const vatPct = Number(so.taxRatePercent ?? 0)
   const lineAmountsIncludeTax = !!so.pricesIncludeVat && vatPct > 0
 
@@ -1681,10 +1682,11 @@ export async function createRefund(
           const referencedCostLayers = referencedCostLayerIds.length > 0
             ? await tx.costLayer.findMany({
                 where: { id: { in: referencedCostLayerIds } },
-                select: { id: true, productId: true },
+                select: { id: true, productId: true, poLineId: true },
               })
             : []
           const productIdByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, layer.productId]))
+          const poLineIdByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, layer.poLineId]))
 
           const extractPayloadAmount = (
             payload: unknown,
@@ -2008,6 +2010,7 @@ export async function createRefund(
                   productId,
                   qty: entry.qty,
                   unitCostBase: entry.unitCostBase,
+                  poLineId: poLineIdByCostLayerId.get(entry.costLayerId) ?? null,
                 }]
               })
             ))

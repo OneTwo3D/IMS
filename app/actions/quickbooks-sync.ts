@@ -101,9 +101,10 @@ export async function getQuickBooksConnectionStatus(): Promise<{
 export async function connectQuickBooks(
   clientId: string,
   clientSecret: string,
-  _origin: string,
+  origin: string,
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
   try {
+    void origin
     const session = await requireAdmin()
 
     // Save credentials

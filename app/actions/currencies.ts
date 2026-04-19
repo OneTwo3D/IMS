@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
-import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode, getFallbackCurrencyMeta } from '@/lib/base-currency'
+import { getBaseCurrencyCode, getFallbackCurrencyMeta } from '@/lib/base-currency'
 
 // ---------------------------------------------------------------------------
 // Types

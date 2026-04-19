@@ -4,7 +4,7 @@
  */
 
 import { db } from '@/lib/db'
-import { qboQuery, qboGet } from './api'
+import { qboQuery } from './api'
 
 const QBO_CONNECTOR = 'quickbooks'
 

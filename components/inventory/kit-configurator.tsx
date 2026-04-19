@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useRef, useEffect } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Plus, Trash2, Save, Search, X, AlertTriangle } from 'lucide-react'
 import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert'
@@ -57,7 +57,10 @@ export function KitConfigurator({ productId, productType, initialComponents, all
     setLines((prev) => prev.map((l) => (l.key === key ? { ...l, [field]: value } : l)))
   }
 
-  const validLines = lines.filter((line) => line.componentId && Number(line.qty) > 0)
+  const validLines = useMemo(
+    () => lines.filter((line) => line.componentId && Number(line.qty) > 0),
+    [lines],
+  )
 
   useEffect(() => {
     let cancelled = false
@@ -86,7 +89,7 @@ export function KitConfigurator({ productId, productType, initialComponents, all
       cancelled = true
       clearTimeout(timer)
     }
-  }, [productId, lines])
+  }, [productId, validLines])
 
   async function handleSave() {
     setSaving(true)

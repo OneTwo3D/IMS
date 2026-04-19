@@ -532,6 +532,7 @@ export async function getShoppingSyncLogs(limit = 50): Promise<SyncLogRow[]> {
 const WC_WEBHOOK_DEFS = [
   { name: 'OTI – Order created',   topic: 'order.created',   path: '/api/webhooks/shopping/woocommerce/orders' },
   { name: 'OTI – Order updated',   topic: 'order.updated',   path: '/api/webhooks/shopping/woocommerce/orders' },
+  { name: 'OTI – Refund created',  topic: 'refund.created',  path: '/api/webhooks/shopping/woocommerce/orders' },
   { name: 'OTI – Product updated', topic: 'product.updated', path: '/api/webhooks/shopping/woocommerce/products' },
 ] as const
 

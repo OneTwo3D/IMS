@@ -8,6 +8,7 @@
  */
 
 import type { Prisma } from '@/app/generated/prisma/client'
+import { parseCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 
 type TxClient = Prisma.TransactionClient
 
@@ -50,12 +51,22 @@ export async function consumeFifoLayers(
   let totalCost = 0
   const consumed: ConsumedLayer[] = []
 
-  const layers = await tx.costLayer.findMany({
+  const candidateLayers = await tx.costLayer.findMany({
     where: { productId, warehouseId, remainingQty: { gt: 0 } },
     select: { id: true, remainingQty: true, unitCostBase: true },
     orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
   })
-  await lockCostLayers(tx, layers.map((l) => l.id))
+  await lockCostLayers(tx, candidateLayers.map((l) => l.id))
+
+  // Re-read after taking row locks so concurrent consumers cannot both act on
+  // the same pre-lock remainingQty snapshot and double-decrement a layer.
+  const layers = candidateLayers.length === 0
+    ? []
+    : await tx.costLayer.findMany({
+        where: { id: { in: candidateLayers.map((layer) => layer.id) } },
+        select: { id: true, remainingQty: true, unitCostBase: true },
+        orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
+      })
 
   for (const layer of layers) {
     if (remaining <= 0) break
@@ -134,6 +145,7 @@ export async function createCostLayer(
     qty: number
     unitCostBase: number
     poLineId?: string
+    adjustmentMovementId?: string
     isOpeningStock?: boolean
     receivedAt?: Date
   },
@@ -146,6 +158,7 @@ export async function createCostLayer(
       remainingQty: data.qty,
       unitCostBase: Math.round(data.unitCostBase * 1000000) / 1000000,
       poLineId: data.poLineId ?? null,
+      adjustmentMovementId: data.adjustmentMovementId ?? null,
       isOpeningStock: data.isOpeningStock ?? false,
       ...(data.receivedAt ? { receivedAt: data.receivedAt } : {}),
     },
@@ -184,17 +197,18 @@ export async function updateSnapshotsForCostLayerChange(
   let updated = 0
 
   const tables = [
-    { model: 'shipment_lines', idCol: 'id' },
-    { model: 'order_allocations', idCol: 'id' },
-    { model: 'sales_order_refund_lines', idCol: 'id' },
-    { model: 'stock_transfer_lines', idCol: 'id' },
+    { model: 'shipment_lines' },
+    { model: 'order_allocations' },
+    { model: 'sales_order_refund_lines' },
+    { model: 'stock_transfer_lines' },
   ] as const
+  const containsCostLayer = JSON.stringify([{ costLayerId }])
 
   for (const table of tables) {
     // Find rows whose snapshot JSON mentions this cost layer id
     const rows = await tx.$queryRawUnsafe<Array<{ id: string; costLayerSnapshot: unknown }>>(
-      `SELECT id, "costLayerSnapshot" FROM "${table.model}" WHERE "costLayerSnapshot"::text LIKE $1`,
-      `%${costLayerId}%`,
+      `SELECT id, "costLayerSnapshot" FROM "${table.model}" WHERE "costLayerSnapshot" @> $1::jsonb`,
+      containsCostLayer,
     )
 
     for (const row of rows) {
@@ -219,4 +233,93 @@ export async function updateSnapshotsForCostLayerChange(
   }
 
   return updated
+}
+
+/**
+ * Recompute stored shipment-level COGS for any shipment whose line snapshots
+ * reference the changed cost layer. This keeps shipment COGS aligned with
+ * retrospective landed-cost changes, including shipments already journaled.
+ */
+export async function refreshShipmentCogsForCostLayerChange(
+  tx: TxClient,
+  costLayerId: string,
+): Promise<number> {
+  const containsCostLayer = JSON.stringify([{ costLayerId }])
+  const shipments = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+    `SELECT DISTINCT "shipmentId" AS id FROM "shipment_lines" WHERE "costLayerSnapshot" @> $1::jsonb`,
+    containsCostLayer,
+  )
+
+  let updated = 0
+  for (const shipment of shipments) {
+    const lines = await tx.shipmentLine.findMany({
+      where: { shipmentId: shipment.id },
+      select: { costLayerSnapshot: true },
+    })
+    const cogs = Math.round(lines.reduce((sum, line) => (
+      sum + sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot))
+    ), 0) * 100) / 100
+    await tx.shipment.update({
+      where: { id: shipment.id },
+      data: { cogsBatchAmount: cogs },
+    })
+    updated++
+  }
+
+  return updated
+}
+
+export async function refreshSalesOrderLineCogs(
+  tx: TxClient,
+  lineIds: string[],
+): Promise<number> {
+  const uniqueLineIds = [...new Set(lineIds)]
+  if (uniqueLineIds.length === 0) return 0
+
+  const shipmentLines = await tx.shipmentLine.findMany({
+    where: { lineId: { in: uniqueLineIds } },
+    select: { lineId: true, costLayerSnapshot: true },
+  })
+
+  const cogsByLineId = new Map<string, number>()
+  const hasSnapshotByLineId = new Map<string, boolean>()
+  for (const shipmentLine of shipmentLines) {
+    const snapshot = parseCostLayerSnapshot(shipmentLine.costLayerSnapshot)
+    cogsByLineId.set(
+      shipmentLine.lineId,
+      (cogsByLineId.get(shipmentLine.lineId) ?? 0)
+        + sumCostLayerSnapshot(snapshot),
+    )
+    if (snapshot.length > 0) {
+      hasSnapshotByLineId.set(shipmentLine.lineId, true)
+    }
+  }
+
+  let updated = 0
+  for (const lineId of uniqueLineIds) {
+    const cogs = cogsByLineId.get(lineId)
+    await tx.salesOrderLine.update({
+      where: { id: lineId },
+      data: {
+        cogsBase: cogs == null || !hasSnapshotByLineId.get(lineId)
+          ? null
+          : Math.round(cogs * 10000) / 10000,
+      },
+    })
+    updated++
+  }
+
+  return updated
+}
+
+export async function refreshSalesOrderLineCogsForCostLayerChange(
+  tx: TxClient,
+  costLayerId: string,
+): Promise<number> {
+  const containsCostLayer = JSON.stringify([{ costLayerId }])
+  const rows = await tx.$queryRawUnsafe<Array<{ id: string }>>(
+    `SELECT DISTINCT "lineId" AS id FROM "shipment_lines" WHERE "costLayerSnapshot" @> $1::jsonb`,
+    containsCostLayer,
+  )
+  return refreshSalesOrderLineCogs(tx, rows.map((row) => row.id))
 }

@@ -176,7 +176,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
 
     // Shipping
     const shipping = mapWcShipping(wcOrder)
-    const shippingForeign = parseFloat(wcOrder.shipping_total) || 0 // net shipping (excl tax)
+    const shippingForeign = shipping.shippingForeign
 
     // Tax totals from WC (more accurate than recalculating)
     const taxForeign = parseFloat(wcOrder.total_tax) || 0
@@ -334,12 +334,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       // stay consistent with the LineAmountTypes flag.
       const vatMultiplier = 1 + (taxRateValue || 0)
       const shippingNetGbp = shippingForeign > 0 ? shippingForeign / fxRateNum : 0
-      const shippingSendGbp = pricesIncludeVat ? shippingNetGbp * vatMultiplier : shippingNetGbp
+      const shippingSendForeign = pricesIncludeVat ? shippingNetGbp * vatMultiplier * fxRateNum : shippingForeign
       // WC coupon discounts in `discount_total` are NET when prices_include_tax
       // is false, and GROSS when true — mapWcOrderDiscount stores the raw
       // value so pass it through in the same inclusive/exclusive mode.
-      const discountGbpRaw = orderDiscount.discountAmount / fxRateNum
-      const discountGbp = Math.round(discountGbpRaw * 100) / 100
       await queueAccountingSync({
         type: 'SALES_INVOICE',
         referenceType: 'SalesOrder',
@@ -359,7 +357,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             accountCode: settings.salesAccount,
             taxType: lineTaxResolved[idx]?.accountingTaxType ?? accountingTaxType ?? undefined,
           })),
-          shippingAmount: shippingSendGbp > 0 ? Math.round((shippingSendGbp * fxRateNum) * 10000) / 10000 : undefined,
+          shippingAmount: shippingSendForeign > 0 ? Math.round(shippingSendForeign * 10000) / 10000 : undefined,
           shippingDescription: 'Shipping',
           shippingAccountCode: settings.shippingAccount || undefined,
           shippingTaxType: accountingTaxType ?? undefined,

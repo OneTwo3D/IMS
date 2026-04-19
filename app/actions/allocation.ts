@@ -20,7 +20,7 @@ import {
   listFulfillmentLeafProductIds,
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
-import { consumeFifoLayers } from '@/lib/cost-layers'
+import { consumeFifoLayers, refreshSalesOrderLineCogs } from '@/lib/cost-layers'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 const ALLOCATION_EPSILON = 0.000001
@@ -1250,6 +1250,11 @@ export async function updateShipmentStatus(
             data: { cogsBatchAmount: Math.round(totalShipmentCogs * 100) / 100 },
           })
         }
+
+        await refreshSalesOrderLineCogs(
+          tx,
+          shipment.lines.map((line) => line.lineId),
+        )
 
         return true
       }, STOCK_TX_OPTIONS)

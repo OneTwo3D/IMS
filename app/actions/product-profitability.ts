@@ -127,7 +127,7 @@ export async function getProductProfitability(): Promise<{
     db.salesOrder.findMany({
       where: { status: { in: [...FULFILLED] }, createdAt: { gte: currentFyStart, lt: currentFyEnd } },
       select: {
-        fxRateToBase: true, discountAmount: true,
+        fxRateToBase: true, discountAmount: true, pricesIncludeVat: true, taxRatePercent: true,
         lines: { select: { productId: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true } },
         refunds: { select: { lines: { select: { productId: true, qty: true, totalBase: true } } } },
       },
@@ -135,7 +135,7 @@ export async function getProductProfitability(): Promise<{
     db.salesOrder.findMany({
       where: { status: { in: [...FULFILLED] }, createdAt: { gte: previousFyStart, lt: previousFyEnd } },
       select: {
-        fxRateToBase: true, discountAmount: true,
+        fxRateToBase: true, discountAmount: true, pricesIncludeVat: true, taxRatePercent: true,
         lines: { select: { productId: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true } },
         refunds: { select: { lines: { select: { productId: true, qty: true, totalBase: true } } } },
       },
@@ -148,6 +148,11 @@ export async function getProductProfitability(): Promise<{
     const map = new Map<string, FyAgg>()
     for (const order of orders) {
       const fxRate = Number(order.fxRateToBase) || 1
+      const orderLineTotal = order.lines.reduce((sum, line) => sum + Number(line.totalBase), 0)
+      const orderDiscountBaseRaw = Number(order.discountAmount ?? 0) / fxRate
+      const orderDiscountBase = order.pricesIncludeVat && Number(order.taxRatePercent ?? 0) > 0
+        ? orderDiscountBaseRaw / (1 + Number(order.taxRatePercent))
+        : orderDiscountBaseRaw
       for (const line of order.lines) {
         if (!line.productId) continue
         const agg = map.get(line.productId) ?? { revenue: 0, cogs: 0, qtySold: 0 }
@@ -156,6 +161,9 @@ export async function getProductProfitability(): Promise<{
         agg.qtySold += Number(line.qty)
         // Add back line discount (already subtracted from totalBase)
         agg.revenue += Number(line.discountAmount) / fxRate
+        if (orderDiscountBase > 0 && orderLineTotal > 0) {
+          agg.revenue -= orderDiscountBase * (Number(line.totalBase) / orderLineTotal)
+        }
         map.set(line.productId, agg)
       }
       // Subtract refunds
@@ -177,7 +185,6 @@ export async function getProductProfitability(): Promise<{
   const previousFyMap = aggregateOrders(previousFyOrders)
 
   // 6. Build rows
-  const productInfo = new Map(products.map((p) => [p.id, p]))
   const rows: ProfitabilityRow[] = []
 
   for (const p of products) {

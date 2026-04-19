@@ -9,7 +9,7 @@ import { getWcCredentials as getConnectorWcCredentials } from '@/lib/connectors/
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
 import type { Prisma } from '@/app/generated/prisma/client'
-import { consumeFifoLayers, getAverageUnitCost } from '@/lib/cost-layers'
+import { consumeFifoLayers, createCostLayer, getAverageUnitCost } from '@/lib/cost-layers'
 
 // ---------------------------------------------------------------------------
 // Helpers for inventory adjustment accounting journal
@@ -162,7 +162,7 @@ export async function adjustStock(
       }
 
       // Create stock movement
-      await tx.stockMovement.create({
+      const movement = await tx.stockMovement.create({
         data: {
           type: 'ADJUSTMENT',
           productId,
@@ -193,20 +193,30 @@ export async function adjustStock(
       // Positive adjustments create a new layer at the current average unit cost.
       if (isAddition) {
         const avgCost = await getAverageUnitCost(tx, productId, warehouseId)
-        await tx.costLayer.create({
-          data: {
-            productId,
-            warehouseId,
-            receivedQty: Math.abs(qtyNum),
-            remainingQty: Math.abs(qtyNum),
-            unitCostBase: Math.round(avgCost * 1000000) / 1000000,
-            isOpeningStock: false,
-          },
+        await createCostLayer(tx, {
+          productId,
+          warehouseId,
+          qty: Math.abs(qtyNum),
+          unitCostBase: avgCost,
+          receivedAt: movement.createdAt,
+          isOpeningStock: false,
+          adjustmentMovementId: movement.id,
         })
       } else {
         // Tolerant consume — adjustment may exceed available FIFO layers
         // (e.g. legacy stock with no layers). Shortfall is accepted.
-        await consumeFifoLayers(tx, productId, warehouseId, Math.abs(qtyNum))
+        const { consumed } = await consumeFifoLayers(tx, productId, warehouseId, Math.abs(qtyNum))
+        if (consumed.length > 0) {
+          await tx.cogsEntry.createMany({
+            data: consumed.map((entry) => ({
+              costLayerId: entry.costLayerId,
+              movementId: movement.id,
+              qty: entry.qty,
+              unitCostBase: entry.unitCostBase,
+              totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+            })),
+          })
+        }
       }
 
       // Capture info for activity log
@@ -241,7 +251,7 @@ export async function adjustStock(
           await queueAccountingSync({
             type: 'INVENTORY_ADJUSTMENT',
             referenceType: 'StockMovement',
-            referenceId: productId,
+            referenceId: movement.id,
             payload: journal as unknown as Record<string, unknown>,
           })
         }
@@ -510,7 +520,20 @@ export async function updateAdjustmentMovement(
     await db.$transaction(async (tx) => {
       const movement = await tx.stockMovement.findUnique({
         where: { id },
-        select: { id: true, productId: true, fromWarehouseId: true, toWarehouseId: true, qty: true },
+        select: {
+          id: true,
+          productId: true,
+          fromWarehouseId: true,
+          toWarehouseId: true,
+          qty: true,
+          createdAt: true,
+          cogsEntries: {
+            select: { id: true, costLayerId: true, qty: true },
+          },
+          adjustmentLayers: {
+            select: { id: true, receivedQty: true, remainingQty: true },
+          },
+        },
       })
       if (!movement) throw new Error('Movement not found')
 
@@ -521,6 +544,31 @@ export async function updateAdjustmentMovement(
 
       const newIsAddition = newSignedQty > 0
       const newAbsQty = Math.abs(newSignedQty).toString()
+      if (newSignedQty === oldSignedQty) {
+        await tx.stockMovement.update({
+          where: { id },
+          data: { note: newNote || null },
+        })
+        return
+      }
+
+      const laterMovementCount = await tx.stockMovement.count({
+        where: {
+          id: { not: id },
+          productId: movement.productId,
+          createdAt: { gt: movement.createdAt },
+          OR: [
+            { fromWarehouseId: oldWarehouseId },
+            { toWarehouseId: oldWarehouseId },
+          ],
+        },
+      })
+      if (laterMovementCount > 0) {
+        throw new Error(
+          'This adjustment has later stock movements for the same product and warehouse. ' +
+          'Create a reversing adjustment instead of editing it in place.',
+        )
+      }
 
       // Reverse old stock delta
       await tx.stockLevel.upsert({
@@ -529,6 +577,38 @@ export async function updateAdjustmentMovement(
         update: { quantity: { decrement: oldSignedQty } },
       })
 
+      if (oldIsAddition) {
+        const layer = movement.adjustmentLayers[0]
+        if (!layer) {
+          throw new Error(
+            'This adjustment does not have tracked cost-layer history. ' +
+            'Create a reversing adjustment instead of editing it in place.',
+          )
+        }
+        const consumedQty = Number(layer.receivedQty) - Number(layer.remainingQty)
+        if (consumedQty > 0.000001) {
+          throw new Error(
+            'This adjustment layer has already been consumed. ' +
+            'Create a reversing adjustment instead of editing it in place.',
+          )
+        }
+        await tx.costLayer.deleteMany({ where: { adjustmentMovementId: id } })
+      } else {
+        if (movement.cogsEntries.length === 0) {
+          throw new Error(
+            'This adjustment was created before FIFO edit tracking was enabled. ' +
+            'Create a reversing adjustment instead of editing it in place.',
+          )
+        }
+        for (const entry of movement.cogsEntries) {
+          await tx.costLayer.update({
+            where: { id: entry.costLayerId },
+            data: { remainingQty: { increment: Number(entry.qty) } },
+          })
+        }
+        await tx.cogsEntry.deleteMany({ where: { movementId: id } })
+      }
+
       // Apply new stock delta
       const newWarehouseId = oldWarehouseId // warehouse can't be changed via edit
       await tx.stockLevel.upsert({
@@ -536,6 +616,32 @@ export async function updateAdjustmentMovement(
         create: { productId: movement.productId, warehouseId: newWarehouseId, quantity: newIsAddition ? newAbsQty : `-${newAbsQty}` },
         update: { quantity: { increment: newSignedQty } },
       })
+
+      if (newIsAddition) {
+        const avgCost = await getAverageUnitCost(tx, movement.productId, newWarehouseId)
+        await createCostLayer(tx, {
+          productId: movement.productId,
+          warehouseId: newWarehouseId,
+          qty: Math.abs(newSignedQty),
+          unitCostBase: avgCost,
+          receivedAt: movement.createdAt,
+          isOpeningStock: false,
+          adjustmentMovementId: id,
+        })
+      } else {
+        const { consumed } = await consumeFifoLayers(tx, movement.productId, newWarehouseId, Math.abs(newSignedQty))
+        if (consumed.length > 0) {
+          await tx.cogsEntry.createMany({
+            data: consumed.map((entry) => ({
+              costLayerId: entry.costLayerId,
+              movementId: id,
+              qty: entry.qty,
+              unitCostBase: entry.unitCostBase,
+              totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+            })),
+          })
+        }
+      }
 
       // Update movement record
       await tx.stockMovement.update({

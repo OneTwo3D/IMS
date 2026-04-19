@@ -115,9 +115,10 @@ export async function getXeroConnectionStatus(): Promise<{
 export async function connectXero(
   clientId: string,
   clientSecret: string,
-  _origin: string,
+  origin: string,
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
   try {
+    void origin
     const session = await requireAdmin()
 
     // Save credentials (never overwrite secret with masked value)

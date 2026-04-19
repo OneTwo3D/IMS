@@ -346,8 +346,12 @@ export async function runDailyBatchSync(): Promise<{
         id: true,
         orderNumber: true,
         externalOrderNumber: true,
-        totalBase: true,
-        taxBase: true,
+        fxRateToBase: true,
+        subtotalBase: true,
+        shippingBase: true,
+        discountAmount: true,
+        pricesIncludeVat: true,
+        taxRatePercent: true,
       },
     })
 
@@ -356,7 +360,12 @@ export async function runDailyBatchSync(): Promise<{
       const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = []
 
       for (const order of orders) {
-        const salesValue = round2(Number(order.totalBase) - Number(order.taxBase))
+        const fxRate = Number(order.fxRateToBase) || 1
+        const discountBaseRaw = Number(order.discountAmount ?? 0) / fxRate
+        const discountBase = order.pricesIncludeVat && Number(order.taxRatePercent ?? 0) > 0
+          ? discountBaseRaw / (1 + Number(order.taxRatePercent))
+          : discountBaseRaw
+        const salesValue = round2(Number(order.subtotalBase) + Number(order.shippingBase ?? 0) - discountBase)
         totalRevenueDeferred += salesValue
       }
 
@@ -385,7 +394,12 @@ export async function runDailyBatchSync(): Promise<{
         }
 
         for (const order of orders) {
-          const salesValue = round2(Number(order.totalBase) - Number(order.taxBase))
+          const fxRate = Number(order.fxRateToBase) || 1
+          const discountBaseRaw = Number(order.discountAmount ?? 0) / fxRate
+          const discountBase = order.pricesIncludeVat && Number(order.taxRatePercent ?? 0) > 0
+            ? discountBaseRaw / (1 + Number(order.taxRatePercent))
+            : discountBaseRaw
+          const salesValue = round2(Number(order.subtotalBase) + Number(order.shippingBase ?? 0) - discountBase)
           await tx.salesOrder.update({
             where: { id: order.id },
             data: {
@@ -654,6 +668,7 @@ export async function runDailyBatchSync(): Promise<{
       for (const [orderId, orderShipments] of shipmentsByOrder) {
         const firstShipment = orderShipments[0]
         try {
+        const orderLayerDecrements = new Map<string, number>()
         const deferredBase = Number(firstShipment.order.unearnedRevenueAmount ?? firstShipment.order.totalBase)
         const orderLineTotal = firstShipment.order.lines.reduce((sum, line) => sum + Number(line.totalBase), 0)
         const requirementsByLine = new Map(
@@ -701,18 +716,15 @@ export async function runDailyBatchSync(): Promise<{
             )
           }
 
-          // COGS: read pre-computed cost layer snapshots from shipment
-          // lines. FIFO layer consumption now happens at shipment dispatch
-          // time (allocation.ts). See Xero daily-sync.ts for full comments.
-          const shipmentCogs = Number(shipment.cogsBatchAmount ?? 0)
-          const recomputedCogs = shipmentCogs > 0
-            ? shipmentCogs
-            : round2(shipment.lines.reduce((sum, sl) => {
-                const snapshot = parseCostLayerSnapshot(sl.costLayerSnapshot)
-                return sum + sumCostLayerSnapshot(snapshot)
-              }, 0))
+          const shipmentSnapshotsForLines = shipment.lines.map((line) => (
+            parseCostLayerSnapshot(line.costLayerSnapshot)
+          ))
+          const hasPrecomputedSnapshots = shipmentSnapshotsForLines.some((entries) => entries.length > 0)
+          const precomputedCogs = hasPrecomputedSnapshots
+            ? round2(shipmentSnapshotsForLines.reduce((sum, entries) => sum + sumCostLayerSnapshot(entries), 0))
+            : Number(shipment.cogsBatchAmount ?? 0)
 
-          if (recomputedCogs <= 0) {
+          if (!hasPrecomputedSnapshots && precomputedCogs <= 0) {
             // Legacy fallback: allocation-based consumption for shipments
             // dispatched before FIFO-at-ship-time was deployed.
             const shipmentCostSnapshot: CostLayerSnapshotEntry[] = []
@@ -750,7 +762,10 @@ export async function runDailyBatchSync(): Promise<{
             }
 
             for (const entry of shipmentCostSnapshot) {
-              layerDecrements.set(entry.costLayerId, (layerDecrements.get(entry.costLayerId) ?? 0) + entry.qty)
+              orderLayerDecrements.set(
+                entry.costLayerId,
+                (orderLayerDecrements.get(entry.costLayerId) ?? 0) + entry.qty,
+              )
             }
 
             const legacyCogs = round2(sumCostLayerSnapshot(shipmentCostSnapshot))
@@ -766,10 +781,13 @@ export async function runDailyBatchSync(): Promise<{
             }
           } else {
             totalRevenue += revenueProportion
-            totalCogs += recomputedCogs
+            totalCogs += precomputedCogs
             runningRevenue += revenueProportion
-            shipmentResults.set(shipment.id, { revenue: revenueProportion, cogs: recomputedCogs })
+            shipmentResults.set(shipment.id, { revenue: revenueProportion, cogs: precomputedCogs })
           }
+        }
+        for (const [layerId, decrement] of orderLayerDecrements) {
+          layerDecrements.set(layerId, (layerDecrements.get(layerId) ?? 0) + decrement)
         }
         } catch (orderError) {
           const orderRef = firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8)

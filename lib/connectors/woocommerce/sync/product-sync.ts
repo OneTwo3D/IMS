@@ -392,7 +392,7 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
     updateData.status = deriveWooStatusFromLifecycleStatus(product.lifecycleStatus)
     if (product.description) updateData.description = product.description
     if (product.salesPriceBase) updateData.regular_price = String(Number(product.salesPriceBase))
-    if (product.salePriceBase) updateData.sale_price = String(Number(product.salePriceBase))
+    updateData.sale_price = product.salePriceBase ? String(Number(product.salePriceBase)) : ''
 
     // Only send global_unique_id if barcode is purely numeric (WC only accepts numbers)
     if (product.barcode && /^\d+$/.test(product.barcode)) {

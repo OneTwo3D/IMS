@@ -496,6 +496,18 @@ async function updateBackReference(
         where: { id: referenceId },
         data: { accountingInvoiceId: externalId },
       })
+    } else if (type === 'PURCHASE_INVOICE' && referenceType === 'PurchaseOrder') {
+      const invoice = await db.purchaseInvoice.findFirst({
+        where: { poId: referenceId, accountingInvoiceId: null },
+        orderBy: { createdAt: 'desc' },
+        select: { id: true },
+      })
+      if (invoice) {
+        await db.purchaseInvoice.update({
+          where: { id: invoice.id },
+          data: { accountingInvoiceId: externalId },
+        })
+      }
     }
   } catch {
     // Non-critical — log entry already marked as SYNCED
@@ -575,7 +587,7 @@ async function enqueuePurchaseInvoiceFollowUps(
   payload: SyncPayload,
   syncResult: { externalId?: string },
 ): Promise<void> {
-  if (referenceType !== 'PurchaseInvoice' || !syncResult.externalId || !payload.supplierInvoicePath) return
+  if ((referenceType !== 'PurchaseInvoice' && referenceType !== 'PurchaseOrder') || !syncResult.externalId || !payload.supplierInvoicePath) return
   await enqueueFollowUpSyncLog('BILL_ATTACHMENT', referenceType, referenceId, {
     accountingInvoiceId: syncResult.externalId,
     supplierInvoicePath: payload.supplierInvoicePath,

@@ -139,6 +139,7 @@ export type WcRefundLineItem = {
 
 export type WcRefund = {
   id: number
+  parent_id?: number
   date_created: string
   date_created_gmt: string
   amount: string

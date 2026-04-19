@@ -15,8 +15,18 @@ const THEME_STORAGE_KEY = 'theme'
 
 const ThemeContext = createContext<ThemeContextValue | undefined>(undefined)
 
-function resolveTheme(theme: Theme): ResolvedTheme {
-  if (theme !== 'system') return theme
+function getStoredTheme(): Theme {
+  if (typeof window === 'undefined') return 'system'
+  try {
+    const value = localStorage.getItem(THEME_STORAGE_KEY)
+    return value === 'light' || value === 'dark' || value === 'system' ? value : 'system'
+  } catch {
+    return 'system'
+  }
+}
+
+function getSystemTheme(): ResolvedTheme {
+  if (typeof window === 'undefined') return 'light'
   return window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'
 }
 
@@ -27,35 +37,19 @@ function applyTheme(resolvedTheme: ResolvedTheme) {
 }
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const [theme, setThemeState] = useState<Theme>('system')
-  const [resolvedTheme, setResolvedTheme] = useState<ResolvedTheme>('light')
+  const [theme, setThemeState] = useState<Theme>(() => getStoredTheme())
+  const [systemTheme, setSystemTheme] = useState<ResolvedTheme>(() => getSystemTheme())
+  const resolvedTheme = theme === 'system' ? systemTheme : theme
 
   useEffect(() => {
-    const storedTheme = (() => {
-      try {
-        const value = localStorage.getItem(THEME_STORAGE_KEY)
-        return value === 'light' || value === 'dark' || value === 'system' ? value : 'system'
-      } catch {
-        return 'system'
-      }
-    })()
-
-    const resolved = resolveTheme(storedTheme)
-    setThemeState(storedTheme)
-    setResolvedTheme(resolved)
-    applyTheme(resolved)
-  }, [])
+    applyTheme(resolvedTheme)
+  }, [resolvedTheme])
 
   useEffect(() => {
     const mediaQuery = window.matchMedia('(prefers-color-scheme: dark)')
 
     const handleSystemThemeChange = () => {
-      setResolvedTheme((currentResolvedTheme) => {
-        if (theme !== 'system') return currentResolvedTheme
-        const nextResolvedTheme = mediaQuery.matches ? 'dark' : 'light'
-        applyTheme(nextResolvedTheme)
-        return nextResolvedTheme
-      })
+      setSystemTheme(mediaQuery.matches ? 'dark' : 'light')
     }
 
     const handleStorage = (event: StorageEvent) => {
@@ -64,10 +58,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
         event.newValue === 'light' || event.newValue === 'dark' || event.newValue === 'system'
           ? event.newValue
           : 'system'
-      const nextResolvedTheme = resolveTheme(nextTheme)
       setThemeState(nextTheme)
-      setResolvedTheme(nextResolvedTheme)
-      applyTheme(nextResolvedTheme)
     }
 
     mediaQuery.addEventListener('change', handleSystemThemeChange)
@@ -80,10 +71,7 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
   }, [theme])
 
   const setTheme = (nextTheme: Theme) => {
-    const nextResolvedTheme = resolveTheme(nextTheme)
     setThemeState(nextTheme)
-    setResolvedTheme(nextResolvedTheme)
-    applyTheme(nextResolvedTheme)
     try {
       localStorage.setItem(THEME_STORAGE_KEY, nextTheme)
     } catch {

@@ -9,7 +9,6 @@ import { logActivity } from '@/lib/activity-log'
 import { qboQuery } from './api'
 import { getSettingValue } from '@/lib/settings-store'
 
-const QBO_CONNECTOR = 'quickbooks'
 const LAST_POLL_KEY = 'quickbooks_last_payment_poll'
 
 type QboInvoice = {
