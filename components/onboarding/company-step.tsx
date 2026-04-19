@@ -15,9 +15,33 @@ export type CompanyStepHandle = {
 type Props = {
   org: OrganisationData
   onSaved: () => void
+  onReadyChange?: (ready: boolean) => void
 }
 
-export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function CompanyStep({ org: initialOrg, onSaved }, ref) {
+function hasCompanyDraftChanges(current: OrganisationData, initial: OrganisationData, logoUrl: string | null) {
+  return (
+    current.name !== initial.name ||
+    current.legalName !== initial.legalName ||
+    current.vatNumber !== initial.vatNumber ||
+    current.companyNumber !== initial.companyNumber ||
+    current.addressLine1 !== initial.addressLine1 ||
+    current.addressLine2 !== initial.addressLine2 ||
+    current.city !== initial.city ||
+    current.county !== initial.county ||
+    current.postcode !== initial.postcode ||
+    current.country !== initial.country ||
+    current.phone !== initial.phone ||
+    current.email !== initial.email ||
+    current.website !== initial.website ||
+    logoUrl !== initial.logoUrl
+  )
+}
+
+export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function CompanyStep({
+  org: initialOrg,
+  onSaved,
+  onReadyChange,
+}, ref) {
   const router = useRouter()
   const [co, setCo] = useState(initialOrg)
   const [logoUrl, setLogoUrl] = useState(initialOrg.logoUrl)
@@ -30,6 +54,10 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
     setCo(initialOrg)
     setLogoUrl(initialOrg.logoUrl)
   }, [initialOrg])
+
+  useEffect(() => {
+    onReadyChange?.(hasCompanyDraftChanges(co, initialOrg, logoUrl))
+  }, [co, initialOrg, logoUrl, onReadyChange])
 
   function field(key: keyof OrganisationData, label: string, opts?: { type?: string; span?: number }) {
     return (

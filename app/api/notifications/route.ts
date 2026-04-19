@@ -41,13 +41,17 @@ export async function GET() {
     r.userId === null ? { ...r, read: receiptSet.has(r.id) } : r,
   )
 
-  // Unread count: all user-owned unread + broadcasts without a receipt.
-  const [ownedUnread, totalBroadcasts, totalReceipts] = await Promise.all([
+  // Unread count: all user-owned unread + broadcasts this user has not acknowledged.
+  const [ownedUnread, broadcastUnread] = await Promise.all([
     db.notification.count({ where: { userId, read: false } }),
-    db.notification.count({ where: { userId: null } }),
-    db.notificationReadReceipt.count({ where: { userId } }),
+    db.notification.count({
+      where: {
+        userId: null,
+        readReceipts: { none: { userId } },
+      },
+    }),
   ])
-  const unreadCount = ownedUnread + Math.max(0, totalBroadcasts - totalReceipts)
+  const unreadCount = ownedUnread + broadcastUnread
 
   return jsonNoStore({ notifications, unreadCount })
 }

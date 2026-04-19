@@ -16,7 +16,7 @@ import {
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createTaxRate, updateTaxRate, type TaxRateRow, type TaxCategoryValue } from '@/app/actions/settings'
 
-type Props = { taxRates: TaxRateRow[] }
+type Props = { taxRates: TaxRateRow[]; onChanged?: () => void }
 
 const USED_FOR_LABELS: Record<string, string> = {
   SALES: 'Sales',
@@ -39,9 +39,11 @@ const TAX_CATEGORY_LABELS: Record<string, string> = Object.fromEntries(
 function TaxRateFormDialog({
   rate,
   onClose,
+  onChanged,
 }: {
   rate: TaxRateRow | null
   onClose: () => void
+  onChanged?: () => void
 }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -76,6 +78,7 @@ function TaxRateFormDialog({
         : await createTaxRate(payload)
 
       if (result.success) {
+        onChanged?.()
         router.refresh()
         onClose()
       } else {
@@ -168,7 +171,7 @@ function TaxRateFormDialog({
   )
 }
 
-export function TaxRatesTable({ taxRates }: Props) {
+export function TaxRatesTable({ taxRates, onChanged }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [editing, setEditing] = useState<TaxRateRow | null | undefined>(undefined)
@@ -176,6 +179,7 @@ export function TaxRatesTable({ taxRates }: Props) {
   function handleToggle(rate: TaxRateRow) {
     startTransition(async () => {
       await updateTaxRate(rate.id, { active: !rate.active })
+      onChanged?.()
       router.refresh()
     })
   }
@@ -265,7 +269,7 @@ export function TaxRatesTable({ taxRates }: Props) {
       )}
 
       {editing !== undefined && (
-        <TaxRateFormDialog rate={editing} onClose={() => setEditing(undefined)} />
+        <TaxRateFormDialog rate={editing} onClose={() => setEditing(undefined)} onChanged={onChanged} />
       )}
     </div>
   )

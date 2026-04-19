@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState } from 'react'
+import { useCallback, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import {
   ArrowLeft, ArrowRight, Building2, Check, CheckCircle2, Coins, ExternalLink,
@@ -88,6 +88,10 @@ export function OnboardingClient({
   const [currencyConfiguredOverride, setCurrencyConfiguredOverride] = useState<{ base: boolean; value: boolean } | null>(null)
   const [finishing, setFinishing] = useState(false)
   const [finishError, setFinishError] = useState('')
+  const [companyStepReady, setCompanyStepReady] = useState(initialCompanyConfigured)
+  const [taxTouched, setTaxTouched] = useState(false)
+  const [warehousesTouched, setWarehousesTouched] = useState(false)
+  const [productsImported, setProductsImported] = useState(productCount > 0)
   const [stockImported, setStockImported] = useState(false)
   const [nextPending, setNextPending] = useState(false)
 
@@ -110,17 +114,24 @@ export function OnboardingClient({
   const wcConnected = !!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secretMasked
   const shopifyConnected = !!shopifyCredentials.storeDomain && !!shopifyCredentials.accessTokenMasked
   const accountingConnected = accountingStatus.connected
+  const anyIntegrationsEnabled = plugins.woocommerce || plugins.shopify || plugins.xero || plugins.quickbooks
+  const hasAdditionalWarehouses = warehouses.length > 1
 
   function isStepReady(index: number) {
     const key = STEPS[index]?.key
-    if (key === 'company') return companyConfigured
+    if (key === 'company') return companyConfigured || companyStepReady
     if (key === 'currency') return currencyConfigured
+    if (key === 'tax') return taxTouched
     if (key === 'integrations') {
+      if (!anyIntegrationsEnabled) return false
       if (plugins.woocommerce && !wcConnected) return false
       if (plugins.shopify && !shopifyConnected) return false
       if ((plugins.xero || plugins.quickbooks) && !accountingConnected) return false
       return true
     }
+    if (key === 'warehouses') return hasAdditionalWarehouses || warehousesTouched
+    if (key === 'products') return productsImported
+    if (key === 'opening-stock') return stockImported
     return true
   }
 
@@ -160,9 +171,17 @@ export function OnboardingClient({
     }
   }
 
+  async function handleSkip() {
+    await goTo(Math.min(step + 1, STEPS.length - 1), { force: true })
+  }
+
   async function handleBack() {
     await goTo(Math.max(step - 1, 0))
   }
+
+  const handleCompanyReadyChange = useCallback((ready: boolean) => {
+    setCompanyStepReady(ready)
+  }, [])
 
   async function handleFinish() {
     setFinishing(true)
@@ -228,8 +247,10 @@ export function OnboardingClient({
               <CompanyStep
                 ref={companyStepRef}
                 org={org}
+                onReadyChange={handleCompanyReadyChange}
                 onSaved={() => {
                   setCompanyConfiguredOverride({ base: initialCompanyConfigured, value: true })
+                  setCompanyStepReady(true)
                   markComplete('company')
                 }}
               />
@@ -259,7 +280,7 @@ export function OnboardingClient({
                     for your business.
                   </p>
                 </div>
-                <TaxRatesTable taxRates={taxRates} />
+                <TaxRatesTable taxRates={taxRates} onChanged={() => setTaxTouched(true)} />
               </div>
             )}
 
@@ -285,7 +306,7 @@ export function OnboardingClient({
                     inventory in multiple places.
                   </p>
                 </div>
-                <WarehousesTable warehouses={warehouses} showStoreSync={false} />
+                <WarehousesTable warehouses={warehouses} showStoreSync={false} onChanged={() => setWarehousesTouched(true)} />
               </div>
             )}
 
@@ -294,6 +315,7 @@ export function OnboardingClient({
               <ProductsStep
                 shoppingConnectorEnabled={shoppingEnabled}
                 productCount={productCount}
+                onImported={() => setProductsImported(true)}
               />
             )}
 
@@ -426,11 +448,11 @@ export function OnboardingClient({
 
               <div className="flex items-center gap-2">
                 {currentStepDef.skippable && (
-                  <Button variant="ghost" onClick={handleNext}>
+                  <Button variant="ghost" onClick={handleSkip}>
                     Skip
                   </Button>
                 )}
-                <Button onClick={handleNext} disabled={isLast || nextPending || (step !== 1 && !canAdvanceFromCurrentStep())}>
+                <Button onClick={handleNext} disabled={isLast || nextPending || !canAdvanceFromCurrentStep()}>
                   {nextPending ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
                   Next
                   <ArrowRight className="h-4 w-4 ml-2" />

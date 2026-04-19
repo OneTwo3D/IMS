@@ -52,21 +52,37 @@ test.describe('admin workflows', () => {
 
   test('creates a warehouse from inventory settings', async ({ page }) => {
     const suffix = uniqueSuffix().slice(-6).toUpperCase()
-    const code = `E2W${suffix}`
-    const name = `E2E Warehouse ${suffix}`
+    const codeA = `E2W${suffix}A`
+    const nameA = `E2E Warehouse ${suffix} A`
+    const codeB = `E2W${suffix}B`
+    const nameB = `E2E Warehouse ${suffix} B`
 
     await page.goto('/settings/inventory')
     await page.getByRole('button', { name: /add warehouse/i }).click()
 
     const dialog = page.getByRole('dialog', { name: 'Add Warehouse' })
-    await dialog.locator('input').nth(0).fill(code)
-    await dialog.locator('input').nth(1).fill(name)
+    await dialog.locator('input').nth(0).fill(codeA)
+    await dialog.locator('input').nth(1).fill(nameA)
     await dialog.locator('input').nth(6).fill('Cambridge')
     await dialog.getByRole('button', { name: /create warehouse/i }).click()
 
     await expect(dialog).toBeHidden()
-    const row = page.getByRole('row').filter({ hasText: code }).first()
-    await expect(row).toContainText(name)
+    const rowA = page.getByRole('row').filter({ hasText: codeA }).first()
+    await expect(rowA).toContainText(nameA)
+
+    await page.getByRole('button', { name: /add warehouse/i }).click()
+    await expect(dialog.locator('input').nth(0)).toHaveValue('')
+    await expect(dialog.locator('input').nth(1)).toHaveValue('')
+    await expect(dialog.locator('input').nth(6)).toHaveValue('')
+
+    await dialog.locator('input').nth(0).fill(codeB)
+    await dialog.locator('input').nth(1).fill(nameB)
+    await dialog.locator('input').nth(6).fill('Oxford')
+    await dialog.getByRole('button', { name: /create warehouse/i }).click()
+
+    await expect(dialog).toBeHidden()
+    const rowB = page.getByRole('row').filter({ hasText: codeB }).first()
+    await expect(rowB).toContainText(nameB)
   })
 
   test('creates a user and verifies profile update plus password change', async ({ browser, page }) => {

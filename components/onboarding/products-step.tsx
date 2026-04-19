@@ -10,9 +10,10 @@ import { importProductsCsv } from '@/app/actions/import'
 type Props = {
   shoppingConnectorEnabled: boolean
   productCount: number
+  onImported?: () => void
 }
 
-export function ProductsStep({ shoppingConnectorEnabled, productCount }: Props) {
+export function ProductsStep({ shoppingConnectorEnabled, productCount, onImported }: Props) {
   const [imported, setImported] = useState(false)
 
   return (
@@ -57,7 +58,10 @@ export function ProductsStep({ shoppingConnectorEnabled, productCount }: Props) 
 
       <div className="space-y-3">
         <div className="flex items-center gap-3">
-          <CsvImportFlow action={importProductsCsv} onDone={() => setImported(true)}>
+          <CsvImportFlow action={importProductsCsv} onDone={() => {
+            setImported(true)
+            onImported?.()
+          }}>
             {({ busy, openFilePicker }) => (
               <Button variant="outline" onClick={openFilePicker} disabled={busy}>
                 <Package className="h-4 w-4 mr-2" />

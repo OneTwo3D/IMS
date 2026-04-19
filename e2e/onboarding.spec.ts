@@ -2,6 +2,8 @@ import { execFileSync } from 'node:child_process'
 import { expect, test, type Page } from '@playwright/test'
 import { uniqueSuffix } from './helpers'
 
+test.describe.configure({ mode: 'serial' })
+
 const databaseUrl = process.env.DATABASE_URL!
 
 function psql(query: string) {
@@ -64,13 +66,15 @@ test.describe('onboarding workflow', () => {
     await page.getByRole('link', { name: /complete setup/i }).click()
     await page.waitForURL('**/onboarding')
     await expect(page.getByRole('heading', { name: 'Company Details' })).toBeVisible()
+    await expect(page.getByRole('button', { name: /^Next$/ })).toBeDisabled()
 
     await inputForTextLabel(page, 'Company Name').fill(companyName)
+    await expect(page.getByRole('button', { name: /^Next$/ })).toBeEnabled()
     await page.getByRole('button', { name: /^Next$/ }).click()
 
     await expect(page.getByRole('heading', { name: 'Currency & Financial Year' })).toBeVisible()
     expect(psql(`select name from organisations where id = 'default' limit 1;`)).toBe(companyName)
-    expect(psql(`select value from settings where key = 'onboarding_current_step' limit 1;`)).toBe('2')
+    await expect.poll(() => psql(`select value from settings where key = 'onboarding_current_step' limit 1;`)).toBe('2')
   })
 
   test('admin can resume onboarding from the dashboard banner and complete the wizard', async ({ page }) => {
@@ -83,17 +87,23 @@ test.describe('onboarding workflow', () => {
     await page.waitForURL('**/onboarding')
     await expect(page.getByRole('heading', { name: 'Company Details' })).toBeVisible()
     await expect(page.getByRole('button', { name: 'All Done' })).toBeDisabled()
+    await expect(page.getByRole('button', { name: /^Next$/ })).toBeDisabled()
 
     await inputForTextLabel(page, 'Company Name').fill(companyName)
+    await expect(page.getByRole('button', { name: /^Next$/ })).toBeEnabled()
     await page.getByRole('button', { name: /^Next$/ }).click()
     await expect(page.getByRole('heading', { name: 'Currency & Financial Year' })).toBeVisible()
     await expect(page.getByText(/Base currency is locked to/i)).toBeVisible()
 
     await page.getByRole('button', { name: /^Next$/ }).click()
     await expect(page.getByRole('heading', { name: 'Tax Rates' })).toBeVisible()
+    await expect(page.getByRole('button', { name: /^Next$/ })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Skip' })).toBeEnabled()
 
     await page.getByRole('button', { name: 'Skip' }).click()
     await expect(page.getByRole('heading', { name: 'Integrations', exact: true })).toBeVisible()
+    await expect(page.getByRole('button', { name: /^Next$/ })).toBeDisabled()
+    await expect(page.getByRole('button', { name: 'Skip' })).toBeEnabled()
 
     await page.getByRole('button', { name: 'Skip' }).click()
     await expect(page.getByRole('heading', { name: 'Warehouses' }).first()).toBeVisible()

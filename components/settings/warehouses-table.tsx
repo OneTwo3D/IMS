@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Pencil, Trash2, Plus, Loader2, Warehouse } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -21,7 +21,7 @@ import {
   type WarehouseInput,
 } from '@/app/actions/settings'
 
-type Props = { warehouses: WarehouseRow[]; showStoreSync?: boolean }
+type Props = { warehouses: WarehouseRow[]; showStoreSync?: boolean; onChanged?: () => void }
 
 type WarehouseFormFields = Omit<WarehouseInput, 'syncToStore'> & {
   syncToStore: boolean
@@ -96,6 +96,12 @@ function WarehouseDialog({
   const [fields, setFields] = useState<WarehouseFormFields>(initial)
   const [pending, setPending] = useState(false)
   const [error, setError] = useState('')
+
+  useEffect(() => {
+    if (!open) return
+    setFields(initial)
+    setError('')
+  }, [initial, open])
 
   function set<K extends keyof WarehouseFormFields>(k: K, v: WarehouseFormFields[K]) {
     setFields((f) => ({ ...f, [k]: v }))
@@ -252,7 +258,7 @@ function WarehouseDialog({
 // Table
 // ---------------------------------------------------------------------------
 
-export function WarehousesTable({ warehouses: initial, showStoreSync = true }: Props) {
+export function WarehousesTable({ warehouses: initial, showStoreSync = true, onChanged }: Props) {
   const [warehouses, setWarehouses] = useState(initial)
   const [dialogOpen, setDialogOpen] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
@@ -272,6 +278,7 @@ export function WarehousesTable({ warehouses: initial, showStoreSync = true }: P
   }
 
   function handleSaved(item: WarehouseRow, isNew: boolean) {
+    onChanged?.()
     if (isNew) {
       setWarehouses((prev) => [...prev, item])
     } else {
@@ -299,9 +306,11 @@ export function WarehousesTable({ warehouses: initial, showStoreSync = true }: P
       if (result.deactivated) {
         // Update local state to show deactivated
         setWarehouses((prev) => prev.map((x) => x.id === w.id ? { ...x, active: false } : x))
+        onChanged?.()
         alert('Warehouse has associated data and was deactivated instead of deleted.')
       } else {
         setWarehouses((prev) => prev.filter((x) => x.id !== w.id))
+        onChanged?.()
       }
     } finally {
       setDeletingId(null)

@@ -57,16 +57,20 @@ test.describe('backup and notification workflows', () => {
     expect(seedResponse.ok()).toBeTruthy()
 
     await page.goto('/dashboard')
+    const badge = page.locator('button[aria-label="Notifications"] > span')
+    await expect(badge).toHaveText(/\d+/)
     await page.getByRole('button', { name: 'Notifications' }).click()
 
     await expect(page.getByText(ownedTitle, { exact: true })).toBeVisible()
     await expect(page.getByText(broadcastTitle, { exact: true })).toBeVisible()
 
     await page.getByText(ownedTitle, { exact: true }).click()
+    await page.getByRole('button', { name: /open related page/i }).click()
     await expect(page).toHaveURL(/\/profile$/)
 
     await page.getByRole('button', { name: 'Notifications' }).click()
     await page.getByRole('button', { name: /mark all as read/i }).click()
     await expect(page.getByRole('button', { name: /mark all as read/i })).toHaveCount(0)
+    await expect(badge).toHaveCount(0)
   })
 })
