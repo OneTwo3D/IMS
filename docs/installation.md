@@ -160,6 +160,15 @@ To update to a newer version:
 ```bash
 cd /opt/one-two-inventory
 
+# Preferred: run the bundled update script
+bash scripts/update.sh
+```
+
+Manual equivalent:
+
+```bash
+cd /opt/one-two-inventory
+
 # Pull latest code
 git pull origin main
 

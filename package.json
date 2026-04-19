@@ -1,6 +1,6 @@
 {
   "name": "onetwoinventory",
-  "version": "1.3.1",
+  "version": "1.4.0",
   "private": true,
   "engines": {
     "node": ">=22.0.0"

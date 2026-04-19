@@ -6,6 +6,19 @@ This repository uses an `x.y.z` release scheme.
 - Increment `y` for user-facing non-breaking changes.
 - Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
+## 1.4.0 - 2026-04-19
+
+### User-facing
+
+- Added a guided onboarding setup flow for fresh instances, including fixes for integration gating and hydration issues in the onboarding path.
+- Added opening stock CSV import by SKU and warehouse, with quantity and base unit cost validation.
+- Improved the Product Profitability report with pagination, column visibility controls, and better table scrolling for larger result sets.
+
+### Technical
+
+- Hardened FIFO, allocation, shipment, refund, and landed-cost accounting behavior across the commerce and Xero workflows.
+- Fixed multiple CSV import regressions and added onboarding E2E coverage for the new setup flow.
+
 ## 1.3.0 - 2026-04-16
 
 ### User-facing

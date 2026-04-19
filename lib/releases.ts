@@ -12,6 +12,22 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '1.4.0',
+    date: '2026-04-19',
+    title: 'Onboarding, opening stock import, and profitability usability',
+    summary: 'New instances now have a guided onboarding flow, opening stock can be imported directly by warehouse, and the product profitability report is easier to work with on larger datasets.',
+    userMessage: 'Onboarding is smoother for new installs, opening stock can be imported in bulk, and the product profitability report now has pagination, column visibility, and better scrolling.',
+    userHighlights: [
+      'Added a guided onboarding setup flow for new instances with tighter integration gating.',
+      'Added opening stock CSV import by SKU, warehouse, quantity, and base unit cost.',
+      'Improved the product profitability report with pagination, column visibility controls, and scroll behavior fixes.',
+    ],
+    technicalHighlights: [
+      'Hardened FIFO, allocation, refund, shipment, and landed-cost accounting flows across the Xero and commerce workflows.',
+      'Fixed CSV import regressions and added end-to-end onboarding coverage for the new setup workflow.',
+    ],
+  },
+  {
     version: '1.3.1',
     date: '2026-04-17',
     title: 'Bundle fulfillment hardening and help consolidation',
