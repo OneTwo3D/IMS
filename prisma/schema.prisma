@@ -1225,15 +1225,16 @@ model StockTransfer {
 }
 
 model StockTransferLine {
-  id          String        @id @default(cuid())
-  transferId  String
-  productId   String        // stored directly (no FK to Product to allow orphaned lines in audit)
-  sku         String
-  productName String        @default("")
-  qty         Decimal       @db.Decimal(12, 4)
-  qtyReceived Decimal       @db.Decimal(12, 4) @default(0)
+  id                String        @id @default(cuid())
+  transferId        String
+  productId         String        // stored directly (no FK to Product to allow orphaned lines in audit)
+  sku               String
+  productName       String        @default("")
+  qty               Decimal       @db.Decimal(12, 4)
+  qtyReceived       Decimal       @db.Decimal(12, 4) @default(0)
+  costLayerSnapshot Json?         // FIFO layers consumed at dispatch — used to recreate at destination on receipt
 
-  transfer    StockTransfer @relation(fields: [transferId], references: [id])
+  transfer          StockTransfer @relation(fields: [transferId], references: [id])
 
   @@index([transferId])
   @@map("stock_transfer_lines")

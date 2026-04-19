@@ -1,7 +1,7 @@
 'use server'
 
 import { db } from '@/lib/db'
-import { requireAuth } from '@/lib/auth/server'
+import { requirePermission } from '@/lib/auth/server'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -25,7 +25,7 @@ export type StockOnHandRow = {
 }
 
 export async function getStockOnHand(): Promise<StockOnHandRow[]> {
-  await requireAuth()
+  await requirePermission('analytics')
   const levels = await db.stockLevel.findMany({
     include: {
       product: { select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, lifecycleStatus: true } },
@@ -81,7 +81,7 @@ export type StockMovementRow = {
 }
 
 export async function getStockMovements(dateFrom?: string, dateTo?: string, limit = 500): Promise<StockMovementRow[]> {
-  await requireAuth()
+  await requirePermission('analytics')
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -135,7 +135,7 @@ export type StockAllocationRow = {
 }
 
 export async function getStockAllocations(): Promise<StockAllocationRow[]> {
-  await requireAuth()
+  await requirePermission('analytics')
   const levels = await db.stockLevel.findMany({
     where: { reservedQty: { gt: 0 } },
     include: {
@@ -187,7 +187,7 @@ export type ReorderRow = {
 }
 
 export async function getReorderInventory(): Promise<ReorderRow[]> {
-  await requireAuth()
+  await requirePermission('analytics')
   // Use the forecast engine
   const { generateForecasts } = await import('./forecasting')
   const forecasts = await generateForecasts()

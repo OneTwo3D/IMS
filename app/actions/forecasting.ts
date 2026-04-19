@@ -1,7 +1,7 @@
 'use server'
 
 import { db } from '@/lib/db'
-import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import { OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 
@@ -61,7 +61,7 @@ const DEFAULT_SETTINGS: ForecastSettings = {
 }
 
 export async function getForecastSettings(): Promise<ForecastSettings> {
-  await requireAuth()
+  await requirePermission('analytics')
   const [row, retentionRow] = await Promise.all([
     db.setting.findUnique({ where: { key: 'forecast_settings' } }),
     db.setting.findUnique({ where: { key: 'forecast_retention_months' } }),
@@ -132,7 +132,7 @@ function exponentialSmoothing(data: number[], alpha = 0.3): number {
 // ---------------------------------------------------------------------------
 
 export async function generateForecasts(): Promise<ProductForecast[]> {
-  await requireAuth()
+  await requirePermission('analytics')
   const settings = await getForecastSettings()
   const now = new Date()
   const reviewStart = new Date(now.getTime() - settings.reviewPeriodDays * 86400000)

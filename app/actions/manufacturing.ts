@@ -449,7 +449,8 @@ export async function updateManufacturingOrderStatus(
 ): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('manufacturing')
-    const order = await db.productionOrder.findUnique({
+    // Initial read for post-tx logging (non-authoritative — the tx re-reads under lock)
+    const orderPreview = await db.productionOrder.findUnique({
       where: { id },
       select: {
         reference: true,
@@ -468,17 +469,44 @@ export async function updateManufacturingOrderStatus(
         },
       },
     })
-    if (!order) return { success: false, error: 'Order not found.' }
+    if (!orderPreview) return { success: false, error: 'Order not found.' }
 
     const now = new Date()
-    const qtyPlanned = Number(order.qtyPlanned)
-    const isAssembly = order.orderType === 'ASSEMBLY'
+    const isAssembly = orderPreview.orderType === 'ASSEMBLY'
 
     // When completing: execute stock movements in a transaction
     if (status === 'COMPLETED') {
       await db.$transaction(async (tx) => {
-        const components = order.outputProduct.productComponents
+        // Lock the production order row and re-read inside the tx to
+        // prevent concurrent completion from duplicating stock mutations.
+        await tx.$executeRaw`SELECT id FROM production_orders WHERE id = ${id} FOR UPDATE`
+        const order = await tx.productionOrder.findUnique({
+          where: { id },
+          select: {
+            reference: true,
+            status: true,
+            orderType: true,
+            outputProductId: true,
+            warehouseId: true,
+            qtyPlanned: true,
+            outputProduct: {
+              select: {
+                sku: true,
+                productComponents: {
+                  select: { componentId: true, qty: true },
+                },
+              },
+            },
+          },
+        })
+        if (!order) throw new Error('Order not found')
+        if (order.status === 'COMPLETED') return // idempotent — already completed
+        if (order.status !== 'IN_PROGRESS' && order.status !== 'DRAFT') {
+          throw new Error(`Cannot complete a production order in ${order.status} status`)
+        }
 
+        const qtyPlanned = Number(order.qtyPlanned)
+        const components = order.outputProduct.productComponents
         const wasInProgress = order.status === 'IN_PROGRESS'
 
         if (isAssembly) {
@@ -611,58 +639,61 @@ export async function updateManufacturingOrderStatus(
       })
 
       // Log individual stock movements (fire-and-forget, after transaction)
+      // Use orderPreview for logging — the inner `order` is scoped to the tx
+      const qtyPlanned = Number(orderPreview.qtyPlanned)
       if (isAssembly) {
-        for (const comp of order.outputProduct.productComponents) {
+        for (const comp of orderPreview.outputProduct.productComponents) {
           const totalQty = Number(comp.qty) * qtyPlanned
           await logActivity({
             entityType: 'STOCK_ADJUSTMENT',
             entityId: comp.componentId,
             tag: 'stock',
             action: 'production_out',
-            description: `${order.reference}: consumed ${totalQty} units of component for ${order.outputProduct.sku} assembly`,
-            metadata: { movementType: 'PRODUCTION_OUT', qty: totalQty, warehouseId: order.warehouseId, moReference: order.reference },
+            description: `${orderPreview.reference}: consumed ${totalQty} units of component for ${orderPreview.outputProduct.sku} assembly`,
+            metadata: { movementType: 'PRODUCTION_OUT', qty: totalQty, warehouseId: orderPreview.warehouseId, moReference: orderPreview.reference },
           })
         }
         await logActivity({
           entityType: 'STOCK_ADJUSTMENT',
-          entityId: order.outputProductId,
+          entityId: orderPreview.outputProductId,
           tag: 'stock',
           action: 'production_in',
-          description: `${order.reference}: produced ${qtyPlanned} units of ${order.outputProduct.sku}`,
-          metadata: { movementType: 'PRODUCTION_IN', qty: qtyPlanned, warehouseId: order.warehouseId, moReference: order.reference },
+          description: `${orderPreview.reference}: produced ${qtyPlanned} units of ${orderPreview.outputProduct.sku}`,
+          metadata: { movementType: 'PRODUCTION_IN', qty: qtyPlanned, warehouseId: orderPreview.warehouseId, moReference: orderPreview.reference },
         })
       } else {
         await logActivity({
           entityType: 'STOCK_ADJUSTMENT',
-          entityId: order.outputProductId,
+          entityId: orderPreview.outputProductId,
           tag: 'stock',
           action: 'production_out',
-          description: `${order.reference}: disassembled ${qtyPlanned} units of ${order.outputProduct.sku}`,
-          metadata: { movementType: 'PRODUCTION_OUT', qty: qtyPlanned, warehouseId: order.warehouseId, moReference: order.reference },
+          description: `${orderPreview.reference}: disassembled ${qtyPlanned} units of ${orderPreview.outputProduct.sku}`,
+          metadata: { movementType: 'PRODUCTION_OUT', qty: qtyPlanned, warehouseId: orderPreview.warehouseId, moReference: orderPreview.reference },
         })
-        for (const comp of order.outputProduct.productComponents) {
+        for (const comp of orderPreview.outputProduct.productComponents) {
           const totalQty = Number(comp.qty) * qtyPlanned
           await logActivity({
             entityType: 'STOCK_ADJUSTMENT',
             entityId: comp.componentId,
             tag: 'stock',
             action: 'production_in',
-            description: `${order.reference}: recovered ${totalQty} units from disassembly of ${order.outputProduct.sku}`,
-            metadata: { movementType: 'PRODUCTION_IN', qty: totalQty, warehouseId: order.warehouseId, moReference: order.reference },
+            description: `${orderPreview.reference}: recovered ${totalQty} units from disassembly of ${orderPreview.outputProduct.sku}`,
+            metadata: { movementType: 'PRODUCTION_IN', qty: totalQty, warehouseId: orderPreview.warehouseId, moReference: orderPreview.reference },
           })
         }
       }
     } else if (status === 'IN_PROGRESS') {
+      const qtyPlanned = Number(orderPreview.qtyPlanned)
       // Check stock sufficiency before starting
       if (isAssembly) {
-        const componentIds = order.outputProduct.productComponents.map((c) => c.componentId)
+        const componentIds = orderPreview.outputProduct.productComponents.map((c) => c.componentId)
         const levels = await db.stockLevel.findMany({
-          where: { productId: { in: componentIds }, warehouseId: order.warehouseId },
+          where: { productId: { in: componentIds }, warehouseId: orderPreview.warehouseId },
           select: { productId: true, quantity: true, reservedQty: true },
         })
         const stockMap = new Map(levels.map((l) => [l.productId, Number(l.quantity) - Number(l.reservedQty)]))
         const insufficient: string[] = []
-        for (const comp of order.outputProduct.productComponents) {
+        for (const comp of orderPreview.outputProduct.productComponents) {
           const needed = Number(comp.qty) * qtyPlanned
           const available = stockMap.get(comp.componentId) ?? 0
           if (available < needed) {
@@ -675,7 +706,7 @@ export async function updateManufacturingOrderStatus(
       } else {
         // Disassembly: check output product stock
         const level = await db.stockLevel.findUnique({
-          where: { productId_warehouseId: { productId: order.outputProductId, warehouseId: order.warehouseId } },
+          where: { productId_warehouseId: { productId: orderPreview.outputProductId, warehouseId: orderPreview.warehouseId } },
           select: { quantity: true, reservedQty: true },
         })
         const available = level ? Number(level.quantity) - Number(level.reservedQty) : 0
@@ -687,18 +718,18 @@ export async function updateManufacturingOrderStatus(
       // Stock OK — reserve components and start
       await db.$transaction(async (tx) => {
         if (isAssembly) {
-          for (const comp of order.outputProduct.productComponents) {
+          for (const comp of orderPreview.outputProduct.productComponents) {
             const totalQty = Number(comp.qty) * qtyPlanned
             await tx.stockLevel.upsert({
-              where: { productId_warehouseId: { productId: comp.componentId, warehouseId: order.warehouseId } },
-              create: { productId: comp.componentId, warehouseId: order.warehouseId, quantity: 0, reservedQty: totalQty },
+              where: { productId_warehouseId: { productId: comp.componentId, warehouseId: orderPreview.warehouseId } },
+              create: { productId: comp.componentId, warehouseId: orderPreview.warehouseId, quantity: 0, reservedQty: totalQty },
               update: { reservedQty: { increment: totalQty } },
             })
           }
         } else {
           await tx.stockLevel.upsert({
-            where: { productId_warehouseId: { productId: order.outputProductId, warehouseId: order.warehouseId } },
-            create: { productId: order.outputProductId, warehouseId: order.warehouseId, quantity: 0, reservedQty: qtyPlanned },
+            where: { productId_warehouseId: { productId: orderPreview.outputProductId, warehouseId: orderPreview.warehouseId } },
+            create: { productId: orderPreview.outputProductId, warehouseId: orderPreview.warehouseId, quantity: 0, reservedQty: qtyPlanned },
             update: { reservedQty: { increment: qtyPlanned } },
           })
         }
@@ -707,41 +738,42 @@ export async function updateManufacturingOrderStatus(
 
       // Log stock reservations
       if (isAssembly) {
-        for (const comp of order.outputProduct.productComponents) {
+        for (const comp of orderPreview.outputProduct.productComponents) {
           const totalQty = Number(comp.qty) * qtyPlanned
           await logActivity({
             entityType: 'STOCK_ADJUSTMENT',
             entityId: comp.componentId,
             tag: 'stock',
             action: 'reserved',
-            description: `${order.reference}: reserved ${totalQty} units of component for ${order.outputProduct.sku} assembly`,
-            metadata: { qty: totalQty, warehouseId: order.warehouseId, moReference: order.reference },
+            description: `${orderPreview.reference}: reserved ${totalQty} units of component for ${orderPreview.outputProduct.sku} assembly`,
+            metadata: { qty: totalQty, warehouseId: orderPreview.warehouseId, moReference: orderPreview.reference },
           })
         }
       } else {
         await logActivity({
           entityType: 'STOCK_ADJUSTMENT',
-          entityId: order.outputProductId,
+          entityId: orderPreview.outputProductId,
           tag: 'stock',
           action: 'reserved',
-          description: `${order.reference}: reserved ${qtyPlanned} units of ${order.outputProduct.sku} for disassembly`,
-          metadata: { qty: qtyPlanned, warehouseId: order.warehouseId, moReference: order.reference },
+          description: `${orderPreview.reference}: reserved ${qtyPlanned} units of ${orderPreview.outputProduct.sku} for disassembly`,
+          metadata: { qty: qtyPlanned, warehouseId: orderPreview.warehouseId, moReference: orderPreview.reference },
         })
       }
-    } else if (status === 'CANCELLED' && order.status === 'IN_PROGRESS') {
+    } else if (status === 'CANCELLED' && orderPreview.status === 'IN_PROGRESS') {
+      const qtyPlanned = Number(orderPreview.qtyPlanned)
       // Release reservations when cancelling an in-progress order
       await db.$transaction(async (tx) => {
         if (isAssembly) {
-          for (const comp of order.outputProduct.productComponents) {
+          for (const comp of orderPreview.outputProduct.productComponents) {
             const totalQty = Number(comp.qty) * qtyPlanned
             await tx.stockLevel.update({
-              where: { productId_warehouseId: { productId: comp.componentId, warehouseId: order.warehouseId } },
+              where: { productId_warehouseId: { productId: comp.componentId, warehouseId: orderPreview.warehouseId } },
               data: { reservedQty: { decrement: totalQty } },
             })
           }
         } else {
           await tx.stockLevel.update({
-            where: { productId_warehouseId: { productId: order.outputProductId, warehouseId: order.warehouseId } },
+            where: { productId_warehouseId: { productId: orderPreview.outputProductId, warehouseId: orderPreview.warehouseId } },
             data: { reservedQty: { decrement: qtyPlanned } },
           })
         }
@@ -754,17 +786,18 @@ export async function updateManufacturingOrderStatus(
         entityId: id,
         tag: 'stock',
         action: 'reservation_released',
-        description: `${order.reference}: released stock reservations due to cancellation`,
-        metadata: { moReference: order.reference, warehouseId: order.warehouseId },
+        description: `${orderPreview.reference}: released stock reservations due to cancellation`,
+        metadata: { moReference: orderPreview.reference, warehouseId: orderPreview.warehouseId },
       })
     } else {
       // CANCELLED from DRAFT — no reservations to release
       await db.productionOrder.update({ where: { id }, data: { status } })
     }
 
+    const qtyPlannedLog = Number(orderPreview.qtyPlanned)
     const actionDesc = status === 'COMPLETED'
-      ? `Completed ${order.reference} — ${isAssembly ? 'assembled' : 'disassembled'} ${qtyPlanned} units of ${order.outputProduct.sku}, stock updated`
-      : `Updated ${order.reference} status to ${status}`
+      ? `Completed ${orderPreview.reference} — ${isAssembly ? 'assembled' : 'disassembled'} ${qtyPlannedLog} units of ${orderPreview.outputProduct.sku}, stock updated`
+      : `Updated ${orderPreview.reference} status to ${status}`
 
     await logActivity({
       entityType: 'PRODUCTION_ORDER',
@@ -772,7 +805,7 @@ export async function updateManufacturingOrderStatus(
       tag: 'manufacturing',
       action: 'status_changed',
       description: actionDesc,
-      metadata: status === 'COMPLETED' ? { orderType: order.orderType, qty: qtyPlanned, sku: order.outputProduct.sku } : undefined,
+      metadata: status === 'COMPLETED' ? { orderType: orderPreview.orderType, qty: qtyPlannedLog, sku: orderPreview.outputProduct.sku } : undefined,
     })
 
     revalidatePath('/manufacturing')
@@ -782,8 +815,8 @@ export async function updateManufacturingOrderStatus(
     try {
       await enqueueStockSync(
         [
-          order.outputProductId,
-          ...order.outputProduct.productComponents.map((comp) => comp.componentId),
+          orderPreview.outputProductId,
+          ...orderPreview.outputProduct.productComponents.map((comp) => comp.componentId),
         ],
         'IMS_CHANGE',
       )

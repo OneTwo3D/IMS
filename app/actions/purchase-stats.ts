@@ -1,7 +1,7 @@
 'use server'
 
 import { db } from '@/lib/db'
-import { requireAuth } from '@/lib/auth/server'
+import { requirePermission } from '@/lib/auth/server'
 
 // ---------------------------------------------------------------------------
 // Product purchase stats (Products tab)
@@ -29,7 +29,7 @@ export type PurchaseProductRow = {
 }
 
 export async function getPurchaseProductStats(dateFrom?: string, dateTo?: string): Promise<PurchaseProductRow[]> {
-  await requireAuth()
+  await requirePermission('analytics')
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -121,7 +121,7 @@ export type ReceivedGoodsRow = {
 }
 
 export async function getReceivedGoods(dateFrom?: string, dateTo?: string): Promise<ReceivedGoodsRow[]> {
-  await requireAuth()
+  await requirePermission('analytics')
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -187,7 +187,7 @@ export type BillRow = {
 }
 
 export async function getPurchaseBills(dateFrom?: string, dateTo?: string): Promise<BillRow[]> {
-  await requireAuth()
+  await requirePermission('analytics')
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -260,7 +260,7 @@ export type SupplierAgingRow = {
 }
 
 export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
-  await requireAuth()
+  await requirePermission('analytics')
   const suppliers = await db.supplier.findMany({
     where: { active: true },
     select: {
@@ -334,7 +334,7 @@ export type PurchaseDetailRow = {
 }
 
 export async function getPurchaseDetails(dateFrom?: string, dateTo?: string): Promise<PurchaseDetailRow[]> {
-  await requireAuth()
+  await requirePermission('analytics')
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')

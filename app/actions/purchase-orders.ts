@@ -1572,6 +1572,25 @@ export async function receivePurchaseOrder(
 
     const receiptRef = `RCP-${po.reference}-${Date.now().toString(36).toUpperCase()}`
     const freightPoIdsToRevalidate = await db.$transaction(async (tx) => {
+      // Lock the PO row to prevent concurrent receipts from over-receiving
+      await tx.$executeRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
+
+      // Re-validate outstanding qty under lock — the pre-tx check used a
+      // stale snapshot that concurrent receipts could have advanced past.
+      const lockedLines = await tx.purchaseOrderLine.findMany({
+        where: { poId: id },
+        select: { id: true, qty: true, qtyReceived: true },
+      })
+      const lockedLineMap = new Map(lockedLines.map((l) => [l.id, l]))
+      for (const rl of linesWithQty) {
+        const poLine = lockedLineMap.get(rl.poLineId)
+        if (!poLine) throw new Error('Invalid PO line')
+        const outstanding = Number(poLine.qty) - Number(poLine.qtyReceived)
+        if (rl.qtyReceived > outstanding) {
+          throw new Error(`Cannot receive more than outstanding qty (${outstanding}) for line ${rl.poLineId}`)
+        }
+      }
+
       await tx.purchaseReceipt.create({
         data: {
           poId: id,

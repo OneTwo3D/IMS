@@ -9,6 +9,7 @@ import { getWcCredentials as getConnectorWcCredentials } from '@/lib/connectors/
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
 import type { Prisma } from '@/app/generated/prisma/client'
+import { consumeFifoLayers, getAverageUnitCost } from '@/lib/cost-layers'
 
 // ---------------------------------------------------------------------------
 // Helpers for inventory adjustment accounting journal
@@ -187,6 +188,27 @@ export async function adjustStock(
         },
       })
 
+      // Maintain FIFO cost layers so valuation stays in sync with stock levels.
+      // Negative adjustments consume layers oldest-first (same as sale dispatch).
+      // Positive adjustments create a new layer at the current average unit cost.
+      if (isAddition) {
+        const avgCost = await getAverageUnitCost(tx, productId, warehouseId)
+        await tx.costLayer.create({
+          data: {
+            productId,
+            warehouseId,
+            receivedQty: Math.abs(qtyNum),
+            remainingQty: Math.abs(qtyNum),
+            unitCostBase: Math.round(avgCost * 1000000) / 1000000,
+            isOpeningStock: false,
+          },
+        })
+      } else {
+        // Tolerant consume — adjustment may exceed available FIFO layers
+        // (e.g. legacy stock with no layers). Shortfall is accepted.
+        await consumeFifoLayers(tx, productId, warehouseId, Math.abs(qtyNum))
+      }
+
       // Capture info for activity log
       const logProduct = await tx.product.findUnique({ where: { id: productId }, select: { sku: true } })
       const logWarehouse = await tx.warehouse.findUnique({ where: { id: warehouseId }, select: { name: true } })
@@ -325,6 +347,23 @@ export async function bulkAdjustStock(
           create: { productId, warehouseId, quantity: isAddition ? absQty : `-${absQty}` },
           update: { quantity: { increment: qty } },
         })
+
+        // FIFO layer bookkeeping — same logic as single adjustStock
+        if (isAddition) {
+          const avgCost = await getAverageUnitCost(tx, productId, warehouseId)
+          await tx.costLayer.create({
+            data: {
+              productId,
+              warehouseId,
+              receivedQty: Math.abs(qty),
+              remainingQty: Math.abs(qty),
+              unitCostBase: Math.round(avgCost * 1000000) / 1000000,
+              isOpeningStock: false,
+            },
+          })
+        } else {
+          await consumeFifoLayers(tx, productId, warehouseId, Math.abs(qty))
+        }
 
         // Accounting sync: only queue when the reason has an account code.
         // Reason accounts are configured in Settings → Inventory → Stock

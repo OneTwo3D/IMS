@@ -1,7 +1,7 @@
 'use server'
 
 import { db } from '@/lib/db'
-import { requireAuth } from '@/lib/auth/server'
+import { requirePermission } from '@/lib/auth/server'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -88,7 +88,7 @@ export async function getProductProfitability(): Promise<{
   rows: ProfitabilityRow[]
   summary: ProfitabilitySummary
 }> {
-  await requireAuth()
+  await requirePermission('analytics')
 
   // 1. Organisation FY settings
   const org = await db.organisation.findFirst({

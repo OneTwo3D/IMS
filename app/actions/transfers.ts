@@ -6,6 +6,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
+import { consumeFifoLayers, createCostLayer, type ConsumedLayer } from '@/lib/cost-layers'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -307,12 +308,20 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
   try {
     await requirePermission('stock_control.transfer')
     await db.$transaction(async (tx) => {
+      // Lock the transfer row to prevent concurrent dispatch
+      await tx.$executeRaw`SELECT id FROM stock_transfers WHERE id = ${id} FOR UPDATE`
       const transfer = await tx.stockTransfer.findUnique({
         where: { id },
         select: { ...TRANSFER_SELECT, status: true },
       })
       if (!transfer) throw new Error('Transfer not found')
       if (transfer.status !== 'DRAFT') throw new Error('Transfer is not in DRAFT status')
+
+      // Lock stock levels for all affected products in the source warehouse
+      const productIds = transfer.lines.map((l) => l.productId)
+      if (productIds.length > 0) {
+        await tx.$executeRaw`SELECT "productId", "warehouseId" FROM stock_levels WHERE "productId" = ANY(${productIds}::text[]) AND "warehouseId" = ${transfer.fromWarehouseId} FOR UPDATE`
+      }
 
       // Validate available stock for each line before making any changes
       for (const line of transfer.lines) {
@@ -327,7 +336,9 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
         }
       }
 
-      // Book stock out of source warehouse for each line
+      // Book stock out of source warehouse for each line, consuming FIFO
+      // layers and storing the snapshot so receiveTransfer can recreate
+      // equivalent layers at the destination warehouse.
       for (const line of transfer.lines) {
         const qty = Number(line.qty)
         await tx.stockMovement.create({
@@ -347,12 +358,31 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
           create: { productId: line.productId, warehouseId: transfer.fromWarehouseId, quantity: `-${qty}` },
           update: { quantity: { decrement: qty } },
         })
+
+        // Consume FIFO layers from source warehouse — tolerant mode
+        // (legacy stock may not have layers). Store consumed entries on
+        // the transfer line so receiveTransfer can split/recreate them.
+        const { consumed } = await consumeFifoLayers(tx, line.productId, transfer.fromWarehouseId, qty)
+        if (consumed.length > 0) {
+          await tx.stockTransferLine.update({
+            where: { id: line.id },
+            data: {
+              costLayerSnapshot: consumed.map((c) => ({
+                costLayerId: c.costLayerId,
+                qty: c.qty,
+                unitCostBase: c.unitCostBase,
+              })),
+            },
+          })
+        }
       }
 
-      await tx.stockTransfer.update({
-        where: { id },
+      // Conditional status update — only transitions from DRAFT
+      const updated = await tx.stockTransfer.updateMany({
+        where: { id, status: 'DRAFT' },
         data: { status: 'IN_TRANSIT', dispatchedAt: new Date() },
       })
+      if (updated.count === 0) throw new Error('Transfer was already dispatched')
     })
 
     revalidatePath('/stock-control/transfers')
@@ -415,12 +445,21 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
   try {
     await requirePermission('stock_control.transfer')
     await db.$transaction(async (tx) => {
+      // Lock the transfer row to prevent concurrent receive
+      await tx.$executeRaw`SELECT id FROM stock_transfers WHERE id = ${id} FOR UPDATE`
       const transfer = await tx.stockTransfer.findUnique({
         where: { id },
         select: { ...TRANSFER_SELECT, status: true },
       })
       if (!transfer) throw new Error('Transfer not found')
       if (transfer.status !== 'IN_TRANSIT') throw new Error('Transfer is not IN_TRANSIT')
+
+      // Load cost layer snapshots stored at dispatch time
+      const linesWithSnapshots = await tx.stockTransferLine.findMany({
+        where: { transferId: id },
+        select: { id: true, productId: true, costLayerSnapshot: true },
+      })
+      const snapshotByLineId = new Map(linesWithSnapshots.map((l) => [l.id, l.costLayerSnapshot]))
 
       for (const line of transfer.lines) {
         const qty = Number(line.qty)
@@ -441,6 +480,25 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
           create: { productId: line.productId, warehouseId: transfer.toWarehouseId, quantity: qty.toString() },
           update: { quantity: { increment: qty } },
         })
+
+        // Recreate FIFO layers at the destination warehouse from the
+        // snapshot stored at dispatch. Each consumed source layer becomes
+        // a new destination layer with the same unitCostBase, preserving
+        // FIFO provenance across warehouses.
+        const snapshot = snapshotByLineId.get(line.id)
+        if (Array.isArray(snapshot) && snapshot.length > 0) {
+          for (const entry of snapshot as ConsumedLayer[]) {
+            if (entry.qty > 0 && entry.unitCostBase >= 0) {
+              await createCostLayer(tx, {
+                productId: line.productId,
+                warehouseId: transfer.toWarehouseId,
+                qty: entry.qty,
+                unitCostBase: entry.unitCostBase,
+              })
+            }
+          }
+        }
+
         // Mark line as fully received
         await tx.stockTransferLine.update({
           where: { id: line.id },
@@ -448,10 +506,12 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
         })
       }
 
-      await tx.stockTransfer.update({
-        where: { id },
+      // Conditional status update — only transitions from IN_TRANSIT
+      const updated = await tx.stockTransfer.updateMany({
+        where: { id, status: 'IN_TRANSIT' },
         data: { status: 'RECEIVED', completedAt: new Date() },
       })
+      if (updated.count === 0) throw new Error('Transfer was already received')
     })
 
     revalidatePath('/stock-control/transfers')
