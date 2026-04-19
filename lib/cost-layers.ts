@@ -153,3 +153,70 @@ export async function createCostLayer(
   })
   return layer.id
 }
+
+// ---------------------------------------------------------------------------
+// Snapshot correction (retrospective landed cost adjustments)
+// ---------------------------------------------------------------------------
+
+/**
+ * When a cost layer's unitCostBase changes (e.g. landed cost arrives late),
+ * all frozen costLayerSnapshot JSON entries referencing that layer must be
+ * updated to reflect the new cost. Otherwise future refund reversals and
+ * accounting reads will use the stale pre-adjustment cost.
+ *
+ * Updates snapshots on: ShipmentLine, OrderAllocation, SalesOrderRefundLine,
+ * StockTransferLine — every model that carries a costLayerSnapshot.
+ */
+export async function updateSnapshotsForCostLayerChange(
+  tx: TxClient,
+  costLayerId: string,
+  newUnitCostBase: number,
+): Promise<number> {
+  // PostgreSQL jsonb_set can't easily iterate arrays. Use a raw UPDATE
+  // that rewrites the unitCostBase for every matching array element.
+  // The query: for each row whose costLayerSnapshot contains an entry
+  // with the given costLayerId, update that entry's unitCostBase.
+  //
+  // We use a CTE approach: load matching rows, rewrite the JSON array
+  // in application code, and update back. This is simpler and safer
+  // than raw jsonb manipulation for nested array-of-objects.
+
+  let updated = 0
+
+  const tables = [
+    { model: 'shipment_lines', idCol: 'id' },
+    { model: 'order_allocations', idCol: 'id' },
+    { model: 'sales_order_refund_lines', idCol: 'id' },
+    { model: 'stock_transfer_lines', idCol: 'id' },
+  ] as const
+
+  for (const table of tables) {
+    // Find rows whose snapshot JSON mentions this cost layer id
+    const rows = await tx.$queryRawUnsafe<Array<{ id: string; costLayerSnapshot: unknown }>>(
+      `SELECT id, "costLayerSnapshot" FROM "${table.model}" WHERE "costLayerSnapshot"::text LIKE $1`,
+      `%${costLayerId}%`,
+    )
+
+    for (const row of rows) {
+      if (!Array.isArray(row.costLayerSnapshot)) continue
+      let changed = false
+      const patched = (row.costLayerSnapshot as Array<Record<string, unknown>>).map((entry) => {
+        if (entry.costLayerId === costLayerId && entry.unitCostBase !== newUnitCostBase) {
+          changed = true
+          return { ...entry, unitCostBase: newUnitCostBase }
+        }
+        return entry
+      })
+      if (changed) {
+        await tx.$executeRawUnsafe(
+          `UPDATE "${table.model}" SET "costLayerSnapshot" = $1::jsonb WHERE id = $2`,
+          JSON.stringify(patched),
+          row.id,
+        )
+        updated++
+      }
+    }
+  }
+
+  return updated
+}

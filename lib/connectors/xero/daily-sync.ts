@@ -519,12 +519,14 @@ export async function runDailyBatchSync(): Promise<{
           orderId: true,
           warehouseId: true,
           createdAt: true,
+          cogsBatchAmount: true,
           lines: {
             select: {
               id: true,
               lineId: true,
               productId: true,
               qty: true,
+              costLayerSnapshot: true,
               line: {
                 select: { id: true, productId: true, qty: true, totalBase: true },
               },
@@ -704,56 +706,84 @@ export async function runDailyBatchSync(): Promise<{
             )
           }
 
-          // COGS: consume FIFO cost layers and track layer decrements so the
-          // inventory mutation is committed atomically with the sync log row.
-          const shipmentCostSnapshot: CostLayerSnapshotEntry[] = []
-          for (const sl of shipment.lines) {
-            let remainingQty = Number(sl.qty)
-            const matchingAllocations = orderAllocations.filter((allocation) => (
-              allocation.orderId === shipment.orderId
-              && allocation.lineId === sl.lineId
-              && allocation.productId === sl.productId
-              && allocation.warehouseId === shipment.warehouseId
-            ))
+          // COGS: read pre-computed cost layer snapshots from shipment
+          // lines. FIFO layer consumption now happens at shipment dispatch
+          // time (allocation.ts), so Group B is accounting-only — it reads
+          // immutable snapshots and posts the journal without mutating
+          // inventory state. This eliminates the race window between
+          // shipment and batch where other layer-consuming workflows
+          // could invalidate or double-consume layers.
+          const shipmentCogs = Number(shipment.cogsBatchAmount ?? 0)
+          // If cogsBatchAmount is zero but lines have snapshots, recompute
+          // from snapshots (handles legacy shipments dispatched before this
+          // change was deployed).
+          const recomputedCogs = shipmentCogs > 0
+            ? shipmentCogs
+            : round2(shipment.lines.reduce((sum, sl) => {
+                const snapshot = parseCostLayerSnapshot(sl.costLayerSnapshot)
+                return sum + sumCostLayerSnapshot(snapshot)
+              }, 0))
 
-            for (const allocation of matchingAllocations) {
-              if (remainingQty <= 0) break
-              const availableEntries = allocationAvailability.get(allocation.id) ?? []
-              const consumed = takeFromSnapshotEntries(availableEntries, remainingQty, {
-                orderAllocationId: allocation.id,
-                shipmentLineId: sl.id,
-                source: 'shipment',
-              })
-              shipmentCostSnapshot.push(...consumed.taken)
-              remainingQty = consumed.remainingQty
-              allocationAvailability.set(
-                allocation.id,
-                reduceSnapshotByCostLayer(
-                  availableEntries,
-                  consumed.taken.map((entry) => ({ costLayerId: entry.costLayerId, qty: entry.qty })),
-                ),
+          // If no pre-computed COGS and no snapshots, fall back to the
+          // legacy allocation-based consumption path for backward compat.
+          if (recomputedCogs <= 0) {
+            const shipmentCostSnapshot: CostLayerSnapshotEntry[] = []
+            for (const sl of shipment.lines) {
+              let remainingQty = Number(sl.qty)
+              const matchingAllocations = orderAllocations.filter((allocation) => (
+                allocation.orderId === shipment.orderId
+                && allocation.lineId === sl.lineId
+                && allocation.productId === sl.productId
+                && allocation.warehouseId === shipment.warehouseId
+              ))
+
+              for (const allocation of matchingAllocations) {
+                if (remainingQty <= 0) break
+                const availableEntries = allocationAvailability.get(allocation.id) ?? []
+                const consumed = takeFromSnapshotEntries(availableEntries, remainingQty, {
+                  orderAllocationId: allocation.id,
+                  shipmentLineId: sl.id,
+                  source: 'shipment',
+                })
+                shipmentCostSnapshot.push(...consumed.taken)
+                remainingQty = consumed.remainingQty
+                allocationAvailability.set(
+                  allocation.id,
+                  reduceSnapshotByCostLayer(
+                    availableEntries,
+                    consumed.taken.map((entry) => ({ costLayerId: entry.costLayerId, qty: entry.qty })),
+                  ),
+                )
+              }
+
+              if (remainingQty > 0.0000001) {
+                throw new Error(`Missing allocated cost layers for shipment line ${sl.id}`)
+              }
+            }
+
+            for (const entry of shipmentCostSnapshot) {
+              layerDecrements.set(entry.costLayerId, (layerDecrements.get(entry.costLayerId) ?? 0) + entry.qty)
+            }
+
+            const legacyCogs = round2(sumCostLayerSnapshot(shipmentCostSnapshot))
+            totalRevenue += revenueProportion
+            totalCogs += legacyCogs
+            runningRevenue += revenueProportion
+            shipmentResults.set(shipment.id, { revenue: revenueProportion, cogs: legacyCogs })
+            for (const sl of shipment.lines) {
+              shipmentSnapshots.set(
+                sl.id,
+                shipmentCostSnapshot.filter((entry) => entry.shipmentLineId === sl.id),
               )
             }
-
-            if (remainingQty > 0.0000001) {
-              throw new Error(`Missing allocated cost layers for shipment line ${sl.id}`)
-            }
-          }
-
-          for (const entry of shipmentCostSnapshot) {
-            layerDecrements.set(entry.costLayerId, (layerDecrements.get(entry.costLayerId) ?? 0) + entry.qty)
-          }
-
-          const shipmentCogs = round2(sumCostLayerSnapshot(shipmentCostSnapshot))
-          totalRevenue += revenueProportion
-          totalCogs += shipmentCogs
-          runningRevenue += revenueProportion
-          shipmentResults.set(shipment.id, { revenue: revenueProportion, cogs: shipmentCogs })
-          for (const sl of shipment.lines) {
-            shipmentSnapshots.set(
-              sl.id,
-              shipmentCostSnapshot.filter((entry) => entry.shipmentLineId === sl.id),
-            )
+          } else {
+            // Pre-computed path — snapshots already stored on shipment lines
+            totalRevenue += revenueProportion
+            totalCogs += recomputedCogs
+            runningRevenue += revenueProportion
+            shipmentResults.set(shipment.id, { revenue: revenueProportion, cogs: recomputedCogs })
+            // Snapshots are already on the shipment lines — no need to
+            // write them again or track layerDecrements (already consumed)
           }
         }
         } catch (orderError) {

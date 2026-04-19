@@ -20,6 +20,7 @@ import {
   listFulfillmentLeafProductIds,
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
+import { consumeFifoLayers } from '@/lib/cost-layers'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 const ALLOCATION_EPSILON = 0.000001
@@ -1136,7 +1137,7 @@ export async function updateShipmentStatus(
       where: { id: shipmentId },
       include: {
         order: { select: { id: true, orderNumber: true, externalOrderNumber: true, status: true } },
-        lines: { select: { lineId: true, productId: true, qty: true, product: { select: { sku: true } } } },
+        lines: { select: { id: true, lineId: true, productId: true, qty: true, product: { select: { sku: true } } } },
         warehouse: { select: { code: true } },
       },
     })
@@ -1196,6 +1197,7 @@ export async function updateShipmentStatus(
           [...new Set(shipment.lines.map((line) => line.productId))],
           [shipment.warehouseId],
         )
+        let totalShipmentCogs = 0
         for (const line of shipment.lines) {
           const qty = Number(line.qty)
           await tx.stockLevel.updateMany({
@@ -1217,7 +1219,38 @@ export async function updateShipmentStatus(
               referenceId: shipment.orderId,
             },
           })
+
+          // Consume FIFO cost layers at shipment time so inventory
+          // valuation is immediately correct and the daily batch (Group B)
+          // can read pre-computed snapshots instead of mutating layers.
+          // Tolerant mode — legacy stock without layers won't block shipment.
+          const { consumed, totalCost } = await consumeFifoLayers(
+            tx, line.productId, shipment.warehouseId, qty,
+          )
+          totalShipmentCogs += totalCost
+          if (consumed.length > 0) {
+            await tx.shipmentLine.update({
+              where: { id: line.id },
+              data: {
+                costLayerSnapshot: consumed.map((c) => ({
+                  costLayerId: c.costLayerId,
+                  qty: c.qty,
+                  unitCostBase: c.unitCostBase,
+                })),
+              },
+            })
+          }
         }
+
+        // Store pre-computed COGS on the shipment so Group B can read
+        // it directly without re-consuming layers.
+        if (totalShipmentCogs > 0) {
+          await tx.shipment.update({
+            where: { id: shipmentId },
+            data: { cogsBatchAmount: Math.round(totalShipmentCogs * 100) / 100 },
+          })
+        }
+
         return true
       }, STOCK_TX_OPTIONS)
 
