@@ -12,6 +12,7 @@ import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
@@ -38,6 +39,7 @@ type RefundReturnRow = {
   qty: number
   unitCostBase?: number
   poLineId?: string | null
+  sourceCostLayerId?: string | null
 }
 
 type RefundRequestLine = {
@@ -45,6 +47,7 @@ type RefundRequestLine = {
   productId: string | null
   description: string
   qty: number
+  totalForeign?: number | null
   totalBase: number
 }
 
@@ -264,6 +267,11 @@ async function applyRefundReturnStock(
           unitCostBase: row.unitCostBase,
           poLineId: row.poLineId ?? null,
         },
+        select: { id: true },
+      }).then(async (newLayer) => {
+        if (row.sourceCostLayerId) {
+          await copyCostLayerSourceLinesProportionally(tx, row.sourceCostLayerId, newLayer.id, row.qty)
+        }
       })
     }
   }, STOCK_TX_OPTIONS)
@@ -1004,56 +1012,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     // until they are finalised via updateSalesOrderStatus.
     if (!input.isDraft) {
       try {
-        const settings = await getAccountingSettings()
-        // The accounting payload uses a generic `lineAmountsIncludeTax`
-        // flag — each connector maps this to its native convention. When
-        // inclVat, shipping and discount must be sent GROSS. Our DB stores
-        // shipping NET and the raw order discount (gross when inclVat) so
-        // we reconstruct the right values here.
-        const discountBase = Math.round(((input.orderDiscountForeign ?? 0) / fxRate) * 100) / 100
-        const shippingGrossForeign = shippingInclVat ? totalShippingInput : totalShippingForeign
-        const shippingSendBase = round4(shippingGrossForeign / fxRate)
-        // Manual invoice prefix comes from unified numbering settings
-        const manualPrefix = numbering.inv_prefix
-        await queueAccountingSync({
-          type: 'SALES_INVOICE',
-          referenceType: 'SalesOrder',
-          referenceId: so.id,
-          payload: {
-            invoiceNumber: `${manualPrefix}${orderNumber}`,
-            contactName: input.customerName,
-            contactEmail: input.customerEmail || undefined,
-            date: new Date().toISOString().slice(0, 10),
-            currency: input.currency,
-            reference: orderNumber,
-            lines: lineData.map((l, idx) => {
-              // Pass the raw per-line discount amount (in GBP) through.
-              // Each accounting connector decides how to represent it
-              // natively (rate vs. amount, sales vs. bill, etc.).
-              const discAmtBase = Number(l.discountAmount ?? 0) / fxRate
-              return {
-                itemCode: l.sku ?? undefined,
-                description: l.description ?? l.sku ?? 'Item',
-                quantity: l.qty,
-                // unitPriceBase holds the user-entered price (gross when inclVat)
-                // which matches lineAmountsIncludeTax.
-                unitAmount: Number(l.unitPriceBase),
-                accountCode: settings.salesAccount,
-                taxType: lineResolved[idx]?.accountingTaxType ?? orderDefaultCtx.accountingTaxType ?? undefined,
-                discountAmount: discAmtBase > 0 ? Math.round(discAmtBase * 10000) / 10000 : undefined,
-              }
-            }),
-            shippingAmount: shippingSendBase > 0 ? shippingSendBase : undefined,
-            shippingDescription: 'Shipping',
-            shippingAccountCode: settings.shippingAccount || undefined,
-            shippingTaxType: orderDefaultCtx.accountingTaxType ?? undefined,
-            discountAmount: discountBase > 0 ? discountBase : undefined,
-            discountAccountCode: settings.discountAccount || undefined,
-            discountTaxType: orderDefaultCtx.accountingTaxType ?? undefined,
-            lineAmountsIncludeTax: inclVat,
-            _postingMode: 'draft',
-          },
-        })
+        await queueSalesInvoiceForOrder(so.id)
       } catch { /* Accounting queue errors should never block the main flow */ }
     }
 
@@ -1395,7 +1354,7 @@ export async function createRefund(
 
     type CreatedRefundLine = {
       id: string; productId: string | null; description: string
-      qty: number; unitPriceBase: number; totalBase: number
+      qty: number; unitPriceForeign: number; unitPriceBase: number; totalForeign: number; totalBase: number
     }
 
     const txResult = await db.$transaction(async (tx) => {
@@ -1491,21 +1450,38 @@ export async function createRefund(
 
       const createdRefundLines: CreatedRefundLine[] = []
       for (const refundLine of refundLines) {
+        const totalForeign = refundLine.totalForeign != null
+          ? Math.round(refundLine.totalForeign * 10000) / 10000
+          : Math.round(refundLine.totalBase * fxRate * 10000) / 10000
         const createdLine = await tx.salesOrderRefundLine.create({
           data: {
             refundId: createdRefund.id,
             productId: refundLine.productId,
             description: refundLine.description,
             qty: refundLine.qty,
+            unitPriceForeign: refundLine.qty > 0 ? totalForeign / refundLine.qty : 0,
             unitPriceBase: refundLine.qty > 0 ? refundLine.totalBase / refundLine.qty : 0,
+            totalForeign,
             totalBase: refundLine.totalBase,
           },
-          select: { id: true, productId: true, description: true, qty: true, unitPriceBase: true, totalBase: true },
+          select: {
+            id: true,
+            productId: true,
+            description: true,
+            qty: true,
+            unitPriceForeign: true,
+            unitPriceBase: true,
+            totalForeign: true,
+            totalBase: true,
+          },
         })
         createdRefundLines.push({
           id: createdLine.id, productId: createdLine.productId,
           description: createdLine.description,
-          qty: Number(createdLine.qty), unitPriceBase: Number(createdLine.unitPriceBase),
+          qty: Number(createdLine.qty),
+          unitPriceForeign: Number(createdLine.unitPriceForeign),
+          unitPriceBase: Number(createdLine.unitPriceBase),
+          totalForeign: Number(createdLine.totalForeign),
           totalBase: Number(createdLine.totalBase),
         })
       }
@@ -1521,7 +1497,7 @@ export async function createRefund(
 
     if ('error' in txResult) return { success: false, error: txResult.error }
 
-    const { so, fxRate, createdRefund, createdRefundLines, creditNoteNumber, newStatus } = txResult
+    const { so, createdRefund, createdRefundLines, creditNoteNumber, newStatus } = txResult
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
@@ -1569,7 +1545,7 @@ export async function createRefund(
             quantity: l.qty > 0 ? l.qty : 1,
             unitAmount: orderForCN?.currency === baseCurrency
               ? (l.qty > 0 ? l.unitPriceBase : l.totalBase)
-              : Math.round((l.qty > 0 ? l.unitPriceBase : l.totalBase) * fxRate * 10000) / 10000,
+              : (l.qty > 0 ? l.unitPriceForeign : l.totalForeign),
             accountCode: settings.salesAccount,
             taxType: cnTaxRate?.accountingTaxType ?? undefined,
           })),
@@ -1588,13 +1564,7 @@ export async function createRefund(
       const orderRef = getSalesOrderReference(so)
 
       if (so.revenueDeferredDate) {
-        const vatPct = Number(so.taxRatePercent ?? 0)
-        const pricesIncludeVat = !!so.pricesIncludeVat && vatPct > 0
-        const toNetRevenue = (grossAmountBase: number): number => (
-          pricesIncludeVat
-            ? Math.round((grossAmountBase / (1 + vatPct)) * 100) / 100
-            : Math.round(grossAmountBase * 100) / 100
-        )
+        const toNetRevenue = (amountBase: number): number => Math.round(amountBase * 100) / 100
 
         const refundRevenue = Math.round(createdRefundLines.reduce((sum, line) => sum + toNetRevenue(line.totalBase), 0) * 100) / 100
         const reversalAmounts = await db.$transaction(async (tx) => {
@@ -2011,6 +1981,7 @@ export async function createRefund(
                   qty: entry.qty,
                   unitCostBase: entry.unitCostBase,
                   poLineId: poLineIdByCostLayerId.get(entry.costLayerId) ?? null,
+                  sourceCostLayerId: entry.costLayerId,
                 }]
               })
             ))

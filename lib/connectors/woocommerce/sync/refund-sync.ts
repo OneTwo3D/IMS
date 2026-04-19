@@ -45,7 +45,14 @@ export async function syncWcRefund(
     const hasQtyRefund = wcRefund.line_items.some((l) => Math.abs(l.quantity) > 0)
 
     // Map refund lines
-    const refundLines: { lineId?: string; productId: string | null; description: string; qty: number; totalBase: number }[] = []
+    const refundLines: {
+      lineId?: string
+      productId: string | null
+      description: string
+      qty: number
+      totalForeign?: number
+      totalBase: number
+    }[] = []
 
     if (wcRefund.line_items.length > 0 && hasQtyRefund) {
       // Line-item refund with quantities
@@ -63,6 +70,7 @@ export async function syncWcRefund(
           productId: imsLine?.productId ?? null,
           description: rl.name || imsLine?.description || 'Refund item',
           qty,
+          totalForeign: refundTotal,
           totalBase: refundGbp,
         })
       }
@@ -73,6 +81,7 @@ export async function syncWcRefund(
         productId: null,
         description: wcRefund.reason || 'WooCommerce refund',
         qty: 0,
+        totalForeign: refundAmountForeign,
         totalBase: Math.round((refundAmountForeign / fxRate) * 10000) / 10000,
       })
     }

@@ -8,7 +8,7 @@ import { wcFetch } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems, mapWcOrderDiscount,
-  mapWcShipping, resolveWcTaxRateById, getFxRateToGbp,
+  mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp,
 } from './field-mapping'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
@@ -75,32 +75,23 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const currency = wcOrder.currency || 'GBP'
     const fxRate = await getFxRateToGbp(currency)
 
-    // Primary (order-level) tax rate — looked up from the WC tax_lines
-    // summary; this is the "default" rate stored on the order and used for
-    // shipping / discount VAT.
-    const primaryWcRateId =
-      wcOrder.tax_lines?.[0]?.rate_id ??
-      wcOrder.line_items?.[0]?.taxes?.[0]?.id ??
-      null
-    const {
-      taxRateId: orderDefaultTaxRateId,
-      taxRateName,
-      taxRateValue,
-      accountingTaxType,
-    } = await resolveWcTaxRateById(primaryWcRateId)
     const pricesIncludeVat = wcOrder.prices_include_tax
 
     // Line items (each one may carry its own externalTaxRateId)
-    const mappedLines = await mapWcLineItems(wcOrder.line_items, fxRate)
+    const mappedLines = [
+      ...(await mapWcLineItems(wcOrder.line_items, fxRate)),
+      ...mapWcFeeLines(wcOrder.fee_lines),
+    ]
 
     // --- Per-line tax resolution --------------------------------------
     // 1. Where WC sent a per-line tax rate id, trust it (WC computed it
     //    server-side including shipping-country logic).
     // 2. Otherwise, fall back to the IMS resolver on (productCategory,
     //    shippingCountry, SALES).
-    const distinctWcRateIds = Array.from(
-      new Set(mappedLines.map((l) => l.externalTaxRateId).filter((x): x is number => typeof x === 'number')),
-    )
+    const distinctWcRateIds = Array.from(new Set([
+      ...mappedLines.map((l) => l.externalTaxRateId).filter((x): x is number => typeof x === 'number'),
+      ...wcOrder.tax_lines.map((line) => line.rate_id).filter((x): x is number => typeof x === 'number'),
+    ]))
     const wcResolvedById = new Map<
       number,
       { taxRateId: string | null; taxRateName: string | null; taxRateValue: number; accountingTaxType: string | null }
@@ -108,6 +99,21 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     for (const id of distinctWcRateIds) {
       wcResolvedById.set(id, await resolveWcTaxRateById(id))
     }
+
+    const orderLevelRates = wcOrder.tax_lines
+      .map((line) => wcResolvedById.get(line.rate_id))
+      .filter((rate): rate is NonNullable<typeof rate> => rate != null)
+    const resolvedOrderDefault =
+      orderLevelRates.find((rate) => /standard/i.test(rate.taxRateName ?? ''))
+      ?? [...orderLevelRates].sort((a, b) => b.taxRateValue - a.taxRateValue)[0]
+      ?? [...wcResolvedById.values()].sort((a, b) => b.taxRateValue - a.taxRateValue)[0]
+      ?? await resolveWcTaxRateById(null)
+    const {
+      taxRateId: orderDefaultTaxRateId,
+      taxRateName,
+      taxRateValue,
+      accountingTaxType,
+    } = resolvedOrderDefault
 
     // Load product categories for lines that need the resolver fallback.
     const productIds = Array.from(
@@ -148,6 +154,14 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     )
 
     const lineTaxResolved = mappedLines.map((l, idx) => {
+      if (l.forceNoTax) {
+        return {
+          taxRateId: null,
+          taxRateName: null,
+          taxRateValue: 0,
+          accountingTaxType: null,
+        }
+      }
       if (l.externalTaxRateId != null) {
         const wc = wcResolvedById.get(l.externalTaxRateId)
         if (wc) return wc
@@ -178,8 +192,11 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const shipping = mapWcShipping(wcOrder)
     const shippingForeign = shipping.shippingForeign
 
-    // Tax totals from WC (more accurate than recalculating)
-    const taxForeign = parseFloat(wcOrder.total_tax) || 0
+    const shippingTaxForeign = wcOrder.shipping_lines.reduce(
+      (sum, line) => sum + (parseFloat(line.total_tax) || 0),
+      0,
+    )
+    const taxForeign = mappedLines.reduce((sum, line) => sum + line.taxForeign, 0) + shippingTaxForeign
     const totalForeign = parseFloat(wcOrder.total) || 0
 
     // GBP conversions
@@ -263,7 +280,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           taxRateName,
           taxRatePercent: taxRateValue > 0 ? taxRateValue : null,
           taxForeign,
-          pricesIncludeVat: !!pricesIncludeVat && taxRateValue > 0,
+          pricesIncludeVat: !!pricesIncludeVat,
           totalForeign,
           subtotalBase,
           shippingBase,
@@ -326,18 +343,16 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     try {
       const { queueAccountingSync, getAccountingSettings } = await import('@/lib/accounting')
       const settings = await getAccountingSettings()
-      const fxRateNum = Number(fxRate) || 1
       // WC stores shipping_total already NET; line prices may be gross when
       // the WC store is configured with prices_include_tax. Send everything
       // to Xero as tax-inclusive when WC was inclusive so gross line prices
       // are interpreted correctly — shipping is converted to gross first to
       // stay consistent with the LineAmountTypes flag.
       const vatMultiplier = 1 + (taxRateValue || 0)
-      const shippingNetGbp = shippingForeign > 0 ? shippingForeign / fxRateNum : 0
-      const shippingSendForeign = pricesIncludeVat ? shippingNetGbp * vatMultiplier * fxRateNum : shippingForeign
-      // WC coupon discounts in `discount_total` are NET when prices_include_tax
-      // is false, and GROSS when true — mapWcOrderDiscount stores the raw
-      // value so pass it through in the same inclusive/exclusive mode.
+      const shippingSendForeign = pricesIncludeVat ? shippingForeign * vatMultiplier : shippingForeign
+      // WooCommerce coupon discounts are imported exactly as stored on the
+      // order so the accounting connector sees the original order-currency
+      // discount amount without a base-currency round-trip.
       await queueAccountingSync({
         type: 'SALES_INVOICE',
         referenceType: 'SalesOrder',
@@ -350,12 +365,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           currency,
           reference: orderNumber,
           lines: lineData.map((l, idx) => ({
-            itemCode: l.sku ?? undefined,
+            itemCode: l.productId ? (l.sku || undefined) : undefined,
             description: l.description ?? l.sku ?? 'Item',
             quantity: l.qty,
             unitAmount: l.unitPriceForeign,
             accountCode: settings.salesAccount,
             taxType: lineTaxResolved[idx]?.accountingTaxType ?? accountingTaxType ?? undefined,
+            discountAmount: l.discountAmount > 0 ? Math.round(l.discountAmount * 10000) / 10000 : undefined,
           })),
           shippingAmount: shippingSendForeign > 0 ? Math.round(shippingSendForeign * 10000) / 10000 : undefined,
           shippingDescription: 'Shipping',

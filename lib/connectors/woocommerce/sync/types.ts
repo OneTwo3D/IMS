@@ -52,8 +52,10 @@ export type WcCouponLine = {
 export type WcFeeLine = {
   id: number
   name: string
+  tax_class?: string
   total: string
   total_tax: string
+  taxes?: { id: number; total: string }[]
 }
 
 export type WcTaxLine = {

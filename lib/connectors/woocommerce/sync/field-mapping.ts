@@ -3,7 +3,7 @@
  */
 
 import { db } from '@/lib/db'
-import type { WcAddress, WcFullOrder, WcLineItem, WcCouponLine } from './types'
+import type { WcAddress, WcFullOrder, WcLineItem, WcCouponLine, WcFeeLine } from './types'
 
 // ---------------------------------------------------------------------------
 // Address mapping
@@ -113,14 +113,15 @@ export type MappedLine = {
   unitPriceForeign: number
   discountAmount: number
   discountStr: string | null
-  externalLineItemId: number
   taxForeign: number
+  forceNoTax?: boolean
   /**
    * WC's own tax rate id for this line (from `line_items[].taxes[0].id`).
    * Null when the WC payload doesn't include a per-line tax entry — in that
    * case the IMS resolver is used as a fallback.
    */
   externalTaxRateId: number | null
+  externalLineItemId: number | null
 }
 
 export async function mapWcLineItems(
@@ -152,11 +153,36 @@ export async function mapWcLineItems(
       unitPriceForeign: Math.round(unitPrice * 1000000) / 1000000,
       discountAmount: Math.round(lineDiscount * 10000) / 10000,
       discountStr: lineDiscount > 0 ? lineDiscount.toFixed(2) : null,
-      externalLineItemId: item.id,
       taxForeign: Math.round(tax * 10000) / 10000,
       externalTaxRateId: typeof externalTaxRateId === 'number' && externalTaxRateId > 0 ? externalTaxRateId : null,
+      externalLineItemId: item.id,
     }
   })
+}
+
+export function mapWcFeeLines(feeLines: WcFeeLine[]): MappedLine[] {
+  const mapped: Array<MappedLine | null> = feeLines
+    .map((feeLine) => {
+      const total = parseFloat(feeLine.total) || 0
+      const tax = parseFloat(feeLine.total_tax) || 0
+      const externalTaxRateId = feeLine.taxes?.[0]?.id ?? null
+      if (Math.abs(total) <= 0.000001 && Math.abs(tax) <= 0.000001) return null
+
+      return {
+        productId: null,
+        sku: '',
+        description: feeLine.name || 'Fee',
+        qty: 1,
+        unitPriceForeign: Math.round(total * 1000000) / 1000000,
+        discountAmount: 0,
+        discountStr: null,
+        taxForeign: Math.round(tax * 10000) / 10000,
+        forceNoTax: tax <= 0.000001 && !externalTaxRateId,
+        externalTaxRateId: typeof externalTaxRateId === 'number' && externalTaxRateId > 0 ? externalTaxRateId : null,
+        externalLineItemId: null,
+      }
+    })
+  return mapped.filter((line): line is MappedLine => line !== null)
 }
 
 // ---------------------------------------------------------------------------
@@ -187,16 +213,11 @@ export function mapWcShipping(order: WcFullOrder): {
   shippingForeign: number
 } {
   const totalShipping = parseFloat(order.shipping_total) || 0
-  const totalFees = order.fee_lines.reduce((sum, feeLine) => sum + (parseFloat(feeLine.total) || 0), 0)
-  const labels = [
-    order.shipping_lines[0]?.method_title ?? null,
-    ...order.fee_lines.map((feeLine) => feeLine.name || null),
-  ].filter((value): value is string => !!value)
-  const methodTitle = labels.length > 0 ? labels.join(' + ') : null
+  const methodTitle = order.shipping_lines[0]?.method_title ?? null
 
   return {
     shippingService: methodTitle,
-    shippingForeign: Math.round((totalShipping + totalFees) * 10000) / 10000,
+    shippingForeign: Math.round(totalShipping * 10000) / 10000,
   }
 }
 

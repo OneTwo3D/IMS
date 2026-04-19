@@ -60,6 +60,7 @@ export async function pushCreditNote(
     CreditNoteNumber: data.creditNoteNumber,
     Date: data.date,
     LineItems: lineItems,
+    LineAmountTypes: 'Exclusive',
     Status: status,
     CurrencyCode: data.currency,
   }

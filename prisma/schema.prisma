@@ -530,6 +530,7 @@ model Product {
 
   stockLevels     StockLevel[]
   costLayers      CostLayer[]
+  costLayerSourceLines CostLayerSourceLine[]
   stockMovements  StockMovement[]
 
   poLines         PurchaseOrderLine[]
@@ -632,10 +633,30 @@ model CostLayer {
   adjustmentMovement StockMovement? @relation("AdjustmentMovementLayer", fields: [adjustmentMovementId], references: [id])
 
   cogsEntries     CogsEntry[]
+  sourceLines     CostLayerSourceLine[]
 
   @@index([productId, warehouseId, receivedAt])
   @@index([adjustmentMovementId])
   @@map("cost_layers")
+}
+
+model CostLayerSourceLine {
+  id                String    @id @default(cuid())
+  costLayerId       String
+  sourceProductId   String
+  sourceCostLayerId String?
+  qty               Decimal   @db.Decimal(12, 4)
+  unitCostBase      Decimal   @db.Decimal(18, 6)
+  totalCostBase     Decimal   @db.Decimal(18, 6)
+  createdAt         DateTime  @default(now())
+
+  costLayer         CostLayer @relation(fields: [costLayerId], references: [id], onDelete: Cascade)
+  sourceProduct     Product   @relation(fields: [sourceProductId], references: [id])
+
+  @@index([costLayerId])
+  @@index([sourceProductId])
+  @@index([sourceCostLayerId])
+  @@map("cost_layer_source_lines")
 }
 
 /// Each COGS consumption event (sale, adjustment, etc.)
@@ -1170,7 +1191,9 @@ model SalesOrderRefundLine {
   productId       String?
   description     String
   qty             Decimal          @db.Decimal(12, 4)
+  unitPriceForeign Decimal         @db.Decimal(18, 6)
   unitPriceBase    Decimal          @db.Decimal(18, 6)
+  totalForeign     Decimal          @db.Decimal(18, 4)
   totalBase        Decimal          @db.Decimal(18, 4)
   costLayerSnapshot Json?
 

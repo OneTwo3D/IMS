@@ -7,6 +7,7 @@ import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings, listAccountingBankAccounts, type AccountingBankAccount } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
 import {
+  getReturnedQtyForCostLayer,
   refreshSalesOrderLineCogsForCostLayerChange,
   refreshShipmentCogsForCostLayerChange,
   updateSnapshotsForCostLayerChange,
@@ -1427,31 +1428,15 @@ export async function updatePurchaseOrder(
           return recalculateDirectLandedCosts(tx, id)
         }, STOCK_TX_OPTIONS)
 
+        try {
+          await queueLandedCostAdjustmentJournals(landedResult)
+        } catch { /* Accounting queue errors should not block the main flow */ }
         for (const adj of landedResult.cogsAdjustments) {
-          try {
-            const settings = await getAccountingSettings()
-            const absDelta = Math.abs(adj.totalDelta)
-            const isIncrease = adj.totalDelta > 0
-            await queueAccountingSync({
-              type: 'COGS_JOURNAL',
-              referenceType: 'PurchaseOrder',
-              referenceId: adj.primaryPoId,
-              payload: {
-                date: new Date().toISOString().slice(0, 10),
-                reference: `Landed cost adjustment — ${adj.primaryPoRef}`,
-                narration: `Retrospective COGS adjustment: landed cost ${isIncrease ? 'increase' : 'decrease'} of £${absDelta.toFixed(2)} on ${adj.primaryPoRef}`,
-                lines: [
-                  { accountCode: isIncrease ? settings.cogsAccount : settings.inventoryAccount, description: `COGS adjustment — ${adj.primaryPoRef}`, debit: absDelta },
-                  { accountCode: isIncrease ? settings.inventoryAccount : settings.cogsAccount, description: `COGS adjustment — ${adj.primaryPoRef}`, credit: absDelta },
-                ],
-              },
-            })
-            await logActivity({
-              entityType: 'PURCHASE_ORDER', entityId: id, action: 'cogs_adjusted', tag: 'purchase', level: 'INFO',
-              description: `Retrospective COGS adjustment of £${adj.totalDelta.toFixed(2)} for ${adj.primaryPoRef} due to additional cost change`,
-              metadata: { totalDelta: adj.totalDelta },
-            })
-          } catch { /* Accounting queue errors should not block the main flow */ }
+          await logActivity({
+            entityType: 'PURCHASE_ORDER', entityId: id, action: 'cogs_adjusted', tag: 'purchase', level: 'INFO',
+            description: `Retrospective COGS adjustment of £${adj.totalDelta.toFixed(2)} for ${adj.primaryPoRef} due to additional cost change`,
+            metadata: { totalDelta: adj.totalDelta },
+          })
         }
       } catch (e) {
         // Log but don't fail the PO update — the cost lines are saved,
@@ -2382,8 +2367,9 @@ export async function createInvoice(
           dueDate: input.dueDate ?? undefined,
           currency: supplierData?.currency ?? baseCurrency,
           reference: input.invoiceNumber ?? undefined,
-          // Goods on a PO stay on the balance sheet as Stock-in-Transit until received.
-          // The opposite leg (DR Inventory / CR Transit) is posted on goods receipt.
+          // Bills always debit transit first. For landed-cost changes that arrive
+          // after receipt, the recalculation path posts a separate reclass from
+          // transit into inventory/COGS for the delta on already-received stock.
           lines: [...productPayloadLines, ...costPayloadLines],
           supplierInvoicePath: input.supplierInvoiceUrl ?? undefined,
         },
@@ -2600,13 +2586,17 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
       },
       select: PO_SELECT,
     })
+    const landedResult = await db.$transaction(async (tx) => recalculateLandedCosts(tx, po.id), STOCK_TX_OPTIONS)
 
     // Revalidate linked primary POs
-    for (const pid of input.primaryPoIds) {
+    for (const pid of landedResult.revalidatePoIds) {
       revalidatePath(`/purchase-orders/${pid}`)
     }
     revalidatePath('/purchase-orders')
     const mapped = mapPoRow(po)
+    try {
+      await queueLandedCostAdjustmentJournals(landedResult)
+    } catch { /* Accounting queue errors should not block the main flow */ }
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: mapped.id,
@@ -2793,57 +2783,19 @@ export async function updateFreightPoCosts(
       metadata: { reference, costLineCount: costLines.length },
     })
 
-    // Queue retrospective COGS adjustment journals for any primary POs
-    // whose cost layers were already partially consumed when the landed
-    // cost changed. Each adjustment is a single journal entry capturing
-    // the delta between old and new unit cost × consumed qty.
+    try {
+      await queueLandedCostAdjustmentJournals(landedResult)
+    } catch { /* Accounting queue errors should not block the main flow */ }
     for (const adj of landedResult.cogsAdjustments) {
-      try {
-        const settings = await getAccountingSettings()
-        if (adj.totalDelta > 0) {
-          // Cost went UP — increase COGS, decrease inventory value
-          await queueAccountingSync({
-            type: 'COGS_JOURNAL',
-            referenceType: 'PurchaseOrder',
-            referenceId: adj.primaryPoId,
-            payload: {
-              date: new Date().toISOString().slice(0, 10),
-              reference: `Landed cost adjustment — ${adj.primaryPoRef}`,
-              narration: `Retrospective COGS adjustment: landed cost increase of £${adj.totalDelta.toFixed(2)} on ${adj.primaryPoRef}`,
-              lines: [
-                { accountCode: settings.cogsAccount, description: `COGS adjustment — ${adj.primaryPoRef}`, debit: adj.totalDelta },
-                { accountCode: settings.inventoryAccount, description: `COGS adjustment — ${adj.primaryPoRef}`, credit: adj.totalDelta },
-              ],
-            },
-          })
-        } else if (adj.totalDelta < 0) {
-          // Cost went DOWN — decrease COGS, increase inventory value
-          const absDelta = Math.abs(adj.totalDelta)
-          await queueAccountingSync({
-            type: 'COGS_JOURNAL',
-            referenceType: 'PurchaseOrder',
-            referenceId: adj.primaryPoId,
-            payload: {
-              date: new Date().toISOString().slice(0, 10),
-              reference: `Landed cost adjustment — ${adj.primaryPoRef}`,
-              narration: `Retrospective COGS adjustment: landed cost decrease of £${absDelta.toFixed(2)} on ${adj.primaryPoRef}`,
-              lines: [
-                { accountCode: settings.inventoryAccount, description: `COGS adjustment — ${adj.primaryPoRef}`, debit: absDelta },
-                { accountCode: settings.cogsAccount, description: `COGS adjustment — ${adj.primaryPoRef}`, credit: absDelta },
-              ],
-            },
-          })
-        }
-        await logActivity({
-          entityType: 'PURCHASE_ORDER',
-          entityId: adj.primaryPoId,
-          action: 'cogs_adjusted',
-          tag: 'purchase',
-          level: 'INFO',
-          description: `Retrospective COGS adjustment of £${adj.totalDelta.toFixed(2)} for ${adj.primaryPoRef} due to landed cost change`,
-          metadata: { totalDelta: adj.totalDelta, freightPoId },
-        })
-      } catch { /* Accounting queue errors should not block the main flow */ }
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: adj.primaryPoId,
+        action: 'cogs_adjusted',
+        tag: 'purchase',
+        level: 'INFO',
+        description: `Retrospective COGS adjustment of £${adj.totalDelta.toFixed(2)} for ${adj.primaryPoRef} due to landed cost change`,
+        metadata: { totalDelta: adj.totalDelta, freightPoId },
+      })
     }
 
     return { success: true }
@@ -2978,6 +2930,11 @@ function computeGrossUnitCostBaseByLine(params: {
  */
 type LandedCostRecalcResult = {
   revalidatePoIds: string[]
+  inventoryTransitAdjustments: Array<{
+    primaryPoId: string
+    primaryPoRef: string
+    totalDelta: number
+  }>
   /** COGS adjustment needed for layers that were already consumed before
    *  the landed cost changed. Positive = cost increase, negative = decrease. */
   cogsAdjustments: Array<{
@@ -2985,6 +2942,68 @@ type LandedCostRecalcResult = {
     primaryPoRef: string
     totalDelta: number
   }>
+}
+
+async function queueLandedCostAdjustmentJournals(
+  adjustments: LandedCostRecalcResult,
+): Promise<void> {
+  const settings = await getAccountingSettings()
+
+  for (const adj of adjustments.inventoryTransitAdjustments) {
+    const absDelta = Math.abs(adj.totalDelta)
+    if (absDelta <= 0.01) continue
+    const isIncrease = adj.totalDelta > 0
+    await queueAccountingSync({
+      type: 'STOCK_IN_TRANSIT',
+      referenceType: 'PurchaseOrder',
+      referenceId: adj.primaryPoId,
+      payload: {
+        date: new Date().toISOString().slice(0, 10),
+        reference: `Landed cost reclass — ${adj.primaryPoRef}`,
+        narration: `Late landed cost ${isIncrease ? 'capitalisation' : 'reversal'} of £${absDelta.toFixed(2)} on ${adj.primaryPoRef}`,
+        lines: [
+          {
+            accountCode: isIncrease ? settings.inventoryAccount : settings.transitAccount,
+            description: `Landed cost reclass — ${adj.primaryPoRef}`,
+            debit: absDelta,
+          },
+          {
+            accountCode: isIncrease ? settings.transitAccount : settings.inventoryAccount,
+            description: `Landed cost reclass — ${adj.primaryPoRef}`,
+            credit: absDelta,
+          },
+        ],
+      },
+    })
+  }
+
+  for (const adj of adjustments.cogsAdjustments) {
+    const absDelta = Math.abs(adj.totalDelta)
+    if (absDelta <= 0.01) continue
+    const isIncrease = adj.totalDelta > 0
+    await queueAccountingSync({
+      type: 'COGS_JOURNAL',
+      referenceType: 'PurchaseOrder',
+      referenceId: adj.primaryPoId,
+      payload: {
+        date: new Date().toISOString().slice(0, 10),
+        reference: `Landed cost adjustment — ${adj.primaryPoRef}`,
+        narration: `Retrospective COGS adjustment: landed cost ${isIncrease ? 'increase' : 'decrease'} of £${absDelta.toFixed(2)} on ${adj.primaryPoRef}`,
+        lines: [
+          {
+            accountCode: isIncrease ? settings.cogsAccount : settings.inventoryAccount,
+            description: `COGS adjustment — ${adj.primaryPoRef}`,
+            debit: absDelta,
+          },
+          {
+            accountCode: isIncrease ? settings.inventoryAccount : settings.cogsAccount,
+            description: `COGS adjustment — ${adj.primaryPoRef}`,
+            credit: absDelta,
+          },
+        ],
+      },
+    })
+  }
 }
 
 async function recalculateLandedCosts(
@@ -2996,7 +3015,7 @@ async function recalculateLandedCosts(
     where: { freightPoId },
     select: { primaryPoId: true },
   })
-  const result: LandedCostRecalcResult = { revalidatePoIds: [], cogsAdjustments: [] }
+  const result: LandedCostRecalcResult = { revalidatePoIds: [], inventoryTransitAdjustments: [], cogsAdjustments: [] }
 
   for (const link of links) {
     const primaryPoId = link.primaryPoId
@@ -3028,10 +3047,13 @@ async function recalculateLandedCosts(
             },
           },
         },
+        freightCostLines: {
+          select: { amountBase: true, distributionMethod: true },
+        },
       },
     })
     if (!primaryPo) continue
-    if (primaryPo.status === 'CLOSED' || primaryPo.status === 'INVOICED') {
+    if (primaryPo.status === 'CLOSED') {
       throw new Error(`Cannot recalculate landed costs for ${primaryPoId}: purchase order is in a locked status`)
     }
 
@@ -3056,6 +3078,27 @@ async function recalculateLandedCosts(
     }
 
     const eligibleLines = primaryPo.lines.filter((line) => decimal(line.qty).gt(0))
+    for (const freightCostLine of primaryPo.freightCostLines) {
+      const method = freightCostLine.distributionMethod
+      const bases = eligibleLines.map((line) => ({
+        lineId: line.id,
+        base: computeDistributionBase(line, method),
+      }))
+      let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
+
+      if (basisTotal.lte(0)) {
+        const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
+        basisTotal = equalBase
+        for (const entry of bases) entry.base = new Prisma.Decimal(1)
+      }
+
+      const amountBase = decimal(freightCostLine.amountBase)
+      for (const entry of bases) {
+        const share = amountBase.mul(entry.base).div(basisTotal)
+        landedByLine.set(entry.lineId, decimal(landedByLine.get(entry.lineId)).add(share))
+      }
+    }
+
     for (const linkRow of allLinks) {
       for (const freightCostLine of linkRow.freightPO.freightCostLines) {
         const method = freightCostLine.distributionMethod
@@ -3080,6 +3123,7 @@ async function recalculateLandedCosts(
     }
 
     let totalCogsDelta = 0
+    let totalInventoryDelta = 0
 
     for (const line of primaryPo.lines) {
       const lineQty = decimal(line.qty)
@@ -3100,10 +3144,19 @@ async function recalculateLandedCosts(
         const newUnitCost = grossUnitCostBase.toNumber()
         const costDelta = newUnitCost - oldUnitCost
 
-        // Compute consumed qty for retrospective COGS adjustment
+        // Net out physical refund returns that originated from this layer.
+        // Late landed-cost adjustments should only hit units still consumed
+        // by customers, not units already returned to inventory.
         const consumedQty = Number(cl.receivedQty) - Number(cl.remainingQty)
-        if (consumedQty > 0 && Math.abs(costDelta) > 0.000001) {
-          totalCogsDelta += costDelta * consumedQty
+        const returnedQty = consumedQty > 0.000001
+          ? await getReturnedQtyForCostLayer(tx, cl.id)
+          : 0
+        const netConsumedQty = Math.max(0, consumedQty - returnedQty)
+        if (netConsumedQty > 0 && Math.abs(costDelta) > 0.000001) {
+          totalCogsDelta += costDelta * netConsumedQty
+        }
+        if (Number(cl.remainingQty) > 0.000001 && Math.abs(costDelta) > 0.000001) {
+          totalInventoryDelta += costDelta * Number(cl.remainingQty)
         }
 
         await tx.costLayer.update({
@@ -3130,6 +3183,13 @@ async function recalculateLandedCosts(
         primaryPoId,
         primaryPoRef: primaryPo.reference,
         totalDelta: Math.round(totalCogsDelta * 100) / 100,
+      })
+    }
+    if (Math.abs(totalInventoryDelta) > 0.01) {
+      result.inventoryTransitAdjustments.push({
+        primaryPoId,
+        primaryPoRef: primaryPo.reference,
+        totalDelta: Math.round(totalInventoryDelta * 100) / 100,
       })
     }
   }
@@ -3175,7 +3235,7 @@ async function recalculateDirectLandedCosts(
       },
     },
   })
-  if (!po) return { revalidatePoIds: [], cogsAdjustments: [] }
+  if (!po) return { revalidatePoIds: [], inventoryTransitAdjustments: [], cogsAdjustments: [] }
 
   const landedByLine = new Map<string, Prisma.Decimal>()
   for (const line of po.lines) {
@@ -3202,6 +3262,7 @@ async function recalculateDirectLandedCosts(
   }
 
   let totalCogsDelta = 0
+  let totalInventoryDelta = 0
 
   for (const line of po.lines) {
     const lineQty = decimal(line.qty)
@@ -3222,8 +3283,15 @@ async function recalculateDirectLandedCosts(
       const newUnitCost = grossUnitCostBase.toNumber()
       const costDelta = newUnitCost - oldUnitCost
       const consumedQty = Number(cl.receivedQty) - Number(cl.remainingQty)
-      if (consumedQty > 0 && Math.abs(costDelta) > 0.000001) {
-        totalCogsDelta += costDelta * consumedQty
+      const returnedQty = consumedQty > 0.000001
+        ? await getReturnedQtyForCostLayer(tx, cl.id)
+        : 0
+      const netConsumedQty = Math.max(0, consumedQty - returnedQty)
+      if (netConsumedQty > 0 && Math.abs(costDelta) > 0.000001) {
+        totalCogsDelta += costDelta * netConsumedQty
+      }
+      if (Number(cl.remainingQty) > 0.000001 && Math.abs(costDelta) > 0.000001) {
+        totalInventoryDelta += costDelta * Number(cl.remainingQty)
       }
       await tx.costLayer.update({
         where: { id: cl.id },
@@ -3238,7 +3306,14 @@ async function recalculateDirectLandedCosts(
     }
   }
 
-  const result: LandedCostRecalcResult = { revalidatePoIds: [poId], cogsAdjustments: [] }
+  const result: LandedCostRecalcResult = { revalidatePoIds: [poId], inventoryTransitAdjustments: [], cogsAdjustments: [] }
+  if (Math.abs(totalInventoryDelta) > 0.01) {
+    result.inventoryTransitAdjustments.push({
+      primaryPoId: poId,
+      primaryPoRef: po.reference,
+      totalDelta: Math.round(totalInventoryDelta * 100) / 100,
+    })
+  }
   if (Math.abs(totalCogsDelta) > 0.01) {
     result.cogsAdjustments.push({
       primaryPoId: poId,

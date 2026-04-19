@@ -49,6 +49,23 @@ function round2(value: number): number {
   return Math.round(value * 100) / 100
 }
 
+function normalizeDeferredDiscountBase(order: {
+  fxRateToBase: Prisma.Decimal | number | null
+  discountAmount: Prisma.Decimal | number | null
+  pricesIncludeVat: boolean
+  taxRatePercent: Prisma.Decimal | number | null
+  shoppingLinks?: Array<{ connector: string }>
+}): number {
+  const fxRate = Number(order.fxRateToBase) || 1
+  const discountBaseRaw = Number(order.discountAmount ?? 0) / fxRate
+  const vatPct = Number(order.taxRatePercent ?? 0)
+  const isWooCommerceOrder = !!order.shoppingLinks?.some((link) => link.connector === 'woocommerce')
+
+  if (isWooCommerceOrder) return discountBaseRaw
+  if (order.pricesIncludeVat && vatPct > 0) return discountBaseRaw / (1 + vatPct)
+  return discountBaseRaw
+}
+
 function makeLayerKey(productId: string, warehouseId: string): string {
   return `${productId}|${warehouseId}`
 }
@@ -352,6 +369,9 @@ export async function runDailyBatchSync(): Promise<{
         discountAmount: true,
         pricesIncludeVat: true,
         taxRatePercent: true,
+        shoppingLinks: {
+          select: { connector: true },
+        },
       },
     })
 
@@ -360,11 +380,7 @@ export async function runDailyBatchSync(): Promise<{
       const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = []
 
       for (const order of orders) {
-        const fxRate = Number(order.fxRateToBase) || 1
-        const discountBaseRaw = Number(order.discountAmount ?? 0) / fxRate
-        const discountBase = order.pricesIncludeVat && Number(order.taxRatePercent ?? 0) > 0
-          ? discountBaseRaw / (1 + Number(order.taxRatePercent))
-          : discountBaseRaw
+        const discountBase = normalizeDeferredDiscountBase(order)
         const salesValue = round2(Number(order.subtotalBase) + Number(order.shippingBase ?? 0) - discountBase)
         totalRevenueDeferred += salesValue
       }
@@ -394,11 +410,7 @@ export async function runDailyBatchSync(): Promise<{
         }
 
         for (const order of orders) {
-          const fxRate = Number(order.fxRateToBase) || 1
-          const discountBaseRaw = Number(order.discountAmount ?? 0) / fxRate
-          const discountBase = order.pricesIncludeVat && Number(order.taxRatePercent ?? 0) > 0
-            ? discountBaseRaw / (1 + Number(order.taxRatePercent))
-            : discountBaseRaw
+          const discountBase = normalizeDeferredDiscountBase(order)
           const salesValue = round2(Number(order.subtotalBase) + Number(order.shippingBase ?? 0) - discountBase)
           await tx.salesOrder.update({
             where: { id: order.id },

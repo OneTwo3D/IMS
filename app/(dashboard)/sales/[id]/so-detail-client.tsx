@@ -114,6 +114,7 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
         productId: l.productId,
         description: l.description,
         qty: l.qtyRefund,
+        totalForeign: l.refundAmount,
         totalBase: l.refundAmount / (order.fxRateToBase || 1),
       })), reason, returnWhId || undefined)
       if (result.success) { router.refresh(); onClose() } else setError(result.error ?? 'Failed')

@@ -5,7 +5,12 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
-import { consumeFifoLayersStrict, getAverageUnitCost } from '@/lib/cost-layers'
+import {
+  addCostLayerSourceLines,
+  consumeFifoLayersStrict,
+  createCostLayer,
+  getAverageUnitCost,
+} from '@/lib/cost-layers'
 import { COMPONENT_PRODUCT_STATUSES, OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { Prisma, type ProductionOrderStatus, type ProductionOrderType } from '@/app/generated/prisma/client'
 
@@ -376,6 +381,119 @@ async function assertStockAvailable(
   }
 }
 
+async function buildDisassemblyRecoveryPlan(
+  tx: Prisma.TransactionClient,
+  recoveredLayers: Array<{ costLayerId: string; qty: number; unitCostBase: number }>,
+  components: Array<{ componentId: string; qty: Prisma.Decimal | number }>,
+  warehouseId: string,
+  qtyPlanned: number,
+): Promise<Array<{ componentId: string; totalQty: number; totalCostBase: Prisma.Decimal }>> {
+  const componentById = new Map(components.map((component) => [component.componentId, component]))
+  const layerIds = recoveredLayers.map((layer) => layer.costLayerId)
+
+  const layerDetails = layerIds.length === 0
+    ? []
+    : await tx.costLayer.findMany({
+        where: { id: { in: layerIds } },
+        select: {
+          id: true,
+          receivedQty: true,
+          sourceLines: {
+            select: {
+              sourceProductId: true,
+              qty: true,
+              totalCostBase: true,
+            },
+          },
+        },
+      })
+  const layerDetailById = new Map(layerDetails.map((layer) => [layer.id, layer]))
+
+  const historicalQtyByComponent = new Map<string, number>()
+  const historicalCostByComponent = new Map<string, Prisma.Decimal>()
+  let residualCostBase = new Prisma.Decimal(0)
+
+  for (const recoveredLayer of recoveredLayers) {
+    const layerDetail = layerDetailById.get(recoveredLayer.costLayerId)
+    const entryCostBase = new Prisma.Decimal(recoveredLayer.qty * recoveredLayer.unitCostBase)
+
+    if (!layerDetail || layerDetail.sourceLines.length === 0) {
+      residualCostBase = residualCostBase.add(entryCostBase)
+      continue
+    }
+
+    const receivedQty = Number(layerDetail.receivedQty)
+    if (!Number.isFinite(receivedQty) || receivedQty <= 0) {
+      residualCostBase = residualCostBase.add(entryCostBase)
+      continue
+    }
+
+    const ratio = recoveredLayer.qty / receivedQty
+    let allocatedEntryCostBase = new Prisma.Decimal(0)
+
+    for (const sourceLine of layerDetail.sourceLines) {
+      const allocatedQty = Number(sourceLine.qty) * ratio
+      const allocatedCostBase = new Prisma.Decimal(sourceLine.totalCostBase).mul(ratio)
+      allocatedEntryCostBase = allocatedEntryCostBase.add(allocatedCostBase)
+
+      if (!componentById.has(sourceLine.sourceProductId)) {
+        residualCostBase = residualCostBase.add(allocatedCostBase)
+        continue
+      }
+
+      historicalQtyByComponent.set(
+        sourceLine.sourceProductId,
+        (historicalQtyByComponent.get(sourceLine.sourceProductId) ?? 0) + allocatedQty,
+      )
+      historicalCostByComponent.set(
+        sourceLine.sourceProductId,
+        (historicalCostByComponent.get(sourceLine.sourceProductId) ?? new Prisma.Decimal(0)).add(allocatedCostBase),
+      )
+    }
+
+    const roundingResidual = entryCostBase.sub(allocatedEntryCostBase)
+    if (roundingResidual.abs().gt(0.000001)) {
+      residualCostBase = residualCostBase.add(roundingResidual)
+    }
+  }
+
+  const currentComponentQtyById = new Map(
+    components.map((component) => [component.componentId, Number(component.qty) * qtyPlanned]),
+  )
+  const residualBasis = await Promise.all(components.map(async (component) => {
+    const totalQty = currentComponentQtyById.get(component.componentId) ?? 0
+    const historicalQty = historicalQtyByComponent.get(component.componentId) ?? 0
+    const uncoveredQty = Math.max(0, totalQty - historicalQty)
+    const avgUnitCost = uncoveredQty > 0
+      ? await getAverageUnitCost(tx, component.componentId, warehouseId)
+      : 0
+    return {
+      componentId: component.componentId,
+      totalQty,
+      uncoveredQty,
+      basis: avgUnitCost > 0 ? avgUnitCost * uncoveredQty : uncoveredQty,
+    }
+  }))
+
+  const totalResidualBasis = residualBasis.reduce((sum, component) => sum + component.basis, 0)
+  const fallbackResidualBasis = residualBasis.reduce((sum, component) => sum + component.totalQty, 0)
+
+  return residualBasis
+    .filter((component) => component.totalQty > 0)
+    .map((component) => {
+      const historicalCost = historicalCostByComponent.get(component.componentId) ?? new Prisma.Decimal(0)
+      const allocationBasis = totalResidualBasis > 0 ? component.basis : component.totalQty
+      const residualAllocatedCost = residualCostBase.gt(0) && allocationBasis > 0
+        ? residualCostBase.mul(allocationBasis).div(totalResidualBasis > 0 ? totalResidualBasis : fallbackResidualBasis || 1)
+        : new Prisma.Decimal(0)
+      return {
+        componentId: component.componentId,
+        totalQty: component.totalQty,
+        totalCostBase: historicalCost.add(residualAllocatedCost),
+      }
+    })
+}
+
 export async function updateManufacturingOrderStatus(
   id: string,
   status: ProductionOrderStatus,
@@ -445,11 +563,25 @@ export async function updateManufacturingOrderStatus(
         if (isAssembly) {
           // ASSEMBLY: deduct components (and release reservation), add output product
           let totalAssemblyCostBase = new Prisma.Decimal(0)
+          const assemblySourceLines: Array<{
+            sourceProductId: string
+            sourceCostLayerId: string
+            qty: number
+            unitCostBase: number
+            totalCostBase: number
+          }> = []
           for (const comp of components) {
             const totalQty = Number(comp.qty) * qtyPlanned
             await assertStockAvailable(tx, comp.componentId, order.warehouseId, totalQty)
             const consumed = await consumeFifoLayersStrict(tx, comp.componentId, order.warehouseId, totalQty)
             totalAssemblyCostBase = totalAssemblyCostBase.add(new Prisma.Decimal(consumed.totalCost))
+            assemblySourceLines.push(...consumed.consumed.map((entry) => ({
+              sourceProductId: comp.componentId,
+              sourceCostLayerId: entry.costLayerId,
+              qty: entry.qty,
+              unitCostBase: entry.unitCostBase,
+              totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+            })))
 
             // Deduct component stock + release reservation if was in progress
             await tx.stockLevel.update({
@@ -480,16 +612,14 @@ export async function updateManufacturingOrderStatus(
             create: { productId: order.outputProductId, warehouseId: order.warehouseId, quantity: qtyPlanned },
             update: { quantity: { increment: qtyPlanned } },
           })
-          await tx.costLayer.create({
-            data: {
-              productId: order.outputProductId,
-              warehouseId: order.warehouseId,
-              receivedQty: qtyPlanned,
-              remainingQty: qtyPlanned,
-              unitCostBase: totalAssemblyCostBase.div(new Prisma.Decimal(qtyPlanned)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP),
-              isOpeningStock: false,
-            },
+          const outputLayerId = await createCostLayer(tx, {
+            productId: order.outputProductId,
+            warehouseId: order.warehouseId,
+            qty: qtyPlanned,
+            unitCostBase: totalAssemblyCostBase.div(new Prisma.Decimal(qtyPlanned)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP).toNumber(),
+            isOpeningStock: false,
           })
+          await addCostLayerSourceLines(tx, outputLayerId, assemblySourceLines)
 
           // Record PRODUCTION_IN movement
           await tx.stockMovement.create({
@@ -507,18 +637,13 @@ export async function updateManufacturingOrderStatus(
           // DISASSEMBLY: deduct output product (and release reservation), add components
           await assertStockAvailable(tx, order.outputProductId, order.warehouseId, qtyPlanned)
           const recoveredCost = await consumeFifoLayersStrict(tx, order.outputProductId, order.warehouseId, qtyPlanned)
-          const totalRecoveredCostBase = new Prisma.Decimal(recoveredCost.totalCost)
-          const componentCostBasis = await Promise.all(components.map(async (comp) => {
-            const totalQty = Number(comp.qty) * qtyPlanned
-            const avgUnitCost = await getAverageUnitCost(tx, comp.componentId, order.warehouseId)
-            return {
-              componentId: comp.componentId,
-              totalQty,
-              basis: avgUnitCost > 0 ? avgUnitCost * totalQty : 0,
-            }
-          }))
-          const totalRecoveryBasis = componentCostBasis.reduce((sum, comp) => sum + comp.basis, 0)
-          const fallbackBasis = componentCostBasis.reduce((sum, comp) => sum + comp.totalQty, 0)
+          const recoveryPlan = await buildDisassemblyRecoveryPlan(
+            tx,
+            recoveredCost.consumed,
+            components,
+            order.warehouseId,
+            qtyPlanned,
+          )
           await tx.stockLevel.update({
             where: { productId_warehouseId: { productId: order.outputProductId, warehouseId: order.warehouseId } },
             data: {
@@ -540,14 +665,9 @@ export async function updateManufacturingOrderStatus(
           })
 
           for (const comp of components) {
-            const basis = componentCostBasis.find((entry) => entry.componentId === comp.componentId)
-            const totalQty = basis?.totalQty ?? (Number(comp.qty) * qtyPlanned)
-            const allocationBasis = totalRecoveryBasis > 0
-              ? (basis?.basis ?? 0)
-              : totalQty
-            const allocatedCost = totalQty > 0
-              ? totalRecoveredCostBase.mul(new Prisma.Decimal(allocationBasis)).div(new Prisma.Decimal(totalRecoveryBasis > 0 ? totalRecoveryBasis : fallbackBasis || 1))
-              : new Prisma.Decimal(0)
+            const plannedRecovery = recoveryPlan.find((entry) => entry.componentId === comp.componentId)
+            const totalQty = plannedRecovery?.totalQty ?? (Number(comp.qty) * qtyPlanned)
+            const allocatedCost = plannedRecovery?.totalCostBase ?? new Prisma.Decimal(0)
             const recoveredUnitCost = totalQty > 0
               ? allocatedCost.div(new Prisma.Decimal(totalQty)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
               : new Prisma.Decimal(0)

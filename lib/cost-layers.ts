@@ -32,6 +32,14 @@ export type ConsumedLayer = {
   unitCostBase: number
 }
 
+export type CostLayerSourceLineInput = {
+  sourceProductId: string
+  sourceCostLayerId?: string | null
+  qty: number
+  unitCostBase: number
+  totalCostBase?: number
+}
+
 /**
  * Consume FIFO layers oldest-first for the given product + warehouse.
  * Decrements `remainingQty` on each layer consumed.
@@ -167,6 +175,78 @@ export async function createCostLayer(
   return layer.id
 }
 
+export async function addCostLayerSourceLines(
+  tx: TxClient,
+  costLayerId: string,
+  lines: CostLayerSourceLineInput[],
+): Promise<number> {
+  const validLines = lines
+    .filter((line) => (
+      line.sourceProductId &&
+      Number.isFinite(line.qty) &&
+      line.qty > 0 &&
+      Number.isFinite(line.unitCostBase)
+    ))
+    .map((line) => ({
+      costLayerId,
+      sourceProductId: line.sourceProductId,
+      sourceCostLayerId: line.sourceCostLayerId ?? null,
+      qty: Math.round(line.qty * 10000) / 10000,
+      unitCostBase: Math.round(line.unitCostBase * 1000000) / 1000000,
+      totalCostBase: Math.round(((line.totalCostBase ?? (line.qty * line.unitCostBase)) * 1000000)) / 1000000,
+    }))
+
+  if (validLines.length === 0) return 0
+  const result = await tx.costLayerSourceLine.createMany({
+    data: validLines,
+  })
+  return result.count
+}
+
+export async function copyCostLayerSourceLinesProportionally(
+  tx: TxClient,
+  fromCostLayerId: string,
+  toCostLayerId: string,
+  copiedQty: number,
+): Promise<number> {
+  if (!Number.isFinite(copiedQty) || copiedQty <= 0) return 0
+
+  const sourceLayer = await tx.costLayer.findUnique({
+    where: { id: fromCostLayerId },
+    select: {
+      receivedQty: true,
+      sourceLines: {
+        select: {
+          sourceProductId: true,
+          sourceCostLayerId: true,
+          qty: true,
+          unitCostBase: true,
+          totalCostBase: true,
+        },
+      },
+    },
+  })
+  if (!sourceLayer || sourceLayer.sourceLines.length === 0) return 0
+
+  const sourceReceivedQty = Number(sourceLayer.receivedQty)
+  if (!Number.isFinite(sourceReceivedQty) || sourceReceivedQty <= 0) return 0
+
+  const ratio = Math.min(1, copiedQty / sourceReceivedQty)
+  if (ratio <= 0) return 0
+
+  return addCostLayerSourceLines(
+    tx,
+    toCostLayerId,
+    sourceLayer.sourceLines.map((line) => ({
+      sourceProductId: line.sourceProductId,
+      sourceCostLayerId: line.sourceCostLayerId,
+      qty: Number(line.qty) * ratio,
+      unitCostBase: Number(line.unitCostBase),
+      totalCostBase: Number(line.totalCostBase) * ratio,
+    })),
+  )
+}
+
 // ---------------------------------------------------------------------------
 // Snapshot correction (retrospective landed cost adjustments)
 // ---------------------------------------------------------------------------
@@ -233,6 +313,36 @@ export async function updateSnapshotsForCostLayerChange(
   }
 
   return updated
+}
+
+/**
+ * Sum physically returned quantity for a cost layer by reading refund-line
+ * snapshots on refunds that actually returned stock to a warehouse.
+ */
+export async function getReturnedQtyForCostLayer(
+  tx: TxClient,
+  costLayerId: string,
+): Promise<number> {
+  const containsCostLayer = JSON.stringify([{ costLayerId }])
+  const rows = await tx.$queryRawUnsafe<Array<{ costLayerSnapshot: unknown }>>(
+    `SELECT srl."costLayerSnapshot"
+       FROM "sales_order_refund_lines" srl
+       INNER JOIN "sales_order_refunds" sr ON sr.id = srl."refundId"
+      WHERE sr."returnWarehouseId" IS NOT NULL
+        AND srl."costLayerSnapshot" @> $1::jsonb`,
+    containsCostLayer,
+  )
+
+  let returnedQty = 0
+  for (const row of rows) {
+    for (const entry of parseCostLayerSnapshot(row.costLayerSnapshot)) {
+      if (entry.costLayerId === costLayerId) {
+        returnedQty += entry.qty
+      }
+    }
+  }
+
+  return returnedQty
 }
 
 /**

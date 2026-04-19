@@ -6,7 +6,12 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
-import { consumeFifoLayers, createCostLayer, type ConsumedLayer } from '@/lib/cost-layers'
+import {
+  consumeFifoLayers,
+  copyCostLayerSourceLinesProportionally,
+  createCostLayer,
+  type ConsumedLayer,
+} from '@/lib/cost-layers'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -489,12 +494,13 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
         if (Array.isArray(snapshot) && snapshot.length > 0) {
           for (const entry of snapshot as ConsumedLayer[]) {
             if (entry.qty > 0 && entry.unitCostBase >= 0) {
-              await createCostLayer(tx, {
+              const newLayerId = await createCostLayer(tx, {
                 productId: line.productId,
                 warehouseId: transfer.toWarehouseId,
                 qty: entry.qty,
                 unitCostBase: entry.unitCostBase,
               })
+              await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entry.qty)
             }
           }
         }
