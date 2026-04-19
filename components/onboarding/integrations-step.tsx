@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useTransition } from 'react'
+import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Check, ExternalLink, Loader2, ShoppingCart, Store, BookOpen, Calculator } from 'lucide-react'
 import Link from 'next/link'
@@ -34,10 +34,13 @@ export function IntegrationsStep({
   onPluginStateChange,
 }: Props) {
   const router = useRouter()
-  const [isPending, startTransition] = useTransition()
   const [plugins, setPlugins] = useState(initialPluginState)
   const [pluginsSaved, setPluginsSaved] = useState(false)
   const [error, setError] = useState('')
+  const [savingPlugins, setSavingPlugins] = useState(false)
+  const [savingWc, setSavingWc] = useState(false)
+  const [savingShopify, setSavingShopify] = useState(false)
+  const [connectingAccounting, setConnectingAccounting] = useState(false)
 
   // WooCommerce credentials
   const [wcUrl, setWcUrl] = useState(initialWcCreds.url)
@@ -103,30 +106,32 @@ export function IntegrationsStep({
   }
 
   function handleSavePlugins() {
+    if (savingPlugins || savingWc || savingShopify || connectingAccounting) return
     setError('')
     setPluginsSaved(false)
-    startTransition(async () => {
+    setSavingPlugins(true)
+    void (async () => {
       try {
         const ok = await persistPlugins(plugins)
-        if (!ok) {
-          return
-        }
+        if (!ok) return
         setPluginsSaved(true)
         router.refresh()
         setTimeout(() => setPluginsSaved(false), 2000)
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to save')
+      } finally {
+        setSavingPlugins(false)
       }
-    })
+    })()
   }
 
   function handleSaveWcCredentials() {
+    if (savingPlugins || savingWc || savingShopify || connectingAccounting) return
     setError('')
     setWcSaved(false)
-    startTransition(async () => {
+    setSavingWc(true)
+    void (async () => {
       try {
-        const pluginsPersisted = await persistPlugins(plugins)
-        if (!pluginsPersisted) return
         const result = await saveShoppingConnectorCredentials(wcUrl, wcKey, wcSecret)
         if (!result.success) {
           setError(result.error ?? 'Failed to save WooCommerce credentials')
@@ -137,17 +142,19 @@ export function IntegrationsStep({
         setTimeout(() => setWcSaved(false), 2000)
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to save WooCommerce credentials')
+      } finally {
+        setSavingWc(false)
       }
-    })
+    })()
   }
 
   function handleSaveShopifyCredentials() {
+    if (savingPlugins || savingWc || savingShopify || connectingAccounting) return
     setError('')
     setShopifySaved(false)
-    startTransition(async () => {
+    setSavingShopify(true)
+    void (async () => {
       try {
-        const pluginsPersisted = await persistPlugins(plugins)
-        if (!pluginsPersisted) return
         const result = await saveShopifyConnectorCredentials(shopifyDomain, shopifyToken, shopifyWebhookSecret)
         if (!result.success) {
           setError(result.error ?? 'Failed to save Shopify credentials')
@@ -158,18 +165,21 @@ export function IntegrationsStep({
         setTimeout(() => setShopifySaved(false), 2000)
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to save Shopify credentials')
+      } finally {
+        setSavingShopify(false)
       }
-    })
+    })()
   }
 
   function handleConnectAccounting() {
+    if (savingPlugins || savingWc || savingShopify || connectingAccounting) return
     setError('')
-    startTransition(async () => {
+    setConnectingAccounting(true)
+    void (async () => {
       try {
         const pluginsPersisted = await persistPlugins(plugins)
         if (!pluginsPersisted) return
 
-        // Save credentials first
         const connector = plugins.quickbooks ? 'quickbooks' : 'xero'
         const settingsData: Record<string, string> = {}
         if (connector === 'xero') {
@@ -186,7 +196,6 @@ export function IntegrationsStep({
         }
         setAcSaved(true)
 
-        // Initiate OAuth — redirects to external login
         const origin = window.location.origin
         const result = await connectAccountingConnector(acClientId, acClientSecret, origin, '/onboarding')
         if (result.redirectUrl) {
@@ -196,8 +205,10 @@ export function IntegrationsStep({
         }
       } catch (e) {
         setError(e instanceof Error ? e.message : 'Failed to connect')
+      } finally {
+        setConnectingAccounting(false)
       }
-    })
+    })()
   }
 
   const hasShoppingConnector = plugins.woocommerce || plugins.shopify
@@ -263,8 +274,8 @@ export function IntegrationsStep({
           </label>
         </div>
 
-        <Button onClick={handleSavePlugins} disabled={isPending} size="sm">
-          {isPending ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+        <Button type="button" onClick={handleSavePlugins} disabled={savingPlugins || savingWc || savingShopify || connectingAccounting} size="sm">
+          {savingPlugins ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
           {pluginsSaved ? <><Check className="h-4 w-4 mr-1" />Saved</> : 'Save Plugin Settings'}
         </Button>
       </div>
@@ -296,8 +307,8 @@ export function IntegrationsStep({
               />
             </div>
           </div>
-          <Button onClick={handleSaveWcCredentials} disabled={isPending} size="sm">
-            {isPending ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+          <Button type="button" onClick={handleSaveWcCredentials} disabled={savingPlugins || savingWc || savingShopify || connectingAccounting} size="sm">
+            {savingWc ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
             {wcSaved ? <><Check className="h-4 w-4 mr-1" />Saved</> : 'Save Credentials'}
           </Button>
         </Card>
@@ -336,8 +347,8 @@ export function IntegrationsStep({
               />
             </div>
           </div>
-          <Button onClick={handleSaveShopifyCredentials} disabled={isPending} size="sm">
-            {isPending ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+          <Button type="button" onClick={handleSaveShopifyCredentials} disabled={savingPlugins || savingWc || savingShopify || connectingAccounting} size="sm">
+            {savingShopify ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
             {shopifySaved ? <><Check className="h-4 w-4 mr-1" />Saved</> : 'Save Credentials'}
           </Button>
         </Card>
@@ -376,8 +387,8 @@ export function IntegrationsStep({
                   />
                 </div>
               </div>
-              <Button onClick={handleConnectAccounting} disabled={isPending || !acClientId}>
-                {isPending ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
+              <Button type="button" onClick={handleConnectAccounting} disabled={savingPlugins || savingWc || savingShopify || connectingAccounting || !acClientId}>
+                {connectingAccounting ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
                 {acSaved ? 'Redirecting...' : `Connect to ${accountingLabel}`}
               </Button>
             </>

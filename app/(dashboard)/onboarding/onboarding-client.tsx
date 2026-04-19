@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState } from 'react'
+import { useState } from 'react'
 import { useRouter } from 'next/navigation'
 import {
   ArrowLeft, ArrowRight, Building2, Check, CheckCircle2, Coins, ExternalLink,
@@ -82,37 +82,43 @@ export function OnboardingClient({
     for (let i = 0; i < initialStep; i++) set.add(STEPS[i].key)
     return set
   })
-  const [plugins, setPlugins] = useState(initialPluginState)
-  const [companyConfigured, setCompanyConfigured] = useState(initialCompanyConfigured)
-  const [currencyConfigured, setCurrencyConfigured] = useState(initialCurrencyConfigured)
+  const [pluginDraft, setPluginDraft] = useState<{ base: IntegrationPluginState; value: IntegrationPluginState } | null>(null)
+  const [companyConfiguredOverride, setCompanyConfiguredOverride] = useState<{ base: boolean; value: boolean } | null>(null)
+  const [currencyConfiguredOverride, setCurrencyConfiguredOverride] = useState<{ base: boolean; value: boolean } | null>(null)
   const [finishing, setFinishing] = useState(false)
   const [finishError, setFinishError] = useState('')
   const [stockImported, setStockImported] = useState(false)
+
+  const plugins = pluginDraft?.base === initialPluginState ? pluginDraft.value : initialPluginState
+  const companyConfigured = companyConfiguredOverride?.base === initialCompanyConfigured
+    ? companyConfiguredOverride.value
+    : initialCompanyConfigured
+  const currencyConfigured = currencyConfiguredOverride?.base === initialCurrencyConfigured
+    ? currencyConfiguredOverride.value
+    : initialCurrencyConfigured
 
   const currentStepDef = STEPS[step]
   const isFirst = step === 0
   const isLast = step === STEPS.length - 1
 
-  useEffect(() => {
-    setPlugins(initialPluginState)
-  }, [initialPluginState])
-
-  useEffect(() => {
-    setCompanyConfigured(initialCompanyConfigured)
-  }, [initialCompanyConfigured])
-
-  useEffect(() => {
-    setCurrencyConfigured(initialCurrencyConfigured)
-  }, [initialCurrencyConfigured])
-
   function markComplete(key: string) {
     setCompletedSteps((prev) => new Set(prev).add(key))
   }
+
+  const wcConnected = !!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secretMasked
+  const shopifyConnected = !!shopifyCredentials.storeDomain && !!shopifyCredentials.accessTokenMasked
+  const accountingConnected = accountingStatus.connected
 
   function isStepReady(index: number) {
     const key = STEPS[index]?.key
     if (key === 'company') return companyConfigured
     if (key === 'currency') return currencyConfigured
+    if (key === 'integrations') {
+      if (plugins.woocommerce && !wcConnected) return false
+      if (plugins.shopify && !shopifyConnected) return false
+      if ((plugins.xero || plugins.quickbooks) && !accountingConnected) return false
+      return true
+    }
     return true
   }
 
@@ -208,7 +214,7 @@ export function OnboardingClient({
               <CompanyStep
                 org={org}
                 onSaved={() => {
-                  setCompanyConfigured(true)
+                  setCompanyConfiguredOverride({ base: initialCompanyConfigured, value: true })
                   markComplete('company')
                 }}
               />
@@ -222,7 +228,7 @@ export function OnboardingClient({
                 currencies={currencies}
                 financialYearStart={financialYearStart}
                 onSaved={() => {
-                  setCurrencyConfigured(true)
+                  setCurrencyConfiguredOverride({ base: initialCurrencyConfigured, value: true })
                   markComplete('currency')
                 }}
               />
@@ -250,7 +256,7 @@ export function OnboardingClient({
                 shopifyCredentials={shopifyCredentials}
                 accountingSettings={accountingSettings}
                 accountingStatus={accountingStatus}
-                onPluginStateChange={setPlugins}
+                onPluginStateChange={(nextPlugins) => setPluginDraft({ base: initialPluginState, value: nextPlugins })}
               />
             )}
 

@@ -94,6 +94,11 @@ function extractWooStoreCurrency(data: unknown): string | null {
   }
   if (data && typeof data === 'object') {
     const obj = data as Record<string, unknown>
+    const id = typeof obj.id === 'string' ? obj.id : null
+    const value = typeof obj.value === 'string' ? obj.value : null
+    if (id && value && (id === 'woocommerce_currency' || id === 'currency')) {
+      return value.toUpperCase()
+    }
     const direct = obj.currency
     if (typeof direct === 'string' && direct) return direct.toUpperCase()
     const settings = obj.settings
@@ -115,11 +120,22 @@ function extractWooStoreCurrency(data: unknown): string | null {
 
 async function validateWooStoreBaseCurrency(credentials?: { url: string; key: string; secret: string } | null): Promise<{ ok: true; storeCurrency: string; baseCurrency: string } | { ok: false; error: string }> {
   const baseCurrency = await getBaseCurrencyCode()
-  const general = await wcFetch('/settings/general', {}, credentials ?? undefined)
-  const generalCurrency = general.error ? null : extractWooStoreCurrency(general.data)
-  const status = generalCurrency ? null : await wcFetch('/system_status', {}, credentials ?? undefined)
-  const storeCurrency = generalCurrency ?? (status?.error ? null : extractWooStoreCurrency(status?.data))
+  const probes = [
+    { label: 'settings/general/woocommerce_currency', response: await wcFetch('/settings/general/woocommerce_currency', {}, credentials ?? undefined) },
+    { label: 'settings/general', response: await wcFetch('/settings/general', {}, credentials ?? undefined) },
+    { label: 'system_status', response: await wcFetch('/system_status', {}, credentials ?? undefined) },
+  ]
+  const storeCurrency = probes
+    .map((probe) => (probe.response.error ? null : extractWooStoreCurrency(probe.response.data)))
+    .find((currency): currency is string => !!currency)
+
   if (!storeCurrency) {
+    const probeErrors = probes
+      .filter((probe) => probe.response.error)
+      .map((probe) => `${probe.label}: ${probe.response.error}`)
+    if (probeErrors.length > 0) {
+      return { ok: false, error: `Could not determine the WooCommerce store currency. ${probeErrors.join(' ')}` }
+    }
     return { ok: false, error: 'Could not determine the WooCommerce store currency from the API.' }
   }
   if (storeCurrency !== baseCurrency) {
