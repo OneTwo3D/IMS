@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useTransition, useRef } from 'react'
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Building2, Camera, Loader2, Upload, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -8,19 +8,22 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { updateOrganisation, type OrganisationData } from '@/app/actions/company'
 
+export type CompanyStepHandle = {
+  save: () => Promise<boolean>
+}
+
 type Props = {
   org: OrganisationData
   onSaved: () => void
 }
 
-export function CompanyStep({ org: initialOrg, onSaved }: Props) {
+export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function CompanyStep({ org: initialOrg, onSaved }, ref) {
   const router = useRouter()
-  const [isPending, startTransition] = useTransition()
   const [co, setCo] = useState(initialOrg)
   const [logoUrl, setLogoUrl] = useState(initialOrg.logoUrl)
   const [uploading, setUploading] = useState(false)
+  const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
-  const [saved, setSaved] = useState(false)
   const fileRef = useRef<HTMLInputElement>(null)
 
   useEffect(() => {
@@ -62,21 +65,24 @@ export function CompanyStep({ org: initialOrg, onSaved }: Props) {
     }
   }
 
-  function handleSave() {
+  async function handleSave() {
     setError('')
-    setSaved(false)
-    startTransition(async () => {
+    setSaving(true)
+    try {
       const result = await updateOrganisation({ ...co, logoUrl })
       if (!result.success) {
         setError(result.error ?? 'Failed to save')
-        return
+        return false
       }
-      setSaved(true)
       router.refresh()
       onSaved()
-      setTimeout(() => setSaved(false), 2000)
-    })
+      return true
+    } finally {
+      setSaving(false)
+    }
   }
+
+  useImperativeHandle(ref, () => ({ save: handleSave }), [co, logoUrl, onSaved, router])
 
   return (
     <div className="space-y-6">
@@ -139,11 +145,7 @@ export function CompanyStep({ org: initialOrg, onSaved }: Props) {
       </div>
 
       {error && <p className="text-sm text-destructive">{error}</p>}
-
-      <Button onClick={handleSave} disabled={isPending}>
-        {isPending ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
-        {saved ? 'Saved' : 'Save Company Details'}
-      </Button>
+      <p className="text-xs text-muted-foreground">Your changes will be saved when you continue.</p>
     </div>
   )
-}
+})

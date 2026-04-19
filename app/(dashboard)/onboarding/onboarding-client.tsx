@@ -1,6 +1,6 @@
 'use client'
 
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import {
   ArrowLeft, ArrowRight, Building2, Check, CheckCircle2, Coins, ExternalLink,
@@ -10,7 +10,7 @@ import Link from 'next/link'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { WizardStepper, type StepDef } from '@/components/onboarding/wizard-stepper'
-import { CompanyStep } from '@/components/onboarding/company-step'
+import { CompanyStep, type CompanyStepHandle } from '@/components/onboarding/company-step'
 import { CurrencyStep } from '@/components/onboarding/currency-step'
 import { IntegrationsStep } from '@/components/onboarding/integrations-step'
 import { ProductsStep } from '@/components/onboarding/products-step'
@@ -75,6 +75,7 @@ export function OnboardingClient({
   accountingStatus,
 }: Props) {
   const router = useRouter()
+  const companyStepRef = useRef<CompanyStepHandle | null>(null)
   const [step, setStep] = useState(initialStep)
   const [completedSteps, setCompletedSteps] = useState<Set<string>>(() => {
     const set = new Set<string>()
@@ -88,6 +89,7 @@ export function OnboardingClient({
   const [finishing, setFinishing] = useState(false)
   const [finishError, setFinishError] = useState('')
   const [stockImported, setStockImported] = useState(false)
+  const [nextPending, setNextPending] = useState(false)
 
   const plugins = pluginDraft?.base === initialPluginState ? pluginDraft.value : initialPluginState
   const companyConfigured = companyConfiguredOverride?.base === initialCompanyConfigured
@@ -133,8 +135,8 @@ export function OnboardingClient({
     return STEPS.slice(0, index).every((_, priorIndex) => completedSteps.has(STEPS[priorIndex].key))
   }
 
-  async function goTo(index: number) {
-    if (!canAccessStep(index)) return
+  async function goTo(index: number, opts?: { force?: boolean }) {
+    if (!opts?.force && !canAccessStep(index)) return
 
     // Mark current step as visited
     markComplete(STEPS[step].key)
@@ -143,7 +145,19 @@ export function OnboardingClient({
   }
 
   async function handleNext() {
-    await goTo(Math.min(step + 1, STEPS.length - 1))
+    setNextPending(true)
+    try {
+      const nextStep = Math.min(step + 1, STEPS.length - 1)
+      if (step === 1 && !companyConfigured) {
+        const saved = await companyStepRef.current?.save()
+        if (!saved) return
+        await goTo(nextStep, { force: true })
+        return
+      }
+      await goTo(nextStep)
+    } finally {
+      setNextPending(false)
+    }
   }
 
   async function handleBack() {
@@ -212,6 +226,7 @@ export function OnboardingClient({
             {/* Step 1: Company Details */}
             {step === 1 && (
               <CompanyStep
+                ref={companyStepRef}
                 org={org}
                 onSaved={() => {
                   setCompanyConfiguredOverride({ base: initialCompanyConfigured, value: true })
@@ -415,7 +430,8 @@ export function OnboardingClient({
                     Skip
                   </Button>
                 )}
-                <Button onClick={handleNext} disabled={isLast || !canAdvanceFromCurrentStep()}>
+                <Button onClick={handleNext} disabled={isLast || nextPending || (step !== 1 && !canAdvanceFromCurrentStep())}>
+                  {nextPending ? <Loader2 className="h-4 w-4 animate-spin mr-2" /> : null}
                   Next
                   <ArrowRight className="h-4 w-4 ml-2" />
                 </Button>

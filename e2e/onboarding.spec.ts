@@ -57,6 +57,22 @@ test.describe('onboarding workflow', () => {
     resetOnboardingState()
   })
 
+  test('company step next button saves and advances', async ({ page }) => {
+    const companyName = `E2E Next ${uniqueSuffix()}`
+
+    await page.goto('/dashboard')
+    await page.getByRole('link', { name: /complete setup/i }).click()
+    await page.waitForURL('**/onboarding')
+    await expect(page.getByRole('heading', { name: 'Company Details' })).toBeVisible()
+
+    await inputForTextLabel(page, 'Company Name').fill(companyName)
+    await page.getByRole('button', { name: /^Next$/ }).click()
+
+    await expect(page.getByRole('heading', { name: 'Currency & Financial Year' })).toBeVisible()
+    expect(psql(`select name from organisations where id = 'default' limit 1;`)).toBe(companyName)
+    expect(psql(`select value from settings where key = 'onboarding_current_step' limit 1;`)).toBe('2')
+  })
+
   test('admin can resume onboarding from the dashboard banner and complete the wizard', async ({ page }) => {
     const companyName = `E2E Onboarding ${uniqueSuffix()}`
 
@@ -69,10 +85,6 @@ test.describe('onboarding workflow', () => {
     await expect(page.getByRole('button', { name: 'All Done' })).toBeDisabled()
 
     await inputForTextLabel(page, 'Company Name').fill(companyName)
-    await page.getByRole('button', { name: /save company details/i }).click()
-    await expect(page.getByText('Base currency is locked after setup. Reset the database to change it.')).toHaveCount(0)
-    await expect(page.getByRole('button', { name: /^Next$/ })).toBeEnabled()
-
     await page.getByRole('button', { name: /^Next$/ }).click()
     await expect(page.getByRole('heading', { name: 'Currency & Financial Year' })).toBeVisible()
     await expect(page.getByText(/Base currency is locked to/i)).toBeVisible()
