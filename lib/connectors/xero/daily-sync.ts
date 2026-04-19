@@ -804,15 +804,23 @@ export async function runDailyBatchSync(): Promise<{
         })
       }
 
+      // Only mark shipments that were successfully processed. Failed
+      // orders had their results removed from shipmentResults by the
+      // per-order catch block — those shipments must remain untouched
+      // (shipmentJournalDate stays null) so the next batch run retries.
       for (const shipment of shipments) {
-        const resultForShipment = shipmentResults.get(shipment.id) ?? { revenue: 0, cogs: 0 }
+        const resultForShipment = shipmentResults.get(shipment.id)
+        if (!resultForShipment) continue // failed order — skip, leave retryable
         for (const line of shipment.lines) {
-          await tx.shipmentLine.update({
-            where: { id: line.id },
-            data: {
-              costLayerSnapshot: (shipmentSnapshots.get(line.id) ?? []) as never,
-            },
-          })
+          const lineSnapshot = shipmentSnapshots.get(line.id)
+          if (lineSnapshot) {
+            await tx.shipmentLine.update({
+              where: { id: line.id },
+              data: {
+                costLayerSnapshot: lineSnapshot as never,
+              },
+            })
+          }
         }
         await tx.shipment.update({
           where: { id: shipment.id },
