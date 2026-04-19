@@ -2364,11 +2364,16 @@ export async function updateSalesOrderNotes(
 export async function generateInvoiceNumber(id: string, options?: { skipLog?: boolean }): Promise<{ success: boolean; invoiceNumber?: string; error?: string }> {
   try {
     await requirePermission('sales.process')
-    // Use a transaction to prevent race conditions on invoice numbering
+    // Use a transaction with an advisory lock to prevent race conditions
+    // on invoice numbering. The SO row lock (implicit via update) is
+    // per-order, but invoice numbers are system-wide — without the
+    // advisory lock, two concurrent calls on different orders can read
+    // the same count and generate duplicate invoice numbers.
     const result = await db.$transaction(async (tx) => {
       const so = await tx.salesOrder.findUnique({ where: { id }, select: { externalOrderNumber: true, orderNumber: true, invoiceNumber: true } })
       if (!so) throw new Error('Order not found')
       if (so.invoiceNumber) return { invoiceNumber: so.invoiceNumber, orderNumber: getSalesOrderReference({ id, ...so }) }
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(8675310)`
       const count = await tx.salesOrder.count({ where: { invoiceNumber: { not: null } } })
       const invNum = `INV-${new Date().getFullYear()}-${String(count + 1).padStart(5, '0')}`
       await tx.salesOrder.update({ where: { id }, data: { invoiceNumber: invNum, invoicedAt: new Date() } })
