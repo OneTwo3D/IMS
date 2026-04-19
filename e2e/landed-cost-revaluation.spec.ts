@@ -129,8 +129,8 @@ test.describe.serial('landed cost revaluation workflows', () => {
     expect(inspected.cogsJournalLines).toHaveLength(1)
     expect(inspected.cogsJournalLines[0]).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ debit: 2, credit: 0 }),
-        expect.objectContaining({ debit: 0, credit: 2 }),
+        expect.objectContaining({ accountCode: '500', debit: 2, credit: 0 }),
+        expect.objectContaining({ accountCode: '640', debit: 0, credit: 2 }),
       ]),
     )
   })

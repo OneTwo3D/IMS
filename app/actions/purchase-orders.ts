@@ -2991,12 +2991,12 @@ async function queueLandedCostAdjustmentJournals(
         narration: `Retrospective COGS adjustment: landed cost ${isIncrease ? 'increase' : 'decrease'} of £${absDelta.toFixed(2)} on ${adj.primaryPoRef}`,
         lines: [
           {
-            accountCode: isIncrease ? settings.cogsAccount : settings.inventoryAccount,
+            accountCode: isIncrease ? settings.cogsAccount : settings.transitAccount,
             description: `COGS adjustment — ${adj.primaryPoRef}`,
             debit: absDelta,
           },
           {
-            accountCode: isIncrease ? settings.inventoryAccount : settings.cogsAccount,
+            accountCode: isIncrease ? settings.transitAccount : settings.cogsAccount,
             description: `COGS adjustment — ${adj.primaryPoRef}`,
             credit: absDelta,
           },
@@ -3236,6 +3236,9 @@ async function recalculateDirectLandedCosts(
     },
   })
   if (!po) return { revalidatePoIds: [], inventoryTransitAdjustments: [], cogsAdjustments: [] }
+  if (po.status === 'CLOSED') {
+    throw new Error(`Cannot recalculate landed costs for ${poId}: purchase order is in a locked status`)
+  }
 
   const landedByLine = new Map<string, Prisma.Decimal>()
   for (const line of po.lines) {

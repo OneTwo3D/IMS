@@ -170,6 +170,133 @@ async function seedFxRefundScenario() {
   }))
 }
 
+async function seedMixedRateRefundScenario() {
+  const suffix = uniqueSuffix()
+  await seedAccountingSettings()
+  const warehouse = await ensureDefaultWarehouse()
+  const customer = await db.customer.create({
+    data: {
+      firstName: 'Mixed',
+      lastName: `Refund ${suffix}`,
+      email: `mixed-refund-${suffix}@example.com`,
+      active: true,
+    },
+  })
+  const standardRate = await db.taxRate.create({
+    data: {
+      name: `Mixed Refund Standard ${suffix}`,
+      rate: 0.2,
+      type: 'VAT',
+      taxCategory: 'STANDARD',
+      usedFor: 'SALES',
+      accountingTaxType: 'STANDARD20',
+      active: true,
+    },
+  })
+  const reducedRate = await db.taxRate.create({
+    data: {
+      name: `Mixed Refund Reduced ${suffix}`,
+      rate: 0.05,
+      type: 'VAT',
+      taxCategory: 'REDUCED',
+      usedFor: 'SALES',
+      accountingTaxType: 'REDUCED5',
+      active: true,
+    },
+  })
+  const standardProduct = await db.product.create({
+    data: {
+      sku: `E2E-MIXED-STD-${suffix}`,
+      name: `Mixed Refund Standard Product ${suffix}`,
+      type: 'SIMPLE',
+      lifecycleStatus: 'ACTIVE',
+      salesPriceBase: 12,
+      salesPriceTaxInclusive: false,
+      taxCategory: 'STANDARD',
+      stockUnit: 'pcs',
+      oversellAllowed: false,
+      active: true,
+    },
+  })
+  const reducedProduct = await db.product.create({
+    data: {
+      sku: `E2E-MIXED-RED-${suffix}`,
+      name: `Mixed Refund Reduced Product ${suffix}`,
+      type: 'SIMPLE',
+      lifecycleStatus: 'ACTIVE',
+      salesPriceBase: 8,
+      salesPriceTaxInclusive: false,
+      taxCategory: 'REDUCED',
+      stockUnit: 'pcs',
+      oversellAllowed: false,
+      active: true,
+    },
+  })
+
+  const order = await db.salesOrder.create({
+    data: {
+      orderNumber: `SO-MIXED-${suffix}`,
+      externalOrderNumber: `MIXED-${suffix}`,
+      status: 'SHIPPED',
+      currency: 'GBP',
+      fxRateToBase: 1,
+      customerId: customer.id,
+      customerName: `${customer.firstName} ${customer.lastName}`,
+      customerEmail: customer.email,
+      billingAddress: { country: 'GB' } as never,
+      shippingAddress: { country: 'GB' } as never,
+      subtotalForeign: 20,
+      shippingForeign: 0,
+      taxRateName: standardRate.name,
+      taxRatePercent: 0.2,
+      taxForeign: 2.8,
+      pricesIncludeVat: false,
+      totalForeign: 22.8,
+      subtotalBase: 20,
+      shippingBase: 0,
+      taxBase: 2.8,
+      totalBase: 22.8,
+      shipFromWarehouseId: warehouse.id,
+      shippedAt: new Date(),
+      lines: {
+        create: [
+          {
+            productId: standardProduct.id,
+            sku: standardProduct.sku,
+            description: standardProduct.name,
+            qty: 1,
+            unitPriceForeign: 12,
+            unitPriceBase: 12,
+            taxRateId: standardRate.id,
+            taxForeign: 2.4,
+            taxBase: 2.4,
+            totalForeign: 12,
+            totalBase: 12,
+          },
+          {
+            productId: reducedProduct.id,
+            sku: reducedProduct.sku,
+            description: reducedProduct.name,
+            qty: 1,
+            unitPriceForeign: 8,
+            unitPriceBase: 8,
+            taxRateId: reducedRate.id,
+            taxForeign: 0.4,
+            taxBase: 0.4,
+            totalForeign: 8,
+            totalBase: 8,
+          },
+        ],
+      },
+    },
+  })
+
+  console.log(JSON.stringify({
+    orderId: order.id,
+    expectedTaxTypes: ['STANDARD20', 'REDUCED5'],
+  }))
+}
+
 async function inspectFxRefundScenario(orderId: string) {
   const refund = await db.salesOrderRefund.findFirst({
     where: { orderId },
@@ -220,6 +347,42 @@ async function inspectFxRefundScenario(orderId: string) {
           description: line.description ?? null,
           quantity: Number(line.quantity ?? 0),
           unitAmount: Number(line.unitAmount ?? 0),
+        }))
+      : [],
+  }))
+}
+
+async function inspectCreditNoteScenario(orderId: string) {
+  const refund = await db.salesOrderRefund.findFirst({
+    where: { orderId },
+    orderBy: { createdAt: 'desc' },
+    select: { id: true },
+  })
+
+  const creditNoteLog = refund
+    ? await db.accountingSyncLog.findFirst({
+        where: {
+          connector: 'xero',
+          type: 'CREDIT_NOTE',
+          referenceType: 'SalesOrderRefund',
+          referenceId: refund.id,
+        },
+        orderBy: { createdAt: 'desc' },
+        select: { payload: true },
+      })
+    : null
+
+  const payload = creditNoteLog?.payload as {
+    lines?: Array<{ description?: string; quantity?: number; unitAmount?: number; taxType?: string }>
+  } | null
+
+  console.log(JSON.stringify({
+    lines: Array.isArray(payload?.lines)
+      ? payload.lines.map((line) => ({
+          description: line.description ?? null,
+          quantity: Number(line.quantity ?? 0),
+          unitAmount: Number(line.unitAmount ?? 0),
+          taxType: line.taxType ?? null,
         }))
       : [],
   }))
@@ -789,9 +952,16 @@ async function main() {
     case 'seed-fx-refund':
       await seedFxRefundScenario()
       break
+    case 'seed-mixed-rate-refund':
+      await seedMixedRateRefundScenario()
+      break
     case 'inspect-fx-refund':
       if (!args[0]) throw new Error('inspect-fx-refund requires <orderId>')
       await inspectFxRefundScenario(args[0])
+      break
+    case 'inspect-credit-note':
+      if (!args[0]) throw new Error('inspect-credit-note requires <orderId>')
+      await inspectCreditNoteScenario(args[0])
       break
     case 'import-wc-fee-order':
       await importWcFeeScenario()
@@ -820,7 +990,7 @@ async function main() {
     default:
       throw new Error(
         'usage: tsx scripts/commerce-accounting-e2e-fixture.ts ' +
-        '<seed-manual-fx-order-ui|seed-fx-refund|inspect-fx-refund|import-wc-fee-order|inspect-wc-fee-order|inspect-sales-invoice|import-wc-discount-order|seed-daily-batch-discounts|run-daily-batch-discounts|inspect-daily-batch-discounts> [...]',
+        '<seed-manual-fx-order-ui|seed-fx-refund|seed-mixed-rate-refund|inspect-fx-refund|inspect-credit-note|import-wc-fee-order|inspect-wc-fee-order|inspect-sales-invoice|import-wc-discount-order|seed-daily-batch-discounts|run-daily-batch-discounts|inspect-daily-batch-discounts> [...]',
       )
   }
 }

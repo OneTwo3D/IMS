@@ -1353,7 +1353,7 @@ export async function createRefund(
     const numbering = await getNumberingFormats()
 
     type CreatedRefundLine = {
-      id: string; productId: string | null; description: string
+      id: string; lineId: string | null; productId: string | null; description: string
       qty: number; unitPriceForeign: number; unitPriceBase: number; totalForeign: number; totalBase: number
     }
 
@@ -1476,7 +1476,7 @@ export async function createRefund(
           },
         })
         createdRefundLines.push({
-          id: createdLine.id, productId: createdLine.productId,
+          id: createdLine.id, lineId: refundLine.lineId ?? null, productId: createdLine.productId,
           description: createdLine.description,
           qty: Number(createdLine.qty),
           unitPriceForeign: Number(createdLine.unitPriceForeign),
@@ -1518,7 +1518,17 @@ export async function createRefund(
         getAccountingSettings(),
         db.salesOrder.findUnique({
           where: { id: orderId },
-          select: { customer: { select: { firstName: true, lastName: true, email: true } }, currency: true, taxRateName: true },
+          select: {
+            customer: { select: { firstName: true, lastName: true, email: true } },
+            currency: true,
+            taxRateName: true,
+            lines: {
+              select: {
+                id: true,
+                taxRate: { select: { accountingTaxType: true } },
+              },
+            },
+          },
         }),
         getBaseCurrencyCode(),
       ])
@@ -1529,6 +1539,9 @@ export async function createRefund(
       const cnTaxRate = orderForCN?.taxRateName
         ? await db.taxRate.findFirst({ where: { name: orderForCN.taxRateName, active: true }, select: { accountingTaxType: true } })
         : null
+      const taxTypeBySalesLineId = new Map(
+        (orderForCN?.lines ?? []).map((line) => [line.id, line.taxRate?.accountingTaxType ?? undefined]),
+      )
       await queueAccountingSync({
         type: 'CREDIT_NOTE',
         referenceType: 'SalesOrderRefund',
@@ -1547,7 +1560,7 @@ export async function createRefund(
               ? (l.qty > 0 ? l.unitPriceBase : l.totalBase)
               : (l.qty > 0 ? l.unitPriceForeign : l.totalForeign),
             accountCode: settings.salesAccount,
-            taxType: cnTaxRate?.accountingTaxType ?? undefined,
+            taxType: (l.lineId ? taxTypeBySalesLineId.get(l.lineId) : undefined) ?? cnTaxRate?.accountingTaxType ?? undefined,
           })),
         },
       })

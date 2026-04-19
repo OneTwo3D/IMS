@@ -22,9 +22,23 @@ type FxRefundInspect = {
   }>
 }
 
+type CreditNoteInspect = {
+  lines: Array<{
+    description: string | null
+    quantity: number
+    unitAmount: number
+    taxType: string | null
+  }>
+}
+
 type WcFeeSeed = {
   orderId: string
   feeDescription: string
+}
+
+type MixedRateRefundSeed = {
+  orderId: string
+  expectedTaxTypes: string[]
 }
 
 type ManualFxUiSeed = {
@@ -188,6 +202,28 @@ test.describe.serial('connector and accounting regressions', () => {
         unitAmount: seeded.expectedUnitAmount,
       }),
     ])
+  })
+
+  test('queues mixed-rate credit notes with the originating line tax types', async ({ page }) => {
+    const seeded = parseJsonLine<MixedRateRefundSeed>(runFixture(['seed-mixed-rate-refund']))
+
+    await page.goto(`/sales/${seeded.orderId}`)
+    await expect(page.getByRole('button', { name: /^Refund$/ })).toBeVisible()
+    await page.getByRole('button', { name: /^Refund$/ }).click()
+
+    const refundDialog = page.getByRole('dialog', { name: 'Process Refund' })
+    await expect(refundDialog).toBeVisible()
+    await refundDialog.locator('input').first().fill('Mixed VAT refund')
+    await refundDialog.locator('select').selectOption('')
+    const qtyInputs = refundDialog.locator('input[type="number"]')
+    await qtyInputs.nth(0).fill('1')
+    await qtyInputs.nth(1).fill('1')
+    await refundDialog.getByRole('button', { name: /confirm refund/i }).click()
+    await expect(refundDialog).toBeHidden()
+
+    const inspected = parseJsonLine<CreditNoteInspect>(runFixture(['inspect-credit-note', seeded.orderId]))
+    expect(inspected.lines).toHaveLength(2)
+    expect(inspected.lines.map((line) => line.taxType)).toEqual(seeded.expectedTaxTypes)
   })
 
   test('imports WooCommerce fee lines separately from shipping and preserves fee tax', async ({ page }) => {
