@@ -12,6 +12,19 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '1.4.1',
+    date: '2026-04-19',
+    title: 'Deployment script hotfix',
+    summary: 'The bundled production update script no longer aborts after printing recent commits during a git-based deploy.',
+    userMessage: 'Deployment automation is more reliable: the bundled update script now completes cleanly when showing recent changes from git.',
+    userHighlights: [
+      'Fixed the bundled update script so git-based production updates complete cleanly instead of aborting after printing recent commits.',
+    ],
+    technicalHighlights: [
+      'Replaced the pipefail-sensitive `git log | head` pipeline in `scripts/update.sh` with a single `git log --max-count` invocation.',
+    ],
+  },
+  {
     version: '1.4.0',
     date: '2026-04-19',
     title: 'Onboarding, opening stock import, and profitability usability',

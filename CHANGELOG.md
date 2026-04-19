@@ -6,6 +6,12 @@ This repository uses an `x.y.z` release scheme.
 - Increment `y` for user-facing non-breaking changes.
 - Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
+## 1.4.1 - 2026-04-19
+
+### Technical
+
+- Fixed `scripts/update.sh` so git-based deploys no longer abort under `set -o pipefail` when printing the recent commit list.
+
 ## 1.4.0 - 2026-04-19
 
 ### User-facing

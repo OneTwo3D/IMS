@@ -136,7 +136,7 @@ if ! $NO_GIT; then
       echo ""
       info "Changes in this update:"
       run_git_as_user "${APP_USER}" git -C "${APP_DIR}" log \
-        --oneline "${CURRENT_COMMIT}..${NEW_COMMIT}" | head -20
+        --oneline --max-count 20 "${CURRENT_COMMIT}..${NEW_COMMIT}"
     fi
   else
     [[ -n "${GIT_REPO_URL:-}" ]] || die "No git checkout and no GIT_REPO_URL in ${DEPLOY_META_FILE}. Use --no-git to skip."
