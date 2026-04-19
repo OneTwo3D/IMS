@@ -1,11 +1,12 @@
 'use client'
 
-import { useState, useMemo } from 'react'
-import { Target, ArrowUp, ArrowDown, TrendingUp, TrendingDown, Minus, Download } from 'lucide-react'
+import { useState, useMemo, useEffect } from 'react'
+import { Target, ArrowUp, ArrowDown, TrendingUp, TrendingDown, Minus, Download, Settings2, ChevronLeft, ChevronRight } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
+import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { ProductLink } from '@/components/inventory/product-link'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { formatMoney } from '@/lib/utils'
@@ -23,6 +24,60 @@ const LIFECYCLE_OPTIONS = [
   { value: 'NOT_FOR_SALE', label: 'Not for Sale' },
   { value: 'ARCHIVED', label: 'Archived' },
 ] as const
+
+const PAGE_SIZE = 50
+
+// ---------------------------------------------------------------------------
+// Column definitions
+// ---------------------------------------------------------------------------
+
+type ColKey = 'sku' | 'name' | 'type' | 'lifecycleStatus' | 'totalStock'
+  | 'salesPrice' | 'salePrice' | 'latestCogs' | 'unitMarginPct'
+  | 'currentFyRevenue' | 'currentFyCogs' | 'currentFyProfit' | 'currentFyQtySold'
+  | 'previousFyRevenue' | 'previousFyCogs' | 'previousFyProfit' | 'previousFyQtySold'
+
+type ColDef = { key: ColKey; label: string; shortLabel?: string; align?: 'right'; group?: string }
+
+const ALL_COLUMNS: ColDef[] = [
+  { key: 'sku', label: 'SKU' },
+  { key: 'name', label: 'Product' },
+  { key: 'type', label: 'Type' },
+  { key: 'lifecycleStatus', label: 'Status' },
+  { key: 'totalStock', label: 'Stock', align: 'right' },
+  { key: 'salesPrice', label: 'List Price', align: 'right' },
+  { key: 'salePrice', label: 'Sale Price', align: 'right' },
+  { key: 'latestCogs', label: 'Latest COGS', align: 'right' },
+  { key: 'unitMarginPct', label: 'Margin %', align: 'right' },
+  { key: 'currentFyRevenue', label: 'Revenue', shortLabel: 'Revenue (Current)', align: 'right', group: 'current' },
+  { key: 'currentFyCogs', label: 'COGS', shortLabel: 'COGS (Current)', align: 'right', group: 'current' },
+  { key: 'currentFyProfit', label: 'Profit', shortLabel: 'Profit (Current)', align: 'right', group: 'current' },
+  { key: 'currentFyQtySold', label: 'Qty', shortLabel: 'Qty (Current)', align: 'right', group: 'current' },
+  { key: 'previousFyRevenue', label: 'Revenue', shortLabel: 'Revenue (Previous)', align: 'right', group: 'previous' },
+  { key: 'previousFyCogs', label: 'COGS', shortLabel: 'COGS (Previous)', align: 'right', group: 'previous' },
+  { key: 'previousFyProfit', label: 'Profit', shortLabel: 'Profit (Previous)', align: 'right', group: 'previous' },
+  { key: 'previousFyQtySold', label: 'Qty', shortLabel: 'Qty (Previous)', align: 'right', group: 'previous' },
+]
+
+const DEFAULT_VISIBLE: ColKey[] = [
+  'sku', 'name', 'lifecycleStatus', 'totalStock', 'unitMarginPct',
+  'currentFyRevenue', 'currentFyProfit', 'currentFyQtySold',
+]
+const FIXED_COLS: ColKey[] = ['sku']
+const LS_KEY = 'pp-report-cols'
+
+function loadCols(): ColKey[] {
+  if (typeof window === 'undefined') return DEFAULT_VISIBLE
+  try {
+    const raw = localStorage.getItem(LS_KEY)
+    if (raw) {
+      const arr = JSON.parse(raw) as string[]
+      const valid = new Set(ALL_COLUMNS.map((c) => c.key))
+      const filtered = arr.filter((k) => valid.has(k as ColKey)) as ColKey[]
+      if (filtered.length > 0) return filtered
+    }
+  } catch { /* ignore */ }
+  return DEFAULT_VISIBLE
+}
 
 // ---------------------------------------------------------------------------
 // Main
@@ -45,6 +100,39 @@ export function ProductProfitabilityClient({ data }: Props) {
   const [sortCol, setSortCol] = useState<string>('currentFyRevenue')
   const [sortDir, setSortDir] = useState<SortDir>('desc')
 
+  // Pagination
+  const [page, setPage] = useState(0)
+
+  // Column visibility
+  const [visibleCols, setVisibleCols] = useState<ColKey[]>(loadCols)
+  const [showColPicker, setShowColPicker] = useState(false)
+  const [pickerDraft, setPickerDraft] = useState<Set<ColKey>>(new Set(visibleCols))
+  const colSet = new Set(visibleCols)
+
+  useEffect(() => {
+    try { localStorage.setItem(LS_KEY, JSON.stringify(visibleCols)) } catch { /* ignore */ }
+  }, [visibleCols])
+
+  function openColPicker() {
+    setPickerDraft(new Set(visibleCols))
+    setShowColPicker(true)
+  }
+
+  function applyColPicker() {
+    const ordered = ALL_COLUMNS.map((c) => c.key).filter((k) => pickerDraft.has(k))
+    setVisibleCols(ordered)
+    setShowColPicker(false)
+  }
+
+  function togglePickerCol(key: ColKey) {
+    setPickerDraft((prev) => {
+      const n = new Set(prev)
+      if (FIXED_COLS.includes(key)) return n
+      if (n.has(key)) n.delete(key); else n.add(key)
+      return n
+    })
+  }
+
   function handleSort(key: string) {
     if (sortCol === key) setSortDir((d) => d === 'asc' ? 'desc' : 'asc')
     else { setSortCol(key); setSortDir('desc') }
@@ -57,6 +145,7 @@ export function ProductProfitabilityClient({ data }: Props) {
       else next.add(value)
       return next
     })
+    setPage(0)
   }
 
   // Classify each row into a band
@@ -94,6 +183,16 @@ export function ProductProfitabilityClient({ data }: Props) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rows, band, lifecycleFilter, hideOutOfStock, sortCol, sortDir, targetPct, tolerancePct])
 
+  // Reset page when filters change
+  useEffect(() => { setPage(0) }, [band, hideOutOfStock, targetPct, tolerancePct, sortCol, sortDir])
+
+  // Pagination
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE))
+  const safePage = Math.min(page, totalPages - 1)
+  const pageStart = safePage * PAGE_SIZE
+  const pageEnd = Math.min(pageStart + PAGE_SIZE, filtered.length)
+  const pageRows = filtered.slice(pageStart, pageEnd)
+
   // Band counts (always computed on lifecycle+stock-filtered set, ignoring band filter)
   const bandCounts = useMemo(() => {
     const base = rows.filter((r) => {
@@ -110,7 +209,7 @@ export function ProductProfitabilityClient({ data }: Props) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [rows, lifecycleFilter, hideOutOfStock, targetPct, tolerancePct])
 
-  // Filtered summary
+  // Filtered summary (across ALL filtered rows, not just current page)
   const filteredSummary = useMemo(() => {
     return {
       currentFyRevenue: filtered.reduce((s, r) => s + r.currentFyRevenue, 0),
@@ -122,7 +221,7 @@ export function ProductProfitabilityClient({ data }: Props) {
     }
   }, [filtered])
 
-  // CSV export
+  // CSV export (all filtered rows, not just current page)
   function handleExport() {
     const header = ['SKU', 'Name', 'Type', 'Status', 'Stock', 'List Price', 'Sale Price', 'Latest COGS', 'Unit Margin', 'Margin %',
       `Revenue (${summary.fyLabel})`, `COGS (${summary.fyLabel})`, `Profit (${summary.fyLabel})`, `Qty (${summary.fyLabel})`,
@@ -139,6 +238,14 @@ export function ProductProfitabilityClient({ data }: Props) {
     const a = document.createElement('a')
     a.href = url; a.download = 'product-profitability.csv'; a.click()
     URL.revokeObjectURL(url)
+  }
+
+  // Build column label with FY period for grouped columns
+  function colLabel(col: ColDef): string {
+    if (col.group === 'current') return `${col.label} (${summary.fyLabel})`
+    if (col.group === 'previous') return `${col.label} (${summary.prevFyLabel})`
+    if (col.key === 'salesPrice' || col.key === 'salePrice' || col.key === 'latestCogs') return `${col.label} (${baseCurrency.code})`
+    return col.label
   }
 
   // Column header
@@ -166,13 +273,74 @@ export function ProductProfitabilityClient({ data }: Props) {
     return <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium tabular-nums ${cls}`}>{row.unitMarginPct}%</span>
   }
 
+  // Render cell content for a given column key
+  function renderCell(r: ProfitabilityRow, key: ColKey) {
+    switch (key) {
+      case 'sku': return <ProductLink productId={r.productId} sku={r.sku} name="" />
+      case 'name': return <span className="text-xs truncate max-w-48 block">{r.name}</span>
+      case 'type': return <span className="text-xs">{r.type}</span>
+      case 'lifecycleStatus': return (
+        <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${
+          r.lifecycleStatus === 'ACTIVE' ? 'bg-green-100 text-green-700'
+          : r.lifecycleStatus === 'ARCHIVED' ? 'bg-gray-100 text-gray-500'
+          : 'bg-orange-100 text-orange-700'
+        }`}>{r.lifecycleStatus}</span>
+      )
+      case 'totalStock': return <span className={`tabular-nums text-xs ${r.totalStock <= 0 ? 'text-destructive' : ''}`}>{r.totalStock}</span>
+      case 'salesPrice': return <span className="tabular-nums text-xs font-mono">{r.salesPrice != null ? fmtBase(r.salesPrice) : '—'}</span>
+      case 'salePrice': return <span className="tabular-nums text-xs font-mono">{r.salePrice != null ? fmtBase(r.salePrice) : '—'}</span>
+      case 'latestCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.latestCogs != null ? fmtBase(r.latestCogs) : '—'}</span>
+      case 'unitMarginPct': return <MarginBadge row={r} />
+      case 'currentFyRevenue': return <span className="tabular-nums text-xs font-mono font-medium">{r.currentFyRevenue > 0 ? fmtBase(r.currentFyRevenue) : '—'}</span>
+      case 'currentFyCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.currentFyCogs > 0 ? fmtBase(r.currentFyCogs) : '—'}</span>
+      case 'currentFyProfit': return (
+        <span className={`tabular-nums text-xs font-mono ${r.currentFyProfit > 0 ? 'text-green-600' : r.currentFyProfit < 0 ? 'text-destructive' : ''}`}>
+          {r.currentFyRevenue > 0 || r.currentFyCogs > 0 ? fmtBase(r.currentFyProfit) : '—'}
+        </span>
+      )
+      case 'currentFyQtySold': return <span className="tabular-nums text-xs">{r.currentFyQtySold > 0 ? r.currentFyQtySold : '—'}</span>
+      case 'previousFyRevenue': return <span className="tabular-nums text-xs font-mono">{r.previousFyRevenue > 0 ? fmtBase(r.previousFyRevenue) : '—'}</span>
+      case 'previousFyCogs': return <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.previousFyCogs > 0 ? fmtBase(r.previousFyCogs) : '—'}</span>
+      case 'previousFyProfit': return (
+        <span className={`tabular-nums text-xs font-mono ${r.previousFyProfit > 0 ? 'text-green-600' : r.previousFyProfit < 0 ? 'text-destructive' : ''}`}>
+          {r.previousFyRevenue > 0 || r.previousFyCogs > 0 ? fmtBase(r.previousFyProfit) : '—'}
+        </span>
+      )
+      case 'previousFyQtySold': return <span className="tabular-nums text-xs">{r.previousFyQtySold > 0 ? r.previousFyQtySold : '—'}</span>
+    }
+  }
+
+  // Footer totals mapping
+  const FOOTER_COLS: Partial<Record<ColKey, (s: typeof filteredSummary) => string>> = {
+    currentFyRevenue: (s) => fmtBase(s.currentFyRevenue),
+    currentFyCogs: (s) => fmtBase(s.currentFyCogs),
+    currentFyProfit: (s) => fmtBase(s.currentFyProfit),
+    previousFyRevenue: (s) => fmtBase(s.previousFyRevenue),
+    previousFyCogs: (s) => fmtBase(s.previousFyCogs),
+    previousFyProfit: (s) => fmtBase(s.previousFyProfit),
+  }
+
+  const FOOTER_TONE: Partial<Record<ColKey, (s: typeof filteredSummary) => string>> = {
+    currentFyCogs: () => 'text-muted-foreground',
+    previousFyCogs: () => 'text-muted-foreground',
+    currentFyProfit: (s) => s.currentFyProfit >= 0 ? 'text-green-600' : 'text-destructive',
+    previousFyProfit: (s) => s.previousFyProfit >= 0 ? 'text-green-600' : 'text-destructive',
+  }
+
+  const activeCols = ALL_COLUMNS.filter((c) => colSet.has(c.key))
+
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
         <h1 className="text-2xl font-semibold">Product Profitability</h1>
-        <Button variant="outline" size="sm" className="h-8 text-xs" onClick={handleExport}>
-          <Download className="h-3 w-3 mr-1" />Export CSV
-        </Button>
+        <div className="flex items-center gap-2">
+          <Button variant="outline" size="sm" className="h-8" onClick={openColPicker} title="Column settings">
+            <Settings2 className="h-4 w-4" />
+          </Button>
+          <Button variant="outline" size="sm" className="h-8 text-xs" onClick={handleExport}>
+            <Download className="h-3 w-3 mr-1" />Export CSV
+          </Button>
+        </div>
       </div>
 
       {/* Summary cards */}
@@ -264,7 +432,7 @@ export function ProductProfitabilityClient({ data }: Props) {
           <input
             type="checkbox"
             checked={hideOutOfStock}
-            onChange={(e) => setHideOutOfStock(e.target.checked)}
+            onChange={(e) => { setHideOutOfStock(e.target.checked); setPage(0) }}
             className="rounded border-input"
           />
           <span className="text-xs">Hide out of stock</span>
@@ -286,7 +454,7 @@ export function ProductProfitabilityClient({ data }: Props) {
             <button
               key={t.key}
               type="button"
-              onClick={() => setBand(t.key)}
+              onClick={() => { setBand(t.key); setPage(0) }}
               className={`shrink-0 flex items-center gap-1 px-3 py-2 text-sm font-medium border-b-2 -mb-px transition-colors ${
                 active ? 'border-primary text-primary' : 'border-transparent text-muted-foreground hover:text-foreground'
               }`}
@@ -304,96 +472,115 @@ export function ProductProfitabilityClient({ data }: Props) {
       {/* Data table */}
       <div className="rounded-md border">
         <div className="flex items-center justify-between px-3 py-1.5 bg-muted/30 border-b">
-          <span className="text-xs text-muted-foreground">{filtered.length} of {rows.length} products</span>
+          <span className="text-xs text-muted-foreground">
+            {filtered.length > 0
+              ? `${pageStart + 1}–${pageEnd} of ${filtered.length} products`
+              : `0 of ${rows.length} products`}
+          </span>
+          {totalPages > 1 && (
+            <div className="flex items-center gap-1">
+              <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={safePage === 0}>
+                <ChevronLeft className="h-4 w-4" />
+              </Button>
+              <span className="text-xs tabular-nums text-muted-foreground px-1">
+                {safePage + 1} / {totalPages}
+              </span>
+              <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))} disabled={safePage >= totalPages - 1}>
+                <ChevronRight className="h-4 w-4" />
+              </Button>
+            </div>
+          )}
         </div>
-        <Table className="min-w-[1200px]" containerClassName="max-h-[calc(100vh-22rem)]">
-          <TableHeader className="bg-muted/50">
+        <Table containerClassName="max-h-[calc(100vh-20rem)]">
+          <TableHeader className="bg-muted/50 [&_th]:bg-muted/95">
             <TableRow>
-              <ColHeader colKey="sku" label="SKU" />
-              <ColHeader colKey="name" label="Product" />
-              <ColHeader colKey="type" label="Type" />
-              <ColHeader colKey="lifecycleStatus" label="Status" />
-              <ColHeader colKey="totalStock" label="Stock" align="right" />
-              <ColHeader colKey="salesPrice" label={`List Price (${baseCurrency.code})`} align="right" />
-              <ColHeader colKey="salePrice" label={`Sale Price (${baseCurrency.code})`} align="right" />
-              <ColHeader colKey="latestCogs" label={`Latest COGS (${baseCurrency.code})`} align="right" />
-              <ColHeader colKey="unitMarginPct" label="Margin %" align="right" />
-              <ColHeader colKey="currentFyRevenue" label={`Revenue (${summary.fyLabel})`} align="right" />
-              <ColHeader colKey="currentFyCogs" label={`COGS (${summary.fyLabel})`} align="right" />
-              <ColHeader colKey="currentFyProfit" label={`Profit (${summary.fyLabel})`} align="right" />
-              <ColHeader colKey="currentFyQtySold" label={`Qty (${summary.fyLabel})`} align="right" />
-              <ColHeader colKey="previousFyRevenue" label={`Revenue (${summary.prevFyLabel})`} align="right" />
-              <ColHeader colKey="previousFyCogs" label={`COGS (${summary.prevFyLabel})`} align="right" />
-              <ColHeader colKey="previousFyProfit" label={`Profit (${summary.prevFyLabel})`} align="right" />
-              <ColHeader colKey="previousFyQtySold" label={`Qty (${summary.prevFyLabel})`} align="right" />
+              {activeCols.map((col) => (
+                <ColHeader key={col.key} colKey={col.key} label={colLabel(col)} align={col.align} />
+              ))}
             </TableRow>
           </TableHeader>
           <TableBody className="divide-y">
-            {filtered.map((r) => (
+            {pageRows.map((r) => (
               <TableRow key={r.productId}>
-                <TableCell><ProductLink productId={r.productId} sku={r.sku} name="" /></TableCell>
-                <TableCell><span className="text-xs truncate max-w-48 block">{r.name}</span></TableCell>
-                <TableCell><span className="text-xs">{r.type}</span></TableCell>
-                <TableCell>
-                  <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${
-                    r.lifecycleStatus === 'ACTIVE' ? 'bg-green-100 text-green-700'
-                    : r.lifecycleStatus === 'ARCHIVED' ? 'bg-gray-100 text-gray-500'
-                    : 'bg-orange-100 text-orange-700'
-                  }`}>{r.lifecycleStatus}</span>
-                </TableCell>
-                <TableCell className="text-right">
-                  <span className={`tabular-nums text-xs ${r.totalStock <= 0 ? 'text-destructive' : ''}`}>
-                    {r.totalStock}
-                  </span>
-                </TableCell>
-                <TableCell className="text-right">
-                  <span className="tabular-nums text-xs font-mono">{r.salesPrice != null ? fmtBase(r.salesPrice) : '—'}</span>
-                </TableCell>
-                <TableCell className="text-right">
-                  <span className="tabular-nums text-xs font-mono">{r.salePrice != null ? fmtBase(r.salePrice) : '—'}</span>
-                </TableCell>
-                <TableCell className="text-right">
-                  <span className="tabular-nums text-xs font-mono text-muted-foreground">{r.latestCogs != null ? fmtBase(r.latestCogs) : '—'}</span>
-                </TableCell>
-                <TableCell className="text-right"><MarginBadge row={r} /></TableCell>
-                <TableCell className="text-right"><span className="tabular-nums text-xs font-mono font-medium">{r.currentFyRevenue > 0 ? fmtBase(r.currentFyRevenue) : '—'}</span></TableCell>
-                <TableCell className="text-right"><span className="tabular-nums text-xs font-mono text-muted-foreground">{r.currentFyCogs > 0 ? fmtBase(r.currentFyCogs) : '—'}</span></TableCell>
-                <TableCell className="text-right">
-                  <span className={`tabular-nums text-xs font-mono ${r.currentFyProfit > 0 ? 'text-green-600' : r.currentFyProfit < 0 ? 'text-destructive' : ''}`}>
-                    {r.currentFyRevenue > 0 || r.currentFyCogs > 0 ? fmtBase(r.currentFyProfit) : '—'}
-                  </span>
-                </TableCell>
-                <TableCell className="text-right"><span className="tabular-nums text-xs">{r.currentFyQtySold > 0 ? r.currentFyQtySold : '—'}</span></TableCell>
-                <TableCell className="text-right"><span className="tabular-nums text-xs font-mono">{r.previousFyRevenue > 0 ? fmtBase(r.previousFyRevenue) : '—'}</span></TableCell>
-                <TableCell className="text-right"><span className="tabular-nums text-xs font-mono text-muted-foreground">{r.previousFyCogs > 0 ? fmtBase(r.previousFyCogs) : '—'}</span></TableCell>
-                <TableCell className="text-right">
-                  <span className={`tabular-nums text-xs font-mono ${r.previousFyProfit > 0 ? 'text-green-600' : r.previousFyProfit < 0 ? 'text-destructive' : ''}`}>
-                    {r.previousFyRevenue > 0 || r.previousFyCogs > 0 ? fmtBase(r.previousFyProfit) : '—'}
-                  </span>
-                </TableCell>
-                <TableCell className="text-right"><span className="tabular-nums text-xs">{r.previousFyQtySold > 0 ? r.previousFyQtySold : '—'}</span></TableCell>
+                {activeCols.map((col) => (
+                  <TableCell key={col.key} className={col.align === 'right' ? 'text-right' : ''}>
+                    {renderCell(r, col.key)}
+                  </TableCell>
+                ))}
               </TableRow>
             ))}
           </TableBody>
           <tfoot className="border-t bg-muted/30 text-sm font-medium">
             <tr>
-              <td className="px-3 py-2"><span>Totals</span></td>
-              <td /><td /><td />
-              <td />
-              <td /><td /><td /><td />
-              <td className="px-3 py-2 text-right"><span className="tabular-nums font-mono">{fmtBase(filteredSummary.currentFyRevenue)}</span></td>
-              <td className="px-3 py-2 text-right"><span className="tabular-nums font-mono text-muted-foreground">{fmtBase(filteredSummary.currentFyCogs)}</span></td>
-              <td className="px-3 py-2 text-right"><span className={`tabular-nums font-mono ${filteredSummary.currentFyProfit >= 0 ? 'text-green-600' : 'text-destructive'}`}>{fmtBase(filteredSummary.currentFyProfit)}</span></td>
-              <td />
-              <td className="px-3 py-2 text-right"><span className="tabular-nums font-mono">{fmtBase(filteredSummary.previousFyRevenue)}</span></td>
-              <td className="px-3 py-2 text-right"><span className="tabular-nums font-mono text-muted-foreground">{fmtBase(filteredSummary.previousFyCogs)}</span></td>
-              <td className="px-3 py-2 text-right"><span className={`tabular-nums font-mono ${filteredSummary.previousFyProfit >= 0 ? 'text-green-600' : 'text-destructive'}`}>{fmtBase(filteredSummary.previousFyProfit)}</span></td>
-              <td />
+              {activeCols.map((col, i) => {
+                const fn = FOOTER_COLS[col.key]
+                if (i === 0) return <td key={col.key} className="px-3 py-2"><span>Totals</span></td>
+                if (!fn) return <td key={col.key} />
+                const tone = FOOTER_TONE[col.key]
+                return (
+                  <td key={col.key} className="px-3 py-2 text-right">
+                    <span className={`tabular-nums font-mono ${tone ? tone(filteredSummary) : ''}`}>
+                      {fn(filteredSummary)}
+                    </span>
+                  </td>
+                )
+              })}
             </tr>
           </tfoot>
         </Table>
         {filtered.length === 0 && <p className="text-center text-sm text-muted-foreground py-8">No products match the current filters.</p>}
+        {/* Bottom pagination */}
+        {totalPages > 1 && (
+          <div className="flex items-center justify-between px-3 py-1.5 bg-muted/30 border-t">
+            <span className="text-xs text-muted-foreground">
+              {pageStart + 1}–{pageEnd} of {filtered.length}
+            </span>
+            <div className="flex items-center gap-1">
+              <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setPage((p) => Math.max(0, p - 1))} disabled={safePage === 0}>
+                <ChevronLeft className="h-4 w-4" />
+              </Button>
+              <span className="text-xs tabular-nums text-muted-foreground px-1">
+                {safePage + 1} / {totalPages}
+              </span>
+              <Button variant="ghost" size="sm" className="h-7 w-7 p-0" onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))} disabled={safePage >= totalPages - 1}>
+                <ChevronRight className="h-4 w-4" />
+              </Button>
+            </div>
+          </div>
+        )}
       </div>
+
+      {/* Column picker dialog */}
+      <Dialog open={showColPicker} onOpenChange={setShowColPicker}>
+        <DialogContent className="max-w-sm">
+          <DialogHeader>
+            <DialogTitle>Visible Columns</DialogTitle>
+          </DialogHeader>
+          <div className="grid grid-cols-2 gap-1 py-2">
+            {ALL_COLUMNS.map((c) => {
+              const fixed = FIXED_COLS.includes(c.key)
+              const checked = pickerDraft.has(c.key)
+              return (
+                <label key={c.key} className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-muted cursor-pointer text-sm">
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    disabled={fixed}
+                    onChange={() => togglePickerCol(c.key)}
+                    className="accent-primary h-3.5 w-3.5"
+                  />
+                  <span className={fixed ? 'text-muted-foreground' : ''}>{c.shortLabel ?? c.label}</span>
+                </label>
+              )
+            })}
+          </div>
+          <DialogFooter>
+            <Button variant="outline" size="sm" onClick={() => { setPickerDraft(new Set(DEFAULT_VISIBLE)); }}>Reset</Button>
+            <Button variant="outline" size="sm" onClick={() => setShowColPicker(false)}>Cancel</Button>
+            <Button size="sm" onClick={applyColPicker}>Apply</Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
