@@ -170,18 +170,21 @@ Implement the following core entities.
 - `voucher_expiry_policy`
 - `voucher_reservation`
 
+### Shared finance side
+
+- `accounting_event`
+- `accounting_profile`
+
+### Shared identity side
+
+- `customer_identity`
+
 ### Loyalty side
 
 - `loyalty_points_account`
 - `loyalty_points_transaction`
 - `loyalty_points_expiry_tranche`
 - `loyalty_points_conversion`
-- `customer_identity`
-
-### Shared finance side
-
-- `accounting_event`
-- `accounting_profile`
 
 These entities should preserve correlation to:
 
@@ -211,6 +214,18 @@ Hashed lookup must use HMAC-SHA256 with a server-held secret separate from the d
 
 Default UI masking should show first 4 and last 4 characters only.
 
+Voucher lifecycle statuses should be explicit and shared across voucher types:
+
+- `DRAFT`
+- `ACTIVE`
+- `HELD`
+- `PARTIALLY_REDEEMED`
+- `REDEEMED`
+- `EXPIRED`
+- `VOIDED`
+
+`HELD` is used for fraud review, chargeback review, and other finance locks. Validation must reject redemption for held vouchers unless an explicit finance override path exists.
+
 ### Voucher validation
 
 Before applying a voucher, IMS must validate:
@@ -230,6 +245,8 @@ Transferability defaults:
 
 Customerless issuance must be supported for gift cards and some marketing vouchers.
 
+Refund credits issued for guest checkouts should bind to the guest order and billing email or equivalent source identity token when no durable customer record exists.
+
 ### Voucher application model
 
 `voucher_application` is required in phase 1 because refund correctness depends on it.
@@ -237,6 +254,7 @@ Customerless issuance must be supported for gift cards and some marketing vouche
 It must capture:
 
 - voucher id
+- optional reservation id
 - order id
 - optional order line id
 - checkout currency amount applied
@@ -254,7 +272,11 @@ Default composition:
 
 `sequence_number` must be explicit in connector normalization so retries can be deduplicated while genuinely distinct partial applications still post.
 
+`sequence_number` is scoped per source order plus voucher combination, not globally per voucher.
+
 Reserve / commit / release is phase 1 for gift cards and refund credits. It is not deferred.
+
+All timestamps used for FX snapshots, reservations, and idempotency correlation must be stored in UTC.
 
 ### Chargeback and fraud policy
 
@@ -290,7 +312,7 @@ Source platform balance is authoritative for loyalty.
 
 IMS transaction history is a best-effort mirrored audit trail.
 
-When mirrored transactions do not sum to the source-platform balance, IMS must create an immutable reconciliation entry tagged `IMS_RECONCILIATION_ADJUSTMENT`. Finance may reconcile and annotate the mismatch in IMS, but IMS must not attempt to change the source platform's loyalty balance.
+When mirrored transactions do not equal the source-platform balance, IMS must create an immutable reconciliation entry tagged `IMS_RECONCILIATION_ADJUSTMENT`. Finance may reconcile and annotate the mismatch in IMS, but IMS must not attempt to change the source platform's loyalty balance.
 
 If later high-fidelity event data contradicts an earlier IMS-derived row, the IMS-derived row remains immutable and IMS emits a reconciliation correction entry rather than mutating history.
 
@@ -324,6 +346,8 @@ Accounting policy for functional currency must also be explicit:
 - any delta between original redemption functional amount and refund restoration functional amount must be posted to an explicit FX variance account
 
 This policy is the default for both Xero and QuickBooks mappers and avoids silent connector divergence.
+
+Connector mappers should post in IMS functional currency by default and only rely on native Xero or QuickBooks multi-currency posting behavior when that is explicitly configured and tested for the tenant.
 
 ### Display values
 
@@ -362,6 +386,8 @@ Expiry policy must be explicit:
 - do not automate SPV tax reversal on expiry unless a jurisdiction-specific rule is explicitly configured and accountant-approved
 - escheatment / dormant-balance handling remains policy-driven and disabled by default unless a jurisdiction profile enables it
 - expiry notifications and grace periods are policy-driven features and are out of phase 1 unless explicitly required by tenant configuration
+
+For MPV instruments, expiry is the default operational trigger for breakage recognition where tenant policy enables it.
 
 Loyalty expiry tranches are best-effort. Some sources will only support coarse expiry visibility, for example an aggregate amount expiring within a future time window rather than FIFO tranches.
 
@@ -429,6 +455,8 @@ Required WooCommerce workstream:
 Smart Coupons should be treated as the likely first WooCommerce adapter.
 
 Normalization must distinguish Smart Coupons stored-value instruments from generic WooCommerce coupons using plugin metadata and discount-type classification, not code-pattern matching. Exact meta keys should be confirmed during adapter build, but the design baseline is metadata-driven identification.
+
+Current public Smart Coupons documentation confirms that store credit and gift certificates are represented as discount-type coupons. It does not expose a stable public metadata contract, so exact meta keys should be confirmed from the installed plugin code before the adapter schema is finalized rather than guessed in the plan.
 
 ### Shopify
 
@@ -504,6 +532,14 @@ Build:
 - voucher reservation with reserve / commit / release
 - transferability and customer-binding rules
 - chargeback and fraud state handling
+
+Reservation model requirements:
+
+- reservations must be persisted durably in the primary database
+- Redis may be used as a performance optimization, but not as the sole source of truth
+- reservations must have explicit expiry and release rules for abandoned carts
+- reserve operations must fail atomically if the requested amount exceeds currently available balance after considering committed use and active reservations
+- reservation recovery after process restart must be possible from durable state alone
 
 Exit criteria:
 
@@ -675,6 +711,8 @@ Must show:
 - WooCommerce extension-source mismatches explicitly
 - loyalty balance adjustments where source totals overrule mirrored history
 
+Dual-platform behavior is intentionally not a balance-unification feature in phase 1. WooCommerce and Shopify stored-value instruments can be shown in one customer-facing IMS view, but they remain separate source balances and separate redemption domains unless a later project explicitly introduces cross-platform value unification.
+
 ## Security and Controls
 
 Required controls:
@@ -697,6 +735,18 @@ Default abuse threshold:
 Performance target for phase 1:
 
 - voucher validate / reserve endpoints should target sub-200ms p99 excluding upstream connector latency
+
+## Data Protection and Retention
+
+Voucher and customer identity data must be handled under a documented UK GDPR retention policy.
+
+Baseline policy:
+
+- preserve financial ledger history and audit records where retention is necessary for legal, accounting, or claim-defense purposes
+- on erasure requests, anonymize or restrict customer-linked personal data where possible without destroying financial records
+- active vouchers, refund credits, and loyalty balances should not have their financial records deleted solely because a linked customer requests erasure
+- customer links may be pseudonymized while preserving voucher and ledger continuity
+- the final retention and erasure policy should be confirmed with legal or privacy review before go-live
 
 ## Acceptance Criteria
 
