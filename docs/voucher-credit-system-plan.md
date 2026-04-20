@@ -226,6 +226,8 @@ Voucher lifecycle statuses should be explicit and shared across voucher types:
 
 `HELD` is used for fraud review, chargeback review, and other finance locks. Validation must reject redemption for held vouchers unless an explicit finance override path exists.
 
+The override path is a permission-gated manual finance action only. There is no automatic or public programmatic override path in phase 1.
+
 ### Voucher validation
 
 Before applying a voucher, IMS must validate:
@@ -269,6 +271,8 @@ Default composition:
 
 - redemption idempotency key = hash(source_platform, source_order_id, source_order_line_id_or_order_scope, voucher_code_hmac, sequence_number)
 - reversal idempotency key = hash(original_redemption_idempotency_key, "reversal", reversal_sequence)
+
+All canonical voucher lifecycle events require deterministic idempotency keys using the same composition pattern, including issuance, activation, redemption, reversal, refund restoration, expiry, and hold-state transitions where they are event-driven from a source platform.
 
 `sequence_number` must be explicit in connector normalization so retries can be deduplicated while genuinely distinct partial applications still post.
 
@@ -421,7 +425,7 @@ Points-to-voucher conversion requires an explicit accounting policy.
 Default treatment:
 
 - reporting-only loyalty mode: no accounting post on points accrual or mirror sync, but voucher creation still posts according to the configured voucher treatment
-- marketing mode: debit marketing expense and credit voucher liability or contra-revenue account at conversion
+- marketing mode: debit marketing expense and credit voucher liability for stored-value vouchers; only pure discount instruments may route to contra-revenue
 - contract-liability mode: debit loyalty contract liability and credit voucher liability at conversion
 
 Connector mappers must not infer this policy ad hoc.
@@ -538,6 +542,7 @@ Reservation model requirements:
 - reservations must be persisted durably in the primary database
 - Redis may be used as a performance optimization, but not as the sole source of truth
 - reservations must have explicit expiry and release rules for abandoned carts
+- default reservation expiry is 60 minutes unless tenant configuration overrides it
 - reserve operations must fail atomically if the requested amount exceeds currently available balance after considering committed use and active reservations
 - reservation recovery after process restart must be possible from durable state alone
 
@@ -546,6 +551,7 @@ Exit criteria:
 - stored-value vouchers can be partially redeemed multiple times until exhausted
 - refunds restore original consumed value exactly
 - concurrent checkout attempts cannot double-spend a stored-value voucher
+- concurrency protection must be validated with deterministic concurrent-transaction tests, not only single-threaded happy-path tests
 
 ### Workstream 3. Tax and valuation engine
 
@@ -619,6 +625,8 @@ Build:
 - external sync status tracking
 - explicit FX variance posting
 - points-to-voucher accounting policy support
+
+Points-to-voucher accounting policy should live on the unified `accounting_profile` model with discriminator-specific fields rather than a separate loyalty-only routing table.
 
 Exit criteria:
 
@@ -767,6 +775,7 @@ The implementation is complete when IMS can:
 - expose voucher, loyalty, and reconciliation views in the IMS UI
 - prevent double-spend through reservation on stored-value instruments
 - keep per-platform loyalty balances separate unless explicitly linked by finance action
+- enforce documented UK GDPR retention and erasure policy for customer-linked voucher and loyalty data
 
 Chargeback policy defaults:
 
