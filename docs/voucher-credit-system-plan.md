@@ -93,7 +93,7 @@ The module must:
 
 ## Architecture
 
-Implement the feature as four cooperating submodules.
+Implement the feature as two peer ledgers, one shared service layer, and one downstream adapter layer.
 
 ### 1. Voucher and Credit Ledger
 
@@ -116,7 +116,7 @@ Owns:
 - conversion bridge between points and vouchers
 - mismatch and sync-state tracking
 
-### 3. Tax and Valuation Engine
+### 3. Tax and Valuation Service
 
 Owns:
 
@@ -135,6 +135,15 @@ Owns:
 - connector-specific posting logic
 - retries, reversal handling, dead-letter queues, and reconciliation
 
+The call graph should be:
+
+- connectors normalize platform-specific events into canonical IMS events
+- voucher ledger and loyalty ledger consume only canonical IMS events
+- tax and valuation service is called synchronously by the ledgers
+- accounting adapter consumes normalized accounting events emitted by the ledgers
+
+This keeps platform-specific rules inside `lib/connectors/*` and preserves the platform-agnostic claim for the ledger layer.
+
 ## Core Principles
 
 1. Vouchers are not inventory and must not be represented as stock items.
@@ -145,6 +154,8 @@ Owns:
 6. Connector ingestion and accounting posting must be idempotent.
 7. Tax classification and FX context must be snapshotted at event time.
 8. The system must remain usable even when a source platform only exposes balances, not full transaction history.
+9. Source-platform-specific logic must stay in connector packages; the ledger layer only accepts canonical events.
+10. For multi-jurisdiction tenants like onetwo3d, MPV is the default stored-value tax classification unless SPV can be positively evidenced.
 
 ## Domain Model
 
@@ -156,7 +167,8 @@ Implement the following core entities.
 - `voucher_transaction`
 - `voucher_application`
 - `voucher_tax_profile`
-- `voucher_accounting_profile`
+- `voucher_expiry_policy`
+- `voucher_reservation`
 
 ### Loyalty side
 
@@ -164,11 +176,12 @@ Implement the following core entities.
 - `loyalty_points_transaction`
 - `loyalty_points_expiry_tranche`
 - `loyalty_points_conversion`
-- `loyalty_accounting_profile`
+- `customer_identity`
 
 ### Shared finance side
 
 - `accounting_event`
+- `accounting_profile`
 
 These entities should preserve correlation to:
 
@@ -178,6 +191,10 @@ These entities should preserve correlation to:
 - voucher codes and references
 - customers
 - external accounting records
+
+`customer_identity` should be keyed by source platform and source customer id, with optional merge relationships. Loyalty balances must not auto-merge across platforms. A customer may be represented in one IMS profile view, but Woo loyalty, Shopify loyalty, Woo gift cards, and Shopify store credit remain separate source instruments unless an explicit finance operation links them.
+
+`accounting_profile` should use a discriminator-based shape rather than separate duplicated voucher and loyalty routing tables. Voucher and loyalty routing can still expose type-specific views in application code, but the underlying persistence model should avoid duplicated connector account fields.
 
 ## Voucher Rules
 
@@ -190,6 +207,10 @@ IMS must identify vouchers using submitted code or source reference through:
 - masked display in UI
 - encrypted full-code storage only when operationally necessary
 
+Hashed lookup must use HMAC-SHA256 with a server-held secret separate from the database, not a bare unsalted hash.
+
+Default UI masking should show first 4 and last 4 characters only.
+
 ### Voucher validation
 
 Before applying a voucher, IMS must validate:
@@ -200,6 +221,14 @@ Before applying a voucher, IMS must validate:
 - channel restriction
 - redemption mode
 - sufficient balance
+
+Transferability defaults:
+
+- gift cards: transferable by default
+- refund credits: non-transferable by default and customer-bound where customer identity exists
+- marketing vouchers: configurable
+
+Customerless issuance must be supported for gift cards and some marketing vouchers.
 
 ### Voucher application model
 
@@ -215,6 +244,29 @@ It must capture:
 - functional-currency amount
 - FX source, rate, and timestamp
 - application status
+
+Canonical idempotency keys are mandatory in phase 1.
+
+Default composition:
+
+- redemption idempotency key = hash(source_platform, source_order_id, source_order_line_id_or_order_scope, voucher_code_hmac, sequence_number)
+- reversal idempotency key = hash(original_redemption_idempotency_key, "reversal", reversal_sequence)
+
+`sequence_number` must be explicit in connector normalization so retries can be deduplicated while genuinely distinct partial applications still post.
+
+Reserve / commit / release is phase 1 for gift cards and refund credits. It is not deferred.
+
+### Chargeback and fraud policy
+
+Default operational policy:
+
+- gift-card-funded orders under chargeback or fraud review do not auto-restore voucher value
+- affected vouchers move into a hold or suspended state pending finance review
+- gift card purchases that later charge back should suspend remaining unspent balance
+- if a charged-back gift card has already been partially spent, the spent portion becomes finance exposure for recovery or write-off workflow
+- refund credits created from orders later under chargeback review should be suspended pending review
+
+These defaults should be overridable only by explicit finance policy, not connector-specific behavior.
 
 ## Loyalty Rules
 
@@ -233,6 +285,14 @@ IMS must not:
 - become the customer-facing loyalty authority
 
 When only balance snapshots exist, IMS may infer deltas, but those rows must be marked as IMS-derived.
+
+Source platform balance is authoritative for loyalty.
+
+IMS transaction history is a best-effort mirrored audit trail.
+
+When mirrored transactions do not sum to the source-platform balance, IMS must create an immutable reconciliation entry tagged `IMS_RECONCILIATION_ADJUSTMENT`. Finance may reconcile and annotate the mismatch in IMS, but IMS must not attempt to change the source platform's loyalty balance.
+
+If later high-fidelity event data contradicts an earlier IMS-derived row, the IMS-derived row remains immutable and IMS emits a reconciliation correction entry rather than mutating history.
 
 ## Multi-Currency Rules
 
@@ -257,6 +317,14 @@ At redemption time, store:
 
 Refund restoration must use the original consumed issue-currency amount recorded on `voucher_application`, not a fresh conversion using current FX.
 
+Accounting policy for functional currency must also be explicit:
+
+- voucher balance restoration always uses the original issue-currency amount
+- the functional-currency base amount for accounting posts defaults to current posting FX
+- any delta between original redemption functional amount and refund restoration functional amount must be posted to an explicit FX variance account
+
+This policy is the default for both Xero and QuickBooks mappers and avoids silent connector divergence.
+
 ### Display values
 
 Any other-currency display in UI is informational only and must not affect the authoritative balance.
@@ -279,6 +347,23 @@ Rule inputs should include:
 - jurisdiction restriction
 - product restriction
 - discount vs stored-value behavior
+
+For onetwo3d's expected operating shape, default stored-value classification should be `MPV`.
+
+`SPV` should be treated as an exception that requires positive evidence that both the place of supply and the VAT treatment are knowable at issue. Generic gift cards redeemable across multiple countries, tax outcomes, or broad catalogues should not be treated as `SPV`.
+
+Any stored-value instrument that is not provably `SPV` should default to `MPV`, consistent with HMRC voucher guidance.
+
+Expiry policy must be explicit:
+
+- support fixed time-based expiry in phase 1
+- support partial balance expiry through ledger entries rather than destructive updates
+- support breakage recognition policy by jurisdiction and accounting profile
+- do not automate SPV tax reversal on expiry unless a jurisdiction-specific rule is explicitly configured and accountant-approved
+- escheatment / dormant-balance handling remains policy-driven and disabled by default unless a jurisdiction profile enables it
+- expiry notifications and grace periods are policy-driven features and are out of phase 1 unless explicitly required by tenant configuration
+
+Loyalty expiry tranches are best-effort. Some sources will only support coarse expiry visibility, for example an aggregate amount expiring within a future time window rather than FIFO tranches.
 
 ## Accounting Rules
 
@@ -305,6 +390,16 @@ Default routing:
 - marketing vouchers: contra-revenue by default
 - loyalty: reporting-only by default unless finance enables liability treatment
 
+Points-to-voucher conversion requires an explicit accounting policy.
+
+Default treatment:
+
+- reporting-only loyalty mode: no accounting post on points accrual or mirror sync, but voucher creation still posts according to the configured voucher treatment
+- marketing mode: debit marketing expense and credit voucher liability or contra-revenue account at conversion
+- contract-liability mode: debit loyalty contract liability and credit voucher liability at conversion
+
+Connector mappers must not infer this policy ad hoc.
+
 ## Connector Strategy
 
 ### WooCommerce
@@ -330,6 +425,10 @@ Required WooCommerce workstream:
 - add an extension adapter interface for common plugins
 - support low-fidelity ingestion when a plugin only exposes balances or coupon application data
 - expose plugin-source mismatch states in reconciliation UI
+
+Smart Coupons should be treated as the likely first WooCommerce adapter.
+
+Normalization must distinguish Smart Coupons stored-value instruments from generic WooCommerce coupons using plugin metadata and discount-type classification, not code-pattern matching. Exact meta keys should be confirmed during adapter build, but the design baseline is metadata-driven identification.
 
 ### Shopify
 
@@ -380,11 +479,18 @@ Build first:
 - canonical loyalty events
 - deterministic idempotency key rules
 - correlation keys for orders, refunds, vouchers, customers, and source events
+- customer identity model
+- precision rules for stored amounts and FX rates
 
 Exit criteria:
 
 - all platforms can emit into one IMS event shape
 - no connector-specific business rules leak into the core ledger
+
+Schema precision should be explicit rather than left to ORM defaults. Baseline target:
+
+- amounts: equivalent of `Decimal(19,4)` minimum
+- FX rates: equivalent of `Decimal(18,8)` minimum
 
 ### Workstream 2. Voucher and credit ledger
 
@@ -395,12 +501,15 @@ Build:
 - issue / activate / redeem / reverse / refund-restore flows
 - voucher transaction ledger
 - voucher application ledger
-- reservation model hooks for future concurrency support
+- voucher reservation with reserve / commit / release
+- transferability and customer-binding rules
+- chargeback and fraud state handling
 
 Exit criteria:
 
 - stored-value vouchers can be partially redeemed multiple times until exhausted
 - refunds restore original consumed value exactly
+- concurrent checkout attempts cannot double-spend a stored-value voucher
 
 ### Workstream 3. Tax and valuation engine
 
@@ -410,10 +519,13 @@ Build:
 - tax rationale snapshots
 - issue-currency anchored balance rules
 - FX snapshot storage on redemption and refund restoration
+- expiry rules and breakage policy hooks
+- explicit refund-posting FX variance policy
 
 Exit criteria:
 
 - vouchers can be classified and reported independent of order recalculation
+- MPV is the safe default and SPV requires affirmative evidence
 
 ### Workstream 4. WooCommerce integration
 
@@ -451,10 +563,13 @@ Build:
 - expiry tranche support
 - snapshot polling fallback
 - conversion bridge between points and vouchers
+- reconciliation adjustment entries
+- immutable correction flow for IMS-derived rows
 
 Exit criteria:
 
 - IMS can mirror loyalty balances and events without calculating earning rules
+- source-platform balance wins when mirrored history and source balance diverge
 
 ### Workstream 7. Accounting adapter
 
@@ -466,6 +581,8 @@ Build:
 - QuickBooks event mapper
 - retry and dead-letter flows
 - external sync status tracking
+- explicit FX variance posting
+- points-to-voucher accounting policy support
 
 Exit criteria:
 
@@ -491,12 +608,13 @@ Exit criteria:
 Recommended milestone order:
 
 1. core schema, event model, and voucher ledger
-2. WooCommerce connector foundation for voucher, refund-credit, and loyalty ingestion
-3. Shopify native gift card and store credit ingestion
-4. WooCommerce extension adapters for Smart Coupons, gift card, and points plugins
-5. loyalty mirror and points-to-voucher bridge across both channels
-6. Xero and QuickBooks accounting adapters
-7. finance UI, reconciliation screens, admin controls, and backfill tooling
+2. reservation, concurrency, and customer identity foundations for stored value
+3. WooCommerce connector foundation for voucher, refund-credit, and loyalty ingestion
+4. Shopify native gift card and store credit ingestion
+5. WooCommerce extension adapters for Smart Coupons, gift card, and points plugins
+6. loyalty mirror and points-to-voucher bridge across both channels
+7. Xero and QuickBooks accounting adapters
+8. finance UI, reconciliation screens, admin controls, and backfill tooling
 
 ## UI Plan
 
@@ -529,6 +647,8 @@ Must show:
 - linked accounting events
 - tax classification snapshot
 - loyalty origin if points-funded
+- reservation state
+- fraud or chargeback hold state
 
 ### Finance > Loyalty Points
 
@@ -540,6 +660,7 @@ Must show:
 - converted, expired, reversed, and adjusted totals
 - sync failures
 - linked voucher conversions
+- reconciliation adjustments
 
 ### Reconciliation
 
@@ -552,6 +673,7 @@ Must show:
 - unsynced accounting events
 - orphaned source events
 - WooCommerce extension-source mismatches explicitly
+- loyalty balance adjustments where source totals overrule mirrored history
 
 ## Security and Controls
 
@@ -565,7 +687,16 @@ Required controls:
 - permission-gate accounting resync
 - throttle invalid redemption attempts
 - detect duplicate and replayed redemptions
-- support reserve / commit / release for high-concurrency channels when required
+- support reserve / commit / release for gift cards and refund credits in phase 1
+- freeze or suspend vouchers during chargeback and fraud review flows
+
+Default abuse threshold:
+
+- 5 or more invalid attempts against the same code within 1 hour triggers temporary code lock and finance alert
+
+Performance target for phase 1:
+
+- voucher validate / reserve endpoints should target sub-200ms p99 excluding upstream connector latency
 
 ## Acceptance Criteria
 
@@ -584,6 +715,14 @@ The implementation is complete when IMS can:
 - generate connector-agnostic accounting events
 - sync those accounting events to Xero and QuickBooks through the existing accounting seam
 - expose voucher, loyalty, and reconciliation views in the IMS UI
+- prevent double-spend through reservation on stored-value instruments
+- keep per-platform loyalty balances separate unless explicitly linked by finance action
+
+Chargeback policy defaults:
+
+- gift-card-funded orders under chargeback or fraud review do not auto-restore value; related vouchers enter hold state pending finance decision
+- gift card purchases that later charge back should suspend remaining unspent balance; spent portions become exposure for finance recovery and write-off workflow
+- refund credits created from orders later under chargeback review should be suspended pending review
 
 ## Immediate Implementation Decisions
 
@@ -593,9 +732,14 @@ Before engineering starts, confirm:
 2. which Shopify loyalty apps or integration surfaces need adapter support first
 3. whether refund credits always create new vouchers or may top up existing customer credit instruments
 4. whether marketing stored-value vouchers are always contra-revenue or allow profile overrides
-5. whether checkout channels will support reserve / commit / release
+5. whether any channels cannot support reserve / commit / release semantics for stored value
 6. whether encrypted full voucher-code storage is operationally required
 7. which jurisdictions require SPV / MPV support in the first release
+8. confirm the default MPV treatment for multi-jurisdiction tenants with external accountant review
+9. confirm refund-posting FX policy as current rate plus explicit variance account
+10. confirm loyalty mismatch resolution as source-wins plus reconciliation adjustment entries
+11. confirm customer identity model and whether any manual cross-platform merges are permitted
+12. confirm chargeback policy for gift-card-funded orders, gift-card purchases, and refund credits
 
 ## Status
 
