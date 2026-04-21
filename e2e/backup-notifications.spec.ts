@@ -2,6 +2,8 @@ import { expect, test } from '@playwright/test'
 import { uniqueSuffix } from './helpers'
 import { E2E_ADMIN_EMAIL } from './test-data'
 
+const E2E_ROUTE_SECRET = process.env.E2E_ROUTE_SECRET ?? 'e2e-route-secret'
+
 test.describe.configure({ mode: 'serial' })
 
 test.describe('backup and notification workflows', () => {
@@ -35,6 +37,9 @@ test.describe('backup and notification workflows', () => {
     const broadcastTitle = `E2E broadcast notification ${suffix}`
 
     const seedResponse = await page.request.post('/api/e2e/notifications', {
+      headers: {
+        'x-e2e-secret': E2E_ROUTE_SECRET,
+      },
       data: {
         clearForUserEmail: E2E_ADMIN_EMAIL,
         notifications: [

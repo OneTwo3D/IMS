@@ -3,6 +3,7 @@ import { config as loadDotenv } from 'dotenv'
 
 loadDotenv({ path: '.env.local', override: false })
 loadDotenv({ path: '.env', override: false })
+process.env.E2E_ROUTE_SECRET ??= 'e2e-route-secret'
 
 const PORT = Number(process.env.E2E_PORT ?? 3001)
 const baseURL = process.env.E2E_BASE_URL ?? `http://localhost:${PORT}`
@@ -95,6 +96,7 @@ export default defineConfig({
       ...process.env,
       NODE_ENV: 'development',
       E2E_TEST_MODE: '1',
+      E2E_ROUTE_SECRET: process.env.E2E_ROUTE_SECRET,
       AUTH_URL: baseURL,
       NEXT_PUBLIC_APP_URL: baseURL,
     },

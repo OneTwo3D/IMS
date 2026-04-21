@@ -22,6 +22,20 @@ function buildMintsoftRequestUrl(path: string, baseUrl: string): URL {
   return new URL(normalizedPath, normalizedBaseUrl)
 }
 
+function buildMintsoftRequestHeaders(baseUrl: string, init: RequestInit | undefined): HeadersInit {
+  const url = buildMintsoftRequestUrl('/', baseUrl)
+  const e2eSecret = process.env.E2E_ROUTE_SECRET?.trim()
+
+  return {
+    Accept: 'application/json',
+    'Content-Type': 'application/json',
+    ...(e2eSecret && url.pathname.startsWith('/api/e2e/mintsoft')
+      ? { 'x-e2e-secret': e2eSecret }
+      : {}),
+    ...init?.headers,
+  }
+}
+
 async function sendMintsoftRequest<T>(
   path: string,
   baseUrl: string,
@@ -31,10 +45,8 @@ async function sendMintsoftRequest<T>(
   const response = await fetch(buildMintsoftRequestUrl(path, baseUrl), {
     ...init,
     headers: {
-      Accept: 'application/json',
+      ...buildMintsoftRequestHeaders(baseUrl, init),
       'ms-apikey': apiKey,
-      'Content-Type': 'application/json',
-      ...init?.headers,
     },
     cache: 'no-store',
   })

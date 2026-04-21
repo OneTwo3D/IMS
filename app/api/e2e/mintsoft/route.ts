@@ -7,7 +7,7 @@ import {
 import { runMintsoftReturnsSync } from '@/lib/connectors/mintsoft/sync/returns-sync'
 import { runStockSyncForBinding } from '@/lib/connectors/mintsoft/sync/stock-sync'
 import { serializeSettingValue } from '@/lib/settings-store'
-import { getE2eRouteAccessError } from '@/lib/testing/e2e-route-guard'
+import { requireE2eAdminRoute } from '@/lib/testing/e2e-route-guard'
 
 const E2E_MINTSOFT_STATE_KEY = 'e2e_mintsoft_state'
 const PLUGIN_MINTSOFT_ENABLED_KEY = 'plugin_mintsoft_enabled'
@@ -66,15 +66,43 @@ async function resetMintsoftPersistence() {
 async function clearProductsBySku(skus: string[]) {
   if (skus.length === 0) return
 
+  const products = await db.product.findMany({
+    where: { sku: { in: skus } },
+    select: { id: true },
+  })
+  const productIds = products.map((product) => product.id)
+
+  if (productIds.length === 0) return
+
+  await db.cogsEntry.deleteMany({
+    where: {
+      OR: [
+        { movement: { productId: { in: productIds } } },
+        { costLayer: { productId: { in: productIds } } },
+      ],
+    },
+  })
+  await db.costLayerSourceLine.deleteMany({
+    where: {
+      OR: [
+        { sourceProductId: { in: productIds } },
+        { costLayer: { productId: { in: productIds } } },
+      ],
+    },
+  })
+  await db.costLayer.deleteMany({
+    where: { productId: { in: productIds } },
+  })
+  await db.stockMovement.deleteMany({
+    where: { productId: { in: productIds } },
+  })
   await db.stockLevel.deleteMany({
     where: {
-      product: {
-        sku: { in: skus },
-      },
+      productId: { in: productIds },
     },
   })
   await db.product.deleteMany({
-    where: { sku: { in: skus } },
+    where: { id: { in: productIds } },
   })
 }
 
@@ -165,8 +193,8 @@ async function seedWarehouses(warehouses: SeedWarehouse[]) {
 }
 
 export async function GET(request: NextRequest) {
-  const authError = getE2eRouteAccessError(request)
-  if (authError) return authError
+  const session = await requireE2eAdminRoute(request)
+  if (session instanceof NextResponse) return session
 
   if (request.nextUrl.searchParams.get('summary') === '1') {
     const [bindings, jobs, discrepancies, returnsInbox] = await Promise.all([
@@ -250,6 +278,7 @@ export async function GET(request: NextRequest) {
         externalEventId: true,
         externalAsnId: true,
         processedAt: true,
+        processingError: true,
       },
     })
 
@@ -289,15 +318,40 @@ export async function GET(request: NextRequest) {
       },
     })
 
-    return NextResponse.json({ product })
+    const stockLevels = product
+      ? await db.stockLevel.findMany({
+          where: { productId: product.id },
+          select: {
+            quantity: true,
+            warehouse: {
+              select: {
+                code: true,
+              },
+            },
+          },
+          orderBy: {
+            warehouse: {
+              code: 'asc',
+            },
+          },
+        })
+      : []
+
+    return NextResponse.json({
+      product,
+      stockLevels: stockLevels.map((row) => ({
+        warehouseCode: row.warehouse.code,
+        quantity: Number(row.quantity),
+      })),
+    })
   }
 
   return NextResponse.json({ error: 'Unsupported query' }, { status: 400 })
 }
 
 export async function POST(request: NextRequest) {
-  const authError = getE2eRouteAccessError(request)
-  if (authError) return authError
+  const session = await requireE2eAdminRoute(request)
+  if (session instanceof NextResponse) return session
 
   const body = await request.json() as {
     reset?: boolean

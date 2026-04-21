@@ -7,9 +7,11 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { hasPermission } from '@/lib/permissions'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { Prisma, ProductType } from '@/app/generated/prisma/client'
 import { runMintsoftProductSyncForProduct } from '@/lib/connectors/mintsoft/sync/product-sync'
+import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import {
   COMPONENT_PRODUCT_STATUSES,
   deriveLegacyActiveFromLifecycleStatus,
@@ -572,6 +574,9 @@ export type ProductFormState = {
 
 async function syncMintsoftProductBestEffort(productId: string): Promise<void> {
   try {
+    if (!await isIntegrationPluginEnabled('mintsoft')) {
+      return
+    }
     await runMintsoftProductSyncForProduct(productId, 'product_mutation')
   } catch (syncError) {
     console.error(syncError)
@@ -586,7 +591,7 @@ export async function createProduct(
   _prev: ProductFormState,
   formData: FormData
 ): Promise<ProductFormState> {
-  await requirePermission('inventory.edit')
+  const session = await requirePermission('inventory.edit')
   const raw = {
     sku: ((formData.get('sku') as string) || '').trim(),
     name: formData.get('name') as string,
@@ -687,7 +692,9 @@ export async function createProduct(
   } catch (syncError) {
     console.error(syncError)
   }
-  scheduleMintsoftProductSync(created.id)
+  if (hasPermission(session.user.role, 'sync') && await isIntegrationPluginEnabled('mintsoft')) {
+    scheduleMintsoftProductSync(created.id)
+  }
 
   revalidatePath('/inventory')
   redirect('/inventory')
@@ -698,7 +705,7 @@ export async function updateProduct(
   _prev: ProductFormState,
   formData: FormData
 ): Promise<ProductFormState> {
-  await requirePermission('inventory.edit')
+  const session = await requirePermission('inventory.edit')
   const raw = {
     sku: ((formData.get('sku') as string) || '').trim(),
     name: formData.get('name') as string,
@@ -808,7 +815,9 @@ export async function updateProduct(
   } catch (syncError) {
     console.error(syncError)
   }
-  scheduleMintsoftProductSync(id)
+  if (hasPermission(session.user.role, 'sync') && await isIntegrationPluginEnabled('mintsoft')) {
+    scheduleMintsoftProductSync(id)
+  }
 
   revalidatePath('/inventory')
   revalidatePath(`/inventory/${id}`)

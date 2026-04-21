@@ -4,6 +4,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getMintsoftApiConfiguration, verifyMintsoftWebhookSignature } from '@/lib/connectors/mintsoft'
+import { processMintsoftBookedInEvent } from '@/lib/connectors/mintsoft/sync/booked-in-handler'
 import { persistMintsoftWebhookEvent, type PersistMintsoftWebhookEventInput } from '@/lib/connectors/mintsoft/webhook-events'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
@@ -187,6 +188,16 @@ export async function POST(request: Request) {
     })
   }
 
+  const processingResult = await processMintsoftBookedInEvent(result.eventId)
+  if (processingResult.status === 'failed') {
+    return NextResponse.json({
+      accepted: false,
+      externalEventId,
+      externalAsnId,
+      error: processingResult.error,
+    }, { status: 500 })
+  }
+
   await logActivity({
     entityType: 'SYNC',
     entityId: result.eventId,
@@ -203,5 +214,6 @@ export async function POST(request: Request) {
     accepted: true,
     externalEventId,
     externalAsnId,
+    processed: processingResult.status === 'processed',
   })
 }

@@ -105,6 +105,118 @@ async function getSyncBinding(bindingId: string): Promise<SyncBinding | null> {
   }) as Promise<SyncBinding | null>
 }
 
+type StockSyncReservation =
+  | {
+    binding: null
+    jobId: null
+    skippedReason: string
+  }
+  | {
+    binding: SyncBinding
+    jobId: string | null
+    skippedReason?: string
+  }
+
+async function reserveStockSyncJob(
+  bindingId: string,
+  triggeredBy: string,
+): Promise<StockSyncReservation> {
+  return db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT id FROM external_wms_bindings WHERE id = ${bindingId} FOR UPDATE`
+
+    const binding = await tx.externalWmsBinding.findFirst({
+      where: {
+        id: bindingId,
+        connector: 'mintsoft',
+      },
+      select: {
+        id: true,
+        connector: true,
+        active: true,
+        externalWarehouseId: true,
+        stockSyncMode: true,
+        syncFrequencyMinutes: true,
+        discrepancyThresholds: true,
+        reportRecipients: true,
+        warehouseId: true,
+        lastStockSyncAt: true,
+        connection: {
+          select: {
+            active: true,
+          },
+        },
+        warehouse: {
+          select: {
+            id: true,
+            code: true,
+            name: true,
+          },
+        },
+      },
+    }) as SyncBinding | null
+
+    if (!binding) {
+      return {
+        binding: null,
+        jobId: null,
+        skippedReason: 'Binding not found',
+      } satisfies StockSyncReservation
+    }
+
+    if (!binding.active || !binding.connection.active || binding.stockSyncMode === 'DISABLED') {
+      return {
+        binding,
+        jobId: null,
+        skippedReason: !binding.active
+          ? 'Binding inactive'
+          : !binding.connection.active
+            ? 'Connection inactive'
+            : 'Stock sync disabled',
+      } satisfies StockSyncReservation
+    }
+
+    const runningJob = await tx.wmsSyncJob.findFirst({
+      where: {
+        connector: 'mintsoft',
+        type: 'STOCK_SYNC',
+        warehouseId: binding.warehouseId,
+        status: 'RUNNING',
+      },
+      select: { id: true },
+      orderBy: { startedAt: 'desc' },
+    })
+
+    if (runningJob) {
+      return {
+        binding,
+        jobId: runningJob.id,
+        skippedReason: 'Stock sync already running for this binding',
+      } satisfies StockSyncReservation
+    }
+
+    const job = await tx.wmsSyncJob.create({
+      data: {
+        connector: 'mintsoft',
+        type: 'STOCK_SYNC',
+        status: 'RUNNING',
+        warehouseId: binding.warehouseId,
+        startedAt: new Date(),
+        triggeredBy,
+        summary: {
+          externalWarehouseId: binding.externalWarehouseId,
+          bindingId: binding.id,
+        } satisfies Prisma.InputJsonObject,
+      },
+      select: { id: true },
+    })
+
+    return {
+      binding,
+      jobId: job.id,
+    } satisfies StockSyncReservation
+  })
+}
+
 async function upsertDiscrepancy(params: {
   binding: SyncBinding
   category: 'MISSING_IN_WMS' | 'UNMAPPED_SKU' | 'QTY_MISMATCH' | 'RECEIPT_TIMING_CONFLICT'
@@ -324,8 +436,8 @@ export async function runStockSyncForBinding(
   bindingId: string,
   triggeredBy: string,
 ): Promise<MintsoftStockSyncResult> {
-  const binding = await getSyncBinding(bindingId)
-  if (!binding) {
+  const reservation = await reserveStockSyncJob(bindingId, triggeredBy)
+  if (!reservation.binding) {
     return {
       bindingId,
       warehouseId: '',
@@ -339,16 +451,17 @@ export async function runStockSyncForBinding(
       skipped: 0,
       errors: 1,
       notifiedUsers: 0,
-      skippedReason: 'Binding not found',
+      skippedReason: reservation.skippedReason,
     }
   }
 
-  if (!binding.active || !binding.connection.active || binding.stockSyncMode === 'DISABLED') {
+  const binding = reservation.binding
+  if (reservation.skippedReason) {
     return {
       bindingId: binding.id,
       warehouseId: binding.warehouseId,
       warehouseCode: binding.warehouse.code,
-      jobId: null,
+      jobId: reservation.jobId,
       status: 'SKIPPED',
       totalChecked: 0,
       matched: 0,
@@ -357,24 +470,11 @@ export async function runStockSyncForBinding(
       skipped: 0,
       errors: 0,
       notifiedUsers: 0,
-      skippedReason: !binding.active ? 'Binding inactive' : !binding.connection.active ? 'Connection inactive' : 'Stock sync disabled',
+      skippedReason: reservation.skippedReason,
     }
   }
 
-  const job = await db.wmsSyncJob.create({
-    data: {
-      connector: 'mintsoft',
-      type: 'STOCK_SYNC',
-      status: 'RUNNING',
-      warehouseId: binding.warehouseId,
-      startedAt: new Date(),
-      triggeredBy,
-      summary: {
-        externalWarehouseId: binding.externalWarehouseId,
-      } satisfies Prisma.InputJsonObject,
-    },
-    select: { id: true },
-  })
+  const job = { id: reservation.jobId! }
 
   const counters = {
     totalChecked: 0,

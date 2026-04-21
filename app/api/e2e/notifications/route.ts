@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
-import { getE2eRouteAccessError } from '@/lib/testing/e2e-route-guard'
+import { requireE2eAdminRoute } from '@/lib/testing/e2e-route-guard'
 
 type SeedNotification = {
   userEmail?: string | null
@@ -12,13 +11,8 @@ type SeedNotification = {
 }
 
 export async function POST(request: NextRequest) {
-  const authError = getE2eRouteAccessError(request)
-  if (authError) return authError
-
-  const session = await auth()
-  if (!session?.user?.id || (session.user as { role?: string }).role !== 'ADMIN') {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 403 })
-  }
+  const access = await requireE2eAdminRoute(request)
+  if (access instanceof NextResponse) return access
 
   const body = await request.json() as {
     clearForUserEmail?: string
