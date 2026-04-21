@@ -17,6 +17,7 @@ import {
   createMintsoftBindingHandover,
   runStockSyncForBinding,
 } from '@/lib/connectors/mintsoft/sync/stock-sync'
+import { runMintsoftProductVerify } from '@/lib/connectors/mintsoft/sync/product-sync'
 import { parseMintsoftThresholds, sanitizeMintsoftThresholds } from '@/lib/connectors/mintsoft/sync/stock-sync-helpers'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
@@ -870,6 +871,40 @@ export async function runMintsoftStockSyncNow(
     success: true,
     jobId: result.jobId,
     message: `${result.warehouseCode}: checked ${result.totalChecked}, found ${result.mismatched} discrepancies, ${result.errors} errors.`,
+  }
+}
+
+export async function runMintsoftProductVerifyNow(): Promise<{
+  success: boolean
+  error?: string
+  message?: string
+  jobId?: string | null
+}> {
+  await requireMintsoftReadAccess()
+
+  const result = await runMintsoftProductVerify('manual')
+  revalidatePath('/sync')
+
+  if (result.status === 'FAILED') {
+    return {
+      success: false,
+      error: result.skippedReason ?? 'Mintsoft product verify failed.',
+      jobId: result.jobId,
+    }
+  }
+
+  if (result.status === 'SKIPPED') {
+    return {
+      success: false,
+      error: result.skippedReason ?? 'Mintsoft product verify was skipped.',
+      jobId: result.jobId,
+    }
+  }
+
+  return {
+    success: true,
+    jobId: result.jobId,
+    message: `Checked ${result.totalChecked} products, updated ${result.corrected}, recorded ${result.mismatched} barcode conflicts, ${result.errors} errors.`,
   }
 }
 

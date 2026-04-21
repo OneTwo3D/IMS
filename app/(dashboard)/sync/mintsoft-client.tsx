@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation'
 import { Check, Loader2, Plus, RefreshCw, Settings2, Trash2 } from 'lucide-react'
 import {
   deleteMintsoftBinding,
+  runMintsoftProductVerifyNow,
   runMintsoftStockSyncNow,
   saveMintsoftBinding,
   saveMintsoftConnectionSettings,
@@ -188,6 +189,20 @@ export function MintsoftClient({ data }: Props) {
     })
   }
 
+  function handleRunProductVerify() {
+    setError('')
+    startTransition(async () => {
+      const result = await runMintsoftProductVerifyNow()
+      if (!result.success) {
+        setError(result.error ?? 'Failed to run Mintsoft product verify')
+        return
+      }
+
+      flashSaved(result.message ?? 'Mintsoft product verify completed')
+      router.refresh()
+    })
+  }
+
   return (
     <div className="space-y-6">
       <Card className="p-6 space-y-4">
@@ -195,7 +210,7 @@ export function MintsoftClient({ data }: Props) {
           <div>
             <h3 className="text-base font-semibold">Connection</h3>
             <p className="text-sm text-muted-foreground">
-              Configure Mintsoft credentials, resolve callback order lookup, and expose warehouse polling for notification-only stock sync.
+              Configure Mintsoft credentials, resolve callback order lookup, and run Mintsoft warehouse and product verification from one place.
             </p>
           </div>
           <Button type="button" variant="outline" onClick={() => setIsConnectionDialogOpen(true)} disabled={isPending}>
@@ -229,6 +244,13 @@ export function MintsoftClient({ data }: Props) {
 
         <div className="rounded-lg border bg-muted/30 p-3 text-xs text-muted-foreground">
           Webhook endpoint: <code>/api/webhooks/mintsoft/asn-booked-in</code>
+        </div>
+
+        <div className="flex flex-wrap gap-2">
+          <Button type="button" variant="outline" onClick={handleRunProductVerify} disabled={isPending || !data.status.configured}>
+            <RefreshCw className="mr-2 h-4 w-4" />
+            Run Product Verify
+          </Button>
         </div>
 
         {data.warehouseLookupError ? (

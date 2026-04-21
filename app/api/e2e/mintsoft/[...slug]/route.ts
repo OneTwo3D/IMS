@@ -21,12 +21,28 @@ type FakeMintsoftStockLine = {
   breakdown: unknown[]
 }
 
+type FakeMintsoftProduct = {
+  id: string
+  sku: string
+  name: string
+  ean: string | null
+  customsDescription: string | null
+  commodityCode: string | null
+  countryOfManufacture: string | null
+  weight: number | null
+  height: number | null
+  width: number | null
+  depth: number | null
+  imageUrl: string | null
+}
+
 type FakeMintsoftState = {
   apiKey: string
   username?: string
   password?: string
   warehouses: FakeMintsoftWarehouse[]
   stockLevelsByWarehouse: Record<string, FakeMintsoftStockLine[]>
+  products: FakeMintsoftProduct[]
 }
 
 function parseJsonRecord(value: string | null): Record<string, unknown> | null {
@@ -112,6 +128,32 @@ async function getFakeMintsoftState(): Promise<FakeMintsoftState | null> {
         .filter((line): line is FakeMintsoftStockLine => Boolean(line)),
     ]),
   )
+  const products = asArray(record.products)
+    .map((value) => {
+      const product = value && typeof value === 'object' && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : null
+      const id = asString(product?.id)
+      const sku = asString(product?.sku)
+      const name = asString(product?.name)
+      if (!id || !sku || !name) return null
+
+      return {
+        id,
+        sku,
+        name,
+        ean: asString(product?.ean),
+        customsDescription: asString(product?.customsDescription),
+        commodityCode: asString(product?.commodityCode),
+        countryOfManufacture: asString(product?.countryOfManufacture),
+        weight: product?.weight == null ? null : asNumber(product.weight, 0),
+        height: product?.height == null ? null : asNumber(product.height, 0),
+        width: product?.width == null ? null : asNumber(product.width, 0),
+        depth: product?.depth == null ? null : asNumber(product.depth, 0),
+        imageUrl: asString(product?.imageUrl),
+      } satisfies FakeMintsoftProduct
+    })
+    .filter((value): value is FakeMintsoftProduct => Boolean(value))
 
   return {
     apiKey,
@@ -119,11 +161,42 @@ async function getFakeMintsoftState(): Promise<FakeMintsoftState | null> {
     password: asString(record.password) ?? undefined,
     warehouses,
     stockLevelsByWarehouse,
+    products,
   }
 }
 
 function isAuthorized(request: NextRequest, state: FakeMintsoftState): boolean {
   return request.headers.get('ms-apikey')?.trim() === state.apiKey
+}
+
+function mapMintsoftProductResponse(product: FakeMintsoftProduct) {
+  return {
+    ProductId: Number(product.id),
+    SKU: product.sku,
+    Name: product.name,
+    EAN: product.ean,
+    CustomsDescription: product.customsDescription,
+    CommodityCode: product.commodityCode ? { Code: product.commodityCode } : null,
+    CountryOfManufacture: product.countryOfManufacture ? { Code: product.countryOfManufacture } : null,
+    Weight: product.weight,
+    Height: product.height,
+    Width: product.width,
+    Depth: product.depth,
+    ImageURL: product.imageUrl,
+  }
+}
+
+async function persistFakeMintsoftState(state: FakeMintsoftState): Promise<void> {
+  await db.setting.upsert({
+    where: { key: E2E_MINTSOFT_STATE_KEY },
+    create: {
+      key: E2E_MINTSOFT_STATE_KEY,
+      value: JSON.stringify(state),
+    },
+    update: {
+      value: JSON.stringify(state),
+    },
+  })
 }
 
 export async function GET(
@@ -180,6 +253,34 @@ export async function GET(
     )
   }
 
+  if (path === 'api/Product') {
+    if (!isAuthorized(request, state)) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const sku = request.nextUrl.searchParams.get('SKU') ?? request.nextUrl.searchParams.get('sku')
+    if (sku?.trim()) {
+      const matches = state.products.filter((product) => product.sku === sku.trim())
+      return NextResponse.json(matches.map(mapMintsoftProductResponse))
+    }
+
+    return NextResponse.json(state.products.map(mapMintsoftProductResponse))
+  }
+
+  if (path.startsWith('api/Product/')) {
+    if (!isAuthorized(request, state)) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const productId = path.slice('api/Product/'.length)
+    const product = state.products.find((entry) => entry.id === productId)
+    if (!product) {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    }
+
+    return NextResponse.json(mapMintsoftProductResponse(product))
+  }
+
   return NextResponse.json({ error: 'Not found' }, { status: 404 })
 }
 
@@ -210,5 +311,101 @@ export async function POST(
     return NextResponse.json(state.apiKey)
   }
 
+  if (path === 'api/Product') {
+    if (!isAuthorized(request, state)) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null
+    const sku = asString(body?.SKU ?? body?.sku)
+    const name = asString(body?.Name ?? body?.name)
+    if (!sku || !name) {
+      return NextResponse.json({ error: 'SKU and Name are required' }, { status: 400 })
+    }
+
+    const nextId = String(
+      Math.max(
+        0,
+        ...state.products
+          .map((product) => Number(product.id))
+          .filter((value) => Number.isFinite(value)),
+      ) + 1,
+    )
+    const created: FakeMintsoftProduct = {
+      id: nextId,
+      sku,
+      name,
+      ean: asString(body?.EAN ?? body?.ean),
+      customsDescription: asString(body?.CustomsDescription ?? body?.customsDescription),
+      commodityCode: asString((body?.CommodityCode as Record<string, unknown> | null)?.Code),
+      countryOfManufacture: asString((body?.CountryOfManufacture as Record<string, unknown> | null)?.Code),
+      weight: body?.Weight == null ? null : asNumber(body.Weight, 0),
+      height: body?.Height == null ? null : asNumber(body.Height, 0),
+      width: body?.Width == null ? null : asNumber(body.Width, 0),
+      depth: body?.Depth == null ? null : asNumber(body.Depth, 0),
+      imageUrl: asString(body?.ImageURL ?? body?.imageUrl),
+    }
+
+    state.products.push(created)
+    await persistFakeMintsoftState(state)
+    return NextResponse.json(mapMintsoftProductResponse(created))
+  }
+
+  if (path.startsWith('api/Product/')) {
+    if (!isAuthorized(request, state)) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const productId = path.slice('api/Product/'.length)
+    const index = state.products.findIndex((entry) => entry.id === productId)
+    if (index < 0) {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    }
+
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null
+    const current = state.products[index]!
+    const updated: FakeMintsoftProduct = {
+      ...current,
+      sku: asString(body?.SKU ?? body?.sku) ?? current.sku,
+      name: asString(body?.Name ?? body?.name) ?? current.name,
+      customsDescription: asString(body?.CustomsDescription ?? body?.customsDescription) ?? current.customsDescription,
+      ean: Object.prototype.hasOwnProperty.call(body ?? {}, 'EAN')
+        ? asString(body?.EAN)
+        : current.ean,
+      commodityCode: Object.prototype.hasOwnProperty.call(body ?? {}, 'CommodityCode')
+        ? asString((body?.CommodityCode as Record<string, unknown> | null)?.Code)
+        : current.commodityCode,
+      countryOfManufacture: Object.prototype.hasOwnProperty.call(body ?? {}, 'CountryOfManufacture')
+        ? asString((body?.CountryOfManufacture as Record<string, unknown> | null)?.Code)
+        : current.countryOfManufacture,
+      weight: Object.prototype.hasOwnProperty.call(body ?? {}, 'Weight')
+        ? (body?.Weight == null ? null : asNumber(body.Weight, 0))
+        : current.weight,
+      height: Object.prototype.hasOwnProperty.call(body ?? {}, 'Height')
+        ? (body?.Height == null ? null : asNumber(body.Height, 0))
+        : current.height,
+      width: Object.prototype.hasOwnProperty.call(body ?? {}, 'Width')
+        ? (body?.Width == null ? null : asNumber(body.Width, 0))
+        : current.width,
+      depth: Object.prototype.hasOwnProperty.call(body ?? {}, 'Depth')
+        ? (body?.Depth == null ? null : asNumber(body.Depth, 0))
+        : current.depth,
+      imageUrl: Object.prototype.hasOwnProperty.call(body ?? {}, 'ImageURL')
+        ? asString(body?.ImageURL)
+        : current.imageUrl,
+    }
+
+    state.products[index] = updated
+    await persistFakeMintsoftState(state)
+    return NextResponse.json(mapMintsoftProductResponse(updated))
+  }
+
   return NextResponse.json({ error: 'Not found' }, { status: 404 })
+}
+
+export async function PUT(
+  request: NextRequest,
+  context: { params: Promise<{ slug: string[] }> },
+) {
+  return POST(request, context)
 }

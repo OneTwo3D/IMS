@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
+import { runMintsoftProductVerify } from '@/lib/connectors/mintsoft/sync/product-sync'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
@@ -14,8 +15,6 @@ export async function GET(request: Request) {
     return NextResponse.json({ skipped: true, reason: 'Mintsoft plugin disabled' })
   }
 
-  return NextResponse.json({
-    skipped: true,
-    reason: 'Mintsoft product verification is not implemented yet',
-  })
+  const result = await runMintsoftProductVerify('cron')
+  return NextResponse.json(result)
 }

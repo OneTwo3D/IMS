@@ -12,6 +12,7 @@ This repository uses an `x.y.z` release scheme.
 
 - Added the first Mintsoft WMS integration surface in `/sync`, including connection settings, warehouse bindings, plugin gating, and the signed ASN booked-in webhook endpoint.
 - Added Mintsoft notification-only stock sync operations: warehouse discovery in the binding dialog, manual sync runs, recent run exports, open discrepancy visibility, and threshold-based in-app recipient notifications.
+- Added Mintsoft Phase 3 product verification: IMS product changes now perform a best-effort Mintsoft product sync, and operators can run a manual product verify from the Mintsoft dashboard.
 - Greyed out the future `ALIGN_TO_WMS` Mintsoft stock mode in the binding editor so it remains visible without presenting a dead-end selectable path.
 
 ### Technical
@@ -22,6 +23,7 @@ This repository uses an `x.y.z` release scheme.
 - Implemented Mintsoft's current authentication flow: store username/password, renew the 24-hour API key through `/api/Auth`, persist auth timing metadata, and retry once after a 401 before surfacing the failure.
 - Fixed Mintsoft notification-only stock sync so SKUs missing from the Mintsoft feed now raise `MISSING_IN_WMS` discrepancies instead of silently disappearing from review.
 - Fixed the Mintsoft discrepancy persistence race so concurrent sync runs now collapse onto a single `OPEN` discrepancy per warehouse/category/product-or-sku.
+- Implemented the Mintsoft product sync engine with payload hashing, authoritative product reads, barcode backfill/conflict handling, `WmsProductLink` persistence, the real `mintsoft-product-verify` cron path, and realistic E2E Mintsoft product endpoints for future workflow coverage.
 
 ## 1.4.1 - 2026-04-19
 

@@ -1,5 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import {
+  runMintsoftProductVerify,
+  runMintsoftProductVerifyForSkus,
+} from '@/lib/connectors/mintsoft/sync/product-sync'
 import { runStockSyncForBinding } from '@/lib/connectors/mintsoft/sync/stock-sync'
 import { serializeSettingValue } from '@/lib/settings-store'
 import { getE2eRouteAccessError } from '@/lib/testing/e2e-route-guard'
@@ -16,6 +20,7 @@ type SeedProduct = {
   name: string
   warehouseCode?: string
   quantity: number
+  barcode?: string | null
 }
 
 type SeedWarehouse = {
@@ -109,10 +114,12 @@ async function seedProducts(products: SeedProduct[]) {
       where: { sku: seedProduct.sku },
       update: {
         name: seedProduct.name,
+        barcode: seedProduct.barcode ?? null,
       },
       create: {
         sku: seedProduct.sku,
         name: seedProduct.name,
+        barcode: seedProduct.barcode ?? null,
       },
       select: { id: true },
     })
@@ -218,6 +225,7 @@ export async function GET(request: NextRequest) {
   }
 
   const externalEventId = request.nextUrl.searchParams.get('externalEventId')
+  const sku = request.nextUrl.searchParams.get('sku')
   if (externalEventId?.trim()) {
     const events = await db.wmsInboundReceiptEvent.findMany({
       where: {
@@ -232,6 +240,42 @@ export async function GET(request: NextRequest) {
     })
 
     return NextResponse.json({ events })
+  }
+
+  if (sku?.trim()) {
+    const product = await db.product.findUnique({
+      where: { sku: sku.trim() },
+      select: {
+        id: true,
+        sku: true,
+        barcode: true,
+        wmsProductLinks: {
+          where: { connector: 'mintsoft' },
+          select: {
+            externalProductId: true,
+            payloadHash: true,
+            lastKnownBarcode: true,
+            lastSyncedAt: true,
+            lastError: true,
+          },
+        },
+        wmsStockDiscrepancies: {
+          where: {
+            connector: 'mintsoft',
+          },
+          orderBy: [{ lastSeenAt: 'desc' }],
+          select: {
+            category: true,
+            status: true,
+            imsValue: true,
+            wmsValue: true,
+            message: true,
+          },
+        },
+      },
+    })
+
+    return NextResponse.json({ product })
   }
 
   return NextResponse.json({ error: 'Unsupported query' }, { status: 400 })
@@ -255,6 +299,8 @@ export async function POST(request: NextRequest) {
     clearWarehouseCodes?: string[]
     clearNotificationsForUserEmail?: string
     runFirstBindingSync?: boolean
+    runProductVerify?: boolean
+    runProductVerifySkus?: string[]
   }
 
   if (body.reset) {
@@ -376,6 +422,16 @@ export async function POST(request: NextRequest) {
 
     const result = await runStockSyncForBinding(binding.id, 'e2e')
     return NextResponse.json({ success: true, syncResult: result })
+  }
+
+  if (body.runProductVerify) {
+    const result = await runMintsoftProductVerify('e2e')
+    return NextResponse.json({ success: true, verifyResult: result })
+  }
+
+  if (Array.isArray(body.runProductVerifySkus) && body.runProductVerifySkus.length > 0) {
+    const result = await runMintsoftProductVerifyForSkus(body.runProductVerifySkus, 'e2e')
+    return NextResponse.json({ success: true, verifyResult: result })
   }
 
   return NextResponse.json({ success: true })

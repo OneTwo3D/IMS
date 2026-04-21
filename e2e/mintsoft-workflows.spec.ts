@@ -272,4 +272,202 @@ test.describe('Mintsoft integration workflows', () => {
     expect(eventsBody.events[0]?.externalAsnId).toBe(externalAsnId)
     expect(eventsBody.events[0]?.processedAt).toBeNull()
   })
+
+  test('runs Mintsoft product verify, backfills a missing IMS barcode, and surfaces barcode conflicts without overwriting either side', async ({ page }) => {
+    test.setTimeout(90_000)
+    const suffix = uniqueSuffix()
+    const warehouseCode = `MSPV${suffix}`
+    const warehouseName = `Mintsoft Product Verify ${suffix}`
+    const backfillSku = `MS-E2E-BACKFILL-${suffix}`
+    const conflictSku = `MS-E2E-CONFLICT-${suffix}`
+    const backfillBarcode = `5901234123${suffix.slice(-3)}`
+    const imsConflictBarcode = `5900000001${suffix.slice(-3)}`
+    const wmsConflictBarcode = `5909999999${suffix.slice(-3)}`
+
+    await seedMintsoftE2e(page, {
+      pluginEnabled: true,
+      fakeState: {
+        apiKey: 'e2e-static-ms-apikey',
+        username: 'mintsoft.e2e.user',
+        password: 'mintsoft.e2e.password',
+        warehouses: [
+          { id: 301, name: 'E2E Mintsoft Main' },
+        ],
+        products: [
+          {
+            id: '501',
+            sku: backfillSku,
+            name: `Mintsoft backfill ${suffix}`,
+            ean: backfillBarcode,
+          },
+          {
+            id: '502',
+            sku: conflictSku,
+            name: `Mintsoft conflict ${suffix}`,
+            ean: wmsConflictBarcode,
+          },
+        ],
+        stockLevelsByWarehouse: {
+          '301': [],
+        },
+      },
+      warehouses: [
+        {
+          code: warehouseCode,
+          name: warehouseName,
+        },
+      ],
+      products: [
+        {
+          sku: backfillSku,
+          name: `IMS backfill ${suffix}`,
+          warehouseCode,
+          quantity: 0,
+          barcode: null,
+        },
+        {
+          sku: conflictSku,
+          name: `IMS conflict ${suffix}`,
+          warehouseCode,
+          quantity: 0,
+          barcode: imsConflictBarcode,
+        },
+      ],
+    })
+
+    try {
+      await page.goto('/sync?connector=mintsoft')
+      await expect(page.getByRole('heading', { name: 'Mintsoft Connector' })).toBeVisible()
+
+      await page.getByRole('button', { name: 'Edit Connection' }).click()
+      const connectionDialog = page.getByRole('dialog', { name: 'Edit Mintsoft Connection' })
+      await fieldByLabel(connectionDialog, 'Base URL').fill(`${APP_BASE_URL}/api/e2e/mintsoft`)
+      await fieldByLabel(connectionDialog, 'Username').fill('mintsoft.e2e.user')
+      await fieldByLabel(connectionDialog, 'Password').fill('mintsoft.e2e.password')
+      await fieldByLabel(connectionDialog, 'Webhook Secret').fill('e2e-mintsoft-webhook-secret')
+      await connectionDialog.getByRole('button', { name: 'Save Connection' }).click()
+      await expect(page.getByText('Mintsoft connection saved')).toBeVisible()
+
+      await page.getByRole('button', { name: 'Add Binding' }).click()
+      const bindingDialog = page.getByRole('dialog', { name: 'Add Mintsoft Warehouse Binding' })
+      await fieldByLabel(bindingDialog, 'IMS Warehouse').selectOption({ label: `${warehouseCode} · ${warehouseName}` })
+      await fieldByLabel(bindingDialog, 'Mintsoft Warehouse').selectOption('301')
+      await bindingDialog.getByRole('button', { name: 'Add Warehouse Binding' }).click()
+      await expect(page.getByText('Mintsoft binding saved')).toBeVisible()
+
+      await expect(page.getByRole('button', { name: 'Run Product Verify' })).toBeVisible()
+
+      const verifyResponse = await seedMintsoftE2e(page, {
+        runProductVerifySkus: [backfillSku, conflictSku],
+      })
+      const verifyBody = await verifyResponse.json() as {
+        verifyResult: {
+          status: string
+          totalChecked: number
+          corrected: number
+          mismatched: number
+          errors: number
+        }
+      }
+      expect(verifyBody.verifyResult).toMatchObject({
+        status: 'SUCCEEDED',
+        totalChecked: 2,
+        corrected: 1,
+        mismatched: 1,
+        errors: 0,
+      })
+
+      const backfillResponse = await page.request.get(`/api/e2e/mintsoft?sku=${encodeURIComponent(backfillSku)}`)
+      expect(backfillResponse.ok()).toBeTruthy()
+      const backfillBody = await backfillResponse.json() as {
+        product: {
+          barcode: string | null
+          wmsProductLinks: Array<{
+            externalProductId: string
+            lastKnownBarcode: string | null
+            lastSyncedAt: string | null
+            lastError: string | null
+          }>
+          wmsStockDiscrepancies: Array<{
+            category: string
+            status: string
+          }>
+        } | null
+      }
+      expect(backfillBody.product?.barcode).toBe(backfillBarcode)
+      expect(backfillBody.product?.wmsProductLinks[0]?.externalProductId).toBe('501')
+      expect(backfillBody.product?.wmsProductLinks[0]?.lastKnownBarcode).toBe(backfillBarcode)
+      expect(backfillBody.product?.wmsProductLinks[0]?.lastSyncedAt).toBeTruthy()
+      expect(backfillBody.product?.wmsProductLinks[0]?.lastError ?? null).toBeNull()
+      expect(backfillBody.product?.wmsStockDiscrepancies).toContainEqual(
+        expect.objectContaining({
+          category: 'BARCODE_BACKFILLED_FROM_WMS',
+          status: 'RESOLVED',
+        }),
+      )
+
+      const conflictResponse = await page.request.get(`/api/e2e/mintsoft?sku=${encodeURIComponent(conflictSku)}`)
+      expect(conflictResponse.ok()).toBeTruthy()
+      const conflictBody = await conflictResponse.json() as {
+        product: {
+          barcode: string | null
+          wmsProductLinks: Array<{
+            externalProductId: string
+            lastKnownBarcode: string | null
+          }>
+          wmsStockDiscrepancies: Array<{
+            category: string
+            status: string
+            imsValue: string | null
+            wmsValue: string | null
+          }>
+        } | null
+      }
+      expect(conflictBody.product?.barcode).toBe(imsConflictBarcode)
+      expect(conflictBody.product?.wmsProductLinks[0]?.externalProductId).toBe('502')
+      expect(conflictBody.product?.wmsProductLinks[0]?.lastKnownBarcode).toBe(wmsConflictBarcode)
+      expect(conflictBody.product?.wmsStockDiscrepancies).toContainEqual(
+        expect.objectContaining({
+          category: 'BARCODE_CONFLICT',
+          status: 'OPEN',
+          imsValue: imsConflictBarcode,
+          wmsValue: wmsConflictBarcode,
+        }),
+      )
+
+      const mintsoftBackfillResponse = await page.request.get(`/api/e2e/mintsoft/api/Product?SKU=${encodeURIComponent(backfillSku)}`, {
+        headers: {
+          'ms-apikey': 'e2e-static-ms-apikey',
+        },
+      })
+      expect(mintsoftBackfillResponse.ok()).toBeTruthy()
+      const mintsoftBackfillProducts = await mintsoftBackfillResponse.json() as Array<{ EAN: string | null }>
+      expect(mintsoftBackfillProducts[0]?.EAN).toBe(backfillBarcode)
+
+      const mintsoftConflictResponse = await page.request.get(`/api/e2e/mintsoft/api/Product?SKU=${encodeURIComponent(conflictSku)}`, {
+        headers: {
+          'ms-apikey': 'e2e-static-ms-apikey',
+        },
+      })
+      expect(mintsoftConflictResponse.ok()).toBeTruthy()
+      const mintsoftConflictProducts = await mintsoftConflictResponse.json() as Array<{ EAN: string | null }>
+      expect(mintsoftConflictProducts[0]?.EAN).toBe(wmsConflictBarcode)
+
+      await page.reload()
+      await expect(page.getByText('BARCODE_CONFLICT')).toBeVisible()
+    } finally {
+      await seedMintsoftE2e(page, {
+        reset: true,
+        clearProductSkus: [backfillSku, conflictSku],
+        clearWarehouseCodes: [warehouseCode],
+        pluginEnabled: false,
+        apiKey: null,
+        username: null,
+        password: null,
+        webhookSecret: null,
+        fakeState: null,
+        clearNotificationsForUserEmail: E2E_ADMIN_EMAIL,
+      })
+    }
+  })
 })

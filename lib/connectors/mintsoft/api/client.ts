@@ -1,7 +1,10 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
-import type { WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsProductDto, WmsProductRef, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   extractMintsoftArrayPayload,
+  extractMintsoftObjectPayload,
+  normalizeMintsoftProduct,
+  normalizeMintsoftProductListItem,
   normalizeMintsoftStockLine,
   normalizeMintsoftWarehouse,
 } from './normalizers'
@@ -109,4 +112,89 @@ export async function fetchMintsoftStockLevels(externalWarehouseId: string): Pro
   return extractMintsoftArrayPayload(result.data)
     .map((item) => normalizeMintsoftStockLine(item))
     .filter((item): item is WmsStockLine => Boolean(item))
+}
+
+export async function fetchMintsoftProduct(externalProductId: string): Promise<WmsProductRef | null> {
+  const result = await mintsoftRequest<unknown>(`/api/Product/${encodeURIComponent(externalProductId.trim())}`)
+  if (result.status === 404) return null
+  if (result.error) {
+    throw new Error(result.error)
+  }
+
+  return normalizeMintsoftProduct(result.data)
+}
+
+export async function fetchMintsoftProductBySku(sku: string): Promise<WmsProductRef | null> {
+  const normalizedSku = sku.trim()
+  if (!normalizedSku) return null
+
+  const result = await mintsoftRequest<unknown>(`/api/Product?${new URLSearchParams({ SKU: normalizedSku }).toString()}`)
+  if (result.status === 404) return null
+  if (result.error) {
+    throw new Error(result.error)
+  }
+
+  const direct = normalizeMintsoftProduct(result.data)
+  if (direct?.sku === normalizedSku) return direct
+
+  const listMatch = extractMintsoftArrayPayload(result.data)
+    .map((item) => normalizeMintsoftProductListItem(item))
+    .find((item): item is WmsProductRef => item != null && item.sku === normalizedSku)
+
+  if (listMatch) return listMatch
+
+  const wrapped = extractMintsoftObjectPayload(result.data)
+  return wrapped && direct?.sku === normalizedSku ? direct : null
+}
+
+function buildMintsoftProductPayload(product: WmsProductDto, omitBarcode: boolean): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    SKU: product.sku,
+    Name: product.name,
+  }
+
+  if (product.customsDescription) payload.CustomsDescription = product.customsDescription
+  if (!omitBarcode && product.barcode) payload.EAN = product.barcode
+  if (product.weightKg != null) payload.Weight = product.weightKg
+  if (product.heightCm != null) payload.Height = product.heightCm
+  if (product.widthCm != null) payload.Width = product.widthCm
+  if (product.depthCm != null) payload.Depth = product.depthCm
+  if (product.imageUrl) payload.ImageURL = product.imageUrl
+  if (product.commodityCode) payload.CommodityCode = { Code: product.commodityCode }
+  if (product.countryOfManufacture) payload.CountryOfManufacture = { Code: product.countryOfManufacture }
+
+  return payload
+}
+
+export async function upsertMintsoftProduct(
+  product: WmsProductDto,
+  options?: WmsUpsertProductOptions,
+): Promise<WmsProductRef> {
+  const externalProductId = options?.externalProductId?.trim() || null
+  const omitBarcode = options?.omitBarcode ?? false
+  const path = externalProductId
+    ? `/api/Product/${encodeURIComponent(externalProductId)}`
+    : '/api/Product'
+  const method = externalProductId ? 'POST' : 'PUT'
+  const result = await mintsoftRequest<unknown>(path, {
+    method,
+    body: JSON.stringify(buildMintsoftProductPayload(product, omitBarcode)),
+  })
+
+  if (result.error) {
+    throw new Error(result.error)
+  }
+
+  const normalized = normalizeMintsoftProduct(result.data)
+  if (!normalized) {
+    const fetched = externalProductId
+      ? await fetchMintsoftProduct(externalProductId)
+      : await fetchMintsoftProductBySku(product.sku)
+    if (!fetched) {
+      throw new Error('Mintsoft product upsert succeeded but no product details were returned')
+    }
+    return fetched
+  }
+
+  return normalized
 }

@@ -1,6 +1,6 @@
-import type { WmsConnectionCheck, WmsConnector, WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsConnectionCheck, WmsConnector, WmsProductDto, WmsProductRef, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import { getMintsoftApiConfiguration, isMintsoftConfigured, verifyMintsoftWebhookSignature } from './api/auth'
-import { fetchMintsoftStockLevels, fetchMintsoftWarehouses } from './api/client'
+import { fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 
 const CONNECTOR = 'Mintsoft'
 
@@ -40,6 +40,18 @@ export class MintsoftConnector implements WmsConnector {
     return fetchMintsoftStockLevels(externalWarehouseId)
   }
 
+  async fetchProduct(externalProductId: string): Promise<WmsProductRef | null> {
+    return fetchMintsoftProduct(externalProductId)
+  }
+
+  async fetchProductBySku(sku: string): Promise<WmsProductRef | null> {
+    return fetchMintsoftProductBySku(sku)
+  }
+
+  async upsertProduct(product: WmsProductDto, options?: WmsUpsertProductOptions): Promise<WmsProductRef> {
+    return upsertMintsoftProduct(product, options)
+  }
+
   async verifyWebhookSignature(rawBody: string, signatureHeader: string | null): Promise<boolean> {
     const { webhookSecret } = await getMintsoftApiConfiguration()
     if (!webhookSecret) return false
@@ -59,12 +71,18 @@ export {
   verifyMintsoftWebhookSignature,
 } from './api/auth'
 export {
+  fetchMintsoftProduct,
+  fetchMintsoftProductBySku,
   fetchMintsoftStockLevels,
   fetchMintsoftWarehouses,
   mintsoftRequest,
+  upsertMintsoftProduct,
 } from './api/client'
 export {
   extractMintsoftArrayPayload,
+  extractMintsoftObjectPayload,
+  normalizeMintsoftProduct,
+  normalizeMintsoftProductListItem,
   normalizeMintsoftStockLine,
   normalizeMintsoftWarehouse,
 } from './api/normalizers'

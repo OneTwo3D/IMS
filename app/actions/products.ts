@@ -8,6 +8,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { Prisma, ProductType } from '@/app/generated/prisma/client'
+import { runMintsoftProductSyncForProduct } from '@/lib/connectors/mintsoft/sync/product-sync'
 import {
   COMPONENT_PRODUCT_STATUSES,
   deriveLegacyActiveFromLifecycleStatus,
@@ -568,6 +569,14 @@ export type ProductFormState = {
   message?: string
 }
 
+async function syncMintsoftProductBestEffort(productId: string): Promise<void> {
+  try {
+    await runMintsoftProductSyncForProduct(productId, 'product_mutation')
+  } catch (syncError) {
+    console.error(syncError)
+  }
+}
+
 export async function createProduct(
   _prev: ProductFormState,
   formData: FormData
@@ -673,6 +682,7 @@ export async function createProduct(
   } catch (syncError) {
     console.error(syncError)
   }
+  await syncMintsoftProductBestEffort(created.id)
 
   revalidatePath('/inventory')
   redirect('/inventory')
@@ -793,6 +803,7 @@ export async function updateProduct(
   } catch (syncError) {
     console.error(syncError)
   }
+  await syncMintsoftProductBestEffort(id)
 
   revalidatePath('/inventory')
   revalidatePath(`/inventory/${id}`)
