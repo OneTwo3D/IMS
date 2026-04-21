@@ -15,10 +15,20 @@ When changing the schema:
 Recommended local commands:
 
 ```bash
-npx prisma generate --schema prisma/schema.prisma
-npx prisma migrate deploy --schema prisma/schema.prisma
+bash scripts/prisma-dev-db.sh generate
+bash scripts/prisma-dev-db.sh deploy
+bash scripts/prisma-dev-db.sh status
+bash scripts/prisma-dev-db.sh diff
 node scripts/check-prisma-drift.mjs
 ```
+
+The helper script loads `DATABASE_URL` from `.env.local` or `.env` and uses the repo's `prisma.config.ts` setup consistently.
+
+## Sandbox Note
+
+Prisma 7 schema-engine commands such as `migrate status`, `migrate diff`, `db pull`, and `db execute` open a real TCP connection to PostgreSQL. When they run inside a restricted sandbox, they can fail with `P1001: Can't reach database server` even if Postgres is healthy.
+
+If `psql` and `prisma migrate deploy` work but `migrate status` or `db pull` report `P1001`, treat that as an execution-environment problem first, not a database outage. Run the helper script from a normal shell, or run the Prisma command outside the sandbox.
 
 ## Guardrails
 
