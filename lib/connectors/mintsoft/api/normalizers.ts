@@ -1,6 +1,7 @@
-import type { WmsProductRef, WmsReturnRecord, WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnLineRef, WmsAsnRef, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 
 const ARRAY_PAYLOAD_KEYS = ['data', 'Data', 'items', 'Items', 'results', 'Results', 'warehouses', 'Warehouses', 'stockLevels', 'StockLevels', 'returns', 'Returns'] as const
+const ASN_ARRAY_PAYLOAD_KEYS = [...ARRAY_PAYLOAD_KEYS, 'lines', 'Lines', 'asnLines', 'AsnLines', 'orderItems', 'OrderItems'] as const
 const WAREHOUSE_ID_KEYS = ['warehouseId', 'WarehouseId', 'id', 'Id', 'ID']
 const WAREHOUSE_NAME_KEYS = ['name', 'Name', 'warehouseName', 'WarehouseName', 'description', 'Description', 'label', 'Label']
 const STOCK_SKU_KEYS = ['sku', 'SKU', 'productSku', 'ProductSku', 'productCode', 'ProductCode', 'itemCode', 'ItemCode', 'code', 'Code']
@@ -13,6 +14,10 @@ const RETURN_ORDER_REFERENCE_KEYS = ['orderReference', 'OrderReference', 'orderN
 const RETURN_REASON_KEYS = ['reason', 'Reason', 'returnReason', 'ReturnReason']
 const RETURN_QTY_KEYS = ['qty', 'Qty', 'quantity', 'Quantity', 'returnedQty', 'ReturnedQty', 'returnQty', 'ReturnQty', 'receivedQty', 'ReceivedQty']
 const RETURN_RECEIVED_AT_KEYS = ['receivedAt', 'ReceivedAt', 'createdAt', 'CreatedAt', 'updatedAt', 'UpdatedAt', 'returnDate', 'ReturnDate', 'date', 'Date']
+const ASN_ID_KEYS = ['asnId', 'AsnId', 'ASNId', 'externalAsnId', 'ExternalAsnId', 'id', 'Id', 'ID']
+const ASN_STATUS_KEYS = ['status', 'Status', 'asnStatus', 'AsnStatus']
+const ASN_LINE_ID_KEYS = ['externalAsnLineId', 'ExternalAsnLineId', 'asnLineId', 'AsnLineId', 'lineId', 'LineId', 'lineID', 'LineID', 'id', 'Id', 'ID']
+const ASN_SOURCE_LINE_ID_KEYS = ['sourceLineId', 'SourceLineId', 'referenceLineId', 'ReferenceLineId', 'imsLineId', 'ImsLineId', 'externalReference', 'ExternalReference']
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -65,6 +70,18 @@ export function extractMintsoftArrayPayload(value: unknown): unknown[] {
   if (!record) return []
 
   for (const key of ARRAY_PAYLOAD_KEYS) {
+    if (Array.isArray(record[key])) return record[key] as unknown[]
+  }
+
+  return []
+}
+
+function extractMintsoftArrayPayloadWithKeys(value: unknown, keys: readonly string[]): unknown[] {
+  if (Array.isArray(value)) return value
+  const record = asRecord(value)
+  if (!record) return []
+
+  for (const key of keys) {
     if (Array.isArray(record[key])) return record[key] as unknown[]
   }
 
@@ -178,4 +195,43 @@ export function normalizeMintsoftProductPayload(value: unknown): Record<string, 
   if (commodityCode) payload.CommodityCode = { Code: commodityCode }
 
   return payload
+}
+
+export function normalizeMintsoftAsnLine(value: unknown): WmsAsnLineRef | null {
+  const record = asRecord(value)
+  if (!record) return null
+
+  const externalLineId = getFirstString(record, ASN_LINE_ID_KEYS)
+  const sourceLineId = getFirstString(record, ASN_SOURCE_LINE_ID_KEYS)
+  if (!externalLineId || !sourceLineId) return null
+
+  return {
+    externalLineId,
+    sourceLineId,
+    externalProductId: getFirstString(record, PRODUCT_ID_KEYS),
+    sku: getFirstString(record, STOCK_SKU_KEYS),
+    quantity: getFirstNumber(record, RETURN_QTY_KEYS),
+    raw: record,
+  }
+}
+
+export function normalizeMintsoftAsn(value: unknown): WmsAsnRef | null {
+  const record = extractMintsoftObjectPayload(value)
+  if (!record) return null
+
+  const externalAsnId = getFirstString(record, ASN_ID_KEYS)
+  if (!externalAsnId) return null
+
+  const lines = extractMintsoftArrayPayloadWithKeys(record, ASN_ARRAY_PAYLOAD_KEYS)
+    .map((entry) => normalizeMintsoftAsnLine(entry))
+    .filter((entry): entry is WmsAsnLineRef => Boolean(entry))
+
+  if (lines.length === 0) return null
+
+  return {
+    externalAsnId,
+    status: getFirstString(record, ASN_STATUS_KEYS),
+    lines,
+    raw: record,
+  }
 }

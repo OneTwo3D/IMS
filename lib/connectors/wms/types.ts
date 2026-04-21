@@ -51,6 +51,44 @@ export type WmsReturnRecord = {
   raw: Record<string, unknown> | null
 }
 
+export type WmsAsnPackagingType = 'PARCEL' | 'PALLET' | 'CONTAINER'
+
+export type WmsAsnLineInput = {
+  sourceLineId: string
+  externalProductId: string
+  sku: string
+  quantity: number
+}
+
+export type WmsAsnInput = {
+  externalWarehouseId: string
+  reference: string
+  callbackUrl?: string | null
+  supplierReference?: string | null
+  carrier?: string | null
+  eta?: string | null
+  packagingType?: WmsAsnPackagingType | null
+  packageCount?: number | null
+  autoCallback?: boolean
+  lines: WmsAsnLineInput[]
+}
+
+export type WmsAsnLineRef = {
+  externalLineId: string
+  sourceLineId: string
+  externalProductId: string | null
+  sku: string | null
+  quantity: number | null
+  raw: Record<string, unknown> | null
+}
+
+export type WmsAsnRef = {
+  externalAsnId: string
+  status: string | null
+  lines: WmsAsnLineRef[]
+  raw: Record<string, unknown> | null
+}
+
 export type WmsUpsertProductOptions = {
   externalProductId?: string | null
   omitBarcode?: boolean
@@ -72,6 +110,7 @@ export interface WmsConnector {
   fetchProduct(externalProductId: string): Promise<WmsProductRef | null>
   fetchProductBySku(sku: string): Promise<WmsProductRef | null>
   upsertProduct(product: WmsProductDto, options?: WmsUpsertProductOptions): Promise<WmsProductRef>
+  createAsn(input: WmsAsnInput): Promise<WmsAsnRef>
   pollReturns(since: Date): Promise<WmsReturnRecord[]>
   verifyWebhookSignature?(rawBody: string, signatureHeader: string | null): Promise<boolean> | boolean
 }

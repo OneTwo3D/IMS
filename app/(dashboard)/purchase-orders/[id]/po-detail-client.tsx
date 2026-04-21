@@ -11,6 +11,7 @@ import { Textarea } from '@/components/ui/textarea'
 import {
   Dialog,
   DialogContent,
+  DialogDescription,
   DialogHeader,
   DialogTitle,
   DialogFooter,
@@ -30,6 +31,11 @@ import {
   type PoStatus,
   type InvoiceRow,
 } from '@/app/actions/purchase-orders'
+import type {
+  MintsoftCreatePurchaseOrderAsnInput,
+  MintsoftPurchaseOrderAsnState,
+} from '@/app/actions/mintsoft-sync'
+import { createMintsoftPurchaseOrderAsn } from '@/app/actions/mintsoft-sync'
 import { getTrackingUrl } from '@/lib/tracking'
 import type { AccountingBankAccount } from '@/lib/accounting'
 import type { SupplierRow } from '@/app/actions/suppliers'
@@ -56,6 +62,7 @@ type Props = {
   companyHomeCountry?: string | null
   accountingAvailable: boolean
   accountingBillUrlTemplate: string
+  mintsoftAsnState: MintsoftPurchaseOrderAsnState
 }
 
 const STATUS_LABELS: Record<PoStatus, string> = {
@@ -427,6 +434,168 @@ function ReturnDialog({
           <Button onClick={handleConfirm} disabled={isPending}>
             {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
             Confirm Return
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function MintsoftAsnDialog({
+  po,
+  onClose,
+}: {
+  po: PoDetail
+  onClose: () => void
+}) {
+  const router = useRouter()
+  const [isPending, startTransition] = useTransition()
+  const [packagingType, setPackagingType] = useState<NonNullable<MintsoftCreatePurchaseOrderAsnInput['packagingType']>>('PARCEL')
+  const [packageCount, setPackageCount] = useState('1')
+  const [eta, setEta] = useState(po.expectedDelivery?.slice(0, 10) ?? '')
+  const [supplierReference, setSupplierReference] = useState(po.supplierRef ?? '')
+  const [carrier, setCarrier] = useState('')
+  const [autoCallback, setAutoCallback] = useState(true)
+  const [error, setError] = useState('')
+
+  const outstandingLines = po.lines.filter((line) => line.qtyToReceive > 0)
+
+  function handleConfirm() {
+    setError('')
+
+    const parsedPackageCount = Number.parseInt(packageCount, 10)
+    if (!Number.isFinite(parsedPackageCount) || parsedPackageCount <= 0) {
+      setError('Enter a valid package count.')
+      return
+    }
+
+    startTransition(async () => {
+      const result = await createMintsoftPurchaseOrderAsn(po.id, {
+        packagingType,
+        packageCount: parsedPackageCount,
+        eta: eta || null,
+        supplierReference: supplierReference || null,
+        carrier: carrier || null,
+        autoCallback,
+      } satisfies MintsoftCreatePurchaseOrderAsnInput)
+
+      if (result.success) {
+        router.refresh()
+        onClose()
+        return
+      }
+
+      setError(result.error ?? 'Failed to create Mintsoft ASN')
+    })
+  }
+
+  return (
+    <Dialog open onOpenChange={() => {}}>
+      <DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>Create Mintsoft ASN</DialogTitle>
+          <DialogDescription>
+            Mintsoft will receive the PO&apos;s outstanding quantities in base stock units. The callback can be disabled if this warehouse is not ready to process booked-in webhooks yet.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-4">
+          <Table className="min-w-[600px]">
+            <TableHeader>
+              <TableRow>
+                <TableHead className="text-xs">Product</TableHead>
+                <TableHead className="text-xs text-right w-32">Outstanding Qty</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {outstandingLines.map((line) => (
+                <TableRow key={line.id}>
+                  <TableCell>
+                    <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums font-medium">{line.qtyToReceive}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="mintsoftPackagingType">Packaging Type</Label>
+              <select
+                id="mintsoftPackagingType"
+                value={packagingType}
+                onChange={(event) => setPackagingType(event.target.value as typeof packagingType)}
+                className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+              >
+                <option value="PARCEL">Parcel</option>
+                <option value="PALLET">Pallet</option>
+                <option value="CONTAINER">Container</option>
+              </select>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="mintsoftPackageCount">Package Count</Label>
+              <Input
+                id="mintsoftPackageCount"
+                type="number"
+                min={1}
+                step={1}
+                value={packageCount}
+                onChange={(event) => setPackageCount(event.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="mintsoftEta">ETA</Label>
+              <Input
+                id="mintsoftEta"
+                type="date"
+                value={eta}
+                onChange={(event) => setEta(event.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="mintsoftCarrier">Carrier</Label>
+              <Input
+                id="mintsoftCarrier"
+                value={carrier}
+                onChange={(event) => setCarrier(event.target.value)}
+                placeholder="e.g. DPD, DHL Freight"
+              />
+            </div>
+            <div className="space-y-1.5 md:col-span-2">
+              <Label htmlFor="mintsoftSupplierReference">Supplier Reference</Label>
+              <Input
+                id="mintsoftSupplierReference"
+                value={supplierReference}
+                onChange={(event) => setSupplierReference(event.target.value)}
+                placeholder="Optional supplier or shipment reference"
+              />
+            </div>
+          </div>
+
+          <label className="flex items-start gap-2 rounded-md border p-3 text-sm">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={autoCallback}
+              onChange={(event) => setAutoCallback(event.target.checked)}
+            />
+            <span>
+              <span className="font-medium">Enable booked-in callback</span>
+              <span className="block text-muted-foreground">
+                When enabled, Mintsoft will call back into IMS when the ASN is booked in so the PO receipt can be reconciled automatically.
+              </span>
+            </span>
+          </label>
+
+          {error && <p className="text-sm text-destructive">{error}</p>}
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
+          <Button onClick={handleConfirm} disabled={isPending}>
+            {isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            Create Mintsoft ASN
           </Button>
         </DialogFooter>
       </DialogContent>
@@ -1302,7 +1471,7 @@ function ShipDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate }: Props) {
+export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, mintsoftAsnState }: Props) {
   const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -1325,6 +1494,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const [showReturn, setShowReturn] = useState(false)
   const [showBill, setShowBill] = useState(false)
   const [showShip, setShowShip] = useState(false)
+  const [showMintsoftAsn, setShowMintsoftAsn] = useState(false)
   const [showEditTracking, setShowEditTracking] = useState(false)
   const [showEditFreight, setShowEditFreight] = useState(false)
   const [showReceipts, setShowReceipts] = useState(false)
@@ -1480,6 +1650,17 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
               <PackageCheck className="h-4 w-4 mr-1" />Receive Goods
             </Button>
           )}
+          {mintsoftAsnState.pluginEnabled && mintsoftAsnState.canManage && (
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => setShowMintsoftAsn(true)}
+              disabled={isPending || !mintsoftAsnState.canCreate}
+              title={mintsoftAsnState.canCreate ? undefined : (mintsoftAsnState.blockedReason ?? undefined)}
+            >
+              <Upload className="h-4 w-4 mr-1" />Create Mintsoft ASN
+            </Button>
+          )}
           {canReturn && hasReturnable && (
             <Button variant="outline" size="sm" onClick={() => setShowReturn(true)} disabled={isPending}>
               <Undo2 className="h-4 w-4 mr-1" />Return Items
@@ -1608,6 +1789,60 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
           existingPo={po}
           onClose={() => { setEditing(false); router.refresh() }}
         />
+      )}
+
+      {(mintsoftAsnState.pluginEnabled || mintsoftAsnState.existingAsns.length > 0) && (
+        <div className="rounded-md border p-4 space-y-3">
+          <div>
+            <div>
+              <h2 className="text-sm font-medium">Mintsoft ASN</h2>
+              <p className="text-sm text-muted-foreground">
+                Destination warehouse: {mintsoftAsnState.destinationWarehouseCode ?? '—'}
+                {mintsoftAsnState.bindingExternalWarehouseId ? ` · Mintsoft warehouse ${mintsoftAsnState.bindingExternalWarehouseId}` : ''}
+              </p>
+            </div>
+          </div>
+
+          {!mintsoftAsnState.canCreate && mintsoftAsnState.blockedReason && (
+            <p className="text-sm text-muted-foreground">{mintsoftAsnState.blockedReason}</p>
+          )}
+
+          {mintsoftAsnState.existingAsns.length > 0 ? (
+            <Table className="min-w-[640px]">
+              <TableHeader>
+                <TableRow>
+                  <TableHead className="text-xs">External ASN</TableHead>
+                  <TableHead className="text-xs">Status</TableHead>
+                  <TableHead className="text-xs text-right">Lines</TableHead>
+                  <TableHead className="text-xs text-right">Expected</TableHead>
+                  <TableHead className="text-xs text-right">Received</TableHead>
+                  <TableHead className="text-xs">Created</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {mintsoftAsnState.existingAsns.map((asn) => (
+                  <TableRow key={asn.id}>
+                    <TableCell className="font-mono text-xs font-medium">{asn.externalAsnId}</TableCell>
+                    <TableCell className="text-xs">
+                      <div className="font-medium">{asn.status}</div>
+                      <div className="text-muted-foreground">
+                        {asn.closedAt ? `Closed ${new Date(asn.closedAt).toLocaleDateString('en-GB')}` : 'Open'}
+                      </div>
+                    </TableCell>
+                    <TableCell className="text-right tabular-nums">{asn.lineCount}</TableCell>
+                    <TableCell className="text-right tabular-nums">{asn.totalExpectedQty}</TableCell>
+                    <TableCell className="text-right tabular-nums">{asn.totalReceivedQty}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">
+                      {new Date(asn.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', year: 'numeric' })}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          ) : (
+            <p className="text-sm text-muted-foreground">No Mintsoft ASN has been created for this purchase order yet.</p>
+          )}
+        </div>
       )}
 
       {/* Lines table */}
@@ -1906,6 +2141,11 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
       {/* Receive dialog */}
       {showReceive && (
         <ReceiveDialog po={po} warehouses={warehouses} onClose={() => setShowReceive(false)} />
+      )}
+
+      {/* Mintsoft ASN dialog */}
+      {showMintsoftAsn && (
+        <MintsoftAsnDialog po={po} onClose={() => setShowMintsoftAsn(false)} />
       )}
 
       {/* Return dialog */}

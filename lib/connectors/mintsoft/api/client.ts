@@ -1,7 +1,8 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
-import type { WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnInput, WmsAsnRef, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   extractMintsoftArrayPayload,
+  normalizeMintsoftAsn,
   extractMintsoftObjectPayload,
   normalizeMintsoftProduct,
   normalizeMintsoftProductListItem,
@@ -191,6 +192,26 @@ function buildMintsoftProductPayload(product: WmsProductDto, omitBarcode: boolea
   return payload
 }
 
+function buildMintsoftAsnPayload(input: WmsAsnInput): Record<string, unknown> {
+  return {
+    WarehouseId: /^\d+$/.test(input.externalWarehouseId) ? Number.parseInt(input.externalWarehouseId, 10) : input.externalWarehouseId,
+    Reference: input.reference,
+    SupplierReference: input.supplierReference ?? null,
+    Carrier: input.carrier ?? null,
+    ETA: input.eta ?? null,
+    PackagingType: input.packagingType ?? null,
+    PackageCount: input.packageCount ?? null,
+    CallbackUrl: input.callbackUrl ?? null,
+    AutoCallback: input.autoCallback ?? true,
+    Lines: input.lines.map((line) => ({
+      SourceLineId: line.sourceLineId,
+      ProductId: /^\d+$/.test(line.externalProductId) ? Number.parseInt(line.externalProductId, 10) : line.externalProductId,
+      SKU: line.sku,
+      Quantity: line.quantity,
+    })),
+  }
+}
+
 export function buildMintsoftProductUpsertRequest(
   product: WmsProductDto,
   options?: WmsUpsertProductOptions,
@@ -224,6 +245,20 @@ export function buildMintsoftProductUpsertRequest(
   }
 }
 
+export function buildMintsoftAsnCreateRequest(
+  input: WmsAsnInput,
+): {
+  path: string
+  method: 'POST'
+  body: string
+} {
+  return {
+    path: '/api/ASN',
+    method: 'POST',
+    body: JSON.stringify(buildMintsoftAsnPayload(input)),
+  }
+}
+
 export async function upsertMintsoftProduct(
   product: WmsProductDto,
   options?: WmsUpsertProductOptions,
@@ -248,6 +283,25 @@ export async function upsertMintsoftProduct(
       throw new Error('Mintsoft product upsert succeeded but no product details were returned')
     }
     return fetched
+  }
+
+  return normalized
+}
+
+export async function createMintsoftAsn(input: WmsAsnInput): Promise<WmsAsnRef> {
+  const request = buildMintsoftAsnCreateRequest(input)
+  const result = await mintsoftRequest<unknown>(request.path, {
+    method: request.method,
+    body: request.body,
+  })
+
+  if (result.error) {
+    throw new Error(result.error)
+  }
+
+  const normalized = normalizeMintsoftAsn(result.data)
+  if (!normalized) {
+    throw new Error('Mintsoft ASN create succeeded but no line mapping was returned')
   }
 
   return normalized

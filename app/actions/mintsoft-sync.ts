@@ -6,7 +6,7 @@ import { z } from 'zod'
 import { applyReturnInboundStockTx, type RefundReturnRow } from '@/app/actions/sales'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requirePermission } from '@/lib/auth/server'
+import { getSession, requirePermission } from '@/lib/auth/server'
 import {
   getMintsoftSettings,
   invalidateMintsoftAccessToken,
@@ -26,9 +26,12 @@ import {
   type MintsoftReturnsInboxRow,
 } from '@/lib/connectors/mintsoft/sync/returns-sync'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
-import { getIntegrationPluginState } from '@/lib/integration-plugins'
+import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { hasPermission } from '@/lib/permissions'
+import { getPublicAppUrl } from '@/lib/public-app-url'
 import { serializeSettingValue } from '@/lib/settings-store'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
+import type { WmsAsnPackagingType } from '@/lib/connectors/wms/types'
 
 type MintsoftOrderLookupConnector = ShoppingConnectorId | ''
 
@@ -175,6 +178,37 @@ type MintsoftReturnRestockActivityMetadata = {
   orderId: string | null
 }
 
+export type MintsoftPurchaseOrderAsnRow = {
+  id: string
+  externalAsnId: string
+  status: string
+  createdAt: string
+  lastCallbackAt: string | null
+  closedAt: string | null
+  lineCount: number
+  totalExpectedQty: string
+  totalReceivedQty: string
+}
+
+export type MintsoftPurchaseOrderAsnState = {
+  pluginEnabled: boolean
+  canCreate: boolean
+  canManage: boolean
+  blockedReason: string | null
+  destinationWarehouseCode: string | null
+  bindingExternalWarehouseId: string | null
+  existingAsns: MintsoftPurchaseOrderAsnRow[]
+}
+
+export type MintsoftCreatePurchaseOrderAsnInput = {
+  packagingType?: WmsAsnPackagingType | null
+  packageCount?: number | null
+  eta?: string | null
+  supplierReference?: string | null
+  carrier?: string | null
+  autoCallback?: boolean
+}
+
 export type MintsoftDashboardData = {
   connection: MintsoftConnectionSettingsMasked
   status: MintsoftConnectionStatus
@@ -247,6 +281,14 @@ const MintsoftBindingDeleteSchema = z.string().min(1, 'Binding ID is required.')
 const MintsoftReturnRestockInputSchema = z.object({
   id: z.string().min(1, 'Return inbox item ID is required.'),
   warehouseId: z.string().min(1, 'Warehouse is required.'),
+})
+const MintsoftCreatePurchaseOrderAsnInputSchema = z.object({
+  packagingType: z.enum(['PARCEL', 'PALLET', 'CONTAINER']).nullable().optional(),
+  packageCount: z.number().int().positive('Package count must be at least 1.').nullable().optional(),
+  eta: z.string().trim().nullable().optional(),
+  supplierReference: z.string().trim().max(120, 'Supplier reference is too long.').nullable().optional(),
+  carrier: z.string().trim().max(120, 'Carrier is too long.').nullable().optional(),
+  autoCallback: z.boolean().optional().default(true),
 })
 
 function getValidationErrorMessage(error: z.ZodError): string {
@@ -391,6 +433,65 @@ function mapMintsoftDiscrepancy(row: {
     message: row.message,
     detectionCount: row.detectionCount,
     lastSeenAt: row.lastSeenAt.toISOString(),
+  }
+}
+
+function trimToNull(value: string | null | undefined): string | null {
+  const trimmed = value?.trim()
+  return trimmed ? trimmed : null
+}
+
+function toJsonValue(value: unknown): Prisma.InputJsonValue | null {
+  if (value == null) return null
+  if (value instanceof Date) return value.toISOString()
+  if (Array.isArray(value)) {
+    return value.map((entry) => (
+      entry === undefined ? null : toJsonValue(entry)
+    )) as Prisma.InputJsonValue
+  }
+  if (typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, entry]) => entry !== undefined)
+        .map(([key, entry]) => [key, entry instanceof Date ? entry.toISOString() : toJsonValue(entry)]),
+    ) as Prisma.InputJsonValue
+  }
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return value
+  }
+  return String(value)
+}
+
+function mapMintsoftPurchaseOrderAsnRow(row: {
+  id: string
+  externalAsnId: string
+  status: string
+  createdAt: Date
+  lastCallbackAt: Date | null
+  closedAt: Date | null
+  lines: Array<{
+    expectedQty: Prisma.Decimal
+    qtyAccountedViaReceipt: Prisma.Decimal
+  }>
+}): MintsoftPurchaseOrderAsnRow {
+  const totals = row.lines.reduce(
+    (acc, line) => ({
+      expected: acc.expected + Number(line.expectedQty),
+      received: acc.received + Number(line.qtyAccountedViaReceipt),
+    }),
+    { expected: 0, received: 0 },
+  )
+
+  return {
+    id: row.id,
+    externalAsnId: row.externalAsnId,
+    status: row.status,
+    createdAt: row.createdAt.toISOString(),
+    lastCallbackAt: row.lastCallbackAt?.toISOString() ?? null,
+    closedAt: row.closedAt?.toISOString() ?? null,
+    lineCount: row.lines.length,
+    totalExpectedQty: totals.expected.toString(),
+    totalReceivedQty: totals.received.toString(),
   }
 }
 
@@ -692,6 +793,133 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
     returnsInbox: returnsInbox.map(mapMintsoftReturnsInboxRow),
     availableOrderLookupConnectors,
     orderLookupConnectorRequired: availableOrderLookupConnectors.length > 1,
+  }
+}
+
+export async function getMintsoftPurchaseOrderAsnState(
+  poId: string,
+): Promise<MintsoftPurchaseOrderAsnState> {
+  const [session, pluginEnabled, po, existingAsns] = await Promise.all([
+    getSession(),
+    isIntegrationPluginEnabled('mintsoft'),
+    db.purchaseOrder.findUnique({
+      where: { id: poId },
+      select: {
+        id: true,
+        type: true,
+        status: true,
+        destinationWarehouseId: true,
+        destinationWarehouse: {
+          select: {
+            code: true,
+          },
+        },
+        lines: {
+          select: {
+            id: true,
+            qty: true,
+            qtyReceived: true,
+            product: {
+              select: {
+                wmsProductLinks: {
+                  where: { connector: 'mintsoft' },
+                  select: { id: true },
+                  take: 1,
+                },
+              },
+            },
+          },
+        },
+      },
+    }),
+    db.wmsAsnMap.findMany({
+      where: {
+        connector: 'mintsoft',
+        sourceType: 'PURCHASE_ORDER',
+        sourceId: poId,
+      },
+      orderBy: [{ createdAt: 'desc' }],
+      select: {
+        id: true,
+        externalAsnId: true,
+        status: true,
+        createdAt: true,
+        lastCallbackAt: true,
+        closedAt: true,
+        lines: {
+          select: {
+            expectedQty: true,
+            qtyAccountedViaReceipt: true,
+          },
+        },
+      },
+    }),
+  ])
+
+  const canManage = session?.user ? hasPermission(session.user.role, 'purchasing.receive') : false
+
+  if (!po) {
+    return {
+      pluginEnabled,
+      canCreate: false,
+      canManage,
+      blockedReason: 'Purchase order not found.',
+      destinationWarehouseCode: null,
+      bindingExternalWarehouseId: null,
+      existingAsns: [],
+    }
+  }
+
+  const binding = po.destinationWarehouseId
+    ? await db.externalWmsBinding.findFirst({
+        where: {
+          connector: 'mintsoft',
+          warehouseId: po.destinationWarehouseId,
+          active: true,
+          connection: {
+            active: true,
+          },
+        },
+        select: {
+          externalWarehouseId: true,
+        },
+      })
+    : null
+
+  const outstandingLines = po.lines.filter((line) => Number(line.qty) > Number(line.qtyReceived))
+  const unmappedOutstandingCount = outstandingLines.filter((line) => line.product.wmsProductLinks.length === 0).length
+
+  let blockedReason: string | null = null
+  if (!pluginEnabled) {
+    blockedReason = 'Mintsoft is disabled.'
+  } else if (!canManage) {
+    blockedReason = 'You do not have permission to create Mintsoft ASNs.'
+  } else if (po.type !== 'GOODS') {
+    blockedReason = 'Mintsoft ASNs are only available for goods purchase orders.'
+  } else if (!po.destinationWarehouseId) {
+    blockedReason = 'Choose a destination warehouse before creating a Mintsoft ASN.'
+  } else if (!binding) {
+    blockedReason = 'Bind the destination warehouse to Mintsoft before creating an ASN.'
+  } else if (!['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'].includes(po.status)) {
+    blockedReason = 'Mintsoft ASNs can be created once the PO has been sent and still has outstanding goods.'
+  } else if (outstandingLines.length === 0) {
+    blockedReason = 'This purchase order has no outstanding quantity left to place on an ASN.'
+  } else if (unmappedOutstandingCount > 0) {
+    blockedReason = unmappedOutstandingCount === 1
+      ? 'One outstanding line is not linked to a Mintsoft product yet.'
+      : `${unmappedOutstandingCount} outstanding lines are not linked to Mintsoft products yet.`
+  } else if (existingAsns.some((asn) => asn.closedAt == null)) {
+    blockedReason = 'This purchase order already has an open Mintsoft ASN.'
+  }
+
+  return {
+    pluginEnabled,
+    canCreate: blockedReason == null,
+    canManage,
+    blockedReason,
+    destinationWarehouseCode: po.destinationWarehouse?.code ?? null,
+    bindingExternalWarehouseId: binding?.externalWarehouseId ?? null,
+    existingAsns: existingAsns.map(mapMintsoftPurchaseOrderAsnRow),
   }
 }
 
@@ -1000,6 +1228,353 @@ export async function runMintsoftReturnsSyncNow(): Promise<{
     success: true,
     jobId: result.jobId,
     message: `Checked ${result.totalChecked} returns, staged ${result.corrected} new inbox items, ${result.errors} errors.`,
+  }
+}
+
+export async function createMintsoftPurchaseOrderAsn(
+  poId: unknown,
+  input: unknown,
+): Promise<{ success: boolean; error?: string; message?: string; externalAsnId?: string }> {
+  await requirePermission('purchasing.receive')
+
+  const parsedId = MintsoftBindingDeleteSchema.safeParse(poId)
+  if (!parsedId.success) {
+    return { success: false, error: getValidationErrorMessage(parsedId.error) }
+  }
+
+  const parsedInput = MintsoftCreatePurchaseOrderAsnInputSchema.safeParse(input)
+  if (!parsedInput.success) {
+    return { success: false, error: getValidationErrorMessage(parsedInput.error) }
+  }
+
+  if (!await isIntegrationPluginEnabled('mintsoft')) {
+    return { success: false, error: 'Mintsoft is disabled.' }
+  }
+
+  const data = parsedInput.data
+  const eta = trimToNull(data.eta)
+  let etaIso: string | null = null
+  if (eta) {
+    const parsedEta = new Date(eta)
+    if (!Number.isFinite(parsedEta.getTime())) {
+      return { success: false, error: 'Enter a valid ETA date.' }
+    }
+    etaIso = parsedEta.toISOString()
+  }
+
+  const autoCallback = data.autoCallback ?? true
+  const [publicAppUrl, settings] = await Promise.all([
+    getPublicAppUrl(),
+    getMintsoftSettings(),
+  ])
+
+  if (autoCallback && !publicAppUrl) {
+    return { success: false, error: 'Set the public app URL before enabling Mintsoft ASN callbacks.' }
+  }
+
+  if (autoCallback && !settings.mintsoft_webhook_secret.trim()) {
+    return { success: false, error: 'Save a Mintsoft webhook secret before enabling ASN callbacks.' }
+  }
+
+  const callbackUrl = autoCallback
+    ? `${publicAppUrl!.replace(/\/+$/, '')}/api/webhooks/mintsoft/asn-booked-in`
+    : null
+
+  const job = await db.wmsSyncJob.create({
+    data: {
+      connector: 'mintsoft',
+      type: 'ASN_CREATE',
+      status: 'RUNNING',
+      startedAt: new Date(),
+      triggeredBy: 'manual',
+      summary: {
+        poId: parsedId.data,
+      } satisfies Prisma.InputJsonObject,
+    },
+    select: { id: true },
+  })
+
+  try {
+    const connector = getWmsConnector('mintsoft')
+    const outcome = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM purchase_orders WHERE id = ${parsedId.data} FOR UPDATE`
+
+      const po = await tx.purchaseOrder.findUnique({
+        where: { id: parsedId.data },
+        select: {
+          id: true,
+          reference: true,
+          type: true,
+          status: true,
+          supplierRef: true,
+          destinationWarehouseId: true,
+          destinationWarehouse: {
+            select: {
+              code: true,
+            },
+          },
+          lines: {
+            orderBy: [{ sortOrder: 'asc' }, { id: 'asc' }],
+            select: {
+              id: true,
+              productId: true,
+              qty: true,
+              qtyReceived: true,
+              product: {
+                select: {
+                  sku: true,
+                  wmsProductLinks: {
+                    where: { connector: 'mintsoft' },
+                    select: {
+                      externalProductId: true,
+                    },
+                    take: 1,
+                  },
+                },
+              },
+            },
+          },
+        },
+      })
+
+      if (!po) {
+        throw new Error('Purchase order not found.')
+      }
+
+      const existingAsn = await tx.wmsAsnMap.findFirst({
+        where: {
+          connector: 'mintsoft',
+          sourceType: 'PURCHASE_ORDER',
+          sourceId: po.id,
+        },
+        orderBy: [{ createdAt: 'desc' }],
+        select: {
+          id: true,
+          externalAsnId: true,
+          status: true,
+          lines: {
+            select: { id: true },
+          },
+        },
+      })
+
+      if (existingAsn) {
+        return {
+          kind: 'existing' as const,
+          asnMapId: existingAsn.id,
+          externalAsnId: existingAsn.externalAsnId,
+          status: existingAsn.status,
+          lineCount: existingAsn.lines.length,
+          warehouseCode: po.destinationWarehouse?.code ?? null,
+        }
+      }
+
+      if (po.type !== 'GOODS') {
+        throw new Error('Mintsoft ASNs are only available for goods purchase orders.')
+      }
+
+      if (!po.destinationWarehouseId || !po.destinationWarehouse) {
+        throw new Error('This purchase order does not have a destination warehouse.')
+      }
+
+      if (!['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'].includes(po.status)) {
+        throw new Error('Mintsoft ASNs can only be created for sent purchase orders with outstanding goods.')
+      }
+
+      const binding = await tx.externalWmsBinding.findFirst({
+        where: {
+          connector: 'mintsoft',
+          warehouseId: po.destinationWarehouseId,
+          active: true,
+          connection: {
+            active: true,
+          },
+        },
+        select: {
+          externalWarehouseId: true,
+        },
+      })
+
+      if (!binding) {
+        throw new Error('Bind the destination warehouse to Mintsoft before creating an ASN.')
+      }
+
+      const outstandingLines = po.lines
+        .map((line) => ({
+          id: line.id,
+          productId: line.productId,
+          sku: line.product.sku,
+          externalProductId: line.product.wmsProductLinks[0]?.externalProductId ?? null,
+          outstandingQty: Number(line.qty) - Number(line.qtyReceived),
+        }))
+        .filter((line) => line.outstandingQty > 0)
+
+      if (outstandingLines.length === 0) {
+        throw new Error('This purchase order has no outstanding quantity left to place on an ASN.')
+      }
+
+      const unmappedLine = outstandingLines.find((line) => !line.externalProductId)
+      if (unmappedLine) {
+        throw new Error(`Outstanding SKU ${unmappedLine.sku} is not linked to a Mintsoft product.`)
+      }
+
+      const createdAsn = await connector.createAsn({
+        externalWarehouseId: binding.externalWarehouseId,
+        reference: po.reference,
+        callbackUrl,
+        supplierReference: trimToNull(data.supplierReference) ?? trimToNull(po.supplierRef),
+        carrier: trimToNull(data.carrier),
+        eta: etaIso,
+        packagingType: data.packagingType ?? null,
+        packageCount: data.packageCount ?? null,
+        autoCallback,
+        lines: outstandingLines.map((line) => ({
+          sourceLineId: line.id,
+          externalProductId: line.externalProductId!,
+          sku: line.sku,
+          quantity: line.outstandingQty,
+        })),
+      })
+
+      const sourceLineMap = new Map(createdAsn.lines.map((line) => [line.sourceLineId, line]))
+      const usedExternalLineIds = new Set<string>()
+      const mappedLines = outstandingLines.map((line) => {
+        const createdLine = sourceLineMap.get(line.id)
+        if (!createdLine) {
+          throw new Error(`Mintsoft did not return a line mapping for PO line ${line.id}.`)
+        }
+        if (usedExternalLineIds.has(createdLine.externalLineId)) {
+          throw new Error(`Mintsoft returned duplicate ASN line id ${createdLine.externalLineId}.`)
+        }
+        usedExternalLineIds.add(createdLine.externalLineId)
+
+        return {
+          externalAsnLineId: createdLine.externalLineId,
+          sourceType: 'PURCHASE_ORDER_LINE',
+          sourceLineId: line.id,
+          productId: line.productId,
+          sku: line.sku,
+          expectedQty: line.outstandingQty,
+          payload: createdLine.raw ?? null,
+        }
+      })
+
+      const asnMap = await tx.wmsAsnMap.create({
+        data: {
+          connector: 'mintsoft',
+          externalAsnId: createdAsn.externalAsnId,
+          sourceType: 'PURCHASE_ORDER',
+          sourceId: po.id,
+          warehouseId: po.destinationWarehouseId,
+          status: createdAsn.status ?? 'OPEN',
+          lines: {
+            create: mappedLines.map((line) => ({
+              externalAsnLineId: line.externalAsnLineId,
+              sourceType: line.sourceType,
+              sourceLineId: line.sourceLineId,
+              productId: line.productId,
+              sku: line.sku,
+              expectedQty: line.expectedQty,
+            })),
+          },
+        },
+        select: {
+          id: true,
+        },
+      })
+
+      await tx.wmsSyncLog.createMany({
+        data: mappedLines.map((line) => ({
+          jobId: job.id,
+          sku: line.sku,
+          productId: line.productId,
+          action: 'asn_line_mapped',
+          reason: `Mapped purchase order line ${line.sourceLineId} into Mintsoft ASN ${createdAsn.externalAsnId}`,
+          payload: toJsonValue({
+            sourceLineId: line.sourceLineId,
+            externalAsnLineId: line.externalAsnLineId,
+            expectedQty: line.expectedQty,
+            response: line.payload,
+          }) as Prisma.InputJsonValue,
+        })),
+      })
+
+      return {
+        kind: 'created' as const,
+        asnMapId: asnMap.id,
+        externalAsnId: createdAsn.externalAsnId,
+        status: createdAsn.status ?? 'OPEN',
+        lineCount: mappedLines.length,
+        warehouseCode: po.destinationWarehouse.code,
+      }
+    }, { maxWait: 5000, timeout: 30000 })
+
+    await db.wmsSyncJob.update({
+      where: { id: job.id },
+      data: {
+        status: 'SUCCEEDED',
+        finishedAt: new Date(),
+        totalChecked: outcome.lineCount,
+        matched: outcome.lineCount,
+        summary: {
+          poId: parsedId.data,
+          asnMapId: outcome.asnMapId,
+          externalAsnId: outcome.externalAsnId,
+          status: outcome.status,
+          existing: outcome.kind === 'existing',
+        } satisfies Prisma.InputJsonObject,
+      },
+    })
+
+    if (outcome.kind === 'created') {
+      await logActivity({
+        entityType: 'SYNC',
+        entityId: outcome.asnMapId,
+        tag: 'sync',
+        action: 'mintsoft_asn_created',
+        description: `Created Mintsoft ASN ${outcome.externalAsnId} for purchase order ${parsedId.data}`,
+        metadata: {
+          poId: parsedId.data,
+          externalAsnId: outcome.externalAsnId,
+          warehouseCode: outcome.warehouseCode,
+          lineCount: outcome.lineCount,
+          callbackUrl,
+          autoCallback,
+        },
+      })
+    }
+
+    revalidatePath('/purchase-orders')
+    revalidatePath(`/purchase-orders/${parsedId.data}`)
+    revalidatePath('/sync')
+
+    return {
+      success: true,
+      externalAsnId: outcome.externalAsnId,
+      message: outcome.kind === 'existing'
+        ? `Mintsoft ASN ${outcome.externalAsnId} already exists for this purchase order.`
+        : `Created Mintsoft ASN ${outcome.externalAsnId}.`,
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to create Mintsoft ASN.'
+
+    await db.wmsSyncJob.update({
+      where: { id: job.id },
+      data: {
+        status: 'FAILED',
+        finishedAt: new Date(),
+        errors: 1,
+        summary: {
+          poId: parsedId.data,
+          error: message,
+        } satisfies Prisma.InputJsonObject,
+      },
+    })
+
+    return {
+      success: false,
+      error: message,
+    }
   }
 }
 

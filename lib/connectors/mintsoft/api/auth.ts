@@ -44,6 +44,19 @@ function buildMintsoftRequestUrl(path: string, baseUrl: string): URL {
   return new URL(normalizedPath, normalizedBaseUrl)
 }
 
+function buildMintsoftAuthHeaders(baseUrl: string): HeadersInit {
+  const url = buildMintsoftRequestUrl('/', baseUrl)
+  const e2eSecret = process.env.E2E_ROUTE_SECRET?.trim()
+
+  return {
+    Accept: 'application/json, text/plain;q=0.9',
+    'Content-Type': 'application/json',
+    ...(e2eSecret && url.pathname.startsWith('/api/e2e/mintsoft')
+      ? { 'x-e2e-secret': e2eSecret }
+      : {}),
+  }
+}
+
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -115,10 +128,7 @@ async function requestMintsoftAuthSession(
 ): Promise<{ token: string; expiresAt: Date }> {
   const response = await fetch(buildMintsoftRequestUrl('/api/Auth', baseUrl), {
     method: 'POST',
-    headers: {
-      Accept: 'application/json, text/plain;q=0.9',
-      'Content-Type': 'application/json',
-    },
+    headers: buildMintsoftAuthHeaders(baseUrl),
     body: JSON.stringify({
       Username: username,
       Password: password,

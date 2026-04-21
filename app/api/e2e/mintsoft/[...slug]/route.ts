@@ -46,6 +46,28 @@ type FakeMintsoftReturn = {
   receivedAt: string | null
 }
 
+type FakeMintsoftAsnLine = {
+  id: string
+  sourceLineId: string
+  productId: string | null
+  sku: string | null
+  quantity: number
+}
+
+type FakeMintsoftAsn = {
+  id: string
+  warehouseId: string | null
+  reference: string | null
+  supplierReference: string | null
+  carrier: string | null
+  eta: string | null
+  callbackUrl: string | null
+  autoCallback: boolean
+  status: string
+  createdAt: string
+  lines: FakeMintsoftAsnLine[]
+}
+
 type FakeMintsoftState = {
   apiKey: string
   username?: string
@@ -54,6 +76,7 @@ type FakeMintsoftState = {
   stockLevelsByWarehouse: Record<string, FakeMintsoftStockLine[]>
   products: FakeMintsoftProduct[]
   returns: FakeMintsoftReturn[]
+  asns: FakeMintsoftAsn[]
 }
 
 function parseJsonRecord(value: string | null): Record<string, unknown> | null {
@@ -184,6 +207,48 @@ async function getFakeMintsoftState(): Promise<FakeMintsoftState | null> {
       } satisfies FakeMintsoftReturn
     })
     .filter((value): value is FakeMintsoftReturn => Boolean(value))
+  const asns = asArray(record.asns)
+    .map((value) => {
+      const asn = value && typeof value === 'object' && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : null
+      const id = asString(asn?.id)
+      if (!id) return null
+
+      const lines = asArray(asn?.lines)
+        .map((line) => {
+          const recordLine = line && typeof line === 'object' && !Array.isArray(line)
+            ? line as Record<string, unknown>
+            : null
+          const lineId = asString(recordLine?.id)
+          const sourceLineId = asString(recordLine?.sourceLineId)
+          if (!lineId || !sourceLineId) return null
+
+          return {
+            id: lineId,
+            sourceLineId,
+            productId: asString(recordLine?.productId),
+            sku: asString(recordLine?.sku),
+            quantity: asNumber(recordLine?.quantity, 0),
+          } satisfies FakeMintsoftAsnLine
+        })
+        .filter((line): line is FakeMintsoftAsnLine => Boolean(line))
+
+      return {
+        id,
+        warehouseId: asString(asn?.warehouseId),
+        reference: asString(asn?.reference),
+        supplierReference: asString(asn?.supplierReference),
+        carrier: asString(asn?.carrier),
+        eta: asString(asn?.eta),
+        callbackUrl: asString(asn?.callbackUrl),
+        autoCallback: asBoolean(asn?.autoCallback, true),
+        status: asString(asn?.status) ?? 'OPEN',
+        createdAt: asString(asn?.createdAt) ?? new Date().toISOString(),
+        lines,
+      } satisfies FakeMintsoftAsn
+    })
+    .filter((value): value is FakeMintsoftAsn => Boolean(value))
 
   return {
     apiKey,
@@ -193,6 +258,7 @@ async function getFakeMintsoftState(): Promise<FakeMintsoftState | null> {
     stockLevelsByWarehouse,
     products,
     returns,
+    asns,
   }
 }
 
@@ -215,6 +281,39 @@ function mapMintsoftProductResponse(product: FakeMintsoftProduct) {
     Depth: product.depth,
     ImageURL: product.imageUrl,
   }
+}
+
+function mapMintsoftAsnResponse(asn: FakeMintsoftAsn) {
+  return {
+    AsnId: /^\d+$/.test(asn.id) ? Number(asn.id) : asn.id,
+    WarehouseId: asn.warehouseId && /^\d+$/.test(asn.warehouseId) ? Number(asn.warehouseId) : asn.warehouseId,
+    Reference: asn.reference,
+    SupplierReference: asn.supplierReference,
+    Carrier: asn.carrier,
+    ETA: asn.eta,
+    CallbackUrl: asn.callbackUrl,
+    AutoCallback: asn.autoCallback,
+    Status: asn.status,
+    CreatedAt: asn.createdAt,
+    Lines: asn.lines.map((line) => ({
+      AsnLineId: line.id,
+      SourceLineId: line.sourceLineId,
+      ProductId: line.productId && /^\d+$/.test(line.productId) ? Number(line.productId) : line.productId,
+      SKU: line.sku,
+      Quantity: line.quantity,
+    })),
+  }
+}
+
+function buildNextNumericId(values: string[]): string {
+  return String(
+    Math.max(
+      0,
+      ...values
+        .map((value) => Number(value))
+        .filter((value) => Number.isFinite(value)),
+    ) + 1,
+  )
 }
 
 function readFakeMintsoftProductFields(
@@ -366,6 +465,14 @@ export async function GET(
     )
   }
 
+  if (path === 'api/ASN') {
+    if (!isAuthorized(request, state)) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    return NextResponse.json(state.asns.map(mapMintsoftAsnResponse))
+  }
+
   if (path.startsWith('api/Product/')) {
     if (!isAuthorized(request, state)) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
@@ -435,6 +542,59 @@ export async function POST(
     state.products[index] = updated
     await persistFakeMintsoftState(state)
     return NextResponse.json(mapMintsoftProductResponse(updated))
+  }
+
+  if (path === 'api/ASN') {
+    if (!isAuthorized(request, state)) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const body = await request.json().catch(() => null) as Record<string, unknown> | null
+    const warehouseId = asString(body?.WarehouseId ?? body?.warehouseId)
+    const reference = asString(body?.Reference ?? body?.reference)
+    const lines = asArray(body?.Lines ?? body?.lines)
+      .map((line, index) => {
+        const recordLine = line && typeof line === 'object' && !Array.isArray(line)
+          ? line as Record<string, unknown>
+          : null
+        const sourceLineId = asString(recordLine?.SourceLineId ?? recordLine?.sourceLineId)
+        if (!sourceLineId) return null
+
+        return {
+          id: `${Date.now()}-${index + 1}`,
+          sourceLineId,
+          productId: asString(recordLine?.ProductId ?? recordLine?.productId),
+          sku: asString(recordLine?.SKU ?? recordLine?.sku),
+          quantity: asNumber(recordLine?.Quantity ?? recordLine?.quantity, 0),
+        } satisfies FakeMintsoftAsnLine
+      })
+      .filter((line): line is FakeMintsoftAsnLine => Boolean(line))
+
+    if (!warehouseId || !reference || lines.length === 0) {
+      return NextResponse.json({ error: 'WarehouseId, Reference, and at least one line are required' }, { status: 400 })
+    }
+
+    const asnId = buildNextNumericId(state.asns.map((asn) => asn.id))
+    const asn: FakeMintsoftAsn = {
+      id: asnId,
+      warehouseId,
+      reference,
+      supplierReference: asString(body?.SupplierReference ?? body?.supplierReference),
+      carrier: asString(body?.Carrier ?? body?.carrier),
+      eta: asString(body?.ETA ?? body?.eta),
+      callbackUrl: asString(body?.CallbackUrl ?? body?.callbackUrl),
+      autoCallback: asBoolean(body?.AutoCallback ?? body?.autoCallback, true),
+      status: 'OPEN',
+      createdAt: new Date().toISOString(),
+      lines: lines.map((line, index) => ({
+        ...line,
+        id: `${asnId}-${index + 1}`,
+      })),
+    }
+
+    state.asns.push(asn)
+    await persistFakeMintsoftState(state)
+    return NextResponse.json(mapMintsoftAsnResponse(asn))
   }
 
   return NextResponse.json({ error: 'Not found' }, { status: 404 })

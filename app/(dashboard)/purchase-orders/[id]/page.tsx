@@ -3,6 +3,7 @@ import { notFound } from 'next/navigation'
 import Link from 'next/link'
 import { ChevronLeft } from 'lucide-react'
 import { getPurchaseOrder } from '@/app/actions/purchase-orders'
+import { getMintsoftPurchaseOrderAsnState } from '@/app/actions/mintsoft-sync'
 import { getSuppliers } from '@/app/actions/suppliers'
 import { listProducts } from '@/app/actions/products'
 import { getWarehouses } from '@/app/actions/stock'
@@ -20,7 +21,7 @@ type Props = { params: Promise<{ id: string }> }
 
 export default async function PurchaseOrderDetailPage({ params }: Props) {
   const { id } = await params
-  const [po, suppliers, productsResult, warehouses, currencies, taxRates, purchaseUnits, billUrlTemplate, organisation, carriersJson, accountingSettings, accountingAvailable] = await Promise.all([
+  const [po, suppliers, productsResult, warehouses, currencies, taxRates, purchaseUnits, billUrlTemplate, organisation, carriersJson, accountingSettings, accountingAvailable, mintsoftAsnState] = await Promise.all([
     getPurchaseOrder(id),
     getSuppliers(),
     listProducts({ pageSize: 1000, type: 'ALL', active: 'true' }),
@@ -33,6 +34,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
     getSetting('shipping_carriers'),
     getAccountingSettings(),
     isIntegrationPluginEnabled('xero'),
+    getMintsoftPurchaseOrderAsnState(id),
   ])
 
   if (!po) notFound()
@@ -52,7 +54,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
         </Link>
         <h1 className="text-2xl font-semibold font-mono">{po.reference}</h1>
       </div>
-      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} />
+      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} mintsoftAsnState={mintsoftAsnState} />
     </div>
   )
 }

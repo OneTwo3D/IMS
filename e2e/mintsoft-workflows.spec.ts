@@ -1,6 +1,6 @@
 import { createHmac } from 'node:crypto'
 import { expect, test } from '@playwright/test'
-import { uniqueSuffix } from './helpers'
+import { createSimpleProduct, uniqueSuffix } from './helpers'
 import { E2E_ADMIN_EMAIL } from './test-data'
 
 const APP_BASE_URL = (process.env.E2E_BASE_URL ?? 'http://localhost:3001').replace(/\/$/, '')
@@ -218,6 +218,147 @@ test.describe('Mintsoft integration workflows', () => {
         reset: true,
         clearProductSkus: [matchedSku, missingSku],
         clearWarehouseCodes: [warehouseCode],
+        pluginEnabled: false,
+        apiKey: null,
+        username: null,
+        password: null,
+        webhookSecret: null,
+        fakeState: null,
+        clearNotificationsForUserEmail: E2E_ADMIN_EMAIL,
+      })
+    }
+  })
+
+  test('creates a Mintsoft ASN from a purchase order with outstanding base-unit quantities', async ({ page }) => {
+    test.setTimeout(120_000)
+    const suffix = uniqueSuffix()
+    const warehouseCode = `MSASN${suffix.slice(-6).toUpperCase()}`
+    const warehouseName = `Mintsoft ASN ${suffix}`
+    const product = await createSimpleProduct(page, { price: '14.00' })
+
+    await seedMintsoftE2e(page, {
+      pluginEnabled: true,
+      fakeState: {
+        apiKey: 'e2e-static-ms-apikey',
+        username: 'mintsoft.e2e.user',
+        password: 'mintsoft.e2e.password',
+        warehouses: [
+          { id: 301, name: 'E2E Mintsoft ASN Warehouse' },
+        ],
+        products: [
+          {
+            id: '901',
+            sku: product.sku,
+            name: product.name,
+          },
+        ],
+        stockLevelsByWarehouse: {
+          '301': [],
+        },
+        asns: [],
+      },
+      warehouses: [
+        {
+          code: warehouseCode,
+          name: warehouseName,
+        },
+      ],
+      wmsProductLinks: [
+        {
+          sku: product.sku,
+          externalProductId: '901',
+        },
+      ],
+    })
+
+    try {
+      await page.goto('/sync?connector=mintsoft')
+      await page.getByRole('button', { name: 'Edit Connection' }).click()
+      const connectionDialog = page.getByRole('dialog', { name: 'Edit Mintsoft Connection' })
+      await fieldByLabel(connectionDialog, 'Base URL').fill(`${APP_BASE_URL}/api/e2e/mintsoft`)
+      await fieldByLabel(connectionDialog, 'Username').fill('mintsoft.e2e.user')
+      await fieldByLabel(connectionDialog, 'Password').fill('mintsoft.e2e.password')
+      await fieldByLabel(connectionDialog, 'Webhook Secret').fill('e2e-mintsoft-webhook-secret')
+      await connectionDialog.getByRole('button', { name: 'Save Connection' }).click()
+      await expect(page.getByText('Mintsoft connection saved')).toBeVisible()
+
+      await page.getByRole('button', { name: 'Add Binding' }).click()
+      const bindingDialog = page.getByRole('dialog', { name: 'Add Mintsoft Warehouse Binding' })
+      await fieldByLabel(bindingDialog, 'IMS Warehouse').selectOption({ label: `${warehouseCode} · ${warehouseName}` })
+      await fieldByLabel(bindingDialog, 'Mintsoft Warehouse').selectOption('301')
+      await bindingDialog.getByRole('button', { name: 'Add Warehouse Binding' }).click()
+      await expect(page.getByText('Mintsoft binding saved')).toBeVisible()
+
+      const linkedProductResponse = await mintsoftE2eGet(page, `/api/e2e/mintsoft?sku=${encodeURIComponent(product.sku)}`)
+      expect(linkedProductResponse.ok()).toBeTruthy()
+      const linkedProductBody = await linkedProductResponse.json() as {
+        product: {
+          wmsProductLinks: Array<{
+            externalProductId: string
+          }>
+        } | null
+      }
+      expect(linkedProductBody.product?.wmsProductLinks[0]?.externalProductId).toBe('901')
+
+      await page.goto('/purchase-orders')
+      await page.getByRole('button', { name: /new po/i }).click()
+      const poDialog = page.getByRole('dialog', { name: 'New Purchase Order' })
+      await poDialog.locator('select').first().selectOption({ label: 'E2E Supplier' })
+      await poDialog.getByLabel('Destination Warehouse').selectOption({ label: `${warehouseCode} — ${warehouseName}` })
+      await poDialog.getByLabel('Supplier Reference').fill(`SUP-${suffix}`)
+      await poDialog.getByPlaceholder(/search product to add/i).fill(product.sku)
+      await poDialog.getByRole('button', { name: new RegExp(product.sku) }).first().click()
+      await poDialog.getByRole('button', { name: /create purchase order/i }).click()
+
+      await page.waitForURL(/\/purchase-orders\/.+/)
+      const poId = page.url().split('/').pop()
+      expect(poId).toBeTruthy()
+
+      await page.getByRole('button', { name: /confirm & send po/i }).click()
+      await expect(page.getByText(/^PO Sent$/)).toBeVisible()
+
+      await page.getByRole('button', { name: 'Create Mintsoft ASN' }).click()
+      const asnDialog = page.getByRole('dialog', { name: 'Create Mintsoft ASN' })
+      await asnDialog.getByLabel('Packaging Type').selectOption('PALLET')
+      await asnDialog.getByLabel('Package Count').fill('2')
+      await asnDialog.getByLabel('ETA').fill('2026-05-01')
+      await asnDialog.getByLabel('Carrier').fill('DHL Freight')
+      await asnDialog.getByRole('button', { name: 'Create Mintsoft ASN' }).click()
+      await expect(asnDialog).toBeHidden()
+
+      await expect(page.getByRole('heading', { name: 'Mintsoft ASN' })).toBeVisible()
+      await expect(page.getByText('No Mintsoft ASN has been created for this purchase order yet.')).toHaveCount(0)
+      await expect(
+        page.getByRole('row').filter({ has: page.getByText('1', { exact: true }) }).getByText('OPEN', { exact: true }),
+      ).toBeVisible()
+
+      const asnMapsResponse = await mintsoftE2eGet(page, `/api/e2e/mintsoft?sourcePoId=${encodeURIComponent(poId!)}`)
+      expect(asnMapsResponse.ok()).toBeTruthy()
+      const asnMapsBody = await asnMapsResponse.json() as {
+        asnMaps: Array<{
+          externalAsnId: string
+          status: string
+          lines: Array<{
+            sku: string
+            expectedQty: number
+          }>
+        }>
+      }
+
+      expect(asnMapsBody.asnMaps).toHaveLength(1)
+      expect(asnMapsBody.asnMaps[0]).toMatchObject({
+        externalAsnId: '1',
+        status: 'OPEN',
+      })
+      expect(asnMapsBody.asnMaps[0]?.lines).toEqual([
+        expect.objectContaining({
+          sku: product.sku,
+          expectedQty: 1,
+        }),
+      ])
+    } finally {
+      await seedMintsoftE2e(page, {
+        reset: true,
         pluginEnabled: false,
         apiKey: null,
         username: null,

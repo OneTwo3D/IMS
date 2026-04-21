@@ -1,6 +1,6 @@
-import type { WmsConnectionCheck, WmsConnector, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnInput, WmsAsnRef, WmsConnectionCheck, WmsConnector, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import { getMintsoftApiConfiguration, isMintsoftConfigured, verifyMintsoftWebhookSignature } from './api/auth'
-import { fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
+import { createMintsoftAsn, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 
 const CONNECTOR = 'Mintsoft'
 
@@ -52,6 +52,10 @@ export class MintsoftConnector implements WmsConnector {
     return upsertMintsoftProduct(product, options)
   }
 
+  async createAsn(input: WmsAsnInput): Promise<WmsAsnRef> {
+    return createMintsoftAsn(input)
+  }
+
   async pollReturns(since: Date): Promise<WmsReturnRecord[]> {
     return fetchMintsoftReturns(since)
   }
@@ -75,6 +79,8 @@ export {
   verifyMintsoftWebhookSignature,
 } from './api/auth'
 export {
+  buildMintsoftAsnCreateRequest,
+  createMintsoftAsn,
   fetchMintsoftProduct,
   fetchMintsoftProductBySku,
   fetchMintsoftReturns,
@@ -84,6 +90,8 @@ export {
   upsertMintsoftProduct,
 } from './api/client'
 export {
+  normalizeMintsoftAsn,
+  normalizeMintsoftAsnLine,
   extractMintsoftArrayPayload,
   extractMintsoftObjectPayload,
   normalizeMintsoftProduct,

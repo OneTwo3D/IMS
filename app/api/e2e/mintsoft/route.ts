@@ -24,6 +24,11 @@ type SeedProduct = {
   barcode?: string | null
 }
 
+type SeedWmsProductLink = {
+  sku: string
+  externalProductId: string
+}
+
 type SeedWarehouse = {
   code: string
   name?: string
@@ -54,10 +59,13 @@ async function resetMintsoftPersistence() {
       title: 'Mintsoft stock discrepancies detected',
     },
   })
+  await db.wmsProductLink.deleteMany({ where: { connector: 'mintsoft' } })
   await db.wmsStockSnapshot.deleteMany({ where: { connector: 'mintsoft' } })
   await db.wmsStockDiscrepancy.deleteMany({ where: { connector: 'mintsoft' } })
   await db.wmsReturnsInbox.deleteMany({ where: { connector: 'mintsoft' } })
   await db.wmsInboundReceiptEvent.deleteMany({ where: { connector: 'mintsoft' } })
+  await db.wmsAsnLineMap.deleteMany({ where: { asn: { connector: 'mintsoft' } } })
+  await db.wmsAsnMap.deleteMany({ where: { connector: 'mintsoft' } })
   await db.wmsSyncJob.deleteMany({ where: { connector: 'mintsoft' } })
   await db.externalWmsBinding.deleteMany({ where: { connector: 'mintsoft' } })
   await db.wmsConnection.deleteMany({ where: { connector: 'mintsoft' } })
@@ -94,6 +102,18 @@ async function clearProductsBySku(skus: string[]) {
     where: { productId: { in: productIds } },
   })
   await db.stockMovement.deleteMany({
+    where: { productId: { in: productIds } },
+  })
+  await db.wmsProductLink.deleteMany({
+    where: {
+      connector: 'mintsoft',
+      productId: { in: productIds },
+    },
+  })
+  await db.wmsAsnLineMap.deleteMany({
+    where: { productId: { in: productIds } },
+  })
+  await db.supplierProduct.deleteMany({
     where: { productId: { in: productIds } },
   })
   await db.stockLevel.deleteMany({
@@ -168,6 +188,39 @@ async function seedProducts(products: SeedProduct[]) {
         productId: product.id,
         warehouseId: warehouse.id,
         quantity: seedProduct.quantity,
+      },
+    })
+  }
+}
+
+async function seedWmsProductLinks(links: SeedWmsProductLink[]) {
+  for (const link of links) {
+    const sku = link.sku.trim()
+    const externalProductId = link.externalProductId.trim()
+    if (!sku || !externalProductId) continue
+
+    const product = await db.product.findUnique({
+      where: { sku },
+      select: { id: true, barcode: true },
+    })
+    if (!product) continue
+
+    await db.wmsProductLink.upsert({
+      where: {
+        connector_productId: {
+          connector: 'mintsoft',
+          productId: product.id,
+        },
+      },
+      create: {
+        connector: 'mintsoft',
+        productId: product.id,
+        externalProductId,
+        lastKnownBarcode: product.barcode,
+      },
+      update: {
+        externalProductId,
+        lastKnownBarcode: product.barcode,
       },
     })
   }
@@ -268,6 +321,7 @@ export async function GET(request: NextRequest) {
 
   const externalEventId = request.nextUrl.searchParams.get('externalEventId')
   const sku = request.nextUrl.searchParams.get('sku')
+  const sourcePoId = request.nextUrl.searchParams.get('sourcePoId')
   if (externalEventId?.trim()) {
     const events = await db.wmsInboundReceiptEvent.findMany({
       where: {
@@ -346,6 +400,44 @@ export async function GET(request: NextRequest) {
     })
   }
 
+  if (sourcePoId?.trim()) {
+    const asnMaps = await db.wmsAsnMap.findMany({
+      where: {
+        connector: 'mintsoft',
+        sourceType: 'PURCHASE_ORDER',
+        sourceId: sourcePoId.trim(),
+      },
+      orderBy: [{ createdAt: 'desc' }],
+      select: {
+        externalAsnId: true,
+        status: true,
+        createdAt: true,
+        lines: {
+          select: {
+            externalAsnLineId: true,
+            sourceLineId: true,
+            sku: true,
+            expectedQty: true,
+          },
+        },
+      },
+    })
+
+    return NextResponse.json({
+      asnMaps: asnMaps.map((asn) => ({
+        externalAsnId: asn.externalAsnId,
+        status: asn.status,
+        createdAt: asn.createdAt,
+        lines: asn.lines.map((line) => ({
+          externalAsnLineId: line.externalAsnLineId,
+          sourceLineId: line.sourceLineId,
+          sku: line.sku,
+          expectedQty: Number(line.expectedQty),
+        })),
+      })),
+    })
+  }
+
   return NextResponse.json({ error: 'Unsupported query' }, { status: 400 })
 }
 
@@ -363,6 +455,7 @@ export async function POST(request: NextRequest) {
     fakeState?: Record<string, unknown> | null
     warehouses?: SeedWarehouse[]
     products?: SeedProduct[]
+    wmsProductLinks?: SeedWmsProductLink[]
     clearProductSkus?: string[]
     clearWarehouseCodes?: string[]
     clearNotificationsForUserEmail?: string
@@ -472,6 +565,10 @@ export async function POST(request: NextRequest) {
 
   if (Array.isArray(body.products) && body.products.length > 0) {
     await seedProducts(body.products)
+  }
+
+  if (Array.isArray(body.wmsProductLinks) && body.wmsProductLinks.length > 0) {
+    await seedWmsProductLinks(body.wmsProductLinks)
   }
 
   if (body.runFirstBindingSync) {
