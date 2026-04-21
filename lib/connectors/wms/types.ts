@@ -12,6 +12,12 @@ export type WmsWarehouseRef = {
   name: string
 }
 
+export type WmsStockLine = {
+  sku: string
+  quantity: number
+  raw: Record<string, unknown> | null
+}
+
 export type WmsConnectionCheck = {
   success: boolean
   error?: string
@@ -24,5 +30,6 @@ export interface WmsConnector {
   isConfigured(): Promise<boolean>
   validateConnection(): Promise<WmsConnectionCheck>
   fetchWarehouses(): Promise<WmsWarehouseRef[]>
+  fetchStockLevels(externalWarehouseId: string): Promise<WmsStockLine[]>
   verifyWebhookSignature?(rawBody: string, signatureHeader: string | null): Promise<boolean> | boolean
 }

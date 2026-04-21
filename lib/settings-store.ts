@@ -13,6 +13,7 @@ export const SENSITIVE_SETTING_KEYS = new Set([
   'backup_sftp_password',
   'backup_sftp_private_key',
   'email_smtp_pass',
+  'mintsoft_auth_token',
   'mintsoft_api_key',
   'mintsoft_webhook_secret',
   'quickbooks_client_secret',

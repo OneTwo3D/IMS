@@ -8,14 +8,14 @@ const PORT = Number(process.env.E2E_PORT ?? 3001)
 const baseURL = process.env.E2E_BASE_URL ?? `http://localhost:${PORT}`
 const webServerURL = `${baseURL.replace(/\/$/, '')}/login`
 
-// Specs that mutate shared WooCommerce integration settings
-// (wc_url / wc_consumer_key / wc_stock_sync_enabled / warehouse sync
+// Specs that mutate shared integration settings
+// (WooCommerce credentials, Mintsoft connection/plugin state, warehouse sync
 // flags, etc.). These are unsafe to run in parallel with any other
 // spec that reads those settings, so they run inside the dedicated
 // `wc-isolated` project AFTER the main chromium project has fully
-// completed. Add new WC-setting-mutating specs here, not to the
+// completed. Add new integration-setting-mutating specs here, not to the
 // main project.
-const ISOLATED_SPECS = /(?:stock-sync-drift|woocommerce(?:-[\w-]+)?|security-workflows)\.spec\.ts/
+const ISOLATED_SPECS = /(?:stock-sync-drift|woocommerce(?:-[\w-]+)?|mintsoft-workflows|security-workflows)\.spec\.ts/
 // CSV import/export round-trip coverage mutates shared inventory,
 // costing, and transfer state across multiple domains. Keep these
 // specs out of the main parallel pool so fixture scripts and the dev
@@ -53,13 +53,13 @@ export default defineConfig({
       testIgnore: CHROMIUM_PARALLEL_IGNORE,
     },
     {
-      // WooCommerce-setting-mutating specs. Runs strictly after
+      // Integration-setting-mutating specs. Runs strictly after
       // `chromium` completes (via `dependencies`), and disables
       // intra-file parallelism so no two tests in these specs can
-      // race on shared WC integration state. The app's dev server
-      // reads wc_url/credentials per request, so rewriting them
-      // while chromium tests are still in flight would silently
-      // corrupt those runs — `dependencies` is what prevents that.
+      // race on shared connector state. The app's dev server reads
+      // integration credentials and plugin flags per request, so
+      // rewriting them while chromium tests are still in flight would
+      // silently corrupt those runs — `dependencies` is what prevents that.
       name: 'wc-isolated',
       use: {
         ...devices['Desktop Chrome'],

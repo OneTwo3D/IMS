@@ -2,8 +2,15 @@
 
 import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { Check, Loader2, Plus, Settings2, Trash2 } from 'lucide-react'
-import { deleteMintsoftBinding, saveMintsoftBinding, saveMintsoftConnectionSettings, type MintsoftDashboardData } from '@/app/actions/mintsoft-sync'
+import { Check, Loader2, Plus, RefreshCw, Settings2, Trash2 } from 'lucide-react'
+import {
+  deleteMintsoftBinding,
+  runMintsoftStockSyncNow,
+  saveMintsoftBinding,
+  saveMintsoftConnectionSettings,
+  type MintsoftDashboardData,
+} from '@/app/actions/mintsoft-sync'
+import { ProductLink } from '@/components/inventory/product-link'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import {
@@ -18,9 +25,20 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import { Textarea } from '@/components/ui/textarea'
 
 type Props = {
   data: MintsoftDashboardData
+}
+
+function formatThresholdSummary(
+  thresholds: { absoluteDelta: number | null; percentDelta: number | null } | null,
+): string {
+  if (!thresholds) return 'Default'
+  const parts: string[] = []
+  if (thresholds.absoluteDelta != null) parts.push(`Abs ${thresholds.absoluteDelta}`)
+  if (thresholds.percentDelta != null) parts.push(`${thresholds.percentDelta}%`)
+  return parts.length > 0 ? parts.join(' / ') : 'Default'
 }
 
 export function MintsoftClient({ data }: Props) {
@@ -28,26 +46,30 @@ export function MintsoftClient({ data }: Props) {
   const [isPending, startTransition] = useTransition()
   const [isConnectionDialogOpen, setIsConnectionDialogOpen] = useState(false)
   const [isBindingDialogOpen, setIsBindingDialogOpen] = useState(false)
-  const [connectionDialogKey, setConnectionDialogKey] = useState(0)
-  const [bindingDialogKey, setBindingDialogKey] = useState(0)
   const [label, setLabel] = useState(data.connection.label)
   const [baseUrl, setBaseUrl] = useState(data.connection.baseUrl)
   const [apiKey, setApiKey] = useState('')
   const [webhookSecret, setWebhookSecret] = useState('')
   const [orderLookupConnector, setOrderLookupConnector] = useState(data.connection.orderLookupConnector)
   const [active, setActive] = useState(data.connection.active ? 'true' : 'false')
+  const [bindingActive, setBindingActive] = useState('true')
   const [warehouseId, setWarehouseId] = useState(data.warehouses.find((warehouse) => warehouse.active)?.id ?? '')
-  const [externalWarehouseId, setExternalWarehouseId] = useState('')
-  const [stockSyncMode, setStockSyncMode] = useState<'DISABLED' | 'NOTIFICATION_ONLY'>('NOTIFICATION_ONLY')
+  const [externalWarehouseId, setExternalWarehouseId] = useState(data.externalWarehouses[0]?.externalId ?? '')
+  const [stockSyncMode, setStockSyncMode] = useState<'DISABLED' | 'NOTIFICATION_ONLY' | 'ALIGN_TO_WMS'>('NOTIFICATION_ONLY')
   const [returnsMode, setReturnsMode] = useState<'DISABLED' | 'POLL' | 'WEBHOOK'>('DISABLED')
   const [syncFrequencyMinutes, setSyncFrequencyMinutes] = useState('60')
+  const [absoluteDelta, setAbsoluteDelta] = useState('')
+  const [percentDelta, setPercentDelta] = useState('')
+  const [reportRecipients, setReportRecipients] = useState('')
   const [error, setError] = useState('')
+  const [feedbackMessage, setFeedbackMessage] = useState('')
   const [saved, setSaved] = useState(false)
   const orderLookupConnectorRequired = data.orderLookupConnectorRequired
 
-  function flashSaved() {
+  function flashSaved(message: string) {
+    setFeedbackMessage(message)
     setSaved(true)
-    setTimeout(() => setSaved(false), 2000)
+    setTimeout(() => setSaved(false), 3000)
   }
 
   function resetConnectionForm() {
@@ -57,30 +79,28 @@ export function MintsoftClient({ data }: Props) {
     setWebhookSecret('')
     setOrderLookupConnector(data.connection.orderLookupConnector)
     setActive(data.connection.active ? 'true' : 'false')
-    setConnectionDialogKey((key) => key + 1)
   }
 
   function resetBindingForm() {
+    setBindingActive('true')
     setWarehouseId(data.warehouses.find((warehouse) => warehouse.active)?.id ?? '')
-    setExternalWarehouseId('')
+    setExternalWarehouseId(data.externalWarehouses[0]?.externalId ?? '')
     setStockSyncMode('NOTIFICATION_ONLY')
     setReturnsMode('DISABLED')
     setSyncFrequencyMinutes('60')
-    setBindingDialogKey((key) => key + 1)
+    setAbsoluteDelta('')
+    setPercentDelta('')
+    setReportRecipients('')
   }
 
   function handleConnectionDialogOpenChange(open: boolean) {
     setIsConnectionDialogOpen(open)
-    if (!open) {
-      resetConnectionForm()
-    }
+    if (!open) resetConnectionForm()
   }
 
   function handleBindingDialogOpenChange(open: boolean) {
     setIsBindingDialogOpen(open)
-    if (!open) {
-      resetBindingForm()
-    }
+    if (!open) resetBindingForm()
   }
 
   function handleSaveConnection() {
@@ -101,7 +121,7 @@ export function MintsoftClient({ data }: Props) {
       }
 
       handleConnectionDialogOpenChange(false)
-      flashSaved()
+      flashSaved('Mintsoft connection saved')
       router.refresh()
     })
   }
@@ -112,9 +132,18 @@ export function MintsoftClient({ data }: Props) {
       const result = await saveMintsoftBinding({
         warehouseId,
         externalWarehouseId,
+        active: bindingActive === 'true',
         stockSyncMode,
         returnsMode,
         syncFrequencyMinutes: Number.parseInt(syncFrequencyMinutes, 10) || 60,
+        discrepancyThresholds: {
+          absoluteDelta: absoluteDelta.trim() ? Number(absoluteDelta) : null,
+          percentDelta: percentDelta.trim() ? Number(percentDelta) : null,
+        },
+        reportRecipients: reportRecipients
+          .split(/[\n,]/)
+          .map((recipient) => recipient.trim())
+          .filter(Boolean),
       })
 
       if (!result.success) {
@@ -123,7 +152,7 @@ export function MintsoftClient({ data }: Props) {
       }
 
       handleBindingDialogOpenChange(false)
-      flashSaved()
+      flashSaved('Mintsoft binding saved')
       router.refresh()
     })
   }
@@ -133,11 +162,25 @@ export function MintsoftClient({ data }: Props) {
     startTransition(async () => {
       const result = await deleteMintsoftBinding(id)
       if (!result.success) {
-        setError(result.error ?? 'Failed to delete Mintsoft binding')
+        setError(result.error ?? 'Failed to deactivate Mintsoft binding')
         return
       }
 
-      flashSaved()
+      flashSaved('Mintsoft binding deactivated')
+      router.refresh()
+    })
+  }
+
+  function handleRunSyncNow(id: string) {
+    setError('')
+    startTransition(async () => {
+      const result = await runMintsoftStockSyncNow(id)
+      if (!result.success) {
+        setError(result.error ?? 'Failed to run Mintsoft stock sync')
+        return
+      }
+
+      flashSaved(result.message ?? 'Mintsoft stock sync started')
       router.refresh()
     })
   }
@@ -149,7 +192,7 @@ export function MintsoftClient({ data }: Props) {
           <div>
             <h3 className="text-base font-semibold">Connection</h3>
             <p className="text-sm text-muted-foreground">
-              Configure Mintsoft credentials and define how Mintsoft callbacks map back to storefront orders.
+              Configure Mintsoft credentials, resolve callback order lookup, and expose warehouse polling for notification-only stock sync.
             </p>
           </div>
           <Button type="button" variant="outline" onClick={() => setIsConnectionDialogOpen(true)} disabled={isPending}>
@@ -184,6 +227,12 @@ export function MintsoftClient({ data }: Props) {
         <div className="rounded-lg border bg-muted/30 p-3 text-xs text-muted-foreground">
           Webhook endpoint: <code>/api/webhooks/mintsoft/asn-booked-in</code>
         </div>
+
+        {data.warehouseLookupError ? (
+          <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs text-amber-800">
+            Mintsoft warehouse lookup failed: {data.warehouseLookupError}
+          </div>
+        ) : null}
       </Card>
 
       <Card className="p-6 space-y-4">
@@ -191,7 +240,7 @@ export function MintsoftClient({ data }: Props) {
           <div>
             <h3 className="text-base font-semibold">Warehouse Bindings</h3>
             <p className="text-sm text-muted-foreground">
-              Link IMS warehouses to Mintsoft warehouse identifiers before stock alignment and returns processing are enabled.
+              Phase 2 runs in notification-only mode: IMS stock remains unchanged while Mintsoft deltas are logged into discrepancies, snapshots, and sync jobs.
             </p>
           </div>
           <Button type="button" onClick={() => setIsBindingDialogOpen(true)} disabled={isPending}>
@@ -200,46 +249,183 @@ export function MintsoftClient({ data }: Props) {
           </Button>
         </div>
 
-        <Table containerClassName="rounded-lg border">
+        <Table containerClassName="rounded-lg border max-h-[60vh]" className="min-w-[900px]">
           <TableHeader className="bg-muted/40">
             <TableRow>
               <TableHead>Warehouse</TableHead>
-              <TableHead>Mintsoft ID</TableHead>
-              <TableHead>Stock Mode</TableHead>
-              <TableHead>Returns</TableHead>
+              <TableHead>Mintsoft Warehouse</TableHead>
+              <TableHead>Mode</TableHead>
+              <TableHead>Thresholds</TableHead>
+              <TableHead>Recipients</TableHead>
               <TableHead>Last Sync</TableHead>
+              <TableHead>Status</TableHead>
               <TableHead className="text-right">Action</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
             {data.bindings.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={6} className="py-6 text-center text-muted-foreground">
+                <TableCell colSpan={8} className="py-6 text-center text-muted-foreground">
                   No Mintsoft warehouse bindings yet.
                 </TableCell>
               </TableRow>
             ) : (
               data.bindings.map((binding) => (
-                <TableRow key={binding.id}>
+                <TableRow key={binding.id} className={!binding.active ? 'opacity-60' : ''}>
                   <TableCell>
                     <div className="font-medium">{binding.warehouseCode}</div>
                     <div className="text-xs text-muted-foreground">{binding.warehouseName}</div>
                   </TableCell>
                   <TableCell className="font-mono text-xs">{binding.externalWarehouseId}</TableCell>
-                  <TableCell>{binding.stockSyncMode}</TableCell>
-                  <TableCell>{binding.returnsMode}</TableCell>
-                  <TableCell className="text-xs text-muted-foreground">{binding.lastStockSyncAt ?? 'Never'}</TableCell>
-                  <TableCell className="text-right">
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => handleDeleteBinding(binding.id)}
-                      disabled={isPending}
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </Button>
+                  <TableCell>
+                    <div className="text-sm">{binding.stockSyncMode}</div>
+                    <div className="text-xs text-muted-foreground">{binding.stockMasterSystem}</div>
                   </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {formatThresholdSummary(binding.discrepancyThresholds)}
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {binding.reportRecipients.length > 0 ? binding.reportRecipients.join(', ') : 'None'}
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{binding.lastStockSyncAt ?? 'Never'}</TableCell>
+                  <TableCell className="text-xs">
+                    <span className="font-medium">{binding.lastStockSyncStatus ?? (binding.active ? 'Idle' : 'Inactive')}</span>
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <div className="flex justify-end gap-1">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleRunSyncNow(binding.id)}
+                        disabled={isPending || !binding.active || binding.stockSyncMode === 'DISABLED'}
+                      >
+                        <RefreshCw className="h-4 w-4" />
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleDeleteBinding(binding.id)}
+                        disabled={isPending || !binding.active}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      </Card>
+
+      <Card className="p-6 space-y-4">
+        <div>
+          <h3 className="text-base font-semibold">Recent Stock Sync Runs</h3>
+          <p className="text-sm text-muted-foreground">
+            Latest notification-only sync jobs recorded for Mintsoft warehouse bindings.
+          </p>
+        </div>
+
+        <Table containerClassName="rounded-lg border max-h-[60vh]">
+          <TableHeader className="bg-muted/40">
+            <TableRow>
+              <TableHead>Started</TableHead>
+              <TableHead>Warehouse</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead>Checked</TableHead>
+              <TableHead>Discrepancies</TableHead>
+              <TableHead>Errors</TableHead>
+              <TableHead>Triggered By</TableHead>
+              <TableHead className="text-right">Export</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {data.recentStockSyncJobs.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={8} className="py-6 text-center text-muted-foreground">
+                  No Mintsoft stock sync jobs yet.
+                </TableCell>
+              </TableRow>
+            ) : (
+              data.recentStockSyncJobs.map((job) => (
+                <TableRow key={job.id}>
+                  <TableCell className="text-xs text-muted-foreground">{job.startedAt}</TableCell>
+                  <TableCell>{job.warehouseCode ?? 'N/A'}</TableCell>
+                  <TableCell className="font-medium">{job.status}</TableCell>
+                  <TableCell>{job.totalChecked}</TableCell>
+                  <TableCell>{job.mismatched}</TableCell>
+                  <TableCell>{job.errors}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{job.triggeredBy ?? 'system'}</TableCell>
+                  <TableCell className="text-right">
+                    <a
+                      href={`/api/export/mintsoft-sync/${job.id}`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs text-primary hover:underline"
+                    >
+                      CSV
+                    </a>
+                  </TableCell>
+                </TableRow>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      </Card>
+
+      <Card className="p-6 space-y-4">
+        <div>
+          <h3 className="text-base font-semibold">Open Discrepancies</h3>
+          <p className="text-sm text-muted-foreground">
+            The current notification backlog surfaced by Mintsoft stock snapshots.
+          </p>
+        </div>
+
+        <Table containerClassName="rounded-lg border max-h-[60vh]">
+          <TableHeader className="bg-muted/40">
+            <TableRow>
+              <TableHead>Warehouse</TableHead>
+              <TableHead>Product</TableHead>
+              <TableHead>Category</TableHead>
+              <TableHead>IMS</TableHead>
+              <TableHead>WMS</TableHead>
+              <TableHead>Delta</TableHead>
+              <TableHead>Seen</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {data.openDiscrepancies.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={7} className="py-6 text-center text-muted-foreground">
+                  No open Mintsoft discrepancies.
+                </TableCell>
+              </TableRow>
+            ) : (
+              data.openDiscrepancies.map((discrepancy) => (
+                <TableRow key={discrepancy.id}>
+                  <TableCell>{discrepancy.warehouseCode}</TableCell>
+                  <TableCell>
+                    {discrepancy.productId ? (
+                      <ProductLink productId={discrepancy.productId} sku={discrepancy.sku} name={discrepancy.productName ?? ''} />
+                    ) : (
+                      <div>
+                        <div className="font-mono text-sm font-medium">{discrepancy.sku}</div>
+                        <div className="text-xs text-muted-foreground">{discrepancy.productName ?? 'Unmapped SKU'}</div>
+                      </div>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    <div className="text-sm">{discrepancy.category}</div>
+                    {discrepancy.message ? (
+                      <div className="text-xs text-muted-foreground">{discrepancy.message}</div>
+                    ) : null}
+                  </TableCell>
+                  <TableCell>{discrepancy.imsValue ?? '—'}</TableCell>
+                  <TableCell>{discrepancy.wmsValue ?? '—'}</TableCell>
+                  <TableCell>{discrepancy.delta ?? '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{discrepancy.lastSeenAt}</TableCell>
                 </TableRow>
               ))
             )}
@@ -250,13 +436,13 @@ export function MintsoftClient({ data }: Props) {
       {saved ? (
         <span className="inline-flex items-center gap-1 text-sm text-green-600">
           <Check className="h-4 w-4" />
-          Saved
+          {feedbackMessage}
         </span>
       ) : null}
       {error ? <p className="text-sm text-destructive">{error}</p> : null}
 
       <Dialog open={isConnectionDialogOpen} onOpenChange={handleConnectionDialogOpenChange}>
-        <DialogContent key={connectionDialogKey} className="sm:max-w-2xl">
+        <DialogContent className="sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle>Edit Mintsoft Connection</DialogTitle>
             <DialogDescription>
@@ -331,11 +517,11 @@ export function MintsoftClient({ data }: Props) {
       </Dialog>
 
       <Dialog open={isBindingDialogOpen} onOpenChange={handleBindingDialogOpenChange}>
-        <DialogContent key={bindingDialogKey} className="sm:max-w-2xl">
+        <DialogContent className="sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle>Add Mintsoft Warehouse Binding</DialogTitle>
             <DialogDescription>
-              Create a Mintsoft warehouse binding using the current supported stock and returns modes.
+              Create a notification-only Mintsoft warehouse binding with discrepancy thresholds and in-app notification recipients.
             </DialogDescription>
           </DialogHeader>
 
@@ -352,19 +538,43 @@ export function MintsoftClient({ data }: Props) {
               </Select>
             </div>
             <div className="space-y-1.5">
-              <Label className="text-xs">Mintsoft Warehouse ID</Label>
-              <Input
-                value={externalWarehouseId}
-                onChange={(event) => setExternalWarehouseId(event.target.value)}
-                placeholder="External warehouse ID"
-              />
+              <Label className="text-xs">Connection State</Label>
+              <Select value={bindingActive} onChange={(event) => setBindingActive(event.target.value)}>
+                <option value="true">Active</option>
+                <option value="false">Disabled</option>
+              </Select>
+            </div>
+            <div className="space-y-1.5 md:col-span-2">
+              <Label className="text-xs">Mintsoft Warehouse</Label>
+              {data.externalWarehouses.length > 0 ? (
+                <Select value={externalWarehouseId} onChange={(event) => setExternalWarehouseId(event.target.value)}>
+                  <option value="">Select a Mintsoft warehouse</option>
+                  {data.externalWarehouses.map((warehouse) => (
+                    <option key={warehouse.externalId} value={warehouse.externalId}>
+                      {warehouse.name} · {warehouse.externalId}
+                    </option>
+                  ))}
+                </Select>
+              ) : (
+                <Input
+                  value={externalWarehouseId}
+                  onChange={(event) => setExternalWarehouseId(event.target.value)}
+                  placeholder="External warehouse ID"
+                />
+              )}
             </div>
             <div className="space-y-1.5">
               <Label className="text-xs">Stock Sync Mode</Label>
-              <Select value={stockSyncMode} onChange={(event) => setStockSyncMode(event.target.value as 'DISABLED' | 'NOTIFICATION_ONLY')}>
+              <Select value={stockSyncMode} onChange={(event) => setStockSyncMode(event.target.value as 'DISABLED' | 'NOTIFICATION_ONLY' | 'ALIGN_TO_WMS')}>
                 <option value="DISABLED">Disabled</option>
                 <option value="NOTIFICATION_ONLY">Notification Only</option>
+                <option value="ALIGN_TO_WMS" disabled>
+                  Align To WMS (Coming Later)
+                </option>
               </Select>
+              <p className="text-xs text-muted-foreground">
+                Stock master: {stockSyncMode === 'ALIGN_TO_WMS' ? 'WMS (requires a later phase)' : 'IMS'}
+              </p>
             </div>
             <div className="space-y-1.5">
               <Label className="text-xs">Returns Mode</Label>
@@ -374,7 +584,7 @@ export function MintsoftClient({ data }: Props) {
                 <option value="WEBHOOK">Webhook</option>
               </Select>
             </div>
-            <div className="space-y-1.5 md:col-span-2">
+            <div className="space-y-1.5">
               <Label className="text-xs">Sync Frequency Minutes</Label>
               <Input
                 type="number"
@@ -383,10 +593,48 @@ export function MintsoftClient({ data }: Props) {
                 onChange={(event) => setSyncFrequencyMinutes(event.target.value)}
               />
             </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Absolute Delta Threshold</Label>
+              <Input
+                type="number"
+                min="0"
+                step="0.0001"
+                value={absoluteDelta}
+                onChange={(event) => setAbsoluteDelta(event.target.value)}
+                placeholder="e.g. 5"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Percent Delta Threshold</Label>
+              <Input
+                type="number"
+                min="0"
+                step="0.01"
+                value={percentDelta}
+                onChange={(event) => setPercentDelta(event.target.value)}
+                placeholder="e.g. 10"
+              />
+            </div>
+            <div className="space-y-1.5 md:col-span-2">
+              <Label className="text-xs">Report Recipients</Label>
+              <Textarea
+                value={reportRecipients}
+                onChange={(event) => setReportRecipients(event.target.value)}
+                placeholder="Comma or newline separated user emails"
+                rows={4}
+              />
+              <p className="text-xs text-muted-foreground">
+                Matching IMS users will receive in-app warnings when a discrepancy exceeds the configured threshold.
+              </p>
+            </div>
           </div>
 
           <DialogFooter showCloseButton>
-            <Button type="button" onClick={handleCreateBinding} disabled={isPending || !warehouseId || !externalWarehouseId.trim()}>
+            <Button
+              type="button"
+              onClick={handleCreateBinding}
+              disabled={isPending || !warehouseId || !externalWarehouseId.trim()}
+            >
               {isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
               Add Warehouse Binding
             </Button>

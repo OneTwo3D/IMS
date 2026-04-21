@@ -6,8 +6,19 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
-import { getMintsoftSettings, normalizeMintsoftBaseUrl, type MintsoftSettings } from '@/lib/connectors/mintsoft'
+import {
+  getMintsoftSettings,
+  invalidateMintsoftAccessToken,
+  normalizeMintsoftBaseUrl,
+  type MintsoftSettings,
+} from '@/lib/connectors/mintsoft'
 import { inferMintsoftOrderLookupConnector } from '@/lib/connectors/mintsoft/order-lookup'
+import {
+  createMintsoftBindingHandover,
+  runStockSyncForBinding,
+} from '@/lib/connectors/mintsoft/sync/stock-sync'
+import { parseMintsoftThresholds, sanitizeMintsoftThresholds } from '@/lib/connectors/mintsoft/sync/stock-sync-helpers'
+import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { serializeSettingValue } from '@/lib/settings-store'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
@@ -24,6 +35,8 @@ type MintsoftBindingSelect = {
   bundleSyncDirection: true
   returnsMode: true
   syncFrequencyMinutes: true
+  discrepancyThresholds: true
+  reportRecipients: true
   lastStockSyncAt: true
   lastStockSyncStatus: true
   warehouse: {
@@ -46,6 +59,8 @@ const mintsoftBindingSelect = {
   bundleSyncDirection: true,
   returnsMode: true,
   syncFrequencyMinutes: true,
+  discrepancyThresholds: true,
+  reportRecipients: true,
   lastStockSyncAt: true,
   lastStockSyncStatus: true,
   warehouse: {
@@ -90,6 +105,11 @@ export type MintsoftBindingRow = {
   bundleSyncDirection: string
   returnsMode: string
   syncFrequencyMinutes: number
+  discrepancyThresholds: {
+    absoluteDelta: number | null
+    percentDelta: number | null
+  } | null
+  reportRecipients: string[]
   lastStockSyncAt: string | null
   lastStockSyncStatus: string | null
 }
@@ -101,11 +121,51 @@ export type MintsoftWarehouseOption = {
   active: boolean
 }
 
+export type MintsoftExternalWarehouseOption = {
+  externalId: string
+  name: string
+}
+
+export type MintsoftSyncJobRow = {
+  id: string
+  warehouseCode: string | null
+  status: string
+  totalChecked: number
+  matched: number
+  mismatched: number
+  corrected: number
+  skipped: number
+  errors: number
+  startedAt: string
+  finishedAt: string | null
+  triggeredBy: string | null
+}
+
+export type MintsoftDiscrepancyRow = {
+  id: string
+  warehouseCode: string
+  sku: string
+  productId: string | null
+  productName: string | null
+  category: string
+  status: string
+  imsValue: string | null
+  wmsValue: string | null
+  delta: string | null
+  message: string | null
+  detectionCount: number
+  lastSeenAt: string
+}
+
 export type MintsoftDashboardData = {
   connection: MintsoftConnectionSettingsMasked
   status: MintsoftConnectionStatus
   bindings: MintsoftBindingRow[]
   warehouses: MintsoftWarehouseOption[]
+  externalWarehouses: MintsoftExternalWarehouseOption[]
+  warehouseLookupError: string | null
+  recentStockSyncJobs: MintsoftSyncJobRow[]
+  openDiscrepancies: MintsoftDiscrepancyRow[]
   availableOrderLookupConnectors: ShoppingConnectorId[]
   orderLookupConnectorRequired: boolean
 }
@@ -129,6 +189,11 @@ export type MintsoftBindingInput = {
   bundleSyncDirection?: 'DISABLED' | 'IMS_TO_WMS' | 'WMS_TO_IMS'
   returnsMode?: 'DISABLED' | 'POLL' | 'WEBHOOK'
   syncFrequencyMinutes?: number
+  discrepancyThresholds?: {
+    absoluteDelta?: number | null
+    percentDelta?: number | null
+  }
+  reportRecipients?: string[]
 }
 
 const MintsoftConnectionInputSchema = z.object({
@@ -150,6 +215,11 @@ const MintsoftBindingInputSchema = z.object({
   bundleSyncDirection: z.enum(['DISABLED', 'IMS_TO_WMS', 'WMS_TO_IMS']).optional(),
   returnsMode: z.enum(['DISABLED', 'POLL', 'WEBHOOK']).optional(),
   syncFrequencyMinutes: z.number().int().positive().optional(),
+  discrepancyThresholds: z.object({
+    absoluteDelta: z.number().nonnegative().nullable().optional(),
+    percentDelta: z.number().nonnegative().nullable().optional(),
+  }).optional(),
+  reportRecipients: z.array(z.string().email('Report recipients must be valid email addresses.')).optional(),
 })
 
 const MintsoftBindingDeleteSchema = z.string().min(1, 'Binding ID is required.')
@@ -197,6 +267,8 @@ function mapMintsoftBinding(row: {
   bundleSyncDirection: string
   returnsMode: string
   syncFrequencyMinutes: number
+  discrepancyThresholds: Prisma.JsonValue | null
+  reportRecipients: string[]
   lastStockSyncAt: Date | null
   lastStockSyncStatus: string | null
   warehouse: {
@@ -219,8 +291,79 @@ function mapMintsoftBinding(row: {
     bundleSyncDirection: row.bundleSyncDirection,
     returnsMode: row.returnsMode,
     syncFrequencyMinutes: row.syncFrequencyMinutes,
+    discrepancyThresholds: parseMintsoftThresholds(row.discrepancyThresholds),
+    reportRecipients: row.reportRecipients,
     lastStockSyncAt: row.lastStockSyncAt?.toISOString() ?? null,
     lastStockSyncStatus: row.lastStockSyncStatus,
+  }
+}
+
+function mapMintsoftSyncJob(row: {
+  id: string
+  status: string
+  totalChecked: number
+  matched: number
+  mismatched: number
+  corrected: number
+  skipped: number
+  errors: number
+  startedAt: Date
+  finishedAt: Date | null
+  triggeredBy: string | null
+  warehouse: {
+    code: string
+  } | null
+}): MintsoftSyncJobRow {
+  return {
+    id: row.id,
+    warehouseCode: row.warehouse?.code ?? null,
+    status: row.status,
+    totalChecked: row.totalChecked,
+    matched: row.matched,
+    mismatched: row.mismatched,
+    corrected: row.corrected,
+    skipped: row.skipped,
+    errors: row.errors,
+    startedAt: row.startedAt.toISOString(),
+    finishedAt: row.finishedAt?.toISOString() ?? null,
+    triggeredBy: row.triggeredBy,
+  }
+}
+
+function mapMintsoftDiscrepancy(row: {
+  id: string
+  sku: string | null
+  category: string
+  status: string
+  imsValue: string | null
+  wmsValue: string | null
+  delta: Prisma.Decimal | null
+  message: string | null
+  detectionCount: number
+  lastSeenAt: Date
+  product: {
+    id: string
+    name: string
+    sku: string
+  } | null
+  warehouse: {
+    code: string
+  }
+}): MintsoftDiscrepancyRow {
+  return {
+    id: row.id,
+    warehouseCode: row.warehouse.code,
+    sku: row.product?.sku ?? row.sku ?? '',
+    productId: row.product?.id ?? null,
+    productName: row.product?.name ?? null,
+    category: row.category,
+    status: row.status,
+    imsValue: row.imsValue,
+    wmsValue: row.wmsValue,
+    delta: row.delta?.toString() ?? null,
+    message: row.message,
+    detectionCount: row.detectionCount,
+    lastSeenAt: row.lastSeenAt.toISOString(),
   }
 }
 
@@ -271,7 +414,7 @@ async function ensureMintsoftConnectionId(): Promise<string> {
 export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData> {
   await requireMintsoftReadAccess()
 
-  const [connection, settings, warehouses, bindings, pluginState] = await Promise.all([
+  const [connection, settings, warehouses, bindings, recentStockSyncJobs, openDiscrepancies, pluginState] = await Promise.all([
     db.wmsConnection.findUnique({
       where: { connector: 'mintsoft' },
       select: {
@@ -302,6 +445,64 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
       orderBy: [{ warehouse: { code: 'asc' } }],
       select: mintsoftBindingSelect,
     }),
+    db.wmsSyncJob.findMany({
+      where: {
+        connector: 'mintsoft',
+        type: 'STOCK_SYNC',
+      },
+      orderBy: { startedAt: 'desc' },
+      take: 10,
+      select: {
+        id: true,
+        status: true,
+        totalChecked: true,
+        matched: true,
+        mismatched: true,
+        corrected: true,
+        skipped: true,
+        errors: true,
+        startedAt: true,
+        finishedAt: true,
+        triggeredBy: true,
+        warehouse: {
+          select: {
+            code: true,
+          },
+        },
+      },
+    }),
+    db.wmsStockDiscrepancy.findMany({
+      where: {
+        connector: 'mintsoft',
+        status: 'OPEN',
+      },
+      orderBy: [{ lastSeenAt: 'desc' }],
+      take: 20,
+      select: {
+        id: true,
+        sku: true,
+        category: true,
+        status: true,
+        imsValue: true,
+        wmsValue: true,
+        delta: true,
+        message: true,
+        detectionCount: true,
+        lastSeenAt: true,
+        product: {
+          select: {
+            id: true,
+            name: true,
+            sku: true,
+          },
+        },
+        warehouse: {
+          select: {
+            code: true,
+          },
+        },
+      },
+    }),
     getIntegrationPluginState(),
   ])
   const availableOrderLookupConnectors = getAvailableOrderLookupConnectors(pluginState)
@@ -319,6 +520,24 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
       : '',
   }
 
+  let externalWarehouses: MintsoftExternalWarehouseOption[] = []
+  let warehouseLookupError: string | null = null
+
+  if ((connection?.baseUrl ?? '').trim() && settings.mintsoft_api_key.trim()) {
+    try {
+      externalWarehouses = (await getWmsConnector('mintsoft').fetchWarehouses())
+        .map((warehouse) => ({
+          externalId: warehouse.externalId,
+          name: warehouse.name,
+        }))
+        .sort((left, right) => left.name.localeCompare(right.name))
+    } catch (error) {
+      warehouseLookupError = error instanceof Error
+        ? error.message
+        : 'Mintsoft warehouse lookup failed.'
+    }
+  }
+
   return {
     connection: sanitizedConnection,
     status: {
@@ -330,6 +549,10 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
     },
     bindings: bindings.map(mapMintsoftBinding),
     warehouses,
+    externalWarehouses,
+    warehouseLookupError,
+    recentStockSyncJobs: recentStockSyncJobs.map(mapMintsoftSyncJob),
+    openDiscrepancies: openDiscrepancies.map(mapMintsoftDiscrepancy),
     availableOrderLookupConnectors,
     orderLookupConnectorRequired: availableOrderLookupConnectors.length > 1,
   }
@@ -407,6 +630,7 @@ export async function saveMintsoftConnectionSettings(
       update: { value: serializeSettingValue('mintsoft_webhook_secret', webhookSecret) },
     }),
   ])
+  await invalidateMintsoftAccessToken()
 
   await logActivity({
     entityType: 'SYNC',
@@ -446,6 +670,8 @@ export async function saveMintsoftBinding(
   }
 
   const connectionId = await ensureMintsoftConnectionId()
+  const reportRecipients = Array.from(new Set((data.reportRecipients ?? []).map((recipient) => recipient.trim().toLowerCase()).filter(Boolean)))
+  const discrepancyThresholds = sanitizeMintsoftThresholds(data.discrepancyThresholds)
   const bindingData = {
     connectionId,
     warehouseId: data.warehouseId,
@@ -457,7 +683,11 @@ export async function saveMintsoftBinding(
     bundleSyncDirection: data.bundleSyncDirection ?? 'DISABLED',
     returnsMode: data.returnsMode ?? 'DISABLED',
     syncFrequencyMinutes: Math.max(1, Math.trunc(data.syncFrequencyMinutes ?? 60)),
-  } as const
+    reportRecipients,
+    ...(discrepancyThresholds
+      ? { discrepancyThresholds }
+      : { discrepancyThresholds: Prisma.JsonNull }),
+  }
 
   try {
     let bindingId: string
@@ -465,10 +695,21 @@ export async function saveMintsoftBinding(
     if (data.id) {
       const existingBinding = await db.externalWmsBinding.findFirst({
         where: { id: data.id, connector: 'mintsoft' },
-        select: { id: true },
+        select: {
+          id: true,
+          active: true,
+          stockSyncMode: true,
+        },
       })
       if (!existingBinding) {
         return { success: false, error: 'Mintsoft binding not found.' }
+      }
+
+      if (
+        (existingBinding.active && bindingData.active === false)
+        || (existingBinding.stockSyncMode !== 'DISABLED' && bindingData.stockSyncMode === 'DISABLED')
+      ) {
+        await createMintsoftBindingHandover(existingBinding.id, 'manual:disable')
       }
 
       const binding = await db.externalWmsBinding.update({
@@ -496,6 +737,7 @@ export async function saveMintsoftBinding(
         externalWarehouseId: data.externalWarehouseId.trim(),
         stockSyncMode: bindingData.stockSyncMode,
         returnsMode: bindingData.returnsMode,
+        reportRecipients,
       },
     })
   } catch (error) {
@@ -510,6 +752,41 @@ export async function saveMintsoftBinding(
   return { success: true }
 }
 
+export async function runMintsoftStockSyncNow(
+  bindingId: unknown,
+): Promise<{ success: boolean; error?: string; message?: string; jobId?: string | null }> {
+  await requireMintsoftReadAccess()
+
+  const parsedId = MintsoftBindingDeleteSchema.safeParse(bindingId)
+  if (!parsedId.success) {
+    return { success: false, error: getValidationErrorMessage(parsedId.error) }
+  }
+
+  const result = await runStockSyncForBinding(parsedId.data, 'manual')
+  revalidatePath('/sync')
+
+  if (result.status === 'FAILED') {
+    return {
+      success: false,
+      error: result.skippedReason ?? 'Mintsoft stock sync failed.',
+      jobId: result.jobId,
+    }
+  }
+
+  if (result.status === 'SKIPPED') {
+    return {
+      success: false,
+      error: result.skippedReason ?? 'Mintsoft stock sync was skipped.',
+    }
+  }
+
+  return {
+    success: true,
+    jobId: result.jobId,
+    message: `${result.warehouseCode}: checked ${result.totalChecked}, found ${result.mismatched} discrepancies, ${result.errors} errors.`,
+  }
+}
+
 export async function deleteMintsoftBinding(
   id: unknown,
 ): Promise<{ success: boolean; error?: string }> {
@@ -520,20 +797,34 @@ export async function deleteMintsoftBinding(
     return { success: false, error: getValidationErrorMessage(parsedId.error) }
   }
 
-  const result = await db.externalWmsBinding.deleteMany({
+  const binding = await db.externalWmsBinding.findFirst({
     where: { id: parsedId.data, connector: 'mintsoft' },
+    select: {
+      id: true,
+      warehouseId: true,
+    },
   })
-  if (result.count === 0) {
+  if (!binding) {
     return { success: false, error: 'Binding not found.' }
   }
 
+  await createMintsoftBindingHandover(binding.id, 'manual:deactivate')
+  await db.externalWmsBinding.update({
+    where: { id: binding.id },
+    data: {
+      active: false,
+      stockSyncMode: 'DISABLED',
+      stockMasterSystem: 'IMS',
+    },
+  })
+
   await logActivity({
     entityType: 'SYNC',
-    entityId: parsedId.data,
+    entityId: binding.id,
     tag: 'sync',
-    action: 'mintsoft_binding_deleted',
-    description: 'Deleted Mintsoft warehouse binding',
-    metadata: { id: parsedId.data },
+    action: 'mintsoft_binding_deactivated',
+    description: 'Deactivated Mintsoft warehouse binding',
+    metadata: { id: binding.id, warehouseId: binding.warehouseId },
   })
 
   revalidatePath('/sync')
