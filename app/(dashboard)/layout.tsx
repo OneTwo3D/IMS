@@ -29,8 +29,9 @@ export default async function DashboardLayout({ children }: { children: React.Re
         userName={session.user.name ?? ''}
         userEmail={session.user.email ?? ''}
         userPictureUrl={session.user.pictureUrl}
-        shoppingIntegrationEnabled={pluginState.woocommerce}
-        accountingIntegrationEnabled={pluginState.xero}
+        shoppingIntegrationEnabled={pluginState.woocommerce || pluginState.shopify}
+        accountingIntegrationEnabled={pluginState.xero || pluginState.quickbooks}
+        wmsIntegrationEnabled={pluginState.mintsoft}
       >
         {children}
       </DashboardShell>

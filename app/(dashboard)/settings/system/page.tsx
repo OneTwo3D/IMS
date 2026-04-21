@@ -98,6 +98,7 @@ export default async function SystemSettingsPage({
             shopifyEnabled={pluginState.shopify}
             xeroEnabled={pluginState.xero}
             quickbooksEnabled={pluginState.quickbooks}
+            mintsoftEnabled={pluginState.mintsoft}
           />
         </Card>
       )}

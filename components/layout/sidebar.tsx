@@ -73,6 +73,7 @@ type SidebarProps = {
   userRole?: string
   shoppingIntegrationEnabled: boolean
   accountingIntegrationEnabled: boolean
+  wmsIntegrationEnabled: boolean
   onNavigate?: () => void
   forceExpanded?: boolean
 }
@@ -83,6 +84,7 @@ export function Sidebar({
   userRole = 'ADMIN',
   shoppingIntegrationEnabled,
   accountingIntegrationEnabled,
+  wmsIntegrationEnabled,
   onNavigate,
   forceExpanded,
 }: SidebarProps) {
@@ -91,7 +93,7 @@ export function Sidebar({
   const can = (p: Permission) => hasPermission(userRole, p)
   const isSupplier = userRole === 'SUPPLIER'
   const settingsChildren = getSettingsChildren(accountingIntegrationEnabled)
-  const showIntegrations = shoppingIntegrationEnabled || accountingIntegrationEnabled
+  const showIntegrations = shoppingIntegrationEnabled || accountingIntegrationEnabled || wmsIntegrationEnabled
 
   // Supplier gets a completely different navigation
   if (isSupplier) {

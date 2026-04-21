@@ -12,6 +12,7 @@ type Props = {
   shopifyEnabled: boolean
   xeroEnabled: boolean
   quickbooksEnabled: boolean
+  mintsoftEnabled: boolean
 }
 
 export function IntegrationPluginsSettings({
@@ -19,12 +20,14 @@ export function IntegrationPluginsSettings({
   shopifyEnabled: initialShopifyEnabled,
   xeroEnabled: initialXeroEnabled,
   quickbooksEnabled: initialQuickBooksEnabled,
+  mintsoftEnabled: initialMintsoftEnabled,
 }: Props) {
   const [isPending, startTransition] = useTransition()
   const [woocommerceEnabled, setWooCommerceEnabled] = useState(initialWooCommerceEnabled)
   const [shopifyEnabled, setShopifyEnabled] = useState(initialShopifyEnabled)
   const [xeroEnabled, setXeroEnabled] = useState(initialXeroEnabled)
   const [quickbooksEnabled, setQuickBooksEnabled] = useState(initialQuickBooksEnabled)
+  const [mintsoftEnabled, setMintsoftEnabled] = useState(initialMintsoftEnabled)
   const [saved, setSaved] = useState(false)
   const [error, setError] = useState('')
 
@@ -39,6 +42,7 @@ export function IntegrationPluginsSettings({
           setSetting('plugin_shopify_enabled', String(shopifyEnabled)),
           setSetting('plugin_xero_enabled', String(xeroEnabled)),
           setSetting('plugin_quickbooks_enabled', String(quickbooksEnabled)),
+          setSetting('plugin_mintsoft_enabled', String(mintsoftEnabled)),
         ])
 
         const result = await syncCrontab()
@@ -93,6 +97,16 @@ export function IntegrationPluginsSettings({
           <div className="text-sm font-medium">QuickBooks plugin</div>
           <p className="text-xs text-muted-foreground">
             Reserves the accounting connector slot, settings, and sync/dashboard wiring for QuickBooks.
+          </p>
+        </div>
+      </label>
+
+      <label className="flex items-start gap-3 cursor-pointer">
+        <Switch checked={mintsoftEnabled} onCheckedChange={setMintsoftEnabled} />
+        <div>
+          <div className="text-sm font-medium">Mintsoft plugin</div>
+          <p className="text-xs text-muted-foreground">
+            Enables Mintsoft WMS settings, webhook intake, sync UI, and Mintsoft-specific scheduler jobs.
           </p>
         </div>
       </label>

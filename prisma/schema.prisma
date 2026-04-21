@@ -474,6 +474,7 @@ model Warehouse {
   incomingPurchaseOrders PurchaseOrder[] @relation("PODestinationWarehouse")
   orderAllocations      OrderAllocation[]
   shipments             Shipment[]
+  wmsBindings           ExternalWmsBinding[]
 
   @@map("warehouses")
 }
@@ -562,6 +563,8 @@ model Product {
   stockSyncStates  StockSyncState[]
   stockSyncJobs    StockSyncJob[]
   shoppingLinks    ShoppingProductLink[]
+  wmsProductLinks  WmsProductLink[]
+  wmsBundleLinks   WmsBundleLink[]
 
   @@index([parentId])
   @@map("products")
@@ -1616,6 +1619,329 @@ model ShoppingOrderLink {
   @@index([connector, externalOrderNumber])
   @@index([orderId])
   @@map("shopping_order_links")
+}
+
+// ---------------------------------------------------------------------------
+// WMS / WAREHOUSE CONNECTOR
+// ---------------------------------------------------------------------------
+
+enum WmsStockSyncMode {
+  DISABLED
+  NOTIFICATION_ONLY
+  ALIGN_TO_WMS
+}
+
+enum WmsStockMasterSystem {
+  IMS
+  WMS
+}
+
+enum WmsBundleSyncDirection {
+  DISABLED
+  IMS_TO_WMS
+  WMS_TO_IMS
+}
+
+enum WmsReturnsMode {
+  DISABLED
+  POLL
+  WEBHOOK
+}
+
+enum WmsSyncJobType {
+  STOCK_SYNC
+  PRODUCT_SYNC
+  BUNDLE_SYNC
+  ASN_CREATE
+  ASN_CALLBACK
+  RETURNS_SYNC
+  PRODUCT_VERIFY
+}
+
+enum WmsSyncJobStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  PARTIAL
+}
+
+enum WmsDiscrepancyCategory {
+  MISSING_IN_IMS
+  MISSING_IN_WMS
+  QTY_MISMATCH
+  UNMAPPED_SKU
+  RECEIPT_TIMING_CONFLICT
+  BUNDLE_DERIVATION_CONFLICT
+  BARCODE_CONFLICT
+  BARCODE_BACKFILLED_FROM_WMS
+}
+
+enum WmsDiscrepancyStatus {
+  OPEN
+  ACKNOWLEDGED
+  RESOLVED
+  IGNORED
+}
+
+enum WmsReturnsInboxStatus {
+  NEW
+  UNDER_REVIEW
+  RESTOCKED
+  QUARANTINED
+  REFUNDED_ONLY
+  REPLACED
+  INSPECT
+  DISMISSED
+}
+
+model WmsConnection {
+  id                   String   @id @default(cuid())
+  connector            String
+  label                String?
+  active               Boolean  @default(true)
+  baseUrl              String?
+  orderLookupConnector String?
+  tokenExpiresAt       DateTime?
+  lastAuthAt           DateTime?
+  callbackSecretId     String?
+  createdAt            DateTime @default(now())
+  updatedAt            DateTime @updatedAt
+
+  bindings             ExternalWmsBinding[]
+
+  @@unique([connector])
+  @@map("wms_connections")
+}
+
+model ExternalWmsBinding {
+  id                   String                 @id @default(cuid())
+  connectionId         String
+  warehouseId          String
+  connector            String
+  externalWarehouseId  String
+  active               Boolean                @default(true)
+  stockSyncMode        WmsStockSyncMode       @default(NOTIFICATION_ONLY)
+  stockMasterSystem    WmsStockMasterSystem   @default(IMS)
+  bundleSyncDirection  WmsBundleSyncDirection @default(DISABLED)
+  returnsMode          WmsReturnsMode         @default(DISABLED)
+  syncFrequencyMinutes Int                    @default(60)
+  discrepancyThresholds Json?
+  reportRecipients     String[]               @default([])
+  lastStockSyncAt      DateTime?
+  lastStockSyncStatus  WmsSyncJobStatus?
+  createdAt            DateTime               @default(now())
+  updatedAt            DateTime               @updatedAt
+
+  connection           WmsConnection          @relation(fields: [connectionId], references: [id], onDelete: Cascade)
+  warehouse            Warehouse              @relation(fields: [warehouseId], references: [id])
+
+  @@unique([connector, warehouseId])
+  @@unique([connector, externalWarehouseId])
+  @@index([warehouseId])
+  @@map("external_wms_bindings")
+}
+
+model WmsProductLink {
+  id                String   @id @default(cuid())
+  productId         String
+  connector         String
+  externalProductId String
+  payloadHash       String?
+  lastKnownBarcode  String?
+  metadata          Json?
+  lastSyncedAt      DateTime?
+  lastError         String?
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  product           Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([connector, externalProductId])
+  @@unique([connector, productId])
+  @@index([productId])
+  @@map("wms_product_links")
+}
+
+model WmsBundleLink {
+  id               String   @id @default(cuid())
+  productId        String
+  connector        String
+  externalBundleId String
+  checksum         String?
+  lastSyncedAt     DateTime?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  product          Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([connector, externalBundleId])
+  @@unique([connector, productId])
+  @@map("wms_bundle_links")
+}
+
+model WmsAsnMap {
+  id             String   @id @default(cuid())
+  connector      String
+  externalAsnId  String
+  sourceType     String
+  sourceId       String
+  warehouseId    String
+  status         String
+  lastCallbackAt DateTime?
+  closedAt       DateTime?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  lines          WmsAsnLineMap[]
+
+  @@unique([connector, externalAsnId])
+  @@index([sourceType, sourceId])
+  @@map("wms_asn_maps")
+}
+
+model WmsAsnLineMap {
+  id                     String    @id @default(cuid())
+  asnMapId               String
+  externalAsnLineId      String
+  sourceType             String
+  sourceLineId           String
+  productId              String
+  sku                    String
+  expectedQty            Decimal   @db.Decimal(12, 4)
+  qtyAccountedViaSnapshot Decimal  @db.Decimal(12, 4) @default(0)
+  qtyAccountedViaReceipt  Decimal  @db.Decimal(12, 4) @default(0)
+  lastProcessedReceivedQty Decimal @db.Decimal(12, 4) @default(0)
+  lastCallbackAt         DateTime?
+
+  asn                    WmsAsnMap @relation(fields: [asnMapId], references: [id], onDelete: Cascade)
+
+  @@unique([asnMapId, externalAsnLineId])
+  @@index([sourceType, sourceLineId])
+  @@index([productId])
+  @@map("wms_asn_line_maps")
+}
+
+model WmsSyncJob {
+  id           String           @id @default(cuid())
+  connector    String
+  type         WmsSyncJobType
+  status       WmsSyncJobStatus
+  warehouseId  String?
+  startedAt    DateTime
+  finishedAt   DateTime?
+  totalChecked Int              @default(0)
+  matched      Int              @default(0)
+  mismatched   Int              @default(0)
+  corrected    Int              @default(0)
+  skipped      Int              @default(0)
+  errors       Int              @default(0)
+  summary      Json?
+  triggeredBy  String?
+  createdAt    DateTime         @default(now())
+
+  lines        WmsSyncLog[]
+
+  @@index([connector, type, status, startedAt])
+  @@map("wms_sync_jobs")
+}
+
+model WmsSyncLog {
+  id           String     @id @default(cuid())
+  jobId        String
+  sku          String?
+  productId    String?
+  action       String
+  imsQtyBefore Decimal?   @db.Decimal(12, 4)
+  imsQtyAfter  Decimal?   @db.Decimal(12, 4)
+  wmsQty       Decimal?   @db.Decimal(12, 4)
+  delta        Decimal?   @db.Decimal(12, 4)
+  reason       String?
+  payload      Json?
+
+  job          WmsSyncJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+
+  @@index([jobId])
+  @@map("wms_sync_logs")
+}
+
+model WmsStockSnapshot {
+  id           String   @id @default(cuid())
+  connector    String
+  warehouseId  String
+  productId    String
+  externalQty  Decimal  @db.Decimal(12, 4)
+  imsQtyAtSync Decimal  @db.Decimal(12, 4)
+  lastSeenAt   DateTime
+  updatedAt    DateTime @updatedAt
+
+  @@unique([connector, warehouseId, productId])
+  @@index([warehouseId, productId])
+  @@map("wms_stock_snapshots")
+}
+
+model WmsStockDiscrepancy {
+  id             String               @id @default(cuid())
+  connector      String
+  warehouseId    String
+  productId      String?
+  sku            String?
+  category       WmsDiscrepancyCategory
+  status         WmsDiscrepancyStatus @default(OPEN)
+  imsValue       String?
+  wmsValue       String?
+  delta          Decimal?             @db.Decimal(12, 4)
+  message        String?
+  detectionCount Int                  @default(1)
+  firstSeenAt    DateTime             @default(now())
+  lastSeenAt     DateTime             @default(now())
+  resolvedAt     DateTime?
+  resolvedBy     String?
+  resolvedNote   String?
+
+  @@index([connector, status, category])
+  @@index([productId])
+  @@map("wms_stock_discrepancies")
+}
+
+model WmsInboundReceiptEvent {
+  id              String   @id @default(cuid())
+  connector       String
+  externalEventId String
+  externalAsnId   String?
+  payload         Json
+  processedAt     DateTime?
+  processingError String?
+  receivedAt      DateTime @default(now())
+
+  @@unique([connector, externalEventId])
+  @@index([externalAsnId])
+  @@map("wms_inbound_receipt_events")
+}
+
+model WmsReturnsInbox {
+  id               String                @id @default(cuid())
+  connector        String
+  externalReturnId String
+  orderId          String?
+  productId        String?
+  sku              String?
+  qty              Decimal?              @db.Decimal(12, 4)
+  reason           String?
+  reference        String?
+  warehouseId      String?
+  receivedAt       DateTime?
+  status           WmsReturnsInboxStatus @default(NEW)
+  rawPayload       Json?
+  resolvedAt       DateTime?
+  resolvedBy       String?
+  resolutionNote   String?
+  createdAt        DateTime              @default(now())
+  updatedAt        DateTime              @updatedAt
+
+  @@unique([connector, externalReturnId])
+  @@index([status, connector])
+  @@map("wms_returns_inbox")
 }
 
 // ---------------------------------------------------------------------------

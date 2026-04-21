@@ -1,6 +1,6 @@
 'use client'
 
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from 'react'
+import { forwardRef, useCallback, useEffect, useImperativeHandle, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Building2, Camera, Loader2, Upload, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -46,7 +46,6 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
   const [co, setCo] = useState(initialOrg)
   const [logoUrl, setLogoUrl] = useState(initialOrg.logoUrl)
   const [uploading, setUploading] = useState(false)
-  const [saving, setSaving] = useState(false)
   const [error, setError] = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
 
@@ -93,9 +92,8 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
     }
   }
 
-  async function handleSave() {
+  const handleSave = useCallback(async function handleSave() {
     setError('')
-    setSaving(true)
     try {
       const result = await updateOrganisation({ ...co, logoUrl })
       if (!result.success) {
@@ -105,12 +103,13 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
       router.refresh()
       onSaved()
       return true
-    } finally {
-      setSaving(false)
+    } catch {
+      setError('Failed to save')
+      return false
     }
-  }
+  }, [co, logoUrl, onSaved, router])
 
-  useImperativeHandle(ref, () => ({ save: handleSave }), [co, logoUrl, onSaved, router])
+  useImperativeHandle(ref, () => ({ save: handleSave }), [handleSave])
 
   return (
     <div className="space-y-6">

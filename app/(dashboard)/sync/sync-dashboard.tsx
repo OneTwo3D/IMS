@@ -5,7 +5,9 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { useRouter, useSearchParams } from 'next/navigation'
 import { SyncClient } from './sync-client'
 import { ShopifySyncClient } from './shopify-sync-client'
+import { MintsoftClient } from './mintsoft-client'
 import { XeroClient } from './xero-client'
+import type { MintsoftDashboardData } from '@/app/actions/mintsoft-sync'
 import type {
   ShopifyConnectorCredentials,
   ShopifySyncSettings,
@@ -53,6 +55,7 @@ type Props = {
   accountingReadiness: AccountingSyncReadiness
   accountingBatchPreview: AccountingBatchPreview
   accountingBatchHistory: AccountingBatchHistoryDay[]
+  mintsoftData: MintsoftDashboardData | null
 }
 
 type ConnectorDef = {
@@ -61,6 +64,7 @@ type ConnectorDef = {
   description: string
   logo: string // SVG inline or URL
   category: 'shopping' | 'accounting'
+    | 'wms'
   available: boolean
 }
 
@@ -87,6 +91,14 @@ const CONNECTORS: ConnectorDef[] = [
     description: 'Integrate any system via the One Two Inventory REST API',
     logo: '',
     category: 'shopping',
+    available: true,
+  },
+  {
+    id: 'mintsoft',
+    name: 'Mintsoft',
+    description: 'Bind Mintsoft warehouses, store credentials, and stage WMS callbacks',
+    logo: '',
+    category: 'wms',
     available: true,
   },
   {
@@ -120,13 +132,21 @@ const CONNECTOR_LOGOS: Record<string, React.ReactNode> = {
       <span className="text-base font-bold tracking-tight">REST API</span>
     </div>
   ),
+  mintsoft: (
+    <div className="flex h-8 items-center gap-2">
+      <div className="flex h-8 w-8 items-center justify-center rounded-md bg-amber-100 text-xs font-bold text-amber-700">
+        MS
+      </div>
+      <span className="text-base font-semibold tracking-tight">Mintsoft</span>
+    </div>
+  ),
   // eslint-disable-next-line @next/next/no-img-element
   xero: <img src="/images/xero.svg" alt="Xero" className="h-8 object-contain" />,
   // eslint-disable-next-line @next/next/no-img-element
   quickbooks: <img src="/images/qb-logo-stacked.svg" alt="QuickBooks" className="h-8 object-contain" />,
 }
 
-export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, taxRates, imsTaxRates, accountingTaxRates, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, accountingSettings, accountingConnected, accountingTenantName, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, accountingReadiness, accountingBatchPreview, accountingBatchHistory }: Props) {
+export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, taxRates, imsTaxRates, accountingTaxRates, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, accountingSettings, accountingConnected, accountingTenantName, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, accountingReadiness, accountingBatchPreview, accountingBatchHistory, mintsoftData }: Props) {
   const router = useRouter()
   const searchParams = useSearchParams()
   const requestedConnector = searchParams.get('connector')
@@ -138,6 +158,8 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
     requestedConnector === 'xero' && !pluginState.xero
   ) || (
     requestedConnector === 'quickbooks' && !pluginState.quickbooks
+  ) || (
+    requestedConnector === 'mintsoft' && !pluginState.mintsoft
   )
     ? null
     : requestedConnector
@@ -152,11 +174,13 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
 
   const woocommerceConnected = pluginState.woocommerce && !!shoppingCredentials.url && !!shoppingCredentials.key && !!shoppingCredentials.secret
   const shopifyConnected = pluginState.shopify && !!shopifyCredentials.storeDomain && !!shopifyCredentials.adminApiAccessToken
+  const mintsoftConfigured = pluginState.mintsoft && Boolean(mintsoftData?.status.configured)
   const visibleConnectors = CONNECTORS.filter((connector) => {
     if (connector.id === 'woocommerce') return pluginState.woocommerce
     if (connector.id === 'shopify') return pluginState.shopify
     if (connector.id === 'xero') return pluginState.xero
     if (connector.id === 'quickbooks') return pluginState.quickbooks
+    if (connector.id === 'mintsoft') return pluginState.mintsoft
     return true
   })
 
@@ -268,6 +292,24 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
     )
   }
 
+  if (activeConnector === 'mintsoft' && mintsoftData) {
+    return (
+      <div className="space-y-4">
+        <button type="button" onClick={() => setActiveConnector(null)} className="text-sm text-muted-foreground hover:text-foreground flex items-center gap-1">
+          ← Back to Integrations
+        </button>
+        <div className="flex items-center gap-3 mb-2">
+          {CONNECTOR_LOGOS.mintsoft}
+          <div>
+            <h2 className="text-lg font-semibold">Mintsoft Connector</h2>
+            <p className="text-xs text-muted-foreground">Configure the WMS connection, webhook intake, and warehouse bindings.</p>
+          </div>
+        </div>
+        <MintsoftClient data={mintsoftData} />
+      </div>
+    )
+  }
+
   if (activeConnector === 'quickbooks') {
     return (
       <div className="space-y-4">
@@ -370,6 +412,34 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
                 {c.id === 'shopify' && shopifyConnected && (
                   <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
                     Connected
+                  </span>
+                )}
+                {!c.available && (
+                  <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-muted text-muted-foreground">
+                    Coming Soon
+                  </span>
+                )}
+              </div>
+              <p className="text-sm text-muted-foreground">{c.description}</p>
+            </Card>
+          ))}
+        </div>
+      </div>
+
+      <div>
+        <h2 className="text-sm font-semibold text-muted-foreground uppercase tracking-wide mb-3">Warehouse Management</h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {visibleConnectors.filter((c) => c.category === 'wms').map((c) => (
+            <Card
+              key={c.id}
+              className={`p-5 space-y-3 transition-colors ${c.available ? 'cursor-pointer hover:border-primary/50' : 'opacity-50'}`}
+              onClick={() => c.available && setActiveConnector(c.id)}
+            >
+              <div className="flex items-center justify-between">
+                {CONNECTOR_LOGOS[c.id]}
+                {c.id === 'mintsoft' && mintsoftConfigured && (
+                  <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200">
+                    Configured
                   </span>
                 )}
                 {!c.available && (

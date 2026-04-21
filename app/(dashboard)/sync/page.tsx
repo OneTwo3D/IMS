@@ -20,6 +20,7 @@ import {
   getAccountingSyncReadiness,
 } from '@/app/actions/accounting-sync'
 import { getAccountingBatchHistory, getAccountingBatchPreview } from '@/app/actions/accounting-batch'
+import { getMintsoftDashboardData } from '@/app/actions/mintsoft-sync'
 import { getPaymentMethodCombos } from '@/app/actions/accounting'
 import { getPaymentAccountMap } from '@/lib/accounting'
 import { getTaxRates } from '@/app/actions/settings'
@@ -31,11 +32,11 @@ export const metadata: Metadata = { title: 'Integrations' }
 
 export default async function SyncPage() {
   const pluginState = await getIntegrationPluginState()
-  if (!pluginState.woocommerce && !pluginState.shopify && !pluginState.xero && !pluginState.quickbooks) {
+  if (!pluginState.woocommerce && !pluginState.shopify && !pluginState.xero && !pluginState.quickbooks && !pluginState.mintsoft) {
     redirect('/settings/system?tab=plugins')
   }
 
-  const [shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, taxRatesRaw, accountingSettings, accountingStatus, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, accountingReadiness, currenciesRaw, shoppingPaymentMethods, accountingBatchPreview, accountingBatchHistory] = await Promise.all([
+  const [shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, taxRatesRaw, accountingSettings, accountingStatus, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, accountingReadiness, currenciesRaw, shoppingPaymentMethods, accountingBatchPreview, accountingBatchHistory, mintsoftData] = await Promise.all([
     getShoppingSyncSettings(),
     getShoppingTaxRateMappings(),
     getShoppingStatusMappings(),
@@ -64,6 +65,7 @@ export default async function SyncPage() {
     pluginState.woocommerce ? getShoppingConnectorPaymentMethods() : Promise.resolve([]),
     getAccountingBatchPreview(),
     getAccountingBatchHistory(30),
+    pluginState.mintsoft ? getMintsoftDashboardData() : Promise.resolve(null),
   ])
 
   const taxRates = taxRatesRaw.map((r: { id: string; name: string }) => ({ id: r.id, name: r.name }))
@@ -108,6 +110,7 @@ export default async function SyncPage() {
         accountingReadiness={accountingReadiness}
         accountingBatchPreview={accountingBatchPreview}
         accountingBatchHistory={accountingBatchHistory}
+        mintsoftData={mintsoftData}
       />
     </div>
   )

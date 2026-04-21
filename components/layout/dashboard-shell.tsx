@@ -14,6 +14,7 @@ interface DashboardShellProps {
   userPictureUrl?: string | null
   shoppingIntegrationEnabled: boolean
   accountingIntegrationEnabled: boolean
+  wmsIntegrationEnabled: boolean
   children: React.ReactNode
 }
 
@@ -26,6 +27,7 @@ export function DashboardShell({
   userPictureUrl,
   shoppingIntegrationEnabled,
   accountingIntegrationEnabled,
+  wmsIntegrationEnabled,
   children,
 }: DashboardShellProps) {
   const [mobileOpen, setMobileOpen] = useState(false)
@@ -40,6 +42,7 @@ export function DashboardShell({
           userRole={userRole}
           shoppingIntegrationEnabled={shoppingIntegrationEnabled}
           accountingIntegrationEnabled={accountingIntegrationEnabled}
+          wmsIntegrationEnabled={wmsIntegrationEnabled}
         />
       </div>
 
@@ -55,6 +58,7 @@ export function DashboardShell({
               userRole={userRole}
               shoppingIntegrationEnabled={shoppingIntegrationEnabled}
               accountingIntegrationEnabled={accountingIntegrationEnabled}
+              wmsIntegrationEnabled={wmsIntegrationEnabled}
               onNavigate={() => setMobileOpen(false)}
               forceExpanded
             />

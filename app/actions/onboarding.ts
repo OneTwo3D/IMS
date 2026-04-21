@@ -5,7 +5,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAdmin } from '@/lib/auth/server'
 import { getSettingValue } from '@/lib/settings-store'
-import { getIntegrationPluginState } from '@/lib/integration-plugins'
+import { getIntegrationPluginState, type IntegrationPluginState } from '@/lib/integration-plugins'
 import { isBaseCurrencyLocked } from '@/lib/base-currency'
 import { syncCrontab } from '@/app/actions/cron'
 
@@ -22,12 +22,7 @@ export type OnboardingState = {
   currencyConfigured: boolean
   productCount: number
   warehouseCount: number
-  pluginState: {
-    woocommerce: boolean
-    shopify: boolean
-    xero: boolean
-    quickbooks: boolean
-  }
+  pluginState: IntegrationPluginState
   isLegacyConfigured: boolean
   shouldShowBanner: boolean
   shouldAllowWizard: boolean
@@ -239,6 +234,7 @@ type PluginStateInput = {
   shopify: boolean
   xero: boolean
   quickbooks: boolean
+  mintsoft: boolean
 }
 
 export async function saveOnboardingPluginState(state: PluginStateInput): Promise<{ success: boolean; error?: string }> {
@@ -271,6 +267,11 @@ export async function saveOnboardingPluginState(state: PluginStateInput): Promis
       where: { key: 'plugin_quickbooks_enabled' },
       create: { key: 'plugin_quickbooks_enabled', value: String(state.quickbooks) },
       update: { value: String(state.quickbooks) },
+    }),
+    db.setting.upsert({
+      where: { key: 'plugin_mintsoft_enabled' },
+      create: { key: 'plugin_mintsoft_enabled', value: String(state.mintsoft) },
+      update: { value: String(state.mintsoft) },
     }),
   ])
 

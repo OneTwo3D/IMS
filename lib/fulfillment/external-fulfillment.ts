@@ -1,6 +1,8 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
+import { getMintsoftConnectionRecord } from '@/lib/connectors/mintsoft/api/auth'
+import { inferMintsoftOrderLookupConnector } from '@/lib/connectors/mintsoft/order-lookup'
 
 export type ExternalFulfillmentSource = 'woocommerce' | 'shopify' | 'mintsoft'
 export type ExternalShipmentStatus = 'PENDING' | 'PICKING' | 'PACKED' | 'SHIPPED'
@@ -25,6 +27,15 @@ type ResolvedOrder = {
   status: string
 }
 
+async function resolveShoppingConnectorForSource(
+  source: ExternalFulfillmentSource,
+): Promise<'woocommerce' | 'shopify' | null> {
+  if (source === 'woocommerce' || source === 'shopify') return source
+
+  const connection = await getMintsoftConnectionRecord()
+  return inferMintsoftOrderLookupConnector(connection?.orderLookupConnector)
+}
+
 export async function resolveOrderForExternalFulfillment(
   source: ExternalFulfillmentSource,
   lookup: ExternalFulfillmentLookup,
@@ -37,10 +48,13 @@ export async function resolveOrderForExternalFulfillment(
   }
 
   if ('externalOrderId' in lookup) {
+    const connector = await resolveShoppingConnectorForSource(source)
+    if (!connector) return null
+
     const link = await db.shoppingOrderLink.findUnique({
       where: {
         connector_externalOrderId: {
-          connector: source,
+          connector,
           externalOrderId: String(lookup.externalOrderId),
         },
       },
@@ -54,9 +68,12 @@ export async function resolveOrderForExternalFulfillment(
   }
 
   if ('externalOrderNumber' in lookup) {
+    const connector = await resolveShoppingConnectorForSource(source)
+    if (!connector) return null
+
     const link = await db.shoppingOrderLink.findFirst({
       where: {
-        connector: source,
+        connector,
         externalOrderNumber: lookup.externalOrderNumber,
       },
       select: {

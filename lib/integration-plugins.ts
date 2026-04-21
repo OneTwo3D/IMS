@@ -1,12 +1,13 @@
 import { getSettingValues } from '@/lib/settings-store'
 
-export type IntegrationPluginId = 'woocommerce' | 'shopify' | 'xero' | 'quickbooks'
+export type IntegrationPluginId = 'woocommerce' | 'shopify' | 'xero' | 'quickbooks' | 'mintsoft'
 
 const PLUGIN_SETTING_KEYS = {
   woocommerce: 'plugin_woocommerce_enabled',
   shopify: 'plugin_shopify_enabled',
   xero: 'plugin_xero_enabled',
   quickbooks: 'plugin_quickbooks_enabled',
+  mintsoft: 'plugin_mintsoft_enabled',
 } as const
 
 export type IntegrationPluginState = Record<IntegrationPluginId, boolean>
@@ -16,6 +17,7 @@ const DEFAULT_PLUGIN_STATE: IntegrationPluginState = {
   shopify: false,
   xero: false,
   quickbooks: false,
+  mintsoft: false,
 }
 
 function parseEnabled(value: string | undefined): boolean {
@@ -31,6 +33,7 @@ export async function getIntegrationPluginState(): Promise<IntegrationPluginStat
     shopify: parseEnabled(values.get(PLUGIN_SETTING_KEYS.shopify)),
     xero: parseEnabled(values.get(PLUGIN_SETTING_KEYS.xero)),
     quickbooks: parseEnabled(values.get(PLUGIN_SETTING_KEYS.quickbooks)),
+    mintsoft: parseEnabled(values.get(PLUGIN_SETTING_KEYS.mintsoft)),
   }
 }
 
@@ -50,6 +53,9 @@ export function isIntegrationModuleVisible(
       return state.shopify
     case 'accounting':
       return state.xero || state.quickbooks
+    case 'mintsoft':
+    case 'wms':
+      return state.mintsoft
     default:
       return true
   }

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { Check, ExternalLink, Loader2, ShoppingCart, Store, BookOpen, Calculator } from 'lucide-react'
+import { Check, ExternalLink, Loader2, ShoppingCart, Store, BookOpen, Calculator, Boxes } from 'lucide-react'
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -213,6 +213,7 @@ export function IntegrationsStep({
 
   const hasShoppingConnector = plugins.woocommerce || plugins.shopify
   const hasAccountingConnector = plugins.xero || plugins.quickbooks
+  const hasWmsConnector = plugins.mintsoft
   const accountingLabel = plugins.quickbooks ? 'QuickBooks' : 'Xero'
 
   return (
@@ -270,6 +271,17 @@ export function IntegrationsStep({
                 <span className="text-sm font-medium">QuickBooks Online</span>
               </div>
               <p className="text-xs text-muted-foreground mt-0.5">Post journal entries and sync invoices to QuickBooks</p>
+            </div>
+          </label>
+
+          <label className="flex items-start gap-3 cursor-pointer rounded-lg border p-3 hover:bg-muted/50 transition-colors">
+            <Switch checked={plugins.mintsoft} onCheckedChange={(v) => togglePlugin('mintsoft', v)} className="mt-0.5" />
+            <div className="flex-1 min-w-0">
+              <div className="flex items-center gap-2">
+                <Boxes className="h-4 w-4 text-amber-600" />
+                <span className="text-sm font-medium">Mintsoft</span>
+              </div>
+              <p className="text-xs text-muted-foreground mt-0.5">Enable the Mintsoft WMS connector and warehouse binding tools</p>
             </div>
           </label>
         </div>
@@ -405,7 +417,17 @@ export function IntegrationsStep({
 
       {error && <p className="text-sm text-destructive">{error}</p>}
 
-      {!hasShoppingConnector && !hasAccountingConnector && (
+      {plugins.mintsoft && (
+        <p className="text-xs text-muted-foreground">
+          Mintsoft credentials and warehouse bindings are configured after onboarding in{' '}
+          <Link href="/sync?connector=mintsoft" className="text-primary hover:underline inline-flex items-center gap-0.5">
+            Integrations <ExternalLink className="h-3 w-3" />
+          </Link>
+          .
+        </p>
+      )}
+
+      {!hasShoppingConnector && !hasAccountingConnector && !hasWmsConnector && (
         <p className="text-sm text-muted-foreground italic">
           No integrations selected. You can enable them at any time from Settings.
         </p>

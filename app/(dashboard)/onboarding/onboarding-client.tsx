@@ -114,7 +114,7 @@ export function OnboardingClient({
   const wcConnected = !!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secretMasked
   const shopifyConnected = !!shopifyCredentials.storeDomain && !!shopifyCredentials.accessTokenMasked
   const accountingConnected = accountingStatus.connected
-  const anyIntegrationsEnabled = plugins.woocommerce || plugins.shopify || plugins.xero || plugins.quickbooks
+  const anyIntegrationsEnabled = plugins.woocommerce || plugins.shopify || plugins.xero || plugins.quickbooks || plugins.mintsoft
   const hasAdditionalWarehouses = warehouses.length > 1
 
   function isStepReady(index: number) {

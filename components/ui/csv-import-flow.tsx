@@ -1,6 +1,6 @@
 'use client'
 
-import { useRef, useState, useTransition, type ReactNode } from 'react'
+import { useId, useRef, useState, useTransition, type ReactNode } from 'react'
 import { AlertTriangle, FileSpreadsheet, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import {
@@ -54,6 +54,7 @@ function StatCard({
 }
 
 export function CsvImportFlow({ action, onDone, children }: Props) {
+  const inputId = useId()
   const inputRef = useRef<HTMLInputElement>(null)
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [preview, setPreview] = useState<CsvImportPreviewResult | null>(null)
@@ -84,7 +85,8 @@ export function CsvImportFlow({ action, onDone, children }: Props) {
   }
 
   function openFilePicker() {
-    inputRef.current?.click()
+    const input = document.getElementById(inputId)
+    if (input instanceof HTMLInputElement) input.click()
   }
 
   function handleChange(event: React.ChangeEvent<HTMLInputElement>) {
@@ -172,6 +174,7 @@ export function CsvImportFlow({ action, onDone, children }: Props) {
   return (
     <>
       <input
+        id={inputId}
         ref={inputRef}
         type="file"
         accept=".csv,text/csv"
