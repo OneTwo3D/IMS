@@ -20,6 +20,9 @@ type ReturnsBinding = {
   }
 }
 
+const RETURNS_SYNC_DEFAULT_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1000
+const RETURNS_SYNC_OVERLAP_MS = 15 * 60 * 1000
+
 export type MintsoftReturnsInboxRow = {
   id: string
   externalReturnId: string
@@ -112,6 +115,14 @@ async function getReturnsBindings(): Promise<ReturnsBinding[]> {
   }) as Promise<ReturnsBinding[]>
 }
 
+function getSummaryDate(summary: Prisma.JsonValue | null | undefined, key: string): Date | null {
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) return null
+  const value = summary[key]
+  if (typeof value !== 'string' || !value.trim()) return null
+  const parsed = new Date(value)
+  return Number.isFinite(parsed.getTime()) ? parsed : null
+}
+
 async function getReturnsSyncSince(): Promise<Date> {
   const lastJob = await db.wmsSyncJob.findFirst({
     where: {
@@ -125,10 +136,20 @@ async function getReturnsSyncSince(): Promise<Date> {
       },
     },
     orderBy: { finishedAt: 'desc' },
-    select: { finishedAt: true },
+    select: {
+      startedAt: true,
+      finishedAt: true,
+      summary: true,
+    },
   })
 
-  return lastJob?.finishedAt ?? new Date(Date.now() - 7 * 24 * 60 * 60 * 1000)
+  const cursor = getSummaryDate(lastJob?.summary, 'nextCursor')
+    ?? getSummaryDate(lastJob?.summary, 'maxReceivedAt')
+    ?? lastJob?.startedAt
+    ?? lastJob?.finishedAt
+    ?? new Date(Date.now() - RETURNS_SYNC_DEFAULT_LOOKBACK_MS)
+
+  return new Date(cursor.getTime() - RETURNS_SYNC_OVERLAP_MS)
 }
 
 function buildReturnsSummary(input: {
@@ -136,12 +157,16 @@ function buildReturnsSummary(input: {
   since: Date
   created: number
   updated: number
+  nextCursor: Date
+  maxReceivedAt: Date | null
 }): Prisma.InputJsonObject {
   return {
     bindingCount: input.bindingCount,
     since: input.since.toISOString(),
     created: input.created,
     updated: input.updated,
+    nextCursor: input.nextCursor.toISOString(),
+    ...(input.maxReceivedAt ? { maxReceivedAt: input.maxReceivedAt.toISOString() } : {}),
   }
 }
 
@@ -224,18 +249,21 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
   }
 
   const since = await getReturnsSyncSince()
+  const startedAt = new Date()
   const job = await db.wmsSyncJob.create({
     data: {
       connector: 'mintsoft',
       type: 'RETURNS_SYNC',
       status: 'RUNNING',
-      startedAt: new Date(),
+      startedAt,
       triggeredBy,
       summary: buildReturnsSummary({
         bindingCount: bindings.length,
         since,
         created: 0,
         updated: 0,
+        nextCursor: startedAt,
+        maxReceivedAt: null,
       }),
     },
     select: { id: true },
@@ -252,6 +280,8 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
   const logRows: Prisma.WmsSyncLogCreateManyInput[] = []
   let createdCount = 0
   let updatedCount = 0
+  let maxReceivedAtSeen: Date | null = null
+  let earliestFailedReceivedAt: Date | null = null
 
   try {
     const connector = getWmsConnector('mintsoft')
@@ -276,6 +306,9 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
         const qty = record.qty == null ? null : new Prisma.Decimal(record.qty)
         const receivedAt = parseReceivedAt(record.receivedAt)
         const now = new Date()
+        if (receivedAt && (!maxReceivedAtSeen || receivedAt > maxReceivedAtSeen)) {
+          maxReceivedAtSeen = receivedAt
+        }
 
         const existing = await db.wmsReturnsInbox.findUnique({
           where: {
@@ -355,6 +388,10 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
         })
       } catch (error) {
         counters.errors += 1
+        const failedReceivedAt = parseReceivedAt(record.receivedAt)
+        if (failedReceivedAt && (!earliestFailedReceivedAt || failedReceivedAt < earliestFailedReceivedAt)) {
+          earliestFailedReceivedAt = failedReceivedAt
+        }
         logRows.push({
           jobId: job.id,
           sku: trimToNull(record.sku),
@@ -371,11 +408,16 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
     }
 
     const status: 'SUCCEEDED' | 'PARTIAL' = counters.errors > 0 ? 'PARTIAL' : 'SUCCEEDED'
+    const nextCursor = earliestFailedReceivedAt && earliestFailedReceivedAt < startedAt
+      ? earliestFailedReceivedAt
+      : startedAt
     const summary = buildReturnsSummary({
       bindingCount: bindings.length,
       since,
       created: createdCount,
       updated: updatedCount,
+      nextCursor,
+      maxReceivedAt: maxReceivedAtSeen,
     })
 
     await completeReturnsJob(job.id, status, counters, summary)
@@ -408,6 +450,8 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
       since,
       created: createdCount,
       updated: updatedCount,
+      nextCursor: since,
+      maxReceivedAt: maxReceivedAtSeen,
     }))
     await logActivity({
       entityType: 'SYSTEM',

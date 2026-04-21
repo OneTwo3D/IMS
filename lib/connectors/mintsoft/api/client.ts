@@ -306,3 +306,14 @@ export async function createMintsoftAsn(input: WmsAsnInput): Promise<WmsAsnRef> 
 
   return normalized
 }
+
+export async function fetchMintsoftAsns(): Promise<WmsAsnRef[]> {
+  const result = await mintsoftRequest<unknown>('/api/ASN')
+  if (result.error) {
+    throw new Error(result.error)
+  }
+
+  return extractMintsoftArrayPayload(result.data)
+    .map((item) => normalizeMintsoftAsn(item))
+    .filter((item): item is WmsAsnRef => Boolean(item))
+}

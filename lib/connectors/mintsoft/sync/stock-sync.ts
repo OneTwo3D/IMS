@@ -37,6 +37,8 @@ type SyncSummary = {
   notifiedUsers: number
 }
 
+const STALE_RUNNING_STOCK_SYNC_MS = 2 * 60 * 60 * 1000
+
 export type MintsoftStockSyncResult = {
   bindingId: string
   warehouseId: string
@@ -182,16 +184,48 @@ async function reserveStockSyncJob(
         warehouseId: binding.warehouseId,
         status: 'RUNNING',
       },
-      select: { id: true },
+      select: {
+        id: true,
+        startedAt: true,
+      },
       orderBy: { startedAt: 'desc' },
     })
 
     if (runningJob) {
-      return {
-        binding,
-        jobId: runningJob.id,
-        skippedReason: 'Stock sync already running for this binding',
-      } satisfies StockSyncReservation
+      const staleBefore = new Date(Date.now() - STALE_RUNNING_STOCK_SYNC_MS)
+      if (runningJob.startedAt < staleBefore) {
+        const reclaimed = await tx.wmsSyncJob.updateMany({
+          where: {
+            id: runningJob.id,
+            status: 'RUNNING',
+          },
+          data: {
+            status: 'FAILED',
+            finishedAt: new Date(),
+            errors: 1,
+            summary: {
+              externalWarehouseId: binding.externalWarehouseId,
+              bindingId: binding.id,
+              staleRecoveredAt: new Date().toISOString(),
+              staleStartedAt: runningJob.startedAt.toISOString(),
+            } satisfies Prisma.InputJsonObject,
+          },
+        })
+
+        if (reclaimed.count === 0) {
+          return {
+            binding,
+            jobId: runningJob.id,
+            skippedReason: 'Stock sync already running for this binding',
+          } satisfies StockSyncReservation
+        }
+      } else {
+        return {
+          binding,
+          jobId: runningJob.id,
+          skippedReason: 'Stock sync already running for this binding',
+        } satisfies StockSyncReservation
+      }
     }
 
     const job = await tx.wmsSyncJob.create({

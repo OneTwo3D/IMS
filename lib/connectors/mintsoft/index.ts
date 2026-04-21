@@ -81,6 +81,7 @@ export {
 export {
   buildMintsoftAsnCreateRequest,
   createMintsoftAsn,
+  fetchMintsoftAsns,
   fetchMintsoftProduct,
   fetchMintsoftProductBySku,
   fetchMintsoftReturns,

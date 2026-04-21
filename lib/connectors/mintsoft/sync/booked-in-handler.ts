@@ -133,11 +133,7 @@ export async function processMintsoftBookedInEvent(
       }
 
       const actionableLines = asnMap.lines
-        .map((line) => ({
-          ...line,
-          deltaQty: Number(line.expectedQty) - Number(line.lastProcessedReceivedQty),
-        }))
-        .filter((line) => line.deltaQty > 0)
+        .filter((line) => Number(line.expectedQty) > Number(line.lastProcessedReceivedQty))
 
       const unsupportedLines = actionableLines.filter((line) => line.sourceType !== 'PURCHASE_ORDER_LINE')
       if (unsupportedLines.length > 0) {
@@ -176,7 +172,8 @@ export async function processMintsoftBookedInEvent(
         asnLineMapId: string
         poLineId: string
         productId: string
-        qtyReceived: number
+        expectedQty: number
+        lastProcessedReceivedQty: number
       }>>()
 
       for (const line of actionableLines) {
@@ -185,17 +182,13 @@ export async function processMintsoftBookedInEvent(
           throw new Error(`Missing purchase order line ${line.sourceLineId} for ASN ${lockedEvent.externalAsnId}`)
         }
 
-        const outstanding = Number(poLine.qty) - Number(poLine.qtyReceived)
-        if (outstanding < line.deltaQty) {
-          throw new Error(`ASN ${lockedEvent.externalAsnId} would over-receive PO line ${poLine.id}`)
-        }
-
         const entry = receiptLinesByPoId.get(poLine.poId) ?? []
         entry.push({
           asnLineMapId: line.id,
           poLineId: poLine.id,
           productId: poLine.productId,
-          qtyReceived: line.deltaQty,
+          expectedQty: Number(line.expectedQty),
+          lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),
         })
         receiptLinesByPoId.set(poLine.poId, entry)
       }
@@ -230,97 +223,108 @@ export async function processMintsoftBookedInEvent(
         }
 
         const lockedLineById = new Map(po.lines.map((line) => [line.id, line]))
-        for (const receiptLine of receiptLines) {
+        const reconciledLines = receiptLines.map((receiptLine) => {
           const poLine = lockedLineById.get(receiptLine.poLineId)
           if (!poLine) {
             throw new Error(`Purchase order line ${receiptLine.poLineId} not found on locked PO ${po.reference}`)
           }
 
-          const outstanding = Number(poLine.qty) - Number(poLine.qtyReceived)
-          if (outstanding < receiptLine.qtyReceived) {
-            throw new Error(`ASN ${lockedEvent.externalAsnId} would over-receive PO line ${poLine.id}`)
+          const alreadyReceivedOnPoLine = Math.min(receiptLine.expectedQty, Number(poLine.qtyReceived))
+          const alreadyAccountedViaAsn = Math.max(receiptLine.lastProcessedReceivedQty, alreadyReceivedOnPoLine)
+          const reconciledManualQty = Math.max(0, alreadyAccountedViaAsn - receiptLine.lastProcessedReceivedQty)
+          const qtyReceived = Math.max(0, receiptLine.expectedQty - alreadyAccountedViaAsn)
+
+          return {
+            ...receiptLine,
+            qtyReceived,
+            reconciledManualQty,
           }
+        }).filter((receiptLine) => receiptLine.qtyReceived > 0 || receiptLine.reconciledManualQty > 0)
+
+        const createdReceiptLines = reconciledLines.filter((receiptLine) => receiptLine.qtyReceived > 0)
+        if (createdReceiptLines.length > 0) {
+          await tx.purchaseReceipt.create({
+            data: {
+              poId,
+              reference: formatReceiptReference(lockedEvent.externalAsnId, po.reference),
+              notes: `Mintsoft ASN booked-in webhook ${lockedEvent.externalAsnId}`,
+              lines: {
+                create: createdReceiptLines.map((receiptLine) => ({
+                  poLineId: receiptLine.poLineId,
+                  qtyReceived: receiptLine.qtyReceived,
+                  warehouseId: asnMap.warehouseId,
+                })),
+              },
+            },
+          })
         }
 
-        await tx.purchaseReceipt.create({
-          data: {
-            poId,
-            reference: formatReceiptReference(lockedEvent.externalAsnId, po.reference),
-            notes: `Mintsoft ASN booked-in webhook ${lockedEvent.externalAsnId}`,
-            lines: {
-              create: receiptLines.map((receiptLine) => ({
-                poLineId: receiptLine.poLineId,
-                qtyReceived: receiptLine.qtyReceived,
-                warehouseId: asnMap.warehouseId,
-              })),
-            },
-          },
-        })
-
-        for (const receiptLine of receiptLines) {
+        for (const receiptLine of reconciledLines) {
           const poLine = lockedLineById.get(receiptLine.poLineId)
           if (!poLine) continue
 
-          const unitCostBase = Number(poLine.landedUnitCostBase ?? poLine.unitCostBase)
-          await tx.stockMovement.create({
-            data: {
-              type: 'PURCHASE_RECEIPT',
-              productId: poLine.productId,
-              toWarehouseId: asnMap.warehouseId,
-              qty: receiptLine.qtyReceived,
-              note: `Received against ${po.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
-              referenceType: 'WmsAsnMap',
-              referenceId: asnMap.id,
-            },
-          })
+          if (receiptLine.qtyReceived > 0) {
+            const unitCostBase = Number(poLine.landedUnitCostBase ?? poLine.unitCostBase)
+            await tx.stockMovement.create({
+              data: {
+                type: 'PURCHASE_RECEIPT',
+                productId: poLine.productId,
+                toWarehouseId: asnMap.warehouseId,
+                qty: receiptLine.qtyReceived,
+                note: `Received against ${po.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
+                referenceType: 'WmsAsnMap',
+                referenceId: asnMap.id,
+              },
+            })
 
-          await tx.costLayer.create({
-            data: {
-              productId: poLine.productId,
-              warehouseId: asnMap.warehouseId,
-              receivedQty: receiptLine.qtyReceived,
-              remainingQty: receiptLine.qtyReceived,
-              unitCostBase,
-              poLineId: poLine.id,
-              isOpeningStock: false,
-            },
-          })
-
-          await tx.stockLevel.upsert({
-            where: {
-              productId_warehouseId: {
+            await tx.costLayer.create({
+              data: {
                 productId: poLine.productId,
                 warehouseId: asnMap.warehouseId,
+                receivedQty: receiptLine.qtyReceived,
+                remainingQty: receiptLine.qtyReceived,
+                unitCostBase,
+                poLineId: poLine.id,
+                isOpeningStock: false,
               },
-            },
-            create: {
-              productId: poLine.productId,
-              warehouseId: asnMap.warehouseId,
-              quantity: receiptLine.qtyReceived,
-              reservedQty: 0,
-            },
-            update: {
-              quantity: { increment: receiptLine.qtyReceived },
-            },
-          })
+            })
 
-          await tx.purchaseOrderLine.update({
-            where: { id: poLine.id },
-            data: {
-              qtyReceived: { increment: receiptLine.qtyReceived },
-            },
-          })
+            await tx.stockLevel.upsert({
+              where: {
+                productId_warehouseId: {
+                  productId: poLine.productId,
+                  warehouseId: asnMap.warehouseId,
+                },
+              },
+              create: {
+                productId: poLine.productId,
+                warehouseId: asnMap.warehouseId,
+                quantity: receiptLine.qtyReceived,
+                reservedQty: 0,
+              },
+              update: {
+                quantity: { increment: receiptLine.qtyReceived },
+              },
+            })
+
+            await tx.purchaseOrderLine.update({
+              where: { id: poLine.id },
+              data: {
+                qtyReceived: { increment: receiptLine.qtyReceived },
+              },
+            })
+
+            touchedProductIds.add(poLine.productId)
+          }
 
           await tx.wmsAsnLineMap.update({
             where: { id: receiptLine.asnLineMapId },
             data: {
-              qtyAccountedViaReceipt: { increment: receiptLine.qtyReceived },
-              lastProcessedReceivedQty: { increment: receiptLine.qtyReceived },
+              qtyAccountedViaReceipt: { increment: receiptLine.qtyReceived + receiptLine.reconciledManualQty },
+              lastProcessedReceivedQty: { increment: receiptLine.qtyReceived + receiptLine.reconciledManualQty },
               lastCallbackAt: now,
             },
           })
-
-          touchedProductIds.add(poLine.productId)
         }
 
         const updatedLines = await tx.purchaseOrderLine.findMany({
