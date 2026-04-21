@@ -166,19 +166,46 @@ function buildMintsoftProductPayload(product: WmsProductDto, omitBarcode: boolea
   return payload
 }
 
+export function buildMintsoftProductUpsertRequest(
+  product: WmsProductDto,
+  options?: WmsUpsertProductOptions,
+): {
+  path: string
+  method: 'PUT' | 'POST'
+  body: string
+} {
+  const externalProductId = options?.externalProductId?.trim() || null
+  const omitBarcode = options?.omitBarcode ?? false
+  const payload = buildMintsoftProductPayload(product, omitBarcode)
+
+  if (externalProductId) {
+    const parsedExternalProductId = Number.parseInt(externalProductId, 10)
+    return {
+      path: '/api/Product',
+      method: 'POST',
+      body: JSON.stringify({
+        ID: Number.isFinite(parsedExternalProductId) ? parsedExternalProductId : externalProductId,
+        ...payload,
+      }),
+    }
+  }
+
+  return {
+    path: '/api/Product',
+    method: 'PUT',
+    body: JSON.stringify(payload),
+  }
+}
+
 export async function upsertMintsoftProduct(
   product: WmsProductDto,
   options?: WmsUpsertProductOptions,
 ): Promise<WmsProductRef> {
   const externalProductId = options?.externalProductId?.trim() || null
-  const omitBarcode = options?.omitBarcode ?? false
-  const path = externalProductId
-    ? `/api/Product/${encodeURIComponent(externalProductId)}`
-    : '/api/Product'
-  const method = externalProductId ? 'POST' : 'PUT'
-  const result = await mintsoftRequest<unknown>(path, {
-    method,
-    body: JSON.stringify(buildMintsoftProductPayload(product, omitBarcode)),
+  const request = buildMintsoftProductUpsertRequest(product, options)
+  const result = await mintsoftRequest<unknown>(request.path, {
+    method: request.method,
+    body: request.body,
   })
 
   if (result.error) {

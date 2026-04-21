@@ -372,7 +372,7 @@ test.describe('Mintsoft integration workflows', () => {
       expect(verifyBody.verifyResult).toMatchObject({
         status: 'SUCCEEDED',
         totalChecked: 2,
-        corrected: 1,
+        corrected: 2,
         mismatched: 1,
         errors: 0,
       })

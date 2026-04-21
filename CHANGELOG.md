@@ -24,6 +24,9 @@ This repository uses an `x.y.z` release scheme.
 - Fixed Mintsoft notification-only stock sync so SKUs missing from the Mintsoft feed now raise `MISSING_IN_WMS` discrepancies instead of silently disappearing from review.
 - Fixed the Mintsoft discrepancy persistence race so concurrent sync runs now collapse onto a single `OPEN` discrepancy per warehouse/category/product-or-sku.
 - Implemented the Mintsoft product sync engine with payload hashing, authoritative product reads, barcode backfill/conflict handling, `WmsProductLink` persistence, the real `mintsoft-product-verify` cron path, and realistic E2E Mintsoft product endpoints for future workflow coverage.
+- Corrected Mintsoft product writes to match the documented API shape: create via `PUT /api/Product`, update via `POST /api/Product` with `ID` in the request body, and tightened the E2E simulator so it now rejects the previously incorrect update path.
+- Moved best-effort Mintsoft product sync for IMS product edits out of the interactive submit path using Next.js `after()`, so inventory create/update no longer blocks on Mintsoft round-trips.
+- Reworked Mintsoft product verify to process eligible products in paged batches with bounded concurrency, improved JSON payload normalization for sync logs, and counted conflict rows that still pushed non-barcode Mintsoft updates as both mismatches and corrected changes.
 
 ## 1.4.1 - 2026-04-19
 

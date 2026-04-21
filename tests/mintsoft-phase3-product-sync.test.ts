@@ -2,14 +2,76 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { ProductLifecycleStatus, ProductType } from '../app/generated/prisma/client.ts'
 import * as normalizersNs from '../lib/connectors/mintsoft/api/normalizers.ts'
+import * as clientNs from '../lib/connectors/mintsoft/api/client.ts'
 import * as productSyncNs from '../lib/connectors/mintsoft/sync/product-sync.ts'
 
 const normalizers = 'default' in normalizersNs
   ? normalizersNs.default as typeof import('../lib/connectors/mintsoft/api/normalizers.ts')
   : normalizersNs
+const client = 'default' in clientNs
+  ? clientNs.default as typeof import('../lib/connectors/mintsoft/api/client.ts')
+  : clientNs
 const productSync = 'default' in productSyncNs
   ? productSyncNs.default as typeof import('../lib/connectors/mintsoft/sync/product-sync.ts')
   : productSyncNs
+
+test('buildMintsoftProductUpsertRequest matches Mintsoft create and update API docs', () => {
+  const product = {
+    sku: 'SKU-42',
+    name: 'Widget',
+    customsDescription: 'Cotton widget',
+    barcode: '5012345678900',
+    commodityCode: '902000',
+    countryOfManufacture: 'GB',
+    weightKg: 1.25,
+    heightCm: 11,
+    widthCm: 10,
+    depthCm: 12,
+    imageUrl: 'https://example.test/widget.png',
+  }
+
+  assert.deepEqual(
+    client.buildMintsoftProductUpsertRequest(product),
+    {
+      path: '/api/Product',
+      method: 'PUT',
+      body: JSON.stringify({
+        SKU: 'SKU-42',
+        Name: 'Widget',
+        CustomsDescription: 'Cotton widget',
+        EAN: '5012345678900',
+        Weight: 1.25,
+        Height: 11,
+        Width: 10,
+        Depth: 12,
+        ImageURL: 'https://example.test/widget.png',
+        CommodityCode: { Code: '902000' },
+        CountryOfManufacture: { Code: 'GB' },
+      }),
+    },
+  )
+
+  assert.deepEqual(
+    client.buildMintsoftProductUpsertRequest(product, { externalProductId: '168', omitBarcode: true }),
+    {
+      path: '/api/Product',
+      method: 'POST',
+      body: JSON.stringify({
+        ID: 168,
+        SKU: 'SKU-42',
+        Name: 'Widget',
+        CustomsDescription: 'Cotton widget',
+        Weight: 1.25,
+        Height: 11,
+        Width: 10,
+        Depth: 12,
+        ImageURL: 'https://example.test/widget.png',
+        CommodityCode: { Code: '902000' },
+        CountryOfManufacture: { Code: 'GB' },
+      }),
+    },
+  )
+})
 
 test('normalizeMintsoftProduct accepts realistic Mintsoft product payloads', () => {
   assert.deepEqual(

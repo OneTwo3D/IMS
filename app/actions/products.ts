@@ -2,6 +2,7 @@
 
 import { revalidatePath } from 'next/cache'
 import { redirect } from 'next/navigation'
+import { after } from 'next/server'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -577,6 +578,10 @@ async function syncMintsoftProductBestEffort(productId: string): Promise<void> {
   }
 }
 
+function scheduleMintsoftProductSync(productId: string) {
+  after(() => syncMintsoftProductBestEffort(productId))
+}
+
 export async function createProduct(
   _prev: ProductFormState,
   formData: FormData
@@ -682,7 +687,7 @@ export async function createProduct(
   } catch (syncError) {
     console.error(syncError)
   }
-  await syncMintsoftProductBestEffort(created.id)
+  scheduleMintsoftProductSync(created.id)
 
   revalidatePath('/inventory')
   redirect('/inventory')
@@ -803,7 +808,7 @@ export async function updateProduct(
   } catch (syncError) {
     console.error(syncError)
   }
-  await syncMintsoftProductBestEffort(id)
+  scheduleMintsoftProductSync(id)
 
   revalidatePath('/inventory')
   revalidatePath(`/inventory/${id}`)

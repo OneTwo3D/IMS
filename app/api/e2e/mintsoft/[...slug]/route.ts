@@ -186,6 +186,48 @@ function mapMintsoftProductResponse(product: FakeMintsoftProduct) {
   }
 }
 
+function readFakeMintsoftProductFields(
+  body: Record<string, unknown> | null,
+  current?: FakeMintsoftProduct,
+): FakeMintsoftProduct | null {
+  const sku = asString(body?.SKU ?? body?.sku) ?? current?.sku ?? null
+  const name = asString(body?.Name ?? body?.name) ?? current?.name ?? null
+  if (!sku || !name) return null
+
+  return {
+    id: current?.id ?? '',
+    sku,
+    name,
+    ean: Object.prototype.hasOwnProperty.call(body ?? {}, 'EAN')
+      ? asString(body?.EAN)
+      : (current?.ean ?? null),
+    customsDescription: Object.prototype.hasOwnProperty.call(body ?? {}, 'CustomsDescription')
+      ? asString(body?.CustomsDescription)
+      : (current?.customsDescription ?? null),
+    commodityCode: Object.prototype.hasOwnProperty.call(body ?? {}, 'CommodityCode')
+      ? asString((body?.CommodityCode as Record<string, unknown> | null)?.Code)
+      : (current?.commodityCode ?? null),
+    countryOfManufacture: Object.prototype.hasOwnProperty.call(body ?? {}, 'CountryOfManufacture')
+      ? asString((body?.CountryOfManufacture as Record<string, unknown> | null)?.Code)
+      : (current?.countryOfManufacture ?? null),
+    weight: Object.prototype.hasOwnProperty.call(body ?? {}, 'Weight')
+      ? (body?.Weight == null ? null : asNumber(body.Weight, 0))
+      : (current?.weight ?? null),
+    height: Object.prototype.hasOwnProperty.call(body ?? {}, 'Height')
+      ? (body?.Height == null ? null : asNumber(body.Height, 0))
+      : (current?.height ?? null),
+    width: Object.prototype.hasOwnProperty.call(body ?? {}, 'Width')
+      ? (body?.Width == null ? null : asNumber(body.Width, 0))
+      : (current?.width ?? null),
+    depth: Object.prototype.hasOwnProperty.call(body ?? {}, 'Depth')
+      ? (body?.Depth == null ? null : asNumber(body.Depth, 0))
+      : (current?.depth ?? null),
+    imageUrl: Object.prototype.hasOwnProperty.call(body ?? {}, 'ImageURL')
+      ? asString(body?.ImageURL)
+      : (current?.imageUrl ?? null),
+  }
+}
+
 async function persistFakeMintsoftState(state: FakeMintsoftState): Promise<void> {
   await db.setting.upsert({
     where: { key: E2E_MINTSOFT_STATE_KEY },
@@ -317,82 +359,20 @@ export async function POST(
     }
 
     const body = await request.json().catch(() => null) as Record<string, unknown> | null
-    const sku = asString(body?.SKU ?? body?.sku)
-    const name = asString(body?.Name ?? body?.name)
-    if (!sku || !name) {
-      return NextResponse.json({ error: 'SKU and Name are required' }, { status: 400 })
+    const productId = asString(body?.ID ?? body?.id)
+    if (!productId) {
+      return NextResponse.json({ error: 'ID is required' }, { status: 400 })
     }
 
-    const nextId = String(
-      Math.max(
-        0,
-        ...state.products
-          .map((product) => Number(product.id))
-          .filter((value) => Number.isFinite(value)),
-      ) + 1,
-    )
-    const created: FakeMintsoftProduct = {
-      id: nextId,
-      sku,
-      name,
-      ean: asString(body?.EAN ?? body?.ean),
-      customsDescription: asString(body?.CustomsDescription ?? body?.customsDescription),
-      commodityCode: asString((body?.CommodityCode as Record<string, unknown> | null)?.Code),
-      countryOfManufacture: asString((body?.CountryOfManufacture as Record<string, unknown> | null)?.Code),
-      weight: body?.Weight == null ? null : asNumber(body.Weight, 0),
-      height: body?.Height == null ? null : asNumber(body.Height, 0),
-      width: body?.Width == null ? null : asNumber(body.Width, 0),
-      depth: body?.Depth == null ? null : asNumber(body.Depth, 0),
-      imageUrl: asString(body?.ImageURL ?? body?.imageUrl),
-    }
-
-    state.products.push(created)
-    await persistFakeMintsoftState(state)
-    return NextResponse.json(mapMintsoftProductResponse(created))
-  }
-
-  if (path.startsWith('api/Product/')) {
-    if (!isAuthorized(request, state)) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-
-    const productId = path.slice('api/Product/'.length)
     const index = state.products.findIndex((entry) => entry.id === productId)
     if (index < 0) {
       return NextResponse.json({ error: 'Not found' }, { status: 404 })
     }
 
-    const body = await request.json().catch(() => null) as Record<string, unknown> | null
     const current = state.products[index]!
-    const updated: FakeMintsoftProduct = {
-      ...current,
-      sku: asString(body?.SKU ?? body?.sku) ?? current.sku,
-      name: asString(body?.Name ?? body?.name) ?? current.name,
-      customsDescription: asString(body?.CustomsDescription ?? body?.customsDescription) ?? current.customsDescription,
-      ean: Object.prototype.hasOwnProperty.call(body ?? {}, 'EAN')
-        ? asString(body?.EAN)
-        : current.ean,
-      commodityCode: Object.prototype.hasOwnProperty.call(body ?? {}, 'CommodityCode')
-        ? asString((body?.CommodityCode as Record<string, unknown> | null)?.Code)
-        : current.commodityCode,
-      countryOfManufacture: Object.prototype.hasOwnProperty.call(body ?? {}, 'CountryOfManufacture')
-        ? asString((body?.CountryOfManufacture as Record<string, unknown> | null)?.Code)
-        : current.countryOfManufacture,
-      weight: Object.prototype.hasOwnProperty.call(body ?? {}, 'Weight')
-        ? (body?.Weight == null ? null : asNumber(body.Weight, 0))
-        : current.weight,
-      height: Object.prototype.hasOwnProperty.call(body ?? {}, 'Height')
-        ? (body?.Height == null ? null : asNumber(body.Height, 0))
-        : current.height,
-      width: Object.prototype.hasOwnProperty.call(body ?? {}, 'Width')
-        ? (body?.Width == null ? null : asNumber(body.Width, 0))
-        : current.width,
-      depth: Object.prototype.hasOwnProperty.call(body ?? {}, 'Depth')
-        ? (body?.Depth == null ? null : asNumber(body.Depth, 0))
-        : current.depth,
-      imageUrl: Object.prototype.hasOwnProperty.call(body ?? {}, 'ImageURL')
-        ? asString(body?.ImageURL)
-        : current.imageUrl,
+    const updated = readFakeMintsoftProductFields(body, current)
+    if (!updated) {
+      return NextResponse.json({ error: 'SKU and Name are required' }, { status: 400 })
     }
 
     state.products[index] = updated
@@ -407,5 +387,41 @@ export async function PUT(
   request: NextRequest,
   context: { params: Promise<{ slug: string[] }> },
 ) {
-  return POST(request, context)
+  const authError = getE2eRouteAccessError(request)
+  if (authError) return authError
+
+  const state = await getFakeMintsoftState()
+  if (!state) {
+    return NextResponse.json({ error: 'Mintsoft E2E state not configured' }, { status: 503 })
+  }
+
+  const { slug } = await context.params
+  const path = slug.join('/')
+
+  if (path !== 'api/Product') {
+    return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  }
+
+  if (!isAuthorized(request, state)) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  const body = await request.json().catch(() => null) as Record<string, unknown> | null
+  const nextId = String(
+    Math.max(
+      0,
+      ...state.products
+        .map((product) => Number(product.id))
+        .filter((value) => Number.isFinite(value)),
+    ) + 1,
+  )
+  const created = readFakeMintsoftProductFields(body)
+  if (!created) {
+    return NextResponse.json({ error: 'SKU and Name are required' }, { status: 400 })
+  }
+
+  created.id = nextId
+  state.products.push(created)
+  await persistFakeMintsoftState(state)
+  return NextResponse.json(mapMintsoftProductResponse(created))
 }

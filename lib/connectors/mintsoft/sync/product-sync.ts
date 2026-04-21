@@ -12,6 +12,40 @@ const ELIGIBLE_PRODUCT_TYPES = [
   ProductType.BOM,
 ] as const
 const ELIGIBLE_PRODUCT_TYPE_SET = new Set<ProductType>(ELIGIBLE_PRODUCT_TYPES)
+const PRODUCT_VERIFY_BATCH_SIZE = 100
+const PRODUCT_SYNC_CONCURRENCY = 5
+const ELIGIBLE_PRODUCT_WHERE = {
+  type: { in: [...ELIGIBLE_PRODUCT_TYPES] },
+  lifecycleStatus: { not: ProductLifecycleStatus.ARCHIVED },
+} satisfies Prisma.ProductWhereInput
+const PRODUCT_SYNC_CANDIDATE_SELECT = {
+  id: true,
+  sku: true,
+  name: true,
+  description: true,
+  barcode: true,
+  hsCode: true,
+  countryOfOrigin: true,
+  weight: true,
+  widthCm: true,
+  heightCm: true,
+  depthCm: true,
+  imageUrl: true,
+  type: true,
+  lifecycleStatus: true,
+  wmsProductLinks: {
+    where: { connector: 'mintsoft' },
+    select: {
+      id: true,
+      externalProductId: true,
+      payloadHash: true,
+      lastKnownBarcode: true,
+      lastSyncedAt: true,
+      lastError: true,
+    },
+    take: 1,
+  },
+} satisfies Prisma.ProductSelect
 
 type MintsoftProductSyncScope = {
   warehouseId: string
@@ -74,6 +108,7 @@ type ProductSyncLineResult = {
   action: 'noop' | 'sync' | 'backfill' | 'conflict' | 'skip' | 'error'
   reason: string
   payload: Prisma.WmsSyncLogCreateManyInput['payload']
+  remoteUpdated: boolean
 }
 
 function toNullableNumber(value: Prisma.Decimal | null): number | null {
@@ -95,7 +130,31 @@ function toJsonPayload(value: unknown): Prisma.InputJsonValue {
     return {}
   }
 
-  return JSON.parse(JSON.stringify(value)) as Prisma.InputJsonValue
+  if (value instanceof Date) {
+    return value.toISOString()
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((entry) => (
+      entry === undefined
+        ? null
+        : toJsonPayload(entry)
+    )) as Prisma.InputJsonValue
+  }
+
+  if (typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, entry]) => entry !== undefined)
+        .map(([key, entry]) => [key, entry instanceof Date ? entry.toISOString() : toJsonPayload(entry)]),
+    ) as Prisma.InputJsonValue
+  }
+
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') {
+    return value
+  }
+
+  return String(value)
 }
 
 export function buildMintsoftProductDto(product: ProductSyncCandidate): WmsProductDto {
@@ -171,72 +230,22 @@ async function getMintsoftProductSyncScopes(): Promise<MintsoftProductSyncScope[
 async function getProductSyncCandidate(productId: string): Promise<ProductSyncCandidate | null> {
   return db.product.findUnique({
     where: { id: productId },
-    select: {
-      id: true,
-      sku: true,
-      name: true,
-      description: true,
-      barcode: true,
-      hsCode: true,
-      countryOfOrigin: true,
-      weight: true,
-      widthCm: true,
-      heightCm: true,
-      depthCm: true,
-      imageUrl: true,
-      type: true,
-      lifecycleStatus: true,
-      wmsProductLinks: {
-        where: { connector: 'mintsoft' },
-        select: {
-          id: true,
-          externalProductId: true,
-          payloadHash: true,
-          lastKnownBarcode: true,
-          lastSyncedAt: true,
-          lastError: true,
-        },
-        take: 1,
-      },
-    },
+    select: PRODUCT_SYNC_CANDIDATE_SELECT,
   })
 }
 
-async function listEligibleMintsoftProducts(): Promise<ProductSyncCandidate[]> {
+async function listEligibleMintsoftProductsBatch(cursorId?: string): Promise<ProductSyncCandidate[]> {
   return db.product.findMany({
-    where: {
-      type: { in: [...ELIGIBLE_PRODUCT_TYPES] },
-      lifecycleStatus: { not: ProductLifecycleStatus.ARCHIVED },
-    },
-    orderBy: { sku: 'asc' },
-    select: {
-      id: true,
-      sku: true,
-      name: true,
-      description: true,
-      barcode: true,
-      hsCode: true,
-      countryOfOrigin: true,
-      weight: true,
-      widthCm: true,
-      heightCm: true,
-      depthCm: true,
-      imageUrl: true,
-      type: true,
-      lifecycleStatus: true,
-      wmsProductLinks: {
-        where: { connector: 'mintsoft' },
-        select: {
-          id: true,
-          externalProductId: true,
-          payloadHash: true,
-          lastKnownBarcode: true,
-          lastSyncedAt: true,
-          lastError: true,
-        },
-        take: 1,
-      },
-    },
+    where: ELIGIBLE_PRODUCT_WHERE,
+    orderBy: { id: 'asc' },
+    take: PRODUCT_VERIFY_BATCH_SIZE,
+    ...(cursorId
+      ? {
+          cursor: { id: cursorId },
+          skip: 1,
+        }
+      : {}),
+    select: PRODUCT_SYNC_CANDIDATE_SELECT,
   })
 }
 
@@ -272,9 +281,9 @@ async function upsertMintsoftProductLink(params: {
     },
     update: {
       externalProductId: params.externalProductId,
-      payloadHash: params.payloadHash ?? undefined,
-      lastKnownBarcode: params.lastKnownBarcode ?? undefined,
-      metadata: params.metadata ?? undefined,
+      ...(params.payloadHash !== undefined ? { payloadHash: params.payloadHash } : {}),
+      ...(params.lastKnownBarcode !== undefined ? { lastKnownBarcode: params.lastKnownBarcode } : {}),
+      ...(params.metadata !== undefined ? { metadata: params.metadata } : {}),
       lastError: params.lastError ?? null,
       ...(params.touchLastSyncedAt ? { lastSyncedAt: new Date() } : {}),
     },
@@ -495,6 +504,7 @@ async function syncOneMintsoftProduct(
       action: 'skip',
       reason: 'Product type or lifecycle is not eligible for Mintsoft sync',
       payload: toJsonPayload(null),
+      remoteUpdated: false,
     }
   }
 
@@ -527,6 +537,7 @@ async function syncOneMintsoftProduct(
         action: 'conflict',
         reason: backfill.message,
         payload: toJsonPayload(authoritative?.raw),
+        remoteUpdated: false,
       }
     }
 
@@ -589,6 +600,7 @@ async function syncOneMintsoftProduct(
         ? 'Barcode backfilled from Mintsoft; no remote update required'
         : 'Product already matches Mintsoft payload',
       payload: toJsonPayload(authoritative?.raw),
+      remoteUpdated: false,
     }
   }
 
@@ -609,6 +621,7 @@ async function syncOneMintsoftProduct(
       action: 'conflict',
       reason: 'Barcode conflict recorded; non-barcode payload already matches Mintsoft',
       payload: toJsonPayload(authoritative?.raw),
+      remoteUpdated: false,
     }
   }
 
@@ -642,6 +655,7 @@ async function syncOneMintsoftProduct(
         ? 'Mintsoft product updated'
         : 'Mintsoft product created',
     payload: toJsonPayload(synced.raw),
+    remoteUpdated: true,
   }
 }
 
@@ -687,10 +701,96 @@ async function createProductJob(
   })
 }
 
-async function runMintsoftProductSyncBatch(
-  products: ProductSyncCandidate[],
+function emptyProductSyncCounters(): Omit<MintsoftProductSyncResult, 'jobId' | 'status' | 'skippedReason'> {
+  return {
+    totalChecked: 0,
+    matched: 0,
+    mismatched: 0,
+    corrected: 0,
+    skipped: 0,
+    errors: 0,
+  }
+}
+
+function applyProductSyncLineCounters(
+  counters: Omit<MintsoftProductSyncResult, 'jobId' | 'status' | 'skippedReason'>,
+  line: ProductSyncLineResult,
+) {
+  if (line.action === 'skip') counters.skipped += 1
+  if (line.action === 'noop') counters.matched += 1
+  if (line.action === 'conflict') counters.mismatched += 1
+  if (line.action === 'sync' || line.action === 'backfill' || line.remoteUpdated) {
+    counters.corrected += 1
+  }
+}
+
+async function processMintsoftProductChunk(params: {
+  jobId: string
+  products: ProductSyncCandidate[]
+  scopes: MintsoftProductSyncScope[]
+  connector: ReturnType<typeof getWmsConnector>
+  counters: Omit<MintsoftProductSyncResult, 'jobId' | 'status' | 'skippedReason'>
+  logs: Prisma.WmsSyncLogCreateManyInput[]
+}) {
+  const chunkResults = await Promise.all(
+    params.products.map(async (product) => {
+      try {
+        const line = await syncOneMintsoftProduct({
+          product,
+          scopes: params.scopes,
+          connector: params.connector,
+        })
+
+        return {
+          product,
+          line,
+          error: null,
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : 'Mintsoft product sync failed'
+        await recordMintsoftProductLinkError(product.id, message)
+        return {
+          product,
+          line: null,
+          error: message,
+        }
+      }
+    }),
+  )
+
+  for (const result of chunkResults) {
+    params.counters.totalChecked += 1
+
+    if (result.line) {
+      applyProductSyncLineCounters(params.counters, result.line)
+      params.logs.push({
+        jobId: params.jobId,
+        sku: result.line.sku,
+        productId: result.line.productId,
+        action: result.line.action,
+        reason: result.line.reason,
+        payload: result.line.payload,
+      })
+      continue
+    }
+
+    params.counters.errors += 1
+    params.logs.push({
+      jobId: params.jobId,
+      sku: result.product.sku,
+      productId: result.product.id,
+      action: 'error',
+      reason: result.error ?? 'Mintsoft product sync failed',
+      payload: toJsonPayload(null),
+    })
+  }
+}
+
+async function runMintsoftProductSyncJob(
+  productBatches: AsyncIterable<ProductSyncCandidate[]>,
   type: 'PRODUCT_SYNC' | 'PRODUCT_VERIFY',
   triggeredBy: string,
+  totalCandidates: number,
   summary: Prisma.InputJsonValue,
 ): Promise<MintsoftProductSyncResult> {
   const scopes = await getMintsoftProductSyncScopes()
@@ -716,51 +816,19 @@ async function runMintsoftProductSyncBatch(
     summary,
     scopes.length === 1 ? scopes[0]!.warehouseId : null,
   )
-  const counters = {
-    totalChecked: 0,
-    matched: 0,
-    mismatched: 0,
-    corrected: 0,
-    skipped: 0,
-    errors: 0,
-  }
+  const counters = emptyProductSyncCounters()
   const logs: Prisma.WmsSyncLogCreateManyInput[] = []
 
   try {
-    for (const product of products) {
-      counters.totalChecked += 1
-
-      try {
-        const line = await syncOneMintsoftProduct({
-          product,
+    for await (const batch of productBatches) {
+      for (let index = 0; index < batch.length; index += PRODUCT_SYNC_CONCURRENCY) {
+        await processMintsoftProductChunk({
+          jobId: job.id,
+          products: batch.slice(index, index + PRODUCT_SYNC_CONCURRENCY),
           scopes,
           connector,
-        })
-
-        if (line.action === 'skip') counters.skipped += 1
-        if (line.action === 'noop') counters.matched += 1
-        if (line.action === 'sync' || line.action === 'backfill') counters.corrected += 1
-        if (line.action === 'conflict') counters.mismatched += 1
-
-        logs.push({
-          jobId: job.id,
-          sku: line.sku,
-          productId: line.productId,
-          action: line.action,
-          reason: line.reason,
-          payload: line.payload,
-        })
-      } catch (error) {
-        counters.errors += 1
-        const message = error instanceof Error ? error.message : 'Mintsoft product sync failed'
-        await recordMintsoftProductLinkError(product.id, message)
-        logs.push({
-          jobId: job.id,
-          sku: product.sku,
-          productId: product.id,
-          action: 'error',
-          reason: message,
-          payload: toJsonPayload(null),
+          counters,
+          logs,
         })
       }
     }
@@ -773,6 +841,8 @@ async function runMintsoftProductSyncBatch(
     await completeProductJob(job.id, status, counters, {
       ...(summary as Prisma.InputJsonObject),
       warehouseScopes: warehouseScopeSummary,
+      concurrency: PRODUCT_SYNC_CONCURRENCY,
+      totalCandidates,
     })
 
     await logActivity({
@@ -847,7 +917,9 @@ export async function runMintsoftProductSyncForProduct(
     }
   }
 
-  return runMintsoftProductSyncBatch([product], 'PRODUCT_SYNC', triggeredBy, {
+  return runMintsoftProductSyncJob((async function* () {
+    yield [product]
+  })(), 'PRODUCT_SYNC', triggeredBy, 1, {
     mode: 'single',
     productId,
     sku: product.sku,
@@ -855,8 +927,10 @@ export async function runMintsoftProductSyncForProduct(
 }
 
 export async function runMintsoftProductVerify(triggeredBy: string): Promise<MintsoftProductSyncResult> {
-  const products = await listEligibleMintsoftProducts()
-  if (products.length === 0) {
+  const totalCandidates = await db.product.count({
+    where: ELIGIBLE_PRODUCT_WHERE,
+  })
+  if (totalCandidates === 0) {
     return {
       jobId: null,
       status: 'SKIPPED',
@@ -870,9 +944,22 @@ export async function runMintsoftProductVerify(triggeredBy: string): Promise<Min
     }
   }
 
-  return runMintsoftProductSyncBatch(products, 'PRODUCT_VERIFY', triggeredBy, {
+  return runMintsoftProductSyncJob((async function* () {
+    let cursorId: string | undefined
+    while (true) {
+      const batch = await listEligibleMintsoftProductsBatch(cursorId)
+      if (batch.length === 0) {
+        return
+      }
+
+      yield batch
+      cursorId = batch[batch.length - 1]?.id
+    }
+  })(), 'PRODUCT_VERIFY', triggeredBy, totalCandidates, {
     mode: 'verify',
-    totalCandidates: products.length,
+    totalCandidates,
+    batchSize: PRODUCT_VERIFY_BATCH_SIZE,
+    concurrency: PRODUCT_SYNC_CONCURRENCY,
   } satisfies Prisma.InputJsonObject)
 }
 
@@ -905,38 +992,10 @@ export async function runMintsoftProductVerifyForSkus(
   const products = await db.product.findMany({
     where: {
       sku: { in: normalizedSkus },
-      type: { in: [...ELIGIBLE_PRODUCT_TYPES] },
-      lifecycleStatus: { not: ProductLifecycleStatus.ARCHIVED },
+      ...ELIGIBLE_PRODUCT_WHERE,
     },
     orderBy: { sku: 'asc' },
-    select: {
-      id: true,
-      sku: true,
-      name: true,
-      description: true,
-      barcode: true,
-      hsCode: true,
-      countryOfOrigin: true,
-      weight: true,
-      widthCm: true,
-      heightCm: true,
-      depthCm: true,
-      imageUrl: true,
-      type: true,
-      lifecycleStatus: true,
-      wmsProductLinks: {
-        where: { connector: 'mintsoft' },
-        select: {
-          id: true,
-          externalProductId: true,
-          payloadHash: true,
-          lastKnownBarcode: true,
-          lastSyncedAt: true,
-          lastError: true,
-        },
-        take: 1,
-      },
-    },
+    select: PRODUCT_SYNC_CANDIDATE_SELECT,
   })
 
   if (products.length === 0) {
@@ -953,9 +1012,12 @@ export async function runMintsoftProductVerifyForSkus(
     }
   }
 
-  return runMintsoftProductSyncBatch(products, 'PRODUCT_VERIFY', triggeredBy, {
+  return runMintsoftProductSyncJob((async function* () {
+    yield products
+  })(), 'PRODUCT_VERIFY', triggeredBy, products.length, {
     mode: 'verify',
     totalCandidates: products.length,
     skuScope: normalizedSkus,
+    concurrency: PRODUCT_SYNC_CONCURRENCY,
   } satisfies Prisma.InputJsonObject)
 }
