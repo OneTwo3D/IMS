@@ -6,11 +6,20 @@ import { logActivity } from '@/lib/activity-log'
 import { getMintsoftApiConfiguration, verifyMintsoftWebhookSignature } from '@/lib/connectors/mintsoft'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
+const MAX_WEBHOOK_BODY_BYTES = 256 * 1024
+
 type MintsoftReceiptWebhookPayload = {
   eventId?: string
   id?: string | number
   asnId?: string | number
   externalAsnId?: string | number
+}
+
+class RequestBodyTooLargeError extends Error {
+  constructor() {
+    super('Request body too large')
+    this.name = 'RequestBodyTooLargeError'
+  }
 }
 
 function getExternalEventId(payload: MintsoftReceiptWebhookPayload, rawBody: string): string {
@@ -25,8 +34,55 @@ function getExternalAsnId(payload: MintsoftReceiptWebhookPayload): string | null
   return value == null ? null : `${value}`.trim() || null
 }
 
+async function readWebhookBody(request: Request, maxBytes: number): Promise<string> {
+  const contentLength = request.headers.get('content-length')
+  if (contentLength) {
+    const parsedLength = Number.parseInt(contentLength, 10)
+    if (Number.isFinite(parsedLength) && parsedLength > maxBytes) {
+      throw new RequestBodyTooLargeError()
+    }
+  }
+
+  if (!request.body) return ''
+
+  const reader = request.body.getReader()
+  const chunks: Uint8Array[] = []
+  let totalBytes = 0
+
+  while (true) {
+    const { done, value } = await reader.read()
+    if (done) break
+    if (!value) continue
+
+    totalBytes += value.byteLength
+    if (totalBytes > maxBytes) {
+      throw new RequestBodyTooLargeError()
+    }
+
+    chunks.push(value)
+  }
+
+  const buffer = new Uint8Array(totalBytes)
+  let offset = 0
+  for (const chunk of chunks) {
+    buffer.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+
+  return new TextDecoder().decode(buffer)
+}
+
 export async function POST(request: Request) {
-  const rawBody = await request.text()
+  let rawBody: string
+  try {
+    rawBody = await readWebhookBody(request, MAX_WEBHOOK_BODY_BYTES)
+  } catch (error) {
+    if (error instanceof RequestBodyTooLargeError) {
+      return NextResponse.json({ error: 'Payload too large' }, { status: 413 })
+    }
+    throw error
+  }
+
   if (!rawBody.trim()) {
     return NextResponse.json({ error: 'Empty request body' }, { status: 400 })
   }

@@ -28,6 +28,8 @@ export function MintsoftClient({ data }: Props) {
   const [isPending, startTransition] = useTransition()
   const [isConnectionDialogOpen, setIsConnectionDialogOpen] = useState(false)
   const [isBindingDialogOpen, setIsBindingDialogOpen] = useState(false)
+  const [connectionDialogKey, setConnectionDialogKey] = useState(0)
+  const [bindingDialogKey, setBindingDialogKey] = useState(0)
   const [label, setLabel] = useState(data.connection.label)
   const [baseUrl, setBaseUrl] = useState(data.connection.baseUrl)
   const [apiKey, setApiKey] = useState('')
@@ -48,6 +50,39 @@ export function MintsoftClient({ data }: Props) {
     setTimeout(() => setSaved(false), 2000)
   }
 
+  function resetConnectionForm() {
+    setLabel(data.connection.label)
+    setBaseUrl(data.connection.baseUrl)
+    setApiKey('')
+    setWebhookSecret('')
+    setOrderLookupConnector(data.connection.orderLookupConnector)
+    setActive(data.connection.active ? 'true' : 'false')
+    setConnectionDialogKey((key) => key + 1)
+  }
+
+  function resetBindingForm() {
+    setWarehouseId(data.warehouses.find((warehouse) => warehouse.active)?.id ?? '')
+    setExternalWarehouseId('')
+    setStockSyncMode('NOTIFICATION_ONLY')
+    setReturnsMode('DISABLED')
+    setSyncFrequencyMinutes('60')
+    setBindingDialogKey((key) => key + 1)
+  }
+
+  function handleConnectionDialogOpenChange(open: boolean) {
+    setIsConnectionDialogOpen(open)
+    if (!open) {
+      resetConnectionForm()
+    }
+  }
+
+  function handleBindingDialogOpenChange(open: boolean) {
+    setIsBindingDialogOpen(open)
+    if (!open) {
+      resetBindingForm()
+    }
+  }
+
   function handleSaveConnection() {
     setError('')
     startTransition(async () => {
@@ -65,7 +100,7 @@ export function MintsoftClient({ data }: Props) {
         return
       }
 
-      setIsConnectionDialogOpen(false)
+      handleConnectionDialogOpenChange(false)
       flashSaved()
       router.refresh()
     })
@@ -87,11 +122,7 @@ export function MintsoftClient({ data }: Props) {
         return
       }
 
-      setExternalWarehouseId('')
-      setStockSyncMode('NOTIFICATION_ONLY')
-      setReturnsMode('DISABLED')
-      setSyncFrequencyMinutes('60')
-      setIsBindingDialogOpen(false)
+      handleBindingDialogOpenChange(false)
       flashSaved()
       router.refresh()
     })
@@ -224,8 +255,8 @@ export function MintsoftClient({ data }: Props) {
       ) : null}
       {error ? <p className="text-sm text-destructive">{error}</p> : null}
 
-      <Dialog open={isConnectionDialogOpen} onOpenChange={setIsConnectionDialogOpen}>
-        <DialogContent className="sm:max-w-2xl">
+      <Dialog open={isConnectionDialogOpen} onOpenChange={handleConnectionDialogOpenChange}>
+        <DialogContent key={connectionDialogKey} className="sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle>Edit Mintsoft Connection</DialogTitle>
             <DialogDescription>
@@ -299,8 +330,8 @@ export function MintsoftClient({ data }: Props) {
         </DialogContent>
       </Dialog>
 
-      <Dialog open={isBindingDialogOpen} onOpenChange={setIsBindingDialogOpen}>
-        <DialogContent className="sm:max-w-2xl">
+      <Dialog open={isBindingDialogOpen} onOpenChange={handleBindingDialogOpenChange}>
+        <DialogContent key={bindingDialogKey} className="sm:max-w-2xl">
           <DialogHeader>
             <DialogTitle>Add Mintsoft Warehouse Binding</DialogTitle>
             <DialogDescription>
