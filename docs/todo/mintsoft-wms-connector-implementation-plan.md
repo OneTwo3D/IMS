@@ -22,6 +22,23 @@ The existing `docs/mintsoft-wms-connector-plan.md` is a good architectural desig
 
 ## Revision History
 
+### v3 — 2026-04-21 (Codex implementation review)
+
+Codex reviewed v2 against the live repo structure and the proposed receipt flow. Corrections rolled into this file:
+
+- **Receipt / reconciliation fixes:**
+  - Phase 6 no longer assumes a single receipt-level `skipStockMutationQty` is enough. Coverage is **per ASN line**, so receipt APIs now carry both `qtyReceived` and `coveredBySnapshotQty` per line.
+  - Webhook processing no longer calls session-gated server actions directly. The plan now requires **internal auth-free receipt helpers** (or explicit internal-bypass options) that route handlers can call safely.
+- **Order identity fixes:**
+  - Mintsoft order lookup no longer scans `ShoppingOrderLink` across "any shopping connector". That is ambiguous in multi-connector tenants. The connection now stores an explicit **`orderLookupConnector`** scope and uses that when resolving storefront order numbers.
+- **Repo-shape fixes:**
+  - Plugin toggles live under **`/settings/system?tab=plugins`**, not `settings/integrations/*`.
+  - The existing integrations UI lives under **`/sync`**, so Phase 1 now extends the current sync dashboard surface instead of inventing a parallel settings route tree.
+  - Existing settings / cron writes use **`settings.company`**, not a non-existent `settings.integrations` permission.
+  - Sidebar and onboarding touch points are now called out explicitly because the current repo still passes only WooCommerce/Xero visibility booleans into layout chrome.
+
+---
+
 ### v2 — 2026-04-20 (Codex factual review)
 
 Codex audited v1 against the real codebase. Corrections rolled into this file:
@@ -58,10 +75,10 @@ These are the already-existing utilities the new code must plug into. Do not rei
 | Product model | `prisma/schema.prisma:485-568` | Already has `barcode` (**`@unique`** — collision-sensitive), `hsCode`, `countryOfOrigin`, `weight`, `widthCm/heightCm/depthCm`, `imageUrl`, `description`. Product sync payload reuses these; barcode write path must handle unique-constraint collisions. |
 | Warehouse model | `prisma/schema.prisma:443-479` | Key on `Warehouse.code`. Do not add connector columns — use new `ExternalWmsBinding` table instead. |
 | Stock adjustment | `app/actions/stock.ts:132-242` (`applyStockAdjustment`) | Signed qty, writes `StockMovement` + updates `StockLevel`. Creates a generic cost layer at warehouse average cost (falling back to 0) on positive adjustments. **Not a drop-in replacement for PO receipt costing** — see "Costing model for alignment mode". |
-| PO receipt | `app/actions/purchase-orders.ts:1585` (`receivePurchaseOrder`) | Row-locks the PO and increments `PurchaseOrderLine.qtyReceived`, but `PurchaseReceipt.reference` is **nullable and non-unique** at `schema.prisma:918`, so the function is not idempotent on its own. Must be extended with `options.skipStockMutation` AND an external dedupe key for WMS-triggered receipts. |
+| PO receipt | `app/actions/purchase-orders.ts:1585` (`receivePurchaseOrder`) | Row-locks the PO and increments `PurchaseOrderLine.qtyReceived`, but `PurchaseReceipt.reference` is **nullable and non-unique** at `schema.prisma:918`, so the function is not idempotent on its own. Must be extended with an external dedupe key plus **per-line `coveredBySnapshotQty` handling** for WMS-triggered receipts. |
 | Transfer receipt | `app/actions/transfers.ts:459` (`receiveTransfer`) | **Receives the full transfer only** — takes only `id`, sets every line's `qtyReceived = qty`, marks transfer `RECEIVED`. Does not support partial receipts. A new `receiveTransferPartial(id, lineDeltas, options)` is required for Phase 6 ASN callback support. |
 | Activity log | `lib/activity-log.ts:51` (`logActivity`) | Every mutation must call it. Tag `'sync'` or `'inventory'`. |
-| Auth/permissions | `lib/auth/server.ts` (`requireAuth`, `requirePermission`), `lib/permissions.ts` | Use `requirePermission('sync')` on connector config and admin server actions. |
+| Auth/permissions | `lib/auth/server.ts` (`requireAuth`, `requirePermission`), `lib/permissions.ts` | Use `requirePermission('settings.company')` for connector configuration and scheduler/plugin writes, `requirePermission('sync')` for operator-facing run/report actions, and **internal helpers / bypass** for webhook-triggered receipt processing. |
 | CSV export | `lib/csv.ts` (`toCsv`, `csvResponse`) | Used by `app/api/export/*`. Mirror for `/api/export/mintsoft-sync`. |
 | Sync dashboard | `app/(dashboard)/sync/page.tsx` + `sync-dashboard.tsx` | Add a new "Mintsoft" card, category `'warehouse'`. |
 | Notifications | `lib/notifications.ts` | `notify({userId, type, title, message, actionUrl})`. |
@@ -131,14 +148,10 @@ app/api/
       asn-booked-in/route.ts               # ASN callback webhook
 
 app/(dashboard)/
-  settings/integrations/mintsoft/
-    page.tsx                               # provider-level settings (credentials, token, callback secret)
-    warehouses/
-      page.tsx                             # list bindings
-      [bindingId]/page.tsx                 # edit binding (stockSyncMode selector etc.)
+  settings/system/page.tsx                 # existing plugin-toggle and scheduler surfaces gain Mintsoft
   sync/
-    mintsoft/
-      page.tsx                             # run history, discrepancies, returns inbox
+    mintsoft-client.tsx                    # Mintsoft connector UI embedded in the existing /sync dashboard
+    page.tsx                               # page gating updated to include warehouse-category plugins
 
 components/wms-mintsoft/
   connection-form.tsx                      # credential dialog
@@ -243,6 +256,7 @@ model WmsConnection {
   label            String?
   active           Boolean  @default(true)
   baseUrl          String?
+  orderLookupConnector String? // 'woocommerce' | 'shopify'; required once >1 shopping connector is enabled
   tokenExpiresAt   DateTime?
   lastAuthAt       DateTime?
   callbackSecretId String?  // references Setting.key holding the HMAC secret
@@ -646,8 +660,8 @@ For each reported ASN line:
 4. `receiptQtyAccountedBySnapshot = min(delta, unabsorbedFromSnapshot)`.
 5. Within a transaction:
    - advance `PurchaseOrderLine.qtyReceived` (or transfer-line equivalent) by `delta` — **always**, regardless of mode.
-   - if `stockQtyToAdd > 0`: call the partial-receive variant of `receivePurchaseOrder` / `receiveTransferPartial` with `qty: stockQtyToAdd` so the FIFO layer + `PURCHASE_RECEIPT` movement only covers the portion that the snapshot has not already absorbed.
-   - if `receiptQtyAccountedBySnapshot > 0`: write a `StockMovement` of a new type `WMS_RECEIPT_RECONCILIATION` (qty 0, note `"PO receipt covered by WMS alignment snapshot: {qty}"`) for audit without affecting stock; advance `qtyAccountedViaReceipt` by `receiptQtyAccountedBySnapshot`.
+   - call the partial-receive helper with **both** `qtyReceived: delta` and `coveredBySnapshotQty: receiptQtyAccountedBySnapshot`. The helper records the full receipt quantity on the PO / transfer line, writes `PURCHASE_RECEIPT` / `TRANSFER_IN` stock only for `qtyReceived - coveredBySnapshotQty`, and writes a zero-qty `WMS_RECEIPT_RECONCILIATION` audit movement when `coveredBySnapshotQty > 0`.
+   - advance `qtyAccountedViaReceipt` by `delta` (not just the uncovered portion); otherwise the same snapshot credit could be re-used on the next callback.
    - update `lastProcessedReceivedQty = currentReceivedQty`.
 
 **Rollback on cancellation:** when a PO line or transfer line is cancelled or its qty is reduced below `qtyReceived`, the rollback path must unwind `qtyAccountedViaSnapshot` (by the cancelled portion) and emit a compensating `ADJUSTMENT` movement through `applyStockAdjustment` so the warehouse stock level doesn't drift. Add this to the existing PO cancel/reduce server actions when the PO has any active `WmsAsnLineMap` rows.
@@ -674,13 +688,17 @@ This design means Phase 2b **cannot ship** until Phase 6 is ready, because the a
 
 `applyExternalFulfillmentUpdate` at `lib/fulfillment/external-fulfillment.ts:88` resolves orders by querying `shoppingOrderLink` with `connector: source`. Because Mintsoft is not a shopping connector, no row exists with `connector: 'mintsoft'` — so a naive call with `source: 'mintsoft'` would always return null.
 
-**v2 resolution plan:**
+**v3 resolution plan:**
 
-1. Extend `resolveOrderForExternalFulfillment` (same file, lines 28-75) with a **secondary lookup for `mintsoft`**: when the source is `'mintsoft'` and the lookup is `{externalOrderNumber}` or `{orderNumber}`, it tries (a) a direct WC/Shopify `ShoppingOrderLink` match on that external order number for any shopping connector, then (b) a direct `SalesOrder.orderNumber` match. This keeps Mintsoft aligned with the existing "Mintsoft links by WC order number" assumption from `docs/todo/connector-groundwork-plan.md`.
-2. Do **not** create Mintsoft-scoped rows in `ShoppingOrderLink` — that table is for shopping connectors only. Mintsoft is a fulfillment relay, not an order source.
-3. The plan's webhook/callback code must pass `lookup: {externalOrderNumber: woOrderNumber}` (or the raw `orderNumber`), never `externalOrderId`.
+1. Add `WmsConnection.orderLookupConnector` and set it to the storefront connector Mintsoft order references belong to (`'woocommerce'` or `'shopify'`). If more than one shopping connector is enabled, this field is **required** before the Mintsoft connection can be activated.
+2. Extend `resolveOrderForExternalFulfillment` (same file, lines 28-75) with a Mintsoft-specific branch that:
+   - looks up `ShoppingOrderLink` by `connector: connection.orderLookupConnector` plus `externalOrderNumber`, and
+   - only falls back to direct `SalesOrder.orderNumber` when the payload is explicitly carrying the IMS order number.
+3. Do **not** scan `ShoppingOrderLink` across "any shopping connector". `externalOrderNumber` is indexed but not globally unique across connectors, so that approach can update the wrong order in multi-connector tenants.
+4. Do **not** create Mintsoft-scoped rows in `ShoppingOrderLink` — that table is for shopping connectors only. Mintsoft is a fulfillment relay, not an order source.
+5. The plan's webhook/callback code must pass `lookup: {externalOrderNumber: ...}` or `lookup: {orderNumber: ...}`, never `externalOrderId`.
 
-This change is small and must land in Phase 1 (connector shell) so that anything downstream can rely on it.
+This change is small but critical and must land in Phase 1 (connector shell) so that anything downstream can rely on it.
 
 ---
 
@@ -691,18 +709,18 @@ Uniform `requirePermission('sync')` is too coarse. Use this matrix in server act
 | Action | Permission |
 |---|---|
 | View connector status, bindings, logs, reports | `sync` |
-| Save credentials / base URL / webhook secret | `settings.integrations` |
-| Enable/disable Mintsoft plugin | `settings.integrations` |
-| Create / edit / delete warehouse binding | `settings.integrations` |
-| Change `stockSyncMode` (any transition) | `settings.integrations` |
+| Save credentials / base URL / webhook secret | `settings.company` |
+| Enable/disable Mintsoft plugin | `settings.company` |
+| Create / edit / delete warehouse binding | `settings.company` |
+| Change `stockSyncMode` (any transition) | `settings.company` |
 | Trigger manual sync run | `sync` |
-| Resolve stock discrepancy / barcode conflict | `inventory.edit` (fallback `sync` if the permission does not exist — confirm in `lib/permissions.ts`) |
+| Resolve stock discrepancy / barcode conflict | `inventory.edit` |
 | Create ASN from PO/transfer | `purchasing.receive` (POs) or `stock_control.transfer` (transfers) |
-| Process ASN callback (internal) | no session (webhook) — signature + `INTERNAL_ACTION_BYPASS` pattern |
+| Process ASN callback (internal) | no session (webhook) — signature + internal receipt helpers or explicit internal-bypass options |
 | Handle returns inbox action | `sales.process` |
-| Enable/disable cron jobs | `settings.integrations` |
+| Enable/disable cron jobs | `settings.company` |
 
-Verify each permission name against `lib/permissions.ts` during Phase 1; if a name doesn't exist, add it there first (do not silently degrade to `sync`).
+These names already exist in `lib/permissions.ts` today. Do not introduce a parallel `settings.integrations` permission unless the whole app adopts it consistently.
 
 ---
 
@@ -711,12 +729,12 @@ Verify each permission name against `lib/permissions.ts` during Phase 1; if a na
 The current 4-plugin shape (`woocommerce | shopify | xero | quickbooks`) is hard-coded in more places than v1 acknowledged. Every one of these must be updated:
 
 1. `lib/integration-plugins.ts` — add `'mintsoft'` to the union, `PLUGIN_SETTING_KEYS`, `DEFAULT_PLUGIN_STATE`, `isIntegrationModuleVisible` switch.
-2. Settings → Integrations page (`app/(dashboard)/settings/integrations/*`) — plugin toggle list must render Mintsoft.
-3. Onboarding flow (`app/(dashboard)/onboarding/*` / `components/onboarding/*`) — integration-picker step, if it enumerates plugins.
-4. `/sync` page gating — `app/(dashboard)/sync/page.tsx` redirects if no shopping/accounting plugin enabled; update the condition to include WMS, or make the redirect aware of warehouse-category plugins.
-5. `app/(dashboard)/sync/sync-dashboard.tsx` — category union (`'shopping' | 'accounting'`) must be extended to `'warehouse'`, and card-group rendering must handle the new category.
-6. Sidebar / layout (`components/layout/*`) — any Integration submenu that enumerates plugins.
-7. `app/api/cron/*` cron-list / status UI (`app/(dashboard)/settings/cron/*` if it exists) — new Mintsoft jobs should appear via the cron registry pattern automatically, but verify.
+2. `components/settings/integration-plugins-settings.tsx` plus `app/(dashboard)/settings/system/page.tsx` — System → Plugins is the **current** plugin-toggle surface; Mintsoft must be added there.
+3. Onboarding flow (`app/(dashboard)/onboarding/onboarding-client.tsx`, `components/onboarding/integrations-step.tsx`) — the integration-picker step currently enumerates only four plugins and has shopping/accounting exclusivity logic baked in.
+4. `/sync` page gating — `app/(dashboard)/sync/page.tsx` currently redirects when no shopping/accounting connector is enabled; update the condition to include WMS plugins.
+5. `app/(dashboard)/sync/sync-dashboard.tsx` — category union (`'shopping' | 'accounting'`) must be extended to `'warehouse'`, and connector selection / rendering must handle Mintsoft.
+6. Dashboard layout + sidebar (`app/(dashboard)/layout.tsx`, `components/layout/sidebar.tsx`) — current props only consider WooCommerce/Xero visibility, so Mintsoft would stay hidden from navigation without changes here.
+7. Scheduler UI (`app/(dashboard)/settings/system/page.tsx`) — new Mintsoft cron jobs should appear automatically via the cron registry, but the plugin-based filtering must include the new module id.
 
 Grep for each of `'woocommerce'`, `'shopify'`, `'xero'`, `'quickbooks'` as literal string tokens during Phase 1 and list every file that branches on them — every such branch is a candidate update site.
 
@@ -737,6 +755,7 @@ Phases 0–2 are the near-term target; Phases 3–7 are already sketched in `doc
 - `GET /api/Product/StockLevels?warehouseId=...` → stock feed
 - `POST /api/ASN` + callback registration
 - `GET /api/Returns` polling
+- outbound shipment / status payloads — **confirm which order identity Mintsoft emits back** (`externalOrderNumber`, storefront order number, IMS order number, or another stable field). This determines how `orderLookupConnector` is validated in Phase 1.
 - Bundle API (or confirm there is no public bundle CRUD — gates Phase 4 scope)
 
 **Output:** `docs/mintsoft-api-discovery.md` with the field mapping matrix and any gaps.
@@ -750,13 +769,15 @@ Phases 0–2 are the near-term target; Phases 3–7 are already sketched in `doc
 2. Add sensitive keys to `lib/settings-store.ts:9`: `mintsoft_api_key`, `mintsoft_webhook_secret`.
 3. Create `lib/connectors/wms/` contracts + registry as specified above.
 4. Create `lib/connectors/mintsoft/` skeleton (`api/client.ts`, `api/auth.ts`, `index.ts` exporting a stub that throws `NotImplemented` for every method).
-5. Apply Prisma migration `add_wms_connector` with all enums + tables above.
+5. Apply Prisma migration `add_wms_connector` with all enums + tables above, including `WmsConnection.orderLookupConnector`.
 6. Add `lib/cron-jobs/wms-mintsoft.ts` with `registerCronJobs([...])` for `mintsoft-stock-sync`, `mintsoft-returns-sync`, `mintsoft-product-verify` (all `defaultEnabled: false`). Import it from `lib/cron-jobs/index.ts`.
-7. Create `app/actions/wms-mintsoft.ts` with `saveConnectionSettings`, `createBinding`, `updateBinding`, `deleteBinding` — all guarded by `requirePermission('sync')`, validated with Zod, logging activity with `tag: 'sync'`.
-8. Scaffold `/settings/integrations/mintsoft/` page with empty tabs (Connection, Warehouses, Health). Use dialog forms per `feedback_dialog_forms.md`. Hide the whole route behind `isIntegrationPluginEnabled('mintsoft')`.
-9. Add a "Mintsoft" card to `app/(dashboard)/sync/sync-dashboard.tsx` in a new `category: 'warehouse'` group.
+7. Extend `lib/fulfillment/external-fulfillment.ts` so Mintsoft resolution uses `orderLookupConnector` rather than scanning every shopping connector.
+8. Create `app/actions/wms-mintsoft.ts` with `saveConnectionSettings`, `createBinding`, `updateBinding`, `deleteBinding` — configuration writes guarded by `requirePermission('settings.company')`, validated with Zod, logging activity with `tag: 'sync'`.
+9. Extend the existing System → Plugins UI (`components/settings/integration-plugins-settings.tsx`, `app/(dashboard)/settings/system/page.tsx`) so Mintsoft can be enabled/disabled there.
+10. Scaffold Mintsoft into the **existing** `/sync` dashboard surface (new Mintsoft client component plus dashboard card), not a parallel `/settings/integrations/*` tree.
+11. Update onboarding and sidebar visibility so enabling Mintsoft actually exposes Integrations in the current app shell.
 
-**Acceptance (Phase 1):** `npm run type-check`, `npm run lint`, `npx prisma migrate deploy` all pass. `/settings/integrations/mintsoft` renders with empty tabs. Plugin toggle appears and does not break other integrations.
+**Acceptance (Phase 1):** `npm run type-check`, `npm run lint`, `npx prisma migrate deploy` all pass. Mintsoft appears in `/settings/system?tab=plugins` and in `/sync` when enabled. Plugin toggle appears and does not break other integrations.
 
 ### Phase 2 — Warehouse stock sync, NOTIFICATION_ONLY mode (**the core new requirement, v1 scope**)
 
@@ -795,8 +816,8 @@ Implement one shared function `runStockSyncForBinding(bindingId, triggeredBy)` t
    - if `stockSyncMode === 'NOTIFICATION_ONLY'`:
      - **never mutate stock.** Upsert `WmsStockSnapshot.externalQty` and log a `WmsSyncLog` line with `action: 'discrepancy'` (or `'noop'` if matched).
      - open / update a `WmsStockDiscrepancy` row when categorised.
-   - if `stockSyncMode === 'ALIGN_TO_WMS'` (**Phase 2b only** — in Phase 2 this branch is dead code, guarded by the "option blocked" UI check):
-     - apply the attribution algorithm from "Reconciliation ledger (revised)": resolve the positive delta to the oldest open `WmsAsnLineMap` row(s) for `(warehouseId, productId)`; call `receivePurchaseOrder` / `receiveTransferPartial` with `qty: 0, skipStockMutationQty: 0` is NOT what we want — instead write a `StockMovement` of type `PURCHASE_RECEIPT` with `referenceType: 'WmsAsnLineMap'`, create a cost layer at `PurchaseOrderLine.unitCostBase`, increment `WmsAsnLineMap.qtyAccountedViaSnapshot`.
+    - if `stockSyncMode === 'ALIGN_TO_WMS'` (**Phase 2b only** — in Phase 2 this branch is dead code, guarded by the "option blocked" UI check):
+     - apply the attribution algorithm from "Reconciliation ledger (revised)": resolve the positive delta to the oldest open `WmsAsnLineMap` row(s) for `(warehouseId, productId)`. Do **not** force the receipt APIs through fake zero-qty calls. Instead write a `StockMovement` of type `PURCHASE_RECEIPT` with `referenceType: 'WmsAsnLineMap'`, create a cost layer at `PurchaseOrderLine.unitCostBase`, and increment `WmsAsnLineMap.qtyAccountedViaSnapshot`.
      - if no open `WmsAsnLineMap` row exists for the delta: log `RECEIPT_TIMING_CONFLICT`, no stock mutation.
      - negative delta: log discrepancy, no stock mutation.
      - log `WmsSyncLog` line with `action: 'corrected' | 'conflict'`, before/after qty, delta, reason.
@@ -922,7 +943,7 @@ Idempotency key: `asn:{sourceType}:{sourceId}`. If an `asn_create` job is retrie
 1. Read raw body.
 2. Verify signature via `connector.verifyWebhookSignature(rawBody, request.headers.get('x-mintsoft-signature'))` using HMAC-SHA256 + `timingSafeEqual` (mirror `lib/connectors/woocommerce/sync/webhook-verify.ts`).
 3. Dedupe: upsert `WmsInboundReceiptEvent {externalEventId}` — if row already `processedAt != null`, return 200 with `{dedupe: true}`.
-4. Enqueue processing (inline `await` is fine for v1).
+4. Enqueue processing (inline `await` is fine for v1), but **do not call session-gated server actions directly from the route handler**. The route must call an internal receipt service / helper that is safe for webhook use.
 
 **Handler (`lib/connectors/mintsoft/sync/booked-in-handler.ts`):**
 
@@ -934,8 +955,8 @@ Apply the per-line skip rule from "Reconciliation ledger (revised)". For each li
 4. `stockQtyToAdd = max(delta - unabsorbedFromSnapshot, 0)`.
 5. `receiptQtyAccountedBySnapshot = min(delta, unabsorbedFromSnapshot)`.
 6. Within a `$transaction`:
-   - if `sourceType === 'PURCHASE_ORDER_LINE'`: call `receivePurchaseOrder(poId, [{poLineId, qtyReceived: stockQtyToAdd, warehouseId}], {externalIdempotencyKey: "receipt:{externalAsnLineId}:{currentReceivedQty}", skipStockMutationQty: receiptQtyAccountedBySnapshot})`. **Always** advances `qtyReceived` by `delta` total (stock mutation covers only `stockQtyToAdd`). If `stockQtyToAdd === 0`, the function writes a zero-qty `WMS_RECEIPT_RECONCILIATION` audit movement and no cost layer.
-   - if `sourceType === 'STOCK_TRANSFER_LINE'`: call the new `receiveTransferPartial(transferId, [{transferLineId, qty: stockQtyToAdd, covered: receiptQtyAccountedBySnapshot}], {externalIdempotencyKey: ...})`.
+   - if `sourceType === 'PURCHASE_ORDER_LINE'`: call the internal PO-receipt helper with `[{poLineId, qtyReceived: delta, coveredBySnapshotQty: receiptQtyAccountedBySnapshot, warehouseId}]` and `externalIdempotencyKey: "receipt:{externalAsnLineId}:{currentReceivedQty}"`. The helper records the full receipt qty on the line, creates stock/cost only for `delta - coveredBySnapshotQty`, and writes a zero-qty `WMS_RECEIPT_RECONCILIATION` movement when `coveredBySnapshotQty > 0`.
+   - if `sourceType === 'STOCK_TRANSFER_LINE'`: call the new transfer helper with `[{transferLineId, qtyReceived: delta, coveredBySnapshotQty: receiptQtyAccountedBySnapshot}]` plus the same external idempotency key semantics.
    - advance `WmsAsnLineMap.qtyAccountedViaReceipt += delta`, `lastProcessedReceivedQty = currentReceivedQty`, `lastCallbackAt = now()`.
 7. After processing all lines, close the ASN if every line has `lastProcessedReceivedQty >= expectedQty`; close the PO or transfer if every IMS line is fully received.
 8. Mark `WmsInboundReceiptEvent.processedAt = now()`.
@@ -944,13 +965,14 @@ Apply the per-line skip rule from "Reconciliation ledger (revised)". For each li
 
 - **`receivePurchaseOrder` in `app/actions/purchase-orders.ts:1585`:**
   - add `options.externalIdempotencyKey?: string`. Store it on the new `PurchaseReceipt.externalKey` column (migration adds this with a partial unique index on `(externalKey) WHERE externalKey IS NOT NULL`). On retries, return the existing receipt.
-  - add `options.skipStockMutationQty?: number` (default `0`). The first `skipStockMutationQty` of the requested qty is recorded as a `WMS_RECEIPT_RECONCILIATION` movement (new `StockMovement.type` enum value) with qty 0 and `note: "covered by WMS alignment snapshot"`; the remainder flows through the normal FIFO layer / `PURCHASE_RECEIPT` path.
-  - **Never** skip `qtyReceived` increment. The PO line must always reflect the true received qty.
+  - extend each receipt line to carry `coveredBySnapshotQty?: number` (default `0`). Migration adds `PurchaseReceiptLine.coveredBySnapshotQty Decimal @default(0)` so the receipt audit trail records both the true received qty and the portion already represented in stock.
+  - create an internal helper (`receivePurchaseOrderInternal`, name flexible) that the server action and the webhook handler both use. The public server action keeps the permission check; the internal helper takes an optional `internalBypassToken` or lives outside `app/actions`.
+  - **Never** skip `qtyReceived` increment. The PO line must always reflect the true received qty. `coveredBySnapshotQty` only changes whether stock/cost movements are written for that slice.
 - **`receiveTransferPartial` (new function in `app/actions/transfers.ts`):**
-  - signature: `receiveTransferPartial(id, lines: Array<{transferLineId, qty, covered?}>, options?: {externalIdempotencyKey?})`.
+  - signature: `receiveTransferPartial(id, lines: Array<{transferLineId, qtyReceived, coveredBySnapshotQty?}>, options?: {externalIdempotencyKey?, internalBypassToken?})`.
   - mirrors `receiveTransfer`'s FIFO/cost-layer logic but scoped to the provided line deltas and with the same snapshot-covered split.
   - preserves the existing `receiveTransfer` behaviour for manual receipts — that function becomes a thin wrapper that collects all lines at full qty and calls `receiveTransferPartial`.
-- **Both** functions must include their idempotency handling at the top (row-lock + external-key lookup) so retried callbacks do not re-apply.
+- **Both** functions must include their idempotency handling at the top (row-lock + external-key lookup) so retried callbacks do not re-apply, and both must be callable from webhooks without requiring a browser session.
 
 **Acceptance (Phase 6) — the canonical partial-ASN double-booking test (run under `ALIGN_TO_WMS`, which requires Phase 2b):**
 1. Bind warehouse as `ALIGN_TO_WMS`. Create PO for 100 units, status `PO_SENT`. Create the Mintsoft ASN → one `WmsAsnLineMap` row with `expectedQty=100`.
@@ -993,14 +1015,14 @@ No core changes needed. The `'mintsoft'` source is already supported at line 5.
 
 ### Static
 
-- `cd /root/ims/onetwo3d-ims && npm run type-check` clean
+- `cd /root/ims/onetwo3d-ims-isolated && npm run type-check` clean
 - `npm run lint` clean
 - `npx prisma validate` and `npx prisma migrate dev --name add_wms_connector` succeed
 - `npx prisma generate` produces types for every new model
 
 ### Per-phase smoke tests (manual, dev server)
 
-1. **Plugin toggle**: enable Mintsoft plugin in `/settings/integrations`, confirm Mintsoft settings route becomes visible; disable and confirm it hides.
+1. **Plugin toggle**: enable Mintsoft plugin in `/settings/system?tab=plugins`, confirm Mintsoft appears in `/sync`; disable and confirm Integrations visibility updates correctly.
 2. **Binding CRUD**: create/edit/delete a binding; confirm the enforced invariant between `stockSyncMode` and `stockMasterSystem`; confirm activity log entries.
 3. **Stock sync modes**: run the cron manually via `curl -H "Authorization: Bearer $CRON_SECRET" http://localhost:3000/api/cron/mintsoft-stock-sync`; inspect `wms_sync_jobs` / `wms_sync_logs` in `npx prisma studio`; download the CSV from the run detail page.
 4. **Barcode safety**: drive all five cases (empty/empty, IMS-only, WMS-only, equal, different); confirm no overwrite path executes outside the rule.
@@ -1027,20 +1049,24 @@ Use `scripts/deploy.sh` per memory `project_production_server.md` — never ad-h
 | `lib/connectors/wms/*.ts` | **New** — generic contracts. |
 | `lib/connectors/mintsoft/**/*.ts` | **New** — Mintsoft implementation. |
 | `app/actions/wms-mintsoft.ts` | **New** — server actions. |
-| `app/actions/purchase-orders.ts:1585` | Extend `receivePurchaseOrder` with `options.externalIdempotencyKey` and `options.skipStockMutationQty` (see Phase 6). Add `PurchaseReceipt.externalKey` column with partial unique index in the same migration. |
-| `app/actions/transfers.ts:459` | Refactor `receiveTransfer` to delegate to a new `receiveTransferPartial(id, lineDeltas, options)` with the same idempotency + covered-qty parameters. Existing full-transfer receive becomes a thin wrapper. |
-| `lib/fulfillment/external-fulfillment.ts:28-75` | Extend `resolveOrderForExternalFulfillment` so `source: 'mintsoft'` with `externalOrderNumber` / `orderNumber` falls through to WC/Shopify links and direct `SalesOrder.orderNumber` match. |
+| `app/actions/purchase-orders.ts:1585` | Extend `receivePurchaseOrder` with `options.externalIdempotencyKey` plus per-line `coveredBySnapshotQty`, backed by an internal helper callable from webhooks. Add `PurchaseReceipt.externalKey` and `PurchaseReceiptLine.coveredBySnapshotQty` in the same migration. |
+| `app/actions/transfers.ts:459` | Refactor `receiveTransfer` to delegate to a new `receiveTransferPartial(id, lineDeltas, options)` with the same idempotency + per-line covered-qty parameters, and an internal webhook-safe entry path. Existing full-transfer receive becomes a thin wrapper. |
+| `lib/fulfillment/external-fulfillment.ts:28-75` | Extend `resolveOrderForExternalFulfillment` so Mintsoft uses `WmsConnection.orderLookupConnector` to scope storefront lookups instead of scanning all shopping connectors. |
 | `prisma/schema.prisma` (StockMovementType enum) | Add `WMS_RECEIPT_RECONCILIATION` enum value. |
 | `app/api/cron/mintsoft-stock-sync/route.ts` | **New** — Phase 2. |
 | `app/api/cron/mintsoft-returns-sync/route.ts` | **New** — Phase 7. |
 | `app/api/cron/mintsoft-product-verify/route.ts` | **New** — Phase 3. |
 | `app/api/webhooks/mintsoft/asn-booked-in/route.ts` | **New** — Phase 6. |
 | `app/api/export/mintsoft-sync/[jobId]/route.ts` | **New** — run report CSV. |
-| `app/(dashboard)/settings/integrations/mintsoft/**/*.tsx` | **New** — settings UI. |
-| `app/(dashboard)/sync/mintsoft/page.tsx` | **New** — sync dashboard. |
+| `components/settings/integration-plugins-settings.tsx` | Add Mintsoft plugin toggle. |
+| `app/(dashboard)/settings/system/page.tsx` | Pass Mintsoft state into the existing plugin/scheduler UI. |
+| `app/(dashboard)/sync/page.tsx` | Update gating so warehouse connectors count as Integrations. |
 | `app/(dashboard)/sync/sync-dashboard.tsx` | Add Mintsoft card in `'warehouse'` category. |
+| `app/(dashboard)/layout.tsx` | Pass aggregated integration visibility into the dashboard shell so Mintsoft can expose `/sync`. |
+| `components/layout/sidebar.tsx` | Ensure Integrations navigation appears for warehouse-category plugins too. |
+| `components/onboarding/integrations-step.tsx` | Add Mintsoft to the onboarding integration picker. |
+| `app/(dashboard)/onboarding/onboarding-client.tsx` | Update onboarding readiness logic for the new plugin. |
 | `components/wms-mintsoft/**/*.tsx` | **New** — dialogs + tables. |
-| `prisma/seed.ts` | Seed `AdjustmentReason` with `WMS_ALIGNMENT`. |
 | `CHANGELOG.md` | Entry per `feedback_versioning.md` (minor bump). |
 | `docs/mintsoft-wms-connector-plan.md` | Update with final decisions from Phase 0 discovery. |
 
