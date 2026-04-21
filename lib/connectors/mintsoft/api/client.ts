@@ -6,6 +6,12 @@ type MintsoftRequestResult<T> = {
   status: number
 }
 
+function buildMintsoftRequestUrl(path: string, baseUrl: string): URL {
+  const normalizedBaseUrl = baseUrl.endsWith('/') ? baseUrl : `${baseUrl}/`
+  const normalizedPath = path.replace(/^\/+/, '')
+  return new URL(normalizedPath, normalizedBaseUrl)
+}
+
 export async function mintsoftRequest<T>(
   path: string,
   init?: RequestInit,
@@ -19,7 +25,7 @@ export async function mintsoftRequest<T>(
     }
   }
 
-  const response = await fetch(new URL(path, config.baseUrl), {
+  const response = await fetch(buildMintsoftRequestUrl(path, config.baseUrl), {
     ...init,
     headers: {
       Accept: 'application/json',

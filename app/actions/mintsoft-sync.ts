@@ -1,6 +1,8 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
+import { Prisma } from '@/app/generated/prisma/client'
+import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
@@ -129,10 +131,36 @@ export type MintsoftBindingInput = {
   syncFrequencyMinutes?: number
 }
 
-function maskSecret(value: string, visibleChars = 6): string {
+const MintsoftConnectionInputSchema = z.object({
+  label: z.string().max(120).optional(),
+  baseUrl: z.string().min(1, 'Base URL is required.'),
+  apiKey: z.string().optional().default(''),
+  webhookSecret: z.string().optional().default(''),
+  orderLookupConnector: z.enum(['', 'woocommerce', 'shopify']).optional().default(''),
+  active: z.boolean().optional(),
+})
+
+const MintsoftBindingInputSchema = z.object({
+  id: z.string().min(1).optional(),
+  warehouseId: z.string().min(1, 'Warehouse is required.'),
+  externalWarehouseId: z.string().min(1, 'External warehouse ID is required.'),
+  active: z.boolean().optional(),
+  stockSyncMode: z.enum(['DISABLED', 'NOTIFICATION_ONLY', 'ALIGN_TO_WMS']).optional(),
+  stockMasterSystem: z.enum(['IMS', 'WMS']).optional(),
+  bundleSyncDirection: z.enum(['DISABLED', 'IMS_TO_WMS', 'WMS_TO_IMS']).optional(),
+  returnsMode: z.enum(['DISABLED', 'POLL', 'WEBHOOK']).optional(),
+  syncFrequencyMinutes: z.number().int().positive().optional(),
+})
+
+const MintsoftBindingDeleteSchema = z.string().min(1, 'Binding ID is required.')
+
+function getValidationErrorMessage(error: z.ZodError): string {
+  return error.issues[0]?.message ?? 'Invalid input.'
+}
+
+function maskSecret(value: string): string {
   if (!value) return ''
-  if (value.length <= visibleChars) return '*'.repeat(value.length)
-  return `${value.slice(0, visibleChars)}${'*'.repeat(Math.max(0, value.length - visibleChars))}`
+  return '********'
 }
 
 function mapMintsoftConnection(
@@ -215,34 +243,29 @@ function getAvailableOrderLookupConnectors(pluginState: {
 }
 
 async function ensureMintsoftConnectionId(): Promise<string> {
-  const existing = await db.wmsConnection.findUnique({
-    where: { connector: 'mintsoft' },
-    select: { id: true, orderLookupConnector: true },
-  })
-  if (existing) {
-    const inferredOrderLookupConnector = await inferMintsoftOrderLookupConnector(existing.orderLookupConnector)
-    if (!existing.orderLookupConnector && inferredOrderLookupConnector) {
-      await db.wmsConnection.update({
-        where: { id: existing.id },
-        data: { orderLookupConnector: inferredOrderLookupConnector },
-      })
-    }
-
-    return existing.id
-  }
-
   const inferredOrderLookupConnector = await inferMintsoftOrderLookupConnector()
-
-  const created = await db.wmsConnection.create({
-    data: {
+  const connection = await db.wmsConnection.upsert({
+    where: { connector: 'mintsoft' },
+    create: {
       connector: 'mintsoft',
       active: true,
       orderLookupConnector: inferredOrderLookupConnector,
     },
+    update: {},
     select: { id: true },
   })
 
-  return created.id
+  if (inferredOrderLookupConnector) {
+    await db.wmsConnection.updateMany({
+      where: {
+        id: connection.id,
+        orderLookupConnector: null,
+      },
+      data: { orderLookupConnector: inferredOrderLookupConnector },
+    })
+  }
+
+  return connection.id
 }
 
 export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData> {
@@ -313,19 +336,25 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
 }
 
 export async function saveMintsoftConnectionSettings(
-  input: MintsoftConnectionInput,
+  input: unknown,
 ): Promise<{ success: boolean; error?: string }> {
   await requireMintsoftWriteAccess()
+
+  const parsedInput = MintsoftConnectionInputSchema.safeParse(input)
+  if (!parsedInput.success) {
+    return { success: false, error: getValidationErrorMessage(parsedInput.error) }
+  }
+  const data = parsedInput.data
 
   const [existingSettings, pluginState] = await Promise.all([
     getMintsoftSettings(),
     getIntegrationPluginState(),
   ])
-  const baseUrl = normalizeMintsoftBaseUrl(input.baseUrl)
-  const apiKey = input.apiKey.trim() || existingSettings.mintsoft_api_key
-  const webhookSecret = input.webhookSecret?.trim() || existingSettings.mintsoft_webhook_secret
+  const baseUrl = normalizeMintsoftBaseUrl(data.baseUrl)
+  const apiKey = data.apiKey.trim() || existingSettings.mintsoft_api_key
+  const webhookSecret = data.webhookSecret.trim() || existingSettings.mintsoft_webhook_secret
   const availableOrderLookupConnectors = getAvailableOrderLookupConnectors(pluginState)
-  const requestedOrderLookupConnector = input.orderLookupConnector?.trim() as MintsoftOrderLookupConnector | undefined
+  const requestedOrderLookupConnector = data.orderLookupConnector.trim() as MintsoftOrderLookupConnector | undefined
   const orderLookupConnector = requestedOrderLookupConnector
     || (availableOrderLookupConnectors.length === 1 ? availableOrderLookupConnectors[0] : '')
 
@@ -341,27 +370,29 @@ export async function saveMintsoftConnectionSettings(
     return { success: false, error: 'Choose an enabled shopping connector for order lookup.' }
   }
 
-  if ((input.active ?? true) && availableOrderLookupConnectors.length > 1 && !orderLookupConnector) {
+  if ((data.active ?? true) && availableOrderLookupConnectors.length > 1 && !orderLookupConnector) {
     return { success: false, error: 'Choose the shopping connector Mintsoft order numbers belong to before activating the connection.' }
   }
 
+  const connection = await db.wmsConnection.upsert({
+    where: { connector: 'mintsoft' },
+    create: {
+      connector: 'mintsoft',
+      label: data.label?.trim() || null,
+      baseUrl,
+      orderLookupConnector: orderLookupConnector || null,
+      active: data.active ?? true,
+    },
+    update: {
+      label: data.label?.trim() || null,
+      baseUrl,
+      orderLookupConnector: orderLookupConnector || null,
+      active: data.active ?? true,
+    },
+    select: { id: true },
+  })
+
   await db.$transaction([
-    db.wmsConnection.upsert({
-      where: { connector: 'mintsoft' },
-      create: {
-        connector: 'mintsoft',
-        label: input.label?.trim() || null,
-        baseUrl,
-        orderLookupConnector: orderLookupConnector || null,
-        active: input.active ?? true,
-      },
-      update: {
-        label: input.label?.trim() || null,
-        baseUrl,
-        orderLookupConnector: orderLookupConnector || null,
-        active: input.active ?? true,
-      },
-    }),
     db.setting.upsert({
       where: { key: 'mintsoft_api_key' },
       create: { key: 'mintsoft_api_key', value: serializeSettingValue('mintsoft_api_key', apiKey) },
@@ -378,14 +409,15 @@ export async function saveMintsoftConnectionSettings(
   ])
 
   await logActivity({
-    entityType: 'SETTING',
-    tag: 'settings',
-    action: 'updated',
-      description: 'Updated Mintsoft connection settings',
-      metadata: {
-        baseUrl,
+    entityType: 'SYNC',
+    entityId: connection.id,
+    tag: 'sync',
+    action: 'mintsoft_connection_updated',
+    description: 'Updated Mintsoft connection settings',
+    metadata: {
+      baseUrl,
       orderLookupConnector: orderLookupConnector || null,
-      active: input.active ?? true,
+      active: data.active ?? true,
     },
   })
 
@@ -395,102 +427,113 @@ export async function saveMintsoftConnectionSettings(
 }
 
 export async function saveMintsoftBinding(
-  input: MintsoftBindingInput,
+  input: unknown,
 ): Promise<{ success: boolean; error?: string }> {
   await requireMintsoftWriteAccess()
 
-  if (!input.warehouseId) {
-    return { success: false, error: 'Warehouse is required.' }
+  const parsedInput = MintsoftBindingInputSchema.safeParse(input)
+  if (!parsedInput.success) {
+    return { success: false, error: getValidationErrorMessage(parsedInput.error) }
   }
+  const data = parsedInput.data
 
-  if (!input.externalWarehouseId.trim()) {
-    return { success: false, error: 'External warehouse ID is required.' }
-  }
-
-  if (input.stockSyncMode === 'ALIGN_TO_WMS') {
+  if (data.stockSyncMode === 'ALIGN_TO_WMS') {
     return { success: false, error: 'Align To WMS is not available yet.' }
   }
 
-  if (input.stockMasterSystem && input.stockMasterSystem !== 'IMS') {
+  if (data.stockMasterSystem && data.stockMasterSystem !== 'IMS') {
     return { success: false, error: 'Mintsoft bindings currently require IMS to remain the stock master.' }
   }
 
   const connectionId = await ensureMintsoftConnectionId()
-  const data = {
+  const bindingData = {
     connectionId,
-    warehouseId: input.warehouseId,
+    warehouseId: data.warehouseId,
     connector: 'mintsoft',
-    externalWarehouseId: input.externalWarehouseId.trim(),
-    active: input.active ?? true,
-    stockSyncMode: input.stockSyncMode ?? 'NOTIFICATION_ONLY',
+    externalWarehouseId: data.externalWarehouseId.trim(),
+    active: data.active ?? true,
+    stockSyncMode: data.stockSyncMode ?? 'NOTIFICATION_ONLY',
     stockMasterSystem: 'IMS' as const,
-    bundleSyncDirection: input.bundleSyncDirection ?? 'DISABLED',
-    returnsMode: input.returnsMode ?? 'DISABLED',
-    syncFrequencyMinutes: Math.max(1, Math.trunc(input.syncFrequencyMinutes ?? 60)),
+    bundleSyncDirection: data.bundleSyncDirection ?? 'DISABLED',
+    returnsMode: data.returnsMode ?? 'DISABLED',
+    syncFrequencyMinutes: Math.max(1, Math.trunc(data.syncFrequencyMinutes ?? 60)),
   } as const
 
   try {
-    if (input.id) {
+    let bindingId: string
+
+    if (data.id) {
       const existingBinding = await db.externalWmsBinding.findFirst({
-        where: { id: input.id, connector: 'mintsoft' },
+        where: { id: data.id, connector: 'mintsoft' },
         select: { id: true },
       })
       if (!existingBinding) {
         return { success: false, error: 'Mintsoft binding not found.' }
       }
 
-      await db.externalWmsBinding.update({
+      const binding = await db.externalWmsBinding.update({
         where: { id: existingBinding.id },
-        data,
+        data: bindingData,
+        select: { id: true },
       })
+      bindingId = binding.id
     } else {
-      await db.externalWmsBinding.create({
-        data,
+      const binding = await db.externalWmsBinding.create({
+        data: bindingData,
+        select: { id: true },
       })
+      bindingId = binding.id
     }
+
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: bindingId,
+      tag: 'sync',
+      action: data.id ? 'mintsoft_binding_updated' : 'mintsoft_binding_created',
+      description: data.id ? 'Updated Mintsoft warehouse binding' : 'Created Mintsoft warehouse binding',
+      metadata: {
+        warehouseId: data.warehouseId,
+        externalWarehouseId: data.externalWarehouseId.trim(),
+        stockSyncMode: bindingData.stockSyncMode,
+        returnsMode: bindingData.returnsMode,
+      },
+    })
   } catch (error) {
-    if (error instanceof Error && /unique constraint|Unique constraint/i.test(error.message)) {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002') {
       return { success: false, error: 'This warehouse or Mintsoft warehouse ID is already bound.' }
     }
 
     throw error
   }
 
-  await logActivity({
-    entityType: 'SETTING',
-    tag: 'settings',
-    action: input.id ? 'updated' : 'created',
-    description: input.id ? 'Updated Mintsoft warehouse binding' : 'Created Mintsoft warehouse binding',
-    metadata: {
-      warehouseId: input.warehouseId,
-      externalWarehouseId: input.externalWarehouseId.trim(),
-      stockSyncMode: data.stockSyncMode,
-      returnsMode: data.returnsMode,
-    },
-  })
-
   revalidatePath('/sync')
   return { success: true }
 }
 
 export async function deleteMintsoftBinding(
-  id: string,
+  id: unknown,
 ): Promise<{ success: boolean; error?: string }> {
   await requireMintsoftWriteAccess()
 
+  const parsedId = MintsoftBindingDeleteSchema.safeParse(id)
+  if (!parsedId.success) {
+    return { success: false, error: getValidationErrorMessage(parsedId.error) }
+  }
+
   const result = await db.externalWmsBinding.deleteMany({
-    where: { id, connector: 'mintsoft' },
+    where: { id: parsedId.data, connector: 'mintsoft' },
   })
   if (result.count === 0) {
     return { success: false, error: 'Binding not found.' }
   }
 
   await logActivity({
-    entityType: 'SETTING',
-    tag: 'settings',
-    action: 'deleted',
+    entityType: 'SYNC',
+    entityId: parsedId.data,
+    tag: 'sync',
+    action: 'mintsoft_binding_deleted',
     description: 'Deleted Mintsoft warehouse binding',
-    metadata: { id },
+    metadata: { id: parsedId.data },
   })
 
   revalidatePath('/sync')

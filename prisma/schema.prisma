@@ -475,6 +475,11 @@ model Warehouse {
   orderAllocations      OrderAllocation[]
   shipments             Shipment[]
   wmsBindings           ExternalWmsBinding[]
+  wmsAsnMaps            WmsAsnMap[]            @relation("WmsAsnMapWarehouse")
+  wmsSyncJobs           WmsSyncJob[]           @relation("WmsSyncJobWarehouse")
+  wmsStockSnapshots     WmsStockSnapshot[]     @relation("WmsStockSnapshotWarehouse")
+  wmsStockDiscrepancies WmsStockDiscrepancy[]  @relation("WmsStockDiscrepancyWarehouse")
+  wmsReturnsInbox       WmsReturnsInbox[]      @relation("WmsReturnsInboxWarehouse")
 
   @@map("warehouses")
 }
@@ -565,6 +570,11 @@ model Product {
   shoppingLinks    ShoppingProductLink[]
   wmsProductLinks  WmsProductLink[]
   wmsBundleLinks   WmsBundleLink[]
+  wmsAsnLineMaps   WmsAsnLineMap[]       @relation("WmsAsnLineMapProduct")
+  wmsSyncLogs      WmsSyncLog[]          @relation("WmsSyncLogProduct")
+  wmsStockSnapshots WmsStockSnapshot[]   @relation("WmsStockSnapshotProduct")
+  wmsStockDiscrepancies WmsStockDiscrepancy[] @relation("WmsStockDiscrepancyProduct")
+  wmsReturnsInbox  WmsReturnsInbox[]     @relation("WmsReturnsInboxProduct")
 
   @@index([parentId])
   @@map("products")
@@ -1128,6 +1138,7 @@ model SalesOrder {
   allocations       OrderAllocation[]
   shipments         Shipment[]
   shoppingLinks     ShoppingOrderLink[]
+  wmsReturnsInbox   WmsReturnsInbox[] @relation("WmsReturnsInboxOrder")
 
   @@index([externalOrderId])
   @@index([status])
@@ -1794,6 +1805,7 @@ model WmsAsnMap {
   updatedAt      DateTime @updatedAt
 
   lines          WmsAsnLineMap[]
+  warehouse      Warehouse @relation("WmsAsnMapWarehouse", fields: [warehouseId], references: [id], onDelete: Restrict)
 
   @@unique([connector, externalAsnId])
   @@index([sourceType, sourceId])
@@ -1815,6 +1827,7 @@ model WmsAsnLineMap {
   lastCallbackAt         DateTime?
 
   asn                    WmsAsnMap @relation(fields: [asnMapId], references: [id], onDelete: Cascade)
+  product                Product   @relation("WmsAsnLineMapProduct", fields: [productId], references: [id], onDelete: Restrict)
 
   @@unique([asnMapId, externalAsnLineId])
   @@index([sourceType, sourceLineId])
@@ -1841,6 +1854,7 @@ model WmsSyncJob {
   createdAt    DateTime         @default(now())
 
   lines        WmsSyncLog[]
+  warehouse    Warehouse?       @relation("WmsSyncJobWarehouse", fields: [warehouseId], references: [id], onDelete: SetNull)
 
   @@index([connector, type, status, startedAt])
   @@map("wms_sync_jobs")
@@ -1860,6 +1874,7 @@ model WmsSyncLog {
   payload      Json?
 
   job          WmsSyncJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  product      Product?   @relation("WmsSyncLogProduct", fields: [productId], references: [id], onDelete: SetNull)
 
   @@index([jobId])
   @@map("wms_sync_logs")
@@ -1874,6 +1889,9 @@ model WmsStockSnapshot {
   imsQtyAtSync Decimal  @db.Decimal(12, 4)
   lastSeenAt   DateTime
   updatedAt    DateTime @updatedAt
+
+  warehouse    Warehouse @relation("WmsStockSnapshotWarehouse", fields: [warehouseId], references: [id], onDelete: Cascade)
+  product      Product   @relation("WmsStockSnapshotProduct", fields: [productId], references: [id], onDelete: Cascade)
 
   @@unique([connector, warehouseId, productId])
   @@index([warehouseId, productId])
@@ -1898,6 +1916,9 @@ model WmsStockDiscrepancy {
   resolvedAt     DateTime?
   resolvedBy     String?
   resolvedNote   String?
+
+  warehouse      Warehouse            @relation("WmsStockDiscrepancyWarehouse", fields: [warehouseId], references: [id], onDelete: Cascade)
+  product        Product?             @relation("WmsStockDiscrepancyProduct", fields: [productId], references: [id], onDelete: SetNull)
 
   @@index([connector, status, category])
   @@index([productId])
@@ -1938,6 +1959,10 @@ model WmsReturnsInbox {
   resolutionNote   String?
   createdAt        DateTime              @default(now())
   updatedAt        DateTime              @updatedAt
+
+  order            SalesOrder?           @relation("WmsReturnsInboxOrder", fields: [orderId], references: [id], onDelete: SetNull)
+  product          Product?              @relation("WmsReturnsInboxProduct", fields: [productId], references: [id], onDelete: SetNull)
+  warehouse        Warehouse?            @relation("WmsReturnsInboxWarehouse", fields: [warehouseId], references: [id], onDelete: SetNull)
 
   @@unique([connector, externalReturnId])
   @@index([status, connector])

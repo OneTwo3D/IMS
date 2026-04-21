@@ -48,6 +48,12 @@ export async function resolveOrderForExternalFulfillment(
   }
 
   if ('externalOrderId' in lookup) {
+    if (source === 'mintsoft') {
+      // Mintsoft order IDs are Mintsoft's own internal identifiers, not the
+      // storefront order IDs stored on shopping_order_links.
+      return null
+    }
+
     const connector = await resolveShoppingConnectorForSource(source)
     if (!connector) return null
 

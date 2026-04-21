@@ -1,7 +1,8 @@
 import { createHash } from 'crypto'
 import { NextResponse } from 'next/server'
-import type { Prisma } from '@/app/generated/prisma/client'
+import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 import { getMintsoftApiConfiguration, verifyMintsoftWebhookSignature } from '@/lib/connectors/mintsoft'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
@@ -25,23 +26,28 @@ function getExternalAsnId(payload: MintsoftReceiptWebhookPayload): string | null
 }
 
 export async function POST(request: Request) {
-  if (!(await isIntegrationPluginEnabled('mintsoft'))) {
-    return NextResponse.json({ skipped: true, reason: 'Mintsoft plugin disabled' }, { status: 404 })
-  }
-
   const rawBody = await request.text()
   if (!rawBody.trim()) {
     return NextResponse.json({ error: 'Empty request body' }, { status: 400 })
   }
 
   const signatureHeader = request.headers.get('x-mintsoft-signature')
+  const isPluginEnabled = await isIntegrationPluginEnabled('mintsoft')
   const { webhookSecret } = await getMintsoftApiConfiguration()
-  if (!webhookSecret) {
-    return NextResponse.json({ error: 'Mintsoft webhook secret is not configured' }, { status: 503 })
-  }
-
-  if (!verifyMintsoftWebhookSignature(rawBody, signatureHeader, webhookSecret)) {
-    return NextResponse.json({ error: 'Invalid Mintsoft webhook signature' }, { status: 401 })
+  if (!isPluginEnabled || !webhookSecret || !verifyMintsoftWebhookSignature(rawBody, signatureHeader, webhookSecret)) {
+    await logActivity({
+      entityType: 'SYNC',
+      tag: 'sync',
+      action: 'mintsoft_webhook_rejected',
+      level: 'WARNING',
+      description: 'Rejected Mintsoft ASN webhook request',
+      metadata: {
+        pluginEnabled: isPluginEnabled,
+        hasWebhookSecret: Boolean(webhookSecret),
+      },
+      resolveUser: false,
+    })
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
   let payload: MintsoftReceiptWebhookPayload
@@ -53,26 +59,111 @@ export async function POST(request: Request) {
 
   const externalEventId = getExternalEventId(payload, rawBody)
   const externalAsnId = getExternalAsnId(payload)
-
-  await db.wmsInboundReceiptEvent.upsert({
+  const existing = await db.wmsInboundReceiptEvent.findUnique({
     where: {
       connector_externalEventId: {
         connector: 'mintsoft',
         externalEventId,
       },
     },
-    create: {
-      connector: 'mintsoft',
+    select: { id: true, processedAt: true },
+  })
+
+  if (existing?.processedAt) {
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: existing.id,
+      tag: 'sync',
+      action: 'mintsoft_webhook_duplicate_ignored',
+      description: 'Ignored duplicate Mintsoft ASN webhook after successful processing',
+      metadata: { externalEventId, externalAsnId },
+      resolveUser: false,
+    })
+    return NextResponse.json({
+      accepted: true,
+      duplicate: true,
       externalEventId,
       externalAsnId,
-      payload: payload as Prisma.InputJsonValue,
-    },
-    update: {
-      externalAsnId,
-      payload: payload as Prisma.InputJsonValue,
-      processingError: null,
-    },
-  })
+    })
+  }
+
+  if (existing) {
+    const event = await db.wmsInboundReceiptEvent.update({
+      where: { id: existing.id },
+      data: {
+        externalAsnId,
+        payload: payload as Prisma.InputJsonValue,
+        processingError: null,
+      },
+      select: { id: true },
+    })
+
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: event.id,
+      tag: 'sync',
+      action: 'mintsoft_webhook_event_updated',
+      description: 'Updated pending Mintsoft ASN webhook event payload',
+      metadata: { externalEventId, externalAsnId },
+      resolveUser: false,
+    })
+  } else {
+    try {
+      const event = await db.wmsInboundReceiptEvent.create({
+        data: {
+          connector: 'mintsoft',
+          externalEventId,
+          externalAsnId,
+          payload: payload as Prisma.InputJsonValue,
+        },
+        select: { id: true },
+      })
+
+      await logActivity({
+        entityType: 'SYNC',
+        entityId: event.id,
+        tag: 'sync',
+        action: 'mintsoft_webhook_event_created',
+        description: 'Recorded Mintsoft ASN webhook event',
+        metadata: { externalEventId, externalAsnId },
+        resolveUser: false,
+      })
+    } catch (error) {
+      if (
+        error instanceof Prisma.PrismaClientKnownRequestError
+        && error.code === 'P2002'
+      ) {
+        const concurrent = await db.wmsInboundReceiptEvent.findUnique({
+          where: {
+            connector_externalEventId: {
+              connector: 'mintsoft',
+              externalEventId,
+            },
+          },
+          select: { processedAt: true },
+        })
+
+        if (concurrent?.processedAt) {
+          await logActivity({
+            entityType: 'SYNC',
+            tag: 'sync',
+            action: 'mintsoft_webhook_duplicate_ignored',
+            description: 'Ignored duplicate Mintsoft ASN webhook after concurrent processing',
+            metadata: { externalEventId, externalAsnId },
+            resolveUser: false,
+          })
+          return NextResponse.json({
+            accepted: true,
+            duplicate: true,
+            externalEventId,
+            externalAsnId,
+          })
+        }
+      } else {
+        throw error
+      }
+    }
+  }
 
   return NextResponse.json({
     accepted: true,
