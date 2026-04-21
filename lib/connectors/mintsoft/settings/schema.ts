@@ -2,16 +2,22 @@ import { getSettingValues } from '@/lib/settings-store'
 
 export type MintsoftSettings = {
   mintsoft_api_key: string
+  mintsoft_username: string
+  mintsoft_password: string
   mintsoft_webhook_secret: string
 }
 
 export const MINTSOFT_SETTING_KEYS = [
   'mintsoft_api_key',
+  'mintsoft_username',
+  'mintsoft_password',
   'mintsoft_webhook_secret',
 ] as const
 
 const MINTSOFT_DEFAULTS: MintsoftSettings = {
   mintsoft_api_key: '',
+  mintsoft_username: '',
+  mintsoft_password: '',
   mintsoft_webhook_secret: '',
 }
 

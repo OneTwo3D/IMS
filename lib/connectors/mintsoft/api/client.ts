@@ -1,4 +1,4 @@
-import { getMintsoftApiConfiguration } from './auth'
+import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
 import type { WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   extractMintsoftArrayPayload,
@@ -61,7 +61,7 @@ export async function mintsoftRequest<T>(
   init?: RequestInit,
 ): Promise<MintsoftRequestResult<T>> {
   const config = await getMintsoftApiConfiguration()
-  if (!config.baseUrl || !config.apiKey) {
+  if (!config.baseUrl) {
     return {
       data: null,
       error: 'Mintsoft connection is not configured',
@@ -69,7 +69,23 @@ export async function mintsoftRequest<T>(
     }
   }
 
-  return sendMintsoftRequest(path, config.baseUrl, config.apiKey, init)
+  try {
+    const apiKey = await getMintsoftAccessToken()
+    const firstAttempt = await sendMintsoftRequest<T>(path, config.baseUrl, apiKey, init)
+    if (firstAttempt.status !== 401) {
+      return firstAttempt
+    }
+
+    await invalidateMintsoftAccessToken()
+    const refreshedApiKey = await getMintsoftAccessToken({ forceRefresh: true })
+    return sendMintsoftRequest<T>(path, config.baseUrl, refreshedApiKey, init)
+  } catch (error) {
+    return {
+      data: null,
+      error: error instanceof Error ? error.message : 'Mintsoft request failed',
+      status: 500,
+    }
+  }
 }
 
 export async function fetchMintsoftWarehouses(): Promise<WmsWarehouseRef[]> {

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
+import { getE2eRouteAccessError } from '@/lib/testing/e2e-route-guard'
 
 type SeedNotification = {
   userEmail?: string | null
@@ -11,9 +12,8 @@ type SeedNotification = {
 }
 
 export async function POST(request: NextRequest) {
-  if (process.env.NODE_ENV !== 'development') {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  }
+  const authError = getE2eRouteAccessError(request)
+  if (authError) return authError
 
   const session = await auth()
   if (!session?.user?.id || (session.user as { role?: string }).role !== 'ADMIN') {

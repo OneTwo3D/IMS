@@ -31,6 +31,8 @@ test.describe('Mintsoft integration workflows', () => {
       reset: true,
       pluginEnabled: false,
       apiKey: null,
+      username: null,
+      password: null,
       webhookSecret: null,
       fakeState: null,
       clearNotificationsForUserEmail: E2E_ADMIN_EMAIL,
@@ -44,6 +46,8 @@ test.describe('Mintsoft integration workflows', () => {
         reset: true,
         pluginEnabled: false,
         apiKey: null,
+        username: null,
+        password: null,
         webhookSecret: null,
         fakeState: null,
         clearNotificationsForUserEmail: E2E_ADMIN_EMAIL,
@@ -111,7 +115,8 @@ test.describe('Mintsoft integration workflows', () => {
       await page.getByRole('button', { name: 'Edit Connection' }).click()
       const connectionDialog = page.getByRole('dialog', { name: 'Edit Mintsoft Connection' })
       await fieldByLabel(connectionDialog, 'Base URL').fill(`${APP_BASE_URL}/api/e2e/mintsoft`)
-      await fieldByLabel(connectionDialog, 'API Key').fill('e2e-static-ms-apikey')
+      await fieldByLabel(connectionDialog, 'Username').fill('mintsoft.e2e.user')
+      await fieldByLabel(connectionDialog, 'Password').fill('mintsoft.e2e.password')
       await fieldByLabel(connectionDialog, 'Webhook Secret').fill('e2e-mintsoft-webhook-secret')
       await connectionDialog.getByRole('button', { name: 'Save Connection' }).click()
 
@@ -196,6 +201,8 @@ test.describe('Mintsoft integration workflows', () => {
         clearWarehouseCodes: [warehouseCode],
         pluginEnabled: false,
         apiKey: null,
+        username: null,
+        password: null,
         webhookSecret: null,
         fakeState: null,
         clearNotificationsForUserEmail: E2E_ADMIN_EMAIL,

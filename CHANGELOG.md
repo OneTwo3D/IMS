@@ -19,7 +19,7 @@ This repository uses an `x.y.z` release scheme.
 - Landed the Mintsoft connector foundation, WMS registry wiring, cron registration scaffolding, encrypted Mintsoft secret storage, and Mintsoft-specific order-lookup support.
 - Hardened Mintsoft webhook intake with request-size guards, timing-safe HMAC verification, retry-safe event persistence, and targeted regression coverage for signature handling and concurrent idempotency.
 - Implemented the Phase 2 Mintsoft stock polling engine, cron execution path, discrepancy/snapshot/job persistence, soft deactivation handover rows, and pure helper coverage for response normalization and threshold handling.
-- Fixed Mintsoft API authentication to exchange stored credentials for a short-lived request token, persist auth timing metadata, and retry once after a 401 before surfacing the failure.
+- Implemented Mintsoft's current authentication flow: store username/password, renew the 24-hour API key through `/api/Auth`, persist auth timing metadata, and retry once after a 401 before surfacing the failure.
 - Fixed Mintsoft notification-only stock sync so SKUs missing from the Mintsoft feed now raise `MISSING_IN_WMS` discrepancies instead of silently disappearing from review.
 
 ## 1.4.1 - 2026-04-19

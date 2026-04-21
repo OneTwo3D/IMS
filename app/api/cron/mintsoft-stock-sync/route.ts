@@ -36,9 +36,10 @@ export async function GET(request: Request) {
     isMintsoftBindingDue(binding.lastStockSyncAt, binding.syncFrequencyMinutes)
   ))
 
-  const results = await Promise.all(dueBindings.map((binding) => (
-    runStockSyncForBinding(binding.id, 'cron')
-  )))
+  const results = []
+  for (const binding of dueBindings) {
+    results.push(await runStockSyncForBinding(binding.id, 'cron'))
+  }
 
   return NextResponse.json({
     ran: results.length,

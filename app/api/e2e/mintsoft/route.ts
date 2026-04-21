@@ -2,10 +2,13 @@ import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { runStockSyncForBinding } from '@/lib/connectors/mintsoft/sync/stock-sync'
 import { serializeSettingValue } from '@/lib/settings-store'
+import { getE2eRouteAccessError } from '@/lib/testing/e2e-route-guard'
 
 const E2E_MINTSOFT_STATE_KEY = 'e2e_mintsoft_state'
 const PLUGIN_MINTSOFT_ENABLED_KEY = 'plugin_mintsoft_enabled'
 const MINTSOFT_API_KEY = 'mintsoft_api_key'
+const MINTSOFT_PASSWORD = 'mintsoft_password'
+const MINTSOFT_USERNAME = 'mintsoft_username'
 const MINTSOFT_WEBHOOK_SECRET = 'mintsoft_webhook_secret'
 
 type SeedProduct = {
@@ -18,13 +21,6 @@ type SeedProduct = {
 type SeedWarehouse = {
   code: string
   name?: string
-}
-
-function getE2eAvailabilityError() {
-  if (process.env.NODE_ENV !== 'development') {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  }
-  return null
 }
 
 async function resetMintsoftPersistence() {
@@ -160,7 +156,7 @@ async function seedWarehouses(warehouses: SeedWarehouse[]) {
 }
 
 export async function GET(request: NextRequest) {
-  const authError = getE2eAvailabilityError()
+  const authError = getE2eRouteAccessError(request)
   if (authError) return authError
 
   if (request.nextUrl.searchParams.get('summary') === '1') {
@@ -242,13 +238,15 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
-  const authError = getE2eAvailabilityError()
+  const authError = getE2eRouteAccessError(request)
   if (authError) return authError
 
   const body = await request.json() as {
     reset?: boolean
     pluginEnabled?: boolean
     apiKey?: string | null
+    username?: string | null
+    password?: string | null
     webhookSecret?: string | null
     fakeState?: Record<string, unknown> | null
     warehouses?: SeedWarehouse[]
@@ -293,6 +291,30 @@ export async function POST(request: NextRequest) {
 
   if (body.apiKey === null) {
     await db.setting.deleteMany({ where: { key: MINTSOFT_API_KEY } })
+  }
+
+  if (typeof body.username === 'string') {
+    await db.setting.upsert({
+      where: { key: MINTSOFT_USERNAME },
+      create: { key: MINTSOFT_USERNAME, value: serializeSettingValue(MINTSOFT_USERNAME, body.username) },
+      update: { value: serializeSettingValue(MINTSOFT_USERNAME, body.username) },
+    })
+  }
+
+  if (body.username === null) {
+    await db.setting.deleteMany({ where: { key: MINTSOFT_USERNAME } })
+  }
+
+  if (typeof body.password === 'string') {
+    await db.setting.upsert({
+      where: { key: MINTSOFT_PASSWORD },
+      create: { key: MINTSOFT_PASSWORD, value: serializeSettingValue(MINTSOFT_PASSWORD, body.password) },
+      update: { value: serializeSettingValue(MINTSOFT_PASSWORD, body.password) },
+    })
+  }
+
+  if (body.password === null) {
+    await db.setting.deleteMany({ where: { key: MINTSOFT_PASSWORD } })
   }
 
   if (typeof body.webhookSecret === 'string') {

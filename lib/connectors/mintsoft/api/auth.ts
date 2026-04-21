@@ -3,10 +3,10 @@ import { db } from '@/lib/db'
 import { getMintsoftSettings } from '@/lib/connectors/mintsoft/settings/schema'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 
-export const MINTSOFT_AUTH_TOKEN_KEY = 'mintsoft_auth_token'
+export const MINTSOFT_AUTH_TOKEN_KEY = 'mintsoft_api_key'
 
-const AUTH_TOKEN_TTL_MS = 23 * 60 * 60 * 1000
-const AUTH_TOKEN_REFRESH_BUFFER_MS = 5 * 60 * 1000
+const AUTH_TOKEN_TTL_MS = 24 * 60 * 60 * 1000
+const AUTH_TOKEN_REFRESH_BUFFER_MS = 15 * 60 * 1000
 
 let mintsoftAuthRefreshInFlight: Promise<string> | null = null
 
@@ -56,40 +56,18 @@ function getFirstString(record: Record<string, unknown>, keys: readonly string[]
   return null
 }
 
-function getFirstDate(record: Record<string, unknown>, keys: readonly string[]): Date | null {
-  for (const key of keys) {
-    const value = record[key]
-    if (typeof value !== 'string' || !value.trim()) continue
-
-    const parsed = new Date(value)
-    if (!Number.isNaN(parsed.getTime())) return parsed
-  }
-
-  return null
-}
-
-export function extractMintsoftAuthSession(value: unknown): { token: string; expiresAt: Date | null } | null {
+export function extractMintsoftAuthToken(value: unknown): string | null {
   if (typeof value === 'string' && value.trim()) {
-    return {
-      token: value.trim(),
-      expiresAt: null,
-    }
+    return value.trim()
   }
 
   const record = asRecord(value)
   if (!record) return null
 
-  const token = getFirstString(record, ['token', 'Token', 'accessToken', 'AccessToken', 'jwt', 'Jwt', 'key', 'Key'])
-  if (!token) return null
-
-  return {
-    token,
-    expiresAt: getFirstDate(record, ['expiresAt', 'ExpiresAt', 'expiry', 'Expiry', 'validTo', 'ValidTo']),
-  }
+  return getFirstString(record, ['apiKey', 'ApiKey', 'key', 'Key', 'token', 'Token', 'accessToken', 'AccessToken'])
 }
 
-function getMintsoftAuthExpiry(expiresAt: Date | null, now = Date.now()): Date {
-  if (expiresAt && !Number.isNaN(expiresAt.getTime())) return expiresAt
+function getMintsoftAuthExpiry(now = Date.now()): Date {
   return new Date(now + AUTH_TOKEN_TTL_MS)
 }
 
@@ -127,15 +105,21 @@ async function persistMintsoftAuthSession(token: string, expiresAt: Date): Promi
   ])
 }
 
-async function requestMintsoftAuthSession(baseUrl: string, apiKey: string): Promise<{ token: string; expiresAt: Date }> {
+async function requestMintsoftAuthSession(
+  baseUrl: string,
+  username: string,
+  password: string,
+): Promise<{ token: string; expiresAt: Date }> {
   const response = await fetch(buildMintsoftRequestUrl('/api/Auth', baseUrl), {
     method: 'POST',
     headers: {
       Accept: 'application/json, text/plain;q=0.9',
-      Authorization: `Bearer ${apiKey}`,
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({ apiKey }),
+    body: JSON.stringify({
+      Username: username,
+      Password: password,
+    }),
     cache: 'no-store',
   })
 
@@ -157,14 +141,14 @@ async function requestMintsoftAuthSession(baseUrl: string, apiKey: string): Prom
     throw new Error(`Mintsoft auth failed with status ${response.status}${details}`)
   }
 
-  const session = extractMintsoftAuthSession(parsedBody)
-  if (!session?.token) {
-    throw new Error('Mintsoft auth response did not include a token')
+  const token = extractMintsoftAuthToken(parsedBody)
+  if (!token) {
+    throw new Error('Mintsoft auth response did not include an API key')
   }
 
   return {
-    token: session.token,
-    expiresAt: getMintsoftAuthExpiry(session.expiresAt),
+    token,
+    expiresAt: getMintsoftAuthExpiry(),
   }
 }
 
@@ -182,7 +166,8 @@ export async function getMintsoftApiConfiguration() {
 
   return {
     baseUrl: normalizeMintsoftBaseUrl(connection?.baseUrl ?? '') ?? '',
-    apiKey: settings.mintsoft_api_key.trim(),
+    username: settings.mintsoft_username.trim(),
+    password: settings.mintsoft_password.trim(),
     webhookSecret: settings.mintsoft_webhook_secret.trim(),
     orderLookupConnector: connection?.orderLookupConnector ?? null,
   }
@@ -197,7 +182,10 @@ export async function invalidateMintsoftAccessToken(): Promise<void> {
     }),
     db.wmsConnection.updateMany({
       where: { connector: 'mintsoft' },
-      data: { tokenExpiresAt: null },
+      data: {
+        tokenExpiresAt: null,
+        lastAuthAt: null,
+      },
     }),
   ])
 }
@@ -210,7 +198,7 @@ export async function getMintsoftAccessToken(options?: { forceRefresh?: boolean 
     getSettingValue(MINTSOFT_AUTH_TOKEN_KEY),
   ])
 
-  if (!config.baseUrl || !config.apiKey) {
+  if (!config.baseUrl) {
     throw new Error('Mintsoft connection is not configured')
   }
 
@@ -218,9 +206,15 @@ export async function getMintsoftAccessToken(options?: { forceRefresh?: boolean 
     return storedToken as string
   }
 
+  const hasRenewableCredentials = Boolean(config.username && config.password)
+  if (!hasRenewableCredentials) {
+    if (storedToken) return storedToken
+    throw new Error('Mintsoft username and password are not configured')
+  }
+
   if (!mintsoftAuthRefreshInFlight) {
     const refreshPromise = (async () => {
-      const session = await requestMintsoftAuthSession(config.baseUrl, config.apiKey)
+      const session = await requestMintsoftAuthSession(config.baseUrl, config.username, config.password)
       await persistMintsoftAuthSession(session.token, session.expiresAt)
       return session.token
     })()
@@ -236,8 +230,18 @@ export async function getMintsoftAccessToken(options?: { forceRefresh?: boolean 
 }
 
 export async function isMintsoftConfigured(): Promise<boolean> {
-  const config = await getMintsoftApiConfiguration()
-  return Boolean(config.baseUrl && config.apiKey)
+  const [config, cachedApiKey] = await Promise.all([
+    getMintsoftApiConfiguration(),
+    getSettingValue(MINTSOFT_AUTH_TOKEN_KEY),
+  ])
+
+  return Boolean(
+    config.baseUrl
+      && (
+        (config.username && config.password)
+        || cachedApiKey
+      ),
+  )
 }
 
 export function verifyMintsoftWebhookSignature(

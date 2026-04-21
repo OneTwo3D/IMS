@@ -76,8 +76,9 @@ const mintsoftBindingSelect = {
 export type MintsoftConnectionSettingsMasked = {
   label: string
   baseUrl: string
-  apiKey: string
-  apiKeyMasked: boolean
+  username: string
+  password: string
+  passwordMasked: boolean
   webhookSecret: string
   webhookSecretMasked: boolean
   orderLookupConnector: MintsoftOrderLookupConnector
@@ -173,7 +174,8 @@ export type MintsoftDashboardData = {
 export type MintsoftConnectionInput = {
   label?: string
   baseUrl: string
-  apiKey: string
+  username?: string
+  password?: string
   webhookSecret?: string
   orderLookupConnector?: MintsoftOrderLookupConnector
   active?: boolean
@@ -199,7 +201,8 @@ export type MintsoftBindingInput = {
 const MintsoftConnectionInputSchema = z.object({
   label: z.string().max(120).optional(),
   baseUrl: z.string().min(1, 'Base URL is required.'),
-  apiKey: z.string().optional().default(''),
+  username: z.string().optional().default(''),
+  password: z.string().optional().default(''),
   webhookSecret: z.string().optional().default(''),
   orderLookupConnector: z.enum(['', 'woocommerce', 'shopify']).optional().default(''),
   active: z.boolean().optional(),
@@ -242,14 +245,16 @@ function mapMintsoftConnection(
   } | null,
   settings: MintsoftSettings,
 ): MintsoftConnectionSettingsMasked {
-  const apiKey = settings.mintsoft_api_key
+  const username = settings.mintsoft_username
+  const password = settings.mintsoft_password
   const webhookSecret = settings.mintsoft_webhook_secret
 
   return {
     label: connection?.label ?? '',
     baseUrl: connection?.baseUrl ?? '',
-    apiKey: maskSecret(apiKey),
-    apiKeyMasked: Boolean(apiKey),
+    username,
+    password: maskSecret(password),
+    passwordMasked: Boolean(password),
     webhookSecret: maskSecret(webhookSecret),
     webhookSecretMasked: Boolean(webhookSecret),
     orderLookupConnector: (connection?.orderLookupConnector as MintsoftOrderLookupConnector | null) ?? '',
@@ -411,6 +416,75 @@ async function ensureMintsoftConnectionId(): Promise<string> {
   return connection.id
 }
 
+const MINTSOFT_WAREHOUSE_CACHE_TTL_MS = 5 * 60 * 1000
+
+let mintsoftWarehouseLookupCache:
+  | {
+      key: string
+      fetchedAt: number
+      warehouses: MintsoftExternalWarehouseOption[]
+      error: string | null
+    }
+  | null = null
+
+function getMintsoftWarehouseCacheKey(baseUrl: string, username: string): string {
+  return `${baseUrl.trim()}::${username.trim().toLowerCase()}`
+}
+
+function invalidateMintsoftWarehouseLookupCache(): void {
+  mintsoftWarehouseLookupCache = null
+}
+
+async function getMintsoftExternalWarehouses(
+  baseUrl: string,
+  username: string,
+): Promise<{
+  externalWarehouses: MintsoftExternalWarehouseOption[]
+  warehouseLookupError: string | null
+}> {
+  const cacheKey = getMintsoftWarehouseCacheKey(baseUrl, username)
+  const now = Date.now()
+
+  if (
+    mintsoftWarehouseLookupCache
+    && mintsoftWarehouseLookupCache.key === cacheKey
+    && now - mintsoftWarehouseLookupCache.fetchedAt < MINTSOFT_WAREHOUSE_CACHE_TTL_MS
+  ) {
+    return {
+      externalWarehouses: mintsoftWarehouseLookupCache.warehouses,
+      warehouseLookupError: mintsoftWarehouseLookupCache.error,
+    }
+  }
+
+  try {
+    const externalWarehouses = (await getWmsConnector('mintsoft').fetchWarehouses())
+      .map((warehouse) => ({
+        externalId: warehouse.externalId,
+        name: warehouse.name,
+      }))
+      .sort((left, right) => left.name.localeCompare(right.name))
+
+    mintsoftWarehouseLookupCache = {
+      key: cacheKey,
+      fetchedAt: now,
+      warehouses: externalWarehouses,
+      error: null,
+    }
+
+    return {
+      externalWarehouses,
+      warehouseLookupError: null,
+    }
+  } catch (error) {
+    return {
+      externalWarehouses: [],
+      warehouseLookupError: error instanceof Error
+        ? error.message
+        : 'Mintsoft warehouse lookup failed.',
+    }
+  }
+}
+
 export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData> {
   await requireMintsoftReadAccess()
 
@@ -522,26 +596,24 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
 
   let externalWarehouses: MintsoftExternalWarehouseOption[] = []
   let warehouseLookupError: string | null = null
+  const hasMintsoftAuthMaterial = Boolean(
+    settings.mintsoft_api_key.trim()
+      || (settings.mintsoft_username.trim() && settings.mintsoft_password.trim()),
+  )
 
-  if ((connection?.baseUrl ?? '').trim() && settings.mintsoft_api_key.trim()) {
-    try {
-      externalWarehouses = (await getWmsConnector('mintsoft').fetchWarehouses())
-        .map((warehouse) => ({
-          externalId: warehouse.externalId,
-          name: warehouse.name,
-        }))
-        .sort((left, right) => left.name.localeCompare(right.name))
-    } catch (error) {
-      warehouseLookupError = error instanceof Error
-        ? error.message
-        : 'Mintsoft warehouse lookup failed.'
-    }
+  if ((connection?.baseUrl ?? '').trim() && hasMintsoftAuthMaterial) {
+    const warehouseLookup = await getMintsoftExternalWarehouses(
+      connection?.baseUrl ?? '',
+      settings.mintsoft_username,
+    )
+    externalWarehouses = warehouseLookup.externalWarehouses
+    warehouseLookupError = warehouseLookup.warehouseLookupError
   }
 
   return {
     connection: sanitizedConnection,
     status: {
-      configured: Boolean((connection?.baseUrl ?? '').trim() && settings.mintsoft_api_key.trim()),
+      configured: Boolean((connection?.baseUrl ?? '').trim() && hasMintsoftAuthMaterial),
       active: connection?.active ?? true,
       bindingCount: connection?.bindings.length ?? 0,
       lastAuthAt: connection?.lastAuthAt?.toISOString() ?? null,
@@ -574,7 +646,8 @@ export async function saveMintsoftConnectionSettings(
     getIntegrationPluginState(),
   ])
   const baseUrl = normalizeMintsoftBaseUrl(data.baseUrl)
-  const apiKey = data.apiKey.trim() || existingSettings.mintsoft_api_key
+  const username = data.username.trim() || existingSettings.mintsoft_username
+  const password = data.password.trim() || existingSettings.mintsoft_password
   const webhookSecret = data.webhookSecret.trim() || existingSettings.mintsoft_webhook_secret
   const availableOrderLookupConnectors = getAvailableOrderLookupConnectors(pluginState)
   const requestedOrderLookupConnector = data.orderLookupConnector.trim() as MintsoftOrderLookupConnector | undefined
@@ -585,8 +658,12 @@ export async function saveMintsoftConnectionSettings(
     return { success: false, error: 'Enter a valid Mintsoft base URL.' }
   }
 
-  if (!apiKey) {
-    return { success: false, error: 'API key is required.' }
+  if (!username) {
+    return { success: false, error: 'Mintsoft username is required.' }
+  }
+
+  if (!password) {
+    return { success: false, error: 'Mintsoft password is required.' }
   }
 
   if (orderLookupConnector && !availableOrderLookupConnectors.includes(orderLookupConnector)) {
@@ -617,9 +694,14 @@ export async function saveMintsoftConnectionSettings(
 
   await db.$transaction([
     db.setting.upsert({
-      where: { key: 'mintsoft_api_key' },
-      create: { key: 'mintsoft_api_key', value: serializeSettingValue('mintsoft_api_key', apiKey) },
-      update: { value: serializeSettingValue('mintsoft_api_key', apiKey) },
+      where: { key: 'mintsoft_username' },
+      create: { key: 'mintsoft_username', value: serializeSettingValue('mintsoft_username', username) },
+      update: { value: serializeSettingValue('mintsoft_username', username) },
+    }),
+    db.setting.upsert({
+      where: { key: 'mintsoft_password' },
+      create: { key: 'mintsoft_password', value: serializeSettingValue('mintsoft_password', password) },
+      update: { value: serializeSettingValue('mintsoft_password', password) },
     }),
     db.setting.upsert({
       where: { key: 'mintsoft_webhook_secret' },
@@ -631,6 +713,7 @@ export async function saveMintsoftConnectionSettings(
     }),
   ])
   await invalidateMintsoftAccessToken()
+  invalidateMintsoftWarehouseLookupCache()
 
   await logActivity({
     entityType: 'SYNC',

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
+import { getE2eRouteAccessError } from '@/lib/testing/e2e-route-guard'
 
 const E2E_MINTSOFT_STATE_KEY = 'e2e_mintsoft_state'
 
@@ -129,9 +130,8 @@ export async function GET(
   request: NextRequest,
   context: { params: Promise<{ slug: string[] }> },
 ) {
-  if (process.env.NODE_ENV !== 'development') {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  }
+  const authError = getE2eRouteAccessError(request)
+  if (authError) return authError
 
   const state = await getFakeMintsoftState()
   if (!state) {
@@ -187,9 +187,8 @@ export async function POST(
   request: NextRequest,
   context: { params: Promise<{ slug: string[] }> },
 ) {
-  if (process.env.NODE_ENV !== 'development') {
-    return NextResponse.json({ error: 'Not found' }, { status: 404 })
-  }
+  const authError = getE2eRouteAccessError(request)
+  if (authError) return authError
 
   const state = await getFakeMintsoftState()
   if (!state) {

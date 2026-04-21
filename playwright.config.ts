@@ -94,6 +94,7 @@ export default defineConfig({
     env: {
       ...process.env,
       NODE_ENV: 'development',
+      E2E_TEST_MODE: '1',
       AUTH_URL: baseURL,
       NEXT_PUBLIC_APP_URL: baseURL,
     },

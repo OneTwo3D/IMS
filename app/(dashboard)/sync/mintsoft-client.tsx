@@ -48,7 +48,8 @@ export function MintsoftClient({ data }: Props) {
   const [isBindingDialogOpen, setIsBindingDialogOpen] = useState(false)
   const [label, setLabel] = useState(data.connection.label)
   const [baseUrl, setBaseUrl] = useState(data.connection.baseUrl)
-  const [apiKey, setApiKey] = useState('')
+  const [username, setUsername] = useState(data.connection.username)
+  const [password, setPassword] = useState('')
   const [webhookSecret, setWebhookSecret] = useState('')
   const [orderLookupConnector, setOrderLookupConnector] = useState(data.connection.orderLookupConnector)
   const [active, setActive] = useState(data.connection.active ? 'true' : 'false')
@@ -75,7 +76,8 @@ export function MintsoftClient({ data }: Props) {
   function resetConnectionForm() {
     setLabel(data.connection.label)
     setBaseUrl(data.connection.baseUrl)
-    setApiKey('')
+    setUsername(data.connection.username)
+    setPassword('')
     setWebhookSecret('')
     setOrderLookupConnector(data.connection.orderLookupConnector)
     setActive(data.connection.active ? 'true' : 'false')
@@ -109,7 +111,8 @@ export function MintsoftClient({ data }: Props) {
       const result = await saveMintsoftConnectionSettings({
         label,
         baseUrl,
-        apiKey,
+        username,
+        password,
         webhookSecret,
         orderLookupConnector,
         active: active === 'true',
@@ -446,7 +449,7 @@ export function MintsoftClient({ data }: Props) {
           <DialogHeader>
             <DialogTitle>Edit Mintsoft Connection</DialogTitle>
             <DialogDescription>
-              Save the Mintsoft API credentials and choose which shopping connector should resolve callback order numbers.
+              Save the Mintsoft login credentials used to renew Mintsoft&apos;s 24-hour API key and choose which shopping connector should resolve callback order numbers.
             </DialogDescription>
           </DialogHeader>
 
@@ -460,13 +463,24 @@ export function MintsoftClient({ data }: Props) {
               <Input value={baseUrl} onChange={(event) => setBaseUrl(event.target.value)} placeholder="https://api.mintsoft.co.uk/" />
             </div>
             <div className="space-y-1.5">
-              <Label className="text-xs">API Key</Label>
+              <Label className="text-xs">Username</Label>
+              <Input
+                value={username}
+                onChange={(event) => setUsername(event.target.value)}
+                placeholder="Mintsoft username"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Password</Label>
               <Input
                 type="password"
-                value={apiKey}
-                onChange={(event) => setApiKey(event.target.value)}
-                placeholder={data.connection.apiKeyMasked ? '••••••••' : 'Mintsoft API key'}
+                value={password}
+                onChange={(event) => setPassword(event.target.value)}
+                placeholder={data.connection.passwordMasked ? '••••••••' : 'Mintsoft password'}
               />
+              <p className="text-xs text-muted-foreground">
+                Mintsoft uses these credentials to renew the 24-hour API key automatically.
+              </p>
             </div>
             <div className="space-y-1.5">
               <Label className="text-xs">Webhook Secret</Label>

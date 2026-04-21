@@ -48,7 +48,7 @@ export class MintsoftConnector implements WmsConnector {
 }
 
 export {
-  extractMintsoftAuthSession,
+  extractMintsoftAuthToken,
   getMintsoftAccessToken,
   getMintsoftApiConfiguration,
   getMintsoftConnectionRecord,

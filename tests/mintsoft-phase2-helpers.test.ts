@@ -61,27 +61,20 @@ test('normalizeMintsoftStockLine accepts common stock line field variants', () =
   assert.equal(normalizers.normalizeMintsoftStockLine({ productCode: 'XYZ-2' }), null)
 })
 
-test('extractMintsoftAuthSession accepts common token payload variants', () => {
-  assert.deepEqual(
-    auth.extractMintsoftAuthSession({
-      Token: 'jwt-token',
-      Expiry: '2026-04-22T12:00:00.000Z',
+test('extractMintsoftAuthToken accepts common Mintsoft auth response variants', () => {
+  assert.equal(
+    auth.extractMintsoftAuthToken({
+      ApiKey: 'mintsoft-generated-key',
     }),
-    {
-      token: 'jwt-token',
-      expiresAt: new Date('2026-04-22T12:00:00.000Z'),
-    },
+    'mintsoft-generated-key',
   )
 
-  assert.deepEqual(
-    auth.extractMintsoftAuthSession('plain-text-token'),
-    {
-      token: 'plain-text-token',
-      expiresAt: null,
-    },
+  assert.equal(
+    auth.extractMintsoftAuthToken('plain-text-token'),
+    'plain-text-token',
   )
 
-  assert.equal(auth.extractMintsoftAuthSession({ foo: 'bar' }), null)
+  assert.equal(auth.extractMintsoftAuthToken({ foo: 'bar' }), null)
 })
 
 test('sanitizeMintsoftThresholds normalizes values and drops empty configs', () => {

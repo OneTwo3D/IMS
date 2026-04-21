@@ -3,6 +3,8 @@ import { decryptSecret, encryptSecret, hasEncryptionKey, isEncryptedValue } from
 
 const ENV_FALLBACKS: Partial<Record<string, string>> = {
   mintsoft_api_key: 'MINTSOFT_API_KEY',
+  mintsoft_password: 'MINTSOFT_PASSWORD',
+  mintsoft_username: 'MINTSOFT_USERNAME',
   mintsoft_webhook_secret: 'MINTSOFT_WEBHOOK_SECRET',
   shopify_webhook_secret: 'SHOPIFY_WEBHOOK_SECRET',
   wc_webhook_secret: 'WC_WEBHOOK_SECRET',
@@ -13,8 +15,9 @@ export const SENSITIVE_SETTING_KEYS = new Set([
   'backup_sftp_password',
   'backup_sftp_private_key',
   'email_smtp_pass',
-  'mintsoft_auth_token',
   'mintsoft_api_key',
+  'mintsoft_password',
+  'mintsoft_username',
   'mintsoft_webhook_secret',
   'quickbooks_client_secret',
   'shopify_admin_api_access_token',
