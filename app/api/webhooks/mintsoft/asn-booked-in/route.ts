@@ -215,5 +215,6 @@ export async function POST(request: Request) {
     externalEventId,
     externalAsnId,
     processed: processingResult.status === 'processed',
+    pending: processingResult.status === 'pending',
   })
 }

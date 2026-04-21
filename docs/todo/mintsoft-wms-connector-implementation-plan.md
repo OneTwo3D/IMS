@@ -742,7 +742,7 @@ Grep for each of `'woocommerce'`, `'shopify'`, `'xero'`, `'quickbooks'` as liter
 
 ## Phase Plan
 
-Phases 0–2 are the near-term target; Phases 3–7 are already sketched in `docs/mintsoft-wms-connector-plan.md` and should be implemented once Phase 2 runs stably in production for one warehouse.
+Phases 0–2 are the near-term target; Phases 3–7 are already sketched in `docs/mintsoft-wms-connector-plan.md` and should be implemented once Phase 2 runs stably in production for one warehouse. Phases 8+ below are the expansion roadmap once the core Mintsoft connector is stable and trusted in production.
 
 ### Phase 0 — Discovery spike (no merge-to-main code)
 
@@ -991,6 +991,144 @@ Polling cron + webhook (if API allows). On each return:
 1. Upsert `WmsReturnsInbox` keyed by `(connector, externalReturnId)`.
 2. Match to IMS order via existing `ShoppingOrderLink` (`connector: 'woocommerce'` / `'shopify'`) or by `orderNumber`. Re-use the extended `resolveOrderForExternalFulfillment` logic from the "Order identity" section.
 3. Surface in `/sync/mintsoft` "Returns inbox" tab. Operator picks an action that dispatches to existing returns/refund/restock server actions.
+
+### Phase 8 — Sales order / dispatch lifecycle
+
+This is the largest functional gap after inbound stock. Today the plan covers product, stock, inbound ASN, and returns, but not the full sales-order execution loop inside the WMS.
+
+Scope:
+- sales order → Mintsoft dispatch push, including create / amend / cancel propagation from IMS into Mintsoft
+- order hold / release states, including payment-pending, fraud-review, allocation-failed, and warehouse-hold reasons
+- partial-ship reconciliation against `SalesOrderLine` and `ShipmentLine`
+- Mintsoft shipment / dispatched webhook support that captures tracking number, carrier/service, package weight, actual ship date, and any dispatch reference
+- customer-facing follow-through: feed tracking into the existing shipment / email-notification paths rather than leaving the dispatch event trapped in the connector
+
+Implementation notes:
+- extend the generic `WmsConnector` contract with explicit outbound order/dispatch capabilities rather than embedding this directly in Mintsoft-only code
+- reuse `applyExternalFulfillmentUpdate(...)` for shipment progression, but add a corresponding outbound `pushOrderToWms(...)` / `cancelOrderInWms(...)` layer for IMS-originated changes
+- introduce carrier-service mapping so IMS shipping services can be translated into Mintsoft couriers consistently
+- every shipment/dispatch callback must be idempotent and timeline-visible on the order, shipment, and connector event log
+
+Acceptance:
+- create, amend, hold, release, partially ship, and cancel a sales order in IMS and confirm Mintsoft state stays aligned
+- replay the same dispatch webhook and confirm tracking / shipment state is not duplicated
+
+### Phase 9 — Deep inventory execution (bins, serials, adjustments, transfers)
+
+Phase 2 only works at warehouse-total level. Warehouses that need physical execution detail will quickly hit the ceiling.
+
+Scope:
+- batch / lot / serial / expiry sync, including capability-negotiated support per connector
+- bin/location-level visibility and optional bin-aware sync reports, not only warehouse totals
+- stock adjustments bi-directionally with reason codes, operator identity, and an audit trail
+- inter-warehouse transfers orchestrated through Mintsoft, not only received back into IMS after the fact
+- transfer exception handling: damaged in transit, short-shipped, substituted SKU, over-delivered, refused receipt
+- putaway support after receipt, including staging/quarantine-to-sellable movement
+
+Implementation notes:
+- capability negotiation becomes mandatory here: connectors that do not support bins, batches, or serials must not expose those UI controls
+- keep warehouse-total sync as the default denominator; bin/lot detail is additive and should degrade gracefully when unsupported
+- adjustments and transfers need explicit source-of-truth rules so the connector does not create competing movement ledgers
+
+Acceptance:
+- warehouse can see both rolled-up stock and, when supported, bin/lot detail for the same SKU
+- Mintsoft-originated write-off or found-stock adjustment lands in IMS with the correct reason code and audit chain
+
+### Phase 10 — Advanced returns, QA, and supplier claims
+
+Phase 7 gives an inbox; this phase turns it into a quality workflow.
+
+Scope:
+- grading / dispositioning beyond simple restock: A/B/C-grade stock, quarantine lanes, scrap, refurbish, refund-only
+- rules-based return dispositioning by SKU, return reason, warehouse, condition, or customer channel
+- return routing to original location vs default restock warehouse vs quarantine
+- RMA linkage so customer-service approval and warehouse receipt stay tied together
+- RTV (return-to-vendor) flow connecting supplier returns to WMS outbound processing
+- GRN / booked-in variance handling that can auto-raise a discrepancy or draft supplier credit request
+- return cost-recovery analytics by supplier, courier, SKU, or reason family
+
+Implementation notes:
+- keep the operator inbox, but add policy-driven defaults so repetitive returns do not become entirely manual
+- reuse existing purchase-order / supplier primitives instead of creating a parallel RTV domain model unless the current model proves insufficient
+
+Acceptance:
+- a damaged return is auto-routed to quarantine, linked to the originating order, and visible in supplier/quality follow-up
+- a short or damaged inbound receipt can raise a supplier-credit workflow instead of only logging a discrepancy
+
+### Phase 11 — Ops, resilience, and observability
+
+The core connector should become operable under incident conditions, not just functionally correct.
+
+Scope:
+- per-binding health dashboard: token expiry, webhook lag, sync freshness, stale jobs, error-rate trends, API throttling / retry budget
+- dead-letter queue / exception inbox UI for failed webhooks and sync jobs, with manual replay and “re-run exactly this payload” support
+- webhook backfill by date range for provider outages or missed callback windows
+- scheduled full-reconciliation jobs (for example monthly) in addition to incremental/delta sync
+- maintenance windows per binding so cron activity can pause during stocktakes, cutovers, or warehouse downtime
+- connector kill switch: stop outbound writes while still allowing safe inbound reads / diagnostics
+- SLOs and alerting for silent-failure conditions such as “open ASN with no callback after ETA” or “binding stale for > N hours”
+- audit-grade event timeline and before/after diffs for every connector mutation
+
+Implementation notes:
+- the health dashboard should reuse `WmsSyncJob`, `WmsSyncLog`, and webhook event tables where possible, not invent a second telemetry plane
+- manual replay must preserve the original payload and the original idempotency key unless the operator explicitly forces a new attempt
+- the full-reconciliation job should compare IMS intent vs WMS truth across stock, ASNs, returns, and dispatch state in one report
+
+Acceptance:
+- an operator can see a stale or failing binding, inspect the exact failed payload, replay it safely, and verify the recovery in one UI flow
+
+### Phase 12 — Commercial mapping, bundles, and multi-tenant allocation
+
+This phase covers the pieces that matter once one connector instance starts serving multiple channels, service mappings, or tenants.
+
+Scope:
+- carrier-service mapping (IMS carriers/services ↔ Mintsoft couriers/services)
+- bundle / kit / BOM decomposition rules inside the WMS, including how kits are represented for pick/pack and stock reporting
+- multi-binding / multi-tenant operation: one IMS tenant allocating to multiple Mintsoft tenants, clients, or warehouses with explicit rules
+- customer/channel allocation rules so the connector knows which warehouse or Mintsoft tenant receives each order stream
+- generic capability registry so the UI and workflow engine expose only the functions supported by the active WMS
+- connector versioning / compatibility metadata so API-shape migrations are explicit instead of implicit
+
+Implementation notes:
+- phase 4 bundle sync remains the first structural step; this phase adds the commercial and routing semantics around it
+- if Mintsoft supports per-client or per-account partitioning inside one tenant, model that explicitly rather than smuggling it through warehouse IDs
+
+Acceptance:
+- orders from different channels can route to different Mintsoft targets predictably, and bundle lines decompose correctly for warehouse execution
+
+### Phase 13 — Financial reconciliation and 3PL cost control
+
+Once the connector is operational, warehouse fees and external service costs become the next control point.
+
+Scope:
+- 3PL cost reconciliation: storage, pick/pack, packaging, courier, and exception fees matched back to IMS documents and supplier invoices in Xero
+- variance reporting between expected warehouse charges and actual billed charges
+- accrual-ready reporting for unbilled warehouse services at period end
+- cost attribution from WMS operational events back to orders, returns, and suppliers where possible
+
+Implementation notes:
+- this should integrate with the existing Xero / accounting sync architecture rather than create a standalone warehouse-billing subsystem
+- warehouse fee mappings and billing codes belong in connector configuration with a full audit trail
+
+Acceptance:
+- a monthly 3PL invoice can be matched against recorded dispatch/receipt/return activity and outliers are visible before posting to Xero
+
+### Phase 14 — Compliance, governance, and data lifecycle
+
+As the connector starts carrying customer and warehouse data, governance needs to be first-class.
+
+Scope:
+- GDPR-style customer PII purge / minimisation propagation into the WMS
+- audit log for binding configuration changes, especially credentials, webhook secrets, routing rules, and carrier mappings
+- role-separated approval for high-risk connector actions such as secret rotation, kill-switch changes, or destructive backfills
+- retention windows for webhook payloads, dead-letter entries, and connector diagnostics
+
+Implementation notes:
+- treat configuration changes as auditable business events, not just generic settings edits
+- if payload retention conflicts with supportability, store redacted payloads by default and require elevated access for sensitive replay data
+
+Acceptance:
+- secret rotation, routing-rule changes, and data-purge events are all traceable with actor, timestamp, before/after diff, and outcome
 
 ---
 

@@ -17,6 +17,12 @@ type ProcessMintsoftBookedInResult =
     externalAsnId: string | null
   }
   | {
+    status: 'pending'
+    eventId: string
+    externalAsnId: string | null
+    reason: string
+  }
+  | {
     status: 'failed'
     eventId: string
     externalAsnId: string | null
@@ -33,6 +39,15 @@ async function markEventFailed(eventId: string, error: string): Promise<void> {
     where: { id: eventId },
     data: {
       processingError: error,
+    },
+  })
+}
+
+async function markEventPending(eventId: string, reason: string): Promise<void> {
+  await db.wmsInboundReceiptEvent.update({
+    where: { id: eventId },
+    data: {
+      processingError: reason,
     },
   })
 }
@@ -129,7 +144,12 @@ export async function processMintsoftBookedInEvent(
       })
 
       if (!asnMap) {
-        throw new Error(`No ASN mapping found for ${lockedEvent.externalAsnId}`)
+        return {
+          duplicate: false,
+          pending: true,
+          pendingReason: `ASN ${lockedEvent.externalAsnId} is not mapped yet; waiting for ASN finalization`,
+          productIds: [] as string[],
+        }
       }
 
       const actionableLines = asnMap.lines
@@ -379,6 +399,7 @@ export async function processMintsoftBookedInEvent(
 
       return {
         duplicate: false,
+        pending: false,
         productIds: Array.from(touchedProductIds),
       }
     }, STOCK_TX_OPTIONS)
@@ -388,6 +409,17 @@ export async function processMintsoftBookedInEvent(
         status: 'duplicate',
         eventId: event.id,
         externalAsnId: event.externalAsnId,
+      }
+    }
+
+    if (processed.pending) {
+      const pendingReason = processed.pendingReason ?? `ASN ${event.externalAsnId ?? 'unknown'} is not mapped yet`
+      await markEventPending(event.id, pendingReason)
+      return {
+        status: 'pending',
+        eventId: event.id,
+        externalAsnId: event.externalAsnId,
+        reason: pendingReason,
       }
     }
 
@@ -440,4 +472,43 @@ export async function processMintsoftBookedInEvent(
       error: message,
     }
   }
+}
+
+export async function replayMintsoftBookedInEventsForAsn(externalAsnId: string): Promise<{
+  processed: number
+  duplicates: number
+  pending: number
+  failed: number
+}> {
+  const events = await db.wmsInboundReceiptEvent.findMany({
+    where: {
+      connector: 'mintsoft',
+      externalAsnId,
+      processedAt: null,
+    },
+    orderBy: { receivedAt: 'asc' },
+    select: { id: true },
+  })
+
+  const counters = {
+    processed: 0,
+    duplicates: 0,
+    pending: 0,
+    failed: 0,
+  }
+
+  for (const event of events) {
+    const result = await processMintsoftBookedInEvent(event.id)
+    if (result.status === 'processed') {
+      counters.processed += 1
+    } else if (result.status === 'duplicate') {
+      counters.duplicates += 1
+    } else if (result.status === 'pending') {
+      counters.pending += 1
+    } else {
+      counters.failed += 1
+    }
+  }
+
+  return counters
 }

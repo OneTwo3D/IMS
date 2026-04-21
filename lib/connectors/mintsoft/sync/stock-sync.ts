@@ -1,3 +1,4 @@
+import { randomUUID } from 'crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -38,6 +39,14 @@ type SyncSummary = {
 }
 
 const STALE_RUNNING_STOCK_SYNC_MS = 2 * 60 * 60 * 1000
+const STOCK_SYNC_HEARTBEAT_INTERVAL = 30 * 1000
+
+type RunningStockSyncSummary = {
+  externalWarehouseId: string
+  bindingId: string
+  leaseToken: string
+  heartbeatAt: string
+}
 
 export type MintsoftStockSyncResult = {
   bindingId: string
@@ -116,8 +125,41 @@ type StockSyncReservation =
   | {
     binding: SyncBinding
     jobId: string | null
+    leaseToken?: string
     skippedReason?: string
   }
+
+function parseRunningHeartbeat(summary: Prisma.JsonValue | null | undefined): Date | null {
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) return null
+  const value = summary.heartbeatAt
+  if (typeof value !== 'string' || !value.trim()) return null
+  const parsed = new Date(value)
+  return Number.isFinite(parsed.getTime()) ? parsed : null
+}
+
+function buildRunningStockSyncSummary(binding: SyncBinding, leaseToken: string, heartbeatAt: Date): RunningStockSyncSummary {
+  return {
+    externalWarehouseId: binding.externalWarehouseId,
+    bindingId: binding.id,
+    leaseToken,
+    heartbeatAt: heartbeatAt.toISOString(),
+  }
+}
+
+async function heartbeatStockSyncJob(jobId: string, binding: SyncBinding, leaseToken: string): Promise<boolean> {
+  const heartbeatAt = new Date()
+  const updated = await db.wmsSyncJob.updateMany({
+    where: {
+      id: jobId,
+      status: 'RUNNING',
+    },
+    data: {
+      summary: buildRunningStockSyncSummary(binding, leaseToken, heartbeatAt) as Prisma.InputJsonValue,
+    },
+  })
+
+  return updated.count === 1
+}
 
 async function reserveStockSyncJob(
   bindingId: string,
@@ -187,13 +229,15 @@ async function reserveStockSyncJob(
       select: {
         id: true,
         startedAt: true,
+        summary: true,
       },
       orderBy: { startedAt: 'desc' },
     })
 
     if (runningJob) {
+      const lastHeartbeatAt = parseRunningHeartbeat(runningJob.summary) ?? runningJob.startedAt
       const staleBefore = new Date(Date.now() - STALE_RUNNING_STOCK_SYNC_MS)
-      if (runningJob.startedAt < staleBefore) {
+      if (lastHeartbeatAt < staleBefore) {
         const reclaimed = await tx.wmsSyncJob.updateMany({
           where: {
             id: runningJob.id,
@@ -208,6 +252,7 @@ async function reserveStockSyncJob(
               bindingId: binding.id,
               staleRecoveredAt: new Date().toISOString(),
               staleStartedAt: runningJob.startedAt.toISOString(),
+              staleHeartbeatAt: lastHeartbeatAt.toISOString(),
             } satisfies Prisma.InputJsonObject,
           },
         })
@@ -228,18 +273,17 @@ async function reserveStockSyncJob(
       }
     }
 
+    const leaseToken = randomUUID()
+    const heartbeatAt = new Date()
     const job = await tx.wmsSyncJob.create({
       data: {
         connector: 'mintsoft',
         type: 'STOCK_SYNC',
         status: 'RUNNING',
         warehouseId: binding.warehouseId,
-        startedAt: new Date(),
+        startedAt: heartbeatAt,
         triggeredBy,
-        summary: {
-          externalWarehouseId: binding.externalWarehouseId,
-          bindingId: binding.id,
-        } satisfies Prisma.InputJsonObject,
+        summary: buildRunningStockSyncSummary(binding, leaseToken, heartbeatAt) as Prisma.InputJsonValue,
       },
       select: { id: true },
     })
@@ -247,6 +291,7 @@ async function reserveStockSyncJob(
     return {
       binding,
       jobId: job.id,
+      leaseToken,
     } satisfies StockSyncReservation
   })
 }
@@ -509,6 +554,7 @@ export async function runStockSyncForBinding(
   }
 
   const job = { id: reservation.jobId! }
+  const leaseToken = reservation.leaseToken!
 
   const counters = {
     totalChecked: 0,
@@ -520,10 +566,24 @@ export async function runStockSyncForBinding(
   }
 
   let thresholdBreaches = 0
+  let lastHeartbeatAt = Date.now()
 
   try {
+    const refreshLease = async (force = false) => {
+      if (!force && Date.now() - lastHeartbeatAt < STOCK_SYNC_HEARTBEAT_INTERVAL) {
+        return
+      }
+
+      const kept = await heartbeatStockSyncJob(job.id, binding, leaseToken)
+      if (!kept) {
+        throw new Error('Mintsoft stock sync lease was lost')
+      }
+      lastHeartbeatAt = Date.now()
+    }
+
     const connector = getWmsConnector('mintsoft')
     const fetchedLines = await connector.fetchStockLevels(binding.externalWarehouseId)
+    await refreshLease(true)
     const stockLines = consolidateMintsoftStockLines(fetchedLines)
     const thresholds = parseMintsoftThresholds(binding.discrepancyThresholds)
     const skus = stockLines.map((line) => line.sku)
@@ -612,6 +672,7 @@ export async function runStockSyncForBinding(
     const logRows: Array<Prisma.WmsSyncLogCreateManyInput> = []
 
     for (const line of stockLines) {
+      await refreshLease()
       counters.totalChecked += 1
 
       try {
@@ -752,6 +813,7 @@ export async function runStockSyncForBinding(
     })
 
     for (const candidate of missingCandidates) {
+      await refreshLease()
       counters.totalChecked += 1
       counters.mismatched += 1
 
@@ -787,9 +849,11 @@ export async function runStockSyncForBinding(
     }
 
     if (logRows.length > 0) {
+      await refreshLease(true)
       await db.wmsSyncLog.createMany({ data: logRows })
     }
 
+    await refreshLease(true)
     const notifiedUsers = await notifyThresholdBreaches(binding, thresholdBreaches)
     const status: 'SUCCEEDED' | 'PARTIAL' = counters.errors > 0 ? 'PARTIAL' : 'SUCCEEDED'
     const summary: SyncSummary = {

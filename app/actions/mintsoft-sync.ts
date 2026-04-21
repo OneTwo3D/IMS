@@ -26,6 +26,7 @@ import {
   runMintsoftReturnsSync,
   type MintsoftReturnsInboxRow,
 } from '@/lib/connectors/mintsoft/sync/returns-sync'
+import { replayMintsoftBookedInEventsForAsn } from '@/lib/connectors/mintsoft/sync/booked-in-handler'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { hasPermission } from '@/lib/permissions'
@@ -1503,8 +1504,6 @@ export async function createMintsoftPurchaseOrderAsn(
         throw new Error('Bind the destination warehouse to Mintsoft before creating an ASN.')
       }
 
-      const poLineById = new Map(po.lines.map((line) => [line.id, line]))
-
       const inFlightAsn = await tx.wmsAsnMap.findFirst({
         where: {
           connector: 'mintsoft',
@@ -1561,11 +1560,92 @@ export async function createMintsoftPurchaseOrderAsn(
         },
       })
 
+      const outstandingLines = po.lines
+        .map((line) => ({
+          sourceLineId: line.id,
+          productId: line.productId,
+          sku: line.product.sku,
+          externalProductId: line.product.wmsProductLinks[0]?.externalProductId ?? null,
+          expectedQty: Number(line.qty) - Number(line.qtyReceived),
+        }))
+        .filter((line) => line.expectedQty > 0)
+
       if (pendingAsn) {
-        const pendingLines = pendingAsn.lines.map((line) => {
-          const poLine = poLineById.get(line.sourceLineId)
-          const externalProductId = poLine?.product.wmsProductLinks[0]?.externalProductId ?? null
-          if (!externalProductId) {
+        const unmappedLine = outstandingLines.find((line) => !line.externalProductId)
+        if (unmappedLine) {
+          throw new Error(`Outstanding SKU ${unmappedLine.sku} is not linked to a Mintsoft product.`)
+        }
+
+        if (outstandingLines.length === 0) {
+          await tx.wmsAsnMap.delete({
+            where: { id: pendingAsn.id },
+          })
+          throw new Error('This purchase order has no outstanding quantity left to place on an ASN.')
+        }
+
+        const outstandingBySourceLineId = new Map(outstandingLines.map((line) => [line.sourceLineId, line]))
+        const pendingLineBySourceLineId = new Map(pendingAsn.lines.map((line) => [line.sourceLineId, line]))
+        const activeSourceLineIds = outstandingLines.map((line) => line.sourceLineId)
+
+        await tx.wmsAsnLineMap.deleteMany({
+          where: {
+            asnMapId: pendingAsn.id,
+            ...(activeSourceLineIds.length > 0
+              ? { sourceLineId: { notIn: activeSourceLineIds } }
+              : {}),
+          },
+        })
+
+        for (const outstandingLine of outstandingLines) {
+          const existingLine = pendingLineBySourceLineId.get(outstandingLine.sourceLineId)
+          if (existingLine) {
+            await tx.wmsAsnLineMap.update({
+              where: { id: existingLine.id },
+              data: {
+                productId: outstandingLine.productId,
+                sku: outstandingLine.sku,
+                expectedQty: outstandingLine.expectedQty,
+              },
+            })
+          } else {
+            await tx.wmsAsnLineMap.create({
+              data: {
+                asnMapId: pendingAsn.id,
+                externalAsnLineId: `pending:${outstandingLine.sourceLineId}`,
+                sourceType: 'PURCHASE_ORDER_LINE',
+                sourceLineId: outstandingLine.sourceLineId,
+                productId: outstandingLine.productId,
+                sku: outstandingLine.sku,
+                expectedQty: outstandingLine.expectedQty,
+              },
+            })
+          }
+        }
+
+        const refreshedPendingAsn = await tx.wmsAsnMap.findUnique({
+          where: { id: pendingAsn.id },
+          select: {
+            id: true,
+            lines: {
+              orderBy: [{ id: 'asc' }],
+              select: {
+                id: true,
+                sourceLineId: true,
+                productId: true,
+                sku: true,
+                expectedQty: true,
+              },
+            },
+          },
+        })
+
+        if (!refreshedPendingAsn || refreshedPendingAsn.lines.length === 0) {
+          throw new Error('This purchase order has no outstanding quantity left to place on an ASN.')
+        }
+
+        const pendingLines = refreshedPendingAsn.lines.map((line) => {
+          const outstandingLine = outstandingBySourceLineId.get(line.sourceLineId)
+          if (!outstandingLine?.externalProductId) {
             throw new Error(`Outstanding SKU ${line.sku} is not linked to a Mintsoft product.`)
           }
 
@@ -1575,13 +1655,13 @@ export async function createMintsoftPurchaseOrderAsn(
             productId: line.productId,
             sku: line.sku,
             expectedQty: Number(line.expectedQty),
-            externalProductId,
+            externalProductId: outstandingLine.externalProductId,
           } satisfies ReservedAsnLine
         })
 
         return {
           kind: 'pending',
-          asnMapId: pendingAsn.id,
+          asnMapId: refreshedPendingAsn.id,
           warehouseCode: po.destinationWarehouse.code,
           externalWarehouseId: binding.externalWarehouseId,
           reference: po.reference,
@@ -1595,16 +1675,6 @@ export async function createMintsoftPurchaseOrderAsn(
           lines: pendingLines,
         } satisfies AsnReservation
       }
-
-      const outstandingLines = po.lines
-        .map((line) => ({
-          sourceLineId: line.id,
-          productId: line.productId,
-          sku: line.product.sku,
-          externalProductId: line.product.wmsProductLinks[0]?.externalProductId ?? null,
-          expectedQty: Number(line.qty) - Number(line.qtyReceived),
-        }))
-        .filter((line) => line.expectedQty > 0)
 
       if (outstandingLines.length === 0) {
         throw new Error('This purchase order has no outstanding quantity left to place on an ASN.')
@@ -1889,6 +1959,12 @@ export async function createMintsoftPurchaseOrderAsn(
           autoCallback,
         },
       })
+
+      try {
+        await replayMintsoftBookedInEventsForAsn(outcome.externalAsnId)
+      } catch (error) {
+        console.error(error)
+      }
     }
 
     revalidatePath('/purchase-orders')
