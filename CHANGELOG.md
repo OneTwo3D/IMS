@@ -27,6 +27,9 @@ This repository uses an `x.y.z` release scheme.
 - Corrected Mintsoft product writes to match the documented API shape: create via `PUT /api/Product`, update via `POST /api/Product` with `ID` in the request body, and tightened the E2E simulator so it now rejects the previously incorrect update path.
 - Moved best-effort Mintsoft product sync for IMS product edits out of the interactive submit path using Next.js `after()`, so inventory create/update no longer blocks on Mintsoft round-trips.
 - Reworked Mintsoft product verify to process eligible products in paged batches with bounded concurrency, improved JSON payload normalization for sync logs, and counted conflict rows that still pushed non-barcode Mintsoft updates as both mismatches and corrected changes.
+- Made Mintsoft booked-in webhook processing durable by adding a `mintsoft-webhook-sweeper` cron that drains any `wmsInboundReceiptEvent` rows whose in-process replay failed or raced with ASN finalization, so accepted callbacks can no longer be stranded unprocessed.
+- Revalidated outstanding purchase order quantities under the PO row lock immediately before Mintsoft ASN recover/create, aborting and resetting the pending reservation if a manual receipt consumed the outstanding quantity in the interim, so the remote ASN can never publish stock that is already received.
+- Fenced the Mintsoft stock-sync stale-job reclaim with a compare-and-swap on the observed lease token and heartbeat timestamp, so a live worker heartbeat can no longer be overwritten by a reclaim that read its state moments earlier.
 
 ## 1.4.1 - 2026-04-19
 

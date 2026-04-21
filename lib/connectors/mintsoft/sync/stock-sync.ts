@@ -137,6 +137,12 @@ function parseRunningHeartbeat(summary: Prisma.JsonValue | null | undefined): Da
   return Number.isFinite(parsed.getTime()) ? parsed : null
 }
 
+function parseRunningLeaseToken(summary: Prisma.JsonValue | null | undefined): string | null {
+  if (!summary || typeof summary !== 'object' || Array.isArray(summary)) return null
+  const value = summary.leaseToken
+  return typeof value === 'string' && value.trim() ? value : null
+}
+
 function buildRunningStockSyncSummary(binding: SyncBinding, leaseToken: string, heartbeatAt: Date): RunningStockSyncSummary {
   return {
     externalWarehouseId: binding.externalWarehouseId,
@@ -152,6 +158,9 @@ async function heartbeatStockSyncJob(jobId: string, binding: SyncBinding, leaseT
     where: {
       id: jobId,
       status: 'RUNNING',
+      AND: [
+        { summary: { path: ['leaseToken'], equals: leaseToken } },
+      ],
     },
     data: {
       summary: buildRunningStockSyncSummary(binding, leaseToken, heartbeatAt) as Prisma.InputJsonValue,
@@ -235,13 +244,23 @@ async function reserveStockSyncJob(
     })
 
     if (runningJob) {
-      const lastHeartbeatAt = parseRunningHeartbeat(runningJob.summary) ?? runningJob.startedAt
+      const observedHeartbeatAt = parseRunningHeartbeat(runningJob.summary)
+      const lastHeartbeatAt = observedHeartbeatAt ?? runningJob.startedAt
+      const observedLeaseToken = parseRunningLeaseToken(runningJob.summary)
       const staleBefore = new Date(Date.now() - STALE_RUNNING_STOCK_SYNC_MS)
       if (lastHeartbeatAt < staleBefore) {
+        const fenceAnd: Prisma.WmsSyncJobWhereInput[] = []
+        if (observedLeaseToken) {
+          fenceAnd.push({ summary: { path: ['leaseToken'], equals: observedLeaseToken } })
+        }
+        if (observedHeartbeatAt) {
+          fenceAnd.push({ summary: { path: ['heartbeatAt'], equals: observedHeartbeatAt.toISOString() } })
+        }
         const reclaimed = await tx.wmsSyncJob.updateMany({
           where: {
             id: runningJob.id,
             status: 'RUNNING',
+            ...(fenceAnd.length > 0 ? { AND: fenceAnd } : {}),
           },
           data: {
             status: 'FAILED',
@@ -253,6 +272,7 @@ async function reserveStockSyncJob(
               staleRecoveredAt: new Date().toISOString(),
               staleStartedAt: runningJob.startedAt.toISOString(),
               staleHeartbeatAt: lastHeartbeatAt.toISOString(),
+              staleLeaseToken: observedLeaseToken,
             } satisfies Prisma.InputJsonObject,
           },
         })

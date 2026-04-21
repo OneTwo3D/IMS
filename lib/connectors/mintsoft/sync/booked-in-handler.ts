@@ -512,3 +512,46 @@ export async function replayMintsoftBookedInEventsForAsn(externalAsnId: string):
 
   return counters
 }
+
+const WEBHOOK_SWEEPER_MAX_EVENTS_PER_RUN = 250
+
+export async function sweepUnprocessedMintsoftBookedInEvents(): Promise<{
+  attempted: number
+  processed: number
+  duplicates: number
+  pending: number
+  failed: number
+}> {
+  const events = await db.wmsInboundReceiptEvent.findMany({
+    where: {
+      connector: 'mintsoft',
+      processedAt: null,
+    },
+    orderBy: { receivedAt: 'asc' },
+    select: { id: true },
+    take: WEBHOOK_SWEEPER_MAX_EVENTS_PER_RUN,
+  })
+
+  const counters = {
+    attempted: events.length,
+    processed: 0,
+    duplicates: 0,
+    pending: 0,
+    failed: 0,
+  }
+
+  for (const event of events) {
+    const result = await processMintsoftBookedInEvent(event.id)
+    if (result.status === 'processed') {
+      counters.processed += 1
+    } else if (result.status === 'duplicate') {
+      counters.duplicates += 1
+    } else if (result.status === 'pending') {
+      counters.pending += 1
+    } else {
+      counters.failed += 1
+    }
+  }
+
+  return counters
+}

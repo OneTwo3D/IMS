@@ -1317,6 +1317,7 @@ export async function createMintsoftPurchaseOrderAsn(
     | {
       kind: 'pending'
       asnMapId: string
+      poId: string
       warehouseCode: string
       externalWarehouseId: string
       reference: string
@@ -1662,6 +1663,7 @@ export async function createMintsoftPurchaseOrderAsn(
         return {
           kind: 'pending',
           asnMapId: refreshedPendingAsn.id,
+          poId: po.id,
           warehouseCode: po.destinationWarehouse.code,
           externalWarehouseId: binding.externalWarehouseId,
           reference: po.reference,
@@ -1722,6 +1724,7 @@ export async function createMintsoftPurchaseOrderAsn(
       return {
         kind: 'pending',
         asnMapId: asnMap.id,
+        poId: po.id,
         warehouseCode: po.destinationWarehouse.code,
         externalWarehouseId: binding.externalWarehouseId,
         reference: po.reference,
@@ -1742,6 +1745,65 @@ export async function createMintsoftPurchaseOrderAsn(
         })),
       } satisfies AsnReservation
     }, { maxWait: 5000, timeout: 30000 })
+  }
+
+  async function revalidatePendingReservation(
+    reservation: Extract<AsnReservation, { kind: 'pending' }>,
+  ): Promise<void> {
+    const mismatch = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM purchase_orders WHERE id = ${reservation.poId} FOR UPDATE`
+
+      const po = await tx.purchaseOrder.findUnique({
+        where: { id: reservation.poId },
+        select: {
+          id: true,
+          lines: {
+            select: {
+              id: true,
+              qty: true,
+              qtyReceived: true,
+            },
+          },
+        },
+      })
+
+      if (!po) {
+        return 'Purchase order no longer exists.'
+      }
+
+      const outstandingBySourceLineId = new Map<string, number>()
+      for (const line of po.lines) {
+        const outstanding = Number(line.qty) - Number(line.qtyReceived)
+        if (outstanding > 0) {
+          outstandingBySourceLineId.set(line.id, outstanding)
+        }
+      }
+
+      if (outstandingBySourceLineId.size !== reservation.lines.length) {
+        return 'Outstanding quantities changed after reservation.'
+      }
+
+      for (const reservedLine of reservation.lines) {
+        const currentOutstanding = outstandingBySourceLineId.get(reservedLine.sourceLineId)
+        if (currentOutstanding === undefined || currentOutstanding !== reservedLine.expectedQty) {
+          return 'Outstanding quantities changed after reservation.'
+        }
+      }
+
+      return null
+    }, { maxWait: 5000, timeout: 15000 })
+
+    if (mismatch) {
+      await db.$transaction(async (tx) => {
+        await tx.wmsAsnLineMap.deleteMany({
+          where: { asnMapId: reservation.asnMapId },
+        })
+        await tx.wmsAsnMap.deleteMany({
+          where: { id: reservation.asnMapId, closedAt: null },
+        })
+      })
+      throw new Error(`${mismatch} Please retry creating the Mintsoft ASN.`)
+    }
   }
 
   async function findExistingRemoteAsn(reservation: Extract<AsnReservation, { kind: 'pending' }>) {
@@ -1892,6 +1954,7 @@ export async function createMintsoftPurchaseOrderAsn(
     if (reservation.kind === 'existing') {
       outcome = reservation
     } else {
+      await revalidatePendingReservation(reservation)
       const recoveredAsn = await findExistingRemoteAsn(reservation)
       if (recoveredAsn) {
         outcome = await finalizePendingAsn(reservation, recoveredAsn, 'recovered')
@@ -1900,6 +1963,8 @@ export async function createMintsoftPurchaseOrderAsn(
         if (!claimed) {
           throw new Error('Mintsoft ASN creation is already in progress for this purchase order.')
         }
+
+        await revalidatePendingReservation(reservation)
 
         const createdAsn = await connector.createAsn({
           externalWarehouseId: reservation.externalWarehouseId,

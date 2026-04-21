@@ -31,4 +31,14 @@ registerCronJobs([
     defaultSchedule: '0 3 * * *',
     defaultEnabled: false,
   },
+  {
+    slug: 'mintsoft-webhook-sweeper',
+    settingKey: 'mintsoft_webhook_sweeper',
+    module: 'mintsoft',
+    moduleLabel: 'Mintsoft',
+    label: 'Mintsoft Webhook Sweeper',
+    description: 'Drain unprocessed Mintsoft booked-in webhook events that failed or raced with ASN finalization.',
+    defaultSchedule: '*/5 * * * *',
+    defaultEnabled: false,
+  },
 ])
