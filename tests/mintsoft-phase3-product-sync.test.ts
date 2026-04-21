@@ -71,6 +71,27 @@ test('buildMintsoftProductUpsertRequest matches Mintsoft create and update API d
       }),
     },
   )
+
+  assert.deepEqual(
+    client.buildMintsoftProductUpsertRequest(product, { externalProductId: '168abc', omitBarcode: true }),
+    {
+      path: '/api/Product',
+      method: 'POST',
+      body: JSON.stringify({
+        ID: '168abc',
+        SKU: 'SKU-42',
+        Name: 'Widget',
+        CustomsDescription: 'Cotton widget',
+        Weight: 1.25,
+        Height: 11,
+        Width: 10,
+        Depth: 12,
+        ImageURL: 'https://example.test/widget.png',
+        CommodityCode: { Code: '902000' },
+        CountryOfManufacture: { Code: 'GB' },
+      }),
+    },
+  )
 })
 
 test('normalizeMintsoftProduct accepts realistic Mintsoft product payloads', () => {

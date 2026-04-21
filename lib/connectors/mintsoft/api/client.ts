@@ -179,12 +179,14 @@ export function buildMintsoftProductUpsertRequest(
   const payload = buildMintsoftProductPayload(product, omitBarcode)
 
   if (externalProductId) {
-    const parsedExternalProductId = Number.parseInt(externalProductId, 10)
+    const parsedExternalProductId = /^\d+$/.test(externalProductId)
+      ? Number.parseInt(externalProductId, 10)
+      : externalProductId
     return {
       path: '/api/Product',
       method: 'POST',
       body: JSON.stringify({
-        ID: Number.isFinite(parsedExternalProductId) ? parsedExternalProductId : externalProductId,
+        ID: parsedExternalProductId,
         ...payload,
       }),
     }
