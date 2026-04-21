@@ -249,18 +249,22 @@ async function reserveStockSyncJob(
       const observedLeaseToken = parseRunningLeaseToken(runningJob.summary)
       const staleBefore = new Date(Date.now() - STALE_RUNNING_STOCK_SYNC_MS)
       if (lastHeartbeatAt < staleBefore) {
+        if (!observedLeaseToken || !observedHeartbeatAt) {
+          return {
+            binding,
+            jobId: runningJob.id,
+            skippedReason: 'Stock sync already running for this binding; legacy lease metadata prevents safe reclaim',
+          } satisfies StockSyncReservation
+        }
+
         const fenceAnd: Prisma.WmsSyncJobWhereInput[] = []
-        if (observedLeaseToken) {
-          fenceAnd.push({ summary: { path: ['leaseToken'], equals: observedLeaseToken } })
-        }
-        if (observedHeartbeatAt) {
-          fenceAnd.push({ summary: { path: ['heartbeatAt'], equals: observedHeartbeatAt.toISOString() } })
-        }
+        fenceAnd.push({ summary: { path: ['leaseToken'], equals: observedLeaseToken } })
+        fenceAnd.push({ summary: { path: ['heartbeatAt'], equals: observedHeartbeatAt.toISOString() } })
         const reclaimed = await tx.wmsSyncJob.updateMany({
           where: {
             id: runningJob.id,
             status: 'RUNNING',
-            ...(fenceAnd.length > 0 ? { AND: fenceAnd } : {}),
+            AND: fenceAnd,
           },
           data: {
             status: 'FAILED',
@@ -514,9 +518,18 @@ async function completeJob(
   status: 'SUCCEEDED' | 'PARTIAL' | 'FAILED',
   counters: Omit<MintsoftStockSyncResult, 'bindingId' | 'warehouseId' | 'warehouseCode' | 'jobId' | 'status' | 'notifiedUsers' | 'skippedReason'>,
   summary: SyncSummary,
-) {
-  await db.wmsSyncJob.update({
-    where: { id: jobId },
+  leaseToken?: string,
+): Promise<boolean> {
+  const updated = await db.wmsSyncJob.updateMany({
+    where: {
+      id: jobId,
+      ...(leaseToken
+        ? {
+            status: 'RUNNING',
+            AND: [{ summary: { path: ['leaseToken'], equals: leaseToken } }],
+          }
+        : {}),
+    },
     data: {
       status,
       finishedAt: new Date(),
@@ -526,9 +539,40 @@ async function completeJob(
       corrected: counters.corrected,
       skipped: counters.skipped,
       errors: counters.errors,
-      summary: summary as Prisma.InputJsonValue,
+      summary: (
+        leaseToken
+          ? { ...summary, leaseToken }
+          : summary
+      ) as Prisma.InputJsonValue,
     },
   })
+
+  return updated.count === 1
+}
+
+async function updateBindingSyncStateIfCurrent(
+  bindingId: string,
+  status: 'SUCCEEDED' | 'PARTIAL' | 'FAILED',
+  jobId: string,
+  leaseToken: string,
+): Promise<boolean> {
+  const job = await db.wmsSyncJob.findFirst({
+    where: {
+      id: jobId,
+      AND: [{ summary: { path: ['leaseToken'], equals: leaseToken } }],
+    },
+    select: {
+      id: true,
+      status: true,
+    },
+  })
+
+  if (!job || job.status !== status) {
+    return false
+  }
+
+  await updateBindingSyncState(bindingId, status)
+  return true
 }
 
 export async function runStockSyncForBinding(
@@ -882,8 +926,11 @@ export async function runStockSyncForBinding(
       notifiedUsers,
     }
 
-    await completeJob(job.id, status, counters, summary)
-    await updateBindingSyncState(binding.id, status)
+    const completed = await completeJob(job.id, status, counters, summary, leaseToken)
+    if (!completed) {
+      throw new Error('Mintsoft stock sync lease was lost before completion')
+    }
+    await updateBindingSyncStateIfCurrent(binding.id, status, job.id, leaseToken)
 
     await logActivity({
       entityType: 'SYSTEM',
@@ -920,8 +967,8 @@ export async function runStockSyncForBinding(
       externalWarehouseId: binding.externalWarehouseId,
       thresholdBreaches: 0,
       notifiedUsers: 0,
-    })
-    await updateBindingSyncState(binding.id, 'FAILED')
+    }, leaseToken)
+    await updateBindingSyncStateIfCurrent(binding.id, 'FAILED', job.id, leaseToken)
 
     await logActivity({
       entityType: 'SYSTEM',

@@ -1362,6 +1362,14 @@ export async function createMintsoftPurchaseOrderAsn(
     return Math.abs(left - right) < 0.0001
   }
 
+  function buildCorrelatedAsnCallbackUrl(baseCallbackUrl: string | null, asnMapId: string): string | null {
+    if (!baseCallbackUrl) return null
+
+    const url = new URL(baseCallbackUrl)
+    url.searchParams.set('imsAsnMapId', asnMapId)
+    return url.toString()
+  }
+
   function mapCreatedMintsoftAsnLines(lines: ReservedAsnLine[], externalAsnId: string, createdAsn: {
     lines: Array<{
       externalLineId: string
@@ -1749,8 +1757,8 @@ export async function createMintsoftPurchaseOrderAsn(
 
   async function revalidatePendingReservation(
     reservation: Extract<AsnReservation, { kind: 'pending' }>,
-  ): Promise<void> {
-    const mismatch = await db.$transaction(async (tx) => {
+  ): Promise<string | null> {
+    return db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT id FROM purchase_orders WHERE id = ${reservation.poId} FOR UPDATE`
 
       const po = await tx.purchaseOrder.findUnique({
@@ -1792,23 +1800,21 @@ export async function createMintsoftPurchaseOrderAsn(
 
       return null
     }, { maxWait: 5000, timeout: 15000 })
-
-    if (mismatch) {
-      await db.$transaction(async (tx) => {
-        await tx.wmsAsnLineMap.deleteMany({
-          where: { asnMapId: reservation.asnMapId },
-        })
-        await tx.wmsAsnMap.deleteMany({
-          where: { id: reservation.asnMapId, closedAt: null },
-        })
-      })
-      throw new Error(`${mismatch} Please retry creating the Mintsoft ASN.`)
-    }
   }
 
   async function findExistingRemoteAsn(reservation: Extract<AsnReservation, { kind: 'pending' }>) {
     const remoteAsns = await fetchMintsoftAsns()
+    const correlatedCallbackUrl = buildCorrelatedAsnCallbackUrl(reservation.callbackUrl, reservation.asnMapId)
     const expectedLineCount = reservation.lines.length
+
+    if (correlatedCallbackUrl) {
+      const correlatedMatch = remoteAsns.find((asn) => (
+        getMintsoftAsnRawString(asn.raw, ['CallbackUrl', 'callbackUrl']) === correlatedCallbackUrl
+      ))
+      if (correlatedMatch) {
+        return correlatedMatch
+      }
+    }
 
     const matches = remoteAsns.filter((asn) => {
       if (getMintsoftAsnRawString(asn.raw, ['Reference', 'reference']) !== reservation.reference) {
@@ -1954,22 +1960,29 @@ export async function createMintsoftPurchaseOrderAsn(
     if (reservation.kind === 'existing') {
       outcome = reservation
     } else {
-      await revalidatePendingReservation(reservation)
       const recoveredAsn = await findExistingRemoteAsn(reservation)
       if (recoveredAsn) {
         outcome = await finalizePendingAsn(reservation, recoveredAsn, 'recovered')
       } else {
+        const mismatch = await revalidatePendingReservation(reservation)
+        if (mismatch) {
+          throw new Error(`${mismatch} Please retry creating the Mintsoft ASN.`)
+        }
+
         const claimed = await claimPendingAsnCreation(reservation.asnMapId)
         if (!claimed) {
           throw new Error('Mintsoft ASN creation is already in progress for this purchase order.')
         }
 
-        await revalidatePendingReservation(reservation)
+        const recheckedMismatch = await revalidatePendingReservation(reservation)
+        if (recheckedMismatch) {
+          throw new Error(`${recheckedMismatch} Please retry creating the Mintsoft ASN.`)
+        }
 
         const createdAsn = await connector.createAsn({
           externalWarehouseId: reservation.externalWarehouseId,
           reference: reservation.reference,
-          callbackUrl: reservation.callbackUrl,
+          callbackUrl: buildCorrelatedAsnCallbackUrl(reservation.callbackUrl, reservation.asnMapId),
           supplierReference: reservation.supplierReference,
           carrier: reservation.carrier,
           eta: reservation.eta,

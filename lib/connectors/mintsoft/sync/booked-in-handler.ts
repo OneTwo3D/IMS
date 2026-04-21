@@ -3,6 +3,23 @@ import { logActivity } from '@/lib/activity-log'
 import { enqueueStockSync } from '@/lib/shopping'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
+const PENDING_ASN_FINALIZATION_REASON_PREFIX = 'PENDING_ASN_FINALIZATION:'
+const WEBHOOK_SWEEPER_MAX_EVENTS_PER_RUN = 250
+const WEBHOOK_SWEEPER_SCAN_LIMIT = 5000
+const WEBHOOK_RETRY_STATE_PREFIX = 'RETRY_STATE:'
+const MAX_PENDING_ATTEMPTS = 12
+const MAX_FAILED_ATTEMPTS = 8
+const PENDING_RETRY_BASE_MS = 60 * 1000
+const FAILED_RETRY_BASE_MS = 5 * 60 * 1000
+const MAX_PENDING_RETRY_MS = 30 * 60 * 1000
+const MAX_FAILED_RETRY_MS = 60 * 60 * 1000
+
+type WebhookRetryState = {
+  kind: 'pending' | 'failed' | 'dead'
+  attempts: number
+  nextRetryAt: string | null
+  message: string
+}
 
 type ProcessMintsoftBookedInResult =
   | {
@@ -35,19 +52,88 @@ function formatReceiptReference(externalAsnId: string, poReference: string): str
 }
 
 async function markEventFailed(eventId: string, error: string): Promise<void> {
-  await db.wmsInboundReceiptEvent.update({
-    where: { id: eventId },
-    data: {
-      processingError: error,
-    },
-  })
+  await scheduleWebhookRetry(eventId, 'failed', error)
 }
 
 async function markEventPending(eventId: string, reason: string): Promise<void> {
+  await scheduleWebhookRetry(eventId, 'pending', normalizePendingReason(reason))
+}
+
+function normalizePendingReason(reason: string): string {
+  return reason.startsWith(PENDING_ASN_FINALIZATION_REASON_PREFIX)
+    ? reason
+    : `${PENDING_ASN_FINALIZATION_REASON_PREFIX}${reason}`
+}
+
+function parseWebhookRetryState(value: string | null | undefined): WebhookRetryState | null {
+  if (typeof value !== 'string' || !value.startsWith(WEBHOOK_RETRY_STATE_PREFIX)) return null
+  try {
+    const parsed = JSON.parse(value.slice(WEBHOOK_RETRY_STATE_PREFIX.length)) as Partial<WebhookRetryState>
+    if (
+      (parsed.kind === 'pending' || parsed.kind === 'failed' || parsed.kind === 'dead')
+      && typeof parsed.attempts === 'number'
+      && (parsed.nextRetryAt === null || typeof parsed.nextRetryAt === 'string')
+      && typeof parsed.message === 'string'
+    ) {
+      return parsed as WebhookRetryState
+    }
+  } catch {
+    return null
+  }
+  return null
+}
+
+function serializeWebhookRetryState(state: WebhookRetryState): string {
+  return `${WEBHOOK_RETRY_STATE_PREFIX}${JSON.stringify(state)}`
+}
+
+function buildNextRetryDelayMs(kind: 'pending' | 'failed', attempts: number): number {
+  const baseMs = kind === 'pending' ? PENDING_RETRY_BASE_MS : FAILED_RETRY_BASE_MS
+  const capMs = kind === 'pending' ? MAX_PENDING_RETRY_MS : MAX_FAILED_RETRY_MS
+  return Math.min(baseMs * (2 ** Math.max(attempts - 1, 0)), capMs)
+}
+
+async function scheduleWebhookRetry(
+  eventId: string,
+  kind: 'pending' | 'failed',
+  message: string,
+): Promise<void> {
+  const event = await db.wmsInboundReceiptEvent.findUnique({
+    where: { id: eventId },
+    select: {
+      processingError: true,
+    },
+  })
+
+  const previous = parseWebhookRetryState(event?.processingError)
+  const attempts = (previous?.attempts ?? 0) + 1
+  const maxAttempts = kind === 'pending' ? MAX_PENDING_ATTEMPTS : MAX_FAILED_ATTEMPTS
+
+  if (attempts >= maxAttempts) {
+    await db.wmsInboundReceiptEvent.update({
+      where: { id: eventId },
+      data: {
+        processingError: serializeWebhookRetryState({
+          kind: 'dead',
+          attempts,
+          nextRetryAt: null,
+          message,
+        }),
+      },
+    })
+    return
+  }
+
+  const nextRetryAt = new Date(Date.now() + buildNextRetryDelayMs(kind, attempts))
   await db.wmsInboundReceiptEvent.update({
     where: { id: eventId },
     data: {
-      processingError: reason,
+      processingError: serializeWebhookRetryState({
+        kind,
+        attempts,
+        nextRetryAt: nextRetryAt.toISOString(),
+        message,
+      }),
     },
   })
 }
@@ -147,7 +233,7 @@ export async function processMintsoftBookedInEvent(
         return {
           duplicate: false,
           pending: true,
-          pendingReason: `ASN ${lockedEvent.externalAsnId} is not mapped yet; waiting for ASN finalization`,
+          pendingReason: normalizePendingReason(`ASN ${lockedEvent.externalAsnId} is not mapped yet; waiting for ASN finalization`),
           productIds: [] as string[],
         }
       }
@@ -413,7 +499,7 @@ export async function processMintsoftBookedInEvent(
     }
 
     if (processed.pending) {
-      const pendingReason = processed.pendingReason ?? `ASN ${event.externalAsnId ?? 'unknown'} is not mapped yet`
+      const pendingReason = normalizePendingReason(processed.pendingReason ?? `ASN ${event.externalAsnId ?? 'unknown'} is not mapped yet`)
       await markEventPending(event.id, pendingReason)
       return {
         status: 'pending',
@@ -512,9 +598,6 @@ export async function replayMintsoftBookedInEventsForAsn(externalAsnId: string):
 
   return counters
 }
-
-const WEBHOOK_SWEEPER_MAX_EVENTS_PER_RUN = 250
-
 export async function sweepUnprocessedMintsoftBookedInEvents(): Promise<{
   attempted: number
   processed: number
@@ -522,15 +605,30 @@ export async function sweepUnprocessedMintsoftBookedInEvents(): Promise<{
   pending: number
   failed: number
 }> {
-  const events = await db.wmsInboundReceiptEvent.findMany({
+  const now = new Date()
+  const scannedEvents = await db.wmsInboundReceiptEvent.findMany({
     where: {
       connector: 'mintsoft',
       processedAt: null,
     },
     orderBy: { receivedAt: 'asc' },
-    select: { id: true },
-    take: WEBHOOK_SWEEPER_MAX_EVENTS_PER_RUN,
+    select: {
+      id: true,
+      processingError: true,
+    },
+    take: WEBHOOK_SWEEPER_SCAN_LIMIT,
   })
+
+  const events = scannedEvents
+    .filter((event) => {
+      const retryState = parseWebhookRetryState(event.processingError)
+      if (!retryState) return true
+      if (retryState.kind === 'dead') return false
+      if (!retryState.nextRetryAt) return true
+      const nextRetryAt = new Date(retryState.nextRetryAt)
+      return !Number.isFinite(nextRetryAt.getTime()) || nextRetryAt <= now
+    })
+    .slice(0, WEBHOOK_SWEEPER_MAX_EVENTS_PER_RUN)
 
   const counters = {
     attempted: events.length,

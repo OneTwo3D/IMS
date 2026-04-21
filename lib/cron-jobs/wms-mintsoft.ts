@@ -39,6 +39,6 @@ registerCronJobs([
     label: 'Mintsoft Webhook Sweeper',
     description: 'Drain unprocessed Mintsoft booked-in webhook events that failed or raced with ASN finalization.',
     defaultSchedule: '*/5 * * * *',
-    defaultEnabled: false,
+    defaultEnabled: true,
   },
 ])
