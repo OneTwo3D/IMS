@@ -4,6 +4,7 @@ import {
   runMintsoftProductVerify,
   runMintsoftProductVerifyForSkus,
 } from '@/lib/connectors/mintsoft/sync/product-sync'
+import { runMintsoftReturnsSync } from '@/lib/connectors/mintsoft/sync/returns-sync'
 import { runStockSyncForBinding } from '@/lib/connectors/mintsoft/sync/stock-sync'
 import { serializeSettingValue } from '@/lib/settings-store'
 import { getE2eRouteAccessError } from '@/lib/testing/e2e-route-guard'
@@ -55,6 +56,7 @@ async function resetMintsoftPersistence() {
   })
   await db.wmsStockSnapshot.deleteMany({ where: { connector: 'mintsoft' } })
   await db.wmsStockDiscrepancy.deleteMany({ where: { connector: 'mintsoft' } })
+  await db.wmsReturnsInbox.deleteMany({ where: { connector: 'mintsoft' } })
   await db.wmsInboundReceiptEvent.deleteMany({ where: { connector: 'mintsoft' } })
   await db.wmsSyncJob.deleteMany({ where: { connector: 'mintsoft' } })
   await db.externalWmsBinding.deleteMany({ where: { connector: 'mintsoft' } })
@@ -167,7 +169,7 @@ export async function GET(request: NextRequest) {
   if (authError) return authError
 
   if (request.nextUrl.searchParams.get('summary') === '1') {
-    const [bindings, jobs, discrepancies] = await Promise.all([
+    const [bindings, jobs, discrepancies, returnsInbox] = await Promise.all([
       db.externalWmsBinding.findMany({
         where: { connector: 'mintsoft' },
         select: {
@@ -207,6 +209,17 @@ export async function GET(request: NextRequest) {
           category: true,
         },
       }),
+      db.wmsReturnsInbox.findMany({
+        where: { connector: 'mintsoft' },
+        orderBy: { updatedAt: 'desc' },
+        take: 10,
+        select: {
+          externalReturnId: true,
+          reference: true,
+          sku: true,
+          status: true,
+        },
+      }),
     ])
 
     return NextResponse.json({
@@ -221,6 +234,7 @@ export async function GET(request: NextRequest) {
         warehouseCode: job.warehouse?.code ?? null,
       })),
       discrepancies,
+      returnsInbox,
     })
   }
 
@@ -301,6 +315,7 @@ export async function POST(request: NextRequest) {
     runFirstBindingSync?: boolean
     runProductVerify?: boolean
     runProductVerifySkus?: string[]
+    runReturnsSync?: boolean
   }
 
   if (body.reset) {
@@ -432,6 +447,11 @@ export async function POST(request: NextRequest) {
   if (Array.isArray(body.runProductVerifySkus) && body.runProductVerifySkus.length > 0) {
     const result = await runMintsoftProductVerifyForSkus(body.runProductVerifySkus, 'e2e')
     return NextResponse.json({ success: true, verifyResult: result })
+  }
+
+  if (body.runReturnsSync) {
+    const result = await runMintsoftReturnsSync('e2e')
+    return NextResponse.json({ success: true, returnsResult: result })
   }
 
   return NextResponse.json({ success: true })

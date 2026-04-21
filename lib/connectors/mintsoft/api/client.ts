@@ -1,10 +1,11 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
-import type { WmsProductDto, WmsProductRef, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   extractMintsoftArrayPayload,
   extractMintsoftObjectPayload,
   normalizeMintsoftProduct,
   normalizeMintsoftProductListItem,
+  normalizeMintsoftReturn,
   normalizeMintsoftStockLine,
   normalizeMintsoftWarehouse,
 } from './normalizers'
@@ -145,6 +146,18 @@ export async function fetchMintsoftProductBySku(sku: string): Promise<WmsProduct
 
   const wrapped = extractMintsoftObjectPayload(result.data)
   return wrapped && direct?.sku === normalizedSku ? direct : null
+}
+
+export async function fetchMintsoftReturns(since: Date): Promise<WmsReturnRecord[]> {
+  const query = new URLSearchParams({ since: since.toISOString() })
+  const result = await mintsoftRequest<unknown>(`/api/Returns?${query.toString()}`)
+  if (result.error) {
+    throw new Error(result.error)
+  }
+
+  return extractMintsoftArrayPayload(result.data)
+    .map((item) => normalizeMintsoftReturn(item))
+    .filter((item): item is WmsReturnRecord => Boolean(item))
 }
 
 function buildMintsoftProductPayload(product: WmsProductDto, omitBarcode: boolean): Record<string, unknown> {

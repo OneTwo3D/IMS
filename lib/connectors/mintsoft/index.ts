@@ -1,6 +1,6 @@
-import type { WmsConnectionCheck, WmsConnector, WmsProductDto, WmsProductRef, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsConnectionCheck, WmsConnector, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import { getMintsoftApiConfiguration, isMintsoftConfigured, verifyMintsoftWebhookSignature } from './api/auth'
-import { fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
+import { fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 
 const CONNECTOR = 'Mintsoft'
 
@@ -52,6 +52,10 @@ export class MintsoftConnector implements WmsConnector {
     return upsertMintsoftProduct(product, options)
   }
 
+  async pollReturns(since: Date): Promise<WmsReturnRecord[]> {
+    return fetchMintsoftReturns(since)
+  }
+
   async verifyWebhookSignature(rawBody: string, signatureHeader: string | null): Promise<boolean> {
     const { webhookSecret } = await getMintsoftApiConfiguration()
     if (!webhookSecret) return false
@@ -73,6 +77,7 @@ export {
 export {
   fetchMintsoftProduct,
   fetchMintsoftProductBySku,
+  fetchMintsoftReturns,
   fetchMintsoftStockLevels,
   fetchMintsoftWarehouses,
   mintsoftRequest,
@@ -83,6 +88,7 @@ export {
   extractMintsoftObjectPayload,
   normalizeMintsoftProduct,
   normalizeMintsoftProductListItem,
+  normalizeMintsoftReturn,
   normalizeMintsoftStockLine,
   normalizeMintsoftWarehouse,
 } from './api/normalizers'

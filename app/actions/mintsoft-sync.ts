@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { Prisma } from '@/app/generated/prisma/client'
 import { z } from 'zod'
+import { applyReturnInboundStockTx, type RefundReturnRow } from '@/app/actions/sales'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
@@ -19,6 +20,11 @@ import {
 } from '@/lib/connectors/mintsoft/sync/stock-sync'
 import { runMintsoftProductVerify } from '@/lib/connectors/mintsoft/sync/product-sync'
 import { parseMintsoftThresholds, sanitizeMintsoftThresholds } from '@/lib/connectors/mintsoft/sync/stock-sync-helpers'
+import {
+  mapMintsoftReturnsInboxRow,
+  runMintsoftReturnsSync,
+  type MintsoftReturnsInboxRow,
+} from '@/lib/connectors/mintsoft/sync/returns-sync'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { serializeSettingValue } from '@/lib/settings-store'
@@ -159,6 +165,16 @@ export type MintsoftDiscrepancyRow = {
   lastSeenAt: string
 }
 
+type MintsoftReturnRestockActivityMetadata = {
+  inboxId: string
+  externalReturnId: string
+  warehouseId: string
+  warehouseCode: string
+  productId: string
+  qty: number
+  orderId: string | null
+}
+
 export type MintsoftDashboardData = {
   connection: MintsoftConnectionSettingsMasked
   status: MintsoftConnectionStatus
@@ -168,6 +184,7 @@ export type MintsoftDashboardData = {
   warehouseLookupError: string | null
   recentStockSyncJobs: MintsoftSyncJobRow[]
   openDiscrepancies: MintsoftDiscrepancyRow[]
+  returnsInbox: MintsoftReturnsInboxRow[]
   availableOrderLookupConnectors: ShoppingConnectorId[]
   orderLookupConnectorRequired: boolean
 }
@@ -227,6 +244,10 @@ const MintsoftBindingInputSchema = z.object({
 })
 
 const MintsoftBindingDeleteSchema = z.string().min(1, 'Binding ID is required.')
+const MintsoftReturnRestockInputSchema = z.object({
+  id: z.string().min(1, 'Return inbox item ID is required.'),
+  warehouseId: z.string().min(1, 'Warehouse is required.'),
+})
 
 function getValidationErrorMessage(error: z.ZodError): string {
   return error.issues[0]?.message ?? 'Invalid input.'
@@ -381,6 +402,10 @@ async function requireMintsoftWriteAccess() {
   return requirePermission('settings.company')
 }
 
+async function requireMintsoftReturnsWriteAccess() {
+  return requirePermission('stock_control.adjust')
+}
+
 function getAvailableOrderLookupConnectors(pluginState: {
   woocommerce: boolean
   shopify: boolean
@@ -492,7 +517,7 @@ async function getMintsoftExternalWarehouses(
 export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData> {
   await requireMintsoftReadAccess()
 
-  const [connection, settings, warehouses, bindings, recentStockSyncJobs, openDiscrepancies, pluginState] = await Promise.all([
+  const [connection, settings, warehouses, bindings, recentStockSyncJobs, openDiscrepancies, returnsInbox, pluginState] = await Promise.all([
     db.wmsConnection.findUnique({
       where: { connector: 'mintsoft' },
       select: {
@@ -581,6 +606,41 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
         },
       },
     }),
+    db.wmsReturnsInbox.findMany({
+      where: {
+        connector: 'mintsoft',
+      },
+      orderBy: [{ updatedAt: 'desc' }],
+      take: 20,
+      select: {
+        id: true,
+        externalReturnId: true,
+        sku: true,
+        qty: true,
+        reason: true,
+        reference: true,
+        status: true,
+        receivedAt: true,
+        updatedAt: true,
+        order: {
+          select: {
+            id: true,
+            orderNumber: true,
+            externalOrderNumber: true,
+          },
+        },
+        product: {
+          select: {
+            id: true,
+          },
+        },
+        warehouse: {
+          select: {
+            code: true,
+          },
+        },
+      },
+    }),
     getIntegrationPluginState(),
   ])
   const availableOrderLookupConnectors = getAvailableOrderLookupConnectors(pluginState)
@@ -629,6 +689,7 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
     warehouseLookupError,
     recentStockSyncJobs: recentStockSyncJobs.map(mapMintsoftSyncJob),
     openDiscrepancies: openDiscrepancies.map(mapMintsoftDiscrepancy),
+    returnsInbox: returnsInbox.map(mapMintsoftReturnsInboxRow),
     availableOrderLookupConnectors,
     orderLookupConnectorRequired: availableOrderLookupConnectors.length > 1,
   }
@@ -906,6 +967,252 @@ export async function runMintsoftProductVerifyNow(): Promise<{
     jobId: result.jobId,
     message: `Checked ${result.totalChecked} products, updated ${result.corrected}, recorded ${result.mismatched} barcode conflicts, ${result.errors} errors.`,
   }
+}
+
+export async function runMintsoftReturnsSyncNow(): Promise<{
+  success: boolean
+  error?: string
+  message?: string
+  jobId?: string | null
+}> {
+  await requireMintsoftReadAccess()
+
+  const result = await runMintsoftReturnsSync('manual')
+  revalidatePath('/sync')
+
+  if (result.status === 'FAILED') {
+    return {
+      success: false,
+      error: result.skippedReason ?? 'Mintsoft returns sync failed.',
+      jobId: result.jobId,
+    }
+  }
+
+  if (result.status === 'SKIPPED') {
+    return {
+      success: false,
+      error: result.skippedReason ?? 'Mintsoft returns sync was skipped.',
+      jobId: result.jobId,
+    }
+  }
+
+  return {
+    success: true,
+    jobId: result.jobId,
+    message: `Checked ${result.totalChecked} returns, staged ${result.corrected} new inbox items, ${result.errors} errors.`,
+  }
+}
+
+const MintsoftReturnInboxStatusSchema = z.enum([
+  'NEW',
+  'UNDER_REVIEW',
+  'QUARANTINED',
+  'REFUNDED_ONLY',
+  'REPLACED',
+  'INSPECT',
+  'DISMISSED',
+])
+
+export async function updateMintsoftReturnInboxStatus(
+  id: unknown,
+  status: unknown,
+): Promise<{ success: boolean; error?: string }> {
+  await requireMintsoftReturnsWriteAccess()
+
+  const parsedId = MintsoftBindingDeleteSchema.safeParse(id)
+  if (!parsedId.success) {
+    return { success: false, error: getValidationErrorMessage(parsedId.error) }
+  }
+
+  const parsedStatus = MintsoftReturnInboxStatusSchema.safeParse(status)
+  if (!parsedStatus.success) {
+    return { success: false, error: getValidationErrorMessage(parsedStatus.error) }
+  }
+
+  const item = await db.wmsReturnsInbox.findFirst({
+    where: {
+      id: parsedId.data,
+      connector: 'mintsoft',
+    },
+    select: {
+      id: true,
+      externalReturnId: true,
+      status: true,
+    },
+  })
+  if (!item) {
+    return { success: false, error: 'Mintsoft return inbox item not found.' }
+  }
+
+  if (item.status === 'RESTOCKED') {
+    return { success: false, error: 'This Mintsoft return has already been restocked.' }
+  }
+
+  const isResolvedStatus = ['QUARANTINED', 'REFUNDED_ONLY', 'REPLACED', 'INSPECT', 'DISMISSED']
+    .includes(parsedStatus.data)
+
+  await db.wmsReturnsInbox.update({
+    where: { id: item.id },
+    data: {
+      status: parsedStatus.data,
+      resolvedAt: isResolvedStatus ? new Date() : null,
+      resolutionNote: !isResolvedStatus
+        ? null
+        : `Marked ${parsedStatus.data.toLowerCase().replace(/_/g, ' ')} from Mintsoft sync dashboard`,
+    },
+  })
+
+  await logActivity({
+    entityType: 'SYNC',
+    entityId: item.id,
+    tag: 'sync',
+    action: 'mintsoft_return_inbox_updated',
+    description: `Updated Mintsoft return ${item.externalReturnId} from ${item.status} to ${parsedStatus.data}`,
+    metadata: {
+      previousStatus: item.status,
+      nextStatus: parsedStatus.data,
+    },
+  })
+
+  revalidatePath('/sync')
+  return { success: true }
+}
+
+export async function restockMintsoftReturnInboxItem(
+  input: unknown,
+): Promise<{ success: boolean; error?: string; message?: string }> {
+  await requireMintsoftReturnsWriteAccess()
+
+  const parsedInput = MintsoftReturnRestockInputSchema.safeParse(input)
+  if (!parsedInput.success) {
+    return { success: false, error: getValidationErrorMessage(parsedInput.error) }
+  }
+
+  const data = parsedInput.data
+  let returnedProductIds: string[] = []
+  let successMessage = 'Mintsoft return restocked.'
+  let activityMetadata: MintsoftReturnRestockActivityMetadata | null = null
+
+  try {
+    await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM wms_returns_inbox WHERE id = ${data.id} FOR UPDATE`
+
+      const [item, warehouse] = await Promise.all([
+        tx.wmsReturnsInbox.findFirst({
+          where: {
+            id: data.id,
+            connector: 'mintsoft',
+          },
+          select: {
+            id: true,
+            externalReturnId: true,
+            status: true,
+            orderId: true,
+            productId: true,
+            sku: true,
+            qty: true,
+            order: {
+              select: {
+                id: true,
+                orderNumber: true,
+                externalOrderNumber: true,
+              },
+            },
+          },
+        }),
+        tx.warehouse.findUnique({
+          where: { id: data.warehouseId },
+          select: {
+            id: true,
+            code: true,
+            active: true,
+          },
+        }),
+      ])
+
+      if (!item) {
+        throw new Error('Mintsoft return inbox item not found.')
+      }
+      if (item.status === 'RESTOCKED') {
+        throw new Error('This Mintsoft return has already been restocked.')
+      }
+      if (!warehouse || !warehouse.active) {
+        throw new Error('Select an active warehouse for restocking.')
+      }
+      if (!item.productId) {
+        throw new Error('This Mintsoft return cannot be restocked because its SKU is not mapped to an IMS product.')
+      }
+
+      const qty = Number(item.qty ?? 0)
+      if (!Number.isFinite(qty) || qty <= 0) {
+        throw new Error('This Mintsoft return does not have a positive quantity to restock.')
+      }
+
+      const rows: RefundReturnRow[] = [{
+        productId: item.productId,
+        qty,
+      }]
+
+      const returnedRows = await applyReturnInboundStockTx(tx, {
+        referenceType: 'WmsReturnsInbox',
+        referenceId: item.id,
+        warehouseId: warehouse.id,
+        rows,
+        note: 'Mintsoft return restock',
+      })
+
+      await tx.wmsReturnsInbox.update({
+        where: { id: item.id },
+        data: {
+          status: 'RESTOCKED',
+          warehouseId: warehouse.id,
+          resolvedAt: new Date(),
+          resolutionNote: `Restocked ${qty} unit${qty === 1 ? '' : 's'} to ${warehouse.code}`,
+        },
+      })
+
+      returnedProductIds = returnedRows.map((row) => row.productId)
+      successMessage = `Restocked ${qty} unit${qty === 1 ? '' : 's'} of ${item.sku ?? 'the product'} to ${warehouse.code}.`
+      activityMetadata = {
+        inboxId: item.id,
+        externalReturnId: item.externalReturnId,
+        warehouseId: warehouse.id,
+        warehouseCode: warehouse.code,
+        productId: item.productId,
+        qty,
+        orderId: item.orderId,
+      }
+    })
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Failed to restock Mintsoft return.',
+    }
+  }
+
+  if (returnedProductIds.length > 0) {
+    try {
+      const { enqueueStockSync } = await import('@/lib/shopping')
+      await enqueueStockSync([...new Set(returnedProductIds)], 'IMS_CHANGE')
+    } catch (syncError) {
+      console.error(syncError)
+    }
+  }
+
+  const metadata = activityMetadata as MintsoftReturnRestockActivityMetadata | null
+  if (metadata) {
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: metadata.inboxId,
+      tag: 'sync',
+      action: 'mintsoft_return_restocked',
+      description: `Restocked Mintsoft return ${metadata.externalReturnId} into warehouse ${metadata.warehouseCode}`,
+      metadata,
+    })
+  }
+
+  revalidatePath('/sync')
+  return { success: true, message: successMessage }
 }
 
 export async function deleteMintsoftBinding(

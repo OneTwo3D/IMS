@@ -34,7 +34,7 @@ async function lockCostLayers(
   )
 }
 
-type RefundReturnRow = {
+export type RefundReturnRow = {
   productId: string
   qty: number
   unitCostBase?: number
@@ -228,74 +228,99 @@ async function buildRefundFallbackReturnRows(
   })
 }
 
+export async function applyReturnInboundStockTx(
+  tx: Prisma.TransactionClient,
+  params: {
+    referenceType: string
+    referenceId: string
+    warehouseId: string
+    rows: RefundReturnRow[]
+    note: string
+  },
+): Promise<Array<{ productId: string; sku: string; qty: number }>> {
+  const aggregatedRows = aggregateRefundReturnRows(params.rows)
+  if (aggregatedRows.length === 0) return []
+
+  for (const row of aggregatedRows) {
+    await tx.stockMovement.create({
+      data: {
+        type: 'RETURN_INBOUND',
+        productId: row.productId,
+        toWarehouseId: params.warehouseId,
+        qty: row.qty,
+        note: params.note,
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+      },
+    })
+    await tx.stockLevel.upsert({
+      where: { productId_warehouseId: { productId: row.productId, warehouseId: params.warehouseId } },
+      create: { productId: row.productId, warehouseId: params.warehouseId, quantity: row.qty, reservedQty: 0 },
+      update: { quantity: { increment: row.qty } },
+    })
+  }
+
+  for (const row of params.rows) {
+    if (!Number.isFinite(row.unitCostBase) || row.unitCostBase == null || row.qty <= 0) continue
+    await tx.costLayer.create({
+      data: {
+        productId: row.productId,
+        warehouseId: params.warehouseId,
+        receivedQty: row.qty,
+        remainingQty: row.qty,
+        unitCostBase: row.unitCostBase,
+        poLineId: row.poLineId ?? null,
+      },
+      select: { id: true },
+    }).then(async (newLayer) => {
+      if (row.sourceCostLayerId) {
+        await copyCostLayerSourceLinesProportionally(tx, row.sourceCostLayerId, newLayer.id, row.qty)
+      }
+    })
+  }
+
+  const returnedProducts = await tx.product.findMany({
+    where: { id: { in: aggregatedRows.map((row) => row.productId) } },
+    select: { id: true, sku: true },
+  })
+  const skuByProductId = new Map(returnedProducts.map((product) => [product.id, product.sku]))
+
+  return aggregatedRows.map((row) => ({
+    productId: row.productId,
+    sku: skuByProductId.get(row.productId) ?? row.productId,
+    qty: row.qty,
+  }))
+}
+
 async function applyRefundReturnStock(
   orderId: string,
   orderRef: string,
   warehouseId: string,
   rows: RefundReturnRow[],
 ): Promise<string[]> {
-  const aggregatedRows = aggregateRefundReturnRows(rows)
-  if (aggregatedRows.length === 0) return []
+  const returnedRows = await db.$transaction((tx) => (
+    applyReturnInboundStockTx(tx, {
+      referenceType: 'SalesOrder',
+      referenceId: orderId,
+      warehouseId,
+      rows,
+      note: 'Refund return',
+    })
+  ), STOCK_TX_OPTIONS)
 
-  await db.$transaction(async (tx) => {
-    for (const row of aggregatedRows) {
-      await tx.stockMovement.create({
-        data: {
-          type: 'RETURN_INBOUND',
-          productId: row.productId,
-          toWarehouseId: warehouseId,
-          qty: row.qty,
-          note: 'Refund return',
-          referenceType: 'SalesOrder',
-          referenceId: orderId,
-        },
-      })
-      await tx.stockLevel.upsert({
-        where: { productId_warehouseId: { productId: row.productId, warehouseId } },
-        create: { productId: row.productId, warehouseId, quantity: row.qty, reservedQty: 0 },
-        update: { quantity: { increment: row.qty } },
-      })
-    }
-
-    for (const row of rows) {
-      if (!Number.isFinite(row.unitCostBase) || row.unitCostBase == null || row.qty <= 0) continue
-      await tx.costLayer.create({
-        data: {
-          productId: row.productId,
-          warehouseId,
-          receivedQty: row.qty,
-          remainingQty: row.qty,
-          unitCostBase: row.unitCostBase,
-          poLineId: row.poLineId ?? null,
-        },
-        select: { id: true },
-      }).then(async (newLayer) => {
-        if (row.sourceCostLayerId) {
-          await copyCostLayerSourceLinesProportionally(tx, row.sourceCostLayerId, newLayer.id, row.qty)
-        }
-      })
-    }
-  }, STOCK_TX_OPTIONS)
-
-  const returnedProducts = await db.product.findMany({
-    where: { id: { in: aggregatedRows.map((row) => row.productId) } },
-    select: { id: true, sku: true },
-  })
-  const skuByProductId = new Map(returnedProducts.map((product) => [product.id, product.sku]))
-
-  for (const row of aggregatedRows) {
+  for (const row of returnedRows) {
     await logActivity({
       entityType: 'STOCK_ADJUSTMENT',
       entityId: row.productId,
       action: 'return_inbound',
       tag: 'stock',
       level: 'INFO',
-      description: `Returned ${row.qty} units of SKU ${skuByProductId.get(row.productId) ?? row.productId} to warehouse ${warehouseId} for refund on order ${orderRef}`,
+      description: `Returned ${row.qty} units of SKU ${row.sku} to warehouse ${warehouseId} for refund on order ${orderRef}`,
       metadata: { productId: row.productId, qty: row.qty, orderNumber: orderRef, warehouseId },
     })
   }
 
-  return aggregatedRows.map((row) => row.productId)
+  return returnedRows.map((row) => row.productId)
 }
 
 // ---------------------------------------------------------------------------

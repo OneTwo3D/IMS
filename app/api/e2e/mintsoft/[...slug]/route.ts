@@ -36,6 +36,16 @@ type FakeMintsoftProduct = {
   imageUrl: string | null
 }
 
+type FakeMintsoftReturn = {
+  id: string
+  warehouseId: string | null
+  sku: string | null
+  qty: number | null
+  orderReference: string | null
+  reason: string | null
+  receivedAt: string | null
+}
+
 type FakeMintsoftState = {
   apiKey: string
   username?: string
@@ -43,6 +53,7 @@ type FakeMintsoftState = {
   warehouses: FakeMintsoftWarehouse[]
   stockLevelsByWarehouse: Record<string, FakeMintsoftStockLine[]>
   products: FakeMintsoftProduct[]
+  returns: FakeMintsoftReturn[]
 }
 
 function parseJsonRecord(value: string | null): Record<string, unknown> | null {
@@ -154,6 +165,25 @@ async function getFakeMintsoftState(): Promise<FakeMintsoftState | null> {
       } satisfies FakeMintsoftProduct
     })
     .filter((value): value is FakeMintsoftProduct => Boolean(value))
+  const returns = asArray(record.returns)
+    .map((value) => {
+      const item = value && typeof value === 'object' && !Array.isArray(value)
+        ? value as Record<string, unknown>
+        : null
+      const id = asString(item?.id)
+      if (!id) return null
+
+      return {
+        id,
+        warehouseId: asString(item?.warehouseId),
+        sku: asString(item?.sku),
+        qty: item?.qty == null ? null : asNumber(item.qty, 0),
+        orderReference: asString(item?.orderReference),
+        reason: asString(item?.reason),
+        receivedAt: asString(item?.receivedAt),
+      } satisfies FakeMintsoftReturn
+    })
+    .filter((value): value is FakeMintsoftReturn => Boolean(value))
 
   return {
     apiKey,
@@ -162,6 +192,7 @@ async function getFakeMintsoftState(): Promise<FakeMintsoftState | null> {
     warehouses,
     stockLevelsByWarehouse,
     products,
+    returns,
   }
 }
 
@@ -307,6 +338,32 @@ export async function GET(
     }
 
     return NextResponse.json(state.products.map(mapMintsoftProductResponse))
+  }
+
+  if (path === 'api/Returns') {
+    if (!isAuthorized(request, state)) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const sinceParam = request.nextUrl.searchParams.get('since')
+    const since = sinceParam ? new Date(sinceParam) : null
+    const filtered = state.returns.filter((item) => {
+      if (!since || !Number.isFinite(since.getTime()) || !item.receivedAt) return true
+      const receivedAt = new Date(item.receivedAt)
+      return Number.isFinite(receivedAt.getTime()) && receivedAt >= since
+    })
+
+    return NextResponse.json(
+      filtered.map((item) => ({
+        ReturnId: item.id,
+        WarehouseId: item.warehouseId ? Number(item.warehouseId) : null,
+        SKU: item.sku,
+        Qty: item.qty,
+        OrderNumber: item.orderReference,
+        Reason: item.reason,
+        ReceivedAt: item.receivedAt,
+      })),
+    )
   }
 
   if (path.startsWith('api/Product/')) {

@@ -40,6 +40,17 @@ export type WmsProductRef = {
   raw: Record<string, unknown> | null
 }
 
+export type WmsReturnRecord = {
+  externalReturnId: string
+  externalWarehouseId: string | null
+  sku: string | null
+  qty: number | null
+  orderReference: string | null
+  reason: string | null
+  receivedAt: string | null
+  raw: Record<string, unknown> | null
+}
+
 export type WmsUpsertProductOptions = {
   externalProductId?: string | null
   omitBarcode?: boolean
@@ -61,5 +72,6 @@ export interface WmsConnector {
   fetchProduct(externalProductId: string): Promise<WmsProductRef | null>
   fetchProductBySku(sku: string): Promise<WmsProductRef | null>
   upsertProduct(product: WmsProductDto, options?: WmsUpsertProductOptions): Promise<WmsProductRef>
+  pollReturns(since: Date): Promise<WmsReturnRecord[]>
   verifyWebhookSignature?(rawBody: string, signatureHeader: string | null): Promise<boolean> | boolean
 }

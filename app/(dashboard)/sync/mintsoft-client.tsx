@@ -5,10 +5,13 @@ import { useRouter } from 'next/navigation'
 import { Check, Loader2, Plus, RefreshCw, Settings2, Trash2 } from 'lucide-react'
 import {
   deleteMintsoftBinding,
+  restockMintsoftReturnInboxItem,
   runMintsoftProductVerifyNow,
+  runMintsoftReturnsSyncNow,
   runMintsoftStockSyncNow,
   saveMintsoftBinding,
   saveMintsoftConnectionSettings,
+  updateMintsoftReturnInboxStatus,
   type MintsoftDashboardData,
 } from '@/app/actions/mintsoft-sync'
 import { ProductLink } from '@/components/inventory/product-link'
@@ -47,6 +50,7 @@ export function MintsoftClient({ data }: Props) {
   const [isPending, startTransition] = useTransition()
   const [isConnectionDialogOpen, setIsConnectionDialogOpen] = useState(false)
   const [isBindingDialogOpen, setIsBindingDialogOpen] = useState(false)
+  const [isRestockDialogOpen, setIsRestockDialogOpen] = useState(false)
   const [label, setLabel] = useState(data.connection.label)
   const [baseUrl, setBaseUrl] = useState(data.connection.baseUrl)
   const [username, setUsername] = useState(data.connection.username)
@@ -63,6 +67,9 @@ export function MintsoftClient({ data }: Props) {
   const [absoluteDelta, setAbsoluteDelta] = useState('')
   const [percentDelta, setPercentDelta] = useState('')
   const [reportRecipients, setReportRecipients] = useState('')
+  const [restockItemId, setRestockItemId] = useState('')
+  const [restockItemSku, setRestockItemSku] = useState('')
+  const [restockWarehouseId, setRestockWarehouseId] = useState(data.warehouses.find((warehouse) => warehouse.active)?.id ?? '')
   const [error, setError] = useState('')
   const [feedbackMessage, setFeedbackMessage] = useState('')
   const [saved, setSaved] = useState(false)
@@ -104,6 +111,15 @@ export function MintsoftClient({ data }: Props) {
   function handleBindingDialogOpenChange(open: boolean) {
     setIsBindingDialogOpen(open)
     if (!open) resetBindingForm()
+  }
+
+  function handleRestockDialogOpenChange(open: boolean) {
+    setIsRestockDialogOpen(open)
+    if (!open) {
+      setRestockItemId('')
+      setRestockItemSku('')
+      setRestockWarehouseId(data.warehouses.find((warehouse) => warehouse.active)?.id ?? '')
+    }
   }
 
   function handleSaveConnection() {
@@ -203,6 +219,60 @@ export function MintsoftClient({ data }: Props) {
     })
   }
 
+  function handleRunReturnsSync() {
+    setError('')
+    startTransition(async () => {
+      const result = await runMintsoftReturnsSyncNow()
+      if (!result.success) {
+        setError(result.error ?? 'Failed to run Mintsoft returns sync')
+        return
+      }
+
+      flashSaved(result.message ?? 'Mintsoft returns sync completed')
+      router.refresh()
+    })
+  }
+
+  function handleUpdateReturnStatus(id: string, status: 'UNDER_REVIEW' | 'QUARANTINED' | 'DISMISSED') {
+    setError('')
+    startTransition(async () => {
+      const result = await updateMintsoftReturnInboxStatus(id, status)
+      if (!result.success) {
+        setError(result.error ?? 'Failed to update Mintsoft return inbox item')
+        return
+      }
+
+      flashSaved(`Return marked ${status.toLowerCase().replace(/_/g, ' ')}`)
+      router.refresh()
+    })
+  }
+
+  function handleOpenRestockDialog(item: { id: string; sku: string | null; warehouseCode: string | null }) {
+    setRestockItemId(item.id)
+    setRestockItemSku(item.sku ?? '')
+    const matchingWarehouse = data.warehouses.find((warehouse) => warehouse.code === item.warehouseCode && warehouse.active)
+    setRestockWarehouseId(matchingWarehouse?.id ?? data.warehouses.find((warehouse) => warehouse.active)?.id ?? '')
+    setIsRestockDialogOpen(true)
+  }
+
+  function handleRestockReturn() {
+    setError('')
+    startTransition(async () => {
+      const result = await restockMintsoftReturnInboxItem({
+        id: restockItemId,
+        warehouseId: restockWarehouseId,
+      })
+      if (!result.success) {
+        setError(result.error ?? 'Failed to restock Mintsoft return')
+        return
+      }
+
+      handleRestockDialogOpenChange(false)
+      flashSaved(result.message ?? 'Mintsoft return restocked')
+      router.refresh()
+    })
+  }
+
   return (
     <div className="space-y-6">
       <Card className="p-6 space-y-4">
@@ -250,6 +320,10 @@ export function MintsoftClient({ data }: Props) {
           <Button type="button" variant="outline" onClick={handleRunProductVerify} disabled={isPending || !data.status.configured}>
             <RefreshCw className="mr-2 h-4 w-4" />
             Run Product Verify
+          </Button>
+          <Button type="button" variant="outline" onClick={handleRunReturnsSync} disabled={isPending || !data.status.configured}>
+            <RefreshCw className="mr-2 h-4 w-4" />
+            Poll Returns
           </Button>
         </div>
 
@@ -451,6 +525,105 @@ export function MintsoftClient({ data }: Props) {
                   <TableCell>{discrepancy.wmsValue ?? '—'}</TableCell>
                   <TableCell>{discrepancy.delta ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{discrepancy.lastSeenAt}</TableCell>
+                </TableRow>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      </Card>
+
+      <Card className="p-6 space-y-4">
+        <div>
+          <h3 className="text-base font-semibold">Returns Inbox</h3>
+          <p className="text-sm text-muted-foreground">
+            Mintsoft return events are staged here for operator review. This phase records and classifies the work item; it does not auto-restock inventory.
+          </p>
+        </div>
+
+        <Table containerClassName="rounded-lg border max-h-[60vh]" className="min-w-[980px]">
+          <TableHeader className="bg-muted/40">
+            <TableRow>
+              <TableHead>Return</TableHead>
+              <TableHead>Order</TableHead>
+              <TableHead>Product</TableHead>
+              <TableHead>Qty</TableHead>
+              <TableHead>Reason</TableHead>
+              <TableHead>Warehouse</TableHead>
+              <TableHead>Status</TableHead>
+              <TableHead className="text-right">Actions</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {data.returnsInbox.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={8} className="py-6 text-center text-muted-foreground">
+                  No Mintsoft returns staged yet.
+                </TableCell>
+              </TableRow>
+            ) : (
+              data.returnsInbox.map((item) => (
+                <TableRow key={item.id}>
+                  <TableCell>
+                    <div className="font-mono text-xs font-medium">{item.externalReturnId}</div>
+                    <div className="text-xs text-muted-foreground">{item.reference ?? 'No order reference'}</div>
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {item.orderNumber ?? item.externalOrderNumber ?? 'Unmatched'}
+                  </TableCell>
+                  <TableCell>
+                    {item.productId && item.sku ? (
+                      <ProductLink productId={item.productId} sku={item.sku} name={item.sku} />
+                    ) : (
+                      <span className="font-mono text-xs">{item.sku ?? 'Unmatched SKU'}</span>
+                    )}
+                  </TableCell>
+                  <TableCell>{item.qty ?? '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{item.reason ?? '—'}</TableCell>
+                  <TableCell className="text-xs text-muted-foreground">{item.warehouseCode ?? 'Unmatched'}</TableCell>
+                  <TableCell className="text-xs">
+                    <div className="font-medium">{item.status}</div>
+                    <div className="text-muted-foreground">{item.receivedAt ?? item.updatedAt}</div>
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <div className="flex justify-end gap-1">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleUpdateReturnStatus(item.id, 'UNDER_REVIEW')}
+                        disabled={isPending || item.status === 'UNDER_REVIEW' || item.status === 'RESTOCKED'}
+                      >
+                        Review
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleOpenRestockDialog(item)}
+                        disabled={isPending || item.status === 'RESTOCKED' || !item.productId || !item.qty}
+                      >
+                        Restock
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleUpdateReturnStatus(item.id, 'QUARANTINED')}
+                        disabled={isPending || item.status === 'QUARANTINED' || item.status === 'RESTOCKED'}
+                      >
+                        Quarantine
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleUpdateReturnStatus(item.id, 'DISMISSED')}
+                        disabled={isPending || item.status === 'DISMISSED' || item.status === 'RESTOCKED'}
+                      >
+                        Dismiss
+                      </Button>
+                    </div>
+                  </TableCell>
                 </TableRow>
               ))
             )}
@@ -673,6 +846,42 @@ export function MintsoftClient({ data }: Props) {
             >
               {isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
               Add Warehouse Binding
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      <Dialog open={isRestockDialogOpen} onOpenChange={handleRestockDialogOpenChange}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Restock Mintsoft Return</DialogTitle>
+            <DialogDescription>
+              Choose which warehouse should receive the returned stock for {restockItemSku || 'this product'}.
+            </DialogDescription>
+          </DialogHeader>
+
+          <div className="space-y-1.5">
+            <Label className="text-xs">Restock Warehouse</Label>
+            <Select value={restockWarehouseId} onChange={(event) => setRestockWarehouseId(event.target.value)}>
+              <option value="">Select a warehouse</option>
+              {data.warehouses
+                .filter((warehouse) => warehouse.active)
+                .map((warehouse) => (
+                  <option key={warehouse.id} value={warehouse.id}>
+                    {warehouse.code} · {warehouse.name}
+                  </option>
+                ))}
+            </Select>
+          </div>
+
+          <DialogFooter showCloseButton>
+            <Button
+              type="button"
+              onClick={handleRestockReturn}
+              disabled={isPending || !restockItemId || !restockWarehouseId}
+            >
+              {isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              Confirm Restock
             </Button>
           </DialogFooter>
         </DialogContent>

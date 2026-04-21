@@ -1,6 +1,6 @@
-import type { WmsProductRef, WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsProductRef, WmsReturnRecord, WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 
-const ARRAY_PAYLOAD_KEYS = ['data', 'Data', 'items', 'Items', 'results', 'Results', 'warehouses', 'Warehouses', 'stockLevels', 'StockLevels'] as const
+const ARRAY_PAYLOAD_KEYS = ['data', 'Data', 'items', 'Items', 'results', 'Results', 'warehouses', 'Warehouses', 'stockLevels', 'StockLevels', 'returns', 'Returns'] as const
 const WAREHOUSE_ID_KEYS = ['warehouseId', 'WarehouseId', 'id', 'Id', 'ID']
 const WAREHOUSE_NAME_KEYS = ['name', 'Name', 'warehouseName', 'WarehouseName', 'description', 'Description', 'label', 'Label']
 const STOCK_SKU_KEYS = ['sku', 'SKU', 'productSku', 'ProductSku', 'productCode', 'ProductCode', 'itemCode', 'ItemCode', 'code', 'Code']
@@ -8,6 +8,11 @@ const STOCK_QTY_KEYS = ['level', 'Level', 'quantity', 'Quantity', 'qty', 'Qty', 
 const PRODUCT_ID_KEYS = ['productId', 'ProductId', 'id', 'Id', 'ID']
 const PRODUCT_NAME_KEYS = ['name', 'Name', 'productName', 'ProductName', 'description', 'Description']
 const PRODUCT_BARCODE_KEYS = ['ean', 'EAN', 'barcode', 'Barcode', 'upc', 'UPC', 'eanCode', 'EANCode']
+const RETURN_ID_KEYS = ['returnId', 'ReturnId', 'externalReturnId', 'ExternalReturnId', 'id', 'Id', 'ID']
+const RETURN_ORDER_REFERENCE_KEYS = ['orderReference', 'OrderReference', 'orderNumber', 'OrderNumber', 'externalOrderNumber', 'ExternalOrderNumber', 'reference', 'Reference']
+const RETURN_REASON_KEYS = ['reason', 'Reason', 'returnReason', 'ReturnReason']
+const RETURN_QTY_KEYS = ['qty', 'Qty', 'quantity', 'Quantity', 'returnedQty', 'ReturnedQty', 'returnQty', 'ReturnQty', 'receivedQty', 'ReceivedQty']
+const RETURN_RECEIVED_AT_KEYS = ['receivedAt', 'ReceivedAt', 'createdAt', 'CreatedAt', 'updatedAt', 'UpdatedAt', 'returnDate', 'ReturnDate', 'date', 'Date']
 
 function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
@@ -31,6 +36,24 @@ function getFirstNumber(record: Record<string, unknown>, keys: readonly string[]
     if (typeof value === 'string' && value.trim()) {
       const parsed = Number(value)
       if (Number.isFinite(parsed)) return parsed
+    }
+  }
+  return null
+}
+
+function getFirstDate(record: Record<string, unknown>, keys: readonly string[]): string | null {
+  for (const key of keys) {
+    const value = record[key]
+    if (value instanceof Date && Number.isFinite(value.getTime())) {
+      return value.toISOString()
+    }
+    if (typeof value === 'number' && Number.isFinite(value)) {
+      const date = new Date(value)
+      if (Number.isFinite(date.getTime())) return date.toISOString()
+    }
+    if (typeof value === 'string' && value.trim()) {
+      const date = new Date(value)
+      if (Number.isFinite(date.getTime())) return date.toISOString()
     }
   }
   return null
@@ -114,6 +137,25 @@ export function normalizeMintsoftProductListItem(value: unknown): WmsProductRef 
     externalId,
     sku,
     barcode: getFirstString(record, PRODUCT_BARCODE_KEYS),
+    raw: record,
+  }
+}
+
+export function normalizeMintsoftReturn(value: unknown): WmsReturnRecord | null {
+  const record = asRecord(value)
+  if (!record) return null
+
+  const externalReturnId = getFirstString(record, RETURN_ID_KEYS)
+  if (!externalReturnId) return null
+
+  return {
+    externalReturnId,
+    externalWarehouseId: getFirstString(record, ['warehouseId', 'WarehouseId', 'externalWarehouseId', 'ExternalWarehouseId']),
+    sku: getFirstString(record, STOCK_SKU_KEYS),
+    qty: getFirstNumber(record, RETURN_QTY_KEYS),
+    orderReference: getFirstString(record, RETURN_ORDER_REFERENCE_KEYS),
+    reason: getFirstString(record, RETURN_REASON_KEYS),
+    receivedAt: getFirstDate(record, RETURN_RECEIVED_AT_KEYS),
     raw: record,
   }
 }
