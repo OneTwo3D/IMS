@@ -418,6 +418,9 @@ async function ensureMintsoftConnectionId(): Promise<string> {
 
 const MINTSOFT_WAREHOUSE_CACHE_TTL_MS = 5 * 60 * 1000
 
+// This cache is process-local. In a single-instance deploy it avoids hitting
+// Mintsoft on every dashboard render; in a horizontally scaled setup each app
+// instance will still perform its own refresh.
 let mintsoftWarehouseLookupCache:
   | {
       key: string

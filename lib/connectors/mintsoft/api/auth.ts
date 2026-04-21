@@ -3,6 +3,9 @@ import { db } from '@/lib/db'
 import { getMintsoftSettings } from '@/lib/connectors/mintsoft/settings/schema'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 
+// The cached 24-hour Mintsoft API key lives in the same setting slot that older
+// code treated as the credential itself. That keeps one canonical "current API
+// key" row in storage while username/password remain the renewable source.
 export const MINTSOFT_AUTH_TOKEN_KEY = 'mintsoft_api_key'
 
 const AUTH_TOKEN_TTL_MS = 24 * 60 * 60 * 1000
@@ -238,7 +241,7 @@ export async function isMintsoftConfigured(): Promise<boolean> {
   return Boolean(
     config.baseUrl
       && (
-        (config.username && config.password)
+        ((config.username && config.password))
         || cachedApiKey
       ),
   )

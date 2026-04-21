@@ -68,6 +68,10 @@ function buildDiscrepancyWhere(binding: SyncBinding, category: string, productId
   }
 }
 
+function isUniqueConstraintError(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'
+}
+
 async function getSyncBinding(bindingId: string): Promise<SyncBinding | null> {
   return db.externalWmsBinding.findFirst({
     where: {
@@ -111,46 +115,69 @@ async function upsertDiscrepancy(params: {
   delta: number | null
   message: string | null
 }) {
-  const existing = await db.wmsStockDiscrepancy.findFirst({
-    where: buildDiscrepancyWhere(params.binding, params.category, params.productId, params.sku),
-    select: { id: true, detectionCount: true },
-    orderBy: { lastSeenAt: 'desc' },
-  })
+  const where = buildDiscrepancyWhere(params.binding, params.category, params.productId, params.sku)
+  const now = new Date()
 
-  if (existing) {
-    await db.wmsStockDiscrepancy.update({
-      where: { id: existing.id },
-      data: {
-        imsValue: params.imsValue,
-        wmsValue: params.wmsValue,
-        delta: params.delta,
-        message: params.message,
-        lastSeenAt: new Date(),
-        detectionCount: existing.detectionCount + 1,
-        resolvedAt: null,
-        resolvedBy: null,
-        resolvedNote: null,
-      },
-    })
-    return existing.id
-  }
-
-  const created = await db.wmsStockDiscrepancy.create({
+  const updated = await db.wmsStockDiscrepancy.updateMany({
+    where,
     data: {
-      connector: 'mintsoft',
-      warehouseId: params.binding.warehouseId,
-      productId: params.productId,
-      sku: params.sku,
-      category: params.category,
       imsValue: params.imsValue,
       wmsValue: params.wmsValue,
       delta: params.delta,
       message: params.message,
+      lastSeenAt: now,
+      detectionCount: {
+        increment: 1,
+      },
+      resolvedAt: null,
+      resolvedBy: null,
+      resolvedNote: null,
     },
-    select: { id: true },
   })
+  if (updated.count > 0) {
+    return
+  }
 
-  return created.id
+  try {
+    await db.wmsStockDiscrepancy.create({
+      data: {
+        connector: 'mintsoft',
+        warehouseId: params.binding.warehouseId,
+        productId: params.productId,
+        sku: params.sku,
+        category: params.category,
+        status: 'OPEN',
+        imsValue: params.imsValue,
+        wmsValue: params.wmsValue,
+        delta: params.delta,
+        message: params.message,
+        firstSeenAt: now,
+        lastSeenAt: now,
+      },
+    })
+    return
+  } catch (error) {
+    if (!isUniqueConstraintError(error)) {
+      throw error
+    }
+  }
+
+  await db.wmsStockDiscrepancy.updateMany({
+    where,
+    data: {
+      imsValue: params.imsValue,
+      wmsValue: params.wmsValue,
+      delta: params.delta,
+      message: params.message,
+      lastSeenAt: now,
+      detectionCount: {
+        increment: 1,
+      },
+      resolvedAt: null,
+      resolvedBy: null,
+      resolvedNote: null,
+    },
+  })
 }
 
 async function resolveOpenDiscrepancies(binding: SyncBinding, productId: string, sku: string) {

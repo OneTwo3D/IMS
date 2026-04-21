@@ -1905,6 +1905,9 @@ model WmsStockDiscrepancy {
   productId      String?
   sku            String?
   category       WmsDiscrepancyCategory
+  /// Only one OPEN discrepancy per connector/warehouse/category/product-or-sku
+  /// is allowed. This is enforced with partial unique SQL indexes because
+  /// Prisma cannot express filtered uniqueness in the schema DSL.
   status         WmsDiscrepancyStatus @default(OPEN)
   imsValue       String?
   wmsValue       String?
