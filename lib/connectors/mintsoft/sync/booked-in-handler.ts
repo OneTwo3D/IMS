@@ -266,7 +266,7 @@ export async function processMintsoftBookedInEvent(
         },
       })
       if (lineIds.length > 0) {
-        await tx.$executeRaw`SELECT id FROM wms_asn_line_maps WHERE id = ANY(${lineIds.map((line) => line.id)}::text[]) FOR UPDATE`
+        await tx.$executeRaw`SELECT id FROM wms_asn_line_maps WHERE id = ANY(${lineIds.map((line) => line.id)}::text[]) ORDER BY id FOR UPDATE`
       }
 
       const asnLines = await tx.wmsAsnLineMap.findMany({

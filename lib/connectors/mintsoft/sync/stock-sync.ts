@@ -554,14 +554,14 @@ async function lockAlignmentCandidateLines(
   candidateIds: string[],
 ): Promise<void> {
   if (candidateIds.length === 0) return
-  await tx.$executeRaw`SELECT id FROM wms_asn_line_maps WHERE id = ANY(${candidateIds}::text[]) FOR UPDATE`
+  await tx.$executeRaw`SELECT id FROM wms_asn_line_maps WHERE id = ANY(${candidateIds}::text[]) ORDER BY id FOR UPDATE`
 }
 
 async function lockStockLevelForAlignment(
   tx: Prisma.TransactionClient,
   productId: string,
   warehouseId: string,
-): Promise<{ reservedQty: number }> {
+): Promise<{ reservedQty: number; quantity: number }> {
   await tx.stockLevel.upsert({
     where: {
       productId_warehouseId: {
@@ -602,6 +602,7 @@ async function lockStockLevelForAlignment(
 
   return {
     reservedQty: Number(stockLevel?.reservedQty ?? 0),
+    quantity: Number(stockLevel?.quantity ?? 0),
   }
 }
 
@@ -778,6 +779,8 @@ async function applyMintsoftAlignmentForProduct(params: {
       allocationCount: plan.allocations.length,
       reason: `Aligned ${formatQuantity(params.delta)} from Mintsoft to ${plan.allocations.length} open ASN line${plan.allocations.length === 1 ? '' : 's'}.`,
       reservedQty: stockLevel.reservedQty,
+      quantityBefore: stockLevel.quantity,
+      quantityAfter: stockLevel.quantity + params.delta,
       allocations: plan.allocations.map((allocation) => {
         const candidate = candidateById.get(allocation.asnLineMapId)
         if (!candidate) {
@@ -795,20 +798,27 @@ async function applyMintsoftAlignmentForProduct(params: {
   }, { maxWait: 5000, timeout: 30000 })
 
   if (outcome.kind === 'applied') {
+    const reservedExceedsAvailable = outcome.reservedQty > outcome.quantityAfter
     await logActivity({
       entityType: 'SYNC',
       entityId: params.binding.id,
       tag: 'sync',
       action: 'mintsoft_alignment_applied',
-      description: `Applied Mintsoft alignment for ${params.sku} in ${params.binding.warehouse.code}`,
+      description: reservedExceedsAvailable
+        ? `Applied Mintsoft alignment for ${params.sku} in ${params.binding.warehouse.code} — reservations exceed aligned quantity`
+        : `Applied Mintsoft alignment for ${params.sku} in ${params.binding.warehouse.code}`,
       metadata: {
         warehouseId: params.binding.warehouseId,
         productId: params.productId,
         sku: params.sku,
         delta: params.delta,
         reservedQty: outcome.reservedQty,
+        quantityBefore: outcome.quantityBefore,
+        quantityAfter: outcome.quantityAfter,
+        reservedExceedsAvailable,
         allocations: outcome.allocations,
       },
+      level: reservedExceedsAvailable ? 'WARNING' : undefined,
       resolveUser: false,
     })
   }
