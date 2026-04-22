@@ -30,6 +30,8 @@ This repository uses an `x.y.z` release scheme.
 - Made Mintsoft booked-in webhook processing durable by adding a `mintsoft-webhook-sweeper` cron that drains any `wmsInboundReceiptEvent` rows whose in-process replay failed or raced with ASN finalization, so accepted callbacks can no longer be stranded unprocessed.
 - Revalidated outstanding purchase order quantities under the PO row lock immediately before Mintsoft ASN recover/create, aborting and resetting the pending reservation if a manual receipt consumed the outstanding quantity in the interim, so the remote ASN can never publish stock that is already received.
 - Fenced the Mintsoft stock-sync stale-job reclaim with a compare-and-swap on the observed lease token and heartbeat timestamp, so a live worker heartbeat can no longer be overwritten by a reclaim that read its state moments earlier.
+- Ordered the Mintsoft alignment and booked-in handler `FOR UPDATE` locks on `wms_asn_line_maps` by `id` so concurrent alignment runs and ASN webhook processing always acquire overlapping row locks in the same order, eliminating a deadlock window.
+- Escalated the Mintsoft alignment activity log to WARNING with a `reservedExceedsAvailable` flag when post-align reservations still exceed available stock, surfacing stale allocations instead of silently logging the correction.
 
 ## 1.4.1 - 2026-04-19
 
