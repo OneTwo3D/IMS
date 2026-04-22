@@ -595,9 +595,32 @@ async function syncMintsoftBundleBestEffort(productId: string): Promise<void> {
   }
 }
 
+async function syncMintsoftParentBundlesBestEffort(productId: string): Promise<void> {
+  try {
+    if (!await isIntegrationPluginEnabled('mintsoft')) {
+      return
+    }
+    const parents = await db.productComponent.findMany({
+      where: { componentId: productId },
+      select: { productId: true },
+    })
+    const unique = Array.from(new Set(parents.map((parent) => parent.productId)))
+    for (const parentId of unique) {
+      try {
+        await runBundleSyncForProduct(parentId, 'product_mutation')
+      } catch (error) {
+        console.error('[mintsoft bundle sync] parent KIT sync failed', parentId, error)
+      }
+    }
+  } catch (syncError) {
+    console.error(syncError)
+  }
+}
+
 function scheduleMintsoftProductSync(productId: string) {
   after(() => syncMintsoftProductBestEffort(productId))
   after(() => syncMintsoftBundleBestEffort(productId))
+  after(() => syncMintsoftParentBundlesBestEffort(productId))
 }
 
 export async function createProduct(

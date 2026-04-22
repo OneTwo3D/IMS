@@ -22,6 +22,11 @@ This repository uses an `x.y.z` release scheme.
 - Serialized Mintsoft bundle creation via a `WmsBundleLink` sentinel claim so concurrent product saves or cron+manual runs can no longer double-PUT to `/api/Product/Bundle`; stale sentinels older than 10 minutes are reclaimable.
 - Reordered the Mintsoft bundle normalizer id precedence to prefer the bundle `ID` over any `ProductId` alias so a root `ProductId` can never be mis-selected as the external bundle id.
 - Raise a `BUNDLE_DERIVATION_CONFLICT` when an active-binding KIT has no components, instead of silently skipping and leaving the Mintsoft bundle unchanged.
+- Made Mintsoft bundle-sync decisions per-binding-scope so a single `IMS_TO_WMS` binding no longer suppresses `WMS_TO_IMS` conflicts on other warehouses: push scopes and pull scopes now each get their own conflict rows with direction-specific wording.
+- Extended the Mintsoft bundle verify scan to include KITs with an existing `WmsBundleLink`, not only those with an active `WmsProductLink`, so orphaned bundle mappings stay monitored.
+- Escalated Mintsoft bundle finalize-after-create failures with three retry attempts plus an `ERROR`-level `mintsoft_bundle_finalize_failed` activity log carrying the remote bundle id, checksum, and sentinel link id for manual recovery.
+- Also schedule Mintsoft bundle sync for parent KITs when a component product is saved, so component SKU or Mintsoft-link changes no longer leave parent bundles stale until the next cron.
+- Filtered pending Mintsoft bundle sentinels (`pending:*` external ids) out of the dashboard Bundles table so operators only see real Mintsoft bundle ids.
 
 ## 1.5.0 - 2026-04-21
 

@@ -778,7 +778,10 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
       },
     }),
     db.wmsBundleLink.findMany({
-      where: { connector: 'mintsoft' },
+      where: {
+        connector: 'mintsoft',
+        NOT: { externalBundleId: { startsWith: 'pending:' } },
+      },
       orderBy: [{ lastSyncedAt: 'desc' }, { updatedAt: 'desc' }],
       take: 20,
       select: {

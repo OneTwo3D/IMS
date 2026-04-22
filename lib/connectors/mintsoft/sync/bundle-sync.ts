@@ -187,16 +187,6 @@ async function getBundleSyncScopes(): Promise<BundleSyncScope[]> {
   }))
 }
 
-function resolveEffectiveDirection(scopes: BundleSyncScope[]): WmsBundleSyncDirection {
-  if (scopes.some((scope) => scope.direction === WmsBundleSyncDirection.IMS_TO_WMS)) {
-    return WmsBundleSyncDirection.IMS_TO_WMS
-  }
-  if (scopes.some((scope) => scope.direction === WmsBundleSyncDirection.WMS_TO_IMS)) {
-    return WmsBundleSyncDirection.WMS_TO_IMS
-  }
-  return WmsBundleSyncDirection.DISABLED
-}
-
 function isUniqueConstraintError(error: unknown): boolean {
   return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'
 }
@@ -359,15 +349,27 @@ async function releaseBundleCreateSlot(linkId: string): Promise<void> {
 async function finalizeBundleLink(linkId: string, params: {
   externalBundleId: string
   checksum: string
-}): Promise<void> {
-  await db.wmsBundleLink.update({
-    where: { id: linkId },
-    data: {
-      externalBundleId: params.externalBundleId,
-      checksum: params.checksum,
-      lastSyncedAt: new Date(),
-    },
-  })
+}): Promise<{ success: boolean; lastError: Error | null }> {
+  let lastError: Error | null = null
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      await db.wmsBundleLink.update({
+        where: { id: linkId },
+        data: {
+          externalBundleId: params.externalBundleId,
+          checksum: params.checksum,
+          lastSyncedAt: new Date(),
+        },
+      })
+      return { success: true, lastError: null }
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error))
+      if (attempt < 2) {
+        await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)))
+      }
+    }
+  }
+  return { success: false, lastError }
 }
 
 async function persistBundleLink(params: {
@@ -418,8 +420,9 @@ async function syncBundleInternal(
     }
   }
 
-  const direction = resolveEffectiveDirection(scopes)
-  if (direction === WmsBundleSyncDirection.DISABLED) {
+  const pushScopes = scopes.filter((scope) => scope.direction === WmsBundleSyncDirection.IMS_TO_WMS)
+  const pullScopes = scopes.filter((scope) => scope.direction === WmsBundleSyncDirection.WMS_TO_IMS)
+  if (pushScopes.length === 0 && pullScopes.length === 0) {
     return {
       status: 'SKIPPED',
       action: 'noop',
@@ -580,16 +583,26 @@ async function syncBundleInternal(
       }
     }
 
-    await upsertBundleConflict({
-      scopes,
-      productId,
-      sku: candidate.sku,
-      imsValue: summariseComponents(imsComponents),
-      wmsValue: summariseComponents(remoteComponents),
-      message: direction === WmsBundleSyncDirection.IMS_TO_WMS
-        ? 'Mintsoft bundle composition differs from IMS and cannot be updated via the Mintsoft API.'
-        : 'Mintsoft bundle composition differs from IMS. Resolve manually per WMS_TO_IMS review.',
-    })
+    if (pushScopes.length > 0) {
+      await upsertBundleConflict({
+        scopes: pushScopes,
+        productId,
+        sku: candidate.sku,
+        imsValue: summariseComponents(imsComponents),
+        wmsValue: summariseComponents(remoteComponents),
+        message: 'Mintsoft bundle composition differs from IMS and cannot be updated via the Mintsoft API.',
+      })
+    }
+    if (pullScopes.length > 0) {
+      await upsertBundleConflict({
+        scopes: pullScopes,
+        productId,
+        sku: candidate.sku,
+        imsValue: summariseComponents(imsComponents),
+        wmsValue: summariseComponents(remoteComponents),
+        message: 'Mintsoft bundle composition differs from IMS. Update IMS to match Mintsoft or resolve the discrepancy manually.',
+      })
+    }
 
     return {
       status: 'CONFLICT',
@@ -602,19 +615,19 @@ async function syncBundleInternal(
     }
   }
 
-  if (direction !== WmsBundleSyncDirection.IMS_TO_WMS) {
+  if (pushScopes.length === 0) {
     await upsertBundleConflict({
-      scopes,
+      scopes: pullScopes,
       productId,
       sku: candidate.sku,
       imsValue: summariseComponents(imsComponents),
       wmsValue: null,
-      message: 'Mintsoft has no bundle for this KIT product but the binding direction is WMS_TO_IMS.',
+      message: 'Mintsoft has no bundle for this KIT product but every active binding is pull-only.',
     })
     return {
       status: 'CONFLICT',
       action: 'conflict',
-      reason: 'Mintsoft has no bundle for this KIT and this binding is pull-only.',
+      reason: 'Mintsoft has no bundle for this KIT and every active binding is pull-only.',
       productId,
       sku: candidate.sku,
       checksum,
@@ -659,10 +672,39 @@ async function syncBundleInternal(
     }
   }
 
-  await finalizeBundleLink(claim.linkId, {
+  const finalize = await finalizeBundleLink(claim.linkId, {
     externalBundleId: created.externalBundleId,
     checksum,
   })
+  if (!finalize.success) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      entityId: productId,
+      tag: 'sync',
+      action: 'mintsoft_bundle_finalize_failed',
+      description: `Mintsoft bundle for ${candidate.sku} was created remotely but the local link finalize failed — manual recovery required`,
+      metadata: {
+        productId,
+        sku: candidate.sku,
+        externalBundleId: created.externalBundleId,
+        checksum,
+        triggeredBy,
+        linkId: claim.linkId,
+        error: finalize.lastError?.message ?? 'unknown',
+      },
+      level: 'ERROR',
+      resolveUser: false,
+    })
+    return {
+      status: 'ERROR',
+      action: 'conflict',
+      reason: `Mintsoft bundle was created remotely but the local link finalize failed: ${finalize.lastError?.message ?? 'unknown error'}`,
+      productId,
+      sku: candidate.sku,
+      checksum,
+      externalBundleId: created.externalBundleId,
+    }
+  }
   await resolveBundleConflict(scopes, productId)
   await logActivity({
     entityType: 'SYSTEM',
@@ -719,7 +761,10 @@ export async function runMintsoftBundleVerify(
     where: {
       type: ProductType.KIT,
       lifecycleStatus: { not: ProductLifecycleStatus.ARCHIVED },
-      wmsProductLinks: { some: { connector: CONNECTOR } },
+      OR: [
+        { wmsProductLinks: { some: { connector: CONNECTOR } } },
+        { wmsBundleLinks: { some: { connector: CONNECTOR } } },
+      ],
     },
     select: { id: true },
     orderBy: { sku: 'asc' },
