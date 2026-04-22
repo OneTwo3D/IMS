@@ -376,6 +376,7 @@ test.describe('Mintsoft integration workflows', () => {
     const externalEventId = `mintsoft-event-${suffix}`
     const externalAsnId = `ASN-${suffix}`
     const webhookSecret = 'e2e-mintsoft-webhook-secret'
+    const occurredAt = new Date().toISOString()
 
     await seedMintsoftE2e(page, {
       pluginEnabled: true,
@@ -386,6 +387,7 @@ test.describe('Mintsoft integration workflows', () => {
       eventId: externalEventId,
       asnId: externalAsnId,
       status: 'BookedIn',
+      occurredAt,
     })
     const signature = createHmac('sha256', webhookSecret).update(rawBody, 'utf8').digest('hex')
 
