@@ -112,6 +112,22 @@ test('normalizeMintsoftBundle accepts the documented Mintsoft Bundle shape', () 
   )
 })
 
+test('normalizeMintsoftBundle prefers bundle ID over component-level productId aliases', () => {
+  const result = normalizers.normalizeMintsoftBundle({
+    ID: 42,
+    ProductId: 9999,
+    SKU: 'KIT-AA',
+    Name: 'Assorted',
+    Components: [
+      { ProductId: 100, SKU: 'A', Quantity: 2 },
+    ],
+  })
+
+  assert.ok(result)
+  assert.equal(result?.externalBundleId, '42')
+  assert.notEqual(result?.externalBundleId, '9999')
+})
+
 test('normalizeMintsoftBundle rejects payload without SKU or ID', () => {
   assert.equal(normalizers.normalizeMintsoftBundle({ Components: [] }), null)
   assert.equal(normalizers.normalizeMintsoftBundle({ SKU: 'KIT-1', Components: [] }), null)

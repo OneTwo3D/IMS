@@ -7,6 +7,16 @@ import { getWmsConnector } from '@/lib/connectors/wms/registry'
 
 const BUNDLE_CONCURRENCY = 4
 const CONNECTOR = 'mintsoft' as const
+const BUNDLE_SENTINEL_PREFIX = 'pending:'
+const BUNDLE_SENTINEL_STALE_MS = 10 * 60 * 1000
+
+function buildBundleSentinel(): string {
+  return `${BUNDLE_SENTINEL_PREFIX}${Date.now()}`
+}
+
+function isBundleSentinel(externalBundleId: string | null | undefined): boolean {
+  return typeof externalBundleId === 'string' && externalBundleId.startsWith(BUNDLE_SENTINEL_PREFIX)
+}
 
 type BundleSyncScope = {
   warehouseId: string
@@ -285,6 +295,81 @@ async function resolveBundleConflict(scopes: BundleSyncScope[], productId: strin
   })
 }
 
+async function claimBundleCreateSlot(productId: string): Promise<
+  | { kind: 'claimed'; linkId: string }
+  | { kind: 'conflict'; reason: string }
+> {
+  try {
+    const created = await db.wmsBundleLink.create({
+      data: {
+        connector: CONNECTOR,
+        productId,
+        externalBundleId: buildBundleSentinel(),
+        checksum: null,
+      },
+      select: { id: true },
+    })
+    return { kind: 'claimed', linkId: created.id }
+  } catch (error) {
+    if (!isUniqueConstraintError(error)) throw error
+  }
+
+  const existing = await db.wmsBundleLink.findUnique({
+    where: { connector_productId: { connector: CONNECTOR, productId } },
+    select: { id: true, externalBundleId: true, checksum: true, updatedAt: true },
+  })
+  if (!existing) return { kind: 'conflict', reason: 'Bundle sync already in progress for this product.' }
+
+  if (!isBundleSentinel(existing.externalBundleId)) {
+    return { kind: 'conflict', reason: 'Bundle link already exists; follow the existing-link path.' }
+  }
+
+  const ageMs = Date.now() - existing.updatedAt.getTime()
+  if (ageMs < BUNDLE_SENTINEL_STALE_MS) {
+    return { kind: 'conflict', reason: 'Bundle sync already in progress for this product.' }
+  }
+
+  const stolen = await db.wmsBundleLink.updateMany({
+    where: {
+      id: existing.id,
+      externalBundleId: existing.externalBundleId,
+    },
+    data: {
+      externalBundleId: buildBundleSentinel(),
+      checksum: null,
+    },
+  })
+  if (stolen.count === 0) {
+    return { kind: 'conflict', reason: 'Another worker reclaimed the stale bundle sentinel first.' }
+  }
+  return { kind: 'claimed', linkId: existing.id }
+}
+
+async function releaseBundleCreateSlot(linkId: string): Promise<void> {
+  await db.wmsBundleLink.deleteMany({
+    where: {
+      id: linkId,
+      externalBundleId: { startsWith: BUNDLE_SENTINEL_PREFIX },
+    },
+  }).catch((error) => {
+    console.error('[mintsoft bundle sync] failed to release sentinel', linkId, error)
+  })
+}
+
+async function finalizeBundleLink(linkId: string, params: {
+  externalBundleId: string
+  checksum: string
+}): Promise<void> {
+  await db.wmsBundleLink.update({
+    where: { id: linkId },
+    data: {
+      externalBundleId: params.externalBundleId,
+      checksum: params.checksum,
+      lastSyncedAt: new Date(),
+    },
+  })
+}
+
 async function persistBundleLink(params: {
   productId: string
   externalBundleId: string
@@ -372,9 +457,17 @@ async function syncBundleInternal(
 
   const imsComponents = toImsComponents(candidate)
   if (imsComponents.length === 0) {
+    await upsertBundleConflict({
+      scopes,
+      productId,
+      sku: candidate.sku,
+      imsValue: '(no components)',
+      wmsValue: null,
+      message: 'KIT product has no components but bundle sync is enabled — Mintsoft may still retain the original bundle. Resolve by adding components, disabling bundle sync for this binding, or clearing the bundle in Mintsoft.',
+    })
     return {
-      status: 'SKIPPED',
-      action: 'noop',
+      status: 'CONFLICT',
+      action: 'conflict',
       reason: 'KIT product has no components to sync.',
       productId,
       sku: candidate.sku,
@@ -382,7 +475,10 @@ async function syncBundleInternal(
   }
 
   const wmsProductLink = candidate.wmsProductLinks[0] ?? null
-  const existingBundleLink = candidate.wmsBundleLinks[0] ?? null
+  const rawBundleLink = candidate.wmsBundleLinks[0] ?? null
+  const existingBundleLink = rawBundleLink && !isBundleSentinel(rawBundleLink.externalBundleId)
+    ? rawBundleLink
+    : null
 
   const dto: WmsBundleDto = {
     sku: candidate.sku,
@@ -536,40 +632,23 @@ async function syncBundleInternal(
     }
   }
 
-  try {
-    const created = await connector.createBundle(dto)
-    await persistBundleLink({
-      productId,
-      externalBundleId: created.externalBundleId,
-      checksum,
-    })
-    await resolveBundleConflict(scopes, productId)
-    await logActivity({
-      entityType: 'SYSTEM',
-      entityId: productId,
-      tag: 'sync',
-      action: 'mintsoft_bundle_created',
-      description: `Created Mintsoft bundle for ${candidate.sku}`,
-      metadata: {
-        productId,
-        sku: candidate.sku,
-        externalBundleId: created.externalBundleId,
-        checksum,
-        triggeredBy,
-        componentCount: imsComponents.length,
-      },
-      resolveUser: false,
-    })
+  const claim = await claimBundleCreateSlot(productId)
+  if (claim.kind === 'conflict') {
     return {
-      status: 'SYNCED',
-      action: 'created',
-      reason: 'Created new bundle in Mintsoft.',
+      status: 'SKIPPED',
+      action: 'noop',
+      reason: claim.reason,
       productId,
       sku: candidate.sku,
       checksum,
-      externalBundleId: created.externalBundleId,
     }
+  }
+
+  let created: WmsBundleRef
+  try {
+    created = await connector.createBundle(dto)
   } catch (error) {
+    await releaseBundleCreateSlot(claim.linkId)
     return {
       status: 'ERROR',
       action: 'conflict',
@@ -578,6 +657,37 @@ async function syncBundleInternal(
       sku: candidate.sku,
       checksum,
     }
+  }
+
+  await finalizeBundleLink(claim.linkId, {
+    externalBundleId: created.externalBundleId,
+    checksum,
+  })
+  await resolveBundleConflict(scopes, productId)
+  await logActivity({
+    entityType: 'SYSTEM',
+    entityId: productId,
+    tag: 'sync',
+    action: 'mintsoft_bundle_created',
+    description: `Created Mintsoft bundle for ${candidate.sku}`,
+    metadata: {
+      productId,
+      sku: candidate.sku,
+      externalBundleId: created.externalBundleId,
+      checksum,
+      triggeredBy,
+      componentCount: imsComponents.length,
+    },
+    resolveUser: false,
+  })
+  return {
+    status: 'SYNCED',
+    action: 'created',
+    reason: 'Created new bundle in Mintsoft.',
+    productId,
+    sku: candidate.sku,
+    checksum,
+    externalBundleId: created.externalBundleId,
   }
 }
 

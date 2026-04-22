@@ -19,6 +19,9 @@ This repository uses an `x.y.z` release scheme.
 - Landed `lib/connectors/mintsoft/sync/bundle-sync.ts` with deterministic composition hashing (sorted by component SKU, quantity rounded to 4 dp), `WmsBundleLink` persistence, `BUNDLE_DERIVATION_CONFLICT` upsert per active binding warehouse, and auto-resolution on match. Bundle sync never mutates IMS stock — it only reconciles composition structure.
 - Registered the `mintsoft-bundle-verify` cron (nightly, disabled by default) and added the `runMintsoftBundleVerifyNow` server action under write-scope permission.
 - Hooked best-effort bundle sync into the existing `after()` path on product create/update so KIT composition changes propagate to Mintsoft without blocking the interactive submit.
+- Serialized Mintsoft bundle creation via a `WmsBundleLink` sentinel claim so concurrent product saves or cron+manual runs can no longer double-PUT to `/api/Product/Bundle`; stale sentinels older than 10 minutes are reclaimable.
+- Reordered the Mintsoft bundle normalizer id precedence to prefer the bundle `ID` over any `ProductId` alias so a root `ProductId` can never be mis-selected as the external bundle id.
+- Raise a `BUNDLE_DERIVATION_CONFLICT` when an active-binding KIT has no components, instead of silently skipping and leaving the Mintsoft bundle unchanged.
 
 ## 1.5.0 - 2026-04-21
 

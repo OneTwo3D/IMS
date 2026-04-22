@@ -215,7 +215,7 @@ export function normalizeMintsoftAsnLine(value: unknown): WmsAsnLineRef | null {
   }
 }
 
-const BUNDLE_ID_KEYS = ['externalBundleId', 'ExternalBundleId', 'productId', 'ProductId', 'bundleId', 'BundleId', 'id', 'Id', 'ID']
+const BUNDLE_ID_KEYS = ['ID', 'Id', 'id', 'externalBundleId', 'ExternalBundleId', 'bundleId', 'BundleId']
 const BUNDLE_NAME_KEYS = ['name', 'Name', 'bundleName', 'BundleName', 'description', 'Description']
 const BUNDLE_COMPONENT_KEYS = ['components', 'Components', 'items', 'Items', 'bundleItems', 'BundleItems'] as const
 const BUNDLE_COMPONENT_PRODUCT_ID_KEYS = ['productId', 'ProductId', 'componentProductId', 'ComponentProductId', 'id', 'Id', 'ID']
