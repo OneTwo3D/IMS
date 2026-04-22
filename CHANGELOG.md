@@ -27,6 +27,7 @@ This repository uses an `x.y.z` release scheme.
 - Escalated Mintsoft bundle finalize-after-create failures with three retry attempts plus an `ERROR`-level `mintsoft_bundle_finalize_failed` activity log carrying the remote bundle id, checksum, and sentinel link id for manual recovery.
 - Also schedule Mintsoft bundle sync for parent KITs when a component product is saved, so component SKU or Mintsoft-link changes no longer leave parent bundles stale until the next cron.
 - Filtered pending Mintsoft bundle sentinels (`pending:*` external ids) out of the dashboard Bundles table so operators only see real Mintsoft bundle ids.
+- Moved the Mintsoft bundle parent-product-link requirement from an early return to the push branch only, so a KIT with a persisted `WmsBundleLink` but no `WmsProductLink` is now fully verified against Mintsoft instead of being skipped the moment verify picks it up.
 
 ## 1.5.0 - 2026-04-21
 

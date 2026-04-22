@@ -496,7 +496,7 @@ async function syncBundleInternal(
     components: dto.components,
   })
 
-  if (!wmsProductLink) {
+  if (!wmsProductLink && !existingBundleLink) {
     return {
       status: 'SKIPPED',
       action: 'no_wms_product_link',
@@ -540,19 +540,20 @@ async function syncBundleInternal(
     }
   }
 
+  const fetchKey = existingBundleLink?.externalBundleId ?? wmsProductLink?.externalProductId ?? null
   let remote: WmsBundleRef | null = null
-  try {
-    remote = existingBundleLink
-      ? await connector.fetchBundle?.(existingBundleLink.externalBundleId) ?? null
-      : await connector.fetchBundle?.(wmsProductLink.externalProductId) ?? null
-  } catch (error) {
-    return {
-      status: 'ERROR',
-      action: 'conflict',
-      reason: error instanceof Error ? error.message : 'Mintsoft bundle fetch failed.',
-      productId,
-      sku: candidate.sku,
-      checksum,
+  if (fetchKey) {
+    try {
+      remote = await connector.fetchBundle?.(fetchKey) ?? null
+    } catch (error) {
+      return {
+        status: 'ERROR',
+        action: 'conflict',
+        reason: error instanceof Error ? error.message : 'Mintsoft bundle fetch failed.',
+        productId,
+        sku: candidate.sku,
+        checksum,
+      }
     }
   }
 
@@ -628,6 +629,17 @@ async function syncBundleInternal(
       status: 'CONFLICT',
       action: 'conflict',
       reason: 'Mintsoft has no bundle for this KIT and every active binding is pull-only.',
+      productId,
+      sku: candidate.sku,
+      checksum,
+    }
+  }
+
+  if (!wmsProductLink) {
+    return {
+      status: 'SKIPPED',
+      action: 'no_wms_product_link',
+      reason: 'Parent KIT product has no Mintsoft product link yet; push the product before creating a bundle.',
       productId,
       sku: candidate.sku,
       checksum,
