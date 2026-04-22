@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from 'crypto'
+import { createHash, createHmac, timingSafeEqual } from 'crypto'
 import { db } from '@/lib/db'
 import { getMintsoftSettings } from '@/lib/connectors/mintsoft/settings/schema'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
@@ -7,6 +7,7 @@ import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 // code treated as the credential itself. That keeps one canonical "current API
 // key" row in storage while username/password remain the renewable source.
 export const MINTSOFT_AUTH_TOKEN_KEY = 'mintsoft_api_key'
+export const DEFAULT_MINTSOFT_CONNECTION_LABEL = 'Primary'
 
 const AUTH_TOKEN_TTL_MS = 24 * 60 * 60 * 1000
 const AUTH_TOKEN_REFRESH_BUFFER_MS = 15 * 60 * 1000
@@ -18,10 +19,9 @@ function normalizeSignatureValue(signature: string): string {
 }
 
 function safeCompareSignature(expected: string, provided: string): boolean {
-  const expectedBuffer = Buffer.from(expected, 'utf8')
-  const providedBuffer = Buffer.from(provided, 'utf8')
-  if (expectedBuffer.length !== providedBuffer.length) return false
-  return timingSafeEqual(expectedBuffer, providedBuffer)
+  const expectedBuffer = createHash('sha256').update(expected, 'utf8').digest()
+  const providedBuffer = createHash('sha256').update(provided, 'utf8').digest()
+  return timingSafeEqual(expectedBuffer, providedBuffer) && expected === provided
 }
 
 export function normalizeMintsoftBaseUrl(value: string): string | null {
@@ -95,8 +95,8 @@ function isMintsoftAuthTokenFresh(token: string | null, expiresAt: Date | null, 
 async function persistMintsoftAuthSession(token: string, expiresAt: Date): Promise<void> {
   const now = new Date()
 
-  await db.$transaction([
-    db.setting.upsert({
+  await db.$transaction(async (tx) => {
+    await tx.setting.upsert({
       where: { key: MINTSOFT_AUTH_TOKEN_KEY },
       create: {
         key: MINTSOFT_AUTH_TOKEN_KEY,
@@ -105,20 +105,34 @@ async function persistMintsoftAuthSession(token: string, expiresAt: Date): Promi
       update: {
         value: serializeSettingValue(MINTSOFT_AUTH_TOKEN_KEY, token),
       },
-    }),
-    db.wmsConnection.upsert({
+    })
+
+    const existingConnection = await tx.wmsConnection.findFirst({
       where: { connector: 'mintsoft' },
-      create: {
+      orderBy: [{ createdAt: 'asc' }],
+      select: { id: true },
+    })
+
+    if (existingConnection) {
+      await tx.wmsConnection.update({
+        where: { id: existingConnection.id },
+        data: {
+          tokenExpiresAt: expiresAt,
+          lastAuthAt: now,
+        },
+      })
+      return
+    }
+
+    await tx.wmsConnection.create({
+      data: {
         connector: 'mintsoft',
+        label: DEFAULT_MINTSOFT_CONNECTION_LABEL,
         tokenExpiresAt: expiresAt,
         lastAuthAt: now,
       },
-      update: {
-        tokenExpiresAt: expiresAt,
-        lastAuthAt: now,
-      },
-    }),
-  ])
+    })
+  })
 }
 
 async function requestMintsoftAuthSession(
@@ -166,8 +180,9 @@ async function requestMintsoftAuthSession(
 }
 
 export async function getMintsoftConnectionRecord() {
-  return db.wmsConnection.findUnique({
+  return db.wmsConnection.findFirst({
     where: { connector: 'mintsoft' },
+    orderBy: [{ createdAt: 'asc' }],
   })
 }
 

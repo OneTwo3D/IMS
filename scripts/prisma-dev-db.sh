@@ -21,6 +21,13 @@ if [[ -z "${DATABASE_URL:-}" ]]; then
   exit 1
 fi
 
+if [[ "${PRISMA_DEV_DB_CONFIRM:-}" != "1" ]]; then
+  if [[ "${DATABASE_URL}" != *"localhost"* && "${DATABASE_URL}" != *"127.0.0.1"* && "${DATABASE_URL}" != *"onetwo3d_ims_dev"* ]]; then
+    echo "Refusing to run against a non-local DATABASE_URL without PRISMA_DEV_DB_CONFIRM=1." >&2
+    exit 1
+  fi
+fi
+
 command="${1:-}"
 shift || true
 

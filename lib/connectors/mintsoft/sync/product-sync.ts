@@ -178,7 +178,8 @@ export function buildMintsoftProductDto(product: ProductSyncCandidate): WmsProdu
 }
 
 export function hashMintsoftProductDto(product: WmsProductDto): string {
-  return createHash('sha256').update(JSON.stringify(product)).digest('hex')
+  const orderedEntries = Object.entries(product).sort(([left], [right]) => left.localeCompare(right))
+  return createHash('sha256').update(JSON.stringify(Object.fromEntries(orderedEntries))).digest('hex')
 }
 
 export function resolveMintsoftBarcodePlan(imsBarcode: string | null, wmsBarcode: string | null): BarcodePlan {

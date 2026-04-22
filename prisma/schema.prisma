@@ -1706,10 +1706,39 @@ enum WmsReturnsInboxStatus {
   DISMISSED
 }
 
+enum WmsAsnSourceType {
+  PURCHASE_ORDER
+  PURCHASE_ORDER_LINE
+  STOCK_TRANSFER
+  STOCK_TRANSFER_LINE
+}
+
+enum WmsAsnStatus {
+  CREATE_PENDING
+  CREATE_IN_FLIGHT
+  OPEN
+  PARTIALLY_BOOKED_IN
+  BOOKED_IN
+}
+
+enum WmsSyncLogAction {
+  created
+  updated
+  noop
+  sync
+  backfill
+  conflict
+  skip
+  discrepancy
+  error
+  asn_line_reconciled
+  asn_line_mapped
+}
+
 model WmsConnection {
   id                   String   @id @default(cuid())
   connector            String
-  label                String?
+  label                String   @default("Primary")
   active               Boolean  @default(true)
   baseUrl              String?
   orderLookupConnector String?
@@ -1721,7 +1750,7 @@ model WmsConnection {
 
   bindings             ExternalWmsBinding[]
 
-  @@unique([connector])
+  @@unique([connector, label])
   @@map("wms_connections")
 }
 
@@ -1788,6 +1817,7 @@ model WmsBundleLink {
 
   @@unique([connector, externalBundleId])
   @@unique([connector, productId])
+  @@index([productId])
   @@map("wms_bundle_links")
 }
 
@@ -1795,10 +1825,10 @@ model WmsAsnMap {
   id             String   @id @default(cuid())
   connector      String
   externalAsnId  String
-  sourceType     String
+  sourceType     WmsAsnSourceType
   sourceId       String
   warehouseId    String
-  status         String
+  status         WmsAsnStatus
   lastCallbackAt DateTime?
   closedAt       DateTime?
   createdAt      DateTime @default(now())
@@ -1816,7 +1846,7 @@ model WmsAsnLineMap {
   id                     String    @id @default(cuid())
   asnMapId               String
   externalAsnLineId      String
-  sourceType             String
+  sourceType             WmsAsnSourceType
   sourceLineId           String
   productId              String
   sku                    String
@@ -1825,6 +1855,7 @@ model WmsAsnLineMap {
   qtyAccountedViaReceipt  Decimal  @db.Decimal(12, 4) @default(0)
   lastProcessedReceivedQty Decimal @db.Decimal(12, 4) @default(0)
   lastCallbackAt         DateTime?
+  createdAt              DateTime  @default(now())
 
   asn                    WmsAsnMap @relation(fields: [asnMapId], references: [id], onDelete: Cascade)
   product                Product   @relation("WmsAsnLineMapProduct", fields: [productId], references: [id], onDelete: Restrict)
@@ -1857,6 +1888,7 @@ model WmsSyncJob {
   warehouse    Warehouse?       @relation("WmsSyncJobWarehouse", fields: [warehouseId], references: [id], onDelete: SetNull)
 
   @@index([connector, type, status, startedAt])
+  @@index([warehouseId, type, startedAt])
   @@map("wms_sync_jobs")
 }
 
@@ -1865,13 +1897,14 @@ model WmsSyncLog {
   jobId        String
   sku          String?
   productId    String?
-  action       String
+  action       WmsSyncLogAction
   imsQtyBefore Decimal?   @db.Decimal(12, 4)
   imsQtyAfter  Decimal?   @db.Decimal(12, 4)
   wmsQty       Decimal?   @db.Decimal(12, 4)
   delta        Decimal?   @db.Decimal(12, 4)
   reason       String?
   payload      Json?
+  createdAt    DateTime   @default(now())
 
   job          WmsSyncJob @relation(fields: [jobId], references: [id], onDelete: Cascade)
   product      Product?   @relation("WmsSyncLogProduct", fields: [productId], references: [id], onDelete: SetNull)
@@ -1920,10 +1953,11 @@ model WmsStockDiscrepancy {
   resolvedBy     String?
   resolvedNote   String?
 
-  warehouse      Warehouse            @relation("WmsStockDiscrepancyWarehouse", fields: [warehouseId], references: [id], onDelete: Cascade)
+  warehouse      Warehouse            @relation("WmsStockDiscrepancyWarehouse", fields: [warehouseId], references: [id], onDelete: Restrict)
   product        Product?             @relation("WmsStockDiscrepancyProduct", fields: [productId], references: [id], onDelete: SetNull)
 
   @@index([connector, status, category])
+  @@index([warehouseId, status])
   @@index([productId])
   @@map("wms_stock_discrepancies")
 }

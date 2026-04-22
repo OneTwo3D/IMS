@@ -88,7 +88,7 @@ export function OnboardingClient({
   const [currencyConfiguredOverride, setCurrencyConfiguredOverride] = useState<{ base: boolean; value: boolean } | null>(null)
   const [finishing, setFinishing] = useState(false)
   const [finishError, setFinishError] = useState('')
-  const [companyStepReady, setCompanyStepReady] = useState(initialCompanyConfigured)
+  const [companyStepDirty, setCompanyStepDirty] = useState(false)
   const [taxTouched, setTaxTouched] = useState(false)
   const [warehousesTouched, setWarehousesTouched] = useState(false)
   const [productsImported, setProductsImported] = useState(productCount > 0)
@@ -119,7 +119,7 @@ export function OnboardingClient({
 
   function isStepReady(index: number) {
     const key = STEPS[index]?.key
-    if (key === 'company') return companyConfigured || companyStepReady
+    if (key === 'company') return companyConfigured || companyStepDirty
     if (key === 'currency') return currencyConfigured
     if (key === 'tax') return taxTouched
     if (key === 'integrations') {
@@ -146,8 +146,18 @@ export function OnboardingClient({
     return STEPS.slice(0, index).every((_, priorIndex) => completedSteps.has(STEPS[priorIndex].key))
   }
 
+  async function persistCurrentStepBeforeAdvance(targetIndex: number) {
+    if (targetIndex <= step) return true
+    if (step !== 1 || (companyConfigured && !companyStepDirty)) return true
+
+    const saved = await companyStepRef.current?.save()
+    return Boolean(saved)
+  }
+
   async function goTo(index: number, opts?: { force?: boolean }) {
     if (!opts?.force && !canAccessStep(index)) return
+    const canLeaveCurrentStep = await persistCurrentStepBeforeAdvance(index)
+    if (!canLeaveCurrentStep) return
 
     // Mark current step as visited
     markComplete(STEPS[step].key)
@@ -159,12 +169,6 @@ export function OnboardingClient({
     setNextPending(true)
     try {
       const nextStep = Math.min(step + 1, STEPS.length - 1)
-      if (step === 1 && !companyConfigured) {
-        const saved = await companyStepRef.current?.save()
-        if (!saved) return
-        await goTo(nextStep, { force: true })
-        return
-      }
       await goTo(nextStep)
     } finally {
       setNextPending(false)
@@ -179,8 +183,8 @@ export function OnboardingClient({
     await goTo(Math.max(step - 1, 0))
   }
 
-  const handleCompanyReadyChange = useCallback((ready: boolean) => {
-    setCompanyStepReady(ready)
+  const handleCompanyDirtyChange = useCallback((dirty: boolean) => {
+    setCompanyStepDirty(dirty)
   }, [])
 
   async function handleFinish() {
@@ -247,10 +251,10 @@ export function OnboardingClient({
               <CompanyStep
                 ref={companyStepRef}
                 org={org}
-                onReadyChange={handleCompanyReadyChange}
+                onDirtyChange={handleCompanyDirtyChange}
                 onSaved={() => {
                   setCompanyConfiguredOverride({ base: initialCompanyConfigured, value: true })
-                  setCompanyStepReady(true)
+                  setCompanyStepDirty(false)
                   markComplete('company')
                 }}
               />

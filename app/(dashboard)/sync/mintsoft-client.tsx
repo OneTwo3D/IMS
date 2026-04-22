@@ -1,6 +1,6 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useEffect, useRef, useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import { Check, Loader2, Plus, RefreshCw, Settings2, Trash2 } from 'lucide-react'
 import {
@@ -48,6 +48,9 @@ function formatThresholdSummary(
 export function MintsoftClient({ data }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
+  const savedTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const defaultWarehouseId = data.warehouses.find((warehouse) => warehouse.active)?.id ?? ''
+  const defaultExternalWarehouseId = data.externalWarehouses[0]?.externalId ?? ''
   const [isConnectionDialogOpen, setIsConnectionDialogOpen] = useState(false)
   const [isBindingDialogOpen, setIsBindingDialogOpen] = useState(false)
   const [isRestockDialogOpen, setIsRestockDialogOpen] = useState(false)
@@ -59,8 +62,8 @@ export function MintsoftClient({ data }: Props) {
   const [orderLookupConnector, setOrderLookupConnector] = useState(data.connection.orderLookupConnector)
   const [active, setActive] = useState(data.connection.active ? 'true' : 'false')
   const [bindingActive, setBindingActive] = useState('true')
-  const [warehouseId, setWarehouseId] = useState(data.warehouses.find((warehouse) => warehouse.active)?.id ?? '')
-  const [externalWarehouseId, setExternalWarehouseId] = useState(data.externalWarehouses[0]?.externalId ?? '')
+  const [warehouseId, setWarehouseId] = useState(defaultWarehouseId)
+  const [externalWarehouseId, setExternalWarehouseId] = useState(defaultExternalWarehouseId)
   const [stockSyncMode, setStockSyncMode] = useState<'DISABLED' | 'NOTIFICATION_ONLY' | 'ALIGN_TO_WMS'>('NOTIFICATION_ONLY')
   const [returnsMode, setReturnsMode] = useState<'DISABLED' | 'POLL' | 'WEBHOOK'>('DISABLED')
   const [syncFrequencyMinutes, setSyncFrequencyMinutes] = useState('60')
@@ -69,16 +72,45 @@ export function MintsoftClient({ data }: Props) {
   const [reportRecipients, setReportRecipients] = useState('')
   const [restockItemId, setRestockItemId] = useState('')
   const [restockItemSku, setRestockItemSku] = useState('')
-  const [restockWarehouseId, setRestockWarehouseId] = useState(data.warehouses.find((warehouse) => warehouse.active)?.id ?? '')
+  const [restockWarehouseId, setRestockWarehouseId] = useState(defaultWarehouseId)
   const [error, setError] = useState('')
   const [feedbackMessage, setFeedbackMessage] = useState('')
   const [saved, setSaved] = useState(false)
   const orderLookupConnectorRequired = data.orderLookupConnectorRequired
 
+  useEffect(() => {
+    return () => {
+      if (savedTimeoutRef.current) clearTimeout(savedTimeoutRef.current)
+    }
+  }, [])
+
+  useEffect(() => {
+    setLabel(data.connection.label)
+    setBaseUrl(data.connection.baseUrl)
+    setUsername(data.connection.username)
+    setPassword('')
+    setWebhookSecret('')
+    setOrderLookupConnector(data.connection.orderLookupConnector)
+    setActive(data.connection.active ? 'true' : 'false')
+    setBindingActive('true')
+    setWarehouseId(defaultWarehouseId)
+    setExternalWarehouseId(defaultExternalWarehouseId)
+    setStockSyncMode('NOTIFICATION_ONLY')
+    setReturnsMode('DISABLED')
+    setSyncFrequencyMinutes('60')
+    setAbsoluteDelta('')
+    setPercentDelta('')
+    setReportRecipients('')
+    setRestockItemId('')
+    setRestockItemSku('')
+    setRestockWarehouseId(defaultWarehouseId)
+  }, [data, defaultExternalWarehouseId, defaultWarehouseId])
+
   function flashSaved(message: string) {
     setFeedbackMessage(message)
     setSaved(true)
-    setTimeout(() => setSaved(false), 3000)
+    if (savedTimeoutRef.current) clearTimeout(savedTimeoutRef.current)
+    savedTimeoutRef.current = setTimeout(() => setSaved(false), 3000)
   }
 
   function resetConnectionForm() {
@@ -93,8 +125,8 @@ export function MintsoftClient({ data }: Props) {
 
   function resetBindingForm() {
     setBindingActive('true')
-    setWarehouseId(data.warehouses.find((warehouse) => warehouse.active)?.id ?? '')
-    setExternalWarehouseId(data.externalWarehouses[0]?.externalId ?? '')
+    setWarehouseId(defaultWarehouseId)
+    setExternalWarehouseId(defaultExternalWarehouseId)
     setStockSyncMode('NOTIFICATION_ONLY')
     setReturnsMode('DISABLED')
     setSyncFrequencyMinutes('60')
@@ -118,7 +150,7 @@ export function MintsoftClient({ data }: Props) {
     if (!open) {
       setRestockItemId('')
       setRestockItemSku('')
-      setRestockWarehouseId(data.warehouses.find((warehouse) => warehouse.active)?.id ?? '')
+      setRestockWarehouseId(defaultWarehouseId)
     }
   }
 
@@ -348,7 +380,7 @@ export function MintsoftClient({ data }: Props) {
           </Button>
         </div>
 
-        <Table containerClassName="rounded-lg border max-h-[60vh]" className="min-w-[900px]">
+        <Table containerClassName="rounded-lg border max-h-[40vh]" className="min-w-[900px]">
           <TableHeader className="bg-muted/40">
             <TableRow>
               <TableHead>Warehouse</TableHead>
@@ -427,7 +459,7 @@ export function MintsoftClient({ data }: Props) {
           </p>
         </div>
 
-        <Table containerClassName="rounded-lg border max-h-[60vh]">
+        <Table containerClassName="rounded-lg border max-h-[40vh]">
           <TableHeader className="bg-muted/40">
             <TableRow>
               <TableHead>Started</TableHead>
@@ -482,7 +514,7 @@ export function MintsoftClient({ data }: Props) {
           </p>
         </div>
 
-        <Table containerClassName="rounded-lg border max-h-[60vh]">
+        <Table containerClassName="rounded-lg border max-h-[40vh]">
           <TableHeader className="bg-muted/40">
             <TableRow>
               <TableHead>Warehouse</TableHead>
@@ -540,7 +572,7 @@ export function MintsoftClient({ data }: Props) {
           </p>
         </div>
 
-        <Table containerClassName="rounded-lg border max-h-[60vh]" className="min-w-[980px]">
+        <Table containerClassName="rounded-lg border max-h-[40vh]" className="min-w-[980px]">
           <TableHeader className="bg-muted/40">
             <TableRow>
               <TableHead>Return</TableHead>
@@ -572,7 +604,7 @@ export function MintsoftClient({ data }: Props) {
                   </TableCell>
                   <TableCell>
                     {item.productId && item.sku ? (
-                      <ProductLink productId={item.productId} sku={item.sku} name={item.sku} />
+                      <ProductLink productId={item.productId} sku={item.sku} name="" />
                     ) : (
                       <span className="font-mono text-xs">{item.sku ?? 'Unmatched SKU'}</span>
                     )}

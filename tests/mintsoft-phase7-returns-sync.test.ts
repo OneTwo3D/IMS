@@ -119,3 +119,28 @@ test('resolveMintsoftReturnWarehouseId preserves a restock destination on later 
     'source-wh',
   )
 })
+
+test('resolveMintsoftReturnsNextCursor replays the full window when a failed record has no stable timestamp', () => {
+  const since = new Date('2026-04-20T10:00:00.000Z')
+  const startedAt = new Date('2026-04-21T10:00:00.000Z')
+
+  assert.deepEqual(
+    returnsSync.resolveMintsoftReturnsNextCursor({
+      since,
+      startedAt,
+      earliestFailedReceivedAt: new Date('2026-04-21T09:00:00.000Z'),
+      replayFullWindow: false,
+    }),
+    new Date('2026-04-21T09:00:00.000Z'),
+  )
+
+  assert.deepEqual(
+    returnsSync.resolveMintsoftReturnsNextCursor({
+      since,
+      startedAt,
+      earliestFailedReceivedAt: null,
+      replayFullWindow: true,
+    }),
+    since,
+  )
+})

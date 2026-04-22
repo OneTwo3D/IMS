@@ -1,11 +1,19 @@
 'use client'
 
-import { useState } from 'react'
-import { ChevronDown, ChevronUp, Pencil, X, Truck, PackageCheck, Ban } from 'lucide-react'
+import { useEffect, useState, useTransition } from 'react'
+import { useRouter } from 'next/navigation'
+import { ChevronDown, ChevronUp, Pencil, X, Truck, PackageCheck, Ban, Loader2, Upload } from 'lucide-react'
+import {
+  createMintsoftTransferAsn,
+  type MintsoftCreatePurchaseOrderAsnInput,
+  type MintsoftTransferAsnState,
+} from '@/app/actions/mintsoft-sync'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select } from '@/components/ui/select'
 import { Card } from '@/components/ui/card'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Label } from '@/components/ui/label'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { MobileRecordCard, MobileRecordField, MobileRecordList, ResponsiveTableLayout } from '@/components/ui/mobile-records'
 import {
@@ -40,6 +48,10 @@ function formatDate(iso: string) {
     day: '2-digit', month: 'short', year: 'numeric',
     hour: '2-digit', minute: '2-digit',
   })
+}
+
+function formatAsnStatus(status: string) {
+  return status.replace(/_/g, ' ').toLowerCase().replace(/\b\w/g, (char) => char.toUpperCase())
 }
 
 type Warehouse = { id: string; code: string; name: string }
@@ -211,6 +223,215 @@ function EditDraftForm({
 }
 
 // ---------------------------------------------------------------------------
+// Mintsoft ASN dialog
+// ---------------------------------------------------------------------------
+
+function MintsoftTransferAsnDialog({
+  transfer,
+  mintsoftAsnState,
+  onClose,
+}: {
+  transfer: TransferRow
+  mintsoftAsnState: MintsoftTransferAsnState
+  onClose: () => void
+}) {
+  const router = useRouter()
+  const [isPending, startTransition] = useTransition()
+  const [packagingType, setPackagingType] = useState<NonNullable<MintsoftCreatePurchaseOrderAsnInput['packagingType']>>('PARCEL')
+  const [packageCount, setPackageCount] = useState('1')
+  const [eta, setEta] = useState('')
+  const [supplierReference, setSupplierReference] = useState(transfer.reference)
+  const [carrier, setCarrier] = useState('')
+  const [autoCallback, setAutoCallback] = useState(true)
+  const [error, setError] = useState('')
+
+  const outstandingLines = transfer.lines.filter((line) => line.qty > line.qtyReceived)
+  const hasOpenAsn = mintsoftAsnState.existingAsns.some((asn) => asn.closedAt == null)
+
+  function handleConfirm() {
+    setError('')
+
+    const parsedPackageCount = Number.parseInt(packageCount, 10)
+    if (!Number.isFinite(parsedPackageCount) || parsedPackageCount <= 0) {
+      setError('Enter a valid package count.')
+      return
+    }
+
+    startTransition(async () => {
+      const result = await createMintsoftTransferAsn(transfer.id, {
+        packagingType,
+        packageCount: parsedPackageCount,
+        eta: eta || null,
+        supplierReference: supplierReference || null,
+        carrier: carrier || null,
+        autoCallback,
+      } satisfies MintsoftCreatePurchaseOrderAsnInput)
+
+      if (result.success) {
+        router.refresh()
+        onClose()
+        return
+      }
+
+      setError(result.error ?? 'Failed to create Mintsoft ASN')
+    })
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => {
+      if (!open && !isPending) onClose()
+    }}>
+      <DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl">
+        <DialogHeader>
+          <DialogTitle>Mintsoft ASN</DialogTitle>
+          <DialogDescription>
+            Create or review the Mintsoft ASN for this in-transit warehouse transfer. Mintsoft receives the remaining quantities in base stock units.
+          </DialogDescription>
+        </DialogHeader>
+
+        <div className="space-y-4">
+          {mintsoftAsnState.existingAsns.length > 0 && (
+            <div className="space-y-2 rounded-md border p-3">
+              <div className="flex items-center justify-between gap-3">
+                <h3 className="text-sm font-medium">Existing Mintsoft ASNs</h3>
+                {hasOpenAsn && (
+                  <span className="text-xs text-amber-700 dark:text-amber-400">
+                    An open ASN already exists for this transfer.
+                  </span>
+                )}
+              </div>
+              <Table className="min-w-[520px]">
+                <TableHeader>
+                  <TableRow>
+                    <TableHead className="text-xs">ASN</TableHead>
+                    <TableHead className="text-xs">Status</TableHead>
+                    <TableHead className="text-xs text-right">Expected</TableHead>
+                    <TableHead className="text-xs text-right">Received</TableHead>
+                    <TableHead className="text-xs">Created</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
+                  {mintsoftAsnState.existingAsns.map((asn) => (
+                    <TableRow key={asn.id}>
+                      <TableCell className="font-mono text-xs">{asn.externalAsnId}</TableCell>
+                      <TableCell className="text-xs">{formatAsnStatus(asn.status)}</TableCell>
+                      <TableCell className="text-right tabular-nums text-xs">{asn.totalExpectedQty}</TableCell>
+                      <TableCell className="text-right tabular-nums text-xs">{asn.totalReceivedQty}</TableCell>
+                      <TableCell className="text-xs text-muted-foreground">{formatDate(asn.createdAt)}</TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+          )}
+
+          <Table className="min-w-[600px]">
+            <TableHeader>
+              <TableRow>
+                <TableHead className="text-xs">Product</TableHead>
+                <TableHead className="text-xs text-right w-32">Outstanding Qty</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {outstandingLines.map((line) => (
+                <TableRow key={line.id}>
+                  <TableCell>
+                    <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums font-medium">{line.qty - line.qtyReceived}</TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+
+          <div className="grid gap-3 md:grid-cols-2">
+            <div className="space-y-1.5">
+              <Label htmlFor="mintsoftTransferPackagingType">Packaging Type</Label>
+              <select
+                id="mintsoftTransferPackagingType"
+                value={packagingType}
+                onChange={(event) => setPackagingType(event.target.value as typeof packagingType)}
+                className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+              >
+                <option value="PARCEL">Parcel</option>
+                <option value="PALLET">Pallet</option>
+                <option value="CONTAINER">Container</option>
+              </select>
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="mintsoftTransferPackageCount">Package Count</Label>
+              <Input
+                id="mintsoftTransferPackageCount"
+                type="number"
+                min={1}
+                step={1}
+                value={packageCount}
+                onChange={(event) => setPackageCount(event.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="mintsoftTransferEta">ETA</Label>
+              <Input
+                id="mintsoftTransferEta"
+                type="date"
+                value={eta}
+                onChange={(event) => setEta(event.target.value)}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label htmlFor="mintsoftTransferCarrier">Carrier</Label>
+              <Input
+                id="mintsoftTransferCarrier"
+                value={carrier}
+                onChange={(event) => setCarrier(event.target.value)}
+                placeholder="e.g. DPD, DHL Freight"
+              />
+            </div>
+            <div className="space-y-1.5 md:col-span-2">
+              <Label htmlFor="mintsoftTransferReference">Shipment Reference</Label>
+              <Input
+                id="mintsoftTransferReference"
+                value={supplierReference}
+                onChange={(event) => setSupplierReference(event.target.value)}
+                placeholder="Optional shipment or transfer reference"
+              />
+            </div>
+          </div>
+
+          <label className="flex items-start gap-2 rounded-md border p-3 text-sm">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={autoCallback}
+              onChange={(event) => setAutoCallback(event.target.checked)}
+            />
+            <span>
+              <span className="font-medium">Enable booked-in callback</span>
+              <span className="block text-muted-foreground">
+                When enabled, Mintsoft will call back into IMS when the ASN is booked in so the transfer receipt can be reconciled automatically.
+              </span>
+            </span>
+          </label>
+
+          {mintsoftAsnState.blockedReason && (
+            <p className="text-sm text-muted-foreground">{mintsoftAsnState.blockedReason}</p>
+          )}
+          {error && <p className="text-sm text-destructive">{error}</p>}
+        </div>
+
+        <DialogFooter>
+          <Button variant="outline" onClick={onClose} disabled={isPending}>Close</Button>
+          <Button onClick={handleConfirm} disabled={isPending || !mintsoftAsnState.canCreate}>
+            {isPending && <Loader2 className="mr-2 h-4 w-4 animate-spin" />}
+            Create Mintsoft ASN
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+// ---------------------------------------------------------------------------
 // Single transfer row
 // ---------------------------------------------------------------------------
 
@@ -218,27 +439,40 @@ function TransferCard({
   transfer: initial,
   warehouses,
   products,
+  mintsoftAsnState,
   stockLevels,
   onUpdated,
 }: {
   transfer: TransferRow
   warehouses: Warehouse[]
   products: ProductRow[]
+  mintsoftAsnState: MintsoftTransferAsnState | null
   stockLevels: StockLevels
   onUpdated: (t: TransferRow) => void
 }) {
+  const router = useRouter()
   const imageMap = new Map(products.map((p) => [p.id, p.imageUrl]))
   const [transfer, setTransfer] = useState(initial)
   const [expanded, setExpanded] = useState(false)
   const [editing, setEditing] = useState(false)
+  const [showMintsoftDialog, setShowMintsoftDialog] = useState(false)
   const [actioning, setActioning] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
+
+  useEffect(() => {
+    setTransfer(initial)
+  }, [initial])
 
   async function handleDispatch() {
     setActioning(true); setActionError(null)
     const res = await dispatchTransfer(transfer.id)
     setActioning(false)
-    if (res.success) { setTransfer((t) => ({ ...t, status: 'IN_TRANSIT' })); onUpdated({ ...transfer, status: 'IN_TRANSIT' }) }
+    if (res.success) {
+      const next = { ...transfer, status: 'IN_TRANSIT' as const }
+      setTransfer(next)
+      onUpdated(next)
+      router.refresh()
+    }
     else setActionError(res.message ?? 'Failed.')
   }
 
@@ -246,7 +480,12 @@ function TransferCard({
     setActioning(true); setActionError(null)
     const res = await receiveTransfer(transfer.id)
     setActioning(false)
-    if (res.success) { setTransfer((t) => ({ ...t, status: 'RECEIVED' })); onUpdated({ ...transfer, status: 'RECEIVED' }) }
+    if (res.success) {
+      const next = { ...transfer, status: 'RECEIVED' as const }
+      setTransfer(next)
+      onUpdated(next)
+      router.refresh()
+    }
     else setActionError(res.message ?? 'Failed.')
   }
 
@@ -254,7 +493,12 @@ function TransferCard({
     setActioning(true); setActionError(null)
     const res = await cancelTransfer(transfer.id)
     setActioning(false)
-    if (res.success) { setTransfer((t) => ({ ...t, status: 'CANCELLED' })); onUpdated({ ...transfer, status: 'CANCELLED' }) }
+    if (res.success) {
+      const next = { ...transfer, status: 'CANCELLED' as const }
+      setTransfer(next)
+      onUpdated(next)
+      router.refresh()
+    }
     else setActionError(res.message ?? 'Failed.')
   }
 
@@ -293,10 +537,17 @@ function TransferCard({
               </>
             )}
             {transfer.status === 'IN_TRANSIT' && (
-              <Button size="sm" variant="outline" className="h-7 text-xs gap-1 text-green-700 border-green-300 hover:bg-green-50 dark:text-green-400 dark:border-green-700 dark:hover:bg-green-950"
-                onClick={handleReceive} disabled={actioning}>
-                <PackageCheck className="h-3 w-3" /> Mark Received
-              </Button>
+              <>
+                <Button size="sm" variant="outline" className="h-7 text-xs gap-1"
+                  onClick={() => setShowMintsoftDialog(true)}
+                  disabled={!mintsoftAsnState}>
+                  <Upload className="h-3 w-3" /> Mintsoft ASN
+                </Button>
+                <Button size="sm" variant="outline" className="h-7 text-xs gap-1 text-green-700 border-green-300 hover:bg-green-50 dark:text-green-400 dark:border-green-700 dark:hover:bg-green-950"
+                  onClick={handleReceive} disabled={actioning}>
+                  <PackageCheck className="h-3 w-3" /> Mark Received
+                </Button>
+              </>
             )}
             {actionError && <p className="text-xs text-destructive whitespace-nowrap">{actionError}</p>}
           </div>
@@ -363,6 +614,14 @@ function TransferCard({
           </TableCell>
         </TableRow>
       )}
+
+      {showMintsoftDialog && mintsoftAsnState && transfer.status === 'IN_TRANSIT' && (
+        <MintsoftTransferAsnDialog
+          transfer={transfer}
+          mintsoftAsnState={mintsoftAsnState}
+          onClose={() => setShowMintsoftDialog(false)}
+        />
+      )}
     </>
   )
 }
@@ -375,11 +634,19 @@ type ListProps = {
   transfers: TransferRow[]
   warehouses: Warehouse[]
   products: ProductRow[]
+  mintsoftAsnStates: Record<string, MintsoftTransferAsnState>
   stockLevels: StockLevels
   onTransferUpdated: (t: TransferRow) => void
 }
 
-export function TransferList({ transfers, warehouses, products, stockLevels, onTransferUpdated }: ListProps) {
+export function TransferList({
+  transfers,
+  warehouses,
+  products,
+  mintsoftAsnStates,
+  stockLevels,
+  onTransferUpdated,
+}: ListProps) {
   const [collapsed, setCollapsed] = useState(false)
 
   if (transfers.length === 0) {
@@ -416,6 +683,7 @@ export function TransferList({ transfers, warehouses, products, stockLevels, onT
                 transfer={transfer}
                 warehouses={warehouses}
                 products={products}
+                mintsoftAsnState={mintsoftAsnStates[transfer.id] ?? null}
                 stockLevels={stockLevels}
                 onUpdated={onTransferUpdated}
               />
@@ -441,6 +709,7 @@ export function TransferList({ transfers, warehouses, products, stockLevels, onT
                   transfer={t}
                   warehouses={warehouses}
                   products={products}
+                  mintsoftAsnState={mintsoftAsnStates[t.id] ?? null}
                   stockLevels={stockLevels}
                   onUpdated={onTransferUpdated}
                 />
@@ -466,21 +735,29 @@ function MobileTransferCard({
   transfer: initial,
   warehouses,
   products,
+  mintsoftAsnState,
   stockLevels,
   onUpdated,
 }: {
   transfer: TransferRow
   warehouses: Warehouse[]
   products: ProductRow[]
+  mintsoftAsnState: MintsoftTransferAsnState | null
   stockLevels: StockLevels
   onUpdated: (t: TransferRow) => void
 }) {
+  const router = useRouter()
   const imageMap = new Map(products.map((p) => [p.id, p.imageUrl]))
   const [transfer, setTransfer] = useState(initial)
   const [expanded, setExpanded] = useState(false)
   const [editing, setEditing] = useState(false)
+  const [showMintsoftDialog, setShowMintsoftDialog] = useState(false)
   const [actioning, setActioning] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
+
+  useEffect(() => {
+    setTransfer(initial)
+  }, [initial])
 
   async function handleDispatch() {
     setActioning(true); setActionError(null)
@@ -490,6 +767,7 @@ function MobileTransferCard({
       const next = { ...transfer, status: 'IN_TRANSIT' as const }
       setTransfer(next)
       onUpdated(next)
+      router.refresh()
     } else setActionError(res.message ?? 'Failed.')
   }
 
@@ -501,6 +779,7 @@ function MobileTransferCard({
       const next = { ...transfer, status: 'RECEIVED' as const }
       setTransfer(next)
       onUpdated(next)
+      router.refresh()
     } else setActionError(res.message ?? 'Failed.')
   }
 
@@ -512,6 +791,7 @@ function MobileTransferCard({
       const next = { ...transfer, status: 'CANCELLED' as const }
       setTransfer(next)
       onUpdated(next)
+      router.refresh()
     } else setActionError(res.message ?? 'Failed.')
   }
 
@@ -549,9 +829,14 @@ function MobileTransferCard({
           </>
         )}
         {transfer.status === 'IN_TRANSIT' && (
-          <Button size="sm" variant="outline" className="h-8 text-xs gap-1 text-green-700 border-green-300 hover:bg-green-50 dark:text-green-400 dark:border-green-700 dark:hover:bg-green-950" onClick={handleReceive} disabled={actioning}>
-            <PackageCheck className="h-3 w-3" /> Mark Received
-          </Button>
+          <>
+            <Button size="sm" variant="outline" className="h-8 text-xs gap-1" onClick={() => setShowMintsoftDialog(true)} disabled={!mintsoftAsnState}>
+              <Upload className="h-3 w-3" /> Mintsoft ASN
+            </Button>
+            <Button size="sm" variant="outline" className="h-8 text-xs gap-1 text-green-700 border-green-300 hover:bg-green-50 dark:text-green-400 dark:border-green-700 dark:hover:bg-green-950" onClick={handleReceive} disabled={actioning}>
+              <PackageCheck className="h-3 w-3" /> Mark Received
+            </Button>
+          </>
         )}
         <Button size="sm" variant="ghost" className="h-8 text-xs" onClick={() => { setExpanded((v) => !v); if (editing) setEditing(false) }}>
           {expanded ? <ChevronUp className="h-3.5 w-3.5 mr-1" /> : <ChevronDown className="h-3.5 w-3.5 mr-1" />}
@@ -590,6 +875,14 @@ function MobileTransferCard({
             onCancel={() => setEditing(false)}
           />
         </div>
+      )}
+
+      {showMintsoftDialog && mintsoftAsnState && transfer.status === 'IN_TRANSIT' && (
+        <MintsoftTransferAsnDialog
+          transfer={transfer}
+          mintsoftAsnState={mintsoftAsnState}
+          onClose={() => setShowMintsoftDialog(false)}
+        />
       )}
     </MobileRecordCard>
   )

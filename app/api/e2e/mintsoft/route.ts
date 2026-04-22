@@ -7,7 +7,9 @@ import {
 import { runMintsoftReturnsSync } from '@/lib/connectors/mintsoft/sync/returns-sync'
 import { runStockSyncForBinding } from '@/lib/connectors/mintsoft/sync/stock-sync'
 import { serializeSettingValue } from '@/lib/settings-store'
-import { requireE2eAdminRoute } from '@/lib/testing/e2e-route-guard'
+import { assertE2eRouteModuleEnabled, requireE2eAdminRoute } from '@/lib/testing/e2e-route-guard'
+
+assertE2eRouteModuleEnabled('app/api/e2e/mintsoft/route.ts')
 
 const E2E_MINTSOFT_STATE_KEY = 'e2e_mintsoft_state'
 const PLUGIN_MINTSOFT_ENABLED_KEY = 'plugin_mintsoft_enabled'

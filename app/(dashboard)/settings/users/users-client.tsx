@@ -6,6 +6,7 @@ import { Loader2, Plus, Pencil, Shield, ShieldCheck, Factory, Eye, BarChart3, Wa
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Select } from '@/components/ui/select'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { createUser, deleteUser, updateUser, type UserRow } from '@/app/actions/users'
@@ -193,7 +194,9 @@ export function UsersClient({ users, suppliers }: Props) {
 
       {/* Create dialog */}
       {showCreate && (
-        <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
+        <Dialog open onOpenChange={(open) => {
+          if (!open && !isPending) setShowCreate(false)
+        }}><DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
           <DialogHeader><DialogTitle>Add User</DialogTitle></DialogHeader>
           <div className="space-y-3">
             <div className="space-y-1.5"><Label>Name *</Label><Input value={name} onChange={(e) => setName(e.target.value)} className="h-9 text-sm" /></div>
@@ -201,17 +204,17 @@ export function UsersClient({ users, suppliers }: Props) {
             <div className="space-y-1.5"><Label>Password *</Label><Input type="password" value={password} onChange={(e) => setPassword(e.target.value)} placeholder="Min 8 characters" className="h-9 text-sm" /></div>
             <div className="space-y-1.5">
               <Label>Role *</Label>
-              <select value={role} onChange={(e) => setRole(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
+              <Select value={role} onChange={(e) => setRole(e.target.value)} className="h-9 px-3">
                 {ROLES.map((r) => (<option key={r.value} value={r.value}>{r.label} — {r.description}</option>))}
-              </select>
+              </Select>
             </div>
             {role === 'SUPPLIER' && (
               <div className="space-y-1.5">
                 <Label>Linked Supplier *</Label>
-                <select value={supplierId} onChange={(e) => setSupplierId(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
+                <Select value={supplierId} onChange={(e) => setSupplierId(e.target.value)} className="h-9 px-3">
                   <option value="">Select supplier…</option>
                   {suppliers.map((s) => (<option key={s.id} value={s.id}>{s.name}</option>))}
-                </select>
+                </Select>
               </div>
             )}
             {error && <p className="text-sm text-destructive">{error}</p>}
@@ -225,7 +228,9 @@ export function UsersClient({ users, suppliers }: Props) {
 
       {/* Edit dialog */}
       {editUser && (
-        <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
+        <Dialog open onOpenChange={(open) => {
+          if (!open && !isPending) setEditUser(null)
+        }}><DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
           <DialogHeader><DialogTitle>Edit User</DialogTitle></DialogHeader>
           <div className="space-y-3">
             <div className="space-y-1.5"><Label>Name</Label><Input value={editName} onChange={(e) => setEditName(e.target.value)} className="h-9 text-sm" /></div>
@@ -233,17 +238,17 @@ export function UsersClient({ users, suppliers }: Props) {
             <div className="space-y-1.5"><Label>New Password</Label><Input type="password" value={editPassword} onChange={(e) => setEditPassword(e.target.value)} placeholder="Leave blank to keep current" className="h-9 text-sm" /></div>
             <div className="space-y-1.5">
               <Label>Role</Label>
-              <select value={editRole} onChange={(e) => setEditRole(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
+              <Select value={editRole} onChange={(e) => setEditRole(e.target.value)} className="h-9 px-3">
                 {ROLES.map((r) => (<option key={r.value} value={r.value}>{r.label}</option>))}
-              </select>
+              </Select>
             </div>
             {editRole === 'SUPPLIER' && (
               <div className="space-y-1.5">
                 <Label>Linked Supplier</Label>
-                <select value={editSupplierId} onChange={(e) => setEditSupplierId(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
+                <Select value={editSupplierId} onChange={(e) => setEditSupplierId(e.target.value)} className="h-9 px-3">
                   <option value="">Select supplier…</option>
                   {suppliers.map((s) => (<option key={s.id} value={s.id}>{s.name}</option>))}
-                </select>
+                </Select>
               </div>
             )}
             <label className="flex items-center gap-2 cursor-pointer">
@@ -261,7 +266,9 @@ export function UsersClient({ users, suppliers }: Props) {
 
       {/* Delete dialog */}
       {deleteTarget && (
-        <Dialog open onOpenChange={() => {}}><DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
+        <Dialog open onOpenChange={(open) => {
+          if (!open && !isPending) setDeleteTarget(null)
+        }}><DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
           <DialogHeader><DialogTitle className="text-destructive">Delete User</DialogTitle></DialogHeader>
           <div className="space-y-3">
             <div className="rounded-md border border-destructive/50 bg-destructive/5 p-3 text-sm">
@@ -298,17 +305,17 @@ export function UsersClient({ users, suppliers }: Props) {
             {deleteSalesOrderMode === 'transfer_user' && (
               <div className="space-y-1.5">
                 <Label>Transfer Sales Orders To *</Label>
-                <select
+                <Select
                   value={deleteTransferToUserId}
                   onChange={(e) => setDeleteTransferToUserId(e.target.value)}
                   disabled={transferOptions.length === 0}
-                  className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm"
+                  className="h-9 px-3"
                 >
                   <option value="">Select user…</option>
                   {transferOptions.map((user) => (
                     <option key={user.id} value={user.id}>{user.name} — {user.email} ({user.role})</option>
                   ))}
-                </select>
+                </Select>
                 {transferOptions.length === 0 && (
                   <p className="text-sm text-destructive">No other active user is available to receive transferred sales orders.</p>
                 )}

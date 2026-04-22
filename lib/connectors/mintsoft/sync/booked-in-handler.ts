@@ -1,5 +1,8 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { fetchMintsoftAsns } from '@/lib/connectors/mintsoft'
+import { copyCostLayerSourceLinesProportionally, createCostLayer } from '@/lib/cost-layers'
+import { reconcileBookedInQuantities, sliceTransferSnapshotForReceipt } from './booked-in-helpers'
 import { enqueueStockSync } from '@/lib/shopping'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -49,6 +52,11 @@ type ProcessMintsoftBookedInResult =
 function formatReceiptReference(externalAsnId: string, poReference: string): string {
   const normalizedAsnId = externalAsnId.replace(/[^A-Za-z0-9-]/g, '').slice(0, 32) || 'ASN'
   return `MS-${normalizedAsnId}-${poReference}`.slice(0, 100)
+}
+
+async function fetchMintsoftAsnById(externalAsnId: string) {
+  const asns = await fetchMintsoftAsns()
+  return asns.find((asn) => asn.externalAsnId === externalAsnId) ?? null
 }
 
 async function markEventFailed(eventId: string, error: string): Promise<void> {
@@ -179,6 +187,19 @@ export async function processMintsoftBookedInEvent(
   }
 
   try {
+    const mappedAsn = await db.wmsAsnMap.findUnique({
+      where: {
+        connector_externalAsnId: {
+          connector: 'mintsoft',
+          externalAsnId: event.externalAsnId,
+        },
+      },
+      select: { id: true },
+    })
+    const remoteAsn = mappedAsn
+      ? await fetchMintsoftAsnById(event.externalAsnId)
+      : null
+
     const processed = await db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT id FROM wms_inbound_receipt_events WHERE id = ${event.id} FOR UPDATE`
 
@@ -218,6 +239,7 @@ export async function processMintsoftBookedInEvent(
           lines: {
             select: {
               id: true,
+              externalAsnLineId: true,
               sourceType: true,
               sourceLineId: true,
               productId: true,
@@ -238,20 +260,48 @@ export async function processMintsoftBookedInEvent(
         }
       }
 
-      const actionableLines = asnMap.lines
-        .filter((line) => Number(line.expectedQty) > Number(line.lastProcessedReceivedQty))
+      if (!remoteAsn) {
+        return {
+          duplicate: false,
+          pending: true,
+          pendingReason: `ASN ${lockedEvent.externalAsnId} is not available from Mintsoft yet; retrying booked-in reconciliation`,
+          productIds: [] as string[],
+        }
+      }
 
-      const unsupportedLines = actionableLines.filter((line) => line.sourceType !== 'PURCHASE_ORDER_LINE')
+      const remoteLineByExternalId = new Map(remoteAsn.lines.map((line) => [line.externalLineId, line]))
+      const remoteLineBySourceId = new Map(remoteAsn.lines.map((line) => [line.sourceLineId, line]))
+
+      const actionableLines = asnMap.lines
+        .map((line) => {
+          const remoteLine = remoteLineByExternalId.get(line.externalAsnLineId)
+            ?? remoteLineBySourceId.get(line.sourceLineId)
+          return {
+            ...line,
+            currentReceivedQty: Math.min(
+              Number(line.expectedQty),
+              Math.max(0, Number(remoteLine?.quantity ?? 0)),
+            ),
+          }
+        })
+        .filter((line) => line.currentReceivedQty > Number(line.lastProcessedReceivedQty))
+
+      const unsupportedLines = actionableLines.filter((line) => (
+        line.sourceType !== 'PURCHASE_ORDER_LINE' && line.sourceType !== 'STOCK_TRANSFER_LINE'
+      ))
       if (unsupportedLines.length > 0) {
         const kinds = Array.from(new Set(unsupportedLines.map((line) => line.sourceType))).join(', ')
         throw new Error(`ASN ${lockedEvent.externalAsnId} contains unsupported line source types: ${kinds}`)
       }
 
-      const purchaseOrderLines = actionableLines.length > 0
+      const purchaseActionableLines = actionableLines.filter((line) => line.sourceType === 'PURCHASE_ORDER_LINE')
+      const transferActionableLines = actionableLines.filter((line) => line.sourceType === 'STOCK_TRANSFER_LINE')
+
+      const purchaseOrderLines = purchaseActionableLines.length > 0
         ? await tx.purchaseOrderLine.findMany({
             where: {
               id: {
-                in: actionableLines.map((line) => line.sourceLineId),
+                in: purchaseActionableLines.map((line) => line.sourceLineId),
               },
             },
             select: {
@@ -273,30 +323,78 @@ export async function processMintsoftBookedInEvent(
           })
         : []
 
+      const transferLines = transferActionableLines.length > 0
+        ? await tx.stockTransferLine.findMany({
+            where: {
+              id: {
+                in: transferActionableLines.map((line) => line.sourceLineId),
+              },
+            },
+            select: {
+              id: true,
+              transferId: true,
+              productId: true,
+              qty: true,
+              qtyReceived: true,
+              costLayerSnapshot: true,
+            },
+          })
+        : []
+
       const purchaseLineById = new Map(purchaseOrderLines.map((line) => [line.id, line]))
+      const transferLineById = new Map(transferLines.map((line) => [line.id, line]))
       const receiptLinesByPoId = new Map<string, Array<{
         asnLineMapId: string
         poLineId: string
         productId: string
         expectedQty: number
+        currentReceivedQty: number
+        lastProcessedReceivedQty: number
+      }>>()
+      const receiptLinesByTransferId = new Map<string, Array<{
+        asnLineMapId: string
+        transferLineId: string
+        productId: string
+        expectedQty: number
+        currentReceivedQty: number
         lastProcessedReceivedQty: number
       }>>()
 
       for (const line of actionableLines) {
-        const poLine = purchaseLineById.get(line.sourceLineId)
-        if (!poLine) {
-          throw new Error(`Missing purchase order line ${line.sourceLineId} for ASN ${lockedEvent.externalAsnId}`)
+        if (line.sourceType === 'PURCHASE_ORDER_LINE') {
+          const poLine = purchaseLineById.get(line.sourceLineId)
+          if (!poLine) {
+            throw new Error(`Missing purchase order line ${line.sourceLineId} for ASN ${lockedEvent.externalAsnId}`)
+          }
+
+          const entry = receiptLinesByPoId.get(poLine.poId) ?? []
+          entry.push({
+            asnLineMapId: line.id,
+            poLineId: poLine.id,
+            productId: poLine.productId,
+            expectedQty: Number(line.expectedQty),
+            currentReceivedQty: line.currentReceivedQty,
+            lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),
+          })
+          receiptLinesByPoId.set(poLine.poId, entry)
+          continue
         }
 
-        const entry = receiptLinesByPoId.get(poLine.poId) ?? []
+        const transferLine = transferLineById.get(line.sourceLineId)
+        if (!transferLine) {
+          throw new Error(`Missing transfer line ${line.sourceLineId} for ASN ${lockedEvent.externalAsnId}`)
+        }
+
+        const entry = receiptLinesByTransferId.get(transferLine.transferId) ?? []
         entry.push({
           asnLineMapId: line.id,
-          poLineId: poLine.id,
-          productId: poLine.productId,
+          transferLineId: transferLine.id,
+          productId: transferLine.productId,
           expectedQty: Number(line.expectedQty),
+          currentReceivedQty: line.currentReceivedQty,
           lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),
         })
-        receiptLinesByPoId.set(poLine.poId, entry)
+        receiptLinesByTransferId.set(transferLine.transferId, entry)
       }
 
       const now = new Date()
@@ -335,15 +433,17 @@ export async function processMintsoftBookedInEvent(
             throw new Error(`Purchase order line ${receiptLine.poLineId} not found on locked PO ${po.reference}`)
           }
 
-          const alreadyReceivedOnPoLine = Math.min(receiptLine.expectedQty, Number(poLine.qtyReceived))
-          const alreadyAccountedViaAsn = Math.max(receiptLine.lastProcessedReceivedQty, alreadyReceivedOnPoLine)
-          const reconciledManualQty = Math.max(0, alreadyAccountedViaAsn - receiptLine.lastProcessedReceivedQty)
-          const qtyReceived = Math.max(0, receiptLine.expectedQty - alreadyAccountedViaAsn)
+          const reconciled = reconcileBookedInQuantities({
+            expectedQty: receiptLine.expectedQty,
+            currentReceivedQty: receiptLine.currentReceivedQty,
+            localReceivedQty: Number(poLine.qtyReceived),
+            lastProcessedReceivedQty: receiptLine.lastProcessedReceivedQty,
+          })
 
           return {
             ...receiptLine,
-            qtyReceived,
-            reconciledManualQty,
+            qtyReceived: reconciled.qtyReceived,
+            reconciledManualQty: reconciled.reconciledManualQty,
           }
         }).filter((receiptLine) => receiptLine.qtyReceived > 0 || receiptLine.reconciledManualQty > 0)
 
@@ -448,6 +548,150 @@ export async function processMintsoftBookedInEvent(
             ...(allReceived ? { receivedAt: now } : {}),
           },
         })
+      }
+
+      for (const [transferId, receiptLines] of receiptLinesByTransferId) {
+        await tx.$executeRaw`SELECT id FROM stock_transfers WHERE id = ${transferId} FOR UPDATE`
+
+        const transfer = await tx.stockTransfer.findUnique({
+          where: { id: transferId },
+          select: {
+            id: true,
+            reference: true,
+            status: true,
+            toWarehouseId: true,
+            completedAt: true,
+            lines: {
+              select: {
+                id: true,
+                productId: true,
+                qty: true,
+                qtyReceived: true,
+                costLayerSnapshot: true,
+              },
+            },
+          },
+        })
+
+        if (!transfer) {
+          throw new Error(`Transfer ${transferId} not found for ASN ${lockedEvent.externalAsnId}`)
+        }
+
+        if (!['IN_TRANSIT', 'RECEIVED'].includes(transfer.status)) {
+          throw new Error(`Transfer ${transfer.reference} is not in transit for ASN ${lockedEvent.externalAsnId}`)
+        }
+
+        const lockedLineById = new Map(transfer.lines.map((line) => [line.id, line]))
+        const reconciledLines = receiptLines.map((receiptLine) => {
+          const transferLine = lockedLineById.get(receiptLine.transferLineId)
+          if (!transferLine) {
+            throw new Error(`Transfer line ${receiptLine.transferLineId} not found on locked transfer ${transfer.reference}`)
+          }
+
+          const reconciled = reconcileBookedInQuantities({
+            expectedQty: receiptLine.expectedQty,
+            currentReceivedQty: receiptLine.currentReceivedQty,
+            localReceivedQty: Number(transferLine.qtyReceived),
+            lastProcessedReceivedQty: receiptLine.lastProcessedReceivedQty,
+          })
+
+          return {
+            ...receiptLine,
+            alreadyReceivedQty: Number(transferLine.qtyReceived),
+            qtyReceived: reconciled.qtyReceived,
+            reconciledManualQty: reconciled.reconciledManualQty,
+          }
+        }).filter((receiptLine) => receiptLine.qtyReceived > 0 || receiptLine.reconciledManualQty > 0)
+
+        for (const receiptLine of reconciledLines) {
+          const transferLine = lockedLineById.get(receiptLine.transferLineId)
+          if (!transferLine) continue
+
+          if (receiptLine.qtyReceived > 0) {
+            await tx.stockMovement.create({
+              data: {
+                type: 'TRANSFER_IN',
+                productId: transferLine.productId,
+                fromWarehouseId: null,
+                toWarehouseId: transfer.toWarehouseId,
+                qty: receiptLine.qtyReceived,
+                note: `Received against ${transfer.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
+                referenceType: 'WmsAsnMap',
+                referenceId: asnMap.id,
+              },
+            })
+
+            await tx.stockLevel.upsert({
+              where: {
+                productId_warehouseId: {
+                  productId: transferLine.productId,
+                  warehouseId: transfer.toWarehouseId,
+                },
+              },
+              create: {
+                productId: transferLine.productId,
+                warehouseId: transfer.toWarehouseId,
+                quantity: receiptLine.qtyReceived,
+                reservedQty: 0,
+              },
+              update: {
+                quantity: { increment: receiptLine.qtyReceived },
+              },
+            })
+
+            const snapshotSlice = sliceTransferSnapshotForReceipt({
+              snapshot: transferLine.costLayerSnapshot,
+              alreadyReceivedQty: receiptLine.alreadyReceivedQty,
+              qtyReceived: receiptLine.qtyReceived,
+            })
+
+            for (const entry of snapshotSlice) {
+              const newLayerId = await createCostLayer(tx, {
+                productId: transferLine.productId,
+                warehouseId: transfer.toWarehouseId,
+                qty: entry.qty,
+                unitCostBase: entry.unitCostBase,
+              })
+              await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entry.qty)
+            }
+
+            await tx.stockTransferLine.update({
+              where: { id: transferLine.id },
+              data: {
+                qtyReceived: { increment: receiptLine.qtyReceived },
+              },
+            })
+
+            touchedProductIds.add(transferLine.productId)
+          }
+
+          await tx.wmsAsnLineMap.update({
+            where: { id: receiptLine.asnLineMapId },
+            data: {
+              qtyAccountedViaReceipt: { increment: receiptLine.qtyReceived + receiptLine.reconciledManualQty },
+              lastProcessedReceivedQty: { increment: receiptLine.qtyReceived + receiptLine.reconciledManualQty },
+              lastCallbackAt: now,
+            },
+          })
+        }
+
+        const updatedLines = await tx.stockTransferLine.findMany({
+          where: { transferId },
+          select: {
+            qty: true,
+            qtyReceived: true,
+          },
+        })
+        const allReceived = updatedLines.every((line) => Number(line.qtyReceived) >= Number(line.qty))
+        if (allReceived) {
+          await tx.stockTransfer.update({
+            where: { id: transferId },
+            data: {
+              status: 'RECEIVED',
+              completedAt: transfer.completedAt ?? now,
+            },
+          })
+        }
       }
 
       const refreshedLines = await tx.wmsAsnLineMap.findMany({

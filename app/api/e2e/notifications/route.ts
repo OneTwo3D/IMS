@@ -1,6 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { requireE2eAdminRoute } from '@/lib/testing/e2e-route-guard'
+import { assertE2eRouteModuleEnabled, requireE2eAdminRoute } from '@/lib/testing/e2e-route-guard'
+
+assertE2eRouteModuleEnabled('app/api/e2e/notifications/route.ts')
 
 type SeedNotification = {
   userEmail?: string | null

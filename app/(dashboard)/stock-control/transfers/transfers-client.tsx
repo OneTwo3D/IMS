@@ -1,12 +1,13 @@
 'use client'
 
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { Plus } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { CsvBar } from '@/components/ui/csv-bar'
 import { importTransfersCsv } from '@/app/actions/import'
+import type { MintsoftTransferAsnState } from '@/app/actions/mintsoft-sync'
 import { TransferFormDialog } from './transfer-form'
 import { TransferList } from './transfer-list'
 import type { TransferRow } from '@/app/actions/transfers'
@@ -19,14 +20,19 @@ type Props = {
   warehouses: Warehouse[]
   products: ProductRow[]
   initialTransfers: TransferRow[]
+  mintsoftAsnStates: Record<string, MintsoftTransferAsnState>
   stockLevels: Record<string, Record<string, StockLevelEntry>>
 }
 
-export function TransfersClient({ warehouses, products, initialTransfers, stockLevels }: Props) {
+export function TransfersClient({ warehouses, products, initialTransfers, mintsoftAsnStates, stockLevels }: Props) {
   const [transfers, setTransfers] = useState(initialTransfers)
   const [showCreate, setShowCreate] = useState(false)
   const warehouseCount = warehouses.length
   const canCreateTransfer = warehouseCount >= 2
+
+  useEffect(() => {
+    setTransfers(initialTransfers)
+  }, [initialTransfers])
 
   function handleCreated(t: TransferRow) {
     setTransfers((prev) => [t, ...prev])
@@ -70,6 +76,7 @@ export function TransfersClient({ warehouses, products, initialTransfers, stockL
         transfers={transfers}
         warehouses={warehouses}
         products={products}
+        mintsoftAsnStates={mintsoftAsnStates}
         stockLevels={stockLevels}
         onTransferUpdated={handleUpdated}
       />

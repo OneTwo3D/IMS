@@ -2,17 +2,22 @@ import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import test from 'node:test'
 import * as authModuleNs from '../lib/connectors/mintsoft/api/auth.ts'
+import * as webhookValidationModuleNs from '../lib/connectors/mintsoft/webhook-validation.ts'
 import * as webhookEventsModuleNs from '../lib/connectors/mintsoft/webhook-events.ts'
 import type { PersistMintsoftWebhookEventInput } from '../lib/connectors/mintsoft/webhook-events.ts'
 
 const authModule = 'default' in authModuleNs
   ? authModuleNs.default as typeof import('../lib/connectors/mintsoft/api/auth.ts')
   : authModuleNs
+const webhookValidationModule = 'default' in webhookValidationModuleNs
+  ? webhookValidationModuleNs.default as typeof import('../lib/connectors/mintsoft/webhook-validation.ts')
+  : webhookValidationModuleNs
 const webhookEventsModule = 'default' in webhookEventsModuleNs
   ? webhookEventsModuleNs.default as typeof import('../lib/connectors/mintsoft/webhook-events.ts')
   : webhookEventsModuleNs
 
 const { verifyMintsoftWebhookSignature } = authModule
+const { extractMintsoftWebhookTimestamp, isMintsoftWebhookTimestampFresh } = webhookValidationModule
 const { persistMintsoftWebhookEvent } = webhookEventsModule
 
 function buildInput(): PersistMintsoftWebhookEventInput {
@@ -143,4 +148,35 @@ test('persistMintsoftWebhookEvent updates the pending row after a concurrent uni
     eventId: 'concurrent-1',
   })
   assert.deepEqual(updates, ['concurrent-1'])
+})
+
+test('extractMintsoftWebhookTimestamp prefers signed body timestamps when present', () => {
+  assert.deepEqual(
+    extractMintsoftWebhookTimestamp({
+      id: 'evt-1',
+      createdAt: '2026-04-22T10:00:00.000Z',
+    })?.toISOString(),
+    '2026-04-22T10:00:00.000Z',
+  )
+
+  assert.equal(
+    extractMintsoftWebhookTimestamp({
+      id: 'evt-1',
+    }),
+    null,
+  )
+})
+
+test('isMintsoftWebhookTimestampFresh rejects stale signed timestamps', () => {
+  const now = new Date('2026-04-22T10:10:00.000Z')
+
+  assert.equal(
+    isMintsoftWebhookTimestampFresh(new Date('2026-04-22T10:05:00.000Z'), now),
+    true,
+  )
+
+  assert.equal(
+    isMintsoftWebhookTimestampFresh(new Date('2026-04-22T09:30:00.000Z'), now),
+    false,
+  )
 })

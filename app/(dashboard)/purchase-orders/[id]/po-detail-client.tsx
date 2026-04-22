@@ -7,6 +7,7 @@ import { X, Plus, Pencil, Truck, PackageCheck, Ban, Undo2, ChevronDown, ChevronR
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { Select } from '@/components/ui/select'
 import { Textarea } from '@/components/ui/textarea'
 import {
   Dialog,
@@ -490,7 +491,9 @@ function MintsoftAsnDialog({
   }
 
   return (
-    <Dialog open onOpenChange={() => {}}>
+    <Dialog open onOpenChange={(open) => {
+      if (!open && !isPending) onClose()
+    }}>
       <DialogContent showCloseButton={false} className="max-w-3xl sm:max-w-3xl">
         <DialogHeader>
           <DialogTitle>Create Mintsoft ASN</DialogTitle>
@@ -522,16 +525,16 @@ function MintsoftAsnDialog({
           <div className="grid gap-3 md:grid-cols-2">
             <div className="space-y-1.5">
               <Label htmlFor="mintsoftPackagingType">Packaging Type</Label>
-              <select
+              <Select
                 id="mintsoftPackagingType"
                 value={packagingType}
                 onChange={(event) => setPackagingType(event.target.value as typeof packagingType)}
-                className="h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+                className="h-9 rounded-md px-3"
               >
                 <option value="PARCEL">Parcel</option>
                 <option value="PALLET">Pallet</option>
                 <option value="CONTAINER">Container</option>
-              </select>
+              </Select>
             </div>
             <div className="space-y-1.5">
               <Label htmlFor="mintsoftPackageCount">Package Count</Label>

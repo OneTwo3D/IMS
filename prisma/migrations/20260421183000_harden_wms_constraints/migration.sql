@@ -1,5 +1,85 @@
 DROP INDEX IF EXISTS "external_wms_bindings_connector_warehouseId_key";
 
+DO $$
+DECLARE
+  duplicate_binding_count integer := 0;
+  orphan_asn_line_asn_count integer := 0;
+  orphan_asn_line_product_count integer := 0;
+  orphan_asn_map_warehouse_count integer := 0;
+  orphan_snapshot_count integer := 0;
+  orphan_discrepancy_warehouse_count integer := 0;
+BEGIN
+  SELECT COUNT(*) INTO duplicate_binding_count
+  FROM (
+    SELECT 1
+    FROM "external_wms_bindings"
+    GROUP BY "connector", "warehouseId"
+    HAVING COUNT(*) > 1
+  ) duplicates;
+
+  SELECT COUNT(*) INTO orphan_asn_line_asn_count
+  FROM "wms_asn_line_maps"
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM "wms_asn_maps"
+    WHERE "wms_asn_maps"."id" = "wms_asn_line_maps"."asnMapId"
+  );
+
+  SELECT COUNT(*) INTO orphan_asn_line_product_count
+  FROM "wms_asn_line_maps"
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM "products"
+    WHERE "products"."id" = "wms_asn_line_maps"."productId"
+  );
+
+  SELECT COUNT(*) INTO orphan_asn_map_warehouse_count
+  FROM "wms_asn_maps"
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM "warehouses"
+    WHERE "warehouses"."id" = "wms_asn_maps"."warehouseId"
+  );
+
+  SELECT COUNT(*) INTO orphan_snapshot_count
+  FROM "wms_stock_snapshots"
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM "warehouses"
+    WHERE "warehouses"."id" = "wms_stock_snapshots"."warehouseId"
+  )
+  OR NOT EXISTS (
+    SELECT 1
+    FROM "products"
+    WHERE "products"."id" = "wms_stock_snapshots"."productId"
+  );
+
+  SELECT COUNT(*) INTO orphan_discrepancy_warehouse_count
+  FROM "wms_stock_discrepancies"
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM "warehouses"
+    WHERE "warehouses"."id" = "wms_stock_discrepancies"."warehouseId"
+  );
+
+  IF duplicate_binding_count > 0
+    OR orphan_asn_line_asn_count > 0
+    OR orphan_asn_line_product_count > 0
+    OR orphan_asn_map_warehouse_count > 0
+    OR orphan_snapshot_count > 0
+    OR orphan_discrepancy_warehouse_count > 0
+  THEN
+    RAISE EXCEPTION
+      'Preflight failed for 20260421183000_harden_wms_constraints. Resolve duplicate/orphan WMS rows before applying constraints. duplicate_bindings=%, orphan_asn_line_asn=%, orphan_asn_line_product=%, orphan_asn_map_warehouse=%, orphan_snapshots=%, orphan_discrepancy_warehouse=%',
+      duplicate_binding_count,
+      orphan_asn_line_asn_count,
+      orphan_asn_line_product_count,
+      orphan_asn_map_warehouse_count,
+      orphan_snapshot_count,
+      orphan_discrepancy_warehouse_count;
+  END IF;
+END $$;
+
 DELETE FROM "external_wms_bindings"
 WHERE "id" IN (
   SELECT "id"

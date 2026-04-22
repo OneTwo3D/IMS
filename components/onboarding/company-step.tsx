@@ -15,7 +15,7 @@ export type CompanyStepHandle = {
 type Props = {
   org: OrganisationData
   onSaved: () => void
-  onReadyChange?: (ready: boolean) => void
+  onDirtyChange?: (dirty: boolean) => void
 }
 
 function hasCompanyDraftChanges(current: OrganisationData, initial: OrganisationData, logoUrl: string | null) {
@@ -40,7 +40,7 @@ function hasCompanyDraftChanges(current: OrganisationData, initial: Organisation
 export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function CompanyStep({
   org: initialOrg,
   onSaved,
-  onReadyChange,
+  onDirtyChange,
 }, ref) {
   const router = useRouter()
   const [co, setCo] = useState(initialOrg)
@@ -55,8 +55,8 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
   }, [initialOrg])
 
   useEffect(() => {
-    onReadyChange?.(hasCompanyDraftChanges(co, initialOrg, logoUrl))
-  }, [co, initialOrg, logoUrl, onReadyChange])
+    onDirtyChange?.(hasCompanyDraftChanges(co, initialOrg, logoUrl))
+  }, [co, initialOrg, logoUrl, onDirtyChange])
 
   function field(key: keyof OrganisationData, label: string, opts?: { type?: string; span?: number }) {
     return (

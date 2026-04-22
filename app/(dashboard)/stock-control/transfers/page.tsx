@@ -1,4 +1,5 @@
 import type { Metadata } from 'next'
+import { getMintsoftTransferAsnStates } from '@/app/actions/mintsoft-sync'
 import { getWarehouses, getStockLevelMap } from '@/app/actions/stock'
 import { listProducts } from '@/app/actions/products'
 import { getTransfers } from '@/app/actions/transfers'
@@ -13,6 +14,7 @@ export default async function WarehouseTransfersPage() {
     getTransfers(),
     getStockLevelMap(),
   ])
+  const mintsoftAsnStates = await getMintsoftTransferAsnStates(transfers.map((transfer) => transfer.id))
 
   const stockable = products.filter(
     (p) => p.type !== 'VARIABLE' && p.type !== 'NON_INVENTORY' && p.type !== 'KIT'
@@ -23,6 +25,7 @@ export default async function WarehouseTransfersPage() {
       warehouses={warehouses}
       products={stockable}
       initialTransfers={transfers}
+      mintsoftAsnStates={mintsoftAsnStates}
       stockLevels={stockLevels}
     />
   )

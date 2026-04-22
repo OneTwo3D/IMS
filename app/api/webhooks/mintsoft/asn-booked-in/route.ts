@@ -4,6 +4,10 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getMintsoftApiConfiguration, verifyMintsoftWebhookSignature } from '@/lib/connectors/mintsoft'
+import {
+  extractMintsoftWebhookTimestamp,
+  isMintsoftWebhookTimestampFresh,
+} from '@/lib/connectors/mintsoft/webhook-validation'
 import { processMintsoftBookedInEvent } from '@/lib/connectors/mintsoft/sync/booked-in-handler'
 import { persistMintsoftWebhookEvent, type PersistMintsoftWebhookEventInput } from '@/lib/connectors/mintsoft/webhook-events'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
@@ -15,6 +19,10 @@ type MintsoftReceiptWebhookPayload = {
   id?: string | number
   asnId?: string | number
   externalAsnId?: string | number
+  timestamp?: string | number
+  eventTime?: string | number
+  occurredAt?: string | number
+  createdAt?: string | number
 }
 
 class RequestBodyTooLargeError extends Error {
@@ -93,18 +101,6 @@ export async function POST(request: Request) {
   const isPluginEnabled = await isIntegrationPluginEnabled('mintsoft')
   const { webhookSecret } = await getMintsoftApiConfiguration()
   if (!isPluginEnabled || !webhookSecret || !verifyMintsoftWebhookSignature(rawBody, signatureHeader, webhookSecret)) {
-    await logActivity({
-      entityType: 'SYNC',
-      tag: 'sync',
-      action: 'mintsoft_webhook_rejected',
-      level: 'WARNING',
-      description: 'Rejected Mintsoft ASN webhook request',
-      metadata: {
-        pluginEnabled: isPluginEnabled,
-        hasWebhookSecret: Boolean(webhookSecret),
-      },
-      resolveUser: false,
-    })
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
@@ -113,6 +109,11 @@ export async function POST(request: Request) {
     payload = JSON.parse(rawBody) as MintsoftReceiptWebhookPayload
   } catch {
     return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 })
+  }
+
+  const webhookTimestamp = extractMintsoftWebhookTimestamp(payload as Record<string, unknown>)
+  if (webhookTimestamp && !isMintsoftWebhookTimestampFresh(webhookTimestamp)) {
+    return NextResponse.json({ error: 'Stale webhook timestamp' }, { status: 401 })
   }
 
   const externalEventId = getExternalEventId(payload, rawBody)

@@ -38,7 +38,7 @@ type SyncSummary = {
   notifiedUsers: number
 }
 
-const STALE_RUNNING_STOCK_SYNC_MS = 2 * 60 * 60 * 1000
+const STALE_RUNNING_STOCK_SYNC_MS = 3 * 60 * 1000
 const STOCK_SYNC_HEARTBEAT_INTERVAL = 30 * 1000
 
 type RunningStockSyncSummary = {

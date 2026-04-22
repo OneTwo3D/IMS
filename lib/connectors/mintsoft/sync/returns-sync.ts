@@ -95,6 +95,23 @@ export function selectMintsoftReturnBinding(
   return bindings.length === 1 ? bindings[0] ?? null : null
 }
 
+export function resolveMintsoftReturnsNextCursor(params: {
+  since: Date
+  startedAt: Date
+  earliestFailedReceivedAt: Date | null
+  replayFullWindow: boolean
+}): Date {
+  if (params.replayFullWindow) {
+    return params.since
+  }
+
+  if (params.earliestFailedReceivedAt && params.earliestFailedReceivedAt < params.startedAt) {
+    return params.earliestFailedReceivedAt
+  }
+
+  return params.startedAt
+}
+
 export async function resolveMintsoftReturnOrder(
   reference: string | null,
 ): Promise<{ id: string; orderNumber: string | null; externalOrderNumber: string | null } | null> {
@@ -306,6 +323,7 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
   let updatedCount = 0
   let maxReceivedAtSeen: Date | null = null
   let earliestFailedReceivedAt: Date | null = null
+  let replayFullWindow = false
 
   try {
     const connector = getWmsConnector('mintsoft')
@@ -427,6 +445,8 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
         const failedReceivedAt = parseReceivedAt(record.receivedAt)
         if (failedReceivedAt && (!earliestFailedReceivedAt || failedReceivedAt < earliestFailedReceivedAt)) {
           earliestFailedReceivedAt = failedReceivedAt
+        } else {
+          replayFullWindow = true
         }
         logRows.push({
           jobId: job.id,
@@ -444,9 +464,12 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
     }
 
     const status: 'SUCCEEDED' | 'PARTIAL' = counters.errors > 0 ? 'PARTIAL' : 'SUCCEEDED'
-    const nextCursor = earliestFailedReceivedAt && earliestFailedReceivedAt < startedAt
-      ? earliestFailedReceivedAt
-      : startedAt
+    const nextCursor = resolveMintsoftReturnsNextCursor({
+      since,
+      startedAt,
+      earliestFailedReceivedAt,
+      replayFullWindow,
+    })
     const summary = buildReturnsSummary({
       bindingCount: bindings.length,
       since,
