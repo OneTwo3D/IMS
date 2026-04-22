@@ -4,6 +4,7 @@ import { useEffect, useRef, useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
 import { Check, Loader2, Plus, RefreshCw, Settings2, Trash2 } from 'lucide-react'
 import {
+  confirmMintsoftAlignmentMode,
   deleteMintsoftBinding,
   restockMintsoftReturnInboxItem,
   runMintsoftProductVerifyNow,
@@ -223,6 +224,20 @@ export function MintsoftClient({ data }: Props) {
     })
   }
 
+  function handleConfirmAlignment(bindingId: string) {
+    setError('')
+    startTransition(async () => {
+      const result = await confirmMintsoftAlignmentMode(bindingId)
+      if (!result.success) {
+        setError(result.error ?? 'Failed to confirm alignment mode')
+        return
+      }
+
+      router.refresh()
+      flashSaved('Mintsoft alignment mode confirmed')
+    })
+  }
+
   function handleRunSyncNow(id: string) {
     setError('')
     startTransition(async () => {
@@ -371,7 +386,7 @@ export function MintsoftClient({ data }: Props) {
           <div>
             <h3 className="text-base font-semibold">Warehouse Bindings</h3>
             <p className="text-sm text-muted-foreground">
-              Phase 2 runs in notification-only mode: IMS stock remains unchanged while Mintsoft deltas are logged into discrepancies, snapshots, and sync jobs.
+              Notification-only keeps IMS as stock master. Align To WMS is now available with a required dry run before live corrections are allowed.
             </p>
           </div>
           <Button type="button" onClick={() => setIsBindingDialogOpen(true)} disabled={isPending}>
@@ -410,7 +425,10 @@ export function MintsoftClient({ data }: Props) {
                   <TableCell className="font-mono text-xs">{binding.externalWarehouseId}</TableCell>
                   <TableCell>
                     <div className="text-sm">{binding.stockSyncMode}</div>
-                    <div className="text-xs text-muted-foreground">{binding.stockMasterSystem}</div>
+                    <div className="text-xs text-muted-foreground">
+                      {binding.stockMasterSystem}
+                      {binding.stockSyncMode === 'ALIGN_TO_WMS' && !binding.alignmentConfirmedAt ? ' · Dry run only' : ''}
+                    </div>
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
                     {formatThresholdSummary(binding.discrepancyThresholds)}
@@ -424,6 +442,15 @@ export function MintsoftClient({ data }: Props) {
                   </TableCell>
                   <TableCell className="text-right">
                     <div className="flex justify-end gap-1">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => handleConfirmAlignment(binding.id)}
+                        disabled={isPending || !binding.active || binding.stockSyncMode !== 'ALIGN_TO_WMS' || !!binding.alignmentConfirmedAt}
+                      >
+                        <Check className="h-4 w-4" />
+                      </Button>
                       <Button
                         type="button"
                         variant="ghost"
@@ -809,12 +836,10 @@ export function MintsoftClient({ data }: Props) {
               <Select value={stockSyncMode} onChange={(event) => setStockSyncMode(event.target.value as 'DISABLED' | 'NOTIFICATION_ONLY' | 'ALIGN_TO_WMS')}>
                 <option value="DISABLED">Disabled</option>
                 <option value="NOTIFICATION_ONLY">Notification Only</option>
-                <option value="ALIGN_TO_WMS" disabled>
-                  Align To WMS (Coming Later)
-                </option>
+                <option value="ALIGN_TO_WMS">Align To WMS</option>
               </Select>
               <p className="text-xs text-muted-foreground">
-                Stock master: {stockSyncMode === 'ALIGN_TO_WMS' ? 'WMS (requires a later phase)' : 'IMS'}
+                Stock master: {stockSyncMode === 'ALIGN_TO_WMS' ? 'WMS (first sync is a dry run until confirmed)' : 'IMS'}
               </p>
             </div>
             <div className="space-y-1.5">

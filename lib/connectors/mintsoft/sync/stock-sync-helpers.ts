@@ -13,6 +13,19 @@ export type MintsoftMissingInWmsCandidate = {
   lastExternalQty: number | null
 }
 
+export type MintsoftAlignmentCandidate = {
+  asnLineMapId: string
+  expectedQty: number
+  qtyAccountedViaSnapshot: number
+  lastProcessedReceivedQty: number
+  sortKey: string
+}
+
+export type MintsoftAlignmentAllocation = {
+  asnLineMapId: string
+  qty: number
+}
+
 function asRecord(value: Prisma.JsonValue | null | undefined): Record<string, unknown> | null {
   return value && typeof value === 'object' && !Array.isArray(value)
     ? value as Record<string, unknown>
@@ -147,4 +160,46 @@ export function collectMissingInWmsCandidates(input: {
       || (candidate.lastExternalQty != null && candidate.lastExternalQty !== 0)
     ))
     .sort((left, right) => left.sku.localeCompare(right.sku))
+}
+
+export function planMintsoftAlignmentAllocations(input: {
+  delta: number
+  candidates: MintsoftAlignmentCandidate[]
+}): {
+  allocations: MintsoftAlignmentAllocation[]
+  unallocatedQty: number
+} {
+  let remaining = Math.max(0, input.delta)
+  if (remaining <= 0) {
+    return {
+      allocations: [],
+      unallocatedQty: 0,
+    }
+  }
+
+  const allocations: MintsoftAlignmentAllocation[] = []
+  const candidates = [...input.candidates].sort((left, right) => left.sortKey.localeCompare(right.sortKey))
+
+  for (const candidate of candidates) {
+    if (remaining <= 0) break
+
+    const alreadyCreditedQty = Math.max(
+      0,
+      Math.max(candidate.qtyAccountedViaSnapshot, candidate.lastProcessedReceivedQty),
+    )
+    const availableQty = Math.max(0, candidate.expectedQty - alreadyCreditedQty)
+    if (availableQty <= 0) continue
+
+    const qty = Math.min(remaining, availableQty)
+    allocations.push({
+      asnLineMapId: candidate.asnLineMapId,
+      qty,
+    })
+    remaining -= qty
+  }
+
+  return {
+    allocations,
+    unallocatedQty: remaining,
+  }
 }

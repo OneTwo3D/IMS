@@ -47,6 +47,7 @@ enum WarehouseType {
 
 enum StockMovementType {
   PURCHASE_RECEIPT
+  WMS_RECEIPT_RECONCILIATION
   SALE_DISPATCH
   RETURN_INBOUND
   TRANSFER_OUT
@@ -929,6 +930,7 @@ model PurchaseReceipt {
   id          String    @id @default(cuid())
   poId        String
   reference   String?
+  externalKey String?   @unique
   receivedAt  DateTime  @default(now())
   notes       String?
   createdAt   DateTime  @default(now())
@@ -940,11 +942,12 @@ model PurchaseReceipt {
 }
 
 model PurchaseReceiptLine {
-  id          String    @id @default(cuid())
-  receiptId   String
-  poLineId    String
-  qtyReceived Decimal   @db.Decimal(12, 4)
-  warehouseId String?   // warehouse goods were received into
+  id                   String    @id @default(cuid())
+  receiptId            String
+  poLineId             String
+  qtyReceived          Decimal   @db.Decimal(12, 4)
+  coveredBySnapshotQty Decimal   @db.Decimal(12, 4) @default(0)
+  warehouseId          String?   // warehouse goods were received into
 
   receipt     PurchaseReceipt   @relation(fields: [receiptId], references: [id])
   poLine      PurchaseOrderLine @relation(fields: [poLineId], references: [id])
@@ -1724,6 +1727,7 @@ enum WmsAsnStatus {
 enum WmsSyncLogAction {
   created
   updated
+  corrected
   noop
   sync
   backfill
@@ -1768,6 +1772,7 @@ model ExternalWmsBinding {
   syncFrequencyMinutes Int                    @default(60)
   discrepancyThresholds Json?
   reportRecipients     String[]               @default([])
+  alignmentConfirmedAt DateTime?
   lastStockSyncAt      DateTime?
   lastStockSyncStatus  WmsSyncJobStatus?
   createdAt            DateTime               @default(now())
@@ -1854,6 +1859,7 @@ model WmsAsnLineMap {
   qtyAccountedViaSnapshot Decimal  @db.Decimal(12, 4) @default(0)
   qtyAccountedViaReceipt  Decimal  @db.Decimal(12, 4) @default(0)
   lastProcessedReceivedQty Decimal @db.Decimal(12, 4) @default(0)
+  note                   String?
   lastCallbackAt         DateTime?
   createdAt              DateTime  @default(now())
 

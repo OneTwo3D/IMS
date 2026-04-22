@@ -123,6 +123,58 @@ test('consolidateMintsoftStockLines merges duplicate SKUs and keeps the latest r
   )
 })
 
+test('planMintsoftAlignmentAllocations consumes the oldest open ASN capacity first', () => {
+  assert.deepEqual(
+    stockSyncHelpers.planMintsoftAlignmentAllocations({
+      delta: 9,
+      candidates: [
+        {
+          asnLineMapId: 'line-b',
+          expectedQty: 10,
+          qtyAccountedViaSnapshot: 3,
+          lastProcessedReceivedQty: 0,
+          sortKey: '2026-04-22T10:05:00.000Z:line-b',
+        },
+        {
+          asnLineMapId: 'line-a',
+          expectedQty: 5,
+          qtyAccountedViaSnapshot: 0,
+          lastProcessedReceivedQty: 0,
+          sortKey: '2026-04-22T10:00:00.000Z:line-a',
+        },
+      ],
+    }),
+    {
+      allocations: [
+        { asnLineMapId: 'line-a', qty: 5 },
+        { asnLineMapId: 'line-b', qty: 4 },
+      ],
+      unallocatedQty: 0,
+    },
+  )
+
+  assert.deepEqual(
+    stockSyncHelpers.planMintsoftAlignmentAllocations({
+      delta: 20,
+      candidates: [
+        {
+          asnLineMapId: 'line-a',
+          expectedQty: 5,
+          qtyAccountedViaSnapshot: 2,
+          lastProcessedReceivedQty: 0,
+          sortKey: '2026-04-22T10:00:00.000Z:line-a',
+        },
+      ],
+    }),
+    {
+      allocations: [
+        { asnLineMapId: 'line-a', qty: 3 },
+      ],
+      unallocatedQty: 17,
+    },
+  )
+})
+
 test('collectMissingInWmsCandidates keeps feed omissions visible without zero-zero noise', () => {
   assert.deepEqual(
     stockSyncHelpers.collectMissingInWmsCandidates({

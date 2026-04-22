@@ -245,6 +245,8 @@ export async function processMintsoftBookedInEvent(
               productId: true,
               sku: true,
               expectedQty: true,
+              qtyAccountedViaSnapshot: true,
+              qtyAccountedViaReceipt: true,
               lastProcessedReceivedQty: true,
             },
           },
@@ -348,6 +350,8 @@ export async function processMintsoftBookedInEvent(
         poLineId: string
         productId: string
         expectedQty: number
+        qtyAccountedViaSnapshot: number
+        qtyAccountedViaReceipt: number
         currentReceivedQty: number
         lastProcessedReceivedQty: number
       }>>()
@@ -356,6 +360,8 @@ export async function processMintsoftBookedInEvent(
         transferLineId: string
         productId: string
         expectedQty: number
+        qtyAccountedViaSnapshot: number
+        qtyAccountedViaReceipt: number
         currentReceivedQty: number
         lastProcessedReceivedQty: number
       }>>()
@@ -373,6 +379,8 @@ export async function processMintsoftBookedInEvent(
             poLineId: poLine.id,
             productId: poLine.productId,
             expectedQty: Number(line.expectedQty),
+            qtyAccountedViaSnapshot: Number(line.qtyAccountedViaSnapshot),
+            qtyAccountedViaReceipt: Number(line.qtyAccountedViaReceipt),
             currentReceivedQty: line.currentReceivedQty,
             lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),
           })
@@ -391,6 +399,8 @@ export async function processMintsoftBookedInEvent(
           transferLineId: transferLine.id,
           productId: transferLine.productId,
           expectedQty: Number(line.expectedQty),
+          qtyAccountedViaSnapshot: Number(line.qtyAccountedViaSnapshot),
+          qtyAccountedViaReceipt: Number(line.qtyAccountedViaReceipt),
           currentReceivedQty: line.currentReceivedQty,
           lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),
         })
@@ -438,12 +448,17 @@ export async function processMintsoftBookedInEvent(
             currentReceivedQty: receiptLine.currentReceivedQty,
             localReceivedQty: Number(poLine.qtyReceived),
             lastProcessedReceivedQty: receiptLine.lastProcessedReceivedQty,
+            qtyAccountedViaSnapshot: receiptLine.qtyAccountedViaSnapshot,
+            qtyAccountedViaReceipt: receiptLine.qtyAccountedViaReceipt,
           })
 
           return {
             ...receiptLine,
             qtyReceived: reconciled.qtyReceived,
             reconciledManualQty: reconciled.reconciledManualQty,
+            coveredBySnapshotQty: reconciled.coveredBySnapshotQty,
+            stockQtyToAdd: reconciled.stockQtyToAdd,
+            newlyProcessedQty: reconciled.newlyProcessedQty,
           }
         }).filter((receiptLine) => receiptLine.qtyReceived > 0 || receiptLine.reconciledManualQty > 0)
 
@@ -453,11 +468,13 @@ export async function processMintsoftBookedInEvent(
             data: {
               poId,
               reference: formatReceiptReference(lockedEvent.externalAsnId, po.reference),
+              externalKey: `mintsoft:po:${poId}:event:${lockedEvent.id}`,
               notes: `Mintsoft ASN booked-in webhook ${lockedEvent.externalAsnId}`,
               lines: {
                 create: createdReceiptLines.map((receiptLine) => ({
                   poLineId: receiptLine.poLineId,
                   qtyReceived: receiptLine.qtyReceived,
+                  coveredBySnapshotQty: receiptLine.coveredBySnapshotQty,
                   warehouseId: asnMap.warehouseId,
                 })),
               },
@@ -471,47 +488,63 @@ export async function processMintsoftBookedInEvent(
 
           if (receiptLine.qtyReceived > 0) {
             const unitCostBase = Number(poLine.landedUnitCostBase ?? poLine.unitCostBase)
-            await tx.stockMovement.create({
-              data: {
-                type: 'PURCHASE_RECEIPT',
-                productId: poLine.productId,
-                toWarehouseId: asnMap.warehouseId,
-                qty: receiptLine.qtyReceived,
-                note: `Received against ${po.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
-                referenceType: 'WmsAsnMap',
-                referenceId: asnMap.id,
-              },
-            })
+            if (receiptLine.stockQtyToAdd > 0) {
+              await tx.stockMovement.create({
+                data: {
+                  type: 'PURCHASE_RECEIPT',
+                  productId: poLine.productId,
+                  toWarehouseId: asnMap.warehouseId,
+                  qty: receiptLine.stockQtyToAdd,
+                  note: `Received against ${po.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
+                  referenceType: 'WmsAsnMap',
+                  referenceId: asnMap.id,
+                },
+              })
 
-            await tx.costLayer.create({
-              data: {
-                productId: poLine.productId,
-                warehouseId: asnMap.warehouseId,
-                receivedQty: receiptLine.qtyReceived,
-                remainingQty: receiptLine.qtyReceived,
-                unitCostBase,
-                poLineId: poLine.id,
-                isOpeningStock: false,
-              },
-            })
-
-            await tx.stockLevel.upsert({
-              where: {
-                productId_warehouseId: {
+              await tx.costLayer.create({
+                data: {
                   productId: poLine.productId,
                   warehouseId: asnMap.warehouseId,
+                  receivedQty: receiptLine.stockQtyToAdd,
+                  remainingQty: receiptLine.stockQtyToAdd,
+                  unitCostBase,
+                  poLineId: poLine.id,
+                  isOpeningStock: false,
                 },
-              },
-              create: {
-                productId: poLine.productId,
-                warehouseId: asnMap.warehouseId,
-                quantity: receiptLine.qtyReceived,
-                reservedQty: 0,
-              },
-              update: {
-                quantity: { increment: receiptLine.qtyReceived },
-              },
-            })
+              })
+
+              await tx.stockLevel.upsert({
+                where: {
+                  productId_warehouseId: {
+                    productId: poLine.productId,
+                    warehouseId: asnMap.warehouseId,
+                  },
+                },
+                create: {
+                  productId: poLine.productId,
+                  warehouseId: asnMap.warehouseId,
+                  quantity: receiptLine.stockQtyToAdd,
+                  reservedQty: 0,
+                },
+                update: {
+                  quantity: { increment: receiptLine.stockQtyToAdd },
+                },
+              })
+            }
+
+            if (receiptLine.coveredBySnapshotQty > 0) {
+              await tx.stockMovement.create({
+                data: {
+                  type: 'WMS_RECEIPT_RECONCILIATION',
+                  productId: poLine.productId,
+                  toWarehouseId: asnMap.warehouseId,
+                  qty: 0,
+                  note: `Mintsoft snapshot already accounted for ${receiptLine.coveredBySnapshotQty} on ${po.reference}`,
+                  referenceType: 'WmsAsnLineMap',
+                  referenceId: receiptLine.asnLineMapId,
+                },
+              })
+            }
 
             await tx.purchaseOrderLine.update({
               where: { id: poLine.id },
@@ -526,8 +559,8 @@ export async function processMintsoftBookedInEvent(
           await tx.wmsAsnLineMap.update({
             where: { id: receiptLine.asnLineMapId },
             data: {
-              qtyAccountedViaReceipt: { increment: receiptLine.qtyReceived + receiptLine.reconciledManualQty },
-              lastProcessedReceivedQty: { increment: receiptLine.qtyReceived + receiptLine.reconciledManualQty },
+              qtyAccountedViaReceipt: { increment: receiptLine.newlyProcessedQty },
+              lastProcessedReceivedQty: { increment: receiptLine.newlyProcessedQty },
               lastCallbackAt: now,
             },
           })
@@ -593,13 +626,21 @@ export async function processMintsoftBookedInEvent(
             currentReceivedQty: receiptLine.currentReceivedQty,
             localReceivedQty: Number(transferLine.qtyReceived),
             lastProcessedReceivedQty: receiptLine.lastProcessedReceivedQty,
+            qtyAccountedViaSnapshot: receiptLine.qtyAccountedViaSnapshot,
+            qtyAccountedViaReceipt: receiptLine.qtyAccountedViaReceipt,
           })
 
           return {
             ...receiptLine,
-            alreadyReceivedQty: Number(transferLine.qtyReceived),
             qtyReceived: reconciled.qtyReceived,
             reconciledManualQty: reconciled.reconciledManualQty,
+            coveredBySnapshotQty: reconciled.coveredBySnapshotQty,
+            stockQtyToAdd: reconciled.stockQtyToAdd,
+            newlyProcessedQty: reconciled.newlyProcessedQty,
+            alreadyReceivedQty: Math.max(
+              Number(transferLine.qtyReceived),
+              receiptLine.qtyAccountedViaSnapshot,
+            ),
           }
         }).filter((receiptLine) => receiptLine.qtyReceived > 0 || receiptLine.reconciledManualQty > 0)
 
@@ -608,51 +649,67 @@ export async function processMintsoftBookedInEvent(
           if (!transferLine) continue
 
           if (receiptLine.qtyReceived > 0) {
-            await tx.stockMovement.create({
-              data: {
-                type: 'TRANSFER_IN',
-                productId: transferLine.productId,
-                fromWarehouseId: null,
-                toWarehouseId: transfer.toWarehouseId,
-                qty: receiptLine.qtyReceived,
-                note: `Received against ${transfer.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
-                referenceType: 'WmsAsnMap',
-                referenceId: asnMap.id,
-              },
-            })
+            if (receiptLine.stockQtyToAdd > 0) {
+              await tx.stockMovement.create({
+                data: {
+                  type: 'TRANSFER_IN',
+                  productId: transferLine.productId,
+                  fromWarehouseId: null,
+                  toWarehouseId: transfer.toWarehouseId,
+                  qty: receiptLine.stockQtyToAdd,
+                  note: `Received against ${transfer.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
+                  referenceType: 'WmsAsnMap',
+                  referenceId: asnMap.id,
+                },
+              })
 
-            await tx.stockLevel.upsert({
-              where: {
-                productId_warehouseId: {
+              await tx.stockLevel.upsert({
+                where: {
+                  productId_warehouseId: {
+                    productId: transferLine.productId,
+                    warehouseId: transfer.toWarehouseId,
+                  },
+                },
+                create: {
                   productId: transferLine.productId,
                   warehouseId: transfer.toWarehouseId,
+                  quantity: receiptLine.stockQtyToAdd,
+                  reservedQty: 0,
                 },
-              },
-              create: {
-                productId: transferLine.productId,
-                warehouseId: transfer.toWarehouseId,
-                quantity: receiptLine.qtyReceived,
-                reservedQty: 0,
-              },
-              update: {
-                quantity: { increment: receiptLine.qtyReceived },
-              },
-            })
-
-            const snapshotSlice = sliceTransferSnapshotForReceipt({
-              snapshot: transferLine.costLayerSnapshot,
-              alreadyReceivedQty: receiptLine.alreadyReceivedQty,
-              qtyReceived: receiptLine.qtyReceived,
-            })
-
-            for (const entry of snapshotSlice) {
-              const newLayerId = await createCostLayer(tx, {
-                productId: transferLine.productId,
-                warehouseId: transfer.toWarehouseId,
-                qty: entry.qty,
-                unitCostBase: entry.unitCostBase,
+                update: {
+                  quantity: { increment: receiptLine.stockQtyToAdd },
+                },
               })
-              await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entry.qty)
+
+              const snapshotSlice = sliceTransferSnapshotForReceipt({
+                snapshot: transferLine.costLayerSnapshot,
+                alreadyReceivedQty: receiptLine.alreadyReceivedQty,
+                qtyReceived: receiptLine.stockQtyToAdd,
+              })
+
+              for (const entry of snapshotSlice) {
+                const newLayerId = await createCostLayer(tx, {
+                  productId: transferLine.productId,
+                  warehouseId: transfer.toWarehouseId,
+                  qty: entry.qty,
+                  unitCostBase: entry.unitCostBase,
+                })
+                await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entry.qty)
+              }
+            }
+
+            if (receiptLine.coveredBySnapshotQty > 0) {
+              await tx.stockMovement.create({
+                data: {
+                  type: 'WMS_RECEIPT_RECONCILIATION',
+                  productId: transferLine.productId,
+                  toWarehouseId: transfer.toWarehouseId,
+                  qty: 0,
+                  note: `Mintsoft snapshot already accounted for ${receiptLine.coveredBySnapshotQty} on ${transfer.reference}`,
+                  referenceType: 'WmsAsnLineMap',
+                  referenceId: receiptLine.asnLineMapId,
+                },
+              })
             }
 
             await tx.stockTransferLine.update({
@@ -668,8 +725,8 @@ export async function processMintsoftBookedInEvent(
           await tx.wmsAsnLineMap.update({
             where: { id: receiptLine.asnLineMapId },
             data: {
-              qtyAccountedViaReceipt: { increment: receiptLine.qtyReceived + receiptLine.reconciledManualQty },
-              lastProcessedReceivedQty: { increment: receiptLine.qtyReceived + receiptLine.reconciledManualQty },
+              qtyAccountedViaReceipt: { increment: receiptLine.newlyProcessedQty },
+              lastProcessedReceivedQty: { increment: receiptLine.newlyProcessedQty },
               lastCallbackAt: now,
             },
           })

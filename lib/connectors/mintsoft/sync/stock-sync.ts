@@ -2,14 +2,17 @@ import { randomUUID } from 'crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { createCostLayer, copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import { notify } from '@/lib/notifications'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import {
   collectMissingInWmsCandidates,
   consolidateMintsoftStockLines,
   hasMintsoftThresholdBreach,
+  planMintsoftAlignmentAllocations,
   parseMintsoftThresholds,
 } from './stock-sync-helpers'
+import { sliceTransferSnapshotForReceipt } from './booked-in-helpers'
 
 type SyncBinding = {
   id: string
@@ -20,6 +23,7 @@ type SyncBinding = {
   syncFrequencyMinutes: number
   discrepancyThresholds: Prisma.JsonValue | null
   reportRecipients: string[]
+  alignmentConfirmedAt: Date | null
   warehouseId: string
   lastStockSyncAt: Date | null
   connection: {
@@ -36,6 +40,8 @@ type SyncSummary = {
   externalWarehouseId: string
   thresholdBreaches: number
   notifiedUsers: number
+  dryRun?: boolean
+  alignmentCorrections?: number
 }
 
 const STALE_RUNNING_STOCK_SYNC_MS = 3 * 60 * 1000
@@ -61,6 +67,7 @@ export type MintsoftStockSyncResult = {
   skipped: number
   errors: number
   notifiedUsers: number
+  dryRun?: boolean
   skippedReason?: string
 }
 
@@ -98,6 +105,7 @@ async function getSyncBinding(bindingId: string): Promise<SyncBinding | null> {
       syncFrequencyMinutes: true,
       discrepancyThresholds: true,
       reportRecipients: true,
+      alignmentConfirmedAt: true,
       warehouseId: true,
       lastStockSyncAt: true,
       connection: {
@@ -191,6 +199,7 @@ async function reserveStockSyncJob(
         syncFrequencyMinutes: true,
         discrepancyThresholds: true,
         reportRecipients: true,
+        alignmentConfirmedAt: true,
         warehouseId: true,
         lastStockSyncAt: true,
         connection: {
@@ -471,6 +480,243 @@ async function detectReceiptTimingConflict(
   return null
 }
 
+type AlignmentCandidateLine = {
+  id: string
+  sourceType: 'PURCHASE_ORDER_LINE' | 'STOCK_TRANSFER_LINE'
+  sourceLineId: string
+  expectedQty: number
+  qtyAccountedViaSnapshot: number
+  lastProcessedReceivedQty: number
+  asn: {
+    externalAsnId: string
+    createdAt: Date
+  }
+}
+
+async function getAlignmentCandidateLines(
+  binding: SyncBinding,
+  productId: string,
+): Promise<AlignmentCandidateLine[]> {
+  const lines = await db.wmsAsnLineMap.findMany({
+    where: {
+      productId,
+      asn: {
+        connector: 'mintsoft',
+        warehouseId: binding.warehouseId,
+        closedAt: null,
+      },
+      sourceType: {
+        in: ['PURCHASE_ORDER_LINE', 'STOCK_TRANSFER_LINE'],
+      },
+    },
+    select: {
+      id: true,
+      sourceType: true,
+      sourceLineId: true,
+      expectedQty: true,
+      qtyAccountedViaSnapshot: true,
+      lastProcessedReceivedQty: true,
+      asn: {
+        select: {
+          externalAsnId: true,
+          createdAt: true,
+        },
+      },
+    },
+    orderBy: [
+      { asn: { createdAt: 'asc' } },
+      { createdAt: 'asc' },
+    ],
+  })
+
+  return lines.map((line) => ({
+    id: line.id,
+    sourceType: line.sourceType as 'PURCHASE_ORDER_LINE' | 'STOCK_TRANSFER_LINE',
+    sourceLineId: line.sourceLineId,
+    expectedQty: Number(line.expectedQty),
+    qtyAccountedViaSnapshot: Number(line.qtyAccountedViaSnapshot),
+    lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),
+    asn: line.asn,
+  }))
+}
+
+async function applyMintsoftAlignmentForProduct(params: {
+  binding: SyncBinding
+  productId: string
+  sku: string
+  delta: number
+  dryRun: boolean
+}): Promise<{
+  applied: boolean
+  dryRun: boolean
+  correctedQty: number
+  reason: string
+}> {
+  const candidates = await getAlignmentCandidateLines(params.binding, params.productId)
+  if (candidates.length === 0) {
+    return {
+      applied: false,
+      dryRun: params.dryRun,
+      correctedQty: 0,
+      reason: 'No open ASN line is available to absorb this WMS delta.',
+    }
+  }
+
+  const plan = planMintsoftAlignmentAllocations({
+    delta: params.delta,
+    candidates: candidates.map((candidate) => ({
+      asnLineMapId: candidate.id,
+      expectedQty: candidate.expectedQty,
+      qtyAccountedViaSnapshot: candidate.qtyAccountedViaSnapshot,
+      lastProcessedReceivedQty: candidate.lastProcessedReceivedQty,
+      sortKey: `${candidate.asn.createdAt.toISOString()}:${candidate.id}`,
+    })),
+  })
+
+  if (plan.allocations.length === 0 || plan.unallocatedQty > 0.0001) {
+    const coveredQty = params.delta - plan.unallocatedQty
+    return {
+      applied: false,
+      dryRun: params.dryRun,
+      correctedQty: 0,
+      reason: coveredQty > 0
+        ? `Open ASN lines only explain ${formatQuantity(coveredQty)} of the ${formatQuantity(params.delta)} delta; leaving stock unchanged.`
+        : 'No open ASN line has remaining capacity for this WMS delta.',
+    }
+  }
+
+  if (params.dryRun) {
+    return {
+      applied: false,
+      dryRun: true,
+      correctedQty: params.delta,
+      reason: `Dry run: ${plan.allocations.length} ASN line${plan.allocations.length === 1 ? '' : 's'} would absorb ${formatQuantity(params.delta)}.`,
+    }
+  }
+
+  const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]))
+
+  await db.$transaction(async (tx) => {
+    for (const allocation of plan.allocations) {
+      const candidate = candidateById.get(allocation.asnLineMapId)
+      if (!candidate) {
+        throw new Error(`Missing ASN line ${allocation.asnLineMapId} during alignment.`)
+      }
+
+      if (candidate.sourceType === 'PURCHASE_ORDER_LINE') {
+        const poLine = await tx.purchaseOrderLine.findUnique({
+          where: { id: candidate.sourceLineId },
+          select: {
+            id: true,
+            productId: true,
+            unitCostBase: true,
+          },
+        })
+        if (!poLine) {
+          throw new Error(`Purchase order line ${candidate.sourceLineId} is missing for alignment.`)
+        }
+
+        await tx.stockMovement.create({
+          data: {
+            type: 'PURCHASE_RECEIPT',
+            productId: params.productId,
+            toWarehouseId: params.binding.warehouseId,
+            qty: allocation.qty,
+            note: `Mintsoft alignment snapshot against ASN ${candidate.asn.externalAsnId}`,
+            referenceType: 'WmsAsnLineMap',
+            referenceId: candidate.id,
+          },
+        })
+
+        await createCostLayer(tx, {
+          productId: poLine.productId,
+          warehouseId: params.binding.warehouseId,
+          qty: allocation.qty,
+          unitCostBase: Number(poLine.unitCostBase),
+          poLineId: poLine.id,
+        })
+      } else {
+        const transferLine = await tx.stockTransferLine.findUnique({
+          where: { id: candidate.sourceLineId },
+          select: {
+            id: true,
+            productId: true,
+            costLayerSnapshot: true,
+          },
+        })
+        if (!transferLine) {
+          throw new Error(`Transfer line ${candidate.sourceLineId} is missing for alignment.`)
+        }
+
+        await tx.stockMovement.create({
+          data: {
+            type: 'TRANSFER_IN',
+            productId: params.productId,
+            toWarehouseId: params.binding.warehouseId,
+            qty: allocation.qty,
+            note: `Mintsoft alignment snapshot against ASN ${candidate.asn.externalAsnId}`,
+            referenceType: 'WmsAsnLineMap',
+            referenceId: candidate.id,
+          },
+        })
+
+        const snapshotSlice = sliceTransferSnapshotForReceipt({
+          snapshot: transferLine.costLayerSnapshot,
+          alreadyReceivedQty: candidate.qtyAccountedViaSnapshot,
+          qtyReceived: allocation.qty,
+        })
+
+        if (snapshotSlice.length === 0 && allocation.qty > 0) {
+          throw new Error(`Transfer line ${candidate.sourceLineId} has no FIFO snapshot left for alignment.`)
+        }
+
+        for (const entry of snapshotSlice) {
+          const newLayerId = await createCostLayer(tx, {
+            productId: transferLine.productId,
+            warehouseId: params.binding.warehouseId,
+            qty: entry.qty,
+            unitCostBase: entry.unitCostBase,
+          })
+          await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entry.qty)
+        }
+      }
+
+      await tx.stockLevel.upsert({
+        where: {
+          productId_warehouseId: {
+            productId: params.productId,
+            warehouseId: params.binding.warehouseId,
+          },
+        },
+        create: {
+          productId: params.productId,
+          warehouseId: params.binding.warehouseId,
+          quantity: allocation.qty,
+          reservedQty: 0,
+        },
+        update: {
+          quantity: { increment: allocation.qty },
+        },
+      })
+
+      await tx.wmsAsnLineMap.update({
+        where: { id: candidate.id },
+        data: {
+          qtyAccountedViaSnapshot: { increment: allocation.qty },
+          note: null,
+        },
+      })
+    }
+  }, { maxWait: 5000, timeout: 30000 })
+
+  return {
+    applied: true,
+    dryRun: false,
+    correctedQty: params.delta,
+    reason: `Aligned ${formatQuantity(params.delta)} from Mintsoft to ${plan.allocations.length} open ASN line${plan.allocations.length === 1 ? '' : 's'}.`,
+  }
+}
+
 async function notifyThresholdBreaches(binding: SyncBinding, breachCount: number): Promise<number> {
   if (breachCount === 0 || binding.reportRecipients.length === 0) return 0
 
@@ -630,6 +876,7 @@ export async function runStockSyncForBinding(
   }
 
   let thresholdBreaches = 0
+  const alignmentDryRun = binding.stockSyncMode === 'ALIGN_TO_WMS' && !binding.alignmentConfirmedAt
   let lastHeartbeatAt = Date.now()
 
   try {
@@ -814,6 +1061,34 @@ export async function runStockSyncForBinding(
 
         counters.mismatched += 1
 
+        if (binding.stockSyncMode === 'ALIGN_TO_WMS' && delta > 0) {
+          const alignment = await applyMintsoftAlignmentForProduct({
+            binding,
+            productId: product.id,
+            sku: product.sku,
+            delta,
+            dryRun: alignmentDryRun,
+          })
+
+          if (alignment.applied || alignment.dryRun) {
+            counters.corrected += 1
+            await resolveOpenDiscrepancies(binding, product.id, product.sku)
+            logRows.push({
+              jobId: job.id,
+              sku: product.sku,
+              productId: product.id,
+              action: alignment.applied ? 'corrected' : 'discrepancy',
+              imsQtyBefore: imsQty,
+              imsQtyAfter: alignment.applied ? wmsQty : imsQty,
+              wmsQty,
+              delta,
+              reason: alignment.reason,
+              payload: (line.raw ?? {}) as Prisma.InputJsonValue,
+            })
+            continue
+          }
+        }
+
         const timingConflict = await detectReceiptTimingConflict(binding, product.id, delta)
         const category = timingConflict ? 'RECEIPT_TIMING_CONFLICT' : 'QTY_MISMATCH'
         const message = timingConflict ?? `IMS has ${formatQuantity(imsQty)} and Mintsoft has ${formatQuantity(wmsQty)} for ${product.sku}.`
@@ -924,6 +1199,8 @@ export async function runStockSyncForBinding(
       externalWarehouseId: binding.externalWarehouseId,
       thresholdBreaches,
       notifiedUsers,
+      dryRun: alignmentDryRun,
+      alignmentCorrections: counters.corrected,
     }
 
     const completed = await completeJob(job.id, status, counters, summary, leaseToken)
@@ -959,6 +1236,7 @@ export async function runStockSyncForBinding(
       skipped: counters.skipped,
       errors: counters.errors,
       notifiedUsers,
+      dryRun: alignmentDryRun,
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Mintsoft stock sync failed'
@@ -967,6 +1245,8 @@ export async function runStockSyncForBinding(
       externalWarehouseId: binding.externalWarehouseId,
       thresholdBreaches: 0,
       notifiedUsers: 0,
+      dryRun: alignmentDryRun,
+      alignmentCorrections: counters.corrected,
     }, leaseToken)
     await updateBindingSyncStateIfCurrent(binding.id, 'FAILED', job.id, leaseToken)
 
@@ -997,6 +1277,7 @@ export async function runStockSyncForBinding(
       skipped: counters.skipped,
       errors: counters.errors + 1,
       notifiedUsers: 0,
+      dryRun: alignmentDryRun,
       skippedReason: message,
     }
   }
@@ -1052,4 +1333,26 @@ export async function createMintsoftBindingHandover(
   })
 
   return job.id
+}
+
+export async function clearMintsoftAlignmentCreditsForBinding(bindingId: string): Promise<number> {
+  const binding = await getSyncBinding(bindingId)
+  if (!binding) return 0
+
+  const updated = await db.wmsAsnLineMap.updateMany({
+    where: {
+      qtyAccountedViaSnapshot: { gt: 0 },
+      asn: {
+        connector: 'mintsoft',
+        warehouseId: binding.warehouseId,
+        closedAt: null,
+      },
+    },
+    data: {
+      qtyAccountedViaSnapshot: 0,
+      note: 'alignment credit cleared on mode exit',
+    },
+  })
+
+  return updated.count
 }

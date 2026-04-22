@@ -9,6 +9,9 @@ export type ReconciledBookedInQuantities = {
   currentReceivedQty: number
   qtyReceived: number
   reconciledManualQty: number
+  coveredBySnapshotQty: number
+  stockQtyToAdd: number
+  newlyProcessedQty: number
 }
 
 export function reconcileBookedInQuantities(input: {
@@ -16,19 +19,30 @@ export function reconcileBookedInQuantities(input: {
   currentReceivedQty: number
   localReceivedQty: number
   lastProcessedReceivedQty: number
+  qtyAccountedViaSnapshot?: number
+  qtyAccountedViaReceipt?: number
 }): ReconciledBookedInQuantities {
   const expectedQty = Math.max(0, input.expectedQty)
   const currentReceivedQty = Math.min(expectedQty, Math.max(0, input.currentReceivedQty))
   const localReceivedQty = Math.min(currentReceivedQty, Math.max(0, input.localReceivedQty))
   const lastProcessedReceivedQty = Math.min(expectedQty, Math.max(0, input.lastProcessedReceivedQty))
+  const qtyAccountedViaSnapshot = Math.min(expectedQty, Math.max(0, input.qtyAccountedViaSnapshot ?? 0))
+  const qtyAccountedViaReceipt = Math.min(expectedQty, Math.max(0, input.qtyAccountedViaReceipt ?? 0))
   const alreadyAccountedViaAsn = Math.max(lastProcessedReceivedQty, localReceivedQty)
   const reconciledManualQty = Math.max(0, alreadyAccountedViaAsn - lastProcessedReceivedQty)
   const qtyReceived = Math.max(0, currentReceivedQty - alreadyAccountedViaAsn)
+  const unabsorbedFromSnapshot = Math.max(0, qtyAccountedViaSnapshot - qtyAccountedViaReceipt)
+  const coveredBySnapshotQty = Math.min(qtyReceived, unabsorbedFromSnapshot)
+  const stockQtyToAdd = Math.max(0, qtyReceived - coveredBySnapshotQty)
+  const newlyProcessedQty = qtyReceived + reconciledManualQty
 
   return {
     currentReceivedQty,
     qtyReceived,
     reconciledManualQty,
+    coveredBySnapshotQty,
+    stockQtyToAdd,
+    newlyProcessedQty,
   }
 }
 

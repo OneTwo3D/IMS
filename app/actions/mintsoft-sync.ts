@@ -1,7 +1,7 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { Prisma, type WmsAsnStatus } from '@/app/generated/prisma/client'
+import { Prisma, type WmsAsnStatus, type WmsStockMasterSystem, type WmsStockSyncMode } from '@/app/generated/prisma/client'
 import { z } from 'zod'
 import { applyReturnInboundStockTx, type RefundReturnRow } from '@/app/actions/sales'
 import { db } from '@/lib/db'
@@ -17,6 +17,7 @@ import {
 } from '@/lib/connectors/mintsoft'
 import { inferMintsoftOrderLookupConnector } from '@/lib/connectors/mintsoft/order-lookup'
 import {
+  clearMintsoftAlignmentCreditsForBinding,
   createMintsoftBindingHandover,
   runStockSyncForBinding,
 } from '@/lib/connectors/mintsoft/sync/stock-sync'
@@ -50,6 +51,7 @@ type MintsoftBindingSelect = {
   syncFrequencyMinutes: true
   discrepancyThresholds: true
   reportRecipients: true
+  alignmentConfirmedAt: true
   lastStockSyncAt: true
   lastStockSyncStatus: true
   warehouse: {
@@ -74,6 +76,7 @@ const mintsoftBindingSelect = {
   syncFrequencyMinutes: true,
   discrepancyThresholds: true,
   reportRecipients: true,
+  alignmentConfirmedAt: true,
   lastStockSyncAt: true,
   lastStockSyncStatus: true,
   warehouse: {
@@ -137,6 +140,7 @@ export type MintsoftBindingRow = {
     percentDelta: number | null
   } | null
   reportRecipients: string[]
+  alignmentConfirmedAt: string | null
   lastStockSyncAt: string | null
   lastStockSyncStatus: string | null
 }
@@ -364,6 +368,7 @@ function mapMintsoftBinding(row: {
   syncFrequencyMinutes: number
   discrepancyThresholds: Prisma.JsonValue | null
   reportRecipients: string[]
+  alignmentConfirmedAt: Date | null
   lastStockSyncAt: Date | null
   lastStockSyncStatus: string | null
   warehouse: {
@@ -388,6 +393,7 @@ function mapMintsoftBinding(row: {
     syncFrequencyMinutes: row.syncFrequencyMinutes,
     discrepancyThresholds: parseMintsoftThresholds(row.discrepancyThresholds),
     reportRecipients: row.reportRecipients,
+    alignmentConfirmedAt: row.alignmentConfirmedAt?.toISOString() ?? null,
     lastStockSyncAt: row.lastStockSyncAt?.toISOString() ?? null,
     lastStockSyncStatus: row.lastStockSyncStatus,
   }
@@ -1226,16 +1232,20 @@ export async function saveMintsoftBinding(
   }
   const data = parsedInput.data
 
-  if (data.stockSyncMode === 'ALIGN_TO_WMS') {
-    return { success: false, error: 'Align To WMS is not available yet.' }
-  }
-
   if (data.returnsMode === 'WEBHOOK') {
     return { success: false, error: 'Webhook returns mode is not available yet. Use Poll for now.' }
   }
 
-  if (data.stockMasterSystem && data.stockMasterSystem !== 'IMS') {
-    return { success: false, error: 'Mintsoft bindings currently require IMS to remain the stock master.' }
+  const nextStockSyncMode: WmsStockSyncMode = data.stockSyncMode ?? 'NOTIFICATION_ONLY'
+  const nextStockMasterSystem: WmsStockMasterSystem = nextStockSyncMode === 'ALIGN_TO_WMS' ? 'WMS' : 'IMS'
+
+  if (data.stockMasterSystem && data.stockMasterSystem !== nextStockMasterSystem) {
+    return {
+      success: false,
+      error: nextStockMasterSystem === 'WMS'
+        ? 'Align To WMS bindings require WMS to be the stock master.'
+        : 'Notification-only and disabled bindings require IMS to remain the stock master.',
+    }
   }
 
   const connectionId = await ensureMintsoftConnectionId()
@@ -1247,8 +1257,8 @@ export async function saveMintsoftBinding(
     connector: 'mintsoft',
     externalWarehouseId: data.externalWarehouseId.trim(),
     active: data.active ?? true,
-    stockSyncMode: data.stockSyncMode ?? 'NOTIFICATION_ONLY',
-    stockMasterSystem: 'IMS' as const,
+    stockSyncMode: nextStockSyncMode,
+    stockMasterSystem: nextStockMasterSystem,
     bundleSyncDirection: data.bundleSyncDirection ?? 'DISABLED',
     returnsMode: data.returnsMode ?? 'DISABLED',
     syncFrequencyMinutes: Math.max(1, Math.trunc(data.syncFrequencyMinutes ?? 60)),
@@ -1266,8 +1276,10 @@ export async function saveMintsoftBinding(
         where: { id: data.id, connector: 'mintsoft' },
         select: {
           id: true,
+          warehouseId: true,
           active: true,
           stockSyncMode: true,
+          alignmentConfirmedAt: true,
         },
       })
       if (!existingBinding) {
@@ -1281,15 +1293,34 @@ export async function saveMintsoftBinding(
         await createMintsoftBindingHandover(existingBinding.id, 'manual:disable')
       }
 
+      if (
+        existingBinding.stockSyncMode === 'ALIGN_TO_WMS'
+        && bindingData.stockSyncMode !== 'ALIGN_TO_WMS'
+      ) {
+        await clearMintsoftAlignmentCreditsForBinding(existingBinding.id)
+      }
+
       const binding = await db.externalWmsBinding.update({
         where: { id: existingBinding.id },
-        data: bindingData,
+        data: {
+          ...bindingData,
+          alignmentConfirmedAt: bindingData.stockSyncMode === 'ALIGN_TO_WMS'
+            ? (
+                existingBinding.stockSyncMode === 'ALIGN_TO_WMS'
+                  ? existingBinding.alignmentConfirmedAt
+                  : null
+              )
+            : null,
+        },
         select: { id: true },
       })
       bindingId = binding.id
     } else {
       const binding = await db.externalWmsBinding.create({
-        data: bindingData,
+        data: {
+          ...bindingData,
+          alignmentConfirmedAt: bindingData.stockSyncMode === 'ALIGN_TO_WMS' ? null : undefined,
+        },
         select: { id: true },
       })
       bindingId = binding.id
@@ -1316,6 +1347,61 @@ export async function saveMintsoftBinding(
 
     throw error
   }
+
+  revalidatePath('/sync')
+  return { success: true }
+}
+
+export async function confirmMintsoftAlignmentMode(
+  bindingId: string,
+): Promise<{ success: boolean; error?: string }> {
+  await requireMintsoftWriteAccess()
+
+  const parsedId = MintsoftBindingDeleteSchema.safeParse(bindingId)
+  if (!parsedId.success) {
+    return { success: false, error: getValidationErrorMessage(parsedId.error) }
+  }
+
+  const binding = await db.externalWmsBinding.findFirst({
+    where: {
+      id: parsedId.data,
+      connector: 'mintsoft',
+    },
+    select: {
+      id: true,
+      warehouseId: true,
+      stockSyncMode: true,
+      alignmentConfirmedAt: true,
+    },
+  })
+
+  if (!binding) {
+    return { success: false, error: 'Mintsoft binding not found.' }
+  }
+  if (binding.stockSyncMode !== 'ALIGN_TO_WMS') {
+    return { success: false, error: 'This binding is not configured for Align To WMS.' }
+  }
+  if (binding.alignmentConfirmedAt) {
+    return { success: true }
+  }
+
+  await db.externalWmsBinding.update({
+    where: { id: binding.id },
+    data: {
+      alignmentConfirmedAt: new Date(),
+    },
+  })
+
+  await logActivity({
+    entityType: 'SYNC',
+    entityId: binding.id,
+    tag: 'sync',
+    action: 'mintsoft_alignment_confirmed',
+    description: 'Confirmed Mintsoft alignment mode after dry run review',
+    metadata: {
+      warehouseId: binding.warehouseId,
+    },
+  })
 
   revalidatePath('/sync')
   return { success: true }
@@ -1352,7 +1438,9 @@ export async function runMintsoftStockSyncNow(
   return {
     success: true,
     jobId: result.jobId,
-    message: `${result.warehouseCode}: checked ${result.totalChecked}, found ${result.mismatched} discrepancies, ${result.errors} errors.`,
+    message: result.dryRun
+      ? `${result.warehouseCode}: alignment dry run checked ${result.totalChecked}, previewed ${result.corrected} correction${result.corrected === 1 ? '' : 's'}, found ${result.mismatched} unresolved discrepancies, ${result.errors} errors.`
+      : `${result.warehouseCode}: checked ${result.totalChecked}, found ${result.mismatched} discrepancies, ${result.errors} errors.`,
   }
 }
 

@@ -55,7 +55,7 @@ const ONHAND_FIELDS: FieldDef[] = [
 ]
 
 const MOVEMENT_FIELDS: FieldDef[] = [
-  { key: 'type', label: 'Type', type: 'select', options: ['PURCHASE_RECEIPT', 'SALE_DISPATCH', 'RETURN_INBOUND', 'TRANSFER_OUT', 'TRANSFER_IN', 'ADJUSTMENT', 'PRODUCTION_IN', 'PRODUCTION_OUT', 'OPENING_STOCK'] },
+  { key: 'type', label: 'Type', type: 'select', options: ['PURCHASE_RECEIPT', 'WMS_RECEIPT_RECONCILIATION', 'SALE_DISPATCH', 'RETURN_INBOUND', 'TRANSFER_OUT', 'TRANSFER_IN', 'ADJUSTMENT', 'PRODUCTION_IN', 'PRODUCTION_OUT', 'OPENING_STOCK'] },
   { key: 'sku', label: 'SKU', type: 'text' },
   { key: 'productName', label: 'Product Name', type: 'text' },
   { key: 'fromWarehouse', label: 'From Warehouse', type: 'text' },
@@ -190,7 +190,7 @@ function SaveViewDialog({ tab, columns, filters, onClose }: { tab: string; colum
 }
 
 const MOVEMENT_LABELS: Record<string, string> = {
-  PURCHASE_RECEIPT: 'Purchase Receipt', SALE_DISPATCH: 'Sale Dispatch', RETURN_INBOUND: 'Return Inbound',
+  PURCHASE_RECEIPT: 'Purchase Receipt', WMS_RECEIPT_RECONCILIATION: 'WMS Receipt Reconciliation', SALE_DISPATCH: 'Sale Dispatch', RETURN_INBOUND: 'Return Inbound',
   TRANSFER_OUT: 'Transfer Out', TRANSFER_IN: 'Transfer In', ADJUSTMENT: 'Adjustment',
   PRODUCTION_IN: 'Production In', PRODUCTION_OUT: 'Production Out', OPENING_STOCK: 'Opening Stock',
 }

@@ -861,6 +861,7 @@ export type StockFlowFilters = {
 
 const INBOUND_TYPES = new Set([
   'PURCHASE_RECEIPT',
+  'WMS_RECEIPT_RECONCILIATION',
   'RETURN_INBOUND',
   'TRANSFER_IN',
   'PRODUCTION_IN',
