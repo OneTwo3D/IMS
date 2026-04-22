@@ -63,6 +63,26 @@ function parseReceivedAt(value: string | null): Date | null {
   return Number.isFinite(parsed.getTime()) ? parsed : null
 }
 
+export function isMintsoftReturnFullyMatched(params: {
+  orderId: string | null
+  productId: string | null
+  bindingId: string | null
+}): boolean {
+  return Boolean(params.orderId && params.productId && params.bindingId)
+}
+
+export function resolveMintsoftReturnWarehouseId(params: {
+  existingStatus: string | null
+  existingWarehouseId: string | null
+  bindingWarehouseId: string | null
+}): string | null {
+  if (params.existingStatus === 'RESTOCKED') {
+    return params.existingWarehouseId
+  }
+
+  return params.bindingWarehouseId
+}
+
 export function selectMintsoftReturnBinding(
   record: Pick<WmsReturnRecord, 'externalWarehouseId'>,
   bindings: ReturnsBinding[],
@@ -89,7 +109,11 @@ async function getReturnsBindings(): Promise<ReturnsBinding[]> {
     where: {
       connector: 'mintsoft',
       active: true,
-      returnsMode: 'POLL',
+      // Keep legacy "webhook" bindings on the polling path until a returns
+      // webhook endpoint exists so existing configs do not silently stop ingesting.
+      returnsMode: {
+        in: ['POLL', 'WEBHOOK'],
+      },
       connection: {
         active: true,
       },
@@ -317,7 +341,11 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
               externalReturnId: record.externalReturnId,
             },
           },
-          select: { id: true },
+          select: {
+            id: true,
+            status: true,
+            warehouseId: true,
+          },
         })
 
         const saved = await db.wmsReturnsInbox.upsert({
@@ -348,7 +376,11 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
             qty,
             reason,
             reference,
-            warehouseId: binding?.warehouseId ?? null,
+            warehouseId: resolveMintsoftReturnWarehouseId({
+              existingStatus: existing?.status ?? null,
+              existingWarehouseId: existing?.warehouseId ?? null,
+              bindingWarehouseId: binding?.warehouseId ?? null,
+            }),
             receivedAt,
             rawPayload: (record.raw ?? {}) as Prisma.InputJsonValue,
             updatedAt: now,
@@ -367,7 +399,11 @@ export async function runMintsoftReturnsSync(triggeredBy: string): Promise<Mints
           counters.corrected += 1
         }
 
-        const fullyMatched = Boolean(order) && Boolean(product)
+        const fullyMatched = isMintsoftReturnFullyMatched({
+          orderId: order?.id ?? null,
+          productId: product?.id ?? null,
+          bindingId: binding?.id ?? null,
+        })
         if (fullyMatched) {
           counters.matched += 1
         } else {

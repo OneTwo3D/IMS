@@ -120,6 +120,10 @@ function trimToNull(value: string | null | undefined): string | null {
   return trimmed ? trimmed : null
 }
 
+function isUniqueConstraintError(error: unknown): boolean {
+  return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'
+}
+
 export function isMintsoftProductEligible(product: Pick<ProductSyncCandidate, 'type' | 'lifecycleStatus'>): boolean {
   return ELIGIBLE_PRODUCT_TYPE_SET.has(product.type)
     && product.lifecycleStatus !== ProductLifecycleStatus.ARCHIVED
@@ -349,19 +353,49 @@ async function upsertBarcodeConflict(params: {
 
     if (updated.count > 0) continue
 
-    await db.wmsStockDiscrepancy.create({
-      data: {
+    try {
+      await db.wmsStockDiscrepancy.create({
+        data: {
+          connector: 'mintsoft',
+          warehouseId: scope.warehouseId,
+          productId: params.productId,
+          sku: params.sku,
+          category: 'BARCODE_CONFLICT',
+          status: 'OPEN',
+          imsValue: params.imsValue,
+          wmsValue: params.wmsValue,
+          message: params.message,
+          firstSeenAt: now,
+          lastSeenAt: now,
+        },
+      })
+      continue
+    } catch (error) {
+      if (!isUniqueConstraintError(error)) {
+        throw error
+      }
+    }
+
+    await db.wmsStockDiscrepancy.updateMany({
+      where: {
         connector: 'mintsoft',
         warehouseId: scope.warehouseId,
         productId: params.productId,
-        sku: params.sku,
         category: 'BARCODE_CONFLICT',
         status: 'OPEN',
+      },
+      data: {
+        sku: params.sku,
         imsValue: params.imsValue,
         wmsValue: params.wmsValue,
         message: params.message,
-        firstSeenAt: now,
         lastSeenAt: now,
+        detectionCount: {
+          increment: 1,
+        },
+        resolvedAt: null,
+        resolvedBy: null,
+        resolvedNote: null,
       },
     })
   }

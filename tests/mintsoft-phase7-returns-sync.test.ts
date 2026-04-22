@@ -79,3 +79,43 @@ test('selectMintsoftReturnBinding prefers an explicit warehouse match and otherw
     null,
   )
 })
+
+test('isMintsoftReturnFullyMatched requires an order, product, and warehouse binding', () => {
+  assert.equal(
+    returnsSync.isMintsoftReturnFullyMatched({
+      orderId: 'so-1',
+      productId: 'prod-1',
+      bindingId: 'binding-1',
+    }),
+    true,
+  )
+
+  assert.equal(
+    returnsSync.isMintsoftReturnFullyMatched({
+      orderId: 'so-1',
+      productId: 'prod-1',
+      bindingId: null,
+    }),
+    false,
+  )
+})
+
+test('resolveMintsoftReturnWarehouseId preserves a restock destination on later polling updates', () => {
+  assert.equal(
+    returnsSync.resolveMintsoftReturnWarehouseId({
+      existingStatus: 'RESTOCKED',
+      existingWarehouseId: 'restock-wh',
+      bindingWarehouseId: 'source-wh',
+    }),
+    'restock-wh',
+  )
+
+  assert.equal(
+    returnsSync.resolveMintsoftReturnWarehouseId({
+      existingStatus: 'NEW',
+      existingWarehouseId: 'old-wh',
+      bindingWarehouseId: 'source-wh',
+    }),
+    'source-wh',
+  )
+})

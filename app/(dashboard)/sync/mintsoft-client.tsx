@@ -790,7 +790,9 @@ export function MintsoftClient({ data }: Props) {
               <Select value={returnsMode} onChange={(event) => setReturnsMode(event.target.value as 'DISABLED' | 'POLL' | 'WEBHOOK')}>
                 <option value="DISABLED">Disabled</option>
                 <option value="POLL">Poll</option>
-                <option value="WEBHOOK">Webhook</option>
+                <option value="WEBHOOK" disabled>
+                  Webhook (Coming Later)
+                </option>
               </Select>
             </div>
             <div className="space-y-1.5">

@@ -1043,6 +1043,10 @@ export async function saveMintsoftBinding(
     return { success: false, error: 'Align To WMS is not available yet.' }
   }
 
+  if (data.returnsMode === 'WEBHOOK') {
+    return { success: false, error: 'Webhook returns mode is not available yet. Use Poll for now.' }
+  }
+
   if (data.stockMasterSystem && data.stockMasterSystem !== 'IMS') {
     return { success: false, error: 'Mintsoft bindings currently require IMS to remain the stock master.' }
   }

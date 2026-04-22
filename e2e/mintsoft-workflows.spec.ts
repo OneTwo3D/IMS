@@ -370,7 +370,7 @@ test.describe('Mintsoft integration workflows', () => {
     }
   })
 
-  test('rejects an unmapped signed Mintsoft ASN webhook and records the processing failure for retry', async ({ page }) => {
+  test('accepts an unmapped signed Mintsoft ASN webhook, leaves it pending, and records retry state', async ({ page }) => {
     test.setTimeout(60_000)
     const suffix = uniqueSuffix()
     const externalEventId = `mintsoft-event-${suffix}`
@@ -396,10 +396,12 @@ test.describe('Mintsoft integration workflows', () => {
       },
       data: rawBody,
     })
-    expect(firstResponse.ok()).toBeFalsy()
+    expect(firstResponse.ok()).toBeTruthy()
     const firstBody = await firstResponse.json()
     expect(firstBody).toMatchObject({
-      accepted: false,
+      accepted: true,
+      pending: true,
+      processed: false,
       externalEventId,
       externalAsnId,
     })
@@ -411,10 +413,12 @@ test.describe('Mintsoft integration workflows', () => {
       },
       data: rawBody,
     })
-    expect(duplicateResponse.ok()).toBeFalsy()
+    expect(duplicateResponse.ok()).toBeTruthy()
     const duplicateBody = await duplicateResponse.json()
     expect(duplicateBody).toMatchObject({
-      accepted: false,
+      accepted: true,
+      pending: true,
+      processed: false,
       externalEventId,
       externalAsnId,
     })
@@ -426,13 +430,24 @@ test.describe('Mintsoft integration workflows', () => {
         externalAsnId: string | null
         processedAt: string | null
         processingError: string | null
+        retryState: {
+          kind: string
+          attempts: number
+          nextRetryAt: string | null
+          message: string
+        } | null
       }>
     }
 
     expect(eventsBody.events).toHaveLength(1)
     expect(eventsBody.events[0]?.externalAsnId).toBe(externalAsnId)
     expect(eventsBody.events[0]?.processedAt).toBeNull()
-    expect(eventsBody.events[0]?.processingError).toMatch(/No ASN mapping found/)
+    expect(eventsBody.events[0]?.processingError).toMatch(/^RETRY_STATE:/)
+    expect(eventsBody.events[0]?.retryState).toMatchObject({
+      kind: 'pending',
+      attempts: 1,
+    })
+    expect(eventsBody.events[0]?.retryState?.message).toMatch(/not mapped yet; waiting for ASN finalization/i)
   })
 
   test('runs Mintsoft product verify, backfills a missing IMS barcode, and surfaces barcode conflicts without overwriting either side', async ({ page }) => {
