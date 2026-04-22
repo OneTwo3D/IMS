@@ -1,8 +1,9 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
-import type { WmsAsnInput, WmsAsnRef, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   extractMintsoftArrayPayload,
   normalizeMintsoftAsn,
+  normalizeMintsoftBundle,
   extractMintsoftObjectPayload,
   normalizeMintsoftProduct,
   normalizeMintsoftProductListItem,
@@ -305,6 +306,92 @@ export async function createMintsoftAsn(input: WmsAsnInput): Promise<WmsAsnRef> 
   }
 
   return normalized
+}
+
+function buildMintsoftBundlePayload(input: WmsBundleDto): Record<string, unknown> {
+  return {
+    SKU: input.sku,
+    Name: input.name,
+    PackingInstructions: input.packingInstructions ?? null,
+    Components: input.components.map((component) => ({
+      SKU: component.sku,
+      Quantity: component.quantity,
+      ...(component.externalProductId
+        ? {
+            ProductId: /^\d+$/.test(component.externalProductId)
+              ? Number.parseInt(component.externalProductId, 10)
+              : component.externalProductId,
+          }
+        : {}),
+    })),
+  }
+}
+
+export function buildMintsoftBundleCreateRequest(
+  input: WmsBundleDto,
+): { path: string; method: 'PUT'; body: string } {
+  return {
+    path: '/api/Product/Bundle',
+    method: 'PUT',
+    body: JSON.stringify(buildMintsoftBundlePayload(input)),
+  }
+}
+
+export async function createMintsoftBundle(input: WmsBundleDto): Promise<WmsBundleRef> {
+  const request = buildMintsoftBundleCreateRequest(input)
+  const result = await mintsoftRequest<unknown>(request.path, {
+    method: request.method,
+    body: request.body,
+  })
+
+  if (result.error) {
+    throw new Error(result.error)
+  }
+
+  const newProductResult = extractMintsoftObjectPayload(result.data)
+  const productIdValue = newProductResult
+    ? (newProductResult.ProductId ?? newProductResult.productId ?? newProductResult.ID ?? newProductResult.Id ?? newProductResult.id)
+    : null
+  const productId = typeof productIdValue === 'number'
+    ? String(productIdValue)
+    : typeof productIdValue === 'string' && productIdValue.trim()
+      ? productIdValue.trim()
+      : null
+
+  if (!productId) {
+    throw new Error('Mintsoft bundle create succeeded but no product id was returned')
+  }
+
+  const fetched = await fetchMintsoftBundle(productId)
+  if (!fetched) {
+    return {
+      externalBundleId: productId,
+      sku: input.sku,
+      name: input.name,
+      components: input.components,
+      raw: newProductResult,
+    }
+  }
+  return fetched
+}
+
+export async function fetchMintsoftBundle(externalProductId: string): Promise<WmsBundleRef | null> {
+  const normalized = externalProductId.trim()
+  if (!normalized) return null
+
+  const result = await mintsoftRequest<unknown>(`/api/Product/${encodeURIComponent(normalized)}/Bundle`)
+  if (result.status === 404) return null
+  if (result.error) {
+    throw new Error(result.error)
+  }
+
+  const bundle = normalizeMintsoftBundle(result.data)
+  if (!bundle) return null
+
+  return {
+    ...bundle,
+    externalBundleId: bundle.externalBundleId || normalized,
+  }
 }
 
 export async function fetchMintsoftAsns(): Promise<WmsAsnRef[]> {

@@ -94,6 +94,27 @@ export type WmsUpsertProductOptions = {
   omitBarcode?: boolean
 }
 
+export type WmsBundleComponent = {
+  externalProductId: string | null
+  sku: string
+  quantity: number
+}
+
+export type WmsBundleDto = {
+  sku: string
+  name: string
+  packingInstructions: string | null
+  components: WmsBundleComponent[]
+}
+
+export type WmsBundleRef = {
+  externalBundleId: string
+  sku: string
+  name: string | null
+  components: WmsBundleComponent[]
+  raw: Record<string, unknown> | null
+}
+
 export type WmsConnectionCheck = {
   success: boolean
   error?: string
@@ -112,5 +133,7 @@ export interface WmsConnector {
   upsertProduct(product: WmsProductDto, options?: WmsUpsertProductOptions): Promise<WmsProductRef>
   createAsn(input: WmsAsnInput): Promise<WmsAsnRef>
   pollReturns(since: Date): Promise<WmsReturnRecord[]>
+  createBundle?(input: WmsBundleDto): Promise<WmsBundleRef>
+  fetchBundle?(externalProductId: string): Promise<WmsBundleRef | null>
   verifyWebhookSignature?(rawBody: string, signatureHeader: string | null): Promise<boolean> | boolean
 }

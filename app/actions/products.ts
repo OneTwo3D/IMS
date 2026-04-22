@@ -11,6 +11,7 @@ import { hasPermission } from '@/lib/permissions'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { Prisma, ProductType } from '@/app/generated/prisma/client'
 import { runMintsoftProductSyncForProduct } from '@/lib/connectors/mintsoft/sync/product-sync'
+import { runBundleSyncForProduct } from '@/lib/connectors/mintsoft/sync/bundle-sync'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import {
   COMPONENT_PRODUCT_STATUSES,
@@ -583,8 +584,20 @@ async function syncMintsoftProductBestEffort(productId: string): Promise<void> {
   }
 }
 
+async function syncMintsoftBundleBestEffort(productId: string): Promise<void> {
+  try {
+    if (!await isIntegrationPluginEnabled('mintsoft')) {
+      return
+    }
+    await runBundleSyncForProduct(productId, 'product_mutation')
+  } catch (syncError) {
+    console.error(syncError)
+  }
+}
+
 function scheduleMintsoftProductSync(productId: string) {
   after(() => syncMintsoftProductBestEffort(productId))
+  after(() => syncMintsoftBundleBestEffort(productId))
 }
 
 export async function createProduct(

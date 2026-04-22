@@ -1,4 +1,4 @@
-import type { WmsAsnLineRef, WmsAsnRef, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnLineRef, WmsAsnRef, WmsBundleComponent, WmsBundleRef, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 
 const ARRAY_PAYLOAD_KEYS = ['data', 'Data', 'items', 'Items', 'results', 'Results', 'warehouses', 'Warehouses', 'stockLevels', 'StockLevels', 'returns', 'Returns'] as const
 const ASN_ARRAY_PAYLOAD_KEYS = [...ARRAY_PAYLOAD_KEYS, 'lines', 'Lines', 'asnLines', 'AsnLines', 'orderItems', 'OrderItems'] as const
@@ -211,6 +211,48 @@ export function normalizeMintsoftAsnLine(value: unknown): WmsAsnLineRef | null {
     externalProductId: getFirstString(record, PRODUCT_ID_KEYS),
     sku: getFirstString(record, STOCK_SKU_KEYS),
     quantity: getFirstNumber(record, RETURN_QTY_KEYS),
+    raw: record,
+  }
+}
+
+const BUNDLE_ID_KEYS = ['externalBundleId', 'ExternalBundleId', 'productId', 'ProductId', 'bundleId', 'BundleId', 'id', 'Id', 'ID']
+const BUNDLE_NAME_KEYS = ['name', 'Name', 'bundleName', 'BundleName', 'description', 'Description']
+const BUNDLE_COMPONENT_KEYS = ['components', 'Components', 'items', 'Items', 'bundleItems', 'BundleItems'] as const
+const BUNDLE_COMPONENT_PRODUCT_ID_KEYS = ['productId', 'ProductId', 'componentProductId', 'ComponentProductId', 'id', 'Id', 'ID']
+const BUNDLE_COMPONENT_QTY_KEYS = ['quantity', 'Quantity', 'qty', 'Qty', 'componentQty', 'ComponentQty']
+
+export function normalizeMintsoftBundleItem(value: unknown): WmsBundleComponent | null {
+  const record = asRecord(value)
+  if (!record) return null
+
+  const sku = getFirstString(record, STOCK_SKU_KEYS)
+  const quantity = getFirstNumber(record, BUNDLE_COMPONENT_QTY_KEYS)
+  if (!sku || quantity == null || quantity <= 0) return null
+
+  return {
+    externalProductId: getFirstString(record, BUNDLE_COMPONENT_PRODUCT_ID_KEYS),
+    sku,
+    quantity,
+  }
+}
+
+export function normalizeMintsoftBundle(value: unknown): WmsBundleRef | null {
+  const record = extractMintsoftObjectPayload(value)
+  if (!record) return null
+
+  const sku = getFirstString(record, STOCK_SKU_KEYS)
+  const externalBundleId = getFirstString(record, BUNDLE_ID_KEYS)
+  if (!sku || !externalBundleId) return null
+
+  const components = extractMintsoftArrayPayloadWithKeys(record, BUNDLE_COMPONENT_KEYS)
+    .map((item) => normalizeMintsoftBundleItem(item))
+    .filter((item): item is WmsBundleComponent => Boolean(item))
+
+  return {
+    externalBundleId,
+    sku,
+    name: getFirstString(record, BUNDLE_NAME_KEYS),
+    components,
     raw: record,
   }
 }

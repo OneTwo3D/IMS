@@ -6,6 +6,20 @@ This repository uses an `x.y.z` release scheme.
 - Increment `y` for user-facing non-breaking changes.
 - Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
+## 1.6.0 - 2026-04-22
+
+### User-facing
+
+- Added Mintsoft bundle sync (Phase 4) with a per-binding direction control (`DISABLED`, `IMS → Mintsoft`, `Mintsoft → IMS` verify only). IMS KIT product create/edit now queues a best-effort Mintsoft bundle push, and operators can run a manual **Run Bundle Verify** from the Mintsoft dashboard.
+- Added a Bundles card on the Mintsoft dashboard listing linked Mintsoft bundles with checksum and last-synced timestamp. Composition drift surfaces as an open `BUNDLE_DERIVATION_CONFLICT` discrepancy because the Mintsoft API does not support bundle updates — diverging bundles must be resolved manually.
+
+### Technical
+
+- Added `WmsBundleDto` / `WmsBundleComponent` / `WmsBundleRef` to the WMS connector contract with optional `createBundle` / `fetchBundle` methods, implemented in the Mintsoft connector against `PUT /api/Product/Bundle` and `GET /api/Product/{id}/Bundle`.
+- Landed `lib/connectors/mintsoft/sync/bundle-sync.ts` with deterministic composition hashing (sorted by component SKU, quantity rounded to 4 dp), `WmsBundleLink` persistence, `BUNDLE_DERIVATION_CONFLICT` upsert per active binding warehouse, and auto-resolution on match. Bundle sync never mutates IMS stock — it only reconciles composition structure.
+- Registered the `mintsoft-bundle-verify` cron (nightly, disabled by default) and added the `runMintsoftBundleVerifyNow` server action under write-scope permission.
+- Hooked best-effort bundle sync into the existing `after()` path on product create/update so KIT composition changes propagate to Mintsoft without blocking the interactive submit.
+
 ## 1.5.0 - 2026-04-21
 
 ### User-facing

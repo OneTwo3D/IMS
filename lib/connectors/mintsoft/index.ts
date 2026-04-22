@@ -1,6 +1,6 @@
-import type { WmsAsnInput, WmsAsnRef, WmsConnectionCheck, WmsConnector, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import { getMintsoftApiConfiguration, isMintsoftConfigured, verifyMintsoftWebhookSignature } from './api/auth'
-import { createMintsoftAsn, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
+import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 
 const CONNECTOR = 'Mintsoft'
 
@@ -60,6 +60,14 @@ export class MintsoftConnector implements WmsConnector {
     return fetchMintsoftReturns(since)
   }
 
+  async createBundle(input: WmsBundleDto): Promise<WmsBundleRef> {
+    return createMintsoftBundle(input)
+  }
+
+  async fetchBundle(externalProductId: string): Promise<WmsBundleRef | null> {
+    return fetchMintsoftBundle(externalProductId)
+  }
+
   async verifyWebhookSignature(rawBody: string, signatureHeader: string | null): Promise<boolean> {
     const { webhookSecret } = await getMintsoftApiConfiguration()
     if (!webhookSecret) return false
@@ -81,8 +89,11 @@ export {
 } from './api/auth'
 export {
   buildMintsoftAsnCreateRequest,
+  buildMintsoftBundleCreateRequest,
   createMintsoftAsn,
+  createMintsoftBundle,
   fetchMintsoftAsns,
+  fetchMintsoftBundle,
   fetchMintsoftProduct,
   fetchMintsoftProductBySku,
   fetchMintsoftReturns,
@@ -94,6 +105,8 @@ export {
 export {
   normalizeMintsoftAsn,
   normalizeMintsoftAsnLine,
+  normalizeMintsoftBundle,
+  normalizeMintsoftBundleItem,
   extractMintsoftArrayPayload,
   extractMintsoftObjectPayload,
   normalizeMintsoftProduct,

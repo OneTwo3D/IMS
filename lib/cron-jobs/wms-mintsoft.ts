@@ -32,6 +32,16 @@ registerCronJobs([
     defaultEnabled: false,
   },
   {
+    slug: 'mintsoft-bundle-verify',
+    settingKey: 'mintsoft_bundle_verify',
+    module: 'mintsoft',
+    moduleLabel: 'Mintsoft',
+    label: 'Mintsoft Bundle Verification',
+    description: 'Check IMS KIT product composition against the linked Mintsoft bundle and raise derivation conflicts.',
+    defaultSchedule: '30 3 * * *',
+    defaultEnabled: false,
+  },
+  {
     slug: 'mintsoft-webhook-sweeper',
     settingKey: 'mintsoft_webhook_sweeper',
     module: 'mintsoft',

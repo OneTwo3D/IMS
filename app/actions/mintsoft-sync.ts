@@ -22,6 +22,7 @@ import {
   runStockSyncForBinding,
 } from '@/lib/connectors/mintsoft/sync/stock-sync'
 import { runMintsoftProductVerify } from '@/lib/connectors/mintsoft/sync/product-sync'
+import { runMintsoftBundleVerify } from '@/lib/connectors/mintsoft/sync/bundle-sync'
 import { parseMintsoftThresholds, sanitizeMintsoftThresholds } from '@/lib/connectors/mintsoft/sync/stock-sync-helpers'
 import {
   mapMintsoftReturnsInboxRow,
@@ -240,6 +241,16 @@ export type MintsoftCreatePurchaseOrderAsnInput = {
   autoCallback?: boolean
 }
 
+export type MintsoftBundleLinkRow = {
+  id: string
+  productId: string
+  sku: string
+  name: string
+  externalBundleId: string
+  checksum: string | null
+  lastSyncedAt: string | null
+}
+
 export type MintsoftDashboardData = {
   connection: MintsoftConnectionSettingsMasked
   status: MintsoftConnectionStatus
@@ -249,6 +260,7 @@ export type MintsoftDashboardData = {
   warehouseLookupError: string | null
   recentStockSyncJobs: MintsoftSyncJobRow[]
   openDiscrepancies: MintsoftDiscrepancyRow[]
+  bundleLinks: MintsoftBundleLinkRow[]
   returnsInbox: MintsoftReturnsInboxRow[]
   availableOrderLookupConnectors: ShoppingConnectorId[]
   orderLookupConnectorRequired: boolean
@@ -658,7 +670,7 @@ async function getMintsoftExternalWarehouses(
 export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData> {
   await requireMintsoftReadAccess()
 
-  const [connection, settings, warehouses, bindings, recentStockSyncJobs, dryRunReadyJobs, openDiscrepancies, returnsInbox, pluginState] = await Promise.all([
+  const [connection, settings, warehouses, bindings, recentStockSyncJobs, dryRunReadyJobs, openDiscrepancies, bundleLinks, returnsInbox, pluginState] = await Promise.all([
     db.wmsConnection.findFirst({
       where: { connector: 'mintsoft' },
       orderBy: [{ createdAt: 'asc' }],
@@ -765,6 +777,24 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
         },
       },
     }),
+    db.wmsBundleLink.findMany({
+      where: { connector: 'mintsoft' },
+      orderBy: [{ lastSyncedAt: 'desc' }, { updatedAt: 'desc' }],
+      take: 20,
+      select: {
+        id: true,
+        externalBundleId: true,
+        checksum: true,
+        lastSyncedAt: true,
+        product: {
+          select: {
+            id: true,
+            sku: true,
+            name: true,
+          },
+        },
+      },
+    }),
     db.wmsReturnsInbox.findMany({
       where: {
         connector: 'mintsoft',
@@ -855,6 +885,15 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
     warehouseLookupError,
     recentStockSyncJobs: recentStockSyncJobs.map(mapMintsoftSyncJob),
     openDiscrepancies: openDiscrepancies.map(mapMintsoftDiscrepancy),
+    bundleLinks: bundleLinks.map((link) => ({
+      id: link.id,
+      productId: link.product.id,
+      sku: link.product.sku,
+      name: link.product.name,
+      externalBundleId: link.externalBundleId,
+      checksum: link.checksum,
+      lastSyncedAt: link.lastSyncedAt?.toISOString() ?? null,
+    })),
     returnsInbox: returnsInbox.map(mapMintsoftReturnsInboxRow),
     availableOrderLookupConnectors,
     orderLookupConnectorRequired: availableOrderLookupConnectors.length > 1,
@@ -1543,6 +1582,36 @@ export async function runMintsoftProductVerifyNow(): Promise<{
     success: true,
     jobId: result.jobId,
     message: `Checked ${result.totalChecked} products, updated ${result.corrected}, recorded ${result.mismatched} barcode conflicts, ${result.errors} errors.`,
+  }
+}
+
+export async function runMintsoftBundleVerifyNow(): Promise<{
+  success: boolean
+  error?: string
+  message?: string
+}> {
+  await requireMintsoftWriteAccess()
+
+  const result = await runMintsoftBundleVerify({ triggeredBy: 'manual' })
+  revalidatePath('/sync')
+
+  if (result.status === 'FAILED') {
+    return {
+      success: false,
+      error: result.skippedReason ?? 'Mintsoft bundle verify failed.',
+    }
+  }
+
+  if (result.status === 'SKIPPED') {
+    return {
+      success: false,
+      error: result.skippedReason ?? 'Mintsoft bundle verify was skipped.',
+    }
+  }
+
+  return {
+    success: true,
+    message: `Checked ${result.totalChecked} KIT products, synced ${result.synced}, ${result.conflicts} conflicts, ${result.errors} errors.`,
   }
 }
 

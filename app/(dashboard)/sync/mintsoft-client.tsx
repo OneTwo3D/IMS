@@ -7,6 +7,7 @@ import {
   confirmMintsoftAlignmentMode,
   deleteMintsoftBinding,
   restockMintsoftReturnInboxItem,
+  runMintsoftBundleVerifyNow,
   runMintsoftProductVerifyNow,
   runMintsoftReturnsSyncNow,
   runMintsoftStockSyncNow,
@@ -66,6 +67,7 @@ export function MintsoftClient({ data }: Props) {
   const [warehouseId, setWarehouseId] = useState(defaultWarehouseId)
   const [externalWarehouseId, setExternalWarehouseId] = useState(defaultExternalWarehouseId)
   const [stockSyncMode, setStockSyncMode] = useState<'DISABLED' | 'NOTIFICATION_ONLY' | 'ALIGN_TO_WMS'>('NOTIFICATION_ONLY')
+  const [bundleSyncDirection, setBundleSyncDirection] = useState<'DISABLED' | 'IMS_TO_WMS' | 'WMS_TO_IMS'>('DISABLED')
   const [returnsMode, setReturnsMode] = useState<'DISABLED' | 'POLL' | 'WEBHOOK'>('DISABLED')
   const [syncFrequencyMinutes, setSyncFrequencyMinutes] = useState('60')
   const [absoluteDelta, setAbsoluteDelta] = useState('')
@@ -107,6 +109,7 @@ export function MintsoftClient({ data }: Props) {
     setWarehouseId(defaultWarehouseId)
     setExternalWarehouseId(defaultExternalWarehouseId)
     setStockSyncMode('NOTIFICATION_ONLY')
+    setBundleSyncDirection('DISABLED')
     setReturnsMode('DISABLED')
     setSyncFrequencyMinutes('60')
     setAbsoluteDelta('')
@@ -167,6 +170,7 @@ export function MintsoftClient({ data }: Props) {
         externalWarehouseId,
         active: bindingActive === 'true',
         stockSyncMode,
+        bundleSyncDirection,
         returnsMode,
         syncFrequencyMinutes: Number.parseInt(syncFrequencyMinutes, 10) || 60,
         discrepancyThresholds: {
@@ -242,6 +246,20 @@ export function MintsoftClient({ data }: Props) {
       }
 
       flashSaved(result.message ?? 'Mintsoft product verify completed')
+      router.refresh()
+    })
+  }
+
+  function handleRunBundleVerify() {
+    setError('')
+    startTransition(async () => {
+      const result = await runMintsoftBundleVerifyNow()
+      if (!result.success) {
+        setError(result.error ?? 'Failed to run Mintsoft bundle verify')
+        return
+      }
+
+      flashSaved(result.message ?? 'Mintsoft bundle verify completed')
       router.refresh()
     })
   }
@@ -347,6 +365,10 @@ export function MintsoftClient({ data }: Props) {
           <Button type="button" variant="outline" onClick={handleRunProductVerify} disabled={isPending || !data.status.configured}>
             <RefreshCw className="mr-2 h-4 w-4" />
             Run Product Verify
+          </Button>
+          <Button type="button" variant="outline" onClick={handleRunBundleVerify} disabled={isPending || !data.status.configured}>
+            <RefreshCw className="mr-2 h-4 w-4" />
+            Run Bundle Verify
           </Button>
           <Button type="button" variant="outline" onClick={handleRunReturnsSync} disabled={isPending || !data.status.configured}>
             <RefreshCw className="mr-2 h-4 w-4" />
@@ -565,6 +587,51 @@ export function MintsoftClient({ data }: Props) {
                   <TableCell>{discrepancy.wmsValue ?? '—'}</TableCell>
                   <TableCell>{discrepancy.delta ?? '—'}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{discrepancy.lastSeenAt}</TableCell>
+                </TableRow>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      </Card>
+
+      <Card className="p-6 space-y-4">
+        <div>
+          <h3 className="text-base font-semibold">Bundles</h3>
+          <p className="text-sm text-muted-foreground">
+            Linked Mintsoft bundles for IMS KIT products. Composition drift is surfaced in Open Discrepancies as{' '}
+            <code className="rounded bg-muted px-1">BUNDLE_DERIVATION_CONFLICT</code> — Mintsoft has no bundle update API, so changes after the first push must be resolved manually.
+          </p>
+        </div>
+
+        <Table containerClassName="rounded-lg border max-h-[40vh]" className="min-w-[720px]">
+          <TableHeader className="bg-muted/40">
+            <TableRow>
+              <TableHead>Product</TableHead>
+              <TableHead>Mintsoft Bundle ID</TableHead>
+              <TableHead>Checksum</TableHead>
+              <TableHead>Last Synced</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {data.bundleLinks.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={4} className="py-6 text-center text-muted-foreground">
+                  No Mintsoft bundles have been pushed yet.
+                </TableCell>
+              </TableRow>
+            ) : (
+              data.bundleLinks.map((link) => (
+                <TableRow key={link.id}>
+                  <TableCell>
+                    <ProductLink productId={link.productId} sku={link.sku} name={link.name} />
+                  </TableCell>
+                  <TableCell className="font-mono text-xs">{link.externalBundleId}</TableCell>
+                  <TableCell className="font-mono text-xs text-muted-foreground">
+                    {link.checksum ? `${link.checksum.slice(0, 12)}…` : '—'}
+                  </TableCell>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {link.lastSyncedAt ? new Date(link.lastSyncedAt).toLocaleString() : '—'}
+                  </TableCell>
                 </TableRow>
               ))
             )}
@@ -821,6 +888,22 @@ export function MintsoftClient({ data }: Props) {
               </Select>
               <p className="text-xs text-muted-foreground">
                 Stock master: {stockSyncMode === 'ALIGN_TO_WMS' ? 'WMS for upward corrections only (first sync is a dry run until confirmed)' : 'IMS'}
+              </p>
+            </div>
+            <div className="space-y-1.5">
+              <Label className="text-xs">Bundle Sync</Label>
+              <Select
+                value={bundleSyncDirection}
+                onChange={(event) =>
+                  setBundleSyncDirection(event.target.value as 'DISABLED' | 'IMS_TO_WMS' | 'WMS_TO_IMS')
+                }
+              >
+                <option value="DISABLED">Disabled</option>
+                <option value="IMS_TO_WMS">IMS → Mintsoft (push new KIT bundles)</option>
+                <option value="WMS_TO_IMS">Mintsoft → IMS (verify only)</option>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                Mintsoft bundles are create-only — composition changes after the first push raise a discrepancy.
               </p>
             </div>
             <div className="space-y-1.5">
