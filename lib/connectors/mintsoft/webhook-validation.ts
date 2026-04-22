@@ -7,6 +7,12 @@ const MINTSOFT_WEBHOOK_TIMESTAMP_KEYS = [
   'createdAt',
 ] as const
 
+const MINTSOFT_WEBHOOK_TIMESTAMP_HEADERS = [
+  'x-mintsoft-timestamp',
+  'x-webhook-timestamp',
+  'x-timestamp',
+] as const
+
 function parseWebhookTimestampValue(value: unknown): Date | null {
   if (value instanceof Date) {
     return Number.isFinite(value.getTime()) ? value : null
@@ -26,9 +32,30 @@ function parseWebhookTimestampValue(value: unknown): Date | null {
   return null
 }
 
-export function extractMintsoftWebhookTimestamp(payload: Record<string, unknown>): Date | null {
+function getHeaderValue(
+  headers: Headers | Record<string, string | undefined> | undefined,
+  key: string,
+): string | null {
+  if (!headers) return null
+  if (typeof Headers !== 'undefined' && headers instanceof Headers) {
+    return headers.get(key)
+  }
+
+  const normalizedHeaders = headers as Record<string, string | undefined>
+  return normalizedHeaders[key] ?? normalizedHeaders[key.toLowerCase()] ?? null
+}
+
+export function extractMintsoftWebhookTimestamp(
+  payload: Record<string, unknown>,
+  headers?: Headers | Record<string, string | undefined>,
+): Date | null {
   for (const key of MINTSOFT_WEBHOOK_TIMESTAMP_KEYS) {
     const parsed = parseWebhookTimestampValue(payload[key])
+    if (parsed) return parsed
+  }
+
+  for (const key of MINTSOFT_WEBHOOK_TIMESTAMP_HEADERS) {
+    const parsed = parseWebhookTimestampValue(getHeaderValue(headers, key))
     if (parsed) return parsed
   }
 
@@ -41,4 +68,3 @@ export function isMintsoftWebhookTimestampFresh(
 ): boolean {
   return Math.abs(now.getTime() - timestamp.getTime()) <= MAX_MINTSOFT_WEBHOOK_CLOCK_SKEW_MS
 }
-

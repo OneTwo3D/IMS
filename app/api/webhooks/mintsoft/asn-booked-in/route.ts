@@ -111,8 +111,34 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 })
   }
 
-  const webhookTimestamp = extractMintsoftWebhookTimestamp(payload as Record<string, unknown>)
-  if (webhookTimestamp && !isMintsoftWebhookTimestampFresh(webhookTimestamp)) {
+  const webhookTimestamp = extractMintsoftWebhookTimestamp(payload as Record<string, unknown>, request.headers)
+  if (!webhookTimestamp) {
+    await logActivity({
+      entityType: 'SYNC',
+      tag: 'sync',
+      action: 'mintsoft_webhook_rejected_missing_timestamp',
+      level: 'WARNING',
+      description: 'Rejected Mintsoft ASN webhook without a signed timestamp',
+      metadata: {
+        externalAsnId: getExternalAsnId(payload),
+      },
+      resolveUser: false,
+    })
+    return NextResponse.json({ error: 'Missing webhook timestamp' }, { status: 401 })
+  }
+  if (!isMintsoftWebhookTimestampFresh(webhookTimestamp)) {
+    await logActivity({
+      entityType: 'SYNC',
+      tag: 'sync',
+      action: 'mintsoft_webhook_rejected_stale_timestamp',
+      level: 'WARNING',
+      description: 'Rejected Mintsoft ASN webhook with a stale signed timestamp',
+      metadata: {
+        externalAsnId: getExternalAsnId(payload),
+        timestamp: webhookTimestamp.toISOString(),
+      },
+      resolveUser: false,
+    })
     return NextResponse.json({ error: 'Stale webhook timestamp' }, { status: 401 })
   }
 

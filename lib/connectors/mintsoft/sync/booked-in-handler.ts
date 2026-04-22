@@ -236,20 +236,6 @@ export async function processMintsoftBookedInEvent(
           id: true,
           externalAsnId: true,
           warehouseId: true,
-          lines: {
-            select: {
-              id: true,
-              externalAsnLineId: true,
-              sourceType: true,
-              sourceLineId: true,
-              productId: true,
-              sku: true,
-              expectedQty: true,
-              qtyAccountedViaSnapshot: true,
-              qtyAccountedViaReceipt: true,
-              lastProcessedReceivedQty: true,
-            },
-          },
         },
       })
 
@@ -271,10 +257,40 @@ export async function processMintsoftBookedInEvent(
         }
       }
 
+      const lineIds = await tx.wmsAsnLineMap.findMany({
+        where: {
+          asnMapId: asnMap.id,
+        },
+        select: {
+          id: true,
+        },
+      })
+      if (lineIds.length > 0) {
+        await tx.$executeRaw`SELECT id FROM wms_asn_line_maps WHERE id = ANY(${lineIds.map((line) => line.id)}::text[]) FOR UPDATE`
+      }
+
+      const asnLines = await tx.wmsAsnLineMap.findMany({
+        where: {
+          asnMapId: asnMap.id,
+        },
+        select: {
+          id: true,
+          externalAsnLineId: true,
+          sourceType: true,
+          sourceLineId: true,
+          productId: true,
+          sku: true,
+          expectedQty: true,
+          qtyAccountedViaSnapshot: true,
+          qtyAccountedViaReceipt: true,
+          lastProcessedReceivedQty: true,
+        },
+      })
+
       const remoteLineByExternalId = new Map(remoteAsn.lines.map((line) => [line.externalLineId, line]))
       const remoteLineBySourceId = new Map(remoteAsn.lines.map((line) => [line.sourceLineId, line]))
 
-      const actionableLines = asnMap.lines
+      const candidateLines = asnLines
         .map((line) => {
           const remoteLine = remoteLineByExternalId.get(line.externalAsnLineId)
             ?? remoteLineBySourceId.get(line.sourceLineId)
@@ -286,6 +302,20 @@ export async function processMintsoftBookedInEvent(
             ),
           }
         })
+      const regressedLines = candidateLines.filter((line) => (
+        line.currentReceivedQty + 0.0001 < Math.max(
+          Number(line.lastProcessedReceivedQty),
+          Number(line.qtyAccountedViaSnapshot),
+        )
+      ))
+      if (regressedLines.length > 0) {
+        const first = regressedLines[0]
+        throw new Error(
+          `Mintsoft received quantity regressed for ASN ${lockedEvent.externalAsnId} on ${first?.sku ?? 'unknown SKU'}; manual reconciliation is required before snapshot credits can be changed.`,
+        )
+      }
+
+      const actionableLines = candidateLines
         .filter((line) => line.currentReceivedQty > Number(line.lastProcessedReceivedQty))
 
       const unsupportedLines = actionableLines.filter((line) => (

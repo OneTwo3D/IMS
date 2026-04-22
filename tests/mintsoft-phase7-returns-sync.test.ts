@@ -120,7 +120,7 @@ test('resolveMintsoftReturnWarehouseId preserves a restock destination on later 
   )
 })
 
-test('resolveMintsoftReturnsNextCursor replays the full window when a failed record has no stable timestamp', () => {
+test('resolveMintsoftReturnsNextCursor replays the same overlap window when a failed record has no stable timestamp', () => {
   const since = new Date('2026-04-20T10:00:00.000Z')
   const startedAt = new Date('2026-04-21T10:00:00.000Z')
 
@@ -141,6 +141,6 @@ test('resolveMintsoftReturnsNextCursor replays the full window when a failed rec
       earliestFailedReceivedAt: null,
       replayFullWindow: true,
     }),
-    since,
+    startedAt,
   )
 })

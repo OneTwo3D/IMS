@@ -85,28 +85,6 @@ export function MintsoftClient({ data }: Props) {
     }
   }, [])
 
-  useEffect(() => {
-    setLabel(data.connection.label)
-    setBaseUrl(data.connection.baseUrl)
-    setUsername(data.connection.username)
-    setPassword('')
-    setWebhookSecret('')
-    setOrderLookupConnector(data.connection.orderLookupConnector)
-    setActive(data.connection.active ? 'true' : 'false')
-    setBindingActive('true')
-    setWarehouseId(defaultWarehouseId)
-    setExternalWarehouseId(defaultExternalWarehouseId)
-    setStockSyncMode('NOTIFICATION_ONLY')
-    setReturnsMode('DISABLED')
-    setSyncFrequencyMinutes('60')
-    setAbsoluteDelta('')
-    setPercentDelta('')
-    setReportRecipients('')
-    setRestockItemId('')
-    setRestockItemSku('')
-    setRestockWarehouseId(defaultWarehouseId)
-  }, [data, defaultExternalWarehouseId, defaultWarehouseId])
-
   function flashSaved(message: string) {
     setFeedbackMessage(message)
     setSaved(true)
@@ -137,11 +115,13 @@ export function MintsoftClient({ data }: Props) {
   }
 
   function handleConnectionDialogOpenChange(open: boolean) {
+    if (open) resetConnectionForm()
     setIsConnectionDialogOpen(open)
     if (!open) resetConnectionForm()
   }
 
   function handleBindingDialogOpenChange(open: boolean) {
+    if (open) resetBindingForm()
     setIsBindingDialogOpen(open)
     if (!open) resetBindingForm()
   }
@@ -330,7 +310,7 @@ export function MintsoftClient({ data }: Props) {
               Configure Mintsoft credentials, resolve callback order lookup, and run Mintsoft warehouse and product verification from one place.
             </p>
           </div>
-          <Button type="button" variant="outline" onClick={() => setIsConnectionDialogOpen(true)} disabled={isPending}>
+          <Button type="button" variant="outline" onClick={() => handleConnectionDialogOpenChange(true)} disabled={isPending}>
             <Settings2 className="mr-2 h-4 w-4" />
             Edit Connection
           </Button>
@@ -386,10 +366,10 @@ export function MintsoftClient({ data }: Props) {
           <div>
             <h3 className="text-base font-semibold">Warehouse Bindings</h3>
             <p className="text-sm text-muted-foreground">
-              Notification-only keeps IMS as stock master. Align To WMS is now available with a required dry run before live corrections are allowed.
+              Notification-only keeps IMS as stock master. Align To WMS is align-up only and requires a completed dry run before live corrections are allowed.
             </p>
           </div>
-          <Button type="button" onClick={() => setIsBindingDialogOpen(true)} disabled={isPending}>
+          <Button type="button" onClick={() => handleBindingDialogOpenChange(true)} disabled={isPending}>
             <Plus className="mr-2 h-4 w-4" />
             Add Binding
           </Button>
@@ -428,6 +408,7 @@ export function MintsoftClient({ data }: Props) {
                     <div className="text-xs text-muted-foreground">
                       {binding.stockMasterSystem}
                       {binding.stockSyncMode === 'ALIGN_TO_WMS' && !binding.alignmentConfirmedAt ? ' · Dry run only' : ''}
+                      {binding.stockSyncMode === 'ALIGN_TO_WMS' ? ' · Align up only' : ''}
                     </div>
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
@@ -447,7 +428,7 @@ export function MintsoftClient({ data }: Props) {
                         variant="ghost"
                         size="sm"
                         onClick={() => handleConfirmAlignment(binding.id)}
-                        disabled={isPending || !binding.active || binding.stockSyncMode !== 'ALIGN_TO_WMS' || !!binding.alignmentConfirmedAt}
+                        disabled={isPending || !binding.active || binding.stockSyncMode !== 'ALIGN_TO_WMS' || !!binding.alignmentConfirmedAt || !binding.alignmentDryRunReady}
                       >
                         <Check className="h-4 w-4" />
                       </Button>
@@ -839,7 +820,7 @@ export function MintsoftClient({ data }: Props) {
                 <option value="ALIGN_TO_WMS">Align To WMS</option>
               </Select>
               <p className="text-xs text-muted-foreground">
-                Stock master: {stockSyncMode === 'ALIGN_TO_WMS' ? 'WMS (first sync is a dry run until confirmed)' : 'IMS'}
+                Stock master: {stockSyncMode === 'ALIGN_TO_WMS' ? 'WMS for upward corrections only (first sync is a dry run until confirmed)' : 'IMS'}
               </p>
             </div>
             <div className="space-y-1.5">

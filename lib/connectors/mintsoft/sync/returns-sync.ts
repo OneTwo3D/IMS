@@ -102,7 +102,7 @@ export function resolveMintsoftReturnsNextCursor(params: {
   replayFullWindow: boolean
 }): Date {
   if (params.replayFullWindow) {
-    return params.since
+    return params.startedAt
   }
 
   if (params.earliestFailedReceivedAt && params.earliestFailedReceivedAt < params.startedAt) {

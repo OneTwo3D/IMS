@@ -1,8 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
-import { assertE2eRouteModuleEnabled, getE2eRouteAccessError } from '@/lib/testing/e2e-route-guard'
-
-assertE2eRouteModuleEnabled('app/api/e2e/mintsoft/[...slug]/route.ts')
+import { getE2eRouteAccessError } from '@/lib/testing/e2e-route-guard'
 
 const E2E_MINTSOFT_STATE_KEY = 'e2e_mintsoft_state'
 

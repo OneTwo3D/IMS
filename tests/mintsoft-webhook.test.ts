@@ -167,6 +167,16 @@ test('extractMintsoftWebhookTimestamp prefers signed body timestamps when presen
   )
 })
 
+test('extractMintsoftWebhookTimestamp falls back to common signed timestamp headers', () => {
+  assert.deepEqual(
+    extractMintsoftWebhookTimestamp(
+      { id: 'evt-1' },
+      { 'x-mintsoft-timestamp': '2026-04-22T10:00:00.000Z' },
+    )?.toISOString(),
+    '2026-04-22T10:00:00.000Z',
+  )
+})
+
 test('isMintsoftWebhookTimestampFresh rejects stale signed timestamps', () => {
   const now = new Date('2026-04-22T10:10:00.000Z')
 

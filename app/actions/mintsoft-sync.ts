@@ -141,6 +141,7 @@ export type MintsoftBindingRow = {
   } | null
   reportRecipients: string[]
   alignmentConfirmedAt: string | null
+  alignmentDryRunReady: boolean
   lastStockSyncAt: string | null
   lastStockSyncStatus: string | null
 }
@@ -377,6 +378,8 @@ function mapMintsoftBinding(row: {
     name: string
     active: boolean
   }
+}, options?: {
+  alignmentDryRunReady?: boolean
 }): MintsoftBindingRow {
   return {
     id: row.id,
@@ -394,6 +397,7 @@ function mapMintsoftBinding(row: {
     discrepancyThresholds: parseMintsoftThresholds(row.discrepancyThresholds),
     reportRecipients: row.reportRecipients,
     alignmentConfirmedAt: row.alignmentConfirmedAt?.toISOString() ?? null,
+    alignmentDryRunReady: options?.alignmentDryRunReady ?? false,
     lastStockSyncAt: row.lastStockSyncAt?.toISOString() ?? null,
     lastStockSyncStatus: row.lastStockSyncStatus,
   }
@@ -654,7 +658,7 @@ async function getMintsoftExternalWarehouses(
 export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData> {
   await requireMintsoftReadAccess()
 
-  const [connection, settings, warehouses, bindings, recentStockSyncJobs, openDiscrepancies, returnsInbox, pluginState] = await Promise.all([
+  const [connection, settings, warehouses, bindings, recentStockSyncJobs, dryRunReadyJobs, openDiscrepancies, returnsInbox, pluginState] = await Promise.all([
     db.wmsConnection.findFirst({
       where: { connector: 'mintsoft' },
       orderBy: [{ createdAt: 'asc' }],
@@ -710,6 +714,23 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
             code: true,
           },
         },
+      },
+    }),
+    db.wmsSyncJob.findMany({
+      where: {
+        connector: 'mintsoft',
+        type: 'STOCK_SYNC',
+        status: {
+          in: ['SUCCEEDED', 'PARTIAL'],
+        },
+        finishedAt: {
+          not: null,
+        },
+        AND: [{ summary: { path: ['dryRun'], equals: true } }],
+      },
+      orderBy: [{ finishedAt: 'desc' }],
+      select: {
+        warehouseId: true,
       },
     }),
     db.wmsStockDiscrepancy.findMany({
@@ -782,6 +803,11 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
     getIntegrationPluginState(),
   ])
   const availableOrderLookupConnectors = getAvailableOrderLookupConnectors(pluginState)
+  const alignmentDryRunReadyWarehouseIds = new Set(
+    dryRunReadyJobs
+      .map((job) => job.warehouseId)
+      .filter((warehouseId): warehouseId is string => Boolean(warehouseId)),
+  )
 
   const lastStockSyncAt = bindings
     .map((binding) => binding.lastStockSyncAt)
@@ -821,7 +847,9 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
       lastAuthAt: connection?.lastAuthAt?.toISOString() ?? null,
       lastStockSyncAt: lastStockSyncAt?.toISOString() ?? null,
     },
-    bindings: bindings.map(mapMintsoftBinding),
+    bindings: bindings.map((binding) => mapMintsoftBinding(binding, {
+      alignmentDryRunReady: alignmentDryRunReadyWarehouseIds.has(binding.warehouseId),
+    })),
     warehouses,
     externalWarehouses,
     warehouseLookupError,
@@ -963,11 +991,11 @@ export async function getMintsoftPurchaseOrderAsnState(
 export async function getMintsoftTransferAsnStates(
   transferIds: string[],
 ): Promise<Record<string, MintsoftTransferAsnState>> {
+  const session = await requireMintsoftReadAccess()
   const normalizedIds = Array.from(new Set(transferIds.map((id) => id.trim()).filter(Boolean)))
   if (normalizedIds.length === 0) return {}
 
-  const [session, pluginEnabled, transfers, existingAsns] = await Promise.all([
-    getSession(),
+  const [pluginEnabled, transfers, existingAsns] = await Promise.all([
     isIntegrationPluginEnabled('mintsoft'),
     db.stockTransfer.findMany({
       where: { id: { in: normalizedIds } },
@@ -1286,18 +1314,26 @@ export async function saveMintsoftBinding(
         return { success: false, error: 'Mintsoft binding not found.' }
       }
 
-      if (
-        (existingBinding.active && bindingData.active === false)
-        || (existingBinding.stockSyncMode !== 'DISABLED' && bindingData.stockSyncMode === 'DISABLED')
-      ) {
-        await createMintsoftBindingHandover(existingBinding.id, 'manual:disable')
+      const leavingAlignmentMode = (
+        existingBinding.stockSyncMode === 'ALIGN_TO_WMS'
+        && bindingData.stockSyncMode !== 'ALIGN_TO_WMS'
+      )
+      if (leavingAlignmentMode) {
+        const alignmentCredits = await clearMintsoftAlignmentCreditsForBinding(existingBinding.id)
+        if (!alignmentCredits.success) {
+          return { success: false, error: alignmentCredits.error ?? 'Mintsoft alignment credits still need webhook reconciliation.' }
+        }
       }
 
       if (
-        existingBinding.stockSyncMode === 'ALIGN_TO_WMS'
-        && bindingData.stockSyncMode !== 'ALIGN_TO_WMS'
+        (existingBinding.active && bindingData.active === false)
+        || (existingBinding.stockSyncMode !== 'DISABLED' && bindingData.stockSyncMode === 'DISABLED')
+        || leavingAlignmentMode
       ) {
-        await clearMintsoftAlignmentCreditsForBinding(existingBinding.id)
+        await createMintsoftBindingHandover(
+          existingBinding.id,
+          leavingAlignmentMode ? 'manual:alignment-exit' : 'manual:disable',
+        )
       }
 
       const binding = await db.externalWmsBinding.update({
@@ -1385,12 +1421,44 @@ export async function confirmMintsoftAlignmentMode(
     return { success: true }
   }
 
-  await db.externalWmsBinding.update({
-    where: { id: binding.id },
+  const latestDryRun = await db.wmsSyncJob.findFirst({
+    where: {
+      connector: 'mintsoft',
+      type: 'STOCK_SYNC',
+      warehouseId: binding.warehouseId,
+      status: {
+        in: ['SUCCEEDED', 'PARTIAL'],
+      },
+      finishedAt: {
+        not: null,
+      },
+      AND: [{ summary: { path: ['dryRun'], equals: true } }],
+    },
+    orderBy: [{ finishedAt: 'desc' }],
+    select: {
+      id: true,
+    },
+  })
+
+  if (!latestDryRun) {
+    return { success: false, error: 'Run and review a Mintsoft alignment dry run before confirming live corrections.' }
+  }
+
+  const confirmed = await db.externalWmsBinding.updateMany({
+    where: {
+      id: binding.id,
+      connector: 'mintsoft',
+      stockSyncMode: 'ALIGN_TO_WMS',
+      alignmentConfirmedAt: null,
+    },
     data: {
       alignmentConfirmedAt: new Date(),
     },
   })
+
+  if (confirmed.count === 0) {
+    return { success: true }
+  }
 
   await logActivity({
     entityType: 'SYNC',
@@ -1439,7 +1507,7 @@ export async function runMintsoftStockSyncNow(
     success: true,
     jobId: result.jobId,
     message: result.dryRun
-      ? `${result.warehouseCode}: alignment dry run checked ${result.totalChecked}, previewed ${result.corrected} correction${result.corrected === 1 ? '' : 's'}, found ${result.mismatched} unresolved discrepancies, ${result.errors} errors.`
+      ? `${result.warehouseCode}: alignment dry run checked ${result.totalChecked}, previewed ${result.alignmentPreviews ?? 0} correction${(result.alignmentPreviews ?? 0) === 1 ? '' : 's'}, found ${result.mismatched} unresolved discrepancies, ${result.errors} errors.`
       : `${result.warehouseCode}: checked ${result.totalChecked}, found ${result.mismatched} discrepancies, ${result.errors} errors.`,
   }
 }

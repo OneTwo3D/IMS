@@ -34,7 +34,9 @@ const ROLE_BADGE: Record<string, string> = {
 
 export function UsersClient({ users, suppliers }: Props) {
   const router = useRouter()
-  const [isPending, startTransition] = useTransition()
+  const [isCreatePending, startCreateTransition] = useTransition()
+  const [isUpdatePending, startUpdateTransition] = useTransition()
+  const [isDeletePending, startDeleteTransition] = useTransition()
   const [showCreate, setShowCreate] = useState(false)
   const [editUser, setEditUser] = useState<UserRow | null>(null)
   const [deleteTarget, setDeleteTarget] = useState<UserRow | null>(null)
@@ -58,6 +60,7 @@ export function UsersClient({ users, suppliers }: Props) {
   const [deleteSalesOrderMode, setDeleteSalesOrderMode] = useState<'keep_text' | 'transfer_user'>('keep_text')
   const [deleteTransferToUserId, setDeleteTransferToUserId] = useState('')
   const [deleteError, setDeleteError] = useState('')
+  const isPending = isCreatePending || isUpdatePending || isDeletePending
 
   function openCreate() {
     setName(''); setEmail(''); setPassword(''); setRole('WAREHOUSE'); setSupplierId(''); setError('')
@@ -80,7 +83,7 @@ export function UsersClient({ users, suppliers }: Props) {
 
   function handleCreate() {
     setError('')
-    startTransition(async () => {
+    startCreateTransition(async () => {
       const result = await createUser({ name, email, password, role, supplierId: role === 'SUPPLIER' ? supplierId : undefined })
       if (result.success) { setShowCreate(false); router.refresh() }
       else setError(result.error ?? 'Failed')
@@ -90,7 +93,7 @@ export function UsersClient({ users, suppliers }: Props) {
   function handleUpdate() {
     if (!editUser) return
     setEditError('')
-    startTransition(async () => {
+    startUpdateTransition(async () => {
       const result = await updateUser(editUser.id, {
         name: editName, email: editEmail, role: editRole,
         supplierId: editRole === 'SUPPLIER' ? editSupplierId : null,
@@ -105,7 +108,7 @@ export function UsersClient({ users, suppliers }: Props) {
   function handleDelete() {
     if (!deleteTarget) return
     setDeleteError('')
-    startTransition(async () => {
+    startDeleteTransition(async () => {
       const result = await deleteUser(deleteTarget.id, {
         salesOrderMode: deleteSalesOrderMode,
         transferToUserId: deleteSalesOrderMode === 'transfer_user' ? deleteTransferToUserId : undefined,
@@ -195,7 +198,7 @@ export function UsersClient({ users, suppliers }: Props) {
       {/* Create dialog */}
       {showCreate && (
         <Dialog open onOpenChange={(open) => {
-          if (!open && !isPending) setShowCreate(false)
+          if (!open && !isCreatePending) setShowCreate(false)
         }}><DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
           <DialogHeader><DialogTitle>Add User</DialogTitle></DialogHeader>
           <div className="space-y-3">
@@ -220,8 +223,8 @@ export function UsersClient({ users, suppliers }: Props) {
             {error && <p className="text-sm text-destructive">{error}</p>}
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setShowCreate(false)} disabled={isPending}>Cancel</Button>
-            <Button onClick={handleCreate} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Create User</Button>
+            <Button variant="outline" onClick={() => setShowCreate(false)} disabled={isCreatePending}>Cancel</Button>
+            <Button onClick={handleCreate} disabled={isCreatePending}>{isCreatePending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Create User</Button>
           </DialogFooter>
         </DialogContent></Dialog>
       )}
@@ -229,7 +232,7 @@ export function UsersClient({ users, suppliers }: Props) {
       {/* Edit dialog */}
       {editUser && (
         <Dialog open onOpenChange={(open) => {
-          if (!open && !isPending) setEditUser(null)
+          if (!open && !isUpdatePending) setEditUser(null)
         }}><DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
           <DialogHeader><DialogTitle>Edit User</DialogTitle></DialogHeader>
           <div className="space-y-3">
@@ -258,8 +261,8 @@ export function UsersClient({ users, suppliers }: Props) {
             {editError && <p className="text-sm text-destructive">{editError}</p>}
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setEditUser(null)} disabled={isPending}>Cancel</Button>
-            <Button onClick={handleUpdate} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save Changes</Button>
+            <Button variant="outline" onClick={() => setEditUser(null)} disabled={isUpdatePending}>Cancel</Button>
+            <Button onClick={handleUpdate} disabled={isUpdatePending}>{isUpdatePending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save Changes</Button>
           </DialogFooter>
         </DialogContent></Dialog>
       )}
@@ -267,7 +270,7 @@ export function UsersClient({ users, suppliers }: Props) {
       {/* Delete dialog */}
       {deleteTarget && (
         <Dialog open onOpenChange={(open) => {
-          if (!open && !isPending) setDeleteTarget(null)
+          if (!open && !isDeletePending) setDeleteTarget(null)
         }}><DialogContent showCloseButton={false} className="max-w-md sm:max-w-md">
           <DialogHeader><DialogTitle className="text-destructive">Delete User</DialogTitle></DialogHeader>
           <div className="space-y-3">
@@ -334,13 +337,13 @@ export function UsersClient({ users, suppliers }: Props) {
             {deleteError && <p className="text-sm text-destructive">{deleteError}</p>}
           </div>
           <DialogFooter>
-            <Button variant="outline" onClick={() => setDeleteTarget(null)} disabled={isPending}>Cancel</Button>
+            <Button variant="outline" onClick={() => setDeleteTarget(null)} disabled={isDeletePending}>Cancel</Button>
             <Button
               variant="destructive"
               onClick={handleDelete}
-              disabled={isPending || (deleteSalesOrderMode === 'transfer_user' && (!deleteTransferToUserId || transferOptions.length === 0))}
+              disabled={isDeletePending || (deleteSalesOrderMode === 'transfer_user' && (!deleteTransferToUserId || transferOptions.length === 0))}
             >
-              {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Delete User
+              {isDeletePending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Delete User
             </Button>
           </DialogFooter>
         </DialogContent></Dialog>

@@ -18,7 +18,8 @@ export type MintsoftAlignmentCandidate = {
   expectedQty: number
   qtyAccountedViaSnapshot: number
   lastProcessedReceivedQty: number
-  sortKey: string
+  sortAt: Date | string
+  sortId: string
 }
 
 export type MintsoftAlignmentAllocation = {
@@ -178,7 +179,12 @@ export function planMintsoftAlignmentAllocations(input: {
   }
 
   const allocations: MintsoftAlignmentAllocation[] = []
-  const candidates = [...input.candidates].sort((left, right) => left.sortKey.localeCompare(right.sortKey))
+  const candidates = [...input.candidates].sort((left, right) => {
+    const leftTime = new Date(left.sortAt).getTime()
+    const rightTime = new Date(right.sortAt).getTime()
+    if (leftTime !== rightTime) return leftTime - rightTime
+    return left.sortId.localeCompare(right.sortId)
+  })
 
   for (const candidate of candidates) {
     if (remaining <= 0) break

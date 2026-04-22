@@ -133,14 +133,16 @@ test('planMintsoftAlignmentAllocations consumes the oldest open ASN capacity fir
           expectedQty: 10,
           qtyAccountedViaSnapshot: 3,
           lastProcessedReceivedQty: 0,
-          sortKey: '2026-04-22T10:05:00.000Z:line-b',
+          sortAt: '2026-04-22T10:05:00.000Z',
+          sortId: 'line-b',
         },
         {
           asnLineMapId: 'line-a',
           expectedQty: 5,
           qtyAccountedViaSnapshot: 0,
           lastProcessedReceivedQty: 0,
-          sortKey: '2026-04-22T10:00:00.000Z:line-a',
+          sortAt: '2026-04-22T10:00:00.000Z',
+          sortId: 'line-a',
         },
       ],
     }),
@@ -162,7 +164,8 @@ test('planMintsoftAlignmentAllocations consumes the oldest open ASN capacity fir
           expectedQty: 5,
           qtyAccountedViaSnapshot: 2,
           lastProcessedReceivedQty: 0,
-          sortKey: '2026-04-22T10:00:00.000Z:line-a',
+          sortAt: '2026-04-22T10:00:00.000Z',
+          sortId: 'line-a',
         },
       ],
     }),
@@ -171,6 +174,38 @@ test('planMintsoftAlignmentAllocations consumes the oldest open ASN capacity fir
         { asnLineMapId: 'line-a', qty: 3 },
       ],
       unallocatedQty: 17,
+    },
+  )
+})
+
+test('planMintsoftAlignmentAllocations breaks same-timestamp ties by line id', () => {
+  assert.deepEqual(
+    stockSyncHelpers.planMintsoftAlignmentAllocations({
+      delta: 3,
+      candidates: [
+        {
+          asnLineMapId: 'line-b',
+          expectedQty: 5,
+          qtyAccountedViaSnapshot: 0,
+          lastProcessedReceivedQty: 0,
+          sortAt: '2026-04-22T10:00:00.000Z',
+          sortId: 'line-b',
+        },
+        {
+          asnLineMapId: 'line-a',
+          expectedQty: 5,
+          qtyAccountedViaSnapshot: 0,
+          lastProcessedReceivedQty: 0,
+          sortAt: '2026-04-22T10:00:00.000Z',
+          sortId: 'line-a',
+        },
+      ],
+    }),
+    {
+      allocations: [
+        { asnLineMapId: 'line-a', qty: 3 },
+      ],
+      unallocatedQty: 0,
     },
   )
 })

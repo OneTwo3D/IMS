@@ -42,6 +42,7 @@ type SyncSummary = {
   notifiedUsers: number
   dryRun?: boolean
   alignmentCorrections?: number
+  alignmentPreviews?: number
 }
 
 const STALE_RUNNING_STOCK_SYNC_MS = 3 * 60 * 1000
@@ -68,6 +69,7 @@ export type MintsoftStockSyncResult = {
   errors: number
   notifiedUsers: number
   dryRun?: boolean
+  alignmentPreviews?: number
   skippedReason?: string
 }
 
@@ -484,6 +486,8 @@ type AlignmentCandidateLine = {
   id: string
   sourceType: 'PURCHASE_ORDER_LINE' | 'STOCK_TRANSFER_LINE'
   sourceLineId: string
+  productId: string
+  sku: string
   expectedQty: number
   qtyAccountedViaSnapshot: number
   lastProcessedReceivedQty: number
@@ -494,10 +498,11 @@ type AlignmentCandidateLine = {
 }
 
 async function getAlignmentCandidateLines(
+  tx: Prisma.TransactionClient,
   binding: SyncBinding,
   productId: string,
 ): Promise<AlignmentCandidateLine[]> {
-  const lines = await db.wmsAsnLineMap.findMany({
+  const lines = await tx.wmsAsnLineMap.findMany({
     where: {
       productId,
       asn: {
@@ -513,6 +518,8 @@ async function getAlignmentCandidateLines(
       id: true,
       sourceType: true,
       sourceLineId: true,
+      productId: true,
+      sku: true,
       expectedQty: true,
       qtyAccountedViaSnapshot: true,
       lastProcessedReceivedQty: true,
@@ -533,11 +540,69 @@ async function getAlignmentCandidateLines(
     id: line.id,
     sourceType: line.sourceType as 'PURCHASE_ORDER_LINE' | 'STOCK_TRANSFER_LINE',
     sourceLineId: line.sourceLineId,
+    productId: line.productId,
+    sku: line.sku,
     expectedQty: Number(line.expectedQty),
     qtyAccountedViaSnapshot: Number(line.qtyAccountedViaSnapshot),
     lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),
     asn: line.asn,
   }))
+}
+
+async function lockAlignmentCandidateLines(
+  tx: Prisma.TransactionClient,
+  candidateIds: string[],
+): Promise<void> {
+  if (candidateIds.length === 0) return
+  await tx.$executeRaw`SELECT id FROM wms_asn_line_maps WHERE id = ANY(${candidateIds}::text[]) FOR UPDATE`
+}
+
+async function lockStockLevelForAlignment(
+  tx: Prisma.TransactionClient,
+  productId: string,
+  warehouseId: string,
+): Promise<{ reservedQty: number }> {
+  await tx.stockLevel.upsert({
+    where: {
+      productId_warehouseId: {
+        productId,
+        warehouseId,
+      },
+    },
+    create: {
+      productId,
+      warehouseId,
+      quantity: 0,
+      reservedQty: 0,
+    },
+    update: {
+      quantity: { increment: 0 },
+    },
+  })
+
+  await tx.$executeRaw`
+    SELECT id
+    FROM stock_levels
+    WHERE "productId" = ${productId} AND "warehouseId" = ${warehouseId}
+    FOR UPDATE
+  `
+
+  const stockLevel = await tx.stockLevel.findUnique({
+    where: {
+      productId_warehouseId: {
+        productId,
+        warehouseId,
+      },
+    },
+    select: {
+      quantity: true,
+      reservedQty: true,
+    },
+  })
+
+  return {
+    reservedQty: Number(stockLevel?.reservedQty ?? 0),
+  }
 }
 
 async function applyMintsoftAlignmentForProduct(params: {
@@ -552,56 +617,82 @@ async function applyMintsoftAlignmentForProduct(params: {
   correctedQty: number
   reason: string
 }> {
-  const candidates = await getAlignmentCandidateLines(params.binding, params.productId)
-  if (candidates.length === 0) {
+  if (params.delta <= 0) {
     return {
       applied: false,
       dryRun: params.dryRun,
       correctedQty: 0,
-      reason: 'No open ASN line is available to absorb this WMS delta.',
+      reason: 'Align To WMS only auto-corrects when Mintsoft is higher than IMS; align-down remains manual.',
     }
   }
-
-  const plan = planMintsoftAlignmentAllocations({
-    delta: params.delta,
-    candidates: candidates.map((candidate) => ({
-      asnLineMapId: candidate.id,
-      expectedQty: candidate.expectedQty,
-      qtyAccountedViaSnapshot: candidate.qtyAccountedViaSnapshot,
-      lastProcessedReceivedQty: candidate.lastProcessedReceivedQty,
-      sortKey: `${candidate.asn.createdAt.toISOString()}:${candidate.id}`,
-    })),
-  })
-
-  if (plan.allocations.length === 0 || plan.unallocatedQty > 0.0001) {
-    const coveredQty = params.delta - plan.unallocatedQty
-    return {
-      applied: false,
-      dryRun: params.dryRun,
-      correctedQty: 0,
-      reason: coveredQty > 0
-        ? `Open ASN lines only explain ${formatQuantity(coveredQty)} of the ${formatQuantity(params.delta)} delta; leaving stock unchanged.`
-        : 'No open ASN line has remaining capacity for this WMS delta.',
+  const outcome = await db.$transaction(async (tx) => {
+    let candidates = await getAlignmentCandidateLines(tx, params.binding, params.productId)
+    if (candidates.length === 0) {
+      return {
+        kind: 'unavailable' as const,
+        correctedQty: 0,
+        reason: 'No open ASN line is available to absorb this WMS delta.',
+      }
     }
-  }
 
-  if (params.dryRun) {
-    return {
-      applied: false,
-      dryRun: true,
-      correctedQty: params.delta,
-      reason: `Dry run: ${plan.allocations.length} ASN line${plan.allocations.length === 1 ? '' : 's'} would absorb ${formatQuantity(params.delta)}.`,
+    await lockAlignmentCandidateLines(tx, candidates.map((candidate) => candidate.id))
+    candidates = await getAlignmentCandidateLines(tx, params.binding, params.productId)
+
+    const plan = planMintsoftAlignmentAllocations({
+      delta: params.delta,
+      candidates: candidates.map((candidate) => ({
+        asnLineMapId: candidate.id,
+        expectedQty: candidate.expectedQty,
+        qtyAccountedViaSnapshot: candidate.qtyAccountedViaSnapshot,
+        lastProcessedReceivedQty: candidate.lastProcessedReceivedQty,
+        sortAt: candidate.asn.createdAt,
+        sortId: candidate.id,
+      })),
+    })
+
+    if (plan.allocations.length === 0 || plan.unallocatedQty > 0.0001) {
+      const coveredQty = params.delta - plan.unallocatedQty
+      return {
+        kind: 'unavailable' as const,
+        correctedQty: 0,
+        reason: coveredQty > 0
+          ? `Open ASN lines only explain ${formatQuantity(coveredQty)} of the ${formatQuantity(params.delta)} delta; leaving stock unchanged.`
+          : 'No open ASN line has remaining capacity for this WMS delta.',
+      }
     }
-  }
 
-  const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]))
+    if (params.dryRun) {
+      return {
+        kind: 'dryRun' as const,
+        correctedQty: params.delta,
+        allocationCount: plan.allocations.length,
+        reason: `Dry run: ${plan.allocations.length} ASN line${plan.allocations.length === 1 ? '' : 's'} would absorb ${formatQuantity(params.delta)}.`,
+      }
+    }
 
-  await db.$transaction(async (tx) => {
+    const candidateById = new Map(candidates.map((candidate) => [candidate.id, candidate]))
+    const stockLevel = await lockStockLevelForAlignment(tx, params.productId, params.binding.warehouseId)
+
     for (const allocation of plan.allocations) {
       const candidate = candidateById.get(allocation.asnLineMapId)
       if (!candidate) {
         throw new Error(`Missing ASN line ${allocation.asnLineMapId} during alignment.`)
       }
+
+      const movement = await tx.stockMovement.create({
+        data: {
+          type: 'WMS_RECEIPT_RECONCILIATION',
+          productId: params.productId,
+          toWarehouseId: params.binding.warehouseId,
+          qty: allocation.qty,
+          note: `Mintsoft alignment snapshot against ASN ${candidate.asn.externalAsnId}`,
+          referenceType: 'WmsAsnLineMap',
+          referenceId: candidate.id,
+        },
+        select: {
+          id: true,
+        },
+      })
 
       if (candidate.sourceType === 'PURCHASE_ORDER_LINE') {
         const poLine = await tx.purchaseOrderLine.findUnique({
@@ -610,30 +701,20 @@ async function applyMintsoftAlignmentForProduct(params: {
             id: true,
             productId: true,
             unitCostBase: true,
+            landedUnitCostBase: true,
           },
         })
         if (!poLine) {
           throw new Error(`Purchase order line ${candidate.sourceLineId} is missing for alignment.`)
         }
 
-        await tx.stockMovement.create({
-          data: {
-            type: 'PURCHASE_RECEIPT',
-            productId: params.productId,
-            toWarehouseId: params.binding.warehouseId,
-            qty: allocation.qty,
-            note: `Mintsoft alignment snapshot against ASN ${candidate.asn.externalAsnId}`,
-            referenceType: 'WmsAsnLineMap',
-            referenceId: candidate.id,
-          },
-        })
-
         await createCostLayer(tx, {
           productId: poLine.productId,
           warehouseId: params.binding.warehouseId,
           qty: allocation.qty,
-          unitCostBase: Number(poLine.unitCostBase),
+          unitCostBase: Number(poLine.landedUnitCostBase ?? poLine.unitCostBase),
           poLineId: poLine.id,
+          adjustmentMovementId: movement.id,
         })
       } else {
         const transferLine = await tx.stockTransferLine.findUnique({
@@ -647,18 +728,6 @@ async function applyMintsoftAlignmentForProduct(params: {
         if (!transferLine) {
           throw new Error(`Transfer line ${candidate.sourceLineId} is missing for alignment.`)
         }
-
-        await tx.stockMovement.create({
-          data: {
-            type: 'TRANSFER_IN',
-            productId: params.productId,
-            toWarehouseId: params.binding.warehouseId,
-            qty: allocation.qty,
-            note: `Mintsoft alignment snapshot against ASN ${candidate.asn.externalAsnId}`,
-            referenceType: 'WmsAsnLineMap',
-            referenceId: candidate.id,
-          },
-        })
 
         const snapshotSlice = sliceTransferSnapshotForReceipt({
           snapshot: transferLine.costLayerSnapshot,
@@ -676,25 +745,20 @@ async function applyMintsoftAlignmentForProduct(params: {
             warehouseId: params.binding.warehouseId,
             qty: entry.qty,
             unitCostBase: entry.unitCostBase,
+            adjustmentMovementId: movement.id,
           })
           await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entry.qty)
         }
       }
 
-      await tx.stockLevel.upsert({
+      await tx.stockLevel.update({
         where: {
           productId_warehouseId: {
             productId: params.productId,
             warehouseId: params.binding.warehouseId,
           },
         },
-        create: {
-          productId: params.productId,
-          warehouseId: params.binding.warehouseId,
-          quantity: allocation.qty,
-          reservedQty: 0,
-        },
-        update: {
+        data: {
           quantity: { increment: allocation.qty },
         },
       })
@@ -707,13 +771,53 @@ async function applyMintsoftAlignmentForProduct(params: {
         },
       })
     }
+
+    return {
+      kind: 'applied' as const,
+      correctedQty: params.delta,
+      allocationCount: plan.allocations.length,
+      reason: `Aligned ${formatQuantity(params.delta)} from Mintsoft to ${plan.allocations.length} open ASN line${plan.allocations.length === 1 ? '' : 's'}.`,
+      reservedQty: stockLevel.reservedQty,
+      allocations: plan.allocations.map((allocation) => {
+        const candidate = candidateById.get(allocation.asnLineMapId)
+        if (!candidate) {
+          throw new Error(`Missing ASN line ${allocation.asnLineMapId} during alignment result mapping.`)
+        }
+        return {
+          asnLineMapId: candidate.id,
+          externalAsnId: candidate.asn.externalAsnId,
+          sourceType: candidate.sourceType,
+          sourceLineId: candidate.sourceLineId,
+          qty: allocation.qty,
+        }
+      }),
+    }
   }, { maxWait: 5000, timeout: 30000 })
 
+  if (outcome.kind === 'applied') {
+    await logActivity({
+      entityType: 'SYNC',
+      entityId: params.binding.id,
+      tag: 'sync',
+      action: 'mintsoft_alignment_applied',
+      description: `Applied Mintsoft alignment for ${params.sku} in ${params.binding.warehouse.code}`,
+      metadata: {
+        warehouseId: params.binding.warehouseId,
+        productId: params.productId,
+        sku: params.sku,
+        delta: params.delta,
+        reservedQty: outcome.reservedQty,
+        allocations: outcome.allocations,
+      },
+      resolveUser: false,
+    })
+  }
+
   return {
-    applied: true,
-    dryRun: false,
-    correctedQty: params.delta,
-    reason: `Aligned ${formatQuantity(params.delta)} from Mintsoft to ${plan.allocations.length} open ASN line${plan.allocations.length === 1 ? '' : 's'}.`,
+    applied: outcome.kind === 'applied',
+    dryRun: outcome.kind === 'dryRun',
+    correctedQty: outcome.correctedQty,
+    reason: outcome.reason,
   }
 }
 
@@ -840,6 +944,7 @@ export async function runStockSyncForBinding(
       skipped: 0,
       errors: 1,
       notifiedUsers: 0,
+      alignmentPreviews: 0,
       skippedReason: reservation.skippedReason,
     }
   }
@@ -859,6 +964,7 @@ export async function runStockSyncForBinding(
       skipped: 0,
       errors: 0,
       notifiedUsers: 0,
+      alignmentPreviews: 0,
       skippedReason: reservation.skippedReason,
     }
   }
@@ -871,6 +977,7 @@ export async function runStockSyncForBinding(
     matched: 0,
     mismatched: 0,
     corrected: 0,
+    alignmentPreviews: 0,
     skipped: 0,
     errors: 0,
   }
@@ -1071,8 +1178,12 @@ export async function runStockSyncForBinding(
           })
 
           if (alignment.applied || alignment.dryRun) {
-            counters.corrected += 1
-            await resolveOpenDiscrepancies(binding, product.id, product.sku)
+            if (alignment.applied) {
+              counters.corrected += 1
+              await resolveOpenDiscrepancies(binding, product.id, product.sku)
+            } else {
+              counters.alignmentPreviews += 1
+            }
             logRows.push({
               jobId: job.id,
               sku: product.sku,
@@ -1082,7 +1193,7 @@ export async function runStockSyncForBinding(
               imsQtyAfter: alignment.applied ? wmsQty : imsQty,
               wmsQty,
               delta,
-              reason: alignment.reason,
+              reason: alignment.applied ? alignment.reason : `DRY_RUN_PREVIEW: ${alignment.reason}`,
               payload: (line.raw ?? {}) as Prisma.InputJsonValue,
             })
             continue
@@ -1091,7 +1202,12 @@ export async function runStockSyncForBinding(
 
         const timingConflict = await detectReceiptTimingConflict(binding, product.id, delta)
         const category = timingConflict ? 'RECEIPT_TIMING_CONFLICT' : 'QTY_MISMATCH'
-        const message = timingConflict ?? `IMS has ${formatQuantity(imsQty)} and Mintsoft has ${formatQuantity(wmsQty)} for ${product.sku}.`
+        const message = timingConflict
+          ?? (
+            binding.stockSyncMode === 'ALIGN_TO_WMS' && delta < 0
+              ? `IMS has ${formatQuantity(imsQty)} and Mintsoft has ${formatQuantity(wmsQty)} for ${product.sku}. Align To WMS currently auto-corrects upward deltas only; lower Mintsoft balances remain manual.`
+              : `IMS has ${formatQuantity(imsQty)} and Mintsoft has ${formatQuantity(wmsQty)} for ${product.sku}.`
+          )
 
         await upsertDiscrepancy({
           binding,
@@ -1201,6 +1317,7 @@ export async function runStockSyncForBinding(
       notifiedUsers,
       dryRun: alignmentDryRun,
       alignmentCorrections: counters.corrected,
+      alignmentPreviews: counters.alignmentPreviews,
     }
 
     const completed = await completeJob(job.id, status, counters, summary, leaseToken)
@@ -1237,6 +1354,7 @@ export async function runStockSyncForBinding(
       errors: counters.errors,
       notifiedUsers,
       dryRun: alignmentDryRun,
+      alignmentPreviews: counters.alignmentPreviews,
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Mintsoft stock sync failed'
@@ -1247,6 +1365,7 @@ export async function runStockSyncForBinding(
       notifiedUsers: 0,
       dryRun: alignmentDryRun,
       alignmentCorrections: counters.corrected,
+      alignmentPreviews: counters.alignmentPreviews,
     }, leaseToken)
     await updateBindingSyncStateIfCurrent(binding.id, 'FAILED', job.id, leaseToken)
 
@@ -1278,6 +1397,7 @@ export async function runStockSyncForBinding(
       errors: counters.errors + 1,
       notifiedUsers: 0,
       dryRun: alignmentDryRun,
+      alignmentPreviews: counters.alignmentPreviews,
       skippedReason: message,
     }
   }
@@ -1335,11 +1455,20 @@ export async function createMintsoftBindingHandover(
   return job.id
 }
 
-export async function clearMintsoftAlignmentCreditsForBinding(bindingId: string): Promise<number> {
+export async function clearMintsoftAlignmentCreditsForBinding(bindingId: string): Promise<{
+  success: boolean
+  blockedLines: number
+  error?: string
+}> {
   const binding = await getSyncBinding(bindingId)
-  if (!binding) return 0
+  if (!binding) {
+    return {
+      success: true,
+      blockedLines: 0,
+    }
+  }
 
-  const updated = await db.wmsAsnLineMap.updateMany({
+  const lines = await db.wmsAsnLineMap.findMany({
     where: {
       qtyAccountedViaSnapshot: { gt: 0 },
       asn: {
@@ -1348,11 +1477,34 @@ export async function clearMintsoftAlignmentCreditsForBinding(bindingId: string)
         closedAt: null,
       },
     },
-    data: {
-      qtyAccountedViaSnapshot: 0,
-      note: 'alignment credit cleared on mode exit',
+    select: {
+      id: true,
+      sku: true,
+      qtyAccountedViaSnapshot: true,
+      qtyAccountedViaReceipt: true,
+      asn: {
+        select: {
+          externalAsnId: true,
+        },
+      },
     },
   })
 
-  return updated.count
+  const blockedLines = lines.filter((line) => (
+    Number(line.qtyAccountedViaSnapshot) > Number(line.qtyAccountedViaReceipt) + 0.0001
+  ))
+
+  if (blockedLines.length > 0) {
+    const example = blockedLines[0]
+    return {
+      success: false,
+      blockedLines: blockedLines.length,
+      error: `Cannot leave Align To WMS while ${blockedLines.length} ASN line${blockedLines.length === 1 ? '' : 's'} still depend on unreconciled alignment credits. Example: ${example?.sku ?? 'unknown SKU'} on ASN ${example?.asn.externalAsnId ?? 'unknown'} still has snapshot stock that has not been confirmed by webhook receipts.`,
+    }
+  }
+
+  return {
+    success: true,
+    blockedLines: 0,
+  }
 }
