@@ -373,6 +373,10 @@ export function OnboardingClient({
             {step === 6 && (
               <ProductsStep
                 shoppingConnectorEnabled={shoppingEnabled}
+                wcEnabled={plugins.woocommerce}
+                wcConnected={wcConnected}
+                shopifyEnabled={plugins.shopify}
+                shopifyConnected={shopifyConnected}
                 productCount={productCount}
                 onImported={() => setProductsImported(true)}
               />
