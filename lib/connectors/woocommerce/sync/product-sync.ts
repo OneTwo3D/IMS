@@ -607,9 +607,14 @@ export async function syncAllWcProducts(
   const mode = opts.mode ?? 'poll'
   const cursorKey = mode === 'poll' ? 'last_wc_product_sync_at' : 'last_wc_product_reconcile_at'
 
-  // Only fetch products modified since last sync (incremental)
-  const lastSyncSetting = await db.setting.findUnique({ where: { key: cursorKey } })
-  const modifiedAfter = lastSyncSetting?.value ?? null
+  const [lastSyncSetting, existingProductCount] = await Promise.all([
+    db.setting.findUnique({ where: { key: cursorKey } }),
+    db.product.count(),
+  ])
+
+  // After a product reset or on a fresh install, there is nothing local to
+  // reconcile against. Ignore any stale cursor and force a full import.
+  const modifiedAfter = existingProductCount > 0 ? (lastSyncSetting?.value ?? null) : null
 
   let page = 1
   let totalPages = 1
