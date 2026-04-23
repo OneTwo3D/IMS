@@ -8,6 +8,29 @@ import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/
 
 export type ResetLevel = 'transactions' | 'products' | 'full'
 
+const WC_ORDER_SYNC_STATE_KEYS = [
+  'wc_initial_import_completed',
+  'last_wc_order_sync_at',
+  'last_wc_order_reconcile_at',
+  'wc_order_webhook_last_received_at',
+  'wc_webhook_last_received_at',
+] as const
+
+const WC_PRODUCT_SYNC_STATE_KEYS = [
+  'last_wc_product_sync_at',
+  'last_wc_product_reconcile_at',
+  'wc_product_webhook_last_received_at',
+  'wc_webhook_last_received_at',
+] as const
+
+async function clearSettingKeys(keys: readonly string[]) {
+  await db.setting.deleteMany({
+    where: {
+      key: { in: [...keys] },
+    },
+  })
+}
+
 // IMPORTANT:
 // Keep this reset coverage in sync with prisma/schema.prisma. When models are
 // added, removed, or relationships change, update the relevant reset scope
@@ -73,6 +96,10 @@ async function clearTransactionScope() {
   await db.shoppingSyncLog.deleteMany({})
   await db.accountingSyncLog.deleteMany({})
   await db.activityLog.deleteMany({})
+
+  // Reset WooCommerce transaction intake state so orders can be imported from
+  // scratch after a transaction reset.
+  await clearSettingKeys(WC_ORDER_SYNC_STATE_KEYS)
 }
 
 async function clearProductScope() {
@@ -109,6 +136,10 @@ async function clearProductScope() {
   // Customer/supplier email hygiene should not survive once those master
   // records have been cleared.
   await db.emailSuppression.deleteMany({})
+
+  // Reset WooCommerce product intake state so a fresh catalog import does not
+  // reuse stale cursors from before the reset.
+  await clearSettingKeys(WC_PRODUCT_SYNC_STATE_KEYS)
 }
 
 async function clearFullScope() {
