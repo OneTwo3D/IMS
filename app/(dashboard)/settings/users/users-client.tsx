@@ -60,8 +60,6 @@ export function UsersClient({ users, suppliers }: Props) {
   const [deleteSalesOrderMode, setDeleteSalesOrderMode] = useState<'keep_text' | 'transfer_user'>('keep_text')
   const [deleteTransferToUserId, setDeleteTransferToUserId] = useState('')
   const [deleteError, setDeleteError] = useState('')
-  const isPending = isCreatePending || isUpdatePending || isDeletePending
-
   function openCreate() {
     setName(''); setEmail(''); setPassword(''); setRole('WAREHOUSE'); setSupplierId(''); setError('')
     setShowCreate(true)

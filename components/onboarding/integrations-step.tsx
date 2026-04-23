@@ -90,7 +90,6 @@ export function IntegrationsStep({
       ? ''
       : (initialAccountingSettings.client_secret ?? initialAccountingSettings.xero_client_secret ?? initialAccountingSettings.quickbooks_client_secret ?? ''),
   )
-  const accountingStatus = initialAccountingStatus
   const [acSaved, setAcSaved] = useState(false)
   const [accountingMessage, setAccountingMessage] = useState('')
   const [accountingConnectedLocal, setAccountingConnectedLocal] = useState(initialAccountingStatus.connected)
