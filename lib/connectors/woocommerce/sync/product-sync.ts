@@ -9,6 +9,7 @@ import { getSettingValue } from '@/lib/settings-store'
 import { wcFetch, wcPut } from '../api'
 import { WC_SETTINGS_VERSION_KEY, WC_SYNC_ADVISORY_LOCK_KEY } from '../sync-lock'
 import type { ConnectorCredentials } from '../../types'
+import { toIsoCountryCode } from '@/lib/countries'
 import {
   deriveLegacyActiveFromLifecycleStatus,
   deriveLifecycleStatusFromWooStatus,
@@ -36,11 +37,41 @@ function stripHtml(html: string): string {
     .trim()
 }
 
-/** Parse a WC numeric string, returning null if empty/NaN. */
-function parseNum(val: string | undefined | null): number | null {
-  if (!val) return null
-  const n = parseFloat(val)
+function asTrimmedString(value: unknown): string | null {
+  if (typeof value === 'string') {
+    const trimmed = value.trim()
+    return trimmed || null
+  }
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return String(value)
+  }
+  return null
+}
+
+/** Parse a WC numeric-ish value, returning null if empty/NaN. */
+function parseNum(val: unknown): number | null {
+  const normalized = asTrimmedString(val)
+  if (!normalized) return null
+  const n = parseFloat(normalized)
   return Number.isNaN(n) ? null : n
+}
+
+function getFirstImageUrl(images: unknown): string | null {
+  if (!Array.isArray(images)) return null
+  for (const image of images) {
+    if (image && typeof image === 'object' && 'src' in image) {
+      const src = asTrimmedString((image as { src?: unknown }).src)
+      if (src) return src
+    }
+  }
+  return null
+}
+
+function normalizeAttributeOptions(options: unknown): string[] {
+  if (!Array.isArray(options)) return []
+  return options
+    .map((option) => asTrimmedString(option))
+    .filter((option): option is string => Boolean(option))
 }
 
 /** Search WC product attributes array by name (case-insensitive, ignores underscores/spaces), return first option value. */
@@ -48,11 +79,14 @@ function getWcAttribute(
   attrs: WcFullProduct['attributes'] | undefined,
   ...names: string[]
 ): string | null {
-  if (!attrs) return null
+  if (!Array.isArray(attrs)) return null
   const normalise = (s: string) => s.toLowerCase().replace(/[_\s]+/g, '')
   const targets = names.map(normalise)
-  const attr = attrs.find((a) => targets.includes(normalise(a.name)))
-  return attr?.options?.[0] ?? null
+  const attr = attrs.find((a) => {
+    const name = asTrimmedString(a?.name)
+    return name ? targets.includes(normalise(name)) : false
+  })
+  return attr ? normalizeAttributeOptions(attr.options)[0] ?? null : null
 }
 
 async function snapshotProductSyncContext(): Promise<{
@@ -129,9 +163,10 @@ async function persistMappingIfVersionMatches(
 
 export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ success: boolean; error?: string }> {
   try {
-    if (!wcProduct.sku) return { success: true } // skip products without SKU
+    const sku = asTrimmedString(wcProduct.sku)
+    if (!sku) return { success: true } // skip products without SKU
 
-    const existing = await db.product.findFirst({ where: { sku: wcProduct.sku } })
+    const existing = await db.product.findFirst({ where: { sku } })
 
     // --- Shared field extraction ---
     const description = stripHtml(wcProduct.short_description || wcProduct.description || '')
@@ -141,12 +176,13 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
     const depthCm = parseNum(wcProduct.dimensions?.length)   // WC "length" = depth
     const widthCm = parseNum(wcProduct.dimensions?.width)
     const heightCm = parseNum(wcProduct.dimensions?.height)
-    const imageUrl = wcProduct.images?.[0]?.src ?? null
-    const gtin = wcProduct.global_unique_id?.trim() || null
+    const imageUrl = getFirstImageUrl(wcProduct.images)
+    const gtin = asTrimmedString(wcProduct.global_unique_id)
 
     // Customs fields from WC attributes
-    const hsCodeAttr = getWcAttribute(wcProduct.attributes, 'hs_code', 'hs code', 'hscode')
+    const hsCodeAttr = asTrimmedString(getWcAttribute(wcProduct.attributes, 'hs_code', 'hs code', 'hscode'))
     const originAttr = getWcAttribute(wcProduct.attributes, 'country_of_origin', 'Country of Origin', 'coo')
+    const originIso = toIsoCountryCode(originAttr)
 
     // Product type mapping
     const productType = wcProduct.type === 'variable' ? 'VARIABLE' : 'SIMPLE'
@@ -167,6 +203,7 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
         active,
         lifecycleStatus,
         type: productType,
+        externalProductId: BigInt(wcProduct.id),
       }
 
       // Prices — only set on non-VARIABLE products (VARIABLE shows min-max from variants)
@@ -183,14 +220,58 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
 
       // Customs — only set if IMS field is currently null/empty
       if (hsCodeAttr && !existing.hsCode) updateData.hsCode = hsCodeAttr
-      if (originAttr && !existing.countryOfOrigin) updateData.countryOfOrigin = originAttr
+      if (originIso && !existing.countryOfOrigin) updateData.countryOfOrigin = originIso
 
-      await db.product.update({ where: { id: existing.id }, data: updateData })
+      const saved = await db.product.update({ where: { id: existing.id }, data: updateData })
+      const syncedProductId = saved.id
+
+      // --- Variations (VARIABLE products) ---
+      if (wcProduct.type === 'variable' && wcProduct.variations?.length > 0) {
+        await syncVariations(wcProduct.id, syncedProductId, wcProduct.name)
+      }
+
+      // --- Product options (variation attributes) ---
+      if (Array.isArray(wcProduct.attributes) && wcProduct.attributes.length) {
+        const variationAttrs = wcProduct.attributes.filter((a) => a.variation)
+        for (const attr of variationAttrs) {
+          const attrName = asTrimmedString(attr.name)
+          const optionValues = normalizeAttributeOptions(attr.options)
+          if (!attrName || optionValues.length === 0) continue
+          await db.productOption.upsert({
+            where: {
+              productId_name: { productId: syncedProductId, name: attrName },
+            },
+            create: {
+              productId: syncedProductId,
+              name: attrName,
+              values: optionValues.join(','),
+              sortOrder: attr.position,
+            },
+            update: {
+              values: optionValues.join(','),
+              sortOrder: attr.position,
+            },
+          })
+        }
+      }
+
+      await db.shoppingSyncLog.create({
+        data: {
+          direction: 'FROM_CONNECTOR',
+          status: 'SYNCED',
+          entityType: 'Product',
+          entityId: syncedProductId,
+          externalId: String(wcProduct.id),
+          syncedAt: new Date(),
+        },
+      })
+
+      return { success: true }
     } else {
       // Create new product
-      await db.product.create({
+      const created = await db.product.create({
         data: {
-          sku: wcProduct.sku,
+          sku,
           name: wcProduct.name,
           description: description || null,
           imageUrl,
@@ -205,56 +286,54 @@ export async function syncWcProductToIms(wcProduct: WcFullProduct): Promise<{ su
           lifecycleStatus,
           type: productType,
           hsCode: hsCodeAttr,
-          countryOfOrigin: originAttr,
+          countryOfOrigin: originIso,
+          externalProductId: BigInt(wcProduct.id),
         },
       })
-    }
 
-    // --- Variations (VARIABLE products) ---
-    if (wcProduct.type === 'variable' && wcProduct.variations?.length > 0) {
-      const parent = await db.product.findFirst({ where: { sku: wcProduct.sku } })
-      if (parent) {
-        await syncVariations(wcProduct.id, parent.id, wcProduct.name)
+      // --- Variations (VARIABLE products) ---
+      if (wcProduct.type === 'variable' && wcProduct.variations?.length > 0) {
+        await syncVariations(wcProduct.id, created.id, wcProduct.name)
       }
-    }
 
-    // --- Product options (variation attributes) ---
-    if (wcProduct.attributes?.length) {
-      const parent = existing ?? await db.product.findFirst({ where: { sku: wcProduct.sku } })
-      if (parent) {
+      // --- Product options (variation attributes) ---
+      if (Array.isArray(wcProduct.attributes) && wcProduct.attributes.length) {
         const variationAttrs = wcProduct.attributes.filter((a) => a.variation)
         for (const attr of variationAttrs) {
+          const attrName = asTrimmedString(attr.name)
+          const optionValues = normalizeAttributeOptions(attr.options)
+          if (!attrName || optionValues.length === 0) continue
           await db.productOption.upsert({
             where: {
-              productId_name: { productId: parent.id, name: attr.name },
+              productId_name: { productId: created.id, name: attrName },
             },
             create: {
-              productId: parent.id,
-              name: attr.name,
-              values: attr.options.join(','),
+              productId: created.id,
+              name: attrName,
+              values: optionValues.join(','),
               sortOrder: attr.position,
             },
             update: {
-              values: attr.options.join(','),
+              values: optionValues.join(','),
               sortOrder: attr.position,
             },
           })
         }
       }
+
+      await db.shoppingSyncLog.create({
+        data: {
+          direction: 'FROM_CONNECTOR',
+          status: 'SYNCED',
+          entityType: 'Product',
+          entityId: created.id,
+          externalId: String(wcProduct.id),
+          syncedAt: new Date(),
+        },
+      })
+
+      return { success: true }
     }
-
-    await db.shoppingSyncLog.create({
-      data: {
-        direction: 'FROM_CONNECTOR',
-        status: 'SYNCED',
-        entityType: 'Product',
-        entityId: existing?.id,
-        externalId: String(wcProduct.id),
-        syncedAt: new Date(),
-      },
-    })
-
-    return { success: true }
   } catch (e) {
     await db.shoppingSyncLog.create({
       data: {
@@ -293,10 +372,16 @@ async function syncVariations(
     const variations = data as WcVariation[]
 
     for (const v of variations) {
-      if (!v.sku) continue // skip variations without SKU
+      const sku = asTrimmedString(v.sku)
+      if (!sku) continue // skip variations without SKU
 
       // Build variant name: parent name + attribute values
-      const attrSuffix = v.attributes?.map((a) => a.option).filter(Boolean).join(' / ')
+      const attrSuffix = Array.isArray(v.attributes)
+        ? v.attributes
+          .map((a) => asTrimmedString(a.option))
+          .filter((option): option is string => Boolean(option))
+          .join(' / ')
+        : ''
       const variantName = attrSuffix ? `${parentName} — ${attrSuffix}` : parentName
 
       const description = stripHtml(v.description || '')
@@ -306,10 +391,10 @@ async function syncVariations(
       const depthCm = parseNum(v.dimensions?.length)
       const widthCm = parseNum(v.dimensions?.width)
       const heightCm = parseNum(v.dimensions?.height)
-      const imageUrl = v.images?.[0]?.src ?? null
-      const gtin = v.global_unique_id?.trim() || null
+      const imageUrl = getFirstImageUrl(v.images)
+      const gtin = asTrimmedString(v.global_unique_id)
 
-      const existing = await db.product.findFirst({ where: { sku: v.sku } })
+      const existing = await db.product.findFirst({ where: { sku } })
 
       if (existing) {
         const updateData: Record<string, unknown> = {
@@ -326,6 +411,7 @@ async function syncVariations(
           lifecycleStatus: deriveLifecycleStatusFromWooStatus(v.status, existing.lifecycleStatus),
           type: 'VARIANT',
           parentId: imsParentId,
+          externalProductId: BigInt(v.id),
         }
         if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
         if (salePriceBase !== null) updateData.salePriceBase = salePriceBase
@@ -335,7 +421,7 @@ async function syncVariations(
       } else {
         await db.product.create({
           data: {
-            sku: v.sku,
+            sku,
             name: variantName,
             description: description || null,
             imageUrl,
@@ -350,6 +436,7 @@ async function syncVariations(
             lifecycleStatus: deriveLifecycleStatusFromWooStatus(v.status),
             type: 'VARIANT',
             parentId: imsParentId,
+            externalProductId: BigInt(v.id),
           },
         })
       }
