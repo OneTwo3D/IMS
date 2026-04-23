@@ -12,6 +12,7 @@ import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { toIsoCountryCode } from '@/lib/countries'
 import { copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import {
   parseCostLayerSnapshot,
@@ -608,7 +609,7 @@ function mapSoRow(so: {
     paidAt: so.paidAt?.toISOString() ?? null,
     notes: so.notes,
     internalNotes: so.internalNotes,
-    shippingCountryCode: (so.shippingAddress as Record<string, string> | null)?.country?.toUpperCase() || null,
+    shippingCountryCode: toIsoCountryCode((so.shippingAddress as Record<string, string> | null)?.country) ?? null,
     paymentMethodTitle: so.paymentMethodTitle,
     externalCreatedAt: so.externalCreatedAt?.toISOString() ?? null,
     createdAt: so.createdAt.toISOString(),
@@ -811,7 +812,6 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     }
     // Normalize free-text country values ("United Kingdom", "UK", "gb") to
     // the lowercase ISO-2 code the resolver compares against.
-    const { toIsoCountryCode } = await import('@/lib/countries')
     const destCountryIso = toIsoCountryCode(destCountryRaw)
     const destCountry: string | null = destCountryIso ? destCountryIso.toLowerCase() : (destCountryRaw ? destCountryRaw.toLowerCase() : null)
 

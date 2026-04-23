@@ -5,6 +5,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { toIsoCountryCode } from '@/lib/countries'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 
 // ---------------------------------------------------------------------------
@@ -504,7 +505,7 @@ const warehouseSchema = z.object({
   addressLine2: z.string().max(200).optional().or(z.literal('')),
   city: z.string().max(100).optional().or(z.literal('')),
   postcode: z.string().max(20).optional().or(z.literal('')),
-  country: z.string().max(10).default('GB'),
+  country: z.string().max(100).default('GB'),
   availableForSale: z.boolean().default(true),
   syncToStore: z.boolean().default(false),
   isDefault: z.boolean().default(false),
@@ -523,6 +524,10 @@ export async function createWarehouse(
     return { success: false, error: Object.values(parsed.error.flatten().fieldErrors).flat()[0] ?? 'Validation failed' }
   }
   const data = parsed.data
+  const normalizedCountry = toIsoCountryCode(data.country)
+  if (!normalizedCountry) {
+    return { success: false, error: 'Select a valid country.' }
+  }
   try {
     // Enforce unique code
     const existing = await db.warehouse.findUnique({ where: { code: data.code } })
@@ -548,7 +553,7 @@ export async function createWarehouse(
         addressLine2: data.addressLine2 || null,
         city: data.city || null,
         postcode: data.postcode || null,
-        country: data.country,
+        country: normalizedCountry,
         availableForSale: data.availableForSale,
         syncToStore: data.syncToStore,
         isDefault: data.isDefault,
@@ -576,6 +581,10 @@ export async function updateWarehouse(
     return { success: false, error: Object.values(parsed.error.flatten().fieldErrors).flat()[0] ?? 'Validation failed' }
   }
   const data = parsed.data
+  const normalizedCountry = toIsoCountryCode(data.country)
+  if (!normalizedCountry) {
+    return { success: false, error: 'Select a valid country.' }
+  }
   try {
     // Enforce unique code (excluding self)
     const dup = await db.warehouse.findUnique({ where: { code: data.code } })
@@ -602,7 +611,7 @@ export async function updateWarehouse(
         addressLine2: data.addressLine2 || null,
         city: data.city || null,
         postcode: data.postcode || null,
-        country: data.country,
+        country: normalizedCountry,
         availableForSale: data.availableForSale,
         syncToStore: data.syncToStore,
         isDefault: data.isDefault,

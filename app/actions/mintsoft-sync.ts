@@ -13,6 +13,7 @@ import {
   getMintsoftSettings,
   invalidateMintsoftAccessToken,
   normalizeMintsoftBaseUrl,
+  testMintsoftConnectionSettings,
   type MintsoftSettings,
 } from '@/lib/connectors/mintsoft'
 import { inferMintsoftOrderLookupConnector } from '@/lib/connectors/mintsoft/order-lookup'
@@ -264,6 +265,11 @@ export type MintsoftDashboardData = {
   returnsInbox: MintsoftReturnsInboxRow[]
   availableOrderLookupConnectors: ShoppingConnectorId[]
   orderLookupConnectorRequired: boolean
+}
+
+export type MintsoftOnboardingConnectionData = {
+  connection: MintsoftConnectionSettingsMasked
+  status: MintsoftConnectionStatus
 }
 
 export type MintsoftConnectionInput = {
@@ -903,6 +909,55 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
   }
 }
 
+export async function getMintsoftOnboardingConnectionData(): Promise<MintsoftOnboardingConnectionData> {
+  await requireMintsoftReadAccess()
+
+  const [connection, settings] = await Promise.all([
+    db.wmsConnection.findFirst({
+      where: { connector: 'mintsoft' },
+      orderBy: [{ createdAt: 'asc' }],
+      select: {
+        label: true,
+        baseUrl: true,
+        orderLookupConnector: true,
+        active: true,
+        lastAuthAt: true,
+        bindings: {
+          where: { active: true },
+          select: { id: true },
+        },
+      },
+    }),
+    getMintsoftSettings(),
+  ])
+
+  const lastStockSyncAt = await db.wmsSyncJob.findFirst({
+    where: {
+      connector: 'mintsoft',
+      finishedAt: { not: null },
+      warehouseId: { not: null },
+    },
+    orderBy: [{ finishedAt: 'desc' }],
+    select: { finishedAt: true },
+  })
+
+  const hasMintsoftAuthMaterial = Boolean(
+    settings.mintsoft_api_key.trim()
+      || (settings.mintsoft_username.trim() && settings.mintsoft_password.trim()),
+  )
+
+  return {
+    connection: mapMintsoftConnection(connection, settings),
+    status: {
+      configured: Boolean((connection?.baseUrl ?? '').trim() && hasMintsoftAuthMaterial),
+      active: connection?.active ?? true,
+      bindingCount: connection?.bindings.length ?? 0,
+      lastAuthAt: connection?.lastAuthAt?.toISOString() ?? null,
+      lastStockSyncAt: lastStockSyncAt?.finishedAt?.toISOString() ?? null,
+    },
+  }
+}
+
 export async function getMintsoftPurchaseOrderAsnState(
   poId: string,
 ): Promise<MintsoftPurchaseOrderAsnState> {
@@ -1181,7 +1236,7 @@ export async function getMintsoftTransferAsnStates(
 
 export async function saveMintsoftConnectionSettings(
   input: unknown,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; message?: string }> {
   await requireMintsoftWriteAccess()
 
   const parsedInput = MintsoftConnectionInputSchema.safeParse(input)
@@ -1221,6 +1276,15 @@ export async function saveMintsoftConnectionSettings(
 
   if ((data.active ?? true) && availableOrderLookupConnectors.length > 1 && !orderLookupConnector) {
     return { success: false, error: 'Choose the shopping connector Mintsoft order numbers belong to before activating the connection.' }
+  }
+
+  try {
+    await testMintsoftConnectionSettings(baseUrl, username, password)
+  } catch (error) {
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Mintsoft connection test failed.',
+    }
   }
 
   const existingConnection = await db.wmsConnection.findFirst({
@@ -1288,7 +1352,7 @@ export async function saveMintsoftConnectionSettings(
 
   revalidatePath('/settings/system')
   revalidatePath('/sync')
-  return { success: true }
+  return { success: true, message: 'Connection verified with Mintsoft.' }
 }
 
 export async function saveMintsoftBinding(

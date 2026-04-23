@@ -26,6 +26,9 @@ import type { WarehouseRow } from '@/app/actions/settings'
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
 import type { ShoppingConnectorCredentials, ShopifyConnectorCredentials } from '@/app/actions/shopping-sync'
 import type { AccountingConnectionStatus, AccountingConnectorSettingsMasked } from '@/app/actions/accounting-sync'
+import type { MintsoftOnboardingConnectionData } from '@/app/actions/mintsoft-sync'
+import type { EmailSettings } from '@/app/actions/company'
+import type { PublicAppUrlInfo } from '@/lib/public-app-url'
 
 const STEPS: StepDef[] = [
   { key: 'welcome', label: 'Welcome', icon: Sparkles, skippable: false },
@@ -55,6 +58,11 @@ type Props = {
   shopifyCredentials: ShopifyConnectorCredentials
   accountingSettings: AccountingConnectorSettingsMasked
   accountingStatus: AccountingConnectionStatus
+  mintsoftConnection: MintsoftOnboardingConnectionData
+  emailSettings: EmailSettings
+  publicAppUrlInfo: PublicAppUrlInfo
+  suggestedPublicAppUrl: string | null
+  testEmailDefault: string
 }
 
 export function OnboardingClient({
@@ -73,6 +81,11 @@ export function OnboardingClient({
   shopifyCredentials,
   accountingSettings,
   accountingStatus,
+  mintsoftConnection,
+  emailSettings,
+  publicAppUrlInfo,
+  suggestedPublicAppUrl,
+  testEmailDefault,
 }: Props) {
   const router = useRouter()
   const companyStepRef = useRef<CompanyStepHandle | null>(null)
@@ -86,6 +99,18 @@ export function OnboardingClient({
   const [pluginDraft, setPluginDraft] = useState<{ base: IntegrationPluginState; value: IntegrationPluginState } | null>(null)
   const [companyConfiguredOverride, setCompanyConfiguredOverride] = useState<{ base: boolean; value: boolean } | null>(null)
   const [currencyConfiguredOverride, setCurrencyConfiguredOverride] = useState<{ base: boolean; value: boolean } | null>(null)
+  const [integrationsReadyOverride, setIntegrationsReadyOverride] = useState<boolean | null>(null)
+  const [integrationConnectedOverride, setIntegrationConnectedOverride] = useState<{
+    wc: boolean | null
+    shopify: boolean | null
+    accounting: boolean | null
+    mintsoft: boolean | null
+  }>({
+    wc: null,
+    shopify: null,
+    accounting: null,
+    mintsoft: null,
+  })
   const [finishing, setFinishing] = useState(false)
   const [finishError, setFinishError] = useState('')
   const [companyStepDirty, setCompanyStepDirty] = useState(false)
@@ -111,9 +136,11 @@ export function OnboardingClient({
     setCompletedSteps((prev) => new Set(prev).add(key))
   }
 
-  const wcConnected = !!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secretMasked
-  const shopifyConnected = !!shopifyCredentials.storeDomain && !!shopifyCredentials.accessTokenMasked
-  const accountingConnected = accountingStatus.connected
+  const wcConnected = integrationConnectedOverride.wc ?? (!!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secretMasked)
+  const shopifyConnected = integrationConnectedOverride.shopify ?? (!!shopifyCredentials.storeDomain && !!shopifyCredentials.accessTokenMasked)
+  const accountingConnected = integrationConnectedOverride.accounting ?? accountingStatus.connected
+  const mintsoftConnected = integrationConnectedOverride.mintsoft ?? mintsoftConnection.status.configured
+  const hasTaxRates = taxRates.some((rate) => rate.active)
   const anyIntegrationsEnabled = plugins.woocommerce || plugins.shopify || plugins.xero || plugins.quickbooks || plugins.mintsoft
   const hasAdditionalWarehouses = warehouses.length > 1
 
@@ -121,12 +148,14 @@ export function OnboardingClient({
     const key = STEPS[index]?.key
     if (key === 'company') return companyConfigured || companyStepDirty
     if (key === 'currency') return currencyConfigured
-    if (key === 'tax') return taxTouched
+    if (key === 'tax') return hasTaxRates || taxTouched
     if (key === 'integrations') {
+      if (integrationsReadyOverride != null) return integrationsReadyOverride
       if (!anyIntegrationsEnabled) return false
       if (plugins.woocommerce && !wcConnected) return false
       if (plugins.shopify && !shopifyConnected) return false
       if ((plugins.xero || plugins.quickbooks) && !accountingConnected) return false
+      if (plugins.mintsoft && !mintsoftConnected) return false
       return true
     }
     if (key === 'warehouses') return hasAdditionalWarehouses || warehousesTouched
@@ -185,6 +214,24 @@ export function OnboardingClient({
 
   const handleCompanyDirtyChange = useCallback((dirty: boolean) => {
     setCompanyStepDirty(dirty)
+  }, [])
+
+  const handlePluginStateChange = useCallback((nextPlugins: IntegrationPluginState) => {
+    setPluginDraft({ base: initialPluginState, value: nextPlugins })
+  }, [initialPluginState])
+
+  const handleIntegrationConnectionStateChange = useCallback((updates: {
+    wc?: boolean
+    shopify?: boolean
+    accounting?: boolean
+    mintsoft?: boolean
+  }) => {
+    setIntegrationConnectedOverride((prev) => ({
+      wc: updates.wc ?? prev.wc,
+      shopify: updates.shopify ?? prev.shopify,
+      accounting: updates.accounting ?? prev.accounting,
+      mintsoft: updates.mintsoft ?? prev.mintsoft,
+    }))
   }, [])
 
   async function handleFinish() {
@@ -251,6 +298,10 @@ export function OnboardingClient({
               <CompanyStep
                 ref={companyStepRef}
                 org={org}
+                emailSettings={emailSettings}
+                publicAppUrlInfo={publicAppUrlInfo}
+                suggestedPublicAppUrl={suggestedPublicAppUrl}
+                testEmailDefault={testEmailDefault}
                 onDirtyChange={handleCompanyDirtyChange}
                 onSaved={() => {
                   setCompanyConfiguredOverride({ base: initialCompanyConfigured, value: true })
@@ -296,7 +347,11 @@ export function OnboardingClient({
                 shopifyCredentials={shopifyCredentials}
                 accountingSettings={accountingSettings}
                 accountingStatus={accountingStatus}
-                onPluginStateChange={(nextPlugins) => setPluginDraft({ base: initialPluginState, value: nextPlugins })}
+                mintsoftConnection={mintsoftConnection}
+                publicAppUrlInfo={publicAppUrlInfo}
+                onPluginStateChange={handlePluginStateChange}
+                onConnectionStateChange={handleIntegrationConnectionStateChange}
+                onReadyChange={setIntegrationsReadyOverride}
               />
             )}
 

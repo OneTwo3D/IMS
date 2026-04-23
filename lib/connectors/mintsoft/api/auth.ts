@@ -179,6 +179,15 @@ async function requestMintsoftAuthSession(
   }
 }
 
+export async function testMintsoftConnectionSettings(
+  baseUrl: string,
+  username: string,
+  password: string,
+): Promise<{ expiresAt: Date }> {
+  const session = await requestMintsoftAuthSession(baseUrl, username, password)
+  return { expiresAt: session.expiresAt }
+}
+
 export async function getMintsoftConnectionRecord() {
   return db.wmsConnection.findFirst({
     where: { connector: 'mintsoft' },

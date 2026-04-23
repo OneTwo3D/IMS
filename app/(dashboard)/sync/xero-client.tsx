@@ -15,6 +15,7 @@ import {
   disconnectAccountingConnector,
   fetchAccountingTaxRates,
   retryFailedAccountingSync,
+  saveAccountingConnectionSettings,
   saveAccountingSettings,
   syncAccountingAccounts,
   triggerAccountingSync,
@@ -120,13 +121,14 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [s, setS] = useState(init)
   const [connected, setConnected] = useState(initConnected)
   const [tenantName, setTenantName] = useState(initTenant)
-  const [clientId, setClientId] = useState(init.xero_client_id)
-  const [clientSecret, setClientSecret] = useState(init.xero_client_secret)
+  const [clientId, setClientId] = useState(init.client_id ?? init.xero_client_id ?? init.quickbooks_client_id ?? '')
+  const [clientSecret, setClientSecret] = useState(init.client_secret ?? init.xero_client_secret ?? init.quickbooks_client_secret ?? '')
   const [msg, setMsg] = useState<string | null>(null)
   const [connectMsg, setConnectMsg] = useState<string | null>(null)
   const [syncMsg, setSyncMsg] = useState<string | null>(null)
   const [accountsMsg, setAccountsMsg] = useState<string | null>(null)
   const [connecting, setConnecting] = useState(false)
+  const [savingConnection, setSavingConnection] = useState(false)
   const [syncingAccounts, setSyncingAccounts] = useState(false)
   const [paymentMapRows, setPaymentMapRows] = useState<PaymentMapRow[]>(() => parsePaymentMap(paymentAccountMap))
   const [xeroTaxRates, setXeroTaxRates] = useState(initXeroTaxRates)
@@ -143,21 +145,35 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [retryingAll, setRetryingAll] = useState(false)
   const [retryMsg, setRetryMsg] = useState<string | null>(null)
   const searchParams = useSearchParams()
+  const connectorId = searchParams.get('connector') === 'quickbooks' ? 'quickbooks' : 'xero'
+  const connectorLabel = connectorId === 'quickbooks' ? 'QuickBooks' : 'Xero'
 
   // Handle OAuth redirect query params
   useEffect(() => {
     const success = searchParams.get('accounting_success')
     const error = searchParams.get('accounting_error')
+    setConnecting(false)
+    setSavingConnection(false)
     if (success) {
       setConnected(true)
       setTenantName(success)
       setConnectMsg(`Connected to ${success}`)
-      window.history.replaceState({}, '', '/sync?connector=xero')
+      window.history.replaceState({}, '', `/sync?connector=${connectorId}`)
     } else if (error) {
-      setConnectMsg(`Xero error: ${error}`)
-      window.history.replaceState({}, '', '/sync?connector=xero')
+      setConnectMsg(`${connectorLabel} error: ${error}`)
+      window.history.replaceState({}, '', `/sync?connector=${connectorId}`)
     }
-  }, [searchParams])
+  }, [connectorId, connectorLabel, searchParams])
+
+  useEffect(() => {
+    function resetTransientBusyState() {
+      setConnecting(false)
+      setSavingConnection(false)
+    }
+
+    window.addEventListener('pageshow', resetTransientBusyState)
+    return () => window.removeEventListener('pageshow', resetTransientBusyState)
+  }, [])
 
   function handleField(key: keyof AccountingConnectorSettings, value: string) {
     setS(prev => ({ ...prev, [key]: value }))
@@ -202,6 +218,19 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     })
   }
 
+  async function handleSaveConnection() {
+    setConnectMsg(null)
+    setSavingConnection(true)
+    const result = await saveAccountingConnectionSettings(clientId, clientSecret)
+    setSavingConnection(false)
+    if (result.success) {
+      setConnectMsg(result.message ?? 'Connection settings saved.')
+      router.refresh()
+    } else {
+      setConnectMsg(`Failed: ${result.error}`)
+    }
+  }
+
   async function handleConnect() {
     if (!clientId || !clientSecret) { setConnectMsg('Enter Client ID and Client Secret.'); return }
     setConnectMsg(null)
@@ -209,7 +238,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     const result = await connectAccountingConnector(clientId, clientSecret, window.location.origin)
     setConnecting(false)
     if (result.success && result.redirectUrl) {
-      setConnectMsg('Redirecting to Xero…')
+      setConnectMsg(`Redirecting to ${connectorLabel}…`)
       window.location.href = result.redirectUrl
     } else {
       setConnectMsg(`Failed: ${result.error}`)
@@ -217,7 +246,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   }
 
   async function handleDisconnect() {
-    if (!confirm('Disconnect from Xero? Pending sync entries will not be processed until reconnected.')) return
+    if (!confirm(`Disconnect from ${connectorLabel}? Pending sync entries will not be processed until reconnected.`)) return
     setConnectMsg(null)
     setConnecting(true)
     const result = await disconnectAccountingConnector()
@@ -225,7 +254,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
     if (result.success) {
       setConnected(false)
       setTenantName(undefined)
-      setConnectMsg('Disconnected from Xero.')
+      setConnectMsg(`Disconnected from ${connectorLabel}.`)
       router.refresh()
     } else {
       setConnectMsg(`Error: ${result.error}`)
@@ -345,7 +374,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const hasFailedEntries = logs.some(l => l.status === 'FAILED')
 
   // Show save bar on tabs with editable content
-  const showSaveBar = tab === 'connection' || tab === 'accounts' || tab === 'sync'
+  const showSaveBar = tab === 'accounts' || tab === 'sync'
 
   return (
     <div className={`space-y-4 ${showSaveBar ? 'pb-20' : ''}`}>
@@ -390,7 +419,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                 id="xero_client_id"
                 value={clientId}
                 onChange={e => setClientId(e.target.value)}
-                placeholder="Your Xero app Client ID"
+                placeholder={`Your ${connectorLabel} app Client ID`}
               />
             </div>
             <div className="space-y-1.5">
@@ -400,21 +429,25 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                 type="password"
                 value={clientSecret}
                 onChange={e => setClientSecret(e.target.value)}
-                placeholder="Your Xero app Client Secret"
+                placeholder={`Your ${connectorLabel} app Client Secret`}
               />
             </div>
           </div>
 
           <div className="flex items-center gap-3">
+            <Button variant="outline" size="sm" onClick={handleSaveConnection} disabled={connecting || savingConnection}>
+              {savingConnection ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowUpFromLine className="h-3 w-3 mr-1" />}
+              Save Connection
+            </Button>
             {connected ? (
-              <Button variant="outline" size="sm" onClick={handleDisconnect} disabled={connecting}>
+              <Button variant="outline" size="sm" onClick={handleDisconnect} disabled={connecting || savingConnection}>
                 {connecting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Link2Off className="h-3 w-3 mr-1" />}
                 Disconnect
               </Button>
             ) : (
-              <Button size="sm" onClick={handleConnect} disabled={connecting}>
+              <Button size="sm" onClick={handleConnect} disabled={connecting || savingConnection}>
                 {connecting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Link2 className="h-3 w-3 mr-1" />}
-                Connect to Xero
+                {`Connect to ${connectorLabel}`}
               </Button>
             )}
             {connectMsg && <span className="text-xs text-muted-foreground">{connectMsg}</span>}

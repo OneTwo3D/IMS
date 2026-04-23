@@ -11,6 +11,7 @@ import {
   pdfToBuffer,
   type PdfTableColumn,
 } from '@/lib/pdf'
+import { formatCountryDisplay } from '@/lib/countries'
 
 export async function GET(
   _req: Request,
@@ -83,7 +84,7 @@ export async function GET(
     po.supplier.addressLine2,
     po.supplier.city,
     po.supplier.postcode,
-    po.supplier.country,
+    formatCountryDisplay(po.supplier.country),
   ]
     .filter(Boolean)
     .join('\n')

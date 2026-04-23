@@ -24,7 +24,8 @@ async function getRetentionSettings(): Promise<Record<string, number>> {
   const result: Record<string, number> = {}
   for (const key of RETENTION_KEYS) {
     const row = rows.find((r) => r.key === key)
-    result[key] = row ? parseInt(row.value, 10) : DEFAULTS[key]
+    const parsed = row ? Number.parseInt(row.value, 10) : DEFAULTS[key]
+    result[key] = Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULTS[key]
   }
   return result
 }
@@ -70,13 +71,27 @@ export async function purgeExpiredData(): Promise<{
   const movementMonths = settings.retention_stock_movements_months
   if (movementMonths > 0) {
     const cutoff = monthsAgo(movementMonths)
-    const { count } = await db.stockMovement.deleteMany({
+    const movementIds = (await db.stockMovement.findMany({
       where: {
         createdAt: { lt: cutoff },
         NOT: { referenceType: { in: ['WcHistorical', 'WcInitialImport', 'CsvHistorical'] } },
       },
-    })
-    stockMovementsDeleted = count
+      select: { id: true },
+    })).map((row) => row.id)
+
+    if (movementIds.length > 0) {
+      await db.cogsEntry.deleteMany({
+        where: { movementId: { in: movementIds } },
+      })
+      await db.costLayer.updateMany({
+        where: { adjustmentMovementId: { in: movementIds } },
+        data: { adjustmentMovementId: null },
+      })
+      const { count } = await db.stockMovement.deleteMany({
+        where: { id: { in: movementIds } },
+      })
+      stockMovementsDeleted = count
+    }
   }
 
   // Sales orders — soft archive terminal-status orders
@@ -86,7 +101,7 @@ export async function purgeExpiredData(): Promise<{
     const { count } = await db.salesOrder.updateMany({
       where: {
         createdAt: { lt: cutoff },
-        status: { in: ['COMPLETED', 'DELIVERED', 'CANCELLED', 'REFUNDED'] },
+        status: { in: ['COMPLETED', 'DELIVERED', 'CANCELLED', 'REFUNDED', 'PARTIALLY_REFUNDED'] },
         archived: false,
       },
       data: { archived: true },
@@ -101,7 +116,7 @@ export async function purgeExpiredData(): Promise<{
     const { count } = await db.purchaseOrder.updateMany({
       where: {
         createdAt: { lt: cutoff },
-        status: { in: ['RECEIVED', 'INVOICED', 'CANCELLED'] },
+        status: { in: ['RECEIVED', 'CLOSED', 'INVOICED', 'PARTIALLY_RETURNED', 'RETURNED', 'CANCELLED'] },
         archived: false,
       },
       data: { archived: true },

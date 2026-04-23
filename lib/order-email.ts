@@ -1,6 +1,7 @@
 import { db } from '@/lib/db'
 import { renderEmailHtml } from '@/lib/email-template'
 import { loadInvoicePdf } from '@/lib/invoice-pdf'
+import { formatCountryDisplay } from '@/lib/countries'
 import {
   createPdfDocument,
   drawFooter,
@@ -90,7 +91,7 @@ async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<
   const { doc } = createPdfDocument({ title: `Order ${so.externalOrderNumber}` })
   const date = so.createdAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
   const shipAddr = so.shippingAddress as Record<string, string> | null
-  const recipientAddr = shipAddr ? [shipAddr.line1, shipAddr.line2, shipAddr.city, shipAddr.postcode, shipAddr.country].filter(Boolean).join('\n') : ''
+  const recipientAddr = shipAddr ? [shipAddr.line1, shipAddr.line2, shipAddr.city, shipAddr.postcode, formatCountryDisplay(shipAddr.country)].filter(Boolean).join('\n') : ''
 
   await drawHeader(doc, branding, {
     title: 'Sales Order',
@@ -163,7 +164,7 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
   const invNum = so.invoiceNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
   const { doc } = createPdfDocument({ title: `Invoice ${invNum}` })
   const billAddr = so.billingAddress as Record<string, string> | null
-  const recipientAddr = billAddr ? [billAddr.line1, billAddr.line2, billAddr.city, billAddr.postcode, billAddr.country].filter(Boolean).join('\n') : ''
+  const recipientAddr = billAddr ? [billAddr.line1, billAddr.line2, billAddr.city, billAddr.postcode, formatCountryDisplay(billAddr.country)].filter(Boolean).join('\n') : ''
   const date = (so.invoicedAt ?? so.createdAt).toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
 
   await drawHeader(doc, branding, {

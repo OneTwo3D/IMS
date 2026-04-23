@@ -7,7 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
-import { resetDatabase, sendDatabaseResetCode, type ResetLevel } from '@/app/actions/reset'
+import { resetDatabase, type ResetLevel } from '@/app/actions/reset'
 
 const LEVELS: { key: ResetLevel; label: string; description: string; items: string[] }[] = [
   {
@@ -49,12 +49,15 @@ export function DatabaseReset() {
     setSendingCode(true)
     setCodeStatus(null)
     try {
-      const r = await sendDatabaseResetCode()
-      if (r.success) {
-        setCodeStatus(`Confirmation code emailed to ${r.email}.`)
+      const res = await fetch('/api/reset/code')
+      const data = await res.json()
+      if (res.ok) {
+        setCodeStatus(`Confirmation code emailed to ${data.email}.`)
       } else {
-        setCodeStatus(r.error ?? 'Failed to send confirmation code.')
+        setCodeStatus(data.error ?? 'Failed to send confirmation code.')
       }
+    } catch {
+      setCodeStatus('Failed to send confirmation code.')
     } finally {
       setSendingCode(false)
     }

@@ -6,6 +6,7 @@ import {
   Building2, Palette, Hash, Mail, FileText, Upload, Loader2, Check, Trash2, Camera, Eye,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { CountrySelect } from '@/components/ui/country-select'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card } from '@/components/ui/card'
@@ -15,6 +16,7 @@ import {
   updateOrganisation,
   saveNumberingFormats,
   saveEmailSettings,
+  sendTestEmailSettings,
   saveBrandingColours,
   saveDocumentTemplate,
   type OrganisationData,
@@ -36,6 +38,7 @@ type Props = {
   templates: DocumentTemplateData[]
   shoppingConnectors: ShoppingConnectorSummary[]
   currencies: CurrencyRow[]
+  testEmailDefault: string
 }
 
 const TABS = [
@@ -58,9 +61,10 @@ const TEMPLATE_LABELS: Record<string, string> = {
   manufacturing_order: 'Manufacturing Order',
 }
 
-export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, email, branding, templates, shoppingConnectors, currencies }: Props) {
+export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, email, branding, templates, shoppingConnectors, currencies, testEmailDefault }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
+  const [isEmailPending, startEmailTransition] = useTransition()
   const [tab, setTab] = useState<Tab>('company')
   const [saved, setSaved] = useState<string | null>(null)
 
@@ -81,6 +85,8 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, emai
 
   // --- Email state ---
   const [em, setEm] = useState(email)
+  const [testEmail, setTestEmail] = useState(testEmailDefault)
+  const [emailTestResult, setEmailTestResult] = useState<{ type: 'success' | 'error'; message: string } | null>(null)
 
   // --- Templates state ---
   const [tpls, setTpls] = useState(templates)
@@ -162,9 +168,22 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, emai
 
   // Email
   function handleSaveEmail() {
-    startTransition(async () => {
+    startEmailTransition(async () => {
+      setEmailTestResult(null)
       await saveEmailSettings(em)
       showSaved('email')
+    })
+  }
+
+  function handleTestEmail() {
+    startEmailTransition(async () => {
+      setEmailTestResult(null)
+      const result = await sendTestEmailSettings(em, testEmail)
+      if (result.success && result.message) {
+        setEmailTestResult({ type: 'success', message: result.message })
+        return
+      }
+      setEmailTestResult({ type: 'error', message: result.error ?? 'Failed to send test email.' })
     })
   }
 
@@ -187,12 +206,21 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, emai
     return (
       <div className={`space-y-1.5 ${opts?.span === 2 ? 'sm:col-span-2' : ''}`}>
         <Label className="text-xs">{label}</Label>
-        <Input
-          type={opts?.type ?? 'text'}
-          value={(co[key] as string) ?? ''}
-          onChange={(e) => setCo((p) => ({ ...p, [key]: e.target.value || null }))}
-          className="h-9"
-        />
+        {key === 'country' ? (
+          <CountrySelect
+            value={co.country}
+            onChange={(value) => setCo((p) => ({ ...p, country: value }))}
+            allowBlank={false}
+            className="h-9"
+          />
+        ) : (
+          <Input
+            type={opts?.type ?? 'text'}
+            value={(co[key] as string) ?? ''}
+            onChange={(e) => setCo((p) => ({ ...p, [key]: e.target.value || null }))}
+            className="h-9"
+          />
+        )}
       </div>
     )
   }
@@ -597,7 +625,7 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, emai
             </div>
             <div className="space-y-1.5">
               <Label className="text-xs">From Email</Label>
-              <Input type="email" value={em.from_email} onChange={(e) => setEm((p) => ({ ...p, from_email: e.target.value }))} className="h-9" placeholder="accounts@example.com" />
+              <Input type="email" value={em.from_email} onChange={(e) => setEm((p) => ({ ...p, from_email: e.target.value }))} className="h-9" placeholder="accounts@yourdomain.com" />
             </div>
             <div className="space-y-1.5 sm:col-span-2">
               <Label className="text-xs">Reply-To</Label>
@@ -607,22 +635,48 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, emai
             <p className="sm:col-span-2 text-xs text-muted-foreground">Department email addresses — shown on documents as the contact for queries.</p>
             <div className="space-y-1.5">
               <Label className="text-xs">Sales Email</Label>
-              <Input type="email" value={em.sales_email} onChange={(e) => setEm((p) => ({ ...p, sales_email: e.target.value }))} className="h-9" placeholder="sales@example.com" />
+              <Input type="email" value={em.sales_email} onChange={(e) => setEm((p) => ({ ...p, sales_email: e.target.value }))} className="h-9" placeholder="sales@yourdomain.com" />
               <p className="text-xs text-muted-foreground">Shown on invoices, sales orders, credit notes, packing slips</p>
             </div>
             <div className="space-y-1.5">
               <Label className="text-xs">Purchases Email</Label>
-              <Input type="email" value={em.purchases_email} onChange={(e) => setEm((p) => ({ ...p, purchases_email: e.target.value }))} className="h-9" placeholder="purchasing@example.com" />
+              <Input type="email" value={em.purchases_email} onChange={(e) => setEm((p) => ({ ...p, purchases_email: e.target.value }))} className="h-9" placeholder="purchasing@yourdomain.com" />
               <p className="text-xs text-muted-foreground">Shown on purchase orders and RFQs</p>
             </div>
             <div className="space-y-1.5 sm:col-span-2">
               <Label className="text-xs">Support Email</Label>
-              <Input type="email" value={em.support_email} onChange={(e) => setEm((p) => ({ ...p, support_email: e.target.value }))} className="h-9" placeholder="support@example.com" />
+              <Input type="email" value={em.support_email} onChange={(e) => setEm((p) => ({ ...p, support_email: e.target.value }))} className="h-9" placeholder="support@yourdomain.com" />
               <p className="text-xs text-muted-foreground">General support contact</p>
             </div>
           </div>
+          <div className="mt-4 grid grid-cols-1 gap-3 max-w-lg">
+            <div className="space-y-1.5">
+              <Label className="text-xs">Test Email Recipient</Label>
+              <Input
+                type="email"
+                value={testEmail}
+                onChange={(e) => setTestEmail(e.target.value)}
+                className="h-9"
+                placeholder="you@yourdomain.com"
+              />
+            </div>
+          </div>
+          <div className="mt-4 flex flex-col gap-2 sm:flex-row sm:items-center">
+            <Button variant="outline" size="sm" onClick={handleTestEmail} disabled={isEmailPending}>
+              {isEmailPending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
+              Test SMTP
+            </Button>
+            <p className="text-xs text-muted-foreground">
+              Sends a test email to the address entered above using the values currently entered above.
+            </p>
+          </div>
+          {emailTestResult && (
+            <p className={`mt-3 text-sm ${emailTestResult.type === 'success' ? 'text-green-600' : 'text-destructive'}`}>
+              {emailTestResult.message}
+            </p>
+          )}
           <div className="mt-4">
-            <SaveButton onClick={handleSaveEmail} pending={isPending} saved={saved === 'email'} />
+            <SaveButton onClick={handleSaveEmail} pending={isEmailPending} saved={saved === 'email'} />
           </div>
         </Card>
       )}

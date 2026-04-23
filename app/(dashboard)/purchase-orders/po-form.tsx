@@ -23,7 +23,7 @@ import type { TaxRateRow, PurchaseUnitRow } from '@/app/actions/settings'
 import { ProductLink } from '@/components/inventory/product-link'
 import { formatMoney } from '@/lib/utils'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
-import { toIsoCountryCode } from '@/lib/countries'
+import { formatCountryDisplay, toIsoCountryCode } from '@/lib/countries'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 
 type Warehouse = { id: string; code: string; name: string; country?: string | null; contactName?: string | null; email?: string | null; phone?: string | null; addressLine1?: string | null; addressLine2?: string | null; city?: string | null; postcode?: string | null }
@@ -797,7 +797,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                 {(destWarehouse.city || destWarehouse.postcode) && (
                   <p>{[destWarehouse.city, destWarehouse.postcode].filter(Boolean).join(', ')}</p>
                 )}
-                {destWarehouse.country && <p>{destWarehouse.country}</p>}
+                {destWarehouse.country && <p>{formatCountryDisplay(destWarehouse.country)}</p>}
                 {destWarehouse.phone && <p>Tel: {destWarehouse.phone}</p>}
                 {destWarehouse.email && <p>{destWarehouse.email}</p>}
               </div>

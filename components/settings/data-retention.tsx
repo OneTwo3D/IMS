@@ -16,8 +16,8 @@ type Props = {
 }
 
 const FIELDS = [
-  { key: 'retention_sales_orders_months', label: 'Sales Orders', stateKey: 'salesOrders' as const, hint: 'Archive completed/cancelled orders' },
-  { key: 'retention_purchase_orders_months', label: 'Purchase Orders', stateKey: 'purchaseOrders' as const, hint: 'Archive received/invoiced/cancelled POs' },
+  { key: 'retention_sales_orders_months', label: 'Sales Orders', stateKey: 'salesOrders' as const, hint: 'Archive completed, delivered, cancelled, or refunded orders' },
+  { key: 'retention_purchase_orders_months', label: 'Purchase Orders', stateKey: 'purchaseOrders' as const, hint: 'Archive received, closed, invoiced, returned, or cancelled POs' },
   { key: 'retention_customers_months', label: 'Customers', stateKey: 'customers' as const, hint: 'Archive inactive customers' },
   { key: 'retention_stock_movements_months', label: 'Stock Movements', stateKey: 'stockMovements' as const, hint: 'Permanently delete movements' },
   { key: 'retention_sync_logs_months', label: 'Sync Logs', stateKey: 'syncLogs' as const, hint: 'Permanently delete sync logs' },

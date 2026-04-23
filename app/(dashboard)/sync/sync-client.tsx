@@ -270,6 +270,8 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
   const [saved, setSaved] = useState(false)
+  const [connectionMessage, setConnectionMessage] = useState<string | null>(null)
+  const [connectionError, setConnectionError] = useState(false)
   const [syncResult, setSyncResult] = useState<{ text: string; isError: boolean } | null>(null)
   const [syncingType, setSyncingType] = useState<'orders' | 'products' | 'stock' | null>(null)
   const [importingTax, setImportingTax] = useState(false)
@@ -359,14 +361,24 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
     }
   }
 
-  function handleSave() {
-    setSaved(false)
+  function handleSaveConnection() {
+    setConnectionMessage(null)
+    setConnectionError(false)
     startTransition(async () => {
       const credentialResult = await saveShoppingConnectorCredentials(wcUrl.trim(), wcKey.trim(), wcSecret.trim())
       if (!credentialResult.success) {
-        setSyncResult({ text: `Error: ${credentialResult.error ?? 'Failed to save connector settings.'}`, isError: true })
+        setConnectionError(true)
+        setConnectionMessage(credentialResult.error ?? 'Failed to save connector settings.')
         return
       }
+      router.refresh()
+      setConnectionMessage(credentialResult.message ?? 'Connection verified and saved.')
+    })
+  }
+
+  function handleSaveSettings() {
+    setSaved(false)
+    startTransition(async () => {
       const settingsResult = await saveShoppingSyncSettings(s)
       if (!settingsResult.success) {
         setSyncResult({ text: `Error: ${settingsResult.error ?? 'Failed to save sync settings.'}`, isError: true })
@@ -518,10 +530,14 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
             <p className="text-xs text-green-600 flex items-center gap-1"><Check className="h-3 w-3" />Connected to {wcUrl}</p>
           )}
           <div className="flex items-center gap-2 pt-2">
-            <Button onClick={handleSave} disabled={isPending}>
-              {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save Settings
+            <Button onClick={handleSaveConnection} disabled={isPending}>
+              {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save Connection
             </Button>
-            {saved && <span className="text-sm text-green-600 flex items-center gap-1"><Check className="h-3 w-3" />Saved</span>}
+            {connectionMessage && (
+              <span className={`text-sm ${connectionError ? 'text-destructive' : 'text-green-600'}`}>
+                {connectionMessage}
+              </span>
+            )}
           </div>
         </Card>
       )}
@@ -659,7 +675,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
 
           {/* Save */}
           <div className="flex items-center gap-2">
-            <Button onClick={handleSave} disabled={isPending}>
+            <Button onClick={handleSaveSettings} disabled={isPending}>
               {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save Settings
             </Button>
             {saved && <span className="text-sm text-green-600 flex items-center gap-1"><Check className="h-3 w-3" />Saved</span>}
@@ -756,7 +772,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
 
           {/* Save */}
           <div className="flex items-center gap-2">
-            <Button onClick={handleSave} disabled={isPending}>
+            <Button onClick={handleSaveSettings} disabled={isPending}>
               {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save Settings
             </Button>
             {saved && <span className="text-sm text-green-600 flex items-center gap-1"><Check className="h-3 w-3" />Saved</span>}

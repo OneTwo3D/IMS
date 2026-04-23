@@ -4,6 +4,7 @@ import { useState, useTransition } from 'react'
 import { useRouter, useSearchParams } from 'next/navigation'
 import { Plus, Pencil, X, Loader2, Check } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { CountrySelect } from '@/components/ui/country-select'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
@@ -248,7 +249,7 @@ function SupplierFormDialog({
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <div className="space-y-1.5">
               <Label>Country</Label>
-              <Input value={form.country} onChange={(e) => set('country', e.target.value)} className="h-9" placeholder="United Kingdom" />
+              <CountrySelect value={form.country} onChange={(value) => set('country', value)} className="h-9" />
             </div>
             <div className="space-y-1.5">
               <Label>Account Number</Label>

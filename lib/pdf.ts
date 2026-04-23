@@ -3,6 +3,7 @@ import { readFile } from 'fs/promises'
 import path from 'path'
 import sharp from 'sharp'
 import { db } from '@/lib/db'
+import { formatCountryDisplay } from '@/lib/countries'
 
 // ---------------------------------------------------------------------------
 // Branding — reads from organisation + settings, with sensible defaults
@@ -35,7 +36,7 @@ export async function getBranding(): Promise<Branding> {
     db.setting.findUnique({ where: { key: 'email_support_email' } }),
   ])
 
-  const address = [org?.addressLine1, org?.addressLine2, [org?.city, org?.postcode].filter(Boolean).join(' '), org?.country]
+  const address = [org?.addressLine1, org?.addressLine2, [org?.city, org?.postcode].filter(Boolean).join(' '), formatCountryDisplay(org?.country)]
     .filter(Boolean)
     .join('\n')
 

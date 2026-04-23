@@ -200,7 +200,7 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
  * must also call `resetWcProductIdCache()` (or click the "Reset cached
  * product IDs" button) to flush the cache.
  */
-export async function saveWcCredentials(url: string, key: string, secret: string): Promise<{ success: boolean; wipedMappings: number; error?: string }> {
+export async function saveWcCredentials(url: string, key: string, secret: string): Promise<{ success: boolean; wipedMappings: number; error?: string; message?: string }> {
   await requireAdmin()
 
   const validatedUrl = validateWooCommerceBaseUrl(url)
@@ -208,14 +208,17 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     return { success: false, wipedMappings: 0, error: validatedUrl.error }
   }
 
-  const incomingKeyIsMasked = !!key && key.includes('*')
+  const nextKey = key.trim()
+  const nextSecret = secret.trim()
+  const incomingKeyIsMasked = !!nextKey && nextKey.includes('*')
   const currentKey = incomingKeyIsMasked
     ? await getSettingValue('wc_consumer_key')
-    : key
-  const incomingSecretIsMasked = !!secret && secret.includes('*')
-  const currentSecret = incomingSecretIsMasked
+    : nextKey
+  const incomingSecretIsMasked = !!nextSecret && nextSecret.includes('*')
+  const shouldReuseStoredSecret = incomingSecretIsMasked || !nextSecret
+  const currentSecret = shouldReuseStoredSecret
     ? await getSettingValue('wc_consumer_secret')
-    : secret
+    : nextSecret
   const currencyValidation = await validateWooStoreBaseCurrency({
     url: validatedUrl.normalizedUrl,
     key: currentKey ?? '',
@@ -241,8 +244,8 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     const prevSecret = existingMap.get('wc_consumer_secret')
       ? decryptSecret(existingMap.get('wc_consumer_secret')!)
       : ''
-    const effectiveKey = incomingKeyIsMasked ? prevKey : key
-    const effectiveSecret = incomingSecretIsMasked ? prevSecret : secret
+    const effectiveKey = incomingKeyIsMasked ? prevKey : nextKey
+    const effectiveSecret = shouldReuseStoredSecret ? prevSecret : nextSecret
 
     // "Rebind" = any of the three effective values actually differs from
     // what's already stored. A no-op save (operator opened the form and
@@ -257,18 +260,18 @@ export async function saveWcCredentials(url: string, key: string, secret: string
       create: { key: 'wc_url', value: validatedUrl.normalizedUrl },
       update: { value: validatedUrl.normalizedUrl },
     })
-    if (key && !incomingKeyIsMasked) {
+    if (nextKey && !incomingKeyIsMasked) {
       await tx.setting.upsert({
         where: { key: 'wc_consumer_key' },
-        create: { key: 'wc_consumer_key', value: key },
-        update: { value: key },
+        create: { key: 'wc_consumer_key', value: nextKey },
+        update: { value: nextKey },
       })
     }
-    if (secret && !incomingSecretIsMasked) {
+    if (nextSecret && !incomingSecretIsMasked) {
       await tx.setting.upsert({
         where: { key: 'wc_consumer_secret' },
-        create: { key: 'wc_consumer_secret', value: serializeSettingValue('wc_consumer_secret', secret) },
-        update: { value: serializeSettingValue('wc_consumer_secret', secret) },
+        create: { key: 'wc_consumer_secret', value: serializeSettingValue('wc_consumer_secret', nextSecret) },
+        update: { value: serializeSettingValue('wc_consumer_secret', nextSecret) },
       })
     }
 
@@ -311,7 +314,11 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     metadata: { isRebind: saveOutcome.isRebind, wipedMappings: saveOutcome.wipedMappings },
   })
   revalidatePath('/sync')
-  return { success: true, wipedMappings: saveOutcome.wipedMappings }
+  return {
+    success: true,
+    wipedMappings: saveOutcome.wipedMappings,
+    message: `Connection verified against WooCommerce (${currencyValidation.storeCurrency}).`,
+  }
 }
 
 /**

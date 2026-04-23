@@ -87,6 +87,72 @@ export async function saveQuickBooksSettings(data: Partial<QuickBooksSettings>):
   }
 }
 
+export async function saveQuickBooksConnectionSettings(
+  clientId: string,
+  clientSecret: string,
+): Promise<{ success: boolean; error?: string; message?: string }> {
+  try {
+    await requireAdmin()
+
+    const nextClientId = clientId.trim()
+    const nextClientSecretInput = clientSecret.trim()
+    const nextClientSecret = nextClientSecretInput.includes('****') ? '' : nextClientSecretInput
+    const existingSettings = await getQuickBooksSettings()
+    const resolvedSecret = nextClientSecret || existingSettings.quickbooks_client_secret.trim()
+
+    if (!nextClientId) {
+      return { success: false, error: 'QuickBooks Client ID is required.' }
+    }
+
+    if (!resolvedSecret) {
+      return { success: false, error: 'QuickBooks Client Secret is required.' }
+    }
+
+    const publicAppUrl = await getPublicAppUrl()
+    if (!publicAppUrl) {
+      return { success: false, error: 'Public app URL is not configured.' }
+    }
+
+    const redirectUri = new URL('/api/accounting/callback', publicAppUrl).toString()
+    if (!redirectUri) {
+      return { success: false, error: 'QuickBooks redirect URL is invalid.' }
+    }
+
+    const ops = [
+      db.setting.upsert({
+        where: { key: 'quickbooks_client_id' },
+        create: { key: 'quickbooks_client_id', value: serializeSettingValue('quickbooks_client_id', nextClientId) },
+        update: { value: serializeSettingValue('quickbooks_client_id', nextClientId) },
+      }),
+    ]
+
+    if (nextClientSecret) {
+      ops.push(
+        db.setting.upsert({
+          where: { key: 'quickbooks_client_secret' },
+          create: { key: 'quickbooks_client_secret', value: serializeSettingValue('quickbooks_client_secret', nextClientSecret) },
+          update: { value: serializeSettingValue('quickbooks_client_secret', nextClientSecret) },
+        }),
+      )
+    }
+
+    await db.$transaction(ops)
+
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'quickbooks_connection_settings_updated',
+      tag: 'sync',
+      description: 'Updated QuickBooks connection settings',
+    })
+
+    revalidatePath('/sync')
+    revalidatePath('/onboarding')
+    return { success: true, message: 'Connection settings saved. OAuth redirect is ready.' }
+  } catch (error) {
+    return { success: false, error: String(error) }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------

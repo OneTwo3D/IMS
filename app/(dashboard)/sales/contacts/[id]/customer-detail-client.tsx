@@ -12,6 +12,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { anonymiseCustomer, type CustomerDetail, type AddressData } from '@/app/actions/customers'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { formatCountryDisplay } from '@/lib/countries'
 import { formatMoney } from '@/lib/utils'
 
 const STATUS_LABELS: Record<string, string> = {
@@ -52,7 +53,7 @@ function fmtDate(iso: string): string {
 
 function formatAddr(a: AddressData | null): string {
   if (!a) return '—'
-  return [a.line1, a.line2, a.city, a.county, a.postcode, a.country].filter(Boolean).join(', ') || '—'
+  return [a.line1, a.line2, a.city, a.county, a.postcode, formatCountryDisplay(a.country)].filter(Boolean).join(', ') || '—'
 }
 
 function GdprDialog({ customer, onClose }: { customer: CustomerDetail; onClose: () => void }) {

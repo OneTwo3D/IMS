@@ -9,11 +9,13 @@ import {
   getShoppingConnectors,
 } from '@/app/actions/company'
 import { getCurrencies } from '@/app/actions/currencies'
+import { requireAuth } from '@/lib/auth/server'
 import { CompanySettingsClient } from './company-client'
 
 export const metadata: Metadata = { title: 'Company Settings' }
 
 export default async function CompanySettingsPage() {
+  const session = await requireAuth()
   const [org, baseCurrencySettings, numbering, email, branding, templates, shoppingConnectors, currencies] = await Promise.all([
     getOrganisation(),
     getBaseCurrencySettings(),
@@ -35,6 +37,7 @@ export default async function CompanySettingsPage() {
       templates={templates}
       shoppingConnectors={shoppingConnectors}
       currencies={currencies}
+      testEmailDefault={session.user.email}
     />
   )
 }

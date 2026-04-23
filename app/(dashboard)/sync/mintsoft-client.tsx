@@ -157,7 +157,7 @@ export function MintsoftClient({ data }: Props) {
       }
 
       handleConnectionDialogOpenChange(false)
-      flashSaved('Mintsoft connection saved')
+      flashSaved(result.message ?? 'Connection verified with Mintsoft.')
       router.refresh()
     })
   }

@@ -16,8 +16,8 @@ import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow, UserOption } from '@/app/actions/settings'
 import type { StockLevelEntry } from '@/app/actions/stock'
 import { ProductLink } from '@/components/inventory/product-link'
+import { formatCountryDisplay, toIsoCountryCode } from '@/lib/countries'
 import { formatMoney } from '@/lib/utils'
-import { toIsoCountryCode } from '@/lib/countries'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 
@@ -134,7 +134,7 @@ function makeKey() { return Math.random().toString(36).slice(2) }
 
 function formatAddr(a: AddressData | null): string {
   if (!a) return ''
-  return [a.line1, a.line2, a.city, a.postcode, a.country].filter(Boolean).join(', ')
+  return [a.line1, a.line2, a.city, a.postcode, formatCountryDisplay(a.country)].filter(Boolean).join(', ')
 }
 
 export function SoFormDialog({ products, warehouses, currencies, taxRates, customers, stockLevels, avgCogs, users, currentUserName, companyHomeCountry, onClose }: Props) {

@@ -4,6 +4,7 @@ import path from 'path'
 import sharp from 'sharp'
 import { requireAdmin } from '@/lib/auth/server'
 import { db } from '@/lib/db'
+import { DEFAULT_BASE_CURRENCY } from '@/lib/base-currency'
 
 // SVG deliberately omitted — SVGs can embed scripts and foreign content.
 const MIME_TO_EXT: Record<string, string> = {
@@ -68,6 +69,17 @@ export async function POST(req: NextRequest) {
   await writeFile(filePath, outputBuffer)
 
   const url = `/api/uploads/branding/${filename}?t=${Date.now()}`
+
+  const existingOrg = await db.organisation.findFirst({ select: { id: true } })
+  if (!existingOrg) {
+    await db.organisation.create({
+      data: {
+        name: 'onetwoInventory',
+        country: 'GB',
+        baseCurrency: DEFAULT_BASE_CURRENCY,
+      },
+    })
+  }
 
   if (variant === 'document') {
     await db.organisation.updateMany({ data: { documentLogoUrl: url } })

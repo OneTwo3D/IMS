@@ -4,8 +4,10 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
-import { getSettingValues, serializeSettingValue } from '@/lib/settings-store'
+import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/settings-store'
 import { DEFAULT_BASE_CURRENCY, getFallbackCurrencyMeta, isBaseCurrencyLocked } from '@/lib/base-currency'
+import { toIsoCountryCode } from '@/lib/countries'
+import { sendEmailWithSmtpSettings } from '@/lib/mailer'
 
 // ---------------------------------------------------------------------------
 // Organisation
@@ -58,10 +60,30 @@ export async function getBaseCurrencySettings(): Promise<{ locked: boolean }> {
   return { locked: await isBaseCurrencyLocked() }
 }
 
+async function ensureOrganisationExists(): Promise<void> {
+  const existing = await db.organisation.findFirst({ select: { id: true } })
+  if (existing) return
+
+  await db.organisation.create({
+    data: {
+      name: 'onetwoInventory',
+      country: 'GB',
+      baseCurrency: DEFAULT_BASE_CURRENCY,
+    },
+  })
+}
+
 export async function updateOrganisation(data: Partial<OrganisationData>): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
   try {
     const updateData = { ...data }
+    if (updateData.country !== undefined && updateData.country !== null) {
+      const normalizedCountry = toIsoCountryCode(updateData.country)
+      if (!normalizedCountry) {
+        return { success: false, error: 'Select a valid country.' }
+      }
+      updateData.country = normalizedCountry
+    }
     const existingOrg = await db.organisation.findFirst({ select: { baseCurrency: true } })
 
     if (updateData.baseCurrency) {
@@ -88,6 +110,7 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
       updateData.baseCurrency = code
     }
 
+    await ensureOrganisationExists()
     await db.organisation.updateMany({ data: updateData })
     if (updateData.baseCurrency) {
       await db.setting.upsert({
@@ -109,6 +132,7 @@ export async function updateOrganisation(data: Partial<OrganisationData>): Promi
 
 export async function updateLogoUrl(logoUrl: string | null): Promise<{ success: boolean }> {
   await requirePermission('settings.company')
+  await ensureOrganisationExists()
   await db.organisation.updateMany({ data: { logoUrl } })
   await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: logoUrl ? 'Updated company logo' : 'Removed company logo' })
   revalidatePath('/settings')
@@ -296,6 +320,68 @@ export async function saveEmailSettings(data: EmailSettings): Promise<{ success:
   await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated email/SMTP settings' })
   revalidatePath('/settings/company')
   return { success: true }
+}
+
+export async function sendTestEmailSettings(
+  data: EmailSettings,
+  recipientEmail: string,
+): Promise<{ success: boolean; message?: string; error?: string }> {
+  await requirePermission('settings.company')
+
+  const storedPassword = data.smtp_pass.endsWith('***')
+    ? (await getSettingValue('email_smtp_pass')) ?? ''
+    : data.smtp_pass
+
+  const result = await sendEmailWithSmtpSettings(
+    {
+      host: data.smtp_host,
+      port: data.smtp_port,
+      user: data.smtp_user,
+      pass: storedPassword,
+      secure: data.smtp_secure,
+      fromName: data.from_name,
+      fromEmail: data.from_email,
+      replyTo: data.reply_to,
+    },
+    {
+      to: recipientEmail,
+      subject: 'SMTP test email',
+      html: `
+        <div style="font-family: Arial, sans-serif; line-height: 1.5; color: #111827;">
+          <h1 style="font-size: 18px; margin: 0 0 12px;">SMTP test successful</h1>
+          <p style="margin: 0 0 12px;">
+            This message confirms the SMTP settings entered in Company Settings can send mail from this IMS instance.
+          </p>
+          <p style="margin: 0;">
+            Sent to <strong>${recipientEmail}</strong> at ${new Date().toISOString()}.
+          </p>
+        </div>
+      `,
+    },
+  )
+
+  if (!result.success) {
+    await logActivity({
+      entityType: 'SETTING',
+      tag: 'settings',
+      action: 'updated',
+      level: 'ERROR',
+      description: `SMTP test failed for ${recipientEmail}: ${result.error ?? 'Unknown error'}`,
+    })
+    return { success: false, error: result.error ?? 'Failed to send test email.' }
+  }
+
+  await logActivity({
+    entityType: 'SETTING',
+    tag: 'settings',
+    action: 'updated',
+    description: `Sent SMTP test email to ${recipientEmail}`,
+  })
+
+  return {
+    success: true,
+    message: `Test email sent to ${recipientEmail}.`,
+  }
 }
 
 // ---------------------------------------------------------------------------

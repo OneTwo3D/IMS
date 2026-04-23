@@ -37,6 +37,14 @@ export function countryName(code: string | null | undefined): string {
   return COUNTRIES[code.toUpperCase()] ?? code
 }
 
+/** Format any stored country value for display, preferring the full country name. */
+export function formatCountryDisplay(input: string | null | undefined): string {
+  if (!input) return ''
+  const iso = toIsoCountryCode(input)
+  if (iso) return countryName(iso)
+  return input.trim()
+}
+
 /** Convert ISO-2 country code to emoji flag (Regional Indicator Symbol pairs). */
 export function countryFlag(code: string | null | undefined): string {
   if (!code || code.length !== 2) return ''

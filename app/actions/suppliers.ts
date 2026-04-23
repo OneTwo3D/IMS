@@ -6,6 +6,7 @@ import { parseCsv } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { toIsoCountryCode } from '@/lib/countries'
 import {
   createCsvImportExecutionResult,
   createCsvImportPreviewResult,
@@ -200,6 +201,7 @@ export async function createSupplier(input: SupplierInput): Promise<{ success: b
   await requirePermission('purchasing.create')
   try {
     const baseCurrency = await getBaseCurrencyCode()
+    const normalizedCountry = input.country ? (toIsoCountryCode(input.country) ?? input.country.trim()) : null
     const s = await db.supplier.create({
       data: {
         name: input.name,
@@ -211,7 +213,7 @@ export async function createSupplier(input: SupplierInput): Promise<{ success: b
         city: input.city || null,
         county: input.county || null,
         postcode: input.postcode || null,
-        country: input.country || null,
+        country: normalizedCountry,
         currency: input.currency || baseCurrency,
         taxRateId: input.taxRateId || null,
         vatNumber: input.vatNumber || null,
@@ -234,6 +236,9 @@ export async function createSupplier(input: SupplierInput): Promise<{ success: b
 export async function updateSupplier(id: string, input: Partial<SupplierInput> & { active?: boolean }): Promise<{ success: boolean; supplier?: SupplierRow; error?: string }> {
   await requirePermission('purchasing.create')
   try {
+    const normalizedCountry = input.country !== undefined
+      ? (input.country ? (toIsoCountryCode(input.country) ?? input.country.trim()) : null)
+      : undefined
     const s = await db.supplier.update({
       where: { id },
       data: {
@@ -246,7 +251,7 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
         ...(input.city !== undefined && { city: input.city || null }),
         ...(input.county !== undefined && { county: input.county || null }),
         ...(input.postcode !== undefined && { postcode: input.postcode || null }),
-        ...(input.country !== undefined && { country: input.country || null }),
+        ...(normalizedCountry !== undefined && { country: normalizedCountry }),
         ...(input.currency !== undefined && { currency: input.currency }),
         ...(input.taxRateId !== undefined && { taxRateId: input.taxRateId || null }),
         ...(input.vatNumber !== undefined && { vatNumber: input.vatNumber || null }),
@@ -344,7 +349,7 @@ export async function importSuppliersCsv(formData: FormData): Promise<CsvImportA
                 ...(r.city?.trim() ? { city: r.city.trim() } : {}),
                 ...(r.county?.trim() ? { county: r.county.trim() } : {}),
                 ...(r.postcode?.trim() ? { postcode: r.postcode.trim() } : {}),
-                ...(r.country?.trim() ? { country: r.country.trim() } : {}),
+                ...(r.country?.trim() ? { country: toIsoCountryCode(r.country.trim()) ?? r.country.trim() } : {}),
                 ...(r.notes?.trim() ? { notes: r.notes.trim() } : {}),
               },
             })
@@ -367,7 +372,7 @@ export async function importSuppliersCsv(formData: FormData): Promise<CsvImportA
                 city: r.city?.trim() || null,
                 county: r.county?.trim() || null,
                 postcode: r.postcode?.trim() || null,
-                country: r.country?.trim() || null,
+                country: r.country?.trim() ? (toIsoCountryCode(r.country.trim()) ?? r.country.trim()) : null,
                 notes: r.notes?.trim() || null,
               },
             })

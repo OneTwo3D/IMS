@@ -37,6 +37,8 @@ export type AccountingConnectionStatus = {
   tenantName?: string
 }
 
+export type AccountingConnectorId = 'xero' | 'quickbooks'
+
 export type AccountingSyncReadiness = {
   ready: boolean
   notConnected: boolean
@@ -44,7 +46,9 @@ export type AccountingSyncReadiness = {
   missingTaxTypes: Array<{ id: string; name: string }>
 }
 
-async function getActiveConnector(): Promise<'xero' | 'quickbooks' | null> {
+async function getActiveConnector(preferredConnector?: AccountingConnectorId): Promise<AccountingConnectorId | null> {
+  if (preferredConnector === 'xero' && await isIntegrationPluginEnabled('xero')) return 'xero'
+  if (preferredConnector === 'quickbooks' && await isIntegrationPluginEnabled('quickbooks')) return 'quickbooks'
   if (await isIntegrationPluginEnabled('xero')) return 'xero'
   if (await isIntegrationPluginEnabled('quickbooks')) return 'quickbooks'
   return null
@@ -90,6 +94,27 @@ export async function saveAccountingSettings(data: Record<string, string>): Prom
   }
 }
 
+export async function saveAccountingConnectionSettings(
+  clientId: string,
+  clientSecret: string,
+  preferredConnector?: AccountingConnectorId,
+): Promise<{ success: boolean; error?: string; message?: string }> {
+  const connector = await getActiveConnector(preferredConnector)
+  if (!connector) {
+    return { success: false, error: 'Enable Xero or QuickBooks first.' }
+  }
+  switch (connector) {
+    case 'quickbooks': {
+      const { saveQuickBooksConnectionSettings } = await import('@/app/actions/quickbooks-sync')
+      return saveQuickBooksConnectionSettings(clientId, clientSecret)
+    }
+    default: {
+      const { saveXeroConnectionSettings } = await import('@/app/actions/xero-sync')
+      return saveXeroConnectionSettings(clientId, clientSecret)
+    }
+  }
+}
+
 export async function getAccountingConnectionStatus(): Promise<AccountingConnectionStatus> {
   const connector = await getActiveConnector()
   switch (connector) {
@@ -109,8 +134,12 @@ export async function connectAccountingConnector(
   clientSecret: string,
   origin: string,
   returnPath?: string,
+  preferredConnector?: AccountingConnectorId,
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
-  const connector = await getActiveConnector()
+  const connector = await getActiveConnector(preferredConnector)
+  if (!connector) {
+    return { success: false, error: 'Enable Xero or QuickBooks first.' }
+  }
   switch (connector) {
     case 'quickbooks': {
       const { connectQuickBooks } = await import('@/app/actions/quickbooks-sync')

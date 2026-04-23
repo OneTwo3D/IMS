@@ -31,7 +31,7 @@ import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { calculateCoverageByLine } from '@/lib/products/fulfillment-coverage'
 import { formatMoney } from '@/lib/utils'
 import { getTrackingUrl } from '@/lib/tracking'
-import { countryName } from '@/lib/countries'
+import { countryName, formatCountryDisplay } from '@/lib/countries'
 
 type WarehouseInfo = { id: string; code: string; name: string }
 type Props = {
@@ -1357,7 +1357,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
               </div>
               <div className="sm:col-span-2">
                 <span className="text-muted-foreground text-xs">Billing Address</span>
-                <p className="text-xs mt-0.5">{so.billingAddress ? (() => { const a = so.billingAddress as Record<string, string>; return [a.line1, a.line2, a.city, a.county, a.postcode, a.country].filter(Boolean).join(', ') || '—' })() : '—'}</p>
+                <p className="text-xs mt-0.5">{so.billingAddress ? (() => { const a = so.billingAddress as Record<string, string>; return [a.line1, a.line2, a.city, a.county, a.postcode, formatCountryDisplay(a.country)].filter(Boolean).join(', ') || '—' })() : '—'}</p>
               </div>
             </div>
 

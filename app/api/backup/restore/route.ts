@@ -14,6 +14,7 @@ import { getBackupDir } from '@/lib/backup-storage'
 import { disableMaintenanceMode, enableMaintenanceMode } from '@/lib/maintenance-mode'
 import { sendEmail } from '@/lib/mailer'
 import { consumeAuthToken, setAuthToken } from '@/lib/auth/token-store'
+import { db } from '@/lib/db'
 
 const BACKUP_DIR = getBackupDir()
 const RESTORE_TOKEN_TTL_MS = 5 * 60_000
@@ -148,14 +149,19 @@ async function runRestore(filePath: string, db: ReturnType<typeof getDbConfig>):
 export async function GET() {
   const session = await requireApiAdmin()
   if (session instanceof NextResponse) return session
-  if (!session.user.email) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 403 })
+  const user = await db.user.findUnique({
+    where: { id: session.user.id },
+    select: { email: true },
+  })
+  const email = user?.email?.trim().toLowerCase()
+  if (!email) {
+    return NextResponse.json({ error: 'Your user account does not have an email address configured.' }, { status: 400 })
   }
 
   const restoreToken = randomBytes(4).toString('hex').toUpperCase()
   await setAuthToken(`backup_restore:${restoreToken}`, session.user.id, RESTORE_TOKEN_TTL_MS)
   const mail = await sendEmail({
-    to: session.user.email,
+    to: email,
     subject: 'Backup restore confirmation code',
     html: formatRestoreEmail(restoreToken),
   })
@@ -163,7 +169,7 @@ export async function GET() {
     return NextResponse.json({ error: mail.error ?? 'Failed to send restore confirmation email.' }, { status: 500 })
   }
 
-  return NextResponse.json({ success: true, email: session.user.email, expiresInSec: RESTORE_TOKEN_TTL_MS / 1000 })
+  return NextResponse.json({ success: true, email, expiresInSec: RESTORE_TOKEN_TTL_MS / 1000 })
 }
 
 export async function POST(req: NextRequest) {

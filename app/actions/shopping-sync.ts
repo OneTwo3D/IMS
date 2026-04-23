@@ -25,6 +25,7 @@ import {
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
+import { shopifyGraphql } from '@/lib/connectors/shopify/api'
 import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/settings-store'
 import { getActiveShoppingConnectorInfo, syncShoppingConnectorStock } from '@/lib/shopping'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
@@ -53,6 +54,26 @@ export type ShopifyConnectorCredentials = {
 const SHOPIFY_SYNC_SETTING_KEYS = ['shopify_sync_enabled'] as const
 const SHOPIFY_SYNC_DEFAULTS: ShopifySyncSettings = {
   shopify_sync_enabled: 'false',
+}
+
+type ShopifyConnectionTestResponse = {
+  shop: {
+    name: string
+    myshopifyDomain: string
+  } | null
+}
+
+function normalizeShopifyStoreDomain(value: string): string | null {
+  const trimmed = value.trim()
+  if (!trimmed) return null
+
+  try {
+    const withProtocol = /^[a-z]+:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
+    const url = new URL(withProtocol)
+    return url.hostname.toLowerCase() || null
+  } catch {
+    return null
+  }
 }
 
 async function requireShoppingAdmin() {
@@ -217,11 +238,11 @@ export async function saveShopifyConnectorCredentials(
   storeDomain: string,
   adminApiAccessToken: string,
   webhookSecret: string,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; message?: string }> {
   await requireShoppingAdmin()
 
-  const trimmedDomain = storeDomain.trim()
-  if (!trimmedDomain) {
+  const normalizedDomain = normalizeShopifyStoreDomain(storeDomain)
+  if (!normalizedDomain) {
     return { success: false, error: 'Store domain is required' }
   }
 
@@ -238,11 +259,32 @@ export async function saveShopifyConnectorCredentials(
     return { success: false, error: 'Admin API access token is required' }
   }
 
+  const connectionTest = await shopifyGraphql<ShopifyConnectionTestResponse>(
+    'query ShopifyConnectionTest { shop { name myshopifyDomain } }',
+    undefined,
+    {
+      url: `https://${normalizedDomain}`,
+      key: nextToken,
+      secret: (currentWebhookSecret ?? '').trim(),
+      storeDomain: normalizedDomain,
+      adminApiAccessToken: nextToken,
+      webhookSecret: (currentWebhookSecret ?? '').trim(),
+    },
+  )
+
+  if (connectionTest.error) {
+    return { success: false, error: connectionTest.error }
+  }
+
+  if (!connectionTest.data?.shop) {
+    return { success: false, error: 'Shopify did not return shop details for these credentials.' }
+  }
+
   await db.$transaction([
     db.setting.upsert({
       where: { key: 'shopify_store_domain' },
-      create: { key: 'shopify_store_domain', value: trimmedDomain },
-      update: { value: trimmedDomain },
+      create: { key: 'shopify_store_domain', value: normalizedDomain },
+      update: { value: normalizedDomain },
     }),
     db.setting.upsert({
       where: { key: 'shopify_admin_api_access_token' },
@@ -271,11 +313,14 @@ export async function saveShopifyConnectorCredentials(
     tag: 'settings',
     action: 'updated',
     description: 'Updated Shopify connector credentials',
-    metadata: { storeDomain: trimmedDomain },
+    metadata: { storeDomain: normalizedDomain },
   })
 
   revalidatePath('/sync')
-  return { success: true }
+  return {
+    success: true,
+    message: `Connection verified for ${connectionTest.data.shop.name || connectionTest.data.shop.myshopifyDomain}.`,
+  }
 }
 
 export async function getShopifySyncLogs(limit = 50): Promise<ShoppingSyncLogRow[]> {

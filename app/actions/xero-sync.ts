@@ -101,6 +101,72 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
   }
 }
 
+export async function saveXeroConnectionSettings(
+  clientId: string,
+  clientSecret: string,
+): Promise<{ success: boolean; error?: string; message?: string }> {
+  try {
+    await requireAdmin()
+
+    const nextClientId = clientId.trim()
+    const nextClientSecretInput = clientSecret.trim()
+    const nextClientSecret = nextClientSecretInput.includes('****') ? '' : nextClientSecretInput
+    const existingSettings = await getXeroSettings()
+    const resolvedSecret = nextClientSecret || existingSettings.xero_client_secret.trim()
+
+    if (!nextClientId) {
+      return { success: false, error: 'Xero Client ID is required.' }
+    }
+
+    if (!resolvedSecret) {
+      return { success: false, error: 'Xero Client Secret is required.' }
+    }
+
+    const publicAppUrl = await getPublicAppUrl()
+    if (!publicAppUrl) {
+      return { success: false, error: 'Public app URL is not configured.' }
+    }
+
+    const redirectUri = new URL('/api/accounting/callback', publicAppUrl).toString()
+    if (!redirectUri) {
+      return { success: false, error: 'Xero redirect URL is invalid.' }
+    }
+
+    const ops = [
+      db.setting.upsert({
+        where: { key: 'xero_client_id' },
+        create: { key: 'xero_client_id', value: serializeSettingValue('xero_client_id', nextClientId) },
+        update: { value: serializeSettingValue('xero_client_id', nextClientId) },
+      }),
+    ]
+
+    if (nextClientSecret) {
+      ops.push(
+        db.setting.upsert({
+          where: { key: 'xero_client_secret' },
+          create: { key: 'xero_client_secret', value: serializeSettingValue('xero_client_secret', nextClientSecret) },
+          update: { value: serializeSettingValue('xero_client_secret', nextClientSecret) },
+        }),
+      )
+    }
+
+    await db.$transaction(ops)
+
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_connection_settings_updated',
+      tag: 'sync',
+      description: 'Updated Xero connection settings',
+    })
+
+    revalidatePath('/sync')
+    revalidatePath('/onboarding')
+    return { success: true, message: 'Connection settings saved. OAuth redirect is ready.' }
+  } catch (error) {
+    return { success: false, error: String(error) }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Connection
 // ---------------------------------------------------------------------------

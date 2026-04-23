@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { Pencil, Trash2, Plus, Loader2, Warehouse } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { CountrySelect } from '@/components/ui/country-select'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import {
@@ -205,7 +206,7 @@ function WarehouseDialog({
               </div>
               <div className="space-y-1">
                 <Label className="text-xs">Country</Label>
-                <Input value={fields.country} onChange={(e) => set('country', e.target.value.toUpperCase())} className="h-8 text-sm" />
+                <CountrySelect value={fields.country} onChange={(value) => set('country', value)} allowBlank={false} className="h-8 text-sm" />
               </div>
             </div>
           </fieldset>

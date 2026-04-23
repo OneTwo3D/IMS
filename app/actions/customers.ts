@@ -6,6 +6,7 @@ import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
+import { toIsoCountryCode } from '@/lib/countries'
 import {
   createCsvImportExecutionResult,
   createCsvImportPreviewResult,
@@ -76,7 +77,28 @@ function mergeImportedAddress(
       touched = true
     }
   }
+  if (merged.country) {
+    merged.country = toIsoCountryCode(merged.country) ?? merged.country
+  }
   return touched ? merged : undefined
+}
+
+function normalizeAddress(address: AddressData | null | undefined): AddressData | Prisma.InputJsonValue | typeof Prisma.JsonNull {
+  if (!address) return Prisma.JsonNull
+
+  const normalized: AddressData = {}
+  for (const [key, value] of Object.entries(address)) {
+    if (typeof value !== 'string') continue
+    const trimmed = value.trim()
+    if (!trimmed) continue
+    if (key === 'country') {
+      normalized.country = toIsoCountryCode(trimmed) ?? trimmed
+      continue
+    }
+    normalized[key as keyof AddressData] = trimmed
+  }
+
+  return Object.keys(normalized).length > 0 ? normalized : Prisma.JsonNull
 }
 
 const REVENUE_STATUSES = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'])
@@ -239,8 +261,8 @@ export async function createCustomer(input: CustomerInput): Promise<{ success: b
         phone: input.phone || null,
         company: input.company || null,
         taxNumber: input.taxNumber || null,
-        billingAddress: input.billingAddress ?? Prisma.JsonNull,
-        shippingAddress: input.shippingAddress ?? Prisma.JsonNull,
+        billingAddress: normalizeAddress(input.billingAddress),
+        shippingAddress: normalizeAddress(input.shippingAddress),
         notes: input.notes || null,
       },
       include: { _count: { select: { salesOrders: true } } },
@@ -267,8 +289,8 @@ export async function updateCustomer(id: string, input: Partial<CustomerInput> &
         ...(input.phone !== undefined && { phone: input.phone || null }),
         ...(input.company !== undefined && { company: input.company || null }),
         ...(input.taxNumber !== undefined && { taxNumber: input.taxNumber || null }),
-        ...(input.billingAddress !== undefined && { billingAddress: input.billingAddress ?? Prisma.JsonNull }),
-        ...(input.shippingAddress !== undefined && { shippingAddress: input.shippingAddress ?? Prisma.JsonNull }),
+        ...(input.billingAddress !== undefined && { billingAddress: normalizeAddress(input.billingAddress) }),
+        ...(input.shippingAddress !== undefined && { shippingAddress: normalizeAddress(input.shippingAddress) }),
         ...(input.notes !== undefined && { notes: input.notes || null }),
         ...(input.active !== undefined && { active: input.active }),
       },

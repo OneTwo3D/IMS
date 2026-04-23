@@ -12,6 +12,7 @@ import {
   pdfToBuffer,
   type PdfTableColumn,
 } from '@/lib/pdf'
+import { formatCountryDisplay } from '@/lib/countries'
 import { expandFulfillmentRequirements, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
@@ -70,7 +71,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   // Build recipient from shipping address
   const addr = so.shippingAddress as Record<string, string> | null
   const recipientAddr = addr
-    ? [addr.line1, addr.line2, addr.city, addr.postcode, addr.country].filter(Boolean).join('\n')
+    ? [addr.line1, addr.line2, addr.city, addr.postcode, formatCountryDisplay(addr.country)].filter(Boolean).join('\n')
     : ''
   const date = so.createdAt.toLocaleDateString('en-GB', { day: 'numeric', month: 'long', year: 'numeric' })
 

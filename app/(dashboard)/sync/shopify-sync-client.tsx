@@ -56,13 +56,15 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
   const [syncEnabled, setSyncEnabled] = useState(initialSettings.shopify_sync_enabled === 'true')
   const [saveMessage, setSaveMessage] = useState<string | null>(null)
   const [saveError, setSaveError] = useState(false)
+  const [settingsMessage, setSettingsMessage] = useState<string | null>(null)
+  const [settingsError, setSettingsError] = useState(false)
   const [syncMessage, setSyncMessage] = useState<string | null>(null)
   const [syncError, setSyncError] = useState(false)
   const [copied, setCopied] = useState(false)
   const configured = !!storeDomain && !!accessToken
   const webhookPreview = webhookSecret && !webhookSecret.includes('*') ? webhookSecret : ''
 
-  function handleSave() {
+  function handleSaveConnection() {
     setSaveMessage(null)
     setSaveError(false)
 
@@ -78,16 +80,26 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
         return
       }
 
+      setSaveMessage(credentialResult.message ?? 'Connection verified and saved.')
+      router.refresh()
+    })
+  }
+
+  function handleSaveSettings() {
+    setSettingsMessage(null)
+    setSettingsError(false)
+
+    startTransition(async () => {
       const settingsResult = await saveShopifySyncSettings({
         shopify_sync_enabled: String(syncEnabled),
       })
       if (!settingsResult.success) {
-        setSaveError(true)
-        setSaveMessage(settingsResult.error ?? 'Failed to save Shopify settings')
+        setSettingsError(true)
+        setSettingsMessage(settingsResult.error ?? 'Failed to save Shopify settings')
         return
       }
 
-      setSaveMessage('Shopify settings saved')
+      setSettingsMessage('Shopify settings saved')
       router.refresh()
     })
   }
@@ -174,6 +186,34 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
           </div>
         </div>
 
+        {configured && (
+          <p className="text-xs text-green-600 flex items-center gap-1">
+            <Check className="h-3 w-3" />
+            Configured for {storeDomain}
+          </p>
+        )}
+
+        <div className="flex items-center gap-2">
+          <Button onClick={handleSaveConnection} disabled={isPending}>
+            {isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+            Save Connection
+          </Button>
+          {saveMessage && (
+            <span className={`text-sm ${saveError ? 'text-destructive' : 'text-green-600'}`}>
+              {saveMessage}
+            </span>
+          )}
+        </div>
+      </Card>
+
+      <Card className="p-6 space-y-4">
+        <div>
+          <h2 className="text-base font-semibold">Sync Settings</h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Control whether IMS pushes stock updates to Shopify.
+          </p>
+        </div>
+
         <label className="flex items-center gap-2 text-sm">
           <input
             type="checkbox"
@@ -184,21 +224,14 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
           Enable Shopify stock sync
         </label>
 
-        {configured && (
-          <p className="text-xs text-green-600 flex items-center gap-1">
-            <Check className="h-3 w-3" />
-            Configured for {storeDomain}
-          </p>
-        )}
-
         <div className="flex items-center gap-2">
-          <Button onClick={handleSave} disabled={isPending}>
+          <Button onClick={handleSaveSettings} disabled={isPending}>
             {isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
-            Save Shopify Settings
+            Save Settings
           </Button>
-          {saveMessage && (
-            <span className={`text-sm ${saveError ? 'text-destructive' : 'text-green-600'}`}>
-              {saveMessage}
+          {settingsMessage && (
+            <span className={`text-sm ${settingsError ? 'text-destructive' : 'text-green-600'}`}>
+              {settingsMessage}
             </span>
           )}
         </div>

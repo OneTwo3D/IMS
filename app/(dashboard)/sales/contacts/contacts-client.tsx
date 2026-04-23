@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import { Plus, Pencil, X, Check, Loader2, Search, ShieldAlert, Settings2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { CountrySelect } from '@/components/ui/country-select'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
@@ -13,6 +14,7 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { createCustomer, updateCustomer, importContactsCsv, anonymiseCustomer, type CustomerRow, type CustomerInput, type AddressData } from '@/app/actions/customers'
 import { CsvBar } from '@/components/ui/csv-bar'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { formatCountryDisplay } from '@/lib/countries'
 import { formatMoney } from '@/lib/utils'
 
 // ---------------------------------------------------------------------------
@@ -52,7 +54,7 @@ function defaultVisibility(): Record<ColKey, boolean> {
 
 function formatAddr(a: AddressData | null): string {
   if (!a) return '—'
-  return [a.line1, a.line2, a.city, a.postcode, a.country].filter(Boolean).join(', ') || '—'
+  return [a.line1, a.line2, a.city, a.postcode, formatCountryDisplay(a.country)].filter(Boolean).join(', ') || '—'
 }
 
 function fmtDate(iso: string | null): string {
@@ -76,7 +78,7 @@ function AddressFields({ label, value, onChange, disabled }: { label: string; va
         <Input value={value.county ?? ''} onChange={(e) => set('county', e.target.value)} placeholder="County" className="h-8 text-sm" disabled={disabled} />
         <Input value={value.postcode ?? ''} onChange={(e) => set('postcode', e.target.value)} placeholder="Postcode" className="h-8 text-sm" disabled={disabled} />
       </div>
-      <Input value={value.country ?? ''} onChange={(e) => set('country', e.target.value)} placeholder="Country" className="h-8 text-sm" disabled={disabled} />
+      <CountrySelect value={value.country ?? ''} onChange={(country) => set('country', country)} blankLabel="Country" className="h-8 text-sm" disabled={disabled} />
     </div>
   )
 }
