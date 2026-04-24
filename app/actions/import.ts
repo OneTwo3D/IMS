@@ -9,6 +9,7 @@ import { requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { deriveLegacyActiveFromLifecycleStatus, deriveLifecycleStatusFromLegacyActive } from '@/lib/products/lifecycle'
 import { validateProductStructureChange } from '@/lib/products/type-transforms'
+import { detectComponentCycle } from '@/lib/products/component-cycle'
 import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import {
@@ -456,25 +457,12 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
     }
 
     if (components.length > 0) {
-      // Check for self-reference
-      if (components.some((c) => c.componentId === productId)) {
+      const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId))
+      if (cycle.kind === 'self') {
         result.errors.push(`Row ${cr.lineNum}: ${cr.sku} cannot be a component of itself`)
         continue
       }
-
-      // Check for circular references via BFS
-      let hasCycle = false
-      const visited = new Set<string>()
-      const queue = components.map((c) => c.componentId)
-      while (queue.length > 0) {
-        const current = queue.shift()!
-        if (current === productId) { hasCycle = true; break }
-        if (visited.has(current)) continue
-        visited.add(current)
-        const children = await db.productComponent.findMany({ where: { productId: current }, select: { componentId: true } })
-        for (const child of children) queue.push(child.componentId)
-      }
-      if (hasCycle) {
+      if (cycle.kind === 'cycle') {
         result.errors.push(`Row ${cr.lineNum}: circular BOM reference detected for ${cr.sku}`)
         continue
       }

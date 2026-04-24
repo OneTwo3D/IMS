@@ -21,6 +21,7 @@ import {
 import {
   validateProductStructureChange,
 } from '@/lib/products/type-transforms'
+import { detectComponentCycle } from '@/lib/products/component-cycle'
 import type { ProductLifecycleStatus, TaxCategory } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -1108,51 +1109,18 @@ export async function checkProductComponentDuplicates(
   }
 }
 
-/**
- * Detect circular references in the component graph.
- * Returns the cycle path if found, or null if safe.
- */
-async function detectComponentCycle(
-  productId: string,
-  newComponentIds: string[],
-): Promise<string | null> {
-  // BFS: starting from each new component, walk its existing components to see if we reach productId
-  const visited = new Set<string>()
-  const queue = [...newComponentIds]
-
-  while (queue.length > 0) {
-    const current = queue.shift()!
-    if (current === productId) return productId // cycle detected
-    if (visited.has(current)) continue
-    visited.add(current)
-
-    // Fetch this product's existing components
-    const children = await db.productComponent.findMany({
-      where: { productId: current },
-      select: { componentId: true },
-    })
-    for (const child of children) {
-      if (child.componentId === productId) return current // cycle: child points back to original
-      queue.push(child.componentId)
-    }
-  }
-  return null
-}
-
 export async function saveProductComponents(
   productId: string,
   components: { componentId: string; qty: string }[]
 ): Promise<{ success: boolean; error?: string; warnings?: ProductComponentDuplicateMatch[] }> {
   try {
     await requirePermission('inventory.edit')
-    // Check for self-reference
-    if (components.some((c) => c.componentId === productId)) {
+
+    const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId))
+    if (cycle.kind === 'self') {
       return { success: false, error: 'A product cannot be a component of itself' }
     }
-
-    // Check for circular references
-    const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId))
-    if (cycle) {
+    if (cycle.kind === 'cycle') {
       return { success: false, error: 'Circular reference detected — a component eventually references this product' }
     }
 
