@@ -2,6 +2,7 @@
  * Bidirectional product sync between WooCommerce and IMS.
  */
 
+import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { decryptSecret } from '@/lib/secrets'
@@ -19,6 +20,117 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
 
 const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
+const MANUAL_PRODUCT_SYNC_JOB_KEY = 'manual_wc_product_sync_job'
+
+export type ManualProductSyncProgress = {
+  status: 'idle' | 'running' | 'done' | 'error'
+  message: string
+  productsProcessed: number
+  productsImported: number
+  productsSkipped: number
+  totalProducts: number
+  currentPage: number
+  totalPages: number
+  errors: string[]
+}
+
+type ProductSyncProgressSnapshot = {
+  message: string
+  processed: number
+  synced: number
+  skipped: number
+  totalProducts: number
+  currentPage: number
+  totalPages: number
+  errors: string[]
+}
+
+const INITIAL_MANUAL_PRODUCT_SYNC_PROGRESS: ManualProductSyncProgress = {
+  status: 'idle',
+  message: '',
+  productsProcessed: 0,
+  productsImported: 0,
+  productsSkipped: 0,
+  totalProducts: 0,
+  currentPage: 0,
+  totalPages: 0,
+  errors: [],
+}
+
+async function saveManualProductSyncProgress(progress: ManualProductSyncProgress) {
+  await db.setting.upsert({
+    where: { key: MANUAL_PRODUCT_SYNC_JOB_KEY },
+    create: { key: MANUAL_PRODUCT_SYNC_JOB_KEY, value: JSON.stringify(progress) },
+    update: { value: JSON.stringify(progress) },
+  })
+}
+
+export async function getManualWcProductSyncProgress(): Promise<ManualProductSyncProgress> {
+  const row = await db.setting.findUnique({ where: { key: MANUAL_PRODUCT_SYNC_JOB_KEY } })
+  if (!row?.value) return INITIAL_MANUAL_PRODUCT_SYNC_PROGRESS
+  try {
+    return JSON.parse(row.value) as ManualProductSyncProgress
+  } catch {
+    return INITIAL_MANUAL_PRODUCT_SYNC_PROGRESS
+  }
+}
+
+export async function startManualWcProductSync(): Promise<void> {
+  const current = await getManualWcProductSyncProgress()
+  if (current.status === 'running') return
+
+  const progress: ManualProductSyncProgress = {
+    ...INITIAL_MANUAL_PRODUCT_SYNC_PROGRESS,
+    status: 'running',
+    message: 'Preparing WooCommerce product import...',
+  }
+  await saveManualProductSyncProgress(progress)
+
+  after(() => runManualWcProductSync(progress).catch(async (error) => {
+    progress.status = 'error'
+    progress.message = error instanceof Error ? error.message : String(error)
+    progress.errors = [...progress.errors, progress.message]
+    await saveManualProductSyncProgress(progress)
+  }))
+}
+
+async function runManualWcProductSync(progress: ManualProductSyncProgress) {
+  const result = await syncAllWcProducts({
+    mode: 'manual_reconcile',
+    onProgress: async (snapshot) => {
+      progress.status = 'running'
+      progress.message = snapshot.message
+      progress.productsProcessed = snapshot.processed
+      progress.productsImported = snapshot.synced
+      progress.productsSkipped = snapshot.skipped
+      progress.totalProducts = snapshot.totalProducts
+      progress.currentPage = snapshot.currentPage
+      progress.totalPages = snapshot.totalPages
+      progress.errors = snapshot.errors
+      await saveManualProductSyncProgress(progress)
+    },
+  })
+
+  progress.status = 'done'
+  progress.productsProcessed = Math.max(progress.productsProcessed, result.synced + result.skipped)
+  progress.productsImported = result.synced
+  progress.productsSkipped = result.skipped
+  progress.errors = result.errors
+
+  const totalProducts = progress.totalProducts || (result.synced + result.skipped)
+  if (totalProducts > 0) {
+    const parts = [`Imported ${result.synced} of ${totalProducts} product(s)`]
+    if (result.skipped > 0) parts.push(`${result.skipped} skipped`)
+    if (result.errors.length > 0) parts.push(`${result.errors.length} errors`)
+    progress.message = parts.join(' · ')
+  } else if (result.errors.length > 0) {
+    progress.message = `WooCommerce product import failed: ${result.errors[0]}`
+  } else {
+    progress.message = 'No WooCommerce products found'
+  }
+
+  await saveManualProductSyncProgress(progress)
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -601,25 +713,51 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
 // ---------------------------------------------------------------------------
 
 export async function syncAllWcProducts(
-  opts: { mode?: 'poll' | 'reconcile' | 'manual_reconcile' } = {},
+  opts: {
+    mode?: 'poll' | 'reconcile' | 'manual_reconcile'
+    onProgress?: (progress: ProductSyncProgressSnapshot) => Promise<void> | void
+  } = {},
 ): Promise<SyncResult> {
   const result: SyncResult = { synced: 0, skipped: 0, errors: [] }
   const mode = opts.mode ?? 'poll'
+  const onProgress = opts.onProgress
   const cursorKey = mode === 'poll' ? 'last_wc_product_sync_at' : 'last_wc_product_reconcile_at'
+  let totalProducts = 0
+  let processedProducts = 0
 
-  const [lastSyncSetting, existingProductCount] = await Promise.all([
+  const [lastSyncSetting, existingProduct] = await Promise.all([
     db.setting.findUnique({ where: { key: cursorKey } }),
-    db.product.count(),
+    db.product.findFirst({ select: { id: true } }),
   ])
 
   // After a product reset or on a fresh install, there is nothing local to
   // reconcile against. Ignore any stale cursor and force a full import.
-  const modifiedAfter = existingProductCount > 0 ? (lastSyncSetting?.value ?? null) : null
+  const modifiedAfter = existingProduct ? (lastSyncSetting?.value ?? null) : null
 
   let page = 1
   let totalPages = 1
 
+  async function reportProgress(message: string, currentPage = page) {
+    if (!onProgress) return
+    await onProgress({
+      message,
+      processed: processedProducts,
+      synced: result.synced,
+      skipped: result.skipped,
+      totalProducts,
+      currentPage,
+      totalPages,
+      errors: [...result.errors],
+    })
+  }
+
+  await reportProgress('Preparing WooCommerce product import...', 0)
+
   while (page <= totalPages) {
+    await reportProgress(
+      `Fetching WooCommerce products... page ${page}${totalPages > 1 ? ` / ${totalPages}` : ''}`,
+    )
+
     const params: Record<string, string> = {
       per_page: '100',
       page: String(page),
@@ -627,17 +765,41 @@ export async function syncAllWcProducts(
     }
     if (modifiedAfter) params.modified_after = modifiedAfter
 
-    const { data, totalPages: tp, error } = await wcFetch('/products', params)
-    if (error) { result.errors.push(error); break }
+    const { data, totalPages: tp, totalItems, error } = await wcFetch('/products', params)
+    if (error) {
+      result.errors.push(error)
+      await reportProgress(`Failed to fetch WooCommerce products: ${error}`)
+      break
+    }
 
     totalPages = tp
+    if (totalItems > 0) totalProducts = totalItems
     const products = data as WcFullProduct[]
+    if (totalProducts === 0) totalProducts = products.length
+
+    await reportProgress('Importing WooCommerce products...')
 
     for (const product of products) {
-      if (!product.sku) { result.skipped++; continue }
+      if (!product.sku) {
+        processedProducts++
+        result.skipped++
+        await reportProgress(
+          totalProducts > 0
+            ? `Importing WooCommerce products... ${Math.min(totalProducts, processedProducts)} / ${totalProducts} processed`
+            : 'Importing WooCommerce products...',
+        )
+        continue
+      }
       const r = await syncWcProductToIms(product)
+      processedProducts++
       if (r.success) result.synced++
       else result.errors.push(`SKU ${product.sku}: ${r.error}`)
+
+      await reportProgress(
+        totalProducts > 0
+          ? `Importing WooCommerce products... ${Math.min(totalProducts, processedProducts)} / ${totalProducts} processed`
+          : 'Importing WooCommerce products...',
+      )
     }
 
     page++

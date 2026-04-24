@@ -447,10 +447,10 @@ export async function syncNewWcOrders(
   }
 
   // Read settings
-  const [statusesSetting, lastSyncSetting, existingOrderCount] = await Promise.all([
+  const [statusesSetting, lastSyncSetting, existingOrder] = await Promise.all([
     db.setting.findUnique({ where: { key: 'wc_sync_order_statuses' } }),
     db.setting.findUnique({ where: { key: cursorKey } }),
-    db.salesOrder.count(),
+    db.salesOrder.findFirst({ select: { id: true } }),
   ])
 
   let statuses: string[]
@@ -462,7 +462,7 @@ export async function syncNewWcOrders(
 
   // After a transaction reset or on a fresh install, there is nothing local to
   // reconcile against. Ignore any stale cursor and force a full import.
-  const lastSync = existingOrderCount > 0 ? (lastSyncSetting?.value || null) : null
+  const lastSync = existingOrder ? (lastSyncSetting?.value || null) : null
 
   // Fetch orders page by page
   let page = 1

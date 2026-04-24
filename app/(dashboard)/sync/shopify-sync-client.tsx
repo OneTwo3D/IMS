@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
+import { LoadingProgress } from '@/components/ui/loading-progress'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import {
   saveShopifyConnectorCredentials,
@@ -50,6 +51,7 @@ function formatManualSyncResult(result: unknown): string {
 export function ShopifySyncClient({ settings: initialSettings, credentials, logs }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
+  const [syncPending, startSyncTransition] = useTransition()
   const [storeDomain, setStoreDomain] = useState(credentials.storeDomain)
   const [accessToken, setAccessToken] = useState(credentials.adminApiAccessToken)
   const [webhookSecret, setWebhookSecret] = useState(credentials.webhookSecret)
@@ -108,7 +110,7 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
     setSyncMessage(null)
     setSyncError(false)
 
-    startTransition(async () => {
+    startSyncTransition(async () => {
       const result = await triggerShopifyManualSync('stock')
       if (!result.success) {
         setSyncError(true)
@@ -246,8 +248,8 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
         </div>
 
         <div className="flex items-center gap-2">
-          <Button variant="outline" onClick={handleManualStockSync} disabled={isPending || !configured || !syncEnabled}>
-            {isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
+          <Button variant="outline" onClick={handleManualStockSync} disabled={syncPending || !configured || !syncEnabled}>
+            {syncPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <RefreshCw className="mr-2 h-4 w-4" />}
             Push Stock Now
           </Button>
           {syncMessage && (
@@ -256,6 +258,7 @@ export function ShopifySyncClient({ settings: initialSettings, credentials, logs
             </span>
           )}
         </div>
+        <LoadingProgress active={syncPending} label="Syncing Shopify..." className="max-w-sm" />
       </Card>
 
       <Card className="p-6 space-y-4">

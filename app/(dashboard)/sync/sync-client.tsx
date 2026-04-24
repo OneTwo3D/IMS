@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Card } from '@/components/ui/card'
+import { LoadingProgress } from '@/components/ui/loading-progress'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   createShoppingWebhooks,
@@ -87,6 +88,32 @@ function formatSyncResult(
   }
 
   return { text: `${type} sync completed: ${JSON.stringify(result)}`, isError: false }
+}
+
+type WcProductSyncProgress = {
+  status: 'idle' | 'running' | 'done' | 'error'
+  message: string
+  productsProcessed: number
+  productsImported: number
+  productsSkipped: number
+  totalProducts: number
+  currentPage: number
+  totalPages: number
+  errors: string[]
+}
+
+function formatWcProductSyncProgress(progress: WcProductSyncProgress): { detail: string; isError: boolean } {
+  if (progress.totalProducts > 0) {
+    const parts = [`Imported ${progress.productsImported} of ${progress.totalProducts} products`]
+    if (progress.productsSkipped > 0) parts.push(`${progress.productsSkipped} skipped`)
+    if (progress.errors.length > 0) parts.push(`${progress.errors.length} errors`)
+    return { detail: parts.join(' · '), isError: progress.errors.length > 0 }
+  }
+
+  return {
+    detail: progress.message || 'Preparing WooCommerce product import...',
+    isError: progress.status === 'error',
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +334,11 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   const [importProgress, setImportProgress] = useState<InitialImportProgress | null>(null)
   const [importStarting, setImportStarting] = useState(false)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const [productSyncProgress, setProductSyncProgress] = useState<WcProductSyncProgress | null>(null)
+  const [productSyncStarting, setProductSyncStarting] = useState(false)
+  const productPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const productSyncStartedByUserRef = useRef(false)
+  const productSyncBusy = productSyncStarting || productSyncProgress?.status === 'running'
 
   const stopPolling = useCallback(() => {
     if (pollRef.current) { clearInterval(pollRef.current); pollRef.current = null }
@@ -331,6 +363,44 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
     pollRef.current = setInterval(pollProgress, 2000)
   }, [pollProgress, stopPolling])
 
+  const stopProductPolling = useCallback(() => {
+    if (productPollRef.current) {
+      clearInterval(productPollRef.current)
+      productPollRef.current = null
+    }
+  }, [])
+
+  const pollProductSyncProgress = useCallback(async () => {
+    try {
+      const res = await fetch('/api/shopping/manual-sync?connector=woocommerce&type=products', {
+        cache: 'no-store',
+      })
+      if (!res.ok) return
+
+      const data = await res.json() as WcProductSyncProgress
+      setProductSyncProgress(data)
+
+      if (data.status === 'done' || data.status === 'error') {
+        stopProductPolling()
+        if (productSyncStartedByUserRef.current) {
+          const formatted = formatWcProductSyncProgress(data)
+          setSyncResult({ text: data.message || formatted.detail, isError: formatted.isError })
+          productSyncStartedByUserRef.current = false
+          if (data.status === 'done') router.refresh()
+        }
+      }
+    } catch {
+      // Ignore intermittent progress polling failures.
+    }
+  }, [router, stopProductPolling])
+
+  const startProductPolling = useCallback(() => {
+    stopProductPolling()
+    productPollRef.current = setInterval(() => {
+      void pollProductSyncProgress()
+    }, 2000)
+  }, [pollProductSyncProgress, stopProductPolling])
+
   // Check progress on mount if not completed yet
   useEffect(() => {
     if (wcConfigured && !initialImportDone) {
@@ -341,12 +411,24 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
     return stopPolling
   }, [wcConfigured, initialImportDone, pollProgress, stopPolling])
 
+  useEffect(() => {
+    if (!wcConfigured) return undefined
+    void pollProductSyncProgress()
+    return stopProductPolling
+  }, [pollProductSyncProgress, stopProductPolling, wcConfigured])
+
   // Start polling when import is running
   useEffect(() => {
     if (importProgress?.status === 'running' && !pollRef.current) {
       startPolling()
     }
   }, [importProgress?.status, startPolling])
+
+  useEffect(() => {
+    if (productSyncProgress?.status === 'running' && !productPollRef.current) {
+      startProductPolling()
+    }
+  }, [productSyncProgress?.status, startProductPolling])
 
   async function handleStartInitialImport() {
     setImportStarting(true)
@@ -358,6 +440,54 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
       }
     } finally {
       setImportStarting(false)
+    }
+  }
+
+  async function handleProductSync() {
+    setSyncResult(null)
+    setProductSyncStarting(true)
+    productSyncStartedByUserRef.current = true
+    setProductSyncProgress({
+      status: 'running',
+      message: 'Starting WooCommerce product import...',
+      productsProcessed: 0,
+      productsImported: 0,
+      productsSkipped: 0,
+      totalProducts: 0,
+      currentPage: 0,
+      totalPages: 0,
+      errors: [],
+    })
+
+    try {
+      const response = await fetch('/api/shopping/manual-sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ connector: 'woocommerce', type: 'products' }),
+      })
+
+      const data = await response.json() as { success?: boolean; error?: string }
+      if (!response.ok || !data.success) {
+        productSyncStartedByUserRef.current = false
+        setProductSyncProgress(null)
+        setSyncResult({
+          text: `Error: ${data.error ?? `Request failed (${response.status})`}`,
+          isError: true,
+        })
+        return
+      }
+
+      await pollProductSyncProgress()
+      startProductPolling()
+    } catch (error) {
+      productSyncStartedByUserRef.current = false
+      setProductSyncProgress(null)
+      setSyncResult({
+        text: `Error: ${error instanceof Error ? error.message : String(error)}`,
+        isError: true,
+      })
+    } finally {
+      setProductSyncStarting(false)
     }
   }
 
@@ -392,6 +522,11 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   }
 
   function handleSync(type: 'orders' | 'products' | 'stock') {
+    if (type === 'products') {
+      void handleProductSync()
+      return
+    }
+
     setSyncResult(null)
     setSyncingType(type)
     startTransition(async () => {
@@ -713,10 +848,18 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
                     </label>
                   ))}
                 </div>
-                <Button size="sm" onClick={() => handleSync('products')} disabled={isPending}>
-                  {syncingType === 'products' ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
+                <Button size="sm" onClick={() => handleSync('products')} disabled={isPending || productSyncBusy}>
+                  {productSyncBusy ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
                   Sync Products Now
                 </Button>
+                <LoadingProgress
+                  active={productSyncBusy}
+                  label="Syncing WooCommerce products..."
+                  value={productSyncProgress?.totalProducts ? productSyncProgress.productsProcessed : undefined}
+                  max={productSyncProgress?.totalProducts || undefined}
+                  detail={productSyncProgress ? formatWcProductSyncProgress(productSyncProgress).detail : 'Preparing WooCommerce product import...'}
+                  className="max-w-sm"
+                />
                 {productWebhookActive && (
                   <p className="text-xs text-muted-foreground">Primary product polling is disabled — products are updated via webhook (last received: {new Date(s.wc_product_webhook_last_received_at).toLocaleString('en-GB')}). Cron only runs backup reconciliation.</p>
                 )}

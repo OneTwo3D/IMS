@@ -648,23 +648,28 @@ export async function getWcActivePaymentGateways(): Promise<Array<{ id: string; 
   }
 }
 
+function toSerializableResult(result: unknown): unknown {
+  if (result == null) return result
+  return JSON.parse(JSON.stringify(result))
+}
+
 export async function triggerManualSync(type: 'orders' | 'products' | 'stock'): Promise<{ success: boolean; result?: unknown; error?: string }> {
   await requireAdmin()
   try {
     if (type === 'orders') {
       const { syncNewWcOrders } = await import('@/lib/connectors/woocommerce/sync/order-import')
       const result = await syncNewWcOrders({ mode: 'manual_reconcile' })
-      return { success: true, result }
+      return { success: true, result: toSerializableResult(result) }
     }
     if (type === 'products') {
       const { syncAllWcProducts } = await import('@/lib/connectors/woocommerce/sync/product-sync')
       const result = await syncAllWcProducts({ mode: 'manual_reconcile' })
-      return { success: true, result }
+      return { success: true, result: toSerializableResult(result) }
     }
     if (type === 'stock') {
       const { pushStockToWc } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
       const result = await pushStockToWc({ forceAll: true, source: 'MANUAL' })
-      return { success: true, result }
+      return { success: true, result: toSerializableResult(result) }
     }
     return { success: false, error: 'Unknown sync type' }
   } catch (e) {

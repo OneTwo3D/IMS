@@ -1,12 +1,42 @@
 'use client'
 
-import { useState, useTransition } from 'react'
+import { useCallback, useEffect, useRef, useState, useTransition } from 'react'
 import { Check, Download, Loader2, Package, RefreshCw, ShoppingCart } from 'lucide-react'
 import Link from 'next/link'
 import { Button } from '@/components/ui/button'
 import { CsvImportFlow } from '@/components/ui/csv-import-flow'
+import { LoadingProgress } from '@/components/ui/loading-progress'
 import { importProductsCsv } from '@/app/actions/import'
-import { triggerShoppingManualSync, triggerShopifyManualSync } from '@/app/actions/shopping-sync'
+
+type ManualSyncResponse = {
+  success: boolean
+  started?: boolean
+  result?: unknown
+  error?: string
+}
+
+type WcProductSyncProgress = {
+  status: 'idle' | 'running' | 'done' | 'error'
+  message: string
+  productsProcessed: number
+  productsImported: number
+  productsSkipped: number
+  totalProducts: number
+  currentPage: number
+  totalPages: number
+  errors: string[]
+}
+
+function formatWcProductProgressDetail(progress: WcProductSyncProgress): string {
+  if (progress.totalProducts > 0) {
+    const parts = [`Imported ${progress.productsImported} of ${progress.totalProducts} products`]
+    if (progress.productsSkipped > 0) parts.push(`${progress.productsSkipped} skipped`)
+    if (progress.errors.length > 0) parts.push(`${progress.errors.length} errors`)
+    return parts.join(' · ')
+  }
+
+  return progress.message || 'Preparing WooCommerce product import...'
+}
 
 type Props = {
   shoppingConnectorEnabled: boolean
@@ -28,41 +58,136 @@ export function ProductsStep({
   onImported,
 }: Props) {
   const [imported, setImported] = useState(false)
-  const [wcPending, startWcTransition] = useTransition()
+  const [wcStarting, setWcStarting] = useState(false)
   const [wcMessage, setWcMessage] = useState<{ text: string; isError: boolean } | null>(null)
+  const [wcProgress, setWcProgress] = useState<WcProductSyncProgress | null>(null)
   const [shopifyPending, startShopifyTransition] = useTransition()
   const [shopifyMessage, setShopifyMessage] = useState<{ text: string; isError: boolean } | null>(null)
+  const wcPollRef = useRef<number | null>(null)
+  const wcStartedByUserRef = useRef(false)
+  const wcBusy = wcStarting || wcProgress?.status === 'running'
 
-  function handleWcProductSync() {
-    setWcMessage(null)
-    startWcTransition(async () => {
-      try {
-        const result = await triggerShoppingManualSync('products')
-        if (!result.success) {
-          setWcMessage({ text: result.error ?? 'Failed to sync products', isError: true })
-          return
-        }
-        const payload = (result.result ?? {}) as { synced?: number; skipped?: number; errors?: string[] }
-        const synced = Number(payload.synced ?? 0)
-        const skipped = Number(payload.skipped ?? 0)
-        const errors = Array.isArray(payload.errors) ? payload.errors : []
-        if (errors.length > 0) {
-          setWcMessage({ text: `Completed with ${errors.length} error(s) — ${errors.slice(0, 3).join('; ')}`, isError: true })
-        } else {
-          setWcMessage({ text: `Synced ${synced} product(s) from WooCommerce (${skipped} skipped).`, isError: false })
-        }
-        if (synced > 0) onImported?.()
-      } catch (error) {
-        setWcMessage({ text: `Failed to sync products: ${error instanceof Error ? error.message : String(error)}`, isError: true })
-      }
+  async function callManualSyncApi(
+    connector: 'woocommerce' | 'shopify',
+    type: 'orders' | 'products' | 'stock',
+  ): Promise<ManualSyncResponse> {
+    const response = await fetch('/api/shopping/manual-sync', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ connector, type }),
     })
+
+    let data: ManualSyncResponse | null = null
+    try {
+      data = await response.json() as ManualSyncResponse
+    } catch {
+      data = null
+    }
+
+    if (!response.ok) {
+      return {
+        success: false,
+        error: data?.error ?? `Request failed (${response.status})`,
+      }
+    }
+
+    return data ?? { success: false, error: 'Invalid sync response' }
+  }
+
+  const stopWcPolling = useCallback(() => {
+    if (wcPollRef.current) {
+      window.clearInterval(wcPollRef.current)
+      wcPollRef.current = null
+    }
+  }, [])
+
+  const pollWcProgress = useCallback(async () => {
+    try {
+      const response = await fetch('/api/shopping/manual-sync?connector=woocommerce&type=products', {
+        cache: 'no-store',
+      })
+      if (!response.ok) return
+
+      const data = await response.json() as WcProductSyncProgress
+      setWcProgress(data)
+
+      if (data.status === 'done' || data.status === 'error') {
+        stopWcPolling()
+        if (wcStartedByUserRef.current) {
+          if (data.status === 'done') {
+            setWcMessage({ text: data.message, isError: data.errors.length > 0 })
+            if (data.productsImported > 0) onImported?.()
+          } else {
+            setWcMessage({ text: data.message || 'Failed to sync products', isError: true })
+          }
+          wcStartedByUserRef.current = false
+        }
+      }
+    } catch {
+      // Ignore transient poll failures while the background import is running.
+    }
+  }, [onImported, stopWcPolling])
+
+  const startWcPolling = useCallback(() => {
+    stopWcPolling()
+    wcPollRef.current = window.setInterval(() => {
+      void pollWcProgress()
+    }, 2000)
+  }, [pollWcProgress, stopWcPolling])
+
+  useEffect(() => {
+    if (!(wcEnabled || wcConnected)) return undefined
+    void pollWcProgress()
+    return stopWcPolling
+  }, [wcConnected, wcEnabled, pollWcProgress, stopWcPolling])
+
+  useEffect(() => {
+    if (wcProgress?.status === 'running' && !wcPollRef.current) {
+      startWcPolling()
+    }
+  }, [startWcPolling, wcProgress?.status])
+
+  async function handleWcProductSync() {
+    setWcMessage(null)
+    wcStartedByUserRef.current = true
+    setWcStarting(true)
+    setWcProgress({
+      status: 'running',
+      message: 'Starting WooCommerce product import...',
+      productsProcessed: 0,
+      productsImported: 0,
+      productsSkipped: 0,
+      totalProducts: 0,
+      currentPage: 0,
+      totalPages: 0,
+      errors: [],
+    })
+
+    try {
+      const result = await callManualSyncApi('woocommerce', 'products')
+      if (!result.success) {
+        wcStartedByUserRef.current = false
+        setWcProgress(null)
+        setWcMessage({ text: result.error ?? 'Failed to sync products', isError: true })
+        return
+      }
+
+      await pollWcProgress()
+      startWcPolling()
+    } catch (error) {
+      wcStartedByUserRef.current = false
+      setWcProgress(null)
+      setWcMessage({ text: `Failed to sync products: ${error instanceof Error ? error.message : String(error)}`, isError: true })
+    } finally {
+      setWcStarting(false)
+    }
   }
 
   function handleShopifyProductSync() {
     setShopifyMessage(null)
     startShopifyTransition(async () => {
       try {
-        const result = await triggerShopifyManualSync('products')
+        const result = await callManualSyncApi('shopify', 'products')
         if (!result.success) {
           setShopifyMessage({ text: result.error ?? 'Shopify product sync is not available yet.', isError: true })
           return
@@ -115,29 +240,36 @@ export function ProductsStep({
         </div>
       )}
 
-      {(wcEnabled || shopifyEnabled) && (
+      {(wcEnabled || wcConnected || shopifyEnabled || shopifyConnected) && (
         <div className="space-y-3">
           <div className="flex flex-wrap items-center gap-3">
-            {wcEnabled && (
+            {(wcEnabled || wcConnected) && (
               <div className="flex flex-col gap-1">
                 <Button
                   variant="outline"
                   onClick={handleWcProductSync}
-                  disabled={!wcConnected || wcPending}
+                  disabled={!wcConnected || wcBusy}
                   title={!wcConnected ? 'Connect WooCommerce first to enable product import.' : undefined}
                 >
-                  {wcPending ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
-                  {wcPending ? 'Importing...' : 'Import Products from WooCommerce'}
+                  {wcBusy ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
+                  {wcBusy ? 'Importing...' : 'Import Products from WooCommerce'}
                 </Button>
                 {wcMessage && (
                   <span className={`text-xs ${wcMessage.isError ? 'text-destructive' : 'text-green-600'}`}>
                     {wcMessage.text}
                   </span>
                 )}
+                <LoadingProgress
+                  active={wcBusy}
+                  label="Importing WooCommerce products..."
+                  value={wcProgress?.totalProducts ? wcProgress.productsProcessed : undefined}
+                  max={wcProgress?.totalProducts || undefined}
+                  detail={wcProgress ? formatWcProductProgressDetail(wcProgress) : 'Preparing WooCommerce product import...'}
+                />
               </div>
             )}
 
-            {shopifyEnabled && (
+            {(shopifyEnabled || shopifyConnected) && (
               <div className="flex flex-col gap-1">
                 <Button
                   variant="outline"
@@ -153,6 +285,7 @@ export function ProductsStep({
                     {shopifyMessage.text}
                   </span>
                 )}
+                <LoadingProgress active={shopifyPending} label="Syncing Shopify catalog..." />
               </div>
             )}
           </div>
