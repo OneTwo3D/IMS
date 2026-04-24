@@ -8,6 +8,8 @@ import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { getWcCredentials as getConnectorWcCredentials } from '@/lib/connectors/woocommerce/api'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
+import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
+import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { consumeFifoLayers, createCostLayer, getAverageUnitCost } from '@/lib/cost-layers'
 
@@ -355,6 +357,28 @@ export async function adjustStock(
 
     revalidatePath(`/inventory/${productId}`)
     revalidatePath('/stock-control')
+
+    if (qtyNum > 0) {
+      try {
+        await allocateBackordersForProducts([productId], {
+          source: 'stock_adjustment',
+          referenceId: productId,
+          referenceLabel: `stock adjustment (+${qtyNum}) at ${logWarehouseName}`,
+        })
+      } catch (allocError) {
+        console.error(allocError)
+      }
+    } else if (qtyNum < 0) {
+      try {
+        await releaseOverallocations(
+          [{ productId, warehouseId }],
+          { source: 'stock_adjustment', referenceId: productId, referenceLabel: `stock adjustment (${qtyNum}) at ${logWarehouseName}` },
+        )
+      } catch (rebalanceError) {
+        console.error(rebalanceError)
+      }
+    }
+
     try {
       await enqueueStockSync([productId], 'IMS_CHANGE')
     } catch (syncError) {
@@ -440,6 +464,38 @@ export async function bulkAdjustStock(
 
     revalidatePath('/stock-control')
     revalidatePath('/inventory')
+
+    const positiveProductIds = [...new Set(valid.filter((l) => l.qty > 0).map((l) => l.productId))]
+    const negativePairs = valid
+      .filter((l) => l.qty < 0)
+      .map((l) => ({ productId: l.productId, warehouseId: l.warehouseId }))
+
+    // Release BEFORE allocate: when a bulk adjustment both removes stock
+    // from one warehouse and adds it to another for the same SKU, the
+    // old reservation must be freed first. Otherwise a newer backorder
+    // could consume the newly-added stock while the older fully-allocated
+    // order still looks covered — violating oldest-first allocation.
+    if (negativePairs.length > 0) {
+      try {
+        await releaseOverallocations(negativePairs, {
+          source: 'stock_adjustment',
+          referenceLabel: `bulk stock adjustment (${valid.length} lines)`,
+        })
+      } catch (rebalanceError) {
+        console.error(rebalanceError)
+      }
+    }
+    if (positiveProductIds.length > 0) {
+      try {
+        await allocateBackordersForProducts(positiveProductIds, {
+          source: 'stock_adjustment',
+          referenceLabel: `bulk stock adjustment (${valid.length} lines)`,
+        })
+      } catch (allocError) {
+        console.error(allocError)
+      }
+    }
+
     try {
       await enqueueStockSync(
         [...new Set(valid.map((line) => line.productId))],
@@ -687,16 +743,38 @@ export async function updateAdjustmentMovement(
 
     revalidatePath('/stock-control')
     revalidatePath('/inventory')
-    try {
-      const movement = await db.stockMovement.findUnique({
-        where: { id },
-        select: { productId: true },
-      })
-      if (movement?.productId) {
-        await enqueueStockSync([movement.productId], 'IMS_CHANGE')
+    const movement = await db.stockMovement.findUnique({
+      where: { id },
+      select: { productId: true, fromWarehouseId: true, toWarehouseId: true },
+    })
+    if (movement?.productId) {
+      const netDelta = newSignedQty - oldSignedQtyForLog
+      const warehouseId = movement.toWarehouseId ?? movement.fromWarehouseId
+      if (netDelta > 0) {
+        try {
+          await allocateBackordersForProducts([movement.productId], {
+            source: 'stock_adjustment',
+            referenceId: id,
+            referenceLabel: `adjustment edit (net +${netDelta})`,
+          })
+        } catch (allocError) {
+          console.error(allocError)
+        }
+      } else if (netDelta < 0 && warehouseId) {
+        try {
+          await releaseOverallocations(
+            [{ productId: movement.productId, warehouseId }],
+            { source: 'stock_adjustment', referenceId: id, referenceLabel: `adjustment edit (net ${netDelta})` },
+          )
+        } catch (rebalanceError) {
+          console.error(rebalanceError)
+        }
       }
-    } catch (syncError) {
-      console.error(syncError)
+      try {
+        await enqueueStockSync([movement.productId], 'IMS_CHANGE')
+      } catch (syncError) {
+        console.error(syncError)
+      }
     }
 
     await logActivity({

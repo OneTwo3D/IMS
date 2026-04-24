@@ -6,6 +6,8 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { queueAccountingSync, getAccountingSettings, listAccountingBankAccounts, type AccountingBankAccount } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
+import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
+import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import {
   getReturnedQtyForCostLayer,
   refreshSalesOrderLineCogsForCostLayerChange,
@@ -1884,17 +1886,26 @@ export async function receivePurchaseOrder(
       }
     } catch { /* Accounting queue errors should never block the main flow */ }
 
+    const receivedProductIds = [
+      ...new Set(
+        linesWithQty
+          .map((rl) => po.lines.find((line) => line.id === rl.poLineId)?.productId)
+          .filter((value): value is string => !!value),
+      ),
+    ]
+
     try {
-      await enqueueStockSync(
-        [
-          ...new Set(
-            linesWithQty
-              .map((rl) => po.lines.find((line) => line.id === rl.poLineId)?.productId)
-              .filter((value): value is string => !!value),
-          ),
-        ],
-        'IMS_CHANGE',
-      )
+      await allocateBackordersForProducts(receivedProductIds, {
+        source: 'purchase_receipt',
+        referenceId: id,
+        referenceLabel: `PO receipt ${po.reference}`,
+      })
+    } catch (allocError) {
+      console.error(allocError)
+    }
+
+    try {
+      await enqueueStockSync(receivedProductIds, 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
     }
@@ -2088,6 +2099,31 @@ export async function returnPurchaseOrder(
       description: `Returned stock for PO ${po.reference}`,
       metadata: { reference: po.reference, lineCount: linesWithQty.length, reason },
     })
+
+    try {
+      const returnedPairs = linesWithQty.map((rl) => ({
+        productId: po.lines.find((l) => l.id === rl.poLineId)!.productId,
+        warehouseId: rl.warehouseId,
+      }))
+      await releaseOverallocations(returnedPairs, {
+        source: 'stock_adjustment',
+        referenceId: id,
+        referenceLabel: `supplier return ${returnRef}`,
+      })
+    } catch (rebalanceError) {
+      console.error(rebalanceError)
+    }
+
+    try {
+      const returnedProductIds = [...new Set(
+        linesWithQty.map((rl) => po.lines.find((l) => l.id === rl.poLineId)?.productId).filter((v): v is string => !!v),
+      )]
+      if (returnedProductIds.length > 0) {
+        await enqueueStockSync(returnedProductIds, 'IMS_CHANGE')
+      }
+    } catch (syncError) {
+      console.error(syncError)
+    }
 
     return { success: true }
   } catch (e) {

@@ -5,6 +5,8 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
+import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
+import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import {
   consumeFifoLayers,
@@ -405,7 +407,7 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
 
     const dispatched = await db.stockTransfer.findUnique({
       where: { id },
-      select: { reference: true, fromWarehouse: { select: { name: true } }, toWarehouse: { select: { name: true } }, lines: { select: { id: true } } },
+      select: { reference: true, fromWarehouseId: true, fromWarehouse: { select: { name: true } }, toWarehouse: { select: { name: true } }, lines: { select: { id: true } } },
     })
     await logActivity({
       entityType: 'STOCK_TRANSFER',
@@ -421,15 +423,26 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
       tag: 'stock',
       description: `Transfer ${dispatched?.reference ?? id}: dispatched ${dispatched?.lines.length ?? 0} items from ${dispatched?.fromWarehouse.name ?? id}`,
     })
+    const transferProducts = await db.stockTransferLine.findMany({
+      where: { transferId: id },
+      select: { productId: true },
+    })
+    const dispatchedProductIds = [...new Set(transferProducts.map((line) => line.productId))]
+    const sourceWarehouseId = dispatched?.fromWarehouseId ?? null
+
+    if (sourceWarehouseId) {
+      try {
+        await releaseOverallocations(
+          dispatchedProductIds.map((productId) => ({ productId, warehouseId: sourceWarehouseId })),
+          { source: 'transfer_dispatch', referenceId: id, referenceLabel: `transfer dispatch ${dispatched?.reference ?? id}` },
+        )
+      } catch (rebalanceError) {
+        console.error(rebalanceError)
+      }
+    }
+
     try {
-      const transferProducts = await db.stockTransferLine.findMany({
-        where: { transferId: id },
-        select: { productId: true },
-      })
-      await enqueueStockSync(
-        [...new Set(transferProducts.map((line) => line.productId))],
-        'IMS_CHANGE',
-      )
+      await enqueueStockSync(dispatchedProductIds, 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
     }
@@ -551,15 +564,24 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
       tag: 'stock',
       description: `Transfer ${received?.reference ?? id}: received ${received?.lines.length ?? 0} items at ${received?.toWarehouse.name ?? id}`,
     })
+    const receivedTransferProducts = await db.stockTransferLine.findMany({
+      where: { transferId: id },
+      select: { productId: true },
+    })
+    const receivedProductIds = [...new Set(receivedTransferProducts.map((line) => line.productId))]
+
     try {
-      const transferProducts = await db.stockTransferLine.findMany({
-        where: { transferId: id },
-        select: { productId: true },
+      await allocateBackordersForProducts(receivedProductIds, {
+        source: 'transfer_receive',
+        referenceId: id,
+        referenceLabel: `transfer receive ${received?.reference ?? id}`,
       })
-      await enqueueStockSync(
-        [...new Set(transferProducts.map((line) => line.productId))],
-        'IMS_CHANGE',
-      )
+    } catch (allocError) {
+      console.error(allocError)
+    }
+
+    try {
+      await enqueueStockSync(receivedProductIds, 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
     }

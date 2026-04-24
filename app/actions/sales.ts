@@ -2136,11 +2136,19 @@ export async function createRefund(
       )
 
       if (returnedProductIds.length > 0) {
+        const uniqueReturnedIds = [...new Set(returnedProductIds)]
         try {
-          await enqueueStockSync(
-            [...new Set(returnedProductIds)],
-            'IMS_CHANGE',
-          )
+          const { allocateBackordersForProducts } = await import('@/lib/fulfillment/backorder-allocator')
+          await allocateBackordersForProducts(uniqueReturnedIds, {
+            source: 'customer_return',
+            referenceId: orderId,
+            referenceLabel: `customer return on order ${refundOrderRef}`,
+          })
+        } catch (allocError) {
+          console.error(allocError)
+        }
+        try {
+          await enqueueStockSync(uniqueReturnedIds, 'IMS_CHANGE')
         } catch (syncError) {
           console.error(syncError)
         }

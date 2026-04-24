@@ -459,8 +459,8 @@ export async function getOrderFulfillmentRequirements(
 
 export async function autoAllocateOrder(
   orderId: string,
-  options?: { internalBypassToken?: symbol },
-): Promise<{ success: boolean; error?: string }> {
+  options?: { internalBypassToken?: symbol; deferStockSync?: boolean; refuseIfShipmentsExist?: boolean },
+): Promise<{ success: boolean; error?: string; syncProductIds?: string[] }> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.process')
@@ -510,6 +510,23 @@ export async function autoAllocateOrder(
     const productIds = so.lines.filter((l) => l.productId).map((l) => l.productId!)
     const allocationResult = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
+
+      // Opt-in guard: refuse to rebuild OrderAllocation when the order has
+      // shipments — autoAllocateOrder doesn't touch ShipmentLines, so any
+      // existing ShipmentLine would be left pointing at the old warehouse/
+      // qty and later drive a bogus stock decrement on SHIPPED. Callers
+      // that gate on `shipments: { none: {} }` in their candidate query
+      // should pass this flag so the check is atomic with the lock.
+      if (options?.refuseIfShipmentsExist) {
+        const shipmentExists = await tx.shipment.findFirst({
+          where: { orderId },
+          select: { id: true },
+        })
+        if (shipmentExists) {
+          return { nextAllocations: [], syncProductIds: [], refused: true as const }
+        }
+      }
+
       await resetAllocationAccountingIfStaged(tx, orderId)
       const graph = await loadFulfillmentProductGraph(tx, productIds)
       const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
@@ -529,6 +546,25 @@ export async function autoAllocateOrder(
       })
 
       const stockMap = buildAvailableStockMap(stockLevels)
+
+      // Add this order's existing OrderAllocations back to the available
+      // map. Without this, a partial re-allocation (e.g. backorder retry
+      // triggered by a small receipt) would compute availability against
+      // a reservedQty that still counts this order's own reservations —
+      // the allocator could then rebuild the order with only the newly-
+      // free stock and silently shrink the existing reservation.
+      const ownAllocations = await tx.orderAllocation.findMany({
+        where: { orderId },
+        select: { productId: true, warehouseId: true, qty: true },
+      })
+      for (const alloc of ownAllocations) {
+        const byWarehouse = stockMap.get(alloc.productId) ?? new Map<string, number>()
+        byWarehouse.set(
+          alloc.warehouseId,
+          (byWarehouse.get(alloc.warehouseId) ?? 0) + Number(alloc.qty),
+        )
+        stockMap.set(alloc.productId, byWarehouse)
+      }
 
       const activeShipmentLines = await tx.shipmentLine.findMany({
         where: {
@@ -657,8 +693,13 @@ export async function autoAllocateOrder(
           ...existingAllocs.map((alloc) => alloc.productId),
           ...nextAllocations.map((alloc) => alloc.productId),
         ])],
+        refused: false as const,
       }
     }, STOCK_TX_OPTIONS)
+
+    if (allocationResult.refused) {
+      return { success: false, error: 'Order has existing shipments; reallocation refused', syncProductIds: [] }
+    }
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
@@ -674,17 +715,19 @@ export async function autoAllocateOrder(
       metadata: { orderNumber: orderRef, isWcOrder, shipFromWarehouseId: so.shipFromWarehouseId, allocations: allocationResult.nextAllocations.length },
     })
     if (allocationResult.nextAllocations.length === 0) {
-      return { success: false, error: 'No stock available for allocation' }
+      return { success: false, error: 'No stock available for allocation', syncProductIds: allocationResult.syncProductIds }
     }
-    try {
-      await enqueueStockSync(
-        allocationResult.syncProductIds,
-        'IMS_CHANGE',
-      )
-    } catch (syncError) {
-      console.error(syncError)
+    if (!options?.deferStockSync) {
+      try {
+        await enqueueStockSync(
+          allocationResult.syncProductIds,
+          'IMS_CHANGE',
+        )
+      } catch (syncError) {
+        console.error(syncError)
+      }
     }
-    return { success: true }
+    return { success: true, syncProductIds: allocationResult.syncProductIds }
   } catch (e) {
     return { success: false, error: String(e) }
   }
