@@ -141,6 +141,55 @@ function resolveImportedTaxRateId(
 
 const VALID_TYPES = new Set<string>(['SIMPLE', 'VARIABLE', 'VARIANT', 'KIT', 'BOM', 'NON_INVENTORY'])
 
+async function runWithConcurrency<T>(
+  items: T[],
+  limit: number,
+  worker: (item: T) => Promise<void>,
+): Promise<void> {
+  let cursor = 0
+  const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (cursor < items.length) {
+      const item = items[cursor++]
+      await worker(item)
+    }
+  })
+  await Promise.all(workers)
+}
+
+function scheduleProductImportShoppingSync(
+  targets: Array<{ id: string; lifecycleStatus: 'ACTIVE' | 'NOT_FOR_SALE' | 'ARCHIVED' }>,
+): void {
+  const uniqueTargets = [...new Map(targets.map((entry) => [entry.id, entry])).values()]
+  if (uniqueTargets.length === 0) return
+
+  setTimeout(() => {
+    void (async () => {
+      try {
+        await runWithConcurrency(uniqueTargets, 5, async (target) => {
+          const result = await pushProductMetadata(target.id)
+          if (!result.success && result.error) console.error(result.error)
+        })
+
+        const archivedIds = uniqueTargets
+          .filter((target) => target.lifecycleStatus === 'ARCHIVED')
+          .map((target) => target.id)
+        const activeIds = uniqueTargets
+          .filter((target) => target.lifecycleStatus !== 'ARCHIVED')
+          .map((target) => target.id)
+
+        if (activeIds.length > 0) {
+          await enqueueStockSync(activeIds, 'IMS_CHANGE')
+        }
+        if (archivedIds.length > 0) {
+          await enqueueStockSync(archivedIds, 'IMS_CHANGE', { force: true })
+        }
+      } catch (syncError) {
+        console.error(syncError)
+      }
+    })()
+  }, 0)
+}
+
 export async function importProductsCsv(formData: FormData): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
   const preview = mode === 'preview'
@@ -182,16 +231,15 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
 
   // Pass 1: Create/update non-VARIANT products first, then VARIANTs
   // Sort rows so parents come before children
-  const sorted = [...rows].sort((a, b) => {
+  const sorted = rows.map((row, index) => ({ row, lineNum: index + 2 })).sort((a, b) => {
     const typeOrder: Record<string, number> = { VARIABLE: 0, SIMPLE: 1, NON_INVENTORY: 1, KIT: 2, BOM: 2, VARIANT: 3 }
-    const aType = (a['type'] ?? '').trim().toUpperCase()
-    const bType = (b['type'] ?? '').trim().toUpperCase()
+    const aType = (a.row['type'] ?? '').trim().toUpperCase()
+    const bType = (b.row['type'] ?? '').trim().toUpperCase()
     return (typeOrder[aType] ?? 1) - (typeOrder[bType] ?? 1)
   })
 
   for (let i = 0; i < sorted.length; i++) {
-    const row = sorted[i]
-    const lineNum = rows.indexOf(row) + 2
+    const { row, lineNum } = sorted[i]
 
     const productIdFromRow = readCsvValue(row, 'productId', 'productid').trim() || null
     const sku = row['sku']?.trim()
@@ -498,25 +546,11 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
     }
   }
 
-  const syncTargets = [...new Map(touchedProducts.map((entry) => [entry.id, entry])).values()]
   if (preview) {
     return buildImportPreviewResult(rows.length + dropped, result, dropped)
   }
 
-  for (const target of syncTargets) {
-    try {
-      await pushProductMetadata(target.id)
-    } catch (syncError) {
-      console.error(syncError)
-    }
-    try {
-      await enqueueStockSync([target.id], 'IMS_CHANGE', {
-        force: target.lifecycleStatus === 'ARCHIVED',
-      })
-    } catch (syncError) {
-      console.error(syncError)
-    }
-  }
+  scheduleProductImportShoppingSync(touchedProducts)
 
   revalidatePath('/inventory')
   if (result.errors.length > 0 && result.created === 0 && result.updated === 0) {
