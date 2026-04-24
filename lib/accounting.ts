@@ -2,7 +2,7 @@
  * Generic accounting facade — core code imports ONLY from here, never from connector modules.
  */
 
-import type { AccountingSyncType } from '@/app/generated/prisma/client'
+import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
 export type AccountingSettings = {
@@ -23,6 +23,28 @@ export type AccountingSettings = {
 type AccountingConnectorInfo = {
   id: 'xero' | 'quickbooks'
   name: 'Xero' | 'QuickBooks'
+}
+
+const XERO_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> = {
+  SALES_INVOICE: 'xero_sync_sales_invoice',
+  CREDIT_NOTE: 'xero_sync_credit_note',
+  PURCHASE_INVOICE: 'xero_sync_purchase_invoice',
+  COGS_JOURNAL: 'xero_sync_cogs_journal',
+  COGS_REVERSAL: 'xero_sync_cogs_reversal',
+  STOCK_RECEIPT: 'xero_sync_stock_receipt',
+  INVENTORY_ADJUSTMENT: 'xero_sync_inventory_adjustment',
+  STOCK_ALLOCATION: 'xero_sync_stock_allocation',
+}
+
+const QUICKBOOKS_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> = {
+  SALES_INVOICE: 'quickbooks_sync_sales_invoice',
+  CREDIT_NOTE: 'quickbooks_sync_credit_note',
+  PURCHASE_INVOICE: 'quickbooks_sync_purchase_invoice',
+  COGS_JOURNAL: 'quickbooks_sync_cogs_journal',
+  COGS_REVERSAL: 'quickbooks_sync_cogs_reversal',
+  STOCK_RECEIPT: 'quickbooks_sync_stock_receipt',
+  INVENTORY_ADJUSTMENT: 'quickbooks_sync_inventory_adjustment',
+  STOCK_ALLOCATION: 'quickbooks_sync_stock_allocation',
 }
 
 const DEFAULT_ACCOUNTING_SETTINGS: AccountingSettings = {
@@ -60,6 +82,7 @@ export async function queueAccountingSync(params: {
   referenceType: string
   referenceId: string
   payload: Record<string, unknown>
+  idempotencyKey?: string
 }): Promise<void> {
   const connector = await getActiveAccountingConnectorId()
   if (!connector) return
@@ -73,6 +96,83 @@ export async function queueAccountingSync(params: {
       const { queueQuickBooksSync } = await import('@/lib/connectors/quickbooks/queue')
       return queueQuickBooksSync(params)
     }
+  }
+}
+
+async function getAccountingPostingContext(type: AccountingSyncType): Promise<{
+  connector: AccountingConnectorInfo['id']
+  postingMode: string
+} | null> {
+  const connector = await getActiveAccountingConnectorId()
+  if (!connector) return null
+
+  if (connector === 'xero') {
+    const { getXeroSettings } = await import('@/lib/connectors/xero/settings')
+    const settings = await getXeroSettings()
+    if (settings.xero_sync_enabled !== 'true') return null
+    const settingKey = XERO_SYNC_TYPE_SETTING[type]
+    const postingMode = settingKey ? String(settings[settingKey as keyof typeof settings] ?? '') : 'submitted'
+    if (!postingMode || postingMode === 'off') return null
+    return { connector, postingMode }
+  }
+
+  const { getQuickBooksSettings } = await import('@/lib/connectors/quickbooks/settings')
+  const settings = await getQuickBooksSettings()
+  if (settings.quickbooks_sync_enabled !== 'true') return null
+  const settingKey = QUICKBOOKS_SYNC_TYPE_SETTING[type]
+  const postingMode = settingKey ? String(settings[settingKey as keyof typeof settings] ?? '') : 'submitted'
+  if (!postingMode || postingMode === 'off') return null
+  return { connector, postingMode }
+}
+
+export async function queueAccountingSyncTx(
+  tx: Prisma.TransactionClient,
+  params: {
+    type: AccountingSyncType
+    referenceType: string
+    referenceId: string
+    payload: Record<string, unknown>
+    idempotencyKey?: string
+  },
+): Promise<void> {
+  const context = await getAccountingPostingContext(params.type)
+  if (!context) return
+
+  const payload = {
+    ...params.payload,
+    _postingMode: context.postingMode,
+    ...(params.idempotencyKey ? { _idempotencyKey: params.idempotencyKey } : {}),
+  }
+
+  if (params.idempotencyKey) {
+    const existing = await tx.accountingSyncLog.findFirst({
+      where: {
+        connector: context.connector,
+        type: params.type,
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+        status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+        payload: { path: ['_idempotencyKey'], equals: params.idempotencyKey },
+      },
+      select: { id: true },
+    })
+    if (existing) return
+  }
+
+  try {
+    await tx.accountingSyncLog.create({
+      data: {
+        connector: context.connector,
+        type: params.type,
+        status: 'PENDING',
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+        payload: payload as never,
+      },
+    })
+  } catch (error) {
+    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return
+    throw error
   }
 }
 

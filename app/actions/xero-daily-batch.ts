@@ -3,6 +3,7 @@
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
+import { parseCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 
 /**
  * Preview & history for the Xero daily batch sub-ledger.
@@ -151,14 +152,26 @@ async function computePreview(): Promise<DailyBatchPreview> {
     where: {
       revenueDeferredDate: { not: null },
       inventoryAllocatedDate: null,
-      status: { in: ['ALLOCATED', 'PICKING', 'PACKING'] },
+      status: { in: ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'] },
     },
     select: {
       id: true,
       orderNumber: true,
       externalOrderNumber: true,
+      status: true,
       allocations: {
         select: { productId: true, warehouseId: true, qty: true },
+      },
+      shipments: {
+        where: { status: 'SHIPPED' },
+        select: {
+          lines: {
+            select: {
+              qty: true,
+              costLayerSnapshot: true,
+            },
+          },
+        },
       },
     },
   })
@@ -167,14 +180,23 @@ async function computePreview(): Promise<DailyBatchPreview> {
   let a2Total = 0
   const a2Snapshot = await buildPreviewLayerSnapshot(
     a2OrdersRaw.flatMap((order) =>
-      order.allocations.map((alloc) => ({
-        productId: alloc.productId,
-        warehouseId: alloc.warehouseId,
-      })),
+      order.shipments.length > 0
+        ? []
+        : order.allocations.map((alloc) => ({
+            productId: alloc.productId,
+            warehouseId: alloc.warehouseId,
+          })),
     ),
   )
   for (const order of a2OrdersRaw) {
-    const cost = computeFifoCostFromSnapshot(a2Snapshot, order.allocations)
+    const cost = order.shipments.length > 0
+      ? order.shipments.reduce((sum, shipment) => (
+          sum + shipment.lines.reduce((lineSum, line) => {
+            if (Number(line.qty) <= 0) return lineSum
+            return lineSum + sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot))
+          }, 0)
+        ), 0)
+      : computeFifoCostFromSnapshot(a2Snapshot, order.allocations)
     a2Total += cost
     a2OrdersComputed.push({
       id: order.id,
@@ -205,10 +227,12 @@ async function computePreview(): Promise<DailyBatchPreview> {
       id: true,
       orderId: true,
       warehouseId: true,
+      cogsBatchAmount: true,
       lines: {
         select: {
           productId: true,
           qty: true,
+          costLayerSnapshot: true,
           line: { select: { qty: true, totalBase: true } },
         },
       },
@@ -228,15 +252,6 @@ async function computePreview(): Promise<DailyBatchPreview> {
   const bShipmentsComputed: DailyBatchPreviewShipment[] = []
   let bRevenue = 0
   let bCogs = 0
-  const bSnapshot = await buildPreviewLayerSnapshot(
-    bShipments.flatMap((shipment) =>
-      shipment.lines.map((line) => ({
-        productId: line.productId,
-        warehouseId: shipment.warehouseId,
-      })),
-    ),
-  )
-
   for (const shipment of bShipments) {
     const orderLineTotal = shipment.order.lines.reduce(
       (s, l) => s + Number(l.totalBase),
@@ -258,19 +273,10 @@ async function computePreview(): Promise<DailyBatchPreview> {
       ? round2((shipmentLineValue / orderLineTotal) * deferredBase)
       : 0
 
-    // Preview-only: compute COGS from FIFO layers *without* decrementing
-    // them. Multiple preview shipments for the same product/warehouse may
-    // therefore reuse the same layer depth — which is an acceptable, and
-    // documented, preview approximation. The real batch runs exclusively
-    // and will consume layers atomically.
-    const cogs = computeFifoCostFromSnapshot(
-      bSnapshot,
-      shipment.lines.map((l) => ({
-        productId: l.productId,
-        warehouseId: shipment.warehouseId,
-        qty: l.qty,
-      })),
-    )
+    const snapshotCogs = shipment.lines.reduce((sum, line) => (
+      sum + sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot))
+    ), 0)
+    const cogs = snapshotCogs > 0 ? snapshotCogs : Number(shipment.cogsBatchAmount ?? 0)
 
     bRevenue += revenueProportion
     bCogs += cogs
@@ -389,14 +395,8 @@ export async function getXeroDailyBatchHistory(
   const byDate = new Map<string, DailyBatchHistoryDay>()
 
   for (const row of rows) {
-    const date = row.createdAt.toISOString().slice(0, 10)
-    let day = byDate.get(date)
-    if (!day) {
-      day = { date, a1: null, a2: null, b: null }
-      byDate.set(date, day)
-    }
-
     const payload = (row.payload ?? {}) as {
+      date?: string
       narration?: string
       lines?: Array<{
         accountCode?: string
@@ -405,6 +405,15 @@ export async function getXeroDailyBatchHistory(
         credit?: number
       }>
     }
+    const date = typeof payload.date === 'string' && payload.date
+      ? payload.date.slice(0, 10)
+      : row.createdAt.toISOString().slice(0, 10)
+    let day = byDate.get(date)
+    if (!day) {
+      day = { date, a1: null, a2: null, b: null }
+      byDate.set(date, day)
+    }
+
     const lines = Array.isArray(payload.lines)
       ? payload.lines.map((l) => ({
           accountCode: l.accountCode ?? '',

@@ -23,6 +23,7 @@ export async function queueXeroSync(params: {
   referenceType: string
   referenceId: string
   payload: Record<string, unknown>
+  idempotencyKey?: string
 }): Promise<void> {
   const settings = await getXeroSettings()
   if (settings.xero_sync_enabled !== 'true') return
@@ -31,16 +32,40 @@ export async function queueXeroSync(params: {
   const postingMode = settingKey ? settings[settingKey] : 'submitted'
   if (!postingMode || postingMode === 'off') return
 
-  const payload = { ...params.payload, _postingMode: postingMode }
+  const payload = {
+    ...params.payload,
+    _postingMode: postingMode,
+    ...(params.idempotencyKey ? { _idempotencyKey: params.idempotencyKey } : {}),
+  }
 
-  await db.accountingSyncLog.create({
-    data: {
-      connector: 'xero',
-      type: params.type,
-      status: 'PENDING',
-      referenceType: params.referenceType,
-      referenceId: params.referenceId,
-      payload: payload as never,
-    },
-  })
+  if (params.idempotencyKey) {
+    const existing = await db.accountingSyncLog.findFirst({
+      where: {
+        connector: 'xero',
+        type: params.type,
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+        status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+        payload: { path: ['_idempotencyKey'], equals: params.idempotencyKey },
+      },
+      select: { id: true },
+    })
+    if (existing) return
+  }
+
+  try {
+    await db.accountingSyncLog.create({
+      data: {
+        connector: 'xero',
+        type: params.type,
+        status: 'PENDING',
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+        payload: payload as never,
+      },
+    })
+  } catch (error) {
+    if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return
+    throw error
+  }
 }

@@ -1,16 +1,18 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
+import { createHash } from 'crypto'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
-import { queueAccountingSync, getAccountingSettings, listAccountingBankAccounts, type AccountingBankAccount } from '@/lib/accounting'
+import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, listAccountingBankAccounts, type AccountingBankAccount } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import {
   consumeFifoLayersStrict,
   getReturnedQtyForCostLayer,
+  getSupplierReturnedQtyForCostLayer,
   refreshSalesOrderLineCogsForCostLayerChange,
   refreshShipmentCogsForCostLayerChange,
   updateSnapshotsForCostLayerChange,
@@ -21,6 +23,10 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { Prisma, type TaxCategory } from '@/app/generated/prisma/client'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
+
+function accountingPayloadKey(prefix: string, payload: Record<string, unknown>): string {
+  return `${prefix}:${createHash('sha256').update(JSON.stringify(payload)).digest('hex')}`
+}
 
 async function resolveFxRateToBase(
   tx: Prisma.TransactionClient,
@@ -1686,6 +1692,15 @@ export async function receivePurchaseOrder(
 
     const linesWithQty = receiptLines.filter((rl) => rl.qtyReceived > 0)
     if (!linesWithQty.length) return { success: false, error: 'No quantities to receive' }
+    const [accountingSettings, receiptWarehouseNames] = await Promise.all([
+      getAccountingSettings(),
+      db.warehouse.findMany({
+        where: { id: { in: linesWithQty.map((rl) => rl.warehouseId) } },
+        select: { id: true, name: true },
+      }),
+    ])
+    const whNameMap = Object.fromEntries(receiptWarehouseNames.map((w) => [w.id, w.name]))
+    const warehouseNamesList = [...new Set(linesWithQty.map((rl) => whNameMap[rl.warehouseId] ?? rl.warehouseId))].join(', ')
 
     // Validate: can't receive more than outstanding qty
     for (const rl of linesWithQty) {
@@ -1886,6 +1901,26 @@ export async function receivePurchaseOrder(
         }
       }
 
+      if (accountingSettings.syncEnabled && totalReceiptValue > 0) {
+        const amount = Math.round(totalReceiptValue * 100) / 100
+        const payload = {
+          date: new Date().toISOString().slice(0, 10),
+          reference: `Receipt: ${po.reference}`,
+          narration: `Stock receipt for PO ${po.reference} — ${linesWithQty.length} lines into ${warehouseNamesList}`,
+          lines: [
+            { accountCode: accountingSettings.inventoryAccount, description: `Stock receipt: ${po.reference}`, debit: amount },
+            { accountCode: accountingSettings.transitAccount, description: `Stock receipt: ${po.reference}`, credit: amount },
+          ],
+        }
+        await queueAccountingSyncTx(tx, {
+          type: 'STOCK_RECEIPT',
+          referenceType: 'PurchaseOrder',
+          referenceId: id,
+          payload,
+          idempotencyKey: accountingPayloadKey(`purchase-receipt:${id}:${receiptRef}`, payload),
+        })
+      }
+
       return { allReceived, newStatus, freightPoIds, totalReceiptValue }
     }, STOCK_TX_OPTIONS)
 
@@ -1905,12 +1940,6 @@ export async function receivePurchaseOrder(
     })
 
     // Log stock movement for the receipt
-    const receiptWarehouseNames = await db.warehouse.findMany({
-      where: { id: { in: linesWithQty.map((rl) => rl.warehouseId) } },
-      select: { id: true, name: true },
-    })
-    const whNameMap = Object.fromEntries(receiptWarehouseNames.map((w) => [w.id, w.name]))
-    const warehouseNamesList = [...new Set(linesWithQty.map((rl) => whNameMap[rl.warehouseId] ?? rl.warehouseId))].join(', ')
     await logActivity({
       entityType: 'STOCK_ADJUSTMENT',
       entityId: id,
@@ -1920,31 +1949,6 @@ export async function receivePurchaseOrder(
       description: `Received ${linesWithQty.length} lines for PO ${po.reference} into ${warehouseNamesList}`,
       metadata: { reference: po.reference, lineCount: linesWithQty.length },
     })
-
-    // Queue accounting stock receipt journal: DR Inventory / CR Stock-in-Transit.
-    // The receipt value is gross landed cost, including linked freight. Supplier
-    // and freight bills debit transit separately, so transit clears only after
-    // both goods and freight/AP documents have posted.
-    try {
-      const settings = await getAccountingSettings()
-      const totalReceiptValue = receiptResult.totalReceiptValue
-      if (totalReceiptValue > 0) {
-        await queueAccountingSync({
-          type: 'STOCK_RECEIPT',
-          referenceType: 'PurchaseOrder',
-          referenceId: id,
-          payload: {
-            date: new Date().toISOString().slice(0, 10),
-            reference: `Receipt: ${po.reference}`,
-            narration: `Stock receipt for PO ${po.reference} — ${linesWithQty.length} lines into ${warehouseNamesList}`,
-            lines: [
-              { accountCode: settings.inventoryAccount, description: `Stock receipt: ${po.reference}`, debit: Math.round(totalReceiptValue * 100) / 100 },
-              { accountCode: settings.transitAccount, description: `Stock receipt: ${po.reference}`, credit: Math.round(totalReceiptValue * 100) / 100 },
-            ],
-          },
-        })
-      }
-    } catch { /* Accounting queue errors should never block the main flow */ }
 
     const receivedProductIds = [
       ...new Set(
@@ -2077,6 +2081,7 @@ export async function returnPurchaseOrder(
 
     const linesWithQty = returnLines.filter((rl) => rl.qtyReturned > 0)
     if (!linesWithQty.length) return { success: false, error: 'Enter at least one quantity to return' }
+    const accountingSettings = await getAccountingSettings()
 
     // Validate: can't return more than net received (received - already returned)
     for (const rl of linesWithQty) {
@@ -2185,6 +2190,33 @@ export async function returnPurchaseOrder(
           data: { status: allReceivedReturned ? 'RETURNED' : 'PARTIALLY_RETURNED' },
         })
       }
+      if (accountingSettings.syncEnabled && totalReturnedCostBase > 0.000001) {
+        const amount = Math.round(totalReturnedCostBase * 100) / 100
+        const payload = {
+          date: new Date().toISOString().slice(0, 10),
+          reference: returnRef,
+          narration: `Supplier return for PO ${po.reference}`,
+          lines: [
+            {
+              accountCode: accountingSettings.transitAccount,
+              description: `Reverse supplier return ${returnRef}`,
+              debit: amount,
+            },
+            {
+              accountCode: accountingSettings.inventoryAccount,
+              description: `Reduce inventory for supplier return ${returnRef}`,
+              credit: amount,
+            },
+          ],
+        }
+        await queueAccountingSyncTx(tx, {
+          type: 'INVENTORY_ADJUSTMENT',
+          referenceType: 'PurchaseReturn',
+          referenceId: purchaseReturn.id,
+          payload,
+          idempotencyKey: accountingPayloadKey(`purchase-return:${purchaseReturn.id}`, payload),
+        })
+      }
     }, STOCK_TX_OPTIONS)
 
     revalidatePath('/purchase-orders')
@@ -2209,45 +2241,6 @@ export async function returnPurchaseOrder(
       description: `Returned stock for PO ${po.reference}`,
       metadata: { reference: po.reference, lineCount: linesWithQty.length, reason },
     })
-
-    if (totalReturnedCostBase > 0.000001) {
-      try {
-        const settings = await getAccountingSettings()
-        const amount = Math.round(totalReturnedCostBase * 100) / 100
-        await queueAccountingSync({
-          type: 'INVENTORY_ADJUSTMENT',
-          referenceType: 'PurchaseReturn',
-          referenceId: purchaseReturnId,
-          payload: {
-            date: new Date().toISOString().slice(0, 10),
-            reference: returnRef,
-            narration: `Supplier return for PO ${po.reference}`,
-            lines: [
-              {
-                accountCode: settings.transitAccount,
-                description: `Reverse supplier return ${returnRef}`,
-                debit: amount,
-              },
-              {
-                accountCode: settings.inventoryAccount,
-                description: `Reduce inventory for supplier return ${returnRef}`,
-                credit: amount,
-              },
-            ],
-          },
-        })
-      } catch (accountingError) {
-        await logActivity({
-          entityType: 'PURCHASE_ORDER',
-          entityId: id,
-          action: 'purchase_return_accounting_queue_failed',
-          tag: 'accounting',
-          level: 'WARNING',
-          description: `Failed to queue accounting reversal for supplier return ${returnRef}: ${accountingError instanceof Error ? accountingError.message : String(accountingError)}`,
-          metadata: { reference: po.reference, returnRef, error: String(accountingError) },
-        })
-      }
-    }
 
     try {
       const returnedPairs = linesWithQty.map((rl) => ({
@@ -2462,6 +2455,47 @@ export async function createInvoice(
 
     const totalForeign = subtotalForeign + taxForeign
     const totalBase = subtotalBase + taxBase
+    const [accountingSettings, supplierData] = await Promise.all([
+      getAccountingSettings(),
+      db.purchaseOrder.findUnique({
+        where: { id: poId },
+        select: { supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true } } } }, currency: true },
+      }),
+    ])
+    const fallbackTaxType = supplierData?.supplier?.taxRate?.accountingTaxType ?? undefined
+    const taxTypeByLine = new Map(
+      po.lines.map((r) => [r.id, r.taxRate?.accountingTaxType ?? undefined]),
+    )
+    const productPayloadLines = productInputs.map((l) => ({
+      description: `PO ${po.reference} line`,
+      quantity: l.qtyBilled,
+      unitAmount: Math.round(l.unitCostForeign * 10000) / 10000,
+      accountCode: accountingSettings.transitAccount,
+      taxType: taxTypeByLine.get(l.poLineId) ?? fallbackTaxType,
+    }))
+    const costPayloadLines = costInputs.map((l) => {
+      const costLine = costLineById.get(l.costLineId)!
+      return {
+        description: l.description || costLine.description,
+        quantity: 1,
+        unitAmount: Math.round(l.amountForeign * 10000) / 10000,
+        accountCode: accountingSettings.transitAccount,
+        taxType: costLine.vatable ? fallbackTaxType : undefined,
+      }
+    })
+    const accountingPayload = {
+      invoiceNumber: po.reference,
+      contactName: supplierData?.supplier?.name ?? 'Unknown Supplier',
+      date: input.invoiceDate,
+      dueDate: input.dueDate ?? undefined,
+      currency: supplierData?.currency ?? baseCurrency,
+      reference: input.invoiceNumber ?? undefined,
+      // Bills always debit transit first. For landed-cost changes that arrive
+      // after receipt, the recalculation path posts a separate reclass from
+      // transit into inventory/COGS for the delta on already-received stock.
+      lines: [...productPayloadLines, ...costPayloadLines],
+      supplierInvoicePath: input.supplierInvoiceUrl ?? undefined,
+    }
 
     await db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
@@ -2524,6 +2558,16 @@ export async function createInvoice(
         where: { id: poId },
         data: { invoicedAt: new Date() },
       })
+
+      if (accountingSettings.syncEnabled) {
+        await queueAccountingSyncTx(tx, {
+          type: 'PURCHASE_INVOICE',
+          referenceType: 'PurchaseOrder',
+          referenceId: poId,
+          payload: accountingPayload,
+          idempotencyKey: accountingPayloadKey(`purchase-invoice:${poId}`, accountingPayload),
+        })
+      }
     }, STOCK_TX_OPTIONS)
 
     revalidatePath('/purchase-orders')
@@ -2541,59 +2585,6 @@ export async function createInvoice(
         lineCount: productInputs.length + costInputs.length,
       },
     })
-
-    // Queue accounting purchase invoice (bill) sync
-    try {
-      const [settings, supplierData, baseCurrency] = await Promise.all([
-        getAccountingSettings(),
-        db.purchaseOrder.findUnique({
-          where: { id: poId },
-          select: { supplier: { select: { name: true, taxRate: { select: { accountingTaxType: true } } } }, currency: true },
-        }),
-        getBaseCurrencyCode(),
-      ])
-      const fallbackTaxType = supplierData?.supplier?.taxRate?.accountingTaxType ?? undefined
-      // Look up each billed PO line's per-line tax rate so the accounting
-      // connector gets the correct taxType per line (mixed-VAT orders).
-      const taxTypeByLine = new Map(
-        po.lines.map((r) => [r.id, r.taxRate?.accountingTaxType ?? undefined]),
-      )
-      const productPayloadLines = productInputs.map((l) => ({
-        description: `PO ${po.reference} line`,
-        quantity: l.qtyBilled,
-        unitAmount: Math.round(l.unitCostForeign * 10000) / 10000,
-        accountCode: settings.transitAccount,
-        taxType: taxTypeByLine.get(l.poLineId) ?? fallbackTaxType,
-      }))
-      const costPayloadLines = costInputs.map((l) => {
-        const costLine = costLineById.get(l.costLineId)!
-        return {
-          description: l.description || costLine.description,
-          quantity: 1,
-          unitAmount: Math.round(l.amountForeign * 10000) / 10000,
-          accountCode: settings.transitAccount,
-          taxType: costLine.vatable ? fallbackTaxType : undefined,
-        }
-      })
-      await queueAccountingSync({
-        type: 'PURCHASE_INVOICE',
-        referenceType: 'PurchaseOrder',
-        referenceId: poId,
-        payload: {
-          invoiceNumber: po.reference,
-          contactName: supplierData?.supplier?.name ?? 'Unknown Supplier',
-          date: input.invoiceDate,
-          dueDate: input.dueDate ?? undefined,
-          currency: supplierData?.currency ?? baseCurrency,
-          reference: input.invoiceNumber ?? undefined,
-          // Bills always debit transit first. For landed-cost changes that arrive
-          // after receipt, the recalculation path posts a separate reclass from
-          // transit into inventory/COGS for the delta on already-received stock.
-          lines: [...productPayloadLines, ...costPayloadLines],
-          supplierInvoicePath: input.supplierInvoiceUrl ?? undefined,
-        },
-      })
-    } catch { /* Accounting queue errors should never block the main flow */ }
 
     return { success: true }
   } catch (e) {
@@ -3180,27 +3171,29 @@ async function queueLandedCostAdjustmentJournals(
     const absDelta = Math.abs(adj.totalDelta)
     if (absDelta <= 0.01) continue
     const isIncrease = adj.totalDelta > 0
+    const payload = {
+      date: new Date().toISOString().slice(0, 10),
+      reference: `Landed cost reclass — ${adj.primaryPoRef}`,
+      narration: `Late landed cost ${isIncrease ? 'capitalisation' : 'reversal'} of £${absDelta.toFixed(2)} on ${adj.primaryPoRef}`,
+      lines: [
+        {
+          accountCode: isIncrease ? settings.inventoryAccount : settings.transitAccount,
+          description: `Landed cost reclass — ${adj.primaryPoRef}`,
+          debit: absDelta,
+        },
+        {
+          accountCode: isIncrease ? settings.transitAccount : settings.inventoryAccount,
+          description: `Landed cost reclass — ${adj.primaryPoRef}`,
+          credit: absDelta,
+        },
+      ],
+    }
     await queueAccountingSync({
       type: 'STOCK_IN_TRANSIT',
       referenceType: 'PurchaseOrder',
       referenceId: adj.primaryPoId,
-      payload: {
-        date: new Date().toISOString().slice(0, 10),
-        reference: `Landed cost reclass — ${adj.primaryPoRef}`,
-        narration: `Late landed cost ${isIncrease ? 'capitalisation' : 'reversal'} of £${absDelta.toFixed(2)} on ${adj.primaryPoRef}`,
-        lines: [
-          {
-            accountCode: isIncrease ? settings.inventoryAccount : settings.transitAccount,
-            description: `Landed cost reclass — ${adj.primaryPoRef}`,
-            debit: absDelta,
-          },
-          {
-            accountCode: isIncrease ? settings.transitAccount : settings.inventoryAccount,
-            description: `Landed cost reclass — ${adj.primaryPoRef}`,
-            credit: absDelta,
-          },
-        ],
-      },
+      payload,
+      idempotencyKey: accountingPayloadKey(`landed-cost:inventory:${adj.primaryPoId}`, payload),
     })
   }
 
@@ -3208,27 +3201,29 @@ async function queueLandedCostAdjustmentJournals(
     const absDelta = Math.abs(adj.totalDelta)
     if (absDelta <= 0.01) continue
     const isIncrease = adj.totalDelta > 0
+    const payload = {
+      date: new Date().toISOString().slice(0, 10),
+      reference: `Landed cost adjustment — ${adj.primaryPoRef}`,
+      narration: `Retrospective COGS adjustment: landed cost ${isIncrease ? 'increase' : 'decrease'} of £${absDelta.toFixed(2)} on ${adj.primaryPoRef}`,
+      lines: [
+        {
+          accountCode: isIncrease ? settings.cogsAccount : settings.transitAccount,
+          description: `COGS adjustment — ${adj.primaryPoRef}`,
+          debit: absDelta,
+        },
+        {
+          accountCode: isIncrease ? settings.transitAccount : settings.cogsAccount,
+          description: `COGS adjustment — ${adj.primaryPoRef}`,
+          credit: absDelta,
+        },
+      ],
+    }
     await queueAccountingSync({
       type: 'COGS_JOURNAL',
       referenceType: 'PurchaseOrder',
       referenceId: adj.primaryPoId,
-      payload: {
-        date: new Date().toISOString().slice(0, 10),
-        reference: `Landed cost adjustment — ${adj.primaryPoRef}`,
-        narration: `Retrospective COGS adjustment: landed cost ${isIncrease ? 'increase' : 'decrease'} of £${absDelta.toFixed(2)} on ${adj.primaryPoRef}`,
-        lines: [
-          {
-            accountCode: isIncrease ? settings.cogsAccount : settings.transitAccount,
-            description: `COGS adjustment — ${adj.primaryPoRef}`,
-            debit: absDelta,
-          },
-          {
-            accountCode: isIncrease ? settings.transitAccount : settings.cogsAccount,
-            description: `COGS adjustment — ${adj.primaryPoRef}`,
-            credit: absDelta,
-          },
-        ],
-      },
+      payload,
+      idempotencyKey: accountingPayloadKey(`landed-cost:cogs:${adj.primaryPoId}`, payload),
     })
   }
 }
@@ -3380,7 +3375,10 @@ async function recalculateLandedCosts(
         const returnedQty = consumedQty > 0.000001
           ? await getReturnedQtyForCostLayer(tx, cl.id)
           : 0
-        const netConsumedQty = Math.max(0, consumedQty - returnedQty)
+        const supplierReturnedQty = consumedQty > 0.000001
+          ? await getSupplierReturnedQtyForCostLayer(tx, cl.id)
+          : 0
+        const netConsumedQty = Math.max(0, consumedQty - returnedQty - supplierReturnedQty)
         if (netConsumedQty > 0 && Math.abs(costDelta) > 0.000001) {
           totalCogsDelta += costDelta * netConsumedQty
         }
@@ -3539,7 +3537,10 @@ async function recalculateDirectLandedCosts(
       const returnedQty = consumedQty > 0.000001
         ? await getReturnedQtyForCostLayer(tx, cl.id)
         : 0
-      const netConsumedQty = Math.max(0, consumedQty - returnedQty)
+      const supplierReturnedQty = consumedQty > 0.000001
+        ? await getSupplierReturnedQtyForCostLayer(tx, cl.id)
+        : 0
+      const netConsumedQty = Math.max(0, consumedQty - returnedQty - supplierReturnedQty)
       if (netConsumedQty > 0 && Math.abs(costDelta) > 0.000001) {
         totalCogsDelta += costDelta * netConsumedQty
       }

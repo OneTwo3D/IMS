@@ -353,6 +353,25 @@ export async function getReturnedQtyForCostLayer(
 }
 
 /**
+ * Sum stock returned to suppliers for a cost layer. Supplier returns consume
+ * FIFO layers but are not customer COGS, so landed-cost recalculation must
+ * exclude them from retrospective COGS deltas.
+ */
+export async function getSupplierReturnedQtyForCostLayer(
+  tx: TxClient,
+  costLayerId: string,
+): Promise<number> {
+  const rows = await tx.cogsEntry.findMany({
+    where: {
+      costLayerId,
+      movement: { referenceType: 'PurchaseReturn' },
+    },
+    select: { qty: true },
+  })
+  return rows.reduce((sum, row) => sum + Number(row.qty), 0)
+}
+
+/**
  * Recompute stored shipment-level COGS for any shipment whose line snapshots
  * reference the changed cost layer. This keeps shipment COGS aligned with
  * retrospective landed-cost changes, including shipments already journaled.

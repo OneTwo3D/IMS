@@ -455,7 +455,9 @@ async function processEntry(
     case 'DAILY_BATCH_INVENTORY_ALLOC':
     case 'DAILY_BATCH_GROUP_B':
     case 'UNEARNED_REV_REVERSAL': {
-      const idempotencySource = type.startsWith('DAILY_BATCH_')
+      const idempotencySource = typeof payload._idempotencyKey === 'string'
+        ? payload._idempotencyKey
+        : type.startsWith('DAILY_BATCH_')
         ? `${type}:${referenceId}`
         : entryId
       return pushManualJournal({

@@ -65,6 +65,7 @@ function makeLayerKey(productId: string, warehouseId: string): string {
 }
 
 async function buildLayerSnapshot(
+  tx: Prisma.TransactionClient,
   rows: Array<{ productId: string; warehouseId: string }>,
 ): Promise<LayerSnapshot> {
   const snapshot: LayerSnapshot = new Map()
@@ -72,7 +73,7 @@ async function buildLayerSnapshot(
 
   for (const key of keys) {
     const [productId, warehouseId] = key.split('|')
-    const layers = await db.costLayer.findMany({
+    const candidateLayers = await tx.costLayer.findMany({
       where: {
         productId,
         warehouseId,
@@ -81,6 +82,16 @@ async function buildLayerSnapshot(
       orderBy: { receivedAt: 'asc' },
       select: { id: true, remainingQty: true, unitCostBase: true },
     })
+    if (candidateLayers.length > 0) {
+      await tx.$executeRaw`SELECT id FROM cost_layers WHERE id = ANY(${candidateLayers.map((layer) => layer.id)}::text[]) FOR UPDATE`
+    }
+    const layers = candidateLayers.length === 0
+      ? []
+      : await tx.costLayer.findMany({
+          where: { id: { in: candidateLayers.map((layer) => layer.id) } },
+          orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
+          select: { id: true, remainingQty: true, unitCostBase: true },
+        })
     snapshot.set(
       key,
       layers.map((layer) => ({
@@ -92,6 +103,37 @@ async function buildLayerSnapshot(
   }
 
   return snapshot
+}
+
+function requireShipmentSnapshotValue(order: {
+  id: string
+  shipments: Array<{
+    id: string
+    status: string
+    lines: Array<{ id: string; qty: Prisma.Decimal | number; costLayerSnapshot: Prisma.JsonValue | null }>
+  }>
+}): number {
+  let total = 0
+  let hasShippedLines = false
+
+  for (const shipment of order.shipments) {
+    if (shipment.status !== 'SHIPPED') continue
+    for (const line of shipment.lines) {
+      if (Number(line.qty) <= 0) continue
+      hasShippedLines = true
+      const snapshot = parseCostLayerSnapshot(line.costLayerSnapshot)
+      if (snapshot.length === 0) {
+        throw new Error(`Missing FIFO snapshot for already-shipped line ${line.id} on order ${order.id}`)
+      }
+      total += sumCostLayerSnapshot(snapshot)
+    }
+  }
+
+  if (!hasShippedLines) {
+    throw new Error(`Order ${order.id} is marked shipped but has no shipped lines to reclassify`)
+  }
+
+  return round2(total)
 }
 
 function consumeSnapshotLayers(
@@ -435,13 +477,14 @@ export async function runDailyBatchSync(): Promise<{
       where: {
         revenueDeferredDate: { not: null },
         inventoryAllocatedDate: null,
-        status: { in: ['ALLOCATED', 'PICKING', 'PACKING'] },
+        status: { in: ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'] },
       },
       orderBy: { revenueDeferredDate: 'asc' },
       select: {
         id: true,
         orderNumber: true,
         externalOrderNumber: true,
+        status: true,
         allocations: {
           select: {
             id: true,
@@ -450,14 +493,30 @@ export async function runDailyBatchSync(): Promise<{
             qty: true,
           },
         },
+        shipments: {
+          where: { status: 'SHIPPED' },
+          select: {
+            id: true,
+            status: true,
+            lines: {
+              select: {
+                id: true,
+                qty: true,
+                costLayerSnapshot: true,
+              },
+            },
+          },
+        },
       },
     })
 
     if (orders.length > 0) {
       await db.$transaction(async (tx) => {
         let totalAllocatedValue = 0
+        const unshippedOrders = orders.filter((order) => order.shipments.length === 0)
         const snapshot = await buildLayerSnapshot(
-          orders.flatMap((order) =>
+          tx,
+          unshippedOrders.flatMap((order) =>
             order.allocations.map((alloc) => ({
               productId: alloc.productId,
               warehouseId: alloc.warehouseId,
@@ -470,18 +529,22 @@ export async function runDailyBatchSync(): Promise<{
         for (const order of orders) {
           let orderCostValue = 0
 
-          for (const alloc of order.allocations) {
-            const allocationSnapshot = consumeSnapshotLayers(
-              snapshot,
-              alloc.productId,
-              alloc.warehouseId,
-              Number(alloc.qty),
-            )
-            allocationSnapshots.set(alloc.id, allocationSnapshot)
-            orderCostValue += sumCostLayerSnapshot(allocationSnapshot)
+          if (order.shipments.length > 0) {
+            orderCostValue = requireShipmentSnapshotValue(order)
+          } else {
+            for (const alloc of order.allocations) {
+              const allocationSnapshot = consumeSnapshotLayers(
+                snapshot,
+                alloc.productId,
+                alloc.warehouseId,
+                Number(alloc.qty),
+              )
+              allocationSnapshots.set(alloc.id, allocationSnapshot)
+              orderCostValue += sumCostLayerSnapshot(allocationSnapshot)
+            }
+            orderCostValue = round2(orderCostValue)
           }
 
-          orderCostValue = round2(orderCostValue)
           totalAllocatedValue += orderCostValue
           orderValues.set(order.id, orderCostValue)
         }
@@ -844,18 +907,19 @@ export async function runDailyBatchSync(): Promise<{
       }
 
       const journalLines: JournalLinePayload[] = []
+      const processedShipmentCount = shipmentResults.size
 
       if (totalRevenue > 0) {
         journalLines.push(
-          { accountCode: settings.xero_unearned_revenue_account, description: `Revenue recognition — ${shipments.length} shipment(s)`, debit: totalRevenue },
-          { accountCode: settings.xero_sales_account, description: `Revenue recognition — ${shipments.length} shipment(s)`, credit: totalRevenue },
+          { accountCode: settings.xero_unearned_revenue_account, description: `Revenue recognition — ${processedShipmentCount} shipment(s)`, debit: totalRevenue },
+          { accountCode: settings.xero_sales_account, description: `Revenue recognition — ${processedShipmentCount} shipment(s)`, credit: totalRevenue },
         )
       }
 
       if (totalCogs > 0) {
         journalLines.push(
-          { accountCode: settings.xero_cogs_account, description: `COGS — ${shipments.length} shipment(s)`, debit: totalCogs },
-          { accountCode: settings.xero_allocated_inventory_account, description: `COGS — ${shipments.length} shipment(s)`, credit: totalCogs },
+          { accountCode: settings.xero_cogs_account, description: `COGS — ${processedShipmentCount} shipment(s)`, debit: totalCogs },
+          { accountCode: settings.xero_allocated_inventory_account, description: `COGS — ${processedShipmentCount} shipment(s)`, credit: totalCogs },
         )
       }
 
@@ -866,7 +930,7 @@ export async function runDailyBatchSync(): Promise<{
           payload: {
             date: today,
             reference: `Shipment COGS ${today}`,
-            narration: `Daily shipment batch: ${shipments.length} shipment(s), revenue £${totalRevenue.toFixed(2)}, COGS £${totalCogs.toFixed(2)}`,
+            narration: `Daily shipment batch: ${processedShipmentCount} shipment(s), revenue £${totalRevenue.toFixed(2)}, COGS £${totalCogs.toFixed(2)}`,
             lines: journalLines,
             _postingMode: 'submitted',
           },
@@ -908,7 +972,7 @@ export async function runDailyBatchSync(): Promise<{
         })
       }
 
-      return shipments.length
+      return processedShipmentCount
     })
     if (groupBCount > 0) {
       result.groupB = groupBCount
