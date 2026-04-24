@@ -5,7 +5,7 @@
  */
 
 import type { CreditNoteData } from '@/lib/connectors/types'
-import { qboPost } from './api'
+import { qboPost, qboPostIdempotent } from './api'
 import { findOrCreateContact } from './contacts'
 
 type QboCreditMemo = {
@@ -20,7 +20,7 @@ type QboCreditMemo = {
 export async function pushCreditMemo(
   data: CreditNoteData,
   _status?: string,
-  opts?: { customerId?: string },
+  opts?: { customerId?: string; requestId?: string },
 ): Promise<{ success: boolean; creditNoteId?: string; error?: string }> {
   try {
     // Find or create customer
@@ -57,7 +57,9 @@ export async function pushCreditMemo(
     if (data.currency) body.CurrencyRef = { value: data.currency }
     if (data.reference) body.PrivateNote = data.reference
 
-    const res = await qboPost<{ CreditMemo: QboCreditMemo }>('creditmemo', body)
+    const res = opts?.requestId
+      ? await qboPostIdempotent<{ CreditMemo: QboCreditMemo }>('creditmemo', body, opts.requestId)
+      : await qboPost<{ CreditMemo: QboCreditMemo }>('creditmemo', body)
     if (!res.ok || !res.data) {
       return { success: false, error: res.error ?? 'Failed to create credit memo' }
     }

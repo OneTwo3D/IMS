@@ -8,7 +8,7 @@
  */
 
 import type { BillData } from '@/lib/connectors/types'
-import { qboPost, resolveAccountRef } from './api'
+import { qboPost, qboPostIdempotent, resolveAccountRef } from './api'
 import { findOrCreateContact } from './contacts'
 
 type QboBill = {
@@ -24,7 +24,7 @@ type QboBill = {
 export async function pushPurchaseBill(
   data: BillData,
   _status?: string,
-  opts?: { supplierId?: string },
+  opts?: { supplierId?: string; requestId?: string },
 ): Promise<{ success: boolean; invoiceId?: string; error?: string }> {
   try {
     // Find or create vendor
@@ -73,7 +73,9 @@ export async function pushPurchaseBill(
     if (data.currency) billBody.CurrencyRef = { value: data.currency }
     if (data.reference) billBody.PrivateNote = data.reference
 
-    const res = await qboPost<{ Bill: QboBill }>('bill', billBody)
+    const res = opts?.requestId
+      ? await qboPostIdempotent<{ Bill: QboBill }>('bill', billBody, opts.requestId)
+      : await qboPost<{ Bill: QboBill }>('bill', billBody)
     if (!res.ok || !res.data) {
       return { success: false, error: res.error ?? 'Failed to create bill' }
     }

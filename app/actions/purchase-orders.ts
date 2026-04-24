@@ -3074,7 +3074,18 @@ function normalizeLandedCostMethod(
 }
 
 function warnWeightFallback(context: string) {
-  console.warn(`${context}: BY_WEIGHT landed-cost allocation fell back to equal split because every eligible line had zero weight`)
+  const description = `${context}: BY_WEIGHT landed-cost allocation fell back to equal split because every eligible line had zero weight`
+  console.warn(description)
+  void logActivity({
+    entityType: 'PURCHASE_ORDER',
+    entityId: null,
+    action: 'landed_cost_weight_fallback',
+    tag: 'purchase',
+    level: 'WARNING',
+    description,
+    metadata: { context },
+    resolveUser: false,
+  }).catch((error) => console.error(error))
 }
 
 function computeGrossUnitCostBaseByLine(params: {
@@ -3122,10 +3133,6 @@ function computeGrossUnitCostBaseByLine(params: {
 
   const grossByLine = new Map<string, number>()
   for (const line of params.lines) {
-    if (decimal(line.landedUnitCostBase).gt(0)) {
-      grossByLine.set(line.id, decimal(line.landedUnitCostBase).toNumber())
-      continue
-    }
     if (decimal(line.qty).lte(0)) {
       grossByLine.set(line.id, decimal(line.unitCostBase).toNumber())
       continue

@@ -11,7 +11,7 @@ import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import type { Prisma } from '@/app/generated/prisma/client'
-import { consumeFifoLayersStrict, createCostLayer, getAverageUnitCost } from '@/lib/cost-layers'
+import { consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost } from '@/lib/cost-layers'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -197,7 +197,8 @@ export async function applyStockAdjustment({
   })
 
   if (isAddition) {
-    const avgCost = await getAverageUnitCost(tx, productId, warehouseId)
+    const warehouseAvgCost = await getAverageUnitCost(tx, productId, warehouseId)
+    const avgCost = warehouseAvgCost > 0 ? warehouseAvgCost : await getHistoricalAverageUnitCost(tx, productId)
     await createCostLayer(tx, {
       productId,
       warehouseId,
@@ -742,7 +743,8 @@ export async function updateAdjustmentMovement(
       }
 
       if (newIsAddition) {
-        const avgCost = await getAverageUnitCost(tx, movement.productId, newWarehouseId)
+        const warehouseAvgCost = await getAverageUnitCost(tx, movement.productId, newWarehouseId)
+        const avgCost = warehouseAvgCost > 0 ? warehouseAvgCost : await getHistoricalAverageUnitCost(tx, movement.productId)
         await createCostLayer(tx, {
           productId: movement.productId,
           warehouseId: newWarehouseId,

@@ -85,6 +85,11 @@ function buildUrl(baseUrl: string, realmId: string, path: string): string {
   return `${baseUrl}/${realmId}/${path}${separator}minorversion=${QBO_MINOR_VERSION}`
 }
 
+function appendQueryParam(path: string, key: string, value: string): string {
+  const separator = path.includes('?') ? '&' : '?'
+  return `${path}${separator}${encodeURIComponent(key)}=${encodeURIComponent(value)}`
+}
+
 function parseQboError(body: unknown): string {
   const err = body as QboApiError
   if (!err?.Fault?.Error?.length) return ''
@@ -118,12 +123,14 @@ async function qboFetch<T = unknown>(
   method: 'GET' | 'POST',
   path: string,
   body?: unknown,
+  opts?: { requestId?: string },
 ): Promise<QboResponse<T>> {
   const auth = await getAccessToken()
   if (!auth) return { ok: false, status: 0, error: 'Not connected to QuickBooks' }
 
   const baseUrl = await getBaseUrl()
-  const url = buildUrl(baseUrl, auth.realmId, path)
+  const requestPath = opts?.requestId ? appendQueryParam(path, 'requestid', opts.requestId) : path
+  const url = buildUrl(baseUrl, auth.realmId, requestPath)
 
   const headers: Record<string, string> = {
     'Authorization': `Bearer ${auth.accessToken}`,
@@ -164,6 +171,14 @@ export async function qboGet<T = unknown>(path: string): Promise<QboResponse<T>>
 
 export async function qboPost<T = unknown>(path: string, body: unknown): Promise<QboResponse<T>> {
   return qboFetch<T>('POST', path, body)
+}
+
+export async function qboPostIdempotent<T = unknown>(
+  path: string,
+  body: unknown,
+  requestId: string,
+): Promise<QboResponse<T>> {
+  return qboFetch<T>('POST', path, body, { requestId })
 }
 
 /**

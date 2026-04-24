@@ -141,6 +141,25 @@ export async function getAverageUnitCost(
   return totalQty > 0 ? totalValue / totalQty : 0
 }
 
+export async function getHistoricalAverageUnitCost(
+  tx: TxClient,
+  productId: string,
+): Promise<number> {
+  const layers = await tx.costLayer.findMany({
+    where: { productId },
+    select: { receivedQty: true, unitCostBase: true },
+  })
+  let totalQty = 0
+  let totalValue = 0
+  for (const layer of layers) {
+    const qty = Number(layer.receivedQty)
+    if (!Number.isFinite(qty) || qty <= 0) continue
+    totalQty += qty
+    totalValue += qty * Number(layer.unitCostBase)
+  }
+  return totalQty > 0 ? totalValue / totalQty : 0
+}
+
 /**
  * Create a new cost layer. Used for positive adjustments (at average cost),
  * transfer receipts (at source layer cost), and production output.

@@ -6,6 +6,7 @@
 
 import { readFile } from 'fs/promises'
 import { join } from 'path'
+import { createHash } from 'crypto'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { pushSalesInvoice } from './invoices'
@@ -31,6 +32,20 @@ type ProcessResult = {
 }
 
 type SyncPayload = Record<string, unknown>
+
+function buildQboRequestId(source: string): string {
+  return createHash('sha256').update(source).digest('hex')
+}
+
+function getIdempotencySource(
+  entryId: string,
+  type: AccountingSyncType,
+  referenceId: string,
+  payload: SyncPayload,
+): string {
+  if (typeof payload._idempotencyKey === 'string') return payload._idempotencyKey
+  return type.startsWith('DAILY_BATCH_') ? `${type}:${referenceId}` : entryId
+}
 
 function getRateLimitBackoffMs(retryCount: number, message: string): number {
   const hinted = message.match(/retry after (\d+)ms/i)
@@ -265,6 +280,8 @@ async function processEntry(
   referenceId: string,
   payload: SyncPayload,
 ): Promise<{ success: boolean; externalId?: string; invoiceNumber?: string; error?: string }> {
+  const requestId = buildQboRequestId(getIdempotencySource(entryId, type, referenceId, payload))
+
   switch (type) {
     case 'SALES_INVOICE': {
       const customerId = referenceType === 'SalesOrder'
@@ -290,7 +307,7 @@ async function processEntry(
         discountTaxType: payload.discountTaxType as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
-      }, undefined, { customerId })
+      }, undefined, { customerId, requestId })
       return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, error: invoiceResult.error }
     }
 
@@ -309,7 +326,7 @@ async function processEntry(
         currency: payload.currency as string,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
-      }, undefined, { supplierId: supplier?.supplierId })
+      }, undefined, { supplierId: supplier?.supplierId, requestId })
       return { success: billResult.success, externalId: billResult.invoiceId, error: billResult.error }
     }
 
@@ -328,7 +345,7 @@ async function processEntry(
         currency: payload.currency as string,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
-      }, undefined, { customerId: creditCustomerId })
+      }, undefined, { customerId: creditCustomerId, requestId })
       return { success: creditResult.success, externalId: creditResult.creditNoteId, error: creditResult.error }
     }
 
@@ -498,7 +515,7 @@ async function processEntry(
         reference: payload.reference as string,
         narration: payload.narration as string,
         lines: payload.lines as Array<{ accountCode: string; description: string; debit?: number; credit?: number; taxType?: string }>,
-      })
+      }, undefined, { requestId })
       return { success: journalResult.success, externalId: journalResult.journalId, error: journalResult.error }
     }
 

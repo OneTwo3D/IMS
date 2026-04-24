@@ -2261,6 +2261,7 @@ export async function createRefund(
           if (returnWarehouseId) {
             snapshotReturnRows = createdRefundLines.flatMap((refundLine) => (
               (refundLayerSnapshots.get(refundLine.id) ?? []).flatMap((entry) => {
+                if (entry.source !== 'shipment') return []
                 const productId = productIdByCostLayerId.get(entry.costLayerId)
                 if (!productId) return []
                 return [{

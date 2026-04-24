@@ -6,7 +6,7 @@
  */
 
 import type { JournalEntry } from '@/lib/connectors/types'
-import { qboPost, resolveAccountRef } from './api'
+import { qboPost, qboPostIdempotent, resolveAccountRef } from './api'
 
 type QboJournalEntry = {
   Id: string
@@ -20,6 +20,7 @@ type QboJournalEntry = {
 export async function pushJournalEntry(
   entry: JournalEntry,
   status?: string,
+  opts?: { requestId?: string },
 ): Promise<{ success: boolean; journalId?: string; error?: string }> {
   try {
     void status
@@ -84,7 +85,9 @@ export async function pushJournalEntry(
     if (entry.reference) body.DocNumber = entry.reference
     if (entry.narration) body.PrivateNote = entry.narration
 
-    const res = await qboPost<{ JournalEntry: QboJournalEntry }>('journalentry', body)
+    const res = opts?.requestId
+      ? await qboPostIdempotent<{ JournalEntry: QboJournalEntry }>('journalentry', body, opts.requestId)
+      : await qboPost<{ JournalEntry: QboJournalEntry }>('journalentry', body)
     if (!res.ok || !res.data) {
       return { success: false, error: res.error ?? 'Failed to create journal entry' }
     }

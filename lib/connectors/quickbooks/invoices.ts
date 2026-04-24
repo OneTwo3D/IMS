@@ -10,7 +10,7 @@
  */
 
 import type { InvoiceData } from '@/lib/connectors/types'
-import { qboPost, resolveAccountRef } from './api'
+import { qboPost, qboPostIdempotent, resolveAccountRef } from './api'
 import { findOrCreateContact } from './contacts'
 import { findOrCreateItem } from './items'
 import { getQuickBooksSettings } from './settings'
@@ -46,7 +46,7 @@ type QboLine = {
 export async function pushSalesInvoice(
   data: InvoiceData,
   _status?: string,
-  opts?: { customerId?: string },
+  opts?: { customerId?: string; requestId?: string },
 ): Promise<{ success: boolean; invoiceId?: string; invoiceNumber?: string; total?: number; error?: string }> {
   try {
     // Find or create customer
@@ -188,7 +188,9 @@ export async function pushSalesInvoice(
     if (data.currency) invoiceBody.CurrencyRef = { value: data.currency }
     if (data.reference) invoiceBody.PrivateNote = data.reference
 
-    const res = await qboPost<{ Invoice: QboInvoice }>('invoice', invoiceBody)
+    const res = opts?.requestId
+      ? await qboPostIdempotent<{ Invoice: QboInvoice }>('invoice', invoiceBody, opts.requestId)
+      : await qboPost<{ Invoice: QboInvoice }>('invoice', invoiceBody)
     if (!res.ok || !res.data) {
       return { success: false, error: res.error ?? 'Failed to create invoice' }
     }

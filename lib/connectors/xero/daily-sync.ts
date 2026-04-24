@@ -885,6 +885,9 @@ export async function runDailyBatchSync(): Promise<{
             // write them again or track layerDecrements (already consumed)
           }
         }
+        // Only publish legacy FIFO decrements after the whole order succeeds.
+        // Failed orders keep shipmentJournalDate null and must not mutate layer
+        // balances before their next retry.
         for (const [layerId, decrement] of orderLayerDecrements) {
           layerDecrements.set(layerId, (layerDecrements.get(layerId) ?? 0) + decrement)
         }

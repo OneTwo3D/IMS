@@ -1295,7 +1295,7 @@ export async function updateShipmentStatus(
             where: { productId: line.productId, warehouseId: shipment.warehouseId },
             data: { quantity: { decrement: qty } },
           })
-          await tx.stockMovement.create({
+          const movement = await tx.stockMovement.create({
             data: {
               type: 'SALE_DISPATCH',
               productId: line.productId,
@@ -1305,6 +1305,7 @@ export async function updateShipmentStatus(
               referenceType: 'SalesOrder',
               referenceId: shipment.orderId,
             },
+            select: { id: true },
           })
 
           // Consume FIFO cost layers at shipment time so inventory
@@ -1315,6 +1316,15 @@ export async function updateShipmentStatus(
           )
           totalShipmentCogs += totalCost
           if (consumed.length > 0) {
+            await tx.cogsEntry.createMany({
+              data: consumed.map((entry) => ({
+                costLayerId: entry.costLayerId,
+                movementId: movement.id,
+                qty: entry.qty,
+                unitCostBase: entry.unitCostBase,
+                totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+              })),
+            })
             await tx.shipmentLine.update({
               where: { id: line.id },
               data: {
