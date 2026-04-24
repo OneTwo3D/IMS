@@ -3,6 +3,7 @@
  */
 
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 import type { WcAddress, WcFullOrder, WcLineItem, WcCouponLine, WcFeeLine } from './types'
 
@@ -303,16 +304,36 @@ export function extractWcTracking(order: WcFullOrder): { carrier: string; tracki
 // FX rate lookup
 // ---------------------------------------------------------------------------
 
-export async function getFxRateToGbp(currency: string): Promise<number> {
-  if (currency === 'GBP') return 1
+export async function getFxRateToGbp(currency: string, asOf?: Date): Promise<number> {
+  const normalizedCurrency = currency.trim().toUpperCase()
+  if (normalizedCurrency === 'GBP') return 1
 
-  // Get latest FX rate: stored as 1 GBP = X foreign
+  // Get date-bounded FX rate: stored as 1 GBP = X foreign.
+  // Never silently fall back to 1:1 for foreign currencies; that corrupts
+  // revenue, COGS, and accounting sync downstream.
   const rate = await db.fxRate.findFirst({
-    where: { fromCurrency: 'GBP', toCurrency: currency },
+    where: {
+      fromCurrency: 'GBP',
+      toCurrency: normalizedCurrency,
+      ...(asOf ? { fetchedAt: { lte: asOf } } : {}),
+    },
     orderBy: { fetchedAt: 'desc' },
     select: { rate: true },
   })
+  if (!rate) {
+    const message = `Missing GBP FX rate for ${normalizedCurrency}${asOf ? ` on or before ${asOf.toISOString().slice(0, 10)}` : ''}`
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_order_fx_missing',
+      tag: 'sync',
+      level: 'ERROR',
+      description: message,
+      metadata: { currency: normalizedCurrency, asOf: asOf?.toISOString() ?? null },
+      resolveUser: false,
+    })
+    throw new Error(message)
+  }
   // fxRateToBase in the SalesOrder means: foreign / fxRate = GBP
   // So if 1 GBP = 1.15 EUR, fxRateToBase = 1.15
-  return rate ? Number(rate.rate) : 1
+  return Number(rate.rate)
 }

@@ -271,15 +271,15 @@ export function ProductsStep({
 
             {(shopifyEnabled || shopifyConnected) && (
               <div className="flex flex-col gap-1">
-                <Button
-                  variant="outline"
-                  onClick={handleShopifyProductSync}
-                  disabled={!shopifyConnected || shopifyPending}
-                  title={!shopifyConnected ? 'Connect Shopify first to enable product import.' : 'Shopify product import is not wired yet — this will return a helpful error.'}
-                >
-                  {shopifyPending ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
-                  {shopifyPending ? 'Importing...' : 'Import Products from Shopify'}
-                </Button>
+	                <Button
+	                  variant="outline"
+	                  onClick={handleShopifyProductSync}
+	                  disabled
+	                  title={!shopifyConnected ? 'Connect Shopify first to enable product import.' : 'Shopify product import is not wired yet.'}
+	                >
+	                  {shopifyPending ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}
+	                  {shopifyPending ? 'Importing...' : 'Import Products from Shopify (coming soon)'}
+	                </Button>
                 {shopifyMessage && (
                   <span className={`text-xs ${shopifyMessage.isError ? 'text-destructive' : 'text-green-600'}`}>
                     {shopifyMessage.text}

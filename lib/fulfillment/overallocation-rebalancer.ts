@@ -47,6 +47,7 @@ export async function releaseOverallocations(
 
   type TxOutcome = {
     releases: Array<{ orderId: string; orderRef: string; productId: string; warehouseId: string; qty: number }>
+    pendingShipmentDeletes: Array<{ orderId: string; orderRef: string; count: number }>
     skipped: number
   }
 
@@ -79,7 +80,7 @@ export async function releaseOverallocations(
       const lockOrderIds = [...candidateOrderIds].sort()
 
       const txOutcome: TxOutcome = await db.$transaction(async (tx) => {
-        const pending: TxOutcome = { releases: [], skipped: 0 }
+        const pending: TxOutcome = { releases: [], pendingShipmentDeletes: [], skipped: 0 }
 
         await tx.$queryRaw(
           Prisma.sql`SELECT id FROM "sales_orders" WHERE id IN (${Prisma.join(lockOrderIds)}) FOR UPDATE`,
@@ -173,7 +174,14 @@ export async function releaseOverallocations(
           // order reverts to pre-picking state and the user re-runs
           // confirm-for-picking to regenerate shipments.
           if (!pendingShipmentsCleared.has(alloc.orderId)) {
-            await tx.shipment.deleteMany({ where: { orderId: alloc.orderId, status: 'PENDING' } })
+            const deletedPending = await tx.shipment.deleteMany({ where: { orderId: alloc.orderId, status: 'PENDING' } })
+            if (deletedPending.count > 0) {
+              pending.pendingShipmentDeletes.push({
+                orderId: alloc.orderId,
+                orderRef: alloc.order.orderNumber ?? alloc.order.externalOrderNumber ?? alloc.orderId.slice(0, 8),
+                count: deletedPending.count,
+              })
+            }
             pendingShipmentsCleared.add(alloc.orderId)
           }
 
@@ -215,6 +223,17 @@ export async function releaseOverallocations(
       // back, any in-memory bookkeeping above is discarded.
       if (txOutcome) {
         result.skipped += txOutcome.skipped
+        for (const entry of txOutcome.pendingShipmentDeletes) {
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: entry.orderId,
+            action: 'pending_shipments_deleted',
+            tag: 'sales',
+            level: 'WARNING',
+            description: `Deleted ${entry.count} pending shipment(s) for order ${entry.orderRef} while releasing overallocations due to ${context.referenceLabel ?? context.source}`,
+            metadata: { source: context.source, referenceId: context.referenceId ?? null, count: entry.count },
+          })
+        }
         for (const entry of txOutcome.releases) {
           result.released += entry.qty
           touchedOrders.add(entry.orderId)
@@ -278,6 +297,9 @@ export async function releaseOverallocations(
     revalidatePath('/sales')
     for (const orderId of touchedOrders) {
       revalidatePath(`/sales/${orderId}`)
+    }
+    for (const productId of releasedProductIds) {
+      revalidatePath(`/inventory/${productId}`)
     }
   }
 

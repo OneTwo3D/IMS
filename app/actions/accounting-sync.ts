@@ -1,6 +1,7 @@
 'use server'
 
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { getAccountingConnector } from '@/lib/connectors/accounting-registry'
 
 export type AccountingAccountRow = {
   id: string
@@ -54,6 +55,11 @@ async function getActiveConnector(preferredConnector?: AccountingConnectorId): P
   return null
 }
 
+async function getActiveAccountingConnector(preferredConnector?: AccountingConnectorId) {
+  const connectorId = await getActiveConnector(preferredConnector)
+  return connectorId ? getAccountingConnector(connectorId) : null
+}
+
 export async function getAccountingIntegrationConnector() {
   const connector = await getActiveConnector()
   if (!connector) return null
@@ -65,33 +71,15 @@ export async function getAccountingIntegrationConnector() {
 }
 
 export async function getAccountingSettingsMasked(): Promise<AccountingConnectorSettingsMasked> {
-  const connector = await getActiveConnector()
-  switch (connector) {
-    case 'quickbooks': {
-      const { getQuickBooksSettingsMasked } = await import('@/app/actions/quickbooks-sync')
-      const s = await getQuickBooksSettingsMasked()
-      return s as unknown as AccountingConnectorSettingsMasked
-    }
-    default: {
-      const { getXeroSettingsMasked } = await import('@/app/actions/xero-sync')
-      const s = await getXeroSettingsMasked()
-      return s as unknown as AccountingConnectorSettingsMasked
-    }
-  }
+  const connector = await getActiveAccountingConnector()
+  return connector
+    ? connector.getSettingsMasked()
+    : getAccountingConnector('xero').getSettingsMasked()
 }
 
 export async function saveAccountingSettings(data: Record<string, string>): Promise<{ success: boolean; error?: string }> {
-  const connector = await getActiveConnector()
-  switch (connector) {
-    case 'quickbooks': {
-      const { saveQuickBooksSettings } = await import('@/app/actions/quickbooks-sync')
-      return saveQuickBooksSettings(data)
-    }
-    default: {
-      const { saveXeroSettings } = await import('@/app/actions/xero-sync')
-      return saveXeroSettings(data)
-    }
-  }
+  const connector = await getActiveAccountingConnector()
+  return (connector ?? getAccountingConnector('xero')).saveSettings(data)
 }
 
 export async function saveAccountingConnectionSettings(
@@ -99,34 +87,16 @@ export async function saveAccountingConnectionSettings(
   clientSecret: string,
   preferredConnector?: AccountingConnectorId,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
-  const connector = await getActiveConnector(preferredConnector)
+  const connector = await getActiveAccountingConnector(preferredConnector)
   if (!connector) {
     return { success: false, error: 'Enable Xero or QuickBooks first.' }
   }
-  switch (connector) {
-    case 'quickbooks': {
-      const { saveQuickBooksConnectionSettings } = await import('@/app/actions/quickbooks-sync')
-      return saveQuickBooksConnectionSettings(clientId, clientSecret)
-    }
-    default: {
-      const { saveXeroConnectionSettings } = await import('@/app/actions/xero-sync')
-      return saveXeroConnectionSettings(clientId, clientSecret)
-    }
-  }
+  return connector.saveConnectionSettings(clientId, clientSecret)
 }
 
 export async function getAccountingConnectionStatus(): Promise<AccountingConnectionStatus> {
-  const connector = await getActiveConnector()
-  switch (connector) {
-    case 'quickbooks': {
-      const { getQuickBooksConnectionStatus } = await import('@/app/actions/quickbooks-sync')
-      return getQuickBooksConnectionStatus()
-    }
-    default: {
-      const { getXeroConnectionStatus } = await import('@/app/actions/xero-sync')
-      return getXeroConnectionStatus()
-    }
-  }
+  const connector = await getActiveAccountingConnector()
+  return (connector ?? getAccountingConnector('xero')).getConnectionStatus()
 }
 
 export async function connectAccountingConnector(
@@ -136,83 +106,31 @@ export async function connectAccountingConnector(
   returnPath?: string,
   preferredConnector?: AccountingConnectorId,
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
-  const connector = await getActiveConnector(preferredConnector)
+  const connector = await getActiveAccountingConnector(preferredConnector)
   if (!connector) {
     return { success: false, error: 'Enable Xero or QuickBooks first.' }
   }
-  switch (connector) {
-    case 'quickbooks': {
-      const { connectQuickBooks } = await import('@/app/actions/quickbooks-sync')
-      return connectQuickBooks(clientId, clientSecret, origin, returnPath)
-    }
-    default: {
-      const { connectXero } = await import('@/app/actions/xero-sync')
-      return connectXero(clientId, clientSecret, origin, returnPath)
-    }
-  }
+  return connector.connect(clientId, clientSecret, origin, returnPath)
 }
 
 export async function disconnectAccountingConnector(): Promise<{ success: boolean; error?: string }> {
-  const connector = await getActiveConnector()
-  switch (connector) {
-    case 'quickbooks': {
-      const { disconnectQuickBooks } = await import('@/app/actions/quickbooks-sync')
-      return disconnectQuickBooks()
-    }
-    default: {
-      const { disconnectXero } = await import('@/app/actions/xero-sync')
-      return disconnectXero()
-    }
-  }
+  const connector = await getActiveAccountingConnector()
+  return (connector ?? getAccountingConnector('xero')).disconnect()
 }
 
 export async function syncAccountingAccounts(): Promise<{ synced: number; errors: string[] }> {
-  const connector = await getActiveConnector()
-  switch (connector) {
-    case 'quickbooks': {
-      const { syncQuickBooksAccounts } = await import('@/app/actions/quickbooks-sync')
-      return syncQuickBooksAccounts()
-    }
-    default: {
-      const { syncAccountingAccounts: impl } = await import('@/app/actions/xero-sync')
-      return impl()
-    }
-  }
+  const connector = await getActiveAccountingConnector()
+  return (connector ?? getAccountingConnector('xero')).syncAccounts()
 }
 
 export async function getAccountingAccounts(): Promise<AccountingAccountRow[]> {
-  const connector = await getActiveConnector()
-  switch (connector) {
-    case 'quickbooks': {
-      const { getQuickBooksAccounts } = await import('@/app/actions/quickbooks-sync')
-      return getQuickBooksAccounts()
-    }
-    default: {
-      const { getAccountingAccounts: impl } = await import('@/app/actions/xero-sync')
-      const rows = await impl()
-      return rows.map((row) => ({
-        id: row.id,
-        externalAccountId: row.externalAccountId,
-        code: row.code,
-        name: row.name,
-        type: row.type,
-      }))
-    }
-  }
+  const connector = await getActiveAccountingConnector()
+  return (connector ?? getAccountingConnector('xero')).getAccounts()
 }
 
 export async function fetchAccountingTaxRates(): Promise<AccountingTaxCodeRow[]> {
-  const connector = await getActiveConnector()
-  switch (connector) {
-    case 'quickbooks': {
-      const { fetchQuickBooksTaxCodes } = await import('@/app/actions/quickbooks-sync')
-      return fetchQuickBooksTaxCodes()
-    }
-    default: {
-      const { fetchXeroTaxRates } = await import('@/app/actions/xero-sync')
-      return fetchXeroTaxRates()
-    }
-  }
+  const connector = await getActiveAccountingConnector()
+  return (connector ?? getAccountingConnector('xero')).fetchTaxRates()
 }
 
 export async function autoLinkAccountingTaxRates(): Promise<{
@@ -223,83 +141,26 @@ export async function autoLinkAccountingTaxRates(): Promise<{
   externalRatesCount: number
   error?: string
 }> {
-  // Tax auto-linking currently only implemented for Xero
-  const { autoLinkXeroTaxRates } = await import('@/app/actions/settings')
-  const result = await autoLinkXeroTaxRates()
-  return {
-    success: result.success,
-    linked: result.linked,
-    alreadyLinked: result.alreadyLinked,
-    unmatched: result.unmatched,
-    externalRatesCount: result.xeroRatesCount,
-    error: result.error,
-  }
+  const connector = await getActiveAccountingConnector()
+  return (connector ?? getAccountingConnector('xero')).autoLinkTaxRates()
 }
 
 export async function getAccountingSyncLogs(limit = 50): Promise<AccountingSyncLogRow[]> {
-  const connector = await getActiveConnector()
-  switch (connector) {
-    case 'quickbooks': {
-      const { getQuickBooksSyncLogs } = await import('@/app/actions/quickbooks-sync')
-      return getQuickBooksSyncLogs(limit)
-    }
-    default: {
-      const { getXeroSyncLogs } = await import('@/app/actions/xero-sync')
-      const rows = await getXeroSyncLogs(limit)
-      return rows.map((row) => ({
-        id: row.id,
-        type: row.type,
-        status: row.status,
-        referenceType: row.referenceType,
-        referenceId: row.referenceId,
-        externalTransactionId: row.externalTransactionId,
-        errorMessage: row.errorMessage,
-        retryCount: row.retryCount,
-        syncedAt: row.syncedAt,
-        createdAt: row.createdAt,
-      }))
-    }
-  }
+  const connector = await getActiveAccountingConnector()
+  return (connector ?? getAccountingConnector('xero')).getSyncLogs(limit)
 }
 
 export async function triggerAccountingSync(): Promise<{ success: boolean; result?: unknown; error?: string }> {
-  const connector = await getActiveConnector()
-  switch (connector) {
-    case 'quickbooks': {
-      const { triggerQuickBooksSync } = await import('@/app/actions/quickbooks-sync')
-      return triggerQuickBooksSync()
-    }
-    default: {
-      const { triggerXeroSync } = await import('@/app/actions/xero-sync')
-      return triggerXeroSync()
-    }
-  }
+  const connector = await getActiveAccountingConnector()
+  return (connector ?? getAccountingConnector('xero')).triggerSync()
 }
 
 export async function retryFailedAccountingSync(entryId?: string): Promise<{ success: boolean; reset: number; error?: string }> {
-  const connector = await getActiveConnector()
-  switch (connector) {
-    case 'quickbooks': {
-      const { retryFailedQuickBooksSync } = await import('@/app/actions/quickbooks-sync')
-      return retryFailedQuickBooksSync(entryId)
-    }
-    default: {
-      const { retryFailedXeroSync } = await import('@/app/actions/xero-sync')
-      return retryFailedXeroSync(entryId)
-    }
-  }
+  const connector = await getActiveAccountingConnector()
+  return (connector ?? getAccountingConnector('xero')).retryFailedSync(entryId)
 }
 
 export async function getAccountingSyncReadiness(): Promise<AccountingSyncReadiness> {
-  const connector = await getActiveConnector()
-  switch (connector) {
-    case 'quickbooks': {
-      const { getQuickBooksSyncReadiness } = await import('@/app/actions/quickbooks-sync')
-      return getQuickBooksSyncReadiness()
-    }
-    default: {
-      const { getXeroSyncReadiness } = await import('@/app/actions/xero-sync')
-      return getXeroSyncReadiness()
-    }
-  }
+  const connector = await getActiveAccountingConnector()
+  return (connector ?? getAccountingConnector('xero')).getSyncReadiness()
 }

@@ -20,6 +20,13 @@ function isPrivateIpv6(host: string): boolean {
   return normalized === '::1' || normalized.startsWith('fc') || normalized.startsWith('fd') || normalized.startsWith('fe80:')
 }
 
+function isLoopbackHost(host: string): boolean {
+  const normalized = host.toLowerCase()
+  if (normalized === 'localhost' || normalized.endsWith('.localhost') || normalized === '::1') return true
+  const parts = normalized.split('.').map((part) => Number.parseInt(part, 10))
+  return parts.length === 4 && parts[0] === 127
+}
+
 export function validateWooCommerceBaseUrl(rawUrl: string): { ok: true; normalizedUrl: string } | { ok: false; error: string } {
   let parsed: URL
   try {
@@ -28,17 +35,19 @@ export function validateWooCommerceBaseUrl(rawUrl: string): { ok: true; normaliz
     return { ok: false, error: 'WooCommerce URL is invalid.' }
   }
 
-  if (!['http:', 'https:'].includes(parsed.protocol)) {
-    return { ok: false, error: 'WooCommerce URL must use http or https.' }
+  const host = parsed.hostname.toLowerCase()
+  const allowE2eLocalHttp = process.env.E2E_TEST_MODE === '1' && parsed.protocol === 'http:' && isLoopbackHost(host)
+
+  if (parsed.protocol !== 'https:' && !allowE2eLocalHttp) {
+    return { ok: false, error: 'WooCommerce URL must use https.' }
   }
 
-  const host = parsed.hostname.toLowerCase()
-  if (host === 'localhost' || host.endsWith('.localhost')) {
+  if (!allowE2eLocalHttp && (host === 'localhost' || host.endsWith('.localhost'))) {
     return { ok: false, error: 'WooCommerce URL cannot target localhost.' }
   }
 
   const ipVersion = isIP(host)
-  if ((ipVersion === 4 && isPrivateIpv4(host)) || (ipVersion === 6 && isPrivateIpv6(host))) {
+  if (!allowE2eLocalHttp && ((ipVersion === 4 && isPrivateIpv4(host)) || (ipVersion === 6 && isPrivateIpv6(host)))) {
     return { ok: false, error: 'WooCommerce URL cannot target loopback, link-local, or private network addresses.' }
   }
 

@@ -4,6 +4,7 @@ import { config as loadDotenv } from 'dotenv'
 loadDotenv({ path: '.env.local', override: false })
 loadDotenv({ path: '.env', override: false })
 process.env.E2E_ROUTE_SECRET ??= 'e2e-route-secret'
+process.env.E2E_TEST_MODE ??= '1'
 
 const PORT = Number(process.env.E2E_PORT ?? 3001)
 const baseURL = process.env.E2E_BASE_URL ?? `http://localhost:${PORT}`
@@ -88,7 +89,7 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: `npm run db:seed:e2e && npm run dev -- --hostname 0.0.0.0 --port ${PORT}`,
+    command: `node scripts/clear-stale-next-dev-lock.mjs && npm run db:seed:e2e && node scripts/clear-stale-next-dev-lock.mjs && npm run dev -- --hostname 0.0.0.0 --port ${PORT}`,
     url: webServerURL,
     reuseExistingServer: !process.env.CI,
     timeout: 120000,

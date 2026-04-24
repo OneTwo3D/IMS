@@ -282,7 +282,7 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, emai
                 >
                   {uploading ? <Loader2 className="h-5 w-5 text-white animate-spin" /> : <Camera className="h-5 w-5 text-white" />}
                 </button>
-                <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp,image/svg+xml" className="hidden" onChange={(e) => handleLogoUpload(e, 'icon')} />
+                <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/webp" className="hidden" onChange={(e) => handleLogoUpload(e, 'icon')} />
               </div>
               <div className="flex items-center gap-1">
                 <Button variant="outline" size="sm" className="text-xs h-7" onClick={() => fileRef.current?.click()} disabled={uploading}>
@@ -315,7 +315,7 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, emai
                 >
                   {uploadingDoc ? <Loader2 className="h-5 w-5 text-white animate-spin" /> : <Camera className="h-5 w-5 text-white" />}
                 </button>
-                <input ref={docFileRef} type="file" accept="image/jpeg,image/png,image/webp,image/svg+xml" className="hidden" onChange={(e) => handleLogoUpload(e, 'document')} />
+                <input ref={docFileRef} type="file" accept="image/jpeg,image/png,image/webp" className="hidden" onChange={(e) => handleLogoUpload(e, 'document')} />
               </div>
               <div className="flex items-center gap-1">
                 <Button variant="outline" size="sm" className="text-xs h-7" onClick={() => docFileRef.current?.click()} disabled={uploadingDoc}>

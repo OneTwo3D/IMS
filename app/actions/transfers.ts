@@ -15,6 +15,8 @@ import {
   type ConsumedLayer,
 } from '@/lib/cost-layers'
 
+const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -400,7 +402,7 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
         data: { status: 'IN_TRANSIT', dispatchedAt: new Date() },
       })
       if (updated.count === 0) throw new Error('Transfer was already dispatched')
-    })
+    }, STOCK_TX_OPTIONS)
 
     revalidatePath('/stock-control/transfers')
     revalidatePath('/inventory')
@@ -488,6 +490,24 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
         select: { id: true, productId: true, costLayerSnapshot: true },
       })
       const snapshotByLineId = new Map(linesWithSnapshots.map((l) => [l.id, l.costLayerSnapshot]))
+      const productIds = transfer.lines.map((line) => line.productId)
+      if (productIds.length > 0) {
+        await tx.stockLevel.createMany({
+          data: productIds.map((productId) => ({
+            productId,
+            warehouseId: transfer.toWarehouseId,
+            quantity: 0,
+          })),
+          skipDuplicates: true,
+        })
+        await tx.$executeRaw`
+          SELECT "productId", "warehouseId"
+          FROM stock_levels
+          WHERE "productId" = ANY(${productIds}::text[])
+            AND "warehouseId" = ${transfer.toWarehouseId}
+          FOR UPDATE
+        `
+      }
 
       for (const line of transfer.lines) {
         const qty = Number(line.qty)
@@ -541,7 +561,7 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
         data: { status: 'RECEIVED', completedAt: new Date() },
       })
       if (updated.count === 0) throw new Error('Transfer was already received')
-    })
+    }, STOCK_TX_OPTIONS)
 
     revalidatePath('/stock-control/transfers')
     revalidatePath('/inventory')

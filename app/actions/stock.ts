@@ -156,6 +156,19 @@ export async function applyStockAdjustment({
     }
   }
 
+  await tx.stockLevel.upsert({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    create: { productId, warehouseId, quantity: 0 },
+    update: {},
+  })
+  await tx.$executeRaw`
+    SELECT "productId", "warehouseId"
+    FROM stock_levels
+    WHERE "productId" = ${productId}
+      AND "warehouseId" = ${warehouseId}
+    FOR UPDATE
+  `
+
   const movement = await tx.stockMovement.create({
     data: {
       type: 'ADJUSTMENT',

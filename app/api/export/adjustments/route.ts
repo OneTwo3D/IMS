@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
-import { auth } from '@/lib/auth'
+import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 
 const HEADERS = ['sku', 'warehouseCode', 'qty', 'note']
@@ -8,8 +8,8 @@ const TEMPLATE_HEADERS = ['sku', 'warehouseCode', 'qty', 'note']
 const REQUIRED_HEADERS = ['sku', 'warehouseCode', 'qty']
 
 export async function GET(req: Request) {
-  const session = await auth()
-  if (!session?.user) return new Response('Unauthorized', { status: 401 })
+  const session = await requireApiAuth()
+  if (session instanceof Response) return session
   if (!hasPermission(session.user.role, 'stock_control')) return new Response('Forbidden', { status: 403 })
 
   const url = new URL(req.url)

@@ -42,7 +42,15 @@ export function LoadingProgress({ active, label, detail, className = '', value, 
   if (!active) return null
 
   return (
-    <div className={`w-full space-y-1 ${className}`.trim()}>
+    <div
+      className={`w-full space-y-1 ${className}`.trim()}
+      role="progressbar"
+      aria-busy={active}
+      aria-label={label ?? 'Loading progress'}
+      aria-valuemin={hasDeterminateProgress ? 0 : undefined}
+      aria-valuemax={hasDeterminateProgress ? max : undefined}
+      aria-valuenow={hasDeterminateProgress ? value : undefined}
+    >
       <div className="h-1.5 w-full overflow-hidden rounded-full bg-muted">
         <div
           className="h-full rounded-full bg-primary transition-[width] duration-300 ease-out"
@@ -50,7 +58,7 @@ export function LoadingProgress({ active, label, detail, className = '', value, 
         />
       </div>
       {label ? <p className="text-[11px] text-muted-foreground">{label}</p> : null}
-      {detail ? <p className="text-[11px] text-muted-foreground">{detail}</p> : null}
+      {detail ? <p className="text-[11px] text-muted-foreground" aria-live="polite">{detail}</p> : null}
     </div>
   )
 }

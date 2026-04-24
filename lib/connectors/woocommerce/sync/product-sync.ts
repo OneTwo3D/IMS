@@ -21,6 +21,7 @@ import type { WcFullProduct, WcVariation, SyncResult } from './types'
 
 const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
 const MANUAL_PRODUCT_SYNC_JOB_KEY = 'manual_wc_product_sync_job'
+const MANUAL_PRODUCT_SYNC_STALE_MS = 30 * 60 * 1000
 
 export type ManualProductSyncProgress = {
   status: 'idle' | 'running' | 'done' | 'error'
@@ -32,6 +33,8 @@ export type ManualProductSyncProgress = {
   currentPage: number
   totalPages: number
   errors: string[]
+  startedAt?: string
+  updatedAt?: string
 }
 
 type ProductSyncProgressSnapshot = {
@@ -77,12 +80,17 @@ export async function getManualWcProductSyncProgress(): Promise<ManualProductSyn
 
 export async function startManualWcProductSync(): Promise<void> {
   const current = await getManualWcProductSyncProgress()
-  if (current.status === 'running') return
+  if (current.status === 'running') {
+    const updatedAt = current.updatedAt ? Date.parse(current.updatedAt) : NaN
+    if (Number.isFinite(updatedAt) && Date.now() - updatedAt < MANUAL_PRODUCT_SYNC_STALE_MS) return
+  }
 
   const progress: ManualProductSyncProgress = {
     ...INITIAL_MANUAL_PRODUCT_SYNC_PROGRESS,
     status: 'running',
     message: 'Preparing WooCommerce product import...',
+    startedAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
   }
   await saveManualProductSyncProgress(progress)
 
@@ -107,6 +115,7 @@ async function runManualWcProductSync(progress: ManualProductSyncProgress) {
       progress.currentPage = snapshot.currentPage
       progress.totalPages = snapshot.totalPages
       progress.errors = snapshot.errors
+      progress.updatedAt = new Date().toISOString()
       await saveManualProductSyncProgress(progress)
     },
   })
@@ -116,6 +125,7 @@ async function runManualWcProductSync(progress: ManualProductSyncProgress) {
   progress.productsImported = result.synced
   progress.productsSkipped = result.skipped
   progress.errors = result.errors
+  progress.updatedAt = new Date().toISOString()
 
   const totalProducts = progress.totalProducts || (result.synced + result.skipped)
   if (totalProducts > 0) {
@@ -805,12 +815,15 @@ export async function syncAllWcProducts(
     page++
   }
 
-  // Update last sync timestamp
-  await db.setting.upsert({
-    where: { key: cursorKey },
-    create: { key: cursorKey, value: new Date().toISOString() },
-    update: { value: new Date().toISOString() },
-  })
+  // Only advance the cursor after a fully clean run. Advancing after a fetch
+  // or import error can permanently skip remote changes older than now.
+  if (result.errors.length === 0) {
+    await db.setting.upsert({
+      where: { key: cursorKey },
+      create: { key: cursorKey, value: new Date().toISOString() },
+      update: { value: new Date().toISOString() },
+    })
+  }
 
   if (result.synced > 0) {
     await logActivity({

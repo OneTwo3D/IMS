@@ -1,4 +1,4 @@
-import { auth } from '@/lib/auth'
+import { requireApiAuth } from '@/lib/auth/server'
 import { db } from '@/lib/db'
 import { csvResponse, toCsv } from '@/lib/csv'
 import { hasPermission } from '@/lib/permissions'
@@ -9,8 +9,8 @@ export async function GET(
   _request: Request,
   context: { params: Promise<{ jobId: string }> },
 ) {
-  const session = await auth()
-  if (!session?.user) return new Response('Unauthorized', { status: 401 })
+  const session = await requireApiAuth()
+  if (session instanceof Response) return session
   if (!hasPermission(session.user.role, 'sync')) return new Response('Forbidden', { status: 403 })
 
   const { jobId } = await context.params

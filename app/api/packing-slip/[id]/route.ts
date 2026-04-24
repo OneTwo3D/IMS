@@ -1,5 +1,5 @@
 import { NextResponse } from 'next/server'
-import { auth } from '@/lib/auth'
+import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { db } from '@/lib/db'
 import {
@@ -16,8 +16,8 @@ import { formatCountryDisplay } from '@/lib/countries'
 import { expandFulfillmentRequirements, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
-  const session = await auth()
-  if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireApiAuth()
+  if (session instanceof NextResponse) return session
   if (!hasPermission(session.user.role, 'sales')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
   const { id } = await params

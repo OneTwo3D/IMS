@@ -437,6 +437,11 @@ export async function getSalesOrderAdminLink(orderId: string): Promise<ShoppingE
 }
 
 export async function handleShoppingWebhook(connector: ShoppingConnectorId, resource: ShoppingWebhookResource, request: Request) {
+  const pluginState = await getIntegrationPluginState()
+  if (!pluginState[connector]) {
+    return Response.json({ error: `${getShoppingConnector(connector).label} plugin is disabled` }, { status: 423 })
+  }
+
   switch (connector) {
     case 'woocommerce': {
       const { handleWcWebhook } = await import('@/lib/connectors/woocommerce/webhooks')

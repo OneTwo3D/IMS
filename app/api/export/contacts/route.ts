@@ -1,15 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
-import { auth } from '@/lib/auth'
+import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 
 const HEADERS = ['customerId', 'firstName', 'lastName', 'email', 'phone', 'company', 'taxNumber', 'billing_line1', 'billing_line2', 'billing_city', 'billing_county', 'billing_postcode', 'billing_country', 'shipping_line1', 'shipping_line2', 'shipping_city', 'shipping_county', 'shipping_postcode', 'shipping_country', 'notes']
 const REQUIRED_HEADERS = ['firstName']
 
 export async function GET(req: NextRequest) {
-  const session = await auth()
-  if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireApiAuth()
+  if (session instanceof NextResponse) return session
   if (!hasPermission(session.user.role, 'sales')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
   const template = req.nextUrl.searchParams.get('template')

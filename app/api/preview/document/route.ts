@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { auth } from '@/lib/auth'
+import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { db } from '@/lib/db'
 import {
@@ -300,8 +300,8 @@ const GENERATORS: Record<string, (b: Branding) => Promise<Buffer>> = {
 }
 
 export async function GET(req: NextRequest) {
-  const session = await auth()
-  if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireApiAuth()
+  if (session instanceof NextResponse) return session
   if (!hasPermission(session.user.role, 'settings')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
   const type = req.nextUrl.searchParams.get('type')

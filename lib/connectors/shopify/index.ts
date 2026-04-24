@@ -646,7 +646,7 @@ export async function handleWebhook(
   const webhookId = request.headers.get('x-shopify-webhook-id')
   const eventId = request.headers.get('x-shopify-event-id')
   const shopDomain = request.headers.get('x-shopify-shop-domain')
-  const message = 'Shopify webhook processing is not implemented yet, so this delivery was rejected for retry'
+  const message = 'Shopify webhook processing is not implemented yet; delivery was acknowledged without mutating IMS data'
 
   await recordShopifySyncLog({
     direction: 'FROM_CONNECTOR',
@@ -672,8 +672,9 @@ export async function handleWebhook(
     shopDomain,
     webhookId,
     eventId,
+    skipped: true,
     error: message,
-  }, { status: 503 })
+  }, { status: 202 })
 }
 
 export async function getProductLink(sku: string): Promise<ShoppingProductLinkResult> {

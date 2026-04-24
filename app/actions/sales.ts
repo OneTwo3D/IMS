@@ -1285,10 +1285,22 @@ export async function applySalesOrderStatusTransition(
     if (targetStatus === 'CANCELLED') {
       const { deallocateOrder } = await import('./allocation')
       await deallocateOrder(id)
-      await db.$transaction(async (tx) => {
-        await tx.shipment.deleteMany({ where: { orderId: id, status: { in: ['PENDING', 'PICKING', 'PACKED'] as const } } })
+      const deletedShipments = await db.$transaction(async (tx) => {
+        const deleted = await tx.shipment.deleteMany({ where: { orderId: id, status: { in: ['PENDING', 'PICKING', 'PACKED'] as const } } })
         await tx.salesOrder.update({ where: { id }, data })
+        return deleted.count
       }, STOCK_TX_OPTIONS)
+      if (deletedShipments > 0) {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: id,
+          action: 'pending_shipments_deleted',
+          tag: 'sales',
+          level: 'INFO',
+          description: `Deleted ${deletedShipments} pending shipment(s) while cancelling order ${getSalesOrderReference(so)}`,
+          metadata: { orderNumber: getSalesOrderReference(so), deletedShipments },
+        })
+      }
       orderUpdated = true
     }
 
@@ -1303,10 +1315,30 @@ export async function applySalesOrderStatusTransition(
       try {
         const { autoAllocateOrder } = await import('./allocation')
         await autoAllocateOrder(id)
-      } catch { /* Allocation failures must not block the status transition */ }
+      } catch (allocationError) {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: id,
+          action: 'draft_finalization_allocation_failed',
+          tag: 'sales',
+          level: 'WARNING',
+          description: `Failed to auto-allocate order ${getSalesOrderReference(so)} after status change: ${allocationError instanceof Error ? allocationError.message : String(allocationError)}`,
+          metadata: { orderNumber: getSalesOrderReference(so), targetStatus, error: String(allocationError) },
+        })
+      }
       try {
         await queueSalesInvoiceForOrder(id)
-      } catch { /* Accounting queue errors should never block status transitions */ }
+      } catch (accountingError) {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: id,
+          action: 'draft_finalization_accounting_queue_failed',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: `Failed to queue sales invoice for order ${getSalesOrderReference(so)} after status change: ${accountingError instanceof Error ? accountingError.message : String(accountingError)}`,
+          metadata: { orderNumber: getSalesOrderReference(so), targetStatus, error: String(accountingError) },
+        })
+      }
     }
 
     // Auto-generate invoice on ship if configured (skip its own log —
@@ -1333,9 +1365,19 @@ export async function applySalesOrderStatusTransition(
 
     // Push status to WooCommerce (fire-and-forget)
     if ((options?.pushStatusToWooCommerce ?? true) && so.externalOrderId) {
-      import('@/lib/connectors/woocommerce/sync/order-status').then((m) =>
-        m.pushImsStatusToWc(id, targetStatus as never).catch(() => {}),
-      )
+      import('@/lib/connectors/woocommerce/sync/order-status')
+        .then((m) => m.pushImsStatusToWc(id, targetStatus as never))
+        .catch(async (syncError) => {
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: id,
+            action: 'wc_status_push_failed',
+            tag: 'sync',
+            level: 'WARNING',
+            description: `Failed to push status ${targetStatus} for order ${getSalesOrderReference(so)} to WooCommerce: ${syncError instanceof Error ? syncError.message : String(syncError)}`,
+            metadata: { orderNumber: getSalesOrderReference(so), targetStatus, error: String(syncError) },
+          })
+        })
     }
 
     if (targetStatus === 'SHIPPED') {

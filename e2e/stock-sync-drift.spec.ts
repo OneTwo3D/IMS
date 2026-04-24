@@ -82,12 +82,19 @@ async function startFakeWc(
 ): Promise<{ url: string; close: () => Promise<void> }> {
   const server = http.createServer((req, res) => {
     const urlObj = new URL(req.url ?? '/', 'http://internal')
-    const path = urlObj.pathname
+    const apiPathIndex = urlObj.pathname.indexOf('/wp-json/wc/v3/')
+    const path = apiPathIndex > 0 ? urlObj.pathname.slice(apiPathIndex) : urlObj.pathname
     const method = req.method ?? 'GET'
 
     const send = (status: number, body: unknown) => {
       res.writeHead(status, { 'content-type': 'application/json' })
       res.end(JSON.stringify(body))
+    }
+
+    // GET /wp-json/wc/v3/settings/general/woocommerce_currency
+    // Used by the real connection-save flow to guard base-currency drift.
+    if (method === 'GET' && path === '/wp-json/wc/v3/settings/general/woocommerce_currency') {
+      return send(200, { id: 'woocommerce_currency', value: 'GBP' })
     }
 
     // GET /wp-json/wc/v3/products?include=... (preflight)
@@ -459,7 +466,7 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
     }
   })
 
-  test('changing WC credentials via Save Settings wipes cached externalProductId mappings', async ({ page }) => {
+  test('changing WC credentials via Save Connection wipes cached externalProductId mappings', async ({ page }) => {
     // Before: rebindProduct has a valid-looking cached mapping.
     const before = await db.product.findUnique({
       where: { id: rebindProductId! },
@@ -468,10 +475,9 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
     expect(before?.externalProductId).toBe(BigInt(REBIND_WC_PRODUCT_ID))
 
     // Navigate to Connection tab and bump `wc_url` by appending a
-    // path segment. The server action `saveWcCredentials` compares
-    // incoming values against what's currently in the DB and nulls
-    // every `externalProductId` in the same transaction when it sees a
-    // real change.
+    // path segment. The fake WC server accepts prefixed API paths, so
+    // this is a valid connection save while still exercising the
+    // server action's rebind/cache-wipe path.
     await page.goto('/sync?connector=woocommerce')
     await expect(page.getByRole('heading', { name: 'WooCommerce Connector' })).toBeVisible()
     await page.getByRole('button', { name: 'Connection', exact: true }).click()
@@ -482,8 +488,8 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
     const newUrl = `${originalUrl}/rebind-probe`
     await urlInput.fill(newUrl)
 
-    await page.getByRole('button', { name: /save settings/i }).click()
-    await expect(page.getByText(/saved/i)).toBeVisible({ timeout: 30_000 })
+    await page.getByRole('button', { name: /save connection/i }).click()
+    await expect(page.getByText(/connection verified against woocommerce/i)).toBeVisible({ timeout: 30_000 })
 
     // After: rebindProduct's cached id must be null.
     const after = await db.product.findUnique({
@@ -506,62 +512,67 @@ test.describe('WooCommerce stock-sync cache integrity', () => {
     await upsertSetting('wc_url', fakeWc!.url)
   })
 
-  test('credential rebind cannot commit while a stock batch is between its version check and POST completion', async () => {
+  test('credential rebind during a stock batch cannot overwrite the rebound mapping', async () => {
     state.pauseBatchResponse = true
     state.releaseBatchResponse = null
     recorder.batchPosts.length = 0
 
-    await db.product.update({
-      where: { id: batchFenceProductId! },
-      data: { externalProductId: BigInt(BATCH_FENCE_WC_PRODUCT_ID) },
-    })
-
-    const syncPromise = pushStockToWc()
-
-    await expect
-      .poll(
-        () => recorder.batchPosts.some((post) => (post.update ?? []).some((u) => u.id === BATCH_FENCE_WC_PRODUCT_ID)),
-        { timeout: 30_000 },
-      )
-      .toBe(true)
-
-    let rebindCommitted = false
-    const rebindPromise = db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
-      const currentVersion = await tx.setting.findUnique({
-        where: { key: WC_SETTINGS_VERSION_KEY },
-      })
-      const nextVersion = String((Number.parseInt(currentVersion?.value ?? '0', 10) || 0) + 1)
-      await tx.setting.upsert({
-        where: { key: WC_SETTINGS_VERSION_KEY },
-        create: { key: WC_SETTINGS_VERSION_KEY, value: nextVersion },
-        update: { value: nextVersion },
-      })
-      await tx.product.update({
+    try {
+      await db.product.update({
         where: { id: batchFenceProductId! },
-        data: { externalProductId: BigInt(REBOUND_BATCH_WC_PRODUCT_ID) },
+        data: { externalProductId: BigInt(BATCH_FENCE_WC_PRODUCT_ID) },
       })
-    }).then(() => {
-      rebindCommitted = true
-    })
 
-    await new Promise((resolve) => setTimeout(resolve, 300))
-    expect(rebindCommitted).toBe(false)
+      const syncPromise = pushStockToWc({ forceProductIds: [batchFenceProductId!] })
 
-    const releaseBatchResponse = state.releaseBatchResponse as (() => void) | null
-    if (!releaseBatchResponse) throw new Error('Expected releaseBatchResponse to be set before continuing')
-    releaseBatchResponse()
+      await expect
+        .poll(
+          () => recorder.batchPosts.some((post) => (post.update ?? []).some((u) => u.id === BATCH_FENCE_WC_PRODUCT_ID)),
+          { timeout: 30_000 },
+        )
+        .toBe(true)
 
-    await syncPromise
-    await rebindPromise
+      let rebindCommitted = false
+      const rebindPromise = db.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_SYNC_ADVISORY_LOCK_KEY})`
+        const currentVersion = await tx.setting.findUnique({
+          where: { key: WC_SETTINGS_VERSION_KEY },
+        })
+        const nextVersion = String((Number.parseInt(currentVersion?.value ?? '0', 10) || 0) + 1)
+        await tx.setting.upsert({
+          where: { key: WC_SETTINGS_VERSION_KEY },
+          create: { key: WC_SETTINGS_VERSION_KEY, value: nextVersion },
+          update: { value: nextVersion },
+        })
+        await tx.product.update({
+          where: { id: batchFenceProductId! },
+          data: { externalProductId: BigInt(REBOUND_BATCH_WC_PRODUCT_ID) },
+        })
+      }).then(() => {
+        rebindCommitted = true
+      })
 
-    const productAfter = await db.product.findUnique({
-      where: { id: batchFenceProductId! },
-      select: { externalProductId: true },
-    })
-    expect(productAfter?.externalProductId).toBe(BigInt(REBOUND_BATCH_WC_PRODUCT_ID))
+      await expect.poll(() => rebindCommitted, { timeout: 3_000 }).toBe(true)
 
-    state.pauseBatchResponse = false
-    state.releaseBatchResponse = null
+      const releaseBatchResponse = state.releaseBatchResponse as (() => void) | null
+      if (!releaseBatchResponse) throw new Error('Expected releaseBatchResponse to be set before continuing')
+      releaseBatchResponse()
+
+      const syncResult = await syncPromise
+      await rebindPromise
+
+      expect(syncResult.errors.some((error) => error.includes('credentials were rebound mid-run'))).toBe(true)
+
+      const productAfter = await db.product.findUnique({
+        where: { id: batchFenceProductId! },
+        select: { externalProductId: true },
+      })
+      expect(productAfter?.externalProductId).toBe(BigInt(REBOUND_BATCH_WC_PRODUCT_ID))
+    } finally {
+      const releaseBatchResponse = state.releaseBatchResponse as (() => void) | null
+      if (releaseBatchResponse) releaseBatchResponse()
+      state.pauseBatchResponse = false
+      state.releaseBatchResponse = null
+    }
   })
 })

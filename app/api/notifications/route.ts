@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { auth } from '@/lib/auth'
+import { requireApiAuth } from '@/lib/auth/server'
 import { db } from '@/lib/db'
 import { ensureCurrentReleaseNotification } from '@/lib/releases'
 
@@ -11,8 +11,8 @@ function jsonNoStore(body: unknown, init?: ResponseInit) {
 
 // GET — fetch notifications for current user (+ broadcasts with per-user read state)
 export async function GET() {
-  const session = await auth()
-  if (!session?.user) return jsonNoStore({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireApiAuth()
+  if (session instanceof NextResponse) return session
 
   const userId = session.user.id!
 
@@ -58,8 +58,8 @@ export async function GET() {
 
 // PATCH — mark notification(s) as read for the current user
 export async function PATCH(req: NextRequest) {
-  const session = await auth()
-  if (!session?.user) return jsonNoStore({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireApiAuth()
+  if (session instanceof NextResponse) return session
 
   const userId = session.user.id!
   const body = await req.json()

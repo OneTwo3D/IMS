@@ -374,7 +374,7 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
         <div className="flex items-center gap-3 mb-2">
           {CONNECTOR_LOGOS.woocommerce}
           <div>
-            <h2 className="text-lg font-semibold">Shopping Connector</h2>
+            <h2 className="text-lg font-semibold">WooCommerce Connector</h2>
             <p className="text-xs text-muted-foreground">Sync orders, products and stock levels</p>
           </div>
         </div>

@@ -32,6 +32,10 @@ const ALLOCATION_EPSILON = 0.000001
  * depend on. Reset the accounting flags so A2 re-runs for this order on
  * the next daily batch, re-snapshotting the updated allocations.
  *
+ * Invariant: allocation accounting is staged at the order level. A staged
+ * order must treat every allocation snapshot as a single replaceable set; the
+ * schema does not support mixed staged/unstaged snapshots for one order.
+ *
  * Safe to call unconditionally — no-ops when inventoryAllocatedDate is null.
  * Must run inside the same transaction as the allocation mutation.
  */
@@ -1004,98 +1008,114 @@ export async function confirmAllocations(
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.process')
     }
-    const so = await db.salesOrder.findUnique({
-      where: { id: orderId },
-      select: { orderNumber: true, externalOrderNumber: true, status: true },
-    })
-    if (!so) return { success: false, error: 'Order not found' }
-
-    const allocs = await db.orderAllocation.findMany({
-      where: { orderId },
-      select: { lineId: true, productId: true, warehouseId: true, qty: true },
-    })
-
-    if (!allocs.length) return { success: false, error: 'No allocations to confirm' }
-
-    // Fetch qty already committed in non-PENDING shipments (partial fulfillment)
-    const activeShipmentLines = await db.shipmentLine.findMany({
-      where: {
-        shipment: { orderId, status: { not: 'PENDING' } },
-      },
-      select: { lineId: true, productId: true, shipment: { select: { warehouseId: true } }, qty: true },
-    })
-    const committedByAllocationKey = new Map<string, number>()
-    for (const shipmentLine of activeShipmentLines) {
-      const key = `${shipmentLine.lineId}|${shipmentLine.shipment.warehouseId}|${shipmentLine.productId}`
-      committedByAllocationKey.set(
-        key,
-        (committedByAllocationKey.get(key) ?? 0) + Number(shipmentLine.qty),
-      )
-    }
-
-    const effectiveAllocs = allocs.map((alloc) => {
-      const key = `${alloc.lineId}|${alloc.warehouseId}|${alloc.productId}`
-      const committed = committedByAllocationKey.get(key) ?? 0
-      const effectiveQty = Math.max(0, Number(alloc.qty) - committed)
-      return { ...alloc, qty: effectiveQty }
-    }).filter((alloc) => alloc.qty > 0)
-
-    if (!effectiveAllocs.length) {
-      return { success: false, error: 'All allocated lines are already covered by active shipments' }
-    }
-
-    const integrityError = await validateAllocationIntegrity(db, orderId)
-    if (integrityError) {
-      return { success: false, error: integrityError }
-    }
-
-    // Delete existing pending shipments (re-confirm scenario)
-    await db.shipment.deleteMany({ where: { orderId, status: 'PENDING' } })
-
-    // Group effective allocations by warehouse
-    const byWarehouse = new Map<string, typeof effectiveAllocs>()
-    for (const a of effectiveAllocs) {
-      const group = byWarehouse.get(a.warehouseId) ?? []
-      group.push(a)
-      byWarehouse.set(a.warehouseId, group)
-    }
-
-    // Create a shipment per warehouse
-    for (const [warehouseId, whAllocs] of byWarehouse) {
-      await db.shipment.create({
-        data: {
-          orderId,
-          warehouseId,
-          status: 'PENDING',
-          lines: {
-            create: whAllocs.map((a) => ({
-              lineId: a.lineId,
-              productId: a.productId,
-              qty: a.qty,
-            })),
-          },
-        },
-      })
-    }
-
-    // Keep status as ALLOCATED — shipment-level progression handles the rest
-    if (so.status !== 'ALLOCATED') {
-      await db.salesOrder.update({
+    const result = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      const so = await tx.salesOrder.findUnique({
         where: { id: orderId },
-        data: { status: 'ALLOCATED' },
+        select: { orderNumber: true, externalOrderNumber: true, status: true },
       })
-    }
+      if (!so) throw new Error('Order not found')
+
+      const allocs = await tx.orderAllocation.findMany({
+        where: { orderId },
+        select: { lineId: true, productId: true, warehouseId: true, qty: true },
+      })
+      if (!allocs.length) throw new Error('No allocations to confirm')
+
+      // Fetch qty already committed in non-PENDING shipments (partial fulfillment).
+      const activeShipmentLines = await tx.shipmentLine.findMany({
+        where: {
+          shipment: { orderId, status: { not: 'PENDING' } },
+        },
+        select: { lineId: true, productId: true, shipment: { select: { warehouseId: true } }, qty: true },
+      })
+      const committedByAllocationKey = new Map<string, number>()
+      for (const shipmentLine of activeShipmentLines) {
+        const key = `${shipmentLine.lineId}|${shipmentLine.shipment.warehouseId}|${shipmentLine.productId}`
+        committedByAllocationKey.set(
+          key,
+          (committedByAllocationKey.get(key) ?? 0) + Number(shipmentLine.qty),
+        )
+      }
+
+      const effectiveAllocs = allocs.map((alloc) => {
+        const key = `${alloc.lineId}|${alloc.warehouseId}|${alloc.productId}`
+        const committed = committedByAllocationKey.get(key) ?? 0
+        const effectiveQty = Math.max(0, Number(alloc.qty) - committed)
+        return { ...alloc, qty: effectiveQty }
+      }).filter((alloc) => alloc.qty > 0)
+
+      if (!effectiveAllocs.length) {
+        throw new Error('All allocated lines are already covered by active shipments')
+      }
+
+      const integrityError = await validateAllocationIntegrity(tx, orderId)
+      if (integrityError) throw new Error(integrityError)
+
+      // Delete existing pending shipments (re-confirm scenario) in the same
+      // transaction that rebuilds them, so crashes cannot orphan shipment rows.
+      const deletedPending = await tx.shipment.deleteMany({ where: { orderId, status: 'PENDING' } })
+
+      const byWarehouse = new Map<string, typeof effectiveAllocs>()
+      for (const a of effectiveAllocs) {
+        const group = byWarehouse.get(a.warehouseId) ?? []
+        group.push(a)
+        byWarehouse.set(a.warehouseId, group)
+      }
+
+      for (const [warehouseId, whAllocs] of byWarehouse) {
+        await tx.shipment.create({
+          data: {
+            orderId,
+            warehouseId,
+            status: 'PENDING',
+            lines: {
+              create: whAllocs.map((a) => ({
+                lineId: a.lineId,
+                productId: a.productId,
+                qty: a.qty,
+              })),
+            },
+          },
+        })
+      }
+
+      // Keep status as ALLOCATED — shipment-level progression handles the rest.
+      if (so.status !== 'ALLOCATED') {
+        await tx.salesOrder.update({
+          where: { id: orderId },
+          data: { status: 'ALLOCATED' },
+        })
+      }
+
+      return {
+        orderNumber: so.orderNumber ?? so.externalOrderNumber,
+        shipmentCount: byWarehouse.size,
+        deletedPendingCount: deletedPending.count,
+      }
+    }, STOCK_TX_OPTIONS)
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
+    if (result.deletedPendingCount > 0) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'pending_shipments_replaced',
+        tag: 'sales',
+        level: 'INFO',
+        description: `Replaced ${result.deletedPendingCount} pending shipment(s) while confirming allocations for order ${result.orderNumber}`,
+        metadata: { orderNumber: result.orderNumber, deletedPendingCount: result.deletedPendingCount },
+      })
+    }
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
       action: 'allocations_confirmed',
       tag: 'sales',
       level: 'INFO',
-      description: `Confirmed allocations for order ${so.orderNumber ?? so.externalOrderNumber} — ${byWarehouse.size} shipment(s) created`,
-      metadata: { orderNumber: so.orderNumber ?? so.externalOrderNumber, shipmentCount: byWarehouse.size },
+      description: `Confirmed allocations for order ${result.orderNumber} — ${result.shipmentCount} shipment(s) created`,
+      metadata: { orderNumber: result.orderNumber, shipmentCount: result.shipmentCount },
     })
     return { success: true }
   } catch (e) {
@@ -1370,6 +1390,7 @@ export async function updateShipmentTracking(
       include: {
         order: { select: { id: true, orderNumber: true, externalOrderNumber: true } },
         warehouse: { select: { code: true } },
+        lines: { select: { productId: true } },
       },
     })
     if (!shipment) return { success: false, error: 'Shipment not found' }
@@ -1406,6 +1427,9 @@ export async function updateShipmentTracking(
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${shipment.orderId}`)
+    for (const productId of new Set(shipment.lines.map((line) => line.productId))) {
+      revalidatePath(`/inventory/${productId}`)
+    }
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: shipment.orderId,

@@ -22,13 +22,13 @@
     "db:schema:drift": "node scripts/check-prisma-drift.mjs",
     "db:schema:scope": "node scripts/check-prisma-schema-scope.mjs",
     "cli": "tsx scripts/cli.ts",
-    "e2e": "playwright test",
+    "e2e": "NODE_OPTIONS='--import tsx' playwright test",
     "e2e:select": "node scripts/e2e-select.mjs",
-    "e2e:external": "playwright test --grep @external",
-    "e2e:wc": "playwright test --grep @wc",
-    "e2e:xero": "playwright test --grep @xero",
-    "e2e:headed": "playwright test --headed",
-    "e2e:ui": "playwright test --ui"
+    "e2e:external": "NODE_OPTIONS='--import tsx' playwright test --grep @external",
+    "e2e:wc": "NODE_OPTIONS='--import tsx' playwright test --grep @wc",
+    "e2e:xero": "NODE_OPTIONS='--import tsx' playwright test --grep @xero",
+    "e2e:headed": "NODE_OPTIONS='--import tsx' playwright test --headed",
+    "e2e:ui": "NODE_OPTIONS='--import tsx' playwright test --ui"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.1030.0",

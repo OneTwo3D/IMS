@@ -74,7 +74,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
 
     // Currency & FX
     const currency = wcOrder.currency || 'GBP'
-    const fxRate = await getFxRateToGbp(currency)
+    const orderedAt = wcOrder.date_created_gmt
+      ? new Date(`${wcOrder.date_created_gmt.replace(/Z$/, '')}Z`)
+      : (wcOrder.date_created ? new Date(wcOrder.date_created) : undefined)
+    const fxRate = await getFxRateToGbp(currency, orderedAt)
 
     const pricesIncludeVat = wcOrder.prices_include_tax
 
@@ -500,12 +503,15 @@ export async function syncNewWcOrders(
     page++
   }
 
-  // Update last sync timestamp
-  await db.setting.upsert({
-    where: { key: cursorKey },
-    create: { key: cursorKey, value: new Date().toISOString() },
-    update: { value: new Date().toISOString() },
-  })
+  // Only advance the cursor after a fully clean run. Advancing after a fetch
+  // or import error can permanently skip remote changes older than now.
+  if (result.errors.length === 0) {
+    await db.setting.upsert({
+      where: { key: cursorKey },
+      create: { key: cursorKey, value: new Date().toISOString() },
+      update: { value: new Date().toISOString() },
+    })
+  }
 
   if (result.synced > 0) {
     await logActivity({

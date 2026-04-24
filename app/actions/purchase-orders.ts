@@ -9,6 +9,7 @@ import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import {
+  consumeFifoLayersStrict,
   getReturnedQtyForCostLayer,
   refreshSalesOrderLineCogsForCostLayerChange,
   refreshShipmentCogsForCostLayerChange,
@@ -2055,7 +2056,26 @@ export async function returnPurchaseOrder(
 
       for (const rl of linesWithQty) {
         const poLine = po.lines.find((l) => l.id === rl.poLineId)!
-        await tx.stockMovement.create({
+        await tx.stockLevel.upsert({
+          where: { productId_warehouseId: { productId: poLine.productId, warehouseId: rl.warehouseId } },
+          create: { productId: poLine.productId, warehouseId: rl.warehouseId, quantity: 0 },
+          update: {},
+        })
+        await tx.$executeRaw`
+          SELECT "productId", "warehouseId"
+          FROM stock_levels
+          WHERE "productId" = ${poLine.productId}
+            AND "warehouseId" = ${rl.warehouseId}
+          FOR UPDATE
+        `
+        const lockedLevel = await tx.stockLevel.findUnique({
+          where: { productId_warehouseId: { productId: poLine.productId, warehouseId: rl.warehouseId } },
+          select: { quantity: true },
+        })
+        if (!lockedLevel || Number(lockedLevel.quantity) < rl.qtyReturned) {
+          throw new Error(`Insufficient stock to return (only ${Number(lockedLevel?.quantity ?? 0)} available)`)
+        }
+        const movement = await tx.stockMovement.create({
           data: {
             type: 'ADJUSTMENT',
             productId: poLine.productId,
@@ -2066,6 +2086,18 @@ export async function returnPurchaseOrder(
             referenceId: id,
           },
         })
+        const { consumed } = await consumeFifoLayersStrict(tx, poLine.productId, rl.warehouseId, rl.qtyReturned)
+        if (consumed.length > 0) {
+          await tx.cogsEntry.createMany({
+            data: consumed.map((entry) => ({
+              costLayerId: entry.costLayerId,
+              movementId: movement.id,
+              qty: entry.qty,
+              unitCostBase: entry.unitCostBase,
+              totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+            })),
+          })
+        }
         await tx.stockLevel.updateMany({
           where: { productId: poLine.productId, warehouseId: rl.warehouseId },
           data: { quantity: { decrement: rl.qtyReturned } },
@@ -2073,6 +2105,20 @@ export async function returnPurchaseOrder(
         await tx.purchaseOrderLine.update({
           where: { id: rl.poLineId },
           data: { qtyReturned: { increment: rl.qtyReturned } },
+        })
+      }
+      const updatedLines = await tx.purchaseOrderLine.findMany({
+        where: { poId: id },
+        select: { qtyReceived: true, qtyReturned: true },
+      })
+      const anyReturned = updatedLines.some((line) => Number(line.qtyReturned) > 0)
+      const allReceivedReturned = updatedLines
+        .filter((line) => Number(line.qtyReceived) > 0)
+        .every((line) => Number(line.qtyReturned) >= Number(line.qtyReceived) - 1e-6)
+      if (anyReturned) {
+        await tx.purchaseOrder.update({
+          where: { id },
+          data: { status: allReceivedReturned ? 'RETURNED' : 'PARTIALLY_RETURNED' },
         })
       }
     }, STOCK_TX_OPTIONS)

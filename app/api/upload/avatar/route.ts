@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { writeFile, mkdir } from 'fs/promises'
 import path from 'path'
 import sharp from 'sharp'
-import { auth } from '@/lib/auth'
+import { requireApiAuth } from '@/lib/auth/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 
@@ -15,8 +15,8 @@ const MIME_TO_EXT: Record<string, string> = {
 }
 
 export async function POST(req: NextRequest) {
-  const session = await auth()
-  if (!session?.user?.id) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  const session = await requireApiAuth()
+  if (session instanceof NextResponse) return session
 
   const formData = await req.formData()
   const file = formData.get('file') as File | null
