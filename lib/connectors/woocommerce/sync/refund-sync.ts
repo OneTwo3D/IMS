@@ -110,12 +110,12 @@ export async function syncWcRefund(
       await db.shoppingSyncLog.create({
         data: {
           direction: 'FROM_CONNECTOR',
-          status: 'FAILED',
+          status: 'PENDING',
           entityType: 'SalesOrder',
           entityId: so.id,
           externalId: String(wcRefund.id),
+          payload: wcRefund as never,
           errorMessage: error,
-          syncedAt: new Date(),
         },
       })
       return {

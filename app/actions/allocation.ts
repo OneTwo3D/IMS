@@ -1063,8 +1063,18 @@ export async function confirmAllocations(
       const integrityError = await validateAllocationIntegrity(tx, orderId)
       if (integrityError) throw new Error(integrityError)
 
+      const pendingShipmentMetadata = await tx.shipment.findMany({
+        where: { orderId, status: 'PENDING' },
+        select: { warehouseId: true, trackingNumber: true, shippingService: true },
+      })
+      const pendingMetadataByWarehouse = new Map(
+        pendingShipmentMetadata.map((shipment) => [shipment.warehouseId, shipment]),
+      )
+
       // Delete existing pending shipments (re-confirm scenario) in the same
       // transaction that rebuilds them, so crashes cannot orphan shipment rows.
+      // Preserve pending tracking/service metadata by warehouse; users may
+      // pre-stage carrier data before reconfirming allocation quantities.
       const deletedPending = await tx.shipment.deleteMany({ where: { orderId, status: 'PENDING' } })
 
       const byWarehouse = new Map<string, typeof effectiveAllocs>()
@@ -1075,11 +1085,14 @@ export async function confirmAllocations(
       }
 
       for (const [warehouseId, whAllocs] of byWarehouse) {
+        const pendingMetadata = pendingMetadataByWarehouse.get(warehouseId)
         await tx.shipment.create({
           data: {
             orderId,
             warehouseId,
             status: 'PENDING',
+            trackingNumber: pendingMetadata?.trackingNumber ?? null,
+            shippingService: pendingMetadata?.shippingService ?? null,
             lines: {
               create: whAllocs.map((a) => ({
                 lineId: a.lineId,

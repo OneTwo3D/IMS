@@ -1932,11 +1932,18 @@ export async function createRefund(
           const referencedCostLayers = referencedCostLayerIds.length > 0
             ? await tx.costLayer.findMany({
                 where: { id: { in: referencedCostLayerIds } },
-                select: { id: true, productId: true, poLineId: true },
+                select: { id: true, productId: true, poLineId: true, unitCostBase: true },
               })
             : []
           const productIdByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, layer.productId]))
           const poLineIdByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, layer.poLineId]))
+          const currentUnitCostByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, Number(layer.unitCostBase)]))
+          const refreshSnapshotCosts = (entries: CostLayerSnapshotEntry[]): CostLayerSnapshotEntry[] => (
+            entries.map((entry) => ({
+              ...entry,
+              unitCostBase: currentUnitCostByCostLayerId.get(entry.costLayerId) ?? entry.unitCostBase,
+            }))
+          )
 
           const extractPayloadAmount = (
             payload: unknown,
@@ -2163,7 +2170,7 @@ export async function createRefund(
                   shipmentLineId: shipmentLine.id,
                   source: 'shipment',
                 })
-                consumed.push(...taken.taken)
+                consumed.push(...refreshSnapshotCosts(taken.taken))
                 remainingQty = taken.remainingQty
                 shipmentLineAvailability.set(
                   shipmentLine.id,
@@ -2190,7 +2197,7 @@ export async function createRefund(
                 orderAllocationId: allocation.id,
                 source: 'allocation',
               })
-              consumed.push(...taken.taken)
+              consumed.push(...refreshSnapshotCosts(taken.taken))
               remainingQty = taken.remainingQty
               allocationAvailability.set(
                 allocation.id,
@@ -2815,7 +2822,7 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
       if (!so) return { error: 'Order not found' }
       const payment = await tx.payment.findUnique({
         where: { id: paymentId },
-        select: { orderId: true, refundId: true },
+        select: { orderId: true, refundId: true, amount: true, currency: true },
       })
       if (!payment || payment.orderId !== orderId) {
         return { error: 'Payment not found for this order' }
@@ -2835,9 +2842,42 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
           data: { paidAt: totalPaid >= Number(so.totalForeign) - 0.0001 ? undefined : null },
         })
       }
-      return { so }
+      return { so, payment: { refundId: payment.refundId, amount: Number(payment.amount), currency: payment.currency } }
     }, STOCK_TX_OPTIONS)
     if ('error' in txResult) return { success: false, error: txResult.error }
+    if (!txResult.payment.refundId) {
+      const paymentLogs = await db.accountingSyncLog.findMany({
+        where: {
+          type: 'INVOICE_PAYMENT',
+          referenceType: 'SalesOrder',
+          referenceId: orderId,
+          status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
+        },
+        select: { id: true, status: true, payload: true },
+      })
+      const matchingLogs = paymentLogs.filter((log) => {
+        const payload = log.payload as { amount?: unknown; currency?: unknown } | null
+        const amount = typeof payload?.amount === 'number' ? payload.amount : Number(payload?.amount)
+        const currency = typeof payload?.currency === 'string' ? payload.currency : txResult.payment.currency
+        return Math.abs(amount - txResult.payment.amount) <= 0.0001 && currency === txResult.payment.currency
+      })
+      const pendingIds = matchingLogs.filter((log) => log.status === 'PENDING').map((log) => log.id)
+      if (pendingIds.length > 0) {
+        await db.accountingSyncLog.deleteMany({ where: { id: { in: pendingIds } } })
+      }
+      const externalLogs = matchingLogs.filter((log) => log.status === 'PROCESSING' || log.status === 'SYNCED')
+      if (externalLogs.length > 0) {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: orderId,
+          action: 'payment_external_reversal_required',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: `Deleted local payment for ${getSalesOrderReference(txResult.so)} after payment sync had already started; reverse the payment in the accounting connector if required.`,
+          metadata: { orderNumber: getSalesOrderReference(txResult.so), paymentId, accountingSyncLogIds: externalLogs.map((log) => log.id) },
+        })
+      }
+    }
     revalidatePath(`/sales/${orderId}`)
     await logActivity({
       entityType: 'SALES_ORDER',

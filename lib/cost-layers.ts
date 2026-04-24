@@ -400,8 +400,13 @@ export async function refreshSalesOrderLineCogs(
 
   const cogsByLineId = new Map<string, number>()
   const hasSnapshotByLineId = new Map<string, boolean>()
+  const shipmentLineCountByLineId = new Map<string, number>()
   for (const shipmentLine of shipmentLines) {
     const snapshot = parseCostLayerSnapshot(shipmentLine.costLayerSnapshot)
+    shipmentLineCountByLineId.set(
+      shipmentLine.lineId,
+      (shipmentLineCountByLineId.get(shipmentLine.lineId) ?? 0) + 1,
+    )
     cogsByLineId.set(
       shipmentLine.lineId,
       (cogsByLineId.get(shipmentLine.lineId) ?? 0)
@@ -415,6 +420,13 @@ export async function refreshSalesOrderLineCogs(
   let updated = 0
   for (const lineId of uniqueLineIds) {
     const cogs = cogsByLineId.get(lineId)
+    const hasShipmentLines = (shipmentLineCountByLineId.get(lineId) ?? 0) > 0
+    if (hasShipmentLines && !hasSnapshotByLineId.get(lineId)) {
+      // Legacy shipped lines may pre-date shipment FIFO snapshots. Preserve
+      // their existing COGS instead of nulling historical margin during a
+      // retrospective landed-cost refresh.
+      continue
+    }
     await tx.salesOrderLine.update({
       where: { id: lineId },
       data: {

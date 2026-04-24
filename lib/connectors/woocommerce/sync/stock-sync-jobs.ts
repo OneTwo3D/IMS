@@ -7,6 +7,12 @@ import type { StockSyncReason } from '@/app/generated/prisma/enums'
 const WEBHOOK_ECHO_WINDOW_MS = 10 * 60 * 1000
 const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
 const JOB_CLAIM_WINDOW_MS = 10 * 60 * 1000
+const immediateStockSyncProductIds = new Set<string>()
+let immediateStockSyncScheduled = false
+
+function nextTick(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0))
+}
 
 async function expandDependentKitIds(productIds: string[]): Promise<string[]> {
   if (productIds.length === 0) return []
@@ -207,8 +213,16 @@ export async function enqueueAndProcessImmediateWcStockSync(
 ): Promise<void> {
   const scope = await enqueueWcStockSyncJobs(productIds, reason, options)
   if (scope.length === 0) return
+  for (const productId of scope) immediateStockSyncProductIds.add(productId)
+  if (immediateStockSyncScheduled) return
 
-  const outcome = await processQueuedWcStockSyncJobs({ productIds: scope, limit: scope.length })
+  immediateStockSyncScheduled = true
+  await nextTick()
+  const coalescedScope = [...immediateStockSyncProductIds]
+  immediateStockSyncProductIds.clear()
+  immediateStockSyncScheduled = false
+
+  const outcome = await processQueuedWcStockSyncJobs({ productIds: coalescedScope, limit: coalescedScope.length })
   if (outcome.failed > 0) {
     await logActivity({
       entityType: 'SYNC',
@@ -217,7 +231,7 @@ export async function enqueueAndProcessImmediateWcStockSync(
       level: 'WARNING',
       description: `Immediate WooCommerce stock sync left ${outcome.failed} queued failure(s) for retry`,
       metadata: {
-        productIds: scope,
+        productIds: coalescedScope,
         errors: outcome.errors.slice(0, 10),
       },
     })

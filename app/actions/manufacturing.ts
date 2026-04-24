@@ -708,6 +708,10 @@ export async function updateManufacturingOrderStatus(
             requireReserved: wasInProgress,
           })
           const recoveredCost = await consumeFifoLayersStrict(tx, order.outputProductId, order.warehouseId, qtyPlanned)
+          const totalRecoveredCostBase = recoveredCost.consumed.reduce(
+            (sum, entry) => sum.add(new Prisma.Decimal(entry.qty * entry.unitCostBase)),
+            new Prisma.Decimal(0),
+          )
           const recoveryPlan = await buildDisassemblyRecoveryPlan(
             tx,
             recoveredCost.consumed,
@@ -748,16 +752,22 @@ export async function updateManufacturingOrderStatus(
               create: { productId: comp.componentId, warehouseId: order.warehouseId, quantity: totalQty },
               update: { quantity: { increment: totalQty } },
             })
-            await tx.costLayer.create({
-              data: {
-                productId: comp.componentId,
-                warehouseId: order.warehouseId,
-                receivedQty: totalQty,
-                remainingQty: totalQty,
-                unitCostBase: recoveredUnitCost,
-                isOpeningStock: false,
-              },
+            const componentLayerId = await createCostLayer(tx, {
+              productId: comp.componentId,
+              warehouseId: order.warehouseId,
+              qty: totalQty,
+              unitCostBase: recoveredUnitCost.toNumber(),
             })
+            if (allocatedCost.gt(0) && totalRecoveredCostBase.gt(0)) {
+              const componentShare = allocatedCost.div(totalRecoveredCostBase)
+              await addCostLayerSourceLines(tx, componentLayerId, recoveredCost.consumed.map((entry) => ({
+                sourceProductId: order.outputProductId,
+                sourceCostLayerId: entry.costLayerId,
+                qty: entry.qty * componentShare.toNumber(),
+                unitCostBase: entry.unitCostBase,
+                totalCostBase: entry.qty * entry.unitCostBase * componentShare.toNumber(),
+              })))
+            }
 
             await tx.stockMovement.create({
               data: {

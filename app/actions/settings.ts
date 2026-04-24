@@ -298,6 +298,63 @@ export async function autoLinkXeroTaxRates(): Promise<{
   }
 }
 
+export async function autoLinkQuickBooksTaxRates(): Promise<{
+  success: boolean
+  linked: number
+  alreadyLinked: number
+  unmatched: string[]
+  quickBooksRatesCount: number
+  error?: string
+}> {
+  await requirePermission('settings.company')
+  try {
+    const { getQuickBooksTaxCodes } = await import('@/lib/connectors/quickbooks/accounts')
+    const qboRates = await getQuickBooksTaxCodes()
+    const qboByName = new Map<string, { id: string; name: string }>()
+    for (const rate of qboRates) {
+      qboByName.set(rate.name.trim().toLowerCase(), rate)
+    }
+
+    const imsRates = await db.taxRate.findMany({
+      where: { active: true },
+      select: { id: true, name: true, accountingTaxType: true },
+    })
+
+    let linked = 0
+    let alreadyLinked = 0
+    const unmatched: string[] = []
+
+    for (const ims of imsRates) {
+      if (ims.accountingTaxType) { alreadyLinked++; continue }
+      const match = qboByName.get(ims.name.trim().toLowerCase())
+      if (!match) { unmatched.push(ims.name); continue }
+      await db.taxRate.update({
+        where: { id: ims.id },
+        data: { accountingTaxType: match.id },
+      })
+      linked++
+    }
+
+    await logActivity({
+      entityType: 'SETTING',
+      tag: 'settings',
+      action: 'quickbooks_tax_rates_linked',
+      description: `Auto-linked ${linked} IMS tax rate(s) to QuickBooks tax codes (${alreadyLinked} already linked, ${unmatched.length} unmatched)`,
+      metadata: { linked, alreadyLinked, unmatched, quickBooksRatesCount: qboRates.length },
+    })
+    revalidatePath('/settings/accounting')
+    return {
+      success: true,
+      linked,
+      alreadyLinked,
+      unmatched,
+      quickBooksRatesCount: qboRates.length,
+    }
+  } catch (e) {
+    return { success: false, linked: 0, alreadyLinked: 0, unmatched: [], quickBooksRatesCount: 0, error: String(e) }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Account Codes (from active accounting integration)
 // ---------------------------------------------------------------------------

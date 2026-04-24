@@ -1921,7 +1921,10 @@ export async function receivePurchaseOrder(
       metadata: { reference: po.reference, lineCount: linesWithQty.length },
     })
 
-    // Queue accounting stock receipt journal: DR Inventory / CR Stock-in-Transit
+    // Queue accounting stock receipt journal: DR Inventory / CR Stock-in-Transit.
+    // The receipt value is gross landed cost, including linked freight. Supplier
+    // and freight bills debit transit separately, so transit clears only after
+    // both goods and freight/AP documents have posted.
     try {
       const settings = await getAccountingSettings()
       const totalReceiptValue = receiptResult.totalReceiptValue

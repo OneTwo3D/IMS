@@ -370,16 +370,23 @@ export async function runDailyBatchSync(): Promise<{
     })
 
     if (orders.length > 0) {
+      const orderDeferrals = orders.map((order) => {
+        const discountBase = normalizeDeferredDiscountBase(order)
+        return {
+          orderId: order.id,
+          amount: round2(Number(order.subtotalBase) + Number(order.shippingBase ?? 0) - discountBase),
+        }
+      })
       let totalRevenueDeferred = 0
       const journalLines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = []
 
-      for (const order of orders) {
-        const discountBase = normalizeDeferredDiscountBase(order)
-        const salesValue = round2(Number(order.subtotalBase) + Number(order.shippingBase ?? 0) - discountBase)
-        totalRevenueDeferred += salesValue
-      }
+      for (const orderDeferral of orderDeferrals) totalRevenueDeferred += orderDeferral.amount
 
       totalRevenueDeferred = round2(totalRevenueDeferred)
+      const invariantTotal = round2(orderDeferrals.reduce((sum, order) => sum + order.amount, 0))
+      if (Math.abs(invariantTotal - totalRevenueDeferred) > 0.01) {
+        throw new Error(`A1 revenue deferral invariant failed: per-order ${invariantTotal.toFixed(2)} != journal ${totalRevenueDeferred.toFixed(2)}`)
+      }
 
       if (totalRevenueDeferred > 0) {
         journalLines.push(
@@ -398,19 +405,19 @@ export async function runDailyBatchSync(): Promise<{
               reference: `Revenue Deferral ${today}`,
               narration: `Daily revenue deferral: ${orders.length} order(s), £${totalRevenueDeferred.toFixed(2)}`,
               lines: journalLines,
+              orderDeferrals,
               _postingMode: 'submitted',
             },
           })
         }
 
+        const deferralByOrderId = new Map(orderDeferrals.map((order) => [order.orderId, order.amount]))
         for (const order of orders) {
-          const discountBase = normalizeDeferredDiscountBase(order)
-          const salesValue = round2(Number(order.subtotalBase) + Number(order.shippingBase ?? 0) - discountBase)
           await tx.salesOrder.update({
             where: { id: order.id },
             data: {
               revenueDeferredDate: new Date(),
-              unearnedRevenueAmount: salesValue,
+              unearnedRevenueAmount: deferralByOrderId.get(order.id) ?? 0,
             },
           })
         }
@@ -737,6 +744,18 @@ export async function runDailyBatchSync(): Promise<{
           const precomputedCogs = hasPrecomputedSnapshots
             ? round2(shipmentSnapshotsForLines.reduce((sum, entries) => sum + sumCostLayerSnapshot(entries), 0))
             : Number(shipment.cogsBatchAmount ?? 0)
+          if (hasPrecomputedSnapshots) {
+            const missingSnapshotLines = shipment.lines.filter((line, lineIndex) => (
+              Number(line.qty) > 0 && shipmentSnapshotsForLines[lineIndex].length === 0
+            ))
+            if (missingSnapshotLines.length > 0) {
+              throw new Error(`Incomplete precomputed FIFO snapshots for shipment ${shipment.id}`)
+            }
+            const cogsBatchAmount = Number(shipment.cogsBatchAmount ?? 0)
+            if (cogsBatchAmount > 0 && Math.abs(round2(cogsBatchAmount) - precomputedCogs) > 0.01) {
+              throw new Error(`Precomputed COGS mismatch for shipment ${shipment.id}: batch ${round2(cogsBatchAmount).toFixed(2)} != snapshots ${precomputedCogs.toFixed(2)}`)
+            }
+          }
 
           // If no pre-computed COGS and no snapshots, fall back to the
           // legacy allocation-based consumption path for backward compat.

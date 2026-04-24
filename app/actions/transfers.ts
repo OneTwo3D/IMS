@@ -573,7 +573,19 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
                 qty: entry.qty,
                 unitCostBase: entry.unitCostBase,
               })
-              await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entry.qty)
+              const copied = await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entry.qty)
+              if (copied === 0) {
+                await tx.costLayerSourceLine.create({
+                  data: {
+                    costLayerId: newLayerId,
+                    sourceProductId: line.productId,
+                    sourceCostLayerId: entry.costLayerId,
+                    qty: entry.qty,
+                    unitCostBase: entry.unitCostBase,
+                    totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+                  },
+                })
+              }
             }
           }
         }

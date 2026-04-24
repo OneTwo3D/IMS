@@ -13,6 +13,8 @@ import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalan
 import type { Prisma } from '@/app/generated/prisma/client'
 import { consumeFifoLayersStrict, createCostLayer, getAverageUnitCost } from '@/lib/cost-layers'
 
+const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
+
 // ---------------------------------------------------------------------------
 // Helpers for inventory adjustment accounting journal
 // ---------------------------------------------------------------------------
@@ -728,6 +730,16 @@ export async function updateAdjustmentMovement(
         create: { productId: movement.productId, warehouseId: newWarehouseId, quantity: newIsAddition ? newAbsQty : `-${newAbsQty}` },
         update: { quantity: { increment: newSignedQty } },
       })
+      const adjustedLevel = await tx.stockLevel.findUnique({
+        where: { productId_warehouseId: { productId: movement.productId, warehouseId: newWarehouseId } },
+        select: { quantity: true, reservedQty: true },
+      })
+      if (adjustedLevel && Number(adjustedLevel.quantity) + 0.000001 < Number(adjustedLevel.reservedQty)) {
+        throw new Error(
+          `Cannot edit adjustment: resulting stock (${Number(adjustedLevel.quantity).toFixed(4)}) ` +
+          `would be below reserved quantity (${Number(adjustedLevel.reservedQty).toFixed(4)}).`,
+        )
+      }
 
       if (newIsAddition) {
         const avgCost = await getAverageUnitCost(tx, movement.productId, newWarehouseId)
@@ -765,7 +777,7 @@ export async function updateAdjustmentMovement(
           note: newNote || null,
         },
       })
-    })
+    }, STOCK_TX_OPTIONS)
 
     revalidatePath('/stock-control')
     revalidatePath('/inventory')

@@ -40,6 +40,33 @@ export async function isWcOrderWebhookPrimaryActive(): Promise<boolean> {
   return (Date.now() - ts) <= WEBHOOK_PRIMARY_FRESH_MS
 }
 
+async function updateExistingWcOrderFromPayload(
+  orderId: string,
+  wcOrder: WcFullOrder,
+): Promise<void> {
+  await db.$transaction(async (tx) => {
+    await tx.shoppingOrderLink.updateMany({
+      where: {
+        connector: 'woocommerce',
+        externalOrderId: String(wcOrder.id),
+      },
+      data: {
+        externalOrderNumber: wcOrder.number,
+      },
+    })
+    await tx.salesOrder.update({
+      where: { id: orderId },
+      data: {
+        externalOrderNumber: wcOrder.number,
+        billingAddress: mapWcAddress(wcOrder.billing),
+        shippingAddress: mapWcAddress(wcOrder.shipping),
+        notes: wcOrder.customer_note || null,
+        paidAt: wcOrder.date_paid_gmt ? new Date(wcOrder.date_paid_gmt) : undefined,
+      },
+    })
+  })
+}
+
 export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<{ success: boolean; orderId?: string; error?: string }> {
   try {
     // Skip if already imported
@@ -53,7 +80,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         },
       },
     })
-    if (existing) return { success: true, orderId: existing.id }
+    if (existing) {
+      await updateExistingWcOrderFromPayload(existing.id, wcOrder)
+      return { success: true, orderId: existing.id }
+    }
 
     // Resolve IMS status from WC status
     const statusMapping = await db.shoppingStatusMapping.findUnique({
@@ -315,7 +345,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           },
         },
       })
-      if (concurrent) return { success: true, orderId: concurrent.id }
+      if (concurrent) {
+        await updateExistingWcOrderFromPayload(concurrent.id, wcOrder)
+        return { success: true, orderId: concurrent.id }
+      }
       throw error
     }
 

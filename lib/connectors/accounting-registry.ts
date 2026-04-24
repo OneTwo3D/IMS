@@ -134,13 +134,15 @@ export function getAccountingConnector(id: AccountingConnectorId): AccountingCon
         return fetchQuickBooksTaxCodes()
       },
       async autoLinkTaxRates() {
+        const { autoLinkQuickBooksTaxRates } = await import('@/app/actions/settings')
+        const result = await autoLinkQuickBooksTaxRates()
         return {
-          success: false,
-          linked: 0,
-          alreadyLinked: 0,
-          unmatched: [],
-          externalRatesCount: 0,
-          error: 'Tax auto-linking is currently only implemented for Xero.',
+          success: result.success,
+          linked: result.linked,
+          alreadyLinked: result.alreadyLinked,
+          unmatched: result.unmatched,
+          externalRatesCount: result.quickBooksRatesCount,
+          error: result.error,
         }
       },
       async getSyncLogs(limit = 50) {
