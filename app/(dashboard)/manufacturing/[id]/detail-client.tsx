@@ -16,6 +16,7 @@ import {
   type ManufacturingOrderDetail as OrderType,
 } from '@/app/actions/manufacturing'
 import { ProductThumb } from '@/components/inventory/product-thumb'
+import { ManufacturingCostLinesEditor } from '@/components/manufacturing/cost-lines-editor'
 
 const STATUS_BADGE: Record<string, string> = {
   DRAFT: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300',
@@ -238,6 +239,17 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
           </Card>
         </Link>
       </div>
+
+      {/* Manufacturing-cost lines (per-run overhead) */}
+      <ManufacturingCostLinesEditor
+        productionOrderId={order.id}
+        reference={order.reference}
+        currency={order.currency}
+        fxRateToBase={order.fxRateToBase}
+        initialLines={order.manufacturingCostLines}
+        isCompleted={order.status === 'COMPLETED'}
+        canEdit={order.status !== 'CANCELLED'}
+      />
 
       {/* Components table */}
       <Card className="p-4">

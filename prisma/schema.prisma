@@ -156,6 +156,8 @@ enum AccountingSyncType {
   DAILY_BATCH_GROUP_B
   UNEARNED_REV_REVERSAL
   BILL_PAYMENT
+  MANUFACTURING_JOURNAL
+  MANUFACTURING_RECLASS
 
   @@map("AccountingSyncType")
 }
@@ -639,6 +641,7 @@ model CostLayer {
   receivedAt      DateTime  @default(now())
   poLineId        String?   // link back to the PO line that created this layer
   adjustmentMovementId String? @map("adjustment_movement_id")
+  productionOrderId String?  @map("production_order_id")
   isOpeningStock  Boolean   @default(false)
 
   product         Product   @relation(fields: [productId], references: [id])
@@ -651,6 +654,7 @@ model CostLayer {
 
   @@index([productId, warehouseId, receivedAt])
   @@index([adjustmentMovementId])
+  @@index([productionOrderId])
   @@map("cost_layers")
 }
 
@@ -1407,14 +1411,43 @@ model ProductionOrder {
   createdAt       DateTime             @default(now())
   updatedAt       DateTime             @updatedAt
 
+  // Order currency + FX for foreign-currency manufacturing costs (labour
+  // priced in a non-base currency, etc.). Base totals on cost lines use
+  // this rate. Defaults to base currency / 1.0.
+  currency        String               @default("GBP")
+  fxRateToBase    Decimal              @db.Decimal(18, 8) @default(1)
+
   bom             Bom                  @relation(fields: [bomId], references: [id])
   outputProduct   Product              @relation(fields: [outputProductId], references: [id])
   warehouse       Warehouse            @relation(fields: [warehouseId], references: [id])
   manufacturer    Supplier?            @relation(fields: [manufacturerId], references: [id])
+  manufacturingCostLines ManufacturingCostLine[]
 
   @@index([status])
   @@index([createdAt])
   @@map("production_orders")
+}
+
+/// Per-run overheads applied to a production order (labour, machine time,
+/// utilities, etc.). Sum is spread equally across qtyProduced and folded
+/// into the output cost layer on assembly (or the recovered-component
+/// layers on disassembly). Each line optionally overrides the default
+/// manufacturing-overhead account from Settings.
+model ManufacturingCostLine {
+  id                String   @id @default(cuid())
+  productionOrderId String
+  description       String
+  amountForeign     Decimal  @db.Decimal(18, 4)
+  amountBase        Decimal  @db.Decimal(18, 4)
+  accountCode       String?
+  sortOrder         Int      @default(0)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+
+  productionOrder   ProductionOrder @relation(fields: [productionOrderId], references: [id], onDelete: Cascade)
+
+  @@index([productionOrderId])
+  @@map("manufacturing_cost_lines")
 }
 
 // ---------------------------------------------------------------------------

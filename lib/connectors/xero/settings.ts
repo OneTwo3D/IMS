@@ -17,6 +17,7 @@ export type XeroSettings = {
   xero_sync_stock_receipt: string
   xero_sync_inventory_adjustment: string
   xero_sync_stock_allocation: string
+  xero_sync_manufacturing_journal: string
   xero_sync_attach_pdf: string
   xero_sales_account: string
   xero_shipping_account: string
@@ -26,6 +27,7 @@ export type XeroSettings = {
   xero_allocated_inventory_account: string
   xero_unearned_revenue_account: string
   xero_transit_account: string
+  xero_manufacturing_overhead_account: string
   xero_daily_batch_enabled: string
   xero_payment_polling_enabled: string
 }
@@ -35,11 +37,13 @@ export const XERO_SETTING_KEYS = [
   'xero_sync_sales_invoice', 'xero_sync_credit_note', 'xero_sync_purchase_invoice',
   'xero_sync_cogs_journal', 'xero_sync_cogs_reversal',
   'xero_sync_stock_receipt', 'xero_sync_inventory_adjustment', 'xero_sync_stock_allocation',
+  'xero_sync_manufacturing_journal',
   'xero_sync_attach_pdf',
   'xero_sales_account', 'xero_shipping_account', 'xero_discount_account',
   'xero_cogs_account', 'xero_inventory_account', 'xero_allocated_inventory_account',
   'xero_unearned_revenue_account',
   'xero_transit_account',
+  'xero_manufacturing_overhead_account',
   'xero_daily_batch_enabled', 'xero_payment_polling_enabled',
 ]
 
@@ -55,6 +59,7 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_sync_stock_receipt: 'submitted',
   xero_sync_inventory_adjustment: 'submitted',
   xero_sync_stock_allocation: 'submitted',
+  xero_sync_manufacturing_journal: 'submitted',
   xero_sync_attach_pdf: 'true',
   xero_sales_account: '',
   xero_shipping_account: '',
@@ -64,6 +69,7 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_allocated_inventory_account: '',
   xero_unearned_revenue_account: '',
   xero_transit_account: '',
+  xero_manufacturing_overhead_account: '',
   xero_daily_batch_enabled: 'false',
   xero_payment_polling_enabled: 'false',
 }

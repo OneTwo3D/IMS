@@ -224,6 +224,7 @@ Configure which documents are synced to Xero under **Integrations → Xero → T
 | Stock Receipts | Journal: DR Inventory / CR Stock in Transit on goods received |
 | COGS Reversals | Reverse COGS on stock returns |
 | Inventory Adjustments | Journal for manual stock adjustments |
+| Manufacturing Journal | Capitalise per-run overhead (labour, machine, etc.) on assembly/disassembly: DR Inventory / CR Manufacturing Overhead. Includes the retro-recalc reclass (`MANUFACTURING_RECLASS`) when cost lines are edited after completion. |
 
 ## Sub-Ledger Settings
 

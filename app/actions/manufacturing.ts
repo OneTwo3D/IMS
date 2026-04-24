@@ -5,12 +5,18 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
+import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
 import {
   addCostLayerSourceLines,
   consumeFifoLayersStrict,
   createCostLayer,
   getAverageUnitCost,
+  getReturnedQtyForCostLayer,
+  refreshShipmentCogsForCostLayerChange,
+  refreshSalesOrderLineCogsForCostLayerChange,
+  updateSnapshotsForCostLayerChange,
 } from '@/lib/cost-layers'
+import { recomputeManufacturingUnitCosts } from '@/lib/manufacturing-cost'
 import { COMPONENT_PRODUCT_STATUSES, OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { Prisma, type ProductionOrderStatus, type ProductionOrderType } from '@/app/generated/prisma/client'
 
@@ -583,6 +589,10 @@ export async function updateManufacturingOrderStatus(
             },
           },
         },
+        manufacturingCostLines: {
+          select: { description: true, amountBase: true, accountCode: true },
+          orderBy: { sortOrder: 'asc' },
+        },
       },
     })
     if (!orderPreview) return { success: false, error: 'Order not found.' }
@@ -613,6 +623,10 @@ export async function updateManufacturingOrderStatus(
                 },
               },
             },
+            manufacturingCostLines: {
+              select: { id: true, description: true, amountBase: true, accountCode: true },
+              orderBy: { sortOrder: 'asc' },
+            },
           },
         })
         if (!order) throw new Error('Order not found')
@@ -624,6 +638,10 @@ export async function updateManufacturingOrderStatus(
         const qtyPlanned = Number(order.qtyPlanned)
         const components = order.outputProduct.productComponents
         const wasInProgress = order.status === 'IN_PROGRESS'
+        const totalManufacturingCostBase = order.manufacturingCostLines.reduce(
+          (sum, line) => sum.add(new Prisma.Decimal(line.amountBase)),
+          new Prisma.Decimal(0),
+        )
 
         if (isAssembly) {
           // ASSEMBLY: deduct components (and release reservation), add output product
@@ -680,11 +698,16 @@ export async function updateManufacturingOrderStatus(
             create: { productId: order.outputProductId, warehouseId: order.warehouseId, quantity: qtyPlanned },
             update: { quantity: { increment: qtyPlanned } },
           })
+          // Fold per-run manufacturing overhead (labour, machine, utilities,
+          // etc.) into the output cost layer alongside the consumed component
+          // costs. Spread equally across qtyPlanned.
+          const outputTotalCostBase = totalAssemblyCostBase.add(totalManufacturingCostBase)
           const outputLayerId = await createCostLayer(tx, {
             productId: order.outputProductId,
             warehouseId: order.warehouseId,
             qty: qtyPlanned,
-            unitCostBase: totalAssemblyCostBase.div(new Prisma.Decimal(qtyPlanned)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP).toNumber(),
+            unitCostBase: outputTotalCostBase.div(new Prisma.Decimal(qtyPlanned)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP).toNumber(),
+            productionOrderId: id,
             isOpeningStock: false,
           })
           await addCostLayerSourceLines(tx, outputLayerId, assemblySourceLines)
@@ -712,6 +735,15 @@ export async function updateManufacturingOrderStatus(
             (sum, entry) => sum.add(new Prisma.Decimal(entry.qty * entry.unitCostBase)),
             new Prisma.Decimal(0),
           )
+          // Manufacturing overhead capitalises proportionally onto the
+          // recovered components by scaling each plan entry's allocated
+          // cost by (recovered + overhead) / recovered. When recovered
+          // cost is zero (assembled stock had zero cost layers) the
+          // overhead can't be capitalised this way — it's still booked as
+          // expense via the journal below.
+          const recoveryScaleFactor = totalRecoveredCostBase.gt(0)
+            ? totalRecoveredCostBase.add(totalManufacturingCostBase).div(totalRecoveredCostBase)
+            : new Prisma.Decimal(1)
           const recoveryPlan = await buildDisassemblyRecoveryPlan(
             tx,
             recoveredCost.consumed,
@@ -742,7 +774,7 @@ export async function updateManufacturingOrderStatus(
           for (const comp of components) {
             const plannedRecovery = recoveryPlan.find((entry) => entry.componentId === comp.componentId)
             const totalQty = plannedRecovery?.totalQty ?? (Number(comp.qty) * qtyPlanned)
-            const allocatedCost = plannedRecovery?.totalCostBase ?? new Prisma.Decimal(0)
+            const allocatedCost = (plannedRecovery?.totalCostBase ?? new Prisma.Decimal(0)).mul(recoveryScaleFactor)
             const recoveredUnitCost = totalQty > 0
               ? allocatedCost.div(new Prisma.Decimal(totalQty)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
               : new Prisma.Decimal(0)
@@ -757,6 +789,7 @@ export async function updateManufacturingOrderStatus(
               warehouseId: order.warehouseId,
               qty: totalQty,
               unitCostBase: recoveredUnitCost.toNumber(),
+              productionOrderId: id,
             })
             if (allocatedCost.gt(0) && totalRecoveredCostBase.gt(0)) {
               const componentShare = allocatedCost.div(totalRecoveredCostBase)
@@ -789,6 +822,77 @@ export async function updateManufacturingOrderStatus(
           data: { status, completedAt: now, qtyProduced: qtyPlanned },
         })
       })
+
+      // Queue accounting journal for the per-run manufacturing overhead.
+      // Components moving from one inventory SKU to another (assembly) or
+      // the reverse (disassembly) net to zero on the Inventory account, so
+      // the journal only needs to capture the overhead leg:
+      //   DR Inventory (assembled output / recovered components)
+      //   CR Manufacturing Overhead (per-line account, default from settings)
+      // Each cost line lands on its own credit row so labour, machine, etc.
+      // can post to distinct accounts.
+      const totalManufacturingCostBaseForJournal = orderPreview.manufacturingCostLines.reduce(
+        (sum, line) => sum + Number(line.amountBase),
+        0,
+      )
+      if (totalManufacturingCostBaseForJournal > 0) {
+        try {
+          const settings = await getAccountingSettings()
+          const defaultOverheadAccount = settings.manufacturingOverheadAccount
+          const inventoryAccount = settings.inventoryAccount
+          if (inventoryAccount) {
+            const directionLabel = isAssembly ? 'assembly' : 'disassembly'
+            const reference = `MFG: ${orderPreview.reference}`
+            const narration = `Manufacturing overhead — ${directionLabel} of ${orderPreview.outputProduct.sku} (${Number(orderPreview.qtyPlanned)} units)`
+            const totalRounded = Math.round(totalManufacturingCostBaseForJournal * 100) / 100
+            const lines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = [
+              { accountCode: inventoryAccount, description: `Manufacturing overhead capitalised (${orderPreview.outputProduct.sku})`, debit: totalRounded },
+            ]
+            for (const costLine of orderPreview.manufacturingCostLines) {
+              const account = costLine.accountCode || defaultOverheadAccount
+              const amount = Math.round(Number(costLine.amountBase) * 100) / 100
+              if (!account || amount <= 0) continue
+              lines.push({ accountCode: account, description: costLine.description, credit: amount })
+            }
+            // Only post if every credit line has an account; otherwise the
+            // user hasn't configured a default overhead account yet — skip
+            // and log so the issue is visible.
+            const allLinesHaveAccount = lines.every((l) => l.accountCode)
+            if (allLinesHaveAccount && lines.length > 1) {
+              await queueAccountingSync({
+                type: 'MANUFACTURING_JOURNAL',
+                referenceType: 'ProductionOrder',
+                referenceId: id,
+                payload: {
+                  date: now.toISOString().slice(0, 10),
+                  reference,
+                  narration,
+                  lines,
+                },
+              })
+            } else if (!allLinesHaveAccount) {
+              await logActivity({
+                entityType: 'STOCK_ADJUSTMENT',
+                entityId: id,
+                tag: 'manufacturing',
+                level: 'WARNING',
+                action: 'manufacturing_journal_skipped',
+                description: `Skipped manufacturing-overhead journal for ${orderPreview.reference}: configure a default Manufacturing Overhead account in Settings.`,
+              })
+            }
+          }
+        } catch (e) {
+          // Accounting queue errors must never block the main flow.
+          await logActivity({
+            entityType: 'STOCK_ADJUSTMENT',
+            entityId: id,
+            tag: 'manufacturing',
+            level: 'ERROR',
+            action: 'manufacturing_journal_failed',
+            description: `Failed to queue manufacturing-overhead journal for ${orderPreview.reference}: ${e instanceof Error ? e.message : String(e)}`,
+          })
+        }
+      }
 
       // Log individual stock movements (fire-and-forget, after transaction)
       // Use orderPreview for logging — the inner `order` is scoped to the tx
@@ -987,6 +1091,8 @@ export type ManufacturingOrderDetail = {
   completedAt: string | null
   createdAt: string
   notes: string | null
+  currency: string
+  fxRateToBase: number
   components: {
     componentId: string
     componentSku: string
@@ -995,6 +1101,7 @@ export type ManufacturingOrderDetail = {
     componentImageUrl: string | null
     qtyPerUnit: number
   }[]
+  manufacturingCostLines: ManufacturingCostLineRow[]
 }
 
 export async function getManufacturingOrder(id: string): Promise<ManufacturingOrderDetail | null> {
@@ -1013,6 +1120,8 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
       completedAt: true,
       createdAt: true,
       notes: true,
+      currency: true,
+      fxRateToBase: true,
       outputProduct: {
         select: {
           id: true,
@@ -1033,6 +1142,10 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
       },
       warehouse: { select: { id: true, name: true, code: true } },
       manufacturer: { select: { id: true, name: true, email: true } },
+      manufacturingCostLines: {
+        select: { id: true, description: true, amountForeign: true, amountBase: true, accountCode: true, sortOrder: true },
+        orderBy: { sortOrder: 'asc' },
+      },
     },
   })
   if (!o) return null
@@ -1060,6 +1173,8 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
     completedAt: o.completedAt?.toISOString() ?? null,
     createdAt: o.createdAt.toISOString(),
     notes: o.notes,
+    currency: o.currency,
+    fxRateToBase: Number(o.fxRateToBase),
     components: o.outputProduct.productComponents.map((c) => ({
       componentId: c.componentId,
       componentSku: c.component.sku,
@@ -1068,5 +1183,258 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
       componentImageUrl: c.component.imageUrl ?? c.component.parent?.imageUrl ?? null,
       qtyPerUnit: Number(c.qty),
     })),
+    manufacturingCostLines: o.manufacturingCostLines.map((l) => ({
+      id: l.id,
+      description: l.description,
+      amountForeign: Number(l.amountForeign),
+      amountBase: Number(l.amountBase),
+      accountCode: l.accountCode,
+      sortOrder: l.sortOrder,
+    })),
   }
 }
+
+// ---------------------------------------------------------------------------
+// Manufacturing cost lines (per-run overhead: labour, machine, etc.)
+// ---------------------------------------------------------------------------
+
+export type ManufacturingCostLineRow = {
+  id: string
+  description: string
+  amountForeign: number
+  amountBase: number
+  accountCode: string | null
+  sortOrder: number
+}
+
+export type ManufacturingCostLineInput = {
+  description: string
+  amountForeign: number
+  accountCode?: string | null
+}
+
+export async function getManufacturingCostLines(productionOrderId: string): Promise<ManufacturingCostLineRow[]> {
+  await requireAuth()
+  const rows = await db.manufacturingCostLine.findMany({
+    where: { productionOrderId },
+    orderBy: { sortOrder: 'asc' },
+    select: { id: true, description: true, amountForeign: true, amountBase: true, accountCode: true, sortOrder: true },
+  })
+  return rows.map((r) => ({
+    id: r.id,
+    description: r.description,
+    amountForeign: Number(r.amountForeign),
+    amountBase: Number(r.amountBase),
+    accountCode: r.accountCode,
+    sortOrder: r.sortOrder,
+  }))
+}
+
+/**
+ * Recalculates the unit cost on cost layers produced by this production
+ * order to reflect the current sum of manufacturingCostLines, and posts
+ * COGS reclass entries on layers that have been (partially) consumed.
+ *
+ * Mirror of recalculateDirectLandedCosts but simpler: there's at most one
+ * output cost layer for assembly; for disassembly the overhead is split
+ * across recovered-component layers proportionally to their original
+ * (component-only) base cost from CostLayerSourceLine.
+ *
+ * Must be called inside a transaction. Returns the net COGS delta in
+ * base currency so the caller can queue a reclass journal post-tx.
+ */
+async function recalculateManufacturingCostLayers(
+  tx: Prisma.TransactionClient,
+  productionOrderId: string,
+): Promise<number> {
+  const po = await tx.productionOrder.findUnique({
+    where: { id: productionOrderId },
+    select: {
+      status: true,
+      qtyProduced: true,
+      manufacturingCostLines: { select: { amountBase: true } },
+    },
+  })
+  if (!po || po.status !== 'COMPLETED') return 0
+
+  const currentMfgCost = po.manufacturingCostLines.reduce(
+    (sum, line) => sum + Number(line.amountBase),
+    0,
+  )
+
+  const layers = await tx.costLayer.findMany({
+    where: { productionOrderId },
+    select: {
+      id: true,
+      receivedQty: true,
+      remainingQty: true,
+      unitCostBase: true,
+      sourceLines: { select: { totalCostBase: true } },
+    },
+  })
+  if (layers.length === 0) return 0
+
+  const layerInfos = layers.map((l) => ({
+    id: l.id,
+    receivedQty: Number(l.receivedQty),
+    remainingQty: Number(l.remainingQty),
+    oldUnitCostBase: Number(l.unitCostBase),
+    base: l.sourceLines.reduce((s, sl) => s + Number(sl.totalCostBase), 0),
+  }))
+  const recomputed = recomputeManufacturingUnitCosts(
+    layerInfos.map(({ id, receivedQty, base }) => ({ id, receivedQty, base })),
+    currentMfgCost,
+  )
+  const oldByLayer = new Map(layerInfos.map((l) => [l.id, l]))
+
+  let netCogsDeltaBase = 0
+  for (const r of recomputed) {
+    const li = oldByLayer.get(r.layerId)
+    if (!li) continue
+    if (Math.abs(r.newUnitCostBase - li.oldUnitCostBase) < 1e-6) continue
+
+    await tx.costLayer.update({
+      where: { id: li.id },
+      data: { unitCostBase: r.newUnitCostBase },
+    })
+
+    const returnedQty = await getReturnedQtyForCostLayer(tx, li.id)
+    const consumedQty = li.receivedQty - li.remainingQty - returnedQty
+    if (consumedQty > 0) {
+      netCogsDeltaBase += consumedQty * (r.newUnitCostBase - li.oldUnitCostBase)
+    }
+
+    await updateSnapshotsForCostLayerChange(tx, li.id, r.newUnitCostBase)
+    await refreshShipmentCogsForCostLayerChange(tx, li.id)
+    await refreshSalesOrderLineCogsForCostLayerChange(tx, li.id)
+  }
+
+  return Math.round(netCogsDeltaBase * 1_000_000) / 1_000_000
+}
+
+/**
+ * Replace the manufacturing cost lines on a production order. If the
+ * order is COMPLETED, this also recalculates the produced cost layers
+ * and queues a reclass journal for the COGS delta on already-consumed
+ * (shipped/sold) units.
+ */
+export async function updateManufacturingCostLines(
+  productionOrderId: string,
+  lines: ManufacturingCostLineInput[],
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    await requirePermission('manufacturing')
+
+    const po = await db.productionOrder.findUnique({
+      where: { id: productionOrderId },
+      select: { id: true, reference: true, status: true, fxRateToBase: true, outputProductId: true },
+    })
+    if (!po) return { success: false, error: 'Production order not found.' }
+
+    const fxRate = Number(po.fxRateToBase) || 1
+    const cleaned = lines
+      .filter((l) => l.description.trim().length > 0 && Number.isFinite(l.amountForeign))
+      .map((l, idx) => ({
+        description: l.description.trim(),
+        amountForeign: Math.round(Number(l.amountForeign) * 10000) / 10000,
+        amountBase: Math.round(Number(l.amountForeign) * fxRate * 10000) / 10000,
+        accountCode: l.accountCode?.trim() || null,
+        sortOrder: idx,
+      }))
+
+    let cogsDeltaBase = 0
+    let oldTotal = 0
+    let newTotal = 0
+
+    await db.$transaction(async (tx) => {
+      await tx.$queryRaw(
+        Prisma.sql`SELECT id FROM production_orders WHERE id = ${productionOrderId} FOR UPDATE`,
+      )
+      const existing = await tx.manufacturingCostLine.findMany({
+        where: { productionOrderId },
+        select: { amountBase: true },
+      })
+      oldTotal = existing.reduce((s, l) => s + Number(l.amountBase), 0)
+      newTotal = cleaned.reduce((s, l) => s + l.amountBase, 0)
+
+      await tx.manufacturingCostLine.deleteMany({ where: { productionOrderId } })
+      if (cleaned.length > 0) {
+        await tx.manufacturingCostLine.createMany({
+          data: cleaned.map((l) => ({
+            productionOrderId,
+            description: l.description,
+            amountForeign: l.amountForeign,
+            amountBase: l.amountBase,
+            accountCode: l.accountCode,
+            sortOrder: l.sortOrder,
+          })),
+        })
+      }
+
+      // If completed, recalc produced cost layers + downstream snapshots.
+      if (po.status === 'COMPLETED') {
+        cogsDeltaBase = await recalculateManufacturingCostLayers(tx, productionOrderId)
+      }
+    }, { maxWait: 5000, timeout: 20000 })
+
+    revalidatePath('/manufacturing')
+    revalidatePath(`/manufacturing/${productionOrderId}`)
+
+    if (po.status === 'COMPLETED' && Math.abs(cogsDeltaBase) > 0.005) {
+      // Post a reclass journal: if newCost > oldCost (delta > 0), shipped
+      // units were under-costed; we need to increase COGS and decrease
+      // Inventory by the same amount. Reverse for a decrease.
+      try {
+        const settings = await getAccountingSettings()
+        if (settings.cogsAccount && settings.inventoryAccount) {
+          const absDelta = Math.round(Math.abs(cogsDeltaBase) * 100) / 100
+          const lines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> =
+            cogsDeltaBase > 0
+              ? [
+                  { accountCode: settings.cogsAccount, description: `Manufacturing-cost reclass (${po.reference})`, debit: absDelta },
+                  { accountCode: settings.inventoryAccount, description: `Manufacturing-cost reclass (${po.reference})`, credit: absDelta },
+                ]
+              : [
+                  { accountCode: settings.inventoryAccount, description: `Manufacturing-cost reclass (${po.reference})`, debit: absDelta },
+                  { accountCode: settings.cogsAccount, description: `Manufacturing-cost reclass (${po.reference})`, credit: absDelta },
+                ]
+          await queueAccountingSync({
+            type: 'MANUFACTURING_RECLASS',
+            referenceType: 'ProductionOrder',
+            referenceId: productionOrderId,
+            payload: {
+              date: new Date().toISOString().slice(0, 10),
+              reference: `MFG-RECLASS: ${po.reference}`,
+              narration: `COGS reclass for retro manufacturing-cost change on ${po.reference} (delta ${cogsDeltaBase >= 0 ? '+' : ''}${cogsDeltaBase.toFixed(4)})`,
+              lines,
+            },
+          })
+        }
+      } catch (e) {
+        await logActivity({
+          entityType: 'STOCK_ADJUSTMENT',
+          entityId: productionOrderId,
+          tag: 'manufacturing',
+          level: 'ERROR',
+          action: 'manufacturing_reclass_failed',
+          description: `Failed to queue reclass journal for ${po.reference}: ${e instanceof Error ? e.message : String(e)}`,
+        })
+      }
+    }
+
+    await logActivity({
+      entityType: 'STOCK_ADJUSTMENT',
+      entityId: productionOrderId,
+      tag: 'manufacturing',
+      level: 'INFO',
+      action: 'manufacturing_cost_lines_updated',
+      description: `Updated manufacturing cost lines for ${po.reference}: ${cleaned.length} line(s), total ${newTotal.toFixed(2)} (was ${oldTotal.toFixed(2)})`,
+      metadata: { productionOrderId, lineCount: cleaned.length, oldTotalBase: oldTotal, newTotalBase: newTotal, cogsDeltaBase },
+    })
+
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: e instanceof Error ? e.message : String(e) }
+  }
+}
+

@@ -32,6 +32,7 @@ export async function GET(
       scheduledAt: true,
       notes: true,
       createdAt: true,
+      currency: true,
       outputProduct: {
         select: {
           sku: true,
@@ -58,6 +59,10 @@ export async function GET(
           postcode: true,
           country: true,
         },
+      },
+      manufacturingCostLines: {
+        select: { description: true, amountForeign: true, accountCode: true, sortOrder: true },
+        orderBy: { sortOrder: 'asc' },
       },
     },
   })
@@ -139,6 +144,32 @@ export async function GET(
   ])
 
   drawTable(doc, columns, rows, branding)
+
+  // Manufacturing cost lines (per-run overhead)
+  if (order.manufacturingCostLines.length > 0) {
+    doc.y += 12
+    doc.font('Helvetica-Bold').fontSize(9).fillColor('#333').text('Manufacturing Costs:', 50, doc.y)
+    doc.y += 8
+    const costColumns: PdfTableColumn[] = [
+      { label: '#', width: 25, align: 'right' },
+      { label: 'Description', width: 270 },
+      { label: 'Account', width: 95 },
+      { label: `Amount (${order.currency})`, width: 105, align: 'right' },
+    ]
+    let costTotal = 0
+    const costRows = order.manufacturingCostLines.map((l, i) => {
+      const amt = Number(l.amountForeign)
+      costTotal += amt
+      return [
+        String(i + 1),
+        l.description,
+        l.accountCode ?? '—',
+        amt.toFixed(2),
+      ]
+    })
+    costRows.push(['', '', 'Total', costTotal.toFixed(2)])
+    drawTable(doc, costColumns, costRows, branding)
+  }
 
   // Notes
   if (order.notes) {

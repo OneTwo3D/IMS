@@ -6,6 +6,24 @@ This repository uses an `x.y.z` release scheme.
 - Increment `y` for user-facing non-breaking changes.
 - Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
+## 1.7.0 - 2026-04-25
+
+### User-facing
+
+- **Manufacturing-cost lines** on production orders. Each manufacturing order can now carry a list of per-run overhead lines (labour, machine time, utilities, etc.) with an optional per-line GL account override. Cost lines are managed from the order detail page in a new **Manufacturing costs** card, and appear on the manufacturing-order PDF with a total.
+- **Capitalised overhead** — on completion the total of all cost lines is folded into the produced cost layer's unit cost (assembly: spread across `qtyPlanned`; disassembly: distributed proportionally across recovered components by their value share). Margin reporting and FIFO consumption use the fully-loaded unit cost.
+- **Manufacturing Journal** accounting type — `DR Inventory / CR Manufacturing Overhead` is queued automatically on assembly/disassembly completion. Lines without a per-line override credit a configurable default account (Settings → Accounting → Manufacturing Overhead account).
+- **Retro recalc** — cost lines can be edited after completion. Cost layers are re-priced and a `MANUFACTURING_RECLASS` journal is queued for any units already shipped (delta posts to COGS vs Inventory).
+
+### Technical
+
+- New Prisma model `ManufacturingCostLine` (id, productionOrderId, description, amountForeign, amountBase, accountCode override, sortOrder).
+- Added `ProductionOrder.currency` + `fxRateToBase` columns so cost lines can be entered in a non-base currency.
+- New `AccountingSyncType` enum values: `MANUFACTURING_JOURNAL` and `MANUFACTURING_RECLASS`. Both connectors (Xero, QuickBooks) gained `*_sync_manufacturing_journal` and `*_manufacturing_overhead_account` setting keys.
+- New `CostLayer.production_order_id` foreign key so retro-recalc can find cost layers produced by a given production order. Index added.
+- Server actions: `getManufacturingCostLines`, `updateManufacturingCostLines` (transactional replacement, triggers retro-recalc when status === 'COMPLETED').
+- Internal helper `recalculateManufacturingCostLayers` mirrors `recalculateDirectLandedCosts`: updates `costLayer.unitCostBase`, posts COGS reclass for consumed qty, and refreshes downstream snapshots via `updateSnapshotsForCostLayerChange` / `refreshShipmentCogsForCostLayerChange` / `refreshSalesOrderLineCogsForCostLayerChange`.
+
 ## 1.6.0 - 2026-04-22
 
 ### User-facing

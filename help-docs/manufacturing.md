@@ -91,4 +91,57 @@ The PDF document includes:
 - Order reference and dates
 - Component table with barcode/EAN for each item
 - Per-unit and total quantities for all components
+- **Manufacturing-cost lines** (when configured) with per-line account override and total
 - Manufacturer details
+
+## Manufacturing Costs (Per-Run Overhead)
+
+Each manufacturing order can carry a list of **per-run overhead lines** — labour, machine time, utilities, packaging, or any other indirect cost incurred to produce the run. Cost lines are managed from the order detail page in the **Manufacturing costs** card.
+
+Each line records:
+
+- **Description** (e.g. "Labour", "Machine time")
+- **Amount** in the order's currency
+- **Account override** (optional) — leave blank to credit the default Manufacturing Overhead account from Settings; enter an account code to route this specific line to a different GL account (e.g. "Wages" for labour, "Utilities" for power)
+
+### How costs are capitalised
+
+When the order completes:
+
+- **Assembly** — the total of all cost lines is added to the consumed-component cost and divided across the produced quantity. The output cost layer's unit cost reflects components + overhead, so margin reporting and FIFO consumption use the fully-loaded cost.
+- **Disassembly** — the overhead is distributed proportionally across the recovered component layers by their original value share.
+
+### Accounting journal
+
+On completion, OTI queues a journal entry to your accounting connector (Xero or QuickBooks):
+
+```
+DR  Inventory Account              [total overhead]
+  CR  Manufacturing Overhead        [per-line accounts]
+```
+
+The component movement (output ↔ components) nets to zero on the Inventory account, so the journal only captures the **overhead leg**. Each cost line lands on its own credit row, so labour, machine, and other categories can post to separate GL accounts.
+
+If a cost line lacks both a per-line override AND the default account is unset in Settings, the journal is **skipped** and a warning is logged in the Activity Log; the cost layer still reflects the overhead, but the GL won't be posted until you configure the account.
+
+### Editing costs after completion (retro-recalc)
+
+Cost lines can be added, edited, or removed **after the order is completed**. When that happens:
+
+1. The output cost layer's unit cost is recomputed from the new total.
+2. For any units already consumed (sold/shipped), a **COGS reclass journal** is queued to capture the cost delta:
+   - If the new cost is higher: `DR COGS / CR Inventory` for the delta on shipped units
+   - If lower: `DR Inventory / CR COGS`
+3. Downstream snapshots on sales-order-line `cogsBase` and shipment-line `costLayerSnapshot` are refreshed.
+
+This means you can record actuals against estimates retroactively (e.g. final labour timesheet, monthly utility bill apportionment) without re-running the order or breaking accounting integrity.
+
+### Settings prerequisites
+
+To use this feature, configure under **Settings → Accounting**:
+
+- **Manufacturing Overhead account** — the default credit account for cost lines without a per-line override
+- **Inventory account** — already required for general operations; reused as the debit side
+- **COGS account** — reused for retro reclass journals
+
+The setting keys are `xero_manufacturing_overhead_account` / `quickbooks_manufacturing_overhead_account` and the per-type toggle is `xero_sync_manufacturing_journal` / `quickbooks_sync_manufacturing_journal`.

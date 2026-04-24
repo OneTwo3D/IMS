@@ -173,6 +173,7 @@ export async function createCostLayer(
     unitCostBase: number
     poLineId?: string
     adjustmentMovementId?: string
+    productionOrderId?: string
     isOpeningStock?: boolean
     receivedAt?: Date
   },
@@ -186,6 +187,7 @@ export async function createCostLayer(
       unitCostBase: Math.round(data.unitCostBase * 1000000) / 1000000,
       poLineId: data.poLineId ?? null,
       adjustmentMovementId: data.adjustmentMovementId ?? null,
+      productionOrderId: data.productionOrderId ?? null,
       isOpeningStock: data.isOpeningStock ?? false,
       ...(data.receivedAt ? { receivedAt: data.receivedAt } : {}),
     },
