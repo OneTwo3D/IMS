@@ -155,6 +155,7 @@ export function ManufacturingCostLinesEditor({
                     <Input
                       type="number"
                       step="0.01"
+                      min="0"
                       value={row.amountForeign}
                       onChange={(e) => updateRow(i, { amountForeign: e.target.value })}
                       placeholder="0.00"

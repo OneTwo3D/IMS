@@ -6,6 +6,24 @@ This repository uses an `x.y.z` release scheme.
 - Increment `y` for user-facing non-breaking changes.
 - Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
+## 1.7.1 - 2026-04-25
+
+### Fixes (manufacturing-cost component, post-review)
+
+- **Sync processors now handle the new types.** `MANUFACTURING_JOURNAL` and `MANUFACTURING_RECLASS` were missing from the Xero and QuickBooks sync-processor switches, causing queued rows to fail with `Unknown sync type` and never post. Both processors now route them through `pushManualJournal` / `pushJournalEntry` like other journal types.
+- **Reclass journal now captures the inventory leg.** Retro edits previously posted only the COGS delta on consumed units, leaving the remaining-inventory delta unposted (and skipping the journal entirely when no units had shipped). The reclass is now a balanced 3-leg journal: `DR/CR Inventory` for the remaining-inventory delta + `DR/CR COGS` for the consumed-units delta + `DR/CR Manufacturing Overhead` for the total delta.
+- **Idempotency keys on both journals.** `MANUFACTURING_JOURNAL` keys on `MFG_JOURNAL:<orderId>` so completion retries dedupe; `MANUFACTURING_RECLASS` keys on `MFG_RECLASS:<orderId>:<oldTotal>:<newTotal>` so identical re-saves dedupe but distinct edits each post.
+- **Manufacturing journal queued in-tx.** Moved from post-tx `queueAccountingSync` to in-tx `queueAccountingSyncTx` so the cost-layer changes and the GL post are durable atomically — no more crash-window where inventory moves without a journal.
+- **Disassembly zero-recovered fallback now capitalises overhead.** When `totalRecoveredCostBase === 0` the overhead is now distributed equally across recovered component layers rather than silently dropped, so the Inventory debit posted by the journal matches the layer-derived stock value. Aligns with the recalc helper's existing equal-share fallback.
+- **Unbalanced-journal guard.** Builder now refuses to post if a credit line is dropped due to a missing account (no DR-only journal) and validates the debit/credit sums match within £0.01.
+- **Negative amounts rejected at the action level.** Cost-line amounts must be non-negative; the journal model assumes overhead is a non-negative debit to inventory. UI input adds `min="0"`.
+- **Reclass warnings surfaced in the action return** as `{ success: true, warning }` rather than only logged silently.
+- **`cost_layers.production_order_id` is now a real FK** with `ON DELETE SET NULL` and a Prisma relation on both sides.
+
+### Tests
+
+- Three additional unit tests in `tests/manufacturing-cost-recalc.test.ts`: proportional rounding across multiple layers, equal-share fallback for zero-base layers, and value-share split with mixed receivedQty.
+
 ## 1.7.0 - 2026-04-25
 
 ### User-facing

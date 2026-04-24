@@ -34,3 +34,8 @@ ALTER TABLE "cost_layers"
 
 CREATE INDEX "cost_layers_production_order_id_idx"
   ON "cost_layers" ("production_order_id");
+
+ALTER TABLE "cost_layers"
+  ADD CONSTRAINT "cost_layers_production_order_id_fkey"
+  FOREIGN KEY ("production_order_id") REFERENCES "production_orders" ("id")
+  ON DELETE SET NULL ON UPDATE CASCADE;

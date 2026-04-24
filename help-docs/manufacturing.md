@@ -129,12 +129,15 @@ If a cost line lacks both a per-line override AND the default account is unset i
 Cost lines can be added, edited, or removed **after the order is completed**. When that happens:
 
 1. The output cost layer's unit cost is recomputed from the new total.
-2. For any units already consumed (sold/shipped), a **COGS reclass journal** is queued to capture the cost delta:
-   - If the new cost is higher: `DR COGS / CR Inventory` for the delta on shipped units
-   - If lower: `DR Inventory / CR COGS`
+2. The full overhead delta is split into a **consumed portion** (units already shipped) and a **remaining-inventory portion** (units still in stock), and a balanced 3-leg `MANUFACTURING_RECLASS` journal is queued:
+   - `DR COGS` (or CR if delta is negative) for the consumed-units delta
+   - `DR Inventory` for the remaining-inventory delta
+   - `CR Manufacturing Overhead` for the **total** delta (matches the original journal direction)
 3. Downstream snapshots on sales-order-line `cogsBase` and shipment-line `costLayerSnapshot` are refreshed.
 
-This means you can record actuals against estimates retroactively (e.g. final labour timesheet, monthly utility bill apportionment) without re-running the order or breaking accounting integrity.
+This means you can record actuals against estimates retroactively (e.g. final labour timesheet, monthly utility bill apportionment) without re-running the order or breaking accounting integrity. The journal is **idempotent** — keyed on `MFG_RECLASS:<orderId>:<oldTotal>:<newTotal>`, so saving the same edit twice posts only once.
+
+Negative amounts are not allowed on cost lines — the journal model assumes overhead is a non-negative debit to inventory. If you need to credit inventory (e.g. correcting an over-stated cost), reduce the cost line's amount instead, or use a separate stock adjustment.
 
 ### Settings prerequisites
 

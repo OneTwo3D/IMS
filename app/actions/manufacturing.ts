@@ -5,7 +5,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
-import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
+import { queueAccountingSyncTx, getAccountingSettings } from '@/lib/accounting'
 import {
   addCostLayerSourceLines,
   consumeFifoLayersStrict,
@@ -599,6 +599,9 @@ export async function updateManufacturingOrderStatus(
 
     const now = new Date()
     const isAssembly = orderPreview.orderType === 'ASSEMBLY'
+    // Surface skip reason post-tx (set inside the tx). Lets us log a
+    // readable warning without holding the tx open.
+    let manufacturingJournalSkipReason: string | null = null
 
     // When completing: execute stock movements in a transaction
     if (status === 'COMPLETED') {
@@ -735,13 +738,21 @@ export async function updateManufacturingOrderStatus(
             (sum, entry) => sum.add(new Prisma.Decimal(entry.qty * entry.unitCostBase)),
             new Prisma.Decimal(0),
           )
-          // Manufacturing overhead capitalises proportionally onto the
-          // recovered components by scaling each plan entry's allocated
-          // cost by (recovered + overhead) / recovered. When recovered
-          // cost is zero (assembled stock had zero cost layers) the
-          // overhead can't be capitalised this way — it's still booked as
-          // expense via the journal below.
-          const recoveryScaleFactor = totalRecoveredCostBase.gt(0)
+          // Manufacturing overhead capitalises onto the recovered
+          // component cost layers. Two strategies:
+          //   - Proportional (totalRecoveredCostBase > 0): each component
+          //     gets a share = its allocatedCost / totalRecoveredCostBase.
+          //   - Equal-split fallback (totalRecoveredCostBase === 0, i.e.
+          //     the assembled stock had zero-cost layers): distribute the
+          //     overhead equally across components so the layers carry the
+          //     debit that the journal posts to Inventory. Without this
+          //     fallback the journal would over-state Inventory relative
+          //     to the layer-derived stock value.
+          const useEqualSplitOverhead = totalRecoveredCostBase.eq(0) && components.length > 0
+          const equalSplitOverheadPerComponent = useEqualSplitOverhead
+            ? totalManufacturingCostBase.div(new Prisma.Decimal(components.length))
+            : new Prisma.Decimal(0)
+          const proportionalScaleFactor = totalRecoveredCostBase.gt(0)
             ? totalRecoveredCostBase.add(totalManufacturingCostBase).div(totalRecoveredCostBase)
             : new Prisma.Decimal(1)
           const recoveryPlan = await buildDisassemblyRecoveryPlan(
@@ -774,7 +785,10 @@ export async function updateManufacturingOrderStatus(
           for (const comp of components) {
             const plannedRecovery = recoveryPlan.find((entry) => entry.componentId === comp.componentId)
             const totalQty = plannedRecovery?.totalQty ?? (Number(comp.qty) * qtyPlanned)
-            const allocatedCost = (plannedRecovery?.totalCostBase ?? new Prisma.Decimal(0)).mul(recoveryScaleFactor)
+            const baseAllocatedCost = plannedRecovery?.totalCostBase ?? new Prisma.Decimal(0)
+            const allocatedCost = useEqualSplitOverhead
+              ? baseAllocatedCost.add(equalSplitOverheadPerComponent)
+              : baseAllocatedCost.mul(proportionalScaleFactor)
             const recoveredUnitCost = totalQty > 0
               ? allocatedCost.div(new Prisma.Decimal(totalQty)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
               : new Prisma.Decimal(0)
@@ -816,53 +830,59 @@ export async function updateManufacturingOrderStatus(
           }
         }
 
-        // Update order status and qtyProduced
-        await tx.productionOrder.update({
-          where: { id },
-          data: { status, completedAt: now, qtyProduced: qtyPlanned },
-        })
-      })
-
-      // Queue accounting journal for the per-run manufacturing overhead.
-      // Components moving from one inventory SKU to another (assembly) or
-      // the reverse (disassembly) net to zero on the Inventory account, so
-      // the journal only needs to capture the overhead leg:
-      //   DR Inventory (assembled output / recovered components)
-      //   CR Manufacturing Overhead (per-line account, default from settings)
-      // Each cost line lands on its own credit row so labour, machine, etc.
-      // can post to distinct accounts.
-      const totalManufacturingCostBaseForJournal = orderPreview.manufacturingCostLines.reduce(
-        (sum, line) => sum + Number(line.amountBase),
-        0,
-      )
-      if (totalManufacturingCostBaseForJournal > 0) {
-        try {
+        // Queue manufacturing-overhead accounting journal IN-TX so the
+        // journal is durable atomically with the cost layers + status flip.
+        // Components moving from one inventory SKU to another (assembly) or
+        // the reverse (disassembly) net to zero on the Inventory account, so
+        // the journal only needs to capture the overhead leg:
+        //   DR Inventory       (assembled output / recovered components)
+        //   CR Manufacturing Overhead (per-line account, default from settings)
+        // Each cost line lands on its own credit row so labour/machine/etc.
+        // can post to distinct accounts. Idempotency key prevents double-
+        // posting if completion is retried.
+        const journalTotalBase = orderPreview.manufacturingCostLines.reduce(
+          (sum, line) => sum + Number(line.amountBase),
+          0,
+        )
+        if (journalTotalBase > 0) {
           const settings = await getAccountingSettings()
           const defaultOverheadAccount = settings.manufacturingOverheadAccount
           const inventoryAccount = settings.inventoryAccount
-          if (inventoryAccount) {
+          if (!inventoryAccount) {
+            manufacturingJournalSkipReason = 'Inventory account not configured in Settings.'
+          } else {
             const directionLabel = isAssembly ? 'assembly' : 'disassembly'
             const reference = `MFG: ${orderPreview.reference}`
             const narration = `Manufacturing overhead — ${directionLabel} of ${orderPreview.outputProduct.sku} (${Number(orderPreview.qtyPlanned)} units)`
-            const totalRounded = Math.round(totalManufacturingCostBaseForJournal * 100) / 100
-            const lines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = [
-              { accountCode: inventoryAccount, description: `Manufacturing overhead capitalised (${orderPreview.outputProduct.sku})`, debit: totalRounded },
-            ]
+            // Build credit rows. Track separately whether any line was
+            // dropped due to a missing account so the DR can be balanced
+            // — never let an unbalanced journal through.
+            let creditTotalRounded = 0
+            let missingAccount = false
+            const creditLines: Array<{ accountCode: string; description: string; credit: number }> = []
             for (const costLine of orderPreview.manufacturingCostLines) {
               const account = costLine.accountCode || defaultOverheadAccount
               const amount = Math.round(Number(costLine.amountBase) * 100) / 100
-              if (!account || amount <= 0) continue
-              lines.push({ accountCode: account, description: costLine.description, credit: amount })
+              if (amount <= 0) continue
+              if (!account) { missingAccount = true; break }
+              creditLines.push({ accountCode: account, description: costLine.description, credit: amount })
+              creditTotalRounded += amount
             }
-            // Only post if every credit line has an account; otherwise the
-            // user hasn't configured a default overhead account yet — skip
-            // and log so the issue is visible.
-            const allLinesHaveAccount = lines.every((l) => l.accountCode)
-            if (allLinesHaveAccount && lines.length > 1) {
-              await queueAccountingSync({
+            if (missingAccount) {
+              manufacturingJournalSkipReason = 'configure default Manufacturing Overhead account in Settings.'
+            } else if (creditLines.length === 0) {
+              manufacturingJournalSkipReason = 'no positive-amount cost lines.'
+            } else {
+              const debitTotal = Math.round(creditTotalRounded * 100) / 100
+              const lines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = [
+                { accountCode: inventoryAccount, description: `Manufacturing overhead capitalised (${orderPreview.outputProduct.sku})`, debit: debitTotal },
+                ...creditLines,
+              ]
+              await queueAccountingSyncTx(tx, {
                 type: 'MANUFACTURING_JOURNAL',
                 referenceType: 'ProductionOrder',
                 referenceId: id,
+                idempotencyKey: `MFG_JOURNAL:${id}`,
                 payload: {
                   date: now.toISOString().slice(0, 10),
                   reference,
@@ -870,28 +890,27 @@ export async function updateManufacturingOrderStatus(
                   lines,
                 },
               })
-            } else if (!allLinesHaveAccount) {
-              await logActivity({
-                entityType: 'STOCK_ADJUSTMENT',
-                entityId: id,
-                tag: 'manufacturing',
-                level: 'WARNING',
-                action: 'manufacturing_journal_skipped',
-                description: `Skipped manufacturing-overhead journal for ${orderPreview.reference}: configure a default Manufacturing Overhead account in Settings.`,
-              })
             }
           }
-        } catch (e) {
-          // Accounting queue errors must never block the main flow.
-          await logActivity({
-            entityType: 'STOCK_ADJUSTMENT',
-            entityId: id,
-            tag: 'manufacturing',
-            level: 'ERROR',
-            action: 'manufacturing_journal_failed',
-            description: `Failed to queue manufacturing-overhead journal for ${orderPreview.reference}: ${e instanceof Error ? e.message : String(e)}`,
-          })
         }
+
+        // Update order status and qtyProduced
+        await tx.productionOrder.update({
+          where: { id },
+          data: { status, completedAt: now, qtyProduced: qtyPlanned },
+        })
+      })
+
+      // Surface the journal-skipped warning post-tx if needed (set inside tx)
+      if (manufacturingJournalSkipReason) {
+        await logActivity({
+          entityType: 'STOCK_ADJUSTMENT',
+          entityId: id,
+          tag: 'manufacturing',
+          level: 'WARNING',
+          action: 'manufacturing_journal_skipped',
+          description: `Skipped manufacturing-overhead journal for ${orderPreview.reference}: ${manufacturingJournalSkipReason}`,
+        })
       }
 
       // Log individual stock movements (fire-and-forget, after transaction)
@@ -1246,7 +1265,7 @@ export async function getManufacturingCostLines(productionOrderId: string): Prom
 async function recalculateManufacturingCostLayers(
   tx: Prisma.TransactionClient,
   productionOrderId: string,
-): Promise<number> {
+): Promise<{ cogsDeltaBase: number; inventoryDeltaBase: number }> {
   const po = await tx.productionOrder.findUnique({
     where: { id: productionOrderId },
     select: {
@@ -1255,7 +1274,7 @@ async function recalculateManufacturingCostLayers(
       manufacturingCostLines: { select: { amountBase: true } },
     },
   })
-  if (!po || po.status !== 'COMPLETED') return 0
+  if (!po || po.status !== 'COMPLETED') return { cogsDeltaBase: 0, inventoryDeltaBase: 0 }
 
   const currentMfgCost = po.manufacturingCostLines.reduce(
     (sum, line) => sum + Number(line.amountBase),
@@ -1272,7 +1291,7 @@ async function recalculateManufacturingCostLayers(
       sourceLines: { select: { totalCostBase: true } },
     },
   })
-  if (layers.length === 0) return 0
+  if (layers.length === 0) return { cogsDeltaBase: 0, inventoryDeltaBase: 0 }
 
   const layerInfos = layers.map((l) => ({
     id: l.id,
@@ -1288,6 +1307,7 @@ async function recalculateManufacturingCostLayers(
   const oldByLayer = new Map(layerInfos.map((l) => [l.id, l]))
 
   let netCogsDeltaBase = 0
+  let netInventoryDeltaBase = 0
   for (const r of recomputed) {
     const li = oldByLayer.get(r.layerId)
     if (!li) continue
@@ -1298,10 +1318,17 @@ async function recalculateManufacturingCostLayers(
       data: { unitCostBase: r.newUnitCostBase },
     })
 
+    const unitDelta = r.newUnitCostBase - li.oldUnitCostBase
     const returnedQty = await getReturnedQtyForCostLayer(tx, li.id)
     const consumedQty = li.receivedQty - li.remainingQty - returnedQty
     if (consumedQty > 0) {
-      netCogsDeltaBase += consumedQty * (r.newUnitCostBase - li.oldUnitCostBase)
+      netCogsDeltaBase += consumedQty * unitDelta
+    }
+    // The remainingQty units stayed in inventory; their value just shifted
+    // by unitDelta. Capture so the caller can post the inventory leg of
+    // the reclass journal.
+    if (li.remainingQty > 0) {
+      netInventoryDeltaBase += li.remainingQty * unitDelta
     }
 
     await updateSnapshotsForCostLayerChange(tx, li.id, r.newUnitCostBase)
@@ -1309,19 +1336,26 @@ async function recalculateManufacturingCostLayers(
     await refreshSalesOrderLineCogsForCostLayerChange(tx, li.id)
   }
 
-  return Math.round(netCogsDeltaBase * 1_000_000) / 1_000_000
+  return {
+    cogsDeltaBase: Math.round(netCogsDeltaBase * 1_000_000) / 1_000_000,
+    inventoryDeltaBase: Math.round(netInventoryDeltaBase * 1_000_000) / 1_000_000,
+  }
 }
 
 /**
  * Replace the manufacturing cost lines on a production order. If the
  * order is COMPLETED, this also recalculates the produced cost layers
- * and queues a reclass journal for the COGS delta on already-consumed
- * (shipped/sold) units.
+ * and queues a reclass journal that captures both the consumed-units
+ * COGS delta and the remaining-inventory delta.
+ *
+ * Negative amounts are rejected — the journal model assumes overhead
+ * lines are non-negative debits to inventory; a credit-style adjustment
+ * should be modelled as a separate journal.
  */
 export async function updateManufacturingCostLines(
   productionOrderId: string,
   lines: ManufacturingCostLineInput[],
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; warning?: string }> {
   try {
     await requirePermission('manufacturing')
 
@@ -1341,10 +1375,15 @@ export async function updateManufacturingCostLines(
         accountCode: l.accountCode?.trim() || null,
         sortOrder: idx,
       }))
+    if (cleaned.some((l) => l.amountForeign < 0 || l.amountBase < 0)) {
+      return { success: false, error: 'Manufacturing cost amounts must be non-negative. Use a separate adjustment to credit inventory.' }
+    }
 
     let cogsDeltaBase = 0
+    let inventoryDeltaBase = 0
     let oldTotal = 0
     let newTotal = 0
+    let reclassWarning: string | null = null
 
     await db.$transaction(async (tx) => {
       await tx.$queryRaw(
@@ -1371,55 +1410,86 @@ export async function updateManufacturingCostLines(
         })
       }
 
-      // If completed, recalc produced cost layers + downstream snapshots.
+      // If completed, recalc produced cost layers + downstream snapshots,
+      // then queue the reclass journal IN-TX so the cost-layer change and
+      // the GL post are durable atomically.
       if (po.status === 'COMPLETED') {
-        cogsDeltaBase = await recalculateManufacturingCostLayers(tx, productionOrderId)
+        const deltas = await recalculateManufacturingCostLayers(tx, productionOrderId)
+        cogsDeltaBase = deltas.cogsDeltaBase
+        inventoryDeltaBase = deltas.inventoryDeltaBase
+
+        const totalDeltaBase = Math.round((cogsDeltaBase + inventoryDeltaBase) * 1_000_000) / 1_000_000
+        if (Math.abs(totalDeltaBase) >= 0.005) {
+          const settings = await getAccountingSettings()
+          const overheadAccount = settings.manufacturingOverheadAccount
+          if (!settings.inventoryAccount || !settings.cogsAccount || !overheadAccount) {
+            reclassWarning = 'Reclass journal not posted: configure Inventory, COGS, and Manufacturing Overhead accounts in Settings.'
+          } else {
+            // Build a balanced 3-leg journal:
+            //   side(positive delta) → inventory + cogs absorb the increase
+            //                          (DR), overhead account is credited
+            //   side(negative delta) → reverse: overhead account debited
+            //                          for the total, inventory + cogs CR
+            const desc = `Manufacturing-cost reclass (${po.reference})`
+            type JournalLine = { accountCode: string; description: string; debit?: number; credit?: number }
+            const journalLines: JournalLine[] = []
+
+            const pushLine = (account: string, deltaSigned: number, role: 'capitalisation' | 'overhead-credit') => {
+              const abs = Math.round(Math.abs(deltaSigned) * 100) / 100
+              if (abs < 0.005) return
+              // Capitalisation accounts (Inventory, COGS) take a DR on a
+              // positive total delta. Overhead account takes a CR on a
+              // positive total delta (mirroring the original journal).
+              const isDebit = role === 'capitalisation' ? deltaSigned > 0 : deltaSigned < 0
+              journalLines.push({
+                accountCode: account,
+                description: desc,
+                ...(isDebit ? { debit: abs } : { credit: abs }),
+              })
+            }
+            pushLine(settings.inventoryAccount, inventoryDeltaBase, 'capitalisation')
+            pushLine(settings.cogsAccount, cogsDeltaBase, 'capitalisation')
+            pushLine(overheadAccount, totalDeltaBase, 'overhead-credit')
+
+            // Sanity-check the balance — guard against rounding drift
+            // producing an unbalanced journal that Xero/QB will reject.
+            const debitSum = journalLines.reduce((s, l) => s + (l.debit ?? 0), 0)
+            const creditSum = journalLines.reduce((s, l) => s + (l.credit ?? 0), 0)
+            if (Math.abs(debitSum - creditSum) >= 0.01) {
+              reclassWarning = `Reclass journal not posted: rounding produced an unbalanced journal (DR ${debitSum.toFixed(2)} vs CR ${creditSum.toFixed(2)}).`
+            } else if (journalLines.length === 0) {
+              reclassWarning = null
+            } else {
+              await queueAccountingSyncTx(tx, {
+                type: 'MANUFACTURING_RECLASS',
+                referenceType: 'ProductionOrder',
+                referenceId: productionOrderId,
+                idempotencyKey: `MFG_RECLASS:${productionOrderId}:${oldTotal.toFixed(4)}:${newTotal.toFixed(4)}`,
+                payload: {
+                  date: new Date().toISOString().slice(0, 10),
+                  reference: `MFG-RECLASS: ${po.reference}`,
+                  narration: `Reclass for retro manufacturing-cost change on ${po.reference} — overhead ${oldTotal.toFixed(2)} → ${newTotal.toFixed(2)}, total delta ${totalDeltaBase >= 0 ? '+' : ''}${totalDeltaBase.toFixed(4)} (COGS ${cogsDeltaBase.toFixed(4)} / Inventory ${inventoryDeltaBase.toFixed(4)})`,
+                  lines: journalLines,
+                },
+              })
+            }
+          }
+        }
       }
     }, { maxWait: 5000, timeout: 20000 })
 
     revalidatePath('/manufacturing')
     revalidatePath(`/manufacturing/${productionOrderId}`)
 
-    if (po.status === 'COMPLETED' && Math.abs(cogsDeltaBase) > 0.005) {
-      // Post a reclass journal: if newCost > oldCost (delta > 0), shipped
-      // units were under-costed; we need to increase COGS and decrease
-      // Inventory by the same amount. Reverse for a decrease.
-      try {
-        const settings = await getAccountingSettings()
-        if (settings.cogsAccount && settings.inventoryAccount) {
-          const absDelta = Math.round(Math.abs(cogsDeltaBase) * 100) / 100
-          const lines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> =
-            cogsDeltaBase > 0
-              ? [
-                  { accountCode: settings.cogsAccount, description: `Manufacturing-cost reclass (${po.reference})`, debit: absDelta },
-                  { accountCode: settings.inventoryAccount, description: `Manufacturing-cost reclass (${po.reference})`, credit: absDelta },
-                ]
-              : [
-                  { accountCode: settings.inventoryAccount, description: `Manufacturing-cost reclass (${po.reference})`, debit: absDelta },
-                  { accountCode: settings.cogsAccount, description: `Manufacturing-cost reclass (${po.reference})`, credit: absDelta },
-                ]
-          await queueAccountingSync({
-            type: 'MANUFACTURING_RECLASS',
-            referenceType: 'ProductionOrder',
-            referenceId: productionOrderId,
-            payload: {
-              date: new Date().toISOString().slice(0, 10),
-              reference: `MFG-RECLASS: ${po.reference}`,
-              narration: `COGS reclass for retro manufacturing-cost change on ${po.reference} (delta ${cogsDeltaBase >= 0 ? '+' : ''}${cogsDeltaBase.toFixed(4)})`,
-              lines,
-            },
-          })
-        }
-      } catch (e) {
-        await logActivity({
-          entityType: 'STOCK_ADJUSTMENT',
-          entityId: productionOrderId,
-          tag: 'manufacturing',
-          level: 'ERROR',
-          action: 'manufacturing_reclass_failed',
-          description: `Failed to queue reclass journal for ${po.reference}: ${e instanceof Error ? e.message : String(e)}`,
-        })
-      }
+    if (reclassWarning) {
+      await logActivity({
+        entityType: 'STOCK_ADJUSTMENT',
+        entityId: productionOrderId,
+        tag: 'manufacturing',
+        level: 'WARNING',
+        action: 'manufacturing_reclass_skipped',
+        description: `Manufacturing reclass journal skipped for ${po.reference}: ${reclassWarning}`,
+      })
     }
 
     await logActivity({
@@ -1429,10 +1499,10 @@ export async function updateManufacturingCostLines(
       level: 'INFO',
       action: 'manufacturing_cost_lines_updated',
       description: `Updated manufacturing cost lines for ${po.reference}: ${cleaned.length} line(s), total ${newTotal.toFixed(2)} (was ${oldTotal.toFixed(2)})`,
-      metadata: { productionOrderId, lineCount: cleaned.length, oldTotalBase: oldTotal, newTotalBase: newTotal, cogsDeltaBase },
+      metadata: { productionOrderId, lineCount: cleaned.length, oldTotalBase: oldTotal, newTotalBase: newTotal, cogsDeltaBase, inventoryDeltaBase },
     })
 
-    return { success: true }
+    return { success: true, ...(reclassWarning ? { warning: reclassWarning } : {}) }
   } catch (e) {
     return { success: false, error: e instanceof Error ? e.message : String(e) }
   }

@@ -78,3 +78,60 @@ test('rounding: unit cost rounded to 6 decimal places', () => {
 test('empty layer list returns empty result', () => {
   assert.deepEqual(recomputeManufacturingUnitCosts([], 100), [])
 })
+
+test('proportional split rounds each layer independently to 6dp', () => {
+  // Three layers with bases summing to £100, overhead £10.
+  // Total layer value after = 110. Per-layer share is by base:
+  //   L1: 33.333... base, gets 33.333.../100 × 10 = 3.333... overhead
+  //         → 36.666.../3 ≈ 12.222222 per unit
+  //   L2: 33.333... base, same → 12.222222 per unit
+  //   L3: 33.333... base, same → 12.222222 per unit
+  const result = recomputeManufacturingUnitCosts(
+    [
+      { id: 'L1', receivedQty: 3, base: 100 / 3 },
+      { id: 'L2', receivedQty: 3, base: 100 / 3 },
+      { id: 'L3', receivedQty: 3, base: 100 / 3 },
+    ],
+    10,
+  )
+  // Each layer should round to the same value at 6dp
+  assert.equal(result.length, 3)
+  for (const r of result) {
+    assert.equal(r.newUnitCostBase, 12.222222)
+  }
+})
+
+test('equal-share fallback: zero base across layers spreads overhead evenly', () => {
+  // Mirrors the disassembly completion-time fallback when totalRecoveredCostBase=0.
+  // Three components, each with 0 base + zero source cost. Overhead £30 →
+  // each layer gets £10. With 5 units each → £2/unit.
+  const result = recomputeManufacturingUnitCosts(
+    [
+      { id: 'A', receivedQty: 5, base: 0 },
+      { id: 'B', receivedQty: 5, base: 0 },
+      { id: 'C', receivedQty: 5, base: 0 },
+    ],
+    30,
+  )
+  for (const r of result) {
+    assert.equal(r.newUnitCostBase, 2)
+  }
+})
+
+test('mixed receivedQty per layer: proportional share is by base value not qty', () => {
+  // L1: base £30 over 1 unit (£30/unit base)
+  // L2: base £70 over 7 units (£10/unit base)
+  // overhead £100, totalBase £100 → split 30/70
+  //   L1 gets £30 overhead → (30 + 30) / 1 = £60
+  //   L2 gets £70 overhead → (70 + 70) / 7 = £20
+  const result = recomputeManufacturingUnitCosts(
+    [
+      { id: 'L1', receivedQty: 1, base: 30 },
+      { id: 'L2', receivedQty: 7, base: 70 },
+    ],
+    100,
+  )
+  const byId = Object.fromEntries(result.map((r) => [r.layerId, r.newUnitCostBase]))
+  assert.equal(byId['L1'], 60)
+  assert.equal(byId['L2'], 20)
+})

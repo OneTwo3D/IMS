@@ -648,6 +648,7 @@ model CostLayer {
   warehouse       Warehouse @relation(fields: [warehouseId], references: [id])
   poLine          PurchaseOrderLine? @relation(fields: [poLineId], references: [id])
   adjustmentMovement StockMovement? @relation("AdjustmentMovementLayer", fields: [adjustmentMovementId], references: [id])
+  productionOrder ProductionOrder? @relation(fields: [productionOrderId], references: [id], onDelete: SetNull)
 
   cogsEntries     CogsEntry[]
   sourceLines     CostLayerSourceLine[]
@@ -1422,6 +1423,7 @@ model ProductionOrder {
   warehouse       Warehouse            @relation(fields: [warehouseId], references: [id])
   manufacturer    Supplier?            @relation(fields: [manufacturerId], references: [id])
   manufacturingCostLines ManufacturingCostLine[]
+  costLayers      CostLayer[]
 
   @@index([status])
   @@index([createdAt])

@@ -454,7 +454,9 @@ async function processEntry(
     case 'DAILY_BATCH_REVENUE_DEFERRAL':
     case 'DAILY_BATCH_INVENTORY_ALLOC':
     case 'DAILY_BATCH_GROUP_B':
-    case 'UNEARNED_REV_REVERSAL': {
+    case 'UNEARNED_REV_REVERSAL':
+    case 'MANUFACTURING_JOURNAL':
+    case 'MANUFACTURING_RECLASS': {
       const idempotencySource = typeof payload._idempotencyKey === 'string'
         ? payload._idempotencyKey
         : type.startsWith('DAILY_BATCH_')
