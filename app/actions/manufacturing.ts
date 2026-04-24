@@ -1182,6 +1182,11 @@ export type ManufacturingOrderDetail = {
     componentBarcode: string | null
     componentImageUrl: string | null
     qtyPerUnit: number
+    requiredQty: number
+    stockOnHand: number | null
+    reservedQty: number | null
+    availableForOrder: number | null
+    shortageQty: number | null
   }[]
   manufacturingCostLines: ManufacturingCostLineRow[]
 }
@@ -1232,6 +1237,20 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
   })
   if (!o) return null
 
+  const componentIds = o.outputProduct.productComponents.map((c) => c.componentId)
+  const componentStock = componentIds.length > 0
+    ? await db.stockLevel.findMany({
+        where: {
+          warehouseId: o.warehouse.id,
+          productId: { in: componentIds },
+        },
+        select: { productId: true, quantity: true, reservedQty: true },
+      })
+    : []
+  const stockByProductId = new Map(componentStock.map((s) => [s.productId, s]))
+  const includeReservedForThisOrder = o.orderType === 'ASSEMBLY' && o.status === 'IN_PROGRESS'
+  const plannedQty = Number(o.qtyPlanned)
+
   return {
     id: o.id,
     reference: o.reference,
@@ -1257,14 +1276,27 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
     notes: o.notes,
     currency: o.currency,
     fxRateToBase: Number(o.fxRateToBase),
-    components: o.outputProduct.productComponents.map((c) => ({
-      componentId: c.componentId,
-      componentSku: c.component.sku,
-      componentName: c.component.name,
-      componentBarcode: c.component.barcode,
-      componentImageUrl: c.component.imageUrl ?? c.component.parent?.imageUrl ?? null,
-      qtyPerUnit: Number(c.qty),
-    })),
+    components: o.outputProduct.productComponents.map((c) => {
+      const qtyPerUnit = Number(c.qty)
+      const requiredQty = qtyPerUnit * plannedQty
+      const stock = stockByProductId.get(c.componentId)
+      const stockOnHand = Number(stock?.quantity ?? 0)
+      const reservedQty = Number(stock?.reservedQty ?? 0)
+      const availableForOrder = includeReservedForThisOrder ? stockOnHand : stockOnHand - reservedQty
+      return {
+        componentId: c.componentId,
+        componentSku: c.component.sku,
+        componentName: c.component.name,
+        componentBarcode: c.component.barcode,
+        componentImageUrl: c.component.imageUrl ?? c.component.parent?.imageUrl ?? null,
+        qtyPerUnit,
+        requiredQty,
+        stockOnHand,
+        reservedQty,
+        availableForOrder,
+        shortageQty: Math.max(0, requiredQty - availableForOrder),
+      }
+    }),
     manufacturingCostLines: o.manufacturingCostLines.map((l) => ({
       id: l.id,
       description: l.description,

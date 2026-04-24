@@ -50,6 +50,11 @@ function fmtDateTime(iso: string | null) {
     ' ' + d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' })
 }
 
+function fmtQty(value: number | null) {
+  if (value == null) return '—'
+  return Number.isInteger(value) ? value.toString() : value.toFixed(4).replace(/0+$/, '').replace(/\.$/, '')
+}
+
 export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -58,6 +63,10 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
   const isDisassembly = order.orderType === 'DISASSEMBLY'
   const hasManufacturer = !!order.manufacturerId
   const actions = NEXT_STATUS[order.status] ?? []
+  const showComponentAvailability = !isDisassembly && order.status !== 'COMPLETED' && order.status !== 'CANCELLED'
+  const shortageComponents = showComponentAvailability
+    ? order.components.filter((component) => (component.shortageQty ?? 0) > 0)
+    : []
 
   function handleStatusChange(status: 'IN_PROGRESS' | 'COMPLETED' | 'CANCELLED') {
     setError(null)
@@ -135,6 +144,18 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
         <div className="flex items-center gap-2 text-sm text-destructive">
           <AlertTriangle className="h-4 w-4" />
           {error}
+        </div>
+      )}
+
+      {shortageComponents.length > 0 && (
+        <div className="flex items-start gap-2 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+          <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
+          <div>
+            <p className="font-medium">Component shortage on this production order</p>
+            <p className="mt-0.5">
+              {shortageComponents.length} component{shortageComponents.length === 1 ? '' : 's'} below requirement for {order.qtyPlanned} unit{order.qtyPlanned === 1 ? '' : 's'}.
+            </p>
+          </div>
         </div>
       )}
 
@@ -266,26 +287,45 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
               <TableHead>Barcode</TableHead>
               <TableHead className="text-right">Per Unit</TableHead>
               <TableHead className="text-right">Total Qty</TableHead>
+              {showComponentAvailability && (
+                <>
+                  <TableHead className="text-right">Available</TableHead>
+                  <TableHead className="text-right">Shortage</TableHead>
+                </>
+              )}
             </TableRow>
           </TableHeader>
           <TableBody>
-            {order.components.map((c, i) => (
-              <TableRow key={c.componentId}>
-                <TableCell className="text-muted-foreground">{i + 1}</TableCell>
-                <TableCell>
-                  <ProductThumb productId={c.componentId} imageUrl={c.componentImageUrl} name={c.componentName} />
-                </TableCell>
-                <TableCell className="font-mono text-xs">{c.componentSku}</TableCell>
-                <TableCell>
-                  <Link href={`/inventory/${c.componentId}`} className="hover:underline" target="_blank">
-                    {c.componentName}
-                  </Link>
-                </TableCell>
-                <TableCell className="text-muted-foreground font-mono text-xs">{c.componentBarcode ?? '—'}</TableCell>
-                <TableCell className="text-right">{c.qtyPerUnit}</TableCell>
-                <TableCell className="text-right font-medium">{c.qtyPerUnit * order.qtyPlanned}</TableCell>
-              </TableRow>
-            ))}
+            {order.components.map((c, i) => {
+              const shortageQty = c.shortageQty ?? 0
+              return (
+                <TableRow key={c.componentId} className={showComponentAvailability && shortageQty > 0 ? 'bg-destructive/5' : undefined}>
+                  <TableCell className="text-muted-foreground">{i + 1}</TableCell>
+                  <TableCell>
+                    <ProductThumb productId={c.componentId} imageUrl={c.componentImageUrl} name={c.componentName} />
+                  </TableCell>
+                  <TableCell className="font-mono text-xs">{c.componentSku}</TableCell>
+                  <TableCell>
+                    <Link href={`/inventory/${c.componentId}`} className="hover:underline" target="_blank">
+                      {c.componentName}
+                    </Link>
+                  </TableCell>
+                  <TableCell className="text-muted-foreground font-mono text-xs">{c.componentBarcode ?? '—'}</TableCell>
+                  <TableCell className="text-right">{fmtQty(c.qtyPerUnit)}</TableCell>
+                  <TableCell className="text-right font-medium">{fmtQty(c.requiredQty)}</TableCell>
+                  {showComponentAvailability && (
+                    <>
+                      <TableCell className={`text-right ${shortageQty > 0 ? 'text-destructive font-medium' : 'text-green-600'}`}>
+                        {fmtQty(c.availableForOrder)}
+                      </TableCell>
+                      <TableCell className={`text-right ${shortageQty > 0 ? 'text-destructive font-semibold' : 'text-muted-foreground'}`}>
+                        {shortageQty > 0 ? fmtQty(shortageQty) : '—'}
+                      </TableCell>
+                    </>
+                  )}
+                </TableRow>
+              )
+            })}
           </TableBody>
         </Table>
       </Card>
