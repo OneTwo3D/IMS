@@ -1,6 +1,5 @@
 'use server'
 
-import { createHash } from 'crypto'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -17,7 +16,12 @@ import {
   refreshSalesOrderLineCogsForCostLayerChange,
   updateSnapshotsForCostLayerChange,
 } from '@/lib/cost-layers'
-import { recomputeManufacturingUnitCosts } from '@/lib/manufacturing-cost'
+import {
+  buildOverheadAccountDeltas,
+  compareAccountCodes,
+  recomputeManufacturingUnitCosts,
+  stableHash,
+} from '@/lib/manufacturing-cost'
 import { COMPONENT_PRODUCT_STATUSES, OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { Prisma, type ProductionOrderStatus, type ProductionOrderType } from '@/app/generated/prisma/client'
 
@@ -29,48 +33,6 @@ function roundCurrency(value: number): number {
 
 function roundSix(value: number): number {
   return Math.round(value * 1_000_000) / 1_000_000
-}
-
-function stableHash(value: unknown): string {
-  return createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16)
-}
-
-function addToMap(map: Map<string, number>, key: string, value: number) {
-  if (Math.abs(value) < 0.000001) return
-  map.set(key, (map.get(key) ?? 0) + value)
-}
-
-function buildOverheadAccountDeltas(
-  oldLines: Array<{ amountBase: Prisma.Decimal | number; accountCode: string | null }>,
-  newLines: Array<{ amountBase: number; accountCode: string | null }>,
-  defaultAccount: string,
-): { deltas: Map<string, number>; missingAccount: boolean } {
-  const deltas = new Map<string, number>()
-  let missingAccount = false
-
-  for (const line of oldLines) {
-    const amount = Number(line.amountBase)
-    if (amount <= 0) continue
-    const account = line.accountCode || defaultAccount
-    if (!account) { missingAccount = true; continue }
-    addToMap(deltas, account, -amount)
-  }
-
-  for (const line of newLines) {
-    const amount = Number(line.amountBase)
-    if (amount <= 0) continue
-    const account = line.accountCode || defaultAccount
-    if (!account) { missingAccount = true; continue }
-    addToMap(deltas, account, amount)
-  }
-
-  for (const [account, delta] of [...deltas.entries()]) {
-    const rounded = roundSix(delta)
-    if (Math.abs(rounded) < 0.000001) deltas.delete(account)
-    else deltas.set(account, rounded)
-  }
-
-  return { deltas, missingAccount }
 }
 
 // ---------------------------------------------------------------------------
@@ -945,7 +907,10 @@ export async function updateManufacturingOrderStatus(
                 type: 'MANUFACTURING_JOURNAL',
                 referenceType: 'ProductionOrder',
                 referenceId: id,
-                idempotencyKey: `MFG_JOURNAL:${id}`,
+                idempotencyKey: `MFG_JOURNAL:${id}:${stableHash({
+                  completedAt: now.toISOString(),
+                  lines,
+                })}`,
                 payload: {
                   date: now.toISOString().slice(0, 10),
                   reference,
@@ -1086,6 +1051,7 @@ export async function updateManufacturingOrderStatus(
             data: { reservedQty: { decrement: qtyPlanned } },
           })
         }
+        await tx.manufacturingCostLine.deleteMany({ where: { productionOrderId: id } })
         await tx.productionOrder.update({ where: { id }, data: { status } })
       })
 
@@ -1100,7 +1066,14 @@ export async function updateManufacturingOrderStatus(
       })
     } else {
       // CANCELLED from DRAFT — no reservations to release
-      await db.productionOrder.update({ where: { id }, data: { status } })
+      if (status === 'CANCELLED') {
+        await db.$transaction(async (tx) => {
+          await tx.manufacturingCostLine.deleteMany({ where: { productionOrderId: id } })
+          await tx.productionOrder.update({ where: { id }, data: { status } })
+        })
+      } else {
+        await db.productionOrder.update({ where: { id }, data: { status } })
+      }
     }
 
     const qtyPlannedLog = Number(orderPreview.qtyPlanned)
@@ -1328,7 +1301,7 @@ export type ManufacturingCostLineInput = {
 }
 
 export async function getManufacturingCostLines(productionOrderId: string): Promise<ManufacturingCostLineRow[]> {
-  await requireAuth()
+  await requirePermission('manufacturing')
   const rows = await db.manufacturingCostLine.findMany({
     where: { productionOrderId },
     orderBy: { sortOrder: 'asc' },
@@ -1459,9 +1432,10 @@ export async function updateManufacturingCostLines(
       select: { id: true, reference: true, status: true, fxRateToBase: true, outputProductId: true },
     })
     if (!po) return { success: false, error: 'Production order not found.' }
+    if (po.status === 'CANCELLED') return { success: false, error: 'Cannot edit manufacturing cost lines on a cancelled production order.' }
 
     const fxRate = Number(po.fxRateToBase) || 1
-    const cleaned = lines
+    const parsed = lines
       .filter((l) => l.description.trim().length > 0 && Number.isFinite(l.amountForeign))
       .map((l, idx) => ({
         description: l.description.trim(),
@@ -1470,15 +1444,15 @@ export async function updateManufacturingCostLines(
         accountCode: l.accountCode?.trim() || null,
         sortOrder: idx,
       }))
-    if (cleaned.some((l) => l.amountForeign < 0 || l.amountBase < 0)) {
+    if (parsed.some((l) => l.amountForeign < 0 || l.amountBase < 0)) {
       return { success: false, error: 'Manufacturing cost amounts must be non-negative. Use a separate adjustment to credit inventory.' }
     }
+    const cleaned = parsed.filter((l) => l.amountForeign > 0 && l.amountBase > 0)
 
     let cogsDeltaBase = 0
     let inventoryDeltaBase = 0
     let oldTotal = 0
     let newTotal = 0
-    let reclassWarning: string | null = null
     let cleanedForWrite = cleaned
 
     await db.$transaction(async (tx) => {
@@ -1560,7 +1534,7 @@ export async function updateManufacturingCostLines(
             pushLine(settings.cogsAccount, cogsDeltaBase, 'capitalisation')
           }
 
-          for (const [account, delta] of [...overheadAccountDeltas.deltas.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+          for (const [account, delta] of [...overheadAccountDeltas.deltas.entries()].sort(([a], [b]) => compareAccountCodes(a, b))) {
             pushLine(account, delta, 'overhead-credit')
           }
 
@@ -1595,38 +1569,27 @@ export async function updateManufacturingCostLines(
                 lines: journalLines,
               },
             })
-          } else {
-            reclassWarning = null
           }
         }
       }
+
+      await tx.activityLog.create({
+        data: {
+          entityType: 'STOCK_ADJUSTMENT',
+          entityId: productionOrderId,
+          tag: 'manufacturing',
+          level: 'INFO',
+          action: 'manufacturing_cost_lines_updated',
+          description: `Updated manufacturing cost lines for ${po.reference}: ${cleaned.length} line(s), total ${newTotal.toFixed(2)} (was ${oldTotal.toFixed(2)})`,
+          metadata: { productionOrderId, lineCount: cleaned.length, oldTotalBase: oldTotal, newTotalBase: newTotal, cogsDeltaBase, inventoryDeltaBase },
+        },
+      })
     }, { maxWait: 5000, timeout: 20000 })
 
     revalidatePath('/manufacturing')
     revalidatePath(`/manufacturing/${productionOrderId}`)
 
-    if (reclassWarning) {
-      await logActivity({
-        entityType: 'STOCK_ADJUSTMENT',
-        entityId: productionOrderId,
-        tag: 'manufacturing',
-        level: 'WARNING',
-        action: 'manufacturing_reclass_skipped',
-        description: `Manufacturing reclass journal skipped for ${po.reference}: ${reclassWarning}`,
-      })
-    }
-
-    await logActivity({
-      entityType: 'STOCK_ADJUSTMENT',
-      entityId: productionOrderId,
-      tag: 'manufacturing',
-      level: 'INFO',
-      action: 'manufacturing_cost_lines_updated',
-      description: `Updated manufacturing cost lines for ${po.reference}: ${cleaned.length} line(s), total ${newTotal.toFixed(2)} (was ${oldTotal.toFixed(2)})`,
-      metadata: { productionOrderId, lineCount: cleaned.length, oldTotalBase: oldTotal, newTotalBase: newTotal, cogsDeltaBase, inventoryDeltaBase },
-    })
-
-    return { success: true, ...(reclassWarning ? { warning: reclassWarning } : {}) }
+    return { success: true }
   } catch (e) {
     return { success: false, error: e instanceof Error ? e.message : String(e) }
   }

@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { recomputeManufacturingUnitCosts } from '../lib/manufacturing-cost.ts'
+import {
+  buildOverheadAccountDeltas,
+  recomputeManufacturingUnitCosts,
+  stableHash,
+} from '../lib/manufacturing-cost.ts'
 
 test('assembly: full overhead spread across single output layer', () => {
   // Assembled 10 units of finished good; component cost was £100 (£10/unit).
@@ -134,4 +138,49 @@ test('mixed receivedQty per layer: proportional share is by base value not qty',
   const byId = Object.fromEntries(result.map((r) => [r.layerId, r.newUnitCostBase]))
   assert.equal(byId['L1'], 60)
   assert.equal(byId['L2'], 20)
+})
+
+test('overhead account deltas net same-account edits to zero', () => {
+  const result = buildOverheadAccountDeltas(
+    [{ amountBase: 100, accountCode: '5100' }],
+    [{ amountBase: 100, accountCode: '5100' }],
+    '',
+  )
+  assert.equal(result.missingAccount, false)
+  assert.deepEqual([...result.deltas.entries()], [])
+})
+
+test('overhead account deltas move value between renamed accounts', () => {
+  const result = buildOverheadAccountDeltas(
+    [{ amountBase: 100, accountCode: '5100' }],
+    [{ amountBase: 100, accountCode: '5200' }],
+    '',
+  )
+  assert.equal(result.missingAccount, false)
+  assert.deepEqual(Object.fromEntries(result.deltas), { '5100': -100, '5200': 100 })
+})
+
+test('overhead account deltas surface missing account on posted old lines', () => {
+  const result = buildOverheadAccountDeltas(
+    [{ amountBase: 100, accountCode: null }],
+    [{ amountBase: 100, accountCode: '5200' }],
+    '',
+  )
+  assert.equal(result.missingAccount, true)
+  assert.deepEqual(Object.fromEntries(result.deltas), { '5200': 100 })
+})
+
+test('overhead account deltas drop sub-half-penny rounded changes', () => {
+  const result = buildOverheadAccountDeltas(
+    [{ amountBase: 100, accountCode: '5100' }],
+    [{ amountBase: 100.004, accountCode: '5100' }],
+    '',
+  )
+  assert.equal(result.missingAccount, false)
+  assert.deepEqual([...result.deltas.entries()], [])
+})
+
+test('stableHash is key-sorted and uses full sha256 digest', () => {
+  assert.equal(stableHash({ b: 1, a: 2 }), stableHash({ a: 2, b: 1 }))
+  assert.equal(stableHash({ a: 2 }).length, 64)
 })

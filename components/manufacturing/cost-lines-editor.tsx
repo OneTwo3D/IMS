@@ -76,6 +76,15 @@ export function ManufacturingCostLinesEditor({
   function handleSave() {
     setError(null)
     setSaved(false)
+    const hasNegativeAmount = draft.some((l) => {
+      if (l.description.trim().length === 0) return false
+      const amount = Number.parseFloat(l.amountForeign)
+      return Number.isFinite(amount) && amount < 0
+    })
+    if (hasNegativeAmount) {
+      setError('Manufacturing cost amounts must be non-negative.')
+      return
+    }
     const cleaned = draft
       .filter((l) => l.description.trim().length > 0)
       .map((l) => ({
@@ -86,7 +95,15 @@ export function ManufacturingCostLinesEditor({
     startTransition(async () => {
       const res = await updateManufacturingCostLines(productionOrderId, cleaned)
       if (res.success) {
-        setOriginalSnapshot(JSON.parse(JSON.stringify(draft)))
+        const persistedDraft = cleaned
+          .filter((l) => l.amountForeign > 0)
+          .map((l) => ({
+            description: l.description,
+            amountForeign: l.amountForeign.toString(),
+            accountCode: l.accountCode ?? '',
+          }))
+        setDraft(persistedDraft)
+        setOriginalSnapshot(JSON.parse(JSON.stringify(persistedDraft)))
         setSaved(true)
         router.refresh()
       } else {
