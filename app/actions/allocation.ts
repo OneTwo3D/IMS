@@ -474,8 +474,8 @@ export async function autoAllocateOrder(
       select: {
         id: true,
         orderNumber: true,
-        externalOrderId: true,
         externalOrderNumber: true,
+        shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
         status: true,
         shipFromWarehouseId: true,
         lines: { select: { id: true, productId: true, qty: true, sku: true } },
@@ -485,8 +485,8 @@ export async function autoAllocateOrder(
 
     // Get eligible warehouses: the selected warehouse first, then others available for sale.
     // For WC orders, restrict to WC-synced warehouses to ship from the right locations.
-    // Use externalOrderId (not externalOrderNumber) — manual orders may have orderNumber but no WC provenance.
-    const isWcOrder = so.externalOrderId != null
+    // Use connector provenance (not externalOrderNumber) — manual orders may have orderNumber.
+    const isWcOrder = so.shoppingLinks.length > 0
     const orderRef = so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
     const allWarehouses = await db.warehouse.findMany({
       where: {
@@ -932,7 +932,7 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
     })
     if (!so) return { success: false, error: 'Order not found' }
 
-    const allocs = await db.$transaction(async (tx) => {
+    const deallocationResult = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
       await resetAllocationAccountingIfStaged(tx, orderId)
       const currentAllocs = await tx.orderAllocation.findMany({
@@ -955,7 +955,7 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
         })),
         'release',
       )
-      await tx.stockLevel.updateMany({
+      const clampedReservations = await tx.stockLevel.updateMany({
         where: { reservedQty: { lt: 0 } },
         data: { reservedQty: 0 },
       })
@@ -970,11 +970,22 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
         }
       }
 
-      return currentAllocs
+      return { allocs: currentAllocs, clampedReservationCount: clampedReservations.count }
     }, STOCK_TX_OPTIONS)
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
+    if (deallocationResult.clampedReservationCount > 0) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'negative_reserved_qty_clamped',
+        tag: 'inventory',
+        level: 'WARNING',
+        description: `Clamped ${deallocationResult.clampedReservationCount} negative reservation balance(s) while deallocating order ${so.orderNumber ?? so.externalOrderNumber}`,
+        metadata: { orderNumber: so.orderNumber ?? so.externalOrderNumber, clampedReservationCount: deallocationResult.clampedReservationCount },
+      })
+    }
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
@@ -985,7 +996,7 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
       metadata: { orderNumber: so.orderNumber ?? so.externalOrderNumber },
     })
     try {
-      const syncTargets = [...new Set(allocs.map((alloc) => alloc.productId))]
+      const syncTargets = [...new Set(deallocationResult.allocs.map((alloc) => alloc.productId))]
       await enqueueStockSync(syncTargets, 'IMS_CHANGE')
     } catch (syncError) {
       console.error(syncError)
@@ -1339,8 +1350,22 @@ export async function updateShipmentStatus(
         })
       }
     } else {
-      // Non-SHIPPED transitions: simple status update
-      await db.shipment.update({ where: { id: shipmentId }, data })
+      const transitioned = await db.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT id FROM shipments WHERE id = ${shipmentId} FOR UPDATE`
+        const locked = await tx.shipment.findUnique({
+          where: { id: shipmentId },
+          select: { status: true },
+        })
+        if (!locked) throw new Error('Shipment not found')
+        if (locked.status === targetStatus) return false
+        const lockedAllowed = VALID[locked.status] ?? []
+        if (!lockedAllowed.includes(targetStatus)) {
+          throw new Error(`Cannot transition shipment from ${locked.status} to ${targetStatus}`)
+        }
+        await tx.shipment.update({ where: { id: shipmentId }, data })
+        return true
+      }, STOCK_TX_OPTIONS)
+      if (!transitioned) return { success: true }
     }
 
     if (targetStatus === 'SHIPPED') {

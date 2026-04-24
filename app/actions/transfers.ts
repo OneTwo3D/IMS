@@ -8,8 +8,9 @@ import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
+import type { Prisma } from '@/app/generated/prisma/client'
 import {
-  consumeFifoLayers,
+  consumeFifoLayersStrict,
   copyCostLayerSourceLinesProportionally,
   createCostLayer,
   type ConsumedLayer,
@@ -67,6 +68,39 @@ function makeReference(): string {
   const ymd = now.toISOString().slice(0, 10).replace(/-/g, '')
   const rand = Math.random().toString(36).slice(2, 6).toUpperCase()
   return `TRF-${ymd}-${rand}`
+}
+
+async function validateTransferAvailability(
+  tx: Prisma.TransactionClient,
+  fromWarehouseId: string,
+  lines: TransferLine[],
+) {
+  const requestedByProduct = new Map<string, { qty: number; sku: string }>()
+  for (const line of lines) {
+    const existing = requestedByProduct.get(line.productId)
+    requestedByProduct.set(line.productId, {
+      qty: (existing?.qty ?? 0) + line.qty,
+      sku: existing?.sku ?? line.sku,
+    })
+  }
+
+  for (const [productId, requested] of requestedByProduct) {
+    await tx.$executeRaw`
+      SELECT "productId", "warehouseId"
+      FROM stock_levels
+      WHERE "productId" = ${productId}
+        AND "warehouseId" = ${fromWarehouseId}
+      FOR UPDATE
+    `
+    const level = await tx.stockLevel.findUnique({
+      where: { productId_warehouseId: { productId, warehouseId: fromWarehouseId } },
+      select: { quantity: true, reservedQty: true },
+    })
+    const available = level ? Number(level.quantity) - Number(level.reservedQty) : 0
+    if (available < requested.qty) {
+      throw new Error(`Insufficient stock for ${requested.sku}: ${available} available, ${requested.qty} requested`)
+    }
+  }
 }
 
 async function mapRow(t: {
@@ -183,35 +217,26 @@ export async function createTransfer(
   }
 
   try {
-    // Validate stock availability at source warehouse
-    for (const line of validLines) {
-      const level = await db.stockLevel.findUnique({
-        where: { productId_warehouseId: { productId: line.productId, warehouseId: fromWarehouseId } },
-        select: { quantity: true, reservedQty: true },
-      })
-      const available = level ? Number(level.quantity) - Number(level.reservedQty) : 0
-      if (available < line.qty) {
-        return { message: `Insufficient stock for ${line.sku}: ${available} available, ${line.qty} requested` }
-      }
-    }
-
-    const transfer = await db.stockTransfer.create({
-      data: {
-        reference: reference || makeReference(),
-        fromWarehouseId,
-        toWarehouseId,
-        notes: notes || null,
-        lines: {
-          create: validLines.map((l) => ({
-            productId: l.productId,
-            sku: l.sku,
-            productName: l.productName,
-            qty: l.qty,
-          })),
+    const transfer = await db.$transaction(async (tx) => {
+      await validateTransferAvailability(tx, fromWarehouseId, validLines)
+      return tx.stockTransfer.create({
+        data: {
+          reference: reference || makeReference(),
+          fromWarehouseId,
+          toWarehouseId,
+          notes: notes || null,
+          lines: {
+            create: validLines.map((l) => ({
+              productId: l.productId,
+              sku: l.sku,
+              productName: l.productName,
+              qty: l.qty,
+            })),
+          },
         },
-      },
-      select: TRANSFER_SELECT,
-    })
+        select: TRANSFER_SELECT,
+      })
+    }, STOCK_TX_OPTIONS)
     revalidatePath('/stock-control/transfers')
 
     const mapped = await mapRow(transfer)
@@ -235,7 +260,7 @@ export async function createTransfer(
       description: e instanceof Error ? e.message : 'Failed to create transfer.',
     })
 
-    return { message: 'Failed to create transfer.' }
+    return { message: e instanceof Error ? e.message : 'Failed to create transfer.' }
   }
 }
 
@@ -272,6 +297,11 @@ export async function updateTransferDraft(
     if (existing.status !== 'DRAFT') return { message: 'Only draft transfers can be edited.' }
 
     await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM stock_transfers WHERE id = ${id} FOR UPDATE`
+      const lockedTransfer = await tx.stockTransfer.findUnique({ where: { id }, select: { status: true } })
+      if (!lockedTransfer) throw new Error('Transfer not found.')
+      if (lockedTransfer.status !== 'DRAFT') throw new Error('Only draft transfers can be edited.')
+      await validateTransferAvailability(tx, fromWarehouseId, validLines)
       await tx.stockTransferLine.deleteMany({ where: { transferId: id } })
       await tx.stockTransfer.update({
         where: { id },
@@ -315,7 +345,7 @@ export async function updateTransferDraft(
       description: e instanceof Error ? e.message : 'Failed to update transfer.',
     })
 
-    return { message: 'Failed to update transfer.' }
+    return { message: e instanceof Error ? e.message : 'Failed to update transfer.' }
   }
 }
 
@@ -381,7 +411,7 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
         // Consume FIFO layers from source warehouse — tolerant mode
         // (legacy stock may not have layers). Store consumed entries on
         // the transfer line so receiveTransfer can split/recreate them.
-        const { consumed } = await consumeFifoLayers(tx, line.productId, transfer.fromWarehouseId, qty)
+        const { consumed } = await consumeFifoLayersStrict(tx, line.productId, transfer.fromWarehouseId, qty)
         if (consumed.length > 0) {
           await tx.stockTransferLine.update({
             where: { id: line.id },

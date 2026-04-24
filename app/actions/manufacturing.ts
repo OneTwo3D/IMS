@@ -384,14 +384,57 @@ async function assertStockAvailable(
   productId: string,
   warehouseId: string,
   qty: number,
+  options: { includeReserved?: boolean; requireReserved?: boolean } = {},
 ) {
+  await tx.$executeRaw`
+    SELECT "productId", "warehouseId"
+    FROM stock_levels
+    WHERE "productId" = ${productId}
+      AND "warehouseId" = ${warehouseId}
+    FOR UPDATE
+  `
   const stock = await tx.stockLevel.findUnique({
     where: { productId_warehouseId: { productId, warehouseId } },
-    select: { quantity: true },
+    select: { quantity: true, reservedQty: true },
   })
-  if (!stock || Number(stock.quantity) < qty) {
+  const quantity = Number(stock?.quantity ?? 0)
+  const reservedQty = Number(stock?.reservedQty ?? 0)
+  const available = options.includeReserved ? quantity : quantity - reservedQty
+  if (!stock || available < qty || (options.requireReserved && reservedQty < qty)) {
     throw new Error(`Insufficient stock for product ${productId} in warehouse ${warehouseId}`)
   }
+}
+
+async function reserveAvailableStock(
+  tx: Prisma.TransactionClient,
+  productId: string,
+  warehouseId: string,
+  qty: number,
+) {
+  await tx.stockLevel.upsert({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    create: { productId, warehouseId, quantity: 0, reservedQty: 0 },
+    update: {},
+  })
+  await tx.$executeRaw`
+    SELECT "productId", "warehouseId"
+    FROM stock_levels
+    WHERE "productId" = ${productId}
+      AND "warehouseId" = ${warehouseId}
+    FOR UPDATE
+  `
+  const stock = await tx.stockLevel.findUnique({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    select: { quantity: true, reservedQty: true },
+  })
+  const available = Number(stock?.quantity ?? 0) - Number(stock?.reservedQty ?? 0)
+  if (available < qty) {
+    throw new Error(`Insufficient stock for product ${productId} in warehouse ${warehouseId}`)
+  }
+  await tx.stockLevel.update({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    data: { reservedQty: { increment: qty } },
+  })
 }
 
 async function buildDisassemblyRecoveryPlan(
@@ -594,7 +637,10 @@ export async function updateManufacturingOrderStatus(
           }> = []
           for (const comp of components) {
             const totalQty = Number(comp.qty) * qtyPlanned
-            await assertStockAvailable(tx, comp.componentId, order.warehouseId, totalQty)
+            await assertStockAvailable(tx, comp.componentId, order.warehouseId, totalQty, {
+              includeReserved: wasInProgress,
+              requireReserved: wasInProgress,
+            })
             const consumed = await consumeFifoLayersStrict(tx, comp.componentId, order.warehouseId, totalQty)
             totalAssemblyCostBase = totalAssemblyCostBase.add(new Prisma.Decimal(consumed.totalCost))
             assemblySourceLines.push(...consumed.consumed.map((entry) => ({
@@ -657,7 +703,10 @@ export async function updateManufacturingOrderStatus(
           })
         } else {
           // DISASSEMBLY: deduct output product (and release reservation), add components
-          await assertStockAvailable(tx, order.outputProductId, order.warehouseId, qtyPlanned)
+          await assertStockAvailable(tx, order.outputProductId, order.warehouseId, qtyPlanned, {
+            includeReserved: wasInProgress,
+            requireReserved: wasInProgress,
+          })
           const recoveredCost = await consumeFifoLayersStrict(tx, order.outputProductId, order.warehouseId, qtyPlanned)
           const recoveryPlan = await buildDisassemblyRecoveryPlan(
             tx,
@@ -777,50 +826,25 @@ export async function updateManufacturingOrderStatus(
       }
     } else if (status === 'IN_PROGRESS') {
       const qtyPlanned = Number(orderPreview.qtyPlanned)
-      // Check stock sufficiency before starting
-      if (isAssembly) {
-        const componentStock = await loadComponentStock(orderPreview.outputProductId, orderPreview.warehouseId)
-        const stockMap = new Map(componentStock.map((stock) => [stock.componentId, stock.available]))
-        const insufficient: string[] = []
-        for (const comp of orderPreview.outputProduct.productComponents) {
-          const needed = Number(comp.qty) * qtyPlanned
-          const available = stockMap.get(comp.componentId) ?? 0
-          if (available < needed) {
-            insufficient.push(`${comp.componentId} needs ${needed} but only ${Math.floor(available)} available`)
-          }
-        }
-        if (insufficient.length > 0) {
-          return { success: false, error: `Insufficient stock for ${insufficient.length} component(s). Cannot start production.` }
-        }
-      } else {
-        // Disassembly: check output product stock
-        const level = await db.stockLevel.findUnique({
-          where: { productId_warehouseId: { productId: orderPreview.outputProductId, warehouseId: orderPreview.warehouseId } },
-          select: { quantity: true, reservedQty: true },
-        })
-        const available = level ? Number(level.quantity) - Number(level.reservedQty) : 0
-        if (available < qtyPlanned) {
-          return { success: false, error: `Insufficient stock: need ${qtyPlanned} units but only ${Math.floor(available)} available for disassembly.` }
-        }
-      }
-
-      // Stock OK — reserve components and start
+      // Reserve inside the same locked transaction as the status transition.
       await db.$transaction(async (tx) => {
+        await tx.$executeRaw`SELECT id FROM production_orders WHERE id = ${id} FOR UPDATE`
+        const lockedOrder = await tx.productionOrder.findUnique({
+          where: { id },
+          select: { status: true },
+        })
+        if (!lockedOrder) throw new Error('Order not found')
+        if (lockedOrder.status !== 'DRAFT') {
+          throw new Error(`Cannot start a production order in ${lockedOrder.status} status`)
+        }
+
         if (isAssembly) {
           for (const comp of orderPreview.outputProduct.productComponents) {
             const totalQty = Number(comp.qty) * qtyPlanned
-            await tx.stockLevel.upsert({
-              where: { productId_warehouseId: { productId: comp.componentId, warehouseId: orderPreview.warehouseId } },
-              create: { productId: comp.componentId, warehouseId: orderPreview.warehouseId, quantity: 0, reservedQty: totalQty },
-              update: { reservedQty: { increment: totalQty } },
-            })
+            await reserveAvailableStock(tx, comp.componentId, orderPreview.warehouseId, totalQty)
           }
         } else {
-          await tx.stockLevel.upsert({
-            where: { productId_warehouseId: { productId: orderPreview.outputProductId, warehouseId: orderPreview.warehouseId } },
-            create: { productId: orderPreview.outputProductId, warehouseId: orderPreview.warehouseId, quantity: 0, reservedQty: qtyPlanned },
-            update: { reservedQty: { increment: qtyPlanned } },
-          })
+          await reserveAvailableStock(tx, orderPreview.outputProductId, orderPreview.warehouseId, qtyPlanned)
         }
         await tx.productionOrder.update({ where: { id }, data: { status, startedAt: now } })
       })

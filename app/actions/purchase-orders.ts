@@ -22,11 +22,50 @@ import { Prisma, type TaxCategory } from '@/app/generated/prisma/client'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
+async function resolveFxRateToBase(
+  tx: Prisma.TransactionClient,
+  currency: string,
+  baseCurrency: string,
+  asOf: Date,
+): Promise<number> {
+  const normalizedCurrency = currency.trim().toUpperCase()
+  const normalizedBase = baseCurrency.trim().toUpperCase()
+  if (!normalizedCurrency || normalizedCurrency === normalizedBase) return 1
+  const rate = await tx.fxRate.findFirst({
+    where: {
+      fromCurrency: normalizedBase,
+      toCurrency: normalizedCurrency,
+      fetchedAt: { lte: asOf },
+    },
+    orderBy: { fetchedAt: 'desc' },
+    select: { rate: true },
+  })
+  if (!rate) {
+    throw new Error(`Missing ${normalizedBase} FX rate for ${normalizedCurrency} on or before ${asOf.toISOString().slice(0, 10)}`)
+  }
+  return Number(rate.rate)
+}
+
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 export type PoStatus = 'DRAFT' | 'RFQ_SENT' | 'QUOTE_RECEIVED' | 'PO_SENT' | 'SHIPPED' | 'PARTIALLY_RECEIVED' | 'RECEIVED' | 'CLOSED' | 'INVOICED' | 'PARTIALLY_RETURNED' | 'RETURNED' | 'CANCELLED'
+
+const PO_STATUS_TRANSITIONS: Record<PoStatus, PoStatus[]> = {
+  DRAFT: ['RFQ_SENT', 'PO_SENT'],
+  RFQ_SENT: ['QUOTE_RECEIVED', 'PO_SENT', 'CLOSED'],
+  QUOTE_RECEIVED: ['PO_SENT', 'CLOSED'],
+  PO_SENT: ['SHIPPED', 'CLOSED'],
+  SHIPPED: ['CLOSED'],
+  PARTIALLY_RECEIVED: ['CLOSED'],
+  RECEIVED: ['CLOSED'],
+  INVOICED: ['CLOSED'],
+  CLOSED: [],
+  PARTIALLY_RETURNED: [],
+  RETURNED: [],
+  CANCELLED: [],
+}
 
 export type PoLineRow = {
   id: string
@@ -1512,30 +1551,43 @@ export async function advancePoStatus(
 ): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('purchasing.create')
-    const existing = await db.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
-    if (!existing) return { success: false, error: 'PO not found' }
+    const result = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
+      const existing = await tx.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
+      if (!existing) throw new Error('PO not found')
+      if (existing.status === targetStatus) {
+        return { existing, changed: false }
+      }
+      const allowed = PO_STATUS_TRANSITIONS[existing.status as PoStatus] ?? []
+      if (!allowed.includes(targetStatus as PoStatus)) {
+        throw new Error(`Cannot transition PO from ${existing.status} to ${targetStatus}`)
+      }
 
-    const now = new Date()
-    const data: Record<string, unknown> = { status: targetStatus }
-    if (targetStatus === 'RFQ_SENT') data.rfqSentAt = now
-    if (targetStatus === 'PO_SENT') data.poSentAt = now
-    if (targetStatus === 'SHIPPED') {
-      if (payload?.trackingNumber) data.trackingNumber = payload.trackingNumber
-      if (payload?.shippingProvider) data.shippingProvider = payload.shippingProvider
-    }
+      const now = new Date()
+      const data: Record<string, unknown> = { status: targetStatus }
+      if (targetStatus === 'RFQ_SENT') data.rfqSentAt = now
+      if (targetStatus === 'PO_SENT') data.poSentAt = now
+      if (targetStatus === 'SHIPPED') {
+        if (payload?.trackingNumber) data.trackingNumber = payload.trackingNumber
+        if (payload?.shippingProvider) data.shippingProvider = payload.shippingProvider
+      }
 
-    await db.purchaseOrder.update({ where: { id }, data })
+      await tx.purchaseOrder.update({ where: { id }, data })
+      return { existing, changed: true }
+    }, STOCK_TX_OPTIONS)
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
-    await logActivity({
-      entityType: 'PURCHASE_ORDER',
-      entityId: id,
-      action: 'status_changed',
-      tag: 'purchase',
-      level: 'INFO',
-      description: `Advanced PO ${existing.reference} to ${targetStatus}`,
-      metadata: { reference: existing.reference, previousStatus: existing.status, newStatus: targetStatus },
-    })
+    if (result.changed) {
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: id,
+        action: 'status_changed',
+        tag: 'purchase',
+        level: 'INFO',
+        description: `Advanced PO ${result.existing.reference} to ${targetStatus}`,
+        metadata: { reference: result.existing.reference, previousStatus: result.existing.status, newStatus: targetStatus },
+      })
+    }
 
     return { success: true }
   } catch (e) {
@@ -1628,7 +1680,7 @@ export async function receivePurchaseOrder(
       },
     })
     if (!po) return { success: false, error: 'PO not found' }
-    if (!['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RFQ_SENT'].includes(po.status)) {
+    if (!['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'].includes(po.status)) {
       return { success: false, error: 'PO cannot be received in its current status' }
     }
 
@@ -1655,6 +1707,7 @@ export async function receivePurchaseOrder(
         where: { id },
         select: {
           reference: true,
+          status: true,
           lines: {
             select: {
               id: true,
@@ -1684,6 +1737,9 @@ export async function receivePurchaseOrder(
         },
       })
       if (!currentPo) throw new Error('PO not found')
+      if (!['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'].includes(currentPo.status)) {
+        throw new Error('PO cannot be received in its current status')
+      }
 
       const grossUnitCostBaseByLine = computeGrossUnitCostBaseByLine({
         lines: currentPo.lines.map((line) => ({
@@ -2037,8 +2093,10 @@ export async function returnPurchaseOrder(
     }
 
     const returnRef = `RTN-${po.reference}-${Date.now().toString(36).toUpperCase()}`
+    let purchaseReturnId = ''
+    let totalReturnedCostBase = 0
     await db.$transaction(async (tx) => {
-      await tx.purchaseReturn.create({
+      const purchaseReturn = await tx.purchaseReturn.create({
         data: {
           poId: id,
           reference: returnRef,
@@ -2052,7 +2110,9 @@ export async function returnPurchaseOrder(
             })),
           },
         },
+        select: { id: true },
       })
+      purchaseReturnId = purchaseReturn.id
 
       for (const rl of linesWithQty) {
         const poLine = po.lines.find((l) => l.id === rl.poLineId)!
@@ -2083,10 +2143,11 @@ export async function returnPurchaseOrder(
             qty: rl.qtyReturned,
             note: `Return to supplier against ${po.reference}${reason ? ` — ${reason}` : ''}`,
             referenceType: 'PurchaseReturn',
-            referenceId: id,
+            referenceId: purchaseReturn.id,
           },
         })
         const { consumed } = await consumeFifoLayersStrict(tx, poLine.productId, rl.warehouseId, rl.qtyReturned)
+        totalReturnedCostBase += consumed.reduce((sum, entry) => sum + entry.qty * entry.unitCostBase, 0)
         if (consumed.length > 0) {
           await tx.cogsEntry.createMany({
             data: consumed.map((entry) => ({
@@ -2146,6 +2207,45 @@ export async function returnPurchaseOrder(
       metadata: { reference: po.reference, lineCount: linesWithQty.length, reason },
     })
 
+    if (totalReturnedCostBase > 0.000001) {
+      try {
+        const settings = await getAccountingSettings()
+        const amount = Math.round(totalReturnedCostBase * 100) / 100
+        await queueAccountingSync({
+          type: 'INVENTORY_ADJUSTMENT',
+          referenceType: 'PurchaseReturn',
+          referenceId: purchaseReturnId,
+          payload: {
+            date: new Date().toISOString().slice(0, 10),
+            reference: returnRef,
+            narration: `Supplier return for PO ${po.reference}`,
+            lines: [
+              {
+                accountCode: settings.transitAccount,
+                description: `Reverse supplier return ${returnRef}`,
+                debit: amount,
+              },
+              {
+                accountCode: settings.inventoryAccount,
+                description: `Reduce inventory for supplier return ${returnRef}`,
+                credit: amount,
+              },
+            ],
+          },
+        })
+      } catch (accountingError) {
+        await logActivity({
+          entityType: 'PURCHASE_ORDER',
+          entityId: id,
+          action: 'purchase_return_accounting_queue_failed',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: `Failed to queue accounting reversal for supplier return ${returnRef}: ${accountingError instanceof Error ? accountingError.message : String(accountingError)}`,
+          metadata: { reference: po.reference, returnRef, error: String(accountingError) },
+        })
+      }
+    }
+
     try {
       const returnedPairs = linesWithQty.map((rl) => ({
         productId: po.lines.find((l) => l.id === rl.poLineId)!.productId,
@@ -2153,7 +2253,7 @@ export async function returnPurchaseOrder(
       }))
       await releaseOverallocations(returnedPairs, {
         source: 'stock_adjustment',
-        referenceId: id,
+        referenceId: purchaseReturnId,
         referenceLabel: `supplier return ${returnRef}`,
       })
     } catch (rebalanceError) {
@@ -2249,6 +2349,7 @@ export async function createInvoice(
         id: true,
         reference: true,
         status: true,
+        currency: true,
         fxRateToBase: true,
         taxForeign: true,
         subtotalForeign: true,
@@ -2285,22 +2386,6 @@ export async function createInvoice(
       return { success: false, error: 'Select at least one line to bill' }
     }
 
-    // Load prior billed totals for enforcement.
-    const existing = await db.purchaseInvoiceLine.findMany({
-      where: { invoice: { poId } },
-      select: { poLineId: true, costLineId: true, qtyBilled: true, totalForeign: true },
-    })
-    const alreadyProductByLine = new Map<string, number>()
-    const alreadyCostByLine = new Map<string, number>()
-    for (const el of existing) {
-      if (el.poLineId) {
-        alreadyProductByLine.set(el.poLineId, (alreadyProductByLine.get(el.poLineId) ?? 0) + Number(el.qtyBilled))
-      }
-      if (el.costLineId) {
-        alreadyCostByLine.set(el.costLineId, (alreadyCostByLine.get(el.costLineId) ?? 0) + Number(el.totalForeign))
-      }
-    }
-
     // Enforce limits + build maps to the underlying PO line rows.
     const poLineById = new Map(po.lines.map((l) => [l.id, l]))
     const costLineById = new Map(po.freightCostLines.map((c) => [c.id, c]))
@@ -2308,21 +2393,18 @@ export async function createInvoice(
     for (const l of productInputs) {
       const poLine = poLineById.get(l.poLineId)
       if (!poLine) return { success: false, error: `Unknown PO line ${l.poLineId}` }
-      const already = alreadyProductByLine.get(l.poLineId) ?? 0
-      if (already + l.qtyBilled > Number(poLine.qty) + 1e-6) {
-        return { success: false, error: `Line ${poLine.product.sku} exceeds remaining qty` }
-      }
     }
     for (const l of costInputs) {
       const costLine = costLineById.get(l.costLineId)
       if (!costLine) return { success: false, error: `Unknown cost line ${l.costLineId}` }
-      const already = alreadyCostByLine.get(l.costLineId) ?? 0
-      if (already + l.amountForeign > Number(costLine.amountForeign) + 1e-4) {
-        return { success: false, error: `Cost line "${costLine.description}" exceeds remaining amount` }
-      }
     }
 
-    const fxRate = Number(po.fxRateToBase)
+    const invoiceDate = new Date(input.invoiceDate)
+    const baseCurrency = await getBaseCurrencyCode()
+    const fxRate = await db.$transaction(
+      (tx) => resolveFxRateToBase(tx, po.currency, baseCurrency, invoiceDate),
+      STOCK_TX_OPTIONS,
+    )
     let subtotalForeign = 0
     let subtotalBase = 0
     let taxBaseForeign = 0
@@ -2378,30 +2460,68 @@ export async function createInvoice(
     const totalForeign = subtotalForeign + taxForeign
     const totalBase = subtotalBase + taxBase
 
-    await db.purchaseInvoice.create({
-      data: {
-        poId,
-        invoiceNumber: input.invoiceNumber || null,
-        invoiceDate: new Date(input.invoiceDate),
-        dueDate: input.dueDate ? new Date(input.dueDate) : null,
-        subtotalForeign,
-        subtotalBase,
-        taxForeign,
-        taxBase,
-        totalForeign,
-        totalBase,
-        fxRateToBase: fxRate,
-        notes: input.notes || null,
-        supplierInvoiceUrl: input.supplierInvoiceUrl || null,
-        lines: { create: lineData },
-      },
-    })
+    await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
+      await tx.$executeRaw`SELECT id FROM purchase_order_lines WHERE "poId" = ${poId} FOR UPDATE`
+      await tx.$executeRaw`SELECT id FROM freight_cost_lines WHERE "poId" = ${poId} FOR UPDATE`
 
-    // Mark invoicedAt (don't change primary status — it's shown as a secondary badge)
-    await db.purchaseOrder.update({
-      where: { id: poId },
-      data: { invoicedAt: new Date() },
-    })
+      const existing = await tx.purchaseInvoiceLine.findMany({
+        where: { invoice: { poId } },
+        select: { poLineId: true, costLineId: true, qtyBilled: true, totalForeign: true },
+      })
+      const alreadyProductByLine = new Map<string, number>()
+      const alreadyCostByLine = new Map<string, number>()
+      for (const el of existing) {
+        if (el.poLineId) {
+          alreadyProductByLine.set(el.poLineId, (alreadyProductByLine.get(el.poLineId) ?? 0) + Number(el.qtyBilled))
+        }
+        if (el.costLineId) {
+          alreadyCostByLine.set(el.costLineId, (alreadyCostByLine.get(el.costLineId) ?? 0) + Number(el.totalForeign))
+        }
+      }
+
+      for (const l of productInputs) {
+        const poLine = poLineById.get(l.poLineId)
+        if (!poLine) throw new Error(`Unknown PO line ${l.poLineId}`)
+        const already = alreadyProductByLine.get(l.poLineId) ?? 0
+        if (already + l.qtyBilled > Number(poLine.qty) + 1e-6) {
+          throw new Error(`Line ${poLine.product.sku} exceeds remaining qty`)
+        }
+      }
+      for (const l of costInputs) {
+        const costLine = costLineById.get(l.costLineId)
+        if (!costLine) throw new Error(`Unknown cost line ${l.costLineId}`)
+        const already = alreadyCostByLine.get(l.costLineId) ?? 0
+        if (already + l.amountForeign > Number(costLine.amountForeign) + 1e-4) {
+          throw new Error(`Cost line "${costLine.description}" exceeds remaining amount`)
+        }
+      }
+
+      await tx.purchaseInvoice.create({
+        data: {
+          poId,
+          invoiceNumber: input.invoiceNumber || null,
+          invoiceDate,
+          dueDate: input.dueDate ? new Date(input.dueDate) : null,
+          subtotalForeign,
+          subtotalBase,
+          taxForeign,
+          taxBase,
+          totalForeign,
+          totalBase,
+          fxRateToBase: fxRate,
+          notes: input.notes || null,
+          supplierInvoiceUrl: input.supplierInvoiceUrl || null,
+          lines: { create: lineData },
+        },
+      })
+
+      // Mark invoicedAt (don't change primary status — it's shown as a secondary badge)
+      await tx.purchaseOrder.update({
+        where: { id: poId },
+        data: { invoicedAt: new Date() },
+      })
+    }, STOCK_TX_OPTIONS)
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${poId}`)
@@ -2534,8 +2654,8 @@ export async function markBillPaid(
 
     const paymentAmount = input.amountForeign ?? Number(invoice.totalForeign)
 
-    await db.purchaseInvoice.update({
-      where: { id: invoiceId },
+    const paidUpdate = await db.purchaseInvoice.updateMany({
+      where: { id: invoiceId, paidAt: null },
       data: {
         paidAt: new Date(input.paymentDate),
         paymentAccountId: input.bankAccountId,
@@ -2543,6 +2663,9 @@ export async function markBillPaid(
         paymentReference: input.reference || null,
       },
     })
+    if (paidUpdate.count === 0) {
+      return { success: false, error: 'Bill is already marked as paid' }
+    }
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${invoice.poId}`)
@@ -3341,6 +3464,17 @@ async function recalculateDirectLandedCosts(
       freightCostLines: {
         select: { amountBase: true, distributionMethod: true },
       },
+      landedCostLinks: {
+        select: {
+          freightPO: {
+            select: {
+              freightCostLines: {
+                select: { amountBase: true, distributionMethod: true },
+              },
+            },
+          },
+        },
+      },
     },
   })
   if (!po) return { revalidatePoIds: [], inventoryTransitAdjustments: [], cogsAdjustments: [] }
@@ -3354,7 +3488,11 @@ async function recalculateDirectLandedCosts(
   }
 
   const eligibleLines = po.lines.filter((line) => decimal(line.qty).gt(0))
-  for (const fcl of po.freightCostLines) {
+  const freightCostLines = [
+    ...po.freightCostLines,
+    ...po.landedCostLinks.flatMap((link) => link.freightPO.freightCostLines),
+  ]
+  for (const fcl of freightCostLines) {
     const method = fcl.distributionMethod
     const bases = eligibleLines.map((line) => ({
       lineId: line.id,

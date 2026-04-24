@@ -454,13 +454,17 @@ async function processEntry(
     case 'DAILY_BATCH_REVENUE_DEFERRAL':
     case 'DAILY_BATCH_INVENTORY_ALLOC':
     case 'DAILY_BATCH_GROUP_B':
-    case 'UNEARNED_REV_REVERSAL':
+    case 'UNEARNED_REV_REVERSAL': {
+      const idempotencySource = type.startsWith('DAILY_BATCH_')
+        ? `${type}:${referenceId}`
+        : entryId
       return pushManualJournal({
         date: payload.date as string,
         reference: payload.reference as string,
         narration: payload.narration as string,
         lines: payload.lines as Array<{ accountCode: string; description: string; debit?: number; credit?: number; taxType?: string }>,
-      }, resolveJournalStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'manual-journal') }).then(r => ({ success: r.success, externalId: r.journalId, error: r.error }))
+      }, resolveJournalStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(idempotencySource, 'manual-journal') }).then(r => ({ success: r.success, externalId: r.journalId, error: r.error }))
+    }
 
     default:
       return { success: false, error: `Unknown sync type: ${type}` }
@@ -616,12 +620,15 @@ async function enqueueFollowUps(
   if (type === 'INVOICE_PDF' && referenceType === 'SalesOrder') {
     const order = await db.salesOrder.findUnique({
       where: { id: referenceId },
-      select: { customerEmail: true, externalOrderId: true },
+      select: {
+        customerEmail: true,
+        shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
+      },
     })
     if (order?.customerEmail) {
       await enqueueFollowUpSyncLog('INVOICE_EMAIL', referenceType, referenceId, { referenceId, sourceEntryId: entryId })
     }
-    if (order?.externalOrderId) {
+    if (order?.shoppingLinks.length) {
       await enqueueFollowUpSyncLog('WC_INVOICE_NOTE', referenceType, referenceId, { referenceId, sourceEntryId: entryId })
     }
   }

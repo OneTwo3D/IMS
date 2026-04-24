@@ -26,13 +26,13 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
   const lastPollSetting = await db.setting.findUnique({ where: { key: 'xero_last_payment_poll' } })
   const lastPoll = lastPollSetting?.value || new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString()
 
-  // --- Sales invoices (manual orders only — no externalOrderId) ---
+  // --- Sales invoices (manual orders only — no shopping connector link) ---
   try {
     const unpaidManualOrders = await db.salesOrder.findMany({
       where: {
         accountingInvoiceId: { not: null },
         paidAt: null,
-        externalOrderId: null, // Only manual orders — WC orders already have paidAt
+        shoppingLinks: { none: {} }, // Shopping orders get payment status from their channel
       },
       select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true },
     })
@@ -133,12 +133,23 @@ export async function pollXeroPayments(): Promise<{ salesPaid: number; billsPaid
     result.errors.push(`Bills polling error: ${String(e)}`)
   }
 
-  // Update last poll timestamp
-  await db.setting.upsert({
-    where: { key: 'xero_last_payment_poll' },
-    create: { key: 'xero_last_payment_poll', value: new Date().toISOString() },
-    update: { value: new Date().toISOString() },
-  })
+  if (result.errors.length === 0) {
+    await db.setting.upsert({
+      where: { key: 'xero_last_payment_poll' },
+      create: { key: 'xero_last_payment_poll', value: new Date().toISOString() },
+      update: { value: new Date().toISOString() },
+    })
+  } else {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_payment_poll_cursor_held',
+      tag: 'sync',
+      level: 'WARNING',
+      description: 'Xero payment poll cursor was not advanced because polling returned errors',
+      metadata: result,
+      resolveUser: false,
+    })
+  }
 
   if (result.salesPaid > 0 || result.billsPaid > 0) {
     await logActivity({

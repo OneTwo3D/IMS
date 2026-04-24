@@ -46,7 +46,7 @@ export async function pollQuickBooksPayments(): Promise<{ salesPaid: number; bil
     where: {
       accountingInvoiceId: { not: null },
       paidAt: null,
-      externalOrderId: null, // manual orders only (WC orders get payment status from WC)
+      shoppingLinks: { none: {} }, // manual orders only; shopping orders get channel payment status
     },
     select: { id: true, accountingInvoiceId: true, status: true },
   })

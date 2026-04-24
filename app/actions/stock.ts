@@ -11,7 +11,7 @@ import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import type { Prisma } from '@/app/generated/prisma/client'
-import { consumeFifoLayers, createCostLayer, getAverageUnitCost } from '@/lib/cost-layers'
+import { consumeFifoLayersStrict, createCostLayer, getAverageUnitCost } from '@/lib/cost-layers'
 
 // ---------------------------------------------------------------------------
 // Helpers for inventory adjustment accounting journal
@@ -206,7 +206,7 @@ export async function applyStockAdjustment({
       adjustmentMovementId: movement.id,
     })
   } else {
-    const { consumed } = await consumeFifoLayers(tx, productId, warehouseId, Math.abs(qty))
+    const { consumed } = await consumeFifoLayersStrict(tx, productId, warehouseId, Math.abs(qty))
     if (consumed.length > 0) {
       await tx.cogsEntry.createMany({
         data: consumed.map((entry) => ({
@@ -271,6 +271,26 @@ export async function applyOpeningStock({
     throw new Error('Opening stock unit cost must be zero or greater')
   }
 
+  await tx.stockLevel.upsert({
+    where: { productId_warehouseId: { productId, warehouseId } },
+    create: { productId, warehouseId, quantity: 0 },
+    update: {},
+  })
+  await tx.$executeRaw`
+    SELECT "productId", "warehouseId"
+    FROM stock_levels
+    WHERE "productId" = ${productId}
+      AND "warehouseId" = ${warehouseId}
+    FOR UPDATE
+  `
+  const existingOpeningLayer = await tx.costLayer.findFirst({
+    where: { productId, warehouseId, isOpeningStock: true },
+    select: { id: true },
+  })
+  if (existingOpeningLayer) {
+    throw new Error('Opening stock has already been applied for this product and warehouse')
+  }
+
   const movement = await tx.stockMovement.create({
     data: {
       type: 'OPENING_STOCK',
@@ -281,17 +301,10 @@ export async function applyOpeningStock({
     },
   })
 
-  await tx.stockLevel.upsert({
+  await tx.stockLevel.update({
     where: { productId_warehouseId: { productId, warehouseId } },
-    create: {
-      productId,
-      warehouseId,
-      quantity: qty,
-    },
-    update: {
-      quantity: {
-        increment: qty,
-      },
+    data: {
+      quantity: { increment: qty },
     },
   })
 
@@ -728,7 +741,7 @@ export async function updateAdjustmentMovement(
           adjustmentMovementId: id,
         })
       } else {
-        const { consumed } = await consumeFifoLayers(tx, movement.productId, newWarehouseId, Math.abs(newSignedQty))
+        const { consumed } = await consumeFifoLayersStrict(tx, movement.productId, newWarehouseId, Math.abs(newSignedQty))
         if (consumed.length > 0) {
           await tx.cogsEntry.createMany({
             data: consumed.map((entry) => ({

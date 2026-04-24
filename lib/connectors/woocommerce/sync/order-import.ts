@@ -261,7 +261,6 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     try {
       so = await db.salesOrder.create({
         data: {
-          externalOrderId: wcOrder.id,
           externalOrderNumber: wcOrder.number,
           orderNumber,
           paymentMethod: wcOrder.payment_method || null,

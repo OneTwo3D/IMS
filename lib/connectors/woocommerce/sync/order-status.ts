@@ -16,10 +16,18 @@ type SalesOrderStatus = string
 
 export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{ success: boolean; error?: string }> {
   try {
-    const so = await db.salesOrder.findUnique({
-      where: { externalOrderId: wcOrder.id },
-      select: { id: true, externalOrderNumber: true, status: true },
+    const link = await db.shoppingOrderLink.findUnique({
+      where: {
+        connector_externalOrderId: {
+          connector: 'woocommerce',
+          externalOrderId: String(wcOrder.id),
+        },
+      },
+      select: {
+        order: { select: { id: true, externalOrderNumber: true, status: true } },
+      },
     })
+    const so = link?.order ?? null
     if (!so) return { success: false, error: `Order not found for WC #${wcOrder.id}` }
 
     // Resolve IMS status
@@ -83,18 +91,29 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
     const externalStatus = IMS_TO_WC[newStatus]
     if (!externalStatus) return // no WC equivalent
 
-    const so = await db.salesOrder.findUnique({
+    const order = await db.salesOrder.findUnique({
       where: { id: orderId },
-      select: { externalOrderId: true, externalOrderNumber: true, trackingNumber: true, shippingService: true },
+      select: {
+        externalOrderNumber: true,
+        trackingNumber: true,
+        shippingService: true,
+        shoppingLinks: {
+          where: { connector: 'woocommerce' },
+          select: { externalOrderId: true, externalOrderNumber: true },
+          take: 1,
+        },
+      },
     })
-    if (!so?.externalOrderId) return // not a WC order
+    const wcLink = order?.shoppingLinks[0]
+    if (!order) return
+    if (!wcLink?.externalOrderId) return // not a WC order
 
-    const { error } = await wcPut(`/orders/${so.externalOrderId}`, { status: externalStatus })
+    const { error } = await wcPut(`/orders/${wcLink.externalOrderId}`, { status: externalStatus })
 
     if (error) {
       await logActivity({
         entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_push_failed', tag: 'sync', level: 'WARNING',
-        description: `Failed to push status ${newStatus} → ${externalStatus} to WC order #${so.externalOrderNumber}: ${error}`,
+        description: `Failed to push status ${newStatus} → ${externalStatus} to WC order #${wcLink.externalOrderNumber ?? order.externalOrderNumber}: ${error}`,
         resolveUser: false,
       })
       return
@@ -106,7 +125,7 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
         status: 'SYNCED',
         entityType: 'SalesOrder',
         entityId: orderId,
-        externalId: so.externalOrderId != null ? String(so.externalOrderId) : null,
+        externalId: wcLink.externalOrderId,
         payload: JSON.parse(JSON.stringify({ status: externalStatus })),
         syncedAt: new Date(),
       },
@@ -114,7 +133,7 @@ export async function pushImsStatusToWc(orderId: string, newStatus: SalesOrderSt
 
     await logActivity({
       entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_status_pushed', tag: 'sync', level: 'INFO',
-      description: `Pushed status ${externalStatus} to WC order #${so.externalOrderNumber}`,
+      description: `Pushed status ${externalStatus} to WC order #${wcLink.externalOrderNumber ?? order.externalOrderNumber}`,
       resolveUser: false,
     })
   } catch {

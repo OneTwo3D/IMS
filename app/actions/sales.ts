@@ -24,6 +24,7 @@ import {
 import { Prisma, type TaxCategory } from '@/app/generated/prisma/client'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
+const XERO_DAILY_BATCH_LOCK_KEY = 4_112_208_031
 
 async function lockCostLayers(
   tx: Prisma.TransactionClient,
@@ -242,6 +243,28 @@ export async function applyReturnInboundStockTx(
   const aggregatedRows = aggregateRefundReturnRows(params.rows)
   if (aggregatedRows.length === 0) return []
 
+  const existingMovements = await tx.stockMovement.findMany({
+    where: {
+      type: 'RETURN_INBOUND',
+      referenceType: params.referenceType,
+      referenceId: params.referenceId,
+    },
+    select: { productId: true, qty: true },
+  })
+  if (existingMovements.length > 0) {
+    const productIds = [...new Set(existingMovements.map((movement) => movement.productId))]
+    const products = await tx.product.findMany({
+      where: { id: { in: productIds } },
+      select: { id: true, sku: true },
+    })
+    const skuByProductId = new Map(products.map((product) => [product.id, product.sku]))
+    return existingMovements.map((movement) => ({
+      productId: movement.productId,
+      sku: skuByProductId.get(movement.productId) ?? movement.productId,
+      qty: Number(movement.qty),
+    }))
+  }
+
   for (const row of aggregatedRows) {
     await tx.stockMovement.create({
       data: {
@@ -360,7 +383,7 @@ export type SoLineRow = {
 
 export type SoRow = {
   id: string
-  externalOrderId: number | null
+  externalOrderId: string | null
   externalOrderNumber: string | null
   orderNumber: string | null
   displayOrderNumber: string
@@ -483,10 +506,142 @@ function makeReference(prefix: string): string {
   return `${prefix}${ymd}-${rand}`
 }
 
+async function nextDocumentNumber(
+  tx: Prisma.TransactionClient,
+  params: { key: string; prefix: string; date?: Date },
+): Promise<string> {
+  const date = params.date ?? new Date()
+  const year = date.getFullYear()
+  const counterKey = `document_counter:${params.key}:${year}`
+  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${counterKey}))`
+  const row = await tx.setting.findUnique({
+    where: { key: counterKey },
+    select: { value: true },
+  })
+  const current = row?.value
+    ? Number.parseInt(row.value, 10)
+    : await getExistingDocumentNumberMax(tx, params.key, `${params.prefix}${year}-`)
+  const next = Number.isFinite(current) && current >= 0 ? current + 1 : 1
+  await tx.setting.upsert({
+    where: { key: counterKey },
+    create: { key: counterKey, value: String(next) },
+    update: { value: String(next) },
+  })
+  return `${params.prefix}${year}-${String(next).padStart(5, '0')}`
+}
+
+async function getExistingDocumentNumberMax(
+  tx: Prisma.TransactionClient,
+  key: string,
+  prefix: string,
+): Promise<number> {
+  const parseSuffix = (value: string | null): number => {
+    if (!value?.startsWith(prefix)) return 0
+    const suffix = value.slice(prefix.length)
+    return /^\d+$/.test(suffix) ? Number.parseInt(suffix, 10) : 0
+  }
+  if (key === 'invoice') {
+    const rows = await tx.salesOrder.findMany({
+      where: { invoiceNumber: { startsWith: prefix } },
+      select: { invoiceNumber: true },
+    })
+    return rows.reduce((max, row) => Math.max(max, parseSuffix(row.invoiceNumber)), 0)
+  }
+  if (key === 'credit_note') {
+    const rows = await tx.salesOrderRefund.findMany({
+      where: { creditNoteNumber: { startsWith: prefix } },
+      select: { creditNoteNumber: true },
+    })
+    return rows.reduce((max, row) => Math.max(max, parseSuffix(row.creditNoteNumber)), 0)
+  }
+  return 0
+}
+
+async function resolveFxRateToBase(
+  tx: Prisma.TransactionClient,
+  currency: string,
+  baseCurrency: string,
+  asOf: Date,
+): Promise<number> {
+  const normalizedCurrency = currency.trim().toUpperCase()
+  const normalizedBase = baseCurrency.trim().toUpperCase()
+  if (!normalizedCurrency || normalizedCurrency === normalizedBase) return 1
+  const rate = await tx.fxRate.findFirst({
+    where: {
+      fromCurrency: normalizedBase,
+      toCurrency: normalizedCurrency,
+      fetchedAt: { lte: asOf },
+    },
+    orderBy: { fetchedAt: 'desc' },
+    select: { rate: true },
+  })
+  if (!rate) {
+    throw new Error(`Missing ${normalizedBase} FX rate for ${normalizedCurrency} on or before ${asOf.toISOString().slice(0, 10)}`)
+  }
+  return Number(rate.rate)
+}
+
+async function refreshDraftOrderFxAtFinalization(
+  orderId: string,
+  asOf: Date,
+): Promise<void> {
+  const baseCurrency = await getBaseCurrencyCode()
+  await db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+    const order = await tx.salesOrder.findUnique({
+      where: { id: orderId },
+      select: {
+        status: true,
+        currency: true,
+        subtotalForeign: true,
+        shippingForeign: true,
+        taxForeign: true,
+        totalForeign: true,
+        lines: {
+          select: {
+            id: true,
+            unitPriceForeign: true,
+            totalForeign: true,
+            taxForeign: true,
+          },
+        },
+      },
+    })
+    if (!order || order.status !== 'DRAFT') return
+    const fxRate = await resolveFxRateToBase(tx, order.currency, baseCurrency, asOf)
+    const round4 = (value: number) => Math.round(value * 10000) / 10000
+    const round6 = (value: number) => Math.round(value * 1000000) / 1000000
+    await tx.salesOrder.update({
+      where: { id: orderId },
+      data: {
+        fxRateToBase: fxRate,
+        subtotalBase: round4(Number(order.subtotalForeign) / fxRate),
+        shippingBase: round4(Number(order.shippingForeign) / fxRate),
+        taxBase: round4(Number(order.taxForeign) / fxRate),
+        totalBase: round4(Number(order.totalForeign) / fxRate),
+      },
+    })
+    for (const line of order.lines) {
+      await tx.salesOrderLine.update({
+        where: { id: line.id },
+        data: {
+          unitPriceBase: round6(Number(line.unitPriceForeign) / fxRate),
+          taxBase: round4(Number(line.taxForeign) / fxRate),
+          totalBase: round4(Number(line.totalForeign) / fxRate),
+        },
+      })
+    }
+  }, STOCK_TX_OPTIONS)
+}
+
 const SO_SELECT = {
   id: true,
-  externalOrderId: true,
   externalOrderNumber: true,
+  shoppingLinks: {
+    select: { connector: true, externalOrderId: true },
+    orderBy: { createdAt: 'asc' },
+    take: 1,
+  },
   orderNumber: true,
   status: true,
   currency: true,
@@ -526,8 +681,8 @@ const SO_SELECT = {
 
 function mapSoRow(so: {
   id: string
-  externalOrderId: number | null
   externalOrderNumber: string | null
+  shoppingLinks: { connector: string; externalOrderId: string }[]
   orderNumber: string | null
   status: string
   currency: string
@@ -571,10 +726,11 @@ function mapSoRow(so: {
   const profitMarginPercent = cogsBase != null && totalBase > 0
     ? ((totalBase - cogsBase) / totalBase) * 100
     : null
-  const hasExternalSource = !!so.externalOrderId
+  const externalLink = so.shoppingLinks[0] ?? null
+  const hasExternalSource = !!externalLink
   return {
     id: so.id,
-    externalOrderId: so.externalOrderId,
+    externalOrderId: externalLink?.externalOrderId ?? null,
     externalOrderNumber: so.externalOrderNumber,
     orderNumber: so.orderNumber,
     displayOrderNumber: so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8),
@@ -766,12 +922,13 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       if (l.qty <= 0) return { success: false, error: `Invalid qty for ${l.sku}` }
       if (l.unitPriceForeign < 0) return { success: false, error: `Negative price for ${l.sku}` }
     }
-    if (input.externalOrderNumber?.trim()) {
+    const externalOrderNumber = input.externalOrderNumber?.trim() || null
+    if (externalOrderNumber) {
       const existing = await db.salesOrder.findFirst({
-        where: { externalOrderNumber: input.externalOrderNumber.trim() },
+        where: { externalOrderNumber },
         select: { id: true },
       })
-      if (existing) return { success: false, error: `Order ${input.externalOrderNumber.trim()} already exists` }
+      if (existing) return { success: false, error: `Order ${externalOrderNumber} already exists` }
     }
 
     const fxRate = input.fxRateToBase && input.fxRateToBase > 0 ? input.fxRateToBase : 1
@@ -998,41 +1155,52 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     // order is finalised later (e.g. moved to PENDING_PAYMENT), the invoice
     // will be queued via updateSalesOrderStatus.
     const initialStatus = input.isDraft ? 'DRAFT' : 'PENDING_PAYMENT'
-    const so = await db.salesOrder.create({
-      data: {
-        externalOrderNumber: input.externalOrderNumber || null,
-        orderNumber,
-        status: initialStatus,
-        currency: input.currency,
-        fxRateToBase: fxRate,
-        customerId: input.customerId || null,
-        customerName: input.customerName,
-        customerEmail: input.customerEmail || null,
-        billingAddress: input.billingAddress ?? undefined,
-        shippingAddress: input.shippingAddress ?? undefined,
-        subtotalForeign,
-        shippingService: input.shippingService || null,
-        shippingForeign: totalShippingForeign,
-        taxRateName: input.taxRateName || null,
-        taxRatePercent: vatRate > 0 ? vatRate : null,
-        taxForeign: totalTaxForeign,
-        pricesIncludeVat: inclVat,
-        totalForeign: grandTotalForeign,
-        subtotalBase,
-        shippingBase: totalShippingBase,
-        taxBase: totalTaxBase,
-        totalBase: grandTotalBase,
-        shipFromWarehouseId: input.shipFromWarehouseId || null,
-        expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null,
-        salesRep: input.salesRep || null,
-        discountStr: input.orderDiscountStr || null,
-        discountAmount: storedDiscountAmount,
-        notes: input.notes || null,
-        internalNotes: input.internalNotes || null,
-        lines: { create: lineData },
-      },
-      select: SO_SELECT,
-    })
+    const so = await db.$transaction(async (tx) => {
+      if (externalOrderNumber) {
+        await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`sales_orders.external_order_number:${externalOrderNumber}`}))`
+        const existing = await tx.salesOrder.findFirst({
+          where: { externalOrderNumber },
+          select: { id: true },
+        })
+        if (existing) throw new Error(`Order ${externalOrderNumber} already exists`)
+      }
+
+      return tx.salesOrder.create({
+        data: {
+          externalOrderNumber,
+          orderNumber,
+          status: initialStatus,
+          currency: input.currency,
+          fxRateToBase: fxRate,
+          customerId: input.customerId || null,
+          customerName: input.customerName,
+          customerEmail: input.customerEmail || null,
+          billingAddress: input.billingAddress ?? undefined,
+          shippingAddress: input.shippingAddress ?? undefined,
+          subtotalForeign,
+          shippingService: input.shippingService || null,
+          shippingForeign: totalShippingForeign,
+          taxRateName: input.taxRateName || null,
+          taxRatePercent: vatRate > 0 ? vatRate : null,
+          taxForeign: totalTaxForeign,
+          pricesIncludeVat: inclVat,
+          totalForeign: grandTotalForeign,
+          subtotalBase,
+          shippingBase: totalShippingBase,
+          taxBase: totalTaxBase,
+          totalBase: grandTotalBase,
+          shipFromWarehouseId: input.shipFromWarehouseId || null,
+          expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null,
+          salesRep: input.salesRep || null,
+          discountStr: input.orderDiscountStr || null,
+          discountAmount: storedDiscountAmount,
+          notes: input.notes || null,
+          internalNotes: input.internalNotes || null,
+          lines: { create: lineData },
+        },
+        select: SO_SELECT,
+      })
+    }, STOCK_TX_OPTIONS)
 
     // Auto-allocate stock across warehouses. Drafts stay unallocated —
     // allocation happens when the draft is finalised so the draft can still
@@ -1230,7 +1398,15 @@ export async function applySalesOrderStatusTransition(
     }
     const so = await db.salesOrder.findUnique({
       where: { id },
-      select: { id: true, orderNumber: true, externalOrderId: true, externalOrderNumber: true, status: true, shipFromWarehouseId: true, lines: { select: { id: true, productId: true, sku: true, qty: true } } },
+      select: {
+        id: true,
+        orderNumber: true,
+        externalOrderNumber: true,
+        status: true,
+        shipFromWarehouseId: true,
+        shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
+        lines: { select: { id: true, productId: true, sku: true, qty: true } },
+      },
     })
     if (!so) return { success: false, error: 'Order not found' }
 
@@ -1281,6 +1457,8 @@ export async function applySalesOrderStatusTransition(
       return { success: false, error: 'Cannot cancel a shipped order — process a refund instead' }
     }
 
+    const isDraftFinalization = so.status === 'DRAFT' && targetStatus !== 'CANCELLED' && targetStatus !== 'DRAFT'
+
     // On CANCEL: release all allocations
     if (targetStatus === 'CANCELLED') {
       const { deallocateOrder } = await import('./allocation')
@@ -1304,27 +1482,31 @@ export async function applySalesOrderStatusTransition(
       orderUpdated = true
     }
 
+    if (isDraftFinalization) {
+      await refreshDraftOrderFxAtFinalization(id, new Date())
+    }
+
     if (!orderUpdated) {
       await db.salesOrder.update({ where: { id }, data })
     }
 
     // Draft finalisation: when a DRAFT is moved to any non-cancelled status,
-    // allocate stock (skipped at creation) and queue the sales invoice for
-    // accounting sync (also skipped at creation).
-    if (so.status === 'DRAFT' && targetStatus !== 'CANCELLED' && targetStatus !== 'DRAFT') {
-      try {
-        const { autoAllocateOrder } = await import('./allocation')
-        await autoAllocateOrder(id)
-      } catch (allocationError) {
+    // allocate stock and queue the sales invoice for accounting sync.
+    if (isDraftFinalization) {
+      const { autoAllocateOrder } = await import('./allocation')
+      const allocation = await autoAllocateOrder(id)
+      if (!allocation.success) {
+        await db.salesOrder.update({ where: { id }, data: { status: 'DRAFT' } })
         await logActivity({
           entityType: 'SALES_ORDER',
           entityId: id,
           action: 'draft_finalization_allocation_failed',
           tag: 'sales',
           level: 'WARNING',
-          description: `Failed to auto-allocate order ${getSalesOrderReference(so)} after status change: ${allocationError instanceof Error ? allocationError.message : String(allocationError)}`,
-          metadata: { orderNumber: getSalesOrderReference(so), targetStatus, error: String(allocationError) },
+          description: `Reverted finalizing order ${getSalesOrderReference(so)} because stock allocation failed: ${allocation.error ?? 'unknown allocation error'}`,
+          metadata: { orderNumber: getSalesOrderReference(so), targetStatus, error: allocation.error ?? null },
         })
+        return { success: false, error: allocation.error ?? 'Could not allocate stock for this order' }
       }
       try {
         await queueSalesInvoiceForOrder(id)
@@ -1364,7 +1546,7 @@ export async function applySalesOrderStatusTransition(
     })
 
     // Push status to WooCommerce (fire-and-forget)
-    if ((options?.pushStatusToWooCommerce ?? true) && so.externalOrderId) {
+    if ((options?.pushStatusToWooCommerce ?? true) && so.shoppingLinks.length > 0) {
       import('@/lib/connectors/woocommerce/sync/order-status')
         .then((m) => m.pushImsStatusToWc(id, targetStatus as never))
         .catch(async (syncError) => {
@@ -1436,6 +1618,7 @@ export async function createRefund(
     }
 
     const txResult = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${XERO_DAILY_BATCH_LOCK_KEY})`
       // Lock the sales order row — prevents concurrent refund creation
       await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
 
@@ -1504,14 +1687,10 @@ export async function createRefund(
       }
 
       const totalForeign = Math.round(totalBase * fxRate * 10000) / 10000
-      // Serialize credit note number generation globally — the SO row lock
-      // is per-order, but CN numbers are system-wide. Without this, two
-      // concurrent refunds on different orders could read the same count
-      // and generate duplicate CN numbers. Advisory lock key chosen to
-      // avoid colliding with other lock users in the codebase.
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(8675309)`
-      const cnCount = await tx.salesOrderRefund.count({ where: { creditNoteNumber: { not: null } } })
-      const creditNoteNumber = `${numbering.cn_prefix}${new Date().getFullYear()}-${String(cnCount + 1).padStart(5, '0')}`
+      const creditNoteNumber = await nextDocumentNumber(tx, {
+        key: 'credit_note',
+        prefix: numbering.cn_prefix,
+      })
 
       const createdRefund = await tx.salesOrderRefund.create({
         data: {
@@ -1701,6 +1880,7 @@ export async function createRefund(
               refunds: {
                 where: { id: { not: createdRefund.id } },
                 select: {
+                  id: true,
                   lines: {
                     select: {
                       id: true,
@@ -1720,8 +1900,13 @@ export async function createRefund(
           const priorReversals = await tx.accountingSyncLog.findMany({
             where: {
               connector: 'xero',
-              referenceType: 'SalesOrder',
-              referenceId: orderId,
+              OR: [
+                { referenceType: 'SalesOrder', referenceId: orderId },
+                {
+                  referenceType: 'SalesOrderRefund',
+                  referenceId: { in: (orderAccounting?.refunds ?? []).map((refund) => refund.id) },
+                },
+              ],
               type: { in: ['COGS_REVERSAL', 'UNEARNED_REV_REVERSAL'] },
               status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] },
             },
@@ -2106,8 +2291,8 @@ export async function createRefund(
         if (reversalAmounts.cogsReversal > 0) {
           await queueAccountingSync({
             type: 'COGS_REVERSAL',
-            referenceType: 'SalesOrder',
-            referenceId: orderId,
+            referenceType: 'SalesOrderRefund',
+            referenceId: createdRefund.id,
             payload: {
               date: new Date().toISOString().slice(0, 10),
               reference: `COGS reversal: ${orderRef}`,
@@ -2138,8 +2323,8 @@ export async function createRefund(
           const hasInventoryReversal = reversalAmounts.allocationReversal > 0
           await queueAccountingSync({
             type: 'UNEARNED_REV_REVERSAL',
-            referenceType: 'SalesOrder',
-            referenceId: orderId,
+            referenceType: 'SalesOrderRefund',
+            referenceId: createdRefund.id,
             payload: {
               date: new Date().toISOString().slice(0, 10),
               reference: `Unearned reversal: ${orderRef}`,
@@ -2441,18 +2626,17 @@ export async function updateSalesOrderNotes(
 export async function generateInvoiceNumber(id: string, options?: { skipLog?: boolean }): Promise<{ success: boolean; invoiceNumber?: string; error?: string }> {
   try {
     await requirePermission('sales.process')
-    // Use a transaction with an advisory lock to prevent race conditions
-    // on invoice numbering. The SO row lock (implicit via update) is
-    // per-order, but invoice numbers are system-wide — without the
-    // advisory lock, two concurrent calls on different orders can read
-    // the same count and generate duplicate invoice numbers.
+    const { getNumberingFormats } = await import('./company')
+    const numbering = await getNumberingFormats()
     const result = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${id} FOR UPDATE`
       const so = await tx.salesOrder.findUnique({ where: { id }, select: { externalOrderNumber: true, orderNumber: true, invoiceNumber: true } })
       if (!so) throw new Error('Order not found')
       if (so.invoiceNumber) return { invoiceNumber: so.invoiceNumber, orderNumber: getSalesOrderReference({ id, ...so }) }
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(8675310)`
-      const count = await tx.salesOrder.count({ where: { invoiceNumber: { not: null } } })
-      const invNum = `INV-${new Date().getFullYear()}-${String(count + 1).padStart(5, '0')}`
+      const invNum = await nextDocumentNumber(tx, {
+        key: 'invoice',
+        prefix: numbering.inv_prefix,
+      })
       await tx.salesOrder.update({ where: { id }, data: { invoiceNumber: invNum, invoicedAt: new Date() } })
       return { invoiceNumber: invNum, orderNumber: getSalesOrderReference({ id, ...so }) }
     })
@@ -2515,51 +2699,76 @@ export async function addPayment(input: {
   try {
     await requirePermission('sales.refund')
     if (!input.amount || input.amount <= 0) return { success: false, error: 'Amount must be greater than 0' }
-    const so = await db.salesOrder.findUnique({
-      where: { id: input.orderId },
-      select: {
-        orderNumber: true,
-        externalOrderNumber: true,
-        currency: true,
-        totalForeign: true,
-        paidAt: true,
-      },
-    })
-    if (so && input.currency !== so.currency) {
-      return { success: false, error: `Payment currency must match order currency (${so.currency})` }
-    }
-    await db.payment.create({
-      data: {
-        orderId: input.orderId,
-        refundId: input.refundId || null,
-        amount: input.amount,
-        currency: input.currency,
-        method: input.method || null,
-        reference: input.reference || null,
-        notes: input.notes || null,
-        paidAt: input.paidAt ? new Date(input.paidAt) : new Date(),
-      },
-    })
+    const txResult = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${input.orderId} FOR UPDATE`
+      const so = await tx.salesOrder.findUnique({
+        where: { id: input.orderId },
+        select: {
+          id: true,
+          orderNumber: true,
+          externalOrderNumber: true,
+          status: true,
+          currency: true,
+          totalForeign: true,
+          paidAt: true,
+        },
+      })
+      if (!so) return { error: 'Order not found' }
+      if (so.status === 'CANCELLED' || so.status === 'REFUNDED') {
+        return { error: `Cannot add payments to ${so.status.toLowerCase()} orders` }
+      }
+      if (input.currency !== so.currency) {
+        return { error: `Payment currency must match order currency (${so.currency})` }
+      }
 
-    // Auto-set paidAt on the order if invoice total is fully paid
-    if (so && !so.paidAt) {
-      const payments = await db.payment.findMany({
-        where: { orderId: input.orderId, refundId: null },
+      const refundId = input.refundId || null
+      let payableTotal = Number(so.totalForeign)
+      if (refundId) {
+        const refund = await tx.salesOrderRefund.findFirst({
+          where: { id: refundId, orderId: input.orderId },
+          select: { totalForeign: true },
+        })
+        if (!refund) return { error: 'Refund not found for this order' }
+        payableTotal = Number(refund.totalForeign)
+      }
+
+      const existingPayments = await tx.payment.findMany({
+        where: { orderId: input.orderId, refundId },
         select: { amount: true, currency: true },
       })
-      const totalPaid = payments.reduce((sum, payment) => {
+      const totalPaid = existingPayments.reduce((sum, payment) => {
         if (payment.currency !== so.currency) return sum
         return sum + Number(payment.amount)
       }, 0)
-      if (totalPaid >= Number(so.totalForeign)) {
-        await db.salesOrder.update({ where: { id: input.orderId }, data: { paidAt: new Date() } })
+      if (totalPaid + input.amount > payableTotal + 0.0001) {
+        return { error: `Payment exceeds remaining balance (${so.currency} ${(payableTotal - totalPaid).toFixed(2)})` }
+      }
 
-        // Auto-generate invoice if trigger is on_paid (skip its own log —
-        // the payment_added entry below covers both actions)
-        const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
-        if (trigger?.value === 'on_paid') {
-          await generateInvoiceNumber(input.orderId, { skipLog: true })
-        }
+      await tx.payment.create({
+        data: {
+          orderId: input.orderId,
+          refundId,
+          amount: input.amount,
+          currency: input.currency,
+          method: input.method || null,
+          reference: input.reference || null,
+          notes: input.notes || null,
+          paidAt: input.paidAt ? new Date(input.paidAt) : new Date(),
+        },
+      })
+
+      const becamePaid = !refundId && !so.paidAt && totalPaid + input.amount >= Number(so.totalForeign) - 0.0001
+      if (becamePaid) {
+        await tx.salesOrder.update({ where: { id: input.orderId }, data: { paidAt: new Date() } })
+      }
+      return { so, becamePaid }
+    }, STOCK_TX_OPTIONS)
+    if ('error' in txResult) return { success: false, error: txResult.error }
+
+    if (txResult.becamePaid) {
+      const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
+      if (trigger?.value === 'on_paid') {
+        await generateInvoiceNumber(input.orderId, { skipLog: true })
       }
     }
 
@@ -2570,8 +2779,8 @@ export async function addPayment(input: {
       action: 'payment_added',
       tag: 'sales',
       level: 'INFO',
-      description: `Added ${input.currency} ${input.amount.toFixed(2)} payment to order ${so ? getSalesOrderReference({ id: input.orderId, ...so }) : input.orderId}`,
-      metadata: { orderNumber: so ? getSalesOrderReference({ id: input.orderId, ...so }) : input.orderId, amount: input.amount, currency: input.currency, method: input.method },
+      description: `Added ${input.currency} ${input.amount.toFixed(2)} payment to order ${getSalesOrderReference(txResult.so)}`,
+      metadata: { orderNumber: getSalesOrderReference(txResult.so), amount: input.amount, currency: input.currency, method: input.method },
     })
     return { success: true }
   } catch (e) {
@@ -2591,8 +2800,44 @@ export async function addPayment(input: {
 export async function deletePayment(paymentId: string, orderId: string): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('sales.refund')
-    await db.payment.delete({ where: { id: paymentId } })
-    const so = await db.salesOrder.findUnique({ where: { id: orderId }, select: { orderNumber: true, externalOrderNumber: true } })
+    const txResult = await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+      const so = await tx.salesOrder.findUnique({
+        where: { id: orderId },
+        select: {
+          id: true,
+          orderNumber: true,
+          externalOrderNumber: true,
+          currency: true,
+          totalForeign: true,
+        },
+      })
+      if (!so) return { error: 'Order not found' }
+      const payment = await tx.payment.findUnique({
+        where: { id: paymentId },
+        select: { orderId: true, refundId: true },
+      })
+      if (!payment || payment.orderId !== orderId) {
+        return { error: 'Payment not found for this order' }
+      }
+      await tx.payment.delete({ where: { id: paymentId } })
+      if (!payment.refundId) {
+        const remainingPayments = await tx.payment.findMany({
+          where: { orderId, refundId: null },
+          select: { amount: true, currency: true },
+        })
+        const totalPaid = remainingPayments.reduce((sum, p) => {
+          if (p.currency !== so.currency) return sum
+          return sum + Number(p.amount)
+        }, 0)
+        await tx.salesOrder.update({
+          where: { id: orderId },
+          data: { paidAt: totalPaid >= Number(so.totalForeign) - 0.0001 ? undefined : null },
+        })
+      }
+      return { so }
+    }, STOCK_TX_OPTIONS)
+    if ('error' in txResult) return { success: false, error: txResult.error }
     revalidatePath(`/sales/${orderId}`)
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -2600,8 +2845,8 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
       action: 'payment_deleted',
       tag: 'sales',
       level: 'INFO',
-      description: `Deleted payment from order ${so ? getSalesOrderReference({ id: orderId, ...so }) : orderId}`,
-      metadata: { orderNumber: so ? getSalesOrderReference({ id: orderId, ...so }) : orderId, paymentId },
+      description: `Deleted payment from order ${getSalesOrderReference(txResult.so)}`,
+      metadata: { orderNumber: getSalesOrderReference(txResult.so), paymentId },
     })
     return { success: true }
   } catch (e) {

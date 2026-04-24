@@ -1072,7 +1072,6 @@ model Customer {
 
 model SalesOrder {
   id                String           @id @default(cuid())
-  externalOrderId    Int?             @unique // Shopping connector order ID
   externalOrderNumber String?         // Storefront order number/reference
   status            SalesOrderStatus @default(DRAFT)
   currency          String           @default("GBP")
@@ -1143,7 +1142,6 @@ model SalesOrder {
   shoppingLinks     ShoppingOrderLink[]
   wmsReturnsInbox   WmsReturnsInbox[] @relation("WmsReturnsInboxOrder")
 
-  @@index([externalOrderId])
   @@index([status])
   @@index([createdAt])
   @@map("sales_orders")
