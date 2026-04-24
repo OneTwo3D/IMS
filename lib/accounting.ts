@@ -131,6 +131,10 @@ async function getAccountingPostingContext(type: AccountingSyncType): Promise<{
   return { connector, postingMode }
 }
 
+export async function isAccountingSyncTypeEnabled(type: AccountingSyncType): Promise<boolean> {
+  return (await getAccountingPostingContext(type)) !== null
+}
+
 export async function queueAccountingSyncTx(
   tx: Prisma.TransactionClient,
   params: {

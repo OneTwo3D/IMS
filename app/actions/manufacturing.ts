@@ -1,11 +1,12 @@
 'use server'
 
+import { createHash } from 'crypto'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
-import { queueAccountingSyncTx, getAccountingSettings } from '@/lib/accounting'
+import { queueAccountingSyncTx, getAccountingSettings, isAccountingSyncTypeEnabled } from '@/lib/accounting'
 import {
   addCostLayerSourceLines,
   consumeFifoLayersStrict,
@@ -19,6 +20,58 @@ import {
 import { recomputeManufacturingUnitCosts } from '@/lib/manufacturing-cost'
 import { COMPONENT_PRODUCT_STATUSES, OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { Prisma, type ProductionOrderStatus, type ProductionOrderType } from '@/app/generated/prisma/client'
+
+type JournalLine = { accountCode: string; description: string; debit?: number; credit?: number }
+
+function roundCurrency(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+function roundSix(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000
+}
+
+function stableHash(value: unknown): string {
+  return createHash('sha256').update(JSON.stringify(value)).digest('hex').slice(0, 16)
+}
+
+function addToMap(map: Map<string, number>, key: string, value: number) {
+  if (Math.abs(value) < 0.000001) return
+  map.set(key, (map.get(key) ?? 0) + value)
+}
+
+function buildOverheadAccountDeltas(
+  oldLines: Array<{ amountBase: Prisma.Decimal | number; accountCode: string | null }>,
+  newLines: Array<{ amountBase: number; accountCode: string | null }>,
+  defaultAccount: string,
+): { deltas: Map<string, number>; missingAccount: boolean } {
+  const deltas = new Map<string, number>()
+  let missingAccount = false
+
+  for (const line of oldLines) {
+    const amount = Number(line.amountBase)
+    if (amount <= 0) continue
+    const account = line.accountCode || defaultAccount
+    if (!account) { missingAccount = true; continue }
+    addToMap(deltas, account, -amount)
+  }
+
+  for (const line of newLines) {
+    const amount = Number(line.amountBase)
+    if (amount <= 0) continue
+    const account = line.accountCode || defaultAccount
+    if (!account) { missingAccount = true; continue }
+    addToMap(deltas, account, amount)
+  }
+
+  for (const [account, delta] of [...deltas.entries()]) {
+    const rounded = roundSix(delta)
+    if (Math.abs(rounded) < 0.000001) deltas.delete(account)
+    else deltas.set(account, rounded)
+  }
+
+  return { deltas, missingAccount }
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -805,8 +858,8 @@ export async function updateManufacturingOrderStatus(
               unitCostBase: recoveredUnitCost.toNumber(),
               productionOrderId: id,
             })
-            if (allocatedCost.gt(0) && totalRecoveredCostBase.gt(0)) {
-              const componentShare = allocatedCost.div(totalRecoveredCostBase)
+            if (baseAllocatedCost.gt(0) && totalRecoveredCostBase.gt(0)) {
+              const componentShare = baseAllocatedCost.div(totalRecoveredCostBase)
               await addCostLayerSourceLines(tx, componentLayerId, recoveredCost.consumed.map((entry) => ({
                 sourceProductId: order.outputProductId,
                 sourceCostLayerId: entry.costLayerId,
@@ -840,44 +893,54 @@ export async function updateManufacturingOrderStatus(
         // Each cost line lands on its own credit row so labour/machine/etc.
         // can post to distinct accounts. Idempotency key prevents double-
         // posting if completion is retried.
-        const journalTotalBase = orderPreview.manufacturingCostLines.reduce(
+        const journalTotalBase = order.manufacturingCostLines.reduce(
           (sum, line) => sum + Number(line.amountBase),
           0,
         )
         if (journalTotalBase > 0) {
-          const settings = await getAccountingSettings()
-          const defaultOverheadAccount = settings.manufacturingOverheadAccount
-          const inventoryAccount = settings.inventoryAccount
-          if (!inventoryAccount) {
-            manufacturingJournalSkipReason = 'Inventory account not configured in Settings.'
-          } else {
+          const shouldPostJournal = await isAccountingSyncTypeEnabled('MANUFACTURING_JOURNAL')
+          if (shouldPostJournal) {
+            const settings = await getAccountingSettings()
+            const defaultOverheadAccount = settings.manufacturingOverheadAccount
+            const inventoryAccount = settings.inventoryAccount
+            if (!inventoryAccount) {
+              throw new Error('Cannot complete production order with manufacturing costs: configure Inventory account in Settings.')
+            }
             const directionLabel = isAssembly ? 'assembly' : 'disassembly'
-            const reference = `MFG: ${orderPreview.reference}`
-            const narration = `Manufacturing overhead — ${directionLabel} of ${orderPreview.outputProduct.sku} (${Number(orderPreview.qtyPlanned)} units)`
+            const reference = `MFG: ${order.reference}`
+            const narration = `Manufacturing overhead — ${directionLabel} of ${order.outputProduct.sku} (${Number(order.qtyPlanned)} units)`
             // Build credit rows. Track separately whether any line was
             // dropped due to a missing account so the DR can be balanced
             // — never let an unbalanced journal through.
             let creditTotalRounded = 0
             let missingAccount = false
+            const defaultedCostLineIds: string[] = []
             const creditLines: Array<{ accountCode: string; description: string; credit: number }> = []
-            for (const costLine of orderPreview.manufacturingCostLines) {
+            for (const costLine of order.manufacturingCostLines) {
               const account = costLine.accountCode || defaultOverheadAccount
-              const amount = Math.round(Number(costLine.amountBase) * 100) / 100
+              const amount = roundCurrency(Number(costLine.amountBase))
               if (amount <= 0) continue
               if (!account) { missingAccount = true; break }
+              if (!costLine.accountCode) defaultedCostLineIds.push(costLine.id)
               creditLines.push({ accountCode: account, description: costLine.description, credit: amount })
               creditTotalRounded += amount
             }
             if (missingAccount) {
-              manufacturingJournalSkipReason = 'configure default Manufacturing Overhead account in Settings.'
+              throw new Error('Cannot complete production order with manufacturing costs: configure default Manufacturing Overhead account in Settings or set an account override on each cost line.')
             } else if (creditLines.length === 0) {
               manufacturingJournalSkipReason = 'no positive-amount cost lines.'
             } else {
-              const debitTotal = Math.round(creditTotalRounded * 100) / 100
+              const debitTotal = roundCurrency(creditTotalRounded)
               const lines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = [
-                { accountCode: inventoryAccount, description: `Manufacturing overhead capitalised (${orderPreview.outputProduct.sku})`, debit: debitTotal },
+                { accountCode: inventoryAccount, description: `Manufacturing overhead capitalised (${order.outputProduct.sku})`, debit: debitTotal },
                 ...creditLines,
               ]
+              if (defaultedCostLineIds.length > 0) {
+                await tx.manufacturingCostLine.updateMany({
+                  where: { id: { in: defaultedCostLineIds } },
+                  data: { accountCode: defaultOverheadAccount },
+                })
+              }
               await queueAccountingSyncTx(tx, {
                 type: 'MANUFACTURING_JOURNAL',
                 referenceType: 'ProductionOrder',
@@ -1384,6 +1447,7 @@ export async function updateManufacturingCostLines(
     let oldTotal = 0
     let newTotal = 0
     let reclassWarning: string | null = null
+    let cleanedForWrite = cleaned
 
     await db.$transaction(async (tx) => {
       await tx.$queryRaw(
@@ -1391,15 +1455,34 @@ export async function updateManufacturingCostLines(
       )
       const existing = await tx.manufacturingCostLine.findMany({
         where: { productionOrderId },
-        select: { amountBase: true },
+        select: { amountBase: true, accountCode: true },
+        orderBy: { sortOrder: 'asc' },
       })
       oldTotal = existing.reduce((s, l) => s + Number(l.amountBase), 0)
       newTotal = cleaned.reduce((s, l) => s + l.amountBase, 0)
 
+      const shouldPostReclass = po.status === 'COMPLETED'
+        ? await isAccountingSyncTypeEnabled('MANUFACTURING_RECLASS')
+        : false
+      const settings = shouldPostReclass ? await getAccountingSettings() : null
+      if (shouldPostReclass && settings?.manufacturingOverheadAccount) {
+        cleanedForWrite = cleaned.map((line) => (
+          line.amountBase > 0 && !line.accountCode
+            ? { ...line, accountCode: settings.manufacturingOverheadAccount }
+            : line
+        ))
+      }
+      const overheadAccountDeltas = settings
+        ? buildOverheadAccountDeltas(existing, cleanedForWrite, settings.manufacturingOverheadAccount)
+        : { deltas: new Map<string, number>(), missingAccount: false }
+      if (shouldPostReclass && overheadAccountDeltas.missingAccount) {
+        throw new Error('Cannot update completed manufacturing costs: configure default Manufacturing Overhead account in Settings or set an account override on each cost line.')
+      }
+
       await tx.manufacturingCostLine.deleteMany({ where: { productionOrderId } })
-      if (cleaned.length > 0) {
+      if (cleanedForWrite.length > 0) {
         await tx.manufacturingCostLine.createMany({
-          data: cleaned.map((l) => ({
+          data: cleanedForWrite.map((l) => ({
             productionOrderId,
             description: l.description,
             amountForeign: l.amountForeign,
@@ -1418,61 +1501,70 @@ export async function updateManufacturingCostLines(
         cogsDeltaBase = deltas.cogsDeltaBase
         inventoryDeltaBase = deltas.inventoryDeltaBase
 
-        const totalDeltaBase = Math.round((cogsDeltaBase + inventoryDeltaBase) * 1_000_000) / 1_000_000
-        if (Math.abs(totalDeltaBase) >= 0.005) {
-          const settings = await getAccountingSettings()
-          const overheadAccount = settings.manufacturingOverheadAccount
-          if (!settings.inventoryAccount || !settings.cogsAccount || !overheadAccount) {
-            reclassWarning = 'Reclass journal not posted: configure Inventory, COGS, and Manufacturing Overhead accounts in Settings.'
-          } else {
-            // Build a balanced 3-leg journal:
-            //   side(positive delta) → inventory + cogs absorb the increase
-            //                          (DR), overhead account is credited
-            //   side(negative delta) → reverse: overhead account debited
-            //                          for the total, inventory + cogs CR
-            const desc = `Manufacturing-cost reclass (${po.reference})`
-            type JournalLine = { accountCode: string; description: string; debit?: number; credit?: number }
-            const journalLines: JournalLine[] = []
+        const totalDeltaBase = roundSix(cogsDeltaBase + inventoryDeltaBase)
+        if (shouldPostReclass) {
+          const journalLines: JournalLine[] = []
 
-            const pushLine = (account: string, deltaSigned: number, role: 'capitalisation' | 'overhead-credit') => {
-              const abs = Math.round(Math.abs(deltaSigned) * 100) / 100
-              if (abs < 0.005) return
-              // Capitalisation accounts (Inventory, COGS) take a DR on a
-              // positive total delta. Overhead account takes a CR on a
-              // positive total delta (mirroring the original journal).
-              const isDebit = role === 'capitalisation' ? deltaSigned > 0 : deltaSigned < 0
-              journalLines.push({
-                accountCode: account,
-                description: desc,
-                ...(isDebit ? { debit: abs } : { credit: abs }),
-              })
+          const pushLine = (account: string, deltaSigned: number, role: 'capitalisation' | 'overhead-credit') => {
+            const abs = roundCurrency(Math.abs(deltaSigned))
+            if (abs < 0.005) return
+            // Capitalisation accounts (Inventory, COGS) take a DR on a
+            // positive delta. Overhead accounts take a CR on a positive
+            // delta (mirroring the original completion journal).
+            const isDebit = role === 'capitalisation' ? deltaSigned > 0 : deltaSigned < 0
+            journalLines.push({
+              accountCode: account,
+              description: `Manufacturing-cost reclass (${po.reference})`,
+              ...(isDebit ? { debit: abs } : { credit: abs }),
+            })
+          }
+
+          const hasCapitalDelta = Math.abs(inventoryDeltaBase) >= 0.005 || Math.abs(cogsDeltaBase) >= 0.005
+          if (hasCapitalDelta) {
+            if (!settings || !settings.inventoryAccount || !settings.cogsAccount) {
+              throw new Error('Cannot update completed manufacturing costs: configure Inventory and COGS accounts in Settings.')
             }
             pushLine(settings.inventoryAccount, inventoryDeltaBase, 'capitalisation')
             pushLine(settings.cogsAccount, cogsDeltaBase, 'capitalisation')
-            pushLine(overheadAccount, totalDeltaBase, 'overhead-credit')
+          }
 
-            // Sanity-check the balance — guard against rounding drift
-            // producing an unbalanced journal that Xero/QB will reject.
-            const debitSum = journalLines.reduce((s, l) => s + (l.debit ?? 0), 0)
-            const creditSum = journalLines.reduce((s, l) => s + (l.credit ?? 0), 0)
-            if (Math.abs(debitSum - creditSum) >= 0.01) {
-              reclassWarning = `Reclass journal not posted: rounding produced an unbalanced journal (DR ${debitSum.toFixed(2)} vs CR ${creditSum.toFixed(2)}).`
-            } else if (journalLines.length === 0) {
-              reclassWarning = null
-            } else {
-              await queueAccountingSyncTx(tx, {
-                type: 'MANUFACTURING_RECLASS',
-                referenceType: 'ProductionOrder',
-                referenceId: productionOrderId,
-                idempotencyKey: `MFG_RECLASS:${productionOrderId}:${oldTotal.toFixed(4)}:${newTotal.toFixed(4)}`,
-                payload: {
-                  date: new Date().toISOString().slice(0, 10),
-                  reference: `MFG-RECLASS: ${po.reference}`,
-                  narration: `Reclass for retro manufacturing-cost change on ${po.reference} — overhead ${oldTotal.toFixed(2)} → ${newTotal.toFixed(2)}, total delta ${totalDeltaBase >= 0 ? '+' : ''}${totalDeltaBase.toFixed(4)} (COGS ${cogsDeltaBase.toFixed(4)} / Inventory ${inventoryDeltaBase.toFixed(4)})`,
-                  lines: journalLines,
-                },
-              })
-            }
+          for (const [account, delta] of [...overheadAccountDeltas.deltas.entries()].sort(([a], [b]) => a.localeCompare(b))) {
+            pushLine(account, delta, 'overhead-credit')
+          }
+
+          // Sanity-check the balance — guard against rounding drift
+          // producing an unbalanced journal that Xero/QB will reject.
+          const debitSum = journalLines.reduce((s, l) => s + (l.debit ?? 0), 0)
+          const creditSum = journalLines.reduce((s, l) => s + (l.credit ?? 0), 0)
+          if (Math.abs(debitSum - creditSum) >= 0.01) {
+            throw new Error(`Cannot update completed manufacturing costs: rounding produced an unbalanced reclass journal (DR ${debitSum.toFixed(2)} vs CR ${creditSum.toFixed(2)}).`)
+          } else if (journalLines.length > 0) {
+            const reclassIdempotencyKey = `MFG_RECLASS:${productionOrderId}:${stableHash({
+              old: existing.map((line) => ({
+                amountBase: Number(line.amountBase).toFixed(4),
+                accountCode: line.accountCode ?? '',
+              })),
+              next: cleanedForWrite.map((line) => ({
+                amountBase: line.amountBase.toFixed(4),
+                accountCode: line.accountCode ?? '',
+              })),
+              cogsDeltaBase,
+              inventoryDeltaBase,
+            })}`
+            await queueAccountingSyncTx(tx, {
+              type: 'MANUFACTURING_RECLASS',
+              referenceType: 'ProductionOrder',
+              referenceId: productionOrderId,
+              idempotencyKey: reclassIdempotencyKey,
+              payload: {
+                date: new Date().toISOString().slice(0, 10),
+                reference: `MFG-RECLASS: ${po.reference}`,
+                narration: `Reclass for retro manufacturing-cost change on ${po.reference} — overhead ${oldTotal.toFixed(2)} → ${newTotal.toFixed(2)}, total delta ${totalDeltaBase >= 0 ? '+' : ''}${totalDeltaBase.toFixed(4)} (COGS ${cogsDeltaBase.toFixed(4)} / Inventory ${inventoryDeltaBase.toFixed(4)})`,
+                lines: journalLines,
+              },
+            })
+          } else {
+            reclassWarning = null
           }
         }
       }
@@ -1507,4 +1599,3 @@ export async function updateManufacturingCostLines(
     return { success: false, error: e instanceof Error ? e.message : String(e) }
   }
 }
-
