@@ -446,6 +446,68 @@ export type FxPushLogRow = {
   errorMessage: string | null
 }
 
+/**
+ * Threshold beyond which a stored rate or the last successful push is
+ * considered stale enough to warn about. The cron is scheduled at most every
+ * 24 h (default), so 36 h means we've missed at least one cycle.
+ */
+const FX_STALE_THRESHOLD_MS = 36 * 60 * 60 * 1000
+
+export type FxHealth = {
+  lastFetchedAt: string | null
+  lastFetchAgeMs: number | null
+  fetchStale: boolean
+  wcPushEnabled: boolean
+  lastWcPushAt: string | null
+  lastWcPushAgeMs: number | null
+  wcPushStale: boolean
+  manualOverrideCount: number
+}
+
+/**
+ * Single read for the FX integration health card on the Currencies settings
+ * page. Combines the last frankfurter fetch timestamp, the last successful WC
+ * push, and a count of currencies currently held under manual override.
+ */
+export async function getFxHealth(): Promise<FxHealth> {
+  await requireAuth()
+  const baseCurrency = await getBaseCurrencyCode()
+
+  const [lastFetchedSetting, wcEnabledSetting, lastPushSetting, overrideRows] = await Promise.all([
+    db.setting.findUnique({ where: { key: 'fx_last_fetched' }, select: { value: true } }),
+    db.setting.findUnique({ where: { key: 'wc_fx_push_enabled' }, select: { value: true } }),
+    db.setting.findUnique({ where: { key: 'last_wc_fx_push_at' }, select: { value: true } }),
+    db.$queryRaw<Array<{ count: number }>>`
+      SELECT COUNT(*)::int AS count FROM (
+        SELECT DISTINCT ON ("toCurrency") "toCurrency", "manualOverride"
+        FROM "fx_rates"
+        WHERE "fromCurrency" = ${baseCurrency}
+        ORDER BY "toCurrency", "fetchedAt" DESC
+      ) latest
+      WHERE latest."manualOverride" = true
+    `,
+  ])
+
+  const now = Date.now()
+  const lastFetchedAt = lastFetchedSetting?.value ?? null
+  const lastFetchAgeMs = lastFetchedAt ? now - new Date(lastFetchedAt).getTime() : null
+  const wcPushEnabled = wcEnabledSetting?.value === 'true'
+  const lastWcPushAt = lastPushSetting?.value || null
+  const lastWcPushAgeMs = lastWcPushAt ? now - new Date(lastWcPushAt).getTime() : null
+
+  return {
+    lastFetchedAt,
+    lastFetchAgeMs,
+    fetchStale: lastFetchAgeMs == null || lastFetchAgeMs > FX_STALE_THRESHOLD_MS,
+    wcPushEnabled,
+    lastWcPushAt,
+    lastWcPushAgeMs,
+    // Only flag push-stale when the operator has actually enabled push.
+    wcPushStale: wcPushEnabled && (lastWcPushAgeMs == null || lastWcPushAgeMs > FX_STALE_THRESHOLD_MS),
+    manualOverrideCount: Number(overrideRows[0]?.count ?? 0),
+  }
+}
+
 export async function getFxPushLog(limit = 20): Promise<FxPushLogRow[]> {
   await requireAuth()
   const rows = await db.fxRatePushLog.findMany({

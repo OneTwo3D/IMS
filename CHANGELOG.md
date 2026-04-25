@@ -6,6 +6,14 @@ This repository uses an `x.y.z` release scheme.
 - Increment `y` for user-facing non-breaking changes.
 - Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
+## 1.10.0 - 2026-04-25
+
+### Features (FX integration cutover tooling)
+
+- **Helper-plugin reachability probe.** Settings → Accounting → FX Rates now has a "Probe helper plugin" button. It POSTs a deliberately invalid HMAC signature to the WordPress endpoint and inspects the response: an HTTP 401 with `oti_fx_bad_sig` proves the plugin is installed *and* signature verification is active; `oti_fx_no_secret` flags that the operator hasn't pasted the shared secret on the WP side; 404/405 means the plugin isn't activated. Lets operators verify the integration in seconds before flipping push on.
+- **Integration health card.** Same panel surfaces the ECB last-fetch time, the WooCommerce last-push time, and the count of currencies under manual override — each turning amber once stale (>36 h since last fetch / push). Pulls a single `getFxHealth()` snapshot, no extra round-trips on render.
+- **Cutover runbook.** New `docs/todo/unified-fx-rates-cutover.md` with step-by-step operator instructions for switching a live tenant to the unified FX flow: pre-flight checks, plugin install, Aelia handover, smoke test, first-week monitoring, and rollback. Phase 5 of the unified-FX plan.
+
 ## 1.9.1 - 2026-04-25
 
 ### Fixes (Codex review of Phase 1–4 FX work)

@@ -4,7 +4,7 @@ import { CalendarDays, Receipt, Coins, RefreshCw, ArrowLeftRight } from 'lucide-
 import { cn } from '@/lib/utils'
 import { Card } from '@/components/ui/card'
 import { getSetting, getTaxRates } from '@/app/actions/settings'
-import { getCurrencies, getLatestFxRates, getFxPushLog } from '@/app/actions/currencies'
+import { getCurrencies, getLatestFxRates, getFxPushLog, getFxHealth } from '@/app/actions/currencies'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { FinancialYearStartSetting } from '@/components/settings/financial-year-start'
 import { TaxRatesTable } from '@/components/settings/tax-rates-table'
@@ -100,6 +100,7 @@ export default async function AccountingSettingsPage({
             baseCurrency={fxRatesData.baseCurrency}
             rates={fxRatesData.rates}
             pushLog={fxRatesData.pushLog}
+            health={fxRatesData.health}
           />
         </Card>
       )}
@@ -164,10 +165,11 @@ async function loadCurrencies() {
 }
 
 async function loadFxRates() {
-  const [baseCurrency, rates, pushLog] = await Promise.all([
+  const [baseCurrency, rates, pushLog, health] = await Promise.all([
     getBaseCurrencyCode(),
     getLatestFxRates(),
     getFxPushLog(20),
+    getFxHealth(),
   ])
-  return { baseCurrency, rates, pushLog }
+  return { baseCurrency, rates, pushLog, health }
 }

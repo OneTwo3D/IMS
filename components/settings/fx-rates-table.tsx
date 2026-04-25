@@ -2,7 +2,7 @@
 
 import { useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { Loader2, AlertTriangle, Pencil, Undo2 } from 'lucide-react'
+import { Loader2, AlertTriangle, Pencil, Undo2, Plug, CheckCircle2, XCircle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -13,19 +13,24 @@ import {
   clearManualFxRate,
   type FxRateRow,
   type FxPushLogRow,
+  type FxHealth,
 } from '@/app/actions/currencies'
+import { probeShoppingFxHelperPlugin } from '@/app/actions/shopping-sync'
 
 type Props = {
   baseCurrency: string
   rates: FxRateRow[]
   pushLog: FxPushLogRow[]
+  health: FxHealth
 }
 
-export function FxRatesTable({ baseCurrency, rates, pushLog }: Props) {
+export function FxRatesTable({ baseCurrency, rates, pushLog, health }: Props) {
   const [editing, setEditing] = useState<FxRateRow | null>(null)
 
   return (
     <div className="space-y-6">
+      <FxHealthCard health={health} />
+
       <div>
         <p className="text-sm text-muted-foreground mb-3">
           Latest rate per currency — direction <code className="text-xs bg-muted px-1 rounded">1 {baseCurrency} = X</code>.
@@ -253,5 +258,127 @@ function PushLogSection({ rows }: { rows: FxPushLogRow[] }) {
         </Table>
       )}
     </div>
+  )
+}
+
+function formatAge(ms: number | null): string {
+  if (ms == null) return 'never'
+  const hours = Math.floor(ms / (60 * 60 * 1000))
+  if (hours < 1) return 'just now'
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  return `${days}d ago`
+}
+
+function FxHealthCard({ health }: { health: FxHealth }) {
+  const [probing, setProbing] = useState(false)
+  const [probeResult, setProbeResult] = useState<{
+    status: string
+    message: string
+    httpStatus?: number
+  } | null>(null)
+
+  async function handleProbe() {
+    setProbing(true)
+    setProbeResult(null)
+    try {
+      const result = await probeShoppingFxHelperPlugin()
+      setProbeResult(result)
+    } catch (e) {
+      setProbeResult({ status: 'UNREACHABLE', message: String(e) })
+    } finally {
+      setProbing(false)
+    }
+  }
+
+  return (
+    <div className="rounded-md border bg-muted/20 p-4 space-y-3">
+      <div className="flex items-center gap-2">
+        <h3 className="text-sm font-medium">Integration health</h3>
+      </div>
+
+      <div className="grid gap-2 text-sm sm:grid-cols-2">
+        <HealthRow
+          ok={!health.fetchStale}
+          label="Last ECB fetch"
+          value={health.lastFetchedAt
+            ? `${new Date(health.lastFetchedAt).toLocaleString('en-GB')} (${formatAge(health.lastFetchAgeMs)})`
+            : 'never'}
+          warning={health.fetchStale ? 'Stale — fetch hasn\'t run in over 36h. Check the cron schedule.' : null}
+        />
+        <HealthRow
+          ok={health.wcPushEnabled ? !health.wcPushStale : true}
+          label="Last WooCommerce push"
+          value={
+            health.wcPushEnabled
+              ? health.lastWcPushAt
+                ? `${new Date(health.lastWcPushAt).toLocaleString('en-GB')} (${formatAge(health.lastWcPushAgeMs)})`
+                : 'pending — not yet pushed'
+              : 'disabled'
+          }
+          warning={
+            health.wcPushEnabled && health.wcPushStale
+              ? 'WC push enabled but no successful push in over 36h. Run the probe and check Recent Pushes for failures.'
+              : null
+          }
+        />
+        <HealthRow
+          ok={health.manualOverrideCount === 0}
+          label="Currencies under manual override"
+          value={String(health.manualOverrideCount)}
+          warning={
+            health.manualOverrideCount > 0
+              ? 'Override currencies are skipped by the daily ECB fetch. Review them periodically.'
+              : null
+          }
+        />
+      </div>
+
+      <div className="pt-2 border-t flex items-center gap-3 flex-wrap">
+        <Button variant="outline" size="sm" onClick={handleProbe} disabled={probing}>
+          {probing ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <Plug className="h-3.5 w-3.5 mr-1" />}
+          Probe helper plugin
+        </Button>
+        {probeResult && <ProbeResultPill result={probeResult} />}
+        <p className="text-xs text-muted-foreground">
+          Verifies the onetwoInventory Helper plugin is installed and the FX endpoint is reachable. Sends a deliberately invalid signature; the plugin should reply with HTTP 401.
+        </p>
+      </div>
+    </div>
+  )
+}
+
+function HealthRow({ ok, label, value, warning }: { ok: boolean; label: string; value: string; warning: string | null }) {
+  return (
+    <div className="flex flex-col gap-0.5">
+      <div className="flex items-center gap-1.5">
+        {ok
+          ? <CheckCircle2 className="h-3.5 w-3.5 text-green-600" />
+          : <AlertTriangle className="h-3.5 w-3.5 text-amber-600" />}
+        <span className="text-xs text-muted-foreground">{label}</span>
+      </div>
+      <span className="font-mono text-sm">{value}</span>
+      {warning && <span className="text-xs text-amber-700 dark:text-amber-400">{warning}</span>}
+    </div>
+  )
+}
+
+function ProbeResultPill({ result }: { result: { status: string; message: string; httpStatus?: number } }) {
+  const ok = result.status === 'OK'
+  const Icon = ok ? CheckCircle2 : XCircle
+  const colourClass = ok
+    ? 'bg-green-100 text-green-900 dark:bg-green-900/30 dark:text-green-200'
+    : 'bg-destructive/10 text-destructive'
+  return (
+    <span
+      className={`inline-flex items-start gap-1.5 rounded-md px-2 py-1 text-xs ${colourClass}`}
+      title={result.message}
+    >
+      <Icon className="h-3.5 w-3.5 mt-0.5 shrink-0" />
+      <span className="max-w-md">
+        <strong>{result.status}</strong>
+        {result.httpStatus ? ` (HTTP ${result.httpStatus})` : ''} — {result.message}
+      </span>
+    </span>
   )
 }

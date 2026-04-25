@@ -27,4 +27,5 @@ export { processWcCompletion } from './sync/completion-flow'
 export { verifyWcWebhook } from './sync/webhook-verify'
 
 // FX rate push (onetwoInventory Helper plugin)
-export { pushFxRatesToWc, pushCurrentFxRatesToWc } from './fx-rates'
+export { pushFxRatesToWc, pushCurrentFxRatesToWc, probeFxHelperPlugin } from './fx-rates'
+export type { FxHelperPluginProbe } from './fx-rates'

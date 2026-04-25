@@ -658,6 +658,16 @@ function toSerializableResult(result: unknown): unknown {
   return JSON.parse(JSON.stringify(result))
 }
 
+export async function probeFxHelperPluginAction(): Promise<{
+  status: 'OK' | 'NOT_INSTALLED' | 'BAD_SECRET' | 'NOT_CONFIGURED' | 'UNREACHABLE'
+  httpStatus?: number
+  message: string
+}> {
+  await requireAdmin()
+  const { probeFxHelperPlugin } = await import('@/lib/connectors/woocommerce/fx-rates')
+  return probeFxHelperPlugin()
+}
+
 export async function pushFxRatesToWcNow(): Promise<{ success: boolean; pushed: number; supported: boolean; error?: string }> {
   await requireAdmin()
   try {

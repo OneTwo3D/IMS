@@ -300,8 +300,18 @@ override (per the dialog-forms feedback rule).
    - `FxRatePushLog` table replacing the activity-log-only history of pushes.
    - Schema migration `20260425100000_fx_rate_overrides_and_push_log` adds `source` and `manualOverride` to `FxRate` plus the new push-log table.
    - Daily fetch now honours overrides (skips override currencies so a pinned rate is not overwritten).
-5. **Phase 5 — production cutover.** Disable Aelia's built-in providers,
-   switch to OTI provider, monitor `FxRatePushLog` for a week.
+5. **Phase 5 — production cutover.** ✅ **Code shipped in 1.10.0** — the
+   operational steps for the cutover live in
+   `docs/todo/unified-fx-rates-cutover.md`. Tooling added to support it:
+   - `probeFxHelperPlugin()` adapter + `Probe helper plugin` button on the FX
+     Rates settings tab — sends a deliberately invalid signature to confirm
+     the WP plugin is installed and signature verification is active.
+   - `getFxHealth()` server action + Integration Health card surfacing stale
+     ECB fetches (>36 h), stale WC pushes (>36 h with push enabled), and the
+     count of currencies under manual override.
+   - Cutover runbook with operator steps for installing the plugin, doing the
+     Aelia handover, smoke-testing the round-trip, monitoring `FxRatePushLog`
+     for a week, and rolling back if needed.
 
 Each phase is independently shippable.
 
