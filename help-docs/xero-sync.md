@@ -226,6 +226,44 @@ Configure which documents are synced to Xero under **Integrations → Xero → T
 | Inventory Adjustments | Journal for manual stock adjustments |
 | Manufacturing Journal | Capitalise per-run overhead (labour, machine, etc.) on assembly/disassembly: DR Inventory / CR Manufacturing Overhead. Includes the retro-recalc reclass (`MANUFACTURING_RECLASS`) when cost lines are edited after completion. |
 
+## Multi-Currency FX Rates
+
+Every sales invoice, purchase bill and credit note pushed to Xero is stamped with a `CurrencyRate` derived from the `fxRateToBase` value already stored on the source IMS document (SalesOrder, PurchaseOrder, SalesOrderRefund). This stops Xero from substituting its own daily XE rate, which previously caused 1–3 % drift between IMS base totals and Xero base totals on the same multi-currency document.
+
+**Rate flow:**
+
+```
+frankfurter.dev (ECB) → /api/cron/fx-rates → FxRate table
+       ↓
+fxRateToBase stamped on SalesOrder / PurchaseOrder / SalesOrderRefund at creation
+       ↓
+queueAccountingSync() includes currencyRateToBase in the payload
+       ↓
+Xero adapter inverts to Xero's convention (1 doc-ccy = X base) at 6dp
+       ↓
+CurrencyRate sent on Invoice / Bill / CreditNote API call
+```
+
+**Direction conventions:**
+
+- **IMS** stores `fxRateToBase` as: 1 base = X doc-currency (e.g. base GBP, doc EUR ⇒ 1 GBP = 1.18 EUR).
+- **Xero** `CurrencyRate` is: 1 doc-currency = X base. The connector inverts (`1 / fxRateToBase`) and rounds to 6dp to match Xero's `Decimal(18,6)` schema.
+
+**What's covered:**
+
+| Path | FX rate stamped? |
+|---|---|
+| WooCommerce order import | Yes — `currencyRateToBase` set from the FX rate looked up at import time |
+| Manual sales invoice (DRAFT → finalised) | Yes — read from `SalesOrder.fxRateToBase` |
+| Sales credit note (refund) | Yes — read from the txn-level FX rate computed for the refund |
+| Purchase invoice (PO → bill) | Yes — read from the PO's `fxRateToBase` at invoice time |
+| Same-currency invoices (rate = 1) | `CurrencyRate = 1` is sent (still explicit, so Xero never falls back to its own rate) |
+| Missing/zero/invalid rate | Field is omitted; Xero's default applies (logged as a fallback case) |
+
+**Connector-agnostic design:** the optional `currencyRateToBase` field is on the generic `InvoiceData` / `BillData` / `CreditNoteData` types (`lib/connectors/types.ts`). Each accounting connector decides how to translate it (Xero: `1 / x`; QuickBooks would use the same form). QuickBooks adapter currently ignores the field — to be wired up alongside the rest of the QuickBooks integration.
+
+The unified-FX initiative (which extends this to push the same rates *into* WooCommerce/Aelia so all three systems agree) is tracked in `docs/todo/unified-fx-rates-plan.md`.
+
 ## Sub-Ledger Settings
 
 ### Daily Batch Sync

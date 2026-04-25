@@ -93,7 +93,8 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 **Multi-currency** — Every monetary record stores both foreign-currency and base-currency amounts:
 - `*Foreign` fields: amount in the transaction currency
 - `*Base` fields: value in the organisation base currency at the time of transaction
-- `fxRateToBase`: the exchange rate used
+- `fxRateToBase`: the exchange rate used. Convention: 1 base = X document-currency (matches frankfurter/ECB output direction).
+- The same rate is pushed downstream to Xero on every invoice/bill/credit note (as `CurrencyRate`, inverted) so the accounting platform never substitutes its own daily rate. See `docs/xero-sync.md` § Multi-Currency FX Rates.
 
 **Landed costs** — A freight PO (`type = FREIGHT`) is linked to a goods PO via `LandedCostLink`. When the goods PO is received, landed costs are distributed across cost layers. Distribution methods: by value, by weight, by quantity, or equal split.
 

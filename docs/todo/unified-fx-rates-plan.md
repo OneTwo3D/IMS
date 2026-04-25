@@ -282,9 +282,12 @@ override (per the dialog-forms feedback rule).
 
 ## 11. Rollout
 
-1. **Phase 1 — schema & xero stamping.** Add the `currencyRate` field to
-   `InvoiceData`, wire Xero adapter to send it, deploy. Outcome: IMS and Xero
-   already agree (Xero stops drifting). No WC change yet.
+1. **Phase 1 — schema & xero stamping.** ✅ **Shipped in 1.7.2** (commits
+   `5e5b8be` + `c34f4d1`). `currencyRateToBase` added to `InvoiceData` /
+   `BillData` / `CreditNoteData`. Xero adapter inverts to `CurrencyRate` at
+   6dp. Stamped at every queue site: WooCommerce import, manual sales invoice,
+   sales credit note, purchase invoice. QuickBooks adapter ignores the field
+   for now. Outcome: IMS and Xero now agree on every multi-currency document.
 2. **Phase 2 — companion WP plugin.** Build and install the PHP plugin in a
    staging WC site, point Aelia at it as a provider, verify rate flow.
 3. **Phase 3 — IMS push job.** Wire `pushFxRates` into the cron, behind a
