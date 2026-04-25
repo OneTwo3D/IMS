@@ -399,6 +399,9 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           contactEmail: wcOrder.billing.email || undefined,
           date: new Date(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),
           currency,
+          // Stamp IMS's FX rate so Xero doesn't apply its own daily rate on
+          // imported WC orders — keeping WC, IMS, and Xero numerically aligned.
+          currencyRateToBase: Number(fxRate) || undefined,
           reference: orderNumber,
           lines: lineData.map((l, idx) => ({
             itemCode: l.productId ? (l.sku || undefined) : undefined,
