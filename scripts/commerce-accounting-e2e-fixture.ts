@@ -20,6 +20,7 @@ async function seedAccountingSettings() {
     upsertSetting('plugin_xero_enabled', 'true'),
     upsertSetting('plugin_woocommerce_enabled', 'true'),
     upsertSetting('xero_sync_enabled', 'true'),
+    upsertSetting('xero_daily_batch_enabled', 'true'),
     upsertSetting('xero_sales_account', '200'),
     upsertSetting('xero_shipping_account', '210'),
     upsertSetting('xero_discount_account', '220'),
@@ -774,6 +775,622 @@ async function inspectSalesInvoice(orderId: string) {
   }))
 }
 
+async function seedWcFxCogsFlowScenario() {
+  const suffix = uniqueSuffix()
+  const externalOrderId = Math.floor((Date.now() % 1_000_000_000) + Math.random() * 1000)
+  const fxRate = 150
+  const orderedAt = new Date()
+  const productUnitPriceForeign = 1500
+  const productQty = 2
+  const shippingForeign = 750
+  const cogsUnitBase = 4.25
+
+  await seedAccountingSettings()
+
+  await db.currency.upsert({
+    where: { code: 'JPY' },
+    update: {
+      name: 'Japanese Yen',
+      symbol: 'JPY',
+      symbolPosition: 'PREFIX',
+      active: true,
+    },
+    create: {
+      code: 'JPY',
+      name: 'Japanese Yen',
+      symbol: 'JPY',
+      symbolPosition: 'PREFIX',
+      active: true,
+    },
+  })
+  await db.fxRate.create({
+    data: {
+      fromCurrency: 'GBP',
+      toCurrency: 'JPY',
+      rate: fxRate,
+      fetchedAt: new Date(orderedAt.getTime() - 60_000),
+    },
+  })
+
+  const warehouse = await db.warehouse.create({
+    data: {
+      code: `WCFX-${suffix.slice(-6).toUpperCase()}`,
+      name: `WC FX ${suffix}`,
+      type: 'STANDARD',
+      availableForSale: true,
+      syncToStore: true,
+      isDefault: true,
+      active: true,
+    },
+  })
+
+  const product = await db.product.create({
+    data: {
+      sku: `E2E-WC-FX-COGS-${suffix}`,
+      name: `WC FX COGS Product ${suffix}`,
+      type: 'SIMPLE',
+      lifecycleStatus: 'ACTIVE',
+      salesPriceBase: productUnitPriceForeign / fxRate,
+      salesPriceTaxInclusive: false,
+      taxCategory: 'STANDARD',
+      stockUnit: 'pcs',
+      oversellAllowed: false,
+      active: true,
+    },
+  })
+
+  await db.stockLevel.create({
+    data: {
+      productId: product.id,
+      warehouseId: warehouse.id,
+      quantity: productQty,
+      reservedQty: 0,
+    },
+  })
+  await db.costLayer.create({
+    data: {
+      productId: product.id,
+      warehouseId: warehouse.id,
+      receivedQty: productQty,
+      remainingQty: productQty,
+      unitCostBase: cogsUnitBase,
+      receivedAt: new Date(orderedAt.getTime() - 120_000),
+      isOpeningStock: true,
+    },
+  })
+
+  const wcOrder: WcFullOrder = {
+    id: externalOrderId,
+    parent_id: 0,
+    number: `WC-FX-COGS-${suffix}`,
+    order_key: `wc_order_${suffix}`,
+    created_via: 'checkout',
+    version: '9.0.0',
+    status: 'processing',
+    currency: 'JPY',
+    date_created: orderedAt.toISOString(),
+    date_created_gmt: orderedAt.toISOString(),
+    date_modified: orderedAt.toISOString(),
+    date_modified_gmt: orderedAt.toISOString(),
+    discount_total: '0',
+    discount_tax: '0',
+    shipping_total: String(shippingForeign),
+    shipping_tax: '0',
+    cart_tax: '0',
+    total: String(productUnitPriceForeign * productQty + shippingForeign),
+    total_tax: '0',
+    prices_include_tax: false,
+    customer_id: 0,
+    customer_ip_address: '127.0.0.1',
+    customer_note: '',
+    billing: {
+      first_name: 'Woo',
+      last_name: 'FX COGS',
+      company: '',
+      address_1: '1 Test Street',
+      address_2: '',
+      city: 'Tokyo',
+      state: '',
+      postcode: '100-0001',
+      country: 'JP',
+      email: `wc-fx-cogs-${suffix}@example.com`,
+      phone: '',
+    },
+    shipping: {
+      first_name: 'Woo',
+      last_name: 'FX COGS',
+      company: '',
+      address_1: '1 Test Street',
+      address_2: '',
+      city: 'Tokyo',
+      state: '',
+      postcode: '100-0001',
+      country: 'JP',
+      phone: '',
+    },
+    payment_method: 'stripe',
+    payment_method_title: 'Credit card',
+    transaction_id: `txn-${suffix}`,
+    date_paid: orderedAt.toISOString(),
+    date_paid_gmt: orderedAt.toISOString(),
+    date_completed: null,
+    date_completed_gmt: null,
+    cart_hash: `hash-${suffix}`,
+    meta_data: [],
+    line_items: [
+      {
+        id: externalOrderId + 1,
+        name: product.name,
+        product_id: externalOrderId + 10,
+        variation_id: 0,
+        quantity: productQty,
+        tax_class: '',
+        subtotal: String(productUnitPriceForeign * productQty),
+        subtotal_tax: '0',
+        total: String(productUnitPriceForeign * productQty),
+        total_tax: '0',
+        taxes: [],
+        meta_data: [],
+        sku: product.sku,
+        price: productUnitPriceForeign,
+      },
+    ],
+    tax_lines: [],
+    shipping_lines: [
+      {
+        id: externalOrderId + 2,
+        method_title: 'International Courier',
+        method_id: 'flat_rate',
+        total: String(shippingForeign),
+        total_tax: '0',
+        taxes: [],
+      },
+    ],
+    fee_lines: [],
+    coupon_lines: [],
+    refunds: [],
+  }
+
+  const result = await importWcOrder(wcOrder)
+  if (!result.success || !result.orderId) {
+    throw new Error(result.error ?? 'Failed to import WC FX COGS order')
+  }
+
+  const allocationCount = await db.orderAllocation.count({
+    where: { orderId: result.orderId },
+  })
+  if (allocationCount === 0) {
+    const line = await db.salesOrderLine.findFirstOrThrow({
+      where: { orderId: result.orderId, productId: product.id },
+      select: { id: true },
+    })
+    await db.$transaction([
+      db.orderAllocation.create({
+        data: {
+          orderId: result.orderId,
+          lineId: line.id,
+          productId: product.id,
+          warehouseId: warehouse.id,
+          qty: productQty,
+        },
+      }),
+      db.stockLevel.update({
+        where: {
+          productId_warehouseId: {
+            productId: product.id,
+            warehouseId: warehouse.id,
+          },
+        },
+        data: { reservedQty: productQty },
+      }),
+      db.salesOrder.update({
+        where: { id: result.orderId },
+        data: { status: 'ALLOCATED' },
+      }),
+    ])
+  }
+
+  const invoiceLog = await db.accountingSyncLog.findFirst({
+    where: {
+      connector: 'xero',
+      type: 'SALES_INVOICE',
+      referenceType: 'SalesOrder',
+      referenceId: result.orderId,
+    },
+    select: { id: true },
+  })
+  if (!invoiceLog) {
+    throw new Error('Expected imported WooCommerce order to queue a Xero sales invoice')
+  }
+
+  console.log(JSON.stringify({
+    orderId: result.orderId,
+    sku: product.sku,
+    warehouseId: warehouse.id,
+    expected: {
+      currency: 'JPY',
+      fxRateToBase: fxRate,
+      lineUnitForeign: productUnitPriceForeign,
+      lineUnitBase: productUnitPriceForeign / fxRate,
+      subtotalForeign: productUnitPriceForeign * productQty,
+      subtotalBase: (productUnitPriceForeign * productQty) / fxRate,
+      shippingForeign,
+      shippingBase: shippingForeign / fxRate,
+      totalForeign: productUnitPriceForeign * productQty + shippingForeign,
+      totalBase: (productUnitPriceForeign * productQty + shippingForeign) / fxRate,
+      cogsBase: productQty * cogsUnitBase,
+      revenueBase: (productUnitPriceForeign * productQty + shippingForeign) / fxRate,
+    },
+  }))
+}
+
+async function shipAndBatchWcFxCogsFlowScenario(orderId: string) {
+  let shipment = await db.shipment.findFirst({
+    where: { orderId },
+    orderBy: { createdAt: 'asc' },
+    select: { id: true },
+  })
+
+  if (!shipment) {
+    const allocations = await db.orderAllocation.findMany({
+      where: { orderId },
+      select: {
+        lineId: true,
+        productId: true,
+        warehouseId: true,
+        qty: true,
+      },
+      orderBy: { createdAt: 'asc' },
+    })
+    if (allocations.length === 0) throw new Error('No allocations available to ship')
+    const warehouseIds = [...new Set(allocations.map((allocation) => allocation.warehouseId))]
+    if (warehouseIds.length !== 1) throw new Error('Fixture expected a single allocated warehouse')
+    shipment = await db.shipment.create({
+      data: {
+        orderId,
+        warehouseId: warehouseIds[0],
+        status: 'PENDING',
+        lines: {
+          create: allocations.map((allocation) => ({
+            lineId: allocation.lineId,
+            productId: allocation.productId,
+            qty: allocation.qty,
+          })),
+        },
+      },
+      select: { id: true },
+    })
+  }
+
+  const { consumeFifoLayersStrict, refreshSalesOrderLineCogs } = await import('../lib/cost-layers.ts')
+  await db.$transaction(async (tx) => {
+    const lockedShipment = await tx.shipment.findUniqueOrThrow({
+      where: { id: shipment.id },
+      include: {
+        lines: {
+          select: {
+            id: true,
+            lineId: true,
+            productId: true,
+            qty: true,
+          },
+        },
+        warehouse: { select: { code: true } },
+      },
+    })
+
+    if (lockedShipment.status === 'SHIPPED') return
+
+    await tx.shipment.update({
+      where: { id: shipment.id },
+      data: {
+        status: 'SHIPPED',
+        shippedAt: new Date(),
+        trackingNumber: `FX-${orderId.slice(0, 8)}`,
+        shippingService: 'International Courier',
+      },
+    })
+
+    let totalShipmentCogs = 0
+    for (const line of lockedShipment.lines) {
+      const qty = Number(line.qty)
+      await tx.stockLevel.updateMany({
+        where: { productId: line.productId, warehouseId: lockedShipment.warehouseId },
+        data: { reservedQty: { decrement: qty } },
+      })
+      await tx.stockLevel.updateMany({
+        where: { productId: line.productId, warehouseId: lockedShipment.warehouseId },
+        data: { quantity: { decrement: qty } },
+      })
+      const movement = await tx.stockMovement.create({
+        data: {
+          type: 'SALE_DISPATCH',
+          productId: line.productId,
+          fromWarehouseId: lockedShipment.warehouseId,
+          qty,
+          note: `Dispatched for order - shipment from ${lockedShipment.warehouse.code}`,
+          referenceType: 'SalesOrder',
+          referenceId: orderId,
+        },
+        select: { id: true },
+      })
+      const { consumed, totalCost } = await consumeFifoLayersStrict(
+        tx,
+        line.productId,
+        lockedShipment.warehouseId,
+        qty,
+      )
+      totalShipmentCogs += totalCost
+      await tx.cogsEntry.createMany({
+        data: consumed.map((entry) => ({
+          costLayerId: entry.costLayerId,
+          movementId: movement.id,
+          qty: entry.qty,
+          unitCostBase: entry.unitCostBase,
+          totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+        })),
+      })
+      await tx.shipmentLine.update({
+        where: { id: line.id },
+        data: {
+          costLayerSnapshot: consumed.map((entry) => ({
+            costLayerId: entry.costLayerId,
+            qty: entry.qty,
+            unitCostBase: entry.unitCostBase,
+          })) as never,
+        },
+      })
+    }
+
+    await tx.shipment.update({
+      where: { id: shipment.id },
+      data: { cogsBatchAmount: Math.round(totalShipmentCogs * 100) / 100 },
+    })
+    await refreshSalesOrderLineCogs(
+      tx,
+      lockedShipment.lines.map((line) => line.lineId),
+    )
+    await tx.salesOrder.update({
+      where: { id: orderId },
+      data: {
+        status: 'SHIPPED',
+        shippedAt: new Date(),
+        trackingNumber: `FX-${orderId.slice(0, 8)}`,
+      },
+    })
+  })
+
+  await db.salesOrder.update({
+    where: { id: orderId },
+    data: {
+      accountingInvoiceId: `xero-invoice-${orderId}`,
+      invoicedAt: new Date(),
+    },
+  })
+
+  const batchStartedAt = new Date()
+  const { runDailyBatchSync } = await import('../lib/connectors/xero/daily-sync.ts')
+  const batchResult = await runDailyBatchSync()
+
+  console.log(JSON.stringify({
+    shipmentId: shipment.id,
+    batchStartedAt: batchStartedAt.toISOString(),
+    batchResult,
+  }))
+}
+
+function mapJournalLines(payload: unknown) {
+  const lines = (payload as { lines?: Array<{
+    accountCode?: string
+    description?: string
+    debit?: number
+    credit?: number
+  }> } | null)?.lines
+  return Array.isArray(lines)
+    ? lines.map((line) => ({
+        accountCode: line.accountCode ?? null,
+        description: line.description ?? null,
+        debit: Number(line.debit ?? 0),
+        credit: Number(line.credit ?? 0),
+      }))
+    : []
+}
+
+async function inspectWcFxCogsFlowScenario(orderId: string, logsSinceIso?: string) {
+  const order = await db.salesOrder.findUniqueOrThrow({
+    where: { id: orderId },
+    select: {
+      status: true,
+      currency: true,
+      fxRateToBase: true,
+      subtotalForeign: true,
+      shippingForeign: true,
+      taxForeign: true,
+      totalForeign: true,
+      subtotalBase: true,
+      shippingBase: true,
+      taxBase: true,
+      totalBase: true,
+      paidAt: true,
+      accountingInvoiceId: true,
+      revenueDeferredDate: true,
+      unearnedRevenueAmount: true,
+      inventoryAllocatedDate: true,
+      allocationBatchAmount: true,
+      lines: {
+        select: {
+          sku: true,
+          qty: true,
+          unitPriceForeign: true,
+          unitPriceBase: true,
+          totalForeign: true,
+          totalBase: true,
+          cogsBase: true,
+        },
+      },
+      allocations: {
+        select: {
+          qty: true,
+          costLayerSnapshot: true,
+        },
+      },
+      shipments: {
+        select: {
+          status: true,
+          cogsBatchAmount: true,
+          revenueRecognizedAmount: true,
+          shipmentJournalDate: true,
+          lines: {
+            select: {
+              qty: true,
+              costLayerSnapshot: true,
+            },
+          },
+        },
+      },
+    },
+  })
+
+  const invoiceLog = await db.accountingSyncLog.findFirst({
+    where: {
+      connector: 'xero',
+      type: 'SALES_INVOICE',
+      referenceType: 'SalesOrder',
+      referenceId: orderId,
+    },
+    orderBy: { createdAt: 'desc' },
+    select: { payload: true },
+  })
+
+  const invoicePayload = invoiceLog?.payload as {
+    currency?: string
+    shippingAmount?: number
+    lineAmountsIncludeTax?: boolean
+    lines?: Array<{
+      itemCode?: string
+      description?: string
+      quantity?: number
+      unitAmount?: number
+      accountCode?: string
+      taxType?: string
+    }>
+  } | null
+
+  const logsSince = logsSinceIso ? new Date(logsSinceIso) : null
+  const dailyLogs = logsSince
+    ? await db.accountingSyncLog.findMany({
+        where: {
+          connector: 'xero',
+          type: {
+            in: [
+              'DAILY_BATCH_REVENUE_DEFERRAL',
+              'DAILY_BATCH_INVENTORY_ALLOC',
+              'DAILY_BATCH_GROUP_B',
+            ],
+          },
+          createdAt: { gte: logsSince },
+        },
+        orderBy: { createdAt: 'asc' },
+        select: { type: true, referenceId: true, payload: true },
+      })
+    : []
+
+  const cogsEntries = await db.cogsEntry.findMany({
+    where: {
+      movement: {
+        referenceType: 'SalesOrder',
+        referenceId: orderId,
+      },
+    },
+    select: {
+      qty: true,
+      unitCostBase: true,
+      totalCostBase: true,
+      costLayer: {
+        select: {
+          remainingQty: true,
+        },
+      },
+    },
+  })
+
+  console.log(JSON.stringify({
+    order: {
+      status: order.status,
+      currency: order.currency,
+      fxRateToBase: Number(order.fxRateToBase),
+      subtotalForeign: Number(order.subtotalForeign),
+      shippingForeign: Number(order.shippingForeign),
+      taxForeign: Number(order.taxForeign),
+      totalForeign: Number(order.totalForeign),
+      subtotalBase: Number(order.subtotalBase),
+      shippingBase: Number(order.shippingBase),
+      taxBase: Number(order.taxBase),
+      totalBase: Number(order.totalBase),
+      paid: !!order.paidAt,
+      accountingInvoiceId: order.accountingInvoiceId,
+      revenueDeferred: !!order.revenueDeferredDate,
+      unearnedRevenueAmount: Number(order.unearnedRevenueAmount ?? 0),
+      inventoryAllocated: !!order.inventoryAllocatedDate,
+      allocationBatchAmount: Number(order.allocationBatchAmount ?? 0),
+    },
+    lines: order.lines.map((line) => ({
+      sku: line.sku,
+      qty: Number(line.qty),
+      unitPriceForeign: Number(line.unitPriceForeign),
+      unitPriceBase: Number(line.unitPriceBase),
+      totalForeign: Number(line.totalForeign),
+      totalBase: Number(line.totalBase),
+      cogsBase: line.cogsBase == null ? null : Number(line.cogsBase),
+    })),
+    allocations: order.allocations.map((allocation) => ({
+      qty: Number(allocation.qty),
+      snapshot: allocation.costLayerSnapshot ?? [],
+    })),
+    shipments: order.shipments.map((shipment) => ({
+      status: shipment.status,
+      cogsBatchAmount: shipment.cogsBatchAmount == null ? null : Number(shipment.cogsBatchAmount),
+      revenueRecognizedAmount: shipment.revenueRecognizedAmount == null ? null : Number(shipment.revenueRecognizedAmount),
+      journaled: !!shipment.shipmentJournalDate,
+      lines: shipment.lines.map((line) => ({
+        qty: Number(line.qty),
+        snapshot: line.costLayerSnapshot ?? [],
+      })),
+    })),
+    invoicePayload: {
+      currency: invoicePayload?.currency ?? null,
+      shippingAmount: Number(invoicePayload?.shippingAmount ?? 0),
+      lineAmountsIncludeTax: typeof invoicePayload?.lineAmountsIncludeTax === 'boolean' ? invoicePayload.lineAmountsIncludeTax : null,
+      lines: Array.isArray(invoicePayload?.lines)
+        ? invoicePayload.lines.map((line) => ({
+            itemCode: line.itemCode ?? null,
+            description: line.description ?? null,
+            quantity: Number(line.quantity ?? 0),
+            unitAmount: Number(line.unitAmount ?? 0),
+            accountCode: line.accountCode ?? null,
+            taxType: line.taxType ?? null,
+          }))
+        : [],
+    },
+    cogsEntries: cogsEntries.map((entry) => ({
+      qty: Number(entry.qty),
+      unitCostBase: Number(entry.unitCostBase),
+      totalCostBase: Number(entry.totalCostBase),
+      remainingQty: Number(entry.costLayer.remainingQty),
+    })),
+    dailyLogs: dailyLogs.map((log) => ({
+      type: log.type,
+      referenceId: log.referenceId,
+      lines: mapJournalLines(log.payload),
+      orderDeferrals: ((log.payload as { orderDeferrals?: Array<{ orderId?: string; amount?: number }> } | null)?.orderDeferrals ?? [])
+        .map((deferral) => ({
+          orderId: deferral.orderId ?? null,
+          amount: Number(deferral.amount ?? 0),
+        })),
+    })),
+  }))
+}
+
 async function importWcDiscountScenario() {
   const suffix = uniqueSuffix()
   await seedAccountingSettings()
@@ -1118,10 +1735,21 @@ async function main() {
       if (!args[0] || !args[1]) throw new Error('inspect-daily-batch-discounts requires <manualOrderId> <wcOrderId>')
       await inspectDailyBatchDiscountScenario(args[0], args[1])
       break
+    case 'seed-wc-fx-cogs-flow':
+      await seedWcFxCogsFlowScenario()
+      break
+    case 'ship-and-batch-wc-fx-cogs-flow':
+      if (!args[0]) throw new Error('ship-and-batch-wc-fx-cogs-flow requires <orderId>')
+      await shipAndBatchWcFxCogsFlowScenario(args[0])
+      break
+    case 'inspect-wc-fx-cogs-flow':
+      if (!args[0]) throw new Error('inspect-wc-fx-cogs-flow requires <orderId> [logsSinceIso]')
+      await inspectWcFxCogsFlowScenario(args[0], args[1])
+      break
     default:
       throw new Error(
         'usage: tsx scripts/commerce-accounting-e2e-fixture.ts ' +
-        '<seed-manual-fx-order-ui|seed-fx-refund|seed-mixed-rate-refund|sync-wc-shipping-refund|inspect-fx-refund|inspect-credit-note|import-wc-fee-order|inspect-wc-fee-order|inspect-sales-invoice|import-wc-discount-order|seed-daily-batch-discounts|seed-unpaid-daily-batch-order|run-daily-batch-discounts|inspect-daily-batch-discounts> [...]',
+        '<seed-manual-fx-order-ui|seed-fx-refund|seed-mixed-rate-refund|sync-wc-shipping-refund|inspect-fx-refund|inspect-credit-note|import-wc-fee-order|inspect-wc-fee-order|inspect-sales-invoice|import-wc-discount-order|seed-daily-batch-discounts|seed-unpaid-daily-batch-order|run-daily-batch-discounts|inspect-daily-batch-discounts|seed-wc-fx-cogs-flow|ship-and-batch-wc-fx-cogs-flow|inspect-wc-fx-cogs-flow> [...]',
       )
   }
 }
