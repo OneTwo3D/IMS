@@ -37,6 +37,25 @@ type InspectResult = {
   }>>
 }
 
+type ForeignInvoiceFxSeed = {
+  scenario: 'foreign-invoice-fx-mismatch'
+  goodsPoId: string
+  poLineId: string
+  costLayerId: string
+  poFxRateToBase: number
+  invoiceDateFxRateToBase: number
+}
+
+type ForeignInvoiceFxInspect = {
+  invoiceFxRateToBase: number | null
+  invoiceTotalForeign: number | null
+  invoiceTotalBase: number | null
+  invoiceLineTotalForeign: number | null
+  invoiceLineTotalBase: number | null
+  costLayerUnitCostBase: number | null
+  accountingCurrencyRateToBase: number | null
+}
+
 function runFixture(args: string[]): string {
   return execFileSync(
     'npx',
@@ -220,5 +239,37 @@ test.describe.serial('landed cost revaluation workflows', () => {
         expect.objectContaining({ accountCode: '640', debit: 0, credit: 2 }),
       ]),
     )
+  })
+
+  test('keeps foreign supplier bills on the PO FX rate so FIFO and AP reconcile', async ({ page }) => {
+    const seeded = parseJsonLine<ForeignInvoiceFxSeed>(runFixture(['seed-foreign-invoice-fx-mismatch']))
+
+    await page.goto(`/purchase-orders/${seeded.goodsPoId}`)
+    await page.getByRole('button', { name: /create bill/i }).click()
+    const selectDialog = page.getByRole('dialog', { name: /Create Bill — Select Items/i })
+    await expect(selectDialog).toBeVisible()
+    await selectDialog.getByRole('button', { name: 'Next', exact: true }).click()
+
+    const review = page.getByRole('dialog', { name: /Create Bill — Review & Confirm/i })
+    await expect(review).toBeVisible()
+    await review.locator('input').first().fill(`FX-${Date.now()}`)
+    await review.getByRole('button', { name: /confirm bill/i }).click()
+    await expect(review).toBeHidden()
+    await expect(page.getByText(/Bills \(1\)/)).toBeVisible()
+
+    const inspected = parseJsonLine<ForeignInvoiceFxInspect>(runFixture([
+      'inspect-foreign-invoice-fx-mismatch',
+      seeded.goodsPoId,
+      seeded.poLineId,
+      seeded.costLayerId,
+    ]))
+
+    expect(seeded.invoiceDateFxRateToBase).toBe(1.5)
+    expect(inspected.invoiceFxRateToBase).toBe(seeded.poFxRateToBase)
+    expect(inspected.accountingCurrencyRateToBase).toBe(seeded.poFxRateToBase)
+    expect(inspected.invoiceTotalForeign).toBe(12.5)
+    expect(inspected.invoiceTotalBase).toBe(10)
+    expect(inspected.invoiceLineTotalBase).toBe(10)
+    expect(inspected.costLayerUnitCostBase).toBe(10)
   })
 })

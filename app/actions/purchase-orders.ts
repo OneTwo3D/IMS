@@ -28,30 +28,6 @@ function accountingPayloadKey(prefix: string, payload: Record<string, unknown>):
   return `${prefix}:${createHash('sha256').update(JSON.stringify(payload)).digest('hex')}`
 }
 
-async function resolveFxRateToBase(
-  tx: Prisma.TransactionClient,
-  currency: string,
-  baseCurrency: string,
-  asOf: Date,
-): Promise<number> {
-  const normalizedCurrency = currency.trim().toUpperCase()
-  const normalizedBase = baseCurrency.trim().toUpperCase()
-  if (!normalizedCurrency || normalizedCurrency === normalizedBase) return 1
-  const rate = await tx.fxRate.findFirst({
-    where: {
-      fromCurrency: normalizedBase,
-      toCurrency: normalizedCurrency,
-      fetchedAt: { lte: asOf },
-    },
-    orderBy: { fetchedAt: 'desc' },
-    select: { rate: true },
-  })
-  if (!rate) {
-    throw new Error(`Missing ${normalizedBase} FX rate for ${normalizedCurrency} on or before ${asOf.toISOString().slice(0, 10)}`)
-  }
-  return Number(rate.rate)
-}
-
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
@@ -2397,10 +2373,13 @@ export async function createInvoice(
 
     const invoiceDate = new Date(input.invoiceDate)
     const baseCurrency = await getBaseCurrencyCode()
-    const fxRate = await db.$transaction(
-      (tx) => resolveFxRateToBase(tx, po.currency, baseCurrency, invoiceDate),
-      STOCK_TX_OPTIONS,
-    )
+    // FIFO layers are valued from the PO's booked base cost at receipt time.
+    // Keep supplier bills on that same FX basis so AP, transit, and inventory
+    // reconcile instead of letting invoice-date rates reprice the layer.
+    const fxRate = Number(po.fxRateToBase)
+    if (!Number.isFinite(fxRate) || fxRate <= 0) {
+      return { success: false, error: `Invalid FX rate on PO ${po.reference}` }
+    }
     let subtotalForeign = 0
     let subtotalBase = 0
     let taxBaseForeign = 0

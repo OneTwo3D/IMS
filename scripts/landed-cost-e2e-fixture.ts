@@ -23,6 +23,7 @@ async function seedAccountingSettings() {
   await Promise.all([
     upsertSetting('plugin_xero_enabled', 'true'),
     upsertSetting('xero_sync_enabled', 'true'),
+    upsertSetting('xero_sync_purchase_invoice', 'submitted'),
     upsertSetting('xero_sync_cogs_journal', 'submitted'),
     upsertSetting('xero_sync_cogs_reversal', 'submitted'),
     upsertSetting('xero_sales_account', '200'),
@@ -34,6 +35,29 @@ async function seedAccountingSettings() {
     upsertSetting('xero_unearned_revenue_account', '820'),
     upsertSetting('xero_transit_account', '640'),
   ])
+}
+
+async function ensureCurrency(code: string, name: string, symbol: string, symbolPosition: 'PREFIX' | 'POSTFIX') {
+  return db.currency.upsert({
+    where: { code },
+    update: { name, symbol, symbolPosition, usedFor: 'BOTH', active: true },
+    create: { code, name, symbol, symbolPosition, usedFor: 'BOTH', active: true },
+  })
+}
+
+async function ensureBaseOrganisation() {
+  const updated = await db.organisation.updateMany({
+    data: { baseCurrency: 'GBP' },
+  })
+  if (updated.count === 0) {
+    await db.organisation.create({
+      data: {
+        name: 'One Two Inventory E2E',
+        country: 'GB',
+        baseCurrency: 'GBP',
+      },
+    })
+  }
 }
 
 async function ensureDefaultWarehouse() {
@@ -59,6 +83,160 @@ async function ensureDefaultWarehouse() {
       active: true,
     },
   })
+}
+
+async function seedForeignInvoiceFxMismatch() {
+  const suffix = uniqueSuffix()
+  const now = new Date()
+
+  await seedAccountingSettings()
+  await ensureBaseOrganisation()
+  await Promise.all([
+    ensureCurrency('GBP', 'British Pound Sterling', 'GBP', 'PREFIX'),
+    ensureCurrency('EUR', 'Euro', 'EUR', 'POSTFIX'),
+  ])
+  await db.fxRate.create({
+    data: {
+      fromCurrency: 'GBP',
+      toCurrency: 'EUR',
+      rate: 1.5,
+      fetchedAt: new Date(now.getTime() - 86_400_000),
+      source: 'manual',
+      manualOverride: true,
+    },
+  })
+
+  const warehouse = await ensureDefaultWarehouse()
+  const supplier = await db.supplier.create({
+    data: {
+      name: `Foreign FX Supplier ${suffix}`,
+      currency: 'EUR',
+      active: true,
+    },
+  })
+  const product = await db.product.create({
+    data: {
+      sku: `E2E-FX-PO-${suffix}`,
+      name: `FX PO Product ${suffix}`,
+      type: 'SIMPLE',
+      lifecycleStatus: 'ACTIVE',
+      salesPriceBase: 20,
+      salesPriceTaxInclusive: false,
+      taxCategory: 'STANDARD',
+      stockUnit: 'pcs',
+      oversellAllowed: false,
+      active: true,
+    },
+  })
+
+  const po = await db.purchaseOrder.create({
+    data: {
+      reference: `PO-FX-${suffix}`,
+      type: 'GOODS',
+      supplierId: supplier.id,
+      status: 'RECEIVED',
+      currency: 'EUR',
+      fxRateToBase: 1.25,
+      subtotalForeign: 12.5,
+      subtotalBase: 10,
+      taxForeign: 0,
+      taxBase: 0,
+      totalForeign: 12.5,
+      totalBase: 10,
+      destinationWarehouseId: warehouse.id,
+      receivedAt: now,
+      lines: {
+        create: [
+          {
+            productId: product.id,
+            description: product.name,
+            qty: 1,
+            unitCostForeign: 12.5,
+            unitCostBase: 10,
+            totalForeign: 12.5,
+            totalBase: 10,
+            landedUnitCostBase: 10,
+            qtyReceived: 1,
+            qtyReturned: 0,
+            sortOrder: 0,
+          },
+        ],
+      },
+    },
+    include: {
+      lines: true,
+    },
+  })
+
+  const poLine = po.lines[0]
+  const costLayer = await db.costLayer.create({
+    data: {
+      productId: product.id,
+      warehouseId: warehouse.id,
+      receivedQty: 1,
+      remainingQty: 1,
+      unitCostBase: 10,
+      poLineId: poLine.id,
+      isOpeningStock: false,
+    },
+  })
+  await db.stockLevel.create({
+    data: {
+      productId: product.id,
+      warehouseId: warehouse.id,
+      quantity: 1,
+      reservedQty: 0,
+    },
+  })
+
+  console.log(JSON.stringify({
+    scenario: 'foreign-invoice-fx-mismatch',
+    goodsPoId: po.id,
+    poLineId: poLine.id,
+    costLayerId: costLayer.id,
+    poFxRateToBase: 1.25,
+    invoiceDateFxRateToBase: 1.5,
+  }))
+}
+
+async function inspectForeignInvoiceFxMismatch(poId: string, poLineId: string, costLayerId: string) {
+  const [invoice, invoiceLine, costLayer, syncLog] = await Promise.all([
+    db.purchaseInvoice.findFirst({
+      where: { poId },
+      orderBy: { createdAt: 'desc' },
+      select: { fxRateToBase: true, totalForeign: true, totalBase: true },
+    }),
+    db.purchaseInvoiceLine.findFirst({
+      where: { poLineId, invoice: { poId } },
+      orderBy: { id: 'desc' },
+      select: { totalForeign: true, totalBase: true },
+    }),
+    db.costLayer.findUnique({
+      where: { id: costLayerId },
+      select: { unitCostBase: true },
+    }),
+    db.accountingSyncLog.findFirst({
+      where: {
+        connector: 'xero',
+        type: 'PURCHASE_INVOICE',
+        referenceType: 'PurchaseOrder',
+        referenceId: poId,
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { payload: true },
+    }),
+  ])
+
+  const payload = syncLog?.payload as { currencyRateToBase?: number } | null | undefined
+  console.log(JSON.stringify({
+    invoiceFxRateToBase: invoice ? Number(invoice.fxRateToBase) : null,
+    invoiceTotalForeign: invoice ? Number(invoice.totalForeign) : null,
+    invoiceTotalBase: invoice ? Number(invoice.totalBase) : null,
+    invoiceLineTotalForeign: invoiceLine ? Number(invoiceLine.totalForeign) : null,
+    invoiceLineTotalBase: invoiceLine ? Number(invoiceLine.totalBase) : null,
+    costLayerUnitCostBase: costLayer ? Number(costLayer.unitCostBase) : null,
+    accountingCurrencyRateToBase: payload?.currencyRateToBase ?? null,
+  }))
 }
 
 async function ensureSupplier(name: string, suffix: string) {
@@ -456,10 +634,22 @@ async function main() {
       await inspectScenario(goodsPoId, poLineId, originalCostLayerId)
       break
     }
+    case 'seed-foreign-invoice-fx-mismatch': {
+      await seedForeignInvoiceFxMismatch()
+      break
+    }
+    case 'inspect-foreign-invoice-fx-mismatch': {
+      const [poId, poLineId, costLayerId] = args
+      if (!poId || !poLineId || !costLayerId) {
+        throw new Error('inspect-foreign-invoice-fx-mismatch requires <poId> <poLineId> <costLayerId>')
+      }
+      await inspectForeignInvoiceFxMismatch(poId, poLineId, costLayerId)
+      break
+    }
     default:
       throw new Error(
         'usage: tsx scripts/landed-cost-e2e-fixture.ts ' +
-        '<seed|inspect> [...]',
+        '<seed|inspect|seed-foreign-invoice-fx-mismatch|inspect-foreign-invoice-fx-mismatch> [...]',
       )
   }
 }
