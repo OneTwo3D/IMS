@@ -17,6 +17,14 @@ export type RealisedFxResult = {
   outcome: 'gain' | 'loss' | 'none'
 }
 
+export type FxJournalLine = {
+  accountCode: string
+  description: string
+  debit?: number
+  credit?: number
+  taxType?: string
+}
+
 export function roundMoney(value: number): number {
   return Math.round(value * 100) / 100
 }
@@ -72,6 +80,16 @@ export function buildRealisedFxJournal(params: {
   return [controlLine, fxLine]
 }
 
+export function reverseJournalLines(lines: FxJournalLine[], descriptionSuffix: string): FxJournalLine[] {
+  return lines.map((line) => ({
+    accountCode: line.accountCode,
+    description: `${line.description} ${descriptionSuffix}`.trim(),
+    debit: roundMoney(Number(line.credit ?? 0)),
+    credit: roundMoney(Number(line.debit ?? 0)),
+    taxType: line.taxType,
+  }))
+}
+
 export function getRealisedFxAccounts(settings: AccountingSettings, side: FxSettlementSide): {
   controlAccount: string
   fxGainLossAccount: string
@@ -83,6 +101,20 @@ export function getRealisedFxAccounts(settings: AccountingSettings, side: FxSett
   return {
     controlAccount,
     fxGainLossAccount: settings.realisedFxGainLossAccount,
+  }
+}
+
+export function getUnrealisedFxAccounts(settings: AccountingSettings, side: FxSettlementSide): {
+  controlAccount: string
+  fxGainLossAccount: string
+} | null {
+  const controlAccount = side === 'receivable'
+    ? settings.accountsReceivableAccount
+    : settings.accountsPayableAccount
+  if (!controlAccount || !settings.unrealisedFxGainLossAccount) return null
+  return {
+    controlAccount,
+    fxGainLossAccount: settings.unrealisedFxGainLossAccount,
   }
 }
 

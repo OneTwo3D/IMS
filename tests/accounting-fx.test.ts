@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildRealisedFxJournal, computeRealisedFx } from '../lib/accounting-fx.ts'
+import { buildRealisedFxJournal, computeRealisedFx, reverseJournalLines } from '../lib/accounting-fx.ts'
 
 test('computes realised FX loss on customer payment when settlement base is below booked AR', () => {
   const result = computeRealisedFx({
@@ -61,5 +61,17 @@ test('builds a balanced FX-expense journal for realised FX losses', () => {
   assert.deepEqual(lines, [
     { accountCode: '610', description: 'Realised FX loss', debit: 0, credit: 13.33 },
     { accountCode: '498', description: 'Realised FX loss', debit: 13.33, credit: 0 },
+  ])
+})
+
+test('reverses prior unrealised FX journal lines by swapping debits and credits', () => {
+  const reversed = reverseJournalLines([
+    { accountCode: '610', description: 'Unrealised FX gain on INV-1', debit: 12.34, credit: 0 },
+    { accountCode: '498', description: 'Unrealised FX gain on INV-1', debit: 0, credit: 12.34 },
+  ], '(reversal for 2026-04-30)')
+
+  assert.deepEqual(reversed, [
+    { accountCode: '610', description: 'Unrealised FX gain on INV-1 (reversal for 2026-04-30)', debit: 0, credit: 12.34, taxType: undefined },
+    { accountCode: '498', description: 'Unrealised FX gain on INV-1 (reversal for 2026-04-30)', debit: 12.34, credit: 0, taxType: undefined },
   ])
 })

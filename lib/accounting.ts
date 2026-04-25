@@ -18,6 +18,7 @@ export type AccountingSettings = {
   accountsReceivableAccount: string
   accountsPayableAccount: string
   realisedFxGainLossAccount: string
+  unrealisedFxGainLossAccount: string
   manufacturingOverheadAccount: string
   paymentAccountMap: string
   invoiceUrlTemplate: string
@@ -39,6 +40,7 @@ const XERO_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> = {
   INVENTORY_ADJUSTMENT: 'xero_sync_inventory_adjustment',
   STOCK_ALLOCATION: 'xero_sync_stock_allocation',
   REALISED_FX_JOURNAL: 'xero_sync_realised_fx_journal',
+  UNREALISED_FX_JOURNAL: 'xero_sync_unrealised_fx_journal',
   MANUFACTURING_JOURNAL: 'xero_sync_manufacturing_journal',
   MANUFACTURING_RECLASS: 'xero_sync_manufacturing_journal',
 }
@@ -53,6 +55,7 @@ const QUICKBOOKS_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> 
   INVENTORY_ADJUSTMENT: 'quickbooks_sync_inventory_adjustment',
   STOCK_ALLOCATION: 'quickbooks_sync_stock_allocation',
   REALISED_FX_JOURNAL: 'quickbooks_sync_realised_fx_journal',
+  UNREALISED_FX_JOURNAL: 'quickbooks_sync_unrealised_fx_journal',
   MANUFACTURING_JOURNAL: 'quickbooks_sync_manufacturing_journal',
   MANUFACTURING_RECLASS: 'quickbooks_sync_manufacturing_journal',
 }
@@ -70,6 +73,7 @@ const DEFAULT_ACCOUNTING_SETTINGS: AccountingSettings = {
   accountsReceivableAccount: '',
   accountsPayableAccount: '',
   realisedFxGainLossAccount: '',
+  unrealisedFxGainLossAccount: '',
   manufacturingOverheadAccount: '',
   paymentAccountMap: '{}',
   invoiceUrlTemplate: '',
@@ -230,6 +234,7 @@ export async function getAccountingSettings(): Promise<AccountingSettings> {
         accountsReceivableAccount: xs.xero_accounts_receivable_account,
         accountsPayableAccount: xs.xero_accounts_payable_account,
         realisedFxGainLossAccount: xs.xero_realised_fx_gain_loss_account,
+        unrealisedFxGainLossAccount: xs.xero_unrealised_fx_gain_loss_account,
         manufacturingOverheadAccount: xs.xero_manufacturing_overhead_account,
         paymentAccountMap: paymentMapSetting?.value ?? '{}',
         invoiceUrlTemplate: invoiceUrlSetting?.value ?? '',
@@ -252,6 +257,7 @@ export async function getAccountingSettings(): Promise<AccountingSettings> {
         accountsReceivableAccount: qs.quickbooks_accounts_receivable_account,
         accountsPayableAccount: qs.quickbooks_accounts_payable_account,
         realisedFxGainLossAccount: qs.quickbooks_realised_fx_gain_loss_account,
+        unrealisedFxGainLossAccount: qs.quickbooks_unrealised_fx_gain_loss_account,
         manufacturingOverheadAccount: qs.quickbooks_manufacturing_overhead_account,
         paymentAccountMap: paymentMapSetting?.value ?? '{}',
         invoiceUrlTemplate: invoiceUrlSetting?.value ?? '',

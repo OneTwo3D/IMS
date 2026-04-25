@@ -378,6 +378,7 @@ const REQUIRED_ACCOUNTS: Array<{ key: keyof XeroSettings; label: string }> = [
   { key: 'xero_accounts_receivable_account', label: 'Accounts Receivable' },
   { key: 'xero_accounts_payable_account', label: 'Accounts Payable' },
   { key: 'xero_realised_fx_gain_loss_account', label: 'Realised FX Gain/Loss' },
+  { key: 'xero_unrealised_fx_gain_loss_account', label: 'Unrealised FX Gain/Loss' },
 ]
 
 export async function getXeroSyncReadiness(): Promise<XeroSyncReadiness> {

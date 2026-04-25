@@ -361,6 +361,7 @@ const REQUIRED_ACCOUNTS: Array<{ key: keyof QuickBooksSettings; label: string }>
   { key: 'quickbooks_accounts_receivable_account', label: 'Accounts Receivable' },
   { key: 'quickbooks_accounts_payable_account', label: 'Accounts Payable' },
   { key: 'quickbooks_realised_fx_gain_loss_account', label: 'Realised FX Gain/Loss' },
+  { key: 'quickbooks_unrealised_fx_gain_loss_account', label: 'Unrealised FX Gain/Loss' },
 ]
 
 export async function getQuickBooksSyncReadiness(): Promise<QuickBooksSyncReadiness> {
