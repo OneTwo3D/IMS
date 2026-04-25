@@ -326,7 +326,7 @@ Group B of the daily batch consumes FIFO (First In, First Out) cost layers when 
 | `/api/cron/accounting-daily-batch` | Daily (midnight) | Run sub-ledger Groups A1, A2, B |
 | `/api/cron/accounting-payment-poll` | Every 15 min | Detect paid invoices and bills in the active accounting connector |
 
-All cron endpoints require the `CRON_SECRET` header or localhost origin.
+All cron endpoints require the `CRON_SECRET` bearer header in production.
 
 ## Sync Log
 

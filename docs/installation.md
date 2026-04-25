@@ -137,7 +137,7 @@ Five scheduled tasks are configured automatically:
 | Every 15 min | `/api/cron/delivery-status` | Poll delivery tracking providers for shipment status updates |
 | 06:00 | `/api/cron/fx-rates` | Fetch latest exchange rates from frankfurter.dev |
 
-All cron jobs run under the `imsapp` user and call the application's API endpoints via `curl`. Cron endpoints require the `CRON_SECRET` header or a request from localhost for security.
+All cron jobs run under the `imsapp` user and call the application's API endpoints via `curl`. Cron endpoints require the `CRON_SECRET` bearer header in production. Installer-generated crontab entries read only the `CRON_SECRET=` line from the protected `${APP_DIR}/.env` file at runtime so the cron secret is not embedded directly in the crontab and unrelated environment values are not shell-sourced. Localhost bypass is available outside production only when no `CRON_SECRET` is configured; in production it is disabled unless `CRON_SECRET` is unset and `ALLOW_LOCALHOST_CRON_BYPASS=true` is set explicitly.
 
 For WooCommerce specifically:
 
@@ -213,6 +213,7 @@ Key variables in the `.env` file:
 | `BACKUP_DIR` | Local backup storage directory |
 | `UPLOAD_MAX_SIZE_MB` | Maximum upload file size in MB (default: `10`) |
 | `CRON_SECRET` | Shared secret for authenticating cron endpoint requests |
+| `ALLOW_LOCALHOST_CRON_BYPASS` | Set to `true` only if production cron requests must be allowed from localhost without the bearer header and `CRON_SECRET` is unset; default is `false` |
 | `SMTP_HOST` | SMTP server hostname if you choose to manage mail via env rather than app settings |
 | `SMTP_PORT` | SMTP server port |
 | `SMTP_USER` | SMTP authentication username |

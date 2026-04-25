@@ -108,7 +108,7 @@ The system includes a role-based access control (RBAC) layer defined in `lib/per
 
 - **Sidebar filtering** — each role sees only the navigation items relevant to their access level
 - **Server action authorisation** — all mutations (allocation, email sending, sync operations, etc.) verify the user's role before executing
-- **API route protection** — cron endpoints require `CRON_SECRET` or localhost origin
+- **API route protection** — cron endpoints require the `CRON_SECRET` bearer header in production
 
 
 ## Supplier Portal

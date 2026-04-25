@@ -5,7 +5,7 @@ import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runWcReconcile } from '@/lib/connectors/woocommerce/sync/reconcile'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
-// Called by cron: curl http://localhost:3000/api/cron/wc-reconcile
+// Called by cron with Authorization: Bearer $CRON_SECRET.
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
