@@ -1,0 +1,112 @@
+import type { AccountingSettings } from '@/lib/accounting'
+import type { Prisma } from '@/app/generated/prisma/client'
+
+export type FxSettlementSide = 'receivable' | 'payable'
+
+export type RealisedFxInput = {
+  side: FxSettlementSide
+  amountForeign: number
+  bookedRateToBase: number
+  settlementRateToBase: number
+}
+
+export type RealisedFxResult = {
+  bookedBase: number
+  settlementBase: number
+  gainLossBase: number
+  outcome: 'gain' | 'loss' | 'none'
+}
+
+export function roundMoney(value: number): number {
+  return Math.round(value * 100) / 100
+}
+
+export function computeRealisedFx(input: RealisedFxInput): RealisedFxResult {
+  const amountForeign = Number(input.amountForeign)
+  const bookedRate = Number(input.bookedRateToBase)
+  const settlementRate = Number(input.settlementRateToBase)
+  if (
+    !Number.isFinite(amountForeign) || amountForeign <= 0 ||
+    !Number.isFinite(bookedRate) || bookedRate <= 0 ||
+    !Number.isFinite(settlementRate) || settlementRate <= 0
+  ) {
+    return { bookedBase: 0, settlementBase: 0, gainLossBase: 0, outcome: 'none' }
+  }
+
+  const bookedBase = roundMoney(amountForeign / bookedRate)
+  const settlementBase = roundMoney(amountForeign / settlementRate)
+  const rawGainLoss = input.side === 'receivable'
+    ? settlementBase - bookedBase
+    : bookedBase - settlementBase
+  const gainLossBase = roundMoney(rawGainLoss)
+  const outcome = Math.abs(gainLossBase) < 0.01
+    ? 'none'
+    : gainLossBase > 0
+    ? 'gain'
+    : 'loss'
+
+  return { bookedBase, settlementBase, gainLossBase, outcome }
+}
+
+export function buildRealisedFxJournal(params: {
+  side: FxSettlementSide
+  gainLossBase: number
+  controlAccount: string
+  fxGainLossAccount: string
+  description: string
+}) {
+  const amount = roundMoney(Math.abs(params.gainLossBase))
+  if (amount < 0.01) return []
+  const controlLine = {
+    accountCode: params.controlAccount,
+    description: params.description,
+    debit: params.gainLossBase > 0 ? amount : 0,
+    credit: params.gainLossBase > 0 ? 0 : amount,
+  }
+  const fxLine = {
+    accountCode: params.fxGainLossAccount,
+    description: params.description,
+    debit: params.gainLossBase > 0 ? 0 : amount,
+    credit: params.gainLossBase > 0 ? amount : 0,
+  }
+  return [controlLine, fxLine]
+}
+
+export function getRealisedFxAccounts(settings: AccountingSettings, side: FxSettlementSide): {
+  controlAccount: string
+  fxGainLossAccount: string
+} | null {
+  const controlAccount = side === 'receivable'
+    ? settings.accountsReceivableAccount
+    : settings.accountsPayableAccount
+  if (!controlAccount || !settings.realisedFxGainLossAccount) return null
+  return {
+    controlAccount,
+    fxGainLossAccount: settings.realisedFxGainLossAccount,
+  }
+}
+
+export async function resolveSettlementFxRateToBase(
+  tx: Prisma.TransactionClient,
+  params: {
+    currency: string
+    baseCurrency: string
+    asOf: Date
+    fallbackRateToBase: number
+  },
+): Promise<number> {
+  const currency = params.currency.trim().toUpperCase()
+  const baseCurrency = params.baseCurrency.trim().toUpperCase()
+  if (!currency || currency === baseCurrency) return 1
+  const rate = await tx.fxRate.findFirst({
+    where: {
+      fromCurrency: baseCurrency,
+      toCurrency: currency,
+      fetchedAt: { lte: params.asOf },
+    },
+    orderBy: { fetchedAt: 'desc' },
+    select: { rate: true },
+  })
+  const resolved = rate ? Number(rate.rate) : Number(params.fallbackRateToBase)
+  return Number.isFinite(resolved) && resolved > 0 ? resolved : 1
+}

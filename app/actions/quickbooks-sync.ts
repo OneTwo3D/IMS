@@ -358,6 +358,9 @@ const REQUIRED_ACCOUNTS: Array<{ key: keyof QuickBooksSettings; label: string }>
   { key: 'quickbooks_allocated_inventory_account', label: 'Allocated Inventory' },
   { key: 'quickbooks_cogs_account', label: 'Cost of Goods Sold' },
   { key: 'quickbooks_unearned_revenue_account', label: 'Unearned Revenue' },
+  { key: 'quickbooks_accounts_receivable_account', label: 'Accounts Receivable' },
+  { key: 'quickbooks_accounts_payable_account', label: 'Accounts Payable' },
+  { key: 'quickbooks_realised_fx_gain_loss_account', label: 'Realised FX Gain/Loss' },
 ]
 
 export async function getQuickBooksSyncReadiness(): Promise<QuickBooksSyncReadiness> {

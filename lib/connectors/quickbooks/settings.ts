@@ -19,6 +19,7 @@ export type QuickBooksSettings = {
   quickbooks_sync_stock_receipt: string
   quickbooks_sync_inventory_adjustment: string
   quickbooks_sync_stock_allocation: string
+  quickbooks_sync_realised_fx_journal: string
   quickbooks_sync_manufacturing_journal: string
   quickbooks_sync_attach_pdf: string
   quickbooks_sales_account: string
@@ -29,6 +30,9 @@ export type QuickBooksSettings = {
   quickbooks_allocated_inventory_account: string
   quickbooks_unearned_revenue_account: string
   quickbooks_transit_account: string
+  quickbooks_accounts_receivable_account: string
+  quickbooks_accounts_payable_account: string
+  quickbooks_realised_fx_gain_loss_account: string
   quickbooks_manufacturing_overhead_account: string
   quickbooks_daily_batch_enabled: string
   quickbooks_payment_polling_enabled: string
@@ -40,12 +44,14 @@ export const QUICKBOOKS_SETTING_KEYS = [
   'quickbooks_sync_sales_invoice', 'quickbooks_sync_credit_note', 'quickbooks_sync_purchase_invoice',
   'quickbooks_sync_cogs_journal', 'quickbooks_sync_cogs_reversal',
   'quickbooks_sync_stock_receipt', 'quickbooks_sync_inventory_adjustment', 'quickbooks_sync_stock_allocation',
+  'quickbooks_sync_realised_fx_journal',
   'quickbooks_sync_manufacturing_journal',
   'quickbooks_sync_attach_pdf',
   'quickbooks_sales_account', 'quickbooks_shipping_account', 'quickbooks_discount_account',
   'quickbooks_cogs_account', 'quickbooks_inventory_account', 'quickbooks_allocated_inventory_account',
   'quickbooks_unearned_revenue_account',
   'quickbooks_transit_account',
+  'quickbooks_accounts_receivable_account', 'quickbooks_accounts_payable_account', 'quickbooks_realised_fx_gain_loss_account',
   'quickbooks_manufacturing_overhead_account',
   'quickbooks_daily_batch_enabled', 'quickbooks_payment_polling_enabled',
 ] as const
@@ -64,6 +70,7 @@ const QUICKBOOKS_DEFAULTS: QuickBooksSettings = {
   quickbooks_sync_stock_receipt: 'submitted',
   quickbooks_sync_inventory_adjustment: 'submitted',
   quickbooks_sync_stock_allocation: 'submitted',
+  quickbooks_sync_realised_fx_journal: 'submitted',
   quickbooks_sync_manufacturing_journal: 'submitted',
   quickbooks_sync_attach_pdf: 'true',
   quickbooks_sales_account: '',
@@ -74,6 +81,9 @@ const QUICKBOOKS_DEFAULTS: QuickBooksSettings = {
   quickbooks_allocated_inventory_account: '',
   quickbooks_unearned_revenue_account: '',
   quickbooks_transit_account: '',
+  quickbooks_accounts_receivable_account: '',
+  quickbooks_accounts_payable_account: '',
+  quickbooks_realised_fx_gain_loss_account: '',
   quickbooks_manufacturing_overhead_account: '',
   quickbooks_daily_batch_enabled: 'false',
   quickbooks_payment_polling_enabled: 'false',

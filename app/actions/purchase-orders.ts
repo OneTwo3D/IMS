@@ -20,6 +20,12 @@ import {
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import {
+  buildRealisedFxJournal,
+  computeRealisedFx,
+  getRealisedFxAccounts,
+  resolveSettlementFxRateToBase,
+} from '@/lib/accounting-fx'
 import { Prisma, type TaxCategory } from '@/app/generated/prisma/client'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -2612,6 +2618,7 @@ export async function markBillPaid(
         poId: true,
         invoiceNumber: true,
         totalForeign: true,
+        fxRateToBase: true,
         paidAt: true,
         accountingInvoiceId: true,
         po: { select: { reference: true, currency: true } },
@@ -2628,11 +2635,22 @@ export async function markBillPaid(
     if (!account) return { success: false, error: 'Unknown bank account' }
 
     const paymentAmount = input.amountForeign ?? Number(invoice.totalForeign)
+    const paymentDate = new Date(input.paymentDate)
+    const baseCurrency = await getBaseCurrencyCode()
+    const settlementRateToBase = await db.$transaction(
+      (tx) => resolveSettlementFxRateToBase(tx, {
+        currency: invoice.po.currency,
+        baseCurrency,
+        asOf: paymentDate,
+        fallbackRateToBase: Number(invoice.fxRateToBase),
+      }),
+      STOCK_TX_OPTIONS,
+    )
 
     const paidUpdate = await db.purchaseInvoice.updateMany({
       where: { id: invoiceId, paidAt: null },
       data: {
-        paidAt: new Date(input.paymentDate),
+        paidAt: paymentDate,
         paymentAccountId: input.bankAccountId,
         paymentAccountName: account.name,
         paymentReference: input.reference || null,
@@ -2683,6 +2701,50 @@ export async function markBillPaid(
       } catch {
         // Accounting queue errors should never block the main flow.
       }
+    }
+
+    try {
+      const accountingSettings = await getAccountingSettings()
+      const accounts = getRealisedFxAccounts(accountingSettings, 'payable')
+      if (accountingSettings.syncEnabled && accounts && invoice.po.currency !== baseCurrency) {
+        const realised = computeRealisedFx({
+          side: 'payable',
+          amountForeign: paymentAmount,
+          bookedRateToBase: Number(invoice.fxRateToBase),
+          settlementRateToBase,
+        })
+        const lines = buildRealisedFxJournal({
+          side: 'payable',
+          gainLossBase: realised.gainLossBase,
+          controlAccount: accounts.controlAccount,
+          fxGainLossAccount: accounts.fxGainLossAccount,
+          description: `Realised FX ${realised.outcome} on payment for bill ${invoice.invoiceNumber ?? invoice.po.reference}`,
+        })
+        if (lines.length > 0) {
+          await queueAccountingSync({
+            type: 'REALISED_FX_JOURNAL',
+            referenceType: 'PurchaseInvoice',
+            referenceId: invoice.id,
+            payload: {
+              date: paymentDate.toISOString().slice(0, 10),
+              reference: invoice.invoiceNumber ?? invoice.po.reference,
+              narration: `Realised FX ${realised.outcome} on supplier payment ${invoice.invoiceNumber ?? invoice.po.reference}`,
+              lines,
+              side: 'payable',
+              amountForeign: paymentAmount,
+              currency: invoice.po.currency,
+              bookedRateToBase: Number(invoice.fxRateToBase),
+              settlementRateToBase,
+              bookedBase: realised.bookedBase,
+              settlementBase: realised.settlementBase,
+              gainLossBase: realised.gainLossBase,
+            },
+            idempotencyKey: `realised-fx:bill-payment:${invoice.id}:${paymentDate.toISOString().slice(0, 10)}:${paymentAmount}`,
+          })
+        }
+      }
+    } catch {
+      // FX journal queueing must not block bill payment capture.
     }
 
     return { success: true }

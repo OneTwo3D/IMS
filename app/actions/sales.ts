@@ -12,6 +12,12 @@ import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import {
+  buildRealisedFxJournal,
+  computeRealisedFx,
+  getRealisedFxAccounts,
+  resolveSettlementFxRateToBase,
+} from '@/lib/accounting-fx'
 import { toIsoCountryCode } from '@/lib/countries'
 import { copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import {
@@ -2737,6 +2743,7 @@ export async function addPayment(input: {
   try {
     await requirePermission('sales.refund')
     if (!input.amount || input.amount <= 0) return { success: false, error: 'Amount must be greater than 0' }
+    const baseCurrency = await getBaseCurrencyCode()
     const txResult = await db.$transaction(async (tx) => {
       await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${input.orderId} FOR UPDATE`
       const so = await tx.salesOrder.findUnique({
@@ -2748,6 +2755,7 @@ export async function addPayment(input: {
           status: true,
           currency: true,
           totalForeign: true,
+          fxRateToBase: true,
           paidAt: true,
         },
       })
@@ -2782,7 +2790,8 @@ export async function addPayment(input: {
         return { error: `Payment exceeds remaining balance (${so.currency} ${(payableTotal - totalPaid).toFixed(2)})` }
       }
 
-      await tx.payment.create({
+      const paidAt = input.paidAt ? new Date(input.paidAt) : new Date()
+      const payment = await tx.payment.create({
         data: {
           orderId: input.orderId,
           refundId,
@@ -2791,15 +2800,22 @@ export async function addPayment(input: {
           method: input.method || null,
           reference: input.reference || null,
           notes: input.notes || null,
-          paidAt: input.paidAt ? new Date(input.paidAt) : new Date(),
+          paidAt,
         },
+        select: { id: true, paidAt: true },
       })
 
       const becamePaid = !refundId && !so.paidAt && totalPaid + input.amount >= Number(so.totalForeign) - 0.0001
       if (becamePaid) {
         await tx.salesOrder.update({ where: { id: input.orderId }, data: { paidAt: new Date() } })
       }
-      return { so, becamePaid }
+      const settlementRateToBase = await resolveSettlementFxRateToBase(tx, {
+        currency: so.currency,
+        baseCurrency,
+        asOf: payment.paidAt,
+        fallbackRateToBase: Number(so.fxRateToBase),
+      })
+      return { so, becamePaid, paymentId: payment.id, paidAt: payment.paidAt, settlementRateToBase, baseCurrency }
     }, STOCK_TX_OPTIONS)
     if ('error' in txResult) return { success: false, error: txResult.error }
 
@@ -2820,6 +2836,52 @@ export async function addPayment(input: {
       description: `Added ${input.currency} ${input.amount.toFixed(2)} payment to order ${getSalesOrderReference(txResult.so)}`,
       metadata: { orderNumber: getSalesOrderReference(txResult.so), amount: input.amount, currency: input.currency, method: input.method },
     })
+
+    if (!input.refundId) {
+      try {
+        const accountingSettings = await getAccountingSettings()
+        const accounts = getRealisedFxAccounts(accountingSettings, 'receivable')
+        if (accountingSettings.syncEnabled && accounts && txResult.so.currency !== txResult.baseCurrency) {
+          const realised = computeRealisedFx({
+            side: 'receivable',
+            amountForeign: input.amount,
+            bookedRateToBase: Number(txResult.so.fxRateToBase),
+            settlementRateToBase: txResult.settlementRateToBase,
+          })
+          const lines = buildRealisedFxJournal({
+            side: 'receivable',
+            gainLossBase: realised.gainLossBase,
+            controlAccount: accounts.controlAccount,
+            fxGainLossAccount: accounts.fxGainLossAccount,
+            description: `Realised FX ${realised.outcome} on payment for ${getSalesOrderReference(txResult.so)}`,
+          })
+          if (lines.length > 0) {
+            await queueAccountingSync({
+              type: 'REALISED_FX_JOURNAL',
+              referenceType: 'Payment',
+              referenceId: txResult.paymentId,
+              payload: {
+                date: txResult.paidAt.toISOString().slice(0, 10),
+                reference: getSalesOrderReference(txResult.so),
+                narration: `Realised FX ${realised.outcome} on customer payment ${getSalesOrderReference(txResult.so)}`,
+                lines,
+                side: 'receivable',
+                amountForeign: input.amount,
+                currency: txResult.so.currency,
+                bookedRateToBase: Number(txResult.so.fxRateToBase),
+                settlementRateToBase: txResult.settlementRateToBase,
+                bookedBase: realised.bookedBase,
+                settlementBase: realised.settlementBase,
+                gainLossBase: realised.gainLossBase,
+              },
+              idempotencyKey: `realised-fx:payment:${txResult.paymentId}`,
+            })
+          }
+        }
+      } catch {
+        // FX journal queueing must not block payment capture.
+      }
+    }
     return { success: true }
   } catch (e) {
     await logActivity({

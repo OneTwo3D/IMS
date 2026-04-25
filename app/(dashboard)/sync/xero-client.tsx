@@ -61,6 +61,9 @@ const ACCOUNT_FIELDS: { key: keyof AccountingConnectorSettings; label: string; d
   { key: 'xero_allocated_inventory_account', label: 'Allocated Inventory', description: 'Stock allocated to paid orders awaiting dispatch' },
   { key: 'xero_cogs_account', label: 'Cost of Goods Sold', description: 'COGS booked on dispatch' },
   { key: 'xero_unearned_revenue_account', label: 'Unearned Revenue', description: 'Liability account for revenue deferred until shipment' },
+  { key: 'xero_accounts_receivable_account', label: 'Accounts Receivable', description: 'Control account adjusted for realised FX on customer payments' },
+  { key: 'xero_accounts_payable_account', label: 'Accounts Payable', description: 'Control account adjusted for realised FX on supplier payments' },
+  { key: 'xero_realised_fx_gain_loss_account', label: 'Realised FX Gain/Loss', description: 'P&L account for settlement-rate variances' },
 ]
 
 const SYNC_TYPE_TOGGLES: { key: keyof AccountingConnectorSettings; label: string; description: string }[] = [
@@ -70,6 +73,7 @@ const SYNC_TYPE_TOGGLES: { key: keyof AccountingConnectorSettings; label: string
   { key: 'xero_sync_stock_receipt', label: 'Stock Receipts', description: 'Journal: DR Inventory / CR Stock in Transit on goods received' },
   { key: 'xero_sync_cogs_reversal', label: 'COGS Reversals', description: 'Reverse COGS on stock returns' },
   { key: 'xero_sync_inventory_adjustment', label: 'Inventory Adjustments', description: 'Journal for manual stock adjustments' },
+  { key: 'xero_sync_realised_fx_journal', label: 'Realised FX Journals', description: 'Post settlement-rate gains and losses on foreign payments' },
 ]
 
 const STATUS_BADGE: Record<string, { variant: 'default' | 'secondary' | 'outline' | 'destructive'; label: string }> = {
@@ -193,6 +197,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
           xero_sync_stock_receipt: s.xero_sync_stock_receipt,
           xero_sync_inventory_adjustment: s.xero_sync_inventory_adjustment,
           xero_sync_stock_allocation: s.xero_sync_stock_allocation,
+          xero_sync_realised_fx_journal: s.xero_sync_realised_fx_journal,
           xero_sync_attach_pdf: s.xero_sync_attach_pdf,
           xero_sales_account: s.xero_sales_account,
           xero_shipping_account: s.xero_shipping_account,
@@ -202,6 +207,9 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
           xero_allocated_inventory_account: s.xero_allocated_inventory_account,
           xero_transit_account: s.xero_transit_account,
           xero_unearned_revenue_account: s.xero_unearned_revenue_account,
+          xero_accounts_receivable_account: s.xero_accounts_receivable_account,
+          xero_accounts_payable_account: s.xero_accounts_payable_account,
+          xero_realised_fx_gain_loss_account: s.xero_realised_fx_gain_loss_account,
           xero_daily_batch_enabled: s.xero_daily_batch_enabled,
           xero_payment_polling_enabled: s.xero_payment_polling_enabled,
         }),

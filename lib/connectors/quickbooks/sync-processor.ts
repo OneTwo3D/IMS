@@ -514,6 +514,7 @@ async function processEntry(
     case 'DAILY_BATCH_INVENTORY_ALLOC':
     case 'DAILY_BATCH_GROUP_B':
     case 'UNEARNED_REV_REVERSAL':
+    case 'REALISED_FX_JOURNAL':
     case 'MANUFACTURING_JOURNAL':
     case 'MANUFACTURING_RECLASS': {
       const journalResult = await pushJournalEntry({
