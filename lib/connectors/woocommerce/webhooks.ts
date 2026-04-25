@@ -49,6 +49,14 @@ function isSignedActionPing(topic: string | null) {
   return !!topic && topic.startsWith('action.')
 }
 
+async function advanceWcOrderSyncCursor() {
+  await db.setting.upsert({
+    where: { key: 'last_wc_order_sync_at' },
+    create: { key: 'last_wc_order_sync_at', value: new Date().toISOString() },
+    update: { value: new Date().toISOString() },
+  })
+}
+
 async function handleOrderWebhook(body: string, topic: string | null) {
   const initialImportDone = await db.setting.findUnique({ where: { key: 'wc_initial_import_completed' } })
   if (initialImportDone?.value !== 'true') {
@@ -57,21 +65,35 @@ async function handleOrderWebhook(body: string, topic: string | null) {
 
   if (topic === 'refund.created') {
     const wcRefund = JSON.parse(body) as WcRefund
+    const failures: string[] = []
     if (typeof wcRefund.parent_id === 'number') {
-      await syncWcRefund(wcRefund.parent_id, wcRefund)
+      try {
+        await syncWcRefund(wcRefund.parent_id, wcRefund)
+      } catch (e) {
+        failures.push(`syncWcRefund: ${e instanceof Error ? e.message : String(e)}`)
+      }
     }
-    await db.setting.upsert({
-      where: { key: 'last_wc_order_sync_at' },
-      create: { key: 'last_wc_order_sync_at', value: new Date().toISOString() },
-      update: { value: new Date().toISOString() },
+    if (failures.length === 0) {
+      await advanceWcOrderSyncCursor()
+      return NextResponse.json({ ok: true })
+    }
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_order_webhook_failed',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `WooCommerce refund webhook failed; cursor not advanced so polling can retry`,
+      metadata: { externalRefundId: wcRefund.id, parentOrderId: wcRefund.parent_id, failures },
     })
-    return NextResponse.json({ ok: true })
+    return NextResponse.json({ ok: false, failures })
   }
 
   const wcOrder = JSON.parse(body) as WcFullOrder
 
+  const failures: string[] = []
   if (topic === 'order.created') {
-    await importWcOrder(wcOrder)
+    const importResult = await importWcOrder(wcOrder)
+    if (!importResult.success) failures.push(`importWcOrder: ${importResult.error ?? 'unknown error'}`)
   } else if (topic === 'order.updated') {
     const suppressed = await shouldSuppressWcOrderWebhookEcho(wcOrder)
     if (suppressed.suppress) {
@@ -91,18 +113,31 @@ async function handleOrderWebhook(body: string, topic: string | null) {
       return NextResponse.json({ ok: true, suppressed: suppressed.reason })
     }
 
-    await importWcOrder(wcOrder)
-    await syncWcOrderStatus(wcOrder)
-    await syncRefundsForOrder(wcOrder.id)
+    const importResult = await importWcOrder(wcOrder)
+    if (!importResult.success) failures.push(`importWcOrder: ${importResult.error ?? 'unknown error'}`)
+    const statusResult = await syncWcOrderStatus(wcOrder)
+    if (!statusResult.success) failures.push(`syncWcOrderStatus: ${statusResult.error ?? 'unknown error'}`)
+    try {
+      await syncRefundsForOrder(wcOrder.id)
+    } catch (e) {
+      failures.push(`syncRefundsForOrder: ${e instanceof Error ? e.message : String(e)}`)
+    }
   }
 
-  await db.setting.upsert({
-    where: { key: 'last_wc_order_sync_at' },
-    create: { key: 'last_wc_order_sync_at', value: new Date().toISOString() },
-    update: { value: new Date().toISOString() },
-  })
+  if (failures.length === 0) {
+    await advanceWcOrderSyncCursor()
+    return NextResponse.json({ ok: true })
+  }
 
-  return NextResponse.json({ ok: true })
+  await logActivity({
+    entityType: 'SYNC',
+    action: 'wc_order_webhook_failed',
+    tag: 'sync',
+    level: 'WARNING',
+    description: `WooCommerce order webhook for #${wcOrder.number} had failures; cursor not advanced so polling can retry`,
+    metadata: { externalOrderId: wcOrder.id, topic, status: wcOrder.status, failures },
+  })
+  return NextResponse.json({ ok: false, failures })
 }
 
 async function handleProductWebhook(body: string) {

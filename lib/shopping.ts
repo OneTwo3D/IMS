@@ -88,15 +88,23 @@ function computeKitAvailability(
 
 async function buildShoppingStockUpdates(
   productIds?: string[],
-  options?: { force?: boolean; webhookQty?: number | null },
+  options?: { force?: boolean; webhookQty?: number | null; connector?: ShoppingConnectorId },
 ): Promise<StockUpdate[]> {
   const { db } = await import('@/lib/db')
+  const skipReasons: Record<string, number> = {}
+  const recordSkip = (reason: string, count = 1) => {
+    skipReasons[reason] = (skipReasons[reason] ?? 0) + count
+  }
 
   const warehouses = await db.warehouse.findMany({
     where: { syncToStore: true, active: true },
     select: { id: true },
   })
-  if (warehouses.length === 0) return []
+  if (warehouses.length === 0) {
+    recordSkip('no_syncable_warehouses', 1)
+    await emitStockSyncSkipLog(skipReasons, 0, options?.connector)
+    return []
+  }
 
   const warehouseIds = warehouses.map((warehouse) => warehouse.id)
   const scopedProductIds = productIds && productIds.length > 0 ? [...new Set(productIds)] : null
@@ -170,12 +178,21 @@ async function buildShoppingStockUpdates(
     },
   })
 
-  const products = rawProducts
-    .filter((product) => product.type !== 'VARIABLE' && product.type !== 'NON_INVENTORY') as StockCandidateProduct[]
+  const products = rawProducts.filter((product) => {
+    if (product.type === 'VARIABLE') {
+      recordSkip('product_type_variable')
+      return false
+    }
+    if (product.type === 'NON_INVENTORY') {
+      recordSkip('product_type_non_inventory')
+      return false
+    }
+    return true
+  }) as StockCandidateProduct[]
   const productById = new Map(products.map((product) => [product.id, product]))
   const kitAvailabilityMemo = new Map<string, number>()
 
-  return products.map((product) => {
+  const updates = products.map((product) => {
     const computedQuantity = product.type === 'KIT'
       ? computeKitAvailability(
           product,
@@ -192,6 +209,27 @@ async function buildShoppingStockUpdates(
       productId: product.id,
       quantity: options?.force && product.lifecycleStatus === 'ARCHIVED' ? 0 : computedQuantity,
     }
+  })
+
+  await emitStockSyncSkipLog(skipReasons, updates.length, options?.connector)
+  return updates
+}
+
+async function emitStockSyncSkipLog(
+  skipReasons: Record<string, number>,
+  pushedCount: number,
+  connector?: ShoppingConnectorId,
+): Promise<void> {
+  const totalSkipped = Object.values(skipReasons).reduce((sum, count) => sum + count, 0)
+  if (totalSkipped === 0) return
+  const { logActivity } = await import('@/lib/activity-log')
+  await logActivity({
+    entityType: 'SYNC',
+    tag: 'sync',
+    action: 'stock_sync_skip_summary',
+    level: pushedCount === 0 ? 'WARNING' : 'INFO',
+    description: `Stock sync skipped ${totalSkipped} item(s); ${pushedCount} pushed${connector ? ` to ${connector}` : ''}`,
+    metadata: { skipReasons, pushedCount, connector: connector ?? null },
   })
 }
 
@@ -250,7 +288,7 @@ export async function syncShoppingConnectorStock(
         return { synced: 0, errors: ['Shopify sync is disabled in settings'] }
       }
 
-      const updates = await buildShoppingStockUpdates(productIds, options)
+      const updates = await buildShoppingStockUpdates(productIds, { ...options, connector: 'shopify' })
       if (updates.length === 0) {
         return { synced: 0, errors: ['No stocked products with syncable SKUs were found'] }
       }

@@ -1084,9 +1084,10 @@ export async function confirmAllocations(
         byWarehouse.set(a.warehouseId, group)
       }
 
+      const createdShipments: Array<{ id: string; warehouseId: string; lineCount: number; totalQty: number }> = []
       for (const [warehouseId, whAllocs] of byWarehouse) {
         const pendingMetadata = pendingMetadataByWarehouse.get(warehouseId)
-        await tx.shipment.create({
+        const created = await tx.shipment.create({
           data: {
             orderId,
             warehouseId,
@@ -1101,6 +1102,13 @@ export async function confirmAllocations(
               })),
             },
           },
+          select: { id: true },
+        })
+        createdShipments.push({
+          id: created.id,
+          warehouseId,
+          lineCount: whAllocs.length,
+          totalQty: whAllocs.reduce((sum, a) => sum + Number(a.qty), 0),
         })
       }
 
@@ -1116,6 +1124,7 @@ export async function confirmAllocations(
         orderNumber: so.orderNumber ?? so.externalOrderNumber,
         shipmentCount: byWarehouse.size,
         deletedPendingCount: deletedPending.count,
+        createdShipments,
       }
     }, STOCK_TX_OPTIONS)
 
@@ -1139,7 +1148,11 @@ export async function confirmAllocations(
       tag: 'sales',
       level: 'INFO',
       description: `Confirmed allocations for order ${result.orderNumber} — ${result.shipmentCount} shipment(s) created`,
-      metadata: { orderNumber: result.orderNumber, shipmentCount: result.shipmentCount },
+      metadata: {
+        orderNumber: result.orderNumber,
+        shipmentCount: result.shipmentCount,
+        shipments: result.createdShipments,
+      },
     })
     return { success: true }
   } catch (e) {

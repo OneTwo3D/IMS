@@ -458,13 +458,19 @@ async function reserveAvailableStock(
   })
 }
 
+type DisassemblyRecoveryPlan = {
+  entries: Array<{ componentId: string; totalQty: number; totalCostBase: Prisma.Decimal }>
+  usedLegacyFallback: boolean
+  recoveredLayerCount: number
+}
+
 async function buildDisassemblyRecoveryPlan(
   tx: Prisma.TransactionClient,
   recoveredLayers: Array<{ costLayerId: string; qty: number; unitCostBase: number }>,
   components: Array<{ componentId: string; qty: Prisma.Decimal | number }>,
   warehouseId: string,
   qtyPlanned: number,
-): Promise<Array<{ componentId: string; totalQty: number; totalCostBase: Prisma.Decimal }>> {
+): Promise<DisassemblyRecoveryPlan> {
   const componentById = new Map(components.map((component) => [component.componentId, component]))
   const layerIds = recoveredLayers.map((layer) => layer.costLayerId)
 
@@ -557,14 +563,9 @@ async function buildDisassemblyRecoveryPlan(
 
   const totalResidualBasis = residualBasis.reduce((sum, component) => sum + component.basis, 0)
   const fallbackResidualBasis = residualBasis.reduce((sum, component) => sum + component.totalQty, 0)
-  if (usedLegacyFallback && residualCostBase.abs().gt(0.000001)) {
-    console.warn(
-      `Disassembly recovery used average-cost fallback for ${recoveredLayers.length} recovered layer(s) ` +
-      `because historical source-line provenance was incomplete.`,
-    )
-  }
+  const fallbackTriggered = usedLegacyFallback && residualCostBase.abs().gt(0.000001)
 
-  return residualBasis
+  const entries = residualBasis
     .filter((component) => component.totalQty > 0)
     .map((component) => {
       const historicalCost = historicalCostByComponent.get(component.componentId) ?? new Prisma.Decimal(0)
@@ -578,6 +579,12 @@ async function buildDisassemblyRecoveryPlan(
         totalCostBase: historicalCost.add(residualAllocatedCost),
       }
     })
+
+  return {
+    entries,
+    usedLegacyFallback: fallbackTriggered,
+    recoveredLayerCount: recoveredLayers.length,
+  }
 }
 
 export async function updateManufacturingOrderStatus(
@@ -617,6 +624,7 @@ export async function updateManufacturingOrderStatus(
     // Surface skip reason post-tx (set inside the tx). Lets us log a
     // readable warning without holding the tx open.
     let manufacturingJournalSkipReason: string | null = null
+    let disassemblyFallback = null as { recoveredLayerCount: number } | null
 
     // When completing: execute stock movements in a transaction
     if (status === 'COMPLETED') {
@@ -777,6 +785,9 @@ export async function updateManufacturingOrderStatus(
             order.warehouseId,
             qtyPlanned,
           )
+          if (recoveryPlan.usedLegacyFallback) {
+            disassemblyFallback = { recoveredLayerCount: recoveryPlan.recoveredLayerCount }
+          }
           await tx.stockLevel.update({
             where: { productId_warehouseId: { productId: order.outputProductId, warehouseId: order.warehouseId } },
             data: {
@@ -798,7 +809,7 @@ export async function updateManufacturingOrderStatus(
           })
 
           for (const comp of components) {
-            const plannedRecovery = recoveryPlan.find((entry) => entry.componentId === comp.componentId)
+            const plannedRecovery = recoveryPlan.entries.find((entry) => entry.componentId === comp.componentId)
             const totalQty = plannedRecovery?.totalQty ?? (Number(comp.qty) * qtyPlanned)
             const baseAllocatedCost = plannedRecovery?.totalCostBase ?? new Prisma.Decimal(0)
             const allocatedCost = useEqualSplitOverhead
@@ -938,6 +949,18 @@ export async function updateManufacturingOrderStatus(
           level: 'WARNING',
           action: 'manufacturing_journal_skipped',
           description: `Skipped manufacturing-overhead journal for ${orderPreview.reference}: ${manufacturingJournalSkipReason}`,
+        })
+      }
+
+      if (disassemblyFallback) {
+        await logActivity({
+          entityType: 'STOCK_ADJUSTMENT',
+          entityId: id,
+          tag: 'manufacturing',
+          level: 'WARNING',
+          action: 'disassembly_recovery_fallback',
+          description: `${orderPreview.reference}: disassembly used average-cost fallback for ${disassemblyFallback.recoveredLayerCount} recovered layer(s) due to incomplete source-line provenance`,
+          metadata: { recoveredLayerCount: disassemblyFallback.recoveredLayerCount, moReference: orderPreview.reference },
         })
       }
 

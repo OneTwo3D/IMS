@@ -2160,6 +2160,14 @@ export async function createRefund(
           }
 
           const consumeShipmentCostForLine = (lineId: string, qty: number): CostLayerSnapshotEntry[] => {
+            const matchingShipmentLines = (orderAccounting?.shipments ?? [])
+              .flatMap((shipment) => shipment.lines)
+              .filter((line) => line.lineId === lineId)
+            if (matchingShipmentLines.length === 0) {
+              // Pre-shipment refund (line was refunded before any shipment recorded it):
+              // there is no shipment-level cost basis to reverse, so emit no snapshot entries.
+              return []
+            }
             let remainingQty = qty
             const consumed: CostLayerSnapshotEntry[] = []
             for (const shipment of orderAccounting?.shipments ?? []) {
@@ -2182,12 +2190,23 @@ export async function createRefund(
               }
             }
             if (remainingQty > 0.0000001) {
-              throw new Error(`Missing shipped FIFO history for refunded line ${lineId}`)
+              throw new Error(
+                `Cannot reverse COGS for refunded line ${lineId}: requested ${qty} unit(s) of shipment cost basis ` +
+                `but only ${(qty - remainingQty).toFixed(4)} available across recorded shipments. ` +
+                `This usually means the cost-layer snapshot is stale or was cleared between batch runs.`,
+              )
             }
             return consumed
           }
 
           const consumeAllocationCostForLine = (lineId: string, qty: number): CostLayerSnapshotEntry[] => {
+            const matchingAllocations = (orderAccounting?.allocations ?? [])
+              .filter((allocation) => allocation.lineId === lineId)
+            if (matchingAllocations.length === 0) {
+              // Pre-allocation refund (line never reached the allocation stage):
+              // there is no allocation-level cost basis to reverse.
+              return []
+            }
             let remainingQty = qty
             const consumed: CostLayerSnapshotEntry[] = []
             for (const allocation of orderAccounting?.allocations ?? []) {
@@ -2208,7 +2227,11 @@ export async function createRefund(
               )
             }
             if (remainingQty > 0.0000001) {
-              throw new Error(`Missing allocated FIFO history for refunded line ${lineId}`)
+              throw new Error(
+                `Cannot reverse COGS for refunded line ${lineId}: requested ${qty} unit(s) of allocation cost basis ` +
+                `but only ${(qty - remainingQty).toFixed(4)} available across recorded allocations. ` +
+                `This usually means the cost-layer snapshot is stale or was cleared between batch runs.`,
+              )
             }
             return consumed
           }
