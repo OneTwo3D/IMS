@@ -2,7 +2,7 @@
 
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
-import { normalizeLineDiscountBase, normalizeOrderDiscountBase } from '@/lib/sales-currency'
+import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -130,7 +130,7 @@ export async function getProductProfitability(): Promise<{
       select: {
         fxRateToBase: true, discountAmount: true, pricesIncludeVat: true, taxRatePercent: true,
         shoppingLinks: { select: { connector: true } },
-        lines: { select: { productId: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true } },
+        lines: { select: { productId: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true, taxRate: { select: { rate: true } } } },
         refunds: { select: { lines: { select: { productId: true, qty: true, totalBase: true } } } },
       },
     }),
@@ -139,7 +139,7 @@ export async function getProductProfitability(): Promise<{
       select: {
         fxRateToBase: true, discountAmount: true, pricesIncludeVat: true, taxRatePercent: true,
         shoppingLinks: { select: { connector: true } },
-        lines: { select: { productId: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true } },
+        lines: { select: { productId: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true, taxRate: { select: { rate: true } } } },
         refunds: { select: { lines: { select: { productId: true, qty: true, totalBase: true } } } },
       },
     }),
@@ -150,19 +150,16 @@ export async function getProductProfitability(): Promise<{
   function aggregateOrders(orders: typeof currentFyOrders): Map<string, FyAgg> {
     const map = new Map<string, FyAgg>()
     for (const order of orders) {
-      const orderLineTotal = order.lines.reduce((sum, line) => sum + Number(line.totalBase), 0)
-      const orderDiscountBase = normalizeOrderDiscountBase(order)
-      for (const line of order.lines) {
+      const orderDiscountAllocations = allocateOrderDiscountBase(order, order.lines)
+      for (const [lineIndex, line] of order.lines.entries()) {
         if (!line.productId) continue
         const agg = map.get(line.productId) ?? { revenue: 0, cogs: 0, qtySold: 0 }
         agg.revenue += Number(line.totalBase)
         agg.cogs += Number(line.cogsBase ?? 0)
         agg.qtySold += Number(line.qty)
         // Add back line discount (already subtracted from totalBase)
-        agg.revenue += normalizeLineDiscountBase(order, line.discountAmount)
-        if (orderDiscountBase > 0 && orderLineTotal > 0) {
-          agg.revenue -= orderDiscountBase * (Number(line.totalBase) / orderLineTotal)
-        }
+        agg.revenue += normalizeLineDiscountBase(order, line.discountAmount, line.taxRate?.rate)
+        agg.revenue -= orderDiscountAllocations[lineIndex] ?? 0
         map.set(line.productId, agg)
       }
       // Subtract refunds

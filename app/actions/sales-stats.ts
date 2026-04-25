@@ -6,7 +6,7 @@ import { requirePermission } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
-import { normalizeLineDiscountBase, normalizeOrderDiscountBase } from '@/lib/sales-currency'
+import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
 
 // ---------------------------------------------------------------------------
 // Products tab (line-level)
@@ -66,7 +66,7 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
     select: {
       id: true, totalBase: true, discountAmount: true, fxRateToBase: true, pricesIncludeVat: true, taxRatePercent: true, customerName: true, salesRep: true,
       shoppingLinks: { select: { connector: true } },
-      lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true } },
+      lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true, taxRate: { select: { rate: true } } } },
       refunds: { select: { totalBase: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
     },
   })
@@ -79,9 +79,8 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
   const productMap = new Map<string, SalesStatRow>()
 
   for (const order of orders) {
-    const orderLineTotal = order.lines.reduce((sum, line) => sum + Number(line.totalBase), 0)
-    const orderDiscountBase = normalizeOrderDiscountBase(order)
-    for (const line of order.lines) {
+    const orderDiscountAllocations = allocateOrderDiscountBase(order, order.lines)
+    for (const [lineIndex, line] of order.lines.entries()) {
       if (!line.productId) continue
       const pid = line.productId; const info = productInfo.get(pid)
       if (!productMap.has(pid)) {
@@ -100,15 +99,13 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
         })
       }
       const row = productMap.get(pid)!
-      const lineDiscountBase = normalizeLineDiscountBase(order, line.discountAmount)
+      const lineDiscountBase = normalizeLineDiscountBase(order, line.discountAmount, line.taxRate?.rate)
       row.qtySold += Number(line.qty)
       row.grossRevenue += Number(line.totalBase) + lineDiscountBase
       row.discounts += lineDiscountBase
-      if (orderDiscountBase > 0 && orderLineTotal > 0) {
-        const allocatedOrderDiscount = orderDiscountBase * (Number(line.totalBase) / orderLineTotal)
-        row.grossRevenue += allocatedOrderDiscount
-        row.discounts += allocatedOrderDiscount
-      }
+      const allocatedOrderDiscount = orderDiscountAllocations[lineIndex] ?? 0
+      row.grossRevenue += allocatedOrderDiscount
+      row.discounts += allocatedOrderDiscount
       row.cogs += Number(line.cogsBase ?? 0)
       row.orderCount++
     }

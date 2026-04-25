@@ -177,7 +177,7 @@ export async function getDashboardData(
         id: true, externalOrderNumber: true, customerName: true, status: true, createdAt: true,
         totalBase: true, subtotalBase: true, shippingBase: true, discountAmount: true, fxRateToBase: true, pricesIncludeVat: true, taxRatePercent: true,
         shoppingLinks: { select: { connector: true } },
-        lines: { select: { cogsBase: true, qty: true, totalBase: true, discountAmount: true, productId: true, sku: true, description: true } },
+        lines: { select: { cogsBase: true, qty: true, totalBase: true, discountAmount: true, productId: true, sku: true, description: true, taxRate: { select: { rate: true } } } },
         refunds: { select: { totalBase: true } },
       },
       orderBy: { createdAt: 'desc' },
@@ -230,8 +230,8 @@ export async function getDashboardData(
     let gross = 0, discounts = 0, refunds = 0, cogs = 0, shipping = 0
     for (const o of list) {
       const lineTotal = o.lines.reduce((s, l) => s + Number(l.totalBase), 0)
-      const lineDisc = o.lines.reduce((sum, line) => sum + normalizeLineDiscountBase(o, line.discountAmount), 0)
-      const orderDisc = normalizeOrderDiscountBase(o)
+      const lineDisc = o.lines.reduce((sum, line) => sum + normalizeLineDiscountBase(o, line.discountAmount, line.taxRate?.rate), 0)
+      const orderDisc = normalizeOrderDiscountBase(o, o.lines)
       gross += lineTotal + lineDisc + orderDisc
       discounts += lineDisc + orderDisc
       refunds += o.refunds.reduce((s, r) => s + Number(r.totalBase), 0)

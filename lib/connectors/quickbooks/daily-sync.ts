@@ -56,8 +56,9 @@ function normalizeDeferredDiscountBase(order: {
   pricesIncludeVat: boolean
   taxRatePercent: Prisma.Decimal | number | null
   shoppingLinks?: Array<{ connector: string }>
+  lines?: Array<{ totalBase: Prisma.Decimal | number | null; taxRate?: { rate: Prisma.Decimal | number | null } | null }>
 }): number {
-  return normalizeOrderDiscountBase(order)
+  return normalizeOrderDiscountBase(order, order.lines)
 }
 
 function makeLayerKey(productId: string, warehouseId: string): string {
@@ -407,6 +408,12 @@ export async function runDailyBatchSync(): Promise<{
         taxRatePercent: true,
         shoppingLinks: {
           select: { connector: true },
+        },
+        lines: {
+          select: {
+            totalBase: true,
+            taxRate: { select: { rate: true } },
+          },
         },
       },
     })
