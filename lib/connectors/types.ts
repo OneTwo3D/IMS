@@ -72,6 +72,28 @@ export type DeliveryStatus = {
   lastEventTime?: string
 }
 
+/**
+ * One row of FX rate data pushed to a shopping platform.
+ *
+ * Direction matches IMS internal storage: `rate` is "1 unit of base currency
+ * = `rate` units of toCurrency" (the frankfurter/ECB output convention).
+ * Adapters may invert per-platform if the destination plugin expects the
+ * opposite direction.
+ */
+export type FxRatePush = {
+  fromCurrency: string
+  toCurrency: string
+  rate: number
+  fetchedAt: string // ISO timestamp
+}
+
+export type FxRatePushResult = {
+  /** False if the connector / target plugin does not support multi-currency. */
+  supported: boolean
+  pushed: number
+  errors: string[]
+}
+
 export interface ShoppingConnector {
   /** Unique connector identifier */
   readonly id: string
@@ -93,6 +115,15 @@ export interface ShoppingConnector {
 
   // --- Delivery ---
   getDeliveryStatus(externalOrderId: number | string): Promise<DeliveryStatus | null>
+
+  // --- FX rates (optional capability) ---
+  /**
+   * Push the current set of FX rates to the storefront so cart conversions,
+   * displayed prices and order currency stamps all use the IMS rate. Optional
+   * — connectors that don't support multi-currency may return
+   * `{ supported: false }` and the cron fan-out will skip them silently.
+   */
+  pushFxRates?(rates: FxRatePush[]): Promise<FxRatePushResult>
 }
 
 // ---------------------------------------------------------------------------

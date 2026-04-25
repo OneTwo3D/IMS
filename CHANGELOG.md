@@ -6,6 +6,14 @@ This repository uses an `x.y.z` release scheme.
 - Increment `y` for user-facing non-breaking changes.
 - Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
+## 1.8.0 - 2026-04-25
+
+### Features (FX rate alignment with WooCommerce)
+
+- **onetwoInventory Helper WordPress plugin.** New unified companion plugin that consolidates the existing invoice-buttons module and adds a signed REST endpoint for receiving FX rates from IMS. Old `wc-invoice-buttons.php` removed in favour of `lib/connectors/woocommerce/wp-plugin/onetwoinventory-helper.php`. Installable directly from the IMS WC sync page via a "Download plugin (.zip)" button — no manual file copying. The plugin exposes a settings screen at WP admin → Settings → onetwoInventory where the shop owner pastes the same shared secret used for WC webhooks.
+- **FX rate push to WooCommerce.** With the helper plugin installed and "Push FX rates daily" enabled in the IMS WC sync page, the daily FX cron now fans out to WC after the inbound fetch (HMAC-SHA256 signed). The plugin makes those rates available to Aelia Currency Switcher via the `wc_aelia_currencyswitcher_exchange_rate` filter, so cart conversions, displayed prices and order currency stamps all use the same rate as IMS and Xero. Direct, inverted, and cross-rate conversions are all resolved through IMS's stored rates.
+- **Connector-agnostic plumbing.** `ShoppingConnector` interface now carries an optional `pushFxRates(rates)` capability — implemented by the WC adapter today, available for future Shopify/other adapters without IMS changes. `FxRatePush` and `FxRatePushResult` types live in `lib/connectors/types.ts`.
+
 ## 1.7.2 - 2026-04-25
 
 ### Fixes (Xero FX rate alignment)

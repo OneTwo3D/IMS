@@ -262,7 +262,9 @@ CurrencyRate sent on Invoice / Bill / CreditNote API call
 
 **Connector-agnostic design:** the optional `currencyRateToBase` field is on the generic `InvoiceData` / `BillData` / `CreditNoteData` types (`lib/connectors/types.ts`). Each accounting connector decides how to translate it (Xero: `1 / x`; QuickBooks would use the same form). QuickBooks adapter currently ignores the field — to be wired up alongside the rest of the QuickBooks integration.
 
-The unified-FX initiative (which extends this to push the same rates *into* WooCommerce/Aelia so all three systems agree) is tracked in `docs/todo/unified-fx-rates-plan.md`.
+**Downstream push to WooCommerce.** With the **onetwoInventory Helper** WordPress plugin installed and "Push FX rates daily" enabled in the IMS WC sync page, the same rates are also pushed to the WC store after each daily fetch. Aelia Currency Switcher (and any plugin reading the `wc_aelia_currencyswitcher_exchange_rate` filter) then converts cart prices using the IMS rate, so the storefront, IMS, and Xero all see the same exchange rate on the same order. See `docs/woocommerce.md` § onetwoInventory Helper WordPress plugin for installation steps.
+
+The full unified-FX rollout plan is tracked in `docs/todo/unified-fx-rates-plan.md`.
 
 ## Sub-Ledger Settings
 

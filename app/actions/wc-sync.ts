@@ -42,6 +42,8 @@ export type WcSyncSettings = {
   last_wc_product_reconcile_at: string
   last_wc_stock_sync_at: string
   wc_initial_import_completed: string
+  wc_fx_push_enabled: string
+  last_wc_fx_push_at: string
 }
 
 const SYNC_SETTING_KEYS = [
@@ -50,6 +52,7 @@ const SYNC_SETTING_KEYS = [
   'wc_webhook_secret', 'wc_webhook_last_received_at', 'wc_order_webhook_last_received_at', 'wc_product_webhook_last_received_at',
   'last_wc_order_sync_at', 'last_wc_order_reconcile_at', 'last_wc_product_sync_at', 'last_wc_product_reconcile_at', 'last_wc_stock_sync_at',
   'wc_initial_import_completed',
+  'wc_fx_push_enabled', 'last_wc_fx_push_at',
 ]
 
 const SYNC_DEFAULTS: WcSyncSettings = {
@@ -70,6 +73,8 @@ const SYNC_DEFAULTS: WcSyncSettings = {
   last_wc_product_reconcile_at: '',
   last_wc_stock_sync_at: '',
   wc_initial_import_completed: '',
+  wc_fx_push_enabled: 'false',
+  last_wc_fx_push_at: '',
 }
 
 export async function getWcSyncSettings(): Promise<WcSyncSettings> {
@@ -651,6 +656,30 @@ export async function getWcActivePaymentGateways(): Promise<Array<{ id: string; 
 function toSerializableResult(result: unknown): unknown {
   if (result == null) return result
   return JSON.parse(JSON.stringify(result))
+}
+
+export async function pushFxRatesToWcNow(): Promise<{ success: boolean; pushed: number; supported: boolean; error?: string }> {
+  await requireAdmin()
+  try {
+    const { pushCurrentFxRatesToWc } = await import('@/lib/connectors/woocommerce/fx-rates')
+    const result = await pushCurrentFxRatesToWc()
+    if (!result.supported) {
+      return { success: false, pushed: 0, supported: false, error: result.errors[0] ?? 'FX rate push not enabled or WooCommerce not configured' }
+    }
+    if (result.errors.length) {
+      return { success: false, pushed: result.pushed, supported: true, error: result.errors.join('; ') }
+    }
+    await db.setting.upsert({
+      where: { key: 'last_wc_fx_push_at' },
+      create: { key: 'last_wc_fx_push_at', value: new Date().toISOString() },
+      update: { value: new Date().toISOString() },
+    })
+    await logActivity({ entityType: 'SYNC', tag: 'sync', action: 'fx_rates_pushed', description: `Manually pushed ${result.pushed} FX rate(s) to WooCommerce` })
+    revalidatePath('/sync')
+    return { success: true, pushed: result.pushed, supported: true }
+  } catch (e) {
+    return { success: false, pushed: 0, supported: true, error: String(e) }
+  }
 }
 
 export async function triggerManualSync(type: 'orders' | 'products' | 'stock'): Promise<{ success: boolean; result?: unknown; error?: string }> {

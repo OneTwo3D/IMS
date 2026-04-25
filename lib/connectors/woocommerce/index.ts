@@ -25,3 +25,6 @@ export { syncWcProductToIms, pushImsProductToWc, syncAllWcProducts } from './syn
 export { pushStockToWc } from './sync/stock-sync'
 export { processWcCompletion } from './sync/completion-flow'
 export { verifyWcWebhook } from './sync/webhook-verify'
+
+// FX rate push (onetwoInventory Helper plugin)
+export { pushFxRatesToWc, pushCurrentFxRatesToWc } from './fx-rates'

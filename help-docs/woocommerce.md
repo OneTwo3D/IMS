@@ -163,15 +163,30 @@ When an invoice is generated for a WooCommerce order, the system pushes:
 
 These are stored as WooCommerce order meta (`_invoice_pdf_url` and `_accounting_invoice_url`).
 
-### Optional WordPress Plugin
+## onetwoInventory Helper WordPress plugin
 
-A WordPress must-use plugin is available at `lib/connectors/woocommerce/wc-invoice-buttons.php`. When installed in `wp-content/mu-plugins/`, it adds:
+A single companion WordPress plugin provides every WC-side hook IMS uses. The plugin is **installable directly from the IMS sync page** — go to **Sync → WooCommerce → Connection** and click **Download plugin (.zip)**.
 
-- **Customer My Account**: "Invoice" action button on the orders list
-- **Customer order detail**: "Download Invoice PDF" button
-- **Admin order screen**: an "Invoice" meta box with PDF download and accounting system links
+### What it does
 
-The plugin is compatible with WooCommerce High-Performance Order Storage (HPOS).
+- **Invoice buttons** (Customer My Account orders list, customer order detail, wp-admin order screen meta box). Reads `_invoice_pdf_url` and `_accounting_invoice_url` order meta. HPOS-compatible.
+- **FX rate receiver** — exposes `POST /wp-json/oti/v1/fx-rates`. IMS pushes daily ECB rates here, signed with HMAC-SHA256 using the same shared secret as WC webhooks. Stored rates are surfaced to Aelia Currency Switcher via the `wc_aelia_currencyswitcher_exchange_rate` filter, so the storefront, IMS, and Xero see the same exchange rate.
+
+### Installation
+
+1. In the IMS, go to **Sync → WooCommerce → Connection** and click **Download plugin (.zip)**.
+2. In WordPress admin, go to **Plugins → Add New → Upload Plugin**, choose the zip, and click **Install Now**.
+3. Activate the plugin.
+4. In WordPress admin go to **Settings → onetwoInventory** and paste the same shared secret used for WC webhooks (visible in the IMS Sync → WooCommerce → Orders tab).
+5. Back in IMS, on the same Connection page, tick **Push FX rates daily** and click **Push Now** to verify connectivity.
+
+### Aelia Currency Switcher
+
+If you use Aelia, you do not need to register a custom rate provider — the helper plugin's filter takes effect automatically as soon as IMS has pushed at least one set of rates. Aelia's transient cache is invalidated on each push so new rates take effect immediately. Aelia per-currency markups still apply on top of the IMS rate; only the *base* rate is overridden.
+
+### Other multi-currency plugins
+
+The helper plugin only ships with the Aelia filter today. If you use a different multi-currency plugin (CURCY, WPML, Shopify Markets, etc.) the rates are still stored in WP options and exposed via `get_option('oti_fx_rates')` — write a small adapter in your theme's `functions.php` to feed them into your plugin's rate model.
 
 ## Sync Log
 

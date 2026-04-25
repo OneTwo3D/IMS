@@ -233,6 +233,46 @@ export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; upd
       update: { value: new Date().toISOString() },
     })
     await logActivity({ entityType: 'SYNC', tag: 'sync', action: 'fx_rates_fetched', description: `Fetched FX rates for ${updated.length} currencies` })
+
+    // Fan out the new rates to enabled shopping connectors so the storefront,
+    // IMS and the accounting platform all use the same rate. Failure here must
+    // never roll back the inbound fetch — log and continue.
+    if (updated.length) {
+      try {
+        const { pushCurrentFxRatesToWc } = await import('@/lib/connectors/woocommerce/fx-rates')
+        const pushResult = await pushCurrentFxRatesToWc()
+        if (pushResult.supported && pushResult.errors.length) {
+          await logActivity({
+            entityType: 'SYNC',
+            tag: 'sync',
+            action: 'fx_rates_pushed',
+            level: 'WARNING',
+            description: `FX rate push to WooCommerce failed: ${pushResult.errors.join('; ').slice(0, 240)}`,
+          })
+        } else if (pushResult.supported) {
+          await db.setting.upsert({
+            where: { key: 'last_wc_fx_push_at' },
+            create: { key: 'last_wc_fx_push_at', value: new Date().toISOString() },
+            update: { value: new Date().toISOString() },
+          })
+          await logActivity({
+            entityType: 'SYNC',
+            tag: 'sync',
+            action: 'fx_rates_pushed',
+            description: `Pushed ${pushResult.pushed} FX rate(s) to WooCommerce`,
+          })
+        }
+      } catch (e) {
+        await logActivity({
+          entityType: 'SYNC',
+          tag: 'sync',
+          action: 'fx_rates_pushed',
+          level: 'ERROR',
+          description: `FX rate push threw: ${String(e).slice(0, 240)}`,
+        })
+      }
+    }
+
     revalidatePath('/settings', 'layout')
     revalidatePath('/purchase-orders')
     return { success: true, updated, failed }

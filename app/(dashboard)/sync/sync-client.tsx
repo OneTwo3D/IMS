@@ -14,6 +14,7 @@ import {
   deleteShoppingTaxRateMapping,
   importShoppingTaxRatesFromApi,
   resetShoppingProductIdCache,
+  pushShoppingFxRatesNow,
   saveShoppingConnectorCredentials,
   saveShoppingSyncSettings,
   triggerShoppingManualSync,
@@ -130,6 +131,118 @@ const TABS = [
 ] as const
 
 type TabId = (typeof TABS)[number]['id']
+
+// ---------------------------------------------------------------------------
+// onetwoInventory Helper plugin — install + FX push controls
+// ---------------------------------------------------------------------------
+
+function HelperPluginCard({
+  webhookSecret,
+  fxPushEnabled,
+  lastFxPushAt,
+  onFxPushToggle,
+}: {
+  webhookSecret: string
+  fxPushEnabled: boolean
+  lastFxPushAt: string
+  onFxPushToggle: (enabled: boolean) => Promise<void>
+}) {
+  const [pushing, setPushing] = useState(false)
+  const [pushResult, setPushResult] = useState<{ ok: boolean; text: string } | null>(null)
+
+  async function handlePushNow() {
+    setPushing(true)
+    setPushResult(null)
+    try {
+      const result = await pushShoppingFxRatesNow()
+      if (result.success) {
+        setPushResult({ ok: true, text: `Pushed ${result.pushed} rate(s)` })
+      } else {
+        setPushResult({ ok: false, text: result.error ?? 'Push failed' })
+      }
+    } catch (e) {
+      setPushResult({ ok: false, text: String(e) })
+    } finally {
+      setPushing(false)
+    }
+  }
+
+  return (
+    <Card className="p-6 space-y-4">
+      <div>
+        <h2 className="text-base font-semibold">onetwoInventory Helper plugin</h2>
+        <p className="text-xs text-muted-foreground mt-1">
+          Companion WordPress plugin that adds invoice download buttons to WooCommerce
+          and lets IMS push FX rates into the storefront so cart conversions match the
+          rates used by IMS and the accounting platform.
+        </p>
+      </div>
+
+      <div className="rounded-md border bg-muted/20 p-4 space-y-3">
+        <div>
+          <h3 className="text-sm font-medium">1. Install the plugin</h3>
+          <ol className="list-decimal pl-5 text-xs text-muted-foreground space-y-1 mt-1">
+            <li>Download the plugin zip below.</li>
+            <li>In WordPress admin, go to <strong>Plugins → Add New → Upload Plugin</strong>, choose the zip and click Install Now.</li>
+            <li>Activate the plugin.</li>
+            <li>Go to <strong>Settings → onetwoInventory</strong> and paste the webhook secret shown below as the shared secret.</li>
+          </ol>
+          <div className="pt-2">
+            <a href="/api/woocommerce/helper-plugin" download>
+              <Button variant="outline" size="sm">
+                <Download className="h-3.5 w-3.5 mr-1" />
+                Download plugin (.zip)
+              </Button>
+            </a>
+          </div>
+        </div>
+
+        <div>
+          <h3 className="text-sm font-medium">2. Enable FX rate push</h3>
+          <p className="text-xs text-muted-foreground mt-1">
+            When enabled, IMS sends the daily FX rates (frankfurter / ECB) to the helper plugin
+            after each fetch. The helper plugin makes them available to Aelia Currency Switcher
+            and any other plugin reading the <code className="bg-muted px-1 rounded">wc_aelia_currencyswitcher_exchange_rate</code> filter,
+            so the storefront, IMS, and Xero converge on the same rate.
+          </p>
+          <div className="flex items-center gap-3 pt-2">
+            <label className="flex items-center gap-2 text-sm cursor-pointer">
+              <input
+                type="checkbox"
+                checked={fxPushEnabled}
+                onChange={(e) => onFxPushToggle(e.target.checked)}
+                className="rounded border-input"
+                disabled={!webhookSecret}
+              />
+              <span>Push FX rates daily</span>
+            </label>
+            {!webhookSecret && (
+              <span className="text-xs text-amber-600">
+                Generate a webhook secret in the Orders tab first — the same secret is used to sign FX pushes.
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2 pt-3">
+            <Button variant="outline" size="sm" onClick={handlePushNow} disabled={pushing || !fxPushEnabled}>
+              {pushing ? <Loader2 className="h-3.5 w-3.5 mr-1 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5 mr-1" />}
+              Push Now
+            </Button>
+            {lastFxPushAt && (
+              <span className="text-xs text-muted-foreground">
+                Last push: {new Date(lastFxPushAt).toLocaleString('en-GB')}
+              </span>
+            )}
+            {pushResult && (
+              <span className={`text-xs ${pushResult.ok ? 'text-green-600' : 'text-destructive'}`}>
+                {pushResult.text}
+              </span>
+            )}
+          </div>
+        </div>
+      </div>
+    </Card>
+  )
+}
 
 // ---------------------------------------------------------------------------
 // Webhook Secret Field — auto-generate, show once, then mask
@@ -636,6 +749,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
 
       {/* Connection tab */}
       {tab === 'connection' && (
+        <div className="space-y-6">
         <Card className="p-6 space-y-4">
           <h2 className="text-base font-semibold">Connection</h2>
           <p className="text-xs text-muted-foreground">
@@ -675,6 +789,19 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
             )}
           </div>
         </Card>
+
+        {wcConfigured && (
+          <HelperPluginCard
+            webhookSecret={s.wc_webhook_secret}
+            fxPushEnabled={s.wc_fx_push_enabled === 'true'}
+            lastFxPushAt={s.last_wc_fx_push_at}
+            onFxPushToggle={async (enabled) => {
+              setS({ ...s, wc_fx_push_enabled: enabled ? 'true' : 'false' })
+              await saveShoppingSyncSettings({ wc_fx_push_enabled: enabled ? 'true' : 'false' })
+            }}
+          />
+        )}
+        </div>
       )}
 
       {/* Orders tab */}

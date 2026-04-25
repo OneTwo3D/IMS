@@ -12,6 +12,7 @@ import {
   getShoppingTaxRateMappings as getShoppingTaxRateMappingsImpl,
   importWcTaxRatesFromApi,
   resetWcProductIdCache,
+  pushFxRatesToWcNow,
   saveWcCredentials,
   saveWcSyncSettings,
   triggerManualSync,
@@ -174,6 +175,10 @@ export async function getShoppingConnectorPaymentMethods(): Promise<Array<{ id: 
 
 export async function triggerShoppingManualSync(type: 'orders' | 'products' | 'stock') {
   return triggerManualSync(type)
+}
+
+export async function pushShoppingFxRatesNow() {
+  return pushFxRatesToWcNow()
 }
 
 export async function getShopifySyncSettings(): Promise<ShopifySyncSettings> {

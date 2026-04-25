@@ -288,10 +288,13 @@ override (per the dialog-forms feedback rule).
    6dp. Stamped at every queue site: WooCommerce import, manual sales invoice,
    sales credit note, purchase invoice. QuickBooks adapter ignores the field
    for now. Outcome: IMS and Xero now agree on every multi-currency document.
-2. **Phase 2 — companion WP plugin.** Build and install the PHP plugin in a
-   staging WC site, point Aelia at it as a provider, verify rate flow.
-3. **Phase 3 — IMS push job.** Wire `pushFxRates` into the cron, behind a
-   `WC_FX_PUSH_ENABLED` flag in the WooCommerce config.
+2. **Phase 2 — companion WP plugin + IMS push.** ✅ **Shipped in 1.7.3.**
+   - Unified PHP plugin **onetwoInventory Helper** at `lib/connectors/woocommerce/wp-plugin/onetwoinventory-helper.php`. Rolls up the old `wc-invoice-buttons.php` (now removed) plus a new FX rate receiver module.
+   - REST endpoint `POST /wp-json/oti/v1/fx-rates` validated with HMAC-SHA256 (shared secret = `WC_WEBHOOK_SECRET`, pasted in via the plugin's settings page).
+   - Aelia integration via the `wc_aelia_currencyswitcher_exchange_rate` filter (cross-version safe; no dependency on Aelia's internal class hierarchy). Resolves direct/inverse/cross rates.
+   - IMS-side `pushFxRatesToWc()` adapter, plus generic `pushFxRates` capability on the `ShoppingConnector` interface.
+   - FX cron (`/api/cron/fx-rates`) fans out to the WC connector after each successful inbound fetch, behind `wc_fx_push_enabled` setting.
+   - Installable from the IMS WC sync page: a "Download plugin (.zip)" button serves a hand-rolled STORED zip via `/api/woocommerce/helper-plugin`.
 4. **Phase 4 — admin UI + manual override.** Ship the settings tab.
 5. **Phase 5 — production cutover.** Disable Aelia's built-in providers,
    switch to OTI provider, monitor `FxRatePushLog` for a week.
