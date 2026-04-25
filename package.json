@@ -11,6 +11,8 @@
     "start": "next start",
     "lint": "eslint",
     "type-check": "tsc --noEmit",
+    "validate": "bash scripts/validate-local.sh",
+    "validate:db": "bash scripts/validate-db.sh",
     "db:migrate:status": "bash scripts/prisma-dev-db.sh status",
     "db:migrate:deploy": "bash scripts/prisma-dev-db.sh deploy",
     "db:schema:diff": "bash scripts/prisma-dev-db.sh diff",
