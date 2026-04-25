@@ -2,6 +2,10 @@
 
 import { existsSync, readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
+import { config as loadDotenv } from 'dotenv'
+
+loadDotenv({ path: '.env.local', override: false, quiet: true })
+loadDotenv({ path: '.env', override: false, quiet: true })
 
 const schemaPath = process.env.PRISMA_SCHEMA_PATH ?? 'prisma/schema.prisma'
 const allowlistPath = process.env.PRISMA_DRIFT_ALLOWLIST ?? 'prisma/unsupported-schema-drift-allowlist.json'
@@ -16,7 +20,14 @@ function runPrismaDiff() {
   const result = spawnSync(
     'npx',
     ['prisma', 'migrate', 'diff', '--from-config-datasource', '--to-schema', schemaPath],
-    { encoding: 'utf8', env: process.env },
+    {
+      encoding: 'utf8',
+      env: {
+        ...process.env,
+        CHECKPOINT_DISABLE: '1',
+        PRISMA_HIDE_UPDATE_MESSAGE: '1',
+      },
+    },
   )
 
   if (result.error) {
