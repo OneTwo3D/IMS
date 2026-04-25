@@ -6,6 +6,20 @@ This repository uses an `x.y.z` release scheme.
 - Increment `y` for user-facing non-breaking changes.
 - Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
+## Unreleased - target 2.0.0
+
+### Breaking operator change (cron authentication)
+
+- **Production cron endpoints now require bearer authentication by default.** Localhost-only cron calls without `Authorization: Bearer $CRON_SECRET` will receive `401` in production. This is an operator-facing breaking change and should ship in the next major release (`2.0.0` under the release scheme above).
+- **Before deploying this change, update existing production crontabs.** Replace bare localhost cron calls with commands that read `CRON_SECRET` from the protected app environment file and send the cron bearer token, for example:
+
+  ```bash
+  CRON_SECRET=$(grep -m 1 '^CRON_SECRET=' /opt/one-two-inventory/.env | cut -d= -f2-) && curl -fsS -H "Authorization: Bearer $CRON_SECRET" http://localhost:3000/api/cron/fx-rates
+  ```
+
+- **Fresh installs are handled by `scripts/install.sh`.** Installer-generated cron entries now read only the `CRON_SECRET=` line from `${APP_DIR}/.env` at runtime, keeping the cron secret in the existing `imsapp:imsapp` mode-`600` environment file instead of duplicating it into the crontab or sourcing the full environment file.
+- **Emergency bypass is explicit and narrow.** Production localhost bypass is only available when `CRON_SECRET` is not configured and `ALLOW_LOCALHOST_CRON_BYPASS=true` is set. Do not use this on shared or externally reachable deployments.
+
 ## 1.10.0 - 2026-04-25
 
 ### Features (FX integration cutover tooling)
