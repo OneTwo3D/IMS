@@ -12,6 +12,7 @@
 import type { InvoiceData } from '@/lib/connectors/types'
 import { qboPost, qboPostIdempotent, resolveAccountRef } from './api'
 import { findOrCreateContact } from './contacts'
+import { imsRateToQboExchangeRate } from './fx'
 import { findOrCreateItem } from './items'
 import { getQuickBooksSettings } from './settings'
 
@@ -186,6 +187,10 @@ export async function pushSalesInvoice(
 
     if (data.invoiceNumber) invoiceBody.DocNumber = data.invoiceNumber
     if (data.currency) invoiceBody.CurrencyRef = { value: data.currency }
+    // Stamp the IMS rate so QBO doesn't apply its own daily rate. Inverted
+    // to match QBO's "1 doc-currency = X base" direction.
+    const qboRate = imsRateToQboExchangeRate(data.currencyRateToBase)
+    if (qboRate != null) invoiceBody.ExchangeRate = qboRate
     if (data.reference) invoiceBody.PrivateNote = data.reference
 
     const res = opts?.requestId

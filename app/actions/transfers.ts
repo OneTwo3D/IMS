@@ -13,8 +13,8 @@ import {
   consumeFifoLayersStrict,
   copyCostLayerSourceLinesProportionally,
   createCostLayer,
-  type ConsumedLayer,
 } from '@/lib/cost-layers'
+import { sliceTransferSnapshotForReceipt } from '@/lib/connectors/mintsoft/sync/booked-in-helpers'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -541,31 +541,47 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
 
       for (const line of transfer.lines) {
         const qty = Number(line.qty)
-        await tx.stockMovement.create({
-          data: {
-            type: 'TRANSFER_IN',
-            productId: line.productId,
-            fromWarehouseId: null,
-            toWarehouseId: transfer.toWarehouseId,
-            qty: qty.toString(),
-            note: `Transfer ${transfer.reference} received`,
-            referenceType: 'StockTransfer',
-            referenceId: id,
-          },
-        })
-        await tx.stockLevel.upsert({
-          where: { productId_warehouseId: { productId: line.productId, warehouseId: transfer.toWarehouseId } },
-          create: { productId: line.productId, warehouseId: transfer.toWarehouseId, quantity: qty.toString() },
-          update: { quantity: { increment: qty } },
-        })
+        // A WMS callback (Mintsoft etc.) may already have booked in part of
+        // this line and stamped qtyReceived + cost layers + a TRANSFER_IN
+        // movement for that portion. Receive only the remaining quantity to
+        // avoid double-counting; skip the line entirely if it is already
+        // fully received via WMS.
+        const alreadyReceived = Number(line.qtyReceived ?? 0)
+        const remainingQty = Math.max(0, qty - alreadyReceived)
 
-        // Recreate FIFO layers at the destination warehouse from the
-        // snapshot stored at dispatch. Each consumed source layer becomes
-        // a new destination layer with the same unitCostBase, preserving
-        // FIFO provenance across warehouses.
-        const snapshot = snapshotByLineId.get(line.id)
-        if (Array.isArray(snapshot) && snapshot.length > 0) {
-          for (const entry of snapshot as ConsumedLayer[]) {
+        if (remainingQty > 0) {
+          await tx.stockMovement.create({
+            data: {
+              type: 'TRANSFER_IN',
+              productId: line.productId,
+              fromWarehouseId: null,
+              toWarehouseId: transfer.toWarehouseId,
+              qty: remainingQty.toString(),
+              note: alreadyReceived > 0
+                ? `Transfer ${transfer.reference} received (manual close-out of ${remainingQty} after ${alreadyReceived} already booked via WMS)`
+                : `Transfer ${transfer.reference} received`,
+              referenceType: 'StockTransfer',
+              referenceId: id,
+            },
+          })
+          await tx.stockLevel.upsert({
+            where: { productId_warehouseId: { productId: line.productId, warehouseId: transfer.toWarehouseId } },
+            create: { productId: line.productId, warehouseId: transfer.toWarehouseId, quantity: remainingQty.toString() },
+            update: { quantity: { increment: remainingQty } },
+          })
+
+          // Recreate FIFO layers at the destination warehouse from the slice
+          // of the snapshot that hasn't already been consumed by a WMS
+          // partial-receive. The snapshot is stored at dispatch and represents
+          // the full transfer's source layers; the slicer walks past
+          // alreadyReceived units and returns only the next remainingQty
+          // units, matching the same algorithm the WMS handler uses.
+          const snapshotSlice = sliceTransferSnapshotForReceipt({
+            snapshot: snapshotByLineId.get(line.id),
+            alreadyReceivedQty: alreadyReceived,
+            qtyReceived: remainingQty,
+          })
+          for (const entry of snapshotSlice) {
             if (entry.qty > 0 && entry.unitCostBase >= 0) {
               const newLayerId = await createCostLayer(tx, {
                 productId: line.productId,
@@ -590,7 +606,7 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
           }
         }
 
-        // Mark line as fully received
+        // Mark line as fully received regardless of which path got us here.
         await tx.stockTransferLine.update({
           where: { id: line.id },
           data: { qtyReceived: qty },

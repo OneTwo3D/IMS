@@ -297,6 +297,7 @@ async function processEntry(
         date: payload.date as string,
         dueDate: payload.dueDate as string | undefined,
         currency: payload.currency as string,
+        currencyRateToBase: payload.currencyRateToBase as number | undefined,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; discountAmount?: number }>,
         shippingAmount: payload.shippingAmount as number | undefined,
         shippingDescription: payload.shippingDescription as string | undefined,
@@ -324,6 +325,7 @@ async function processEntry(
         date: payload.date as string,
         dueDate: payload.dueDate as string | undefined,
         currency: payload.currency as string,
+        currencyRateToBase: payload.currencyRateToBase as number | undefined,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
       }, undefined, { supplierId: supplier?.supplierId, requestId })
@@ -343,8 +345,10 @@ async function processEntry(
         contactEmail: payload.contactEmail as string | undefined,
         date: payload.date as string,
         currency: payload.currency as string,
+        currencyRateToBase: payload.currencyRateToBase as number | undefined,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
+        lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
       }, undefined, { customerId: creditCustomerId, requestId })
       return { success: creditResult.success, externalId: creditResult.creditNoteId, error: creditResult.error }
     }

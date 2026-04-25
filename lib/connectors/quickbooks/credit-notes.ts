@@ -7,6 +7,7 @@
 import type { CreditNoteData } from '@/lib/connectors/types'
 import { qboPost, qboPostIdempotent } from './api'
 import { findOrCreateContact } from './contacts'
+import { imsRateToQboExchangeRate } from './fx'
 
 type QboCreditMemo = {
   Id: string
@@ -55,6 +56,8 @@ export async function pushCreditMemo(
 
     if (data.creditNoteNumber) body.DocNumber = data.creditNoteNumber
     if (data.currency) body.CurrencyRef = { value: data.currency }
+    const qboRate = imsRateToQboExchangeRate(data.currencyRateToBase)
+    if (qboRate != null) body.ExchangeRate = qboRate
     if (data.reference) body.PrivateNote = data.reference
 
     const res = opts?.requestId

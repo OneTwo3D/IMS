@@ -10,6 +10,7 @@
 import type { BillData } from '@/lib/connectors/types'
 import { qboPost, qboPostIdempotent, resolveAccountRef } from './api'
 import { findOrCreateContact } from './contacts'
+import { imsRateToQboExchangeRate } from './fx'
 
 type QboBill = {
   Id: string
@@ -71,6 +72,8 @@ export async function pushPurchaseBill(
 
     if (data.invoiceNumber) billBody.DocNumber = data.invoiceNumber
     if (data.currency) billBody.CurrencyRef = { value: data.currency }
+    const qboRate = imsRateToQboExchangeRate(data.currencyRateToBase)
+    if (qboRate != null) billBody.ExchangeRate = qboRate
     if (data.reference) billBody.PrivateNote = data.reference
 
     const res = opts?.requestId

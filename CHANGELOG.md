@@ -6,6 +6,13 @@ This repository uses an `x.y.z` release scheme.
 - Increment `y` for user-facing non-breaking changes.
 - Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
+## 1.9.1 - 2026-04-25
+
+### Fixes (Codex review of Phase 1–4 FX work)
+
+- **QuickBooks now stamps ExchangeRate from `currencyRateToBase`.** Phase 1 added `currencyRateToBase` to every accounting payload but the QuickBooks adapter was dropping it before the API call, so QBO continued applying its own daily rate on multi-currency invoices/bills/credit memos and drifted from IMS by 1–3%. New helper `imsRateToQboExchangeRate()` (sibling of the Xero one) inverts to QBO's `1 doc-currency = X base` convention at 6dp; threaded through `pushSalesInvoice`, `pushPurchaseBill`, and `pushCreditMemo` and wired into `lib/connectors/quickbooks/sync-processor.ts` for all three call sites.
+- **Manual *Mark Received* on a partially-booked transfer no longer double-counts inventory.** When a Mintsoft (or other WMS) callback booked in part of a stock transfer and stamped `qtyReceived` + a `TRANSFER_IN` movement + cost-layer slice, the manual close-out path in `app/actions/transfers.ts` was still receiving the *full* line quantity, recreating the entire snapshot, and over-stating destination stock + cost layers by the already-booked amount. The path now reads each line's `qtyReceived`, posts a movement only for the remaining portion, and slices the snapshot via `sliceTransferSnapshotForReceipt` (the same algorithm the WMS handler uses) so each unit is accounted for exactly once across both paths. Lines already fully received via WMS are skipped.
+
 ## 1.9.0 - 2026-04-25
 
 ### Features (FX rates admin UI)
