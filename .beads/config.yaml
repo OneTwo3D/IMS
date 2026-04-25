@@ -54,3 +54,5 @@ issue-prefix: "onetwo3d-ims"
 # - github.repo
 
 export.git-add: false
+
+sync.remote: "git+ssh://git@github.com/OneTwo3D/IMS.git"
