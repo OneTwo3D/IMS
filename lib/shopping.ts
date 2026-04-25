@@ -231,6 +231,11 @@ async function emitStockSyncSkipLog(
   // calls without a connector skip logging to avoid audit-trail noise.
   if (!connector) return
   const totalSkipped = Object.values(skipReasons).reduce((sum, count) => sum + count, 0)
+  // Suppress completely-empty runs — nothing pushed and nothing skipped just
+  // means the sync had no work to do (e.g., no syncable warehouses configured),
+  // which is already visible in the sync run summary.
+  if (totalSkipped === 0 && pushedCount === 0) return
+  // Suppress healthy runs (everything pushed, nothing skipped) to avoid noise.
   if (totalSkipped === 0 && pushedCount > 0) return
   const { logActivity } = await import('@/lib/activity-log')
   await logActivity({
@@ -238,7 +243,7 @@ async function emitStockSyncSkipLog(
     tag: 'sync',
     action: 'stock_sync_skip_summary',
     level: pushedCount === 0 ? 'WARNING' : 'INFO',
-    description: `Stock sync ${pushedCount === 0 ? 'pushed nothing' : `pushed ${pushedCount} item(s)`}; skipped ${totalSkipped}${connector ? ` to ${connector}` : ''}`,
+    description: `Stock sync ${pushedCount === 0 ? 'pushed nothing' : `pushed ${pushedCount} item(s)`}; skipped ${totalSkipped} to ${connector}`,
     metadata: { skipReasons, pushedCount, connector },
   })
 }
@@ -292,13 +297,13 @@ export async function syncShoppingConnectorStock(
         source: options?.webhookQty != null ? 'WC_WEBHOOK' : 'MANUAL',
       })
       // Surface the same skip/push telemetry the Shopify path emits, derived
-      // from pushStockToWc's StockSyncResult fields. Only emit when the run
-      // produced no successful pushes (skip-noise reduction).
-      const candidates = (result as { candidates?: number }).candidates ?? 0
-      const skipped = (result as { skipped?: number }).skipped ?? 0
-      const unmatched = (result as { unmatched?: number }).unmatched ?? 0
-      const synced = (result as { synced?: number }).synced ?? 0
-      if (synced === 0 && (skipped > 0 || unmatched > 0 || candidates > 0)) {
+      // from pushStockToWc's StockSyncResult. Emit whenever any product was
+      // skipped or unmatched, regardless of whether other products synced
+      // successfully — partial-run gaps still need audit visibility.
+      const skipped = result.skipped ?? 0
+      const unmatched = result.unmatched ?? 0
+      const synced = result.synced ?? 0
+      if (skipped > 0 || unmatched > 0) {
         await emitStockSyncSkipLog(
           {
             ...(skipped > 0 ? { wc_skipped: skipped } : {}),
