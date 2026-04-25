@@ -68,7 +68,8 @@ async function handleOrderWebhook(body: string, topic: string | null) {
     const failures: string[] = []
     if (typeof wcRefund.parent_id === 'number') {
       try {
-        await syncWcRefund(wcRefund.parent_id, wcRefund)
+        const refundResult = await syncWcRefund(wcRefund.parent_id, wcRefund)
+        if (!refundResult.success) failures.push(`syncWcRefund: ${refundResult.error ?? 'unknown error'}`)
       } catch (e) {
         failures.push(`syncWcRefund: ${e instanceof Error ? e.message : String(e)}`)
       }
@@ -85,7 +86,10 @@ async function handleOrderWebhook(body: string, topic: string | null) {
       description: `WooCommerce refund webhook failed; cursor not advanced so polling can retry`,
       metadata: { externalRefundId: wcRefund.id, parentOrderId: wcRefund.parent_id, failures },
     })
-    return NextResponse.json({ ok: false, failures })
+    // Return HTTP 500 so WooCommerce retries delivery (it treats any 2xx as
+    // delivered, regardless of body). Polling reconcile is suppressed while
+    // webhooks are primary, so we rely on WC's retry to recover.
+    return NextResponse.json({ ok: false, failures }, { status: 500 })
   }
 
   const wcOrder = JSON.parse(body) as WcFullOrder
@@ -137,7 +141,10 @@ async function handleOrderWebhook(body: string, topic: string | null) {
     description: `WooCommerce order webhook for #${wcOrder.number} had failures; cursor not advanced so polling can retry`,
     metadata: { externalOrderId: wcOrder.id, topic, status: wcOrder.status, failures },
   })
-  return NextResponse.json({ ok: false, failures })
+  // Return HTTP 500 so WooCommerce retries delivery (any 2xx is treated as
+  // delivered regardless of body). Polling reconcile is suppressed while
+  // webhooks are primary, so we rely on WC's retry to recover.
+  return NextResponse.json({ ok: false, failures }, { status: 500 })
 }
 
 async function handleProductWebhook(body: string) {

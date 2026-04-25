@@ -145,24 +145,22 @@ async function buildShoppingStockUpdates(
   }
 
   const physicalProductIds = [...new Set(stockLevels.map((stockLevel) => stockLevel.productId))]
+  // Pull candidates without the lifecycle/SKU filter so we can count
+  // those skip reasons explicitly instead of silently dropping them.
   const rawProducts = await db.product.findMany({
-    where: {
-      lifecycleStatus: { in: ['ACTIVE', 'NOT_FOR_SALE', 'ARCHIVED'] },
-      sku: { not: '' },
-      ...(scopedProductIds
-        ? {
-            OR: [
-              { id: { in: scopedProductIds } },
-              { type: 'KIT', productComponents: { some: { componentId: { in: scopedProductIds } } } },
-            ],
-          }
-        : {
-            OR: [
-              { id: { in: physicalProductIds } },
-              { type: 'KIT', productComponents: { some: {} } },
-            ],
-          }),
-    },
+    where: scopedProductIds
+      ? {
+          OR: [
+            { id: { in: scopedProductIds } },
+            { type: 'KIT', productComponents: { some: { componentId: { in: scopedProductIds } } } },
+          ],
+        }
+      : {
+          OR: [
+            { id: { in: physicalProductIds } },
+            { type: 'KIT', productComponents: { some: {} } },
+          ],
+        },
     select: {
       id: true,
       sku: true,
@@ -178,7 +176,16 @@ async function buildShoppingStockUpdates(
     },
   })
 
+  const allowedLifecycle = new Set<ProductLifecycleStatus>(['ACTIVE', 'NOT_FOR_SALE', 'ARCHIVED'])
   const products = rawProducts.filter((product) => {
+    if (!product.sku) {
+      recordSkip('blank_sku')
+      return false
+    }
+    if (!allowedLifecycle.has(product.lifecycleStatus)) {
+      recordSkip(`lifecycle_${product.lifecycleStatus.toLowerCase()}`)
+      return false
+    }
     if (product.type === 'VARIABLE') {
       recordSkip('product_type_variable')
       return false
@@ -220,16 +227,19 @@ async function emitStockSyncSkipLog(
   pushedCount: number,
   connector?: ShoppingConnectorId,
 ): Promise<void> {
+  // Only emit when invoked from a sync run (connector tag set). Preview/utility
+  // calls without a connector skip logging to avoid audit-trail noise.
+  if (!connector) return
   const totalSkipped = Object.values(skipReasons).reduce((sum, count) => sum + count, 0)
-  if (totalSkipped === 0) return
+  if (totalSkipped === 0 && pushedCount > 0) return
   const { logActivity } = await import('@/lib/activity-log')
   await logActivity({
     entityType: 'SYNC',
     tag: 'sync',
     action: 'stock_sync_skip_summary',
     level: pushedCount === 0 ? 'WARNING' : 'INFO',
-    description: `Stock sync skipped ${totalSkipped} item(s); ${pushedCount} pushed${connector ? ` to ${connector}` : ''}`,
-    metadata: { skipReasons, pushedCount, connector: connector ?? null },
+    description: `Stock sync ${pushedCount === 0 ? 'pushed nothing' : `pushed ${pushedCount} item(s)`}; skipped ${totalSkipped}${connector ? ` to ${connector}` : ''}`,
+    metadata: { skipReasons, pushedCount, connector },
   })
 }
 
@@ -275,12 +285,30 @@ export async function syncShoppingConnectorStock(
   switch (connector) {
     case 'woocommerce': {
       const { pushStockToWc } = await import('@/lib/connectors/woocommerce/sync/stock-sync')
-      return pushStockToWc({
+      const result = await pushStockToWc({
         productIds: productIds && productIds.length > 0 ? [...new Set(productIds)] : undefined,
         forceAll: !productIds || productIds.length === 0,
         forceProductIds: options?.force && productIds ? [...new Set(productIds)] : [],
         source: options?.webhookQty != null ? 'WC_WEBHOOK' : 'MANUAL',
       })
+      // Surface the same skip/push telemetry the Shopify path emits, derived
+      // from pushStockToWc's StockSyncResult fields. Only emit when the run
+      // produced no successful pushes (skip-noise reduction).
+      const candidates = (result as { candidates?: number }).candidates ?? 0
+      const skipped = (result as { skipped?: number }).skipped ?? 0
+      const unmatched = (result as { unmatched?: number }).unmatched ?? 0
+      const synced = (result as { synced?: number }).synced ?? 0
+      if (synced === 0 && (skipped > 0 || unmatched > 0 || candidates > 0)) {
+        await emitStockSyncSkipLog(
+          {
+            ...(skipped > 0 ? { wc_skipped: skipped } : {}),
+            ...(unmatched > 0 ? { wc_unmatched_sku: unmatched } : {}),
+          },
+          synced,
+          'woocommerce',
+        )
+      }
+      return result
     }
     case 'shopify': {
       const shopifySettings = await getShopifySettings()
