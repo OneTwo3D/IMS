@@ -4,6 +4,7 @@
 
 import { xeroPost } from './api'
 import { findOrCreateContact } from './contacts'
+import { imsRateToXeroCurrencyRate } from './fx'
 import type { BillData, InvoiceLine } from '../types'
 
 type XeroInvoiceResponse = {
@@ -76,6 +77,9 @@ export async function pushPurchaseBill(
     Date: data.date,
     DueDate: dueDate,
   }
+  // Stamp the IMS rate so Xero doesn't apply its own daily XE rate.
+  const xeroCurrencyRate = imsRateToXeroCurrencyRate(data.currencyRateToBase)
+  if (xeroCurrencyRate != null) invoice.CurrencyRate = xeroCurrencyRate
   if (data.invoiceNumber) invoice.InvoiceNumber = data.invoiceNumber
   if (data.reference) invoice.Reference = data.reference
 

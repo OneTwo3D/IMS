@@ -263,6 +263,7 @@ async function processEntry(
         date: payload.date as string,
         dueDate: payload.dueDate as string | undefined,
         currency: payload.currency as string,
+        currencyRateToBase: payload.currencyRateToBase as number | undefined,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; discountRate?: number }>,
         shippingAmount: payload.shippingAmount as number | undefined,
         shippingDescription: payload.shippingDescription as string | undefined,
@@ -291,6 +292,7 @@ async function processEntry(
         date: payload.date as string,
         dueDate: payload.dueDate as string | undefined,
         currency: payload.currency as string,
+        currencyRateToBase: payload.currencyRateToBase as number | undefined,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: billIdempotencyKey, supplierId: supplier?.supplierId, supplierEmail: supplier?.supplier.email ?? undefined })
@@ -440,8 +442,10 @@ async function processEntry(
         contactEmail: payload.contactEmail as string | undefined,
         date: payload.date as string,
         currency: payload.currency as string,
+        currencyRateToBase: payload.currencyRateToBase as number | undefined,
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string }>,
         reference: payload.reference as string | undefined,
+        lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
     }
 

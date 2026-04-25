@@ -2489,6 +2489,8 @@ export async function createInvoice(
       date: input.invoiceDate,
       dueDate: input.dueDate ?? undefined,
       currency: supplierData?.currency ?? baseCurrency,
+      // Stamp IMS's FX rate so Xero/QB don't apply their own daily rate.
+      currencyRateToBase: Number(fxRate) || undefined,
       reference: input.invoiceNumber ?? undefined,
       // Bills always debit transit first. For landed-cost changes that arrive
       // after receipt, the recalculation path posts a separate reclass from

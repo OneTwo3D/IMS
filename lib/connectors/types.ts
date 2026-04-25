@@ -144,6 +144,19 @@ export type InvoiceLine = {
   discountAmount?: number
 }
 
+/**
+ * Generic FX rate stamped on accounting documents so the accounting platform
+ * does not substitute its own daily rate.
+ *
+ * Convention used here, across all accounting connectors:
+ *   `currencyRateToBase` = how many units of the **document currency** equal
+ *   1 unit of the **base currency**. e.g. base GBP, doc EUR, 1 GBP = 1.18 EUR
+ *   ⇒ `currencyRateToBase = 1.18`. This matches IMS's stored `fxRateToBase`.
+ *
+ * Each adapter inverts/translates as needed:
+ *   - Xero `CurrencyRate` is `1 doc-ccy = X base` → `1 / currencyRateToBase`.
+ *   - QuickBooks `ExchangeRate` is `1 doc-ccy = X base` → same as Xero.
+ */
 export type InvoiceData = {
   invoiceNumber: string
   contactName: string
@@ -151,6 +164,12 @@ export type InvoiceData = {
   date: string
   dueDate?: string
   currency: string
+  /**
+   * FX rate stamped on the document. See top-level convention comment.
+   * Optional — when omitted the accounting platform will fall back to its own
+   * daily rate, which is what we are trying to avoid.
+   */
+  currencyRateToBase?: number
   lines: InvoiceLine[]
   shippingAmount?: number
   shippingDescription?: string
@@ -184,6 +203,8 @@ export type BillData = {
   date: string
   dueDate?: string
   currency: string
+  /** See `InvoiceData.currencyRateToBase`. */
+  currencyRateToBase?: number
   lines: InvoiceLine[]
   reference?: string
 }
@@ -194,6 +215,8 @@ export type CreditNoteData = {
   contactEmail?: string
   date: string
   currency: string
+  /** See `InvoiceData.currencyRateToBase`. */
+  currencyRateToBase?: number
   lines: InvoiceLine[]
   /**
    * When true, unit amounts are tax-inclusive in the accounting system.

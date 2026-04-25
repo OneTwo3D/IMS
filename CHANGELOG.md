@@ -6,6 +6,12 @@ This repository uses an `x.y.z` release scheme.
 - Increment `y` for user-facing non-breaking changes.
 - Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
+## 1.7.2 - 2026-04-25
+
+### Fixes (Xero FX rate alignment)
+
+- **Xero now uses IMS's stored FX rate.** Sales invoices, purchase bills and credit notes posted to Xero are now stamped with `CurrencyRate` derived from the IMS `fxRateToBase` on the source document. Previously Xero substituted its own daily XE rate, causing 1–3 % drift between IMS and Xero base-currency totals on the same multi-currency document. New helper `imsRateToXeroCurrencyRate()` inverts IMS's "1 base = X foreign" convention into Xero's "1 foreign = X base" at 8dp. Connector contract updated: `InvoiceData` / `BillData` / `CreditNoteData` accept an optional `currencyRateToBase` field, kept connector-agnostic so QuickBooks (and future accounting connectors) can adopt the same field. First step toward the unified-FX plan in `docs/todo/unified-fx-rates-plan.md` that aligns rates across IMS, WooCommerce/Aelia and Xero.
+
 ## 1.7.1 - 2026-04-25
 
 ### Fixes (manufacturing-cost component, post-review)

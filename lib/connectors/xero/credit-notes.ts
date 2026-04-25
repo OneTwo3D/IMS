@@ -4,6 +4,7 @@
 
 import { xeroPost } from './api'
 import { findOrCreateContact } from './contacts'
+import { imsRateToXeroCurrencyRate } from './fx'
 import type { CreditNoteData, InvoiceLine } from '../types'
 
 type XeroCreditNoteResponse = {
@@ -64,6 +65,9 @@ export async function pushCreditNote(
     Status: status,
     CurrencyCode: data.currency,
   }
+  // Stamp the IMS rate so Xero doesn't apply its own daily XE rate.
+  const xeroCurrencyRate = imsRateToXeroCurrencyRate(data.currencyRateToBase)
+  if (xeroCurrencyRate != null) creditNote.CurrencyRate = xeroCurrencyRate
   if (data.reference) creditNote.Reference = data.reference
 
   const res = await xeroPost<XeroCreditNoteResponse>('CreditNotes', creditNote, opts)

@@ -1348,6 +1348,10 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
       contactEmail: so.customerEmail ?? undefined,
       date: new Date().toISOString().slice(0, 10),
       currency: so.currency,
+      // Stamp IMS's FX rate on the document so Xero/QuickBooks don't apply
+      // their own daily rate (which causes 1-3 % drift on multi-currency
+      // invoices). Connector adapter inverts to the platform's convention.
+      currencyRateToBase: Number(so.fxRateToBase) || undefined,
       reference: orderNumber,
       lines: so.lines.map((l) => {
         const qty = Number(l.qty)
@@ -1755,7 +1759,7 @@ export async function createRefund(
 
     if ('error' in txResult) return { success: false, error: txResult.error }
 
-    const { so, createdRefund, createdRefundLines, creditNoteNumber, newStatus } = txResult
+    const { so, fxRate: refundFxRate, createdRefund, createdRefundLines, creditNoteNumber, newStatus } = txResult
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
@@ -1823,6 +1827,9 @@ export async function createRefund(
             taxType: (l.lineId ? taxTypeBySalesLineId.get(l.lineId) : undefined) ?? cnTaxRate?.accountingTaxType ?? undefined,
           })),
           lineAmountsIncludeTax: false,
+          // Stamp IMS's FX rate on the credit note so Xero doesn't apply its
+          // own daily rate (would drift from the original invoice).
+          currencyRateToBase: Number(refundFxRate) || undefined,
         },
       })
     } catch { /* Accounting queue errors should never block the main flow */ }
