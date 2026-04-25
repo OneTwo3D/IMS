@@ -295,7 +295,11 @@ override (per the dialog-forms feedback rule).
    - IMS-side `pushFxRatesToWc()` adapter, plus generic `pushFxRates` capability on the `ShoppingConnector` interface.
    - FX cron (`/api/cron/fx-rates`) fans out to the WC connector after each successful inbound fetch, behind `wc_fx_push_enabled` setting.
    - Installable from the IMS WC sync page: a "Download plugin (.zip)" button serves a hand-rolled STORED zip via `/api/woocommerce/helper-plugin`.
-4. **Phase 4 — admin UI + manual override.** Ship the settings tab.
+4. **Phase 4 — admin UI + manual override.** ✅ **Shipped in 1.9.0.**
+   - New Settings → Accounting → FX Rates tab with current rates, source badges, manual override dialog, and clear-override action.
+   - `FxRatePushLog` table replacing the activity-log-only history of pushes.
+   - Schema migration `20260425100000_fx_rate_overrides_and_push_log` adds `source` and `manualOverride` to `FxRate` plus the new push-log table.
+   - Daily fetch now honours overrides (skips override currencies so a pinned rate is not overwritten).
 5. **Phase 5 — production cutover.** Disable Aelia's built-in providers,
    switch to OTI provider, monitor `FxRatePushLog` for a week.
 

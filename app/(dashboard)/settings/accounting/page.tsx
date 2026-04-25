@@ -1,14 +1,16 @@
 import type { Metadata } from 'next'
 import Link from 'next/link'
-import { CalendarDays, Receipt, Coins, RefreshCw } from 'lucide-react'
+import { CalendarDays, Receipt, Coins, RefreshCw, ArrowLeftRight } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { Card } from '@/components/ui/card'
 import { getSetting, getTaxRates } from '@/app/actions/settings'
-import { getCurrencies } from '@/app/actions/currencies'
+import { getCurrencies, getLatestFxRates, getFxPushLog } from '@/app/actions/currencies'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { FinancialYearStartSetting } from '@/components/settings/financial-year-start'
 import { TaxRatesTable } from '@/components/settings/tax-rates-table'
 import { CurrenciesTable } from '@/components/settings/currencies-table'
 import { FxScheduleSettings } from '@/components/settings/fx-schedule'
+import { FxRatesTable } from '@/components/settings/fx-rates-table'
 
 export const metadata: Metadata = { title: 'Accounting Settings' }
 
@@ -16,6 +18,7 @@ const TABS = [
   { key: 'financial-year', label: 'Financial Year', icon: CalendarDays },
   { key: 'tax', label: 'Tax', icon: Receipt },
   { key: 'currencies', label: 'Currencies', icon: Coins },
+  { key: 'fx-rates', label: 'FX Rates', icon: ArrowLeftRight },
 ] as const
 
 type Tab = (typeof TABS)[number]['key']
@@ -29,10 +32,11 @@ export default async function AccountingSettingsPage({
   const raw = typeof params.tab === 'string' ? params.tab : undefined
   const activeTab: Tab = TABS.some((t) => t.key === raw) ? (raw as Tab) : 'financial-year'
 
-  const [fyData, taxData, currencyData] = await Promise.all([
+  const [fyData, taxData, currencyData, fxRatesData] = await Promise.all([
     activeTab === 'financial-year' ? loadFinancialYear() : null,
     activeTab === 'tax' ? loadTaxRates() : null,
     activeTab === 'currencies' ? loadCurrencies() : null,
+    activeTab === 'fx-rates' ? loadFxRates() : null,
   ])
 
   return (
@@ -83,6 +87,20 @@ export default async function AccountingSettingsPage({
             {' '}These rates still apply even when no accounting connector is enabled.
           </p>
           <TaxRatesTable taxRates={taxData.taxRates} />
+        </Card>
+      )}
+
+      {activeTab === 'fx-rates' && fxRatesData && (
+        <Card className="p-6">
+          <div className="flex items-center gap-2 mb-4">
+            <ArrowLeftRight className="h-4 w-4 text-muted-foreground" />
+            <h2 className="text-base font-semibold">FX Rates</h2>
+          </div>
+          <FxRatesTable
+            baseCurrency={fxRatesData.baseCurrency}
+            rates={fxRatesData.rates}
+            pushLog={fxRatesData.pushLog}
+          />
         </Card>
       )}
 
@@ -143,4 +161,13 @@ async function loadCurrencies() {
     getSetting('fx_last_fetched'),
   ])
   return { currencies, fxEnabled, fxInterval, fxLastFetched }
+}
+
+async function loadFxRates() {
+  const [baseCurrency, rates, pushLog] = await Promise.all([
+    getBaseCurrencyCode(),
+    getLatestFxRates(),
+    getFxPushLog(20),
+  ])
+  return { baseCurrency, rates, pushLog }
 }

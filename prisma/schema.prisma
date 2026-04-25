@@ -400,16 +400,41 @@ enum CurrencySymbolPos {
 }
 
 model FxRate {
-  id           String   @id @default(cuid())
-  fromCurrency String   // always GBP (base)
-  toCurrency   String
-  rate         Decimal  @db.Decimal(18, 8) // 1 GBP = rate toCurrency
-  fetchedAt    DateTime @default(now())
+  id             String   @id @default(cuid())
+  fromCurrency   String   // always GBP (base)
+  toCurrency     String
+  rate           Decimal  @db.Decimal(18, 8) // 1 GBP = rate toCurrency
+  fetchedAt      DateTime @default(now())
+  /// Provenance of the rate. 'frankfurter' for ECB cron fetches, 'manual'
+  /// when an admin pins a rate via the Currencies settings page. Lets the
+  /// fetch loop skip override currencies and the UI badge them.
+  source         String   @default("frankfurter")
+  /// True when the row was inserted as a manual override. Stays true on the
+  /// row forever; "clearing" the override means inserting a newer, non-
+  /// override row that becomes the latest.
+  manualOverride Boolean  @default(false)
 
-  currency     Currency @relation(fields: [toCurrency], references: [code])
+  currency       Currency @relation(fields: [toCurrency], references: [code])
 
   @@index([toCurrency, fetchedAt])
   @@map("fx_rates")
+}
+
+/// Audit trail for outbound FX rate pushes from IMS to shopping connectors
+/// (currently WooCommerce via the onetwoInventory Helper plugin). One row
+/// per push attempt, success or failure. Surfaced on the Currencies
+/// settings page so admins can see when a push last succeeded and whether
+/// any errors occurred.
+model FxRatePushLog {
+  id           String   @id @default(cuid())
+  connector    String   // 'woocommerce' | future: 'shopify' | etc.
+  pushedAt     DateTime @default(now())
+  ratesCount   Int
+  status       String   // 'OK' | 'FAILED' | 'SKIPPED'
+  errorMessage String?
+
+  @@index([connector, pushedAt(sort: Desc)])
+  @@map("fx_rate_push_log")
 }
 
 // ---------------------------------------------------------------------------

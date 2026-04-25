@@ -185,7 +185,23 @@ export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; upd
 
     if (!currencies.length) return { success: true, updated: [], failed: [] }
 
-    const codes = currencies.map((c) => c.code)
+    // Skip currencies whose latest rate is a manual override — the admin has
+    // pinned that rate and doesn't want frankfurter to overwrite it. The
+    // override stays in effect until they explicitly insert a fresh non-
+    // override row via clearManualFxRate().
+    const allCodes = currencies.map((c) => c.code)
+    const overrideCodes = await getActiveOverrideCurrencies(allCodes)
+    const codes = allCodes.filter((c) => !overrideCodes.has(c))
+
+    if (!codes.length) {
+      await logActivity({
+        entityType: 'SYNC',
+        tag: 'sync',
+        action: 'fx_rates_fetched',
+        description: `FX fetch skipped — all ${allCodes.length} currencies have manual overrides`,
+      })
+      return { success: true, updated: [], failed: [] }
+    }
     const symbols = encodeURIComponent(codes.join(','))
 
     let res: Response | null = null
@@ -218,7 +234,7 @@ export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; upd
       const rate = rates[code]
       if (typeof rate === 'number' && rate > 0) {
         await db.fxRate.create({
-          data: { fromCurrency: baseCurrency, toCurrency: code, rate },
+          data: { fromCurrency: baseCurrency, toCurrency: code, rate, source: 'frankfurter' },
         })
         updated.push(code)
       } else {
@@ -242,6 +258,14 @@ export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; upd
         const { pushCurrentFxRatesToWc } = await import('@/lib/connectors/woocommerce/fx-rates')
         const pushResult = await pushCurrentFxRatesToWc()
         if (pushResult.supported && pushResult.errors.length) {
+          await db.fxRatePushLog.create({
+            data: {
+              connector: 'woocommerce',
+              ratesCount: pushResult.pushed,
+              status: 'FAILED',
+              errorMessage: pushResult.errors.join('; ').slice(0, 500),
+            },
+          })
           await logActivity({
             entityType: 'SYNC',
             tag: 'sync',
@@ -250,6 +274,9 @@ export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; upd
             description: `FX rate push to WooCommerce failed: ${pushResult.errors.join('; ').slice(0, 240)}`,
           })
         } else if (pushResult.supported) {
+          await db.fxRatePushLog.create({
+            data: { connector: 'woocommerce', ratesCount: pushResult.pushed, status: 'OK' },
+          })
           await db.setting.upsert({
             where: { key: 'last_wc_fx_push_at' },
             create: { key: 'last_wc_fx_push_at', value: new Date().toISOString() },
@@ -286,4 +313,151 @@ export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; upd
 export async function fetchAllFxRates(): Promise<{ success: boolean; updated: string[]; failed: string[]; error?: string }> {
   await requirePermission('settings.company')
   return fetchAllFxRatesInternal()
+}
+
+// ---------------------------------------------------------------------------
+// Manual overrides + push log (Phase 4 admin UI)
+// ---------------------------------------------------------------------------
+
+/**
+ * Of the given currency codes, return the set whose latest FxRate row is a
+ * manual override. The fetch loop calls this so it can skip those currencies
+ * without overwriting the admin-pinned rate.
+ */
+async function getActiveOverrideCurrencies(codes: string[]): Promise<Set<string>> {
+  if (!codes.length) return new Set()
+  // For each currency, take the latest row and check `manualOverride`. Done
+  // in SQL to avoid loading every historical row.
+  const rows = await db.$queryRaw<Array<{ toCurrency: string; manualOverride: boolean }>>`
+    SELECT DISTINCT ON ("toCurrency") "toCurrency", "manualOverride"
+    FROM "fx_rates"
+    WHERE "toCurrency" = ANY(${codes}::text[])
+    ORDER BY "toCurrency", "fetchedAt" DESC
+  `
+  return new Set(rows.filter((r) => r.manualOverride).map((r) => r.toCurrency))
+}
+
+export type FxRateRow = {
+  toCurrency: string
+  rate: number
+  fetchedAt: string
+  source: string
+  manualOverride: boolean
+}
+
+/** Latest rate per active non-base currency, with provenance flags. */
+export async function getLatestFxRates(): Promise<FxRateRow[]> {
+  await requireAuth()
+  const baseCurrency = await getBaseCurrencyCode()
+  const rows = await db.$queryRaw<Array<{ toCurrency: string; rate: string; fetchedAt: Date; source: string; manualOverride: boolean }>>`
+    SELECT DISTINCT ON ("toCurrency")
+      "toCurrency", "rate", "fetchedAt", "source", "manualOverride"
+    FROM "fx_rates"
+    WHERE "fromCurrency" = ${baseCurrency}
+    ORDER BY "toCurrency", "fetchedAt" DESC
+  `
+  return rows.map((r) => ({
+    toCurrency: r.toCurrency,
+    rate: Number(r.rate),
+    fetchedAt: r.fetchedAt.toISOString(),
+    source: r.source,
+    manualOverride: r.manualOverride,
+  }))
+}
+
+/**
+ * Pin a manual rate for a currency. Inserts a new FxRate row with
+ * `manualOverride=true`, which becomes the latest for that currency and is
+ * therefore picked up by every read site (PO/SO creation, Xero stamping,
+ * WC push). Stays in effect until cleared.
+ */
+export async function setManualFxRate(toCurrency: string, rate: number): Promise<{ success: boolean; error?: string }> {
+  await requirePermission('settings.company')
+  const code = toCurrency.trim().toUpperCase()
+  if (!code) return { success: false, error: 'Currency code required' }
+  if (!Number.isFinite(rate) || rate <= 0) return { success: false, error: 'Rate must be a positive number' }
+  const baseCurrency = await getBaseCurrencyCode()
+  if (code === baseCurrency) return { success: false, error: 'Cannot override the base currency' }
+
+  await db.fxRate.create({
+    data: {
+      fromCurrency: baseCurrency,
+      toCurrency: code,
+      rate,
+      source: 'manual',
+      manualOverride: true,
+    },
+  })
+  await logActivity({
+    entityType: 'SETTING',
+    tag: 'settings',
+    action: 'fx_rate_overridden',
+    description: `Manual FX rate set: 1 ${baseCurrency} = ${rate} ${code}`,
+  })
+  revalidatePath('/settings/accounting')
+  return { success: true }
+}
+
+/**
+ * Clear an override by re-fetching just this currency from frankfurter and
+ * inserting it as a non-override row. The new row becomes "latest", so the
+ * next fetch loop will treat the currency as normal again.
+ */
+export async function clearManualFxRate(toCurrency: string): Promise<{ success: boolean; error?: string }> {
+  await requirePermission('settings.company')
+  const code = toCurrency.trim().toUpperCase()
+  if (!code) return { success: false, error: 'Currency code required' }
+  const baseCurrency = await getBaseCurrencyCode()
+
+  let res: Response | null = null
+  try {
+    res = await fetch(
+      `https://api.frankfurter.dev/v1/latest?base=${encodeURIComponent(baseCurrency)}&symbols=${encodeURIComponent(code)}`,
+      { signal: AbortSignal.timeout(15000) },
+    )
+  } catch (e) {
+    return { success: false, error: `Failed to reach frankfurter.dev: ${String(e).slice(0, 200)}` }
+  }
+  if (!res.ok) return { success: false, error: `frankfurter.dev returned ${res.status}` }
+  const data = (await res.json().catch(() => ({}))) as { rates?: Record<string, number> }
+  const fresh = data.rates?.[code]
+  if (typeof fresh !== 'number' || fresh <= 0) {
+    return { success: false, error: `frankfurter.dev did not return a rate for ${code}` }
+  }
+  await db.fxRate.create({
+    data: { fromCurrency: baseCurrency, toCurrency: code, rate: fresh, source: 'frankfurter', manualOverride: false },
+  })
+  await logActivity({
+    entityType: 'SETTING',
+    tag: 'settings',
+    action: 'fx_rate_override_cleared',
+    description: `Cleared manual override for ${code}; new rate from frankfurter: 1 ${baseCurrency} = ${fresh} ${code}`,
+  })
+  revalidatePath('/settings/accounting')
+  return { success: true }
+}
+
+export type FxPushLogRow = {
+  id: string
+  connector: string
+  pushedAt: string
+  ratesCount: number
+  status: string
+  errorMessage: string | null
+}
+
+export async function getFxPushLog(limit = 20): Promise<FxPushLogRow[]> {
+  await requireAuth()
+  const rows = await db.fxRatePushLog.findMany({
+    orderBy: { pushedAt: 'desc' },
+    take: Math.min(Math.max(limit, 1), 100),
+  })
+  return rows.map((r) => ({
+    id: r.id,
+    connector: r.connector,
+    pushedAt: r.pushedAt.toISOString(),
+    ratesCount: r.ratesCount,
+    status: r.status,
+    errorMessage: r.errorMessage,
+  }))
 }

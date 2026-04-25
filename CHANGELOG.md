@@ -6,6 +6,14 @@ This repository uses an `x.y.z` release scheme.
 - Increment `y` for user-facing non-breaking changes.
 - Increment `z` for backend-only non-breaking changes that do not affect users directly.
 
+## 1.9.0 - 2026-04-25
+
+### Features (FX rates admin UI)
+
+- **New Settings → Accounting → FX Rates tab.** Shows the current rate per non-base currency with a source badge (ECB/frankfurter or Manual override) and the last-fetched timestamp. Admins can pin a manual rate per currency via a pencil icon — while pinned, the daily ECB fetch skips that currency so the override sticks. Click the undo icon to clear an override and re-fetch from frankfurter.
+- **Push log.** Same panel includes a recent-pushes table (one row per fan-out attempt to a shopping connector — currently WooCommerce). Backed by a new `FxRatePushLog` table; both the FX cron and the manual *Push Now* button record success/failure here. Replaces the activity-log-only history.
+- **Schema additions.** `FxRate` now carries `source` (`'frankfurter'` or `'manual'`) and `manualOverride` flags so the fetch loop can honour overrides without hard-coding rules. Migration `20260425100000_fx_rate_overrides_and_push_log` adds these plus the new `fx_rate_push_log` table.
+
 ## 1.8.0 - 2026-04-25
 
 ### Features (FX rate alignment with WooCommerce)
