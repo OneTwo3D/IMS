@@ -356,7 +356,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const TERMINAL_STATUSES = ['CANCELLED', 'REFUNDED']
     if (!TERMINAL_STATUSES.includes(imsStatus)) {
       const { autoAllocateOrder } = await import('@/app/actions/allocation')
-      await autoAllocateOrder(so.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
+      const allocation = await autoAllocateOrder(so.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
+      if (!allocation.success && allocation.error !== 'No stock available for allocation') {
+        throw new Error(`WooCommerce order imported but auto-allocation failed: ${allocation.error ?? 'Unknown error'}`)
+      }
     }
 
     // Queue accounting sales invoice — only for PROCESSING orders and when

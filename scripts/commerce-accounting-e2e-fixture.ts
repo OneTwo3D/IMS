@@ -956,40 +956,6 @@ async function seedWcFxCogsFlowScenario() {
     throw new Error(result.error ?? 'Failed to import WC FX COGS order')
   }
 
-  const allocationCount = await db.orderAllocation.count({
-    where: { orderId: result.orderId },
-  })
-  if (allocationCount === 0) {
-    const line = await db.salesOrderLine.findFirstOrThrow({
-      where: { orderId: result.orderId, productId: product.id },
-      select: { id: true },
-    })
-    await db.$transaction([
-      db.orderAllocation.create({
-        data: {
-          orderId: result.orderId,
-          lineId: line.id,
-          productId: product.id,
-          warehouseId: warehouse.id,
-          qty: productQty,
-        },
-      }),
-      db.stockLevel.update({
-        where: {
-          productId_warehouseId: {
-            productId: product.id,
-            warehouseId: warehouse.id,
-          },
-        },
-        data: { reservedQty: productQty },
-      }),
-      db.salesOrder.update({
-        where: { id: result.orderId },
-        data: { status: 'ALLOCATED' },
-      }),
-    ])
-  }
-
   const invoiceLog = await db.accountingSyncLog.findFirst({
     where: {
       connector: 'xero',

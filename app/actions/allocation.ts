@@ -25,6 +25,19 @@ import { consumeFifoLayersStrict, refreshSalesOrderLineCogs } from '@/lib/cost-l
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 const ALLOCATION_EPSILON = 0.000001
 
+function revalidateSalesAllocationPaths(orderId: string) {
+  try {
+    revalidatePath('/sales')
+    revalidatePath(`/sales/${orderId}`)
+  } catch (error) {
+    // Internal import/cron/test callers can execute this action outside a
+    // live Next request store. Allocation has already committed by here, so
+    // a cache-refresh failure must not be reported as an allocation failure.
+    if (String(error).includes('static generation store missing')) return
+    throw error
+  }
+}
+
 /**
  * If the daily batch A2 has already staged this order's allocations for
  * accounting (inventoryAllocatedDate is set), any subsequent allocation
@@ -164,11 +177,13 @@ async function applyAllocationReservationDelta(
     const qty = Number(row.qty)
     if (qty <= 0) continue
     if (direction === 'reserve') {
-      await tx.stockLevel.upsert({
-        where: { productId_warehouseId: { productId: row.productId, warehouseId: row.warehouseId } },
-        create: { productId: row.productId, warehouseId: row.warehouseId, quantity: 0, reservedQty: qty },
-        update: { reservedQty: { increment: qty } },
+      const updated = await tx.stockLevel.updateMany({
+        where: { productId: row.productId, warehouseId: row.warehouseId },
+        data: { reservedQty: { increment: qty } },
       })
+      if (updated.count === 0) {
+        throw new Error(`Cannot reserve stock for product ${row.productId} in warehouse ${row.warehouseId}: no stock level exists`)
+      }
       continue
     }
 
@@ -705,8 +720,7 @@ export async function autoAllocateOrder(
       return { success: false, error: 'Order has existing shipments; reallocation refused', syncProductIds: [] }
     }
 
-    revalidatePath('/sales')
-    revalidatePath(`/sales/${orderId}`)
+    revalidateSalesAllocationPaths(orderId)
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: orderId,
