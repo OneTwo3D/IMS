@@ -1,0 +1,78 @@
+title = "OneTwo3D IMS secret scanning"
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "committed-env-file"
+description = "Environment files must not be committed; keep only example templates in git."
+path = '''(^|/)\.env(\.[^/]+)?$'''
+regex = '''(?m).+'''
+tags = ["env", "secret"]
+
+[rules.allowlist]
+  description = "Tracked env templates contain placeholders only."
+  paths = [
+    '''^\.env\.example$''',
+    '''^scripts/[^/]+\.env\.example$''',
+  ]
+
+[[rules]]
+id = "committed-private-key-file"
+description = "Private key files must not be committed."
+path = '''(?i)(^|/).*(id_rsa|id_dsa|id_ecdsa|id_ed25519|private[-_]?key|\.pem|\.p12|\.pfx)$'''
+regex = '''(?m).+'''
+tags = ["key", "secret"]
+
+[rules.allowlist]
+  description = "UI placeholders and docs may mention private-key labels without containing a key file."
+  paths = [
+    '''^docs/.*\.md$''',
+    '''^help-docs/.*\.md$''',
+  ]
+
+[[rules]]
+id = "committed-service-account-file"
+description = "Service-account credential JSON files must not be committed."
+path = '''(?i)(^|/).*(service[-_]?account|credentials?|secrets?|tokens?).*\.json$'''
+regex = '''(?m).+'''
+tags = ["json", "secret"]
+
+[[rules]]
+id = "committed-credential-file"
+description = "Credential, token, and secret files must not be committed."
+path = '''(?i)(^|/).*(credentials?|secrets?|tokens?|\.npmrc|\.pypirc|netrc|kubeconfig)$'''
+regex = '''(?m).+'''
+tags = ["credential", "secret"]
+
+[rules.allowlist]
+  description = "Repository code may include secret-handling source files; this rule targets credential files, not implementation modules."
+  regexTarget = "line"
+  paths = [
+    '''^lib/.*\.ts$''',
+    '''^app/.*\.tsx?$''',
+    '''^components/.*\.tsx?$''',
+    '''^scripts/.*\.(?:ts|mjs|sh)$''',
+    '''^docs/.*\.md$''',
+    '''^help-docs/.*\.md$''',
+  ]
+  regexes = [
+    '''^legacy-peer-deps=true$''',
+  ]
+
+[allowlist]
+description = "Documented placeholders and deterministic local/E2E test credentials."
+regexTarget = "line"
+regexes = [
+  '''CHANGE_ME(?:_[A-Za-z0-9_-]+)?''',
+  '''ck_x{20,}''',
+  '''cs_x{20,}''',
+  '''your@email\.com''',
+  '''e2e-route-secret''',
+  '''e2e-static-ms-apikey''',
+  '''changeme123''',
+  '''WC_WEBHOOK_SECRET''',
+  '''BAD_SECRET''',
+  '''-----BEGIN OPENSSH PRIVATE KEY-----\\n\.\.\.\\n-----END OPENSSH PRIVATE KEY-----''',
+  '''-----BEGIN OPENSSH PRIVATE KEY-----&#10;\.\.\.&#10;-----END OPENSSH PRIVATE KEY-----''',
+]
