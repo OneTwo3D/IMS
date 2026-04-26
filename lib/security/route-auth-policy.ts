@@ -37,6 +37,10 @@ export const apiRouteAuthPolicy = {
     access: 'admin',
     reason: 'Accounting invariant report is restricted through requireApiAdmin.',
   },
+  '/api/admin/accounting/reconciliation': {
+    access: 'admin',
+    reason: 'Accounting reconciliation report is restricted through requireApiAdmin.',
+  },
   '/api/backup/create': {
     access: 'admin',
     reason: 'Backup creation is restricted through requireApiAdmin.',

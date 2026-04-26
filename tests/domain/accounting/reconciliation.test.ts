@@ -17,6 +17,7 @@ function cleanRows(): AccountingReconciliationRows {
       id: 'order-1',
       orderNumber: 'SO-1',
       externalOrderNumber: null,
+      status: 'SHIPPED',
       revenueDeferredDate: A1_DATE,
       inventoryAllocatedDate: A2_DATE,
     }],
@@ -257,7 +258,18 @@ test('accounting reconciliation row collection selects required datasets', async
   assert.ok(calls.accountingSyncLog)
   assert.ok(calls.accountingEvent)
   assert.deepEqual(
+    (calls.salesOrder as { where: { status: unknown } }).where.status,
+    { notIn: ['REFUNDED', 'CANCELLED'] },
+  )
+  assert.deepEqual(
     (calls.shipment as { where: unknown }).where,
     { shipmentJournalDate: { not: null } },
   )
+  assert.deepEqual(
+    (calls.salesOrderRefund as { where: { order: unknown }; take: number }).where.order,
+    { status: { notIn: ['REFUNDED', 'CANCELLED'] } },
+  )
+  assert.equal((calls.salesOrderRefund as { take: number }).take, 10000)
+  assert.equal((calls.accountingSyncLog as { take: number }).take, 10000)
+  assert.equal((calls.accountingEvent as { take: number }).take, 10000)
 })

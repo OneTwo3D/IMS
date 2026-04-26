@@ -28,6 +28,7 @@ type SourceOrderRow = {
   id: string
   orderNumber: string | null
   externalOrderNumber: string | null
+  status: string
   revenueDeferredDate: Date | string | null
   inventoryAllocatedDate: Date | string | null
 }
@@ -93,6 +94,10 @@ type AccountingReconciliationClient = {
     findMany(args: unknown): Promise<AccountingEventRow[]>
   }
 }
+
+const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
+const MAX_RECONCILIATION_ROWS = 10_000
+const TERMINAL_SALES_ORDER_STATUSES = ['REFUNDED', 'CANCELLED'] as const
 
 const MIRRORED_SYNC_TYPES = new Set([
   'DAILY_BATCH_REVENUE_DEFERRAL',
@@ -174,6 +179,12 @@ function buildSummary(findings: AccountingReconciliationFinding[]): AccountingRe
   )
 }
 
+function lookbackDate(days: number): Date {
+  const date = new Date()
+  date.setUTCDate(date.getUTCDate() - days)
+  return date
+}
+
 function addExpectedSourceEventFinding(
   findings: AccountingReconciliationFinding[],
   rows: AccountingReconciliationRows,
@@ -226,7 +237,7 @@ export function evaluateAccountingReconciliationRows(
         sourceEntityId,
         orderId: order.id,
         message: `Sales order ${label} has A1 revenue deferral but no mirrored accounting event`,
-        details: { revenueDeferredDate: order.revenueDeferredDate },
+        details: { status: order.status, revenueDeferredDate: order.revenueDeferredDate },
       })
     }
 
@@ -241,7 +252,7 @@ export function evaluateAccountingReconciliationRows(
         sourceEntityId,
         orderId: order.id,
         message: `Sales order ${label} has A2 inventory allocation but no mirrored accounting event`,
-        details: { inventoryAllocatedDate: order.inventoryAllocatedDate },
+        details: { status: order.status, inventoryAllocatedDate: order.inventoryAllocatedDate },
       })
     }
   }
@@ -391,10 +402,13 @@ export function evaluateAccountingReconciliationRows(
 
 export async function collectAccountingReconciliationRows(
   client: AccountingReconciliationClient = db as unknown as AccountingReconciliationClient,
+  options: { lookbackDays?: number } = {},
 ): Promise<AccountingReconciliationRows> {
+  const fromDate = lookbackDate(options.lookbackDays ?? DEFAULT_RECONCILIATION_LOOKBACK_DAYS)
   const [salesOrders, shipments, refunds, syncLogs, accountingEvents] = await Promise.all([
     client.salesOrder.findMany({
       where: {
+        status: { notIn: [...TERMINAL_SALES_ORDER_STATUSES] },
         OR: [
           { revenueDeferredDate: { not: null } },
           { inventoryAllocatedDate: { not: null } },
@@ -404,6 +418,7 @@ export async function collectAccountingReconciliationRows(
         id: true,
         orderNumber: true,
         externalOrderNumber: true,
+        status: true,
         revenueDeferredDate: true,
         inventoryAllocatedDate: true,
       },
@@ -417,6 +432,12 @@ export async function collectAccountingReconciliationRows(
       },
     }),
     client.salesOrderRefund.findMany({
+      where: {
+        refundedAt: { gte: fromDate },
+        order: { status: { notIn: [...TERMINAL_SALES_ORDER_STATUSES] } },
+      },
+      orderBy: { refundedAt: 'desc' },
+      take: MAX_RECONCILIATION_ROWS,
       select: {
         id: true,
         orderId: true,
@@ -425,6 +446,14 @@ export async function collectAccountingReconciliationRows(
       },
     }),
     client.accountingSyncLog.findMany({
+      where: {
+        OR: [
+          { status: { in: ['PENDING', 'PROCESSING'] } },
+          { status: { in: ['SYNCED', 'FAILED'] }, createdAt: { gte: fromDate } },
+        ],
+      },
+      orderBy: { createdAt: 'desc' },
+      take: MAX_RECONCILIATION_ROWS,
       select: {
         id: true,
         connector: true,
@@ -437,6 +466,14 @@ export async function collectAccountingReconciliationRows(
       },
     }),
     client.accountingEvent.findMany({
+      where: {
+        OR: [
+          { businessDate: { gte: fromDate } },
+          { status: { not: 'POSTED' } },
+        ],
+      },
+      orderBy: { businessDate: 'desc' },
+      take: MAX_RECONCILIATION_ROWS,
       select: {
         id: true,
         type: true,
@@ -456,9 +493,11 @@ export async function collectAccountingReconciliationRows(
 
 export async function runAccountingReconciliationReport(options: {
   client?: AccountingReconciliationClient
+  lookbackDays?: number
 } = {}): Promise<AccountingReconciliationReport> {
   const rows = await collectAccountingReconciliationRows(
     options.client ?? (db as unknown as AccountingReconciliationClient),
+    { lookbackDays: options.lookbackDays },
   )
   const findings = evaluateAccountingReconciliationRows(rows)
 
