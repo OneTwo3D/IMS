@@ -1222,6 +1222,7 @@ model SalesOrderRefund {
   totalBase        Decimal    @db.Decimal(18, 4)
   accountingRetryRequired Boolean @default(false) @map("accounting_retry_required")
   accountingWarning String?   @map("accounting_warning")
+  accountingRetrySyncs Json?  @map("accounting_retry_syncs")
   refundedAt      DateTime   @default(now())
   createdAt       DateTime   @default(now())
 

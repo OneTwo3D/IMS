@@ -42,6 +42,7 @@ type Refund = {
   returnWarehouseId: string | null
   accountingRetryRequired?: boolean
   accountingWarning?: string | null
+  accountingRetrySyncs?: unknown
 }
 
 type RefundLine = {
@@ -617,6 +618,72 @@ test('createSalesOrderRefund clears accounting deferral dates for full refunds',
   assert.equal(state.orders[0].status, 'REFUNDED')
   assert.equal(state.orders[0].revenueDeferredDate, null)
   assert.equal(state.orders[0].inventoryAllocatedDate, null)
+  assert.deepEqual(state.refunds[0].accountingRetrySyncs, result.success ? result.accountingSyncs : [])
+})
+
+test('retrySalesOrderRefundAccounting replays persisted syncs after full refund clears deferral dates', async () => {
+  const persistedSyncs = [{
+    type: 'COGS_REVERSAL' as const,
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    idempotencyKey: 'sales-order-refund:refund-1:cogs-reversal',
+    payload: {
+      date: '2026-01-03',
+      reference: 'COGS reversal: SO-1',
+      lines: [
+        { accountCode: '1200', description: 'COGS reversal: SO-1', debit: 20 },
+        { accountCode: '5000', description: 'COGS reversal: SO-1', credit: 20 },
+      ],
+    },
+  }]
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'REFUNDED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: 20,
+    }],
+    refunds: [{
+      id: 'refund-1',
+      orderId: 'order-1',
+      creditNoteNumber: 'CN-2026-00001',
+      externalRefundId: null,
+      reason: 'Full return',
+      totalForeign: 100,
+      totalBase: 100,
+      returnWarehouseId: null,
+      accountingRetryRequired: true,
+      accountingWarning: 'Previous accounting queueing failed',
+      accountingRetrySyncs: persistedSyncs,
+    }],
+    refundLines: [{
+      id: 'refund-line-1',
+      refundId: 'refund-1',
+      salesOrderLineId: 'line-1',
+      productId: 'product-1',
+      description: 'Product 1',
+      qty: 2,
+      unitPriceForeign: 50,
+      unitPriceBase: 50,
+      totalForeign: 100,
+      totalBase: 100,
+    }],
+  })
+
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-1',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.deepEqual(result.success ? result.accountingSyncs : [], persistedSyncs)
+  assert.equal(state.movements.length, 0)
 })
 
 test('applyReturnInboundStockTx returns existing movement rows without duplicating stock', async () => {

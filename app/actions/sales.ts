@@ -1283,6 +1283,17 @@ async function markRefundAccountingRetryRequired(
   })
 }
 
+async function clearRefundAccountingRetryState(refundId: string): Promise<void> {
+  await db.salesOrderRefund.update({
+    where: { id: refundId },
+    data: {
+      accountingRetryRequired: false,
+      accountingWarning: null,
+      accountingRetrySyncs: Prisma.DbNull,
+    },
+  })
+}
+
 async function queueRefundAccountingActions(input: {
   orderId: string
   refundId: string
@@ -1504,6 +1515,10 @@ export async function createRefund(
       })
     }
 
+    if (!accountingWarning) {
+      await clearRefundAccountingRetryState(refundResult.createdRefund.id)
+    }
+
     if (returnWarehouseId && refundResult.returnedRows.length > 0) {
       for (const row of refundResult.returnedRows) {
         await logActivity({
@@ -1592,6 +1607,7 @@ export async function retryRefundAccounting(
       data: {
         accountingRetryRequired: false,
         accountingWarning: null,
+        accountingRetrySyncs: Prisma.DbNull,
       },
     })
 

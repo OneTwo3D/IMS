@@ -962,6 +962,41 @@ function accountingWarningMessage(error: unknown): string {
   return `Refund was created, but accounting reversal staging failed: ${formatRefundAccountingError(error)}`
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+function parseRefundAccountingRetrySyncs(
+  value: Prisma.JsonValue | null | undefined,
+): RefundAccountingSyncRequest[] {
+  if (!Array.isArray(value)) return []
+
+  return value.flatMap((entry) => {
+    if (!isRecord(entry) || !isRecord(entry.payload)) return []
+    if (
+      typeof entry.type !== 'string' ||
+      typeof entry.referenceType !== 'string' ||
+      typeof entry.referenceId !== 'string'
+    ) {
+      return []
+    }
+    return [{
+      type: entry.type as AccountingSyncType,
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+      payload: entry.payload,
+      idempotencyKey: typeof entry.idempotencyKey === 'string' ? entry.idempotencyKey : undefined,
+    }]
+  })
+}
+
+function refundAccountingSyncsJson(
+  syncs: RefundAccountingSyncRequest[],
+): Prisma.InputJsonValue | typeof Prisma.DbNull {
+  if (syncs.length === 0) return Prisma.DbNull
+  return JSON.parse(JSON.stringify(syncs)) as Prisma.InputJsonValue
+}
+
 export async function createSalesOrderRefund(
   client: RefundServiceClient,
   input: {
@@ -1163,6 +1198,12 @@ export async function createSalesOrderRefund(
       })
       accountingSyncs = staged.accountingSyncs
       snapshotReturnRows = staged.snapshotReturnRows
+      await client.salesOrderRefund.update({
+        where: { id: txResult.createdRefund.id },
+        data: {
+          accountingRetrySyncs: refundAccountingSyncsJson(accountingSyncs),
+        },
+      })
     } catch (error) {
       accountingWarning = accountingWarningMessage(error)
       await client.salesOrderRefund.update({
@@ -1224,6 +1265,7 @@ export async function retrySalesOrderRefundAccounting(
       orderId: true,
       returnWarehouseId: true,
       accountingRetryRequired: true,
+      accountingRetrySyncs: true,
       order: {
         select: {
           id: true,
@@ -1252,6 +1294,17 @@ export async function retrySalesOrderRefundAccounting(
   if (!refund) return { success: false, error: 'Refund not found' }
   if (!refund.accountingRetryRequired) {
     return { success: false, error: 'No failed refund accounting action is pending for this refund' }
+  }
+  const persistedSyncs = parseRefundAccountingRetrySyncs(refund.accountingRetrySyncs)
+  if (persistedSyncs.length > 0) {
+    return {
+      success: true,
+      orderId: refund.orderId,
+      refundId: refund.id,
+      refundOrderRef: getSalesOrderReference(refund.order),
+      accountingSyncs: persistedSyncs,
+      returnedRows: [],
+    }
   }
   if (!refund.order.revenueDeferredDate) {
     return {
@@ -1302,6 +1355,12 @@ export async function retrySalesOrderRefundAccounting(
         })
       ))
     }
+    await client.salesOrderRefund.update({
+      where: { id: refund.id },
+      data: {
+        accountingRetrySyncs: refundAccountingSyncsJson(staged.accountingSyncs),
+      },
+    })
 
     return {
       success: true,
