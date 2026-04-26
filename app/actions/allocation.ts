@@ -1217,15 +1217,18 @@ async function reconcileOrderAfterShipment(
       .filter(Boolean)
       .join(', ')
 
-    // Only advance if order is not already in a terminal state
-    const currentOrder = await db.salesOrder.findUnique({
-      where: { id: shipment.orderId },
-      select: { status: true },
-    })
-    if (currentOrder && !['SHIPPED', 'COMPLETED', 'DELIVERED', 'REFUNDED', 'CANCELLED'].includes(currentOrder.status)) {
+    await db.$transaction(async (tx) => {
+      await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${shipment.orderId} FOR UPDATE`
+      const currentOrder = await tx.salesOrder.findUnique({
+        where: { id: shipment.orderId },
+        select: { status: true },
+      })
+      if (!currentOrder) return
+      if (['SHIPPED', 'COMPLETED', 'DELIVERED', 'REFUNDED', 'CANCELLED'].includes(currentOrder.status)) return
+
       const transition = validateSalesOrderStatusTransition(currentOrder.status, 'SHIPPED')
       if (!transition.success) throw new Error(transition.error)
-      await db.salesOrder.update({
+      await tx.salesOrder.update({
         where: { id: shipment.orderId },
         data: {
           status: 'SHIPPED',
@@ -1233,7 +1236,7 @@ async function reconcileOrderAfterShipment(
           trackingNumber: trackingNumbers || (extra?.trackingNumber ?? null),
         },
       })
-    }
+    }, STOCK_TX_OPTIONS)
 
     // Auto-generate invoice on ship if configured (idempotent — checks
     // if invoice already exists inside generateInvoiceNumber)

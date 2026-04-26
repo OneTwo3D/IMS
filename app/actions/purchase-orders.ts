@@ -20,7 +20,10 @@ import {
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
-import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
+import {
+  validateLinkedFreightReceiptStatus,
+  validatePurchaseOrderStatusTransition,
+} from '@/lib/domain/workflows/action-guards'
 import {
   buildRealisedFxJournal,
   computeRealisedFx,
@@ -1867,7 +1870,10 @@ export async function receivePurchaseOrder(
               select: { status: true, type: true },
             })
             if (!freightPo) throw new Error('Linked freight PO not found')
-            if (freightPo.type !== 'FREIGHT') {
+            if (freightPo.type === 'FREIGHT') {
+              const freightTransition = validateLinkedFreightReceiptStatus(freightPo.status)
+              if (!freightTransition.success) throw new Error(freightTransition.error)
+            } else {
               const freightTransition = validatePurchaseOrderStatusTransition(freightPo.status, 'RECEIVED')
               if (!freightTransition.success) throw new Error(freightTransition.error)
             }

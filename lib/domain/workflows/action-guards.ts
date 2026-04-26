@@ -62,7 +62,10 @@ export function validateSalesOrderStatusTransition(
 export function validateManualSalesOrderStatusTransition(
   from: string,
   to: string,
+  options: { bypass?: boolean } = {},
 ): WorkflowTransitionGuardResult {
+  if (options.bypass) return { success: true }
+
   if (to === 'PARTIALLY_REFUNDED' || to === 'REFUNDED') {
     return {
       success: false,
@@ -71,6 +74,29 @@ export function validateManualSalesOrderStatusTransition(
   }
 
   return validateSalesOrderStatusTransition(from, to)
+}
+
+export function validateRefundSalesOrderStatusUpdate(
+  from: string,
+  to: string,
+): WorkflowTransitionGuardResult {
+  if (from === to) return { success: true }
+  return validateSalesOrderStatusTransition(from, to)
+}
+
+export function validateLinkedFreightReceiptStatus(
+  status: string,
+): WorkflowTransitionGuardResult {
+  if (!isKnownStatus(PURCHASE_ORDER_STATUSES, status)) {
+    return { success: false, error: `Unknown current purchase order status: ${status}` }
+  }
+  if (['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED'].includes(status)) {
+    return { success: true }
+  }
+  return {
+    success: false,
+    error: `Cannot mark linked freight purchase order as received from ${status}`,
+  }
 }
 
 export function validateShipmentStatusTransition(

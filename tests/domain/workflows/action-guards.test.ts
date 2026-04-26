@@ -2,8 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  validateLinkedFreightReceiptStatus,
   validateManualSalesOrderStatusTransition,
   validatePurchaseOrderStatusTransition,
+  validateRefundSalesOrderStatusUpdate,
   validateRefundStatusTransition,
   validateSalesOrderStatusTransition,
   validateShipmentStatusTransition,
@@ -25,6 +27,7 @@ test('sales order action guard allows current aggregate ship flow and blocks dir
 
 test('manual sales order status guard routes refund states through refund workflow', () => {
   assert.deepEqual(validateManualSalesOrderStatusTransition('SHIPPED', 'COMPLETED'), { success: true })
+  assert.deepEqual(validateManualSalesOrderStatusTransition('DRAFT', 'REFUNDED', { bypass: true }), { success: true })
   assert.deepEqual(validateManualSalesOrderStatusTransition('SHIPPED', 'PARTIALLY_REFUNDED'), {
     success: false,
     error: 'Use the refund workflow to update refund status.',
@@ -32,6 +35,15 @@ test('manual sales order status guard routes refund states through refund workfl
   assert.deepEqual(validateManualSalesOrderStatusTransition('DRAFT', 'REFUNDED'), {
     success: false,
     error: 'Use the refund workflow to update refund status.',
+  })
+})
+
+test('refund sales order status guard permits repeated partial refunds without partial commits', () => {
+  assert.deepEqual(validateRefundSalesOrderStatusUpdate('SHIPPED', 'PARTIALLY_REFUNDED'), { success: true })
+  assert.deepEqual(validateRefundSalesOrderStatusUpdate('PARTIALLY_REFUNDED', 'PARTIALLY_REFUNDED'), { success: true })
+  assert.deepEqual(validateRefundSalesOrderStatusUpdate('REFUNDED', 'PARTIALLY_REFUNDED'), {
+    success: false,
+    error: 'Cannot transition sales order from REFUNDED to PARTIALLY_REFUNDED',
   })
 })
 
@@ -48,6 +60,19 @@ test('purchase order action guard blocks invalid receipt and closed transitions'
   assert.deepEqual(validatePurchaseOrderStatusTransition('DRAFT', 'RECEIVED'), {
     success: false,
     error: 'Cannot transition purchase order from DRAFT to RECEIVED',
+  })
+})
+
+test('linked freight receipt guard allows derived receipt from open freight states only', () => {
+  assert.deepEqual(validateLinkedFreightReceiptStatus('DRAFT'), { success: true })
+  assert.deepEqual(validateLinkedFreightReceiptStatus('RECEIVED'), { success: true })
+  assert.deepEqual(validateLinkedFreightReceiptStatus('CANCELLED'), {
+    success: false,
+    error: 'Cannot mark linked freight purchase order as received from CANCELLED',
+  })
+  assert.deepEqual(validateLinkedFreightReceiptStatus('CLOSED'), {
+    success: false,
+    error: 'Cannot mark linked freight purchase order as received from CLOSED',
   })
 })
 

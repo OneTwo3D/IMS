@@ -14,7 +14,7 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import {
   validateManualSalesOrderStatusTransition,
-  validateSalesOrderStatusTransition,
+  validateRefundSalesOrderStatusUpdate,
 } from '@/lib/domain/workflows/action-guards'
 import {
   buildRealisedFxJournal,
@@ -1424,7 +1424,9 @@ export async function applySalesOrderStatusTransition(
     })
     if (!so) return { success: false, error: 'Order not found' }
 
-    const transition = validateManualSalesOrderStatusTransition(so.status, targetStatus)
+    const transition = validateManualSalesOrderStatusTransition(so.status, targetStatus, {
+      bypass: bypassPermission,
+    })
     if (!transition.success) {
       return { success: false, error: transition.error }
     }
@@ -1750,8 +1752,8 @@ export async function createRefund(
       const totalRefundedNow = previouslyRefunded + totalBase
       const orderTotal = Number(so.totalBase)
       const newStatus = totalRefundedNow >= orderTotal * 0.999 ? 'REFUNDED' : 'PARTIALLY_REFUNDED'
-      const refundTransition = validateSalesOrderStatusTransition(so.status, newStatus)
-      if (!refundTransition.success) return { error: refundTransition.error }
+      const refundTransition = validateRefundSalesOrderStatusUpdate(so.status, newStatus)
+      if (!refundTransition.success) throw new Error(refundTransition.error)
       await tx.salesOrder.update({ where: { id: orderId }, data: { status: newStatus } })
 
       return { so, fxRate, createdRefund, createdRefundLines, previouslyRefunded, creditNoteNumber, newStatus }
