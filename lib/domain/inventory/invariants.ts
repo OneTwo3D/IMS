@@ -1,4 +1,6 @@
 import { db } from '@/lib/db'
+import { parseCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
+import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 
 export type InventoryInvariantSeverity = 'info' | 'warning' | 'critical'
 
@@ -21,8 +23,6 @@ export type InventoryInvariantReport = {
     critical: number
   }
 }
-
-type DecimalLike = number | string | { toString(): string } | null | undefined
 
 type ProductType = 'SIMPLE' | 'VARIABLE' | 'VARIANT' | 'KIT' | 'BOM' | 'NON_INVENTORY'
 
@@ -89,16 +89,14 @@ type InventoryInvariantClient = {
 }
 
 const DEFAULT_QUANTITY_TOLERANCE = 0.0001
+const FIFO_RECONCILIATION_EXCEPTION = 'Products without FIFO cost layers are excluded; FIFO cost-layer products are expected to reconcile within tolerance.'
 
-const STOCKABLE_PRODUCT_TYPES = new Set<ProductType>(['SIMPLE', 'VARIANT', 'BOM'])
+// KIT availability is derived from components, so KIT parents do not carry
+// their own FIFO cost layers or shipment COGS snapshots.
+const FIFO_COST_LAYER_PRODUCT_TYPES = new Set<ProductType>(['SIMPLE', 'VARIANT', 'BOM'])
 
-export function isStockableProductType(type: ProductType): boolean {
-  return STOCKABLE_PRODUCT_TYPES.has(type)
-}
-
-function toNumber(value: DecimalLike): number {
-  if (value == null) return 0
-  return typeof value === 'number' ? value : Number(value.toString())
+export function isFifoCostLayerProductType(type: ProductType): boolean {
+  return FIFO_COST_LAYER_PRODUCT_TYPES.has(type)
 }
 
 function isEffectivelyNegative(value: number, tolerance: number): boolean {
@@ -114,12 +112,7 @@ function quantityKey(productId: string, warehouseId: string): string {
 }
 
 function hasCostLayerSnapshot(value: unknown): boolean {
-  if (!Array.isArray(value)) return false
-  return value.some((entry) => {
-    if (!entry || typeof entry !== 'object') return false
-    const record = entry as { qty?: unknown; costLayerId?: unknown }
-    return typeof record.costLayerId === 'string' && toNumber(record.qty as DecimalLike) > 0
-  })
+  return parseCostLayerSnapshot(value).some((entry) => Number.isFinite(entry.qty) && entry.qty > 0)
 }
 
 function buildSummary(findings: InventoryInvariantFinding[]): InventoryInvariantReport['summary'] {
@@ -140,11 +133,16 @@ export function evaluateInventoryInvariantRows(
   const tolerance = options.quantityTolerance ?? DEFAULT_QUANTITY_TOLERANCE
   const findings: InventoryInvariantFinding[] = []
   const costLayerRemainingByStockKey = new Map<string, number>()
+  const costLayerStockKeyMetadata = new Map<string, {
+    productId: string
+    warehouseId: string
+    product: InventoryInvariantCostLayerRow['product']
+  }>()
   const stockLevelByStockKey = new Map<string, InventoryInvariantStockLevelRow>()
 
   for (const stockLevel of rows.stockLevels) {
-    const quantity = toNumber(stockLevel.quantity)
-    const reservedQty = toNumber(stockLevel.reservedQty)
+    const quantity = decimalToNumber(stockLevel.quantity)
+    const reservedQty = decimalToNumber(stockLevel.reservedQty)
     stockLevelByStockKey.set(quantityKey(stockLevel.productId, stockLevel.warehouseId), stockLevel)
 
     if (isEffectivelyNegative(quantity, tolerance)) {
@@ -178,7 +176,7 @@ export function evaluateInventoryInvariantRows(
     }
 
     if (
-      isStockableProductType(stockLevel.product.type) &&
+      isFifoCostLayerProductType(stockLevel.product.type) &&
       !stockLevel.product.oversellAllowed &&
       greaterThanWithTolerance(reservedQty, quantity, tolerance)
     ) {
@@ -200,13 +198,20 @@ export function evaluateInventoryInvariantRows(
   }
 
   for (const costLayer of rows.costLayers) {
-    const remainingQty = toNumber(costLayer.remainingQty)
-    const receivedQty = toNumber(costLayer.receivedQty)
+    const remainingQty = decimalToNumber(costLayer.remainingQty)
+    const receivedQty = decimalToNumber(costLayer.receivedQty)
     const key = quantityKey(costLayer.productId, costLayer.warehouseId)
     costLayerRemainingByStockKey.set(
       key,
       (costLayerRemainingByStockKey.get(key) ?? 0) + remainingQty,
     )
+    if (!costLayerStockKeyMetadata.has(key)) {
+      costLayerStockKeyMetadata.set(key, {
+        productId: costLayer.productId,
+        warehouseId: costLayer.warehouseId,
+        product: costLayer.product,
+      })
+    }
 
     if (isEffectivelyNegative(remainingQty, tolerance)) {
       findings.push({
@@ -241,9 +246,9 @@ export function evaluateInventoryInvariantRows(
   }
 
   for (const stockLevel of rows.stockLevels) {
-    if (!isStockableProductType(stockLevel.product.type)) continue
+    if (!isFifoCostLayerProductType(stockLevel.product.type)) continue
 
-    const quantity = toNumber(stockLevel.quantity)
+    const quantity = decimalToNumber(stockLevel.quantity)
     const remainingCostLayerQty = costLayerRemainingByStockKey.get(
       quantityKey(stockLevel.productId, stockLevel.warehouseId),
     ) ?? 0
@@ -262,41 +267,38 @@ export function evaluateInventoryInvariantRows(
           quantity,
           remainingCostLayerQty,
           delta: Math.round((quantity - remainingCostLayerQty) * 10000) / 10000,
-          exception: 'Non-stockable products are excluded; stockable products are expected to reconcile within tolerance.',
+          exception: FIFO_RECONCILIATION_EXCEPTION,
         },
       })
     }
   }
 
-  for (const costLayer of rows.costLayers) {
-    if (!isStockableProductType(costLayer.product.type)) continue
-
-    const key = quantityKey(costLayer.productId, costLayer.warehouseId)
+  for (const [key, remainingCostLayerQty] of costLayerRemainingByStockKey) {
+    const metadata = costLayerStockKeyMetadata.get(key)
+    if (!metadata || !isFifoCostLayerProductType(metadata.product.type)) continue
     if (stockLevelByStockKey.has(key)) continue
-
-    const remainingCostLayerQty = costLayerRemainingByStockKey.get(key) ?? 0
     if (Math.abs(remainingCostLayerQty) <= tolerance) continue
 
     findings.push({
       severity: 'warning',
       code: 'stock_cost_layer_quantity_mismatch',
-      productId: costLayer.productId,
-      warehouseId: costLayer.warehouseId,
-      message: `Remaining cost-layer quantity has no matching stock level for ${costLayer.product.sku}`,
+      productId: metadata.productId,
+      warehouseId: metadata.warehouseId,
+      message: `Remaining cost-layer quantity has no matching stock level for ${metadata.product.sku}`,
       details: {
-        sku: costLayer.product.sku,
-        productType: costLayer.product.type,
+        sku: metadata.product.sku,
+        productType: metadata.product.type,
         quantity: 0,
         remainingCostLayerQty,
         delta: Math.round((0 - remainingCostLayerQty) * 10000) / 10000,
-        exception: 'Non-stockable products are excluded; stockable products are expected to reconcile within tolerance.',
+        exception: FIFO_RECONCILIATION_EXCEPTION,
       },
     })
   }
 
   for (const shipmentLine of rows.shippedShipmentLines) {
-    if (!isStockableProductType(shipmentLine.product.type)) continue
-    if (toNumber(shipmentLine.qty) <= tolerance) continue
+    if (!isFifoCostLayerProductType(shipmentLine.product.type)) continue
+    if (decimalToNumber(shipmentLine.qty) <= tolerance) continue
     if (hasCostLayerSnapshot(shipmentLine.costLayerSnapshot)) continue
 
     findings.push({
@@ -311,7 +313,7 @@ export function evaluateInventoryInvariantRows(
         orderId: shipmentLine.shipment.orderId,
         lineId: shipmentLine.lineId,
         sku: shipmentLine.product.sku,
-        qty: toNumber(shipmentLine.qty),
+        qty: decimalToNumber(shipmentLine.qty),
       },
     })
   }
@@ -359,7 +361,12 @@ export async function collectInventoryInvariantRows(
     }),
     client.shipmentLine.findMany({
       where: {
-        shipment: { status: 'SHIPPED' },
+        shipment: {
+          status: 'SHIPPED',
+          order: {
+            status: { not: 'REFUNDED' },
+          },
+        },
       },
       select: {
         id: true,

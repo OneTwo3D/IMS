@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  collectInventoryInvariantRows,
   evaluateInventoryInvariantRows,
   type InventoryInvariantRows,
 } from '@/lib/domain/inventory/invariants'
@@ -238,6 +239,50 @@ test('remaining cost layers without matching stock levels are reported', () => {
   assert.equal(findings[0]?.warehouseId, 'warehouse-1')
 })
 
+test('remaining cost layers without matching stock levels are reported once per product warehouse', () => {
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [
+      {
+        id: 'orphan-layer-1',
+        productId: 'orphan-product',
+        warehouseId: 'warehouse-1',
+        receivedQty: 5,
+        remainingQty: 3,
+        product: {
+          id: 'orphan-product',
+          sku: 'ORPHAN',
+          type: 'SIMPLE',
+        },
+      },
+      {
+        id: 'orphan-layer-2',
+        productId: 'orphan-product',
+        warehouseId: 'warehouse-1',
+        receivedQty: 5,
+        remainingQty: 2,
+        product: {
+          id: 'orphan-product',
+          sku: 'ORPHAN',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    shippedShipmentLines: [],
+  })
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0]?.code, 'stock_cost_layer_quantity_mismatch')
+  assert.deepEqual(findings[0]?.details, {
+    sku: 'ORPHAN',
+    productType: 'SIMPLE',
+    quantity: 0,
+    remainingCostLayerQty: 5,
+    delta: -5,
+    exception: 'Products without FIFO cost layers are excluded; FIFO cost-layer products are expected to reconcile within tolerance.',
+  })
+})
+
 test('non-stockable products are excluded from cost-layer reconciliation', () => {
   const findings = evaluateInventoryInvariantRows({
     stockLevels: [
@@ -288,4 +333,74 @@ test('shipped stockable lines require COGS snapshots', () => {
   assert.ok(missingSnapshot)
   assert.equal(missingSnapshot.severity, 'critical')
   assert.equal(missingSnapshot.productId, 'product-1')
+})
+
+test('malformed COGS snapshots are treated as missing', () => {
+  const rows = cleanRows()
+  rows.shippedShipmentLines[0] = {
+    ...rows.shippedShipmentLines[0],
+    costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2 }],
+  }
+
+  const findings = evaluateInventoryInvariantRows(rows)
+  const missingSnapshot = findings.find((finding) => finding.code === 'shipped_line_missing_cogs_snapshot')
+
+  assert.ok(missingSnapshot)
+  assert.equal(missingSnapshot.productId, 'product-1')
+})
+
+test('inventory row collection excludes fully refunded orders from shipped COGS checks', async () => {
+  let shipmentLineArgs: unknown
+  const client = {
+    stockLevel: {
+      async findMany() {
+        return []
+      },
+    },
+    costLayer: {
+      async findMany() {
+        return []
+      },
+    },
+    shipmentLine: {
+      async findMany(args: unknown) {
+        shipmentLineArgs = args
+        return []
+      },
+    },
+  }
+
+  await collectInventoryInvariantRows(client)
+
+  assert.deepEqual(shipmentLineArgs, {
+    where: {
+      shipment: {
+        status: 'SHIPPED',
+        order: {
+          status: { not: 'REFUNDED' },
+        },
+      },
+    },
+    select: {
+      id: true,
+      shipmentId: true,
+      lineId: true,
+      productId: true,
+      qty: true,
+      costLayerSnapshot: true,
+      product: {
+        select: {
+          id: true,
+          sku: true,
+          type: true,
+        },
+      },
+      shipment: {
+        select: {
+          orderId: true,
+          warehouseId: true,
+        },
+      },
+    },
+  })
 })
