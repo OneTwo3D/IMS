@@ -6,7 +6,7 @@ import {
   reverseJournalLines,
   getUnrealisedFxAccounts,
   resolveSettlementFxRateToBase,
-  roundMoney,
+  roundAccountingMoney,
   type FxSettlementSide,
 } from '@/lib/accounting-fx'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -164,7 +164,7 @@ async function getOpenReceivables(baseCurrency: string): Promise<OpenBalance[]> 
     const paid = order.payments.reduce((sum, payment) => (
       payment.currency === order.currency ? sum + Number(payment.amount) : sum
     ), 0)
-    const outstandingForeign = roundMoney(Number(order.totalForeign) - paid)
+    const outstandingForeign = roundAccountingMoney(Number(order.totalForeign) - paid)
     if (outstandingForeign < 0.01) return []
     return [{
       id: order.id,
