@@ -182,6 +182,11 @@ export async function queueAccountingSyncTx(
   }
 
   try {
+    const [{ getBaseCurrencyCode }, { mirrorAccountingSyncLogToEvent }] = await Promise.all([
+      import('@/lib/base-currency'),
+      import('@/lib/domain/accounting/accounting-event-mirror'),
+    ])
+    const baseCurrency = await getBaseCurrencyCode()
     await tx.accountingSyncLog.create({
       data: {
         connector: context.connector,
@@ -191,6 +196,15 @@ export async function queueAccountingSyncTx(
         referenceId: params.referenceId,
         payload: payload as never,
       },
+    })
+    await mirrorAccountingSyncLogToEvent(tx, {
+      connector: context.connector,
+      type: params.type,
+      referenceType: params.referenceType,
+      referenceId: params.referenceId,
+      payload,
+      currency: baseCurrency,
+      status: 'PENDING',
     })
   } catch (error) {
     if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return
