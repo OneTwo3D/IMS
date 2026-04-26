@@ -600,7 +600,7 @@ async function stageRefundAccountingReversals(
       const linesPayload = (payload as { lines?: Array<{ accountCode?: string; debit?: number; credit?: number }> } | null)?.lines
       if (!Array.isArray(linesPayload)) return 0
       return linesPayload.reduce((sum, line) => (
-        line.accountCode === accountCode ? sum + Number(line.debit ?? 0) : sum
+        line.accountCode === accountCode ? sum + decimalToNumber(line.debit ?? 0) : sum
       ), 0)
     }
 
@@ -855,6 +855,16 @@ async function stageRefundAccountingReversals(
       (refundLayerSnapshots.get(line.id) ?? []).filter((entry) => entry.source === 'allocation')
     ))
 
+    if (params.newStatus === 'REFUNDED') {
+      await tx.salesOrder.update({
+        where: { id: params.orderId },
+        data: {
+          revenueDeferredDate: null,
+          inventoryAllocatedDate: null,
+        },
+      })
+    }
+
     return {
       cogsReversal: Math.round(sumCostLayerSnapshot(shipmentRefundSnapshot) * 100) / 100,
       unearnedReversal: Math.min(
@@ -913,17 +923,11 @@ async function stageRefundAccountingReversals(
     })
   }
 
-  if (params.newStatus === 'REFUNDED') {
-    await client.salesOrder.update({
-      where: { id: params.orderId },
-      data: {
-        revenueDeferredDate: null,
-        inventoryAllocatedDate: null,
-      },
-    })
-  }
-
   return { accountingSyncs, snapshotReturnRows }
+}
+
+function formatRefundAccountingError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 export async function createSalesOrderRefund(
@@ -1124,9 +1128,11 @@ export async function createSalesOrderRefund(
       })
       accountingSyncs = staged.accountingSyncs
       snapshotReturnRows = staged.snapshotReturnRows
-    } catch {
-      accountingSyncs = []
-      snapshotReturnRows = null
+    } catch (error) {
+      return {
+        success: false,
+        error: `Refund was created, but accounting reversal staging failed: ${formatRefundAccountingError(error)}`,
+      }
     }
   }
 

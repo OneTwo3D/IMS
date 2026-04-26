@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  applyReturnInboundStockTx,
   createSalesOrderRefund,
   type RefundServiceClient,
 } from '@/lib/domain/sales/refund-service'
@@ -277,6 +278,35 @@ test('createSalesOrderRefund creates a partial refund record', async () => {
   assert.equal(state.refundLines[0].unitPriceBase, 50)
 })
 
+test('createSalesOrderRefund converts refund totals from base to foreign currency', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 2,
+      totalBase: 100,
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: null,
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: null,
+    }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Customer return',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.refunds[0].totalForeign, 100)
+  assert.equal(state.refundLines[0].totalForeign, 100)
+  assert.equal(state.refundLines[0].unitPriceForeign, 100)
+})
+
 test('createSalesOrderRefund rejects stock returns before shipment', async () => {
   const state = baseState({
     orders: [{
@@ -348,6 +378,48 @@ test('createSalesOrderRefund rejects stock returns for packed shipments', async 
   })
   assert.equal(state.refunds.length, 0)
   assert.equal(state.movements.length, 0)
+})
+
+test('createSalesOrderRefund surfaces stale shipment cost snapshots without fallback stock returns', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: 2, costLayerSnapshot: [] }],
+    }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Customer return',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, false)
+  assert.match(result.success === false ? result.error : '', /accounting reversal staging failed/)
+  assert.match(result.success === false ? result.error : '', /Cannot reverse COGS/)
+  assert.equal(state.refunds.length, 1)
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.stockLevels.length, 0)
 })
 
 test('createSalesOrderRefund rejects refund quantities beyond remaining order quantity', async () => {
@@ -465,4 +537,68 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   assert.equal(state.stockLevels[0].quantity, 1)
   assert.equal(state.costLayers[1].unitCostBase, 10)
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
+})
+
+test('createSalesOrderRefund clears accounting deferral dates for full refunds', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Full return',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.orders[0].status, 'REFUNDED')
+  assert.equal(state.orders[0].revenueDeferredDate, null)
+  assert.equal(state.orders[0].inventoryAllocatedDate, null)
+})
+
+test('applyReturnInboundStockTx returns existing movement rows without duplicating stock', async () => {
+  const state = baseState({
+    movements: [{ productId: 'product-1', qty: 1, referenceType: 'SalesOrder', referenceId: 'order-1' }],
+  })
+
+  const rows = await applyReturnInboundStockTx(createClient(state) as Parameters<typeof applyReturnInboundStockTx>[0], {
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    warehouseId: 'warehouse-returns',
+    rows: [{ productId: 'product-1', qty: 1, unitCostBase: 10 }],
+    note: 'Refund return',
+  })
+
+  assert.deepEqual(rows, [{ productId: 'product-1', sku: 'PRODUCT-1', qty: 1 }])
+  assert.equal(state.movements.length, 1)
+  assert.equal(state.stockLevels.length, 0)
+  assert.equal(state.costLayers.length, 0)
 })
