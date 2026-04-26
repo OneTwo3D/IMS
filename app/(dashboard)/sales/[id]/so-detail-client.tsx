@@ -7,11 +7,12 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
 import {
-  updateSalesOrderStatus, createRefund, cloneSalesOrder, deleteSalesOrder,
+  updateSalesOrderStatus, createRefund, retryRefundAccounting, cloneSalesOrder, deleteSalesOrder,
   updateSalesOrderNotes, generateInvoiceNumber,
   addPayment, deletePayment,
   type SoDetail, type SoStatus,
@@ -102,9 +103,11 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
   const [returnWhId, setReturnWhId] = useState(warehouses[0]?.id ?? '')
   const [refundLines, setRefundLines] = useState(order.lines.map((l) => ({ ...l, qtyRefund: 0, refundAmount: 0 })))
   const [error, setError] = useState('')
+  const [warning, setWarning] = useState('')
   const totalRefund = refundLines.reduce((s, l) => s + l.refundAmount, 0)
   function handleConfirm() {
     setError('')
+    setWarning('')
     const toRefund = refundLines.filter((l) => l.qtyRefund > 0)
     if (!toRefund.length) { setError('Select at least one line'); return }
     if (!reason.trim()) { setError('Reason is required'); return }
@@ -117,7 +120,14 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
         totalForeign: l.refundAmount,
         totalBase: l.refundAmount / (order.fxRateToBase || 1),
       })), reason, returnWhId || undefined)
-      if (result.success) { router.refresh(); onClose() } else setError(result.error ?? 'Failed')
+      if (result.success) {
+        router.refresh()
+        if (result.warning) {
+          setWarning(result.warning)
+        } else {
+          onClose()
+        }
+      } else setError(result.error ?? 'Failed')
     })
   }
   return (
@@ -146,11 +156,19 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
           </TableRow>))}
         </TableBody></Table>
         <div className="flex justify-end text-sm font-medium">Total: {formatMoney(totalRefund, sym)}</div>
+        {warning && (
+          <Alert>
+            <AlertTriangle className="h-4 w-4" />
+            <AlertDescription>{warning}</AlertDescription>
+          </Alert>
+        )}
         {error && <p className="text-sm text-destructive">{error}</p>}
       </div>
       <DialogFooter>
-        <Button type="button" variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-        <Button type="button" onClick={handleConfirm} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Confirm Refund</Button>
+        <Button type="button" variant="outline" onClick={onClose} disabled={isPending}>{warning ? 'Close' : 'Cancel'}</Button>
+        {!warning && (
+          <Button type="button" onClick={handleConfirm} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Confirm Refund</Button>
+        )}
       </DialogFooter>
     </DialogContent></Dialog>
   )
@@ -837,6 +855,15 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     })
   }
 
+  function handleRetryRefundAccounting(refundId: string) {
+    setError('')
+    startTransition(async () => {
+      const result = await retryRefundAccounting(refundId)
+      if (result.success) router.refresh()
+      else setError(result.error ?? 'Failed to retry refund accounting')
+    })
+  }
+
   function toggleCol(col: OptCol) {
     setVisibleCols((prev) => { const n = new Set(prev); if (n.has(col)) n.delete(col); else n.add(col); return n })
   }
@@ -1318,9 +1345,17 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                 </div>
               )}
               {accountingAvailable && (
-                <Button variant="outline" size="sm" className="h-6 text-xs mt-1" onClick={() => setShowPayment({ refundId: r.id, creditNoteNumber: r.creditNoteNumber ?? undefined })}>
-                  <CreditCard className="h-3 w-3 mr-1" />Add Payment
-                </Button>
+                <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                  <Button variant="outline" size="sm" className="h-6 text-xs" onClick={() => setShowPayment({ refundId: r.id, creditNoteNumber: r.creditNoteNumber ?? undefined })}>
+                    <CreditCard className="h-3 w-3 mr-1" />Add Payment
+                  </Button>
+                  {r.accountingRetryRequired && (
+                    <Button variant="outline" size="sm" className="h-6 text-xs" onClick={() => handleRetryRefundAccounting(r.id)} disabled={isPending}>
+                      {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Undo2 className="h-3 w-3 mr-1" />}
+                      Retry Accounting
+                    </Button>
+                  )}
+                </div>
               )}
             </div>
           ))}</div>}

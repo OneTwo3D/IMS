@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
-import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
+import { queueAccountingSync, getAccountingSettings, type AccountingSettings } from '@/lib/accounting'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 import { isSellableProductStatus } from '@/lib/products/lifecycle'
@@ -12,6 +12,7 @@ import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { decimalToNumber } from '@/lib/decimal'
 import { validateManualSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   buildRealisedFxJournal,
@@ -22,6 +23,9 @@ import {
 import { toIsoCountryCode } from '@/lib/countries'
 import {
   createSalesOrderRefund,
+  retrySalesOrderRefundAccounting,
+  type CreatedRefundLine,
+  type RefundAccountingSyncRequest,
   type RefundRequestLine,
 } from '@/lib/domain/sales/refund-service'
 import { Prisma, type TaxCategory } from '@/app/generated/prisma/client'
@@ -118,6 +122,7 @@ export type SoDetail = SoRow & {
     reason: string | null
     totalForeign: number
     totalBase: number
+    accountingRetryRequired: boolean
     refundedAt: string
     payments: PaymentRow[]
     lines: {
@@ -541,6 +546,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
       refunds: {
         select: {
           id: true, creditNoteNumber: true, reason: true, totalForeign: true, totalBase: true, refundedAt: true,
+          accountingRetryRequired: true,
           lines: {
             select: { id: true, productId: true, description: true, qty: true, totalBase: true },
           },
@@ -570,6 +576,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
       reason: r.reason,
       totalForeign: Number(r.totalForeign),
       totalBase: Number(r.totalBase),
+      accountingRetryRequired: r.accountingRetryRequired,
       refundedAt: r.refundedAt.toISOString(),
       payments: (r.payments ?? []).map((p) => ({
         id: p.id, refundId: r.id, creditNoteNumber: r.creditNoteNumber,
@@ -1260,13 +1267,193 @@ export async function applySalesOrderStatusTransition(
   }
 }
 
+function formatRefundAccountingQueueError(error: unknown): string {
+  return `Refund was created, but accounting queueing failed: ${error instanceof Error ? error.message : String(error)}`
+}
+
+async function markRefundAccountingRetryRequired(
+  refundId: string,
+  warning: string,
+): Promise<void> {
+  await db.salesOrderRefund.update({
+    where: { id: refundId },
+    data: {
+      accountingRetryRequired: true,
+      accountingWarning: warning,
+    },
+  })
+}
+
+async function clearRefundAccountingRetryState(refundId: string): Promise<void> {
+  await db.salesOrderRefund.update({
+    where: { id: refundId },
+    data: {
+      accountingRetryRequired: false,
+      accountingWarning: null,
+      accountingRetrySyncs: Prisma.DbNull,
+    },
+  })
+}
+
+async function queueRefundAccountingActions(input: {
+  orderId: string
+  refundId: string
+  creditNoteNumber: string | null
+  refundFxRate: number
+  externalOrderNumber: string | null
+  lines: CreatedRefundLine[]
+  accountingSyncs: RefundAccountingSyncRequest[]
+  accountingSettings?: AccountingSettings
+}): Promise<void> {
+  const [settings, orderForCN, baseCurrency] = await Promise.all([
+    input.accountingSettings ? Promise.resolve(input.accountingSettings) : getAccountingSettings(),
+    db.salesOrder.findUnique({
+      where: { id: input.orderId },
+      select: {
+        customer: { select: { firstName: true, lastName: true, email: true } },
+        currency: true,
+        taxRateName: true,
+        lines: {
+          select: {
+            id: true,
+            taxRate: { select: { accountingTaxType: true } },
+          },
+        },
+      },
+    }),
+    getBaseCurrencyCode(),
+  ])
+  const cnContactName = orderForCN?.customer
+    ? `${orderForCN.customer.firstName} ${orderForCN.customer.lastName}`.trim()
+    : 'Walk-in Customer'
+  const cnTaxRate = orderForCN?.taxRateName
+    ? await db.taxRate.findFirst({
+        where: { name: orderForCN.taxRateName, active: true },
+        select: { accountingTaxType: true },
+      })
+    : null
+  const taxTypeBySalesLineId = new Map(
+    (orderForCN?.lines ?? []).map((line) => [line.id, line.taxRate?.accountingTaxType ?? undefined]),
+  )
+
+  await queueAccountingSync({
+    type: 'CREDIT_NOTE',
+    referenceType: 'SalesOrderRefund',
+    referenceId: input.refundId,
+    idempotencyKey: `sales-order-refund:${input.refundId}:credit-note`,
+    payload: {
+      creditNoteNumber: input.creditNoteNumber ?? undefined,
+      contactName: cnContactName,
+      contactEmail: orderForCN?.customer?.email ?? undefined,
+      date: new Date().toISOString().slice(0, 10),
+      currency: orderForCN?.currency ?? baseCurrency,
+      reference: input.externalOrderNumber ?? undefined,
+      lines: input.lines.map((line) => ({
+        description: line.description || 'Refund line',
+        quantity: line.qty > 0 ? line.qty : 1,
+        unitAmount: orderForCN?.currency === baseCurrency
+          ? (line.qty > 0 ? line.unitPriceBase : line.totalBase)
+          : (line.qty > 0 ? line.unitPriceForeign : line.totalForeign),
+        accountCode: line.lineKind === 'shipping'
+          ? (settings.shippingAccount || settings.salesAccount)
+          : settings.salesAccount,
+        taxType: (line.lineId ? taxTypeBySalesLineId.get(line.lineId) : undefined) ?? cnTaxRate?.accountingTaxType ?? undefined,
+      })),
+      lineAmountsIncludeTax: false,
+      currencyRateToBase: Number(input.refundFxRate) || undefined,
+    },
+  })
+
+  for (const sync of input.accountingSyncs) {
+    await queueAccountingSync(sync)
+  }
+}
+
+async function loadRefundAccountingQueueInput(
+  refundId: string,
+  accountingSyncs: RefundAccountingSyncRequest[],
+): Promise<Parameters<typeof queueRefundAccountingActions>[0]> {
+  const refund = await db.salesOrderRefund.findUnique({
+    where: { id: refundId },
+    select: {
+      id: true,
+      orderId: true,
+      creditNoteNumber: true,
+      order: {
+        select: {
+          fxRateToBase: true,
+          externalOrderNumber: true,
+        },
+      },
+      lines: {
+        select: {
+          id: true,
+          salesOrderLineId: true,
+          productId: true,
+          description: true,
+          qty: true,
+          unitPriceForeign: true,
+          unitPriceBase: true,
+          totalForeign: true,
+          totalBase: true,
+        },
+      },
+    },
+  })
+  if (!refund) throw new Error('Refund not found')
+
+  return {
+    orderId: refund.orderId,
+    refundId: refund.id,
+    creditNoteNumber: refund.creditNoteNumber,
+    refundFxRate: decimalToNumber(refund.order.fxRateToBase) || 1,
+    externalOrderNumber: refund.order.externalOrderNumber,
+    lines: refund.lines.map((line) => ({
+      id: line.id,
+      lineId: line.salesOrderLineId,
+      productId: line.productId,
+      description: line.description,
+      qty: decimalToNumber(line.qty),
+      unitPriceForeign: decimalToNumber(line.unitPriceForeign),
+      unitPriceBase: decimalToNumber(line.unitPriceBase),
+      totalForeign: decimalToNumber(line.totalForeign),
+      totalBase: decimalToNumber(line.totalBase),
+      lineKind: line.productId ? 'sale' : 'shipping',
+    })),
+    accountingSyncs,
+  }
+}
+
+async function loadRefundAuditContext(
+  refundId: string,
+): Promise<{ orderId: string; refundOrderRef: string } | null> {
+  const refund = await db.salesOrderRefund.findUnique({
+    where: { id: refundId },
+    select: {
+      orderId: true,
+      order: {
+        select: {
+          id: true,
+          externalOrderNumber: true,
+          orderNumber: true,
+        },
+      },
+    },
+  })
+  if (!refund) return null
+  return {
+    orderId: refund.orderId,
+    refundOrderRef: getSalesOrderReference(refund.order),
+  }
+}
+
 export async function createRefund(
   orderId: string,
   lines: RefundRequestLine[],
   reason: string,
   returnWarehouseId?: string,
   options?: { internalBypassToken?: symbol; externalRefundId?: number },
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; warning?: string }> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.refund')
@@ -1305,66 +1492,56 @@ export async function createRefund(
         reason,
       },
     })
-
-    try {
-      const [settings, orderForCN, baseCurrency] = await Promise.all([
-        getAccountingSettings(),
-        db.salesOrder.findUnique({
-          where: { id: orderId },
-          select: {
-            customer: { select: { firstName: true, lastName: true, email: true } },
-            currency: true,
-            taxRateName: true,
-            lines: {
-              select: {
-                id: true,
-                taxRate: { select: { accountingTaxType: true } },
-              },
-            },
-          },
-        }),
-        getBaseCurrencyCode(),
-      ])
-      const cnContactName = orderForCN?.customer
-        ? `${orderForCN.customer.firstName} ${orderForCN.customer.lastName}`.trim()
-        : 'Walk-in Customer'
-      const cnTaxRate = orderForCN?.taxRateName
-        ? await db.taxRate.findFirst({ where: { name: orderForCN.taxRateName, active: true }, select: { accountingTaxType: true } })
-        : null
-      const taxTypeBySalesLineId = new Map(
-        (orderForCN?.lines ?? []).map((line) => [line.id, line.taxRate?.accountingTaxType ?? undefined]),
-      )
-      await queueAccountingSync({
-        type: 'CREDIT_NOTE',
-        referenceType: 'SalesOrderRefund',
-        referenceId: refundResult.createdRefund.id,
-        payload: {
+    if (refundResult.accountingWarning) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'refund_accounting_warning',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: refundResult.accountingWarning,
+        metadata: {
+          orderNumber: refundResult.refundOrderRef,
+          refundId: refundResult.createdRefund.id,
           creditNoteNumber: refundResult.creditNoteNumber,
-          contactName: cnContactName,
-          contactEmail: orderForCN?.customer?.email ?? undefined,
-          date: new Date().toISOString().slice(0, 10),
-          currency: orderForCN?.currency ?? baseCurrency,
-          reference: refundResult.so.externalOrderNumber ?? undefined,
-          lines: refundResult.createdRefundLines.map((line) => ({
-            description: line.description || 'Refund line',
-            quantity: line.qty > 0 ? line.qty : 1,
-            unitAmount: orderForCN?.currency === baseCurrency
-              ? (line.qty > 0 ? line.unitPriceBase : line.totalBase)
-              : (line.qty > 0 ? line.unitPriceForeign : line.totalForeign),
-            accountCode: line.lineKind === 'shipping'
-              ? (settings.shippingAccount || settings.salesAccount)
-              : settings.salesAccount,
-            taxType: (line.lineId ? taxTypeBySalesLineId.get(line.lineId) : undefined) ?? cnTaxRate?.accountingTaxType ?? undefined,
-          })),
-          lineAmountsIncludeTax: false,
-          currencyRateToBase: Number(refundResult.refundFxRate) || undefined,
         },
       })
+    }
 
-      for (const sync of refundResult.accountingSyncs) {
-        await queueAccountingSync(sync)
-      }
-    } catch { /* Accounting queue errors should never block the main flow */ }
+    let accountingWarning = refundResult.accountingWarning
+    try {
+      await queueRefundAccountingActions({
+        orderId,
+        refundId: refundResult.createdRefund.id,
+        creditNoteNumber: refundResult.creditNoteNumber,
+        refundFxRate: refundResult.refundFxRate,
+        externalOrderNumber: refundResult.so.externalOrderNumber,
+        lines: refundResult.createdRefundLines,
+        accountingSyncs: refundResult.accountingSyncs,
+        accountingSettings: accountingSettings ?? undefined,
+      })
+    } catch (queueError) {
+      const queueWarning = formatRefundAccountingQueueError(queueError)
+      accountingWarning = accountingWarning ? `${accountingWarning}; ${queueWarning}` : queueWarning
+      await markRefundAccountingRetryRequired(refundResult.createdRefund.id, accountingWarning)
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'refund_accounting_warning',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: queueWarning,
+        metadata: {
+          orderNumber: refundResult.refundOrderRef,
+          refundId: refundResult.createdRefund.id,
+          creditNoteNumber: refundResult.creditNoteNumber,
+        },
+      })
+    }
+
+    if (!accountingWarning) {
+      await clearRefundAccountingRetryState(refundResult.createdRefund.id)
+    }
 
     if (returnWarehouseId && refundResult.returnedRows.length > 0) {
       for (const row of refundResult.returnedRows) {
@@ -1397,7 +1574,7 @@ export async function createRefund(
       }
     }
 
-    return { success: true }
+    return { success: true, warning: accountingWarning }
   } catch (e) {
     if (
       options?.externalRefundId &&
@@ -1416,6 +1593,115 @@ export async function createRefund(
       level: 'ERROR',
       description: `Failed to create refund: ${String(e)}`,
       metadata: null,
+    })
+    return { success: false, error: String(e) }
+  }
+}
+
+export async function retryRefundAccounting(
+  refundId: string,
+): Promise<{ success: boolean; error?: string }> {
+  await requirePermission('sales.refund')
+
+  try {
+    const accountingSettings = await getAccountingSettings()
+    const result = await retrySalesOrderRefundAccounting(db, {
+      refundId,
+      accountingSettings,
+    })
+    if (!result.success) {
+      const auditContext = await loadRefundAuditContext(refundId)
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: auditContext?.orderId ?? refundId,
+        action: 'refund_accounting_retry_failed',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: result.error,
+        metadata: { refundId, orderNumber: auditContext?.refundOrderRef },
+      })
+      return result
+    }
+
+    await queueRefundAccountingActions({
+      ...await loadRefundAccountingQueueInput(result.refundId, result.accountingSyncs),
+      accountingSettings,
+    })
+
+    await db.salesOrderRefund.update({
+      where: { id: result.refundId },
+      data: {
+        accountingRetryRequired: false,
+        accountingWarning: null,
+        accountingRetrySyncs: Prisma.DbNull,
+      },
+    })
+
+    for (const row of result.returnedRows) {
+      await logActivity({
+        entityType: 'STOCK_ADJUSTMENT',
+        entityId: row.productId,
+        action: 'return_inbound',
+        tag: 'stock',
+        level: 'INFO',
+        description: `Returned ${row.qty} units of SKU ${row.sku} for accounting retry on refund ${refundId}`,
+        metadata: { productId: row.productId, qty: row.qty, orderNumber: result.refundOrderRef, refundId },
+      })
+    }
+
+    if (result.returnedRows.length > 0) {
+      const uniqueReturnedIds = [...new Set(result.returnedRows.map((row) => row.productId))]
+      try {
+        const { allocateBackordersForProducts } = await import('@/lib/fulfillment/backorder-allocator')
+        await allocateBackordersForProducts(uniqueReturnedIds, {
+          source: 'customer_return',
+          referenceId: result.orderId,
+          referenceLabel: `customer return accounting retry on order ${result.refundOrderRef}`,
+        })
+      } catch (allocError) {
+        console.error(allocError)
+      }
+      try {
+        await enqueueStockSync(uniqueReturnedIds, 'IMS_CHANGE')
+      } catch (syncError) {
+        console.error(syncError)
+      }
+    }
+
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: result.orderId,
+      action: 'refund_accounting_retried',
+      tag: 'accounting',
+      level: 'INFO',
+      description: `Retried refund accounting for order ${result.refundOrderRef}`,
+      metadata: {
+        refundId,
+        accountingSyncCount: result.accountingSyncs.length + 1,
+        returnedRows: result.returnedRows,
+      },
+    })
+
+    revalidatePath('/sales')
+    revalidatePath(`/sales/${result.orderId}`)
+    return { success: true }
+  } catch (e) {
+    const auditContext = await loadRefundAuditContext(refundId).catch(() => null)
+    await db.salesOrderRefund.update({
+      where: { id: refundId },
+      data: {
+        accountingRetryRequired: true,
+        accountingWarning: String(e),
+      },
+    }).catch(() => undefined)
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: auditContext?.orderId ?? refundId,
+      action: 'refund_accounting_retry_failed',
+      tag: 'accounting',
+      level: 'ERROR',
+      description: `Failed to retry refund accounting: ${String(e)}`,
+      metadata: { refundId, orderNumber: auditContext?.refundOrderRef },
     })
     return { success: false, error: String(e) }
   }
