@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   buildMirroredAccountingEventDraft,
   isMirrorableAccountingSyncType,
+  resetMirroredAccountingEventsToPending,
   updateMirroredAccountingEventStatus,
 } from '@/lib/domain/accounting/accounting-event-mirror'
 
@@ -218,5 +219,76 @@ test('terminal sync failure updates mirrored refund reversal event to failed', a
         externalId: null,
       },
     },
+  }])
+})
+
+test('failed daily batch mirror reset moves matching events back to pending', async () => {
+  const findManyArgs: unknown[] = []
+  const updateManyArgs: unknown[] = []
+  const createManyArgs: unknown[] = []
+  const client = {
+    accountingEvent: {
+      findMany: async (args: unknown) => {
+        findManyArgs.push(args)
+        return [{
+          id: 'event-1',
+          type: 'DAILY_BATCH_REVENUE_DEFERRAL',
+          sourceEntityType: 'DailyBatch',
+          sourceEntityId: 'A1-2026-04-26',
+        }]
+      },
+      updateMany: async (args: unknown) => {
+        updateManyArgs.push(args)
+        return { count: 1 }
+      },
+    },
+    accountingEventLog: {
+      createMany: async (args: unknown) => {
+        createManyArgs.push(args)
+        return { count: 1 }
+      },
+    },
+  }
+
+  await resetMirroredAccountingEventsToPending(client as never, {
+    connector: 'xero',
+    types: ['DAILY_BATCH_REVENUE_DEFERRAL', 'CREDIT_NOTE'],
+    referenceType: 'DailyBatch',
+    referenceIds: ['A1-2026-04-26', 'A1-2026-04-26', ''],
+  })
+
+  assert.deepEqual(findManyArgs, [{
+    where: {
+      externalSystem: 'xero',
+      type: { in: ['DAILY_BATCH_REVENUE_DEFERRAL'] },
+      sourceEntityType: 'DailyBatch',
+      sourceEntityId: { in: ['A1-2026-04-26'] },
+      status: 'FAILED',
+    },
+    select: {
+      id: true,
+      type: true,
+      sourceEntityType: true,
+      sourceEntityId: true,
+    },
+  }])
+  assert.deepEqual(updateManyArgs, [{
+    where: { id: { in: ['event-1'] } },
+    data: {
+      status: 'PENDING',
+      externalId: null,
+    },
+  }])
+  assert.deepEqual(createManyArgs, [{
+    data: [{
+      accountingEventId: 'event-1',
+      action: 'reset_from_sync_log',
+      metadata: {
+        connector: 'xero',
+        syncType: 'DAILY_BATCH_REVENUE_DEFERRAL',
+        referenceType: 'DailyBatch',
+        referenceId: 'A1-2026-04-26',
+      },
+    }],
   }])
 })

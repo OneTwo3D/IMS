@@ -61,24 +61,26 @@ export async function queueQuickBooksSync(params: {
 
   try {
     const baseCurrency = await getBaseCurrencyCode()
-    await db.accountingSyncLog.create({
-      data: {
+    await db.$transaction(async (tx) => {
+      await tx.accountingSyncLog.create({
+        data: {
+          connector: 'quickbooks',
+          type: params.type,
+          status: 'PENDING',
+          referenceType: params.referenceType,
+          referenceId: params.referenceId,
+          payload: payload as never,
+        },
+      })
+      await mirrorAccountingSyncLogToEvent(tx, {
         connector: 'quickbooks',
         type: params.type,
-        status: 'PENDING',
         referenceType: params.referenceType,
         referenceId: params.referenceId,
-        payload: payload as never,
-      },
-    })
-    await mirrorAccountingSyncLogToEvent(db, {
-      connector: 'quickbooks',
-      type: params.type,
-      referenceType: params.referenceType,
-      referenceId: params.referenceId,
-      payload,
-      currency: baseCurrency,
-      status: 'PENDING',
+        payload,
+        currency: baseCurrency,
+        status: 'PENDING',
+      })
     })
   } catch (error) {
     if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return

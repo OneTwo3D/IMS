@@ -19,7 +19,10 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { getQuickBooksSettings } from '@/lib/connectors/quickbooks/settings'
 import { normalizeOrderDiscountBase } from '@/lib/sales-currency'
 import { Prisma } from '@/app/generated/prisma/client'
-import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
+import {
+  mirrorAccountingSyncLogToEvent,
+  resetMirroredAccountingEventsToPending,
+} from '@/lib/domain/accounting/accounting-event-mirror'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
@@ -49,6 +52,11 @@ type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog'
 
 const QBO_DAILY_BATCH_LOCK_KEY = 4_112_208_032
 const QBO_CONNECTOR = 'quickbooks'
+const DAILY_BATCH_TYPES = [
+  'DAILY_BATCH_REVENUE_DEFERRAL',
+  'DAILY_BATCH_INVENTORY_ALLOC',
+  'DAILY_BATCH_GROUP_B',
+] as const
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100
@@ -216,22 +224,40 @@ async function lockCostLayers(
 }
 
 async function resetFailedDailyBatchLogs(): Promise<void> {
-  await db.accountingSyncLog.updateMany({
-    where: {
+  await db.$transaction(async (tx) => {
+    const failedLogs = await tx.accountingSyncLog.findMany({
+      where: {
+        connector: QBO_CONNECTOR,
+        type: { in: [...DAILY_BATCH_TYPES] },
+        status: 'FAILED',
+      },
+      select: { referenceId: true },
+    })
+
+    await tx.accountingSyncLog.updateMany({
+      where: {
+        connector: QBO_CONNECTOR,
+        type: { in: [...DAILY_BATCH_TYPES] },
+        status: 'FAILED',
+      },
+      data: {
+        status: 'PENDING',
+        retryCount: 0,
+        errorMessage: null,
+        processingStartedAt: null,
+      },
+    })
+
+    await resetMirroredAccountingEventsToPending(tx, {
       connector: QBO_CONNECTOR,
-      type: { in: ['DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B'] },
-      status: 'FAILED',
-    },
-    data: {
-      status: 'PENDING',
-      retryCount: 0,
-      errorMessage: null,
-      processingStartedAt: null,
-    },
+      types: [...DAILY_BATCH_TYPES],
+      referenceType: 'DailyBatch',
+      referenceIds: failedLogs.map((log) => log.referenceId),
+    })
   })
 }
 
-type DailyBatchLogType = 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B'
+type DailyBatchLogType = typeof DAILY_BATCH_TYPES[number]
 
 async function hasLiveDailyBatchLog(type: DailyBatchLogType, referenceId: string): Promise<boolean> {
   const count = await db.accountingSyncLog.count({

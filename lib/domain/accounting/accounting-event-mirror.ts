@@ -225,3 +225,55 @@ export async function updateMirroredAccountingEventStatus(
     }) as never,
   })
 }
+
+export async function resetMirroredAccountingEventsToPending(
+  client: AccountingEventMirrorClient,
+  params: {
+    connector: string
+    types: string[]
+    referenceType: string
+    referenceIds: string[]
+  },
+): Promise<void> {
+  const types = params.types.filter(isMirrorableAccountingSyncType)
+  const referenceIds = Array.from(new Set(params.referenceIds.filter((referenceId) => referenceId.trim())))
+  if (types.length === 0 || referenceIds.length === 0) return
+
+  const events = await client.accountingEvent.findMany({
+    where: {
+      externalSystem: params.connector,
+      type: { in: types },
+      sourceEntityType: params.referenceType,
+      sourceEntityId: { in: referenceIds },
+      status: 'FAILED',
+    },
+    select: {
+      id: true,
+      type: true,
+      sourceEntityType: true,
+      sourceEntityId: true,
+    },
+  })
+  if (events.length === 0) return
+
+  await client.accountingEvent.updateMany({
+    where: { id: { in: events.map((event) => event.id) } },
+    data: {
+      status: 'PENDING',
+      externalId: null,
+    },
+  })
+
+  await client.accountingEventLog.createMany({
+    data: events.map((event) => buildAccountingEventLog({
+      accountingEventId: event.id,
+      action: 'reset_from_sync_log',
+      metadata: {
+        connector: params.connector,
+        syncType: event.type,
+        referenceType: event.sourceEntityType,
+        referenceId: event.sourceEntityId,
+      },
+    }) as never),
+  })
+}
