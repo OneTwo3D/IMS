@@ -15,9 +15,14 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { getXeroSettings } from '@/lib/connectors/xero/settings'
 import { normalizeOrderDiscountBase } from '@/lib/sales-currency'
 import { Prisma } from '@/app/generated/prisma/client'
+import {
+  mirrorAccountingSyncLogToEvent,
+  resetMirroredAccountingEventsToPending,
+} from '@/lib/domain/accounting/accounting-event-mirror'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
@@ -43,9 +48,15 @@ type JournalLinePayload = {
   debit?: number
   credit?: number
 }
+type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog'>
 
 const XERO_DAILY_BATCH_LOCK_KEY = 4_112_208_031
 const XERO_CONNECTOR = 'xero'
+const DAILY_BATCH_TYPES = [
+  'DAILY_BATCH_REVENUE_DEFERRAL',
+  'DAILY_BATCH_INVENTORY_ALLOC',
+  'DAILY_BATCH_GROUP_B',
+] as const
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100
@@ -173,11 +184,12 @@ function consumeSnapshotLayers(
 }
 
 async function createPendingSyncLog(
-  tx: Prisma.TransactionClient,
+  tx: AccountingMirrorClient,
   params: {
     type: 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B'
     referenceId: string
     payload: Record<string, unknown>
+    currency: string
   },
 ): Promise<void> {
   await tx.accountingSyncLog.create({
@@ -189,6 +201,15 @@ async function createPendingSyncLog(
       referenceId: params.referenceId,
       payload: params.payload as never,
     },
+  })
+  await mirrorAccountingSyncLogToEvent(tx, {
+    connector: XERO_CONNECTOR,
+    type: params.type,
+    referenceType: 'DailyBatch',
+    referenceId: params.referenceId,
+    payload: params.payload,
+    currency: params.currency,
+    status: 'PENDING',
   })
 }
 
@@ -203,22 +224,40 @@ async function lockCostLayers(
 }
 
 async function resetFailedDailyBatchLogs(): Promise<void> {
-  await db.accountingSyncLog.updateMany({
-    where: {
+  await db.$transaction(async (tx) => {
+    const failedLogs = await tx.accountingSyncLog.findMany({
+      where: {
+        connector: XERO_CONNECTOR,
+        type: { in: [...DAILY_BATCH_TYPES] },
+        status: 'FAILED',
+      },
+      select: { referenceId: true },
+    })
+
+    await tx.accountingSyncLog.updateMany({
+      where: {
+        connector: XERO_CONNECTOR,
+        type: { in: [...DAILY_BATCH_TYPES] },
+        status: 'FAILED',
+      },
+      data: {
+        status: 'PENDING',
+        retryCount: 0,
+        errorMessage: null,
+        processingStartedAt: null,
+      },
+    })
+
+    await resetMirroredAccountingEventsToPending(tx, {
       connector: XERO_CONNECTOR,
-      type: { in: ['DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B'] },
-      status: 'FAILED',
-    },
-    data: {
-      status: 'PENDING',
-      retryCount: 0,
-      errorMessage: null,
-      processingStartedAt: null,
-    },
+      types: [...DAILY_BATCH_TYPES],
+      referenceType: 'DailyBatch',
+      referenceIds: failedLogs.map((log) => log.referenceId),
+    })
   })
 }
 
-type DailyBatchLogType = 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B'
+type DailyBatchLogType = typeof DAILY_BATCH_TYPES[number]
 
 async function hasLiveDailyBatchLog(type: DailyBatchLogType, referenceId: string): Promise<boolean> {
   const count = await db.accountingSyncLog.count({
@@ -232,7 +271,7 @@ async function hasLiveDailyBatchLog(type: DailyBatchLogType, referenceId: string
   return count > 0
 }
 
-async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof getXeroSettings>>): Promise<void> {
+async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof getXeroSettings>>, baseCurrency: string): Promise<void> {
   const orphanA1Orders = await db.salesOrder.findMany({
     where: { revenueDeferredDate: { not: null } },
     select: { revenueDeferredDate: true, unearnedRevenueAmount: true },
@@ -283,13 +322,11 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
   for (const [date, summary] of a1ByDate) {
     const referenceId = `A1-${date}`
     if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_REVENUE_DEFERRAL', referenceId)) continue
-    await db.accountingSyncLog.create({
-      data: {
-        connector: XERO_CONNECTOR,
+    await db.$transaction(async (tx) => {
+      await createPendingSyncLog(tx, {
         type: 'DAILY_BATCH_REVENUE_DEFERRAL',
-        status: 'PENDING',
-        referenceType: 'DailyBatch',
         referenceId,
+        currency: baseCurrency,
         payload: {
           date,
           reference: `Revenue Deferral ${date}`,
@@ -300,21 +337,19 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
           ],
           _postingMode: 'submitted',
           _recreatedFromStage: true,
-        } as never,
-      },
+        },
+      })
     })
   }
 
   for (const [date, summary] of a2ByDate) {
     const referenceId = `A2-${date}`
     if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_INVENTORY_ALLOC', referenceId)) continue
-    await db.accountingSyncLog.create({
-      data: {
-        connector: XERO_CONNECTOR,
+    await db.$transaction(async (tx) => {
+      await createPendingSyncLog(tx, {
         type: 'DAILY_BATCH_INVENTORY_ALLOC',
-        status: 'PENDING',
-        referenceType: 'DailyBatch',
         referenceId,
+        currency: baseCurrency,
         payload: {
           date,
           reference: `Inventory Allocation ${date}`,
@@ -325,8 +360,8 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
           ],
           _postingMode: 'submitted',
           _recreatedFromStage: true,
-        } as never,
-      },
+        },
+      })
     })
   }
 
@@ -346,13 +381,11 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
         { accountCode: settings.xero_allocated_inventory_account, description: `COGS — ${summary.shipmentCount} shipment(s)`, credit: round2(summary.cogs) },
       )
     }
-    await db.accountingSyncLog.create({
-      data: {
-        connector: XERO_CONNECTOR,
+    await db.$transaction(async (tx) => {
+      await createPendingSyncLog(tx, {
         type: 'DAILY_BATCH_GROUP_B',
-        status: 'PENDING',
-        referenceType: 'DailyBatch',
         referenceId,
+        currency: baseCurrency,
         payload: {
           date,
           reference: `Shipment COGS ${date}`,
@@ -360,8 +393,8 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
           lines,
           _postingMode: 'submitted',
           _recreatedFromStage: true,
-        } as never,
-      },
+        },
+      })
     })
   }
 }
@@ -383,6 +416,7 @@ export async function runDailyBatchSync(): Promise<{
 
   try {
     const settings = await getXeroSettings()
+    const baseCurrency = await getBaseCurrencyCode()
     const today = new Date().toISOString().slice(0, 10)
 
     if (settings.xero_sync_enabled !== 'true') {
@@ -390,7 +424,7 @@ export async function runDailyBatchSync(): Promise<{
     }
 
     await resetFailedDailyBatchLogs()
-    await recreateMissingDailyBatchLogs(settings)
+    await recreateMissingDailyBatchLogs(settings, baseCurrency)
 
   // --- Group A1: Revenue Deferral ---
   try {
@@ -454,6 +488,7 @@ export async function runDailyBatchSync(): Promise<{
           await createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_REVENUE_DEFERRAL',
             referenceId: `A1-${today}`,
+            currency: baseCurrency,
             payload: {
               date: today,
               reference: `Revenue Deferral ${today}`,
@@ -566,6 +601,7 @@ export async function runDailyBatchSync(): Promise<{
           await createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_INVENTORY_ALLOC',
             referenceId: `A2-${today}`,
+            currency: baseCurrency,
             payload: {
               date: today,
               reference: `Inventory Allocation ${today}`,
@@ -952,6 +988,7 @@ export async function runDailyBatchSync(): Promise<{
         await createPendingSyncLog(tx, {
           type: 'DAILY_BATCH_GROUP_B',
           referenceId: `B-${today}`,
+          currency: baseCurrency,
           payload: {
             date: today,
             reference: `Shipment COGS ${today}`,

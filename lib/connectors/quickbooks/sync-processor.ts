@@ -15,7 +15,8 @@ import { pushCreditMemo } from './credit-notes'
 import { pushJournalEntry } from './journals'
 import { qboPost, qboUploadAttachment, resolveAccountRef } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
-import type { AccountingSyncType } from '@/app/generated/prisma/client'
+import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
+import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 
 const MAX_RETRIES = 5
 const MAX_PER_RUN = 100 // QBO rate limit: 500/min — can handle more than Xero
@@ -56,6 +57,27 @@ function getRateLimitBackoffMs(retryCount: number, message: string): number {
 
 function isRateLimitError(message: string): boolean {
   return /rate limit|rate limited|http 429|status 429/i.test(message)
+}
+
+async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingEventLog'>, params: {
+  type: AccountingSyncType
+  referenceType: string
+  referenceId: string
+  payload: SyncPayload
+  status: 'POSTED' | 'FAILED'
+  externalId?: string | null
+  message?: string
+}): Promise<void> {
+  await updateMirroredAccountingEventStatus(client, {
+    connector: QBO_CONNECTOR,
+    type: params.type,
+    referenceType: params.referenceType,
+    referenceId: params.referenceId,
+    payload: params.payload,
+    status: params.status,
+    externalId: params.externalId,
+    message: params.message,
+  })
 }
 
 async function hasExistingSyncLog(
@@ -154,14 +176,24 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
       // Idempotency guard: if a previous run already posted to QBO but failed
       // during follow-up work, don't re-post. Skip straight to follow-ups.
       if (entry.externalTransactionId) {
-        await db.accountingSyncLog.update({
-          where: { id: entry.id },
-          data: {
-            status: 'SYNCED',
-            syncedAt: new Date(),
-            errorMessage: null,
-            processingStartedAt: null,
-          },
+        await db.$transaction(async (tx) => {
+          await tx.accountingSyncLog.update({
+            where: { id: entry.id },
+            data: {
+              status: 'SYNCED',
+              syncedAt: new Date(),
+              errorMessage: null,
+              processingStartedAt: null,
+            },
+          })
+          await updateMirroredEventForSyncLog(tx, {
+            type: entry.type,
+            referenceType: entry.referenceType,
+            referenceId: entry.referenceId,
+            payload,
+            status: 'POSTED',
+            externalId: entry.externalTransactionId,
+          })
         })
         await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
         await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
@@ -175,15 +207,25 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         // Persist external ID and SYNCED status BEFORE any follow-up work.
         // If follow-ups fail, the next retry will see externalTransactionId
         // and skip the QBO write (idempotency guard above).
-        await db.accountingSyncLog.update({
-          where: { id: entry.id },
-          data: {
-            status: 'SYNCED',
-            externalTransactionId: syncResult.externalId ?? null,
-            syncedAt: new Date(),
-            errorMessage: null,
-            processingStartedAt: null,
-          },
+        await db.$transaction(async (tx) => {
+          await tx.accountingSyncLog.update({
+            where: { id: entry.id },
+            data: {
+              status: 'SYNCED',
+              externalTransactionId: syncResult.externalId ?? null,
+              syncedAt: new Date(),
+              errorMessage: null,
+              processingStartedAt: null,
+            },
+          })
+          await updateMirroredEventForSyncLog(tx, {
+            type: entry.type,
+            referenceType: entry.referenceType,
+            referenceId: entry.referenceId,
+            payload,
+            status: 'POSTED',
+            externalId: syncResult.externalId ?? null,
+          })
         })
 
         // Follow-up work (back-references, enqueue PDF/email/payment).
@@ -216,14 +258,27 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           })
         } else {
           const retryCount = entry.retryCount + 1
-          await db.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
-              retryCount,
-              errorMessage,
-              processingStartedAt: null,
-            },
+          const finalFailure = retryCount >= MAX_RETRIES
+          await db.$transaction(async (tx) => {
+            await tx.accountingSyncLog.update({
+              where: { id: entry.id },
+              data: {
+                status: finalFailure ? 'FAILED' : 'PENDING',
+                retryCount,
+                errorMessage,
+                processingStartedAt: null,
+              },
+            })
+            if (finalFailure) {
+              await updateMirroredEventForSyncLog(tx, {
+                type: entry.type,
+                referenceType: entry.referenceType,
+                referenceId: entry.referenceId,
+                payload,
+                status: 'FAILED',
+                message: errorMessage,
+              })
+            }
           })
         }
         result.failed++
@@ -241,14 +296,27 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
         })
       } else {
         const retryCount = entry.retryCount + 1
-        await db.accountingSyncLog.update({
-          where: { id: entry.id },
-          data: {
-            status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
-            retryCount,
-            errorMessage,
-            processingStartedAt: null,
-          },
+        const finalFailure = retryCount >= MAX_RETRIES
+        await db.$transaction(async (tx) => {
+          await tx.accountingSyncLog.update({
+            where: { id: entry.id },
+            data: {
+              status: finalFailure ? 'FAILED' : 'PENDING',
+              retryCount,
+              errorMessage,
+              processingStartedAt: null,
+            },
+          })
+          if (finalFailure) {
+            await updateMirroredEventForSyncLog(tx, {
+              type: entry.type,
+              referenceType: entry.referenceType,
+              referenceId: entry.referenceId,
+              payload,
+              status: 'FAILED',
+              message: errorMessage,
+            })
+          }
         })
       }
       result.failed++

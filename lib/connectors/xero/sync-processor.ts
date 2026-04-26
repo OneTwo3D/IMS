@@ -13,7 +13,8 @@ import { pushCreditNote } from './credit-notes'
 import { pushManualJournal } from './journals'
 import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
-import type { AccountingSyncType } from '@/app/generated/prisma/client'
+import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
+import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 
 const MAX_RETRIES = 5
 const MAX_PER_RUN = 50 // Xero rate limit: 60/min — leave headroom
@@ -45,6 +46,27 @@ function getRateLimitBackoffMs(retryCount: number, message: string): number {
 
 function isRateLimitError(message: string): boolean {
   return /rate limit|rate limited|http 429|status 429/i.test(message)
+}
+
+async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingEventLog'>, params: {
+  type: AccountingSyncType
+  referenceType: string
+  referenceId: string
+  payload: SyncPayload
+  status: 'POSTED' | 'FAILED'
+  externalId?: string | null
+  message?: string
+}): Promise<void> {
+  await updateMirroredAccountingEventStatus(client, {
+    connector: XERO_CONNECTOR,
+    type: params.type,
+    referenceType: params.referenceType,
+    referenceId: params.referenceId,
+    payload: params.payload,
+    status: params.status,
+    externalId: params.externalId,
+    message: params.message,
+  })
 }
 
 async function hasExistingSyncLog(
@@ -143,15 +165,25 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
       const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload)
 
       if (syncResult.success) {
-        await db.accountingSyncLog.update({
-          where: { id: entry.id },
-          data: {
-            status: 'SYNCED',
-            externalTransactionId: syncResult.externalId ?? null,
-            syncedAt: new Date(),
-            errorMessage: null,
-            processingStartedAt: null,
-          },
+        await db.$transaction(async (tx) => {
+          await tx.accountingSyncLog.update({
+            where: { id: entry.id },
+            data: {
+              status: 'SYNCED',
+              externalTransactionId: syncResult.externalId ?? null,
+              syncedAt: new Date(),
+              errorMessage: null,
+              processingStartedAt: null,
+            },
+          })
+          await updateMirroredEventForSyncLog(tx, {
+            type: entry.type,
+            referenceType: entry.referenceType,
+            referenceId: entry.referenceId,
+            payload,
+            status: 'POSTED',
+            externalId: syncResult.externalId ?? null,
+          })
         })
 
         // Update back-references (e.g. accountingInvoiceId on SalesOrder)
@@ -172,14 +204,27 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
           })
         } else {
           const retryCount = entry.retryCount + 1
-          await db.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
-              retryCount,
-              errorMessage,
-              processingStartedAt: null,
-            },
+          const finalFailure = retryCount >= MAX_RETRIES
+          await db.$transaction(async (tx) => {
+            await tx.accountingSyncLog.update({
+              where: { id: entry.id },
+              data: {
+                status: finalFailure ? 'FAILED' : 'PENDING',
+                retryCount,
+                errorMessage,
+                processingStartedAt: null,
+              },
+            })
+            if (finalFailure) {
+              await updateMirroredEventForSyncLog(tx, {
+                type: entry.type,
+                referenceType: entry.referenceType,
+                referenceId: entry.referenceId,
+                payload,
+                status: 'FAILED',
+                message: errorMessage,
+              })
+            }
           })
         }
         result.failed++
@@ -197,14 +242,27 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
         })
       } else {
         const retryCount = entry.retryCount + 1
-        await db.accountingSyncLog.update({
-          where: { id: entry.id },
-          data: {
-            status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
-            retryCount,
-            errorMessage,
-            processingStartedAt: null,
-          },
+        const finalFailure = retryCount >= MAX_RETRIES
+        await db.$transaction(async (tx) => {
+          await tx.accountingSyncLog.update({
+            where: { id: entry.id },
+            data: {
+              status: finalFailure ? 'FAILED' : 'PENDING',
+              retryCount,
+              errorMessage,
+              processingStartedAt: null,
+            },
+          })
+          if (finalFailure) {
+            await updateMirroredEventForSyncLog(tx, {
+              type: entry.type,
+              referenceType: entry.referenceType,
+              referenceId: entry.referenceId,
+              payload,
+              status: 'FAILED',
+              message: errorMessage,
+            })
+          }
         })
       }
       result.failed++
