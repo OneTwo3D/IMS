@@ -186,7 +186,7 @@ async function buildRefundFallbackReturnRows(
         },
       },
       shipments: {
-        where: { status: { not: 'PENDING' } },
+        where: { status: 'SHIPPED' },
         select: {
           lines: {
             select: {
@@ -963,7 +963,7 @@ export async function createSalesOrderRefund(
         allocationBatchAmount: true,
         lines: { select: { id: true, productId: true, qty: true } },
         shipments: {
-          where: { status: { not: 'PENDING' } },
+          where: { status: 'SHIPPED' },
           select: { id: true },
         },
       },

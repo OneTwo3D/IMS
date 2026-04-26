@@ -159,7 +159,7 @@ function createClient(state: State): RefundServiceClient {
               .filter((line) => line.orderId === order.id)
               .map((line) => ({ id: line.id, productId: line.productId, qty: line.qty })),
             shipments: state.shipments
-              .filter((row) => row.orderId === order.id && row.status !== 'PENDING')
+              .filter((row) => row.orderId === order.id && row.status === 'SHIPPED')
               .map((row) => ({ id: row.id })),
           }
         }
@@ -290,6 +290,47 @@ test('createSalesOrderRefund rejects stock returns before shipment', async () =>
       unearnedRevenueAmount: null,
       inventoryAllocatedDate: null,
       allocationBatchAmount: null,
+    }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Customer return',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.deepEqual(result, {
+    success: false,
+    error: 'Cannot return refunded stock before the order has shipped',
+  })
+  assert.equal(state.refunds.length, 0)
+  assert.equal(state.movements.length, 0)
+})
+
+test('createSalesOrderRefund rejects stock returns for packed shipments', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'PACKING',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: null,
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: null,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'PACKED',
+      shipmentJournalDate: null,
+      revenueRecognizedAmount: null,
+      cogsBatchAmount: null,
+      lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: 2, costLayerSnapshot: [] }],
     }],
   })
 
