@@ -4,6 +4,15 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { parseCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
+import {
+  addMoney,
+  multiplyMoney,
+  roundQuantity,
+  subtractMoney,
+  toDecimal,
+  type Decimal,
+  type DecimalInput,
+} from '@/lib/domain/math/decimal'
 
 /**
  * Preview & history for the Xero daily batch sub-ledger.
@@ -177,7 +186,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
   })
 
   const a2OrdersComputed: DailyBatchPreviewOrder[] = []
-  let a2Total = 0
+  let a2Total = toDecimal(0)
   const a2Snapshot = await buildPreviewLayerSnapshot(
     a2OrdersRaw.flatMap((order) =>
       order.shipments.length > 0
@@ -191,23 +200,23 @@ async function computePreview(): Promise<DailyBatchPreview> {
   for (const order of a2OrdersRaw) {
     const cost = order.shipments.length > 0
       ? order.shipments.reduce((sum, shipment) => (
-          sum + shipment.lines.reduce((lineSum, line) => {
+          addMoney(sum, shipment.lines.reduce((lineSum, line) => {
             if (Number(line.qty) <= 0) return lineSum
-            return lineSum + sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot)).toNumber()
-          }, 0)
-        ), 0)
+            return addMoney(lineSum, sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot)))
+          }, toDecimal(0)))
+        ), toDecimal(0))
       : computeFifoCostFromSnapshot(a2Snapshot, order.allocations)
-    a2Total += cost
+    a2Total = addMoney(a2Total, cost)
     a2OrdersComputed.push({
       id: order.id,
       displayOrderNumber: getSalesOrderReference(order),
-      amount: round2(cost),
+      amount: roundQuantity(cost, 2).toNumber(),
     })
   }
 
   const a2 = {
     orderCount: a2OrdersRaw.length,
-    totalCost: round2(a2Total),
+    totalCost: roundQuantity(a2Total, 2).toNumber(),
     orders: a2OrdersComputed.slice(0, 200),
   }
 
@@ -251,7 +260,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
 
   const bShipmentsComputed: DailyBatchPreviewShipment[] = []
   let bRevenue = 0
-  let bCogs = 0
+  let bCogs = toDecimal(0)
   for (const shipment of bShipments) {
     const orderLineTotal = shipment.order.lines.reduce(
       (s, l) => s + Number(l.totalBase),
@@ -274,25 +283,25 @@ async function computePreview(): Promise<DailyBatchPreview> {
       : 0
 
     const snapshotCogs = shipment.lines.reduce((sum, line) => (
-      sum + sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot)).toNumber()
-    ), 0)
-    const cogs = snapshotCogs > 0 ? snapshotCogs : Number(shipment.cogsBatchAmount ?? 0)
+      addMoney(sum, sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot)))
+    ), toDecimal(0))
+    const cogs = snapshotCogs.gt(0) ? snapshotCogs : toDecimal(shipment.cogsBatchAmount ?? 0)
 
     bRevenue += revenueProportion
-    bCogs += cogs
+    bCogs = addMoney(bCogs, cogs)
     bShipmentsComputed.push({
       id: shipment.id,
       orderId: shipment.orderId,
       displayOrderNumber: getSalesOrderReference({ id: shipment.orderId, ...shipment.order }),
       revenue: revenueProportion,
-      cogs: round2(cogs),
+      cogs: roundQuantity(cogs, 2).toNumber(),
     })
   }
 
   const b = {
     shipmentCount: bShipments.length,
     totalRevenue: round2(bRevenue),
-    totalCogs: round2(bCogs),
+    totalCogs: roundQuantity(bCogs, 2).toNumber(),
     shipments: bShipmentsComputed.slice(0, 200),
   }
 
@@ -309,7 +318,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
  * Sum FIFO cost for a set of allocation-like rows. Reads cost layers but
  * never mutates them — this is a preview helper only.
  */
-type PreviewLayerSnapshot = Map<string, Array<{ remainingQty: number; unitCostBase: number }>>
+type PreviewLayerSnapshot = Map<string, Array<{ remainingQty: Decimal; unitCostBase: Decimal }>>
 
 async function buildPreviewLayerSnapshot(
   rows: Array<{ productId: string; warehouseId: string }>,
@@ -331,8 +340,8 @@ async function buildPreviewLayerSnapshot(
     snapshot.set(
       key,
       layers.map((layer) => ({
-        remainingQty: Number(layer.remainingQty),
-        unitCostBase: Number(layer.unitCostBase),
+        remainingQty: toDecimal(layer.remainingQty),
+        unitCostBase: toDecimal(layer.unitCostBase),
       })),
     )
   }
@@ -343,18 +352,19 @@ async function buildPreviewLayerSnapshot(
 function computeFifoCostFromSnapshot(
   snapshot: PreviewLayerSnapshot,
   rows: Array<{ productId: string; warehouseId: string; qty: number | { toString(): string } }>,
-): number {
-  let total = 0
+): Decimal {
+  let total = toDecimal(0)
 
   for (const row of rows) {
     const layers = snapshot.get(`${row.productId}|${row.warehouseId}`) ?? []
-    let remaining = Number(row.qty)
+    const rowQty: DecimalInput = typeof row.qty === 'number' ? row.qty : row.qty.toString()
+    let remaining = toDecimal(rowQty)
     for (const layer of layers) {
-      if (remaining <= 0) break
-      const take = Math.min(remaining, layer.remainingQty)
-      total += take * layer.unitCostBase
-      layer.remainingQty -= take
-      remaining -= take
+      if (remaining.lte(0)) break
+      const take = remaining.lte(layer.remainingQty) ? remaining : layer.remainingQty
+      total = addMoney(total, multiplyMoney(take, layer.unitCostBase))
+      layer.remainingQty = subtractMoney(layer.remainingQty, take)
+      remaining = subtractMoney(remaining, take)
     }
   }
 

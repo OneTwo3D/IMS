@@ -236,6 +236,7 @@ export async function addCostLayerSourceLines(
     .filter((line) => (
       line.sourceProductId &&
       isPositiveDecimalInput(line.qty) &&
+      line.unitCostBase != null &&
       isFiniteDecimalInput(line.unitCostBase)
     ))
     .map((line) => ({
