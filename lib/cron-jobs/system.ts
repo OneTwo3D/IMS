@@ -33,6 +33,16 @@ registerCronJobs([
     defaultEnabled: true,
   },
   {
+    slug: 'invariant-check',
+    settingKey: 'invariant_check',
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'Invariant Check',
+    description: 'Runs inventory and accounting invariant reports and logs critical findings.',
+    defaultSchedule: '0 4 * * *',
+    defaultEnabled: true,
+  },
+  {
     slug: 'delivery-status',
     settingKey: 'delivery_status',
     module: 'system',
