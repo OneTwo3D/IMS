@@ -13,6 +13,10 @@ import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import {
+  validateManualSalesOrderStatusTransition,
+  validateRefundSalesOrderStatusUpdate,
+} from '@/lib/domain/workflows/action-guards'
+import {
   buildRealisedFxJournal,
   computeRealisedFx,
   getRealisedFxAccounts,
@@ -1420,21 +1424,11 @@ export async function applySalesOrderStatusTransition(
     })
     if (!so) return { success: false, error: 'Order not found' }
 
-    // Valid status transitions
-    const VALID_TRANSITIONS: Record<string, string[]> = {
-      DRAFT: ['PROCESSING', 'PENDING_PAYMENT', 'CANCELLED', 'ON_HOLD'],
-      PENDING_PAYMENT: ['PROCESSING', 'DRAFT', 'CANCELLED', 'ON_HOLD'],
-      ON_HOLD: ['DRAFT', 'PROCESSING', 'CANCELLED'],
-      PROCESSING: ['ALLOCATED', 'CANCELLED', 'ON_HOLD'],
-      ALLOCATED: ['PICKING', 'PROCESSING', 'CANCELLED', 'ON_HOLD'],
-      PICKING: ['PACKING', 'CANCELLED', 'ON_HOLD'],
-      PACKING: ['SHIPPED', 'CANCELLED', 'ON_HOLD'],
-      SHIPPED: ['COMPLETED'],
-      COMPLETED: ['DELIVERED'],
-    }
-    const allowed = VALID_TRANSITIONS[so.status] ?? []
-    if (!allowed.includes(targetStatus)) {
-      return { success: false, error: `Cannot transition from ${so.status} to ${targetStatus}` }
+    const transition = validateManualSalesOrderStatusTransition(so.status, targetStatus, {
+      bypass: bypassPermission,
+    })
+    if (!transition.success) {
+      return { success: false, error: transition.error }
     }
 
     // Guard: cannot start picking without allocations
@@ -1758,6 +1752,8 @@ export async function createRefund(
       const totalRefundedNow = previouslyRefunded + totalBase
       const orderTotal = Number(so.totalBase)
       const newStatus = totalRefundedNow >= orderTotal * 0.999 ? 'REFUNDED' : 'PARTIALLY_REFUNDED'
+      const refundTransition = validateRefundSalesOrderStatusUpdate(so.status, newStatus)
+      if (!refundTransition.success) throw new Error(refundTransition.error)
       await tx.salesOrder.update({ where: { id: orderId }, data: { status: newStatus } })
 
       return { so, fxRate, createdRefund, createdRefundLines, previouslyRefunded, creditNoteNumber, newStatus }

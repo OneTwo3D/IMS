@@ -8,6 +8,7 @@ import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
+import { validateStockTransferStatusTransition } from '@/lib/domain/workflows/action-guards'
 import type { Prisma } from '@/app/generated/prisma/client'
 import {
   consumeFifoLayersStrict,
@@ -364,7 +365,8 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
         select: { ...TRANSFER_SELECT, status: true },
       })
       if (!transfer) throw new Error('Transfer not found')
-      if (transfer.status !== 'DRAFT') throw new Error('Transfer is not in DRAFT status')
+      const transition = validateStockTransferStatusTransition(transfer.status, 'IN_TRANSIT')
+      if (!transition.success) throw new Error(transition.error)
 
       // Lock stock levels for all affected products in the source warehouse
       const productIds = transfer.lines.map((l) => l.productId)
@@ -512,7 +514,8 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
         select: { ...TRANSFER_SELECT, status: true },
       })
       if (!transfer) throw new Error('Transfer not found')
-      if (transfer.status !== 'IN_TRANSIT') throw new Error('Transfer is not IN_TRANSIT')
+      const transition = validateStockTransferStatusTransition(transfer.status, 'RECEIVED')
+      if (!transition.success) throw new Error(transition.error)
 
       // Load cost layer snapshots stored at dispatch time
       const linesWithSnapshots = await tx.stockTransferLine.findMany({
@@ -691,7 +694,8 @@ export async function cancelTransfer(id: string): Promise<TransferResult> {
     await requirePermission('stock_control.transfer')
     const existing = await db.stockTransfer.findUnique({ where: { id }, select: { status: true } })
     if (!existing) return { message: 'Transfer not found.' }
-    if (existing.status !== 'DRAFT') return { message: 'Only draft transfers can be cancelled.' }
+    const transition = validateStockTransferStatusTransition(existing.status, 'CANCELLED')
+    if (!transition.success) return { message: transition.error }
 
     await db.stockTransfer.update({ where: { id }, data: { status: 'CANCELLED' } })
     revalidatePath('/stock-control/transfers')

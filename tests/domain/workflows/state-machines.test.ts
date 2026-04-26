@@ -67,19 +67,44 @@ test('every workflow transition map covers every known status', () => {
 
 test('sales order state machine allows current forward paths and blocks direct jumps', () => {
   assert.equal(canTransitionSalesOrder('DRAFT', 'PROCESSING'), true)
+  assert.equal(canTransitionSalesOrder('DRAFT', 'ALLOCATED'), true)
+  assert.equal(canTransitionSalesOrder('PENDING_PAYMENT', 'ALLOCATED'), true)
   assert.equal(canTransitionSalesOrder('PROCESSING', 'ALLOCATED'), true)
+  assert.equal(canTransitionSalesOrder('ALLOCATED', 'SHIPPED'), true)
   assert.equal(canTransitionSalesOrder('PICKING', 'ON_HOLD'), true)
+  assert.equal(canTransitionSalesOrder('PICKING', 'SHIPPED'), true)
   assert.equal(canTransitionSalesOrder('ON_HOLD', 'PICKING'), true)
   assert.equal(canTransitionSalesOrder('PACKING', 'ON_HOLD'), true)
   assert.equal(canTransitionSalesOrder('ON_HOLD', 'PACKING'), true)
   assert.equal(canTransitionSalesOrder('PACKING', 'SHIPPED'), true)
   assert.equal(canTransitionSalesOrder('SHIPPED', 'COMPLETED'), true)
+  assert.equal(canTransitionSalesOrder('SHIPPED', 'DELIVERED'), true)
   assert.equal(canTransitionSalesOrder('DRAFT', 'SHIPPED'), false)
   assert.equal(canTransitionSalesOrder('SHIPPED', 'CANCELLED'), false)
   assert.throws(
     () => assertSalesOrderTransition('DRAFT', 'SHIPPED'),
     WorkflowTransitionError,
   )
+})
+
+test('sales order state machine allows refund status updates from current refund paths', () => {
+  for (const status of [
+    'DRAFT',
+    'PENDING_PAYMENT',
+    'ON_HOLD',
+    'PROCESSING',
+    'ALLOCATED',
+    'PICKING',
+    'PACKING',
+    'SHIPPED',
+    'COMPLETED',
+    'DELIVERED',
+  ] as const) {
+    assert.equal(canTransitionSalesOrder(status, 'PARTIALLY_REFUNDED'), true)
+    assert.equal(canTransitionSalesOrder(status, 'REFUNDED'), true)
+  }
+  assert.equal(canTransitionSalesOrder('PARTIALLY_REFUNDED', 'REFUNDED'), true)
+  assert.equal(canTransitionSalesOrder('REFUNDED', 'PARTIALLY_REFUNDED'), false)
 })
 
 test('shipment state machine preserves pick-pack-ship sequence', () => {
