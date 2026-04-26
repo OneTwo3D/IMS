@@ -23,6 +23,7 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import {
   validateLinkedFreightReceiptStatus,
   validatePurchaseOrderStatusTransition,
+  validatePurchaseReceiptStatusUpdate,
 } from '@/lib/domain/workflows/action-guards'
 import {
   buildRealisedFxJournal,
@@ -1837,7 +1838,7 @@ export async function receivePurchaseOrder(
       })
       const allReceived = updatedLines.every((line) => Number(line.qtyReceived) >= Number(line.qty))
       const newStatus = allReceived ? 'RECEIVED' : 'PARTIALLY_RECEIVED'
-      const receiptTransition = validatePurchaseOrderStatusTransition(currentPo.status, newStatus)
+      const receiptTransition = validatePurchaseReceiptStatusUpdate(currentPo.status, newStatus)
       if (!receiptTransition.success) throw new Error(receiptTransition.error)
       await tx.purchaseOrder.update({
         where: { id },

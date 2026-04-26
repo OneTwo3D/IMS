@@ -99,6 +99,14 @@ export function validateLinkedFreightReceiptStatus(
   }
 }
 
+export function validatePurchaseReceiptStatusUpdate(
+  from: string,
+  to: string,
+): WorkflowTransitionGuardResult {
+  if (from === 'PARTIALLY_RECEIVED' && to === 'PARTIALLY_RECEIVED') return { success: true }
+  return validatePurchaseOrderStatusTransition(from, to)
+}
+
 export function validateShipmentStatusTransition(
   from: string,
   to: string,

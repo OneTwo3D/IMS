@@ -5,6 +5,7 @@ import {
   validateLinkedFreightReceiptStatus,
   validateManualSalesOrderStatusTransition,
   validatePurchaseOrderStatusTransition,
+  validatePurchaseReceiptStatusUpdate,
   validateRefundSalesOrderStatusUpdate,
   validateRefundStatusTransition,
   validateSalesOrderStatusTransition,
@@ -60,6 +61,16 @@ test('purchase order action guard blocks invalid receipt and closed transitions'
   assert.deepEqual(validatePurchaseOrderStatusTransition('DRAFT', 'RECEIVED'), {
     success: false,
     error: 'Cannot transition purchase order from DRAFT to RECEIVED',
+  })
+})
+
+test('purchase receipt status guard permits repeated partial receipts as progress', () => {
+  assert.deepEqual(validatePurchaseReceiptStatusUpdate('PO_SENT', 'PARTIALLY_RECEIVED'), { success: true })
+  assert.deepEqual(validatePurchaseReceiptStatusUpdate('PARTIALLY_RECEIVED', 'PARTIALLY_RECEIVED'), { success: true })
+  assert.deepEqual(validatePurchaseReceiptStatusUpdate('PARTIALLY_RECEIVED', 'RECEIVED'), { success: true })
+  assert.deepEqual(validatePurchaseReceiptStatusUpdate('RECEIVED', 'PARTIALLY_RECEIVED'), {
+    success: false,
+    error: 'Cannot transition purchase order from RECEIVED to PARTIALLY_RECEIVED',
   })
 })
 
