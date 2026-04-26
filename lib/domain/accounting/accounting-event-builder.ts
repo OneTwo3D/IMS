@@ -1,4 +1,4 @@
-import { roundMoney } from '@/lib/domain/math/decimal'
+import { addMoney, roundMoney, toDecimal } from '@/lib/domain/math/decimal'
 import type {
   AccountingEventDraft,
   AccountingEventLine,
@@ -63,22 +63,25 @@ export function assertBalancedAccountingEventLines(lines: AccountingEventLine[],
   const normalizedCurrency = normalizeCurrency(currency)
   const totals = lines.reduce(
     (sum, line) => ({
-      debit: sum.debit + (line.debit ?? 0),
-      credit: sum.credit + (line.credit ?? 0),
+      debit: addMoney(sum.debit, line.debit ?? 0),
+      credit: addMoney(sum.credit, line.credit ?? 0),
     }),
-    { debit: 0, credit: 0 },
+    { debit: toDecimal(0), credit: toDecimal(0) },
   )
-  const debit = roundMoney(totals.debit, normalizedCurrency).toNumber()
-  const credit = roundMoney(totals.credit, normalizedCurrency).toNumber()
-  if (debit !== credit) {
-    throw new Error(`Accounting event lines must balance: debit ${debit} != credit ${credit}`)
+  const debit = roundMoney(totals.debit, normalizedCurrency)
+  const credit = roundMoney(totals.credit, normalizedCurrency)
+  if (!debit.eq(credit)) {
+    throw new Error(`Accounting event lines must balance: debit ${debit.toString()} != credit ${credit.toString()}`)
   }
 }
 
+/**
+ * Date idempotency parts are interpreted as date-only UTC values.
+ */
 export function buildAccountingEventIdempotencyKey(parts: Array<string | number | Date>): string {
   if (parts.length === 0) throw new Error('At least one idempotency key part is required')
   return parts.map((part) => {
-    const value = part instanceof Date ? part.toISOString() : String(part)
+    const value = part instanceof Date ? part.toISOString().slice(0, 10) : String(part)
     const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._:-]+/g, '-').replace(/^-+|-+$/g, '')
     if (!normalized) throw new Error('Idempotency key parts must not be blank')
     return normalized
@@ -101,6 +104,7 @@ export function buildAccountingEvent(input: BuildAccountingEventInput): Accounti
     status: input.status ?? DEFAULT_STATUS,
     idempotencyKey: requireNonBlank(input.idempotencyKey, 'idempotencyKey'),
     linesJson,
+    currency,
     ...(input.externalSystem !== undefined ? { externalSystem: input.externalSystem } : {}),
     ...(input.externalId !== undefined ? { externalId: input.externalId } : {}),
     ...(input.reversalOfId !== undefined ? { reversalOfId: input.reversalOfId } : {}),

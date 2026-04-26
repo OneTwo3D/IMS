@@ -23,6 +23,7 @@ test('buildAccountingEvent normalizes balanced event lines', () => {
   })
 
   assert.equal(event.status, 'PENDING')
+  assert.equal(event.currency, 'GBP')
   assert.equal(event.idempotencyKey, 'shipment:shipment-1:group-b')
   assert.equal(event.businessDate.toISOString(), '2026-04-26T00:00:00.000Z')
   assert.deepEqual(event.linesJson, [
@@ -49,6 +50,35 @@ test('buildAccountingEvent uses the provided currency minor units', () => {
     { accountCode: '500', description: 'COGS', debit: 1.235 },
     { accountCode: '631', description: 'Allocated inventory', credit: 1.235 },
   ])
+})
+
+test('buildAccountingEvent balance checks use decimal accumulation', () => {
+  const event = buildAccountingEvent({
+    type: 'DAILY_BATCH_GROUP_B',
+    sourceEntityType: 'Shipment',
+    sourceEntityId: 'shipment-1',
+    businessDate: '2026-04-26',
+    currency: 'GBP',
+    idempotencyKey: 'shipment-1-decimal',
+    lines: [
+      { accountCode: '500', description: 'COGS A', debit: 0.1 },
+      { accountCode: '500', description: 'COGS B', debit: 0.2 },
+      { accountCode: '631', description: 'Allocated inventory', credit: 0.3 },
+    ],
+  })
+
+  assert.deepEqual(event.linesJson, [
+    { accountCode: '500', description: 'COGS A', debit: 0.1 },
+    { accountCode: '500', description: 'COGS B', debit: 0.2 },
+    { accountCode: '631', description: 'Allocated inventory', credit: 0.3 },
+  ])
+})
+
+test('buildAccountingEventIdempotencyKey treats Date parts as UTC date-only', () => {
+  assert.equal(
+    buildAccountingEventIdempotencyKey(['daily-batch', new Date('2026-04-26T21:29:56.789Z')]),
+    'daily-batch:2026-04-26',
+  )
 })
 
 test('buildAccountingEvent rejects malformed or unbalanced lines', () => {

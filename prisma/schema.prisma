@@ -1539,6 +1539,7 @@ model AccountingEvent {
   status           String   @default("PENDING")
   idempotencyKey   String   @unique
   linesJson        Json
+  currency         String
   externalSystem   String?
   externalId       String?
   reversalOfId     String?
@@ -1551,7 +1552,7 @@ model AccountingEvent {
 
   @@index([sourceEntityType, sourceEntityId])
   @@index([status, businessDate])
-  @@index([externalSystem, externalId])
+  @@unique([externalSystem, externalId])
   @@index([reversalOfId])
   @@map("accounting_events")
 }

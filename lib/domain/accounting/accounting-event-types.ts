@@ -23,6 +23,7 @@ export type AccountingEventDraft = {
   status: AccountingEventStatus
   idempotencyKey: string
   linesJson: AccountingEventLine[]
+  currency: string
   externalSystem?: string | null
   externalId?: string | null
   reversalOfId?: string | null
