@@ -14,6 +14,7 @@ test('buildAccountingEvent normalizes balanced event lines', () => {
     sourceEntityType: 'Shipment',
     sourceEntityId: 'shipment-1',
     businessDate: '2026-04-26',
+    currency: 'GBP',
     idempotencyKey: buildAccountingEventIdempotencyKey(['shipment', 'shipment-1', 'group-b']),
     lines: [
       { accountCode: '500', description: 'COGS', debit: 10.005 },
@@ -30,12 +31,33 @@ test('buildAccountingEvent normalizes balanced event lines', () => {
   ])
 })
 
+test('buildAccountingEvent uses the provided currency minor units', () => {
+  const event = buildAccountingEvent({
+    type: 'DAILY_BATCH_GROUP_B',
+    sourceEntityType: 'Shipment',
+    sourceEntityId: 'shipment-1',
+    businessDate: '2026-04-26',
+    currency: 'KWD',
+    idempotencyKey: 'shipment-1-kwd',
+    lines: [
+      { accountCode: '500', description: 'COGS', debit: 1.2345 },
+      { accountCode: '631', description: 'Allocated inventory', credit: 1.2345 },
+    ],
+  })
+
+  assert.deepEqual(event.linesJson, [
+    { accountCode: '500', description: 'COGS', debit: 1.235 },
+    { accountCode: '631', description: 'Allocated inventory', credit: 1.235 },
+  ])
+})
+
 test('buildAccountingEvent rejects malformed or unbalanced lines', () => {
   assert.throws(() => buildAccountingEvent({
     type: 'DAILY_BATCH_GROUP_B',
     sourceEntityType: 'Shipment',
     sourceEntityId: 'shipment-1',
     businessDate: '2026-04-26',
+    currency: 'GBP',
     idempotencyKey: 'shipment-1',
     lines: [{ accountCode: '500', description: 'COGS', debit: 10, credit: 10 }],
   }), /exactly one positive debit or credit/)
@@ -45,6 +67,7 @@ test('buildAccountingEvent rejects malformed or unbalanced lines', () => {
     sourceEntityType: 'Shipment',
     sourceEntityId: 'shipment-1',
     businessDate: '2026-04-26',
+    currency: 'GBP',
     idempotencyKey: 'shipment-1',
     lines: [
       { accountCode: '500', description: 'COGS', debit: 10 },

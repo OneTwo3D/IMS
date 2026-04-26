@@ -23,19 +23,24 @@ function coerceBusinessDate(value: Date | string): Date {
   return date
 }
 
-function normalizeAmount(value: number | undefined): number {
+function normalizeCurrency(value: string): string {
+  return requireNonBlank(value, 'currency').toUpperCase()
+}
+
+function normalizeAmount(value: number | undefined, currency: string): number {
   if (value == null) return 0
   if (!Number.isFinite(value) || value < 0) {
     throw new Error('Accounting event line amounts must be finite, non-negative numbers')
   }
-  return roundMoney(value, 'GBP').toNumber()
+  return roundMoney(value, currency).toNumber()
 }
 
-export function normalizeAccountingEventLine(line: AccountingEventLine): AccountingEventLine {
+export function normalizeAccountingEventLine(line: AccountingEventLine, currency: string): AccountingEventLine {
   const accountCode = requireNonBlank(line.accountCode, 'line.accountCode')
   const description = requireNonBlank(line.description, 'line.description')
-  const debit = normalizeAmount(line.debit)
-  const credit = normalizeAmount(line.credit)
+  const normalizedCurrency = normalizeCurrency(currency)
+  const debit = normalizeAmount(line.debit, normalizedCurrency)
+  const credit = normalizeAmount(line.credit, normalizedCurrency)
   const hasDebit = debit > 0
   const hasCredit = credit > 0
 
@@ -54,7 +59,8 @@ export function normalizeAccountingEventLine(line: AccountingEventLine): Account
   }
 }
 
-export function assertBalancedAccountingEventLines(lines: AccountingEventLine[]): void {
+export function assertBalancedAccountingEventLines(lines: AccountingEventLine[], currency: string): void {
+  const normalizedCurrency = normalizeCurrency(currency)
   const totals = lines.reduce(
     (sum, line) => ({
       debit: sum.debit + (line.debit ?? 0),
@@ -62,10 +68,10 @@ export function assertBalancedAccountingEventLines(lines: AccountingEventLine[])
     }),
     { debit: 0, credit: 0 },
   )
-  const debit = roundMoney(totals.debit, 'GBP').toNumber()
-  const credit = roundMoney(totals.credit, 'GBP').toNumber()
+  const debit = roundMoney(totals.debit, normalizedCurrency).toNumber()
+  const credit = roundMoney(totals.credit, normalizedCurrency).toNumber()
   if (debit !== credit) {
-    throw new Error(`Accounting event lines must balance: debit ${debit.toFixed(2)} != credit ${credit.toFixed(2)}`)
+    throw new Error(`Accounting event lines must balance: debit ${debit} != credit ${credit}`)
   }
 }
 
@@ -80,11 +86,12 @@ export function buildAccountingEventIdempotencyKey(parts: Array<string | number 
 }
 
 export function buildAccountingEvent(input: BuildAccountingEventInput): AccountingEventDraft {
-  const linesJson = input.lines.map(normalizeAccountingEventLine)
+  const currency = normalizeCurrency(input.currency)
+  const linesJson = input.lines.map((line) => normalizeAccountingEventLine(line, currency))
   if (linesJson.length === 0) {
     throw new Error('Accounting events require at least one line')
   }
-  assertBalancedAccountingEventLines(linesJson)
+  assertBalancedAccountingEventLines(linesJson, currency)
 
   return {
     type: requireNonBlank(input.type, 'type'),

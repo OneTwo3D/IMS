@@ -40,6 +40,7 @@ export type BuildAccountingEventInput = {
   sourceEntityType: string
   sourceEntityId: string
   businessDate: Date | string
+  currency: string
   idempotencyKey: string
   lines: AccountingEventLine[]
   status?: AccountingEventStatus
