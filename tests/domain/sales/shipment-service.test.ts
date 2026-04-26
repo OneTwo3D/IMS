@@ -1,0 +1,316 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+
+import {
+  confirmSalesOrderShipments,
+  transitionShipmentStatus,
+  type ShipmentServiceClient,
+} from '@/lib/domain/sales/shipment-service'
+
+type Order = { id: string; orderNumber: string; externalOrderNumber: string | null; status: string }
+type OrderLine = { id: string; orderId: string; productId: string; qty: number; sku: string; description: string; cogsBase?: number | null }
+type Allocation = { orderId: string; lineId: string; productId: string; warehouseId: string; qty: number }
+type Shipment = {
+  id: string
+  orderId: string
+  warehouseId: string
+  status: string
+  trackingNumber: string | null
+  shippingService: string | null
+  shippedAt?: Date | null
+  cogsBatchAmount?: number | null
+}
+type ShipmentLine = {
+  id: string
+  shipmentId: string
+  lineId: string
+  productId: string
+  qty: number
+  costLayerSnapshot?: unknown
+}
+type StockLevel = { productId: string; warehouseId: string; quantity: number; reservedQty: number }
+type CostLayer = { id: string; productId: string; warehouseId: string; remainingQty: number; unitCostBase: number }
+
+type State = {
+  orders: Order[]
+  lines: OrderLine[]
+  allocations: Allocation[]
+  shipments: Shipment[]
+  shipmentLines: ShipmentLine[]
+  stockLevels: StockLevel[]
+  costLayers: CostLayer[]
+  movements: Array<{ id: string; productId: string; qty: number }>
+  cogsEntries: Array<{ costLayerId: string; movementId: string; qty: number; unitCostBase: number; totalCostBase: number }>
+}
+
+function baseState(overrides: Partial<State> = {}): State {
+  return {
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'PROCESSING' }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 2, sku: 'SKU-1', description: 'Product 1' }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
+    shipments: [],
+    shipmentLines: [],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 2, unitCostBase: 5 }],
+    movements: [],
+    cogsEntries: [],
+    ...overrides,
+  }
+}
+
+function createClient(state: State): ShipmentServiceClient {
+  let shipmentSequence = state.shipments.length + 1
+  let movementSequence = state.movements.length + 1
+  const client = {
+    $queryRaw: async () => [],
+    $executeRaw: async () => 0,
+    $transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(client),
+    salesOrder: {
+      findUnique: async ({ where }: { where: { id: string } }) => state.orders.find((order) => order.id === where.id) ?? null,
+      update: async ({ where, data }: { where: { id: string }; data: Partial<Order> }) => {
+        const order = state.orders.find((row) => row.id === where.id)
+        if (!order) throw new Error('Order not found')
+        Object.assign(order, data)
+        return order
+      },
+    },
+    salesOrderLine: {
+      findMany: async ({ where }: { where: { orderId?: string; lineId?: { in: string[] }; id?: { in: string[] } } }) => state.lines
+        .filter((line) => where.orderId == null || line.orderId === where.orderId)
+        .filter((line) => where.id?.in == null || where.id.in.includes(line.id))
+        .map((line) => ({ id: line.id, productId: line.productId, qty: line.qty, sku: line.sku, description: line.description })),
+      update: async ({ where, data }: { where: { id: string }; data: { cogsBase?: number | null } }) => {
+        const line = state.lines.find((row) => row.id === where.id)
+        if (line) line.cogsBase = data.cogsBase
+      },
+    },
+    product: {
+      findMany: async ({ where }: { where: { id: { in: string[] } } }) => where.id.in.map((id) => ({
+        id,
+        type: 'SIMPLE',
+        productComponents: [],
+      })),
+    },
+    orderAllocation: {
+      findMany: async ({ where }: { where: { orderId: string } }) => state.allocations
+        .filter((allocation) => allocation.orderId === where.orderId),
+    },
+    shipment: {
+      findMany: async ({ where, select }: { where: { orderId: string; status?: string }; select?: Record<string, boolean> }) => state.shipments
+        .filter((shipment) => shipment.orderId === where.orderId)
+        .filter((shipment) => where.status == null || shipment.status === where.status)
+        .map((shipment) => {
+          if (select?.warehouseId) return {
+            warehouseId: shipment.warehouseId,
+            trackingNumber: shipment.trackingNumber,
+            shippingService: shipment.shippingService,
+          }
+          if (select?.trackingNumber) return { trackingNumber: shipment.trackingNumber }
+          return { id: shipment.id, status: shipment.status }
+        }),
+      findUnique: async ({ where, include, select }: { where: { id: string }; include?: unknown; select?: Record<string, boolean> }) => {
+        const shipment = state.shipments.find((row) => row.id === where.id)
+        if (!shipment) return null
+        if (select?.status) return { status: shipment.status }
+        if (!include) return shipment
+        const order = state.orders.find((row) => row.id === shipment.orderId)!
+        return {
+          ...shipment,
+          order,
+          warehouse: { code: 'MAIN' },
+          lines: state.shipmentLines
+            .filter((line) => line.shipmentId === shipment.id)
+            .map((line) => ({
+              ...line,
+              product: { sku: line.productId.toUpperCase() },
+            })),
+        }
+      },
+      create: async ({ data }: { data: { orderId: string; warehouseId: string; status: string; trackingNumber: string | null; shippingService: string | null; lines: { create: Array<{ lineId: string; productId: string; qty: number }> } } }) => {
+        const shipment = {
+          id: `shipment-${shipmentSequence++}`,
+          orderId: data.orderId,
+          warehouseId: data.warehouseId,
+          status: data.status,
+          trackingNumber: data.trackingNumber,
+          shippingService: data.shippingService,
+          cogsBatchAmount: null,
+        }
+        state.shipments.push(shipment)
+        for (const line of data.lines.create) {
+          state.shipmentLines.push({
+            id: `shipment-line-${state.shipmentLines.length + 1}`,
+            shipmentId: shipment.id,
+            lineId: line.lineId,
+            productId: line.productId,
+            qty: line.qty,
+          })
+        }
+        return { id: shipment.id }
+      },
+      deleteMany: async ({ where }: { where: { orderId: string; status: string } }) => {
+        const pendingIds = state.shipments
+          .filter((shipment) => shipment.orderId === where.orderId && shipment.status === where.status)
+          .map((shipment) => shipment.id)
+        state.shipments = state.shipments.filter((shipment) => !pendingIds.includes(shipment.id))
+        state.shipmentLines = state.shipmentLines.filter((line) => !pendingIds.includes(line.shipmentId))
+        return { count: pendingIds.length }
+      },
+      update: async ({ where, data }: { where: { id: string }; data: Partial<Shipment> }) => {
+        const shipment = state.shipments.find((row) => row.id === where.id)
+        if (!shipment) throw new Error('Shipment not found')
+        Object.assign(shipment, data)
+        return shipment
+      },
+    },
+    shipmentLine: {
+      findMany: async ({ where, select }: { where: { shipment?: { orderId: string; status?: { not: string } }; lineId?: { in: string[] } }; select?: Record<string, boolean> }) => state.shipmentLines
+        .filter((line) => {
+          if (where.shipment == null) return true
+          const shipment = state.shipments.find((row) => row.id === line.shipmentId)
+          if (!shipment || shipment.orderId !== where.shipment.orderId) return false
+          return where.shipment.status?.not == null || shipment.status !== where.shipment.status.not
+        })
+        .filter((line) => where.lineId?.in == null || where.lineId.in.includes(line.lineId))
+        .map((line) => {
+          if (select?.shipment) {
+            const shipment = state.shipments.find((row) => row.id === line.shipmentId)!
+            return { lineId: line.lineId, productId: line.productId, qty: line.qty, shipment: { warehouseId: shipment.warehouseId } }
+          }
+          if (select?.costLayerSnapshot) return { lineId: line.lineId, costLayerSnapshot: line.costLayerSnapshot }
+          return { lineId: line.lineId, productId: line.productId, qty: line.qty }
+        }),
+      update: async ({ where, data }: { where: { id: string }; data: { costLayerSnapshot: unknown } }) => {
+        const line = state.shipmentLines.find((row) => row.id === where.id)
+        if (line) line.costLayerSnapshot = data.costLayerSnapshot
+      },
+    },
+    stockLevel: {
+      updateMany: async ({ where, data }: { where: { productId: string; warehouseId: string }; data: { quantity?: { decrement: number }; reservedQty?: { decrement: number } } }) => {
+        const rows = state.stockLevels.filter((row) => row.productId === where.productId && row.warehouseId === where.warehouseId)
+        for (const row of rows) {
+          if (data.quantity) row.quantity -= data.quantity.decrement
+          if (data.reservedQty) row.reservedQty -= data.reservedQty.decrement
+        }
+        return { count: rows.length }
+      },
+    },
+    stockMovement: {
+      create: async ({ data }: { data: { productId: string; qty: number } }) => {
+        const movement = { id: `movement-${movementSequence++}`, productId: data.productId, qty: data.qty }
+        state.movements.push(movement)
+        return { id: movement.id }
+      },
+    },
+    costLayer: {
+      findMany: async ({ where }: { where: { productId?: string; warehouseId?: string; remainingQty?: { gt: number }; id?: { in: string[] } } }) => state.costLayers
+        .filter((layer) => where.productId == null || layer.productId === where.productId)
+        .filter((layer) => where.warehouseId == null || layer.warehouseId === where.warehouseId)
+        .filter((layer) => where.id?.in == null || where.id.in.includes(layer.id))
+        .filter((layer) => where.remainingQty?.gt == null || layer.remainingQty > where.remainingQty.gt)
+        .map((layer) => ({ id: layer.id, remainingQty: layer.remainingQty, unitCostBase: layer.unitCostBase })),
+      update: async ({ where, data }: { where: { id: string }; data: { remainingQty: { decrement: number } } }) => {
+        const layer = state.costLayers.find((row) => row.id === where.id)
+        if (!layer) throw new Error('Layer not found')
+        layer.remainingQty -= data.remainingQty.decrement
+      },
+    },
+    cogsEntry: {
+      createMany: async ({ data }: { data: State['cogsEntries'] }) => {
+        state.cogsEntries.push(...data)
+      },
+    },
+    setting: {
+      findUnique: async () => ({ value: 'manual' }),
+    },
+  }
+  return client as unknown as ShipmentServiceClient
+}
+
+test('confirmSalesOrderShipments creates a full pending shipment from allocations', async () => {
+  const state = baseState()
+  const result = await confirmSalesOrderShipments(createClient(state), 'order-1')
+
+  assert.equal(result.shipmentCount, 1)
+  assert.equal(result.createdShipments[0].totalQty, 2)
+  assert.equal(state.shipments[0].status, 'PENDING')
+  assert.equal(state.shipmentLines[0].qty, 2)
+  assert.equal(state.orders[0].status, 'ALLOCATED')
+})
+
+test('confirmSalesOrderShipments only creates shipment lines for unshipped allocation quantity', async () => {
+  const state = baseState({
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
+    shipments: [{ id: 'shipment-active', orderId: 'order-1', warehouseId: 'warehouse-2', status: 'PICKING', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-active', shipmentId: 'shipment-active', lineId: 'line-1', productId: 'product-1', qty: 1 }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 3, sku: 'SKU-1', description: 'Product 1' }],
+  })
+  const result = await confirmSalesOrderShipments(createClient(state), 'order-1')
+
+  assert.equal(result.shipmentCount, 1)
+  const pendingLine = state.shipmentLines.find((line) => line.shipmentId !== 'shipment-active')
+  assert.equal(pendingLine?.qty, 2)
+})
+
+test('transitionShipmentStatus rejects invalid shipment status jumps', async () => {
+  const state = baseState({
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+  })
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.deepEqual(result, {
+    success: false,
+    error: 'Cannot transition shipment from PENDING to SHIPPED',
+  })
+  assert.equal(state.shipments[0].status, 'PENDING')
+})
+
+test('transitionShipmentStatus ships stock and stores FIFO COGS snapshot', async () => {
+  const state = baseState({
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+  })
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(result.success && result.dispatched, true)
+  assert.equal(state.shipments[0].status, 'SHIPPED')
+  assert.equal(state.stockLevels[0].quantity, 0)
+  assert.equal(state.stockLevels[0].reservedQty, 0)
+  assert.equal(state.costLayers[0].remainingQty, 0)
+  assert.equal(state.shipments[0].cogsBatchAmount, 10)
+  assert.deepEqual(state.shipmentLines[0].costLayerSnapshot, [
+    { costLayerId: 'layer-1', qty: 2, unitCostBase: 5 },
+  ])
+  assert.deepEqual(state.cogsEntries, [{
+    costLayerId: 'layer-1',
+    movementId: 'movement-1',
+    qty: 2,
+    unitCostBase: 5,
+    totalCostBase: 10,
+  }])
+  assert.equal(state.lines[0].cogsBase, 10)
+})
+
+test('transitionShipmentStatus rejects shipping when FIFO layers are insufficient', async () => {
+  const state = baseState({
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 }],
+  })
+
+  await assert.rejects(
+    () => transitionShipmentStatus(createClient(state), {
+      shipmentId: 'shipment-1',
+      targetStatus: 'SHIPPED',
+    }),
+    /Insufficient FIFO layers/,
+  )
+})
