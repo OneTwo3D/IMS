@@ -164,6 +164,23 @@ test('sales and purchase document sync logs mirror with stable document keys', (
   assert.equal((purchase.linesJson as Record<string, unknown>).supplierInvoicePath, 'uploads/supplier/SUP-123.pdf')
 })
 
+test('malformed document sync log payloads surface validation errors', () => {
+  assert.throws(() => buildMirroredAccountingEventDraft({
+    connector: 'xero',
+    type: 'CREDIT_NOTE',
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    currency: 'GBP',
+    payload: {
+      _idempotencyKey: 'sales-order-refund:refund-1:credit-note',
+      contactName: 'Customer One',
+      date: '2026-04-26',
+      currency: 'GBP',
+      lines: [{ description: 'Refund line', quantity: 0, unitAmount: 10, accountCode: '400' }],
+    },
+  }), /quantity must be positive/)
+})
+
 test('reruns build the same deterministic accounting event key', () => {
   const params = {
     connector: 'xero',

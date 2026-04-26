@@ -155,30 +155,26 @@ export function buildMirroredAccountingEventDraft(params: {
     const idempotencyKey = buildMirroredAccountingEventIdempotencyKey(params)
     if (!idempotencyKey) return null
 
-    try {
-      const documentPayload = buildAccountingDocumentPayload({
-        type: params.type,
-        sourceEntityType: params.referenceType,
-        sourceEntityId: params.referenceId,
-        payload: params.payload,
-        fallbackCurrency: params.currency,
-      })
+    const documentPayload = buildAccountingDocumentPayload({
+      type: params.type,
+      sourceEntityType: params.referenceType,
+      sourceEntityId: params.referenceId,
+      payload: params.payload,
+      fallbackCurrency: params.currency,
+    })
 
-      return buildAccountingDocumentEvent({
-        type: params.type,
-        sourceEntityType: params.referenceType,
-        sourceEntityId: params.referenceId,
-        businessDate: documentPayload.date,
-        currency: documentPayload.currency,
-        status: mapStatus(params.status),
-        idempotencyKey,
-        payload: documentPayload,
-        externalSystem: params.connector,
-        externalId: params.externalId ?? null,
-      })
-    } catch {
-      return null
-    }
+    return buildAccountingDocumentEvent({
+      type: params.type,
+      sourceEntityType: params.referenceType,
+      sourceEntityId: params.referenceId,
+      businessDate: documentPayload.date,
+      currency: documentPayload.currency,
+      status: mapStatus(params.status),
+      idempotencyKey,
+      payload: documentPayload,
+      externalSystem: params.connector,
+      externalId: params.externalId ?? null,
+    })
   }
 
   if (!isMirrorableJournalAccountingSyncType(params.type)) return null
