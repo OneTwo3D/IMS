@@ -1,30 +1,21 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
-import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { auth } from '@/lib/auth'
 import { requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
-import {
-  calculateFulfillmentCoverage,
-  calculateCoverageByLine,
-  requirementsMapToRows,
-  type FulfillmentRequirement,
-} from '@/lib/products/fulfillment-coverage'
+import { decimalToNumber } from '@/lib/decimal'
+import { requirementsMapToRows, type FulfillmentRequirement } from '@/lib/products/fulfillment-coverage'
 import {
   expandFulfillmentRequirements,
   getFulfillmentAvailableQty,
   listFulfillmentLeafProductIds,
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
-import { consumeFifoLayersStrict, refreshSalesOrderLineCogs } from '@/lib/cost-layers'
-import {
-  validateSalesOrderStatusTransition,
-  validateShipmentStatusTransition,
-} from '@/lib/domain/workflows/action-guards'
+import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   allocateSalesOrder,
   applyAllocationReservationDelta,
@@ -32,10 +23,15 @@ import {
   lockSalesOrder,
   lockStockLevels,
   resetAllocationAccountingIfStaged,
+  validateAllocationIntegrity,
 } from '@/lib/domain/sales/allocation-service'
+import {
+  confirmSalesOrderShipments,
+  reconcileOrderAfterShipment,
+  transitionShipmentStatus,
+} from '@/lib/domain/sales/shipment-service'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
-const ALLOCATION_EPSILON = 0.000001
 
 function revalidateSalesAllocationPaths(orderId: string) {
   try {
@@ -54,122 +50,6 @@ async function requireAuth() {
   const session = await auth()
   if (!session?.user?.id) throw new Error('Unauthorized')
   return session
-}
-
-async function validateAllocationIntegrity(
-  client: Prisma.TransactionClient | typeof db,
-  orderId: string,
-  lineIds?: string[],
-): Promise<string | null> {
-  const lines = await client.salesOrderLine.findMany({
-    where: {
-      orderId,
-      productId: { not: null },
-      ...(lineIds?.length ? { id: { in: lineIds } } : {}),
-    },
-    select: {
-      id: true,
-      productId: true,
-      qty: true,
-      sku: true,
-      description: true,
-    },
-  })
-  if (lines.length === 0) return null
-
-  const graph = await loadFulfillmentProductGraph(
-    client,
-    lines.map((line) => line.productId!).filter(Boolean),
-  )
-  const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
-  for (const line of lines) {
-    requirementsByLine.set(
-      line.id,
-      requirementsMapToRows(expandFulfillmentRequirements(line.productId!, 1, graph)),
-    )
-  }
-
-  const [allocations, activeShipmentLines] = await Promise.all([
-    client.orderAllocation.findMany({
-      where: {
-        orderId,
-        ...(lineIds?.length ? { lineId: { in: lineIds } } : {}),
-      },
-      select: {
-        lineId: true,
-        productId: true,
-        warehouseId: true,
-        qty: true,
-      },
-    }),
-    client.shipmentLine.findMany({
-      where: {
-        shipment: { orderId, status: { not: 'PENDING' } },
-        ...(lineIds?.length ? { lineId: { in: lineIds } } : {}),
-      },
-      select: {
-        lineId: true,
-        productId: true,
-        qty: true,
-      },
-    }),
-  ])
-
-  const committedByLine = calculateCoverageByLine(
-    requirementsByLine,
-    activeShipmentLines.map((line) => ({
-      lineId: line.lineId,
-      productId: line.productId,
-      qty: Number(line.qty),
-    })),
-  )
-
-  for (const line of lines) {
-    const requirements = requirementsByLine.get(line.id) ?? []
-    if (requirements.length === 0) continue
-
-    const requiredProductIds = new Set(requirements.map((requirement) => requirement.productId))
-    const lineAllocations = allocations.filter((allocation) => allocation.lineId === line.id)
-    const byWarehouse = new Map<string, Map<string, number>>()
-
-    for (const allocation of lineAllocations) {
-      const quantities = byWarehouse.get(allocation.warehouseId) ?? new Map<string, number>()
-      quantities.set(allocation.productId, (quantities.get(allocation.productId) ?? 0) + Number(allocation.qty))
-      byWarehouse.set(allocation.warehouseId, quantities)
-    }
-
-    let allocatedCoverage = 0
-    for (const [warehouseId, quantities] of byWarehouse) {
-      const coverage = calculateFulfillmentCoverage(requirements, quantities)
-      if (coverage <= ALLOCATION_EPSILON) {
-        return `Allocation for sales line ${line.sku ?? line.description} in warehouse ${warehouseId} does not contain a complete component set`
-      }
-
-      for (const requirement of requirements) {
-        const actualQty = quantities.get(requirement.productId) ?? 0
-        const expectedQty = coverage * requirement.factor
-        if (Math.abs(actualQty - expectedQty) > ALLOCATION_EPSILON) {
-          return `Allocation for sales line ${line.sku ?? line.description} in warehouse ${warehouseId} must keep bundle components in matching quantities`
-        }
-      }
-
-      for (const productId of quantities.keys()) {
-        if (!requiredProductIds.has(productId)) {
-          return `Allocation for sales line ${line.sku ?? line.description} contains an unexpected component`
-        }
-      }
-
-      allocatedCoverage += coverage
-    }
-
-    const committedCoverage = committedByLine.get(line.id) ?? 0
-    const remainingQty = Math.max(0, Number(line.qty) - committedCoverage)
-    if (Math.abs(allocatedCoverage - remainingQty) > ALLOCATION_EPSILON && allocatedCoverage > remainingQty) {
-      return `Allocation for sales line ${line.sku ?? line.description} exceeds the remaining quantity to fulfill`
-    }
-  }
-
-  return null
 }
 
 // ---------------------------------------------------------------------------
@@ -667,116 +547,7 @@ export async function confirmAllocations(
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.process')
     }
-    const result = await db.$transaction(async (tx) => {
-      await lockSalesOrder(tx, orderId)
-      const so = await tx.salesOrder.findUnique({
-        where: { id: orderId },
-        select: { orderNumber: true, externalOrderNumber: true, status: true },
-      })
-      if (!so) throw new Error('Order not found')
-
-      const allocs = await tx.orderAllocation.findMany({
-        where: { orderId },
-        select: { lineId: true, productId: true, warehouseId: true, qty: true },
-      })
-      if (!allocs.length) throw new Error('No allocations to confirm')
-
-      // Fetch qty already committed in non-PENDING shipments (partial fulfillment).
-      const activeShipmentLines = await tx.shipmentLine.findMany({
-        where: {
-          shipment: { orderId, status: { not: 'PENDING' } },
-        },
-        select: { lineId: true, productId: true, shipment: { select: { warehouseId: true } }, qty: true },
-      })
-      const committedByAllocationKey = new Map<string, number>()
-      for (const shipmentLine of activeShipmentLines) {
-        const key = `${shipmentLine.lineId}|${shipmentLine.shipment.warehouseId}|${shipmentLine.productId}`
-        committedByAllocationKey.set(
-          key,
-          (committedByAllocationKey.get(key) ?? 0) + Number(shipmentLine.qty),
-        )
-      }
-
-      const effectiveAllocs = allocs.map((alloc) => {
-        const key = `${alloc.lineId}|${alloc.warehouseId}|${alloc.productId}`
-        const committed = committedByAllocationKey.get(key) ?? 0
-        const effectiveQty = Math.max(0, Number(alloc.qty) - committed)
-        return { ...alloc, qty: effectiveQty }
-      }).filter((alloc) => alloc.qty > 0)
-
-      if (!effectiveAllocs.length) {
-        throw new Error('All allocated lines are already covered by active shipments')
-      }
-
-      const integrityError = await validateAllocationIntegrity(tx, orderId)
-      if (integrityError) throw new Error(integrityError)
-
-      const pendingShipmentMetadata = await tx.shipment.findMany({
-        where: { orderId, status: 'PENDING' },
-        select: { warehouseId: true, trackingNumber: true, shippingService: true },
-      })
-      const pendingMetadataByWarehouse = new Map(
-        pendingShipmentMetadata.map((shipment) => [shipment.warehouseId, shipment]),
-      )
-
-      // Delete existing pending shipments (re-confirm scenario) in the same
-      // transaction that rebuilds them, so crashes cannot orphan shipment rows.
-      // Preserve pending tracking/service metadata by warehouse; users may
-      // pre-stage carrier data before reconfirming allocation quantities.
-      const deletedPending = await tx.shipment.deleteMany({ where: { orderId, status: 'PENDING' } })
-
-      const byWarehouse = new Map<string, typeof effectiveAllocs>()
-      for (const a of effectiveAllocs) {
-        const group = byWarehouse.get(a.warehouseId) ?? []
-        group.push(a)
-        byWarehouse.set(a.warehouseId, group)
-      }
-
-      const createdShipments: Array<{ id: string; warehouseId: string; lineCount: number; totalQty: number }> = []
-      for (const [warehouseId, whAllocs] of byWarehouse) {
-        const pendingMetadata = pendingMetadataByWarehouse.get(warehouseId)
-        const created = await tx.shipment.create({
-          data: {
-            orderId,
-            warehouseId,
-            status: 'PENDING',
-            trackingNumber: pendingMetadata?.trackingNumber ?? null,
-            shippingService: pendingMetadata?.shippingService ?? null,
-            lines: {
-              create: whAllocs.map((a) => ({
-                lineId: a.lineId,
-                productId: a.productId,
-                qty: a.qty,
-              })),
-            },
-          },
-          select: { id: true },
-        })
-        createdShipments.push({
-          id: created.id,
-          warehouseId,
-          lineCount: whAllocs.length,
-          totalQty: whAllocs.reduce((sum, a) => sum + Number(a.qty), 0),
-        })
-      }
-
-      // Keep status as ALLOCATED — shipment-level progression handles the rest.
-      if (so.status !== 'ALLOCATED') {
-        const transition = validateSalesOrderStatusTransition(so.status, 'ALLOCATED')
-        if (!transition.success) throw new Error(transition.error)
-        await tx.salesOrder.update({
-          where: { id: orderId },
-          data: { status: 'ALLOCATED' },
-        })
-      }
-
-      return {
-        orderNumber: so.orderNumber ?? so.externalOrderNumber,
-        shipmentCount: byWarehouse.size,
-        deletedPendingCount: deletedPending.count,
-        createdShipments,
-      }
-    }, STOCK_TX_OPTIONS)
+    const result = await confirmSalesOrderShipments(db, orderId)
 
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)
@@ -811,70 +582,6 @@ export async function confirmAllocations(
 }
 
 // ---------------------------------------------------------------------------
-// Post-shipment reconciliation — idempotent, safe to re-run on retries.
-// Checks whether all shipments for the order are shipped, advances order
-// status, aggregates tracking numbers, and triggers auto-invoicing.
-// ---------------------------------------------------------------------------
-
-type ShipmentContext = {
-  orderId: string
-  lines: Array<{ productId: string }>
-  warehouse: { code: string }
-  order: { orderNumber: string | null; externalOrderNumber: string | null }
-}
-
-async function reconcileOrderAfterShipment(
-  shipment: ShipmentContext,
-  extra?: { trackingNumber?: string; shippingService?: string },
-): Promise<void> {
-  const allShipments = await db.shipment.findMany({
-    where: { orderId: shipment.orderId },
-    select: { id: true, status: true },
-  })
-  const allShipped = allShipments.every((s) => s.status === 'SHIPPED')
-
-  if (allShipped) {
-    const shippedShipments = await db.shipment.findMany({
-      where: { orderId: shipment.orderId },
-      select: { trackingNumber: true },
-    })
-    const trackingNumbers = shippedShipments
-      .map((s) => s.trackingNumber)
-      .filter(Boolean)
-      .join(', ')
-
-    await db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT id FROM sales_orders WHERE id = ${shipment.orderId} FOR UPDATE`
-      const currentOrder = await tx.salesOrder.findUnique({
-        where: { id: shipment.orderId },
-        select: { status: true },
-      })
-      if (!currentOrder) return
-      if (['SHIPPED', 'COMPLETED', 'DELIVERED', 'REFUNDED', 'CANCELLED'].includes(currentOrder.status)) return
-
-      const transition = validateSalesOrderStatusTransition(currentOrder.status, 'SHIPPED')
-      if (!transition.success) throw new Error(transition.error)
-      await tx.salesOrder.update({
-        where: { id: shipment.orderId },
-        data: {
-          status: 'SHIPPED',
-          shippedAt: new Date(),
-          trackingNumber: trackingNumbers || (extra?.trackingNumber ?? null),
-        },
-      })
-    }, STOCK_TX_OPTIONS)
-
-    // Auto-generate invoice on ship if configured (idempotent — checks
-    // if invoice already exists inside generateInvoiceNumber)
-    const trigger = await db.setting.findUnique({ where: { key: 'invoice_trigger' } })
-    if (trigger?.value === 'on_shipped') {
-      const { generateInvoiceNumber } = await import('./sales')
-      await generateInvoiceNumber(shipment.orderId)
-    }
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Update shipment (tracking, status)
 // ---------------------------------------------------------------------------
 
@@ -888,193 +595,57 @@ export async function updateShipmentStatus(
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.process')
     }
-    const shipment = await db.shipment.findUnique({
-      where: { id: shipmentId },
-      include: {
-        order: { select: { id: true, orderNumber: true, externalOrderNumber: true, status: true } },
-        lines: { select: { id: true, lineId: true, productId: true, qty: true, product: { select: { sku: true } } } },
-        warehouse: { select: { code: true } },
-      },
+    const result = await transitionShipmentStatus(db, {
+      shipmentId,
+      targetStatus,
+      extra,
     })
-    if (!shipment) return { success: false, error: 'Shipment not found' }
+    if (!result.success) return result
 
-    // Idempotent: if the shipment is already at the target status, re-run
-    // the post-commit reconciliation (order status, tracking, invoice,
-    // delivery metadata, stock sync) which may have been missed on a prior
-    // attempt that committed the tx but crashed before finishing side-effects.
-    if (shipment.status === targetStatus) {
-      if (targetStatus === 'SHIPPED') {
-        await reconcileOrderAfterShipment(shipment, extra)
-      }
-      return { success: true }
-    }
-
-    const transition = validateShipmentStatusTransition(shipment.status, targetStatus)
-    if (!transition.success) {
-      return { success: false, error: transition.error }
-    }
-
-    const data: Record<string, unknown> = { status: targetStatus }
-    if (extra?.trackingNumber) data.trackingNumber = extra.trackingNumber
-    if (extra?.shippingService) data.shippingService = extra.shippingService
-
-    // On SHIPPED: dispatch stock atomically with the status change.
-    // The status update MUST happen inside the same transaction as the
-    // stock mutation so two concurrent calls (duplicate webhook, retry,
-    // double-click) cannot both observe PACKED, both pass validation,
-    // and both decrement stock. The conditional update ensures already-
-    // shipped shipments are treated as a no-op.
     if (targetStatus === 'SHIPPED') {
-      data.shippedAt = new Date()
-
-      const dispatched = await db.$transaction(async (tx) => {
-        await lockSalesOrder(tx, shipment.orderId)
-        // Re-check status under lock — another caller may have shipped it
-        // between our initial read and this transaction.
-        const locked = await tx.shipment.findUnique({
-          where: { id: shipmentId },
-          select: { status: true },
-        })
-        if (locked?.status !== shipment.status) {
-          return false // already transitioned — no-op
-        }
-
-        // Persist shipment status change inside the tx
-        await tx.shipment.update({ where: { id: shipmentId }, data })
-
-        await lockStockLevels(
-          tx,
-          [...new Set(shipment.lines.map((line) => line.productId))],
-          [shipment.warehouseId],
-        )
-        let totalShipmentCogs = 0
-        for (const line of shipment.lines) {
-          const qty = Number(line.qty)
-          await tx.stockLevel.updateMany({
-            where: { productId: line.productId, warehouseId: shipment.warehouseId },
-            data: { reservedQty: { decrement: qty } },
-          })
-          await tx.stockLevel.updateMany({
-            where: { productId: line.productId, warehouseId: shipment.warehouseId },
-            data: { quantity: { decrement: qty } },
-          })
-          const movement = await tx.stockMovement.create({
-            data: {
-              type: 'SALE_DISPATCH',
-              productId: line.productId,
-              fromWarehouseId: shipment.warehouseId,
-              qty,
-              note: `Dispatched for order — shipment from ${shipment.warehouse.code}`,
-              referenceType: 'SalesOrder',
-              referenceId: shipment.orderId,
-            },
-            select: { id: true },
-          })
-
-          // Consume FIFO cost layers at shipment time so inventory
-          // valuation is immediately correct and the daily batch (Group B)
-          // can read pre-computed snapshots instead of mutating layers.
-          const { consumed, totalCost } = await consumeFifoLayersStrict(
-            tx, line.productId, shipment.warehouseId, qty,
-          )
-          totalShipmentCogs += totalCost
-          if (consumed.length > 0) {
-            await tx.cogsEntry.createMany({
-              data: consumed.map((entry) => ({
-                costLayerId: entry.costLayerId,
-                movementId: movement.id,
-                qty: entry.qty,
-                unitCostBase: entry.unitCostBase,
-                totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
-              })),
-            })
-            await tx.shipmentLine.update({
-              where: { id: line.id },
-              data: {
-                costLayerSnapshot: consumed.map((c) => ({
-                  costLayerId: c.costLayerId,
-                  qty: c.qty,
-                  unitCostBase: c.unitCostBase,
-                })),
-              },
-            })
-          }
-        }
-
-        // Store pre-computed COGS on the shipment so Group B can read
-        // it directly without re-consuming layers.
-        if (totalShipmentCogs > 0) {
-          await tx.shipment.update({
-            where: { id: shipmentId },
-            data: { cogsBatchAmount: Math.round(totalShipmentCogs * 100) / 100 },
-          })
-        }
-
-        await refreshSalesOrderLineCogs(
-          tx,
-          shipment.lines.map((line) => line.lineId),
-        )
-
-        return true
-      }, STOCK_TX_OPTIONS)
-
-      if (!dispatched) {
-        return { success: true } // idempotent — already shipped
+      const reconciliation = await reconcileOrderAfterShipment(db, result.shipment, extra)
+      if (reconciliation.shouldGenerateInvoice) {
+        const { generateInvoiceNumber } = await import('./sales')
+        await generateInvoiceNumber(reconciliation.orderId)
       }
+    }
+    if (!result.transitioned) return { success: true }
 
-      for (const line of shipment.lines) {
-        const qty = Number(line.qty)
+    if (result.dispatched) {
+      for (const line of result.shipment.lines) {
+        const qty = decimalToNumber(line.qty)
         await logActivity({
           entityType: 'STOCK_ADJUSTMENT',
           entityId: line.productId,
           action: 'dispatched',
           tag: 'stock',
           level: 'INFO',
-          description: `Dispatched ${qty} units of SKU ${line.product.sku} from ${shipment.warehouse.code} for order ${shipment.order.orderNumber ?? shipment.order.externalOrderNumber}`,
-          metadata: { sku: line.product.sku, productId: line.productId, qty, orderNumber: shipment.order.orderNumber ?? shipment.order.externalOrderNumber, warehouseId: shipment.warehouseId },
+          description: `Dispatched ${qty} units of SKU ${line.product.sku} from ${result.shipment.warehouse.code} for order ${result.shipment.order.orderNumber ?? result.shipment.order.externalOrderNumber}`,
+          metadata: { sku: line.product.sku, productId: line.productId, qty, orderNumber: result.shipment.order.orderNumber ?? result.shipment.order.externalOrderNumber, warehouseId: result.shipment.warehouseId },
         })
       }
-    } else {
-      const transitioned = await db.$transaction(async (tx) => {
-        await tx.$executeRaw`SELECT id FROM shipments WHERE id = ${shipmentId} FOR UPDATE`
-        const locked = await tx.shipment.findUnique({
-          where: { id: shipmentId },
-          select: { status: true },
-        })
-        if (!locked) throw new Error('Shipment not found')
-        if (locked.status === targetStatus) return false
-        const lockedTransition = validateShipmentStatusTransition(locked.status, targetStatus)
-        if (!lockedTransition.success) throw new Error(lockedTransition.error)
-        await tx.shipment.update({ where: { id: shipmentId }, data })
-        return true
-      }, STOCK_TX_OPTIONS)
-      if (!transitioned) return { success: true }
-    }
-
-    if (targetStatus === 'SHIPPED') {
-      await reconcileOrderAfterShipment(shipment, extra)
     }
 
     revalidatePath('/sales')
-    revalidatePath(`/sales/${shipment.orderId}`)
+    revalidatePath(`/sales/${result.shipment.orderId}`)
     await logActivity({
       entityType: 'SALES_ORDER',
-      entityId: shipment.orderId,
+      entityId: result.shipment.orderId,
       action: 'shipment_status_changed',
       tag: 'sales',
       level: 'INFO',
-      description: `Shipment from ${shipment.warehouse.code} for order ${shipment.order.orderNumber ?? shipment.order.externalOrderNumber} → ${targetStatus}`,
-      metadata: { shipmentId, warehouseCode: shipment.warehouse.code, previousStatus: shipment.status, newStatus: targetStatus },
+      description: `Shipment from ${result.shipment.warehouse.code} for order ${result.shipment.order.orderNumber ?? result.shipment.order.externalOrderNumber} → ${targetStatus}`,
+      metadata: { shipmentId, warehouseCode: result.shipment.warehouse.code, previousStatus: result.previousStatus, newStatus: targetStatus },
     })
     if (targetStatus === 'SHIPPED') {
       try {
-        await pushOrderDeliveryMetadata(shipment.orderId)
+        await pushOrderDeliveryMetadata(result.shipment.orderId)
       } catch (syncError) {
         console.error(syncError)
       }
       try {
         await enqueueStockSync(
-          [...new Set(shipment.lines.map((line) => line.productId))],
+          result.stockSyncProductIds,
           'IMS_CHANGE',
         )
       } catch (syncError) {

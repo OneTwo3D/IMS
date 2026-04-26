@@ -1,6 +1,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
 import {
+  calculateFulfillmentCoverage,
   calculateCoverageByLine,
   requirementsMapToRows,
   type FulfillmentRequirement,
@@ -192,6 +193,125 @@ export async function applyAllocationReservationDelta(
       data: { reservedQty: { decrement: qty } },
     })
   }
+}
+
+export async function validateAllocationIntegrity(
+  client: AllocationServiceClient,
+  orderId: string,
+  lineIds?: string[],
+): Promise<string | null> {
+  const lines = await client.salesOrderLine.findMany({
+    where: {
+      orderId,
+      productId: { not: null },
+      ...(lineIds?.length ? { id: { in: lineIds } } : {}),
+    },
+    select: {
+      id: true,
+      productId: true,
+      qty: true,
+      sku: true,
+      description: true,
+    },
+  })
+  if (lines.length === 0) return null
+
+  const graph = await loadFulfillmentProductGraph(
+    client,
+    lines.map((line) => line.productId!).filter(Boolean),
+  )
+  const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
+  for (const line of lines) {
+    requirementsByLine.set(
+      line.id,
+      requirementsMapToRows(expandFulfillmentRequirements(line.productId!, 1, graph)),
+    )
+  }
+
+  const [allocations, activeShipmentLines] = await Promise.all([
+    client.orderAllocation.findMany({
+      where: {
+        orderId,
+        ...(lineIds?.length ? { lineId: { in: lineIds } } : {}),
+      },
+      select: {
+        lineId: true,
+        productId: true,
+        warehouseId: true,
+        qty: true,
+      },
+    }),
+    client.shipmentLine.findMany({
+      where: {
+        shipment: { orderId, status: { not: 'PENDING' } },
+        ...(lineIds?.length ? { lineId: { in: lineIds } } : {}),
+      },
+      select: {
+        lineId: true,
+        productId: true,
+        qty: true,
+      },
+    }),
+  ])
+
+  const committedByLine = calculateCoverageByLine(
+    requirementsByLine,
+    activeShipmentLines.map((line) => ({
+      lineId: line.lineId,
+      productId: line.productId,
+      qty: decimalToNumber(line.qty),
+    })),
+  )
+
+  for (const line of lines) {
+    const requirements = requirementsByLine.get(line.id) ?? []
+    if (requirements.length === 0) continue
+
+    const requiredProductIds = new Set(requirements.map((requirement) => requirement.productId))
+    const lineAllocations = allocations.filter((allocation) => allocation.lineId === line.id)
+    const byWarehouse = new Map<string, Map<string, number>>()
+
+    for (const allocation of lineAllocations) {
+      const quantities = byWarehouse.get(allocation.warehouseId) ?? new Map<string, number>()
+      quantities.set(
+        allocation.productId,
+        (quantities.get(allocation.productId) ?? 0) + decimalToNumber(allocation.qty),
+      )
+      byWarehouse.set(allocation.warehouseId, quantities)
+    }
+
+    let allocatedCoverage = 0
+    for (const [warehouseId, quantities] of byWarehouse) {
+      const coverage = calculateFulfillmentCoverage(requirements, quantities)
+      if (coverage <= ALLOCATION_EPSILON) {
+        return `Allocation for sales line ${line.sku ?? line.description} in warehouse ${warehouseId} does not contain a complete component set`
+      }
+
+      for (const requirement of requirements) {
+        const actualQty = quantities.get(requirement.productId) ?? 0
+        const expectedQty = coverage * requirement.factor
+        if (Math.abs(actualQty - expectedQty) > ALLOCATION_EPSILON) {
+          return `Allocation for sales line ${line.sku ?? line.description} in warehouse ${warehouseId} must keep bundle components in matching quantities`
+        }
+      }
+
+      for (const productId of quantities.keys()) {
+        if (!requiredProductIds.has(productId)) {
+          return `Allocation for sales line ${line.sku ?? line.description} contains an unexpected component`
+        }
+      }
+
+      allocatedCoverage += coverage
+    }
+
+    const committedCoverage = committedByLine.get(line.id) ?? 0
+    const remainingQty = Math.max(0, decimalToNumber(line.qty) - committedCoverage)
+    if (Math.abs(allocatedCoverage - remainingQty) > ALLOCATION_EPSILON && allocatedCoverage > remainingQty) {
+      return `Allocation for sales line ${line.sku ?? line.description} exceeds the remaining quantity to fulfill`
+    }
+  }
+
+  return null
 }
 
 function mergeAllocationRows(rows: AllocationRowInput[]): AllocationRowInput[] {
