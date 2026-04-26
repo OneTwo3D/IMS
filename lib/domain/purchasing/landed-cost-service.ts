@@ -1,0 +1,649 @@
+import { Prisma } from '@/app/generated/prisma/client'
+import { getAccountingSettings, queueAccountingSync } from '@/lib/accounting'
+import { accountingPayloadKey } from '@/lib/accounting/payload-key'
+import { logActivity } from '@/lib/activity-log'
+import {
+  getReturnedQtyForCostLayer,
+  getSupplierReturnedQtyForCostLayer,
+  refreshSalesOrderLineCogsForCostLayerChange,
+  refreshShipmentCogsForCostLayerChange,
+  updateSnapshotsForCostLayerChange,
+} from '@/lib/cost-layers'
+import { decimalToNumber } from '@/lib/decimal'
+
+export const LANDED_COST_DISTRIBUTION_METHODS = [
+  'BY_VALUE',
+  'BY_QUANTITY',
+  'BY_WEIGHT',
+  'EQUAL_SPLIT',
+] as const
+
+export type LandedCostDistributionMethod = typeof LANDED_COST_DISTRIBUTION_METHODS[number]
+
+export type PendingGrossCostLine = {
+  id: string
+  qty: Prisma.Decimal | number | string
+  unitCostBase: Prisma.Decimal | number | string
+  totalBase: Prisma.Decimal | number | string
+  landedUnitCostBase?: Prisma.Decimal | number | string | null
+  weight?: Prisma.Decimal | number | string | null
+}
+
+export type PendingGrossCostLineSource = {
+  amountBase: Prisma.Decimal | number | string
+  distributionMethod: string | null | undefined
+}
+
+export type LandedCostRecalcResult = {
+  revalidatePoIds: string[]
+  inventoryTransitAdjustments: Array<{
+    primaryPoId: string
+    primaryPoRef: string
+    totalDelta: number
+  }>
+  /** COGS adjustment needed for layers that were already consumed before
+   *  the landed cost changed. Positive = cost increase, negative = decrease. */
+  cogsAdjustments: Array<{
+    primaryPoId: string
+    primaryPoRef: string
+    totalDelta: number
+  }>
+}
+
+type DistributionLine = {
+  qty: Prisma.Decimal
+  totalBase: Prisma.Decimal
+  product: { weight: Prisma.Decimal | null }
+}
+
+type CostLayerAdjustmentInput = {
+  oldUnitCost: number
+  newUnitCost: number
+  receivedQty: number
+  remainingQty: number
+  returnedQty: number
+  supplierReturnedQty: number
+}
+
+type LandedCostAdjustment = LandedCostRecalcResult['inventoryTransitAdjustments'][number]
+
+export type LandedCostServiceDeps = {
+  getReturnedQtyForCostLayer: typeof getReturnedQtyForCostLayer
+  getSupplierReturnedQtyForCostLayer: typeof getSupplierReturnedQtyForCostLayer
+  updateSnapshotsForCostLayerChange: typeof updateSnapshotsForCostLayerChange
+  refreshShipmentCogsForCostLayerChange: typeof refreshShipmentCogsForCostLayerChange
+  refreshSalesOrderLineCogsForCostLayerChange: typeof refreshSalesOrderLineCogsForCostLayerChange
+  warnWeightFallback: (context: string) => void
+}
+
+const defaultDeps: LandedCostServiceDeps = {
+  getReturnedQtyForCostLayer,
+  getSupplierReturnedQtyForCostLayer,
+  updateSnapshotsForCostLayerChange,
+  refreshShipmentCogsForCostLayerChange,
+  refreshSalesOrderLineCogsForCostLayerChange,
+  warnWeightFallback,
+}
+
+function decimal(value: Prisma.Decimal | number | string | null | undefined): Prisma.Decimal {
+  return new Prisma.Decimal(value ?? 0)
+}
+
+export function normalizeLandedCostMethod(
+  method: string | null | undefined,
+): LandedCostDistributionMethod {
+  return LANDED_COST_DISTRIBUTION_METHODS.includes(method as LandedCostDistributionMethod)
+    ? method as LandedCostDistributionMethod
+    : 'BY_VALUE'
+}
+
+export function computeDistributionBase(
+  line: DistributionLine,
+  method: LandedCostDistributionMethod,
+): Prisma.Decimal {
+  switch (method) {
+    case 'BY_WEIGHT':
+      return decimal(line.product.weight).mul(line.qty)
+    case 'BY_QUANTITY':
+      return decimal(line.qty)
+    case 'EQUAL_SPLIT':
+      return new Prisma.Decimal(1)
+    case 'BY_VALUE':
+    default:
+      return decimal(line.totalBase)
+  }
+}
+
+export function calculateLayerAdjustmentDeltas(input: CostLayerAdjustmentInput): {
+  costDelta: number
+  consumedQty: number
+  netConsumedQty: number
+  cogsDelta: number
+  inventoryDelta: number
+} {
+  const costDelta = input.newUnitCost - input.oldUnitCost
+  const consumedQty = input.receivedQty - input.remainingQty
+  const netConsumedQty = Math.max(0, consumedQty - input.returnedQty - input.supplierReturnedQty)
+  return {
+    costDelta,
+    consumedQty,
+    netConsumedQty,
+    cogsDelta: netConsumedQty > 0 && Math.abs(costDelta) > 0.000001
+      ? costDelta * netConsumedQty
+      : 0,
+    inventoryDelta: input.remainingQty > 0.000001 && Math.abs(costDelta) > 0.000001
+      ? costDelta * input.remainingQty
+      : 0,
+  }
+}
+
+function warnWeightFallback(context: string) {
+  const description = `${context}: BY_WEIGHT landed-cost allocation fell back to equal split because every eligible line had zero weight`
+  console.warn(description)
+  void logActivity({
+    entityType: 'PURCHASE_ORDER',
+    entityId: null,
+    action: 'landed_cost_weight_fallback',
+    tag: 'purchase',
+    level: 'WARNING',
+    description,
+    metadata: { context },
+    resolveUser: false,
+  }).catch((error) => console.error(error))
+}
+
+function landedCostAdjustmentKeyPayload(adj: LandedCostAdjustment): Record<string, unknown> {
+  return {
+    primaryPoId: adj.primaryPoId,
+    primaryPoRef: adj.primaryPoRef,
+    totalDelta: Math.round(adj.totalDelta * 100) / 100,
+  }
+}
+
+export function landedCostAdjustmentIdempotencyKey(
+  kind: 'inventory' | 'cogs',
+  adj: LandedCostAdjustment,
+): string {
+  return accountingPayloadKey(
+    `landed-cost:${kind}:${adj.primaryPoId}`,
+    landedCostAdjustmentKeyPayload(adj),
+  )
+}
+
+export function computeGrossUnitCostBaseByLine(params: {
+  lines: PendingGrossCostLine[]
+  directCostLines?: PendingGrossCostLineSource[]
+  linkedCostLines?: PendingGrossCostLineSource[]
+}): Map<string, number> {
+  const eligibleLines = params.lines.filter((line) => decimal(line.qty).gt(0))
+  const landedByLine = new Map<string, Prisma.Decimal>()
+  for (const line of eligibleLines) {
+    landedByLine.set(line.id, new Prisma.Decimal(0))
+  }
+
+  const allCostLines = [
+    ...(params.directCostLines ?? []),
+    ...(params.linkedCostLines ?? []),
+  ]
+
+  for (const costLine of allCostLines) {
+    const amountBase = decimal(costLine.amountBase)
+    if (amountBase.lte(0)) continue
+    const method = normalizeLandedCostMethod(costLine.distributionMethod)
+    const bases = eligibleLines.map((line) => ({
+      lineId: line.id,
+      base: computeDistributionBase(
+        {
+          qty: decimal(line.qty),
+          totalBase: decimal(line.totalBase),
+          product: { weight: decimal(line.weight) },
+        },
+        method,
+      ),
+    }))
+    let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
+    if (basisTotal.lte(0)) {
+      if (method === 'BY_WEIGHT') warnWeightFallback('computeGrossUnitCostBaseByLine')
+      basisTotal = new Prisma.Decimal(eligibleLines.length || 1)
+      for (const entry of bases) entry.base = new Prisma.Decimal(1)
+    }
+    for (const entry of bases) {
+      const share = amountBase.mul(entry.base).div(basisTotal)
+      landedByLine.set(entry.lineId, decimal(landedByLine.get(entry.lineId)).add(share))
+    }
+  }
+
+  const grossByLine = new Map<string, number>()
+  for (const line of params.lines) {
+    if (decimal(line.qty).lte(0)) {
+      grossByLine.set(line.id, decimal(line.unitCostBase).toNumber())
+      continue
+    }
+    grossByLine.set(
+      line.id,
+      decimal(line.unitCostBase)
+        .add(decimal(landedByLine.get(line.id)).div(decimal(line.qty)))
+        .toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+        .toNumber(),
+    )
+  }
+
+  return grossByLine
+}
+
+export async function queueLandedCostAdjustmentJournals(
+  adjustments: LandedCostRecalcResult,
+): Promise<void> {
+  const settings = await getAccountingSettings()
+
+  for (const adj of adjustments.inventoryTransitAdjustments) {
+    const absDelta = Math.abs(adj.totalDelta)
+    if (absDelta <= 0.01) continue
+    const isIncrease = adj.totalDelta > 0
+    const payload = {
+      date: new Date().toISOString().slice(0, 10),
+      reference: `Landed cost reclass — ${adj.primaryPoRef}`,
+      narration: `Late landed cost ${isIncrease ? 'capitalisation' : 'reversal'} of £${absDelta.toFixed(2)} on ${adj.primaryPoRef}`,
+      lines: [
+        {
+          accountCode: isIncrease ? settings.inventoryAccount : settings.transitAccount,
+          description: `Landed cost reclass — ${adj.primaryPoRef}`,
+          debit: absDelta,
+        },
+        {
+          accountCode: isIncrease ? settings.transitAccount : settings.inventoryAccount,
+          description: `Landed cost reclass — ${adj.primaryPoRef}`,
+          credit: absDelta,
+        },
+      ],
+    }
+    await queueAccountingSync({
+      type: 'STOCK_IN_TRANSIT',
+      referenceType: 'PurchaseOrder',
+      referenceId: adj.primaryPoId,
+      payload,
+      idempotencyKey: landedCostAdjustmentIdempotencyKey('inventory', adj),
+    })
+  }
+
+  for (const adj of adjustments.cogsAdjustments) {
+    const absDelta = Math.abs(adj.totalDelta)
+    if (absDelta <= 0.01) continue
+    const isIncrease = adj.totalDelta > 0
+    const payload = {
+      date: new Date().toISOString().slice(0, 10),
+      reference: `Landed cost adjustment — ${adj.primaryPoRef}`,
+      narration: `Retrospective COGS adjustment: landed cost ${isIncrease ? 'increase' : 'decrease'} of £${absDelta.toFixed(2)} on ${adj.primaryPoRef}`,
+      lines: [
+        {
+          accountCode: isIncrease ? settings.cogsAccount : settings.transitAccount,
+          description: `COGS adjustment — ${adj.primaryPoRef}`,
+          debit: absDelta,
+        },
+        {
+          accountCode: isIncrease ? settings.transitAccount : settings.cogsAccount,
+          description: `COGS adjustment — ${adj.primaryPoRef}`,
+          credit: absDelta,
+        },
+      ],
+    }
+    await queueAccountingSync({
+      type: 'COGS_JOURNAL',
+      referenceType: 'PurchaseOrder',
+      referenceId: adj.primaryPoId,
+      payload,
+      idempotencyKey: landedCostAdjustmentIdempotencyKey('cogs', adj),
+    })
+  }
+}
+
+/**
+ * Recalculate landed cost on all primary POs linked to this freight PO.
+ * Updates PO line `landedUnitCostBase`, CostLayer `unitCostBase`, and CogsEntry costs.
+ */
+export async function recalculateLandedCosts(
+  tx: Prisma.TransactionClient,
+  freightPoId: string,
+  deps: LandedCostServiceDeps = defaultDeps,
+): Promise<LandedCostRecalcResult> {
+  const links = await tx.landedCostLink.findMany({
+    where: { freightPoId },
+    select: { primaryPoId: true },
+  })
+  const result: LandedCostRecalcResult = { revalidatePoIds: [], inventoryTransitAdjustments: [], cogsAdjustments: [] }
+
+  for (const link of links) {
+    const primaryPoId = link.primaryPoId
+
+    const primaryPo = await tx.purchaseOrder.findUnique({
+      where: { id: primaryPoId },
+      select: {
+        id: true,
+        reference: true,
+        status: true,
+        subtotalBase: true,
+        directFreightBase: true,
+        lines: {
+          select: {
+            id: true,
+            qty: true,
+            unitCostBase: true,
+            totalBase: true,
+            product: { select: { weight: true } },
+            costLayers: {
+              select: {
+                id: true,
+                unitCostBase: true,
+                receivedQty: true,
+                remainingQty: true,
+              },
+            },
+          },
+        },
+        freightCostLines: {
+          select: { amountBase: true, distributionMethod: true },
+        },
+      },
+    })
+    if (!primaryPo) continue
+    if (primaryPo.status === 'CLOSED') {
+      throw new Error(`Cannot recalculate landed costs for ${primaryPoId}: purchase order is in a locked status`)
+    }
+
+    const allLinks = await tx.landedCostLink.findMany({
+      where: { primaryPoId },
+      select: {
+        freightPO: {
+          select: {
+            freightCostLines: {
+              select: { amountBase: true, distributionMethod: true },
+            },
+          },
+        },
+      },
+    })
+    const landedByLine = new Map<string, Prisma.Decimal>()
+    for (const line of primaryPo.lines) {
+      landedByLine.set(line.id, new Prisma.Decimal(0))
+    }
+
+    const eligibleLines = primaryPo.lines.filter((line) => decimal(line.qty).gt(0))
+    for (const freightCostLine of primaryPo.freightCostLines) {
+      const method = normalizeLandedCostMethod(freightCostLine.distributionMethod)
+      const bases = eligibleLines.map((line) => ({
+        lineId: line.id,
+        base: computeDistributionBase(line, method),
+      }))
+      let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
+
+      if (basisTotal.lte(0)) {
+        if (method === 'BY_WEIGHT') deps.warnWeightFallback(`recalculateLandedCosts:${primaryPo.reference}`)
+        const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
+        basisTotal = equalBase
+        for (const entry of bases) entry.base = new Prisma.Decimal(1)
+      }
+
+      const amountBase = decimal(freightCostLine.amountBase)
+      for (const entry of bases) {
+        const share = amountBase.mul(entry.base).div(basisTotal)
+        landedByLine.set(entry.lineId, decimal(landedByLine.get(entry.lineId)).add(share))
+      }
+    }
+
+    for (const linkRow of allLinks) {
+      for (const freightCostLine of linkRow.freightPO.freightCostLines) {
+        const method = normalizeLandedCostMethod(freightCostLine.distributionMethod)
+        const bases = eligibleLines.map((line) => ({
+          lineId: line.id,
+          base: computeDistributionBase(line, method),
+        }))
+        let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
+
+        if (basisTotal.lte(0)) {
+          if (method === 'BY_WEIGHT') deps.warnWeightFallback(`recalculateLandedCosts:${primaryPo.reference}:linked`)
+          const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
+          basisTotal = equalBase
+          for (const entry of bases) entry.base = new Prisma.Decimal(1)
+        }
+
+        const amountBase = decimal(freightCostLine.amountBase)
+        for (const entry of bases) {
+          const share = amountBase.mul(entry.base).div(basisTotal)
+          landedByLine.set(entry.lineId, decimal(landedByLine.get(entry.lineId)).add(share))
+        }
+      }
+    }
+
+    let totalCogsDelta = 0
+    let totalInventoryDelta = 0
+
+    for (const line of primaryPo.lines) {
+      const lineQty = decimal(line.qty)
+      if (lineQty.lte(0)) continue
+
+      const baseUnitCostBase = decimal(line.unitCostBase)
+      const landedForLine = decimal(landedByLine.get(line.id))
+      const landedPerUnit = landedForLine.div(lineQty)
+      const grossUnitCostBase = baseUnitCostBase.add(landedPerUnit).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+
+      await tx.purchaseOrderLine.update({
+        where: { id: line.id },
+        data: { landedUnitCostBase: grossUnitCostBase },
+      })
+
+      for (const cl of line.costLayers) {
+        const oldUnitCost = decimalToNumber(cl.unitCostBase)
+        const newUnitCost = grossUnitCostBase.toNumber()
+        const receivedQty = decimalToNumber(cl.receivedQty)
+        const remainingQty = decimalToNumber(cl.remainingQty)
+        const consumedQty = receivedQty - remainingQty
+        const returnedQty = consumedQty > 0.000001
+          ? await deps.getReturnedQtyForCostLayer(tx, cl.id)
+          : 0
+        const supplierReturnedQty = consumedQty > 0.000001
+          ? await deps.getSupplierReturnedQtyForCostLayer(tx, cl.id)
+          : 0
+        const deltas = calculateLayerAdjustmentDeltas({
+          oldUnitCost,
+          newUnitCost,
+          receivedQty,
+          remainingQty,
+          returnedQty,
+          supplierReturnedQty,
+        })
+        totalCogsDelta += deltas.cogsDelta
+        totalInventoryDelta += deltas.inventoryDelta
+
+        await tx.costLayer.update({
+          where: { id: cl.id },
+          data: { unitCostBase: grossUnitCostBase },
+        })
+
+        if (Math.abs(deltas.costDelta) > 0.000001) {
+          await deps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase.toNumber())
+          await deps.refreshShipmentCogsForCostLayerChange(tx, cl.id)
+          await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
+        }
+      }
+    }
+
+    result.revalidatePoIds.push(primaryPoId)
+
+    if (Math.abs(totalCogsDelta) > 0.01) {
+      result.cogsAdjustments.push({
+        primaryPoId,
+        primaryPoRef: primaryPo.reference,
+        totalDelta: Math.round(totalCogsDelta * 100) / 100,
+      })
+    }
+    if (Math.abs(totalInventoryDelta) > 0.01) {
+      result.inventoryTransitAdjustments.push({
+        primaryPoId,
+        primaryPoRef: primaryPo.reference,
+        totalDelta: Math.round(totalInventoryDelta * 100) / 100,
+      })
+    }
+
+    await tx.landedCostLink.updateMany({
+      where: { primaryPoId, freightPoId },
+      data: { allocated: true },
+    })
+  }
+  return result
+}
+
+/**
+ * Recalculate landed costs for a GOODS PO that has its own direct
+ * additional costs (FreightCostLine rows on the PO itself, no
+ * LandedCostLink). Same logic as recalculateLandedCosts but operates
+ * on the PO's own cost lines instead of looking up linked freight POs.
+ */
+export async function recalculateDirectLandedCosts(
+  tx: Prisma.TransactionClient,
+  poId: string,
+  deps: LandedCostServiceDeps = defaultDeps,
+): Promise<LandedCostRecalcResult> {
+  const po = await tx.purchaseOrder.findUnique({
+    where: { id: poId },
+    select: {
+      id: true,
+      reference: true,
+      status: true,
+      subtotalBase: true,
+      lines: {
+        select: {
+          id: true,
+          qty: true,
+          unitCostBase: true,
+          totalBase: true,
+          product: { select: { weight: true } },
+          costLayers: {
+            select: {
+              id: true,
+              unitCostBase: true,
+              receivedQty: true,
+              remainingQty: true,
+            },
+          },
+        },
+      },
+      freightCostLines: {
+        select: { amountBase: true, distributionMethod: true },
+      },
+      landedCostLinks: {
+        select: {
+          freightPO: {
+            select: {
+              freightCostLines: {
+                select: { amountBase: true, distributionMethod: true },
+              },
+            },
+          },
+        },
+      },
+    },
+  })
+  if (!po) return { revalidatePoIds: [], inventoryTransitAdjustments: [], cogsAdjustments: [] }
+  if (po.status === 'CLOSED') {
+    throw new Error(`Cannot recalculate landed costs for ${poId}: purchase order is in a locked status`)
+  }
+
+  const landedByLine = new Map<string, Prisma.Decimal>()
+  for (const line of po.lines) {
+    landedByLine.set(line.id, new Prisma.Decimal(0))
+  }
+
+  const eligibleLines = po.lines.filter((line) => decimal(line.qty).gt(0))
+  const freightCostLines = [
+    ...po.freightCostLines,
+    ...po.landedCostLinks.flatMap((link) => link.freightPO.freightCostLines),
+  ]
+  for (const fcl of freightCostLines) {
+    const method = normalizeLandedCostMethod(fcl.distributionMethod)
+    const bases = eligibleLines.map((line) => ({
+      lineId: line.id,
+      base: computeDistributionBase(line, method),
+    }))
+    let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
+    if (basisTotal.lte(0)) {
+      if (method === 'BY_WEIGHT') deps.warnWeightFallback(`recalculateDirectLandedCosts:${po.reference}`)
+      basisTotal = new Prisma.Decimal(eligibleLines.length || 1)
+      for (const entry of bases) entry.base = new Prisma.Decimal(1)
+    }
+    const amountBase = decimal(fcl.amountBase)
+    for (const entry of bases) {
+      const share = amountBase.mul(entry.base).div(basisTotal)
+      landedByLine.set(entry.lineId, decimal(landedByLine.get(entry.lineId)).add(share))
+    }
+  }
+
+  let totalCogsDelta = 0
+  let totalInventoryDelta = 0
+
+  for (const line of po.lines) {
+    const lineQty = decimal(line.qty)
+    if (lineQty.lte(0)) continue
+
+    const baseUnitCostBase = decimal(line.unitCostBase)
+    const landedForLine = decimal(landedByLine.get(line.id))
+    const landedPerUnit = landedForLine.div(lineQty)
+    const grossUnitCostBase = baseUnitCostBase.add(landedPerUnit).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+
+    await tx.purchaseOrderLine.update({
+      where: { id: line.id },
+      data: { landedUnitCostBase: grossUnitCostBase },
+    })
+
+    for (const cl of line.costLayers) {
+      const oldUnitCost = decimalToNumber(cl.unitCostBase)
+      const newUnitCost = grossUnitCostBase.toNumber()
+      const receivedQty = decimalToNumber(cl.receivedQty)
+      const remainingQty = decimalToNumber(cl.remainingQty)
+      const consumedQty = receivedQty - remainingQty
+      const returnedQty = consumedQty > 0.000001
+        ? await deps.getReturnedQtyForCostLayer(tx, cl.id)
+        : 0
+      const supplierReturnedQty = consumedQty > 0.000001
+        ? await deps.getSupplierReturnedQtyForCostLayer(tx, cl.id)
+        : 0
+      const deltas = calculateLayerAdjustmentDeltas({
+        oldUnitCost,
+        newUnitCost,
+        receivedQty,
+        remainingQty,
+        returnedQty,
+        supplierReturnedQty,
+      })
+      totalCogsDelta += deltas.cogsDelta
+      totalInventoryDelta += deltas.inventoryDelta
+
+      await tx.costLayer.update({
+        where: { id: cl.id },
+        data: { unitCostBase: grossUnitCostBase },
+      })
+
+      if (Math.abs(deltas.costDelta) > 0.000001) {
+        await deps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase.toNumber())
+        await deps.refreshShipmentCogsForCostLayerChange(tx, cl.id)
+        await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
+      }
+    }
+  }
+
+  const result: LandedCostRecalcResult = { revalidatePoIds: [poId], inventoryTransitAdjustments: [], cogsAdjustments: [] }
+  if (Math.abs(totalInventoryDelta) > 0.01) {
+    result.inventoryTransitAdjustments.push({
+      primaryPoId: poId,
+      primaryPoRef: po.reference,
+      totalDelta: Math.round(totalInventoryDelta * 100) / 100,
+    })
+  }
+  if (Math.abs(totalCogsDelta) > 0.01) {
+    result.cogsAdjustments.push({
+      primaryPoId: poId,
+      primaryPoRef: po.reference,
+      totalDelta: Math.round(totalCogsDelta * 100) / 100,
+    })
+  }
+  return result
+}
