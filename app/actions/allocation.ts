@@ -25,6 +25,7 @@ import {
   validateSalesOrderStatusTransition,
   validateShipmentStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
+import { allocateSalesOrder } from '@/lib/domain/sales/allocation-service'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 const ALLOCATION_EPSILON = 0.000001
@@ -145,33 +146,6 @@ function buildAvailableStockMap(
   return stockMap
 }
 
-function cloneAvailableStockMap(
-  stockMap: Map<string, Map<string, number>>,
-): Map<string, Map<string, number>> {
-  const copy = new Map<string, Map<string, number>>()
-  for (const [productId, byWarehouse] of stockMap) {
-    copy.set(productId, new Map(byWarehouse))
-  }
-  return copy
-}
-
-function applyRequirementDeltaToAvailableMap(
-  stockMap: Map<string, Map<string, number>>,
-  requirements: Map<string, number>,
-  warehouseId: string,
-  direction: 'reserve' | 'release',
-) {
-  for (const [productId, qty] of requirements) {
-    const byWarehouse = stockMap.get(productId) ?? new Map<string, number>()
-    const current = byWarehouse.get(warehouseId) ?? 0
-    byWarehouse.set(
-      warehouseId,
-      direction === 'reserve' ? current - qty : current + qty,
-    )
-    stockMap.set(productId, byWarehouse)
-  }
-}
-
 async function applyAllocationReservationDelta(
   tx: Prisma.TransactionClient,
   rows: Array<{ productId: string; warehouseId: string; qty: number }>,
@@ -196,24 +170,6 @@ async function applyAllocationReservationDelta(
       data: { reservedQty: { decrement: qty } },
     })
   }
-}
-
-function mergeAllocationRows(
-  rows: Array<{ lineId: string; productId: string; warehouseId: string; qty: number }>,
-): Array<{ lineId: string; productId: string; warehouseId: string; qty: number }> {
-  const merged = new Map<string, { lineId: string; productId: string; warehouseId: string; qty: number }>()
-
-  for (const row of rows) {
-    const key = `${row.lineId}|${row.warehouseId}|${row.productId}`
-    const existing = merged.get(key)
-    if (existing) {
-      existing.qty += row.qty
-      continue
-    }
-    merged.set(key, { ...row })
-  }
-
-  return [...merged.values()].filter((row) => row.qty > 0)
 }
 
 async function validateAllocationIntegrity(
@@ -488,258 +444,44 @@ export async function autoAllocateOrder(
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.process')
     }
-    const so = await db.salesOrder.findUnique({
-      where: { id: orderId },
-      select: {
-        id: true,
-        orderNumber: true,
-        externalOrderNumber: true,
-        shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
-        status: true,
-        shipFromWarehouseId: true,
-        lines: { select: { id: true, productId: true, qty: true, sku: true } },
-      },
-    })
-    if (!so) return { success: false, error: 'Order not found' }
-
-    // Get eligible warehouses: the selected warehouse first, then others available for sale.
-    // For WC orders, restrict to WC-synced warehouses to ship from the right locations.
-    // Use connector provenance (not externalOrderNumber) — manual orders may have orderNumber.
-    const isWcOrder = so.shoppingLinks.length > 0
-    const orderRef = so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
-    const allWarehouses = await db.warehouse.findMany({
-      where: {
-        active: true,
-        availableForSale: true,
-        ...(isWcOrder ? { syncToStore: true } : {}),
-      },
-      select: { id: true, code: true, name: true, isDefault: true, syncToStore: true },
-      orderBy: { isDefault: 'desc' },
-    })
-    if (!allWarehouses.length) return { success: false, error: isWcOrder ? 'No WooCommerce-synced warehouses available for sale' : 'No warehouses available for sale' }
-
-    // Order warehouses: selected first, then default, then WC-synced, then rest
-    const primaryId = so.shipFromWarehouseId
-    const sorted = [...allWarehouses].sort((a, b) => {
-      if (a.id === primaryId) return -1
-      if (b.id === primaryId) return 1
-      if (a.isDefault && !b.isDefault) return -1
-      if (!a.isDefault && b.isDefault) return 1
-      if (a.syncToStore && !b.syncToStore) return -1
-      if (!a.syncToStore && b.syncToStore) return 1
-      return 0
+    const allocationResult = await allocateSalesOrder(db, {
+      orderId,
+      refuseIfShipmentsExist: options?.refuseIfShipmentsExist,
     })
 
-    const productIds = so.lines.filter((l) => l.productId).map((l) => l.productId!)
-    const allocationResult = await db.$transaction(async (tx) => {
-      await lockSalesOrder(tx, orderId)
-
-      // Opt-in guard: refuse to rebuild OrderAllocation when the order has
-      // shipments — autoAllocateOrder doesn't touch ShipmentLines, so any
-      // existing ShipmentLine would be left pointing at the old warehouse/
-      // qty and later drive a bogus stock decrement on SHIPPED. Callers
-      // that gate on `shipments: { none: {} }` in their candidate query
-      // should pass this flag so the check is atomic with the lock.
-      if (options?.refuseIfShipmentsExist) {
-        const shipmentExists = await tx.shipment.findFirst({
-          where: { orderId },
-          select: { id: true },
-        })
-        if (shipmentExists) {
-          return { nextAllocations: [], syncProductIds: [], refused: true as const }
-        }
-      }
-
-      await resetAllocationAccountingIfStaged(tx, orderId)
-      const graph = await loadFulfillmentProductGraph(tx, productIds)
-      const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
-      for (const line of so.lines) {
-        if (!line.productId) continue
-        requirementsByLine.set(
-          line.id,
-          requirementsMapToRows(expandFulfillmentRequirements(line.productId, 1, graph)),
-        )
-      }
-      const leafProductIds = listFulfillmentLeafProductIds(productIds, graph)
-      await lockStockLevels(tx, leafProductIds, sorted.map((warehouse) => warehouse.id))
-
-      const stockLevels = await tx.stockLevel.findMany({
-        where: { productId: { in: leafProductIds }, warehouseId: { in: sorted.map((w) => w.id) } },
-        select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
-      })
-
-      const stockMap = buildAvailableStockMap(stockLevels)
-
-      // Add this order's existing OrderAllocations back to the available
-      // map. Without this, a partial re-allocation (e.g. backorder retry
-      // triggered by a small receipt) would compute availability against
-      // a reservedQty that still counts this order's own reservations —
-      // the allocator could then rebuild the order with only the newly-
-      // free stock and silently shrink the existing reservation.
-      const ownAllocations = await tx.orderAllocation.findMany({
-        where: { orderId },
-        select: { productId: true, warehouseId: true, qty: true },
-      })
-      for (const alloc of ownAllocations) {
-        const byWarehouse = stockMap.get(alloc.productId) ?? new Map<string, number>()
-        byWarehouse.set(
-          alloc.warehouseId,
-          (byWarehouse.get(alloc.warehouseId) ?? 0) + Number(alloc.qty),
-        )
-        stockMap.set(alloc.productId, byWarehouse)
-      }
-
-      const activeShipmentLines = await tx.shipmentLine.findMany({
-        where: {
-          shipment: { orderId, status: { not: 'PENDING' } },
-        },
-        select: { lineId: true, productId: true, qty: true },
-      })
-      const committedByLine = calculateCoverageByLine(
-        requirementsByLine,
-        activeShipmentLines.map((line) => ({
-          lineId: line.lineId,
-          productId: line.productId,
-          qty: Number(line.qty),
-        })),
-      )
-
-      const lines = so.lines.filter((l) => l.productId).map((l) => {
-        const committed = committedByLine.get(l.id) ?? 0
-        return {
-          id: l.id,
-          productId: l.productId!,
-          sku: l.sku ?? l.productId!,
-          qty: Math.max(0, Number(l.qty) - committed),
-        }
-      }).filter((l) => l.qty > 0)
-
-      const lineOptions = new Map<string, string[]>()
-      for (const line of lines) {
-        const options: string[] = []
-        for (const wh of sorted) {
-          const avail = getFulfillmentAvailableQty(line.productId, wh.id, graph, stockMap)
-          if (avail >= line.qty) options.push(wh.id)
-        }
-        lineOptions.set(line.id, options)
-      }
-
-      const forcedWarehouses = new Set<string>()
-      for (const [, options] of lineOptions) {
-        if (options.length === 1) forcedWarehouses.add(options[0])
-      }
-
-      const nextAllocationRows: Array<{ lineId: string; productId: string; warehouseId: string; qty: number }> = []
-      const tempStock = cloneAvailableStockMap(stockMap)
-
-      for (const line of lines) {
-        const options = lineOptions.get(line.id) ?? []
-        let bestWh: string | null = null
-        let remaining = line.qty
-
-        if (options.length > 0) {
-          const forcedOption = options.find((w) => forcedWarehouses.has(w))
-          bestWh = forcedOption ?? options[0]
-        }
-
-        if (bestWh) {
-          const avail = getFulfillmentAvailableQty(line.productId, bestWh, graph, tempStock)
-          const allocQty = Math.min(remaining, avail)
-          if (allocQty > 0) {
-            for (const [productId, qty] of expandFulfillmentRequirements(line.productId, allocQty, graph)) {
-              nextAllocationRows.push({ lineId: line.id, productId, warehouseId: bestWh, qty })
-            }
-            applyRequirementDeltaToAvailableMap(tempStock, expandFulfillmentRequirements(line.productId, allocQty, graph), bestWh, 'reserve')
-            remaining -= allocQty
-          }
-        }
-
-        if (remaining > 0) {
-          for (const wh of sorted) {
-            if (remaining <= 0) break
-            if (bestWh && wh.id === bestWh) continue
-            const avail = getFulfillmentAvailableQty(line.productId, wh.id, graph, tempStock)
-            if (avail <= 0) continue
-            const allocQty = Math.min(remaining, avail)
-            for (const [productId, qty] of expandFulfillmentRequirements(line.productId, allocQty, graph)) {
-              nextAllocationRows.push({ lineId: line.id, productId, warehouseId: wh.id, qty })
-            }
-            applyRequirementDeltaToAvailableMap(tempStock, expandFulfillmentRequirements(line.productId, allocQty, graph), wh.id, 'reserve')
-            remaining -= allocQty
-          }
-        }
-      }
-
-      const nextAllocations = mergeAllocationRows(nextAllocationRows)
-      const existingAllocs = await tx.orderAllocation.findMany({
-        where: { orderId },
-        select: { lineId: true, productId: true, warehouseId: true, qty: true },
-      })
-      await applyAllocationReservationDelta(
-        tx,
-        existingAllocs.map((alloc) => ({
-          productId: alloc.productId,
-          warehouseId: alloc.warehouseId,
-          qty: Number(alloc.qty),
-        })),
-        'release',
-      )
-      await tx.orderAllocation.deleteMany({ where: { orderId } })
-
-      for (const alloc of nextAllocations) {
-        await tx.orderAllocation.create({
-          data: {
-            orderId,
-            lineId: alloc.lineId,
-            productId: alloc.productId,
-            warehouseId: alloc.warehouseId,
-            qty: alloc.qty,
-          },
-        })
-      }
-      await applyAllocationReservationDelta(
-        tx,
-        nextAllocations.map((alloc) => ({
-          productId: alloc.productId,
-          warehouseId: alloc.warehouseId,
-          qty: alloc.qty,
-        })),
-        'reserve',
-      )
-
-      if (nextAllocations.length > 0 && ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING'].includes(so.status)) {
-        const transition = validateSalesOrderStatusTransition(so.status, 'ALLOCATED')
-        if (!transition.success) throw new Error(transition.error)
-        await tx.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
-      }
+    if (!allocationResult.logAttempt && !allocationResult.success) {
       return {
-        nextAllocations,
-        syncProductIds: [...new Set([
-          ...existingAllocs.map((alloc) => alloc.productId),
-          ...nextAllocations.map((alloc) => alloc.productId),
-        ])],
-        refused: false as const,
+        success: false,
+        error: allocationResult.error,
+        syncProductIds: allocationResult.syncProductIds,
       }
-    }, STOCK_TX_OPTIONS)
-
-    if (allocationResult.refused) {
-      return { success: false, error: 'Order has existing shipments; reallocation refused', syncProductIds: [] }
     }
 
     revalidateSalesAllocationPaths(orderId)
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: orderId,
-      action: allocationResult.nextAllocations.length > 0 ? 'allocated' : 'allocation_failed',
-      tag: 'sales',
-      level: allocationResult.nextAllocations.length > 0 ? 'INFO' : 'WARNING',
-      description: allocationResult.nextAllocations.length > 0
-        ? `Auto-allocated stock for order ${orderRef} — ${allocationResult.nextAllocations.length} allocation(s)`
-        : `No stock available to allocate for order ${orderRef}`,
-      metadata: { orderNumber: orderRef, isWcOrder, shipFromWarehouseId: so.shipFromWarehouseId, allocations: allocationResult.nextAllocations.length },
-    })
-    if (allocationResult.nextAllocations.length === 0) {
-      return { success: false, error: 'No stock available for allocation', syncProductIds: allocationResult.syncProductIds }
+    if (allocationResult.logAttempt && allocationResult.orderRef) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: allocationResult.allocationCount > 0 ? 'allocated' : 'allocation_failed',
+        tag: 'sales',
+        level: allocationResult.allocationCount > 0 ? 'INFO' : 'WARNING',
+        description: allocationResult.allocationCount > 0
+          ? `Auto-allocated stock for order ${allocationResult.orderRef} — ${allocationResult.allocationCount} allocation(s)`
+          : `No stock available to allocate for order ${allocationResult.orderRef}`,
+        metadata: {
+          orderNumber: allocationResult.orderRef,
+          isWcOrder: allocationResult.isWcOrder,
+          shipFromWarehouseId: allocationResult.shipFromWarehouseId,
+          allocations: allocationResult.allocationCount,
+        },
+      })
+    }
+    if (!allocationResult.success) {
+      return {
+        success: false,
+        error: allocationResult.error,
+        syncProductIds: allocationResult.syncProductIds,
+      }
     }
     if (!options?.deferStockSync) {
       try {
