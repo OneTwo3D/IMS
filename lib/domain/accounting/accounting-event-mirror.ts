@@ -76,6 +76,34 @@ function mapStatus(status: string | undefined): AccountingEventStatus {
   }
 }
 
+function buildMirroredAccountingEventIdempotencyKey(params: {
+  connector: string
+  type: string
+  referenceType: string
+  referenceId: string
+  payload: unknown
+}): string | null {
+  if (!isMirrorableAccountingSyncType(params.type)) return null
+
+  const payload = normalizePayload(params.payload)
+  const payloadIdempotencyKey = stringValue(payload._idempotencyKey)
+  if (payloadIdempotencyKey) {
+    return buildAccountingEventIdempotencyKey(['accounting-sync', params.connector, params.type, payloadIdempotencyKey])
+  }
+
+  const payloadDate = stringValue(payload.date)
+  if (!payloadDate) return null
+
+  return buildAccountingEventIdempotencyKey([
+    'accounting-sync',
+    params.connector,
+    params.type,
+    params.referenceType,
+    params.referenceId,
+    payloadDate,
+  ])
+}
+
 function isIdempotencyKeyUniqueError(error: unknown): boolean {
   if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') return false
   const target = error.meta?.target
@@ -106,17 +134,8 @@ export function buildMirroredAccountingEventDraft(params: {
 
   const payloadDate = stringValue(payload.date)
   if (!payloadDate) return null
-  const payloadIdempotencyKey = stringValue(payload._idempotencyKey)
-  const idempotencyKey = payloadIdempotencyKey
-    ? buildAccountingEventIdempotencyKey(['accounting-sync', params.connector, params.type, payloadIdempotencyKey])
-    : buildAccountingEventIdempotencyKey([
-        'accounting-sync',
-        params.connector,
-        params.type,
-        params.referenceType,
-        params.referenceId,
-        payloadDate,
-      ])
+  const idempotencyKey = buildMirroredAccountingEventIdempotencyKey(params)
+  if (!idempotencyKey) return null
 
   return buildAccountingEvent({
     type: params.type,
@@ -160,4 +179,49 @@ export async function mirrorAccountingSyncLogToEvent(
     if (isIdempotencyKeyUniqueError(error)) return
     throw error
   }
+}
+
+export async function updateMirroredAccountingEventStatus(
+  client: AccountingEventMirrorClient,
+  params: {
+    connector: string
+    type: string
+    referenceType: string
+    referenceId: string
+    payload: unknown
+    status: AccountingEventStatus
+    externalId?: string | null
+    message?: string | null
+  },
+): Promise<void> {
+  const idempotencyKey = buildMirroredAccountingEventIdempotencyKey(params)
+  if (!idempotencyKey) return
+
+  const event = await client.accountingEvent.update({
+    where: { idempotencyKey },
+    data: {
+      status: params.status,
+      ...(params.externalId !== undefined ? { externalId: params.externalId } : {}),
+    },
+    select: { id: true },
+  }).catch((error: unknown) => {
+    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') return null
+    throw error
+  })
+  if (!event) return
+
+  await client.accountingEventLog.create({
+    data: buildAccountingEventLog({
+      accountingEventId: event.id,
+      action: params.status === 'POSTED' ? 'posted_from_sync_log' : 'failed_from_sync_log',
+      ...(params.message ? { message: params.message } : {}),
+      metadata: {
+        connector: params.connector,
+        syncType: params.type,
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+        externalId: params.externalId ?? null,
+      },
+    }) as never,
+  })
 }

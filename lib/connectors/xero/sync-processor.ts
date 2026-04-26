@@ -13,6 +13,7 @@ import { pushCreditNote } from './credit-notes'
 import { pushManualJournal } from './journals'
 import { xeroUploadAttachment, xeroPost } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
+import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 
 const MAX_RETRIES = 5
@@ -45,6 +46,39 @@ function getRateLimitBackoffMs(retryCount: number, message: string): number {
 
 function isRateLimitError(message: string): boolean {
   return /rate limit|rate limited|http 429|status 429/i.test(message)
+}
+
+async function updateMirroredEventForSyncLog(params: {
+  type: AccountingSyncType
+  referenceType: string
+  referenceId: string
+  payload: SyncPayload
+  status: 'POSTED' | 'FAILED'
+  externalId?: string | null
+  message?: string
+}): Promise<void> {
+  try {
+    await updateMirroredAccountingEventStatus(db, {
+      connector: XERO_CONNECTOR,
+      type: params.type,
+      referenceType: params.referenceType,
+      referenceId: params.referenceId,
+      payload: params.payload,
+      status: params.status,
+      externalId: params.externalId,
+      message: params.message,
+    })
+  } catch (error) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_accounting_event_mirror_update_failed',
+      tag: 'sync',
+      level: 'WARNING',
+      description: `Failed to update mirrored accounting event for ${params.type} ${params.referenceId}: ${String(error)}`,
+      metadata: { type: params.type, referenceType: params.referenceType, referenceId: params.referenceId },
+      resolveUser: false,
+    })
+  }
 }
 
 async function hasExistingSyncLog(
@@ -153,6 +187,14 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
             processingStartedAt: null,
           },
         })
+        await updateMirroredEventForSyncLog({
+          type: entry.type,
+          referenceType: entry.referenceType,
+          referenceId: entry.referenceId,
+          payload,
+          status: 'POSTED',
+          externalId: syncResult.externalId ?? null,
+        })
 
         // Update back-references (e.g. accountingInvoiceId on SalesOrder)
         await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
@@ -172,15 +214,26 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
           })
         } else {
           const retryCount = entry.retryCount + 1
+          const finalFailure = retryCount >= MAX_RETRIES
           await db.accountingSyncLog.update({
             where: { id: entry.id },
             data: {
-              status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
+              status: finalFailure ? 'FAILED' : 'PENDING',
               retryCount,
               errorMessage,
               processingStartedAt: null,
             },
           })
+          if (finalFailure) {
+            await updateMirroredEventForSyncLog({
+              type: entry.type,
+              referenceType: entry.referenceType,
+              referenceId: entry.referenceId,
+              payload,
+              status: 'FAILED',
+              message: errorMessage,
+            })
+          }
         }
         result.failed++
       }
@@ -197,15 +250,26 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
         })
       } else {
         const retryCount = entry.retryCount + 1
+        const finalFailure = retryCount >= MAX_RETRIES
         await db.accountingSyncLog.update({
           where: { id: entry.id },
           data: {
-            status: retryCount >= MAX_RETRIES ? 'FAILED' : 'PENDING',
+            status: finalFailure ? 'FAILED' : 'PENDING',
             retryCount,
             errorMessage,
             processingStartedAt: null,
           },
         })
+        if (finalFailure) {
+          await updateMirroredEventForSyncLog({
+            type: entry.type,
+            referenceType: entry.referenceType,
+            referenceId: entry.referenceId,
+            payload,
+            status: 'FAILED',
+            message: errorMessage,
+          })
+        }
       }
       result.failed++
     }
