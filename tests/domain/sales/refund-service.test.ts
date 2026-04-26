@@ -4,6 +4,7 @@ import test from 'node:test'
 import {
   applyReturnInboundStockTx,
   createSalesOrderRefund,
+  retrySalesOrderRefundAccounting,
   type RefundServiceClient,
 } from '@/lib/domain/sales/refund-service'
 import type { AccountingSettings } from '@/lib/accounting'
@@ -39,11 +40,14 @@ type Refund = {
   totalForeign: number
   totalBase: number
   returnWarehouseId: string | null
+  accountingRetryRequired?: boolean
+  accountingWarning?: string | null
 }
 
 type RefundLine = {
   id: string
   refundId: string
+  salesOrderLineId?: string | null
   productId: string | null
   description: string
   qty: number
@@ -171,6 +175,10 @@ function createClient(state: State): RefundServiceClient {
             shipments: state.shipments.filter((row) => row.orderId === order.id && row.shipmentJournalDate),
             refunds: state.refunds
               .filter((refund) => refund.orderId === order.id)
+              .filter((refund) => {
+                const refundSelect = select.refunds as { where?: { id?: { not?: string } } } | undefined
+                return refundSelect?.where?.id?.not == null || refund.id !== refundSelect.where.id.not
+              })
               .map((refund) => ({
                 id: refund.id,
                 lines: state.refundLines.filter((line) => line.refundId === refund.id),
@@ -187,6 +195,17 @@ function createClient(state: State): RefundServiceClient {
       },
     },
     salesOrderRefund: {
+      findUnique: async ({ where }: { where: { id: string } }) => {
+        const refund = state.refunds.find((row) => row.id === where.id)
+        if (!refund) return null
+        const order = state.orders.find((row) => row.id === refund.orderId)
+        if (!order) return null
+        return {
+          ...refund,
+          order,
+          lines: state.refundLines.filter((line) => line.refundId === refund.id),
+        }
+      },
       findMany: async ({ where, select }: { where: { orderId?: string; creditNoteNumber?: { startsWith: string } }; select: Record<string, boolean> }) => {
         if (select.creditNoteNumber) {
           return state.refunds
@@ -198,9 +217,20 @@ function createClient(state: State): RefundServiceClient {
           .map((refund) => ({ totalBase: refund.totalBase }))
       },
       create: async ({ data }: { data: Omit<Refund, 'id'> }) => {
-        const refund = { id: `refund-${state.nextRefundId++}`, ...data }
+        const refund = {
+          id: `refund-${state.nextRefundId++}`,
+          accountingRetryRequired: false,
+          accountingWarning: null,
+          ...data,
+        }
         state.refunds.push(refund)
         return { id: refund.id }
+      },
+      update: async ({ where, data }: { where: { id: string }; data: Partial<Refund> }) => {
+        const refund = state.refunds.find((row) => row.id === where.id)
+        if (!refund) throw new Error('Refund not found')
+        Object.assign(refund, data)
+        return refund
       },
     },
     salesOrderRefundLine: {
@@ -276,6 +306,7 @@ test('createSalesOrderRefund creates a partial refund record', async () => {
   assert.equal(state.refunds[0].creditNoteNumber, 'CN-2026-00001')
   assert.equal(state.refundLines[0].qty, 1)
   assert.equal(state.refundLines[0].unitPriceBase, 50)
+  assert.equal(state.refundLines[0].salesOrderLineId, 'line-1')
 })
 
 test('createSalesOrderRefund converts refund totals from base to foreign currency', async () => {
@@ -380,7 +411,7 @@ test('createSalesOrderRefund rejects stock returns for packed shipments', async 
   assert.equal(state.movements.length, 0)
 })
 
-test('createSalesOrderRefund surfaces stale shipment cost snapshots without fallback stock returns', async () => {
+test('createSalesOrderRefund records accounting warnings without fallback stock returns', async () => {
   const state = baseState({
     orders: [{
       id: 'order-1',
@@ -414,10 +445,12 @@ test('createSalesOrderRefund surfaces stale shipment cost snapshots without fall
     accountingSettings,
   })
 
-  assert.equal(result.success, false)
-  assert.match(result.success === false ? result.error : '', /accounting reversal staging failed/)
-  assert.match(result.success === false ? result.error : '', /Cannot reverse COGS/)
+  assert.equal(result.success, true)
+  assert.match(result.success ? result.accountingWarning ?? '' : '', /accounting reversal staging failed/)
+  assert.match(result.success ? result.accountingWarning ?? '' : '', /Cannot reverse COGS/)
   assert.equal(state.refunds.length, 1)
+  assert.equal(state.refunds[0].accountingRetryRequired, true)
+  assert.match(state.refunds[0].accountingWarning ?? '', /Cannot reverse COGS/)
   assert.equal(state.movements.length, 0)
   assert.equal(state.stockLevels.length, 0)
 })
@@ -534,6 +567,8 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   }])
   assert.equal(state.movements[0].productId, 'product-1')
   assert.equal(state.movements[0].qty, 1)
+  assert.equal(state.movements[0].referenceType, 'SalesOrderRefund')
+  assert.equal(state.movements[0].referenceId, 'refund-1')
   assert.equal(state.stockLevels[0].quantity, 1)
   assert.equal(state.costLayers[1].unitCostBase, 10)
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
@@ -601,4 +636,239 @@ test('applyReturnInboundStockTx returns existing movement rows without duplicati
   assert.equal(state.movements.length, 1)
   assert.equal(state.stockLevels.length, 0)
   assert.equal(state.costLayers.length, 0)
+})
+
+test('retrySalesOrderRefundAccounting stages accounting and return stock for an existing refund', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'PARTIALLY_REFUNDED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    refunds: [{
+      id: 'refund-1',
+      orderId: 'order-1',
+      creditNoteNumber: 'CN-2026-00001',
+      externalRefundId: null,
+      reason: 'Customer return',
+      totalForeign: 50,
+      totalBase: 50,
+      returnWarehouseId: 'warehouse-returns',
+      accountingRetryRequired: true,
+      accountingWarning: 'Previous accounting staging failed',
+    }],
+    refundLines: [{
+      id: 'refund-line-1',
+      refundId: 'refund-1',
+      salesOrderLineId: 'line-1',
+      productId: 'product-1',
+      description: 'Product 1',
+      qty: 1,
+      unitPriceForeign: 50,
+      unitPriceBase: 50,
+      totalForeign: 50,
+      totalBase: 50,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-1',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
+  assert.equal(
+    result.success && result.accountingSyncs[0].idempotencyKey,
+    'sales-order-refund:refund-1:cogs-reversal',
+  )
+  assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
+    costLayerId: 'layer-1',
+    qty: 1,
+    unitCostBase: 10,
+    shipmentLineId: 'shipment-line-1',
+    orderAllocationId: undefined,
+    source: 'shipment',
+  }])
+  assert.equal(state.movements[0].productId, 'product-1')
+  assert.equal(state.movements[0].referenceType, 'SalesOrderRefund')
+  assert.equal(state.movements[0].referenceId, 'refund-1')
+  assert.equal(state.stockLevels[0].quantity, 1)
+})
+
+test('retrySalesOrderRefundAccounting requires a pending accounting failure', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'PARTIALLY_REFUNDED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    refunds: [{
+      id: 'refund-1',
+      orderId: 'order-1',
+      creditNoteNumber: 'CN-2026-00001',
+      externalRefundId: null,
+      reason: 'Customer return',
+      totalForeign: 50,
+      totalBase: 50,
+      returnWarehouseId: 'warehouse-returns',
+      accountingRetryRequired: false,
+      accountingWarning: null,
+    }],
+  })
+
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-1',
+    accountingSettings,
+  })
+
+  assert.deepEqual(result, {
+    success: false,
+    error: 'No failed refund accounting action is pending for this refund',
+  })
+})
+
+test('retrySalesOrderRefundAccounting uses persisted sales line identity and refund-scoped stock returns', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'PARTIALLY_REFUNDED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    lines: [
+      { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 },
+      { id: 'line-2', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 },
+    ],
+    refunds: [{
+      id: 'prior-refund',
+      orderId: 'order-1',
+      creditNoteNumber: 'CN-2026-00001',
+      externalRefundId: null,
+      reason: 'Earlier return',
+      totalForeign: 50,
+      totalBase: 50,
+      returnWarehouseId: 'warehouse-returns',
+      accountingRetryRequired: false,
+      accountingWarning: null,
+    }, {
+      id: 'refund-2',
+      orderId: 'order-1',
+      creditNoteNumber: 'CN-2026-00002',
+      externalRefundId: null,
+      reason: 'Customer return',
+      totalForeign: 50,
+      totalBase: 50,
+      returnWarehouseId: 'warehouse-returns',
+      accountingRetryRequired: true,
+      accountingWarning: 'Previous accounting staging failed',
+    }],
+    refundLines: [{
+      id: 'prior-refund-line',
+      refundId: 'prior-refund',
+      salesOrderLineId: 'line-1',
+      productId: 'product-1',
+      description: 'Product 1',
+      qty: 1,
+      unitPriceForeign: 50,
+      unitPriceBase: 50,
+      totalForeign: 50,
+      totalBase: 50,
+      costLayerSnapshot: [{
+        costLayerId: 'layer-1',
+        qty: 1,
+        unitCostBase: 10,
+        shipmentLineId: 'shipment-line-1',
+        source: 'shipment',
+      }],
+    }, {
+      id: 'refund-line-2',
+      refundId: 'refund-2',
+      salesOrderLineId: 'line-2',
+      productId: 'product-1',
+      description: 'Product 1',
+      qty: 1,
+      unitPriceForeign: 50,
+      unitPriceBase: 50,
+      totalForeign: 50,
+      totalBase: 50,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 25,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 1,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 1, unitCostBase: 10 }],
+      }, {
+        id: 'shipment-line-2',
+        lineId: 'line-2',
+        qty: 1,
+        costLayerSnapshot: [{ costLayerId: 'layer-2', qty: 1, unitCostBase: 15 }],
+      }],
+    }],
+    costLayers: [
+      { id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 1, unitCostBase: 10 },
+      { id: 'layer-2', productId: 'product-1', poLineId: 'po-line-2', receivedQty: 1, unitCostBase: 15 },
+    ],
+    movements: [{ productId: 'product-1', qty: 1, referenceType: 'SalesOrderRefund', referenceId: 'prior-refund' }],
+  })
+
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-2',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.deepEqual(state.refundLines[1].costLayerSnapshot, [{
+    costLayerId: 'layer-2',
+    qty: 1,
+    unitCostBase: 15,
+    shipmentLineId: 'shipment-line-2',
+    orderAllocationId: undefined,
+    source: 'shipment',
+  }])
+  assert.equal(state.movements.length, 2)
+  assert.equal(state.movements[1].referenceType, 'SalesOrderRefund')
+  assert.equal(state.movements[1].referenceId, 'refund-2')
 })

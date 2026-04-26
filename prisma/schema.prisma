@@ -1203,6 +1203,7 @@ model SalesOrderLine {
   taxRate         TaxRate?   @relation(fields: [taxRateId], references: [id])
   allocations     OrderAllocation[]
   shipmentLines   ShipmentLine[]
+  refundLines     SalesOrderRefundLine[]
 
   @@index([orderId])
   @@index([productId])
@@ -1219,6 +1220,8 @@ model SalesOrderRefund {
   reason          String?
   totalForeign    Decimal    @db.Decimal(18, 4)
   totalBase        Decimal    @db.Decimal(18, 4)
+  accountingRetryRequired Boolean @default(false) @map("accounting_retry_required")
+  accountingWarning String?   @map("accounting_warning")
   refundedAt      DateTime   @default(now())
   createdAt       DateTime   @default(now())
 
@@ -1235,6 +1238,7 @@ model SalesOrderRefund {
 model SalesOrderRefundLine {
   id              String           @id @default(cuid())
   refundId        String
+  salesOrderLineId String?         @map("sales_order_line_id")
   productId       String?
   description     String
   qty             Decimal          @db.Decimal(12, 4)
@@ -1245,9 +1249,11 @@ model SalesOrderRefundLine {
   costLayerSnapshot Json?
 
   refund          SalesOrderRefund @relation(fields: [refundId], references: [id])
+  salesOrderLine  SalesOrderLine?  @relation(fields: [salesOrderLineId], references: [id], onDelete: SetNull)
   product         Product?         @relation(fields: [productId], references: [id])
 
   @@index([refundId])
+  @@index([salesOrderLineId], map: "sales_order_refund_lines_sales_order_line_id_idx")
   @@index([productId])
   @@index([costLayerSnapshot(ops: JsonbOps)], type: Gin, map: "sales_order_refund_lines_costLayerSnapshot_gin_idx")
   @@map("sales_order_refund_lines")

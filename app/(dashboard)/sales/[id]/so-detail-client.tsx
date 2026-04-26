@@ -11,7 +11,7 @@ import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
 import {
-  updateSalesOrderStatus, createRefund, cloneSalesOrder, deleteSalesOrder,
+  updateSalesOrderStatus, createRefund, retryRefundAccounting, cloneSalesOrder, deleteSalesOrder,
   updateSalesOrderNotes, generateInvoiceNumber,
   addPayment, deletePayment,
   type SoDetail, type SoStatus,
@@ -117,7 +117,11 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
         totalForeign: l.refundAmount,
         totalBase: l.refundAmount / (order.fxRateToBase || 1),
       })), reason, returnWhId || undefined)
-      if (result.success) { router.refresh(); onClose() } else setError(result.error ?? 'Failed')
+      if (result.success) {
+        router.refresh()
+        if (result.warning) alert(result.warning)
+        onClose()
+      } else setError(result.error ?? 'Failed')
     })
   }
   return (
@@ -837,6 +841,15 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
     })
   }
 
+  function handleRetryRefundAccounting(refundId: string) {
+    setError('')
+    startTransition(async () => {
+      const result = await retryRefundAccounting(refundId)
+      if (result.success) router.refresh()
+      else setError(result.error ?? 'Failed to retry refund accounting')
+    })
+  }
+
   function toggleCol(col: OptCol) {
     setVisibleCols((prev) => { const n = new Set(prev); if (n.has(col)) n.delete(col); else n.add(col); return n })
   }
@@ -1318,9 +1331,17 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                 </div>
               )}
               {accountingAvailable && (
-                <Button variant="outline" size="sm" className="h-6 text-xs mt-1" onClick={() => setShowPayment({ refundId: r.id, creditNoteNumber: r.creditNoteNumber ?? undefined })}>
-                  <CreditCard className="h-3 w-3 mr-1" />Add Payment
-                </Button>
+                <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                  <Button variant="outline" size="sm" className="h-6 text-xs" onClick={() => setShowPayment({ refundId: r.id, creditNoteNumber: r.creditNoteNumber ?? undefined })}>
+                    <CreditCard className="h-3 w-3 mr-1" />Add Payment
+                  </Button>
+                  {r.accountingRetryRequired && (
+                    <Button variant="outline" size="sm" className="h-6 text-xs" onClick={() => handleRetryRefundAccounting(r.id)} disabled={isPending}>
+                      {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Undo2 className="h-3 w-3 mr-1" />}
+                      Retry Accounting
+                    </Button>
+                  )}
+                </div>
               )}
             </div>
           ))}</div>}
