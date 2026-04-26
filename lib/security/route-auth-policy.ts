@@ -29,6 +29,10 @@ export const apiRouteAuthPolicy = {
     access: 'authenticated',
     reason: 'Requires an authenticated session before setting up, verifying, or disabling TOTP.',
   },
+  '/api/admin/inventory/invariants': {
+    access: 'admin',
+    reason: 'Inventory invariant report is restricted through requireApiAdmin.',
+  },
   '/api/backup/create': {
     access: 'admin',
     reason: 'Backup creation is restricted through requireApiAdmin.',
