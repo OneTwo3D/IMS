@@ -21,6 +21,10 @@ import {
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
 import { consumeFifoLayersStrict, refreshSalesOrderLineCogs } from '@/lib/cost-layers'
+import {
+  validateSalesOrderStatusTransition,
+  validateShipmentStatusTransition,
+} from '@/lib/domain/workflows/action-guards'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 const ALLOCATION_EPSILON = 0.000001
@@ -704,6 +708,8 @@ export async function autoAllocateOrder(
       )
 
       if (nextAllocations.length > 0 && ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING'].includes(so.status)) {
+        const transition = validateSalesOrderStatusTransition(so.status, 'ALLOCATED')
+        if (!transition.success) throw new Error(transition.error)
         await tx.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
       }
       return {
@@ -980,6 +986,8 @@ export async function deallocateOrder(orderId: string): Promise<{ success: boole
           where: { orderId, status: { not: 'PENDING' } },
         })
         if (activeShipmentCount === 0) {
+          const transition = validateSalesOrderStatusTransition(so.status, 'PROCESSING')
+          if (!transition.success) throw new Error(transition.error)
           await tx.salesOrder.update({ where: { id: orderId }, data: { status: 'PROCESSING' } })
         }
       }
@@ -1128,6 +1136,8 @@ export async function confirmAllocations(
 
       // Keep status as ALLOCATED — shipment-level progression handles the rest.
       if (so.status !== 'ALLOCATED') {
+        const transition = validateSalesOrderStatusTransition(so.status, 'ALLOCATED')
+        if (!transition.success) throw new Error(transition.error)
         await tx.salesOrder.update({
           where: { id: orderId },
           data: { status: 'ALLOCATED' },
@@ -1213,6 +1223,8 @@ async function reconcileOrderAfterShipment(
       select: { status: true },
     })
     if (currentOrder && !['SHIPPED', 'COMPLETED', 'DELIVERED', 'REFUNDED', 'CANCELLED'].includes(currentOrder.status)) {
+      const transition = validateSalesOrderStatusTransition(currentOrder.status, 'SHIPPED')
+      if (!transition.success) throw new Error(transition.error)
       await db.salesOrder.update({
         where: { id: shipment.orderId },
         data: {
@@ -1268,14 +1280,9 @@ export async function updateShipmentStatus(
       return { success: true }
     }
 
-    const VALID: Record<string, string[]> = {
-      PENDING: ['PICKING'],
-      PICKING: ['PACKED'],
-      PACKED: ['SHIPPED'],
-    }
-    const allowed = VALID[shipment.status] ?? []
-    if (!allowed.includes(targetStatus)) {
-      return { success: false, error: `Cannot transition shipment from ${shipment.status} to ${targetStatus}` }
+    const transition = validateShipmentStatusTransition(shipment.status, targetStatus)
+    if (!transition.success) {
+      return { success: false, error: transition.error }
     }
 
     const data: Record<string, unknown> = { status: targetStatus }
@@ -1407,10 +1414,8 @@ export async function updateShipmentStatus(
         })
         if (!locked) throw new Error('Shipment not found')
         if (locked.status === targetStatus) return false
-        const lockedAllowed = VALID[locked.status] ?? []
-        if (!lockedAllowed.includes(targetStatus)) {
-          throw new Error(`Cannot transition shipment from ${locked.status} to ${targetStatus}`)
-        }
+        const lockedTransition = validateShipmentStatusTransition(locked.status, targetStatus)
+        if (!lockedTransition.success) throw new Error(lockedTransition.error)
         await tx.shipment.update({ where: { id: shipmentId }, data })
         return true
       }, STOCK_TX_OPTIONS)

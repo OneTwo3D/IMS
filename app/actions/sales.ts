@@ -12,6 +12,7 @@ import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   buildRealisedFxJournal,
   computeRealisedFx,
@@ -1420,21 +1421,9 @@ export async function applySalesOrderStatusTransition(
     })
     if (!so) return { success: false, error: 'Order not found' }
 
-    // Valid status transitions
-    const VALID_TRANSITIONS: Record<string, string[]> = {
-      DRAFT: ['PROCESSING', 'PENDING_PAYMENT', 'CANCELLED', 'ON_HOLD'],
-      PENDING_PAYMENT: ['PROCESSING', 'DRAFT', 'CANCELLED', 'ON_HOLD'],
-      ON_HOLD: ['DRAFT', 'PROCESSING', 'CANCELLED'],
-      PROCESSING: ['ALLOCATED', 'CANCELLED', 'ON_HOLD'],
-      ALLOCATED: ['PICKING', 'PROCESSING', 'CANCELLED', 'ON_HOLD'],
-      PICKING: ['PACKING', 'CANCELLED', 'ON_HOLD'],
-      PACKING: ['SHIPPED', 'CANCELLED', 'ON_HOLD'],
-      SHIPPED: ['COMPLETED'],
-      COMPLETED: ['DELIVERED'],
-    }
-    const allowed = VALID_TRANSITIONS[so.status] ?? []
-    if (!allowed.includes(targetStatus)) {
-      return { success: false, error: `Cannot transition from ${so.status} to ${targetStatus}` }
+    const transition = validateSalesOrderStatusTransition(so.status, targetStatus)
+    if (!transition.success) {
+      return { success: false, error: transition.error }
     }
 
     // Guard: cannot start picking without allocations

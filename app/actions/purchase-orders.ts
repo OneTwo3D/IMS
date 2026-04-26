@@ -20,6 +20,7 @@ import {
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   buildRealisedFxJournal,
   computeRealisedFx,
@@ -39,21 +40,6 @@ function accountingPayloadKey(prefix: string, payload: Record<string, unknown>):
 // ---------------------------------------------------------------------------
 
 export type PoStatus = 'DRAFT' | 'RFQ_SENT' | 'QUOTE_RECEIVED' | 'PO_SENT' | 'SHIPPED' | 'PARTIALLY_RECEIVED' | 'RECEIVED' | 'CLOSED' | 'INVOICED' | 'PARTIALLY_RETURNED' | 'RETURNED' | 'CANCELLED'
-
-const PO_STATUS_TRANSITIONS: Record<PoStatus, PoStatus[]> = {
-  DRAFT: ['RFQ_SENT', 'PO_SENT'],
-  RFQ_SENT: ['QUOTE_RECEIVED', 'PO_SENT', 'CLOSED'],
-  QUOTE_RECEIVED: ['PO_SENT', 'CLOSED'],
-  PO_SENT: ['SHIPPED', 'CLOSED'],
-  SHIPPED: ['CLOSED'],
-  PARTIALLY_RECEIVED: ['CLOSED'],
-  RECEIVED: ['CLOSED'],
-  INVOICED: ['CLOSED'],
-  CLOSED: [],
-  PARTIALLY_RETURNED: [],
-  RETURNED: [],
-  CANCELLED: [],
-}
 
 export type PoLineRow = {
   id: string
@@ -1546,10 +1532,8 @@ export async function advancePoStatus(
       if (existing.status === targetStatus) {
         return { existing, changed: false }
       }
-      const allowed = PO_STATUS_TRANSITIONS[existing.status as PoStatus] ?? []
-      if (!allowed.includes(targetStatus as PoStatus)) {
-        throw new Error(`Cannot transition PO from ${existing.status} to ${targetStatus}`)
-      }
+      const transition = validatePurchaseOrderStatusTransition(existing.status, targetStatus)
+      if (!transition.success) throw new Error(transition.error)
 
       const now = new Date()
       const data: Record<string, unknown> = { status: targetStatus }
@@ -1734,8 +1718,10 @@ export async function receivePurchaseOrder(
         },
       })
       if (!currentPo) throw new Error('PO not found')
-      if (!['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'].includes(currentPo.status)) {
-        throw new Error('PO cannot be received in its current status')
+      const canPartiallyReceive = validatePurchaseOrderStatusTransition(currentPo.status, 'PARTIALLY_RECEIVED')
+      const canFullyReceive = validatePurchaseOrderStatusTransition(currentPo.status, 'RECEIVED')
+      if (!canPartiallyReceive.success && !canFullyReceive.success) {
+        throw new Error(canFullyReceive.error)
       }
 
       const grossUnitCostBaseByLine = computeGrossUnitCostBaseByLine({
@@ -1848,6 +1834,8 @@ export async function receivePurchaseOrder(
       })
       const allReceived = updatedLines.every((line) => Number(line.qtyReceived) >= Number(line.qty))
       const newStatus = allReceived ? 'RECEIVED' : 'PARTIALLY_RECEIVED'
+      const receiptTransition = validatePurchaseOrderStatusTransition(currentPo.status, newStatus)
+      if (!receiptTransition.success) throw new Error(receiptTransition.error)
       await tx.purchaseOrder.update({
         where: { id },
         data: {
@@ -1874,6 +1862,13 @@ export async function receivePurchaseOrder(
             select: { primaryPO: { select: { status: true } } },
           })
           if (allLinks.every((link) => link.primaryPO.status === 'RECEIVED')) {
+            const freightPo = await tx.purchaseOrder.findUnique({
+              where: { id: fl.freightPoId },
+              select: { status: true },
+            })
+            if (!freightPo) throw new Error('Linked freight PO not found')
+            const freightTransition = validatePurchaseOrderStatusTransition(freightPo.status, 'RECEIVED')
+            if (!freightTransition.success) throw new Error(freightTransition.error)
             await tx.purchaseOrder.update({
               where: { id: fl.freightPoId },
               data: { status: 'RECEIVED', receivedAt: new Date() },
@@ -1976,7 +1971,8 @@ export async function cancelPurchaseOrder(id: string): Promise<{ success: boolea
     await requirePermission('purchasing.create')
     const existing = await db.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
     if (!existing) return { success: false, error: 'PO not found' }
-    if (existing.status !== 'DRAFT') return { success: false, error: 'Only DRAFT POs can be cancelled' }
+    const transition = validatePurchaseOrderStatusTransition(existing.status, 'CANCELLED')
+    if (!transition.success) return { success: false, error: transition.error }
 
     await db.purchaseOrder.update({ where: { id }, data: { status: 'CANCELLED' } })
     revalidatePath('/purchase-orders')

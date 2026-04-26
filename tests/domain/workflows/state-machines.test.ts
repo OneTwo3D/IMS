@@ -68,7 +68,9 @@ test('every workflow transition map covers every known status', () => {
 test('sales order state machine allows current forward paths and blocks direct jumps', () => {
   assert.equal(canTransitionSalesOrder('DRAFT', 'PROCESSING'), true)
   assert.equal(canTransitionSalesOrder('PROCESSING', 'ALLOCATED'), true)
+  assert.equal(canTransitionSalesOrder('ALLOCATED', 'SHIPPED'), true)
   assert.equal(canTransitionSalesOrder('PICKING', 'ON_HOLD'), true)
+  assert.equal(canTransitionSalesOrder('PICKING', 'SHIPPED'), true)
   assert.equal(canTransitionSalesOrder('ON_HOLD', 'PICKING'), true)
   assert.equal(canTransitionSalesOrder('PACKING', 'ON_HOLD'), true)
   assert.equal(canTransitionSalesOrder('ON_HOLD', 'PACKING'), true)
