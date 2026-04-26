@@ -4,6 +4,8 @@
  */
 
 import { db } from '@/lib/db'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
 import { getQuickBooksSettings, type QuickBooksSettings } from './settings'
 
 /** Map sync type enum → setting key for per-type enable/disable */
@@ -58,6 +60,7 @@ export async function queueQuickBooksSync(params: {
   }
 
   try {
+    const baseCurrency = await getBaseCurrencyCode()
     await db.accountingSyncLog.create({
       data: {
         connector: 'quickbooks',
@@ -67,6 +70,15 @@ export async function queueQuickBooksSync(params: {
         referenceId: params.referenceId,
         payload: payload as never,
       },
+    })
+    await mirrorAccountingSyncLogToEvent(db, {
+      connector: 'quickbooks',
+      type: params.type,
+      referenceType: params.referenceType,
+      referenceId: params.referenceId,
+      payload,
+      currency: baseCurrency,
+      status: 'PENDING',
     })
   } catch (error) {
     if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return
