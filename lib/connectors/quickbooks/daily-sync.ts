@@ -322,42 +322,46 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
   for (const [date, summary] of a1ByDate) {
     const referenceId = `A1-${date}`
     if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_REVENUE_DEFERRAL', referenceId)) continue
-    await createPendingSyncLog(db, {
-      type: 'DAILY_BATCH_REVENUE_DEFERRAL',
-      referenceId,
-      currency: baseCurrency,
-      payload: {
-        date,
-        reference: `Revenue Deferral ${date}`,
-        narration: `Recreated revenue deferral batch: ${summary.orderCount} order(s), £${round2(summary.total).toFixed(2)}`,
-        lines: [
-          { accountCode: settings.quickbooks_sales_account, description: `Daily revenue deferral — ${summary.orderCount} order(s)`, debit: round2(summary.total) },
-          { accountCode: settings.quickbooks_unearned_revenue_account, description: `Daily revenue deferral — ${summary.orderCount} order(s)`, credit: round2(summary.total) },
-        ],
-        _postingMode: 'submitted',
-        _recreatedFromStage: true,
-      },
+    await db.$transaction(async (tx) => {
+      await createPendingSyncLog(tx, {
+        type: 'DAILY_BATCH_REVENUE_DEFERRAL',
+        referenceId,
+        currency: baseCurrency,
+        payload: {
+          date,
+          reference: `Revenue Deferral ${date}`,
+          narration: `Recreated revenue deferral batch: ${summary.orderCount} order(s), £${round2(summary.total).toFixed(2)}`,
+          lines: [
+            { accountCode: settings.quickbooks_sales_account, description: `Daily revenue deferral — ${summary.orderCount} order(s)`, debit: round2(summary.total) },
+            { accountCode: settings.quickbooks_unearned_revenue_account, description: `Daily revenue deferral — ${summary.orderCount} order(s)`, credit: round2(summary.total) },
+          ],
+          _postingMode: 'submitted',
+          _recreatedFromStage: true,
+        },
+      })
     })
   }
 
   for (const [date, summary] of a2ByDate) {
     const referenceId = `A2-${date}`
     if (summary.total <= 0 || await hasLiveDailyBatchLog('DAILY_BATCH_INVENTORY_ALLOC', referenceId)) continue
-    await createPendingSyncLog(db, {
-      type: 'DAILY_BATCH_INVENTORY_ALLOC',
-      referenceId,
-      currency: baseCurrency,
-      payload: {
-        date,
-        reference: `Inventory Allocation ${date}`,
-        narration: `Recreated inventory allocation batch: ${summary.orderCount} order(s), £${round2(summary.total).toFixed(2)}`,
-        lines: [
-          { accountCode: settings.quickbooks_allocated_inventory_account, description: `Daily inventory allocation — ${summary.orderCount} order(s)`, debit: round2(summary.total) },
-          { accountCode: settings.quickbooks_inventory_account, description: `Daily inventory allocation — ${summary.orderCount} order(s)`, credit: round2(summary.total) },
-        ],
-        _postingMode: 'submitted',
-        _recreatedFromStage: true,
-      },
+    await db.$transaction(async (tx) => {
+      await createPendingSyncLog(tx, {
+        type: 'DAILY_BATCH_INVENTORY_ALLOC',
+        referenceId,
+        currency: baseCurrency,
+        payload: {
+          date,
+          reference: `Inventory Allocation ${date}`,
+          narration: `Recreated inventory allocation batch: ${summary.orderCount} order(s), £${round2(summary.total).toFixed(2)}`,
+          lines: [
+            { accountCode: settings.quickbooks_allocated_inventory_account, description: `Daily inventory allocation — ${summary.orderCount} order(s)`, debit: round2(summary.total) },
+            { accountCode: settings.quickbooks_inventory_account, description: `Daily inventory allocation — ${summary.orderCount} order(s)`, credit: round2(summary.total) },
+          ],
+          _postingMode: 'submitted',
+          _recreatedFromStage: true,
+        },
+      })
     })
   }
 
@@ -377,18 +381,20 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
         { accountCode: settings.quickbooks_allocated_inventory_account, description: `COGS — ${summary.shipmentCount} shipment(s)`, credit: round2(summary.cogs) },
       )
     }
-    await createPendingSyncLog(db, {
-      type: 'DAILY_BATCH_GROUP_B',
-      referenceId,
-      currency: baseCurrency,
-      payload: {
-        date,
-        reference: `Shipment COGS ${date}`,
-        narration: `Recreated shipment batch: ${summary.shipmentCount} shipment(s), revenue £${round2(summary.revenue).toFixed(2)}, COGS £${round2(summary.cogs).toFixed(2)}`,
-        lines,
-        _postingMode: 'submitted',
-        _recreatedFromStage: true,
-      },
+    await db.$transaction(async (tx) => {
+      await createPendingSyncLog(tx, {
+        type: 'DAILY_BATCH_GROUP_B',
+        referenceId,
+        currency: baseCurrency,
+        payload: {
+          date,
+          reference: `Shipment COGS ${date}`,
+          narration: `Recreated shipment batch: ${summary.shipmentCount} shipment(s), revenue £${round2(summary.revenue).toFixed(2)}, COGS £${round2(summary.cogs).toFixed(2)}`,
+          lines,
+          _postingMode: 'submitted',
+          _recreatedFromStage: true,
+        },
+      })
     })
   }
 }
