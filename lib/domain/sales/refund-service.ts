@@ -1258,118 +1258,124 @@ export async function retrySalesOrderRefundAccounting(
     accountingSettings: AccountingSettings
   },
 ): Promise<RetrySalesOrderRefundAccountingResult> {
-  const refund = await client.salesOrderRefund.findUnique({
-    where: { id: input.refundId },
-    select: {
-      id: true,
-      orderId: true,
-      returnWarehouseId: true,
-      accountingRetryRequired: true,
-      accountingRetrySyncs: true,
-      order: {
-        select: {
-          id: true,
-          externalOrderNumber: true,
-          orderNumber: true,
-          status: true,
-          revenueDeferredDate: true,
-          unearnedRevenueAmount: true,
-        },
-      },
-      lines: {
-        select: {
-          id: true,
-          salesOrderLineId: true,
-          productId: true,
-          description: true,
-          qty: true,
-          unitPriceForeign: true,
-          unitPriceBase: true,
-          totalForeign: true,
-          totalBase: true,
-        },
-      },
-    },
-  })
-  if (!refund) return { success: false, error: 'Refund not found' }
-  if (!refund.accountingRetryRequired) {
-    return { success: false, error: 'No failed refund accounting action is pending for this refund' }
-  }
-  const persistedSyncs = parseRefundAccountingRetrySyncs(refund.accountingRetrySyncs)
-  if (persistedSyncs.length > 0) {
-    return {
-      success: true,
-      orderId: refund.orderId,
-      refundId: refund.id,
-      refundOrderRef: getSalesOrderReference(refund.order),
-      accountingSyncs: persistedSyncs,
-      returnedRows: [],
-    }
-  }
-  if (!refund.order.revenueDeferredDate) {
-    return {
-      success: true,
-      orderId: refund.orderId,
-      refundId: refund.id,
-      refundOrderRef: getSalesOrderReference(refund.order),
-      accountingSyncs: [],
-      returnedRows: [],
-    }
-  }
-
   try {
-    const refundOrderRef = getSalesOrderReference(refund.order)
-    const refundLines: CreatedRefundLine[] = refund.lines.map((line) => ({
-      id: line.id,
-      lineId: line.salesOrderLineId,
-      productId: line.productId,
-      description: line.description,
-      qty: decimalToNumber(line.qty),
-      unitPriceForeign: decimalToNumber(line.unitPriceForeign),
-      unitPriceBase: decimalToNumber(line.unitPriceBase),
-      totalForeign: decimalToNumber(line.totalForeign),
-      totalBase: decimalToNumber(line.totalBase),
-      lineKind: line.productId ? 'sale' : 'shipping',
-    }))
-    const newStatus = refund.order.status === 'REFUNDED' ? 'REFUNDED' : 'PARTIALLY_REFUNDED'
-    const staged = await stageRefundAccountingReversals(client, {
-      orderId: refund.orderId,
-      orderRef: refundOrderRef,
-      refundId: refund.id,
-      refundLines,
-      returnWarehouseId: refund.returnWarehouseId ?? undefined,
-      accountingSettings: input.accountingSettings,
-      so: refund.order,
-      newStatus,
-    })
+    return await runInTransaction(client, async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${REFUND_ACCOUNTING_LOCK_KEY})`
 
-    let returnedRows: Array<{ productId: string; sku: string; qty: number }> = []
-    if (refund.returnWarehouseId && staged.snapshotReturnRows && staged.snapshotReturnRows.length > 0) {
-      returnedRows = await runInTransaction(client, (tx) => (
-        applyReturnInboundStockTx(tx, {
+      const refund = await tx.salesOrderRefund.findUnique({
+        where: { id: input.refundId },
+        select: {
+          id: true,
+          orderId: true,
+          returnWarehouseId: true,
+          accountingRetryRequired: true,
+          accountingRetrySyncs: true,
+          order: {
+            select: {
+              id: true,
+              externalOrderNumber: true,
+              orderNumber: true,
+              status: true,
+              revenueDeferredDate: true,
+              unearnedRevenueAmount: true,
+            },
+          },
+          lines: {
+            select: {
+              id: true,
+              salesOrderLineId: true,
+              productId: true,
+              description: true,
+              qty: true,
+              unitPriceForeign: true,
+              unitPriceBase: true,
+              totalForeign: true,
+              totalBase: true,
+            },
+          },
+        },
+      })
+      if (!refund) return { success: false, error: 'Refund not found' }
+      if (!refund.accountingRetryRequired) {
+        return { success: false, error: 'No failed refund accounting action is pending for this refund' }
+      }
+      const persistedSyncs = parseRefundAccountingRetrySyncs(refund.accountingRetrySyncs)
+      if (persistedSyncs.length > 0) {
+        return {
+          success: true,
+          orderId: refund.orderId,
+          refundId: refund.id,
+          refundOrderRef: getSalesOrderReference(refund.order),
+          accountingSyncs: persistedSyncs,
+          returnedRows: [],
+        }
+      }
+      if (!refund.order.revenueDeferredDate) {
+        return {
+          success: true,
+          orderId: refund.orderId,
+          refundId: refund.id,
+          refundOrderRef: getSalesOrderReference(refund.order),
+          accountingSyncs: [],
+          returnedRows: [],
+        }
+      }
+
+      const refundOrderRef = getSalesOrderReference(refund.order)
+      const refundLines: CreatedRefundLine[] = refund.lines.map((line) => ({
+        id: line.id,
+        lineId: line.salesOrderLineId,
+        productId: line.productId,
+        description: line.description,
+        qty: decimalToNumber(line.qty),
+        unitPriceForeign: decimalToNumber(line.unitPriceForeign),
+        unitPriceBase: decimalToNumber(line.unitPriceBase),
+        totalForeign: decimalToNumber(line.totalForeign),
+        totalBase: decimalToNumber(line.totalBase),
+        lineKind: line.productId ? 'sale' : 'shipping',
+      }))
+      const newStatus = refund.order.status === 'REFUNDED' ? 'REFUNDED' : 'PARTIALLY_REFUNDED'
+      const staged = await stageRefundAccountingReversals(tx, {
+        orderId: refund.orderId,
+        orderRef: refundOrderRef,
+        refundId: refund.id,
+        refundLines,
+        returnWarehouseId: refund.returnWarehouseId ?? undefined,
+        accountingSettings: input.accountingSettings,
+        so: refund.order,
+        newStatus,
+      })
+
+      let returnedRows: Array<{ productId: string; sku: string; qty: number }> = []
+      if (refund.returnWarehouseId) {
+        const snapshotRows = staged.snapshotReturnRows ?? []
+        const returnRows = snapshotRows.length > 0
+          ? snapshotRows
+          : await buildRefundFallbackReturnRows(tx, refund.orderId, refundLines)
+        returnedRows = await applyReturnInboundStockTx(tx, {
           referenceType: 'SalesOrderRefund',
           referenceId: refund.id,
           warehouseId: refund.returnWarehouseId!,
-          rows: staged.snapshotReturnRows ?? [],
+          rows: returnRows,
           note: 'Refund return',
         })
-      ))
-    }
-    await client.salesOrderRefund.update({
-      where: { id: refund.id },
-      data: {
-        accountingRetrySyncs: refundAccountingSyncsJson(staged.accountingSyncs),
-      },
-    })
+      }
+      await tx.salesOrderRefund.update({
+        where: { id: refund.id },
+        data: {
+          accountingRetrySyncs: refundAccountingSyncsJson(staged.accountingSyncs),
+        },
+      })
 
-    return {
-      success: true,
-      orderId: refund.orderId,
-      refundId: refund.id,
-      refundOrderRef,
-      accountingSyncs: staged.accountingSyncs,
-      returnedRows,
-    }
+      return {
+        success: true,
+        orderId: refund.orderId,
+        refundId: refund.id,
+        refundOrderRef,
+        accountingSyncs: staged.accountingSyncs,
+        returnedRows,
+      }
+    })
   } catch (error) {
     const warning = accountingWarningMessage(error)
     await client.salesOrderRefund.update({

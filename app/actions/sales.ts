@@ -12,6 +12,7 @@ import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { decimalToNumber } from '@/lib/decimal'
 import { validateManualSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   buildRealisedFxJournal,
@@ -1405,21 +1406,44 @@ async function loadRefundAccountingQueueInput(
     orderId: refund.orderId,
     refundId: refund.id,
     creditNoteNumber: refund.creditNoteNumber,
-    refundFxRate: Number(refund.order.fxRateToBase) || 1,
+    refundFxRate: decimalToNumber(refund.order.fxRateToBase) || 1,
     externalOrderNumber: refund.order.externalOrderNumber,
     lines: refund.lines.map((line) => ({
       id: line.id,
       lineId: line.salesOrderLineId,
       productId: line.productId,
       description: line.description,
-      qty: Number(line.qty),
-      unitPriceForeign: Number(line.unitPriceForeign),
-      unitPriceBase: Number(line.unitPriceBase),
-      totalForeign: Number(line.totalForeign),
-      totalBase: Number(line.totalBase),
+      qty: decimalToNumber(line.qty),
+      unitPriceForeign: decimalToNumber(line.unitPriceForeign),
+      unitPriceBase: decimalToNumber(line.unitPriceBase),
+      totalForeign: decimalToNumber(line.totalForeign),
+      totalBase: decimalToNumber(line.totalBase),
       lineKind: line.productId ? 'sale' : 'shipping',
     })),
     accountingSyncs,
+  }
+}
+
+async function loadRefundAuditContext(
+  refundId: string,
+): Promise<{ orderId: string; refundOrderRef: string } | null> {
+  const refund = await db.salesOrderRefund.findUnique({
+    where: { id: refundId },
+    select: {
+      orderId: true,
+      order: {
+        select: {
+          id: true,
+          externalOrderNumber: true,
+          orderNumber: true,
+        },
+      },
+    },
+  })
+  if (!refund) return null
+  return {
+    orderId: refund.orderId,
+    refundOrderRef: getSalesOrderReference(refund.order),
   }
 }
 
@@ -1577,22 +1601,24 @@ export async function createRefund(
 export async function retryRefundAccounting(
   refundId: string,
 ): Promise<{ success: boolean; error?: string }> {
+  await requirePermission('sales.refund')
+
   try {
-    await requirePermission('sales.refund')
     const accountingSettings = await getAccountingSettings()
     const result = await retrySalesOrderRefundAccounting(db, {
       refundId,
       accountingSettings,
     })
     if (!result.success) {
+      const auditContext = await loadRefundAuditContext(refundId)
       await logActivity({
         entityType: 'SALES_ORDER',
-        entityId: refundId,
+        entityId: auditContext?.orderId ?? refundId,
         action: 'refund_accounting_retry_failed',
         tag: 'accounting',
         level: 'WARNING',
         description: result.error,
-        metadata: { refundId },
+        metadata: { refundId, orderNumber: auditContext?.refundOrderRef },
       })
       return result
     }
@@ -1660,6 +1686,7 @@ export async function retryRefundAccounting(
     revalidatePath(`/sales/${result.orderId}`)
     return { success: true }
   } catch (e) {
+    const auditContext = await loadRefundAuditContext(refundId).catch(() => null)
     await db.salesOrderRefund.update({
       where: { id: refundId },
       data: {
@@ -1669,12 +1696,12 @@ export async function retryRefundAccounting(
     }).catch(() => undefined)
     await logActivity({
       entityType: 'SALES_ORDER',
-      entityId: refundId,
+      entityId: auditContext?.orderId ?? refundId,
       action: 'refund_accounting_retry_failed',
       tag: 'accounting',
       level: 'ERROR',
       description: `Failed to retry refund accounting: ${String(e)}`,
-      metadata: { refundId },
+      metadata: { refundId, orderNumber: auditContext?.refundOrderRef },
     })
     return { success: false, error: String(e) }
   }

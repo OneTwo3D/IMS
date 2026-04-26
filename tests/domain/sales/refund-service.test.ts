@@ -73,11 +73,12 @@ type State = {
     cogsBatchAmount: number | null
     lines: Array<{ id: string; lineId: string; qty: number; costLayerSnapshot: unknown }>
   }>
-  allocations: Array<{ id: string; orderId: string; lineId: string; warehouseId: string; costLayerSnapshot: unknown }>
+  allocations: Array<{ id: string; orderId: string; lineId: string; productId: string; warehouseId: string; qty: number; costLayerSnapshot: unknown }>
   costLayers: Array<{ id: string; productId: string; poLineId: string | null; receivedQty: number; unitCostBase: number }>
   movements: Array<{ productId: string; qty: number; referenceType: string; referenceId: string }>
   stockLevels: Array<{ productId: string; warehouseId: string; quantity: number; reservedQty: number }>
   settings: Record<string, string>
+  executeRawCalls: number
   nextRefundId: number
   nextRefundLineId: number
   nextCostLayerId: number
@@ -133,6 +134,7 @@ function baseState(overrides: Partial<State> = {}): State {
     movements: [],
     stockLevels: [],
     settings: {},
+    executeRawCalls: 0,
     nextRefundId: 1,
     nextRefundLineId: 1,
     nextCostLayerId: 1,
@@ -143,7 +145,10 @@ function baseState(overrides: Partial<State> = {}): State {
 function createClient(state: State): RefundServiceClient {
   const client = {
     $queryRaw: async () => [],
-    $executeRaw: async () => 0,
+    $executeRaw: async () => {
+      state.executeRawCalls += 1
+      return 0
+    },
     $transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(client),
     setting: {
       findUnique: async ({ where }: { where: { key: string } }) => {
@@ -779,6 +784,70 @@ test('retrySalesOrderRefundAccounting stages accounting and return stock for an 
     orderAllocationId: undefined,
     source: 'shipment',
   }])
+  assert.equal(state.movements[0].productId, 'product-1')
+  assert.equal(state.movements[0].referenceType, 'SalesOrderRefund')
+  assert.equal(state.movements[0].referenceId, 'refund-1')
+  assert.equal(state.stockLevels[0].quantity, 1)
+  assert.equal(state.executeRawCalls, 1)
+})
+
+test('retrySalesOrderRefundAccounting falls back to order rows when staged return snapshots are empty', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'PARTIALLY_REFUNDED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    refunds: [{
+      id: 'refund-1',
+      orderId: 'order-1',
+      creditNoteNumber: 'CN-2026-00001',
+      externalRefundId: null,
+      reason: 'Customer return',
+      totalForeign: 50,
+      totalBase: 50,
+      returnWarehouseId: 'warehouse-returns',
+      accountingRetryRequired: true,
+      accountingWarning: 'Previous accounting staging failed',
+    }],
+    refundLines: [{
+      id: 'refund-line-1',
+      refundId: 'refund-1',
+      salesOrderLineId: 'line-1',
+      productId: 'product-1',
+      description: 'Product 1',
+      qty: 1,
+      unitPriceForeign: 50,
+      unitPriceBase: 50,
+      totalForeign: 50,
+      totalBase: 50,
+    }],
+    allocations: [{
+      id: 'allocation-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-main',
+      qty: 2,
+      costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+
+  const result = await retrySalesOrderRefundAccounting(createClient(state), {
+    refundId: 'refund-1',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(result.success && result.accountingSyncs[0].type, 'UNEARNED_REV_REVERSAL')
   assert.equal(state.movements[0].productId, 'product-1')
   assert.equal(state.movements[0].referenceType, 'SalesOrderRefund')
   assert.equal(state.movements[0].referenceId, 'refund-1')

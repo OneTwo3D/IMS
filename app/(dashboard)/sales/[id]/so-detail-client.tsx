@@ -7,6 +7,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Textarea } from '@/components/ui/textarea'
+import { Alert, AlertDescription } from '@/components/ui/alert'
 import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogFooter } from '@/components/ui/dialog'
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import { DropdownMenu, DropdownMenuTrigger, DropdownMenuContent, DropdownMenuItem, DropdownMenuSeparator } from '@/components/ui/dropdown-menu'
@@ -102,9 +103,11 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
   const [returnWhId, setReturnWhId] = useState(warehouses[0]?.id ?? '')
   const [refundLines, setRefundLines] = useState(order.lines.map((l) => ({ ...l, qtyRefund: 0, refundAmount: 0 })))
   const [error, setError] = useState('')
+  const [warning, setWarning] = useState('')
   const totalRefund = refundLines.reduce((s, l) => s + l.refundAmount, 0)
   function handleConfirm() {
     setError('')
+    setWarning('')
     const toRefund = refundLines.filter((l) => l.qtyRefund > 0)
     if (!toRefund.length) { setError('Select at least one line'); return }
     if (!reason.trim()) { setError('Reason is required'); return }
@@ -119,8 +122,11 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
       })), reason, returnWhId || undefined)
       if (result.success) {
         router.refresh()
-        if (result.warning) alert(result.warning)
-        onClose()
+        if (result.warning) {
+          setWarning(result.warning)
+        } else {
+          onClose()
+        }
       } else setError(result.error ?? 'Failed')
     })
   }
@@ -150,11 +156,19 @@ function RefundDialog({ order, warehouses, sym, onClose }: { order: SoDetail; wa
           </TableRow>))}
         </TableBody></Table>
         <div className="flex justify-end text-sm font-medium">Total: {formatMoney(totalRefund, sym)}</div>
+        {warning && (
+          <Alert>
+            <AlertTriangle className="h-4 w-4" />
+            <AlertDescription>{warning}</AlertDescription>
+          </Alert>
+        )}
         {error && <p className="text-sm text-destructive">{error}</p>}
       </div>
       <DialogFooter>
-        <Button type="button" variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-        <Button type="button" onClick={handleConfirm} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Confirm Refund</Button>
+        <Button type="button" variant="outline" onClick={onClose} disabled={isPending}>{warning ? 'Close' : 'Cancel'}</Button>
+        {!warning && (
+          <Button type="button" onClick={handleConfirm} disabled={isPending}>{isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Confirm Refund</Button>
+        )}
       </DialogFooter>
     </DialogContent></Dialog>
   )
