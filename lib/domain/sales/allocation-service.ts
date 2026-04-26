@@ -12,6 +12,7 @@ import {
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
 import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
+import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 
 export const ALLOCATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -21,7 +22,6 @@ export type AllocationServiceClient = Prisma.TransactionClient | typeof db
 
 export type AllocateSalesOrderInput = {
   orderId: string
-  actorId?: string
   refuseIfShipmentsExist?: boolean
 }
 
@@ -49,8 +49,8 @@ function canRunTransaction(
   return typeof (client as typeof db).$transaction === 'function'
 }
 
-function buildAvailableStockMap(
-  rows: Array<{ productId: string; warehouseId: string; quantity: unknown; reservedQty: unknown }>,
+export function buildAvailableStockMap(
+  rows: Array<{ productId: string; warehouseId: string; quantity: DecimalLike; reservedQty: DecimalLike }>,
 ): Map<string, Map<string, number>> {
   const stockMap = new Map<string, Map<string, number>>()
   for (const row of rows) {
@@ -61,7 +61,7 @@ function buildAvailableStockMap(
     }
     byWarehouse.set(
       row.warehouseId,
-      Math.max(0, Number(row.quantity) - Number(row.reservedQty)),
+      Math.max(0, decimalToNumber(row.quantity) - decimalToNumber(row.reservedQty)),
     )
   }
   return stockMap
@@ -94,7 +94,7 @@ function applyRequirementDeltaToAvailableMap(
   }
 }
 
-async function lockSalesOrder(
+export async function lockSalesOrder(
   tx: Prisma.TransactionClient,
   orderId: string,
 ): Promise<void> {
@@ -103,7 +103,7 @@ async function lockSalesOrder(
   )
 }
 
-async function lockStockLevels(
+export async function lockStockLevels(
   tx: Prisma.TransactionClient,
   productIds: string[],
   warehouseIds: string[],
@@ -120,7 +120,21 @@ async function lockStockLevels(
   )
 }
 
-async function resetAllocationAccountingIfStaged(
+/**
+ * If the daily batch A2 has already staged this order's allocations for
+ * accounting (inventoryAllocatedDate is set), any subsequent allocation
+ * edit would orphan the FIFO snapshots that Group B and refund reversals
+ * depend on. Reset the accounting flags so A2 re-runs for this order on
+ * the next daily batch, re-snapshotting the updated allocations.
+ *
+ * Invariant: allocation accounting is staged at the order level. A staged
+ * order must treat every allocation snapshot as a single replaceable set; the
+ * schema does not support mixed staged/unstaged snapshots for one order.
+ *
+ * Safe to call unconditionally; no-ops when inventoryAllocatedDate is null.
+ * Must run inside the same transaction as the allocation mutation.
+ */
+export async function resetAllocationAccountingIfStaged(
   tx: Prisma.TransactionClient,
   orderId: string,
 ): Promise<void> {
@@ -154,13 +168,13 @@ async function resetAllocationAccountingIfStaged(
   })
 }
 
-async function applyAllocationReservationDelta(
+export async function applyAllocationReservationDelta(
   tx: Prisma.TransactionClient,
   rows: Array<{ productId: string; warehouseId: string; qty: number }>,
   direction: 'reserve' | 'release',
 ) {
   for (const row of rows) {
-    const qty = Number(row.qty)
+    const qty = decimalToNumber(row.qty)
     if (qty <= 0) continue
     if (direction === 'reserve') {
       const updated = await tx.stockLevel.updateMany({
@@ -298,7 +312,7 @@ export async function allocateSalesOrder(
       const byWarehouse = stockMap.get(alloc.productId) ?? new Map<string, number>()
       byWarehouse.set(
         alloc.warehouseId,
-        (byWarehouse.get(alloc.warehouseId) ?? 0) + Number(alloc.qty),
+        (byWarehouse.get(alloc.warehouseId) ?? 0) + decimalToNumber(alloc.qty),
       )
       stockMap.set(alloc.productId, byWarehouse)
     }
@@ -314,7 +328,7 @@ export async function allocateSalesOrder(
       activeShipmentLines.map((line) => ({
         lineId: line.lineId,
         productId: line.productId,
-        qty: Number(line.qty),
+        qty: decimalToNumber(line.qty),
       })),
     )
 
@@ -324,7 +338,7 @@ export async function allocateSalesOrder(
         id: line.id,
         productId: line.productId!,
         sku: line.sku ?? line.productId!,
-        qty: Math.max(0, Number(line.qty) - committed),
+        qty: Math.max(0, decimalToNumber(line.qty) - committed),
       }
     }).filter((line) => line.qty > 0)
 
@@ -396,7 +410,7 @@ export async function allocateSalesOrder(
       existingAllocs.map((alloc) => ({
         productId: alloc.productId,
         warehouseId: alloc.warehouseId,
-        qty: Number(alloc.qty),
+        qty: decimalToNumber(alloc.qty),
       })),
       'release',
     )

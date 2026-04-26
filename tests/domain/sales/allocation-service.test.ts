@@ -59,16 +59,24 @@ type AllocationRow = {
   qty: number
 }
 
+type ShipmentRow = {
+  id: string
+  orderId: string
+  shipmentJournalDate: Date | null
+}
+
 type MemoryState = {
   order: OrderRow
   products: ProductRow[]
   warehouses: WarehouseRow[]
   stockLevels: StockLevelRow[]
   allocations?: AllocationRow[]
+  shipments?: ShipmentRow[]
 }
 
 function createClient(state: MemoryState): AllocationServiceClient {
   const allocations = state.allocations ?? []
+  const shipments = state.shipments ?? []
   const client = {
     $queryRaw: async () => [],
     $transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(client),
@@ -139,7 +147,13 @@ function createClient(state: MemoryState): AllocationServiceClient {
       updateMany: async () => ({ count: 0 }),
     },
     shipment: {
-      findFirst: async () => null,
+      findFirst: async ({ where }: { where: { orderId: string; shipmentJournalDate?: { not: null } } }) => {
+        const rows = shipments.filter((shipment) => shipment.orderId === where.orderId)
+        if (where.shipmentJournalDate?.not === null) {
+          return rows.find((shipment) => shipment.shipmentJournalDate != null) ?? null
+        }
+        return rows[0] ?? null
+      },
     },
     shipmentLine: {
       findMany: async () => [],
@@ -173,6 +187,7 @@ function baseState(overrides: Partial<MemoryState> = {}): MemoryState {
     }],
     stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 0 }],
     allocations: [],
+    shipments: [],
     ...overrides,
   }
 }
@@ -266,4 +281,38 @@ test('allocateSalesOrder preserves this order own reservations when reallocating
     qty: 2,
   }])
   assert.equal(state.stockLevels[0].reservedQty, 2)
+})
+
+test('allocateSalesOrder refuses to rebuild allocations when guarded shipments exist', async () => {
+  const state = baseState({
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', shipmentJournalDate: null }],
+  })
+  const result = await allocateSalesOrder(createClient(state), {
+    orderId: 'order-1',
+    refuseIfShipmentsExist: true,
+  })
+
+  assert.equal(result.success, false)
+  assert.equal(result.error, 'Order has existing shipments; reallocation refused')
+  assert.deepEqual(state.allocations, [])
+  assert.equal(state.stockLevels[0].reservedQty, 0)
+  assert.equal(state.order.status, 'PROCESSING')
+})
+
+test('allocateSalesOrder blocks allocation edits after shipment accounting is journaled', async () => {
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00Z'),
+    },
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', shipmentJournalDate: new Date('2026-01-02T00:00:00Z') }],
+  })
+
+  await assert.rejects(
+    () => allocateSalesOrder(createClient(state), { orderId: 'order-1' }),
+    /Cannot modify allocations after shipments have been posted to accounting/,
+  )
+  assert.deepEqual(state.allocations, [])
+  assert.equal(state.stockLevels[0].reservedQty, 0)
+  assert.equal(state.order.status, 'PROCESSING')
 })

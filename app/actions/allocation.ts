@@ -25,7 +25,14 @@ import {
   validateSalesOrderStatusTransition,
   validateShipmentStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
-import { allocateSalesOrder } from '@/lib/domain/sales/allocation-service'
+import {
+  allocateSalesOrder,
+  applyAllocationReservationDelta,
+  buildAvailableStockMap,
+  lockSalesOrder,
+  lockStockLevels,
+  resetAllocationAccountingIfStaged,
+} from '@/lib/domain/sales/allocation-service'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 const ALLOCATION_EPSILON = 0.000001
@@ -43,133 +50,10 @@ function revalidateSalesAllocationPaths(orderId: string) {
   }
 }
 
-/**
- * If the daily batch A2 has already staged this order's allocations for
- * accounting (inventoryAllocatedDate is set), any subsequent allocation
- * edit would orphan the FIFO snapshots that Group B and refund reversals
- * depend on. Reset the accounting flags so A2 re-runs for this order on
- * the next daily batch, re-snapshotting the updated allocations.
- *
- * Invariant: allocation accounting is staged at the order level. A staged
- * order must treat every allocation snapshot as a single replaceable set; the
- * schema does not support mixed staged/unstaged snapshots for one order.
- *
- * Safe to call unconditionally — no-ops when inventoryAllocatedDate is null.
- * Must run inside the same transaction as the allocation mutation.
- */
-async function resetAllocationAccountingIfStaged(
-  tx: Prisma.TransactionClient,
-  orderId: string,
-): Promise<void> {
-  const so = await tx.salesOrder.findUnique({
-    where: { id: orderId },
-    select: { inventoryAllocatedDate: true },
-  })
-  if (!so?.inventoryAllocatedDate) return
-
-  // Check if any shipments have already been journaled — if so, we
-  // cannot simply reset because Group B has already consumed the
-  // snapshots. Block the edit instead.
-  const journaledShipment = await tx.shipment.findFirst({
-    where: { orderId, shipmentJournalDate: { not: null } },
-    select: { id: true },
-  })
-  if (journaledShipment) {
-    throw new Error(
-      'Cannot modify allocations after shipments have been posted to accounting. ' +
-      'Process a refund instead, or contact finance to reverse the journal entries first.',
-    )
-  }
-
-  await tx.salesOrder.update({
-    where: { id: orderId },
-    data: {
-      inventoryAllocatedDate: null,
-      allocationBatchAmount: null,
-    },
-  })
-  // Clear cost layer snapshots on all allocations for this order so A2
-  // rebuilds them from scratch.
-  await tx.orderAllocation.updateMany({
-    where: { orderId },
-    data: { costLayerSnapshot: Prisma.DbNull },
-  })
-}
-
-async function lockSalesOrder(
-  tx: Prisma.TransactionClient,
-  orderId: string,
-): Promise<void> {
-  await tx.$queryRaw(
-    Prisma.sql`SELECT id FROM "sales_orders" WHERE id = ${orderId} FOR UPDATE`,
-  )
-}
-
-async function lockStockLevels(
-  tx: Prisma.TransactionClient,
-  productIds: string[],
-  warehouseIds: string[],
-): Promise<void> {
-  if (productIds.length === 0 || warehouseIds.length === 0) return
-  await tx.$queryRaw(
-    Prisma.sql`
-      SELECT id
-      FROM "stock_levels"
-      WHERE "productId" IN (${Prisma.join(productIds)})
-        AND "warehouseId" IN (${Prisma.join(warehouseIds)})
-      FOR UPDATE
-    `,
-  )
-}
-
 async function requireAuth() {
   const session = await auth()
   if (!session?.user?.id) throw new Error('Unauthorized')
   return session
-}
-
-function buildAvailableStockMap(
-  rows: Array<{ productId: string; warehouseId: string; quantity: unknown; reservedQty: unknown }>,
-): Map<string, Map<string, number>> {
-  const stockMap = new Map<string, Map<string, number>>()
-  for (const row of rows) {
-    let byWarehouse = stockMap.get(row.productId)
-    if (!byWarehouse) {
-      byWarehouse = new Map<string, number>()
-      stockMap.set(row.productId, byWarehouse)
-    }
-    byWarehouse.set(
-      row.warehouseId,
-      Math.max(0, Number(row.quantity) - Number(row.reservedQty)),
-    )
-  }
-  return stockMap
-}
-
-async function applyAllocationReservationDelta(
-  tx: Prisma.TransactionClient,
-  rows: Array<{ productId: string; warehouseId: string; qty: number }>,
-  direction: 'reserve' | 'release',
-) {
-  for (const row of rows) {
-    const qty = Number(row.qty)
-    if (qty <= 0) continue
-    if (direction === 'reserve') {
-      const updated = await tx.stockLevel.updateMany({
-        where: { productId: row.productId, warehouseId: row.warehouseId },
-        data: { reservedQty: { increment: qty } },
-      })
-      if (updated.count === 0) {
-        throw new Error(`Cannot reserve stock for product ${row.productId} in warehouse ${row.warehouseId}: no stock level exists`)
-      }
-      continue
-    }
-
-    await tx.stockLevel.updateMany({
-      where: { productId: row.productId, warehouseId: row.warehouseId },
-      data: { reservedQty: { decrement: qty } },
-    })
-  }
 }
 
 async function validateAllocationIntegrity(
