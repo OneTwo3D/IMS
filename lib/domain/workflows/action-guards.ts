@@ -59,6 +59,20 @@ export function validateSalesOrderStatusTransition(
   )
 }
 
+export function validateManualSalesOrderStatusTransition(
+  from: string,
+  to: string,
+): WorkflowTransitionGuardResult {
+  if (to === 'PARTIALLY_REFUNDED' || to === 'REFUNDED') {
+    return {
+      success: false,
+      error: 'Use the refund workflow to update refund status.',
+    }
+  }
+
+  return validateSalesOrderStatusTransition(from, to)
+}
+
 export function validateShipmentStatusTransition(
   from: string,
   to: string,

@@ -1864,11 +1864,13 @@ export async function receivePurchaseOrder(
           if (allLinks.every((link) => link.primaryPO.status === 'RECEIVED')) {
             const freightPo = await tx.purchaseOrder.findUnique({
               where: { id: fl.freightPoId },
-              select: { status: true },
+              select: { status: true, type: true },
             })
             if (!freightPo) throw new Error('Linked freight PO not found')
-            const freightTransition = validatePurchaseOrderStatusTransition(freightPo.status, 'RECEIVED')
-            if (!freightTransition.success) throw new Error(freightTransition.error)
+            if (freightPo.type !== 'FREIGHT') {
+              const freightTransition = validatePurchaseOrderStatusTransition(freightPo.status, 'RECEIVED')
+              if (!freightTransition.success) throw new Error(freightTransition.error)
+            }
             await tx.purchaseOrder.update({
               where: { id: fl.freightPoId },
               data: { status: 'RECEIVED', receivedAt: new Date() },

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  validateManualSalesOrderStatusTransition,
   validatePurchaseOrderStatusTransition,
   validateRefundStatusTransition,
   validateSalesOrderStatusTransition,
@@ -19,6 +20,18 @@ test('sales order action guard allows current aggregate ship flow and blocks dir
   assert.deepEqual(validateSalesOrderStatusTransition('DRAFT', 'SHIPPED'), {
     success: false,
     error: 'Cannot transition sales order from DRAFT to SHIPPED',
+  })
+})
+
+test('manual sales order status guard routes refund states through refund workflow', () => {
+  assert.deepEqual(validateManualSalesOrderStatusTransition('SHIPPED', 'COMPLETED'), { success: true })
+  assert.deepEqual(validateManualSalesOrderStatusTransition('SHIPPED', 'PARTIALLY_REFUNDED'), {
+    success: false,
+    error: 'Use the refund workflow to update refund status.',
+  })
+  assert.deepEqual(validateManualSalesOrderStatusTransition('DRAFT', 'REFUNDED'), {
+    success: false,
+    error: 'Use the refund workflow to update refund status.',
   })
 })
 
