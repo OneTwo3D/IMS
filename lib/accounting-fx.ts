@@ -1,5 +1,6 @@
 import type { AccountingSettings } from '@/lib/accounting'
 import type { Prisma } from '@/app/generated/prisma/client'
+import { roundQuantity } from '@/lib/domain/math/decimal'
 
 export type FxSettlementSide = 'receivable' | 'payable'
 
@@ -25,8 +26,8 @@ export type FxJournalLine = {
   taxType?: string
 }
 
-export function roundMoney(value: number): number {
-  return Math.round(value * 100) / 100
+export function roundAccountingMoney(value: number): number {
+  return roundQuantity(value, 2).toNumber()
 }
 
 export function computeRealisedFx(input: RealisedFxInput): RealisedFxResult {
@@ -41,12 +42,12 @@ export function computeRealisedFx(input: RealisedFxInput): RealisedFxResult {
     return { bookedBase: 0, settlementBase: 0, gainLossBase: 0, outcome: 'none' }
   }
 
-  const bookedBase = roundMoney(amountForeign / bookedRate)
-  const settlementBase = roundMoney(amountForeign / settlementRate)
+  const bookedBase = roundAccountingMoney(amountForeign / bookedRate)
+  const settlementBase = roundAccountingMoney(amountForeign / settlementRate)
   const rawGainLoss = input.side === 'receivable'
     ? settlementBase - bookedBase
     : bookedBase - settlementBase
-  const gainLossBase = roundMoney(rawGainLoss)
+  const gainLossBase = roundAccountingMoney(rawGainLoss)
   const outcome = Math.abs(gainLossBase) < 0.01
     ? 'none'
     : gainLossBase > 0
@@ -63,7 +64,7 @@ export function buildRealisedFxJournal(params: {
   fxGainLossAccount: string
   description: string
 }) {
-  const amount = roundMoney(Math.abs(params.gainLossBase))
+  const amount = roundAccountingMoney(Math.abs(params.gainLossBase))
   if (amount < 0.01) return []
   const controlLine = {
     accountCode: params.controlAccount,
@@ -84,8 +85,8 @@ export function reverseJournalLines(lines: FxJournalLine[], descriptionSuffix: s
   return lines.map((line) => ({
     accountCode: line.accountCode,
     description: `${line.description} ${descriptionSuffix}`.trim(),
-    debit: roundMoney(Number(line.credit ?? 0)),
-    credit: roundMoney(Number(line.debit ?? 0)),
+    debit: roundAccountingMoney(Number(line.credit ?? 0)),
+    credit: roundAccountingMoney(Number(line.debit ?? 0)),
     taxType: line.taxType,
   }))
 }
