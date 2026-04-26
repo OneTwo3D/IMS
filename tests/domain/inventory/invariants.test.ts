@@ -212,6 +212,32 @@ test('stockable quantity must reconcile to remaining cost layers', () => {
   assert.equal(findings[0]?.severity, 'warning')
 })
 
+test('remaining cost layers without matching stock levels are reported', () => {
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [
+      {
+        id: 'orphan-layer',
+        productId: 'orphan-product',
+        warehouseId: 'warehouse-1',
+        receivedQty: 5,
+        remainingQty: 5,
+        product: {
+          id: 'orphan-product',
+          sku: 'ORPHAN',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    shippedShipmentLines: [],
+  })
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0]?.code, 'stock_cost_layer_quantity_mismatch')
+  assert.equal(findings[0]?.productId, 'orphan-product')
+  assert.equal(findings[0]?.warehouseId, 'warehouse-1')
+})
+
 test('non-stockable products are excluded from cost-layer reconciliation', () => {
   const findings = evaluateInventoryInvariantRows({
     stockLevels: [

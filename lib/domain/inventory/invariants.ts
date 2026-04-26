@@ -140,10 +140,12 @@ export function evaluateInventoryInvariantRows(
   const tolerance = options.quantityTolerance ?? DEFAULT_QUANTITY_TOLERANCE
   const findings: InventoryInvariantFinding[] = []
   const costLayerRemainingByStockKey = new Map<string, number>()
+  const stockLevelByStockKey = new Map<string, InventoryInvariantStockLevelRow>()
 
   for (const stockLevel of rows.stockLevels) {
     const quantity = toNumber(stockLevel.quantity)
     const reservedQty = toNumber(stockLevel.reservedQty)
+    stockLevelByStockKey.set(quantityKey(stockLevel.productId, stockLevel.warehouseId), stockLevel)
 
     if (isEffectivelyNegative(quantity, tolerance)) {
       findings.push({
@@ -264,6 +266,32 @@ export function evaluateInventoryInvariantRows(
         },
       })
     }
+  }
+
+  for (const costLayer of rows.costLayers) {
+    if (!isStockableProductType(costLayer.product.type)) continue
+
+    const key = quantityKey(costLayer.productId, costLayer.warehouseId)
+    if (stockLevelByStockKey.has(key)) continue
+
+    const remainingCostLayerQty = costLayerRemainingByStockKey.get(key) ?? 0
+    if (Math.abs(remainingCostLayerQty) <= tolerance) continue
+
+    findings.push({
+      severity: 'warning',
+      code: 'stock_cost_layer_quantity_mismatch',
+      productId: costLayer.productId,
+      warehouseId: costLayer.warehouseId,
+      message: `Remaining cost-layer quantity has no matching stock level for ${costLayer.product.sku}`,
+      details: {
+        sku: costLayer.product.sku,
+        productType: costLayer.product.type,
+        quantity: 0,
+        remainingCostLayerQty,
+        delta: Math.round((0 - remainingCostLayerQty) * 10000) / 10000,
+        exception: 'Non-stockable products are excluded; stockable products are expected to reconcile within tolerance.',
+      },
+    })
   }
 
   for (const shipmentLine of rows.shippedShipmentLines) {
