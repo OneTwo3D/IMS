@@ -343,7 +343,7 @@ export async function transitionShipmentStatus(
 export async function reconcileOrderAfterShipment(
   client: ShipmentServiceClient,
   shipment: { orderId: string },
-  extra?: { trackingNumber?: string; shippingService?: string },
+  extra?: { trackingNumber?: string },
 ): Promise<ShipmentReconciliationResult> {
   const allShipments = await client.shipment.findMany({
     where: { orderId: shipment.orderId },

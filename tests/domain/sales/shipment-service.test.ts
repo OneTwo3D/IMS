@@ -3,11 +3,19 @@ import test from 'node:test'
 
 import {
   confirmSalesOrderShipments,
+  reconcileOrderAfterShipment,
   transitionShipmentStatus,
   type ShipmentServiceClient,
 } from '@/lib/domain/sales/shipment-service'
 
-type Order = { id: string; orderNumber: string; externalOrderNumber: string | null; status: string }
+type Order = {
+  id: string
+  orderNumber: string
+  externalOrderNumber: string | null
+  status: string
+  shippedAt?: Date | null
+  trackingNumber?: string | null
+}
 type OrderLine = { id: string; orderId: string; productId: string; qty: number; sku: string; description: string; cogsBase?: number | null }
 type Allocation = { orderId: string; lineId: string; productId: string; warehouseId: string; qty: number }
 type Shipment = {
@@ -41,6 +49,7 @@ type State = {
   costLayers: CostLayer[]
   movements: Array<{ id: string; productId: string; qty: number }>
   cogsEntries: Array<{ costLayerId: string; movementId: string; qty: number; unitCostBase: number; totalCostBase: number }>
+  settings: Record<string, string>
 }
 
 function baseState(overrides: Partial<State> = {}): State {
@@ -54,6 +63,7 @@ function baseState(overrides: Partial<State> = {}): State {
     costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 2, unitCostBase: 5 }],
     movements: [],
     cogsEntries: [],
+    settings: { invoice_trigger: 'manual' },
     ...overrides,
   }
 }
@@ -221,7 +231,10 @@ function createClient(state: State): ShipmentServiceClient {
       },
     },
     setting: {
-      findUnique: async () => ({ value: 'manual' }),
+      findUnique: async ({ where }: { where: { key: string } }) => {
+        const value = state.settings[where.key]
+        return value == null ? null : { value }
+      },
     },
   }
   return client as unknown as ShipmentServiceClient
@@ -313,4 +326,63 @@ test('transitionShipmentStatus rejects shipping when FIFO layers are insufficien
     }),
     /Insufficient FIFO layers/,
   )
+})
+
+test('reconcileOrderAfterShipment leaves order open until every shipment is shipped', async () => {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED' }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-1', shippingService: null },
+      { id: 'shipment-2', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null },
+    ],
+  })
+
+  const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(result, { shouldGenerateInvoice: false, orderId: 'order-1' })
+  assert.equal(state.orders[0].status, 'ALLOCATED')
+  assert.equal(state.orders[0].trackingNumber, undefined)
+})
+
+test('reconcileOrderAfterShipment marks fully shipped order and returns invoice trigger state', async () => {
+  const state = baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED' }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-1', shippingService: null },
+      { id: 'shipment-2', orderId: 'order-1', warehouseId: 'warehouse-2', status: 'SHIPPED', trackingNumber: 'TRACK-2', shippingService: null },
+    ],
+    settings: { invoice_trigger: 'on_shipped' },
+  })
+
+  const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(result, { shouldGenerateInvoice: true, orderId: 'order-1' })
+  assert.equal(state.orders[0].status, 'SHIPPED')
+  assert.equal(state.orders[0].trackingNumber, 'TRACK-1, TRACK-2')
+  assert.ok(state.orders[0].shippedAt instanceof Date)
+})
+
+test('reconcileOrderAfterShipment does not rewrite terminal orders', async () => {
+  const shippedAt = new Date('2026-01-01T00:00:00.000Z')
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      orderNumber: 'SO-1',
+      externalOrderNumber: null,
+      status: 'COMPLETED',
+      shippedAt,
+      trackingNumber: 'EXISTING',
+    }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: 'TRACK-1', shippingService: null },
+    ],
+    settings: { invoice_trigger: 'on_shipped' },
+  })
+
+  const result = await reconcileOrderAfterShipment(createClient(state), { orderId: 'order-1' })
+
+  assert.deepEqual(result, { shouldGenerateInvoice: true, orderId: 'order-1' })
+  assert.equal(state.orders[0].status, 'COMPLETED')
+  assert.equal(state.orders[0].trackingNumber, 'EXISTING')
+  assert.equal(state.orders[0].shippedAt, shippedAt)
 })

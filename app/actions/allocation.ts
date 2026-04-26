@@ -7,6 +7,7 @@ import { auth } from '@/lib/auth'
 import { requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
+import { decimalToNumber } from '@/lib/decimal'
 import { requirementsMapToRows, type FulfillmentRequirement } from '@/lib/products/fulfillment-coverage'
 import {
   expandFulfillmentRequirements,
@@ -612,7 +613,7 @@ export async function updateShipmentStatus(
 
     if (result.dispatched) {
       for (const line of result.shipment.lines) {
-        const qty = Number(line.qty)
+        const qty = decimalToNumber(line.qty)
         await logActivity({
           entityType: 'STOCK_ADJUSTMENT',
           entityId: line.productId,
