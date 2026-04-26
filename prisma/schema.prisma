@@ -1530,6 +1530,47 @@ model AccountingSyncLog {
   @@map("accounting_sync_logs")
 }
 
+model AccountingEvent {
+  id               String   @id @default(cuid())
+  type             String
+  sourceEntityType String
+  sourceEntityId   String
+  businessDate     DateTime
+  status           String   @default("PENDING")
+  idempotencyKey   String   @unique
+  linesJson        Json
+  currency         String
+  externalSystem   String?
+  externalId       String?
+  reversalOfId     String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  reversalOf       AccountingEvent?  @relation("AccountingEventReversal", fields: [reversalOfId], references: [id])
+  reversals        AccountingEvent[] @relation("AccountingEventReversal")
+  logs             AccountingEventLog[]
+
+  @@index([sourceEntityType, sourceEntityId])
+  @@index([status, businessDate])
+  @@unique([externalSystem, externalId])
+  @@index([reversalOfId])
+  @@map("accounting_events")
+}
+
+model AccountingEventLog {
+  id                String   @id @default(cuid())
+  accountingEventId String
+  action            String
+  message           String?
+  metadata          Json?
+  createdAt         DateTime @default(now())
+
+  accountingEvent   AccountingEvent @relation(fields: [accountingEventId], references: [id], onDelete: Cascade)
+
+  @@index([accountingEventId, createdAt])
+  @@map("accounting_event_logs")
+}
+
 model AccountingToken {
   id           String   @id @default(cuid())
   connector    String   @default("xero")
