@@ -16,7 +16,8 @@ DRAFT -> PENDING_PAYMENT -> PROCESSING -> ALLOCATED -> PICKING -> PACKING -> SHI
 Current alternate paths:
 
 - `DRAFT`, `PENDING_PAYMENT`, `ON_HOLD`, `PROCESSING`, `ALLOCATED`, `PICKING`, and `PACKING` can move to `CANCELLED` where the current actions allow cancellation.
-- `DRAFT`, `PENDING_PAYMENT`, `PROCESSING`, and `ALLOCATED` can move through `ON_HOLD` where the current actions allow hold/release.
+- `DRAFT` can move directly to `PROCESSING` for orders that do not need to wait in `PENDING_PAYMENT`.
+- `DRAFT`, `PENDING_PAYMENT`, `PROCESSING`, `ALLOCATED`, `PICKING`, and `PACKING` can move through `ON_HOLD` where the current actions allow hold/release.
 - `PENDING_PAYMENT` can return to `DRAFT`.
 - `ALLOCATED` can return to `PROCESSING` when allocations are released.
 - `PARTIALLY_REFUNDED` and `REFUNDED` are terminal order states set by refund creation.
@@ -39,7 +40,7 @@ work; sales order `SHIPPED` represents the aggregate order state.
 Purchase order status tracks supplier procurement plus receipt and return state:
 
 ```text
-DRAFT -> RFQ_SENT -> QUOTE_RECEIVED -> PO_SENT -> SHIPPED -> PARTIALLY_RECEIVED -> RECEIVED -> CLOSED
+DRAFT -> RFQ_SENT -> QUOTE_RECEIVED -> PO_SENT -> SHIPPED -> PARTIALLY_RECEIVED -> RECEIVED -> INVOICED -> CLOSED
 ```
 
 Current alternate paths:
@@ -48,7 +49,7 @@ Current alternate paths:
 - `RFQ_SENT` and `QUOTE_RECEIVED` can close without being sent.
 - `PO_SENT` and `SHIPPED` can become `PARTIALLY_RECEIVED` or `RECEIVED` through receipt.
 - `PO_SENT`, `PARTIALLY_RECEIVED`, `RECEIVED`, `INVOICED`, and `PARTIALLY_RETURNED` can become `PARTIALLY_RETURNED` or `RETURNED` through supplier return.
-- `INVOICED` is currently mostly a secondary state in the schema; invoice creation stamps `invoicedAt` and does not always replace the primary PO status.
+- `RECEIVED` can move to `INVOICED`; current invoice creation also stamps `invoicedAt`, so follow-up enforcement needs to decide whether to keep that secondary timestamp behavior or promote `INVOICED` as the primary status.
 
 ## Refunds
 

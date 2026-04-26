@@ -68,6 +68,10 @@ test('every workflow transition map covers every known status', () => {
 test('sales order state machine allows current forward paths and blocks direct jumps', () => {
   assert.equal(canTransitionSalesOrder('DRAFT', 'PROCESSING'), true)
   assert.equal(canTransitionSalesOrder('PROCESSING', 'ALLOCATED'), true)
+  assert.equal(canTransitionSalesOrder('PICKING', 'ON_HOLD'), true)
+  assert.equal(canTransitionSalesOrder('ON_HOLD', 'PICKING'), true)
+  assert.equal(canTransitionSalesOrder('PACKING', 'ON_HOLD'), true)
+  assert.equal(canTransitionSalesOrder('ON_HOLD', 'PACKING'), true)
   assert.equal(canTransitionSalesOrder('PACKING', 'SHIPPED'), true)
   assert.equal(canTransitionSalesOrder('SHIPPED', 'COMPLETED'), true)
   assert.equal(canTransitionSalesOrder('DRAFT', 'SHIPPED'), false)
@@ -95,6 +99,7 @@ test('purchase order state machine includes manual, receipt, return, and cancel 
   assert.equal(canTransitionPurchaseOrder('DRAFT', 'CANCELLED'), true)
   assert.equal(canTransitionPurchaseOrder('PO_SENT', 'PARTIALLY_RECEIVED'), true)
   assert.equal(canTransitionPurchaseOrder('PARTIALLY_RECEIVED', 'RECEIVED'), true)
+  assert.equal(canTransitionPurchaseOrder('RECEIVED', 'INVOICED'), true)
   assert.equal(canTransitionPurchaseOrder('RECEIVED', 'PARTIALLY_RETURNED'), true)
   assert.equal(canTransitionPurchaseOrder('DRAFT', 'RECEIVED'), false)
   assert.equal(canTransitionPurchaseOrder('RETURNED', 'RECEIVED'), false)
