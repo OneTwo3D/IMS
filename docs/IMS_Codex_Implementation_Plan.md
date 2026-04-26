@@ -1184,6 +1184,46 @@ Run lint, type-check, and accounting document-event tests.
 
 ---
 
+## PR 6.5 — Backfill missing accounting events from sync logs
+
+### Goal
+
+Repair historical gaps after the reconciliation report can identify missing `AccountingEvent` rows. This is a controlled backfill only; current posting behavior still remains unchanged.
+
+### Target files
+
+```text
+lib/domain/accounting/accounting-event-backfill.ts
+app/api/admin/accounting/backfill/route.ts
+tests/domain/accounting/accounting-event-backfill.test.ts
+```
+
+### Acceptance criteria
+
+- Uses the PR 6.3 reconciliation output to select old mirrorable `AccountingSyncLog` rows that have no matching `AccountingEvent`.
+- Supports report-only/dry-run mode by default.
+- Creates missing journal-shaped A1/A2/B/refund reversal events with deterministic idempotency keys.
+- Creates missing document-shaped invoice, credit note, and purchase invoice events only after PR 6.4 payload builders exist.
+- Does not re-post to accounting systems or mutate source orders, shipments, refunds, invoices, or purchase orders.
+- Logs every created event and skipped row with a reason.
+- Tests cover dry-run output, idempotent reruns, unsupported payload skips, and successful backfill creation.
+
+### Codex prompt
+
+```text
+Add a controlled accounting-event backfill for old AccountingSyncLog rows missing mirrored AccountingEvent rows.
+
+Use the reconciliation report to identify candidate gaps.
+Default to dry-run/report-only mode.
+Backfill only rows whose payload can be mapped deterministically to the journal-shaped or document-shaped event builders.
+Do not post to Xero/QuickBooks and do not mutate source business records.
+Log created events and skipped rows with reasons.
+Add tests for dry-run, idempotency, unsupported payload skips, and successful backfill.
+Run lint, type-check, and accounting-event backfill tests.
+```
+
+---
+
 # Stage 7 — Connector outbox and retry system
 
 ## Stage goal
@@ -1623,12 +1663,13 @@ PR 6.1  AccountingEvent model
 PR 6.2  Mirror current accounting actions
 PR 6.3  Accounting reconciliation report
 PR 6.4  Document-shaped accounting events
+PR 6.5  Backfill missing accounting events
 PR 7.1  IntegrationOutbox model
 PR 7.2  WooCommerce outbox migration
 PR 7.3  Xero outbox migration
 ```
 
-Do not start Xero outbox migration until accounting-event mirroring, document-shaped accounting events, and reconciliation are stable.
+Do not start Xero outbox migration until accounting-event mirroring, document-shaped accounting events, reconciliation, and missing-event backfill are stable.
 
 ## Wave 5 — Ops, security, and scale
 
