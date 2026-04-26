@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { Prisma, type WmsAsnStatus, type WmsStockMasterSystem, type WmsStockSyncMode } from '@/app/generated/prisma/client'
 import { z } from 'zod'
-import { applyReturnInboundStockTx, type RefundReturnRow } from '@/app/actions/sales'
+import { applyReturnInboundStockTx, type RefundReturnRow } from '@/lib/domain/sales/refund-service'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getSession, requirePermission } from '@/lib/auth/server'
