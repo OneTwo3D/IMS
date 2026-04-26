@@ -10,7 +10,12 @@ import {
 } from '@/lib/domain/workflows/action-guards'
 
 test('sales order action guard allows current aggregate ship flow and blocks direct draft ship', () => {
+  assert.deepEqual(validateSalesOrderStatusTransition('DRAFT', 'ALLOCATED'), { success: true })
+  assert.deepEqual(validateSalesOrderStatusTransition('PENDING_PAYMENT', 'ALLOCATED'), { success: true })
   assert.deepEqual(validateSalesOrderStatusTransition('ALLOCATED', 'SHIPPED'), { success: true })
+  assert.deepEqual(validateSalesOrderStatusTransition('SHIPPED', 'DELIVERED'), { success: true })
+  assert.deepEqual(validateSalesOrderStatusTransition('SHIPPED', 'PARTIALLY_REFUNDED'), { success: true })
+  assert.deepEqual(validateSalesOrderStatusTransition('PARTIALLY_REFUNDED', 'REFUNDED'), { success: true })
   assert.deepEqual(validateSalesOrderStatusTransition('DRAFT', 'SHIPPED'), {
     success: false,
     error: 'Cannot transition sales order from DRAFT to SHIPPED',

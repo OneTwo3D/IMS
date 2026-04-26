@@ -17,13 +17,18 @@ Current alternate paths:
 
 - `DRAFT`, `PENDING_PAYMENT`, `ON_HOLD`, `PROCESSING`, `ALLOCATED`, `PICKING`, and `PACKING` can move to `CANCELLED` where the current actions allow cancellation.
 - `DRAFT` can move directly to `PROCESSING` for orders that do not need to wait in `PENDING_PAYMENT`.
+- `DRAFT`, `PENDING_PAYMENT`, and `PROCESSING` can move directly to `ALLOCATED` when auto-allocation reserves stock for the order.
 - `DRAFT`, `PENDING_PAYMENT`, `PROCESSING`, `ALLOCATED`, `PICKING`, and `PACKING` can move through `ON_HOLD` where the current actions allow hold/release.
 - `PENDING_PAYMENT` can return to `DRAFT`.
 - `ALLOCATED` can return to `PROCESSING` when allocations are released.
 - `ALLOCATED` and `PICKING` can become `SHIPPED` only after shipment rows exist
   and every shipment row has already reached shipment `SHIPPED`; the sales order
   transition is an aggregate state update, not stock dispatch.
-- `PARTIALLY_REFUNDED` and `REFUNDED` are terminal order states set by refund creation.
+- `SHIPPED` can move directly to `DELIVERED` when delivery tracking confirms all
+  tracked shipments are delivered.
+- `PARTIALLY_REFUNDED` and `REFUNDED` are order states set by refund creation.
+  `REFUNDED` is terminal; `PARTIALLY_REFUNDED` can move to `REFUNDED` when later
+  refunds bring the total refunded amount up to the order total.
 
 ## Shipments
 
