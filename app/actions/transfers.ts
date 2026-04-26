@@ -420,8 +420,8 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
             data: {
               costLayerSnapshot: consumed.map((c) => ({
                 costLayerId: c.costLayerId,
-                qty: c.qty,
-                unitCostBase: c.unitCostBase,
+                qty: c.qty.toNumber(),
+                unitCostBase: c.unitCostBase.toNumber(),
               })),
             },
           })

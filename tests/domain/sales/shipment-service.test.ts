@@ -312,6 +312,38 @@ test('transitionShipmentStatus ships stock and stores FIFO COGS snapshot', async
   assert.equal(state.lines[0].cogsBase, 10)
 })
 
+test('transitionShipmentStatus consumes fractional FIFO layers without binary remainder drift', async () => {
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 0.3, sku: 'SKU-1', description: 'Product 1' }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 0.3 }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 0.3 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 0.3, reservedQty: 0.3 }],
+    costLayers: [
+      { id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 0.1, unitCostBase: 0.1 },
+      { id: 'layer-2', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 0.2, unitCostBase: 0.2 },
+    ],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.costLayers[0].remainingQty, 0)
+  assert.equal(state.costLayers[1].remainingQty, 0)
+  assert.equal(state.shipments[0].cogsBatchAmount, 0.05)
+  assert.deepEqual(state.shipmentLines[0].costLayerSnapshot, [
+    { costLayerId: 'layer-1', qty: 0.1, unitCostBase: 0.1 },
+    { costLayerId: 'layer-2', qty: 0.2, unitCostBase: 0.2 },
+  ])
+  assert.deepEqual(state.cogsEntries, [
+    { costLayerId: 'layer-1', movementId: 'movement-1', qty: 0.1, unitCostBase: 0.1, totalCostBase: 0.01 },
+    { costLayerId: 'layer-2', movementId: 'movement-1', qty: 0.2, unitCostBase: 0.2, totalCostBase: 0.04 },
+  ])
+})
+
 test('transitionShipmentStatus rejects shipping when FIFO layers are insufficient', async () => {
   const state = baseState({
     shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],

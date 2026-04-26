@@ -31,6 +31,7 @@ import {
   resolveSettlementFxRateToBase,
 } from '@/lib/accounting-fx'
 import { Prisma, type TaxCategory } from '@/app/generated/prisma/client'
+import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -2084,7 +2085,7 @@ export async function returnPurchaseOrder(
 
     const returnRef = `RTN-${po.reference}-${Date.now().toString(36).toUpperCase()}`
     let purchaseReturnId = ''
-    let totalReturnedCostBase = 0
+    let totalReturnedCostBase = toDecimal(0)
     await db.$transaction(async (tx) => {
       const purchaseReturn = await tx.purchaseReturn.create({
         data: {
@@ -2137,15 +2138,18 @@ export async function returnPurchaseOrder(
           },
         })
         const { consumed } = await consumeFifoLayersStrict(tx, poLine.productId, rl.warehouseId, rl.qtyReturned)
-        totalReturnedCostBase += consumed.reduce((sum, entry) => sum + entry.qty * entry.unitCostBase, 0)
+        totalReturnedCostBase = consumed.reduce(
+          (sum, entry) => addMoney(sum, multiplyMoney(entry.qty, entry.unitCostBase)),
+          totalReturnedCostBase,
+        )
         if (consumed.length > 0) {
           await tx.cogsEntry.createMany({
             data: consumed.map((entry) => ({
               costLayerId: entry.costLayerId,
               movementId: movement.id,
-              qty: entry.qty,
-              unitCostBase: entry.unitCostBase,
-              totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+              qty: entry.qty.toNumber(),
+              unitCostBase: entry.unitCostBase.toNumber(),
+              totalCostBase: roundQuantity(multiplyMoney(entry.qty, entry.unitCostBase), 6).toNumber(),
             })),
           })
         }
@@ -2172,8 +2176,8 @@ export async function returnPurchaseOrder(
           data: { status: allReceivedReturned ? 'RETURNED' : 'PARTIALLY_RETURNED' },
         })
       }
-      if (accountingSettings.syncEnabled && totalReturnedCostBase > 0.000001) {
-        const amount = Math.round(totalReturnedCostBase * 100) / 100
+      if (accountingSettings.syncEnabled && totalReturnedCostBase.gt(0.000001)) {
+        const amount = roundQuantity(totalReturnedCostBase, 2).toNumber()
         const payload = {
           date: new Date().toISOString().slice(0, 10),
           reference: returnRef,

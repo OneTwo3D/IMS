@@ -25,6 +25,7 @@ import {
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
+import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
 import { expandFulfillmentRequirements, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
@@ -48,6 +49,10 @@ const QBO_CONNECTOR = 'quickbooks'
 
 function round2(value: number): number {
   return Math.round(value * 100) / 100
+}
+
+function round2Decimal(value: Decimal): number {
+  return roundQuantity(value, 2).toNumber()
 }
 
 function normalizeDeferredDiscountBase(order: {
@@ -113,8 +118,8 @@ function requireShipmentSnapshotValue(order: {
     status: string
     lines: Array<{ id: string; qty: Prisma.Decimal | number; costLayerSnapshot: Prisma.JsonValue | null }>
   }>
-}): number {
-  let total = 0
+}): Decimal {
+  let total = toDecimal(0)
   let hasShippedLines = false
 
   for (const shipment of order.shipments) {
@@ -126,7 +131,7 @@ function requireShipmentSnapshotValue(order: {
       if (snapshot.length === 0) {
         throw new Error(`Missing FIFO snapshot for already-shipped line ${line.id} on order ${order.id}`)
       }
-      total += sumCostLayerSnapshot(snapshot)
+      total = addMoney(total, sumCostLayerSnapshot(snapshot))
     }
   }
 
@@ -134,7 +139,7 @@ function requireShipmentSnapshotValue(order: {
     throw new Error(`Order ${order.id} is marked shipped but has no shipped lines to reclassify`)
   }
 
-  return round2(total)
+  return roundQuantity(total, 2)
 }
 
 function consumeSnapshotLayers(
@@ -519,7 +524,7 @@ export async function runDailyBatchSync(): Promise<{
 
     if (orders.length > 0) {
       await db.$transaction(async (tx) => {
-        let totalAllocatedValue = 0
+        let totalAllocatedValue = toDecimal(0)
         const unshippedOrders = orders.filter((order) => order.shipments.length === 0)
         const snapshot = await buildLayerSnapshot(
           tx,
@@ -534,7 +539,7 @@ export async function runDailyBatchSync(): Promise<{
         const allocationSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
 
         for (const order of orders) {
-          let orderCostValue = 0
+          let orderCostValue = toDecimal(0)
 
           if (order.shipments.length > 0) {
             orderCostValue = requireShipmentSnapshotValue(order)
@@ -547,26 +552,27 @@ export async function runDailyBatchSync(): Promise<{
                 Number(alloc.qty),
               )
               allocationSnapshots.set(alloc.id, allocationSnapshot)
-              orderCostValue += sumCostLayerSnapshot(allocationSnapshot)
+              orderCostValue = addMoney(orderCostValue, sumCostLayerSnapshot(allocationSnapshot))
             }
-            orderCostValue = round2(orderCostValue)
+            orderCostValue = roundQuantity(orderCostValue, 2)
           }
 
-          totalAllocatedValue += orderCostValue
-          orderValues.set(order.id, orderCostValue)
+          totalAllocatedValue = addMoney(totalAllocatedValue, orderCostValue)
+          orderValues.set(order.id, orderCostValue.toNumber())
         }
 
-        if (totalAllocatedValue > 0) {
+        const totalAllocatedValueNumber = round2Decimal(totalAllocatedValue)
+        if (totalAllocatedValueNumber > 0) {
           await createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_INVENTORY_ALLOC',
             referenceId: `A2-${today}`,
             payload: {
               date: today,
               reference: `Inventory Allocation ${today}`,
-              narration: `Daily inventory reclassification: ${orders.length} order(s), £${totalAllocatedValue.toFixed(2)}`,
+              narration: `Daily inventory reclassification: ${orders.length} order(s), £${totalAllocatedValueNumber.toFixed(2)}`,
               lines: [
-                { accountCode: settings.quickbooks_allocated_inventory_account, description: `Daily inventory allocation — ${orders.length} order(s)`, debit: totalAllocatedValue },
-                { accountCode: settings.quickbooks_inventory_account, description: `Daily inventory allocation — ${orders.length} order(s)`, credit: totalAllocatedValue },
+                { accountCode: settings.quickbooks_allocated_inventory_account, description: `Daily inventory allocation — ${orders.length} order(s)`, debit: totalAllocatedValueNumber },
+                { accountCode: settings.quickbooks_inventory_account, description: `Daily inventory allocation — ${orders.length} order(s)`, credit: totalAllocatedValueNumber },
               ],
               _postingMode: 'submitted',
             },
@@ -655,7 +661,7 @@ export async function runDailyBatchSync(): Promise<{
       }
 
       let totalRevenue = 0
-      let totalCogs = 0
+      let totalCogs = toDecimal(0)
       const layerDecrements = new Map<string, number>()
       const shipmentResults = new Map<string, { revenue: number; cogs: number }>()
       const shipmentSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
@@ -804,8 +810,15 @@ export async function runDailyBatchSync(): Promise<{
           ))
           const hasPrecomputedSnapshots = shipmentSnapshotsForLines.some((entries) => entries.length > 0)
           const precomputedCogs = hasPrecomputedSnapshots
-            ? round2(shipmentSnapshotsForLines.reduce((sum, entries) => sum + sumCostLayerSnapshot(entries), 0))
-            : Number(shipment.cogsBatchAmount ?? 0)
+            ? roundQuantity(
+                shipmentSnapshotsForLines.reduce(
+                  (sum, entries) => addMoney(sum, sumCostLayerSnapshot(entries)),
+                  toDecimal(0),
+                ),
+                2,
+              )
+            : toDecimal(shipment.cogsBatchAmount ?? 0)
+          const precomputedCogsNumber = precomputedCogs.toNumber()
           if (hasPrecomputedSnapshots) {
             const missingSnapshotLines = shipment.lines.filter((line, lineIndex) => (
               Number(line.qty) > 0 && shipmentSnapshotsForLines[lineIndex].length === 0
@@ -814,12 +827,12 @@ export async function runDailyBatchSync(): Promise<{
               throw new Error(`Incomplete precomputed FIFO snapshots for shipment ${shipment.id}`)
             }
             const cogsBatchAmount = Number(shipment.cogsBatchAmount ?? 0)
-            if (cogsBatchAmount > 0 && Math.abs(round2(cogsBatchAmount) - precomputedCogs) > 0.01) {
-              throw new Error(`Precomputed COGS mismatch for shipment ${shipment.id}: batch ${round2(cogsBatchAmount).toFixed(2)} != snapshots ${precomputedCogs.toFixed(2)}`)
+            if (cogsBatchAmount > 0 && Math.abs(round2(cogsBatchAmount) - precomputedCogsNumber) > 0.01) {
+              throw new Error(`Precomputed COGS mismatch for shipment ${shipment.id}: batch ${round2(cogsBatchAmount).toFixed(2)} != snapshots ${precomputedCogsNumber.toFixed(2)}`)
             }
           }
 
-          if (!hasPrecomputedSnapshots && precomputedCogs <= 0) {
+          if (!hasPrecomputedSnapshots && precomputedCogs.lte(0)) {
             // Legacy fallback: allocation-based consumption for shipments
             // dispatched before FIFO-at-ship-time was deployed.
             const shipmentCostSnapshot: CostLayerSnapshotEntry[] = []
@@ -863,11 +876,12 @@ export async function runDailyBatchSync(): Promise<{
               )
             }
 
-            const legacyCogs = round2(sumCostLayerSnapshot(shipmentCostSnapshot))
+            const legacyCogs = roundQuantity(sumCostLayerSnapshot(shipmentCostSnapshot), 2)
+            const legacyCogsNumber = legacyCogs.toNumber()
             totalRevenue += revenueProportion
-            totalCogs += legacyCogs
+            totalCogs = addMoney(totalCogs, legacyCogs)
             runningRevenue += revenueProportion
-            shipmentResults.set(shipment.id, { revenue: revenueProportion, cogs: legacyCogs })
+            shipmentResults.set(shipment.id, { revenue: revenueProportion, cogs: legacyCogsNumber })
             for (const sl of shipment.lines) {
               shipmentSnapshots.set(
                 sl.id,
@@ -876,9 +890,9 @@ export async function runDailyBatchSync(): Promise<{
             }
           } else {
             totalRevenue += revenueProportion
-            totalCogs += precomputedCogs
+            totalCogs = addMoney(totalCogs, precomputedCogs)
             runningRevenue += revenueProportion
-            shipmentResults.set(shipment.id, { revenue: revenueProportion, cogs: precomputedCogs })
+            shipmentResults.set(shipment.id, { revenue: revenueProportion, cogs: precomputedCogsNumber })
           }
         }
         // Only publish legacy FIFO decrements after the whole order succeeds.
@@ -894,7 +908,7 @@ export async function runDailyBatchSync(): Promise<{
             const sr = shipmentResults.get(s.id)
             if (sr) {
               totalRevenue -= sr.revenue
-              totalCogs -= sr.cogs
+              totalCogs = subtractMoney(totalCogs, sr.cogs)
               shipmentResults.delete(s.id)
             }
             for (const sl of s.lines) shipmentSnapshots.delete(sl.id)
@@ -904,6 +918,7 @@ export async function runDailyBatchSync(): Promise<{
 
       const journalLines: JournalLinePayload[] = []
       const processedShipmentCount = shipmentResults.size
+      const totalCogsNumber = round2Decimal(totalCogs)
 
       if (totalRevenue > 0) {
         journalLines.push(
@@ -912,10 +927,10 @@ export async function runDailyBatchSync(): Promise<{
         )
       }
 
-      if (totalCogs > 0) {
+      if (totalCogsNumber > 0) {
         journalLines.push(
-          { accountCode: settings.quickbooks_cogs_account, description: `COGS — ${processedShipmentCount} shipment(s)`, debit: totalCogs },
-          { accountCode: settings.quickbooks_allocated_inventory_account, description: `COGS — ${processedShipmentCount} shipment(s)`, credit: totalCogs },
+          { accountCode: settings.quickbooks_cogs_account, description: `COGS — ${processedShipmentCount} shipment(s)`, debit: totalCogsNumber },
+          { accountCode: settings.quickbooks_allocated_inventory_account, description: `COGS — ${processedShipmentCount} shipment(s)`, credit: totalCogsNumber },
         )
       }
 
@@ -926,7 +941,7 @@ export async function runDailyBatchSync(): Promise<{
           payload: {
             date: today,
             reference: `Shipment COGS ${today}`,
-            narration: `Daily shipment batch: ${processedShipmentCount} shipment(s), revenue £${totalRevenue.toFixed(2)}, COGS £${totalCogs.toFixed(2)}`,
+            narration: `Daily shipment batch: ${processedShipmentCount} shipment(s), revenue £${totalRevenue.toFixed(2)}, COGS £${totalCogsNumber.toFixed(2)}`,
             lines: journalLines,
             _postingMode: 'submitted',
           },

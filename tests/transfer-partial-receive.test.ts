@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
+  sumCostLayerSnapshot,
   takeFromSnapshotEntries,
 } from '../lib/cost-layer-snapshots.ts'
 
@@ -115,4 +116,13 @@ test('zero remaining qty is a no-op (skip the line entirely)', () => {
     qtyReceived: 0,
   })
   assert.equal(got.length, 0)
+})
+
+test('snapshot cost summation uses Decimal arithmetic internally', () => {
+  const total = sumCostLayerSnapshot([
+    { costLayerId: 'L1', qty: 0.1, unitCostBase: 0.1 },
+    { costLayerId: 'L2', qty: 0.2, unitCostBase: 0.2 },
+  ])
+
+  assert.equal(total.toString(), '0.05')
 })

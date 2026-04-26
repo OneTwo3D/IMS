@@ -10,6 +10,7 @@ import {
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
 import { decimalToNumber } from '@/lib/decimal'
+import { roundQuantity } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { validateRefundSalesOrderStatusUpdate } from '@/lib/domain/workflows/action-guards'
 
@@ -895,12 +896,12 @@ async function stageRefundAccountingReversals(
     }
 
     return {
-      cogsReversal: Math.round(sumCostLayerSnapshot(shipmentRefundSnapshot) * 100) / 100,
+      cogsReversal: roundQuantity(sumCostLayerSnapshot(shipmentRefundSnapshot), 2).toNumber(),
       unearnedReversal: Math.min(
         remainingUnearned,
         Math.round((unshippedQtyRevenue + nonQtyRevenue) * 100) / 100,
       ),
-      allocationReversal: Math.round(sumCostLayerSnapshot(allocationRefundSnapshot) * 100) / 100,
+      allocationReversal: roundQuantity(sumCostLayerSnapshot(allocationRefundSnapshot), 2).toNumber(),
     }
   })
 

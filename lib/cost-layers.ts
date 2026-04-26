@@ -9,8 +9,38 @@
 
 import type { Prisma } from '@/app/generated/prisma/client'
 import { parseCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
+import {
+  addMoney,
+  multiplyMoney,
+  roundQuantity,
+  subtractMoney,
+  toDecimal,
+  type Decimal,
+  type DecimalInput,
+} from '@/lib/domain/math/decimal'
 
 type TxClient = Prisma.TransactionClient
+
+function minDecimal(a: Decimal, b: Decimal): Decimal {
+  return a.lte(b) ? a : b
+}
+
+function isPositiveDecimalInput(value: DecimalInput): boolean {
+  try {
+    return toDecimal(value).gt(0)
+  } catch {
+    return false
+  }
+}
+
+function isFiniteDecimalInput(value: DecimalInput): boolean {
+  try {
+    toDecimal(value)
+    return true
+  } catch {
+    return false
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Locking
@@ -28,16 +58,16 @@ export async function lockCostLayers(tx: TxClient, ids: string[]): Promise<void>
 
 export type ConsumedLayer = {
   costLayerId: string
-  qty: number
-  unitCostBase: number
+  qty: Decimal
+  unitCostBase: Decimal
 }
 
 export type CostLayerSourceLineInput = {
   sourceProductId: string
   sourceCostLayerId?: string | null
-  qty: number
-  unitCostBase: number
-  totalCostBase?: number
+  qty: DecimalInput
+  unitCostBase: DecimalInput
+  totalCostBase?: DecimalInput
 }
 
 /**
@@ -54,9 +84,9 @@ export async function consumeFifoLayers(
   productId: string,
   warehouseId: string,
   qty: number,
-): Promise<{ consumed: ConsumedLayer[]; totalCost: number; remainingQty: number }> {
-  let remaining = qty
-  let totalCost = 0
+): Promise<{ consumed: ConsumedLayer[]; totalCost: Decimal; remainingQty: Decimal }> {
+  let remaining = toDecimal(qty)
+  let totalCost = toDecimal(0)
   const consumed: ConsumedLayer[] = []
 
   const candidateLayers = await tx.costLayer.findMany({
@@ -77,18 +107,19 @@ export async function consumeFifoLayers(
       })
 
   for (const layer of layers) {
-    if (remaining <= 0) break
-    const layerRemaining = Number(layer.remainingQty)
-    const take = Math.min(remaining, layerRemaining)
-    if (take <= 0) continue
+    if (remaining.lte(0)) break
+    const layerRemaining = toDecimal(layer.remainingQty)
+    const take = minDecimal(remaining, layerRemaining)
+    if (take.lte(0)) continue
+    const takeNumber = take.toNumber()
     await tx.costLayer.update({
       where: { id: layer.id },
-      data: { remainingQty: { decrement: take } },
+      data: { remainingQty: { decrement: takeNumber } },
     })
-    const unitCost = Number(layer.unitCostBase)
-    totalCost += take * unitCost
+    const unitCost = toDecimal(layer.unitCostBase)
+    totalCost = addMoney(totalCost, multiplyMoney(take, unitCost))
     consumed.push({ costLayerId: layer.id, qty: take, unitCostBase: unitCost })
-    remaining -= take
+    remaining = subtractMoney(remaining, take)
   }
 
   return { consumed, totalCost, remainingQty: remaining }
@@ -103,12 +134,12 @@ export async function consumeFifoLayersStrict(
   productId: string,
   warehouseId: string,
   qty: number,
-): Promise<{ consumed: ConsumedLayer[]; totalCost: number }> {
+): Promise<{ consumed: ConsumedLayer[]; totalCost: Decimal }> {
   const result = await consumeFifoLayers(tx, productId, warehouseId, qty)
-  if (result.remainingQty > 0.0001) {
+  if (result.remainingQty.gt(0.0001)) {
     throw new Error(
       `Insufficient FIFO layers for product ${productId} in warehouse ${warehouseId}: ` +
-      `needed ${qty}, only ${qty - result.remainingQty} available in cost layers`,
+      `needed ${qty}, only ${subtractMoney(qty, result.remainingQty).toString()} available in cost layers`,
     )
   }
   return { consumed: result.consumed, totalCost: result.totalCost }
@@ -131,14 +162,14 @@ export async function getAverageUnitCost(
     where: { productId, warehouseId, remainingQty: { gt: 0 } },
     select: { remainingQty: true, unitCostBase: true },
   })
-  let totalQty = 0
-  let totalValue = 0
+  let totalQty = toDecimal(0)
+  let totalValue = toDecimal(0)
   for (const l of layers) {
-    const qty = Number(l.remainingQty)
-    totalQty += qty
-    totalValue += qty * Number(l.unitCostBase)
+    const qty = toDecimal(l.remainingQty)
+    totalQty = addMoney(totalQty, qty)
+    totalValue = addMoney(totalValue, multiplyMoney(qty, l.unitCostBase))
   }
-  return totalQty > 0 ? totalValue / totalQty : 0
+  return totalQty.gt(0) ? totalValue.div(totalQty).toNumber() : 0
 }
 
 export async function getHistoricalAverageUnitCost(
@@ -149,15 +180,15 @@ export async function getHistoricalAverageUnitCost(
     where: { productId },
     select: { receivedQty: true, unitCostBase: true },
   })
-  let totalQty = 0
-  let totalValue = 0
+  let totalQty = toDecimal(0)
+  let totalValue = toDecimal(0)
   for (const layer of layers) {
-    const qty = Number(layer.receivedQty)
-    if (!Number.isFinite(qty) || qty <= 0) continue
-    totalQty += qty
-    totalValue += qty * Number(layer.unitCostBase)
+    const qty = toDecimal(layer.receivedQty)
+    if (qty.lte(0)) continue
+    totalQty = addMoney(totalQty, qty)
+    totalValue = addMoney(totalValue, multiplyMoney(qty, layer.unitCostBase))
   }
-  return totalQty > 0 ? totalValue / totalQty : 0
+  return totalQty.gt(0) ? totalValue.div(totalQty).toNumber() : 0
 }
 
 /**
@@ -184,7 +215,7 @@ export async function createCostLayer(
       warehouseId: data.warehouseId,
       receivedQty: data.qty,
       remainingQty: data.qty,
-      unitCostBase: Math.round(data.unitCostBase * 1000000) / 1000000,
+      unitCostBase: roundQuantity(data.unitCostBase, 6).toNumber(),
       poLineId: data.poLineId ?? null,
       adjustmentMovementId: data.adjustmentMovementId ?? null,
       productionOrderId: data.productionOrderId ?? null,
@@ -204,17 +235,17 @@ export async function addCostLayerSourceLines(
   const validLines = lines
     .filter((line) => (
       line.sourceProductId &&
-      Number.isFinite(line.qty) &&
-      line.qty > 0 &&
-      Number.isFinite(line.unitCostBase)
+      isPositiveDecimalInput(line.qty) &&
+      line.unitCostBase != null &&
+      isFiniteDecimalInput(line.unitCostBase)
     ))
     .map((line) => ({
       costLayerId,
       sourceProductId: line.sourceProductId,
       sourceCostLayerId: line.sourceCostLayerId ?? null,
-      qty: Math.round(line.qty * 10000) / 10000,
-      unitCostBase: Math.round(line.unitCostBase * 1000000) / 1000000,
-      totalCostBase: Math.round(((line.totalCostBase ?? (line.qty * line.unitCostBase)) * 1000000)) / 1000000,
+      qty: roundQuantity(line.qty, 4).toNumber(),
+      unitCostBase: roundQuantity(line.unitCostBase, 6).toNumber(),
+      totalCostBase: roundQuantity(line.totalCostBase ?? multiplyMoney(line.qty, line.unitCostBase), 6).toNumber(),
     }))
 
   if (validLines.length === 0) return 0
@@ -249,16 +280,16 @@ export async function copyCostLayerSourceLinesProportionally(
   })
   if (!sourceLayer || sourceLayer.sourceLines.length === 0) return 0
 
-  const sourceReceivedQty = Number(sourceLayer.receivedQty)
-  if (!Number.isFinite(sourceReceivedQty) || sourceReceivedQty <= 0) return 0
+  const sourceReceivedQty = toDecimal(sourceLayer.receivedQty)
+  if (sourceReceivedQty.lte(0)) return 0
 
-  const rawRatio = copiedQty / sourceReceivedQty
-  const ratio = Math.min(1, rawRatio)
-  if (ratio <= 0) return 0
-  if (rawRatio > 1.000001) {
+  const rawRatio = toDecimal(copiedQty).div(sourceReceivedQty)
+  const ratio = rawRatio.gt(1) ? toDecimal(1) : rawRatio
+  if (ratio.lte(0)) return 0
+  if (rawRatio.gt('1.000001')) {
     console.warn(
       `copyCostLayerSourceLinesProportionally capped ratio at 1 for ${fromCostLayerId} -> ${toCostLayerId} ` +
-      `(copiedQty=${copiedQty}, sourceReceivedQty=${sourceReceivedQty})`,
+      `(copiedQty=${copiedQty}, sourceReceivedQty=${sourceReceivedQty.toString()})`,
     )
   }
 
@@ -268,9 +299,9 @@ export async function copyCostLayerSourceLinesProportionally(
     sourceLayer.sourceLines.map((line) => ({
       sourceProductId: line.sourceProductId,
       sourceCostLayerId: line.sourceCostLayerId,
-      qty: Number(line.qty) * ratio,
-      unitCostBase: Number(line.unitCostBase),
-      totalCostBase: Number(line.totalCostBase) * ratio,
+      qty: multiplyMoney(line.qty, ratio).toNumber(),
+      unitCostBase: toDecimal(line.unitCostBase).toNumber(),
+      totalCostBase: multiplyMoney(line.totalCostBase, ratio).toNumber(),
     })),
   )
 }
@@ -361,16 +392,16 @@ export async function getReturnedQtyForCostLayer(
     containsCostLayer,
   )
 
-  let returnedQty = 0
+  let returnedQty = toDecimal(0)
   for (const row of rows) {
     for (const entry of parseCostLayerSnapshot(row.costLayerSnapshot)) {
       if (entry.costLayerId === costLayerId) {
-        returnedQty += entry.qty
+        returnedQty = addMoney(returnedQty, entry.qty)
       }
     }
   }
 
-  return returnedQty
+  return returnedQty.toNumber()
 }
 
 /**
@@ -389,7 +420,7 @@ export async function getSupplierReturnedQtyForCostLayer(
     },
     select: { qty: true },
   })
-  return rows.reduce((sum, row) => sum + Number(row.qty), 0)
+  return rows.reduce((sum, row) => addMoney(sum, row.qty), toDecimal(0)).toNumber()
 }
 
 /**
@@ -413,9 +444,11 @@ export async function refreshShipmentCogsForCostLayerChange(
       where: { shipmentId: shipment.id },
       select: { costLayerSnapshot: true },
     })
-    const cogs = Math.round(lines.reduce((sum, line) => (
-      sum + sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot))
-    ), 0) * 100) / 100
+    const cogsTotal = lines.reduce(
+      (sum, line) => addMoney(sum, sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot))),
+      toDecimal(0),
+    )
+    const cogs = roundQuantity(cogsTotal, 2).toNumber()
     await tx.shipment.update({
       where: { id: shipment.id },
       data: { cogsBatchAmount: cogs },
@@ -438,7 +471,7 @@ export async function refreshSalesOrderLineCogs(
     select: { lineId: true, costLayerSnapshot: true },
   })
 
-  const cogsByLineId = new Map<string, number>()
+  const cogsByLineId = new Map<string, Decimal>()
   const hasSnapshotByLineId = new Map<string, boolean>()
   const shipmentLineCountByLineId = new Map<string, number>()
   for (const shipmentLine of shipmentLines) {
@@ -449,8 +482,10 @@ export async function refreshSalesOrderLineCogs(
     )
     cogsByLineId.set(
       shipmentLine.lineId,
-      (cogsByLineId.get(shipmentLine.lineId) ?? 0)
-        + sumCostLayerSnapshot(snapshot),
+      addMoney(
+        cogsByLineId.get(shipmentLine.lineId) ?? toDecimal(0),
+        sumCostLayerSnapshot(snapshot),
+      ),
     )
     if (snapshot.length > 0) {
       hasSnapshotByLineId.set(shipmentLine.lineId, true)
@@ -472,7 +507,7 @@ export async function refreshSalesOrderLineCogs(
       data: {
         cogsBase: cogs == null || !hasSnapshotByLineId.get(lineId)
           ? null
-          : Math.round(cogs * 10000) / 10000,
+          : roundQuantity(cogs, 4).toNumber(),
       },
     })
     updated++
