@@ -179,6 +179,7 @@ async function buildRefundFallbackReturnRows(
   client: RefundServiceClient,
   orderId: string,
   lines: RefundRequestLine[],
+  excludeRefundId?: string,
 ): Promise<RefundReturnRow[]> {
   const order = await client.salesOrder.findUnique({
     where: { id: orderId },
@@ -213,6 +214,7 @@ async function buildRefundFallbackReturnRows(
       refunds: {
         where: { returnWarehouseId: { not: null } },
         select: {
+          id: true,
           lines: {
             select: { productId: true, qty: true },
           },
@@ -252,6 +254,7 @@ async function buildRefundFallbackReturnRows(
 
   const priorReturnedByProduct = new Map<string, number>()
   for (const refund of order.refunds) {
+    if (excludeRefundId && refund.id === excludeRefundId) continue
     for (const refundLine of refund.lines) {
       if (!refundLine.productId) continue
       priorReturnedByProduct.set(
@@ -1221,7 +1224,7 @@ export async function createSalesOrderRefund(
     const snapshotRows = snapshotReturnRows ?? []
     const returnRows = snapshotRows.length > 0
       ? snapshotRows
-      : await buildRefundFallbackReturnRows(client, input.orderId, refundLines)
+      : await buildRefundFallbackReturnRows(client, input.orderId, refundLines, txResult.createdRefund.id)
 
     returnedRows = await runInTransaction(client, (tx) => (
       applyReturnInboundStockTx(tx, {
@@ -1351,7 +1354,7 @@ export async function retrySalesOrderRefundAccounting(
         const snapshotRows = staged.snapshotReturnRows ?? []
         const returnRows = snapshotRows.length > 0
           ? snapshotRows
-          : await buildRefundFallbackReturnRows(tx, refund.orderId, refundLines)
+          : await buildRefundFallbackReturnRows(tx, refund.orderId, refundLines, refund.id)
         returnedRows = await applyReturnInboundStockTx(tx, {
           referenceType: 'SalesOrderRefund',
           referenceId: refund.id,

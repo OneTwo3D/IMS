@@ -626,6 +626,56 @@ test('createSalesOrderRefund clears accounting deferral dates for full refunds',
   assert.deepEqual(state.refunds[0].accountingRetrySyncs, result.success ? result.accountingSyncs : [])
 })
 
+test('createSalesOrderRefund fallback stock return excludes the current refund from prior returns', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: null,
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: null,
+    }],
+    allocations: [{
+      id: 'allocation-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-main',
+      qty: 2,
+      costLayerSnapshot: [],
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: null,
+      revenueRecognizedAmount: null,
+      cogsBatchAmount: null,
+      lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: 2, costLayerSnapshot: [] }],
+    }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 2, totalBase: 100 }],
+    reason: 'Full return',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.movements[0].productId, 'product-1')
+  assert.equal(state.movements[0].qty, 2)
+  assert.equal(state.movements[0].referenceType, 'SalesOrderRefund')
+  assert.equal(state.movements[0].referenceId, 'refund-1')
+  assert.equal(state.stockLevels[0].quantity, 2)
+})
+
 test('retrySalesOrderRefundAccounting replays persisted syncs after full refund clears deferral dates', async () => {
   const persistedSyncs = [{
     type: 'COGS_REVERSAL' as const,
@@ -811,8 +861,8 @@ test('retrySalesOrderRefundAccounting falls back to order rows when staged retur
       creditNoteNumber: 'CN-2026-00001',
       externalRefundId: null,
       reason: 'Customer return',
-      totalForeign: 50,
-      totalBase: 50,
+      totalForeign: 100,
+      totalBase: 100,
       returnWarehouseId: 'warehouse-returns',
       accountingRetryRequired: true,
       accountingWarning: 'Previous accounting staging failed',
@@ -823,11 +873,11 @@ test('retrySalesOrderRefundAccounting falls back to order rows when staged retur
       salesOrderLineId: 'line-1',
       productId: 'product-1',
       description: 'Product 1',
-      qty: 1,
+      qty: 2,
       unitPriceForeign: 50,
       unitPriceBase: 50,
-      totalForeign: 50,
-      totalBase: 50,
+      totalForeign: 100,
+      totalBase: 100,
     }],
     allocations: [{
       id: 'allocation-1',
@@ -849,9 +899,10 @@ test('retrySalesOrderRefundAccounting falls back to order rows when staged retur
   assert.equal(result.success, true)
   assert.equal(result.success && result.accountingSyncs[0].type, 'UNEARNED_REV_REVERSAL')
   assert.equal(state.movements[0].productId, 'product-1')
+  assert.equal(state.movements[0].qty, 2)
   assert.equal(state.movements[0].referenceType, 'SalesOrderRefund')
   assert.equal(state.movements[0].referenceId, 'refund-1')
-  assert.equal(state.stockLevels[0].quantity, 1)
+  assert.equal(state.stockLevels[0].quantity, 2)
 })
 
 test('retrySalesOrderRefundAccounting requires a pending accounting failure', async () => {
