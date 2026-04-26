@@ -73,19 +73,95 @@ test('refund reversal sync log payload mirrors using the existing idempotency ke
   ])
 })
 
-test('non-journal refund documents are not mirrored as debit-credit events', () => {
-  assert.equal(isMirrorableAccountingSyncType('CREDIT_NOTE'), false)
-  assert.equal(buildMirroredAccountingEventDraft({
+test('credit note sync logs mirror as document-shaped accounting events', () => {
+  assert.equal(isMirrorableAccountingSyncType('CREDIT_NOTE'), true)
+  const event = buildMirroredAccountingEventDraft({
     connector: 'xero',
     type: 'CREDIT_NOTE',
     referenceType: 'SalesOrderRefund',
     referenceId: 'refund-1',
     currency: 'GBP',
+    status: 'PENDING',
     payload: {
+      _idempotencyKey: 'sales-order-refund:refund-1:credit-note',
+      creditNoteNumber: 'CN-1001',
+      contactName: 'Customer One',
+      contactEmail: 'customer@example.com',
       date: '2026-04-26',
-      lines: [{ description: 'Refund line', quantity: 1, unitAmount: 10, accountCode: '400' }],
+      currency: 'EUR',
+      currencyRateToBase: 1.18,
+      reference: 'SO-1001',
+      lineAmountsIncludeTax: false,
+      lines: [{ description: 'Refund line', quantity: 1, unitAmount: 10, accountCode: '400', taxType: 'OUTPUT2' }],
     },
-  }), null)
+  })
+
+  assert.ok(event)
+  assert.equal(event.type, 'CREDIT_NOTE')
+  assert.equal(event.currency, 'EUR')
+  assert.equal(event.idempotencyKey, 'accounting-sync:xero:credit_note:sales-order-refund:refund-1:credit-note')
+  assert.deepEqual(event.linesJson, {
+    kind: 'accounting-document',
+    schemaVersion: 1,
+    documentType: 'CREDIT_NOTE',
+    documentNumber: 'CN-1001',
+    creditNoteNumber: 'CN-1001',
+    contact: { name: 'Customer One', email: 'customer@example.com' },
+    date: '2026-04-26',
+    currency: 'EUR',
+    currencyRateToBase: 1.18,
+    reference: 'SO-1001',
+    lineAmountMode: 'EXCLUSIVE',
+    lineAmountsIncludeTax: false,
+    sourceRefundId: 'refund-1',
+    lines: [{ description: 'Refund line', quantity: 1, unitAmount: 10, accountCode: '400', taxType: 'OUTPUT2' }],
+  })
+})
+
+test('sales and purchase document sync logs mirror with stable document keys', () => {
+  const sales = buildMirroredAccountingEventDraft({
+    connector: 'quickbooks',
+    type: 'SALES_INVOICE',
+    referenceType: 'SalesOrder',
+    referenceId: 'order-1',
+    currency: 'GBP',
+    payload: {
+      _idempotencyKey: 'sales-order:order-1:invoice',
+      invoiceNumber: 'INV-1001',
+      contactName: 'Customer One',
+      date: '2026-04-26',
+      currency: 'USD',
+      lines: [{ description: 'Item', quantity: 2, unitAmount: 10.1234, accountCode: '400', taxType: 'OUTPUT2' }],
+      lineAmountsIncludeTax: true,
+    },
+  })
+  const purchase = buildMirroredAccountingEventDraft({
+    connector: 'xero',
+    type: 'PURCHASE_INVOICE',
+    referenceType: 'PurchaseOrder',
+    referenceId: 'po-1',
+    currency: 'GBP',
+    payload: {
+      _idempotencyKey: 'purchase-invoice:po-1:abc123',
+      invoiceNumber: 'SUP-123',
+      contactName: 'Supplier Ltd',
+      date: '2026-04-26',
+      dueDate: '2026-05-10',
+      currency: 'EUR',
+      reference: 'PO-1',
+      supplierInvoicePath: 'uploads/supplier/SUP-123.pdf',
+      lines: [{ description: 'PO line', quantity: 5, unitAmount: 4.5678, accountCode: '150', taxType: 'INPUT2' }],
+    },
+  })
+
+  assert.ok(sales)
+  assert.equal(sales.idempotencyKey, 'accounting-sync:quickbooks:sales_invoice:sales-order:order-1:invoice')
+  assert.equal(sales.currency, 'USD')
+  assert.equal((sales.linesJson as Record<string, unknown>).lineAmountMode, 'INCLUSIVE')
+  assert.ok(purchase)
+  assert.equal(purchase.idempotencyKey, 'accounting-sync:xero:purchase_invoice:purchase-invoice:po-1:abc123')
+  assert.equal(purchase.currency, 'EUR')
+  assert.equal((purchase.linesJson as Record<string, unknown>).supplierInvoicePath, 'uploads/supplier/SUP-123.pdf')
 })
 
 test('reruns build the same deterministic accounting event key', () => {
@@ -260,7 +336,7 @@ test('failed daily batch mirror reset moves matching events back to pending', as
   assert.deepEqual(findManyArgs, [{
     where: {
       externalSystem: 'xero',
-      type: { in: ['DAILY_BATCH_REVENUE_DEFERRAL'] },
+      type: { in: ['DAILY_BATCH_REVENUE_DEFERRAL', 'CREDIT_NOTE'] },
       sourceEntityType: 'DailyBatch',
       sourceEntityId: { in: ['A1-2026-04-26'] },
       status: 'FAILED',

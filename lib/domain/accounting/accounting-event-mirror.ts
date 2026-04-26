@@ -4,23 +4,42 @@ import {
   buildAccountingEventIdempotencyKey,
   buildAccountingEventLog,
 } from './accounting-event-builder'
+import {
+  buildAccountingDocumentEvent,
+  buildAccountingDocumentPayload,
+  isAccountingDocumentEventType,
+} from './accounting-document-event-builder'
 import type { AccountingEventDraft, AccountingEventLine, AccountingEventStatus } from './accounting-event-types'
 
-export type MirroredAccountingSyncType =
+export type MirroredJournalAccountingSyncType =
   | 'DAILY_BATCH_REVENUE_DEFERRAL'
   | 'DAILY_BATCH_INVENTORY_ALLOC'
   | 'DAILY_BATCH_GROUP_B'
   | 'COGS_REVERSAL'
   | 'UNEARNED_REV_REVERSAL'
 
+export type MirroredDocumentAccountingSyncType =
+  | 'SALES_INVOICE'
+  | 'CREDIT_NOTE'
+  | 'PURCHASE_INVOICE'
+
+export type MirroredAccountingSyncType = MirroredJournalAccountingSyncType | MirroredDocumentAccountingSyncType
+
 type AccountingEventMirrorClient = Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingEventLog'>
 
-const MIRRORED_TYPES = new Set<string>([
+const MIRRORED_JOURNAL_TYPES = new Set<string>([
   'DAILY_BATCH_REVENUE_DEFERRAL',
   'DAILY_BATCH_INVENTORY_ALLOC',
   'DAILY_BATCH_GROUP_B',
   'COGS_REVERSAL',
   'UNEARNED_REV_REVERSAL',
+])
+
+const MIRRORED_TYPES = new Set<string>([
+  ...MIRRORED_JOURNAL_TYPES,
+  'SALES_INVOICE',
+  'CREDIT_NOTE',
+  'PURCHASE_INVOICE',
 ])
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -116,6 +135,10 @@ export function isMirrorableAccountingSyncType(type: string): type is MirroredAc
   return MIRRORED_TYPES.has(type)
 }
 
+function isMirrorableJournalAccountingSyncType(type: string): type is MirroredJournalAccountingSyncType {
+  return MIRRORED_JOURNAL_TYPES.has(type)
+}
+
 export function buildMirroredAccountingEventDraft(params: {
   connector: string
   type: string
@@ -127,6 +150,38 @@ export function buildMirroredAccountingEventDraft(params: {
   externalId?: string | null
 }): AccountingEventDraft | null {
   if (!isMirrorableAccountingSyncType(params.type)) return null
+
+  if (isAccountingDocumentEventType(params.type)) {
+    const idempotencyKey = buildMirroredAccountingEventIdempotencyKey(params)
+    if (!idempotencyKey) return null
+
+    try {
+      const documentPayload = buildAccountingDocumentPayload({
+        type: params.type,
+        sourceEntityType: params.referenceType,
+        sourceEntityId: params.referenceId,
+        payload: params.payload,
+        fallbackCurrency: params.currency,
+      })
+
+      return buildAccountingDocumentEvent({
+        type: params.type,
+        sourceEntityType: params.referenceType,
+        sourceEntityId: params.referenceId,
+        businessDate: documentPayload.date,
+        currency: documentPayload.currency,
+        status: mapStatus(params.status),
+        idempotencyKey,
+        payload: documentPayload,
+        externalSystem: params.connector,
+        externalId: params.externalId ?? null,
+      })
+    } catch {
+      return null
+    }
+  }
+
+  if (!isMirrorableJournalAccountingSyncType(params.type)) return null
 
   const payload = normalizePayload(params.payload)
   const lines = extractJournalLines(payload)

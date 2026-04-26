@@ -15,6 +15,8 @@ export type AccountingEventLine = {
   metadata?: Record<string, unknown>
 }
 
+export type AccountingEventPayload = AccountingEventLine[] | Record<string, unknown>
+
 export type AccountingEventDraft = {
   type: string
   sourceEntityType: string
@@ -22,7 +24,7 @@ export type AccountingEventDraft = {
   businessDate: Date
   status: AccountingEventStatus
   idempotencyKey: string
-  linesJson: AccountingEventLine[]
+  linesJson: AccountingEventPayload
   currency: string
   externalSystem?: string | null
   externalId?: string | null
