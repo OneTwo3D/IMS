@@ -12,6 +12,7 @@ import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-alloc
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost } from '@/lib/cost-layers'
+import { multiplyMoney, roundQuantity } from '@/lib/domain/math/decimal'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -215,9 +216,9 @@ export async function applyStockAdjustment({
         data: consumed.map((entry) => ({
           costLayerId: entry.costLayerId,
           movementId: movement.id,
-          qty: entry.qty,
-          unitCostBase: entry.unitCostBase,
-          totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+          qty: entry.qty.toNumber(),
+          unitCostBase: entry.unitCostBase.toNumber(),
+          totalCostBase: roundQuantity(multiplyMoney(entry.qty, entry.unitCostBase), 6).toNumber(),
         })),
       })
     }
@@ -761,9 +762,9 @@ export async function updateAdjustmentMovement(
             data: consumed.map((entry) => ({
               costLayerId: entry.costLayerId,
               movementId: id,
-              qty: entry.qty,
-              unitCostBase: entry.unitCostBase,
-              totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+              qty: entry.qty.toNumber(),
+              unitCostBase: entry.unitCostBase.toNumber(),
+              totalCostBase: roundQuantity(multiplyMoney(entry.qty, entry.unitCostBase), 6).toNumber(),
             })),
           })
         }

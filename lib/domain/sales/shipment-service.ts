@@ -2,6 +2,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
 import { consumeFifoLayersStrict, refreshSalesOrderLineCogs } from '@/lib/cost-layers'
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
+import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import {
   validateSalesOrderStatusTransition,
   validateShipmentStatusTransition,
@@ -238,7 +239,7 @@ export async function transitionShipmentStatus(
       await tx.shipment.update({ where: { id: shipmentId }, data })
 
       await lockStockLevels(tx, stockSyncProductIds, [shipment.warehouseId])
-      let totalShipmentCogs = 0
+      let totalShipmentCogs = toDecimal(0)
       for (const line of shipment.lines) {
         const qty = decimalToNumber(line.qty)
         await tx.stockLevel.updateMany({
@@ -265,15 +266,15 @@ export async function transitionShipmentStatus(
         const { consumed, totalCost } = await consumeFifoLayersStrict(
           tx, line.productId, shipment.warehouseId, qty,
         )
-        totalShipmentCogs += totalCost
+        totalShipmentCogs = addMoney(totalShipmentCogs, totalCost)
         if (consumed.length > 0) {
           await tx.cogsEntry.createMany({
             data: consumed.map((entry) => ({
               costLayerId: entry.costLayerId,
               movementId: movement.id,
-              qty: entry.qty,
-              unitCostBase: entry.unitCostBase,
-              totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+              qty: entry.qty.toNumber(),
+              unitCostBase: entry.unitCostBase.toNumber(),
+              totalCostBase: roundQuantity(multiplyMoney(entry.qty, entry.unitCostBase), 6).toNumber(),
             })),
           })
           await tx.shipmentLine.update({
@@ -281,18 +282,18 @@ export async function transitionShipmentStatus(
             data: {
               costLayerSnapshot: consumed.map((entry) => ({
                 costLayerId: entry.costLayerId,
-                qty: entry.qty,
-                unitCostBase: entry.unitCostBase,
+                qty: entry.qty.toNumber(),
+                unitCostBase: entry.unitCostBase.toNumber(),
               })),
             },
           })
         }
       }
 
-      if (totalShipmentCogs > 0) {
+      if (totalShipmentCogs.gt(0)) {
         await tx.shipment.update({
           where: { id: shipmentId },
-          data: { cogsBatchAmount: Math.round(totalShipmentCogs * 100) / 100 },
+          data: { cogsBatchAmount: roundQuantity(totalShipmentCogs, 2).toNumber() },
         })
       }
 

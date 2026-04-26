@@ -126,7 +126,7 @@ function requireShipmentSnapshotValue(order: {
       if (snapshot.length === 0) {
         throw new Error(`Missing FIFO snapshot for already-shipped line ${line.id} on order ${order.id}`)
       }
-      total += sumCostLayerSnapshot(snapshot)
+      total += sumCostLayerSnapshot(snapshot).toNumber()
     }
   }
 
@@ -547,7 +547,7 @@ export async function runDailyBatchSync(): Promise<{
                 Number(alloc.qty),
               )
               allocationSnapshots.set(alloc.id, allocationSnapshot)
-              orderCostValue += sumCostLayerSnapshot(allocationSnapshot)
+              orderCostValue += sumCostLayerSnapshot(allocationSnapshot).toNumber()
             }
             orderCostValue = round2(orderCostValue)
           }
@@ -812,7 +812,7 @@ export async function runDailyBatchSync(): Promise<{
           ))
           const hasPrecomputedSnapshots = shipmentSnapshotsForLines.some((entries) => entries.length > 0)
           const precomputedCogs = hasPrecomputedSnapshots
-            ? round2(shipmentSnapshotsForLines.reduce((sum, entries) => sum + sumCostLayerSnapshot(entries), 0))
+            ? round2(shipmentSnapshotsForLines.reduce((sum, entries) => sum + sumCostLayerSnapshot(entries).toNumber(), 0))
             : Number(shipment.cogsBatchAmount ?? 0)
           if (hasPrecomputedSnapshots) {
             const missingSnapshotLines = shipment.lines.filter((line, lineIndex) => (
@@ -871,7 +871,7 @@ export async function runDailyBatchSync(): Promise<{
               )
             }
 
-            const legacyCogs = round2(sumCostLayerSnapshot(shipmentCostSnapshot))
+            const legacyCogs = round2(sumCostLayerSnapshot(shipmentCostSnapshot).toNumber())
             totalRevenue += revenueProportion
             totalCogs += legacyCogs
             runningRevenue += revenueProportion

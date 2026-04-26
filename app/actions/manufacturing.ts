@@ -466,7 +466,7 @@ type DisassemblyRecoveryPlan = {
 
 async function buildDisassemblyRecoveryPlan(
   tx: Prisma.TransactionClient,
-  recoveredLayers: Array<{ costLayerId: string; qty: number; unitCostBase: number }>,
+  recoveredLayers: Array<{ costLayerId: string; qty: Prisma.Decimal; unitCostBase: Prisma.Decimal }>,
   components: Array<{ componentId: string; qty: Prisma.Decimal | number }>,
   warehouseId: string,
   qtyPlanned: number,
@@ -499,7 +499,7 @@ async function buildDisassemblyRecoveryPlan(
 
   for (const recoveredLayer of recoveredLayers) {
     const layerDetail = layerDetailById.get(recoveredLayer.costLayerId)
-    const entryCostBase = new Prisma.Decimal(recoveredLayer.qty * recoveredLayer.unitCostBase)
+    const entryCostBase = recoveredLayer.qty.mul(recoveredLayer.unitCostBase)
 
     if (!layerDetail || layerDetail.sourceLines.length === 0) {
       usedLegacyFallback = true
@@ -514,11 +514,11 @@ async function buildDisassemblyRecoveryPlan(
       continue
     }
 
-    const ratio = recoveredLayer.qty / receivedQty
+    const ratio = recoveredLayer.qty.div(receivedQty)
     let allocatedEntryCostBase = new Prisma.Decimal(0)
 
     for (const sourceLine of layerDetail.sourceLines) {
-      const allocatedQty = Number(sourceLine.qty) * ratio
+      const allocatedQty = new Prisma.Decimal(sourceLine.qty).mul(ratio).toNumber()
       const allocatedCostBase = new Prisma.Decimal(sourceLine.totalCostBase).mul(ratio)
       allocatedEntryCostBase = allocatedEntryCostBase.add(allocatedCostBase)
 
@@ -675,8 +675,8 @@ export async function updateManufacturingOrderStatus(
           const assemblySourceLines: Array<{
             sourceProductId: string
             sourceCostLayerId: string
-            qty: number
-            unitCostBase: number
+            qty: Prisma.Decimal
+            unitCostBase: Prisma.Decimal
             totalCostBase: number
           }> = []
           for (const comp of components) {
@@ -686,13 +686,13 @@ export async function updateManufacturingOrderStatus(
               requireReserved: wasInProgress,
             })
             const consumed = await consumeFifoLayersStrict(tx, comp.componentId, order.warehouseId, totalQty)
-            totalAssemblyCostBase = totalAssemblyCostBase.add(new Prisma.Decimal(consumed.totalCost))
+            totalAssemblyCostBase = totalAssemblyCostBase.add(consumed.totalCost)
             assemblySourceLines.push(...consumed.consumed.map((entry) => ({
               sourceProductId: comp.componentId,
               sourceCostLayerId: entry.costLayerId,
               qty: entry.qty,
               unitCostBase: entry.unitCostBase,
-              totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+              totalCostBase: entry.qty.mul(entry.unitCostBase).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP).toNumber(),
             })))
 
             // Deduct component stock + release reservation if was in progress
@@ -758,7 +758,7 @@ export async function updateManufacturingOrderStatus(
           })
           const recoveredCost = await consumeFifoLayersStrict(tx, order.outputProductId, order.warehouseId, qtyPlanned)
           const totalRecoveredCostBase = recoveredCost.consumed.reduce(
-            (sum, entry) => sum.add(new Prisma.Decimal(entry.qty * entry.unitCostBase)),
+            (sum, entry) => sum.add(entry.qty.mul(entry.unitCostBase)),
             new Prisma.Decimal(0),
           )
           // Manufacturing overhead capitalises onto the recovered
@@ -836,9 +836,9 @@ export async function updateManufacturingOrderStatus(
               await addCostLayerSourceLines(tx, componentLayerId, recoveredCost.consumed.map((entry) => ({
                 sourceProductId: order.outputProductId,
                 sourceCostLayerId: entry.costLayerId,
-                qty: entry.qty * componentShare.toNumber(),
+                qty: entry.qty.mul(componentShare),
                 unitCostBase: entry.unitCostBase,
-                totalCostBase: entry.qty * entry.unitCostBase * componentShare.toNumber(),
+                totalCostBase: entry.qty.mul(entry.unitCostBase).mul(componentShare),
               })))
             }
 

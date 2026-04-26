@@ -2,6 +2,7 @@ import 'dotenv/config'
 import { db } from '../lib/db/index.ts'
 import { importWcOrder } from '../lib/connectors/woocommerce/sync/order-import.ts'
 import type { WcFullOrder, WcRefund } from '../lib/connectors/woocommerce/sync/types.ts'
+import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '../lib/domain/math/decimal.ts'
 
 function uniqueSuffix() {
   return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
@@ -1057,7 +1058,7 @@ async function shipAndBatchWcFxCogsFlowScenario(orderId: string) {
       },
     })
 
-    let totalShipmentCogs = 0
+    let totalShipmentCogs = toDecimal(0)
     for (const line of lockedShipment.lines) {
       const qty = Number(line.qty)
       await tx.stockLevel.updateMany({
@@ -1086,14 +1087,14 @@ async function shipAndBatchWcFxCogsFlowScenario(orderId: string) {
         lockedShipment.warehouseId,
         qty,
       )
-      totalShipmentCogs += totalCost
+      totalShipmentCogs = addMoney(totalShipmentCogs, totalCost)
       await tx.cogsEntry.createMany({
         data: consumed.map((entry) => ({
           costLayerId: entry.costLayerId,
           movementId: movement.id,
-          qty: entry.qty,
-          unitCostBase: entry.unitCostBase,
-          totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+          qty: entry.qty.toNumber(),
+          unitCostBase: entry.unitCostBase.toNumber(),
+          totalCostBase: roundQuantity(multiplyMoney(entry.qty, entry.unitCostBase), 6).toNumber(),
         })),
       })
       await tx.shipmentLine.update({
@@ -1101,8 +1102,8 @@ async function shipAndBatchWcFxCogsFlowScenario(orderId: string) {
         data: {
           costLayerSnapshot: consumed.map((entry) => ({
             costLayerId: entry.costLayerId,
-            qty: entry.qty,
-            unitCostBase: entry.unitCostBase,
+            qty: entry.qty.toNumber(),
+            unitCostBase: entry.unitCostBase.toNumber(),
           })) as never,
         },
       })
@@ -1110,7 +1111,7 @@ async function shipAndBatchWcFxCogsFlowScenario(orderId: string) {
 
     await tx.shipment.update({
       where: { id: shipment.id },
-      data: { cogsBatchAmount: Math.round(totalShipmentCogs * 100) / 100 },
+      data: { cogsBatchAmount: roundQuantity(totalShipmentCogs, 2).toNumber() },
     })
     await refreshSalesOrderLineCogs(
       tx,

@@ -193,7 +193,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
       ? order.shipments.reduce((sum, shipment) => (
           sum + shipment.lines.reduce((lineSum, line) => {
             if (Number(line.qty) <= 0) return lineSum
-            return lineSum + sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot))
+            return lineSum + sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot)).toNumber()
           }, 0)
         ), 0)
       : computeFifoCostFromSnapshot(a2Snapshot, order.allocations)
@@ -274,7 +274,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
       : 0
 
     const snapshotCogs = shipment.lines.reduce((sum, line) => (
-      sum + sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot))
+      sum + sumCostLayerSnapshot(parseCostLayerSnapshot(line.costLayerSnapshot)).toNumber()
     ), 0)
     const cogs = snapshotCogs > 0 ? snapshotCogs : Number(shipment.cogsBatchAmount ?? 0)
 

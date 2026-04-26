@@ -31,6 +31,7 @@ import {
   resolveSettlementFxRateToBase,
 } from '@/lib/accounting-fx'
 import { Prisma, type TaxCategory } from '@/app/generated/prisma/client'
+import { addMoney, multiplyMoney, roundQuantity } from '@/lib/domain/math/decimal'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -2137,15 +2138,18 @@ export async function returnPurchaseOrder(
           },
         })
         const { consumed } = await consumeFifoLayersStrict(tx, poLine.productId, rl.warehouseId, rl.qtyReturned)
-        totalReturnedCostBase += consumed.reduce((sum, entry) => sum + entry.qty * entry.unitCostBase, 0)
+        totalReturnedCostBase = consumed.reduce(
+          (sum, entry) => addMoney(sum, multiplyMoney(entry.qty, entry.unitCostBase)).toNumber(),
+          totalReturnedCostBase,
+        )
         if (consumed.length > 0) {
           await tx.cogsEntry.createMany({
             data: consumed.map((entry) => ({
               costLayerId: entry.costLayerId,
               movementId: movement.id,
-              qty: entry.qty,
-              unitCostBase: entry.unitCostBase,
-              totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+              qty: entry.qty.toNumber(),
+              unitCostBase: entry.unitCostBase.toNumber(),
+              totalCostBase: roundQuantity(multiplyMoney(entry.qty, entry.unitCostBase), 6).toNumber(),
             })),
           })
         }

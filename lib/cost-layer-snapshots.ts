@@ -1,3 +1,5 @@
+import { addMoney, multiplyMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+
 export type CostLayerSnapshotSource = 'allocation' | 'shipment'
 
 export type CostLayerSnapshotEntry = {
@@ -34,8 +36,11 @@ export function parseCostLayerSnapshot(value: unknown): CostLayerSnapshotEntry[]
   })
 }
 
-export function sumCostLayerSnapshot(entries: CostLayerSnapshotEntry[]): number {
-  return entries.reduce((sum, entry) => sum + entry.qty * entry.unitCostBase, 0)
+export function sumCostLayerSnapshot(entries: CostLayerSnapshotEntry[]): Decimal {
+  return entries.reduce(
+    (sum, entry) => addMoney(sum, multiplyMoney(entry.qty, entry.unitCostBase)),
+    toDecimal(0),
+  )
 }
 
 export function reduceSnapshotByCostLayer(
