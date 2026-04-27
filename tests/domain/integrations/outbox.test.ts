@@ -32,6 +32,7 @@ type MockWhere = {
   id?: string
   connector?: string
   operation?: string
+  idempotencyKey?: { in?: string[] }
   status?: string | { in?: string[] }
   attempts?: number | { lt?: number; gte?: number }
   lockedAt?: Date | null | { lt?: Date }
@@ -57,6 +58,14 @@ function uniqueError(target: string[]) {
   })
 }
 
+function adapterUniqueError() {
+  return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+    code: 'P2002',
+    clientVersion: 'test',
+    meta: { modelName: 'IntegrationOutbox' },
+  })
+}
+
 function makeRow(overrides: Partial<IntegrationOutboxRow> = {}): IntegrationOutboxRow {
   const now = new Date('2026-04-27T10:00:00.000Z')
   return {
@@ -77,7 +86,10 @@ function makeRow(overrides: Partial<IntegrationOutboxRow> = {}): IntegrationOutb
   }
 }
 
-function makeClient(initialRows: IntegrationOutboxRow[] = []) {
+function makeClient(
+  initialRows: IntegrationOutboxRow[] = [],
+  options: { adapterUniqueMeta?: boolean } = {},
+) {
   const rows = [...initialRows]
 
   function findByWhere(where: FindUniqueArgs['where']): IntegrationOutboxRow | null {
@@ -93,6 +105,7 @@ function makeClient(initialRows: IntegrationOutboxRow[] = []) {
     if (where.id && row.id !== where.id) return false
     if (where.connector && row.connector !== where.connector) return false
     if (where.operation && row.operation !== where.operation) return false
+    if (where.idempotencyKey?.in && !where.idempotencyKey.in.includes(row.idempotencyKey)) return false
     if (typeof where.status === 'string' && row.status !== where.status) return false
     if (typeof where.status === 'object' && where.status.in && !where.status.in.includes(row.status)) return false
     if (typeof where.attempts === 'number' && row.attempts !== where.attempts) return false
@@ -131,7 +144,7 @@ function makeClient(initialRows: IntegrationOutboxRow[] = []) {
       async create(args: unknown) {
         const data = (args as CreateArgs).data
         if (rows.some((row) => row.idempotencyKey === data.idempotencyKey)) {
-          throw uniqueError(['idempotencyKey'])
+          throw options.adapterUniqueMeta ? adapterUniqueError() : uniqueError(['idempotencyKey'])
         }
         const row = makeRow({
           ...data,
@@ -187,6 +200,27 @@ test('integration outbox enqueue is idempotent by idempotency key', async () => 
   assert.equal(second.id, first.id)
   assert.deepEqual(rows[0].payloadJson, { productId: 'sku-1', quantity: 4 })
   assert.equal(rows[0].status, INTEGRATION_OUTBOX_STATUS.PENDING)
+})
+
+test('integration outbox enqueue treats adapter unique violations as idempotent', async () => {
+  const { client, rows } = makeClient([
+    makeRow({
+      id: 'existing-job',
+      idempotencyKey: 'woocommerce:stock.push:sku-1',
+      payloadJson: { productId: 'sku-1', quantity: 4 },
+    }),
+  ], { adapterUniqueMeta: true })
+
+  const row = await enqueueIntegrationOutbox({
+    connector: 'woocommerce',
+    operation: 'stock.push',
+    idempotencyKey: 'woocommerce:stock.push:sku-1',
+    payloadJson: { productId: 'sku-1', quantity: 9 },
+  }, { client })
+
+  assert.equal(rows.length, 1)
+  assert.equal(row.id, 'existing-job')
+  assert.deepEqual(rows[0].payloadJson, { productId: 'sku-1', quantity: 4 })
 })
 
 test('integration outbox idempotency key builder normalizes deterministic parts', () => {
@@ -250,6 +284,34 @@ test('integration outbox claim locks due pending and retryable rows', async () =
   assert.equal(rows.find((row) => row.id === 'future')?.status, INTEGRATION_OUTBOX_STATUS.PENDING)
   assert.equal(rows.find((row) => row.id === 'locked')?.lockedBy, null)
   assert.equal(rows.find((row) => row.id === 'attempts-capped')?.lockedBy, null)
+})
+
+test('integration outbox claim can be scoped by idempotency key', async () => {
+  const now = new Date('2026-04-27T10:00:00.000Z')
+  const { client } = makeClient([
+    makeRow({
+      id: 'job-1',
+      idempotencyKey: 'woocommerce:stock.push:sku-1',
+      createdAt: new Date('2026-04-27T09:00:00.000Z'),
+    }),
+    makeRow({
+      id: 'job-2',
+      idempotencyKey: 'woocommerce:stock.push:sku-2',
+      createdAt: new Date('2026-04-27T09:01:00.000Z'),
+    }),
+  ])
+
+  const claimed = await claimIntegrationOutboxWork({
+    client,
+    connector: 'woocommerce',
+    operation: 'stock.push',
+    idempotencyKeys: ['woocommerce:stock.push:sku-2'],
+    limit: 10,
+    workerId: 'worker-1',
+    now,
+  })
+
+  assert.deepEqual(claimed.map((row) => row.id), ['job-2'])
 })
 
 test('integration outbox failure helpers schedule retry or permanent failure', async () => {

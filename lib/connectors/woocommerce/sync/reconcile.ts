@@ -55,12 +55,12 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
 
   const stockEnabled = await db.setting.findUnique({ where: { key: 'wc_stock_sync_enabled' } })
   if (stockEnabled?.value === 'true') {
+    const queued = await processQueuedWcStockSyncJobs({ limit: 100 })
     const lastReconcile = await db.setting.findUnique({ where: { key: 'last_wc_stock_daily_reconcile_at' } })
     const lastReconcileTs = lastReconcile?.value ? Date.parse(lastReconcile.value) : Number.NaN
     const reconcileDue = !Number.isFinite(lastReconcileTs) || (Date.now() - lastReconcileTs) >= STOCK_RECONCILE_INTERVAL_MS
 
     if (reconcileDue) {
-      const queued = await processQueuedWcStockSyncJobs({ limit: 100 })
       const stock = await pushStockToWc({ forceAll: true, source: 'DAILY_RECONCILIATION' })
       const now = new Date().toISOString()
       await db.setting.upsert({
@@ -75,6 +75,7 @@ export async function runWcReconcile(): Promise<Record<string, unknown>> {
       }
     } else {
       results.stock = {
+        queued,
         skipped: true,
         reason: 'daily_reconciliation_not_due',
         reconciliationDue: false,

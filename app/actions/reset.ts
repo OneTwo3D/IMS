@@ -53,6 +53,7 @@ async function clearTransactionScope() {
   await db.wmsAsnMap.deleteMany({})
 
   // Generic stock sync operational state
+  await db.integrationOutbox.deleteMany({})
   await db.stockSyncJob.deleteMany({})
   await db.stockSyncState.deleteMany({})
 
