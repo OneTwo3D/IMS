@@ -75,6 +75,8 @@ export type MarkIntegrationOutboxSuccessOptions = {
   lockedAt: Date
 }
 
+class IntegrationOutboxClaimConflictError extends Error {}
+
 const CLAIMABLE_STATUSES = [
   INTEGRATION_OUTBOX_STATUS.PENDING,
   INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
@@ -211,7 +213,9 @@ async function updateClaimedOutboxRow(
     data: options.data,
   })
   if (result.count === 0) {
-    throw new Error(`Integration outbox row ${options.id} is not claimed by ${options.workerId}`)
+    throw new IntegrationOutboxClaimConflictError(
+      `Integration outbox row ${options.id} is not claimed by ${options.workerId}`,
+    )
   }
   return requireOutboxRow(client, options.id)
 }
@@ -313,31 +317,29 @@ export async function markIntegrationOutboxRetryableFailure(
   const now = options.now ?? new Date()
   const maxAttempts = positiveMaxAttempts(options.maxAttempts)
 
-  try {
-    return await updateClaimedOutboxRow(client, {
-      id: options.id,
-      workerId: options.workerId,
-      lockedAt: options.lockedAt,
-      where: { attempts: { lt: maxAttempts - 1 } },
-      data: {
-        status: INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
-        attempts: { increment: 1 },
-        nextAttemptAt: new Date(now.getTime() + (options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS)),
-        lastError: truncateError(options.error),
-        lockedAt: null,
-        lockedBy: null,
-      },
-    })
-  } catch (error) {
-    if (!errorMessage(error).includes(`Integration outbox row ${options.id} is not claimed by ${options.workerId}`)) {
-      throw error
-    }
+  const retryableUpdate = await client.integrationOutbox.updateMany({
+    where: {
+      ...claimedBy(options),
+      attempts: { lt: maxAttempts - 1 },
+    },
+    data: {
+      status: INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
+      attempts: { increment: 1 },
+      nextAttemptAt: new Date(now.getTime() + (options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS)),
+      lastError: truncateError(options.error),
+      lockedAt: null,
+      lockedBy: null,
+    },
+  })
+  if (retryableUpdate.count > 0) {
+    return requireOutboxRow(client, options.id)
   }
 
   return updateClaimedOutboxRow(client, {
     id: options.id,
     workerId: options.workerId,
     lockedAt: options.lockedAt,
+    where: { attempts: { gte: maxAttempts - 1 } },
     data: {
       status: INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
       attempts: { increment: 1 },

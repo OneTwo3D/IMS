@@ -33,7 +33,7 @@ type MockWhere = {
   connector?: string
   operation?: string
   status?: string | { in?: string[] }
-  attempts?: number | { lt?: number }
+  attempts?: number | { lt?: number; gte?: number }
   lockedAt?: Date | null | { lt?: Date }
   lockedBy?: string
   nextAttemptAt?: null | { lte?: Date }
@@ -97,6 +97,9 @@ function makeClient(initialRows: IntegrationOutboxRow[] = []) {
     if (typeof where.status === 'object' && where.status.in && !where.status.in.includes(row.status)) return false
     if (typeof where.attempts === 'number' && row.attempts !== where.attempts) return false
     if (typeof where.attempts === 'object' && where.attempts.lt !== undefined && row.attempts >= where.attempts.lt) {
+      return false
+    }
+    if (typeof where.attempts === 'object' && where.attempts.gte !== undefined && row.attempts < where.attempts.gte) {
       return false
     }
     if (where.lockedBy && row.lockedBy !== where.lockedBy) return false
