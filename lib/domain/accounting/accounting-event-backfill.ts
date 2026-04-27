@@ -1,15 +1,13 @@
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import { buildAccountingEventLog } from './accounting-event-builder'
-import { buildMirroredAccountingEventDraft } from './accounting-event-mirror'
+import {
+  buildMirroredAccountingEventDraft,
+  MIRRORED_ACCOUNTING_SYNC_TYPES,
+} from './accounting-event-mirror'
 import type { AccountingEventDraft } from './accounting-event-types'
 import { isIdempotencyKeyUniqueError } from './prisma-errors'
-import {
-  collectAccountingReconciliationRows,
-  evaluateAccountingReconciliationRows,
-  type AccountingReconciliationFinding,
-  type AccountingReconciliationRows,
-} from './reconciliation'
+import type { AccountingReconciliationRows } from './reconciliation'
 
 type AccountingBackfillSyncLogRow = AccountingReconciliationRows['syncLogs'][number]
 type AccountingBackfillWriteClient = {
@@ -20,7 +18,15 @@ type AccountingBackfillWriteClient = {
     create(args: unknown): Promise<unknown>
   }
 }
-type AccountingBackfillClient = Parameters<typeof collectAccountingReconciliationRows>[0] & AccountingBackfillWriteClient & {
+type AccountingBackfillCandidateClient = {
+  accountingSyncLog: {
+    findMany(args: unknown): Promise<AccountingBackfillSyncLogRow[]>
+  }
+  accountingEvent: {
+    findMany(args: unknown): Promise<AccountingBackfillEventRow[]>
+  }
+}
+type AccountingBackfillClient = AccountingBackfillCandidateClient & AccountingBackfillWriteClient & {
   $transaction<T>(fn: (tx: AccountingBackfillWriteClient) => Promise<T>): Promise<T>
 }
 
@@ -66,6 +72,12 @@ export type RunAccountingEventBackfillOptions = {
 }
 
 const DEFAULT_BACKFILL_LIMIT = 100
+const BACKFILL_CANDIDATE_PAGE_SIZE = 100
+
+type AccountingBackfillEventRow = Pick<
+  AccountingReconciliationRows['accountingEvents'][number],
+  'externalSystem' | 'type' | 'sourceEntityType' | 'sourceEntityId'
+>
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -107,26 +119,113 @@ function buildDraftForSyncLog(log: AccountingBackfillSyncLogRow, baseCurrency: s
   })
 }
 
-function candidateSyncLogIds(findings: AccountingReconciliationFinding[]): Set<string> {
-  return new Set(findings.flatMap((finding) => (
-    finding.code === 'old_sync_log_without_mirrored_event' && finding.syncLogId
-      ? [finding.syncLogId]
-      : []
-  )))
+function lookbackDate(days: number): Date {
+  const date = new Date()
+  date.setUTCDate(date.getUTCDate() - days)
+  return date
 }
 
-function selectCandidateSyncLogs(
-  rows: AccountingReconciliationRows,
-  findings: AccountingReconciliationFinding[],
-  limit: number,
-): AccountingBackfillSyncLogRow[] {
-  const ids = candidateSyncLogIds(findings)
-  if (ids.size === 0) return []
+function eventKey(input: {
+  externalSystem?: string | null
+  type: string
+  sourceEntityType: string
+  sourceEntityId: string
+}): string {
+  return [
+    input.externalSystem ?? '*',
+    input.type,
+    input.sourceEntityType,
+    input.sourceEntityId,
+  ].join('|')
+}
 
-  return rows.syncLogs
-    .filter((log) => ids.has(log.id))
-    .sort((left, right) => left.id.localeCompare(right.id))
-    .slice(0, limit)
+function hasMirroredAccountingEvent(
+  accountingEvents: AccountingBackfillEventRow[],
+  log: AccountingBackfillSyncLogRow,
+): boolean {
+  const key = eventKey({
+    externalSystem: log.connector,
+    type: log.type,
+    sourceEntityType: log.referenceType,
+    sourceEntityId: log.referenceId,
+  })
+  return accountingEvents.some((event) => eventKey(event) === key)
+}
+
+function buildBackfillSyncLogWhere(lookbackDays: number | undefined): unknown {
+  const fromDate = lookbackDate(lookbackDays ?? 90)
+  return {
+    type: { in: [...MIRRORED_ACCOUNTING_SYNC_TYPES] },
+    OR: [
+      { status: { in: ['PENDING', 'PROCESSING'] } },
+      { status: { in: ['SYNCED', 'FAILED'] }, createdAt: { gte: fromDate } },
+    ],
+  }
+}
+
+async function findExistingEventsForSyncLogs(
+  client: AccountingBackfillCandidateClient,
+  logs: AccountingBackfillSyncLogRow[],
+): Promise<AccountingBackfillEventRow[]> {
+  if (logs.length === 0) return []
+
+  return client.accountingEvent.findMany({
+    where: {
+      OR: logs.map((log) => ({
+        externalSystem: log.connector,
+        type: log.type,
+        sourceEntityType: log.referenceType,
+        sourceEntityId: log.referenceId,
+      })),
+    },
+    select: {
+      externalSystem: true,
+      type: true,
+      sourceEntityType: true,
+      sourceEntityId: true,
+    },
+  })
+}
+
+async function collectAccountingBackfillCandidateSyncLogs(
+  client: AccountingBackfillCandidateClient,
+  options: { lookbackDays?: number; limit: number },
+): Promise<AccountingBackfillSyncLogRow[]> {
+  const candidates: AccountingBackfillSyncLogRow[] = []
+  const pageSize = Math.max(1, Math.min(options.limit, BACKFILL_CANDIDATE_PAGE_SIZE))
+  let cursor: { id: string } | undefined
+
+  while (candidates.length < options.limit) {
+    const page = await client.accountingSyncLog.findMany({
+      where: buildBackfillSyncLogWhere(options.lookbackDays),
+      orderBy: { id: 'asc' },
+      take: pageSize,
+      ...(cursor ? { cursor, skip: 1 } : {}),
+      select: {
+        id: true,
+        connector: true,
+        type: true,
+        status: true,
+        referenceType: true,
+        referenceId: true,
+        externalTransactionId: true,
+        payload: true,
+      },
+    })
+    if (page.length === 0) break
+
+    const existingEvents = await findExistingEventsForSyncLogs(client, page)
+    for (const log of page) {
+      if (hasMirroredAccountingEvent(existingEvents, log)) continue
+      candidates.push(log)
+      if (candidates.length >= options.limit) break
+    }
+
+    cursor = { id: page[page.length - 1].id }
+    if (page.length < pageSize) break
+  }
+
+  return candidates
 }
 
 async function createBackfilledEvent(
@@ -191,9 +290,7 @@ export async function runAccountingEventBackfill(
   const dryRun = options.dryRun ?? true
   const limit = Math.max(1, Math.floor(options.limit ?? DEFAULT_BACKFILL_LIMIT))
   const baseCurrency = await resolveBaseCurrency(options)
-  const rows = await collectAccountingReconciliationRows(client, { lookbackDays: options.lookbackDays })
-  const findings = evaluateAccountingReconciliationRows(rows)
-  const candidates = selectCandidateSyncLogs(rows, findings, limit)
+  const candidates = await collectAccountingBackfillCandidateSyncLogs(client, { lookbackDays: options.lookbackDays, limit })
 
   const results: AccountingEventBackfillResult[] = []
   for (const log of candidates) {
@@ -255,14 +352,7 @@ export async function runAccountingEventBackfill(
     dryRun,
     ...(options.lookbackDays !== undefined ? { lookbackDays: options.lookbackDays } : {}),
     limit,
-    reconciliationSummary: findings.reduce(
-      (summary, finding) => {
-        summary.total += 1
-        summary[finding.severity] += 1
-        return summary
-      },
-      { total: 0, warning: 0, critical: 0 },
-    ),
+    reconciliationSummary: { total: candidates.length, warning: candidates.length, critical: 0 },
     summary: buildSummary(results),
     results,
   }

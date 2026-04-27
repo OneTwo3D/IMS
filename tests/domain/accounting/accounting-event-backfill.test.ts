@@ -33,7 +33,7 @@ type EventRow = {
 
 type MockTransactionClient = {
   accountingEvent: {
-    findMany(): Promise<EventRow[]>
+    findMany(args?: unknown): Promise<EventRow[]>
     create(args: { data: EventRow }): Promise<{ id: string }>
   }
   accountingEventLog: {
@@ -42,11 +42,25 @@ type MockTransactionClient = {
 }
 
 type MockBackfillClient = MockTransactionClient & {
-  salesOrder: { findMany(): Promise<unknown[]> }
-  shipment: { findMany(): Promise<unknown[]> }
-  salesOrderRefund: { findMany(): Promise<unknown[]> }
-  accountingSyncLog: { findMany(): Promise<SyncLog[]> }
+  salesOrder: { findMany(args?: unknown): Promise<unknown[]> }
+  shipment: { findMany(args?: unknown): Promise<unknown[]> }
+  salesOrderRefund: { findMany(args?: unknown): Promise<unknown[]> }
+  accountingSyncLog: { findMany(args?: unknown): Promise<SyncLog[]> }
   $transaction<T>(fn: (tx: MockTransactionClient) => Promise<T>): Promise<T>
+}
+
+type MockFindManyArgs = {
+  cursor?: { id: string }
+  skip?: number
+  take?: number
+  orderBy?: { id?: 'asc' | 'desc' }
+  where?: {
+    type?: { in?: string[] }
+    OR?: Array<{
+      status?: { in?: string[] }
+      createdAt?: { gte?: Date }
+    }>
+  }
 }
 
 function makeClient(input: {
@@ -54,34 +68,69 @@ function makeClient(input: {
   events?: EventRow[]
   eventCreateError?: unknown | ((args: { data: EventRow }) => unknown)
   logCreateError?: unknown
+  throwOnSourceRead?: boolean
 }) {
   const events: EventRow[] = [...(input.events ?? [])]
   const createdEvents: unknown[] = []
   const createdLogs: unknown[] = []
+  const calls = {
+    salesOrderFindMany: [] as unknown[],
+    shipmentFindMany: [] as unknown[],
+    salesOrderRefundFindMany: [] as unknown[],
+    accountingSyncLogFindMany: [] as unknown[],
+    accountingEventFindMany: [] as unknown[],
+  }
+
+  function sourceRead(name: keyof Pick<typeof calls, 'salesOrderFindMany' | 'shipmentFindMany' | 'salesOrderRefundFindMany'>, args: unknown) {
+    calls[name].push(args)
+    if (input.throwOnSourceRead) throw new Error('full reconciliation source rows should not be read')
+    return []
+  }
+
+  function syncLogMatchesWhere(log: SyncLog, where: MockFindManyArgs['where']): boolean {
+    const types = where?.type?.in
+    if (types && !types.includes(log.type)) return false
+    const statusBranches = where?.OR?.flatMap((branch) => branch.status?.in ?? [])
+    return !statusBranches?.length || statusBranches.includes(log.status)
+  }
+
+  function pageSyncLogs(args: MockFindManyArgs): SyncLog[] {
+    const ordered = [...input.syncLogs]
+      .filter((log) => syncLogMatchesWhere(log, args.where))
+      .sort((left, right) => {
+        const comparison = left.id.localeCompare(right.id)
+        return args.orderBy?.id === 'desc' ? -comparison : comparison
+      })
+    const cursorIndex = args.cursor ? ordered.findIndex((log) => log.id === args.cursor?.id) : -1
+    const start = cursorIndex >= 0 ? cursorIndex + (args.skip ?? 0) : 0
+    return ordered.slice(start, args.take ? start + args.take : undefined)
+  }
 
   const client: MockBackfillClient = {
     salesOrder: {
-      async findMany() {
-        return []
+      async findMany(args?: unknown) {
+        return sourceRead('salesOrderFindMany', args)
       },
     },
     shipment: {
-      async findMany() {
-        return []
+      async findMany(args?: unknown) {
+        return sourceRead('shipmentFindMany', args)
       },
     },
     salesOrderRefund: {
-      async findMany() {
-        return []
+      async findMany(args?: unknown) {
+        return sourceRead('salesOrderRefundFindMany', args)
       },
     },
     accountingSyncLog: {
-      async findMany() {
-        return input.syncLogs
+      async findMany(args?: unknown) {
+        calls.accountingSyncLogFindMany.push(args)
+        return pageSyncLogs((args ?? {}) as MockFindManyArgs)
       },
     },
     accountingEvent: {
-      async findMany() {
+      async findMany(args?: unknown) {
+        calls.accountingEventFindMany.push(args)
         return events
       },
       async create(args: { data: EventRow }) {
@@ -120,6 +169,7 @@ function makeClient(input: {
   }
 
   return {
+    calls,
     createdEvents,
     createdLogs,
     client,
@@ -169,6 +219,20 @@ function syncedDocumentLog(overrides: Partial<SyncLog> = {}): SyncLog {
       lines: [{ description: 'Refund line', quantity: 1, unitAmount: 10, accountCode: '400' }],
     },
     ...overrides,
+  }
+}
+
+function mirroredEventForLog(log: SyncLog): EventRow {
+  return {
+    id: `event-${log.id}`,
+    type: log.type,
+    sourceEntityType: log.referenceType,
+    sourceEntityId: log.referenceId,
+    businessDate: '2026-04-26',
+    status: log.status === 'SYNCED' ? 'POSTED' : log.status,
+    idempotencyKey: `event-key-${log.id}`,
+    externalSystem: log.connector,
+    externalId: log.externalTransactionId,
   }
 }
 
@@ -389,13 +453,59 @@ test('accounting event backfill applies limit after stable candidate ordering', 
       ],
     } }),
   ]
-  const { client } = makeClient({ syncLogs: logs })
+  const { calls, client } = makeClient({ syncLogs: logs, throwOnSourceRead: true })
 
   const report = await runTestBackfill({ client: client as never, limit: 2 })
 
   assert.deepEqual(report.results.map((result) => result.syncLogId), ['sync-a', 'sync-b'])
   assert.equal(report.summary.candidates, 2)
   assert.equal(report.summary.wouldCreate, 2)
+  assert.equal((calls.accountingSyncLogFindMany[0] as { take: number }).take, 2)
+  assert.equal(calls.salesOrderFindMany.length, 0)
+  assert.equal(calls.shipmentFindMany.length, 0)
+  assert.equal(calls.salesOrderRefundFindMany.length, 0)
+})
+
+test('accounting event backfill pages deterministically until it fills the limit', async () => {
+  const mirrored = syncedJournalLog({
+    id: 'sync-a',
+    externalTransactionId: 'journal-a',
+    payload: {
+      date: '2026-04-26',
+      _idempotencyKey: 'daily-batch:a:2026-04-26',
+      lines: [
+        { accountCode: '400', description: 'Daily revenue deferral', debit: 12.34 },
+        { accountCode: '210', description: 'Daily revenue deferral', credit: 12.34 },
+      ],
+    },
+  })
+  const missing = syncedJournalLog({
+    id: 'sync-b',
+    referenceId: 'B1-2026-04-26',
+    externalTransactionId: 'journal-b',
+    payload: {
+      date: '2026-04-26',
+      _idempotencyKey: 'daily-batch:b:2026-04-26',
+      lines: [
+        { accountCode: '400', description: 'Daily revenue deferral', debit: 12.34 },
+        { accountCode: '210', description: 'Daily revenue deferral', credit: 12.34 },
+      ],
+    },
+  })
+  const { calls, client } = makeClient({
+    syncLogs: [missing, mirrored],
+    events: [mirroredEventForLog(mirrored)],
+    throwOnSourceRead: true,
+  })
+
+  const report = await runTestBackfill({ client: client as never, limit: 1 })
+
+  assert.deepEqual(report.results.map((result) => result.syncLogId), ['sync-b'])
+  assert.equal(report.summary.candidates, 1)
+  assert.equal(calls.accountingSyncLogFindMany.length, 2)
+  assert.deepEqual(calls.accountingSyncLogFindMany.map((args) => (args as { take: number }).take), [1, 1])
+  assert.deepEqual((calls.accountingSyncLogFindMany[1] as { cursor: { id: string }; skip: number }).cursor, { id: 'sync-a' })
+  assert.equal((calls.accountingSyncLogFindMany[1] as { skip: number }).skip, 1)
 })
 
 test('accounting event backfill skips unsupported payloads with a reason', async () => {
