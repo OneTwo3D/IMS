@@ -44,15 +44,23 @@ export type AccountingEventBackfillResult = {
   accountingEventId?: string
 }
 
+export type AccountingEventBackfillReconciliationIssueSummary = {
+  code: 'old_sync_log_without_mirrored_event'
+  severity: 'warning' | 'critical'
+  count: number
+}
+
 export type AccountingEventBackfillReport = {
   checkedAt: string
   dryRun: boolean
   lookbackDays?: number
   limit: number
   reconciliationSummary: {
+    scope: 'accounting_event_backfill_candidates'
     total: number
     warning: number
     critical: number
+    issues: AccountingEventBackfillReconciliationIssueSummary[]
   }
   summary: {
     candidates: number
@@ -94,6 +102,26 @@ function buildSummary(results: AccountingEventBackfillResult[]): AccountingEvent
     },
     { candidates: 0, wouldCreate: 0, created: 0, skipped: 0 },
   )
+}
+
+function buildBackfillReconciliationSummary(
+  candidates: AccountingBackfillSyncLogRow[],
+): AccountingEventBackfillReport['reconciliationSummary'] {
+  const missingMirrorCount = candidates.length
+
+  return {
+    scope: 'accounting_event_backfill_candidates',
+    total: missingMirrorCount,
+    warning: missingMirrorCount,
+    critical: 0,
+    issues: missingMirrorCount > 0
+      ? [{
+          code: 'old_sync_log_without_mirrored_event',
+          severity: 'warning',
+          count: missingMirrorCount,
+        }]
+      : [],
+  }
 }
 
 function syncLogResultBase(log: AccountingBackfillSyncLogRow): Omit<AccountingEventBackfillResult, 'action' | 'reason'> {
@@ -192,7 +220,7 @@ async function collectAccountingBackfillCandidateSyncLogs(
   options: { lookbackDays?: number; limit: number },
 ): Promise<AccountingBackfillSyncLogRow[]> {
   const candidates: AccountingBackfillSyncLogRow[] = []
-  const pageSize = Math.max(1, Math.min(options.limit, BACKFILL_CANDIDATE_PAGE_SIZE))
+  const pageSize = BACKFILL_CANDIDATE_PAGE_SIZE
   let cursor: { id: string } | undefined
 
   while (candidates.length < options.limit) {
@@ -352,7 +380,7 @@ export async function runAccountingEventBackfill(
     dryRun,
     ...(options.lookbackDays !== undefined ? { lookbackDays: options.lookbackDays } : {}),
     limit,
-    reconciliationSummary: { total: candidates.length, warning: candidates.length, critical: 0 },
+    reconciliationSummary: buildBackfillReconciliationSummary(candidates),
     summary: buildSummary(results),
     results,
   }

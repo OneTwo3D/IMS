@@ -460,32 +460,43 @@ test('accounting event backfill applies limit after stable candidate ordering', 
   assert.deepEqual(report.results.map((result) => result.syncLogId), ['sync-a', 'sync-b'])
   assert.equal(report.summary.candidates, 2)
   assert.equal(report.summary.wouldCreate, 2)
-  assert.equal((calls.accountingSyncLogFindMany[0] as { take: number }).take, 2)
+  assert.deepEqual(report.reconciliationSummary, {
+    scope: 'accounting_event_backfill_candidates',
+    total: 2,
+    warning: 2,
+    critical: 0,
+    issues: [{ code: 'old_sync_log_without_mirrored_event', severity: 'warning', count: 2 }],
+  })
+  assert.equal((calls.accountingSyncLogFindMany[0] as { take: number }).take, 100)
   assert.equal(calls.salesOrderFindMany.length, 0)
   assert.equal(calls.shipmentFindMany.length, 0)
   assert.equal(calls.salesOrderRefundFindMany.length, 0)
 })
 
 test('accounting event backfill pages deterministically until it fills the limit', async () => {
-  const mirrored = syncedJournalLog({
-    id: 'sync-a',
-    externalTransactionId: 'journal-a',
-    payload: {
-      date: '2026-04-26',
-      _idempotencyKey: 'daily-batch:a:2026-04-26',
-      lines: [
-        { accountCode: '400', description: 'Daily revenue deferral', debit: 12.34 },
-        { accountCode: '210', description: 'Daily revenue deferral', credit: 12.34 },
-      ],
-    },
+  const mirroredLogs = Array.from({ length: 100 }, (_, index) => {
+    const suffix = index.toString().padStart(3, '0')
+    return syncedJournalLog({
+      id: `sync-${suffix}`,
+      referenceId: `A1-${suffix}-2026-04-26`,
+      externalTransactionId: `journal-${suffix}`,
+      payload: {
+        date: '2026-04-26',
+        _idempotencyKey: `daily-batch:${suffix}:2026-04-26`,
+        lines: [
+          { accountCode: '400', description: 'Daily revenue deferral', debit: 12.34 },
+          { accountCode: '210', description: 'Daily revenue deferral', credit: 12.34 },
+        ],
+      },
+    })
   })
   const missing = syncedJournalLog({
-    id: 'sync-b',
-    referenceId: 'B1-2026-04-26',
-    externalTransactionId: 'journal-b',
+    id: 'sync-100',
+    referenceId: 'A1-100-2026-04-26',
+    externalTransactionId: 'journal-100',
     payload: {
       date: '2026-04-26',
-      _idempotencyKey: 'daily-batch:b:2026-04-26',
+      _idempotencyKey: 'daily-batch:100:2026-04-26',
       lines: [
         { accountCode: '400', description: 'Daily revenue deferral', debit: 12.34 },
         { accountCode: '210', description: 'Daily revenue deferral', credit: 12.34 },
@@ -493,18 +504,18 @@ test('accounting event backfill pages deterministically until it fills the limit
     },
   })
   const { calls, client } = makeClient({
-    syncLogs: [missing, mirrored],
-    events: [mirroredEventForLog(mirrored)],
+    syncLogs: [missing, ...mirroredLogs],
+    events: mirroredLogs.map(mirroredEventForLog),
     throwOnSourceRead: true,
   })
 
   const report = await runTestBackfill({ client: client as never, limit: 1 })
 
-  assert.deepEqual(report.results.map((result) => result.syncLogId), ['sync-b'])
+  assert.deepEqual(report.results.map((result) => result.syncLogId), ['sync-100'])
   assert.equal(report.summary.candidates, 1)
   assert.equal(calls.accountingSyncLogFindMany.length, 2)
-  assert.deepEqual(calls.accountingSyncLogFindMany.map((args) => (args as { take: number }).take), [1, 1])
-  assert.deepEqual((calls.accountingSyncLogFindMany[1] as { cursor: { id: string }; skip: number }).cursor, { id: 'sync-a' })
+  assert.deepEqual(calls.accountingSyncLogFindMany.map((args) => (args as { take: number }).take), [100, 100])
+  assert.deepEqual((calls.accountingSyncLogFindMany[1] as { cursor: { id: string }; skip: number }).cursor, { id: 'sync-099' })
   assert.equal((calls.accountingSyncLogFindMany[1] as { skip: number }).skip, 1)
 })
 
