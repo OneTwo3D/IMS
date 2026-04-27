@@ -12,13 +12,16 @@ import {
 } from './reconciliation'
 
 type AccountingBackfillSyncLogRow = AccountingReconciliationRows['syncLogs'][number]
-type AccountingBackfillClient = Parameters<typeof collectAccountingReconciliationRows>[0] & {
+type AccountingBackfillWriteClient = {
   accountingEvent: {
     create(args: unknown): Promise<{ id: string }>
   }
   accountingEventLog: {
     create(args: unknown): Promise<unknown>
   }
+}
+type AccountingBackfillClient = Parameters<typeof collectAccountingReconciliationRows>[0] & AccountingBackfillWriteClient & {
+  $transaction<T>(fn: (tx: AccountingBackfillWriteClient) => Promise<T>): Promise<T>
 }
 
 export type AccountingEventBackfillAction = 'would_create' | 'created' | 'skipped'
@@ -64,9 +67,12 @@ export type RunAccountingEventBackfillOptions = {
 
 const DEFAULT_BACKFILL_LIMIT = 100
 
-function isUniqueConstraintError(error: unknown): boolean {
+function isIdempotencyKeyUniqueError(error: unknown): boolean {
   if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') return false
-  return true
+  const target = error.meta?.target
+  return Array.isArray(target)
+    ? target.includes('idempotencyKey')
+    : String(target).includes('idempotencyKey')
 }
 
 function errorMessage(error: unknown): string {
@@ -136,22 +142,25 @@ async function createBackfilledEvent(
   draft: AccountingEventDraft,
 ): Promise<AccountingEventBackfillResult> {
   try {
-    const created = await client.accountingEvent.create({
-      data: draft as never,
-      select: { id: true },
-    })
-    await client.accountingEventLog.create({
-      data: buildAccountingEventLog({
-        accountingEventId: created.id,
-        action: 'backfilled_from_sync_log',
-        metadata: {
-          connector: log.connector,
-          syncLogId: log.id,
-          syncType: log.type,
-          referenceType: log.referenceType,
-          referenceId: log.referenceId,
-        },
-      }) as never,
+    const created = await client.$transaction(async (tx) => {
+      const event = await tx.accountingEvent.create({
+        data: draft as never,
+        select: { id: true },
+      })
+      await tx.accountingEventLog.create({
+        data: buildAccountingEventLog({
+          accountingEventId: event.id,
+          action: 'backfilled_from_sync_log',
+          metadata: {
+            connector: log.connector,
+            syncLogId: log.id,
+            syncType: log.type,
+            referenceType: log.referenceType,
+            referenceId: log.referenceId,
+          },
+        }) as never,
+      })
+      return event
     })
 
     return {
@@ -162,7 +171,7 @@ async function createBackfilledEvent(
       accountingEventId: created.id,
     }
   } catch (error) {
-    if (isUniqueConstraintError(error)) {
+    if (isIdempotencyKeyUniqueError(error)) {
       return {
         ...syncLogResultBase(log),
         action: 'skipped',
@@ -204,6 +213,16 @@ export async function runAccountingEventBackfill(
         ...syncLogResultBase(log),
         action: 'skipped',
         reason: 'payload_not_mirrorable',
+      })
+      continue
+    }
+
+    if (draft.status === 'POSTED' && !draft.externalId?.trim()) {
+      results.push({
+        ...syncLogResultBase(log),
+        action: 'skipped',
+        reason: 'posted_sync_log_missing_external_transaction_id',
+        idempotencyKey: draft.idempotencyKey,
       })
       continue
     }
