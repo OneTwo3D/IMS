@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { isMirrorableAccountingSyncType } from './accounting-event-mirror'
 
 export type AccountingReconciliationSeverity = 'warning' | 'critical'
 
@@ -99,7 +100,7 @@ const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
 const MAX_RECONCILIATION_ROWS = 10_000
 const TERMINAL_SALES_ORDER_STATUSES = ['REFUNDED', 'CANCELLED'] as const
 
-const MIRRORED_SYNC_TYPES = new Set([
+const SOURCE_TRACKED_EVENT_TYPES = new Set([
   'DAILY_BATCH_REVENUE_DEFERRAL',
   'DAILY_BATCH_INVENTORY_ALLOC',
   'DAILY_BATCH_GROUP_B',
@@ -298,7 +299,7 @@ export function evaluateAccountingReconciliationRows(
   }
 
   for (const log of rows.syncLogs) {
-    if (!MIRRORED_SYNC_TYPES.has(log.type)) continue
+    if (!isMirrorableAccountingSyncType(log.type)) continue
     if (hasAccountingEvent(rows.accountingEvents, {
       externalSystem: log.connector,
       type: log.type,
@@ -337,7 +338,7 @@ export function evaluateAccountingReconciliationRows(
       })
     }
 
-    if (!MIRRORED_SYNC_TYPES.has(event.type)) continue
+    if (!SOURCE_TRACKED_EVENT_TYPES.has(event.type)) continue
     const key = sourceKey(event.type, event.sourceEntityType, event.sourceEntityId)
     const isKnownRefund = event.sourceEntityType === 'SalesOrderRefund' && refundIds.has(event.sourceEntityId)
     if (!sourceKeys.has(key) && !isKnownRefund) {
