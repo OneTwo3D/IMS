@@ -50,6 +50,7 @@ export type ClaimIntegrationOutboxOptions = {
   client?: IntegrationOutboxClient
   connector?: string
   operation?: string
+  idempotencyKeys?: string[]
   limit?: number
   workerId: string
   now?: Date
@@ -118,6 +119,7 @@ export function buildOutboxIdempotencyKey(
 function isIdempotencyKeyConflict(error: unknown): boolean {
   if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') return false
   const target = error.meta?.target
+  if (target == null && error.meta?.modelName === 'IntegrationOutbox') return true
   return Array.isArray(target)
     ? target.includes('idempotencyKey')
     : String(target).includes('idempotencyKey')
@@ -134,6 +136,7 @@ function unlockedOrStale(now: Date, staleLockMs: number): unknown {
 function claimableWhere(options: {
   connector?: string
   operation?: string
+  idempotencyKeys?: string[]
   now: Date
   staleLockMs: number
   maxAttempts: number
@@ -142,6 +145,9 @@ function claimableWhere(options: {
   return {
     ...(options.connector ? { connector: options.connector } : {}),
     ...(options.operation ? { operation: options.operation } : {}),
+    ...(options.idempotencyKeys && options.idempotencyKeys.length > 0
+      ? { idempotencyKey: { in: [...new Set(options.idempotencyKeys)] } }
+      : {}),
     attempts: { lt: options.maxAttempts },
     OR: [
       {
@@ -261,6 +267,7 @@ export async function claimIntegrationOutboxWork(
     where: claimableWhere({
       connector: options.connector,
       operation: options.operation,
+      idempotencyKeys: options.idempotencyKeys,
       now,
       staleLockMs,
       maxAttempts,
