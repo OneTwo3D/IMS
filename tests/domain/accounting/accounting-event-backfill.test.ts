@@ -63,6 +63,12 @@ type MockFindManyArgs = {
   }
 }
 
+type MockAccountingEventFindManyArgs = {
+  where?: {
+    OR?: Array<Partial<Pick<EventRow, 'externalSystem' | 'type' | 'sourceEntityType' | 'sourceEntityId'>>>
+  }
+}
+
 function makeClient(input: {
   syncLogs: SyncLog[]
   events?: EventRow[]
@@ -106,6 +112,15 @@ function makeClient(input: {
     return ordered.slice(start, args.take ? start + args.take : undefined)
   }
 
+  function findAccountingEvents(args: MockAccountingEventFindManyArgs): EventRow[] {
+    const clauses = args.where?.OR
+    if (!clauses?.length) return events
+
+    return events.filter((event) => clauses.some((clause) => (
+      Object.entries(clause).every(([key, value]) => (event as Record<string, unknown>)[key] === value)
+    )))
+  }
+
   const client: MockBackfillClient = {
     salesOrder: {
       async findMany(args?: unknown) {
@@ -131,7 +146,7 @@ function makeClient(input: {
     accountingEvent: {
       async findMany(args?: unknown) {
         calls.accountingEventFindMany.push(args)
-        return events
+        return findAccountingEvents((args ?? {}) as MockAccountingEventFindManyArgs)
       },
       async create(args: { data: EventRow }) {
         if (typeof input.eventCreateError === 'function') {
@@ -460,7 +475,7 @@ test('accounting event backfill applies limit after stable candidate ordering', 
   assert.deepEqual(report.results.map((result) => result.syncLogId), ['sync-a', 'sync-b'])
   assert.equal(report.summary.candidates, 2)
   assert.equal(report.summary.wouldCreate, 2)
-  assert.deepEqual(report.reconciliationSummary, {
+  assert.deepEqual(report.candidateSummary, {
     scope: 'accounting_event_backfill_candidates',
     total: 2,
     warning: 2,
@@ -471,6 +486,28 @@ test('accounting event backfill applies limit after stable candidate ordering', 
   assert.equal(calls.salesOrderFindMany.length, 0)
   assert.equal(calls.shipmentFindMany.length, 0)
   assert.equal(calls.salesOrderRefundFindMany.length, 0)
+})
+
+test('accounting event backfill only suppresses candidates with matching mirrored events', async () => {
+  const sourceLog = syncedJournalLog({
+    id: 'sync-source',
+    externalTransactionId: 'journal-source',
+  })
+  const wrongConnectorEvent = {
+    ...mirroredEventForLog(sourceLog),
+    id: 'event-wrong-connector',
+    externalSystem: 'quickbooks',
+  }
+  const { client } = makeClient({
+    syncLogs: [sourceLog],
+    events: [wrongConnectorEvent],
+  })
+
+  const report = await runTestBackfill({ client: client as never })
+
+  assert.deepEqual(report.results.map((result) => result.syncLogId), ['sync-source'])
+  assert.equal(report.summary.candidates, 1)
+  assert.equal(report.candidateSummary.total, 1)
 })
 
 test('accounting event backfill pages deterministically until it fills the limit', async () => {

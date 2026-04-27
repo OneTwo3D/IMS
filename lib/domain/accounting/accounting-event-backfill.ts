@@ -7,7 +7,11 @@ import {
 } from './accounting-event-mirror'
 import type { AccountingEventDraft } from './accounting-event-types'
 import { isIdempotencyKeyUniqueError } from './prisma-errors'
-import type { AccountingReconciliationRows } from './reconciliation'
+import {
+  DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
+  reconciliationLookbackDate,
+  type AccountingReconciliationRows,
+} from './reconciliation'
 
 type AccountingBackfillSyncLogRow = AccountingReconciliationRows['syncLogs'][number]
 type AccountingBackfillWriteClient = {
@@ -44,7 +48,7 @@ export type AccountingEventBackfillResult = {
   accountingEventId?: string
 }
 
-export type AccountingEventBackfillReconciliationIssueSummary = {
+export type AccountingEventBackfillCandidateIssueSummary = {
   code: 'old_sync_log_without_mirrored_event'
   severity: 'warning' | 'critical'
   count: number
@@ -55,12 +59,12 @@ export type AccountingEventBackfillReport = {
   dryRun: boolean
   lookbackDays?: number
   limit: number
-  reconciliationSummary: {
+  candidateSummary: {
     scope: 'accounting_event_backfill_candidates'
     total: number
     warning: number
     critical: number
-    issues: AccountingEventBackfillReconciliationIssueSummary[]
+    issues: AccountingEventBackfillCandidateIssueSummary[]
   }
   summary: {
     candidates: number
@@ -104,9 +108,9 @@ function buildSummary(results: AccountingEventBackfillResult[]): AccountingEvent
   )
 }
 
-function buildBackfillReconciliationSummary(
+function buildBackfillCandidateSummary(
   candidates: AccountingBackfillSyncLogRow[],
-): AccountingEventBackfillReport['reconciliationSummary'] {
+): AccountingEventBackfillReport['candidateSummary'] {
   const missingMirrorCount = candidates.length
 
   return {
@@ -147,12 +151,6 @@ function buildDraftForSyncLog(log: AccountingBackfillSyncLogRow, baseCurrency: s
   })
 }
 
-function lookbackDate(days: number): Date {
-  const date = new Date()
-  date.setUTCDate(date.getUTCDate() - days)
-  return date
-}
-
 function eventKey(input: {
   externalSystem?: string | null
   type: string
@@ -181,7 +179,7 @@ function hasMirroredAccountingEvent(
 }
 
 function buildBackfillSyncLogWhere(lookbackDays: number | undefined): unknown {
-  const fromDate = lookbackDate(lookbackDays ?? 90)
+  const fromDate = reconciliationLookbackDate(lookbackDays ?? DEFAULT_RECONCILIATION_LOOKBACK_DAYS)
   return {
     type: { in: [...MIRRORED_ACCOUNTING_SYNC_TYPES] },
     OR: [
@@ -380,7 +378,7 @@ export async function runAccountingEventBackfill(
     dryRun,
     ...(options.lookbackDays !== undefined ? { lookbackDays: options.lookbackDays } : {}),
     limit,
-    reconciliationSummary: buildBackfillReconciliationSummary(candidates),
+    candidateSummary: buildBackfillCandidateSummary(candidates),
     summary: buildSummary(results),
     results,
   }
