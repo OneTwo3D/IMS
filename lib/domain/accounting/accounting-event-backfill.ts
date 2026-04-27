@@ -1,9 +1,9 @@
-import { Prisma } from '@/app/generated/prisma/client'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import { buildAccountingEventLog } from './accounting-event-builder'
 import { buildMirroredAccountingEventDraft } from './accounting-event-mirror'
 import type { AccountingEventDraft } from './accounting-event-types'
+import { isIdempotencyKeyUniqueError } from './prisma-errors'
 import {
   collectAccountingReconciliationRows,
   evaluateAccountingReconciliationRows,
@@ -67,14 +67,6 @@ export type RunAccountingEventBackfillOptions = {
 
 const DEFAULT_BACKFILL_LIMIT = 100
 const EXTERNAL_ID_REQUIRED_STATUSES = new Set(['POSTED', 'FAILED'])
-
-function isIdempotencyKeyUniqueError(error: unknown): boolean {
-  if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') return false
-  const target = error.meta?.target
-  return Array.isArray(target)
-    ? target.includes('idempotencyKey')
-    : String(target).includes('idempotencyKey')
-}
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
