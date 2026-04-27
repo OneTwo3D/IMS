@@ -96,7 +96,7 @@ type AccountingReconciliationClient = {
   }
 }
 
-const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
+export const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
 const MAX_RECONCILIATION_ROWS = 10_000
 const TERMINAL_SALES_ORDER_STATUSES = ['REFUNDED', 'CANCELLED'] as const
 
@@ -181,7 +181,7 @@ function buildSummary(findings: AccountingReconciliationFinding[]): AccountingRe
   )
 }
 
-function lookbackDate(days: number): Date {
+export function reconciliationLookbackDate(days: number): Date {
   const date = new Date()
   date.setUTCDate(date.getUTCDate() - days)
   return date
@@ -406,7 +406,7 @@ export async function collectAccountingReconciliationRows(
   client: AccountingReconciliationClient = db as unknown as AccountingReconciliationClient,
   options: { lookbackDays?: number } = {},
 ): Promise<AccountingReconciliationRows> {
-  const fromDate = lookbackDate(options.lookbackDays ?? DEFAULT_RECONCILIATION_LOOKBACK_DAYS)
+  const fromDate = reconciliationLookbackDate(options.lookbackDays ?? DEFAULT_RECONCILIATION_LOOKBACK_DAYS)
   const [salesOrders, shipments, refunds, syncLogs, accountingEvents] = await Promise.all([
     client.salesOrder.findMany({
       where: {

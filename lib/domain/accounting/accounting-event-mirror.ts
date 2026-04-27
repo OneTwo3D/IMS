@@ -29,20 +29,23 @@ export type MirroredAccountingSyncType = MirroredJournalAccountingSyncType | Mir
 
 type AccountingEventMirrorTransactionClient = Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingEventLog'>
 
-const MIRRORED_JOURNAL_TYPES = new Set<string>([
+export const MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES = [
   'DAILY_BATCH_REVENUE_DEFERRAL',
   'DAILY_BATCH_INVENTORY_ALLOC',
   'DAILY_BATCH_GROUP_B',
   'COGS_REVERSAL',
   'UNEARNED_REV_REVERSAL',
-])
+] as const
 
-const MIRRORED_TYPES = new Set<string>([
-  ...MIRRORED_JOURNAL_TYPES,
+export const MIRRORED_ACCOUNTING_SYNC_TYPES = [
+  ...MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES,
   'SALES_INVOICE',
   'CREDIT_NOTE',
   'PURCHASE_INVOICE',
-])
+] as const
+
+const MIRRORED_JOURNAL_TYPES = new Set<string>(MIRRORED_JOURNAL_ACCOUNTING_SYNC_TYPES)
+const MIRRORED_TYPES = new Set<string>(MIRRORED_ACCOUNTING_SYNC_TYPES)
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value)

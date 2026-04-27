@@ -63,7 +63,7 @@ export async function POST(request: NextRequest) {
         limit,
         created: report.summary.created,
         skipped: report.summary.skipped,
-        reconciliationFindings: report.reconciliationSummary,
+        candidateSummary: report.candidateSummary,
       },
     })
   }
