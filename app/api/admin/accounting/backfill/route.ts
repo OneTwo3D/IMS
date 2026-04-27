@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 
+import { logActivity } from '@/lib/activity-log'
 import { requireApiAdmin } from '@/lib/auth/server'
 import { runAccountingEventBackfill } from '@/lib/domain/accounting/accounting-event-backfill'
 
@@ -44,11 +45,28 @@ export async function POST(request: NextRequest) {
     )
   }
 
+  const lookbackDays = positiveInteger(body.lookbackDays)
+  const limit = positiveInteger(body.limit)
   const report = await runAccountingEventBackfill({
     dryRun,
-    lookbackDays: positiveInteger(body.lookbackDays),
-    limit: positiveInteger(body.limit),
+    lookbackDays,
+    limit,
   })
+  if (!dryRun) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      tag: 'accounting',
+      action: 'accounting_event_backfill',
+      description: `Backfilled ${report.summary.created} accounting event(s) from legacy sync logs`,
+      metadata: {
+        lookbackDays,
+        limit,
+        created: report.summary.created,
+        skipped: report.summary.skipped,
+        reconciliationFindings: report.reconciliationSummary,
+      },
+    })
+  }
   return NextResponse.json(report, {
     headers: {
       'Cache-Control': 'no-store',

@@ -1,4 +1,5 @@
 import { Prisma } from '@/app/generated/prisma/client'
+import { roundMoney } from '@/lib/domain/math/decimal'
 import {
   buildAccountingEvent,
   buildAccountingEventIdempotencyKey,
@@ -50,15 +51,15 @@ function stringValue(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value : null
 }
 
-function numberValue(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+function moneyValue(value: unknown, currency: string): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? roundMoney(value, currency).toNumber() : undefined
 }
 
 function normalizePayload(payload: unknown): Record<string, unknown> {
   return isRecord(payload) ? payload : {}
 }
 
-function extractJournalLines(payload: Record<string, unknown>): AccountingEventLine[] | null {
+function extractJournalLines(payload: Record<string, unknown>, currency: string): AccountingEventLine[] | null {
   if (!Array.isArray(payload.lines) || payload.lines.length === 0) return null
 
   const lines: AccountingEventLine[] = []
@@ -67,8 +68,8 @@ function extractJournalLines(payload: Record<string, unknown>): AccountingEventL
     const accountCode = stringValue(line.accountCode)
     const description = stringValue(line.description)
     if (!accountCode || !description) return null
-    const debit = numberValue(line.debit)
-    const credit = numberValue(line.credit)
+    const debit = moneyValue(line.debit, currency)
+    const credit = moneyValue(line.credit, currency)
 
     lines.push({
       accountCode,
@@ -180,7 +181,7 @@ export function buildMirroredAccountingEventDraft(params: {
   if (!isMirrorableJournalAccountingSyncType(params.type)) return null
 
   const payload = normalizePayload(params.payload)
-  const lines = extractJournalLines(payload)
+  const lines = extractJournalLines(payload, params.currency)
   if (!lines) return null
 
   const payloadDate = stringValue(payload.date)

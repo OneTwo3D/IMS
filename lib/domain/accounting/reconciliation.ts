@@ -100,6 +100,7 @@ const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
 const MAX_RECONCILIATION_ROWS = 10_000
 const TERMINAL_SALES_ORDER_STATUSES = ['REFUNDED', 'CANCELLED'] as const
 
+// Document sync events are mirrorable, but their source checks are document-specific rather than DailyBatch source-key checks.
 const SOURCE_TRACKED_EVENT_TYPES = new Set([
   'DAILY_BATCH_REVENUE_DEFERRAL',
   'DAILY_BATCH_INVENTORY_ALLOC',

@@ -66,6 +66,7 @@ export type RunAccountingEventBackfillOptions = {
 }
 
 const DEFAULT_BACKFILL_LIMIT = 100
+const EXTERNAL_ID_REQUIRED_STATUSES = new Set(['POSTED', 'FAILED'])
 
 function isIdempotencyKeyUniqueError(error: unknown): boolean {
   if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') return false
@@ -133,6 +134,7 @@ function selectCandidateSyncLogs(
 
   return rows.syncLogs
     .filter((log) => ids.has(log.id))
+    .sort((left, right) => left.id.localeCompare(right.id))
     .slice(0, limit)
 }
 
@@ -183,13 +185,21 @@ async function createBackfilledEvent(
   }
 }
 
+async function resolveBaseCurrency(options: RunAccountingEventBackfillOptions): Promise<string> {
+  if (options.baseCurrency) return options.baseCurrency
+  if (options.client) {
+    throw new Error('baseCurrency is required when a custom accounting backfill client is supplied')
+  }
+  return getBaseCurrencyCode()
+}
+
 export async function runAccountingEventBackfill(
   options: RunAccountingEventBackfillOptions = {},
 ): Promise<AccountingEventBackfillReport> {
   const client = options.client ?? (db as unknown as AccountingBackfillClient)
   const dryRun = options.dryRun ?? true
   const limit = Math.max(1, Math.floor(options.limit ?? DEFAULT_BACKFILL_LIMIT))
-  const baseCurrency = options.baseCurrency ?? (options.client ? 'GBP' : await getBaseCurrencyCode())
+  const baseCurrency = await resolveBaseCurrency(options)
   const rows = await collectAccountingReconciliationRows(client, { lookbackDays: options.lookbackDays })
   const findings = evaluateAccountingReconciliationRows(rows)
   const candidates = selectCandidateSyncLogs(rows, findings, limit)
@@ -217,11 +227,11 @@ export async function runAccountingEventBackfill(
       continue
     }
 
-    if (draft.status === 'POSTED' && !draft.externalId?.trim()) {
+    if (EXTERNAL_ID_REQUIRED_STATUSES.has(draft.status) && !draft.externalId?.trim()) {
       results.push({
         ...syncLogResultBase(log),
         action: 'skipped',
-        reason: 'posted_sync_log_missing_external_transaction_id',
+        reason: `${draft.status.toLowerCase()}_sync_log_missing_external_transaction_id`,
         idempotencyKey: draft.idempotencyKey,
       })
       continue
@@ -237,7 +247,16 @@ export async function runAccountingEventBackfill(
       continue
     }
 
-    results.push(await createBackfilledEvent(client, log, draft))
+    try {
+      results.push(await createBackfilledEvent(client, log, draft))
+    } catch (error) {
+      results.push({
+        ...syncLogResultBase(log),
+        action: 'skipped',
+        reason: `db_error: ${errorMessage(error)}`,
+        idempotencyKey: draft.idempotencyKey,
+      })
+    }
   }
 
   return {
