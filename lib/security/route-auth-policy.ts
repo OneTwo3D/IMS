@@ -41,6 +41,10 @@ export const apiRouteAuthPolicy = {
     access: 'admin',
     reason: 'Accounting reconciliation report is restricted through requireApiAdmin.',
   },
+  '/api/admin/accounting/backfill': {
+    access: 'admin',
+    reason: 'Accounting event backfill is restricted through requireApiAdmin and defaults to dry-run.',
+  },
   '/api/backup/create': {
     access: 'admin',
     reason: 'Backup creation is restricted through requireApiAdmin.',

@@ -1,4 +1,5 @@
 import { Prisma } from '@/app/generated/prisma/client'
+import { roundMoney } from '@/lib/domain/math/decimal'
 import {
   buildAccountingEvent,
   buildAccountingEventIdempotencyKey,
@@ -10,6 +11,7 @@ import {
   isAccountingDocumentEventType,
 } from './accounting-document-event-builder'
 import type { AccountingEventDraft, AccountingEventLine, AccountingEventStatus } from './accounting-event-types'
+import { isIdempotencyKeyUniqueError } from './prisma-errors'
 
 export type MirroredJournalAccountingSyncType =
   | 'DAILY_BATCH_REVENUE_DEFERRAL'
@@ -25,7 +27,7 @@ export type MirroredDocumentAccountingSyncType =
 
 export type MirroredAccountingSyncType = MirroredJournalAccountingSyncType | MirroredDocumentAccountingSyncType
 
-type AccountingEventMirrorClient = Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingEventLog'>
+type AccountingEventMirrorTransactionClient = Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingEventLog'>
 
 const MIRRORED_JOURNAL_TYPES = new Set<string>([
   'DAILY_BATCH_REVENUE_DEFERRAL',
@@ -50,15 +52,15 @@ function stringValue(value: unknown): string | null {
   return typeof value === 'string' && value.trim() ? value : null
 }
 
-function numberValue(value: unknown): number | undefined {
-  return typeof value === 'number' && Number.isFinite(value) ? value : undefined
+function moneyValue(value: unknown, currency: string): number | undefined {
+  return typeof value === 'number' && Number.isFinite(value) ? roundMoney(value, currency).toNumber() : undefined
 }
 
 function normalizePayload(payload: unknown): Record<string, unknown> {
   return isRecord(payload) ? payload : {}
 }
 
-function extractJournalLines(payload: Record<string, unknown>): AccountingEventLine[] | null {
+function extractJournalLines(payload: Record<string, unknown>, currency: string): AccountingEventLine[] | null {
   if (!Array.isArray(payload.lines) || payload.lines.length === 0) return null
 
   const lines: AccountingEventLine[] = []
@@ -67,8 +69,8 @@ function extractJournalLines(payload: Record<string, unknown>): AccountingEventL
     const accountCode = stringValue(line.accountCode)
     const description = stringValue(line.description)
     if (!accountCode || !description) return null
-    const debit = numberValue(line.debit)
-    const credit = numberValue(line.credit)
+    const debit = moneyValue(line.debit, currency)
+    const credit = moneyValue(line.credit, currency)
 
     lines.push({
       accountCode,
@@ -123,14 +125,6 @@ function buildMirroredAccountingEventIdempotencyKey(params: {
   ])
 }
 
-function isIdempotencyKeyUniqueError(error: unknown): boolean {
-  if (!(error instanceof Prisma.PrismaClientKnownRequestError) || error.code !== 'P2002') return false
-  const target = error.meta?.target
-  return Array.isArray(target)
-    ? target.includes('idempotencyKey')
-    : String(target).includes('idempotencyKey')
-}
-
 export function isMirrorableAccountingSyncType(type: string): type is MirroredAccountingSyncType {
   return MIRRORED_TYPES.has(type)
 }
@@ -180,7 +174,7 @@ export function buildMirroredAccountingEventDraft(params: {
   if (!isMirrorableJournalAccountingSyncType(params.type)) return null
 
   const payload = normalizePayload(params.payload)
-  const lines = extractJournalLines(payload)
+  const lines = extractJournalLines(payload, params.currency)
   if (!lines) return null
 
   const payloadDate = stringValue(payload.date)
@@ -202,8 +196,10 @@ export function buildMirroredAccountingEventDraft(params: {
   })
 }
 
+// Callers must pass the `tx` object from an enclosing db.$transaction so the
+// mirrored event and its audit log commit or roll back with the sync log row.
 export async function mirrorAccountingSyncLogToEvent(
-  client: AccountingEventMirrorClient,
+  client: AccountingEventMirrorTransactionClient,
   params: Parameters<typeof buildMirroredAccountingEventDraft>[0],
 ): Promise<void> {
   const event = buildMirroredAccountingEventDraft(params)
@@ -233,7 +229,7 @@ export async function mirrorAccountingSyncLogToEvent(
 }
 
 export async function updateMirroredAccountingEventStatus(
-  client: AccountingEventMirrorClient,
+  client: AccountingEventMirrorTransactionClient,
   params: {
     connector: string
     type: string
@@ -278,7 +274,7 @@ export async function updateMirroredAccountingEventStatus(
 }
 
 export async function resetMirroredAccountingEventsToPending(
-  client: AccountingEventMirrorClient,
+  client: AccountingEventMirrorTransactionClient,
   params: {
     connector: string
     types: string[]

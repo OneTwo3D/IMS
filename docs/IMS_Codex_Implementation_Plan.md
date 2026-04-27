@@ -1224,6 +1224,43 @@ Run lint, type-check, and accounting-event backfill tests.
 
 ---
 
+## PR 6.6 — Optimize accounting-event backfill candidate queries
+
+### Goal
+
+Make the accounting-event backfill scale to large historical sync-log tables by selecting missing-event candidates directly, instead of running the full reconciliation row collection before applying a small backfill limit.
+
+### Target files
+
+```text
+lib/domain/accounting/accounting-event-backfill.ts
+lib/domain/accounting/reconciliation.ts
+tests/domain/accounting/accounting-event-backfill.test.ts
+```
+
+### Acceptance criteria
+
+- Adds a backfill-specific candidate query path that pages mirrorable `AccountingSyncLog` rows deterministically.
+- Applies `limit` at the database candidate-selection layer, not only after collecting up to `MAX_RECONCILIATION_ROWS`.
+- Preserves the PR 6.5 dry-run, idempotency, audit-log, and skip-reason behavior.
+- Keeps the full reconciliation report unchanged for operator diagnostics.
+- Adds tests proving small limits do not require full reconciliation-row collection and that repeated runs page deterministically.
+
+### Codex prompt
+
+```text
+Optimize accounting-event backfill candidate selection so small backfill runs do not first collect the full reconciliation dataset.
+
+Add a backfill-specific query path for mirrorable AccountingSyncLog rows missing AccountingEvent mirrors.
+Apply limit and stable ordering in the database query.
+Keep the reconciliation report behavior unchanged.
+Preserve PR 6.5 dry-run, idempotency, audit logging, and skip reasons.
+Add focused tests for database-level limiting and deterministic repeated runs.
+Run lint, type-check, and accounting-event backfill tests.
+```
+
+---
+
 # Stage 7 — Connector outbox and retry system
 
 ## Stage goal
@@ -1664,6 +1701,7 @@ PR 6.2  Mirror current accounting actions
 PR 6.3  Accounting reconciliation report
 PR 6.4  Document-shaped accounting events
 PR 6.5  Backfill missing accounting events
+PR 6.6  Optimize accounting-event backfill candidate queries
 PR 7.1  IntegrationOutbox model
 PR 7.2  WooCommerce outbox migration
 PR 7.3  Xero outbox migration
