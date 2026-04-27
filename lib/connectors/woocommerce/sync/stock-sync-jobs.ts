@@ -16,6 +16,7 @@ import {
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
   markIntegrationOutboxSuccess,
+  type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
 
 const WEBHOOK_ECHO_WINDOW_MS = 10 * 60 * 1000
@@ -24,6 +25,7 @@ const WC_STOCK_SYNC_OPERATION = 'stock.push'
 const WC_STOCK_SYNC_WORKER_ID = 'woocommerce-stock-sync'
 const WC_STOCK_SYNC_RETRY_DELAY_BASE_MS = 5 * 60 * 1000
 const WC_STOCK_SYNC_RETRY_DELAY_MAX_STEPS = 12
+const WC_STOCK_SYNC_MAX_ATTEMPTS = 12
 const immediateStockSyncProductIds = new Set<string>()
 let immediateStockSyncScheduled = false
 
@@ -58,6 +60,107 @@ function retryDelayMs(attemptsBeforeFailure: number): number {
   return Math.min(attemptsBeforeFailure + 1, WC_STOCK_SYNC_RETRY_DELAY_MAX_STEPS) * WC_STOCK_SYNC_RETRY_DELAY_BASE_MS
 }
 
+function samePayload(left: unknown, right: unknown): boolean {
+  return JSON.stringify(left) === JSON.stringify(right)
+}
+
+async function requeueClaimedJobIfPayloadChanged(job: IntegrationOutboxRow): Promise<boolean> {
+  const current = await db.integrationOutbox.findUnique({
+    where: { id: job.id },
+    select: { payloadJson: true },
+  })
+  if (!current || samePayload(current.payloadJson, job.payloadJson)) return false
+  const requeued = await db.integrationOutbox.updateMany({
+    where: {
+      id: job.id,
+      status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+      lockedBy: WC_STOCK_SYNC_WORKER_ID,
+      lockedAt: job.lockedAt,
+    },
+    data: {
+      status: INTEGRATION_OUTBOX_STATUS.PENDING,
+      nextAttemptAt: new Date(),
+      lastError: null,
+      lockedAt: null,
+      lockedBy: null,
+    },
+  })
+  if (requeued.count === 0) {
+    throw new Error(`WooCommerce stock outbox job ${job.id} changed while processing but could not be requeued`)
+  }
+  return true
+}
+
+async function migrateLegacyWcStockSyncJobs(productIds?: string[], limit = 100): Promise<number> {
+  const jobs = await db.stockSyncJob.findMany({
+    where: {
+      connector: WC_STOCK_SYNC_CONNECTOR,
+      ...(productIds ? { productId: { in: productIds } } : {}),
+    },
+    orderBy: { updatedAt: 'asc' },
+    take: limit,
+  })
+
+  for (const job of jobs) {
+    const incomingPayload = buildWcStockSyncOutboxPayload(
+      job.productId,
+      job.reason,
+      { force: job.force, webhookQty: job.webhookQty },
+    )
+    const row = await enqueueIntegrationOutbox({
+      connector: WC_STOCK_SYNC_CONNECTOR,
+      operation: WC_STOCK_SYNC_OPERATION,
+      idempotencyKey: wcStockSyncIdempotencyKey(job.productId),
+      payloadJson: incomingPayload,
+      nextAttemptAt: job.availableAt,
+    })
+    const payload = buildWcStockSyncOutboxPayload(
+      job.productId,
+      job.reason,
+      { force: job.force, webhookQty: job.webhookQty },
+      row.payloadJson,
+    )
+
+    if (row.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
+      await db.integrationOutbox.updateMany({
+        where: { id: row.id, status: INTEGRATION_OUTBOX_STATUS.PROCESSING },
+        data: { payloadJson: payload },
+      })
+    } else {
+      await db.integrationOutbox.updateMany({
+        where: {
+          id: row.id,
+          status: { not: INTEGRATION_OUTBOX_STATUS.PROCESSING },
+        },
+        data: {
+          payloadJson: payload,
+          status: job.status === 'FAILED'
+            ? INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED
+            : INTEGRATION_OUTBOX_STATUS.PENDING,
+          attempts: job.attempts,
+          nextAttemptAt: job.availableAt,
+          lastError: job.lastError,
+          lockedAt: null,
+          lockedBy: null,
+        },
+      })
+    }
+
+    await db.stockSyncJob.delete({
+      where: {
+        connector_productId: {
+          connector: job.connector,
+          productId: job.productId,
+        },
+      },
+    }).catch(() => {
+      // Another worker may have migrated the same legacy row.
+    })
+  }
+
+  return jobs.length
+}
+
 export async function enqueueWcStockSyncJobs(
   productIds: string[],
   reason: StockSyncReason,
@@ -76,6 +179,22 @@ export async function enqueueWcStockSyncJobs(
       nextAttemptAt: now,
     })
     const payload = buildWcStockSyncOutboxPayload(productId, reason, options, row.payloadJson)
+    if (row.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
+      await db.integrationOutbox.updateMany({
+        where: {
+          id: row.id,
+          status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+        },
+        data: {
+          payloadJson: payload,
+          lastError: null,
+        },
+      })
+      continue
+    }
+
+    const resetAttempts = row.status === INTEGRATION_OUTBOX_STATUS.SUCCEEDED
+      || row.status === INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED
     await db.integrationOutbox.updateMany({
       where: {
         id: row.id,
@@ -87,7 +206,7 @@ export async function enqueueWcStockSyncJobs(
         idempotencyKey: wcStockSyncIdempotencyKey(productId),
         payloadJson: payload,
         status: INTEGRATION_OUTBOX_STATUS.PENDING,
-        attempts: 0,
+        ...(resetAttempts ? { attempts: 0 } : {}),
         nextAttemptAt: now,
         lastError: null,
         lockedAt: null,
@@ -108,12 +227,15 @@ export async function processQueuedWcStockSyncJobs(options?: {
   const summary = { processed: 0, synced: 0, failed: 0, errors: [] as string[] }
   if (productIds?.length === 0) return summary
 
+  await migrateLegacyWcStockSyncJobs(productIds, limit)
+
   const jobs = await claimIntegrationOutboxWork({
     connector: WC_STOCK_SYNC_CONNECTOR,
     operation: WC_STOCK_SYNC_OPERATION,
     idempotencyKeys: productIds?.map(wcStockSyncIdempotencyKey),
     limit,
     workerId: WC_STOCK_SYNC_WORKER_ID,
+    maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
   })
 
   function shouldRetainJob(result: { synced: number; errors: string[]; message: string }, job: { force: boolean; reason: StockSyncReason }) {
@@ -171,9 +293,15 @@ export async function processQueuedWcStockSyncJobs(options?: {
           lockedAt: job.lockedAt,
           error: result.errors.join(' | ') || result.message || 'WooCommerce stock sync failed',
           retryDelayMs: retryDelayMs(job.attempts),
+          maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
         })
         summary.failed++
         summary.errors.push(...result.errors)
+        continue
+      }
+
+      if (await requeueClaimedJobIfPayloadChanged(job)) {
+        summary.synced += result.synced
         continue
       }
 
@@ -207,6 +335,7 @@ export async function processQueuedWcStockSyncJobs(options?: {
         lockedAt: job.lockedAt,
         error: message,
         retryDelayMs: retryDelayMs(job.attempts),
+        maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
       })
       summary.failed++
       summary.errors.push(message)
