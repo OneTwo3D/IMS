@@ -256,7 +256,9 @@ export async function enqueueWcStockSyncJobs(
   options?: { force?: boolean; webhookQty?: number | null },
 ): Promise<string[]> {
   const scope = await expandProductScope(productIds)
+  if (scope.length === 0) return []
   const now = new Date()
+  await migrateLegacyWcStockSyncJobs(scope, Math.max(scope.length, 1))
 
   for (const productId of scope) {
     const row = await enqueueIntegrationOutbox({
@@ -284,13 +286,16 @@ export async function enqueueWcStockSyncJobs(
 export async function processQueuedWcStockSyncJobs(options?: {
   productIds?: string[]
   limit?: number
+  migrateLegacy?: boolean
 }): Promise<{ processed: number; synced: number; failed: number; errors: string[] }> {
   const limit = options?.limit ?? 25
   const productIds = options?.productIds !== undefined ? [...new Set(options.productIds)] : undefined
   const summary = { processed: 0, synced: 0, failed: 0, errors: [] as string[] }
   if (productIds?.length === 0) return summary
 
-  await migrateLegacyWcStockSyncJobs(productIds, limit)
+  if (options?.migrateLegacy !== false) {
+    await migrateLegacyWcStockSyncJobs(productIds, limit)
+  }
 
   const jobs = await claimIntegrationOutboxWork({
     connector: WC_STOCK_SYNC_CONNECTOR,
@@ -420,7 +425,11 @@ export async function enqueueAndProcessImmediateWcStockSync(
   immediateStockSyncProductIds.clear()
   immediateStockSyncScheduled = false
 
-  const outcome = await processQueuedWcStockSyncJobs({ productIds: coalescedScope, limit: coalescedScope.length })
+  const outcome = await processQueuedWcStockSyncJobs({
+    productIds: coalescedScope,
+    limit: coalescedScope.length,
+    migrateLegacy: false,
+  })
   if (outcome.failed > 0) {
     await logActivity({
       entityType: 'SYNC',
