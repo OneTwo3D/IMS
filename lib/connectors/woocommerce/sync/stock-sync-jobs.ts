@@ -15,7 +15,6 @@ import {
   INTEGRATION_OUTBOX_STATUS,
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
-  markIntegrationOutboxSuccess,
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
 
@@ -64,12 +63,120 @@ function samePayload(left: unknown, right: unknown): boolean {
   return JSON.stringify(left) === JSON.stringify(right)
 }
 
-async function requeueClaimedJobIfPayloadChanged(job: IntegrationOutboxRow): Promise<boolean> {
+type ApplyStockOutboxPayloadOptions = {
+  row: IntegrationOutboxRow
+  productId: string
+  reason: StockSyncReason
+  force?: boolean
+  webhookQty?: number | null
+  nextAttemptAt: Date
+  status: string
+  attempts?: number
+  lastError?: string | null
+}
+
+async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions): Promise<boolean> {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const current = attempt === 0
+      ? options.row
+      : await db.integrationOutbox.findUnique({ where: { id: options.row.id } })
+    if (!current) return false
+
+    const payload = buildWcStockSyncOutboxPayload(
+      options.productId,
+      options.reason,
+      { force: options.force, webhookQty: options.webhookQty },
+      current.payloadJson,
+    )
+
+    if (current.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
+      if (samePayload(current.payloadJson, payload)) return true
+      const updated = await db.integrationOutbox.updateMany({
+        where: {
+          id: current.id,
+          status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+        },
+        data: {
+          payloadJson: payload,
+          lastError: null,
+        },
+      })
+      if (updated.count > 0) return true
+      continue
+    }
+
+    const resetAttempts = current.status === INTEGRATION_OUTBOX_STATUS.SUCCEEDED
+      || current.status === INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED
+    const updated = await db.integrationOutbox.updateMany({
+      where: {
+        id: current.id,
+        status: { not: INTEGRATION_OUTBOX_STATUS.PROCESSING },
+      },
+      data: {
+        connector: WC_STOCK_SYNC_CONNECTOR,
+        operation: WC_STOCK_SYNC_OPERATION,
+        idempotencyKey: wcStockSyncIdempotencyKey(options.productId),
+        payloadJson: payload,
+        status: options.status,
+        ...(options.attempts !== undefined ? { attempts: options.attempts } : {}),
+        ...(options.attempts === undefined && resetAttempts ? { attempts: 0 } : {}),
+        nextAttemptAt: options.nextAttemptAt,
+        lastError: options.lastError ?? null,
+        lockedAt: null,
+        lockedBy: null,
+      },
+    })
+    if (updated.count > 0) return true
+  }
+  return false
+}
+
+async function completeClaimedJob(job: IntegrationOutboxRow): Promise<'succeeded' | 'requeued'> {
+  const succeeded = await db.integrationOutbox.updateMany({
+    where: {
+      id: job.id,
+      status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+      lockedBy: WC_STOCK_SYNC_WORKER_ID,
+      lockedAt: job.lockedAt,
+      updatedAt: job.updatedAt,
+    },
+    data: {
+      status: INTEGRATION_OUTBOX_STATUS.SUCCEEDED,
+      nextAttemptAt: null,
+      lastError: null,
+      lockedAt: null,
+      lockedBy: null,
+    },
+  })
+  if (succeeded.count > 0) return 'succeeded'
+
   const current = await db.integrationOutbox.findUnique({
     where: { id: job.id },
     select: { payloadJson: true },
   })
-  if (!current || samePayload(current.payloadJson, job.payloadJson)) return false
+  if (!current) {
+    throw new Error(`WooCommerce stock outbox job ${job.id} could not be completed by ${WC_STOCK_SYNC_WORKER_ID}`)
+  }
+  if (samePayload(current.payloadJson, job.payloadJson)) {
+    const completed = await db.integrationOutbox.updateMany({
+      where: {
+        id: job.id,
+        status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+        lockedBy: WC_STOCK_SYNC_WORKER_ID,
+        lockedAt: job.lockedAt,
+      },
+      data: {
+        status: INTEGRATION_OUTBOX_STATUS.SUCCEEDED,
+        nextAttemptAt: null,
+        lastError: null,
+        lockedAt: null,
+        lockedBy: null,
+      },
+    })
+    if (completed.count > 0) return 'succeeded'
+    throw new Error(`WooCommerce stock outbox job ${job.id} could not be completed by ${WC_STOCK_SYNC_WORKER_ID}`)
+  }
+
   const requeued = await db.integrationOutbox.updateMany({
     where: {
       id: job.id,
@@ -88,7 +195,7 @@ async function requeueClaimedJobIfPayloadChanged(job: IntegrationOutboxRow): Pro
   if (requeued.count === 0) {
     throw new Error(`WooCommerce stock outbox job ${job.id} changed while processing but could not be requeued`)
   }
-  return true
+  return 'requeued'
 }
 
 async function migrateLegacyWcStockSyncJobs(productIds?: string[], limit = 100): Promise<number> {
@@ -102,49 +209,31 @@ async function migrateLegacyWcStockSyncJobs(productIds?: string[], limit = 100):
   })
 
   for (const job of jobs) {
-    const incomingPayload = buildWcStockSyncOutboxPayload(
-      job.productId,
-      job.reason,
-      { force: job.force, webhookQty: job.webhookQty },
-    )
     const row = await enqueueIntegrationOutbox({
       connector: WC_STOCK_SYNC_CONNECTOR,
       operation: WC_STOCK_SYNC_OPERATION,
       idempotencyKey: wcStockSyncIdempotencyKey(job.productId),
-      payloadJson: incomingPayload,
+      payloadJson: buildWcStockSyncOutboxPayload(
+        job.productId,
+        job.reason,
+        { force: job.force, webhookQty: job.webhookQty },
+      ),
       nextAttemptAt: job.availableAt,
     })
-    const payload = buildWcStockSyncOutboxPayload(
-      job.productId,
-      job.reason,
-      { force: job.force, webhookQty: job.webhookQty },
-      row.payloadJson,
-    )
-
-    if (row.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
-      await db.integrationOutbox.updateMany({
-        where: { id: row.id, status: INTEGRATION_OUTBOX_STATUS.PROCESSING },
-        data: { payloadJson: payload },
-      })
-    } else {
-      await db.integrationOutbox.updateMany({
-        where: {
-          id: row.id,
-          status: { not: INTEGRATION_OUTBOX_STATUS.PROCESSING },
-        },
-        data: {
-          payloadJson: payload,
-          status: job.status === 'FAILED'
-            ? INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED
-            : INTEGRATION_OUTBOX_STATUS.PENDING,
-          attempts: job.attempts,
-          nextAttemptAt: job.availableAt,
-          lastError: job.lastError,
-          lockedAt: null,
-          lockedBy: null,
-        },
-      })
-    }
+    const migrated = await applyStockOutboxPayload({
+      row,
+      productId: job.productId,
+      reason: job.reason,
+      force: job.force,
+      webhookQty: job.webhookQty,
+      nextAttemptAt: job.availableAt,
+      status: job.status === 'FAILED'
+        ? INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED
+        : INTEGRATION_OUTBOX_STATUS.PENDING,
+      attempts: job.attempts,
+      lastError: job.lastError,
+    })
+    if (!migrated) continue
 
     await db.stockSyncJob.delete({
       where: {
@@ -170,49 +259,23 @@ export async function enqueueWcStockSyncJobs(
   const now = new Date()
 
   for (const productId of scope) {
-    const incomingPayload = buildWcStockSyncOutboxPayload(productId, reason, options)
     const row = await enqueueIntegrationOutbox({
       connector: WC_STOCK_SYNC_CONNECTOR,
       operation: WC_STOCK_SYNC_OPERATION,
       idempotencyKey: wcStockSyncIdempotencyKey(productId),
-      payloadJson: incomingPayload,
+      payloadJson: buildWcStockSyncOutboxPayload(productId, reason, options),
       nextAttemptAt: now,
     })
-    const payload = buildWcStockSyncOutboxPayload(productId, reason, options, row.payloadJson)
-    if (row.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
-      await db.integrationOutbox.updateMany({
-        where: {
-          id: row.id,
-          status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
-        },
-        data: {
-          payloadJson: payload,
-          lastError: null,
-        },
-      })
-      continue
-    }
-
-    const resetAttempts = row.status === INTEGRATION_OUTBOX_STATUS.SUCCEEDED
-      || row.status === INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED
-    await db.integrationOutbox.updateMany({
-      where: {
-        id: row.id,
-        status: { not: INTEGRATION_OUTBOX_STATUS.PROCESSING },
-      },
-      data: {
-        connector: WC_STOCK_SYNC_CONNECTOR,
-        operation: WC_STOCK_SYNC_OPERATION,
-        idempotencyKey: wcStockSyncIdempotencyKey(productId),
-        payloadJson: payload,
-        status: INTEGRATION_OUTBOX_STATUS.PENDING,
-        ...(resetAttempts ? { attempts: 0 } : {}),
-        nextAttemptAt: now,
-        lastError: null,
-        lockedAt: null,
-        lockedBy: null,
-      },
+    const queued = await applyStockOutboxPayload({
+      row,
+      productId,
+      reason,
+      force: options?.force,
+      webhookQty: options?.webhookQty,
+      nextAttemptAt: now,
+      status: INTEGRATION_OUTBOX_STATUS.PENDING,
     })
+    if (!queued) throw new Error(`WooCommerce stock outbox job for product ${productId} could not be queued`)
   }
 
   return scope
@@ -300,16 +363,12 @@ export async function processQueuedWcStockSyncJobs(options?: {
         continue
       }
 
-      if (await requeueClaimedJobIfPayloadChanged(job)) {
+      const completion = await completeClaimedJob(job)
+      if (completion === 'requeued') {
         summary.synced += result.synced
         continue
       }
 
-      await markIntegrationOutboxSuccess({
-        id: job.id,
-        workerId: WC_STOCK_SYNC_WORKER_ID,
-        lockedAt: job.lockedAt,
-      })
       if (payload.reason === 'DAILY_RECONCILIATION') {
         await db.stockSyncState.upsert({
           where: {

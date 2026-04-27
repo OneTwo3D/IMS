@@ -287,13 +287,7 @@ export async function claimIntegrationOutboxWork(
       },
     })
     if (result.count === 0) continue
-    claimed.push({
-      ...row,
-      status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
-      lockedAt: now,
-      lockedBy: options.workerId,
-      updatedAt: now,
-    })
+    claimed.push(await requireOutboxRow(client, row.id))
   }
 
   return claimed
