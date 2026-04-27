@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import {
+  buildOutboxIdempotencyKey,
   claimIntegrationOutboxWork,
   enqueueIntegrationOutbox,
   INTEGRATION_OUTBOX_STATUS,
@@ -20,7 +21,11 @@ type FindManyArgs = {
 
 type UpdateManyArgs = {
   where?: MockWhere
-  data?: Partial<IntegrationOutboxRow>
+  data?: MockUpdateData
+}
+
+type MockUpdateData = Omit<Partial<IntegrationOutboxRow>, 'attempts'> & {
+  attempts?: number | { increment: number }
 }
 
 type MockWhere = {
@@ -28,6 +33,7 @@ type MockWhere = {
   connector?: string
   operation?: string
   status?: string | { in?: string[] }
+  attempts?: number | { lt?: number }
   lockedAt?: Date | null | { lt?: Date }
   lockedBy?: string
   nextAttemptAt?: null | { lte?: Date }
@@ -89,6 +95,10 @@ function makeClient(initialRows: IntegrationOutboxRow[] = []) {
     if (where.operation && row.operation !== where.operation) return false
     if (typeof where.status === 'string' && row.status !== where.status) return false
     if (typeof where.status === 'object' && where.status.in && !where.status.in.includes(row.status)) return false
+    if (typeof where.attempts === 'number' && row.attempts !== where.attempts) return false
+    if (typeof where.attempts === 'object' && where.attempts.lt !== undefined && row.attempts >= where.attempts.lt) {
+      return false
+    }
     if (where.lockedBy && row.lockedBy !== where.lockedBy) return false
     if (where.lockedAt === null && row.lockedAt !== null) return false
     if (where.lockedAt instanceof Date && row.lockedAt?.getTime() !== where.lockedAt.getTime()) return false
@@ -102,8 +112,14 @@ function makeClient(initialRows: IntegrationOutboxRow[] = []) {
     return true
   }
 
-  function updateRow(row: IntegrationOutboxRow, data: Partial<IntegrationOutboxRow>): IntegrationOutboxRow {
-    Object.assign(row, data, { updatedAt: new Date('2026-04-27T10:00:00.000Z') })
+  function updateRow(row: IntegrationOutboxRow, data: MockUpdateData): IntegrationOutboxRow {
+    const attempts = typeof data.attempts === 'object'
+      ? row.attempts + data.attempts.increment
+      : data.attempts
+    Object.assign(row, data, {
+      attempts: attempts ?? row.attempts,
+      updatedAt: new Date('2026-04-27T10:00:00.000Z'),
+    })
     return row
   }
 
@@ -170,6 +186,20 @@ test('integration outbox enqueue is idempotent by idempotency key', async () => 
   assert.equal(rows[0].status, INTEGRATION_OUTBOX_STATUS.PENDING)
 })
 
+test('integration outbox idempotency key builder normalizes deterministic parts', () => {
+  const key = buildOutboxIdempotencyKey(
+    ' WooCommerce ',
+    ' Stock Push ',
+    ' SKU 1 ',
+    new Date('2026-04-27T19:45:00.000Z'),
+    'Batch #42',
+  )
+
+  assert.equal(key, 'woocommerce:stock-push:sku-1:2026-04-27:batch-42')
+  assert.throws(() => buildOutboxIdempotencyKey('woocommerce', 'stock.push'), /At least one/)
+  assert.throws(() => buildOutboxIdempotencyKey('woocommerce', 'stock.push', ' '), /must not be blank/)
+})
+
 test('integration outbox claim locks due pending and retryable rows', async () => {
   const now = new Date('2026-04-27T10:00:00.000Z')
   const { client, rows } = makeClient([
@@ -191,6 +221,13 @@ test('integration outbox claim locks due pending and retryable rows', async () =
       lockedAt: new Date('2026-04-27T09:59:00.000Z'),
       createdAt: new Date('2026-04-27T09:03:00.000Z'),
     }),
+    makeRow({
+      id: 'attempts-capped',
+      status: INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
+      attempts: 5,
+      nextAttemptAt: new Date('2026-04-27T09:59:00.000Z'),
+      createdAt: new Date('2026-04-27T09:04:00.000Z'),
+    }),
   ])
 
   const claimed = await claimIntegrationOutboxWork({
@@ -209,6 +246,7 @@ test('integration outbox claim locks due pending and retryable rows', async () =
   )
   assert.equal(rows.find((row) => row.id === 'future')?.status, INTEGRATION_OUTBOX_STATUS.PENDING)
   assert.equal(rows.find((row) => row.id === 'locked')?.lockedBy, null)
+  assert.equal(rows.find((row) => row.id === 'attempts-capped')?.lockedBy, null)
 })
 
 test('integration outbox failure helpers schedule retry or permanent failure', async () => {
@@ -260,6 +298,35 @@ test('integration outbox failure helpers schedule retry or permanent failure', a
   assert.equal(permanent.nextAttemptAt, null)
   assert.equal(permanent.lastError, 'invalid payload')
   assert.equal(rows.find((row) => row.id === 'job-2')?.lockedBy, null)
+})
+
+test('integration outbox retryable failure promotes to permanent at max attempts', async () => {
+  const now = new Date('2026-04-27T10:00:00.000Z')
+  const { client } = makeClient([
+    makeRow({
+      id: 'job-1',
+      status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+      attempts: 4,
+      lockedAt: now,
+      lockedBy: 'worker-1',
+    }),
+  ])
+
+  const failure = await markIntegrationOutboxRetryableFailure({
+    client,
+    id: 'job-1',
+    workerId: 'worker-1',
+    lockedAt: now,
+    error: 'connector still unavailable',
+    now,
+    maxAttempts: 5,
+  })
+
+  assert.equal(failure.status, INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED)
+  assert.equal(failure.attempts, 5)
+  assert.equal(failure.nextAttemptAt, null)
+  assert.equal(failure.lockedAt, null)
+  assert.equal(failure.lockedBy, null)
 })
 
 test('integration outbox success clears claim state', async () => {

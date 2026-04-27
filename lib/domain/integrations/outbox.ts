@@ -54,6 +54,7 @@ export type ClaimIntegrationOutboxOptions = {
   workerId: string
   now?: Date
   staleLockMs?: number
+  maxAttempts?: number
 }
 
 export type MarkIntegrationOutboxFailureOptions = {
@@ -64,6 +65,7 @@ export type MarkIntegrationOutboxFailureOptions = {
   error: unknown
   now?: Date
   retryDelayMs?: number
+  maxAttempts?: number
 }
 
 export type MarkIntegrationOutboxSuccessOptions = {
@@ -80,6 +82,7 @@ const CLAIMABLE_STATUSES = [
 const DEFAULT_CLAIM_LIMIT = 25
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000
 const DEFAULT_RETRY_DELAY_MS = 5 * 60 * 1000
+export const DEFAULT_INTEGRATION_OUTBOX_MAX_ATTEMPTS = 5
 const MAX_ERROR_LENGTH = 1000
 
 function getClient(client?: IntegrationOutboxClient): IntegrationOutboxClient {
@@ -92,6 +95,22 @@ function errorMessage(error: unknown): string {
 
 function truncateError(error: unknown): string {
   return errorMessage(error).slice(0, MAX_ERROR_LENGTH)
+}
+
+function normalizeIdempotencyPart(part: string | number | Date): string {
+  const value = part instanceof Date ? part.toISOString().slice(0, 10) : String(part)
+  const normalized = value.trim().toLowerCase().replace(/[^a-z0-9._:-]+/g, '-').replace(/^-+|-+$/g, '')
+  if (!normalized) throw new Error('Integration outbox idempotency key parts must not be blank')
+  return normalized
+}
+
+export function buildOutboxIdempotencyKey(
+  connector: string,
+  operation: string,
+  ...parts: Array<string | number | Date>
+): string {
+  if (parts.length === 0) throw new Error('At least one integration outbox idempotency key part is required')
+  return [connector, operation, ...parts].map(normalizeIdempotencyPart).join(':')
 }
 
 function isIdempotencyKeyConflict(error: unknown): boolean {
@@ -115,11 +134,13 @@ function claimableWhere(options: {
   operation?: string
   now: Date
   staleLockMs: number
+  maxAttempts: number
 }): unknown {
   const staleLockedBefore = new Date(options.now.getTime() - options.staleLockMs)
   return {
     ...(options.connector ? { connector: options.connector } : {}),
     ...(options.operation ? { operation: options.operation } : {}),
+    attempts: { lt: options.maxAttempts },
     OR: [
       {
         status: { in: [...CLAIMABLE_STATUSES] },
@@ -136,11 +157,12 @@ function claimableWhere(options: {
   }
 }
 
-function claimUpdateWhere(row: IntegrationOutboxRow, now: Date): unknown {
+function claimUpdateWhere(row: IntegrationOutboxRow, now: Date, maxAttempts: number): unknown {
   if (row.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
     return {
       id: row.id,
       status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+      attempts: { lt: maxAttempts },
       lockedAt: row.lockedAt,
       lockedBy: row.lockedBy,
     }
@@ -149,6 +171,7 @@ function claimUpdateWhere(row: IntegrationOutboxRow, now: Date): unknown {
   return {
     id: row.id,
     status: { in: [...CLAIMABLE_STATUSES] },
+    attempts: { lt: maxAttempts },
     AND: [
       dueAtOrBefore(now),
       row.lockedAt ? { lockedAt: row.lockedAt } : { lockedAt: null },
@@ -160,13 +183,17 @@ function positiveLimit(limit: number | undefined): number {
   return Math.max(1, Math.floor(limit ?? DEFAULT_CLAIM_LIMIT))
 }
 
+function positiveMaxAttempts(maxAttempts: number | undefined): number {
+  return Math.max(1, Math.floor(maxAttempts ?? DEFAULT_INTEGRATION_OUTBOX_MAX_ATTEMPTS))
+}
+
 async function requireOutboxRow(client: IntegrationOutboxClient, id: string): Promise<IntegrationOutboxRow> {
   const row = await client.integrationOutbox.findUnique({ where: { id } })
   if (!row) throw new Error(`Integration outbox row ${id} was not found`)
   return row
 }
 
-function claimedBy(options: { id: string; workerId: string; lockedAt: Date }): unknown {
+function claimedBy(options: { id: string; workerId: string; lockedAt: Date }): Record<string, unknown> {
   return {
     id: options.id,
     status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
@@ -177,10 +204,10 @@ function claimedBy(options: { id: string; workerId: string; lockedAt: Date }): u
 
 async function updateClaimedOutboxRow(
   client: IntegrationOutboxClient,
-  options: { id: string; workerId: string; lockedAt: Date; data: unknown },
+  options: { id: string; workerId: string; lockedAt: Date; data: unknown; where?: Record<string, unknown> },
 ): Promise<IntegrationOutboxRow> {
   const result = await client.integrationOutbox.updateMany({
-    where: claimedBy(options),
+    where: { ...claimedBy(options), ...(options.where ?? {}) },
     data: options.data,
   })
   if (result.count === 0) {
@@ -225,12 +252,14 @@ export async function claimIntegrationOutboxWork(
   const client = getClient(options.client)
   const now = options.now ?? new Date()
   const staleLockMs = options.staleLockMs ?? DEFAULT_STALE_LOCK_MS
+  const maxAttempts = positiveMaxAttempts(options.maxAttempts)
   const candidates = await client.integrationOutbox.findMany({
     where: claimableWhere({
       connector: options.connector,
       operation: options.operation,
       now,
       staleLockMs,
+      maxAttempts,
     }),
     orderBy: { createdAt: 'asc' },
     take: positiveLimit(options.limit),
@@ -239,7 +268,7 @@ export async function claimIntegrationOutboxWork(
   const claimed: IntegrationOutboxRow[] = []
   for (const row of candidates) {
     const result = await client.integrationOutbox.updateMany({
-      where: claimUpdateWhere(row, now),
+      where: claimUpdateWhere(row, now, maxAttempts),
       data: {
         status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
         lockedAt: now,
@@ -282,16 +311,37 @@ export async function markIntegrationOutboxRetryableFailure(
 ): Promise<IntegrationOutboxRow> {
   const client = getClient(options.client)
   const now = options.now ?? new Date()
-  const row = await requireOutboxRow(client, options.id)
-  const attempts = row.attempts + 1
+  const maxAttempts = positiveMaxAttempts(options.maxAttempts)
+
+  try {
+    return await updateClaimedOutboxRow(client, {
+      id: options.id,
+      workerId: options.workerId,
+      lockedAt: options.lockedAt,
+      where: { attempts: { lt: maxAttempts - 1 } },
+      data: {
+        status: INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
+        attempts: { increment: 1 },
+        nextAttemptAt: new Date(now.getTime() + (options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS)),
+        lastError: truncateError(options.error),
+        lockedAt: null,
+        lockedBy: null,
+      },
+    })
+  } catch (error) {
+    if (!errorMessage(error).includes(`Integration outbox row ${options.id} is not claimed by ${options.workerId}`)) {
+      throw error
+    }
+  }
+
   return updateClaimedOutboxRow(client, {
     id: options.id,
     workerId: options.workerId,
     lockedAt: options.lockedAt,
     data: {
-      status: INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
-      attempts,
-      nextAttemptAt: new Date(now.getTime() + (options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS)),
+      status: INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
+      attempts: { increment: 1 },
+      nextAttemptAt: null,
       lastError: truncateError(options.error),
       lockedAt: null,
       lockedBy: null,
@@ -303,14 +353,13 @@ export async function markIntegrationOutboxPermanentFailure(
   options: MarkIntegrationOutboxFailureOptions,
 ): Promise<IntegrationOutboxRow> {
   const client = getClient(options.client)
-  const row = await requireOutboxRow(client, options.id)
   return updateClaimedOutboxRow(client, {
     id: options.id,
     workerId: options.workerId,
     lockedAt: options.lockedAt,
     data: {
       status: INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
-      attempts: row.attempts + 1,
+      attempts: { increment: 1 },
       nextAttemptAt: null,
       lastError: truncateError(options.error),
       lockedAt: null,
