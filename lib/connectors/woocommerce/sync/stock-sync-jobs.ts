@@ -4,6 +4,11 @@ import { COMPONENT_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { pushStockToWc } from './stock-sync'
 import type { StockSyncReason } from '@/app/generated/prisma/enums'
 import {
+  buildWcStockSyncOutboxPayload,
+  parseWcStockSyncPayload,
+  type WcStockSyncOutboxPayload,
+} from './stock-sync-job-payload'
+import {
   buildOutboxIdempotencyKey,
   claimIntegrationOutboxWork,
   enqueueIntegrationOutbox,
@@ -11,7 +16,6 @@ import {
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
   markIntegrationOutboxSuccess,
-  type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
 
 const WEBHOOK_ECHO_WINDOW_MS = 10 * 60 * 1000
@@ -22,20 +26,6 @@ const WC_STOCK_SYNC_RETRY_DELAY_BASE_MS = 5 * 60 * 1000
 const WC_STOCK_SYNC_RETRY_DELAY_MAX_STEPS = 12
 const immediateStockSyncProductIds = new Set<string>()
 let immediateStockSyncScheduled = false
-
-type WcStockSyncOutboxPayload = {
-  productId: string
-  reason: StockSyncReason
-  force: boolean
-  webhookQty: number | null
-}
-
-const WC_STOCK_SYNC_REASONS: StockSyncReason[] = [
-  'IMS_CHANGE',
-  'WC_WEBHOOK',
-  'DAILY_RECONCILIATION',
-  'MANUAL',
-]
 
 function nextTick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0))
@@ -64,30 +54,6 @@ function wcStockSyncIdempotencyKey(productId: string): string {
   return buildOutboxIdempotencyKey(WC_STOCK_SYNC_CONNECTOR, WC_STOCK_SYNC_OPERATION, productId)
 }
 
-function isStockSyncReason(value: unknown): value is StockSyncReason {
-  return typeof value === 'string' && WC_STOCK_SYNC_REASONS.includes(value as StockSyncReason)
-}
-
-function parseWcStockSyncPayload(row: IntegrationOutboxRow): WcStockSyncOutboxPayload {
-  const payload = row.payloadJson
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    throw new Error(`WooCommerce stock outbox payload for ${row.id} must be an object`)
-  }
-  const data = payload as Record<string, unknown>
-  if (typeof data.productId !== 'string' || !data.productId.trim()) {
-    throw new Error(`WooCommerce stock outbox payload for ${row.id} is missing productId`)
-  }
-  if (!isStockSyncReason(data.reason)) {
-    throw new Error(`WooCommerce stock outbox payload for ${row.id} has invalid reason`)
-  }
-  return {
-    productId: data.productId,
-    reason: data.reason,
-    force: data.force === true,
-    webhookQty: typeof data.webhookQty === 'number' ? data.webhookQty : null,
-  }
-}
-
 function retryDelayMs(attemptsBeforeFailure: number): number {
   return Math.min(attemptsBeforeFailure + 1, WC_STOCK_SYNC_RETRY_DELAY_MAX_STEPS) * WC_STOCK_SYNC_RETRY_DELAY_BASE_MS
 }
@@ -101,19 +67,15 @@ export async function enqueueWcStockSyncJobs(
   const now = new Date()
 
   for (const productId of scope) {
-    const payload: WcStockSyncOutboxPayload = {
-      productId,
-      reason,
-      force: options?.force ?? false,
-      webhookQty: options?.webhookQty ?? null,
-    }
+    const incomingPayload = buildWcStockSyncOutboxPayload(productId, reason, options)
     const row = await enqueueIntegrationOutbox({
       connector: WC_STOCK_SYNC_CONNECTOR,
       operation: WC_STOCK_SYNC_OPERATION,
       idempotencyKey: wcStockSyncIdempotencyKey(productId),
-      payloadJson: payload,
+      payloadJson: incomingPayload,
       nextAttemptAt: now,
     })
+    const payload = buildWcStockSyncOutboxPayload(productId, reason, options, row.payloadJson)
     await db.integrationOutbox.updateMany({
       where: {
         id: row.id,
