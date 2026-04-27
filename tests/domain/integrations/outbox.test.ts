@@ -14,25 +14,25 @@ import {
 } from '@/lib/domain/integrations/outbox'
 
 type FindManyArgs = {
-  where?: {
-    connector?: string
-    operation?: string
-    status?: { in?: string[] }
-  }
+  where?: MockWhere
   take?: number
 }
 
 type UpdateManyArgs = {
-  where?: {
-    id?: string
-    status?: { in?: string[] }
-  }
+  where?: MockWhere
   data?: Partial<IntegrationOutboxRow>
 }
 
-type UpdateArgs = {
-  where: { id: string }
-  data: Partial<IntegrationOutboxRow>
+type MockWhere = {
+  id?: string
+  connector?: string
+  operation?: string
+  status?: string | { in?: string[] }
+  lockedAt?: Date | null | { lt?: Date }
+  lockedBy?: string
+  nextAttemptAt?: null | { lte?: Date }
+  AND?: MockWhere[]
+  OR?: MockWhere[]
 }
 
 type CreateArgs = {
@@ -80,25 +80,26 @@ function makeClient(initialRows: IntegrationOutboxRow[] = []) {
     return null
   }
 
-  function nextAttemptIsDue(row: IntegrationOutboxRow): boolean {
-    return row.nextAttemptAt === null || row.nextAttemptAt <= new Date('2026-04-27T10:00:00.000Z')
-  }
-
-  function lockIsAvailable(row: IntegrationOutboxRow): boolean {
-    return row.lockedAt === null || row.lockedAt < new Date('2026-04-27T09:50:00.000Z')
-  }
-
-  function matchesFindMany(row: IntegrationOutboxRow, args: FindManyArgs): boolean {
-    if (args.where?.connector && row.connector !== args.where.connector) return false
-    if (args.where?.operation && row.operation !== args.where.operation) return false
-    if (args.where?.status?.in && !args.where.status.in.includes(row.status)) return false
-    return nextAttemptIsDue(row) && lockIsAvailable(row)
-  }
-
-  function matchesUpdateMany(row: IntegrationOutboxRow, args: UpdateManyArgs): boolean {
-    if (args.where?.id && row.id !== args.where.id) return false
-    if (args.where?.status?.in && !args.where.status.in.includes(row.status)) return false
-    return nextAttemptIsDue(row)
+  function matchesWhere(row: IntegrationOutboxRow, where: MockWhere | undefined): boolean {
+    if (!where) return true
+    if (where.AND?.some((branch) => !matchesWhere(row, branch))) return false
+    if (where.OR && !where.OR.some((branch) => matchesWhere(row, branch))) return false
+    if (where.id && row.id !== where.id) return false
+    if (where.connector && row.connector !== where.connector) return false
+    if (where.operation && row.operation !== where.operation) return false
+    if (typeof where.status === 'string' && row.status !== where.status) return false
+    if (typeof where.status === 'object' && where.status.in && !where.status.in.includes(row.status)) return false
+    if (where.lockedBy && row.lockedBy !== where.lockedBy) return false
+    if (where.lockedAt === null && row.lockedAt !== null) return false
+    if (where.lockedAt instanceof Date && row.lockedAt?.getTime() !== where.lockedAt.getTime()) return false
+    if (typeof where.lockedAt === 'object' && !(where.lockedAt instanceof Date) && where.lockedAt?.lt) {
+      if (row.lockedAt === null || row.lockedAt >= where.lockedAt.lt) return false
+    }
+    if (where.nextAttemptAt === null && row.nextAttemptAt !== null) return false
+    if (typeof where.nextAttemptAt === 'object' && where.nextAttemptAt?.lte) {
+      if (row.nextAttemptAt === null || row.nextAttemptAt > where.nextAttemptAt.lte) return false
+    }
+    return true
   }
 
   function updateRow(row: IntegrationOutboxRow, data: Partial<IntegrationOutboxRow>): IntegrationOutboxRow {
@@ -131,19 +132,13 @@ function makeClient(initialRows: IntegrationOutboxRow[] = []) {
       async findMany(args: unknown) {
         const typedArgs = args as FindManyArgs
         return rows
-          .filter((row) => matchesFindMany(row, typedArgs))
+          .filter((row) => matchesWhere(row, typedArgs.where))
           .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime())
           .slice(0, typedArgs.take)
       },
-      async update(args: unknown) {
-        const typedArgs = args as UpdateArgs
-        const row = findByWhere(typedArgs.where)
-        if (!row) throw new Error(`missing row ${typedArgs.where.id}`)
-        return updateRow(row, typedArgs.data)
-      },
       async updateMany(args: unknown) {
         const typedArgs = args as UpdateManyArgs
-        const matched = rows.filter((row) => matchesUpdateMany(row, typedArgs))
+        const matched = rows.filter((row) => matchesWhere(row, typedArgs.where))
         for (const row of matched) updateRow(row, typedArgs.data ?? {})
         return { count: matched.length }
       },
@@ -238,6 +233,8 @@ test('integration outbox failure helpers schedule retry or permanent failure', a
   const retry = await markIntegrationOutboxRetryableFailure({
     client,
     id: 'job-1',
+    workerId: 'worker-1',
+    lockedAt: now,
     error: new Error('temporary connector outage'),
     now,
     retryDelayMs: 60_000,
@@ -245,6 +242,8 @@ test('integration outbox failure helpers schedule retry or permanent failure', a
   const permanent = await markIntegrationOutboxPermanentFailure({
     client,
     id: 'job-2',
+    workerId: 'worker-1',
+    lockedAt: now,
     error: 'invalid payload',
     now,
   })
@@ -277,11 +276,53 @@ test('integration outbox success clears claim state', async () => {
     }),
   ])
 
-  const success = await markIntegrationOutboxSuccess({ client, id: 'job-1' })
+  const success = await markIntegrationOutboxSuccess({
+    client,
+    id: 'job-1',
+    workerId: 'worker-1',
+    lockedAt: now,
+  })
 
   assert.equal(success.status, INTEGRATION_OUTBOX_STATUS.SUCCEEDED)
   assert.equal(success.nextAttemptAt, null)
   assert.equal(success.lastError, null)
   assert.equal(success.lockedAt, null)
   assert.equal(success.lockedBy, null)
+})
+
+test('integration outbox completion rejects stale worker claims after reclaim', async () => {
+  const workerOneLock = new Date('2026-04-27T09:45:00.000Z')
+  const workerTwoLock = new Date('2026-04-27T10:00:00.000Z')
+  const { client, rows } = makeClient([
+    makeRow({
+      id: 'job-1',
+      status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+      lockedAt: workerOneLock,
+      lockedBy: 'worker-1',
+    }),
+  ])
+
+  const reclaimed = await claimIntegrationOutboxWork({
+    client,
+    connector: 'woocommerce',
+    limit: 1,
+    workerId: 'worker-2',
+    now: workerTwoLock,
+    staleLockMs: 10 * 60 * 1000,
+  })
+
+  assert.deepEqual(reclaimed.map((row) => row.id), ['job-1'])
+  await assert.rejects(
+    () => markIntegrationOutboxSuccess({
+      client,
+      id: 'job-1',
+      workerId: 'worker-1',
+      lockedAt: workerOneLock,
+    }),
+    /not claimed by worker-1/,
+  )
+
+  assert.equal(rows[0].status, INTEGRATION_OUTBOX_STATUS.PROCESSING)
+  assert.equal(rows[0].lockedBy, 'worker-2')
+  assert.deepEqual(rows[0].lockedAt, workerTwoLock)
 })
