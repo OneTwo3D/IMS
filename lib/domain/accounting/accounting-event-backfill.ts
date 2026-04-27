@@ -66,7 +66,6 @@ export type RunAccountingEventBackfillOptions = {
 }
 
 const DEFAULT_BACKFILL_LIMIT = 100
-const EXTERNAL_ID_REQUIRED_STATUSES = new Set(['POSTED', 'FAILED'])
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -219,11 +218,11 @@ export async function runAccountingEventBackfill(
       continue
     }
 
-    if (EXTERNAL_ID_REQUIRED_STATUSES.has(draft.status) && !draft.externalId?.trim()) {
+    if (draft.status === 'POSTED' && !draft.externalId?.trim()) {
       results.push({
         ...syncLogResultBase(log),
         action: 'skipped',
-        reason: `${draft.status.toLowerCase()}_sync_log_missing_external_transaction_id`,
+        reason: 'posted_sync_log_missing_external_transaction_id',
         idempotencyKey: draft.idempotencyKey,
       })
       continue

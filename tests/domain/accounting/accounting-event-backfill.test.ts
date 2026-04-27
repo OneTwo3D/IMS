@@ -247,7 +247,7 @@ test('accounting event backfill skips posted sync logs without external transact
   assert.equal(result.idempotencyKey, 'accounting-sync:xero:daily_batch_revenue_deferral:daily-batch:a1:2026-04-26')
 })
 
-test('accounting event backfill skips failed sync logs without external transaction ids', async () => {
+test('accounting event backfill creates failed sync logs without external transaction ids', async () => {
   const { client, createdEvents, createdLogs } = makeClient({
     syncLogs: [
       syncedJournalLog({
@@ -260,11 +260,13 @@ test('accounting event backfill skips failed sync logs without external transact
 
   const report = await runTestBackfill({ client: client as never, dryRun: false })
 
-  assert.equal(createdEvents.length, 0)
-  assert.equal(createdLogs.length, 0)
+  assert.equal(createdEvents.length, 1)
+  assert.equal(createdLogs.length, 1)
   const result = resultBySyncLog(report, 'sync-failed-missing-external')
-  assert.equal(result.action, 'skipped')
-  assert.equal(result.reason, 'failed_sync_log_missing_external_transaction_id')
+  assert.equal(result.action, 'created')
+  assert.equal(result.reason, 'created_missing_mirror')
+  assert.equal((createdEvents[0] as { data: EventRow }).data.status, 'FAILED')
+  assert.equal((createdEvents[0] as { data: EventRow }).data.externalId, null)
 })
 
 test('accounting event backfill only treats idempotency key conflicts as already mirrored', async () => {
