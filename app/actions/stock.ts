@@ -13,6 +13,14 @@ import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalan
 import type { Prisma } from '@/app/generated/prisma/client'
 import { consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost } from '@/lib/cost-layers'
 import { multiplyMoney, roundQuantity } from '@/lib/domain/math/decimal'
+import {
+  buildStockLevelMap,
+  isEmptyStockLevelMapScope,
+  normalizeStockLevelMapScope,
+  type StockLevelEntry,
+  type StockLevelMap,
+  type StockLevelMapScope,
+} from '@/lib/domain/inventory/stock-level-map'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -898,21 +906,26 @@ export async function getWarehouses() {
 // Stock level map (productId → warehouseId → quantity)
 // ---------------------------------------------------------------------------
 
-export type StockLevelEntry = { total: number; available: number }
+export type { StockLevelEntry, StockLevelMap, StockLevelMapScope }
 
-export async function getStockLevelMap(): Promise<Record<string, Record<string, StockLevelEntry>>> {
+export async function getScopedStockLevelMap(scope: StockLevelMapScope = {}): Promise<StockLevelMap> {
   await requireAuth()
+  if (isEmptyStockLevelMapScope(scope)) return {}
+
+  const normalized = normalizeStockLevelMapScope(scope)
+  const where: Prisma.StockLevelWhereInput = {}
+  if (normalized.productIds) where.productId = { in: normalized.productIds }
+  if (normalized.warehouseIds) where.warehouseId = { in: normalized.warehouseIds }
+  if (normalized.updatedSince) where.updatedAt = { gte: normalized.updatedSince }
+
   const levels = await db.stockLevel.findMany({
+    where,
     select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
+    orderBy: [{ productId: 'asc' }, { warehouseId: 'asc' }],
+    skip: normalized.skip,
+    take: normalized.take,
   })
-  const map: Record<string, Record<string, StockLevelEntry>> = {}
-  for (const l of levels) {
-    if (!map[l.productId]) map[l.productId] = {}
-    const total = Number(l.quantity)
-    const reserved = Number(l.reservedQty)
-    map[l.productId][l.warehouseId] = { total, available: total - reserved }
-  }
-  return map
+  return buildStockLevelMap(levels)
 }
 
 /** Avg COGS per product from FIFO cost layers (weighted avg of remaining stock) */
