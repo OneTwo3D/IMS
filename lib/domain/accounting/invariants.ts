@@ -521,7 +521,15 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
 
 function monthsAgo(now: Date, months: number): Date {
   const date = new Date(now)
+  const targetDay = date.getUTCDate()
+  date.setUTCDate(1)
   date.setUTCMonth(date.getUTCMonth() - months)
+  const lastTargetMonthDay = new Date(Date.UTC(
+    date.getUTCFullYear(),
+    date.getUTCMonth() + 1,
+    0,
+  )).getUTCDate()
+  date.setUTCDate(Math.min(targetDay, lastTargetMonthDay))
   return date
 }
 
