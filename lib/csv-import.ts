@@ -1,12 +1,25 @@
 export type CsvImportMode = 'preview' | 'execute'
 
-export type CsvImportPreviewResult = {
-  preview: true
-  totalRows: number
+export type ImportWarning = string
+export type ImportError = string
+
+export type ImportChangeSummary = {
   created: number
   updated: number
-  errorCount: number
-  errors: string[]
+  skipped: number
+}
+
+export type ImportDryRunResult = {
+  dryRun: true
+  validRows: number
+  invalidRows: number
+  warnings: ImportWarning[]
+  errors: ImportError[]
+  proposedChanges: ImportChangeSummary
+}
+
+export type CsvImportPreviewResult = ImportDryRunResult & {
+  preview: true
   error?: string
 }
 
@@ -27,11 +40,40 @@ export type CsvImportActionResult = CsvImportPreviewResult | CsvImportExecutionR
 export type CsvImportAction = (formData: FormData) => Promise<CsvImportActionResult>
 
 export function getCsvImportMode(formData: FormData): CsvImportMode {
-  return formData.get('mode') === 'preview' ? 'preview' : 'execute'
+  const mode = formData.get('mode')
+  if (mode === 'preview' || mode === 'dry-run' || mode === 'dryRun') return 'preview'
+  if (formData.get('dryRun') === 'true') return 'preview'
+  return 'execute'
+}
+
+export function isCsvImportDryRunMode(mode: CsvImportMode): boolean {
+  return mode === 'preview'
 }
 
 export function isCsvImportPreviewResult(result: CsvImportActionResult): result is CsvImportPreviewResult {
   return result.preview === true
+}
+
+export function createImportDryRunResult(args: {
+  totalRows: number
+  created: number
+  updated: number
+  errorCount: number
+  errors: string[]
+  warnings?: string[]
+}): ImportDryRunResult {
+  return {
+    dryRun: true,
+    validRows: Math.max(0, args.totalRows - args.errorCount),
+    invalidRows: args.errorCount,
+    warnings: args.warnings ?? [],
+    errors: args.errors,
+    proposedChanges: {
+      created: args.created,
+      updated: args.updated,
+      skipped: args.errorCount,
+    },
+  }
 }
 
 export function createCsvImportPreviewResult(args: {
@@ -40,15 +82,12 @@ export function createCsvImportPreviewResult(args: {
   updated: number
   errorCount: number
   errors: string[]
+  warnings?: string[]
   error?: string
 }): CsvImportPreviewResult {
   return {
+    ...createImportDryRunResult(args),
     preview: true,
-    totalRows: args.totalRows,
-    created: args.created,
-    updated: args.updated,
-    errorCount: args.errorCount,
-    errors: args.errors,
     error: args.error,
   }
 }
@@ -75,4 +114,12 @@ export function createCsvImportExecutionResult(args: {
     error: args.error,
     message: args.message,
   }
+}
+
+export async function runCsvImportMutation<T>(
+  mode: CsvImportMode,
+  mutation: () => Promise<T>,
+): Promise<T | null> {
+  if (isCsvImportDryRunMode(mode)) return null
+  return await mutation()
 }
