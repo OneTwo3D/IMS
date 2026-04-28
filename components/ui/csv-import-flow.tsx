@@ -137,9 +137,9 @@ export function CsvImportFlow({ action, onDone, children }: Props) {
         setResultFileName(fileName)
         setResult(isCsvImportPreviewResult(response)
           ? createCsvImportExecutionResult({
-              created: response.created,
-              updated: response.updated,
-              skipped: response.errorCount,
+              created: response.proposedChanges.created,
+              updated: response.proposedChanges.updated,
+              skipped: response.proposedChanges.skipped,
               errors: response.errors,
               error: response.error,
               success: false,
@@ -163,7 +163,8 @@ export function CsvImportFlow({ action, onDone, children }: Props) {
     })
   }
 
-  const validRows = (preview?.created ?? 0) + (preview?.updated ?? 0)
+  const validRows = preview?.validRows ?? 0
+  const totalRows = (preview?.validRows ?? 0) + (preview?.invalidRows ?? 0)
   const resultErrorCount = result?.errors.length ?? 0
   const resultTitle = result?.error && !result?.count
     ? 'Import Failed'
@@ -196,13 +197,13 @@ export function CsvImportFlow({ action, onDone, children }: Props) {
 
           <div className="space-y-4">
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
-              <StatCard label="CSV Records" value={preview?.totalRows ?? 0} />
-              <StatCard label="Will Create" value={preview?.created ?? 0} tone="success" />
-              <StatCard label="Will Update" value={preview?.updated ?? 0} />
-              <StatCard label="Errors" value={preview?.errorCount ?? 0} tone="warning" />
+              <StatCard label="CSV Records" value={totalRows} />
+              <StatCard label="Will Create" value={preview?.proposedChanges.created ?? 0} tone="success" />
+              <StatCard label="Will Update" value={preview?.proposedChanges.updated ?? 0} />
+              <StatCard label="Errors" value={preview?.invalidRows ?? 0} tone="warning" />
             </div>
 
-            {preview?.errors.length ? (
+            {preview?.errors.length || preview?.warnings.length ? (
               <div className="space-y-2">
                 <div className="flex items-center gap-2 text-sm font-medium text-orange-700">
                   <AlertTriangle className="h-4 w-4" />
@@ -210,8 +211,11 @@ export function CsvImportFlow({ action, onDone, children }: Props) {
                 </div>
                 <div className="max-h-64 overflow-y-auto rounded-lg border border-orange-200 bg-orange-50/60 p-3">
                   <ul className="space-y-1 text-sm text-orange-900">
+                    {preview.warnings.map((entry, index) => (
+                      <li key={`warning-${index}-${entry}`}>{entry}</li>
+                    ))}
                     {preview.errors.map((entry, index) => (
-                      <li key={`${index}-${entry}`}>{entry}</li>
+                      <li key={`error-${index}-${entry}`}>{entry}</li>
                     ))}
                   </ul>
                 </div>

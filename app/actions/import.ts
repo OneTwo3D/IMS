@@ -16,6 +16,7 @@ import {
   createCsvImportExecutionResult,
   createCsvImportPreviewResult,
   getCsvImportMode,
+  isCsvImportDryRunMode,
   type CsvImportActionResult,
   type CsvImportExecutionResult,
 } from '@/lib/csv-import'
@@ -192,7 +193,7 @@ function scheduleProductImportShoppingSync(
 
 export async function importProductsCsv(formData: FormData): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
-  const preview = mode === 'preview'
+  const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'inventory.edit')
   if ('error' in validated) {
     const result = { created: 0, updated: 0, skipped: 0, errors: [validated.error] }

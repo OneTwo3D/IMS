@@ -11,6 +11,7 @@ import {
   createCsvImportExecutionResult,
   createCsvImportPreviewResult,
   getCsvImportMode,
+  isCsvImportDryRunMode,
   type CsvImportActionResult,
 } from '@/lib/csv-import'
 
@@ -307,7 +308,7 @@ export async function updateCustomer(id: string, input: Partial<CustomerInput> &
 
 export async function importContactsCsv(formData: FormData): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
-  const preview = mode === 'preview'
+  const preview = isCsvImportDryRunMode(mode)
   await requirePermission('sales.create')
   try {
     const file = formData.get('file') as File

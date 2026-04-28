@@ -11,6 +11,7 @@ import {
   createCsvImportExecutionResult,
   createCsvImportPreviewResult,
   getCsvImportMode,
+  isCsvImportDryRunMode,
   type CsvImportActionResult,
 } from '@/lib/csv-import'
 
@@ -274,7 +275,7 @@ export async function updateSupplier(id: string, input: Partial<SupplierInput> &
 
 export async function importSuppliersCsv(formData: FormData): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
-  const preview = mode === 'preview'
+  const preview = isCsvImportDryRunMode(mode)
   await requirePermission('purchasing.create')
   try {
     const baseCurrency = await getBaseCurrencyCode()
