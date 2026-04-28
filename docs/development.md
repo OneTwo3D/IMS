@@ -49,6 +49,27 @@ The repo now enforces six rules:
 - `node scripts/check-prisma-drift.mjs`
   Runs `prisma migrate diff` against the configured datasource, suppresses only explicitly allowlisted unsupported differences, and prints the full drift when validation fails.
 
+## Auth Rate Limiting
+
+Login, TOTP verification, and supplier quote throttling use the shared rate-limit backend in `lib/security/rate-limit.ts`.
+
+Local and single-process installs default to the in-memory backend:
+
+```env
+RATE_LIMIT_BACKEND=memory
+```
+
+Clustered deployments can use Redis without adding application code changes:
+
+```env
+RATE_LIMIT_BACKEND=redis
+REDIS_URL=redis://localhost:6379/0
+```
+
+When Redis is selected, `REDIS_URL` must be configured. The Redis backend uses a single atomic sorted-set script for check-and-record decisions and clears buckets on successful authentication just like the memory backend.
+
+If the configured backend fails, auth throttling fails open and writes a warning activity log. This keeps login and TOTP available during Redis outages while making the degraded protection visible to operators.
+
 ## Allowlisted Unsupported Features
 
 `prisma/unsupported-schema-drift-allowlist.json` must stay small and intentional.

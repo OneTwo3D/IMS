@@ -253,7 +253,7 @@ export async function submitSupplierQuote(
   try {
     const ctx = await requireSupplier()
     if (!ctx) return { success: false, error: 'Unauthorized' }
-    const rl = checkRateLimit(`supplier-quote:${ctx.supplierId}`, 20, 5 * 60_000)
+    const rl = await checkRateLimit(`supplier-quote:${ctx.supplierId}`, 20, 5 * 60_000)
     if (!rl.allowed) return { success: false, error: `Too many quote updates. Try again in ${rl.retryAfterSec}s.` }
 
     const parsed = supplierQuoteSchema.safeParse(data)

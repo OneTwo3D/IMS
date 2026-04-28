@@ -104,7 +104,7 @@ export const authConfig: NextAuthConfig = {
         }
 
         const rlKey = `login:${parsed.data.email.toLowerCase()}:${clientIp}`
-        const rl = checkRateLimit(rlKey, 10, 15 * 60_000)
+        const rl = await checkRateLimit(rlKey, 10, 15 * 60_000)
         if (!rl.allowed) return null
 
         const user = await db.user.findUnique({
@@ -129,7 +129,7 @@ export const authConfig: NextAuthConfig = {
         )
         if (!user || !user.active || !passwordMatch) return null
 
-        clearRateLimit(rlKey)
+        await clearRateLimit(rlKey)
 
         return {
           id: user.id,
