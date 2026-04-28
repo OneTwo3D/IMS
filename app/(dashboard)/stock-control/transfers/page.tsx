@@ -13,12 +13,18 @@ export default async function WarehouseTransfersPage() {
     listProducts({ active: 'true', type: 'ALL', pageSize: 1000 }),
     getTransfers(),
   ])
-  const stockable = products.filter(
-    (p) => p.type !== 'VARIABLE' && p.type !== 'NON_INVENTORY' && p.type !== 'KIT'
+  const isStockableProduct = (product: { type: string }) => (
+    product.type !== 'VARIABLE' && product.type !== 'NON_INVENTORY' && product.type !== 'KIT'
   )
+  const stockable = products.filter(isStockableProduct)
+  const productById = new Map(products.map((product) => [product.id, product]))
   const stockProductIds = Array.from(new Set([
     ...stockable.map((product) => product.id),
-    ...transfers.flatMap((transfer) => transfer.lines.map((line) => line.productId)),
+    ...transfers.flatMap((transfer) => transfer.lines.map((line) => line.productId))
+      .filter((productId) => {
+        const product = productById.get(productId)
+        return !product || isStockableProduct(product)
+      }),
   ]))
   const [mintsoftAsnStates, stockLevels] = await Promise.all([
     getMintsoftTransferAsnStates(transfers.map((transfer) => transfer.id)),

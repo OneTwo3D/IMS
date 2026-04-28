@@ -1,11 +1,14 @@
+import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
+import { roundQuantity, subtractMoney } from '@/lib/domain/math/decimal'
+
 export type StockLevelEntry = { total: number; available: number }
 export type StockLevelMap = Record<string, Record<string, StockLevelEntry>>
 
 export type StockLevelMapRow = {
   productId: string
   warehouseId: string
-  quantity: unknown
-  reservedQty: unknown
+  quantity: DecimalLike
+  reservedQty: DecimalLike
   updatedAt?: Date | string | null
 }
 
@@ -52,9 +55,12 @@ export function buildStockLevelMap(rows: readonly StockLevelMapRow[]): StockLeve
   const map: StockLevelMap = {}
   for (const row of rows) {
     if (!map[row.productId]) map[row.productId] = {}
-    const total = Number(row.quantity)
-    const reserved = Number(row.reservedQty)
-    map[row.productId][row.warehouseId] = { total, available: total - reserved }
+    const total = decimalToNumber(row.quantity)
+    const reserved = decimalToNumber(row.reservedQty)
+    map[row.productId][row.warehouseId] = {
+      total,
+      available: roundQuantity(subtractMoney(total, reserved), 4).toNumber(),
+    }
   }
   return map
 }
