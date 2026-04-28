@@ -137,7 +137,7 @@ test('retrospective layer adjustment excludes customer and supplier returns from
 })
 
 test('landed-cost adjustment idempotency key ignores wall-clock journal date', () => {
-  const adj = { primaryPoId: 'po-1', primaryPoRef: 'PO-1', totalDelta: 12.345 }
+  const adj = { primaryPoId: 'po-1', primaryPoRef: 'PO-1', eventKey: 'event-a', totalDelta: 12.345 }
 
   assert.equal(
     landedCostAdjustmentIdempotencyKey('inventory', adj),
@@ -146,6 +146,15 @@ test('landed-cost adjustment idempotency key ignores wall-clock journal date', (
   assert.notEqual(
     landedCostAdjustmentIdempotencyKey('inventory', adj),
     landedCostAdjustmentIdempotencyKey('cogs', adj),
+  )
+})
+
+test('landed-cost adjustment idempotency key includes recalculation context', () => {
+  const adj = { primaryPoId: 'po-1', primaryPoRef: 'PO-1', eventKey: 'event-a', totalDelta: 10 }
+
+  assert.notEqual(
+    landedCostAdjustmentIdempotencyKey('inventory', adj),
+    landedCostAdjustmentIdempotencyKey('inventory', { ...adj, eventKey: 'event-b' }),
   )
 })
 
@@ -271,6 +280,51 @@ test('recalculateDirectLandedCosts falls back to equal split when every BY_WEIGH
     [
       { id: 'line-a', landedUnitCostBase: 17.5 },
       { id: 'line-b', landedUnitCostBase: 35 },
+    ],
+  )
+})
+
+test('recalculateDirectLandedCosts combines direct and linked landed-cost lines', async () => {
+  const { tx, purchaseOrderLineUpdates } = createDirectTx({
+    id: 'po-1',
+    reference: 'PO-1',
+    status: 'RECEIVED',
+    lines: [
+      {
+        id: 'line-a',
+        qty: 2,
+        unitCostBase: 10,
+        totalBase: 20,
+        product: { weight: 2 },
+        costLayers: [{ id: 'layer-a', unitCostBase: 10, receivedQty: 2, remainingQty: 2 }],
+      },
+      {
+        id: 'line-b',
+        qty: 1,
+        unitCostBase: 20,
+        totalBase: 20,
+        product: { weight: 1 },
+        costLayers: [{ id: 'layer-b', unitCostBase: 20, receivedQty: 1, remainingQty: 1 }],
+      },
+    ],
+    freightCostLines: [{ amountBase: 30, distributionMethod: 'BY_QUANTITY' }],
+    landedCostLinks: [{
+      freightPO: {
+        freightCostLines: [{ amountBase: 40, distributionMethod: 'BY_VALUE' }],
+      },
+    }],
+  })
+
+  await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps())
+
+  assert.deepEqual(
+    purchaseOrderLineUpdates.map((entry) => ({
+      id: (entry as { where: { id: string } }).where.id,
+      landedUnitCostBase: (entry as { data: { landedUnitCostBase: { toNumber(): number } } }).data.landedUnitCostBase.toNumber(),
+    })),
+    [
+      { id: 'line-a', landedUnitCostBase: 30 },
+      { id: 'line-b', landedUnitCostBase: 50 },
     ],
   )
 })

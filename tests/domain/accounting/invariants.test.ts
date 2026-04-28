@@ -49,6 +49,7 @@ function cleanRows(): AccountingInvariantRows {
       order: {
         id: 'order-1',
         orderNumber: 'SO-1',
+        status: 'SHIPPED',
         revenueDeferredDate: A1_DATE,
         inventoryAllocatedDate: A2_DATE,
       },
@@ -144,7 +145,30 @@ test('posted shipments require live Group B sync evidence and batch amounts', ()
   const codes = evaluateAccountingInvariantRows(rows).map((finding) => finding.code)
 
   assert.ok(codes.includes('shipment_posted_without_sync_evidence'))
-  assert.ok(codes.includes('shipment_posted_missing_batch_amounts'))
+  assert.ok(codes.includes('shipment_posted_missing_revenue_amount'))
+  assert.ok(codes.includes('shipment_posted_missing_cogs_amount'))
+})
+
+test('posted shipment amount checks report revenue and COGS gaps independently', () => {
+  const revenueOnly = cleanRows()
+  revenueOnly.postedShipments[0] = {
+    ...revenueOnly.postedShipments[0],
+    cogsBatchAmount: null,
+  }
+  const revenueOnlyCodes = evaluateAccountingInvariantRows(revenueOnly).map((finding) => finding.code)
+
+  assert.equal(revenueOnlyCodes.includes('shipment_posted_missing_revenue_amount'), false)
+  assert.ok(revenueOnlyCodes.includes('shipment_posted_missing_cogs_amount'))
+
+  const cogsOnly = cleanRows()
+  cogsOnly.postedShipments[0] = {
+    ...cogsOnly.postedShipments[0],
+    revenueRecognizedAmount: null,
+  }
+  const cogsOnlyCodes = evaluateAccountingInvariantRows(cogsOnly).map((finding) => finding.code)
+
+  assert.ok(cogsOnlyCodes.includes('shipment_posted_missing_revenue_amount'))
+  assert.equal(cogsOnlyCodes.includes('shipment_posted_missing_cogs_amount'), false)
 })
 
 test('A1 and A2 stages require live daily batch sync evidence', () => {
@@ -388,13 +412,31 @@ test('accounting row collection selects staged orders, posted shipments, and syn
     },
   }
 
-  await collectAccountingInvariantRows(client)
+  const now = new Date('2026-07-01T00:00:00.000Z')
+  await collectAccountingInvariantRows(client, { now, syncLogRetentionMonths: 6 })
 
   assert.ok(calls.salesOrder)
   assert.ok(calls.shipment)
   assert.ok(calls.accountingSyncLog)
   assert.deepEqual(
+    (calls.salesOrder as { where: { status: unknown } }).where.status,
+    { notIn: ['REFUNDED', 'CANCELLED'] },
+  )
+  assert.deepEqual(
     (calls.shipment as { where: unknown }).where,
-    { shipmentJournalDate: { not: null } },
+    {
+      shipmentJournalDate: { gte: new Date('2026-01-01T00:00:00.000Z') },
+      order: { status: { notIn: ['REFUNDED', 'CANCELLED'] } },
+    },
+  )
+  assert.deepEqual(
+    (calls.accountingSyncLog as { where: unknown }).where,
+    {
+      createdAt: { gte: new Date('2026-01-01T00:00:00.000Z') },
+      OR: [
+        { status: 'FAILED' },
+        { status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] } },
+      ],
+    },
   )
 })

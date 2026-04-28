@@ -64,6 +64,7 @@ type ShipmentAccountingRow = {
   order: {
     id: string
     orderNumber: string | null
+    status: string
     revenueDeferredDate: Date | string | null
     inventoryAllocatedDate: Date | string | null
   }
@@ -100,6 +101,9 @@ type AccountingInvariantClient = {
   accountingSyncLog: {
     findMany(args: unknown): Promise<AccountingSyncLogRow[]>
   }
+  setting?: {
+    findUnique(args: unknown): Promise<{ value: string } | null>
+  }
 }
 
 const LIVE_SYNC_STATUSES = new Set(['PENDING', 'PROCESSING', 'SYNCED'])
@@ -113,6 +117,8 @@ const REFUND_REVERSAL_TYPES = new Set([
   'COGS_REVERSAL',
   'UNEARNED_REV_REVERSAL',
 ])
+const DEFAULT_SYNC_LOG_RETENTION_MONTHS = 6
+const TERMINAL_SALES_ORDER_STATUSES = ['REFUNDED', 'CANCELLED'] as const
 
 function dateKey(value: Date | string | null | undefined): string | null {
   if (!value) return null
@@ -154,18 +160,30 @@ function buildSummary(findings: AccountingInvariantFinding[]): AccountingInvaria
   )
 }
 
+function liveSyncLogIndexKey(type: string, referenceId: string, referenceType: string): string {
+  return `${type}\u0000${referenceType}\u0000${referenceId}`
+}
+
+function buildLiveSyncLogIndex(syncLogs: AccountingSyncLogRow[]): Set<string> {
+  const index = new Set<string>()
+  for (const log of syncLogs) {
+    if (!LIVE_SYNC_STATUSES.has(log.status)) continue
+    index.add(liveSyncLogIndexKey(log.type, log.referenceId, log.referenceType))
+  }
+  return index
+}
+
 function hasLiveSyncLog(
-  syncLogs: AccountingSyncLogRow[],
+  syncLogIndex: Set<string>,
   type: string,
   referenceId: string,
   referenceType?: string,
 ): boolean {
-  return syncLogs.some((log) => (
-    log.type === type &&
-    log.referenceId === referenceId &&
-    (referenceType == null || log.referenceType === referenceType) &&
-    LIVE_SYNC_STATUSES.has(log.status)
-  ))
+  if (referenceType) return syncLogIndex.has(liveSyncLogIndexKey(type, referenceId, referenceType))
+  for (const key of syncLogIndex) {
+    if (key.startsWith(`${type}\u0000`) && key.endsWith(`\u0000${referenceId}`)) return true
+  }
+  return false
 }
 
 function expectedDailyBatchReference(prefix: 'A1' | 'A2' | 'B', stagedAt: Date | string | null): string | null {
@@ -175,11 +193,12 @@ function expectedDailyBatchReference(prefix: 'A1' | 'A2' | 'B', stagedAt: Date |
 
 export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): AccountingInvariantFinding[] {
   const findings: AccountingInvariantFinding[] = []
+  const syncLogIndex = buildLiveSyncLogIndex(rows.syncLogs)
 
   for (const shipment of rows.postedShipments) {
     const expectedReferenceId = expectedDailyBatchReference('B', shipment.shipmentJournalDate)
     const hasSyncEvidence = expectedReferenceId
-      ? hasLiveSyncLog(rows.syncLogs, 'DAILY_BATCH_GROUP_B', expectedReferenceId, 'DailyBatch')
+      ? hasLiveSyncLog(syncLogIndex, 'DAILY_BATCH_GROUP_B', expectedReferenceId, 'DailyBatch')
       : false
 
     if (!hasSyncEvidence) {
@@ -198,15 +217,27 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
       })
     }
 
-    if (decimalToNumber(shipment.revenueRecognizedAmount) <= 0 && decimalToNumber(shipment.cogsBatchAmount) <= 0) {
+    if (decimalToNumber(shipment.revenueRecognizedAmount) <= 0) {
       findings.push({
         severity: 'critical',
-        code: 'shipment_posted_missing_batch_amounts',
+        code: 'shipment_posted_missing_revenue_amount',
         orderId: shipment.orderId,
         shipmentId: shipment.id,
-        message: `Shipment ${shipment.id} is marked posted with no revenue or COGS batch amount`,
+        message: `Shipment ${shipment.id} is marked posted with no revenue batch amount`,
         details: {
           revenueRecognizedAmount: decimalToNumber(shipment.revenueRecognizedAmount),
+        },
+      })
+    }
+
+    if (decimalToNumber(shipment.cogsBatchAmount) <= 0) {
+      findings.push({
+        severity: 'critical',
+        code: 'shipment_posted_missing_cogs_amount',
+        orderId: shipment.orderId,
+        shipmentId: shipment.id,
+        message: `Shipment ${shipment.id} is marked posted with no COGS batch amount`,
+        details: {
           cogsBatchAmount: decimalToNumber(shipment.cogsBatchAmount),
         },
       })
@@ -293,7 +324,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     if (hasA1) {
       const expectedReferenceId = expectedDailyBatchReference('A1', order.revenueDeferredDate)
       const hasSyncEvidence = expectedReferenceId
-        ? hasLiveSyncLog(rows.syncLogs, 'DAILY_BATCH_REVENUE_DEFERRAL', expectedReferenceId, 'DailyBatch')
+        ? hasLiveSyncLog(syncLogIndex, 'DAILY_BATCH_REVENUE_DEFERRAL', expectedReferenceId, 'DailyBatch')
         : false
 
       if (!hasSyncEvidence) {
@@ -315,7 +346,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     if (hasA2) {
       const expectedReferenceId = expectedDailyBatchReference('A2', order.inventoryAllocatedDate)
       const hasSyncEvidence = expectedReferenceId
-        ? hasLiveSyncLog(rows.syncLogs, 'DAILY_BATCH_INVENTORY_ALLOC', expectedReferenceId, 'DailyBatch')
+        ? hasLiveSyncLog(syncLogIndex, 'DAILY_BATCH_INVENTORY_ALLOC', expectedReferenceId, 'DailyBatch')
         : false
 
       if (!hasSyncEvidence) {
@@ -424,10 +455,10 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
       }
 
       const hasCreditNoteEvidence = Boolean(refund.accountingCreditNoteId) ||
-        hasLiveSyncLog(rows.syncLogs, 'CREDIT_NOTE', refund.id, 'SalesOrderRefund') ||
+        hasLiveSyncLog(syncLogIndex, 'CREDIT_NOTE', refund.id, 'SalesOrderRefund') ||
         refundRetryTypes.has('CREDIT_NOTE')
-      const hasReversalEvidence = hasLiveSyncLog(rows.syncLogs, 'COGS_REVERSAL', refund.id, 'SalesOrderRefund') ||
-        hasLiveSyncLog(rows.syncLogs, 'UNEARNED_REV_REVERSAL', refund.id, 'SalesOrderRefund') ||
+      const hasReversalEvidence = hasLiveSyncLog(syncLogIndex, 'COGS_REVERSAL', refund.id, 'SalesOrderRefund') ||
+        hasLiveSyncLog(syncLogIndex, 'UNEARNED_REV_REVERSAL', refund.id, 'SalesOrderRefund') ||
         [...refundRetryTypes].some((type) => REFUND_REVERSAL_TYPES.has(type))
 
       if (
@@ -488,17 +519,56 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
   return findings
 }
 
+function monthsAgo(now: Date, months: number): Date {
+  const date = new Date(now)
+  date.setUTCMonth(date.getUTCMonth() - months)
+  return date
+}
+
+async function resolveSyncLogRetentionMonths(
+  client: AccountingInvariantClient,
+  override?: number,
+): Promise<number> {
+  if (override !== undefined) return Math.max(0, Math.floor(override))
+  if (!client.setting) return DEFAULT_SYNC_LOG_RETENTION_MONTHS
+  const row = await client.setting.findUnique({
+    where: { key: 'retention_sync_logs_months' },
+    select: { value: true },
+  }).catch(() => null)
+  const parsed = Number.parseInt(row?.value ?? '', 10)
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : DEFAULT_SYNC_LOG_RETENTION_MONTHS
+}
+
 export async function collectAccountingInvariantRows(
   client: AccountingInvariantClient = db as unknown as AccountingInvariantClient,
+  options: { now?: Date; syncLogRetentionMonths?: number } = {},
 ): Promise<AccountingInvariantRows> {
+  const retentionMonths = await resolveSyncLogRetentionMonths(client, options.syncLogRetentionMonths)
+  const retentionCutoff = retentionMonths > 0 ? monthsAgo(options.now ?? new Date(), retentionMonths) : null
+  const retainedDateFilter = retentionCutoff ? { gte: retentionCutoff } : { not: null }
+  const syncLogWhere = retentionCutoff
+    ? {
+        createdAt: { gte: retentionCutoff },
+        OR: [
+          { status: 'FAILED' },
+          { status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] } },
+        ],
+      }
+    : {
+        OR: [
+          { status: 'FAILED' },
+          { status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] } },
+        ],
+      }
   const [salesOrders, postedShipments, syncLogs] = await Promise.all([
     client.salesOrder.findMany({
       where: {
+        status: { notIn: [...TERMINAL_SALES_ORDER_STATUSES] },
         OR: [
-          { revenueDeferredDate: { not: null } },
-          { inventoryAllocatedDate: { not: null } },
-          { shipments: { some: { shipmentJournalDate: { not: null } } } },
-          { refunds: { some: {} } },
+          { revenueDeferredDate: retainedDateFilter },
+          { inventoryAllocatedDate: retainedDateFilter },
+          { shipments: { some: { shipmentJournalDate: retainedDateFilter } } },
+          { refunds: { some: retentionCutoff ? { refundedAt: { gte: retentionCutoff } } : {} } },
         ],
       },
       select: {
@@ -533,7 +603,10 @@ export async function collectAccountingInvariantRows(
       },
     }),
     client.shipment.findMany({
-      where: { shipmentJournalDate: { not: null } },
+      where: {
+        shipmentJournalDate: retainedDateFilter,
+        order: { status: { notIn: [...TERMINAL_SALES_ORDER_STATUSES] } },
+      },
       select: {
         id: true,
         orderId: true,
@@ -545,6 +618,7 @@ export async function collectAccountingInvariantRows(
           select: {
             id: true,
             orderNumber: true,
+            status: true,
             revenueDeferredDate: true,
             inventoryAllocatedDate: true,
           },
@@ -552,12 +626,7 @@ export async function collectAccountingInvariantRows(
       },
     }),
     client.accountingSyncLog.findMany({
-      where: {
-        OR: [
-          { status: 'FAILED' },
-          { status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] } },
-        ],
-      },
+      where: syncLogWhere,
       select: {
         id: true,
         connector: true,
