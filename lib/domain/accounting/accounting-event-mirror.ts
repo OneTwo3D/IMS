@@ -101,6 +101,7 @@ function mapStatus(status: string | undefined): AccountingEventStatus {
 }
 
 function buildMirroredAccountingEventIdempotencyKey(params: {
+  syncLogId?: string
   connector: string
   type: string
   referenceType: string
@@ -113,6 +114,10 @@ function buildMirroredAccountingEventIdempotencyKey(params: {
   const payloadIdempotencyKey = stringValue(payload._idempotencyKey)
   if (payloadIdempotencyKey) {
     return buildAccountingEventIdempotencyKey(['accounting-sync', params.connector, params.type, payloadIdempotencyKey])
+  }
+
+  if (params.syncLogId?.trim()) {
+    return buildAccountingEventIdempotencyKey(['accounting-sync-log', params.connector, params.syncLogId])
   }
 
   const payloadDate = stringValue(payload.date)
@@ -137,6 +142,7 @@ function isMirrorableJournalAccountingSyncType(type: string): type is MirroredJo
 }
 
 export function buildMirroredAccountingEventDraft(params: {
+  syncLogId?: string
   connector: string
   type: string
   referenceType: string
@@ -219,6 +225,7 @@ export async function mirrorAccountingSyncLogToEvent(
         action: 'mirrored_from_sync_log',
         metadata: {
           connector: params.connector,
+          ...(params.syncLogId ? { syncLogId: params.syncLogId } : {}),
           syncType: params.type,
           referenceType: params.referenceType,
           referenceId: params.referenceId,
@@ -235,6 +242,7 @@ export async function updateMirroredAccountingEventStatus(
   client: AccountingEventMirrorTransactionClient,
   params: {
     connector: string
+    syncLogId?: string
     type: string
     referenceType: string
     referenceId: string
@@ -247,17 +255,34 @@ export async function updateMirroredAccountingEventStatus(
   const idempotencyKey = buildMirroredAccountingEventIdempotencyKey(params)
   if (!idempotencyKey) return
 
-  const event = await client.accountingEvent.update({
-    where: { idempotencyKey },
-    data: {
-      status: params.status,
-      ...(params.externalId !== undefined ? { externalId: params.externalId } : {}),
-    },
-    select: { id: true },
-  }).catch((error: unknown) => {
-    if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') return null
-    throw error
-  })
+  async function updateByIdempotencyKey(key: string) {
+    return client.accountingEvent.update({
+      where: { idempotencyKey: key },
+      data: {
+        status: params.status,
+        ...(params.externalId !== undefined ? { externalId: params.externalId } : {}),
+      },
+      select: { id: true },
+    }).catch((error: unknown) => {
+      if (error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2025') return null
+      throw error
+    })
+  }
+
+  let event = await updateByIdempotencyKey(idempotencyKey)
+  if (!event && params.syncLogId) {
+    const legacyIdempotencyKey = buildMirroredAccountingEventIdempotencyKey({
+      connector: params.connector,
+      type: params.type,
+      referenceType: params.referenceType,
+      referenceId: params.referenceId,
+      payload: params.payload,
+    })
+    if (legacyIdempotencyKey && legacyIdempotencyKey !== idempotencyKey) {
+      event = await updateByIdempotencyKey(legacyIdempotencyKey)
+    }
+  }
+
   if (!event) return
 
   await client.accountingEventLog.create({
@@ -267,6 +292,7 @@ export async function updateMirroredAccountingEventStatus(
       ...(params.message ? { message: params.message } : {}),
       metadata: {
         connector: params.connector,
+        ...(params.syncLogId ? { syncLogId: params.syncLogId } : {}),
         syncType: params.type,
         referenceType: params.referenceType,
         referenceId: params.referenceId,

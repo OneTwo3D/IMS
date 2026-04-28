@@ -207,6 +207,7 @@ async function createPendingSyncLog(
     accountingSyncLogId: log.id,
   })
   await mirrorAccountingSyncLogToEvent(tx, {
+    syncLogId: log.id,
     connector: XERO_CONNECTOR,
     type: params.type,
     referenceType: 'DailyBatch',

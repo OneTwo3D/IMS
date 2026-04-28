@@ -70,6 +70,7 @@ function isRateLimitError(message: string): boolean {
 }
 
 async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingEventLog'>, params: {
+  syncLogId: string
   type: AccountingSyncType
   referenceType: string
   referenceId: string
@@ -80,6 +81,7 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
 }): Promise<void> {
   await updateMirroredAccountingEventStatus(client, {
     connector: XERO_CONNECTOR,
+    syncLogId: params.syncLogId,
     type: params.type,
     referenceType: params.referenceType,
     referenceId: params.referenceId,
@@ -87,6 +89,33 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
     status: params.status,
     externalId: params.externalId,
     message: params.message,
+  })
+}
+
+async function markSyncLogForFollowUpRetry(
+  entryId: string,
+  error: unknown,
+  client?: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+): Promise<string> {
+  const errorMessage = `Xero follow-up work failed after connector post: ${String(error)}`
+  await (client ?? db).accountingSyncLog.update({
+    where: { id: entryId },
+    data: {
+      status: 'PENDING',
+      errorMessage,
+      processingStartedAt: null,
+    },
+  })
+  return errorMessage
+}
+
+async function logFollowUpRetry(entryId: string, error: unknown): Promise<void> {
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'xero_followup_error',
+    tag: 'sync',
+    level: 'WARNING',
+    description: `Xero sync entry ${entryId} posted successfully but follow-up work failed and will be retried: ${String(error)}`,
   })
 }
 
@@ -321,6 +350,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
             },
           })
           await updateMirroredEventForSyncLog(tx, {
+            syncLogId: entry.id,
             type: entry.type,
             referenceType: entry.referenceType,
             referenceId: entry.referenceId,
@@ -333,13 +363,10 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
         } catch (followUpError) {
-          await logActivity({
-            entityType: 'SYSTEM',
-            action: 'xero_followup_error',
-            tag: 'sync',
-            level: 'WARNING',
-            description: `Xero sync entry ${entry.id} posted successfully but follow-up work failed: ${String(followUpError)}`,
-          })
+          await markSyncLogForFollowUpRetry(entry.id, followUpError)
+          await logFollowUpRetry(entry.id, followUpError)
+          result.failed++
+          continue
         }
         result.succeeded++
         continue
@@ -360,6 +387,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
             },
           })
           await updateMirroredEventForSyncLog(tx, {
+            syncLogId: entry.id,
             type: entry.type,
             referenceType: entry.referenceType,
             referenceId: entry.referenceId,
@@ -373,13 +401,10 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
         } catch (followUpError) {
-          await logActivity({
-            entityType: 'SYSTEM',
-            action: 'xero_followup_error',
-            tag: 'sync',
-            level: 'WARNING',
-            description: `Xero sync entry ${entry.id} posted successfully but follow-up work failed: ${String(followUpError)}`,
-          })
+          await markSyncLogForFollowUpRetry(entry.id, followUpError)
+          await logFollowUpRetry(entry.id, followUpError)
+          result.failed++
+          continue
         }
 
         result.succeeded++
@@ -409,6 +434,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
             })
             if (finalFailure) {
               await updateMirroredEventForSyncLog(tx, {
+                syncLogId: entry.id,
                 type: entry.type,
                 referenceType: entry.referenceType,
                 referenceId: entry.referenceId,
@@ -447,6 +473,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           })
           if (finalFailure) {
             await updateMirroredEventForSyncLog(tx, {
+              syncLogId: entry.id,
               type: entry.type,
               referenceType: entry.referenceType,
               referenceId: entry.referenceId,
@@ -549,6 +576,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             },
           })
           await updateMirroredEventForSyncLog(tx, {
+            syncLogId: entry.id,
             type: entry.type,
             referenceType: entry.referenceType,
             referenceId: entry.referenceId,
@@ -561,13 +589,15 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
         } catch (followUpError) {
-          await logActivity({
-            entityType: 'SYSTEM',
-            action: 'xero_followup_error',
-            tag: 'sync',
-            level: 'WARNING',
-            description: `Xero sync entry ${entry.id} posted successfully but follow-up work failed: ${String(followUpError)}`,
+          const errorMessage = await db.$transaction(async (tx) => {
+            const message = await markSyncLogForFollowUpRetry(entry.id, followUpError, tx)
+            await markXeroOutboxRetry(job, message, 0, tx)
+            return message
           })
+          await logFollowUpRetry(entry.id, followUpError)
+          if (!errorMessage) throw new Error(`Xero sync entry ${entry.id} follow-up failure could not be recorded`)
+          result.failed++
+          continue
         }
         await markXeroOutboxSuccess(job)
         result.succeeded++
@@ -589,6 +619,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             },
           })
           await updateMirroredEventForSyncLog(tx, {
+            syncLogId: entry.id,
             type: entry.type,
             referenceType: entry.referenceType,
             referenceId: entry.referenceId,
@@ -602,13 +633,15 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
         } catch (followUpError) {
-          await logActivity({
-            entityType: 'SYSTEM',
-            action: 'xero_followup_error',
-            tag: 'sync',
-            level: 'WARNING',
-            description: `Xero sync entry ${entry.id} posted successfully but follow-up work failed: ${String(followUpError)}`,
+          const errorMessage = await db.$transaction(async (tx) => {
+            const message = await markSyncLogForFollowUpRetry(entry.id, followUpError, tx)
+            await markXeroOutboxRetry(job, message, 0, tx)
+            return message
           })
+          await logFollowUpRetry(entry.id, followUpError)
+          if (!errorMessage) throw new Error(`Xero sync entry ${entry.id} follow-up failure could not be recorded`)
+          result.failed++
+          continue
         }
 
         await markXeroOutboxSuccess(job)
@@ -643,6 +676,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             })
             if (finalFailure) {
               await updateMirroredEventForSyncLog(tx, {
+                syncLogId: entry.id,
                 type: entry.type,
                 referenceType: entry.referenceType,
                 referenceId: entry.referenceId,
@@ -691,6 +725,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           })
           if (finalFailure) {
             await updateMirroredEventForSyncLog(tx, {
+              syncLogId: entry.id,
               type: entry.type,
               referenceType: entry.referenceType,
               referenceId: entry.referenceId,

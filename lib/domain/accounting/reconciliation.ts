@@ -412,8 +412,8 @@ export async function collectAccountingReconciliationRows(
       where: {
         status: { notIn: [...TERMINAL_SALES_ORDER_STATUSES] },
         OR: [
-          { revenueDeferredDate: { not: null } },
-          { inventoryAllocatedDate: { not: null } },
+          { revenueDeferredDate: { gte: fromDate } },
+          { inventoryAllocatedDate: { gte: fromDate } },
         ],
       },
       select: {
@@ -426,7 +426,7 @@ export async function collectAccountingReconciliationRows(
       },
     }),
     client.shipment.findMany({
-      where: { shipmentJournalDate: { not: null } },
+      where: { shipmentJournalDate: { gte: fromDate } },
       select: {
         id: true,
         orderId: true,
@@ -436,7 +436,7 @@ export async function collectAccountingReconciliationRows(
     client.salesOrderRefund.findMany({
       where: {
         refundedAt: { gte: fromDate },
-        order: { status: { notIn: [...TERMINAL_SALES_ORDER_STATUSES] } },
+        order: { status: { not: 'CANCELLED' } },
       },
       orderBy: { refundedAt: 'desc' },
       take: MAX_RECONCILIATION_ROWS,

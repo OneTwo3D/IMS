@@ -228,7 +228,9 @@ async function migrateLegacyWcStockSyncJobs(productIds?: string[], limit = 100):
       webhookQty: job.webhookQty,
       nextAttemptAt: job.availableAt,
       status: job.status === 'FAILED'
-        ? INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED
+        ? job.attempts >= WC_STOCK_SYNC_MAX_ATTEMPTS
+          ? INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED
+          : INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED
         : INTEGRATION_OUTBOX_STATUS.PENDING,
       attempts: job.attempts,
       lastError: job.lastError,
