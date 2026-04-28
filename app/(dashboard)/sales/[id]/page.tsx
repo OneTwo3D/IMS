@@ -3,7 +3,7 @@ import { notFound } from 'next/navigation'
 import Link from 'next/link'
 import { ChevronLeft } from 'lucide-react'
 import { getSalesOrder } from '@/app/actions/sales'
-import { getWarehouses, getStockLevelMap } from '@/app/actions/stock'
+import { getWarehouses, getScopedStockLevelMap } from '@/app/actions/stock'
 import { getCurrencies } from '@/app/actions/currencies'
 import { getSetting } from '@/app/actions/settings'
 import { getOrderAllocations, getOrderFulfillmentRequirements, getOrderShipments } from '@/app/actions/allocation'
@@ -19,12 +19,11 @@ type Props = { params: Promise<{ id: string }> }
 
 export default async function SalesOrderDetailPage({ params }: Props) {
   const { id } = await params
-  const [so, warehouses, currencies, externalOrderLinks, stockLevels, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable] = await Promise.all([
+  const [so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable] = await Promise.all([
     getSalesOrder(id),
     getWarehouses(),
     getCurrencies(true),
     getSalesOrderAdminLinks(id),
-    getStockLevelMap(),
     getOrderAllocations(id),
     getOrderShipments(id),
     getOrderFulfillmentRequirements(id),
@@ -38,6 +37,10 @@ export default async function SalesOrderDetailPage({ params }: Props) {
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
 
   if (!so) notFound()
+  const stockLevels = await getScopedStockLevelMap({
+    productIds: Array.from(new Set(so.lines.map((line) => line.productId).filter((productId): productId is string => Boolean(productId)))),
+    warehouseIds: warehouses.map((warehouse) => warehouse.id),
+  })
 
   return (
     <div className="space-y-4">

@@ -1,6 +1,7 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
+import { cache } from 'react'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -13,6 +14,14 @@ import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalan
 import type { Prisma } from '@/app/generated/prisma/client'
 import { consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost } from '@/lib/cost-layers'
 import { multiplyMoney, roundQuantity } from '@/lib/domain/math/decimal'
+import {
+  buildStockLevelMap,
+  isEmptyStockLevelMapScope,
+  normalizeStockLevelMapScope,
+  type StockLevelEntry,
+  type StockLevelMap,
+  type StockLevelMapScope,
+} from '@/lib/domain/inventory/stock-level-map'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -898,21 +907,44 @@ export async function getWarehouses() {
 // Stock level map (productId → warehouseId → quantity)
 // ---------------------------------------------------------------------------
 
-export type StockLevelEntry = { total: number; available: number }
+export type { StockLevelEntry, StockLevelMap, StockLevelMapScope }
 
-export async function getStockLevelMap(): Promise<Record<string, Record<string, StockLevelEntry>>> {
-  await requireAuth()
+const readScopedStockLevelMap = cache(async (
+  productIdsKey: string | null,
+  warehouseIdsKey: string | null,
+  updatedSinceIso: string | null,
+  skip: number | null,
+  take: number | null,
+): Promise<StockLevelMap> => {
+  const productIds = productIdsKey ? JSON.parse(productIdsKey) as string[] : undefined
+  const warehouseIds = warehouseIdsKey ? JSON.parse(warehouseIdsKey) as string[] : undefined
+  const where: Prisma.StockLevelWhereInput = {}
+  if (productIds) where.productId = { in: productIds }
+  if (warehouseIds) where.warehouseId = { in: warehouseIds }
+  if (updatedSinceIso) where.updatedAt = { gte: new Date(updatedSinceIso) }
+
   const levels = await db.stockLevel.findMany({
+    where,
     select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
+    orderBy: [{ productId: 'asc' }, { warehouseId: 'asc' }],
+    skip: skip ?? undefined,
+    take: take ?? undefined,
   })
-  const map: Record<string, Record<string, StockLevelEntry>> = {}
-  for (const l of levels) {
-    if (!map[l.productId]) map[l.productId] = {}
-    const total = Number(l.quantity)
-    const reserved = Number(l.reservedQty)
-    map[l.productId][l.warehouseId] = { total, available: total - reserved }
-  }
-  return map
+  return buildStockLevelMap(levels)
+})
+
+export async function getScopedStockLevelMap(scope: StockLevelMapScope = {}): Promise<StockLevelMap> {
+  await requireAuth()
+  if (isEmptyStockLevelMapScope(scope)) return {}
+
+  const normalized = normalizeStockLevelMapScope(scope)
+  return readScopedStockLevelMap(
+    normalized.productIds ? JSON.stringify(normalized.productIds) : null,
+    normalized.warehouseIds ? JSON.stringify(normalized.warehouseIds) : null,
+    normalized.updatedSince?.toISOString() ?? null,
+    normalized.skip ?? null,
+    normalized.take ?? null,
+  )
 }
 
 /** Avg COGS per product from FIFO cost layers (weighted avg of remaining stock) */
