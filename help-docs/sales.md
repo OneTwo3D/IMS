@@ -29,7 +29,7 @@ WooCommerce orders always enter the IMS as **Processing**. When WooCommerce mark
 
 ## Order Statuses
 
-Sales orders progress through the following statuses:
+Sales orders use the canonical sales order workflow documented in `docs/workflows.md`. User-facing order stages include:
 
 | Status | Description |
 |---|---|
@@ -44,6 +44,10 @@ Sales orders progress through the following statuses:
 | **Completed** | Order fulfilled and closed |
 | **Delivered** | Order confirmed as delivered (requires delivery tracking module) |
 | **Cancelled** | Order cancelled, stock reservations released |
+| **Partially Refunded** | Order has one or more refunds but is not fully refunded |
+| **Refunded** | Order has been fully refunded |
+
+The exact allowed transitions are kept in the canonical workflow reference so UI help does not drift from the enforced state-machine rules.
 
 ## Stock Allocation
 

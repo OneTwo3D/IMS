@@ -1,0 +1,34 @@
+name: Workflow Docs
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/workflow-docs.yml"
+      - "docs/workflows.md"
+      - "lib/domain/workflows/**"
+      - "package-lock.json"
+      - "package.json"
+      - "scripts/generate-workflow-docs.ts"
+  push:
+    branches:
+      - main
+      - development
+    paths:
+      - ".github/workflows/workflow-docs.yml"
+      - "docs/workflows.md"
+      - "lib/domain/workflows/**"
+      - "package-lock.json"
+      - "package.json"
+      - "scripts/generate-workflow-docs.ts"
+
+jobs:
+  generated-workflow-docs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run docs:workflows:check

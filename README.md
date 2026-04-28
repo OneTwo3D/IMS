@@ -13,7 +13,7 @@ Inventory Management System — built with Next.js 16, TypeScript, Prisma 7, Pos
 
 ### Stock Control
 - Bulk stock adjustments with configurable reasons (linked to Xero accounts)
-- Warehouse transfers (DRAFT > IN_TRANSIT > RECEIVED) with stock booking
+- Warehouse transfers with stock booking
 - Stock level export per warehouse with multi-select filter
 
 ### Purchases
@@ -27,7 +27,7 @@ Inventory Management System — built with Next.js 16, TypeScript, Prisma 7, Pos
 - Supplier management with default currency, tax rate, and payment terms
 
 ### Sales
-- Sales orders with shipment-first fulfillment and shipment status progression (`PENDING > PICKING > PACKED > SHIPPED`)
+- Sales orders with shipment-first fulfillment and shipment status progression
 - Multi-currency with VAT, line/order discounts (% or absolute), shipping fees
 - Customer contacts with billing/shipping addresses and tax numbers
 - Component-aware stock allocation for kits / bundles, including bundle refunds and COGS reversal support
@@ -62,7 +62,7 @@ Inventory Management System — built with Next.js 16, TypeScript, Prisma 7, Pos
 ## Tech Stack
 
 - **Framework**: Next.js 16 (App Router, Server Components, Server Actions, Turbopack)
-- **Database**: PostgreSQL with Prisma 7 ORM (~40 models)
+- **Database**: PostgreSQL with Prisma 7 ORM
 - **UI**: Shadcn/UI with base-ui primitives, Tailwind CSS, Lucide icons
 - **PDF**: PDFKit (server-external package)
 - **FX Rates**: frankfurter.dev API (free, ECB data, no API key)
@@ -98,7 +98,7 @@ lib/
   csv.ts            — CSV parse/export utilities
   pdf.ts            — PDF generation helpers with branding
 prisma/
-  schema.prisma     — Database schema (~40 models)
+  schema.prisma     — Database schema
   migrations/       — Migration history
 scripts/
   install.sh        — Production installer
@@ -107,6 +107,7 @@ scripts/
 ## Documentation
 
 - [Architecture](docs/architecture.md)
+- [Workflow State Machines](docs/workflows.md)
 - [Installation & Deployment](docs/installation.md)
 - [WooCommerce Integration](docs/woocommerce.md)
 - [Xero Accounting Sync](docs/xero-sync.md)

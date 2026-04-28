@@ -11,6 +11,8 @@
     "start": "next start",
     "lint": "eslint",
     "type-check": "tsc --noEmit",
+    "docs:workflows": "tsx scripts/generate-workflow-docs.ts",
+    "docs:workflows:check": "tsx scripts/generate-workflow-docs.ts --check",
     "validate": "bash scripts/validate-local.sh",
     "validate:db": "bash scripts/validate-db.sh",
     "db:migrate:status": "bash scripts/prisma-dev-db.sh status",

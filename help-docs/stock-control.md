@@ -38,12 +38,14 @@ Warehouse transfers move stock from one warehouse to another. A transfer goes th
 
 ### Transfer Statuses
 
+Warehouse transfers use the canonical transfer workflow documented in `docs/workflows.md`.
+
 | Status | Meaning |
 |---|---|
 | **Draft** | The transfer has been created but not yet actioned. Lines can still be edited. |
-| **Dispatched** | Stock has been sent from the source warehouse. On-hand stock at the source is reduced. |
+| **In Transit** | Stock has been sent from the source warehouse. On-hand stock at the source is reduced. |
 | **Received** | Stock has arrived at the destination warehouse. On-hand stock at the destination is increased. |
-| **Cancelled** | The transfer has been cancelled. If it was dispatched, stock is returned to the source warehouse. |
+| **Cancelled** | The transfer has been cancelled. If it was already in transit, stock is returned to the source warehouse. |
 
 ### Creating a Transfer
 

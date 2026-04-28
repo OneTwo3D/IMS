@@ -11,13 +11,13 @@
 #   2. Installs Node.js 22 (via NodeSource)
 #   3. Installs and configures PostgreSQL
 #   4. Installs nginx, fail2ban, and automatic security updates
-#   5. Installs PM2 process manager
+#   5. Installs runtime tooling
 #   6. Prompts for all configuration values
 #   7. Creates the app system user
 #   8. Clones the repository (or copies local files)
 #   9. Installs npm dependencies and builds the app
 #  10. Runs database migrations
-#  11. Writes the systemd service (via PM2)
+#  11. Writes the systemd service
 #  12. Configures nginx reverse proxy
 #  13. Sets up cron jobs (FX rates, activity cleanup, backups, WC sync, delivery status)
 #  14. Prints post-install summary
@@ -346,13 +346,6 @@ else
   curl -fsSL "https://deb.nodesource.com/setup_${NODE_VERSION}.x" | bash -
   apt-get install -y nodejs
   success "Node.js $(node --version) installed."
-fi
-
-if ! command -v pm2 &>/dev/null; then
-  npm install -g pm2 --quiet
-  success "PM2 installed."
-else
-  success "PM2 already installed."
 fi
 
 # ---------------------------------------------------------------------------
@@ -756,9 +749,12 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
+# Remove legacy PM2-managed instances when upgrading an older install.
 systemctl disable "pm2-${APP_USER}" 2>/dev/null || true
-env PM2_HOME="${APP_DIR}/.pm2" pm2 delete "${APP_NAME}" 2>/dev/null || true
-env PM2_HOME="${APP_DIR}/.pm2" pm2 kill 2>/dev/null || true
+if command -v pm2 >/dev/null 2>&1; then
+  env PM2_HOME="${APP_DIR}/.pm2" pm2 delete "${APP_NAME}" 2>/dev/null || true
+  env PM2_HOME="${APP_DIR}/.pm2" pm2 kill 2>/dev/null || true
+fi
 systemctl enable --now "${APP_NAME}.service"
 
 success "Application service started and registered with systemd."
@@ -910,10 +906,6 @@ ${LOG_DIR}/*.log {
     compress
     delaycompress
     notifempty
-    sharedscripts
-    postrotate
-        pm2 reloadLogs 2>/dev/null || true
-    endscript
 }
 /var/log/nginx/${APP_NAME}-*.log {
     daily
@@ -1019,11 +1011,11 @@ echo ""
 echo -e "  5. Import existing data:"
 echo -e "     Products, suppliers, BOMs, stock — all via CSV import in the respective modules"
 echo ""
-echo -e "  6. View PM2 process status:"
-echo -e "     ${BOLD}pm2 status${RESET}"
+echo -e "  6. View application service status:"
+echo -e "     ${BOLD}systemctl status ${APP_NAME}.service${RESET}"
 echo ""
 echo -e "  7. View live logs:"
-echo -e "     ${BOLD}pm2 logs ${APP_NAME}${RESET}"
+echo -e "     ${BOLD}journalctl -u ${APP_NAME}.service -f${RESET}"
 echo ""
 
 if [[ "$ENABLE_SSL" != "y" ]]; then
