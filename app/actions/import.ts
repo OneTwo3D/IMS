@@ -568,7 +568,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
 
 export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
-  const preview = mode === 'preview'
+  const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'stock_control.adjust')
   if ('error' in validated) {
     const result = { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
@@ -659,7 +659,7 @@ export async function importAdjustmentsCsv(formData: FormData): Promise<CsvImpor
 
 export async function importOpeningStockCsv(formData: FormData): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
-  const preview = mode === 'preview'
+  const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'stock_control.adjust')
   if ('error' in validated) {
     const result = { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
@@ -883,7 +883,7 @@ export async function importOpeningStockCsv(formData: FormData): Promise<CsvImpo
 
 export async function importTransfersCsv(formData: FormData): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
-  const preview = mode === 'preview'
+  const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'stock_control.transfer')
   if ('error' in validated) {
     const result = { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
@@ -1032,7 +1032,7 @@ export async function importTransfersCsv(formData: FormData): Promise<CsvImportA
 
 export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
-  const preview = mode === 'preview'
+  const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'sales.create')
   if ('error' in validated) {
     const result = { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
@@ -1270,7 +1270,7 @@ export async function importSalesOrdersCsv(formData: FormData): Promise<CsvImpor
 
 export async function importPurchaseOrdersCsv(formData: FormData): Promise<CsvImportActionResult> {
   const mode = getCsvImportMode(formData)
-  const preview = mode === 'preview'
+  const preview = isCsvImportDryRunMode(mode)
   const validated = await validateImportFile(formData, 'purchasing.create')
   if ('error' in validated) {
     const result = { created: 0, updated: 0, skipped: 0, errors: [validated.error] }
