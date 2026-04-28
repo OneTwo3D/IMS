@@ -93,20 +93,23 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
 }
 
 async function markSyncLogForFollowUpRetry(
-  entryId: string,
+  entry: { id: string; retryCount: number },
   error: unknown,
   client?: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
-): Promise<string> {
+): Promise<{ errorMessage: string; finalFailure: boolean }> {
   const errorMessage = `Xero follow-up work failed after connector post: ${String(error)}`
+  const retryCount = entry.retryCount + 1
+  const finalFailure = retryCount >= MAX_RETRIES
   await (client ?? db).accountingSyncLog.update({
-    where: { id: entryId },
+    where: { id: entry.id },
     data: {
-      status: 'PENDING',
+      status: finalFailure ? 'FAILED' : 'PENDING',
+      retryCount,
       errorMessage,
       processingStartedAt: null,
     },
   })
-  return errorMessage
+  return { errorMessage, finalFailure }
 }
 
 async function logFollowUpRetry(entryId: string, error: unknown): Promise<void> {
@@ -363,7 +366,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
         } catch (followUpError) {
-          await markSyncLogForFollowUpRetry(entry.id, followUpError)
+          await markSyncLogForFollowUpRetry(entry, followUpError)
           await logFollowUpRetry(entry.id, followUpError)
           result.failed++
           continue
@@ -401,7 +404,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
         } catch (followUpError) {
-          await markSyncLogForFollowUpRetry(entry.id, followUpError)
+          await markSyncLogForFollowUpRetry(entry, followUpError)
           await logFollowUpRetry(entry.id, followUpError)
           result.failed++
           continue
@@ -589,13 +592,17 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
         } catch (followUpError) {
-          const errorMessage = await db.$transaction(async (tx) => {
-            const message = await markSyncLogForFollowUpRetry(entry.id, followUpError, tx)
-            await markXeroOutboxRetry(job, message, 0, tx)
-            return message
+          const retry = await db.$transaction(async (tx) => {
+            const nextRetry = await markSyncLogForFollowUpRetry(entry, followUpError, tx)
+            if (nextRetry.finalFailure) {
+              await markXeroOutboxPermanent(job, nextRetry.errorMessage, tx)
+            } else {
+              await markXeroOutboxRetry(job, nextRetry.errorMessage, 0, tx)
+            }
+            return nextRetry
           })
           await logFollowUpRetry(entry.id, followUpError)
-          if (!errorMessage) throw new Error(`Xero sync entry ${entry.id} follow-up failure could not be recorded`)
+          if (!retry.errorMessage) throw new Error(`Xero sync entry ${entry.id} follow-up failure could not be recorded`)
           result.failed++
           continue
         }
@@ -633,13 +640,17 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
           await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
         } catch (followUpError) {
-          const errorMessage = await db.$transaction(async (tx) => {
-            const message = await markSyncLogForFollowUpRetry(entry.id, followUpError, tx)
-            await markXeroOutboxRetry(job, message, 0, tx)
-            return message
+          const retry = await db.$transaction(async (tx) => {
+            const nextRetry = await markSyncLogForFollowUpRetry(entry, followUpError, tx)
+            if (nextRetry.finalFailure) {
+              await markXeroOutboxPermanent(job, nextRetry.errorMessage, tx)
+            } else {
+              await markXeroOutboxRetry(job, nextRetry.errorMessage, 0, tx)
+            }
+            return nextRetry
           })
           await logFollowUpRetry(entry.id, followUpError)
-          if (!errorMessage) throw new Error(`Xero sync entry ${entry.id} follow-up failure could not be recorded`)
+          if (!retry.errorMessage) throw new Error(`Xero sync entry ${entry.id} follow-up failure could not be recorded`)
           result.failed++
           continue
         }
