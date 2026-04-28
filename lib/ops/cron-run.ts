@@ -43,6 +43,16 @@ export type RunCronWithLoggingOptions<T extends Record<string, unknown>> = {
   writeLog?: CronRunLogWriter
 }
 
+export function cronRunResponseInit(init: ResponseInit = {}): ResponseInit {
+  const headers = new Headers(init.headers)
+  headers.set('Cache-Control', 'no-store')
+
+  return {
+    ...init,
+    headers,
+  }
+}
+
 export async function runCronWithLogging<T extends Record<string, unknown>>(
   options: RunCronWithLoggingOptions<T>,
 ): Promise<{ runId: string; result: T; log: CronRunLog; responseStatus?: number }> {

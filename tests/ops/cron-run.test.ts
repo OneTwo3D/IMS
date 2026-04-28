@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   appendCronRunId,
+  cronRunResponseInit,
   inferCronRunOutcome,
   runCronWithLogging,
   type CronRunLog,
@@ -105,6 +106,20 @@ test('cron run helper appends run id to JSON response bodies', () => {
     ok: true,
     runId: 'run-1',
   })
+})
+
+test('cron run helper builds no-store response init without losing status or headers', () => {
+  const init = cronRunResponseInit({
+    status: 500,
+    headers: {
+      'X-Test': 'present',
+    },
+  })
+
+  const headers = new Headers(init.headers)
+  assert.equal(init.status, 500)
+  assert.equal(headers.get('Cache-Control'), 'no-store')
+  assert.equal(headers.get('X-Test'), 'present')
 })
 
 test('cron run helper infers invariant summaries and error arrays', () => {

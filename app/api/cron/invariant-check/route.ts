@@ -3,7 +3,7 @@ import { NextResponse } from 'next/server'
 import { runScheduledInvariantCheck } from '@/lib/cron/invariant-check'
 import { verifyCron } from '@/lib/cron-auth'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import { appendCronRunId, runCronWithLogging } from '@/lib/ops/cron-run'
+import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
 
 export const runtime = 'nodejs'
 
@@ -18,10 +18,7 @@ export async function GET(request: Request) {
     run: async ({ runId }) => await runScheduledInvariantCheck({ createRunId: () => runId }) as unknown as Record<string, unknown>,
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), {
+  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit({
     status: result.status === 'completed' ? 200 : 500,
-    headers: {
-      'Cache-Control': 'no-store',
-    },
-  })
+  }))
 }

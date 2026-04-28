@@ -8,7 +8,7 @@ import { verifyCron } from '@/lib/cron-auth'
 import { getBackupDir } from '@/lib/backup-storage'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { uploadBackupToTarget } from '@/lib/backup-remote'
-import { appendCronRunId, runCronWithLogging } from '@/lib/ops/cron-run'
+import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
 
 const BACKUP_DIR = getBackupDir()
 
@@ -122,5 +122,5 @@ export async function GET(request: Request) {
     }),
   })
 
-  return NextResponse.json(appendCronRunId(result, runId), { status: responseStatus })
+  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit({ status: responseStatus }))
 }

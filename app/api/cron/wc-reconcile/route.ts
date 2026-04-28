@@ -4,7 +4,7 @@ import { db } from '@/lib/db'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runWcReconcile } from '@/lib/connectors/woocommerce/sync/reconcile'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
-import { appendCronRunId, runCronWithLogging } from '@/lib/ops/cron-run'
+import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
 
 // Called by cron with Authorization: Bearer $CRON_SECRET.
 export async function GET(request: Request) {
@@ -29,5 +29,5 @@ export async function GET(request: Request) {
     },
   })
 
-  return NextResponse.json(appendCronRunId(result, runId))
+  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit())
 }

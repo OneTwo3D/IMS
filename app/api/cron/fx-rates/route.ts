@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { fetchAllFxRatesInternal } from '@/app/actions/currencies'
-import { appendCronRunId, runCronWithLogging } from '@/lib/ops/cron-run'
+import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
 
 export async function GET(request: Request) {
   const err = await verifyCron(request)
@@ -14,5 +14,5 @@ export async function GET(request: Request) {
     run: async () => await fetchAllFxRatesInternal() as Record<string, unknown>,
   })
 
-  return NextResponse.json(appendCronRunId(result, runId))
+  return NextResponse.json(appendCronRunId(result, runId), cronRunResponseInit())
 }
