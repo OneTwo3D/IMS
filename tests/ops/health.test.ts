@@ -9,6 +9,7 @@ import {
   buildPublicHealthResponse,
   collectAdminHealth,
   createAdminHealthHandler,
+  summarizeHealthStatus,
 } from '../../lib/ops/health.ts'
 
 const FIXED_DATE = new Date('2026-04-28T12:00:00.000Z')
@@ -90,33 +91,7 @@ test('admin health handler returns service-unavailable only when core health is 
 })
 
 test('admin health collection summarizes adapter checks without exposing raw environment data', async () => {
-  const adapters: HealthAdapters = {
-    now: () => FIXED_DATE,
-    appVersion: () => '1.5.0',
-    commitSha: () => 'abc1234',
-    checkDatabase: async () => ({ status: 'ok', checkedAt: FIXED_DATE.toISOString() }),
-    latestMigration: async () => ({
-      status: 'ok',
-      checkedAt: FIXED_DATE.toISOString(),
-      lastRunAt: FIXED_DATE.toISOString(),
-      lastStatus: 'applied',
-      reference: '202604280001_stage_091',
-    }),
-    checkWritableDirectories: async () => [
-      {
-        label: 'backups',
-        writable: true,
-        status: 'ok',
-        checkedAt: FIXED_DATE.toISOString(),
-      },
-    ],
-    latestBackup: async () => ({
-      status: 'ok',
-      checkedAt: FIXED_DATE.toISOString(),
-      lastRunAt: FIXED_DATE.toISOString(),
-      lastStatus: 'available',
-      reference: 'scheduled.dump',
-    }),
+  const adapters = createHealthAdapters({
     latestAccountingBatch: async () => ({
       status: 'warning',
       checkedAt: FIXED_DATE.toISOString(),
@@ -124,23 +99,7 @@ test('admin health collection summarizes adapter checks without exposing raw env
       lastStatus: 'FAILED',
       reference: 'DAILY_BATCH_GROUP_B',
     }),
-    latestWooCommerceSync: async () => ({
-      status: 'ok',
-      checkedAt: FIXED_DATE.toISOString(),
-      lastRunAt: FIXED_DATE.toISOString(),
-      lastStatus: 'SYNCED',
-      reference: 'Product',
-      details: { connector: 'woocommerce' },
-    }),
-    latestFxSync: async () => ({
-      status: 'ok',
-      checkedAt: FIXED_DATE.toISOString(),
-      lastRunAt: FIXED_DATE.toISOString(),
-      lastStatus: 'synced',
-      reference: 'EUR',
-      details: { source: 'frankfurter' },
-    }),
-  }
+  })
 
   const report = await collectAdminHealth(adapters)
 
@@ -149,6 +108,28 @@ test('admin health collection summarizes adapter checks without exposing raw env
   assert.equal(report.checkedAt, FIXED_DATE.toISOString())
   assert.deepEqual(report.app, { version: '1.5.0', commitSha: 'abc1234' })
   assert.equal(JSON.stringify(report).includes('DATABASE_URL'), false)
+  assert.equal(JSON.stringify(report).includes('stage_091'), false)
+})
+
+test('admin health status treats any error check as down without relying on array position', () => {
+  const okCheck = { status: 'ok', checkedAt: FIXED_DATE.toISOString() } as const
+  const errorCheck = { status: 'error', checkedAt: FIXED_DATE.toISOString() } as const
+
+  assert.equal(summarizeHealthStatus(okCheck, [errorCheck]), 'down')
+  assert.equal(summarizeHealthStatus(errorCheck, [okCheck]), 'down')
+})
+
+test('admin health collection degrades instead of hanging when an adapter times out', async () => {
+  const report = await collectAdminHealth(
+    createHealthAdapters({
+      latestBackup: async () => new Promise(() => undefined),
+    }),
+    { timeoutMs: 5 },
+  )
+
+  assert.equal(report.status, 'degraded')
+  assert.equal(report.checks.latestBackup.status, 'warning')
+  assert.equal(report.checks.latestBackup.message, 'Health check failed or timed out: latest backup')
 })
 
 test('FX health uses last successful fetch timestamp instead of FX rate rows', () => {
@@ -235,6 +216,61 @@ function createAdminReport(overrides: Partial<AdminHealthResponse> = {}): AdminH
         reference: 'EUR',
       },
     },
+    ...overrides,
+  }
+}
+
+function createHealthAdapters(overrides: Partial<HealthAdapters> = {}): HealthAdapters {
+  return {
+    now: () => FIXED_DATE,
+    appVersion: () => '1.5.0',
+    commitSha: () => 'abc1234',
+    checkDatabase: async () => ({ status: 'ok', checkedAt: FIXED_DATE.toISOString() }),
+    latestMigration: async () => ({
+      status: 'ok',
+      checkedAt: FIXED_DATE.toISOString(),
+      lastRunAt: FIXED_DATE.toISOString(),
+      lastStatus: 'applied',
+      reference: null,
+    }),
+    checkWritableDirectories: async () => [
+      {
+        label: 'backups',
+        writable: true,
+        status: 'ok',
+        checkedAt: FIXED_DATE.toISOString(),
+      },
+    ],
+    latestBackup: async () => ({
+      status: 'ok',
+      checkedAt: FIXED_DATE.toISOString(),
+      lastRunAt: FIXED_DATE.toISOString(),
+      lastStatus: 'available',
+      reference: 'scheduled.dump',
+    }),
+    latestAccountingBatch: async () => ({
+      status: 'ok',
+      checkedAt: FIXED_DATE.toISOString(),
+      lastRunAt: FIXED_DATE.toISOString(),
+      lastStatus: 'SYNCED',
+      reference: 'DAILY_BATCH_REVENUE_DEFERRAL',
+    }),
+    latestWooCommerceSync: async () => ({
+      status: 'ok',
+      checkedAt: FIXED_DATE.toISOString(),
+      lastRunAt: FIXED_DATE.toISOString(),
+      lastStatus: 'SYNCED',
+      reference: 'Product',
+      details: { connector: 'woocommerce' },
+    }),
+    latestFxSync: async () => ({
+      status: 'ok',
+      checkedAt: FIXED_DATE.toISOString(),
+      lastRunAt: FIXED_DATE.toISOString(),
+      lastStatus: 'synced',
+      reference: 'frankfurter',
+      details: { source: 'frankfurter' },
+    }),
     ...overrides,
   }
 }

@@ -17,6 +17,8 @@ const DAILY_BATCH_SYNC_TYPES = [
 
 const FX_SYNC_STALE_AFTER_MS = 36 * 60 * 60 * 1000
 
+const HEALTH_CHECK_TIMEOUT_MS = 5000
+
 type JsonPrimitive = string | number | boolean | null
 
 export type PublicHealthResponse = {
@@ -79,6 +81,14 @@ export type HealthAdapters = {
   latestFxSync: () => Promise<LatestOperationHealthCheck>
 }
 
+export type CollectAdminHealthOptions = {
+  timeoutMs?: number
+}
+
+/**
+ * Return a Response only when access should stop early, such as a 401/403
+ * denial. Return null when the caller is authorized to receive diagnostics.
+ */
 export type AdminHealthAuthorizer = () => Promise<Response | null>
 
 export function buildPublicHealthResponse(now: Date = new Date()): PublicHealthResponse {
@@ -91,8 +101,10 @@ export function buildPublicHealthResponse(now: Date = new Date()): PublicHealthR
 
 export async function collectAdminHealth(
   adapters: HealthAdapters = createDefaultHealthAdapters(),
+  options: CollectAdminHealthOptions = {},
 ): Promise<AdminHealthResponse> {
   const checkedAt = adapters.now().toISOString()
+  const timeoutMs = options.timeoutMs ?? HEALTH_CHECK_TIMEOUT_MS
   const [
     database,
     migrations,
@@ -102,19 +114,24 @@ export async function collectAdminHealth(
     latestWooCommerceSync,
     latestFxSync,
   ] = await Promise.all([
-    adapters.checkDatabase(),
-    adapters.latestMigration(),
-    adapters.checkWritableDirectories(),
-    adapters.latestBackup(),
-    adapters.latestAccountingBatch(),
-    adapters.latestWooCommerceSync(),
-    adapters.latestFxSync(),
+    runHealthAdapter('database', adapters.checkDatabase, timeoutMs, (message) => errorCheck(message)),
+    runHealthAdapter('migrations', adapters.latestMigration, timeoutMs, (message) => warningLatest(message)),
+    runHealthAdapter('writable directories', adapters.checkWritableDirectories, timeoutMs, (message) => [
+      warningDirectoryCheck('writableDirectories', message),
+    ]),
+    runHealthAdapter('latest backup', adapters.latestBackup, timeoutMs, (message) => warningLatest(message)),
+    runHealthAdapter('latest accounting batch', adapters.latestAccountingBatch, timeoutMs, (message) =>
+      warningLatest(message),
+    ),
+    runHealthAdapter('latest WooCommerce sync', adapters.latestWooCommerceSync, timeoutMs, (message) =>
+      warningLatest(message),
+    ),
+    runHealthAdapter('latest FX sync', adapters.latestFxSync, timeoutMs, (message) => warningLatest(message)),
   ])
 
-  const status = summarizeHealthStatus([
-    database,
-    migrations,
+  const status = summarizeHealthStatus(database, [
     ...writableDirectories,
+    migrations,
     latestBackup,
     latestAccountingBatch,
     latestWooCommerceSync,
@@ -157,8 +174,8 @@ export function createAdminHealthHandler({
   collect?: () => Promise<AdminHealthResponse>
 }) {
   return async function adminHealthHandler() {
-    const unauthorizedResponse = await authorize()
-    if (unauthorizedResponse) return unauthorizedResponse
+    const denyResponse = await authorize()
+    if (denyResponse) return denyResponse
 
     const health = await collect()
     return Response.json(health, {
@@ -183,9 +200,9 @@ export function createDefaultHealthAdapters(): HealthAdapters {
   }
 }
 
-function summarizeHealthStatus(checks: HealthCheck[]): HealthStatus {
-  if (checks[0]?.status === 'error') return 'down'
-  if (checks.some((check) => check.status !== 'ok')) return 'degraded'
+export function summarizeHealthStatus(database: HealthCheck, checks: HealthCheck[]): HealthStatus {
+  if (database.status === 'error' || checks.some((check) => check.status === 'error')) return 'down'
+  if (database.status !== 'ok' || checks.some((check) => check.status !== 'ok')) return 'degraded'
   return 'ok'
 }
 
@@ -205,6 +222,24 @@ function okCheck(details?: Record<string, JsonPrimitive>): HealthCheck {
   }
 }
 
+function errorCheck(message: string): HealthCheck {
+  return {
+    status: 'error',
+    checkedAt: checkedAt(),
+    message,
+  }
+}
+
+function warningDirectoryCheck(label: string, message: string): DirectoryHealthCheck {
+  return {
+    label,
+    writable: false,
+    status: 'warning',
+    checkedAt: checkedAt(),
+    message,
+  }
+}
+
 function warningLatest(message: string): LatestOperationHealthCheck {
   return {
     status: 'warning',
@@ -214,6 +249,33 @@ function warningLatest(message: string): LatestOperationHealthCheck {
     lastStatus: null,
     reference: null,
   }
+}
+
+async function runHealthAdapter<T>(
+  label: string,
+  run: () => Promise<T>,
+  timeoutMs: number,
+  fallback: (message: string) => T,
+): Promise<T> {
+  try {
+    return await withHealthCheckTimeout(run(), timeoutMs, label)
+  } catch (error) {
+    console.error(`Admin health ${label} check failed`, error)
+    return fallback(`Health check failed or timed out: ${label}`)
+  }
+}
+
+function withHealthCheckTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timeout: ReturnType<typeof setTimeout> | null = null
+  const timeoutPromise = new Promise<T>((_, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(`Health check timed out: ${label}`))
+    }, timeoutMs)
+  })
+
+  return Promise.race([promise, timeoutPromise]).finally(() => {
+    if (timeout) clearTimeout(timeout)
+  })
 }
 
 function errorLatest(message: string): LatestOperationHealthCheck {
@@ -323,7 +385,7 @@ async function getLatestMigration(): Promise<LatestOperationHealthCheck> {
     return latestOperation({
       lastRunAt: latest.finished_at,
       lastStatus: 'applied',
-      reference: latest.migration_name,
+      reference: null,
     })
   } catch (error) {
     console.error('Admin health migration check failed', error)
