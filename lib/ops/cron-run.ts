@@ -200,6 +200,10 @@ function collectResultErrors(value: unknown, path: string[] = []): string[] {
     summaries.push(formatResultError(label, summarizeErrorArray(value.errors)))
   }
 
+  if (Array.isArray(value.failed) && value.failed.length > 0) {
+    summaries.push(formatResultError(label, summarizeFailedArray(value.failed)))
+  }
+
   if (value.success === false && summaries.length === initialLength) {
     summaries.push(formatResultError(label, 'success false'))
   }
@@ -214,7 +218,7 @@ function collectResultErrors(value: unknown, path: string[] = []): string[] {
   }
 
   for (const [key, nestedValue] of Object.entries(value)) {
-    if (['error', 'errors', 'success', 'status'].includes(key)) continue
+    if (['error', 'errors', 'failed', 'success', 'status'].includes(key)) continue
     if (!isRecord(nestedValue) && !Array.isArray(nestedValue)) continue
     summaries.push(...collectNestedResultErrors(nestedValue, [...path, key]))
   }
@@ -241,6 +245,20 @@ function summarizeErrorArray(errors: unknown[]): string {
     .join('; ')
 
   return summary || `${errors.length} error(s)`
+}
+
+function summarizeFailedArray(failed: unknown[]): string {
+  const summary = failed
+    .map((failure) => {
+      if (typeof failure === 'string') return failure
+      if (isJsonObject(failure) && typeof failure.message === 'string') return failure.message
+      if (isJsonObject(failure) && typeof failure.code === 'string') return failure.code
+      return null
+    })
+    .filter((message): message is string => Boolean(message))
+    .join(', ')
+
+  return summary ? `failed: ${summary}` : `${failed.length} failed item(s)`
 }
 
 function formatResultError(path: string, message: string): string {

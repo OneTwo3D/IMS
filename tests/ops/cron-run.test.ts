@@ -148,6 +148,21 @@ test('cron run helper infers nested WooCommerce section failures', () => {
   assert.equal(outcome.errorSummary, 'orders: Order sync failed; stock.sync: Stock push failed')
 })
 
+test('cron run helper infers non-empty failed arrays as failures', () => {
+  assert.deepEqual(
+    inferCronRunOutcome({
+      success: true,
+      updated: ['EUR'],
+      failed: ['USD', 'CAD'],
+    }),
+    {
+      status: 'failed',
+      counts: { success: true },
+      errorSummary: 'failed: USD, CAD',
+    },
+  )
+})
+
 test('cron run helper treats nested skipped sections as non-fatal', () => {
   assert.deepEqual(
     inferCronRunOutcome({
