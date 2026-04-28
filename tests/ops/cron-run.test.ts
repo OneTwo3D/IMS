@@ -121,3 +121,28 @@ test('cron run helper infers invariant summaries and error arrays', () => {
     },
   )
 })
+
+test('cron run helper infers nested WooCommerce section failures', () => {
+  const outcome = inferCronRunOutcome({
+    orders: { success: false, error: 'Order sync failed' },
+    products: { imported: 2 },
+    stock: { sync: { errors: ['Stock push failed'] } },
+  })
+
+  assert.equal(outcome.status, 'failed')
+  assert.equal(outcome.errorSummary, 'orders: Order sync failed; stock.sync: Stock push failed')
+})
+
+test('cron run helper treats nested skipped sections as non-fatal', () => {
+  assert.deepEqual(
+    inferCronRunOutcome({
+      orders: { imported: 3 },
+      stock: { skipped: true, reason: 'No stock mappings queued' },
+    }),
+    {
+      status: 'completed',
+      counts: null,
+      errorSummary: null,
+    },
+  )
+})

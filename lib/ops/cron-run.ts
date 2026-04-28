@@ -4,6 +4,8 @@ import { db } from '@/lib/db'
 
 export type CronRunStatus = 'completed' | 'failed' | 'skipped'
 
+const MAX_ERROR_SUMMARY_LENGTH = 500
+
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue }
 type JsonObject = { [key: string]: JsonValue }
 
@@ -161,25 +163,82 @@ function getCounts(result: Record<string, unknown>): JsonObject | null {
 }
 
 function summarizeResultError(result: Record<string, unknown>): string | null {
-  if (typeof result.error === 'string' && result.error.trim()) return result.error
-  if (Array.isArray(result.errors) && result.errors.length > 0) {
-    return result.errors
-      .map((error) => {
-        if (typeof error === 'string') return error
-        if (isJsonObject(error) && typeof error.message === 'string') return error.message
-        return null
-      })
-      .filter((message): message is string => Boolean(message))
-      .join('; ')
-      .slice(0, 500) || `${result.errors.length} error(s)`
-  }
-  return null
+  const summaries = collectResultErrors(result)
+  if (summaries.length === 0) return null
+
+  return summaries.join('; ').slice(0, MAX_ERROR_SUMMARY_LENGTH)
 }
 
 function summarizeError(error: unknown): string {
-  if (error instanceof Error && error.message.trim()) return error.message.slice(0, 500)
-  if (typeof error === 'string' && error.trim()) return error.slice(0, 500)
+  if (error instanceof Error && error.message.trim()) return error.message.slice(0, MAX_ERROR_SUMMARY_LENGTH)
+  if (typeof error === 'string' && error.trim()) return error.slice(0, MAX_ERROR_SUMMARY_LENGTH)
   return 'Unknown cron run failure'
+}
+
+function collectResultErrors(value: unknown, path: string[] = []): string[] {
+  if (!isRecord(value)) return []
+
+  const summaries: string[] = []
+  const label = path.join('.')
+  const initialLength = summaries.length
+
+  if (typeof value.error === 'string' && value.error.trim()) {
+    summaries.push(formatResultError(label, value.error.trim()))
+  }
+
+  if (Array.isArray(value.errors) && value.errors.length > 0) {
+    summaries.push(formatResultError(label, summarizeErrorArray(value.errors)))
+  }
+
+  if (value.success === false && summaries.length === initialLength) {
+    summaries.push(formatResultError(label, 'success false'))
+  }
+
+  if (
+    path.length > 0 &&
+    typeof value.status === 'string' &&
+    ['failed', 'partial_failure'].includes(value.status) &&
+    summaries.length === initialLength
+  ) {
+    summaries.push(formatResultError(label, value.status))
+  }
+
+  for (const [key, nestedValue] of Object.entries(value)) {
+    if (['error', 'errors', 'success', 'status'].includes(key)) continue
+    if (!isRecord(nestedValue) && !Array.isArray(nestedValue)) continue
+    summaries.push(...collectNestedResultErrors(nestedValue, [...path, key]))
+  }
+
+  return summaries
+}
+
+function collectNestedResultErrors(value: unknown, path: string[]): string[] {
+  if (Array.isArray(value)) {
+    return value.flatMap((entry, index) => collectNestedResultErrors(entry, [...path, String(index)]))
+  }
+
+  return collectResultErrors(value, path)
+}
+
+function summarizeErrorArray(errors: unknown[]): string {
+  const summary = errors
+    .map((error) => {
+      if (typeof error === 'string') return error
+      if (isJsonObject(error) && typeof error.message === 'string') return error.message
+      return null
+    })
+    .filter((message): message is string => Boolean(message))
+    .join('; ')
+
+  return summary || `${errors.length} error(s)`
+}
+
+function formatResultError(path: string, message: string): string {
+  return path ? `${path}: ${message}` : message
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === 'object' && !Array.isArray(value)
 }
 
 function isJsonObject(value: unknown): value is JsonObject {
