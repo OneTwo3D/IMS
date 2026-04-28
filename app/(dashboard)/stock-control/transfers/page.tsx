@@ -16,10 +16,14 @@ export default async function WarehouseTransfersPage() {
   const stockable = products.filter(
     (p) => p.type !== 'VARIABLE' && p.type !== 'NON_INVENTORY' && p.type !== 'KIT'
   )
+  const stockProductIds = Array.from(new Set([
+    ...stockable.map((product) => product.id),
+    ...transfers.flatMap((transfer) => transfer.lines.map((line) => line.productId)),
+  ]))
   const [mintsoftAsnStates, stockLevels] = await Promise.all([
     getMintsoftTransferAsnStates(transfers.map((transfer) => transfer.id)),
     getScopedStockLevelMap({
-      productIds: stockable.map((product) => product.id),
+      productIds: stockProductIds,
       warehouseIds: warehouses.map((warehouse) => warehouse.id),
     }),
   ])
