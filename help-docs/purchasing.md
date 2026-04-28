@@ -25,13 +25,21 @@ The main purchasing page shows all purchase orders in a searchable table.
 
 ## Purchase Order Statuses
 
+Purchase orders use the canonical purchase workflow documented in `docs/workflows.md`. User-facing statuses include:
+
 | Status | Meaning |
 |---|---|
 | **Draft** | The PO has been created but not yet sent. Lines can still be edited. |
 | **RFQ Sent** | A request for quotation has been sent to the supplier. |
+| **Quote Received** | A supplier quote has been received and can be converted to a purchase order. |
 | **PO Sent** | The purchase order has been confirmed and sent to the supplier. |
+| **Shipped** | The supplier has shipped the goods. |
 | **Partially Received** | Some lines have been received but the PO is not yet complete. |
-| **Fully Received** | All lines have been received. |
+| **Received** | All expected lines have been received. |
+| **Invoiced** | A supplier invoice has been recorded for the PO. |
+| **Partially Returned** | Some received goods have been returned to the supplier. |
+| **Returned** | Received goods have been fully returned to the supplier. |
+| **Closed** | The PO has been closed. |
 | **Cancelled** | The PO has been cancelled. |
 
 

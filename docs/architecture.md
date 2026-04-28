@@ -11,7 +11,7 @@
 | Email | nodemailer (SMTP) |
 | Charts | Recharts |
 | Styling | TailwindCSS 4 |
-| Process Manager | PM2 |
+| Process Manager | systemd service (`one-two-inventory.service`) |
 | Reverse Proxy | nginx |
 
 
@@ -125,7 +125,7 @@ Transform rules:
 - Blockers include stock on hand, reserved stock, open sales order lines, open purchase order lines, open production orders, and open transfer lines.
 - This prevents converting bundles or BOMs back to simple products while operational state is still attached.
 
-### Key Models (30+)
+### Key Models
 
 **Core Inventory:**
 - `Product` — all product types, with SKU, pricing, dimensions, weight, stock unit, images, HS code, country of origin

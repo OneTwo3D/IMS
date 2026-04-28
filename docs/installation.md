@@ -23,14 +23,14 @@ The script performs the following steps:
 2. **Installs Node.js 22** via NodeSource
 3. **Installs and configures PostgreSQL** — creates the database and user
 4. **Installs nginx**, `fail2ban`, and automatic security updates
-5. **Installs PM2** globally for process management
+5. **Installs runtime tooling** used by deployment and maintenance scripts
 6. **Prompts for configuration** values (see below)
 7. **Creates the app system user** (`imsapp`)
 8. **Deploys the application** — clones from git or copies from a local directory
 9. **Installs npm dependencies** and builds the Next.js application
 10. **Runs database migrations** via Prisma
 11. **Optionally seeds public URL, SMTP settings, and a default admin user**
-12. **Configures PM2** with an ecosystem file and registers it with systemd
+12. **Configures a native systemd service** for the application
 13. **Configures nginx** as a reverse proxy
 14. **Enables fail2ban and unattended security updates**
 15. **Sets up cron jobs** for scheduled tasks
@@ -95,34 +95,35 @@ After installation, sign in and set the organisation base currency in **Settings
 | `/var/log/one-two-inventory` | Application logs |
 
 
-## PM2 Process Management
+## Application Service Management
 
-The application runs under PM2 with automatic restarts and systemd integration.
+Current installs run the application as a native systemd service named
+`one-two-inventory.service`. Older deployments may still have PM2 installed, but
+PM2 is not the current process manager for new installs.
 
 ### Common Commands
 
 ```bash
 # View process status
-pm2 status
+systemctl status one-two-inventory.service
 
 # View live logs
-pm2 logs one-two-inventory
+journalctl -u one-two-inventory.service -f
 
 # Restart the application
-pm2 restart one-two-inventory
+systemctl restart one-two-inventory.service
 
 # Stop the application
-pm2 stop one-two-inventory
+systemctl stop one-two-inventory.service
 
 # Start the application
-pm2 start one-two-inventory
+systemctl start one-two-inventory.service
 ```
 
-PM2 is configured with:
+The service is configured with:
 - Automatic restart on crash
-- Maximum memory restart at 1 GB
-- Log files in `/var/log/one-two-inventory/`
-- Systemd service for boot persistence
+- Logs available through journald
+- Boot persistence through systemd
 
 
 ## Cron Jobs
@@ -169,8 +170,9 @@ Manual equivalent:
 ```bash
 cd /opt/one-two-inventory
 
-# Pull latest code
-git pull origin main
+# Replace <deployed-branch> with the branch this instance tracks
+git fetch origin
+git reset --hard origin/<deployed-branch>
 
 # Install dependencies
 npm ci --omit=dev
@@ -183,7 +185,7 @@ npx prisma migrate deploy --schema prisma/schema.prisma
 npm run build
 
 # Restart
-pm2 restart one-two-inventory
+systemctl restart one-two-inventory.service
 ```
 
 
