@@ -64,7 +64,7 @@ type ScheduledInvariantCheckDependencies = {
   runInventoryReport?: () => Promise<InventoryInvariantReport>
   runAccountingReport?: () => Promise<AccountingInvariantReport>
   writeActivityLog?: typeof logActivity
-  notifyAdmins?: typeof notify
+  notifyAdmins?: (params: Omit<Parameters<typeof notify>[0], 'userId'>) => Promise<void>
   getPreviousCriticalFindingsHash?: () => Promise<string | null>
   setCriticalFindingsHash?: (hash: string | null) => Promise<void>
 }
@@ -194,6 +194,21 @@ async function setCriticalFindingsHash(hash: string | null): Promise<void> {
   })
 }
 
+async function notifyActiveAdmins(params: Omit<Parameters<typeof notify>[0], 'userId'>): Promise<void> {
+  const admins = await db.user.findMany({
+    where: {
+      role: 'ADMIN',
+      active: true,
+    },
+    select: { id: true },
+  })
+
+  await Promise.all(admins.map((admin) => notify({
+    ...params,
+    userId: admin.id,
+  })))
+}
+
 export async function runScheduledInvariantCheck(
   dependencies: ScheduledInvariantCheckDependencies = {},
 ): Promise<ScheduledInvariantCheckResult> {
@@ -202,7 +217,7 @@ export async function runScheduledInvariantCheck(
   const runInventoryReport = dependencies.runInventoryReport ?? runInventoryInvariantReport
   const runAccountingReport = dependencies.runAccountingReport ?? runAccountingInvariantReport
   const writeActivityLog = dependencies.writeActivityLog ?? logActivity
-  const notifyAdmins = dependencies.notifyAdmins ?? notify
+  const notifyAdmins = dependencies.notifyAdmins ?? notifyActiveAdmins
   const readCriticalFindingsHash = dependencies.getPreviousCriticalFindingsHash ?? getPreviousCriticalFindingsHash
   const writeCriticalFindingsHash = dependencies.setCriticalFindingsHash ?? setCriticalFindingsHash
 

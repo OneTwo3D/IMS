@@ -39,6 +39,7 @@ export type LandedCostRecalcResult = {
   inventoryTransitAdjustments: Array<{
     primaryPoId: string
     primaryPoRef: string
+    eventKey: string
     totalDelta: number
   }>
   /** COGS adjustment needed for layers that were already consumed before
@@ -46,6 +47,7 @@ export type LandedCostRecalcResult = {
   cogsAdjustments: Array<{
     primaryPoId: string
     primaryPoRef: string
+    eventKey: string
     totalDelta: number
   }>
 }
@@ -66,6 +68,15 @@ type CostLayerAdjustmentInput = {
 }
 
 type LandedCostAdjustment = LandedCostRecalcResult['inventoryTransitAdjustments'][number]
+type LandedCostAdjustmentLayerContext = {
+  costLayerId: string
+  oldUnitCost: number
+  newUnitCost: number
+  receivedQty: number
+  remainingQty: number
+  returnedQty: number
+  supplierReturnedQty: number
+}
 
 export type LandedCostServiceDeps = {
   getReturnedQtyForCostLayer: typeof getReturnedQtyForCostLayer
@@ -156,8 +167,33 @@ function landedCostAdjustmentKeyPayload(adj: LandedCostAdjustment): Record<strin
   return {
     primaryPoId: adj.primaryPoId,
     primaryPoRef: adj.primaryPoRef,
+    eventKey: adj.eventKey,
     totalDelta: Math.round(adj.totalDelta * 100) / 100,
   }
+}
+
+function roundAdjustmentContextValue(value: number): number {
+  return Math.round(value * 1_000_000) / 1_000_000
+}
+
+function landedCostAdjustmentEventKey(
+  primaryPoId: string,
+  layers: LandedCostAdjustmentLayerContext[],
+): string {
+  return accountingPayloadKey('landed-cost-adjustment-event', {
+    primaryPoId,
+    layers: layers
+      .map((layer) => ({
+        costLayerId: layer.costLayerId,
+        oldUnitCost: roundAdjustmentContextValue(layer.oldUnitCost),
+        newUnitCost: roundAdjustmentContextValue(layer.newUnitCost),
+        receivedQty: roundAdjustmentContextValue(layer.receivedQty),
+        remainingQty: roundAdjustmentContextValue(layer.remainingQty),
+        returnedQty: roundAdjustmentContextValue(layer.returnedQty),
+        supplierReturnedQty: roundAdjustmentContextValue(layer.supplierReturnedQty),
+      }))
+      .sort((left, right) => left.costLayerId.localeCompare(right.costLayerId)),
+  })
 }
 
 export function landedCostAdjustmentIdempotencyKey(
@@ -416,6 +452,7 @@ export async function recalculateLandedCosts(
 
     let totalCogsDelta = 0
     let totalInventoryDelta = 0
+    const adjustmentLayers: LandedCostAdjustmentLayerContext[] = []
 
     for (const line of primaryPo.lines) {
       const lineQty = decimal(line.qty)
@@ -453,6 +490,17 @@ export async function recalculateLandedCosts(
         })
         totalCogsDelta += deltas.cogsDelta
         totalInventoryDelta += deltas.inventoryDelta
+        if (Math.abs(deltas.cogsDelta) > 0.000001 || Math.abs(deltas.inventoryDelta) > 0.000001) {
+          adjustmentLayers.push({
+            costLayerId: cl.id,
+            oldUnitCost,
+            newUnitCost,
+            receivedQty,
+            remainingQty,
+            returnedQty,
+            supplierReturnedQty,
+          })
+        }
 
         await tx.costLayer.update({
           where: { id: cl.id },
@@ -468,11 +516,13 @@ export async function recalculateLandedCosts(
     }
 
     result.revalidatePoIds.push(primaryPoId)
+    const eventKey = landedCostAdjustmentEventKey(primaryPoId, adjustmentLayers)
 
     if (Math.abs(totalCogsDelta) > 0.01) {
       result.cogsAdjustments.push({
         primaryPoId,
         primaryPoRef: primaryPo.reference,
+        eventKey,
         totalDelta: Math.round(totalCogsDelta * 100) / 100,
       })
     }
@@ -480,6 +530,7 @@ export async function recalculateLandedCosts(
       result.inventoryTransitAdjustments.push({
         primaryPoId,
         primaryPoRef: primaryPo.reference,
+        eventKey,
         totalDelta: Math.round(totalInventoryDelta * 100) / 100,
       })
     }
@@ -579,6 +630,7 @@ export async function recalculateDirectLandedCosts(
 
   let totalCogsDelta = 0
   let totalInventoryDelta = 0
+  const adjustmentLayers: LandedCostAdjustmentLayerContext[] = []
 
   for (const line of po.lines) {
     const lineQty = decimal(line.qty)
@@ -616,6 +668,17 @@ export async function recalculateDirectLandedCosts(
       })
       totalCogsDelta += deltas.cogsDelta
       totalInventoryDelta += deltas.inventoryDelta
+      if (Math.abs(deltas.cogsDelta) > 0.000001 || Math.abs(deltas.inventoryDelta) > 0.000001) {
+        adjustmentLayers.push({
+          costLayerId: cl.id,
+          oldUnitCost,
+          newUnitCost,
+          receivedQty,
+          remainingQty,
+          returnedQty,
+          supplierReturnedQty,
+        })
+      }
 
       await tx.costLayer.update({
         where: { id: cl.id },
@@ -631,10 +694,12 @@ export async function recalculateDirectLandedCosts(
   }
 
   const result: LandedCostRecalcResult = { revalidatePoIds: [poId], inventoryTransitAdjustments: [], cogsAdjustments: [] }
+  const eventKey = landedCostAdjustmentEventKey(poId, adjustmentLayers)
   if (Math.abs(totalInventoryDelta) > 0.01) {
     result.inventoryTransitAdjustments.push({
       primaryPoId: poId,
       primaryPoRef: po.reference,
+      eventKey,
       totalDelta: Math.round(totalInventoryDelta * 100) / 100,
     })
   }
@@ -642,6 +707,7 @@ export async function recalculateDirectLandedCosts(
     result.cogsAdjustments.push({
       primaryPoId: poId,
       primaryPoRef: po.reference,
+      eventKey,
       totalDelta: Math.round(totalCogsDelta * 100) / 100,
     })
   }
