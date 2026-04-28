@@ -204,6 +204,7 @@ export async function queueAccountingSyncTx(
       })
     }
     await mirrorAccountingSyncLogToEvent(tx, {
+      syncLogId: log.id,
       connector: context.connector,
       type: params.type,
       referenceType: params.referenceType,
@@ -211,7 +212,15 @@ export async function queueAccountingSyncTx(
       payload,
       currency: baseCurrency,
       status: 'PENDING',
-    })
+    }).catch((mirrorError: unknown) => tx.activityLog.create({
+      data: {
+        entityType: 'SYSTEM',
+        action: 'accounting_event_mirror_error',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `Accounting sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
+      },
+    }).then(() => undefined))
   } catch (error) {
     if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return
     throw error

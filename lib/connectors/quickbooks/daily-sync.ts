@@ -192,7 +192,7 @@ async function createPendingSyncLog(
     currency: string
   },
 ): Promise<void> {
-  await tx.accountingSyncLog.create({
+  const log = await tx.accountingSyncLog.create({
     data: {
       connector: QBO_CONNECTOR,
       type: params.type,
@@ -203,6 +203,7 @@ async function createPendingSyncLog(
     },
   })
   await mirrorAccountingSyncLogToEvent(tx, {
+    syncLogId: log.id,
     connector: QBO_CONNECTOR,
     type: params.type,
     referenceType: 'DailyBatch',

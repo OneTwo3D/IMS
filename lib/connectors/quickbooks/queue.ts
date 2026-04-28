@@ -4,6 +4,7 @@
  */
 
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
 import { getQuickBooksSettings, type QuickBooksSettings } from './settings'
@@ -60,28 +61,39 @@ export async function queueQuickBooksSync(params: {
   }
 
   try {
-    const baseCurrency = await getBaseCurrencyCode()
-    await db.$transaction(async (tx) => {
-      await tx.accountingSyncLog.create({
-        data: {
-          connector: 'quickbooks',
-          type: params.type,
-          status: 'PENDING',
-          referenceType: params.referenceType,
-          referenceId: params.referenceId,
-          payload: payload as never,
-        },
-      })
-      await mirrorAccountingSyncLogToEvent(tx, {
+    const log = await db.$transaction(async (tx) => tx.accountingSyncLog.create({
+      data: {
         connector: 'quickbooks',
         type: params.type,
+        status: 'PENDING',
         referenceType: params.referenceType,
         referenceId: params.referenceId,
-        payload,
-        currency: baseCurrency,
-        status: 'PENDING',
+        payload: payload as never,
+      },
+    }))
+    try {
+      const baseCurrency = await getBaseCurrencyCode()
+      await db.$transaction(async (tx) => {
+        await mirrorAccountingSyncLogToEvent(tx, {
+          syncLogId: log.id,
+          connector: 'quickbooks',
+          type: params.type,
+          referenceType: params.referenceType,
+          referenceId: params.referenceId,
+          payload,
+          currency: baseCurrency,
+          status: 'PENDING',
+        })
       })
-    })
+    } catch (mirrorError) {
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'accounting_event_mirror_error',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `QuickBooks sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
+      })
+    }
   } catch (error) {
     if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return
     throw error

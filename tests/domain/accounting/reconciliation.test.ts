@@ -261,13 +261,14 @@ test('accounting reconciliation row collection selects required datasets', async
     (calls.salesOrder as { where: { status: unknown } }).where.status,
     { notIn: ['REFUNDED', 'CANCELLED'] },
   )
-  assert.deepEqual(
-    (calls.shipment as { where: unknown }).where,
-    { shipmentJournalDate: { not: null } },
-  )
+  const salesOrderWhere = (calls.salesOrder as { where: { OR: Array<{ revenueDeferredDate?: { gte?: unknown }; inventoryAllocatedDate?: { gte?: unknown } }> } }).where
+  assert.ok(salesOrderWhere.OR[0].revenueDeferredDate?.gte instanceof Date)
+  assert.ok(salesOrderWhere.OR[1].inventoryAllocatedDate?.gte instanceof Date)
+  const shipmentWhere = (calls.shipment as { where: { shipmentJournalDate: { gte?: unknown } } }).where
+  assert.ok(shipmentWhere.shipmentJournalDate.gte instanceof Date)
   assert.deepEqual(
     (calls.salesOrderRefund as { where: { order: unknown }; take: number }).where.order,
-    { status: { notIn: ['REFUNDED', 'CANCELLED'] } },
+    { status: { not: 'CANCELLED' } },
   )
   assert.equal((calls.salesOrderRefund as { take: number }).take, 10000)
   assert.equal((calls.accountingSyncLog as { take: number }).take, 10000)

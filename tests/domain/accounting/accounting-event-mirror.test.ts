@@ -205,6 +205,31 @@ test('reruns build the same deterministic accounting event key', () => {
   assert.equal(first.idempotencyKey, second.idempotencyKey)
 })
 
+test('sync-log id disambiguates mirror keys when payload only has a date fallback', () => {
+  const params = {
+    connector: 'xero',
+    type: 'DAILY_BATCH_REVENUE_DEFERRAL',
+    referenceType: 'DailyBatch',
+    referenceId: 'A1-2026-04-26',
+    currency: 'GBP',
+    payload: {
+      date: '2026-04-26',
+      lines: [
+        { accountCode: '400', description: 'Daily revenue deferral', debit: 10 },
+        { accountCode: '210', description: 'Daily revenue deferral', credit: 10 },
+      ],
+    },
+  }
+
+  const first = buildMirroredAccountingEventDraft({ ...params, syncLogId: 'sync-1' })
+  const second = buildMirroredAccountingEventDraft({ ...params, syncLogId: 'sync-2' })
+
+  assert.ok(first)
+  assert.ok(second)
+  assert.equal(first.idempotencyKey, 'accounting-sync-log:xero:sync-1')
+  assert.equal(second.idempotencyKey, 'accounting-sync-log:xero:sync-2')
+})
+
 test('sync success updates mirrored daily batch event to posted with external id', async () => {
   const updates: unknown[] = []
   const logs: unknown[] = []

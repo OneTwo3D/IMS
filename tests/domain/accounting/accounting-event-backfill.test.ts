@@ -510,6 +510,36 @@ test('accounting event backfill only suppresses candidates with matching mirrore
   assert.equal(report.candidateSummary.total, 1)
 })
 
+test('accounting event backfill matches legacy blank connector sync logs connector-agnostically', async () => {
+  const sourceLog = syncedJournalLog({
+    id: 'sync-blank-connector',
+    connector: '',
+    externalTransactionId: 'journal-source',
+  })
+  const mirroredEvent = {
+    ...mirroredEventForLog(sourceLog),
+    id: 'event-real-connector',
+    externalSystem: 'xero',
+  }
+  const { calls, client } = makeClient({
+    syncLogs: [sourceLog],
+    events: [mirroredEvent],
+  })
+
+  const report = await runTestBackfill({ client: client as never })
+
+  assert.equal(report.summary.candidates, 0)
+  assert.deepEqual(report.results, [])
+  assert.deepEqual(
+    (calls.accountingEventFindMany[0] as MockAccountingEventFindManyArgs).where?.OR?.[0],
+    {
+      type: 'DAILY_BATCH_REVENUE_DEFERRAL',
+      sourceEntityType: 'DailyBatch',
+      sourceEntityId: 'A1-2026-04-26',
+    },
+  )
+})
+
 test('accounting event backfill pages deterministically until it fills the limit', async () => {
   const mirroredLogs = Array.from({ length: 100 }, (_, index) => {
     const suffix = index.toString().padStart(3, '0')

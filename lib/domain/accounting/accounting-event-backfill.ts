@@ -140,6 +140,7 @@ function syncLogResultBase(log: AccountingBackfillSyncLogRow): Omit<AccountingEv
 
 function buildDraftForSyncLog(log: AccountingBackfillSyncLogRow, baseCurrency: string): AccountingEventDraft | null {
   return buildMirroredAccountingEventDraft({
+    syncLogId: log.id,
     connector: log.connector,
     type: log.type,
     referenceType: log.referenceType,
@@ -151,31 +152,17 @@ function buildDraftForSyncLog(log: AccountingBackfillSyncLogRow, baseCurrency: s
   })
 }
 
-function eventKey(input: {
-  externalSystem?: string | null
-  type: string
-  sourceEntityType: string
-  sourceEntityId: string
-}): string {
-  return [
-    input.externalSystem ?? '*',
-    input.type,
-    input.sourceEntityType,
-    input.sourceEntityId,
-  ].join('|')
-}
-
 function hasMirroredAccountingEvent(
   accountingEvents: AccountingBackfillEventRow[],
   log: AccountingBackfillSyncLogRow,
 ): boolean {
-  const key = eventKey({
-    externalSystem: log.connector,
-    type: log.type,
-    sourceEntityType: log.referenceType,
-    sourceEntityId: log.referenceId,
+  const connector = log.connector.trim()
+  return accountingEvents.some((event) => {
+    if (connector && event.externalSystem !== connector) return false
+    return event.type === log.type &&
+      event.sourceEntityType === log.referenceType &&
+      event.sourceEntityId === log.referenceId
   })
-  return accountingEvents.some((event) => eventKey(event) === key)
 }
 
 function buildBackfillSyncLogWhere(lookbackDays: number | undefined): unknown {
@@ -198,7 +185,7 @@ async function findExistingEventsForSyncLogs(
   return client.accountingEvent.findMany({
     where: {
       OR: logs.map((log) => ({
-        externalSystem: log.connector,
+        ...(log.connector.trim() ? { externalSystem: log.connector } : {}),
         type: log.type,
         sourceEntityType: log.referenceType,
         sourceEntityId: log.referenceId,

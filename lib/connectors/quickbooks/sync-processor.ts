@@ -60,6 +60,7 @@ function isRateLimitError(message: string): boolean {
 }
 
 async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClient, 'accountingEvent' | 'accountingEventLog'>, params: {
+  syncLogId: string
   type: AccountingSyncType
   referenceType: string
   referenceId: string
@@ -70,6 +71,7 @@ async function updateMirroredEventForSyncLog(client: Pick<Prisma.TransactionClie
 }): Promise<void> {
   await updateMirroredAccountingEventStatus(client, {
     connector: QBO_CONNECTOR,
+    syncLogId: params.syncLogId,
     type: params.type,
     referenceType: params.referenceType,
     referenceId: params.referenceId,
@@ -187,6 +189,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             },
           })
           await updateMirroredEventForSyncLog(tx, {
+            syncLogId: entry.id,
             type: entry.type,
             referenceType: entry.referenceType,
             referenceId: entry.referenceId,
@@ -219,6 +222,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             },
           })
           await updateMirroredEventForSyncLog(tx, {
+            syncLogId: entry.id,
             type: entry.type,
             referenceType: entry.referenceType,
             referenceId: entry.referenceId,
@@ -271,6 +275,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
             })
             if (finalFailure) {
               await updateMirroredEventForSyncLog(tx, {
+                syncLogId: entry.id,
                 type: entry.type,
                 referenceType: entry.referenceType,
                 referenceId: entry.referenceId,
@@ -309,6 +314,7 @@ export async function processPendingQuickBooksSync(): Promise<ProcessResult> {
           })
           if (finalFailure) {
             await updateMirroredEventForSyncLog(tx, {
+              syncLogId: entry.id,
               type: entry.type,
               referenceType: entry.referenceType,
               referenceId: entry.referenceId,

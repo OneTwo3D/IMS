@@ -4,6 +4,7 @@
  */
 
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
 import { getXeroSettings, type XeroSettings } from './settings'
@@ -61,8 +62,7 @@ export async function queueXeroSync(params: {
   }
 
   try {
-    const baseCurrency = await getBaseCurrencyCode()
-    await db.$transaction(async (tx) => {
+    const log = await db.$transaction(async (tx) => {
       const log = await tx.accountingSyncLog.create({
         data: {
           connector: 'xero',
@@ -76,16 +76,31 @@ export async function queueXeroSync(params: {
       await scheduleXeroAccountingOutbox(tx, {
         accountingSyncLogId: log.id,
       })
-      await mirrorAccountingSyncLogToEvent(tx, {
-        connector: 'xero',
-        type: params.type,
-        referenceType: params.referenceType,
-        referenceId: params.referenceId,
-        payload,
-        currency: baseCurrency,
-        status: 'PENDING',
-      })
+      return log
     })
+    try {
+      const baseCurrency = await getBaseCurrencyCode()
+      await db.$transaction(async (tx) => {
+        await mirrorAccountingSyncLogToEvent(tx, {
+          syncLogId: log.id,
+          connector: 'xero',
+          type: params.type,
+          referenceType: params.referenceType,
+          referenceId: params.referenceId,
+          payload,
+          currency: baseCurrency,
+          status: 'PENDING',
+        })
+      })
+    } catch (mirrorError) {
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'accounting_event_mirror_error',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `Xero sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
+      })
+    }
   } catch (error) {
     if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return
     throw error
