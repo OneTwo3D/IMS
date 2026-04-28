@@ -5,6 +5,7 @@ import { GET as publicHealthGET, HEAD as publicHealthHEAD } from '../../app/api/
 import {
   type AdminHealthResponse,
   type HealthAdapters,
+  buildFxSyncHealthFromLastFetched,
   buildPublicHealthResponse,
   collectAdminHealth,
   createAdminHealthHandler,
@@ -148,6 +149,35 @@ test('admin health collection summarizes adapter checks without exposing raw env
   assert.equal(report.checkedAt, FIXED_DATE.toISOString())
   assert.deepEqual(report.app, { version: '1.5.0', commitSha: 'abc1234' })
   assert.equal(JSON.stringify(report).includes('DATABASE_URL'), false)
+})
+
+test('FX health uses last successful fetch timestamp instead of FX rate rows', () => {
+  assert.deepEqual(
+    buildFxSyncHealthFromLastFetched('2026-04-28T06:00:00.000Z', FIXED_DATE),
+    {
+      status: 'ok',
+      checkedAt: FIXED_DATE.toISOString(),
+      message: undefined,
+      lastRunAt: '2026-04-28T06:00:00.000Z',
+      lastStatus: 'fetched',
+      reference: 'frankfurter',
+      details: {
+        ageMs: 21600000,
+        staleAfterMs: 129600000,
+      },
+    },
+  )
+})
+
+test('FX health warns when the last successful fetch timestamp is stale or missing', () => {
+  const stale = buildFxSyncHealthFromLastFetched('2026-04-26T00:00:00.000Z', FIXED_DATE)
+  const missing = buildFxSyncHealthFromLastFetched(null, FIXED_DATE)
+
+  assert.equal(stale.status, 'warning')
+  assert.equal(stale.lastStatus, 'stale')
+  assert.equal(stale.message, 'Latest FX fetch is stale')
+  assert.equal(missing.status, 'warning')
+  assert.equal(missing.message, 'No FX rate fetch timestamp found')
 })
 
 function createAdminReport(overrides: Partial<AdminHealthResponse> = {}): AdminHealthResponse {

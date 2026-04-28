@@ -15,6 +15,8 @@ const DAILY_BATCH_SYNC_TYPES = [
   'DAILY_BATCH_GROUP_B',
 ] as const
 
+const FX_SYNC_STALE_AFTER_MS = 36 * 60 * 60 * 1000
+
 type JsonPrimitive = string | number | boolean | null
 
 export type PublicHealthResponse = {
@@ -191,6 +193,10 @@ function checkedAt(): string {
   return new Date().toISOString()
 }
 
+function checkedAtFrom(now: Date): string {
+  return now.toISOString()
+}
+
 function okCheck(details?: Record<string, JsonPrimitive>): HealthCheck {
   return {
     status: 'ok',
@@ -218,6 +224,50 @@ function errorLatest(message: string): LatestOperationHealthCheck {
     lastRunAt: null,
     lastStatus: null,
     reference: null,
+  }
+}
+
+export function buildFxSyncHealthFromLastFetched(
+  lastFetchedAt: string | null | undefined,
+  now: Date = new Date(),
+): LatestOperationHealthCheck {
+  if (!lastFetchedAt) {
+    return {
+      status: 'warning',
+      checkedAt: checkedAtFrom(now),
+      message: 'No FX rate fetch timestamp found',
+      lastRunAt: null,
+      lastStatus: null,
+      reference: null,
+    }
+  }
+
+  const lastFetchedDate = new Date(lastFetchedAt)
+  if (Number.isNaN(lastFetchedDate.getTime())) {
+    return {
+      status: 'warning',
+      checkedAt: checkedAtFrom(now),
+      message: 'FX rate fetch timestamp is invalid',
+      lastRunAt: null,
+      lastStatus: null,
+      reference: null,
+    }
+  }
+
+  const ageMs = Math.max(0, now.getTime() - lastFetchedDate.getTime())
+  const stale = ageMs > FX_SYNC_STALE_AFTER_MS
+
+  return {
+    status: stale ? 'warning' : 'ok',
+    checkedAt: checkedAtFrom(now),
+    message: stale ? 'Latest FX fetch is stale' : undefined,
+    lastRunAt: lastFetchedDate.toISOString(),
+    lastStatus: stale ? 'stale' : 'fetched',
+    reference: 'frankfurter',
+    details: {
+      ageMs,
+      staleAfterMs: FX_SYNC_STALE_AFTER_MS,
+    },
   }
 }
 
@@ -409,24 +459,12 @@ async function getLatestWooCommerceSync(): Promise<LatestOperationHealthCheck> {
 async function getLatestFxSync(): Promise<LatestOperationHealthCheck> {
   try {
     const { db } = await import('@/lib/db')
-    const latest = await db.fxRate.findFirst({
-      orderBy: { fetchedAt: 'desc' },
-      select: {
-        toCurrency: true,
-        fetchedAt: true,
-        source: true,
-        manualOverride: true,
-      },
+    const latestFetch = await db.setting.findUnique({
+      where: { key: 'fx_last_fetched' },
+      select: { value: true },
     })
 
-    if (!latest) return warningLatest('No FX rate sync row found')
-
-    return latestOperation({
-      lastRunAt: latest.fetchedAt,
-      lastStatus: latest.manualOverride ? 'manual_override' : 'synced',
-      reference: latest.toCurrency,
-      details: { source: latest.source },
-    })
+    return buildFxSyncHealthFromLastFetched(latestFetch?.value)
   } catch (error) {
     console.error('Admin health FX sync check failed', error)
     return errorLatest('FX sync check failed')
