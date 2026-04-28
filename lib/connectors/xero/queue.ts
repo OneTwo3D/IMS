@@ -7,6 +7,7 @@ import { db } from '@/lib/db'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
 import { getXeroSettings, type XeroSettings } from './settings'
+import { scheduleXeroAccountingOutbox } from './outbox'
 
 /** Map sync type enum → setting key for per-type enable/disable */
 const SYNC_TYPE_SETTING: Record<string, keyof XeroSettings> = {
@@ -62,7 +63,7 @@ export async function queueXeroSync(params: {
   try {
     const baseCurrency = await getBaseCurrencyCode()
     await db.$transaction(async (tx) => {
-      await tx.accountingSyncLog.create({
+      const log = await tx.accountingSyncLog.create({
         data: {
           connector: 'xero',
           type: params.type,
@@ -71,6 +72,9 @@ export async function queueXeroSync(params: {
           referenceId: params.referenceId,
           payload: payload as never,
         },
+      })
+      await scheduleXeroAccountingOutbox(tx, {
+        accountingSyncLogId: log.id,
       })
       await mirrorAccountingSyncLogToEvent(tx, {
         connector: 'xero',

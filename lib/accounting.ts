@@ -187,7 +187,7 @@ export async function queueAccountingSyncTx(
       import('@/lib/domain/accounting/accounting-event-mirror'),
     ])
     const baseCurrency = await getBaseCurrencyCode()
-    await tx.accountingSyncLog.create({
+    const log = await tx.accountingSyncLog.create({
       data: {
         connector: context.connector,
         type: params.type,
@@ -197,6 +197,12 @@ export async function queueAccountingSyncTx(
         payload: payload as never,
       },
     })
+    if (context.connector === 'xero') {
+      const { scheduleXeroAccountingOutbox } = await import('@/lib/connectors/xero/outbox')
+      await scheduleXeroAccountingOutbox(tx, {
+        accountingSyncLogId: log.id,
+      })
+    }
     await mirrorAccountingSyncLogToEvent(tx, {
       connector: context.connector,
       type: params.type,

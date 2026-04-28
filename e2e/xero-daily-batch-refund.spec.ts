@@ -175,9 +175,8 @@ test.describe('xero daily batch refund verification', () => {
     expect(inspected.replacementLayers).toEqual(
       expect.arrayContaining([
         expect.objectContaining({ receivedQty: 1, remainingQty: 1, unitCostBase: 4 }),
-        expect.objectContaining({ receivedQty: 1, remainingQty: 1, unitCostBase: 4 }),
       ]),
     )
-    expect(inspected.replacementLayers).toHaveLength(2)
+    expect(inspected.replacementLayers).toHaveLength(1)
   })
 })

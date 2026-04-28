@@ -23,6 +23,7 @@ import {
   mirrorAccountingSyncLogToEvent,
   resetMirroredAccountingEventsToPending,
 } from '@/lib/domain/accounting/accounting-event-mirror'
+import { scheduleXeroAccountingOutbox } from '@/lib/connectors/xero/outbox'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
@@ -48,7 +49,7 @@ type JournalLinePayload = {
   debit?: number
   credit?: number
 }
-type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog'>
+type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog' | 'integrationOutbox'>
 
 const XERO_DAILY_BATCH_LOCK_KEY = 4_112_208_031
 const XERO_CONNECTOR = 'xero'
@@ -192,7 +193,7 @@ async function createPendingSyncLog(
     currency: string
   },
 ): Promise<void> {
-  await tx.accountingSyncLog.create({
+  const log = await tx.accountingSyncLog.create({
     data: {
       connector: XERO_CONNECTOR,
       type: params.type,
@@ -201,6 +202,9 @@ async function createPendingSyncLog(
       referenceId: params.referenceId,
       payload: params.payload as never,
     },
+  })
+  await scheduleXeroAccountingOutbox(tx, {
+    accountingSyncLogId: log.id,
   })
   await mirrorAccountingSyncLogToEvent(tx, {
     connector: XERO_CONNECTOR,
