@@ -8,6 +8,7 @@ import { verifyCron } from '@/lib/cron-auth'
 import { getBackupDir } from '@/lib/backup-storage'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { uploadBackupToTarget } from '@/lib/backup-remote'
+import { appendCronRunId, runCronWithLogging } from '@/lib/ops/cron-run'
 
 const BACKUP_DIR = getBackupDir()
 
@@ -32,83 +33,94 @@ export async function GET(request: Request) {
   if (cronErr) return cronErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
-  const enabled = await getSetting('backup_schedule_enabled')
-  if (enabled !== 'true') {
-    return NextResponse.json({ skipped: true, reason: 'Scheduled backups disabled' })
-  }
 
-  const retentionDays = parseInt(await getSetting('backup_retention_days') || '30')
-  const maxBackups = parseInt(await getSetting('backup_max_count') || '10')
-
-  const dbConf = getDbConfig()
-  const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
-  const filename = `scheduled-${ts}.sql`
-  const filePath = path.join(BACKUP_DIR, filename)
-
-  await mkdir(BACKUP_DIR, { recursive: true })
-
-  // Create backup (using execFile to prevent command injection)
-  const created = await new Promise<boolean>((resolve) => {
-    const args = ['-h', dbConf.host, '-p', dbConf.port, '-U', dbConf.user, '-d', dbConf.database, '--no-owner', '--no-acl', '-F', 'p', '-f', filePath]
-    execFile('pg_dump', args, { timeout: 120000, env: { ...process.env, PGPASSWORD: dbConf.password } }, async (error) => {
-      if (error) {
-        await logActivity({ entityType: 'SYSTEM', tag: 'system', action: 'scheduled_backup', level: 'ERROR', description: `Scheduled backup failed: ${error.message}` })
-        resolve(false)
-      } else {
-        resolve(true)
+  const { runId, result, responseStatus } = await runCronWithLogging({
+    jobName: 'backup',
+    run: async () => {
+      const enabled = await getSetting('backup_schedule_enabled')
+      if (enabled !== 'true') {
+        return { skipped: true, reason: 'Scheduled backups disabled' }
       }
-    })
-  })
 
-  if (!created) return NextResponse.json({ error: 'Backup creation failed' }, { status: 500 })
+      const retentionDays = parseInt(await getSetting('backup_retention_days') || '30')
+      const maxBackups = parseInt(await getSetting('backup_max_count') || '10')
 
-  // Upload to remote if configured
-  const autoUploadTarget = await getSetting('backup_auto_upload')
-  let uploaded = false
-  if (autoUploadTarget === 's3' || autoUploadTarget === 'sftp') {
-    try {
-      await uploadBackupToTarget(filePath, filename, autoUploadTarget)
-      uploaded = true
-    } catch (error) {
+      const dbConf = getDbConfig()
+      const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
+      const filename = `scheduled-${ts}.sql`
+      const filePath = path.join(BACKUP_DIR, filename)
+
+      await mkdir(BACKUP_DIR, { recursive: true })
+
+      // Create backup (using execFile to prevent command injection)
+      const created = await new Promise<boolean>((resolve) => {
+        const args = ['-h', dbConf.host, '-p', dbConf.port, '-U', dbConf.user, '-d', dbConf.database, '--no-owner', '--no-acl', '-F', 'p', '-f', filePath]
+        execFile('pg_dump', args, { timeout: 120000, env: { ...process.env, PGPASSWORD: dbConf.password } }, async (error) => {
+          if (error) {
+            await logActivity({ entityType: 'SYSTEM', tag: 'system', action: 'scheduled_backup', level: 'ERROR', description: `Scheduled backup failed: ${error.message}` })
+            resolve(false)
+          } else {
+            resolve(true)
+          }
+        })
+      })
+
+      if (!created) return { error: 'Backup creation failed' }
+
+      // Upload to remote if configured
+      const autoUploadTarget = await getSetting('backup_auto_upload')
+      let uploaded = false
+      if (autoUploadTarget === 's3' || autoUploadTarget === 'sftp') {
+        try {
+          await uploadBackupToTarget(filePath, filename, autoUploadTarget)
+          uploaded = true
+        } catch (error) {
+          await logActivity({
+            entityType: 'SYSTEM',
+            tag: 'system',
+            action: 'scheduled_backup',
+            level: 'WARNING',
+            description: `Scheduled backup created but remote upload to ${autoUploadTarget} failed: ${String(error)}`,
+          })
+        }
+      }
+
+      // Cleanup: remove old backups beyond retention
+      let deleted = 0
+      try {
+        const files = await readdir(BACKUP_DIR)
+        const backups: { name: string; mtime: Date }[] = []
+        for (const f of files) {
+          if (!f.endsWith('.sql') && !f.endsWith('.dump')) continue
+          const s = await stat(path.join(BACKUP_DIR, f))
+          backups.push({ name: f, mtime: s.mtime })
+        }
+        backups.sort((a, b) => b.mtime.getTime() - a.mtime.getTime())
+
+        const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000
+
+        for (let i = 0; i < backups.length; i++) {
+          const shouldDelete = i >= maxBackups || backups[i].mtime.getTime() < cutoff
+          if (shouldDelete) {
+            await unlink(path.join(BACKUP_DIR, backups[i].name))
+            deleted++
+          }
+        }
+      } catch { /* ignore cleanup errors */ }
+
       await logActivity({
         entityType: 'SYSTEM',
         tag: 'system',
         action: 'scheduled_backup',
-        level: 'WARNING',
-        description: `Scheduled backup created but remote upload to ${autoUploadTarget} failed: ${String(error)}`,
+        description: `Scheduled backup ${filename} created${uploaded ? ` and uploaded to ${autoUploadTarget}` : ''}${deleted > 0 ? `, ${deleted} old backup(s) purged` : ''}`,
       })
-    }
-  }
 
-  // Cleanup: remove old backups beyond retention
-  let deleted = 0
-  try {
-    const files = await readdir(BACKUP_DIR)
-    const backups: { name: string; mtime: Date }[] = []
-    for (const f of files) {
-      if (!f.endsWith('.sql') && !f.endsWith('.dump')) continue
-      const s = await stat(path.join(BACKUP_DIR, f))
-      backups.push({ name: f, mtime: s.mtime })
-    }
-    backups.sort((a, b) => b.mtime.getTime() - a.mtime.getTime())
-
-    const cutoff = Date.now() - retentionDays * 24 * 60 * 60 * 1000
-
-    for (let i = 0; i < backups.length; i++) {
-      const shouldDelete = i >= maxBackups || backups[i].mtime.getTime() < cutoff
-      if (shouldDelete) {
-        await unlink(path.join(BACKUP_DIR, backups[i].name))
-        deleted++
-      }
-    }
-  } catch { /* ignore cleanup errors */ }
-
-  await logActivity({
-    entityType: 'SYSTEM',
-    tag: 'system',
-    action: 'scheduled_backup',
-    description: `Scheduled backup ${filename} created${uploaded ? ` and uploaded to ${autoUploadTarget}` : ''}${deleted > 0 ? `, ${deleted} old backup(s) purged` : ''}`,
+      return { filename, uploaded, deleted }
+    },
+    getOutcome: (result) => ({
+      responseStatus: 'error' in result ? 500 : 200,
+    }),
   })
 
-  return NextResponse.json({ filename, uploaded, deleted })
+  return NextResponse.json(appendCronRunId(result, runId), { status: responseStatus })
 }
