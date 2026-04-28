@@ -113,3 +113,28 @@ test('Xero accounting outbox scheduling reopens failed rows without creating dup
   assert.equal(row.lastError, null)
   assert.deepEqual(row.nextAttemptAt, nextAttemptAt)
 })
+
+test('Xero accounting outbox scheduling applies retry state to processing rows', async () => {
+  const lockedAt = new Date('2026-04-28T10:02:00.000Z')
+  const { client, rows } = makeClient([
+    makeRow({
+      status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+      attempts: 1,
+      lastError: 'stale failure',
+      lockedAt,
+      lockedBy: 'worker-1',
+    }),
+  ])
+
+  const row = await scheduleXeroAccountingOutbox(client, {
+    accountingSyncLogId: 'sync-1',
+    attempts: 4,
+    resetAttempts: true,
+  })
+
+  assert.equal(rows.length, 1)
+  assert.equal(row.status, INTEGRATION_OUTBOX_STATUS.PROCESSING)
+  assert.equal(row.attempts, 4)
+  assert.equal(row.lastError, null)
+  assert.deepEqual(row.lockedAt, lockedAt)
+})

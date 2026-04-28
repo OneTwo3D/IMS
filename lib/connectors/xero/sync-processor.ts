@@ -38,6 +38,8 @@ const RATE_LIMIT_BACKOFF_MAX_MS = 15 * 60_000
 const XERO_CONNECTOR = 'xero'
 const XERO_ACCOUNTING_WORKER_ID = 'xero-accounting-sync'
 
+class XeroOutboxCompletionError extends Error {}
+
 type ProcessResult = {
   processed: number
   succeeded: number
@@ -47,6 +49,10 @@ type ProcessResult = {
 
 type SyncPayload = Record<string, unknown>
 type FollowUpSyncType = 'INVOICE_PAYMENT' | 'BILL_ATTACHMENT' | 'INVOICE_PDF' | 'INVOICE_EMAIL' | 'WC_INVOICE_NOTE'
+
+export function isXeroAccountingOutboxEnabled(value = process.env.XERO_ACCOUNTING_OUTBOX_ENABLED): boolean {
+  return !['false', '0', 'off'].includes(String(value ?? 'true').trim().toLowerCase())
+}
 
 function buildXeroIdempotencyKey(entryId: string, operation: string): string {
   return `ims-${operation}-${entryId}`
@@ -187,9 +193,14 @@ function accountingSyncLogClaimWhere(id: string, staleClaimCutoff: Date) {
   }
 }
 
-async function deferOutboxForRateLimit(job: IntegrationOutboxRow, error: string, retryDelayMs: number): Promise<void> {
+async function deferOutboxForRateLimit(
+  client: Pick<Prisma.TransactionClient, 'integrationOutbox'>,
+  job: IntegrationOutboxRow,
+  error: string,
+  retryDelayMs: number,
+): Promise<void> {
   if (!job.lockedAt) throw new Error(`Xero outbox job ${job.id} was claimed without lockedAt`)
-  const released = await db.integrationOutbox.updateMany({
+  const released = await client.integrationOutbox.updateMany({
     where: {
       id: job.id,
       status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
@@ -207,9 +218,10 @@ async function deferOutboxForRateLimit(job: IntegrationOutboxRow, error: string,
   if (released.count === 0) throw new Error(`Xero outbox job ${job.id} is not claimed by ${XERO_ACCOUNTING_WORKER_ID}`)
 }
 
-async function markXeroOutboxRetry(job: IntegrationOutboxRow, error: string, retryDelayMs = 0): Promise<void> {
+async function markXeroOutboxRetry(job: IntegrationOutboxRow, error: string, retryDelayMs = 0, client?: Pick<Prisma.TransactionClient, 'integrationOutbox'>): Promise<void> {
   if (!job.lockedAt) throw new Error(`Xero outbox job ${job.id} was claimed without lockedAt`)
   await markIntegrationOutboxRetryableFailure({
+    client,
     id: job.id,
     workerId: XERO_ACCOUNTING_WORKER_ID,
     lockedAt: job.lockedAt,
@@ -219,9 +231,10 @@ async function markXeroOutboxRetry(job: IntegrationOutboxRow, error: string, ret
   })
 }
 
-async function markXeroOutboxPermanent(job: IntegrationOutboxRow, error: string): Promise<void> {
+async function markXeroOutboxPermanent(job: IntegrationOutboxRow, error: string, client?: Pick<Prisma.TransactionClient, 'integrationOutbox'>): Promise<void> {
   if (!job.lockedAt) throw new Error(`Xero outbox job ${job.id} was claimed without lockedAt`)
   await markIntegrationOutboxPermanentFailure({
+    client,
     id: job.id,
     workerId: XERO_ACCOUNTING_WORKER_ID,
     lockedAt: job.lockedAt,
@@ -242,13 +255,231 @@ async function markXeroOutboxSuccess(job: IntegrationOutboxRow): Promise<void> {
       entityType: 'SYSTEM',
       action: 'xero_outbox_completion_error',
       tag: 'sync',
-      level: 'WARNING',
-      description: `Xero outbox job ${job.id} posted successfully but could not be marked complete: ${String(error)}`,
+      level: 'ERROR',
+      description: `Xero outbox job ${job.id} posted but mark-complete failed: ${String(error)}`,
     })
+    throw new XeroOutboxCompletionError(`Xero outbox job ${job.id} posted but mark-complete failed: ${String(error)}`)
   }
 }
 
 export async function processPendingXeroSync(): Promise<ProcessResult> {
+  if (!isXeroAccountingOutboxEnabled()) {
+    return processPendingXeroSyncDirect()
+  }
+  return processPendingXeroSyncViaOutbox()
+}
+
+async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
+  const result: ProcessResult = { processed: 0, succeeded: 0, failed: 0, skipped: 0 }
+  const staleClaimCutoff = new Date(Date.now() - CLAIM_STALE_MS)
+
+  const pending = await db.accountingSyncLog.findMany({
+    where: {
+      connector: XERO_CONNECTOR,
+      OR: [
+        {
+          status: 'PENDING',
+          OR: [
+            { processingStartedAt: null },
+            { processingStartedAt: { lte: new Date() } },
+          ],
+        },
+        {
+          status: 'PROCESSING',
+          processingStartedAt: { lt: staleClaimCutoff },
+        },
+      ],
+      retryCount: { lt: MAX_RETRIES },
+    },
+    orderBy: { createdAt: 'asc' },
+    take: MAX_PER_RUN,
+  })
+
+  for (const entry of pending) {
+    const claim = await db.accountingSyncLog.updateMany({
+      where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff),
+      data: {
+        status: 'PROCESSING',
+        processingStartedAt: new Date(),
+      },
+    })
+    if (claim.count === 0) continue
+
+    result.processed++
+    const payload = (entry.payload ?? {}) as SyncPayload
+
+    try {
+      if (entry.externalTransactionId) {
+        await db.$transaction(async (tx) => {
+          await tx.accountingSyncLog.update({
+            where: { id: entry.id },
+            data: {
+              status: 'SYNCED',
+              syncedAt: new Date(),
+              errorMessage: null,
+              processingStartedAt: null,
+            },
+          })
+          await updateMirroredEventForSyncLog(tx, {
+            type: entry.type,
+            referenceType: entry.referenceType,
+            referenceId: entry.referenceId,
+            payload,
+            status: 'POSTED',
+            externalId: entry.externalTransactionId,
+          })
+        })
+        try {
+          await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, { externalId: entry.externalTransactionId })
+        } catch (followUpError) {
+          await logActivity({
+            entityType: 'SYSTEM',
+            action: 'xero_followup_error',
+            tag: 'sync',
+            level: 'WARNING',
+            description: `Xero sync entry ${entry.id} posted successfully but follow-up work failed: ${String(followUpError)}`,
+          })
+        }
+        result.succeeded++
+        continue
+      }
+
+      const syncResult = await processEntry(entry.id, entry.type, entry.referenceType, entry.referenceId, payload)
+
+      if (syncResult.success) {
+        await db.$transaction(async (tx) => {
+          await tx.accountingSyncLog.update({
+            where: { id: entry.id },
+            data: {
+              status: 'SYNCED',
+              externalTransactionId: syncResult.externalId ?? null,
+              syncedAt: new Date(),
+              errorMessage: null,
+              processingStartedAt: null,
+            },
+          })
+          await updateMirroredEventForSyncLog(tx, {
+            type: entry.type,
+            referenceType: entry.referenceType,
+            referenceId: entry.referenceId,
+            payload,
+            status: 'POSTED',
+            externalId: syncResult.externalId ?? null,
+          })
+        })
+
+        try {
+          await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
+          await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult)
+        } catch (followUpError) {
+          await logActivity({
+            entityType: 'SYSTEM',
+            action: 'xero_followup_error',
+            tag: 'sync',
+            level: 'WARNING',
+            description: `Xero sync entry ${entry.id} posted successfully but follow-up work failed: ${String(followUpError)}`,
+          })
+        }
+
+        result.succeeded++
+      } else {
+        const errorMessage = syncResult.error ?? 'Unknown error'
+        if (isRateLimitError(errorMessage)) {
+          await db.accountingSyncLog.update({
+            where: { id: entry.id },
+            data: {
+              status: 'PENDING',
+              errorMessage,
+              processingStartedAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
+            },
+          })
+        } else {
+          const retryCount = entry.retryCount + 1
+          const finalFailure = retryCount >= MAX_RETRIES
+          await db.$transaction(async (tx) => {
+            await tx.accountingSyncLog.update({
+              where: { id: entry.id },
+              data: {
+                status: finalFailure ? 'FAILED' : 'PENDING',
+                retryCount,
+                errorMessage,
+                processingStartedAt: null,
+              },
+            })
+            if (finalFailure) {
+              await updateMirroredEventForSyncLog(tx, {
+                type: entry.type,
+                referenceType: entry.referenceType,
+                referenceId: entry.referenceId,
+                payload,
+                status: 'FAILED',
+                message: errorMessage,
+              })
+            }
+          })
+        }
+        result.failed++
+      }
+    } catch (e) {
+      const errorMessage = String(e)
+      if (isRateLimitError(errorMessage)) {
+        await db.accountingSyncLog.update({
+          where: { id: entry.id },
+          data: {
+            status: 'PENDING',
+            errorMessage,
+            processingStartedAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
+          },
+        })
+      } else {
+        const retryCount = entry.retryCount + 1
+        const finalFailure = retryCount >= MAX_RETRIES
+        await db.$transaction(async (tx) => {
+          await tx.accountingSyncLog.update({
+            where: { id: entry.id },
+            data: {
+              status: finalFailure ? 'FAILED' : 'PENDING',
+              retryCount,
+              errorMessage,
+              processingStartedAt: null,
+            },
+          })
+          if (finalFailure) {
+            await updateMirroredEventForSyncLog(tx, {
+              type: entry.type,
+              referenceType: entry.referenceType,
+              referenceId: entry.referenceId,
+              payload,
+              status: 'FAILED',
+              message: errorMessage,
+            })
+          }
+        })
+      }
+      result.failed++
+    }
+  }
+
+  const skippedCount = await db.accountingSyncLog.count({
+    where: { connector: XERO_CONNECTOR, status: 'FAILED', retryCount: { gte: MAX_RETRIES } },
+  })
+  result.skipped = skippedCount
+
+  if (result.processed > 0) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'xero_sync_batch',
+      tag: 'sync',
+      description: `Xero sync: ${result.succeeded} synced, ${result.failed} failed out of ${result.processed} processed`,
+      metadata: { ...result, mode: 'direct' },
+    })
+  }
+
+  return result
+}
+
+async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
   const result: ProcessResult = { processed: 0, succeeded: 0, failed: 0, skipped: 0 }
   const staleClaimCutoff = new Date(Date.now() - CLAIM_STALE_MS)
 
@@ -386,15 +617,17 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
         const errorMessage = syncResult.error ?? 'Unknown error'
         if (isRateLimitError(errorMessage)) {
           const retryDelayMs = getRateLimitBackoffMs(entry.retryCount, errorMessage)
-          await db.accountingSyncLog.update({
-            where: { id: entry.id },
-            data: {
-              status: 'PENDING',
-              errorMessage,
-              processingStartedAt: new Date(Date.now() + retryDelayMs),
-            },
+          await db.$transaction(async (tx) => {
+            await tx.accountingSyncLog.update({
+              where: { id: entry.id },
+              data: {
+                status: 'PENDING',
+                errorMessage,
+                processingStartedAt: new Date(Date.now() + retryDelayMs),
+              },
+            })
+            await deferOutboxForRateLimit(tx, job, errorMessage, retryDelayMs)
           })
-          await deferOutboxForRateLimit(job, errorMessage, retryDelayMs)
         } else {
           const retryCount = entry.retryCount + 1
           const finalFailure = retryCount >= MAX_RETRIES
@@ -418,28 +651,31 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
                 message: errorMessage,
               })
             }
+            if (finalFailure) {
+              await markXeroOutboxPermanent(job, errorMessage, tx)
+            } else {
+              await markXeroOutboxRetry(job, errorMessage, 0, tx)
+            }
           })
-          if (finalFailure) {
-            await markXeroOutboxPermanent(job, errorMessage)
-          } else {
-            await markXeroOutboxRetry(job, errorMessage)
-          }
         }
         result.failed++
       }
     } catch (e) {
+      if (e instanceof XeroOutboxCompletionError) throw e
       const errorMessage = String(e)
       if (isRateLimitError(errorMessage)) {
         const retryDelayMs = getRateLimitBackoffMs(entry.retryCount, errorMessage)
-        await db.accountingSyncLog.update({
-          where: { id: entry.id },
-          data: {
-            status: 'PENDING',
-            errorMessage,
-            processingStartedAt: new Date(Date.now() + retryDelayMs),
-          },
+        await db.$transaction(async (tx) => {
+          await tx.accountingSyncLog.update({
+            where: { id: entry.id },
+            data: {
+              status: 'PENDING',
+              errorMessage,
+              processingStartedAt: new Date(Date.now() + retryDelayMs),
+            },
+          })
+          await deferOutboxForRateLimit(tx, job, errorMessage, retryDelayMs)
         })
-        await deferOutboxForRateLimit(job, errorMessage, retryDelayMs)
       } else {
         const retryCount = entry.retryCount + 1
         const finalFailure = retryCount >= MAX_RETRIES
@@ -463,12 +699,12 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
               message: errorMessage,
             })
           }
+          if (finalFailure) {
+            await markXeroOutboxPermanent(job, errorMessage, tx)
+          } else {
+            await markXeroOutboxRetry(job, errorMessage, 0, tx)
+          }
         })
-        if (finalFailure) {
-          await markXeroOutboxPermanent(job, errorMessage)
-        } else {
-          await markXeroOutboxRetry(job, errorMessage)
-        }
       }
       result.failed++
     }

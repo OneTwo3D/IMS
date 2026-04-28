@@ -59,7 +59,17 @@ export async function scheduleXeroAccountingOutbox(
     || row.status === INTEGRATION_OUTBOX_STATUS.SUCCEEDED
     || row.status === INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED
 
-  if (row.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) return row
+  if (row.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
+    await client.integrationOutbox.updateMany({
+      where: { id: row.id, status: INTEGRATION_OUTBOX_STATUS.PROCESSING, lockedAt: row.lockedAt },
+      data: {
+        payloadJson: payload,
+        lastError: null,
+        ...(options.attempts !== undefined ? { attempts: options.attempts } : {}),
+      },
+    })
+    return await client.integrationOutbox.findUnique({ where: { id: row.id } }) ?? row
+  }
 
   await client.integrationOutbox.updateMany({
     where: { id: row.id, status: { not: INTEGRATION_OUTBOX_STATUS.PROCESSING } },
