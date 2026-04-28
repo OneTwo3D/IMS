@@ -58,9 +58,23 @@ async function upsertSetting(key: string, value: string) {
   })
 }
 
+async function quarantinePriorFixtures() {
+  await db.salesOrder.updateMany({
+    where: {
+      orderNumber: { startsWith: 'SO-E2E-XERO-' },
+      status: { not: 'REFUNDED' },
+    },
+    data: {
+      status: 'REFUNDED',
+    },
+  })
+}
+
 async function seed() {
   const suffix = uniqueSuffix()
   const now = new Date()
+
+  await quarantinePriorFixtures()
 
   await Promise.all([
     upsertSetting('xero_sync_enabled', 'true'),
@@ -209,6 +223,22 @@ async function seed() {
     },
   })
 
+  const response = await fetch(`${getAppBaseUrl()}/api/cron/accounting-daily-batch`, {
+    headers: getCronHeaders(),
+  })
+  if (!response.ok) {
+    throw new Error(`daily batch request failed: ${response.status} ${await response.text()}`)
+  }
+  const batchResult = await response.json() as {
+    groupA1: number
+    groupA2: number
+    groupB: number
+    errors: string[]
+  }
+  if (batchResult.errors.length > 0) {
+    throw new Error(batchResult.errors.join('; '))
+  }
+
   const shipment = await db.shipment.create({
     data: {
       orderId: order.id,
@@ -229,21 +259,38 @@ async function seed() {
       lines: true,
     },
   })
+  const shipmentLine = shipment.lines[0]
 
-  const response = await fetch(`${getAppBaseUrl()}/api/cron/accounting-daily-batch`, {
+  await db.shipmentLine.update({
+    where: { id: shipmentLine.id },
+    data: {
+      costLayerSnapshot: [
+        {
+          costLayerId: costLayer.id,
+          qty: 1,
+          unitCostBase: 4,
+          orderAllocationId: allocation.id,
+          shipmentLineId: shipmentLine.id,
+          source: 'shipment',
+        },
+      ] as never,
+    },
+  })
+
+  const shipmentBatchResponse = await fetch(`${getAppBaseUrl()}/api/cron/accounting-daily-batch`, {
     headers: getCronHeaders(),
   })
-  if (!response.ok) {
-    throw new Error(`daily batch request failed: ${response.status} ${await response.text()}`)
+  if (!shipmentBatchResponse.ok) {
+    throw new Error(`shipment daily batch request failed: ${shipmentBatchResponse.status} ${await shipmentBatchResponse.text()}`)
   }
-  const batchResult = await response.json() as {
+  const shipmentBatchResult = await shipmentBatchResponse.json() as {
     groupA1: number
     groupA2: number
     groupB: number
     errors: string[]
   }
-  if (batchResult.errors.length > 0) {
-    throw new Error(batchResult.errors.join('; '))
+  if (shipmentBatchResult.errors.length > 0) {
+    throw new Error(shipmentBatchResult.errors.join('; '))
   }
 
   await db.salesOrder.update({
@@ -274,7 +321,7 @@ async function seed() {
     productId: product.id,
     warehouseId: warehouse.id,
     allocationId: allocation.id,
-    shipmentLineId: shipment.lines[0].id,
+    shipmentLineId: shipmentLine.id,
     costLayerId: costLayer.id,
     unearnedRevenueAmount: Number(seededOrder.unearnedRevenueAmount ?? 0),
     allocationBatchAmount: Number(seededOrder.allocationBatchAmount ?? 0),
@@ -317,7 +364,16 @@ async function inspect(orderId: string, allocationId: string, shipmentLineId: st
 
   const orderLogs = await db.accountingSyncLog.findMany({
     where: {
-      referenceId: orderId,
+      OR: [
+        {
+          referenceType: 'SalesOrder',
+          referenceId: orderId,
+        },
+        {
+          referenceType: 'SalesOrderRefund',
+          referenceId: refund.id,
+        },
+      ],
       type: { in: ['COGS_REVERSAL', 'UNEARNED_REV_REVERSAL'] },
     },
     select: {
