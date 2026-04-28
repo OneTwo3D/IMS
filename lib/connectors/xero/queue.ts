@@ -4,7 +4,6 @@
  */
 
 import { db } from '@/lib/db'
-import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
 import { getXeroSettings, type XeroSettings } from './settings'
@@ -62,7 +61,7 @@ export async function queueXeroSync(params: {
   }
 
   try {
-    const log = await db.$transaction(async (tx) => {
+    await db.$transaction(async (tx) => {
       const log = await tx.accountingSyncLog.create({
         data: {
           connector: 'xero',
@@ -76,11 +75,8 @@ export async function queueXeroSync(params: {
       await scheduleXeroAccountingOutbox(tx, {
         accountingSyncLogId: log.id,
       })
-      return log
-    })
-    try {
-      const baseCurrency = await getBaseCurrencyCode()
-      await db.$transaction(async (tx) => {
+      try {
+        const baseCurrency = await getBaseCurrencyCode()
         await mirrorAccountingSyncLogToEvent(tx, {
           syncLogId: log.id,
           connector: 'xero',
@@ -91,16 +87,18 @@ export async function queueXeroSync(params: {
           currency: baseCurrency,
           status: 'PENDING',
         })
-      })
-    } catch (mirrorError) {
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: 'accounting_event_mirror_error',
-        tag: 'sync',
-        level: 'WARNING',
-        description: `Xero sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
-      })
-    }
+      } catch (mirrorError) {
+        await tx.activityLog.create({
+          data: {
+            entityType: 'SYSTEM',
+            action: 'accounting_event_mirror_error',
+            tag: 'sync',
+            level: 'WARNING',
+            description: `Xero sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
+          },
+        })
+      }
+    })
   } catch (error) {
     if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return
     throw error
