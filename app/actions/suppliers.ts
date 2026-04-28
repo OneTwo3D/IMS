@@ -12,6 +12,7 @@ import {
   createCsvImportPreviewResult,
   getCsvImportMode,
   isCsvImportDryRunMode,
+  runCsvImportMutation,
   type CsvImportActionResult,
 } from '@/lib/csv-import'
 
@@ -412,8 +413,8 @@ export async function importSuppliersCsv(formData: FormData): Promise<CsvImportA
       error: created === 0 && updated === 0 && errors.length > 0 ? errors[0] : undefined,
     })
   } catch (e) {
-    await logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import suppliers from CSV: ${String(e)}` })
     const error = String(e)
+    await runCsvImportMutation(mode, () => logActivity({ entityType: 'IMPORT', tag: 'import', action: 'imported', level: 'ERROR', description: `Failed to import suppliers from CSV: ${error}` }))
     return preview
       ? createCsvImportPreviewResult({ totalRows: 0, created: 0, updated: 0, errorCount: 1, errors: [error], error })
       : createCsvImportExecutionResult({ created: 0, updated: 0, skipped: 0, errors: [error], error, success: false })
