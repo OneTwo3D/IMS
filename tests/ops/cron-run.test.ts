@@ -163,6 +163,31 @@ test('cron run helper infers non-empty failed arrays as failures', () => {
   )
 })
 
+test('cron run helper preserves nested WooCommerce reconcile counts', () => {
+  assert.deepEqual(
+    inferCronRunOutcome({
+      orders: { synced: 4, skipped: 1, errors: [] },
+      products: { synced: 2, skipped: 0, errors: [] },
+      stock: {
+        queued: { processed: 3, synced: 3, failed: 0, errors: [] },
+        sync: { synced: 8, skipped: 2, errors: [] },
+      },
+    }),
+    {
+      status: 'completed',
+      counts: {
+        orders: { synced: 4, skipped: 1 },
+        products: { synced: 2, skipped: 0 },
+        stock: {
+          queued: { processed: 3, synced: 3, failed: 0 },
+          sync: { synced: 8, skipped: 2 },
+        },
+      },
+      errorSummary: null,
+    },
+  )
+})
+
 test('cron run helper treats nested skipped sections as non-fatal', () => {
   assert.deepEqual(
     inferCronRunOutcome({
@@ -171,7 +196,7 @@ test('cron run helper treats nested skipped sections as non-fatal', () => {
     }),
     {
       status: 'completed',
-      counts: null,
+      counts: { orders: { imported: 3 }, stock: { skipped: true } },
       errorSummary: null,
     },
   )

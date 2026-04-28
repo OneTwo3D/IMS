@@ -165,11 +165,27 @@ function getCounts(result: Record<string, unknown>): JsonObject | null {
   if (isJsonObject(result.counts)) return result.counts
   if (isJsonObject(result.summary)) return result.summary
 
-  const numericCounts = Object.fromEntries(
-    Object.entries(result).filter(([, value]) => typeof value === 'number' || typeof value === 'boolean'),
-  ) as JsonObject
+  const numericCounts = getNestedCounts(result)
 
   return Object.keys(numericCounts).length > 0 ? numericCounts : null
+}
+
+function getNestedCounts(result: Record<string, unknown>): JsonObject {
+  const counts: JsonObject = {}
+
+  for (const [key, value] of Object.entries(result)) {
+    if (typeof value === 'number' || typeof value === 'boolean') {
+      counts[key] = value
+      continue
+    }
+
+    if (isRecord(value)) {
+      const nested = getNestedCounts(value)
+      if (Object.keys(nested).length > 0) counts[key] = nested
+    }
+  }
+
+  return counts
 }
 
 function summarizeResultError(result: Record<string, unknown>): string | null {
