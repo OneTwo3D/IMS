@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { Prisma } from '@/app/generated/prisma/client'
 import {
   buildStockLevelMap,
   filterStockLevelRowsForScope,
@@ -14,6 +15,7 @@ const rows: StockLevelMapRow[] = [
   { productId: 'product-1', warehouseId: 'warehouse-2', quantity: '5.5', reservedQty: '1.25', updatedAt: new Date('2026-01-02T00:00:00.000Z') },
   { productId: 'product-2', warehouseId: 'warehouse-1', quantity: 3, reservedQty: 0, updatedAt: new Date('2026-01-03T00:00:00.000Z') },
   { productId: 'product-3', warehouseId: 'warehouse-1', quantity: '0.3', reservedQty: '0.2', updatedAt: new Date('2026-01-04T00:00:00.000Z') },
+  { productId: 'product-4', warehouseId: 'warehouse-1', quantity: new Prisma.Decimal('0.1'), reservedQty: new Prisma.Decimal('0.3'), updatedAt: new Date('2026-01-05T00:00:00.000Z') },
 ]
 
 test('buildStockLevelMap preserves the legacy product and warehouse map shape', () => {
@@ -27,6 +29,9 @@ test('buildStockLevelMap preserves the legacy product and warehouse map shape', 
     },
     'product-3': {
       'warehouse-1': { total: 0.3, available: 0.1 },
+    },
+    'product-4': {
+      'warehouse-1': { total: 0.1, available: -0.2 },
     },
   })
 })

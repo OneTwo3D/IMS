@@ -1,6 +1,7 @@
 'use server'
 
 import { revalidatePath } from 'next/cache'
+import { cache } from 'react'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -908,24 +909,42 @@ export async function getWarehouses() {
 
 export type { StockLevelEntry, StockLevelMap, StockLevelMapScope }
 
-export async function getScopedStockLevelMap(scope: StockLevelMapScope = {}): Promise<StockLevelMap> {
-  await requireAuth()
-  if (isEmptyStockLevelMapScope(scope)) return {}
-
-  const normalized = normalizeStockLevelMapScope(scope)
+const readScopedStockLevelMap = cache(async (
+  productIdsKey: string | null,
+  warehouseIdsKey: string | null,
+  updatedSinceIso: string | null,
+  skip: number | null,
+  take: number | null,
+): Promise<StockLevelMap> => {
+  const productIds = productIdsKey ? JSON.parse(productIdsKey) as string[] : undefined
+  const warehouseIds = warehouseIdsKey ? JSON.parse(warehouseIdsKey) as string[] : undefined
   const where: Prisma.StockLevelWhereInput = {}
-  if (normalized.productIds) where.productId = { in: normalized.productIds }
-  if (normalized.warehouseIds) where.warehouseId = { in: normalized.warehouseIds }
-  if (normalized.updatedSince) where.updatedAt = { gte: normalized.updatedSince }
+  if (productIds) where.productId = { in: productIds }
+  if (warehouseIds) where.warehouseId = { in: warehouseIds }
+  if (updatedSinceIso) where.updatedAt = { gte: new Date(updatedSinceIso) }
 
   const levels = await db.stockLevel.findMany({
     where,
     select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
     orderBy: [{ productId: 'asc' }, { warehouseId: 'asc' }],
-    skip: normalized.skip,
-    take: normalized.take,
+    skip: skip ?? undefined,
+    take: take ?? undefined,
   })
   return buildStockLevelMap(levels)
+})
+
+export async function getScopedStockLevelMap(scope: StockLevelMapScope = {}): Promise<StockLevelMap> {
+  await requireAuth()
+  if (isEmptyStockLevelMapScope(scope)) return {}
+
+  const normalized = normalizeStockLevelMapScope(scope)
+  return readScopedStockLevelMap(
+    normalized.productIds ? JSON.stringify(normalized.productIds) : null,
+    normalized.warehouseIds ? JSON.stringify(normalized.warehouseIds) : null,
+    normalized.updatedSince?.toISOString() ?? null,
+    normalized.skip ?? null,
+    normalized.take ?? null,
+  )
 }
 
 /** Avg COGS per product from FIFO cost layers (weighted avg of remaining stock) */
