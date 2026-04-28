@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { writeFile, mkdir } from 'fs/promises'
+import { writeFile, mkdir, unlink } from 'fs/promises'
 import path from 'path'
 import { requireAdmin } from '@/lib/auth/server'
 import { db } from '@/lib/db'
 import { DEFAULT_BASE_CURRENCY } from '@/lib/base-currency'
+import { logActivity } from '@/lib/activity-log'
 import {
   LOGO_IMAGE_MIME_TO_EXT,
   MAX_LOGO_UPLOAD_BYTES,
@@ -11,9 +12,28 @@ import {
   validateImageUploadMetadata,
 } from '@/lib/security/upload-validation'
 
-export async function POST(req: NextRequest) {
+function brandingFilenameFromUrl(url: string | null | undefined): string | null {
+  if (!url?.startsWith('/api/uploads/branding/')) return null
+  const rawFilename = url.slice('/api/uploads/branding/'.length).split('?')[0] ?? ''
+  const filename = path.basename(rawFilename)
+  return filename === rawFilename && filename ? filename : null
+}
+
+async function deletePreviousBrandingFile(previousUrl: string | null | undefined, currentFilename: string): Promise<void> {
+  const previousFilename = brandingFilenameFromUrl(previousUrl)
+  if (!previousFilename || previousFilename === currentFilename) return
+
   try {
-    await requireAdmin()
+    await unlink(path.join(process.cwd(), 'public', 'uploads', 'branding', previousFilename))
+  } catch {
+    // Best-effort cleanup only; upload success should not depend on old-file removal.
+  }
+}
+
+export async function POST(req: NextRequest) {
+  let session
+  try {
+    session = await requireAdmin()
   } catch {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
@@ -57,7 +77,9 @@ export async function POST(req: NextRequest) {
 
   const url = `/api/uploads/branding/${filename}?t=${Date.now()}`
 
-  const existingOrg = await db.organisation.findFirst({ select: { id: true } })
+  const existingOrg = await db.organisation.findFirst({
+    select: { id: true, logoUrl: true, documentLogoUrl: true },
+  })
   if (!existingOrg) {
     await db.organisation.create({
       data: {
@@ -68,11 +90,27 @@ export async function POST(req: NextRequest) {
     })
   }
 
+  const previousUrl = variant === 'document' ? existingOrg?.documentLogoUrl : existingOrg?.logoUrl
   if (variant === 'document') {
     await db.organisation.updateMany({ data: { documentLogoUrl: url } })
   } else {
     await db.organisation.updateMany({ data: { logoUrl: url } })
   }
+  await deletePreviousBrandingFile(previousUrl, filename)
+  await logActivity({
+    entityType: 'SETTING',
+    tag: 'settings',
+    action: 'updated',
+    description: `Uploaded ${variant === 'document' ? 'document' : 'icon'} company logo`,
+    userId: session.user.id,
+    metadata: {
+      variant,
+      originalFilename: file.name,
+      storedFilename: filename,
+      url,
+      previousUrl: previousUrl ?? null,
+    },
+  })
 
   return NextResponse.json({ url, variant })
 }

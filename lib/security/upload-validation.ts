@@ -52,6 +52,10 @@ export function validateImageUploadMetadata(
   return { ok: true, value: ext }
 }
 
+/**
+ * Server-side image content validation. Call this after MIME/size validation;
+ * validateImageUploadMetadata only checks client-supplied metadata.
+ */
 export async function reencodeTrustedImage(
   buffer: Buffer,
   ext: TrustedImageExtension,
@@ -92,6 +96,9 @@ export function hasPdfMagicBytes(buffer: Buffer): boolean {
 
 export function sanitizeInvoiceUploadFilename(originalName: string, timestamp = Date.now()): string {
   const rawBase = path.basename(originalName).replace(/\.[^.]+$/, '')
-  const safeBase = rawBase.replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80) || 'invoice'
+  const safeBase = rawBase
+    .replace(/[^a-zA-Z0-9._-]/g, '_')
+    .replace(/^\.+/, '_')
+    .slice(0, 80) || 'invoice'
   return `${timestamp}-${safeBase}.pdf`
 }

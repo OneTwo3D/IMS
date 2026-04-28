@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { writeFile, mkdir } from 'fs/promises'
 import path from 'path'
 import { requireRole } from '@/lib/auth/server'
+import { logActivity } from '@/lib/activity-log'
 import {
   hasPdfMagicBytes,
   sanitizeInvoiceUploadFilename,
@@ -9,8 +10,9 @@ import {
 } from '@/lib/security/upload-validation'
 
 export async function POST(req: Request) {
+  let session
   try {
-    await requireRole('ADMIN', 'FINANCE', 'MANAGER')
+    session = await requireRole('ADMIN', 'FINANCE', 'MANAGER')
   } catch {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
@@ -35,6 +37,19 @@ export async function POST(req: Request) {
   const filepath = path.join(dir, filename)
 
   await writeFile(filepath, buffer)
+  await logActivity({
+    entityType: 'SYSTEM',
+    tag: 'purchase',
+    action: 'uploaded',
+    description: `Uploaded invoice PDF: ${filename}`,
+    userId: session.user.id,
+    metadata: {
+      originalFilename: file.name,
+      storedFilename: filename,
+      storedPath: path.join('uploads', 'invoices', filename),
+      sizeBytes: file.size,
+    },
+  })
 
   return NextResponse.json({ url: `/uploads/invoices/${filename}` })
 }

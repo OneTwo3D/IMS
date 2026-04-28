@@ -73,6 +73,19 @@ test('image upload re-encoding accepts a real image matching the claimed MIME fa
   assert.equal((await sharp(output).metadata()).format, 'png')
 })
 
+test('image upload re-encoding rejects real images claimed as the wrong MIME family', async () => {
+  const jpeg = await sharp({
+    create: {
+      width: 2,
+      height: 2,
+      channels: 3,
+      background: '#ffffff',
+    },
+  }).jpeg().toBuffer()
+
+  assert.equal(await reencodeTrustedImage(jpeg, 'png'), null)
+})
+
 test('invoice PDF upload validation rejects wrong MIME, oversized, and empty files', () => {
   assert.deepEqual(validateInvoicePdfMetadata({ name: 'invoice.png', type: 'image/png', size: 10 }), {
     ok: false,
@@ -87,6 +100,7 @@ test('invoice PDF upload validation rejects wrong MIME, oversized, and empty fil
     error: 'File too large. Maximum 20MB.',
   })
   assert.equal(hasPdfMagicBytes(Buffer.alloc(0)), false)
+  assert.equal(hasPdfMagicBytes(Buffer.from('%PDF')), false)
   assert.equal(hasPdfMagicBytes(Buffer.from('%PDF-1.7\n')), true)
 })
 
@@ -96,7 +110,10 @@ test('invoice upload filename sanitizer contains traversal and documents double-
   const windowsTraversal = sanitizeInvoiceUploadFilename('..\\..\\secret.pdf', 1234)
   assert.equal(windowsTraversal.includes('/'), false)
   assert.equal(windowsTraversal.includes('\\'), false)
-  assert.equal(windowsTraversal, '1234-.._.._secret.pdf')
+  assert.equal(windowsTraversal, '1234-__.._secret.pdf')
+
+  assert.equal(sanitizeInvoiceUploadFilename('.htaccess.pdf', 1234), '1234-_htaccess.pdf')
+  assert.equal(sanitizeInvoiceUploadFilename('invoice\x00evil.pdf', 1234), '1234-invoice_evil.pdf')
 
   // Current behavior: a double-extension base is preserved, but the served file
   // is forced to the PDF extension and validated by MIME plus PDF magic bytes.
