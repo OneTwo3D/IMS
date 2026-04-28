@@ -30,7 +30,10 @@ export default async function WarehouseTransfersPage() {
     getMintsoftTransferAsnStates(transfers.map((transfer) => transfer.id)),
     getScopedStockLevelMap({
       productIds: stockProductIds,
-      warehouseIds: warehouses.map((warehouse) => warehouse.id),
+      warehouseIds: Array.from(new Set([
+        ...warehouses.map((warehouse) => warehouse.id),
+        ...transfers.flatMap((transfer) => [transfer.fromWarehouseId, transfer.toWarehouseId]),
+      ])),
     }),
   ])
 

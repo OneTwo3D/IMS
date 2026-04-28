@@ -119,6 +119,7 @@ class RedisCommandClient {
   }
 
   private async runExclusive(commands: string[][]): Promise<RedisValue[]> {
+    this.clearIdleClose()
     await this.connect()
     const setupCommands = this.setupComplete ? [] : this.setupCommands()
     const responses = await this.writeAndRead([...setupCommands, ...commands])
@@ -238,9 +239,14 @@ class RedisCommandClient {
   }
 
   private scheduleIdleClose(): void {
-    if (this.idleTimer) clearTimeout(this.idleTimer)
+    this.clearIdleClose()
     this.idleTimer = setTimeout(() => this.destroy(), this.idleTimeoutMs)
     this.idleTimer.unref()
+  }
+
+  private clearIdleClose(): void {
+    if (this.idleTimer) clearTimeout(this.idleTimer)
+    this.idleTimer = null
   }
 
   private resetSocket(): void {
@@ -250,8 +256,7 @@ class RedisCommandClient {
   }
 
   private destroy(): void {
-    if (this.idleTimer) clearTimeout(this.idleTimer)
-    this.idleTimer = null
+    this.clearIdleClose()
     this.socket?.destroy()
     this.resetSocket()
   }

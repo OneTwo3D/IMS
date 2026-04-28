@@ -456,7 +456,7 @@ async function getLatestBackup(): Promise<LatestOperationHealthCheck> {
     })
   } catch (error) {
     console.error('Admin health backup check failed', error)
-    return errorLatest('Backup check failed')
+    return warningLatest('Backup check failed')
   }
 }
 

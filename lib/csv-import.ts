@@ -42,6 +42,7 @@ export type CsvImportAction = (formData: FormData) => Promise<CsvImportActionRes
 export function getCsvImportMode(formData: FormData): CsvImportMode {
   const mode = formData.get('mode')
   if (mode === 'preview' || mode === 'dry-run' || mode === 'dryRun') return 'preview'
+  if (mode === 'execute') return 'execute'
   if (formData.get('dryRun') === 'true') return 'preview'
   return 'execute'
 }
