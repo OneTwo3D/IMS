@@ -4,6 +4,7 @@
  */
 
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
 import { getQuickBooksSettings, type QuickBooksSettings } from './settings'
@@ -60,6 +61,7 @@ export async function queueQuickBooksSync(params: {
   }
 
   try {
+    let mirrorErrorMessage: string | null = null
     await db.$transaction(async (tx) => {
       const log = await tx.accountingSyncLog.create({
         data: {
@@ -84,17 +86,18 @@ export async function queueQuickBooksSync(params: {
           status: 'PENDING',
         })
       } catch (mirrorError) {
-        await tx.activityLog.create({
-          data: {
-            entityType: 'SYSTEM',
-            action: 'accounting_event_mirror_error',
-            tag: 'sync',
-            level: 'WARNING',
-            description: `QuickBooks sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
-          },
-        })
+        mirrorErrorMessage = `QuickBooks sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`
       }
     })
+    if (mirrorErrorMessage) {
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'accounting_event_mirror_error',
+        tag: 'sync',
+        level: 'WARNING',
+        description: mirrorErrorMessage,
+      })
+    }
   } catch (error) {
     if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return
     throw error

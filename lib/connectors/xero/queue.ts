@@ -4,6 +4,7 @@
  */
 
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
 import { getXeroSettings, type XeroSettings } from './settings'
@@ -61,6 +62,7 @@ export async function queueXeroSync(params: {
   }
 
   try {
+    let mirrorErrorMessage: string | null = null
     await db.$transaction(async (tx) => {
       const log = await tx.accountingSyncLog.create({
         data: {
@@ -88,17 +90,18 @@ export async function queueXeroSync(params: {
           status: 'PENDING',
         })
       } catch (mirrorError) {
-        await tx.activityLog.create({
-          data: {
-            entityType: 'SYSTEM',
-            action: 'accounting_event_mirror_error',
-            tag: 'sync',
-            level: 'WARNING',
-            description: `Xero sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`,
-          },
-        })
+        mirrorErrorMessage = `Xero sync entry ${log.id} was queued but accounting event mirroring failed: ${String(mirrorError)}`
       }
     })
+    if (mirrorErrorMessage) {
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'accounting_event_mirror_error',
+        tag: 'sync',
+        level: 'WARNING',
+        description: mirrorErrorMessage,
+      })
+    }
   } catch (error) {
     if (params.idempotencyKey && String(error).includes('accounting_sync_logs_idempotency_key_uq')) return
     throw error
