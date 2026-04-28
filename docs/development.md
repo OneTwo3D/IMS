@@ -66,7 +66,9 @@ RATE_LIMIT_BACKEND=redis
 REDIS_URL=redis://localhost:6379/0
 ```
 
-When Redis is selected, `REDIS_URL` must be configured. The Redis backend uses sorted-set windows and clears buckets on successful authentication just like the memory backend.
+When Redis is selected, `REDIS_URL` must be configured. The Redis backend uses a single atomic sorted-set script for check-and-record decisions and clears buckets on successful authentication just like the memory backend.
+
+If the configured backend fails, auth throttling fails open and writes a warning activity log. This keeps login and TOTP available during Redis outages while making the degraded protection visible to operators.
 
 ## Allowlisted Unsupported Features
 

@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto'
+
 export type RateLimitResult = {
   allowed: boolean
   retryAfterSec: number
@@ -25,9 +27,14 @@ export function getConfiguredRateLimitBackendName(
 }
 
 function getBackendSignature(): string {
+  const backendName = getConfiguredRateLimitBackendName()
+  const redisUrl = process.env.REDIS_URL ?? ''
+  const redisUrlHash = redisUrl
+    ? createHash('sha256').update(redisUrl).digest('hex').slice(0, 16)
+    : ''
   return [
-    getConfiguredRateLimitBackendName(),
-    process.env.REDIS_URL ?? '',
+    backendName,
+    redisUrlHash,
   ].join(':')
 }
 
@@ -59,16 +66,41 @@ export async function checkRateLimit(
   max = 5,
   windowMs = 5 * 60_000,
 ): Promise<RateLimitResult> {
-  const backend = await getRateLimitBackend()
-  return backend.check(key, max, windowMs)
+  try {
+    const backend = await getRateLimitBackend()
+    return await backend.check(key, max, windowMs)
+  } catch (error) {
+    await logRateLimitBackendFailure('check', error)
+    return { allowed: true, retryAfterSec: 0, remaining: max }
+  }
 }
 
 export async function clearRateLimit(key: string): Promise<void> {
-  const backend = await getRateLimitBackend()
-  await backend.clear(key)
+  try {
+    const backend = await getRateLimitBackend()
+    await backend.clear(key)
+  } catch (error) {
+    await logRateLimitBackendFailure('clear', error)
+  }
 }
 
 export function resetRateLimitBackendForTests(): void {
   backendPromise = null
   backendSignature = null
+}
+
+async function logRateLimitBackendFailure(operation: 'check' | 'clear', error: unknown): Promise<void> {
+  try {
+    const { logActivity } = await import('@/lib/activity-log')
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: 'rate_limit_backend_error',
+      tag: 'auth',
+      level: 'WARNING',
+      description: `Rate-limit ${operation} failed open: ${String(error)}`,
+      resolveUser: false,
+    })
+  } catch {
+    console.warn(`[rate-limit] ${operation} failed open:`, error)
+  }
 }
