@@ -1,6 +1,8 @@
 #!/usr/bin/env tsx
 
 import { readFile, writeFile } from 'node:fs/promises'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import { PURCHASE_ORDER_TRANSITIONS } from '../lib/domain/workflows/purchase-order-state.ts'
 import { REFUND_TRANSITIONS } from '../lib/domain/workflows/refund-state.ts'
@@ -8,7 +10,12 @@ import { SALES_ORDER_TRANSITIONS } from '../lib/domain/workflows/sales-order-sta
 import { SHIPMENT_TRANSITIONS } from '../lib/domain/workflows/shipment-state.ts'
 import { STOCK_TRANSFER_TRANSITIONS } from '../lib/domain/workflows/stock-transfer-state.ts'
 
-const WORKFLOWS_DOC = 'docs/workflows.md'
+const WORKFLOWS_DOC = path.resolve(
+  path.dirname(fileURLToPath(import.meta.url)),
+  '..',
+  'docs',
+  'workflows.md',
+)
 const START_MARKER = '<!-- BEGIN:generated-workflow-status-tables -->'
 const END_MARKER = '<!-- END:generated-workflow-status-tables -->'
 
@@ -72,11 +79,13 @@ function formatNextStatuses(nextStatuses: readonly string[]): string {
 }
 
 function formatWorkflowTable(workflow: (typeof WORKFLOWS)[number]): string {
-  const rows = Object.entries(workflow.transitions).map(([status, nextStatuses]) => {
-    const note = workflow.notes?.[status] ?? '-'
+  const rows = Object.entries(workflow.transitions)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([status, nextStatuses]) => {
+      const note = workflow.notes?.[status] ?? '-'
 
-    return `| \`${status}\` | ${formatNextStatuses(nextStatuses)} | ${note} |`
-  })
+      return `| \`${status}\` | ${formatNextStatuses(nextStatuses)} | ${note} |`
+    })
 
   return [
     `### ${workflow.name}`,

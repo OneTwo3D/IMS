@@ -17,62 +17,62 @@ rules.
 
 | Status | Allowed next statuses | Notes |
 |---|---|---|
-| `DRAFT` | `PROCESSING`, `PENDING_PAYMENT`, `ALLOCATED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `PENDING_PAYMENT` | `PROCESSING`, `DRAFT`, `ALLOCATED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `ON_HOLD` | `DRAFT`, `PENDING_PAYMENT`, `PROCESSING`, `ALLOCATED`, `PICKING`, `PACKING`, `CANCELLED`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `PROCESSING` | `ALLOCATED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
 | `ALLOCATED` | `PICKING`, `PROCESSING`, `SHIPPED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `PICKING` | `PACKING`, `SHIPPED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `PACKING` | `SHIPPED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `SHIPPED` | `COMPLETED`, `DELIVERED`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
+| `CANCELLED` | None | Terminal. |
 | `COMPLETED` | `DELIVERED`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
 | `DELIVERED` | `PARTIALLY_REFUNDED`, `REFUNDED` | - |
-| `CANCELLED` | None | Terminal. |
-| `REFUNDED` | None | Terminal. |
+| `DRAFT` | `PROCESSING`, `PENDING_PAYMENT`, `ALLOCATED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
+| `ON_HOLD` | `DRAFT`, `PENDING_PAYMENT`, `PROCESSING`, `ALLOCATED`, `PICKING`, `PACKING`, `CANCELLED`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
+| `PACKING` | `SHIPPED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
 | `PARTIALLY_REFUNDED` | `REFUNDED` | Can move only to `REFUNDED`. |
+| `PENDING_PAYMENT` | `PROCESSING`, `DRAFT`, `ALLOCATED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
+| `PICKING` | `PACKING`, `SHIPPED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
+| `PROCESSING` | `ALLOCATED`, `CANCELLED`, `ON_HOLD`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
+| `REFUNDED` | None | Terminal. |
+| `SHIPPED` | `COMPLETED`, `DELIVERED`, `PARTIALLY_REFUNDED`, `REFUNDED` | - |
 
 ### Shipments
 
 | Status | Allowed next statuses | Notes |
 |---|---|---|
+| `PACKED` | `SHIPPED` | - |
 | `PENDING` | `PICKING` | - |
 | `PICKING` | `PACKED` | - |
-| `PACKED` | `SHIPPED` | - |
 | `SHIPPED` | None | Terminal; stock dispatch and cost-layer snapshots happen on this transition. |
 
 ### Purchase Orders
 
 | Status | Allowed next statuses | Notes |
 |---|---|---|
-| `DRAFT` | `RFQ_SENT`, `PO_SENT`, `CANCELLED` | - |
-| `RFQ_SENT` | `QUOTE_RECEIVED`, `PO_SENT`, `CLOSED` | - |
-| `QUOTE_RECEIVED` | `PO_SENT`, `CLOSED` | - |
-| `PO_SENT` | `SHIPPED`, `PARTIALLY_RECEIVED`, `RECEIVED`, `PARTIALLY_RETURNED`, `RETURNED`, `CLOSED` | - |
-| `SHIPPED` | `PARTIALLY_RECEIVED`, `RECEIVED`, `CLOSED` | - |
-| `PARTIALLY_RECEIVED` | `RECEIVED`, `PARTIALLY_RETURNED`, `RETURNED`, `CLOSED` | - |
-| `RECEIVED` | `INVOICED`, `PARTIALLY_RETURNED`, `RETURNED`, `CLOSED` | - |
-| `CLOSED` | None | Terminal. |
-| `INVOICED` | `PARTIALLY_RETURNED`, `RETURNED`, `CLOSED` | - |
-| `PARTIALLY_RETURNED` | `RETURNED` | - |
-| `RETURNED` | None | Terminal. |
 | `CANCELLED` | None | Terminal. |
+| `CLOSED` | None | Terminal. |
+| `DRAFT` | `RFQ_SENT`, `PO_SENT`, `CANCELLED` | - |
+| `INVOICED` | `PARTIALLY_RETURNED`, `RETURNED`, `CLOSED` | - |
+| `PARTIALLY_RECEIVED` | `RECEIVED`, `PARTIALLY_RETURNED`, `RETURNED`, `CLOSED` | - |
+| `PARTIALLY_RETURNED` | `RETURNED` | - |
+| `PO_SENT` | `SHIPPED`, `PARTIALLY_RECEIVED`, `RECEIVED`, `PARTIALLY_RETURNED`, `RETURNED`, `CLOSED` | - |
+| `QUOTE_RECEIVED` | `PO_SENT`, `CLOSED` | - |
+| `RECEIVED` | `INVOICED`, `PARTIALLY_RETURNED`, `RETURNED`, `CLOSED` | - |
+| `RETURNED` | None | Terminal. |
+| `RFQ_SENT` | `QUOTE_RECEIVED`, `PO_SENT`, `CLOSED` | - |
+| `SHIPPED` | `PARTIALLY_RECEIVED`, `RECEIVED`, `CLOSED` | - |
 
 ### Refunds
 
 | Status | Allowed next statuses | Notes |
 |---|---|---|
-| `RECORDED` | `CREDIT_NOTE_SYNCED`, `PAID` | Derived when a `SalesOrderRefund` row exists. |
 | `CREDIT_NOTE_SYNCED` | `PAID` | Derived from accounting credit-note sync state. |
 | `PAID` | None | Terminal; derived from linked refund payments. |
+| `RECORDED` | `CREDIT_NOTE_SYNCED`, `PAID` | Derived when a `SalesOrderRefund` row exists. |
 
 ### Stock Transfers
 
 | Status | Allowed next statuses | Notes |
 |---|---|---|
+| `CANCELLED` | None | Terminal. |
 | `DRAFT` | `IN_TRANSIT`, `CANCELLED` | - |
 | `IN_TRANSIT` | `RECEIVED` | - |
 | `RECEIVED` | None | Terminal. |
-| `CANCELLED` | None | Terminal. |
 
 <!-- END:generated-workflow-status-tables -->
 
