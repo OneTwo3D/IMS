@@ -156,7 +156,7 @@ class RedisCommandClient {
       const onConnect = () => {
         socket.off('error', onInitialError)
         socket.on('error', (error) => this.handleSocketError(error))
-        socket.on('close', () => this.resetSocket())
+        socket.on('close', () => this.handleSocketClose())
         socket.on('data', (chunk) => this.handleData(chunk))
         this.connectPromise = null
         resolve()
@@ -222,6 +222,11 @@ class RedisCommandClient {
   private handleSocketError(error: Error): void {
     this.failPending(error)
     this.destroy()
+  }
+
+  private handleSocketClose(): void {
+    this.failPending(new Error('Redis socket closed'))
+    this.resetSocket()
   }
 
   private failPending(error: Error): void {
