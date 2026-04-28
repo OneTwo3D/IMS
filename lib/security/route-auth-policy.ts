@@ -45,6 +45,10 @@ export const apiRouteAuthPolicy = {
     access: 'admin',
     reason: 'Accounting event backfill is restricted through requireApiAdmin and defaults to dry-run.',
   },
+  '/api/admin/health': {
+    access: 'admin',
+    reason: 'Detailed operational diagnostics are restricted through requireApiAdmin.',
+  },
   '/api/backup/create': {
     access: 'admin',
     reason: 'Backup creation is restricted through requireApiAdmin.',
@@ -175,7 +179,7 @@ export const apiRouteAuthPolicy = {
   },
   '/api/health': {
     access: 'public-webhook',
-    reason: 'Public minimal health endpoint for uptime checks; exposes only database health status.',
+    reason: 'Public minimal health endpoint for uptime checks; exposes no service diagnostics.',
   },
   '/api/import/historical-orders': {
     access: 'authenticated',
