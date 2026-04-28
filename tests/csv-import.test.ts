@@ -48,6 +48,14 @@ test('csv import mode accepts dry-run aliases', () => {
   assert.equal(getCsvImportMode(dryRunFlagForm), 'preview')
 })
 
+test('csv import mode honors explicit execute over stale dry-run flag', () => {
+  const form = new FormData()
+  form.set('mode', 'execute')
+  form.set('dryRun', 'true')
+
+  assert.equal(getCsvImportMode(form), 'execute')
+})
+
 test('csv import mutation guard does not call mutations during dry run', async () => {
   let calls = 0
 

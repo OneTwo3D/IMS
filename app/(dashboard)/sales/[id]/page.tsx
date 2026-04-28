@@ -37,9 +37,13 @@ export default async function SalesOrderDetailPage({ params }: Props) {
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
 
   if (!so) notFound()
+  const stockWarehouseIds = Array.from(new Set([
+    ...warehouses.map((warehouse) => warehouse.id),
+    so.shipFromWarehouseId,
+  ].filter((warehouseId): warehouseId is string => Boolean(warehouseId))))
   const stockLevels = await getScopedStockLevelMap({
     productIds: Array.from(new Set(so.lines.map((line) => line.productId).filter((productId): productId is string => Boolean(productId)))),
-    warehouseIds: warehouses.map((warehouse) => warehouse.id),
+    warehouseIds: stockWarehouseIds,
   })
 
   return (
