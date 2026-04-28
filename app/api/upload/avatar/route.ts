@@ -1,18 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { writeFile, mkdir } from 'fs/promises'
 import path from 'path'
-import sharp from 'sharp'
 import { requireApiAuth } from '@/lib/auth/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-
-// MIME → extension. Only formats we trust sharp to safely decode and re-encode.
-const MIME_TO_EXT: Record<string, string> = {
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/webp': 'webp',
-  'image/gif': 'gif',
-}
+import {
+  AVATAR_IMAGE_MIME_TO_EXT,
+  MAX_AVATAR_UPLOAD_BYTES,
+  reencodeTrustedImage,
+  validateImageUploadMetadata,
+} from '@/lib/security/upload-validation'
 
 export async function POST(req: NextRequest) {
   const session = await requireApiAuth()
@@ -22,39 +19,23 @@ export async function POST(req: NextRequest) {
   const file = formData.get('file') as File | null
   if (!file) return NextResponse.json({ error: 'No file provided' }, { status: 400 })
 
-  const ext = MIME_TO_EXT[file.type]
-  if (!ext) {
+  const validation = validateImageUploadMetadata(file, {
+    mimeToExt: AVATAR_IMAGE_MIME_TO_EXT,
+    maxBytes: MAX_AVATAR_UPLOAD_BYTES,
+    invalidTypeMessage: 'Invalid file type. Use JPEG, PNG, WebP or GIF.',
+    tooLargeMessage: 'File too large. Maximum 2MB.',
+  })
+  if (!validation.ok) {
     return NextResponse.json(
-      { error: 'Invalid file type. Use JPEG, PNG, WebP or GIF.' },
+      { error: validation.error },
       { status: 400 },
     )
   }
-  if (file.size > 2 * 1024 * 1024) {
-    return NextResponse.json({ error: 'File too large. Maximum 2MB.' }, { status: 400 })
-  }
+  const ext = validation.value
 
   const inputBuffer = Buffer.from(await file.arrayBuffer())
-
-  // Verify the buffer is actually a real image of the claimed type and
-  // re-encode it to strip metadata / polyglot payloads. Reject on parse error.
-  let outputBuffer: Buffer
-  try {
-    const image = sharp(inputBuffer, { failOn: 'error' })
-    const metadata = await image.metadata()
-    if (!metadata.format) throw new Error('No image format detected')
-
-    // Re-encode to the claimed format, dropping metadata. For GIF keep frames.
-    if (ext === 'jpg') {
-      outputBuffer = await image.jpeg({ quality: 90, mozjpeg: true }).toBuffer()
-    } else if (ext === 'png') {
-      outputBuffer = await image.png().toBuffer()
-    } else if (ext === 'webp') {
-      outputBuffer = await image.webp().toBuffer()
-    } else {
-      // gif — preserve animation
-      outputBuffer = await sharp(inputBuffer, { animated: true }).gif().toBuffer()
-    }
-  } catch {
+  const outputBuffer = await reencodeTrustedImage(inputBuffer, ext, { jpegQuality: 90, mozjpeg: true })
+  if (!outputBuffer) {
     return NextResponse.json(
       { error: 'Invalid or corrupted image file.' },
       { status: 400 },
