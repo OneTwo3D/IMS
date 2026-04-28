@@ -22,7 +22,7 @@ export async function POST(request: NextRequest) {
   }
 
   const rlKey = `totp_verify:${session.user.id}`
-  const rl = checkRateLimit(rlKey, 5, 5 * 60_000)
+  const rl = await checkRateLimit(rlKey, 5, 5 * 60_000)
   if (!rl.allowed) {
     return Response.json(
       { error: 'Too many attempts, try again later.' },
@@ -52,7 +52,7 @@ export async function POST(request: NextRequest) {
   }
 
   // Success — clear the rate-limit bucket so the next genuine verify is clean.
-  clearRateLimit(rlKey)
+  await clearRateLimit(rlKey)
 
   // Generate a one-time token for secure session update
   const totpToken = randomBytes(32).toString('hex')
