@@ -412,7 +412,7 @@ test('accounting row collection selects staged orders, posted shipments, and syn
     },
   }
 
-  const now = new Date('2026-07-01T00:00:00.000Z')
+  const now = new Date('2026-08-31T00:00:00.000Z')
   await collectAccountingInvariantRows(client, { now, syncLogRetentionMonths: 6 })
 
   assert.ok(calls.salesOrder)
@@ -425,14 +425,14 @@ test('accounting row collection selects staged orders, posted shipments, and syn
   assert.deepEqual(
     (calls.shipment as { where: unknown }).where,
     {
-      shipmentJournalDate: { gte: new Date('2026-01-01T00:00:00.000Z') },
+      shipmentJournalDate: { gte: new Date('2026-02-28T00:00:00.000Z') },
       order: { status: { notIn: ['REFUNDED', 'CANCELLED'] } },
     },
   )
   assert.deepEqual(
     (calls.accountingSyncLog as { where: unknown }).where,
     {
-      createdAt: { gte: new Date('2026-01-01T00:00:00.000Z') },
+      createdAt: { gte: new Date('2026-02-28T00:00:00.000Z') },
       OR: [
         { status: 'FAILED' },
         { status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] } },
