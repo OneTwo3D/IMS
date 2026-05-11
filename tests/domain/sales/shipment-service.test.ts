@@ -52,6 +52,10 @@ type State = {
   settings: Record<string, string>
 }
 
+type ClientOptions = {
+  beforeTransaction?: () => void
+}
+
 function baseState(overrides: Partial<State> = {}): State {
   return {
     orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'PROCESSING' }],
@@ -68,13 +72,16 @@ function baseState(overrides: Partial<State> = {}): State {
   }
 }
 
-function createClient(state: State): ShipmentServiceClient {
+function createClient(state: State, options: ClientOptions = {}): ShipmentServiceClient {
   let shipmentSequence = state.shipments.length + 1
   let movementSequence = state.movements.length + 1
   const client = {
     $queryRaw: async () => [],
     $executeRaw: async () => 0,
-    $transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(client),
+    $transaction: async (callback: (tx: unknown) => Promise<unknown>) => {
+      options.beforeTransaction?.()
+      return callback(client)
+    },
     salesOrder: {
       findUnique: async ({ where }: { where: { id: string } }) => state.orders.find((order) => order.id === where.id) ?? null,
       update: async ({ where, data }: { where: { id: string }; data: Partial<Order> }) => {
@@ -310,6 +317,87 @@ test('transitionShipmentStatus ships stock and stores FIFO COGS snapshot', async
     totalCostBase: 10,
   }])
   assert.equal(state.lines[0].cogsBase, 10)
+})
+
+test('transitionShipmentStatus dispatch uses shipment lines reloaded inside the transaction', async () => {
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 2, sku: 'SKU-1', description: 'Product 1' }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 2, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state, {
+    beforeTransaction() {
+      state.shipmentLines[0].qty = 1
+    },
+  }), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.stockLevels[0].quantity, 1)
+  assert.equal(state.stockLevels[0].reservedQty, 1)
+  assert.equal(state.costLayers[0].remainingQty, 1)
+  assert.equal(state.movements[0].qty, 1)
+  assert.equal(state.shipments[0].cogsBatchAmount, 5)
+  assert.deepEqual(state.shipmentLines[0].costLayerSnapshot, [
+    { costLayerId: 'layer-1', qty: 1, unitCostBase: 5 },
+  ])
+})
+
+test('transitionShipmentStatus fails cleanly when shipment status changes before dispatch lock', async () => {
+  const state = baseState({
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state, {
+    beforeTransaction() {
+      state.shipments[0].status = 'PICKING'
+    },
+  }), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.deepEqual(result, {
+    success: false,
+    error: 'Shipment status changed from PACKED to PICKING. Reload and retry.',
+  })
+  assert.equal(state.shipments[0].status, 'PICKING')
+  assert.equal(state.stockLevels[0].quantity, 2)
+  assert.equal(state.stockLevels[0].reservedQty, 2)
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.cogsEntries.length, 0)
+})
+
+test('transitionShipmentStatus fails cleanly when dispatch shipment lines are empty', async () => {
+  const state = baseState({
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state, {
+    beforeTransaction() {
+      state.shipmentLines = []
+    },
+  }), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.deepEqual(result, {
+    success: false,
+    error: 'Shipment has no lines to dispatch',
+  })
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.stockLevels[0].quantity, 2)
+  assert.equal(state.stockLevels[0].reservedQty, 2)
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.cogsEntries.length, 0)
 })
 
 test('transitionShipmentStatus consumes fractional FIFO layers without binary remainder drift', async () => {

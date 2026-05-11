@@ -25,7 +25,7 @@ import {
   type AllocationRow, type FulfillmentRequirementRow, type ShipmentRow,
 } from '@/app/actions/allocation'
 import type { CurrencyRow } from '@/app/actions/currencies'
-import type { StockLevelEntry } from '@/app/actions/stock'
+import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'

@@ -18,7 +18,6 @@ import {
   buildStockLevelMap,
   isEmptyStockLevelMapScope,
   normalizeStockLevelMapScope,
-  type StockLevelEntry,
   type StockLevelMap,
   type StockLevelMapScope,
 } from '@/lib/domain/inventory/stock-level-map'
@@ -695,12 +694,32 @@ export async function updateAdjustmentMovement(
         )
       }
 
-      // Reverse old stock delta
-      await tx.stockLevel.upsert({
-        where: { productId_warehouseId: { productId: movement.productId, warehouseId: oldWarehouseId } },
-        create: { productId: movement.productId, warehouseId: oldWarehouseId, quantity: '0' },
-        update: { quantity: { decrement: oldSignedQty } },
+      const stockDelta = newSignedQty - oldSignedQty
+      const newWarehouseId = oldWarehouseId // warehouse can't be changed via edit
+      const currentLevel = await tx.stockLevel.findUnique({
+        where: { productId_warehouseId: { productId: movement.productId, warehouseId: newWarehouseId } },
+        select: { quantity: true, reservedQty: true },
       })
+      const resultingQuantity = (currentLevel ? Number(currentLevel.quantity) : 0) + stockDelta
+      const reservedQty = currentLevel ? Number(currentLevel.reservedQty) : 0
+      if (resultingQuantity + 0.000001 < reservedQty) {
+        throw new Error(
+          `Cannot edit adjustment: resulting stock (${resultingQuantity.toFixed(4)}) ` +
+          `would be below reserved quantity (${reservedQty.toFixed(4)}).`,
+        )
+      }
+
+      if (stockDelta !== 0) {
+        await tx.stockLevel.upsert({
+          where: { productId_warehouseId: { productId: movement.productId, warehouseId: newWarehouseId } },
+          create: {
+            productId: movement.productId,
+            warehouseId: newWarehouseId,
+            quantity: resultingQuantity.toString(),
+          },
+          update: { quantity: { increment: stockDelta } },
+        })
+      }
 
       if (oldIsAddition) {
         const layer = movement.adjustmentLayers[0]
@@ -732,24 +751,6 @@ export async function updateAdjustmentMovement(
           })
         }
         await tx.cogsEntry.deleteMany({ where: { movementId: id } })
-      }
-
-      // Apply new stock delta
-      const newWarehouseId = oldWarehouseId // warehouse can't be changed via edit
-      await tx.stockLevel.upsert({
-        where: { productId_warehouseId: { productId: movement.productId, warehouseId: newWarehouseId } },
-        create: { productId: movement.productId, warehouseId: newWarehouseId, quantity: newIsAddition ? newAbsQty : `-${newAbsQty}` },
-        update: { quantity: { increment: newSignedQty } },
-      })
-      const adjustedLevel = await tx.stockLevel.findUnique({
-        where: { productId_warehouseId: { productId: movement.productId, warehouseId: newWarehouseId } },
-        select: { quantity: true, reservedQty: true },
-      })
-      if (adjustedLevel && Number(adjustedLevel.quantity) + 0.000001 < Number(adjustedLevel.reservedQty)) {
-        throw new Error(
-          `Cannot edit adjustment: resulting stock (${Number(adjustedLevel.quantity).toFixed(4)}) ` +
-          `would be below reserved quantity (${Number(adjustedLevel.reservedQty).toFixed(4)}).`,
-        )
       }
 
       if (newIsAddition) {
@@ -906,8 +907,6 @@ export async function getWarehouses() {
 // ---------------------------------------------------------------------------
 // Stock level map (productId → warehouseId → quantity)
 // ---------------------------------------------------------------------------
-
-export type { StockLevelEntry, StockLevelMap, StockLevelMapScope }
 
 const readScopedStockLevelMap = cache(async (
   productIdsKey: string | null,

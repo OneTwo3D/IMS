@@ -12,7 +12,7 @@ import { TransferFormDialog } from './transfer-form'
 import { TransferList } from './transfer-list'
 import type { TransferRow } from '@/app/actions/transfers'
 import type { ProductRow } from '@/app/actions/products'
-import type { StockLevelEntry } from '@/app/actions/stock'
+import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 
 type Warehouse = { id: string; code: string; name: string }
 
