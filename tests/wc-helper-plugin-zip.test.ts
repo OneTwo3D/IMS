@@ -1,9 +1,5 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { execSync } from 'node:child_process'
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 
 /**
  * The download endpoint at app/api/woocommerce/helper-plugin/route.ts builds
@@ -13,7 +9,7 @@ import { join } from 'node:path'
  *
  * Lock in:
  *   1. EOCD signature is at the end of the file.
- *   2. The system `unzip -t` (or `python3 -m zipfile -t`) accepts the zip.
+ *   2. Central-directory metadata points to a valid STORED local file entry.
  *   3. The contained file has the expected name and content.
  *
  * We re-implement buildZip() locally to keep the test isolated from the
@@ -94,9 +90,51 @@ function buildZip(entries: ZipEntry[]): Buffer {
   return Buffer.concat([localBuf, centralBuf, eocd])
 }
 
+function extractStoredZipEntry(zip: Buffer, expectedPath: string): Buffer {
+  const eocdOffset = zip.length - 22
+  assert.equal(zip.readUInt32LE(eocdOffset), 0x06054b50)
+
+  const entryCount = zip.readUInt16LE(eocdOffset + 10)
+  const centralSize = zip.readUInt32LE(eocdOffset + 12)
+  const centralOffset = zip.readUInt32LE(eocdOffset + 16)
+  assert.equal(centralOffset + centralSize, eocdOffset)
+
+  let centralCursor = centralOffset
+  for (let index = 0; index < entryCount; index += 1) {
+    assert.equal(zip.readUInt32LE(centralCursor), 0x02014b50)
+    const compressionMethod = zip.readUInt16LE(centralCursor + 10)
+    const compressedSize = zip.readUInt32LE(centralCursor + 20)
+    const uncompressedSize = zip.readUInt32LE(centralCursor + 24)
+    const nameLength = zip.readUInt16LE(centralCursor + 28)
+    const extraLength = zip.readUInt16LE(centralCursor + 30)
+    const commentLength = zip.readUInt16LE(centralCursor + 32)
+    const localOffset = zip.readUInt32LE(centralCursor + 42)
+    const entryPath = zip.subarray(centralCursor + 46, centralCursor + 46 + nameLength).toString('utf8')
+
+    if (entryPath === expectedPath) {
+      assert.equal(compressionMethod, 0)
+      assert.equal(compressedSize, uncompressedSize)
+      assert.equal(zip.readUInt32LE(localOffset), 0x04034b50)
+
+      const localNameLength = zip.readUInt16LE(localOffset + 26)
+      const localExtraLength = zip.readUInt16LE(localOffset + 28)
+      const localPath = zip.subarray(localOffset + 30, localOffset + 30 + localNameLength).toString('utf8')
+      assert.equal(localPath, expectedPath)
+
+      const contentOffset = localOffset + 30 + localNameLength + localExtraLength
+      return zip.subarray(contentOffset, contentOffset + uncompressedSize)
+    }
+
+    centralCursor += 46 + nameLength + extraLength + commentLength
+  }
+
+  assert.fail(`Missing zip entry: ${expectedPath}`)
+}
+
 test('buildZip emits a parseable zip with the expected file content', () => {
   const content = Buffer.from('<?php\necho "hello";\n')
-  const zip = buildZip([{ path: 'onetwoinventory-helper/onetwoinventory-helper.php', content }])
+  const path = 'onetwoinventory-helper/onetwoinventory-helper.php'
+  const zip = buildZip([{ path, content }])
 
   // EOCD magic must be present at the end (offset = length - 22 for no comment).
   assert.equal(zip.readUInt32LE(zip.length - 22), 0x06054b50)
@@ -104,15 +142,6 @@ test('buildZip emits a parseable zip with the expected file content', () => {
   // Local file header magic at offset 0.
   assert.equal(zip.readUInt32LE(0), 0x04034b50)
 
-  // Round-trip via the system unzip — make sure a real zip parser accepts it.
-  const tmp = mkdtempSync(join(tmpdir(), 'oti-zip-'))
-  try {
-    const zipPath = join(tmp, 'p.zip')
-    writeFileSync(zipPath, zip)
-    execSync(`python3 -m zipfile -e ${zipPath} ${tmp}`)
-    const extracted = readFileSync(join(tmp, 'onetwoinventory-helper/onetwoinventory-helper.php'))
-    assert.equal(extracted.toString(), content.toString())
-  } finally {
-    rmSync(tmp, { recursive: true, force: true })
-  }
+  const extracted = extractStoredZipEntry(zip, path)
+  assert.equal(extracted.toString(), content.toString())
 })

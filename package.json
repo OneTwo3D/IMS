@@ -11,6 +11,7 @@
     "start": "next start",
     "lint": "eslint",
     "type-check": "tsc --noEmit",
+    "test:unit": "NODE_OPTIONS='--import tsx' node --test \"tests/**/*.test.ts\"",
     "docs:workflows": "tsx scripts/generate-workflow-docs.ts",
     "docs:workflows:check": "tsx scripts/generate-workflow-docs.ts --check",
     "validate": "bash scripts/validate-local.sh",
