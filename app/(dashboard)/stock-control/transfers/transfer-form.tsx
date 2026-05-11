@@ -16,7 +16,7 @@ import {
 import { createTransfer, type TransferRow } from '@/app/actions/transfers'
 import { ProductLink } from '@/components/inventory/product-link'
 import type { ProductRow } from '@/app/actions/products'
-import type { StockLevelEntry } from '@/app/actions/stock'
+import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 
 type Warehouse = { id: string; code: string; name: string }
 type StockLevels = Record<string, Record<string, StockLevelEntry>>

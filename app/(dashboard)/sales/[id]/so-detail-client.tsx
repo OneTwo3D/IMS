@@ -25,11 +25,12 @@ import {
   type AllocationRow, type FulfillmentRequirementRow, type ShipmentRow,
 } from '@/app/actions/allocation'
 import type { CurrencyRow } from '@/app/actions/currencies'
-import type { StockLevelEntry } from '@/app/actions/stock'
+import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { calculateCoverageByLine } from '@/lib/products/fulfillment-coverage'
+import { hasPermission } from '@/lib/permissions'
 import { formatMoney } from '@/lib/utils'
 import { getTrackingUrl } from '@/lib/tracking'
 import { countryName, formatCountryDisplay } from '@/lib/countries'
@@ -49,6 +50,7 @@ type Props = {
   accountingAvailable: boolean
   accountingInvoiceUrlTemplate: string
   accountingSyncEnabled: boolean
+  currentUserRole: string
 }
 
 const STATUS_LABELS: Record<SoStatus, string> = {
@@ -717,7 +719,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole }: Props) {
   const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -768,6 +770,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const canCancel = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status)
   const canDelete = ['DRAFT', 'PENDING_PAYMENT'].includes(so.status)
   const canRefund = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'].includes(so.status)
+  const canRetryRefundAccounting = hasPermission(currentUserRole, 'sales.refund')
 
   // Compute qty already committed in non-PENDING shipments for partial fulfillment
   const committedByLine = calculateCoverageByLine(
@@ -1349,7 +1352,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   <Button variant="outline" size="sm" className="h-6 text-xs" onClick={() => setShowPayment({ refundId: r.id, creditNoteNumber: r.creditNoteNumber ?? undefined })}>
                     <CreditCard className="h-3 w-3 mr-1" />Add Payment
                   </Button>
-                  {r.accountingRetryRequired && (
+                  {canRetryRefundAccounting && r.accountingRetryRequired && (
                     <Button variant="outline" size="sm" className="h-6 text-xs" onClick={() => handleRetryRefundAccounting(r.id)} disabled={isPending}>
                       {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Undo2 className="h-3 w-3 mr-1" />}
                       Retry Accounting

@@ -11,6 +11,7 @@ import { getAccountingSettings } from '@/lib/accounting'
 import { DEFAULT_CARRIERS } from '@/lib/tracking'
 import { getSalesOrderAdminLinks } from '@/lib/shopping'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import { requireAuth } from '@/lib/auth/server'
 import { SoDetailClient } from './so-detail-client'
 
 export const metadata: Metadata = { title: 'Sales Order' }
@@ -19,7 +20,8 @@ type Props = { params: Promise<{ id: string }> }
 
 export default async function SalesOrderDetailPage({ params }: Props) {
   const { id } = await params
-  const [so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable] = await Promise.all([
+  const [session, so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable] = await Promise.all([
+    requireAuth(),
     getSalesOrder(id),
     getWarehouses(),
     getCurrencies(true),
@@ -68,6 +70,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         accountingAvailable={accountingAvailable}
         accountingInvoiceUrlTemplate={invoiceUrlTemplate ?? accountingSettings.invoiceUrlTemplate}
         accountingSyncEnabled={accountingAvailable && accountingSettings.syncEnabled}
+        currentUserRole={session.user.role}
       />
     </div>
   )

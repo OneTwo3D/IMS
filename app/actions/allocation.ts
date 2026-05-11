@@ -46,6 +46,48 @@ function revalidateSalesAllocationPaths(orderId: string) {
   }
 }
 
+function shouldLogShipmentStatusFailure(error: string): boolean {
+  return (
+    error.startsWith('Shipment status changed') ||
+    error === 'Shipment lines changed. Reload and retry.' ||
+    error === 'Shipment has no lines to dispatch'
+  )
+}
+
+async function logShipmentStatusFailure(
+  shipmentId: string,
+  targetStatus: string,
+  error: string,
+) {
+  if (!shouldLogShipmentStatusFailure(error)) return
+  const shipment = await db.shipment.findUnique({
+    where: { id: shipmentId },
+    select: {
+      orderId: true,
+      status: true,
+      order: { select: { orderNumber: true, externalOrderNumber: true } },
+      warehouse: { select: { code: true } },
+    },
+  })
+  if (!shipment) return
+
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: shipment.orderId,
+    action: 'shipment_status_change_failed',
+    tag: 'sales',
+    level: 'WARNING',
+    description: `Shipment from ${shipment.warehouse.code} for order ${shipment.order.orderNumber ?? shipment.order.externalOrderNumber} could not transition to ${targetStatus}: ${error}`,
+    metadata: {
+      shipmentId,
+      warehouseCode: shipment.warehouse.code,
+      currentStatus: shipment.status,
+      targetStatus,
+      error,
+    },
+  })
+}
+
 async function requireAuth() {
   const session = await auth()
   if (!session?.user?.id) throw new Error('Unauthorized')
@@ -600,7 +642,14 @@ export async function updateShipmentStatus(
       targetStatus,
       extra,
     })
-    if (!result.success) return result
+    if (!result.success) {
+      try {
+        await logShipmentStatusFailure(shipmentId, targetStatus, result.error)
+      } catch (logError) {
+        console.warn('Failed to log shipment status transition failure', logError)
+      }
+      return result
+    }
 
     if (targetStatus === 'SHIPPED') {
       const reconciliation = await reconcileOrderAfterShipment(db, result.shipment, extra)

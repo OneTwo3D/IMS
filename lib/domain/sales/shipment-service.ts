@@ -72,6 +72,39 @@ async function runInTransaction<T>(
     : callback(client)
 }
 
+async function loadShipmentTransitionContext(
+  client: ShipmentServiceClient,
+  shipmentId: string,
+): Promise<ShipmentTransitionContext | null> {
+  return client.shipment.findUnique({
+    where: { id: shipmentId },
+    include: {
+      order: { select: { id: true, orderNumber: true, externalOrderNumber: true, status: true } },
+      lines: { select: { id: true, lineId: true, productId: true, qty: true, product: { select: { sku: true } } } },
+      warehouse: { select: { code: true } },
+    },
+  }) as Promise<ShipmentTransitionContext | null>
+}
+
+function shipmentLineDispatchFingerprint(line: ShipmentTransitionContext['lines'][number]): string {
+  return [
+    line.id,
+    line.lineId,
+    line.productId,
+    decimalToNumber(line.qty),
+  ].join('|')
+}
+
+function hasSameShipmentLines(
+  currentLines: ShipmentTransitionContext['lines'],
+  lockedLines: ShipmentTransitionContext['lines'],
+): boolean {
+  if (currentLines.length !== lockedLines.length) return false
+  const currentFingerprints = currentLines.map(shipmentLineDispatchFingerprint).sort()
+  const lockedFingerprints = lockedLines.map(shipmentLineDispatchFingerprint).sort()
+  return currentFingerprints.every((fingerprint, index) => fingerprint === lockedFingerprints[index])
+}
+
 export async function confirmSalesOrderShipments(
   client: ShipmentServiceClient,
   orderId: string,
@@ -191,14 +224,7 @@ export async function transitionShipmentStatus(
   },
 ): Promise<ShipmentTransitionResult> {
   const { shipmentId, targetStatus, extra } = input
-  const shipment = await client.shipment.findUnique({
-    where: { id: shipmentId },
-    include: {
-      order: { select: { id: true, orderNumber: true, externalOrderNumber: true, status: true } },
-      lines: { select: { id: true, lineId: true, productId: true, qty: true, product: { select: { sku: true } } } },
-      warehouse: { select: { code: true } },
-    },
-  }) as ShipmentTransitionContext | null
+  const shipment = await loadShipmentTransitionContext(client, shipmentId)
   if (!shipment) return { success: false, error: 'Shipment not found' }
 
   const stockSyncProductIds = [...new Set(shipment.lines.map((line) => line.productId))]
@@ -226,45 +252,70 @@ export async function transitionShipmentStatus(
   if (targetStatus === 'SHIPPED') {
     data.shippedAt = new Date()
 
-    const dispatched = await runInTransaction(client, async (tx) => {
+    const dispatchResult = await runInTransaction(client, async (tx) => {
       await lockSalesOrder(tx, shipment.orderId)
-      const locked = await tx.shipment.findUnique({
-        where: { id: shipmentId },
-        select: { status: true },
-      })
-      if (locked?.status !== shipment.status) {
-        return false
+      await tx.$queryRaw(
+        Prisma.sql`SELECT id FROM "shipments" WHERE id = ${shipmentId} FOR UPDATE`,
+      )
+
+      const lockedShipment = await loadShipmentTransitionContext(tx, shipmentId)
+      if (!lockedShipment) throw new Error('Shipment not found')
+      if (lockedShipment.status !== shipment.status) {
+        return {
+          success: false as const,
+          error: `Shipment status changed from ${shipment.status} to ${lockedShipment.status}. Reload and retry.`,
+        }
+      }
+      if (!hasSameShipmentLines(shipment.lines, lockedShipment.lines)) {
+        return {
+          success: false as const,
+          error: 'Shipment lines changed. Reload and retry.',
+        }
       }
 
-      await tx.shipment.update({ where: { id: shipmentId }, data })
+      const lockedTransition = validateShipmentStatusTransition(lockedShipment.status, targetStatus)
+      if (!lockedTransition.success) throw new Error(lockedTransition.error)
 
-      await lockStockLevels(tx, stockSyncProductIds, [shipment.warehouseId])
+      if (lockedShipment.lines.length === 0) {
+        return {
+          success: false as const,
+          error: 'Shipment has no lines to dispatch',
+        }
+      }
+
+      const lockedProductIds = [...new Set(lockedShipment.lines.map((line) => line.productId))]
+
+      await tx.shipment.update({ where: { id: shipmentId }, data })
+      const updatedShipment = await loadShipmentTransitionContext(tx, shipmentId)
+      if (!updatedShipment) throw new Error('Shipment not found')
+
+      await lockStockLevels(tx, lockedProductIds, [lockedShipment.warehouseId])
       let totalShipmentCogs = toDecimal(0)
-      for (const line of shipment.lines) {
+      for (const line of lockedShipment.lines) {
         const qty = decimalToNumber(line.qty)
         await tx.stockLevel.updateMany({
-          where: { productId: line.productId, warehouseId: shipment.warehouseId },
+          where: { productId: line.productId, warehouseId: lockedShipment.warehouseId },
           data: { reservedQty: { decrement: qty } },
         })
         await tx.stockLevel.updateMany({
-          where: { productId: line.productId, warehouseId: shipment.warehouseId },
+          where: { productId: line.productId, warehouseId: lockedShipment.warehouseId },
           data: { quantity: { decrement: qty } },
         })
         const movement = await tx.stockMovement.create({
           data: {
             type: 'SALE_DISPATCH',
             productId: line.productId,
-            fromWarehouseId: shipment.warehouseId,
+            fromWarehouseId: lockedShipment.warehouseId,
             qty,
-            note: `Dispatched for order — shipment from ${shipment.warehouse.code}`,
+            note: `Dispatched for order — shipment from ${lockedShipment.warehouse.code}`,
             referenceType: 'SalesOrder',
-            referenceId: shipment.orderId,
+            referenceId: lockedShipment.orderId,
           },
           select: { id: true },
         })
 
         const { consumed, totalCost } = await consumeFifoLayersStrict(
-          tx, line.productId, shipment.warehouseId, qty,
+          tx, line.productId, lockedShipment.warehouseId, qty,
         )
         totalShipmentCogs = addMoney(totalShipmentCogs, totalCost)
         if (consumed.length > 0) {
@@ -299,20 +350,28 @@ export async function transitionShipmentStatus(
 
       await refreshSalesOrderLineCogs(
         tx,
-        shipment.lines.map((line) => line.lineId),
+        lockedShipment.lines.map((line) => line.lineId),
       )
 
-      return true
+      return {
+        success: true as const,
+        shipment: updatedShipment,
+        stockSyncProductIds: lockedProductIds,
+      }
     })
+
+    if (!dispatchResult.success) {
+      return dispatchResult
+    }
 
     return {
       success: true,
-      transitioned: dispatched,
-      dispatched,
-      shipment,
+      transitioned: true,
+      dispatched: true,
+      shipment: dispatchResult.shipment,
       targetStatus,
       previousStatus: shipment.status,
-      stockSyncProductIds,
+      stockSyncProductIds: dispatchResult.stockSyncProductIds,
     }
   }
 

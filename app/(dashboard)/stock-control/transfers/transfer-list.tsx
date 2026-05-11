@@ -25,7 +25,7 @@ import {
   type TransferLine,
 } from '@/app/actions/transfers'
 import type { ProductRow } from '@/app/actions/products'
-import type { StockLevelEntry } from '@/app/actions/stock'
+import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 

@@ -14,7 +14,7 @@ import { createCustomer, type CustomerRow, type AddressData } from '@/app/action
 import type { ProductRow } from '@/app/actions/products'
 import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow, UserOption } from '@/app/actions/settings'
-import type { StockLevelEntry } from '@/app/actions/stock'
+import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
 import { ProductLink } from '@/components/inventory/product-link'
 import { formatCountryDisplay, toIsoCountryCode } from '@/lib/countries'
 import { formatMoney } from '@/lib/utils'

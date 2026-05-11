@@ -104,13 +104,13 @@ test.describe.serial('COGS workflow coverage', () => {
     const seeded = parseJsonLine<AdjustmentSeed>(runFixture(['seed-adjustment-safe']))
 
     await page.goto('/stock-control/stock-adjustments')
-    const row = page.locator('tbody tr').first()
+    const row = page.locator('tbody tr').filter({ hasText: seeded.sku }).first()
     await expect(row).toBeVisible()
-    await expect(row).toContainText(seeded.note)
     await row.getByTitle('Edit').click({ force: true })
 
-    const editingRow = page.locator('tbody tr').filter({ has: page.getByRole('spinbutton') }).first()
-    await editingRow.getByRole('spinbutton').fill('-3')
+    const editingRow = row
+    await expect(editingRow.locator('input[type="number"]')).toBeVisible()
+    await editingRow.locator('input[type="number"]').fill('-3')
     await editingRow.locator('button').first().click()
 
     await expect.poll(() => runFixture(['inspect-adjustment', seeded.movementId])).toContain('"signedQty":-3')
@@ -138,12 +138,13 @@ test.describe.serial('COGS workflow coverage', () => {
     const seeded = parseJsonLine<AdjustmentSeed>(runFixture(['seed-adjustment-blocked']))
 
     await page.goto('/stock-control/stock-adjustments')
-    const row = page.locator('tbody tr').filter({ hasText: seeded.note }).first()
+    const row = page.locator('tbody tr').filter({ hasText: seeded.sku }).first()
     await expect(row).toBeVisible()
     await row.getByTitle('Edit').click({ force: true })
 
-    const editingRow = page.locator('tbody tr').filter({ has: page.getByRole('spinbutton') }).first()
-    await editingRow.getByRole('spinbutton').fill('-3')
+    const editingRow = row
+    await expect(editingRow.locator('input[type="number"]')).toBeVisible()
+    await editingRow.locator('input[type="number"]').fill('-3')
     await editingRow.locator('button').first().click()
 
     await expect(editingRow.getByText('Failed to update adjustment.')).toBeVisible()
