@@ -21,6 +21,7 @@ import {
   type StockLevelMap,
   type StockLevelMapScope,
 } from '@/lib/domain/inventory/stock-level-map'
+import { calculateAdjustmentStockDelta } from '@/lib/domain/inventory/stock-adjustment-edit'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -694,20 +695,17 @@ export async function updateAdjustmentMovement(
         )
       }
 
-      const stockDelta = newSignedQty - oldSignedQty
       const newWarehouseId = oldWarehouseId // warehouse can't be changed via edit
       const currentLevel = await tx.stockLevel.findUnique({
         where: { productId_warehouseId: { productId: movement.productId, warehouseId: newWarehouseId } },
         select: { quantity: true, reservedQty: true },
       })
-      const resultingQuantity = (currentLevel ? Number(currentLevel.quantity) : 0) + stockDelta
-      const reservedQty = currentLevel ? Number(currentLevel.reservedQty) : 0
-      if (resultingQuantity + 0.000001 < reservedQty) {
-        throw new Error(
-          `Cannot edit adjustment: resulting stock (${resultingQuantity.toFixed(4)}) ` +
-          `would be below reserved quantity (${reservedQty.toFixed(4)}).`,
-        )
-      }
+      const { stockDelta, resultingQuantity } = calculateAdjustmentStockDelta({
+        oldSignedQty,
+        newSignedQty,
+        currentQuantity: currentLevel?.quantity,
+        currentReservedQty: currentLevel?.reservedQty,
+      })
 
       if (stockDelta !== 0) {
         await tx.stockLevel.upsert({

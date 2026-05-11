@@ -86,6 +86,16 @@ async function loadShipmentTransitionContext(
   }) as Promise<ShipmentTransitionContext | null>
 }
 
+function hasSameShipmentLineSet(
+  currentLines: ShipmentTransitionContext['lines'],
+  lockedLines: ShipmentTransitionContext['lines'],
+): boolean {
+  if (currentLines.length !== lockedLines.length) return false
+  const currentIds = currentLines.map((line) => line.id).sort()
+  const lockedIds = lockedLines.map((line) => line.id).sort()
+  return currentIds.every((id, index) => id === lockedIds[index])
+}
+
 export async function confirmSalesOrderShipments(
   client: ShipmentServiceClient,
   orderId: string,
@@ -247,6 +257,12 @@ export async function transitionShipmentStatus(
           error: `Shipment status changed from ${shipment.status} to ${lockedShipment.status}. Reload and retry.`,
         }
       }
+      if (!hasSameShipmentLineSet(shipment.lines, lockedShipment.lines)) {
+        return {
+          success: false as const,
+          error: 'Shipment lines changed. Reload and retry.',
+        }
+      }
 
       const lockedTransition = validateShipmentStatusTransition(lockedShipment.status, targetStatus)
       if (!lockedTransition.success) throw new Error(lockedTransition.error)
@@ -261,6 +277,7 @@ export async function transitionShipmentStatus(
       const lockedProductIds = [...new Set(lockedShipment.lines.map((line) => line.productId))]
 
       await tx.shipment.update({ where: { id: shipmentId }, data })
+      const updatedShipment = { ...lockedShipment, status: targetStatus }
 
       await lockStockLevels(tx, lockedProductIds, [lockedShipment.warehouseId])
       let totalShipmentCogs = toDecimal(0)
@@ -328,7 +345,7 @@ export async function transitionShipmentStatus(
 
       return {
         success: true as const,
-        shipment: lockedShipment,
+        shipment: updatedShipment,
         stockSyncProductIds: lockedProductIds,
       }
     })

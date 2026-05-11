@@ -30,7 +30,7 @@ export type NormalizedStockLevelMapScope = {
 
 function normalizeIds(ids: readonly string[] | undefined): string[] | undefined {
   if (!ids) return undefined
-  return Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean)))
+  return Array.from(new Set(ids.map((id) => id.trim()).filter(Boolean))).sort()
 }
 
 export function normalizeStockLevelMapScope(scope: StockLevelMapScope = {}): NormalizedStockLevelMapScope {

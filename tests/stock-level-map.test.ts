@@ -64,17 +64,21 @@ test('stock-level scope supports updated-since and pagination', () => {
 
 test('stock-level scope normalizes duplicate ids and empty scopes', () => {
   assert.deepEqual(normalizeStockLevelMapScope({
-    productIds: ['product-1', 'product-1', ''],
-    warehouseIds: ['warehouse-1', 'warehouse-1'],
+    productIds: ['product-2', 'product-1', 'product-1', ''],
+    warehouseIds: ['warehouse-2', 'warehouse-1', 'warehouse-1'],
     skip: -2,
     take: 2.8,
   }), {
-    productIds: ['product-1'],
-    warehouseIds: ['warehouse-1'],
+    productIds: ['product-1', 'product-2'],
+    warehouseIds: ['warehouse-1', 'warehouse-2'],
     updatedSince: undefined,
     skip: undefined,
     take: 2,
   })
+  assert.deepEqual(
+    normalizeStockLevelMapScope({ productIds: ['product-1', 'product-2'] }),
+    normalizeStockLevelMapScope({ productIds: ['product-2', 'product-1'] }),
+  )
   assert.equal(isEmptyStockLevelMapScope({ productIds: [] }), true)
   assert.equal(isEmptyStockLevelMapScope({ take: 0 }), true)
 })

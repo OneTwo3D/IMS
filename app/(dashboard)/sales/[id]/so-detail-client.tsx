@@ -49,6 +49,7 @@ type Props = {
   accountingAvailable: boolean
   accountingInvoiceUrlTemplate: string
   accountingSyncEnabled: boolean
+  currentUserRole: string
 }
 
 const STATUS_LABELS: Record<SoStatus, string> = {
@@ -717,7 +718,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled }: Props) {
+export function SoDetailClient({ order: so, warehouses, currencies, externalOrderLinks, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole }: Props) {
   const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -768,6 +769,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const canCancel = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status)
   const canDelete = ['DRAFT', 'PENDING_PAYMENT'].includes(so.status)
   const canRefund = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'].includes(so.status)
+  const canRetryRefundAccounting = currentUserRole === 'ADMIN'
 
   // Compute qty already committed in non-PENDING shipments for partial fulfillment
   const committedByLine = calculateCoverageByLine(
@@ -1349,7 +1351,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
                   <Button variant="outline" size="sm" className="h-6 text-xs" onClick={() => setShowPayment({ refundId: r.id, creditNoteNumber: r.creditNoteNumber ?? undefined })}>
                     <CreditCard className="h-3 w-3 mr-1" />Add Payment
                   </Button>
-                  {r.accountingRetryRequired && (
+                  {canRetryRefundAccounting && r.accountingRetryRequired && (
                     <Button variant="outline" size="sm" className="h-6 text-xs" onClick={() => handleRetryRefundAccounting(r.id)} disabled={isPending}>
                       {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Undo2 className="h-3 w-3 mr-1" />}
                       Retry Accounting

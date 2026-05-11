@@ -301,6 +301,7 @@ test('transitionShipmentStatus ships stock and stores FIFO COGS snapshot', async
 
   assert.equal(result.success, true)
   assert.equal(result.success && result.dispatched, true)
+  assert.equal(result.success && result.shipment.status, 'SHIPPED')
   assert.equal(state.shipments[0].status, 'SHIPPED')
   assert.equal(state.stockLevels[0].quantity, 0)
   assert.equal(state.stockLevels[0].reservedQty, 0)
@@ -374,7 +375,7 @@ test('transitionShipmentStatus fails cleanly when shipment status changes before
   assert.equal(state.cogsEntries.length, 0)
 })
 
-test('transitionShipmentStatus fails cleanly when dispatch shipment lines are empty', async () => {
+test('transitionShipmentStatus fails cleanly when dispatch shipment lines are removed before lock', async () => {
   const state = baseState({
     shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
     shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
@@ -385,6 +386,54 @@ test('transitionShipmentStatus fails cleanly when dispatch shipment lines are em
       state.shipmentLines = []
     },
   }), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.deepEqual(result, {
+    success: false,
+    error: 'Shipment lines changed. Reload and retry.',
+  })
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.stockLevels[0].quantity, 2)
+  assert.equal(state.stockLevels[0].reservedQty, 2)
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.cogsEntries.length, 0)
+})
+
+test('transitionShipmentStatus fails cleanly when dispatch shipment lines are added before lock', async () => {
+  const state = baseState({
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state, {
+    beforeTransaction() {
+      state.shipmentLines.push({ id: 'shipment-line-2', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 1 })
+    },
+  }), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.deepEqual(result, {
+    success: false,
+    error: 'Shipment lines changed. Reload and retry.',
+  })
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.stockLevels[0].quantity, 2)
+  assert.equal(state.stockLevels[0].reservedQty, 2)
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.cogsEntries.length, 0)
+})
+
+test('transitionShipmentStatus fails cleanly when dispatch shipment starts with no lines', async () => {
+  const state = baseState({
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
     shipmentId: 'shipment-1',
     targetStatus: 'SHIPPED',
   })
