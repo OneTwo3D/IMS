@@ -11,6 +11,8 @@ export type PublicRouteSecurityProperty =
   | 'body-size-limit'
   | 'timestamp-replay-protection'
   | 'development-only'
+  | 'path-traversal-protection'
+  | 'extension-allowlist'
   | 'no-sensitive-output'
 
 export const publicRouteSecurityPropertyValues = [
@@ -20,6 +22,8 @@ export const publicRouteSecurityPropertyValues = [
   'body-size-limit',
   'timestamp-replay-protection',
   'development-only',
+  'path-traversal-protection',
+  'extension-allowlist',
   'no-sensitive-output',
 ] as const satisfies readonly PublicRouteSecurityProperty[]
 
@@ -66,7 +70,7 @@ export const publicRouteSecurityPolicy: Partial<Record<ApiRoutePath, PublicRoute
     rationale: 'Public invoice PDFs require an HMAC token for the invoice id before storage is accessed.',
   },
   '/api/uploads/branding/[filename]': {
-    properties: ['no-sensitive-output'],
+    properties: ['path-traversal-protection', 'extension-allowlist', 'no-sensitive-output'],
     rationale: 'Public branding assets are limited to safe image extensions and not-found responses for missing or disallowed files.',
   },
   '/api/webhooks/mintsoft/asn-booked-in': {

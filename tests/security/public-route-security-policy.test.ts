@@ -54,8 +54,13 @@ test('public-like route classifications retain their required security propertie
       assert.ok(securityPolicy.properties.includes('development-only'), `${route} must document its development-only guard`)
     }
 
-    if (route.includes('/webhooks/')) {
+    if (authPolicy.access === 'public-webhook' && route.startsWith('/api/webhooks/')) {
       assert.ok(securityPolicy.properties.includes('hmac-signature'), `${route} must document webhook signature validation`)
+    }
+
+    if (route === '/api/uploads/branding/[filename]') {
+      assert.ok(securityPolicy.properties.includes('path-traversal-protection'), `${route} must document path traversal protection`)
+      assert.ok(securityPolicy.properties.includes('extension-allowlist'), `${route} must document extension allowlisting`)
     }
   }
 })
