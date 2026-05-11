@@ -49,6 +49,7 @@ function revalidateSalesAllocationPaths(orderId: string) {
 function shouldLogShipmentStatusFailure(error: string): boolean {
   return (
     error.startsWith('Shipment status changed') ||
+    error.startsWith('Insufficient physical or reserved stock to dispatch') ||
     error === 'Shipment lines changed. Reload and retry.' ||
     error === 'Shipment has no lines to dispatch'
   )
@@ -703,7 +704,13 @@ export async function updateShipmentStatus(
     }
     return { success: true }
   } catch (e) {
-    return { success: false, error: String(e) }
+    const error = e instanceof Error ? e.message : String(e)
+    try {
+      await logShipmentStatusFailure(shipmentId, targetStatus, error)
+    } catch (logError) {
+      console.warn('Failed to log shipment status transition failure', logError)
+    }
+    return { success: false, error }
   }
 }
 

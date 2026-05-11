@@ -293,14 +293,22 @@ export async function transitionShipmentStatus(
       let totalShipmentCogs = toDecimal(0)
       for (const line of lockedShipment.lines) {
         const qty = decimalToNumber(line.qty)
-        await tx.stockLevel.updateMany({
-          where: { productId: line.productId, warehouseId: lockedShipment.warehouseId },
-          data: { reservedQty: { decrement: qty } },
+        const qtyForDb = String(line.qty ?? 0)
+        const updatedStock = await tx.stockLevel.updateMany({
+          where: {
+            productId: line.productId,
+            warehouseId: lockedShipment.warehouseId,
+            quantity: { gte: qtyForDb },
+            reservedQty: { gte: qtyForDb },
+          },
+          data: {
+            quantity: { decrement: qtyForDb },
+            reservedQty: { decrement: qtyForDb },
+          },
         })
-        await tx.stockLevel.updateMany({
-          where: { productId: line.productId, warehouseId: lockedShipment.warehouseId },
-          data: { quantity: { decrement: qty } },
-        })
+        if (updatedStock.count !== 1) {
+          throw new Error(`Insufficient physical or reserved stock to dispatch ${line.product.sku}`)
+        }
         const movement = await tx.stockMovement.create({
           data: {
             type: 'SALE_DISPATCH',
