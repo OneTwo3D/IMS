@@ -1,7 +1,7 @@
 # WooCommerce Follow-Up Plan
 
 Date: 2026-04-15
-Branch baseline: `main`
+Branch baseline: `development`
 
 ## Goal
 

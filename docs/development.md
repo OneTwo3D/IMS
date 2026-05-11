@@ -1,5 +1,45 @@
 # Development Workflow
 
+## Branch and PR Workflow
+
+Use `development` as the integration branch for implementation work. Feature branches should be based on `development`, and pull requests should target `development` unless a human explicitly says otherwise. Do not use `main` as the implementation branch.
+
+Before opening a PR, run:
+
+```bash
+npm run validate
+```
+
+`npm run validate` runs linting, TypeScript type-checking, Prisma client generation, unit/security tests, workflow documentation checks, and the Prisma schema scope check against `origin/development`.
+
+For schema, migration, Prisma, or database behavior changes, also run:
+
+```bash
+npm run validate:db
+```
+
+For workflow or UI behavior changes, run the relevant Playwright coverage. Use the selector helper first when choosing focused e2e coverage:
+
+```bash
+npm run e2e:select
+```
+
+Inventory and accounting behavior changes must include focused tests. Keep server actions thin: use them for auth, input parsing, adapter work, revalidation, and redirects; put reusable business rules in `lib/domain/**` or `lib/jobs/**`. Do not commit secrets, credentials, OAuth tokens, webhook secrets, or private keys.
+
+## Test Commands
+
+Unit and security tests run through Node's test runner with `tsx`:
+
+```bash
+npm run test:unit
+```
+
+Focused tests can also be run directly:
+
+```bash
+npx tsx --test tests/<relevant-file>.test.ts
+```
+
 This repository treats `prisma/schema.prisma` as the canonical application schema. Migrations, deployment scripts, and CI all assume the Prisma schema and the live database describe the same shape unless a difference is intentionally documented as unsupported by Prisma.
 
 ## Schema Workflow
