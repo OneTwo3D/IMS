@@ -8,4 +8,6 @@ npm run lint
 npm run type-check
 # Use direct Prisma generate so the baseline does not require DATABASE_URL.
 npx prisma generate --schema prisma/schema.prisma
+npm run test:unit
+npm run docs:workflows:check
 npm run db:schema:scope -- "${schema_scope_base_ref}" "${schema_scope_head_ref}"
