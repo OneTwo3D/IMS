@@ -56,6 +56,19 @@ type ClientOptions = {
   beforeTransaction?: () => void
 }
 
+function restoreState(state: State, snapshot: State) {
+  state.orders = snapshot.orders
+  state.lines = snapshot.lines
+  state.allocations = snapshot.allocations
+  state.shipments = snapshot.shipments
+  state.shipmentLines = snapshot.shipmentLines
+  state.stockLevels = snapshot.stockLevels
+  state.costLayers = snapshot.costLayers
+  state.movements = snapshot.movements
+  state.cogsEntries = snapshot.cogsEntries
+  state.settings = snapshot.settings
+}
+
 function baseState(overrides: Partial<State> = {}): State {
   return {
     orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'PROCESSING' }],
@@ -80,7 +93,13 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
     $executeRaw: async () => 0,
     $transaction: async (callback: (tx: unknown) => Promise<unknown>) => {
       options.beforeTransaction?.()
-      return callback(client)
+      const snapshot = structuredClone(state)
+      try {
+        return await callback(client)
+      } catch (error) {
+        restoreState(state, snapshot)
+        throw error
+      }
     },
     salesOrder: {
       findUnique: async ({ where }: { where: { id: string } }) => state.orders.find((order) => order.id === where.id) ?? null,
@@ -203,11 +222,25 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       },
     },
     stockLevel: {
-      updateMany: async ({ where, data }: { where: { productId: string; warehouseId: string }; data: { quantity?: { decrement: number }; reservedQty?: { decrement: number } } }) => {
-        const rows = state.stockLevels.filter((row) => row.productId === where.productId && row.warehouseId === where.warehouseId)
+      updateMany: async ({
+        where,
+        data,
+      }: {
+        where: {
+          productId: string
+          warehouseId: string
+          quantity?: { gte: number | string }
+          reservedQty?: { gte: number | string }
+        }
+        data: { quantity?: { decrement: number | string }; reservedQty?: { decrement: number | string } }
+      }) => {
+        const rows = state.stockLevels
+          .filter((row) => row.productId === where.productId && row.warehouseId === where.warehouseId)
+          .filter((row) => where.quantity?.gte == null || row.quantity >= Number(where.quantity.gte))
+          .filter((row) => where.reservedQty?.gte == null || row.reservedQty >= Number(where.reservedQty.gte))
         for (const row of rows) {
-          if (data.quantity) row.quantity -= data.quantity.decrement
-          if (data.reservedQty) row.reservedQty -= data.reservedQty.decrement
+          if (data.quantity) row.quantity -= Number(data.quantity.decrement)
+          if (data.reservedQty) row.reservedQty -= Number(data.reservedQty.decrement)
         }
         return { count: rows.length }
       },
@@ -449,6 +482,56 @@ test('transitionShipmentStatus fails cleanly when dispatch shipment starts with 
   assert.equal(state.stockLevels[0].reservedQty, 2)
   assert.equal(state.movements.length, 0)
   assert.equal(state.cogsEntries.length, 0)
+})
+
+test('transitionShipmentStatus rolls back when physical stock is insufficient for dispatch', async () => {
+  const state = baseState({
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 2 }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 2, unitCostBase: 5 }],
+  })
+
+  await assert.rejects(
+    () => transitionShipmentStatus(createClient(state), {
+      shipmentId: 'shipment-1',
+      targetStatus: 'SHIPPED',
+    }),
+    /Insufficient physical or reserved stock to dispatch PRODUCT-1/,
+  )
+
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.stockLevels[0].quantity, 1)
+  assert.equal(state.stockLevels[0].reservedQty, 2)
+  assert.equal(state.costLayers[0].remainingQty, 2)
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.cogsEntries.length, 0)
+  assert.equal(state.shipmentLines[0].costLayerSnapshot, undefined)
+})
+
+test('transitionShipmentStatus rolls back when reserved stock is insufficient for dispatch', async () => {
+  const state = baseState({
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 1 }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 2, unitCostBase: 5 }],
+  })
+
+  await assert.rejects(
+    () => transitionShipmentStatus(createClient(state), {
+      shipmentId: 'shipment-1',
+      targetStatus: 'SHIPPED',
+    }),
+    /Insufficient physical or reserved stock to dispatch PRODUCT-1/,
+  )
+
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.stockLevels[0].quantity, 2)
+  assert.equal(state.stockLevels[0].reservedQty, 1)
+  assert.equal(state.costLayers[0].remainingQty, 2)
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.cogsEntries.length, 0)
+  assert.equal(state.shipmentLines[0].costLayerSnapshot, undefined)
 })
 
 test('transitionShipmentStatus consumes fractional FIFO layers without binary remainder drift', async () => {
