@@ -6,20 +6,15 @@ import { redirect } from 'next/navigation'
 import { NextResponse } from 'next/server'
 import { hasPermission } from '@/lib/permissions'
 import type { Permission } from '@/lib/permissions'
+import {
+  requireApiAdminSession,
+  requireApiAuthSession,
+  requireRoleSession,
+  type AuthSession,
+} from '@/lib/auth/session-gates'
 
 export type { Permission }
-
-export type AuthSession = {
-  user: {
-    id: string
-    email: string
-    name: string
-    role: string
-    supplierId: string | null
-    totpEnabled: boolean
-    totpVerified: boolean
-  }
-}
+export type { AuthSession } from '@/lib/auth/session-gates'
 
 /**
  * Returns the current session or redirects to /login.
@@ -46,10 +41,7 @@ export async function requireAuth(): Promise<AuthSession> {
  */
 export async function requireRole(...roles: string[]): Promise<AuthSession> {
   const session = await requireAuth()
-  if (!roles.includes(session.user.role)) {
-    throw new Error('Forbidden')
-  }
-  return session
+  return requireRoleSession(session, roles)
 }
 
 /**
@@ -82,21 +74,9 @@ export async function getSession(): Promise<AuthSession | null> {
 }
 
 export async function requireApiAuth(): Promise<AuthSession | NextResponse> {
-  const session = await auth()
-  if (!session?.user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-  if (session.user.totpEnabled && !session.user.totpVerified) {
-    return NextResponse.json({ error: 'Two-factor verification required' }, { status: 401 })
-  }
-  return session as AuthSession
+  return requireApiAuthSession(await auth())
 }
 
 export async function requireApiAdmin(): Promise<AuthSession | NextResponse> {
-  const session = await requireApiAuth()
-  if (session instanceof NextResponse) return session
-  if (session.user.role !== 'ADMIN') {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  }
-  return session
+  return requireApiAdminSession(await auth())
 }
