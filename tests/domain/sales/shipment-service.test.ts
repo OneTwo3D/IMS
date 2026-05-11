@@ -534,6 +534,53 @@ test('transitionShipmentStatus rolls back when reserved stock is insufficient fo
   assert.equal(state.shipmentLines[0].costLayerSnapshot, undefined)
 })
 
+test('transitionShipmentStatus rolls back earlier line mutations when a later dispatch line has insufficient stock', async () => {
+  const state = baseState({
+    lines: [
+      { id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 1, sku: 'SKU-1', description: 'Product 1' },
+      { id: 'line-2', orderId: 'order-1', productId: 'product-2', qty: 1, sku: 'SKU-2', description: 'Product 2' },
+    ],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 1 },
+      { id: 'shipment-line-2', shipmentId: 'shipment-1', lineId: 'line-2', productId: 'product-2', qty: 1 },
+    ],
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 1 },
+      { productId: 'product-2', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 0 },
+    ],
+    costLayers: [
+      { id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 },
+      { id: 'layer-2', productId: 'product-2', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 7 },
+    ],
+  })
+
+  await assert.rejects(
+    () => transitionShipmentStatus(createClient(state), {
+      shipmentId: 'shipment-1',
+      targetStatus: 'SHIPPED',
+    }),
+    /Insufficient physical or reserved stock to dispatch PRODUCT-2/,
+  )
+
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.deepEqual(state.stockLevels, [
+    { productId: 'product-1', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 1 },
+    { productId: 'product-2', warehouseId: 'warehouse-1', quantity: 1, reservedQty: 0 },
+  ])
+  assert.deepEqual(state.costLayers, [
+    { id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 5 },
+    { id: 'layer-2', productId: 'product-2', warehouseId: 'warehouse-1', remainingQty: 1, unitCostBase: 7 },
+  ])
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.cogsEntries.length, 0)
+  assert.equal(state.shipmentLines[0].costLayerSnapshot, undefined)
+  assert.equal(state.shipmentLines[1].costLayerSnapshot, undefined)
+  assert.equal(state.shipments[0].cogsBatchAmount, undefined)
+  assert.equal(state.lines[0].cogsBase, undefined)
+  assert.equal(state.lines[1].cogsBase, undefined)
+})
+
 test('transitionShipmentStatus consumes fractional FIFO layers without binary remainder drift', async () => {
   const state = baseState({
     lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 0.3, sku: 'SKU-1', description: 'Product 1' }],
