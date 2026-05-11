@@ -13,6 +13,7 @@ import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-alloc
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost } from '@/lib/cost-layers'
+import { decimalToNumber } from '@/lib/decimal'
 import { multiplyMoney, roundQuantity } from '@/lib/domain/math/decimal'
 import {
   buildStockLevelMap,
@@ -664,7 +665,8 @@ export async function updateAdjustmentMovement(
 
       const oldIsAddition = movement.toWarehouseId !== null
       const oldWarehouseId = (oldIsAddition ? movement.toWarehouseId : movement.fromWarehouseId)!
-      const oldSignedQty = oldIsAddition ? Number(movement.qty) : -Number(movement.qty)
+      const oldQty = decimalToNumber(movement.qty)
+      const oldSignedQty = oldIsAddition ? oldQty : -oldQty
       oldSignedQtyForLog = oldSignedQty
 
       const newIsAddition = newSignedQty > 0

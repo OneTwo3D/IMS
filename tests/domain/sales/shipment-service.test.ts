@@ -320,7 +320,7 @@ test('transitionShipmentStatus ships stock and stores FIFO COGS snapshot', async
   assert.equal(state.lines[0].cogsBase, 10)
 })
 
-test('transitionShipmentStatus dispatch uses shipment lines reloaded inside the transaction', async () => {
+test('transitionShipmentStatus fails cleanly when dispatch shipment line quantity changes before lock', async () => {
   const state = baseState({
     lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 2, sku: 'SKU-1', description: 'Product 1' }],
     shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
@@ -338,15 +338,17 @@ test('transitionShipmentStatus dispatch uses shipment lines reloaded inside the 
     targetStatus: 'SHIPPED',
   })
 
-  assert.equal(result.success, true)
-  assert.equal(state.stockLevels[0].quantity, 1)
-  assert.equal(state.stockLevels[0].reservedQty, 1)
-  assert.equal(state.costLayers[0].remainingQty, 1)
-  assert.equal(state.movements[0].qty, 1)
-  assert.equal(state.shipments[0].cogsBatchAmount, 5)
-  assert.deepEqual(state.shipmentLines[0].costLayerSnapshot, [
-    { costLayerId: 'layer-1', qty: 1, unitCostBase: 5 },
-  ])
+  assert.deepEqual(result, {
+    success: false,
+    error: 'Shipment lines changed. Reload and retry.',
+  })
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.stockLevels[0].quantity, 2)
+  assert.equal(state.stockLevels[0].reservedQty, 2)
+  assert.equal(state.costLayers[0].remainingQty, 2)
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.cogsEntries.length, 0)
+  assert.equal(state.shipmentLines[0].costLayerSnapshot, undefined)
 })
 
 test('transitionShipmentStatus fails cleanly when shipment status changes before dispatch lock', async () => {

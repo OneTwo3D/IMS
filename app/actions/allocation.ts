@@ -643,7 +643,11 @@ export async function updateShipmentStatus(
       extra,
     })
     if (!result.success) {
-      await logShipmentStatusFailure(shipmentId, targetStatus, result.error)
+      try {
+        await logShipmentStatusFailure(shipmentId, targetStatus, result.error)
+      } catch (logError) {
+        console.warn('Failed to log shipment status transition failure', logError)
+      }
       return result
     }
 

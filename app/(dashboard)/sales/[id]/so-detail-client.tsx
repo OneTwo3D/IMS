@@ -30,6 +30,7 @@ import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { calculateCoverageByLine } from '@/lib/products/fulfillment-coverage'
+import { hasPermission } from '@/lib/permissions'
 import { formatMoney } from '@/lib/utils'
 import { getTrackingUrl } from '@/lib/tracking'
 import { countryName, formatCountryDisplay } from '@/lib/countries'
@@ -769,7 +770,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const canCancel = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'].includes(so.status)
   const canDelete = ['DRAFT', 'PENDING_PAYMENT'].includes(so.status)
   const canRefund = ['SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'].includes(so.status)
-  const canRetryRefundAccounting = currentUserRole === 'ADMIN'
+  const canRetryRefundAccounting = hasPermission(currentUserRole, 'sales.refund')
 
   // Compute qty already committed in non-PENDING shipments for partial fulfillment
   const committedByLine = calculateCoverageByLine(

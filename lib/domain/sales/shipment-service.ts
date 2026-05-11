@@ -86,14 +86,23 @@ async function loadShipmentTransitionContext(
   }) as Promise<ShipmentTransitionContext | null>
 }
 
-function hasSameShipmentLineSet(
+function shipmentLineDispatchFingerprint(line: ShipmentTransitionContext['lines'][number]): string {
+  return [
+    line.id,
+    line.lineId,
+    line.productId,
+    decimalToNumber(line.qty),
+  ].join('|')
+}
+
+function hasSameShipmentLines(
   currentLines: ShipmentTransitionContext['lines'],
   lockedLines: ShipmentTransitionContext['lines'],
 ): boolean {
   if (currentLines.length !== lockedLines.length) return false
-  const currentIds = currentLines.map((line) => line.id).sort()
-  const lockedIds = lockedLines.map((line) => line.id).sort()
-  return currentIds.every((id, index) => id === lockedIds[index])
+  const currentFingerprints = currentLines.map(shipmentLineDispatchFingerprint).sort()
+  const lockedFingerprints = lockedLines.map(shipmentLineDispatchFingerprint).sort()
+  return currentFingerprints.every((fingerprint, index) => fingerprint === lockedFingerprints[index])
 }
 
 export async function confirmSalesOrderShipments(
@@ -257,7 +266,7 @@ export async function transitionShipmentStatus(
           error: `Shipment status changed from ${shipment.status} to ${lockedShipment.status}. Reload and retry.`,
         }
       }
-      if (!hasSameShipmentLineSet(shipment.lines, lockedShipment.lines)) {
+      if (!hasSameShipmentLines(shipment.lines, lockedShipment.lines)) {
         return {
           success: false as const,
           error: 'Shipment lines changed. Reload and retry.',
@@ -277,7 +286,8 @@ export async function transitionShipmentStatus(
       const lockedProductIds = [...new Set(lockedShipment.lines.map((line) => line.productId))]
 
       await tx.shipment.update({ where: { id: shipmentId }, data })
-      const updatedShipment = { ...lockedShipment, status: targetStatus }
+      const updatedShipment = await loadShipmentTransitionContext(tx, shipmentId)
+      if (!updatedShipment) throw new Error('Shipment not found')
 
       await lockStockLevels(tx, lockedProductIds, [lockedShipment.warehouseId])
       let totalShipmentCogs = toDecimal(0)
