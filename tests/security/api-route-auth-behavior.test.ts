@@ -5,7 +5,12 @@ import { GET as publicHealthGet } from '../../app/api/health/route.ts'
 import { GET as invoicePdfGet } from '../../app/api/invoices/[id]/route.ts'
 import { POST as e2eNotificationsPost } from '../../app/api/e2e/notifications/route.ts'
 import { verifyCron } from '../../lib/cron-auth.ts'
-import { createRequireApiAdmin, createRequireApiAuth, type AuthSession } from '../../lib/auth/server.ts'
+import {
+  requireApiAdminSession,
+  requireApiAuthSession,
+  requireRoleSession,
+  type AuthSession,
+} from '../../lib/auth/session-gates.ts'
 import {
   apiRouteRequest,
   assertRouteAccess,
@@ -57,18 +62,17 @@ test('cron-secret policy route accepts the configured bearer token before cron w
 test('admin policy route rejects unauthenticated and non-admin sessions', async () => {
   assertRouteAccess('/api/admin/health', 'admin')
 
-  const requireAnonymousAdmin = createRequireApiAdmin(async () => null)
-  await expectStatus('anonymous admin route', requireAnonymousAdmin() as Promise<Response>, 401)
+  await expectStatus('anonymous admin route', requireApiAdminSession(null) as Response, 401)
 
-  const requireUserAdmin = createRequireApiAdmin(async () => session('USER'))
-  await expectStatus('non-admin admin route', requireUserAdmin() as Promise<Response>, 403)
+  for (const role of ['MANAGER', 'WAREHOUSE', 'FINANCE', 'READONLY', 'SUPPLIER']) {
+    await expectStatus(`non-admin ${role} admin route`, requireApiAdminSession(session(role)) as Response, 403)
+  }
 })
 
 test('admin policy route accepts admin sessions', async () => {
   assertRouteAccess('/api/admin/health', 'admin')
 
-  const requireAdmin = createRequireApiAdmin(async () => session('ADMIN'))
-  const result = await requireAdmin()
+  const result = requireApiAdminSession(session('ADMIN'))
   assert.equal(result instanceof Response, false)
   assert.equal((result as AuthSession).user.role, 'ADMIN')
 })
@@ -76,11 +80,9 @@ test('admin policy route accepts admin sessions', async () => {
 test('authenticated policy route rejects anonymous sessions and accepts verified users', async () => {
   assertRouteAccess('/api/export/products', 'authenticated')
 
-  const requireAnonymousAuth = createRequireApiAuth(async () => null)
-  await expectStatus('anonymous authenticated route', requireAnonymousAuth() as Promise<Response>, 401)
+  await expectStatus('anonymous authenticated route', requireApiAuthSession(null) as Response, 401)
 
-  const requireVerifiedAuth = createRequireApiAuth(async () => session('USER'))
-  const result = await requireVerifiedAuth()
+  const result = requireApiAuthSession(session('USER'))
   assert.equal(result instanceof Response, false)
   assert.equal((result as AuthSession).user.email, 'user@example.com')
 })
@@ -88,11 +90,21 @@ test('authenticated policy route rejects anonymous sessions and accepts verified
 test('authenticated policy route rejects sessions still pending TOTP verification', async () => {
   assertRouteAccess('/api/export/products', 'authenticated')
 
-  const requireTotpAuth = createRequireApiAuth(async () => session('USER', {
+  await expectStatus('totp-pending authenticated route', requireApiAuthSession(session('USER', {
     totpEnabled: true,
     totpVerified: false,
-  }))
-  await expectStatus('totp-pending authenticated route', requireTotpAuth() as Promise<Response>, 401)
+  })) as Response, 401)
+})
+
+test('multi-role helper accepts only explicitly allowed RBAC roles', () => {
+  const allowedRoles = ['ADMIN', 'FINANCE', 'MANAGER']
+  for (const role of allowedRoles) {
+    assert.equal(requireRoleSession(session(role), allowedRoles).user.role, role)
+  }
+
+  for (const role of ['WAREHOUSE', 'READONLY', 'SUPPLIER']) {
+    assert.throws(() => requireRoleSession(session(role), allowedRoles), /Forbidden/)
+  }
 })
 
 test('internal-dev-only route returns 404 outside development E2E mode', async () => {

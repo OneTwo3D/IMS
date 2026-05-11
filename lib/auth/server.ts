@@ -6,31 +6,15 @@ import { redirect } from 'next/navigation'
 import { NextResponse } from 'next/server'
 import { hasPermission } from '@/lib/permissions'
 import type { Permission } from '@/lib/permissions'
+import {
+  requireApiAdminSession,
+  requireApiAuthSession,
+  requireRoleSession,
+  type AuthSession,
+} from '@/lib/auth/session-gates'
 
 export type { Permission }
-
-export type AuthSession = {
-  user: {
-    id: string
-    email: string
-    name: string
-    role: string
-    supplierId: string | null
-    totpEnabled: boolean
-    totpVerified: boolean
-  }
-}
-
-type ApiAuthProvider = () => Promise<unknown>
-
-function isAuthSession(value: unknown): value is AuthSession {
-  return Boolean(
-    value &&
-    typeof value === 'object' &&
-    'user' in value &&
-    (value as { user?: unknown }).user,
-  )
-}
+export type { AuthSession } from '@/lib/auth/session-gates'
 
 /**
  * Returns the current session or redirects to /login.
@@ -57,10 +41,7 @@ export async function requireAuth(): Promise<AuthSession> {
  */
 export async function requireRole(...roles: string[]): Promise<AuthSession> {
   const session = await requireAuth()
-  if (!roles.includes(session.user.role)) {
-    throw new Error('Forbidden')
-  }
-  return session
+  return requireRoleSession(session, roles)
 }
 
 /**
@@ -92,31 +73,10 @@ export async function getSession(): Promise<AuthSession | null> {
   return session as AuthSession
 }
 
-export function createRequireApiAuth(authProvider: ApiAuthProvider): () => Promise<AuthSession | NextResponse> {
-  return async () => {
-    const session = await authProvider()
-    if (!isAuthSession(session)) {
-      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-    }
-    if (session.user.totpEnabled && !session.user.totpVerified) {
-      return NextResponse.json({ error: 'Two-factor verification required' }, { status: 401 })
-    }
-    return session
-  }
+export async function requireApiAuth(): Promise<AuthSession | NextResponse> {
+  return requireApiAuthSession(await auth())
 }
 
-export const requireApiAuth = createRequireApiAuth(auth)
-
-export function createRequireApiAdmin(authProvider: ApiAuthProvider): () => Promise<AuthSession | NextResponse> {
-  const requireAuth = createRequireApiAuth(authProvider)
-  return async () => {
-    const session = await requireAuth()
-    if (session instanceof NextResponse) return session
-    if (session.user.role !== 'ADMIN') {
-      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-    }
-    return session
-  }
+export async function requireApiAdmin(): Promise<AuthSession | NextResponse> {
+  return requireApiAdminSession(await auth())
 }
-
-export const requireApiAdmin = createRequireApiAdmin(auth)
