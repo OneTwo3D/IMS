@@ -21,6 +21,17 @@ export type AuthSession = {
   }
 }
 
+type ApiAuthProvider = () => Promise<unknown>
+
+function isAuthSession(value: unknown): value is AuthSession {
+  return Boolean(
+    value &&
+    typeof value === 'object' &&
+    'user' in value &&
+    (value as { user?: unknown }).user,
+  )
+}
+
 /**
  * Returns the current session or redirects to /login.
  * Use in Server Components and Route Handlers that require authentication.
@@ -81,22 +92,31 @@ export async function getSession(): Promise<AuthSession | null> {
   return session as AuthSession
 }
 
-export async function requireApiAuth(): Promise<AuthSession | NextResponse> {
-  const session = await auth()
-  if (!session?.user) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+export function createRequireApiAuth(authProvider: ApiAuthProvider): () => Promise<AuthSession | NextResponse> {
+  return async () => {
+    const session = await authProvider()
+    if (!isAuthSession(session)) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+    if (session.user.totpEnabled && !session.user.totpVerified) {
+      return NextResponse.json({ error: 'Two-factor verification required' }, { status: 401 })
+    }
+    return session
   }
-  if (session.user.totpEnabled && !session.user.totpVerified) {
-    return NextResponse.json({ error: 'Two-factor verification required' }, { status: 401 })
-  }
-  return session as AuthSession
 }
 
-export async function requireApiAdmin(): Promise<AuthSession | NextResponse> {
-  const session = await requireApiAuth()
-  if (session instanceof NextResponse) return session
-  if (session.user.role !== 'ADMIN') {
-    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+export const requireApiAuth = createRequireApiAuth(auth)
+
+export function createRequireApiAdmin(authProvider: ApiAuthProvider): () => Promise<AuthSession | NextResponse> {
+  const requireAuth = createRequireApiAuth(authProvider)
+  return async () => {
+    const session = await requireAuth()
+    if (session instanceof NextResponse) return session
+    if (session.user.role !== 'ADMIN') {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+    return session
   }
-  return session
 }
+
+export const requireApiAdmin = createRequireApiAdmin(auth)
