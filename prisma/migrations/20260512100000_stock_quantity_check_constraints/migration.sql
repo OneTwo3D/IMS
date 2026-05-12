@@ -51,13 +51,22 @@ END $$;
 
 ALTER TABLE "stock_levels"
   ADD CONSTRAINT "stock_levels_quantity_nonnegative"
-  CHECK ("quantity" >= 0),
+  CHECK ("quantity" >= 0) NOT VALID,
   ADD CONSTRAINT "stock_levels_reserved_nonnegative"
-  CHECK ("reservedQty" >= 0);
+  CHECK ("reservedQty" >= 0) NOT VALID;
 
 ALTER TABLE "cost_layers"
   ADD CONSTRAINT "cost_layers_received_nonnegative"
-  CHECK ("receivedQty" >= 0);
+  CHECK ("receivedQty" >= 0) NOT VALID;
+
+ALTER TABLE "stock_levels"
+  VALIDATE CONSTRAINT "stock_levels_quantity_nonnegative";
+
+ALTER TABLE "stock_levels"
+  VALIDATE CONSTRAINT "stock_levels_reserved_nonnegative";
+
+-- Keep the earlier reserved<=quantity cleanup deferred in the prior migration.
+-- This migration only validates the globally-safe non-negative quantity checks.
 
 ALTER TABLE "cost_layers"
   VALIDATE CONSTRAINT "cost_layers_remaining_qty_non_negative";
@@ -65,6 +74,12 @@ ALTER TABLE "cost_layers"
 ALTER TABLE "cost_layers"
   VALIDATE CONSTRAINT "cost_layers_remaining_qty_lte_received_qty";
 
+ALTER TABLE "cost_layers"
+  VALIDATE CONSTRAINT "cost_layers_received_nonnegative";
+
 ALTER TABLE "stock_movements"
   ADD CONSTRAINT "stock_movements_qty_nonnegative"
-  CHECK ("qty" >= 0);
+  CHECK ("qty" >= 0) NOT VALID;
+
+ALTER TABLE "stock_movements"
+  VALIDATE CONSTRAINT "stock_movements_qty_nonnegative";
