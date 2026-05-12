@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
+import { roundQuantity } from '@/lib/domain/math/decimal'
 import {
   calculateCoverageByLine,
   requirementsMapToRows,
@@ -98,11 +99,14 @@ type BackorderReportClient = {
   product: Parameters<typeof loadFulfillmentProductGraph>[0]['product']
 }
 
+const QUANTITY_TOLERANCE = 0.0001
+// KIT included: backorder coverage is evaluated against the parent sales line,
+// even though KITs have no FIFO layers of their own.
 const STOCK_TRACKED_PRODUCT_TYPES = new Set<BackorderProductType>(['SIMPLE', 'VARIANT', 'KIT', 'BOM'])
-const EPSILON = 0.000001
 
-function roundQuantity(value: number): number {
-  return Math.round(value * 10000) / 10000
+function toReportQuantity(value: number): number {
+  if (Math.abs(value) <= QUANTITY_TOLERANCE) return 0
+  return roundQuantity(value, 4).toNumber()
 }
 
 function isStockTracked(type: BackorderProductType): boolean {
@@ -119,7 +123,7 @@ function buildSummary(lines: BackorderReportLine[]): BackorderReport['summary'] 
     (summary, line) => {
       summary.totalLines += 1
       if (line.requiresStock) summary.stockTrackedLines += 1
-      if (line.unallocatedQty > EPSILON) summary.backorderLines += 1
+      if (line.unallocatedQty > QUANTITY_TOLERANCE) summary.backorderLines += 1
       summary.orderedQty += line.orderedQty
       summary.shippedQty += line.shippedQty
       summary.committedShipmentQty += line.committedShipmentQty
@@ -179,7 +183,7 @@ export function buildBackorderReport(rows: BackorderReportRows): BackorderReport
         productId: line.productId,
         sku: line.sku,
         description: line.description,
-        orderedQty: roundQuantity(orderedQty),
+        orderedQty: toReportQuantity(orderedQty),
         shippedQty: 0,
         committedShipmentQty: 0,
         allocatedQty: 0,
@@ -197,7 +201,7 @@ export function buildBackorderReport(rows: BackorderReportRows): BackorderReport
         productId: line.productId,
         sku: line.sku,
         description: line.description,
-        orderedQty: roundQuantity(orderedQty),
+        orderedQty: toReportQuantity(orderedQty),
         shippedQty: 0,
         committedShipmentQty: 0,
         allocatedQty: 0,
@@ -211,9 +215,13 @@ export function buildBackorderReport(rows: BackorderReportRows): BackorderReport
     const shippedQty = shippedByLine.get(line.id) ?? 0
     const committedShipmentQty = committedShipmentByLine.get(line.id) ?? 0
     const remainingAfterCommitted = Math.max(0, orderedQty - committedShipmentQty)
-    const allocatedQty = Math.min(remainingAfterCommitted, allocatedByLine.get(line.id) ?? 0)
-    const unallocatedQty = Math.max(0, remainingAfterCommitted - allocatedQty)
-    const hasBackorder = unallocatedQty > EPSILON
+    const rawAllocatedQty = allocatedByLine.get(line.id) ?? 0
+    // This is a demand report, not an integrity report: over-allocation drift
+    // is capped to the remaining demand and must be surfaced by invariants.
+    const allocatedQty = Math.min(remainingAfterCommitted, rawAllocatedQty)
+    const rawUnallocatedQty = Math.max(0, remainingAfterCommitted - allocatedQty)
+    const hasBackorder = rawUnallocatedQty > QUANTITY_TOLERANCE
+    const unallocatedQty = hasBackorder ? rawUnallocatedQty : 0
 
     return {
       orderId: line.orderId,
@@ -221,12 +229,14 @@ export function buildBackorderReport(rows: BackorderReportRows): BackorderReport
       productId: line.productId,
       sku: line.sku,
       description: line.description,
-      orderedQty: roundQuantity(orderedQty),
-      shippedQty: roundQuantity(Math.min(orderedQty, shippedQty)),
-      committedShipmentQty: roundQuantity(Math.min(orderedQty, committedShipmentQty)),
-      allocatedQty: roundQuantity(allocatedQty),
-      unallocatedQty: roundQuantity(unallocatedQty),
+      orderedQty: toReportQuantity(orderedQty),
+      shippedQty: toReportQuantity(Math.min(orderedQty, shippedQty)),
+      committedShipmentQty: toReportQuantity(Math.min(orderedQty, committedShipmentQty)),
+      allocatedQty: toReportQuantity(allocatedQty),
+      unallocatedQty: toReportQuantity(unallocatedQty),
       requiresStock: true,
+      // Eligibility is a sales-policy hint. Allocation can still fail if a
+      // KIT's required components are not themselves allocatable.
       backorderEligible: hasBackorder && line.product.oversellAllowed,
       reason: hasBackorder ? 'stock_shortage' : 'fully_covered',
     }
@@ -238,6 +248,12 @@ export function buildBackorderReport(rows: BackorderReportRows): BackorderReport
   }
 }
 
+/**
+ * Read-only collector for a single sales order. Callers must authenticate and
+ * verify that the current user may view `orderId` before calling this helper.
+ * The reads are intentionally eventual-consistent; callers making mutation
+ * decisions from the report should run collection inside their own transaction.
+ */
 export async function collectBackorderReportRows(
   orderId: string,
   client: BackorderReportClient = db as unknown as BackorderReportClient,
@@ -305,6 +321,11 @@ export async function collectBackorderReportRows(
   }
 }
 
+/**
+ * Builds a derived backorder report for one sales order. This domain helper
+ * performs no auth or ownership checks; route handlers/server actions must
+ * enforce those boundaries before exposing the returned data.
+ */
 export async function getSalesOrderBackorderReport(
   orderId: string,
   client?: BackorderReportClient,
