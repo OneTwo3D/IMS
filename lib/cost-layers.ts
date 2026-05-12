@@ -9,6 +9,7 @@
 
 import type { Prisma } from '@/app/generated/prisma/client'
 import { parseCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
+import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import {
   addMoney,
   multiplyMoney,
@@ -135,7 +136,14 @@ export async function consumeFifoLayersStrict(
   warehouseId: string,
   qty: number,
 ): Promise<{ consumed: ConsumedLayer[]; totalCost: Decimal }> {
-  const result = await consumeFifoLayers(tx, productId, warehouseId, qty)
+  let result
+  try {
+    result = await consumeFifoLayers(tx, productId, warehouseId, qty)
+  } catch (error) {
+    const message = getInventoryConstraintMessage(error)
+    if (message) throw new Error(message)
+    throw error
+  }
   if (result.remainingQty.gt(0.0001)) {
     throw new Error(
       `Insufficient FIFO layers for product ${productId} in warehouse ${warehouseId}: ` +

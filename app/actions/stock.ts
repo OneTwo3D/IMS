@@ -22,6 +22,7 @@ import {
   type StockLevelMap,
   type StockLevelMapScope,
 } from '@/lib/domain/inventory/stock-level-map'
+import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { calculateAdjustmentStockDelta } from '@/lib/domain/inventory/stock-adjustment-edit'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -435,6 +436,7 @@ export async function adjustStock(
 
     return { success: true }
   } catch (e) {
+    const message = toInventoryConstraintMessage(e, 'Failed to save adjustment. Please try again.')
     console.error(e)
 
     await logActivity({
@@ -443,10 +445,10 @@ export async function adjustStock(
       action: 'adjusted',
       tag: 'stock',
       level: 'ERROR',
-      description: e instanceof Error ? e.message : 'Failed to save adjustment.',
+      description: message,
     })
 
-    return { message: 'Failed to save adjustment. Please try again.' }
+    return { message }
   }
 }
 
@@ -554,6 +556,7 @@ export async function bulkAdjustStock(
 
     return { success: true, count: valid.length }
   } catch (e) {
+    const message = toInventoryConstraintMessage(e, 'Failed to save adjustments. Please try again.')
     console.error(e)
 
     await logActivity({
@@ -561,10 +564,10 @@ export async function bulkAdjustStock(
       action: 'bulk_adjusted',
       tag: 'stock',
       level: 'ERROR',
-      description: e instanceof Error ? e.message : 'Failed to save adjustments.',
+      description: message,
     })
 
-    return { message: 'Failed to save adjustments. Please try again.' }
+    return { message }
   }
 }
 
@@ -838,6 +841,7 @@ export async function updateAdjustmentMovement(
 
     return { success: true }
   } catch (e) {
+    const message = toInventoryConstraintMessage(e, 'Failed to update adjustment.')
     console.error(e)
 
     await logActivity({
@@ -846,10 +850,10 @@ export async function updateAdjustmentMovement(
       action: 'adjustment_updated',
       tag: 'stock',
       level: 'ERROR',
-      description: e instanceof Error ? e.message : 'Failed to update adjustment.',
+      description: message,
     })
 
-    return { message: 'Failed to update adjustment.' }
+    return { message }
   }
 }
 

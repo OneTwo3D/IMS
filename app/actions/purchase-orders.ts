@@ -10,6 +10,7 @@ import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import { consumeFifoLayersStrict } from '@/lib/cost-layers'
+import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -2255,16 +2256,17 @@ export async function returnPurchaseOrder(
 
     return { success: true }
   } catch (e) {
+    const message = toInventoryConstraintMessage(e, 'Failed to return purchase order stock.')
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'returned',
       tag: 'purchase',
       level: 'ERROR',
-      description: `Failed to return PO ${id}: ${String(e)}`,
+      description: `Failed to return PO ${id}: ${message}`,
       metadata: null,
     })
-    return { success: false, error: String(e) }
+    return { success: false, error: message }
   }
 }
 
