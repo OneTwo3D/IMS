@@ -16,6 +16,7 @@ import {
   createCostLayer,
 } from '@/lib/cost-layers'
 import { sliceTransferSnapshotForReceipt } from '@/lib/connectors/mintsoft/sync/booked-in-helpers'
+import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -484,7 +485,7 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
     return { success: true }
   } catch (e: unknown) {
     console.error(e)
-    const msg = e instanceof Error ? e.message : 'Failed to dispatch transfer.'
+    const msg = toInventoryConstraintMessage(e, 'Failed to dispatch transfer.')
 
     await logActivity({
       entityType: 'STOCK_TRANSFER',
@@ -670,7 +671,7 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
     return { success: true }
   } catch (e: unknown) {
     console.error(e)
-    const msg = e instanceof Error ? e.message : 'Failed to receive transfer.'
+    const msg = toInventoryConstraintMessage(e, 'Failed to receive transfer.')
 
     await logActivity({
       entityType: 'STOCK_TRANSFER',

@@ -22,6 +22,7 @@ import {
   recomputeManufacturingUnitCosts,
   stableHash,
 } from '@/lib/manufacturing-cost'
+import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { COMPONENT_PRODUCT_STATUSES, OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { Prisma, type ProductionOrderStatus, type ProductionOrderType } from '@/app/generated/prisma/client'
 
@@ -1130,15 +1131,16 @@ export async function updateManufacturingOrderStatus(
     }
     return { success: true }
   } catch (e) {
+    const message = toInventoryConstraintMessage(e, 'Failed to update status.')
     await logActivity({
       entityType: 'PRODUCTION_ORDER',
       entityId: id,
       tag: 'manufacturing',
       action: 'status_changed',
       level: 'ERROR',
-      description: `Failed to update manufacturing order status: ${e instanceof Error ? e.message : e}`,
+      description: `Failed to update manufacturing order status: ${message}`,
     })
-    return { success: false, error: 'Failed to update status.' }
+    return { success: false, error: message }
   }
 }
 

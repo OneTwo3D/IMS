@@ -49,6 +49,15 @@ BEGIN
   END IF;
 END $$;
 
+-- Operator mapping for the preflight counts above:
+--   negative_stock_quantity            -> inventory invariant code stock_negative_quantity
+--   negative_stock_reserved            -> inventory invariant code stock_negative_reserved_quantity
+--   negative_cost_layer_received       -> query cost_layers WHERE "receivedQty" < 0
+--   negative_cost_layer_remaining      -> inventory invariant code cost_layer_negative_remaining_quantity
+--   cost_layer_remaining_over_received -> inventory invariant code cost_layer_remaining_exceeds_received
+--   negative_stock_movement_qty        -> query stock_movements WHERE qty < 0
+-- See docs/development.md for the remediation checklist.
+
 ALTER TABLE "stock_levels"
   ADD CONSTRAINT "stock_levels_quantity_nonnegative"
   CHECK ("quantity" >= 0) NOT VALID,

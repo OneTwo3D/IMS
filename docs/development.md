@@ -64,6 +64,31 @@ node scripts/check-prisma-drift.mjs
 
 The helper script loads `DATABASE_URL` from `.env.local` or `.env` and uses the repo's `prisma.config.ts` setup consistently.
 
+## Stock Quantity Constraint Preflight
+
+Migration `20260512100000_stock_quantity_check_constraints` fails fast when historical rows already violate the stock and FIFO quantity checks.
+
+Interpret the preflight counters as follows:
+
+- `negative_stock_quantity`:
+  inventory invariant finding `stock_negative_quantity`
+- `negative_stock_reserved`:
+  inventory invariant finding `stock_negative_reserved_quantity`
+- `negative_cost_layer_received`:
+  no current invariant finding; inspect `cost_layers` rows where `"receivedQty" < 0`
+- `negative_cost_layer_remaining`:
+  inventory invariant finding `cost_layer_negative_remaining_quantity`
+- `cost_layer_remaining_over_received`:
+  inventory invariant finding `cost_layer_remaining_exceeds_received`
+- `negative_stock_movement_qty`:
+  no current invariant finding; inspect `stock_movements` rows where `qty < 0`
+
+Recommended response order:
+
+1. Run the inventory invariant report to identify stock-level and cost-layer drift.
+2. Query the raw tables for `negative_cost_layer_received` and `negative_stock_movement_qty`, because those are not yet surfaced by the invariant report.
+3. Repair the underlying rows before rerunning `prisma migrate deploy`.
+
 ## Sandbox Note
 
 Prisma 7 schema-engine commands such as `migrate status`, `migrate diff`, `db pull`, and `db execute` open a real TCP connection to PostgreSQL. When they run inside a restricted sandbox, they can fail with `P1001: Can't reach database server` even if Postgres is healthy.
