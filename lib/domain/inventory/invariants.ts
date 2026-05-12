@@ -52,6 +52,16 @@ export type InventoryInvariantCostLayerRow = {
   product: Pick<ProductSnapshot, 'id' | 'sku' | 'type'>
 }
 
+export type InventoryInvariantStockMovementRow = {
+  id: string
+  type: string
+  productId: string
+  fromWarehouseId: string | null
+  toWarehouseId: string | null
+  qty: DecimalLike
+  product: Pick<ProductSnapshot, 'id' | 'sku' | 'type'>
+}
+
 export type InventoryInvariantShipmentLineRow = {
   id: string
   shipmentId: string
@@ -69,6 +79,7 @@ export type InventoryInvariantShipmentLineRow = {
 export type InventoryInvariantRows = {
   stockLevels: InventoryInvariantStockLevelRow[]
   costLayers: InventoryInvariantCostLayerRow[]
+  stockMovements: InventoryInvariantStockMovementRow[]
   shippedShipmentLines: InventoryInvariantShipmentLineRow[]
 }
 
@@ -82,6 +93,9 @@ type InventoryInvariantClient = {
   }
   costLayer: {
     findMany(args: unknown): Promise<InventoryInvariantCostLayerRow[]>
+  }
+  stockMovement: {
+    findMany(args: unknown): Promise<InventoryInvariantStockMovementRow[]>
   }
   shipmentLine: {
     findMany(args: unknown): Promise<InventoryInvariantShipmentLineRow[]>
@@ -101,6 +115,10 @@ export function isFifoCostLayerProductType(type: ProductType): boolean {
 
 function isEffectivelyNegative(value: number, tolerance: number): boolean {
   return value < -tolerance
+}
+
+function isStrictlyNegative(value: number): boolean {
+  return value < 0
 }
 
 function greaterThanWithTolerance(left: number, right: number, tolerance: number): boolean {
@@ -213,6 +231,21 @@ export function evaluateInventoryInvariantRows(
       })
     }
 
+    if (isStrictlyNegative(receivedQty)) {
+      findings.push({
+        severity: 'critical',
+        code: 'cost_layer_negative_received_quantity',
+        productId: costLayer.productId,
+        warehouseId: costLayer.warehouseId,
+        message: `Cost layer received quantity is negative for ${costLayer.product.sku}`,
+        details: {
+          costLayerId: costLayer.id,
+          sku: costLayer.product.sku,
+          receivedQty,
+        },
+      })
+    }
+
     if (isEffectivelyNegative(remainingQty, tolerance)) {
       findings.push({
         severity: 'critical',
@@ -296,6 +329,29 @@ export function evaluateInventoryInvariantRows(
     })
   }
 
+  for (const stockMovement of rows.stockMovements) {
+    const qty = decimalToNumber(stockMovement.qty)
+    if (!isStrictlyNegative(qty)) continue
+
+    findings.push({
+      severity: 'critical',
+      code: 'stock_movement_negative_quantity',
+      productId: stockMovement.productId,
+      // Transfer movements involve two warehouses; use the origin side first
+      // as the primary grouping key and keep both sides in details.
+      warehouseId: stockMovement.fromWarehouseId ?? stockMovement.toWarehouseId ?? undefined,
+      message: `Stock movement quantity is negative for ${stockMovement.product.sku}`,
+      details: {
+        movementId: stockMovement.id,
+        movementType: stockMovement.type,
+        sku: stockMovement.product.sku,
+        qty,
+        fromWarehouseId: stockMovement.fromWarehouseId,
+        toWarehouseId: stockMovement.toWarehouseId,
+      },
+    })
+  }
+
   for (const shipmentLine of rows.shippedShipmentLines) {
     if (!isFifoCostLayerProductType(shipmentLine.product.type)) continue
     if (decimalToNumber(shipmentLine.qty) <= tolerance) continue
@@ -324,7 +380,7 @@ export function evaluateInventoryInvariantRows(
 export async function collectInventoryInvariantRows(
   client: InventoryInvariantClient = db as unknown as InventoryInvariantClient,
 ): Promise<InventoryInvariantRows> {
-  const [stockLevels, costLayers, shippedShipmentLines] = await Promise.all([
+  const [stockLevels, costLayers, stockMovements, shippedShipmentLines] = await Promise.all([
     client.stockLevel.findMany({
       select: {
         id: true,
@@ -350,6 +406,26 @@ export async function collectInventoryInvariantRows(
         warehouseId: true,
         receivedQty: true,
         remainingQty: true,
+        product: {
+          select: {
+            id: true,
+            sku: true,
+            type: true,
+          },
+        },
+      },
+    }),
+    client.stockMovement.findMany({
+      where: {
+        qty: { lt: 0 },
+      },
+      select: {
+        id: true,
+        type: true,
+        productId: true,
+        fromWarehouseId: true,
+        toWarehouseId: true,
+        qty: true,
         product: {
           select: {
             id: true,
@@ -392,7 +468,7 @@ export async function collectInventoryInvariantRows(
     }),
   ])
 
-  return { stockLevels, costLayers, shippedShipmentLines }
+  return { stockLevels, costLayers, stockMovements, shippedShipmentLines }
 }
 
 export async function runInventoryInvariantReport(options: {
