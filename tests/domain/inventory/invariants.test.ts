@@ -53,6 +53,7 @@ function cleanRows(): InventoryInvariantRows {
         },
       },
     ],
+    stockMovements: [],
     shippedShipmentLines: [
       {
         id: 'shipment-line-1',
@@ -136,6 +137,18 @@ test('broken stock levels and cost layers produce structured findings', () => {
       },
     },
     {
+      id: 'layer-negative-received',
+      productId: 'product-negative-received',
+      warehouseId: 'warehouse-1',
+      receivedQty: -2,
+      remainingQty: 0,
+      product: {
+        id: 'product-negative-received',
+        sku: 'NEG-RECEIVED',
+        type: 'SIMPLE',
+      },
+    },
+    {
       id: 'layer-over',
       productId: 'product-over-layer',
       warehouseId: 'warehouse-1',
@@ -148,6 +161,19 @@ test('broken stock levels and cost layers produce structured findings', () => {
       },
     },
   )
+  rows.stockMovements.push({
+    id: 'movement-negative',
+    type: 'ADJUSTMENT',
+    productId: 'product-movement-negative',
+    fromWarehouseId: 'warehouse-1',
+    toWarehouseId: null,
+    qty: -3,
+    product: {
+      id: 'product-movement-negative',
+      sku: 'NEG-MOVE',
+      type: 'SIMPLE',
+    },
+  })
 
   const findings = evaluateInventoryInvariantRows(rows)
   const codes = findings.map((finding) => finding.code)
@@ -155,8 +181,10 @@ test('broken stock levels and cost layers produce structured findings', () => {
   assert.ok(codes.includes('stock_negative_quantity'))
   assert.ok(codes.includes('stock_negative_reserved_quantity'))
   assert.ok(codes.includes('stock_reserved_exceeds_quantity'))
+  assert.ok(codes.includes('cost_layer_negative_received_quantity'))
   assert.ok(codes.includes('cost_layer_negative_remaining_quantity'))
   assert.ok(codes.includes('cost_layer_remaining_exceeds_received'))
+  assert.ok(codes.includes('stock_movement_negative_quantity'))
   assert.ok(findings.every((finding) => finding.severity === 'critical' || finding.severity === 'warning'))
 })
 
@@ -191,6 +219,7 @@ test('reserved quantity can exceed stock when product explicitly allows oversell
         },
       },
     ],
+    stockMovements: [],
     shippedShipmentLines: [],
   })
 
@@ -230,6 +259,7 @@ test('remaining cost layers without matching stock levels are reported', () => {
         },
       },
     ],
+    stockMovements: [],
     shippedShipmentLines: [],
   })
 
@@ -268,6 +298,7 @@ test('remaining cost layers without matching stock levels are reported once per 
         },
       },
     ],
+    stockMovements: [],
     shippedShipmentLines: [],
   })
 
@@ -301,6 +332,7 @@ test('non-stockable products are excluded from cost-layer reconciliation', () =>
       },
     ],
     costLayers: [],
+    stockMovements: [],
     shippedShipmentLines: [],
   })
 
@@ -351,6 +383,7 @@ test('malformed COGS snapshots are treated as missing', () => {
 
 test('inventory row collection excludes fully refunded orders from shipped COGS checks', async () => {
   let shipmentLineArgs: unknown
+  let stockMovementArgs: unknown
   const client = {
     stockLevel: {
       async findMany() {
@@ -359,6 +392,12 @@ test('inventory row collection excludes fully refunded orders from shipped COGS 
     },
     costLayer: {
       async findMany() {
+        return []
+      },
+    },
+    stockMovement: {
+      async findMany(args: unknown) {
+        stockMovementArgs = args
         return []
       },
     },
@@ -399,6 +438,26 @@ test('inventory row collection excludes fully refunded orders from shipped COGS 
         select: {
           orderId: true,
           warehouseId: true,
+        },
+      },
+    },
+  })
+  assert.deepEqual(stockMovementArgs, {
+    where: {
+      qty: { lt: 0 },
+    },
+    select: {
+      id: true,
+      type: true,
+      productId: true,
+      fromWarehouseId: true,
+      toWarehouseId: true,
+      qty: true,
+      product: {
+        select: {
+          id: true,
+          sku: true,
+          type: true,
         },
       },
     },
