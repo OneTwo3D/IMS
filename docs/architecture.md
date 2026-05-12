@@ -100,6 +100,21 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 
 **Stock reservation** — `StockLevel.reservedQty` tracks stock that is allocated but not yet dispatched. Transfers in `IN_TRANSIT` status reserve stock on the source warehouse.
 
+### Quantity Constraint Monitoring
+
+The database and the invariant report intentionally overlap on core quantity integrity checks:
+
+| Database CHECK Constraint | Inventory Invariant Code |
+|---|---|
+| `stock_levels_quantity_nonnegative` | `stock_negative_quantity` |
+| `stock_levels_reserved_nonnegative` | `stock_negative_reserved_quantity` |
+| `cost_layers_received_nonnegative` | `cost_layer_negative_received_quantity` |
+| `cost_layers_remaining_qty_non_negative` | `cost_layer_negative_remaining_quantity` |
+| `cost_layers_remaining_qty_lte_received_qty` | `cost_layer_remaining_exceeds_received` |
+| `stock_movements_qty_nonnegative` | `stock_movement_negative_quantity` |
+
+The CHECK constraints prevent new bad writes. The invariant report remains the read-only backstop for historical drift, manual SQL damage, and rollout verification.
+
 **Discount storage** — Discounts are stored separately as `discountStr` (the original input) and `discountAmount` (the computed value). Prices are never baked with discounts applied.
 
 **Tax rate snapshotting** — Sales orders store `taxRateName` and `taxRatePercent` at creation time, ensuring historical accuracy if tax rates change later.

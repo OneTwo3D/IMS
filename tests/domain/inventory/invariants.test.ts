@@ -188,6 +188,202 @@ test('broken stock levels and cost layers produce structured findings', () => {
   assert.ok(findings.every((finding) => finding.severity === 'critical' || finding.severity === 'warning'))
 })
 
+test('exact negative checks mirror DB quantity constraints at the tolerance boundary', () => {
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [
+      {
+        id: 'received-small-negative',
+        productId: 'product-small-negative',
+        warehouseId: 'warehouse-1',
+        receivedQty: -0.00005,
+        remainingQty: 0,
+        product: {
+          id: 'product-small-negative',
+          sku: 'SMALL-NEG-RECEIVED',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    stockMovements: [
+      {
+        id: 'movement-small-negative',
+        type: 'ADJUSTMENT',
+        productId: 'product-small-negative',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: -0.00005,
+        product: {
+          id: 'product-small-negative',
+          sku: 'SMALL-NEG-MOVE',
+          type: 'SIMPLE',
+        },
+      },
+      {
+        id: 'movement-negative',
+        type: 'ADJUSTMENT',
+        productId: 'product-negative',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: -0.001,
+        product: {
+          id: 'product-negative',
+          sku: 'NEG-MOVE',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    shippedShipmentLines: [],
+  })
+
+  const codes = findings.map((finding) => finding.code)
+  assert.ok(codes.includes('cost_layer_negative_received_quantity'))
+  assert.ok(codes.includes('stock_movement_negative_quantity'))
+  assert.equal(findings.filter((finding) => finding.code === 'stock_movement_negative_quantity').length, 2)
+})
+
+test('clean stock movements do not generate findings', () => {
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [],
+    stockMovements: [
+      {
+        id: 'movement-zero',
+        type: 'ADJUSTMENT',
+        productId: 'product-1',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: 0,
+        product: {
+          id: 'product-1',
+          sku: 'ZERO-MOVE',
+          type: 'SIMPLE',
+        },
+      },
+      {
+        id: 'movement-positive',
+        type: 'TRANSFER_IN',
+        productId: 'product-1',
+        fromWarehouseId: null,
+        toWarehouseId: 'warehouse-1',
+        qty: 1,
+        product: {
+          id: 'product-1',
+          sku: 'POS-MOVE',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    shippedShipmentLines: [],
+  })
+
+  assert.equal(
+    findings.some((finding) => finding.code === 'stock_movement_negative_quantity'),
+    false,
+  )
+})
+
+test('PR47 quantity constraints map to inventory invariant findings', () => {
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [
+      {
+        id: 'stock-negative',
+        productId: 'product-stock-negative',
+        warehouseId: 'warehouse-1',
+        quantity: -1,
+        reservedQty: 0,
+        product: {
+          id: 'product-stock-negative',
+          sku: 'NEG-STOCK',
+          type: 'SIMPLE',
+          oversellAllowed: true,
+        },
+      },
+      {
+        id: 'reserved-negative',
+        productId: 'product-reserved-negative',
+        warehouseId: 'warehouse-1',
+        quantity: 1,
+        reservedQty: -1,
+        product: {
+          id: 'product-reserved-negative',
+          sku: 'NEG-RES',
+          type: 'SIMPLE',
+          oversellAllowed: false,
+        },
+      },
+    ],
+    costLayers: [
+      {
+        id: 'received-negative',
+        productId: 'product-received-negative',
+        warehouseId: 'warehouse-1',
+        receivedQty: -1,
+        remainingQty: 0,
+        product: {
+          id: 'product-received-negative',
+          sku: 'NEG-RECEIVED',
+          type: 'SIMPLE',
+        },
+      },
+      {
+        id: 'remaining-negative',
+        productId: 'product-remaining-negative',
+        warehouseId: 'warehouse-1',
+        receivedQty: 1,
+        remainingQty: -1,
+        product: {
+          id: 'product-remaining-negative',
+          sku: 'NEG-REMAINING',
+          type: 'SIMPLE',
+        },
+      },
+      {
+        id: 'remaining-over',
+        productId: 'product-remaining-over',
+        warehouseId: 'warehouse-1',
+        receivedQty: 1,
+        remainingQty: 2,
+        product: {
+          id: 'product-remaining-over',
+          sku: 'OVER-REMAINING',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    stockMovements: [
+      {
+        id: 'movement-negative',
+        type: 'ADJUSTMENT',
+        productId: 'product-movement-negative',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: -1,
+        product: {
+          id: 'product-movement-negative',
+          sku: 'NEG-MOVE',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    shippedShipmentLines: [],
+  })
+
+  const codes = new Set(findings.map((finding) => finding.code))
+  assert.deepEqual(
+    codes,
+    new Set([
+      'stock_negative_quantity',
+      'stock_negative_reserved_quantity',
+      'cost_layer_negative_received_quantity',
+      'cost_layer_negative_remaining_quantity',
+      'cost_layer_remaining_exceeds_received',
+      'stock_movement_negative_quantity',
+      'stock_cost_layer_quantity_mismatch',
+    ]),
+  )
+})
+
 test('reserved quantity can exceed stock when product explicitly allows oversell', () => {
   const findings = evaluateInventoryInvariantRows({
     stockLevels: [

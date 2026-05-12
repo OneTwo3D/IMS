@@ -117,6 +117,10 @@ function isEffectivelyNegative(value: number, tolerance: number): boolean {
   return value < -tolerance
 }
 
+function isStrictlyNegative(value: number): boolean {
+  return value < 0
+}
+
 function greaterThanWithTolerance(left: number, right: number, tolerance: number): boolean {
   return left - right > tolerance
 }
@@ -227,7 +231,7 @@ export function evaluateInventoryInvariantRows(
       })
     }
 
-    if (isEffectivelyNegative(receivedQty, tolerance)) {
+    if (isStrictlyNegative(receivedQty)) {
       findings.push({
         severity: 'critical',
         code: 'cost_layer_negative_received_quantity',
@@ -327,12 +331,14 @@ export function evaluateInventoryInvariantRows(
 
   for (const stockMovement of rows.stockMovements) {
     const qty = decimalToNumber(stockMovement.qty)
-    if (!isEffectivelyNegative(qty, tolerance)) continue
+    if (!isStrictlyNegative(qty)) continue
 
     findings.push({
       severity: 'critical',
       code: 'stock_movement_negative_quantity',
       productId: stockMovement.productId,
+      // Transfer movements involve two warehouses; use the origin side first
+      // as the primary grouping key and keep both sides in details.
       warehouseId: stockMovement.fromWarehouseId ?? stockMovement.toWarehouseId ?? undefined,
       message: `Stock movement quantity is negative for ${stockMovement.product.sku}`,
       details: {
