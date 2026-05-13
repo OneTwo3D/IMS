@@ -929,7 +929,7 @@ Base branch: development.
 
 Update Mintsoft webhook signature validation so the timestamp is bound into the signed payload.
 Preferred signed payload format: `${timestamp}.${rawBody}`.
-Require the timestamp header or body timestamp used for freshness validation to be the same value included in signature verification.
+Require the timestamp header used for freshness validation to be the same value included in signature verification.
 Add tests for valid signature, stale timestamp, tampered timestamp, missing timestamp, and body-only rejection.
 Run npm run validate and Mintsoft webhook tests.
 ```

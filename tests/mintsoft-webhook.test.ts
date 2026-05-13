@@ -342,6 +342,39 @@ test('Mintsoft booked-in webhook route updates pending events and still returns 
   assert.equal((logs[0] as { action?: string } | undefined)?.action, 'mintsoft_webhook_event_updated')
 })
 
+test('Mintsoft booked-in webhook route requires a signed timestamp header', async () => {
+  const timestamp = new Date().toISOString()
+  const rawBody = JSON.stringify({ timestamp, eventId: 'evt-body-timestamp', externalAsnId: 'asn-body-timestamp' })
+  const signature = createHmac('sha256', WEBHOOK_SECRET).update(`${timestamp}.${rawBody}`, 'utf8').digest('hex')
+  const repository: MintsoftWebhookEventRepository = {
+    async createEvent() {
+      throw new Error('createEvent should not run without a timestamp header')
+    },
+    async findEvent() {
+      throw new Error('findEvent should not run without a timestamp header')
+    },
+    async updatePendingEvent() {
+      throw new Error('updatePendingEvent should not run without a timestamp header')
+    },
+  }
+
+  const response = await handleMintsoftBookedInWebhook(
+    new Request('https://ims.example.com/api/webhooks/mintsoft/asn-booked-in', {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-mintsoft-signature': signature,
+      },
+      body: rawBody,
+    }),
+    buildWebhookRouteDependencies(repository),
+  )
+  const body = await response.json() as { error?: string }
+
+  assert.equal(response.status, 401)
+  assert.equal(body.error, 'Missing webhook timestamp')
+})
+
 test('extractMintsoftWebhookTimestamp prefers signed body timestamps when present', () => {
   assert.deepEqual(
     extractMintsoftWebhookTimestamp({
@@ -387,24 +420,19 @@ test('extractMintsoftWebhookTimestampCandidate returns the exact timestamp value
   )
 })
 
-test('extractMintsoftWebhookTimestampCandidateFromRequest extracts timestamps without JSON parsing', () => {
-  assert.deepEqual(
+test('extractMintsoftWebhookTimestampCandidateFromRequest requires timestamp headers', () => {
+  assert.equal(
     extractMintsoftWebhookTimestampCandidateFromRequest(
       '{"eventId":"evt-1","timestamp":1776852000.0}',
     ),
-    {
-      date: new Date('2026-04-22T10:00:00.000Z'),
-      value: '1776852000.0',
-      source: 'payload',
-      key: 'timestamp',
-    },
+    null,
   )
 })
 
-test('extractMintsoftWebhookTimestampCandidateFromRequest prefers headers over payload timestamps', () => {
+test('extractMintsoftWebhookTimestampCandidateFromRequest ignores payload timestamp collisions', () => {
   assert.deepEqual(
     extractMintsoftWebhookTimestampCandidateFromRequest(
-      '{"eventId":"evt-1","timestamp":"2026-04-22T09:00:00.000Z"}',
+      '{"note":"got it at \\"timestamp\\":\\"2026-01-01T00:00:00.000Z\\"","timestamp":"2026-04-22T09:00:00.000Z"}',
       { 'x-mintsoft-timestamp': '2026-04-22T10:00:00.000Z' },
     ),
     {
@@ -416,10 +444,13 @@ test('extractMintsoftWebhookTimestampCandidateFromRequest prefers headers over p
   )
 })
 
-test('raw numeric timestamp signatures use the exact JSON token', () => {
+test('numeric timestamp header signatures use the exact header value', () => {
   const secret = 'top-secret'
   const rawBody = '{"eventId":"evt-1","timestamp":1776852000.0}'
-  const timestamp = extractMintsoftWebhookTimestampCandidateFromRequest(rawBody)?.value
+  const timestamp = extractMintsoftWebhookTimestampCandidateFromRequest(
+    rawBody,
+    { 'x-mintsoft-timestamp': '1776852000.0' },
+  )?.value
   const canonicalSignature = createHmac('sha256', secret)
     .update(`1776852000.${rawBody}`, 'utf8')
     .digest('hex')

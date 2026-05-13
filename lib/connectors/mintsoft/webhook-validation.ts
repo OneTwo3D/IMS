@@ -94,23 +94,8 @@ export function extractMintsoftWebhookTimestamp(
   return extractMintsoftWebhookTimestampCandidate(payload, headers)?.date ?? null
 }
 
-function parseRawJsonTimestampValue(rawValue: string): string | null {
-  const trimmed = rawValue.trim()
-  if (!trimmed) return null
-  if (trimmed.startsWith('"')) {
-    try {
-      const parsed = JSON.parse(trimmed) as unknown
-      return typeof parsed === 'string' && parsed.trim() ? parsed.trim() : null
-    } catch {
-      return null
-    }
-  }
-
-  return /^-?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(trimmed) ? trimmed : null
-}
-
 export function extractMintsoftWebhookTimestampCandidateFromRequest(
-  rawBody: string,
+  _rawBody: string,
   headers?: Headers | Record<string, string | undefined>,
 ): MintsoftWebhookTimestampCandidate | null {
   for (const key of MINTSOFT_WEBHOOK_TIMESTAMP_HEADERS) {
@@ -118,14 +103,6 @@ export function extractMintsoftWebhookTimestampCandidateFromRequest(
     const value = timestampSignatureValue(headerValue)
     const parsed = parseWebhookTimestampValue(headerValue)
     if (value && parsed) return { date: parsed, value, source: 'header', key }
-  }
-
-  for (const key of MINTSOFT_WEBHOOK_TIMESTAMP_KEYS) {
-    const pattern = new RegExp(`"${key}"\\s*:\\s*("(?:\\\\.|[^"\\\\])*"|-?\\d+(?:\\.\\d+)?(?:e[+-]?\\d+)?)`, 'i')
-    const match = pattern.exec(rawBody)
-    const value = match?.[1] ? parseRawJsonTimestampValue(match[1]) : null
-    const parsed = value ? parseWebhookTimestampValue(value) : null
-    if (value && parsed) return { date: parsed, value, source: 'payload', key }
   }
 
   return null
