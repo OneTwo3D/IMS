@@ -892,6 +892,8 @@ Make Mintsoft webhook receipt durable, replay-safe, and asynchronous.
 
 ## PR 5.1 — Bind webhook timestamp to the HMAC signature
 
+Status: implemented in PR #55.
+
 ### Problem
 
 Webhook replay protection must ensure the timestamp cannot be swapped independently of the signed body.
