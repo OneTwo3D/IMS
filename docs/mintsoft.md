@@ -19,7 +19,8 @@ Mintsoft is the WMS connector for stock alignment, ASN creation, product verific
 
 - IMS creates outbound ASN payloads for purchase orders and transfer lines.
 - Mintsoft callback metadata preserves the source type, source line, product, and expected quantity.
-- Booked-in webhook processing is idempotent via `wms_inbound_receipt_events`.
+- Booked-in webhook receipt is idempotent via `wms_inbound_receipt_events`.
+- Accepted webhooks are persisted and acknowledged with `202 Accepted`; stock and purchase-order mutations run later through `/api/cron/mintsoft-webhook-sweeper`.
 - Line deltas are applied only for previously unaccounted received quantities.
 
 ## Booked-In Webhook Signing

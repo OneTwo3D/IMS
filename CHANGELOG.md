@@ -24,6 +24,7 @@ This repository uses an `x.y.z` release scheme.
 ### Fixes (Mintsoft webhook security)
 
 - **Mintsoft ASN booked-in webhooks now bind the freshness timestamp into the HMAC signature.** IMS verifies `HMAC_SHA256(secret, "${timestamp}.${rawBody}")` and rejects body-only signatures.
+- **Mintsoft ASN booked-in webhooks now acknowledge after durable persistence.** Accepted webhooks are stored idempotently in `wms_inbound_receipt_events` and return `202 Accepted`; the Mintsoft webhook sweeper applies stock and purchase-order effects asynchronously.
 
 ### User-facing (sales allocation and backorders)
 

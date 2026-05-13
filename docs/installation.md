@@ -128,7 +128,7 @@ The service is configured with:
 
 ## Cron Jobs
 
-Five scheduled tasks are configured automatically:
+Scheduled tasks are configured automatically:
 
 | Time | Endpoint | Purpose |
 |---|---|---|
@@ -136,6 +136,7 @@ Five scheduled tasks are configured automatically:
 | 03:00 | `/api/cron/activity-cleanup` | Purge activity log entries past their retention period |
 | 04:00 | `/api/cron/wc-reconcile` | WooCommerce backup reconciliation for orders/products plus stock retry draining |
 | Every 15 min | `/api/cron/delivery-status` | Poll delivery tracking providers for shipment status updates |
+| Every 5 min | `/api/cron/mintsoft-webhook-sweeper` | Drain persisted Mintsoft ASN booked-in webhook events |
 | 06:00 | `/api/cron/fx-rates` | Fetch latest exchange rates from frankfurter.dev |
 
 All cron jobs run under the `imsapp` user and call the application's API endpoints via `curl`. Cron endpoints require the `CRON_SECRET` bearer header in production. Installer-generated crontab entries read only the `CRON_SECRET=` line from the protected `${APP_DIR}/.env` file at runtime so the cron secret is not embedded directly in the crontab and unrelated environment values are not shell-sourced. Localhost bypass is available outside production only when no `CRON_SECRET` is configured; in production it is disabled unless `CRON_SECRET` is unset and `ALLOW_LOCALHOST_CRON_BYPASS=true` is set explicitly.
@@ -144,6 +145,11 @@ For WooCommerce specifically:
 
 - real-time order/product intake should come from webhooks
 - `/api/cron/wc-reconcile` is the daily backup reconcile path for orders/products and also runs the stock catch-up plus queued retry drain
+
+For Mintsoft specifically:
+
+- accepted ASN booked-in webhooks return after persistence
+- `/api/cron/mintsoft-webhook-sweeper` applies the pending stock and purchase-order effects asynchronously
 
 Authentication note:
 

@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import test from 'node:test'
+import {
+  handleMintsoftBookedInWebhook,
+  type MintsoftBookedInWebhookRouteDependencies,
+} from '../app/api/webhooks/mintsoft/asn-booked-in/route.ts'
 import * as authModuleNs from '../lib/connectors/mintsoft/api/auth.ts'
 import * as webhookValidationModuleNs from '../lib/connectors/mintsoft/webhook-validation.ts'
 import * as webhookEventsModuleNs from '../lib/connectors/mintsoft/webhook-events.ts'
+import type { MintsoftWebhookEventRepository } from '../lib/connectors/mintsoft/webhook-events.ts'
 import type { PersistMintsoftWebhookEventInput } from '../lib/connectors/mintsoft/webhook-events.ts'
 
 const authModule = 'default' in authModuleNs
@@ -27,6 +32,8 @@ const {
 } = webhookValidationModule
 const { persistMintsoftWebhookEvent } = webhookEventsModule
 
+const WEBHOOK_SECRET = 'top-secret'
+
 function buildInput(): PersistMintsoftWebhookEventInput {
   return {
     externalEventId: 'evt-123',
@@ -36,6 +43,47 @@ function buildInput(): PersistMintsoftWebhookEventInput {
       asnId: 'asn-123',
       bookedInQty: 5,
     },
+  }
+}
+
+function buildSignedWebhookRequest(payload: Record<string, unknown>, timestamp = new Date().toISOString()): Request {
+  const rawBody = JSON.stringify({ timestamp, ...payload })
+  const signature = createHmac('sha256', WEBHOOK_SECRET).update(`${timestamp}.${rawBody}`, 'utf8').digest('hex')
+  return new Request('https://ims.example.com/api/webhooks/mintsoft/asn-booked-in', {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'x-mintsoft-signature': signature,
+      'x-mintsoft-timestamp': timestamp,
+    },
+    body: rawBody,
+  })
+}
+
+function buildWebhookRouteDependencies(
+  repository: MintsoftWebhookEventRepository,
+  logs: unknown[] = [],
+): MintsoftBookedInWebhookRouteDependencies {
+  return {
+    async getMintsoftApiConfiguration() {
+      return {
+        baseUrl: '',
+        username: '',
+        password: '',
+        webhookSecret: WEBHOOK_SECRET,
+        orderLookupConnector: null,
+      }
+    },
+    async isIntegrationPluginEnabled(plugin) {
+      return plugin === 'mintsoft'
+    },
+    isUniqueConstraintError() {
+      return false
+    },
+    async logActivity(entry) {
+      logs.push(entry)
+    },
+    repository,
   }
 }
 
@@ -179,6 +227,119 @@ test('persistMintsoftWebhookEvent updates the pending row after a concurrent uni
     eventId: 'concurrent-1',
   })
   assert.deepEqual(updates, ['concurrent-1'])
+})
+
+test('Mintsoft booked-in webhook route persists and returns 202 without processing inline', async () => {
+  const logs: unknown[] = []
+  const createdInputs: PersistMintsoftWebhookEventInput[] = []
+  const repository: MintsoftWebhookEventRepository = {
+    async createEvent(input) {
+      createdInputs.push(input)
+      return { id: 'event-1' }
+    },
+    async findEvent() {
+      return null
+    },
+    async updatePendingEvent() {
+      throw new Error('updatePendingEvent should not run for a new event')
+    },
+  }
+
+  const response = await handleMintsoftBookedInWebhook(
+    buildSignedWebhookRequest({ eventId: 'evt-route-1', externalAsnId: 'asn-route-1' }),
+    buildWebhookRouteDependencies(repository, logs),
+  )
+  const body = await response.json() as {
+    accepted?: boolean
+    externalEventId?: string
+    externalAsnId?: string | null
+    queued?: boolean
+    pending?: boolean
+  }
+
+  assert.equal(response.status, 202)
+  assert.deepEqual(body, {
+    accepted: true,
+    externalEventId: 'evt-route-1',
+    externalAsnId: 'asn-route-1',
+    queued: true,
+    pending: true,
+  })
+  assert.equal(createdInputs.length, 1)
+  assert.equal(createdInputs[0]?.externalEventId, 'evt-route-1')
+  assert.equal((logs[0] as { action?: string } | undefined)?.action, 'mintsoft_webhook_event_created')
+})
+
+test('Mintsoft booked-in webhook route returns duplicate marker for processed events', async () => {
+  const logs: unknown[] = []
+  const repository: MintsoftWebhookEventRepository = {
+    async createEvent() {
+      throw new Error('createEvent should not run for a duplicate event')
+    },
+    async findEvent() {
+      return { id: 'event-processed', processedAt: new Date('2026-04-22T10:05:00.000Z') }
+    },
+    async updatePendingEvent() {
+      throw new Error('updatePendingEvent should not run for a processed duplicate')
+    },
+  }
+
+  const response = await handleMintsoftBookedInWebhook(
+    buildSignedWebhookRequest({ eventId: 'evt-route-processed', externalAsnId: 'asn-route-processed' }),
+    buildWebhookRouteDependencies(repository, logs),
+  )
+  const body = await response.json() as {
+    accepted?: boolean
+    duplicate?: boolean
+    externalEventId?: string
+    externalAsnId?: string | null
+  }
+
+  assert.equal(response.status, 200)
+  assert.deepEqual(body, {
+    accepted: true,
+    duplicate: true,
+    externalEventId: 'evt-route-processed',
+    externalAsnId: 'asn-route-processed',
+  })
+  assert.equal((logs[0] as { action?: string } | undefined)?.action, 'mintsoft_webhook_duplicate_ignored')
+})
+
+test('Mintsoft booked-in webhook route updates pending events and still returns 202', async () => {
+  const logs: unknown[] = []
+  const updatedInputs: PersistMintsoftWebhookEventInput[] = []
+  const repository: MintsoftWebhookEventRepository = {
+    async createEvent() {
+      throw new Error('createEvent should not run for an existing pending event')
+    },
+    async findEvent() {
+      return { id: 'event-pending', processedAt: null }
+    },
+    async updatePendingEvent(_id, input) {
+      updatedInputs.push(input)
+      return true
+    },
+  }
+
+  const response = await handleMintsoftBookedInWebhook(
+    buildSignedWebhookRequest({ eventId: 'evt-route-pending', externalAsnId: 'asn-route-pending' }),
+    buildWebhookRouteDependencies(repository, logs),
+  )
+  const body = await response.json() as {
+    accepted?: boolean
+    externalEventId?: string
+    externalAsnId?: string | null
+    queued?: boolean
+    pending?: boolean
+  }
+
+  assert.equal(response.status, 202)
+  assert.equal(body.accepted, true)
+  assert.equal(body.queued, true)
+  assert.equal(body.pending, true)
+  assert.equal(updatedInputs.length, 1)
+  assert.equal(updatedInputs[0]?.externalEventId, 'evt-route-pending')
+  assert.equal((logs[0] as { action?: string } | undefined)?.action, 'mintsoft_webhook_event_updated')
 })
 
 test('extractMintsoftWebhookTimestamp prefers signed body timestamps when present', () => {

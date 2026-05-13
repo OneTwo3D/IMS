@@ -938,6 +938,8 @@ Run npm run validate and Mintsoft webhook tests.
 
 ## PR 5.2 — Change Mintsoft webhook route to persist-and-202
 
+Status: implemented in PR #55.
+
 ### Problem
 
 The webhook currently validates, persists, then processes stock/PO effects synchronously. Webhook response time should not depend on internal stock reconciliation.
@@ -949,20 +951,20 @@ Change route flow:
 ```text
 validate body/signature/timestamp
 persist event idempotently
-enqueue outbox job or mark event pending for worker
+mark event pending for worker
 return 202 Accepted
 ```
 
 Do not process stock mutations inside the webhook request.
 
-Add worker:
+Use worker:
 
 ```text
 lib/jobs/wms/process-mintsoft-booked-in-events.ts
 app/api/cron/mintsoft-webhook-sweeper/route.ts
 ```
 
-Reuse existing sweeper where practical.
+The job delegates to the existing booked-in event sweeper.
 
 ### Acceptance criteria
 
