@@ -8,8 +8,10 @@ export type FulfillmentGraphNode = {
   type: ProductType
   productComponents: Array<{
     componentId: string
+    componentSku: string
     qty: number
     componentType: ProductType
+    componentOversellAllowed: boolean
   }>
 }
 
@@ -34,7 +36,7 @@ export async function loadFulfillmentProductGraph(
           select: {
             componentId: true,
             qty: true,
-            component: { select: { type: true } },
+            component: { select: { sku: true, type: true, oversellAllowed: true } },
           },
           orderBy: { sortOrder: 'asc' },
         },
@@ -47,8 +49,10 @@ export async function loadFulfillmentProductGraph(
         type: row.type,
         productComponents: row.productComponents.map((component) => ({
           componentId: component.componentId,
+          componentSku: component.component.sku,
           qty: Number(component.qty),
           componentType: component.component.type,
+          componentOversellAllowed: component.component.oversellAllowed,
         })),
       })
       for (const component of row.productComponents) {

@@ -24,6 +24,7 @@ import {
   lockStockLevels,
   resetAllocationAccountingIfStaged,
   validateAllocationIntegrity,
+  type AllocationUnallocatedLine,
 } from '@/lib/domain/sales/allocation-service'
 import {
   confirmSalesOrderShipments,
@@ -246,7 +247,15 @@ export async function getOrderFulfillmentRequirements(
 export async function autoAllocateOrder(
   orderId: string,
   options?: { internalBypassToken?: symbol; deferStockSync?: boolean; refuseIfShipmentsExist?: boolean },
-): Promise<{ success: boolean; error?: string; syncProductIds?: string[] }> {
+): Promise<{
+  success: boolean
+  error?: string
+  syncProductIds?: string[]
+  allocationCount?: number
+  unallocatedLines?: AllocationUnallocatedLine[]
+  unallocatedQty?: number
+  backorderLineCount?: number
+}> {
   try {
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.process')
@@ -261,33 +270,72 @@ export async function autoAllocateOrder(
         success: false,
         error: allocationResult.error,
         syncProductIds: allocationResult.syncProductIds,
+        allocationCount: allocationResult.allocationCount,
+        unallocatedLines: allocationResult.unallocatedLines,
+        unallocatedQty: allocationResult.unallocatedQty,
+        backorderLineCount: allocationResult.backorderLineCount,
       }
     }
 
     revalidateSalesAllocationPaths(orderId)
     if (allocationResult.logAttempt && allocationResult.orderRef) {
+      const hasUnallocatedDemand = allocationResult.unallocatedQty > 0
+      const action = !allocationResult.success
+        ? 'allocation_failed'
+        : allocationResult.allocationCount > 0
+        ? 'allocated'
+        : hasUnallocatedDemand
+          ? 'backorder_recorded'
+          : 'allocation_failed'
+      const level = allocationResult.success ? 'INFO' : 'WARNING'
+      const description = !allocationResult.success
+        ? allocationResult.allocationCount > 0
+          ? `Partially allocated stock for order ${allocationResult.orderRef} — ${allocationResult.allocationCount} allocation(s), but some lines are not oversell-eligible`
+          : `No stock available to allocate for order ${allocationResult.orderRef}`
+        : allocationResult.allocationCount > 0
+        ? hasUnallocatedDemand
+          ? `Auto-allocated stock for order ${allocationResult.orderRef} — ${allocationResult.allocationCount} allocation(s), ${allocationResult.unallocatedQty} unit(s) left unallocated`
+          : `Auto-allocated stock for order ${allocationResult.orderRef} — ${allocationResult.allocationCount} allocation(s)`
+        : hasUnallocatedDemand
+          ? `Recorded ${allocationResult.unallocatedQty} unit(s) as backorder demand for order ${allocationResult.orderRef}`
+          : `No stock available to allocate for order ${allocationResult.orderRef}`
       await logActivity({
         entityType: 'SALES_ORDER',
         entityId: orderId,
-        action: allocationResult.allocationCount > 0 ? 'allocated' : 'allocation_failed',
+        action,
         tag: 'sales',
-        level: allocationResult.allocationCount > 0 ? 'INFO' : 'WARNING',
-        description: allocationResult.allocationCount > 0
-          ? `Auto-allocated stock for order ${allocationResult.orderRef} — ${allocationResult.allocationCount} allocation(s)`
-          : `No stock available to allocate for order ${allocationResult.orderRef}`,
+        level,
+        description,
         metadata: {
           orderNumber: allocationResult.orderRef,
           isWcOrder: allocationResult.isWcOrder,
           shipFromWarehouseId: allocationResult.shipFromWarehouseId,
           allocations: allocationResult.allocationCount,
+          unallocatedQty: allocationResult.unallocatedQty,
+          backorderLineCount: allocationResult.backorderLineCount,
+          unallocatedLines: allocationResult.unallocatedLines,
         },
       })
     }
     if (!allocationResult.success) {
+      if (!options?.deferStockSync && allocationResult.syncProductIds.length > 0) {
+        try {
+          await enqueueStockSync(
+            allocationResult.syncProductIds,
+            'IMS_CHANGE',
+          )
+        } catch (syncError) {
+          console.error(syncError)
+        }
+      }
       return {
         success: false,
         error: allocationResult.error,
         syncProductIds: allocationResult.syncProductIds,
+        allocationCount: allocationResult.allocationCount,
+        unallocatedLines: allocationResult.unallocatedLines,
+        unallocatedQty: allocationResult.unallocatedQty,
+        backorderLineCount: allocationResult.backorderLineCount,
       }
     }
     if (!options?.deferStockSync) {
@@ -300,7 +348,14 @@ export async function autoAllocateOrder(
         console.error(syncError)
       }
     }
-    return { success: true, syncProductIds: allocationResult.syncProductIds }
+    return {
+      success: true,
+      syncProductIds: allocationResult.syncProductIds,
+      allocationCount: allocationResult.allocationCount,
+      unallocatedLines: allocationResult.unallocatedLines,
+      unallocatedQty: allocationResult.unallocatedQty,
+      backorderLineCount: allocationResult.backorderLineCount,
+    }
   } catch (e) {
     return { success: false, error: String(e) }
   }

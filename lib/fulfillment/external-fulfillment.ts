@@ -124,6 +124,12 @@ export async function applyExternalFulfillmentUpdate(
     if (!result.success) {
       return { success: false, error: result.error ?? 'Auto-allocation failed' }
     }
+    if ((result.allocationCount ?? 0) === 0 && (result.unallocatedQty ?? 0) > 0) {
+      return {
+        success: false,
+        error: `External fulfillment requires physical stock — order has ${result.unallocatedQty} unit(s) on backorder`,
+      }
+    }
   }
 
   const shipmentCount = await db.shipment.count({ where: { orderId: order.id } })
