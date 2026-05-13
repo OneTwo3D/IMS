@@ -5,11 +5,14 @@ import {
   allocateSalesOrder,
   buildAvailableStockMapIncludingOwnReservations,
   buildAvailableStockMap,
-  expandFulfillmentRequirementsDecimal,
-  getDecimalFulfillmentAvailableQty,
   type AllocationServiceClient,
 } from '@/lib/domain/sales/allocation-service'
-import type { FulfillmentGraphNode } from '@/lib/products/kit-fulfillment'
+import {
+  expandFulfillmentRequirementsDecimal,
+  getFulfillmentAvailableQtyDecimal,
+  type FulfillmentGraphNode,
+} from '@/lib/products/kit-fulfillment'
+import { toDecimal } from '@/lib/domain/math/decimal'
 
 type ProductRow = {
   id: string
@@ -445,7 +448,7 @@ test('Decimal fulfillment helpers preserve repeated fractional component sums', 
       productComponents: Array.from({ length: 100 }, (_, index) => ({
         componentId: 'component-1',
         componentSku: `COMP-${index}`,
-        qty: 0.1,
+        qty: toDecimal('0.1'),
         componentType: 'SIMPLE',
         componentOversellAllowed: false,
       })),
@@ -465,7 +468,7 @@ test('Decimal fulfillment availability preserves fractional kit component covera
       productComponents: [{
         componentId: 'component-1',
         componentSku: 'COMP-1',
-        qty: 0.1,
+        qty: toDecimal('0.1'),
         componentType: 'SIMPLE',
         componentOversellAllowed: false,
       }],
@@ -475,7 +478,7 @@ test('Decimal fulfillment availability preserves fractional kit component covera
     { productId: 'component-1', warehouseId: 'warehouse-1', quantity: 0.02, reservedQty: 0 },
   ])
 
-  const available = getDecimalFulfillmentAvailableQty('kit-1', 'warehouse-1', graph, stockMap)
+  const available = getFulfillmentAvailableQtyDecimal('kit-1', 'warehouse-1', graph, stockMap)
 
   assert.equal(available.toString(), '0.2')
 })

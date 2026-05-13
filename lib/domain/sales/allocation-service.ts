@@ -1,12 +1,14 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
 import {
-  calculateCoverageByLine,
-  requirementsMapToRows,
-  type FulfillmentRequirement,
+  calculateDecimalCoverageByLine,
+  calculateDecimalFulfillmentCoverage,
+  requirementsMapToDecimalRows,
+  type DecimalFulfillmentRequirement,
 } from '@/lib/products/fulfillment-coverage'
 import {
-  expandFulfillmentRequirements,
+  expandFulfillmentRequirementsDecimal,
+  getFulfillmentAvailableQtyDecimal,
   listFulfillmentLeafProductIds,
   loadFulfillmentProductGraph,
   type FulfillmentGraphNode,
@@ -152,129 +154,6 @@ function applyRequirementDeltaToAvailableMap(
   }
 }
 
-export function expandFulfillmentRequirementsDecimal(
-  productId: string,
-  qty: DecimalInput,
-  graph: Map<string, FulfillmentGraphNode>,
-): Map<string, Prisma.Decimal> {
-  const totals = new Map<string, Prisma.Decimal>()
-
-  function addRequirement(componentProductId: string, requiredQty: Prisma.Decimal) {
-    totals.set(
-      componentProductId,
-      (totals.get(componentProductId) ?? new Prisma.Decimal(0)).add(requiredQty),
-    )
-  }
-
-  function visit(currentProductId: string, currentQty: Prisma.Decimal, stack: Set<string>) {
-    if (currentQty.lte(0)) return
-    const node = graph.get(currentProductId)
-    if (!node) {
-      console.warn(`[kit-fulfillment] Product ${currentProductId} referenced as component but not found in graph — treating as leaf`)
-      addRequirement(currentProductId, currentQty)
-      return
-    }
-    if (node.type !== 'KIT' || node.productComponents.length === 0) {
-      addRequirement(currentProductId, currentQty)
-      return
-    }
-    if (stack.has(currentProductId)) {
-      throw new Error(`Circular kit structure detected for product ${currentProductId}`)
-    }
-
-    stack.add(currentProductId)
-    for (const component of node.productComponents) {
-      const requiredQty = currentQty.mul(component.qty)
-      if (component.componentType === 'KIT') {
-        visit(component.componentId, requiredQty, stack)
-      } else {
-        addRequirement(component.componentId, requiredQty)
-      }
-    }
-    stack.delete(currentProductId)
-  }
-
-  visit(productId, toDecimal(qty), new Set<string>())
-  return totals
-}
-
-export function getDecimalFulfillmentAvailableQty(
-  productId: string,
-  warehouseId: string,
-  graph: Map<string, FulfillmentGraphNode>,
-  stockByProductWarehouse: DecimalStockMap,
-  memo = new Map<string, Prisma.Decimal>(),
-  stack = new Set<string>(),
-): Prisma.Decimal {
-  const memoKey = `${productId}|${warehouseId}`
-  const memoized = memo.get(memoKey)
-  if (memoized) return memoized
-
-  const node = graph.get(productId)
-  if (!node || node.type !== 'KIT' || node.productComponents.length === 0) {
-    const available = Prisma.Decimal.max(
-      new Prisma.Decimal(0),
-      stockByProductWarehouse.get(productId)?.get(warehouseId) ?? new Prisma.Decimal(0),
-    )
-    memo.set(memoKey, available)
-    return available
-  }
-
-  if (stack.has(memoKey)) {
-    const zero = new Prisma.Decimal(0)
-    memo.set(memoKey, zero)
-    return zero
-  }
-
-  stack.add(memoKey)
-
-  let available: Prisma.Decimal | null = null
-  for (const component of node.productComponents) {
-    // TODO(stage-4): component.qty is still number-typed by the product graph loader.
-    // Switch this guard to Decimal predicates when that shared contract is widened.
-    if (!Number.isFinite(component.qty) || component.qty <= 0) {
-      available = new Prisma.Decimal(0)
-      break
-    }
-
-    const componentAvailable = component.componentType === 'KIT'
-      ? getDecimalFulfillmentAvailableQty(component.componentId, warehouseId, graph, stockByProductWarehouse, memo, stack)
-      : Prisma.Decimal.max(
-        new Prisma.Decimal(0),
-        stockByProductWarehouse.get(component.componentId)?.get(warehouseId) ?? new Prisma.Decimal(0),
-      )
-
-    const componentCoverage = componentAvailable.div(component.qty)
-    available = available == null ? componentCoverage : Prisma.Decimal.min(available, componentCoverage)
-  }
-
-  stack.delete(memoKey)
-  const resolved = available == null ? new Prisma.Decimal(0) : Prisma.Decimal.max(new Prisma.Decimal(0), available)
-  memo.set(memoKey, resolved)
-  return resolved
-}
-
-function calculateDecimalFulfillmentCoverage(
-  requirements: FulfillmentRequirement[],
-  quantitiesByProduct: Map<string, Prisma.Decimal>,
-): Prisma.Decimal {
-  if (requirements.length === 0) return new Prisma.Decimal(0)
-
-  let coverage: Prisma.Decimal | null = null
-  for (const requirement of requirements) {
-    // TODO(stage-4): requirement.factor is still number-typed by the coverage helpers.
-    // Switch this guard to Decimal predicates when those shared contracts are widened.
-    if (!Number.isFinite(requirement.factor) || requirement.factor <= 0) {
-      return new Prisma.Decimal(0)
-    }
-    const availableQty = quantitiesByProduct.get(requirement.productId) ?? new Prisma.Decimal(0)
-    const productCoverage = availableQty.div(requirement.factor)
-    coverage = coverage == null ? productCoverage : Prisma.Decimal.min(coverage, productCoverage)
-  }
-
-  return coverage == null ? new Prisma.Decimal(0) : coverage
-}
-
 export async function lockSalesOrder(
   tx: Prisma.TransactionClient,
   orderId: string,
@@ -400,11 +279,11 @@ export async function validateAllocationIntegrity(
     client,
     lines.map((line) => line.productId!).filter(Boolean),
   )
-  const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
+  const requirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
   for (const line of lines) {
     requirementsByLine.set(
       line.id,
-      requirementsMapToRows(expandFulfillmentRequirements(line.productId!, 1, graph)),
+      requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId!, 1, graph)),
     )
   }
 
@@ -434,15 +313,9 @@ export async function validateAllocationIntegrity(
     }),
   ])
 
-  // calculateCoverageByLine remains number-based until the shared fulfillment
-  // coverage helpers are widened; ALLOCATION_EPSILON_DECIMAL bounds this seam.
-  const committedByLine = calculateCoverageByLine(
+  const committedByLine = calculateDecimalCoverageByLine(
     requirementsByLine,
-    activeShipmentLines.map((line) => ({
-      lineId: line.lineId,
-      productId: line.productId,
-      qty: toDecimal(line.qty).toNumber(),
-    })),
+    activeShipmentLines,
   )
 
   for (const line of lines) {
@@ -486,7 +359,7 @@ export async function validateAllocationIntegrity(
       allocatedCoverage = allocatedCoverage.add(coverage)
     }
 
-    const committedCoverage = toDecimal(committedByLine.get(line.id) ?? 0)
+    const committedCoverage = committedByLine.get(line.id) ?? new Prisma.Decimal(0)
     const remainingQty = Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(line.qty).sub(committedCoverage))
     if (allocatedCoverage.sub(remainingQty).abs().gt(ALLOCATION_EPSILON_DECIMAL) && allocatedCoverage.gt(remainingQty)) {
       return `Allocation for sales line ${line.sku ?? line.description} exceeds the remaining quantity to fulfill`
@@ -636,12 +509,12 @@ export async function allocateSalesOrder(
 
     await resetAllocationAccountingIfStaged(tx, orderId)
     const graph = await loadFulfillmentProductGraph(tx, productIds)
-    const requirementsByLine = new Map<string, FulfillmentRequirement[]>()
+    const requirementsByLine = new Map<string, DecimalFulfillmentRequirement[]>()
     for (const line of so.lines) {
       if (!line.productId) continue
       requirementsByLine.set(
         line.id,
-        requirementsMapToRows(expandFulfillmentRequirements(line.productId, 1, graph)),
+        requirementsMapToDecimalRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph)),
       )
     }
 
@@ -664,19 +537,13 @@ export async function allocateSalesOrder(
       },
       select: { lineId: true, productId: true, qty: true, shipment: { select: { status: true } } },
     })
-    // calculateCoverageByLine remains number-based until the shared fulfillment
-    // coverage helpers are widened; ALLOCATION_EPSILON_DECIMAL bounds this seam.
-    const committedByLine = calculateCoverageByLine(
+    const committedByLine = calculateDecimalCoverageByLine(
       requirementsByLine,
-      activeShipmentLines.map((line) => ({
-        lineId: line.lineId,
-        productId: line.productId,
-        qty: toDecimal(line.qty).toNumber(),
-      })),
+      activeShipmentLines,
     )
 
     const lines = so.lines.filter((line) => line.productId).map((line) => {
-      const committed = toDecimal(committedByLine.get(line.id) ?? 0)
+      const committed = committedByLine.get(line.id) ?? new Prisma.Decimal(0)
       return {
         id: line.id,
         productId: line.productId!,
@@ -689,7 +556,7 @@ export async function allocateSalesOrder(
     for (const line of lines) {
       const options: string[] = []
       for (const warehouse of sorted) {
-        const avail = getDecimalFulfillmentAvailableQty(line.productId, warehouse.id, graph, stockMap)
+        const avail = getFulfillmentAvailableQtyDecimal(line.productId, warehouse.id, graph, stockMap)
         if (avail.gte(line.qty)) options.push(warehouse.id)
       }
       lineOptions.set(line.id, options)
@@ -714,7 +581,7 @@ export async function allocateSalesOrder(
       }
 
       if (bestWh) {
-        const avail = getDecimalFulfillmentAvailableQty(line.productId, bestWh, graph, tempStock)
+        const avail = getFulfillmentAvailableQtyDecimal(line.productId, bestWh, graph, tempStock)
         const allocQty = Prisma.Decimal.min(remaining, avail)
         if (allocQty.gt(ALLOCATION_EPSILON_DECIMAL)) {
           const requirements = expandFulfillmentRequirementsDecimal(line.productId, allocQty, graph)
@@ -730,7 +597,7 @@ export async function allocateSalesOrder(
         for (const warehouse of sorted) {
           if (remaining.lte(ALLOCATION_EPSILON_DECIMAL)) break
           if (bestWh && warehouse.id === bestWh) continue
-          const avail = getDecimalFulfillmentAvailableQty(line.productId, warehouse.id, graph, tempStock)
+          const avail = getFulfillmentAvailableQtyDecimal(line.productId, warehouse.id, graph, tempStock)
           if (avail.lte(ALLOCATION_EPSILON_DECIMAL)) continue
           const allocQty = Prisma.Decimal.min(remaining, avail)
           const requirements = expandFulfillmentRequirementsDecimal(line.productId, allocQty, graph)
@@ -802,7 +669,13 @@ export async function allocateSalesOrder(
         qty: allocation.qty.toNumber(),
       })),
       shipmentLines: activeShipmentLines,
-      requirementsByLine,
+      requirementsByLine: new Map([...requirementsByLine].map(([lineId, requirements]) => [
+        lineId,
+        requirements.map((requirement) => ({
+          productId: requirement.productId,
+          factor: requirement.factor.toNumber(),
+        })),
+      ])),
     })
 
     return {

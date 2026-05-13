@@ -8,7 +8,7 @@ import {
   type FulfillmentRequirement,
 } from '@/lib/products/fulfillment-coverage'
 import {
-  expandFulfillmentRequirements,
+  expandFulfillmentRequirementsDecimal,
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
 import {
@@ -310,7 +310,7 @@ export async function collectBackorderReportRows(
     requirementsByLine.set(
       line.id,
       line.productId
-        ? requirementsMapToRows(expandFulfillmentRequirements(line.productId, 1, graph))
+        ? requirementsMapToRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph))
         : defaultRequirements(line),
     )
   }

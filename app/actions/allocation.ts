@@ -10,7 +10,8 @@ import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 import { decimalToNumber } from '@/lib/decimal'
 import { requirementsMapToRows, type FulfillmentRequirement } from '@/lib/products/fulfillment-coverage'
 import {
-  expandFulfillmentRequirements,
+  expandFulfillmentRequirementsDecimal,
+  getFulfillmentAvailableQtyDecimal,
   listFulfillmentLeafProductIds,
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
@@ -20,8 +21,6 @@ import {
   allocateSalesOrder,
   applyAllocationReservationDelta,
   buildAvailableStockMap,
-  expandFulfillmentRequirementsDecimal,
-  getDecimalFulfillmentAvailableQty,
   lockSalesOrder,
   lockStockLevels,
   resetAllocationAccountingIfStaged,
@@ -237,7 +236,7 @@ export async function getOrderFulfillmentRequirements(
   return lines.map((line) => ({
     lineId: line.id,
     requirements: requirementsMapToRows(
-      expandFulfillmentRequirements(line.productId!, 1, graph),
+      expandFulfillmentRequirementsDecimal(line.productId!, 1, graph),
     ),
   }))
 }
@@ -491,7 +490,7 @@ export async function addAllocation(
       })
       const stockMap = buildAvailableStockMap(stockLevels)
       const requestedQty = toDecimal(qty)
-      const avail = getDecimalFulfillmentAvailableQty(productId, warehouseId, graph, stockMap)
+      const avail = getFulfillmentAvailableQtyDecimal(productId, warehouseId, graph, stockMap)
       if (requestedQty.gt(avail)) throw new Error(`Only ${avail.toString()} available`)
       const requirements = expandFulfillmentRequirementsDecimal(productId, requestedQty, graph)
 

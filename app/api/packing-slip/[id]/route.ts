@@ -13,7 +13,7 @@ import {
   type PdfTableColumn,
 } from '@/lib/pdf'
 import { formatCountryDisplay } from '@/lib/countries'
-import { expandFulfillmentRequirements, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireApiAuth()
@@ -130,11 +130,11 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         }]
       }
 
-      return [...expandFulfillmentRequirements(line.productId, Number(line.qty), graph).entries()].map(([productId, qty]) => ({
+      return [...expandFulfillmentRequirementsDecimal(line.productId, line.qty, graph).entries()].map(([productId, qty]) => ({
         sku: '',
         name: line.description,
         productId,
-        qty,
+        qty: qty.toNumber(),
       }))
     })
 

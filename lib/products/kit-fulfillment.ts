@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
 import { Prisma, type ProductType } from '@/app/generated/prisma/client'
+import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 type FulfillmentClient = Prisma.TransactionClient | typeof db
 
@@ -9,7 +10,7 @@ export type FulfillmentGraphNode = {
   productComponents: Array<{
     componentId: string
     componentSku: string
-    qty: number
+    qty: Prisma.Decimal
     componentType: ProductType
     componentOversellAllowed: boolean
   }>
@@ -50,7 +51,7 @@ export async function loadFulfillmentProductGraph(
         productComponents: row.productComponents.map((component) => ({
           componentId: component.componentId,
           componentSku: component.component.sku,
-          qty: Number(component.qty),
+          qty: toDecimal(component.qty),
           componentType: component.component.type,
           componentOversellAllowed: component.component.oversellAllowed,
         })),
@@ -66,15 +67,22 @@ export async function loadFulfillmentProductGraph(
   return graph
 }
 
-export function expandFulfillmentRequirements(
+export function expandFulfillmentRequirementsDecimal(
   productId: string,
-  qty: number,
+  qty: DecimalInput,
   graph: Map<string, FulfillmentGraphNode>,
-): Map<string, number> {
-  const totals = new Map<string, number>()
+): Map<string, Prisma.Decimal> {
+  const totals = new Map<string, Prisma.Decimal>()
 
-  function visit(currentProductId: string, currentQty: number, stack: Set<string>) {
-    if (!Number.isFinite(currentQty) || currentQty <= 0) return
+  function addRequirement(componentProductId: string, requiredQty: Prisma.Decimal) {
+    totals.set(
+      componentProductId,
+      (totals.get(componentProductId) ?? new Prisma.Decimal(0)).add(requiredQty),
+    )
+  }
+
+  function visit(currentProductId: string, currentQty: Prisma.Decimal, stack: Set<string>) {
+    if (!currentQty.isFinite() || currentQty.lte(0)) return
     const node = graph.get(currentProductId)
     if (!node) {
       // Product referenced as a component but not loaded in the graph —
@@ -82,11 +90,11 @@ export function expandFulfillmentRequirements(
       // Treat as a leaf (accumulate to totals) but log a warning so ops
       // can investigate rather than silently masking the issue.
       console.warn(`[kit-fulfillment] Product ${currentProductId} referenced as component but not found in graph — treating as leaf`)
-      totals.set(currentProductId, (totals.get(currentProductId) ?? 0) + currentQty)
+      addRequirement(currentProductId, currentQty)
       return
     }
     if (node.type !== 'KIT' || node.productComponents.length === 0) {
-      totals.set(currentProductId, (totals.get(currentProductId) ?? 0) + currentQty)
+      addRequirement(currentProductId, currentQty)
       return
     }
     if (stack.has(currentProductId)) {
@@ -95,17 +103,17 @@ export function expandFulfillmentRequirements(
 
     stack.add(currentProductId)
     for (const component of node.productComponents) {
-      const requiredQty = currentQty * component.qty
+      const requiredQty = currentQty.mul(component.qty)
       if (component.componentType === 'KIT') {
         visit(component.componentId, requiredQty, stack)
       } else {
-        totals.set(component.componentId, (totals.get(component.componentId) ?? 0) + requiredQty)
+        addRequirement(component.componentId, requiredQty)
       }
     }
     stack.delete(currentProductId)
   }
 
-  visit(productId, qty, new Set<string>())
+  visit(productId, toDecimal(qty), new Set<string>())
   return totals
 }
 
@@ -115,54 +123,63 @@ export function listFulfillmentLeafProductIds(
 ): string[] {
   const ids = new Set<string>()
   for (const productId of productIds) {
-    for (const leafId of expandFulfillmentRequirements(productId, 1, graph).keys()) {
+    for (const leafId of expandFulfillmentRequirementsDecimal(productId, 1, graph).keys()) {
       ids.add(leafId)
     }
   }
   return [...ids]
 }
 
-export function getFulfillmentAvailableQty(
+export function getFulfillmentAvailableQtyDecimal(
   productId: string,
   warehouseId: string,
   graph: Map<string, FulfillmentGraphNode>,
-  stockByProductWarehouse: Map<string, Map<string, number>>,
-  memo = new Map<string, number>(),
+  stockByProductWarehouse: Map<string, Map<string, DecimalInput>>,
+  memo = new Map<string, Prisma.Decimal>(),
   stack = new Set<string>(),
-): number {
+): Prisma.Decimal {
   const memoKey = `${productId}|${warehouseId}`
-  if (memo.has(memoKey)) return memo.get(memoKey) ?? 0
+  const memoized = memo.get(memoKey)
+  if (memoized) return memoized
 
   const node = graph.get(productId)
   if (!node || node.type !== 'KIT' || node.productComponents.length === 0) {
-    const available = Math.max(0, stockByProductWarehouse.get(productId)?.get(warehouseId) ?? 0)
+    const available = Prisma.Decimal.max(
+      new Prisma.Decimal(0),
+      toDecimal(stockByProductWarehouse.get(productId)?.get(warehouseId)),
+    )
     memo.set(memoKey, available)
     return available
   }
 
   if (stack.has(memoKey)) {
-    memo.set(memoKey, 0)
-    return 0
+    const zero = new Prisma.Decimal(0)
+    memo.set(memoKey, zero)
+    return zero
   }
 
   stack.add(memoKey)
 
-  let available = Number.POSITIVE_INFINITY
+  let available: Prisma.Decimal | null = null
   for (const component of node.productComponents) {
-    if (!Number.isFinite(component.qty) || component.qty <= 0) {
-      available = 0
+    if (!component.qty.isFinite() || component.qty.lte(0)) {
+      available = new Prisma.Decimal(0)
       break
     }
 
     const componentAvailable = component.componentType === 'KIT'
-      ? getFulfillmentAvailableQty(component.componentId, warehouseId, graph, stockByProductWarehouse, memo, stack)
-      : Math.max(0, stockByProductWarehouse.get(component.componentId)?.get(warehouseId) ?? 0)
+      ? getFulfillmentAvailableQtyDecimal(component.componentId, warehouseId, graph, stockByProductWarehouse, memo, stack)
+      : Prisma.Decimal.max(
+        new Prisma.Decimal(0),
+        toDecimal(stockByProductWarehouse.get(component.componentId)?.get(warehouseId)),
+      )
 
-    available = Math.min(available, componentAvailable / component.qty)
+    const componentCoverage = componentAvailable.div(component.qty)
+    available = available == null ? componentCoverage : Prisma.Decimal.min(available, componentCoverage)
   }
 
   stack.delete(memoKey)
-  const resolved = Number.isFinite(available) ? Math.max(0, available) : 0
+  const resolved = available == null ? new Prisma.Decimal(0) : Prisma.Decimal.max(new Prisma.Decimal(0), available)
   memo.set(memoKey, resolved)
   return resolved
 }
