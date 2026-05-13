@@ -1,4 +1,11 @@
 import { createHash } from 'crypto'
+import {
+  addMoney,
+  roundQuantity,
+  toDecimal,
+  type Decimal,
+  type DecimalInput,
+} from '@/lib/domain/math/decimal'
 
 /**
  * Pure-math helpers for manufacturing-cost capitalisation. Kept separate
@@ -10,15 +17,15 @@ export type LayerInfo = {
   /** Cost-layer id (passthrough — used only to identify rows). */
   id: string
   /** Original receivedQty on the layer. Used as the divisor for unit cost. */
-  receivedQty: number
+  receivedQty: DecimalInput
   /** Sum of `costLayerSourceLine.totalCostBase` for this layer — the
    *  component-only base cost before any manufacturing overhead. */
-  base: number
+  base: DecimalInput
 }
 
 export type RecalcResult = {
   layerId: string
-  newUnitCostBase: number
+  newUnitCostBase: Decimal
 }
 
 export type ManufacturingCostAccountLine = {
@@ -120,16 +127,23 @@ export function buildOverheadAccountDeltas(
  */
 export function recomputeManufacturingUnitCosts(
   layers: LayerInfo[],
-  currentMfgCostBase: number,
+  currentMfgCostBase: DecimalInput,
 ): RecalcResult[] {
   if (layers.length === 0) return []
-  const totalBase = layers.reduce((s, l) => s + l.base, 0)
-  return layers.map((l) => {
-    const share = totalBase > 0 ? l.base / totalBase : 1 / layers.length
-    const overhead = currentMfgCostBase * share
-    const unit = l.receivedQty > 0
-      ? Math.round(((l.base + overhead) / l.receivedQty) * 1_000_000) / 1_000_000
-      : 0
-    return { layerId: l.id, newUnitCostBase: unit }
+  const decimalLayers = layers.map((layer) => ({
+    id: layer.id,
+    receivedQty: toDecimal(layer.receivedQty),
+    base: toDecimal(layer.base),
+  }))
+  const totalBase = decimalLayers.reduce((sum, layer) => addMoney(sum, layer.base), toDecimal(0))
+  const mfgCostBase = toDecimal(currentMfgCostBase)
+
+  return decimalLayers.map((layer) => {
+    const share = totalBase.gt(0) ? layer.base.div(totalBase) : toDecimal(1).div(decimalLayers.length)
+    const overhead = mfgCostBase.mul(share)
+    const unit = layer.receivedQty.gt(0)
+      ? roundQuantity(layer.base.add(overhead).div(layer.receivedQty), 6)
+      : toDecimal(0)
+    return { layerId: layer.id, newUnitCostBase: unit }
   })
 }

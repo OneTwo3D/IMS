@@ -7,6 +7,10 @@ import {
   stableHash,
 } from '../lib/manufacturing-cost.ts'
 
+function unitCostsAsNumbers(result: ReturnType<typeof recomputeManufacturingUnitCosts>): Record<string, number> {
+  return Object.fromEntries(result.map((entry) => [entry.layerId, entry.newUnitCostBase.toNumber()]))
+}
+
 test('assembly: full overhead spread across single output layer', () => {
   // Assembled 10 units of finished good; component cost was £100 (£10/unit).
   // Add £20 of labour / machine overhead → unit cost should rise to £12.
@@ -16,7 +20,7 @@ test('assembly: full overhead spread across single output layer', () => {
   )
   assert.equal(result.length, 1)
   assert.equal(result[0].layerId, 'L1')
-  assert.equal(result[0].newUnitCostBase, 12)
+  assert.equal(result[0].newUnitCostBase.toNumber(), 12)
 })
 
 test('assembly: zero overhead leaves unit cost equal to base', () => {
@@ -24,7 +28,7 @@ test('assembly: zero overhead leaves unit cost equal to base', () => {
     [{ id: 'L1', receivedQty: 4, base: 80 }],
     0,
   )
-  assert.equal(result[0].newUnitCostBase, 20)
+  assert.equal(result[0].newUnitCostBase.toNumber(), 20)
 })
 
 test('disassembly: overhead distributes proportionally to component value share', () => {
@@ -41,7 +45,7 @@ test('disassembly: overhead distributes proportionally to component value share'
     ],
     30,
   )
-  const byId = Object.fromEntries(result.map((r) => [r.layerId, r.newUnitCostBase]))
+  const byId = unitCostsAsNumbers(result)
   assert.equal(byId['A'], 26)
   assert.equal(byId['B'], 13)
 })
@@ -57,7 +61,7 @@ test('zero base across all layers falls back to equal share', () => {
     ],
     40,
   )
-  const byId = Object.fromEntries(result.map((r) => [r.layerId, r.newUnitCostBase]))
+  const byId = unitCostsAsNumbers(result)
   assert.equal(byId['A'], 10)
   assert.equal(byId['B'], 10)
 })
@@ -67,7 +71,7 @@ test('zero receivedQty on a layer yields zero unit cost (no divide-by-zero)', ()
     [{ id: 'L1', receivedQty: 0, base: 0 }],
     50,
   )
-  assert.equal(result[0].newUnitCostBase, 0)
+  assert.equal(result[0].newUnitCostBase.toNumber(), 0)
 })
 
 test('rounding: unit cost rounded to 6 decimal places', () => {
@@ -77,7 +81,7 @@ test('rounding: unit cost rounded to 6 decimal places', () => {
     [{ id: 'L1', receivedQty: 10, base: 100 / 3 }],
     0,
   )
-  assert.equal(result[0].newUnitCostBase, 3.333333)
+  assert.equal(result[0].newUnitCostBase.toNumber(), 3.333333)
 })
 
 test('empty layer list returns empty result', () => {
@@ -102,7 +106,7 @@ test('proportional split rounds each layer independently to 6dp', () => {
   // Each layer should round to the same value at 6dp
   assert.equal(result.length, 3)
   for (const r of result) {
-    assert.equal(r.newUnitCostBase, 12.222222)
+    assert.equal(r.newUnitCostBase.toNumber(), 12.222222)
   }
 })
 
@@ -119,7 +123,7 @@ test('equal-share fallback: zero base across layers spreads overhead evenly', ()
     30,
   )
   for (const r of result) {
-    assert.equal(r.newUnitCostBase, 2)
+    assert.equal(r.newUnitCostBase.toNumber(), 2)
   }
 })
 
@@ -136,45 +140,49 @@ test('mixed receivedQty per layer: proportional share is by base value not qty',
     ],
     100,
   )
-  const byId = Object.fromEntries(result.map((r) => [r.layerId, r.newUnitCostBase]))
+  const byId = unitCostsAsNumbers(result)
   assert.equal(byId['L1'], 60)
   assert.equal(byId['L2'], 20)
 })
 
-test('fractional manufacturing unit-cost helper matches Decimal arithmetic at the current 6dp boundary', () => {
-  // This pins one current float-compatible fractional case. PR 4.5 should
-  // replace it with broader corpus/property coverage once the implementation
-  // itself is Decimal-safe end-to-end.
-  const layers = [
-    { id: 'A', receivedQty: 0.3, base: 0.1 },
-    { id: 'B', receivedQty: 0.6, base: 0.2 },
+test('fractional manufacturing unit-cost helper matches Decimal arithmetic at the 6dp boundary', () => {
+  const cases = [
+    {
+      layers: [
+        { id: 'A', receivedQty: '0.3', base: '0.1' },
+        { id: 'B', receivedQty: '0.6', base: '0.2' },
+      ],
+      currentMfgCostBase: '0.1',
+    },
+    {
+      layers: [
+        { id: 'A', receivedQty: '0.07', base: '0.123456789' },
+        { id: 'B', receivedQty: '0.11', base: '0.987654321' },
+      ],
+      currentMfgCostBase: '0.333333333',
+    },
   ]
-  const currentMfgCostBase = 0.1
 
-  const result = Object.fromEntries(
-    recomputeManufacturingUnitCosts(layers, currentMfgCostBase)
-      .map((entry) => [entry.layerId, entry.newUnitCostBase]),
-  )
+  for (const scenario of cases) {
+    const result = Object.fromEntries(
+      recomputeManufacturingUnitCosts(scenario.layers, scenario.currentMfgCostBase)
+        .map((entry) => [entry.layerId, entry.newUnitCostBase.toFixed(6)]),
+    )
 
-  const totalBase = layers.reduce((sum, layer) => sum.add(layer.base), new Prisma.Decimal(0))
-  const expected = Object.fromEntries(layers.map((layer) => {
-    const share = new Prisma.Decimal(layer.base).div(totalBase)
-    const overhead = new Prisma.Decimal(currentMfgCostBase).mul(share)
-    const unitCost = new Prisma.Decimal(layer.base)
-      .add(overhead)
-      .div(layer.receivedQty)
-      .toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
-      .toNumber()
-    return [layer.id, unitCost]
-  }))
+    const totalBase = scenario.layers.reduce((sum, layer) => sum.add(layer.base), new Prisma.Decimal(0))
+    const expected = Object.fromEntries(scenario.layers.map((layer) => {
+      const share = new Prisma.Decimal(layer.base).div(totalBase)
+      const overhead = new Prisma.Decimal(scenario.currentMfgCostBase).mul(share)
+      const unitCost = new Prisma.Decimal(layer.base)
+        .add(overhead)
+        .div(layer.receivedQty)
+        .toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+        .toFixed(6)
+      return [layer.id, unitCost]
+    }))
 
-  assert.deepEqual(result, expected)
-})
-
-test('manufacturing cost-layer revaluation still needs Decimal-safe returned quantities and delta totals', {
-  todo: 'PR 4.5 Decimalizes recalculateManufacturingCostLayers returnedQty, unitDelta, consumedQty, COGS delta, and inventory delta.',
-}, () => {
-  assert.equal(typeof recomputeManufacturingUnitCosts, 'function')
+    assert.deepEqual(result, expected)
+  }
 })
 
 test('overhead account deltas net same-account edits to zero', () => {

@@ -824,6 +824,8 @@ Run npm run validate and landed-cost/FIFO/refund tests.
 
 ## PR 4.5 — Decimalize manufacturing cost revaluation
 
+Status: implemented in the PR 4.4 follow-up branch.
+
 ### Problem
 
 PR 4.4 removes the landed-cost dependency number boundaries, but `recalculateManufacturingCostLayers` still mirrors the old revaluation pattern:
@@ -1929,6 +1931,7 @@ PR 4.2  Decimal landed-cost deltas
 PR 4.3  Decimal allocation maps
 PR 4.4  Decimal landed-cost boundary contracts
 PR 4.5  Decimal manufacturing revaluation
+        Implemented in PR 4.4 follow-up branch.
 ```
 
 ## Wave 3 — WMS reliability and security
