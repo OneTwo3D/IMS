@@ -14,6 +14,10 @@ import {
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
+/**
+ * Deliberate call-site boundary for this number-shaped shipment service contract.
+ * Do not treat this as Decimal-internal arithmetic.
+ */
 function shipmentBoundaryNumber(value: DecimalInput): number {
   return toDecimal(value).toNumber()
 }

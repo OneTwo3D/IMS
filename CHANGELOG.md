@@ -15,7 +15,7 @@ This repository uses an `x.y.z` release scheme.
 ### Fixes (landed-cost precision)
 
 - **Retrospective landed-cost deltas now use Decimal arithmetic internally.** Cost-layer revaluation now keeps unit-cost deltas, consumed quantities, COGS deltas, and inventory-in-transit deltas as `Prisma.Decimal` until the accounting payload or snapshot-refresh boundary. This removes binary floating-point drift from fractional landed-cost recalculations while preserving existing journal payload rounding, including the pre-existing `Math.round` behavior for negative half-cent deltas. Existing journal entries are not retroactively re-rounded.
-- **Landed-cost snapshot refreshes now keep returned quantities and replacement unit costs Decimal-safe until serialization.** Customer and supplier return helpers now return `Prisma.Decimal`, and cost-layer snapshot refreshes accept Decimal inputs before explicitly preserving the existing JSON number shape for `unitCostBase`. Manufacturing cost-layer recalculation still uses number arithmetic for `unitDelta`, `consumedQty`, and totals; a follow-up Decimalizes that path.
+- **Landed-cost snapshot refreshes now keep returned quantities and replacement unit costs Decimal-safe until serialization.** Customer and supplier return helpers now return `Prisma.Decimal`, and cost-layer snapshot refreshes accept Decimal inputs before explicitly preserving the existing JSON number shape for `unitCostBase`. Manufacturing cost-layer recalculation now also keeps unit deltas, consumed quantities, COGS deltas, and inventory deltas Decimal-safe until the journal/server-action return boundary.
 
 ### Fixes (allocation precision)
 

@@ -16,6 +16,10 @@ import { validateRefundSalesOrderStatusUpdate } from '@/lib/domain/workflows/act
 export const REFUND_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 export const REFUND_ACCOUNTING_LOCK_KEY = 4_112_208_031
 
+/**
+ * Deliberate call-site boundary for this number-shaped refund service contract.
+ * Do not treat this as Decimal-internal arithmetic.
+ */
 function refundBoundaryNumber(value: DecimalInput): number {
   return toDecimal(value).toNumber()
 }
