@@ -523,7 +523,7 @@ export async function recalculateLandedCosts(
         })
 
         if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
-          await deps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase.toNumber())
+          await deps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
           await deps.refreshShipmentCogsForCostLayerChange(tx, cl.id)
           await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
         }
@@ -701,7 +701,7 @@ export async function recalculateDirectLandedCosts(
       })
 
       if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
-        await deps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase.toNumber())
+        await deps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
         await deps.refreshShipmentCogsForCostLayerChange(tx, cl.id)
         await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
       }

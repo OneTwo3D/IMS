@@ -3,6 +3,12 @@ import test from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import {
+  getReturnedQtyForCostLayer,
+  getSupplierReturnedQtyForCostLayer,
+  updateSnapshotsForCostLayerChange,
+} from '@/lib/cost-layers'
+import { toDecimal } from '@/lib/domain/math/decimal'
+import {
   LANDED_COST_DISTRIBUTION_METHODS,
   calculateLayerAdjustmentDeltas,
   computeGrossUnitCostBaseByLine,
@@ -162,6 +168,63 @@ test('retrospective layer adjustment uses Decimal arithmetic for fractional land
   assert.equal(deltas.inventoryDelta.toString(), '0.2')
 })
 
+test('returned quantity helpers return Decimal without fractional drift', async () => {
+  const refundTx = {
+    $queryRawUnsafe: async () => [
+      { costLayerSnapshot: [{ costLayerId: 'layer-a', qty: '0.1', unitCostBase: 1 }] },
+      { costLayerSnapshot: [{ costLayerId: 'layer-a', qty: '0.2', unitCostBase: 1 }] },
+      { costLayerSnapshot: [{ costLayerId: 'other-layer', qty: '9', unitCostBase: 1 }] },
+    ],
+  }
+  const supplierTx = {
+    cogsEntry: {
+      findMany: async () => [
+        { qty: new Prisma.Decimal('0.1') },
+        { qty: new Prisma.Decimal('0.2') },
+      ],
+    },
+  }
+
+  const customerReturned = await getReturnedQtyForCostLayer(refundTx as never, 'layer-a')
+  const supplierReturned = await getSupplierReturnedQtyForCostLayer(supplierTx as never, 'layer-a')
+
+  assert.equal(customerReturned.toString(), '0.3')
+  assert.equal(supplierReturned.toString(), '0.3')
+})
+
+test('snapshot updates accept Decimal input and serialize the legacy JSON number shape', async () => {
+  const updates: Array<{ sql: string; snapshot: unknown; id: string }> = []
+  const tx = {
+    $queryRawUnsafe: async (_sql: string, containsCostLayer: string) => (
+      containsCostLayer === JSON.stringify([{ costLayerId: 'layer-a' }])
+        ? [{
+          id: 'row-a',
+          costLayerSnapshot: [
+            { costLayerId: 'layer-a', qty: 1, unitCostBase: 10 },
+            { costLayerId: 'layer-b', qty: 1, unitCostBase: 5 },
+          ],
+        }]
+        : []
+    ),
+    $executeRawUnsafe: async (sql: string, snapshotJson: string, id: string) => {
+      updates.push({ sql, snapshot: JSON.parse(snapshotJson), id })
+      return 1
+    },
+  }
+
+  const updated = await updateSnapshotsForCostLayerChange(tx as never, 'layer-a', new Prisma.Decimal('14.123456'))
+
+  assert.equal(updated, 4)
+  assert.equal(updates.length, 4)
+  for (const update of updates) {
+    assert.equal(update.id, 'row-a')
+    assert.deepEqual(update.snapshot, [
+      { costLayerId: 'layer-a', qty: 1, unitCostBase: 14.123456 },
+      { costLayerId: 'layer-b', qty: 1, unitCostBase: 5 },
+    ])
+  }
+})
+
 test('landed-cost adjustment idempotency key ignores wall-clock journal date', () => {
   const adj = { primaryPoId: 'po-1', primaryPoRef: 'PO-1', eventKey: 'event-a', totalDelta: 12.345 }
 
@@ -186,8 +249,8 @@ test('landed-cost adjustment idempotency key includes recalculation context', ()
 
 function noopDeps(overrides: Partial<LandedCostServiceDeps> = {}): LandedCostServiceDeps {
   return {
-    getReturnedQtyForCostLayer: async () => 0,
-    getSupplierReturnedQtyForCostLayer: async () => 0,
+    getReturnedQtyForCostLayer: async () => new Prisma.Decimal(0),
+    getSupplierReturnedQtyForCostLayer: async () => new Prisma.Decimal(0),
     updateSnapshotsForCostLayerChange: async () => 0,
     refreshShipmentCogsForCostLayerChange: async () => 0,
     refreshSalesOrderLineCogsForCostLayerChange: async () => 0,
@@ -410,6 +473,43 @@ test('recalculateDirectLandedCosts skips snapshot refresh when cost delta is neg
   }))
 
   assert.equal(snapshotRefreshes, 0)
+})
+
+test('recalculateDirectLandedCosts keeps fractional returns and snapshot cost as Decimal inputs', async () => {
+  let snapshotUnitCost: string | null = null
+  const { tx } = createDirectTx({
+    id: 'po-1',
+    reference: 'PO-1',
+    status: 'RECEIVED',
+    lines: [{
+      id: 'line-a',
+      qty: 1,
+      unitCostBase: '1.00',
+      totalBase: '1.00',
+      product: { weight: 1 },
+      costLayers: [{
+        id: 'layer-a',
+        unitCostBase: '1.00',
+        receivedQty: '1',
+        remainingQty: '0.5',
+      }],
+    }],
+    freightCostLines: [{ amountBase: '0.10', distributionMethod: 'BY_QUANTITY' }],
+    landedCostLinks: [],
+  })
+
+  const result = await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps({
+    getReturnedQtyForCostLayer: async () => new Prisma.Decimal('0.1'),
+    getSupplierReturnedQtyForCostLayer: async () => new Prisma.Decimal('0.2'),
+    updateSnapshotsForCostLayerChange: async (_tx, _costLayerId, newUnitCostBase) => {
+      snapshotUnitCost = toDecimal(newUnitCostBase).toString()
+      return 1
+    },
+  }))
+
+  assert.equal(snapshotUnitCost, '1.1')
+  assert.deepEqual(result.cogsAdjustments.map((adj) => adj.totalDelta), [0.02])
+  assert.deepEqual(result.inventoryTransitAdjustments.map((adj) => adj.totalDelta), [0.05])
 })
 
 test('recalculateDirectLandedCosts preserves legacy negative midpoint journal rounding', async () => {

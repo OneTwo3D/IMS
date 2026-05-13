@@ -1412,7 +1412,7 @@ async function recalculateManufacturingCostLayers(
     })
 
     const unitDelta = r.newUnitCostBase - li.oldUnitCostBase
-    const returnedQty = await getReturnedQtyForCostLayer(tx, li.id)
+    const returnedQty = (await getReturnedQtyForCostLayer(tx, li.id)).toNumber()
     const consumedQty = li.receivedQty - li.remainingQty - returnedQty
     if (consumedQty > 0) {
       netCogsDeltaBase += consumedQty * unitDelta

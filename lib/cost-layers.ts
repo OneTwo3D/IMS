@@ -330,8 +330,10 @@ export async function copyCostLayerSourceLinesProportionally(
 export async function updateSnapshotsForCostLayerChange(
   tx: TxClient,
   costLayerId: string,
-  newUnitCostBase: number,
+  newUnitCostBase: DecimalInput,
 ): Promise<number> {
+  const newUnitCost = toDecimal(newUnitCostBase)
+  const serializedUnitCostBase = newUnitCost.toNumber()
   // PostgreSQL jsonb_set can't easily iterate arrays. Use a raw UPDATE
   // that rewrites the unitCostBase for every matching array element.
   // The query: for each row whose costLayerSnapshot contains an entry
@@ -362,9 +364,9 @@ export async function updateSnapshotsForCostLayerChange(
       if (!Array.isArray(row.costLayerSnapshot)) continue
       let changed = false
       const patched = (row.costLayerSnapshot as Array<Record<string, unknown>>).map((entry) => {
-        if (entry.costLayerId === costLayerId && entry.unitCostBase !== newUnitCostBase) {
+        if (entry.costLayerId === costLayerId && !snapshotUnitCostMatches(entry.unitCostBase, newUnitCost)) {
           changed = true
-          return { ...entry, unitCostBase: newUnitCostBase }
+          return { ...entry, unitCostBase: serializedUnitCostBase }
         }
         return entry
       })
@@ -382,6 +384,14 @@ export async function updateSnapshotsForCostLayerChange(
   return updated
 }
 
+function snapshotUnitCostMatches(value: unknown, expected: Decimal): boolean {
+  try {
+    return toDecimal(value as DecimalInput).eq(expected)
+  } catch {
+    return false
+  }
+}
+
 /**
  * Sum physically returned quantity for a cost layer by reading refund-line
  * snapshots on refunds that actually returned stock to a warehouse.
@@ -389,7 +399,7 @@ export async function updateSnapshotsForCostLayerChange(
 export async function getReturnedQtyForCostLayer(
   tx: TxClient,
   costLayerId: string,
-): Promise<number> {
+): Promise<Decimal> {
   const containsCostLayer = JSON.stringify([{ costLayerId }])
   const rows = await tx.$queryRawUnsafe<Array<{ costLayerSnapshot: unknown }>>(
     `SELECT srl."costLayerSnapshot"
@@ -409,7 +419,7 @@ export async function getReturnedQtyForCostLayer(
     }
   }
 
-  return returnedQty.toNumber()
+  return returnedQty
 }
 
 /**
@@ -420,7 +430,7 @@ export async function getReturnedQtyForCostLayer(
 export async function getSupplierReturnedQtyForCostLayer(
   tx: TxClient,
   costLayerId: string,
-): Promise<number> {
+): Promise<Decimal> {
   const rows = await tx.cogsEntry.findMany({
     where: {
       costLayerId,
@@ -428,7 +438,7 @@ export async function getSupplierReturnedQtyForCostLayer(
     },
     select: { qty: true },
   })
-  return rows.reduce((sum, row) => addMoney(sum, row.qty), toDecimal(0)).toNumber()
+  return rows.reduce((sum, row) => addMoney(sum, row.qty), toDecimal(0))
 }
 
 /**
