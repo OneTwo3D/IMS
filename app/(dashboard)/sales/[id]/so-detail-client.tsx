@@ -31,13 +31,46 @@ import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-poli
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
-import { calculateCoverageByLine } from '@/lib/products/fulfillment-coverage'
 import { hasPermission } from '@/lib/permissions'
 import { formatMoney } from '@/lib/utils'
 import { getTrackingUrl } from '@/lib/tracking'
 import { countryName, formatCountryDisplay } from '@/lib/countries'
 
 type WarehouseInfo = { id: string; code: string; name: string }
+
+// Client-side display helper. Server allocation paths use Decimal coverage in
+// lib/products/fulfillment-coverage.ts; this keeps Prisma Decimal out of the
+// browser bundle for already-serialized UI quantities.
+function calculateClientCoverageByLine(
+  requirementsByLine: Map<string, FulfillmentRequirementRow['requirements']>,
+  rows: Array<{ lineId: string; productId: string; qty: number }>,
+): Map<string, number> {
+  const quantitiesByLine = new Map<string, Map<string, number>>()
+  for (const row of rows) {
+    const lineQuantities = quantitiesByLine.get(row.lineId) ?? new Map<string, number>()
+    lineQuantities.set(row.productId, (lineQuantities.get(row.productId) ?? 0) + row.qty)
+    quantitiesByLine.set(row.lineId, lineQuantities)
+  }
+
+  const coverageByLine = new Map<string, number>()
+  for (const [lineId, requirements] of requirementsByLine) {
+    let coverage = Number.POSITIVE_INFINITY
+    let hasRequirement = false
+    const quantities = quantitiesByLine.get(lineId) ?? new Map<string, number>()
+    for (const requirement of requirements) {
+      if (!Number.isFinite(requirement.factor) || requirement.factor <= 0) {
+        coverage = 0
+        hasRequirement = true
+        break
+      }
+      hasRequirement = true
+      coverage = Math.min(coverage, (quantities.get(requirement.productId) ?? 0) / requirement.factor)
+    }
+    coverageByLine.set(lineId, hasRequirement && Number.isFinite(coverage) ? Math.max(0, coverage) : 0)
+  }
+
+  return coverageByLine
+}
 type AllocationPanelLine = {
   id: string
   productId: string | null
@@ -322,7 +355,7 @@ function AllocationPanel({
   }
 
   // Compute qty already committed in non-PENDING shipments
-  const shipmentCommittedByLine = calculateCoverageByLine(
+  const shipmentCommittedByLine = calculateClientCoverageByLine(
     requirementsByLine,
     shipments
       .filter((shipment) => shipment.status !== 'PENDING')
@@ -334,7 +367,7 @@ function AllocationPanel({
   )
 
   // Find backordered lines (not fully allocated for remaining qty)
-  const allocatedByLine = calculateCoverageByLine(
+  const allocatedByLine = calculateClientCoverageByLine(
     requirementsByLine,
     allocations.map((allocation) => ({
       lineId: allocation.lineId,
@@ -799,7 +832,7 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
   const canRetryRefundAccounting = hasPermission(currentUserRole, 'sales.refund')
 
   // Compute qty already committed in non-PENDING shipments for partial fulfillment
-  const committedByLine = calculateCoverageByLine(
+  const committedByLine = calculateClientCoverageByLine(
     requirementsByLine,
     shipments
       .filter((shipment) => shipment.status !== 'PENDING')

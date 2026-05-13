@@ -32,7 +32,7 @@ import {
 } from '@/lib/cost-layer-snapshots'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { calculateCoverageByLine, requirementsMapToRows } from '@/lib/products/fulfillment-coverage'
-import { expandFulfillmentRequirements, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { expandFulfillmentRequirementsDecimal, loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 
 type MutableLayer = {
   id: string
@@ -802,7 +802,7 @@ export async function runDailyBatchSync(): Promise<{
             .filter((line) => !!line.productId)
             .map((line) => [
               line.id,
-              requirementsMapToRows(expandFulfillmentRequirements(line.productId!, 1, graph)),
+              requirementsMapToRows(expandFulfillmentRequirementsDecimal(line.productId!, 1, graph)),
             ]),
         )
         const orderLineById = new Map(firstShipment.order.lines.map((line) => [line.id, line]))

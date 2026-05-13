@@ -8,7 +8,7 @@ import {
   type FulfillmentRequirement,
 } from '@/lib/products/fulfillment-coverage'
 import {
-  expandFulfillmentRequirements,
+  expandFulfillmentRequirementsDecimal,
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
 
@@ -46,7 +46,7 @@ export async function allocateBackordersForProducts(
   if (directIds.length === 0) return result
 
   // Walk only through KIT parents to every depth. BOM parents are treated
-  // as leaf stock by expandFulfillmentRequirements — receiving a BOM's
+  // as leaf stock by expandFulfillmentRequirementsDecimal — receiving a BOM's
   // component doesn't improve BOM-line coverage (BOM orders need the
   // assembled BOM, not its components), so chasing through BOMs would
   // retry orders whose fulfillable qty didn't actually increase.
@@ -112,7 +112,7 @@ export async function allocateBackordersForProducts(
       if (!line.productId) continue
       requirementsByLine.set(
         line.id,
-        requirementsMapToRows(expandFulfillmentRequirements(line.productId, 1, graph)),
+        requirementsMapToRows(expandFulfillmentRequirementsDecimal(line.productId, 1, graph)),
       )
     }
   }
