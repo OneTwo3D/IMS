@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { Prisma } from '@/app/generated/prisma/client'
 import {
   LANDED_COST_DISTRIBUTION_METHODS,
   calculateLayerAdjustmentDeltas,
@@ -34,6 +35,16 @@ function grossFor(amountBase: number, distributionMethod: string): Record<string
     lines: baseLines,
     directCostLines: [{ amountBase, distributionMethod }],
   }))
+}
+
+function deltasToNumbers(input: ReturnType<typeof calculateLayerAdjustmentDeltas>): Record<string, number> {
+  return {
+    costDelta: input.costDelta.toNumber(),
+    consumedQty: input.consumedQty.toNumber(),
+    netConsumedQty: input.netConsumedQty.toNumber(),
+    cogsDelta: input.cogsDelta.toNumber(),
+    inventoryDelta: input.inventoryDelta.toNumber(),
+  }
 }
 
 test('centralizes supported landed-cost distribution methods', () => {
@@ -88,14 +99,14 @@ test('combines direct and linked landed-cost sources', () => {
 })
 
 test('retrospective layer adjustment splits inventory and consumed COGS deltas', () => {
-  assert.deepEqual(calculateLayerAdjustmentDeltas({
+  assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
     oldUnitCost: 10,
     newUnitCost: 12,
     receivedQty: 10,
     remainingQty: 4,
     returnedQty: 1,
     supplierReturnedQty: 2,
-  }), {
+  })), {
     costDelta: 2,
     consumedQty: 6,
     netConsumedQty: 3,
@@ -105,14 +116,14 @@ test('retrospective layer adjustment splits inventory and consumed COGS deltas',
 })
 
 test('retrospective layer adjustment handles landed-cost decreases', () => {
-  assert.deepEqual(calculateLayerAdjustmentDeltas({
+  assert.deepEqual(deltasToNumbers(calculateLayerAdjustmentDeltas({
     oldUnitCost: 12,
     newUnitCost: 10,
     receivedQty: 8,
     remainingQty: 5,
     returnedQty: 0,
     supplierReturnedQty: 0,
-  }), {
+  })), {
     costDelta: -2,
     consumedQty: 3,
     netConsumedQty: 3,
@@ -131,9 +142,24 @@ test('retrospective layer adjustment excludes customer and supplier returns from
     supplierReturnedQty: 2,
   })
 
-  assert.equal(deltas.netConsumedQty, 0)
-  assert.equal(deltas.cogsDelta, 0)
-  assert.equal(deltas.inventoryDelta, 8)
+  assert.equal(deltas.netConsumedQty.toNumber(), 0)
+  assert.equal(deltas.cogsDelta.toNumber(), 0)
+  assert.equal(deltas.inventoryDelta.toNumber(), 8)
+})
+
+test('retrospective layer adjustment uses Decimal arithmetic for fractional landed-cost deltas', () => {
+  const deltas = calculateLayerAdjustmentDeltas({
+    oldUnitCost: '0.10',
+    newUnitCost: '0.30',
+    receivedQty: '3',
+    remainingQty: '1',
+    returnedQty: '0',
+    supplierReturnedQty: '0',
+  })
+
+  assert.equal(deltas.costDelta.toString(), '0.2')
+  assert.equal(deltas.cogsDelta.toString(), '0.4')
+  assert.equal(deltas.inventoryDelta.toString(), '0.2')
 })
 
 test('landed-cost adjustment idempotency key ignores wall-clock journal date', () => {
@@ -194,6 +220,35 @@ function createDirectTx(po: unknown) {
       },
     },
   }
+}
+
+async function directRecalcForSingleLayer(params: {
+  unitCostBase: Prisma.Decimal | number | string
+  costLayerUnitCostBase: Prisma.Decimal | number | string
+  amountBase: Prisma.Decimal | number | string
+}) {
+  const { tx } = createDirectTx({
+    id: 'po-1',
+    reference: 'PO-1',
+    status: 'RECEIVED',
+    lines: [{
+      id: 'line-a',
+      qty: 1,
+      unitCostBase: params.unitCostBase,
+      totalBase: 1,
+      product: { weight: 1 },
+      costLayers: [{
+        id: 'layer-a',
+        unitCostBase: params.costLayerUnitCostBase,
+        receivedQty: 1,
+        remainingQty: 1,
+      }],
+    }],
+    freightCostLines: [{ amountBase: params.amountBase, distributionMethod: 'BY_QUANTITY' }],
+    landedCostLinks: [],
+  })
+
+  return recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps())
 }
 
 test('recalculateDirectLandedCosts rejects CLOSED purchase orders', async () => {
@@ -355,4 +410,33 @@ test('recalculateDirectLandedCosts skips snapshot refresh when cost delta is neg
   }))
 
   assert.equal(snapshotRefreshes, 0)
+})
+
+test('recalculateDirectLandedCosts preserves legacy negative midpoint journal rounding', async () => {
+  const result = await directRecalcForSingleLayer({
+    unitCostBase: '0.98',
+    costLayerUnitCostBase: '1.00',
+    amountBase: '0.005',
+  })
+
+  assert.deepEqual(result.inventoryTransitAdjustments.map((adj) => adj.totalDelta), [-0.01])
+})
+
+test('landed-cost adjustment event keys normalize equivalent decimal input shapes', async () => {
+  const inputs = [
+    0.3,
+    '0.3',
+    0.30000000000000004,
+    new Prisma.Decimal('0.300000123456'),
+  ]
+  const eventKeys = await Promise.all(inputs.map(async (costLayerUnitCostBase) => {
+    const result = await directRecalcForSingleLayer({
+      unitCostBase: '0.30',
+      costLayerUnitCostBase,
+      amountBase: '1.00',
+    })
+    return result.inventoryTransitAdjustments[0]?.eventKey
+  }))
+
+  assert.equal(new Set(eventKeys).size, 1)
 })

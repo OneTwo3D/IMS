@@ -772,6 +772,56 @@ Run npm run validate and allocation tests.
 
 ---
 
+## PR 4.4 — Remove remaining landed-cost Decimal boundary contracts
+
+### Problem
+
+PR 4.2 keeps landed-cost delta math Decimal-safe internally, but three dependency contracts still cross a `number` boundary:
+
+```text
+getReturnedQtyForCostLayer
+getSupplierReturnedQtyForCostLayer
+updateSnapshotsForCostLayerChange
+```
+
+Returned quantities can be fractional, and cost-layer snapshots are auditable inventory records. Passing these values through `number` can still reintroduce binary floating-point drift at the edge of landed-cost revaluation.
+
+### Implementation
+
+Widen the landed-cost and cost-layer dependency contracts:
+
+```text
+- getReturnedQtyForCostLayer returns Prisma.Decimal
+- getSupplierReturnedQtyForCostLayer returns Prisma.Decimal
+- updateSnapshotsForCostLayerChange accepts Prisma.Decimal or a Decimal-safe input and serializes explicitly at the JSON boundary
+```
+
+Keep existing external JSON shape stable unless a migration plan is added.
+
+### Acceptance criteria
+
+```text
+- Landed-cost recalculation has no internal number boundary before accounting payload or JSON serialization.
+- Fractional return quantities keep Decimal precision through retrospective COGS calculations.
+- Snapshot JSON updates remain backward-compatible.
+- Existing landed-cost, FIFO, refund, and shipment COGS tests pass.
+```
+
+### Codex prompt
+
+```text
+Implement PR 4.4.
+
+Base branch: development.
+
+Remove the remaining number boundaries in landed-cost dependency contracts by widening returned-quantity helpers and cost-layer snapshot update inputs to Decimal-safe values.
+Keep JSON serialization explicit and backward-compatible.
+Add focused fractional-return and snapshot-boundary regression tests.
+Run npm run validate and landed-cost/FIFO/refund tests.
+```
+
+---
+
 # Stage 5 — WMS / Mintsoft webhook reliability
 
 ## Goal
