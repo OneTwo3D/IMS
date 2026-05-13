@@ -98,9 +98,11 @@ export {
   isMintsoftConfigured,
   MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE_ENV,
   MINTSOFT_AUTH_TOKEN_KEY,
+  MINTSOFT_LEGACY_SIGNATURE_SUNSET,
   normalizeMintsoftBaseUrl,
   testMintsoftConnectionSettings,
   verifyMintsoftWebhookSignature,
+  verifyMintsoftWebhookSignatureDetailed,
 } from './api/auth'
 export {
   buildMintsoftAsnCreateRequest,

@@ -27,7 +27,7 @@ Mintsoft is the WMS connector for stock alignment, ASN creation, product verific
 Mintsoft ASN booked-in webhooks must include:
 
 - `x-mintsoft-signature`: HMAC-SHA256 digest, hex or base64, optionally prefixed with `sha256=`.
-- A fresh timestamp, either in the payload (`timestamp`, `eventTime`, `occurredAt`, or `createdAt`) or in `x-mintsoft-timestamp` / `x-webhook-timestamp` / `x-timestamp`.
+- A fresh timestamp, either in `x-mintsoft-timestamp` / `x-webhook-timestamp` / `x-timestamp` or in the payload (`timestamp`, `eventTime`, `occurredAt`, or `createdAt`). Header timestamps take priority when both are present.
 
 The signed payload is:
 
@@ -35,7 +35,15 @@ The signed payload is:
 ${timestamp}.${rawBody}
 ```
 
-The `timestamp` string must be the exact value IMS uses for freshness validation. Body-only signatures are rejected by default. `MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE=true` temporarily accepts legacy `HMAC(secret, rawBody)` signatures for rollout compatibility, but webhooks still require a fresh timestamp.
+The `timestamp` string must be the exact value IMS uses for freshness validation. Prefer ISO-8601 timestamp strings. Numeric JSON timestamps are accepted, but the signature prefix must match the exact JSON numeric token in the raw body; for example, `1776852000.0` and `1776852000` are different signature prefixes. Body-only signatures are rejected by default. `MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE=true` temporarily accepts legacy `HMAC(secret, rawBody)` signatures for rollout compatibility, but webhooks still require a fresh timestamp.
+
+### Migration Runbook
+
+1. Discovery: before deploying this change, check recent sync activity for Mintsoft webhook signature failures and confirm which senders are still using body-only HMAC.
+2. Rollout: set `MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE=true` before deploying only if any sender still signs `HMAC(secret, rawBody)`.
+3. Sender migration: update each sender to sign `${timestamp}.${rawBody}` using the same timestamp value it sends to IMS, preferably in `x-mintsoft-timestamp`.
+4. Monitoring: watch activity-log entries with `action = 'mintsoft_webhook_legacy_signature_accepted'` and `metadata.signatureFormat = 'legacy-body-only'`.
+5. Sunset: disable the compatibility flag after 14 consecutive days with zero legacy-signature acceptance entries. Remove the flag by 2026-09-30.
 
 ## Product And Bundle Sync
 

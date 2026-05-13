@@ -894,6 +894,10 @@ Make Mintsoft webhook receipt durable, replay-safe, and asynchronous.
 
 Status: implemented in PR #55.
 
+Follow-up: remove `MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE` by 2026-09-30
+after operators see zero `mintsoft_webhook_legacy_signature_accepted` activity-log
+entries for 14 consecutive days.
+
 ### Problem
 
 Webhook replay protection must ensure the timestamp cannot be swapped independently of the signed body.

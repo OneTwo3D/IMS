@@ -208,7 +208,7 @@ Key variables in the `.env` file:
 | `WC_CONSUMER_KEY` | WooCommerce API consumer key |
 | `WC_CONSUMER_SECRET` | WooCommerce API consumer secret |
 | `WC_WEBHOOK_SECRET` | Secret for verifying WooCommerce webhooks |
-| `MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE` | Temporary Mintsoft webhook compatibility flag. Default `false`; set `true` only while migrating senders from body-only HMAC to timestamp-bound HMAC. |
+| `MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE` | Temporary Mintsoft webhook compatibility flag. Default `false`; set `true` only while migrating senders from body-only HMAC to timestamp-bound HMAC. Disable after 14 days with no `mintsoft_webhook_legacy_signature_accepted` activity-log entries; remove by 2026-09-30. |
 | `XERO_CLIENT_ID` | Xero OAuth client ID |
 | `XERO_CLIENT_SECRET` | Xero OAuth client secret |
 | `FX_BASE_CURRENCY` | Installer/default base currency seed for first-run setup. In normal use, the live system base currency is set once in **Settings > Company**. |

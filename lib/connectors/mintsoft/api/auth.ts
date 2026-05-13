@@ -12,6 +12,7 @@ export const MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE_ENV = 'MINTSOFT_ALLOW_LEG
 
 const AUTH_TOKEN_TTL_MS = 24 * 60 * 60 * 1000
 const AUTH_TOKEN_REFRESH_BUFFER_MS = 15 * 60 * 1000
+export const MINTSOFT_LEGACY_SIGNATURE_SUNSET = '2026-09-30'
 
 let mintsoftAuthRefreshInFlight: Promise<string> | null = null
 
@@ -282,6 +283,52 @@ export async function isMintsoftConfigured(): Promise<boolean> {
   )
 }
 
+export type MintsoftWebhookSignatureFormat = 'timestamp-bound' | 'legacy-body-only'
+
+export type MintsoftWebhookSignatureVerification = {
+  valid: boolean
+  format: MintsoftWebhookSignatureFormat | null
+}
+
+export function verifyMintsoftWebhookSignatureDetailed(
+  rawBody: string,
+  signatureHeader: string | null,
+  secret: string,
+  options?: {
+    timestamp?: string | null
+    allowLegacyBodyOnly?: boolean
+  },
+): MintsoftWebhookSignatureVerification {
+  const normalizedProvided = signatureHeader ? normalizeSignatureValue(signatureHeader) : ''
+  const normalizedSecret = secret.trim()
+  const timestamp = options?.timestamp?.trim()
+
+  if (!normalizedProvided || !normalizedSecret) return { valid: false, format: null }
+
+  const signedPayload = timestamp ? `${timestamp}.${rawBody}` : null
+  if (signedPayload) {
+    const expectedHex = createHmac('sha256', normalizedSecret).update(signedPayload, 'utf8').digest('hex')
+    const expectedBase64 = createHmac('sha256', normalizedSecret).update(signedPayload, 'utf8').digest('base64')
+
+    if (safeCompareSignature(expectedHex, normalizedProvided)
+      || safeCompareSignature(expectedBase64, normalizedProvided)) {
+      return { valid: true, format: 'timestamp-bound' }
+    }
+  }
+
+  if (!options?.allowLegacyBodyOnly) return { valid: false, format: null }
+
+  const legacyExpectedHex = createHmac('sha256', normalizedSecret).update(rawBody, 'utf8').digest('hex')
+  const legacyExpectedBase64 = createHmac('sha256', normalizedSecret).update(rawBody, 'utf8').digest('base64')
+
+  const legacyValid = safeCompareSignature(legacyExpectedHex, normalizedProvided)
+    || safeCompareSignature(legacyExpectedBase64, normalizedProvided)
+
+  return legacyValid
+    ? { valid: true, format: 'legacy-body-only' }
+    : { valid: false, format: null }
+}
+
 export function verifyMintsoftWebhookSignature(
   rawBody: string,
   signatureHeader: string | null,
@@ -291,30 +338,7 @@ export function verifyMintsoftWebhookSignature(
     allowLegacyBodyOnly?: boolean
   },
 ): boolean {
-  const normalizedProvided = signatureHeader ? normalizeSignatureValue(signatureHeader) : ''
-  const normalizedSecret = secret.trim()
-  const timestamp = options?.timestamp?.trim()
-
-  if (!normalizedProvided || !normalizedSecret) return false
-
-  const signedPayload = timestamp ? `${timestamp}.${rawBody}` : null
-  if (signedPayload) {
-    const expectedHex = createHmac('sha256', normalizedSecret).update(signedPayload, 'utf8').digest('hex')
-    const expectedBase64 = createHmac('sha256', normalizedSecret).update(signedPayload, 'utf8').digest('base64')
-
-    if (safeCompareSignature(expectedHex, normalizedProvided)
-      || safeCompareSignature(expectedBase64, normalizedProvided)) {
-      return true
-    }
-  }
-
-  if (!options?.allowLegacyBodyOnly) return false
-
-  const legacyExpectedHex = createHmac('sha256', normalizedSecret).update(rawBody, 'utf8').digest('hex')
-  const legacyExpectedBase64 = createHmac('sha256', normalizedSecret).update(rawBody, 'utf8').digest('base64')
-
-  return safeCompareSignature(legacyExpectedHex, normalizedProvided)
-    || safeCompareSignature(legacyExpectedBase64, normalizedProvided)
+  return verifyMintsoftWebhookSignatureDetailed(rawBody, signatureHeader, secret, options).valid
 }
 
 export function isLegacyMintsoftBodyOnlySignatureAllowed(

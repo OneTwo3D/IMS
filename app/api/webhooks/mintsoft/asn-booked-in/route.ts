@@ -6,10 +6,11 @@ import { logActivity } from '@/lib/activity-log'
 import {
   getMintsoftApiConfiguration,
   isLegacyMintsoftBodyOnlySignatureAllowed,
-  verifyMintsoftWebhookSignature,
+  MINTSOFT_LEGACY_SIGNATURE_SUNSET,
+  verifyMintsoftWebhookSignatureDetailed,
 } from '@/lib/connectors/mintsoft'
 import {
-  extractMintsoftWebhookTimestampCandidate,
+  extractMintsoftWebhookTimestampCandidateFromRequest,
   isMintsoftWebhookTimestampFresh,
 } from '@/lib/connectors/mintsoft/webhook-validation'
 import { processMintsoftBookedInEvent } from '@/lib/connectors/mintsoft/sync/booked-in-handler'
@@ -101,13 +102,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Empty request body' }, { status: 400 })
   }
 
-  let payload: MintsoftReceiptWebhookPayload
-  try {
-    payload = JSON.parse(rawBody) as MintsoftReceiptWebhookPayload
-  } catch {
-    return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 })
-  }
-
   const signatureHeader = request.headers.get('x-mintsoft-signature')
   const isPluginEnabled = await isIntegrationPluginEnabled('mintsoft')
   const { webhookSecret } = await getMintsoftApiConfiguration()
@@ -115,7 +109,7 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  const webhookTimestamp = extractMintsoftWebhookTimestampCandidate(payload as Record<string, unknown>, request.headers)
+  const webhookTimestamp = extractMintsoftWebhookTimestampCandidateFromRequest(rawBody, request.headers)
   if (!webhookTimestamp) {
     await logActivity({
       entityType: 'SYNC',
@@ -123,18 +117,17 @@ export async function POST(request: Request) {
       action: 'mintsoft_webhook_rejected_missing_timestamp',
       level: 'WARNING',
       description: 'Rejected Mintsoft ASN webhook without a signed timestamp',
-      metadata: {
-        externalAsnId: getExternalAsnId(payload),
-      },
+      metadata: {},
       resolveUser: false,
     })
     return NextResponse.json({ error: 'Missing webhook timestamp' }, { status: 401 })
   }
 
-  if (!verifyMintsoftWebhookSignature(rawBody, signatureHeader, webhookSecret, {
+  const signatureVerification = verifyMintsoftWebhookSignatureDetailed(rawBody, signatureHeader, webhookSecret, {
     timestamp: webhookTimestamp.value,
     allowLegacyBodyOnly: isLegacyMintsoftBodyOnlySignatureAllowed(),
-  })) {
+  })
+  if (!signatureVerification.valid) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
@@ -146,7 +139,6 @@ export async function POST(request: Request) {
       level: 'WARNING',
       description: 'Rejected Mintsoft ASN webhook with a stale signed timestamp',
       metadata: {
-        externalAsnId: getExternalAsnId(payload),
         timestamp: webhookTimestamp.date.toISOString(),
         timestampSource: webhookTimestamp.source,
         timestampKey: webhookTimestamp.key,
@@ -156,8 +148,33 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Stale webhook timestamp' }, { status: 401 })
   }
 
+  let payload: MintsoftReceiptWebhookPayload
+  try {
+    payload = JSON.parse(rawBody) as MintsoftReceiptWebhookPayload
+  } catch {
+    return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 })
+  }
+
   const externalEventId = getExternalEventId(payload, rawBody)
   const externalAsnId = getExternalAsnId(payload)
+
+  if (signatureVerification.format === 'legacy-body-only') {
+    await logActivity({
+      entityType: 'SYNC',
+      tag: 'sync',
+      action: 'mintsoft_webhook_legacy_signature_accepted',
+      level: 'WARNING',
+      description: 'Accepted Mintsoft ASN webhook using temporary legacy body-only signature verification',
+      metadata: {
+        externalEventId,
+        externalAsnId,
+        signatureFormat: signatureVerification.format,
+        legacyFlagSunset: MINTSOFT_LEGACY_SIGNATURE_SUNSET,
+      },
+      resolveUser: false,
+    })
+  }
+
   const eventInput: PersistMintsoftWebhookEventInput = {
     externalEventId,
     externalAsnId,

@@ -32,7 +32,13 @@ function parseWebhookTimestampValue(value: unknown): Date | null {
   }
 
   if (typeof value === 'string' && value.trim()) {
-    const parsed = new Date(value)
+    const trimmed = value.trim()
+    const numeric = /^-?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(trimmed) ? Number(trimmed) : null
+    if (numeric != null && Number.isFinite(numeric)) {
+      return parseWebhookTimestampValue(numeric)
+    }
+
+    const parsed = new Date(trimmed)
     return Number.isFinite(parsed.getTime()) ? parsed : null
   }
 
@@ -53,6 +59,8 @@ function getHeaderValue(
 }
 
 function timestampSignatureValue(value: unknown): string | null {
+  // Internal tests and non-route callers may pass pre-normalized Date values.
+  // JSON webhook request bodies never deserialize directly to Date instances.
   if (value instanceof Date) return value.toISOString()
   if (typeof value === 'number' && Number.isFinite(value)) return String(value)
   if (typeof value === 'string' && value.trim()) return value.trim()
@@ -84,6 +92,43 @@ export function extractMintsoftWebhookTimestamp(
   headers?: Headers | Record<string, string | undefined>,
 ): Date | null {
   return extractMintsoftWebhookTimestampCandidate(payload, headers)?.date ?? null
+}
+
+function parseRawJsonTimestampValue(rawValue: string): string | null {
+  const trimmed = rawValue.trim()
+  if (!trimmed) return null
+  if (trimmed.startsWith('"')) {
+    try {
+      const parsed = JSON.parse(trimmed) as unknown
+      return typeof parsed === 'string' && parsed.trim() ? parsed.trim() : null
+    } catch {
+      return null
+    }
+  }
+
+  return /^-?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(trimmed) ? trimmed : null
+}
+
+export function extractMintsoftWebhookTimestampCandidateFromRequest(
+  rawBody: string,
+  headers?: Headers | Record<string, string | undefined>,
+): MintsoftWebhookTimestampCandidate | null {
+  for (const key of MINTSOFT_WEBHOOK_TIMESTAMP_HEADERS) {
+    const headerValue = getHeaderValue(headers, key)
+    const value = timestampSignatureValue(headerValue)
+    const parsed = parseWebhookTimestampValue(headerValue)
+    if (value && parsed) return { date: parsed, value, source: 'header', key }
+  }
+
+  for (const key of MINTSOFT_WEBHOOK_TIMESTAMP_KEYS) {
+    const pattern = new RegExp(`"${key}"\\s*:\\s*("(?:\\\\.|[^"\\\\])*"|-?\\d+(?:\\.\\d+)?(?:e[+-]?\\d+)?)`, 'i')
+    const match = pattern.exec(rawBody)
+    const value = match?.[1] ? parseRawJsonTimestampValue(match[1]) : null
+    const parsed = value ? parseWebhookTimestampValue(value) : null
+    if (value && parsed) return { date: parsed, value, source: 'payload', key }
+  }
+
+  return null
 }
 
 export function isMintsoftWebhookTimestampFresh(
