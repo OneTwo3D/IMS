@@ -333,6 +333,8 @@ export async function updateSnapshotsForCostLayerChange(
   newUnitCostBase: DecimalInput,
 ): Promise<number> {
   const newUnitCost = toDecimal(newUnitCostBase)
+  // Snapshot JSON is legacy/audit data stored as a number, so values above
+  // JavaScript's double-precision ceiling are intentionally truncated here.
   const serializedUnitCostBase = newUnitCost.toNumber()
   // PostgreSQL jsonb_set can't easily iterate arrays. Use a raw UPDATE
   // that rewrites the unitCostBase for every matching array element.
@@ -364,7 +366,7 @@ export async function updateSnapshotsForCostLayerChange(
       if (!Array.isArray(row.costLayerSnapshot)) continue
       let changed = false
       const patched = (row.costLayerSnapshot as Array<Record<string, unknown>>).map((entry) => {
-        if (entry.costLayerId === costLayerId && !snapshotUnitCostMatches(entry.unitCostBase, newUnitCost)) {
+        if (entry.costLayerId === costLayerId && !snapshotUnitCostMatches(entry.unitCostBase, newUnitCost, costLayerId)) {
           changed = true
           return { ...entry, unitCostBase: serializedUnitCostBase }
         }
@@ -384,11 +386,32 @@ export async function updateSnapshotsForCostLayerChange(
   return updated
 }
 
-function snapshotUnitCostMatches(value: unknown, expected: Decimal): boolean {
+function snapshotUnitCostMatches(value: unknown, expected: Decimal, costLayerId: string): boolean {
+  if (value == null || value === '') {
+    warnMalformedSnapshotUnitCost(costLayerId, value)
+    return false
+  }
+
   try {
     return toDecimal(value as DecimalInput).eq(expected)
   } catch {
+    warnMalformedSnapshotUnitCost(costLayerId, value)
     return false
+  }
+}
+
+function warnMalformedSnapshotUnitCost(costLayerId: string, value: unknown): void {
+  console.warn(
+    `Malformed costLayerSnapshot unitCostBase for costLayerId=${costLayerId}; ` +
+    `rewriting value=${formatSnapshotWarningValue(value)}`,
+  )
+}
+
+function formatSnapshotWarningValue(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value)
+  } catch {
+    return String(value)
   }
 }
 

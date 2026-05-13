@@ -225,6 +225,107 @@ test('snapshot updates accept Decimal input and serialize the legacy JSON number
   }
 })
 
+test('snapshot updates document the JSON number precision boundary', async () => {
+  const runSnapshotUpdate = async (newUnitCostBase: Prisma.Decimal) => {
+    let snapshot: unknown = null
+    const tx = {
+      $queryRawUnsafe: async (sql: string) => (
+        sql.includes('"shipment_lines"')
+          ? [{
+            id: 'row-a',
+            costLayerSnapshot: [{ costLayerId: 'layer-a', qty: 1, unitCostBase: 1 }],
+          }]
+          : []
+      ),
+      $executeRawUnsafe: async (_sql: string, snapshotJson: string) => {
+        snapshot = JSON.parse(snapshotJson)
+        return 1
+      },
+    }
+
+    const updated = await updateSnapshotsForCostLayerChange(tx as never, 'layer-a', newUnitCostBase)
+    assert.equal(updated, 1)
+    return (snapshot as Array<{ unitCostBase: number }>)[0].unitCostBase
+  }
+
+  assert.equal(await runSnapshotUpdate(new Prisma.Decimal('1.123456789012345')), 1.123456789012345)
+  assert.equal(await runSnapshotUpdate(new Prisma.Decimal('1.1234567890123456789')), 1.1234567890123457)
+})
+
+test('snapshot updates rewrite malformed unit costs and emit warnings', async () => {
+  const updates: unknown[] = []
+  const warnings: string[] = []
+  const originalWarn = console.warn
+  console.warn = (message?: unknown) => {
+    warnings.push(String(message))
+  }
+
+  try {
+    const tx = {
+      $queryRawUnsafe: async (sql: string) => (
+        sql.includes('"shipment_lines"')
+          ? [{
+            id: 'row-a',
+            costLayerSnapshot: [
+              { costLayerId: 'layer-a', qty: 1, unitCostBase: null },
+              { costLayerId: 'layer-a', qty: 1, unitCostBase: 'abc' },
+              { costLayerId: 'layer-a', qty: 1, unitCostBase: {} },
+              { costLayerId: 'layer-b', qty: 1, unitCostBase: 5 },
+            ],
+          }]
+          : []
+      ),
+      $executeRawUnsafe: async (_sql: string, snapshotJson: string) => {
+        updates.push(JSON.parse(snapshotJson))
+        return 1
+      },
+    }
+
+    const updated = await updateSnapshotsForCostLayerChange(tx as never, 'layer-a', new Prisma.Decimal('9.25'))
+
+    assert.equal(updated, 1)
+    assert.equal(warnings.length, 3)
+    assert.ok(warnings.every((warning) => warning.includes('costLayerId=layer-a')))
+    assert.match(warnings[0], /value=null/)
+    assert.match(warnings[1], /value="abc"/)
+    assert.match(warnings[2], /value=\{\}/)
+    assert.deepEqual(updates, [[
+      { costLayerId: 'layer-a', qty: 1, unitCostBase: 9.25 },
+      { costLayerId: 'layer-a', qty: 1, unitCostBase: 9.25 },
+      { costLayerId: 'layer-a', qty: 1, unitCostBase: 9.25 },
+      { costLayerId: 'layer-b', qty: 1, unitCostBase: 5 },
+    ]])
+  } finally {
+    console.warn = originalWarn
+  }
+})
+
+test('snapshot updates skip rows whose unit cost already matches', async () => {
+  let executed = false
+  const tx = {
+    $queryRawUnsafe: async (sql: string) => (
+      sql.includes('"shipment_lines"')
+        ? [{
+          id: 'row-a',
+          costLayerSnapshot: [
+            { costLayerId: 'layer-a', qty: 1, unitCostBase: 14.123456 },
+            { costLayerId: 'layer-b', qty: 1, unitCostBase: 5 },
+          ],
+        }]
+        : []
+    ),
+    $executeRawUnsafe: async () => {
+      executed = true
+      return 1
+    },
+  }
+
+  const updated = await updateSnapshotsForCostLayerChange(tx as never, 'layer-a', new Prisma.Decimal('14.123456'))
+
+  assert.equal(updated, 0)
+  assert.equal(executed, false)
+})
+
 test('landed-cost adjustment idempotency key ignores wall-clock journal date', () => {
   const adj = { primaryPoId: 'po-1', primaryPoRef: 'PO-1', eventKey: 'event-a', totalDelta: 12.345 }
 

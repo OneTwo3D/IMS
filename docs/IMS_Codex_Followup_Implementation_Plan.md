@@ -822,6 +822,66 @@ Run npm run validate and landed-cost/FIFO/refund tests.
 
 ---
 
+## PR 4.5 — Decimalize manufacturing cost revaluation and rounding policy
+
+### Problem
+
+PR 4.4 removes the landed-cost dependency number boundaries, but `recalculateManufacturingCostLayers` still mirrors the old revaluation pattern:
+
+```text
+unitDelta
+returnedQty conversion
+consumedQty
+netCogsDeltaBase
+netInventoryDeltaBase
+```
+
+Those values are still calculated as `number`, and `recomputeManufacturingUnitCosts` returns number-shaped unit costs. This is a separate manufacturing-costing path, so it should be fixed in its own reviewable PR rather than hidden inside the landed-cost contract cleanup.
+
+Stage 4 also still needs an explicit rounding policy decision for journal totals and the remaining temporary `legacy-pre-stage-4` Decimal boundary comments in refund and shipment paths.
+
+### Implementation
+
+Refactor manufacturing cost-layer revaluation to use Decimal-safe helpers internally:
+
+```text
+- recomputeManufacturingUnitCosts input and output contracts
+- recalculateManufacturingCostLayers unit deltas and returned quantities
+- consumed quantity, COGS delta, inventory delta, and net totals
+- snapshot refresh inputs
+```
+
+Only convert to number at Prisma writes, journal payload boundaries, JSON snapshot serialization, or UI display boundaries.
+
+Document the rounding policy for journal totals, including whether the system standard is HALF_UP, HALF_EVEN, or a connector-specific rule.
+
+Review and either remove or narrow the remaining `legacy-pre-stage-4` Decimal boundary comments in refund and shipment paths.
+
+### Acceptance criteria
+
+```text
+- Manufacturing cost-layer revaluation has no internal number boundary for unitDelta, consumedQty, returnedQty, COGS delta, or inventory delta.
+- Fractional manufacturing-cost recalculation has parity coverage against the landed-cost Decimal behavior.
+- Journal total rounding policy is documented and covered by tests.
+- Remaining legacy-pre-stage-4 Decimal boundary comments are removed, narrowed, or assigned to a later explicit task.
+- Existing manufacturing, landed-cost, refund, shipment, FIFO, and accounting tests pass.
+```
+
+### Codex prompt
+
+```text
+Implement PR 4.5.
+
+Base branch: development.
+
+Decimalize manufacturing cost-layer revaluation and the pure manufacturing unit-cost helper so fractional manufacturing-cost recalculations do not cross number boundaries internally.
+Document the journal rounding policy and add tests covering the selected policy.
+Review remaining legacy-pre-stage-4 Decimal boundary comments in refund and shipment paths and either remove/narrow them or add explicit follow-up tasks.
+Run npm run validate and manufacturing/landed-cost/refund/shipment tests.
+```
+
+---
+
 # Stage 5 — WMS / Mintsoft webhook reliability
 
 ## Goal
@@ -1869,6 +1929,8 @@ PR 3.2  reservedQty physical-only
 PR 4.1  Decimal boundary guard
 PR 4.2  Decimal landed-cost deltas
 PR 4.3  Decimal allocation maps
+PR 4.4  Decimal landed-cost boundary contracts
+PR 4.5  Decimal manufacturing revaluation and rounding policy
 ```
 
 ## Wave 3 — WMS reliability and security

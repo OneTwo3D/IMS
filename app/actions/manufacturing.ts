@@ -1412,6 +1412,8 @@ async function recalculateManufacturingCostLayers(
     })
 
     const unitDelta = r.newUnitCostBase - li.oldUnitCostBase
+    // TODO(stage-4): Decimalize manufacturing cost-layer revaluation so this
+    // path matches landed-cost precision and stops converting returnedQty here.
     const returnedQty = (await getReturnedQtyForCostLayer(tx, li.id)).toNumber()
     const consumedQty = li.receivedQty - li.remainingQty - returnedQty
     if (consumedQty > 0) {
