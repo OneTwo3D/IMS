@@ -23,6 +23,13 @@ import {
   stableHash,
 } from '@/lib/manufacturing-cost'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
+import {
+  addMoney,
+  multiplyMoney,
+  roundQuantity,
+  subtractMoney,
+  toDecimal,
+} from '@/lib/domain/math/decimal'
 import { COMPONENT_PRODUCT_STATUSES, OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { Prisma, type ProductionOrderStatus, type ProductionOrderType } from '@/app/generated/prisma/client'
 
@@ -1370,8 +1377,8 @@ async function recalculateManufacturingCostLayers(
   if (!po || po.status !== 'COMPLETED') return { cogsDeltaBase: 0, inventoryDeltaBase: 0 }
 
   const currentMfgCost = po.manufacturingCostLines.reduce(
-    (sum, line) => sum + Number(line.amountBase),
-    0,
+    (sum, line) => addMoney(sum, line.amountBase),
+    toDecimal(0),
   )
 
   const layers = await tx.costLayer.findMany({
@@ -1388,10 +1395,10 @@ async function recalculateManufacturingCostLayers(
 
   const layerInfos = layers.map((l) => ({
     id: l.id,
-    receivedQty: Number(l.receivedQty),
-    remainingQty: Number(l.remainingQty),
-    oldUnitCostBase: Number(l.unitCostBase),
-    base: l.sourceLines.reduce((s, sl) => s + Number(sl.totalCostBase), 0),
+    receivedQty: toDecimal(l.receivedQty),
+    remainingQty: toDecimal(l.remainingQty),
+    oldUnitCostBase: toDecimal(l.unitCostBase),
+    base: l.sourceLines.reduce((sum, sl) => addMoney(sum, sl.totalCostBase), toDecimal(0)),
   }))
   const recomputed = recomputeManufacturingUnitCosts(
     layerInfos.map(({ id, receivedQty, base }) => ({ id, receivedQty, base })),
@@ -1399,29 +1406,29 @@ async function recalculateManufacturingCostLayers(
   )
   const oldByLayer = new Map(layerInfos.map((l) => [l.id, l]))
 
-  let netCogsDeltaBase = 0
-  let netInventoryDeltaBase = 0
+  let netCogsDeltaBase = toDecimal(0)
+  let netInventoryDeltaBase = toDecimal(0)
   for (const r of recomputed) {
     const li = oldByLayer.get(r.layerId)
     if (!li) continue
-    if (Math.abs(r.newUnitCostBase - li.oldUnitCostBase) < 1e-6) continue
+    const unitDelta = subtractMoney(r.newUnitCostBase, li.oldUnitCostBase)
+    if (unitDelta.abs().lt('0.000001')) continue
 
     await tx.costLayer.update({
       where: { id: li.id },
       data: { unitCostBase: r.newUnitCostBase },
     })
 
-    const unitDelta = r.newUnitCostBase - li.oldUnitCostBase
     const returnedQty = await getReturnedQtyForCostLayer(tx, li.id)
-    const consumedQty = li.receivedQty - li.remainingQty - returnedQty
-    if (consumedQty > 0) {
-      netCogsDeltaBase += consumedQty * unitDelta
+    const consumedQty = li.receivedQty.sub(li.remainingQty).sub(returnedQty)
+    if (consumedQty.gt(0)) {
+      netCogsDeltaBase = addMoney(netCogsDeltaBase, multiplyMoney(consumedQty, unitDelta))
     }
     // The remainingQty units stayed in inventory; their value just shifted
     // by unitDelta. Capture so the caller can post the inventory leg of
     // the reclass journal.
-    if (li.remainingQty > 0) {
-      netInventoryDeltaBase += li.remainingQty * unitDelta
+    if (li.remainingQty.gt(0)) {
+      netInventoryDeltaBase = addMoney(netInventoryDeltaBase, multiplyMoney(li.remainingQty, unitDelta))
     }
 
     await updateSnapshotsForCostLayerChange(tx, li.id, r.newUnitCostBase)
@@ -1430,8 +1437,8 @@ async function recalculateManufacturingCostLayers(
   }
 
   return {
-    cogsDeltaBase: Math.round(netCogsDeltaBase * 1_000_000) / 1_000_000,
-    inventoryDeltaBase: Math.round(netInventoryDeltaBase * 1_000_000) / 1_000_000,
+    cogsDeltaBase: roundQuantity(netCogsDeltaBase, 6).toNumber(),
+    inventoryDeltaBase: roundQuantity(netInventoryDeltaBase, 6).toNumber(),
   }
 }
 

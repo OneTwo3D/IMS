@@ -330,8 +330,12 @@ export async function copyCostLayerSourceLinesProportionally(
 export async function updateSnapshotsForCostLayerChange(
   tx: TxClient,
   costLayerId: string,
-  newUnitCostBase: number,
+  newUnitCostBase: DecimalInput,
 ): Promise<number> {
+  const newUnitCost = toDecimal(newUnitCostBase)
+  // Snapshot JSON is legacy/audit data stored as a number, so values above
+  // JavaScript's double-precision ceiling are intentionally truncated here.
+  const serializedUnitCostBase = newUnitCost.toNumber()
   // PostgreSQL jsonb_set can't easily iterate arrays. Use a raw UPDATE
   // that rewrites the unitCostBase for every matching array element.
   // The query: for each row whose costLayerSnapshot contains an entry
@@ -362,9 +366,9 @@ export async function updateSnapshotsForCostLayerChange(
       if (!Array.isArray(row.costLayerSnapshot)) continue
       let changed = false
       const patched = (row.costLayerSnapshot as Array<Record<string, unknown>>).map((entry) => {
-        if (entry.costLayerId === costLayerId && entry.unitCostBase !== newUnitCostBase) {
+        if (entry.costLayerId === costLayerId && !snapshotUnitCostMatches(entry.unitCostBase, newUnitCost, costLayerId)) {
           changed = true
-          return { ...entry, unitCostBase: newUnitCostBase }
+          return { ...entry, unitCostBase: serializedUnitCostBase }
         }
         return entry
       })
@@ -382,6 +386,35 @@ export async function updateSnapshotsForCostLayerChange(
   return updated
 }
 
+function snapshotUnitCostMatches(value: unknown, expected: Decimal, costLayerId: string): boolean {
+  if (value == null || value === '') {
+    warnMalformedSnapshotUnitCost(costLayerId, value)
+    return false
+  }
+
+  try {
+    return toDecimal(value as DecimalInput).eq(expected)
+  } catch {
+    warnMalformedSnapshotUnitCost(costLayerId, value)
+    return false
+  }
+}
+
+function warnMalformedSnapshotUnitCost(costLayerId: string, value: unknown): void {
+  console.warn(
+    `Malformed costLayerSnapshot unitCostBase for costLayerId=${costLayerId}; ` +
+    `rewriting value=${formatSnapshotWarningValue(value)}`,
+  )
+}
+
+function formatSnapshotWarningValue(value: unknown): string {
+  try {
+    return JSON.stringify(value) ?? String(value)
+  } catch {
+    return String(value)
+  }
+}
+
 /**
  * Sum physically returned quantity for a cost layer by reading refund-line
  * snapshots on refunds that actually returned stock to a warehouse.
@@ -389,7 +422,7 @@ export async function updateSnapshotsForCostLayerChange(
 export async function getReturnedQtyForCostLayer(
   tx: TxClient,
   costLayerId: string,
-): Promise<number> {
+): Promise<Decimal> {
   const containsCostLayer = JSON.stringify([{ costLayerId }])
   const rows = await tx.$queryRawUnsafe<Array<{ costLayerSnapshot: unknown }>>(
     `SELECT srl."costLayerSnapshot"
@@ -409,7 +442,7 @@ export async function getReturnedQtyForCostLayer(
     }
   }
 
-  return returnedQty.toNumber()
+  return returnedQty
 }
 
 /**
@@ -420,7 +453,7 @@ export async function getReturnedQtyForCostLayer(
 export async function getSupplierReturnedQtyForCostLayer(
   tx: TxClient,
   costLayerId: string,
-): Promise<number> {
+): Promise<Decimal> {
   const rows = await tx.cogsEntry.findMany({
     where: {
       costLayerId,
@@ -428,7 +461,7 @@ export async function getSupplierReturnedQtyForCostLayer(
     },
     select: { qty: true },
   })
-  return rows.reduce((sum, row) => addMoney(sum, row.qty), toDecimal(0)).toNumber()
+  return rows.reduce((sum, row) => addMoney(sum, row.qty), toDecimal(0))
 }
 
 /**

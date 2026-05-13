@@ -1,9 +1,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
 import { consumeFifoLayersStrict, refreshSalesOrderLineCogs } from '@/lib/cost-layers'
-// decimal-boundary-ok: legacy-pre-stage-4 (shipment quantity boundary; staged Decimal refactor follows)
-import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
-import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import {
   validateSalesOrderStatusTransition,
   validateShipmentStatusTransition,
@@ -15,6 +13,14 @@ import {
 } from '@/lib/domain/sales/allocation-service'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
+
+/**
+ * Deliberate call-site boundary for this number-shaped shipment service contract.
+ * Do not treat this as Decimal-internal arithmetic.
+ */
+function shipmentBoundaryNumber(value: DecimalInput): number {
+  return toDecimal(value).toNumber()
+}
 
 export type ShipmentServiceClient = Prisma.TransactionClient | typeof db
 
@@ -36,7 +42,7 @@ export type ShipmentTransitionContext = {
     id: string
     lineId: string
     productId: string
-    qty: DecimalLike
+    qty: DecimalInput
     product: { sku: string }
   }>
 }
@@ -92,7 +98,7 @@ function shipmentLineDispatchFingerprint(line: ShipmentTransitionContext['lines'
     line.id,
     line.lineId,
     line.productId,
-    decimalToNumber(line.qty),
+    shipmentBoundaryNumber(line.qty),
   ].join('|')
 }
 
@@ -135,14 +141,14 @@ export async function confirmSalesOrderShipments(
       const key = `${shipmentLine.lineId}|${shipmentLine.shipment.warehouseId}|${shipmentLine.productId}`
       committedByAllocationKey.set(
         key,
-        (committedByAllocationKey.get(key) ?? 0) + decimalToNumber(shipmentLine.qty),
+        (committedByAllocationKey.get(key) ?? 0) + shipmentBoundaryNumber(shipmentLine.qty),
       )
     }
 
     const effectiveAllocs = allocs.map((alloc) => {
       const key = `${alloc.lineId}|${alloc.warehouseId}|${alloc.productId}`
       const committed = committedByAllocationKey.get(key) ?? 0
-      const effectiveQty = Math.max(0, decimalToNumber(alloc.qty) - committed)
+      const effectiveQty = Math.max(0, shipmentBoundaryNumber(alloc.qty) - committed)
       return { ...alloc, qty: effectiveQty }
     }).filter((alloc) => alloc.qty > 0)
 
@@ -194,7 +200,7 @@ export async function confirmSalesOrderShipments(
         id: created.id,
         warehouseId,
         lineCount: whAllocs.length,
-        totalQty: whAllocs.reduce((sum, allocation) => sum + decimalToNumber(allocation.qty), 0),
+        totalQty: whAllocs.reduce((sum, allocation) => sum + shipmentBoundaryNumber(allocation.qty), 0),
       })
     }
 
@@ -293,7 +299,7 @@ export async function transitionShipmentStatus(
       await lockStockLevels(tx, lockedProductIds, [lockedShipment.warehouseId])
       let totalShipmentCogs = toDecimal(0)
       for (const line of lockedShipment.lines) {
-        const qty = decimalToNumber(line.qty)
+        const qty = shipmentBoundaryNumber(line.qty)
         const qtyForDb = String(line.qty ?? 0)
         const updatedStock = await tx.stockLevel.updateMany({
           where: {

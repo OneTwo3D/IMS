@@ -9,14 +9,20 @@ import {
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
-// decimal-boundary-ok: legacy-pre-stage-4 (refund quantity/accounting boundary; staged Decimal refactor follows)
-import { decimalToNumber } from '@/lib/decimal'
-import { roundQuantity } from '@/lib/domain/math/decimal'
+import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { validateRefundSalesOrderStatusUpdate } from '@/lib/domain/workflows/action-guards'
 
 export const REFUND_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 export const REFUND_ACCOUNTING_LOCK_KEY = 4_112_208_031
+
+/**
+ * Deliberate call-site boundary for this number-shaped refund service contract.
+ * Do not treat this as Decimal-internal arithmetic.
+ */
+function refundBoundaryNumber(value: DecimalInput): number {
+  return toDecimal(value).toNumber()
+}
 
 export type RefundServiceClient = Prisma.TransactionClient | typeof db
 
@@ -244,13 +250,13 @@ async function buildRefundFallbackReturnRows(
   }
 
   for (const allocation of order.allocations) {
-    addSourceQty(allocation.lineId, allocation.productId, decimalToNumber(allocation.qty))
+    addSourceQty(allocation.lineId, allocation.productId, refundBoundaryNumber(allocation.qty))
   }
   for (const shipment of order.shipments) {
     for (const line of shipment.lines) {
       const existing = sourceRowsByLine.get(line.lineId)
       if (existing && existing.size > 0) continue
-      addSourceQty(line.lineId, line.productId, decimalToNumber(line.qty))
+      addSourceQty(line.lineId, line.productId, refundBoundaryNumber(line.qty))
     }
   }
 
@@ -261,7 +267,7 @@ async function buildRefundFallbackReturnRows(
       if (!refundLine.productId) continue
       priorReturnedByProduct.set(
         refundLine.productId,
-        (priorReturnedByProduct.get(refundLine.productId) ?? 0) + decimalToNumber(refundLine.qty),
+        (priorReturnedByProduct.get(refundLine.productId) ?? 0) + refundBoundaryNumber(refundLine.qty),
       )
     }
   }
@@ -293,7 +299,7 @@ async function buildRefundFallbackReturnRows(
     }
 
     const sourceRows = sourceRowsByLine.get(sourceLine.id)
-    const sourceLineQty = decimalToNumber(sourceLine.qty)
+    const sourceLineQty = refundBoundaryNumber(sourceLine.qty)
     if (!sourceRows || sourceRows.size === 0 || !Number.isFinite(sourceLineQty) || sourceLineQty <= 0) {
       return [{ productId: sourceLine.productId ?? line.productId, qty: line.qty }]
     }
@@ -343,7 +349,7 @@ export async function applyReturnInboundStockTx(
     return existingMovements.map((movement) => ({
       productId: movement.productId,
       sku: skuByProductId.get(movement.productId) ?? movement.productId,
-      qty: decimalToNumber(movement.qty),
+      qty: refundBoundaryNumber(movement.qty),
     }))
   }
 
@@ -436,7 +442,7 @@ function consumeRefundLineQuantity(
   let assignedRevenue = 0
   const lineAllocations: Array<{ lineId: string; shippedQty: number; unshippedQty: number }> = []
   const refundUnitPrice = refundLine.unitPriceBase != null
-    ? decimalToNumber(refundLine.unitPriceBase)
+    ? refundBoundaryNumber(refundLine.unitPriceBase)
     : (refundLine.qty > 0 ? refundLine.totalBase / refundLine.qty : null)
 
   const priceMatches = (unitRevenue: number, candidateUnitPrice: number | null): boolean => {
@@ -615,7 +621,7 @@ async function stageRefundAccountingReversals(
       : []
     const productIdByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, layer.productId]))
     const poLineIdByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, layer.poLineId]))
-    const currentUnitCostByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, decimalToNumber(layer.unitCostBase)]))
+    const currentUnitCostByCostLayerId = new Map(referencedCostLayers.map((layer) => [layer.id, refundBoundaryNumber(layer.unitCostBase)]))
     const refreshSnapshotCosts = (entries: CostLayerSnapshotEntry[]): CostLayerSnapshotEntry[] => (
       entries.map((entry) => ({
         ...entry,
@@ -630,7 +636,7 @@ async function stageRefundAccountingReversals(
       const linesPayload = (payload as { lines?: Array<{ accountCode?: string; debit?: number; credit?: number }> } | null)?.lines
       if (!Array.isArray(linesPayload)) return 0
       return linesPayload.reduce((sum, line) => (
-        line.accountCode === accountCode ? sum + decimalToNumber(line.debit ?? 0) : sum
+        line.accountCode === accountCode ? sum + refundBoundaryNumber(line.debit ?? 0) : sum
       ), 0)
     }
 
@@ -642,19 +648,19 @@ async function stageRefundAccountingReversals(
       id: line.id,
       productId: line.productId,
       description: line.description,
-      qty: decimalToNumber(line.qty),
-      totalBase: decimalToNumber(line.totalBase),
+      qty: refundBoundaryNumber(line.qty),
+      totalBase: refundBoundaryNumber(line.totalBase),
     }))
 
     const shippedQtyByLine = new Map<string, number>()
     let totalRecognized = 0
 
     for (const shipment of orderAccounting?.shipments ?? []) {
-      totalRecognized += decimalToNumber(shipment.revenueRecognizedAmount)
+      totalRecognized += refundBoundaryNumber(shipment.revenueRecognizedAmount)
       for (const line of shipment.lines) {
         shippedQtyByLine.set(
           line.lineId,
-          (shippedQtyByLine.get(line.lineId) ?? 0) + decimalToNumber(line.qty),
+          (shippedQtyByLine.get(line.lineId) ?? 0) + refundBoundaryNumber(line.qty),
         )
       }
     }
@@ -679,9 +685,9 @@ async function stageRefundAccountingReversals(
             lineId: priorRefundLine.salesOrderLineId,
             productId: priorRefundLine.productId,
             description: priorRefundLine.description,
-            qty: decimalToNumber(priorRefundLine.qty),
-            totalBase: decimalToNumber(priorRefundLine.totalBase),
-            unitPriceBase: decimalToNumber(priorRefundLine.unitPriceBase),
+            qty: refundBoundaryNumber(priorRefundLine.qty),
+            totalBase: refundBoundaryNumber(priorRefundLine.totalBase),
+            unitPriceBase: refundBoundaryNumber(priorRefundLine.unitPriceBase),
           },
         )
       }
@@ -877,7 +883,7 @@ async function stageRefundAccountingReversals(
 
     const remainingUnearned = Math.round(Math.max(
       0,
-      decimalToNumber(params.so.unearnedRevenueAmount) - totalRecognized - priorUnearnedReversed,
+      refundBoundaryNumber(params.so.unearnedRevenueAmount) - totalRecognized - priorUnearnedReversed,
     ) * 100) / 100
     const shipmentRefundSnapshot = params.refundLines.flatMap((line) => (
       (refundLayerSnapshots.get(line.id) ?? []).filter((entry) => entry.source === 'shipment')
@@ -1046,7 +1052,7 @@ export async function createSalesOrderRefund(
     })
     if (!so) return { error: 'Order not found' } as const
 
-    const fxRate = decimalToNumber(so.fxRateToBase) || 1
+    const fxRate = refundBoundaryNumber(so.fxRateToBase) || 1
     if (
       input.returnWarehouseId &&
       refundLines.some((refundLine) => refundLine.productId && refundLine.qty > 0) &&
@@ -1059,8 +1065,8 @@ export async function createSalesOrderRefund(
       where: { orderId: input.orderId },
       select: { totalBase: true },
     })
-    const previouslyRefunded = existingRefunds.reduce((sum, refund) => sum + decimalToNumber(refund.totalBase), 0)
-    if (totalBase + previouslyRefunded > decimalToNumber(so.totalBase) * 1.001) {
+    const previouslyRefunded = existingRefunds.reduce((sum, refund) => sum + refundBoundaryNumber(refund.totalBase), 0)
+    if (totalBase + previouslyRefunded > refundBoundaryNumber(so.totalBase) * 1.001) {
       return { error: 'Refund total would exceed order total' } as const
     }
 
@@ -1073,7 +1079,7 @@ export async function createSalesOrderRefund(
       if (!refundLine.productId) continue
       refundedQtyByProduct.set(
         refundLine.productId,
-        (refundedQtyByProduct.get(refundLine.productId) ?? 0) + decimalToNumber(refundLine.qty),
+        (refundedQtyByProduct.get(refundLine.productId) ?? 0) + refundBoundaryNumber(refundLine.qty),
       )
     }
     const originalQtyByProduct = new Map<string, number>()
@@ -1081,7 +1087,7 @@ export async function createSalesOrderRefund(
       if (!salesLine.productId) continue
       originalQtyByProduct.set(
         salesLine.productId,
-        (originalQtyByProduct.get(salesLine.productId) ?? 0) + decimalToNumber(salesLine.qty),
+        (originalQtyByProduct.get(salesLine.productId) ?? 0) + refundBoundaryNumber(salesLine.qty),
       )
     }
     const soLineProductIds = new Set(
@@ -1155,17 +1161,17 @@ export async function createSalesOrderRefund(
         lineId: createdLine.salesOrderLineId ?? null,
         productId: createdLine.productId,
         description: createdLine.description,
-        qty: decimalToNumber(createdLine.qty),
-        unitPriceForeign: decimalToNumber(createdLine.unitPriceForeign),
-        unitPriceBase: decimalToNumber(createdLine.unitPriceBase),
-        totalForeign: decimalToNumber(createdLine.totalForeign),
-        totalBase: decimalToNumber(createdLine.totalBase),
+        qty: refundBoundaryNumber(createdLine.qty),
+        unitPriceForeign: refundBoundaryNumber(createdLine.unitPriceForeign),
+        unitPriceBase: refundBoundaryNumber(createdLine.unitPriceBase),
+        totalForeign: refundBoundaryNumber(createdLine.totalForeign),
+        totalBase: refundBoundaryNumber(createdLine.totalBase),
         lineKind: refundLine.lineKind === 'shipping' ? 'shipping' : 'sale',
       })
     }
 
     const totalRefundedNow = previouslyRefunded + totalBase
-    const orderTotal = decimalToNumber(so.totalBase)
+    const orderTotal = refundBoundaryNumber(so.totalBase)
     const newStatus: 'REFUNDED' | 'PARTIALLY_REFUNDED' = totalRefundedNow >= orderTotal * 0.999
       ? 'REFUNDED'
       : 'PARTIALLY_REFUNDED'
@@ -1332,11 +1338,11 @@ export async function retrySalesOrderRefundAccounting(
         lineId: line.salesOrderLineId,
         productId: line.productId,
         description: line.description,
-        qty: decimalToNumber(line.qty),
-        unitPriceForeign: decimalToNumber(line.unitPriceForeign),
-        unitPriceBase: decimalToNumber(line.unitPriceBase),
-        totalForeign: decimalToNumber(line.totalForeign),
-        totalBase: decimalToNumber(line.totalBase),
+        qty: refundBoundaryNumber(line.qty),
+        unitPriceForeign: refundBoundaryNumber(line.unitPriceForeign),
+        unitPriceBase: refundBoundaryNumber(line.unitPriceBase),
+        totalForeign: refundBoundaryNumber(line.totalForeign),
+        totalBase: refundBoundaryNumber(line.totalBase),
         lineKind: line.productId ? 'sale' : 'shipping',
       }))
       const newStatus = refund.order.status === 'REFUNDED' ? 'REFUNDED' : 'PARTIALLY_REFUNDED'
