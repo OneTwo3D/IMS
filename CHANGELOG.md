@@ -12,6 +12,10 @@ This repository uses an `x.y.z` release scheme.
 
 - **Decimal boundary guard.** Added `npm run check:decimal-boundaries` and wired it into `npm run validate` plus GitHub Actions so guarded domain/accounting paths must document any direct `decimalToNumber` import with a `decimal-boundary-ok:` rationale. The leading rationale token is now a closed vocabulary, and current `legacy-pre-stage-4` annotations mark Decimal conversion follow-up work planned for Stage 4. Developers rebasing older branches that touch guarded paths may need to add or narrow these comments before validation passes.
 
+### Fixes (landed-cost precision)
+
+- **Retrospective landed-cost deltas now use Decimal arithmetic internally.** Cost-layer revaluation now keeps unit-cost deltas, consumed quantities, COGS deltas, and inventory-in-transit deltas as `Prisma.Decimal` until the accounting payload or snapshot-refresh boundary. This removes binary floating-point drift from fractional landed-cost recalculations while preserving existing journal payload rounding, including the pre-existing `Math.round` behavior for negative half-cent deltas. Existing journal entries are not retroactively re-rounded.
+
 ### User-facing (sales allocation and backorders)
 
 - **Sales allocation now distinguishes physical reservations from backorder demand.** Auto-allocation reserves only stock that physically exists; oversell-eligible shortfalls remain unallocated and appear as backorder demand instead of inflating `reservedQty`. Operators may see existing phantom over-reservations corrected on the next re-allocation, with affected lines shown as `Backorder` or `Unallocated` in the sales-order allocation panel.

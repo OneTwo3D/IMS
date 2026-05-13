@@ -9,8 +9,6 @@ import {
   refreshShipmentCogsForCostLayerChange,
   updateSnapshotsForCostLayerChange,
 } from '@/lib/cost-layers'
-// decimal-boundary-ok: legacy-pre-stage-4 (landed-cost delta path; PR 4.2 converts this to Decimal)
-import { decimalToNumber } from '@/lib/decimal'
 
 export const LANDED_COST_DISTRIBUTION_METHODS = [
   'BY_VALUE',
@@ -60,23 +58,23 @@ type DistributionLine = {
 }
 
 type CostLayerAdjustmentInput = {
-  oldUnitCost: number
-  newUnitCost: number
-  receivedQty: number
-  remainingQty: number
-  returnedQty: number
-  supplierReturnedQty: number
+  oldUnitCost: Prisma.Decimal | number | string
+  newUnitCost: Prisma.Decimal | number | string
+  receivedQty: Prisma.Decimal | number | string
+  remainingQty: Prisma.Decimal | number | string
+  returnedQty: Prisma.Decimal | number | string
+  supplierReturnedQty: Prisma.Decimal | number | string
 }
 
 type LandedCostAdjustment = LandedCostRecalcResult['inventoryTransitAdjustments'][number]
 type LandedCostAdjustmentLayerContext = {
   costLayerId: string
-  oldUnitCost: number
-  newUnitCost: number
-  receivedQty: number
-  remainingQty: number
-  returnedQty: number
-  supplierReturnedQty: number
+  oldUnitCost: Prisma.Decimal
+  newUnitCost: Prisma.Decimal
+  receivedQty: Prisma.Decimal
+  remainingQty: Prisma.Decimal
+  returnedQty: Prisma.Decimal
+  supplierReturnedQty: Prisma.Decimal
 }
 
 export type LandedCostServiceDeps = {
@@ -96,6 +94,9 @@ const defaultDeps: LandedCostServiceDeps = {
   refreshSalesOrderLineCogsForCostLayerChange,
   warnWeightFallback,
 }
+
+const LANDED_COST_DELTA_EPSILON = new Prisma.Decimal('0.000001')
+const LANDED_COST_JOURNAL_EPSILON = new Prisma.Decimal('0.01')
 
 function decimal(value: Prisma.Decimal | number | string | null | undefined): Prisma.Decimal {
   return new Prisma.Decimal(value ?? 0)
@@ -126,26 +127,35 @@ export function computeDistributionBase(
   }
 }
 
+/**
+ * Accepts Decimal, number, or string inputs so focused tests and boundary
+ * callers can exercise exact decimal strings without building Prisma rows.
+ * The implementation normalizes immediately and keeps all internal math in
+ * Decimal until the accounting or snapshot-refresh boundary.
+ */
 export function calculateLayerAdjustmentDeltas(input: CostLayerAdjustmentInput): {
-  costDelta: number
-  consumedQty: number
-  netConsumedQty: number
-  cogsDelta: number
-  inventoryDelta: number
+  costDelta: Prisma.Decimal
+  consumedQty: Prisma.Decimal
+  netConsumedQty: Prisma.Decimal
+  cogsDelta: Prisma.Decimal
+  inventoryDelta: Prisma.Decimal
 } {
-  const costDelta = input.newUnitCost - input.oldUnitCost
-  const consumedQty = input.receivedQty - input.remainingQty
-  const netConsumedQty = Math.max(0, consumedQty - input.returnedQty - input.supplierReturnedQty)
+  const costDelta = decimal(input.newUnitCost).sub(decimal(input.oldUnitCost))
+  const consumedQty = decimal(input.receivedQty).sub(decimal(input.remainingQty))
+  const netConsumedQty = Prisma.Decimal.max(
+    new Prisma.Decimal(0),
+    consumedQty.sub(decimal(input.returnedQty)).sub(decimal(input.supplierReturnedQty)),
+  )
   return {
     costDelta,
     consumedQty,
     netConsumedQty,
-    cogsDelta: netConsumedQty > 0 && Math.abs(costDelta) > 0.000001
-      ? costDelta * netConsumedQty
-      : 0,
-    inventoryDelta: input.remainingQty > 0.000001 && Math.abs(costDelta) > 0.000001
-      ? costDelta * input.remainingQty
-      : 0,
+    cogsDelta: netConsumedQty.gt(0) && costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)
+      ? costDelta.mul(netConsumedQty)
+      : new Prisma.Decimal(0),
+    inventoryDelta: decimal(input.remainingQty).gt(LANDED_COST_DELTA_EPSILON) && costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)
+      ? costDelta.mul(decimal(input.remainingQty))
+      : new Prisma.Decimal(0),
   }
 }
 
@@ -173,8 +183,12 @@ function landedCostAdjustmentKeyPayload(adj: LandedCostAdjustment): Record<strin
   }
 }
 
-function roundAdjustmentContextValue(value: number): number {
-  return Math.round(value * 1_000_000) / 1_000_000
+function roundAdjustmentContextValue(value: Prisma.Decimal): number {
+  return value.toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP).toNumber()
+}
+
+function roundAdjustmentTotalDelta(value: Prisma.Decimal): number {
+  return Math.round(value.mul(100).toNumber()) / 100
 }
 
 function landedCostAdjustmentEventKey(
@@ -451,8 +465,8 @@ export async function recalculateLandedCosts(
       }
     }
 
-    let totalCogsDelta = 0
-    let totalInventoryDelta = 0
+    let totalCogsDelta = new Prisma.Decimal(0)
+    let totalInventoryDelta = new Prisma.Decimal(0)
     const adjustmentLayers: LandedCostAdjustmentLayerContext[] = []
 
     for (const line of primaryPo.lines) {
@@ -470,17 +484,17 @@ export async function recalculateLandedCosts(
       })
 
       for (const cl of line.costLayers) {
-        const oldUnitCost = decimalToNumber(cl.unitCostBase)
-        const newUnitCost = grossUnitCostBase.toNumber()
-        const receivedQty = decimalToNumber(cl.receivedQty)
-        const remainingQty = decimalToNumber(cl.remainingQty)
-        const consumedQty = receivedQty - remainingQty
-        const returnedQty = consumedQty > 0.000001
-          ? await deps.getReturnedQtyForCostLayer(tx, cl.id)
-          : 0
-        const supplierReturnedQty = consumedQty > 0.000001
-          ? await deps.getSupplierReturnedQtyForCostLayer(tx, cl.id)
-          : 0
+        const oldUnitCost = decimal(cl.unitCostBase)
+        const newUnitCost = grossUnitCostBase
+        const receivedQty = decimal(cl.receivedQty)
+        const remainingQty = decimal(cl.remainingQty)
+        const consumedQty = receivedQty.sub(remainingQty)
+        const returnedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
+          ? decimal(await deps.getReturnedQtyForCostLayer(tx, cl.id))
+          : new Prisma.Decimal(0)
+        const supplierReturnedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
+          ? decimal(await deps.getSupplierReturnedQtyForCostLayer(tx, cl.id))
+          : new Prisma.Decimal(0)
         const deltas = calculateLayerAdjustmentDeltas({
           oldUnitCost,
           newUnitCost,
@@ -489,9 +503,9 @@ export async function recalculateLandedCosts(
           returnedQty,
           supplierReturnedQty,
         })
-        totalCogsDelta += deltas.cogsDelta
-        totalInventoryDelta += deltas.inventoryDelta
-        if (Math.abs(deltas.cogsDelta) > 0.000001 || Math.abs(deltas.inventoryDelta) > 0.000001) {
+        totalCogsDelta = totalCogsDelta.add(deltas.cogsDelta)
+        totalInventoryDelta = totalInventoryDelta.add(deltas.inventoryDelta)
+        if (deltas.cogsDelta.abs().gt(LANDED_COST_DELTA_EPSILON) || deltas.inventoryDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
           adjustmentLayers.push({
             costLayerId: cl.id,
             oldUnitCost,
@@ -508,7 +522,7 @@ export async function recalculateLandedCosts(
           data: { unitCostBase: grossUnitCostBase },
         })
 
-        if (Math.abs(deltas.costDelta) > 0.000001) {
+        if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
           await deps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase.toNumber())
           await deps.refreshShipmentCogsForCostLayerChange(tx, cl.id)
           await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
@@ -519,20 +533,20 @@ export async function recalculateLandedCosts(
     result.revalidatePoIds.push(primaryPoId)
     const eventKey = landedCostAdjustmentEventKey(primaryPoId, adjustmentLayers)
 
-    if (Math.abs(totalCogsDelta) > 0.01) {
+    if (totalCogsDelta.abs().gt(LANDED_COST_JOURNAL_EPSILON)) {
       result.cogsAdjustments.push({
         primaryPoId,
         primaryPoRef: primaryPo.reference,
         eventKey,
-        totalDelta: Math.round(totalCogsDelta * 100) / 100,
+        totalDelta: roundAdjustmentTotalDelta(totalCogsDelta),
       })
     }
-    if (Math.abs(totalInventoryDelta) > 0.01) {
+    if (totalInventoryDelta.abs().gt(LANDED_COST_JOURNAL_EPSILON)) {
       result.inventoryTransitAdjustments.push({
         primaryPoId,
         primaryPoRef: primaryPo.reference,
         eventKey,
-        totalDelta: Math.round(totalInventoryDelta * 100) / 100,
+        totalDelta: roundAdjustmentTotalDelta(totalInventoryDelta),
       })
     }
 
@@ -629,8 +643,8 @@ export async function recalculateDirectLandedCosts(
     }
   }
 
-  let totalCogsDelta = 0
-  let totalInventoryDelta = 0
+  let totalCogsDelta = new Prisma.Decimal(0)
+  let totalInventoryDelta = new Prisma.Decimal(0)
   const adjustmentLayers: LandedCostAdjustmentLayerContext[] = []
 
   for (const line of po.lines) {
@@ -648,17 +662,17 @@ export async function recalculateDirectLandedCosts(
     })
 
     for (const cl of line.costLayers) {
-      const oldUnitCost = decimalToNumber(cl.unitCostBase)
-      const newUnitCost = grossUnitCostBase.toNumber()
-      const receivedQty = decimalToNumber(cl.receivedQty)
-      const remainingQty = decimalToNumber(cl.remainingQty)
-      const consumedQty = receivedQty - remainingQty
-      const returnedQty = consumedQty > 0.000001
-        ? await deps.getReturnedQtyForCostLayer(tx, cl.id)
-        : 0
-      const supplierReturnedQty = consumedQty > 0.000001
-        ? await deps.getSupplierReturnedQtyForCostLayer(tx, cl.id)
-        : 0
+      const oldUnitCost = decimal(cl.unitCostBase)
+      const newUnitCost = grossUnitCostBase
+      const receivedQty = decimal(cl.receivedQty)
+      const remainingQty = decimal(cl.remainingQty)
+      const consumedQty = receivedQty.sub(remainingQty)
+      const returnedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
+        ? decimal(await deps.getReturnedQtyForCostLayer(tx, cl.id))
+        : new Prisma.Decimal(0)
+      const supplierReturnedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
+        ? decimal(await deps.getSupplierReturnedQtyForCostLayer(tx, cl.id))
+        : new Prisma.Decimal(0)
       const deltas = calculateLayerAdjustmentDeltas({
         oldUnitCost,
         newUnitCost,
@@ -667,9 +681,9 @@ export async function recalculateDirectLandedCosts(
         returnedQty,
         supplierReturnedQty,
       })
-      totalCogsDelta += deltas.cogsDelta
-      totalInventoryDelta += deltas.inventoryDelta
-      if (Math.abs(deltas.cogsDelta) > 0.000001 || Math.abs(deltas.inventoryDelta) > 0.000001) {
+      totalCogsDelta = totalCogsDelta.add(deltas.cogsDelta)
+      totalInventoryDelta = totalInventoryDelta.add(deltas.inventoryDelta)
+      if (deltas.cogsDelta.abs().gt(LANDED_COST_DELTA_EPSILON) || deltas.inventoryDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
         adjustmentLayers.push({
           costLayerId: cl.id,
           oldUnitCost,
@@ -686,7 +700,7 @@ export async function recalculateDirectLandedCosts(
         data: { unitCostBase: grossUnitCostBase },
       })
 
-      if (Math.abs(deltas.costDelta) > 0.000001) {
+      if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
         await deps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase.toNumber())
         await deps.refreshShipmentCogsForCostLayerChange(tx, cl.id)
         await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
@@ -696,20 +710,20 @@ export async function recalculateDirectLandedCosts(
 
   const result: LandedCostRecalcResult = { revalidatePoIds: [poId], inventoryTransitAdjustments: [], cogsAdjustments: [] }
   const eventKey = landedCostAdjustmentEventKey(poId, adjustmentLayers)
-  if (Math.abs(totalInventoryDelta) > 0.01) {
+  if (totalInventoryDelta.abs().gt(LANDED_COST_JOURNAL_EPSILON)) {
     result.inventoryTransitAdjustments.push({
       primaryPoId: poId,
       primaryPoRef: po.reference,
       eventKey,
-      totalDelta: Math.round(totalInventoryDelta * 100) / 100,
+      totalDelta: roundAdjustmentTotalDelta(totalInventoryDelta),
     })
   }
-  if (Math.abs(totalCogsDelta) > 0.01) {
+  if (totalCogsDelta.abs().gt(LANDED_COST_JOURNAL_EPSILON)) {
     result.cogsAdjustments.push({
       primaryPoId: poId,
       primaryPoRef: po.reference,
       eventKey,
-      totalDelta: Math.round(totalCogsDelta * 100) / 100,
+      totalDelta: roundAdjustmentTotalDelta(totalCogsDelta),
     })
   }
   return result
