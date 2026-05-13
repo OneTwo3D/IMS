@@ -6,6 +6,7 @@ schema_scope_head_ref="${SCHEMA_SCOPE_HEAD_REF:-HEAD}"
 
 npm run lint
 npm run type-check
+npm run check:decimal-boundaries
 # Use direct Prisma generate so the baseline does not require DATABASE_URL.
 npx prisma generate --schema prisma/schema.prisma
 npm run test:unit

@@ -42,6 +42,31 @@ npx tsx --test tests/<relevant-file>.test.ts
 
 This repository treats `prisma/schema.prisma` as the canonical application schema. Migrations, deployment scripts, and CI all assume the Prisma schema and the live database describe the same shape unless a difference is intentionally documented as unsupported by Prisma.
 
+## Decimal Boundary Guard
+
+Guarded domain and accounting integration paths must not import `decimalToNumber` from `@/lib/decimal` unless the file carries an explicit boundary rationale comment:
+
+```ts
+// decimal-boundary-ok: display-only (UI serialization)
+```
+
+The guard is a first-line check for direct `decimalToNumber` imports. It runs in `npm run validate` and in the `Decimal Boundary Guard` GitHub Actions workflow through:
+
+```bash
+npm run check:decimal-boundaries
+```
+
+Guarded targets live in `scripts/decimal-boundary-targets.json`. The check fails if any configured target path or glob stops matching source files, so moved connector/domain code must update that config in the same PR.
+
+The leading rationale token must be one of:
+
+- `display-only`: conversion only serializes values for UI or API display payloads.
+- `report-only`: conversion only builds diagnostics, invariant findings, or other read-only reports.
+- `server-action-boundary`: conversion validates or normalizes user input at a server-action boundary before Decimal-safe domain logic.
+- `legacy-pre-stage-4`: temporary Stage 4 tech debt. Keep the parenthetical specific and remove or narrow this token when the Decimal refactor for that path lands.
+
+The comment is file-scoped rather than line-scoped so import formatting changes do not break validation. One file should use one leading rationale token; if a file appears to need mixed rationales, split the boundary or choose the stricter temporary rationale and explain the narrower cases in the parenthetical. This guard does not catch every Decimal-to-number bypass, such as direct `.toNumber()` calls or `Number(decimalValue)` on Decimal-typed values; those require a future typed-AST lint rule.
+
 ## Schema Workflow
 
 When changing the schema:

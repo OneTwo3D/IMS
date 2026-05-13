@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+// decimal-boundary-ok: report-only (derived backorder quantities)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { roundQuantity } from '@/lib/domain/math/decimal'
 import {

@@ -1,0 +1,45 @@
+name: Decimal Boundary Guard
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/decimal-boundary-guard.yml"
+      - "app/actions/accounting*.ts"
+      - "app/actions/xero*.ts"
+      - "docs/development.md"
+      - "lib/connectors/quickbooks/**"
+      - "lib/connectors/xero/**"
+      - "lib/cost-layers.ts"
+      - "lib/domain/**"
+      - "package-lock.json"
+      - "package.json"
+      - "scripts/check-domain-decimal-boundaries.mjs"
+      - "scripts/decimal-boundary-targets.json"
+      - "tests/scripts/domain-decimal-boundaries.test.ts"
+  push:
+    branches:
+      - development
+    paths:
+      - ".github/workflows/decimal-boundary-guard.yml"
+      - "app/actions/accounting*.ts"
+      - "app/actions/xero*.ts"
+      - "docs/development.md"
+      - "lib/connectors/quickbooks/**"
+      - "lib/connectors/xero/**"
+      - "lib/cost-layers.ts"
+      - "lib/domain/**"
+      - "package-lock.json"
+      - "package.json"
+      - "scripts/check-domain-decimal-boundaries.mjs"
+      - "scripts/decimal-boundary-targets.json"
+      - "tests/scripts/domain-decimal-boundaries.test.ts"
+
+jobs:
+  decimal-boundary-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm run check:decimal-boundaries

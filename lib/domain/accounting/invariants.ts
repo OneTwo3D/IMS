@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+// decimal-boundary-ok: report-only (accounting invariant finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 
 export type AccountingInvariantSeverity = 'info' | 'warning' | 'critical'

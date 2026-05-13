@@ -1,3 +1,4 @@
+// decimal-boundary-ok: display-only (UI/API stock-level map output)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { roundQuantity, subtractMoney } from '@/lib/domain/math/decimal'
 

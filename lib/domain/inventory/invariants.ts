@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
 import { parseCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
+// decimal-boundary-ok: report-only (inventory invariant finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 
 export type InventoryInvariantSeverity = 'info' | 'warning' | 'critical'

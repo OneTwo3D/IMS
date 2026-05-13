@@ -1,6 +1,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
 import { consumeFifoLayersStrict, refreshSalesOrderLineCogs } from '@/lib/cost-layers'
+// decimal-boundary-ok: legacy-pre-stage-4 (shipment quantity boundary; staged Decimal refactor follows)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import {
