@@ -249,6 +249,7 @@ There is no separate worker process. Background tasks are handled via HTTP endpo
 | Activity cleanup | `GET /api/cron/activity-cleanup` | Daily 03:00 | Purge activity log entries past retention |
 | Scheduled backup | `GET /api/cron/backup` | Daily 02:00 | Create backup, apply retention, upload to remote storage |
 | WooCommerce reconcile | `GET /api/cron/wc-reconcile` | Daily | Backup reconciliation for WooCommerce orders/products plus stock catch-up and queued retry draining |
+| Mintsoft webhook sweeper | `GET /api/cron/mintsoft-webhook-sweeper` | Every 5 minutes | Drain persisted Mintsoft ASN booked-in webhook events and apply stock/PO effects asynchronously |
 | Delivery status | `GET /api/cron/delivery-status` | Every 15 min | Poll delivery tracking providers for shipment status updates |
 
 All cron endpoints require the `CRON_SECRET` bearer header in production. Localhost bypass is available outside production only when no `CRON_SECRET` is configured; in production it is disabled unless `CRON_SECRET` is unset and `ALLOW_LOCALHOST_CRON_BYPASS=true` is set explicitly.

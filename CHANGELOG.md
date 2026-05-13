@@ -21,6 +21,11 @@ This repository uses an `x.y.z` release scheme.
 
 - **Allocation availability now uses Decimal arithmetic internally.** Sales allocation stock maps, product graph component quantities, kit requirement expansion, coverage checks, and reservation deltas now keep fractional quantities as `Prisma.Decimal` through the allocation service. This avoids binary floating-point drift when allocating fractional kit/component quantities while preserving existing UI and report number boundaries.
 
+### Fixes (Mintsoft webhook security)
+
+- **Mintsoft ASN booked-in webhooks now bind the freshness timestamp into the HMAC signature.** IMS verifies `HMAC_SHA256(secret, "${timestamp}.${rawBody}")` and rejects body-only signatures.
+- **Mintsoft ASN booked-in webhooks now acknowledge after durable persistence.** Accepted webhooks are stored idempotently in `wms_inbound_receipt_events` and return `202 Accepted`; the Mintsoft webhook sweeper applies stock and purchase-order effects asynchronously.
+
 ### User-facing (sales allocation and backorders)
 
 - **Sales allocation now distinguishes physical reservations from backorder demand.** Auto-allocation reserves only stock that physically exists; oversell-eligible shortfalls remain unallocated and appear as backorder demand instead of inflating `reservedQty`. Operators may see existing phantom over-reservations corrected on the next re-allocation, with affected lines shown as `Backorder` or `Unallocated` in the sales-order allocation panel.

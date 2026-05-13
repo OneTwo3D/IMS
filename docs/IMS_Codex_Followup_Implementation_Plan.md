@@ -892,6 +892,8 @@ Make Mintsoft webhook receipt durable, replay-safe, and asynchronous.
 
 ## PR 5.1 — Bind webhook timestamp to the HMAC signature
 
+Status: implemented in PR #55.
+
 ### Problem
 
 Webhook replay protection must ensure the timestamp cannot be swapped independently of the signed body.
@@ -905,11 +907,8 @@ signedPayload = `${timestamp}.${rawBody}`
 signature = HMAC_SHA256(webhookSecret, signedPayload)
 ```
 
-Accept legacy body-only signatures only behind an explicit temporary compatibility flag:
-
-```env
-MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE=false
-```
+Reject legacy body-only signatures. The system was not live when this stage
+landed, so no compatibility flag or fallback path is required.
 
 ### Acceptance criteria
 
@@ -917,7 +916,7 @@ MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE=false
 - Fresh signed timestamp + body succeeds.
 - Stale signed timestamp fails.
 - Valid body signature with tampered timestamp fails.
-- Legacy body-only mode disabled by default.
+- Legacy body-only signatures are rejected.
 - Docs updated.
 ```
 
@@ -930,15 +929,16 @@ Base branch: development.
 
 Update Mintsoft webhook signature validation so the timestamp is bound into the signed payload.
 Preferred signed payload format: `${timestamp}.${rawBody}`.
-Require the timestamp header or body timestamp used for freshness validation to be the same value included in signature verification.
-Add a temporary MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE flag defaulting false if compatibility is needed.
-Add tests for valid signature, stale timestamp, tampered timestamp, missing timestamp, and legacy mode.
+Require the timestamp header used for freshness validation to be the same value included in signature verification.
+Add tests for valid signature, stale timestamp, tampered timestamp, missing timestamp, and body-only rejection.
 Run npm run validate and Mintsoft webhook tests.
 ```
 
 ---
 
 ## PR 5.2 — Change Mintsoft webhook route to persist-and-202
+
+Status: implemented in PR #55.
 
 ### Problem
 
@@ -951,20 +951,20 @@ Change route flow:
 ```text
 validate body/signature/timestamp
 persist event idempotently
-enqueue outbox job or mark event pending for worker
+mark event pending for worker
 return 202 Accepted
 ```
 
 Do not process stock mutations inside the webhook request.
 
-Add worker:
+Use worker:
 
 ```text
 lib/jobs/wms/process-mintsoft-booked-in-events.ts
 app/api/cron/mintsoft-webhook-sweeper/route.ts
 ```
 
-Reuse existing sweeper where practical.
+The job delegates to the existing booked-in event sweeper.
 
 ### Acceptance criteria
 

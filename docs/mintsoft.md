@@ -19,8 +19,31 @@ Mintsoft is the WMS connector for stock alignment, ASN creation, product verific
 
 - IMS creates outbound ASN payloads for purchase orders and transfer lines.
 - Mintsoft callback metadata preserves the source type, source line, product, and expected quantity.
-- Booked-in webhook processing is idempotent via `wms_inbound_receipt_events`.
+- Booked-in webhook receipt is idempotent via `wms_inbound_receipt_events`.
+- Accepted webhooks are persisted and acknowledged with `202 Accepted`; stock and purchase-order mutations run later through `/api/cron/mintsoft-webhook-sweeper`.
 - Line deltas are applied only for previously unaccounted received quantities.
+
+## Booked-In Webhook Signing
+
+Mintsoft ASN booked-in webhooks must include:
+
+- `x-mintsoft-signature`: HMAC-SHA256 digest, hex or base64, optionally prefixed with `sha256=`.
+- A fresh timestamp in `x-mintsoft-timestamp`, `x-webhook-timestamp`, or `x-timestamp`. New senders should use `x-mintsoft-timestamp`.
+
+The signed payload is:
+
+```text
+${timestamp}.${rawBody}
+```
+
+The `timestamp` string must be the exact header value IMS uses for freshness validation. Prefer ISO-8601 timestamp strings. Numeric timestamp headers are accepted, but the signature prefix must match the exact header value; for example, `1776852000.0` and `1776852000` are different signature prefixes. Body-only signatures and payload-only timestamps are rejected.
+
+### Migration Runbook
+
+1. Discovery: before deploying this change, check recent sync activity for Mintsoft webhook signature failures and confirm which senders are still using body-only HMAC.
+2. Sender migration: update each sender to send `x-mintsoft-timestamp` and sign `${timestamp}.${rawBody}` using that exact header value.
+3. Rollout: deploy only after every sender signs timestamp-bound payloads and sends the timestamp header. Body-only signatures and payload-only timestamps are intentionally unsupported.
+4. Monitoring: watch sync activity for `mintsoft_webhook_rejected_missing_timestamp`, `mintsoft_webhook_rejected_stale_timestamp`, and unauthorized responses from the webhook route.
 
 ## Product And Bundle Sync
 

@@ -13,6 +13,13 @@ const MINTSOFT_WEBHOOK_TIMESTAMP_HEADERS = [
   'x-timestamp',
 ] as const
 
+export type MintsoftWebhookTimestampCandidate = {
+  date: Date
+  value: string
+  source: 'payload' | 'header'
+  key: string
+}
+
 function parseWebhookTimestampValue(value: unknown): Date | null {
   if (value instanceof Date) {
     return Number.isFinite(value.getTime()) ? value : null
@@ -25,7 +32,13 @@ function parseWebhookTimestampValue(value: unknown): Date | null {
   }
 
   if (typeof value === 'string' && value.trim()) {
-    const parsed = new Date(value)
+    const trimmed = value.trim()
+    const numeric = /^-?\d+(?:\.\d+)?(?:e[+-]?\d+)?$/i.test(trimmed) ? Number(trimmed) : null
+    if (numeric != null && Number.isFinite(numeric)) {
+      return parseWebhookTimestampValue(numeric)
+    }
+
+    const parsed = new Date(trimmed)
     return Number.isFinite(parsed.getTime()) ? parsed : null
   }
 
@@ -45,18 +58,51 @@ function getHeaderValue(
   return normalizedHeaders[key] ?? normalizedHeaders[key.toLowerCase()] ?? null
 }
 
+function timestampSignatureValue(value: unknown): string | null {
+  // Internal tests and non-route callers may pass pre-normalized Date values.
+  // JSON webhook request bodies never deserialize directly to Date instances.
+  if (value instanceof Date) return value.toISOString()
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  if (typeof value === 'string' && value.trim()) return value.trim()
+  return null
+}
+
+export function extractMintsoftWebhookTimestampCandidate(
+  payload: Record<string, unknown>,
+  headers?: Headers | Record<string, string | undefined>,
+): MintsoftWebhookTimestampCandidate | null {
+  for (const key of MINTSOFT_WEBHOOK_TIMESTAMP_KEYS) {
+    const value = timestampSignatureValue(payload[key])
+    const parsed = parseWebhookTimestampValue(payload[key])
+    if (value && parsed) return { date: parsed, value, source: 'payload', key }
+  }
+
+  for (const key of MINTSOFT_WEBHOOK_TIMESTAMP_HEADERS) {
+    const headerValue = getHeaderValue(headers, key)
+    const value = timestampSignatureValue(headerValue)
+    const parsed = parseWebhookTimestampValue(headerValue)
+    if (value && parsed) return { date: parsed, value, source: 'header', key }
+  }
+
+  return null
+}
+
 export function extractMintsoftWebhookTimestamp(
   payload: Record<string, unknown>,
   headers?: Headers | Record<string, string | undefined>,
 ): Date | null {
-  for (const key of MINTSOFT_WEBHOOK_TIMESTAMP_KEYS) {
-    const parsed = parseWebhookTimestampValue(payload[key])
-    if (parsed) return parsed
-  }
+  return extractMintsoftWebhookTimestampCandidate(payload, headers)?.date ?? null
+}
 
+export function extractMintsoftWebhookTimestampCandidateFromRequest(
+  _rawBody: string,
+  headers?: Headers | Record<string, string | undefined>,
+): MintsoftWebhookTimestampCandidate | null {
   for (const key of MINTSOFT_WEBHOOK_TIMESTAMP_HEADERS) {
-    const parsed = parseWebhookTimestampValue(getHeaderValue(headers, key))
-    if (parsed) return parsed
+    const headerValue = getHeaderValue(headers, key)
+    const value = timestampSignatureValue(headerValue)
+    const parsed = parseWebhookTimestampValue(headerValue)
+    if (value && parsed) return { date: parsed, value, source: 'header', key }
   }
 
   return null

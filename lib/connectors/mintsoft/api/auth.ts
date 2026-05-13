@@ -285,14 +285,17 @@ export function verifyMintsoftWebhookSignature(
   rawBody: string,
   signatureHeader: string | null,
   secret: string,
+  options?: { timestamp?: string | null },
 ): boolean {
   const normalizedProvided = signatureHeader ? normalizeSignatureValue(signatureHeader) : ''
   const normalizedSecret = secret.trim()
+  const timestamp = options?.timestamp?.trim()
 
-  if (!normalizedProvided || !normalizedSecret) return false
+  if (!normalizedProvided || !normalizedSecret || !timestamp) return false
 
-  const expectedHex = createHmac('sha256', normalizedSecret).update(rawBody, 'utf8').digest('hex')
-  const expectedBase64 = createHmac('sha256', normalizedSecret).update(rawBody, 'utf8').digest('base64')
+  const signedPayload = `${timestamp}.${rawBody}`
+  const expectedHex = createHmac('sha256', normalizedSecret).update(signedPayload, 'utf8').digest('hex')
+  const expectedBase64 = createHmac('sha256', normalizedSecret).update(signedPayload, 'utf8').digest('base64')
 
   return safeCompareSignature(expectedHex, normalizedProvided)
     || safeCompareSignature(expectedBase64, normalizedProvided)

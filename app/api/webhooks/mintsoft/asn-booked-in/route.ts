@@ -3,13 +3,19 @@ import { NextResponse } from 'next/server'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { getMintsoftApiConfiguration, verifyMintsoftWebhookSignature } from '@/lib/connectors/mintsoft'
 import {
-  extractMintsoftWebhookTimestamp,
+  getMintsoftApiConfiguration,
+  verifyMintsoftWebhookSignature,
+} from '@/lib/connectors/mintsoft'
+import {
+  extractMintsoftWebhookTimestampCandidateFromRequest,
   isMintsoftWebhookTimestampFresh,
 } from '@/lib/connectors/mintsoft/webhook-validation'
-import { processMintsoftBookedInEvent } from '@/lib/connectors/mintsoft/sync/booked-in-handler'
-import { persistMintsoftWebhookEvent, type PersistMintsoftWebhookEventInput } from '@/lib/connectors/mintsoft/webhook-events'
+import {
+  persistMintsoftWebhookEvent,
+  type MintsoftWebhookEventRepository,
+  type PersistMintsoftWebhookEventInput,
+} from '@/lib/connectors/mintsoft/webhook-events'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
 const MAX_WEBHOOK_BODY_BYTES = 256 * 1024
@@ -23,6 +29,14 @@ type MintsoftReceiptWebhookPayload = {
   eventTime?: string | number
   occurredAt?: string | number
   createdAt?: string | number
+}
+
+export type MintsoftBookedInWebhookRouteDependencies = {
+  getMintsoftApiConfiguration: typeof getMintsoftApiConfiguration
+  isIntegrationPluginEnabled: (plugin: 'mintsoft') => Promise<boolean>
+  isUniqueConstraintError: (error: unknown) => boolean
+  logActivity: typeof logActivity
+  repository: MintsoftWebhookEventRepository
 }
 
 class RequestBodyTooLargeError extends Error {
@@ -82,7 +96,57 @@ async function readWebhookBody(request: Request, maxBytes: number): Promise<stri
   return new TextDecoder().decode(buffer)
 }
 
-export async function POST(request: Request) {
+const defaultMintsoftBookedInWebhookDependencies: MintsoftBookedInWebhookRouteDependencies = {
+  getMintsoftApiConfiguration,
+  isIntegrationPluginEnabled,
+  isUniqueConstraintError(error) {
+    return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'
+  },
+  logActivity,
+  repository: {
+    async createEvent(input) {
+      return db.wmsInboundReceiptEvent.create({
+        data: {
+          connector: 'mintsoft',
+          externalEventId: input.externalEventId,
+          externalAsnId: input.externalAsnId,
+          payload: input.payload,
+        },
+        select: { id: true },
+      })
+    },
+    async findEvent(eventExternalId) {
+      return db.wmsInboundReceiptEvent.findUnique({
+        where: {
+          connector_externalEventId: {
+            connector: 'mintsoft',
+            externalEventId: eventExternalId,
+          },
+        },
+        select: { id: true, processedAt: true },
+      })
+    },
+    async updatePendingEvent(id, input) {
+      const updated = await db.wmsInboundReceiptEvent.updateMany({
+        where: {
+          id,
+          processedAt: null,
+        },
+        data: {
+          externalAsnId: input.externalAsnId,
+          payload: input.payload,
+          processingError: null,
+        },
+      })
+      return updated.count > 0
+    },
+  },
+}
+
+export async function handleMintsoftBookedInWebhook(
+  request: Request,
+  dependencies: MintsoftBookedInWebhookRouteDependencies = defaultMintsoftBookedInWebhookDependencies,
+) {
   let rawBody: string
   try {
     rawBody = await readWebhookBody(request, MAX_WEBHOOK_BODY_BYTES)
@@ -98,10 +162,48 @@ export async function POST(request: Request) {
   }
 
   const signatureHeader = request.headers.get('x-mintsoft-signature')
-  const isPluginEnabled = await isIntegrationPluginEnabled('mintsoft')
-  const { webhookSecret } = await getMintsoftApiConfiguration()
-  if (!isPluginEnabled || !webhookSecret || !verifyMintsoftWebhookSignature(rawBody, signatureHeader, webhookSecret)) {
+  const isPluginEnabled = await dependencies.isIntegrationPluginEnabled('mintsoft')
+  const { webhookSecret } = await dependencies.getMintsoftApiConfiguration()
+  if (!isPluginEnabled || !webhookSecret) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  const webhookTimestamp = extractMintsoftWebhookTimestampCandidateFromRequest(rawBody, request.headers)
+  if (!webhookTimestamp) {
+    await dependencies.logActivity({
+      entityType: 'SYNC',
+      tag: 'sync',
+      action: 'mintsoft_webhook_rejected_missing_timestamp',
+      level: 'WARNING',
+      description: 'Rejected Mintsoft ASN webhook without a signed timestamp',
+      metadata: {},
+      resolveUser: false,
+    })
+    return NextResponse.json({ error: 'Missing webhook timestamp' }, { status: 401 })
+  }
+
+  const signatureValid = verifyMintsoftWebhookSignature(rawBody, signatureHeader, webhookSecret, {
+    timestamp: webhookTimestamp.value,
+  })
+  if (!signatureValid) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  if (!isMintsoftWebhookTimestampFresh(webhookTimestamp.date)) {
+    await dependencies.logActivity({
+      entityType: 'SYNC',
+      tag: 'sync',
+      action: 'mintsoft_webhook_rejected_stale_timestamp',
+      level: 'WARNING',
+      description: 'Rejected Mintsoft ASN webhook with a stale signed timestamp',
+      metadata: {
+        timestamp: webhookTimestamp.date.toISOString(),
+        timestampSource: webhookTimestamp.source,
+        timestampKey: webhookTimestamp.key,
+      },
+      resolveUser: false,
+    })
+    return NextResponse.json({ error: 'Stale webhook timestamp' }, { status: 401 })
   }
 
   let payload: MintsoftReceiptWebhookPayload
@@ -111,39 +213,9 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 })
   }
 
-  const webhookTimestamp = extractMintsoftWebhookTimestamp(payload as Record<string, unknown>, request.headers)
-  if (!webhookTimestamp) {
-    await logActivity({
-      entityType: 'SYNC',
-      tag: 'sync',
-      action: 'mintsoft_webhook_rejected_missing_timestamp',
-      level: 'WARNING',
-      description: 'Rejected Mintsoft ASN webhook without a signed timestamp',
-      metadata: {
-        externalAsnId: getExternalAsnId(payload),
-      },
-      resolveUser: false,
-    })
-    return NextResponse.json({ error: 'Missing webhook timestamp' }, { status: 401 })
-  }
-  if (!isMintsoftWebhookTimestampFresh(webhookTimestamp)) {
-    await logActivity({
-      entityType: 'SYNC',
-      tag: 'sync',
-      action: 'mintsoft_webhook_rejected_stale_timestamp',
-      level: 'WARNING',
-      description: 'Rejected Mintsoft ASN webhook with a stale signed timestamp',
-      metadata: {
-        externalAsnId: getExternalAsnId(payload),
-        timestamp: webhookTimestamp.toISOString(),
-      },
-      resolveUser: false,
-    })
-    return NextResponse.json({ error: 'Stale webhook timestamp' }, { status: 401 })
-  }
-
   const externalEventId = getExternalEventId(payload, rawBody)
   const externalAsnId = getExternalAsnId(payload)
+
   const eventInput: PersistMintsoftWebhookEventInput = {
     externalEventId,
     externalAsnId,
@@ -151,54 +223,15 @@ export async function POST(request: Request) {
   }
 
   const result = await persistMintsoftWebhookEvent(
-    {
-      async createEvent(input) {
-        return db.wmsInboundReceiptEvent.create({
-          data: {
-            connector: 'mintsoft',
-            externalEventId: input.externalEventId,
-            externalAsnId: input.externalAsnId,
-            payload: input.payload,
-          },
-          select: { id: true },
-        })
-      },
-      async findEvent(eventExternalId) {
-        return db.wmsInboundReceiptEvent.findUnique({
-          where: {
-            connector_externalEventId: {
-              connector: 'mintsoft',
-              externalEventId: eventExternalId,
-            },
-          },
-          select: { id: true, processedAt: true },
-        })
-      },
-      async updatePendingEvent(id, input) {
-        const updated = await db.wmsInboundReceiptEvent.updateMany({
-          where: {
-            id,
-            processedAt: null,
-          },
-          data: {
-            externalAsnId: input.externalAsnId,
-            payload: input.payload,
-            processingError: null,
-          },
-        })
-        return updated.count > 0
-      },
-    },
+    dependencies.repository,
     eventInput,
     {
-      isUniqueConstraintError(error) {
-        return error instanceof Prisma.PrismaClientKnownRequestError && error.code === 'P2002'
-      },
+      isUniqueConstraintError: dependencies.isUniqueConstraintError,
     },
   )
 
   if (result.status === 'duplicate') {
-    await logActivity({
+    await dependencies.logActivity({
       entityType: 'SYNC',
       entityId: result.eventId,
       tag: 'sync',
@@ -215,17 +248,7 @@ export async function POST(request: Request) {
     })
   }
 
-  const processingResult = await processMintsoftBookedInEvent(result.eventId)
-  if (processingResult.status === 'failed') {
-    return NextResponse.json({
-      accepted: false,
-      externalEventId,
-      externalAsnId,
-      error: processingResult.error,
-    }, { status: 500 })
-  }
-
-  await logActivity({
+  await dependencies.logActivity({
     entityType: 'SYNC',
     entityId: result.eventId,
     tag: 'sync',
@@ -241,7 +264,11 @@ export async function POST(request: Request) {
     accepted: true,
     externalEventId,
     externalAsnId,
-    processed: processingResult.status === 'processed',
-    pending: processingResult.status === 'pending',
-  })
+    queued: true,
+    pending: true,
+  }, { status: 202 })
+}
+
+export async function POST(request: Request) {
+  return handleMintsoftBookedInWebhook(request)
 }
