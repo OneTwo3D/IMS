@@ -39,6 +39,7 @@ test('money arithmetic avoids binary floating point drift', () => {
 
 test('money rounding uses currency minor units and half-up behavior', () => {
   assert.equal(roundMoney('10.005', 'GBP').toString(), '10.01')
+  assert.equal(roundMoney('10.025', 'GBP').toString(), '10.03')
   assert.equal(roundMoney('10.004', 'gbp').toString(), '10')
   assert.equal(roundMoney('123.5', 'JPY').toString(), '124')
   assert.equal(roundMoney('12500.7', 'KRW').toString(), '12501')
@@ -51,6 +52,7 @@ test('money rounding uses currency minor units and half-up behavior', () => {
 })
 
 test('quantity rounding supports configured precision', () => {
+  assert.equal(roundQuantity('2.5', 0).toString(), '3')
   assert.equal(roundQuantity('1.23445', 4).toString(), '1.2345')
   assert.equal(roundQuantity('1.23444', 4).toString(), '1.2344')
   assert.equal(roundQuantity('0.00005', 4).toString(), '0.0001')

@@ -67,6 +67,12 @@ The leading rationale token must be one of:
 
 The comment is file-scoped rather than line-scoped so import formatting changes do not break validation. One file should use one leading rationale token; if a file appears to need mixed rationales, split the boundary or choose the stricter temporary rationale and explain the narrower cases in the parenthetical. This guard does not catch every Decimal-to-number bypass, such as direct `.toNumber()` calls or `Number(decimalValue)` on Decimal-typed values; those require a future typed-AST lint rule.
 
+## Rounding Policy
+
+IMS uses Decimal `ROUND_HALF_UP` for explicit money, quantity, and journal-total rounding. Money amounts round to the relevant ISO 4217 minor units, defaulting to 2 decimal places when no special minor-unit rule exists. Inventory quantities and FIFO/COGS unit values round only at explicit storage, payload, or report boundaries; internal domain calculations should keep `Prisma.Decimal` values until one of those boundaries is reached.
+
+Do not introduce half-even/banker's rounding unless a connector contract explicitly requires it, and document that connector-specific exception next to the adapter boundary.
+
 ## Schema Workflow
 
 When changing the schema:
