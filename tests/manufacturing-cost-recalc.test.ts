@@ -142,6 +142,9 @@ test('mixed receivedQty per layer: proportional share is by base value not qty',
 })
 
 test('fractional manufacturing unit-cost helper matches Decimal arithmetic at the current 6dp boundary', () => {
+  // This pins one current float-compatible fractional case. PR 4.5 should
+  // replace it with broader corpus/property coverage once the implementation
+  // itself is Decimal-safe end-to-end.
   const layers = [
     { id: 'A', receivedQty: 0.3, base: 0.1 },
     { id: 'B', receivedQty: 0.6, base: 0.2 },
