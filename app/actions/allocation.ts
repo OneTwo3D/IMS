@@ -388,8 +388,8 @@ export async function updateAllocation(
         where: { productId: alloc.productId, warehouseId: { in: Array.from(new Set([alloc.warehouseId, newWarehouseId])) } },
         select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
       })
-      const stockMap = buildAvailableStockMap(stockLevels).get(alloc.productId) ?? new Map<string, number>()
-      const effectiveAvailable = (stockMap.get(newWarehouseId) ?? 0)
+      const stockMap = buildAvailableStockMap(stockLevels).get(alloc.productId) ?? new Map()
+      const effectiveAvailable = (stockMap.get(newWarehouseId)?.toNumber() ?? 0)
         + (alloc.warehouseId === newWarehouseId ? Number(alloc.qty) : 0)
 
       if (newQty > effectiveAvailable) {
@@ -488,7 +488,15 @@ export async function addAllocation(
         select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
       })
       const stockMap = buildAvailableStockMap(stockLevels)
-      const avail = getFulfillmentAvailableQty(productId, warehouseId, graph, stockMap)
+      const avail = getFulfillmentAvailableQty(
+        productId,
+        warehouseId,
+        graph,
+        new Map([...stockMap].map(([stockProductId, byWarehouse]) => [
+          stockProductId,
+          new Map([...byWarehouse].map(([stockWarehouseId, qty]) => [stockWarehouseId, qty.toNumber()])),
+        ])),
+      )
       if (qty > avail) throw new Error(`Only ${avail} available`)
 
       for (const [leafProductId, requiredQty] of expandFulfillmentRequirements(productId, qty, graph)) {

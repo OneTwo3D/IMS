@@ -86,6 +86,10 @@ type MemoryState = {
   shipments?: ShipmentRow[]
 }
 
+function decimalLikeToNumber(value: number | { toNumber(): number } | undefined): number {
+  return typeof value === 'number' ? value : (value?.toNumber() ?? 0)
+}
+
 function createClient(state: MemoryState): AllocationServiceClient {
   const allocations = state.allocations ?? []
   const shipments = state.shipments ?? []
@@ -135,12 +139,12 @@ function createClient(state: MemoryState): AllocationServiceClient {
         data,
       }: {
         where: { productId: string; warehouseId: string }
-        data: { reservedQty: { increment?: number; decrement?: number } }
+        data: { reservedQty: { increment?: number | { toNumber(): number }; decrement?: number | { toNumber(): number } } }
       }) => {
         const rows = state.stockLevels.filter((row) => row.productId === where.productId && row.warehouseId === where.warehouseId)
         for (const row of rows) {
-          row.reservedQty += data.reservedQty.increment ?? 0
-          row.reservedQty -= data.reservedQty.decrement ?? 0
+          row.reservedQty += decimalLikeToNumber(data.reservedQty.increment)
+          row.reservedQty -= decimalLikeToNumber(data.reservedQty.decrement)
         }
         return { count: rows.length }
       },
@@ -156,8 +160,8 @@ function createClient(state: MemoryState): AllocationServiceClient {
         }
         return { count: before - allocations.length }
       },
-      create: async ({ data }: { data: AllocationRow }) => {
-        allocations.push({ ...data })
+      create: async ({ data }: { data: AllocationRow & { qty: number | { toNumber(): number } } }) => {
+        allocations.push({ ...data, qty: decimalLikeToNumber(data.qty) })
         return data
       },
       updateMany: async () => ({ count: 0 }),
@@ -397,6 +401,38 @@ test('allocateSalesOrder expands kit lines into component allocations', async ()
   ])
 })
 
+test('allocateSalesOrder preserves fractional kit component quantities without float drift', async () => {
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      lines: [{
+        id: 'line-1',
+        productId: 'kit-1',
+        qty: 0.2,
+        sku: 'KIT-1',
+        description: 'Kit 1',
+        product: { id: 'kit-1', sku: 'KIT-1', type: 'KIT', oversellAllowed: false },
+      }],
+    },
+    products: [{
+      id: 'kit-1',
+      type: 'KIT',
+      productComponents: [
+        { componentId: 'component-1', qty: 0.1, componentType: 'SIMPLE' },
+      ],
+    }],
+    stockLevels: [
+      { productId: 'component-1', warehouseId: 'warehouse-1', quantity: 0.02, reservedQty: 0 },
+    ],
+  })
+  const result = await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
+
+  assert.equal(result.success, true)
+  assert.equal(result.allocationCount, 1)
+  assert.equal(state.allocations?.[0]?.qty, 0.02)
+  assert.equal(state.stockLevels[0].reservedQty, 0.02)
+})
+
 test('allocateSalesOrder exposes non-oversell kit component blockers in unallocated metadata', async () => {
   const state = baseState({
     order: {
@@ -528,7 +564,7 @@ test('buildAvailableStockMapIncludingOwnReservations warns when own allocations 
       [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 5, reservedQty: 1 }],
       [{ productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
     )
-    assert.equal(stockMap.get('product-1')?.get('warehouse-1'), 5)
+    assert.equal(stockMap.get('product-1')?.get('warehouse-1')?.toNumber(), 5)
     assert.match(warnings[0] ?? '', /own allocations exceed reserved stock/)
   } finally {
     console.warn = originalWarn
