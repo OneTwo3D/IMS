@@ -5,9 +5,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import {
   getMintsoftApiConfiguration,
-  isLegacyMintsoftBodyOnlySignatureAllowed,
-  MINTSOFT_LEGACY_SIGNATURE_SUNSET,
-  verifyMintsoftWebhookSignatureDetailed,
+  verifyMintsoftWebhookSignature,
 } from '@/lib/connectors/mintsoft'
 import {
   extractMintsoftWebhookTimestampCandidateFromRequest,
@@ -123,11 +121,10 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Missing webhook timestamp' }, { status: 401 })
   }
 
-  const signatureVerification = verifyMintsoftWebhookSignatureDetailed(rawBody, signatureHeader, webhookSecret, {
+  const signatureValid = verifyMintsoftWebhookSignature(rawBody, signatureHeader, webhookSecret, {
     timestamp: webhookTimestamp.value,
-    allowLegacyBodyOnly: isLegacyMintsoftBodyOnlySignatureAllowed(),
   })
-  if (!signatureVerification.valid) {
+  if (!signatureValid) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
@@ -157,23 +154,6 @@ export async function POST(request: Request) {
 
   const externalEventId = getExternalEventId(payload, rawBody)
   const externalAsnId = getExternalAsnId(payload)
-
-  if (signatureVerification.format === 'legacy-body-only') {
-    await logActivity({
-      entityType: 'SYNC',
-      tag: 'sync',
-      action: 'mintsoft_webhook_legacy_signature_accepted',
-      level: 'WARNING',
-      description: 'Accepted Mintsoft ASN webhook using temporary legacy body-only signature verification',
-      metadata: {
-        externalEventId,
-        externalAsnId,
-        signatureFormat: signatureVerification.format,
-        legacyFlagSunset: MINTSOFT_LEGACY_SIGNATURE_SUNSET,
-      },
-      resolveUser: false,
-    })
-  }
 
   const eventInput: PersistMintsoftWebhookEventInput = {
     externalEventId,

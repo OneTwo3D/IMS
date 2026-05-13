@@ -894,10 +894,6 @@ Make Mintsoft webhook receipt durable, replay-safe, and asynchronous.
 
 Status: implemented in PR #55.
 
-Follow-up: remove `MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE` by 2026-09-30
-after operators see zero `mintsoft_webhook_legacy_signature_accepted` activity-log
-entries for 14 consecutive days.
-
 ### Problem
 
 Webhook replay protection must ensure the timestamp cannot be swapped independently of the signed body.
@@ -911,11 +907,8 @@ signedPayload = `${timestamp}.${rawBody}`
 signature = HMAC_SHA256(webhookSecret, signedPayload)
 ```
 
-Accept legacy body-only signatures only behind an explicit temporary compatibility flag:
-
-```env
-MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE=false
-```
+Reject legacy body-only signatures. The system was not live when this stage
+landed, so no compatibility flag or fallback path is required.
 
 ### Acceptance criteria
 
@@ -923,7 +916,7 @@ MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE=false
 - Fresh signed timestamp + body succeeds.
 - Stale signed timestamp fails.
 - Valid body signature with tampered timestamp fails.
-- Legacy body-only mode disabled by default.
+- Legacy body-only signatures are rejected.
 - Docs updated.
 ```
 
@@ -937,8 +930,7 @@ Base branch: development.
 Update Mintsoft webhook signature validation so the timestamp is bound into the signed payload.
 Preferred signed payload format: `${timestamp}.${rawBody}`.
 Require the timestamp header or body timestamp used for freshness validation to be the same value included in signature verification.
-Add a temporary MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE flag defaulting false if compatibility is needed.
-Add tests for valid signature, stale timestamp, tampered timestamp, missing timestamp, and legacy mode.
+Add tests for valid signature, stale timestamp, tampered timestamp, missing timestamp, and body-only rejection.
 Run npm run validate and Mintsoft webhook tests.
 ```
 

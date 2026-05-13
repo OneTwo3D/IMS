@@ -17,9 +17,7 @@ const webhookEventsModule = 'default' in webhookEventsModuleNs
   : webhookEventsModuleNs
 
 const {
-  isLegacyMintsoftBodyOnlySignatureAllowed,
   verifyMintsoftWebhookSignature,
-  verifyMintsoftWebhookSignatureDetailed,
 } = authModule
 const {
   extractMintsoftWebhookTimestamp,
@@ -68,7 +66,7 @@ test('verifyMintsoftWebhookSignature binds the timestamp into the signature', ()
   assert.equal(verifyMintsoftWebhookSignature(rawBody, signature, secret), false)
 })
 
-test('verifyMintsoftWebhookSignature only accepts legacy body-only signatures behind the flag', () => {
+test('verifyMintsoftWebhookSignature rejects body-only signatures', () => {
   const secret = 'top-secret'
   const rawBody = JSON.stringify({ eventId: 'evt-1' })
   const signature = createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex')
@@ -76,31 +74,6 @@ test('verifyMintsoftWebhookSignature only accepts legacy body-only signatures be
   assert.equal(verifyMintsoftWebhookSignature(rawBody, signature, secret, {
     timestamp: '2026-04-22T10:00:00.000Z',
   }), false)
-  assert.equal(verifyMintsoftWebhookSignature(rawBody, signature, secret, {
-    timestamp: '2026-04-22T10:00:00.000Z',
-    allowLegacyBodyOnly: true,
-  }), true)
-})
-
-test('verifyMintsoftWebhookSignatureDetailed reports legacy fallback use for observability', () => {
-  const secret = 'top-secret'
-  const rawBody = JSON.stringify({ eventId: 'evt-1' })
-  const signature = createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex')
-
-  assert.deepEqual(
-    verifyMintsoftWebhookSignatureDetailed(rawBody, signature, secret, {
-      timestamp: '2026-04-22T10:00:00.000Z',
-      allowLegacyBodyOnly: true,
-    }),
-    { valid: true, format: 'legacy-body-only' },
-  )
-})
-
-test('isLegacyMintsoftBodyOnlySignatureAllowed defaults off and accepts explicit true only', () => {
-  assert.equal(isLegacyMintsoftBodyOnlySignatureAllowed({}), false)
-  assert.equal(isLegacyMintsoftBodyOnlySignatureAllowed({ MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE: 'false' }), false)
-  assert.equal(isLegacyMintsoftBodyOnlySignatureAllowed({ MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE: 'true' }), true)
-  assert.equal(isLegacyMintsoftBodyOnlySignatureAllowed({ MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE: 'TRUE' }), true)
 })
 
 test('persistMintsoftWebhookEvent creates a new event when none exists', async () => {

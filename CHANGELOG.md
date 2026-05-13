@@ -23,7 +23,7 @@ This repository uses an `x.y.z` release scheme.
 
 ### Fixes (Mintsoft webhook security)
 
-- **Mintsoft ASN booked-in webhooks now bind the freshness timestamp into the HMAC signature.** IMS verifies `HMAC_SHA256(secret, "${timestamp}.${rawBody}")`, rejects body-only signatures by default, and keeps a temporary `MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE=true` compatibility flag for rollout windows where a sender has not yet switched signing formats. Disable the flag after 14 days with no `mintsoft_webhook_legacy_signature_accepted` activity-log entries; remove it by 2026-09-30.
+- **Mintsoft ASN booked-in webhooks now bind the freshness timestamp into the HMAC signature.** IMS verifies `HMAC_SHA256(secret, "${timestamp}.${rawBody}")` and rejects body-only signatures.
 
 ### User-facing (sales allocation and backorders)
 
