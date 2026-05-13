@@ -10,8 +10,17 @@ import {
   expandFulfillmentRequirements,
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
+import {
+  isStockTrackedProductType,
+  STOCK_TRACKED_PRODUCT_TYPES,
+  type BackorderProductType,
+} from '@/lib/domain/inventory/backorder-policy'
 
-type BackorderProductType = 'SIMPLE' | 'VARIABLE' | 'VARIANT' | 'KIT' | 'BOM' | 'NON_INVENTORY'
+export {
+  isStockTrackedProductType,
+  STOCK_TRACKED_PRODUCT_TYPES,
+  type BackorderProductType,
+}
 
 export type BackorderReportLineRow = {
   id: string
@@ -100,17 +109,9 @@ type BackorderReportClient = {
 }
 
 const QUANTITY_TOLERANCE = 0.0001
-// KIT included: backorder coverage is evaluated against the parent sales line,
-// even though KITs have no FIFO layers of their own.
-const STOCK_TRACKED_PRODUCT_TYPES = new Set<BackorderProductType>(['SIMPLE', 'VARIANT', 'KIT', 'BOM'])
-
 function toReportQuantity(value: number): number {
   if (Math.abs(value) <= QUANTITY_TOLERANCE) return 0
   return roundQuantity(value, 4).toNumber()
-}
-
-function isStockTracked(type: BackorderProductType): boolean {
-  return STOCK_TRACKED_PRODUCT_TYPES.has(type)
 }
 
 function defaultRequirements(line: BackorderReportLineRow): FulfillmentRequirement[] {
@@ -194,7 +195,7 @@ export function buildBackorderReport(rows: BackorderReportRows): BackorderReport
       }
     }
 
-    if (!isStockTracked(line.product.type)) {
+    if (!isStockTrackedProductType(line.product.type)) {
       return {
         orderId: line.orderId,
         lineId: line.id,

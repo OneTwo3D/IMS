@@ -25,7 +25,9 @@ import {
   type AllocationRow, type FulfillmentRequirementRow, type ShipmentRow,
 } from '@/app/actions/allocation'
 import type { CurrencyRow } from '@/app/actions/currencies'
+import type { ProductType } from '@/app/generated/prisma/client'
 import type { StockLevelEntry } from '@/lib/domain/inventory/stock-level-map'
+import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 import { ProductLink } from '@/components/inventory/product-link'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
@@ -36,6 +38,15 @@ import { getTrackingUrl } from '@/lib/tracking'
 import { countryName, formatCountryDisplay } from '@/lib/countries'
 
 type WarehouseInfo = { id: string; code: string; name: string }
+type AllocationPanelLine = {
+  id: string
+  productId: string | null
+  sku: string
+  description: string
+  productType: ProductType | null
+  oversellAllowed: boolean
+  qty: number
+}
 type Props = {
   order: SoDetail
   warehouses: WarehouseInfo[]
@@ -285,7 +296,7 @@ function AllocationPanel({
 }: {
   orderId: string
   allocations: AllocationRow[]
-  lines: { id: string; productId: string | null; sku: string; description: string; qty: number }[]
+  lines: AllocationPanelLine[]
   warehouses: WarehouseInfo[]
   status: SoStatus
   shipments: ShipmentRow[]
@@ -297,6 +308,7 @@ function AllocationPanel({
   const [editWhId, setEditWhId] = useState('')
   const [editQty, setEditQty] = useState('')
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
   const [showAddLine, setShowAddLine] = useState<string | null>(null) // lineId
   const [addWhId, setAddWhId] = useState('')
   const [addQty, setAddQty] = useState('')
@@ -330,17 +342,24 @@ function AllocationPanel({
       qty: allocation.qty,
     })),
   )
-  const backorderLines = lines.filter((l) => {
-    if (!l.productId) return false
+  const backorderLines = lines.flatMap((l) => {
+    if (!l.productId) return []
+    const requiresStock = !l.productType || isStockTrackedProductType(l.productType)
+    if (!requiresStock) return []
     const committed = shipmentCommittedByLine.get(l.id) ?? 0
     const remaining = Math.max(0, l.qty - committed)
-    if (remaining <= 0) return false
+    if (remaining <= 0) return []
     const allocated = allocatedByLine.get(l.id) ?? 0
-    return allocated < remaining
+    const short = remaining - allocated
+    if (short <= 0.0001) return []
+    return [{ ...l, committed, remaining, allocated, short, backorderEligible: l.oversellAllowed }]
   })
+
+  const visibleNotice = backorderLines.length > 0 ? notice : ''
 
   function handleDeallocate() {
     setError('')
+    setNotice('')
     startTransition(async () => {
       const result = await deallocateOrder(orderId)
       if (result.success) onRefresh()
@@ -350,15 +369,24 @@ function AllocationPanel({
 
   function handleReAllocate() {
     setError('')
+    setNotice('')
     startTransition(async () => {
       const result = await autoAllocateOrder(orderId)
-      if (result.success) onRefresh()
-      else setError(result.error ?? 'Failed')
+      if (result.success) {
+        if ((result.unallocatedQty ?? 0) > 0) {
+          setNotice(`${result.unallocatedQty} unit(s) remain unallocated; ${result.backorderLineCount ?? 0} line(s) are backorder eligible.`)
+        }
+        onRefresh()
+      } else {
+        if ((result.allocationCount ?? 0) > 0) onRefresh()
+        setError(result.error ?? 'Failed')
+      }
     })
   }
 
   function handleSaveEdit(allocId: string) {
     setError('')
+    setNotice('')
     const qty = parseFloat(editQty)
     if (isNaN(qty) || qty < 0) { setError('Invalid quantity'); return }
     startTransition(async () => {
@@ -370,6 +398,7 @@ function AllocationPanel({
 
   function handleAddAllocation(lineId: string, productId: string) {
     setError('')
+    setNotice('')
     const qty = parseFloat(addQty)
     if (isNaN(qty) || qty <= 0) { setError('Invalid quantity'); return }
     startTransition(async () => {
@@ -414,6 +443,7 @@ function AllocationPanel({
       </div>
 
       {error && <p className="px-4 py-2 text-sm text-destructive">{error}</p>}
+      {visibleNotice && <p className="px-4 py-2 text-sm text-muted-foreground">{visibleNotice}</p>}
 
       {allocations.length === 0 && backorderLines.length === 0 && (
         <div className="px-4 py-6 text-center text-sm text-muted-foreground">
@@ -500,10 +530,6 @@ function AllocationPanel({
           </div>
           <div className="divide-y">
             {backorderLines.map((l) => {
-              const committed = shipmentCommittedByLine.get(l.id) ?? 0
-              const remaining = Math.max(0, l.qty - committed)
-              const allocated = allocatedByLine.get(l.id) ?? 0
-              const short = remaining - allocated
               const isAdding = showAddLine === l.id
               return (
                 <div key={l.id} className="px-4 py-2.5 flex items-center gap-3">
@@ -517,20 +543,20 @@ function AllocationPanel({
                         <option value="">Warehouse…</option>
                         {warehouses.map((w) => (<option key={w.id} value={w.id}>{w.code}</option>))}
                       </select>
-                      <Input type="number" min={1} step={1} value={addQty} onChange={(e) => setAddQty(e.target.value)} placeholder={String(short)} className="h-7 w-16 text-xs text-right font-mono" />
+                      <Input type="number" min={1} step={1} value={addQty} onChange={(e) => setAddQty(e.target.value)} placeholder={String(l.short)} className="h-7 w-16 text-xs text-right font-mono" />
                       <Button size="sm" className="h-7 text-xs" onClick={() => l.productId && handleAddAllocation(l.id, l.productId)} disabled={isPending || !addWhId}>Add</Button>
                       <Button variant="ghost" size="sm" className="h-7 text-xs" onClick={() => setShowAddLine(null)}>×</Button>
                     </div>
                   ) : (
                     <div className="flex items-center gap-3">
                       <span className="text-xs text-muted-foreground">
-                        Short <span className="font-mono font-medium text-destructive">{short}</span> of {remaining}
+                        Short <span className="font-mono font-medium text-destructive">{l.short}</span> of {l.remaining}
                       </span>
-                      <span className="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200">
-                        Backorder
+                      <span className={`inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ${l.backorderEligible ? 'bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200' : 'bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200'}`}>
+                        {l.backorderEligible ? (l.productType === 'KIT' ? 'Backorder (component-limited)' : 'Backorder') : 'Unallocated'}
                       </span>
                       {['PROCESSING', 'ALLOCATED'].includes(status) && l.productId && (
-                        <button type="button" className="text-xs text-primary hover:underline" onClick={() => { setShowAddLine(l.id); setAddWhId(warehouses[0]?.id ?? ''); setAddQty(String(short)) }}>
+                        <button type="button" className="text-xs text-primary hover:underline" onClick={() => { setShowAddLine(l.id); setAddWhId(warehouses[0]?.id ?? ''); setAddQty(String(l.short)) }}>
                           Allocate
                         </button>
                       )}
@@ -804,7 +830,10 @@ export function SoDetailClient({ order: so, warehouses, currencies, externalOrde
       startTransition(async () => {
         const result = await autoAllocateOrder(so.id)
         if (result.success) { refreshAllocations(); router.refresh() }
-        else setError(result.error ?? 'Failed')
+        else {
+          if ((result.allocationCount ?? 0) > 0) refreshAllocations()
+          setError(result.error ?? 'Failed')
+        }
       })
       return
     }

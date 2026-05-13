@@ -437,7 +437,7 @@ test('collector uses the order-scoped query shapes and expands kit requirements'
               {
                 componentId: 'component-1',
                 qty: 2,
-                component: { type: 'SIMPLE' },
+                component: { sku: 'COMP-1', type: 'SIMPLE', oversellAllowed: false },
               },
             ],
           },
@@ -497,7 +497,7 @@ test('collector uses the order-scoped query shapes and expands kit requirements'
         select: {
           componentId: true,
           qty: true,
-          component: { select: { type: true } },
+          component: { select: { sku: true, type: true, oversellAllowed: true } },
         },
         orderBy: { sortOrder: 'asc' },
       },

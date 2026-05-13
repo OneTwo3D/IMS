@@ -12,6 +12,7 @@ import {
   listFulfillmentLeafProductIds,
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
+import { buildBackorderReport, type BackorderReportLine } from '@/lib/domain/inventory/backorder-report'
 import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 
@@ -31,11 +32,28 @@ export type AllocateSalesOrderResult = {
   error?: string
   syncProductIds: string[]
   allocationCount: number
+  unallocatedLines: AllocationUnallocatedLine[]
+  unallocatedQty: number
+  backorderLineCount: number
   orderRef?: string
   isWcOrder?: boolean
   shipFromWarehouseId?: string | null
   logAttempt?: boolean
 }
+
+export type AllocationUnallocatedLine = Pick<
+  BackorderReportLine,
+  | 'lineId'
+  | 'productId'
+  | 'sku'
+  | 'description'
+  | 'orderedQty'
+  | 'committedShipmentQty'
+  | 'allocatedQty'
+  | 'unallocatedQty'
+  | 'backorderEligible'
+  | 'reason'
+> & { componentBlockers: string[] }
 
 type AllocationRowInput = {
   lineId: string
@@ -64,6 +82,42 @@ export function buildAvailableStockMap(
       row.warehouseId,
       Math.max(0, decimalToNumber(row.quantity) - decimalToNumber(row.reservedQty)),
     )
+  }
+  return stockMap
+}
+
+export function buildAvailableStockMapIncludingOwnReservations(
+  stockRows: Array<{ productId: string; warehouseId: string; quantity: DecimalLike; reservedQty: DecimalLike }>,
+  ownRows: Array<{ productId: string; warehouseId: string; qty: DecimalLike }>,
+): Map<string, Map<string, number>> {
+  const ownByProductWarehouse = new Map<string, number>()
+  for (const row of ownRows) {
+    const key = `${row.productId}:${row.warehouseId}`
+    ownByProductWarehouse.set(
+      key,
+      (ownByProductWarehouse.get(key) ?? 0) + decimalToNumber(row.qty),
+    )
+  }
+
+  const stockMap = new Map<string, Map<string, number>>()
+  for (const row of stockRows) {
+    const quantity = decimalToNumber(row.quantity)
+    const reservedQty = decimalToNumber(row.reservedQty)
+    const ownQty = ownByProductWarehouse.get(`${row.productId}:${row.warehouseId}`) ?? 0
+    if (ownQty > reservedQty + ALLOCATION_EPSILON) {
+      console.warn(
+        `[allocation-service] own allocations exceed reserved stock for product ${row.productId} in warehouse ${row.warehouseId}; reservedQty=${reservedQty}, ownQty=${ownQty}`,
+      )
+    }
+    const otherReservedQty = Math.max(0, reservedQty - ownQty)
+    const available = Math.max(0, quantity - otherReservedQty)
+
+    let byWarehouse = stockMap.get(row.productId)
+    if (!byWarehouse) {
+      byWarehouse = new Map<string, number>()
+      stockMap.set(row.productId, byWarehouse)
+    }
+    byWarehouse.set(row.warehouseId, available)
   }
   return stockMap
 }
@@ -330,12 +384,43 @@ function mergeAllocationRows(rows: AllocationRowInput[]): AllocationRowInput[] {
   return [...merged.values()].filter((row) => row.qty > 0)
 }
 
+function collectNonOversellLeafComponents(
+  productId: string,
+  graph: Awaited<ReturnType<typeof loadFulfillmentProductGraph>>,
+): string[] {
+  const blockers = new Set<string>()
+
+  function visit(currentProductId: string, stack: Set<string>) {
+    if (stack.has(currentProductId)) return
+    const node = graph.get(currentProductId)
+    if (!node || node.type !== 'KIT') return
+
+    stack.add(currentProductId)
+    for (const component of node.productComponents) {
+      if (component.componentType === 'KIT') {
+        visit(component.componentId, stack)
+        continue
+      }
+      if (!component.componentOversellAllowed) {
+        blockers.add(component.componentSku || component.componentId)
+      }
+    }
+    stack.delete(currentProductId)
+  }
+
+  visit(productId, new Set<string>())
+  return [...blockers].sort()
+}
+
 function noAllocationResult(error: string): AllocateSalesOrderResult {
   return {
     success: false,
     error,
     syncProductIds: [],
     allocationCount: 0,
+    unallocatedLines: [],
+    unallocatedQty: 0,
+    backorderLineCount: 0,
   }
 }
 
@@ -353,7 +438,24 @@ export async function allocateSalesOrder(
       shoppingLinks: { where: { connector: 'woocommerce' }, select: { id: true }, take: 1 },
       status: true,
       shipFromWarehouseId: true,
-      lines: { select: { id: true, productId: true, qty: true, sku: true } },
+      lines: {
+        select: {
+          id: true,
+          orderId: true,
+          productId: true,
+          qty: true,
+          sku: true,
+          description: true,
+          product: {
+            select: {
+              id: true,
+              sku: true,
+              type: true,
+              oversellAllowed: true,
+            },
+          },
+        },
+      },
     },
   })
   if (!so) return noAllocationResult('Order not found')
@@ -422,26 +524,17 @@ export async function allocateSalesOrder(
       where: { productId: { in: leafProductIds }, warehouseId: { in: sorted.map((warehouse) => warehouse.id) } },
       select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
     })
-    const stockMap = buildAvailableStockMap(stockLevels)
-
     const ownAllocations = await tx.orderAllocation.findMany({
       where: { orderId },
       select: { productId: true, warehouseId: true, qty: true },
     })
-    for (const alloc of ownAllocations) {
-      const byWarehouse = stockMap.get(alloc.productId) ?? new Map<string, number>()
-      byWarehouse.set(
-        alloc.warehouseId,
-        (byWarehouse.get(alloc.warehouseId) ?? 0) + decimalToNumber(alloc.qty),
-      )
-      stockMap.set(alloc.productId, byWarehouse)
-    }
+    const stockMap = buildAvailableStockMapIncludingOwnReservations(stockLevels, ownAllocations)
 
     const activeShipmentLines = await tx.shipmentLine.findMany({
       where: {
         shipment: { orderId, status: { not: 'PENDING' } },
       },
-      select: { lineId: true, productId: true, qty: true },
+      select: { lineId: true, productId: true, qty: true, shipment: { select: { status: true } } },
     })
     const committedByLine = calculateCoverageByLine(
       requirementsByLine,
@@ -563,12 +656,53 @@ export async function allocateSalesOrder(
       await tx.salesOrder.update({ where: { id: orderId }, data: { status: 'ALLOCATED' } })
     }
 
+    const report = buildBackorderReport({
+      lines: so.lines.map((line) => ({
+        id: line.id,
+        orderId: line.orderId,
+        productId: line.productId,
+        sku: line.sku,
+        description: line.description,
+        qty: line.qty,
+        product: line.product,
+      })),
+      allocations: nextAllocations.map((allocation) => ({
+        lineId: allocation.lineId,
+        productId: allocation.productId,
+        qty: allocation.qty,
+      })),
+      shipmentLines: activeShipmentLines,
+      requirementsByLine,
+    })
+
     return {
       nextAllocations,
       syncProductIds: [...new Set([
         ...existingAllocs.map((alloc) => alloc.productId),
         ...nextAllocations.map((alloc) => alloc.productId),
       ])],
+      unallocatedLines: report.lines
+        .filter((line) => line.unallocatedQty > ALLOCATION_EPSILON)
+        .map((line) => {
+          const sourceLine = so.lines.find((candidate) => candidate.id === line.lineId)
+          return {
+            lineId: line.lineId,
+            productId: line.productId,
+            sku: line.sku,
+            description: line.description,
+            orderedQty: line.orderedQty,
+            committedShipmentQty: line.committedShipmentQty,
+            allocatedQty: line.allocatedQty,
+            unallocatedQty: line.unallocatedQty,
+            backorderEligible: line.backorderEligible,
+            reason: line.reason,
+            componentBlockers: sourceLine?.product?.type === 'KIT' && sourceLine.productId
+              ? collectNonOversellLeafComponents(sourceLine.productId, graph)
+              : [],
+          }
+        }),
+      unallocatedQty: report.summary.unallocatedQty,
+      backorderLineCount: report.lines.filter((line) => line.unallocatedQty > ALLOCATION_EPSILON && line.backorderEligible).length,
       refused: false as const,
     }
   }
@@ -583,6 +717,9 @@ export async function allocateSalesOrder(
       error: 'Order has existing shipments; reallocation refused',
       syncProductIds: [],
       allocationCount: 0,
+      unallocatedLines: [],
+      unallocatedQty: 0,
+      backorderLineCount: 0,
       orderRef,
       isWcOrder,
       shipFromWarehouseId: so.shipFromWarehouseId,
@@ -590,11 +727,20 @@ export async function allocateSalesOrder(
   }
 
   const allocationCount = allocationResult.nextAllocations.length
+  const canLeaveUnallocated = allocationResult.unallocatedLines.every((line) => line.backorderEligible)
+  const success = canLeaveUnallocated
   return {
-    success: allocationCount > 0,
-    error: allocationCount > 0 ? undefined : 'No stock available for allocation',
+    success,
+    error: success
+      ? undefined
+      : allocationCount > 0
+        ? 'Some lines could not be fully allocated and are not oversell-eligible'
+        : 'No stock available for allocation',
     syncProductIds: allocationResult.syncProductIds,
     allocationCount,
+    unallocatedLines: allocationResult.unallocatedLines,
+    unallocatedQty: allocationResult.unallocatedQty,
+    backorderLineCount: allocationResult.backorderLineCount,
     orderRef,
     isWcOrder,
     shipFromWarehouseId: so.shipFromWarehouseId,

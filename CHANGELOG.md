@@ -8,6 +8,11 @@ This repository uses an `x.y.z` release scheme.
 
 ## Unreleased - target 2.0.0
 
+### User-facing (sales allocation and backorders)
+
+- **Sales allocation now distinguishes physical reservations from backorder demand.** Auto-allocation reserves only stock that physically exists; oversell-eligible shortfalls remain unallocated and appear as backorder demand instead of inflating `reservedQty`. Operators may see existing phantom over-reservations corrected on the next re-allocation, with affected lines shown as `Backorder` or `Unallocated` in the sales-order allocation panel.
+- **Allocation activity logs include backorder details.** Allocation entries can now include unallocated quantities and per-line backorder metadata. The activity-log UI has no action allowlist, but downstream log parsers should expect the new `backorder_recorded` action and the longer allocation descriptions.
+
 ### Breaking operator change (cron authentication)
 
 - **Production cron endpoints now require bearer authentication by default.** Localhost-only cron calls without `Authorization: Bearer $CRON_SECRET` will receive `401` in production. This is an operator-facing breaking change and should ship in the next major release (`2.0.0` under the release scheme above).

@@ -179,7 +179,7 @@ export async function allocateBackordersForProducts(
         refuseIfShipmentsExist: true,
       })
       for (const productId of res.syncProductIds ?? []) syncProductIds.add(productId)
-      if (res.success) {
+      if (res.success && (res.allocationCount ?? 0) > 0) {
         result.allocated += 1
         result.orderIds.push(order.id)
       } else if (res.error && !BENIGN_ALLOC_ERRORS.has(res.error)) {

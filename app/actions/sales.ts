@@ -28,7 +28,7 @@ import {
   type RefundAccountingSyncRequest,
   type RefundRequestLine,
 } from '@/lib/domain/sales/refund-service'
-import { Prisma, type TaxCategory } from '@/app/generated/prisma/client'
+import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -48,6 +48,8 @@ export type SoLineRow = {
   sku: string
   imageUrl: string | null
   description: string
+  productType: ProductType | null
+  oversellAllowed: boolean
   qty: number
   unitPriceForeign: number  // original price before discount
   unitPriceBase: number
@@ -478,7 +480,7 @@ function mapLine(l: {
   cogsBase: unknown
   taxRateId?: string | null
   taxRate?: { id: string; name: string; rate: unknown; taxCategory?: string } | null
-  product?: { imageUrl: string | null; parent?: { imageUrl: string | null } | null } | null
+  product?: { imageUrl: string | null; type?: ProductType; oversellAllowed?: boolean; parent?: { imageUrl: string | null } | null } | null
 }): SoLineRow {
   return {
     id: l.id,
@@ -486,6 +488,8 @@ function mapLine(l: {
     sku: l.sku ?? '',
     imageUrl: l.product?.imageUrl ?? l.product?.parent?.imageUrl ?? null,
     description: l.description,
+    productType: l.product?.type ?? null,
+    oversellAllowed: l.product?.oversellAllowed ?? false,
     qty: Number(l.qty),
     unitPriceForeign: Number(l.unitPriceForeign),
     unitPriceBase: Number(l.unitPriceBase),
@@ -540,7 +544,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
           cogsBase: true,
           taxRateId: true,
           taxRate: { select: { id: true, name: true, rate: true, taxCategory: true } },
-          product: { select: { imageUrl: true, parent: { select: { imageUrl: true } } } },
+          product: { select: { imageUrl: true, type: true, oversellAllowed: true, parent: { select: { imageUrl: true } } } },
         },
       },
       refunds: {
@@ -1175,9 +1179,12 @@ export async function applySalesOrderStatusTransition(
     // Draft finalisation: when a DRAFT is moved to any non-cancelled status,
     // allocate stock and queue the sales invoice for accounting sync.
     if (isDraftFinalization) {
-      const { autoAllocateOrder } = await import('./allocation')
+      const { autoAllocateOrder, deallocateOrder } = await import('./allocation')
       const allocation = await autoAllocateOrder(id)
       if (!allocation.success) {
+        if ((allocation.allocationCount ?? 0) > 0) {
+          await deallocateOrder(id)
+        }
         await db.salesOrder.update({ where: { id }, data: { status: 'DRAFT' } })
         await logActivity({
           entityType: 'SALES_ORDER',
