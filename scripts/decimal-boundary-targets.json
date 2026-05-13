@@ -1,0 +1,10 @@
+{
+  "targets": [
+    { "path": "lib/domain" },
+    { "path": "lib/cost-layers.ts" },
+    { "path": "lib/connectors/xero" },
+    { "path": "lib/connectors/quickbooks" },
+    { "glob": "app/actions/accounting*.ts" },
+    { "glob": "app/actions/xero*.ts" }
+  ]
+}

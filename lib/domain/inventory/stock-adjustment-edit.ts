@@ -1,3 +1,4 @@
+// decimal-boundary-ok: server-action-boundary (numeric stock adjustment input validation)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 
 const QUANTITY_EPSILON = 0.000001

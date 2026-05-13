@@ -9,6 +9,7 @@ import {
   refreshShipmentCogsForCostLayerChange,
   updateSnapshotsForCostLayerChange,
 } from '@/lib/cost-layers'
+// decimal-boundary-ok: legacy-pre-stage-4 (landed-cost delta path; PR 4.2 converts this to Decimal)
 import { decimalToNumber } from '@/lib/decimal'
 
 export const LANDED_COST_DISTRIBUTION_METHODS = [

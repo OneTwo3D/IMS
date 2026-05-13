@@ -9,6 +9,7 @@ import {
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
+// decimal-boundary-ok: legacy-pre-stage-4 (refund quantity/accounting boundary; staged Decimal refactor follows)
 import { decimalToNumber } from '@/lib/decimal'
 import { roundQuantity } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'

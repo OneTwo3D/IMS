@@ -14,6 +14,7 @@ import {
 } from '@/lib/products/kit-fulfillment'
 import { buildBackorderReport, type BackorderReportLine } from '@/lib/domain/inventory/backorder-report'
 import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
+// decimal-boundary-ok: legacy-pre-stage-4 (quantity allocator; staged Decimal refactor follows)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 
 export const ALLOCATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
