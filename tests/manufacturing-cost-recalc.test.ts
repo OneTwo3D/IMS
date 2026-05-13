@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { Prisma } from '@/app/generated/prisma/client'
 import {
   buildOverheadAccountDeltas,
   recomputeManufacturingUnitCosts,
@@ -138,6 +139,39 @@ test('mixed receivedQty per layer: proportional share is by base value not qty',
   const byId = Object.fromEntries(result.map((r) => [r.layerId, r.newUnitCostBase]))
   assert.equal(byId['L1'], 60)
   assert.equal(byId['L2'], 20)
+})
+
+test('fractional manufacturing unit-cost helper matches Decimal arithmetic at the current 6dp boundary', () => {
+  const layers = [
+    { id: 'A', receivedQty: 0.3, base: 0.1 },
+    { id: 'B', receivedQty: 0.6, base: 0.2 },
+  ]
+  const currentMfgCostBase = 0.1
+
+  const result = Object.fromEntries(
+    recomputeManufacturingUnitCosts(layers, currentMfgCostBase)
+      .map((entry) => [entry.layerId, entry.newUnitCostBase]),
+  )
+
+  const totalBase = layers.reduce((sum, layer) => sum.add(layer.base), new Prisma.Decimal(0))
+  const expected = Object.fromEntries(layers.map((layer) => {
+    const share = new Prisma.Decimal(layer.base).div(totalBase)
+    const overhead = new Prisma.Decimal(currentMfgCostBase).mul(share)
+    const unitCost = new Prisma.Decimal(layer.base)
+      .add(overhead)
+      .div(layer.receivedQty)
+      .toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+      .toNumber()
+    return [layer.id, unitCost]
+  }))
+
+  assert.deepEqual(result, expected)
+})
+
+test('manufacturing cost-layer revaluation still needs Decimal-safe returned quantities and delta totals', {
+  todo: 'PR 4.5 Decimalizes recalculateManufacturingCostLayers returnedQty, unitDelta, consumedQty, COGS delta, and inventory delta.',
+}, () => {
+  assert.equal(typeof recomputeManufacturingUnitCosts, 'function')
 })
 
 test('overhead account deltas net same-account edits to zero', () => {
