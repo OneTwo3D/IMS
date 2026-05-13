@@ -16,8 +16,12 @@ const webhookEventsModule = 'default' in webhookEventsModuleNs
   ? webhookEventsModuleNs.default as typeof import('../lib/connectors/mintsoft/webhook-events.ts')
   : webhookEventsModuleNs
 
-const { verifyMintsoftWebhookSignature } = authModule
-const { extractMintsoftWebhookTimestamp, isMintsoftWebhookTimestampFresh } = webhookValidationModule
+const { isLegacyMintsoftBodyOnlySignatureAllowed, verifyMintsoftWebhookSignature } = authModule
+const {
+  extractMintsoftWebhookTimestamp,
+  extractMintsoftWebhookTimestampCandidate,
+  isMintsoftWebhookTimestampFresh,
+} = webhookValidationModule
 const { persistMintsoftWebhookEvent } = webhookEventsModule
 
 function buildInput(): PersistMintsoftWebhookEventInput {
@@ -32,17 +36,52 @@ function buildInput(): PersistMintsoftWebhookEventInput {
   }
 }
 
-test('verifyMintsoftWebhookSignature accepts both hex and base64 HMAC digests', () => {
+test('verifyMintsoftWebhookSignature accepts signed timestamp and body digests', () => {
   const secret = 'top-secret'
   const rawBody = JSON.stringify({ eventId: 'evt-1' })
-  const hex = createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex')
-  const base64 = createHmac('sha256', secret).update(rawBody, 'utf8').digest('base64')
+  const timestamp = '2026-04-22T10:00:00.000Z'
+  const signedPayload = `${timestamp}.${rawBody}`
+  const hex = createHmac('sha256', secret).update(signedPayload, 'utf8').digest('hex')
+  const base64 = createHmac('sha256', secret).update(signedPayload, 'utf8').digest('base64')
 
-  assert.equal(verifyMintsoftWebhookSignature(rawBody, hex, secret), true)
-  assert.equal(verifyMintsoftWebhookSignature(rawBody, `sha256=${hex}`, secret), true)
-  assert.equal(verifyMintsoftWebhookSignature(rawBody, base64, secret), true)
-  assert.equal(verifyMintsoftWebhookSignature(rawBody, `${base64} `, secret), true)
-  assert.equal(verifyMintsoftWebhookSignature(rawBody, 'wrong', secret), false)
+  assert.equal(verifyMintsoftWebhookSignature(rawBody, hex, secret, { timestamp }), true)
+  assert.equal(verifyMintsoftWebhookSignature(rawBody, `sha256=${hex}`, secret, { timestamp }), true)
+  assert.equal(verifyMintsoftWebhookSignature(rawBody, base64, secret, { timestamp }), true)
+  assert.equal(verifyMintsoftWebhookSignature(rawBody, `${base64} `, secret, { timestamp }), true)
+  assert.equal(verifyMintsoftWebhookSignature(rawBody, 'wrong', secret, { timestamp }), false)
+})
+
+test('verifyMintsoftWebhookSignature binds the timestamp into the signature', () => {
+  const secret = 'top-secret'
+  const rawBody = JSON.stringify({ eventId: 'evt-1' })
+  const timestamp = '2026-04-22T10:00:00.000Z'
+  const tamperedTimestamp = '2026-04-22T10:05:00.000Z'
+  const signature = createHmac('sha256', secret).update(`${timestamp}.${rawBody}`, 'utf8').digest('hex')
+
+  assert.equal(verifyMintsoftWebhookSignature(rawBody, signature, secret, { timestamp }), true)
+  assert.equal(verifyMintsoftWebhookSignature(rawBody, signature, secret, { timestamp: tamperedTimestamp }), false)
+  assert.equal(verifyMintsoftWebhookSignature(rawBody, signature, secret), false)
+})
+
+test('verifyMintsoftWebhookSignature only accepts legacy body-only signatures behind the flag', () => {
+  const secret = 'top-secret'
+  const rawBody = JSON.stringify({ eventId: 'evt-1' })
+  const signature = createHmac('sha256', secret).update(rawBody, 'utf8').digest('hex')
+
+  assert.equal(verifyMintsoftWebhookSignature(rawBody, signature, secret, {
+    timestamp: '2026-04-22T10:00:00.000Z',
+  }), false)
+  assert.equal(verifyMintsoftWebhookSignature(rawBody, signature, secret, {
+    timestamp: '2026-04-22T10:00:00.000Z',
+    allowLegacyBodyOnly: true,
+  }), true)
+})
+
+test('isLegacyMintsoftBodyOnlySignatureAllowed defaults off and accepts explicit true only', () => {
+  assert.equal(isLegacyMintsoftBodyOnlySignatureAllowed({}), false)
+  assert.equal(isLegacyMintsoftBodyOnlySignatureAllowed({ MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE: 'false' }), false)
+  assert.equal(isLegacyMintsoftBodyOnlySignatureAllowed({ MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE: 'true' }), true)
+  assert.equal(isLegacyMintsoftBodyOnlySignatureAllowed({ MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE: 'TRUE' }), true)
 })
 
 test('persistMintsoftWebhookEvent creates a new event when none exists', async () => {
@@ -164,6 +203,34 @@ test('extractMintsoftWebhookTimestamp prefers signed body timestamps when presen
       id: 'evt-1',
     }),
     null,
+  )
+})
+
+test('extractMintsoftWebhookTimestampCandidate returns the exact timestamp value to sign', () => {
+  assert.deepEqual(
+    extractMintsoftWebhookTimestampCandidate({
+      id: 'evt-1',
+      timestamp: 1776852000,
+    }),
+    {
+      date: new Date('2026-04-22T10:00:00.000Z'),
+      value: '1776852000',
+      source: 'payload',
+      key: 'timestamp',
+    },
+  )
+
+  assert.deepEqual(
+    extractMintsoftWebhookTimestampCandidate(
+      { id: 'evt-1' },
+      { 'x-mintsoft-timestamp': '2026-04-22T10:00:00.000Z' },
+    ),
+    {
+      date: new Date('2026-04-22T10:00:00.000Z'),
+      value: '2026-04-22T10:00:00.000Z',
+      source: 'header',
+      key: 'x-mintsoft-timestamp',
+    },
   )
 })
 

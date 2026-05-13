@@ -1,5 +1,10 @@
 import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
-import { getMintsoftApiConfiguration, isMintsoftConfigured, verifyMintsoftWebhookSignature } from './api/auth'
+import {
+  getMintsoftApiConfiguration,
+  isLegacyMintsoftBodyOnlySignatureAllowed,
+  isMintsoftConfigured,
+  verifyMintsoftWebhookSignature,
+} from './api/auth'
 import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 
 const CONNECTOR = 'Mintsoft'
@@ -68,10 +73,17 @@ export class MintsoftConnector implements WmsConnector {
     return fetchMintsoftBundle(externalProductId)
   }
 
-  async verifyWebhookSignature(rawBody: string, signatureHeader: string | null): Promise<boolean> {
+  async verifyWebhookSignature(
+    rawBody: string,
+    signatureHeader: string | null,
+    options?: { timestamp?: string | null },
+  ): Promise<boolean> {
     const { webhookSecret } = await getMintsoftApiConfiguration()
     if (!webhookSecret) return false
-    return verifyMintsoftWebhookSignature(rawBody, signatureHeader, webhookSecret)
+    return verifyMintsoftWebhookSignature(rawBody, signatureHeader, webhookSecret, {
+      timestamp: options?.timestamp,
+      allowLegacyBodyOnly: isLegacyMintsoftBodyOnlySignatureAllowed(),
+    })
   }
 }
 
@@ -82,7 +94,9 @@ export {
   getMintsoftApiConfiguration,
   getMintsoftConnectionRecord,
   invalidateMintsoftAccessToken,
+  isLegacyMintsoftBodyOnlySignatureAllowed,
   isMintsoftConfigured,
+  MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE_ENV,
   MINTSOFT_AUTH_TOKEN_KEY,
   normalizeMintsoftBaseUrl,
   testMintsoftConnectionSettings,

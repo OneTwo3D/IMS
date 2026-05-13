@@ -21,6 +21,10 @@ This repository uses an `x.y.z` release scheme.
 
 - **Allocation availability now uses Decimal arithmetic internally.** Sales allocation stock maps, product graph component quantities, kit requirement expansion, coverage checks, and reservation deltas now keep fractional quantities as `Prisma.Decimal` through the allocation service. This avoids binary floating-point drift when allocating fractional kit/component quantities while preserving existing UI and report number boundaries.
 
+### Fixes (Mintsoft webhook security)
+
+- **Mintsoft ASN booked-in webhooks now bind the freshness timestamp into the HMAC signature.** IMS verifies `HMAC_SHA256(secret, "${timestamp}.${rawBody}")`, rejects body-only signatures by default, and keeps a temporary `MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE=true` compatibility flag for rollout windows where a sender has not yet switched signing formats.
+
 ### User-facing (sales allocation and backorders)
 
 - **Sales allocation now distinguishes physical reservations from backorder demand.** Auto-allocation reserves only stock that physically exists; oversell-eligible shortfalls remain unallocated and appear as backorder demand instead of inflating `reservedQty`. Operators may see existing phantom over-reservations corrected on the next re-allocation, with affected lines shown as `Backorder` or `Unallocated` in the sales-order allocation panel.

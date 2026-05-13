@@ -135,5 +135,9 @@ export interface WmsConnector {
   pollReturns(since: Date): Promise<WmsReturnRecord[]>
   createBundle?(input: WmsBundleDto): Promise<WmsBundleRef>
   fetchBundle?(externalProductId: string): Promise<WmsBundleRef | null>
-  verifyWebhookSignature?(rawBody: string, signatureHeader: string | null): Promise<boolean> | boolean
+  verifyWebhookSignature?(
+    rawBody: string,
+    signatureHeader: string | null,
+    options?: { timestamp?: string | null },
+  ): Promise<boolean> | boolean
 }

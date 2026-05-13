@@ -3,9 +3,13 @@ import { NextResponse } from 'next/server'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { getMintsoftApiConfiguration, verifyMintsoftWebhookSignature } from '@/lib/connectors/mintsoft'
 import {
-  extractMintsoftWebhookTimestamp,
+  getMintsoftApiConfiguration,
+  isLegacyMintsoftBodyOnlySignatureAllowed,
+  verifyMintsoftWebhookSignature,
+} from '@/lib/connectors/mintsoft'
+import {
+  extractMintsoftWebhookTimestampCandidate,
   isMintsoftWebhookTimestampFresh,
 } from '@/lib/connectors/mintsoft/webhook-validation'
 import { processMintsoftBookedInEvent } from '@/lib/connectors/mintsoft/sync/booked-in-handler'
@@ -97,13 +101,6 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Empty request body' }, { status: 400 })
   }
 
-  const signatureHeader = request.headers.get('x-mintsoft-signature')
-  const isPluginEnabled = await isIntegrationPluginEnabled('mintsoft')
-  const { webhookSecret } = await getMintsoftApiConfiguration()
-  if (!isPluginEnabled || !webhookSecret || !verifyMintsoftWebhookSignature(rawBody, signatureHeader, webhookSecret)) {
-    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
-  }
-
   let payload: MintsoftReceiptWebhookPayload
   try {
     payload = JSON.parse(rawBody) as MintsoftReceiptWebhookPayload
@@ -111,7 +108,14 @@ export async function POST(request: Request) {
     return NextResponse.json({ error: 'Invalid JSON payload' }, { status: 400 })
   }
 
-  const webhookTimestamp = extractMintsoftWebhookTimestamp(payload as Record<string, unknown>, request.headers)
+  const signatureHeader = request.headers.get('x-mintsoft-signature')
+  const isPluginEnabled = await isIntegrationPluginEnabled('mintsoft')
+  const { webhookSecret } = await getMintsoftApiConfiguration()
+  if (!isPluginEnabled || !webhookSecret) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  const webhookTimestamp = extractMintsoftWebhookTimestampCandidate(payload as Record<string, unknown>, request.headers)
   if (!webhookTimestamp) {
     await logActivity({
       entityType: 'SYNC',
@@ -126,7 +130,15 @@ export async function POST(request: Request) {
     })
     return NextResponse.json({ error: 'Missing webhook timestamp' }, { status: 401 })
   }
-  if (!isMintsoftWebhookTimestampFresh(webhookTimestamp)) {
+
+  if (!verifyMintsoftWebhookSignature(rawBody, signatureHeader, webhookSecret, {
+    timestamp: webhookTimestamp.value,
+    allowLegacyBodyOnly: isLegacyMintsoftBodyOnlySignatureAllowed(),
+  })) {
+    return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+
+  if (!isMintsoftWebhookTimestampFresh(webhookTimestamp.date)) {
     await logActivity({
       entityType: 'SYNC',
       tag: 'sync',
@@ -135,7 +147,9 @@ export async function POST(request: Request) {
       description: 'Rejected Mintsoft ASN webhook with a stale signed timestamp',
       metadata: {
         externalAsnId: getExternalAsnId(payload),
-        timestamp: webhookTimestamp.toISOString(),
+        timestamp: webhookTimestamp.date.toISOString(),
+        timestampSource: webhookTimestamp.source,
+        timestampKey: webhookTimestamp.key,
       },
       resolveUser: false,
     })

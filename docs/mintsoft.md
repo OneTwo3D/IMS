@@ -22,6 +22,21 @@ Mintsoft is the WMS connector for stock alignment, ASN creation, product verific
 - Booked-in webhook processing is idempotent via `wms_inbound_receipt_events`.
 - Line deltas are applied only for previously unaccounted received quantities.
 
+## Booked-In Webhook Signing
+
+Mintsoft ASN booked-in webhooks must include:
+
+- `x-mintsoft-signature`: HMAC-SHA256 digest, hex or base64, optionally prefixed with `sha256=`.
+- A fresh timestamp, either in the payload (`timestamp`, `eventTime`, `occurredAt`, or `createdAt`) or in `x-mintsoft-timestamp` / `x-webhook-timestamp` / `x-timestamp`.
+
+The signed payload is:
+
+```text
+${timestamp}.${rawBody}
+```
+
+The `timestamp` string must be the exact value IMS uses for freshness validation. Body-only signatures are rejected by default. `MINTSOFT_ALLOW_LEGACY_BODY_ONLY_SIGNATURE=true` temporarily accepts legacy `HMAC(secret, rawBody)` signatures for rollout compatibility, but webhooks still require a fresh timestamp.
+
 ## Product And Bundle Sync
 
 - Product sync normalizes Mintsoft payload variants before creating or updating IMS links.
