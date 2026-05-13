@@ -4,8 +4,12 @@ import test from 'node:test'
 import {
   allocateSalesOrder,
   buildAvailableStockMapIncludingOwnReservations,
+  buildAvailableStockMap,
+  expandFulfillmentRequirementsDecimal,
+  getDecimalFulfillmentAvailableQty,
   type AllocationServiceClient,
 } from '@/lib/domain/sales/allocation-service'
+import type { FulfillmentGraphNode } from '@/lib/products/kit-fulfillment'
 
 type ProductRow = {
   id: string
@@ -431,6 +435,49 @@ test('allocateSalesOrder preserves fractional kit component quantities without f
   assert.equal(result.allocationCount, 1)
   assert.equal(state.allocations?.[0]?.qty, 0.02)
   assert.equal(state.stockLevels[0].reservedQty, 0.02)
+})
+
+test('Decimal fulfillment helpers preserve repeated fractional component sums', () => {
+  const graph: Map<string, FulfillmentGraphNode> = new Map([
+    ['kit-1', {
+      id: 'kit-1',
+      type: 'KIT',
+      productComponents: Array.from({ length: 100 }, (_, index) => ({
+        componentId: 'component-1',
+        componentSku: `COMP-${index}`,
+        qty: 0.1,
+        componentType: 'SIMPLE',
+        componentOversellAllowed: false,
+      })),
+    }],
+  ])
+
+  const requirements = expandFulfillmentRequirementsDecimal('kit-1', 1, graph)
+
+  assert.equal(requirements.get('component-1')?.toString(), '10')
+})
+
+test('Decimal fulfillment availability preserves fractional kit component coverage', () => {
+  const graph: Map<string, FulfillmentGraphNode> = new Map([
+    ['kit-1', {
+      id: 'kit-1',
+      type: 'KIT',
+      productComponents: [{
+        componentId: 'component-1',
+        componentSku: 'COMP-1',
+        qty: 0.1,
+        componentType: 'SIMPLE',
+        componentOversellAllowed: false,
+      }],
+    }],
+  ])
+  const stockMap = buildAvailableStockMap([
+    { productId: 'component-1', warehouseId: 'warehouse-1', quantity: 0.02, reservedQty: 0 },
+  ])
+
+  const available = getDecimalFulfillmentAvailableQty('kit-1', 'warehouse-1', graph, stockMap)
+
+  assert.equal(available.toString(), '0.2')
 })
 
 test('allocateSalesOrder exposes non-oversell kit component blockers in unallocated metadata', async () => {

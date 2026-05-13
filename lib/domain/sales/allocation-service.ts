@@ -9,6 +9,7 @@ import {
   expandFulfillmentRequirements,
   listFulfillmentLeafProductIds,
   loadFulfillmentProductGraph,
+  type FulfillmentGraphNode,
 } from '@/lib/products/kit-fulfillment'
 import { buildBackorderReport, type BackorderReportLine } from '@/lib/domain/inventory/backorder-report'
 import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
@@ -151,10 +152,10 @@ function applyRequirementDeltaToAvailableMap(
   }
 }
 
-function expandFulfillmentRequirementsDecimal(
+export function expandFulfillmentRequirementsDecimal(
   productId: string,
   qty: DecimalInput,
-  graph: Awaited<ReturnType<typeof loadFulfillmentProductGraph>>,
+  graph: Map<string, FulfillmentGraphNode>,
 ): Map<string, Prisma.Decimal> {
   const totals = new Map<string, Prisma.Decimal>()
 
@@ -197,10 +198,10 @@ function expandFulfillmentRequirementsDecimal(
   return totals
 }
 
-function getDecimalFulfillmentAvailableQty(
+export function getDecimalFulfillmentAvailableQty(
   productId: string,
   warehouseId: string,
-  graph: Awaited<ReturnType<typeof loadFulfillmentProductGraph>>,
+  graph: Map<string, FulfillmentGraphNode>,
   stockByProductWarehouse: DecimalStockMap,
   memo = new Map<string, Prisma.Decimal>(),
   stack = new Set<string>(),
@@ -229,6 +230,8 @@ function getDecimalFulfillmentAvailableQty(
 
   let available: Prisma.Decimal | null = null
   for (const component of node.productComponents) {
+    // TODO(stage-4): component.qty is still number-typed by the product graph loader.
+    // Switch this guard to Decimal predicates when that shared contract is widened.
     if (!Number.isFinite(component.qty) || component.qty <= 0) {
       available = new Prisma.Decimal(0)
       break
@@ -259,6 +262,8 @@ function calculateDecimalFulfillmentCoverage(
 
   let coverage: Prisma.Decimal | null = null
   for (const requirement of requirements) {
+    // TODO(stage-4): requirement.factor is still number-typed by the coverage helpers.
+    // Switch this guard to Decimal predicates when those shared contracts are widened.
     if (!Number.isFinite(requirement.factor) || requirement.factor <= 0) {
       return new Prisma.Decimal(0)
     }
@@ -429,6 +434,8 @@ export async function validateAllocationIntegrity(
     }),
   ])
 
+  // calculateCoverageByLine remains number-based until the shared fulfillment
+  // coverage helpers are widened; ALLOCATION_EPSILON_DECIMAL bounds this seam.
   const committedByLine = calculateCoverageByLine(
     requirementsByLine,
     activeShipmentLines.map((line) => ({
@@ -507,7 +514,7 @@ function mergeAllocationRows(rows: AllocationRowInput[]): AllocationRowInput[] {
 
 function collectNonOversellLeafComponents(
   productId: string,
-  graph: Awaited<ReturnType<typeof loadFulfillmentProductGraph>>,
+  graph: Map<string, FulfillmentGraphNode>,
 ): string[] {
   const blockers = new Set<string>()
 
@@ -657,6 +664,8 @@ export async function allocateSalesOrder(
       },
       select: { lineId: true, productId: true, qty: true, shipment: { select: { status: true } } },
     })
+    // calculateCoverageByLine remains number-based until the shared fulfillment
+    // coverage helpers are widened; ALLOCATION_EPSILON_DECIMAL bounds this seam.
     const committedByLine = calculateCoverageByLine(
       requirementsByLine,
       activeShipmentLines.map((line) => ({

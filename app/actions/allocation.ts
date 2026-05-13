@@ -11,15 +11,17 @@ import { decimalToNumber } from '@/lib/decimal'
 import { requirementsMapToRows, type FulfillmentRequirement } from '@/lib/products/fulfillment-coverage'
 import {
   expandFulfillmentRequirements,
-  getFulfillmentAvailableQty,
   listFulfillmentLeafProductIds,
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
 import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
+import { toDecimal } from '@/lib/domain/math/decimal'
 import {
   allocateSalesOrder,
   applyAllocationReservationDelta,
   buildAvailableStockMap,
+  expandFulfillmentRequirementsDecimal,
+  getDecimalFulfillmentAvailableQty,
   lockSalesOrder,
   lockStockLevels,
   resetAllocationAccountingIfStaged,
@@ -488,18 +490,12 @@ export async function addAllocation(
         select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
       })
       const stockMap = buildAvailableStockMap(stockLevels)
-      const avail = getFulfillmentAvailableQty(
-        productId,
-        warehouseId,
-        graph,
-        new Map([...stockMap].map(([stockProductId, byWarehouse]) => [
-          stockProductId,
-          new Map([...byWarehouse].map(([stockWarehouseId, qty]) => [stockWarehouseId, qty.toNumber()])),
-        ])),
-      )
-      if (qty > avail) throw new Error(`Only ${avail} available`)
+      const requestedQty = toDecimal(qty)
+      const avail = getDecimalFulfillmentAvailableQty(productId, warehouseId, graph, stockMap)
+      if (requestedQty.gt(avail)) throw new Error(`Only ${avail.toString()} available`)
+      const requirements = expandFulfillmentRequirementsDecimal(productId, requestedQty, graph)
 
-      for (const [leafProductId, requiredQty] of expandFulfillmentRequirements(productId, qty, graph)) {
+      for (const [leafProductId, requiredQty] of requirements) {
         const existing = await tx.orderAllocation.findUnique({
           where: {
             lineId_warehouseId_productId: {
@@ -513,7 +509,7 @@ export async function addAllocation(
         if (existing) {
           await tx.orderAllocation.update({
             where: { id: existing.id },
-            data: { qty: Number(existing.qty) + requiredQty },
+            data: { qty: toDecimal(existing.qty).add(requiredQty) },
           })
         } else {
           await tx.orderAllocation.create({
@@ -524,7 +520,7 @@ export async function addAllocation(
 
       await applyAllocationReservationDelta(
         tx,
-        [...expandFulfillmentRequirements(productId, qty, graph).entries()].map(([leafProductId, requiredQty]) => ({
+        [...requirements.entries()].map(([leafProductId, requiredQty]) => ({
           productId: leafProductId,
           warehouseId,
           qty: requiredQty,

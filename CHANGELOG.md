@@ -18,7 +18,7 @@ This repository uses an `x.y.z` release scheme.
 
 ### Fixes (allocation precision)
 
-- **Allocation availability now uses Decimal arithmetic internally.** Sales allocation stock maps, kit requirement expansion, and reservation deltas now keep fractional quantities as `Prisma.Decimal` through the allocation service. This avoids binary floating-point drift when allocating fractional kit/component quantities while preserving existing UI and report number boundaries.
+- **Allocation availability now uses Decimal arithmetic internally.** Sales allocation stock maps, kit requirement expansion, and reservation deltas now keep fractional quantities as `Prisma.Decimal` through the allocation service. This avoids binary floating-point drift when allocating fractional kit/component quantities while preserving existing UI and report number boundaries. BOM/requirement factor precision remains bounded by the existing product graph and fulfillment coverage helper contracts.
 
 ### User-facing (sales allocation and backorders)
 
