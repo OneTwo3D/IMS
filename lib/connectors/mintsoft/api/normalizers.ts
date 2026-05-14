@@ -257,11 +257,18 @@ export function normalizeMintsoftBundle(value: unknown): WmsBundleRef | null {
   }
 }
 
-export function normalizeMintsoftAsn(value: unknown): WmsAsnRef | null {
+export type MintsoftAsnNormalizationOptions = {
+  externalAsnIdFallback?: string | null
+}
+
+export function normalizeMintsoftAsn(
+  value: unknown,
+  options?: MintsoftAsnNormalizationOptions,
+): WmsAsnRef | null {
   const record = extractMintsoftObjectPayload(value)
   if (!record) return null
 
-  const externalAsnId = getFirstString(record, ASN_ID_KEYS)
+  const externalAsnId = getFirstString(record, ASN_ID_KEYS) ?? options?.externalAsnIdFallback?.trim() ?? null
   if (!externalAsnId) return null
 
   const lines = extractMintsoftArrayPayloadWithKeys(record, ASN_ARRAY_PAYLOAD_KEYS)

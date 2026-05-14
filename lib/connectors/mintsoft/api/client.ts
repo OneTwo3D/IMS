@@ -12,7 +12,7 @@ import {
   normalizeMintsoftWarehouse,
 } from './normalizers'
 
-type MintsoftRequestResult<T> = {
+export type MintsoftRequestResult<T> = {
   data: T | null
   error?: string
   status: number
@@ -263,9 +263,11 @@ export function buildMintsoftAsnCreateRequest(
 export function buildMintsoftAsnFetchByIdRequest(externalAsnId: string): {
   path: string
   method: 'GET'
-} | null {
+} {
   const normalized = externalAsnId.trim()
-  if (!normalized) return null
+  if (!normalized) {
+    throw new Error('externalAsnId is required')
+  }
 
   return {
     path: `/api/ASN/${encodeURIComponent(normalized)}`,
@@ -420,19 +422,29 @@ export async function fetchMintsoftAsns(): Promise<WmsAsnRef[]> {
 
 export async function fetchMintsoftAsnById(externalAsnId: string): Promise<WmsAsnRef | null> {
   const request = buildMintsoftAsnFetchByIdRequest(externalAsnId)
-  if (!request) return null
 
   const result = await mintsoftRequest<unknown>(request.path, { method: request.method })
+  return normalizeMintsoftAsnFetchByIdResult(externalAsnId, result)
+}
+
+export function normalizeMintsoftAsnFetchByIdResult(
+  externalAsnId: string,
+  result: MintsoftRequestResult<unknown>,
+): WmsAsnRef | null {
+  const normalizedExternalAsnId = externalAsnId.trim()
+  if (!normalizedExternalAsnId) {
+    throw new Error('externalAsnId is required')
+  }
+
   if (result.status === 404) return null
   if (result.error) {
     throw new Error(result.error)
   }
 
-  const normalized = normalizeMintsoftAsn(result.data)
+  const normalized = normalizeMintsoftAsn(result.data, {
+    externalAsnIdFallback: normalizedExternalAsnId,
+  })
   if (!normalized) return null
 
-  return {
-    ...normalized,
-    externalAsnId: normalized.externalAsnId || externalAsnId.trim(),
-  }
+  return normalized
 }

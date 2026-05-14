@@ -150,6 +150,7 @@ For Mintsoft specifically:
 
 - accepted ASN booked-in webhooks return after persistence
 - `/api/cron/mintsoft-webhook-sweeper` applies the pending stock and purchase-order effects asynchronously
+- booked-in processing uses direct ASN lookup by default; `MINTSOFT_USE_BULK_ASN_LOOKUP=true` temporarily restores the legacy list-and-match path if Mintsoft endpoint discovery proves the direct path incompatible
 
 Authentication note:
 
@@ -214,6 +215,7 @@ Key variables in the `.env` file:
 | `WC_CONSUMER_KEY` | WooCommerce API consumer key |
 | `WC_CONSUMER_SECRET` | WooCommerce API consumer secret |
 | `WC_WEBHOOK_SECRET` | Secret for verifying WooCommerce webhooks |
+| `MINTSOFT_USE_BULK_ASN_LOOKUP` | Temporary rollback flag for Mintsoft ASN booked-in processing. Default `false` uses direct ASN lookup; set `true` only if the Mintsoft direct ASN endpoint fails in staging/production. |
 | `XERO_CLIENT_ID` | Xero OAuth client ID |
 | `XERO_CLIENT_SECRET` | Xero OAuth client secret |
 | `FX_BASE_CURRENCY` | Installer/default base currency seed for first-run setup. In normal use, the live system base currency is set once in **Settings > Company**. |
