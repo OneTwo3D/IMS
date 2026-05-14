@@ -18,8 +18,10 @@
 import { createHmac } from 'node:crypto'
 
 import { db } from '@/lib/db'
+import { connectorFetch } from '@/lib/security/connector-fetch'
 import { getSettingValues } from '@/lib/settings-store'
 import type { FxRatePush, FxRatePushResult } from '../types'
+import { validateWooCommerceBaseUrl } from './url-safety'
 
 const HELPER_PATH = '/wp-json/oti/v1/fx-rates'
 const PUSH_TIMEOUT_MS = 15_000
@@ -39,15 +41,19 @@ export async function pushFxRatesToWc(rates: FxRatePush[]): Promise<FxRatePushRe
   if (!url || !secret) {
     return { supported: false, pushed: 0, errors: ['WooCommerce URL or webhook secret not configured'] }
   }
+  const validatedUrl = validateWooCommerceBaseUrl(url)
+  if (!validatedUrl.ok) {
+    return { supported: true, pushed: 0, errors: [validatedUrl.error] }
+  }
 
   if (!rates.length) return { supported: true, pushed: 0, errors: [] }
 
   const body = JSON.stringify({ rates })
   const signature = createHmac('sha256', secret).update(body).digest('hex')
-  const endpoint = url.replace(/\/+$/, '') + HELPER_PATH
+  const endpoint = validatedUrl.normalizedUrl + HELPER_PATH
 
   try {
-    const res = await fetch(endpoint, {
+    const res = await connectorFetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -55,6 +61,8 @@ export async function pushFxRatesToWc(rates: FxRatePush[]): Promise<FxRatePushRe
       },
       body,
       signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
+    }, {
+      connectorName: 'WooCommerce',
     })
 
     if (!res.ok) {
@@ -99,7 +107,11 @@ export async function probeFxHelperPlugin(): Promise<FxHelperPluginProbe> {
   if (!url) {
     return { status: 'NOT_CONFIGURED', message: 'WooCommerce store URL is not set in Sync settings.' }
   }
-  const endpoint = url.replace(/\/+$/, '') + HELPER_PATH
+  const validatedUrl = validateWooCommerceBaseUrl(url)
+  if (!validatedUrl.ok) {
+    return { status: 'NOT_CONFIGURED', message: validatedUrl.error }
+  }
+  const endpoint = validatedUrl.normalizedUrl + HELPER_PATH
 
   // Send a body the plugin will reject — empty rates list, deliberately
   // invalid HMAC. We're testing the plugin layer, not the rate logic.
@@ -107,7 +119,7 @@ export async function probeFxHelperPlugin(): Promise<FxHelperPluginProbe> {
 
   let res: Response | null = null
   try {
-    res = await fetch(endpoint, {
+    res = await connectorFetch(endpoint, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -115,6 +127,8 @@ export async function probeFxHelperPlugin(): Promise<FxHelperPluginProbe> {
       },
       body,
       signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
+    }, {
+      connectorName: 'WooCommerce',
     })
   } catch (e) {
     return {

@@ -9,6 +9,7 @@ import { decryptSecret } from '@/lib/secrets'
 import { getSettingValue } from '@/lib/settings-store'
 import { wcFetch, wcPut } from '../api'
 import { WC_SETTINGS_VERSION_KEY, WC_SYNC_ADVISORY_LOCK_KEY } from '../sync-lock'
+import { validateWooCommerceBaseUrl } from '../url-safety'
 import type { ConnectorCredentials } from '../../types'
 import { toIsoCountryCode } from '@/lib/countries'
 import {
@@ -227,8 +228,9 @@ async function snapshotProductSyncContext(): Promise<{
     const key = map.get('wc_consumer_key')
     const secret = map.get('wc_consumer_secret')
     const syncVersion = map.get(WC_SETTINGS_VERSION_KEY) ?? '0'
-    const creds: ConnectorCredentials | null = url && key && secret
-      ? { url: url.replace(/\/$/, ''), key, secret: decryptSecret(secret) }
+    const validatedUrl = url ? validateWooCommerceBaseUrl(url) : null
+    const creds: ConnectorCredentials | null = validatedUrl?.ok && key && secret
+      ? { url: validatedUrl.normalizedUrl, key, secret: decryptSecret(secret) }
       : null
     return { creds, syncVersion }
   })

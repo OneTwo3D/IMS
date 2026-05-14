@@ -43,6 +43,7 @@ import {
   WC_SYNC_ADVISORY_LOCK_KEY,
   WC_SETTINGS_VERSION_KEY,
 } from '../sync-lock'
+import { validateWooCommerceBaseUrl } from '../url-safety'
 import type { ConnectorCredentials } from '../../types'
 import {
   shouldForceWooZeroStock,
@@ -58,15 +59,14 @@ const WC_VARIATION_BATCH_SIZE = 100
 const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
 
 /**
- * `wcFetch` uses bare `fetch(...)` + `AbortSignal.timeout(...)` with no
- * internal try/catch, so DNS failures, connection resets, TLS errors,
- * and abort-timeouts escape as thrown exceptions instead of populating
- * the `{ error }` field the partial-failure logic in this module relies
- * on. Wrap every call the sync path makes so a thrown transport error
- * is normalized into the same `{ data: null, error }` shape. Without
- * this shim, a single network blip would bypass preflight/lookup error
- * collection and abort the entire sync with no `recordAttempt()` or
- * activity log, contradicting the module's partial-failure contract.
+ * `wcFetch` uses the connector HTTP client for DNS-safe outbound requests, but
+ * transport failures still escape as thrown exceptions instead of populating the
+ * `{ error }` field the partial-failure logic in this module relies on. Wrap
+ * every call the sync path makes so a thrown transport error is normalized into
+ * the same `{ data: null, error }` shape. Without this shim, a single network
+ * blip would bypass preflight/lookup error collection and abort the entire sync
+ * with no `recordAttempt()` or activity log, contradicting the module's
+ * partial-failure contract.
  *
  * The `creds` argument is the sync-run credentials snapshot. Passing
  * it explicitly (instead of letting `wcFetch` re-read credentials from
@@ -132,8 +132,9 @@ async function snapshotSyncContext(): Promise<{
     const key = map.get('wc_consumer_key')
     const secret = map.get('wc_consumer_secret')
     const syncVersion = map.get(WC_SETTINGS_VERSION_KEY) ?? '0'
-    const creds: ConnectorCredentials | null = url && key && secret
-      ? { url: url.replace(/\/$/, ''), key, secret: decryptSecret(secret) }
+    const validatedUrl = url ? validateWooCommerceBaseUrl(url) : null
+    const creds: ConnectorCredentials | null = validatedUrl?.ok && key && secret
+      ? { url: validatedUrl.normalizedUrl, key, secret: decryptSecret(secret) }
       : null
     return { creds, syncVersion }
   })

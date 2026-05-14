@@ -100,6 +100,7 @@ export {
   MINTSOFT_AUTH_TOKEN_KEY,
   normalizeMintsoftBaseUrl,
   testMintsoftConnectionSettings,
+  validateMintsoftBaseUrl,
   verifyMintsoftWebhookSignature,
 } from './api/auth'
 export {

@@ -1,6 +1,8 @@
 import { createHash, createHmac, timingSafeEqual } from 'crypto'
 import { db } from '@/lib/db'
 import { getMintsoftSettings } from '@/lib/connectors/mintsoft/settings/schema'
+import { connectorFetch } from '@/lib/security/connector-fetch'
+import { validateExternalBaseUrl } from '@/lib/security/external-url-safety'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 
 // The cached 24-hour Mintsoft API key lives in the same setting slot that older
@@ -25,17 +27,16 @@ function safeCompareSignature(expected: string, provided: string): boolean {
 }
 
 export function normalizeMintsoftBaseUrl(value: string): string | null {
-  const trimmed = value.trim()
-  if (!trimmed) return null
+  const validated = validateMintsoftBaseUrl(value)
+  return validated.ok ? validated.normalizedUrl : null
+}
 
-  try {
-    const withProtocol = /^[a-z]+:\/\//i.test(trimmed) ? trimmed : `https://${trimmed}`
-    const url = new URL(withProtocol)
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null
-    return url.toString()
-  } catch {
-    return null
-  }
+export function validateMintsoftBaseUrl(value: string) {
+  return validateExternalBaseUrl(value, {
+    connectorName: 'Mintsoft',
+    allowMissingProtocol: true,
+    allowE2eLocalHttp: true,
+  })
 }
 
 function buildMintsoftRequestUrl(path: string, baseUrl: string): URL {
@@ -140,7 +141,7 @@ async function requestMintsoftAuthSession(
   username: string,
   password: string,
 ): Promise<{ token: string; expiresAt: Date }> {
-  const response = await fetch(buildMintsoftRequestUrl('/api/Auth', baseUrl), {
+  const response = await connectorFetch(buildMintsoftRequestUrl('/api/Auth', baseUrl), {
     method: 'POST',
     headers: buildMintsoftAuthHeaders(baseUrl),
     body: JSON.stringify({
@@ -148,6 +149,9 @@ async function requestMintsoftAuthSession(
       Password: password,
     }),
     cache: 'no-store',
+  }, {
+    connectorName: 'Mintsoft',
+    allowE2eLocalHttp: true,
   })
 
   const bodyText = await response.text()

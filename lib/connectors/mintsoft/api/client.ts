@@ -1,5 +1,6 @@
 import { getMintsoftAccessToken, getMintsoftApiConfiguration, invalidateMintsoftAccessToken } from './auth'
 import type { WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import { connectorFetch } from '@/lib/security/connector-fetch'
 import {
   extractMintsoftArrayPayload,
   normalizeMintsoftAsn,
@@ -44,13 +45,16 @@ async function sendMintsoftRequest<T>(
   apiKey: string,
   init: RequestInit | undefined,
 ): Promise<MintsoftRequestResult<T>> {
-  const response = await fetch(buildMintsoftRequestUrl(path, baseUrl), {
+  const response = await connectorFetch(buildMintsoftRequestUrl(path, baseUrl), {
     ...init,
     headers: {
       ...buildMintsoftRequestHeaders(baseUrl, init),
       'ms-apikey': apiKey,
     },
     cache: 'no-store',
+  }, {
+    connectorName: 'Mintsoft',
+    allowE2eLocalHttp: true,
   })
 
   if (!response.ok) {
