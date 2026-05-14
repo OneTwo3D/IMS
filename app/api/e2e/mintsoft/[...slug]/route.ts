@@ -473,6 +473,20 @@ export async function GET(
     return NextResponse.json(state.asns.map(mapMintsoftAsnResponse))
   }
 
+  if (path.startsWith('api/ASN/')) {
+    if (!isAuthorized(request, state)) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const asnId = decodeURIComponent(path.slice('api/ASN/'.length))
+    const asn = state.asns.find((entry) => entry.id === asnId)
+    if (!asn) {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    }
+
+    return NextResponse.json(mapMintsoftAsnResponse(asn))
+  }
+
   if (path.startsWith('api/Product/')) {
     if (!isAuthorized(request, state)) {
       return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })

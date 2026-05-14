@@ -1,6 +1,6 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { fetchMintsoftAsns } from '@/lib/connectors/mintsoft'
+import { fetchMintsoftAsnById } from '@/lib/connectors/mintsoft'
 import { copyCostLayerSourceLinesProportionally, createCostLayer } from '@/lib/cost-layers'
 import { reconcileBookedInQuantities, sliceTransferSnapshotForReceipt } from './booked-in-helpers'
 import { enqueueStockSync } from '@/lib/shopping'
@@ -52,11 +52,6 @@ type ProcessMintsoftBookedInResult =
 function formatReceiptReference(externalAsnId: string, poReference: string): string {
   const normalizedAsnId = externalAsnId.replace(/[^A-Za-z0-9-]/g, '').slice(0, 32) || 'ASN'
   return `MS-${normalizedAsnId}-${poReference}`.slice(0, 100)
-}
-
-async function fetchMintsoftAsnById(externalAsnId: string) {
-  const asns = await fetchMintsoftAsns()
-  return asns.find((asn) => asn.externalAsnId === externalAsnId) ?? null
 }
 
 async function markEventFailed(eventId: string, error: string): Promise<void> {

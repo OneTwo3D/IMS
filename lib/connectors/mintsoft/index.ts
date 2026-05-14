@@ -4,7 +4,7 @@ import {
   isMintsoftConfigured,
   verifyMintsoftWebhookSignature,
 } from './api/auth'
-import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
+import { createMintsoftAsn, createMintsoftBundle, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 
 const CONNECTOR = 'Mintsoft'
 
@@ -60,6 +60,10 @@ export class MintsoftConnector implements WmsConnector {
     return createMintsoftAsn(input)
   }
 
+  async fetchAsnById(externalAsnId: string): Promise<WmsAsnRef | null> {
+    return fetchMintsoftAsnById(externalAsnId)
+  }
+
   async pollReturns(since: Date): Promise<WmsReturnRecord[]> {
     return fetchMintsoftReturns(since)
   }
@@ -99,10 +103,12 @@ export {
   verifyMintsoftWebhookSignature,
 } from './api/auth'
 export {
+  buildMintsoftAsnFetchByIdRequest,
   buildMintsoftAsnCreateRequest,
   buildMintsoftBundleCreateRequest,
   createMintsoftAsn,
   createMintsoftBundle,
+  fetchMintsoftAsnById,
   fetchMintsoftAsns,
   fetchMintsoftBundle,
   fetchMintsoftProduct,

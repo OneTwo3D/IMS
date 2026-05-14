@@ -260,6 +260,19 @@ export function buildMintsoftAsnCreateRequest(
   }
 }
 
+export function buildMintsoftAsnFetchByIdRequest(externalAsnId: string): {
+  path: string
+  method: 'GET'
+} | null {
+  const normalized = externalAsnId.trim()
+  if (!normalized) return null
+
+  return {
+    path: `/api/ASN/${encodeURIComponent(normalized)}`,
+    method: 'GET',
+  }
+}
+
 export async function upsertMintsoftProduct(
   product: WmsProductDto,
   options?: WmsUpsertProductOptions,
@@ -403,4 +416,23 @@ export async function fetchMintsoftAsns(): Promise<WmsAsnRef[]> {
   return extractMintsoftArrayPayload(result.data)
     .map((item) => normalizeMintsoftAsn(item))
     .filter((item): item is WmsAsnRef => Boolean(item))
+}
+
+export async function fetchMintsoftAsnById(externalAsnId: string): Promise<WmsAsnRef | null> {
+  const request = buildMintsoftAsnFetchByIdRequest(externalAsnId)
+  if (!request) return null
+
+  const result = await mintsoftRequest<unknown>(request.path, { method: request.method })
+  if (result.status === 404) return null
+  if (result.error) {
+    throw new Error(result.error)
+  }
+
+  const normalized = normalizeMintsoftAsn(result.data)
+  if (!normalized) return null
+
+  return {
+    ...normalized,
+    externalAsnId: normalized.externalAsnId || externalAsnId.trim(),
+  }
 }

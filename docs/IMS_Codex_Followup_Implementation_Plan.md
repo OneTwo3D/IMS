@@ -993,6 +993,8 @@ Run npm run validate and Mintsoft workflow tests.
 
 ## PR 5.3 — Add direct ASN lookup to WMS connector
 
+Status: implemented in PR #56.
+
 ### Problem
 
 Booked-in processing currently fetches all ASNs and searches for one. That will not scale.

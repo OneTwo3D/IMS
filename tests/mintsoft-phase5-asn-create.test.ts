@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import * as normalizersNs from '../lib/connectors/mintsoft/api/normalizers.ts'
 import * as clientNs from '../lib/connectors/mintsoft/api/client.ts'
@@ -67,6 +68,28 @@ test('buildMintsoftAsnCreateRequest preserves source line mapping and callback m
       }),
     },
   )
+})
+
+test('buildMintsoftAsnFetchByIdRequest targets the direct ASN endpoint', () => {
+  assert.deepEqual(
+    client.buildMintsoftAsnFetchByIdRequest(' ASN 77/2026 '),
+    {
+      path: '/api/ASN/ASN%2077%2F2026',
+      method: 'GET',
+    },
+  )
+
+  assert.equal(client.buildMintsoftAsnFetchByIdRequest('   '), null)
+})
+
+test('booked-in processor uses direct ASN lookup instead of fetch-all search', () => {
+  const source = readFileSync(
+    new URL('../lib/connectors/mintsoft/sync/booked-in-handler.ts', import.meta.url),
+    'utf8',
+  )
+
+  assert.match(source, /fetchMintsoftAsnById/)
+  assert.doesNotMatch(source, /fetchMintsoftAsns/)
 })
 
 test('normalizeMintsoftAsn accepts realistic create responses with explicit line mapping', () => {
