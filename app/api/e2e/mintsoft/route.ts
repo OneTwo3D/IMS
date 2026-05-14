@@ -34,35 +34,6 @@ type SeedWarehouse = {
   name?: string
 }
 
-type ParsedWebhookRetryState = {
-  kind: 'pending' | 'failed' | 'dead'
-  attempts: number
-  nextRetryAt: string | null
-  message: string
-}
-
-const WEBHOOK_RETRY_STATE_PREFIX = 'RETRY_STATE:'
-
-function parseWebhookRetryState(value: string | null): ParsedWebhookRetryState | null {
-  if (!value?.startsWith(WEBHOOK_RETRY_STATE_PREFIX)) return null
-
-  try {
-    const parsed = JSON.parse(value.slice(WEBHOOK_RETRY_STATE_PREFIX.length)) as Partial<ParsedWebhookRetryState>
-    if (
-      (parsed.kind === 'pending' || parsed.kind === 'failed' || parsed.kind === 'dead')
-      && typeof parsed.attempts === 'number'
-      && (parsed.nextRetryAt === null || typeof parsed.nextRetryAt === 'string')
-      && typeof parsed.message === 'string'
-    ) {
-      return parsed as ParsedWebhookRetryState
-    }
-  } catch {
-    return null
-  }
-
-  return null
-}
-
 async function resetMintsoftPersistence() {
   const jobs = await db.wmsSyncJob.findMany({
     where: { connector: 'mintsoft' },
@@ -361,14 +332,24 @@ export async function GET(request: NextRequest) {
         externalEventId: true,
         externalAsnId: true,
         processedAt: true,
-        processingError: true,
+        processingStatus: true,
+        processingAttempts: true,
+        nextRetryAt: true,
+        deadLetteredAt: true,
+        lastError: true,
       },
     })
 
     return NextResponse.json({
       events: events.map((event) => ({
         ...event,
-        retryState: parseWebhookRetryState(event.processingError),
+        retryState: {
+          status: event.processingStatus,
+          attempts: event.processingAttempts,
+          nextRetryAt: event.nextRetryAt?.toISOString() ?? null,
+          deadLetteredAt: event.deadLetteredAt?.toISOString() ?? null,
+          message: event.lastError,
+        },
       })),
     })
   }

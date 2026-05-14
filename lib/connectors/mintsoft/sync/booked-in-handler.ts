@@ -9,8 +9,6 @@ import { enqueueStockSync } from '@/lib/shopping'
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 const PENDING_ASN_FINALIZATION_REASON_PREFIX = 'PENDING_ASN_FINALIZATION:'
 const WEBHOOK_SWEEPER_MAX_EVENTS_PER_RUN = 250
-const WEBHOOK_SWEEPER_SCAN_LIMIT = 5000
-const WEBHOOK_RETRY_STATE_PREFIX = 'RETRY_STATE:'
 const MAX_PENDING_ATTEMPTS = 12
 const MAX_FAILED_ATTEMPTS = 8
 const PENDING_RETRY_BASE_MS = 60 * 1000
@@ -20,11 +18,24 @@ const MAX_FAILED_RETRY_MS = 60 * 60 * 1000
 const MINTSOFT_USE_BULK_ASN_LOOKUP_ENV = 'MINTSOFT_USE_BULK_ASN_LOOKUP'
 const mintsoftConnector = new MintsoftConnector()
 
-type WebhookRetryState = {
-  kind: 'pending' | 'failed' | 'dead'
-  attempts: number
-  nextRetryAt: string | null
-  message: string
+export const MINTSOFT_WEBHOOK_PROCESSING_STATUS = {
+  pending: 'PENDING',
+  pendingRetry: 'PENDING_RETRY',
+  failedRetry: 'FAILED_RETRY',
+  dead: 'DEAD',
+  processed: 'PROCESSED',
+} as const
+
+type MintsoftWebhookProcessingStatus = typeof MINTSOFT_WEBHOOK_PROCESSING_STATUS[keyof typeof MINTSOFT_WEBHOOK_PROCESSING_STATUS]
+
+type WebhookRetryKind = 'pending' | 'failed'
+
+type WebhookRetryUpdate = {
+  processingStatus: MintsoftWebhookProcessingStatus
+  processingAttempts: number
+  nextRetryAt: Date | null
+  deadLetteredAt: Date | null
+  lastError: string
 }
 
 type ProcessMintsoftBookedInResult =
@@ -110,76 +121,91 @@ function normalizePendingReason(reason: string): string {
     : `${PENDING_ASN_FINALIZATION_REASON_PREFIX}${reason}`
 }
 
-function parseWebhookRetryState(value: string | null | undefined): WebhookRetryState | null {
-  if (typeof value !== 'string' || !value.startsWith(WEBHOOK_RETRY_STATE_PREFIX)) return null
-  try {
-    const parsed = JSON.parse(value.slice(WEBHOOK_RETRY_STATE_PREFIX.length)) as Partial<WebhookRetryState>
-    if (
-      (parsed.kind === 'pending' || parsed.kind === 'failed' || parsed.kind === 'dead')
-      && typeof parsed.attempts === 'number'
-      && (parsed.nextRetryAt === null || typeof parsed.nextRetryAt === 'string')
-      && typeof parsed.message === 'string'
-    ) {
-      return parsed as WebhookRetryState
-    }
-  } catch {
-    return null
-  }
-  return null
-}
-
-function serializeWebhookRetryState(state: WebhookRetryState): string {
-  return `${WEBHOOK_RETRY_STATE_PREFIX}${JSON.stringify(state)}`
-}
-
-function buildNextRetryDelayMs(kind: 'pending' | 'failed', attempts: number): number {
+export function buildNextRetryDelayMs(
+  kind: WebhookRetryKind,
+  attempts: number,
+  random: () => number = Math.random,
+): number {
   const baseMs = kind === 'pending' ? PENDING_RETRY_BASE_MS : FAILED_RETRY_BASE_MS
   const capMs = kind === 'pending' ? MAX_PENDING_RETRY_MS : MAX_FAILED_RETRY_MS
-  return Math.min(baseMs * (2 ** Math.max(attempts - 1, 0)), capMs)
+  const baseDelay = Math.min(baseMs * (2 ** Math.max(attempts - 1, 0)), capMs)
+  const jitter = baseDelay * 0.2 * ((random() - 0.5) * 2)
+  return Math.min(capMs, Math.max(baseMs, Math.round(baseDelay + jitter)))
+}
+
+export function buildMintsoftWebhookRetryUpdate(
+  kind: WebhookRetryKind,
+  message: string,
+  previousAttempts: number,
+  now = new Date(),
+  random: () => number = Math.random,
+): WebhookRetryUpdate {
+  const attempts = previousAttempts + 1
+  const maxAttempts = kind === 'pending' ? MAX_PENDING_ATTEMPTS : MAX_FAILED_ATTEMPTS
+
+  if (attempts >= maxAttempts) {
+    return {
+      processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.dead,
+      processingAttempts: attempts,
+      nextRetryAt: null,
+      deadLetteredAt: now,
+      lastError: message,
+    }
+  }
+
+  return {
+    processingStatus: kind === 'pending'
+      ? MINTSOFT_WEBHOOK_PROCESSING_STATUS.pendingRetry
+      : MINTSOFT_WEBHOOK_PROCESSING_STATUS.failedRetry,
+    processingAttempts: attempts,
+    nextRetryAt: new Date(now.getTime() + buildNextRetryDelayMs(kind, attempts, random)),
+    deadLetteredAt: null,
+    lastError: message,
+  }
+}
+
+export function buildMintsoftWebhookSweepWhere(now = new Date()) {
+  return {
+    connector: 'mintsoft',
+    processedAt: null,
+    OR: [
+      { processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.pending },
+      {
+        processingStatus: {
+          in: [
+            MINTSOFT_WEBHOOK_PROCESSING_STATUS.pendingRetry,
+            MINTSOFT_WEBHOOK_PROCESSING_STATUS.failedRetry,
+          ],
+        },
+        nextRetryAt: { lte: now },
+      },
+    ],
+  }
+}
+
+export function buildMintsoftWebhookReplayForAsnWhere(externalAsnId: string) {
+  return {
+    connector: 'mintsoft',
+    externalAsnId,
+    processedAt: null,
+  }
 }
 
 async function scheduleWebhookRetry(
   eventId: string,
-  kind: 'pending' | 'failed',
+  kind: WebhookRetryKind,
   message: string,
 ): Promise<void> {
   const event = await db.wmsInboundReceiptEvent.findUnique({
     where: { id: eventId },
     select: {
-      processingError: true,
+      processingAttempts: true,
     },
   })
 
-  const previous = parseWebhookRetryState(event?.processingError)
-  const attempts = (previous?.attempts ?? 0) + 1
-  const maxAttempts = kind === 'pending' ? MAX_PENDING_ATTEMPTS : MAX_FAILED_ATTEMPTS
-
-  if (attempts >= maxAttempts) {
-    await db.wmsInboundReceiptEvent.update({
-      where: { id: eventId },
-      data: {
-        processingError: serializeWebhookRetryState({
-          kind: 'dead',
-          attempts,
-          nextRetryAt: null,
-          message,
-        }),
-      },
-    })
-    return
-  }
-
-  const nextRetryAt = new Date(Date.now() + buildNextRetryDelayMs(kind, attempts))
   await db.wmsInboundReceiptEvent.update({
     where: { id: eventId },
-    data: {
-      processingError: serializeWebhookRetryState({
-        kind,
-        attempts,
-        nextRetryAt: nextRetryAt.toISOString(),
-        message,
-      }),
-    },
+    data: buildMintsoftWebhookRetryUpdate(kind, message, event?.processingAttempts ?? 0),
   })
 }
 
@@ -848,7 +874,10 @@ export async function processMintsoftBookedInEvent(
         where: { id: lockedEvent.id },
         data: {
           processedAt: now,
-          processingError: null,
+          processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.processed,
+          nextRetryAt: null,
+          deadLetteredAt: null,
+          lastError: null,
         },
       })
 
@@ -936,11 +965,7 @@ export async function replayMintsoftBookedInEventsForAsn(externalAsnId: string):
   failed: number
 }> {
   const events = await db.wmsInboundReceiptEvent.findMany({
-    where: {
-      connector: 'mintsoft',
-      externalAsnId,
-      processedAt: null,
-    },
+    where: buildMintsoftWebhookReplayForAsnWhere(externalAsnId),
     orderBy: { receivedAt: 'asc' },
     select: { id: true },
   })
@@ -975,29 +1000,14 @@ export async function sweepUnprocessedMintsoftBookedInEvents(): Promise<{
   failed: number
 }> {
   const now = new Date()
-  const scannedEvents = await db.wmsInboundReceiptEvent.findMany({
-    where: {
-      connector: 'mintsoft',
-      processedAt: null,
-    },
+  const events = await db.wmsInboundReceiptEvent.findMany({
+    where: buildMintsoftWebhookSweepWhere(now),
     orderBy: { receivedAt: 'asc' },
     select: {
       id: true,
-      processingError: true,
     },
-    take: WEBHOOK_SWEEPER_SCAN_LIMIT,
+    take: WEBHOOK_SWEEPER_MAX_EVENTS_PER_RUN,
   })
-
-  const events = scannedEvents
-    .filter((event) => {
-      const retryState = parseWebhookRetryState(event.processingError)
-      if (!retryState) return true
-      if (retryState.kind === 'dead') return false
-      if (!retryState.nextRetryAt) return true
-      const nextRetryAt = new Date(retryState.nextRetryAt)
-      return !Number.isFinite(nextRetryAt.getTime()) || nextRetryAt <= now
-    })
-    .slice(0, WEBHOOK_SWEEPER_MAX_EVENTS_PER_RUN)
 
   const counters = {
     attempted: events.length,

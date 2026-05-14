@@ -2098,17 +2098,23 @@ model WmsStockDiscrepancy {
 }
 
 model WmsInboundReceiptEvent {
-  id              String   @id @default(cuid())
-  connector       String
-  externalEventId String
-  externalAsnId   String?
-  payload         Json
-  processedAt     DateTime?
-  processingError String?
-  receivedAt      DateTime @default(now())
+  id                 String   @id @default(cuid())
+  connector          String
+  externalEventId    String
+  externalAsnId      String?
+  payload            Json
+  processedAt        DateTime?
+  processingStatus   String   @default("PENDING")
+  processingAttempts Int      @default(0)
+  nextRetryAt        DateTime?
+  deadLetteredAt     DateTime?
+  lastError          String?
+  receivedAt         DateTime @default(now())
 
   @@unique([connector, externalEventId])
   @@index([externalAsnId])
+  @@index([processingStatus, nextRetryAt])
+  @@index([deadLetteredAt])
   @@map("wms_inbound_receipt_events")
 }
 

@@ -1041,6 +1041,8 @@ Run npm run validate and Mintsoft tests.
 
 ## PR 5.4 — Replace encoded webhook retry state with typed fields
 
+Status: implemented in PR #57.
+
 ### Problem
 
 Retry state should not be encoded inside an error string.
@@ -1057,7 +1059,7 @@ deadLetteredAt        DateTime?
 lastError             String?
 ```
 
-Backfill existing `processingError` values where possible.
+Drop the old `processingError` column once typed retry fields are present. The system was not live when this stage landed, so runtime compatibility for encoded retry strings is intentionally not retained.
 
 ### Acceptance criteria
 
@@ -1065,7 +1067,7 @@ Backfill existing `processingError` values where possible.
 - Retry state is queryable without parsing strings.
 - Sweeper uses nextRetryAt and processingStatus.
 - Dead events are visible in admin/sync UI or at least queryable.
-- Existing behavior preserved.
+- No runtime reads or writes use the old processingError column.
 ```
 
 ### Codex prompt
@@ -1077,7 +1079,7 @@ Base branch: development.
 
 Replace encoded Mintsoft webhook retry state stored in processingError with typed columns.
 Add migration fields: processingStatus, processingAttempts, nextRetryAt, deadLetteredAt, lastError.
-Backfill existing retry-state strings where possible.
+Drop processingError after typed fields are present.
 Update processing and sweeper logic to use typed fields.
 Add tests for pending retry, failed retry, dead-letter, and successful processing.
 Run npm run validate and npm run validate:db.

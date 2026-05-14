@@ -16,6 +16,7 @@ import {
   type MintsoftWebhookEventRepository,
   type PersistMintsoftWebhookEventInput,
 } from '@/lib/connectors/mintsoft/webhook-events'
+import { MINTSOFT_WEBHOOK_PROCESSING_STATUS } from '@/lib/connectors/mintsoft/sync/booked-in-handler'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 
 const MAX_WEBHOOK_BODY_BYTES = 256 * 1024
@@ -29,6 +30,38 @@ type MintsoftReceiptWebhookPayload = {
   eventTime?: string | number
   occurredAt?: string | number
   createdAt?: string | number
+}
+
+type MintsoftWebhookRetryResetSnapshot = {
+  id: string
+  processingStatus: string
+  processingAttempts: number
+  nextRetryAt: Date | null
+  deadLetteredAt: Date | null
+  lastError: string | null
+}
+
+export function shouldLogMintsoftWebhookRetryStateReset(
+  previous: MintsoftWebhookRetryResetSnapshot,
+): boolean {
+  return previous.processingStatus !== MINTSOFT_WEBHOOK_PROCESSING_STATUS.pending
+    || previous.processingAttempts > 0
+    || previous.nextRetryAt != null
+    || previous.deadLetteredAt != null
+    || previous.lastError != null
+}
+
+export function buildMintsoftWebhookRetryStateResetMetadata(
+  previous: MintsoftWebhookRetryResetSnapshot,
+): Record<string, unknown> {
+  return {
+    eventId: previous.id,
+    priorStatus: previous.processingStatus,
+    priorAttempts: previous.processingAttempts,
+    priorNextRetryAt: previous.nextRetryAt?.toISOString() ?? null,
+    priorDeadLetteredAt: previous.deadLetteredAt?.toISOString() ?? null,
+    priorLastError: previous.lastError,
+  }
 }
 
 export type MintsoftBookedInWebhookRouteDependencies = {
@@ -111,6 +144,11 @@ const defaultMintsoftBookedInWebhookDependencies: MintsoftBookedInWebhookRouteDe
           externalEventId: input.externalEventId,
           externalAsnId: input.externalAsnId,
           payload: input.payload,
+          processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.pending,
+          processingAttempts: 0,
+          nextRetryAt: null,
+          deadLetteredAt: null,
+          lastError: null,
         },
         select: { id: true },
       })
@@ -127,6 +165,17 @@ const defaultMintsoftBookedInWebhookDependencies: MintsoftBookedInWebhookRouteDe
       })
     },
     async updatePendingEvent(id, input) {
+      const previous = await db.wmsInboundReceiptEvent.findUnique({
+        where: { id },
+        select: {
+          id: true,
+          processingStatus: true,
+          processingAttempts: true,
+          nextRetryAt: true,
+          deadLetteredAt: true,
+          lastError: true,
+        },
+      })
       const updated = await db.wmsInboundReceiptEvent.updateMany({
         where: {
           id,
@@ -135,9 +184,29 @@ const defaultMintsoftBookedInWebhookDependencies: MintsoftBookedInWebhookRouteDe
         data: {
           externalAsnId: input.externalAsnId,
           payload: input.payload,
-          processingError: null,
+          processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.pending,
+          processingAttempts: 0,
+          nextRetryAt: null,
+          deadLetteredAt: null,
+          lastError: null,
         },
       })
+      if (updated.count > 0 && previous && shouldLogMintsoftWebhookRetryStateReset(previous)) {
+        await logActivity({
+          entityType: 'SYNC',
+          entityId: id,
+          tag: 'sync',
+          action: 'mintsoft_webhook_retry_state_reset',
+          level: 'WARNING',
+          description: `Reset Mintsoft webhook retry state for replayed event ${input.externalEventId}`,
+          metadata: {
+            ...buildMintsoftWebhookRetryStateResetMetadata(previous),
+            externalEventId: input.externalEventId,
+            externalAsnId: input.externalAsnId,
+          },
+          resolveUser: false,
+        })
+      }
       return updated.count > 0
     },
   },
