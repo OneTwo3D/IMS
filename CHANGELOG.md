@@ -25,6 +25,7 @@ This repository uses an `x.y.z` release scheme.
 
 - **Mintsoft ASN booked-in webhooks now bind the freshness timestamp into the HMAC signature.** IMS verifies `HMAC_SHA256(secret, "${timestamp}.${rawBody}")` and rejects body-only signatures.
 - **Mintsoft ASN booked-in webhooks now acknowledge after durable persistence.** Accepted webhooks are stored idempotently in `wms_inbound_receipt_events` and return `202 Accepted`; the Mintsoft webhook sweeper applies stock and purchase-order effects asynchronously.
+- **Mintsoft booked-in reconciliation now uses direct ASN lookup.** The processor fetches the referenced ASN by id through the WMS connector instead of listing all ASNs and searching client-side. `MINTSOFT_USE_BULK_ASN_LOOKUP=true` is available as a temporary rollback flag if Mintsoft endpoint discovery shows a different direct endpoint shape.
 
 ### User-facing (sales allocation and backorders)
 

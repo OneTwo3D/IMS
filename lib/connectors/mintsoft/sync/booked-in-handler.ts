@@ -1,6 +1,7 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { fetchMintsoftAsns } from '@/lib/connectors/mintsoft'
+import { MintsoftConnector, fetchMintsoftAsns } from '@/lib/connectors/mintsoft'
+import type { WmsAsnRef, WmsConnector } from '@/lib/connectors/wms/types'
 import { copyCostLayerSourceLinesProportionally, createCostLayer } from '@/lib/cost-layers'
 import { reconcileBookedInQuantities, sliceTransferSnapshotForReceipt } from './booked-in-helpers'
 import { enqueueStockSync } from '@/lib/shopping'
@@ -16,6 +17,8 @@ const PENDING_RETRY_BASE_MS = 60 * 1000
 const FAILED_RETRY_BASE_MS = 5 * 60 * 1000
 const MAX_PENDING_RETRY_MS = 30 * 60 * 1000
 const MAX_FAILED_RETRY_MS = 60 * 60 * 1000
+const MINTSOFT_USE_BULK_ASN_LOOKUP_ENV = 'MINTSOFT_USE_BULK_ASN_LOOKUP'
+const mintsoftConnector = new MintsoftConnector()
 
 type WebhookRetryState = {
   kind: 'pending' | 'failed' | 'dead'
@@ -49,14 +52,48 @@ type ProcessMintsoftBookedInResult =
     error: string
   }
 
+type FetchMintsoftBookedInAsnOptions = {
+  connector?: Pick<WmsConnector, 'fetchAsnById'>
+  env?: Record<string, string | undefined>
+  fetchAsns?: () => Promise<WmsAsnRef[]>
+}
+
+type ProcessMintsoftBookedInEventOptions = {
+  fetchRemoteAsn?: (externalAsnId: string) => Promise<WmsAsnRef | null>
+}
+
+export function isMintsoftBulkAsnLookupEnabled(
+  env: Record<string, string | undefined> = process.env,
+): boolean {
+  const raw = env[MINTSOFT_USE_BULK_ASN_LOOKUP_ENV]?.trim().toLowerCase()
+  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
+}
+
+export async function fetchMintsoftBookedInAsn(
+  externalAsnId: string,
+  options?: FetchMintsoftBookedInAsnOptions,
+): Promise<WmsAsnRef | null> {
+  const normalizedExternalAsnId = externalAsnId.trim()
+  if (!normalizedExternalAsnId) {
+    throw new Error('externalAsnId is required')
+  }
+
+  if (isMintsoftBulkAsnLookupEnabled(options?.env)) {
+    const asns = await (options?.fetchAsns ?? fetchMintsoftAsns)()
+    return asns.find((asn) => asn.externalAsnId === normalizedExternalAsnId) ?? null
+  }
+
+  const connector = options?.connector ?? mintsoftConnector
+  if (!connector.fetchAsnById) {
+    throw new Error('Configured WMS connector does not support direct ASN lookup')
+  }
+
+  return connector.fetchAsnById(normalizedExternalAsnId)
+}
+
 function formatReceiptReference(externalAsnId: string, poReference: string): string {
   const normalizedAsnId = externalAsnId.replace(/[^A-Za-z0-9-]/g, '').slice(0, 32) || 'ASN'
   return `MS-${normalizedAsnId}-${poReference}`.slice(0, 100)
-}
-
-async function fetchMintsoftAsnById(externalAsnId: string) {
-  const asns = await fetchMintsoftAsns()
-  return asns.find((asn) => asn.externalAsnId === externalAsnId) ?? null
 }
 
 async function markEventFailed(eventId: string, error: string): Promise<void> {
@@ -148,6 +185,7 @@ async function scheduleWebhookRetry(
 
 export async function processMintsoftBookedInEvent(
   eventId: string,
+  options?: ProcessMintsoftBookedInEventOptions,
 ): Promise<ProcessMintsoftBookedInResult> {
   const event = await db.wmsInboundReceiptEvent.findUnique({
     where: { id: eventId },
@@ -197,7 +235,7 @@ export async function processMintsoftBookedInEvent(
       select: { id: true },
     })
     const remoteAsn = mappedAsn
-      ? await fetchMintsoftAsnById(event.externalAsnId)
+      ? await (options?.fetchRemoteAsn ?? fetchMintsoftBookedInAsn)(event.externalAsnId)
       : null
 
     const processed = await db.$transaction(async (tx) => {

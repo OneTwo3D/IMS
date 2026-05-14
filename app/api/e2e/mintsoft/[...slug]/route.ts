@@ -305,6 +305,11 @@ function mapMintsoftAsnResponse(asn: FakeMintsoftAsn) {
   }
 }
 
+export function parseFakeMintsoftDirectAsnPath(path: string): string | null {
+  if (!path.startsWith('api/ASN/')) return null
+  return decodeURIComponent(path.slice('api/ASN/'.length))
+}
+
 function buildNextNumericId(values: string[]): string {
   return String(
     Math.max(
@@ -471,6 +476,20 @@ export async function GET(
     }
 
     return NextResponse.json(state.asns.map(mapMintsoftAsnResponse))
+  }
+
+  const directAsnId = parseFakeMintsoftDirectAsnPath(path)
+  if (directAsnId != null) {
+    if (!isAuthorized(request, state)) {
+      return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    }
+
+    const asn = state.asns.find((entry) => entry.id === directAsnId)
+    if (!asn) {
+      return NextResponse.json({ error: 'Not found' }, { status: 404 })
+    }
+
+    return NextResponse.json(mapMintsoftAsnResponse(asn))
   }
 
   if (path.startsWith('api/Product/')) {

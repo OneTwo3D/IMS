@@ -21,7 +21,12 @@ Mintsoft is the WMS connector for stock alignment, ASN creation, product verific
 - Mintsoft callback metadata preserves the source type, source line, product, and expected quantity.
 - Booked-in webhook receipt is idempotent via `wms_inbound_receipt_events`.
 - Accepted webhooks are persisted and acknowledged with `202 Accepted`; stock and purchase-order mutations run later through `/api/cron/mintsoft-webhook-sweeper`.
+- Booked-in processing looks up the referenced ASN directly by id through the WMS connector. Bulk ASN listing remains available for reconciliation/backfill flows and as a temporary rollback path.
 - Line deltas are applied only for previously unaccounted received quantities.
+
+### Direct ASN Lookup Rollback
+
+Direct booked-in reconciliation calls Mintsoft's `/api/ASN/:id` endpoint. If staging or production API discovery shows a different direct endpoint shape, set `MINTSOFT_USE_BULK_ASN_LOOKUP=true` to temporarily restore the legacy list-and-match path while the connector endpoint is corrected. Leave it unset or `false` for normal operation.
 
 ## Booked-In Webhook Signing
 

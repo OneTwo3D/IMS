@@ -132,6 +132,7 @@ export interface WmsConnector {
   fetchProductBySku(sku: string): Promise<WmsProductRef | null>
   upsertProduct(product: WmsProductDto, options?: WmsUpsertProductOptions): Promise<WmsProductRef>
   createAsn(input: WmsAsnInput): Promise<WmsAsnRef>
+  fetchAsnById?(externalAsnId: string): Promise<WmsAsnRef | null>
   pollReturns(since: Date): Promise<WmsReturnRecord[]>
   createBundle?(input: WmsBundleDto): Promise<WmsBundleRef>
   fetchBundle?(externalProductId: string): Promise<WmsBundleRef | null>

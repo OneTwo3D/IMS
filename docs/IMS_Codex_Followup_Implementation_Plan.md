@@ -993,6 +993,8 @@ Run npm run validate and Mintsoft workflow tests.
 
 ## PR 5.3 — Add direct ASN lookup to WMS connector
 
+Status: implemented in PR #56.
+
 ### Problem
 
 Booked-in processing currently fetches all ASNs and searches for one. That will not scale.
@@ -1010,6 +1012,8 @@ Implement in Mintsoft connector.
 Use direct lookup in booked-in processing.
 
 Keep fetch-all for reconciliation/backfill jobs.
+
+The implementation uses the optional WMS connector method for the direct path and keeps `MINTSOFT_USE_BULK_ASN_LOOKUP=true` as a temporary rollback flag if Mintsoft endpoint discovery proves `/api/ASN/:id` incompatible in staging.
 
 ### Acceptance criteria
 
