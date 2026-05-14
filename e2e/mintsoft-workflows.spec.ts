@@ -431,11 +431,12 @@ test.describe('Mintsoft integration workflows', () => {
       events: Array<{
         externalAsnId: string | null
         processedAt: string | null
-        processingError: string | null
+        processingStatus: string
         retryState: {
-          kind: string
+          status: string
           attempts: number
           nextRetryAt: string | null
+          deadLetteredAt: string | null
           message: string
         } | null
       }>
@@ -444,9 +445,9 @@ test.describe('Mintsoft integration workflows', () => {
     expect(eventsBody.events).toHaveLength(1)
     expect(eventsBody.events[0]?.externalAsnId).toBe(externalAsnId)
     expect(eventsBody.events[0]?.processedAt).toBeNull()
-    expect(eventsBody.events[0]?.processingError).toMatch(/^RETRY_STATE:/)
+    expect(eventsBody.events[0]?.processingStatus).toBe('PENDING_RETRY')
     expect(eventsBody.events[0]?.retryState).toMatchObject({
-      kind: 'pending',
+      status: 'PENDING_RETRY',
       attempts: 1,
     })
     expect(eventsBody.events[0]?.retryState?.message).toMatch(/not mapped yet; waiting for ASN finalization/i)

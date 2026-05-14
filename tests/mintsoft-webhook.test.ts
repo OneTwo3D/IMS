@@ -2,7 +2,9 @@ import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import test from 'node:test'
 import {
+  buildMintsoftWebhookRetryStateResetMetadata,
   handleMintsoftBookedInWebhook,
+  shouldLogMintsoftWebhookRetryStateReset,
   type MintsoftBookedInWebhookRouteDependencies,
 } from '../app/api/webhooks/mintsoft/asn-booked-in/route.ts'
 import * as authModuleNs from '../lib/connectors/mintsoft/api/auth.ts'
@@ -227,6 +229,41 @@ test('persistMintsoftWebhookEvent updates the pending row after a concurrent uni
     eventId: 'concurrent-1',
   })
   assert.deepEqual(updates, ['concurrent-1'])
+})
+
+test('Mintsoft webhook retry reset helper preserves prior dead-letter state for audit logs', () => {
+  const previous = {
+    id: 'event-dead',
+    processingStatus: 'DEAD',
+    processingAttempts: 12,
+    nextRetryAt: null,
+    deadLetteredAt: new Date('2026-05-14T10:00:00.000Z'),
+    lastError: 'ASN never finalized',
+  }
+
+  assert.equal(shouldLogMintsoftWebhookRetryStateReset(previous), true)
+  assert.deepEqual(
+    buildMintsoftWebhookRetryStateResetMetadata(previous),
+    {
+      eventId: 'event-dead',
+      priorStatus: 'DEAD',
+      priorAttempts: 12,
+      priorNextRetryAt: null,
+      priorDeadLetteredAt: '2026-05-14T10:00:00.000Z',
+      priorLastError: 'ASN never finalized',
+    },
+  )
+  assert.equal(
+    shouldLogMintsoftWebhookRetryStateReset({
+      id: 'event-new',
+      processingStatus: 'PENDING',
+      processingAttempts: 0,
+      nextRetryAt: null,
+      deadLetteredAt: null,
+      lastError: null,
+    }),
+    false,
+  )
 })
 
 test('Mintsoft booked-in webhook route persists and returns 202 without processing inline', async () => {
