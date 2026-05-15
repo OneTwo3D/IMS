@@ -1,4 +1,5 @@
 import { getSettingValues } from '@/lib/settings-store'
+import { connectorFetch } from '@/lib/security/connector-fetch'
 import type { ConnectorCredentials } from '../types'
 import { validateWooCommerceBaseUrl } from './url-safety'
 
@@ -12,6 +13,20 @@ async function readErrorDetails(res: Response): Promise<string> {
     return (await res.text()).slice(0, 500)
   } catch {
     return res.statusText
+  }
+}
+
+function validateWooCommerceCredentials(
+  credentials: ConnectorCredentials,
+): { ok: true; credentials: ConnectorCredentials } | { ok: false; error: string } {
+  const validated = validateWooCommerceBaseUrl(credentials.url)
+  if (!validated.ok) return { ok: false, error: validated.error }
+  return {
+    ok: true,
+    credentials: {
+      ...credentials,
+      url: validated.normalizedUrl,
+    },
   }
 }
 
@@ -39,14 +54,21 @@ export async function wcFetch(
   if (!credentials) {
     return { data: null, totalPages: 0, totalItems: 0, error: 'WooCommerce not configured. Set wc_url, wc_consumer_key, wc_consumer_secret in Settings.' }
   }
+  const validatedCredentials = validateWooCommerceCredentials(credentials)
+  if (!validatedCredentials.ok) {
+    return { data: null, totalPages: 0, totalItems: 0, error: validatedCredentials.error }
+  }
+  const safeCredentials = validatedCredentials.credentials
 
-  const url = new URL(`${credentials.url}/wp-json/wc/v3${path}`)
+  const url = new URL(`${safeCredentials.url}/wp-json/wc/v3${path}`)
   for (const [k, v] of Object.entries(params)) url.searchParams.set(k, v)
 
-  const auth = Buffer.from(`${credentials.key}:${credentials.secret}`).toString('base64')
-  const res = await fetch(url.toString(), {
+  const auth = Buffer.from(`${safeCredentials.key}:${safeCredentials.secret}`).toString('base64')
+  const res = await connectorFetch(url, {
     headers: { Authorization: `Basic ${auth}` },
     signal: AbortSignal.timeout(120000),
+  }, {
+    connectorName: 'WooCommerce',
   })
 
   if (!res.ok) {
@@ -72,13 +94,18 @@ export async function wcPost(
 ): Promise<{ data: unknown; error?: string }> {
   const credentials = creds ?? (await getWcCredentials())
   if (!credentials) return { data: null, error: 'WooCommerce not configured.' }
+  const validatedCredentials = validateWooCommerceCredentials(credentials)
+  if (!validatedCredentials.ok) return { data: null, error: validatedCredentials.error }
+  const safeCredentials = validatedCredentials.credentials
 
-  const auth = Buffer.from(`${credentials.key}:${credentials.secret}`).toString('base64')
-  const res = await fetch(`${credentials.url}/wp-json/wc/v3${path}`, {
+  const auth = Buffer.from(`${safeCredentials.key}:${safeCredentials.secret}`).toString('base64')
+  const res = await connectorFetch(`${safeCredentials.url}/wp-json/wc/v3${path}`, {
     method: 'POST',
     headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(120000),
+  }, {
+    connectorName: 'WooCommerce',
   })
 
   if (!res.ok) {
@@ -95,13 +122,18 @@ export async function wcPut(
 ): Promise<{ data: unknown; error?: string }> {
   const credentials = creds ?? (await getWcCredentials())
   if (!credentials) return { data: null, error: 'WooCommerce not configured.' }
+  const validatedCredentials = validateWooCommerceCredentials(credentials)
+  if (!validatedCredentials.ok) return { data: null, error: validatedCredentials.error }
+  const safeCredentials = validatedCredentials.credentials
 
-  const auth = Buffer.from(`${credentials.key}:${credentials.secret}`).toString('base64')
-  const res = await fetch(`${credentials.url}/wp-json/wc/v3${path}`, {
+  const auth = Buffer.from(`${safeCredentials.key}:${safeCredentials.secret}`).toString('base64')
+  const res = await connectorFetch(`${safeCredentials.url}/wp-json/wc/v3${path}`, {
     method: 'PUT',
     headers: { Authorization: `Basic ${auth}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(120000),
+  }, {
+    connectorName: 'WooCommerce',
   })
 
   if (!res.ok) {

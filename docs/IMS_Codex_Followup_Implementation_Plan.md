@@ -1091,11 +1091,13 @@ Run npm run validate and npm run validate:db.
 
 ## Goal
 
-Prevent SSRF and reduce blast radius of stored connector credentials.
+Harden connector URL handling and reduce blast radius of stored connector credentials. Full SSRF protection requires the DNS-pinned outbound lookup follow-up noted under PR 6.1.
 
 ---
 
 ## PR 6.1 — Add server-side connector URL safety
+
+Status: implemented in PR #58.
 
 ### Implementation
 
@@ -1121,6 +1123,7 @@ production:
 
 development/e2e:
   - allow local URLs only when E2E_TEST_MODE=1
+  - ignore E2E_TEST_MODE when NODE_ENV=production
 ```
 
 Apply to:
@@ -1154,6 +1157,11 @@ Allow local test URLs only when E2E_TEST_MODE=1.
 Add comprehensive tests for URL parsing edge cases.
 Run npm run validate.
 ```
+
+Implemented follow-up:
+
+- Add DNS-pinned outbound HTTP lookup validation for connector fetches. PR 6.1 validates URL strings and central wrapper inputs; the follow-up connector HTTP client validates DNS results at connection time to prevent hostname rebinding to blocked addresses.
+- Support an optional private-IP connector allow-list for VPN/internal deployments through `CONNECTOR_PRIVATE_IP_ALLOWLIST` with exact IP and CIDR entries. Production connector endpoints should still prefer public HTTPS unless an internal deployment explicitly opts into the allow-list.
 
 ---
 
@@ -1947,7 +1955,7 @@ PR 5.1  Signed timestamp for Mintsoft webhooks
 PR 5.2  Persist-and-202 webhook flow
 PR 5.3  Direct ASN lookup
 PR 5.4  Typed webhook retry fields
-PR 6.1  Connector URL SSRF protection
+PR 6.1  Connector URL hardening
 PR 6.2  Encrypted connector settings
 ```
 

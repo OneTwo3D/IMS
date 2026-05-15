@@ -22,7 +22,7 @@ test('WooCommerce URL validation blocks localhost outside e2e mode', () => {
   try {
     assert.deepEqual(validateWooCommerceBaseUrl('https://127.0.0.1:8443'), {
       ok: false,
-      error: 'WooCommerce URL cannot target loopback, link-local, or private network addresses.',
+      error: 'WooCommerce URL cannot target loopback, link-local, private, or metadata network addresses.',
     })
   } finally {
     process.env.E2E_TEST_MODE = original

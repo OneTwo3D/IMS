@@ -3,6 +3,7 @@
  */
 
 import { db } from '@/lib/db'
+import { connectorFetch } from '@/lib/security/connector-fetch'
 import { getWcCredentials } from './api'
 import type { DeliveryStatus } from '../types'
 
@@ -12,9 +13,11 @@ export async function getWcDeliveryStatus(externalOrderId: number): Promise<Deli
     if (!creds) return null
 
     const auth = Buffer.from(`${creds.key}:${creds.secret}`).toString('base64')
-    const res = await fetch(`${creds.url}/wp-json/wc/v3/orders/${externalOrderId}`, {
+    const res = await connectorFetch(`${creds.url}/wp-json/wc/v3/orders/${externalOrderId}`, {
       headers: { Authorization: `Basic ${auth}` },
       signal: AbortSignal.timeout(15000),
+    }, {
+      connectorName: 'WooCommerce',
     })
     if (!res.ok) return null
     const order = await res.json()

@@ -12,8 +12,8 @@ import {
   fetchMintsoftAsns,
   getMintsoftSettings,
   invalidateMintsoftAccessToken,
-  normalizeMintsoftBaseUrl,
   testMintsoftConnectionSettings,
+  validateMintsoftBaseUrl,
   type MintsoftSettings,
 } from '@/lib/connectors/mintsoft'
 import { inferMintsoftOrderLookupConnector } from '@/lib/connectors/mintsoft/order-lookup'
@@ -1249,7 +1249,8 @@ export async function saveMintsoftConnectionSettings(
     getMintsoftSettings(),
     getIntegrationPluginState(),
   ])
-  const baseUrl = normalizeMintsoftBaseUrl(data.baseUrl)
+  const baseUrlValidation = validateMintsoftBaseUrl(data.baseUrl)
+  const baseUrl = baseUrlValidation.ok ? baseUrlValidation.normalizedUrl : null
   const username = data.username.trim() || existingSettings.mintsoft_username
   const password = data.password.trim() || existingSettings.mintsoft_password
   const webhookSecret = data.webhookSecret.trim() || existingSettings.mintsoft_webhook_secret
@@ -1259,7 +1260,7 @@ export async function saveMintsoftConnectionSettings(
     || (availableOrderLookupConnectors.length === 1 ? availableOrderLookupConnectors[0] : '')
 
   if (!baseUrl) {
-    return { success: false, error: 'Enter a valid Mintsoft base URL.' }
+    return { success: false, error: baseUrlValidation.ok ? 'Enter a valid Mintsoft base URL.' : baseUrlValidation.error }
   }
 
   if (!username) {
