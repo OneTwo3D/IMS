@@ -5,7 +5,7 @@ const IV_LENGTH = 12
 const AUTH_TAG_LENGTH = 16
 
 function resolveEncryptionKey(): Buffer | null {
-  const raw = process.env.ENCRYPTION_KEY
+  const raw = process.env.SETTINGS_ENCRYPTION_KEY ?? process.env.ENCRYPTION_KEY
   if (!raw) return null
 
   const trimmed = raw.trim()
@@ -32,7 +32,7 @@ export function isEncryptedValue(value: string | null | undefined): value is str
 export function encryptSecret(plaintext: string): string {
   const key = resolveEncryptionKey()
   if (!key) {
-    throw new Error('ENCRYPTION_KEY is required to store encrypted secrets')
+    throw new Error('SETTINGS_ENCRYPTION_KEY or ENCRYPTION_KEY is required to store encrypted secrets')
   }
 
   const iv = randomBytes(IV_LENGTH)
@@ -48,7 +48,7 @@ export function decryptSecret(value: string): string {
 
   const key = resolveEncryptionKey()
   if (!key) {
-    throw new Error('ENCRYPTION_KEY is required to read encrypted secrets')
+    throw new Error('SETTINGS_ENCRYPTION_KEY or ENCRYPTION_KEY is required to read encrypted secrets')
   }
 
   const payload = Buffer.from(value.slice(ENCRYPTED_PREFIX.length), 'base64')

@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
-import { decryptSecret } from '@/lib/secrets'
+import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/settings-store'
 import { validateWooCommerceBaseUrl } from '@/lib/connectors/woocommerce/url-safety'
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
@@ -247,7 +247,7 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     const prevUrl = existingMap.get('wc_url') ?? ''
     const prevKey = existingMap.get('wc_consumer_key') ?? ''
     const prevSecret = existingMap.get('wc_consumer_secret')
-      ? decryptSecret(existingMap.get('wc_consumer_secret')!)
+      ? decryptSettingValue('wc_consumer_secret', existingMap.get('wc_consumer_secret')!)
       : ''
     const effectiveKey = incomingKeyIsMasked ? prevKey : nextKey
     const effectiveSecret = shouldReuseStoredSecret ? prevSecret : nextSecret

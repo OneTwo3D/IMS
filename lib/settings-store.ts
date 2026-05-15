@@ -1,5 +1,10 @@
 import { db } from '@/lib/db'
-import { decryptSecret, encryptSecret, hasEncryptionKey, isEncryptedValue } from '@/lib/secrets'
+import {
+  decryptSettingValue,
+  encryptSettingValue,
+  hasSettingsEncryptionKey,
+  isCurrentEncryptedSettingValue,
+} from '@/lib/security/encrypted-settings'
 
 const ENV_FALLBACKS: Partial<Record<string, string>> = {
   mintsoft_api_key: 'MINTSOFT_API_KEY',
@@ -7,6 +12,8 @@ const ENV_FALLBACKS: Partial<Record<string, string>> = {
   mintsoft_username: 'MINTSOFT_USERNAME',
   mintsoft_webhook_secret: 'MINTSOFT_WEBHOOK_SECRET',
   shopify_webhook_secret: 'SHOPIFY_WEBHOOK_SECRET',
+  wc_consumer_key: 'WC_CONSUMER_KEY',
+  wc_consumer_secret: 'WC_CONSUMER_SECRET',
   wc_webhook_secret: 'WC_WEBHOOK_SECRET',
 }
 
@@ -29,14 +36,15 @@ export const SENSITIVE_SETTING_KEYS = new Set([
 ])
 
 async function maybeMigrateSetting(key: string, value: string): Promise<void> {
-  if (!SENSITIVE_SETTING_KEYS.has(key) || !value || isEncryptedValue(value) || !hasEncryptionKey()) {
+  if (!SENSITIVE_SETTING_KEYS.has(key) || !value || isCurrentEncryptedSettingValue(value) || !hasSettingsEncryptionKey()) {
     return
   }
 
   try {
+    const plaintext = decryptSettingValue(key, value)
     await db.setting.update({
       where: { key },
-      data: { value: encryptSecret(value) },
+      data: { value: encryptSettingValue(key, plaintext) },
     })
   } catch {
     // Best-effort migration only.
@@ -58,7 +66,7 @@ export async function getSettingValue(key: string): Promise<string | null> {
   if (!row?.value) return null
 
   await maybeMigrateSetting(key, row.value)
-  return SENSITIVE_SETTING_KEYS.has(key) ? decryptSecret(row.value) : row.value
+  return SENSITIVE_SETTING_KEYS.has(key) ? decryptSettingValue(key, row.value) : row.value
 }
 
 export async function getSettingValues(keys: string[]): Promise<Map<string, string>> {
@@ -82,7 +90,7 @@ export async function getSettingValues(keys: string[]): Promise<Map<string, stri
   for (const row of rows) {
     result.set(
       row.key,
-      SENSITIVE_SETTING_KEYS.has(row.key) ? decryptSecret(row.value) : row.value,
+      SENSITIVE_SETTING_KEYS.has(row.key) ? decryptSettingValue(row.key, row.value) : row.value,
     )
   }
 
@@ -91,5 +99,5 @@ export async function getSettingValues(keys: string[]): Promise<Map<string, stri
 
 export function serializeSettingValue(key: string, value: string): string {
   if (!SENSITIVE_SETTING_KEYS.has(key) || !value) return value
-  return encryptSecret(value)
+  return encryptSettingValue(key, value)
 }

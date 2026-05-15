@@ -1167,6 +1167,8 @@ Implemented follow-up:
 
 ## PR 6.2 — Add encrypted settings for connector secrets
 
+Status: implemented in PR #59.
+
 ### Implementation
 
 Add helper:

@@ -2,7 +2,7 @@ import { createHmac } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
 import { expect, test } from '@playwright/test'
 import type { Page } from '@playwright/test'
-import { decryptSecret } from '../lib/secrets.ts'
+import { decryptSettingValue } from '../lib/security/encrypted-settings.ts'
 
 const wcEnabled = process.env.E2E_WC_ENABLED === 'true'
 const xeroEnabled = process.env.E2E_XERO_ENABLED === 'true'
@@ -75,7 +75,7 @@ function getSettingValues(keys: string[]) {
     order by key asc;
   `))
   for (const [key, value] of rows) {
-    result[key] = sensitiveKeys.has(key) ? decryptSecret(value) : value
+    result[key] = sensitiveKeys.has(key) ? decryptSettingValue(key, value) : value
   }
 
   return result

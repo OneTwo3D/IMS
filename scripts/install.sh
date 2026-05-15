@@ -613,7 +613,7 @@ chmod 600 "${DEPLOY_META_FILE}"
 header "Writing .env configuration"
 
 AUTH_SECRET="$(openssl rand -base64 32)"
-ENCRYPTION_KEY="$(openssl rand -base64 32)"
+SETTINGS_ENCRYPTION_KEY="$(openssl rand -base64 32)"
 CRON_SECRET="$(openssl rand -hex 32)"
 
 cat > "${APP_DIR}/.env" <<EOF
@@ -622,7 +622,7 @@ cat > "${APP_DIR}/.env" <<EOF
 NODE_ENV=production
 APP_PORT=${APP_PORT}
 AUTH_SECRET=${AUTH_SECRET}
-ENCRYPTION_KEY=${ENCRYPTION_KEY}
+SETTINGS_ENCRYPTION_KEY=${SETTINGS_ENCRYPTION_KEY}
 
 DATABASE_URL=${DATABASE_URL}
 NEXT_PUBLIC_APP_URL=https://${APP_DOMAIN}

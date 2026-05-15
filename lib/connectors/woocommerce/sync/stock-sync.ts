@@ -36,7 +36,7 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { decryptSecret } from '@/lib/secrets'
+import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { wcFetch, wcPost } from '../api'
 import {
@@ -134,7 +134,7 @@ async function snapshotSyncContext(): Promise<{
     const syncVersion = map.get(WC_SETTINGS_VERSION_KEY) ?? '0'
     const validatedUrl = url ? validateWooCommerceBaseUrl(url) : null
     const creds: ConnectorCredentials | null = validatedUrl?.ok && key && secret
-      ? { url: validatedUrl.normalizedUrl, key, secret: decryptSecret(secret) }
+      ? { url: validatedUrl.normalizedUrl, key, secret: decryptSettingValue('wc_consumer_secret', secret) }
       : null
     return { creds, syncVersion }
   })

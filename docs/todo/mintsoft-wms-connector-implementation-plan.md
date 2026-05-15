@@ -68,7 +68,7 @@ These are the already-existing utilities the new code must plug into. Do not rei
 | External fulfillment entry point | `lib/fulfillment/external-fulfillment.ts:5,88` | `'mintsoft'` already in `ExternalFulfillmentSource`. Use `applyExternalFulfillmentUpdate()` for shipment progression. **Do not write shipment rows directly.** |
 | Integration plugin toggles | `lib/integration-plugins.ts:3-9` | Add `'mintsoft'` to `IntegrationPluginId` + `PLUGIN_SETTING_KEYS` + `DEFAULT_PLUGIN_STATE` + `isIntegrationModuleVisible`. |
 | Settings storage | `lib/settings-store.ts:9-21` | Add `mintsoft_api_key`, `mintsoft_webhook_secret`, `mintsoft_base_url` (if sensitive) to `SENSITIVE_SETTING_KEYS`. |
-| Secrets crypto | `lib/secrets.ts` | AES-256-GCM via `ENCRYPTION_KEY`. Already auto-encrypts sensitive Setting keys. |
+| Secrets crypto | `lib/security/encrypted-settings.ts` | AES-256-GCM via `SETTINGS_ENCRYPTION_KEY` with legacy `ENCRYPTION_KEY` fallback. Already auto-encrypts sensitive Setting keys. |
 | Cron registry | `lib/cron-registry.ts:8-27` | Register new jobs via `registerCronJobs([...])` from a module init file imported in `lib/cron-jobs/index.ts`. |
 | Cron auth | `lib/cron-auth.ts:10-40` | `verifyCron(request)` returns a `NextResponse` error or null. |
 | Shopping link table pattern | `prisma/schema.prisma:1567-1583` (`ShoppingProductLink`), `1585-1600` (`ShoppingCustomerLink`), `1602-1619` (`ShoppingOrderLink`) | Field name is `connector` (not `provider`). **Do not reuse** — WMS gets its own `WmsProductLink`, `WmsBundleLink`, etc. |
