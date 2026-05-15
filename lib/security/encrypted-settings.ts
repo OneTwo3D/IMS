@@ -1,7 +1,10 @@
 import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'crypto'
 import { decryptSecret, isEncryptedValue as isLegacyEncryptedValue } from '@/lib/secrets'
 
-const ENCRYPTED_SETTING_PREFIX = 'enc:v2:'
+// Setting-table ciphertext format. OAuth, TOTP, and other non-Setting secrets
+// still use the legacy secret helpers until their storage paths are migrated.
+const ENCRYPTED_SETTING_PREFIX = 'enc:setting:v1:'
+const DRAFT_ENCRYPTED_SETTING_PREFIX = 'enc:v2:'
 const IV_LENGTH = 12
 const AUTH_TAG_LENGTH = 16
 
@@ -33,7 +36,11 @@ export function hasSettingsEncryptionKey(): boolean {
 }
 
 export function isEncryptedSettingValue(value: string | null | undefined): value is string {
-  return !!value && (value.startsWith(ENCRYPTED_SETTING_PREFIX) || isLegacyEncryptedValue(value))
+  return !!value && (
+    value.startsWith(ENCRYPTED_SETTING_PREFIX)
+    || value.startsWith(DRAFT_ENCRYPTED_SETTING_PREFIX)
+    || isLegacyEncryptedValue(value)
+  )
 }
 
 export function isCurrentEncryptedSettingValue(value: string | null | undefined): value is string {
@@ -56,7 +63,13 @@ export function encryptSettingValue(key: string, plaintext: string): string {
 }
 
 export function decryptSettingValue(key: string, value: string): string {
-  if (!value.startsWith(ENCRYPTED_SETTING_PREFIX)) {
+  const prefix = value.startsWith(ENCRYPTED_SETTING_PREFIX)
+    ? ENCRYPTED_SETTING_PREFIX
+    : value.startsWith(DRAFT_ENCRYPTED_SETTING_PREFIX)
+      ? DRAFT_ENCRYPTED_SETTING_PREFIX
+      : null
+
+  if (!prefix) {
     return isLegacyEncryptedValue(value) ? decryptSecret(value) : value
   }
 
@@ -65,7 +78,7 @@ export function decryptSettingValue(key: string, value: string): string {
     throw new Error('SETTINGS_ENCRYPTION_KEY is required to read encrypted settings')
   }
 
-  const payload = Buffer.from(value.slice(ENCRYPTED_SETTING_PREFIX.length), 'base64')
+  const payload = Buffer.from(value.slice(prefix.length), 'base64')
   const iv = payload.subarray(0, IV_LENGTH)
   const authTag = payload.subarray(IV_LENGTH, IV_LENGTH + AUTH_TAG_LENGTH)
   const ciphertext = payload.subarray(IV_LENGTH + AUTH_TAG_LENGTH)

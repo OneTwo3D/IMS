@@ -1228,6 +1228,16 @@ Update .env.example and docs.
 Run npm run validate.
 ```
 
+### Follow-up hardening
+
+Add multi-key support for graceful settings-key rotation after the initial encrypted-settings rollout. Target shape:
+
+```text
+SETTINGS_ENCRYPTION_KEYS={"v2026":"<base64-key>","v2027":"<base64-key>"}
+```
+
+Ciphertexts should carry the active key id in a setting-scoped prefix, and readers should try the prefix-matched key first with decrypt-only fallback to older keys. This avoids downtime when rotating between two settings keys.
+
 ---
 
 # Stage 7 — Accounting reconciliation and landed-cost audit

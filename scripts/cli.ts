@@ -5,14 +5,12 @@
  *
  * Commands:
  *   create-user   Interactively create a new user
+ *   migrate-encrypted-settings   Re-encrypt sensitive settings with SETTINGS_ENCRYPTION_KEY
  */
 import { createInterface } from 'readline'
-import { PrismaClient } from '../app/generated/prisma/client'
-import { PrismaPg } from '@prisma/adapter-pg'
 import bcrypt from 'bcryptjs'
-
-const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! })
-const db = new PrismaClient({ adapter })
+import { db } from '../lib/db/index'
+import { bulkMigrateEncryptedSettings } from '../lib/settings-store'
 
 const rl = createInterface({ input: process.stdin, output: process.stdout })
 const ask = (q: string): Promise<string> =>
@@ -65,6 +63,20 @@ async function createUser() {
   console.log(`\nUser created: ${user.email} (ID: ${user.id})`)
 }
 
+async function migrateEncryptedSettings() {
+  const result = await bulkMigrateEncryptedSettings()
+  console.log(
+    [
+      `Scanned ${result.scanned} sensitive setting(s).`,
+      `Migrated ${result.migrated}.`,
+      `Skipped ${result.skipped}.`,
+      `Raced ${result.raced}.`,
+      `Failed ${result.failed}.`,
+    ].join(' '),
+  )
+  if (result.failed > 0) process.exitCode = 1
+}
+
 const command = process.argv[2]
 
 switch (command) {
@@ -73,8 +85,16 @@ switch (command) {
       .catch(console.error)
       .finally(() => { rl.close(); db.$disconnect() })
     break
+  case 'migrate-encrypted-settings':
+    migrateEncryptedSettings()
+      .catch((error) => {
+        console.error(error)
+        process.exitCode = 1
+      })
+      .finally(() => { rl.close(); db.$disconnect() })
+    break
   default:
-    console.log('Available commands: create-user')
+    console.log('Available commands: create-user, migrate-encrypted-settings')
     rl.close()
     db.$disconnect()
 }

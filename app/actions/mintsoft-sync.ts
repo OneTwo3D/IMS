@@ -35,7 +35,7 @@ import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { hasPermission } from '@/lib/permissions'
 import { getPublicAppUrl } from '@/lib/public-app-url'
-import { serializeSettingValue } from '@/lib/settings-store'
+import { getActiveSettingEnvOverrides, serializeSettingValue } from '@/lib/settings-store'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import type { WmsAsnPackagingType } from '@/lib/connectors/wms/types'
 
@@ -112,6 +112,7 @@ export type MintsoftConnectionSettingsMasked = {
   passwordMasked: boolean
   webhookSecret: string
   webhookSecretMasked: boolean
+  envOverrides: Record<string, string>
   orderLookupConnector: MintsoftOrderLookupConnector
   active: boolean
 }
@@ -370,6 +371,12 @@ function mapMintsoftConnection(
     passwordMasked: Boolean(password),
     webhookSecret: maskSecret(webhookSecret),
     webhookSecretMasked: Boolean(webhookSecret),
+    envOverrides: getActiveSettingEnvOverrides([
+      'mintsoft_api_key',
+      'mintsoft_username',
+      'mintsoft_password',
+      'mintsoft_webhook_secret',
+    ]),
     orderLookupConnector: (connection?.orderLookupConnector as MintsoftOrderLookupConnector | null) ?? '',
     active: connection?.active ?? true,
   }

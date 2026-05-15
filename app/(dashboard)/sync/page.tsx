@@ -51,6 +51,7 @@ export default async function SyncPage() {
           accessTokenMasked: false,
           webhookSecret: '',
           webhookSecretMasked: false,
+          envOverrides: {},
         }),
     pluginState.shopify ? getShopifySyncLogs(100) : Promise.resolve([]),
     getTaxRates(),
