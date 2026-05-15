@@ -28,7 +28,12 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
 import { shopifyGraphql } from '@/lib/connectors/shopify/api'
-import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/settings-store'
+import {
+  getActiveSettingEnvOverrides,
+  getSettingValue,
+  getSettingValues,
+  serializeSettingValue,
+} from '@/lib/settings-store'
 import { getActiveShoppingConnectorInfo, syncShoppingConnectorStock } from '@/lib/shopping'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 
@@ -41,6 +46,7 @@ export type ShoppingConnectorCredentials = {
   key: string
   secret: string
   secretMasked: boolean
+  envOverrides: Record<string, string>
 }
 export type ShopifySyncSettings = {
   shopify_sync_enabled: string
@@ -51,6 +57,7 @@ export type ShopifyConnectorCredentials = {
   accessTokenMasked: boolean
   webhookSecret: string
   webhookSecretMasked: boolean
+  envOverrides: Record<string, string>
 }
 
 const SHOPIFY_SYNC_SETTING_KEYS = ['shopify_sync_enabled'] as const
@@ -241,6 +248,10 @@ export async function getShopifyConnectorCredentials(): Promise<ShopifyConnector
     accessTokenMasked: !!adminApiAccessToken,
     webhookSecret: maskSecret(webhookSecret),
     webhookSecretMasked: !!webhookSecret,
+    envOverrides: getActiveSettingEnvOverrides([
+      'shopify_admin_api_access_token',
+      'shopify_webhook_secret',
+    ]),
   }
 }
 

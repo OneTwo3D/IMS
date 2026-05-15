@@ -4,8 +4,13 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
-import { decryptSecret } from '@/lib/secrets'
-import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/settings-store'
+import { decryptSettingValue } from '@/lib/security/encrypted-settings'
+import {
+  getActiveSettingEnvOverrides,
+  getSettingValue,
+  getSettingValues,
+  serializeSettingValue,
+} from '@/lib/settings-store'
 import { validateWooCommerceBaseUrl } from '@/lib/connectors/woocommerce/url-safety'
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -44,6 +49,7 @@ export type WcSyncSettings = {
   wc_initial_import_completed: string
   wc_fx_push_enabled: string
   last_wc_fx_push_at: string
+  envOverrides: Record<string, string>
 }
 
 const SYNC_SETTING_KEYS = [
@@ -75,6 +81,7 @@ const SYNC_DEFAULTS: WcSyncSettings = {
   wc_initial_import_completed: '',
   wc_fx_push_enabled: 'false',
   last_wc_fx_push_at: '',
+  envOverrides: {},
 }
 
 export async function getWcSyncSettings(): Promise<WcSyncSettings> {
@@ -82,9 +89,11 @@ export async function getWcSyncSettings(): Promise<WcSyncSettings> {
   const map = await getSettingValues(SYNC_SETTING_KEYS)
   const result = { ...SYNC_DEFAULTS }
   for (const k of Object.keys(result) as (keyof WcSyncSettings)[]) {
+    if (k === 'envOverrides') continue
     const v = map.get(k)
     if (v) result[k] = v
   }
+  result.envOverrides = getActiveSettingEnvOverrides(SYNC_SETTING_KEYS)
   return result
 }
 
@@ -156,7 +165,7 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
     if (!validation.ok) return { success: false, error: validation.error }
   }
   const ops = Object.entries(data)
-    .filter(([k]) => SYNC_SETTING_KEYS.includes(k))
+    .filter((entry): entry is [string, string] => SYNC_SETTING_KEYS.includes(entry[0]) && typeof entry[1] === 'string')
     .map(([k, v]) =>
       db.setting.upsert({
         where: { key: k },
@@ -247,7 +256,7 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     const prevUrl = existingMap.get('wc_url') ?? ''
     const prevKey = existingMap.get('wc_consumer_key') ?? ''
     const prevSecret = existingMap.get('wc_consumer_secret')
-      ? decryptSecret(existingMap.get('wc_consumer_secret')!)
+      ? decryptSettingValue('wc_consumer_secret', existingMap.get('wc_consumer_secret')!)
       : ''
     const effectiveKey = incomingKeyIsMasked ? prevKey : nextKey
     const effectiveSecret = shouldReuseStoredSecret ? prevSecret : nextSecret
@@ -374,7 +383,7 @@ export async function resetWcProductIdCache(): Promise<{ success: boolean; wiped
   return { success: true, wipedMappings: wipedCount }
 }
 
-export async function getWcCredentials(): Promise<{ url: string; key: string; secret: string; secretMasked: boolean }> {
+export async function getWcCredentials(): Promise<{ url: string; key: string; secret: string; secretMasked: boolean; envOverrides: Record<string, string> }> {
   await requireAdmin()
   const map = await getSettingValues(['wc_url', 'wc_consumer_key', 'wc_consumer_secret'])
   const key = map.get('wc_consumer_key') ?? ''
@@ -385,6 +394,7 @@ export async function getWcCredentials(): Promise<{ url: string; key: string; se
     key: key ? `${key.slice(0, 7)}${'*'.repeat(Math.max(0, key.length - 7))}` : '',
     secret: secret ? `${secret.slice(0, 7)}${'*'.repeat(Math.max(0, secret.length - 7))}` : '',
     secretMasked: !!secret,
+    envOverrides: getActiveSettingEnvOverrides(['wc_consumer_key', 'wc_consumer_secret']),
   }
 }
 

@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
-import { Check, Loader2, Plus, RefreshCw, Settings2, Trash2 } from 'lucide-react'
+import { AlertTriangle, Check, Loader2, Plus, RefreshCw, Settings2, Trash2 } from 'lucide-react'
 import {
   confirmMintsoftAlignmentMode,
   deleteMintsoftBinding,
@@ -45,6 +45,23 @@ function formatThresholdSummary(
   if (thresholds.absoluteDelta != null) parts.push(`Abs ${thresholds.absoluteDelta}`)
   if (thresholds.percentDelta != null) parts.push(`${thresholds.percentDelta}%`)
   return parts.length > 0 ? parts.join(' / ') : 'Default'
+}
+
+function EnvOverrideNotice({ overrides }: { overrides: Record<string, string> }) {
+  const entries = Object.entries(overrides)
+  if (entries.length === 0) return null
+
+  return (
+    <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+      <div className="flex gap-2">
+        <AlertTriangle className="mt-0.5 h-3.5 w-3.5 flex-none" />
+        <span>
+          {entries.map(([settingKey, envKey]) => `${settingKey} is overridden by ${envKey}`).join('; ')}.
+          {' '}Clear the environment variable to apply changes saved here.
+        </span>
+      </div>
+    </div>
+  )
 }
 
 export function MintsoftClient({ data }: Props) {
@@ -754,6 +771,7 @@ export function MintsoftClient({ data }: Props) {
               Save the Mintsoft login credentials used to renew Mintsoft&apos;s 24-hour API key and choose which shopping connector should resolve callback order numbers.
             </DialogDescription>
           </DialogHeader>
+          <EnvOverrideNotice overrides={data.connection.envOverrides} />
 
           <div className="grid gap-3 md:grid-cols-2">
             <div className="space-y-1.5">

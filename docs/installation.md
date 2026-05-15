@@ -214,7 +214,8 @@ Key variables in the `.env` file:
 | `NEXT_PUBLIC_APP_URL` | Public URL of the application (e.g. `https://ims.yourdomain.com`) |
 | `NODE_ENV` | Set to `production` for deployment |
 | `AUTH_SECRET` | Secret key for signing session tokens (auto-generated) |
-| `ENCRYPTION_KEY` | Key used to encrypt sensitive values stored in the database (auto-generated) |
+| `SETTINGS_ENCRYPTION_KEY` | Key used to encrypt sensitive Setting values stored in the database (auto-generated) |
+| `ENCRYPTION_KEY` | Legacy fallback for older installs; keep set to the same value during migration if existing `enc:v1` secrets are present |
 | `AUTH_URL` | Authentication callback URL (same as app URL) |
 | `DATABASE_URL` | PostgreSQL connection string |
 | `REDIS_URL` | Redis connection URL |
@@ -237,6 +238,24 @@ Key variables in the `.env` file:
 | `SMTP_PORT` | SMTP server port |
 | `SMTP_USER` | SMTP authentication username |
 | `SMTP_PASS` | SMTP authentication password |
+
+### Settings Encryption Key Rotation
+
+Sensitive connector settings are stored as AES-256-GCM ciphertext when `SETTINGS_ENCRYPTION_KEY` is configured. Current Setting-table ciphertexts use the `enc:setting:v1:` prefix and are authenticated against the setting key, so a ciphertext copied from one setting cannot be replayed into another setting. Existing plaintext settings remain readable and are lazily rewritten in encrypted form when read or saved. Older `enc:v1` values encrypted with `ENCRYPTION_KEY` also remain readable while that legacy fallback is set.
+
+Run a one-shot migration after deploying the key to avoid waiting for low-traffic settings to be read:
+
+```bash
+npm run cli -- migrate-encrypted-settings
+```
+
+Environment variables for connector secrets take precedence over database settings. For example, when `WC_CONSUMER_SECRET` is non-empty, WooCommerce sync uses that value even if an operator saves a different value in the UI. Clear the environment variable and restart the app to use the database value. The connector settings UI shows a warning banner when an environment override is active.
+
+To rotate from the legacy global key to the settings key, first deploy with both the old key as `ENCRYPTION_KEY` and the new key as `SETTINGS_ENCRYPTION_KEY`, then run `npm run cli -- migrate-encrypted-settings` or save each connector settings page so sensitive values are rewritten as `enc:setting:v1:` with the new key. After confirming no `enc:v1` values remain in the `settings` table, remove the legacy `ENCRYPTION_KEY`.
+
+This release supports one active `SETTINGS_ENCRYPTION_KEY` plus the legacy `ENCRYPTION_KEY` fallback. It does not yet support a multi-key map for zero-downtime rotations between two settings keys; that is tracked in the follow-up plan.
+
+Rollback note: application versions before this feature cannot read `enc:setting:v1:` values. Rolling back past this change requires either keeping this code deployed until the old version is no longer needed, or manually decrypting and rewriting affected rows to plaintext or legacy `enc:v1` before rollback.
 
 ## Base Currency
 
