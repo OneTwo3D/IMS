@@ -213,6 +213,7 @@ enum ActivityEntityType {
   SYNC
   CURRENCY
   SYSTEM
+  AccountingReconciliationFinding
 }
 
 enum ActivityLogLevel {
@@ -939,6 +940,25 @@ model LandedCostLink {
 
   @@unique([primaryPoId, freightPoId])
   @@map("landed_cost_links")
+}
+
+model LandedCostRevaluationRun {
+  id             String   @id @default(cuid())
+  freightPoId    String?
+  primaryPoId    String?
+  triggeredById  String?
+  status         String
+  reason         String?
+  beforeJson     Json
+  afterJson      Json
+  accountingJson Json?
+  warningsJson   Json?
+  createdAt      DateTime @default(now())
+
+  @@index([freightPoId, createdAt])
+  @@index([primaryPoId, createdAt])
+  @@index([status, createdAt])
+  @@map("landed_cost_revaluation_runs")
 }
 
 /// Individual cost line items on a FREIGHT-type PO

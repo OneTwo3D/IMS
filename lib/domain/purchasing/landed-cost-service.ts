@@ -9,6 +9,7 @@ import {
   refreshShipmentCogsForCostLayerChange,
   updateSnapshotsForCostLayerChange,
 } from '@/lib/cost-layers'
+import { toJsonInputValue } from '@/lib/db/json-input'
 
 export const LANDED_COST_DISTRIBUTION_METHODS = [
   'BY_VALUE',
@@ -35,6 +36,8 @@ export type PendingGrossCostLineSource = {
 
 export type LandedCostRecalcResult = {
   revalidatePoIds: string[]
+  auditRunIds: string[]
+  warnings: LandedCostRevaluationWarning[]
   inventoryTransitAdjustments: Array<{
     primaryPoId: string
     primaryPoRef: string
@@ -49,6 +52,27 @@ export type LandedCostRecalcResult = {
     eventKey: string
     totalDelta: number
   }>
+}
+
+export type LandedCostRevaluationWarning = {
+  code: 'weight_fallback'
+  context: string
+  message: string
+}
+
+export const LANDED_COST_REVALUATION_REASONS = [
+  'direct_landed_cost_recalculation',
+  'linked_freight_recalculation',
+  'purchase_order_additional_costs_updated',
+  'freight_purchase_order_created',
+  'freight_purchase_order_costs_updated',
+] as const
+
+export type LandedCostRevaluationReason = typeof LANDED_COST_REVALUATION_REASONS[number]
+
+export type LandedCostRevaluationOptions = {
+  triggeredById: string | null
+  reason?: LandedCostRevaluationReason | null
 }
 
 type DistributionLine = {
@@ -83,7 +107,7 @@ export type LandedCostServiceDeps = {
   updateSnapshotsForCostLayerChange: typeof updateSnapshotsForCostLayerChange
   refreshShipmentCogsForCostLayerChange: typeof refreshShipmentCogsForCostLayerChange
   refreshSalesOrderLineCogsForCostLayerChange: typeof refreshSalesOrderLineCogsForCostLayerChange
-  warnWeightFallback: (context: string) => void
+  warnWeightFallback: (context: string) => LandedCostRevaluationWarning | void
 }
 
 const defaultDeps: LandedCostServiceDeps = {
@@ -100,6 +124,16 @@ const LANDED_COST_JOURNAL_EPSILON = new Prisma.Decimal('0.01')
 
 function decimal(value: Prisma.Decimal | number | string | null | undefined): Prisma.Decimal {
   return new Prisma.Decimal(value ?? 0)
+}
+
+function emptyRecalcResult(): LandedCostRecalcResult {
+  return {
+    revalidatePoIds: [],
+    auditRunIds: [],
+    warnings: [],
+    inventoryTransitAdjustments: [],
+    cogsAdjustments: [],
+  }
 }
 
 export function normalizeLandedCostMethod(
@@ -159,8 +193,14 @@ export function calculateLayerAdjustmentDeltas(input: CostLayerAdjustmentInput):
   }
 }
 
-function warnWeightFallback(context: string) {
+function makeWeightFallbackWarning(context: string): LandedCostRevaluationWarning {
   const description = `${context}: BY_WEIGHT landed-cost allocation fell back to equal split because every eligible line had zero weight`
+  return { code: 'weight_fallback', context, message: description }
+}
+
+function warnWeightFallback(context: string): LandedCostRevaluationWarning {
+  const warning = makeWeightFallbackWarning(context)
+  const description = warning.message
   console.warn(description)
   void logActivity({
     entityType: 'PURCHASE_ORDER',
@@ -172,6 +212,76 @@ function warnWeightFallback(context: string) {
     metadata: { context },
     resolveUser: false,
   }).catch((error) => console.error(error))
+  return warning
+}
+
+function captureWeightFallback(
+  result: LandedCostRecalcResult,
+  runWarnings: LandedCostRevaluationWarning[],
+  deps: LandedCostServiceDeps,
+  context: string,
+): void {
+  const warning = deps.warnWeightFallback(context) ?? makeWeightFallbackWarning(context)
+  result.warnings.push(warning)
+  runWarnings.push(warning)
+}
+
+function decimalText(value: Prisma.Decimal | number | string | null | undefined): string {
+  return decimal(value).toString()
+}
+
+function revaluationBeforeJson(po: {
+  id: string
+  reference: string
+  lines: Array<{
+    id: string
+    qty: Prisma.Decimal | number | string
+    unitCostBase: Prisma.Decimal | number | string
+    landedUnitCostBase?: Prisma.Decimal | number | string | null
+    costLayers: Array<{
+      id: string
+      unitCostBase: Prisma.Decimal | number | string
+      receivedQty: Prisma.Decimal | number | string
+      remainingQty: Prisma.Decimal | number | string
+    }>
+  }>
+}) {
+  return {
+    purchaseOrder: { id: po.id, reference: po.reference },
+    lines: po.lines.map((line) => ({
+      lineId: line.id,
+      qty: decimalText(line.qty),
+      unitCostBase: decimalText(line.unitCostBase),
+      landedUnitCostBase: decimalText(line.landedUnitCostBase),
+      costLayers: line.costLayers.map((layer) => ({
+        costLayerId: layer.id,
+        unitCostBase: decimalText(layer.unitCostBase),
+        receivedQty: decimalText(layer.receivedQty),
+        remainingQty: decimalText(layer.remainingQty),
+      })),
+    })),
+  }
+}
+
+function revaluationAccountingJson(params: {
+  primaryPoId: string
+  inventoryTransitAdjustments: LandedCostRecalcResult['inventoryTransitAdjustments']
+  cogsAdjustments: LandedCostRecalcResult['cogsAdjustments']
+}) {
+  return {
+    inventoryTransitAdjustments: params.inventoryTransitAdjustments
+      .filter((adj) => adj.primaryPoId === params.primaryPoId)
+      .map((adj) => ({
+        ...adj,
+        idempotencyKey: landedCostAdjustmentIdempotencyKey('inventory', adj),
+      })),
+    cogsAdjustments: params.cogsAdjustments
+      .filter((adj) => adj.primaryPoId === params.primaryPoId)
+      .map((adj) => ({
+        ...adj,
+        idempotencyKey: landedCostAdjustmentIdempotencyKey('cogs', adj),
+      })),
+  }
 }
 
 function landedCostAdjustmentKeyPayload(adj: LandedCostAdjustment): Record<string, unknown> {
@@ -183,11 +293,15 @@ function landedCostAdjustmentKeyPayload(adj: LandedCostAdjustment): Record<strin
   }
 }
 
-function roundAdjustmentContextValue(value: Prisma.Decimal): number {
+// Event-key context uses the project rounding policy so equivalent Decimal
+// inputs normalize consistently before hashing.
+export function roundAdjustmentContextValue(value: Prisma.Decimal): number {
   return value.toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP).toNumber()
 }
 
-function roundAdjustmentTotalDelta(value: Prisma.Decimal): number {
+// Journal totals preserve the legacy JS midpoint behavior for backward
+// compatibility with existing landed-cost adjustment idempotency keys.
+export function roundAdjustmentTotalDelta(value: Prisma.Decimal): number {
   return Math.round(value.mul(100).toNumber()) / 100
 }
 
@@ -355,13 +469,15 @@ export async function queueLandedCostAdjustmentJournals(
 export async function recalculateLandedCosts(
   tx: Prisma.TransactionClient,
   freightPoId: string,
-  deps: LandedCostServiceDeps = defaultDeps,
+  deps: LandedCostServiceDeps | undefined,
+  options: LandedCostRevaluationOptions,
 ): Promise<LandedCostRecalcResult> {
+  const serviceDeps = deps ?? defaultDeps
   const links = await tx.landedCostLink.findMany({
     where: { freightPoId },
     select: { primaryPoId: true },
   })
-  const result: LandedCostRecalcResult = { revalidatePoIds: [], inventoryTransitAdjustments: [], cogsAdjustments: [] }
+  const result = emptyRecalcResult()
 
   for (const link of links) {
     const primaryPoId = link.primaryPoId
@@ -379,6 +495,7 @@ export async function recalculateLandedCosts(
             id: true,
             qty: true,
             unitCostBase: true,
+            landedUnitCostBase: true,
             totalBase: true,
             product: { select: { weight: true } },
             costLayers: {
@@ -400,6 +517,7 @@ export async function recalculateLandedCosts(
     if (primaryPo.status === 'CLOSED') {
       throw new Error(`Cannot recalculate landed costs for ${primaryPoId}: purchase order is in a locked status`)
     }
+    const beforeJson = revaluationBeforeJson(primaryPo)
 
     const allLinks = await tx.landedCostLink.findMany({
       where: { primaryPoId },
@@ -419,6 +537,7 @@ export async function recalculateLandedCosts(
     }
 
     const eligibleLines = primaryPo.lines.filter((line) => decimal(line.qty).gt(0))
+    const runWarnings: LandedCostRevaluationWarning[] = []
     for (const freightCostLine of primaryPo.freightCostLines) {
       const method = normalizeLandedCostMethod(freightCostLine.distributionMethod)
       const bases = eligibleLines.map((line) => ({
@@ -428,7 +547,12 @@ export async function recalculateLandedCosts(
       let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
 
       if (basisTotal.lte(0)) {
-        if (method === 'BY_WEIGHT') deps.warnWeightFallback(`recalculateLandedCosts:${primaryPo.reference}`)
+        if (method === 'BY_WEIGHT') captureWeightFallback(
+          result,
+          runWarnings,
+          serviceDeps,
+          `recalculateLandedCosts:${primaryPo.reference}`,
+        )
         const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
         basisTotal = equalBase
         for (const entry of bases) entry.base = new Prisma.Decimal(1)
@@ -451,7 +575,12 @@ export async function recalculateLandedCosts(
         let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
 
         if (basisTotal.lte(0)) {
-          if (method === 'BY_WEIGHT') deps.warnWeightFallback(`recalculateLandedCosts:${primaryPo.reference}:linked`)
+          if (method === 'BY_WEIGHT') captureWeightFallback(
+            result,
+            runWarnings,
+            serviceDeps,
+            `recalculateLandedCosts:${primaryPo.reference}:linked`,
+          )
           const equalBase = new Prisma.Decimal(eligibleLines.length || 1)
           basisTotal = equalBase
           for (const entry of bases) entry.base = new Prisma.Decimal(1)
@@ -468,6 +597,28 @@ export async function recalculateLandedCosts(
     let totalCogsDelta = new Prisma.Decimal(0)
     let totalInventoryDelta = new Prisma.Decimal(0)
     const adjustmentLayers: LandedCostAdjustmentLayerContext[] = []
+    const afterLines: Array<{
+      lineId: string
+      qty: string
+      unitCostBase: string
+      landedAmountBase: string
+      grossUnitCostBase: string
+      costLayers: Array<{
+        costLayerId: string
+        oldUnitCostBase: string
+        newUnitCostBase: string
+        receivedQty: string
+        remainingQty: string
+        consumedQty: string
+        returnedQty: string
+        supplierReturnedQty: string
+        cogsDelta: string
+        inventoryDelta: string
+        affectedRefundSnapshots: number
+        affectedShipments: number
+        affectedSalesOrderLines: number
+      }>
+    }> = []
 
     for (const line of primaryPo.lines) {
       const lineQty = decimal(line.qty)
@@ -477,6 +628,21 @@ export async function recalculateLandedCosts(
       const landedForLine = decimal(landedByLine.get(line.id))
       const landedPerUnit = landedForLine.div(lineQty)
       const grossUnitCostBase = baseUnitCostBase.add(landedPerUnit).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+      const afterLayers: Array<{
+        costLayerId: string
+        oldUnitCostBase: string
+        newUnitCostBase: string
+        receivedQty: string
+        remainingQty: string
+        consumedQty: string
+        returnedQty: string
+        supplierReturnedQty: string
+        cogsDelta: string
+        inventoryDelta: string
+        affectedRefundSnapshots: number
+        affectedShipments: number
+        affectedSalesOrderLines: number
+      }> = []
 
       await tx.purchaseOrderLine.update({
         where: { id: line.id },
@@ -490,10 +656,10 @@ export async function recalculateLandedCosts(
         const remainingQty = decimal(cl.remainingQty)
         const consumedQty = receivedQty.sub(remainingQty)
         const returnedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-          ? decimal(await deps.getReturnedQtyForCostLayer(tx, cl.id))
+          ? decimal(await serviceDeps.getReturnedQtyForCostLayer(tx, cl.id))
           : new Prisma.Decimal(0)
         const supplierReturnedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-          ? decimal(await deps.getSupplierReturnedQtyForCostLayer(tx, cl.id))
+          ? decimal(await serviceDeps.getSupplierReturnedQtyForCostLayer(tx, cl.id))
           : new Prisma.Decimal(0)
         const deltas = calculateLayerAdjustmentDeltas({
           oldUnitCost,
@@ -522,12 +688,38 @@ export async function recalculateLandedCosts(
           data: { unitCostBase: grossUnitCostBase },
         })
 
+        let affectedRefundSnapshots = 0
+        let affectedShipments = 0
+        let affectedSalesOrderLines = 0
         if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
-          await deps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
-          await deps.refreshShipmentCogsForCostLayerChange(tx, cl.id)
-          await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
+          affectedRefundSnapshots = await serviceDeps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
+          affectedShipments = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id)
+          affectedSalesOrderLines = await serviceDeps.refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
         }
+        afterLayers.push({
+          costLayerId: cl.id,
+          oldUnitCostBase: oldUnitCost.toString(),
+          newUnitCostBase: newUnitCost.toString(),
+          receivedQty: receivedQty.toString(),
+          remainingQty: remainingQty.toString(),
+          consumedQty: consumedQty.toString(),
+          returnedQty: returnedQty.toString(),
+          supplierReturnedQty: supplierReturnedQty.toString(),
+          cogsDelta: deltas.cogsDelta.toString(),
+          inventoryDelta: deltas.inventoryDelta.toString(),
+          affectedRefundSnapshots,
+          affectedShipments,
+          affectedSalesOrderLines,
+        })
       }
+      afterLines.push({
+        lineId: line.id,
+        qty: lineQty.toString(),
+        unitCostBase: baseUnitCostBase.toString(),
+        landedAmountBase: landedForLine.toString(),
+        grossUnitCostBase: grossUnitCostBase.toString(),
+        costLayers: afterLayers,
+      })
     }
 
     result.revalidatePoIds.push(primaryPoId)
@@ -554,6 +746,32 @@ export async function recalculateLandedCosts(
       where: { primaryPoId, freightPoId },
       data: { allocated: true },
     })
+
+    // Audit row writes inside the transaction so an audit failure aborts the
+    // recalc. Trade-off: schema bugs here break the operation; benefit:
+    // every committed landed-cost change has a matching audit row.
+    const auditRun = await tx.landedCostRevaluationRun.create({
+      data: {
+        freightPoId,
+        primaryPoId,
+        triggeredById: options.triggeredById ?? null,
+        status: 'COMPLETED',
+        reason: options.reason ?? 'linked_freight_recalculation',
+        beforeJson: toJsonInputValue(beforeJson),
+        afterJson: toJsonInputValue({
+          purchaseOrder: { id: primaryPo.id, reference: primaryPo.reference },
+          lines: afterLines,
+        }),
+        accountingJson: toJsonInputValue(revaluationAccountingJson({
+          primaryPoId,
+          inventoryTransitAdjustments: result.inventoryTransitAdjustments,
+          cogsAdjustments: result.cogsAdjustments,
+        })),
+        warningsJson: toJsonInputValue(runWarnings),
+      },
+      select: { id: true },
+    })
+    result.auditRunIds.push(auditRun.id)
   }
   return result
 }
@@ -567,8 +785,11 @@ export async function recalculateLandedCosts(
 export async function recalculateDirectLandedCosts(
   tx: Prisma.TransactionClient,
   poId: string,
-  deps: LandedCostServiceDeps = defaultDeps,
+  deps: LandedCostServiceDeps | undefined,
+  options: LandedCostRevaluationOptions,
 ): Promise<LandedCostRecalcResult> {
+  const serviceDeps = deps ?? defaultDeps
+  const result = emptyRecalcResult()
   const po = await tx.purchaseOrder.findUnique({
     where: { id: poId },
     select: {
@@ -581,6 +802,7 @@ export async function recalculateDirectLandedCosts(
           id: true,
           qty: true,
           unitCostBase: true,
+          landedUnitCostBase: true,
           totalBase: true,
           product: { select: { weight: true } },
           costLayers: {
@@ -609,10 +831,11 @@ export async function recalculateDirectLandedCosts(
       },
     },
   })
-  if (!po) return { revalidatePoIds: [], inventoryTransitAdjustments: [], cogsAdjustments: [] }
+  if (!po) return result
   if (po.status === 'CLOSED') {
     throw new Error(`Cannot recalculate landed costs for ${poId}: purchase order is in a locked status`)
   }
+  const beforeJson = revaluationBeforeJson(po)
 
   const landedByLine = new Map<string, Prisma.Decimal>()
   for (const line of po.lines) {
@@ -621,22 +844,34 @@ export async function recalculateDirectLandedCosts(
 
   const eligibleLines = po.lines.filter((line) => decimal(line.qty).gt(0))
   const freightCostLines = [
-    ...po.freightCostLines,
-    ...po.landedCostLinks.flatMap((link) => link.freightPO.freightCostLines),
+    ...po.freightCostLines.map((freightCostLine) => ({
+      freightCostLine,
+      warningContext: `recalculateDirectLandedCosts:${po.reference}`,
+    })),
+    ...po.landedCostLinks.flatMap((link) => link.freightPO.freightCostLines.map((freightCostLine) => ({
+      freightCostLine,
+      warningContext: `recalculateDirectLandedCosts:${po.reference}:linked`,
+    }))),
   ]
-  for (const fcl of freightCostLines) {
-    const method = normalizeLandedCostMethod(fcl.distributionMethod)
+  const runWarnings: LandedCostRevaluationWarning[] = []
+  for (const { freightCostLine, warningContext } of freightCostLines) {
+    const method = normalizeLandedCostMethod(freightCostLine.distributionMethod)
     const bases = eligibleLines.map((line) => ({
       lineId: line.id,
       base: computeDistributionBase(line, method),
     }))
     let basisTotal = bases.reduce((sum, entry) => sum.add(entry.base), new Prisma.Decimal(0))
     if (basisTotal.lte(0)) {
-      if (method === 'BY_WEIGHT') deps.warnWeightFallback(`recalculateDirectLandedCosts:${po.reference}`)
+      if (method === 'BY_WEIGHT') captureWeightFallback(
+        result,
+        runWarnings,
+        serviceDeps,
+        warningContext,
+      )
       basisTotal = new Prisma.Decimal(eligibleLines.length || 1)
       for (const entry of bases) entry.base = new Prisma.Decimal(1)
     }
-    const amountBase = decimal(fcl.amountBase)
+    const amountBase = decimal(freightCostLine.amountBase)
     for (const entry of bases) {
       const share = amountBase.mul(entry.base).div(basisTotal)
       landedByLine.set(entry.lineId, decimal(landedByLine.get(entry.lineId)).add(share))
@@ -646,6 +881,28 @@ export async function recalculateDirectLandedCosts(
   let totalCogsDelta = new Prisma.Decimal(0)
   let totalInventoryDelta = new Prisma.Decimal(0)
   const adjustmentLayers: LandedCostAdjustmentLayerContext[] = []
+  const afterLines: Array<{
+    lineId: string
+    qty: string
+    unitCostBase: string
+    landedAmountBase: string
+    grossUnitCostBase: string
+    costLayers: Array<{
+      costLayerId: string
+      oldUnitCostBase: string
+      newUnitCostBase: string
+      receivedQty: string
+      remainingQty: string
+      consumedQty: string
+      returnedQty: string
+      supplierReturnedQty: string
+      cogsDelta: string
+      inventoryDelta: string
+      affectedRefundSnapshots: number
+      affectedShipments: number
+      affectedSalesOrderLines: number
+    }>
+  }> = []
 
   for (const line of po.lines) {
     const lineQty = decimal(line.qty)
@@ -655,6 +912,21 @@ export async function recalculateDirectLandedCosts(
     const landedForLine = decimal(landedByLine.get(line.id))
     const landedPerUnit = landedForLine.div(lineQty)
     const grossUnitCostBase = baseUnitCostBase.add(landedPerUnit).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+    const afterLayers: Array<{
+      costLayerId: string
+      oldUnitCostBase: string
+      newUnitCostBase: string
+      receivedQty: string
+      remainingQty: string
+      consumedQty: string
+      returnedQty: string
+      supplierReturnedQty: string
+      cogsDelta: string
+      inventoryDelta: string
+      affectedRefundSnapshots: number
+      affectedShipments: number
+      affectedSalesOrderLines: number
+    }> = []
 
     await tx.purchaseOrderLine.update({
       where: { id: line.id },
@@ -668,10 +940,10 @@ export async function recalculateDirectLandedCosts(
       const remainingQty = decimal(cl.remainingQty)
       const consumedQty = receivedQty.sub(remainingQty)
       const returnedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-        ? decimal(await deps.getReturnedQtyForCostLayer(tx, cl.id))
+        ? decimal(await serviceDeps.getReturnedQtyForCostLayer(tx, cl.id))
         : new Prisma.Decimal(0)
       const supplierReturnedQty = consumedQty.gt(LANDED_COST_DELTA_EPSILON)
-        ? decimal(await deps.getSupplierReturnedQtyForCostLayer(tx, cl.id))
+        ? decimal(await serviceDeps.getSupplierReturnedQtyForCostLayer(tx, cl.id))
         : new Prisma.Decimal(0)
       const deltas = calculateLayerAdjustmentDeltas({
         oldUnitCost,
@@ -700,15 +972,41 @@ export async function recalculateDirectLandedCosts(
         data: { unitCostBase: grossUnitCostBase },
       })
 
+      let affectedRefundSnapshots = 0
+      let affectedShipments = 0
+      let affectedSalesOrderLines = 0
       if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
-        await deps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
-        await deps.refreshShipmentCogsForCostLayerChange(tx, cl.id)
-        await deps.refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
+        affectedRefundSnapshots = await serviceDeps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
+        affectedShipments = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id)
+        affectedSalesOrderLines = await serviceDeps.refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
       }
+      afterLayers.push({
+        costLayerId: cl.id,
+        oldUnitCostBase: oldUnitCost.toString(),
+        newUnitCostBase: newUnitCost.toString(),
+        receivedQty: receivedQty.toString(),
+        remainingQty: remainingQty.toString(),
+        consumedQty: consumedQty.toString(),
+        returnedQty: returnedQty.toString(),
+        supplierReturnedQty: supplierReturnedQty.toString(),
+        cogsDelta: deltas.cogsDelta.toString(),
+        inventoryDelta: deltas.inventoryDelta.toString(),
+        affectedRefundSnapshots,
+        affectedShipments,
+        affectedSalesOrderLines,
+      })
     }
+    afterLines.push({
+      lineId: line.id,
+      qty: lineQty.toString(),
+      unitCostBase: baseUnitCostBase.toString(),
+      landedAmountBase: landedForLine.toString(),
+      grossUnitCostBase: grossUnitCostBase.toString(),
+      costLayers: afterLayers,
+    })
   }
 
-  const result: LandedCostRecalcResult = { revalidatePoIds: [poId], inventoryTransitAdjustments: [], cogsAdjustments: [] }
+  result.revalidatePoIds.push(poId)
   const eventKey = landedCostAdjustmentEventKey(poId, adjustmentLayers)
   if (totalInventoryDelta.abs().gt(LANDED_COST_JOURNAL_EPSILON)) {
     result.inventoryTransitAdjustments.push({
@@ -726,5 +1024,30 @@ export async function recalculateDirectLandedCosts(
       totalDelta: roundAdjustmentTotalDelta(totalCogsDelta),
     })
   }
+  // Audit row writes inside the transaction so an audit failure aborts the
+  // recalc. Trade-off: schema bugs here break the operation; benefit:
+  // every committed landed-cost change has a matching audit row.
+  const auditRun = await tx.landedCostRevaluationRun.create({
+    data: {
+      freightPoId: null,
+      primaryPoId: poId,
+      triggeredById: options.triggeredById ?? null,
+      status: 'COMPLETED',
+      reason: options.reason ?? 'direct_landed_cost_recalculation',
+      beforeJson: toJsonInputValue(beforeJson),
+      afterJson: toJsonInputValue({
+        purchaseOrder: { id: po.id, reference: po.reference },
+        lines: afterLines,
+      }),
+      accountingJson: toJsonInputValue(revaluationAccountingJson({
+        primaryPoId: poId,
+        inventoryTransitAdjustments: result.inventoryTransitAdjustments,
+        cogsAdjustments: result.cogsAdjustments,
+      })),
+      warningsJson: toJsonInputValue(runWarnings),
+    },
+    select: { id: true },
+  })
+  result.auditRunIds.push(auditRun.id)
   return result
 }

@@ -16,8 +16,15 @@ import {
   normalizeLandedCostMethod,
   recalculateDirectLandedCosts,
   recalculateLandedCosts,
+  roundAdjustmentContextValue,
+  roundAdjustmentTotalDelta,
   type LandedCostServiceDeps,
 } from '@/lib/domain/purchasing/landed-cost-service'
+
+const TEST_AUDIT_OPTIONS = {
+  triggeredById: null,
+  reason: 'direct_landed_cost_recalculation',
+} as const
 
 const baseLines = [
   {
@@ -360,12 +367,19 @@ function noopDeps(overrides: Partial<LandedCostServiceDeps> = {}): LandedCostSer
   }
 }
 
-function createDirectTx(po: unknown) {
+function createDirectTx(
+  po: unknown,
+  options: {
+    createAuditRun?: (args: unknown, existingRuns: unknown[]) => Promise<{ id: string }>
+  } = {},
+) {
   const purchaseOrderLineUpdates: unknown[] = []
   const costLayerUpdates: unknown[] = []
+  const landedCostRevaluationRuns: unknown[] = []
   return {
     purchaseOrderLineUpdates,
     costLayerUpdates,
+    landedCostRevaluationRuns,
     tx: {
       purchaseOrder: {
         findUnique: async () => po,
@@ -380,6 +394,13 @@ function createDirectTx(po: unknown) {
         update: async (args: unknown) => {
           costLayerUpdates.push(args)
           return args
+        },
+      },
+      landedCostRevaluationRun: {
+        create: async (args: unknown) => {
+          if (options.createAuditRun) return options.createAuditRun(args, landedCostRevaluationRuns)
+          landedCostRevaluationRuns.push(args)
+          return { id: `audit-${landedCostRevaluationRuns.length}` }
         },
       },
     },
@@ -412,7 +433,7 @@ async function directRecalcForSingleLayer(params: {
     landedCostLinks: [],
   })
 
-  return recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps())
+  return recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps(), TEST_AUDIT_OPTIONS)
 }
 
 test('recalculateDirectLandedCosts rejects CLOSED purchase orders', async () => {
@@ -426,7 +447,7 @@ test('recalculateDirectLandedCosts rejects CLOSED purchase orders', async () => 
   })
 
   await assert.rejects(
-    recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps()),
+    recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps(), TEST_AUDIT_OPTIONS),
     /locked status/,
   )
 })
@@ -453,14 +474,14 @@ test('recalculateLandedCosts rejects CLOSED linked primary purchase orders', asy
   }
 
   await assert.rejects(
-    recalculateLandedCosts(tx as never, 'freight-1', noopDeps()),
+    recalculateLandedCosts(tx as never, 'freight-1', noopDeps(), TEST_AUDIT_OPTIONS),
     /locked status/,
   )
 })
 
 test('recalculateDirectLandedCosts falls back to equal split when every BY_WEIGHT line has zero weight', async () => {
   const warned: string[] = []
-  const { tx, purchaseOrderLineUpdates } = createDirectTx({
+  const { tx, purchaseOrderLineUpdates, landedCostRevaluationRuns } = createDirectTx({
     id: 'po-1',
     reference: 'PO-1',
     status: 'RECEIVED',
@@ -486,11 +507,24 @@ test('recalculateDirectLandedCosts falls back to equal split when every BY_WEIGH
     landedCostLinks: [],
   })
 
-  await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps({
-    warnWeightFallback: (context) => warned.push(context),
-  }))
+  const result = await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps({
+    warnWeightFallback: (context) => {
+      warned.push(context)
+    },
+  }), TEST_AUDIT_OPTIONS)
 
   assert.deepEqual(warned, ['recalculateDirectLandedCosts:PO-1'])
+  assert.deepEqual(result.warnings.map((warning) => warning.context), ['recalculateDirectLandedCosts:PO-1'])
+  const auditRun = landedCostRevaluationRuns[0] as {
+    data: {
+      triggeredById: string | null
+      reason: string
+      warningsJson: Array<{ context: string }>
+    }
+  }
+  assert.deepEqual(auditRun.data.warningsJson.map((warning) => warning.context), ['recalculateDirectLandedCosts:PO-1'])
+  assert.equal(auditRun.data.triggeredById, null)
+  assert.equal(auditRun.data.reason.length > 0, true)
   assert.deepEqual(
     purchaseOrderLineUpdates.map((entry) => ({
       id: (entry as { where: { id: string } }).where.id,
@@ -534,7 +568,7 @@ test('recalculateDirectLandedCosts combines direct and linked landed-cost lines'
     }],
   })
 
-  await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps())
+  await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps(), TEST_AUDIT_OPTIONS)
 
   assert.deepEqual(
     purchaseOrderLineUpdates.map((entry) => ({
@@ -545,6 +579,41 @@ test('recalculateDirectLandedCosts combines direct and linked landed-cost lines'
       { id: 'line-a', landedUnitCostBase: 30 },
       { id: 'line-b', landedUnitCostBase: 50 },
     ],
+  )
+})
+
+test('recalculateDirectLandedCosts records direct and linked weight fallback warnings separately', async () => {
+  const { tx, landedCostRevaluationRuns } = createDirectTx({
+    id: 'po-1',
+    reference: 'PO-1',
+    status: 'RECEIVED',
+    lines: [{
+      id: 'line-a',
+      qty: 1,
+      unitCostBase: 10,
+      landedUnitCostBase: 10,
+      totalBase: 10,
+      product: { weight: 0 },
+      costLayers: [{ id: 'layer-a', unitCostBase: 10, receivedQty: 1, remainingQty: 1 }],
+    }],
+    freightCostLines: [{ amountBase: 5, distributionMethod: 'BY_WEIGHT' }],
+    landedCostLinks: [{
+      freightPO: {
+        freightCostLines: [{ amountBase: 7, distributionMethod: 'BY_WEIGHT' }],
+      },
+    }],
+  })
+
+  const result = await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps(), TEST_AUDIT_OPTIONS)
+
+  assert.deepEqual(
+    result.warnings.map((warning) => warning.context),
+    ['recalculateDirectLandedCosts:PO-1', 'recalculateDirectLandedCosts:PO-1:linked'],
+  )
+  const auditRun = landedCostRevaluationRuns[0] as { data: { warningsJson: Array<{ context: string }> } }
+  assert.deepEqual(
+    auditRun.data.warningsJson.map((warning) => warning.context),
+    ['recalculateDirectLandedCosts:PO-1', 'recalculateDirectLandedCosts:PO-1:linked'],
   )
 })
 
@@ -571,7 +640,7 @@ test('recalculateDirectLandedCosts skips snapshot refresh when cost delta is neg
       snapshotRefreshes += 1
       return 0
     },
-  }))
+  }), TEST_AUDIT_OPTIONS)
 
   assert.equal(snapshotRefreshes, 0)
 })
@@ -606,11 +675,141 @@ test('recalculateDirectLandedCosts keeps fractional returns and snapshot cost as
       snapshotUnitCost = toDecimal(newUnitCostBase).toString()
       return 1
     },
-  }))
+  }), TEST_AUDIT_OPTIONS)
 
   assert.equal(snapshotUnitCost, '1.1')
   assert.deepEqual(result.cogsAdjustments.map((adj) => adj.totalDelta), [0.02])
   assert.deepEqual(result.inventoryTransitAdjustments.map((adj) => adj.totalDelta), [0.05])
+})
+
+test('recalculateDirectLandedCosts writes an audit run with cost-layer and accounting context', async () => {
+  const { tx, landedCostRevaluationRuns } = createDirectTx({
+    id: 'po-1',
+    reference: 'PO-1',
+    status: 'RECEIVED',
+    lines: [{
+      id: 'line-a',
+      qty: '1',
+      unitCostBase: '1.00',
+      landedUnitCostBase: '1.00',
+      totalBase: '1.00',
+      product: { weight: 1 },
+      costLayers: [{
+        id: 'layer-a',
+        unitCostBase: '1.00',
+        receivedQty: '1',
+        remainingQty: '1',
+      }],
+    }],
+    freightCostLines: [{ amountBase: '0.10', distributionMethod: 'BY_QUANTITY' }],
+    landedCostLinks: [],
+  })
+
+  const result = await recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps({
+    updateSnapshotsForCostLayerChange: async () => 2,
+    refreshShipmentCogsForCostLayerChange: async () => 3,
+    refreshSalesOrderLineCogsForCostLayerChange: async () => 4,
+  }), { triggeredById: 'user-1', reason: 'direct_landed_cost_recalculation' })
+
+  assert.deepEqual(result.auditRunIds, ['audit-1'])
+  const auditRun = landedCostRevaluationRuns[0] as {
+    data: {
+      primaryPoId: string
+      freightPoId: string | null
+      triggeredById: string | null
+      status: string
+      reason: string
+      beforeJson: {
+        lines: Array<{ costLayers: Array<{ unitCostBase: string }> }>
+      }
+      afterJson: {
+        lines: Array<{
+          grossUnitCostBase: string
+          costLayers: Array<{
+            oldUnitCostBase: string
+            newUnitCostBase: string
+            inventoryDelta: string
+            affectedRefundSnapshots: number
+            affectedShipments: number
+            affectedSalesOrderLines: number
+          }>
+        }>
+      }
+      accountingJson: {
+        inventoryTransitAdjustments: Array<{ totalDelta: number; idempotencyKey: string }>
+        cogsAdjustments: unknown[]
+      }
+      warningsJson: unknown[]
+    }
+  }
+
+  assert.equal(auditRun.data.primaryPoId, 'po-1')
+  assert.equal(auditRun.data.freightPoId, null)
+  assert.equal(auditRun.data.triggeredById, 'user-1')
+  assert.equal(auditRun.data.status, 'COMPLETED')
+  assert.equal(auditRun.data.reason, 'direct_landed_cost_recalculation')
+  assert.equal(auditRun.data.beforeJson.lines[0]?.costLayers[0]?.unitCostBase, '1')
+  assert.equal(auditRun.data.afterJson.lines[0]?.grossUnitCostBase, '1.1')
+  assert.deepEqual(auditRun.data.afterJson.lines[0]?.costLayers[0], {
+    costLayerId: 'layer-a',
+    oldUnitCostBase: '1',
+    newUnitCostBase: '1.1',
+    receivedQty: '1',
+    remainingQty: '1',
+    consumedQty: '0',
+    returnedQty: '0',
+    supplierReturnedQty: '0',
+    cogsDelta: '0',
+    inventoryDelta: '0.1',
+    affectedRefundSnapshots: 2,
+    affectedShipments: 3,
+    affectedSalesOrderLines: 4,
+  })
+  assert.equal(auditRun.data.accountingJson.inventoryTransitAdjustments[0]?.totalDelta, 0.1)
+  assert.equal(
+    auditRun.data.accountingJson.inventoryTransitAdjustments[0]?.idempotencyKey,
+    landedCostAdjustmentIdempotencyKey('inventory', result.inventoryTransitAdjustments[0]!),
+  )
+  assert.deepEqual(auditRun.data.accountingJson.cogsAdjustments, [])
+  assert.deepEqual(auditRun.data.warningsJson, [])
+})
+
+test('recalculateDirectLandedCosts treats audit persistence as transaction-critical', async () => {
+  const { tx } = createDirectTx({
+    id: 'po-1',
+    reference: 'PO-1',
+    status: 'RECEIVED',
+    lines: [{
+      id: 'line-a',
+      qty: '1',
+      unitCostBase: '1.00',
+      landedUnitCostBase: '1.00',
+      totalBase: '1.00',
+      product: { weight: 1 },
+      costLayers: [{
+        id: 'layer-a',
+        unitCostBase: '1.00',
+        receivedQty: '1',
+        remainingQty: '1',
+      }],
+    }],
+    freightCostLines: [{ amountBase: '0.10', distributionMethod: 'BY_QUANTITY' }],
+    landedCostLinks: [],
+  }, {
+    createAuditRun: async () => {
+      throw new Error('audit insert failed')
+    },
+  })
+
+  await assert.rejects(
+    recalculateDirectLandedCosts(tx as never, 'po-1', noopDeps(), TEST_AUDIT_OPTIONS),
+    /audit insert failed/,
+  )
+})
+
+test('landed-cost adjustment rounding documents context-vs-journal behavior', () => {
+  assert.equal(roundAdjustmentContextValue(new Prisma.Decimal('-0.0000005')), -0.000001)
+  assert.equal(Object.is(roundAdjustmentTotalDelta(new Prisma.Decimal('-0.005')), -0), true)
 })
 
 test('recalculateDirectLandedCosts preserves legacy negative midpoint journal rounding', async () => {

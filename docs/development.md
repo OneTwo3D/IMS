@@ -75,6 +75,12 @@ IMS uses Decimal `ROUND_HALF_UP` for explicit money, quantity, and journal-total
 
 Do not introduce half-even/banker's rounding unless a connector contract explicitly requires it, and document that connector-specific exception next to the adapter boundary.
 
+Known exception: landed-cost retrospective journal totals intentionally preserve
+the legacy JavaScript `Math.round` midpoint behavior so existing negative
+half-cent adjustment idempotency keys remain stable. The landed-cost event-key
+context still uses `ROUND_HALF_UP`; do not normalize the journal-total helper
+without a migration plan for historical landed-cost adjustment keys.
+
 ## Schema Workflow
 
 When changing the schema:

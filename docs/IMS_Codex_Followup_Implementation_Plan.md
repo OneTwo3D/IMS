@@ -1408,6 +1408,14 @@ warnings such as weight fallback
 - Tests cover normal revaluation and warning capture.
 ```
 
+### Follow-up
+
+```text
+- Define and implement retention/archive policy for landed_cost_revaluation_runs
+  once the first admin audit viewer is planned; the table intentionally grows
+  with every landed-cost recalculation.
+```
+
 ### Codex prompt
 
 ```text
