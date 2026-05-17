@@ -4,7 +4,7 @@ import { db } from '@/lib/db'
 
 export type CronRunStatus = 'completed' | 'failed' | 'skipped'
 
-const MAX_ERROR_SUMMARY_LENGTH = 500
+const MAX_STATUS_REASON_LENGTH = 500
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue }
 type JsonObject = { [key: string]: JsonValue }
@@ -14,9 +14,23 @@ export type CronRunLog = {
   jobName: string
   startedAt: string
   finishedAt: string
+  durationMs: number
   status: CronRunStatus
   counts: JsonObject | null
-  errorSummary: string | null
+  statusReason: string | null
+}
+
+export type CronRunRecord = {
+  id: string
+  runId: string
+  jobName: string
+  startedAt: Date
+  finishedAt: Date | null
+  durationMs: number | null
+  status: CronRunStatus
+  countsJson: unknown
+  statusReason: string | null
+  createdAt: Date
 }
 
 export type CronRunContext = {
@@ -27,12 +41,33 @@ export type CronRunContext = {
 export type CronRunOutcome<T> = {
   status?: CronRunStatus
   counts?: JsonObject | null
-  errorSummary?: string | null
+  statusReason?: string | null
   responseStatus?: number
   result?: T
 }
 
 export type CronRunLogWriter = (log: CronRunLog) => Promise<void>
+
+export type CronRunPersistenceTransactionClient = {
+  cronRun: {
+    create(args: unknown): Promise<unknown>
+  }
+  activityLog: {
+    create(args: unknown): Promise<unknown>
+  }
+}
+
+export type CronRunPersistenceClient = {
+  cronRun: {
+    create(args: unknown): Promise<unknown>
+    findUnique(args: unknown): Promise<CronRunRecord | null>
+    findMany(args: unknown): Promise<CronRunRecord[]>
+  }
+  activityLog: {
+    create(args: unknown): Promise<unknown>
+  }
+  $transaction<T>(fn: (tx: CronRunPersistenceTransactionClient) => Promise<T>): Promise<T>
+}
 
 export type RunCronWithLoggingOptions<T extends Record<string, unknown>> = {
   jobName: string
@@ -59,46 +94,60 @@ export async function runCronWithLogging<T extends Record<string, unknown>>(
   const now = options.now ?? (() => new Date())
   const writeLog = options.writeLog ?? persistCronRunLog
   const runId = options.createRunId?.() ?? randomUUID()
-  const startedAt = now().toISOString()
+  const startedAtDate = now()
+  const startedAt = startedAtDate.toISOString()
 
+  let result: T
   try {
-    const result = await options.run({ runId, startedAt })
-    const outcome = {
-      ...inferCronRunOutcome(result),
-      ...(options.getOutcome?.(result) ?? {}),
-    }
-    const log = buildCronRunLog({
-      runId,
-      jobName: options.jobName,
-      startedAt,
-      finishedAt: now().toISOString(),
-      status: outcome.status ?? 'completed',
-      counts: outcome.counts ?? null,
-      errorSummary: outcome.errorSummary ?? null,
-    })
-
-    await safeWriteCronRunLog(writeLog, log)
-
-    return {
-      runId,
-      result: outcome.result ?? result,
-      log,
-      responseStatus: outcome.responseStatus,
-    }
+    result = await options.run({ runId, startedAt })
   } catch (error) {
+    const finishedAtDate = now()
     const log = buildCronRunLog({
       runId,
       jobName: options.jobName,
       startedAt,
-      finishedAt: now().toISOString(),
+      finishedAt: finishedAtDate.toISOString(),
+      durationMs: durationMs(startedAtDate, finishedAtDate),
       status: 'failed',
       counts: null,
-      errorSummary: summarizeError(error),
+      statusReason: summarizeError(error),
     })
 
     await safeWriteCronRunLog(writeLog, log)
     throw error
   }
+
+  const outcome = {
+    ...inferCronRunOutcome(result),
+    ...(options.getOutcome?.(result) ?? {}),
+  }
+  const finishedAtDate = now()
+  const log = buildCronRunLog({
+    runId,
+    jobName: options.jobName,
+    startedAt,
+    finishedAt: finishedAtDate.toISOString(),
+    durationMs: durationMs(startedAtDate, finishedAtDate),
+    status: outcome.status ?? 'completed',
+    counts: outcome.counts ?? null,
+    statusReason: outcome.statusReason ?? null,
+  })
+
+  // CronRun is the canonical audit record for successful cron execution. If
+  // the structured row cannot be written, surface the persistence failure.
+  await writeLog(log)
+
+  return {
+    runId,
+    result: outcome.result ?? result,
+    log,
+    responseStatus: outcome.responseStatus,
+  }
+}
+
+function durationMs(startedAt: Date, finishedAt: Date): number {
+  // Wall-clock duration; clamped to 0 to survive NTP backward adjustments. This is sufficient for cron-scale timing.
+  return Math.max(0, finishedAt.getTime() - startedAt.getTime())
 }
 
 export function appendCronRunId<T extends Record<string, unknown>>(result: T, runId: string): T & { runId: string } {
@@ -108,49 +157,102 @@ export function appendCronRunId<T extends Record<string, unknown>>(result: T, ru
   }
 }
 
-export async function persistCronRunLog(log: CronRunLog): Promise<void> {
-  await db.activityLog.create({
+export async function persistCronRunLog(
+  log: CronRunLog,
+  client: CronRunPersistenceClient = db as unknown as CronRunPersistenceClient,
+): Promise<void> {
+  assertCronRunCounts(log.counts)
+
+  const cronRunCreate = {
+    data: {
+      runId: log.runId,
+      jobName: log.jobName,
+      startedAt: new Date(log.startedAt),
+      finishedAt: new Date(log.finishedAt),
+      durationMs: log.durationMs,
+      status: log.status,
+      countsJson: log.counts,
+      statusReason: log.statusReason,
+    },
+  }
+
+  const activityLogCreate = {
     data: {
       entityType: 'SYSTEM',
       entityId: log.runId,
       action: 'cron_run',
       tag: 'system',
-      level: log.status === 'failed' ? 'ERROR' : log.status === 'skipped' ? 'INFO' : 'INFO',
+      level: log.status === 'failed' ? 'ERROR' : 'INFO',
       description: `${log.jobName} cron run ${log.status} (${log.runId})`,
       metadata: log,
     },
+  }
+
+  await client.$transaction(async (tx) => {
+    await tx.cronRun.create(cronRunCreate)
+    await tx.activityLog.create(activityLogCreate)
+  })
+}
+
+export async function findCronRunByRunId(
+  runId: string,
+  client: CronRunPersistenceClient = db as unknown as CronRunPersistenceClient,
+): Promise<CronRunRecord | null> {
+  return client.cronRun.findUnique({ where: { runId } })
+}
+
+export async function listRecentCronRuns(
+  options: { jobName?: string; status?: CronRunStatus; limit?: number } = {},
+  client: CronRunPersistenceClient = db as unknown as CronRunPersistenceClient,
+): Promise<CronRunRecord[]> {
+  const requestedLimit = Math.floor(options.limit ?? 50)
+  const take = Number.isFinite(requestedLimit) ? Math.min(Math.max(requestedLimit, 1), 100) : 50
+
+  return client.cronRun.findMany({
+    where: {
+      ...(options.jobName ? { jobName: options.jobName } : {}),
+      ...(options.status ? { status: options.status } : {}),
+    },
+    orderBy: { startedAt: 'desc' },
+    take,
   })
 }
 
 export function inferCronRunOutcome<T extends Record<string, unknown>>(result: T): CronRunOutcome<T> {
   const statusValue = typeof result.status === 'string' ? result.status : null
-  const errorSummary = summarizeResultError(result)
+  const statusReason = summarizeResultError(result)
 
   if (result.skipped === true) {
     return {
       status: 'skipped',
       counts: getCounts(result),
-      errorSummary: typeof result.reason === 'string' ? result.reason : null,
+      statusReason: typeof result.reason === 'string' ? result.reason : null,
     }
   }
 
-  if (errorSummary || statusValue === 'failed' || statusValue === 'partial_failure') {
+  if (statusReason || statusValue === 'failed' || statusValue === 'partial_failure') {
     return {
       status: 'failed',
       counts: getCounts(result),
-      errorSummary: errorSummary ?? statusValue,
+      statusReason: statusReason ?? statusValue,
     }
   }
 
   return {
     status: 'completed',
     counts: getCounts(result),
-    errorSummary: null,
+    statusReason: null,
   }
 }
 
 function buildCronRunLog(input: CronRunLog): CronRunLog {
   return input
+}
+
+function assertCronRunCounts(counts: JsonObject | null): void {
+  if (counts !== null && !isJsonObject(counts)) {
+    throw new Error(`cron run counts must be a JSON object, got ${Array.isArray(counts) ? 'array' : typeof counts}`)
+  }
 }
 
 async function safeWriteCronRunLog(writeLog: CronRunLogWriter, log: CronRunLog): Promise<void> {
@@ -192,12 +294,12 @@ function summarizeResultError(result: Record<string, unknown>): string | null {
   const summaries = collectResultErrors(result)
   if (summaries.length === 0) return null
 
-  return summaries.join('; ').slice(0, MAX_ERROR_SUMMARY_LENGTH)
+  return summaries.join('; ').slice(0, MAX_STATUS_REASON_LENGTH)
 }
 
 function summarizeError(error: unknown): string {
-  if (error instanceof Error && error.message.trim()) return error.message.slice(0, MAX_ERROR_SUMMARY_LENGTH)
-  if (typeof error === 'string' && error.trim()) return error.slice(0, MAX_ERROR_SUMMARY_LENGTH)
+  if (error instanceof Error && error.message.trim()) return error.message.slice(0, MAX_STATUS_REASON_LENGTH)
+  if (typeof error === 'string' && error.trim()) return error.slice(0, MAX_STATUS_REASON_LENGTH)
   return 'Unknown cron run failure'
 }
 

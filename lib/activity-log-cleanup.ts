@@ -6,6 +6,13 @@ const DEFAULTS: Record<string, number> = {
   ERROR: 90,
 }
 const DELETE_BATCH_SIZE = 10_000
+const DEFAULT_CRON_RUN_RETENTION_DAYS = 90
+
+export type CronRunCleanupClient = {
+  cronRun: {
+    deleteMany(args: unknown): Promise<{ count: number }>
+  }
+}
 
 async function getSetting(key: string): Promise<string | null> {
   const row = await db.setting.findUnique({ where: { key } })
@@ -60,4 +67,24 @@ export async function purgeExpiredActivityLogs() {
   }
 
   return { totalDeleted, retention }
+}
+
+export async function purgeExpiredCronRuns(
+  options: {
+    client?: CronRunCleanupClient
+    now?: Date
+    retentionDays?: number
+  } = {},
+) {
+  const retentionDays = Math.floor(options.retentionDays ?? DEFAULT_CRON_RUN_RETENTION_DAYS)
+  if (retentionDays <= 0) return { deleted: 0, retentionDays }
+
+  const cutoff = new Date((options.now ?? new Date()).getTime() - retentionDays * 24 * 60 * 60 * 1000)
+  const result = await (options.client ?? db).cronRun.deleteMany({
+    where: {
+      startedAt: { lt: cutoff },
+    },
+  })
+
+  return { deleted: result.count, retentionDays }
 }

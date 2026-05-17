@@ -2236,6 +2236,23 @@ model ActivityLog {
   @@map("activity_logs")
 }
 
+model CronRun {
+  id           String    @id @default(cuid())
+  runId        String    @unique
+  jobName      String
+  startedAt    DateTime
+  finishedAt   DateTime?
+  durationMs   Int?
+  status       String
+  countsJson   Json?
+  statusReason String?
+  createdAt    DateTime  @default(now())
+
+  @@index([jobName, startedAt])
+  @@index([status, startedAt])
+  @@map("cron_runs")
+}
+
 model Notification {
   id        String   @id @default(cuid())
   userId    String?  // null = broadcast to all users
