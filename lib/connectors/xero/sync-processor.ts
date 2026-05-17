@@ -250,7 +250,7 @@ async function deferOutboxForRateLimit(
   if (released.count === 0) throw new Error(`Xero outbox job ${job.id} is not claimed by ${XERO_ACCOUNTING_WORKER_ID}`)
 }
 
-async function markXeroOutboxRetry(job: IntegrationOutboxRow, error: string, retryDelayMs = 0, client?: Pick<Prisma.TransactionClient, 'integrationOutbox'>): Promise<void> {
+async function markXeroOutboxRetry(job: IntegrationOutboxRow, error: string, client?: Pick<Prisma.TransactionClient, 'integrationOutbox'>): Promise<void> {
   if (!job.lockedAt) throw new Error(`Xero outbox job ${job.id} was claimed without lockedAt`)
   await markIntegrationOutboxRetryableFailure({
     client,
@@ -258,7 +258,7 @@ async function markXeroOutboxRetry(job: IntegrationOutboxRow, error: string, ret
     workerId: XERO_ACCOUNTING_WORKER_ID,
     lockedAt: job.lockedAt,
     error,
-    retryDelayMs,
+    attemptsBeforeFailure: job.attempts,
     maxAttempts: MAX_RETRIES,
   })
 }
@@ -597,7 +597,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             if (nextRetry.finalFailure) {
               await markXeroOutboxPermanent(job, nextRetry.errorMessage, tx)
             } else {
-              await markXeroOutboxRetry(job, nextRetry.errorMessage, 0, tx)
+              await markXeroOutboxRetry(job, nextRetry.errorMessage, tx)
             }
             return nextRetry
           })
@@ -645,7 +645,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             if (nextRetry.finalFailure) {
               await markXeroOutboxPermanent(job, nextRetry.errorMessage, tx)
             } else {
-              await markXeroOutboxRetry(job, nextRetry.errorMessage, 0, tx)
+              await markXeroOutboxRetry(job, nextRetry.errorMessage, tx)
             }
             return nextRetry
           })
@@ -699,7 +699,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
             if (finalFailure) {
               await markXeroOutboxPermanent(job, errorMessage, tx)
             } else {
-              await markXeroOutboxRetry(job, errorMessage, 0, tx)
+              await markXeroOutboxRetry(job, errorMessage, tx)
             }
           })
         }
@@ -748,7 +748,7 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
           if (finalFailure) {
             await markXeroOutboxPermanent(job, errorMessage, tx)
           } else {
-            await markXeroOutboxRetry(job, errorMessage, 0, tx)
+            await markXeroOutboxRetry(job, errorMessage, tx)
           }
         })
       }

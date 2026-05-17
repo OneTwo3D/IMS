@@ -23,8 +23,6 @@ const WEBHOOK_ECHO_WINDOW_MS = 10 * 60 * 1000
 const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
 const WC_STOCK_SYNC_OPERATION = INTEGRATION_OUTBOX_OPERATIONS.woocommerce.stockSync
 const WC_STOCK_SYNC_WORKER_ID = 'woocommerce-stock-sync'
-const WC_STOCK_SYNC_RETRY_DELAY_BASE_MS = 5 * 60 * 1000
-const WC_STOCK_SYNC_RETRY_DELAY_MAX_STEPS = 12
 const WC_STOCK_SYNC_MAX_ATTEMPTS = 12
 const immediateStockSyncProductIds = new Set<string>()
 let immediateStockSyncScheduled = false
@@ -54,10 +52,6 @@ async function expandProductScope(productIds: string[]): Promise<string[]> {
 
 function wcStockSyncIdempotencyKey(productId: string): string {
   return buildOutboxIdempotencyKey(WC_STOCK_SYNC_CONNECTOR, WC_STOCK_SYNC_OPERATION, productId)
-}
-
-function retryDelayMs(attemptsBeforeFailure: number): number {
-  return Math.min(attemptsBeforeFailure + 1, WC_STOCK_SYNC_RETRY_DELAY_MAX_STEPS) * WC_STOCK_SYNC_RETRY_DELAY_BASE_MS
 }
 
 function samePayload(left: unknown, right: unknown): boolean {
@@ -366,7 +360,7 @@ export async function processQueuedWcStockSyncJobs(options?: {
           workerId: WC_STOCK_SYNC_WORKER_ID,
           lockedAt: job.lockedAt,
           error: result.errors.join(' | ') || result.message || 'WooCommerce stock sync failed',
-          retryDelayMs: retryDelayMs(job.attempts),
+          attemptsBeforeFailure: job.attempts,
           maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
         })
         summary.failed++
@@ -404,7 +398,7 @@ export async function processQueuedWcStockSyncJobs(options?: {
         workerId: WC_STOCK_SYNC_WORKER_ID,
         lockedAt: job.lockedAt,
         error: message,
-        retryDelayMs: retryDelayMs(job.attempts),
+        attemptsBeforeFailure: job.attempts,
         maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
       })
       summary.failed++
