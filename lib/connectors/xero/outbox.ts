@@ -5,13 +5,14 @@ import {
   type IntegrationOutboxClient,
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
+import {
+  INTEGRATION_OUTBOX_OPERATIONS,
+  parseIntegrationOutboxPayload,
+  type XeroAccountingOutboxPayload,
+} from '@/lib/domain/integrations/outbox-registry'
 
 export const XERO_OUTBOX_CONNECTOR = 'xero'
-export const XERO_ACCOUNTING_POST_OPERATION = 'accounting.post'
-
-export type XeroAccountingOutboxPayload = {
-  accountingSyncLogId: string
-}
+export const XERO_ACCOUNTING_POST_OPERATION = INTEGRATION_OUTBOX_OPERATIONS.xero.postAccountingEvent
 
 export function buildXeroAccountingOutboxIdempotencyKey(accountingSyncLogId: string): string {
   return buildOutboxIdempotencyKey(
@@ -26,15 +27,12 @@ export function buildXeroAccountingOutboxPayload(accountingSyncLogId: string): X
 }
 
 export function parseXeroAccountingOutboxPayload(row: { id: string; payloadJson: unknown }): XeroAccountingOutboxPayload {
-  const payload = row.payloadJson
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    throw new Error(`Xero accounting outbox payload for ${row.id} must be an object`)
-  }
-  const data = payload as Record<string, unknown>
-  if (typeof data.accountingSyncLogId !== 'string' || !data.accountingSyncLogId.trim()) {
-    throw new Error(`Xero accounting outbox payload for ${row.id} is missing accountingSyncLogId`)
-  }
-  return { accountingSyncLogId: data.accountingSyncLogId }
+  return parseIntegrationOutboxPayload<XeroAccountingOutboxPayload>({
+    connector: XERO_OUTBOX_CONNECTOR,
+    operation: XERO_ACCOUNTING_POST_OPERATION,
+    payloadJson: row.payloadJson,
+    rowId: row.id,
+  })
 }
 
 export async function scheduleXeroAccountingOutbox(
@@ -46,7 +44,10 @@ export async function scheduleXeroAccountingOutbox(
     resetAttempts?: boolean
   },
 ): Promise<IntegrationOutboxRow> {
-  const payload = buildXeroAccountingOutboxPayload(options.accountingSyncLogId)
+  const payload = parseXeroAccountingOutboxPayload({
+    id: buildXeroAccountingOutboxIdempotencyKey(options.accountingSyncLogId),
+    payloadJson: buildXeroAccountingOutboxPayload(options.accountingSyncLogId),
+  })
   const row = await enqueueIntegrationOutbox({
     connector: XERO_OUTBOX_CONNECTOR,
     operation: XERO_ACCOUNTING_POST_OPERATION,

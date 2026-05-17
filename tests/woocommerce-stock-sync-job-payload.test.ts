@@ -28,24 +28,21 @@ test('WooCommerce stock outbox payload preserves existing forced jobs', () => {
 })
 
 test('WooCommerce stock outbox payload validates queued payload shape', () => {
+  const built = buildWcStockSyncOutboxPayload('product-1', 'WC_WEBHOOK', { force: true, webhookQty: 8 })
   const parsed = parseWcStockSyncPayload({
     id: 'job-1',
-    payloadJson: {
-      productId: 'product-1',
-      reason: 'WC_WEBHOOK',
-      force: true,
-      webhookQty: 8,
-    },
+    payloadJson: built,
   })
 
-  assert.deepEqual(parsed, {
+  assert.deepEqual(built, {
     productId: 'product-1',
     reason: 'WC_WEBHOOK',
     force: true,
     webhookQty: 8,
   })
+  assert.deepEqual(parsed, built)
   assert.throws(
     () => parseWcStockSyncPayload({ id: 'job-2', payloadJson: { productId: 'product-1', reason: 'BAD' } }),
-    /invalid reason/,
+    /job-2 is invalid: reason/,
   )
 })

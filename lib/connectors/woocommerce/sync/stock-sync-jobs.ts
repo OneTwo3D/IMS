@@ -17,10 +17,11 @@ import {
   markIntegrationOutboxRetryableFailure,
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
+import { INTEGRATION_OUTBOX_OPERATIONS } from '@/lib/domain/integrations/outbox-registry'
 
 const WEBHOOK_ECHO_WINDOW_MS = 10 * 60 * 1000
 const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
-const WC_STOCK_SYNC_OPERATION = 'stock.push'
+const WC_STOCK_SYNC_OPERATION = INTEGRATION_OUTBOX_OPERATIONS.woocommerce.stockSync
 const WC_STOCK_SYNC_WORKER_ID = 'woocommerce-stock-sync'
 const WC_STOCK_SYNC_RETRY_DELAY_BASE_MS = 5 * 60 * 1000
 const WC_STOCK_SYNC_RETRY_DELAY_MAX_STEPS = 12
@@ -82,12 +83,15 @@ async function applyStockOutboxPayload(options: ApplyStockOutboxPayloadOptions):
       : await db.integrationOutbox.findUnique({ where: { id: options.row.id } })
     if (!current) return false
 
-    const payload = buildWcStockSyncOutboxPayload(
-      options.productId,
-      options.reason,
-      { force: options.force, webhookQty: options.webhookQty },
-      current.payloadJson,
-    )
+    const payload = parseWcStockSyncPayload({
+      id: current.id,
+      payloadJson: buildWcStockSyncOutboxPayload(
+        options.productId,
+        options.reason,
+        { force: options.force, webhookQty: options.webhookQty },
+        current.payloadJson,
+      ),
+    })
 
     if (current.status === INTEGRATION_OUTBOX_STATUS.PROCESSING) {
       if (samePayload(current.payloadJson, payload)) return true

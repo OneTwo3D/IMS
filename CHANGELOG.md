@@ -11,6 +11,7 @@ This repository uses an `x.y.z` release scheme.
 ### Developer-facing
 
 - **Decimal boundary guard.** Added `npm run check:decimal-boundaries` and wired it into `npm run validate` plus GitHub Actions so guarded domain/accounting paths must document any direct `decimalToNumber` import with a `decimal-boundary-ok:` rationale. The leading rationale token is now a closed vocabulary, and current `legacy-pre-stage-4` annotations mark Decimal conversion follow-up work planned for Stage 4. Developers rebasing older branches that touch guarded paths may need to add or narrow these comments before validation passes.
+- **Integration outbox payload registry.** WooCommerce stock-sync, Xero accounting-post, and Mintsoft booked-in outbox operations now have registered Zod payload schemas. Registered payloads are validated and normalized on enqueue and again by connector processors before execution, while unknown outbox operations remain backwards-compatible for existing rows and future connectors.
 
 ### Fixes (landed-cost precision)
 
