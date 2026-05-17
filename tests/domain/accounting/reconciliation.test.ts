@@ -257,6 +257,123 @@ test('refunded terminal order with posted shipment reports missing credit-note a
   assert.ok(codes.includes('terminal_refunded_order_missing_reversal_evidence'))
 })
 
+test('zero-value refund on a posted-shipment order does not require reversal evidence', () => {
+  const rows = cleanRows()
+  rows.salesOrders = [{
+    ...rows.salesOrders[0],
+    status: 'REFUNDED',
+  }]
+  rows.refunds = [{
+    ...rows.refunds[0],
+    accountingRetrySyncs: null,
+    totalBase: '0',
+  }]
+  rows.syncLogs = rows.syncLogs.filter((log) => log.type !== 'COGS_REVERSAL')
+  rows.accountingEvents = rows.accountingEvents.filter((event) => event.type !== 'COGS_REVERSAL')
+
+  const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
+
+  assert.equal(codes.includes('terminal_refunded_order_missing_reversal_evidence'), false)
+})
+
+test('live sync status membership gates terminal credit-note evidence', () => {
+  for (const status of ['PENDING', 'PROCESSING', 'SYNCED']) {
+    const rows = cleanRows()
+    rows.salesOrders = [{ ...rows.salesOrders[0], status: 'REFUNDED' }]
+    rows.refunds = [{ ...rows.refunds[0], accountingCreditNoteId: null }]
+    rows.syncLogs = rows.syncLogs.filter((log) => log.referenceType !== 'SalesOrderRefund')
+    rows.accountingEvents = rows.accountingEvents.filter((event) => event.sourceEntityType !== 'SalesOrderRefund' || event.type !== 'CREDIT_NOTE')
+    rows.syncLogs.push({
+      id: `sync-refund-credit-note-${status}`,
+      connector: 'xero',
+      type: 'CREDIT_NOTE',
+      status,
+      referenceType: 'SalesOrderRefund',
+      referenceId: 'refund-1',
+      externalTransactionId: status === 'SYNCED' ? 'credit-note-1' : null,
+      payload: { _idempotencyKey: `sales-order-refund:refund-1:credit-note:${status}` },
+    })
+
+    const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
+
+    assert.equal(codes.includes('terminal_refunded_order_missing_credit_note_evidence'), false)
+  }
+
+  for (const status of ['FAILED', 'REJECTED']) {
+    const rows = cleanRows()
+    rows.salesOrders = [{ ...rows.salesOrders[0], status: 'REFUNDED' }]
+    rows.refunds = [{ ...rows.refunds[0], accountingCreditNoteId: null }]
+    rows.syncLogs = rows.syncLogs.filter((log) => log.referenceType !== 'SalesOrderRefund')
+    rows.accountingEvents = rows.accountingEvents.filter((event) => event.sourceEntityType !== 'SalesOrderRefund' || event.type !== 'CREDIT_NOTE')
+    rows.syncLogs.push({
+      id: `sync-refund-credit-note-${status}`,
+      connector: 'xero',
+      type: 'CREDIT_NOTE',
+      status,
+      referenceType: 'SalesOrderRefund',
+      referenceId: 'refund-1',
+      externalTransactionId: null,
+      payload: { _idempotencyKey: `sales-order-refund:refund-1:credit-note:${status}` },
+    })
+
+    const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
+
+    assert.equal(codes.includes('terminal_refunded_order_missing_credit_note_evidence'), true)
+  }
+})
+
+test('cancelled terminal order with reversal evidence stays clean', () => {
+  const rows = cleanRows()
+  rows.salesOrders = [{
+    ...rows.salesOrders[0],
+    id: 'order-cancelled',
+    orderNumber: 'SO-CANCELLED',
+    status: 'CANCELLED',
+  }]
+  rows.shipments = []
+  rows.refunds = [{
+    ...rows.refunds[0],
+    orderId: 'order-cancelled',
+  }]
+  rows.syncLogs = rows.syncLogs.filter((log) => log.referenceType !== 'SalesOrderRefund')
+  rows.syncLogs.push({
+    id: 'sync-cancelled-reversal',
+    connector: 'xero',
+    type: 'COGS_REVERSAL',
+    status: 'SYNCED',
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    externalTransactionId: 'cancelled-reversal-1',
+    payload: { _idempotencyKey: 'sales-order-refund:refund-1:cogs-reversal' },
+  })
+
+  const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
+
+  assert.equal(codes.includes('terminal_cancelled_order_missing_reversal_evidence'), false)
+})
+
+test('refund sync evidence on a cancelled order still reports missing mirrored event', () => {
+  const rows = cleanRows()
+  rows.salesOrders = [{
+    ...rows.salesOrders[0],
+    id: 'order-cancelled',
+    orderNumber: 'SO-CANCELLED',
+    status: 'CANCELLED',
+  }]
+  rows.refunds = [{
+    ...rows.refunds[0],
+    orderId: 'order-cancelled',
+    accountingRetrySyncs: [
+      { type: 'COGS_REVERSAL', referenceType: 'SalesOrderRefund', referenceId: 'refund-1' },
+    ],
+  }]
+  rows.accountingEvents = rows.accountingEvents.filter((event) => event.sourceEntityType !== 'SalesOrderRefund')
+
+  const codes = evaluateAccountingReconciliationRows(rows).map((finding) => finding.code)
+
+  assert.equal(codes.includes('source_refund_without_event'), true)
+})
+
 test('refunded terminal order with credit-note and reversal evidence stays clean', () => {
   const rows = cleanRows()
   rows.salesOrders = [{
@@ -278,6 +395,28 @@ test('refunded terminal order with credit-note and reversal evidence stays clean
 
   assert.equal(codes.includes('terminal_refunded_order_missing_credit_note_evidence'), false)
   assert.equal(codes.includes('terminal_refunded_order_missing_reversal_evidence'), false)
+})
+
+test('row cap exhaustion emits an incomplete-report warning', () => {
+  const rows = cleanRows()
+  rows.salesOrders = Array.from({ length: 10_000 }, (_, index) => ({
+    ...rows.salesOrders[0],
+    id: `order-${index}`,
+    orderNumber: `SO-${index}`,
+    revenueDeferredDate: null,
+    inventoryAllocatedDate: null,
+  }))
+  rows.shipments = []
+  rows.refunds = []
+  rows.syncLogs = []
+  rows.accountingEvents = []
+
+  const finding = evaluateAccountingReconciliationRows(rows).find((entry) => (
+    entry.code === 'reconciliation_row_cap_reached'
+  ))
+
+  assert.ok(finding)
+  assert.equal((finding.details as { dataset?: unknown }).dataset, 'salesOrders')
 })
 
 test('accounting reconciliation row collection selects required datasets', async () => {
@@ -343,6 +482,7 @@ test('accounting reconciliation row collection selects required datasets', async
   assert.equal(salesOrderCall.take, 10000)
   const shipmentWhere = (calls.shipment as { where: { shipmentJournalDate: { gte?: unknown } } }).where
   assert.ok(shipmentWhere.shipmentJournalDate.gte instanceof Date)
+  assert.equal((calls.shipment as { take: number }).take, 10000)
   assert.equal((calls.salesOrderRefund as { take: number }).take, 10000)
   assert.equal((calls.accountingSyncLog as { take: number }).take, 10000)
   assert.equal((calls.accountingEvent as { take: number }).take, 10000)

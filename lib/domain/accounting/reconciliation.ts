@@ -104,6 +104,8 @@ export const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
 const MAX_RECONCILIATION_ROWS = 10_000
 const TERMINAL_SALES_ORDER_STATUSES = ['REFUNDED', 'PARTIALLY_REFUNDED', 'CANCELLED', 'COMPLETED', 'DELIVERED'] as const
 const REFUNDED_SALES_ORDER_STATUSES = new Set(['REFUNDED', 'PARTIALLY_REFUNDED'])
+// PENDING/PROCESSING are intentional evidence: reconciliation distinguishes
+// "queued but not mirrored" from "no accounting path was ever scheduled".
 const LIVE_SYNC_STATUSES = new Set(['PENDING', 'PROCESSING', 'SYNCED'])
 
 // Document sync events are mirrorable, but their source checks are document-specific rather than DailyBatch source-key checks.
@@ -189,6 +191,8 @@ function hasAccountingEvent(
 }
 
 function hasRefundCreditNoteEvidence(rows: AccountingReconciliationRows, refund: SourceRefundRow): boolean {
+  // Any non-empty connector credit-note id is durable evidence. Sync writers
+  // must clear this field if a remote credit note is voided or invalidated.
   if (refund.accountingCreditNoteId?.trim()) return true
   if (syncLogHasLiveEvidence(rows.syncLogs, {
     type: 'CREDIT_NOTE',
@@ -270,15 +274,45 @@ function addExpectedSourceEventFinding(
   })
 }
 
+function addRowCapFindings(
+  findings: AccountingReconciliationFinding[],
+  rows: AccountingReconciliationRows,
+): void {
+  const cappedDatasets: Array<{ dataset: keyof AccountingReconciliationRows; count: number }> = [
+    { dataset: 'salesOrders', count: rows.salesOrders.length },
+    { dataset: 'shipments', count: rows.shipments.length },
+    { dataset: 'refunds', count: rows.refunds.length },
+    { dataset: 'syncLogs', count: rows.syncLogs.length },
+    { dataset: 'accountingEvents', count: rows.accountingEvents.length },
+  ]
+
+  for (const { dataset, count } of cappedDatasets) {
+    if (count < MAX_RECONCILIATION_ROWS) continue
+    findings.push({
+      severity: 'warning',
+      code: 'reconciliation_row_cap_reached',
+      message: `Accounting reconciliation reached the ${MAX_RECONCILIATION_ROWS} row cap for ${dataset}; report may be incomplete`,
+      details: {
+        dataset,
+        scanned: count,
+        limit: MAX_RECONCILIATION_ROWS,
+      },
+    })
+  }
+}
+
 export function evaluateAccountingReconciliationRows(
   rows: AccountingReconciliationRows,
 ): AccountingReconciliationFinding[] {
   const findings: AccountingReconciliationFinding[] = []
+  addRowCapFindings(findings, rows)
   const sourceKeys = new Set<string>()
   const refundIds = new Set(rows.refunds.map((refund) => refund.id))
   const refundsByOrderId = new Map<string, SourceRefundRow[]>()
   for (const refund of rows.refunds) {
-    refundsByOrderId.set(refund.orderId, [...(refundsByOrderId.get(refund.orderId) ?? []), refund])
+    const existing = refundsByOrderId.get(refund.orderId)
+    if (existing) existing.push(refund)
+    else refundsByOrderId.set(refund.orderId, [refund])
   }
   const postedShipmentOrderIds = new Set(
     rows.shipments
@@ -359,6 +393,8 @@ export function evaluateAccountingReconciliationRows(
           })
         }
 
+        // Zero-total refunds post no COGS/unearned-revenue reversal; only
+        // positive-value refunds require reversal evidence.
         if (postedShipmentOrderIds.has(order.id) && decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence) {
           findings.push({
             severity: 'critical',
@@ -548,6 +584,8 @@ export async function collectAccountingReconciliationRows(
     }),
     client.shipment.findMany({
       where: { shipmentJournalDate: { gte: fromDate } },
+      orderBy: { shipmentJournalDate: 'desc' },
+      take: MAX_RECONCILIATION_ROWS,
       select: {
         id: true,
         orderId: true,
