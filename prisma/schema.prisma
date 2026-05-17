@@ -1572,6 +1572,44 @@ model AccountingEventLog {
   @@map("accounting_event_logs")
 }
 
+model AccountingReconciliationRun {
+  id            String   @id @default(cuid())
+  fromDate      DateTime?
+  toDate        DateTime?
+  status        String
+  totalCount    Int
+  warningCount  Int
+  criticalCount Int
+  createdAt     DateTime @default(now())
+
+  findings      AccountingReconciliationFinding[]
+
+  @@index([status, createdAt])
+  @@index([createdAt])
+  @@map("accounting_reconciliation_runs")
+}
+
+model AccountingReconciliationFinding {
+  id         String   @id @default(cuid())
+  runId      String
+  severity   String
+  code       String
+  entityType String?
+  entityId   String?
+  message    String
+  details    Json
+  status     String   @default("OPEN")
+  createdAt  DateTime @default(now())
+
+  run        AccountingReconciliationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
+
+  @@index([runId, status])
+  @@index([status, createdAt])
+  @@index([code, status])
+  @@index([entityType, entityId])
+  @@map("accounting_reconciliation_findings")
+}
+
 model AccountingToken {
   id           String   @id @default(cuid())
   connector    String   @default("xero")

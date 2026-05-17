@@ -39,7 +39,15 @@ export const apiRouteAuthPolicy = {
   },
   '/api/admin/accounting/reconciliation': {
     access: 'admin',
-    reason: 'Accounting reconciliation report is restricted through requireApiAdmin.',
+    reason: 'Accounting reconciliation dry-run and persisted report creation are restricted through requireApiAdmin.',
+  },
+  '/api/admin/accounting/reconciliation/findings/[id]': {
+    access: 'admin',
+    reason: 'Accounting reconciliation finding review state is restricted through requireApiAdmin.',
+  },
+  '/api/admin/accounting/reconciliation/runs': {
+    access: 'admin',
+    reason: 'Accounting reconciliation run history is restricted through requireApiAdmin.',
   },
   '/api/admin/accounting/backfill': {
     access: 'admin',

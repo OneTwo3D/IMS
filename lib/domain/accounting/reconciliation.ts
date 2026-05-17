@@ -1,9 +1,12 @@
+import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 // decimal-boundary-ok: report-only (accounting reconciliation finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { isMirrorableAccountingSyncType } from './accounting-event-mirror'
 
 export type AccountingReconciliationSeverity = 'warning' | 'critical'
+export type AccountingReconciliationRunStatus = 'COMPLETED'
+export type AccountingReconciliationFindingStatus = 'OPEN' | 'RESOLVED' | 'ACCEPTED'
 
 export type AccountingReconciliationFinding = {
   severity: AccountingReconciliationSeverity
@@ -18,7 +21,11 @@ export type AccountingReconciliationFinding = {
 }
 
 export type AccountingReconciliationReport = {
+  runId?: string
   checkedAt: string
+  fromDate: string
+  toDate: string
+  persisted?: boolean
   findings: AccountingReconciliationFinding[]
   summary: {
     total: number
@@ -99,6 +106,46 @@ type AccountingReconciliationClient = {
     findMany(args: unknown): Promise<AccountingEventRow[]>
   }
 }
+
+type PersistedAccountingReconciliationFinding = {
+  id: string
+  runId: string
+  severity: string
+  code: string
+  entityType: string | null
+  entityId: string | null
+  message: string
+  details: unknown
+  status: string
+  createdAt: Date | string
+}
+
+type PersistedAccountingReconciliationRun = {
+  id: string
+  fromDate: Date | string | null
+  toDate: Date | string | null
+  status: string
+  totalCount: number
+  warningCount: number
+  criticalCount: number
+  createdAt: Date | string
+  findings?: PersistedAccountingReconciliationFinding[]
+  _count?: { findings: number }
+}
+
+type AccountingReconciliationPersistenceClient = {
+  $transaction?<T>(fn: (tx: AccountingReconciliationPersistenceClient) => Promise<T>): Promise<T>
+  accountingReconciliationRun: {
+    create(args: unknown): Promise<PersistedAccountingReconciliationRun>
+    findMany(args: unknown): Promise<PersistedAccountingReconciliationRun[]>
+  }
+  accountingReconciliationFinding: {
+    createMany(args: unknown): Promise<{ count: number }>
+    update(args: unknown): Promise<PersistedAccountingReconciliationFinding>
+  }
+}
+
+export const ACCOUNTING_RECONCILIATION_FINDING_STATUSES = ['OPEN', 'RESOLVED', 'ACCEPTED'] as const
 
 export const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
 const MAX_RECONCILIATION_ROWS = 10_000
@@ -236,10 +283,31 @@ function buildSummary(findings: AccountingReconciliationFinding[]): AccountingRe
   )
 }
 
-export function reconciliationLookbackDate(days: number): Date {
-  const date = new Date()
+export function reconciliationLookbackDate(days: number, now: Date = new Date()): Date {
+  const date = new Date(now)
   date.setUTCDate(date.getUTCDate() - days)
   return date
+}
+
+function toJsonValue(value: unknown): Prisma.InputJsonValue {
+  return JSON.parse(JSON.stringify(value ?? null)) as Prisma.InputJsonValue
+}
+
+function findingEntity(finding: AccountingReconciliationFinding): { entityType: string | null; entityId: string | null } {
+  if (finding.accountingEventId) return { entityType: 'AccountingEvent', entityId: finding.accountingEventId }
+  if (finding.syncLogId) return { entityType: 'AccountingSyncLog', entityId: finding.syncLogId }
+  if (finding.refundId) return { entityType: 'SalesOrderRefund', entityId: finding.refundId }
+  if (finding.shipmentId) return { entityType: 'Shipment', entityId: finding.shipmentId }
+  if (finding.orderId) return { entityType: 'SalesOrder', entityId: finding.orderId }
+  return { entityType: null, entityId: null }
+}
+
+function normalizeFindingStatus(value: unknown): AccountingReconciliationFindingStatus | null {
+  if (typeof value !== 'string') return null
+  const normalized = value.trim().toUpperCase()
+  return ACCOUNTING_RECONCILIATION_FINDING_STATUSES.includes(normalized as AccountingReconciliationFindingStatus)
+    ? normalized as AccountingReconciliationFindingStatus
+    : null
 }
 
 function addExpectedSourceEventFinding(
@@ -559,9 +627,12 @@ export function evaluateAccountingReconciliationRows(
 
 export async function collectAccountingReconciliationRows(
   client: AccountingReconciliationClient = db as unknown as AccountingReconciliationClient,
-  options: { lookbackDays?: number } = {},
+  options: { lookbackDays?: number; toDate?: Date } = {},
 ): Promise<AccountingReconciliationRows> {
-  const fromDate = reconciliationLookbackDate(options.lookbackDays ?? DEFAULT_RECONCILIATION_LOOKBACK_DAYS)
+  const fromDate = reconciliationLookbackDate(
+    options.lookbackDays ?? DEFAULT_RECONCILIATION_LOOKBACK_DAYS,
+    options.toDate,
+  )
   const [salesOrders, shipments, refunds, syncLogs, accountingEvents] = await Promise.all([
     client.salesOrder.findMany({
       where: {
@@ -655,17 +726,104 @@ export async function collectAccountingReconciliationRows(
 
 export async function runAccountingReconciliationReport(options: {
   client?: AccountingReconciliationClient
+  persistenceClient?: AccountingReconciliationPersistenceClient
   lookbackDays?: number
+  persist?: boolean
+  now?: () => Date
 } = {}): Promise<AccountingReconciliationReport> {
+  const checkedAt = options.now?.() ?? new Date()
+  const fromDate = reconciliationLookbackDate(options.lookbackDays ?? DEFAULT_RECONCILIATION_LOOKBACK_DAYS, checkedAt)
   const rows = await collectAccountingReconciliationRows(
     options.client ?? (db as unknown as AccountingReconciliationClient),
-    { lookbackDays: options.lookbackDays },
+    { lookbackDays: options.lookbackDays, toDate: checkedAt },
   )
   const findings = evaluateAccountingReconciliationRows(rows)
 
-  return {
-    checkedAt: new Date().toISOString(),
+  const report: AccountingReconciliationReport = {
+    checkedAt: checkedAt.toISOString(),
+    fromDate: fromDate.toISOString(),
+    toDate: checkedAt.toISOString(),
     findings,
     summary: buildSummary(findings),
   }
+
+  if (!options.persist) return report
+  return persistAccountingReconciliationReport(
+    report,
+    options.persistenceClient ?? (db as unknown as AccountingReconciliationPersistenceClient),
+  )
+}
+
+export async function persistAccountingReconciliationReport(
+  report: AccountingReconciliationReport,
+  client: AccountingReconciliationPersistenceClient = db as unknown as AccountingReconciliationPersistenceClient,
+): Promise<AccountingReconciliationReport> {
+  const persist = async (tx: AccountingReconciliationPersistenceClient) => {
+    const run = await tx.accountingReconciliationRun.create({
+      data: {
+        fromDate: report.fromDate ? new Date(report.fromDate) : null,
+        toDate: report.toDate ? new Date(report.toDate) : null,
+        status: 'COMPLETED' satisfies AccountingReconciliationRunStatus,
+        totalCount: report.summary.total,
+        warningCount: report.summary.warning,
+        criticalCount: report.summary.critical,
+      },
+    })
+
+    if (report.findings.length > 0) {
+      await tx.accountingReconciliationFinding.createMany({
+        data: report.findings.map((finding) => {
+          const entity = findingEntity(finding)
+          return {
+            runId: run.id,
+            severity: finding.severity,
+            code: finding.code,
+            entityType: entity.entityType,
+            entityId: entity.entityId,
+            message: finding.message,
+            details: toJsonValue(finding.details),
+            status: 'OPEN' satisfies AccountingReconciliationFindingStatus,
+          }
+        }),
+      })
+    }
+
+    return {
+      ...report,
+      runId: run.id,
+      persisted: true,
+    }
+  }
+
+  return client.$transaction ? client.$transaction(persist) : persist(client)
+}
+
+export async function listAccountingReconciliationRuns(
+  client: AccountingReconciliationPersistenceClient = db as unknown as AccountingReconciliationPersistenceClient,
+  options: { limit?: number; includeFindings?: boolean } = {},
+): Promise<PersistedAccountingReconciliationRun[]> {
+  const take = Math.min(Math.max(options.limit ?? 25, 1), 100)
+  return client.accountingReconciliationRun.findMany({
+    orderBy: { createdAt: 'desc' },
+    take,
+    include: options.includeFindings
+      ? { findings: { orderBy: { createdAt: 'asc' } } }
+      : { _count: { select: { findings: true } } },
+  })
+}
+
+export async function updateAccountingReconciliationFindingStatus(
+  findingId: string,
+  status: unknown,
+  client: AccountingReconciliationPersistenceClient = db as unknown as AccountingReconciliationPersistenceClient,
+): Promise<PersistedAccountingReconciliationFinding> {
+  const normalized = normalizeFindingStatus(status)
+  if (!normalized) {
+    throw new Error(`Invalid accounting reconciliation finding status: ${String(status)}`)
+  }
+
+  return client.accountingReconciliationFinding.update({
+    where: { id: findingId },
+    data: { status: normalized },
+  })
 }
