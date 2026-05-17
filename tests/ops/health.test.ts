@@ -5,8 +5,15 @@ import { GET as publicHealthGET, HEAD as publicHealthHEAD } from '../../app/api/
 import {
   type AdminHealthResponse,
   type HealthAdapters,
+  buildAccountingEventsHealth,
+  buildCronFreshnessPolicies,
+  buildCronFreshnessHealth,
   buildFxSyncHealthFromLastFetched,
+  buildIntegrationOutboxHealth,
+  buildInvariantCheckHealthFromCronRun,
+  buildMintsoftWebhookQueueHealth,
   buildPublicHealthResponse,
+  buildWmsStockSyncHealth,
   collectAdminHealth,
   createAdminHealthHandler,
   summarizeHealthStatus,
@@ -77,6 +84,9 @@ test('admin health handler returns detailed diagnostics for authorized admins', 
   assert.equal(body.app.version, '1.5.0')
   assert.equal(body.checks.database.status, 'ok')
   assert.equal(body.checks.writableDirectories[0].label, 'backups')
+  assert.equal(body.checks.integrationOutbox.status, 'ok')
+  assert.equal(body.checks.latestInvariantCheck.details?.criticalCount, 0)
+  assert.equal(body.checks.cronFreshness.jobs['invariant-check'].status, 'ok')
 })
 
 test('admin health handler returns service-unavailable only when core health is down', async () => {
@@ -111,12 +121,31 @@ test('admin health collection summarizes adapter checks without exposing raw env
   assert.equal(JSON.stringify(report).includes('stage_091'), false)
 })
 
+test('admin health collection degrades when invariant critical counts exist', async () => {
+  const report = await collectAdminHealth(createHealthAdapters({
+    latestInvariantCheck: async () => buildInvariantCheckHealthFromCronRun({
+      runId: 'run-1',
+      startedAt: new Date('2026-04-28T11:59:00.000Z'),
+      finishedAt: new Date('2026-04-28T12:00:00.000Z'),
+      status: 'completed',
+      countsJson: { total: { total: 3, info: 0, warning: 1, critical: 2 } },
+    }, FIXED_DATE),
+  }))
+
+  assert.equal(report.status, 'degraded')
+  assert.equal(report.ok, false)
+  assert.equal(report.checks.latestInvariantCheck.status, 'warning')
+  assert.equal(report.checks.latestInvariantCheck.lastStatus, 'critical_findings')
+  assert.equal(report.checks.latestInvariantCheck.criticalCount, 2)
+  assert.equal(report.checks.latestInvariantCheck.details?.criticalCount, 2)
+})
+
 test('admin health status treats any error check as down without relying on array position', () => {
   const okCheck = { status: 'ok', checkedAt: FIXED_DATE.toISOString() } as const
   const errorCheck = { status: 'error', checkedAt: FIXED_DATE.toISOString() } as const
 
-  assert.equal(summarizeHealthStatus(okCheck, [errorCheck]), 'down')
-  assert.equal(summarizeHealthStatus(errorCheck, [okCheck]), 'down')
+  assert.equal(summarizeHealthStatus([okCheck, errorCheck]), 'down')
+  assert.equal(summarizeHealthStatus([errorCheck, okCheck]), 'down')
 })
 
 test('admin health collection degrades instead of hanging when an adapter times out', async () => {
@@ -129,7 +158,26 @@ test('admin health collection degrades instead of hanging when an adapter times 
 
   assert.equal(report.status, 'degraded')
   assert.equal(report.checks.latestBackup.status, 'warning')
-  assert.equal(report.checks.latestBackup.message, 'Health check failed or timed out: latest backup')
+  assert.equal(
+    report.checks.latestBackup.message,
+    'Health check failed or timed out: latest backup (Health check timed out: latest backup)',
+  )
+})
+
+test('admin health collection marks down when database check times out', async () => {
+  const report = await collectAdminHealth(
+    createHealthAdapters({
+      checkDatabase: async () => new Promise(() => undefined),
+    }),
+    { timeoutMs: 5 },
+  )
+
+  assert.equal(report.status, 'down')
+  assert.equal(report.checks.database.status, 'error')
+  assert.equal(
+    report.checks.database.message,
+    'Health check failed or timed out: database (Health check timed out: database)',
+  )
 })
 
 test('FX health uses last successful fetch timestamp instead of FX rate rows', () => {
@@ -159,6 +207,171 @@ test('FX health warns when the last successful fetch timestamp is stale or missi
   assert.equal(stale.message, 'Latest FX fetch is stale')
   assert.equal(missing.status, 'warning')
   assert.equal(missing.message, 'No FX rate fetch timestamp found')
+})
+
+test('operational health builders summarize outbox webhook accounting and cron risk', () => {
+  const outbox = buildIntegrationOutboxHealth({
+    pending: 4,
+    retryableFailed: 1,
+    permanentFailed: 0,
+    processing: 2,
+    oldestPendingCreatedAt: new Date('2026-04-28T11:00:00.000Z'),
+    now: FIXED_DATE,
+  })
+  const webhook = buildMintsoftWebhookQueueHealth({
+    pending: 1,
+    pendingRetry: 0,
+    failedRetry: 0,
+    dead: 1,
+    oldestUnprocessedReceivedAt: new Date('2026-04-28T10:00:00.000Z'),
+    now: FIXED_DATE,
+  })
+  const accountingEvents = buildAccountingEventsHealth({
+    pending: 3,
+    failed: 1,
+    now: FIXED_DATE,
+  })
+  const cronFreshness = buildCronFreshnessHealth([
+    {
+      jobName: 'invariant-check',
+      startedAt: new Date('2026-04-28T11:30:00.000Z'),
+      finishedAt: new Date('2026-04-28T11:31:00.000Z'),
+      status: 'completed',
+    },
+  ], FIXED_DATE, [
+    { jobName: 'invariant-check', schedule: '0 4 * * *', staleAfterMs: 60 * 60 * 1000 },
+    { jobName: 'wc-reconcile', schedule: '0 4 * * *', staleAfterMs: 60 * 60 * 1000 },
+  ])
+
+  assert.equal(outbox.status, 'warning')
+  assert.equal(outbox.details?.oldestPendingAgeMs, 3600000)
+  assert.equal(webhook.status, 'warning')
+  assert.equal(webhook.details?.dead, 1)
+  assert.equal(accountingEvents.status, 'warning')
+  assert.equal(accountingEvents.details?.failed, 1)
+  assert.equal(cronFreshness.status, 'warning')
+  assert.equal(cronFreshness.jobs['invariant-check'].status, 'ok')
+  assert.equal(cronFreshness.jobs['wc-reconcile'].status, 'warning')
+})
+
+test('operational health builders warn on stale backlogs and preserve healthy active queues', () => {
+  const activeOutbox = buildIntegrationOutboxHealth({
+    pending: 0,
+    retryableFailed: 0,
+    permanentFailed: 0,
+    processing: 1,
+    oldestProcessingLockedAt: new Date('2026-04-28T11:55:00.000Z'),
+    now: FIXED_DATE,
+  })
+  const stuckOutbox = buildIntegrationOutboxHealth({
+    pending: 0,
+    retryableFailed: 0,
+    permanentFailed: 0,
+    processing: 1,
+    oldestProcessingLockedAt: new Date('2026-04-28T11:30:00.000Z'),
+    now: FIXED_DATE,
+  })
+  const freshAccountingBacklog = buildAccountingEventsHealth({
+    pending: 20,
+    failed: 0,
+    oldestPendingCreatedAt: new Date('2026-04-28T11:45:00.000Z'),
+    now: FIXED_DATE,
+  })
+  const staleAccountingBacklog = buildAccountingEventsHealth({
+    pending: 20,
+    failed: 0,
+    oldestPendingCreatedAt: new Date('2026-04-28T11:00:00.000Z'),
+    now: FIXED_DATE,
+  })
+
+  assert.equal(activeOutbox.status, 'ok')
+  assert.equal(stuckOutbox.status, 'warning')
+  assert.equal(freshAccountingBacklog.status, 'ok')
+  assert.equal(staleAccountingBacklog.status, 'warning')
+})
+
+test('cron freshness handles missing runs, clock skew, and registry-derived schedules', () => {
+  const empty = buildCronFreshnessHealth([], FIXED_DATE, [
+    { jobName: 'invariant-check', schedule: '0 4 * * *', staleAfterMs: 36 * 60 * 60 * 1000 },
+    { jobName: 'mintsoft-webhook-sweeper', schedule: '*/5 * * * *', staleAfterMs: 15 * 60 * 1000 },
+  ])
+  const future = buildCronFreshnessHealth([
+    {
+      jobName: 'mintsoft-webhook-sweeper',
+      startedAt: new Date('2026-04-28T12:05:00.000Z'),
+      finishedAt: null,
+      status: 'completed',
+    },
+  ], FIXED_DATE, [
+    { jobName: 'mintsoft-webhook-sweeper', schedule: '*/5 * * * *', staleAfterMs: 15 * 60 * 1000 },
+  ])
+  const policies = buildCronFreshnessPolicies([
+    {
+      slug: 'wc-reconcile',
+      settingKey: 'wc_reconcile',
+      module: 'woocommerce',
+      moduleLabel: 'WooCommerce',
+      label: 'WooCommerce Reconcile',
+      description: 'Daily WooCommerce reconcile',
+      defaultSchedule: '0 4 * * *',
+      defaultEnabled: true,
+    },
+    {
+      slug: 'mintsoft-webhook-sweeper',
+      settingKey: 'mintsoft_webhook_sweeper',
+      module: 'mintsoft',
+      moduleLabel: 'Mintsoft',
+      label: 'Mintsoft Webhook Sweeper',
+      description: 'Drain queued Mintsoft webhooks',
+      defaultSchedule: '*/5 * * * *',
+      defaultEnabled: true,
+    },
+    {
+      slug: 'mintsoft-product-verify',
+      settingKey: 'mintsoft_product_verify',
+      module: 'mintsoft',
+      moduleLabel: 'Mintsoft',
+      label: 'Mintsoft Product Verification',
+      description: 'Verify Mintsoft product mappings',
+      defaultSchedule: '0 3 * * *',
+      defaultEnabled: false,
+    },
+  ], new Map([['cron_mintsoft_product_verify_enabled', 'true']]))
+
+  assert.equal(empty.status, 'warning')
+  assert.equal(empty.jobs['invariant-check'].lastRunAt, null)
+  assert.equal(future.jobs['mintsoft-webhook-sweeper'].ageMs, 0)
+  assert.equal(policies.find((policy) => policy.jobName === 'wc-reconcile')?.staleAfterMs, 36 * 60 * 60 * 1000)
+  assert.equal(
+    policies.find((policy) => policy.jobName === 'mintsoft-webhook-sweeper')?.staleAfterMs,
+    15 * 60 * 1000,
+  )
+  assert.equal(Boolean(policies.find((policy) => policy.jobName === 'mintsoft-product-verify')), true)
+})
+
+test('invariant and WMS stock health elevate parse mismatches and completed jobs with findings', () => {
+  const malformedInvariant = buildInvariantCheckHealthFromCronRun({
+    runId: 'run-1',
+    startedAt: new Date('2026-04-28T11:55:00.000Z'),
+    finishedAt: new Date('2026-04-28T12:00:00.000Z'),
+    status: 'completed',
+    countsJson: { summary: { criticalCount: 5 } },
+  }, FIXED_DATE)
+  const stockSync = buildWmsStockSyncHealth({
+    id: 'sync-1',
+    status: 'SUCCEEDED',
+    startedAt: new Date('2026-04-28T11:55:00.000Z'),
+    finishedAt: new Date('2026-04-28T12:00:00.000Z'),
+    totalChecked: 10,
+    mismatched: 1,
+    errors: 0,
+  }, FIXED_DATE)
+
+  assert.equal(malformedInvariant.status, 'warning')
+  assert.equal(malformedInvariant.countShape, 'mismatch')
+  assert.equal(malformedInvariant.details?.countShape, 'mismatch')
+  assert.equal(stockSync.status, 'warning')
+  assert.equal(stockSync.message, 'Latest Mintsoft stock sync completed with mismatches or errors')
 })
 
 function createAdminReport(overrides: Partial<AdminHealthResponse> = {}): AdminHealthResponse {
@@ -214,6 +427,84 @@ function createAdminReport(overrides: Partial<AdminHealthResponse> = {}): AdminH
         lastRunAt: FIXED_DATE.toISOString(),
         lastStatus: 'synced',
         reference: 'EUR',
+      },
+      integrationOutbox: {
+        status: 'ok',
+        checkedAt: FIXED_DATE.toISOString(),
+        details: {
+          pending: 0,
+          retryableFailed: 0,
+          permanentFailed: 0,
+          processing: 0,
+          oldestPendingCreatedAt: null,
+          oldestPendingAgeMs: null,
+          pendingStaleAfterMs: 1800000,
+          oldestProcessingLockedAt: null,
+          oldestProcessingAgeMs: null,
+          stuckProcessingAfterMs: 600000,
+        },
+      },
+      latestInvariantCheck: {
+        status: 'ok',
+        checkedAt: FIXED_DATE.toISOString(),
+        lastRunAt: FIXED_DATE.toISOString(),
+        lastStatus: 'completed',
+        reference: 'invariant-run-1',
+        criticalCount: 0,
+        countShape: 'exact',
+        details: { criticalCount: 0, countShape: 'exact' },
+      },
+      latestWmsStockSync: {
+        status: 'ok',
+        checkedAt: FIXED_DATE.toISOString(),
+        lastRunAt: FIXED_DATE.toISOString(),
+        lastStatus: 'SUCCEEDED',
+        reference: 'wms-sync-1',
+        details: {
+          connector: 'mintsoft',
+          totalChecked: 10,
+          mismatched: 0,
+          errors: 0,
+        },
+      },
+      mintsoftWebhookQueue: {
+        status: 'ok',
+        checkedAt: FIXED_DATE.toISOString(),
+        details: {
+          pending: 0,
+          pendingRetry: 0,
+          failedRetry: 0,
+          dead: 0,
+          oldestUnprocessedReceivedAt: null,
+          oldestUnprocessedAgeMs: null,
+          staleAfterMs: 3600000,
+        },
+      },
+      accountingEvents: {
+        status: 'ok',
+        checkedAt: FIXED_DATE.toISOString(),
+        details: {
+          pending: 0,
+          failed: 0,
+          oldestPendingCreatedAt: null,
+          oldestPendingAgeMs: null,
+          pendingStaleAfterMs: 1800000,
+        },
+      },
+      cronFreshness: {
+        status: 'ok',
+        checkedAt: FIXED_DATE.toISOString(),
+        details: { warningCount: 0 },
+        jobs: {
+          'invariant-check': {
+            status: 'ok',
+            lastRunAt: FIXED_DATE.toISOString(),
+            lastStatus: 'completed',
+            ageMs: 0,
+            staleAfterMs: 129600000,
+            schedule: '0 4 * * *',
+          },
+        },
       },
     },
     ...overrides,
@@ -271,6 +562,59 @@ function createHealthAdapters(overrides: Partial<HealthAdapters> = {}): HealthAd
       reference: 'frankfurter',
       details: { source: 'frankfurter' },
     }),
+    integrationOutbox: async () => buildIntegrationOutboxHealth({
+      pending: 0,
+      retryableFailed: 0,
+      permanentFailed: 0,
+      processing: 0,
+      oldestPendingCreatedAt: null,
+      oldestProcessingLockedAt: null,
+      now: FIXED_DATE,
+    }),
+    latestInvariantCheck: async () => buildInvariantCheckHealthFromCronRun({
+      runId: 'invariant-run-1',
+      startedAt: FIXED_DATE,
+      finishedAt: FIXED_DATE,
+      status: 'completed',
+      countsJson: { total: { total: 0, info: 0, warning: 0, critical: 0 } },
+    }, FIXED_DATE),
+    latestWmsStockSync: async () => ({
+      status: 'ok',
+      checkedAt: FIXED_DATE.toISOString(),
+      lastRunAt: FIXED_DATE.toISOString(),
+      lastStatus: 'SUCCEEDED',
+      reference: 'wms-sync-1',
+      details: {
+        connector: 'mintsoft',
+        totalChecked: 10,
+        mismatched: 0,
+        errors: 0,
+      },
+    }),
+    mintsoftWebhookQueue: async () => buildMintsoftWebhookQueueHealth({
+      pending: 0,
+      pendingRetry: 0,
+      failedRetry: 0,
+      dead: 0,
+      oldestUnprocessedReceivedAt: null,
+      now: FIXED_DATE,
+    }),
+    accountingEvents: async () => buildAccountingEventsHealth({
+      pending: 0,
+      failed: 0,
+      oldestPendingCreatedAt: null,
+      now: FIXED_DATE,
+    }),
+    cronFreshness: async () => buildCronFreshnessHealth([
+      {
+        jobName: 'invariant-check',
+        startedAt: FIXED_DATE,
+        finishedAt: FIXED_DATE,
+        status: 'completed',
+      },
+    ], FIXED_DATE, [
+      { jobName: 'invariant-check', schedule: '0 4 * * *', staleAfterMs: 129600000 },
+    ]),
     ...overrides,
   }
 }
