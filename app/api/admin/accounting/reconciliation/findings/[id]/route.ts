@@ -16,17 +16,19 @@ export async function PATCH(
   const { id } = await context.params
   const body = await request.json().catch(() => ({})) as Record<string, unknown>
   try {
-    const finding = await updateAccountingReconciliationFindingStatus(id, body.status)
+    const { finding, priorStatus } = await updateAccountingReconciliationFindingStatus(id, body.status, session.user.id)
     await logActivity({
-      entityType: 'SYSTEM',
-      entityId: finding.runId,
+      entityType: 'AccountingReconciliationFinding',
+      entityId: finding.id,
       tag: 'accounting',
       action: 'accounting_reconciliation_finding_status',
-      description: `Marked accounting reconciliation finding ${finding.id} as ${finding.status}`,
+      description: `Marked accounting reconciliation finding ${finding.id} from ${priorStatus} to ${finding.status}`,
       metadata: {
         findingId: finding.id,
         runId: finding.runId,
+        priorStatus,
         status: finding.status,
+        actorUserId: session.user.id,
         code: finding.code,
       },
     })
