@@ -57,6 +57,18 @@ export const apiRouteAuthPolicy = {
     access: 'admin',
     reason: 'Detailed operational diagnostics are restricted through requireApiAdmin.',
   },
+  '/api/admin/outbox': {
+    access: 'admin',
+    reason: 'Integration outbox inspection is restricted through requireApiAdmin and redacts connector payload secrets.',
+  },
+  '/api/admin/outbox/[id]/permanent-fail': {
+    access: 'admin',
+    reason: 'Manual integration outbox dead-letter actions are restricted through requireApiAdmin and logged.',
+  },
+  '/api/admin/outbox/[id]/replay': {
+    access: 'admin',
+    reason: 'Manual integration outbox replay actions are restricted through requireApiAdmin and logged.',
+  },
   '/api/backup/create': {
     access: 'admin',
     reason: 'Backup creation is restricted through requireApiAdmin.',
