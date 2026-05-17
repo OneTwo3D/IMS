@@ -1175,6 +1175,7 @@ model SalesOrder {
   wmsReturnsInbox   WmsReturnsInbox[] @relation("WmsReturnsInboxOrder")
 
   @@index([status])
+  @@index([status, updatedAt(sort: Desc)], map: "sales_orders_status_updatedAt_idx")
   @@index([createdAt])
   @@map("sales_orders")
 }

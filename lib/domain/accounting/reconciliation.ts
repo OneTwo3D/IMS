@@ -1,4 +1,6 @@
 import { db } from '@/lib/db'
+// decimal-boundary-ok: report-only (accounting reconciliation finding details)
+import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { isMirrorableAccountingSyncType } from './accounting-event-mirror'
 
 export type AccountingReconciliationSeverity = 'warning' | 'critical'
@@ -44,6 +46,8 @@ type SourceRefundRow = {
   id: string
   orderId: string
   creditNoteNumber: string | null
+  accountingCreditNoteId: string | null
+  totalBase: DecimalLike
   accountingRetrySyncs: unknown
 }
 
@@ -98,7 +102,11 @@ type AccountingReconciliationClient = {
 
 export const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
 const MAX_RECONCILIATION_ROWS = 10_000
-const TERMINAL_SALES_ORDER_STATUSES = ['REFUNDED', 'CANCELLED'] as const
+const TERMINAL_SALES_ORDER_STATUSES = ['REFUNDED', 'PARTIALLY_REFUNDED', 'CANCELLED', 'COMPLETED', 'DELIVERED'] as const
+const REFUNDED_SALES_ORDER_STATUSES = new Set(['REFUNDED', 'PARTIALLY_REFUNDED'])
+// PENDING/PROCESSING are intentional evidence: reconciliation distinguishes
+// "queued but not mirrored" from "no accounting path was ever scheduled".
+const LIVE_SYNC_STATUSES = new Set(['PENDING', 'PROCESSING', 'SYNCED'])
 
 // Document sync events are mirrorable, but their source checks are document-specific rather than DailyBatch source-key checks.
 const SOURCE_TRACKED_EVENT_TYPES = new Set([
@@ -150,6 +158,18 @@ function retrySyncTypes(value: unknown): Set<string> {
   )))
 }
 
+function syncLogHasLiveEvidence(
+  syncLogs: AccountingSyncLogRow[],
+  params: { type: string; referenceType: string; referenceId: string },
+): boolean {
+  return syncLogs.some((log) => (
+    log.type === params.type &&
+    log.referenceType === params.referenceType &&
+    log.referenceId === params.referenceId &&
+    LIVE_SYNC_STATUSES.has(log.status)
+  ))
+}
+
 function refundLabel(refund: SourceRefundRow): string {
   return refund.creditNoteNumber ?? refund.id
 }
@@ -168,6 +188,41 @@ function hasAccountingEvent(
   }
   const anyConnectorKey = sourceKey(params.type, params.sourceEntityType, params.sourceEntityId)
   return accountingEvents.some((event) => sourceKey(event.type, event.sourceEntityType, event.sourceEntityId) === anyConnectorKey)
+}
+
+function hasRefundCreditNoteEvidence(rows: AccountingReconciliationRows, refund: SourceRefundRow): boolean {
+  // Any non-empty connector credit-note id is durable evidence. Sync writers
+  // must clear this field if a remote credit note is voided or invalidated.
+  if (refund.accountingCreditNoteId?.trim()) return true
+  if (syncLogHasLiveEvidence(rows.syncLogs, {
+    type: 'CREDIT_NOTE',
+    referenceType: 'SalesOrderRefund',
+    referenceId: refund.id,
+  })) return true
+  if (hasAccountingEvent(rows.accountingEvents, {
+    type: 'CREDIT_NOTE',
+    sourceEntityType: 'SalesOrderRefund',
+    sourceEntityId: refund.id,
+  })) return true
+  return retrySyncTypes(refund.accountingRetrySyncs).has('CREDIT_NOTE')
+}
+
+function hasRefundReversalEvidence(rows: AccountingReconciliationRows, refund: SourceRefundRow): boolean {
+  const retryTypes = retrySyncTypes(refund.accountingRetrySyncs)
+  for (const type of REFUND_REVERSAL_TYPES) {
+    if (syncLogHasLiveEvidence(rows.syncLogs, {
+      type,
+      referenceType: 'SalesOrderRefund',
+      referenceId: refund.id,
+    })) return true
+    if (hasAccountingEvent(rows.accountingEvents, {
+      type,
+      sourceEntityType: 'SalesOrderRefund',
+      sourceEntityId: refund.id,
+    })) return true
+    if (retryTypes.has(type)) return true
+  }
+  return false
 }
 
 function buildSummary(findings: AccountingReconciliationFinding[]): AccountingReconciliationReport['summary'] {
@@ -219,12 +274,51 @@ function addExpectedSourceEventFinding(
   })
 }
 
+function addRowCapFindings(
+  findings: AccountingReconciliationFinding[],
+  rows: AccountingReconciliationRows,
+): void {
+  const cappedDatasets: Array<{ dataset: keyof AccountingReconciliationRows; count: number }> = [
+    { dataset: 'salesOrders', count: rows.salesOrders.length },
+    { dataset: 'shipments', count: rows.shipments.length },
+    { dataset: 'refunds', count: rows.refunds.length },
+    { dataset: 'syncLogs', count: rows.syncLogs.length },
+    { dataset: 'accountingEvents', count: rows.accountingEvents.length },
+  ]
+
+  for (const { dataset, count } of cappedDatasets) {
+    if (count < MAX_RECONCILIATION_ROWS) continue
+    findings.push({
+      severity: 'warning',
+      code: 'reconciliation_row_cap_reached',
+      message: `Accounting reconciliation reached the ${MAX_RECONCILIATION_ROWS} row cap for ${dataset}; report may be incomplete`,
+      details: {
+        dataset,
+        scanned: count,
+        limit: MAX_RECONCILIATION_ROWS,
+      },
+    })
+  }
+}
+
 export function evaluateAccountingReconciliationRows(
   rows: AccountingReconciliationRows,
 ): AccountingReconciliationFinding[] {
   const findings: AccountingReconciliationFinding[] = []
+  addRowCapFindings(findings, rows)
   const sourceKeys = new Set<string>()
   const refundIds = new Set(rows.refunds.map((refund) => refund.id))
+  const refundsByOrderId = new Map<string, SourceRefundRow[]>()
+  for (const refund of rows.refunds) {
+    const existing = refundsByOrderId.get(refund.orderId)
+    if (existing) existing.push(refund)
+    else refundsByOrderId.set(refund.orderId, [refund])
+  }
+  const postedShipmentOrderIds = new Set(
+    rows.shipments
+      .filter((shipment) => shipment.shipmentJournalDate != null)
+      .map((shipment) => shipment.orderId),
+  )
 
   for (const order of rows.salesOrders) {
     const label = orderLabel(order)
@@ -256,6 +350,67 @@ export function evaluateAccountingReconciliationRows(
         message: `Sales order ${label} has A2 inventory allocation but no mirrored accounting event`,
         details: { status: order.status, inventoryAllocatedDate: order.inventoryAllocatedDate },
       })
+    }
+
+    const orderRefunds = refundsByOrderId.get(order.id) ?? []
+    const hasPostedAccountingState = Boolean(a1Date || a2Date || postedShipmentOrderIds.has(order.id))
+    if (order.status === 'CANCELLED' && hasPostedAccountingState) {
+      const hasReversalEvidence = orderRefunds.some((refund) => hasRefundReversalEvidence(rows, refund))
+      if (!hasReversalEvidence) {
+        findings.push({
+          severity: 'critical',
+          code: 'terminal_cancelled_order_missing_reversal_evidence',
+          orderId: order.id,
+          message: `Cancelled sales order ${label} has posted accounting state but no reversal evidence`,
+          details: {
+            status: order.status,
+            revenueDeferredDate: order.revenueDeferredDate,
+            inventoryAllocatedDate: order.inventoryAllocatedDate,
+            hasPostedShipment: postedShipmentOrderIds.has(order.id),
+            refundIds: orderRefunds.map((refund) => refund.id),
+          },
+        })
+      }
+    }
+
+    if (REFUNDED_SALES_ORDER_STATUSES.has(order.status)) {
+      for (const refund of orderRefunds) {
+        const hasCreditNoteEvidence = hasRefundCreditNoteEvidence(rows, refund)
+        const hasReversalEvidence = hasRefundReversalEvidence(rows, refund)
+        if (!hasCreditNoteEvidence) {
+          findings.push({
+            severity: 'critical',
+            code: 'terminal_refunded_order_missing_credit_note_evidence',
+            orderId: order.id,
+            refundId: refund.id,
+            message: `Refunded sales order ${label} has refund ${refundLabel(refund)} but no credit-note evidence`,
+            details: {
+              status: order.status,
+              creditNoteNumber: refund.creditNoteNumber,
+              accountingCreditNoteId: refund.accountingCreditNoteId,
+              totalBase: decimalToNumber(refund.totalBase),
+            },
+          })
+        }
+
+        // Zero-total refunds post no COGS/unearned-revenue reversal; only
+        // positive-value refunds require reversal evidence.
+        if (postedShipmentOrderIds.has(order.id) && decimalToNumber(refund.totalBase) > 0 && !hasReversalEvidence) {
+          findings.push({
+            severity: 'critical',
+            code: 'terminal_refunded_order_missing_reversal_evidence',
+            orderId: order.id,
+            refundId: refund.id,
+            message: `Refunded sales order ${label} has refund ${refundLabel(refund)} but no reversal evidence`,
+            details: {
+              status: order.status,
+              creditNoteNumber: refund.creditNoteNumber,
+              totalBase: decimalToNumber(refund.totalBase),
+              hasPostedShipment: true,
+            },
+          })
+        }
+      }
     }
   }
 
@@ -410,12 +565,14 @@ export async function collectAccountingReconciliationRows(
   const [salesOrders, shipments, refunds, syncLogs, accountingEvents] = await Promise.all([
     client.salesOrder.findMany({
       where: {
-        status: { notIn: [...TERMINAL_SALES_ORDER_STATUSES] },
         OR: [
           { revenueDeferredDate: { gte: fromDate } },
           { inventoryAllocatedDate: { gte: fromDate } },
+          { status: { in: [...TERMINAL_SALES_ORDER_STATUSES] }, updatedAt: { gte: fromDate } },
         ],
       },
+      orderBy: { updatedAt: 'desc' },
+      take: MAX_RECONCILIATION_ROWS,
       select: {
         id: true,
         orderNumber: true,
@@ -427,6 +584,8 @@ export async function collectAccountingReconciliationRows(
     }),
     client.shipment.findMany({
       where: { shipmentJournalDate: { gte: fromDate } },
+      orderBy: { shipmentJournalDate: 'desc' },
+      take: MAX_RECONCILIATION_ROWS,
       select: {
         id: true,
         orderId: true,
@@ -436,7 +595,6 @@ export async function collectAccountingReconciliationRows(
     client.salesOrderRefund.findMany({
       where: {
         refundedAt: { gte: fromDate },
-        order: { status: { not: 'CANCELLED' } },
       },
       orderBy: { refundedAt: 'desc' },
       take: MAX_RECONCILIATION_ROWS,
@@ -444,6 +602,8 @@ export async function collectAccountingReconciliationRows(
         id: true,
         orderId: true,
         creditNoteNumber: true,
+        accountingCreditNoteId: true,
+        totalBase: true,
         accountingRetrySyncs: true,
       },
     }),
