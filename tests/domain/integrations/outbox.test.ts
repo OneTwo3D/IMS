@@ -5,6 +5,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { StockSyncReason } from '@/app/generated/prisma/enums'
 import {
   buildOutboxIdempotencyKey,
+  calculateIntegrationOutboxRetryDelayMs,
   claimIntegrationOutboxWork,
   enqueueIntegrationOutbox,
   INTEGRATION_OUTBOX_STATUS,
@@ -184,6 +185,30 @@ function makeClient(
   }
 
   return { client, rows }
+}
+
+function withEnv(overrides: Record<string, string | undefined>, fn: () => void): void {
+  const previous = new Map<string, string | undefined>()
+  for (const key of Object.keys(overrides)) {
+    previous.set(key, process.env[key])
+    const value = overrides[key]
+    if (value === undefined) {
+      delete process.env[key]
+    } else {
+      process.env[key] = value
+    }
+  }
+  try {
+    fn()
+  } finally {
+    for (const [key, value] of previous) {
+      if (value === undefined) {
+        delete process.env[key]
+      } else {
+        process.env[key] = value
+      }
+    }
+  }
 }
 
 test('integration outbox enqueue is idempotent by idempotency key', async () => {
@@ -439,6 +464,7 @@ test('integration outbox failure helpers schedule retry or permanent failure', a
     lockedAt: now,
     error: new Error('temporary connector outage'),
     now,
+    attemptsBeforeFailure: 1,
     retryDelayMs: 60_000,
   })
   const permanent = await markIntegrationOutboxPermanentFailure({
@@ -464,6 +490,160 @@ test('integration outbox failure helpers schedule retry or permanent failure', a
   assert.equal(rows.find((row) => row.id === 'job-2')?.lockedBy, null)
 })
 
+test('integration outbox retry delay increases exponentially by attempt count', () => {
+  assert.equal(
+    calculateIntegrationOutboxRetryDelayMs({
+      attemptsBeforeFailure: 0,
+      baseDelayMs: 1_000,
+      maxDelayMs: 60_000,
+      jitterMs: 0,
+      random: () => 0,
+    }),
+    1_000,
+  )
+  assert.equal(
+    calculateIntegrationOutboxRetryDelayMs({
+      attemptsBeforeFailure: 1,
+      baseDelayMs: 1_000,
+      maxDelayMs: 60_000,
+      jitterMs: 0,
+      random: () => 0,
+    }),
+    2_000,
+  )
+  assert.equal(
+    calculateIntegrationOutboxRetryDelayMs({
+      attemptsBeforeFailure: 4,
+      baseDelayMs: 1_000,
+      maxDelayMs: 60_000,
+      jitterMs: 0,
+      random: () => 0,
+    }),
+    16_000,
+  )
+})
+
+test('integration outbox retry delay applies deterministic jitter and max cap', () => {
+  assert.equal(
+    calculateIntegrationOutboxRetryDelayMs({
+      attemptsBeforeFailure: 2,
+      baseDelayMs: 1_000,
+      maxDelayMs: 60_000,
+      jitterMs: 250,
+      random: () => 0.5,
+    }),
+    4_125,
+  )
+  assert.equal(
+    calculateIntegrationOutboxRetryDelayMs({
+      attemptsBeforeFailure: 20,
+      baseDelayMs: 300_000,
+      maxDelayMs: 3_600_000,
+      jitterMs: 30_000,
+      random: () => 1,
+    }),
+    3_600_000,
+  )
+})
+
+test('integration outbox retry delay reads env vars when no explicit delay options are supplied', () => {
+  withEnv({
+    OUTBOX_RETRY_BASE_MS: '1000',
+    OUTBOX_RETRY_MAX_MS: '60000',
+    OUTBOX_RETRY_JITTER_MS: '0',
+  }, () => {
+    assert.equal(
+      calculateIntegrationOutboxRetryDelayMs({ attemptsBeforeFailure: 1, random: () => 0 }),
+      2_000,
+    )
+  })
+})
+
+test('integration outbox retry delay applies a minimum jitter floor when configured jitter is zero', () => {
+  assert.equal(
+    calculateIntegrationOutboxRetryDelayMs({
+      attemptsBeforeFailure: 0,
+      baseDelayMs: 1_000,
+      maxDelayMs: 60_000,
+      jitterMs: 0,
+      random: () => 1,
+    }),
+    1_050,
+  )
+})
+
+test('WooCommerce stock outbox retry curve is the documented shared exponential curve', () => {
+  const minute = 60_000
+  const delaysMinutes = Array.from({ length: 12 }, (_, attemptsBeforeFailure) => (
+    calculateIntegrationOutboxRetryDelayMs({
+      attemptsBeforeFailure,
+      baseDelayMs: 5 * minute,
+      maxDelayMs: 60 * minute,
+      jitterMs: 0,
+      random: () => 0,
+    }) / minute
+  ))
+
+  assert.deepEqual(delaysMinutes, [5, 10, 20, 40, 60, 60, 60, 60, 60, 60, 60, 60])
+})
+
+test('integration outbox explicit zero retry delay stays immediate', async () => {
+  const now = new Date('2026-04-27T10:00:00.000Z')
+  const { client } = makeClient([
+    makeRow({
+      id: 'job-1',
+      status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+      attempts: 1,
+      lockedAt: now,
+      lockedBy: 'worker-1',
+    }),
+  ])
+
+  const retry = await markIntegrationOutboxRetryableFailure({
+    client,
+    id: 'job-1',
+    workerId: 'worker-1',
+    lockedAt: now,
+    error: 'rate-limit retry-after now',
+    now,
+    attemptsBeforeFailure: 1,
+    retryDelayMs: 0,
+  })
+
+  assert.deepEqual(retry.nextAttemptAt, now)
+})
+
+test('integration outbox retryable failure uses backoff when no explicit retry delay is supplied', async () => {
+  const now = new Date('2026-04-27T10:00:00.000Z')
+  const { client } = makeClient([
+    makeRow({
+      id: 'job-1',
+      status: INTEGRATION_OUTBOX_STATUS.PROCESSING,
+      attempts: 2,
+      lockedAt: now,
+      lockedBy: 'worker-1',
+    }),
+  ])
+
+  const retry = await markIntegrationOutboxRetryableFailure({
+    client,
+    id: 'job-1',
+    workerId: 'worker-1',
+    lockedAt: now,
+    error: 'temporary connector outage',
+    now,
+    attemptsBeforeFailure: 2,
+    retryBaseDelayMs: 1_000,
+    retryMaxDelayMs: 60_000,
+    retryJitterMs: 250,
+    retryJitterRandom: () => 0.5,
+  })
+
+  assert.equal(retry.status, INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED)
+  assert.equal(retry.attempts, 3)
+  assert.deepEqual(retry.nextAttemptAt, new Date('2026-04-27T10:00:04.125Z'))
+})
+
 test('integration outbox retryable failure promotes to permanent at max attempts', async () => {
   const now = new Date('2026-04-27T10:00:00.000Z')
   const { client } = makeClient([
@@ -483,6 +663,7 @@ test('integration outbox retryable failure promotes to permanent at max attempts
     lockedAt: now,
     error: 'connector still unavailable',
     now,
+    attemptsBeforeFailure: 4,
     maxAttempts: 5,
   })
 

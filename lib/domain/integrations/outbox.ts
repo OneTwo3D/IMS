@@ -66,8 +66,16 @@ export type MarkIntegrationOutboxFailureOptions = {
   lockedAt: Date
   error: unknown
   now?: Date
-  retryDelayMs?: number
   maxAttempts?: number
+}
+
+export type MarkIntegrationOutboxRetryableFailureOptions = MarkIntegrationOutboxFailureOptions & {
+  attemptsBeforeFailure: number
+  retryDelayMs?: number
+  retryBaseDelayMs?: number
+  retryMaxDelayMs?: number
+  retryJitterMs?: number
+  retryJitterRandom?: () => number
 }
 
 export type MarkIntegrationOutboxSuccessOptions = {
@@ -85,7 +93,11 @@ const CLAIMABLE_STATUSES = [
 ] as const
 const DEFAULT_CLAIM_LIMIT = 25
 const DEFAULT_STALE_LOCK_MS = 10 * 60 * 1000
-const DEFAULT_RETRY_DELAY_MS = 5 * 60 * 1000
+const DEFAULT_RETRY_BASE_DELAY_MS = 5 * 60 * 1000
+const DEFAULT_RETRY_MAX_DELAY_MS = 60 * 60 * 1000
+const DEFAULT_RETRY_JITTER_MS = 30 * 1000
+const DEFAULT_MINIMUM_JITTER_RATIO = 0.05
+const EXPONENTIAL_ATTEMPT_CAP = 30
 export const DEFAULT_INTEGRATION_OUTBOX_MAX_ATTEMPTS = 5
 const MAX_ERROR_LENGTH = 1000
 
@@ -99,6 +111,66 @@ function errorMessage(error: unknown): string {
 
 function truncateError(error: unknown): string {
   return errorMessage(error).slice(0, MAX_ERROR_LENGTH)
+}
+
+function configuredPositiveMs(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (raw == null || raw.trim() === '') return fallback
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback
+  return Math.floor(parsed)
+}
+
+function configuredNonNegativeMs(name: string, fallback: number): number {
+  const raw = process.env[name]
+  if (raw == null || raw.trim() === '') return fallback
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback
+  return Math.floor(parsed)
+}
+
+function normalizeDelayMs(delayMs: number): number {
+  if (!Number.isFinite(delayMs)) return 0
+  return Math.max(0, Math.floor(delayMs))
+}
+
+/**
+ * Computes retry delay as exponential backoff plus tail jitter.
+ *
+ * Tail jitter only moves retries later than the exponential schedule, which
+ * preserves a predictable minimum wait while spreading workers after connector
+ * outages. A small jitter floor still applies when configured jitter is zero to
+ * avoid synchronized retry bursts.
+ */
+export function calculateIntegrationOutboxRetryDelayMs(options: {
+  attemptsBeforeFailure: number
+  baseDelayMs?: number
+  maxDelayMs?: number
+  jitterMs?: number
+  random?: () => number
+}): number {
+  // Retry config is read per call so tests and one-off jobs can exercise env
+  // fallback behavior without reloading the module. Production changes still
+  // require a process restart to affect running workers predictably.
+  const attemptsBeforeFailure = Math.max(0, Math.floor(options.attemptsBeforeFailure))
+  const baseDelayMs = normalizeDelayMs(
+    options.baseDelayMs ?? configuredPositiveMs('OUTBOX_RETRY_BASE_MS', DEFAULT_RETRY_BASE_DELAY_MS),
+  )
+  const maxDelayMs = normalizeDelayMs(
+    options.maxDelayMs ?? configuredPositiveMs('OUTBOX_RETRY_MAX_MS', DEFAULT_RETRY_MAX_DELAY_MS),
+  )
+  const jitterMs = normalizeDelayMs(
+    options.jitterMs ?? configuredNonNegativeMs('OUTBOX_RETRY_JITTER_MS', DEFAULT_RETRY_JITTER_MS),
+  )
+  const random = options.random ?? Math.random
+  const jitterRatio = Math.min(1, Math.max(0, random()))
+  // Tail jitter preserves the exponential minimum and only pushes jobs later,
+  // avoiding early retries while spreading workers after connector outages.
+  const effectiveJitterMs = Math.max(jitterMs, Math.floor(baseDelayMs * DEFAULT_MINIMUM_JITTER_RATIO))
+  const jitterDelayMs = Math.floor(effectiveJitterMs * jitterRatio)
+  const cappedAttempts = Math.min(attemptsBeforeFailure, EXPONENTIAL_ATTEMPT_CAP)
+  const exponentialDelayMs = baseDelayMs * (2 ** cappedAttempts)
+  return Math.min(exponentialDelayMs + jitterDelayMs, maxDelayMs)
 }
 
 function normalizeIdempotencyPart(part: string | number | Date): string {
@@ -318,11 +390,20 @@ export async function markIntegrationOutboxSuccess(
 }
 
 export async function markIntegrationOutboxRetryableFailure(
-  options: MarkIntegrationOutboxFailureOptions,
+  options: MarkIntegrationOutboxRetryableFailureOptions,
 ): Promise<IntegrationOutboxRow> {
   const client = getClient(options.client)
   const now = options.now ?? new Date()
   const maxAttempts = positiveMaxAttempts(options.maxAttempts)
+  const retryDelayMs = options.retryDelayMs === undefined
+    ? calculateIntegrationOutboxRetryDelayMs({
+      attemptsBeforeFailure: options.attemptsBeforeFailure,
+      baseDelayMs: options.retryBaseDelayMs,
+      maxDelayMs: options.retryMaxDelayMs,
+      jitterMs: options.retryJitterMs,
+      random: options.retryJitterRandom,
+    })
+    : normalizeDelayMs(options.retryDelayMs)
 
   const retryableUpdate = await client.integrationOutbox.updateMany({
     where: {
@@ -332,7 +413,7 @@ export async function markIntegrationOutboxRetryableFailure(
     data: {
       status: INTEGRATION_OUTBOX_STATUS.RETRYABLE_FAILED,
       attempts: { increment: 1 },
-      nextAttemptAt: new Date(now.getTime() + (options.retryDelayMs ?? DEFAULT_RETRY_DELAY_MS)),
+      nextAttemptAt: new Date(now.getTime() + retryDelayMs),
       lastError: truncateError(options.error),
       lockedAt: null,
       lockedBy: null,
