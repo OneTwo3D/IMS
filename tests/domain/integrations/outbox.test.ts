@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
+import { StockSyncReason } from '@/app/generated/prisma/enums'
 import {
   buildOutboxIdempotencyKey,
   claimIntegrationOutboxWork,
@@ -13,6 +14,11 @@ import {
   type IntegrationOutboxClient,
   type IntegrationOutboxRow,
 } from '@/lib/domain/integrations/outbox'
+import {
+  INTEGRATION_OUTBOX_REGISTRY,
+  parseIntegrationOutboxPayload,
+  WcStockSyncOutboxPayloadSchema,
+} from '@/lib/domain/integrations/outbox-registry'
 
 type FindManyArgs = {
   where?: MockWhere
@@ -73,7 +79,7 @@ function makeRow(overrides: Partial<IntegrationOutboxRow> = {}): IntegrationOutb
     connector: 'woocommerce',
     operation: 'stock.push',
     idempotencyKey: 'woocommerce:stock.push:sku-1',
-    payloadJson: { productId: 'sku-1' },
+    payloadJson: { productId: 'sku-1', reason: 'IMS_CHANGE', force: false, webhookQty: null },
     status: INTEGRATION_OUTBOX_STATUS.PENDING,
     attempts: 0,
     nextAttemptAt: null,
@@ -187,19 +193,112 @@ test('integration outbox enqueue is idempotent by idempotency key', async () => 
     connector: 'woocommerce',
     operation: 'stock.push',
     idempotencyKey: 'woocommerce:stock.push:sku-1',
-    payloadJson: { productId: 'sku-1', quantity: 4 },
+    payloadJson: { productId: 'sku-1', reason: 'IMS_CHANGE' },
   }, { client })
   const second = await enqueueIntegrationOutbox({
     connector: 'woocommerce',
     operation: 'stock.push',
     idempotencyKey: 'woocommerce:stock.push:sku-1',
-    payloadJson: { productId: 'sku-1', quantity: 9 },
+    payloadJson: { productId: 'sku-1', reason: 'MANUAL', force: true },
   }, { client })
 
   assert.equal(rows.length, 1)
   assert.equal(second.id, first.id)
-  assert.deepEqual(rows[0].payloadJson, { productId: 'sku-1', quantity: 4 })
+  assert.deepEqual(rows[0].payloadJson, { productId: 'sku-1', reason: 'IMS_CHANGE', force: false, webhookQty: null })
   assert.equal(rows[0].status, INTEGRATION_OUTBOX_STATUS.PENDING)
+})
+
+test('integration outbox validates registered payloads on enqueue', async () => {
+  const { client, rows } = makeClient()
+
+  await assert.rejects(
+    () => enqueueIntegrationOutbox({
+      connector: 'woocommerce',
+      operation: 'stock.push',
+      idempotencyKey: 'woocommerce:stock.push:sku-1',
+      payloadJson: { productId: 'sku-1', reason: 'BAD_REASON' },
+    }, { client }),
+    /Integration outbox payload for woocommerce\/stock\.push is invalid/,
+  )
+
+  assert.equal(rows.length, 0)
+})
+
+test('integration outbox preserves unknown operation payloads for backwards compatibility', async () => {
+  const { client, rows } = makeClient()
+
+  const row = await enqueueIntegrationOutbox({
+    connector: 'legacy-connector',
+    operation: 'legacy.operation',
+    idempotencyKey: 'legacy-connector:legacy.operation:job-1',
+    payloadJson: { arbitrary: true, nested: { value: 4 } },
+  }, { client })
+
+  assert.equal(row.id, 'outbox-1')
+  assert.deepEqual(rows[0].payloadJson, { arbitrary: true, nested: { value: 4 } })
+})
+
+test('integration outbox parser passes unknown operation payloads through unchanged', () => {
+  const payload = { arbitrary: true, nested: { value: 4 } }
+
+  assert.equal(
+    parseIntegrationOutboxPayload({
+      connector: 'legacy-connector',
+      operation: 'legacy.operation',
+      payloadJson: payload,
+    }),
+    payload,
+  )
+})
+
+test('integration outbox registry operation strings use namespaced lowercase dot notation', () => {
+  const operationPattern = /^[a-z]+\.[a-z-]+$/
+
+  for (const operations of Object.values(INTEGRATION_OUTBOX_REGISTRY)) {
+    for (const operation of Object.keys(operations)) {
+      assert.match(operation, operationPattern)
+    }
+  }
+})
+
+test('WooCommerce stock sync payload schema accepts every Prisma StockSyncReason value', () => {
+  for (const reason of Object.values(StockSyncReason)) {
+    assert.equal(
+      WcStockSyncOutboxPayloadSchema.safeParse({ productId: 'sku-1', reason }).success,
+      true,
+    )
+  }
+})
+
+test('integration outbox parser error messages include the row id when provided', () => {
+  assert.throws(
+    () => parseIntegrationOutboxPayload({
+      connector: 'woocommerce',
+      operation: 'stock.push',
+      payloadJson: { productId: 'sku-1', reason: 'BAD_REASON' },
+      rowId: 'outbox-42',
+    }),
+    /Integration outbox payload for outbox-42 is invalid: reason/,
+  )
+})
+
+test('integration outbox registry validates Mintsoft booked-in event payloads', () => {
+  assert.deepEqual(
+    parseIntegrationOutboxPayload({
+      connector: 'mintsoft',
+      operation: 'inbound.booked-in',
+      payloadJson: { eventId: ' event-1 ' },
+    }),
+    { eventId: 'event-1' },
+  )
+  assert.throws(
+    () => parseIntegrationOutboxPayload({
+      connector: 'mintsoft',
+      operation: 'inbound.booked-in',
+      payloadJson: { eventId: ' ' },
+    }),
+    /mintsoft\/inbound\.booked-in is invalid/,
+  )
 })
 
 test('integration outbox enqueue treats adapter unique violations as idempotent', async () => {
@@ -207,7 +306,7 @@ test('integration outbox enqueue treats adapter unique violations as idempotent'
     makeRow({
       id: 'existing-job',
       idempotencyKey: 'woocommerce:stock.push:sku-1',
-      payloadJson: { productId: 'sku-1', quantity: 4 },
+      payloadJson: { productId: 'sku-1', reason: 'IMS_CHANGE', force: false, webhookQty: null },
     }),
   ], { adapterUniqueMeta: true })
 
@@ -215,12 +314,12 @@ test('integration outbox enqueue treats adapter unique violations as idempotent'
     connector: 'woocommerce',
     operation: 'stock.push',
     idempotencyKey: 'woocommerce:stock.push:sku-1',
-    payloadJson: { productId: 'sku-1', quantity: 9 },
+    payloadJson: { productId: 'sku-1', reason: 'MANUAL', force: true },
   }, { client })
 
   assert.equal(rows.length, 1)
   assert.equal(row.id, 'existing-job')
-  assert.deepEqual(rows[0].payloadJson, { productId: 'sku-1', quantity: 4 })
+  assert.deepEqual(rows[0].payloadJson, { productId: 'sku-1', reason: 'IMS_CHANGE', force: false, webhookQty: null })
 })
 
 test('integration outbox idempotency key builder normalizes deterministic parts', () => {

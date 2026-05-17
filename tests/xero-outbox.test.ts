@@ -89,7 +89,7 @@ test('Xero accounting outbox uses deterministic sync-log keys and validates payl
   )
   assert.throws(
     () => parseXeroAccountingOutboxPayload({ id: 'outbox-2', payloadJson: { accountingSyncLogId: '' } }),
-    /missing accountingSyncLogId/,
+    /outbox-2 is invalid: accountingSyncLogId/,
   )
 })
 

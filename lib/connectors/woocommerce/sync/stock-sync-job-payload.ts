@@ -1,18 +1,11 @@
 import type { StockSyncReason } from '@/app/generated/prisma/enums'
+import {
+  INTEGRATION_OUTBOX_OPERATIONS,
+  parseIntegrationOutboxPayload,
+  type WcStockSyncOutboxPayload,
+} from '@/lib/domain/integrations/outbox-registry'
 
-export type WcStockSyncOutboxPayload = {
-  productId: string
-  reason: StockSyncReason
-  force: boolean
-  webhookQty: number | null
-}
-
-const WC_STOCK_SYNC_REASONS: StockSyncReason[] = [
-  'IMS_CHANGE',
-  'WC_WEBHOOK',
-  'DAILY_RECONCILIATION',
-  'MANUAL',
-]
+export type { WcStockSyncOutboxPayload }
 
 function hasForcedWcStockSyncPayload(payload: unknown): boolean {
   return !!payload && typeof payload === 'object' && !Array.isArray(payload) && (payload as { force?: unknown }).force === true
@@ -32,26 +25,11 @@ export function buildWcStockSyncOutboxPayload(
   }
 }
 
-function isStockSyncReason(value: unknown): value is StockSyncReason {
-  return typeof value === 'string' && WC_STOCK_SYNC_REASONS.includes(value as StockSyncReason)
-}
-
 export function parseWcStockSyncPayload(row: { id: string; payloadJson: unknown }): WcStockSyncOutboxPayload {
-  const payload = row.payloadJson
-  if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
-    throw new Error(`WooCommerce stock outbox payload for ${row.id} must be an object`)
-  }
-  const data = payload as Record<string, unknown>
-  if (typeof data.productId !== 'string' || !data.productId.trim()) {
-    throw new Error(`WooCommerce stock outbox payload for ${row.id} is missing productId`)
-  }
-  if (!isStockSyncReason(data.reason)) {
-    throw new Error(`WooCommerce stock outbox payload for ${row.id} has invalid reason`)
-  }
-  return {
-    productId: data.productId,
-    reason: data.reason,
-    force: data.force === true,
-    webhookQty: typeof data.webhookQty === 'number' ? data.webhookQty : null,
-  }
+  return parseIntegrationOutboxPayload<WcStockSyncOutboxPayload>({
+    connector: 'woocommerce',
+    operation: INTEGRATION_OUTBOX_OPERATIONS.woocommerce.stockSync,
+    payloadJson: row.payloadJson,
+    rowId: row.id,
+  })
 }

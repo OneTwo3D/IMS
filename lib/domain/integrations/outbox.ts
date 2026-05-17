@@ -1,5 +1,6 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { parseIntegrationOutboxPayload } from '@/lib/domain/integrations/outbox-registry'
 
 export const INTEGRATION_OUTBOX_STATUS = {
   PENDING: 'PENDING',
@@ -231,13 +232,18 @@ export async function enqueueIntegrationOutbox(
   options: { client?: IntegrationOutboxClient } = {},
 ): Promise<IntegrationOutboxRow> {
   const client = getClient(options.client)
+  const payloadJson = parseIntegrationOutboxPayload({
+    connector: input.connector,
+    operation: input.operation,
+    payloadJson: input.payloadJson,
+  })
   try {
     return await client.integrationOutbox.create({
       data: {
         connector: input.connector,
         operation: input.operation,
         idempotencyKey: input.idempotencyKey,
-        payloadJson: input.payloadJson,
+        payloadJson,
         status: INTEGRATION_OUTBOX_STATUS.PENDING,
         attempts: 0,
         nextAttemptAt: input.nextAttemptAt ?? null,
