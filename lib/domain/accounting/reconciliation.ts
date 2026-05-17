@@ -1,5 +1,5 @@
-import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { toJsonInputValue } from '@/lib/db/json-input'
 // decimal-boundary-ok: report-only (accounting reconciliation finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { isMirrorableAccountingSyncType } from './accounting-event-mirror'
@@ -292,16 +292,6 @@ export function reconciliationLookbackDate(days: number, now: Date = new Date())
   const date = new Date(now)
   date.setUTCDate(date.getUTCDate() - days)
   return date
-}
-
-/**
- * Converts report-only finding details into a Prisma JSON value using the same
- * JSON serialization contract the API response already exposes: undefined keys
- * are dropped, Date values become ISO strings, circular structures throw, and
- * non-plain containers such as Map/Set do not retain entries.
- */
-function toJsonValue(value: unknown): Prisma.InputJsonValue {
-  return JSON.parse(JSON.stringify(value ?? null)) as Prisma.InputJsonValue
 }
 
 function findingEntity(finding: AccountingReconciliationFinding): { entityType: string | null; entityId: string | null } {
@@ -792,7 +782,7 @@ export async function persistAccountingReconciliationReport(
             entityType: entity.entityType,
             entityId: entity.entityId,
             message: finding.message,
-            details: toJsonValue(finding.details),
+            details: toJsonInputValue(finding.details),
             status: 'OPEN' satisfies AccountingReconciliationFindingStatus,
           }
         }),

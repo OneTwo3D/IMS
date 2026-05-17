@@ -1124,7 +1124,7 @@ export async function updatePurchaseOrder(
   input: Partial<CreatePoInput>,
 ): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
-    await requirePermission('purchasing.create')
+    const session = await requirePermission('purchasing.create')
     const existing = await db.purchaseOrder.findUnique({
       where: { id },
       select: { status: true, fxRateToBase: true, directFreightForeign: true, directFreightBase: true },
@@ -1447,11 +1447,16 @@ export async function updatePurchaseOrder(
     // received (cost layers exist), recalculate the landed unit cost on
     // each PO line and update the corresponding cost layers. This also
     // computes retrospective COGS adjustments for consumed stock.
+    let landedCostAuditRunIds: string[] = []
     if (input.additionalCosts !== undefined && ['PARTIALLY_RECEIVED', 'RECEIVED', 'INVOICED'].includes(existing.status)) {
       try {
         const landedResult = await db.$transaction(async (tx) => {
-          return recalculateDirectLandedCosts(tx, id)
+          return recalculateDirectLandedCosts(tx, id, undefined, {
+            triggeredById: session.user.id,
+            reason: 'purchase_order_additional_costs_updated',
+          })
         }, STOCK_TX_OPTIONS)
+        landedCostAuditRunIds = landedResult.auditRunIds
 
         try {
           await queueLandedCostAdjustmentJournals(landedResult)
@@ -1460,7 +1465,7 @@ export async function updatePurchaseOrder(
           await logActivity({
             entityType: 'PURCHASE_ORDER', entityId: id, action: 'cogs_adjusted', tag: 'purchase', level: 'INFO',
             description: `Retrospective COGS adjustment of £${adj.totalDelta.toFixed(2)} for ${adj.primaryPoRef} due to additional cost change`,
-            metadata: { totalDelta: adj.totalDelta },
+            metadata: { totalDelta: adj.totalDelta, landedCostAuditRunIds: landedResult.auditRunIds },
           })
         }
       } catch (e) {
@@ -1502,7 +1507,7 @@ export async function updatePurchaseOrder(
       tag: 'purchase',
       level: 'INFO',
       description: `Updated PO ${mapped.reference}`,
-      metadata: { reference: mapped.reference },
+      metadata: { reference: mapped.reference, landedCostAuditRunIds },
     })
     return { success: true, po: mapped }
   } catch (e) {
@@ -2792,7 +2797,7 @@ export type CreateFreightPoInput = {
 
 export async function createFreightPo(input: CreateFreightPoInput): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
-    await requirePermission('purchasing.create')
+    const session = await requirePermission('purchasing.create')
     if (!input.costLines.length) return { success: false, error: 'Add at least one cost line' }
     if (!input.primaryPoIds.length) return { success: false, error: 'Link to at least one primary PO' }
 
@@ -2848,7 +2853,13 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
       },
       select: PO_SELECT,
     })
-    const landedResult = await db.$transaction(async (tx) => recalculateLandedCosts(tx, po.id), STOCK_TX_OPTIONS)
+    const landedResult = await db.$transaction(
+      async (tx) => recalculateLandedCosts(tx, po.id, undefined, {
+        triggeredById: session.user.id,
+        reason: 'freight_purchase_order_created',
+      }),
+      STOCK_TX_OPTIONS,
+    )
 
     // Revalidate linked primary POs
     for (const pid of landedResult.revalidatePoIds) {
@@ -2866,7 +2877,13 @@ export async function createFreightPo(input: CreateFreightPoInput): Promise<{ su
       tag: 'purchase',
       level: 'INFO',
       description: `Created freight PO ${mapped.reference}`,
-      metadata: { reference: mapped.reference, supplierId: input.supplierId, primaryPoIds: input.primaryPoIds, costLineCount: input.costLines.length },
+      metadata: {
+        reference: mapped.reference,
+        supplierId: input.supplierId,
+        primaryPoIds: input.primaryPoIds,
+        costLineCount: input.costLines.length,
+        landedCostAuditRunIds: landedResult.auditRunIds,
+      },
     })
     return { success: true, po: mapped }
   } catch (e) {
@@ -2970,7 +2987,7 @@ export async function updateFreightPoCosts(
   taxRateValue?: number,
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    await requirePermission('purchasing.create')
+    const session = await requirePermission('purchasing.create')
     const { reference, landedResult } = await db.$transaction(async (tx) => {
       const po = await tx.purchaseOrder.findUnique({
         where: { id: freightPoId },
@@ -3026,7 +3043,10 @@ export async function updateFreightPoCosts(
         },
       })
 
-      const landedResult = await recalculateLandedCosts(tx, freightPoId)
+      const landedResult = await recalculateLandedCosts(tx, freightPoId, undefined, {
+        triggeredById: session.user.id,
+        reason: 'freight_purchase_order_costs_updated',
+      })
       return { reference: po.reference, landedResult }
     }, STOCK_TX_OPTIONS)
 
@@ -3042,7 +3062,7 @@ export async function updateFreightPoCosts(
       tag: 'purchase',
       level: 'INFO',
       description: `Updated freight costs for PO ${reference}`,
-      metadata: { reference, costLineCount: costLines.length },
+      metadata: { reference, costLineCount: costLines.length, landedCostAuditRunIds: landedResult.auditRunIds },
     })
 
     try {
@@ -3056,7 +3076,7 @@ export async function updateFreightPoCosts(
         tag: 'purchase',
         level: 'INFO',
         description: `Retrospective COGS adjustment of £${adj.totalDelta.toFixed(2)} for ${adj.primaryPoRef} due to landed cost change`,
-        metadata: { totalDelta: adj.totalDelta, freightPoId },
+        metadata: { totalDelta: adj.totalDelta, freightPoId, landedCostAuditRunIds: landedResult.auditRunIds },
       })
     }
 
