@@ -1590,16 +1590,20 @@ model AccountingReconciliationRun {
 }
 
 model AccountingReconciliationFinding {
-  id         String   @id @default(cuid())
-  runId      String
-  severity   String
-  code       String
-  entityType String?
-  entityId   String?
-  message    String
-  details    Json
-  status     String   @default("OPEN")
-  createdAt  DateTime @default(now())
+  id              String    @id @default(cuid())
+  runId           String
+  severity        String
+  code            String
+  entityType      String?
+  entityId        String?
+  message         String
+  details         Json
+  status          String    @default("OPEN")
+  /// Latest review-state actor/time for fast admin lists. Full status-change
+  /// history is written to ActivityLog as AccountingReconciliationFinding rows.
+  statusUpdatedAt DateTime?
+  statusUpdatedBy String?
+  createdAt       DateTime  @default(now())
 
   run        AccountingReconciliationRun @relation(fields: [runId], references: [id], onDelete: Cascade)
 

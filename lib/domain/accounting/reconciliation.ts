@@ -5,7 +5,7 @@ import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { isMirrorableAccountingSyncType } from './accounting-event-mirror'
 
 export type AccountingReconciliationSeverity = 'warning' | 'critical'
-export type AccountingReconciliationRunStatus = 'COMPLETED'
+export type AccountingReconciliationRunStatus = 'COMPLETED' | 'FAILED' | 'PARTIAL'
 export type AccountingReconciliationFindingStatus = 'OPEN' | 'RESOLVED' | 'ACCEPTED'
 
 export type AccountingReconciliationFinding = {
@@ -117,6 +117,8 @@ type PersistedAccountingReconciliationFinding = {
   message: string
   details: unknown
   status: string
+  statusUpdatedAt: Date | string | null
+  statusUpdatedBy: string | null
   createdAt: Date | string
 }
 
@@ -141,11 +143,14 @@ type AccountingReconciliationPersistenceClient = {
   }
   accountingReconciliationFinding: {
     createMany(args: unknown): Promise<{ count: number }>
+    findUnique(args: unknown): Promise<PersistedAccountingReconciliationFinding | null>
     update(args: unknown): Promise<PersistedAccountingReconciliationFinding>
   }
 }
 
 export const ACCOUNTING_RECONCILIATION_FINDING_STATUSES = ['OPEN', 'RESOLVED', 'ACCEPTED'] as const
+export const MAX_RECONCILIATION_LIST_RUNS = 100
+export const MAX_RECONCILIATION_FINDINGS_PER_RUN = 500
 
 export const DEFAULT_RECONCILIATION_LOOKBACK_DAYS = 90
 const MAX_RECONCILIATION_ROWS = 10_000
@@ -289,6 +294,12 @@ export function reconciliationLookbackDate(days: number, now: Date = new Date())
   return date
 }
 
+/**
+ * Converts report-only finding details into a Prisma JSON value using the same
+ * JSON serialization contract the API response already exposes: undefined keys
+ * are dropped, Date values become ISO strings, circular structures throw, and
+ * non-plain containers such as Map/Set do not retain entries.
+ */
 function toJsonValue(value: unknown): Prisma.InputJsonValue {
   return JSON.parse(JSON.stringify(value ?? null)) as Prisma.InputJsonValue
 }
@@ -802,28 +813,60 @@ export async function listAccountingReconciliationRuns(
   client: AccountingReconciliationPersistenceClient = db as unknown as AccountingReconciliationPersistenceClient,
   options: { limit?: number; includeFindings?: boolean } = {},
 ): Promise<PersistedAccountingReconciliationRun[]> {
-  const take = Math.min(Math.max(options.limit ?? 25, 1), 100)
+  const take = Math.min(Math.max(options.limit ?? 25, 1), MAX_RECONCILIATION_LIST_RUNS)
   return client.accountingReconciliationRun.findMany({
     orderBy: { createdAt: 'desc' },
     take,
     include: options.includeFindings
-      ? { findings: { orderBy: { createdAt: 'asc' } } }
+      ? {
+          findings: {
+            orderBy: { createdAt: 'asc' },
+            take: MAX_RECONCILIATION_FINDINGS_PER_RUN,
+          },
+          _count: { select: { findings: true } },
+        }
       : { _count: { select: { findings: true } } },
   })
+}
+
+export type AccountingReconciliationFindingStatusUpdate = {
+  finding: PersistedAccountingReconciliationFinding
+  priorStatus: AccountingReconciliationFindingStatus
 }
 
 export async function updateAccountingReconciliationFindingStatus(
   findingId: string,
   status: unknown,
+  actorId?: string | null,
   client: AccountingReconciliationPersistenceClient = db as unknown as AccountingReconciliationPersistenceClient,
-): Promise<PersistedAccountingReconciliationFinding> {
+): Promise<AccountingReconciliationFindingStatusUpdate> {
   const normalized = normalizeFindingStatus(status)
   if (!normalized) {
     throw new Error(`Invalid accounting reconciliation finding status: ${String(status)}`)
   }
 
-  return client.accountingReconciliationFinding.update({
-    where: { id: findingId },
-    data: { status: normalized },
-  })
+  const update = async (tx: AccountingReconciliationPersistenceClient) => {
+    const prior = await tx.accountingReconciliationFinding.findUnique({
+      where: { id: findingId },
+    })
+    if (!prior) throw new Error(`Accounting reconciliation finding not found: ${findingId}`)
+
+    const priorStatus = normalizeFindingStatus(prior.status)
+    if (!priorStatus) {
+      throw new Error(`Invalid existing accounting reconciliation finding status: ${prior.status}`)
+    }
+
+    const finding = await tx.accountingReconciliationFinding.update({
+      where: { id: findingId },
+      data: {
+        status: normalized,
+        statusUpdatedAt: new Date(),
+        statusUpdatedBy: actorId ?? null,
+      },
+    })
+
+    return { finding, priorStatus }
+  }
+
+  return client.$transaction ? client.$transaction(update) : update(client)
 }
