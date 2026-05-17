@@ -4,6 +4,10 @@ import test from 'node:test'
 import {
   collectAccountingReconciliationRows,
   evaluateAccountingReconciliationRows,
+  listAccountingReconciliationRuns,
+  persistAccountingReconciliationReport,
+  updateAccountingReconciliationFindingStatus,
+  type AccountingReconciliationReport,
   type AccountingReconciliationRows,
 } from '@/lib/domain/accounting/reconciliation'
 
@@ -125,8 +129,160 @@ function cleanRows(): AccountingReconciliationRows {
   }
 }
 
+function persistenceClient() {
+  const runs: Array<Record<string, unknown>> = []
+  const findings: Array<Record<string, unknown>> = []
+  type TestPersistenceClient = {
+    $transaction<T>(fn: (tx: TestPersistenceClient) => Promise<T>): Promise<T>
+    accountingReconciliationRun: {
+      create(args: unknown): Promise<Record<string, unknown>>
+      findMany(args: unknown): Promise<Array<Record<string, unknown>>>
+    }
+    accountingReconciliationFinding: {
+      createMany(args: unknown): Promise<{ count: number }>
+      update(args: unknown): Promise<Record<string, unknown>>
+    }
+  }
+  const client: TestPersistenceClient = {
+    $transaction: async <T>(fn: (tx: TestPersistenceClient) => Promise<T>) => fn(client),
+    accountingReconciliationRun: {
+      async create(args: unknown) {
+        const data = (args as { data: Record<string, unknown> }).data
+        const row = {
+          id: `run-${runs.length + 1}`,
+          createdAt: new Date('2026-05-17T12:00:00.000Z'),
+          ...data,
+        }
+        runs.push(row)
+        return row
+      },
+      async findMany(args: unknown) {
+        const include = (args as { include?: { findings?: unknown; _count?: unknown } }).include
+        return [...runs].reverse().map((run) => ({
+          ...run,
+          ...(include?.findings ? { findings: findings.filter((finding) => finding.runId === run.id) } : {}),
+          ...(include?._count ? { _count: { findings: findings.filter((finding) => finding.runId === run.id).length } } : {}),
+        }))
+      },
+    },
+    accountingReconciliationFinding: {
+      async createMany(args: unknown) {
+        const data = (args as { data: Array<Record<string, unknown>> }).data
+        for (const entry of data) {
+          findings.push({
+            id: `finding-${findings.length + 1}`,
+            createdAt: new Date('2026-05-17T12:00:00.000Z'),
+            ...entry,
+          })
+        }
+        return { count: data.length }
+      },
+      async update(args: unknown) {
+        const { where, data } = args as { where: { id: string }; data: { status: string } }
+        const finding = findings.find((entry) => entry.id === where.id)
+        if (!finding) throw new Error('Finding not found')
+        finding.status = data.status
+        return finding
+      },
+    },
+  }
+
+  return { client, runs, findings }
+}
+
 test('clean reconciliation rows produce no findings', () => {
   assert.deepEqual(evaluateAccountingReconciliationRows(cleanRows()), [])
+})
+
+test('persisted reconciliation run stores summary counts and findings for later review', async () => {
+  const { client, runs, findings } = persistenceClient()
+  const report: AccountingReconciliationReport = {
+    checkedAt: '2026-05-17T12:00:00.000Z',
+    fromDate: '2026-02-16T12:00:00.000Z',
+    toDate: '2026-05-17T12:00:00.000Z',
+    summary: { total: 2, warning: 1, critical: 1 },
+    findings: [
+      {
+        severity: 'critical',
+        code: 'terminal_refunded_order_missing_credit_note_evidence',
+        orderId: 'order-1',
+        refundId: 'refund-1',
+        message: 'Missing credit note',
+        details: { status: 'REFUNDED' },
+      },
+      {
+        severity: 'warning',
+        code: 'old_sync_log_without_mirrored_event',
+        syncLogId: 'sync-1',
+        message: 'Missing mirrored event',
+        details: { connector: 'xero' },
+      },
+    ],
+  }
+
+  const persisted = await persistAccountingReconciliationReport(report, client as never)
+
+  assert.equal(persisted.persisted, true)
+  assert.equal(persisted.runId, 'run-1')
+  assert.equal(runs[0].status, 'COMPLETED')
+  assert.equal(runs[0].totalCount, 2)
+  assert.equal(runs[0].warningCount, 1)
+  assert.equal(runs[0].criticalCount, 1)
+  assert.equal(findings.length, 2)
+  assert.equal(findings[0].runId, 'run-1')
+  assert.equal(findings[0].entityType, 'SalesOrderRefund')
+  assert.equal(findings[0].entityId, 'refund-1')
+  assert.equal(findings[0].status, 'OPEN')
+  assert.deepEqual(findings[0].details, { status: 'REFUNDED' })
+})
+
+test('persisted reconciliation runs can be listed with finding counts', async () => {
+  const { client } = persistenceClient()
+  const report: AccountingReconciliationReport = {
+    checkedAt: '2026-05-17T12:00:00.000Z',
+    fromDate: '2026-02-16T12:00:00.000Z',
+    toDate: '2026-05-17T12:00:00.000Z',
+    summary: { total: 1, warning: 1, critical: 0 },
+    findings: [{
+      severity: 'warning',
+      code: 'reconciliation_row_cap_reached',
+      message: 'Row cap reached',
+      details: { dataset: 'salesOrders' },
+    }],
+  }
+  await persistAccountingReconciliationReport(report, client as never)
+
+  const runs = await listAccountingReconciliationRuns(client as never, { limit: 10 })
+
+  assert.equal(runs.length, 1)
+  assert.equal(runs[0].id, 'run-1')
+  assert.deepEqual(runs[0]._count, { findings: 1 })
+})
+
+test('reconciliation finding status updates accept review states and reject invalid values', async () => {
+  const { client, findings } = persistenceClient()
+  await persistAccountingReconciliationReport({
+    checkedAt: '2026-05-17T12:00:00.000Z',
+    fromDate: '2026-02-16T12:00:00.000Z',
+    toDate: '2026-05-17T12:00:00.000Z',
+    summary: { total: 1, warning: 0, critical: 1 },
+    findings: [{
+      severity: 'critical',
+      code: 'posted_event_without_external_id',
+      accountingEventId: 'event-1',
+      message: 'Posted event missing external ID',
+      details: { type: 'DAILY_BATCH_GROUP_B' },
+    }],
+  }, client as never)
+
+  const updated = await updateAccountingReconciliationFindingStatus('finding-1', 'accepted', client as never)
+
+  assert.equal(updated.status, 'ACCEPTED')
+  assert.equal(findings[0].status, 'ACCEPTED')
+  await assert.rejects(
+    () => updateAccountingReconciliationFindingStatus('finding-1', 'IGNORED', client as never),
+    /Invalid accounting reconciliation finding status/,
+  )
 })
 
 test('sources with accounting state report missing mirrored events', () => {
