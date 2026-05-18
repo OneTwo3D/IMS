@@ -129,6 +129,8 @@ APP_DIR="/opt/${APP_NAME}"
 DATA_DIR="/var/lib/${APP_NAME}"
 LOG_DIR="/var/log/${APP_NAME}"
 BACKUP_DIR="${DATA_DIR}/backups"
+UPLOAD_STORAGE_DIR="${DATA_DIR}/uploads"
+PUBLIC_UPLOAD_STORAGE_DIR="${DATA_DIR}/public-uploads"
 NGINX_CONF="/etc/nginx/sites-available/${APP_NAME}"
 NODE_VERSION="22"
 DEPLOY_SSH_DIR="${DATA_DIR}/git-ssh"
@@ -468,9 +470,9 @@ fi
 
 mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BACKUP_DIR}" \
   "${DATA_DIR}/xero" \
-  "${APP_DIR}/uploads/invoices" \
-  "${APP_DIR}/public/uploads/branding" \
-  "${APP_DIR}/public/uploads/avatars" \
+  "${UPLOAD_STORAGE_DIR}/invoices" \
+  "${PUBLIC_UPLOAD_STORAGE_DIR}/branding" \
+  "${PUBLIC_UPLOAD_STORAGE_DIR}/avatars" \
   "${APP_DIR}/backups" \
   /tmp/${APP_NAME}/pdf \
   /tmp/${APP_NAME}/uploads
@@ -654,6 +656,8 @@ FX_BASE_CURRENCY=GBP
 PDF_TEMP_DIR=/tmp/${APP_NAME}/pdf
 BACKUP_DIR=${BACKUP_DIR}
 UPLOAD_MAX_SIZE_MB=10
+UPLOAD_STORAGE_DIR=${UPLOAD_STORAGE_DIR}
+PUBLIC_UPLOAD_STORAGE_DIR=${PUBLIC_UPLOAD_STORAGE_DIR}
 UPLOAD_TEMP_DIR=/tmp/${APP_NAME}/uploads
 
 LOG_LEVEL=info

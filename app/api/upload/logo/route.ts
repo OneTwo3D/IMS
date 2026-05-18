@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { writeFile, mkdir, unlink } from 'fs/promises'
-import path from 'path'
 import { requireAdmin } from '@/lib/auth/server'
 import { db } from '@/lib/db'
 import { DEFAULT_BASE_CURRENCY } from '@/lib/base-currency'
@@ -11,22 +10,23 @@ import {
   reencodeTrustedImage,
   validateImageUploadMetadata,
 } from '@/lib/security/upload-validation'
-
-function brandingFilenameFromUrl(url: string | null | undefined): string | null {
-  if (!url?.startsWith('/api/uploads/branding/')) return null
-  const rawFilename = url.slice('/api/uploads/branding/'.length).split('?')[0] ?? ''
-  const filename = path.basename(rawFilename)
-  return filename === rawFilename && filename ? filename : null
-}
+import {
+  filenameFromBrandingUploadUrl,
+  getBrandingUploadDir,
+  getBrandingUploadUrl,
+  resolveBrandingUploadFilePath,
+} from '@/lib/upload-storage'
 
 async function deletePreviousBrandingFile(previousUrl: string | null | undefined, currentFilename: string): Promise<void> {
-  const previousFilename = brandingFilenameFromUrl(previousUrl)
+  const previousFilename = filenameFromBrandingUploadUrl(previousUrl)
   if (!previousFilename || previousFilename === currentFilename) return
 
   try {
-    await unlink(path.join(process.cwd(), 'public', 'uploads', 'branding', previousFilename))
-  } catch {
+    const previousPath = resolveBrandingUploadFilePath(previousFilename)
+    if (previousPath) await unlink(previousPath)
+  } catch (error) {
     // Best-effort cleanup only; upload success should not depend on old-file removal.
+    console.warn('Failed to delete previous branding upload', error)
   }
 }
 
@@ -68,14 +68,16 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  const filename = variant === 'document' ? `document-logo.${ext}` : `logo.${ext}`
-  const uploadDir = path.join(process.cwd(), 'public', 'uploads', 'branding')
+  const timestamp = Date.now()
+  const filename = variant === 'document' ? `document-logo-${timestamp}.${ext}` : `logo-${timestamp}.${ext}`
+  const uploadDir = getBrandingUploadDir()
   await mkdir(uploadDir, { recursive: true })
-  const filePath = path.join(uploadDir, filename)
+  const filePath = resolveBrandingUploadFilePath(filename)
+  if (!filePath) return NextResponse.json({ error: 'Invalid file' }, { status: 400 })
 
   await writeFile(filePath, outputBuffer)
 
-  const url = `/api/uploads/branding/${filename}?t=${Date.now()}`
+  const url = getBrandingUploadUrl(filename)
 
   const existingOrg = await db.organisation.findFirst({
     select: { id: true, logoUrl: true, documentLogoUrl: true },
