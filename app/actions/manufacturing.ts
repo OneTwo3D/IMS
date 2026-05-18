@@ -10,7 +10,6 @@ import {
   addCostLayerSourceLines,
   consumeFifoLayersStrict,
   createCostLayer,
-  getAverageUnitCost,
   getReturnedQtyForCostLayer,
   refreshShipmentCogsForCostLayerChange,
   refreshSalesOrderLineCogsForCostLayerChange,
@@ -21,7 +20,16 @@ import {
   compareAccountCodes,
   recomputeManufacturingUnitCosts,
   stableHash,
-} from '@/lib/manufacturing-cost'
+} from '@/lib/domain/manufacturing/production-costing'
+import {
+  buildDisassemblyRecoveryPlan,
+  calculateRequiredComponentQty,
+} from '@/lib/domain/manufacturing/component-consumption'
+import {
+  evaluateProductionOrderCompletion,
+  evaluateProductionOrderCancellation,
+  evaluateProductionOrderStart,
+} from '@/lib/domain/manufacturing/manufacturing-state'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import {
   addMoney,
@@ -41,6 +49,11 @@ function roundCurrency(value: number): number {
 
 function roundSix(value: number): number {
   return Math.round(value * 1_000_000) / 1_000_000
+}
+
+function manufacturingQtyBoundaryNumber(value: Prisma.Decimal): number {
+  // decimal-boundary-ok: server-action-boundary (Prisma stock/cost-layer APIs currently accept number quantities)
+  return value.toNumber()
 }
 
 // ---------------------------------------------------------------------------
@@ -466,135 +479,6 @@ async function reserveAvailableStock(
   })
 }
 
-type DisassemblyRecoveryPlan = {
-  entries: Array<{ componentId: string; totalQty: number; totalCostBase: Prisma.Decimal }>
-  usedLegacyFallback: boolean
-  recoveredLayerCount: number
-}
-
-async function buildDisassemblyRecoveryPlan(
-  tx: Prisma.TransactionClient,
-  recoveredLayers: Array<{ costLayerId: string; qty: Prisma.Decimal; unitCostBase: Prisma.Decimal }>,
-  components: Array<{ componentId: string; qty: Prisma.Decimal | number }>,
-  warehouseId: string,
-  qtyPlanned: number,
-): Promise<DisassemblyRecoveryPlan> {
-  const componentById = new Map(components.map((component) => [component.componentId, component]))
-  const layerIds = recoveredLayers.map((layer) => layer.costLayerId)
-
-  const layerDetails = layerIds.length === 0
-    ? []
-    : await tx.costLayer.findMany({
-        where: { id: { in: layerIds } },
-        select: {
-          id: true,
-          receivedQty: true,
-          sourceLines: {
-            select: {
-              sourceProductId: true,
-              qty: true,
-              totalCostBase: true,
-            },
-          },
-        },
-      })
-  const layerDetailById = new Map(layerDetails.map((layer) => [layer.id, layer]))
-
-  const historicalQtyByComponent = new Map<string, number>()
-  const historicalCostByComponent = new Map<string, Prisma.Decimal>()
-  let residualCostBase = new Prisma.Decimal(0)
-  let usedLegacyFallback = false
-
-  for (const recoveredLayer of recoveredLayers) {
-    const layerDetail = layerDetailById.get(recoveredLayer.costLayerId)
-    const entryCostBase = recoveredLayer.qty.mul(recoveredLayer.unitCostBase)
-
-    if (!layerDetail || layerDetail.sourceLines.length === 0) {
-      usedLegacyFallback = true
-      residualCostBase = residualCostBase.add(entryCostBase)
-      continue
-    }
-
-    const receivedQty = Number(layerDetail.receivedQty)
-    if (!Number.isFinite(receivedQty) || receivedQty <= 0) {
-      usedLegacyFallback = true
-      residualCostBase = residualCostBase.add(entryCostBase)
-      continue
-    }
-
-    const ratio = recoveredLayer.qty.div(receivedQty)
-    let allocatedEntryCostBase = new Prisma.Decimal(0)
-
-    for (const sourceLine of layerDetail.sourceLines) {
-      const allocatedQty = new Prisma.Decimal(sourceLine.qty).mul(ratio).toNumber()
-      const allocatedCostBase = new Prisma.Decimal(sourceLine.totalCostBase).mul(ratio)
-      allocatedEntryCostBase = allocatedEntryCostBase.add(allocatedCostBase)
-
-      if (!componentById.has(sourceLine.sourceProductId)) {
-        residualCostBase = residualCostBase.add(allocatedCostBase)
-        continue
-      }
-
-      historicalQtyByComponent.set(
-        sourceLine.sourceProductId,
-        (historicalQtyByComponent.get(sourceLine.sourceProductId) ?? 0) + allocatedQty,
-      )
-      historicalCostByComponent.set(
-        sourceLine.sourceProductId,
-        (historicalCostByComponent.get(sourceLine.sourceProductId) ?? new Prisma.Decimal(0)).add(allocatedCostBase),
-      )
-    }
-
-    const roundingResidual = entryCostBase.sub(allocatedEntryCostBase)
-    if (roundingResidual.abs().gt(0.000001)) {
-      residualCostBase = residualCostBase.add(roundingResidual)
-    }
-  }
-
-  const currentComponentQtyById = new Map(
-    components.map((component) => [component.componentId, Number(component.qty) * qtyPlanned]),
-  )
-  const residualBasis = await Promise.all(components.map(async (component) => {
-    const totalQty = currentComponentQtyById.get(component.componentId) ?? 0
-    const historicalQty = historicalQtyByComponent.get(component.componentId) ?? 0
-    const uncoveredQty = Math.max(0, totalQty - historicalQty)
-    const avgUnitCost = uncoveredQty > 0
-      ? await getAverageUnitCost(tx, component.componentId, warehouseId)
-      : 0
-    return {
-      componentId: component.componentId,
-      totalQty,
-      uncoveredQty,
-      basis: avgUnitCost > 0 ? avgUnitCost * uncoveredQty : uncoveredQty,
-    }
-  }))
-
-  const totalResidualBasis = residualBasis.reduce((sum, component) => sum + component.basis, 0)
-  const fallbackResidualBasis = residualBasis.reduce((sum, component) => sum + component.totalQty, 0)
-  const fallbackTriggered = usedLegacyFallback && residualCostBase.abs().gt(0.000001)
-
-  const entries = residualBasis
-    .filter((component) => component.totalQty > 0)
-    .map((component) => {
-      const historicalCost = historicalCostByComponent.get(component.componentId) ?? new Prisma.Decimal(0)
-      const allocationBasis = totalResidualBasis > 0 ? component.basis : component.totalQty
-      const residualAllocatedCost = residualCostBase.gt(0) && allocationBasis > 0
-        ? residualCostBase.mul(allocationBasis).div(totalResidualBasis > 0 ? totalResidualBasis : fallbackResidualBasis || 1)
-        : new Prisma.Decimal(0)
-      return {
-        componentId: component.componentId,
-        totalQty: component.totalQty,
-        totalCostBase: historicalCost.add(residualAllocatedCost),
-      }
-    })
-
-  return {
-    entries,
-    usedLegacyFallback: fallbackTriggered,
-    recoveredLayerCount: recoveredLayers.length,
-  }
-}
-
 export async function updateManufacturingOrderStatus(
   id: string,
   status: ProductionOrderStatus,
@@ -664,10 +548,9 @@ export async function updateManufacturingOrderStatus(
           },
         })
         if (!order) throw new Error('Order not found')
-        if (order.status === 'COMPLETED') return // idempotent — already completed
-        if (order.status !== 'IN_PROGRESS' && order.status !== 'DRAFT') {
-          throw new Error(`Cannot complete a production order in ${order.status} status`)
-        }
+        const completionDecision = evaluateProductionOrderCompletion(order.status)
+        if (!completionDecision.allowed) throw new Error(completionDecision.error)
+        if (completionDecision.action === 'already-completed') return
 
         const qtyPlanned = Number(order.qtyPlanned)
         const components = order.outputProduct.productComponents
@@ -688,7 +571,7 @@ export async function updateManufacturingOrderStatus(
             totalCostBase: number
           }> = []
           for (const comp of components) {
-            const totalQty = Number(comp.qty) * qtyPlanned
+            const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
             await assertStockAvailable(tx, comp.componentId, order.warehouseId, totalQty, {
               includeReserved: wasInProgress,
               requireReserved: wasInProgress,
@@ -818,24 +701,25 @@ export async function updateManufacturingOrderStatus(
 
           for (const comp of components) {
             const plannedRecovery = recoveryPlan.entries.find((entry) => entry.componentId === comp.componentId)
-            const totalQty = plannedRecovery?.totalQty ?? (Number(comp.qty) * qtyPlanned)
+            const totalQty = plannedRecovery?.totalQty ?? calculateRequiredComponentQty(comp, qtyPlanned)
             const baseAllocatedCost = plannedRecovery?.totalCostBase ?? new Prisma.Decimal(0)
             const allocatedCost = useEqualSplitOverhead
               ? baseAllocatedCost.add(equalSplitOverheadPerComponent)
               : baseAllocatedCost.mul(proportionalScaleFactor)
-            const recoveredUnitCost = totalQty > 0
-              ? allocatedCost.div(new Prisma.Decimal(totalQty)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+            const recoveredUnitCost = totalQty.gt(0)
+              ? allocatedCost.div(totalQty).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
               : new Prisma.Decimal(0)
+            const totalQtyNumber = manufacturingQtyBoundaryNumber(totalQty)
 
             await tx.stockLevel.upsert({
               where: { productId_warehouseId: { productId: comp.componentId, warehouseId: order.warehouseId } },
-              create: { productId: comp.componentId, warehouseId: order.warehouseId, quantity: totalQty },
-              update: { quantity: { increment: totalQty } },
+              create: { productId: comp.componentId, warehouseId: order.warehouseId, quantity: totalQtyNumber },
+              update: { quantity: { increment: totalQtyNumber } },
             })
             const componentLayerId = await createCostLayer(tx, {
               productId: comp.componentId,
               warehouseId: order.warehouseId,
-              qty: totalQty,
+              qty: totalQtyNumber,
               unitCostBase: recoveredUnitCost.toNumber(),
               productionOrderId: id,
             })
@@ -855,7 +739,7 @@ export async function updateManufacturingOrderStatus(
                 type: 'PRODUCTION_IN',
                 productId: comp.componentId,
                 toWarehouseId: order.warehouseId,
-                qty: totalQty,
+                qty: totalQtyNumber,
                 note: `${order.reference}: recovered from disassembly of ${order.outputProduct.sku}`,
                 referenceType: 'ProductionOrder',
                 referenceId: id,
@@ -977,7 +861,7 @@ export async function updateManufacturingOrderStatus(
       const qtyPlanned = Number(orderPreview.qtyPlanned)
       if (isAssembly) {
         for (const comp of orderPreview.outputProduct.productComponents) {
-          const totalQty = Number(comp.qty) * qtyPlanned
+          const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
           await logActivity({
             entityType: 'STOCK_ADJUSTMENT',
             entityId: comp.componentId,
@@ -1005,7 +889,7 @@ export async function updateManufacturingOrderStatus(
           metadata: { movementType: 'PRODUCTION_OUT', qty: qtyPlanned, warehouseId: orderPreview.warehouseId, moReference: orderPreview.reference },
         })
         for (const comp of orderPreview.outputProduct.productComponents) {
-          const totalQty = Number(comp.qty) * qtyPlanned
+          const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
           await logActivity({
             entityType: 'STOCK_ADJUSTMENT',
             entityId: comp.componentId,
@@ -1026,13 +910,12 @@ export async function updateManufacturingOrderStatus(
           select: { status: true },
         })
         if (!lockedOrder) throw new Error('Order not found')
-        if (lockedOrder.status !== 'DRAFT') {
-          throw new Error(`Cannot start a production order in ${lockedOrder.status} status`)
-        }
+        const startDecision = evaluateProductionOrderStart(lockedOrder.status)
+        if (!startDecision.allowed) throw new Error(startDecision.error)
 
         if (isAssembly) {
           for (const comp of orderPreview.outputProduct.productComponents) {
-            const totalQty = Number(comp.qty) * qtyPlanned
+            const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
             await reserveAvailableStock(tx, comp.componentId, orderPreview.warehouseId, totalQty)
           }
         } else {
@@ -1044,7 +927,7 @@ export async function updateManufacturingOrderStatus(
       // Log stock reservations
       if (isAssembly) {
         for (const comp of orderPreview.outputProduct.productComponents) {
-          const totalQty = Number(comp.qty) * qtyPlanned
+          const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
           await logActivity({
             entityType: 'STOCK_ADJUSTMENT',
             entityId: comp.componentId,
@@ -1064,47 +947,48 @@ export async function updateManufacturingOrderStatus(
           metadata: { qty: qtyPlanned, warehouseId: orderPreview.warehouseId, moReference: orderPreview.reference },
         })
       }
-    } else if (status === 'CANCELLED' && orderPreview.status === 'IN_PROGRESS') {
-      const qtyPlanned = Number(orderPreview.qtyPlanned)
-      // Release reservations when cancelling an in-progress order
-      await db.$transaction(async (tx) => {
-        if (isAssembly) {
-          for (const comp of orderPreview.outputProduct.productComponents) {
-            const totalQty = Number(comp.qty) * qtyPlanned
-            await tx.stockLevel.update({
-              where: { productId_warehouseId: { productId: comp.componentId, warehouseId: orderPreview.warehouseId } },
-              data: { reservedQty: { decrement: totalQty } },
-            })
-          }
-        } else {
-          await tx.stockLevel.update({
-            where: { productId_warehouseId: { productId: orderPreview.outputProductId, warehouseId: orderPreview.warehouseId } },
-            data: { reservedQty: { decrement: qtyPlanned } },
-          })
-        }
-        await tx.manufacturingCostLine.deleteMany({ where: { productionOrderId: id } })
-        await tx.productionOrder.update({ where: { id }, data: { status } })
-      })
-
-      // Log reservation release
-      await logActivity({
-        entityType: 'STOCK_ADJUSTMENT',
-        entityId: id,
-        tag: 'stock',
-        action: 'reservation_released',
-        description: `${orderPreview.reference}: released stock reservations due to cancellation`,
-        metadata: { moReference: orderPreview.reference, warehouseId: orderPreview.warehouseId },
-      })
-    } else {
-      // CANCELLED from DRAFT — no reservations to release
-      if (status === 'CANCELLED') {
+    } else if (status === 'CANCELLED') {
+      const cancellationDecision = evaluateProductionOrderCancellation(orderPreview.status)
+      if (!cancellationDecision.allowed) throw new Error(cancellationDecision.error)
+      if (cancellationDecision.action !== 'release-reservations') {
         await db.$transaction(async (tx) => {
           await tx.manufacturingCostLine.deleteMany({ where: { productionOrderId: id } })
           await tx.productionOrder.update({ where: { id }, data: { status } })
         })
       } else {
-        await db.productionOrder.update({ where: { id }, data: { status } })
+        const qtyPlanned = Number(orderPreview.qtyPlanned)
+        // Release reservations when cancelling an in-progress order
+        await db.$transaction(async (tx) => {
+          if (isAssembly) {
+            for (const comp of orderPreview.outputProduct.productComponents) {
+              const totalQty = manufacturingQtyBoundaryNumber(calculateRequiredComponentQty(comp, qtyPlanned))
+              await tx.stockLevel.update({
+                where: { productId_warehouseId: { productId: comp.componentId, warehouseId: orderPreview.warehouseId } },
+                data: { reservedQty: { decrement: totalQty } },
+              })
+            }
+          } else {
+            await tx.stockLevel.update({
+              where: { productId_warehouseId: { productId: orderPreview.outputProductId, warehouseId: orderPreview.warehouseId } },
+              data: { reservedQty: { decrement: qtyPlanned } },
+            })
+          }
+          await tx.manufacturingCostLine.deleteMany({ where: { productionOrderId: id } })
+          await tx.productionOrder.update({ where: { id }, data: { status } })
+        })
+
+        // Log reservation release
+        await logActivity({
+          entityType: 'STOCK_ADJUSTMENT',
+          entityId: id,
+          tag: 'stock',
+          action: 'reservation_released',
+          description: `${orderPreview.reference}: released stock reservations due to cancellation`,
+          metadata: { moReference: orderPreview.reference, warehouseId: orderPreview.warehouseId },
+        })
       }
+    } else {
+      await db.productionOrder.update({ where: { id }, data: { status } })
     }
 
     const qtyPlannedLog = Number(orderPreview.qtyPlanned)

@@ -5,7 +5,7 @@ import {
   buildOverheadAccountDeltas,
   recomputeManufacturingUnitCosts,
   stableHash,
-} from '../lib/manufacturing-cost.ts'
+} from '../lib/domain/manufacturing/production-costing.ts'
 
 function unitCostsAsNumbers(result: ReturnType<typeof recomputeManufacturingUnitCosts>): Record<string, number> {
   return Object.fromEntries(result.map((entry) => [entry.layerId, entry.newUnitCostBase.toNumber()]))

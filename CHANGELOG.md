@@ -27,6 +27,7 @@ This repository uses an `x.y.z` release scheme.
 - **Integration outbox payload registry.** WooCommerce stock-sync, Xero accounting-post, and Mintsoft booked-in outbox operations now have registered Zod payload schemas. Registered payloads are validated and normalized on enqueue and again by connector processors before execution, while unknown outbox operations remain backwards-compatible for existing rows and future connectors.
 - **Integration outbox retry backoff.** Retryable IntegrationOutbox failures now use configurable exponential backoff with tail jitter (`OUTBOX_RETRY_BASE_MS`, `OUTBOX_RETRY_MAX_MS`, `OUTBOX_RETRY_JITTER_MS`) instead of the fixed default delay. WooCommerce stock-sync retries now follow the shared 5/10/20/40/60-minute capped curve, extending the 12-attempt time-to-permanent-failure from roughly 6.5 hours to roughly 9.25 hours before jitter. Connector-specific explicit retry delays, such as rate-limit backoff, remain supported.
 - **Inventory invariant SQL collector.** Production inventory invariant reports now use a SQL-backed collector with cursor pagination, product/warehouse/severity filters, and bounded cron defaults. The pure row evaluator remains available for fixture tests; scheduled checks surface cap exhaustion as a critical truncation finding and can be tuned with `INVARIANT_CHECK_PAGE_SIZE` / `INVARIANT_CHECK_MAX_FINDINGS`.
+- **Manufacturing domain helpers extracted.** Manufacturing costing, disassembly component-consumption planning, and production-order state decisions now live under `lib/domain/manufacturing` with focused unit coverage. Server actions remain responsible for auth, transactions, stock writes, accounting queueing, and UI revalidation.
 
 ### Fixes (landed-cost precision)
 
@@ -116,7 +117,7 @@ This repository uses an `x.y.z` release scheme.
 
 ### Tests
 
-- Three additional unit tests in `tests/manufacturing-cost-recalc.test.ts`: proportional rounding across multiple layers, equal-share fallback for zero-base layers, and value-share split with mixed receivedQty.
+- Three additional unit tests in `tests/manufacturing-production-costing.test.ts`: proportional rounding across multiple layers, equal-share fallback for zero-base layers, and value-share split with mixed receivedQty.
 
 ## 1.7.0 - 2026-04-25
 
