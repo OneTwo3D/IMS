@@ -18,6 +18,8 @@ export type InventoryInvariantFinding = {
 export type InventoryInvariantReport = {
   checkedAt: string
   findings: InventoryInvariantFinding[]
+  truncated?: boolean
+  nextCursor?: string | null
   summary: {
     total: number
     info: number
@@ -28,6 +30,10 @@ export type InventoryInvariantReport = {
 
 export type InventoryInvariantSqlCollectorOptions = {
   limit?: number
+  /**
+   * Cursor pagination wins over page/offset pagination. An empty string is
+   * treated as no cursor and reads from the first page.
+   */
   cursor?: string | null
   page?: number
   productId?: string
@@ -40,6 +46,12 @@ export type InventoryInvariantFindingPage = {
   findings: InventoryInvariantFinding[]
   nextCursor: string | null
   hasMore: boolean
+}
+
+export type InventoryInvariantFindingCollection = {
+  findings: InventoryInvariantFinding[]
+  truncated: boolean
+  nextCursor: string | null
 }
 
 type ProductType = 'SIMPLE' | 'VARIABLE' | 'VARIANT' | 'KIT' | 'BOM' | 'NON_INVENTORY'
@@ -139,6 +151,7 @@ const DEFAULT_SQL_COLLECTOR_PAGE_SIZE = 500
 const MAX_SQL_COLLECTOR_PAGE_SIZE = 1000
 const DEFAULT_SQL_REPORT_MAX_FINDINGS = 5000
 const FIFO_RECONCILIATION_EXCEPTION = 'Products without FIFO cost layers are excluded; FIFO cost-layer products are expected to reconcile within tolerance.'
+const INVENTORY_INVARIANT_TRUNCATED_CODE = 'invariant_report_truncated'
 
 // KIT availability is derived from components, so KIT parents do not carry
 // their own FIFO cost layers or shipment COGS snapshots.
@@ -189,6 +202,12 @@ function normalizeSqlCollectorLimit(limit: number | undefined): number {
   return Math.min(Math.max(Math.floor(limit), 1), MAX_SQL_COLLECTOR_PAGE_SIZE)
 }
 
+function normalizeSqlQueryLimit(limit: number | undefined): number {
+  if (limit === undefined) return DEFAULT_SQL_COLLECTOR_PAGE_SIZE
+  if (!Number.isFinite(limit)) return DEFAULT_SQL_COLLECTOR_PAGE_SIZE
+  return Math.max(Math.floor(limit), 1)
+}
+
 function normalizeSqlCollectorOffset(page: number | undefined, limit: number): number {
   if (page === undefined || !Number.isFinite(page)) return 0
   return Math.max(Math.floor(page) - 1, 0) * limit
@@ -203,6 +222,26 @@ function mapSqlFindingRows(rows: InventoryInvariantSqlFindingRow[]): InventoryIn
     message: row.message,
     details: row.details,
   }))
+}
+
+function buildTruncatedFinding(maxFindings: number, nextCursor: string | null): InventoryInvariantFinding {
+  return {
+    severity: 'critical',
+    code: INVENTORY_INVARIANT_TRUNCATED_CODE,
+    message: `Inventory invariant report capped at ${maxFindings} findings; more findings exist`,
+    details: {
+      maxFindings,
+      nextCursor,
+    },
+  }
+}
+
+function hasRowModeFilters(options: {
+  productId?: string
+  warehouseId?: string
+  severity?: InventoryInvariantSeverity
+}): boolean {
+  return Boolean(options.productId || options.warehouseId || options.severity)
 }
 
 export function evaluateInventoryInvariantRows(
@@ -394,17 +433,27 @@ export function evaluateInventoryInvariantRows(
     const qty = decimalToNumber(stockMovement.qty)
     if (!isStrictlyNegative(qty)) continue
 
-    findings.push({
+    const warehouseFindings = [
+      stockMovement.fromWarehouseId
+        ? { warehouseId: stockMovement.fromWarehouseId, warehouseRole: 'from' }
+        : stockMovement.toWarehouseId
+          ? { warehouseId: stockMovement.toWarehouseId, warehouseRole: 'to' }
+          : { warehouseId: undefined, warehouseRole: 'unknown' },
+      ...(stockMovement.fromWarehouseId && stockMovement.toWarehouseId && stockMovement.toWarehouseId !== stockMovement.fromWarehouseId
+        ? [{ warehouseId: stockMovement.toWarehouseId, warehouseRole: 'to' }]
+        : []),
+    ]
+
+    for (const warehouseFinding of warehouseFindings) findings.push({
       severity: 'critical',
       code: 'stock_movement_negative_quantity',
       productId: stockMovement.productId,
-      // Transfer movements involve two warehouses; use the origin side first
-      // as the primary grouping key and keep both sides in details.
-      warehouseId: stockMovement.fromWarehouseId ?? stockMovement.toWarehouseId ?? undefined,
+      warehouseId: warehouseFinding.warehouseId,
       message: `Stock movement quantity is negative for ${stockMovement.product.sku}`,
       details: {
         movementId: stockMovement.id,
         movementType: stockMovement.type,
+        warehouseRole: warehouseFinding.warehouseRole,
         sku: stockMovement.product.sku,
         qty,
         fromWarehouseId: stockMovement.fromWarehouseId,
@@ -539,6 +588,7 @@ function sqlFifoProductTypes(): Prisma.Sql {
 function sqlOptionalProductFilter(alias: 'sl' | 'cl' | 'sm' | 'p', productId: string | undefined): Prisma.Sql {
   if (!productId) return Prisma.empty
   if (alias === 'p') return Prisma.sql`AND p.id = ${productId}`
+  // safe: alias is statically constrained by the function signature; do NOT widen.
   return Prisma.sql`AND ${Prisma.raw(alias)}."productId" = ${productId}`
 }
 
@@ -550,6 +600,7 @@ function sqlOptionalWarehouseFilter(
   if (alias === 'sm') {
     return Prisma.sql`AND (sm."fromWarehouseId" = ${warehouseId} OR sm."toWarehouseId" = ${warehouseId})`
   }
+  // safe: alias is statically constrained by the function signature; do NOT widen.
   return Prisma.sql`AND ${Prisma.raw(alias)}."warehouseId" = ${warehouseId}`
 }
 
@@ -568,7 +619,7 @@ function sqlPageOffset(page: number | undefined, cursor: string | null | undefin
 }
 
 function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvariantSqlCollectorOptions, 'quantityTolerance'>> & InventoryInvariantSqlCollectorOptions): Prisma.Sql {
-  const limit = normalizeSqlCollectorLimit(options.limit)
+  const limit = normalizeSqlQueryLimit(options.limit)
   const tolerance = options.quantityTolerance
   const negativeTolerance = -tolerance
   const offset = sqlPageOffset(options.page, options.cursor, limit)
@@ -691,6 +742,8 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         ) AS details
       FROM "cost_layers" cl
       INNER JOIN "products" p ON p.id = cl."productId"
+      -- receivedQty is the immutable receipt quantity, so strict zero
+      -- mirrors the database CHECK constraint rather than tolerance drift.
       WHERE cl."receivedQty" < 0
         ${costLayerProductFilter}
         ${costLayerWarehouseFilter}
@@ -787,7 +840,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       UNION ALL
 
       SELECT
-        'stock_movement_negative_quantity:' || sm.id AS "sortKey",
+        'stock_movement_negative_quantity:' || sm.id || ':primary' AS "sortKey",
         'critical'::text AS severity,
         'stock_movement_negative_quantity'::text AS code,
         sm."productId",
@@ -796,6 +849,33 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         jsonb_build_object(
           'movementId', sm.id,
           'movementType', sm.type,
+          'warehouseRole', CASE WHEN sm."fromWarehouseId" IS NOT NULL THEN 'from' WHEN sm."toWarehouseId" IS NOT NULL THEN 'to' ELSE 'unknown' END,
+          'sku', p.sku,
+          'qty', sm.qty,
+          'fromWarehouseId', sm."fromWarehouseId",
+          'toWarehouseId', sm."toWarehouseId"
+        ) AS details
+      FROM "stock_movements" sm
+      INNER JOIN "products" p ON p.id = sm."productId"
+      -- stock movement qty is written as a signed event input, not an
+      -- accumulated balance, so strict zero mirrors the database constraint.
+      WHERE sm.qty < 0
+        ${movementProductFilter}
+        ${movementWarehouseFilter}
+
+      UNION ALL
+
+      SELECT
+        'stock_movement_negative_quantity:' || sm.id || ':to' AS "sortKey",
+        'critical'::text AS severity,
+        'stock_movement_negative_quantity'::text AS code,
+        sm."productId",
+        sm."toWarehouseId" AS "warehouseId",
+        'Stock movement quantity is negative for ' || p.sku AS message,
+        jsonb_build_object(
+          'movementId', sm.id,
+          'movementType', sm.type,
+          'warehouseRole', 'to',
           'sku', p.sku,
           'qty', sm.qty,
           'fromWarehouseId', sm."fromWarehouseId",
@@ -804,6 +884,9 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       FROM "stock_movements" sm
       INNER JOIN "products" p ON p.id = sm."productId"
       WHERE sm.qty < 0
+        AND sm."fromWarehouseId" IS NOT NULL
+        AND sm."toWarehouseId" IS NOT NULL
+        AND sm."toWarehouseId" <> sm."fromWarehouseId"
         ${movementProductFilter}
         ${movementWarehouseFilter}
 
@@ -841,8 +924,10 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
             WHERE jsonb_typeof(entry.value) = 'object'
               AND jsonb_typeof(entry.value->'costLayerId') = 'string'
               AND entry.value->>'costLayerId' <> ''
+              AND length(entry.value->>'qty') <= 64
               AND COALESCE(entry.value->>'qty', '') ~ '^-?(?:[0-9]+(?:\\.[0-9]+)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$'
               AND (entry.value->>'qty')::numeric > 0
+              AND length(entry.value->>'unitCostBase') <= 64
               AND COALESCE(entry.value->>'unitCostBase', '') ~ '^-?(?:[0-9]+(?:\\.[0-9]+)?|\\.[0-9]+)(?:[eE][+-]?[0-9]+)?$'
           )
         END
@@ -859,6 +944,9 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       details
     FROM findings
     WHERE TRUE
+      -- Severity is applied after the UNION so all codes share one query
+      -- shape. Production cron does not filter severity; ad-hoc filtered
+      -- admin calls trade some inner work for simpler collector maintenance.
       ${severityFilter}
       ${cursorFilter}
     ORDER BY "sortKey"
@@ -875,16 +963,53 @@ export async function collectSqlInventoryInvariantFindingsPage(
   const rows = await client.$queryRaw<InventoryInvariantSqlFindingRow[]>(
     buildSqlInventoryInvariantQuery({
       ...options,
-      limit,
+      limit: limit + 1,
       quantityTolerance: options.quantityTolerance ?? DEFAULT_QUANTITY_TOLERANCE,
     }),
   )
+  const hasMore = rows.length > limit
+  const visibleRows = hasMore ? rows.slice(0, limit) : rows
 
   return {
-    findings: mapSqlFindingRows(rows),
-    nextCursor: rows.length === limit ? rows[rows.length - 1]?.sortKey ?? null : null,
-    hasMore: rows.length === limit,
+    findings: mapSqlFindingRows(visibleRows),
+    nextCursor: hasMore ? visibleRows[visibleRows.length - 1]?.sortKey ?? null : null,
+    hasMore,
   }
+}
+
+export async function collectSqlInventoryInvariantFindingCollection(
+  client: InventoryInvariantSqlClient = db as unknown as InventoryInvariantSqlClient,
+  options: Omit<InventoryInvariantSqlCollectorOptions, 'cursor' | 'page'> & {
+    pageSize?: number
+    maxFindings?: number
+  } = {},
+): Promise<InventoryInvariantFindingCollection> {
+  const maxFindings = Math.max(1, Math.floor(options.maxFindings ?? DEFAULT_SQL_REPORT_MAX_FINDINGS))
+  const pageSize = normalizeSqlCollectorLimit(options.pageSize ?? options.limit)
+  const findings: InventoryInvariantFinding[] = []
+  let cursor: string | null = null
+  let truncated = false
+
+  while (findings.length < maxFindings) {
+    const page = await collectSqlInventoryInvariantFindingsPage(client, {
+      ...options,
+      limit: Math.min(pageSize, maxFindings - findings.length),
+      cursor,
+    })
+    findings.push(...page.findings)
+    cursor = page.nextCursor
+    if (findings.length >= maxFindings && page.hasMore) {
+      truncated = true
+      break
+    }
+    if (!page.hasMore || !page.nextCursor) break
+  }
+
+  if (truncated) {
+    findings.push(buildTruncatedFinding(maxFindings, cursor))
+  }
+
+  return { findings, truncated, nextCursor: truncated ? cursor : null }
 }
 
 export async function collectSqlInventoryInvariantFindings(
@@ -894,29 +1019,18 @@ export async function collectSqlInventoryInvariantFindings(
     maxFindings?: number
   } = {},
 ): Promise<InventoryInvariantFinding[]> {
-  const maxFindings = Math.max(1, Math.floor(options.maxFindings ?? DEFAULT_SQL_REPORT_MAX_FINDINGS))
-  const pageSize = normalizeSqlCollectorLimit(options.pageSize ?? options.limit)
-  const findings: InventoryInvariantFinding[] = []
-  let cursor: string | null = null
-
-  while (findings.length < maxFindings) {
-    const page = await collectSqlInventoryInvariantFindingsPage(client, {
-      ...options,
-      limit: Math.min(pageSize, maxFindings - findings.length),
-      cursor,
-    })
-    findings.push(...page.findings)
-    if (!page.hasMore || !page.nextCursor) break
-    cursor = page.nextCursor
-  }
-
-  return findings
+  const collection = await collectSqlInventoryInvariantFindingCollection(client, options)
+  return collection.findings
 }
 
 export async function runInventoryInvariantReport(options: {
   client?: InventoryInvariantClient
   sqlClient?: InventoryInvariantSqlClient
   quantityTolerance?: number
+  /**
+   * SQL mode supports productId/warehouseId/severity filters. Row mode exists
+   * for evaluator fixtures and rejects those filters rather than ignoring them.
+   */
   collectionMode?: 'rows' | 'sql'
   limit?: number
   pageSize?: number
@@ -926,14 +1040,18 @@ export async function runInventoryInvariantReport(options: {
   severity?: InventoryInvariantSeverity
 } = {}): Promise<InventoryInvariantReport> {
   const client = options.client ?? (db as unknown as InventoryInvariantClient)
-  const sqlClient = options.sqlClient ?? (
-    isSqlInventoryInvariantClient(client)
-      ? client
-      : db as unknown as InventoryInvariantSqlClient
-  )
   const collectionMode = options.collectionMode ?? (isSqlInventoryInvariantClient(client) ? 'sql' : 'rows')
-  const findings = collectionMode === 'sql'
-    ? await collectSqlInventoryInvariantFindings(sqlClient, {
+  if (collectionMode === 'rows' && hasRowModeFilters(options)) {
+    throw new Error('Inventory invariant row collection mode does not support productId, warehouseId, or severity filters')
+  }
+  if (collectionMode === 'sql' && !options.sqlClient && !isSqlInventoryInvariantClient(client)) {
+    throw new Error('SQL collection mode requires a $queryRaw-capable client; pass options.sqlClient explicitly')
+  }
+
+  const collection = collectionMode === 'sql'
+    ? await collectSqlInventoryInvariantFindingCollection(
+        options.sqlClient ?? (client as unknown as InventoryInvariantSqlClient),
+        {
         quantityTolerance: options.quantityTolerance,
         limit: options.limit,
         pageSize: options.pageSize,
@@ -941,15 +1059,22 @@ export async function runInventoryInvariantReport(options: {
         productId: options.productId,
         warehouseId: options.warehouseId,
         severity: options.severity,
-      })
-    : evaluateInventoryInvariantRows(
-        await collectInventoryInvariantRows(client),
-        { quantityTolerance: options.quantityTolerance },
+        },
       )
+      : {
+          findings: evaluateInventoryInvariantRows(
+            await collectInventoryInvariantRows(client),
+            { quantityTolerance: options.quantityTolerance },
+          ),
+          truncated: false,
+          nextCursor: null,
+        }
 
   return {
     checkedAt: new Date().toISOString(),
-    findings,
-    summary: buildSummary(findings),
+    findings: collection.findings,
+    truncated: collection.truncated,
+    nextCursor: collection.nextCursor,
+    summary: buildSummary(collection.findings),
   }
 }
