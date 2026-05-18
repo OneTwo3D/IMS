@@ -1,22 +1,20 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { MintsoftConnector, fetchMintsoftAsns } from '@/lib/connectors/mintsoft'
-import type { WmsAsnRef, WmsConnector } from '@/lib/connectors/wms/types'
+import type { WmsAsnRef } from '@/lib/connectors/wms/types'
 import { copyCostLayerSourceLinesProportionally, createCostLayer } from '@/lib/cost-layers'
-import { reconcileBookedInQuantities, sliceTransferSnapshotForReceipt } from './booked-in-helpers'
+import { reconcileBookedInQuantities, sliceTransferSnapshotForReceipt } from './asn-reconciliation'
 import { enqueueStockSync } from '@/lib/shopping'
 
+// Booked-in reconciliation mutates stock levels, FIFO layers, PO lines, and sync state in one unit.
+// The longer timeout avoids false rollback on large ASNs while preserving a bounded lock window.
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 const PENDING_ASN_FINALIZATION_REASON_PREFIX = 'PENDING_ASN_FINALIZATION:'
-const WEBHOOK_SWEEPER_MAX_EVENTS_PER_RUN = 250
 const MAX_PENDING_ATTEMPTS = 12
 const MAX_FAILED_ATTEMPTS = 8
 const PENDING_RETRY_BASE_MS = 60 * 1000
 const FAILED_RETRY_BASE_MS = 5 * 60 * 1000
 const MAX_PENDING_RETRY_MS = 30 * 60 * 1000
 const MAX_FAILED_RETRY_MS = 60 * 60 * 1000
-const MINTSOFT_USE_BULK_ASN_LOOKUP_ENV = 'MINTSOFT_USE_BULK_ASN_LOOKUP'
-const mintsoftConnector = new MintsoftConnector()
 
 export const MINTSOFT_WEBHOOK_PROCESSING_STATUS = {
   pending: 'PENDING',
@@ -38,7 +36,7 @@ type WebhookRetryUpdate = {
   lastError: string
 }
 
-type ProcessMintsoftBookedInResult =
+export type ProcessMintsoftBookedInResult =
   | {
     status: 'processed'
     eventId: string
@@ -63,43 +61,8 @@ type ProcessMintsoftBookedInResult =
     error: string
   }
 
-type FetchMintsoftBookedInAsnOptions = {
-  connector?: Pick<WmsConnector, 'fetchAsnById'>
-  env?: Record<string, string | undefined>
-  fetchAsns?: () => Promise<WmsAsnRef[]>
-}
-
-type ProcessMintsoftBookedInEventOptions = {
-  fetchRemoteAsn?: (externalAsnId: string) => Promise<WmsAsnRef | null>
-}
-
-export function isMintsoftBulkAsnLookupEnabled(
-  env: Record<string, string | undefined> = process.env,
-): boolean {
-  const raw = env[MINTSOFT_USE_BULK_ASN_LOOKUP_ENV]?.trim().toLowerCase()
-  return raw === '1' || raw === 'true' || raw === 'yes' || raw === 'on'
-}
-
-export async function fetchMintsoftBookedInAsn(
-  externalAsnId: string,
-  options?: FetchMintsoftBookedInAsnOptions,
-): Promise<WmsAsnRef | null> {
-  const normalizedExternalAsnId = externalAsnId.trim()
-  if (!normalizedExternalAsnId) {
-    throw new Error('externalAsnId is required')
-  }
-
-  if (isMintsoftBulkAsnLookupEnabled(options?.env)) {
-    const asns = await (options?.fetchAsns ?? fetchMintsoftAsns)()
-    return asns.find((asn) => asn.externalAsnId === normalizedExternalAsnId) ?? null
-  }
-
-  const connector = options?.connector ?? mintsoftConnector
-  if (!connector.fetchAsnById) {
-    throw new Error('Configured WMS connector does not support direct ASN lookup')
-  }
-
-  return connector.fetchAsnById(normalizedExternalAsnId)
+export type ProcessMintsoftBookedInEventOptions = {
+  fetchRemoteAsn: (externalAsnId: string) => Promise<WmsAsnRef | null>
 }
 
 function formatReceiptReference(externalAsnId: string, poReference: string): string {
@@ -209,9 +172,9 @@ async function scheduleWebhookRetry(
   })
 }
 
-export async function processMintsoftBookedInEvent(
+export async function processBookedInEvent(
   eventId: string,
-  options?: ProcessMintsoftBookedInEventOptions,
+  options: ProcessMintsoftBookedInEventOptions,
 ): Promise<ProcessMintsoftBookedInResult> {
   const event = await db.wmsInboundReceiptEvent.findUnique({
     where: { id: eventId },
@@ -261,7 +224,7 @@ export async function processMintsoftBookedInEvent(
       select: { id: true },
     })
     const remoteAsn = mappedAsn
-      ? await (options?.fetchRemoteAsn ?? fetchMintsoftBookedInAsn)(event.externalAsnId)
+      ? await options.fetchRemoteAsn(event.externalAsnId)
       : null
 
     const processed = await db.$transaction(async (tx) => {
@@ -956,79 +919,4 @@ export async function processMintsoftBookedInEvent(
       error: message,
     }
   }
-}
-
-export async function replayMintsoftBookedInEventsForAsn(externalAsnId: string): Promise<{
-  processed: number
-  duplicates: number
-  pending: number
-  failed: number
-}> {
-  const events = await db.wmsInboundReceiptEvent.findMany({
-    where: buildMintsoftWebhookReplayForAsnWhere(externalAsnId),
-    orderBy: { receivedAt: 'asc' },
-    select: { id: true },
-  })
-
-  const counters = {
-    processed: 0,
-    duplicates: 0,
-    pending: 0,
-    failed: 0,
-  }
-
-  for (const event of events) {
-    const result = await processMintsoftBookedInEvent(event.id)
-    if (result.status === 'processed') {
-      counters.processed += 1
-    } else if (result.status === 'duplicate') {
-      counters.duplicates += 1
-    } else if (result.status === 'pending') {
-      counters.pending += 1
-    } else {
-      counters.failed += 1
-    }
-  }
-
-  return counters
-}
-export async function sweepUnprocessedMintsoftBookedInEvents(): Promise<{
-  attempted: number
-  processed: number
-  duplicates: number
-  pending: number
-  failed: number
-}> {
-  const now = new Date()
-  const events = await db.wmsInboundReceiptEvent.findMany({
-    where: buildMintsoftWebhookSweepWhere(now),
-    orderBy: { receivedAt: 'asc' },
-    select: {
-      id: true,
-    },
-    take: WEBHOOK_SWEEPER_MAX_EVENTS_PER_RUN,
-  })
-
-  const counters = {
-    attempted: events.length,
-    processed: 0,
-    duplicates: 0,
-    pending: 0,
-    failed: 0,
-  }
-
-  for (const event of events) {
-    const result = await processMintsoftBookedInEvent(event.id)
-    if (result.status === 'processed') {
-      counters.processed += 1
-    } else if (result.status === 'duplicate') {
-      counters.duplicates += 1
-    } else if (result.status === 'pending') {
-      counters.pending += 1
-    } else {
-      counters.failed += 1
-    }
-  }
-
-  return counters
 }

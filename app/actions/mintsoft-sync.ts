@@ -30,7 +30,7 @@ import {
   runMintsoftReturnsSync,
   type MintsoftReturnsInboxRow,
 } from '@/lib/connectors/mintsoft/sync/returns-sync'
-import { replayMintsoftBookedInEventsForAsn } from '@/lib/connectors/mintsoft/sync/booked-in-handler'
+import { replayMintsoftBookedInEventsForAsn } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { hasPermission } from '@/lib/permissions'

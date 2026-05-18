@@ -960,7 +960,7 @@ Do not process stock mutations inside the webhook request.
 Use worker:
 
 ```text
-lib/jobs/wms/process-mintsoft-booked-in-events.ts
+lib/jobs/wms/process-mintsoft-booked-in-event.ts
 app/api/cron/mintsoft-webhook-sweeper/route.ts
 ```
 
@@ -1867,7 +1867,7 @@ Move business logic out of connector/webhook files into:
 ```text
 lib/domain/wms/booked-in-service.ts
 lib/domain/wms/asn-reconciliation.ts
-lib/jobs/wms/process-booked-in-event.ts
+lib/jobs/wms/process-mintsoft-booked-in-event.ts
 ```
 
 Keep connector files responsible only for external API operations.
@@ -1891,7 +1891,7 @@ Base branch: development.
 Refactor Mintsoft booked-in processing into domain and job modules:
 lib/domain/wms/booked-in-service.ts
 lib/domain/wms/asn-reconciliation.ts
-lib/jobs/wms/process-booked-in-event.ts
+lib/jobs/wms/process-mintsoft-booked-in-event.ts
 
 Keep route handlers thin and connector files focused on external API calls.
 Do not change business behavior.

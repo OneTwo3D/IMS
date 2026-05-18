@@ -15,7 +15,7 @@ import {
   copyCostLayerSourceLinesProportionally,
   createCostLayer,
 } from '@/lib/cost-layers'
-import { sliceTransferSnapshotForReceipt } from '@/lib/connectors/mintsoft/sync/booked-in-helpers'
+import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }

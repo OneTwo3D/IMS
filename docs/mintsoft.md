@@ -23,6 +23,7 @@ Mintsoft is the WMS connector for stock alignment, ASN creation, product verific
 - Accepted webhooks are persisted and acknowledged with `202 Accepted`; stock and purchase-order mutations run later through `/api/cron/mintsoft-webhook-sweeper`.
 - Retry state is stored in typed `wms_inbound_receipt_events` columns: `processingStatus`, `processingAttempts`, `nextRetryAt`, `deadLetteredAt`, and `lastError`. The sweeper selects pending/due rows from these fields directly.
 - Booked-in processing looks up the referenced ASN directly by id through the WMS connector. Bulk ASN listing remains available for reconciliation/backfill flows and as a temporary rollback path.
+- `/api/cron/mintsoft-webhook-sweeper` drains at most `MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE` persisted events per run. Leave it unset for the default `250`.
 - Line deltas are applied only for previously unaccounted received quantities.
 
 ### Direct ASN Lookup Rollback
