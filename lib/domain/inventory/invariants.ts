@@ -593,15 +593,29 @@ function sqlOptionalProductFilter(alias: 'sl' | 'cl' | 'sm' | 'p', productId: st
 }
 
 function sqlOptionalWarehouseFilter(
-  alias: 'sl' | 'cl' | 'sm' | 's',
+  alias: 'sl' | 'cl' | 's',
   warehouseId: string | undefined,
 ): Prisma.Sql {
   if (!warehouseId) return Prisma.empty
-  if (alias === 'sm') {
-    return Prisma.sql`AND (sm."fromWarehouseId" = ${warehouseId} OR sm."toWarehouseId" = ${warehouseId})`
-  }
   // safe: alias is statically constrained by the function signature; do NOT widen.
   return Prisma.sql`AND ${Prisma.raw(alias)}."warehouseId" = ${warehouseId}`
+}
+
+// Stock movements have two UNION arms that emit different warehouse columns
+// (the 'primary' arm emits COALESCE(from, to); the 'to' arm emits toWarehouseId).
+// A naive OR predicate that lets either side match leaks findings outside the
+// requested warehouse — when filtering for W1 on a W1→W2 movement, the 'to' arm
+// would still emit W2 as the warehouseId. Each arm therefore needs its own
+// filter that matches the column it actually emits.
+function sqlOptionalMovementWarehouseFilter(
+  arm: 'primary' | 'to',
+  warehouseId: string | undefined,
+): Prisma.Sql {
+  if (!warehouseId) return Prisma.empty
+  if (arm === 'primary') {
+    return Prisma.sql`AND COALESCE(sm."fromWarehouseId", sm."toWarehouseId") = ${warehouseId}`
+  }
+  return Prisma.sql`AND sm."toWarehouseId" = ${warehouseId}`
 }
 
 function sqlSeverityFilter(severity: InventoryInvariantSeverity | undefined): Prisma.Sql {
@@ -628,7 +642,8 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
   const costLayerProductFilter = sqlOptionalProductFilter('cl', options.productId)
   const costLayerWarehouseFilter = sqlOptionalWarehouseFilter('cl', options.warehouseId)
   const movementProductFilter = sqlOptionalProductFilter('sm', options.productId)
-  const movementWarehouseFilter = sqlOptionalWarehouseFilter('sm', options.warehouseId)
+  const movementPrimaryWarehouseFilter = sqlOptionalMovementWarehouseFilter('primary', options.warehouseId)
+  const movementToWarehouseFilter = sqlOptionalMovementWarehouseFilter('to', options.warehouseId)
   const shipmentProductFilter = sqlOptionalProductFilter('sl', options.productId)
   const shipmentWarehouseFilter = sqlOptionalWarehouseFilter('s', options.warehouseId)
   const severityFilter = sqlSeverityFilter(options.severity)
@@ -861,7 +876,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       -- accumulated balance, so strict zero mirrors the database constraint.
       WHERE sm.qty < 0
         ${movementProductFilter}
-        ${movementWarehouseFilter}
+        ${movementPrimaryWarehouseFilter}
 
       UNION ALL
 
@@ -888,7 +903,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         AND sm."toWarehouseId" IS NOT NULL
         AND sm."toWarehouseId" <> sm."fromWarehouseId"
         ${movementProductFilter}
-        ${movementWarehouseFilter}
+        ${movementToWarehouseFilter}
 
       UNION ALL
 

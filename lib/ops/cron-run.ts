@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 
+import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 
 export type CronRunStatus = 'completed' | 'failed' | 'skipped'
@@ -171,7 +172,9 @@ export async function persistCronRunLog(
       finishedAt: new Date(log.finishedAt),
       durationMs: log.durationMs,
       status: log.status,
-      countsJson: log.counts,
+      // Prisma rejects a bare JS `null` for nullable Json columns; translate to the
+      // documented JsonNull sentinel so failed runs (counts === null) still persist.
+      countsJson: log.counts === null ? Prisma.JsonNull : log.counts,
       statusReason: log.statusReason,
     },
   }

@@ -64,7 +64,7 @@ test('command file scan mode reports clean scanner exits', async () => {
   })
 })
 
-test('command file scan mode treats nonzero scanner exits as infected', async () => {
+test('command file scan mode treats scanner exit code 1 as infected', async () => {
   await withTempFile(async (filePath, dir) => {
     const scriptPath = await writeScannerScript(dir, 1)
     const result = await scanFile(filePath, {
@@ -78,6 +78,23 @@ test('command file scan mode treats nonzero scanner exits as infected', async ()
     assert.equal(result.status, 'infected')
     assert.equal(result.exitCode, 1)
     assert.equal(result.reason, 'nonzero-exit')
+  })
+})
+
+test('command file scan mode treats scanner exit code 2+ as scanner error, not infected', async () => {
+  await withTempFile(async (filePath, dir) => {
+    const scriptPath = await writeScannerScript(dir, 2)
+    const result = await scanFile(filePath, {
+      env: {
+        FILE_SCAN_MODE: 'command',
+        FILE_SCAN_COMMAND: `${process.execPath} ${scriptPath} {file}`,
+      },
+    })
+
+    assert.equal(result.mode, 'command')
+    assert.equal(result.status, 'error')
+    assert.equal(result.exitCode, 2)
+    assert.equal(result.reason, 'scanner-error')
   })
 })
 

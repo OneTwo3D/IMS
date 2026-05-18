@@ -12,7 +12,7 @@ export type FileScanResult = {
   status: FileScanStatus
   exitCode?: number | null
   signal?: NodeJS.Signals | null
-  reason?: 'disabled' | 'missing-command' | 'invalid-command' | 'spawn-error' | 'timeout' | 'nonzero-exit'
+  reason?: 'disabled' | 'missing-command' | 'invalid-command' | 'spawn-error' | 'timeout' | 'nonzero-exit' | 'scanner-error'
   scannerId?: string
 }
 
@@ -211,11 +211,20 @@ export async function scanFile(filePath: string, options: FileScanOptions = {}):
       settle({ mode: 'command', status: 'error', reason: 'spawn-error', scannerId })
     })
     child.on('close', (exitCode, signal) => {
+      // Follow the ClamAV convention documented for `clamscan`:
+      //   0 = clean, 1 = virus(es) found, 2+ = scanner error.
+      // Mapping every non-zero exit to `infected` mislabels operational scanner
+      // outages (missing/outdated signature DB, IO failure) as malicious uploads
+      // and surfaces the wrong remediation to the user.
       if (exitCode === 0) {
         settle({ mode: 'command', status: 'clean', exitCode, signal, scannerId })
         return
       }
-      settle({ mode: 'command', status: 'infected', exitCode, signal, reason: 'nonzero-exit', scannerId })
+      if (exitCode === 1) {
+        settle({ mode: 'command', status: 'infected', exitCode, signal, reason: 'nonzero-exit', scannerId })
+        return
+      }
+      settle({ mode: 'command', status: 'error', exitCode, signal, reason: 'scanner-error', scannerId })
     })
   })
 }
