@@ -1,5 +1,5 @@
-import { NextRequest, NextResponse } from 'next/server'
-import { resolveBrandingUploadFilePath } from '@/lib/upload-storage'
+import { NextResponse } from 'next/server'
+import { resolveAvatarUploadFilePath } from '@/lib/upload-storage'
 import { uploadFileResponse } from '@/lib/upload-file-response'
 
 export const runtime = 'nodejs'
@@ -9,23 +9,24 @@ const MIME: Record<string, string> = {
   jpeg: 'image/jpeg',
   png: 'image/png',
   webp: 'image/webp',
+  gif: 'image/gif',
 }
 
-// Branding assets are intentionally public. Logos appear in customer emails,
-// PDF invoices, and partner systems that fetch them via stored URLs.
+// Avatar URLs intentionally preserve the historical public `/uploads/avatars/*`
+// shape. Uploaded images are low-sensitivity profile display assets and may be
+// referenced from stored user.pictureUrl values created before env storage.
 export async function GET(
-  _req: NextRequest,
+  _req: Request,
   { params }: { params: Promise<{ filename: string }> },
 ) {
   const { filename } = await params
   const ext = filename.split('.').pop()?.toLowerCase() ?? ''
   const contentType = MIME[ext]
-  if (!contentType) return NextResponse.json({ error: 'Not found' }, { status: 404 })
+  const filepath = resolveAvatarUploadFilePath(filename)
+  if (!contentType || !filepath) return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
   try {
-    const filePath = resolveBrandingUploadFilePath(filename)
-    if (!filePath) return NextResponse.json({ error: 'Not found' }, { status: 404 })
-    return await uploadFileResponse(filePath, {
+    return await uploadFileResponse(filepath, {
       'Content-Type': contentType,
       'Cache-Control': 'public, max-age=31536000, immutable',
       'X-Content-Type-Options': 'nosniff',

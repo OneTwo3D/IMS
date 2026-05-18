@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { writeFile, mkdir } from 'fs/promises'
+import { writeFile, mkdir, unlink } from 'fs/promises'
 import path from 'path'
 import { requireApiAuth } from '@/lib/auth/server'
 import { db } from '@/lib/db'
@@ -10,6 +10,12 @@ import {
   reencodeTrustedImage,
   validateImageUploadMetadata,
 } from '@/lib/security/upload-validation'
+import {
+  filenameFromAvatarUploadUrl,
+  getAvatarUploadDir,
+  getAvatarUploadUrl,
+  resolveAvatarUploadFilePath,
+} from '@/lib/upload-storage'
 
 export async function POST(req: NextRequest) {
   const session = await requireApiAuth()
@@ -44,14 +50,26 @@ export async function POST(req: NextRequest) {
 
   // session.user.id is always safe (cuid), but force basename anyway.
   const filename = `${path.basename(session.user.id)}.${ext}`
-  const uploadDir = path.join(process.cwd(), 'public', 'uploads', 'avatars')
+  const uploadDir = getAvatarUploadDir()
   await mkdir(uploadDir, { recursive: true })
-  const filePath = path.join(uploadDir, filename)
+  const filePath = resolveAvatarUploadFilePath(filename)
+  if (!filePath) return NextResponse.json({ error: 'Invalid file' }, { status: 400 })
 
   await writeFile(filePath, outputBuffer)
 
-  const pictureUrl = `/uploads/avatars/${filename}?t=${Date.now()}`
+  const previous = await db.user.findUnique({
+    where: { id: session.user.id },
+    select: { pictureUrl: true },
+  })
+  const pictureUrl = getAvatarUploadUrl(filename)
   await db.user.update({ where: { id: session.user.id }, data: { pictureUrl } })
+  const previousFilename = filenameFromAvatarUploadUrl(previous?.pictureUrl)
+  if (previousFilename && previousFilename !== filename) {
+    // Best-effort cleanup only; upload success should not depend on old avatar removal.
+    const previousPath = resolveAvatarUploadFilePath(previousFilename)
+    await (previousPath ? unlink(previousPath) : Promise.resolve())
+      .catch((error) => console.warn('Failed to delete previous avatar upload', error))
+  }
 
   await logActivity({
     entityType: 'USER',

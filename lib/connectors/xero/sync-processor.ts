@@ -4,7 +4,6 @@
  */
 
 import { readFile } from 'fs/promises'
-import { join } from 'path'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { pushSalesInvoice } from './invoices'
@@ -29,6 +28,7 @@ import {
   XERO_ACCOUNTING_POST_OPERATION,
   XERO_OUTBOX_CONNECTOR,
 } from './outbox'
+import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
 
 const MAX_RETRIES = 5
 const MAX_PER_RUN = 50 // Xero rate limit: 60/min — leave headroom
@@ -888,7 +888,10 @@ async function processEntry(
       }
       try {
         const relPath = supplierInvoicePath.replace(/^\/+/, '')
-        const pdfPath = join(/* turbopackIgnore: true */ process.cwd(), relPath)
+        const pdfPath = resolveStoredInvoiceUploadPath(relPath)
+        if (!pdfPath) {
+          return { success: false, error: 'Invalid supplier invoice PDF path' }
+        }
         const pdfBuffer = await readFile(pdfPath)
         const filename = relPath.split('/').pop() ?? 'supplier-invoice.pdf'
         const uploadRes = await xeroUploadAttachment('Invoices', accountingInvoiceId, filename, pdfBuffer, 'application/pdf')

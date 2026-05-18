@@ -88,11 +88,21 @@ After installation, sign in and set the organisation base currency in **Settings
 | `/opt/one-two-inventory` | Application root directory |
 | `/opt/one-two-inventory/.env` | Environment configuration (chmod 600) |
 | `/var/lib/one-two-inventory/backups` | Runtime backup storage directory used by backup create/restore/upload flows |
-| `/opt/one-two-inventory/uploads` | Uploaded files (invoices, etc.) |
-| `/opt/one-two-inventory/public/uploads/branding` | Logo and branding images |
-| `/opt/one-two-inventory/public/uploads/avatars` | User avatar images |
+| `/var/lib/one-two-inventory/uploads` | Private uploaded files served through authenticated routes, such as supplier invoice PDFs |
+| `/var/lib/one-two-inventory/public-uploads/branding` | Logo and branding images served through `/api/uploads/branding/*` |
+| `/var/lib/one-two-inventory/public-uploads/avatars` | User avatar images served through `/uploads/avatars/*` |
 | `/var/lib/one-two-inventory` | Persistent data directory |
 | `/var/log/one-two-inventory` | Application logs |
+
+Container deployments must set `UPLOAD_STORAGE_DIR` and
+`PUBLIC_UPLOAD_STORAGE_DIR` to mounted persistent volumes. If either variable is
+unset in production, IMS logs a warning and falls back to local development
+paths under the application working tree, which may be ephemeral in containers.
+Branding upload URLs include a unique filename per upload so browser and CDN
+caches do not depend on query-string cache keys. Avatar URLs preserve the
+historical `/uploads/avatars/*` path and rotate a `?t=` cache-busting query
+string on upload; configure any CDN in front of avatar assets to include query
+strings in its cache key.
 
 
 ## Application Service Management
@@ -235,6 +245,8 @@ Key variables in the `.env` file:
 | `PDF_TEMP_DIR` | Temporary directory for PDF generation |
 | `BACKUP_DIR` | Local backup storage directory |
 | `UPLOAD_MAX_SIZE_MB` | Maximum upload file size in MB (default: `10`) |
+| `UPLOAD_STORAGE_DIR` | Persistent private upload root. Defaults locally to `./uploads` when unset |
+| `PUBLIC_UPLOAD_STORAGE_DIR` | Persistent branding/avatar upload root. Defaults locally to `./public/uploads` when unset |
 | `CRON_SECRET` | Shared secret for authenticating cron endpoint requests |
 | `ALLOW_LOCALHOST_CRON_BYPASS` | Set to `true` only if production cron requests must be allowed from localhost without the bearer header and `CRON_SECRET` is unset; default is `false` |
 | `INVARIANT_CHECK_PAGE_SIZE` | Optional page size for the scheduled invariant check inventory SQL collector. Default `500`; raise temporarily only for production triage. |

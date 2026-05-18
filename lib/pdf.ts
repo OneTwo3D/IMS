@@ -2,6 +2,7 @@ import PDFDocument from 'pdfkit'
 import { readFile } from 'fs/promises'
 import path from 'path'
 import sharp from 'sharp'
+import { filenameFromBrandingUploadUrl, resolveBrandingUploadFilePath } from '@/lib/upload-storage'
 import { db } from '@/lib/db'
 import { formatCountryDisplay } from '@/lib/countries'
 
@@ -97,19 +98,23 @@ export function createPdfDocument(options?: { title?: string }) {
  * Draw the document header with company info and recipient
  */
 /**
- * Load a logo image from the public directory for embedding in PDFs.
+ * Load a logo image from configured upload storage, or from public assets for
+ * static bundled logos.
  * Returns null if the file doesn't exist or isn't a supported format.
  */
 async function loadLogoBuffer(logoUrl: string | null): Promise<Buffer | null> {
   if (!logoUrl) return null
   try {
-    // Strip query string and /api prefix, resolve to filesystem path
-    let urlPath = logoUrl.split('?')[0]
-    if (urlPath.startsWith('/api/')) urlPath = urlPath.slice(4)
-    const publicDir = path.join(process.cwd(), 'public')
-    const filePath = path.resolve(publicDir, urlPath.replace(/^\//, ''))
-    // Guard against path traversal
-    if (!filePath.startsWith(publicDir)) return null
+    const brandingFilename = filenameFromBrandingUploadUrl(logoUrl)
+    let filePath = brandingFilename ? resolveBrandingUploadFilePath(brandingFilename) : null
+
+    if (!filePath) {
+      const urlPath = logoUrl.split('?')[0] ?? ''
+      const publicDir = path.resolve(process.cwd(), 'public')
+      filePath = path.resolve(publicDir, urlPath.replace(/^\//, ''))
+      if (!filePath.startsWith(publicDir + path.sep)) return null
+    }
+
     const raw = await readFile(filePath)
     // SVG → convert to PNG via sharp (PDFKit doesn't support SVG natively)
     if (filePath.endsWith('.svg')) {

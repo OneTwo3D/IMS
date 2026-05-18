@@ -1,6 +1,5 @@
 import { NextResponse } from 'next/server'
 import { writeFile, mkdir } from 'fs/promises'
-import path from 'path'
 import { requireRole } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import {
@@ -8,6 +7,12 @@ import {
   sanitizeInvoiceUploadFilename,
   validateInvoicePdfMetadata,
 } from '@/lib/security/upload-validation'
+import {
+  getInvoiceStoredPath,
+  getInvoiceUploadDir,
+  getInvoiceUploadUrl,
+  resolveInvoiceUploadFilePath,
+} from '@/lib/upload-storage'
 
 export async function POST(req: Request) {
   let session
@@ -30,11 +35,12 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'Invalid PDF file.' }, { status: 400 })
   }
 
-  const dir = path.join(process.cwd(), 'uploads', 'invoices')
+  const dir = getInvoiceUploadDir()
   await mkdir(dir, { recursive: true })
 
   const filename = sanitizeInvoiceUploadFilename(file.name)
-  const filepath = path.join(dir, filename)
+  const filepath = resolveInvoiceUploadFilePath(filename)
+  if (!filepath) return NextResponse.json({ error: 'Invalid file' }, { status: 400 })
 
   await writeFile(filepath, buffer)
   await logActivity({
@@ -46,10 +52,10 @@ export async function POST(req: Request) {
     metadata: {
       originalFilename: file.name,
       storedFilename: filename,
-      storedPath: path.join('uploads', 'invoices', filename),
+      storedPath: getInvoiceStoredPath(filename),
       sizeBytes: file.size,
     },
   })
 
-  return NextResponse.json({ url: `/uploads/invoices/${filename}` })
+  return NextResponse.json({ url: getInvoiceUploadUrl(filename) })
 }

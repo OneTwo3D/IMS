@@ -60,7 +60,7 @@
 | `help-docs/` | User-facing help articles rendered in the app |
 | `docs/` | Internal/admin/reference documentation kept in git only, plus repo copies of the user help docs |
 | `scripts/` | Installation and maintenance scripts |
-| `public/uploads/` | User-uploaded files (branding, avatars) |
+| `UPLOAD_STORAGE_DIR` / `PUBLIC_UPLOAD_STORAGE_DIR` | Env-configured persistent upload roots for private invoice PDFs, public branding assets, and avatar assets |
 
 
 ## Request Flow

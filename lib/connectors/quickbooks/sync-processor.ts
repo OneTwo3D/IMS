@@ -5,7 +5,6 @@
  */
 
 import { readFile } from 'fs/promises'
-import { join } from 'path'
 import { createHash } from 'crypto'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -17,6 +16,7 @@ import { qboPost, qboUploadAttachment, resolveAccountRef } from './api'
 import { lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
+import { resolveStoredInvoiceUploadPath } from '@/lib/upload-storage'
 
 const MAX_RETRIES = 5
 const MAX_PER_RUN = 100 // QBO rate limit: 500/min — can handle more than Xero
@@ -528,7 +528,10 @@ async function processEntry(
       }
       try {
         const relPath = supplierInvoicePath.replace(/^\/+/, '')
-        const pdfPath = join(/* turbopackIgnore: true */ process.cwd(), relPath)
+        const pdfPath = resolveStoredInvoiceUploadPath(relPath)
+        if (!pdfPath) {
+          return { success: false, error: 'Invalid supplier invoice PDF path' }
+        }
         const pdfBuffer = await readFile(pdfPath)
         const filename = relPath.split('/').pop() ?? 'supplier-invoice.pdf'
         const uploadRes = await qboUploadAttachment('Bill', accountingInvoiceId, filename, pdfBuffer, 'application/pdf')
