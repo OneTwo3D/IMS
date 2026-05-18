@@ -6,7 +6,7 @@ const IMAGE_EXTENSIONS = ['gif', 'jpeg', 'jpg', 'png', 'webp'] as const
 const BRANDING_IMAGE_EXTENSIONS = ['jpeg', 'jpg', 'png', 'webp'] as const
 const PDF_EXTENSIONS = ['pdf'] as const
 
-type UploadDirectoryLabel = 'avatarUploads' | 'brandingUploads' | 'invoiceUploads'
+type UploadDirectoryLabel = 'avatarUploads' | 'brandingUploads' | 'invoiceUploads' | 'invoiceQuarantineUploads'
 type UploadRootEnvName = 'UPLOAD_STORAGE_DIR' | 'PUBLIC_UPLOAD_STORAGE_DIR'
 
 export type UploadStorageDirectory = {
@@ -37,6 +37,10 @@ export function getInvoiceUploadDir(): string {
   return path.join(getPrivateUploadRoot(), 'invoices')
 }
 
+export function getInvoiceQuarantineDir(): string {
+  return path.join(getPrivateUploadRoot(), 'quarantine', 'invoices')
+}
+
 export function getAvatarUploadDir(): string {
   return path.join(getPublicUploadRoot(), 'avatars')
 }
@@ -50,6 +54,7 @@ export function getUploadStorageDirectories(): UploadStorageDirectory[] {
     { label: 'avatarUploads', directory: getAvatarUploadDir() },
     { label: 'brandingUploads', directory: getBrandingUploadDir() },
     { label: 'invoiceUploads', directory: getInvoiceUploadDir() },
+    { label: 'invoiceQuarantineUploads', directory: getInvoiceQuarantineDir() },
   ]
 }
 
@@ -81,6 +86,10 @@ function resolveUploadFilePath(
 
 export function resolveInvoiceUploadFilePath(filename: string): string | null {
   return resolveUploadFilePath(getInvoiceUploadDir(), filename, PDF_EXTENSIONS)
+}
+
+export function resolveInvoiceQuarantineFilePath(filename: string): string | null {
+  return resolveUploadFilePath(getInvoiceQuarantineDir(), filename, PDF_EXTENSIONS)
 }
 
 export function resolveAvatarUploadFilePath(filename: string): string | null {

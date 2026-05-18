@@ -8,6 +8,7 @@ import {
   getAvatarUploadUrl,
   getBrandingUploadDir,
   getBrandingUploadUrl,
+  getInvoiceQuarantineDir,
   getInvoiceStoredPath,
   getInvoiceUploadDir,
   getInvoiceUploadUrl,
@@ -16,6 +17,7 @@ import {
   getUploadStorageDirectories,
   resolveAvatarUploadFilePath,
   resolveBrandingUploadFilePath,
+  resolveInvoiceQuarantineFilePath,
   resolveInvoiceUploadFilePath,
   resolveStoredInvoiceUploadPath,
 } from '@/lib/upload-storage'
@@ -57,6 +59,7 @@ test('upload storage roots default to local development directories', () => {
     assert.equal(getPrivateUploadRoot(), path.resolve(process.cwd(), 'uploads'))
     assert.equal(getPublicUploadRoot(), path.resolve(process.cwd(), 'public', 'uploads'))
     assert.equal(getInvoiceUploadDir(), path.resolve(process.cwd(), 'uploads', 'invoices'))
+    assert.equal(getInvoiceQuarantineDir(), path.resolve(process.cwd(), 'uploads', 'quarantine', 'invoices'))
     assert.equal(getAvatarUploadDir(), path.resolve(process.cwd(), 'public', 'uploads', 'avatars'))
     assert.equal(getBrandingUploadDir(), path.resolve(process.cwd(), 'public', 'uploads', 'branding'))
   })
@@ -73,6 +76,7 @@ test('upload storage roots use configured persistent directories', () => {
       { label: 'avatarUploads', directory: path.join(publicRoot, 'avatars') },
       { label: 'brandingUploads', directory: path.join(publicRoot, 'branding') },
       { label: 'invoiceUploads', directory: path.join(privateRoot, 'invoices') },
+      { label: 'invoiceQuarantineUploads', directory: path.join(privateRoot, 'quarantine', 'invoices') },
     ])
   })
 })
@@ -85,6 +89,7 @@ test('upload file path resolution rejects traversal and disallowed extensions', 
     assert.equal(resolveInvoiceUploadFilePath('../invoice.pdf'), null)
     assert.equal(resolveInvoiceUploadFilePath('nested/invoice.pdf'), null)
     assert.equal(resolveInvoiceUploadFilePath('invoice.png'), null)
+    assert.equal(resolveInvoiceQuarantineFilePath('../invoice.pdf'), null)
     assert.equal(resolveAvatarUploadFilePath('avatar.svg'), null)
     assert.equal(resolveBrandingUploadFilePath('..\\logo.png'), null)
     assert.equal(resolveBrandingUploadFilePath('logo.gif'), null)
@@ -92,6 +97,10 @@ test('upload file path resolution rejects traversal and disallowed extensions', 
     assert.equal(
       resolveInvoiceUploadFilePath('supplier-123.pdf'),
       path.join('/tmp', 'ims-private-uploads', 'invoices', 'supplier-123.pdf'),
+    )
+    assert.equal(
+      resolveInvoiceQuarantineFilePath('supplier-123.pdf'),
+      path.join('/tmp', 'ims-private-uploads', 'quarantine', 'invoices', 'supplier-123.pdf'),
     )
     assert.equal(
       resolveAvatarUploadFilePath('user_123.webp'),

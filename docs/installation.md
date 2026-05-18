@@ -104,6 +104,26 @@ historical `/uploads/avatars/*` path and rotate a `?t=` cache-busting query
 string on upload; configure any CDN in front of avatar assets to include query
 strings in its cache key.
 
+Invoice PDF scanning is disabled by default. Set `FILE_SCAN_MODE=command` and
+`FILE_SCAN_COMMAND_ARGV='["clamscan","--no-summary","{file}"]'` or
+`FILE_SCAN_COMMAND='clamscan --no-summary {file}'` to enable fail-closed
+scanning. IMS writes uploaded PDFs to
+`$UPLOAD_STORAGE_DIR/quarantine/invoices`, runs the command against the
+quarantined path, and moves the file to `$UPLOAD_STORAGE_DIR/invoices` only when
+the scanner exits `0`. Non-zero scanner exits reject the upload as unsafe;
+spawn errors and timeouts also reject the upload. Rejected quarantine files are
+deleted by default for disk hygiene; the activity log records scanner mode,
+status, reason, exit code, signal, and scanner identifier without scanner output
+or filesystem paths.
+
+Scanner commands run without a shell. Prefer `FILE_SCAN_COMMAND_ARGV` when an
+argument contains spaces or empty values. The scanner process receives only the
+environment variables listed in `FILE_SCAN_ENV_ALLOWLIST`, which defaults to
+basic process/runtime variables such as `PATH` and `TMPDIR`; application secrets
+such as `DATABASE_URL` and `AUTH_SECRET` are not inherited. The admin health
+endpoint runs a short scanner smoke check in command mode so misconfigured
+scanner commands are visible before the first invoice upload.
+
 
 ## Application Service Management
 
@@ -247,6 +267,12 @@ Key variables in the `.env` file:
 | `UPLOAD_MAX_SIZE_MB` | Maximum upload file size in MB (default: `10`) |
 | `UPLOAD_STORAGE_DIR` | Persistent private upload root. Defaults locally to `./uploads` when unset |
 | `PUBLIC_UPLOAD_STORAGE_DIR` | Persistent branding/avatar upload root. Defaults locally to `./public/uploads` when unset |
+| `FILE_SCAN_MODE` | Invoice PDF scan mode: `disabled` or `command` |
+| `FILE_SCAN_COMMAND_ARGV` | Preferred JSON argv scanner command when `FILE_SCAN_MODE=command`; include `{file}` or IMS appends the quarantined PDF path |
+| `FILE_SCAN_COMMAND` | Shell-like scanner command fallback when `FILE_SCAN_MODE=command`; run without a shell |
+| `FILE_SCAN_NAME` | Optional stable scanner identifier stored in audit metadata; defaults to a short hash of the configured command |
+| `FILE_SCAN_ENV_ALLOWLIST` | Comma-separated environment variables inherited by the scanner process |
+| `FILE_SCAN_TIMEOUT_MS` | Scan command timeout in milliseconds (default: `30000`; raise for large PDFs or busy scanners) |
 | `CRON_SECRET` | Shared secret for authenticating cron endpoint requests |
 | `ALLOW_LOCALHOST_CRON_BYPASS` | Set to `true` only if production cron requests must be allowed from localhost without the bearer header and `CRON_SECRET` is unset; default is `false` |
 | `INVARIANT_CHECK_PAGE_SIZE` | Optional page size for the scheduled invariant check inventory SQL collector. Default `500`; raise temporarily only for production triage. |

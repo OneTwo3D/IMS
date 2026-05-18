@@ -506,6 +506,16 @@ function createAdminReport(overrides: Partial<AdminHealthResponse> = {}): AdminH
           },
         },
       },
+      fileScanner: {
+        status: 'ok',
+        checkedAt: FIXED_DATE.toISOString(),
+        details: {
+          scanMode: 'disabled',
+          scanStatus: 'skipped',
+          scanReason: 'disabled',
+          scanScannerId: null,
+        },
+      },
     },
     ...overrides,
   }
@@ -615,6 +625,16 @@ function createHealthAdapters(overrides: Partial<HealthAdapters> = {}): HealthAd
     ], FIXED_DATE, [
       { jobName: 'invariant-check', schedule: '0 4 * * *', staleAfterMs: 129600000 },
     ]),
+    fileScanner: async () => ({
+      status: 'ok',
+      checkedAt: FIXED_DATE.toISOString(),
+      details: {
+        scanMode: 'disabled',
+        scanStatus: 'skipped',
+        scanReason: 'disabled',
+        scanScannerId: null,
+      },
+    }),
     ...overrides,
   }
 }
