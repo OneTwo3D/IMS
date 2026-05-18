@@ -15,6 +15,21 @@ import {
 import { notify } from '@/lib/notifications'
 
 const CRITICAL_FINDINGS_HASH_SETTING = 'cron_invariant_check_critical_findings_hash'
+const DEFAULT_INVENTORY_INVARIANT_PAGE_SIZE = 500
+const DEFAULT_INVENTORY_INVARIANT_MAX_FINDINGS = 5000
+
+function positiveIntEnv(name: string, fallback: number): number {
+  const parsed = Number.parseInt(process.env[name] ?? '', 10)
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback
+}
+
+function inventoryInvariantPageSize(): number {
+  return positiveIntEnv('INVARIANT_CHECK_PAGE_SIZE', DEFAULT_INVENTORY_INVARIANT_PAGE_SIZE)
+}
+
+function inventoryInvariantMaxFindings(): number {
+  return positiveIntEnv('INVARIANT_CHECK_MAX_FINDINGS', DEFAULT_INVENTORY_INVARIANT_MAX_FINDINGS)
+}
 
 type InvariantDomain = 'inventory' | 'accounting'
 
@@ -214,7 +229,11 @@ export async function runScheduledInvariantCheck(
 ): Promise<ScheduledInvariantCheckResult> {
   const runId = dependencies.createRunId?.() ?? randomUUID()
   const checkedAt = (dependencies.now?.() ?? new Date()).toISOString()
-  const runInventoryReport = dependencies.runInventoryReport ?? runInventoryInvariantReport
+  const runInventoryReport = dependencies.runInventoryReport ?? (() => runInventoryInvariantReport({
+    collectionMode: 'sql',
+    pageSize: inventoryInvariantPageSize(),
+    maxFindings: inventoryInvariantMaxFindings(),
+  }))
   const runAccountingReport = dependencies.runAccountingReport ?? runAccountingInvariantReport
   const writeActivityLog = dependencies.writeActivityLog ?? logActivity
   const notifyAdmins = dependencies.notifyAdmins ?? notifyActiveAdmins

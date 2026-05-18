@@ -3,9 +3,27 @@ import test from 'node:test'
 
 import {
   collectInventoryInvariantRows,
+  collectSqlInventoryInvariantFindingCollection,
+  collectSqlInventoryInvariantFindings,
+  collectSqlInventoryInvariantFindingsPage,
   evaluateInventoryInvariantRows,
+  runInventoryInvariantReport,
+  type InventoryInvariantFinding,
   type InventoryInvariantRows,
+  type InventoryInvariantSqlClient,
 } from '@/lib/domain/inventory/invariants'
+
+const CANONICAL_INVENTORY_INVARIANT_CODES = new Set([
+  'stock_negative_quantity',
+  'stock_negative_reserved_quantity',
+  'stock_reserved_exceeds_quantity',
+  'cost_layer_negative_received_quantity',
+  'cost_layer_negative_remaining_quantity',
+  'cost_layer_remaining_exceeds_received',
+  'stock_cost_layer_quantity_mismatch',
+  'stock_movement_negative_quantity',
+  'shipped_line_missing_cogs_snapshot',
+])
 
 function cleanRows(): InventoryInvariantRows {
   return {
@@ -281,6 +299,77 @@ test('clean stock movements do not generate findings', () => {
     findings.some((finding) => finding.code === 'stock_movement_negative_quantity'),
     false,
   )
+})
+
+test('negative transfer movements produce one finding per warehouse side', () => {
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [],
+    stockMovements: [
+      {
+        id: 'movement-transfer-negative',
+        type: 'TRANSFER_OUT',
+        productId: 'product-1',
+        fromWarehouseId: 'warehouse-from',
+        toWarehouseId: 'warehouse-to',
+        qty: -1,
+        product: {
+          id: 'product-1',
+          sku: 'NEG-TRANSFER',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    shippedShipmentLines: [],
+  })
+
+  assert.deepEqual(
+    findings.map((finding) => finding.warehouseId).sort(),
+    ['warehouse-from', 'warehouse-to'],
+  )
+  assert.deepEqual(
+    findings.map((finding) => (finding.details as { warehouseRole: string }).warehouseRole).sort(),
+    ['from', 'to'],
+  )
+})
+
+test('quantity tolerance is configurable for arithmetic-drift checks', () => {
+  const rows: InventoryInvariantRows = {
+    stockLevels: [
+      {
+        id: 'stock-small-negative',
+        productId: 'product-small-negative',
+        warehouseId: 'warehouse-1',
+        quantity: -0.25,
+        reservedQty: -0.25,
+        product: {
+          id: 'product-small-negative',
+          sku: 'SMALL-NEG',
+          type: 'SIMPLE',
+          oversellAllowed: false,
+        },
+      },
+    ],
+    costLayers: [
+      {
+        id: 'layer-small-negative',
+        productId: 'product-small-negative',
+        warehouseId: 'warehouse-1',
+        receivedQty: 1,
+        remainingQty: -0.25,
+        product: {
+          id: 'product-small-negative',
+          sku: 'SMALL-NEG',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    stockMovements: [],
+    shippedShipmentLines: [],
+  }
+
+  assert.ok(evaluateInventoryInvariantRows(rows, { quantityTolerance: 0 }).length > 0)
+  assert.deepEqual(evaluateInventoryInvariantRows(rows, { quantityTolerance: 0.5 }), [])
 })
 
 test('PR47 quantity constraints map to inventory invariant findings', () => {
@@ -658,4 +747,405 @@ test('inventory row collection excludes fully refunded orders from shipped COGS 
       },
     },
   })
+})
+
+test('inventory SQL collector keeps partially refunded orders eligible for shipped COGS checks', async () => {
+  let capturedQuery: unknown
+  const client: InventoryInvariantSqlClient = {
+    async $queryRaw<T = unknown>(query: unknown) {
+      capturedQuery = query
+      return [] as T
+    },
+  }
+
+  await collectSqlInventoryInvariantFindingsPage(client, { limit: 10 })
+
+  const sql = String((capturedQuery as { sql?: string }).sql ?? '')
+  assert.match(sql, /so\.status <> 'REFUNDED'/)
+  assert.doesNotMatch(sql, /PARTIALLY_REFUNDED/)
+})
+
+function findingKey(finding: InventoryInvariantFinding): string {
+  return [
+    finding.severity,
+    finding.code,
+    finding.productId ?? '',
+    finding.warehouseId ?? '',
+  ].join(':')
+}
+
+test('SQL inventory collector output matches evaluator output for seeded findings', async () => {
+  const rows = cleanRows()
+  rows.stockLevels[0] = {
+    ...rows.stockLevels[0],
+    quantity: 11,
+  }
+  rows.stockLevels.push(
+    {
+      id: 'stock-negative',
+      productId: 'product-negative',
+      warehouseId: 'warehouse-1',
+      quantity: -1,
+      reservedQty: 0,
+      product: {
+        id: 'product-negative',
+        sku: 'NEG-QTY',
+        type: 'SIMPLE',
+        oversellAllowed: false,
+      },
+    },
+    {
+      id: 'stock-reserved-negative',
+      productId: 'product-reserved-negative',
+      warehouseId: 'warehouse-1',
+      quantity: 1,
+      reservedQty: -1,
+      product: {
+        id: 'product-reserved-negative',
+        sku: 'NEG-RESERVED',
+        type: 'SIMPLE',
+        oversellAllowed: false,
+      },
+    },
+    {
+      id: 'stock-reserved-over',
+      productId: 'product-reserved-over',
+      warehouseId: 'warehouse-1',
+      quantity: 1,
+      reservedQty: 2,
+      product: {
+        id: 'product-reserved-over',
+        sku: 'OVER-RESERVED',
+        type: 'SIMPLE',
+        oversellAllowed: false,
+      },
+    },
+  )
+  rows.costLayers.push(
+    {
+      id: 'layer-negative-received',
+      productId: 'product-negative-received',
+      warehouseId: 'warehouse-1',
+      receivedQty: -1,
+      remainingQty: 0,
+      product: {
+        id: 'product-negative-received',
+        sku: 'NEG-RECEIVED',
+        type: 'SIMPLE',
+      },
+    },
+    {
+      id: 'layer-negative-remaining',
+      productId: 'product-negative-remaining',
+      warehouseId: 'warehouse-1',
+      receivedQty: 5,
+      remainingQty: -1,
+      product: {
+        id: 'product-negative-remaining',
+        sku: 'NEG-REMAINING',
+        type: 'SIMPLE',
+      },
+    },
+    {
+      id: 'layer-over',
+      productId: 'product-over-layer',
+      warehouseId: 'warehouse-1',
+      receivedQty: 5,
+      remainingQty: 6,
+      product: {
+        id: 'product-over-layer',
+        sku: 'OVER-LAYER',
+        type: 'SIMPLE',
+      },
+    },
+  )
+  rows.stockMovements.push({
+    id: 'movement-negative',
+    type: 'ADJUSTMENT',
+    productId: 'product-movement-negative',
+    fromWarehouseId: 'warehouse-1',
+    toWarehouseId: null,
+    qty: -3,
+    product: {
+      id: 'product-movement-negative',
+      sku: 'NEG-MOVE',
+      type: 'SIMPLE',
+    },
+  })
+  rows.shippedShipmentLines.push({
+    id: 'shipment-line-missing',
+    shipmentId: 'shipment-2',
+    lineId: 'sales-line-2',
+    productId: 'product-1',
+    qty: 1,
+    costLayerSnapshot: null,
+    product: {
+      id: 'product-1',
+      sku: 'SKU-1',
+      type: 'SIMPLE',
+    },
+    shipment: {
+      orderId: 'order-2',
+      warehouseId: 'warehouse-1',
+    },
+  })
+
+  const expected = evaluateInventoryInvariantRows(rows)
+  const expectedKeys = new Set(expected.map(findingKey))
+  assert.deepEqual(new Set(expected.map((finding) => finding.code)), CANONICAL_INVENTORY_INVARIANT_CODES)
+  const client: InventoryInvariantSqlClient = {
+    async $queryRaw<T = unknown>() {
+      const rows = expected.map((finding, index) => ({
+        sortKey: `${finding.code}:${String(index).padStart(3, '0')}`,
+        severity: finding.severity,
+        code: finding.code,
+        productId: finding.productId ?? null,
+        warehouseId: finding.warehouseId ?? null,
+        message: finding.message,
+        details: finding.details,
+      }))
+      assert.equal(new Set(rows.map((row) => row.sortKey)).size, rows.length)
+      return rows as T
+    },
+  }
+
+  const actual = await collectSqlInventoryInvariantFindings(client)
+
+  assert.deepEqual(new Set(actual.map((finding) => finding.code)), CANONICAL_INVENTORY_INVARIANT_CODES)
+  assert.deepEqual(
+    new Set(actual.map(findingKey)),
+    expectedKeys,
+  )
+})
+
+test('SQL inventory collector supports cursor pagination and bounded report collection', async () => {
+  const queries: unknown[] = []
+  const pages = [
+    [
+      {
+        sortKey: 'a',
+        severity: 'critical',
+        code: 'stock_negative_quantity',
+        productId: 'product-a',
+        warehouseId: 'warehouse-1',
+        message: 'Stock quantity is negative for A',
+        details: { stockLevelId: 'stock-a', sku: 'A', quantity: -1 },
+      },
+      {
+        sortKey: 'b',
+        severity: 'warning',
+        code: 'stock_cost_layer_quantity_mismatch',
+        productId: 'product-b',
+        warehouseId: 'warehouse-1',
+        message: 'Stock quantity does not match remaining cost-layer quantity for B',
+        details: { stockLevelId: 'stock-b', sku: 'B', quantity: 2, remainingCostLayerQty: 1, delta: 1 },
+      },
+    ],
+    [
+      {
+        sortKey: 'b',
+        severity: 'warning',
+        code: 'stock_cost_layer_quantity_mismatch',
+        productId: 'product-b',
+        warehouseId: 'warehouse-1',
+        message: 'Stock quantity does not match remaining cost-layer quantity for B',
+        details: { stockLevelId: 'stock-b', sku: 'B', quantity: 2, remainingCostLayerQty: 1, delta: 1 },
+      },
+    ],
+  ]
+  const client: InventoryInvariantSqlClient = {
+    async $queryRaw<T = unknown>(query: unknown) {
+      queries.push(query)
+      return (pages[queries.length - 1] ?? []) as T
+    },
+  }
+
+  const findings = await collectSqlInventoryInvariantFindings(client, {
+    pageSize: 1,
+    maxFindings: 2,
+  })
+
+  assert.equal(findings.length, 2)
+  assert.deepEqual(findings.map((finding) => finding.code), [
+    'stock_negative_quantity',
+    'stock_cost_layer_quantity_mismatch',
+  ])
+  assert.equal(queries.length, 2)
+  assert.ok((queries[1] as { values?: unknown[] }).values?.includes('a'))
+})
+
+test('SQL inventory collector surfaces truncation as a critical finding', async () => {
+  const client: InventoryInvariantSqlClient = {
+    async $queryRaw<T = unknown>() {
+      return [
+        {
+          sortKey: 'a',
+          severity: 'critical',
+          code: 'stock_negative_quantity',
+          productId: 'product-a',
+          warehouseId: 'warehouse-1',
+          message: 'Stock quantity is negative for A',
+          details: { stockLevelId: 'stock-a', sku: 'A', quantity: -1 },
+        },
+        {
+          sortKey: 'b',
+          severity: 'critical',
+          code: 'stock_negative_quantity',
+          productId: 'product-b',
+          warehouseId: 'warehouse-1',
+          message: 'Stock quantity is negative for B',
+          details: { stockLevelId: 'stock-b', sku: 'B', quantity: -1 },
+        },
+      ] as T
+    },
+  }
+
+  const collection = await collectSqlInventoryInvariantFindingCollection(client, {
+    pageSize: 1,
+    maxFindings: 1,
+  })
+
+  assert.equal(collection.truncated, true)
+  assert.equal(collection.nextCursor, 'a')
+  assert.deepEqual(collection.findings.map((finding) => finding.code), [
+    'stock_negative_quantity',
+    'invariant_report_truncated',
+  ])
+  assert.equal(collection.findings[1]?.severity, 'critical')
+})
+
+test('SQL inventory collector page accepts filters and returns a next cursor', async () => {
+  let capturedQuery: unknown
+  const client: InventoryInvariantSqlClient = {
+    async $queryRaw<T = unknown>(query: unknown) {
+      capturedQuery = query
+      return [
+        {
+          sortKey: 'warning-row',
+          severity: 'warning',
+          code: 'stock_cost_layer_quantity_mismatch',
+          productId: 'product-1',
+          warehouseId: 'warehouse-1',
+          message: 'Stock quantity does not match remaining cost-layer quantity for SKU-1',
+          details: { stockLevelId: 'stock-1', sku: 'SKU-1', quantity: 2, remainingCostLayerQty: 1, delta: 1 },
+        },
+        {
+          sortKey: 'warning-row-2',
+          severity: 'warning',
+          code: 'stock_cost_layer_quantity_mismatch',
+          productId: 'product-2',
+          warehouseId: 'warehouse-1',
+          message: 'Stock quantity does not match remaining cost-layer quantity for SKU-2',
+          details: { stockLevelId: 'stock-2', sku: 'SKU-2', quantity: 3, remainingCostLayerQty: 1, delta: 2 },
+        },
+      ] as T
+    },
+  }
+
+  const page = await collectSqlInventoryInvariantFindingsPage(client, {
+    limit: 1,
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    severity: 'warning',
+  })
+
+  assert.equal(page.findings.length, 1)
+  assert.equal(page.nextCursor, 'warning-row')
+  assert.equal(page.hasMore, true)
+  const values = (capturedQuery as { values?: unknown[] }).values ?? []
+  assert.ok(values.includes('product-1'))
+  assert.ok(values.includes('warehouse-1'))
+  assert.ok(values.includes('warning'))
+})
+
+test('inventory report uses SQL collector when a SQL client is provided', async () => {
+  const client: InventoryInvariantSqlClient = {
+    async $queryRaw<T = unknown>() {
+      return [
+        {
+          sortKey: 'stock_negative_quantity:stock-1',
+          severity: 'critical',
+          code: 'stock_negative_quantity',
+          productId: 'product-1',
+          warehouseId: 'warehouse-1',
+          message: 'Stock quantity is negative for SKU-1',
+          details: { stockLevelId: 'stock-1', sku: 'SKU-1', quantity: -1 },
+        },
+      ] as T
+    },
+  }
+
+  const report = await runInventoryInvariantReport({
+    sqlClient: client,
+    collectionMode: 'sql',
+    limit: 25,
+  })
+
+  assert.equal(report.summary.total, 1)
+  assert.equal(report.summary.critical, 1)
+  assert.equal(report.findings[0]?.code, 'stock_negative_quantity')
+})
+
+test('inventory report keeps row-collector fallback for evaluator fixtures', async () => {
+  const client = {
+    stockLevel: {
+      async findMany() {
+        return cleanRows().stockLevels
+      },
+    },
+    costLayer: {
+      async findMany() {
+        return cleanRows().costLayers
+      },
+    },
+    stockMovement: {
+      async findMany() {
+        return []
+      },
+    },
+    shipmentLine: {
+      async findMany() {
+        return cleanRows().shippedShipmentLines
+      },
+    },
+  }
+
+  const report = await runInventoryInvariantReport({ client })
+
+  assert.equal(report.summary.total, 0)
+})
+
+test('inventory report rejects row-mode filters instead of silently ignoring them', async () => {
+  const client = {
+    stockLevel: { async findMany() { return [] } },
+    costLayer: { async findMany() { return [] } },
+    stockMovement: { async findMany() { return [] } },
+    shipmentLine: { async findMany() { return [] } },
+  }
+
+  await assert.rejects(
+    runInventoryInvariantReport({
+      client,
+      collectionMode: 'rows',
+      productId: 'product-1',
+    }),
+    /row collection mode does not support productId/,
+  )
+})
+
+test('inventory report fails fast when SQL mode receives only a row mock client', async () => {
+  const client = {
+    stockLevel: { async findMany() { return [] } },
+    costLayer: { async findMany() { return [] } },
+    stockMovement: { async findMany() { return [] } },
+    shipmentLine: { async findMany() { return [] } },
+  }
+
+  await assert.rejects(
+    runInventoryInvariantReport({
+      client,
+      collectionMode: 'sql',
+    }),
+    /\$queryRaw-capable client/,
+  )
 })

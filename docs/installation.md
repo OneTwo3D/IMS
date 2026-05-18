@@ -237,6 +237,8 @@ Key variables in the `.env` file:
 | `UPLOAD_MAX_SIZE_MB` | Maximum upload file size in MB (default: `10`) |
 | `CRON_SECRET` | Shared secret for authenticating cron endpoint requests |
 | `ALLOW_LOCALHOST_CRON_BYPASS` | Set to `true` only if production cron requests must be allowed from localhost without the bearer header and `CRON_SECRET` is unset; default is `false` |
+| `INVARIANT_CHECK_PAGE_SIZE` | Optional page size for the scheduled invariant check inventory SQL collector. Default `500`; raise temporarily only for production triage. |
+| `INVARIANT_CHECK_MAX_FINDINGS` | Optional maximum inventory invariant findings collected by the scheduled invariant check. Default `5000`; when the cap is hit, the report adds a critical truncation finding. |
 | `SMTP_HOST` | SMTP server hostname if you choose to manage mail via env rather than app settings |
 | `SMTP_PORT` | SMTP server port |
 | `SMTP_USER` | SMTP authentication username |
