@@ -5,6 +5,7 @@ import path from 'node:path'
 
 import { getAllCronJobs } from '@/lib/cron-jobs'
 import type { CronJobDef } from '@/lib/cron-registry'
+import { getIntegrationPluginState, isIntegrationModuleVisible } from '@/lib/integration-plugins'
 import { checkFileScanHealth } from '@/lib/security/file-scan'
 import packageJson from '@/package.json'
 
@@ -1058,7 +1059,10 @@ async function getAccountingEventsHealth(now: Date = new Date()): Promise<Health
 async function getCronFreshnessHealth(now: Date = new Date()): Promise<CronFreshnessHealthCheck> {
   try {
     const { db } = await import('@/lib/db')
-    const jobs = getAllCronJobs()
+    // Match the scheduler in app/actions/cron.ts: jobs from disabled integration plugins
+    // are intentionally absent from crontab, so they must not be reported as stale.
+    const pluginState = await getIntegrationPluginState()
+    const jobs = getAllCronJobs().filter((job) => isIntegrationModuleVisible(job.module, pluginState))
     const settings = await db.setting.findMany({
       where: {
         key: {
@@ -1178,6 +1182,9 @@ function staleAfterMsForCronSchedule(schedule: string): number {
   const [minute, hour, dayOfMonth, month, dayOfWeek] = fields
   if (dayOfMonth !== '*' || month !== '*' || dayOfWeek !== '*') return 36 * HOUR_MS
 
+  // Treat `* * * * *` (every minute) like the */N branch with N=1 so the freshness
+  // policy uses minute-scale staleness rather than the 36h fallback.
+  if (minute === '*' && hour === '*') return 3 * MINUTE_MS
   if (minute.startsWith('*/') && hour === '*') {
     const intervalMinutes = Number(minute.slice(2))
     if (Number.isFinite(intervalMinutes) && intervalMinutes > 0) return intervalMinutes * 3 * MINUTE_MS

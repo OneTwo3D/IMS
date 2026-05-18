@@ -478,7 +478,29 @@ mkdir -p "${DATA_DIR}" "${LOG_DIR}" "${BACKUP_DIR}" \
   /tmp/${APP_NAME}/pdf \
   /tmp/${APP_NAME}/uploads
 
+# Migrate uploads from any previous in-tree location to the new storage roots.
+# Existing DB rows reference filenames only, so files left behind under
+# ${APP_DIR}/uploads or ${APP_DIR}/public/uploads will 404 after restart once
+# the .env points the app at the new roots. Move (not copy) so re-runs are
+# idempotent — `mv -n` skips files that already exist in the destination.
+migrate_uploads() {
+  local src="$1"
+  local dest="$2"
+  if [[ -d "${src}" ]] && [[ -n "$(find "${src}" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null)" ]]; then
+    info "Migrating legacy uploads: ${src} -> ${dest}"
+    mkdir -p "${dest}"
+    find "${src}" -mindepth 1 -maxdepth 1 -exec mv -n -t "${dest}" {} +
+    rmdir "${src}" 2>/dev/null || true
+  fi
+}
+
+migrate_uploads "${APP_DIR}/uploads/invoices" "${UPLOAD_STORAGE_DIR}/invoices"
+migrate_uploads "${APP_DIR}/uploads/quarantine/invoices" "${UPLOAD_STORAGE_DIR}/quarantine/invoices"
+migrate_uploads "${APP_DIR}/public/uploads/branding" "${PUBLIC_UPLOAD_STORAGE_DIR}/branding"
+migrate_uploads "${APP_DIR}/public/uploads/avatars" "${PUBLIC_UPLOAD_STORAGE_DIR}/avatars"
+
 chown -R "${APP_USER}:${APP_USER}" "${DATA_DIR}" "${LOG_DIR}"
+chown -R "${APP_USER}:${APP_USER}" "${UPLOAD_STORAGE_DIR}" "${PUBLIC_UPLOAD_STORAGE_DIR}"
 
 success "Directories created."
 

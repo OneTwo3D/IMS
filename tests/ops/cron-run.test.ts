@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { Prisma } from '../../app/generated/prisma/client.ts'
 import {
   appendCronRunId,
   cronRunResponseInit,
@@ -320,6 +321,26 @@ test('cron run persistence rejects non-object counts payloads at the boundary', 
   )
 
   assert.equal(creates.length, 0)
+})
+
+test('cron run persistence translates null counts to Prisma.JsonNull at the boundary', async () => {
+  const { client, creates } = createCronRunPersistenceClient()
+
+  await persistCronRunLog({
+    runId: 'run-null-counts',
+    jobName: 'backup',
+    startedAt: '2026-04-28T12:00:00.000Z',
+    finishedAt: '2026-04-28T12:00:05.000Z',
+    durationMs: 5000,
+    status: 'failed',
+    counts: null,
+    statusReason: 'Backup creation failed',
+  }, client)
+
+  assert.equal(creates.length, 2)
+  assert.equal(creates[0].table, 'cronRun')
+  const cronRunData = (creates[0].args as { data: Record<string, unknown> }).data
+  assert.equal(cronRunData.countsJson, Prisma.JsonNull)
 })
 
 test('cron run query helpers use the structured CronRun table', async () => {

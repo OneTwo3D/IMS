@@ -349,6 +349,26 @@ test('cron freshness handles missing runs, clock skew, and registry-derived sche
   assert.equal(Boolean(policies.find((policy) => policy.jobName === 'mintsoft-product-verify')), true)
 })
 
+test('every-minute cron schedule yields a minute-scale staleness policy, not 36h', () => {
+  const policies = buildCronFreshnessPolicies([
+    {
+      slug: 'every-minute-sweep',
+      settingKey: 'every_minute_sweep',
+      module: 'core',
+      moduleLabel: 'Core',
+      label: 'Every-minute sweep',
+      description: 'Tick every minute',
+      defaultSchedule: '* * * * *',
+      defaultEnabled: true,
+    },
+  ], new Map())
+
+  const policy = policies.find((p) => p.jobName === 'every-minute-sweep')
+  assert.ok(policy, 'policy for * * * * * job should exist')
+  // 1 minute interval * 3 = 3 minutes staleness window — same shape as the */N branch.
+  assert.equal(policy.staleAfterMs, 3 * 60 * 1000)
+})
+
 test('invariant and WMS stock health elevate parse mismatches and completed jobs with findings', () => {
   const malformedInvariant = buildInvariantCheckHealthFromCronRun({
     runId: 'run-1',
