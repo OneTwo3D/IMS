@@ -147,38 +147,23 @@ export async function ensureCurrentReleaseNotification(): Promise<void> {
   const id = getReleaseNotificationId(release.version)
   const title = `What's New in ${release.version}`
   const actionUrl = '/settings/system?tab=releases'
-  const existing = await db.notification.findUnique({ where: { id } })
 
-  if (!existing) {
-    await db.notification.create({
-      data: {
-        id,
-        userId: null,
-        type: 'info',
-        title,
-        message: release.userMessage,
-        actionUrl,
-      },
-    })
-    return
-  }
-
-  if (
-    existing.userId !== null ||
-    existing.type !== 'info' ||
-    existing.title !== title ||
-    existing.message !== release.userMessage ||
-    existing.actionUrl !== actionUrl
-  ) {
-    await db.notification.update({
-      where: { id },
-      data: {
-        userId: null,
-        type: 'info',
-        title,
-        message: release.userMessage,
-        actionUrl,
-      },
-    })
-  }
+  await db.notification.upsert({
+    where: { id },
+    create: {
+      id,
+      userId: null,
+      type: 'info',
+      title,
+      message: release.userMessage,
+      actionUrl,
+    },
+    update: {
+      userId: null,
+      type: 'info',
+      title,
+      message: release.userMessage,
+      actionUrl,
+    },
+  })
 }

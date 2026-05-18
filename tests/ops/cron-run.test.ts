@@ -146,6 +146,7 @@ test('cron run helper persists failure summaries before rethrowing unexpected er
     runCronWithLogging({
       jobName: 'wc-reconcile',
       createRunId: () => 'run-error',
+      now: () => new Date('2026-04-28T12:00:00.000Z'),
       writeLog: async (log) => {
         logs.push(log)
       },

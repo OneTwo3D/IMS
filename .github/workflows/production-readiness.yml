@@ -1,0 +1,113 @@
+name: Production Readiness
+
+on:
+  pull_request:
+    branches:
+      - development
+    paths-ignore:
+      - "*.md"
+      - "**/*.md"
+      - "docs/**"
+      - ".gitignore"
+      - "CHANGELOG.md"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: production-readiness-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  AUTH_SECRET: production-readiness-ci-auth-secret
+  AUTH_URL: http://localhost:3001
+  NEXT_PUBLIC_APP_URL: http://localhost:3001
+  CRON_SECRET: production-readiness-ci-cron-secret
+  SETTINGS_ENCRYPTION_KEY: prod_readiness_ci_settings_key__
+  CI: "true"
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # npm run validate compares Prisma changes against origin/development,
+          # so this job intentionally keeps full history.
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate --schema prisma/schema.prisma
+      - run: npm run validate
+
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate --schema prisma/schema.prisma
+      - run: npm run build
+
+  e2e-select:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/ims_ci
+      E2E_BASE_URL: http://localhost:3001
+      E2E_PORT: "3001"
+      E2E_TEST_MODE: "1"
+      E2E_ROUTE_SECRET: ${{ secrets.E2E_ROUTE_SECRET || 'e2e-route-secret' }}
+      E2E_WEB_SERVER_TIMEOUT_MS: "240000"
+    services:
+      postgres:
+        image: postgres:14.13
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ims_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d ims_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx prisma generate --schema prisma/schema.prisma
+      - run: npx prisma migrate deploy --schema prisma/schema.prisma
+      # Playwright's webServer command seeds E2E data immediately before
+      # starting Next.js; keeping seed there avoids double-seeding races.
+      - name: Cache Playwright browsers
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
+      - run: npx playwright install --with-deps chromium
+      - name: Run selected E2E workflow without third-party integrations
+        run: npm run e2e:select -- --workflow=sales-order --no-integrations
+      - name: Upload Playwright report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report-${{ github.run_id }}
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 14
