@@ -1,5 +1,4 @@
 import { NextResponse } from 'next/server'
-import { writeFile, mkdir } from 'fs/promises'
 import { requireRole } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import {
@@ -7,12 +6,9 @@ import {
   sanitizeInvoiceUploadFilename,
   validateInvoicePdfMetadata,
 } from '@/lib/security/upload-validation'
-import {
-  getInvoiceStoredPath,
-  getInvoiceUploadDir,
-  getInvoiceUploadUrl,
-  resolveInvoiceUploadFilePath,
-} from '@/lib/upload-storage'
+import { getInvoiceStoredPath, getInvoiceUploadUrl } from '@/lib/upload-storage'
+import { fileScanAuditMetadata } from '@/lib/security/file-scan'
+import { storeInvoicePdfUpload } from '@/lib/invoice-upload-storage'
 
 export async function POST(req: Request) {
   let session
@@ -35,14 +31,25 @@ export async function POST(req: Request) {
     return NextResponse.json({ error: 'Invalid PDF file.' }, { status: 400 })
   }
 
-  const dir = getInvoiceUploadDir()
-  await mkdir(dir, { recursive: true })
-
   const filename = sanitizeInvoiceUploadFilename(file.name)
-  const filepath = resolveInvoiceUploadFilePath(filename)
-  if (!filepath) return NextResponse.json({ error: 'Invalid file' }, { status: 400 })
+  const stored = await storeInvoicePdfUpload(filename, buffer)
+  if (!stored.ok) {
+    await logActivity({
+      entityType: 'SYSTEM',
+      tag: 'purchase',
+      action: 'rejected',
+      description: `Rejected invoice PDF upload: ${filename}`,
+      userId: session.user.id,
+      metadata: {
+        originalFilename: file.name,
+        storedFilename: filename,
+        sizeBytes: file.size,
+        ...fileScanAuditMetadata(stored.scan),
+      },
+    })
+    return NextResponse.json({ error: stored.error }, { status: stored.status })
+  }
 
-  await writeFile(filepath, buffer)
   await logActivity({
     entityType: 'SYSTEM',
     tag: 'purchase',
@@ -54,6 +61,7 @@ export async function POST(req: Request) {
       storedFilename: filename,
       storedPath: getInvoiceStoredPath(filename),
       sizeBytes: file.size,
+      ...fileScanAuditMetadata(stored.scan),
     },
   })
 

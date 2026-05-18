@@ -5,6 +5,7 @@ import path from 'node:path'
 
 import { getAllCronJobs } from '@/lib/cron-jobs'
 import type { CronJobDef } from '@/lib/cron-registry'
+import { checkFileScanHealth } from '@/lib/security/file-scan'
 import packageJson from '@/package.json'
 
 export const HEALTH_NO_STORE_HEADERS = {
@@ -116,6 +117,7 @@ export type AdminHealthResponse = {
     mintsoftWebhookQueue: HealthCheck
     accountingEvents: HealthCheck
     cronFreshness: CronFreshnessHealthCheck
+    fileScanner: HealthCheck
   }
 }
 
@@ -136,6 +138,7 @@ export type HealthAdapters = {
   mintsoftWebhookQueue: (now: Date) => Promise<HealthCheck>
   accountingEvents: (now: Date) => Promise<HealthCheck>
   cronFreshness: (now: Date) => Promise<CronFreshnessHealthCheck>
+  fileScanner: (now: Date) => Promise<HealthCheck>
 }
 
 export type CollectAdminHealthOptions = {
@@ -177,6 +180,7 @@ export async function collectAdminHealth(
     mintsoftWebhookQueue,
     accountingEvents,
     cronFreshness,
+    fileScanner,
   ] = await Promise.all([
     runHealthAdapter('database', () => adapters.checkDatabase(now), timeoutMs, (message) => errorCheck(message, now)),
     runHealthAdapter('migrations', () => adapters.latestMigration(now), timeoutMs, (message) =>
@@ -215,6 +219,9 @@ export async function collectAdminHealth(
     runHealthAdapter('cron freshness', () => adapters.cronFreshness(now), timeoutMs, (message) =>
       warningCronFreshness(message, now),
     ),
+    runHealthAdapter('file scanner', () => adapters.fileScanner(now), timeoutMs, (message) =>
+      warningCheck(message, now),
+    ),
   ])
 
   const status = summarizeHealthStatus([
@@ -231,6 +238,7 @@ export async function collectAdminHealth(
     mintsoftWebhookQueue,
     accountingEvents,
     cronFreshness,
+    fileScanner,
   ])
 
   return {
@@ -255,6 +263,7 @@ export async function collectAdminHealth(
       mintsoftWebhookQueue,
       accountingEvents,
       cronFreshness,
+      fileScanner,
     },
   }
 }
@@ -304,6 +313,7 @@ export function createDefaultHealthAdapters(): HealthAdapters {
     mintsoftWebhookQueue: getMintsoftWebhookQueueHealth,
     accountingEvents: getAccountingEventsHealth,
     cronFreshness: getCronFreshnessHealth,
+    fileScanner: getFileScannerHealth,
   }
 }
 
@@ -1077,6 +1087,22 @@ async function getCronFreshnessHealth(now: Date = new Date()): Promise<CronFresh
     console.error('Admin health cron freshness check failed', error)
     return warningCronFreshness('Cron freshness check failed', now)
   }
+}
+
+async function getFileScannerHealth(now: Date = new Date()): Promise<HealthCheck> {
+  const result = await checkFileScanHealth()
+  const details = {
+    scanMode: result.mode,
+    scanStatus: result.status,
+    scanReason: result.reason ?? null,
+    scanScannerId: result.scannerId ?? null,
+  }
+
+  if (result.mode === 'disabled' || result.status === 'clean') {
+    return okCheck(details, now)
+  }
+
+  return warningCheck('File scanner command failed the health smoke check', now, details)
 }
 
 export function buildWmsStockSyncHealth(
