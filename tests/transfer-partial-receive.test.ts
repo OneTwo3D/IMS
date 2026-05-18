@@ -8,7 +8,7 @@ import {
 } from '../lib/cost-layer-snapshots.ts'
 
 /**
- * The production helper at `lib/connectors/mintsoft/sync/booked-in-helpers.ts`
+ * The production helper at `lib/domain/wms/asn-reconciliation.ts`
  * imports via `@/lib/...` which Node's plain ESM resolver doesn't understand.
  * Re-implement it here from the same pure primitives so the test runs without
  * the Next runtime. If the production copy drifts from this re-implementation

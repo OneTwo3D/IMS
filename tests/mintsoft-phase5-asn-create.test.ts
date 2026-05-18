@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import * as normalizersNs from '../lib/connectors/mintsoft/api/normalizers.ts'
 import * as clientNs from '../lib/connectors/mintsoft/api/client.ts'
-import * as bookedInHandlerNs from '../lib/connectors/mintsoft/sync/booked-in-handler.ts'
+import * as bookedInJobNs from '../lib/jobs/wms/process-mintsoft-booked-in-event.ts'
 import * as fakeMintsoftRouteNs from '../app/api/e2e/mintsoft/[...slug]/route.ts'
 import type { WmsAsnRef } from '../lib/connectors/wms/types.ts'
 
@@ -12,9 +12,9 @@ const normalizers = 'default' in normalizersNs
 const client = 'default' in clientNs
   ? clientNs.default as typeof import('../lib/connectors/mintsoft/api/client.ts')
   : clientNs
-const bookedInHandler = 'default' in bookedInHandlerNs
-  ? bookedInHandlerNs.default as typeof import('../lib/connectors/mintsoft/sync/booked-in-handler.ts')
-  : bookedInHandlerNs
+const bookedInJob = 'default' in bookedInJobNs
+  ? bookedInJobNs.default as typeof import('../lib/jobs/wms/process-mintsoft-booked-in-event.ts')
+  : bookedInJobNs
 const fakeMintsoftRoute = 'default' in fakeMintsoftRouteNs
   ? fakeMintsoftRouteNs.default as typeof import('../app/api/e2e/mintsoft/[...slug]/route.ts')
   : fakeMintsoftRouteNs
@@ -107,7 +107,7 @@ test('booked-in ASN lookup routes through the connector direct lookup by default
     raw: null,
   }
 
-  const result = await bookedInHandler.fetchMintsoftBookedInAsn(' ASN 77/2026 ', {
+  const result = await bookedInJob.fetchMintsoftBookedInAsn(' ASN 77/2026 ', {
     env: {},
     connector: {
       async fetchAsnById(externalAsnId: string) {
@@ -122,6 +122,19 @@ test('booked-in ASN lookup routes through the connector direct lookup by default
 
   assert.equal(result, asn)
   assert.deepEqual(calls, ['ASN 77/2026'])
+})
+
+test('booked-in ASN lookup explains how to use the rollback path when direct lookup is unavailable', async () => {
+  await assert.rejects(
+    bookedInJob.fetchMintsoftBookedInAsn('ASN 77/2026', {
+      env: {},
+      connector: {} as { fetchAsnById?: never },
+      async fetchAsns() {
+        throw new Error('bulk ASN lookup should not run')
+      },
+    }),
+    /Configured WMS connector Object does not support direct ASN lookup; set MINTSOFT_USE_BULK_ASN_LOOKUP=true/,
+  )
 })
 
 test('booked-in ASN lookup can use the bulk lookup rollback flag', async () => {
@@ -141,7 +154,7 @@ test('booked-in ASN lookup can use the bulk lookup rollback flag', async () => {
     },
   ]
 
-  const result = await bookedInHandler.fetchMintsoftBookedInAsn(' ASN 77/2026 ', {
+  const result = await bookedInJob.fetchMintsoftBookedInAsn(' ASN 77/2026 ', {
     env: { MINTSOFT_USE_BULK_ASN_LOOKUP: 'true' },
     connector: {
       async fetchAsnById(externalAsnId: string) {
@@ -156,6 +169,13 @@ test('booked-in ASN lookup can use the bulk lookup rollback flag', async () => {
 
   assert.equal(result, bulkAsns[1])
   assert.deepEqual(directCalls, [])
+})
+
+test('Mintsoft webhook sweeper page size uses a positive integer environment override', () => {
+  assert.equal(bookedInJob.getMintsoftWebhookSweeperPageSize({}), 250)
+  assert.equal(bookedInJob.getMintsoftWebhookSweeperPageSize({ MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE: '25' }), 25)
+  assert.equal(bookedInJob.getMintsoftWebhookSweeperPageSize({ MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE: '0' }), 250)
+  assert.equal(bookedInJob.getMintsoftWebhookSweeperPageSize({ MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE: 'nope' }), 250)
 })
 
 test('normalizeMintsoftAsnFetchByIdResult handles not-found, error, and fallback-id responses', () => {

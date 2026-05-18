@@ -16,7 +16,7 @@ export const XeroAccountingOutboxPayloadSchema = z.object({
 
 /**
  * Scaffolded for future outbox-based Mintsoft webhook processing. Current
- * Mintsoft webhook processing routes through processMintsoftBookedInEvent
+ * Mintsoft webhook processing routes through the WMS booked-in job
  * directly without enqueueing to IntegrationOutbox.
  *
  * The future processor should read the full event row from

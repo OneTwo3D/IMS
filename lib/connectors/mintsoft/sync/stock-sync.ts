@@ -12,7 +12,7 @@ import {
   planMintsoftAlignmentAllocations,
   parseMintsoftThresholds,
 } from './stock-sync-helpers'
-import { sliceTransferSnapshotForReceipt } from './booked-in-helpers'
+import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 
 type SyncBinding = {
   id: string

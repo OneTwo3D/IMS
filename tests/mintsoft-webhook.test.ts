@@ -2,11 +2,14 @@ import assert from 'node:assert/strict'
 import { createHmac } from 'node:crypto'
 import test from 'node:test'
 import {
-  buildMintsoftWebhookRetryStateResetMetadata,
   handleMintsoftBookedInWebhook,
-  shouldLogMintsoftWebhookRetryStateReset,
   type MintsoftBookedInWebhookRouteDependencies,
 } from '../app/api/webhooks/mintsoft/asn-booked-in/route.ts'
+import {
+  buildMintsoftWebhookRetryStateResetMetadata,
+  createMintsoftWebhookEventRepository,
+  shouldLogMintsoftWebhookRetryStateReset,
+} from '../lib/jobs/wms/process-mintsoft-booked-in-event.ts'
 import * as authModuleNs from '../lib/connectors/mintsoft/api/auth.ts'
 import * as webhookValidationModuleNs from '../lib/connectors/mintsoft/webhook-validation.ts'
 import * as webhookEventsModuleNs from '../lib/connectors/mintsoft/webhook-events.ts'
@@ -35,6 +38,8 @@ const {
 const { persistMintsoftWebhookEvent } = webhookEventsModule
 
 const WEBHOOK_SECRET = 'top-secret'
+
+type RepositoryFactoryOptions = NonNullable<Parameters<typeof createMintsoftWebhookEventRepository>[0]>
 
 function buildInput(): PersistMintsoftWebhookEventInput {
   return {
@@ -264,6 +269,63 @@ test('Mintsoft webhook retry reset helper preserves prior dead-letter state for 
     }),
     false,
   )
+})
+
+test('Mintsoft webhook repository factory accepts injected storage and audits retry-state reset', async () => {
+  const input = buildInput()
+  const priorNextRetryAt = new Date('2026-05-14T09:00:00.000Z')
+  const findArgs: unknown[] = []
+  const updateArgs: unknown[] = []
+  const activityLogs: unknown[] = []
+  const client = {
+    async create() {
+      throw new Error('create should not run')
+    },
+    async findUnique(args: unknown) {
+      findArgs.push(args)
+      return {
+        id: 'event-dead',
+        processingStatus: 'DEAD',
+        processingAttempts: 4,
+        nextRetryAt: priorNextRetryAt,
+        deadLetteredAt: null,
+        lastError: 'previous failure',
+      }
+    },
+    async updateMany(args: unknown) {
+      updateArgs.push(args)
+      return { count: 1 }
+    },
+  }
+  const repository = createMintsoftWebhookEventRepository({
+    client: client as unknown as RepositoryFactoryOptions['client'],
+    async logActivity(entry) {
+      activityLogs.push(entry)
+    },
+  })
+
+  const updated = await repository.updatePendingEvent('event-dead', input)
+
+  assert.equal(updated, true)
+  assert.equal(findArgs.length, 1)
+  assert.equal(updateArgs.length, 1)
+  assert.deepEqual((updateArgs[0] as { where?: unknown }).where, {
+    id: 'event-dead',
+    processedAt: null,
+  })
+  assert.equal(activityLogs.length, 1)
+  const activityLog = activityLogs[0] as { action?: string; metadata?: Record<string, unknown> }
+  assert.equal(activityLog.action, 'mintsoft_webhook_retry_state_reset')
+  assert.deepEqual(activityLog.metadata, {
+    eventId: 'event-dead',
+    priorStatus: 'DEAD',
+    priorAttempts: 4,
+    priorNextRetryAt: '2026-05-14T09:00:00.000Z',
+    priorDeadLetteredAt: null,
+    priorLastError: 'previous failure',
+    externalEventId: input.externalEventId,
+    externalAsnId: input.externalAsnId,
+  })
 })
 
 test('Mintsoft booked-in webhook route persists and returns 202 without processing inline', async () => {

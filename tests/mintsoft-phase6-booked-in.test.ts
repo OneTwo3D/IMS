@@ -6,11 +6,11 @@ import {
   buildMintsoftWebhookRetryUpdate,
   buildMintsoftWebhookSweepWhere,
   MINTSOFT_WEBHOOK_PROCESSING_STATUS,
-} from '../lib/connectors/mintsoft/sync/booked-in-handler.ts'
+} from '../lib/domain/wms/booked-in-service.ts'
 import {
   reconcileBookedInQuantities,
   sliceTransferSnapshotForReceipt,
-} from '../lib/connectors/mintsoft/sync/booked-in-helpers.ts'
+} from '../lib/domain/wms/asn-reconciliation.ts'
 
 test('reconcileBookedInQuantities only books the unaccounted delta from Mintsoft', () => {
   assert.deepEqual(
