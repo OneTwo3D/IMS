@@ -4,12 +4,6 @@ on:
   pull_request:
     branches:
       - development
-    paths-ignore:
-      - "*.md"
-      - "**/*.md"
-      - "docs/**"
-      - ".gitignore"
-      - "CHANGELOG.md"
 
 permissions:
   contents: read
@@ -27,7 +21,35 @@ env:
   CI: "true"
 
 jobs:
+  classify_changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      run_expensive: ${{ steps.changed-files.outputs.run_expensive }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: changed-files
+        run: |
+          git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" > changed-files.txt
+
+          run_expensive=false
+          while IFS= read -r path; do
+            case "$path" in
+              *.md|docs/*|.gitignore|CHANGELOG.md)
+                ;;
+              *)
+                run_expensive=true
+                ;;
+            esac
+          done < changed-files.txt
+
+          echo "run_expensive=$run_expensive" >> "$GITHUB_OUTPUT"
+
   validate:
+    needs: classify_changes
+    if: needs.classify_changes.outputs.run_expensive == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -45,6 +67,8 @@ jobs:
       - run: npm run validate
 
   build:
+    needs: classify_changes
+    if: needs.classify_changes.outputs.run_expensive == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
@@ -58,6 +82,8 @@ jobs:
       - run: npm run build
 
   e2e-select:
+    needs: classify_changes
+    if: needs.classify_changes.outputs.run_expensive == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:

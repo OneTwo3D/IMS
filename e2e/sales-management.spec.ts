@@ -121,7 +121,25 @@ test.describe('sales management workflows', () => {
     await page.reload()
 
     const generateInvoiceButton = page.getByRole('button', { name: /generate invoice/i })
-    if (await generateInvoiceButton.isVisible()) {
+    const pendingSyncBadge = page.getByText(/invoice pending sync/i)
+    const invoiceOutcome = async () => {
+      if (await generateInvoiceButton.isVisible().catch(() => false)) return 'generate'
+      if (await pendingSyncBadge.isVisible().catch(() => false)) return 'pending-sync'
+      return 'none'
+    }
+    const waitForInvoiceOutcome = async () => {
+      const deadline = Date.now() + 15000
+      while (Date.now() < deadline) {
+        const outcome = await invoiceOutcome()
+        if (outcome !== 'none') return outcome
+        await page.waitForTimeout(250)
+      }
+      return 'none'
+    }
+
+    const invoiceState = await waitForInvoiceOutcome()
+
+    if (invoiceState === 'generate') {
       await generateInvoiceButton.click()
       await expect(page.getByText(/Invoice #/i)).toBeVisible()
 
@@ -140,11 +158,12 @@ test.describe('sales management workflows', () => {
       await paymentDialog.getByRole('button', { name: /record payment/i }).click()
       await expect(paymentDialog).toBeHidden()
       await expect(page.getByText(/^Paid$/).first()).toBeVisible()
+    } else if (invoiceState === 'pending-sync') {
+      await expect(pendingSyncBadge).toBeVisible()
     } else {
-      const pendingSyncBadge = page.getByText(/invoice pending sync/i)
-      if (await pendingSyncBadge.isVisible().catch(() => false)) {
-        await expect(pendingSyncBadge).toBeVisible()
-      }
+      expect(process.env.E2E_XERO_ENABLED).not.toBe('true')
+      await expect(generateInvoiceButton).toBeHidden()
+      await expect(pendingSyncBadge).toBeHidden()
     }
 
     const refundButton = page.getByRole('button', { name: /^Refund$/ })
