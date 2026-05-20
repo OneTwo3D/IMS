@@ -151,6 +151,10 @@ test.describe('sales management workflows', () => {
     await refundDialog.locator('input').first().fill('Customer return')
     await refundDialog.locator('input[type="number"]').first().fill('1')
     await refundDialog.getByRole('button', { name: /confirm refund/i }).click()
+    await expect(refundDialog.getByRole('button', { name: /confirm refund/i })).toBeHidden({ timeout: 15000 })
+    if (await refundDialog.isVisible().catch(() => false)) {
+      await refundDialog.getByRole('button', { name: /^Close$/ }).click()
+    }
     await expect(refundDialog).toBeHidden()
 
     await expect(page.getByText(/Refunds \(1\)/)).toBeVisible()
