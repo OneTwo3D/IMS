@@ -9,6 +9,9 @@ process.env.E2E_TEST_MODE ??= '1'
 const PORT = Number(process.env.E2E_PORT ?? 3001)
 const baseURL = process.env.E2E_BASE_URL ?? `http://localhost:${PORT}`
 const webServerURL = `${baseURL.replace(/\/$/, '')}/login`
+const webServerTimeout = Number(process.env.E2E_WEB_SERVER_TIMEOUT_MS ?? 120000)
+const configuredWorkers = process.env.E2E_WORKERS ? Number(process.env.E2E_WORKERS) : undefined
+const configuredRetries = process.env.E2E_RETRIES ? Number(process.env.E2E_RETRIES) : undefined
 
 // Specs that mutate shared integration settings
 // (WooCommerce credentials, Mintsoft connection/plugin state, warehouse sync
@@ -29,8 +32,8 @@ export default defineConfig({
   testDir: './e2e',
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 2 : 0,
-  workers: process.env.CI ? 2 : undefined,
+  retries: configuredRetries ?? (process.env.CI ? 2 : 0),
+  workers: configuredWorkers ?? (process.env.CI ? 2 : undefined),
   reporter: process.env.CI ? [['html'], ['list']] : 'list',
   use: {
     baseURL,
@@ -92,7 +95,7 @@ export default defineConfig({
     command: `node scripts/clear-stale-next-dev-lock.mjs && npm run db:seed:e2e && node scripts/clear-stale-next-dev-lock.mjs && npm run dev -- --hostname 0.0.0.0 --port ${PORT}`,
     url: webServerURL,
     reuseExistingServer: !process.env.CI,
-    timeout: 120000,
+    timeout: webServerTimeout,
     env: {
       ...process.env,
       NODE_ENV: 'development',

@@ -97,13 +97,26 @@ async function promptForThirdPartyToggle(rl) {
 
 async function main() {
   const dryRun = process.argv.includes('--dry-run')
+  const workflowArg = process.argv.find((arg) => arg.startsWith('--workflow='))
+  const workflowKey = workflowArg?.slice('--workflow='.length)
+  const includeIntegrationsArg = process.argv.includes('--integrations')
+    ? true
+    : (process.argv.includes('--no-integrations') ? false : undefined)
   const rl = createInterface({ input, output })
 
   let workflow
   let includeIntegrations
   try {
-    workflow = await promptForWorkflowSelection(rl)
-    includeIntegrations = await promptForThirdPartyToggle(rl)
+    if (workflowKey) {
+      workflow = WORKFLOW_OPTIONS.find((option) => option.key === workflowKey)
+      if (!workflow) {
+        throw new Error(`Unknown E2E workflow "${workflowKey}". Valid options: ${WORKFLOW_OPTIONS.map((option) => option.key).join(', ')}`)
+      }
+    } else {
+      workflow = await promptForWorkflowSelection(rl)
+    }
+
+    includeIntegrations = includeIntegrationsArg ?? (await promptForThirdPartyToggle(rl))
   } finally {
     rl.close()
   }

@@ -50,6 +50,29 @@ async function main() {
   })
 
   await db.warehouse.upsert({
+    where: { code: 'CBG' },
+    update: {
+      name: 'Cambridge',
+      type: 'STANDARD',
+      availableForSale: true,
+      syncToStore: false,
+      isDefault: false,
+      defaultReturnWarehouse: false,
+      active: true,
+    },
+    create: {
+      code: 'CBG',
+      name: 'Cambridge',
+      type: 'STANDARD',
+      availableForSale: true,
+      syncToStore: false,
+      isDefault: false,
+      defaultReturnWarehouse: false,
+      active: true,
+    },
+  })
+
+  await db.warehouse.upsert({
     where: { code: 'E2E-SECOND' },
     update: {
       name: 'E2E Secondary',
@@ -86,6 +109,28 @@ async function main() {
       email: E2E_SUPPLIER_EMAIL,
       currency: 'GBP',
       active: true,
+    },
+  })
+
+  await db.customer.upsert({
+    where: { id: 'e2e-customer' },
+    update: {
+      firstName: 'E2E',
+      lastName: 'Customer',
+      email: 'customer@example.com',
+      company: 'OneTwo3D E2E Customer',
+      active: true,
+      archived: false,
+      gdprAnonymisedAt: null,
+    },
+    create: {
+      id: 'e2e-customer',
+      firstName: 'E2E',
+      lastName: 'Customer',
+      email: 'customer@example.com',
+      company: 'OneTwo3D E2E Customer',
+      active: true,
+      archived: false,
     },
   })
 

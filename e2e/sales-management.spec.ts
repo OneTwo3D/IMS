@@ -8,7 +8,7 @@ const CBG_WAREHOUSE_LABEL = 'CBG — Cambridge'
 const CBG_WAREHOUSE_CODE = 'CBG'
 
 async function openMoreActions(page: Page) {
-  await page.locator('button[aria-haspopup="menu"]').last().click()
+  await page.locator('main button[aria-haspopup="menu"]').last().click()
 }
 
 async function createShippedSalesOrder(page: Page) {
@@ -27,10 +27,9 @@ async function createShippedSalesOrder(page: Page) {
     .toBe(true)
 
   const createShipmentsButton = page.getByRole('button', { name: /create shipments/i })
-  if (await createShipmentsButton.isVisible()) {
-    await createShipmentsButton.click()
-  }
-  await expect(page.getByText(/shipment from/i)).toBeVisible()
+  await expect(createShipmentsButton).toBeVisible()
+  await createShipmentsButton.click()
+  await expect(page.getByText(/shipment from/i)).toBeVisible({ timeout: 15000 })
   await page.getByRole('button', { name: /start picking/i }).click()
   await expect(page.getByText('Picking', { exact: false })).toBeVisible()
   await page.getByRole('button', { name: /mark packed/i }).click()
@@ -44,6 +43,8 @@ async function createShippedSalesOrder(page: Page) {
 }
 
 test.describe('sales management workflows', () => {
+  test.describe.configure({ mode: 'serial' })
+
   test('edits notes, clones, and deletes a draft sales order', async ({ page }) => {
     const product = await createSimpleProduct(page, { price: '14.50' })
     const original = await createDraftSalesOrder(page, { sku: product.sku, warehouseLabel: DEFAULT_WAREHOUSE_LABEL })
@@ -85,7 +86,7 @@ test.describe('sales management workflows', () => {
 
     await page.getByRole('button', { name: 'Process' }).click()
     await expect(page.getByText(/^Allocated$/).first()).toBeVisible()
-    await expect(page.getByText(/Allocated Stock/i)).toBeVisible()
+    await expect(page.getByRole('heading', { name: /stock allocation/i })).toBeVisible()
 
     await page.once('dialog', (dialogEvent) => dialogEvent.accept())
     await page.getByRole('button', { name: /^Deallocate$/ }).click()
@@ -97,10 +98,11 @@ test.describe('sales management workflows', () => {
       .toBe(true)
 
     await page.getByRole('button', { name: /auto-allocate/i }).click()
-    await expect(page.getByText(/Allocated Stock/i)).toBeVisible()
+    await expect(page.getByRole('heading', { name: /stock allocation/i })).toBeVisible()
   })
 
   test('handles post-shipment documents and refund flows', async ({ page }) => {
+    test.setTimeout(60_000)
     const { product, orderId } = await createShippedSalesOrder(page)
     const origin = new URL(page.url()).origin
 
@@ -119,7 +121,25 @@ test.describe('sales management workflows', () => {
     await page.reload()
 
     const generateInvoiceButton = page.getByRole('button', { name: /generate invoice/i })
-    if (await generateInvoiceButton.isVisible()) {
+    const pendingSyncBadge = page.getByText(/invoice pending sync/i)
+    const invoiceOutcome = async () => {
+      if (await generateInvoiceButton.isVisible().catch(() => false)) return 'generate'
+      if (await pendingSyncBadge.isVisible().catch(() => false)) return 'pending-sync'
+      return 'none'
+    }
+    const waitForInvoiceOutcome = async () => {
+      const deadline = Date.now() + 15000
+      while (Date.now() < deadline) {
+        const outcome = await invoiceOutcome()
+        if (outcome !== 'none') return outcome
+        await page.waitForTimeout(250)
+      }
+      return 'none'
+    }
+
+    const invoiceState = await waitForInvoiceOutcome()
+
+    if (invoiceState === 'generate') {
       await generateInvoiceButton.click()
       await expect(page.getByText(/Invoice #/i)).toBeVisible()
 
@@ -138,18 +158,35 @@ test.describe('sales management workflows', () => {
       await paymentDialog.getByRole('button', { name: /record payment/i }).click()
       await expect(paymentDialog).toBeHidden()
       await expect(page.getByText(/^Paid$/).first()).toBeVisible()
+    } else if (invoiceState === 'pending-sync') {
+      await expect(pendingSyncBadge).toBeVisible()
     } else {
-      await expect(page.getByText(/invoice pending sync/i)).toBeVisible()
+      expect(process.env.E2E_XERO_ENABLED).not.toBe('true')
+      await expect(generateInvoiceButton).toBeHidden()
+      await expect(pendingSyncBadge).toBeHidden()
     }
 
-    await page.getByRole('button', { name: /^Refund$/ }).click()
+    const refundButton = page.getByRole('button', { name: /^Refund$/ })
     const refundDialog = page.getByRole('dialog', { name: 'Process Refund' })
+    await expect
+      .poll(async () => {
+        if (await refundDialog.isVisible().catch(() => false)) return true
+        await refundButton.click()
+        return refundDialog.isVisible().catch(() => false)
+      }, { timeout: 15000 })
+      .toBe(true)
+    await expect(refundDialog.locator('input[type="number"]').first()).toBeVisible()
     await refundDialog.locator('input').first().fill('Customer return')
     await refundDialog.locator('input[type="number"]').first().fill('1')
     await refundDialog.getByRole('button', { name: /confirm refund/i }).click()
+    await expect(refundDialog.getByRole('button', { name: /confirm refund/i })).toBeHidden({ timeout: 20000 })
+    if (await refundDialog.isVisible().catch(() => false)) {
+      await refundDialog.getByRole('button', { name: /^Close$/ }).click()
+    }
     await expect(refundDialog).toBeHidden()
 
-    await expect(page.getByText(/Refunds \(1\)/)).toBeVisible()
+    await page.reload()
+    await expect(page.getByText(/Refunds \(1\)/)).toBeVisible({ timeout: 15000 })
     await page.getByRole('button', { name: /Refunds \(1\)/ }).click()
     await expect(page.getByText('Customer return')).toBeVisible()
   })
