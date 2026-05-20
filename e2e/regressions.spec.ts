@@ -34,7 +34,7 @@ test('processing shows allocations in the UI without a page reload', async ({ pa
   await page.getByRole('button', { name: 'Process' }).click()
 
   await expect(page.getByRole('button', { name: /create shipments/i })).toBeVisible()
-  await expect(page.getByText(/allocated stock/i)).toBeVisible()
+  await expect(page.getByRole('heading', { name: /stock allocation/i })).toBeVisible()
 })
 
 test('processing allocates stock from the DEFAULT warehouse', async ({ page }) => {
@@ -47,7 +47,7 @@ test('processing allocates stock from the DEFAULT warehouse', async ({ page }) =
   await expect.poll(async () => {
     await page.reload()
     const createShipmentsVisible = await page.getByRole('button', { name: /create shipments/i }).isVisible().catch(() => false)
-    const allocatedStockVisible = await page.getByText(/allocated stock/i).isVisible().catch(() => false)
+    const allocatedStockVisible = await page.getByRole('heading', { name: /stock allocation/i }).isVisible().catch(() => false)
     return createShipmentsVisible && allocatedStockVisible
   }, {
     timeout: 15000,

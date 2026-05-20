@@ -8,7 +8,7 @@ const CBG_WAREHOUSE_LABEL = 'CBG — Cambridge'
 const CBG_WAREHOUSE_CODE = 'CBG'
 
 async function openMoreActions(page: Page) {
-  await page.locator('button[aria-haspopup="menu"]').last().click()
+  await page.locator('main button[aria-haspopup="menu"]').last().click()
 }
 
 async function createShippedSalesOrder(page: Page) {
@@ -27,9 +27,8 @@ async function createShippedSalesOrder(page: Page) {
     .toBe(true)
 
   const createShipmentsButton = page.getByRole('button', { name: /create shipments/i })
-  if (await createShipmentsButton.isVisible()) {
-    await createShipmentsButton.click()
-  }
+  await expect(createShipmentsButton).toBeVisible()
+  await createShipmentsButton.click()
   await expect(page.getByText(/shipment from/i)).toBeVisible()
   await page.getByRole('button', { name: /start picking/i }).click()
   await expect(page.getByText('Picking', { exact: false })).toBeVisible()
@@ -44,6 +43,8 @@ async function createShippedSalesOrder(page: Page) {
 }
 
 test.describe('sales management workflows', () => {
+  test.describe.configure({ mode: 'serial' })
+
   test('edits notes, clones, and deletes a draft sales order', async ({ page }) => {
     const product = await createSimpleProduct(page, { price: '14.50' })
     const original = await createDraftSalesOrder(page, { sku: product.sku, warehouseLabel: DEFAULT_WAREHOUSE_LABEL })
@@ -85,7 +86,7 @@ test.describe('sales management workflows', () => {
 
     await page.getByRole('button', { name: 'Process' }).click()
     await expect(page.getByText(/^Allocated$/).first()).toBeVisible()
-    await expect(page.getByText(/Allocated Stock/i)).toBeVisible()
+    await expect(page.getByRole('heading', { name: /stock allocation/i })).toBeVisible()
 
     await page.once('dialog', (dialogEvent) => dialogEvent.accept())
     await page.getByRole('button', { name: /^Deallocate$/ }).click()
@@ -97,7 +98,7 @@ test.describe('sales management workflows', () => {
       .toBe(true)
 
     await page.getByRole('button', { name: /auto-allocate/i }).click()
-    await expect(page.getByText(/Allocated Stock/i)).toBeVisible()
+    await expect(page.getByRole('heading', { name: /stock allocation/i })).toBeVisible()
   })
 
   test('handles post-shipment documents and refund flows', async ({ page }) => {
