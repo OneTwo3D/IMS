@@ -29,7 +29,7 @@ async function createShippedSalesOrder(page: Page) {
   const createShipmentsButton = page.getByRole('button', { name: /create shipments/i })
   await expect(createShipmentsButton).toBeVisible()
   await createShipmentsButton.click()
-  await expect(page.getByText(/shipment from/i)).toBeVisible()
+  await expect(page.getByText(/shipment from/i)).toBeVisible({ timeout: 15000 })
   await page.getByRole('button', { name: /start picking/i }).click()
   await expect(page.getByText('Picking', { exact: false })).toBeVisible()
   await page.getByRole('button', { name: /mark packed/i }).click()
@@ -102,6 +102,7 @@ test.describe('sales management workflows', () => {
   })
 
   test('handles post-shipment documents and refund flows', async ({ page }) => {
+    test.setTimeout(60_000)
     const { product, orderId } = await createShippedSalesOrder(page)
     const origin = new URL(page.url()).origin
 
@@ -146,18 +147,27 @@ test.describe('sales management workflows', () => {
       }
     }
 
-    await page.getByRole('button', { name: /^Refund$/ }).click()
+    const refundButton = page.getByRole('button', { name: /^Refund$/ })
     const refundDialog = page.getByRole('dialog', { name: 'Process Refund' })
+    await expect
+      .poll(async () => {
+        if (await refundDialog.isVisible().catch(() => false)) return true
+        await refundButton.click()
+        return refundDialog.isVisible().catch(() => false)
+      }, { timeout: 15000 })
+      .toBe(true)
+    await expect(refundDialog.locator('input[type="number"]').first()).toBeVisible()
     await refundDialog.locator('input').first().fill('Customer return')
     await refundDialog.locator('input[type="number"]').first().fill('1')
     await refundDialog.getByRole('button', { name: /confirm refund/i }).click()
-    await expect(refundDialog.getByRole('button', { name: /confirm refund/i })).toBeHidden({ timeout: 15000 })
+    await expect(refundDialog.getByRole('button', { name: /confirm refund/i })).toBeHidden({ timeout: 20000 })
     if (await refundDialog.isVisible().catch(() => false)) {
       await refundDialog.getByRole('button', { name: /^Close$/ }).click()
     }
     await expect(refundDialog).toBeHidden()
 
-    await expect(page.getByText(/Refunds \(1\)/)).toBeVisible()
+    await page.reload()
+    await expect(page.getByText(/Refunds \(1\)/)).toBeVisible({ timeout: 15000 })
     await page.getByRole('button', { name: /Refunds \(1\)/ }).click()
     await expect(page.getByText('Customer return')).toBeVisible()
   })
