@@ -10,6 +10,7 @@ const PORT = Number(process.env.E2E_PORT ?? 3001)
 const baseURL = process.env.E2E_BASE_URL ?? `http://localhost:${PORT}`
 const webServerURL = `${baseURL.replace(/\/$/, '')}/login`
 const webServerTimeout = Number(process.env.E2E_WEB_SERVER_TIMEOUT_MS ?? 120000)
+const configuredWorkers = process.env.E2E_WORKERS ? Number(process.env.E2E_WORKERS) : undefined
 
 // Specs that mutate shared integration settings
 // (WooCommerce credentials, Mintsoft connection/plugin state, warehouse sync
@@ -31,7 +32,7 @@ export default defineConfig({
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 2 : 0,
-  workers: process.env.CI ? 2 : undefined,
+  workers: configuredWorkers ?? (process.env.CI ? 2 : undefined),
   reporter: process.env.CI ? [['html'], ['list']] : 'list',
   use: {
     baseURL,

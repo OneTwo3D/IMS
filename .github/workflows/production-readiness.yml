@@ -67,6 +67,7 @@ jobs:
       E2E_TEST_MODE: "1"
       E2E_ROUTE_SECRET: ${{ secrets.E2E_ROUTE_SECRET || 'e2e-route-secret' }}
       E2E_WEB_SERVER_TIMEOUT_MS: "240000"
+      E2E_WORKERS: "1"
     services:
       postgres:
         image: postgres:14.13
