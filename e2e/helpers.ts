@@ -152,6 +152,7 @@ export async function createDraftSalesOrder(
 
   const customerSelect = dialog.locator('select').first()
   const customerName = ((await customerSelect.locator('option').nth(1).textContent()) ?? '').trim()
+  const customerFullName = customerName.replace(/\s+\(.+\)$/, '')
   await customerSelect.selectOption({ index: 1 })
 
   if (opts.warehouseLabel) {
@@ -164,7 +165,7 @@ export async function createDraftSalesOrder(
 
   await page.waitForURL(/\/sales\/.+/)
   return {
-    customerName,
+    customerName: customerFullName,
     orderUrl: page.url(),
   }
 }
