@@ -15,6 +15,7 @@
     "check:decimal-boundaries": "node scripts/check-domain-decimal-boundaries.mjs",
     "docs:workflows": "tsx scripts/generate-workflow-docs.ts",
     "docs:workflows:check": "tsx scripts/generate-workflow-docs.ts --check",
+    "preflight:production": "tsx scripts/preflight-production.ts",
     "validate": "bash scripts/validate-local.sh",
     "validate:db": "bash scripts/validate-db.sh",
     "db:migrate:status": "bash scripts/prisma-dev-db.sh status",

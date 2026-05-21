@@ -66,6 +66,59 @@ jobs:
       - run: npx prisma generate --schema prisma/schema.prisma
       - run: npm run validate
 
+  docs-workflows:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run docs:workflows:check
+
+  preflight-production:
+    needs: classify_changes
+    if: needs.classify_changes.outputs.run_expensive == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      AUTH_URL: https://localhost:3001
+      NEXT_PUBLIC_APP_URL: https://localhost:3001
+      DATABASE_URL: postgresql://imsuser:password@localhost:5432/ims_ci
+      BACKUP_DIR: /tmp/ims-preflight/backups
+      UPLOAD_STORAGE_DIR: /tmp/ims-preflight/uploads
+      PUBLIC_UPLOAD_STORAGE_DIR: /tmp/ims-preflight/public-uploads
+      FILE_SCAN_MODE: disabled
+      ALLOW_DATABASE_RESTORE: "false"
+      ALLOW_DATABASE_RESTORE_UPLOAD: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Create writable production storage placeholders
+        run: |
+          mkdir -p \
+            "$BACKUP_DIR" \
+            "$UPLOAD_STORAGE_DIR/invoices" \
+            "$UPLOAD_STORAGE_DIR/quarantine/invoices" \
+            "$PUBLIC_UPLOAD_STORAGE_DIR/avatars" \
+            "$PUBLIC_UPLOAD_STORAGE_DIR/branding"
+      - name: Verify disabled scanner preflight
+        run: npm run preflight:production
+        env:
+          NODE_ENV: production
+      - name: Verify command scanner preflight
+        run: npm run preflight:production
+        env:
+          NODE_ENV: production
+          FILE_SCAN_MODE: command
+          FILE_SCAN_COMMAND_ARGV: '["true","{file}"]'
+
   build:
     needs: classify_changes
     if: needs.classify_changes.outputs.run_expensive == 'true'
