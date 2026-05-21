@@ -124,6 +124,20 @@ such as `DATABASE_URL` and `AUTH_SECRET` are not inherited. The admin health
 endpoint runs a short scanner smoke check in command mode so misconfigured
 scanner commands are visible before the first invoice upload.
 
+Before starting or rolling a production instance, run:
+
+```bash
+NODE_ENV=production npm run preflight:production
+```
+
+The preflight checks required secrets, production URLs, PostgreSQL URL shape,
+explicit persistent storage paths, writable upload/backup directories, scanner
+policy and command health, trusted proxy configuration when
+`REQUIRE_TRUSTED_PROXY_CONFIG=true`, and database-restore kill switches. Set
+`PREFLIGHT_DB_CONNECT=true` during production rollout when the preflight process
+can reach Postgres; this adds a short `SELECT 1` connectivity probe. It prints
+variable names and status messages only; it does not print secret values.
+
 
 ## Application Service Management
 
@@ -199,6 +213,8 @@ Authentication note:
 - if you add a second web instance or separate worker handling auth routes, move rate limiting to shared storage such as Redis before doing so
 - if you deploy behind OpenLiteSpeed or another upstream proxy, strip/replace incoming `X-Forwarded-For` before proxying to the app tier
 - set `TRUSTED_PROXY_IPS` / `TRUSTED_PROXY_CIDRS` so the app can walk the forwarded chain from right to left and ignore internal proxy hops
+- set `REQUIRE_TRUSTED_PROXY_CONFIG=true` so `npm run preflight:production`
+  fails if trusted proxy entries are missing on a proxied production deploy
 
 
 ## Updating
@@ -249,6 +265,7 @@ Key variables in the `.env` file:
 | `ENCRYPTION_KEY` | Legacy fallback for older installs; keep set to the same value during migration if existing `enc:v1` secrets are present |
 | `AUTH_URL` | Authentication callback URL (same as app URL) |
 | `DATABASE_URL` | PostgreSQL connection string |
+| `PREFLIGHT_DB_CONNECT` | Optional production preflight database connectivity probe. Set `true` during rollout when the preflight process can reach Postgres; default `false` for build-only CI jobs |
 | `REDIS_URL` | Redis connection URL |
 | `REDIS_PASSWORD` | Redis password (if required) |
 | `REDIS_KEY_PREFIX` | Optional Redis namespace prefix for tenant- or instance-scoped keys |
@@ -266,6 +283,8 @@ Key variables in the `.env` file:
 | `FX_BASE_CURRENCY` | Installer/default base currency seed for first-run setup. In normal use, the live system base currency is set once in **Settings > Company**. |
 | `PDF_TEMP_DIR` | Temporary directory for PDF generation |
 | `BACKUP_DIR` | Local backup storage directory |
+| `ALLOW_DATABASE_RESTORE` | Production restore kill switch; leave `false` except during a supervised restore window |
+| `ALLOW_DATABASE_RESTORE_UPLOAD` | Additional kill switch for uploaded SQL restore files; leave `false` except during a supervised restore window |
 | `UPLOAD_MAX_SIZE_MB` | Maximum upload file size in MB (default: `10`) |
 | `UPLOAD_STORAGE_DIR` | Persistent private upload root. Defaults locally to `./uploads` when unset |
 | `PUBLIC_UPLOAD_STORAGE_DIR` | Persistent branding/avatar upload root. Defaults locally to `./public/uploads` when unset |
@@ -277,6 +296,7 @@ Key variables in the `.env` file:
 | `FILE_SCAN_TIMEOUT_MS` | Scan command timeout in milliseconds (default: `30000`; raise for large PDFs or busy scanners) |
 | `CRON_SECRET` | Shared secret for authenticating cron endpoint requests |
 | `ALLOW_LOCALHOST_CRON_BYPASS` | Set to `true` only if production cron requests must be allowed from localhost without the bearer header and `CRON_SECRET` is unset; default is `false` |
+| `REQUIRE_TRUSTED_PROXY_CONFIG` | Set to `true` on proxied production deployments so preflight fails when `TRUSTED_PROXY_IPS` / `TRUSTED_PROXY_CIDRS` are empty |
 | `INVARIANT_CHECK_PAGE_SIZE` | Optional page size for the scheduled invariant check inventory SQL collector. Default `500`; raise temporarily only for production triage. |
 | `INVARIANT_CHECK_MAX_FINDINGS` | Optional maximum inventory invariant findings collected by the scheduled invariant check. Default `5000`; when the cap is hit, the report adds a critical truncation finding. |
 | `SMTP_HOST` | SMTP server hostname if you choose to manage mail via env rather than app settings |
