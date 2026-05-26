@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -13,11 +13,8 @@ import {
   createBackupRestoreGetHandler,
   createBackupRestorePostHandler,
   type BackupRestoreHandlerDeps,
+  type RestoreLogEntry,
 } from '../../app/api/backup/restore/route.ts'
-
-type ActivityEntry = NonNullable<BackupRestoreHandlerDeps['log']> extends (entry: infer Entry) => Promise<void>
-  ? Entry
-  : never
 
 const adminSession = {
   user: {
@@ -33,12 +30,13 @@ function productionEnv() {
 }
 
 function baseDeps(overrides: BackupRestoreHandlerDeps = {}) {
-  const activityLogs: ActivityEntry[] = []
+  const activityLogs: RestoreLogEntry[] = []
   const calls = {
     userFindUnique: 0,
     mailer: 0,
     setToken: 0,
     consumeToken: 0,
+    deleteToken: 0,
     enableMaintenance: 0,
     disableMaintenance: 0,
     runRestore: 0,
@@ -67,6 +65,9 @@ function baseDeps(overrides: BackupRestoreHandlerDeps = {}) {
       calls.consumeToken += 1
       return 'admin-1'
     },
+    deleteRestoreToken: async () => {
+      calls.deleteToken += 1
+    },
     enableMaintenance: async () => {
       calls.enableMaintenance += 1
     },
@@ -94,9 +95,11 @@ function sameOriginRequest(body: BodyInit): NextRequest {
 }
 
 function existingBackupBody(filename = 'backup.sql'): URLSearchParams {
+  // The existing-backup branch uses urlencoded form data so these tests do not
+  // need multipart setup when no file upload is involved.
   return new URLSearchParams({
     confirm: 'RESTORE',
-    restoreToken: 'ABCDEF',
+    restoreToken: 'ABCDEF12',
     filename,
   })
 }
@@ -105,7 +108,7 @@ async function responseJson(response: Response): Promise<Record<string, unknown>
   return await response.json() as Record<string, unknown>
 }
 
-function metadataReason(entry: ActivityEntry): unknown {
+function metadataReason(entry: RestoreLogEntry): unknown {
   return (entry.metadata as { reason?: unknown } | null | undefined)?.reason
 }
 
@@ -133,11 +136,60 @@ test('production restore code issuance is disabled by default and logs a warning
   }])
 })
 
+test('production restore code issuance removes the one-time token when email delivery fails', async () => {
+  const { deps, calls } = baseDeps({
+    env: {
+      ...productionEnv(),
+      ALLOW_DATABASE_RESTORE: 'true',
+    },
+    mailer: async () => {
+      calls.mailer += 1
+      return { success: false, error: 'smtp down' }
+    },
+  })
+  const handler = createBackupRestoreGetHandler(deps)
+
+  const response = await handler()
+  const body = await responseJson(response)
+
+  assert.equal(response.status, 500)
+  assert.equal(body.error, 'smtp down')
+  assert.equal(calls.setToken, 1)
+  assert.equal(calls.deleteToken, 1)
+})
+
 test('cross-origin production restore POST is denied and logged before the production kill switch', async () => {
   const { deps, calls, activityLogs } = baseDeps()
   const handler = createBackupRestorePostHandler(deps)
 
   const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', { method: 'POST' }))
+  const body = await responseJson(response)
+
+  assert.equal(response.status, 403)
+  assert.equal(body.error, 'Cross-site restore requests are not allowed.')
+  assert.equal(calls.consumeToken, 0)
+  assert.equal(calls.runRestore, 0)
+  assert.equal(activityLogs.length, 1)
+  assert.equal(metadataReason(activityLogs[0]), 'cross_origin_restore_request')
+})
+
+test('cross-origin restore POST remains denied when both production restore flags are enabled', async () => {
+  const { deps, calls, activityLogs } = baseDeps({
+    env: {
+      ...productionEnv(),
+      ALLOW_DATABASE_RESTORE: 'true',
+      ALLOW_DATABASE_RESTORE_UPLOAD: 'true',
+    },
+  })
+  const handler = createBackupRestorePostHandler(deps)
+
+  const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', {
+    method: 'POST',
+    headers: {
+      origin: 'https://attacker.example.test',
+    },
+    body: existingBackupBody('backup.sql'),
+  }))
   const body = await responseJson(response)
 
   assert.equal(response.status, 403)
@@ -242,7 +294,7 @@ test('uploaded production restore denied by the upload kill switch keeps the ema
     await writeFile(path.join(root, 'backup.sql'), 'select 1;\n')
     const form = new FormData()
     form.set('confirm', 'RESTORE')
-    form.set('restoreToken', 'ABCDEF')
+    form.set('restoreToken', 'ABCDEF12')
     form.set('file', new File(['select 1;\n'], 'sensitive-upload.sql', { type: 'application/sql' }))
 
     const { deps, calls, activityLogs } = baseDeps({
@@ -272,6 +324,7 @@ test('uploaded production restore denied by the upload kill switch keeps the ema
     assert.equal(activityLogs.length, 1)
     assert.equal(metadataReason(activityLogs[0]), 'production_upload_restore_disabled')
     assert.doesNotMatch(activityLogs[0].description, /sensitive-upload/)
+    assert.equal(JSON.stringify(activityLogs[0].metadata).includes('sensitive-upload'), false)
 
     const retryResponse = await handler(sameOriginRequest(existingBackupBody('backup.sql')))
     const retryBody = await responseJson(retryResponse)
@@ -290,7 +343,7 @@ test('enabled production upload restore writes a temporary file, runs restore, a
   try {
     const form = new FormData()
     form.set('confirm', 'RESTORE')
-    form.set('restoreToken', 'ABCDEF')
+    form.set('restoreToken', 'ABCDEF12')
     form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
 
     let tempPath = ''
@@ -323,8 +376,107 @@ test('enabled production upload restore writes a temporary file, runs restore, a
     assert.equal(body.success, true)
     assert.equal(calls.consumeToken, 1)
     assert.equal(calls.runRestore, 1)
+    assert.equal(calls.disableMaintenance, 1)
     assert.equal(path.basename(tempPath), 'restore-upload-1234567890.sql')
     await assert.rejects(stat(tempPath), { code: 'ENOENT' })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('failed production upload restore disables maintenance and removes the temporary file', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-upload-failure-test-'))
+  try {
+    const form = new FormData()
+    form.set('confirm', 'RESTORE')
+    form.set('restoreToken', 'ABCDEF12')
+    form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
+
+    let tempPath = ''
+    const { deps, calls } = baseDeps({
+      backupDir: root,
+      env: {
+        ...productionEnv(),
+        ALLOW_DATABASE_RESTORE: 'true',
+        ALLOW_DATABASE_RESTORE_UPLOAD: 'true',
+      },
+      runRestoreFile: async (filePath) => {
+        calls.runRestore += 1
+        tempPath = filePath
+        await stat(filePath)
+        throw new Error('psql failed')
+      },
+    })
+    const handler = createBackupRestorePostHandler(deps)
+
+    const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', {
+      method: 'POST',
+      headers: {
+        origin: 'https://ims.example.test',
+        'content-length': '100',
+      },
+      body: form,
+    }))
+    const body = await responseJson(response)
+
+    assert.equal(response.status, 500)
+    assert.equal(body.error, 'Restore failed: psql failed')
+    assert.equal(calls.consumeToken, 1)
+    assert.equal(calls.enableMaintenance, 1)
+    assert.equal(calls.disableMaintenance, 1)
+    assert.equal(calls.runRestore, 1)
+    await assert.rejects(stat(tempPath), { code: 'ENOENT' })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('maintenance-start failure still runs disable-maintenance cleanup and removes the temporary file', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-maintenance-failure-test-'))
+  try {
+    const form = new FormData()
+    form.set('confirm', 'RESTORE')
+    form.set('restoreToken', 'ABCDEF12')
+    form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
+
+    let tempPath = ''
+    const { deps, calls } = baseDeps({
+      backupDir: root,
+      env: {
+        ...productionEnv(),
+        ALLOW_DATABASE_RESTORE: 'true',
+        ALLOW_DATABASE_RESTORE_UPLOAD: 'true',
+      },
+      enableMaintenance: async () => {
+        calls.enableMaintenance += 1
+        throw new Error('maintenance failed')
+      },
+      runRestoreFile: async (filePath) => {
+        calls.runRestore += 1
+        tempPath = filePath
+      },
+    })
+    const handler = createBackupRestorePostHandler(deps)
+
+    const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', {
+      method: 'POST',
+      headers: {
+        origin: 'https://ims.example.test',
+        'content-length': '100',
+      },
+      body: form,
+    }))
+    const body = await responseJson(response)
+    const remainingFiles = await readdir(root)
+
+    assert.equal(response.status, 500)
+    assert.equal(body.error, 'Restore failed: maintenance failed')
+    assert.equal(calls.consumeToken, 1)
+    assert.equal(calls.enableMaintenance, 1)
+    assert.equal(calls.disableMaintenance, 1)
+    assert.equal(calls.runRestore, 0)
+    assert.equal(tempPath, '')
+    assert.deepEqual(remainingFiles, [])
   } finally {
     await rm(root, { recursive: true, force: true })
   }

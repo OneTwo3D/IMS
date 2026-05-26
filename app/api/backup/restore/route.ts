@@ -13,7 +13,7 @@ import { requireApiAdmin } from '@/lib/auth/server'
 import { getBackupDir } from '@/lib/backup-storage'
 import { disableMaintenanceMode, enableMaintenanceMode } from '@/lib/maintenance-mode'
 import { sendEmail } from '@/lib/mailer'
-import { consumeAuthToken, setAuthToken } from '@/lib/auth/token-store'
+import { consumeAuthToken, deleteAuthToken, setAuthToken } from '@/lib/auth/token-store'
 import { db } from '@/lib/db'
 
 const BACKUP_DIR = getBackupDir()
@@ -37,8 +37,9 @@ type RestoreUserClient = {
   findUnique(args: { where: { id: string }; select: { email: true } }): Promise<{ email: string | null } | null>
 }
 
-type RestoreLogEntry = Parameters<typeof logActivity>[0]
+export type RestoreLogEntry = Parameters<typeof logActivity>[0]
 
+/** @internal Test seam for route-handler unit tests; not an application API. */
 export type BackupRestoreHandlerDeps = {
   authorize?: RestoreAuthorizer
   users?: RestoreUserClient
@@ -48,6 +49,7 @@ export type BackupRestoreHandlerDeps = {
   mailer?: typeof sendEmail
   setRestoreToken?: typeof setAuthToken
   consumeRestoreToken?: typeof consumeAuthToken
+  deleteRestoreToken?: typeof deleteAuthToken
   enableMaintenance?: typeof enableMaintenanceMode
   disableMaintenance?: typeof disableMaintenanceMode
   runRestoreFile?: typeof runRestore
@@ -55,6 +57,7 @@ export type BackupRestoreHandlerDeps = {
 }
 
 function isTruthy(value: string | undefined): boolean {
+  // Unknown values fail closed. Only explicit opt-in strings enable restore gates.
   return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase())
 }
 
@@ -216,12 +219,15 @@ function withDefaults(deps: BackupRestoreHandlerDeps = {}): RequiredRestoreDeps 
   return {
     authorize: deps.authorize ?? requireApiAdmin,
     users: deps.users ?? db.user,
+    // Keep the production route wired to the live process.env object so runtime
+    // restore-window changes are observed without rebuilding handlers.
     env: deps.env ?? process.env,
     backupDir: deps.backupDir ?? BACKUP_DIR,
     log: deps.log ?? logActivity,
     mailer: deps.mailer ?? sendEmail,
     setRestoreToken: deps.setRestoreToken ?? setAuthToken,
     consumeRestoreToken: deps.consumeRestoreToken ?? consumeAuthToken,
+    deleteRestoreToken: deps.deleteRestoreToken ?? deleteAuthToken,
     enableMaintenance: deps.enableMaintenance ?? enableMaintenanceMode,
     disableMaintenance: deps.disableMaintenance ?? disableMaintenanceMode,
     runRestoreFile: deps.runRestoreFile ?? runRestore,
@@ -249,13 +255,15 @@ export function createBackupRestoreGetHandler(deps: BackupRestoreHandlerDeps = {
     }
 
     const restoreToken = randomBytes(4).toString('hex').toUpperCase()
-    await resolvedDeps.setRestoreToken(`backup_restore:${restoreToken}`, session.user.id, RESTORE_TOKEN_TTL_MS)
+    const restoreTokenKey = `backup_restore:${restoreToken}`
+    await resolvedDeps.setRestoreToken(restoreTokenKey, session.user.id, RESTORE_TOKEN_TTL_MS)
     const mail = await resolvedDeps.mailer({
       to: email,
       subject: 'Backup restore confirmation code',
       html: formatRestoreEmail(restoreToken),
     })
     if (!mail.success) {
+      await resolvedDeps.deleteRestoreToken(restoreTokenKey)
       return NextResponse.json({ error: mail.error ?? 'Failed to send restore confirmation email.' }, { status: 500 })
     }
 
@@ -299,7 +307,7 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
     if (confirm !== 'RESTORE') {
       return NextResponse.json({ error: 'Restore confirmation missing.' }, { status: 400 })
     }
-    if (typeof restoreToken !== 'string' || restoreToken.trim().length < 6) {
+    if (typeof restoreToken !== 'string' || !/^[0-9A-Fa-f]{8}$/.test(restoreToken.trim())) {
       return NextResponse.json({ error: 'Restore email code missing.' }, { status: 400 })
     }
 
@@ -373,17 +381,16 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
     try {
       await resolvedDeps.enableMaintenance(`Database restore requested by admin ${session.user.id}`)
       await resolvedDeps.runRestoreFile(restorePath, restoreDbConfig)
-      await resolvedDeps.disableMaintenance()
       await resolvedDeps.log({
         entityType: 'SYSTEM',
         tag: 'system',
         action: 'backup_restored',
         level: 'WARNING',
+        // For uploads this is the generated temp filename, never user input.
         description: `Restored database from backup: ${path.basename(restorePath)}`,
       })
       return NextResponse.json({ success: true })
     } catch (error) {
-      await resolvedDeps.disableMaintenance()
       const message = error instanceof Error ? error.message : String(error)
       await resolvedDeps.log({
         entityType: 'SYSTEM',
