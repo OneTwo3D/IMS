@@ -268,13 +268,14 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
   return async function POST(req: NextRequest) {
     const session = await resolvedDeps.authorize()
     if (session instanceof NextResponse) return session
+    if (!isSameOriginRequest(req)) {
+      await logDeniedRestoreAttempt(resolvedDeps, session.user.id, 'cross_origin_restore_request')
+      return NextResponse.json({ error: 'Cross-site restore requests are not allowed.' }, { status: 403 })
+    }
+
     if (!isProductionRestoreAllowed(resolvedDeps.env)) {
       await logDeniedRestoreAttempt(resolvedDeps, session.user.id, 'production_restore_disabled')
       return restoreDisabledResponse()
-    }
-
-    if (!isSameOriginRequest(req)) {
-      return NextResponse.json({ error: 'Cross-site restore requests are not allowed.' }, { status: 403 })
     }
 
     const contentType = req.headers.get('content-type') ?? ''
@@ -313,16 +314,16 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
         await logDeniedRestoreAttempt(resolvedDeps, session.user.id, 'production_upload_restore_disabled')
         return NextResponse.json({ error: 'Uploaded database restore is disabled in production.' }, { status: 403 })
       }
-      const restoreTokenUserId = await resolvedDeps.consumeRestoreToken(`backup_restore:${restoreToken.trim().toUpperCase()}`)
-      if (restoreTokenUserId !== session.user.id) {
-        return NextResponse.json({ error: 'Restore email code invalid or expired.' }, { status: 400 })
-      }
-      // Uploaded file
       if (!file.name.endsWith('.sql')) {
         return NextResponse.json({ error: 'Invalid file type. Only plain SQL (.sql) backups are supported. PostgreSQL custom-format .dump files require pg_restore and are not supported.' }, { status: 400 })
       }
       if (file.size > MAX_RESTORE_FILE_BYTES) {
         return NextResponse.json({ error: 'Restore file is too large.' }, { status: 413 })
+      }
+      // Validate upload policy and shape before consuming the one-time email code.
+      const restoreTokenUserId = await resolvedDeps.consumeRestoreToken(`backup_restore:${restoreToken.trim().toUpperCase()}`)
+      if (restoreTokenUserId !== session.user.id) {
+        return NextResponse.json({ error: 'Restore email code invalid or expired.' }, { status: 400 })
       }
       await mkdir(resolvedDeps.backupDir, { recursive: true })
       restorePath = path.join(resolvedDeps.backupDir, `restore-upload-${resolvedDeps.now()}.sql`)
@@ -333,11 +334,6 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       )
       uploadedTempFile = true
     } else if (filename) {
-      const restoreTokenUserId = await resolvedDeps.consumeRestoreToken(`backup_restore:${restoreToken.trim().toUpperCase()}`)
-      if (restoreTokenUserId !== session.user.id) {
-        return NextResponse.json({ error: 'Restore email code invalid or expired.' }, { status: 400 })
-      }
-      // Existing backup file
       if (!filename.endsWith('.sql')) {
         return NextResponse.json({ error: 'Invalid backup filename.' }, { status: 400 })
       }
@@ -354,6 +350,10 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       const fileInfo = await stat(restorePath)
       if (fileInfo.size > MAX_RESTORE_FILE_BYTES) {
         return NextResponse.json({ error: 'Restore file is too large.' }, { status: 413 })
+      }
+      const restoreTokenUserId = await resolvedDeps.consumeRestoreToken(`backup_restore:${restoreToken.trim().toUpperCase()}`)
+      if (restoreTokenUserId !== session.user.id) {
+        return NextResponse.json({ error: 'Restore email code invalid or expired.' }, { status: 400 })
       }
     } else {
       return NextResponse.json({ error: 'No file provided.' }, { status: 400 })
