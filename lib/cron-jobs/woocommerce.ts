@@ -12,4 +12,14 @@ registerCronJobs([
     defaultEnabled: true,
     legacyEnabledKey: 'cron_wc_sync_enabled',
   },
+  {
+    slug: 'shopping-webhook-inbox',
+    settingKey: 'shopping_webhook_inbox',
+    module: 'woocommerce',
+    moduleLabel: 'WooCommerce',
+    label: 'WooCommerce Webhook Inbox',
+    description: 'Processes persisted WooCommerce order, product, and refund webhook events outside the public request path.',
+    defaultSchedule: '*/5 * * * *',
+    defaultEnabled: false,
+  },
 ])

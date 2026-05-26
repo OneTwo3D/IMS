@@ -10,6 +10,10 @@ import {
   handleWcWebhook,
   type WcWebhookDependencies,
 } from '../../lib/connectors/woocommerce/webhooks.ts'
+import type {
+  WcWebhookEventRepository,
+  WcWebhookEventRow,
+} from '../../lib/connectors/woocommerce/webhook-inbox.ts'
 import {
   handleWebhook as handleShopifyWebhook,
 } from '../../lib/connectors/shopify/index.ts'
@@ -46,6 +50,22 @@ function wcDependencies(overrides: Partial<WcWebhookDependencies> = {}): WcWebho
   const unreachable = (name: string) => async () => {
     throw new Error(`${name} should not run`)
   }
+  const event: WcWebhookEventRow = {
+    id: 'wc-webhook-event-1',
+    connector: 'woocommerce',
+    resource: 'products',
+    externalEventId: null,
+    topic: 'product.updated',
+    payloadHash: 'hash',
+    payloadJson: {},
+    status: 'PENDING',
+    attempts: 0,
+    nextAttemptAt: null,
+    processedAt: null,
+    lastError: null,
+    receivedAt: new Date('2026-05-26T00:00:00.000Z'),
+    updatedAt: new Date('2026-05-26T00:00:00.000Z'),
+  }
 
   return {
     async getMaintenanceModeResponse() {
@@ -55,6 +75,13 @@ function wcDependencies(overrides: Partial<WcWebhookDependencies> = {}): WcWebho
       return signature === wcSignature(body)
     },
     async recordWebhookReceipt() {},
+    async getWebhookProcessingGate() {
+      return { enabled: true }
+    },
+    async persistWebhookEvent() {
+      return { status: 'created', event }
+    },
+    webhookEventRepository: undefined as unknown as WcWebhookEventRepository,
     handleOrderWebhook: unreachable('order handler'),
     async handleProductWebhook(payload) {
       assert.equal(typeof payload, 'object')
@@ -314,9 +341,9 @@ test('WooCommerce webhook returns 400 for malformed signed order and refund JSON
   }
 })
 
-test('WooCommerce webhook dispatches valid signed JSON fixtures', async () => {
+test('WooCommerce webhook persists valid signed JSON fixtures without inline processing', async () => {
   const rawBody = JSON.stringify({ id: 123, sku: 'SKU-1', type: 'simple', name: 'Product', status: 'publish' })
-  let handledPayload: unknown
+  let persistedPayload: unknown
 
   const response = await handleWcWebhook(
     'products',
@@ -326,16 +353,136 @@ test('WooCommerce webhook dispatches valid signed JSON fixtures', async () => {
     }),
     rawBody,
     wcDependencies({
-      async handleProductWebhook(payload) {
-        handledPayload = payload
-        return Response.json({ ok: true })
+      async persistWebhookEvent(_repository, input) {
+        persistedPayload = input.payload
+        return {
+          status: 'created',
+          event: {
+            id: 'wc-webhook-event-1',
+            connector: 'woocommerce',
+            resource: input.resource,
+            externalEventId: input.externalEventId ?? null,
+            topic: input.topic,
+            payloadHash: 'hash',
+            payloadJson: input.payload,
+            status: 'PENDING',
+            attempts: 0,
+            nextAttemptAt: null,
+            processedAt: null,
+            lastError: null,
+            receivedAt: new Date('2026-05-26T00:00:00.000Z'),
+            updatedAt: new Date('2026-05-26T00:00:00.000Z'),
+          },
+        }
       },
     }),
   )
 
-  assert.equal(response.status, 200)
-  assert.deepEqual(handledPayload, JSON.parse(rawBody))
-  assert.deepEqual(await response.json(), { ok: true })
+  assert.equal(response.status, 202)
+  assert.deepEqual(persistedPayload, JSON.parse(rawBody))
+  assert.deepEqual(await response.json(), {
+    accepted: true,
+    queued: true,
+    duplicate: false,
+    eventId: 'wc-webhook-event-1',
+  })
+})
+
+test('WooCommerce webhook accepts but does not queue when WC sync is disabled', async () => {
+  const rawBody = JSON.stringify({ id: 123, sku: 'SKU-1', type: 'simple', name: 'Product', status: 'publish' })
+  let persisted = false
+
+  const response = await handleWcWebhook(
+    'products',
+    shoppingRequest('woocommerce', 'products', rawBody, {
+      'x-wc-webhook-topic': 'product.updated',
+      'x-wc-webhook-signature': wcSignature(rawBody),
+    }),
+    rawBody,
+    wcDependencies({
+      async getWebhookProcessingGate() {
+        return { enabled: false, reason: 'wc_sync_disabled' }
+      },
+      async persistWebhookEvent() {
+        persisted = true
+        throw new Error('persist should not run')
+      },
+    }),
+  )
+
+  assert.equal(response.status, 202)
+  assert.equal(persisted, false)
+  assert.deepEqual(await response.json(), {
+    accepted: true,
+    queued: false,
+    skipped: true,
+    reason: 'wc_sync_disabled',
+  })
+})
+
+test('WooCommerce webhook returns accepted duplicate responses for repeated payloads', async () => {
+  const rawBody = JSON.stringify({ id: 123, sku: 'SKU-1', type: 'simple', name: 'Product', status: 'publish' })
+
+  const response = await handleWcWebhook(
+    'products',
+    shoppingRequest('woocommerce', 'products', rawBody, {
+      'x-wc-webhook-topic': 'product.updated',
+      'x-wc-webhook-signature': wcSignature(rawBody),
+    }),
+    rawBody,
+    wcDependencies({
+      async persistWebhookEvent(_repository, input) {
+        return {
+          status: 'duplicate',
+          event: {
+            id: 'wc-webhook-event-1',
+            connector: 'woocommerce',
+            resource: input.resource,
+            externalEventId: input.externalEventId ?? null,
+            topic: input.topic,
+            payloadHash: 'hash',
+            payloadJson: input.payload,
+            status: 'PENDING',
+            attempts: 0,
+            nextAttemptAt: null,
+            processedAt: null,
+            lastError: null,
+            receivedAt: new Date('2026-05-26T00:00:00.000Z'),
+            updatedAt: new Date('2026-05-26T00:00:00.000Z'),
+          },
+        }
+      },
+    }),
+  )
+
+  assert.equal(response.status, 202)
+  assert.deepEqual(await response.json(), {
+    accepted: true,
+    queued: false,
+    duplicate: true,
+    eventId: 'wc-webhook-event-1',
+  })
+})
+
+test('WooCommerce webhook propagates unexpected persistence failures', async () => {
+  const rawBody = JSON.stringify({ id: 123, sku: 'SKU-1', type: 'simple', name: 'Product', status: 'publish' })
+
+  await assert.rejects(
+    () => handleWcWebhook(
+      'products',
+      shoppingRequest('woocommerce', 'products', rawBody, {
+        'x-wc-webhook-topic': 'product.updated',
+        'x-wc-webhook-signature': wcSignature(rawBody),
+      }),
+      rawBody,
+      wcDependencies({
+        async persistWebhookEvent() {
+          throw new Error('database unavailable')
+        },
+      }),
+    ),
+    /database unavailable/,
+  )
 })
 
 test('Shopify webhook rejects unsigned requests before parsing JSON', async () => {

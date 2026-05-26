@@ -1,11 +1,11 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
 
 import { apiRouteAccessValues, apiRouteAuthPolicy } from '../../lib/security/route-auth-policy.ts'
-import { apiRoutePathFromFile, discoverApiRoutePaths } from '../../scripts/list-api-routes.ts'
+import { apiRoutePathFromFile, discoverApiRouteFiles, discoverApiRoutePaths } from '../../scripts/list-api-routes.ts'
 
 test('all API routes are present in the authorization policy map', async () => {
   const discoveredRoutes = await discoverApiRoutePaths()
@@ -33,6 +33,19 @@ test('public and internal routes document why they can be reached without a norm
       /public|oauth|e2e|development|health|signed|auth\.js/i,
       `${route} needs an explicit public/internal access rationale`,
     )
+  }
+})
+
+test('cron-secret routes call verifyCron before doing cron work', async () => {
+  const files = await discoverApiRouteFiles()
+  const fileByRoute = new Map(files.map((file) => [apiRoutePathFromFile(file), file]))
+
+  for (const [route, policy] of Object.entries(apiRouteAuthPolicy)) {
+    if (policy.access !== 'cron-secret') continue
+    const file = fileByRoute.get(route)
+    assert.ok(file, `${route} route file was not discovered`)
+    const source = await readFile(file, 'utf8')
+    assert.match(source, /verifyCron\s*\(/, `${route} must enforce verifyCron at runtime`)
   }
 })
 
