@@ -3,6 +3,7 @@
  */
 
 import { getAccessToken } from './auth'
+import { connectorFetch } from '@/lib/security/connector-fetch'
 
 const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
 const XERO_MAX_RETRIES = 3
@@ -77,7 +78,7 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
     await waitForBudget(auth.tenantId)
     noteRequest(auth.tenantId)
 
-    const res = await fetch(url, init)
+    const res = await connectorFetch(url, init, { connectorName: 'Xero' })
     if (res.status !== 429) return res
 
     lastRateLimitMs = Math.max(parseRetryAfterMs(res.headers.get('Retry-After')), 1000 * 2 ** attempt)

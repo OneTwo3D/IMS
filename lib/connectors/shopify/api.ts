@@ -1,6 +1,7 @@
 import { createHmac, timingSafeEqual } from 'node:crypto'
 
 import type { ConnectorCredentials } from '@/lib/connectors/types'
+import { connectorFetch } from '@/lib/security/connector-fetch'
 import { getShopifySettings } from './settings'
 
 const SHOPIFY_API_VERSION = '2025-01'
@@ -104,15 +105,14 @@ export async function shopifyGraphql<T>(
     }
   }
 
-  const res = await fetch(`https://${credentials.storeDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
+  const res = await connectorFetch(`https://${credentials.storeDomain}/admin/api/${SHOPIFY_API_VERSION}/graphql.json`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'X-Shopify-Access-Token': credentials.adminApiAccessToken,
     },
     body: JSON.stringify({ query, variables }),
-    signal: AbortSignal.timeout(30000),
-  })
+  }, { connectorName: 'Shopify' })
 
   if (!res.ok) {
     const detail = await readErrorDetails(res)
@@ -138,4 +138,3 @@ export function verifyShopifyWebhookSignature(body: string, providedSignature: s
   if (providedBuffer.length !== expectedBuffer.length) return false
   return timingSafeEqual(providedBuffer, expectedBuffer)
 }
-
