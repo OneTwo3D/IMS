@@ -21,7 +21,90 @@ export type ConnectorFetchOptions = Pick<
 }
 
 const MAX_REDIRECTS = 5
+export const DEFAULT_CONNECTOR_FETCH_TIMEOUT_MS = 30_000
+export const DEFAULT_CONNECTOR_FETCH_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
+
+function parsePositiveIntegerEnv(value: string | undefined, fallback: number): number {
+  const raw = value?.trim()
+  if (!raw || !/^\d+$/.test(raw)) return fallback
+  const parsed = Number(raw)
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return fallback
+  return parsed
+}
+
+function getConnectorFetchTimeoutMs(options: ConnectorFetchOptions): number {
+  // Connector transport limits are read per call so runtime env changes take
+  // effect without a process restart.
+  return parsePositiveIntegerEnv(
+    options.env?.CONNECTOR_FETCH_TIMEOUT_MS ?? process.env.CONNECTOR_FETCH_TIMEOUT_MS,
+    DEFAULT_CONNECTOR_FETCH_TIMEOUT_MS,
+  )
+}
+
+function getConnectorFetchMaxResponseBytes(options: ConnectorFetchOptions): number {
+  // Connector transport limits are read per call so runtime env changes take
+  // effect without a process restart.
+  return parsePositiveIntegerEnv(
+    options.env?.CONNECTOR_FETCH_MAX_RESPONSE_BYTES ?? process.env.CONNECTOR_FETCH_MAX_RESPONSE_BYTES,
+    DEFAULT_CONNECTOR_FETCH_MAX_RESPONSE_BYTES,
+  )
+}
+
+function abortReasonError(signal: AbortSignal | null | undefined, fallback: string): Error {
+  if (signal?.reason instanceof Error) return signal.reason
+  if (signal?.reason !== undefined) return new Error(String(signal.reason))
+  return new Error(fallback)
+}
+
+function createConnectorAbortSignal(
+  callerSignal: AbortSignal | null | undefined,
+  timeoutMs: number,
+  connectorName: string,
+): { signal: AbortSignal, cleanup: () => void } {
+  const timeoutController = new AbortController()
+  const timeout = setTimeout(() => {
+    timeoutController.abort(new Error(`${connectorName} request timed out after ${timeoutMs}ms.`))
+  }, timeoutMs)
+  timeout.unref?.()
+
+  if (!callerSignal) {
+    return {
+      signal: timeoutController.signal,
+      cleanup: () => clearTimeout(timeout),
+    }
+  }
+
+  const compositeController = new AbortController()
+  const abortFrom = (signal: AbortSignal) => {
+    if (!compositeController.signal.aborted) compositeController.abort(signal.reason)
+  }
+  const abortFromCaller = () => abortFrom(callerSignal)
+  const abortFromTimeout = () => abortFrom(timeoutController.signal)
+
+  if (callerSignal.aborted) abortFrom(callerSignal)
+  else callerSignal.addEventListener('abort', abortFromCaller, { once: true })
+
+  if (timeoutController.signal.aborted) abortFrom(timeoutController.signal)
+  else timeoutController.signal.addEventListener('abort', abortFromTimeout, { once: true })
+
+  return {
+    signal: compositeController.signal,
+    cleanup: () => {
+      clearTimeout(timeout)
+      callerSignal.removeEventListener('abort', abortFromCaller)
+      timeoutController.signal.removeEventListener('abort', abortFromTimeout)
+    },
+  }
+}
+
+function declaredContentLength(message: IncomingMessage): number | null {
+  const value = message.headers['content-length']
+  const raw = Array.isArray(value) ? value[0] : value
+  if (!raw || !/^\d+$/.test(raw.trim())) return null
+  const parsed = Number(raw)
+  return Number.isSafeInteger(parsed) ? parsed : null
+}
 
 function headersFromInit(headers: HeadersInit | undefined): Headers {
   return new Headers(headers)
@@ -172,14 +255,48 @@ function headersForRedirect(headers: Headers, from: URL, to: URL, methodChangedT
   return next
 }
 
-function collectResponse(message: IncomingMessage): Promise<Buffer> {
+function collectResponse(message: IncomingMessage, maxBytes: number, connectorName: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
-    message.on('data', (chunk: Buffer | string) => {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+    let totalBytes = 0
+    let settled = false
+
+    const settle = (action: () => void) => {
+      if (settled) return
+      settled = true
+      action()
+    }
+
+    const fail = (error: Error, destroyMessage = false) => settle(() => {
+      if (destroyMessage) message.destroy(error)
+      reject(error)
     })
-    message.on('end', () => resolve(Buffer.concat(chunks)))
-    message.on('error', reject)
+
+    const contentLength = declaredContentLength(message)
+    if (contentLength != null && contentLength > maxBytes) {
+      fail(new Error(`${connectorName} declared content-length ${contentLength} exceeds ${maxBytes} bytes.`), true)
+      return
+    }
+
+    const succeed = () => settle(() => {
+      resolve(Buffer.concat(chunks))
+    })
+
+    message.on('data', (chunk: Buffer | string) => {
+      // String chunks are measured as UTF-8 encoded bytes, matching the
+      // response-body byte cap instead of JavaScript character count.
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      totalBytes += buffer.byteLength
+      if (totalBytes > maxBytes) {
+        // Destroy aborts the upstream stream; reject propagates the error. The
+        // settled guard suppresses the duplicate error event from destroy().
+        fail(new Error(`${connectorName} response exceeded ${maxBytes} bytes.`), true)
+        return
+      }
+      chunks.push(buffer)
+    })
+    message.on('end', succeed)
+    message.on('error', fail)
   })
 }
 
@@ -195,11 +312,18 @@ async function sendConnectorRequest(
 
   const requestOptions = buildRequestOptions(url, method, headers, options)
   const requestImpl = url.protocol === 'http:' ? httpRequest : httpsRequest
+  const maxResponseBytes = getConnectorFetchMaxResponseBytes(options)
 
   return new Promise<Response>((resolve, reject) => {
+    if (signal?.aborted) {
+      // Covers aborts between redirect hops or before the socket is created.
+      reject(abortReasonError(signal, 'Connector request aborted.'))
+      return
+    }
+
     const request: ClientRequest = requestImpl(requestOptions, async (message) => {
       try {
-        const responseBody = await collectResponse(message)
+        const responseBody = await collectResponse(message, maxResponseBytes, options.connectorName)
         resolve(new Response(new Uint8Array(responseBody), {
           status: message.statusCode ?? 0,
           statusText: message.statusMessage,
@@ -211,7 +335,7 @@ async function sendConnectorRequest(
     })
 
     const abort = () => {
-      request.destroy(new Error('Connector request aborted.'))
+      request.destroy(abortReasonError(signal, 'Connector request aborted.'))
     }
 
     request.on('error', reject)
@@ -243,22 +367,31 @@ export async function connectorFetch(
   let method = init.method ?? 'GET'
   let headers = headersFromInit(init.headers)
   let body = bodyFromInit(init.body)
+  const timeoutMs = getConnectorFetchTimeoutMs(options)
+  const abortSignal = createConnectorAbortSignal(init.signal, timeoutMs, options.connectorName)
 
-  for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
-    const response = await sendConnectorRequest(url, method, headers, body, init.signal, options)
-    const nextUrl = redirectLocation(response, url)
-    if (!nextUrl) return response
-    if (redirectCount === MAX_REDIRECTS) {
-      throw new Error(`${options.connectorName} request exceeded ${MAX_REDIRECTS} redirects.`)
+  try {
+    // One wall-clock timeout budget covers connection, response, and all
+    // redirect hops. Caller-supplied cancellation is composed with that budget
+    // so it cannot accidentally disable the connector safety net.
+    for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
+      const response = await sendConnectorRequest(url, method, headers, body, abortSignal.signal, options)
+      const nextUrl = redirectLocation(response, url)
+      if (!nextUrl) return response
+      if (redirectCount === MAX_REDIRECTS) {
+        throw new Error(`${options.connectorName} request exceeded ${MAX_REDIRECTS} redirects.`)
+      }
+
+      const nextMethod = redirectMethod(method, response.status)
+      const methodChangedToGet = nextMethod !== method && nextMethod === 'GET'
+      headers = headersForRedirect(headers, url, nextUrl, methodChangedToGet)
+      method = nextMethod
+      if (methodChangedToGet) body = undefined
+      url = nextUrl
     }
 
-    const nextMethod = redirectMethod(method, response.status)
-    const methodChangedToGet = nextMethod !== method && nextMethod === 'GET'
-    headers = headersForRedirect(headers, url, nextUrl, methodChangedToGet)
-    method = nextMethod
-    if (methodChangedToGet) body = undefined
-    url = nextUrl
+    throw new Error(`${options.connectorName} request exceeded ${MAX_REDIRECTS} redirects.`)
+  } finally {
+    abortSignal.cleanup()
   }
-
-  throw new Error(`${options.connectorName} request exceeded ${MAX_REDIRECTS} redirects.`)
 }
