@@ -11,8 +11,8 @@ import {
   type WcWebhookDependencies,
 } from '../../lib/connectors/woocommerce/webhooks.ts'
 import type {
-  WcWebhookEventRepository,
-  WcWebhookEventRow,
+  ShoppingWebhookEventRepository,
+  ShoppingWebhookEventRow,
 } from '../../lib/connectors/woocommerce/webhook-inbox.ts'
 import {
   handleWebhook as handleShopifyWebhook,
@@ -50,7 +50,7 @@ function wcDependencies(overrides: Partial<WcWebhookDependencies> = {}): WcWebho
   const unreachable = (name: string) => async () => {
     throw new Error(`${name} should not run`)
   }
-  const event: WcWebhookEventRow = {
+  const event: ShoppingWebhookEventRow = {
     id: 'wc-webhook-event-1',
     connector: 'woocommerce',
     resource: 'products',
@@ -81,7 +81,7 @@ function wcDependencies(overrides: Partial<WcWebhookDependencies> = {}): WcWebho
     async persistWebhookEvent() {
       return { status: 'created', event }
     },
-    webhookEventRepository: undefined as unknown as WcWebhookEventRepository,
+    webhookEventRepository: undefined as unknown as ShoppingWebhookEventRepository,
     handleOrderWebhook: unreachable('order handler'),
     async handleProductWebhook(payload) {
       assert.equal(typeof payload, 'object')
@@ -512,6 +512,7 @@ test('Shopify webhook returns 400 for malformed signed JSON instead of throwing'
     request: shoppingRequest('shopify', 'orders', rawBody, {
       'x-shopify-hmac-sha256': shopifySignature(rawBody),
       'x-shopify-topic': 'orders/create',
+      'x-shopify-shop-domain': 'example.myshopify.com',
     }),
     resource: 'orders',
     rawBody,
@@ -535,6 +536,7 @@ test('Shopify webhook rejects signed non-object JSON roots', async () => {
     request: shoppingRequest('shopify', 'orders', rawBody, {
       'x-shopify-hmac-sha256': shopifySignature(rawBody),
       'x-shopify-topic': 'orders/create',
+      'x-shopify-shop-domain': 'example.myshopify.com',
     }),
     resource: 'orders',
     rawBody,
@@ -576,13 +578,37 @@ test('Shopify webhook rejects mismatched shop domains', async () => {
   assert.deepEqual(await response.json(), { success: false, error: 'Shopify webhook shop domain mismatch' })
 })
 
-test('Shopify webhook accepts valid signed JSON without storing raw payloads', async () => {
+test('Shopify webhook requires a signed shop-domain header', async () => {
+  const rawBody = JSON.stringify({ id: 123 })
+  const response = await handleShopifyWebhook({
+    request: shoppingRequest('shopify', 'orders', rawBody, {
+      'x-shopify-hmac-sha256': shopifySignature(rawBody),
+      'x-shopify-topic': 'orders/create',
+    }),
+    resource: 'orders',
+    rawBody,
+    dependencies: {
+      async getShopifyCredentials() {
+        return shopifyCredentials
+      },
+      async recordShopifySyncLog() {
+        throw new Error('sync log should not be written for missing shop domain')
+      },
+    },
+  })
+
+  assert.equal(response.status, 401)
+  assert.deepEqual(await response.json(), { success: false, error: 'Shopify webhook shop domain is required' })
+})
+
+test('Shopify webhook persists valid signed JSON without inline processing', async () => {
   const rawBody = JSON.stringify({
     id: 123,
     admin_graphql_api_id: 'gid://shopify/Order/123',
     secret_value: 'sentinel-value-xyz',
   })
   const logs: unknown[] = []
+  const persisted: unknown[] = []
 
   const response = await handleShopifyWebhook({
     request: shoppingRequest('shopify', 'orders', rawBody, {
@@ -601,13 +627,182 @@ test('Shopify webhook accepts valid signed JSON without storing raw payloads', a
       async recordShopifySyncLog(entry) {
         logs.push(entry)
       },
+      async getWebhookProcessingGate() {
+        return { enabled: true }
+      },
+      async persistWebhookEvent(_repository, input) {
+        persisted.push(input)
+        return {
+          status: 'created',
+          event: {
+            id: 'shopify-webhook-event-1',
+            connector: 'shopify',
+            resource: input.resource,
+            externalEventId: input.externalEventId ?? null,
+            topic: input.topic,
+            payloadHash: 'hash',
+            payloadJson: input.payload,
+            status: 'PENDING',
+            attempts: 0,
+            nextAttemptAt: null,
+            processedAt: null,
+            lastError: null,
+            receivedAt: new Date('2026-05-26T00:00:00.000Z'),
+            updatedAt: new Date('2026-05-26T00:00:00.000Z'),
+          },
+        }
+      },
+      webhookEventRepository: undefined as unknown as ShoppingWebhookEventRepository,
     },
   })
 
   assert.equal(response.status, 202)
-  assert.equal(logs.length, 1)
-  const payload = (logs[0] as { payload?: Record<string, unknown> }).payload
-  assert.equal(payload?.bodyLength, rawBody.length)
-  assert.deepEqual(payload?.payloadKeys, ['admin_graphql_api_id', 'id', 'secret_value'])
-  assert.equal(JSON.stringify(logs).includes('sentinel-value-xyz'), false)
+  assert.equal(logs.length, 0)
+  assert.equal(persisted.length, 1)
+  const payload = persisted[0] as {
+    externalEventId?: string | null
+    topic?: string | null
+    rawBody?: string
+    payload?: Record<string, unknown>
+  }
+  assert.equal(payload.externalEventId, 'webhook-1')
+  assert.equal(payload.topic, 'orders/create')
+  assert.equal(payload.rawBody, rawBody)
+  assert.deepEqual(payload.payload, {
+    id: 123,
+    admin_graphql_api_id: 'gid://shopify/Order/123',
+    secret_value: 'sentinel-value-xyz',
+  })
+  assert.deepEqual(await response.json(), {
+    accepted: true,
+    queued: true,
+    duplicate: false,
+    eventId: 'shopify-webhook-event-1',
+    connector: 'shopify',
+    resource: 'orders',
+    topic: 'orders/create',
+    webhookId: 'webhook-1',
+    shopifyEventId: 'event-1',
+  })
+})
+
+test('Shopify webhook accepts but does not queue when Shopify sync is disabled', async () => {
+  const rawBody = JSON.stringify({ id: 123 })
+  let persisted = false
+
+  const response = await handleShopifyWebhook({
+    request: shoppingRequest('shopify', 'orders', rawBody, {
+      'x-shopify-hmac-sha256': shopifySignature(rawBody),
+      'x-shopify-topic': 'orders/create',
+      'x-shopify-shop-domain': 'example.myshopify.com',
+    }),
+    resource: 'orders',
+    rawBody,
+    dependencies: {
+      async getShopifyCredentials() {
+        return shopifyCredentials
+      },
+      async getWebhookProcessingGate() {
+        return { enabled: false, reason: 'shopify_sync_disabled' }
+      },
+      async persistWebhookEvent() {
+        persisted = true
+        throw new Error('persist should not run')
+      },
+    },
+  })
+
+  assert.equal(response.status, 202)
+  assert.equal(persisted, false)
+  assert.deepEqual(await response.json(), {
+    accepted: true,
+    queued: false,
+    skipped: true,
+    reason: 'shopify_sync_disabled',
+  })
+})
+
+test('Shopify webhook returns accepted duplicate responses for repeated payloads', async () => {
+  const rawBody = JSON.stringify({ id: 123 })
+
+  const response = await handleShopifyWebhook({
+    request: shoppingRequest('shopify', 'orders', rawBody, {
+      'x-shopify-hmac-sha256': shopifySignature(rawBody),
+      'x-shopify-topic': 'orders/create',
+      'x-shopify-webhook-id': 'webhook-1',
+      'x-shopify-shop-domain': 'example.myshopify.com',
+    }),
+    resource: 'orders',
+    rawBody,
+    dependencies: {
+      async getShopifyCredentials() {
+        return shopifyCredentials
+      },
+      async getWebhookProcessingGate() {
+        return { enabled: true }
+      },
+      async persistWebhookEvent(_repository, input) {
+        return {
+          status: 'duplicate',
+          event: {
+            id: 'shopify-webhook-event-1',
+            connector: 'shopify',
+            resource: input.resource,
+            externalEventId: input.externalEventId ?? null,
+            topic: input.topic,
+            payloadHash: 'hash',
+            payloadJson: input.payload,
+            status: 'PENDING',
+            attempts: 0,
+            nextAttemptAt: null,
+            processedAt: null,
+            lastError: null,
+            receivedAt: new Date('2026-05-26T00:00:00.000Z'),
+            updatedAt: new Date('2026-05-26T00:00:00.000Z'),
+          },
+        }
+      },
+    },
+  })
+
+  assert.equal(response.status, 202)
+  assert.deepEqual(await response.json(), {
+    accepted: true,
+    queued: false,
+    duplicate: true,
+    eventId: 'shopify-webhook-event-1',
+    connector: 'shopify',
+    resource: 'orders',
+    topic: 'orders/create',
+    webhookId: 'webhook-1',
+    shopifyEventId: null,
+  })
+})
+
+test('Shopify webhook propagates unexpected persistence failures', async () => {
+  const rawBody = JSON.stringify({ id: 123 })
+
+  await assert.rejects(
+    () => handleShopifyWebhook({
+      request: shoppingRequest('shopify', 'orders', rawBody, {
+        'x-shopify-hmac-sha256': shopifySignature(rawBody),
+        'x-shopify-topic': 'orders/create',
+        'x-shopify-shop-domain': 'example.myshopify.com',
+      }),
+      resource: 'orders',
+      rawBody,
+      dependencies: {
+        async getShopifyCredentials() {
+          return shopifyCredentials
+        },
+        async getWebhookProcessingGate() {
+          return { enabled: true }
+        },
+        async persistWebhookEvent() {
+          throw new Error('database unavailable')
+        },
+      },
+    }),
+    /database unavailable/,
+  )
 })
