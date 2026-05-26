@@ -20,6 +20,6 @@ registerCronJobs([
     label: 'WooCommerce Webhook Inbox',
     description: 'Processes persisted WooCommerce order, product, and refund webhook events outside the public request path.',
     defaultSchedule: '*/5 * * * *',
-    defaultEnabled: true,
+    defaultEnabled: false,
   },
 ])

@@ -18,12 +18,20 @@ export async function GET(request: Request) {
     jobName: 'shopping-webhook-inbox',
     run: async () => {
       if (!(await isIntegrationPluginEnabled('woocommerce'))) {
-        return { skipped: true, reason: 'WooCommerce plugin disabled' }
+        return {
+          skipped: true,
+          reason: 'woocommerce_plugin_disabled',
+          gates: { pluginEnabled: false, syncEnabled: null },
+        }
       }
 
       const enabled = await db.setting.findUnique({ where: { key: 'wc_sync_enabled' } })
       if (enabled?.value !== 'true') {
-        return { skipped: true, reason: 'WC sync disabled' }
+        return {
+          skipped: true,
+          reason: 'wc_sync_disabled',
+          gates: { pluginEnabled: true, syncEnabled: false },
+        }
       }
 
       return await processPendingWcWebhookEvents() as Record<string, unknown>

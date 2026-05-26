@@ -1,13 +1,18 @@
 import { createHash } from 'crypto'
 
+import type { Prisma, PrismaClient } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { parsePositiveIntegerEnv } from '@/lib/env'
 import type { ShoppingWebhookResource } from '@/lib/shopping'
+
+const WOOCOMMERCE_CONNECTOR = 'woocommerce' as const
 
 export const WC_WEBHOOK_EVENT_STATUS = {
   pending: 'PENDING',
   processing: 'PROCESSING',
   processed: 'PROCESSED',
   failed: 'FAILED',
+  deadLetter: 'DEAD_LETTER',
 } as const
 
 export type WcWebhookEventStatus =
@@ -57,24 +62,19 @@ export type WcWebhookEventRepository = {
   claimEvent(id: string, now: Date, staleProcessingBefore: Date): Promise<WcWebhookEventRow | null>
   markProcessed(id: string, now: Date): Promise<WcWebhookEventRow>
   markFailed(input: { id: string; now: Date; error: string; nextAttemptAt: Date }): Promise<WcWebhookEventRow>
+  markDeadLetter(input: { id: string; now: Date; error: string }): Promise<WcWebhookEventRow>
 }
 
-type ShoppingWebhookEventDelegate = {
-  create(args: unknown): Promise<WcWebhookEventRow>
-  findUnique(args: unknown): Promise<WcWebhookEventRow | null>
-  findMany(args: unknown): Promise<Array<Pick<WcWebhookEventRow, 'id'>>>
-  update(args: unknown): Promise<WcWebhookEventRow>
-  updateMany(args: unknown): Promise<{ count: number }>
-}
-
-type ShoppingWebhookEventClient = {
-  shoppingWebhookEvent: ShoppingWebhookEventDelegate
-}
+type ShoppingWebhookEventClient = Pick<PrismaClient, 'shoppingWebhookEvent' | '$queryRaw'>
 
 const DEFAULT_PROCESS_PAGE_SIZE = 100
 const DEFAULT_RETRY_DELAY_MS = 60_000
 const MAX_RETRY_DELAY_MS = 60 * 60 * 1000
 const DEFAULT_STALE_PROCESSING_MS = 15 * 60 * 1000
+const DEFAULT_MAX_ATTEMPTS = 24
+const DEFAULT_RETRY_JITTER_RATIO = 0.25
+const MIN_RETRY_DELAY_MS = 1_000
+const MAX_ERROR_LENGTH = 8 * 1024
 
 const eventSelect = {
   id: true,
@@ -94,42 +94,66 @@ const eventSelect = {
 }
 
 function getClient(client?: ShoppingWebhookEventClient): ShoppingWebhookEventClient {
-  return client ?? (db as unknown as ShoppingWebhookEventClient)
+  return client ?? db
 }
 
 function isUniqueConstraintError(error: unknown): boolean {
+  // P2002 is Prisma's unique-constraint violation code.
   return typeof error === 'object' && error !== null && (error as { code?: string }).code === 'P2002'
 }
 
 export function hashWcWebhookPayload(rawBody: string): string {
+  // Hash the exact signed body bytes. Do not stringify parsed JSON here: WC
+  // redeliveries are byte-identical, and whitespace-sensitive hashing keeps
+  // dedupe aligned with the signature input while avoiding extra CPU work.
   return createHash('sha256').update(rawBody).digest('hex')
 }
 
-export function calculateWcWebhookRetryDelayMs(attempts: number): number {
+function seededUnitInterval(seed: string): number {
+  const digest = createHash('sha256').update(seed).digest()
+  return digest.readUInt32BE(0) / 0xFFFF_FFFF
+}
+
+export function calculateWcWebhookRetryDelayMs(
+  attempts: number,
+  options: {
+    jitterSeed?: string
+    jitterRatio?: number
+    random?: () => number
+  } = {},
+): number {
   const safeAttempts = Math.max(1, attempts)
-  return Math.min(MAX_RETRY_DELAY_MS, DEFAULT_RETRY_DELAY_MS * 2 ** (safeAttempts - 1))
+  const base = Math.min(MAX_RETRY_DELAY_MS, DEFAULT_RETRY_DELAY_MS * 2 ** (safeAttempts - 1))
+  const jitterRatio = options.jitterRatio ?? DEFAULT_RETRY_JITTER_RATIO
+  if (jitterRatio <= 0) return base
+  const unit = options.jitterSeed ? seededUnitInterval(options.jitterSeed) : (options.random ?? Math.random)()
+  const jitter = base * jitterRatio * (unit * 2 - 1)
+  return Math.max(MIN_RETRY_DELAY_MS, Math.floor(base + jitter))
 }
 
 export function normalizeWcWebhookError(error: unknown): string {
-  if (error instanceof Error) return error.message
-  return String(error)
+  const message = error instanceof Error ? error.message : String(error)
+  if (message.length <= MAX_ERROR_LENGTH) return message
+  return `${message.slice(0, MAX_ERROR_LENGTH)}... [truncated]`
 }
 
 export function createWcWebhookEventRepository(
-  options: { client?: ShoppingWebhookEventClient } = {},
+  options: { client?: ShoppingWebhookEventClient; connector?: typeof WOOCOMMERCE_CONNECTOR } = {},
 ): WcWebhookEventRepository {
-  const client = getClient(options.client).shoppingWebhookEvent
+  const prisma = getClient(options.client)
+  const client = prisma.shoppingWebhookEvent
+  const connector = options.connector ?? WOOCOMMERCE_CONNECTOR
 
   return {
     async createEvent(input) {
       return client.create({
         data: {
-          connector: input.connector,
+          connector,
           resource: input.resource,
           externalEventId: input.externalEventId ?? null,
           topic: input.topic,
           payloadHash: input.payloadHash,
-          payloadJson: input.payload,
+          payloadJson: input.payload as Prisma.InputJsonValue,
           status: WC_WEBHOOK_EVENT_STATUS.pending,
           attempts: 0,
           nextAttemptAt: null,
@@ -154,7 +178,7 @@ export function createWcWebhookEventRepository(
     async findDueEvents(input) {
       return client.findMany({
         where: {
-          connector: 'woocommerce',
+          connector,
           OR: [
             { status: WC_WEBHOOK_EVENT_STATUS.pending },
             {
@@ -173,31 +197,38 @@ export function createWcWebhookEventRepository(
       })
     },
     async claimEvent(id, now, staleProcessingBefore) {
-      const updated = await client.updateMany({
-        where: {
-          id,
-          connector: 'woocommerce',
-          OR: [
-            { status: WC_WEBHOOK_EVENT_STATUS.pending },
-            {
-              status: WC_WEBHOOK_EVENT_STATUS.failed,
-              OR: [{ nextAttemptAt: null }, { nextAttemptAt: { lte: now } }],
-            },
-            {
-              status: WC_WEBHOOK_EVENT_STATUS.processing,
-              updatedAt: { lte: staleProcessingBefore },
-            },
-          ],
-        },
-        data: {
-          status: WC_WEBHOOK_EVENT_STATUS.processing,
-          attempts: { increment: 1 },
-          nextAttemptAt: null,
-          lastError: null,
-        },
-      })
-      if (updated.count === 0) return null
-      return client.findUnique({ where: { id }, select: eventSelect })
+      const rows = await prisma.$queryRaw<WcWebhookEventRow[]>`
+        UPDATE "shopping_webhook_events"
+        SET
+          "status" = ${WC_WEBHOOK_EVENT_STATUS.processing},
+          "attempts" = "attempts" + 1,
+          "nextAttemptAt" = NULL,
+          "lastError" = NULL,
+          "updatedAt" = ${now}
+        WHERE "id" = ${id}
+          AND "connector" = ${connector}
+          AND (
+            "status" = ${WC_WEBHOOK_EVENT_STATUS.pending}
+            OR ("status" = ${WC_WEBHOOK_EVENT_STATUS.failed} AND ("nextAttemptAt" IS NULL OR "nextAttemptAt" <= ${now}))
+            OR ("status" = ${WC_WEBHOOK_EVENT_STATUS.processing} AND "updatedAt" <= ${staleProcessingBefore})
+          )
+        RETURNING
+          "id",
+          "connector",
+          "resource",
+          "externalEventId",
+          "topic",
+          "payloadHash",
+          "payloadJson",
+          "status",
+          "attempts",
+          "nextAttemptAt",
+          "processedAt",
+          "lastError",
+          "receivedAt",
+          "updatedAt"
+      `
+      return rows[0] ?? null
     },
     async markProcessed(id, now) {
       return client.update({
@@ -218,6 +249,17 @@ export function createWcWebhookEventRepository(
           status: WC_WEBHOOK_EVENT_STATUS.failed,
           lastError: input.error,
           nextAttemptAt: input.nextAttemptAt,
+        },
+        select: eventSelect,
+      })
+    },
+    async markDeadLetter(input) {
+      return client.update({
+        where: { id: input.id },
+        data: {
+          status: WC_WEBHOOK_EVENT_STATUS.deadLetter,
+          lastError: input.error,
+          nextAttemptAt: null,
         },
         select: eventSelect,
       })
@@ -249,25 +291,32 @@ export async function persistWcWebhookEvent(
       resource: input.resource,
       payloadHash,
     })
-    if (!existing) throw error
+    if (!existing) {
+      console.warn('[woocommerce-webhook-inbox] unique collision without findable duplicate', {
+        connector: WOOCOMMERCE_CONNECTOR,
+        resource: input.resource,
+        payloadHash,
+      })
+      throw error
+    }
     return { status: 'duplicate', event: existing }
   }
 }
 
 export function getWcWebhookProcessPageSize(env: Record<string, string | undefined> = process.env): number {
-  const raw = env.WC_WEBHOOK_INBOX_PROCESS_PAGE_SIZE?.trim()
-  if (!raw || !/^\d+$/.test(raw)) return DEFAULT_PROCESS_PAGE_SIZE
-  const parsed = Number(raw)
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_PROCESS_PAGE_SIZE
+  return parsePositiveIntegerEnv(env.WC_WEBHOOK_INBOX_PROCESS_PAGE_SIZE, DEFAULT_PROCESS_PAGE_SIZE)
 }
 
 export function getWcWebhookStaleProcessingMs(env: Record<string, string | undefined> = process.env): number {
-  const raw = env.WC_WEBHOOK_INBOX_STALE_PROCESSING_MS?.trim()
-  if (!raw || !/^\d+$/.test(raw)) return DEFAULT_STALE_PROCESSING_MS
-  const parsed = Number(raw)
-  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : DEFAULT_STALE_PROCESSING_MS
+  return parsePositiveIntegerEnv(env.WC_WEBHOOK_INBOX_STALE_PROCESSING_MS, DEFAULT_STALE_PROCESSING_MS)
 }
 
-export function nextWcWebhookRetryAt(options: { attempts: number; now: Date }): Date {
-  return new Date(options.now.getTime() + calculateWcWebhookRetryDelayMs(options.attempts))
+export function getWcWebhookMaxAttempts(env: Record<string, string | undefined> = process.env): number {
+  return parsePositiveIntegerEnv(env.WC_WEBHOOK_INBOX_MAX_ATTEMPTS, DEFAULT_MAX_ATTEMPTS)
+}
+
+export function nextWcWebhookRetryAt(options: { attempts: number; now: Date; eventId?: string }): Date {
+  return new Date(options.now.getTime() + calculateWcWebhookRetryDelayMs(options.attempts, {
+    jitterSeed: options.eventId ? `${options.eventId}:${options.attempts}` : undefined,
+  }))
 }

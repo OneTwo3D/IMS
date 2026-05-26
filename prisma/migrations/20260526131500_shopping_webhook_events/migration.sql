@@ -20,15 +20,15 @@ CREATE TABLE "shopping_webhook_events" (
 CREATE UNIQUE INDEX "shopping_webhook_events_connector_resource_payloadHash_key"
     ON "shopping_webhook_events"("connector", "resource", "payloadHash");
 
-CREATE INDEX "shopping_webhook_events_connector_resource_status_receivedA_idx"
+CREATE INDEX "swhe_due_idx"
     ON "shopping_webhook_events"("connector", "resource", "status", "receivedAt");
 
-CREATE INDEX "shopping_webhook_events_status_nextAttemptAt_idx"
-    ON "shopping_webhook_events"("status", "nextAttemptAt");
+CREATE INDEX "swhe_retry_idx"
+    ON "shopping_webhook_events"("connector", "status", "nextAttemptAt");
+
+CREATE INDEX "swhe_external_event_id_idx"
+    ON "shopping_webhook_events"("connector", "externalEventId");
 
 ALTER TABLE "shopping_webhook_events"
     ADD CONSTRAINT "shopping_webhook_events_status_check"
-    CHECK ("status" IN ('PENDING', 'PROCESSING', 'PROCESSED', 'FAILED')) NOT VALID;
-
-ALTER TABLE "shopping_webhook_events"
-    VALIDATE CONSTRAINT "shopping_webhook_events_status_check";
+    CHECK ("status" IN ('PENDING', 'PROCESSING', 'PROCESSED', 'FAILED', 'DEAD_LETTER'));

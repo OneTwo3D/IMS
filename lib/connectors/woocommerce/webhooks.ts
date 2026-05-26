@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
+import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { importWcOrder } from '@/lib/connectors/woocommerce/sync/order-import'
 import { syncWcOrderStatus } from '@/lib/connectors/woocommerce/sync/order-status'
 import { syncRefundsForOrder, syncWcRefund } from '@/lib/connectors/woocommerce/sync/refund-sync'
@@ -26,11 +27,17 @@ type JsonParseResult<T> =
   | { ok: true; value: T }
   | { ok: false; response: NextResponse }
 
+const MAX_WEBHOOK_EXTERNAL_EVENT_ID_LENGTH = 256
+
 /** @internal Test-only dependency injection for webhook unit tests. */
 export type WcWebhookDependencies = {
   getMaintenanceModeResponse: (kind: 'cron' | 'webhook') => Promise<NextResponse | null>
   verifyWebhook: (body: string, signature: string | null) => Promise<boolean>
   recordWebhookReceipt: (resource: ShoppingWebhookResource) => Promise<void>
+  getWebhookProcessingGate: () => Promise<{
+    enabled: boolean
+    reason?: 'woocommerce_plugin_disabled' | 'wc_sync_disabled'
+  }>
   persistWebhookEvent: typeof persistWcWebhookEvent
   webhookEventRepository: WcWebhookEventRepository
   handleOrderWebhook: (payload: unknown, topic: string | null) => Promise<Response>
@@ -71,12 +78,18 @@ async function recordWebhookReceipt(resource: ShoppingWebhookResource) {
 }
 
 function getWebhookHeaders(request: Request) {
+  // WC versions and helper plugins have used different delivery-id headers.
+  // Persist a bounded copy for operator lookup only; idempotency stays based on
+  // the signed body hash because delivery ids can vary across redeliveries.
+  const rawExternalEventId = request.headers.get('x-wc-webhook-delivery-id')
+    ?? request.headers.get('x-wc-webhook-event-id')
+    ?? request.headers.get('x-wc-webhook-id')
   return {
     signature: request.headers.get('x-wc-webhook-signature'),
     topic: request.headers.get('x-wc-webhook-topic'),
-    externalEventId: request.headers.get('x-wc-webhook-delivery-id')
-      ?? request.headers.get('x-wc-webhook-event-id')
-      ?? request.headers.get('x-wc-webhook-id'),
+    externalEventId: rawExternalEventId
+      ? rawExternalEventId.slice(0, MAX_WEBHOOK_EXTERNAL_EVENT_ID_LENGTH)
+      : null,
   }
 }
 
@@ -283,6 +296,17 @@ async function handleRefundWebhook(payload: unknown) {
   return NextResponse.json({ ok: true })
 }
 
+async function getWebhookProcessingGate() {
+  if (!(await isIntegrationPluginEnabled('woocommerce'))) {
+    return { enabled: false as const, reason: 'woocommerce_plugin_disabled' as const }
+  }
+  const enabled = await db.setting.findUnique({ where: { key: 'wc_sync_enabled' } })
+  if (enabled?.value !== 'true') {
+    return { enabled: false as const, reason: 'wc_sync_disabled' as const }
+  }
+  return { enabled: true as const }
+}
+
 export async function processWcWebhookPayload(
   input: {
     resource: ShoppingWebhookResource
@@ -305,6 +329,7 @@ const defaultDependencies: WcWebhookDependencies = {
   getMaintenanceModeResponse,
   verifyWebhook: verifyWcWebhook,
   recordWebhookReceipt,
+  getWebhookProcessingGate,
   persistWebhookEvent: persistWcWebhookEvent,
   webhookEventRepository: createWcWebhookEventRepository(),
   handleOrderWebhook,
@@ -337,6 +362,16 @@ export async function handleWcWebhook(
 
   if (isSignedActionPing(topic)) {
     return NextResponse.json({ ok: true, ping: true })
+  }
+
+  const gate = await dependencies.getWebhookProcessingGate()
+  if (!gate.enabled) {
+    return NextResponse.json({
+      accepted: true,
+      queued: false,
+      skipped: true,
+      reason: gate.reason,
+    }, { status: 202 })
   }
 
   const parsed = parseWebhookJson<unknown>(body)
