@@ -22,13 +22,20 @@ const adminSession = {
   },
 }
 
-function productionEnv() {
+function productionEnv(): Record<string, string> {
   return {
     NODE_ENV: 'production',
     DATABASE_URL: 'postgresql://imsuser:password@localhost:5432/ims',
     AUTH_URL: 'https://ims.example.test',
     NEXT_PUBLIC_APP_URL: 'https://ims.example.test',
   }
+}
+
+function productionEnvWithoutConfiguredOrigin() {
+  const env = productionEnv()
+  delete env.AUTH_URL
+  delete env.NEXT_PUBLIC_APP_URL
+  return env
 }
 
 function baseDeps(overrides: BackupRestoreHandlerDeps = {}) {
@@ -97,6 +104,7 @@ function sameOriginRequest(body: BodyInit): NextRequest {
 }
 
 function refererRequest(body: BodyInit, referer: string): NextRequest {
+  // Intentionally omit Origin so this helper exercises the referer fallback.
   return new NextRequest('https://internal-proxy.example.test/api/backup/restore', {
     method: 'POST',
     headers: {
@@ -217,6 +225,7 @@ test('production restore POST accepts configured app origin even behind an inter
   try {
     const backupPath = path.join(root, 'backup.sql')
     await writeFile(backupPath, 'select 1;\n')
+    let restoredPath = ''
     const { deps, calls } = baseDeps({
       backupDir: root,
       env: {
@@ -224,6 +233,10 @@ test('production restore POST accepts configured app origin even behind an inter
         AUTH_URL: 'https://app.ims.example.test/auth',
         NEXT_PUBLIC_APP_URL: 'https://app.ims.example.test',
         ALLOW_DATABASE_RESTORE: 'true',
+      },
+      runRestoreFile: async (filePath) => {
+        calls.runRestore += 1
+        restoredPath = filePath
       },
     })
     const handler = createBackupRestorePostHandler(deps)
@@ -241,7 +254,122 @@ test('production restore POST accepts configured app origin even behind an inter
     assert.equal(body.success, true)
     assert.equal(calls.consumeToken, 1)
     assert.equal(calls.runRestore, 1)
-    assert.equal(backupPath.endsWith('backup.sql'), true)
+    assert.equal(restoredPath, backupPath)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('production restore POST normalizes origin header casing before comparison', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-origin-normalization-test-'))
+  try {
+    await writeFile(path.join(root, 'backup.sql'), 'select 1;\n')
+    const { deps, calls } = baseDeps({
+      backupDir: root,
+      env: {
+        ...productionEnv(),
+        NEXT_PUBLIC_APP_URL: 'https://ims.example.test',
+        ALLOW_DATABASE_RESTORE: 'true',
+      },
+    })
+    const handler = createBackupRestorePostHandler(deps)
+
+    const response = await handler(new NextRequest('https://internal-proxy.example.test/api/backup/restore', {
+      method: 'POST',
+      headers: {
+        origin: 'HTTPS://IMS.EXAMPLE.TEST',
+      },
+      body: existingBackupBody('backup.sql'),
+    }))
+    const body = await responseJson(response)
+
+    assert.equal(response.status, 200)
+    assert.equal(body.success, true)
+    assert.equal(calls.consumeToken, 1)
+    assert.equal(calls.runRestore, 1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('production restore POST trusts NEXT_PUBLIC_APP_URL before AUTH_URL when origins differ', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-split-origin-test-'))
+  try {
+    await writeFile(path.join(root, 'backup.sql'), 'select 1;\n')
+    const { deps, calls, activityLogs } = baseDeps({
+      backupDir: root,
+      env: {
+        ...productionEnv(),
+        AUTH_URL: 'https://auth.ims.example.test',
+        NEXT_PUBLIC_APP_URL: 'https://app.ims.example.test',
+        ALLOW_DATABASE_RESTORE: 'true',
+      },
+    })
+    const handler = createBackupRestorePostHandler(deps)
+
+    const authOriginResponse = await handler(new NextRequest('https://internal-proxy.example.test/api/backup/restore', {
+      method: 'POST',
+      headers: {
+        origin: 'https://auth.ims.example.test',
+      },
+      body: existingBackupBody('backup.sql'),
+    }))
+    const authOriginBody = await responseJson(authOriginResponse)
+
+    assert.equal(authOriginResponse.status, 403)
+    assert.equal(authOriginBody.error, 'Cross-site restore requests are not allowed.')
+    assert.equal(calls.consumeToken, 0)
+    assert.equal(calls.runRestore, 0)
+    assert.equal(activityLogs.length, 1)
+    assert.equal(metadataReason(activityLogs[0]), 'cross_origin_restore_request')
+
+    const appOriginResponse = await handler(new NextRequest('https://internal-proxy.example.test/api/backup/restore', {
+      method: 'POST',
+      headers: {
+        origin: 'https://app.ims.example.test',
+      },
+      body: existingBackupBody('backup.sql'),
+    }))
+    const appOriginBody = await responseJson(appOriginResponse)
+
+    assert.equal(appOriginResponse.status, 200)
+    assert.equal(appOriginBody.success, true)
+    assert.equal(calls.consumeToken, 1)
+    assert.equal(calls.runRestore, 1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('production restore POST falls back to AUTH_URL only when app URL is absent', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-auth-origin-fallback-test-'))
+  try {
+    await writeFile(path.join(root, 'backup.sql'), 'select 1;\n')
+    const env = productionEnv()
+    delete env.NEXT_PUBLIC_APP_URL
+    const { deps, calls } = baseDeps({
+      backupDir: root,
+      env: {
+        ...env,
+        AUTH_URL: 'https://auth-only.ims.example.test',
+        ALLOW_DATABASE_RESTORE: 'true',
+      },
+    })
+    const handler = createBackupRestorePostHandler(deps)
+
+    const response = await handler(new NextRequest('https://internal-proxy.example.test/api/backup/restore', {
+      method: 'POST',
+      headers: {
+        origin: 'https://auth-only.ims.example.test',
+      },
+      body: existingBackupBody('backup.sql'),
+    }))
+    const body = await responseJson(response)
+
+    assert.equal(response.status, 200)
+    assert.equal(body.success, true)
+    assert.equal(calls.consumeToken, 1)
+    assert.equal(calls.runRestore, 1)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -277,11 +405,37 @@ test('production restore POST does not trust spoofed forwarded host headers', as
   assert.equal(metadataReason(activityLogs[0]), 'cross_origin_restore_request')
 })
 
+test('production restore POST does not trust spoofed forwarded host without origin header', async () => {
+  const { deps, calls, activityLogs } = baseDeps({
+    env: {
+      ...productionEnv(),
+      ALLOW_DATABASE_RESTORE: 'true',
+    },
+  })
+  const handler = createBackupRestorePostHandler(deps)
+
+  const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', {
+    method: 'POST',
+    headers: {
+      'x-forwarded-proto': 'https',
+      'x-forwarded-host': 'ims.example.test',
+    },
+    body: existingBackupBody('backup.sql'),
+  }))
+  const body = await responseJson(response)
+
+  assert.equal(response.status, 403)
+  assert.equal(body.error, 'Cross-site restore requests are not allowed.')
+  assert.equal(calls.consumeToken, 0)
+  assert.equal(calls.runRestore, 0)
+  assert.equal(activityLogs.length, 1)
+  assert.equal(metadataReason(activityLogs[0]), 'cross_origin_restore_request')
+})
+
 test('production restore POST rejects missing configured app origin before consuming token', async () => {
   const { deps, calls, activityLogs } = baseDeps({
     env: {
-      NODE_ENV: 'production',
-      DATABASE_URL: 'postgresql://imsuser:password@localhost:5432/ims',
+      ...productionEnvWithoutConfiguredOrigin(),
       ALLOW_DATABASE_RESTORE: 'true',
     },
   })
@@ -301,7 +455,35 @@ test('production restore POST rejects missing configured app origin before consu
   assert.equal(calls.consumeToken, 0)
   assert.equal(calls.runRestore, 0)
   assert.equal(activityLogs.length, 1)
-  assert.equal(metadataReason(activityLogs[0]), 'cross_origin_restore_request')
+  assert.equal(metadataReason(activityLogs[0]), 'misconfigured_app_origin')
+})
+
+test('production restore POST rejects opaque configured origins as misconfiguration', async () => {
+  const { deps, calls, activityLogs } = baseDeps({
+    env: {
+      ...productionEnv(),
+      AUTH_URL: 'file:///tmp/ims.html',
+      NEXT_PUBLIC_APP_URL: 'data:text/plain,ims',
+      ALLOW_DATABASE_RESTORE: 'true',
+    },
+  })
+  const handler = createBackupRestorePostHandler(deps)
+
+  const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', {
+    method: 'POST',
+    headers: {
+      origin: 'null',
+    },
+    body: existingBackupBody('backup.sql'),
+  }))
+  const body = await responseJson(response)
+
+  assert.equal(response.status, 403)
+  assert.equal(body.error, 'Cross-site restore requests are not allowed.')
+  assert.equal(calls.consumeToken, 0)
+  assert.equal(calls.runRestore, 0)
+  assert.equal(activityLogs.length, 1)
+  assert.equal(metadataReason(activityLogs[0]), 'misconfigured_app_origin')
 })
 
 test('production restore POST accepts valid configured referer and rejects invalid referer', async () => {
@@ -327,16 +509,26 @@ test('production restore POST accepts valid configured referer and rejects inval
     assert.equal(calls.consumeToken, 1)
     assert.equal(calls.runRestore, 1)
 
-    const invalidResponse = await handler(refererRequest(existingBackupBody('backup.sql'), 'not-a-url'))
-    const invalidBody = await responseJson(invalidResponse)
+    const malformedRefererResponse = await handler(refererRequest(existingBackupBody('backup.sql'), 'not-a-url'))
+    const malformedRefererBody = await responseJson(malformedRefererResponse)
 
-    assert.equal(invalidResponse.status, 403)
-    assert.equal(invalidBody.error, 'Cross-site restore requests are not allowed.')
+    assert.equal(malformedRefererResponse.status, 403)
+    assert.equal(malformedRefererBody.error, 'Cross-site restore requests are not allowed.')
+    assert.equal(calls.consumeToken, 1)
+    assert.equal(calls.runRestore, 1)
+
+    const attackerRefererResponse = await handler(refererRequest(existingBackupBody('backup.sql'), 'https://attacker.example.test/admin/backups'))
+    const attackerRefererBody = await responseJson(attackerRefererResponse)
+
+    assert.equal(attackerRefererResponse.status, 403)
+    assert.equal(attackerRefererBody.error, 'Cross-site restore requests are not allowed.')
+    // Both denied referer attempts happen before token consumption.
     assert.equal(calls.consumeToken, 1)
     assert.equal(calls.runRestore, 1)
     const denialLogs = activityLogs.filter((entry) => entry.action === 'backup_restore_denied')
-    assert.equal(denialLogs.length, 1)
+    assert.equal(denialLogs.length, 2)
     assert.equal(metadataReason(denialLogs[0]), 'cross_origin_restore_request')
+    assert.equal(metadataReason(denialLogs[1]), 'cross_origin_restore_request')
   } finally {
     await rm(root, { recursive: true, force: true })
   }

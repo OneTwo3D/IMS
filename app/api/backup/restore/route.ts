@@ -101,42 +101,63 @@ function parseOrigin(value: string | undefined): string | null {
   const raw = value?.trim()
   if (!raw) return null
   try {
-    return new URL(raw).origin
+    const url = new URL(raw)
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return null
+    if (url.origin === 'null') return null
+    return url.origin
   } catch {
     return null
   }
 }
 
+type RestoreOriginCheck = {
+  allowed: boolean
+  denialReason?: 'cross_origin_restore_request' | 'misconfigured_app_origin'
+}
+
 function getAllowedRequestOrigins(env: Env, request: NextRequest): Set<string> {
   const origins = new Set<string>()
-  for (const name of ['AUTH_URL', 'NEXT_PUBLIC_APP_URL'] as const) {
-    const origin = parseOrigin(env[name])
-    if (origin) origins.add(origin)
+  const appOrigin = parseOrigin(env.NEXT_PUBLIC_APP_URL)
+  if (appOrigin) {
+    origins.add(appOrigin)
+  } else {
+    const authOrigin = parseOrigin(env.AUTH_URL)
+    if (authOrigin) origins.add(authOrigin)
   }
 
+  // Return early when configured origins exist, or in production so an empty set
+  // fails closed instead of falling back to the request URL.
   if (origins.size > 0 || env.NODE_ENV === 'production') return origins
 
   // Local/dev route-handler tests often do not configure app URLs. Fall back to
-  // the request URL origin outside production, but never to forwarded headers.
+  // the request URL origin outside production only. NextRequest.url can still
+  // reflect the Host header; production therefore never uses this fallback.
   origins.add(new URL(request.url).origin)
   return origins
 }
 
-function isSameOriginRequest(request: NextRequest, env: Env): boolean {
+function checkSameOriginRequest(request: NextRequest, env: Env): RestoreOriginCheck {
   const allowedOrigins = getAllowedRequestOrigins(env, request)
-  if (allowedOrigins.size === 0) return false
+  if (allowedOrigins.size === 0) {
+    return {
+      allowed: false,
+      denialReason: env.NODE_ENV === 'production'
+        ? 'misconfigured_app_origin'
+        : 'cross_origin_restore_request',
+    }
+  }
 
-  const origin = request.headers.get('origin')
-  if (origin) return allowedOrigins.has(origin)
+  const originHeader = request.headers.get('origin')
+  if (originHeader) {
+    const origin = parseOrigin(originHeader)
+    return { allowed: origin !== null && allowedOrigins.has(origin), denialReason: 'cross_origin_restore_request' }
+  }
 
   const referer = request.headers.get('referer')
-  if (!referer) return false
+  if (!referer) return { allowed: false, denialReason: 'cross_origin_restore_request' }
 
-  try {
-    return allowedOrigins.has(new URL(referer).origin)
-  } catch {
-    return false
-  }
+  const refererOrigin = parseOrigin(referer)
+  return { allowed: refererOrigin !== null && allowedOrigins.has(refererOrigin), denialReason: 'cross_origin_restore_request' }
 }
 
 function resolveBackupPath(backupDir: string, filename: string): string | null {
@@ -297,8 +318,9 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
   return async function POST(req: NextRequest) {
     const session = await resolvedDeps.authorize()
     if (session instanceof NextResponse) return session
-    if (!isSameOriginRequest(req, resolvedDeps.env)) {
-      await logDeniedRestoreAttempt(resolvedDeps, session.user.id, 'cross_origin_restore_request')
+    const originCheck = checkSameOriginRequest(req, resolvedDeps.env)
+    if (!originCheck.allowed) {
+      await logDeniedRestoreAttempt(resolvedDeps, session.user.id, originCheck.denialReason ?? 'cross_origin_restore_request')
       return NextResponse.json({ error: 'Cross-site restore requests are not allowed.' }, { status: 403 })
     }
 
