@@ -89,13 +89,10 @@ test.describe('sales management workflows', () => {
     await expect(page.getByRole('heading', { name: /stock allocation/i })).toBeVisible()
 
     await page.once('dialog', (dialogEvent) => dialogEvent.accept())
-    await page.getByRole('button', { name: /^Deallocate$/ }).click()
-    await expect
-      .poll(async () => {
-        await page.reload()
-        return page.getByRole('button', { name: /auto-allocate/i }).isVisible()
-      })
-      .toBe(true)
+    const deallocateButton = page.getByRole('button', { name: /^Deallocate$/ })
+    await deallocateButton.click()
+    await expect(deallocateButton).toBeHidden({ timeout: 15000 })
+    await expect(page.getByRole('button', { name: /auto-allocate/i })).toBeVisible({ timeout: 15000 })
 
     await page.getByRole('button', { name: /auto-allocate/i }).click()
     await expect(page.getByRole('heading', { name: /stock allocation/i })).toBeVisible()
