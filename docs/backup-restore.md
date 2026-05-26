@@ -29,6 +29,8 @@ Restoring overwrites all current data. To confirm, you must type **RESTORE** int
 
 The restore API also enforces this confirmation server-side, requires a short-lived one-time confirmation code emailed to the authenticated admin address, and only accepts plain `.sql` files from the configured backup directory or an uploaded `.sql` file for that request.
 
+In production, restore is disabled unless `ALLOW_DATABASE_RESTORE=true` is set for a supervised restore window. Restoring from a server-side backup only requires that base flag; restoring from an uploaded SQL file also requires `ALLOW_DATABASE_RESTORE_UPLOAD=true`. Leave both flags unset or `false` during normal operation.
+
 ## Remote Storage
 
 Backups can be uploaded to remote storage for off-site protection. Two storage types are supported.
