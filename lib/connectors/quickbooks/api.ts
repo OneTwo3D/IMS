@@ -6,6 +6,7 @@
  */
 
 import { db } from '@/lib/db'
+import { connectorFetch } from '@/lib/security/connector-fetch'
 import { getAccessToken } from './auth'
 import { getQuickBooksSettings } from './settings'
 
@@ -105,7 +106,7 @@ async function performRequest(auth: { accessToken: string; realmId: string }, in
     await waitForBudget(auth.realmId)
     noteRequest(auth.realmId)
 
-    const res = await fetch(url, init)
+    const res = await connectorFetch(url, init, { connectorName: 'QuickBooks' })
     if (res.status !== 429) return res
 
     lastRateLimitMs = Math.max(parseRetryAfterMs(res.headers.get('Retry-After')), 1000 * 2 ** attempt)

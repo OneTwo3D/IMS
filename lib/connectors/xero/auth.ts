@@ -13,6 +13,7 @@ import { notify } from '@/lib/notifications'
 import { decryptSecret, encryptSecret, hasEncryptionKey, isEncryptedValue } from '@/lib/secrets'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { connectorFetch } from '@/lib/security/connector-fetch'
 
 const XERO_AUTHORIZE_URL = 'https://login.xero.com/identity/connect/authorize'
 const XERO_CONNECTOR = 'xero'
@@ -136,13 +137,13 @@ function selectTenantConnection(connections: XeroConnection[], expectedTenantId:
 }
 
 async function fetchOrganisationBaseCurrency(accessToken: string, tenantId: string): Promise<string | null> {
-  const res = await fetch(XERO_ORGANISATION_URL, {
+  const res = await connectorFetch(XERO_ORGANISATION_URL, {
     headers: {
       'Authorization': `Bearer ${accessToken}`,
       'Xero-Tenant-Id': tenantId,
       'Accept': 'application/json',
     },
-  })
+  }, { connectorName: 'Xero' })
   if (!res.ok) return null
   const data = await res.json() as Record<string, unknown>
   const organisations =
@@ -257,7 +258,7 @@ export async function exchangeCodeForTokens(
     }
 
     const basicAuth = buildBasicAuth(clientId, clientSecret)
-    const tokenRes = await fetch(XERO_TOKEN_URL, {
+    const tokenRes = await connectorFetch(XERO_TOKEN_URL, {
       method: 'POST',
       headers: {
         'Authorization': `Basic ${basicAuth}`,
@@ -268,7 +269,7 @@ export async function exchangeCodeForTokens(
         code,
         redirect_uri: redirectUri,
       }),
-    })
+    }, { connectorName: 'Xero' })
 
     if (!tokenRes.ok) {
       const err = await tokenRes.text()
@@ -278,9 +279,9 @@ export async function exchangeCodeForTokens(
     const tokenData: TokenResponse = await tokenRes.json()
 
     // Fetch tenant (organisation) info
-    const connRes = await fetch(XERO_CONNECTIONS_URL, {
+    const connRes = await connectorFetch(XERO_CONNECTIONS_URL, {
       headers: { 'Authorization': `Bearer ${tokenData.access_token}` },
-    })
+    }, { connectorName: 'Xero' })
 
     if (!connRes.ok) {
       const connErr = await connRes.text().catch(() => '')
@@ -355,7 +356,7 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
     }
 
     try {
-      const res = await fetch(XERO_TOKEN_URL, {
+      const res = await connectorFetch(XERO_TOKEN_URL, {
         method: 'POST',
         headers: {
           'Authorization': `Basic ${buildBasicAuth(clientId, clientSecret)}`,
@@ -365,7 +366,7 @@ export async function refreshToken(): Promise<{ accessToken: string; tenantId: s
           grant_type: 'refresh_token',
           refresh_token: token.refreshToken,
         }),
-      })
+      }, { connectorName: 'Xero' })
 
       if (!res.ok) {
         const errorBody = await res.text().catch(() => '')

@@ -6,7 +6,7 @@ import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
-import { getWcCredentials as getConnectorWcCredentials } from '@/lib/connectors/woocommerce/api'
+import { wcFetch } from '@/lib/connectors/woocommerce/api'
 import { queueAccountingSync, getAccountingSettings } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
@@ -866,23 +866,8 @@ export async function fetchWcImage(
 ): Promise<{ imageUrl: string | null; error?: string }> {
   try {
     await requirePermission('stock_control.adjust')
-    const credentials = await getConnectorWcCredentials()
-    if (!credentials) {
-      return { imageUrl: null, error: 'WooCommerce not configured in Settings' }
-    }
-    const auth = Buffer.from(`${credentials.key}:${credentials.secret}`).toString('base64')
-    const endpoint = `${credentials.url}/wp-json/wc/v3/products?sku=${encodeURIComponent(sku)}&per_page=1`
-
-    const res = await fetch(endpoint, {
-      headers: { Authorization: `Basic ${auth}` },
-      cache: 'no-store',
-    })
-
-    if (!res.ok) {
-      return { imageUrl: null, error: `WooCommerce API error: ${res.status}` }
-    }
-
-    const data = await res.json()
+    const { data, error } = await wcFetch('/products', { sku, per_page: '1' })
+    if (error) return { imageUrl: null, error }
     const product = Array.isArray(data) ? data[0] : data
     if (!product) return { imageUrl: null, error: `No WooCommerce product found for SKU "${sku}"` }
     const imageUrl = product.images?.[0]?.src ?? product.image?.src ?? null

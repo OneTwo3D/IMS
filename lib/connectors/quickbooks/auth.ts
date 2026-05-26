@@ -13,6 +13,7 @@ import { notify } from '@/lib/notifications'
 import { decryptSecret, encryptSecret, hasEncryptionKey, isEncryptedValue } from '@/lib/secrets'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { connectorFetch } from '@/lib/security/connector-fetch'
 
 const QBO_AUTHORIZE_URL = 'https://appcenter.intuit.com/connect/oauth2'
 const QBO_TOKEN_URL = 'https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer'
@@ -134,12 +135,12 @@ async function fetchCompanyInfo(
     ? 'https://sandbox-quickbooks.api.intuit.com/v3/company'
     : 'https://quickbooks.api.intuit.com/v3/company'
 
-  const res = await fetch(`${base}/${realmId}/companyinfo/${realmId}?minorversion=73`, {
+  const res = await connectorFetch(`${base}/${realmId}/companyinfo/${realmId}?minorversion=73`, {
     headers: {
       'Authorization': `Bearer ${accessToken}`,
       'Accept': 'application/json',
     },
-  })
+  }, { connectorName: 'QuickBooks' })
 
   if (!res.ok) return { companyName: null, baseCurrency: null }
 
@@ -268,7 +269,7 @@ export async function exchangeCodeForTokens(
     }
 
     const basicAuth = buildBasicAuth(clientId, clientSecret)
-    const tokenRes = await fetch(QBO_TOKEN_URL, {
+    const tokenRes = await connectorFetch(QBO_TOKEN_URL, {
       method: 'POST',
       headers: {
         'Authorization': `Basic ${basicAuth}`,
@@ -280,7 +281,7 @@ export async function exchangeCodeForTokens(
         code,
         redirect_uri: redirectUri,
       }),
-    })
+    }, { connectorName: 'QuickBooks' })
 
     if (!tokenRes.ok) {
       const err = await tokenRes.text()
@@ -358,7 +359,7 @@ export async function refreshToken(): Promise<{ accessToken: string; realmId: st
     }
 
     try {
-      const res = await fetch(QBO_TOKEN_URL, {
+      const res = await connectorFetch(QBO_TOKEN_URL, {
         method: 'POST',
         headers: {
           'Authorization': `Basic ${buildBasicAuth(clientId, clientSecret)}`,
@@ -369,7 +370,7 @@ export async function refreshToken(): Promise<{ accessToken: string; realmId: st
           grant_type: 'refresh_token',
           refresh_token: token.refreshToken,
         }),
-      })
+      }, { connectorName: 'QuickBooks' })
 
       if (!res.ok) {
         const errorBody = await res.text().catch(() => '')
@@ -415,7 +416,7 @@ export async function disconnect(): Promise<void> {
     ])
     if (clientId && clientSecret) {
       try {
-        await fetch(QBO_REVOKE_URL, {
+        await connectorFetch(QBO_REVOKE_URL, {
           method: 'POST',
           headers: {
             'Authorization': `Basic ${buildBasicAuth(clientId, clientSecret)}`,
@@ -423,9 +424,10 @@ export async function disconnect(): Promise<void> {
             'Accept': 'application/json',
           },
           body: JSON.stringify({ token: token.refreshToken }),
-        })
+        }, { connectorName: 'QuickBooks' })
       } catch {
-        // Best-effort — don't fail disconnect on revoke error
+        // Best-effort: disconnect should complete even if connectorFetch adds
+        // timeout, response-size, DNS, or network failures to token revocation.
       }
     }
   }

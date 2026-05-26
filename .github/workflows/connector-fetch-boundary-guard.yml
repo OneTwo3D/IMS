@@ -1,0 +1,37 @@
+name: Connector Fetch Boundary Guard
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/connector-fetch-boundary-guard.yml"
+      - "app/actions/**"
+      - "app/api/cron/**"
+      - "lib/connectors/**"
+      - "lib/shopping.ts"
+      - "package-lock.json"
+      - "package.json"
+      - "scripts/check-connector-fetch-boundaries.mjs"
+      - "tests/scripts/connector-fetch-boundaries.test.ts"
+  push:
+    branches:
+      - development
+    paths:
+      - ".github/workflows/connector-fetch-boundary-guard.yml"
+      - "app/actions/**"
+      - "app/api/cron/**"
+      - "lib/connectors/**"
+      - "lib/shopping.ts"
+      - "package-lock.json"
+      - "package.json"
+      - "scripts/check-connector-fetch-boundaries.mjs"
+      - "tests/scripts/connector-fetch-boundaries.test.ts"
+
+jobs:
+  connector-fetch-boundary-guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm run check:connector-fetch-boundaries
