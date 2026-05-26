@@ -18,10 +18,12 @@ export const WC_WEBHOOK_EVENT_STATUS = {
   deadLetter: 'DEAD_LETTER',
 } as const
 
-export type WcWebhookEventStatus =
+export type ShoppingWebhookEventStatus =
   typeof WC_WEBHOOK_EVENT_STATUS[keyof typeof WC_WEBHOOK_EVENT_STATUS]
 
-export type WcWebhookEventRow = {
+export type WcWebhookEventStatus = ShoppingWebhookEventStatus
+
+export type ShoppingWebhookEventRow = {
   id: string
   connector: string
   resource: string
@@ -37,6 +39,8 @@ export type WcWebhookEventRow = {
   receivedAt: Date
   updatedAt: Date
 }
+
+export type WcWebhookEventRow = ShoppingWebhookEventRow
 
 export type PersistShoppingWebhookEventInput = {
   resource: ShoppingWebhookResource
@@ -54,23 +58,26 @@ export type PersistShoppingWebhookEventResult =
 
 export type PersistWcWebhookEventResult = PersistShoppingWebhookEventResult
 
-export type WcWebhookEventRepository = {
-  createEvent(input: PersistShoppingWebhookEventInput & { connector: ShoppingWebhookEventConnector; payloadHash: string }): Promise<WcWebhookEventRow>
+export type ShoppingWebhookEventRepository = {
+  createEvent(input: PersistShoppingWebhookEventInput & { connector: ShoppingWebhookEventConnector; payloadHash: string }): Promise<ShoppingWebhookEventRow>
   findByConnectorResourceAndPayloadHash(input: {
     connector: ShoppingWebhookEventConnector
     resource: ShoppingWebhookResource
     payloadHash: string
-  }): Promise<WcWebhookEventRow | null>
+  }): Promise<ShoppingWebhookEventRow | null>
   findDueEvents(input: {
     now: Date
     take: number
     staleProcessingBefore: Date
-  }): Promise<Array<Pick<WcWebhookEventRow, 'id'>>>
-  claimEvent(id: string, now: Date, staleProcessingBefore: Date): Promise<WcWebhookEventRow | null>
-  markProcessed(id: string, now: Date): Promise<WcWebhookEventRow>
-  markFailed(input: { id: string; now: Date; error: string; nextAttemptAt: Date }): Promise<WcWebhookEventRow>
-  markDeadLetter(input: { id: string; now: Date; error: string }): Promise<WcWebhookEventRow>
+  }): Promise<Array<Pick<ShoppingWebhookEventRow, 'id'>>>
+  claimEvent(id: string, now: Date, staleProcessingBefore: Date): Promise<ShoppingWebhookEventRow | null>
+  markProcessed(id: string, now: Date): Promise<ShoppingWebhookEventRow>
+  markFailed(input: { id: string; now: Date; error: string; nextAttemptAt: Date }): Promise<ShoppingWebhookEventRow>
+  markDeadLetter(input: { id: string; now: Date; error: string }): Promise<ShoppingWebhookEventRow>
 }
+
+/** @deprecated Use ShoppingWebhookEventRepository. */
+export type WcWebhookEventRepository = ShoppingWebhookEventRepository
 
 type ShoppingWebhookEventClient = Pick<PrismaClient, 'shoppingWebhookEvent' | '$queryRaw'>
 
@@ -109,18 +116,19 @@ function isUniqueConstraintError(error: unknown): boolean {
   return typeof error === 'object' && error !== null && (error as { code?: string }).code === 'P2002'
 }
 
-export function hashWcWebhookPayload(rawBody: string): string {
+export function hashShoppingWebhookPayload(rawBody: string): string {
   // Hash the exact signed body bytes. Do not stringify parsed JSON here: WC
   // redeliveries are byte-identical, and whitespace-sensitive hashing keeps
   // dedupe aligned with the signature input while avoiding extra CPU work.
   return createHash('sha256').update(rawBody).digest('hex')
 }
 
-export const hashShoppingWebhookPayload = hashWcWebhookPayload
+/** @deprecated Use hashShoppingWebhookPayload. */
+export const hashWcWebhookPayload = hashShoppingWebhookPayload
 
 function seededUnitInterval(seed: string): number {
   const digest = createHash('sha256').update(seed).digest()
-  return digest.readUInt32BE(0) / 0xFFFF_FFFF
+  return digest.readUInt32BE(0) / 0x1_0000_0000
 }
 
 export function calculateWcWebhookRetryDelayMs(
@@ -137,6 +145,8 @@ export function calculateWcWebhookRetryDelayMs(
   if (jitterRatio <= 0) return base
   const unit = options.jitterSeed ? seededUnitInterval(options.jitterSeed) : (options.random ?? Math.random)()
   const jitter = base * jitterRatio * (unit * 2 - 1)
+  // Keep retries delayed enough to avoid immediate tight loops even when jitter
+  // subtracts from the first-attempt base delay.
   return Math.max(MIN_RETRY_DELAY_MS, Math.floor(base + jitter))
 }
 
@@ -146,9 +156,9 @@ export function normalizeWcWebhookError(error: unknown): string {
   return `${message.slice(0, MAX_ERROR_LENGTH)}... [truncated]`
 }
 
-export function createWcWebhookEventRepository(
+export function createShoppingWebhookEventRepository(
   options: { client?: ShoppingWebhookEventClient; connector?: ShoppingWebhookEventConnector } = {},
-): WcWebhookEventRepository {
+): ShoppingWebhookEventRepository {
   const prisma = getClient(options.client)
   const client = prisma.shoppingWebhookEvent
   const connector = options.connector ?? WOOCOMMERCE_CONNECTOR
@@ -206,7 +216,7 @@ export function createWcWebhookEventRepository(
       })
     },
     async claimEvent(id, now, staleProcessingBefore) {
-      const rows = await prisma.$queryRaw<WcWebhookEventRow[]>`
+      const rows = await prisma.$queryRaw<ShoppingWebhookEventRow[]>`
         UPDATE "shopping_webhook_events"
         SET
           "status" = ${WC_WEBHOOK_EVENT_STATUS.processing},
@@ -276,8 +286,11 @@ export function createWcWebhookEventRepository(
   }
 }
 
+/** @deprecated Use createShoppingWebhookEventRepository. */
+export const createWcWebhookEventRepository = createShoppingWebhookEventRepository
+
 export async function persistShoppingWebhookEvent(
-  repository: WcWebhookEventRepository,
+  repository: ShoppingWebhookEventRepository,
   input: PersistShoppingWebhookEventInput,
   options: {
     connector: ShoppingWebhookEventConnector
@@ -316,7 +329,7 @@ export async function persistShoppingWebhookEvent(
 }
 
 export async function persistWcWebhookEvent(
-  repository: WcWebhookEventRepository,
+  repository: ShoppingWebhookEventRepository,
   input: PersistWcWebhookEventInput,
   options: { isUniqueConstraintError?: (error: unknown) => boolean } = {},
 ): Promise<PersistWcWebhookEventResult> {
@@ -327,7 +340,7 @@ export async function persistWcWebhookEvent(
 }
 
 export async function persistShopifyWebhookEvent(
-  repository: WcWebhookEventRepository,
+  repository: ShoppingWebhookEventRepository,
   input: PersistShoppingWebhookEventInput,
   options: { isUniqueConstraintError?: (error: unknown) => boolean } = {},
 ): Promise<PersistShoppingWebhookEventResult> {

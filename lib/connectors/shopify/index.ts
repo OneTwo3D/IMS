@@ -4,10 +4,10 @@ import { notImplementedResult } from '@/lib/connectors/not-implemented'
 import { db } from '@/lib/db'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import {
-  createWcWebhookEventRepository,
+  createShoppingWebhookEventRepository,
   persistShopifyWebhookEvent,
   type PersistShoppingWebhookEventResult,
-  type WcWebhookEventRepository,
+  type ShoppingWebhookEventRepository,
 } from '@/lib/connectors/woocommerce/webhook-inbox'
 import { getShopifyDeliveryStatusForSalesOrder } from './delivery'
 import { extractShopifyLegacyResourceId, getShopifyCredentials, shopifyGraphql, verifyShopifyWebhookSignature } from './api'
@@ -630,7 +630,7 @@ type ShopifyWebhookDependencies = {
     reason?: 'shopify_plugin_disabled' | 'shopify_sync_disabled'
   }>
   persistWebhookEvent: typeof persistShopifyWebhookEvent
-  webhookEventRepository: WcWebhookEventRepository
+  webhookEventRepository: ShoppingWebhookEventRepository
   recordShopifySyncLog: typeof recordShopifySyncLog
 }
 
@@ -678,8 +678,19 @@ function defaultShopifyWebhookDependencies(): ShopifyWebhookDependencies {
     getShopifyCredentials,
     getWebhookProcessingGate,
     persistWebhookEvent: persistShopifyWebhookEvent,
-    webhookEventRepository: createWcWebhookEventRepository({ connector: 'shopify' }),
+    webhookEventRepository: createShoppingWebhookEventRepository({ connector: 'shopify' }),
     recordShopifySyncLog,
+  }
+}
+
+function normalizeShopifyDomain(value: string): string | null {
+  const trimmed = value.trim().toLowerCase()
+  if (!trimmed) return null
+  if (!trimmed.includes('://')) return trimmed
+  try {
+    return new URL(trimmed).hostname.toLowerCase()
+  } catch {
+    return null
   }
 }
 
@@ -762,7 +773,15 @@ export async function handleWebhook(options: ShopifyWebhookOptions = {}) {
 
   const { topic, externalEventId, webhookId, eventId, shopDomain } = getShopifyWebhookHeaders(request)
 
-  if (shopDomain && shopDomain.toLowerCase() !== creds.storeDomain.toLowerCase()) {
+  const configuredShopDomain = normalizeShopifyDomain(creds.storeDomain)
+  const receivedShopDomain = shopDomain ? normalizeShopifyDomain(shopDomain) : null
+  if (!configuredShopDomain) {
+    return Response.json({ success: false, error: 'Shopify store domain is not configured correctly' }, { status: 503 })
+  }
+  if (!receivedShopDomain) {
+    return Response.json({ success: false, error: 'Shopify webhook shop domain is required' }, { status: 401 })
+  }
+  if (receivedShopDomain !== configuredShopDomain) {
     return Response.json({ success: false, error: 'Shopify webhook shop domain mismatch' }, { status: 401 })
   }
 

@@ -3,8 +3,8 @@ import test from 'node:test'
 
 import {
   WC_WEBHOOK_EVENT_STATUS,
-  type WcWebhookEventRepository,
-  type WcWebhookEventRow,
+  type ShoppingWebhookEventRepository,
+  type ShoppingWebhookEventRow,
 } from '../lib/connectors/woocommerce/webhook-inbox.ts'
 import {
   processPendingShopifyWebhookEvents,
@@ -12,7 +12,7 @@ import {
 } from '../lib/jobs/shopify/process-shopping-webhook-events.ts'
 import { processShopifyWebhookPayload } from '../lib/connectors/shopify/index.ts'
 
-function makeRow(overrides: Partial<WcWebhookEventRow> = {}): WcWebhookEventRow {
+function makeRow(overrides: Partial<ShoppingWebhookEventRow> = {}): ShoppingWebhookEventRow {
   return {
     id: 'shopify-event-1',
     connector: 'shopify',
@@ -32,12 +32,12 @@ function makeRow(overrides: Partial<WcWebhookEventRow> = {}): WcWebhookEventRow 
   }
 }
 
-function makeRepository(initialRows: WcWebhookEventRow[] = []): {
-  repository: WcWebhookEventRepository
-  rows: WcWebhookEventRow[]
+function makeRepository(initialRows: ShoppingWebhookEventRow[] = []): {
+  repository: ShoppingWebhookEventRepository
+  rows: ShoppingWebhookEventRow[]
 } {
   const rows = initialRows.map((row) => ({ ...row }))
-  const repository: WcWebhookEventRepository = {
+  const repository: ShoppingWebhookEventRepository = {
     async createEvent() {
       throw new Error('createEvent should not run')
     },
@@ -134,6 +134,25 @@ test('processShopifyWebhookPayload records the existing Shopify webhook sync-log
   assert.equal(JSON.stringify(logs).includes('sentinel'), false)
 })
 
+test('processShopifyWebhookPayload rejects non-object payloads as permanent bad payloads', async () => {
+  const response = await processShopifyWebhookPayload(
+    {
+      resource: 'orders',
+      topic: 'orders/create',
+      externalEventId: 'webhook-1',
+      payload: [],
+    },
+    {
+      async recordShopifySyncLog() {
+        throw new Error('sync log should not run for non-object payload')
+      },
+    },
+  )
+
+  assert.equal(response.status, 400)
+  assert.deepEqual(await response.json(), { success: false, error: 'Shopify webhook body must be a JSON object' })
+})
+
 test('processShopifyWebhookEvent processes a claimed event and marks it processed', async () => {
   const now = new Date('2026-05-26T10:00:00.000Z')
   const { repository, rows } = makeRepository([makeRow()])
@@ -152,6 +171,20 @@ test('processShopifyWebhookEvent processes a claimed event and marks it processe
   assert.deepEqual(processedPayloads, [{ id: 123, secret_value: 'sentinel' }])
   assert.equal(rows[0]?.status, WC_WEBHOOK_EVENT_STATUS.processed)
   assert.equal(rows[0]?.attempts, 1)
+})
+
+test('processShopifyWebhookEvent skips rows that were already claimed', async () => {
+  const now = new Date('2026-05-26T10:00:00.000Z')
+  const { repository } = makeRepository([
+    makeRow({
+      status: WC_WEBHOOK_EVENT_STATUS.processing,
+      updatedAt: new Date('2026-05-26T09:59:00.000Z'),
+    }),
+  ])
+
+  const result = await processShopifyWebhookEvent('shopify-event-1', { repository, now })
+
+  assert.deepEqual(result, { status: 'skipped', eventId: 'shopify-event-1', reason: 'not_due_or_already_processed' })
 })
 
 test('processShopifyWebhookEvent retries transient failures and dead-letters permanent failures', async () => {
@@ -182,6 +215,61 @@ test('processShopifyWebhookEvent retries transient failures and dead-letters per
   assert.equal(rows.find((row) => row.id === 'permanent')?.status, WC_WEBHOOK_EVENT_STATUS.deadLetter)
 })
 
+test('processShopifyWebhookEvent retries 408 and 429 responses', async () => {
+  const now = new Date('2026-05-26T10:00:00.000Z')
+  const timeout = makeRow({ id: 'timeout' })
+  const rateLimited = makeRow({ id: 'rate-limited' })
+  const { repository, rows } = makeRepository([timeout, rateLimited])
+
+  const timeoutResult = await processShopifyWebhookEvent('timeout', {
+    repository,
+    now,
+    async processPayload() {
+      return Response.json({ error: 'timeout' }, { status: 408 })
+    },
+  })
+  const rateLimitResult = await processShopifyWebhookEvent('rate-limited', {
+    repository,
+    now,
+    async processPayload() {
+      return Response.json({ error: 'rate limited' }, { status: 429 })
+    },
+  })
+
+  assert.equal(timeoutResult.status, 'failed')
+  assert.equal(rateLimitResult.status, 'failed')
+  assert.equal(rows.find((row) => row.id === 'timeout')?.status, WC_WEBHOOK_EVENT_STATUS.failed)
+  assert.equal(rows.find((row) => row.id === 'rate-limited')?.status, WC_WEBHOOK_EVENT_STATUS.failed)
+})
+
+test('processShopifyWebhookEvent dead-letters max attempts and unsupported resources', async () => {
+  const now = new Date('2026-05-26T10:00:00.000Z')
+  const exhausted = makeRow({ id: 'exhausted', attempts: 23 })
+  const unsupported = makeRow({ id: 'unsupported', resource: 'reviews' })
+  const { repository, rows } = makeRepository([exhausted, unsupported])
+
+  const exhaustedResult = await processShopifyWebhookEvent('exhausted', {
+    repository,
+    now,
+    env: { WC_WEBHOOK_INBOX_MAX_ATTEMPTS: '24' },
+    async processPayload() {
+      throw new Error('still broken')
+    },
+  })
+  const unsupportedResult = await processShopifyWebhookEvent('unsupported', {
+    repository,
+    now,
+    async processPayload() {
+      throw new Error('processPayload should not run')
+    },
+  })
+
+  assert.equal(exhaustedResult.status, 'dead_letter')
+  assert.equal(unsupportedResult.status, 'dead_letter')
+  assert.equal(rows.find((row) => row.id === 'exhausted')?.status, WC_WEBHOOK_EVENT_STATUS.deadLetter)
+  assert.equal(rows.find((row) => row.id === 'unsupported')?.status, WC_WEBHOOK_EVENT_STATUS.deadLetter)
+})
+
 test('processPendingShopifyWebhookEvents drains only Shopify claimable rows', async () => {
   const now = new Date('2026-05-26T10:00:00.000Z')
   const { repository, rows } = makeRepository([
@@ -191,6 +279,12 @@ test('processPendingShopifyWebhookEvents drains only Shopify claimable rows', as
       status: WC_WEBHOOK_EVENT_STATUS.failed,
       nextAttemptAt: new Date('2026-05-26T10:00:00.000Z'),
       receivedAt: new Date('2026-05-26T09:59:00.000Z'),
+    }),
+    makeRow({
+      id: 'shopify-stale-processing',
+      status: WC_WEBHOOK_EVENT_STATUS.processing,
+      updatedAt: new Date('2026-05-26T09:40:00.000Z'),
+      receivedAt: new Date('2026-05-26T09:59:30.000Z'),
     }),
     makeRow({ id: 'wc-pending', connector: 'woocommerce' }),
   ])
@@ -203,8 +297,31 @@ test('processPendingShopifyWebhookEvents drains only Shopify claimable rows', as
     },
   })
 
-  assert.deepEqual(result, { attempted: 2, processed: 2, failed: 0, deadLettered: 0, skipped: 0 })
+  assert.deepEqual(result, { attempted: 3, processed: 3, failed: 0, deadLettered: 0, skipped: 0 })
   assert.equal(rows.find((row) => row.id === 'shopify-pending')?.status, WC_WEBHOOK_EVENT_STATUS.processed)
   assert.equal(rows.find((row) => row.id === 'shopify-due-failed')?.status, WC_WEBHOOK_EVENT_STATUS.processed)
+  assert.equal(rows.find((row) => row.id === 'shopify-stale-processing')?.status, WC_WEBHOOK_EVENT_STATUS.processed)
   assert.equal(rows.find((row) => row.id === 'wc-pending')?.status, WC_WEBHOOK_EVENT_STATUS.pending)
+})
+
+test('processPendingShopifyWebhookEvents handles empty queues and per-event crashes', async () => {
+  const now = new Date('2026-05-26T10:00:00.000Z')
+  const empty = makeRepository()
+  assert.deepEqual(
+    await processPendingShopifyWebhookEvents({ repository: empty.repository, now }),
+    { attempted: 0, processed: 0, failed: 0, deadLettered: 0, skipped: 0 },
+  )
+
+  const { repository } = makeRepository([makeRow({ id: 'shopify-event-1' })])
+  const result = await processPendingShopifyWebhookEvents({
+    repository: {
+      ...repository,
+      async claimEvent() {
+        throw new Error('claim failed')
+      },
+    },
+    now,
+  })
+
+  assert.deepEqual(result, { attempted: 1, processed: 0, failed: 1, deadLettered: 0, skipped: 0 })
 })

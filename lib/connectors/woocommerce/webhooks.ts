@@ -15,10 +15,10 @@ import {
 } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
 import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verify'
 import {
-  createWcWebhookEventRepository,
+  createShoppingWebhookEventRepository,
   persistWcWebhookEvent,
   type PersistWcWebhookEventResult,
-  type WcWebhookEventRepository,
+  type ShoppingWebhookEventRepository,
 } from '@/lib/connectors/woocommerce/webhook-inbox'
 import type { WcFullOrder, WcFullProduct, WcRefund } from '@/lib/connectors/woocommerce/sync/types'
 import type { ShoppingWebhookResource } from '@/lib/shopping'
@@ -39,7 +39,7 @@ export type WcWebhookDependencies = {
     reason?: 'woocommerce_plugin_disabled' | 'wc_sync_disabled'
   }>
   persistWebhookEvent: typeof persistWcWebhookEvent
-  webhookEventRepository: WcWebhookEventRepository
+  webhookEventRepository: ShoppingWebhookEventRepository
   handleOrderWebhook: (payload: unknown, topic: string | null) => Promise<Response>
   handleProductWebhook: (payload: unknown) => Promise<Response>
   handleRefundWebhook: (payload: unknown) => Promise<Response>
@@ -331,7 +331,7 @@ const defaultDependencies: WcWebhookDependencies = {
   recordWebhookReceipt,
   getWebhookProcessingGate,
   persistWebhookEvent: persistWcWebhookEvent,
-  webhookEventRepository: createWcWebhookEventRepository(),
+  webhookEventRepository: createShoppingWebhookEventRepository({ connector: 'woocommerce' }),
   handleOrderWebhook,
   handleProductWebhook,
   handleRefundWebhook,

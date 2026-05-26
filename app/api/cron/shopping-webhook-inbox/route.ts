@@ -9,6 +9,63 @@ import { processPendingWcWebhookEvents } from '@/lib/jobs/woocommerce/process-sh
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
 
+type ConnectorTickResult = Record<string, unknown>
+
+function normalizeCronError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+async function runConnectorTick(input: {
+  connector: 'woocommerce' | 'shopify'
+  pluginDisabledReason: string
+  syncDisabledReason: string
+  getSyncEnabled: () => Promise<boolean>
+  processPendingEvents: () => Promise<ConnectorTickResult>
+}): Promise<ConnectorTickResult> {
+  try {
+    if (!(await isIntegrationPluginEnabled(input.connector))) {
+      return {
+        skipped: true,
+        reason: input.pluginDisabledReason,
+        gates: { pluginEnabled: false, syncEnabled: null },
+      }
+    }
+
+    if (!(await input.getSyncEnabled())) {
+      return {
+        skipped: true,
+        reason: input.syncDisabledReason,
+        gates: { pluginEnabled: true, syncEnabled: false },
+      }
+    }
+
+    return await input.processPendingEvents()
+  } catch (error) {
+    console.warn('[shopping-webhook-inbox] connector tick failed', {
+      connector: input.connector,
+      error: normalizeCronError(error),
+    })
+    return {
+      attempted: 0,
+      processed: 0,
+      failed: 1,
+      deadLettered: 0,
+      skipped: 0,
+      error: normalizeCronError(error),
+    }
+  }
+}
+
+async function getWcSyncEnabled(): Promise<boolean> {
+  const enabled = await db.setting.findUnique({ where: { key: 'wc_sync_enabled' } })
+  return enabled?.value === 'true'
+}
+
+async function getShopifySyncEnabled(): Promise<boolean> {
+  const settings = await getShopifySettings()
+  return settings.shopify_sync_enabled === 'true'
+}
+
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
@@ -19,46 +76,24 @@ export async function GET(request: Request) {
   const { runId, result } = await runCronWithLogging({
     jobName: 'shopping-webhook-inbox',
     run: async () => {
-      const connectorResults: Record<string, unknown> = {}
-      if (!(await isIntegrationPluginEnabled('woocommerce'))) {
-        connectorResults.woocommerce = {
-          skipped: true,
-          reason: 'woocommerce_plugin_disabled',
-          gates: { pluginEnabled: false, syncEnabled: null },
-        }
-      } else {
-        const enabled = await db.setting.findUnique({ where: { key: 'wc_sync_enabled' } })
-        if (enabled?.value !== 'true') {
-          connectorResults.woocommerce = {
-            skipped: true,
-            reason: 'wc_sync_disabled',
-            gates: { pluginEnabled: true, syncEnabled: false },
-          }
-        } else {
-          connectorResults.woocommerce = await processPendingWcWebhookEvents()
-        }
-      }
+      const [woocommerce, shopify] = await Promise.all([
+        runConnectorTick({
+          connector: 'woocommerce',
+          pluginDisabledReason: 'woocommerce_plugin_disabled',
+          syncDisabledReason: 'wc_sync_disabled',
+          getSyncEnabled: getWcSyncEnabled,
+          processPendingEvents: processPendingWcWebhookEvents,
+        }),
+        runConnectorTick({
+          connector: 'shopify',
+          pluginDisabledReason: 'shopify_plugin_disabled',
+          syncDisabledReason: 'shopify_sync_disabled',
+          getSyncEnabled: getShopifySyncEnabled,
+          processPendingEvents: processPendingShopifyWebhookEvents,
+        }),
+      ])
 
-      if (!(await isIntegrationPluginEnabled('shopify'))) {
-        connectorResults.shopify = {
-          skipped: true,
-          reason: 'shopify_plugin_disabled',
-          gates: { pluginEnabled: false, syncEnabled: null },
-        }
-      } else {
-        const settings = await getShopifySettings()
-        if (settings.shopify_sync_enabled !== 'true') {
-          connectorResults.shopify = {
-            skipped: true,
-            reason: 'shopify_sync_disabled',
-            gates: { pluginEnabled: true, syncEnabled: false },
-          }
-        } else {
-          connectorResults.shopify = await processPendingShopifyWebhookEvents()
-        }
-      }
-
-      return { connectors: connectorResults } as Record<string, unknown>
+      return { connectors: { woocommerce, shopify } } as Record<string, unknown>
     },
   })
 
