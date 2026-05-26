@@ -2,12 +2,22 @@ import type { DeliveryStatus, ExternalOrder, ExternalProduct, StockUpdate } from
 import type { ShoppingProductLinkResult, ShoppingWebhookResource } from '@/lib/shopping'
 import { notImplementedResult } from '@/lib/connectors/not-implemented'
 import { db } from '@/lib/db'
+import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
+import {
+  createWcWebhookEventRepository,
+  persistShopifyWebhookEvent,
+  type PersistShoppingWebhookEventResult,
+  type WcWebhookEventRepository,
+} from '@/lib/connectors/woocommerce/webhook-inbox'
 import { getShopifyDeliveryStatusForSalesOrder } from './delivery'
 import { extractShopifyLegacyResourceId, getShopifyCredentials, shopifyGraphql, verifyShopifyWebhookSignature } from './api'
 import { getShopifyProductExternalLink, getShopifySalesOrderAdminLink } from './links'
 import { getShopifySettings } from './settings'
 
 const CONNECTOR = 'Shopify'
+const MAX_SHOPIFY_WEBHOOK_EXTERNAL_EVENT_ID_LENGTH = 256
+const SHOPIFY_WEBHOOK_NOT_IMPLEMENTED_MESSAGE =
+  'Shopify webhook processing is not implemented yet; delivery was acknowledged without mutating IMS data'
 
 type ShopifyOrdersResponse = {
   orders: {
@@ -615,6 +625,12 @@ export async function syncStock(updates: StockUpdate[] = []) {
 
 type ShopifyWebhookDependencies = {
   getShopifyCredentials: typeof getShopifyCredentials
+  getWebhookProcessingGate: () => Promise<{
+    enabled: boolean
+    reason?: 'shopify_plugin_disabled' | 'shopify_sync_disabled'
+  }>
+  persistWebhookEvent: typeof persistShopifyWebhookEvent
+  webhookEventRepository: WcWebhookEventRepository
   recordShopifySyncLog: typeof recordShopifySyncLog
 }
 
@@ -623,25 +639,101 @@ type ShopifyWebhookOptions =
       request?: undefined
       resource?: ShoppingWebhookResource
       rawBody?: undefined
-      dependencies?: ShopifyWebhookDependencies
+      dependencies?: Partial<ShopifyWebhookDependencies>
     }
   | {
       request: Request
       resource?: ShoppingWebhookResource
       rawBody: string
-      dependencies?: ShopifyWebhookDependencies
+      dependencies?: Partial<ShopifyWebhookDependencies>
     }
+
+function getShopifyWebhookHeaders(request: Request) {
+  const rawExternalEventId = request.headers.get('x-shopify-webhook-id')
+    ?? request.headers.get('x-shopify-event-id')
+  return {
+    topic: request.headers.get('x-shopify-topic'),
+    externalEventId: rawExternalEventId
+      ? rawExternalEventId.slice(0, MAX_SHOPIFY_WEBHOOK_EXTERNAL_EVENT_ID_LENGTH)
+      : null,
+    webhookId: request.headers.get('x-shopify-webhook-id'),
+    eventId: request.headers.get('x-shopify-event-id'),
+    shopDomain: request.headers.get('x-shopify-shop-domain'),
+  }
+}
+
+async function getWebhookProcessingGate() {
+  if (!(await isIntegrationPluginEnabled('shopify'))) {
+    return { enabled: false as const, reason: 'shopify_plugin_disabled' as const }
+  }
+  const settings = await getShopifySettings()
+  if (settings.shopify_sync_enabled !== 'true') {
+    return { enabled: false as const, reason: 'shopify_sync_disabled' as const }
+  }
+  return { enabled: true as const }
+}
+
+function defaultShopifyWebhookDependencies(): ShopifyWebhookDependencies {
+  return {
+    getShopifyCredentials,
+    getWebhookProcessingGate,
+    persistWebhookEvent: persistShopifyWebhookEvent,
+    webhookEventRepository: createWcWebhookEventRepository({ connector: 'shopify' }),
+    recordShopifySyncLog,
+  }
+}
+
+export async function processShopifyWebhookPayload(
+  input: {
+    resource: ShoppingWebhookResource
+    topic: string | null
+    externalEventId: string | null
+    payload: unknown
+  },
+  dependencies: Pick<ShopifyWebhookDependencies, 'recordShopifySyncLog'> = defaultShopifyWebhookDependencies(),
+) {
+  if (!input.payload || typeof input.payload !== 'object' || Array.isArray(input.payload)) {
+    return Response.json({ success: false, error: 'Shopify webhook body must be a JSON object' }, { status: 400 })
+  }
+
+  const payload = input.payload as Record<string, unknown>
+  await dependencies.recordShopifySyncLog({
+    direction: 'FROM_CONNECTOR',
+    status: 'FAILED',
+    entityType: 'Webhook',
+    externalId: input.externalEventId,
+    payload: {
+      resource: input.resource,
+      topic: input.topic,
+      externalEventId: input.externalEventId,
+      // Store key names for triage, never values or raw payload content.
+      payloadKeys: Object.keys(payload).sort(),
+    },
+    errorMessage: SHOPIFY_WEBHOOK_NOT_IMPLEMENTED_MESSAGE,
+  })
+
+  return Response.json({
+    success: false,
+    connector: 'shopify',
+    resource: input.resource,
+    topic: input.topic,
+    externalEventId: input.externalEventId,
+    skipped: true,
+    error: SHOPIFY_WEBHOOK_NOT_IMPLEMENTED_MESSAGE,
+  }, { status: 202 })
+}
 
 export async function handleWebhook(options: ShopifyWebhookOptions = {}) {
   const {
     request,
     resource,
     rawBody,
-    dependencies = {
-      getShopifyCredentials,
-      recordShopifySyncLog,
-    },
+    dependencies: dependencyOverrides,
   } = options
+  const dependencies = {
+    ...defaultShopifyWebhookDependencies(),
+    ...dependencyOverrides,
+  }
 
   if (!request) {
     return Response.json(
@@ -668,6 +760,12 @@ export async function handleWebhook(options: ShopifyWebhookOptions = {}) {
     return Response.json({ success: false, error: 'Invalid Shopify webhook signature' }, { status: 401 })
   }
 
+  const { topic, externalEventId, webhookId, eventId, shopDomain } = getShopifyWebhookHeaders(request)
+
+  if (shopDomain && shopDomain.toLowerCase() !== creds.storeDomain.toLowerCase()) {
+    return Response.json({ success: false, error: 'Shopify webhook shop domain mismatch' }, { status: 401 })
+  }
+
   let parsedPayload: unknown
   try {
     parsedPayload = JSON.parse(body) as unknown
@@ -679,44 +777,37 @@ export async function handleWebhook(options: ShopifyWebhookOptions = {}) {
   }
   const payload = parsedPayload as Record<string, unknown>
 
-  const topic = request.headers.get('x-shopify-topic')
-  const webhookId = request.headers.get('x-shopify-webhook-id')
-  const eventId = request.headers.get('x-shopify-event-id')
-  const shopDomain = request.headers.get('x-shopify-shop-domain')
-  const message = 'Shopify webhook processing is not implemented yet; delivery was acknowledged without mutating IMS data'
-
-  if (shopDomain && shopDomain.toLowerCase() !== creds.storeDomain.toLowerCase()) {
-    return Response.json({ success: false, error: 'Shopify webhook shop domain mismatch' }, { status: 401 })
+  const gate = await dependencies.getWebhookProcessingGate()
+  if (!gate.enabled) {
+    return Response.json({
+      accepted: true,
+      queued: false,
+      skipped: true,
+      reason: gate.reason,
+    }, { status: 202 })
   }
 
-  await dependencies.recordShopifySyncLog({
-    direction: 'FROM_CONNECTOR',
-    status: 'FAILED',
-    entityType: 'Webhook',
-    externalId: webhookId ?? eventId ?? null,
-    payload: {
-      resource: resource ?? null,
+  const result: PersistShoppingWebhookEventResult = await dependencies.persistWebhookEvent(
+    dependencies.webhookEventRepository,
+    {
+      resource: resource ?? 'orders',
       topic,
-      shopDomain,
-      webhookId,
-      eventId,
-      bodyLength: body.length,
-      // Store key names for triage, never values or raw payload content.
-      payloadKeys: Object.keys(payload).sort(),
+      externalEventId,
+      rawBody: body,
+      payload,
     },
-    errorMessage: message,
-  })
+  )
 
   return Response.json({
-    success: false,
+    accepted: true,
+    queued: result.status === 'created',
+    duplicate: result.status === 'duplicate',
+    eventId: result.event.id,
     connector: 'shopify',
-    resource: resource ?? null,
+    resource: resource ?? 'orders',
     topic,
-    shopDomain,
     webhookId,
-    eventId,
-    skipped: true,
-    error: message,
+    shopifyEventId: eventId,
   }, { status: 202 })
 }
 

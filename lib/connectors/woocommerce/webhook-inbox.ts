@@ -6,6 +6,9 @@ import { parsePositiveIntegerEnv } from '@/lib/env'
 import type { ShoppingWebhookResource } from '@/lib/shopping'
 
 const WOOCOMMERCE_CONNECTOR = 'woocommerce' as const
+const SHOPIFY_CONNECTOR = 'shopify' as const
+
+export type ShoppingWebhookEventConnector = typeof WOOCOMMERCE_CONNECTOR | typeof SHOPIFY_CONNECTOR
 
 export const WC_WEBHOOK_EVENT_STATUS = {
   pending: 'PENDING',
@@ -35,7 +38,7 @@ export type WcWebhookEventRow = {
   updatedAt: Date
 }
 
-export type PersistWcWebhookEventInput = {
+export type PersistShoppingWebhookEventInput = {
   resource: ShoppingWebhookResource
   topic: string | null
   externalEventId?: string | null
@@ -43,14 +46,18 @@ export type PersistWcWebhookEventInput = {
   payload: unknown
 }
 
-export type PersistWcWebhookEventResult =
+export type PersistWcWebhookEventInput = PersistShoppingWebhookEventInput
+
+export type PersistShoppingWebhookEventResult =
   | { status: 'created'; event: WcWebhookEventRow }
   | { status: 'duplicate'; event: WcWebhookEventRow }
 
+export type PersistWcWebhookEventResult = PersistShoppingWebhookEventResult
+
 export type WcWebhookEventRepository = {
-  createEvent(input: PersistWcWebhookEventInput & { connector: 'woocommerce'; payloadHash: string }): Promise<WcWebhookEventRow>
+  createEvent(input: PersistShoppingWebhookEventInput & { connector: ShoppingWebhookEventConnector; payloadHash: string }): Promise<WcWebhookEventRow>
   findByConnectorResourceAndPayloadHash(input: {
-    connector: 'woocommerce'
+    connector: ShoppingWebhookEventConnector
     resource: ShoppingWebhookResource
     payloadHash: string
   }): Promise<WcWebhookEventRow | null>
@@ -109,6 +116,8 @@ export function hashWcWebhookPayload(rawBody: string): string {
   return createHash('sha256').update(rawBody).digest('hex')
 }
 
+export const hashShoppingWebhookPayload = hashWcWebhookPayload
+
 function seededUnitInterval(seed: string): number {
   const digest = createHash('sha256').update(seed).digest()
   return digest.readUInt32BE(0) / 0xFFFF_FFFF
@@ -138,7 +147,7 @@ export function normalizeWcWebhookError(error: unknown): string {
 }
 
 export function createWcWebhookEventRepository(
-  options: { client?: ShoppingWebhookEventClient; connector?: typeof WOOCOMMERCE_CONNECTOR } = {},
+  options: { client?: ShoppingWebhookEventClient; connector?: ShoppingWebhookEventConnector } = {},
 ): WcWebhookEventRepository {
   const prisma = getClient(options.client)
   const client = prisma.shoppingWebhookEvent
@@ -267,12 +276,15 @@ export function createWcWebhookEventRepository(
   }
 }
 
-export async function persistWcWebhookEvent(
+export async function persistShoppingWebhookEvent(
   repository: WcWebhookEventRepository,
-  input: PersistWcWebhookEventInput,
-  options: { isUniqueConstraintError?: (error: unknown) => boolean } = {},
-): Promise<PersistWcWebhookEventResult> {
-  const payloadHash = hashWcWebhookPayload(input.rawBody)
+  input: PersistShoppingWebhookEventInput,
+  options: {
+    connector: ShoppingWebhookEventConnector
+    isUniqueConstraintError?: (error: unknown) => boolean
+  },
+): Promise<PersistShoppingWebhookEventResult> {
+  const payloadHash = hashShoppingWebhookPayload(input.rawBody)
   const uniqueError = options.isUniqueConstraintError ?? isUniqueConstraintError
 
   try {
@@ -280,20 +292,20 @@ export async function persistWcWebhookEvent(
       status: 'created',
       event: await repository.createEvent({
         ...input,
-        connector: 'woocommerce',
+        connector: options.connector,
         payloadHash,
       }),
     }
   } catch (error) {
     if (!uniqueError(error)) throw error
     const existing = await repository.findByConnectorResourceAndPayloadHash({
-      connector: 'woocommerce',
+      connector: options.connector,
       resource: input.resource,
       payloadHash,
     })
     if (!existing) {
-      console.warn('[woocommerce-webhook-inbox] unique collision without findable duplicate', {
-        connector: WOOCOMMERCE_CONNECTOR,
+      console.warn('[shopping-webhook-inbox] unique collision without findable duplicate', {
+        connector: options.connector,
         resource: input.resource,
         payloadHash,
       })
@@ -301,6 +313,28 @@ export async function persistWcWebhookEvent(
     }
     return { status: 'duplicate', event: existing }
   }
+}
+
+export async function persistWcWebhookEvent(
+  repository: WcWebhookEventRepository,
+  input: PersistWcWebhookEventInput,
+  options: { isUniqueConstraintError?: (error: unknown) => boolean } = {},
+): Promise<PersistWcWebhookEventResult> {
+  return persistShoppingWebhookEvent(repository, input, {
+    ...options,
+    connector: WOOCOMMERCE_CONNECTOR,
+  })
+}
+
+export async function persistShopifyWebhookEvent(
+  repository: WcWebhookEventRepository,
+  input: PersistShoppingWebhookEventInput,
+  options: { isUniqueConstraintError?: (error: unknown) => boolean } = {},
+): Promise<PersistShoppingWebhookEventResult> {
+  return persistShoppingWebhookEvent(repository, input, {
+    ...options,
+    connector: SHOPIFY_CONNECTOR,
+  })
 }
 
 export function getWcWebhookProcessPageSize(env: Record<string, string | undefined> = process.env): number {
