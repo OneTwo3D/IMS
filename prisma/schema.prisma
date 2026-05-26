@@ -1675,6 +1675,28 @@ model ShoppingSyncLog {
   @@map("shopping_sync_logs")
 }
 
+model ShoppingWebhookEvent {
+  id              String    @id @default(cuid())
+  connector       String
+  resource        String
+  externalEventId String?
+  topic           String?
+  payloadHash     String
+  payloadJson     Json
+  status          String
+  attempts        Int       @default(0)
+  nextAttemptAt   DateTime?
+  processedAt     DateTime?
+  lastError       String?
+  receivedAt      DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@unique([connector, resource, payloadHash], map: "shopping_webhook_events_connector_resource_payloadHash_key")
+  @@index([connector, resource, status, receivedAt], map: "shopping_webhook_events_connector_resource_status_receivedA_idx")
+  @@index([status, nextAttemptAt], map: "shopping_webhook_events_status_nextAttemptAt_idx")
+  @@map("shopping_webhook_events")
+}
+
 model StockSyncState {
   connector        String
   productId        String

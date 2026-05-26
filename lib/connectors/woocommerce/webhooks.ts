@@ -13,6 +13,12 @@ import {
   shouldSuppressWcWebhookEcho,
 } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
 import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verify'
+import {
+  createWcWebhookEventRepository,
+  persistWcWebhookEvent,
+  type PersistWcWebhookEventResult,
+  type WcWebhookEventRepository,
+} from '@/lib/connectors/woocommerce/webhook-inbox'
 import type { WcFullOrder, WcFullProduct, WcRefund } from '@/lib/connectors/woocommerce/sync/types'
 import type { ShoppingWebhookResource } from '@/lib/shopping'
 
@@ -25,6 +31,8 @@ export type WcWebhookDependencies = {
   getMaintenanceModeResponse: (kind: 'cron' | 'webhook') => Promise<NextResponse | null>
   verifyWebhook: (body: string, signature: string | null) => Promise<boolean>
   recordWebhookReceipt: (resource: ShoppingWebhookResource) => Promise<void>
+  persistWebhookEvent: typeof persistWcWebhookEvent
+  webhookEventRepository: WcWebhookEventRepository
   handleOrderWebhook: (payload: unknown, topic: string | null) => Promise<Response>
   handleProductWebhook: (payload: unknown) => Promise<Response>
   handleRefundWebhook: (payload: unknown) => Promise<Response>
@@ -66,6 +74,9 @@ function getWebhookHeaders(request: Request) {
   return {
     signature: request.headers.get('x-wc-webhook-signature'),
     topic: request.headers.get('x-wc-webhook-topic'),
+    externalEventId: request.headers.get('x-wc-webhook-delivery-id')
+      ?? request.headers.get('x-wc-webhook-event-id')
+      ?? request.headers.get('x-wc-webhook-id'),
   }
 }
 
@@ -272,10 +283,30 @@ async function handleRefundWebhook(payload: unknown) {
   return NextResponse.json({ ok: true })
 }
 
+export async function processWcWebhookPayload(
+  input: {
+    resource: ShoppingWebhookResource
+    topic: string | null
+    payload: unknown
+  },
+  dependencies: Pick<WcWebhookDependencies, 'handleOrderWebhook' | 'handleProductWebhook' | 'handleRefundWebhook'> = defaultDependencies,
+) {
+  switch (input.resource) {
+    case 'orders':
+      return dependencies.handleOrderWebhook(input.payload, input.topic)
+    case 'products':
+      return dependencies.handleProductWebhook(input.payload)
+    case 'refunds':
+      return dependencies.handleRefundWebhook(input.payload)
+  }
+}
+
 const defaultDependencies: WcWebhookDependencies = {
   getMaintenanceModeResponse,
   verifyWebhook: verifyWcWebhook,
   recordWebhookReceipt,
+  persistWebhookEvent: persistWcWebhookEvent,
+  webhookEventRepository: createWcWebhookEventRepository(),
   handleOrderWebhook,
   handleProductWebhook,
   handleRefundWebhook,
@@ -291,7 +322,7 @@ export async function handleWcWebhook(
   if (maintenance) return maintenance
 
   const body = rawBody
-  const { signature, topic } = getWebhookHeaders(request)
+  const { signature, topic, externalEventId } = getWebhookHeaders(request)
 
   if (isWebhookPing(signature, topic)) {
     return NextResponse.json({ ok: true, ping: true })
@@ -311,12 +342,21 @@ export async function handleWcWebhook(
   const parsed = parseWebhookJson<unknown>(body)
   if (!parsed.ok) return parsed.response
 
-  switch (resource) {
-    case 'orders':
-      return dependencies.handleOrderWebhook(parsed.value, topic)
-    case 'products':
-      return dependencies.handleProductWebhook(parsed.value)
-    case 'refunds':
-      return dependencies.handleRefundWebhook(parsed.value)
-  }
+  const result: PersistWcWebhookEventResult = await dependencies.persistWebhookEvent(
+    dependencies.webhookEventRepository,
+    {
+      resource,
+      topic,
+      externalEventId,
+      rawBody: body,
+      payload: parsed.value,
+    },
+  )
+
+  return NextResponse.json({
+    accepted: true,
+    queued: result.status === 'created',
+    duplicate: result.status === 'duplicate',
+    eventId: result.event.id,
+  }, { status: 202 })
 }
