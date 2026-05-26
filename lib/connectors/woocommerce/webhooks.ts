@@ -16,6 +16,34 @@ import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verif
 import type { WcFullOrder, WcFullProduct, WcRefund } from '@/lib/connectors/woocommerce/sync/types'
 import type { ShoppingWebhookResource } from '@/lib/shopping'
 
+type JsonParseResult<T> =
+  | { ok: true; value: T }
+  | { ok: false; response: NextResponse }
+
+/** @internal Test-only dependency injection for webhook unit tests. */
+export type WcWebhookDependencies = {
+  getMaintenanceModeResponse: (kind: 'cron' | 'webhook') => Promise<NextResponse | null>
+  verifyWebhook: (body: string, signature: string | null) => Promise<boolean>
+  recordWebhookReceipt: (resource: ShoppingWebhookResource) => Promise<void>
+  handleOrderWebhook: (payload: unknown, topic: string | null) => Promise<Response>
+  handleProductWebhook: (payload: unknown) => Promise<Response>
+  handleRefundWebhook: (payload: unknown) => Promise<Response>
+}
+
+function parseWebhookJson<T>(body: string): JsonParseResult<T> {
+  try {
+    return { ok: true, value: JSON.parse(body) as T }
+  } catch (error) {
+    console.warn('[woocommerce-webhook] JSON parse failed', {
+      error: error instanceof Error ? error.message : String(error),
+    })
+    return {
+      ok: false,
+      response: NextResponse.json({ success: false, error: 'Malformed JSON body' }, { status: 400 }),
+    }
+  }
+}
+
 async function recordWebhookReceipt(resource: ShoppingWebhookResource) {
   const receivedAt = new Date().toISOString()
   const keys = ['wc_webhook_last_received_at']
@@ -57,14 +85,14 @@ async function advanceWcOrderSyncCursor() {
   })
 }
 
-async function handleOrderWebhook(body: string, topic: string | null) {
+async function handleOrderWebhook(payload: unknown, topic: string | null) {
   const initialImportDone = await db.setting.findUnique({ where: { key: 'wc_initial_import_completed' } })
   if (initialImportDone?.value !== 'true') {
     return NextResponse.json({ ok: true, skipped: 'initial_import_pending' })
   }
 
   if (topic === 'refund.created') {
-    const wcRefund = JSON.parse(body) as WcRefund
+    const wcRefund = payload as WcRefund
     const failures: string[] = []
     if (typeof wcRefund.parent_id === 'number') {
       try {
@@ -92,7 +120,7 @@ async function handleOrderWebhook(body: string, topic: string | null) {
     return NextResponse.json({ ok: false, failures }, { status: 500 })
   }
 
-  const wcOrder = JSON.parse(body) as WcFullOrder
+  const wcOrder = payload as WcFullOrder
 
   const failures: string[] = []
   if (topic === 'order.created') {
@@ -147,17 +175,17 @@ async function handleOrderWebhook(body: string, topic: string | null) {
   return NextResponse.json({ ok: false, failures }, { status: 500 })
 }
 
-async function handleProductWebhook(body: string) {
-  const payload = JSON.parse(body) as Partial<WcFullProduct> & { stock_quantity?: number | null }
+async function handleProductWebhook(payload: unknown) {
+  const productPayload = payload as Partial<WcFullProduct> & { stock_quantity?: number | null }
   const canSyncProduct =
-    typeof payload.id === 'number'
-    && typeof payload.sku === 'string'
-    && typeof payload.type === 'string'
-    && typeof payload.name === 'string'
-    && typeof payload.status === 'string'
+    typeof productPayload.id === 'number'
+    && typeof productPayload.sku === 'string'
+    && typeof productPayload.type === 'string'
+    && typeof productPayload.name === 'string'
+    && typeof productPayload.status === 'string'
 
   if (canSyncProduct) {
-    const result = await syncWcProductToIms(payload as WcFullProduct)
+    const result = await syncWcProductToIms(productPayload as WcFullProduct)
     if (result.success) {
       await db.setting.upsert({
         where: { key: 'last_wc_product_sync_at' },
@@ -170,40 +198,40 @@ async function handleProductWebhook(body: string) {
         action: 'wc_product_webhook',
         tag: 'sync',
         level: 'WARNING',
-        description: `WooCommerce product webhook import failed for ${payload.sku}`,
+        description: `WooCommerce product webhook import failed for ${productPayload.sku}`,
         metadata: {
-          externalId: payload.id,
-          sku: payload.sku,
+          externalId: productPayload.id,
+          sku: productPayload.sku,
           error: result.error ?? 'Unknown product sync error',
         },
       })
     }
-  } else if (typeof payload.id === 'number') {
+  } else if (typeof productPayload.id === 'number') {
     await logActivity({
       entityType: 'SYNC',
       action: 'wc_product_webhook',
       tag: 'sync',
       level: 'WARNING',
-      description: `WooCommerce product webhook payload skipped for WC product ${payload.id}`,
+      description: `WooCommerce product webhook payload skipped for WC product ${productPayload.id}`,
       metadata: {
-        externalId: payload.id,
-        skuType: typeof payload.sku,
-        typeType: typeof payload.type,
-        nameType: typeof payload.name,
-        statusType: typeof payload.status,
-        payloadKeys: Object.keys(payload).sort(),
+        externalId: productPayload.id,
+        skuType: typeof productPayload.sku,
+        typeType: typeof productPayload.type,
+        nameType: typeof productPayload.name,
+        statusType: typeof productPayload.status,
+        payloadKeys: Object.keys(productPayload).sort(),
       },
     })
   }
 
-  if (typeof payload.id === 'number' && Object.prototype.hasOwnProperty.call(payload, 'stock_quantity')) {
+  if (typeof productPayload.id === 'number' && Object.prototype.hasOwnProperty.call(productPayload, 'stock_quantity')) {
     const product = await db.product.findFirst({
-      where: { externalProductId: BigInt(payload.id) },
+      where: { externalProductId: BigInt(productPayload.id) },
       select: { id: true, sku: true },
     })
     if (product) {
-      const qty = typeof payload.stock_quantity === 'number'
-        ? Math.floor(payload.stock_quantity)
+      const qty = typeof productPayload.stock_quantity === 'number'
+        ? Math.floor(productPayload.stock_quantity)
         : null
       await recordIncomingWcWebhook(product.id, qty)
       const suppressed = await shouldSuppressWcWebhookEcho(product.id, qty)
@@ -223,7 +251,7 @@ async function handleProductWebhook(body: string) {
             description: `WooCommerce stock webhook correction failed for ${product.sku}`,
             metadata: {
               productId: product.id,
-              externalId: payload.id,
+              externalId: productPayload.id,
               error: error instanceof Error ? error.message : String(error),
             },
           })
@@ -235,42 +263,60 @@ async function handleProductWebhook(body: string) {
   return NextResponse.json({ ok: true })
 }
 
-async function handleRefundWebhook(body: string) {
-  const payload = JSON.parse(body) as WcRefund & { order_id?: number; parent_id?: number }
-  const externalOrderId = payload.order_id ?? payload.parent_id
+async function handleRefundWebhook(payload: unknown) {
+  const refundPayload = payload as WcRefund & { order_id?: number; parent_id?: number }
+  const externalOrderId = refundPayload.order_id ?? refundPayload.parent_id
   if (!externalOrderId) return NextResponse.json({ error: 'Missing order_id' }, { status: 400 })
 
-  await syncWcRefund(externalOrderId, payload)
+  await syncWcRefund(externalOrderId, refundPayload)
   return NextResponse.json({ ok: true })
 }
 
-export async function handleWcWebhook(resource: ShoppingWebhookResource, request: Request) {
-  const maintenance = await getMaintenanceModeResponse('webhook')
+const defaultDependencies: WcWebhookDependencies = {
+  getMaintenanceModeResponse,
+  verifyWebhook: verifyWcWebhook,
+  recordWebhookReceipt,
+  handleOrderWebhook,
+  handleProductWebhook,
+  handleRefundWebhook,
+}
+
+export async function handleWcWebhook(
+  resource: ShoppingWebhookResource,
+  request: Request,
+  rawBody: string,
+  dependencies: WcWebhookDependencies = defaultDependencies,
+) {
+  const maintenance = await dependencies.getMaintenanceModeResponse('webhook')
   if (maintenance) return maintenance
 
-  const body = await request.text()
+  const body = rawBody
   const { signature, topic } = getWebhookHeaders(request)
 
   if (isWebhookPing(signature, topic)) {
     return NextResponse.json({ ok: true, ping: true })
   }
 
-  if (!(await verifyWcWebhook(body, signature))) {
+  if (!(await dependencies.verifyWebhook(body, signature))) {
     return NextResponse.json({ error: 'Invalid signature' }, { status: 401 })
   }
 
-  await recordWebhookReceipt(resource)
+  // Signed pings count toward last-received telemetry, unsigned pings do not.
+  await dependencies.recordWebhookReceipt(resource)
 
   if (isSignedActionPing(topic)) {
     return NextResponse.json({ ok: true, ping: true })
   }
 
+  const parsed = parseWebhookJson<unknown>(body)
+  if (!parsed.ok) return parsed.response
+
   switch (resource) {
     case 'orders':
-      return handleOrderWebhook(body, topic)
+      return dependencies.handleOrderWebhook(parsed.value, topic)
     case 'products':
-      return handleProductWebhook(body)
+      return dependencies.handleProductWebhook(parsed.value)
     case 'refunds':
-      return handleRefundWebhook(body)
+      return dependencies.handleRefundWebhook(parsed.value)
   }
 }

@@ -10,6 +10,7 @@ import {
   isUnsafeHost,
   validateExternalResolvedAddress,
 } from './external-url-safety'
+import { parsePositiveIntegerEnv } from '@/lib/env'
 
 export type ConnectorDnsLookup = (hostname: string) => Promise<LookupAddress[]>
 
@@ -24,14 +25,6 @@ const MAX_REDIRECTS = 5
 export const DEFAULT_CONNECTOR_FETCH_TIMEOUT_MS = 30_000
 export const DEFAULT_CONNECTOR_FETCH_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
-
-function parsePositiveIntegerEnv(value: string | undefined, fallback: number): number {
-  const raw = value?.trim()
-  if (!raw || !/^\d+$/.test(raw)) return fallback
-  const parsed = Number(raw)
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) return fallback
-  return parsed
-}
 
 function getConnectorFetchTimeoutMs(options: ConnectorFetchOptions): number {
   // Connector transport limits are read per call so runtime env changes take

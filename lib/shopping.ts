@@ -507,7 +507,12 @@ export async function getSalesOrderAdminLink(orderId: string): Promise<ShoppingE
   return links[0] ?? null
 }
 
-export async function handleShoppingWebhook(connector: ShoppingConnectorId, resource: ShoppingWebhookResource, request: Request) {
+export async function handleShoppingWebhook(
+  connector: ShoppingConnectorId,
+  resource: ShoppingWebhookResource,
+  request: Request,
+  rawBody: string,
+) {
   const pluginState = await getIntegrationPluginState()
   if (!pluginState[connector]) {
     return Response.json({ error: `${getShoppingConnector(connector).label} plugin is disabled` }, { status: 423 })
@@ -516,11 +521,11 @@ export async function handleShoppingWebhook(connector: ShoppingConnectorId, reso
   switch (connector) {
     case 'woocommerce': {
       const { handleWcWebhook } = await import('@/lib/connectors/woocommerce/webhooks')
-      return handleWcWebhook(resource, request)
+      return handleWcWebhook(resource, request, rawBody)
     }
     case 'shopify': {
       const { handleWebhook } = await import('@/lib/connectors/shopify')
-      return handleWebhook(request, resource)
+      return handleWebhook({ request, resource, rawBody })
     }
   }
 }

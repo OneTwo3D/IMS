@@ -149,9 +149,7 @@ test('public signed invoice route rejects missing HMAC token before loading PDF 
   )
 })
 
-test('public webhook shopping route requires connector-specific signature fixtures', {
-  todo: 'Add a WooCommerce/Shopify fixture that seeds connector settings and asserts unsigned webhook requests are rejected before dispatch.',
-}, () => {
+test('public webhook shopping route is registered with public-webhook classification', () => {
   assertRouteAccess('/api/webhooks/shopping/[connector]/[resource]', 'public-webhook')
 })
 
