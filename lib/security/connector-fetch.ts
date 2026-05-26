@@ -21,7 +21,29 @@ export type ConnectorFetchOptions = Pick<
 }
 
 const MAX_REDIRECTS = 5
+const DEFAULT_CONNECTOR_FETCH_TIMEOUT_MS = 30_000
+const DEFAULT_CONNECTOR_FETCH_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308])
+
+function parsePositiveIntegerEnv(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseInt(String(value ?? '').trim(), 10)
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback
+  return parsed
+}
+
+function getConnectorFetchTimeoutMs(options: ConnectorFetchOptions): number {
+  return parsePositiveIntegerEnv(
+    options.env?.CONNECTOR_FETCH_TIMEOUT_MS ?? process.env.CONNECTOR_FETCH_TIMEOUT_MS,
+    DEFAULT_CONNECTOR_FETCH_TIMEOUT_MS,
+  )
+}
+
+function getConnectorFetchMaxResponseBytes(options: ConnectorFetchOptions): number {
+  return parsePositiveIntegerEnv(
+    options.env?.CONNECTOR_FETCH_MAX_RESPONSE_BYTES ?? process.env.CONNECTOR_FETCH_MAX_RESPONSE_BYTES,
+    DEFAULT_CONNECTOR_FETCH_MAX_RESPONSE_BYTES,
+  )
+}
 
 function headersFromInit(headers: HeadersInit | undefined): Headers {
   return new Headers(headers)
@@ -172,14 +194,38 @@ function headersForRedirect(headers: Headers, from: URL, to: URL, methodChangedT
   return next
 }
 
-function collectResponse(message: IncomingMessage): Promise<Buffer> {
+function collectResponse(message: IncomingMessage, maxBytes: number, connectorName: string): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
+    let totalBytes = 0
+    let settled = false
+
+    const fail = (error: Error) => {
+      if (settled) return
+      settled = true
+      message.destroy(error)
+      reject(error)
+    }
+
     message.on('data', (chunk: Buffer | string) => {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk))
+      const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+      totalBytes += buffer.byteLength
+      if (totalBytes > maxBytes) {
+        fail(new Error(`${connectorName} response exceeded ${maxBytes} bytes.`))
+        return
+      }
+      chunks.push(buffer)
     })
-    message.on('end', () => resolve(Buffer.concat(chunks)))
-    message.on('error', reject)
+    message.on('end', () => {
+      if (settled) return
+      settled = true
+      resolve(Buffer.concat(chunks))
+    })
+    message.on('error', (error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    })
   })
 }
 
@@ -195,11 +241,17 @@ async function sendConnectorRequest(
 
   const requestOptions = buildRequestOptions(url, method, headers, options)
   const requestImpl = url.protocol === 'http:' ? httpRequest : httpsRequest
+  const maxResponseBytes = getConnectorFetchMaxResponseBytes(options)
 
   return new Promise<Response>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason instanceof Error ? signal.reason : new Error('Connector request aborted.'))
+      return
+    }
+
     const request: ClientRequest = requestImpl(requestOptions, async (message) => {
       try {
-        const responseBody = await collectResponse(message)
+        const responseBody = await collectResponse(message, maxResponseBytes, options.connectorName)
         resolve(new Response(new Uint8Array(responseBody), {
           status: message.statusCode ?? 0,
           statusText: message.statusMessage,
@@ -211,7 +263,7 @@ async function sendConnectorRequest(
     })
 
     const abort = () => {
-      request.destroy(new Error('Connector request aborted.'))
+      request.destroy(signal?.reason instanceof Error ? signal.reason : new Error('Connector request aborted.'))
     }
 
     request.on('error', reject)
@@ -243,22 +295,34 @@ export async function connectorFetch(
   let method = init.method ?? 'GET'
   let headers = headersFromInit(init.headers)
   let body = bodyFromInit(init.body)
+  const timeoutMs = getConnectorFetchTimeoutMs(options)
+  const timeoutController = init.signal ? null : new AbortController()
+  const signal = init.signal ?? timeoutController?.signal
+  const timeout = timeoutController
+    ? setTimeout(() => {
+      timeoutController.abort(new Error(`${options.connectorName} request timed out after ${timeoutMs}ms.`))
+    }, timeoutMs)
+    : null
 
-  for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
-    const response = await sendConnectorRequest(url, method, headers, body, init.signal, options)
-    const nextUrl = redirectLocation(response, url)
-    if (!nextUrl) return response
-    if (redirectCount === MAX_REDIRECTS) {
-      throw new Error(`${options.connectorName} request exceeded ${MAX_REDIRECTS} redirects.`)
+  try {
+    for (let redirectCount = 0; redirectCount <= MAX_REDIRECTS; redirectCount += 1) {
+      const response = await sendConnectorRequest(url, method, headers, body, signal, options)
+      const nextUrl = redirectLocation(response, url)
+      if (!nextUrl) return response
+      if (redirectCount === MAX_REDIRECTS) {
+        throw new Error(`${options.connectorName} request exceeded ${MAX_REDIRECTS} redirects.`)
+      }
+
+      const nextMethod = redirectMethod(method, response.status)
+      const methodChangedToGet = nextMethod !== method && nextMethod === 'GET'
+      headers = headersForRedirect(headers, url, nextUrl, methodChangedToGet)
+      method = nextMethod
+      if (methodChangedToGet) body = undefined
+      url = nextUrl
     }
 
-    const nextMethod = redirectMethod(method, response.status)
-    const methodChangedToGet = nextMethod !== method && nextMethod === 'GET'
-    headers = headersForRedirect(headers, url, nextUrl, methodChangedToGet)
-    method = nextMethod
-    if (methodChangedToGet) body = undefined
-    url = nextUrl
+    throw new Error(`${options.connectorName} request exceeded ${MAX_REDIRECTS} redirects.`)
+  } finally {
+    if (timeout) clearTimeout(timeout)
   }
-
-  throw new Error(`${options.connectorName} request exceeded ${MAX_REDIRECTS} redirects.`)
 }

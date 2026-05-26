@@ -102,6 +102,81 @@ test('connectorFetch rejects redirects to blocked resolved addresses', async () 
   }
 })
 
+test('connectorFetch applies default timeout when caller does not provide a signal', async () => {
+  const server = createServer(() => {
+    // Hold the socket open until the connector timeout aborts the request.
+  })
+  const port = await listen(server)
+
+  try {
+    await assert.rejects(
+      connectorFetch(`http://127.0.0.1:${port}/slow`, {}, {
+        connectorName: 'Connector',
+        allowE2eLocalHttp: true,
+        env: {
+          E2E_TEST_MODE: '1',
+          CONNECTOR_FETCH_TIMEOUT_MS: '20',
+        },
+      }),
+      /Connector request timed out after 20ms/,
+    )
+  } finally {
+    await close(server)
+  }
+})
+
+test('connectorFetch preserves caller supplied AbortSignal instead of adding the default timeout', async () => {
+  const server = createServer((_request, response) => {
+    setTimeout(() => {
+      response.writeHead(200, { 'Content-Type': 'application/json' })
+      response.end(JSON.stringify({ ok: true }))
+    }, 60)
+  })
+  const port = await listen(server)
+
+  try {
+    const response = await connectorFetch(`http://127.0.0.1:${port}/delayed`, {
+      signal: AbortSignal.timeout(1_000),
+    }, {
+      connectorName: 'Connector',
+      allowE2eLocalHttp: true,
+      env: {
+        E2E_TEST_MODE: '1',
+        CONNECTOR_FETCH_TIMEOUT_MS: '5',
+      },
+    })
+
+    assert.equal(response.status, 200)
+    assert.deepEqual(await response.json(), { ok: true })
+  } finally {
+    await close(server)
+  }
+})
+
+test('connectorFetch rejects responses that exceed the configured byte cap', async () => {
+  const server = createServer((_request, response) => {
+    response.writeHead(200, { 'Content-Type': 'text/plain' })
+    response.end('too large')
+  })
+  const port = await listen(server)
+
+  try {
+    await assert.rejects(
+      connectorFetch(`http://127.0.0.1:${port}/large`, {}, {
+        connectorName: 'Connector',
+        allowE2eLocalHttp: true,
+        env: {
+          E2E_TEST_MODE: '1',
+          CONNECTOR_FETCH_MAX_RESPONSE_BYTES: '4',
+        },
+      }),
+      /Connector response exceeded 4 bytes/,
+    )
+  } finally {
+    await close(server)
+  }
+})
+
 test('resolved private addresses can be explicitly allowlisted', () => {
   assert.deepEqual(
     validateExternalResolvedAddress('10.0.0.5', {
