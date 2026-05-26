@@ -26,6 +26,8 @@ function productionEnv() {
   return {
     NODE_ENV: 'production',
     DATABASE_URL: 'postgresql://imsuser:password@localhost:5432/ims',
+    AUTH_URL: 'https://ims.example.test',
+    NEXT_PUBLIC_APP_URL: 'https://ims.example.test',
   }
 }
 
@@ -89,6 +91,16 @@ function sameOriginRequest(body: BodyInit): NextRequest {
     method: 'POST',
     headers: {
       origin: 'https://ims.example.test',
+    },
+    body,
+  })
+}
+
+function refererRequest(body: BodyInit, referer: string): NextRequest {
+  return new NextRequest('https://internal-proxy.example.test/api/backup/restore', {
+    method: 'POST',
+    headers: {
+      referer,
     },
     body,
   })
@@ -200,6 +212,136 @@ test('cross-origin restore POST remains denied when both production restore flag
   assert.equal(metadataReason(activityLogs[0]), 'cross_origin_restore_request')
 })
 
+test('production restore POST accepts configured app origin even behind an internal request URL', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-configured-origin-test-'))
+  try {
+    const backupPath = path.join(root, 'backup.sql')
+    await writeFile(backupPath, 'select 1;\n')
+    const { deps, calls } = baseDeps({
+      backupDir: root,
+      env: {
+        ...productionEnv(),
+        AUTH_URL: 'https://app.ims.example.test/auth',
+        NEXT_PUBLIC_APP_URL: 'https://app.ims.example.test',
+        ALLOW_DATABASE_RESTORE: 'true',
+      },
+    })
+    const handler = createBackupRestorePostHandler(deps)
+
+    const response = await handler(new NextRequest('https://internal-proxy.example.test/api/backup/restore', {
+      method: 'POST',
+      headers: {
+        origin: 'https://app.ims.example.test',
+      },
+      body: existingBackupBody('backup.sql'),
+    }))
+    const body = await responseJson(response)
+
+    assert.equal(response.status, 200)
+    assert.equal(body.success, true)
+    assert.equal(calls.consumeToken, 1)
+    assert.equal(calls.runRestore, 1)
+    assert.equal(backupPath.endsWith('backup.sql'), true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('production restore POST does not trust spoofed forwarded host headers', async () => {
+  const { deps, calls, activityLogs } = baseDeps({
+    env: {
+      ...productionEnv(),
+      AUTH_URL: 'https://ims.example.test',
+      NEXT_PUBLIC_APP_URL: 'https://ims.example.test',
+      ALLOW_DATABASE_RESTORE: 'true',
+    },
+  })
+  const handler = createBackupRestorePostHandler(deps)
+
+  const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', {
+    method: 'POST',
+    headers: {
+      origin: 'https://attacker.example.test',
+      'x-forwarded-proto': 'https',
+      'x-forwarded-host': 'attacker.example.test',
+    },
+    body: existingBackupBody('backup.sql'),
+  }))
+  const body = await responseJson(response)
+
+  assert.equal(response.status, 403)
+  assert.equal(body.error, 'Cross-site restore requests are not allowed.')
+  assert.equal(calls.consumeToken, 0)
+  assert.equal(calls.runRestore, 0)
+  assert.equal(activityLogs.length, 1)
+  assert.equal(metadataReason(activityLogs[0]), 'cross_origin_restore_request')
+})
+
+test('production restore POST rejects missing configured app origin before consuming token', async () => {
+  const { deps, calls, activityLogs } = baseDeps({
+    env: {
+      NODE_ENV: 'production',
+      DATABASE_URL: 'postgresql://imsuser:password@localhost:5432/ims',
+      ALLOW_DATABASE_RESTORE: 'true',
+    },
+  })
+  const handler = createBackupRestorePostHandler(deps)
+
+  const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', {
+    method: 'POST',
+    headers: {
+      origin: 'https://ims.example.test',
+    },
+    body: existingBackupBody('backup.sql'),
+  }))
+  const body = await responseJson(response)
+
+  assert.equal(response.status, 403)
+  assert.equal(body.error, 'Cross-site restore requests are not allowed.')
+  assert.equal(calls.consumeToken, 0)
+  assert.equal(calls.runRestore, 0)
+  assert.equal(activityLogs.length, 1)
+  assert.equal(metadataReason(activityLogs[0]), 'cross_origin_restore_request')
+})
+
+test('production restore POST accepts valid configured referer and rejects invalid referer', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-referer-test-'))
+  try {
+    await writeFile(path.join(root, 'backup.sql'), 'select 1;\n')
+    const { deps, calls, activityLogs } = baseDeps({
+      backupDir: root,
+      env: {
+        ...productionEnv(),
+        AUTH_URL: 'https://ims.example.test',
+        NEXT_PUBLIC_APP_URL: 'https://ims.example.test',
+        ALLOW_DATABASE_RESTORE: 'true',
+      },
+    })
+    const handler = createBackupRestorePostHandler(deps)
+
+    const validResponse = await handler(refererRequest(existingBackupBody('backup.sql'), 'https://ims.example.test/admin/backups'))
+    const validBody = await responseJson(validResponse)
+
+    assert.equal(validResponse.status, 200)
+    assert.equal(validBody.success, true)
+    assert.equal(calls.consumeToken, 1)
+    assert.equal(calls.runRestore, 1)
+
+    const invalidResponse = await handler(refererRequest(existingBackupBody('backup.sql'), 'not-a-url'))
+    const invalidBody = await responseJson(invalidResponse)
+
+    assert.equal(invalidResponse.status, 403)
+    assert.equal(invalidBody.error, 'Cross-site restore requests are not allowed.')
+    assert.equal(calls.consumeToken, 1)
+    assert.equal(calls.runRestore, 1)
+    const denialLogs = activityLogs.filter((entry) => entry.action === 'backup_restore_denied')
+    assert.equal(denialLogs.length, 1)
+    assert.equal(metadataReason(denialLogs[0]), 'cross_origin_restore_request')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('production filename restore POST is disabled by default before consuming the email code', async () => {
   const { deps, calls, activityLogs } = baseDeps()
   const handler = createBackupRestorePostHandler(deps)
@@ -300,8 +442,7 @@ test('uploaded production restore denied by the upload kill switch keeps the ema
     const { deps, calls, activityLogs } = baseDeps({
       backupDir: root,
       env: {
-        NODE_ENV: 'production',
-        DATABASE_URL: 'postgresql://imsuser:password@localhost:5432/ims',
+        ...productionEnv(),
         ALLOW_DATABASE_RESTORE: 'true',
       },
     })

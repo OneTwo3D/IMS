@@ -97,22 +97,43 @@ function getDbConfig(env: Env = process.env) {
   }
 }
 
-function getRequestOrigin(request: NextRequest): string {
-  const fwdProto = (request.headers.get('x-forwarded-proto') ?? new URL(request.url).protocol.replace(':', '')).split(',')[0].trim()
-  const fwdHost = (request.headers.get('x-forwarded-host') ?? request.headers.get('host') ?? new URL(request.url).host).split(',')[0].trim()
-  return `${fwdProto}://${fwdHost}`
+function parseOrigin(value: string | undefined): string | null {
+  const raw = value?.trim()
+  if (!raw) return null
+  try {
+    return new URL(raw).origin
+  } catch {
+    return null
+  }
 }
 
-function isSameOriginRequest(request: NextRequest): boolean {
-  const expectedOrigin = getRequestOrigin(request)
+function getAllowedRequestOrigins(env: Env, request: NextRequest): Set<string> {
+  const origins = new Set<string>()
+  for (const name of ['AUTH_URL', 'NEXT_PUBLIC_APP_URL'] as const) {
+    const origin = parseOrigin(env[name])
+    if (origin) origins.add(origin)
+  }
+
+  if (origins.size > 0 || env.NODE_ENV === 'production') return origins
+
+  // Local/dev route-handler tests often do not configure app URLs. Fall back to
+  // the request URL origin outside production, but never to forwarded headers.
+  origins.add(new URL(request.url).origin)
+  return origins
+}
+
+function isSameOriginRequest(request: NextRequest, env: Env): boolean {
+  const allowedOrigins = getAllowedRequestOrigins(env, request)
+  if (allowedOrigins.size === 0) return false
+
   const origin = request.headers.get('origin')
-  if (origin) return origin === expectedOrigin
+  if (origin) return allowedOrigins.has(origin)
 
   const referer = request.headers.get('referer')
   if (!referer) return false
 
   try {
-    return new URL(referer).origin === expectedOrigin
+    return allowedOrigins.has(new URL(referer).origin)
   } catch {
     return false
   }
@@ -276,7 +297,7 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
   return async function POST(req: NextRequest) {
     const session = await resolvedDeps.authorize()
     if (session instanceof NextResponse) return session
-    if (!isSameOriginRequest(req)) {
+    if (!isSameOriginRequest(req, resolvedDeps.env)) {
       await logDeniedRestoreAttempt(resolvedDeps, session.user.id, 'cross_origin_restore_request')
       return NextResponse.json({ error: 'Cross-site restore requests are not allowed.' }, { status: 403 })
     }
