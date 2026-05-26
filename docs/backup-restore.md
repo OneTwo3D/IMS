@@ -29,6 +29,10 @@ Restoring overwrites all current data. To confirm, you must type **RESTORE** int
 
 The restore API also enforces this confirmation server-side, requires a short-lived one-time confirmation code emailed to the authenticated admin address, and only accepts plain `.sql` files from the configured backup directory or an uploaded `.sql` file for that request.
 
+When `NODE_ENV=production`, restore is disabled unless `ALLOW_DATABASE_RESTORE=true` is set for a supervised restore window. Restoring from a server-side backup only requires that base flag; restoring from an uploaded SQL file also requires `ALLOW_DATABASE_RESTORE_UPLOAD=true`. Leave both flags unset or `false` during normal operation. Non-production environments bypass these kill switches, so staging restore drills should run with `NODE_ENV=production` if they need to exercise production restore gating.
+
+Denied restore attempts are written to the activity log as `WARNING` entries with action `backup_restore_denied` and a machine-readable `metadata.reason`, such as `production_restore_disabled`, `production_upload_restore_disabled`, or `cross_origin_restore_request`.
+
 ## Remote Storage
 
 Backups can be uploaded to remote storage for off-site protection. Two storage types are supported.

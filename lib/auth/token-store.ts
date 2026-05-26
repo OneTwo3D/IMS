@@ -47,3 +47,7 @@ export async function consumeAuthToken(key: string): Promise<string | null> {
   }
   return entry.value
 }
+
+export async function deleteAuthToken(key: string): Promise<void> {
+  await db.oneTimeToken.delete({ where: { key } }).catch(() => null)
+}

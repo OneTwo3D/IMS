@@ -13,7 +13,7 @@ import { requireApiAdmin } from '@/lib/auth/server'
 import { getBackupDir } from '@/lib/backup-storage'
 import { disableMaintenanceMode, enableMaintenanceMode } from '@/lib/maintenance-mode'
 import { sendEmail } from '@/lib/mailer'
-import { consumeAuthToken, setAuthToken } from '@/lib/auth/token-store'
+import { consumeAuthToken, deleteAuthToken, setAuthToken } from '@/lib/auth/token-store'
 import { db } from '@/lib/db'
 
 const BACKUP_DIR = getBackupDir()
@@ -21,8 +21,73 @@ const RESTORE_TOKEN_TTL_MS = 5 * 60_000
 const MAX_RESTORE_FILE_BYTES = 256 * 1024 * 1024
 const MAX_RESTORE_FORM_BYTES = MAX_RESTORE_FILE_BYTES + 64 * 1024
 
-function getDbConfig() {
-  const url = new URL(process.env.DATABASE_URL!)
+export const runtime = 'nodejs'
+
+type Env = Record<string, string | undefined>
+
+type RestoreSession = {
+  user: {
+    id: string
+  }
+}
+
+type RestoreAuthorizer = () => Promise<NextResponse | RestoreSession>
+
+type RestoreUserClient = {
+  findUnique(args: { where: { id: string }; select: { email: true } }): Promise<{ email: string | null } | null>
+}
+
+export type RestoreLogEntry = Parameters<typeof logActivity>[0]
+
+/** @internal Test seam for route-handler unit tests; not an application API. */
+export type BackupRestoreHandlerDeps = {
+  authorize?: RestoreAuthorizer
+  users?: RestoreUserClient
+  env?: Env
+  backupDir?: string
+  log?: (entry: RestoreLogEntry) => Promise<void>
+  mailer?: typeof sendEmail
+  setRestoreToken?: typeof setAuthToken
+  consumeRestoreToken?: typeof consumeAuthToken
+  deleteRestoreToken?: typeof deleteAuthToken
+  enableMaintenance?: typeof enableMaintenanceMode
+  disableMaintenance?: typeof disableMaintenanceMode
+  runRestoreFile?: typeof runRestore
+  now?: () => number
+}
+
+function isTruthy(value: string | undefined): boolean {
+  // Unknown values fail closed. Only explicit opt-in strings enable restore gates.
+  return ['1', 'true', 'yes', 'on'].includes(String(value ?? '').trim().toLowerCase())
+}
+
+function isProductionRestoreAllowed(env: Env): boolean {
+  return env.NODE_ENV !== 'production' || isTruthy(env.ALLOW_DATABASE_RESTORE)
+}
+
+function isProductionUploadRestoreAllowed(env: Env): boolean {
+  return env.NODE_ENV !== 'production' || isTruthy(env.ALLOW_DATABASE_RESTORE_UPLOAD)
+}
+
+async function logDeniedRestoreAttempt(deps: RequiredRestoreDeps, userId: string, reason: string): Promise<void> {
+  await deps.log({
+    entityType: 'SYSTEM',
+    tag: 'system',
+    action: 'backup_restore_denied',
+    level: 'WARNING',
+    description: `Denied database restore request: ${reason}`,
+    userId,
+    resolveUser: false,
+    metadata: { reason },
+  })
+}
+
+function restoreDisabledResponse(): NextResponse {
+  return NextResponse.json({ error: 'Database restore is disabled in production.' }, { status: 403 })
+}
+
+function getDbConfig(env: Env = process.env) {
+  const url = new URL(env.DATABASE_URL!)
   return {
     host: url.hostname,
     port: url.port || '5432',
@@ -53,10 +118,10 @@ function isSameOriginRequest(request: NextRequest): boolean {
   }
 }
 
-function resolveBackupPath(filename: string): string | null {
+function resolveBackupPath(backupDir: string, filename: string): string | null {
   const safe = path.basename(filename)
-  const resolvedBase = path.resolve(BACKUP_DIR)
-  const resolvedTarget = path.resolve(BACKUP_DIR, safe)
+  const resolvedBase = path.resolve(backupDir)
+  const resolvedTarget = path.resolve(backupDir, safe)
   if (!resolvedTarget.startsWith(`${resolvedBase}${path.sep}`) && resolvedTarget !== resolvedBase) {
     return null
   }
@@ -146,148 +211,201 @@ async function runRestore(filePath: string, db: ReturnType<typeof getDbConfig>):
   })
 }
 
-export async function GET() {
-  const session = await requireApiAdmin()
-  if (session instanceof NextResponse) return session
-  const user = await db.user.findUnique({
-    where: { id: session.user.id },
-    select: { email: true },
-  })
-  const email = user?.email?.trim().toLowerCase()
-  if (!email) {
-    return NextResponse.json({ error: 'Your user account does not have an email address configured.' }, { status: 400 })
-  }
-
-  const restoreToken = randomBytes(4).toString('hex').toUpperCase()
-  await setAuthToken(`backup_restore:${restoreToken}`, session.user.id, RESTORE_TOKEN_TTL_MS)
-  const mail = await sendEmail({
-    to: email,
-    subject: 'Backup restore confirmation code',
-    html: formatRestoreEmail(restoreToken),
-  })
-  if (!mail.success) {
-    return NextResponse.json({ error: mail.error ?? 'Failed to send restore confirmation email.' }, { status: 500 })
-  }
-
-  return NextResponse.json({ success: true, email, expiresInSec: RESTORE_TOKEN_TTL_MS / 1000 })
+type RequiredRestoreDeps = Required<Omit<BackupRestoreHandlerDeps, 'now'>> & {
+  now: () => number
 }
 
-export async function POST(req: NextRequest) {
-  const session = await requireApiAdmin()
-  if (session instanceof NextResponse) return session
-  if (!isSameOriginRequest(req)) {
-    return NextResponse.json({ error: 'Cross-site restore requests are not allowed.' }, { status: 403 })
-  }
-
-  const contentType = req.headers.get('content-type') ?? ''
-  const contentLength = req.headers.get('content-length')
-  if (contentType.includes('multipart/form-data')) {
-    if (!contentLength) {
-      return NextResponse.json({ error: 'Restore upload must include Content-Length.' }, { status: 411 })
-    }
-    const requestBytes = Number.parseInt(contentLength, 10)
-    if (!Number.isFinite(requestBytes) || requestBytes <= 0) {
-      return NextResponse.json({ error: 'Restore upload size is invalid.' }, { status: 400 })
-    }
-    if (requestBytes > MAX_RESTORE_FORM_BYTES) {
-      return NextResponse.json({ error: 'Restore upload is too large.' }, { status: 413 })
-    }
-  }
-
-  const formData = await req.formData()
-  const confirm = formData.get('confirm')
-  const restoreToken = formData.get('restoreToken')
-  if (confirm !== 'RESTORE') {
-    return NextResponse.json({ error: 'Restore confirmation missing.' }, { status: 400 })
-  }
-  if (typeof restoreToken !== 'string' || restoreToken.trim().length < 6) {
-    return NextResponse.json({ error: 'Restore email code missing.' }, { status: 400 })
-  }
-  const restoreTokenUserId = await consumeAuthToken(`backup_restore:${restoreToken.trim().toUpperCase()}`)
-  if (restoreTokenUserId !== session.user.id) {
-    return NextResponse.json({ error: 'Restore email code invalid or expired.' }, { status: 400 })
-  }
-
-  const file = formData.get('file') as File | null
-  const filename = formData.get('filename') as string | null
-
-  const db = getDbConfig()
-  let restorePath: string
-  let uploadedTempFile = false
-
-  if (file) {
-    // Uploaded file
-    if (!file.name.endsWith('.sql')) {
-      return NextResponse.json({ error: 'Invalid file type. Only plain SQL (.sql) backups are supported. PostgreSQL custom-format .dump files require pg_restore and are not supported.' }, { status: 400 })
-    }
-    if (file.size > MAX_RESTORE_FILE_BYTES) {
-      return NextResponse.json({ error: 'Restore file is too large.' }, { status: 413 })
-    }
-    await mkdir(BACKUP_DIR, { recursive: true })
-    restorePath = path.join(BACKUP_DIR, `restore-upload-${Date.now()}.sql`)
-    const uploadStream = file.stream() as unknown as NodeReadableStream<Uint8Array>
-    await pipeline(
-      Readable.fromWeb(uploadStream),
-      createWriteStream(restorePath),
-    )
-    uploadedTempFile = true
-  } else if (filename) {
-    // Existing backup file
-    if (!filename.endsWith('.sql')) {
-      return NextResponse.json({ error: 'Invalid backup filename.' }, { status: 400 })
-    }
-    const resolved = resolveBackupPath(filename)
-    if (!resolved) {
-      return NextResponse.json({ error: 'Invalid backup filename.' }, { status: 400 })
-    }
-    restorePath = resolved
-    try {
-      await access(restorePath)
-    } catch {
-      return NextResponse.json({ error: 'Backup file not found.' }, { status: 404 })
-    }
-    const fileInfo = await stat(restorePath)
-    if (fileInfo.size > MAX_RESTORE_FILE_BYTES) {
-      return NextResponse.json({ error: 'Restore file is too large.' }, { status: 413 })
-    }
-  } else {
-    return NextResponse.json({ error: 'No file provided.' }, { status: 400 })
-  }
-
-  const cleanup = async () => {
-    if (!uploadedTempFile) return
-    try {
-      await unlink(restorePath)
-    } catch {
-      // Best-effort cleanup only.
-    }
-  }
-
-  try {
-    await enableMaintenanceMode(`Database restore requested by admin ${session.user.id}`)
-    await runRestore(restorePath, db)
-    await disableMaintenanceMode()
-    await logActivity({
-      entityType: 'SYSTEM',
-      tag: 'system',
-      action: 'backup_restored',
-      level: 'WARNING',
-      description: `Restored database from backup: ${path.basename(restorePath)}`,
-    })
-    return NextResponse.json({ success: true })
-  } catch (error) {
-    await disableMaintenanceMode()
-    const message = error instanceof Error ? error.message : String(error)
-    await logActivity({
-      entityType: 'SYSTEM',
-      tag: 'system',
-      action: 'backup_restored',
-      level: 'ERROR',
-      description: `Failed to restore backup: ${message}`,
-    })
-    return NextResponse.json({ error: `Restore failed: ${message.slice(0, 200)}` }, { status: 500 })
-  } finally {
-    await disableMaintenanceMode()
-    await cleanup()
+function withDefaults(deps: BackupRestoreHandlerDeps = {}): RequiredRestoreDeps {
+  return {
+    authorize: deps.authorize ?? requireApiAdmin,
+    users: deps.users ?? db.user,
+    // Keep the production route wired to the live process.env object so runtime
+    // restore-window changes are observed without rebuilding handlers.
+    env: deps.env ?? process.env,
+    backupDir: deps.backupDir ?? BACKUP_DIR,
+    log: deps.log ?? logActivity,
+    mailer: deps.mailer ?? sendEmail,
+    setRestoreToken: deps.setRestoreToken ?? setAuthToken,
+    consumeRestoreToken: deps.consumeRestoreToken ?? consumeAuthToken,
+    deleteRestoreToken: deps.deleteRestoreToken ?? deleteAuthToken,
+    enableMaintenance: deps.enableMaintenance ?? enableMaintenanceMode,
+    disableMaintenance: deps.disableMaintenance ?? disableMaintenanceMode,
+    runRestoreFile: deps.runRestoreFile ?? runRestore,
+    now: deps.now ?? Date.now,
   }
 }
+
+export function createBackupRestoreGetHandler(deps: BackupRestoreHandlerDeps = {}) {
+  const resolvedDeps = withDefaults(deps)
+  return async function GET() {
+    const session = await resolvedDeps.authorize()
+    if (session instanceof NextResponse) return session
+    if (!isProductionRestoreAllowed(resolvedDeps.env)) {
+      await logDeniedRestoreAttempt(resolvedDeps, session.user.id, 'production_restore_disabled')
+      return restoreDisabledResponse()
+    }
+
+    const user = await resolvedDeps.users.findUnique({
+      where: { id: session.user.id },
+      select: { email: true },
+    })
+    const email = user?.email?.trim().toLowerCase()
+    if (!email) {
+      return NextResponse.json({ error: 'Your user account does not have an email address configured.' }, { status: 400 })
+    }
+
+    const restoreToken = randomBytes(4).toString('hex').toUpperCase()
+    const restoreTokenKey = `backup_restore:${restoreToken}`
+    await resolvedDeps.setRestoreToken(restoreTokenKey, session.user.id, RESTORE_TOKEN_TTL_MS)
+    const mail = await resolvedDeps.mailer({
+      to: email,
+      subject: 'Backup restore confirmation code',
+      html: formatRestoreEmail(restoreToken),
+    })
+    if (!mail.success) {
+      await resolvedDeps.deleteRestoreToken(restoreTokenKey)
+      return NextResponse.json({ error: mail.error ?? 'Failed to send restore confirmation email.' }, { status: 500 })
+    }
+
+    return NextResponse.json({ success: true, email, expiresInSec: RESTORE_TOKEN_TTL_MS / 1000 })
+  }
+}
+
+export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = {}) {
+  const resolvedDeps = withDefaults(deps)
+  return async function POST(req: NextRequest) {
+    const session = await resolvedDeps.authorize()
+    if (session instanceof NextResponse) return session
+    if (!isSameOriginRequest(req)) {
+      await logDeniedRestoreAttempt(resolvedDeps, session.user.id, 'cross_origin_restore_request')
+      return NextResponse.json({ error: 'Cross-site restore requests are not allowed.' }, { status: 403 })
+    }
+
+    if (!isProductionRestoreAllowed(resolvedDeps.env)) {
+      await logDeniedRestoreAttempt(resolvedDeps, session.user.id, 'production_restore_disabled')
+      return restoreDisabledResponse()
+    }
+
+    const contentType = req.headers.get('content-type') ?? ''
+    const contentLength = req.headers.get('content-length')
+    if (contentType.includes('multipart/form-data')) {
+      if (!contentLength) {
+        return NextResponse.json({ error: 'Restore upload must include Content-Length.' }, { status: 411 })
+      }
+      const requestBytes = Number.parseInt(contentLength, 10)
+      if (!Number.isFinite(requestBytes) || requestBytes <= 0) {
+        return NextResponse.json({ error: 'Restore upload size is invalid.' }, { status: 400 })
+      }
+      if (requestBytes > MAX_RESTORE_FORM_BYTES) {
+        return NextResponse.json({ error: 'Restore upload is too large.' }, { status: 413 })
+      }
+    }
+
+    const formData = await req.formData()
+    const confirm = formData.get('confirm')
+    const restoreToken = formData.get('restoreToken')
+    if (confirm !== 'RESTORE') {
+      return NextResponse.json({ error: 'Restore confirmation missing.' }, { status: 400 })
+    }
+    if (typeof restoreToken !== 'string' || !/^[0-9A-Fa-f]{8}$/.test(restoreToken.trim())) {
+      return NextResponse.json({ error: 'Restore email code missing.' }, { status: 400 })
+    }
+
+    const file = formData.get('file') as File | null
+    const filename = formData.get('filename') as string | null
+
+    let restorePath: string
+    let uploadedTempFile = false
+
+    if (file) {
+      if (!isProductionUploadRestoreAllowed(resolvedDeps.env)) {
+        await logDeniedRestoreAttempt(resolvedDeps, session.user.id, 'production_upload_restore_disabled')
+        return NextResponse.json({ error: 'Uploaded database restore is disabled in production.' }, { status: 403 })
+      }
+      if (!file.name.endsWith('.sql')) {
+        return NextResponse.json({ error: 'Invalid file type. Only plain SQL (.sql) backups are supported. PostgreSQL custom-format .dump files require pg_restore and are not supported.' }, { status: 400 })
+      }
+      if (file.size > MAX_RESTORE_FILE_BYTES) {
+        return NextResponse.json({ error: 'Restore file is too large.' }, { status: 413 })
+      }
+      // Validate upload policy and shape before consuming the one-time email code.
+      const restoreTokenUserId = await resolvedDeps.consumeRestoreToken(`backup_restore:${restoreToken.trim().toUpperCase()}`)
+      if (restoreTokenUserId !== session.user.id) {
+        return NextResponse.json({ error: 'Restore email code invalid or expired.' }, { status: 400 })
+      }
+      await mkdir(resolvedDeps.backupDir, { recursive: true })
+      restorePath = path.join(resolvedDeps.backupDir, `restore-upload-${resolvedDeps.now()}.sql`)
+      const uploadStream = file.stream() as unknown as NodeReadableStream<Uint8Array>
+      await pipeline(
+        Readable.fromWeb(uploadStream),
+        createWriteStream(restorePath),
+      )
+      uploadedTempFile = true
+    } else if (filename) {
+      if (!filename.endsWith('.sql')) {
+        return NextResponse.json({ error: 'Invalid backup filename.' }, { status: 400 })
+      }
+      const resolved = resolveBackupPath(resolvedDeps.backupDir, filename)
+      if (!resolved) {
+        return NextResponse.json({ error: 'Invalid backup filename.' }, { status: 400 })
+      }
+      restorePath = resolved
+      try {
+        await access(restorePath)
+      } catch {
+        return NextResponse.json({ error: 'Backup file not found.' }, { status: 404 })
+      }
+      const fileInfo = await stat(restorePath)
+      if (fileInfo.size > MAX_RESTORE_FILE_BYTES) {
+        return NextResponse.json({ error: 'Restore file is too large.' }, { status: 413 })
+      }
+      const restoreTokenUserId = await resolvedDeps.consumeRestoreToken(`backup_restore:${restoreToken.trim().toUpperCase()}`)
+      if (restoreTokenUserId !== session.user.id) {
+        return NextResponse.json({ error: 'Restore email code invalid or expired.' }, { status: 400 })
+      }
+    } else {
+      return NextResponse.json({ error: 'No file provided.' }, { status: 400 })
+    }
+
+    const cleanup = async () => {
+      if (!uploadedTempFile) return
+      try {
+        await unlink(restorePath)
+      } catch {
+        // Best-effort cleanup only.
+      }
+    }
+
+    const restoreDbConfig = getDbConfig(resolvedDeps.env)
+
+    try {
+      await resolvedDeps.enableMaintenance(`Database restore requested by admin ${session.user.id}`)
+      await resolvedDeps.runRestoreFile(restorePath, restoreDbConfig)
+      await resolvedDeps.log({
+        entityType: 'SYSTEM',
+        tag: 'system',
+        action: 'backup_restored',
+        level: 'WARNING',
+        // For uploads this is the generated temp filename, never user input.
+        description: `Restored database from backup: ${path.basename(restorePath)}`,
+      })
+      return NextResponse.json({ success: true })
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      await resolvedDeps.log({
+        entityType: 'SYSTEM',
+        tag: 'system',
+        action: 'backup_restored',
+        level: 'ERROR',
+        description: `Failed to restore backup: ${message}`,
+      })
+      return NextResponse.json({ error: `Restore failed: ${message.slice(0, 200)}` }, { status: 500 })
+    } finally {
+      await resolvedDeps.disableMaintenance()
+      await cleanup()
+    }
+  }
+}
+
+export const GET = createBackupRestoreGetHandler()
+export const POST = createBackupRestorePostHandler()
