@@ -613,10 +613,36 @@ export async function syncStock(updates: StockUpdate[] = []) {
   return { synced, errors }
 }
 
-export async function handleWebhook(
-  request?: Request,
-  resource?: ShoppingWebhookResource,
-) {
+type ShopifyWebhookDependencies = {
+  getShopifyCredentials: typeof getShopifyCredentials
+  recordShopifySyncLog: typeof recordShopifySyncLog
+}
+
+type ShopifyWebhookOptions =
+  | {
+      request?: undefined
+      resource?: ShoppingWebhookResource
+      rawBody?: undefined
+      dependencies?: ShopifyWebhookDependencies
+    }
+  | {
+      request: Request
+      resource?: ShoppingWebhookResource
+      rawBody: string
+      dependencies?: ShopifyWebhookDependencies
+    }
+
+export async function handleWebhook(options: ShopifyWebhookOptions = {}) {
+  const {
+    request,
+    resource,
+    rawBody,
+    dependencies = {
+      getShopifyCredentials,
+      recordShopifySyncLog,
+    },
+  } = options
+
   if (!request) {
     return Response.json(
       {
@@ -627,7 +653,7 @@ export async function handleWebhook(
     )
   }
 
-  const creds = await getShopifyCredentials()
+  const creds = await dependencies.getShopifyCredentials()
   if (!creds) {
     return Response.json({ success: false, error: 'Shopify not configured' }, { status: 503 })
   }
@@ -636,11 +662,22 @@ export async function handleWebhook(
     return Response.json({ success: false, error: 'Shopify webhook secret is not configured' }, { status: 503 })
   }
 
-  const rawBody = await request.text()
+  const body = rawBody
   const providedSignature = request.headers.get('x-shopify-hmac-sha256') ?? ''
-  if (!verifyShopifyWebhookSignature(rawBody, providedSignature, creds.webhookSecret)) {
+  if (!verifyShopifyWebhookSignature(body, providedSignature, creds.webhookSecret)) {
     return Response.json({ success: false, error: 'Invalid Shopify webhook signature' }, { status: 401 })
   }
+
+  let parsedPayload: unknown
+  try {
+    parsedPayload = JSON.parse(body) as unknown
+  } catch {
+    return Response.json({ success: false, error: 'Malformed JSON body' }, { status: 400 })
+  }
+  if (!parsedPayload || typeof parsedPayload !== 'object' || Array.isArray(parsedPayload)) {
+    return Response.json({ success: false, error: 'Shopify webhook body must be a JSON object' }, { status: 400 })
+  }
+  const payload = parsedPayload as Record<string, unknown>
 
   const topic = request.headers.get('x-shopify-topic')
   const webhookId = request.headers.get('x-shopify-webhook-id')
@@ -648,7 +685,11 @@ export async function handleWebhook(
   const shopDomain = request.headers.get('x-shopify-shop-domain')
   const message = 'Shopify webhook processing is not implemented yet; delivery was acknowledged without mutating IMS data'
 
-  await recordShopifySyncLog({
+  if (shopDomain && shopDomain.toLowerCase() !== creds.storeDomain.toLowerCase()) {
+    return Response.json({ success: false, error: 'Shopify webhook shop domain mismatch' }, { status: 401 })
+  }
+
+  await dependencies.recordShopifySyncLog({
     direction: 'FROM_CONNECTOR',
     status: 'FAILED',
     entityType: 'Webhook',
@@ -659,7 +700,9 @@ export async function handleWebhook(
       shopDomain,
       webhookId,
       eventId,
-      bodyLength: rawBody.length,
+      bodyLength: body.length,
+      // Store key names for triage, never values or raw payload content.
+      payloadKeys: Object.keys(payload).sort(),
     },
     errorMessage: message,
   })
