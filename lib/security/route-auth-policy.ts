@@ -72,7 +72,7 @@ export const apiRouteAuthPolicy = {
   },
   '/api/admin/wms/receipt-events/[id]/review': {
     access: 'admin-fresh',
-    reason: 'Mintsoft receipt review inspection is admin-only; approval requires requireApiFreshAdmin plus same-origin mutation header and is logged.',
+    reason: 'Mintsoft receipt review inspection and approval require requireApiFreshAdmin; approval also requires a same-origin mutation header and is logged.',
   },
   '/api/backup/create': {
     access: 'admin',

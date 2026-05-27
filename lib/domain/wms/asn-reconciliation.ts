@@ -5,7 +5,7 @@ import {
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
 
-const QTY_EPSILON = 0.0001
+export const WMS_RECEIPT_QTY_EPSILON = 0.0001
 
 export type BookedInDryRunWarningCode =
   | 'remote_regression'
@@ -103,10 +103,12 @@ export function reconcileBookedInQuantities(input: {
 }
 
 function normalizeQty(value: number | undefined): number {
-  return Math.max(0, Number.isFinite(value) ? value ?? 0 : 0)
+  if (!Number.isFinite(value)) return 0
+  return Math.max(0, value as number)
 }
 
 function uniqueWarnings(lines: BookedInDryRunLine[]): BookedInDryRunWarningCode[] {
+  // Keep aggregate warning order stable; UI styling handles severity.
   return Array.from(new Set(lines.flatMap((line) => line.warnings))).sort()
 }
 
@@ -132,21 +134,23 @@ export function buildBookedInDryRun(input: {
     })
     const warnings: BookedInDryRunWarningCode[] = []
 
-    if (currentRemoteReceivedQty > expectedQty + QTY_EPSILON) {
+    // Conservative policy: every over-receipt requires review because it can affect stock valuation,
+    // supplier billing, and accounting variance. It remains approval-allowed after acknowledgement.
+    if (currentRemoteReceivedQty > expectedQty + WMS_RECEIPT_QTY_EPSILON) {
       warnings.push('received_over_expected')
     }
-    if (currentRemoteReceivedQty + QTY_EPSILON < Math.max(lastProcessedReceivedQty, qtyAccountedViaSnapshot)) {
+    if (currentRemoteReceivedQty + WMS_RECEIPT_QTY_EPSILON < Math.max(lastProcessedReceivedQty, qtyAccountedViaSnapshot)) {
       warnings.push('remote_regression')
     }
     if (line.sourceType !== 'PURCHASE_ORDER_LINE' && line.sourceType !== 'STOCK_TRANSFER_LINE') {
       warnings.push('unsupported_source_type')
     }
-    if (line.localLineExists === false) {
+    if (line.localLineExists !== true) {
       warnings.push('missing_local_line')
     }
     if (
       line.sourceType === 'STOCK_TRANSFER_LINE'
-      && reconciled.stockQtyToAdd > QTY_EPSILON
+      && reconciled.stockQtyToAdd > WMS_RECEIPT_QTY_EPSILON
       && parseCostLayerSnapshot(line.costLayerSnapshot).length === 0
     ) {
       warnings.push('cost_layer_snapshot_missing')
@@ -170,8 +174,8 @@ export function buildBookedInDryRun(input: {
       coveredBySnapshotQty: reconciled.coveredBySnapshotQty,
       stockQtyToAdd: reconciled.stockQtyToAdd,
       newlyProcessedQty: reconciled.newlyProcessedQty,
-      wouldCreateReceipt: reconciled.qtyReceived > QTY_EPSILON,
-      wouldCreateCostLayer: reconciled.stockQtyToAdd > QTY_EPSILON,
+      wouldCreateReceipt: reconciled.qtyReceived > WMS_RECEIPT_QTY_EPSILON,
+      wouldCreateCostLayer: reconciled.stockQtyToAdd > WMS_RECEIPT_QTY_EPSILON,
       warnings,
     }
   })

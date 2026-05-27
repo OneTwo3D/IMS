@@ -33,7 +33,14 @@ function makeEvent(overrides: Partial<MockEvent> = {}): MockEvent {
     reviewDetails: {
       externalAsnId: 'asn-1',
       warnings: ['received_over_expected'],
-      lines: [],
+      lines: [
+        {
+          asnLineMapId: 'line-map-1',
+          externalAsnLineId: 'remote-line-1',
+          sku: 'SKU-1',
+          warnings: ['received_over_expected'],
+        },
+      ],
     },
     reviewedAt: null,
     reviewedBy: null,
@@ -64,18 +71,38 @@ function makeClient(initialEvent: MockEvent | null) {
           calls.updateMany += 1
           const typedArgs = args as {
             where?: { id?: string; processingStatus?: string; processedAt?: null }
-            data?: { reviewedAt?: Date; reviewedBy?: string | null }
+            data?: {
+              processingStatus?: string
+              nextRetryAt?: Date | null
+              lastError?: string | null
+              reviewedAt?: Date | null
+              reviewedBy?: string | null
+            }
           }
+          const processedAtMatches = typedArgs.where?.processedAt === undefined
+            || typedArgs.where.processedAt === event?.processedAt
+          const processingStatusMatches = typedArgs.where?.processingStatus === undefined
+            || typedArgs.where.processingStatus === event?.processingStatus
           if (
             event
             && typedArgs.where?.id === event.id
-            && typedArgs.where.processingStatus === event.processingStatus
-            && typedArgs.where.processedAt === event.processedAt
+            && processingStatusMatches
+            && processedAtMatches
           ) {
             event = {
               ...event,
-              reviewedAt: typedArgs.data?.reviewedAt ?? event.reviewedAt,
-              reviewedBy: typedArgs.data?.reviewedBy ?? event.reviewedBy,
+              processingStatus: Object.prototype.hasOwnProperty.call(typedArgs.data ?? {}, 'processingStatus')
+                ? typedArgs.data?.processingStatus ?? event.processingStatus
+                : event.processingStatus,
+              lastError: Object.prototype.hasOwnProperty.call(typedArgs.data ?? {}, 'lastError')
+                ? typedArgs.data?.lastError ?? null
+                : event.lastError,
+              reviewedAt: Object.prototype.hasOwnProperty.call(typedArgs.data ?? {}, 'reviewedAt')
+                ? typedArgs.data?.reviewedAt ?? null
+                : event.reviewedAt,
+              reviewedBy: Object.prototype.hasOwnProperty.call(typedArgs.data ?? {}, 'reviewedBy')
+                ? typedArgs.data?.reviewedBy ?? null
+                : event.reviewedBy,
             }
             return { count: 1 }
           }
@@ -180,10 +207,32 @@ test('admin WMS receipt review POST approves review and reruns processor in appr
 
   assert.equal(response.status, 200)
   assert.equal(body.result.status, 'processed')
+  assert.equal(body.approved, true)
   assert.deepEqual(processCalls, [{ eventId: 'event-1', options: { approveReview: true } }])
   assert.equal(mock.event?.reviewedAt?.toISOString(), reviewedAt.toISOString())
   assert.equal(mock.event?.reviewedBy, 'admin-1')
   assert.equal(activityLogs.length, 1)
+  const log = activityLogs[0] as {
+    action: string
+    metadata: {
+      priorWarnings: string[]
+      lineWarnings: Array<{ asnLineMapId: string; warnings: string[] }>
+      outcome: string
+      resultStatus: string
+    }
+  }
+  assert.equal(log.action, 'mintsoft_booked_in_review_approved')
+  assert.deepEqual(log.metadata.priorWarnings, ['received_over_expected'])
+  assert.deepEqual(log.metadata.lineWarnings, [
+    {
+      asnLineMapId: 'line-map-1',
+      externalAsnLineId: 'remote-line-1',
+      sku: 'SKU-1',
+      warnings: ['received_over_expected'],
+    },
+  ])
+  assert.equal(log.metadata.outcome, 'approved')
+  assert.equal(log.metadata.resultStatus, 'processed')
 })
 
 test('admin WMS receipt review POST rejects events not waiting for review', async () => {
@@ -205,4 +254,136 @@ test('admin WMS receipt review POST rejects events not waiting for review', asyn
   assert.equal(response.status, 409)
   assert.equal(body.code, 'wms_receipt_event_not_reviewable')
   assert.equal(calls.updateMany, 0)
+})
+
+test('admin WMS receipt review GET returns no-store 404 for missing events', async () => {
+  const { client } = makeClient(null)
+  const handlers = createAdminWmsReceiptReviewHandlers({
+    client,
+    authorizeRead: async () => ({ user: { id: 'admin-1' } }),
+  })
+
+  const response = await handlers.GET(
+    new NextRequest('http://localhost/api/admin/wms/receipt-events/missing/review'),
+    { params: Promise.resolve({ id: 'missing' }) },
+  )
+  const body = await response.json()
+
+  assert.equal(response.status, 404)
+  assert.equal(response.headers.get('Cache-Control'), 'no-store')
+  assert.equal(body.error, 'WMS receipt event was not found.')
+})
+
+test('admin WMS receipt review POST rejects authorized sessions without a user id', async () => {
+  const { client, calls } = makeClient(makeEvent())
+  const handlers = createAdminWmsReceiptReviewHandlers({
+    client,
+    authorizeApprove: async () => ({ user: {} }),
+  })
+
+  const response = await handlers.POST(
+    adminPostRequest('http://localhost/api/admin/wms/receipt-events/event-1/review'),
+    { params: Promise.resolve({ id: 'event-1' }) },
+  )
+  const body = await response.json()
+
+  assert.equal(response.status, 500)
+  assert.equal(response.headers.get('Cache-Control'), 'no-store')
+  assert.equal(body.error, 'Internal: missing user id on authorized session')
+  assert.equal(calls.updateMany, 0)
+})
+
+test('admin WMS receipt review POST uses compare-and-set so a second approval is rejected', async () => {
+  const mock = makeClient(makeEvent())
+  const handlers = createAdminWmsReceiptReviewHandlers({
+    client: mock.client,
+    authorizeApprove: async () => ({ user: { id: 'admin-1' } }),
+    processEvent: async (eventId) => ({
+      status: 'pending',
+      eventId,
+      externalAsnId: 'asn-1',
+      reason: 'remote ASN unavailable',
+    }),
+    log: async () => {},
+  })
+
+  const first = await handlers.POST(
+    adminPostRequest('http://localhost/api/admin/wms/receipt-events/event-1/review'),
+    { params: Promise.resolve({ id: 'event-1' }) },
+  )
+  const second = await handlers.POST(
+    adminPostRequest('http://localhost/api/admin/wms/receipt-events/event-1/review'),
+    { params: Promise.resolve({ id: 'event-1' }) },
+  )
+  const secondBody = await second.json()
+
+  assert.equal(first.status, 409)
+  assert.equal(second.status, 409)
+  assert.equal(secondBody.code, 'wms_receipt_event_not_reviewable')
+  assert.equal(mock.event?.reviewedAt, null)
+  assert.equal(mock.event?.reviewedBy, null)
+})
+
+test('admin WMS receipt review POST does not stamp reviewed fields when processing throws', async () => {
+  const mock = makeClient(makeEvent())
+  const handlers = createAdminWmsReceiptReviewHandlers({
+    client: mock.client,
+    authorizeApprove: async () => ({ user: { id: 'admin-1' } }),
+    processEvent: async () => {
+      throw new Error('database timeout')
+    },
+  })
+
+  const response = await handlers.POST(
+    adminPostRequest('http://localhost/api/admin/wms/receipt-events/event-1/review'),
+    { params: Promise.resolve({ id: 'event-1' }) },
+  )
+  const body = await response.json()
+
+  assert.equal(response.status, 500)
+  assert.equal(body.code, 'wms_receipt_review_approval_failed')
+  assert.equal(mock.event?.processingStatus, MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview)
+  assert.equal(mock.event?.lastError, 'database timeout')
+  assert.equal(mock.event?.reviewedAt, null)
+  assert.equal(mock.event?.reviewedBy, null)
+})
+
+test('admin WMS receipt review POST reports approval attempts that still require review', async () => {
+  const mock = makeClient(makeEvent())
+  const activityLogs: unknown[] = []
+  const handlers = createAdminWmsReceiptReviewHandlers({
+    client: mock.client,
+    authorizeApprove: async () => ({ user: { id: 'admin-1' } }),
+    processEvent: async (eventId) => ({
+      status: 'requires_review',
+      eventId,
+      externalAsnId: 'asn-1',
+      dryRun: {
+        externalAsnId: 'asn-1',
+        generatedAt: '2026-05-27T11:00:00.000Z',
+        warnings: ['missing_local_line'],
+        lines: [],
+      },
+    }),
+    log: async (entry) => {
+      activityLogs.push(entry)
+    },
+  })
+
+  const response = await handlers.POST(
+    adminPostRequest('http://localhost/api/admin/wms/receipt-events/event-1/review'),
+    { params: Promise.resolve({ id: 'event-1' }) },
+  )
+  const body = await response.json()
+
+  assert.equal(response.status, 409)
+  assert.equal(body.approved, false)
+  assert.equal(body.result.status, 'requires_review')
+  assert.equal(mock.event?.processingStatus, MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview)
+  assert.equal(mock.event?.reviewedAt, null)
+  assert.equal(mock.event?.reviewedBy, null)
+  const log = activityLogs[0] as { action: string; metadata: { outcome: string; resultStatus: string } }
+  assert.equal(log.action, 'mintsoft_booked_in_review_approval_not_processed')
+  assert.equal(log.metadata.outcome, 'not_processed')
+  assert.equal(log.metadata.resultStatus, 'requires_review')
 })

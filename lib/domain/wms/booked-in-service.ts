@@ -36,6 +36,9 @@ export const MINTSOFT_WEBHOOK_PROCESSING_STATUS = {
   processed: 'PROCESSED',
 } as const
 
+// Approval-blocking warnings are structural mismatches that admin acknowledgement alone cannot
+// resolve; the underlying IMS/Mintsoft data must be corrected. `received_over_expected` is a
+// variance signal, so approval treats the over-count as accepted for processing.
 const APPROVAL_BLOCKED_WARNING_CODES = new Set<BookedInDryRunWarningCode>([
   'remote_regression',
   'missing_local_line',
@@ -110,6 +113,37 @@ function reviewErrorMessage(dryRun: BookedInDryRun): string {
 
 function approvalBlockedWarnings(dryRun: BookedInDryRun): BookedInDryRunWarningCode[] {
   return dryRun.warnings.filter((warning) => APPROVAL_BLOCKED_WARNING_CODES.has(warning))
+}
+
+function approvalBlockedLineSummaries(dryRun: BookedInDryRun): string[] {
+  return dryRun.lines
+    .map((line) => ({
+      asnLineMapId: line.asnLineMapId,
+      warnings: line.warnings.filter((warning) => APPROVAL_BLOCKED_WARNING_CODES.has(warning)),
+    }))
+    .filter((line) => line.warnings.length > 0)
+    .map((line) => `${line.asnLineMapId} (${line.warnings.join(', ')})`)
+}
+
+function lineWarningDetails(dryRun: BookedInDryRun) {
+  return dryRun.lines
+    .filter((line) => line.warnings.length > 0)
+    .map((line) => ({
+      asnLineMapId: line.asnLineMapId,
+      externalAsnLineId: line.externalAsnLineId,
+      sku: line.sku,
+      warnings: line.warnings,
+    }))
+}
+
+function approvalBlockedErrorMessage(externalAsnId: string, dryRun: BookedInDryRun): string {
+  const blockedWarnings = approvalBlockedWarnings(dryRun)
+  const blockedLines = approvalBlockedLineSummaries(dryRun)
+  const lineDetails = blockedLines.length > 0
+    ? ` Affected ASN line maps: ${blockedLines.join('; ')}.`
+    : ''
+
+  return `Mintsoft booked-in review for ASN ${externalAsnId} cannot be approved until structural warnings are corrected: ${blockedWarnings.join(', ')}.${lineDetails} Fix the source IMS or Mintsoft data, then retry approval.`
 }
 
 function normalizePendingReason(reason: string): string {
@@ -419,6 +453,8 @@ export async function processBookedInEvent(
       const purchaseLineById = new Map(purchaseOrderLines.map((line) => [line.id, line]))
       const transferLineById = new Map(transferLines.map((line) => [line.id, line]))
       const now = new Date()
+      // Keep buildBookedInDryRun pure and I/O-free: this transaction holds row locks while
+      // deriving review state, so any remote/database reads must happen before this point.
       const dryRun = buildBookedInDryRun({
         externalAsnId: lockedEvent.externalAsnId,
         generatedAt: now,
@@ -476,9 +512,26 @@ export async function processBookedInEvent(
 
       const blockedWarnings = approvalBlockedWarnings(dryRun)
       if (options.approveReview && blockedWarnings.length > 0) {
-        throw new Error(
-          `Mintsoft booked-in review for ASN ${lockedEvent.externalAsnId} cannot be approved until these warnings are corrected: ${blockedWarnings.join(', ')}`,
-        )
+        const message = approvalBlockedErrorMessage(lockedEvent.externalAsnId, dryRun)
+        await tx.wmsInboundReceiptEvent.update({
+          where: { id: lockedEvent.id },
+          data: {
+            processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview,
+            nextRetryAt: null,
+            deadLetteredAt: null,
+            lastError: message,
+            reviewDetails: dryRun,
+            reviewedAt: null,
+            reviewedBy: null,
+          },
+        })
+        return {
+          duplicate: false,
+          pending: false,
+          reviewRequired: true,
+          dryRun,
+          productIds: [] as string[],
+        }
       }
 
       const receiptLinesByPoId = new Map<string, Array<{
@@ -966,6 +1019,7 @@ export async function processBookedInEvent(
         metadata: {
           externalAsnId: event.externalAsnId,
           warnings: processed.dryRun.warnings,
+          lineWarnings: lineWarningDetails(processed.dryRun),
         },
         resolveUser: false,
       })

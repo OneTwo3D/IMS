@@ -26,6 +26,16 @@ Mintsoft is the WMS connector for stock alignment, ASN creation, product verific
 - `/api/cron/mintsoft-webhook-sweeper` drains at most `MINTSOFT_WEBHOOK_SWEEPER_PAGE_SIZE` persisted events per run. Leave it unset for the default `250`.
 - Line deltas are applied only for previously unaccounted received quantities.
 
+### Receipt Review
+
+Booked-in callbacks pause in `REQUIRES_REVIEW` before stock mutation when the dry-run finds reconciliation warnings.
+
+- Structural warnings block approval until the underlying IMS or Mintsoft data is fixed: remote quantity regression, missing IMS source line, unsupported source type, or missing transfer cost-layer snapshot.
+- `received_over_expected` is a variance warning. It always requires admin review, but approval accepts the over-receipt and lets processing continue.
+- Approval requires fresh admin auth and the admin mutation header. Successful approvals stamp `reviewedAt` and `reviewedBy`; failed approval attempts remain visible through `lastError` and activity logs without stamping those success fields.
+- Activity logs include aggregate and line-level warning details so post-hoc audits can identify which ASN lines were approved.
+- The Mintsoft dashboard shows the newest 20 events and the total review backlog. Use the JSON inspection endpoint for full line-level detail until a dedicated review queue UI exists.
+
 ### Direct ASN Lookup Rollback
 
 Direct booked-in reconciliation calls Mintsoft's `/api/ASN/:id` endpoint. If staging or production API discovery shows a different direct endpoint shape, set `MINTSOFT_USE_BULK_ASN_LOOKUP=true` to temporarily restore the legacy list-and-match path while the connector endpoint is corrected. Leave it unset or `false` for normal operation.

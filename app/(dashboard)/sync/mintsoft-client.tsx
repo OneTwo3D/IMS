@@ -37,6 +37,21 @@ type Props = {
   data: MintsoftDashboardData
 }
 
+const RECEIPT_REVIEW_WARNING_LABELS: Record<string, string> = {
+  cost_layer_snapshot_missing: 'Cost-layer snapshot missing',
+  missing_local_line: 'IMS line missing',
+  received_over_expected: 'Over-received',
+  remote_regression: 'Mintsoft quantity decreased',
+  unsupported_source_type: 'Unsupported source line',
+}
+
+const RECEIPT_REVIEW_BLOCKING_WARNINGS = new Set([
+  'cost_layer_snapshot_missing',
+  'missing_local_line',
+  'remote_regression',
+  'unsupported_source_type',
+])
+
 function formatThresholdSummary(
   thresholds: { absoluteDelta: number | null; percentDelta: number | null } | null,
 ): string {
@@ -60,6 +75,30 @@ function EnvOverrideNotice({ overrides }: { overrides: Record<string, string> })
           {' '}Clear the environment variable to apply changes saved here.
         </span>
       </div>
+    </div>
+  )
+}
+
+function ReceiptReviewWarnings({ warnings }: { warnings: string[] }) {
+  if (warnings.length === 0) return <span className="text-muted-foreground">Review required</span>
+
+  return (
+    <div className="flex flex-wrap gap-1">
+      {warnings.map((warning) => {
+        const blocking = RECEIPT_REVIEW_BLOCKING_WARNINGS.has(warning)
+        return (
+          <span
+            key={warning}
+            className={
+              blocking
+                ? 'rounded border border-red-200 bg-red-50 px-1.5 py-0.5 text-[11px] font-medium text-red-700'
+                : 'rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-700'
+            }
+          >
+            {RECEIPT_REVIEW_WARNING_LABELS[warning] ?? warning}
+          </span>
+        )
+      })}
     </div>
   )
 }
@@ -660,7 +699,9 @@ export function MintsoftClient({ data }: Props) {
         <div>
           <h3 className="text-base font-semibold">Receipt Reviews</h3>
           <p className="text-sm text-muted-foreground">
-            Mintsoft booked-in callbacks paused before stock updates because the dry-run found reconciliation warnings.
+            {data.receiptReviewEventCount === data.receiptReviewEvents.length
+              ? `${data.receiptReviewEventCount} Mintsoft booked-in callback${data.receiptReviewEventCount === 1 ? '' : 's'} paused before stock updates.`
+              : `${data.receiptReviewEventCount} Mintsoft booked-in callbacks paused before stock updates; showing newest ${data.receiptReviewEvents.length}.`}
           </p>
         </div>
 
@@ -693,7 +734,7 @@ export function MintsoftClient({ data }: Props) {
                     <div className="text-xs text-muted-foreground">{event.externalEventId}</div>
                   </TableCell>
                   <TableCell className="text-xs">
-                    {event.warnings.length === 0 ? 'Review required' : event.warnings.join(', ')}
+                    <ReceiptReviewWarnings warnings={event.warnings} />
                   </TableCell>
                   <TableCell>{event.lineCount}</TableCell>
                   <TableCell className="max-w-[260px] truncate text-xs text-muted-foreground">

@@ -156,6 +156,8 @@ export function createMintsoftWebhookEventRepository(
           nextRetryAt: null,
           deadLetteredAt: null,
           lastError: null,
+          // Clear row-level review state so the next attempt derives a fresh dry-run.
+          // Historical approvals remain in ActivityLog.
           reviewDetails: Prisma.DbNull,
           reviewedAt: null,
           reviewedBy: null,

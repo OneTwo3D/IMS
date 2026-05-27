@@ -543,6 +543,8 @@ export function buildMintsoftWebhookQueueHealth(input: {
     ? Math.max(0, now.getTime() - input.oldestUnprocessedReceivedAt.getTime())
     : null
   const stale = oldestUnprocessedAgeMs != null && oldestUnprocessedAgeMs > MINTSOFT_WEBHOOK_STALE_AFTER_MS
+  // Any receipt review backlog is intentionally amber for now: each item represents a paused
+  // stock mutation that needs operator acknowledgement or source-data repair before retry.
   const status = input.dead > 0 || input.failedRetry > 0 || input.requiresReview > 0 || stale ? 'warning' : 'ok'
 
   return {

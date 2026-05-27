@@ -277,6 +277,7 @@ export type MintsoftDashboardData = {
   bundleLinks: MintsoftBundleLinkRow[]
   returnsInbox: MintsoftReturnsInboxRow[]
   receiptReviewEvents: MintsoftReceiptReviewEventRow[]
+  receiptReviewEventCount: number
   availableOrderLookupConnectors: ShoppingConnectorId[]
   orderLookupConnectorRequired: boolean
 }
@@ -728,7 +729,13 @@ async function getMintsoftExternalWarehouses(
 export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData> {
   await requireMintsoftReadAccess()
 
-  const [connection, settings, warehouses, bindings, recentStockSyncJobs, dryRunReadyJobs, openDiscrepancies, bundleLinks, returnsInbox, receiptReviewEvents, pluginState] = await Promise.all([
+  const receiptReviewWhere = {
+    connector: 'mintsoft',
+    processedAt: null,
+    processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview,
+  }
+
+  const [connection, settings, warehouses, bindings, recentStockSyncJobs, dryRunReadyJobs, openDiscrepancies, bundleLinks, returnsInbox, receiptReviewEventCount, receiptReviewEvents, pluginState] = await Promise.all([
     db.wmsConnection.findFirst({
       where: { connector: 'mintsoft' },
       orderBy: [{ createdAt: 'asc' }],
@@ -891,12 +898,11 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
         },
       },
     }),
+    db.wmsInboundReceiptEvent.count({
+      where: receiptReviewWhere,
+    }),
     db.wmsInboundReceiptEvent.findMany({
-      where: {
-        connector: 'mintsoft',
-        processedAt: null,
-        processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview,
-      },
+      where: receiptReviewWhere,
       orderBy: [{ receivedAt: 'desc' }],
       take: 20,
       select: {
@@ -974,6 +980,7 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
     })),
     returnsInbox: returnsInbox.map(mapMintsoftReturnsInboxRow),
     receiptReviewEvents: receiptReviewEvents.map(mapMintsoftReceiptReviewEvent),
+    receiptReviewEventCount,
     availableOrderLookupConnectors,
     orderLookupConnectorRequired: availableOrderLookupConnectors.length > 1,
   }

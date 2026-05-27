@@ -194,7 +194,104 @@ test('buildBookedInDryRun flags ambiguous ASNs before stock mutation', () => {
   assert.deepEqual(dryRun.lines[0]?.warnings, ['received_over_expected', 'missing_local_line'])
   assert.deepEqual(dryRun.lines[1]?.warnings, ['remote_regression'])
   assert.deepEqual(dryRun.lines[2]?.warnings, ['cost_layer_snapshot_missing'])
-  assert.deepEqual(dryRun.lines[3]?.warnings, ['unsupported_source_type'])
+  assert.deepEqual(dryRun.lines[3]?.warnings, ['unsupported_source_type', 'missing_local_line'])
+})
+
+test('buildBookedInDryRun treats missing localLineExists as unsafe', () => {
+  const dryRun = buildBookedInDryRun({
+    externalAsnId: 'asn-missing-local-flag',
+    generatedAt: new Date('2026-05-27T10:00:00.000Z'),
+    lines: [
+      {
+        asnLineMapId: 'line-map-1',
+        externalAsnLineId: 'remote-line-1',
+        sourceType: 'PURCHASE_ORDER_LINE',
+        sourceLineId: 'po-line-1',
+        productId: 'product-1',
+        sku: 'SKU-1',
+        expectedQty: 10,
+        currentRemoteReceivedQty: 5,
+      },
+    ],
+  })
+
+  assert.deepEqual(dryRun.warnings, ['missing_local_line'])
+  assert.deepEqual(dryRun.lines[0]?.warnings, ['missing_local_line'])
+})
+
+test('buildBookedInDryRun only flags over-receipts outside the quantity tolerance', () => {
+  const line = {
+    asnLineMapId: 'line-map-1',
+    externalAsnLineId: 'remote-line-1',
+    sourceType: 'PURCHASE_ORDER_LINE',
+    sourceLineId: 'po-line-1',
+    productId: 'product-1',
+    sku: 'SKU-1',
+    expectedQty: 10,
+    localReceivedQty: 0,
+    qtyAccountedViaSnapshot: 0,
+    qtyAccountedViaReceipt: 0,
+    lastProcessedReceivedQty: 0,
+    localLineExists: true,
+  }
+
+  const atExpected = buildBookedInDryRun({
+    externalAsnId: 'asn-at-expected',
+    generatedAt: new Date('2026-05-27T10:00:00.000Z'),
+    lines: [{ ...line, currentRemoteReceivedQty: 10 }],
+  })
+  const withinTolerance = buildBookedInDryRun({
+    externalAsnId: 'asn-within-tolerance',
+    generatedAt: new Date('2026-05-27T10:00:00.000Z'),
+    lines: [{ ...line, currentRemoteReceivedQty: 10.0001 }],
+  })
+  const outsideTolerance = buildBookedInDryRun({
+    externalAsnId: 'asn-outside-tolerance',
+    generatedAt: new Date('2026-05-27T10:00:00.000Z'),
+    lines: [{ ...line, currentRemoteReceivedQty: 10.0002 }],
+  })
+
+  assert.deepEqual(atExpected.warnings, [])
+  assert.deepEqual(withinTolerance.warnings, [])
+  assert.deepEqual(outsideTolerance.warnings, ['received_over_expected'])
+})
+
+test('buildBookedInDryRun handles empty ASN line lists', () => {
+  const dryRun = buildBookedInDryRun({
+    externalAsnId: 'asn-empty',
+    generatedAt: new Date('2026-05-27T10:00:00.000Z'),
+    lines: [],
+  })
+
+  assert.deepEqual(dryRun.lines, [])
+  assert.deepEqual(dryRun.warnings, [])
+})
+
+test('buildBookedInDryRun preserves multiple warning codes on one line', () => {
+  const dryRun = buildBookedInDryRun({
+    externalAsnId: 'asn-many-warnings',
+    generatedAt: new Date('2026-05-27T10:00:00.000Z'),
+    lines: [
+      {
+        asnLineMapId: 'line-map-1',
+        externalAsnLineId: 'remote-line-1',
+        sourceType: 'UNKNOWN',
+        sourceLineId: 'unknown-line-1',
+        productId: 'product-1',
+        sku: 'SKU-1',
+        expectedQty: 10,
+        currentRemoteReceivedQty: 12,
+        qtyAccountedViaSnapshot: 8,
+        lastProcessedReceivedQty: 8,
+      },
+    ],
+  })
+
+  assert.deepEqual(dryRun.lines[0]?.warnings, [
+    'received_over_expected',
+    'unsupported_source_type',
+    'missing_local_line',
+  ])
 })
 
 test('buildMintsoftWebhookRetryUpdate schedules pending retry state in typed columns', () => {
