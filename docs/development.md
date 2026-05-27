@@ -28,6 +28,20 @@ For GitHub Actions trigger or gating changes, validate both the static workflow 
 
 Inventory and accounting behavior changes must include focused tests. Keep server actions thin: use them for auth, input parsing, adapter work, revalidation, and redirects; put reusable business rules in `lib/domain/**` or `lib/jobs/**`. Do not commit secrets, credentials, OAuth tokens, webhook secrets, or private keys.
 
+## Documentation Updates
+
+Keep documentation in the same PR as the behavior it describes. When changing a feature, check the affected documentation surfaces and update every one that would become stale:
+
+- `README.md` for high-level setup, feature, or support-entry changes
+- `docs/development.md` for validation, branch workflow, guardrails, and agent workflow rules
+- `docs/architecture.md` for model, invariant, accounting, inventory, WMS, connector, or transaction-boundary changes
+- `docs/installation.md` and `.env.example` for configuration, deployment, secrets, storage, and connector setup changes
+- connector/runbook docs such as `docs/woocommerce.md`, `docs/xero-sync.md`, `docs/woocommerce-live-runbook.md`, and WMS/Mintsoft docs for integration behavior changes
+- `docs/workflows.md` and `npm run docs:workflows` when workflow state transitions change
+- `help-docs/` when user-facing screens, labels, available actions, or support workflows change
+
+If a code change intentionally has no documentation impact, state that in the PR summary or review response so reviewers do not have to infer it.
+
 ## Test Commands
 
 Unit and security tests run through Node's test runner with `tsx`:
@@ -116,18 +130,18 @@ Interpret the preflight counters as follows:
 - `negative_stock_reserved`:
   inventory invariant finding `stock_negative_reserved_quantity`
 - `negative_cost_layer_received`:
-  no current invariant finding; inspect `cost_layers` rows where `"receivedQty" < 0`
+  inventory invariant finding `cost_layer_negative_received_quantity`
 - `negative_cost_layer_remaining`:
   inventory invariant finding `cost_layer_negative_remaining_quantity`
 - `cost_layer_remaining_over_received`:
   inventory invariant finding `cost_layer_remaining_exceeds_received`
 - `negative_stock_movement_qty`:
-  no current invariant finding; inspect `stock_movements` rows where `qty < 0`
+  inventory invariant finding `stock_movement_negative_quantity`
 
 Recommended response order:
 
 1. Run the inventory invariant report to identify stock-level and cost-layer drift.
-2. Query the raw tables for `negative_cost_layer_received` and `negative_stock_movement_qty`, because those are not yet surfaced by the invariant report.
+2. Query the raw tables behind any reported counts if you need row-level repair detail beyond the invariant report.
 3. Repair the underlying rows before rerunning `prisma migrate deploy`.
 
 ## Sandbox Note

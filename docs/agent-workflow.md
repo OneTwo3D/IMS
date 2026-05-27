@@ -1,6 +1,6 @@
 # Agent Workflow
 
-This repository uses a staged reliability plan for AI-assisted work. The plan is tracked in `docs/IMS_Codex_Implementation_Plan.md`; implement it one PR or sub-stage at a time.
+This repository uses a staged reliability plan for AI-assisted work. The active plan is tracked in `docs/IMS_Codex_Followup_Implementation_Plan.md`; `docs/IMS_Codex_Implementation_Plan.md` is historical context unless a human explicitly asks to revisit it. Implement the active plan one PR or sub-stage at a time.
 
 ## Branching
 
@@ -21,7 +21,7 @@ Do not branch from `main` and do not target `main`. If `development` is unavaila
 At the start of a Codex session:
 
 1. Load local instructions from `AGENTS.local.md` when present; otherwise follow this document and the tracked `AGENTS.md`. `AGENTS.local.md` is intentionally ignored by git for clone-specific agent preferences.
-2. Read the assigned stage or sub-stage in `docs/IMS_Codex_Implementation_Plan.md`.
+2. Read the assigned stage or sub-stage in `docs/IMS_Codex_Followup_Implementation_Plan.md`.
 3. Inspect the relevant parts of `README.md`, `package.json`, `prisma/schema.prisma`, `docs/`, `app/actions/`, `app/api/`, `lib/`, `tests/`, and CI files.
 4. Read relevant Next.js docs from `node_modules/next/dist/docs/` before editing routing, server actions, route handlers, caching, or config.
 5. Confirm validation commands from `package.json`.
@@ -32,6 +32,7 @@ At the start of a Codex session:
 - Preserve existing behavior unless the task explicitly says otherwise.
 - Keep PRs small and reviewable.
 - Add or update tests for every changed behavior.
+- Add or update documentation in the same PR when behavior, operator workflow, validation, configuration, public/help text, integrations, or runbooks change.
 - Do not remove tests to make validation pass.
 - Do not add dependencies unless the PR explains why existing tools are insufficient.
 
@@ -69,14 +70,13 @@ Prefer deterministic idempotency keys for integrations, cron jobs, accounting ev
 
 ## Validation
 
-The usual baseline is:
+The usual baseline before opening a PR is:
 
 ```bash
-npm run lint
-npm run type-check
-npx prisma generate --schema prisma/schema.prisma
-npm run db:schema:scope -- origin/development HEAD
+npm run validate
 ```
+
+`npm run validate` runs linting, TypeScript type-checking, Prisma client generation, unit/security tests, workflow documentation checks, and the Prisma schema scope check against `origin/development`.
 
 For schema, migration, Prisma, or database behavior changes, also run:
 
@@ -93,10 +93,27 @@ npx tsx --test tests/<relevant-file>.test.ts
 For focused E2E tests:
 
 ```bash
+npm run e2e:select
 npx playwright test e2e/<relevant-spec>.spec.ts
 ```
 
-Run `npm run validate` for the environment-light local baseline. Run `npm run validate:db` when a local `DATABASE_URL` is configured and the database is reachable.
+For GitHub Actions trigger or gating changes, validate both the static workflow checks and the event-specific behavior being changed. `npm run docs:workflows:check` does not simulate GitHub event payloads; push-trigger changes need either a real CI push run or focused tests that assert push and pull request event paths use the intended refs.
+
+Run `npm run validate:db` when a local `DATABASE_URL` is configured and the database is reachable.
+
+## Documentation Updates
+
+Documentation is part of the change, not a later cleanup. For every PR, check whether the change affects:
+
+- `README.md` for high-level user or setup entry points
+- `docs/development.md` for agent/developer workflow, validation, and guardrails
+- `docs/architecture.md` for domain model, invariant, accounting, inventory, or integration design
+- `docs/installation.md` and `.env.example` for configuration, deployment, secrets, storage, or connector setup
+- connector and runbook docs such as `docs/woocommerce.md`, `docs/xero-sync.md`, `docs/woocommerce-live-runbook.md`, and WMS/Mintsoft docs when integration behavior changes
+- `docs/workflows.md` and the workflow generator when status transitions change
+- `help-docs/` when user-facing screens, labels, available actions, or support workflows change
+
+If a behavior change intentionally has no documentation impact, say that explicitly in the PR summary or review response.
 
 ## Staged PR Process
 
