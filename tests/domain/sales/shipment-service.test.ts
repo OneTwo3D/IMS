@@ -47,7 +47,7 @@ type State = {
   shipmentLines: ShipmentLine[]
   stockLevels: StockLevel[]
   costLayers: CostLayer[]
-  movements: Array<{ id: string; productId: string; qty: number }>
+  movements: Array<{ id: string; productId: string; qty: number; idempotencyKey?: string | null }>
   cogsEntries: Array<{ costLayerId: string; movementId: string; qty: number; unitCostBase: number; totalCostBase: number }>
   settings: Record<string, string>
 }
@@ -246,8 +246,13 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       },
     },
     stockMovement: {
-      create: async ({ data }: { data: { productId: string; qty: number } }) => {
-        const movement = { id: `movement-${movementSequence++}`, productId: data.productId, qty: data.qty }
+      create: async ({ data }: { data: { productId: string; qty: number; idempotencyKey?: string | null } }) => {
+        const movement = {
+          id: `movement-${movementSequence++}`,
+          productId: data.productId,
+          qty: data.qty,
+          idempotencyKey: data.idempotencyKey,
+        }
         state.movements.push(movement)
         return { id: movement.id }
       },
@@ -350,6 +355,7 @@ test('transitionShipmentStatus ships stock and stores FIFO COGS snapshot', async
     unitCostBase: 5,
     totalCostBase: 10,
   }])
+  assert.equal(state.movements[0].idempotencyKey, 'SALE_DISPATCH:shipmentLine:shipment-line-1')
   assert.equal(state.lines[0].cogsBase, 10)
 })
 

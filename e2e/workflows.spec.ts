@@ -5,8 +5,11 @@ test.describe('workflow coverage', () => {
   test('creates a product through the inventory UI', async ({ page }) => {
     const product = await createSimpleProduct(page)
 
-    await expect(page.getByText(product.sku, { exact: true })).toBeVisible()
-    await expect(page.getByText(product.name, { exact: true })).toBeVisible()
+    await page.getByRole('textbox', { name: /search products/i }).fill(product.sku)
+    const row = page.getByRole('row').filter({
+      has: page.getByRole('link', { name: product.sku, exact: true }),
+    }).first()
+    await expect(row).toContainText(product.name)
   })
 
   test('creates a stock adjustment and shows it in history', async ({ page }) => {

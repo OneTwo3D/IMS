@@ -11,6 +11,7 @@ import {
   lockStockLevels,
   validateAllocationIntegrity,
 } from '@/lib/domain/sales/allocation-service'
+import { saleDispatchMovementKey } from '@/lib/domain/inventory/stock-movement-idempotency'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -325,6 +326,7 @@ export async function transitionShipmentStatus(
             note: `Dispatched for order — shipment from ${lockedShipment.warehouse.code}`,
             referenceType: 'SalesOrder',
             referenceId: lockedShipment.orderId,
+            idempotencyKey: saleDispatchMovementKey(line.id),
           },
           select: { id: true },
         })

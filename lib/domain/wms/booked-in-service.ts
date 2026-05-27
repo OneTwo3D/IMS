@@ -4,6 +4,10 @@ import type { WmsAsnRef } from '@/lib/connectors/wms/types'
 import { copyCostLayerSourceLinesProportionally, createCostLayer } from '@/lib/cost-layers'
 import { reconcileBookedInQuantities, sliceTransferSnapshotForReceipt } from './asn-reconciliation'
 import { enqueueStockSync } from '@/lib/shopping'
+import {
+  wmsPurchaseReceiptMovementKey,
+  wmsTransferInMovementKey,
+} from '@/lib/domain/inventory/stock-movement-idempotency'
 
 // Booked-in reconciliation mutates stock levels, FIFO layers, PO lines, and sync state in one unit.
 // The longer timeout avoids false rollback on large ASNs while preserving a bounded lock window.
@@ -555,6 +559,10 @@ export async function processBookedInEvent(
                   note: `Received against ${po.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
                   referenceType: 'WmsAsnMap',
                   referenceId: asnMap.id,
+                  idempotencyKey: wmsPurchaseReceiptMovementKey({
+                    asnLineMapId: receiptLine.asnLineMapId,
+                    receiptEventId: lockedEvent.id,
+                  }),
                 },
               })
 
@@ -717,6 +725,10 @@ export async function processBookedInEvent(
                   note: `Received against ${transfer.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
                   referenceType: 'WmsAsnMap',
                   referenceId: asnMap.id,
+                  idempotencyKey: wmsTransferInMovementKey({
+                    asnLineMapId: receiptLine.asnLineMapId,
+                    receiptEventId: lockedEvent.id,
+                  }),
                 },
               })
 

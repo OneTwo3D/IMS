@@ -75,7 +75,13 @@ type State = {
   }>
   allocations: Array<{ id: string; orderId: string; lineId: string; productId: string; warehouseId: string; qty: number; costLayerSnapshot: unknown }>
   costLayers: Array<{ id: string; productId: string; poLineId: string | null; receivedQty: number; unitCostBase: number }>
-  movements: Array<{ productId: string; qty: number; referenceType: string; referenceId: string }>
+  movements: Array<{
+    productId: string
+    qty: number
+    referenceType: string
+    referenceId: string
+    idempotencyKey?: string | null
+  }>
   stockLevels: Array<{ productId: string; warehouseId: string; quantity: number; reservedQty: number }>
   settings: Record<string, string>
   executeRawCalls: number
@@ -274,7 +280,7 @@ function createClient(state: State): RefundServiceClient {
     stockMovement: {
       findMany: async ({ where }: { where: { referenceType: string; referenceId: string } }) => state.movements
         .filter((movement) => movement.referenceType === where.referenceType && movement.referenceId === where.referenceId),
-      create: async ({ data }: { data: { productId: string; qty: number; referenceType: string; referenceId: string } }) => {
+      create: async ({ data }: { data: { productId: string; qty: number; referenceType: string; referenceId: string; idempotencyKey?: string | null } }) => {
         state.movements.push(data)
       },
     },
@@ -575,6 +581,7 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   assert.equal(state.movements[0].qty, 1)
   assert.equal(state.movements[0].referenceType, 'SalesOrderRefund')
   assert.equal(state.movements[0].referenceId, 'refund-1')
+  assert.equal(state.movements[0].idempotencyKey, 'RETURN_INBOUND:refund:refund-1:line:refund-line-1')
   assert.equal(state.stockLevels[0].quantity, 1)
   assert.equal(state.costLayers[1].unitCostBase, 10)
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
@@ -673,6 +680,7 @@ test('createSalesOrderRefund fallback stock return excludes the current refund f
   assert.equal(state.movements[0].qty, 2)
   assert.equal(state.movements[0].referenceType, 'SalesOrderRefund')
   assert.equal(state.movements[0].referenceId, 'refund-1')
+  assert.equal(state.movements[0].idempotencyKey, 'RETURN_INBOUND:refund:refund-1:line:refund-line-1')
   assert.equal(state.stockLevels[0].quantity, 2)
 })
 

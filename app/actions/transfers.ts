@@ -405,11 +405,17 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
             referenceId: id,
           },
         })
-        await tx.stockLevel.upsert({
-          where: { productId_warehouseId: { productId: line.productId, warehouseId: transfer.fromWarehouseId } },
-          create: { productId: line.productId, warehouseId: transfer.fromWarehouseId, quantity: `-${qty}` },
-          update: { quantity: { decrement: qty } },
+        const updatedStock = await tx.stockLevel.updateMany({
+          where: {
+            productId: line.productId,
+            warehouseId: transfer.fromWarehouseId,
+            quantity: { gte: qty.toString() },
+          },
+          data: { quantity: { decrement: qty } },
         })
+        if (updatedStock.count !== 1) {
+          throw new Error(`Insufficient stock for ${line.sku}: stock changed during dispatch`)
+        }
 
         // Consume FIFO layers from source warehouse — tolerant mode
         // (legacy stock may not have layers). Store consumed entries on
