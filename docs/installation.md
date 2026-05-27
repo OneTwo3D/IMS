@@ -88,16 +88,20 @@ After installation, sign in and set the organisation base currency in **Settings
 | `/opt/one-two-inventory` | Application root directory |
 | `/opt/one-two-inventory/.env` | Environment configuration (chmod 600) |
 | `/var/lib/one-two-inventory/backups` | Runtime backup storage directory used by backup create/restore/upload flows |
+| `/var/lib/one-two-inventory/invoice-pdfs` | Accounting connector invoice PDFs served through signed invoice links |
 | `/var/lib/one-two-inventory/uploads` | Private uploaded files served through authenticated routes, such as supplier invoice PDFs |
 | `/var/lib/one-two-inventory/public-uploads/branding` | Logo and branding images served through `/api/uploads/branding/*` |
 | `/var/lib/one-two-inventory/public-uploads/avatars` | User avatar images served through `/uploads/avatars/*` |
 | `/var/lib/one-two-inventory` | Persistent data directory |
 | `/var/log/one-two-inventory` | Application logs |
 
-Container deployments must set `UPLOAD_STORAGE_DIR` and
-`PUBLIC_UPLOAD_STORAGE_DIR` to mounted persistent volumes. If either variable is
-unset in production, IMS logs a warning and falls back to local development
-paths under the application working tree, which may be ephemeral in containers.
+Container deployments must set `UPLOAD_STORAGE_DIR`,
+`PUBLIC_UPLOAD_STORAGE_DIR`, and `INVOICE_PDF_STORAGE_DIR` to mounted
+persistent volumes. If an upload storage variable is unset in production, IMS
+logs a warning and falls back to local development paths under the application
+working tree, which may be ephemeral in containers. Production preflight fails
+when `INVOICE_PDF_STORAGE_DIR` is unset because signed invoice links depend on
+persisted connector-downloaded PDFs.
 Branding upload URLs include a unique filename per upload so browser and CDN
 caches do not depend on query-string cache keys. Avatar URLs preserve the
 historical `/uploads/avatars/*` path and rotate a `?t=` cache-busting query
@@ -262,6 +266,7 @@ Key variables in the `.env` file:
 | `NODE_ENV` | Set to `production` for deployment |
 | `AUTH_SECRET` | Secret key for signing session tokens (auto-generated) |
 | `INVOICE_PDF_TOKEN_TTL_SECONDS` | Lifetime for public signed invoice PDF download links. Default `259200` (3 days), maximum `2592000` (30 days). Lower values reduce leaked-link exposure; higher values reduce customer "link expired" friction. |
+| `INVOICE_PDF_STORAGE_DIR` | Persistent storage directory for connector-downloaded invoice PDFs served through signed links. Defaults locally to `./data/invoices`; required by production preflight |
 | `SETTINGS_ENCRYPTION_KEY` | Key used to encrypt sensitive Setting values stored in the database (auto-generated) |
 | `ENCRYPTION_KEY` | Legacy fallback for older installs; keep set to the same value during migration if existing `enc:v1` secrets are present |
 | `AUTH_URL` | Authentication callback URL (same as app URL) |

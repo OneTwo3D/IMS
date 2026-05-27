@@ -757,9 +757,11 @@ async function getLatestMigration(now: Date = new Date()): Promise<LatestOperati
 
 async function checkWritableDirectories(now: Date = new Date()): Promise<DirectoryHealthCheck[]> {
   const { getBackupDir } = await import('@/lib/backup-storage')
+  const { getInvoicePdfStorageDir } = await import('@/lib/invoice-pdf')
   const { getUploadStorageDirectories } = await import('@/lib/upload-storage')
   const checks = [
     ...getUploadStorageDirectories().map(({ label, directory }) => [label, directory] as const),
+    ['invoicePdfStorage', getInvoicePdfStorageDir()],
     ['temporaryUploads', path.join(os.tmpdir(), 'onetwoinventory', 'uploads')],
     ['backups', getBackupDir()],
   ] as const

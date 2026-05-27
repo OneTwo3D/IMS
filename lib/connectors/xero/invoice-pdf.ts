@@ -3,11 +3,8 @@
  * Generic PDF helpers (load, sign, serve) are in lib/invoice-pdf.ts.
  */
 
-import { mkdir, writeFile } from 'fs/promises'
-import { join } from 'path'
+import { saveInvoicePdfFile } from '@/lib/invoice-pdf'
 import { xeroGetRaw } from './api'
-
-const PDF_DIR = join(process.cwd(), 'data', 'invoices')
 
 /** Download a Xero invoice as PDF */
 export async function downloadXeroInvoicePdf(xeroInvoiceId: string): Promise<Buffer | null> {
@@ -18,9 +15,5 @@ export async function downloadXeroInvoicePdf(xeroInvoiceId: string): Promise<Buf
 
 /** Save invoice PDF to disk */
 export async function saveInvoicePdf(orderId: string, buffer: Buffer): Promise<string> {
-  await mkdir(PDF_DIR, { recursive: true })
-  const filename = `${orderId}.pdf`
-  const filePath = join(PDF_DIR, filename)
-  await writeFile(filePath, buffer)
-  return filePath
+  return saveInvoicePdfFile(orderId, buffer)
 }

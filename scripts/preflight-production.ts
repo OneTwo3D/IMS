@@ -225,6 +225,7 @@ async function checkWritableDirectory(checks: PreflightCheck[], label: string, d
 function getPreflightStorageDirectories(env: Env): Array<{ label: string; directory: string }> {
   const privateRoot = path.resolve(envValue(env, 'UPLOAD_STORAGE_DIR') || path.join(process.cwd(), 'uploads'))
   const publicRoot = path.resolve(envValue(env, 'PUBLIC_UPLOAD_STORAGE_DIR') || path.join(process.cwd(), 'public', 'uploads'))
+  const invoicePdfRoot = path.resolve(envValue(env, 'INVOICE_PDF_STORAGE_DIR') || path.join(process.cwd(), 'data', 'invoices'))
   const backupRoot = path.resolve(envValue(env, 'BACKUP_DIR') || '/var/lib/onetwoinventory/backups')
 
   return [
@@ -232,6 +233,7 @@ function getPreflightStorageDirectories(env: Env): Array<{ label: string; direct
     { label: 'brandingUploads', directory: path.join(publicRoot, 'branding') },
     { label: 'invoiceUploads', directory: path.join(privateRoot, 'invoices') },
     { label: 'invoiceQuarantineUploads', directory: path.join(privateRoot, 'quarantine', 'invoices') },
+    { label: 'invoicePdfStorage', directory: invoicePdfRoot },
     { label: 'backupStorage', directory: backupRoot },
   ]
 }
@@ -353,6 +355,9 @@ export async function runProductionPreflight(options: PreflightOptions = {}): Pr
   }
   if (!envValue(env, 'PUBLIC_UPLOAD_STORAGE_DIR')) {
     add(checks, 'fail', 'public-upload-storage-dir', 'PUBLIC_UPLOAD_STORAGE_DIR', 'PUBLIC_UPLOAD_STORAGE_DIR must be explicitly configured in production.')
+  }
+  if (!envValue(env, 'INVOICE_PDF_STORAGE_DIR')) {
+    add(checks, 'fail', 'invoice-pdf-storage-dir', 'INVOICE_PDF_STORAGE_DIR', 'INVOICE_PDF_STORAGE_DIR must be explicitly configured in production.')
   }
   if (!envValue(env, 'BACKUP_DIR')) {
     add(checks, 'fail', 'backup-dir', 'BACKUP_DIR', 'BACKUP_DIR must be explicitly configured in production.')

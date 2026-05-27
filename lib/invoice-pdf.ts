@@ -9,13 +9,14 @@
  * consumption semantics.
  */
 
-import { readFile } from 'fs/promises'
-import { join } from 'path'
+import { mkdir, readFile, writeFile } from 'fs/promises'
+import path from 'path'
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 
 import { parsePositiveIntegerEnv } from '@/lib/env'
 
-const PDF_DIR = join(process.cwd(), 'data', 'invoices')
+const INVOICE_PDF_STORED_PATH_PREFIX = 'invoice-pdfs'
+const SAFE_INVOICE_PDF_ID = /^[a-zA-Z0-9._-]+$/
 const INVOICE_PDF_TOKEN_PURPOSE = 'invoice-pdf'
 const INVOICE_PDF_TOKEN_VERSION = 1
 const DEFAULT_INVOICE_PDF_TOKEN_TTL_SECONDS = 3 * 24 * 60 * 60
@@ -59,6 +60,38 @@ type TokenOptions = {
   ttlSeconds?: number
   nonce?: string
   env?: Record<string, string | undefined>
+}
+
+function configuredInvoicePdfStorageDir(env: Record<string, string | undefined> = process.env): string {
+  const configured = env.INVOICE_PDF_STORAGE_DIR?.trim()
+  return path.resolve(configured || path.join(process.cwd(), 'data', 'invoices'))
+}
+
+function invoicePdfFilename(orderId: string): string | null {
+  if (!orderId || orderId.includes('\0') || orderId.includes('/') || orderId.includes('\\')) return null
+  if (!SAFE_INVOICE_PDF_ID.test(orderId)) return null
+  return `${orderId}.pdf`
+}
+
+function isWithinDirectory(root: string, filePath: string): boolean {
+  const relative = path.relative(root, filePath)
+  return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative)
+}
+
+function resolveInvoicePdfPath(orderId: string): string | null {
+  const filename = invoicePdfFilename(orderId)
+  if (!filename) return null
+
+  const root = configuredInvoicePdfStorageDir()
+  const filePath = path.resolve(root, filename)
+  if (!isWithinDirectory(root, filePath)) return null
+  return filePath
+}
+
+function invoicePdfStoredPath(orderId: string): string {
+  const filename = invoicePdfFilename(orderId)
+  if (!filename) throw new Error('Invalid invoice PDF order id')
+  return path.posix.join(INVOICE_PDF_STORED_PATH_PREFIX, filename)
 }
 
 function getSigningSecret(): string {
@@ -123,16 +156,33 @@ function parsePayload(encoded: string): InvoicePdfTokenPayload | null {
 
 /** Get the file path for a saved invoice PDF */
 export function getInvoicePdfPath(orderId: string): string {
-  return join(PDF_DIR, `${orderId}.pdf`)
+  const filePath = resolveInvoicePdfPath(orderId)
+  if (!filePath) throw new Error('Invalid invoice PDF order id')
+  return filePath
+}
+
+/** Get the configured directory for saved invoice PDFs. */
+export function getInvoicePdfStorageDir(): string {
+  return configuredInvoicePdfStorageDir()
 }
 
 /** Load a saved invoice PDF from disk */
 export async function loadInvoicePdf(orderId: string): Promise<Buffer | null> {
+  const filePath = resolveInvoicePdfPath(orderId)
+  if (!filePath) return null
   try {
-    return await readFile(getInvoicePdfPath(orderId))
+    return await readFile(filePath)
   } catch {
     return null
   }
+}
+
+/** Save an invoice PDF to configured persistent storage and return its logical stored path. */
+export async function saveInvoicePdfFile(orderId: string, buffer: Buffer): Promise<string> {
+  const filePath = getInvoicePdfPath(orderId)
+  await mkdir(path.dirname(filePath), { recursive: true })
+  await writeFile(filePath, buffer)
+  return invoicePdfStoredPath(orderId)
 }
 
 /** Generate an expiring HMAC-signed token for public PDF download. */
