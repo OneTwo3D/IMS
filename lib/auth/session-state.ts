@@ -30,6 +30,21 @@ export type SessionStateDecision =
   | { valid: true }
   | { valid: false; reason: SessionInvalidReason }
 
+export const DEFAULT_FRESH_AUTH_MAX_AGE_SECONDS = 15 * 60
+
+export type FreshAuthInvalidReason =
+  | 'missing-auth-time'
+  | 'stale-auth'
+
+export type FreshAuthOptions = {
+  nowSeconds?: number
+  maxAgeSeconds?: number
+}
+
+export type FreshAuthDecision =
+  | { valid: true; ageSeconds: number; maxAgeSeconds: number }
+  | { valid: false; reason: FreshAuthInvalidReason; ageSeconds: number | null; maxAgeSeconds: number }
+
 export function isSessionInvalidReason(value: unknown): value is SessionInvalidReason {
   return value === 'missing-user' ||
     value === 'inactive-user' ||
@@ -42,6 +57,33 @@ export function isSessionInvalidReason(value: unknown): value is SessionInvalidR
 export function sessionAuthTimeSeconds(value: unknown): number | null {
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) return null
   return value
+}
+
+export function freshAuthMaxAgeSeconds(value: unknown = process.env.FRESH_AUTH_MAX_AGE_SECONDS): number {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return value
+  if (typeof value !== 'string') return DEFAULT_FRESH_AUTH_MAX_AGE_SECONDS
+  const parsed = Number(value)
+  return Number.isSafeInteger(parsed) && parsed > 0
+    ? parsed
+    : DEFAULT_FRESH_AUTH_MAX_AGE_SECONDS
+}
+
+export function evaluateFreshAuth(
+  sessionAuthTime: unknown,
+  options: FreshAuthOptions = {},
+): FreshAuthDecision {
+  const maxAgeSeconds = freshAuthMaxAgeSeconds(options.maxAgeSeconds)
+  const authTime = sessionAuthTimeSeconds(sessionAuthTime)
+  if (authTime === null) {
+    return { valid: false, reason: 'missing-auth-time', ageSeconds: null, maxAgeSeconds }
+  }
+
+  const nowSeconds = options.nowSeconds ?? Math.floor(Date.now() / 1000)
+  const ageSeconds = Math.max(0, nowSeconds - authTime)
+  if (ageSeconds > maxAgeSeconds) {
+    return { valid: false, reason: 'stale-auth', ageSeconds, maxAgeSeconds }
+  }
+  return { valid: true, ageSeconds, maxAgeSeconds }
 }
 
 export function evaluateSessionState(

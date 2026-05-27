@@ -1,6 +1,6 @@
 'use server'
 
-import { requirePermission } from '@/lib/auth/server'
+import { requireFreshPermission, requirePermission } from '@/lib/auth/server'
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
@@ -21,6 +21,16 @@ async function requireAdmin() {
   return requirePermission('sync')
 }
 
+async function requireFreshAdmin() {
+  return requireFreshPermission('sync')
+}
+
+function shouldFreshGateSecretWrite(data: object, key: string): boolean {
+  if (!Object.hasOwn(data, key)) return false
+  const value = (data as Record<string, unknown>)[key]
+  return typeof value !== 'string' || !value.includes('****')
+}
+
 // ---------------------------------------------------------------------------
 // Settings (UI-facing server actions)
 // ---------------------------------------------------------------------------
@@ -36,6 +46,9 @@ export async function getXeroSettingsMasked(): Promise<XeroSettings & { secretMa
 export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ success: boolean; error?: string }> {
   try {
     await requireAdmin()
+    if (shouldFreshGateSecretWrite(data, 'xero_client_secret')) {
+      await requireFreshAdmin()
+    }
 
     // Only run the readiness gate when the user is *transitioning* sync from
     // OFF → ON. If sync is already enabled, allow any save to go through so the
@@ -106,7 +119,7 @@ export async function saveXeroConnectionSettings(
   clientSecret: string,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
   try {
-    await requireAdmin()
+    await requireFreshAdmin()
 
     const nextClientId = clientId.trim()
     const nextClientSecretInput = clientSecret.trim()
@@ -186,7 +199,7 @@ export async function connectXero(
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
   try {
     void origin
-    const session = await requireAdmin()
+    const session = await requireFreshAdmin()
 
     // Save credentials (never overwrite secret with masked value)
     const ops = [
@@ -215,7 +228,7 @@ export async function connectXero(
 
 export async function disconnectXero(): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAdmin()
+    await requireFreshAdmin()
     await disconnect()
 
     await logActivity({

@@ -51,7 +51,7 @@ export const apiRouteAuthPolicy = {
   },
   '/api/admin/accounting/backfill': {
     access: 'admin',
-    reason: 'Accounting event backfill is restricted through requireApiAdmin and defaults to dry-run.',
+    reason: 'Accounting event backfill is restricted through requireApiAdmin, defaults to dry-run, and requires fresh admin auth before execution.',
   },
   '/api/admin/health': {
     access: 'admin',
@@ -63,11 +63,11 @@ export const apiRouteAuthPolicy = {
   },
   '/api/admin/outbox/[id]/permanent-fail': {
     access: 'admin',
-    reason: 'Manual integration outbox dead-letter actions are restricted through requireApiAdmin and logged.',
+    reason: 'Manual integration outbox dead-letter actions are restricted through requireApiFreshAdmin and logged.',
   },
   '/api/admin/outbox/[id]/replay': {
     access: 'admin',
-    reason: 'Manual integration outbox replay actions are restricted through requireApiAdmin and logged.',
+    reason: 'Manual integration outbox replay actions are restricted through requireApiFreshAdmin and logged.',
   },
   '/api/backup/create': {
     access: 'admin',
@@ -75,7 +75,7 @@ export const apiRouteAuthPolicy = {
   },
   '/api/backup/restore': {
     access: 'admin',
-    reason: 'Backup restore is restricted through requireApiAdmin plus restore confirmation checks.',
+    reason: 'Backup restore is restricted through requireApiFreshAdmin plus restore confirmation checks.',
   },
   '/api/backup/upload-remote': {
     access: 'admin',
@@ -243,7 +243,7 @@ export const apiRouteAuthPolicy = {
   },
   '/api/reset/code': {
     access: 'admin',
-    reason: 'Database reset code issuance is restricted through requireApiAdmin.',
+    reason: 'Database reset code issuance is restricted through requireApiFreshAdmin.',
   },
   '/api/rfq/[id]': {
     access: 'supplier',

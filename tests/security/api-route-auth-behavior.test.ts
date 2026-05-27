@@ -8,6 +8,7 @@ import { verifyCron } from '../../lib/cron-auth.ts'
 import {
   requireApiAdminSession,
   requireApiAuthSession,
+  requireApiFreshAdminSession,
   requireRoleSession,
   type AuthSession,
 } from '../../lib/auth/session-gates.ts'
@@ -76,6 +77,24 @@ test('admin policy route accepts admin sessions', async () => {
   const result = requireApiAdminSession(session('ADMIN'))
   assert.equal(result instanceof Response, false)
   assert.equal((result as AuthSession).user.role, 'ADMIN')
+})
+
+test('fresh admin policy rejects stale admin sessions before high-risk mutations', async () => {
+  const stale = requireApiFreshAdminSession(
+    session('ADMIN', { sessionAuthTime: 1_700_000_000 }),
+    { nowSeconds: 1_700_001_000, maxAgeSeconds: 900 },
+  )
+  const response = await expectStatus('stale fresh-admin session', stale as Response, 401)
+  const body = await response.json() as { code?: unknown; reason?: unknown }
+  assert.equal(body.code, 'fresh_auth_required')
+  assert.equal(body.reason, 'stale-auth')
+
+  const accepted = requireApiFreshAdminSession(
+    session('ADMIN', { sessionAuthTime: 1_700_000_100 }),
+    { nowSeconds: 1_700_001_000, maxAgeSeconds: 900 },
+  )
+  assert.equal(accepted instanceof Response, false)
+  assert.equal((accepted as AuthSession).user.role, 'ADMIN')
 })
 
 test('authenticated policy route rejects anonymous sessions and accepts verified users', async () => {

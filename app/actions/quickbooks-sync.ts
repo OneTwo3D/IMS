@@ -1,6 +1,6 @@
 'use server'
 
-import { requirePermission } from '@/lib/auth/server'
+import { requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -22,6 +22,16 @@ async function requireAdmin() {
   return requirePermission('sync')
 }
 
+async function requireFreshAdmin() {
+  return requireFreshPermission('sync')
+}
+
+function shouldFreshGateSecretWrite(data: object, key: string): boolean {
+  if (!Object.hasOwn(data, key)) return false
+  const value = (data as Record<string, unknown>)[key]
+  return typeof value !== 'string' || !value.includes('****')
+}
+
 // ---------------------------------------------------------------------------
 // Settings
 // ---------------------------------------------------------------------------
@@ -37,6 +47,9 @@ export async function getQuickBooksSettingsMasked(): Promise<QuickBooksSettings 
 export async function saveQuickBooksSettings(data: Partial<QuickBooksSettings>): Promise<{ success: boolean; error?: string }> {
   try {
     await requireAdmin()
+    if (shouldFreshGateSecretWrite(data, 'quickbooks_client_secret')) {
+      await requireFreshAdmin()
+    }
 
     if (data.quickbooks_sync_enabled === 'true') {
       const currentEnabled = await getSettingValue('quickbooks_sync_enabled')
@@ -92,7 +105,7 @@ export async function saveQuickBooksConnectionSettings(
   clientSecret: string,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
   try {
-    await requireAdmin()
+    await requireFreshAdmin()
 
     const nextClientId = clientId.trim()
     const nextClientSecretInput = clientSecret.trim()
@@ -172,7 +185,7 @@ export async function connectQuickBooks(
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
   try {
     void origin
-    const session = await requireAdmin()
+    const session = await requireFreshAdmin()
 
     // Save credentials
     const ops = [
@@ -198,7 +211,7 @@ export async function connectQuickBooks(
 
 export async function disconnectQuickBooks(): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAdmin()
+    await requireFreshAdmin()
     await disconnect()
 
     await logActivity({

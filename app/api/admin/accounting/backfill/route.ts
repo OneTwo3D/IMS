@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 
 import { logActivity } from '@/lib/activity-log'
-import { requireApiAdmin } from '@/lib/auth/server'
+import { requireApiAdmin, requireApiFreshAdmin } from '@/lib/auth/server'
 import { runAccountingEventBackfill } from '@/lib/domain/accounting/accounting-event-backfill'
 
 export const runtime = 'nodejs'
@@ -43,6 +43,10 @@ export async function POST(request: NextRequest) {
       { error: 'Set confirm to BACKFILL_ACCOUNTING_EVENTS to run the accounting event backfill.' },
       { status: 400 },
     )
+  }
+  if (!dryRun) {
+    const freshSession = await requireApiFreshAdmin()
+    if (freshSession instanceof NextResponse) return freshSession
   }
 
   const lookbackDays = positiveInteger(body.lookbackDays)

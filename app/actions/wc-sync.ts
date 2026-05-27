@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requirePermission } from '@/lib/auth/server'
+import { requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import {
   getActiveSettingEnvOverrides,
@@ -23,6 +23,16 @@ import {
 // All mutating exports in this file require the `sync` permission.
 async function requireAdmin() {
   return requirePermission('sync')
+}
+
+async function requireFreshAdmin() {
+  return requireFreshPermission('sync')
+}
+
+function shouldFreshGateSecretWrite(data: object, key: string): boolean {
+  if (!Object.hasOwn(data, key)) return false
+  const value = (data as Record<string, unknown>)[key]
+  return typeof value !== 'string' || !value.includes('*')
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +170,9 @@ async function validateWooStoreBaseCurrency(credentials?: { url: string; key: st
 
 export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise<{ success: boolean; error?: string }> {
   await requireAdmin()
+  if (shouldFreshGateSecretWrite(data, 'wc_webhook_secret')) {
+    await requireFreshAdmin()
+  }
   if (data.wc_sync_enabled === 'true') {
     const validation = await validateWooStoreBaseCurrency()
     if (!validation.ok) return { success: false, error: validation.error }
@@ -215,7 +228,7 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
  * product IDs" button) to flush the cache.
  */
 export async function saveWcCredentials(url: string, key: string, secret: string): Promise<{ success: boolean; wipedMappings: number; error?: string; message?: string }> {
-  await requireAdmin()
+  await requireFreshAdmin()
 
   const validatedUrl = validateWooCommerceBaseUrl(url)
   if (!validatedUrl.ok) {
@@ -349,7 +362,7 @@ export async function saveWcCredentials(url: string, key: string, secret: string
  * reflects the reset.
  */
 export async function resetWcProductIdCache(): Promise<{ success: boolean; wipedMappings: number }> {
-  await requireAdmin()
+  await requireFreshAdmin()
   // Serialize with in-flight stock syncs and bump the version so any
   // snapshotted run aborts on its next persist attempt — same contract
   // as `saveWcCredentials`, minus the credentials writes themselves.

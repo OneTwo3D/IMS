@@ -1,10 +1,10 @@
 import { NextResponse } from 'next/server'
-import { requireApiAdmin } from '@/lib/auth/server'
+import { requireApiFreshAdmin } from '@/lib/auth/server'
 import { issueDestructiveActionCode } from '@/lib/destructive-action-confirm'
 import { db } from '@/lib/db'
 
 export async function GET() {
-  const session = await requireApiAdmin()
+  const session = await requireApiFreshAdmin()
   if (session instanceof NextResponse) return session
 
   const user = await db.user.findUnique({

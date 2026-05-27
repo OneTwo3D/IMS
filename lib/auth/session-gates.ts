@@ -1,5 +1,9 @@
 import { NextResponse } from 'next/server'
-import type { SessionInvalidReason } from '@/lib/auth/session-state'
+import {
+  evaluateFreshAuth,
+  type FreshAuthOptions,
+  type SessionInvalidReason,
+} from '@/lib/auth/session-state'
 
 export type AuthSession = {
   user: {
@@ -48,6 +52,51 @@ export function requireApiAuthSession(session: unknown): AuthSession | NextRespo
 
 export function requireApiAdminSession(session: unknown): AuthSession | NextResponse {
   const authResult = requireApiAuthSession(session)
+  if (authResult instanceof NextResponse) return authResult
+  if (authResult.user.role !== 'ADMIN') {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  }
+  return authResult
+}
+
+export function requireFreshAuthSession(
+  session: AuthSession,
+  options?: FreshAuthOptions,
+): AuthSession {
+  const decision = evaluateFreshAuth(session.user.sessionAuthTime, options)
+  if (!decision.valid) {
+    throw new Error('Fresh authentication required')
+  }
+  return session
+}
+
+export function requireApiFreshAuthSession(
+  session: unknown,
+  options?: FreshAuthOptions,
+): AuthSession | NextResponse {
+  const authResult = requireApiAuthSession(session)
+  if (authResult instanceof NextResponse) return authResult
+
+  const decision = evaluateFreshAuth(authResult.user.sessionAuthTime, options)
+  if (!decision.valid) {
+    return NextResponse.json(
+      {
+        error: 'Fresh authentication required',
+        code: 'fresh_auth_required',
+        reason: decision.reason,
+      },
+      { status: 401 },
+    )
+  }
+
+  return authResult
+}
+
+export function requireApiFreshAdminSession(
+  session: unknown,
+  options?: FreshAuthOptions,
+): AuthSession | NextResponse {
+  const authResult = requireApiFreshAuthSession(session, options)
   if (authResult instanceof NextResponse) return authResult
   if (authResult.user.role !== 'ADMIN') {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })

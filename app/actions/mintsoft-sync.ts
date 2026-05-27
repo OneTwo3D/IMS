@@ -6,7 +6,7 @@ import { z } from 'zod'
 import { applyReturnInboundStockTx, type RefundReturnRow } from '@/lib/domain/sales/refund-service'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { getSession, requirePermission } from '@/lib/auth/server'
+import { getSession, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   DEFAULT_MINTSOFT_CONNECTION_LABEL,
   fetchMintsoftAsns,
@@ -562,6 +562,10 @@ async function requireMintsoftReadAccess() {
 
 async function requireMintsoftWriteAccess() {
   return requirePermission('settings.company')
+}
+
+async function requireFreshMintsoftWriteAccess() {
+  return requireFreshPermission('settings.company')
 }
 
 async function requireMintsoftReturnsWriteAccess() {
@@ -1244,7 +1248,7 @@ export async function getMintsoftTransferAsnStates(
 export async function saveMintsoftConnectionSettings(
   input: unknown,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
-  await requireMintsoftWriteAccess()
+  await requireFreshMintsoftWriteAccess()
 
   const parsedInput = MintsoftConnectionInputSchema.safeParse(input)
   if (!parsedInput.success) {

@@ -4,7 +4,7 @@ import { revalidatePath } from 'next/cache'
 import { hash } from 'bcryptjs'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAdmin, requirePermission } from '@/lib/auth/server'
+import { requireAdmin, requireFreshAdmin, requirePermission } from '@/lib/auth/server'
 
 const VALID_ROLES = ['ADMIN', 'MANAGER', 'WAREHOUSE', 'FINANCE', 'READONLY', 'SUPPLIER'] as const
 type ValidRole = typeof VALID_ROLES[number]
@@ -71,7 +71,7 @@ export async function createUser(data: {
   supplierId?: string
 }): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAdmin()
+    await requireFreshAdmin()
     await requirePermission('settings.users')
 
     if (!data.name?.trim()) return { success: false, error: 'Name is required' }
@@ -109,7 +109,7 @@ export async function updateUser(
   data: { name?: string; email?: string; role?: string; supplierId?: string | null; active?: boolean; password?: string },
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    const session = await requireAdmin()
+    const session = await requireFreshAdmin()
     await requirePermission('settings.users')
 
     const target = await db.user.findUnique({
@@ -199,7 +199,7 @@ export async function deleteUser(
   },
 ): Promise<{ success: boolean; error?: string }> {
   try {
-    const session = await requireAdmin()
+    const session = await requireFreshAdmin()
     await requirePermission('settings.users')
 
     if (!['keep_text', 'transfer_user'].includes(options.salesOrderMode)) {

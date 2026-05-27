@@ -9,7 +9,7 @@ import { pipeline } from 'stream/promises'
 import { Readable } from 'stream'
 import type { ReadableStream as NodeReadableStream } from 'stream/web'
 import { logActivity } from '@/lib/activity-log'
-import { requireApiAdmin } from '@/lib/auth/server'
+import { requireApiFreshAdmin } from '@/lib/auth/server'
 import { getBackupDir } from '@/lib/backup-storage'
 import { disableMaintenanceMode, enableMaintenanceMode } from '@/lib/maintenance-mode'
 import { sendEmail } from '@/lib/mailer'
@@ -259,7 +259,7 @@ type RequiredRestoreDeps = Required<Omit<BackupRestoreHandlerDeps, 'now'>> & {
 
 function withDefaults(deps: BackupRestoreHandlerDeps = {}): RequiredRestoreDeps {
   return {
-    authorize: deps.authorize ?? requireApiAdmin,
+    authorize: deps.authorize ?? requireApiFreshAdmin,
     users: deps.users ?? db.user,
     // Keep the production route wired to the live process.env object so runtime
     // restore-window changes are observed without rebuilding handlers.

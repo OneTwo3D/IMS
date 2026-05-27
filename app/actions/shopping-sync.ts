@@ -26,7 +26,7 @@ import {
 } from '@/app/actions/wc-sync'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requirePermission } from '@/lib/auth/server'
+import { requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import { shopifyGraphql } from '@/lib/connectors/shopify/api'
 import {
   getActiveSettingEnvOverrides,
@@ -87,6 +87,10 @@ function normalizeShopifyStoreDomain(value: string): string | null {
 
 async function requireShoppingAdmin() {
   return requirePermission('sync')
+}
+
+async function requireFreshShoppingAdmin() {
+  return requireFreshPermission('sync')
 }
 
 function maskSecret(value: string, visibleChars = 7): string {
@@ -260,7 +264,7 @@ export async function saveShopifyConnectorCredentials(
   adminApiAccessToken: string,
   webhookSecret: string,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
-  await requireShoppingAdmin()
+  await requireFreshShoppingAdmin()
 
   const normalizedDomain = normalizeShopifyStoreDomain(storeDomain)
   if (!normalizedDomain) {

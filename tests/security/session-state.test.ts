@@ -2,7 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  DEFAULT_FRESH_AUTH_MAX_AGE_SECONDS,
   evaluateSessionState,
+  evaluateFreshAuth,
+  freshAuthMaxAgeSeconds,
   loginPathForSessionInvalidReason,
   sessionAuthTimeSeconds,
   sessionInvalidLoginMessage,
@@ -125,6 +128,28 @@ test('session state treats string token versions as stale', () => {
     evaluateSessionState({ sessionVersion: '3', sessionAuthTime: 1_700_000_000 }, user()),
     { valid: false, reason: 'session-version-mismatch' },
   )
+})
+
+test('fresh auth accepts recent auth_time and rejects missing or stale auth_time', () => {
+  assert.deepEqual(
+    evaluateFreshAuth(1_700_000_000, { nowSeconds: 1_700_000_600, maxAgeSeconds: 900 }),
+    { valid: true, ageSeconds: 600, maxAgeSeconds: 900 },
+  )
+  assert.deepEqual(
+    evaluateFreshAuth(1_700_000_000, { nowSeconds: 1_700_000_901, maxAgeSeconds: 900 }),
+    { valid: false, reason: 'stale-auth', ageSeconds: 901, maxAgeSeconds: 900 },
+  )
+  assert.deepEqual(
+    evaluateFreshAuth(undefined, { nowSeconds: 1_700_000_000, maxAgeSeconds: 900 }),
+    { valid: false, reason: 'missing-auth-time', ageSeconds: null, maxAgeSeconds: 900 },
+  )
+})
+
+test('fresh auth max age falls back to the default for invalid configuration', () => {
+  assert.equal(freshAuthMaxAgeSeconds('1200'), 1200)
+  assert.equal(freshAuthMaxAgeSeconds(300), 300)
+  assert.equal(freshAuthMaxAgeSeconds('0'), DEFAULT_FRESH_AUTH_MAX_AGE_SECONDS)
+  assert.equal(freshAuthMaxAgeSeconds('abc'), DEFAULT_FRESH_AUTH_MAX_AGE_SECONDS)
 })
 
 test('session invalidation reasons map to login UX reasons', () => {
