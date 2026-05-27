@@ -5,6 +5,62 @@ import {
   type CostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
 
+const QTY_EPSILON = 0.0001
+
+export type BookedInDryRunWarningCode =
+  | 'remote_regression'
+  | 'missing_local_line'
+  | 'unsupported_source_type'
+  | 'cost_layer_snapshot_missing'
+  | 'received_over_expected'
+
+export type BookedInDryRunLineInput = {
+  asnLineMapId: string
+  externalAsnLineId: string
+  sourceType: string
+  sourceLineId: string
+  productId: string
+  sku: string
+  expectedQty: number
+  currentRemoteReceivedQty: number
+  localReceivedQty?: number
+  qtyAccountedViaSnapshot?: number
+  qtyAccountedViaReceipt?: number
+  lastProcessedReceivedQty?: number
+  localLineExists?: boolean
+  costLayerSnapshot?: unknown
+}
+
+export type BookedInDryRunLine = {
+  asnLineMapId: string
+  externalAsnLineId: string
+  sourceType: string
+  sourceLineId: string
+  productId: string
+  sku: string
+  expectedQty: number
+  currentRemoteReceivedQty: number
+  localReceivedQty: number
+  qtyAccountedViaSnapshot: number
+  qtyAccountedViaReceipt: number
+  lastProcessedReceivedQty: number
+  qtyReceived: number
+  reconciledManualQty: number
+  coveredBySnapshotQty: number
+  stockQtyToAdd: number
+  newlyProcessedQty: number
+  wouldCreateReceipt: boolean
+  wouldCreateCostLayer: boolean
+  warnings: BookedInDryRunWarningCode[]
+}
+
+export type BookedInDryRun = {
+  externalAsnId: string
+  generatedAt: string
+  lines: BookedInDryRunLine[]
+  warnings: BookedInDryRunWarningCode[]
+}
+
 export type ReconciledBookedInQuantities = {
   currentReceivedQty: number
   qtyReceived: number
@@ -43,6 +99,88 @@ export function reconcileBookedInQuantities(input: {
     coveredBySnapshotQty,
     stockQtyToAdd,
     newlyProcessedQty,
+  }
+}
+
+function normalizeQty(value: number | undefined): number {
+  return Math.max(0, Number.isFinite(value) ? value ?? 0 : 0)
+}
+
+function uniqueWarnings(lines: BookedInDryRunLine[]): BookedInDryRunWarningCode[] {
+  return Array.from(new Set(lines.flatMap((line) => line.warnings))).sort()
+}
+
+export function buildBookedInDryRun(input: {
+  externalAsnId: string
+  generatedAt: Date
+  lines: BookedInDryRunLineInput[]
+}): BookedInDryRun {
+  const lines = input.lines.map<BookedInDryRunLine>((line) => {
+    const expectedQty = normalizeQty(line.expectedQty)
+    const currentRemoteReceivedQty = normalizeQty(line.currentRemoteReceivedQty)
+    const localReceivedQty = normalizeQty(line.localReceivedQty)
+    const qtyAccountedViaSnapshot = normalizeQty(line.qtyAccountedViaSnapshot)
+    const qtyAccountedViaReceipt = normalizeQty(line.qtyAccountedViaReceipt)
+    const lastProcessedReceivedQty = normalizeQty(line.lastProcessedReceivedQty)
+    const reconciled = reconcileBookedInQuantities({
+      expectedQty,
+      currentReceivedQty: currentRemoteReceivedQty,
+      localReceivedQty,
+      lastProcessedReceivedQty,
+      qtyAccountedViaSnapshot,
+      qtyAccountedViaReceipt,
+    })
+    const warnings: BookedInDryRunWarningCode[] = []
+
+    if (currentRemoteReceivedQty > expectedQty + QTY_EPSILON) {
+      warnings.push('received_over_expected')
+    }
+    if (currentRemoteReceivedQty + QTY_EPSILON < Math.max(lastProcessedReceivedQty, qtyAccountedViaSnapshot)) {
+      warnings.push('remote_regression')
+    }
+    if (line.sourceType !== 'PURCHASE_ORDER_LINE' && line.sourceType !== 'STOCK_TRANSFER_LINE') {
+      warnings.push('unsupported_source_type')
+    }
+    if (line.localLineExists === false) {
+      warnings.push('missing_local_line')
+    }
+    if (
+      line.sourceType === 'STOCK_TRANSFER_LINE'
+      && reconciled.stockQtyToAdd > QTY_EPSILON
+      && parseCostLayerSnapshot(line.costLayerSnapshot).length === 0
+    ) {
+      warnings.push('cost_layer_snapshot_missing')
+    }
+
+    return {
+      asnLineMapId: line.asnLineMapId,
+      externalAsnLineId: line.externalAsnLineId,
+      sourceType: line.sourceType,
+      sourceLineId: line.sourceLineId,
+      productId: line.productId,
+      sku: line.sku,
+      expectedQty,
+      currentRemoteReceivedQty,
+      localReceivedQty,
+      qtyAccountedViaSnapshot,
+      qtyAccountedViaReceipt,
+      lastProcessedReceivedQty,
+      qtyReceived: reconciled.qtyReceived,
+      reconciledManualQty: reconciled.reconciledManualQty,
+      coveredBySnapshotQty: reconciled.coveredBySnapshotQty,
+      stockQtyToAdd: reconciled.stockQtyToAdd,
+      newlyProcessedQty: reconciled.newlyProcessedQty,
+      wouldCreateReceipt: reconciled.qtyReceived > QTY_EPSILON,
+      wouldCreateCostLayer: reconciled.stockQtyToAdd > QTY_EPSILON,
+      warnings,
+    }
+  })
+
+  return {
+    externalAsnId: input.externalAsnId,
+    generatedAt: input.generatedAt.toISOString(),
+    lines,
+    warnings: uniqueWarnings(lines),
   }
 }
 

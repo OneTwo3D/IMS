@@ -2203,6 +2203,9 @@ model WmsInboundReceiptEvent {
   nextRetryAt        DateTime?
   deadLetteredAt     DateTime?
   lastError          String?
+  reviewDetails      Json?
+  reviewedAt         DateTime?
+  reviewedBy         String?
   receivedAt         DateTime @default(now())
 
   @@unique([connector, externalEventId])

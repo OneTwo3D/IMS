@@ -2,7 +2,13 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import type { WmsAsnRef } from '@/lib/connectors/wms/types'
 import { copyCostLayerSourceLinesProportionally, createCostLayer } from '@/lib/cost-layers'
-import { reconcileBookedInQuantities, sliceTransferSnapshotForReceipt } from './asn-reconciliation'
+import {
+  buildBookedInDryRun,
+  reconcileBookedInQuantities,
+  sliceTransferSnapshotForReceipt,
+  type BookedInDryRun,
+  type BookedInDryRunWarningCode,
+} from './asn-reconciliation'
 import { enqueueStockSync } from '@/lib/shopping'
 import {
   isStockMovementIdempotencyConflict,
@@ -25,9 +31,17 @@ export const MINTSOFT_WEBHOOK_PROCESSING_STATUS = {
   pending: 'PENDING',
   pendingRetry: 'PENDING_RETRY',
   failedRetry: 'FAILED_RETRY',
+  requiresReview: 'REQUIRES_REVIEW',
   dead: 'DEAD',
   processed: 'PROCESSED',
 } as const
+
+const APPROVAL_BLOCKED_WARNING_CODES = new Set<BookedInDryRunWarningCode>([
+  'remote_regression',
+  'missing_local_line',
+  'unsupported_source_type',
+  'cost_layer_snapshot_missing',
+])
 
 type MintsoftWebhookProcessingStatus = typeof MINTSOFT_WEBHOOK_PROCESSING_STATUS[keyof typeof MINTSOFT_WEBHOOK_PROCESSING_STATUS]
 
@@ -60,6 +74,12 @@ export type ProcessMintsoftBookedInResult =
     reason: string
   }
   | {
+    status: 'requires_review'
+    eventId: string
+    externalAsnId: string
+    dryRun: BookedInDryRun
+  }
+  | {
     status: 'failed'
     eventId: string
     externalAsnId: string | null
@@ -68,6 +88,7 @@ export type ProcessMintsoftBookedInResult =
 
 export type ProcessMintsoftBookedInEventOptions = {
   fetchRemoteAsn: (externalAsnId: string) => Promise<WmsAsnRef | null>
+  approveReview?: boolean
 }
 
 function formatReceiptReference(externalAsnId: string, poReference: string): string {
@@ -81,6 +102,14 @@ async function markEventFailed(eventId: string, error: string): Promise<void> {
 
 async function markEventPending(eventId: string, reason: string): Promise<void> {
   await scheduleWebhookRetry(eventId, 'pending', normalizePendingReason(reason))
+}
+
+function reviewErrorMessage(dryRun: BookedInDryRun): string {
+  return `Mintsoft booked-in review required: ${dryRun.warnings.join(', ')}`
+}
+
+function approvalBlockedWarnings(dryRun: BookedInDryRun): BookedInDryRunWarningCode[] {
+  return dryRun.warnings.filter((warning) => APPROVAL_BLOCKED_WARNING_CODES.has(warning))
 }
 
 function normalizePendingReason(reason: string): string {
@@ -326,37 +355,19 @@ export async function processBookedInEvent(
         .map((line) => {
           const remoteLine = remoteLineByExternalId.get(line.externalAsnLineId)
             ?? remoteLineBySourceId.get(line.sourceLineId)
+          const currentRemoteReceivedQty = Math.max(0, Number(remoteLine?.quantity ?? 0))
           return {
             ...line,
+            currentRemoteReceivedQty,
             currentReceivedQty: Math.min(
               Number(line.expectedQty),
-              Math.max(0, Number(remoteLine?.quantity ?? 0)),
+              currentRemoteReceivedQty,
             ),
           }
         })
-      const regressedLines = candidateLines.filter((line) => (
-        line.currentReceivedQty + 0.0001 < Math.max(
-          Number(line.lastProcessedReceivedQty),
-          Number(line.qtyAccountedViaSnapshot),
-        )
-      ))
-      if (regressedLines.length > 0) {
-        const first = regressedLines[0]
-        throw new Error(
-          `Mintsoft received quantity regressed for ASN ${lockedEvent.externalAsnId} on ${first?.sku ?? 'unknown SKU'}; manual reconciliation is required before snapshot credits can be changed.`,
-        )
-      }
 
       const actionableLines = candidateLines
         .filter((line) => line.currentReceivedQty > Number(line.lastProcessedReceivedQty))
-
-      const unsupportedLines = actionableLines.filter((line) => (
-        line.sourceType !== 'PURCHASE_ORDER_LINE' && line.sourceType !== 'STOCK_TRANSFER_LINE'
-      ))
-      if (unsupportedLines.length > 0) {
-        const kinds = Array.from(new Set(unsupportedLines.map((line) => line.sourceType))).join(', ')
-        throw new Error(`ASN ${lockedEvent.externalAsnId} contains unsupported line source types: ${kinds}`)
-      }
 
       const purchaseActionableLines = actionableLines.filter((line) => line.sourceType === 'PURCHASE_ORDER_LINE')
       const transferActionableLines = actionableLines.filter((line) => line.sourceType === 'STOCK_TRANSFER_LINE')
@@ -407,6 +418,69 @@ export async function processBookedInEvent(
 
       const purchaseLineById = new Map(purchaseOrderLines.map((line) => [line.id, line]))
       const transferLineById = new Map(transferLines.map((line) => [line.id, line]))
+      const now = new Date()
+      const dryRun = buildBookedInDryRun({
+        externalAsnId: lockedEvent.externalAsnId,
+        generatedAt: now,
+        lines: candidateLines.map((line) => {
+          const purchaseLine = line.sourceType === 'PURCHASE_ORDER_LINE'
+            ? purchaseLineById.get(line.sourceLineId)
+            : null
+          const transferLine = line.sourceType === 'STOCK_TRANSFER_LINE'
+            ? transferLineById.get(line.sourceLineId)
+            : null
+          return {
+            asnLineMapId: line.id,
+            externalAsnLineId: line.externalAsnLineId,
+            sourceType: line.sourceType,
+            sourceLineId: line.sourceLineId,
+            productId: line.productId,
+            sku: line.sku,
+            expectedQty: Number(line.expectedQty),
+            currentRemoteReceivedQty: line.currentRemoteReceivedQty,
+            localReceivedQty: Number(purchaseLine?.qtyReceived ?? transferLine?.qtyReceived ?? 0),
+            qtyAccountedViaSnapshot: Number(line.qtyAccountedViaSnapshot),
+            qtyAccountedViaReceipt: Number(line.qtyAccountedViaReceipt),
+            lastProcessedReceivedQty: Number(line.lastProcessedReceivedQty),
+            localLineExists: line.sourceType === 'PURCHASE_ORDER_LINE'
+              ? Boolean(purchaseLine)
+              : line.sourceType === 'STOCK_TRANSFER_LINE'
+                ? Boolean(transferLine)
+                : undefined,
+            costLayerSnapshot: transferLine?.costLayerSnapshot,
+          }
+        }),
+      })
+
+      if (dryRun.warnings.length > 0 && !options.approveReview) {
+        await tx.wmsInboundReceiptEvent.update({
+          where: { id: lockedEvent.id },
+          data: {
+            processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview,
+            nextRetryAt: null,
+            deadLetteredAt: null,
+            lastError: reviewErrorMessage(dryRun),
+            reviewDetails: dryRun,
+            reviewedAt: null,
+            reviewedBy: null,
+          },
+        })
+        return {
+          duplicate: false,
+          pending: false,
+          reviewRequired: true,
+          dryRun,
+          productIds: [] as string[],
+        }
+      }
+
+      const blockedWarnings = approvalBlockedWarnings(dryRun)
+      if (options.approveReview && blockedWarnings.length > 0) {
+        throw new Error(
+          `Mintsoft booked-in review for ASN ${lockedEvent.externalAsnId} cannot be approved until these warnings are corrected: ${blockedWarnings.join(', ')}`,
+        )
+      }
+
       const receiptLinesByPoId = new Map<string, Array<{
         asnLineMapId: string
         poLineId: string
@@ -469,7 +543,6 @@ export async function processBookedInEvent(
         receiptLinesByTransferId.set(transferLine.transferId, entry)
       }
 
-      const now = new Date()
       const touchedProductIds = new Set<string>()
 
       for (const [poId, receiptLines] of receiptLinesByPoId) {
@@ -879,6 +952,28 @@ export async function processBookedInEvent(
         status: 'duplicate',
         eventId: event.id,
         externalAsnId: event.externalAsnId,
+      }
+    }
+
+    if (processed.reviewRequired) {
+      await logActivity({
+        entityType: 'SYNC',
+        entityId: event.id,
+        tag: 'sync',
+        action: 'mintsoft_booked_in_review_required',
+        level: 'WARNING',
+        description: `Mintsoft ASN booked-in webhook ${event.externalAsnId} requires manual review`,
+        metadata: {
+          externalAsnId: event.externalAsnId,
+          warnings: processed.dryRun.warnings,
+        },
+        resolveUser: false,
+      })
+      return {
+        status: 'requires_review',
+        eventId: event.id,
+        externalAsnId: event.externalAsnId,
+        dryRun: processed.dryRun,
       }
     }
 

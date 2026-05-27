@@ -658,6 +658,66 @@ export function MintsoftClient({ data }: Props) {
 
       <Card className="p-6 space-y-4">
         <div>
+          <h3 className="text-base font-semibold">Receipt Reviews</h3>
+          <p className="text-sm text-muted-foreground">
+            Mintsoft booked-in callbacks paused before stock updates because the dry-run found reconciliation warnings.
+          </p>
+        </div>
+
+        <Table containerClassName="rounded-lg border max-h-[40vh]" className="min-w-[860px]">
+          <TableHeader className="bg-muted/40">
+            <TableRow>
+              <TableHead>Received</TableHead>
+              <TableHead>ASN</TableHead>
+              <TableHead>Warnings</TableHead>
+              <TableHead>Lines</TableHead>
+              <TableHead>Error</TableHead>
+              <TableHead className="text-right">Details</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {data.receiptReviewEvents.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={6} className="py-6 text-center text-muted-foreground">
+                  No Mintsoft receipt callbacks require review.
+                </TableCell>
+              </TableRow>
+            ) : (
+              data.receiptReviewEvents.map((event) => (
+                <TableRow key={event.id}>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {new Date(event.receivedAt).toLocaleString()}
+                  </TableCell>
+                  <TableCell>
+                    <div className="font-mono text-xs font-medium">{event.externalAsnId ?? 'Unmapped'}</div>
+                    <div className="text-xs text-muted-foreground">{event.externalEventId}</div>
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    {event.warnings.length === 0 ? 'Review required' : event.warnings.join(', ')}
+                  </TableCell>
+                  <TableCell>{event.lineCount}</TableCell>
+                  <TableCell className="max-w-[260px] truncate text-xs text-muted-foreground">
+                    {event.lastError ?? '—'}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <a
+                      href={`/api/admin/wms/receipt-events/${event.id}/review`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs text-primary hover:underline"
+                    >
+                      JSON
+                    </a>
+                  </TableCell>
+                </TableRow>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      </Card>
+
+      <Card className="p-6 space-y-4">
+        <div>
           <h3 className="text-base font-semibold">Returns Inbox</h3>
           <p className="text-sm text-muted-foreground">
             Mintsoft return events are staged here for operator review. This phase records and classifies the work item; it does not auto-restock inventory.

@@ -70,6 +70,10 @@ export const apiRouteAuthPolicy = {
     access: 'admin-fresh',
     reason: 'Manual integration outbox replay actions are restricted through requireApiFreshAdmin and logged.',
   },
+  '/api/admin/wms/receipt-events/[id]/review': {
+    access: 'admin-fresh',
+    reason: 'Mintsoft receipt review inspection is admin-only; approval requires requireApiFreshAdmin plus same-origin mutation header and is logged.',
+  },
   '/api/backup/create': {
     access: 'admin',
     reason: 'Backup creation is restricted through requireApiAdmin.',

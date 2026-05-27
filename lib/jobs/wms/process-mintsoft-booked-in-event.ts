@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { Prisma } from '@/app/generated/prisma/client'
 import { MintsoftConnector, fetchMintsoftAsns } from '@/lib/connectors/mintsoft'
 import type {
   MintsoftWebhookEventRepository,
@@ -28,6 +29,7 @@ type FetchMintsoftBookedInAsnOptions = {
 
 type ProcessMintsoftBookedInEventJobOptions = {
   fetchRemoteAsn?: (externalAsnId: string) => Promise<WmsAsnRef | null>
+  approveReview?: boolean
 }
 
 type SweepUnprocessedMintsoftBookedInEventsOptions = ProcessMintsoftBookedInEventJobOptions & {
@@ -55,6 +57,7 @@ type MintsoftBookedInCounters = {
   processed: number
   duplicates: number
   pending: number
+  requiresReview: number
   failed: number
 }
 
@@ -153,6 +156,9 @@ export function createMintsoftWebhookEventRepository(
           nextRetryAt: null,
           deadLetteredAt: null,
           lastError: null,
+          reviewDetails: Prisma.DbNull,
+          reviewedAt: null,
+          reviewedBy: null,
         },
       })
       if (updated.count > 0 && previous && shouldLogMintsoftWebhookRetryStateReset(previous)) {
@@ -224,6 +230,7 @@ export async function processMintsoftBookedInEvent(
 ): Promise<ProcessMintsoftBookedInResult> {
   return processBookedInEvent(eventId, {
     fetchRemoteAsn: options?.fetchRemoteAsn ?? fetchMintsoftBookedInAsn,
+    approveReview: options?.approveReview,
   })
 }
 
@@ -234,6 +241,8 @@ function incrementCounter(counters: MintsoftBookedInCounters, result: ProcessMin
     counters.duplicates += 1
   } else if (result.status === 'pending') {
     counters.pending += 1
+  } else if (result.status === 'requires_review') {
+    counters.requiresReview += 1
   } else {
     counters.failed += 1
   }
@@ -250,6 +259,7 @@ export async function replayMintsoftBookedInEventsForAsn(externalAsnId: string):
     processed: 0,
     duplicates: 0,
     pending: 0,
+    requiresReview: 0,
     failed: 0,
   }
 
@@ -278,12 +288,14 @@ export async function sweepUnprocessedMintsoftBookedInEvents(
     processed: 0,
     duplicates: 0,
     pending: 0,
+    requiresReview: 0,
     failed: 0,
   }
 
   for (const event of events) {
     incrementCounter(counters, await processMintsoftBookedInEvent(event.id, {
       fetchRemoteAsn: options.fetchRemoteAsn,
+      approveReview: options.approveReview,
     }))
   }
 
