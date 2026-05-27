@@ -3,7 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAdmin } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireFreshAdmin } from '@/lib/auth/server'
 import { issueDestructiveActionCode, consumeDestructiveActionCode } from '@/lib/destructive-action-confirm'
 
 export type ResetLevel = 'transactions' | 'products' | 'full'
@@ -168,9 +168,9 @@ async function clearFullScope() {
   await db.organisation.deleteMany({})
 }
 
-export async function sendDatabaseResetCode(): Promise<{ success: boolean; email?: string; expiresInSec?: number; error?: string }> {
+export async function sendDatabaseResetCode(): Promise<{ success: boolean; email?: string; expiresInSec?: number; error?: string; code?: string; reason?: string }> {
   try {
-    const session = await requireAdmin()
+    const session = await requireFreshAdmin()
     const email = session.user.email
     const issued = await issueDestructiveActionCode({
       purpose: 'database_reset',
@@ -182,13 +182,15 @@ export async function sendDatabaseResetCode(): Promise<{ success: boolean; email
     if (!issued.success) return { success: false, error: issued.error }
     return { success: true, email: issued.email, expiresInSec: issued.expiresInSec }
   } catch (e) {
+    const freshAuthFailure = freshAuthFailureResult(e)
+    if (freshAuthFailure) return freshAuthFailure
     return { success: false, error: String(e) }
   }
 }
 
-export async function resetDatabase(level: ResetLevel, confirmationCode: string): Promise<{ success: boolean; error?: string }> {
+export async function resetDatabase(level: ResetLevel, confirmationCode: string): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
   try {
-    const session = await requireAdmin()
+    const session = await requireFreshAdmin()
     if (!confirmationCode || confirmationCode.trim().length < 6) {
       return { success: false, error: 'Email confirmation code is required.' }
     }
@@ -219,6 +221,8 @@ export async function resetDatabase(level: ResetLevel, confirmationCode: string)
     }
     return { success: true }
   } catch (e) {
+    const freshAuthFailure = freshAuthFailureResult(e)
+    if (freshAuthFailure) return freshAuthFailure
     await logActivity({ entityType: 'SYSTEM', tag: 'system', action: 'database_reset', level: 'ERROR', description: `Failed to reset database: ${String(e)}` })
     return { success: false, error: String(e) }
   }

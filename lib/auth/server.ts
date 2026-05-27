@@ -9,6 +9,8 @@ import type { Permission } from '@/lib/permissions'
 import {
   requireApiAdminSession,
   requireApiAuthSession,
+  requireApiFreshAdminSession,
+  requireFreshAuthSession,
   requireRoleSession,
   type AuthSession,
 } from '@/lib/auth/session-gates'
@@ -16,6 +18,7 @@ import { loginPathForSessionInvalidReason } from '@/lib/auth/session-state'
 
 export type { Permission }
 export type { AuthSession } from '@/lib/auth/session-gates'
+export { FreshAuthRequiredError, freshAuthFailureResult } from '@/lib/auth/session-gates'
 
 /**
  * Returns the current session or redirects to /login.
@@ -57,6 +60,21 @@ export async function requireAdmin(): Promise<AuthSession> {
 }
 
 /**
+ * Requires a recently authenticated session for high-risk mutations.
+ * Re-signing in refreshes sessionAuthTime; stale sessions fail closed.
+ */
+export async function requireFreshAuth(): Promise<AuthSession> {
+  const session = await requireAuth()
+  return requireFreshAuthSession(session)
+}
+
+export async function requireFreshAdmin(): Promise<AuthSession> {
+  const session = await requireAuth()
+  requireRoleSession(session, ['ADMIN'])
+  return requireFreshAuthSession(session)
+}
+
+/**
  * Requires the current user to hold a specific RBAC permission.
  * Use this on mutating server actions so that non-admin roles can be granted
  * (or denied) specific capabilities.
@@ -67,6 +85,16 @@ export async function requirePermission(permission: Permission): Promise<AuthSes
     throw new Error(`Forbidden: missing permission ${permission}`)
   }
   return session
+}
+
+export async function requireFreshPermission(
+  permission: Permission,
+): Promise<AuthSession> {
+  const session = await requireAuth()
+  if (!hasPermission(session.user.role, permission)) {
+    throw new Error(`Forbidden: missing permission ${permission}`)
+  }
+  return requireFreshAuthSession(session)
 }
 
 /**
@@ -85,4 +113,8 @@ export async function requireApiAuth(): Promise<AuthSession | NextResponse> {
 
 export async function requireApiAdmin(): Promise<AuthSession | NextResponse> {
   return requireApiAdminSession(await auth())
+}
+
+export async function requireApiFreshAdmin(): Promise<AuthSession | NextResponse> {
+  return requireApiFreshAdminSession(await auth())
 }

@@ -1,6 +1,6 @@
 'use server'
 
-import { requirePermission } from '@/lib/auth/server'
+import { requireFreshPermission, requirePermission } from '@/lib/auth/server'
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
@@ -13,6 +13,7 @@ import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { xeroGet } from '@/lib/connectors/xero/api'
+import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
 
 // Type re-export (allowed in 'use server' files)
 export type { XeroSettings } from '@/lib/connectors/xero/settings'
@@ -21,21 +22,26 @@ async function requireAdmin() {
   return requirePermission('sync')
 }
 
+async function requireFreshAdmin() {
+  return requireFreshPermission('sync')
+}
+
 // ---------------------------------------------------------------------------
 // Settings (UI-facing server actions)
 // ---------------------------------------------------------------------------
 
 export async function getXeroSettingsMasked(): Promise<XeroSettings & { secretMasked: boolean }> {
   const settings = await getXeroSettings()
-  const masked = settings.xero_client_secret
-    ? settings.xero_client_secret.substring(0, 4) + '****'
-    : ''
+  const masked = maskSecret(settings.xero_client_secret)
   return { ...settings, xero_client_secret: masked, secretMasked: !!settings.xero_client_secret }
 }
 
 export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ success: boolean; error?: string }> {
   try {
     await requireAdmin()
+    if (shouldFreshGateSecretWrite(data, 'xero_client_secret')) {
+      await requireFreshAdmin()
+    }
 
     // Only run the readiness gate when the user is *transitioning* sync from
     // OFF → ON. If sync is already enabled, allow any save to go through so the
@@ -74,7 +80,7 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
     // Don't overwrite secret with masked value
     const entries = Object.entries(data).filter(([k, v]) => {
       if (!XERO_SETTING_KEYS.includes(k)) return false
-      if (k === 'xero_client_secret' && typeof v === 'string' && v.includes('****')) return false
+      if (k === 'xero_client_secret' && isMaskedSecret(v)) return false
       return true
     })
 
@@ -106,11 +112,11 @@ export async function saveXeroConnectionSettings(
   clientSecret: string,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
   try {
-    await requireAdmin()
+    await requireFreshAdmin()
 
     const nextClientId = clientId.trim()
     const nextClientSecretInput = clientSecret.trim()
-    const nextClientSecret = nextClientSecretInput.includes('****') ? '' : nextClientSecretInput
+    const nextClientSecret = isMaskedSecret(nextClientSecretInput) ? '' : nextClientSecretInput
     const existingSettings = await getXeroSettings()
     const resolvedSecret = nextClientSecret || existingSettings.xero_client_secret.trim()
 
@@ -186,13 +192,13 @@ export async function connectXero(
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
   try {
     void origin
-    const session = await requireAdmin()
+    const session = await requireFreshAdmin()
 
     // Save credentials (never overwrite secret with masked value)
     const ops = [
       db.setting.upsert({ where: { key: 'xero_client_id' }, create: { key: 'xero_client_id', value: serializeSettingValue('xero_client_id', clientId) }, update: { value: serializeSettingValue('xero_client_id', clientId) } }),
     ]
-    if (clientSecret && !clientSecret.includes('****')) {
+    if (clientSecret && !isMaskedSecret(clientSecret)) {
       ops.push(db.setting.upsert({ where: { key: 'xero_client_secret' }, create: { key: 'xero_client_secret', value: serializeSettingValue('xero_client_secret', clientSecret) }, update: { value: serializeSettingValue('xero_client_secret', clientSecret) } }))
     }
     await db.$transaction(ops)
@@ -215,7 +221,7 @@ export async function connectXero(
 
 export async function disconnectXero(): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAdmin()
+    await requireFreshAdmin()
     await disconnect()
 
     await logActivity({

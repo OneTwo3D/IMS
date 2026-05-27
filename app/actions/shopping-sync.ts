@@ -26,7 +26,7 @@ import {
 } from '@/app/actions/wc-sync'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requirePermission } from '@/lib/auth/server'
+import { requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import { shopifyGraphql } from '@/lib/connectors/shopify/api'
 import {
   getActiveSettingEnvOverrides,
@@ -34,6 +34,7 @@ import {
   getSettingValues,
   serializeSettingValue,
 } from '@/lib/settings-store'
+import { isMaskedSecret, maskSecret } from '@/lib/security/secret-mask'
 import { getActiveShoppingConnectorInfo, syncShoppingConnectorStock } from '@/lib/shopping'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 
@@ -89,10 +90,8 @@ async function requireShoppingAdmin() {
   return requirePermission('sync')
 }
 
-function maskSecret(value: string, visibleChars = 7): string {
-  if (!value) return ''
-  if (value.length <= visibleChars) return '*'.repeat(value.length)
-  return `${value.slice(0, visibleChars)}${'*'.repeat(Math.max(0, value.length - visibleChars))}`
+async function requireFreshShoppingAdmin() {
+  return requireFreshPermission('sync')
 }
 
 function mapSyncLogRows(
@@ -260,15 +259,15 @@ export async function saveShopifyConnectorCredentials(
   adminApiAccessToken: string,
   webhookSecret: string,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
-  await requireShoppingAdmin()
+  await requireFreshShoppingAdmin()
 
   const normalizedDomain = normalizeShopifyStoreDomain(storeDomain)
   if (!normalizedDomain) {
     return { success: false, error: 'Store domain is required' }
   }
 
-  const incomingTokenIsMasked = !!adminApiAccessToken && adminApiAccessToken.includes('*')
-  const incomingWebhookSecretIsMasked = !!webhookSecret && webhookSecret.includes('*')
+  const incomingTokenIsMasked = isMaskedSecret(adminApiAccessToken)
+  const incomingWebhookSecretIsMasked = isMaskedSecret(webhookSecret)
 
   const [currentToken, currentWebhookSecret] = await Promise.all([
     incomingTokenIsMasked ? getSettingValue('shopify_admin_api_access_token') : Promise.resolve(adminApiAccessToken),

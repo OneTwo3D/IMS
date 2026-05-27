@@ -6,7 +6,7 @@ import { z } from 'zod'
 import { applyReturnInboundStockTx, type RefundReturnRow } from '@/lib/domain/sales/refund-service'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { getSession, requirePermission } from '@/lib/auth/server'
+import { getSession, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import {
   DEFAULT_MINTSOFT_CONNECTION_LABEL,
   fetchMintsoftAsns,
@@ -36,6 +36,7 @@ import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/int
 import { hasPermission } from '@/lib/permissions'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getActiveSettingEnvOverrides, serializeSettingValue } from '@/lib/settings-store'
+import { maskSecret } from '@/lib/security/secret-mask'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import type { WmsAsnPackagingType } from '@/lib/connectors/wms/types'
 
@@ -345,11 +346,6 @@ function getValidationErrorMessage(error: z.ZodError): string {
   return error.issues[0]?.message ?? 'Invalid input.'
 }
 
-function maskSecret(value: string): string {
-  if (!value) return ''
-  return '********'
-}
-
 function mapMintsoftConnection(
   connection: {
     label: string | null
@@ -562,6 +558,10 @@ async function requireMintsoftReadAccess() {
 
 async function requireMintsoftWriteAccess() {
   return requirePermission('settings.company')
+}
+
+async function requireFreshMintsoftWriteAccess() {
+  return requireFreshPermission('settings.company')
 }
 
 async function requireMintsoftReturnsWriteAccess() {
@@ -1244,7 +1244,9 @@ export async function getMintsoftTransferAsnStates(
 export async function saveMintsoftConnectionSettings(
   input: unknown,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
-  await requireMintsoftWriteAccess()
+  // Fresh auth is limited to connection-secret writes; reversible sync triggers
+  // and review flows remain protected by their normal permission gates.
+  await requireFreshMintsoftWriteAccess()
 
   const parsedInput = MintsoftConnectionInputSchema.safeParse(input)
   if (!parsedInput.success) {

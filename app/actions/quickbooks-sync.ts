@@ -1,6 +1,6 @@
 'use server'
 
-import { requirePermission } from '@/lib/auth/server'
+import { requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -15,11 +15,16 @@ import {
 import { getQuickBooksSettings, QUICKBOOKS_SETTING_KEYS, type QuickBooksSettings } from '@/lib/connectors/quickbooks/settings'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
+import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
 
 export type { QuickBooksSettings } from '@/lib/connectors/quickbooks/settings'
 
 async function requireAdmin() {
   return requirePermission('sync')
+}
+
+async function requireFreshAdmin() {
+  return requireFreshPermission('sync')
 }
 
 // ---------------------------------------------------------------------------
@@ -28,15 +33,16 @@ async function requireAdmin() {
 
 export async function getQuickBooksSettingsMasked(): Promise<QuickBooksSettings & { secretMasked: boolean }> {
   const settings = await getQuickBooksSettings()
-  const masked = settings.quickbooks_client_secret
-    ? settings.quickbooks_client_secret.substring(0, 4) + '****'
-    : ''
+  const masked = maskSecret(settings.quickbooks_client_secret)
   return { ...settings, quickbooks_client_secret: masked, secretMasked: !!settings.quickbooks_client_secret }
 }
 
 export async function saveQuickBooksSettings(data: Partial<QuickBooksSettings>): Promise<{ success: boolean; error?: string }> {
   try {
     await requireAdmin()
+    if (shouldFreshGateSecretWrite(data, 'quickbooks_client_secret')) {
+      await requireFreshAdmin()
+    }
 
     if (data.quickbooks_sync_enabled === 'true') {
       const currentEnabled = await getSettingValue('quickbooks_sync_enabled')
@@ -60,7 +66,7 @@ export async function saveQuickBooksSettings(data: Partial<QuickBooksSettings>):
     // Don't overwrite secret with masked value
     const entries = Object.entries(data).filter(([k, v]) => {
       if (!(QUICKBOOKS_SETTING_KEYS as readonly string[]).includes(k)) return false
-      if (k === 'quickbooks_client_secret' && typeof v === 'string' && v.includes('****')) return false
+      if (k === 'quickbooks_client_secret' && isMaskedSecret(v)) return false
       return true
     })
 
@@ -92,11 +98,11 @@ export async function saveQuickBooksConnectionSettings(
   clientSecret: string,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
   try {
-    await requireAdmin()
+    await requireFreshAdmin()
 
     const nextClientId = clientId.trim()
     const nextClientSecretInput = clientSecret.trim()
-    const nextClientSecret = nextClientSecretInput.includes('****') ? '' : nextClientSecretInput
+    const nextClientSecret = isMaskedSecret(nextClientSecretInput) ? '' : nextClientSecretInput
     const existingSettings = await getQuickBooksSettings()
     const resolvedSecret = nextClientSecret || existingSettings.quickbooks_client_secret.trim()
 
@@ -172,13 +178,13 @@ export async function connectQuickBooks(
 ): Promise<{ success: boolean; redirectUrl?: string; error?: string }> {
   try {
     void origin
-    const session = await requireAdmin()
+    const session = await requireFreshAdmin()
 
     // Save credentials
     const ops = [
       db.setting.upsert({ where: { key: 'quickbooks_client_id' }, create: { key: 'quickbooks_client_id', value: serializeSettingValue('quickbooks_client_id', clientId) }, update: { value: serializeSettingValue('quickbooks_client_id', clientId) } }),
     ]
-    if (clientSecret && !clientSecret.includes('****')) {
+    if (clientSecret && !isMaskedSecret(clientSecret)) {
       ops.push(db.setting.upsert({ where: { key: 'quickbooks_client_secret' }, create: { key: 'quickbooks_client_secret', value: serializeSettingValue('quickbooks_client_secret', clientSecret) }, update: { value: serializeSettingValue('quickbooks_client_secret', clientSecret) } }))
     }
     await db.$transaction(ops)
@@ -198,7 +204,9 @@ export async function connectQuickBooks(
 
 export async function disconnectQuickBooks(): Promise<{ success: boolean; error?: string }> {
   try {
-    await requireAdmin()
+    // Fresh-at-start is the security boundary; connector revocation may outlive
+    // the freshness window after the operator has already confirmed intent.
+    await requireFreshAdmin()
     await disconnect()
 
     await logActivity({

@@ -3,8 +3,9 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requirePermission } from '@/lib/auth/server'
+import { requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import { decryptSettingValue } from '@/lib/security/encrypted-settings'
+import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
 import {
   getActiveSettingEnvOverrides,
   getSettingValue,
@@ -23,6 +24,10 @@ import {
 // All mutating exports in this file require the `sync` permission.
 async function requireAdmin() {
   return requirePermission('sync')
+}
+
+async function requireFreshAdmin() {
+  return requireFreshPermission('sync')
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +165,9 @@ async function validateWooStoreBaseCurrency(credentials?: { url: string; key: st
 
 export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise<{ success: boolean; error?: string }> {
   await requireAdmin()
+  if (shouldFreshGateSecretWrite(data, 'wc_webhook_secret')) {
+    await requireFreshAdmin()
+  }
   if (data.wc_sync_enabled === 'true') {
     const validation = await validateWooStoreBaseCurrency()
     if (!validation.ok) return { success: false, error: validation.error }
@@ -215,7 +223,8 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
  * product IDs" button) to flush the cache.
  */
 export async function saveWcCredentials(url: string, key: string, secret: string): Promise<{ success: boolean; wipedMappings: number; error?: string; message?: string }> {
-  await requireAdmin()
+  // Direct credential parameters are action intent, not masked echo values.
+  await requireFreshAdmin()
 
   const validatedUrl = validateWooCommerceBaseUrl(url)
   if (!validatedUrl.ok) {
@@ -224,11 +233,11 @@ export async function saveWcCredentials(url: string, key: string, secret: string
 
   const nextKey = key.trim()
   const nextSecret = secret.trim()
-  const incomingKeyIsMasked = !!nextKey && nextKey.includes('*')
+  const incomingKeyIsMasked = isMaskedSecret(nextKey)
   const currentKey = incomingKeyIsMasked
     ? await getSettingValue('wc_consumer_key')
     : nextKey
-  const incomingSecretIsMasked = !!nextSecret && nextSecret.includes('*')
+  const incomingSecretIsMasked = isMaskedSecret(nextSecret)
   const shouldReuseStoredSecret = incomingSecretIsMasked || !nextSecret
   const currentSecret = shouldReuseStoredSecret
     ? await getSettingValue('wc_consumer_secret')
@@ -349,7 +358,9 @@ export async function saveWcCredentials(url: string, key: string, secret: string
  * reflects the reset.
  */
 export async function resetWcProductIdCache(): Promise<{ success: boolean; wipedMappings: number }> {
-  await requireAdmin()
+  // This reset forces full WooCommerce product-id re-resolution and can leave
+  // stock displays temporarily out of sync while the next sync catches up.
+  await requireFreshAdmin()
   // Serialize with in-flight stock syncs and bump the version so any
   // snapshotted run aborts on its next persist attempt — same contract
   // as `saveWcCredentials`, minus the credentials writes themselves.
@@ -391,8 +402,8 @@ export async function getWcCredentials(): Promise<{ url: string; key: string; se
   return {
     url: map.get('wc_url') ?? '',
     // Never send full credentials to client — mask them
-    key: key ? `${key.slice(0, 7)}${'*'.repeat(Math.max(0, key.length - 7))}` : '',
-    secret: secret ? `${secret.slice(0, 7)}${'*'.repeat(Math.max(0, secret.length - 7))}` : '',
+    key: maskSecret(key, 7),
+    secret: maskSecret(secret, 7),
     secretMasked: !!secret,
     envOverrides: getActiveSettingEnvOverrides(['wc_consumer_key', 'wc_consumer_secret']),
   }

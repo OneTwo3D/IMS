@@ -3,7 +3,7 @@ import { createHash } from 'node:crypto'
 import { NextRequest, NextResponse } from 'next/server'
 
 import { logActivity } from '@/lib/activity-log'
-import { requireApiAdmin } from '@/lib/auth/server'
+import { requireApiFreshAdmin } from '@/lib/auth/server'
 import {
   IntegrationOutboxAdminError,
   replayIntegrationOutboxAdminRow,
@@ -48,7 +48,7 @@ export function createAdminOutboxReplayHandler(deps: AdminOutboxReplayHandlerDep
     request: NextRequest,
     context: { params: Promise<{ id: string }> },
   ): Promise<NextResponse> {
-    const authResult = await (deps.authorize ?? requireApiAdmin)()
+    const authResult = await (deps.authorize ?? requireApiFreshAdmin)()
     if (authResult instanceof Response) return authResult as NextResponse
     const mutationHeaderError = requireAdminMutationHeader(request)
     if (mutationHeaderError) return mutationHeaderError as NextResponse
