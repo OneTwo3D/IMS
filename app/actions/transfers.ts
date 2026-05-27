@@ -17,6 +17,7 @@ import {
 } from '@/lib/cost-layers'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
+import { toDecimal } from '@/lib/domain/math/decimal'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -392,7 +393,8 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
       // layers and storing the snapshot so receiveTransfer can recreate
       // equivalent layers at the destination warehouse.
       for (const line of transfer.lines) {
-        const qty = Number(line.qty)
+        const qtyDecimal = toDecimal(line.qty)
+        const qty = qtyDecimal.toNumber()
         await tx.stockMovement.create({
           data: {
             type: 'TRANSFER_OUT',
@@ -409,12 +411,26 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
           where: {
             productId: line.productId,
             warehouseId: transfer.fromWarehouseId,
-            quantity: { gte: qty.toString() },
+            quantity: { gte: qtyDecimal.toString() },
           },
           data: { quantity: { decrement: qty } },
         })
         if (updatedStock.count !== 1) {
-          throw new Error(`Insufficient stock for ${line.sku}: stock changed during dispatch`)
+          const currentStock = await tx.stockLevel.findUnique({
+            where: {
+              productId_warehouseId: {
+                productId: line.productId,
+                warehouseId: transfer.fromWarehouseId,
+              },
+            },
+            select: { quantity: true },
+          })
+          if (!currentStock) {
+            throw new Error(`No stock at ${transfer.fromWarehouse.code} for ${line.sku}`)
+          }
+          throw new Error(
+            `Insufficient stock for ${line.sku}: ${currentStock.quantity} on hand, ${qtyDecimal.toString()} requested`,
+          )
         }
 
         // Consume FIFO layers from source warehouse — tolerant mode

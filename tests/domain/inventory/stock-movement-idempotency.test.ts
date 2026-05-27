@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { Prisma } from '@/app/generated/prisma/client'
 import {
+  isStockMovementIdempotencyConflict,
   refundInboundMovementKey,
   saleDispatchMovementKey,
   wmsPurchaseReceiptMovementKey,
@@ -27,10 +29,37 @@ test('builds deterministic stock movement idempotency keys for irreversible flow
   )
 })
 
-test('rejects blank or delimiter-containing key parts', () => {
+test('builds stable disjoint keys across calls and movement kinds', () => {
+  assert.equal(saleDispatchMovementKey('same-id'), saleDispatchMovementKey('same-id'))
+  assert.notEqual(
+    saleDispatchMovementKey('same-id'),
+    refundInboundMovementKey({ refundId: 'same-id', refundLineId: 'same-id' }),
+  )
+})
+
+test('rejects blank, overlong, or invalid key parts', () => {
   assert.throws(() => saleDispatchMovementKey(' '), /must not be blank/)
   assert.throws(
     () => refundInboundMovementKey({ refundId: 'refund:1', refundLineId: 'line-1' }),
-    /must not contain/,
+    /invalid characters/,
   )
+  assert.throws(() => saleDispatchMovementKey('a'.repeat(201)), /200 characters or fewer/)
+  assert.throws(() => saleDispatchMovementKey('line\n1'), /invalid characters/)
+  assert.throws(() => saleDispatchMovementKey('line\u00001'), /invalid characters/)
+})
+
+function prismaKnownError(code: string, target?: string[] | string) {
+  return new Prisma.PrismaClientKnownRequestError('Prisma error', {
+    code,
+    clientVersion: 'test',
+    meta: target == null ? undefined : { target },
+  })
+}
+
+test('detects only stock movement idempotency unique conflicts', () => {
+  assert.equal(isStockMovementIdempotencyConflict(prismaKnownError('P2002', ['idempotencyKey'])), true)
+  assert.equal(isStockMovementIdempotencyConflict(prismaKnownError('P2002', 'idempotencyKey')), true)
+  assert.equal(isStockMovementIdempotencyConflict(prismaKnownError('P2002', ['referenceId'])), false)
+  assert.equal(isStockMovementIdempotencyConflict(prismaKnownError('P2003', ['idempotencyKey'])), false)
+  assert.equal(isStockMovementIdempotencyConflict(new Error('Unique constraint failed')), false)
 })

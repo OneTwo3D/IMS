@@ -6,6 +6,8 @@ test.describe('workflow coverage', () => {
     const product = await createSimpleProduct(page)
 
     await page.getByRole('textbox', { name: /search products/i }).fill(product.sku)
+    // Keep first() because highlighted/virtualized search results can render
+    // duplicate row-like matches while still representing the same product.
     const row = page.getByRole('row').filter({
       has: page.getByRole('link', { name: product.sku, exact: true }),
     }).first()

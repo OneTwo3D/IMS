@@ -5,6 +5,7 @@ import { copyCostLayerSourceLinesProportionally, createCostLayer } from '@/lib/c
 import { reconcileBookedInQuantities, sliceTransferSnapshotForReceipt } from './asn-reconciliation'
 import { enqueueStockSync } from '@/lib/shopping'
 import {
+  isStockMovementIdempotencyConflict,
   wmsPurchaseReceiptMovementKey,
   wmsTransferInMovementKey,
 } from '@/lib/domain/inventory/stock-movement-idempotency'
@@ -550,21 +551,26 @@ export async function processBookedInEvent(
           if (receiptLine.qtyReceived > 0) {
             const unitCostBase = Number(poLine.landedUnitCostBase ?? poLine.unitCostBase)
             if (receiptLine.stockQtyToAdd > 0) {
-              await tx.stockMovement.create({
-                data: {
-                  type: 'PURCHASE_RECEIPT',
-                  productId: poLine.productId,
-                  toWarehouseId: asnMap.warehouseId,
-                  qty: receiptLine.stockQtyToAdd,
-                  note: `Received against ${po.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
-                  referenceType: 'WmsAsnMap',
-                  referenceId: asnMap.id,
-                  idempotencyKey: wmsPurchaseReceiptMovementKey({
-                    asnLineMapId: receiptLine.asnLineMapId,
-                    receiptEventId: lockedEvent.id,
-                  }),
-                },
-              })
+              try {
+                await tx.stockMovement.create({
+                  data: {
+                    type: 'PURCHASE_RECEIPT',
+                    productId: poLine.productId,
+                    toWarehouseId: asnMap.warehouseId,
+                    qty: receiptLine.stockQtyToAdd,
+                    note: `Received against ${po.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
+                    referenceType: 'WmsAsnMap',
+                    referenceId: asnMap.id,
+                    idempotencyKey: wmsPurchaseReceiptMovementKey({
+                      asnLineMapId: receiptLine.asnLineMapId,
+                      receiptEventId: lockedEvent.id,
+                    }),
+                  },
+                })
+              } catch (error) {
+                if (!isStockMovementIdempotencyConflict(error)) throw error
+                continue
+              }
 
               await tx.costLayer.create({
                 data: {
@@ -715,22 +721,27 @@ export async function processBookedInEvent(
 
           if (receiptLine.qtyReceived > 0) {
             if (receiptLine.stockQtyToAdd > 0) {
-              await tx.stockMovement.create({
-                data: {
-                  type: 'TRANSFER_IN',
-                  productId: transferLine.productId,
-                  fromWarehouseId: null,
-                  toWarehouseId: transfer.toWarehouseId,
-                  qty: receiptLine.stockQtyToAdd,
-                  note: `Received against ${transfer.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
-                  referenceType: 'WmsAsnMap',
-                  referenceId: asnMap.id,
-                  idempotencyKey: wmsTransferInMovementKey({
-                    asnLineMapId: receiptLine.asnLineMapId,
-                    receiptEventId: lockedEvent.id,
-                  }),
-                },
-              })
+              try {
+                await tx.stockMovement.create({
+                  data: {
+                    type: 'TRANSFER_IN',
+                    productId: transferLine.productId,
+                    fromWarehouseId: null,
+                    toWarehouseId: transfer.toWarehouseId,
+                    qty: receiptLine.stockQtyToAdd,
+                    note: `Received against ${transfer.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
+                    referenceType: 'WmsAsnMap',
+                    referenceId: asnMap.id,
+                    idempotencyKey: wmsTransferInMovementKey({
+                      asnLineMapId: receiptLine.asnLineMapId,
+                      receiptEventId: lockedEvent.id,
+                    }),
+                  },
+                })
+              } catch (error) {
+                if (!isStockMovementIdempotencyConflict(error)) throw error
+                continue
+              }
 
               await tx.stockLevel.upsert({
                 where: {
