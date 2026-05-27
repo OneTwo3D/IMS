@@ -1,5 +1,5 @@
 import { constants } from 'node:fs'
-import { access, readdir, stat } from 'node:fs/promises'
+import { access, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -770,8 +770,11 @@ async function checkWritableDirectories(now: Date = new Date()): Promise<Directo
 }
 
 async function checkWritableDirectory(label: string, directory: string, now: Date): Promise<DirectoryHealthCheck> {
+  const probePath = path.join(directory, `.ims-health-${process.pid}-${Date.now()}.tmp`)
   try {
     await access(directory, constants.W_OK)
+    await writeFile(probePath, '')
+    await unlink(probePath)
 
     return {
       label,

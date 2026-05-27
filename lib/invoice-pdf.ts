@@ -9,14 +9,16 @@
  * consumption semantics.
  */
 
-import { mkdir, readFile, writeFile } from 'fs/promises'
+import { constants } from 'node:fs'
+import { access, lstat, mkdir, readFile, realpath, rename, writeFile } from 'fs/promises'
 import path from 'path'
 import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto'
 
 import { parsePositiveIntegerEnv } from '@/lib/env'
 
 const INVOICE_PDF_STORED_PATH_PREFIX = 'invoice-pdfs'
-const SAFE_INVOICE_PDF_ID = /^[a-zA-Z0-9._-]+$/
+const SAFE_INVOICE_PDF_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/
+const MAX_INVOICE_PDF_ID_LENGTH = 256
 const INVOICE_PDF_TOKEN_PURPOSE = 'invoice-pdf'
 const INVOICE_PDF_TOKEN_VERSION = 1
 const DEFAULT_INVOICE_PDF_TOKEN_TTL_SECONDS = 3 * 24 * 60 * 60
@@ -64,10 +66,14 @@ type TokenOptions = {
 
 function configuredInvoicePdfStorageDir(env: Record<string, string | undefined> = process.env): string {
   const configured = env.INVOICE_PDF_STORAGE_DIR?.trim()
-  return path.resolve(configured || path.join(process.cwd(), 'data', 'invoices'))
+  const fallback = path.join(process.cwd(), 'data', 'invoices')
+  return path.resolve(configured && configured.length > 0 ? configured : fallback)
 }
 
 function invoicePdfFilename(orderId: string): string | null {
+  // Keep both explicit path-separator checks and the allowlist: the redundancy
+  // makes the traversal boundary obvious if the filename regex changes later.
+  if (orderId.length > MAX_INVOICE_PDF_ID_LENGTH) return null
   if (!orderId || orderId.includes('\0') || orderId.includes('/') || orderId.includes('\\')) return null
   if (!SAFE_INVOICE_PDF_ID.test(orderId)) return null
   return `${orderId}.pdf`
@@ -75,7 +81,49 @@ function invoicePdfFilename(orderId: string): string | null {
 
 function isWithinDirectory(root: string, filePath: string): boolean {
   const relative = path.relative(root, filePath)
-  return relative !== '' && !relative.startsWith('..') && !path.isAbsolute(relative)
+  return relative !== '' && relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative)
+}
+
+function isSameOrWithinDirectory(root: string, filePath: string): boolean {
+  return root === filePath || isWithinDirectory(root, filePath)
+}
+
+async function resolveRealInvoicePdfPath(filePath: string): Promise<string | null> {
+  try {
+    const [realRoot, realFilePath] = await Promise.all([
+      realpath(configuredInvoicePdfStorageDir()),
+      realpath(filePath),
+    ])
+    return isWithinDirectory(realRoot, realFilePath) ? realFilePath : null
+  } catch {
+    return null
+  }
+}
+
+async function ensureInvoicePdfStorageDir(filePath: string): Promise<void> {
+  const root = configuredInvoicePdfStorageDir()
+  if (process.env.NODE_ENV === 'production') {
+    await access(root, constants.W_OK)
+  } else {
+    await mkdir(root, { recursive: true })
+  }
+
+  const [realRoot, realParent] = await Promise.all([
+    realpath(root),
+    realpath(path.dirname(filePath)),
+  ])
+  if (!isSameOrWithinDirectory(realRoot, realParent)) {
+    throw new Error('Invoice PDF storage path resolved outside configured directory')
+  }
+
+  try {
+    const existing = await lstat(filePath)
+    if (existing.isSymbolicLink()) {
+      throw new Error('Invoice PDF target path must not be a symlink')
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error
+  }
 }
 
 function resolveInvoicePdfPath(orderId: string): string | null {
@@ -90,7 +138,10 @@ function resolveInvoicePdfPath(orderId: string): string | null {
 
 function invoicePdfStoredPath(orderId: string): string {
   const filename = invoicePdfFilename(orderId)
-  if (!filename) throw new Error('Invalid invoice PDF order id')
+  if (!filename) throw new Error('Invalid invoice PDF order id for stored path')
+  // Logical marker stored in SalesOrder.invoicePdfPath. The actual on-disk path
+  // is derived at read time via loadInvoicePdf(orderId), so storage can move
+  // without rewriting database rows.
   return path.posix.join(INVOICE_PDF_STORED_PATH_PREFIX, filename)
 }
 
@@ -157,7 +208,7 @@ function parsePayload(encoded: string): InvoicePdfTokenPayload | null {
 /** Get the file path for a saved invoice PDF */
 export function getInvoicePdfPath(orderId: string): string {
   const filePath = resolveInvoicePdfPath(orderId)
-  if (!filePath) throw new Error('Invalid invoice PDF order id')
+  if (!filePath) throw new Error('Invalid invoice PDF order id for storage path')
   return filePath
 }
 
@@ -170,8 +221,10 @@ export function getInvoicePdfStorageDir(): string {
 export async function loadInvoicePdf(orderId: string): Promise<Buffer | null> {
   const filePath = resolveInvoicePdfPath(orderId)
   if (!filePath) return null
+  const realFilePath = await resolveRealInvoicePdfPath(filePath)
+  if (!realFilePath) return null
   try {
-    return await readFile(filePath)
+    return await readFile(realFilePath)
   } catch {
     return null
   }
@@ -180,8 +233,12 @@ export async function loadInvoicePdf(orderId: string): Promise<Buffer | null> {
 /** Save an invoice PDF to configured persistent storage and return its logical stored path. */
 export async function saveInvoicePdfFile(orderId: string, buffer: Buffer): Promise<string> {
   const filePath = getInvoicePdfPath(orderId)
-  await mkdir(path.dirname(filePath), { recursive: true })
-  await writeFile(filePath, buffer)
+  await ensureInvoicePdfStorageDir(filePath)
+  const tempPath = path.join(path.dirname(filePath), `.${path.basename(filePath)}.${randomBytes(8).toString('hex')}.tmp`)
+  // Connector PDFs are idempotently re-fetchable, so atomic rename is enough
+  // here; this intentionally does not fsync the directory for crash durability.
+  await writeFile(tempPath, buffer)
+  await rename(tempPath, filePath)
   return invoicePdfStoredPath(orderId)
 }
 

@@ -1,6 +1,7 @@
 /**
  * Public signed-URL PDF download endpoint for Xero invoices.
  * GET /api/invoices/[id]?token=<expiring-signed-token>
+ * Authenticated invoice rendering lives in the sibling singular /api/invoice/[id] route.
  */
 
 import { NextRequest, NextResponse } from 'next/server'

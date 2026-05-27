@@ -82,6 +82,17 @@ test('production preflight requires explicit invoice PDF storage configuration',
   })
 })
 
+test('production preflight treats empty invoice PDF storage configuration as missing', async () => {
+  await withStorageDirs(async (storage) => {
+    const env = { ...baseEnv(storage), INVOICE_PDF_STORAGE_DIR: '' }
+
+    const result = await runProductionPreflight({ env })
+
+    assert.equal(result.ok, false)
+    assertFailed(result, 'invoice-pdf-storage-dir')
+  })
+})
+
 test('production preflight fails without printing secret values', async () => {
   await withStorageDirs(async (storage) => {
     const invalidSettingsKey = 'tiny-key-value'
@@ -335,6 +346,8 @@ test('production preflight passes when scanner command health is clean', async (
 test('production preflight reports missing storage subdirectories with expected paths', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ims-preflight-missing-storage-'))
   try {
+    // Deliberately use a fresh root rather than withStorageDirs so every
+    // storage path, including invoicePdfStorage, exercises the missing path.
     const result = await runProductionPreflight({
       env: baseEnv({
         UPLOAD_STORAGE_DIR: path.join(root, 'uploads'),
