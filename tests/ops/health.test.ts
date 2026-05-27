@@ -222,6 +222,7 @@ test('operational health builders summarize outbox webhook accounting and cron r
     pending: 1,
     pendingRetry: 0,
     failedRetry: 0,
+    requiresReview: 1,
     dead: 1,
     oldestUnprocessedReceivedAt: new Date('2026-04-28T10:00:00.000Z'),
     now: FIXED_DATE,
@@ -246,6 +247,7 @@ test('operational health builders summarize outbox webhook accounting and cron r
   assert.equal(outbox.status, 'warning')
   assert.equal(outbox.details?.oldestPendingAgeMs, 3600000)
   assert.equal(webhook.status, 'warning')
+  assert.equal(webhook.details?.requiresReview, 1)
   assert.equal(webhook.details?.dead, 1)
   assert.equal(accountingEvents.status, 'warning')
   assert.equal(accountingEvents.details?.failed, 1)
@@ -625,6 +627,7 @@ function createHealthAdapters(overrides: Partial<HealthAdapters> = {}): HealthAd
       pending: 0,
       pendingRetry: 0,
       failedRetry: 0,
+      requiresReview: 0,
       dead: 0,
       oldestUnprocessedReceivedAt: null,
       now: FIXED_DATE,

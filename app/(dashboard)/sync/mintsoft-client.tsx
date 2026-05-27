@@ -37,6 +37,21 @@ type Props = {
   data: MintsoftDashboardData
 }
 
+const RECEIPT_REVIEW_WARNING_LABELS: Record<string, string> = {
+  cost_layer_snapshot_missing: 'Cost-layer snapshot missing',
+  missing_local_line: 'IMS line missing',
+  received_over_expected: 'Over-received',
+  remote_regression: 'Mintsoft quantity decreased',
+  unsupported_source_type: 'Unsupported source line',
+}
+
+const RECEIPT_REVIEW_BLOCKING_WARNINGS = new Set([
+  'cost_layer_snapshot_missing',
+  'missing_local_line',
+  'remote_regression',
+  'unsupported_source_type',
+])
+
 function formatThresholdSummary(
   thresholds: { absoluteDelta: number | null; percentDelta: number | null } | null,
 ): string {
@@ -60,6 +75,30 @@ function EnvOverrideNotice({ overrides }: { overrides: Record<string, string> })
           {' '}Clear the environment variable to apply changes saved here.
         </span>
       </div>
+    </div>
+  )
+}
+
+function ReceiptReviewWarnings({ warnings }: { warnings: string[] }) {
+  if (warnings.length === 0) return <span className="text-muted-foreground">Review required</span>
+
+  return (
+    <div className="flex flex-wrap gap-1">
+      {warnings.map((warning) => {
+        const blocking = RECEIPT_REVIEW_BLOCKING_WARNINGS.has(warning)
+        return (
+          <span
+            key={warning}
+            className={
+              blocking
+                ? 'rounded border border-red-200 bg-red-50 px-1.5 py-0.5 text-[11px] font-medium text-red-700'
+                : 'rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-700'
+            }
+          >
+            {RECEIPT_REVIEW_WARNING_LABELS[warning] ?? warning}
+          </span>
+        )
+      })}
     </div>
   )
 }
@@ -648,6 +687,68 @@ export function MintsoftClient({ data }: Props) {
                   </TableCell>
                   <TableCell className="text-xs text-muted-foreground">
                     {link.lastSyncedAt ? new Date(link.lastSyncedAt).toLocaleString() : '—'}
+                  </TableCell>
+                </TableRow>
+              ))
+            )}
+          </TableBody>
+        </Table>
+      </Card>
+
+      <Card className="p-6 space-y-4">
+        <div>
+          <h3 className="text-base font-semibold">Receipt Reviews</h3>
+          <p className="text-sm text-muted-foreground">
+            {data.receiptReviewEventCount === data.receiptReviewEvents.length
+              ? `${data.receiptReviewEventCount} Mintsoft booked-in callback${data.receiptReviewEventCount === 1 ? '' : 's'} paused before stock updates.`
+              : `${data.receiptReviewEventCount} Mintsoft booked-in callbacks paused before stock updates; showing newest ${data.receiptReviewEvents.length}.`}
+          </p>
+        </div>
+
+        <Table containerClassName="rounded-lg border max-h-[40vh]" className="min-w-[860px]">
+          <TableHeader className="bg-muted/40">
+            <TableRow>
+              <TableHead>Received</TableHead>
+              <TableHead>ASN</TableHead>
+              <TableHead>Warnings</TableHead>
+              <TableHead>Lines</TableHead>
+              <TableHead>Error</TableHead>
+              <TableHead className="text-right">Details</TableHead>
+            </TableRow>
+          </TableHeader>
+          <TableBody>
+            {data.receiptReviewEvents.length === 0 ? (
+              <TableRow>
+                <TableCell colSpan={6} className="py-6 text-center text-muted-foreground">
+                  No Mintsoft receipt callbacks require review.
+                </TableCell>
+              </TableRow>
+            ) : (
+              data.receiptReviewEvents.map((event) => (
+                <TableRow key={event.id}>
+                  <TableCell className="text-xs text-muted-foreground">
+                    {new Date(event.receivedAt).toLocaleString()}
+                  </TableCell>
+                  <TableCell>
+                    <div className="font-mono text-xs font-medium">{event.externalAsnId ?? 'Unmapped'}</div>
+                    <div className="text-xs text-muted-foreground">{event.externalEventId}</div>
+                  </TableCell>
+                  <TableCell className="text-xs">
+                    <ReceiptReviewWarnings warnings={event.warnings} />
+                  </TableCell>
+                  <TableCell>{event.lineCount}</TableCell>
+                  <TableCell className="max-w-[260px] truncate text-xs text-muted-foreground">
+                    {event.lastError ?? '—'}
+                  </TableCell>
+                  <TableCell className="text-right">
+                    <a
+                      href={`/api/admin/wms/receipt-events/${event.id}/review`}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-xs text-primary hover:underline"
+                    >
+                      JSON
+                    </a>
                   </TableCell>
                 </TableRow>
               ))

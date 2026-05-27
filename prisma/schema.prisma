@@ -2203,6 +2203,14 @@ model WmsInboundReceiptEvent {
   nextRetryAt        DateTime?
   deadLetteredAt     DateTime?
   lastError          String?
+  /// Full dry-run object captured when the event entered REQUIRES_REVIEW state.
+  /// Stored as JSONB; dashboard queries show a capped event list and keep detailed inspection on the review API.
+  reviewDetails      Json?
+  /// Set only after an admin approval reprocesses the event successfully.
+  /// Failed approval attempts remain visible in ActivityLog and lastError without stamping this field.
+  reviewedAt         DateTime?
+  /// User id of the approving admin. No FK so audit history survives user deletion.
+  reviewedBy         String?
   receivedAt         DateTime @default(now())
 
   @@unique([connector, externalEventId])

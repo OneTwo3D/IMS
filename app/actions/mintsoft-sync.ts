@@ -31,6 +31,7 @@ import {
   type MintsoftReturnsInboxRow,
 } from '@/lib/connectors/mintsoft/sync/returns-sync'
 import { replayMintsoftBookedInEventsForAsn } from '@/lib/jobs/wms/process-mintsoft-booked-in-event'
+import { MINTSOFT_WEBHOOK_PROCESSING_STATUS } from '@/lib/domain/wms/booked-in-service'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { hasPermission } from '@/lib/permissions'
@@ -254,6 +255,16 @@ export type MintsoftBundleLinkRow = {
   lastSyncedAt: string | null
 }
 
+export type MintsoftReceiptReviewEventRow = {
+  id: string
+  externalEventId: string
+  externalAsnId: string | null
+  receivedAt: string
+  lastError: string | null
+  warnings: string[]
+  lineCount: number
+}
+
 export type MintsoftDashboardData = {
   connection: MintsoftConnectionSettingsMasked
   status: MintsoftConnectionStatus
@@ -265,6 +276,8 @@ export type MintsoftDashboardData = {
   openDiscrepancies: MintsoftDiscrepancyRow[]
   bundleLinks: MintsoftBundleLinkRow[]
   returnsInbox: MintsoftReturnsInboxRow[]
+  receiptReviewEvents: MintsoftReceiptReviewEventRow[]
+  receiptReviewEventCount: number
   availableOrderLookupConnectors: ShoppingConnectorId[]
   orderLookupConnectorRequired: boolean
 }
@@ -493,6 +506,39 @@ function mapMintsoftDiscrepancy(row: {
   }
 }
 
+function parseReceiptReviewDetails(value: Prisma.JsonValue | null): { warnings: string[]; lineCount: number } {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return { warnings: [], lineCount: 0 }
+  }
+  const record = value as Record<string, unknown>
+  return {
+    warnings: Array.isArray(record.warnings)
+      ? record.warnings.filter((warning): warning is string => typeof warning === 'string')
+      : [],
+    lineCount: Array.isArray(record.lines) ? record.lines.length : 0,
+  }
+}
+
+function mapMintsoftReceiptReviewEvent(row: {
+  id: string
+  externalEventId: string
+  externalAsnId: string | null
+  receivedAt: Date
+  lastError: string | null
+  reviewDetails: Prisma.JsonValue | null
+}): MintsoftReceiptReviewEventRow {
+  const details = parseReceiptReviewDetails(row.reviewDetails)
+  return {
+    id: row.id,
+    externalEventId: row.externalEventId,
+    externalAsnId: row.externalAsnId,
+    receivedAt: row.receivedAt.toISOString(),
+    lastError: row.lastError,
+    warnings: details.warnings,
+    lineCount: details.lineCount,
+  }
+}
+
 function trimToNull(value: string | null | undefined): string | null {
   const trimmed = value?.trim()
   return trimmed ? trimmed : null
@@ -683,7 +729,13 @@ async function getMintsoftExternalWarehouses(
 export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData> {
   await requireMintsoftReadAccess()
 
-  const [connection, settings, warehouses, bindings, recentStockSyncJobs, dryRunReadyJobs, openDiscrepancies, bundleLinks, returnsInbox, pluginState] = await Promise.all([
+  const receiptReviewWhere = {
+    connector: 'mintsoft',
+    processedAt: null,
+    processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview,
+  }
+
+  const [connection, settings, warehouses, bindings, recentStockSyncJobs, dryRunReadyJobs, openDiscrepancies, bundleLinks, returnsInbox, receiptReviewEventCount, receiptReviewEvents, pluginState] = await Promise.all([
     db.wmsConnection.findFirst({
       where: { connector: 'mintsoft' },
       orderBy: [{ createdAt: 'asc' }],
@@ -846,6 +898,22 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
         },
       },
     }),
+    db.wmsInboundReceiptEvent.count({
+      where: receiptReviewWhere,
+    }),
+    db.wmsInboundReceiptEvent.findMany({
+      where: receiptReviewWhere,
+      orderBy: [{ receivedAt: 'desc' }],
+      take: 20,
+      select: {
+        id: true,
+        externalEventId: true,
+        externalAsnId: true,
+        receivedAt: true,
+        lastError: true,
+        reviewDetails: true,
+      },
+    }),
     getIntegrationPluginState(),
   ])
   const availableOrderLookupConnectors = getAvailableOrderLookupConnectors(pluginState)
@@ -911,6 +979,8 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
       lastSyncedAt: link.lastSyncedAt?.toISOString() ?? null,
     })),
     returnsInbox: returnsInbox.map(mapMintsoftReturnsInboxRow),
+    receiptReviewEvents: receiptReviewEvents.map(mapMintsoftReceiptReviewEvent),
+    receiptReviewEventCount,
     availableOrderLookupConnectors,
     orderLookupConnectorRequired: availableOrderLookupConnectors.length > 1,
   }

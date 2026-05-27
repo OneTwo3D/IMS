@@ -533,6 +533,7 @@ export function buildMintsoftWebhookQueueHealth(input: {
   pending: number
   pendingRetry: number
   failedRetry: number
+  requiresReview: number
   dead: number
   oldestUnprocessedReceivedAt?: Date | null
   now?: Date
@@ -542,7 +543,9 @@ export function buildMintsoftWebhookQueueHealth(input: {
     ? Math.max(0, now.getTime() - input.oldestUnprocessedReceivedAt.getTime())
     : null
   const stale = oldestUnprocessedAgeMs != null && oldestUnprocessedAgeMs > MINTSOFT_WEBHOOK_STALE_AFTER_MS
-  const status = input.dead > 0 || input.failedRetry > 0 || stale ? 'warning' : 'ok'
+  // Any receipt review backlog is intentionally amber for now: each item represents a paused
+  // stock mutation that needs operator acknowledgement or source-data repair before retry.
+  const status = input.dead > 0 || input.failedRetry > 0 || input.requiresReview > 0 || stale ? 'warning' : 'ok'
 
   return {
     status,
@@ -552,6 +555,7 @@ export function buildMintsoftWebhookQueueHealth(input: {
       pending: input.pending,
       pendingRetry: input.pendingRetry,
       failedRetry: input.failedRetry,
+      requiresReview: input.requiresReview,
       dead: input.dead,
       oldestUnprocessedReceivedAt: input.oldestUnprocessedReceivedAt?.toISOString() ?? null,
       oldestUnprocessedAgeMs,
@@ -1021,6 +1025,7 @@ async function getMintsoftWebhookQueueHealth(now: Date = new Date()): Promise<He
       pending: groupedProcessingStatusCount(statusCounts, 'PENDING'),
       pendingRetry: groupedProcessingStatusCount(statusCounts, 'PENDING_RETRY'),
       failedRetry: groupedProcessingStatusCount(statusCounts, 'FAILED_RETRY'),
+      requiresReview: groupedProcessingStatusCount(statusCounts, 'REQUIRES_REVIEW'),
       dead: groupedProcessingStatusCount(statusCounts, 'DEAD'),
       oldestUnprocessedReceivedAt: oldestUnprocessed?.receivedAt ?? null,
       now,
