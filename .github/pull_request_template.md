@@ -11,3 +11,4 @@
 - [ ] Any hand-written migration SQL was reviewed explicitly, and I documented what changed in `prisma/schema.prisma` to match it.
 - [ ] Any intentionally unsupported database feature was isolated in a dedicated manual migration and recorded in `prisma/unsupported-schema-drift-allowlist.json`.
 - [ ] I did not bypass schema validation in deployment scripts to make drift invisible.
+- [ ] I updated all affected docs/help pages/runbooks/config examples, or stated why this PR has no documentation impact.
