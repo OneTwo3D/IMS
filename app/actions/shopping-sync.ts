@@ -34,6 +34,7 @@ import {
   getSettingValues,
   serializeSettingValue,
 } from '@/lib/settings-store'
+import { isMaskedSecret, maskSecret } from '@/lib/security/secret-mask'
 import { getActiveShoppingConnectorInfo, syncShoppingConnectorStock } from '@/lib/shopping'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 
@@ -91,12 +92,6 @@ async function requireShoppingAdmin() {
 
 async function requireFreshShoppingAdmin() {
   return requireFreshPermission('sync')
-}
-
-function maskSecret(value: string, visibleChars = 7): string {
-  if (!value) return ''
-  if (value.length <= visibleChars) return '*'.repeat(value.length)
-  return `${value.slice(0, visibleChars)}${'*'.repeat(Math.max(0, value.length - visibleChars))}`
 }
 
 function mapSyncLogRows(
@@ -271,8 +266,8 @@ export async function saveShopifyConnectorCredentials(
     return { success: false, error: 'Store domain is required' }
   }
 
-  const incomingTokenIsMasked = !!adminApiAccessToken && adminApiAccessToken.includes('*')
-  const incomingWebhookSecretIsMasked = !!webhookSecret && webhookSecret.includes('*')
+  const incomingTokenIsMasked = isMaskedSecret(adminApiAccessToken)
+  const incomingWebhookSecretIsMasked = isMaskedSecret(webhookSecret)
 
   const [currentToken, currentWebhookSecret] = await Promise.all([
     incomingTokenIsMasked ? getSettingValue('shopify_admin_api_access_token') : Promise.resolve(adminApiAccessToken),

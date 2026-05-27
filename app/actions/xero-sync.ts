@@ -13,6 +13,7 @@ import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { xeroGet } from '@/lib/connectors/xero/api'
+import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
 
 // Type re-export (allowed in 'use server' files)
 export type { XeroSettings } from '@/lib/connectors/xero/settings'
@@ -25,21 +26,13 @@ async function requireFreshAdmin() {
   return requireFreshPermission('sync')
 }
 
-function shouldFreshGateSecretWrite(data: object, key: string): boolean {
-  if (!Object.hasOwn(data, key)) return false
-  const value = (data as Record<string, unknown>)[key]
-  return typeof value !== 'string' || !value.includes('****')
-}
-
 // ---------------------------------------------------------------------------
 // Settings (UI-facing server actions)
 // ---------------------------------------------------------------------------
 
 export async function getXeroSettingsMasked(): Promise<XeroSettings & { secretMasked: boolean }> {
   const settings = await getXeroSettings()
-  const masked = settings.xero_client_secret
-    ? settings.xero_client_secret.substring(0, 4) + '****'
-    : ''
+  const masked = maskSecret(settings.xero_client_secret)
   return { ...settings, xero_client_secret: masked, secretMasked: !!settings.xero_client_secret }
 }
 
@@ -87,7 +80,7 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
     // Don't overwrite secret with masked value
     const entries = Object.entries(data).filter(([k, v]) => {
       if (!XERO_SETTING_KEYS.includes(k)) return false
-      if (k === 'xero_client_secret' && typeof v === 'string' && v.includes('****')) return false
+      if (k === 'xero_client_secret' && isMaskedSecret(v)) return false
       return true
     })
 
@@ -123,7 +116,7 @@ export async function saveXeroConnectionSettings(
 
     const nextClientId = clientId.trim()
     const nextClientSecretInput = clientSecret.trim()
-    const nextClientSecret = nextClientSecretInput.includes('****') ? '' : nextClientSecretInput
+    const nextClientSecret = isMaskedSecret(nextClientSecretInput) ? '' : nextClientSecretInput
     const existingSettings = await getXeroSettings()
     const resolvedSecret = nextClientSecret || existingSettings.xero_client_secret.trim()
 
@@ -205,7 +198,7 @@ export async function connectXero(
     const ops = [
       db.setting.upsert({ where: { key: 'xero_client_id' }, create: { key: 'xero_client_id', value: serializeSettingValue('xero_client_id', clientId) }, update: { value: serializeSettingValue('xero_client_id', clientId) } }),
     ]
-    if (clientSecret && !clientSecret.includes('****')) {
+    if (clientSecret && !isMaskedSecret(clientSecret)) {
       ops.push(db.setting.upsert({ where: { key: 'xero_client_secret' }, create: { key: 'xero_client_secret', value: serializeSettingValue('xero_client_secret', clientSecret) }, update: { value: serializeSettingValue('xero_client_secret', clientSecret) } }))
     }
     await db.$transaction(ops)

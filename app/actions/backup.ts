@@ -2,7 +2,7 @@
 
 import { readdir, stat, unlink } from 'fs/promises'
 import path from 'path'
-import { requireAdmin, requireFreshAdmin } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireAdmin, requireFreshAdmin } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import { getBackupDir } from '@/lib/backup-storage'
 
@@ -42,10 +42,12 @@ export async function listBackups(): Promise<BackupEntry[]> {
   }
 }
 
-export async function deleteBackup(filename: string): Promise<{ success: boolean; error?: string }> {
+export async function deleteBackup(filename: string): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
   try {
     await requireFreshAdmin()
-  } catch {
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
     return { success: false, error: 'Unauthorized' }
   }
 

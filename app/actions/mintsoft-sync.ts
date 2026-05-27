@@ -36,6 +36,7 @@ import { getIntegrationPluginState, isIntegrationPluginEnabled } from '@/lib/int
 import { hasPermission } from '@/lib/permissions'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getActiveSettingEnvOverrides, serializeSettingValue } from '@/lib/settings-store'
+import { maskSecret } from '@/lib/security/secret-mask'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import type { WmsAsnPackagingType } from '@/lib/connectors/wms/types'
 
@@ -343,11 +344,6 @@ const MintsoftCreatePurchaseOrderAsnInputSchema = z.object({
 
 function getValidationErrorMessage(error: z.ZodError): string {
   return error.issues[0]?.message ?? 'Invalid input.'
-}
-
-function maskSecret(value: string): string {
-  if (!value) return ''
-  return '********'
 }
 
 function mapMintsoftConnection(
@@ -1248,6 +1244,8 @@ export async function getMintsoftTransferAsnStates(
 export async function saveMintsoftConnectionSettings(
   input: unknown,
 ): Promise<{ success: boolean; error?: string; message?: string }> {
+  // Fresh auth is limited to connection-secret writes; reversible sync triggers
+  // and review flows remain protected by their normal permission gates.
   await requireFreshMintsoftWriteAccess()
 
   const parsedInput = MintsoftConnectionInputSchema.safeParse(input)

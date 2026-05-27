@@ -84,10 +84,19 @@ test('fresh admin policy rejects stale admin sessions before high-risk mutations
     session('ADMIN', { sessionAuthTime: 1_700_000_000 }),
     { nowSeconds: 1_700_001_000, maxAgeSeconds: 900 },
   )
-  const response = await expectStatus('stale fresh-admin session', stale as Response, 401)
+  const response = await expectStatus('stale fresh-admin session', stale as Response, 403)
   const body = await response.json() as { code?: unknown; reason?: unknown }
   assert.equal(body.code, 'fresh_auth_required')
   assert.equal(body.reason, 'stale-auth')
+
+  const missingAuthTime = requireApiFreshAdminSession(
+    session('ADMIN'),
+    { nowSeconds: 1_700_001_000, maxAgeSeconds: 900 },
+  )
+  const missingResponse = await expectStatus('missing auth-time fresh-admin session', missingAuthTime as Response, 403)
+  const missingBody = await missingResponse.json() as { code?: unknown; reason?: unknown }
+  assert.equal(missingBody.code, 'fresh_auth_required')
+  assert.equal(missingBody.reason, 'missing-auth-time')
 
   const accepted = requireApiFreshAdminSession(
     session('ADMIN', { sessionAuthTime: 1_700_000_100 }),
@@ -95,6 +104,35 @@ test('fresh admin policy rejects stale admin sessions before high-risk mutations
   )
   assert.equal(accepted instanceof Response, false)
   assert.equal((accepted as AuthSession).user.role, 'ADMIN')
+
+  await expectStatus(
+    'fresh non-admin fresh-admin session',
+    requireApiFreshAdminSession(
+      session('MANAGER', { sessionAuthTime: 1_700_001_000 }),
+      { nowSeconds: 1_700_001_000, maxAgeSeconds: 900 },
+    ) as Response,
+    403,
+  )
+  await expectStatus(
+    'stale non-admin fresh-admin session checks role before freshness',
+    requireApiFreshAdminSession(
+      session('MANAGER', { sessionAuthTime: 1_700_000_000 }),
+      { nowSeconds: 1_700_001_000, maxAgeSeconds: 900 },
+    ) as Response,
+    403,
+  )
+  const invalidSession = await expectStatus(
+    'invalidated fresh-admin session rejects before fresh auth',
+    requireApiFreshAdminSession(
+      session('ADMIN', {
+        sessionAuthTime: 1_700_000_000,
+        sessionInvalidReason: 'session-version-mismatch',
+      }),
+      { nowSeconds: 1_700_001_000, maxAgeSeconds: 900 },
+    ) as Response,
+    401,
+  )
+  assert.deepEqual(await invalidSession.json(), { error: 'Session expired' })
 })
 
 test('authenticated policy route rejects anonymous sessions and accepts verified users', async () => {

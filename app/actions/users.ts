@@ -4,10 +4,25 @@ import { revalidatePath } from 'next/cache'
 import { hash } from 'bcryptjs'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { requireAdmin, requireFreshAdmin, requirePermission } from '@/lib/auth/server'
+import { freshAuthFailureResult, requireAdmin, requireFreshAdmin, requirePermission } from '@/lib/auth/server'
+import type { AuthSession } from '@/lib/auth/server'
 
 const VALID_ROLES = ['ADMIN', 'MANAGER', 'WAREHOUSE', 'FINANCE', 'READONLY', 'SUPPLIER'] as const
 type ValidRole = typeof VALID_ROLES[number]
+
+function userUpdateRequiresFreshAuth(data: {
+  email?: string
+  role?: string
+  supplierId?: string | null
+  active?: boolean
+  password?: string
+}): boolean {
+  return data.email !== undefined ||
+    data.role !== undefined ||
+    data.supplierId !== undefined ||
+    data.active !== undefined ||
+    Boolean(data.password)
+}
 
 export type UserRow = {
   id: string
@@ -69,7 +84,7 @@ export async function createUser(data: {
   password: string
   role: string
   supplierId?: string
-}): Promise<{ success: boolean; error?: string }> {
+}): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
   try {
     await requireFreshAdmin()
     await requirePermission('settings.users')
@@ -100,6 +115,8 @@ export async function createUser(data: {
     })
     return { success: true }
   } catch (e) {
+    const freshAuthFailure = freshAuthFailureResult(e)
+    if (freshAuthFailure) return freshAuthFailure
     return { success: false, error: String(e) }
   }
 }
@@ -107,9 +124,11 @@ export async function createUser(data: {
 export async function updateUser(
   userId: string,
   data: { name?: string; email?: string; role?: string; supplierId?: string | null; active?: boolean; password?: string },
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
   try {
-    const session = await requireFreshAdmin()
+    const session: AuthSession = userUpdateRequiresFreshAuth(data)
+      ? await requireFreshAdmin()
+      : await requireAdmin()
     await requirePermission('settings.users')
 
     const target = await db.user.findUnique({
@@ -187,6 +206,8 @@ export async function updateUser(
     })
     return { success: true }
   } catch (e) {
+    const freshAuthFailure = freshAuthFailureResult(e)
+    if (freshAuthFailure) return freshAuthFailure
     return { success: false, error: String(e) }
   }
 }
@@ -197,7 +218,7 @@ export async function deleteUser(
     salesOrderMode: 'keep_text' | 'transfer_user'
     transferToUserId?: string | null
   },
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
   try {
     const session = await requireFreshAdmin()
     await requirePermission('settings.users')
@@ -266,6 +287,8 @@ export async function deleteUser(
     })
     return { success: true }
   } catch (e) {
+    const freshAuthFailure = freshAuthFailureResult(e)
+    if (freshAuthFailure) return freshAuthFailure
     return { success: false, error: String(e) }
   }
 }

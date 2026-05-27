@@ -31,9 +31,12 @@ export type SessionStateDecision =
   | { valid: false; reason: SessionInvalidReason }
 
 export const DEFAULT_FRESH_AUTH_MAX_AGE_SECONDS = 15 * 60
+export const MAX_FRESH_AUTH_MAX_AGE_SECONDS = 24 * 60 * 60
+export const FRESH_AUTH_FUTURE_TOLERANCE_SECONDS = 60
 
 export type FreshAuthInvalidReason =
   | 'missing-auth-time'
+  | 'invalid-auth-time'
   | 'stale-auth'
 
 export type FreshAuthOptions = {
@@ -60,12 +63,13 @@ export function sessionAuthTimeSeconds(value: unknown): number | null {
 }
 
 export function freshAuthMaxAgeSeconds(value: unknown = process.env.FRESH_AUTH_MAX_AGE_SECONDS): number {
-  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) return value
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) {
+    return Math.min(value, MAX_FRESH_AUTH_MAX_AGE_SECONDS)
+  }
   if (typeof value !== 'string') return DEFAULT_FRESH_AUTH_MAX_AGE_SECONDS
   const parsed = Number(value)
-  return Number.isSafeInteger(parsed) && parsed > 0
-    ? parsed
-    : DEFAULT_FRESH_AUTH_MAX_AGE_SECONDS
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return DEFAULT_FRESH_AUTH_MAX_AGE_SECONDS
+  return Math.min(parsed, MAX_FRESH_AUTH_MAX_AGE_SECONDS)
 }
 
 export function evaluateFreshAuth(
@@ -79,6 +83,9 @@ export function evaluateFreshAuth(
   }
 
   const nowSeconds = options.nowSeconds ?? Math.floor(Date.now() / 1000)
+  if (authTime > nowSeconds + FRESH_AUTH_FUTURE_TOLERANCE_SECONDS) {
+    return { valid: false, reason: 'invalid-auth-time', ageSeconds: null, maxAgeSeconds }
+  }
   const ageSeconds = Math.max(0, nowSeconds - authTime)
   if (ageSeconds > maxAgeSeconds) {
     return { valid: false, reason: 'stale-auth', ageSeconds, maxAgeSeconds }

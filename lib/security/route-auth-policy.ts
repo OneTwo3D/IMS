@@ -3,6 +3,7 @@ export type ApiRouteAccess =
   | 'cron-secret'
   | 'authenticated'
   | 'admin'
+  | 'admin-fresh'
   | 'supplier'
   | 'xero-oauth'
   | 'internal-dev-only'
@@ -50,7 +51,7 @@ export const apiRouteAuthPolicy = {
     reason: 'Accounting reconciliation run history is restricted through requireApiAdmin.',
   },
   '/api/admin/accounting/backfill': {
-    access: 'admin',
+    access: 'admin-fresh',
     reason: 'Accounting event backfill is restricted through requireApiAdmin, defaults to dry-run, and requires fresh admin auth before execution.',
   },
   '/api/admin/health': {
@@ -62,11 +63,11 @@ export const apiRouteAuthPolicy = {
     reason: 'Integration outbox inspection is restricted through requireApiAdmin and redacts connector payload secrets.',
   },
   '/api/admin/outbox/[id]/permanent-fail': {
-    access: 'admin',
+    access: 'admin-fresh',
     reason: 'Manual integration outbox dead-letter actions are restricted through requireApiFreshAdmin and logged.',
   },
   '/api/admin/outbox/[id]/replay': {
-    access: 'admin',
+    access: 'admin-fresh',
     reason: 'Manual integration outbox replay actions are restricted through requireApiFreshAdmin and logged.',
   },
   '/api/backup/create': {
@@ -74,7 +75,7 @@ export const apiRouteAuthPolicy = {
     reason: 'Backup creation is restricted through requireApiAdmin.',
   },
   '/api/backup/restore': {
-    access: 'admin',
+    access: 'admin-fresh',
     reason: 'Backup restore is restricted through requireApiFreshAdmin plus restore confirmation checks.',
   },
   '/api/backup/upload-remote': {
@@ -242,7 +243,7 @@ export const apiRouteAuthPolicy = {
     reason: 'Requires an authenticated user with settings permission.',
   },
   '/api/reset/code': {
-    access: 'admin',
+    access: 'admin-fresh',
     reason: 'Database reset code issuance is restricted through requireApiFreshAdmin.',
   },
   '/api/rfq/[id]': {
@@ -298,6 +299,7 @@ export const apiRouteAccessValues = [
   'cron-secret',
   'authenticated',
   'admin',
+  'admin-fresh',
   'supplier',
   'xero-oauth',
   'internal-dev-only',

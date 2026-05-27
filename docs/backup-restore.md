@@ -27,7 +27,7 @@ You can restore from:
 
 Restoring overwrites all current data. To confirm, you must type **RESTORE** into the confirmation field. This safeguard prevents accidental restores.
 
-The restore API also enforces this confirmation server-side, requires a short-lived one-time confirmation code emailed to the authenticated admin address, and only accepts plain `.sql` files from the configured backup directory or an uploaded `.sql` file for that request.
+The restore API also enforces this confirmation server-side, requires a short-lived one-time confirmation code emailed to the authenticated admin address, requires a fresh admin login, and only accepts plain `.sql` files from the configured backup directory or an uploaded `.sql` file for that request. The confirmation code expires after five minutes; by default the fresh-login window is 15 minutes (`FRESH_AUTH_MAX_AGE_SECONDS`), so admins may need to sign in again and request a new code if either window expires.
 
 When `NODE_ENV=production`, restore is disabled unless `ALLOW_DATABASE_RESTORE=true` is set for a supervised restore window. Restoring from a server-side backup only requires that base flag; restoring from an uploaded SQL file also requires `ALLOW_DATABASE_RESTORE_UPLOAD=true`. Leave both flags unset or `false` during normal operation. Non-production environments bypass these kill switches, so staging restore drills should run with `NODE_ENV=production` if they need to exercise production restore gating.
 

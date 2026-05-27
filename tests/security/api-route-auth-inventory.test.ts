@@ -49,6 +49,19 @@ test('cron-secret routes call verifyCron before doing cron work', async () => {
   }
 })
 
+test('admin-fresh routes call requireApiFreshAdmin before mutating high-risk state', async () => {
+  const files = await discoverApiRouteFiles()
+  const fileByRoute = new Map(files.map((file) => [apiRoutePathFromFile(file), file]))
+
+  for (const [route, policy] of Object.entries(apiRouteAuthPolicy)) {
+    if (policy.access !== 'admin-fresh') continue
+    const file = fileByRoute.get(route)
+    assert.ok(file, `${route} route file was not discovered`)
+    const source = await readFile(file, 'utf8')
+    assert.match(source, /requireApiFreshAdmin\b/, `${route} must enforce requireApiFreshAdmin at runtime`)
+  }
+})
+
 test('route discovery follows Next.js route file and URL segment conventions', async () => {
   const fixtureRoot = await mkdtemp(path.join(tmpdir(), 'ims-api-routes-'))
   const apiDir = path.join(fixtureRoot, 'app', 'api')
