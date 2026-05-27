@@ -1,5 +1,5 @@
 import { constants } from 'node:fs'
-import { access, readdir, stat } from 'node:fs/promises'
+import { access, readdir, stat, unlink, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 
@@ -757,9 +757,11 @@ async function getLatestMigration(now: Date = new Date()): Promise<LatestOperati
 
 async function checkWritableDirectories(now: Date = new Date()): Promise<DirectoryHealthCheck[]> {
   const { getBackupDir } = await import('@/lib/backup-storage')
+  const { getInvoicePdfStorageDir } = await import('@/lib/invoice-pdf')
   const { getUploadStorageDirectories } = await import('@/lib/upload-storage')
   const checks = [
     ...getUploadStorageDirectories().map(({ label, directory }) => [label, directory] as const),
+    ['invoicePdfStorage', getInvoicePdfStorageDir()],
     ['temporaryUploads', path.join(os.tmpdir(), 'onetwoinventory', 'uploads')],
     ['backups', getBackupDir()],
   ] as const
@@ -768,8 +770,11 @@ async function checkWritableDirectories(now: Date = new Date()): Promise<Directo
 }
 
 async function checkWritableDirectory(label: string, directory: string, now: Date): Promise<DirectoryHealthCheck> {
+  const probePath = path.join(directory, `.ims-health-${process.pid}-${Date.now()}.tmp`)
   try {
     await access(directory, constants.W_OK)
+    await writeFile(probePath, '')
+    await unlink(probePath)
 
     return {
       label,

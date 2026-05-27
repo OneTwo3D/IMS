@@ -3,11 +3,8 @@
  * QBO serves invoice PDFs at GET /v3/company/{realmId}/invoice/{id}/pdf.
  */
 
-import { writeFile, mkdir } from 'fs/promises'
-import { join } from 'path'
+import { saveInvoicePdfFile } from '@/lib/invoice-pdf'
 import { qboGetRaw } from './api'
-
-const PDF_DIR = join(process.cwd(), 'data', 'invoices')
 
 /**
  * Download an invoice PDF from QuickBooks.
@@ -19,11 +16,8 @@ export async function downloadQuickBooksInvoicePdf(qboInvoiceId: string): Promis
 }
 
 /**
- * Save an invoice PDF to disk. Returns the relative path.
+ * Save an invoice PDF to configured persistent storage. Returns the logical stored path.
  */
 export async function saveInvoicePdf(orderId: string, buffer: Buffer): Promise<string> {
-  await mkdir(PDF_DIR, { recursive: true })
-  const filePath = join(PDF_DIR, `${orderId}.pdf`)
-  await writeFile(filePath, buffer)
-  return `data/invoices/${orderId}.pdf`
+  return saveInvoicePdfFile(orderId, buffer)
 }

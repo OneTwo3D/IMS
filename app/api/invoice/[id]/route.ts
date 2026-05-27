@@ -1,12 +1,16 @@
-import { readFile } from 'fs/promises'
-import { join } from 'path'
 import { NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
 import { db } from '@/lib/db'
 import { formatCountryDisplay } from '@/lib/countries'
+import { loadInvoicePdf } from '@/lib/invoice-pdf'
 import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, groupVatBreakdown, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
 import { formatMoney } from '@/lib/utils'
+
+function safeInvoiceFilenamePart(value: string): string {
+  const safe = value.replace(/[^a-zA-Z0-9_-]/g, '_').slice(0, 120)
+  return safe.length > 0 ? safe : 'invoice'
+}
 
 export async function GET(_req: Request, { params }: { params: Promise<{ id: string }> }) {
   const session = await requireApiAuth()
@@ -27,17 +31,15 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   })
   if (!so) return NextResponse.json({ error: 'Not found' }, { status: 404 })
 
-  // Serve Xero-downloaded PDF if available
+  // Authenticated singular route; public signed downloads live in sibling /api/invoices/[id].
+  // Serve connector-downloaded PDF if available.
   if (so.invoicePdfPath) {
-    try {
-      const pdfPath = join(process.cwd(), 'public', so.invoicePdfPath)
-      const pdfBuffer = await readFile(pdfPath)
+    const pdfBuffer = await loadInvoicePdf(so.id)
+    if (pdfBuffer) {
       const invNum = so.invoiceNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
       return new NextResponse(new Uint8Array(pdfBuffer), {
-        headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="Invoice-${invNum}.pdf"` },
+        headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="Invoice-${safeInvoiceFilenamePart(invNum)}.pdf"` },
       })
-    } catch {
-      // Fall through to IMS-generated PDF if file not found
     }
   }
 
@@ -162,6 +164,6 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   drawFooter(doc, 'Thank you for your business.', branding, { customFooter: tpl?.customFooter, contactEmail: branding.salesEmail })
   const buffer = await pdfToBuffer(doc)
   return new NextResponse(new Uint8Array(buffer), {
-    headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="Invoice-${invNum}.pdf"` },
+    headers: { 'Content-Type': 'application/pdf', 'Content-Disposition': `inline; filename="Invoice-${safeInvoiceFilenamePart(invNum)}.pdf"` },
   })
 }

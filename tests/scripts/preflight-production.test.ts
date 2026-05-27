@@ -15,17 +15,20 @@ async function withStorageDirs<T>(fn: (env: Record<string, string>) => Promise<T
   try {
     const uploadRoot = path.join(root, 'uploads')
     const publicUploadRoot = path.join(root, 'public-uploads')
+    const invoicePdfRoot = path.join(root, 'invoice-pdfs')
     const backupRoot = path.join(root, 'backups')
     await Promise.all([
       mkdir(path.join(uploadRoot, 'invoices'), { recursive: true }),
       mkdir(path.join(uploadRoot, 'quarantine', 'invoices'), { recursive: true }),
       mkdir(path.join(publicUploadRoot, 'avatars'), { recursive: true }),
       mkdir(path.join(publicUploadRoot, 'branding'), { recursive: true }),
+      mkdir(invoicePdfRoot, { recursive: true }),
       mkdir(backupRoot, { recursive: true }),
     ])
     return await fn({
       UPLOAD_STORAGE_DIR: uploadRoot,
       PUBLIC_UPLOAD_STORAGE_DIR: publicUploadRoot,
+      INVOICE_PDF_STORAGE_DIR: invoicePdfRoot,
       BACKUP_DIR: backupRoot,
     })
   } finally {
@@ -64,6 +67,29 @@ test('production preflight passes with explicit production-like configuration', 
     assert.equal(result.ok, true)
     assertStatus(result, 'database-url', 'pass')
     assertStatus(result, 'file-scan-mode', 'warn')
+  })
+})
+
+test('production preflight requires explicit invoice PDF storage configuration', async () => {
+  await withStorageDirs(async (storage) => {
+    const env = baseEnv(storage)
+    delete env.INVOICE_PDF_STORAGE_DIR
+
+    const result = await runProductionPreflight({ env })
+
+    assert.equal(result.ok, false)
+    assertFailed(result, 'invoice-pdf-storage-dir')
+  })
+})
+
+test('production preflight treats empty invoice PDF storage configuration as missing', async () => {
+  await withStorageDirs(async (storage) => {
+    const env = { ...baseEnv(storage), INVOICE_PDF_STORAGE_DIR: '' }
+
+    const result = await runProductionPreflight({ env })
+
+    assert.equal(result.ok, false)
+    assertFailed(result, 'invoice-pdf-storage-dir')
   })
 })
 
@@ -320,21 +346,26 @@ test('production preflight passes when scanner command health is clean', async (
 test('production preflight reports missing storage subdirectories with expected paths', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ims-preflight-missing-storage-'))
   try {
+    // Deliberately use a fresh root rather than withStorageDirs so every
+    // storage path, including invoicePdfStorage, exercises the missing path.
     const result = await runProductionPreflight({
       env: baseEnv({
         UPLOAD_STORAGE_DIR: path.join(root, 'uploads'),
         PUBLIC_UPLOAD_STORAGE_DIR: path.join(root, 'public-uploads'),
+        INVOICE_PDF_STORAGE_DIR: path.join(root, 'invoice-pdfs'),
         BACKUP_DIR: path.join(root, 'backups'),
       }),
     })
 
     assert.equal(result.ok, false)
     assertFailed(result, 'invoiceUploads')
+    assertFailed(result, 'invoicePdfStorage')
     const output = formatPreflightResult(result)
     assert.match(output, /uploads\/invoices/)
     assert.match(output, /uploads\/quarantine\/invoices/)
     assert.match(output, /public-uploads\/avatars/)
     assert.match(output, /public-uploads\/branding/)
+    assert.match(output, /invoice-pdfs/)
     assert.match(output, /backups/)
   } finally {
     await rm(root, { recursive: true, force: true })

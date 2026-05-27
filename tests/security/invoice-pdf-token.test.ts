@@ -11,6 +11,7 @@ import {
   type InvoicePdfTokenPayload,
   type PdfTokenVerificationResult,
 } from '../../lib/invoice-pdf.ts'
+import { withEnvPatch } from '../helpers/env.ts'
 
 const SECRET = 'invoice-pdf-test-secret'
 const NOW = new Date('2026-05-27T10:00:00.000Z')
@@ -20,36 +21,12 @@ async function withInvoiceTokenEnv<T>(
   env: Record<string, string | undefined>,
   run: () => Promise<T> | T,
 ): Promise<T> {
-  // Serial-only helper: these tests mutate process.env and must not run with test concurrency.
-  const mutableEnv = process.env as Record<string, string | undefined>
-  const patch = {
+  return withEnvPatch({
     AUTH_SECRET: SECRET,
     NEXTAUTH_SECRET: undefined,
     INVOICE_PDF_TOKEN_TTL_SECONDS: undefined,
     ...env,
-  }
-  const previous = Object.fromEntries(
-    Object.keys(patch).map((key) => [key, mutableEnv[key]]),
-  ) as Record<string, string | undefined>
-
-  try {
-    for (const [key, value] of Object.entries(patch)) {
-      if (value === undefined) {
-        delete mutableEnv[key]
-      } else {
-        mutableEnv[key] = value
-      }
-    }
-    return await run()
-  } finally {
-    for (const [key, value] of Object.entries(previous)) {
-      if (value === undefined) {
-        delete mutableEnv[key]
-      } else {
-        mutableEnv[key] = value
-      }
-    }
-  }
+  }, run)
 }
 
 function seconds(date: Date): number {
