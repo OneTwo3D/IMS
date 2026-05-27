@@ -90,6 +90,7 @@ jobs:
       BACKUP_DIR: /tmp/ims-preflight/backups
       UPLOAD_STORAGE_DIR: /tmp/ims-preflight/uploads
       PUBLIC_UPLOAD_STORAGE_DIR: /tmp/ims-preflight/public-uploads
+      INVOICE_PDF_STORAGE_DIR: /tmp/ims-preflight/invoice-pdfs
       FILE_SCAN_MODE: disabled
       ALLOW_DATABASE_RESTORE: "false"
       ALLOW_DATABASE_RESTORE_UPLOAD: "false"
@@ -107,7 +108,8 @@ jobs:
             "$UPLOAD_STORAGE_DIR/invoices" \
             "$UPLOAD_STORAGE_DIR/quarantine/invoices" \
             "$PUBLIC_UPLOAD_STORAGE_DIR/avatars" \
-            "$PUBLIC_UPLOAD_STORAGE_DIR/branding"
+            "$PUBLIC_UPLOAD_STORAGE_DIR/branding" \
+            "$INVOICE_PDF_STORAGE_DIR"
       - name: Verify disabled scanner preflight
         run: npm run preflight:production
         env:
