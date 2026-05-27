@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { GET as publicHealthGet } from '../../app/api/health/route.ts'
-import { GET as invoicePdfGet } from '../../app/api/invoices/[id]/route.ts'
+import { handleInvoicePdfRoute } from '../../app/api/invoices/[id]/route.ts'
 import { POST as e2eNotificationsPost } from '../../app/api/e2e/notifications/route.ts'
 import { verifyCron } from '../../lib/cron-auth.ts'
 import {
@@ -137,14 +137,25 @@ test('public health route stays reachable without authentication and exposes min
   assert.equal('database' in body, false)
 })
 
-test('public signed invoice route rejects missing HMAC token before loading PDF storage', async () => {
+test('public signed invoice route rejects missing signed token before loading PDF storage', async () => {
   assertRouteAccess('/api/invoices/[id]', 'public-webhook')
 
   await expectStatus(
     'signed invoice without token',
-    invoicePdfGet(nextApiRouteRequest('/api/invoices/inv_123'), {
-      params: Promise.resolve({ id: 'inv_123' }),
-    }),
+    handleInvoicePdfRoute(
+      nextApiRouteRequest('/api/invoices/inv_123'),
+      { id: 'inv_123' },
+      {
+        async loadInvoicePdf() {
+          throw new Error('PDF storage should not be reached without a token')
+        },
+        verifyPdfToken(_orderId, token) {
+          assert.equal(token, null)
+          return { valid: false, reason: 'missing' }
+        },
+        async auditTokenAttempt() {},
+      },
+    ),
     403,
   )
 })

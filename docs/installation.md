@@ -261,6 +261,7 @@ Key variables in the `.env` file:
 | `NEXT_PUBLIC_APP_URL` | Public URL of the application (e.g. `https://ims.yourdomain.com`) |
 | `NODE_ENV` | Set to `production` for deployment |
 | `AUTH_SECRET` | Secret key for signing session tokens (auto-generated) |
+| `INVOICE_PDF_TOKEN_TTL_SECONDS` | Lifetime for public signed invoice PDF download links. Default `259200` (3 days), maximum `2592000` (30 days). Lower values reduce leaked-link exposure; higher values reduce customer "link expired" friction. |
 | `SETTINGS_ENCRYPTION_KEY` | Key used to encrypt sensitive Setting values stored in the database (auto-generated) |
 | `ENCRYPTION_KEY` | Legacy fallback for older installs; keep set to the same value during migration if existing `enc:v1` secrets are present |
 | `AUTH_URL` | Authentication callback URL (same as app URL) |
