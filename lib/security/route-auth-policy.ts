@@ -219,7 +219,7 @@ export const apiRouteAuthPolicy = {
   },
   '/api/invoices/[id]': {
     access: 'public-webhook',
-    reason: 'Public signed-URL invoice PDF endpoint; requires a valid HMAC token for the invoice id.',
+    reason: 'Public signed-URL invoice PDF endpoint; requires a valid expiring signed token for the invoice id.',
   },
   '/api/manufacturing-order/[id]': {
     access: 'authenticated',
