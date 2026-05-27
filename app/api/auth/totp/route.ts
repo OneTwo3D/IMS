@@ -20,6 +20,12 @@ export async function POST(request: NextRequest) {
   if (!session?.user?.id) {
     return Response.json({ error: 'Unauthorised' }, { status: 401 })
   }
+  // This route intentionally cannot use requireApiAuthSession: pending-TOTP
+  // sessions must be allowed to complete verification, but invalidated sessions
+  // still need to be rejected before rate-limit state is consumed.
+  if (session.user.sessionInvalidReason) {
+    return Response.json({ error: 'Session expired' }, { status: 401 })
+  }
 
   const rlKey = `totp_verify:${session.user.id}`
   const rl = await checkRateLimit(rlKey, 5, 5 * 60_000)

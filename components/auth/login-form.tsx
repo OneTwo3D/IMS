@@ -36,9 +36,10 @@ declare global {
 
 type LoginFormProps = {
   turnstileSiteKey?: string | null
+  sessionMessage?: string | null
 }
 
-export function LoginForm({ turnstileSiteKey }: LoginFormProps) {
+export function LoginForm({ turnstileSiteKey, sessionMessage }: LoginFormProps) {
   const router = useRouter()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
@@ -174,6 +175,12 @@ export function LoginForm({ turnstileSiteKey }: LoginFormProps) {
         )}
 
         <form onSubmit={handleSubmit} className="flex flex-col gap-4">
+          {!error && sessionMessage && (
+            <Alert className="text-sm py-2 px-3">
+              {sessionMessage}
+            </Alert>
+          )}
+
           {error && (
             <Alert variant="destructive" className="text-sm py-2 px-3">
               {error}

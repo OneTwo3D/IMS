@@ -59,6 +59,7 @@ export async function POST(request: NextRequest) {
       totpSecret: serializeTotpSecret(secrets.pendingTotpSecret),
       totpEnabled: true,
       pendingTotpSecret: null,
+      sessionVersion: { increment: 1 },
     },
   })
 
@@ -95,7 +96,12 @@ export async function DELETE(request: NextRequest) {
 
   await db.user.update({
     where: { id: session.user.id },
-    data: { totpSecret: null, totpEnabled: false, pendingTotpSecret: null },
+    data: {
+      totpSecret: null,
+      totpEnabled: false,
+      pendingTotpSecret: null,
+      sessionVersion: { increment: 1 },
+    },
   })
 
   await logActivity({

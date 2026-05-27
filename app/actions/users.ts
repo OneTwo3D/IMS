@@ -114,7 +114,7 @@ export async function updateUser(
 
     const target = await db.user.findUnique({
       where: { id: userId },
-      select: { id: true, name: true, role: true, active: true },
+      select: { id: true, name: true, email: true, role: true, supplierId: true, active: true },
     })
     if (!target) return { success: false, error: 'User not found' }
 
@@ -153,6 +153,16 @@ export async function updateUser(
     if (data.active !== undefined) updateData.active = data.active
     if (data.password && data.password.length >= 8) {
       updateData.passwordHash = await hash(data.password, 12)
+    }
+    const roleChanged = data.role !== undefined && data.role !== target.role
+    const emailChanged = nextEmail !== undefined && nextEmail !== target.email
+    const activeChanged = data.active !== undefined && data.active !== target.active
+    const supplierChanged = data.supplierId !== undefined && data.supplierId !== target.supplierId
+    const passwordChanged = Boolean(data.password && data.password.length >= 8)
+    if (roleChanged || emailChanged || activeChanged || supplierChanged || passwordChanged) {
+      updateData.sessionVersion = { increment: 1 }
+      if (data.active === false) updateData.forceLogoutAt = new Date()
+      if (data.active === true) updateData.forceLogoutAt = null
     }
 
     await db.$transaction(async (tx) => {

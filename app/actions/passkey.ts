@@ -12,7 +12,7 @@ import type {
 } from '@simplewebauthn/server'
 import { randomBytes } from 'crypto'
 import { db } from '@/lib/db'
-import { auth } from '@/lib/auth'
+import { getSession } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import { consumeAuthToken, setAuthToken } from '@/lib/auth/token-store'
 import { getPublicAppUrl } from '@/lib/public-app-url'
@@ -42,7 +42,7 @@ async function getChallenge(key: string): Promise<string | null> {
 // --- Registration ---
 
 export async function getPasskeyRegistrationOptions() {
-  const session = await auth()
+  const session = await getSession()
   if (!session?.user?.id) return { error: 'Unauthorized' }
   const originConfig = await getPasskeyOriginConfig()
   if ('error' in originConfig) return { error: originConfig.error }
@@ -78,7 +78,7 @@ export async function verifyPasskeyRegistration(
   response: RegistrationResponseJSON,
   name?: string,
 ) {
-  const session = await auth()
+  const session = await getSession()
   if (!session?.user?.id) return { error: 'Unauthorized' }
   const originConfig = await getPasskeyOriginConfig()
   if ('error' in originConfig) return { error: originConfig.error }
@@ -100,16 +100,22 @@ export async function verifyPasskeyRegistration(
 
     const { credential } = verification.registrationInfo
 
-    await db.passkey.create({
-      data: {
-        userId: session.user.id,
-        credentialId: credential.id,
-        credentialPublicKey: Buffer.from(credential.publicKey),
-        counter: BigInt(credential.counter),
-        transports: response.response.transports ?? [],
-        name: name || 'Passkey',
-      },
-    })
+    await db.$transaction([
+      db.passkey.create({
+        data: {
+          userId: session.user.id,
+          credentialId: credential.id,
+          credentialPublicKey: Buffer.from(credential.publicKey),
+          counter: BigInt(credential.counter),
+          transports: response.response.transports ?? [],
+          name: name || 'Passkey',
+        },
+      }),
+      db.user.update({
+        where: { id: session.user.id },
+        data: { sessionVersion: { increment: 1 } },
+      }),
+    ])
 
     await logActivity({ entityType: 'USER', tag: 'auth', action: 'passkey_registered', description: `Registered passkey: ${name || 'Passkey'}` })
     return { success: true }
@@ -204,7 +210,7 @@ export async function verifyPasskeyAuthentication(
 // --- Management ---
 
 export async function listPasskeys() {
-  const session = await auth()
+  const session = await getSession()
   if (!session?.user?.id) return []
 
   return db.passkey.findMany({
@@ -215,7 +221,7 @@ export async function listPasskeys() {
 }
 
 export async function renamePasskey(id: string, name: string) {
-  const session = await auth()
+  const session = await getSession()
   if (!session?.user?.id) return { error: 'Unauthorized' }
 
   await db.passkey.updateMany({
@@ -227,12 +233,18 @@ export async function renamePasskey(id: string, name: string) {
 }
 
 export async function deletePasskey(id: string) {
-  const session = await auth()
+  const session = await getSession()
   if (!session?.user?.id) return { error: 'Unauthorized' }
 
-  await db.passkey.deleteMany({
-    where: { id, userId: session.user.id },
-  })
+  await db.$transaction([
+    db.passkey.deleteMany({
+      where: { id, userId: session.user.id },
+    }),
+    db.user.update({
+      where: { id: session.user.id },
+      data: { sessionVersion: { increment: 1 } },
+    }),
+  ])
   await logActivity({ entityType: 'USER', tag: 'auth', action: 'passkey_deleted', description: 'Deleted a passkey' })
   return { success: true }
 }

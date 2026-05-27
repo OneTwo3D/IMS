@@ -1,17 +1,16 @@
 export const dynamic = 'force-dynamic'
 
 import { redirect } from 'next/navigation'
-import { auth } from '@/lib/auth'
 import { db } from '@/lib/db'
+import { requireAuth } from '@/lib/auth/server'
 import { DashboardShell } from '@/components/layout/dashboard-shell'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { getBaseCurrencyDisplay } from '@/lib/base-currency'
 import { BaseCurrencyProvider } from '@/components/providers/base-currency-provider'
 
 export default async function DashboardLayout({ children }: { children: React.ReactNode }) {
-  const session = await auth()
+  const session = await requireAuth()
 
-  if (!session?.user) redirect('/login')
   if (session.user.totpEnabled && !session.user.totpVerified) redirect('/2fa')
 
   const [org, pluginState, baseCurrency] = await Promise.all([

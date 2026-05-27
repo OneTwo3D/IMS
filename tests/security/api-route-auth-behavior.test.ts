@@ -18,6 +18,7 @@ import {
   nextApiRouteRequest,
   withRouteEnv,
 } from '../../lib/testing/api-route-test-harness.ts'
+import type { SessionInvalidReason } from '../../lib/auth/session-state.ts'
 
 function session(role: string, overrides: Partial<AuthSession['user']> = {}): AuthSession {
   return {
@@ -94,6 +95,23 @@ test('authenticated policy route rejects sessions still pending TOTP verificatio
     totpEnabled: true,
     totpVerified: false,
   })) as Response, 401)
+})
+
+test('authenticated policy route rejects sessions invalidated by fresh user checks', async () => {
+  assertRouteAccess('/api/export/products', 'authenticated')
+
+  for (const reason of [
+    'missing-user',
+    'inactive-user',
+    'invalid-version',
+    'session-version-mismatch',
+    'force-logout',
+    'missing-auth-time',
+  ] satisfies SessionInvalidReason[]) {
+    await expectStatus(`invalidated authenticated route ${reason}`, requireApiAuthSession(session('USER', {
+      sessionInvalidReason: reason,
+    })) as Response, 401)
+  }
 })
 
 test('multi-role helper accepts only explicitly allowed RBAC roles', () => {

@@ -1,4 +1,5 @@
 import { NextResponse } from 'next/server'
+import type { SessionInvalidReason } from '@/lib/auth/session-state'
 
 export type AuthSession = {
   user: {
@@ -7,8 +8,12 @@ export type AuthSession = {
     name: string
     role: string
     supplierId: string | null
+    pictureUrl?: string | null
     totpEnabled: boolean
     totpVerified: boolean
+    sessionVersion?: number
+    sessionAuthTime?: number
+    sessionInvalidReason?: SessionInvalidReason | null
   }
 }
 
@@ -31,6 +36,9 @@ export function requireRoleSession(session: AuthSession, roles: readonly string[
 export function requireApiAuthSession(session: unknown): AuthSession | NextResponse {
   if (!isAuthSession(session)) {
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+  }
+  if (session.user.sessionInvalidReason) {
+    return NextResponse.json({ error: 'Session expired' }, { status: 401 })
   }
   if (session.user.totpEnabled && !session.user.totpVerified) {
     return NextResponse.json({ error: 'Two-factor verification required' }, { status: 401 })

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 import type { NextRequest } from 'next/server'
 import { auth } from '@/lib/auth'
+import { sessionInvalidLoginReason } from '@/lib/auth/session-state'
 
 export async function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl
@@ -23,9 +24,12 @@ export async function proxy(request: NextRequest) {
     return NextResponse.redirect(loginUrl)
   }
 
-  if (!session?.user) {
+  if (!session?.user || session.user.sessionInvalidReason) {
     const loginUrl = new URL('/login', request.url)
     loginUrl.searchParams.set('callbackUrl', pathname)
+    if (session?.user?.sessionInvalidReason) {
+      loginUrl.searchParams.set('reason', sessionInvalidLoginReason(session.user.sessionInvalidReason))
+    }
     return NextResponse.redirect(loginUrl)
   }
 

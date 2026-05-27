@@ -265,6 +265,8 @@ model User {
   pendingTotpSecret String? // staged secret during setup before confirmation
   totpEnabled    Boolean   @default(false)
   active         Boolean   @default(true)
+  sessionVersion Int       @default(1)
+  forceLogoutAt  DateTime?
   lastLoginAt    DateTime?
   createdAt      DateTime  @default(now())
   updatedAt      DateTime  @updatedAt
