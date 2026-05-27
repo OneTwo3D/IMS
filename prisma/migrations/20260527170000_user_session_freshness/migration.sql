@@ -1,0 +1,2 @@
+ALTER TABLE "users" ADD COLUMN "sessionVersion" INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE "users" ADD COLUMN "forceLogoutAt" TIMESTAMP(3);

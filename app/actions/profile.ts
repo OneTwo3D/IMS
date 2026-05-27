@@ -36,7 +36,10 @@ export async function changePassword(data: { currentPassword: string; newPasswor
   if (!match) return { success: false, error: 'Current password is incorrect' }
 
   const passwordHash = await bcrypt.hash(data.newPassword, 12)
-  await db.user.update({ where: { id: userId }, data: { passwordHash } })
+  await db.user.update({
+    where: { id: userId },
+    data: { passwordHash, sessionVersion: { increment: 1 } },
+  })
   await logActivity({ entityType: 'USER', entityId: userId, tag: 'auth', action: 'password_changed', description: 'Changed password' })
   return { success: true }
 }

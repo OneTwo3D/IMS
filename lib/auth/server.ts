@@ -12,6 +12,7 @@ import {
   requireRoleSession,
   type AuthSession,
 } from '@/lib/auth/session-gates'
+import { loginPathForSessionInvalidReason } from '@/lib/auth/session-state'
 
 export type { Permission }
 export type { AuthSession } from '@/lib/auth/session-gates'
@@ -25,6 +26,10 @@ export async function requireAuth(): Promise<AuthSession> {
 
   if (!session?.user) {
     redirect('/login')
+  }
+
+  if (session.user.sessionInvalidReason) {
+    redirect(loginPathForSessionInvalidReason(session.user.sessionInvalidReason))
   }
 
   // If 2FA is enabled but not verified in this session, send to TOTP challenge
@@ -70,6 +75,7 @@ export async function requirePermission(permission: Permission): Promise<AuthSes
 export async function getSession(): Promise<AuthSession | null> {
   const session = await auth()
   if (!session?.user) return null
+  if (session.user.sessionInvalidReason) return null
   return session as AuthSession
 }
 

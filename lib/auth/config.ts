@@ -1,12 +1,18 @@
 import type { NextAuthConfig } from 'next-auth'
 import Credentials from 'next-auth/providers/credentials'
 import bcrypt from 'bcryptjs'
+import { cache } from 'react'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { consumeAuthToken } from '@/lib/auth/token-store'
 import { checkRateLimit, clearRateLimit } from '@/lib/rate-limit'
 import { getClientIp } from '@/lib/request-ip'
 import { isTurnstileEnabled, verifyTurnstileToken } from '@/lib/turnstile'
+import {
+  evaluateSessionState,
+  isSessionInvalidReason,
+  SESSION_REVALIDATION_SELECT,
+} from '@/lib/auth/session-state'
 
 const loginSchema = z.object({
   email: z.string().email(),
@@ -14,6 +20,13 @@ const loginSchema = z.object({
 })
 
 const DUMMY_BCRYPT_HASH = '$2b$12$Q7QxTQqR0p6vJY9Yx1m8JOkjH3J0mD6G4jY6YtV2v0mL4YvM1gM9S'
+
+const nowSeconds = () => Math.floor(Date.now() / 1000)
+
+const getSessionRevalidationUser = cache(async (userId: string) => db.user.findUnique({
+  where: { id: userId },
+  select: SESSION_REVALIDATION_SELECT,
+}))
 
 export const authConfig: NextAuthConfig = {
   trustHost: true,
@@ -26,7 +39,7 @@ export const authConfig: NextAuthConfig = {
   },
   callbacks: {
     authorized({ auth, request: { nextUrl } }) {
-      const isLoggedIn = !!auth?.user
+      const isLoggedIn = !!auth?.user && !auth.user.sessionInvalidReason
       const isAuthPage =
         nextUrl.pathname.startsWith('/login') ||
         nextUrl.pathname.startsWith('/2fa')
@@ -45,6 +58,9 @@ export const authConfig: NextAuthConfig = {
         token.totpEnabled = (user as { totpEnabled?: boolean }).totpEnabled
         token.totpVerified = (user as { totpVerified?: boolean }).totpVerified ?? false
         token.pictureUrl = (user as { pictureUrl?: string | null }).pictureUrl ?? null
+        token.sessionVersion = (user as { sessionVersion?: number }).sessionVersion ?? 1
+        token.sessionAuthTime = (user as { sessionAuthTime?: number }).sessionAuthTime ?? nowSeconds()
+        token.sessionInvalidReason = null
       }
       // Allow client-side session.update() to refresh non-sensitive token fields only.
       // SECURITY: totpVerified and totpEnabled must only be set server-side (TOTP API route),
@@ -59,19 +75,47 @@ export const authConfig: NextAuthConfig = {
             token.totpVerified = true
           }
         }
-        // totpEnabled is refreshed from DB when TOTP setup changes
-        if (session._refreshTotp === true) {
-          // Re-read from DB to get fresh totpEnabled state
-          const { db } = await import('@/lib/db')
-          const user = await db.user.findUnique({
-            where: { id: token.id as string },
-            select: { totpEnabled: true },
+      }
+      if (typeof token.id === 'string') {
+        let user
+        try {
+          user = await getSessionRevalidationUser(token.id)
+        } catch (error) {
+          console.warn('[auth] session revalidation lookup failed', {
+            userId: token.id,
+            error: error instanceof Error ? error.message : String(error),
           })
-          if (user) {
-            token.totpEnabled = user.totpEnabled
-            if (!user.totpEnabled) token.totpVerified = false
-          }
+          return token
         }
+        if (user && typeof token.sessionVersion !== 'number') {
+          token.sessionVersion = user.sessionVersion
+        }
+        if (user && trigger === 'update' && session?._refreshTotp === true) {
+          token.sessionVersion = user.sessionVersion
+        }
+        if (user && !user.forceLogoutAt && typeof token.sessionAuthTime !== 'number') {
+          token.sessionAuthTime = nowSeconds()
+        }
+        const decision = evaluateSessionState({
+          sessionVersion: token.sessionVersion,
+          sessionAuthTime: token.sessionAuthTime,
+        }, user)
+        if (!user) {
+          token.sessionInvalidReason = 'missing-user'
+          return token
+        }
+        if (!decision.valid) {
+          token.sessionInvalidReason = decision.reason
+          return token
+        }
+
+        // Reached only after the current user record validates this token.
+        token.sessionInvalidReason = null
+        // Identity fields such as name/email/role remain the values minted into the token.
+        // Security-sensitive changes bump sessionVersion and force a fresh sign-in.
+        token.totpEnabled = user.totpEnabled
+        token.sessionVersion = user.sessionVersion
+        if (!user.totpEnabled) token.totpVerified = false
       }
       return token
     },
@@ -83,6 +127,11 @@ export const authConfig: NextAuthConfig = {
         session.user.totpEnabled = token.totpEnabled as boolean
         session.user.totpVerified = token.totpVerified as boolean
         session.user.pictureUrl = token.pictureUrl as string | null
+        session.user.sessionVersion = token.sessionVersion as number
+        session.user.sessionAuthTime = token.sessionAuthTime as number
+        session.user.sessionInvalidReason = isSessionInvalidReason(token.sessionInvalidReason)
+          ? token.sessionInvalidReason
+          : null
       }
       return session
     },
@@ -119,6 +168,7 @@ export const authConfig: NextAuthConfig = {
             pictureUrl: true,
             totpEnabled: true,
             active: true,
+            sessionVersion: true,
           },
         })
 
@@ -140,6 +190,8 @@ export const authConfig: NextAuthConfig = {
           pictureUrl: user.pictureUrl,
           totpEnabled: user.totpEnabled,
           totpVerified: false,
+          sessionVersion: user.sessionVersion,
+          sessionAuthTime: nowSeconds(),
         }
       },
     }),
@@ -171,6 +223,7 @@ export const authConfig: NextAuthConfig = {
             pictureUrl: true,
             totpEnabled: true,
             active: true,
+            sessionVersion: true,
           },
         })
 
@@ -186,6 +239,8 @@ export const authConfig: NextAuthConfig = {
           totpEnabled: user.totpEnabled,
           // Passkey counts as strong auth — skip TOTP
           totpVerified: true,
+          sessionVersion: user.sessionVersion,
+          sessionAuthTime: nowSeconds(),
         }
       },
     }),
