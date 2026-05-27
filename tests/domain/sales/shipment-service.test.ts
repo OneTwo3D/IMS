@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { Prisma } from '@/app/generated/prisma/client'
 import {
   confirmSalesOrderShipments,
   reconcileOrderAfterShipment,
@@ -39,6 +40,14 @@ type ShipmentLine = {
 type StockLevel = { productId: string; warehouseId: string; quantity: number; reservedQty: number }
 type CostLayer = { id: string; productId: string; warehouseId: string; remainingQty: number; unitCostBase: number }
 
+function uniqueStockMovementError() {
+  return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+    code: 'P2002',
+    clientVersion: 'test',
+    meta: { target: ['idempotencyKey'] },
+  })
+}
+
 type State = {
   orders: Order[]
   lines: OrderLine[]
@@ -47,7 +56,7 @@ type State = {
   shipmentLines: ShipmentLine[]
   stockLevels: StockLevel[]
   costLayers: CostLayer[]
-  movements: Array<{ id: string; productId: string; qty: number }>
+  movements: Array<{ id: string; productId: string; qty: number; idempotencyKey?: string | null }>
   cogsEntries: Array<{ costLayerId: string; movementId: string; qty: number; unitCostBase: number; totalCostBase: number }>
   settings: Record<string, string>
 }
@@ -246,8 +255,38 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       },
     },
     stockMovement: {
-      create: async ({ data }: { data: { productId: string; qty: number } }) => {
-        const movement = { id: `movement-${movementSequence++}`, productId: data.productId, qty: data.qty }
+      createMany: async ({ data, skipDuplicates }: { data: Array<{ productId: string; qty: number; idempotencyKey?: string | null }>; skipDuplicates?: boolean }) => {
+        let count = 0
+        for (const entry of data) {
+          if (skipDuplicates && entry.idempotencyKey && state.movements.some((movement) => movement.idempotencyKey === entry.idempotencyKey)) {
+            continue
+          }
+          const movement = {
+            id: `movement-${movementSequence++}`,
+            productId: entry.productId,
+            qty: entry.qty,
+            idempotencyKey: entry.idempotencyKey,
+          }
+          state.movements.push(movement)
+          count += 1
+        }
+        return { count }
+      },
+      findUnique: async ({ where }: { where: { idempotencyKey: string } }) => {
+        const movement = state.movements.find((row) => row.idempotencyKey === where.idempotencyKey)
+        if (!movement) return null
+        return { id: movement.id }
+      },
+      create: async ({ data }: { data: { productId: string; qty: number; idempotencyKey?: string | null } }) => {
+        if (data.idempotencyKey && state.movements.some((movement) => movement.idempotencyKey === data.idempotencyKey)) {
+          throw uniqueStockMovementError()
+        }
+        const movement = {
+          id: `movement-${movementSequence++}`,
+          productId: data.productId,
+          qty: data.qty,
+          idempotencyKey: data.idempotencyKey,
+        }
         state.movements.push(movement)
         return { id: movement.id }
       },
@@ -350,7 +389,33 @@ test('transitionShipmentStatus ships stock and stores FIFO COGS snapshot', async
     unitCostBase: 5,
     totalCostBase: 10,
   }])
+  assert.equal(state.movements[0].idempotencyKey, 'SALE_DISPATCH:shipmentLine:shipment-line-1')
   assert.equal(state.lines[0].cogsBase, 10)
+})
+
+test('transitionShipmentStatus treats an existing dispatch movement as an idempotent no-op for stock', async () => {
+  const state = baseState({
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+    movements: [{
+      id: 'movement-existing',
+      productId: 'product-1',
+      qty: 2,
+      idempotencyKey: 'SALE_DISPATCH:shipmentLine:shipment-line-1',
+    }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.movements.length, 1)
+  assert.equal(state.stockLevels[0].quantity, 2)
+  assert.equal(state.stockLevels[0].reservedQty, 2)
+  assert.equal(state.costLayers[0].remainingQty, 2)
+  assert.equal(state.cogsEntries.length, 0)
 })
 
 test('transitionShipmentStatus fails cleanly when dispatch shipment line quantity changes before lock', async () => {

@@ -732,6 +732,9 @@ model StockMovement {
   note            String?
   referenceType   String?           // e.g. "PurchaseOrder", "SalesOrder"
   referenceId     String?           // ID of the related entity
+  /// Deterministic key for irreversible stock-movement flows. Null for legacy/manual rows.
+  /// Keys are built by lib/domain/inventory/stock-movement-idempotency.ts.
+  idempotencyKey  String?           @unique
   createdAt       DateTime          @default(now())
 
   product         Product           @relation(fields: [productId], references: [id])

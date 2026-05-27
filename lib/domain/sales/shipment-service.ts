@@ -11,6 +11,10 @@ import {
   lockStockLevels,
   validateAllocationIntegrity,
 } from '@/lib/domain/sales/allocation-service'
+import {
+  isStockMovementIdempotencyConflict,
+  saleDispatchMovementKey,
+} from '@/lib/domain/inventory/stock-movement-idempotency'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -301,6 +305,34 @@ export async function transitionShipmentStatus(
       for (const line of lockedShipment.lines) {
         const qty = shipmentBoundaryNumber(line.qty)
         const qtyForDb = String(line.qty ?? 0)
+        const idempotencyKey = saleDispatchMovementKey(line.id)
+        let movement: { id: string } | null = null
+        try {
+          movement = await tx.stockMovement.create({
+            data: {
+              type: 'SALE_DISPATCH',
+              productId: line.productId,
+              fromWarehouseId: lockedShipment.warehouseId,
+              qty,
+              note: `Dispatched for order — shipment from ${lockedShipment.warehouse.code}`,
+              referenceType: 'SalesOrder',
+              referenceId: lockedShipment.orderId,
+              idempotencyKey,
+            },
+            select: { id: true },
+          })
+        } catch (error) {
+          if (!isStockMovementIdempotencyConflict(error)) throw error
+        }
+        if (!movement) {
+          movement = await tx.stockMovement.findUnique({
+            where: { idempotencyKey },
+            select: { id: true },
+          })
+          if (!movement) throw new Error('Dispatched stock movement was not persisted')
+          continue
+        }
+
         const updatedStock = await tx.stockLevel.updateMany({
           where: {
             productId: line.productId,
@@ -316,18 +348,6 @@ export async function transitionShipmentStatus(
         if (updatedStock.count !== 1) {
           throw new Error(`Insufficient physical or reserved stock to dispatch ${line.product.sku}`)
         }
-        const movement = await tx.stockMovement.create({
-          data: {
-            type: 'SALE_DISPATCH',
-            productId: line.productId,
-            fromWarehouseId: lockedShipment.warehouseId,
-            qty,
-            note: `Dispatched for order — shipment from ${lockedShipment.warehouse.code}`,
-            referenceType: 'SalesOrder',
-            referenceId: lockedShipment.orderId,
-          },
-          select: { id: true },
-        })
 
         const { consumed, totalCost } = await consumeFifoLayersStrict(
           tx, line.productId, lockedShipment.warehouseId, qty,

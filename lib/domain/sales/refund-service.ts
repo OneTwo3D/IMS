@@ -12,6 +12,10 @@ import {
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { validateRefundSalesOrderStatusUpdate } from '@/lib/domain/workflows/action-guards'
+import {
+  isStockMovementIdempotencyConflict,
+  refundInboundMovementKey,
+} from '@/lib/domain/inventory/stock-movement-idempotency'
 
 export const REFUND_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 export const REFUND_ACCOUNTING_LOCK_KEY = 4_112_208_031
@@ -29,6 +33,7 @@ export type RefundServiceClient = Prisma.TransactionClient | typeof db
 export type RefundReturnRow = {
   productId: string
   qty: number
+  refundLineId?: string | null
   unitCostBase?: number
   poLineId?: string | null
   sourceCostLayerId?: string | null
@@ -131,12 +136,16 @@ function aggregateRefundReturnRows(
 
   for (const row of rows) {
     if (!row.productId || !Number.isFinite(row.qty) || row.qty <= 0) continue
-    const existing = aggregated.get(row.productId)
+    // Key by refundLineId when present so same-product refund lines keep
+    // distinct movement keys; legacy callers without line ids retain the old
+    // product-level aggregation behavior.
+    const aggregateKey = row.refundLineId ? `${row.productId}:${row.refundLineId}` : row.productId
+    const existing = aggregated.get(aggregateKey)
     if (existing) {
       existing.qty += row.qty
       continue
     }
-    aggregated.set(row.productId, { ...row })
+    aggregated.set(aggregateKey, { ...row })
   }
 
   return [...aggregated.values()]
@@ -186,7 +195,7 @@ async function nextCreditNoteNumber(
 async function buildRefundFallbackReturnRows(
   client: RefundServiceClient,
   orderId: string,
-  lines: RefundRequestLine[],
+  lines: Array<RefundRequestLine | CreatedRefundLine>,
   excludeRefundId?: string,
 ): Promise<RefundReturnRow[]> {
   const order = await client.salesOrder.findUnique({
@@ -287,6 +296,7 @@ async function buildRefundFallbackReturnRows(
 
   return lines.flatMap((line) => {
     if (!line.productId || line.qty <= 0) return []
+    const refundLineId = 'id' in line ? line.id : null
 
     const sourceLine = line.lineId
       ? lineById.get(line.lineId) ?? null
@@ -295,13 +305,13 @@ async function buildRefundFallbackReturnRows(
         ?? null
 
     if (!sourceLine) {
-      return [{ productId: line.productId, qty: line.qty }]
+      return [{ productId: line.productId, qty: line.qty, refundLineId }]
     }
 
     const sourceRows = sourceRowsByLine.get(sourceLine.id)
     const sourceLineQty = refundBoundaryNumber(sourceLine.qty)
     if (!sourceRows || sourceRows.size === 0 || !Number.isFinite(sourceLineQty) || sourceLineQty <= 0) {
-      return [{ productId: sourceLine.productId ?? line.productId, qty: line.qty }]
+      return [{ productId: sourceLine.productId ?? line.productId, qty: line.qty, refundLineId }]
     }
 
     return [...sourceRows.entries()].flatMap(([productId, totalQty]) => {
@@ -313,7 +323,7 @@ async function buildRefundFallbackReturnRows(
       remainingReturnable.set(productId, available - cappedQty)
 
       if (cappedQty <= 0) return []
-      return [{ productId, qty: cappedQty }]
+      return [{ productId, qty: cappedQty, refundLineId }]
     })
   })
 }
@@ -354,17 +364,30 @@ export async function applyReturnInboundStockTx(
   }
 
   for (const row of aggregatedRows) {
-    await tx.stockMovement.create({
-      data: {
-        type: 'RETURN_INBOUND',
-        productId: row.productId,
-        toWarehouseId: params.warehouseId,
-        qty: row.qty,
-        note: params.note,
-        referenceType: params.referenceType,
-        referenceId: params.referenceId,
-      },
-    })
+    const idempotencyKey = row.refundLineId && params.referenceType === 'SalesOrderRefund'
+      ? refundInboundMovementKey({
+          refundId: params.referenceId,
+          refundLineId: row.refundLineId,
+        })
+      : undefined
+    try {
+      await tx.stockMovement.create({
+        data: {
+          type: 'RETURN_INBOUND',
+          productId: row.productId,
+          toWarehouseId: params.warehouseId,
+          qty: row.qty,
+          note: params.note,
+          referenceType: params.referenceType,
+          referenceId: params.referenceId,
+          ...(idempotencyKey ? { idempotencyKey } : {}),
+        },
+      })
+    } catch (error) {
+      if (!isStockMovementIdempotencyConflict(error)) throw error
+      continue
+    }
+
     await tx.stockLevel.upsert({
       where: { productId_warehouseId: { productId: row.productId, warehouseId: params.warehouseId } },
       create: { productId: row.productId, warehouseId: params.warehouseId, quantity: row.qty, reservedQty: 0 },
@@ -873,6 +896,7 @@ async function stageRefundAccountingReversals(
           return [{
             productId,
             qty: entry.qty,
+            refundLineId: refundLine.id,
             unitCostBase: entry.unitCostBase,
             poLineId: poLineIdByCostLayerId.get(entry.costLayerId) ?? null,
             sourceCostLayerId: entry.costLayerId,
@@ -1232,7 +1256,9 @@ export async function createSalesOrderRefund(
     const snapshotRows = snapshotReturnRows ?? []
     const returnRows = snapshotRows.length > 0
       ? snapshotRows
-      : await buildRefundFallbackReturnRows(client, input.orderId, refundLines, txResult.createdRefund.id)
+      // Use persisted refund lines so fallback rows carry refundLineId for
+      // deterministic RETURN_INBOUND movement keys.
+      : await buildRefundFallbackReturnRows(client, input.orderId, txResult.createdRefundLines, txResult.createdRefund.id)
 
     returnedRows = await runInTransaction(client, (tx) => (
       applyReturnInboundStockTx(tx, {

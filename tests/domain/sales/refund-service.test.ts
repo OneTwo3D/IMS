@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { Prisma } from '@/app/generated/prisma/client'
 import {
   applyReturnInboundStockTx,
   createSalesOrderRefund,
@@ -29,6 +30,14 @@ type SalesLine = {
   description: string
   qty: number
   totalBase: number
+}
+
+function uniqueStockMovementError() {
+  return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+    code: 'P2002',
+    clientVersion: 'test',
+    meta: { target: ['idempotencyKey'] },
+  })
 }
 
 type Refund = {
@@ -75,7 +84,13 @@ type State = {
   }>
   allocations: Array<{ id: string; orderId: string; lineId: string; productId: string; warehouseId: string; qty: number; costLayerSnapshot: unknown }>
   costLayers: Array<{ id: string; productId: string; poLineId: string | null; receivedQty: number; unitCostBase: number }>
-  movements: Array<{ productId: string; qty: number; referenceType: string; referenceId: string }>
+  movements: Array<{
+    productId: string
+    qty: number
+    referenceType: string
+    referenceId: string
+    idempotencyKey?: string | null
+  }>
   stockLevels: Array<{ productId: string; warehouseId: string; quantity: number; reservedQty: number }>
   settings: Record<string, string>
   executeRawCalls: number
@@ -274,7 +289,21 @@ function createClient(state: State): RefundServiceClient {
     stockMovement: {
       findMany: async ({ where }: { where: { referenceType: string; referenceId: string } }) => state.movements
         .filter((movement) => movement.referenceType === where.referenceType && movement.referenceId === where.referenceId),
-      create: async ({ data }: { data: { productId: string; qty: number; referenceType: string; referenceId: string } }) => {
+      createMany: async ({ data, skipDuplicates }: { data: Array<{ productId: string; qty: number; referenceType: string; referenceId: string; idempotencyKey?: string | null }>; skipDuplicates?: boolean }) => {
+        let count = 0
+        for (const entry of data) {
+          if (skipDuplicates && entry.idempotencyKey && state.movements.some((movement) => movement.idempotencyKey === entry.idempotencyKey)) {
+            continue
+          }
+          state.movements.push(entry)
+          count += 1
+        }
+        return { count }
+      },
+      create: async ({ data }: { data: { productId: string; qty: number; referenceType: string; referenceId: string; idempotencyKey?: string | null } }) => {
+        if (data.idempotencyKey && state.movements.some((movement) => movement.idempotencyKey === data.idempotencyKey)) {
+          throw uniqueStockMovementError()
+        }
         state.movements.push(data)
       },
     },
@@ -575,6 +604,7 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   assert.equal(state.movements[0].qty, 1)
   assert.equal(state.movements[0].referenceType, 'SalesOrderRefund')
   assert.equal(state.movements[0].referenceId, 'refund-1')
+  assert.equal(state.movements[0].idempotencyKey, 'RETURN_INBOUND:refund:refund-1:line:refund-line-1')
   assert.equal(state.stockLevels[0].quantity, 1)
   assert.equal(state.costLayers[1].unitCostBase, 10)
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
@@ -673,6 +703,61 @@ test('createSalesOrderRefund fallback stock return excludes the current refund f
   assert.equal(state.movements[0].qty, 2)
   assert.equal(state.movements[0].referenceType, 'SalesOrderRefund')
   assert.equal(state.movements[0].referenceId, 'refund-1')
+  assert.equal(state.movements[0].idempotencyKey, 'RETURN_INBOUND:refund:refund-1:line:refund-line-1')
+  assert.equal(state.stockLevels[0].quantity, 2)
+})
+
+test('createSalesOrderRefund keeps same-product refund lines as distinct inbound movements', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: null,
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: null,
+    }],
+    lines: [
+      { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Product 1 A', qty: 1, totalBase: 50 },
+      { id: 'line-2', orderId: 'order-1', productId: 'product-1', description: 'Product 1 B', qty: 1, totalBase: 50 },
+    ],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: null,
+      revenueRecognizedAmount: null,
+      cogsBatchAmount: null,
+      lines: [
+        { id: 'shipment-line-1', lineId: 'line-1', qty: 1, costLayerSnapshot: [] },
+        { id: 'shipment-line-2', lineId: 'line-2', qty: 1, costLayerSnapshot: [] },
+      ],
+    }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [
+      { lineId: 'line-1', productId: 'product-1', description: 'Product 1 A', qty: 1, totalBase: 50 },
+      { lineId: 'line-2', productId: 'product-1', description: 'Product 1 B', qty: 1, totalBase: 50 },
+    ],
+    reason: 'Return both same-SKU lines',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.equal(result.success, true)
+  assert.deepEqual(
+    state.movements.map((movement) => movement.idempotencyKey),
+    [
+      'RETURN_INBOUND:refund:refund-1:line:refund-line-1',
+      'RETURN_INBOUND:refund:refund-1:line:refund-line-2',
+    ],
+  )
   assert.equal(state.stockLevels[0].quantity, 2)
 })
 
