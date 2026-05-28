@@ -10,10 +10,11 @@ import type { InventoryInvariantReport } from '@/lib/domain/inventory/invariants
 type CronEnv = {
   ALLOW_LOCALHOST_CRON_BYPASS?: string
   CRON_SECRET?: string
+  INVARIANT_CHECK_STOCK_MOVEMENT_LOOKBACK_DAYS?: string
   NODE_ENV?: string
 }
 
-const ENV_KEYS = ['ALLOW_LOCALHOST_CRON_BYPASS', 'CRON_SECRET', 'NODE_ENV'] as const
+const ENV_KEYS = ['ALLOW_LOCALHOST_CRON_BYPASS', 'CRON_SECRET', 'INVARIANT_CHECK_STOCK_MOVEMENT_LOOKBACK_DAYS', 'NODE_ENV'] as const
 
 async function withCronEnv(env: CronEnv, fn: () => Promise<void>): Promise<void> {
   const mutableEnv = process.env as Record<string, string | undefined>

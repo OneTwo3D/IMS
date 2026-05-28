@@ -136,8 +136,19 @@ export async function GET(req: NextRequest) {
     }
     case 'inv_movements': {
       const rows = await getStockMovements(dateFrom, dateTo)
-      const data = rows.map((r) => ({ type: r.type, sku: r.sku, productName: r.productName, from: r.fromWarehouse, to: r.toWarehouse, qty: r.qty, note: r.note, date: r.createdAt.slice(0, 10) }))
-      return csvResponse(toCsv(data, ['type', 'sku', 'productName', 'from', 'to', 'qty', 'note', 'date']), `stock-movements-${date}.csv`)
+      const data = rows.map((r) => ({
+        type: r.type,
+        sku: r.sku,
+        productName: r.productName,
+        from: r.fromWarehouse,
+        to: r.toWarehouse,
+        qty: r.qty,
+        note: r.note,
+        date: r.createdAt.slice(0, 10),
+        unitCostBase: r.unitCostBase == null ? '' : r.unitCostBase.toFixed(6),
+        totalValueBase: r.totalValueBase == null ? '' : r.totalValueBase.toFixed(6),
+      }))
+      return csvResponse(toCsv(data, ['type', 'sku', 'productName', 'from', 'to', 'qty', 'note', 'date', 'unitCostBase', 'totalValueBase']), `stock-movements-${date}.csv`)
     }
     case 'inv_allocations': {
       const rows = await getStockAllocations()

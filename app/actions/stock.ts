@@ -24,6 +24,10 @@ import {
 } from '@/lib/domain/inventory/stock-level-map'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { calculateAdjustmentStockDelta } from '@/lib/domain/inventory/stock-adjustment-edit'
+import {
+  buildStockMovementValueFields,
+  buildStockMovementValueFieldsFromConsumed,
+} from '@/lib/domain/inventory/stock-movement-value'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -183,6 +187,12 @@ export async function applyStockAdjustment({
     FOR UPDATE
   `
 
+  let additionUnitCost: number | null = null
+  if (isAddition) {
+    const warehouseAvgCost = await getAverageUnitCost(tx, productId, warehouseId)
+    additionUnitCost = warehouseAvgCost > 0 ? warehouseAvgCost : await getHistoricalAverageUnitCost(tx, productId)
+  }
+
   const movement = await tx.stockMovement.create({
     data: {
       type: 'ADJUSTMENT',
@@ -191,6 +201,7 @@ export async function applyStockAdjustment({
       toWarehouseId: isAddition ? warehouseId : null,
       qty: absQty,
       note: reasonName,
+      ...(isAddition ? buildStockMovementValueFields({ qty: absQty, unitCostBase: additionUnitCost ?? 0 }) : {}),
     },
   })
 
@@ -209,19 +220,21 @@ export async function applyStockAdjustment({
   })
 
   if (isAddition) {
-    const warehouseAvgCost = await getAverageUnitCost(tx, productId, warehouseId)
-    const avgCost = warehouseAvgCost > 0 ? warehouseAvgCost : await getHistoricalAverageUnitCost(tx, productId)
     await createCostLayer(tx, {
       productId,
       warehouseId,
       qty: Math.abs(qty),
-      unitCostBase: avgCost,
+      unitCostBase: additionUnitCost ?? 0,
       receivedAt: movement.createdAt,
       isOpeningStock: false,
       adjustmentMovementId: movement.id,
     })
   } else {
     const { consumed } = await consumeFifoLayersStrict(tx, productId, warehouseId, Math.abs(qty))
+    await tx.stockMovement.update({
+      where: { id: movement.id },
+      data: buildStockMovementValueFieldsFromConsumed(consumed),
+    })
     if (consumed.length > 0) {
       await tx.cogsEntry.createMany({
         data: consumed.map((entry) => ({
@@ -312,6 +325,7 @@ export async function applyOpeningStock({
       productId,
       toWarehouseId: warehouseId,
       qty,
+      ...buildStockMovementValueFields({ qty, unitCostBase }),
       note: note || null,
     },
   })
@@ -756,9 +770,11 @@ export async function updateAdjustmentMovement(
         await tx.cogsEntry.deleteMany({ where: { movementId: id } })
       }
 
+      let nextMovementValueFields: ReturnType<typeof buildStockMovementValueFields> | ReturnType<typeof buildStockMovementValueFieldsFromConsumed>
       if (newIsAddition) {
         const warehouseAvgCost = await getAverageUnitCost(tx, movement.productId, newWarehouseId)
         const avgCost = warehouseAvgCost > 0 ? warehouseAvgCost : await getHistoricalAverageUnitCost(tx, movement.productId)
+        nextMovementValueFields = buildStockMovementValueFields({ qty: Math.abs(newSignedQty), unitCostBase: avgCost })
         await createCostLayer(tx, {
           productId: movement.productId,
           warehouseId: newWarehouseId,
@@ -770,6 +786,7 @@ export async function updateAdjustmentMovement(
         })
       } else {
         const { consumed } = await consumeFifoLayersStrict(tx, movement.productId, newWarehouseId, Math.abs(newSignedQty))
+        nextMovementValueFields = buildStockMovementValueFieldsFromConsumed(consumed)
         if (consumed.length > 0) {
           await tx.cogsEntry.createMany({
             data: consumed.map((entry) => ({
@@ -790,6 +807,7 @@ export async function updateAdjustmentMovement(
           fromWarehouseId: newIsAddition ? null : oldWarehouseId,
           toWarehouseId: newIsAddition ? oldWarehouseId : null,
           qty: newAbsQty,
+          ...nextMovementValueFields,
           note: newNote || null,
         },
       })

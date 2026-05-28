@@ -17,6 +17,7 @@ import { notify } from '@/lib/notifications'
 const CRITICAL_FINDINGS_HASH_SETTING = 'cron_invariant_check_critical_findings_hash'
 const DEFAULT_INVENTORY_INVARIANT_PAGE_SIZE = 500
 const DEFAULT_INVENTORY_INVARIANT_MAX_FINDINGS = 5000
+const DEFAULT_STOCK_MOVEMENT_LOOKBACK_DAYS = 90
 
 function positiveIntEnv(name: string, fallback: number): number {
   const parsed = Number.parseInt(process.env[name] ?? '', 10)
@@ -29,6 +30,10 @@ function inventoryInvariantPageSize(): number {
 
 function inventoryInvariantMaxFindings(): number {
   return positiveIntEnv('INVARIANT_CHECK_MAX_FINDINGS', DEFAULT_INVENTORY_INVARIANT_MAX_FINDINGS)
+}
+
+function stockMovementLookbackDays(): number {
+  return positiveIntEnv('INVARIANT_CHECK_STOCK_MOVEMENT_LOOKBACK_DAYS', DEFAULT_STOCK_MOVEMENT_LOOKBACK_DAYS)
 }
 
 type InvariantDomain = 'inventory' | 'accounting'
@@ -233,6 +238,7 @@ export async function runScheduledInvariantCheck(
     collectionMode: 'sql',
     pageSize: inventoryInvariantPageSize(),
     maxFindings: inventoryInvariantMaxFindings(),
+    stockMovementLookbackDays: stockMovementLookbackDays(),
   }))
   const runAccountingReport = dependencies.runAccountingReport ?? runAccountingInvariantReport
   const writeActivityLog = dependencies.writeActivityLog ?? logActivity

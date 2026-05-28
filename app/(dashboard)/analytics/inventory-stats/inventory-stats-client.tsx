@@ -61,6 +61,8 @@ const MOVEMENT_FIELDS: FieldDef[] = [
   { key: 'fromWarehouse', label: 'From Warehouse', type: 'text' },
   { key: 'toWarehouse', label: 'To Warehouse', type: 'text' },
   { key: 'qty', label: 'Quantity', type: 'number' },
+  { key: 'unitCostBase', label: 'Unit Cost (Base)', type: 'number' },
+  { key: 'totalValueBase', label: 'Value (Base)', type: 'number' },
   { key: 'note', label: 'Note', type: 'text' },
   { key: 'createdAt', label: 'Date', type: 'text' },
 ]
@@ -97,7 +99,7 @@ const TAB_FIELDS: Record<Tab, FieldDef[]> = {
 
 const DEFAULT_COLS: Record<Tab, string[]> = {
   onhand: ['sku', 'name', 'type', 'warehouseCode', 'quantity', 'reservedQty', 'available', 'inventoryValue', 'stockUnit'],
-  movements: ['type', 'sku', 'productName', 'fromWarehouse', 'toWarehouse', 'qty', 'note', 'createdAt'],
+  movements: ['type', 'sku', 'productName', 'fromWarehouse', 'toWarehouse', 'qty', 'unitCostBase', 'totalValueBase', 'note', 'createdAt'],
   allocations: ['sku', 'productName', 'warehouseCode', 'totalStock', 'reservedQty', 'available', 'pendingOrders'],
   reorder: ['sku', 'name', 'currentStock', 'availableStock', 'reorderPoint', 'shortfall', 'avgDailyDemand', 'daysUntilStockout', 'supplierName'],
 }
@@ -284,6 +286,7 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
       if (key === 'sku') return <ProductLink productId={row.productId} sku={row.sku} name={row.productName} />
       if (key === 'fromWarehouse' || key === 'toWarehouse') return <span className="text-xs font-mono">{v ?? '—'}</span>
       if (key === 'qty') return <span className="tabular-nums text-xs font-medium">{v}</span>
+      if (key === 'unitCostBase' || key === 'totalValueBase') return <span className="tabular-nums text-xs font-mono">{v == null ? '—' : fmtBase(v)}</span>
       if (key === 'note') return <span className="text-xs text-muted-foreground truncate max-w-48 block">{v ?? '—'}</span>
       if (key === 'createdAt') return <span className="text-xs text-muted-foreground">{fmtDate(v)}</span>
     }

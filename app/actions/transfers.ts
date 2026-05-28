@@ -18,6 +18,10 @@ import {
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { toDecimal } from '@/lib/domain/math/decimal'
+import {
+  buildStockMovementValueFieldsFromConsumed,
+  buildStockMovementValueFieldsFromTotal,
+} from '@/lib/domain/inventory/stock-movement-value'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -395,7 +399,10 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
       for (const line of transfer.lines) {
         const qtyDecimal = toDecimal(line.qty)
         const qty = qtyDecimal.toNumber()
-        await tx.stockMovement.create({
+        // Two-phase value write: create the movement to obtain its id, consume
+        // FIFO, then update reporting value fields inside the same transaction.
+        // Partial NULL value state is not visible outside the transaction.
+        const movement = await tx.stockMovement.create({
           data: {
             type: 'TRANSFER_OUT',
             productId: line.productId,
@@ -406,6 +413,7 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
             referenceType: 'StockTransfer',
             referenceId: id,
           },
+          select: { id: true },
         })
         const updatedStock = await tx.stockLevel.updateMany({
           where: {
@@ -437,6 +445,10 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
         // (legacy stock may not have layers). Store consumed entries on
         // the transfer line so receiveTransfer can split/recreate them.
         const { consumed } = await consumeFifoLayersStrict(tx, line.productId, transfer.fromWarehouseId, qty)
+        await tx.stockMovement.update({
+          where: { id: movement.id },
+          data: buildStockMovementValueFieldsFromConsumed(consumed),
+        })
         if (consumed.length > 0) {
           await tx.stockTransferLine.update({
             where: { id: line.id },
@@ -576,6 +588,18 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
         const remainingQty = Math.max(0, qty - alreadyReceived)
 
         if (remainingQty > 0) {
+          // Compute the pure snapshot slice before movement creation so the
+          // transfer-in value fields and recreated destination layers use the
+          // same cost basis.
+          const snapshotSlice = sliceTransferSnapshotForReceipt({
+            snapshot: snapshotByLineId.get(line.id),
+            alreadyReceivedQty: alreadyReceived,
+            qtyReceived: remainingQty,
+          })
+          const totalValueBase = snapshotSlice.reduce(
+            (sum, entry) => sum + (entry.qty * entry.unitCostBase),
+            0,
+          )
           await tx.stockMovement.create({
             data: {
               type: 'TRANSFER_IN',
@@ -588,6 +612,7 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
                 : `Transfer ${transfer.reference} received`,
               referenceType: 'StockTransfer',
               referenceId: id,
+              ...buildStockMovementValueFieldsFromTotal({ qty: remainingQty, totalValueBase }),
             },
           })
           await tx.stockLevel.upsert({
@@ -602,11 +627,6 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
           // the full transfer's source layers; the slicer walks past
           // alreadyReceived units and returns only the next remainingQty
           // units, matching the same algorithm the WMS handler uses.
-          const snapshotSlice = sliceTransferSnapshotForReceipt({
-            snapshot: snapshotByLineId.get(line.id),
-            alreadyReceivedQty: alreadyReceived,
-            qtyReceived: remainingQty,
-          })
           for (const entry of snapshotSlice) {
             if (entry.qty > 0 && entry.unitCostBase >= 0) {
               const newLayerId = await createCostLayer(tx, {

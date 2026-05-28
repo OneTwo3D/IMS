@@ -102,6 +102,25 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 
 **Product reporting categories** — `ProductCategory` is a normalized hierarchy used to slice inventory, turnover, aging, stock-on-hand, and reorder reports. `Product.categoryId` is optional so existing products can remain uncategorized during rollout; CSV import/export and product create/edit use the category display name and create the category on first use. Names are capped at 100 characters, normalize case/diacritics/invisible characters for matching, and preserve the first display spelling for each normalized key.
 
+**Stock movement reporting value** — New `StockMovement` rows carry `unitCostBase` and `totalValueBase` so inventory movement reports and CSV exports can read value directly from the movement table instead of joining COGS entries or cost layers. Outbound movements derive value from FIFO/CogsEntry consumption, inbound movements derive it from the created cost layer or transfer snapshot, and historical demand imports or positive adjustments with no prior cost source use zero cost as known-unknown provenance. Backfilled rows that cannot be derived remain `NULL`; aggregate queries must either `COALESCE(totalValueBase, 0)` or filter `IS NOT NULL` explicitly. Migration `20260528162500_stock_movement_values` records unresolved per-type counts in `stock_movement_backfill_audit`, preserving the first run timestamp and updating the latest run/count on retry. The inventory invariant report expects `totalValueBase ≈ ABS(qty) * unitCostBase` because writer helpers store movement value as a positive magnitude even for signed correction inputs. The invariant uses a hybrid absolute/relative tolerance so small movements do not hide large percentage drift and very large movements do not fail on immaterial cent-level rounding.
+
+| Stock Movement Type | Reporting Value Source |
+|---|---|
+| `ADJUSTMENT` | Positive adjustments use average/historical cost; negative adjustments use FIFO consumption. |
+| `KIT_ASSEMBLY_IN` | Reserved legacy type; active manufacturing assembly writes `PRODUCTION_IN`. |
+| `KIT_ASSEMBLY_OUT` | Reserved legacy type; active manufacturing assembly writes `PRODUCTION_OUT`. |
+| `OPENING_STOCK` | Opening stock uses the explicit opening unit cost. |
+| `PRODUCTION_IN` | Manufacturing output/recovery uses consumed component and overhead cost. |
+| `PRODUCTION_OUT` | Manufacturing consumption/disassembly uses FIFO consumption. |
+| `PURCHASE_RECEIPT` | Purchase receipts use landed or gross purchase unit cost. |
+| `RETURN_INBOUND` | Customer returns use shipped cost snapshots where available. |
+| `SALE_DISPATCH` | Sales dispatch uses FIFO consumption; historical imports use the zero-cost provenance sentinel. |
+| `TRANSFER_IN` | Transfer receipts use the dispatch FIFO snapshot slice. |
+| `TRANSFER_OUT` | Transfer dispatch uses FIFO consumption. |
+| `WMS_RECEIPT_RECONCILIATION` | WMS reconciliation uses source PO/transfer cost or zero-value audit markers. |
+
+The value writer surface is broad by design. New movement writers must route through `lib/domain/inventory/stock-movement-value.ts` and either populate both value fields, intentionally leave both `NULL` for non-derivable historical data, or document an explicit zero-cost provenance sentinel. Consumption-based writers currently use a two-phase transaction pattern: create the movement, consume FIFO using the movement id, then update the movement value fields inside the same transaction. The intermediate `NULL` state is not externally observable under normal transaction isolation, but repeated writer implementations should be consolidated if another movement writer is added. Scheduled invariant checks restrict stock-movement value scans to a 90-day window by default (`INVARIANT_CHECK_STOCK_MOVEMENT_LOOKBACK_DAYS`) to avoid daily full-table scans; admin/on-demand invariant reports leave the window unset for historical audits. CSV exports emit fixed dot-decimal numeric literals for these value fields regardless of server locale.
+
 ### Quantity Constraint Monitoring
 
 The database and the invariant report intentionally overlap on core quantity integrity checks:

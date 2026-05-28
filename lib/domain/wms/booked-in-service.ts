@@ -15,6 +15,10 @@ import {
   wmsPurchaseReceiptMovementKey,
   wmsTransferInMovementKey,
 } from '@/lib/domain/inventory/stock-movement-idempotency'
+import {
+  buildStockMovementValueFields,
+  buildStockMovementValueFieldsFromTotal,
+} from '@/lib/domain/inventory/stock-movement-value'
 
 // Booked-in reconciliation mutates stock levels, FIFO layers, PO lines, and sync state in one unit.
 // The longer timeout avoids false rollback on large ASNs while preserving a bounded lock window.
@@ -684,6 +688,7 @@ export async function processBookedInEvent(
                     productId: poLine.productId,
                     toWarehouseId: asnMap.warehouseId,
                     qty: receiptLine.stockQtyToAdd,
+                    ...buildStockMovementValueFields({ qty: receiptLine.stockQtyToAdd, unitCostBase }),
                     note: `Received against ${po.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
                     referenceType: 'WmsAsnMap',
                     referenceId: asnMap.id,
@@ -730,12 +735,16 @@ export async function processBookedInEvent(
             }
 
             if (receiptLine.coveredBySnapshotQty > 0) {
+              // Zero-qty movements are audit markers for quantities already
+              // accounted by a prior snapshot; reports counting physical stock
+              // movement should filter to qty > 0.
               await tx.stockMovement.create({
                 data: {
                   type: 'WMS_RECEIPT_RECONCILIATION',
                   productId: poLine.productId,
                   toWarehouseId: asnMap.warehouseId,
                   qty: 0,
+                  ...buildStockMovementValueFields({ qty: 0, unitCostBase: 0 }),
                   note: `Mintsoft snapshot already accounted for ${receiptLine.coveredBySnapshotQty} on ${po.reference}`,
                   referenceType: 'WmsAsnLineMap',
                   referenceId: receiptLine.asnLineMapId,
@@ -847,6 +856,15 @@ export async function processBookedInEvent(
 
           if (receiptLine.qtyReceived > 0) {
             if (receiptLine.stockQtyToAdd > 0) {
+              const snapshotSlice = sliceTransferSnapshotForReceipt({
+                snapshot: transferLine.costLayerSnapshot,
+                alreadyReceivedQty: receiptLine.alreadyReceivedQty,
+                qtyReceived: receiptLine.stockQtyToAdd,
+              })
+              const totalValueBase = snapshotSlice.reduce(
+                (sum, entry) => sum + (entry.qty * entry.unitCostBase),
+                0,
+              )
               try {
                 await tx.stockMovement.create({
                   data: {
@@ -855,6 +873,7 @@ export async function processBookedInEvent(
                     fromWarehouseId: null,
                     toWarehouseId: transfer.toWarehouseId,
                     qty: receiptLine.stockQtyToAdd,
+                    ...buildStockMovementValueFieldsFromTotal({ qty: receiptLine.stockQtyToAdd, totalValueBase }),
                     note: `Received against ${transfer.reference} via Mintsoft webhook ${lockedEvent.externalAsnId}`,
                     referenceType: 'WmsAsnMap',
                     referenceId: asnMap.id,
@@ -887,12 +906,6 @@ export async function processBookedInEvent(
                 },
               })
 
-              const snapshotSlice = sliceTransferSnapshotForReceipt({
-                snapshot: transferLine.costLayerSnapshot,
-                alreadyReceivedQty: receiptLine.alreadyReceivedQty,
-                qtyReceived: receiptLine.stockQtyToAdd,
-              })
-
               for (const entry of snapshotSlice) {
                 const newLayerId = await createCostLayer(tx, {
                   productId: transferLine.productId,
@@ -905,12 +918,16 @@ export async function processBookedInEvent(
             }
 
             if (receiptLine.coveredBySnapshotQty > 0) {
+              // Zero-qty movements are audit markers for quantities already
+              // accounted by a prior snapshot; reports counting physical stock
+              // movement should filter to qty > 0.
               await tx.stockMovement.create({
                 data: {
                   type: 'WMS_RECEIPT_RECONCILIATION',
                   productId: transferLine.productId,
                   toWarehouseId: transfer.toWarehouseId,
                   qty: 0,
+                  ...buildStockMovementValueFields({ qty: 0, unitCostBase: 0 }),
                   note: `Mintsoft snapshot already accounted for ${receiptLine.coveredBySnapshotQty} on ${transfer.reference}`,
                   referenceType: 'WmsAsnLineMap',
                   referenceId: receiptLine.asnLineMapId,

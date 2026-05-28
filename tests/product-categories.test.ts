@@ -50,3 +50,13 @@ test('product export csv escapes category names containing csv syntax', () => {
     'sku,category\r\nSKU-1,"Hardware, ""Special""\nParts"',
   )
 })
+
+test('csv export preserves fixed decimal reporting values as dot-decimal literals', () => {
+  assert.equal(
+    toCsv(
+      [{ qty: '2.500000', unitCostBase: '1.234568', totalValueBase: '3.086420' }],
+      ['qty', 'unitCostBase', 'totalValueBase'],
+    ),
+    'qty,unitCostBase,totalValueBase\r\n2.500000,1.234568,3.086420',
+  )
+})

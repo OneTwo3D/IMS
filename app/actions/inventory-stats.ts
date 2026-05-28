@@ -75,6 +75,8 @@ export type StockMovementRow = {
   fromWarehouse: string | null
   toWarehouse: string | null
   qty: number
+  unitCostBase: number | null
+  totalValueBase: number | null
   note: string | null
   referenceType: string | null
   createdAt: string
@@ -95,7 +97,7 @@ export async function getStockMovements(dateFrom?: string, dateTo?: string, limi
   const movements = await db.stockMovement.findMany({
     where: baseWhere,
     select: {
-      id: true, type: true, productId: true, qty: true, note: true, referenceType: true, createdAt: true,
+      id: true, type: true, productId: true, qty: true, unitCostBase: true, totalValueBase: true, note: true, referenceType: true, createdAt: true,
       product: { select: { sku: true, name: true } },
       fromWarehouse: { select: { code: true } },
       toWarehouse: { select: { code: true } },
@@ -113,6 +115,8 @@ export async function getStockMovements(dateFrom?: string, dateTo?: string, limi
     fromWarehouse: m.fromWarehouse?.code ?? null,
     toWarehouse: m.toWarehouse?.code ?? null,
     qty: Number(m.qty),
+    unitCostBase: m.unitCostBase == null ? null : Number(m.unitCostBase),
+    totalValueBase: m.totalValueBase == null ? null : Number(m.totalValueBase),
     note: m.note,
     referenceType: m.referenceType,
     createdAt: m.createdAt.toISOString(),

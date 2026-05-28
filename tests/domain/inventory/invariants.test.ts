@@ -22,6 +22,8 @@ const CANONICAL_INVENTORY_INVARIANT_CODES = new Set([
   'cost_layer_remaining_exceeds_received',
   'stock_cost_layer_quantity_mismatch',
   'stock_movement_negative_quantity',
+  'stock_movement_value_mismatch',
+  'stock_movement_value_partial',
   'shipped_line_missing_cogs_snapshot',
 ])
 
@@ -299,6 +301,160 @@ test('clean stock movements do not generate findings', () => {
     findings.some((finding) => finding.code === 'stock_movement_negative_quantity'),
     false,
   )
+  assert.equal(
+    findings.some((finding) => finding.code.startsWith('stock_movement_value_')),
+    false,
+  )
+})
+
+test('stock movement value fields must reconcile within reporting tolerance', () => {
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [],
+    stockMovements: [
+      {
+        id: 'movement-value-mismatch',
+        type: 'SALE_DISPATCH',
+        productId: 'product-1',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: 2,
+        unitCostBase: 5,
+        totalValueBase: 11,
+        product: {
+          id: 'product-1',
+          sku: 'VALUE-MISMATCH',
+          type: 'SIMPLE',
+        },
+      },
+      {
+        id: 'movement-value-partial',
+        type: 'SALE_DISPATCH',
+        productId: 'product-2',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: 2,
+        unitCostBase: 5,
+        totalValueBase: null,
+        product: {
+          id: 'product-2',
+          sku: 'VALUE-PARTIAL',
+          type: 'SIMPLE',
+        },
+      },
+      {
+        id: 'movement-value-clean',
+        type: 'SALE_DISPATCH',
+        productId: 'product-3',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: 2,
+        unitCostBase: 5,
+        totalValueBase: 10,
+        product: {
+          id: 'product-3',
+          sku: 'VALUE-CLEAN',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    shippedShipmentLines: [],
+  })
+
+  assert.deepEqual(findings.map((finding) => finding.code).sort(), [
+    'stock_movement_value_mismatch',
+    'stock_movement_value_partial',
+  ])
+})
+
+test('stock movement value invariant compares against absolute movement quantity', () => {
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [],
+    stockMovements: [
+      {
+        id: 'movement-negative-valued',
+        type: 'ADJUSTMENT',
+        productId: 'product-1',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: -2,
+        unitCostBase: 5,
+        totalValueBase: 10,
+        product: {
+          id: 'product-1',
+          sku: 'NEGATIVE-VALUED',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    shippedShipmentLines: [],
+  })
+
+  assert.equal(
+    findings.some((finding) => finding.code === 'stock_movement_value_mismatch'),
+    false,
+  )
+})
+
+test('stock movement value invariant keeps boundary and symmetric partial contracts', () => {
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [],
+    stockMovements: [
+      {
+        id: 'movement-value-boundary',
+        type: 'SALE_DISPATCH',
+        productId: 'product-1',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: 2,
+        unitCostBase: 5,
+        totalValueBase: 10.01,
+        product: {
+          id: 'product-1',
+          sku: 'VALUE-BOUNDARY',
+          type: 'SIMPLE',
+        },
+      },
+      {
+        id: 'movement-value-small-relative',
+        type: 'SALE_DISPATCH',
+        productId: 'product-2',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: 0.01,
+        unitCostBase: 0.5,
+        totalValueBase: 0.005002,
+        product: {
+          id: 'product-2',
+          sku: 'VALUE-SMALL',
+          type: 'SIMPLE',
+        },
+      },
+      {
+        id: 'movement-value-total-only',
+        type: 'SALE_DISPATCH',
+        productId: 'product-3',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: 2,
+        unitCostBase: null,
+        totalValueBase: 10,
+        product: {
+          id: 'product-3',
+          sku: 'VALUE-TOTAL-ONLY',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    shippedShipmentLines: [],
+  })
+
+  assert.deepEqual(findings.map((finding) => finding.code).sort(), [
+    'stock_movement_value_mismatch',
+    'stock_movement_value_partial',
+  ])
 })
 
 test('negative transfer movements produce one finding per warehouse side', () => {
@@ -729,7 +885,11 @@ test('inventory row collection excludes fully refunded orders from shipped COGS 
   })
   assert.deepEqual(stockMovementArgs, {
     where: {
-      qty: { lt: 0 },
+      OR: [
+        { qty: { lt: 0 } },
+        { unitCostBase: { not: null } },
+        { totalValueBase: { not: null } },
+      ],
     },
     select: {
       id: true,
@@ -738,6 +898,8 @@ test('inventory row collection excludes fully refunded orders from shipped COGS 
       fromWarehouseId: true,
       toWarehouseId: true,
       qty: true,
+      unitCostBase: true,
+      totalValueBase: true,
       product: {
         select: {
           id: true,
@@ -762,6 +924,8 @@ test('inventory SQL collector keeps partially refunded orders eligible for shipp
 
   const sql = String((capturedQuery as { sql?: string }).sql ?? '')
   assert.match(sql, /so\.status <> 'REFUNDED'/)
+  assert.match(sql, /ABS\(sm\.qty\) \* sm\."unitCostBase"/)
+  assert.match(sql, /relativeTolerance/)
   assert.doesNotMatch(sql, /PARTIALLY_REFUNDED/)
 })
 
@@ -872,6 +1036,38 @@ test('SQL inventory collector output matches evaluator output for seeded finding
       type: 'SIMPLE',
     },
   })
+  rows.stockMovements.push(
+    {
+      id: 'movement-value-mismatch',
+      type: 'SALE_DISPATCH',
+      productId: 'product-value-mismatch',
+      fromWarehouseId: 'warehouse-1',
+      toWarehouseId: null,
+      qty: 2,
+      unitCostBase: 5,
+      totalValueBase: 11,
+      product: {
+        id: 'product-value-mismatch',
+        sku: 'VALUE-MISMATCH',
+        type: 'SIMPLE',
+      },
+    },
+    {
+      id: 'movement-value-partial',
+      type: 'SALE_DISPATCH',
+      productId: 'product-value-partial',
+      fromWarehouseId: 'warehouse-1',
+      toWarehouseId: null,
+      qty: 2,
+      unitCostBase: 5,
+      totalValueBase: null,
+      product: {
+        id: 'product-value-partial',
+        sku: 'VALUE-PARTIAL',
+        type: 'SIMPLE',
+      },
+    },
+  )
   rows.shippedShipmentLines.push({
     id: 'shipment-line-missing',
     shipmentId: 'shipment-2',
