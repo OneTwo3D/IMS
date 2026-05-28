@@ -58,6 +58,10 @@ export const apiRouteAuthPolicy = {
     access: 'admin',
     reason: 'Detailed operational diagnostics are restricted through requireApiAdmin.',
   },
+  '/api/admin/rollout-readiness': {
+    access: 'admin',
+    reason: 'Production rollout readiness diagnostics are restricted through requireApiAdmin, scrub secret-like values, and use 412 for deploy precondition failures; do not use this as a load-balancer health check.',
+  },
   '/api/admin/outbox': {
     access: 'admin',
     reason: 'Integration outbox inspection is restricted through requireApiAdmin and redacts connector payload secrets.',
