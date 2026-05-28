@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
-import { requireApiAuth } from '@/lib/auth/server'
+import { requireApiAuth, type AuthSession } from '@/lib/auth/server'
+import type { Prisma } from '@/app/generated/prisma/client'
 import { hasPermission } from '@/lib/permissions'
 import { db } from '@/lib/db'
 import {
@@ -13,71 +14,149 @@ import {
 } from '@/lib/pdf'
 import { formatCountryDisplay } from '@/lib/countries'
 
+type RfqSession = AuthSession | NextResponse
+type RfqQuantity = Prisma.Decimal | number | string
+type RfqPurchaseOrder = {
+  reference: string
+  currency: string
+  notes: string | null
+  expectedDelivery: Date | null
+  createdAt: Date
+  supplier: {
+    name: string
+    contactName: string | null
+    email: string | null
+    addressLine1: string | null
+    addressLine2: string | null
+    city: string | null
+    postcode: string | null
+    country: string | null
+  }
+  lines: Array<{
+    qty: RfqQuantity
+    purchaseUnitQty: RfqQuantity | null
+    purchaseUnit: { abbreviation: string; stockUnitName: string } | null
+    product: { sku: string; name: string; barcode: string | null }
+  }>
+}
+type RfqDocumentTemplate = {
+  headerNote: string | null
+  footerNote: string | null
+  termsText: string | null
+  customFooter: string | null
+}
+type RfqRouteDependencies = {
+  authorize: () => Promise<RfqSession>
+  hasPermission: typeof hasPermission
+  findSupplierOwnedPurchaseOrder: (id: string, supplierId: string) => Promise<{ id: string } | null>
+  findPurchaseOrder: (id: string) => Promise<RfqPurchaseOrder | null>
+  findDocumentTemplate: () => Promise<RfqDocumentTemplate | null>
+  renderPdf: (po: RfqPurchaseOrder, tpl: RfqDocumentTemplate | null) => Promise<Response>
+}
+
+const defaultRfqRouteDependencies: RfqRouteDependencies = {
+  authorize: requireApiAuth,
+  hasPermission,
+  findSupplierOwnedPurchaseOrder(id, supplierId) {
+    return db.purchaseOrder.findFirst({
+      where: { id, supplierId },
+      select: { id: true },
+    })
+  },
+  findPurchaseOrder(id) {
+    return db.purchaseOrder.findUnique({
+      where: { id },
+      select: {
+        reference: true,
+        currency: true,
+        notes: true,
+        expectedDelivery: true,
+        createdAt: true,
+        supplier: {
+          select: {
+            name: true,
+            contactName: true,
+            email: true,
+            addressLine1: true,
+            addressLine2: true,
+            city: true,
+            postcode: true,
+            country: true,
+          },
+        },
+        lines: {
+          select: {
+            qty: true,
+            purchaseUnitQty: true,
+            purchaseUnit: { select: { abbreviation: true, stockUnitName: true } },
+            product: { select: { sku: true, name: true, barcode: true } },
+          },
+          orderBy: { sortOrder: 'asc' },
+        },
+      },
+    })
+  },
+  findDocumentTemplate() {
+    return db.documentTemplate.findUnique({
+      where: { type: 'rfq' },
+      select: { headerNote: true, footerNote: true, termsText: true, customFooter: true },
+    })
+  },
+  renderPdf: renderRfqPdf,
+}
+
 export async function GET(
   _req: Request,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const session = await requireApiAuth()
+  return handleRfqGetRequest({ params })
+}
+
+/** @internal Route adapter seam for tests that need to exercise promised params. */
+export async function handleRfqGetRequest(
+  { params }: { params: Promise<{ id: string }> },
+  overrides: Partial<RfqRouteDependencies> = {},
+) {
+  return handleRfqGet(await params, overrides)
+}
+
+/** @internal Exported for tests; production callers should use the route GET handler. */
+export async function handleRfqGet(
+  params: { id: string },
+  overrides: Partial<RfqRouteDependencies> = {},
+) {
+  const dependencies = { ...defaultRfqRouteDependencies, ...overrides }
+  const session = await dependencies.authorize()
   if (session instanceof NextResponse) return session
 
   const isSupplier = session.user.role === 'SUPPLIER'
-  if (!isSupplier && !hasPermission(session.user.role, 'purchasing')) {
+  if (!isSupplier && !dependencies.hasPermission(session.user.role, 'purchasing')) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
-  const { id } = await params
+  const { id } = params
 
-  // Suppliers may only access RFQs owned by their own supplier record.
+  // Suppliers get 403 before the broad PO lookup to avoid ID existence leaks.
+  // Purchasers/admins can distinguish 404 because they have purchasing access.
   if (isSupplier) {
     if (!session.user.supplierId) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-    const owned = await db.purchaseOrder.findFirst({
-      where: { id, supplierId: session.user.supplierId },
-      select: { id: true },
-    })
+    const owned = await dependencies.findSupplierOwnedPurchaseOrder(id, session.user.supplierId)
     if (!owned) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
 
-  const po = await db.purchaseOrder.findUnique({
-    where: { id },
-    select: {
-      reference: true,
-      currency: true,
-      notes: true,
-      expectedDelivery: true,
-      createdAt: true,
-      supplier: {
-        select: {
-          name: true,
-          contactName: true,
-          email: true,
-          addressLine1: true,
-          addressLine2: true,
-          city: true,
-          postcode: true,
-          country: true,
-        },
-      },
-      lines: {
-        select: {
-          qty: true,
-          purchaseUnitQty: true,
-          purchaseUnit: { select: { abbreviation: true, stockUnitName: true } },
-          product: { select: { sku: true, name: true, barcode: true } },
-        },
-        orderBy: { sortOrder: 'asc' },
-      },
-    },
-  })
+  const po = await dependencies.findPurchaseOrder(id)
 
   if (!po) {
     return NextResponse.json({ error: 'Not found' }, { status: 404 })
   }
+  const tpl = await dependencies.findDocumentTemplate()
+  return dependencies.renderPdf(po, tpl)
+}
 
+async function renderRfqPdf(po: RfqPurchaseOrder, tpl: RfqDocumentTemplate | null) {
+  // Branding is intentionally outside the route DI surface; auth tests stub the
+  // whole renderPdf dependency. Thread getBranding through only for branding-specific tests.
   const branding = await getBranding()
-  const tpl = await db.documentTemplate.findUnique({
-    where: { type: 'rfq' },
-    select: { headerNote: true, footerNote: true, termsText: true, customFooter: true },
-  })
 
   const supplierAddress = [
     po.supplier.addressLine1,

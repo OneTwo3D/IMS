@@ -36,6 +36,28 @@ test('public and internal routes document why they can be reached without a norm
   }
 })
 
+test('public-webhook policy entries are tracked for executable behavior coverage', () => {
+  const routesWithBehaviorFixtures = new Set([
+    '/api/auth/[...nextauth]',
+    '/api/health',
+    '/api/invoices/[id]',
+    '/api/uploads/branding/[filename]',
+    '/api/webhooks/mintsoft/asn-booked-in',
+    '/api/webhooks/shopping/[connector]/[resource]',
+  ])
+
+  const publicWebhookRoutes = Object.entries(apiRouteAuthPolicy)
+    .filter((entry) => entry[1].access === 'public-webhook')
+    .map(([route]) => route)
+    .sort()
+
+  assert.deepEqual(
+    publicWebhookRoutes,
+    [...routesWithBehaviorFixtures].sort(),
+    'public-webhook routes need an executable behavior fixture or an explicit entry in this coverage contract',
+  )
+})
+
 test('cron-secret routes call verifyCron before doing cron work', async () => {
   const files = await discoverApiRouteFiles()
   const fileByRoute = new Map(files.map((file) => [apiRoutePathFromFile(file), file]))
