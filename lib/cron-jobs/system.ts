@@ -43,6 +43,16 @@ registerCronJobs([
     defaultEnabled: true,
   },
   {
+    slug: 'inventory-snapshot',
+    settingKey: 'inventory_snapshot',
+    module: 'system',
+    moduleLabel: 'System',
+    label: 'Inventory Snapshot',
+    description: 'Writes daily product/warehouse on-hand quantity and value snapshots for inventory analytics.',
+    defaultSchedule: '0 5 * * *',
+    defaultEnabled: false,
+  },
+  {
     slug: 'delivery-status',
     settingKey: 'delivery_status',
     module: 'system',

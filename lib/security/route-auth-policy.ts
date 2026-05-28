@@ -130,6 +130,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
   },
+  '/api/cron/inventory-snapshot': {
+    access: 'cron-secret',
+    reason: 'Writes daily inventory snapshots; guarded by verifyCron and reports stock-level/FIFO drift.',
+  },
   '/api/cron/mintsoft-bundle-verify': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
