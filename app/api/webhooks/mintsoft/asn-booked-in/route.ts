@@ -37,6 +37,7 @@ export type MintsoftBookedInWebhookRouteDependencies = {
   isUniqueConstraintError: (error: unknown) => boolean
   logActivity: typeof logActivity
   repository: MintsoftWebhookEventRepository
+  now?: () => Date
 }
 
 class RequestBodyTooLargeError extends Error {
@@ -104,6 +105,7 @@ const defaultMintsoftBookedInWebhookDependencies: MintsoftBookedInWebhookRouteDe
   },
   logActivity,
   repository: createMintsoftWebhookEventRepository(),
+  now: () => new Date(),
 }
 
 export async function handleMintsoftBookedInWebhook(
@@ -152,7 +154,7 @@ export async function handleMintsoftBookedInWebhook(
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
 
-  if (!isMintsoftWebhookTimestampFresh(webhookTimestamp.date)) {
+  if (!isMintsoftWebhookTimestampFresh(webhookTimestamp.date, dependencies.now?.() ?? new Date())) {
     await dependencies.logActivity({
       entityType: 'SYNC',
       tag: 'sync',
