@@ -38,6 +38,11 @@ import {
   subtractMoney,
   toDecimal,
 } from '@/lib/domain/math/decimal'
+import {
+  buildStockMovementValueFields,
+  buildStockMovementValueFieldsFromConsumed,
+  buildStockMovementValueFieldsFromTotal,
+} from '@/lib/domain/inventory/stock-movement-value'
 import { COMPONENT_PRODUCT_STATUSES, OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { Prisma, type ProductionOrderStatus, type ProductionOrderType } from '@/app/generated/prisma/client'
 
@@ -602,6 +607,7 @@ export async function updateManufacturingOrderStatus(
                 productId: comp.componentId,
                 fromWarehouseId: order.warehouseId,
                 qty: totalQty,
+                ...buildStockMovementValueFieldsFromConsumed(consumed.consumed),
                 note: `${order.reference}: consumed for ${order.outputProduct.sku}`,
                 referenceType: 'ProductionOrder',
                 referenceId: id,
@@ -636,6 +642,10 @@ export async function updateManufacturingOrderStatus(
               productId: order.outputProductId,
               toWarehouseId: order.warehouseId,
               qty: qtyPlanned,
+              ...buildStockMovementValueFieldsFromTotal({
+                qty: qtyPlanned,
+                totalValueBase: outputTotalCostBase,
+              }),
               note: `${order.reference}: assembled ${qtyPlanned} units`,
               referenceType: 'ProductionOrder',
               referenceId: id,
@@ -693,6 +703,7 @@ export async function updateManufacturingOrderStatus(
               productId: order.outputProductId,
               fromWarehouseId: order.warehouseId,
               qty: qtyPlanned,
+              ...buildStockMovementValueFieldsFromConsumed(recoveredCost.consumed),
               note: `${order.reference}: disassembled ${qtyPlanned} units`,
               referenceType: 'ProductionOrder',
               referenceId: id,
@@ -709,6 +720,11 @@ export async function updateManufacturingOrderStatus(
             const recoveredUnitCost = totalQty.gt(0)
               ? allocatedCost.div(totalQty).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
               : new Prisma.Decimal(0)
+            // Recovery cost is a hard inventory valuation input; fail loudly
+            // rather than writing a non-finite cost marker into cost layers.
+            if (!recoveredUnitCost.isFinite()) {
+              throw new Error(`Recovered unit cost is not finite for component ${comp.componentId}`)
+            }
             const totalQtyNumber = manufacturingQtyBoundaryNumber(totalQty)
 
             await tx.stockLevel.upsert({
@@ -740,6 +756,7 @@ export async function updateManufacturingOrderStatus(
                 productId: comp.componentId,
                 toWarehouseId: order.warehouseId,
                 qty: totalQtyNumber,
+                ...buildStockMovementValueFields({ qty: totalQtyNumber, unitCostBase: recoveredUnitCost }),
                 note: `${order.reference}: recovered from disassembly of ${order.outputProduct.sku}`,
                 referenceType: 'ProductionOrder',
                 referenceId: id,

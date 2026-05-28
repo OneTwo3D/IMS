@@ -40,6 +40,11 @@ export type InventoryInvariantSqlCollectorOptions = {
   warehouseId?: string
   severity?: InventoryInvariantSeverity
   quantityTolerance?: number
+  /**
+   * Optional stock-movement branch window for scheduled checks. Admin/on-demand
+   * reports leave this unset to inspect all historical movement rows.
+   */
+  stockMovementLookbackDays?: number | null
 }
 
 export type InventoryInvariantFindingPage = {
@@ -89,6 +94,8 @@ export type InventoryInvariantStockMovementRow = {
   fromWarehouseId: string | null
   toWarehouseId: string | null
   qty: DecimalLike
+  unitCostBase?: DecimalLike | null
+  totalValueBase?: DecimalLike | null
   product: Pick<ProductSnapshot, 'id' | 'sku' | 'type'>
 }
 
@@ -147,6 +154,9 @@ type InventoryInvariantSqlFindingRow = {
 }
 
 const DEFAULT_QUANTITY_TOLERANCE = 0.0001
+const STOCK_MOVEMENT_VALUE_TOLERANCE = 0.01
+const STOCK_MOVEMENT_VALUE_SMALL_TOLERANCE = 0.000001
+const STOCK_MOVEMENT_VALUE_RELATIVE_TOLERANCE = 0.0001
 const DEFAULT_SQL_COLLECTOR_PAGE_SIZE = 500
 const MAX_SQL_COLLECTOR_PAGE_SIZE = 1000
 const DEFAULT_SQL_REPORT_MAX_FINDINGS = 5000
@@ -171,6 +181,39 @@ function isStrictlyNegative(value: number): boolean {
 
 function greaterThanWithTolerance(left: number, right: number, tolerance: number): boolean {
   return left - right > tolerance
+}
+
+function stockMovementValueDelta(params: {
+  qty: number
+  unitCostBase: number
+  totalValueBase: number
+}): {
+  expectedTotalValueBase: number
+  delta: number
+  absoluteTolerance: number
+  relativeDelta: number | null
+  isMismatch: boolean
+} {
+  const expectedTotalValueBase = Math.abs(params.qty) * params.unitCostBase
+  const delta = params.totalValueBase - expectedTotalValueBase
+  const absoluteDelta = Math.abs(delta)
+  const expectedMagnitude = Math.abs(expectedTotalValueBase)
+  const absoluteTolerance = expectedMagnitude < 1
+    ? STOCK_MOVEMENT_VALUE_SMALL_TOLERANCE
+    : STOCK_MOVEMENT_VALUE_TOLERANCE
+  const relativeDelta = expectedMagnitude > 0
+    ? absoluteDelta / expectedMagnitude
+    : absoluteDelta === 0
+      ? 0
+      : null
+
+  return {
+    expectedTotalValueBase,
+    delta,
+    absoluteTolerance,
+    relativeDelta,
+    isMismatch: absoluteDelta > absoluteTolerance && (relativeDelta == null || relativeDelta > STOCK_MOVEMENT_VALUE_RELATIVE_TOLERANCE),
+  }
 }
 
 function quantityKey(productId: string, warehouseId: string): string {
@@ -431,35 +474,82 @@ export function evaluateInventoryInvariantRows(
 
   for (const stockMovement of rows.stockMovements) {
     const qty = decimalToNumber(stockMovement.qty)
-    if (!isStrictlyNegative(qty)) continue
+    const unitCostBase = stockMovement.unitCostBase == null ? null : decimalToNumber(stockMovement.unitCostBase)
+    const totalValueBase = stockMovement.totalValueBase == null ? null : decimalToNumber(stockMovement.totalValueBase)
 
-    const warehouseFindings = [
-      stockMovement.fromWarehouseId
-        ? { warehouseId: stockMovement.fromWarehouseId, warehouseRole: 'from' }
-        : stockMovement.toWarehouseId
-          ? { warehouseId: stockMovement.toWarehouseId, warehouseRole: 'to' }
-          : { warehouseId: undefined, warehouseRole: 'unknown' },
-      ...(stockMovement.fromWarehouseId && stockMovement.toWarehouseId && stockMovement.toWarehouseId !== stockMovement.fromWarehouseId
-        ? [{ warehouseId: stockMovement.toWarehouseId, warehouseRole: 'to' }]
-        : []),
-    ]
+    if (isStrictlyNegative(qty)) {
+      const warehouseFindings = [
+        stockMovement.fromWarehouseId
+          ? { warehouseId: stockMovement.fromWarehouseId, warehouseRole: 'from' }
+          : stockMovement.toWarehouseId
+            ? { warehouseId: stockMovement.toWarehouseId, warehouseRole: 'to' }
+            : { warehouseId: undefined, warehouseRole: 'unknown' },
+        ...(stockMovement.fromWarehouseId && stockMovement.toWarehouseId && stockMovement.toWarehouseId !== stockMovement.fromWarehouseId
+          ? [{ warehouseId: stockMovement.toWarehouseId, warehouseRole: 'to' }]
+          : []),
+      ]
 
-    for (const warehouseFinding of warehouseFindings) findings.push({
-      severity: 'critical',
-      code: 'stock_movement_negative_quantity',
-      productId: stockMovement.productId,
-      warehouseId: warehouseFinding.warehouseId,
-      message: `Stock movement quantity is negative for ${stockMovement.product.sku}`,
-      details: {
-        movementId: stockMovement.id,
-        movementType: stockMovement.type,
-        warehouseRole: warehouseFinding.warehouseRole,
-        sku: stockMovement.product.sku,
-        qty,
-        fromWarehouseId: stockMovement.fromWarehouseId,
-        toWarehouseId: stockMovement.toWarehouseId,
-      },
-    })
+      for (const warehouseFinding of warehouseFindings) findings.push({
+        severity: 'critical',
+        code: 'stock_movement_negative_quantity',
+        productId: stockMovement.productId,
+        warehouseId: warehouseFinding.warehouseId,
+        message: `Stock movement quantity is negative for ${stockMovement.product.sku}`,
+        details: {
+          movementId: stockMovement.id,
+          movementType: stockMovement.type,
+          warehouseRole: warehouseFinding.warehouseRole,
+          sku: stockMovement.product.sku,
+          qty,
+          fromWarehouseId: stockMovement.fromWarehouseId,
+          toWarehouseId: stockMovement.toWarehouseId,
+        },
+      })
+    }
+
+    if (unitCostBase != null && totalValueBase != null) {
+      const valueDelta = stockMovementValueDelta({ qty, unitCostBase, totalValueBase })
+      if (valueDelta.isMismatch) {
+        findings.push({
+          severity: 'warning',
+          code: 'stock_movement_value_mismatch',
+          productId: stockMovement.productId,
+          warehouseId: stockMovement.fromWarehouseId ?? stockMovement.toWarehouseId ?? undefined,
+          message: `Stock movement value does not match quantity times unit cost for ${stockMovement.product.sku}`,
+          details: {
+            movementId: stockMovement.id,
+            movementType: stockMovement.type,
+            sku: stockMovement.product.sku,
+            qty,
+            unitCostBase,
+            totalValueBase,
+            expectedTotalValueBase: valueDelta.expectedTotalValueBase,
+            delta: Math.round(valueDelta.delta * 1000000) / 1000000,
+            absoluteTolerance: valueDelta.absoluteTolerance,
+            relativeDelta: valueDelta.relativeDelta == null
+              ? null
+              : Math.round(valueDelta.relativeDelta * 1000000) / 1000000,
+            relativeTolerance: STOCK_MOVEMENT_VALUE_RELATIVE_TOLERANCE,
+          },
+        })
+      }
+    } else if (unitCostBase != null || totalValueBase != null) {
+      findings.push({
+        severity: 'warning',
+        code: 'stock_movement_value_partial',
+        productId: stockMovement.productId,
+        warehouseId: stockMovement.fromWarehouseId ?? stockMovement.toWarehouseId ?? undefined,
+        message: `Stock movement has only one reporting value field populated for ${stockMovement.product.sku}`,
+        details: {
+          movementId: stockMovement.id,
+          movementType: stockMovement.type,
+          sku: stockMovement.product.sku,
+          qty,
+          unitCostBase,
+          totalValueBase,
+        },
+      })
+    }
   }
 
   for (const shipmentLine of rows.shippedShipmentLines) {
@@ -527,7 +617,11 @@ export async function collectInventoryInvariantRows(
     }),
     client.stockMovement.findMany({
       where: {
-        qty: { lt: 0 },
+        OR: [
+          { qty: { lt: 0 } },
+          { unitCostBase: { not: null } },
+          { totalValueBase: { not: null } },
+        ],
       },
       select: {
         id: true,
@@ -536,6 +630,8 @@ export async function collectInventoryInvariantRows(
         fromWarehouseId: true,
         toWarehouseId: true,
         qty: true,
+        unitCostBase: true,
+        totalValueBase: true,
         product: {
           select: {
             id: true,
@@ -632,6 +728,13 @@ function sqlPageOffset(page: number | undefined, cursor: string | null | undefin
   return offset > 0 ? Prisma.sql`OFFSET ${offset}` : Prisma.empty
 }
 
+function sqlOptionalStockMovementLookbackFilter(days: number | null | undefined): Prisma.Sql {
+  if (days == null) return Prisma.empty
+  if (!Number.isFinite(days)) return Prisma.empty
+  const normalizedDays = Math.max(1, Math.floor(days))
+  return Prisma.sql`AND sm."createdAt" >= NOW() - (${normalizedDays}::int * INTERVAL '1 day')`
+}
+
 function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvariantSqlCollectorOptions, 'quantityTolerance'>> & InventoryInvariantSqlCollectorOptions): Prisma.Sql {
   const limit = normalizeSqlQueryLimit(options.limit)
   const tolerance = options.quantityTolerance
@@ -644,6 +747,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
   const movementProductFilter = sqlOptionalProductFilter('sm', options.productId)
   const movementPrimaryWarehouseFilter = sqlOptionalMovementWarehouseFilter('primary', options.warehouseId)
   const movementToWarehouseFilter = sqlOptionalMovementWarehouseFilter('to', options.warehouseId)
+  const stockMovementLookbackFilter = sqlOptionalStockMovementLookbackFilter(options.stockMovementLookbackDays)
   const shipmentProductFilter = sqlOptionalProductFilter('sl', options.productId)
   const shipmentWarehouseFilter = sqlOptionalWarehouseFilter('s', options.warehouseId)
   const severityFilter = sqlSeverityFilter(options.severity)
@@ -877,6 +981,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       WHERE sm.qty < 0
         ${movementProductFilter}
         ${movementPrimaryWarehouseFilter}
+        ${stockMovementLookbackFilter}
 
       UNION ALL
 
@@ -904,6 +1009,78 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         AND sm."toWarehouseId" <> sm."fromWarehouseId"
         ${movementProductFilter}
         ${movementToWarehouseFilter}
+        ${stockMovementLookbackFilter}
+
+      UNION ALL
+
+      SELECT
+        'stock_movement_value_mismatch:' || sm.id AS "sortKey",
+        'warning'::text AS severity,
+        'stock_movement_value_mismatch'::text AS code,
+        sm."productId",
+        COALESCE(sm."fromWarehouseId", sm."toWarehouseId") AS "warehouseId",
+        'Stock movement value does not match quantity times unit cost for ' || p.sku AS message,
+        jsonb_build_object(
+          'movementId', sm.id,
+          'movementType', sm.type,
+          'sku', p.sku,
+          'qty', sm.qty,
+          'unitCostBase', sm."unitCostBase",
+          'totalValueBase', sm."totalValueBase",
+          'expectedTotalValueBase', ABS(sm.qty) * sm."unitCostBase",
+          'delta', ROUND(sm."totalValueBase" - (ABS(sm.qty) * sm."unitCostBase"), 6),
+          'absoluteTolerance', CASE
+            WHEN ABS(ABS(sm.qty) * sm."unitCostBase") < 1 THEN ${STOCK_MOVEMENT_VALUE_SMALL_TOLERANCE}
+            ELSE ${STOCK_MOVEMENT_VALUE_TOLERANCE}
+          END,
+          'relativeDelta', CASE
+            WHEN ABS(ABS(sm.qty) * sm."unitCostBase") > 0
+              THEN ROUND((ABS(sm."totalValueBase" - (ABS(sm.qty) * sm."unitCostBase")) / ABS(ABS(sm.qty) * sm."unitCostBase"))::numeric, 6)
+            WHEN ABS(sm."totalValueBase" - (ABS(sm.qty) * sm."unitCostBase")) = 0 THEN 0
+            ELSE NULL
+          END,
+          'relativeTolerance', ${STOCK_MOVEMENT_VALUE_RELATIVE_TOLERANCE}
+        ) AS details
+      FROM "stock_movements" sm
+      INNER JOIN "products" p ON p.id = sm."productId"
+      WHERE sm."unitCostBase" IS NOT NULL
+        AND sm."totalValueBase" IS NOT NULL
+        AND ABS(sm."totalValueBase" - (ABS(sm.qty) * sm."unitCostBase")) > CASE
+          WHEN ABS(ABS(sm.qty) * sm."unitCostBase") < 1 THEN ${STOCK_MOVEMENT_VALUE_SMALL_TOLERANCE}
+          ELSE ${STOCK_MOVEMENT_VALUE_TOLERANCE}
+        END
+        AND CASE
+          WHEN ABS(ABS(sm.qty) * sm."unitCostBase") = 0 THEN TRUE
+          ELSE ABS(sm."totalValueBase" - (ABS(sm.qty) * sm."unitCostBase")) / ABS(ABS(sm.qty) * sm."unitCostBase") > ${STOCK_MOVEMENT_VALUE_RELATIVE_TOLERANCE}
+        END
+        ${movementProductFilter}
+        ${movementPrimaryWarehouseFilter}
+        ${stockMovementLookbackFilter}
+
+      UNION ALL
+
+      SELECT
+        'stock_movement_value_partial:' || sm.id AS "sortKey",
+        'warning'::text AS severity,
+        'stock_movement_value_partial'::text AS code,
+        sm."productId",
+        COALESCE(sm."fromWarehouseId", sm."toWarehouseId") AS "warehouseId",
+        'Stock movement has only one reporting value field populated for ' || p.sku AS message,
+        jsonb_build_object(
+          'movementId', sm.id,
+          'movementType', sm.type,
+          'sku', p.sku,
+          'qty', sm.qty,
+          'unitCostBase', sm."unitCostBase",
+          'totalValueBase', sm."totalValueBase"
+        ) AS details
+      FROM "stock_movements" sm
+      INNER JOIN "products" p ON p.id = sm."productId"
+      WHERE ((sm."unitCostBase" IS NULL AND sm."totalValueBase" IS NOT NULL)
+        OR (sm."unitCostBase" IS NOT NULL AND sm."totalValueBase" IS NULL))
+        ${movementProductFilter}
+        ${movementPrimaryWarehouseFilter}
+        ${stockMovementLookbackFilter}
 
       UNION ALL
 
@@ -1053,6 +1230,7 @@ export async function runInventoryInvariantReport(options: {
   productId?: string
   warehouseId?: string
   severity?: InventoryInvariantSeverity
+  stockMovementLookbackDays?: number | null
 } = {}): Promise<InventoryInvariantReport> {
   const client = options.client ?? (db as unknown as InventoryInvariantClient)
   const collectionMode = options.collectionMode ?? (isSqlInventoryInvariantClient(client) ? 'sql' : 'rows')
@@ -1074,6 +1252,7 @@ export async function runInventoryInvariantReport(options: {
         productId: options.productId,
         warehouseId: options.warehouseId,
         severity: options.severity,
+        stockMovementLookbackDays: options.stockMovementLookbackDays,
         },
       )
       : {

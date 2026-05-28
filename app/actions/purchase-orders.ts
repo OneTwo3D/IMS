@@ -33,6 +33,10 @@ import {
 } from '@/lib/accounting-fx'
 import { Prisma, type TaxCategory } from '@/app/generated/prisma/client'
 import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import {
+  buildStockMovementValueFields,
+  buildStockMovementValueFieldsFromConsumed,
+} from '@/lib/domain/inventory/stock-movement-value'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -1792,6 +1796,7 @@ export async function receivePurchaseOrder(
             productId: poLine.productId,
             toWarehouseId: rl.warehouseId,
             qty: rl.qtyReceived,
+            ...buildStockMovementValueFields({ qty: rl.qtyReceived, unitCostBase }),
             note: `Received against ${currentPo.reference}`,
             referenceType: 'PurchaseOrder',
             referenceId: id,
@@ -2144,6 +2149,10 @@ export async function returnPurchaseOrder(
           },
         })
         const { consumed } = await consumeFifoLayersStrict(tx, poLine.productId, rl.warehouseId, rl.qtyReturned)
+        await tx.stockMovement.update({
+          where: { id: movement.id },
+          data: buildStockMovementValueFieldsFromConsumed(consumed),
+        })
         totalReturnedCostBase = consumed.reduce(
           (sum, entry) => addMoney(sum, multiplyMoney(entry.qty, entry.unitCostBase)),
           totalReturnedCostBase,

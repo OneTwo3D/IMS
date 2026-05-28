@@ -13,6 +13,10 @@ import {
   parseMintsoftThresholds,
 } from './stock-sync-helpers'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
+import {
+  buildStockMovementValueFields,
+  buildStockMovementValueFieldsFromTotal,
+} from '@/lib/domain/inventory/stock-movement-value'
 
 type SyncBinding = {
   id: string
@@ -708,12 +712,17 @@ async function applyMintsoftAlignmentForProduct(params: {
         if (!poLine) {
           throw new Error(`Purchase order line ${candidate.sourceLineId} is missing for alignment.`)
         }
+        const unitCostBase = Number(poLine.landedUnitCostBase ?? poLine.unitCostBase)
+        await tx.stockMovement.update({
+          where: { id: movement.id },
+          data: buildStockMovementValueFields({ qty: allocation.qty, unitCostBase }),
+        })
 
         await createCostLayer(tx, {
           productId: poLine.productId,
           warehouseId: params.binding.warehouseId,
           qty: allocation.qty,
-          unitCostBase: Number(poLine.landedUnitCostBase ?? poLine.unitCostBase),
+          unitCostBase,
           poLineId: poLine.id,
           adjustmentMovementId: movement.id,
         })
@@ -739,6 +748,13 @@ async function applyMintsoftAlignmentForProduct(params: {
         if (snapshotSlice.length === 0 && allocation.qty > 0) {
           throw new Error(`Transfer line ${candidate.sourceLineId} has no FIFO snapshot left for alignment.`)
         }
+        await tx.stockMovement.update({
+          where: { id: movement.id },
+          data: buildStockMovementValueFieldsFromTotal({
+            qty: allocation.qty,
+            totalValueBase: snapshotSlice.reduce((sum, entry) => sum + (entry.qty * entry.unitCostBase), 0),
+          }),
+        })
 
         for (const entry of snapshotSlice) {
           const newLayerId = await createCostLayer(tx, {

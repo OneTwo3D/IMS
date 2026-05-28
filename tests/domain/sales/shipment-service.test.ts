@@ -56,7 +56,14 @@ type State = {
   shipmentLines: ShipmentLine[]
   stockLevels: StockLevel[]
   costLayers: CostLayer[]
-  movements: Array<{ id: string; productId: string; qty: number; idempotencyKey?: string | null }>
+  movements: Array<{
+    id: string
+    productId: string
+    qty: number
+    idempotencyKey?: string | null
+    unitCostBase?: string | number | null
+    totalValueBase?: string | number | null
+  }>
   cogsEntries: Array<{ costLayerId: string; movementId: string; qty: number; unitCostBase: number; totalCostBase: number }>
   settings: Record<string, string>
 }
@@ -290,6 +297,18 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
         state.movements.push(movement)
         return { id: movement.id }
       },
+      update: async ({
+        where,
+        data,
+      }: {
+        where: { id: string }
+        data: { unitCostBase?: string | number | null; totalValueBase?: string | number | null }
+      }) => {
+        const movement = state.movements.find((row) => row.id === where.id)
+        if (!movement) throw new Error('Movement not found')
+        Object.assign(movement, data)
+        return movement
+      },
     },
     costLayer: {
       findMany: async ({ where }: { where: { productId?: string; warehouseId?: string; remainingQty?: { gt: number }; id?: { in: string[] } } }) => state.costLayers
@@ -390,6 +409,8 @@ test('transitionShipmentStatus ships stock and stores FIFO COGS snapshot', async
     totalCostBase: 10,
   }])
   assert.equal(state.movements[0].idempotencyKey, 'SALE_DISPATCH:shipmentLine:shipment-line-1')
+  assert.equal(state.movements[0].unitCostBase, '5.000000')
+  assert.equal(state.movements[0].totalValueBase, '10.000000')
   assert.equal(state.lines[0].cogsBase, 10)
 })
 

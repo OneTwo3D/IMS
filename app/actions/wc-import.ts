@@ -9,6 +9,10 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
+import {
+  HISTORICAL_IMPORT_UNIT_COST,
+  buildStockMovementValueFields,
+} from '@/lib/domain/inventory/stock-movement-value'
 
 export type HistoricalImportProgress = {
   status: 'idle' | 'running' | 'done' | 'error'
@@ -60,6 +64,7 @@ export async function importHistoricalSalesCsv(
           type: 'SALE_DISPATCH',
           productId,
           qty,
+          ...buildStockMovementValueFields({ qty, unitCostBase: HISTORICAL_IMPORT_UNIT_COST }),
           note: `Historical CSV import`,
           referenceType: 'CsvHistorical',
           referenceId: `csv-${i}`,

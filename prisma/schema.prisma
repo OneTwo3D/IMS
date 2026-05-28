@@ -760,6 +760,13 @@ model StockMovement {
   /// Deterministic key for irreversible stock-movement flows. Null for legacy/manual rows.
   /// Keys are built by lib/domain/inventory/stock-movement-idempotency.ts.
   idempotencyKey  String?           @unique
+  /// Reporting denormalization: unit cost in base currency at movement time.
+  /// Null means historical source cost provenance was unavailable during backfill.
+  /// Derivation: FIFO consumption for outbound, cost-layer or transfer snapshot for inbound, zero for historical demand imports.
+  unitCostBase    Decimal?          @db.Decimal(18, 6)
+  /// Reporting denormalization: total movement value in base currency.
+  /// Expected to match qty * unitCostBase within inventory invariant tolerance.
+  totalValueBase  Decimal?          @db.Decimal(18, 6)
   createdAt       DateTime          @default(now())
 
   product         Product           @relation(fields: [productId], references: [id])
@@ -770,8 +777,25 @@ model StockMovement {
   cogsEntries     CogsEntry[]
 
   @@index([productId])
+  @@index([createdAt])
+  @@index([productId, createdAt])
+  @@index([type, createdAt])
   @@index([referenceType, referenceId])
   @@map("stock_movements")
+}
+
+/// Per-migration stock movement value backfill audit. The id format is
+/// <migration_name>:<movementType>:<reason> so multiple data migrations can
+/// coexist; runAt updates on retry while firstRunAt preserves first occurrence.
+model StockMovementBackfillAudit {
+  id           String            @id
+  movementType StockMovementType
+  count        Int
+  reason       String
+  firstRunAt   DateTime          @default(now())
+  runAt        DateTime          @default(now())
+
+  @@map("stock_movement_backfill_audit")
 }
 
 // ---------------------------------------------------------------------------

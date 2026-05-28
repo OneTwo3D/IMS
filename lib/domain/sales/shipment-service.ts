@@ -15,6 +15,7 @@ import {
   isStockMovementIdempotencyConflict,
   saleDispatchMovementKey,
 } from '@/lib/domain/inventory/stock-movement-idempotency'
+import { buildStockMovementValueFieldsFromConsumed } from '@/lib/domain/inventory/stock-movement-value'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -353,6 +354,10 @@ export async function transitionShipmentStatus(
           tx, line.productId, lockedShipment.warehouseId, qty,
         )
         totalShipmentCogs = addMoney(totalShipmentCogs, totalCost)
+        await tx.stockMovement.update({
+          where: { id: movement.id },
+          data: buildStockMovementValueFieldsFromConsumed(consumed),
+        })
         if (consumed.length > 0) {
           await tx.cogsEntry.createMany({
             data: consumed.map((entry) => ({

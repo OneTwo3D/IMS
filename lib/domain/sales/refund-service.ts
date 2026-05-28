@@ -16,6 +16,7 @@ import {
   isStockMovementIdempotencyConflict,
   refundInboundMovementKey,
 } from '@/lib/domain/inventory/stock-movement-idempotency'
+import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
 
 export const REFUND_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 export const REFUND_ACCOUNTING_LOCK_KEY = 4_112_208_031
@@ -142,6 +143,14 @@ function aggregateRefundReturnRows(
     const aggregateKey = row.refundLineId ? `${row.productId}:${row.refundLineId}` : row.productId
     const existing = aggregated.get(aggregateKey)
     if (existing) {
+      if (Number.isFinite(existing.unitCostBase) && Number.isFinite(row.unitCostBase)) {
+        const combinedQty = existing.qty + row.qty
+        existing.unitCostBase = combinedQty > 0
+          ? (((existing.unitCostBase ?? 0) * existing.qty) + ((row.unitCostBase ?? 0) * row.qty)) / combinedQty
+          : existing.unitCostBase
+      } else if (existing.unitCostBase == null && row.unitCostBase != null) {
+        existing.unitCostBase = row.unitCostBase
+      }
       existing.qty += row.qty
       continue
     }
@@ -377,6 +386,7 @@ export async function applyReturnInboundStockTx(
           productId: row.productId,
           toWarehouseId: params.warehouseId,
           qty: row.qty,
+          ...buildStockMovementValueFields({ qty: row.qty, unitCostBase: row.unitCostBase ?? 0 }),
           note: params.note,
           referenceType: params.referenceType,
           referenceId: params.referenceId,

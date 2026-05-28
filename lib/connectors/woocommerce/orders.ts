@@ -2,6 +2,10 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { notify } from '@/lib/notifications'
 import { wcFetch } from './api'
+import {
+  HISTORICAL_IMPORT_UNIT_COST,
+  buildStockMovementValueFields,
+} from '@/lib/domain/inventory/stock-movement-value'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -180,6 +184,7 @@ async function runImport(dateFrom: string, dateTo: string, progress: HistoricalI
             type: 'SALE_DISPATCH',
             productId,
             qty: item.quantity,
+            ...buildStockMovementValueFields({ qty: item.quantity, unitCostBase: HISTORICAL_IMPORT_UNIT_COST }),
             note: `Historical WC import — Order #${order.number}`,
             referenceType: 'WcHistorical',
             referenceId: wcOrderRef,
