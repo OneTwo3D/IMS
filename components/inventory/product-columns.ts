@@ -1,5 +1,6 @@
 export type ColKey =
   | 'sku' | 'name' | 'type' | 'parentSku' | 'barcode'
+  | 'category'
   | 'dimensions' | 'weight' | 'salesPriceBase' | 'salePriceBase' | 'salesPriceTaxInclusive'
   | 'totalStock' | 'allocatedStock' | 'availableStock' | 'incomingStock'
   | 'inventoryValue' | 'variantCount'
@@ -9,6 +10,7 @@ export const ALL_COLUMNS: { key: ColKey; label: string; defaultVisible: boolean 
   { key: 'sku',                  label: 'SKU',                defaultVisible: true  },
   { key: 'name',                 label: 'Name',               defaultVisible: true  },
   { key: 'type',                 label: 'Type',               defaultVisible: true  },
+  { key: 'category',             label: 'Category',           defaultVisible: false },
   { key: 'parentSku',            label: 'Parent SKU',         defaultVisible: false },
   { key: 'barcode',              label: 'Barcode',            defaultVisible: false },
   { key: 'dimensions',           label: 'Dimensions (W×H×D)', defaultVisible: false },

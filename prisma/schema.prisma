@@ -528,6 +528,7 @@ model Product {
   description     String?
   type            ProductType @default(SIMPLE)
   lifecycleStatus ProductLifecycleStatus @default(ACTIVE)
+  categoryId      String?
   parentId        String?     // set for VARIANT products
   barcode         String?     @unique
   hsCode          String?
@@ -564,6 +565,7 @@ model Product {
   updatedAt       DateTime    @updatedAt
 
   // Relations
+  category        ProductCategory? @relation(fields: [categoryId], references: [id], onDelete: SetNull)
   parent          Product?    @relation("ProductVariants", fields: [parentId], references: [id])
   variants        Product[]   @relation("ProductVariants")
 
@@ -610,7 +612,28 @@ model Product {
   wmsReturnsInbox  WmsReturnsInbox[]     @relation("WmsReturnsInboxProduct")
 
   @@index([parentId])
+  @@index([categoryId])
   @@map("products")
+}
+
+/// Product reporting category assigned to products for inventory and CSV reporting.
+/// Categories are auto-created from product forms/imports and preserve the first
+/// display spelling while matching future writes by normalized name.
+model ProductCategory {
+  id             String            @id @default(cuid())
+  /// Operator-facing display name.
+  name           String            @db.VarChar(100)
+  /// Diacritic-insensitive normalized lookup key for case-insensitive matching.
+  nameNormalized String            @unique @map("name_normalized") @db.VarChar(100)
+  parentId       String?
+  parent         ProductCategory?  @relation("ProductCategoryTree", fields: [parentId], references: [id], onDelete: SetNull)
+  children       ProductCategory[] @relation("ProductCategoryTree")
+  products       Product[]
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+
+  @@index([parentId])
+  @@map("product_categories")
 }
 
 model ProductOption {

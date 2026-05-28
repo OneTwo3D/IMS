@@ -100,6 +100,8 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 
 **Stock reservation** — `StockLevel.reservedQty` tracks stock that is allocated but not yet dispatched. Transfers in `IN_TRANSIT` status reserve stock on the source warehouse.
 
+**Product reporting categories** — `ProductCategory` is a normalized hierarchy used to slice inventory, turnover, aging, stock-on-hand, and reorder reports. `Product.categoryId` is optional so existing products can remain uncategorized during rollout; CSV import/export and product create/edit use the category display name and create the category on first use. Names are capped at 100 characters, normalize case/diacritics/invisible characters for matching, and preserve the first display spelling for each normalized key.
+
 ### Quantity Constraint Monitoring
 
 The database and the invariant report intentionally overlap on core quantity integrity checks:
@@ -144,6 +146,7 @@ Transform rules:
 
 **Core Inventory:**
 - `Product` — all product types, with SKU, pricing, dimensions, weight, stock unit, images, HS code, country of origin
+- `ProductCategory` — optional product reporting hierarchy for inventory and sales/purchase report slices
 - `ProductOption` — variant options (e.g. Colour, Size) with comma-separated values
 - `ProductComponent` — component list for KIT and BOM products
 - `Warehouse` — locations (STANDARD, QUARANTINE, RESTOCK types)

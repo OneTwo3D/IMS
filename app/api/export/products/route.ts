@@ -10,7 +10,7 @@ const HEADERS = [
   'salesPriceBase', 'salePriceBase', 'salesPriceTaxInclusive',
   'stockUnit', 'oversellAllowed', 'imageUrl', 'active', 'lifecycleStatus',
   'components',
-  'totalStock', 'inventoryValue',
+  'totalStock', 'inventoryValue', 'category',
 ]
 
 const TEMPLATE_HEADERS = [
@@ -19,7 +19,7 @@ const TEMPLATE_HEADERS = [
   'weight', 'widthCm', 'heightCm', 'depthCm',
   'salesPriceBase', 'salePriceBase', 'salesPriceTaxInclusive',
   'stockUnit', 'oversellAllowed', 'imageUrl', 'active', 'lifecycleStatus',
-  'components',
+  'components', 'category',
 ]
 const REQUIRED_HEADERS = ['sku', 'name']
 
@@ -34,17 +34,18 @@ export async function GET(req: Request) {
   if (templateOnly) {
     // Add example rows for each type
     return csvResponse(buildTemplateCsv(TEMPLATE_HEADERS, REQUIRED_HEADERS, [
-      { sku: 'WIDGET-001', name: 'Widget', description: 'A simple widget', type: 'SIMPLE', barcode: '1234567890123', weight: '0.5', widthCm: '10', heightCm: '5', depthCm: '3', salesPriceBase: '9.99', salePriceBase: '7.99', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
-      { sku: 'TSHIRT', name: 'T-Shirt Parent', description: 'Variable product with sizes', type: 'VARIABLE', barcode: '', weight: '0.2', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '19.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
-      { sku: 'TSHIRT-S', name: 'T-Shirt Small', description: 'Size S variant', type: 'VARIANT', parentSku: 'TSHIRT', barcode: '', weight: '0.2', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '19.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
-      { sku: 'TSHIRT-M', name: 'T-Shirt Medium', description: 'Size M variant', type: 'VARIANT', parentSku: 'TSHIRT', barcode: '', weight: '0.2', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '19.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
-      { sku: 'BUNDLE-01', name: 'Starter Kit', description: 'A kit/bundle product', type: 'KIT', parentSku: '', barcode: '', weight: '', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '29.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: 'WIDGET-001:2;TSHIRT-S:1' },
-      { sku: 'BOM-01', name: 'Assembled Widget', description: 'A manufactured product', type: 'BOM', parentSku: '', barcode: '', weight: '', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '15.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: 'WIDGET-001:3' },
+      { sku: 'WIDGET-001', name: 'Widget', category: 'Components', description: 'A simple widget', type: 'SIMPLE', barcode: '1234567890123', weight: '0.5', widthCm: '10', heightCm: '5', depthCm: '3', salesPriceBase: '9.99', salePriceBase: '7.99', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
+      { sku: 'TSHIRT', name: 'T-Shirt Parent', category: 'Apparel', description: 'Variable product with sizes', type: 'VARIABLE', barcode: '', weight: '0.2', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '19.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
+      { sku: 'TSHIRT-S', name: 'T-Shirt Small', category: 'Apparel', description: 'Size S variant', type: 'VARIANT', parentSku: 'TSHIRT', barcode: '', weight: '0.2', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '19.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
+      { sku: 'TSHIRT-M', name: 'T-Shirt Medium', category: 'Apparel', description: 'Size M variant', type: 'VARIANT', parentSku: 'TSHIRT', barcode: '', weight: '0.2', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '19.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: '' },
+      { sku: 'BUNDLE-01', name: 'Starter Kit', category: 'Bundles', description: 'A kit/bundle product', type: 'KIT', parentSku: '', barcode: '', weight: '', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '29.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: 'WIDGET-001:2;TSHIRT-S:1' },
+      { sku: 'BOM-01', name: 'Assembled Widget', category: 'Manufactured', description: 'A manufactured product', type: 'BOM', parentSku: '', barcode: '', weight: '', widthCm: '', heightCm: '', depthCm: '', salesPriceBase: '15.99', salePriceBase: '', salesPriceTaxInclusive: 'TRUE', stockUnit: 'pcs', oversellAllowed: 'TRUE', imageUrl: '', active: 'TRUE', lifecycleStatus: 'ACTIVE', components: 'WIDGET-001:3' },
     ]), 'products-import-template.csv')
   }
 
   const products = await db.product.findMany({
     include: {
+      category: { select: { name: true } },
       parent: { select: { sku: true } },
       stockLevels: { select: { quantity: true } },
       costLayers: {
@@ -70,6 +71,7 @@ export async function GET(req: Request) {
       parentProductId: p.parentId ?? '',
       sku: p.sku,
       name: p.name,
+      category: p.category?.name ?? '',
       description: p.description ?? '',
       type: p.type,
       parentSku: p.parent?.sku ?? '',

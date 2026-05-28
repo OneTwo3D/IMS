@@ -185,7 +185,7 @@ test.describe('admin workflows', () => {
 
     const adminRow = page.getByRole('row').filter({ hasText: 'admin@example.com' }).first()
     await expect(adminRow).toBeVisible()
-    await adminRow.getByRole('button').click()
+    await adminRow.getByRole('button', { name: 'Edit admin@example.com' }).click()
 
     const editDialog = page.getByRole('dialog', { name: 'Edit User' })
     await expect(editDialog).toBeVisible()

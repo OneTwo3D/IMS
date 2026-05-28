@@ -153,6 +153,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
     if (searchParams.search) params.set('search', searchParams.search)
     if (searchParams.type) params.set('type', searchParams.type)
     if (searchParams.lifecycleStatus) params.set('lifecycleStatus', searchParams.lifecycleStatus)
+    if (searchParams.categoryId) params.set('categoryId', searchParams.categoryId)
     if (searchParams.sort) params.set('sort', searchParams.sort)
     if (searchParams.dir) params.set('dir', searchParams.dir)
     return params
@@ -169,6 +170,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
     if (searchParams.search) params.set('search', searchParams.search)
     if (searchParams.type) params.set('type', searchParams.type)
     if (searchParams.lifecycleStatus) params.set('lifecycleStatus', searchParams.lifecycleStatus)
+    if (searchParams.categoryId) params.set('categoryId', searchParams.categoryId)
     params.set('sort', field)
     params.set('dir', currentSort === field && currentDir === 'asc' ? 'desc' : 'asc')
     params.set('page', '1')
@@ -202,6 +204,8 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
         )
       case 'type':
         return <Badge variant={TYPE_COLOURS[p.type]}>{TYPE_LABELS[p.type]}</Badge>
+      case 'category':
+        return p.categoryName ?? '—'
       case 'parentSku':
         return p.parentSku ?? '—'
       case 'barcode':
