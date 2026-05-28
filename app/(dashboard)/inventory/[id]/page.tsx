@@ -2,7 +2,7 @@ import Link from 'next/link'
 import { notFound } from 'next/navigation'
 import { ChevronRight, Package, Layers, SlidersHorizontal } from 'lucide-react'
 import { db } from '@/lib/db'
-import { getProduct, getVariableProducts, updateProduct, getProductOptions, getProductSuppliers, getProductComponents, getKitStock } from '@/app/actions/products'
+import { getProduct, getVariableProducts, listProductCategories, updateProduct, getProductOptions, getProductSuppliers, getProductComponents, getKitStock } from '@/app/actions/products'
 import { getWarehouses, getActiveAdjustmentReasons } from '@/app/actions/stock'
 import { getStockUnitOptions } from '@/app/actions/settings'
 import { ProductForm } from '@/components/inventory/product-form'
@@ -54,12 +54,13 @@ export default async function ProductDetailPage({
   params: Promise<{ id: string }>
 }) {
   const { id } = await params
-  const [product, variableProducts, warehouses, reasons, stockUnitOptions] = await Promise.all([
+  const [product, variableProducts, warehouses, reasons, stockUnitOptions, productCategories] = await Promise.all([
     getProduct(id),
     getVariableProducts(),
     getWarehouses(),
     getActiveAdjustmentReasons(),
     getStockUnitOptions(),
+    listProductCategories(),
   ])
   const baseCurrency = await getBaseCurrencyDisplay()
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
@@ -111,6 +112,7 @@ export default async function ProductDetailPage({
             {STATUS_LABELS[product.lifecycleStatus]}
           </Badge>
           <Badge variant="secondary">{TYPE_LABELS[product.type]}</Badge>
+          {product.categoryName && <Badge variant="outline">{product.categoryName}</Badge>}
           {hasStoreLink && <ShoppingProductLinkButton sku={product.sku} />}
           {product.type !== 'VARIABLE' && product.type !== 'NON_INVENTORY' && (
             <StockFlowButton productId={id} />
@@ -136,6 +138,7 @@ export default async function ProductDetailPage({
               defaultValues={{
                 sku: product.sku,
                 name: product.name,
+                categoryName: product.categoryName,
                 description: product.description ?? undefined,
                 type: product.type,
                 parentId: product.parentId ?? undefined,
@@ -157,6 +160,7 @@ export default async function ProductDetailPage({
                 lifecycleStatus: product.lifecycleStatus,
               }}
               stockUnitOptions={stockUnitOptions}
+              productCategories={productCategories}
               inline
             />
           </Card>

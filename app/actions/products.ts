@@ -22,6 +22,13 @@ import {
   validateProductStructureChange,
 } from '@/lib/products/type-transforms'
 import { detectComponentCycle } from '@/lib/products/component-cycle'
+import {
+  cleanProductCategoryName,
+  listProductCategoryOptions,
+  PRODUCT_CATEGORY_NAME_MAX_LENGTH,
+  resolveProductCategoryIdByName,
+  type ProductCategoryOption,
+} from '@/lib/products/categories'
 import type { ProductLifecycleStatus, TaxCategory } from '@/app/generated/prisma/client'
 
 // ---------------------------------------------------------------------------
@@ -32,6 +39,8 @@ export type ProductRow = {
   id: string
   sku: string
   name: string
+  categoryId: string | null
+  categoryName: string | null
   type: ProductType
   parentSku: string | null
   barcode: string | null
@@ -105,6 +114,7 @@ export async function listProducts(params: {
   type?: ProductType | 'ALL'
   active?: 'true' | 'false' | 'all'
   lifecycleStatus?: ProductLifecycleStatus | 'ALL'
+  categoryId?: string
   page?: number
   pageSize?: number
   sort?: SortField
@@ -141,12 +151,14 @@ export async function listProducts(params: {
       : params.active === 'false'
       ? { lifecycleStatus: 'ARCHIVED' as const }
       : {}),
+    ...(params.categoryId ? { categoryId: params.categoryId } : {}),
   }
 
   const [rawProducts, total] = await Promise.all([
     db.product.findMany({
       where,
       include: {
+        category: { select: { id: true, name: true } },
         parent: { select: { sku: true, imageUrl: true } },
         variants: {
           select: {
@@ -234,6 +246,8 @@ export async function listProducts(params: {
     id: p.id,
     sku: p.sku,
     name: p.name,
+    categoryId: p.category?.id ?? null,
+    categoryName: p.category?.name ?? null,
     type: p.type,
     parentSku: p.parent?.sku ?? null,
     barcode: p.barcode,
@@ -285,9 +299,13 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     db.product.findUnique({
       where: { id },
       include: {
+        category: { select: { id: true, name: true } },
         parent: { select: { sku: true, imageUrl: true } },
         variants: {
-          include: { stockLevels: { select: { quantity: true, reservedQty: true } } },
+          include: {
+            category: { select: { id: true, name: true } },
+            stockLevels: { select: { quantity: true, reservedQty: true } },
+          },
           orderBy: { sku: 'asc' },
         },
         stockLevels: {
@@ -411,6 +429,8 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     id: p.id,
     sku: p.sku,
     name: p.name,
+    categoryId: p.category?.id ?? null,
+    categoryName: p.category?.name ?? null,
     description: p.description,
     type: p.type,
     parentId: p.parentId,
@@ -448,6 +468,8 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       id: v.id,
       sku: v.sku,
       name: v.name,
+      categoryId: v.category?.id ?? null,
+      categoryName: v.category?.name ?? null,
       type: v.type,
       parentSku: p.sku,
       barcode: v.barcode,
@@ -541,6 +563,13 @@ export async function getVariableProducts() {
   })
 }
 
+export async function listProductCategories(): Promise<ProductCategoryOption[]> {
+  // Internal inventory/admin surface only. Re-check ownership/portal semantics
+  // before reusing product reporting categories in supplier- or customer-facing UI.
+  await requireAuth()
+  return listProductCategoryOptions()
+}
+
 // ---------------------------------------------------------------------------
 // Mutations
 // ---------------------------------------------------------------------------
@@ -548,6 +577,7 @@ export async function getVariableProducts() {
 const productSchema = z.object({
   sku: z.string().min(1).max(100),
   name: z.string().min(1).max(255),
+  categoryName: z.string().max(PRODUCT_CATEGORY_NAME_MAX_LENGTH).optional().nullable(),
   description: z.string().optional(),
   type: z.nativeEnum(ProductType),
   parentId: z.string().optional().nullable(),
@@ -632,6 +662,7 @@ export async function createProduct(
   const raw = {
     sku: ((formData.get('sku') as string) || '').trim(),
     name: formData.get('name') as string,
+    categoryName: cleanProductCategoryName(formData.get('categoryName') as string | null),
     description: formData.get('description') as string || undefined,
     type: formData.get('type') as string,
     parentId: formData.get('parentId') as string || null,
@@ -681,30 +712,34 @@ export async function createProduct(
     return { errors: structureValidation.fieldErrors, message: structureValidation.message }
   }
 
-  const created = await db.product.create({
-    data: {
-      sku: data.sku,
-      name: data.name,
-      description: data.description || null,
-      type: data.type,
-      parentId: structureValidation.normalizedParentId,
-      barcode: data.barcode || null,
-      hsCode: data.hsCode || null,
-      countryOfOrigin: data.countryOfOrigin || null,
-      weight: data.weight ? data.weight : null,
-      salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
-      salePriceBase: data.salePriceBase ? data.salePriceBase : null,
-      salesPriceTaxInclusive: data.salesPriceTaxInclusive,
-      taxCategory: data.taxCategory,
-      stockUnit: data.stockUnit,
-      oversellAllowed: data.oversellAllowed,
-      imageUrl: data.imageUrl || null,
-      widthCm: data.widthCm || null,
-      heightCm: data.heightCm || null,
-      depthCm: data.depthCm || null,
-      active: deriveLegacyActiveFromLifecycleStatus(data.lifecycleStatus),
-      lifecycleStatus: data.lifecycleStatus,
-    },
+  const created = await db.$transaction(async (tx) => {
+    const categoryId = await resolveProductCategoryIdByName(data.categoryName, { client: tx })
+    return tx.product.create({
+      data: {
+        sku: data.sku,
+        name: data.name,
+        categoryId,
+        description: data.description || null,
+        type: data.type,
+        parentId: structureValidation.normalizedParentId,
+        barcode: data.barcode || null,
+        hsCode: data.hsCode || null,
+        countryOfOrigin: data.countryOfOrigin || null,
+        weight: data.weight ? data.weight : null,
+        salesPriceBase: data.salesPriceBase ? data.salesPriceBase : null,
+        salePriceBase: data.salePriceBase ? data.salePriceBase : null,
+        salesPriceTaxInclusive: data.salesPriceTaxInclusive,
+        taxCategory: data.taxCategory,
+        stockUnit: data.stockUnit,
+        oversellAllowed: data.oversellAllowed,
+        imageUrl: data.imageUrl || null,
+        widthCm: data.widthCm || null,
+        heightCm: data.heightCm || null,
+        depthCm: data.depthCm || null,
+        active: deriveLegacyActiveFromLifecycleStatus(data.lifecycleStatus),
+        lifecycleStatus: data.lifecycleStatus,
+      },
+    })
   })
 
   await logActivity({
@@ -714,7 +749,7 @@ export async function createProduct(
     tag: 'inventory',
     level: 'INFO',
     description: `Created product ${data.sku} — ${data.name}`,
-    metadata: { sku: data.sku, name: data.name, type: data.type },
+    metadata: { sku: data.sku, name: data.name, type: data.type, categoryName: data.categoryName ?? null },
   })
 
   try {
@@ -746,6 +781,7 @@ export async function updateProduct(
   const raw = {
     sku: ((formData.get('sku') as string) || '').trim(),
     name: formData.get('name') as string,
+    categoryName: cleanProductCategoryName(formData.get('categoryName') as string | null),
     description: formData.get('description') as string || undefined,
     type: formData.get('type') as string,
     parentId: formData.get('parentId') as string || null,
@@ -796,12 +832,20 @@ export async function updateProduct(
     return { errors: structureValidation.fieldErrors, message: structureValidation.message }
   }
 
-  await db.$transaction(async (tx) => {
+  const updatedCategoryChange = await db.$transaction(async (tx) => {
+    const previous = await tx.product.findUnique({
+      where: { id },
+      select: { category: { select: { name: true } } },
+    })
+    const previousCategoryName = previous?.category?.name ?? null
+    const categoryId = await resolveProductCategoryIdByName(data.categoryName, { client: tx })
+
     await tx.product.update({
       where: { id },
       data: {
         sku: data.sku,
         name: data.name,
+        categoryId,
         description: data.description || null,
         type: data.type,
         parentId: structureValidation.normalizedParentId,
@@ -828,6 +872,11 @@ export async function updateProduct(
     if (structureValidation.clearComponents) {
       await tx.productComponent.deleteMany({ where: { productId: id } })
     }
+
+    return {
+      from: previousCategoryName,
+      to: data.categoryName ?? null,
+    }
   })
 
   await logActivity({
@@ -837,7 +886,13 @@ export async function updateProduct(
     tag: 'inventory',
     level: 'INFO',
     description: `Updated product ${data.sku} — ${data.name}`,
-    metadata: { sku: data.sku, name: data.name, type: data.type },
+    metadata: {
+      sku: data.sku,
+      name: data.name,
+      type: data.type,
+      categoryName: data.categoryName ?? null,
+      categoryNameChange: updatedCategoryChange,
+    },
   })
 
   try {

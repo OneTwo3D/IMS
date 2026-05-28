@@ -1,5 +1,5 @@
 import type { Metadata } from 'next'
-import { listProducts, getVariableProducts } from '@/app/actions/products'
+import { listProductCategories, listProducts, getVariableProducts } from '@/app/actions/products'
 import type { SortField, SortDir } from '@/app/actions/products'
 import { getStockUnitOptions } from '@/app/actions/settings'
 import { ProductFilters } from './product-filters'
@@ -13,6 +13,7 @@ type SearchParams = {
   search?: string
   type?: string
   lifecycleStatus?: string
+  categoryId?: string
   page?: string
   sort?: string
   dir?: string
@@ -26,27 +27,31 @@ export default async function InventoryPage({
   const sp = await searchParams
   const page = parseInt(sp.page ?? '1')
 
-  const [result, variableProducts, stockUnitOptions] = await Promise.all([
+  const [result, variableProducts, stockUnitOptions, categories] = await Promise.all([
     listProducts({
       search: sp.search,
       type: sp.type as ProductType | 'ALL' | undefined,
       lifecycleStatus: sp.lifecycleStatus as ProductLifecycleStatus | 'ALL' | undefined,
+      categoryId: sp.categoryId,
       page,
       sort: (sp.sort as SortField) || undefined,
       dir: (sp.dir as SortDir) || undefined,
     }),
     getVariableProducts(),
     getStockUnitOptions(),
+    listProductCategories(),
   ])
 
   return (
     <div className="space-y-4">
-      <InventoryHeader total={result.total} variableProducts={variableProducts} stockUnitOptions={stockUnitOptions} />
+      <InventoryHeader total={result.total} variableProducts={variableProducts} stockUnitOptions={stockUnitOptions} productCategories={categories} />
 
       <ProductFilters
         search={sp.search}
         type={sp.type}
         lifecycleStatus={sp.lifecycleStatus ?? 'ALL'}
+        categoryId={sp.categoryId}
+        productCategories={categories}
       />
 
       <ProductTable
@@ -54,7 +59,7 @@ export default async function InventoryPage({
         total={result.total}
         page={result.page}
         pageSize={result.pageSize}
-        searchParams={{ search: sp.search, type: sp.type, lifecycleStatus: sp.lifecycleStatus, sort: sp.sort, dir: sp.dir }}
+        searchParams={{ search: sp.search, type: sp.type, lifecycleStatus: sp.lifecycleStatus, categoryId: sp.categoryId, sort: sp.sort, dir: sp.dir }}
       />
     </div>
   )

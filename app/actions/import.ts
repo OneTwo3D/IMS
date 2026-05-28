@@ -3,13 +3,19 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { parseCsv } from '@/lib/csv'
-import { ProductType } from '@/app/generated/prisma/client'
+import { ProductType, type Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync, pushProductMetadata } from '@/lib/shopping'
 import { deriveLegacyActiveFromLifecycleStatus, deriveLifecycleStatusFromLegacyActive } from '@/lib/products/lifecycle'
 import { validateProductStructureChange } from '@/lib/products/type-transforms'
 import { detectComponentCycle } from '@/lib/products/component-cycle'
+import {
+  cleanProductCategoryName,
+  normalizeProductCategoryName,
+  PRODUCT_CATEGORY_NAME_MAX_LENGTH,
+  resolveProductCategoryIdByName,
+} from '@/lib/products/categories'
 import type { Permission } from '@/lib/auth/server'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import {
@@ -213,7 +219,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
 
   // Build parent lookup: sku → id
   const allProducts = await db.product.findMany({
-    select: { id: true, sku: true, barcode: true, type: true, parentId: true, lifecycleStatus: true },
+    select: { id: true, sku: true, barcode: true, type: true, parentId: true, categoryId: true, lifecycleStatus: true },
   })
   const skuToId = new Map(allProducts.map((p) => [p.sku, p.id]))
   const productById = new Map(allProducts.map((p) => [p.id, p]))
@@ -229,6 +235,26 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
   // Track rows with components to process in second pass
   const componentRows: { lineNum: number; sku: string; components: string }[] = []
   const touchedProducts: Array<{ id: string; lifecycleStatus: 'ACTIVE' | 'NOT_FOR_SALE' | 'ARCHIVED' }> = []
+  const categoryIdCache = new Map<string, string>()
+  type ProductCategoryResolverClient = Pick<Prisma.TransactionClient, 'productCategory'> | Pick<typeof db, 'productCategory'>
+
+  async function resolveImportedCategoryId(
+    categoryName: string | null,
+    client?: ProductCategoryResolverClient,
+  ): Promise<string | null> {
+    if (!categoryName) return null
+    const key = normalizeProductCategoryName(categoryName)
+    const cached = categoryIdCache.get(key)
+    if (cached) return cached
+    const id = await resolveProductCategoryIdByName(categoryName, { client, dryRun: preview })
+    if (id && preview) categoryIdCache.set(key, id)
+    return id
+  }
+
+  function rememberImportedCategoryId(categoryName: string | null, categoryId: string | null) {
+    if (!categoryName || !categoryId) return
+    categoryIdCache.set(normalizeProductCategoryName(categoryName), categoryId)
+  }
 
   // Pass 1: Create/update non-VARIANT products first, then VARIANTs
   // Sort rows so parents come before children
@@ -287,6 +313,12 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
       : hasCsvValue(row, 'active')
         ? deriveLifecycleStatusFromLegacyActive((row['active'] ?? 'TRUE').trim().toUpperCase() !== 'FALSE')
         : existingProduct?.lifecycleStatus ?? deriveLifecycleStatusFromLegacyActive(true)
+    const categoryName = cleanProductCategoryName(readCsvValue(row, 'category', 'productCategory', 'productcategory'))
+    if (categoryName && categoryName.length > PRODUCT_CATEGORY_NAME_MAX_LENGTH) {
+      result.errors.push(`Row ${lineNum} (${sku}): category must be ${PRODUCT_CATEGORY_NAME_MAX_LENGTH} characters or fewer`)
+      result.skipped++
+      continue
+    }
 
       try {
         const barcode = hasCsvValue(row, 'barcode') ? row['barcode']!.trim() : undefined
@@ -345,12 +377,23 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           continue
         }
 
+        let effectiveCategoryId = existingProduct.categoryId
+        if (categoryName && preview) {
+          effectiveCategoryId = await resolveImportedCategoryId(categoryName)
+          updateData.categoryId = effectiveCategoryId
+        }
+
         if (!preview) {
+          let resolvedCategoryId: string | null = null
           await db.$transaction(async (tx) => {
+            if (categoryName) {
+              resolvedCategoryId = await resolveImportedCategoryId(categoryName, tx)
+            }
             await tx.product.update({
               where: { id: existingProduct.id },
               data: {
                 ...updateData,
+                ...(categoryName ? { categoryId: resolvedCategoryId } : {}),
                 ...(sku !== existingProduct.sku ? { sku } : {}),
                 parentId: structureValidation.normalizedParentId,
                 ...(structureValidation.clearExternalMapping ? { externalProductId: null } : {}),
@@ -360,6 +403,8 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
               await tx.productComponent.deleteMany({ where: { productId: existingProduct.id } })
             }
           })
+          rememberImportedCategoryId(categoryName, resolvedCategoryId)
+          if (categoryName) effectiveCategoryId = resolvedCategoryId
         }
         if (existingProduct.sku !== sku) {
           skuToId.delete(existingProduct.sku)
@@ -379,6 +424,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           barcode: barcode ?? previousBarcode,
           type: ((updateData.type as ProductType | undefined) ?? existingProduct.type),
           parentId: structureValidation.normalizedParentId,
+          categoryId: effectiveCategoryId,
           lifecycleStatus,
         })
         touchedProducts.push({ id: existingProduct.id, lifecycleStatus })
@@ -436,14 +482,20 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
               barcode: barcode ?? null,
               type: createData.type,
               parentId: structureValidation.normalizedParentId,
+              categoryId: await resolveImportedCategoryId(categoryName),
               lifecycleStatus,
             }
-          : await db.product.create({
-              data: {
-                ...createData,
-                parentId: structureValidation.normalizedParentId,
-              },
+          : await db.$transaction(async (tx) => {
+              const createCategoryId = await resolveImportedCategoryId(categoryName, tx)
+              return tx.product.create({
+                data: {
+                  ...createData,
+                  categoryId: createCategoryId,
+                  parentId: structureValidation.normalizedParentId,
+                },
+              })
             })
+        rememberImportedCategoryId(categoryName, created.categoryId)
         skuToId.set(sku, created.id)
         if (barcode) {
           barcodeToId.set(barcode, created.id)
@@ -455,6 +507,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           barcode: created.barcode,
           type: created.type,
           parentId: created.parentId,
+          categoryId: created.categoryId,
           lifecycleStatus: created.lifecycleStatus,
         })
         touchedProducts.push({ id: created.id, lifecycleStatus })

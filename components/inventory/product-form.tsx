@@ -18,13 +18,16 @@ import { COUNTRY_LIST } from '@/lib/countries'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 
 type VariableProduct = { id: string; sku: string; name: string }
+type ProductCategoryOption = { id: string; name: string; parentId: string | null }
 
 type Props = {
   action: (prev: ProductFormState, formData: FormData) => Promise<ProductFormState>
   variableProducts: VariableProduct[]
+  productCategories?: ProductCategoryOption[]
   defaultValues?: {
     sku?: string
     name?: string
+    categoryName?: string | null
     description?: string
     type?: string
     parentId?: string
@@ -61,8 +64,20 @@ const PRODUCT_TYPES = [
 ]
 
 const CHILD_PRODUCT_TYPES = new Set(['VARIANT', 'KIT', 'BOM'])
+const CATEGORY_DIACRITICS = /\p{Diacritic}/gu
 
-export function ProductForm({ action, variableProducts, defaultValues, stockUnitOptions, onClose, title, inline }: Props) {
+function normalizeCategoryOption(value: string) {
+  return value
+    .normalize('NFKC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .trim()
+    .replace(/\s+/g, ' ')
+    .normalize('NFKD')
+    .replace(CATEGORY_DIACRITICS, '')
+    .toLocaleLowerCase('en-US')
+}
+
+export function ProductForm({ action, variableProducts, productCategories, defaultValues, stockUnitOptions, onClose, title, inline }: Props) {
   const baseCurrency = useBaseCurrency()
   const [state, formAction, isPending] = useActionState(action, {})
 
@@ -70,6 +85,7 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
   const [fields, setFields] = useState({
     sku:                  defaultValues?.sku                  ?? '',
     name:                 defaultValues?.name                 ?? '',
+    categoryName:         defaultValues?.categoryName         ?? '',
     description:          defaultValues?.description          ?? '',
     type:                 defaultValues?.type                 ?? 'SIMPLE',
     parentId:             defaultValues?.parentId             ?? '',
@@ -96,6 +112,10 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
   }
 
   const e = state.errors ?? {}
+  const cleanedCategoryName = fields.categoryName.trim().replace(/\s+/g, ' ')
+  const categoryMatchesExisting = cleanedCategoryName.length > 0
+    && (productCategories ?? []).some((category) => normalizeCategoryOption(category.name) === normalizeCategoryOption(cleanedCategoryName))
+  const willCreateCategory = cleanedCategoryName.length > 0 && !categoryMatchesExisting
 
   const formContent = (
     <form action={formAction} className="space-y-6">
@@ -170,6 +190,40 @@ export function ProductForm({ action, variableProducts, defaultValues, stockUnit
           className={e.name ? 'border-destructive' : ''}
         />
         {e.name && <p className="text-xs text-destructive">{e.name[0]}</p>}
+      </div>
+
+      <div className="space-y-1.5">
+        <Label htmlFor="categoryName">Category</Label>
+        <div className="flex gap-2">
+          <Input
+            id="categoryName"
+            name="categoryName"
+            value={fields.categoryName}
+            onChange={(ev) => set('categoryName', ev.target.value)}
+            list="product-category-options"
+            placeholder="e.g. Filament"
+          />
+          {fields.categoryName.trim() && (
+            <Button
+              type="button"
+              variant="outline"
+              size="sm"
+              className="shrink-0"
+              onClick={() => set('categoryName', '')}
+            >
+              Clear
+            </Button>
+          )}
+        </div>
+        <datalist id="product-category-options">
+          {(productCategories ?? []).map((category) => (
+            <option key={category.id} value={category.name} />
+          ))}
+        </datalist>
+        {willCreateCategory && (
+          <p className="text-xs text-muted-foreground">Will create new category &ldquo;{cleanedCategoryName}&rdquo;.</p>
+        )}
+        {e.categoryName && <p className="text-xs text-destructive">{e.categoryName[0]}</p>}
       </div>
 
       <div className="space-y-1.5">

@@ -19,9 +19,11 @@ type Props = {
   search?: string
   type?: string
   lifecycleStatus?: string
+  categoryId?: string
+  productCategories: { id: string; name: string; parentId: string | null }[]
 }
 
-export function ProductFilters({ search, type, lifecycleStatus }: Props) {
+export function ProductFilters({ search, type, lifecycleStatus, categoryId, productCategories }: Props) {
   const router = useRouter()
   const pathname = usePathname()
   const [isPending, startTransition] = useTransition()
@@ -52,13 +54,14 @@ export function ProductFilters({ search, type, lifecycleStatus }: Props) {
       if (key !== 'search' && search) params.set('search', search)
       if (key !== 'type' && type) params.set('type', type)
       if (key !== 'lifecycleStatus' && lifecycleStatus && lifecycleStatus !== 'ALL') params.set('lifecycleStatus', lifecycleStatus)
+      if (key !== 'categoryId' && categoryId) params.set('categoryId', categoryId)
       if (value) params.set(key, value)
       // reset page on filter change
       startTransition(() => {
         router.push(`${pathname}?${params.toString()}`)
       })
     },
-    [router, pathname, search, type, lifecycleStatus]
+    [router, pathname, search, type, lifecycleStatus, categoryId]
   )
 
   useEffect(() => {
@@ -119,6 +122,22 @@ export function ProductFilters({ search, type, lifecycleStatus }: Props) {
           <option value="ACTIVE">Active</option>
           <option value="NOT_FOR_SALE">Not for sale</option>
           <option value="ARCHIVED">Archived</option>
+        </Select>
+      </div>
+
+      <div className="w-full sm:w-48">
+        <label htmlFor="inventory-category" className="sr-only">Filter by product category</label>
+        {/* Product reporting categories are a small v1 taxonomy; switch to async search if this grows. */}
+        <Select
+          id="inventory-category"
+          className="w-full"
+          value={categoryId ?? ''}
+          onChange={(e) => update('categoryId', e.target.value)}
+        >
+          <option value="">All Categories</option>
+          {productCategories.map((category) => (
+            <option key={category.id} value={category.id}>{category.name}</option>
+          ))}
         </Select>
       </div>
 
