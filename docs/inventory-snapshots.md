@@ -6,9 +6,11 @@ value for historical inventory reports.
 ## Daily Cron
 
 The `/api/cron/inventory-snapshot` route is guarded by `CRON_SECRET`. It writes
-yesterday's UTC snapshot so late cron execution does not skip the prior day.
-The cron is disabled by default for new installs; enable it only after the
-migration has been deployed.
+yesterday's UTC snapshot at `00:00 UTC`, immediately after the prior UTC day has
+closed. The midnight schedule is part of the reporting contract: downstream
+as-of helpers treat each `snapshotDate` as an end-of-day UTC position. The cron
+is disabled by default for new installs; enable it only after the migration has
+been deployed.
 
 Rows are idempotent on `(snapshotDate, productId, warehouseId)`. Re-running the
 same day updates the existing row, including explicit zero rows for pairs that

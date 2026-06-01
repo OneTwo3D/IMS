@@ -58,7 +58,7 @@ test('inventory snapshot is registered as a daily scheduled system cron job', ()
   assert.ok(job)
   assert.equal(job.settingKey, 'inventory_snapshot')
   assert.equal(job.module, 'system')
-  assert.equal(job.defaultSchedule, '0 5 * * *')
+  assert.equal(job.defaultSchedule, '0 0 * * *')
   assert.equal(job.defaultEnabled, false)
 })
 

@@ -49,7 +49,7 @@ registerCronJobs([
     moduleLabel: 'System',
     label: 'Inventory Snapshot',
     description: 'Writes daily product/warehouse on-hand quantity and value snapshots for inventory analytics.',
-    defaultSchedule: '0 5 * * *',
+    defaultSchedule: '0 0 * * *',
     defaultEnabled: false,
   },
   {
