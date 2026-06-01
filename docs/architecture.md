@@ -98,7 +98,7 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 
 **Landed costs** — A freight PO (`type = FREIGHT`) is linked to a goods PO via `LandedCostLink`. When the goods PO is received, landed costs are distributed across cost layers. Distribution methods: by value, by weight, by quantity, or equal split.
 
-**Stock reservation** — `StockLevel.reservedQty` tracks stock that is allocated but not yet dispatched. Transfers in `IN_TRANSIT` status reserve stock on the source warehouse.
+**Stock reservation** — `StockLevel.reservedQty` tracks stock that is allocated but not yet dispatched. Sales allocations reserve the remaining allocated quantity after non-pending shipment lines are subtracted. In-progress manufacturing reserves component stock for assemblies and the input SKU for disassemblies. Stock transfers do not currently reserve `reservedQty`; dispatch removes source on-hand quantity and receipt creates destination stock. `lib/domain/inventory/reservation-breakdown.ts` exposes the per-source breakdown and the inventory invariant report flags any delta between known reservation sources and `StockLevel.reservedQty`.
 
 **Product reporting categories** — `ProductCategory` is a normalized hierarchy used to slice inventory, turnover, aging, stock-on-hand, and reorder reports. `Product.categoryId` is optional so existing products can remain uncategorized during rollout; CSV import/export and product create/edit use the category display name and create the category on first use. Names are capped at 100 characters, normalize case/diacritics/invisible characters for matching, and preserve the first display spelling for each normalized key.
 

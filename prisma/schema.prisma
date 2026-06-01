@@ -2474,6 +2474,7 @@ model OrderAllocation {
 
   @@unique([lineId, warehouseId, productId])
   @@index([orderId])
+  @@index([productId, warehouseId])
   @@index([costLayerSnapshot(ops: JsonbOps)], type: Gin, map: "order_allocations_costLayerSnapshot_gin_idx")
   @@map("order_allocations")
 }

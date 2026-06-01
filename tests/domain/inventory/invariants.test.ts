@@ -17,6 +17,7 @@ const CANONICAL_INVENTORY_INVARIANT_CODES = new Set([
   'stock_negative_quantity',
   'stock_negative_reserved_quantity',
   'stock_reserved_exceeds_quantity',
+  'stock_reserved_source_mismatch',
   'cost_layer_negative_received_quantity',
   'cost_layer_negative_remaining_quantity',
   'cost_layer_remaining_exceeds_received',
@@ -74,6 +75,17 @@ function cleanRows(): InventoryInvariantRows {
       },
     ],
     stockMovements: [],
+    reservationSources: [
+      {
+        source: 'sales_order',
+        productId: 'product-1',
+        warehouseId: 'warehouse-1',
+        referenceId: 'order-1',
+        referenceLabel: 'SO order-1',
+        qty: '2',
+        expectedDate: null,
+      },
+    ],
     shippedShipmentLines: [
       {
         id: 'shipment-line-1',
@@ -98,6 +110,31 @@ function cleanRows(): InventoryInvariantRows {
 
 test('clean inventory rows produce no findings', () => {
   assert.deepEqual(evaluateInventoryInvariantRows(cleanRows()), [])
+})
+
+test('reservation source mismatch produces a critical invariant finding', () => {
+  const rows = cleanRows()
+  rows.reservationSources = [
+    {
+      source: 'sales_order',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      referenceId: 'order-1',
+      referenceLabel: 'SO order-1',
+      qty: '1.25',
+      expectedDate: null,
+    },
+  ]
+
+  const findings = evaluateInventoryInvariantRows(rows)
+  const finding = findings.find((candidate) => candidate.code === 'stock_reserved_source_mismatch')
+
+  assert.ok(finding)
+  assert.equal(finding.severity, 'critical')
+  assert.equal(finding.productId, 'product-1')
+  assert.equal(finding.warehouseId, 'warehouse-1')
+  assert.equal((finding.details as { reservedQty: number; knownReservedQty: number }).reservedQty, 2)
+  assert.equal((finding.details as { reservedQty: number; knownReservedQty: number }).knownReservedQty, 1.25)
 })
 
 test('broken stock levels and cost layers produce structured findings', () => {
