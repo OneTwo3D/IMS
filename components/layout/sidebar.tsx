@@ -49,6 +49,13 @@ const ANALYTICS_CHILDREN = [
   { href: '/analytics/forecast',               label: 'Reorder Forecast' },
 ]
 
+const INVENTORY_LEDGER_REPORT_LINKS = [
+  { href: '/analytics/stock-movements',        label: 'Stock Movement Ledger' },
+  { href: '/analytics/stock-adjustments',      label: 'Stock Adjustments' },
+  { href: '/analytics/transfers',              label: 'Stock Transfers' },
+  { href: '/analytics/stock-counts',           label: 'Stock Counts' },
+]
+
 function getSettingsChildren(accountingIntegrationEnabled: boolean) {
   return [
     { href: '/settings/company', label: 'Company' },
@@ -96,7 +103,11 @@ export function Sidebar({
   const isSupplier = userRole === 'SUPPLIER'
   const settingsChildren = getSettingsChildren(accountingIntegrationEnabled)
   const showIntegrations = shoppingIntegrationEnabled || accountingIntegrationEnabled || wmsIntegrationEnabled
-  const analyticsChildren = can('analytics') ? ANALYTICS_CHILDREN : [...STOCK_POSITION_REPORT_LINKS]
+  const canAccessInventoryLedgerReports = userRole === 'ADMIN' || userRole === 'MANAGER' || userRole === 'FINANCE' || userRole === 'WAREHOUSE'
+  const analyticsChildren = [
+    ...(can('analytics') ? ANALYTICS_CHILDREN : [...STOCK_POSITION_REPORT_LINKS]),
+    ...(canAccessInventoryLedgerReports ? INVENTORY_LEDGER_REPORT_LINKS : []),
+  ]
 
   // Supplier gets a completely different navigation
   if (isSupplier) {

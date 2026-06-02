@@ -31,6 +31,10 @@ export function toCsv(rows: Record<string, unknown>[], headers: string[]): strin
   return lines.join('\r\n')
 }
 
+function csvLine(row: Record<string, unknown>, headers: string[]): string {
+  return headers.map((header) => escapeField(row[header])).join(',')
+}
+
 export function buildTemplateCsv(
   headers: string[],
   requiredHeaders: string[],
@@ -108,6 +112,40 @@ function parseRows(text: string): string[][] {
 /** Build a Response that triggers a file download */
 export function csvResponse(csv: string, filename: string): Response {
   return new Response(csv, {
+    headers: {
+      'Content-Type': 'text/csv; charset=utf-8',
+      'Content-Disposition': `attachment; filename="${filename}"`,
+    },
+  })
+}
+
+/** Build a streamed CSV download response for large read-only report exports. */
+export function csvStreamResponse(rows: Iterable<Record<string, unknown>>, headers: string[], filename: string): Response {
+  const encoder = new TextEncoder()
+  const iterator = rows[Symbol.iterator]()
+  let headerSent = false
+
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (!headerSent) {
+        controller.enqueue(encoder.encode(headers.join(',')))
+        headerSent = true
+      }
+
+      let pushed = 0
+      while (pushed < 100) {
+        const next = iterator.next()
+        if (next.done) {
+          controller.close()
+          return
+        }
+        controller.enqueue(encoder.encode(`\r\n${csvLine(next.value, headers)}`))
+        pushed += 1
+      }
+    },
+  })
+
+  return new Response(stream, {
     headers: {
       'Content-Type': 'text/csv; charset=utf-8',
       'Content-Disposition': `attachment; filename="${filename}"`,
