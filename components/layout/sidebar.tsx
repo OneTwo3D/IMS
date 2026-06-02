@@ -44,7 +44,16 @@ const ANALYTICS_CHILDREN = [
   { href: '/analytics/purchase-stats',         label: 'Purchase Statistics' },
   { href: '/analytics/product-profitability',  label: 'Product Profitability' },
   { href: '/analytics/inventory-stats',        label: 'Inventory Report' },
+  { href: '/analytics/stock-on-hand',          label: 'Stock on Hand' },
+  { href: '/analytics/stock-allocations',      label: 'Stock Allocations' },
+  { href: '/analytics/negative-stock',         label: 'Negative Stock' },
   { href: '/analytics/forecast',               label: 'Reorder Forecast' },
+]
+
+const WAREHOUSE_ANALYTICS_CHILDREN = [
+  { href: '/analytics/stock-on-hand',          label: 'Stock on Hand' },
+  { href: '/analytics/stock-allocations',      label: 'Stock Allocations' },
+  { href: '/analytics/negative-stock',         label: 'Negative Stock' },
 ]
 
 function getSettingsChildren(accountingIntegrationEnabled: boolean) {
@@ -94,6 +103,7 @@ export function Sidebar({
   const isSupplier = userRole === 'SUPPLIER'
   const settingsChildren = getSettingsChildren(accountingIntegrationEnabled)
   const showIntegrations = shoppingIntegrationEnabled || accountingIntegrationEnabled || wmsIntegrationEnabled
+  const analyticsChildren = can('analytics') ? ANALYTICS_CHILDREN : WAREHOUSE_ANALYTICS_CHILDREN
 
   // Supplier gets a completely different navigation
   if (isSupplier) {
@@ -165,8 +175,8 @@ export function Sidebar({
         {can('sales') && (
           <NavGroup label="Sales" icon={TrendingUp} items={SALES_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
-        {can('analytics') && (
-          <NavGroup label="Analytics" icon={BarChart3} items={ANALYTICS_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
+        {(can('analytics') || userRole === 'WAREHOUSE') && (
+          <NavGroup label="Analytics" icon={BarChart3} items={analyticsChildren} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
         {can('manufacturing') && <NavItem href="/manufacturing" label="Manufacturing" icon={Factory} collapsed={collapsed} onNavigate={onNavigate} />}
         {can('sync') && showIntegrations && <NavItem href="/sync" label="Integrations" icon={RefreshCw} collapsed={collapsed} onNavigate={onNavigate} />}

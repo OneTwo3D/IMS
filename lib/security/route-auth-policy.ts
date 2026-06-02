@@ -180,7 +180,7 @@ export const apiRouteAuthPolicy = {
   },
   '/api/export/analytics': {
     access: 'authenticated',
-    reason: 'Requires an authenticated user with analytics permission.',
+    reason: 'Requires analytics permission, except stock-position exports which allow ADMIN/MANAGER/WAREHOUSE/FINANCE.',
   },
   '/api/export/contacts': {
     access: 'authenticated',
