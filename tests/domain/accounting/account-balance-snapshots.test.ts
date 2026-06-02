@@ -3,11 +3,31 @@ import test from 'node:test'
 
 import {
   calculateAccountBalanceVarianceBase,
+  findLatestAccountBalanceSnapshot,
   getAccountBalancePeriodMovement,
+  normalizeBalanceDate,
   persistAccountingAccountBalanceSnapshots,
   type AccountingAccountBalanceSnapshotRow,
 } from '@/lib/domain/accounting/account-balance-snapshots'
 import { toDecimal } from '@/lib/domain/math/decimal'
+
+function makeSnapshot(overrides: Partial<AccountingAccountBalanceSnapshotRow>): AccountingAccountBalanceSnapshotRow {
+  return {
+    id: 'snapshot',
+    connector: 'xero',
+    externalAccountId: 'account-1',
+    accountCode: '500',
+    accountName: 'Inventory Asset',
+    balanceDate: new Date('2026-06-01T00:00:00.000Z'),
+    currency: 'GBP',
+    amountForeign: toDecimal('0'),
+    amountBase: toDecimal('0'),
+    sourcePayloadRef: null,
+    syncRunId: null,
+    fetchedAt: new Date('2026-06-01T01:00:00.000Z'),
+    ...overrides,
+  }
+}
 
 function snapshotClient(initial: AccountingAccountBalanceSnapshotRow[] = []) {
   const rows = [...initial]
@@ -52,17 +72,16 @@ function snapshotClient(initial: AccountingAccountBalanceSnapshotRow[] = []) {
           connector: string
           balanceDate: { lte: Date }
           currency?: string
-          OR: Array<{ externalAccountId?: string; accountCode?: string }>
+          externalAccountId?: string
+          accountCode?: string
         }
         return rows
           .filter((row) =>
             row.connector === where.connector &&
             row.balanceDate <= where.balanceDate.lte &&
             (!where.currency || row.currency === where.currency) &&
-            where.OR.some((filter) =>
-              (filter.externalAccountId && row.externalAccountId === filter.externalAccountId) ||
-              (filter.accountCode && row.accountCode === filter.accountCode),
-            ),
+            (!where.externalAccountId || row.externalAccountId === where.externalAccountId) &&
+            (!where.accountCode || row.accountCode === where.accountCode),
           )
           .sort((a, b) => b.balanceDate.getTime() - a.balanceDate.getTime() || b.fetchedAt.getTime() - a.fetchedAt.getTime() || b.id.localeCompare(a.id))[0] ?? null
       },
@@ -107,34 +126,26 @@ test('persistAccountingAccountBalanceSnapshots upserts by connector account date
 
 test('getAccountBalancePeriodMovement subtracts opening from closing balance in base currency', async () => {
   const client = snapshotClient([
-    {
+    makeSnapshot({
       id: 'opening',
-      connector: 'xero',
       externalAccountId: 'cogs-account',
       accountCode: '600',
       accountName: 'COGS',
       balanceDate: new Date('2026-05-31T00:00:00.000Z'),
-      currency: 'GBP',
       amountForeign: toDecimal('12.50'),
       amountBase: toDecimal('12.50'),
-      sourcePayloadRef: null,
-      syncRunId: null,
       fetchedAt: new Date('2026-05-31T01:00:00.000Z'),
-    },
-    {
+    }),
+    makeSnapshot({
       id: 'closing',
-      connector: 'xero',
       externalAccountId: 'cogs-account',
       accountCode: '600',
       accountName: 'COGS',
       balanceDate: new Date('2026-06-30T00:00:00.000Z'),
-      currency: 'GBP',
       amountForeign: toDecimal('20.75'),
       amountBase: toDecimal('20.75'),
-      sourcePayloadRef: null,
-      syncRunId: null,
       fetchedAt: new Date('2026-06-30T01:00:00.000Z'),
-    },
+    }),
   ])
 
   const movement = await getAccountBalancePeriodMovement({
@@ -150,4 +161,81 @@ test('getAccountBalancePeriodMovement subtracts opening from closing balance in 
 
 test('calculateAccountBalanceVarianceBase subtracts accounting balance from IMS value', () => {
   assert.equal(calculateAccountBalanceVarianceBase('125.50', '120.25').toFixed(6), '5.250000')
+})
+
+test('getAccountBalancePeriodMovement rejects stale opening snapshots', async () => {
+  const client = snapshotClient([
+    makeSnapshot({
+      id: 'stale-opening',
+      externalAccountId: 'cogs-account',
+      accountCode: '600',
+      balanceDate: new Date('2026-01-31T00:00:00.000Z'),
+      amountBase: toDecimal('12.50'),
+    }),
+    makeSnapshot({
+      id: 'closing',
+      externalAccountId: 'cogs-account',
+      accountCode: '600',
+      balanceDate: new Date('2026-06-30T00:00:00.000Z'),
+      amountBase: toDecimal('20.75'),
+    }),
+  ])
+
+  const movement = await getAccountBalancePeriodMovement({
+    connector: 'xero',
+    accountCode: '600',
+    dateFrom: '2026-06-01',
+    dateTo: '2026-06-30',
+    currency: 'GBP',
+  }, client as never)
+
+  assert.equal(movement, null)
+})
+
+test('findLatestAccountBalanceSnapshot prefers external account id before account code', async () => {
+  const client = snapshotClient([
+    makeSnapshot({
+      id: 'wanted-by-id',
+      externalAccountId: 'account-x',
+      accountCode: '500',
+      balanceDate: new Date('2026-06-01T00:00:00.000Z'),
+    }),
+    makeSnapshot({
+      id: 'newer-same-code',
+      externalAccountId: 'account-y',
+      accountCode: '500',
+      balanceDate: new Date('2026-06-02T00:00:00.000Z'),
+    }),
+  ])
+
+  const snapshot = await findLatestAccountBalanceSnapshot({
+    connector: 'xero',
+    externalAccountId: 'account-x',
+    accountCode: '500',
+    balanceDate: '2026-06-03',
+    currency: 'GBP',
+  }, client as never)
+
+  assert.equal(snapshot?.id, 'wanted-by-id')
+})
+
+test('findLatestAccountBalanceSnapshot filters by currency', async () => {
+  const client = snapshotClient([
+    makeSnapshot({ id: 'gbp', accountCode: '500', currency: 'GBP', amountBase: toDecimal('10') }),
+    makeSnapshot({ id: 'usd', accountCode: '500', currency: 'USD', amountBase: toDecimal('20') }),
+  ])
+
+  const snapshot = await findLatestAccountBalanceSnapshot({
+    connector: 'xero',
+    accountCode: '500',
+    balanceDate: '2026-06-03',
+    currency: 'USD',
+  }, client as never)
+
+  assert.equal(snapshot?.id, 'usd')
+})
+
+test('normalizeBalanceDate rejects invalid date strings', () => {
+  assert.throws(() => normalizeBalanceDate('2026-02-30'), /real calendar date/)
+  assert.throws(() => normalizeBalanceDate('2026/02/28'), /YYYY-MM-DD/)
 })

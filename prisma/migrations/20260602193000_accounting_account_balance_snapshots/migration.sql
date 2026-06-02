@@ -12,7 +12,7 @@ CREATE TABLE "accounting_account_balance_snapshots" (
   "syncRunId" TEXT,
   "fetchedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
   "createdAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
-  "updatedAt" TIMESTAMP(3) NOT NULL,
+  "updatedAt" TIMESTAMP(3) NOT NULL DEFAULT CURRENT_TIMESTAMP,
 
   CONSTRAINT "accounting_account_balance_snapshots_pkey" PRIMARY KEY ("id")
 );

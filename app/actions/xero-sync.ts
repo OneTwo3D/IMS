@@ -1,6 +1,6 @@
 'use server'
 
-import { requireFreshPermission, requirePermission } from '@/lib/auth/server'
+import { requireFreshPermission, requirePermission, requireRole } from '@/lib/auth/server'
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
@@ -260,14 +260,19 @@ export async function syncAccountingAccounts(): Promise<{ synced: number; errors
 }
 
 export async function syncAccountingAccountBalanceSnapshots(balanceDate?: string): Promise<{ fetched: number; persisted: number; skipped: number; errors: string[] }> {
-  await requireAdmin()
+  await requireRole('ADMIN', 'FINANCE')
   const result = await syncXeroAccountBalanceSnapshots({ balanceDate })
+  const hasErrors = result.errors.length > 0
+  const hasSkipped = result.skipped > 0
 
   await logActivity({
     entityType: 'SYSTEM',
     action: 'accounting_account_balance_snapshots_synced',
     tag: 'sync',
-    description: `Synced ${result.persisted} account balance snapshots from Xero`,
+    level: hasErrors ? 'ERROR' : hasSkipped ? 'WARNING' : 'INFO',
+    description: hasErrors
+      ? `Synced ${result.persisted} account balance snapshots from Xero with ${result.errors.length} error(s)`
+      : `Synced ${result.persisted} account balance snapshots from Xero`,
     metadata: { balanceDate: balanceDate ?? null, ...result },
   })
 

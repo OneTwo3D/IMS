@@ -3,6 +3,8 @@ import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/
+const DAY_MS = 24 * 60 * 60 * 1000
+export const DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS = 7
 
 export type AccountingAccountBalanceSnapshotInput = {
   connector: string
@@ -39,7 +41,7 @@ export type PersistAccountingAccountBalanceSnapshotResult = {
   snapshots: AccountingAccountBalanceSnapshotRow[]
 }
 
-type SnapshotClient = Pick<PrismaClient, 'accountingAccountBalanceSnapshot'>
+type SnapshotClient = Pick<PrismaClient, 'accountingAccountBalanceSnapshot'> & Partial<Pick<PrismaClient, '$transaction'>>
 
 export type AccountBalanceSnapshotLookup = {
   connector: string
@@ -54,6 +56,8 @@ export type AccountBalancePeriodMovement = {
   closing: AccountingAccountBalanceSnapshotRow
   movementBase: Decimal
 }
+
+type NormalizedAccountingAccountBalanceSnapshotInput = ReturnType<typeof normalizeInput>
 
 function assertNonEmpty(value: string, label: string): string {
   const trimmed = value.trim()
@@ -106,35 +110,44 @@ function normalizeInput(input: AccountingAccountBalanceSnapshotInput) {
   }
 }
 
+function upsertSnapshotArgs(normalized: NormalizedAccountingAccountBalanceSnapshotInput) {
+  return {
+    where: {
+      connector_externalAccountId_balanceDate_currency: {
+        connector: normalized.connector,
+        externalAccountId: normalized.externalAccountId,
+        balanceDate: normalized.balanceDate,
+        currency: normalized.currency,
+      },
+    },
+    create: normalized,
+    update: {
+      accountCode: normalized.accountCode,
+      accountName: normalized.accountName,
+      amountForeign: normalized.amountForeign,
+      amountBase: normalized.amountBase,
+      sourcePayloadRef: normalized.sourcePayloadRef,
+      syncRunId: normalized.syncRunId,
+      fetchedAt: normalized.fetchedAt,
+    },
+  }
+}
+
 export async function persistAccountingAccountBalanceSnapshots(
   inputs: AccountingAccountBalanceSnapshotInput[],
   client: SnapshotClient = db,
 ): Promise<PersistAccountingAccountBalanceSnapshotResult> {
-  const snapshots: AccountingAccountBalanceSnapshotRow[] = []
-  for (const input of inputs) {
-    const normalized = normalizeInput(input)
-    const snapshot = await client.accountingAccountBalanceSnapshot.upsert({
-      where: {
-        connector_externalAccountId_balanceDate_currency: {
-          connector: normalized.connector,
-          externalAccountId: normalized.externalAccountId,
-          balanceDate: normalized.balanceDate,
-          currency: normalized.currency,
-        },
-      },
-      create: normalized,
-      update: {
-        accountCode: normalized.accountCode,
-        accountName: normalized.accountName,
-        amountForeign: normalized.amountForeign,
-        amountBase: normalized.amountBase,
-        sourcePayloadRef: normalized.sourcePayloadRef,
-        syncRunId: normalized.syncRunId,
-        fetchedAt: normalized.fetchedAt,
-      },
-    })
-    snapshots.push(snapshot)
+  const normalizedInputs = inputs.map(normalizeInput)
+  const upsertAll = async (delegate: Pick<SnapshotClient, 'accountingAccountBalanceSnapshot'>) => {
+    const snapshots: AccountingAccountBalanceSnapshotRow[] = []
+    for (const normalized of normalizedInputs) {
+      snapshots.push(await delegate.accountingAccountBalanceSnapshot.upsert(upsertSnapshotArgs(normalized)))
+    }
+    return snapshots
   }
+  const snapshots = client.$transaction
+    ? await client.$transaction((tx) => upsertAll(tx as Pick<SnapshotClient, 'accountingAccountBalanceSnapshot'>))
+    : await upsertAll(client)
   return { attempted: inputs.length, persisted: snapshots.length, snapshots }
 }
 
@@ -142,33 +155,44 @@ export async function findLatestAccountBalanceSnapshot(
   lookup: AccountBalanceSnapshotLookup,
   client: SnapshotClient = db,
 ): Promise<AccountingAccountBalanceSnapshotRow | null> {
-  const accountFilters: Record<string, unknown>[] = []
   const externalAccountId = lookup.externalAccountId?.trim()
   const accountCode = lookup.accountCode?.trim()
-  if (externalAccountId) accountFilters.push({ externalAccountId })
-  if (accountCode) accountFilters.push({ accountCode })
-  if (accountFilters.length === 0) return null
+  if (!externalAccountId && !accountCode) return null
+  const baseWhere = {
+    connector: assertNonEmpty(lookup.connector, 'connector'),
+    balanceDate: { lte: normalizeBalanceDate(lookup.balanceDate) },
+    ...(lookup.currency ? { currency: normalizeCurrency(lookup.currency) } : {}),
+  }
+  const orderBy = [{ balanceDate: 'desc' as const }, { fetchedAt: 'desc' as const }, { id: 'desc' as const }]
 
-  return client.accountingAccountBalanceSnapshot.findFirst({
-    where: {
-      connector: assertNonEmpty(lookup.connector, 'connector'),
-      balanceDate: { lte: normalizeBalanceDate(lookup.balanceDate) },
-      ...(lookup.currency ? { currency: normalizeCurrency(lookup.currency) } : {}),
-      OR: accountFilters,
-    },
-    orderBy: [{ balanceDate: 'desc' }, { fetchedAt: 'desc' }, { id: 'desc' }],
-  })
+  if (externalAccountId) {
+    const exactById = await client.accountingAccountBalanceSnapshot.findFirst({
+      where: { ...baseWhere, externalAccountId },
+      orderBy,
+    })
+    if (exactById) return exactById
+  }
+  return accountCode
+    ? client.accountingAccountBalanceSnapshot.findFirst({
+        where: { ...baseWhere, accountCode },
+        orderBy,
+      })
+    : null
 }
 
 export async function getAccountBalancePeriodMovement(
-  lookup: Omit<AccountBalanceSnapshotLookup, 'balanceDate'> & { dateFrom: Date | string; dateTo: Date | string },
+  lookup: Omit<AccountBalanceSnapshotLookup, 'balanceDate'> & { dateFrom: Date | string; dateTo: Date | string; maxOpeningStalenessDays?: number },
   client: SnapshotClient = db,
 ): Promise<AccountBalancePeriodMovement | null> {
+  const dateFrom = normalizeBalanceDate(lookup.dateFrom)
   const [opening, closing] = await Promise.all([
     findLatestAccountBalanceSnapshot({ ...lookup, balanceDate: previousDate(lookup.dateFrom) }, client),
     findLatestAccountBalanceSnapshot({ ...lookup, balanceDate: lookup.dateTo }, client),
   ])
   if (!opening || !closing) return null
+  const maxStalenessDays = lookup.maxOpeningStalenessDays ?? DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS
+  const staleBefore = dateFrom.getTime() - maxStalenessDays * DAY_MS
+  if (opening.balanceDate.getTime() < staleBefore) return null
   return {
     opening,
     closing,

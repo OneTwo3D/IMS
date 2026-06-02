@@ -134,6 +134,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [connectMsg, setConnectMsg] = useState<string | null>(null)
   const [syncMsg, setSyncMsg] = useState<string | null>(null)
   const [accountsMsg, setAccountsMsg] = useState<string | null>(null)
+  const [accountsMsgLevel, setAccountsMsgLevel] = useState<'info' | 'warning' | 'error'>('info')
   const [connecting, setConnecting] = useState(false)
   const [savingConnection, setSavingConnection] = useState(false)
   const [syncingAccounts, setSyncingAccounts] = useState(false)
@@ -335,19 +336,28 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
 
   async function handleSyncAccounts() {
     setAccountsMsg(null)
+    setAccountsMsgLevel('info')
     setSyncingAccounts(true)
     const result = await syncAccountingAccounts()
     setSyncingAccounts(false)
     setAccountsMsg(`Synced ${result.synced} accounts.${result.errors.length > 0 ? ` Errors: ${result.errors.join(', ')}` : ''}`)
+    setAccountsMsgLevel(result.errors.length > 0 ? 'error' : 'info')
     router.refresh()
   }
 
   async function handleSyncAccountBalances() {
     setAccountsMsg(null)
+    setAccountsMsgLevel('info')
     setSyncingBalances(true)
     const result = await syncAccountingAccountBalanceSnapshots()
     setSyncingBalances(false)
-    setAccountsMsg(`Synced ${result.persisted} balance snapshot(s).${result.errors.length > 0 ? ` Errors: ${result.errors.join(', ')}` : ''}`)
+    if (result.errors.length > 0) {
+      setAccountsMsg(`Balance sync warning: synced ${result.persisted} snapshot(s); ${result.errors.join(' ')}`)
+      setAccountsMsgLevel(result.persisted > 0 ? 'warning' : 'error')
+    } else {
+      setAccountsMsg(`Synced ${result.persisted} balance snapshot(s).`)
+      setAccountsMsgLevel(result.skipped > 0 ? 'warning' : 'info')
+    }
     router.refresh()
   }
 
@@ -499,7 +509,11 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
                 </Button>
               </div>
             </div>
-            {accountsMsg && <p className="text-xs text-muted-foreground">{accountsMsg}</p>}
+            {accountsMsg && (
+              <p className={`text-xs ${accountsMsgLevel === 'error' ? 'text-destructive' : accountsMsgLevel === 'warning' ? 'text-amber-700 dark:text-amber-300' : 'text-muted-foreground'}`}>
+                {accountsMsg}
+              </p>
+            )}
 
             {accounts.length === 0 ? (
               <p className="text-sm text-muted-foreground">No accounts synced yet. Click &quot;Sync Chart of Accounts&quot; to pull your Xero accounts.</p>

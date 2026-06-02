@@ -3,6 +3,7 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import {
   calculateAccountBalanceVarianceBase,
+  DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS,
   findLatestAccountBalanceSnapshot,
   getAccountBalancePeriodMovement,
 } from '@/lib/domain/accounting/account-balance-snapshots'
@@ -10,6 +11,8 @@ import { getOnHandAsOf, type OnHandAsOfRow } from '@/lib/domain/inventory/get-on
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getXeroSettings } from '@/lib/connectors/xero/settings'
+import { getIntegrationPluginState } from '@/lib/integration-plugins'
+import { cache } from 'react'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -354,17 +357,47 @@ function supplierNames(product: ProductMeta): string[] {
   return product.supplierProducts.map((entry) => entry.supplier.name).sort((a, b) => a.localeCompare(b))
 }
 
-async function loadConfiguredAccountingContext(): Promise<{ baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> {
-  const [baseCurrency, settings] = await Promise.all([getBaseCurrencyCode(), getXeroSettings()])
+const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: 'xero' | null; baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> => {
+  const [baseCurrency, settings, plugins] = await Promise.all([getBaseCurrencyCode(), getXeroSettings(), getIntegrationPluginState()])
   return {
+    connector: plugins.xero ? 'xero' : null,
     baseCurrency,
     inventoryAccountCode: settings.xero_inventory_account.trim() || null,
     cogsAccountCode: settings.xero_cogs_account.trim() || null,
   }
+})
+
+function hasInventoryValuationGlScope(filters: InventoryCostingFilters): boolean {
+  return !filters.warehouseId &&
+    !filters.categoryId &&
+    !filters.supplierId &&
+    !filters.product?.trim() &&
+    !filters.includeZero
 }
 
-async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal): Promise<{ glBalanceBase: Decimal | null; glVarianceBase: Decimal | null; notices: string[] }> {
+function hasCogsGlScope(filters: InventoryCostingFilters): boolean {
+  return !filters.warehouseId &&
+    !filters.categoryId &&
+    !filters.supplierId &&
+    !filters.product?.trim()
+}
+
+async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal, filters: InventoryCostingFilters): Promise<{ glBalanceBase: Decimal | null; glVarianceBase: Decimal | null; notices: string[] }> {
+  if (!hasInventoryValuationGlScope(filters)) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: ['GL variance is account-level and is shown only for unfiltered inventory valuation totals.'],
+    }
+  }
   const context = await loadConfiguredAccountingContext()
+  if (!context.connector) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: ['Xero is not enabled, so GL inventory variance is blank.'],
+    }
+  }
   if (!context.inventoryAccountCode) {
     return {
       glBalanceBase: null,
@@ -373,7 +406,7 @@ async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal):
     }
   }
   const snapshot = await findLatestAccountBalanceSnapshot({
-    connector: 'xero',
+    connector: context.connector,
     accountCode: context.inventoryAccountCode,
     balanceDate: asOf,
     currency: context.baseCurrency,
@@ -388,12 +421,26 @@ async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal):
   return {
     glBalanceBase: snapshot.amountBase,
     glVarianceBase: calculateAccountBalanceVarianceBase(totalValueBase, snapshot.amountBase),
-    notices: [`GL variance uses ${snapshot.connector.toUpperCase()} inventory asset account ${snapshot.accountCode ?? snapshot.externalAccountId} snapshot dated ${snapshot.balanceDate.toISOString().slice(0, 10)}.`],
+    notices: [],
   }
 }
 
-async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBase: Decimal): Promise<{ glBalanceBase: Decimal | null; glVarianceBase: Decimal | null; notices: string[] }> {
+async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBase: Decimal, filters: InventoryCostingFilters): Promise<{ glBalanceBase: Decimal | null; glVarianceBase: Decimal | null; notices: string[] }> {
+  if (!hasCogsGlScope(filters)) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: ['GL COGS variance is account-level and is shown only for unfiltered COGS totals.'],
+    }
+  }
   const context = await loadConfiguredAccountingContext()
+  if (!context.connector) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: ['Xero is not enabled, so GL COGS variance is blank.'],
+    }
+  }
   if (!context.cogsAccountCode) {
     return {
       glBalanceBase: null,
@@ -402,7 +449,7 @@ async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBas
     }
   }
   const movement = await getAccountBalancePeriodMovement({
-    connector: 'xero',
+    connector: context.connector,
     accountCode: context.cogsAccountCode,
     dateFrom,
     dateTo,
@@ -412,13 +459,16 @@ async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBas
     return {
       glBalanceBase: null,
       glVarianceBase: null,
-      notices: [`No stored opening and closing GL balance snapshots exist for COGS account ${context.cogsAccountCode} across ${dateFrom} to ${dateTo}, so GL COGS variance is blank.`],
+      notices: [`No fresh opening and closing GL balance snapshots exist for COGS account ${context.cogsAccountCode} across ${dateFrom} to ${dateTo}. Opening snapshots must be within ${DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS} days before the period start, so GL COGS variance is blank.`],
     }
   }
+  const notices = movement.movementBase.lt(0)
+    ? ['GL COGS movement is negative. This can be caused by period-end reclassification, year-end close, or refunds; investigate before relying on the variance.']
+    : []
   return {
     glBalanceBase: movement.movementBase,
     glVarianceBase: calculateAccountBalanceVarianceBase(cogsBase, movement.movementBase),
-    notices: [`GL COGS variance uses ${movement.closing.connector.toUpperCase()} account ${movement.closing.accountCode ?? movement.closing.externalAccountId} movement from ${movement.opening.balanceDate.toISOString().slice(0, 10)} to ${movement.closing.balanceDate.toISOString().slice(0, 10)}.`],
+    notices,
   }
 }
 
@@ -668,7 +718,7 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
     }),
     { qty: decimalZero(), totalValueBase: decimalZero() },
   )
-  const gl = await inventoryGlBalanceForDate(snapshot.asOf, totals.totalValueBase)
+  const gl = await inventoryGlBalanceForDate(snapshot.asOf, totals.totalValueBase, filters)
   const paged = paginate(allRows, filters, options)
   return {
     asOf: snapshot.asOf,
@@ -826,7 +876,7 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
     }),
     { qty: decimalZero(), cogsBase: decimalZero(), revenueBase: decimalZero(), grossMarginBase: decimalZero(), revenueCapturedRows: 0 },
   )
-  const gl = await cogsGlMovementForPeriod(dateFrom, dateTo, totals.cogsBase)
+  const gl = await cogsGlMovementForPeriod(dateFrom, dateTo, totals.cogsBase, filters)
   const paged = paginate(allRows, filters, options)
   return {
     dateFrom,

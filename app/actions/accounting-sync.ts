@@ -126,6 +126,8 @@ export async function syncAccountingAccounts(): Promise<{ synced: number; errors
 export async function syncAccountingAccountBalanceSnapshots(balanceDate?: string): Promise<{ fetched: number; persisted: number; skipped: number; errors: string[] }> {
   const connectorId = await getActiveConnector()
   if (connectorId === 'xero') {
+    // Keep this dynamic to avoid making the generic accounting facade eagerly
+    // load Xero server-action code in every accounting connector path.
     const { syncAccountingAccountBalanceSnapshots: syncXeroBalances } = await import('@/app/actions/xero-sync')
     return syncXeroBalances(balanceDate)
   }

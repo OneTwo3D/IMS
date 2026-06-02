@@ -1677,7 +1677,7 @@ model AccountingAccountBalanceSnapshot {
   syncRunId         String?
   fetchedAt         DateTime @default(now())
   createdAt         DateTime @default(now())
-  updatedAt         DateTime @updatedAt
+  updatedAt         DateTime @default(now()) @updatedAt
 
   @@unique([connector, externalAccountId, balanceDate, currency], map: "accounting_account_balance_snapshots_connector_externalAcco_key")
   @@index([connector, accountCode, balanceDate], map: "accounting_account_balance_snapshots_connector_accountCode__idx")
