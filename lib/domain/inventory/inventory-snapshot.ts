@@ -106,6 +106,26 @@ export type InventorySnapshotBackfillResult = {
   missingValueMovementCount: number
   dryRun: boolean
   valueReplayReliable: boolean
+  reservationBackfill: InventoryReservationSnapshotBackfillResult
+}
+
+export type InventoryReservationSnapshotBackfillWarningCode =
+  | 'reservation_source_changed_after_cutoff'
+
+export type InventoryReservationSnapshotBackfillWarning = {
+  snapshotDate: string
+  code: InventoryReservationSnapshotBackfillWarningCode
+  message: string
+}
+
+export type InventoryReservationSnapshotBackfillResult = {
+  enabled: boolean
+  daysWritten: number
+  snapshotsWritten: number
+  runMarkersWritten: number
+  unsupportedDays: number
+  reliable: boolean
+  warnings: InventoryReservationSnapshotBackfillWarning[]
 }
 
 export type InventorySnapshotClient = Pick<
@@ -173,6 +193,16 @@ type SnapshotStateEntry = {
 }
 
 type SnapshotState = Map<string, SnapshotStateEntry>
+
+const EMPTY_RESERVATION_BACKFILL_RESULT: InventoryReservationSnapshotBackfillResult = {
+  enabled: false,
+  daysWritten: 0,
+  snapshotsWritten: 0,
+  runMarkersWritten: 0,
+  unsupportedDays: 0,
+  reliable: true,
+  warnings: [],
+}
 
 function stockKey(productId: string, warehouseId: string): string {
   return JSON.stringify([productId, warehouseId])
@@ -397,6 +427,68 @@ export function buildInventoryReservationSnapshotRows(input: {
     ))
 }
 
+function reservationSourceStatsByKey(reservationSources: readonly ReservationBreakdownRow[]): Map<string, {
+  reservedQty: Decimal
+  reservationSourceCount: number
+}> {
+  const stats = new Map<string, { reservedQty: Decimal; reservationSourceCount: number }>()
+  for (const source of reservationSources) {
+    const key = sourceCountKey(source)
+    const existing = stats.get(key) ?? {
+      reservedQty: toDecimal(0),
+      reservationSourceCount: 0,
+    }
+    existing.reservedQty = existing.reservedQty.add(toDecimal(source.qty))
+    existing.reservationSourceCount += 1
+    stats.set(key, existing)
+  }
+  return stats
+}
+
+function buildBackfilledReservationSnapshotRows(input: {
+  snapshotDate: Date
+  inventoryRows: readonly InventorySnapshotRowInput[]
+  reservationSources: readonly ReservationBreakdownRow[]
+}): { rows: InventoryReservationSnapshotRowInput[]; stockLevelCount: number } {
+  const sourceStats = reservationSourceStatsByKey(input.reservationSources)
+  const inventoryRowsByKey = new Map(input.inventoryRows.map((row) => [
+    stockKey(row.productId, row.warehouseId),
+    row,
+  ]))
+  const keys = new Set([...inventoryRowsByKey.keys(), ...sourceStats.keys()])
+  const rows: InventoryReservationSnapshotRowInput[] = []
+
+  for (const key of keys) {
+    const parsedKey = parseStockKey(key)
+    if (!parsedKey) continue
+    const [productId, warehouseId] = parsedKey
+    const inventoryRow = inventoryRowsByKey.get(key)
+    const source = sourceStats.get(key)
+    const reservedQty = roundQty(source?.reservedQty ?? 0)
+    const reservationSourceCount = source?.reservationSourceCount ?? 0
+    if (reservedQty.isZero() && reservationSourceCount === 0) continue
+    const quantity = inventoryRow?.qty ?? toDecimal(0)
+    rows.push({
+      snapshotDate: input.snapshotDate,
+      productId,
+      warehouseId,
+      reservedQty,
+      availableQty: roundQty(quantity.sub(reservedQty)),
+      reservationSourceCount,
+    })
+  }
+
+  rows.sort((a, b) => (
+    a.productId.localeCompare(b.productId) ||
+    a.warehouseId.localeCompare(b.warehouseId)
+  ))
+
+  return {
+    rows,
+    stockLevelCount: input.inventoryRows.length,
+  }
+}
+
 async function loadCurrentSnapshotRows(client: SnapshotClient): Promise<{
   stockLevels: InventorySnapshotStockLevelRow[]
   costLayers: InventorySnapshotCostLayerRow[]
@@ -420,6 +512,39 @@ function assertReservationStockLevelRow(
   if (!('reservedQty' in row)) {
     throw new Error('Reservation snapshot stock-level query must select reservedQty')
   }
+}
+
+async function hasReservationSourceMutationAfter(
+  client: SnapshotClient,
+  cutoff: Date,
+): Promise<boolean> {
+  const [allocationRows, shipmentRows, productionRows] = await Promise.all([
+    client.orderAllocation.findMany({
+      where: {
+        OR: [
+          { updatedAt: { gt: cutoff } },
+          { order: { updatedAt: { gt: cutoff } } },
+        ],
+      },
+      take: 1,
+    }),
+    client.shipmentLine.findMany({
+      where: {
+        shipment: {
+          updatedAt: { gt: cutoff },
+        },
+      },
+      take: 1,
+    }),
+    client.productionOrder.findMany({
+      where: {
+        updatedAt: { gt: cutoff },
+      },
+      take: 1,
+    }),
+  ])
+
+  return allocationRows.length > 0 || shipmentRows.length > 0 || productionRows.length > 0
 }
 
 async function loadCurrentReservationSnapshotRows(
@@ -724,6 +849,7 @@ export async function backfillInventorySnapshots(options: {
   fromDate: SnapshotDateInput
   toDate?: SnapshotDateInput
   dryRun?: boolean
+  includeReservationSnapshots?: boolean
 }): Promise<InventorySnapshotBackfillResult> {
   const client: SnapshotClient = options.client ?? db as SnapshotClient
   const fromDate = parseSnapshotDate(options.fromDate)
@@ -744,6 +870,14 @@ export async function backfillInventorySnapshots(options: {
   let movementPage: InventorySnapshotMovementRow[] = []
   let movementPageIndex = 0
   let pendingMovement: InventorySnapshotMovementRow | null = null
+  const reservationBackfill: InventoryReservationSnapshotBackfillResult = {
+    ...EMPTY_RESERVATION_BACKFILL_RESULT,
+    enabled: options.includeReservationSnapshots === true,
+    warnings: [],
+  }
+  const currentReservationSources = options.includeReservationSnapshots
+    ? await loadReservationSourceRows(client as unknown as ReservationBreakdownClient)
+    : []
 
   async function nextMovement(): Promise<InventorySnapshotMovementRow | null> {
     if (pendingMovement) {
@@ -797,6 +931,41 @@ export async function backfillInventorySnapshots(options: {
     const rows = rowsFromState(day, state)
     snapshotsWritten += options.dryRun ? rows.length : await writeSnapshotRows(client, rows)
     daysWritten += 1
+
+    if (options.includeReservationSnapshots) {
+      const cutoff = endOfUtcDay(day)
+      if (await hasReservationSourceMutationAfter(client, cutoff)) {
+        reservationBackfill.unsupportedDays += 1
+        reservationBackfill.reliable = false
+        reservationBackfill.warnings.push({
+          snapshotDate: formatSnapshotDate(day),
+          code: 'reservation_source_changed_after_cutoff',
+          message: [
+            `Reservation sources changed after ${cutoff.toISOString()};`,
+            'historical reserved quantities cannot be reconstructed from current allocation/shipment/production state for this day.',
+          ].join(' '),
+        })
+      } else {
+        const reservationSnapshot = buildBackfilledReservationSnapshotRows({
+          snapshotDate: day,
+          inventoryRows: rows,
+          reservationSources: currentReservationSources,
+        })
+        reservationBackfill.snapshotsWritten += options.dryRun
+          ? reservationSnapshot.rows.length
+          : await writeReservationSnapshotRows(client, reservationSnapshot.rows)
+        if (!options.dryRun) {
+          await writeReservationSnapshotRun(client, {
+            snapshotDate: day,
+            stockLevelCount: reservationSnapshot.stockLevelCount,
+            reservationSnapshotCount: reservationSnapshot.rows.length,
+          })
+        }
+        reservationBackfill.daysWritten += 1
+        reservationBackfill.runMarkersWritten += options.dryRun ? 0 : 1
+      }
+    }
+
     await reverseMovementsAfter(endOfUtcDay(addUtcDays(day, -1)))
   }
 
@@ -808,6 +977,7 @@ export async function backfillInventorySnapshots(options: {
     missingValueMovementCount,
     dryRun: options.dryRun === true,
     valueReplayReliable: missingValueMovementCount === 0,
+    reservationBackfill,
   }
 }
 

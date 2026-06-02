@@ -74,11 +74,22 @@ Backfill reconstructs older days from current state by replaying
 `missingValueMovementCount` and make the value result advisory for affected
 ranges.
 
-Reservation snapshot backfill is not part of the current on-hand backfill. Only
-days captured by the daily cron after the reservation snapshot migration have
-true historical reserved/available evidence. Older inventory snapshot days will
-surface missing reservation evidence in stock-on-hand reports until the
-reservation backfill follow-up lands.
+Reservation snapshots are opt-in during backfill:
+
+```bash
+npm run inventory:snapshots:backfill -- --from 2026-01-01 --to 2026-01-31 --include-reservations --dry-run
+npm run inventory:snapshots:backfill -- --from 2026-01-01 --to 2026-01-31 --include-reservations --yes
+```
+
+The reservation pass is conservative. It writes sparse reservation rows and a
+daily run marker only when allocation, shipment, and production reservation
+sources have not changed after the target UTC day. If those sources changed
+after the cutoff, the backfill reports a warning for that date and does not
+write `inventory_reservation_snapshot_runs`; stock-on-hand reports will continue
+to surface missing reservation evidence rather than treating absent rows as
+zero. Historical reservation reconstruction cannot recover deleted source rows
+or pre-existing data that lacks mutation evidence, so run the dry-run first and
+review every `reservationBackfill.warnings` entry before writing.
 
 ## Performance
 
