@@ -23,6 +23,7 @@ import { NavGroup } from './nav-group'
 import { Button } from '@/components/ui/button'
 import { Separator } from '@/components/ui/separator'
 import { hasPermission, type Permission } from '@/lib/permissions'
+import { canAccessStockPositionReports, STOCK_POSITION_REPORT_LINKS } from '@/lib/security/stock-position-policy'
 
 const STOCK_CONTROL_CHILDREN = [
   { href: '/stock-control/stock-adjustments', label: 'Stock Adjustments' },
@@ -44,16 +45,8 @@ const ANALYTICS_CHILDREN = [
   { href: '/analytics/purchase-stats',         label: 'Purchase Statistics' },
   { href: '/analytics/product-profitability',  label: 'Product Profitability' },
   { href: '/analytics/inventory-stats',        label: 'Inventory Report' },
-  { href: '/analytics/stock-on-hand',          label: 'Stock on Hand' },
-  { href: '/analytics/stock-allocations',      label: 'Stock Allocations' },
-  { href: '/analytics/negative-stock',         label: 'Negative Stock' },
+  ...STOCK_POSITION_REPORT_LINKS,
   { href: '/analytics/forecast',               label: 'Reorder Forecast' },
-]
-
-const WAREHOUSE_ANALYTICS_CHILDREN = [
-  { href: '/analytics/stock-on-hand',          label: 'Stock on Hand' },
-  { href: '/analytics/stock-allocations',      label: 'Stock Allocations' },
-  { href: '/analytics/negative-stock',         label: 'Negative Stock' },
 ]
 
 function getSettingsChildren(accountingIntegrationEnabled: boolean) {
@@ -103,7 +96,7 @@ export function Sidebar({
   const isSupplier = userRole === 'SUPPLIER'
   const settingsChildren = getSettingsChildren(accountingIntegrationEnabled)
   const showIntegrations = shoppingIntegrationEnabled || accountingIntegrationEnabled || wmsIntegrationEnabled
-  const analyticsChildren = can('analytics') ? ANALYTICS_CHILDREN : WAREHOUSE_ANALYTICS_CHILDREN
+  const analyticsChildren = can('analytics') ? ANALYTICS_CHILDREN : [...STOCK_POSITION_REPORT_LINKS]
 
   // Supplier gets a completely different navigation
   if (isSupplier) {
@@ -175,7 +168,7 @@ export function Sidebar({
         {can('sales') && (
           <NavGroup label="Sales" icon={TrendingUp} items={SALES_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
-        {(can('analytics') || userRole === 'WAREHOUSE') && (
+        {canAccessStockPositionReports(userRole) && (
           <NavGroup label="Analytics" icon={BarChart3} items={analyticsChildren} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
         {can('manufacturing') && <NavItem href="/manufacturing" label="Manufacturing" icon={Factory} collapsed={collapsed} onNavigate={onNavigate} />}

@@ -1,6 +1,5 @@
 import type { Metadata } from 'next'
 import Link from 'next/link'
-import { requireRole } from '@/lib/auth/server'
 import {
   getStockAllocationReport,
   getStockPositionFilterOptions,
@@ -13,6 +12,7 @@ import {
   type StockPositionFilterValues,
 } from '../_components/stock-position-report'
 import { ProductLink } from '@/components/inventory/product-link'
+import { requireStockPositionReportAccess } from '@/lib/security/stock-position-access'
 
 export const metadata: Metadata = { title: 'Stock Allocations' }
 
@@ -47,7 +47,7 @@ function sourceLabel(source: StockAllocationReportRow['source']): string {
 }
 
 export default async function StockAllocationsPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  await requireRole('ADMIN', 'MANAGER', 'WAREHOUSE', 'FINANCE')
+  await requireStockPositionReportAccess()
   const resolvedSearchParams = await searchParams
   const filters = filtersFromSearch(resolvedSearchParams)
   const [report, filterOptions] = await Promise.all([
@@ -79,7 +79,7 @@ export default async function StockAllocationsPage({ searchParams }: { searchPar
     },
     { key: 'expected', label: 'Expected clear', render: (row) => row.expectedDate?.slice(0, 10) ?? 'Undated' },
     { key: 'ageBucket', label: 'Age bucket', render: (row) => row.ageBucket.replaceAll('_', ' ') },
-    { key: 'reserved', label: 'Reserved', align: 'right', render: (row) => `${row.reservedQty} ${row.stockUnit}`, footer: report.totals.reservedQty },
+    { key: 'reserved', label: 'Attributed reserved', align: 'right', render: (row) => `${row.reservedQty} ${row.stockUnit}`, footer: report.totals.reservedQty },
     { key: 'stockLevelReserved', label: 'StockLevel reserved', align: 'right', render: (row) => row.stockLevelReservedQty, footer: report.totals.stockLevelReservedQty },
     { key: 'drift', label: 'Drift', align: 'right', render: (row) => row.driftQty, footer: report.totals.driftQty },
   ]
@@ -93,9 +93,10 @@ export default async function StockAllocationsPage({ searchParams }: { searchPar
       filterOptions={filterOptions}
       pageInfo={report.pageInfo}
       rows={report.rows}
+      rowKey={(row) => `${row.productId}:${row.warehouseId}:${row.source}:${row.referenceId}`}
       columns={columns}
       summary={[
-        { label: 'Reserved', value: report.totals.reservedQty },
+        { label: 'Attributed reserved', value: report.totals.reservedQty },
         { label: 'StockLevel reserved', value: report.totals.stockLevelReservedQty },
         { label: 'Drift', value: report.totals.driftQty, tone: Number(report.totals.driftQty) !== 0 ? 'danger' : 'default' },
         { label: 'Rows', value: report.pageInfo.totalRows.toLocaleString() },

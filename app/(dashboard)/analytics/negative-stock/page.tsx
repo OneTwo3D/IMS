@@ -1,5 +1,4 @@
 import type { Metadata } from 'next'
-import { requireRole } from '@/lib/auth/server'
 import {
   getNegativeStockReport,
   getStockPositionFilterOptions,
@@ -12,6 +11,7 @@ import {
   type StockPositionFilterValues,
 } from '../_components/stock-position-report'
 import { ProductLink } from '@/components/inventory/product-link'
+import { requireStockPositionReportAccess } from '@/lib/security/stock-position-access'
 
 export const metadata: Metadata = { title: 'Negative Stock' }
 
@@ -34,8 +34,12 @@ function filtersFromSearch(searchParams: SearchParams): StockPositionFilters {
   }
 }
 
+function isNegativeDecimalString(value: string): boolean {
+  return value.trim().startsWith('-') && !value.startsWith('-0')
+}
+
 export default async function NegativeStockPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  await requireRole('ADMIN', 'MANAGER', 'WAREHOUSE', 'FINANCE')
+  await requireStockPositionReportAccess()
   const resolvedSearchParams = await searchParams
   const filters = filtersFromSearch(resolvedSearchParams)
   const [report, filterOptions] = await Promise.all([
@@ -77,13 +81,15 @@ export default async function NegativeStockPage({ searchParams }: { searchParams
       filterOptions={filterOptions}
       pageInfo={report.pageInfo}
       rows={report.rows}
+      rowKey={(row) => `${row.productId}:${row.warehouseId}`}
       columns={columns}
       summary={[
         { label: 'Current negative', value: report.totals.currentNegativeRows.toLocaleString(), tone: report.totals.currentNegativeRows > 0 ? 'danger' : 'default' },
         { label: 'Historical negative', value: report.totals.historicalNegativeRows.toLocaleString(), tone: report.totals.historicalNegativeRows > 0 ? 'warning' : 'default' },
-        { label: 'Minimum qty', value: report.totals.minimumQty, tone: Number(report.totals.minimumQty) < 0 ? 'danger' : 'default' },
+        { label: 'Minimum qty', value: report.totals.minimumQty, tone: isNegativeDecimalString(report.totals.minimumQty) ? 'danger' : 'default' },
         { label: 'Rows', value: report.pageInfo.totalRows.toLocaleString() },
       ]}
+      notices={!filters.dateFrom ? ['Showing the default 90-day movement window because no From date is selected.'] : []}
       dateMode="range"
     />
   )

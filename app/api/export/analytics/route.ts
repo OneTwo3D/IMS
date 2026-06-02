@@ -6,42 +6,13 @@ import { generateForecasts } from '@/app/actions/forecasting'
 import { toCsv, csvResponse } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
-import {
-  getNegativeStockReport,
-  getStockAllocationReport,
-  getStockOnHandReport,
-  type StockPositionFilters,
-} from '@/lib/domain/inventory/stock-position-reports'
-
-const STOCK_POSITION_EXPORT_TYPES = new Set(['stock-on-hand', 'stock-allocations', 'negative-stock'])
-const STOCK_POSITION_ROLES = new Set(['ADMIN', 'MANAGER', 'WAREHOUSE', 'FINANCE'])
-
-function one(req: NextRequest, key: string): string | undefined {
-  return req.nextUrl.searchParams.get(key) ?? undefined
-}
-
-function stockPositionFilters(req: NextRequest): StockPositionFilters {
-  return {
-    asOf: one(req, 'asOf'),
-    dateFrom: one(req, 'dateFrom') ?? one(req, 'from'),
-    dateTo: one(req, 'dateTo') ?? one(req, 'to'),
-    warehouseId: one(req, 'warehouseId'),
-    categoryId: one(req, 'categoryId'),
-    supplierId: one(req, 'supplierId'),
-    productType: one(req, 'productType') as StockPositionFilters['productType'],
-    includeZero: one(req, 'includeZero') === '1',
-  }
-}
 
 export async function GET(req: NextRequest) {
   const session = await requireApiAuth()
   if (session instanceof NextResponse) return session
 
   const type = req.nextUrl.searchParams.get('type') ?? 'products'
-  const stockPositionExport = STOCK_POSITION_EXPORT_TYPES.has(type)
-  if (stockPositionExport) {
-    if (!STOCK_POSITION_ROLES.has(session.user.role)) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
-  } else if (!hasPermission(session.user.role, 'analytics')) {
+  if (!hasPermission(session.user.role, 'analytics')) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   const dateFrom = req.nextUrl.searchParams.get('from') ?? undefined
@@ -190,72 +161,6 @@ export async function GET(req: NextRequest) {
       const rows = await getReorderInventory()
       const data = rows.map((r) => ({ sku: r.sku, name: r.name, stockUnit: r.stockUnit, currentStock: r.currentStock, available: r.availableStock, reorderPoint: r.reorderPoint, shortfall: r.shortfall, supplier: r.supplierName, dailyDemand: r.avgDailyDemand, daysToStockout: r.daysUntilStockout }))
       return csvResponse(toCsv(data, ['sku', 'name', 'stockUnit', 'currentStock', 'available', 'reorderPoint', 'shortfall', 'supplier', 'dailyDemand', 'daysToStockout']), `reorder-inventory-${date}.csv`)
-    }
-
-    case 'stock-on-hand': {
-      const report = await getStockOnHandReport(stockPositionFilters(req), { paginate: false })
-      const data = report.rows.map((r) => ({
-        sku: r.sku,
-        productName: r.productName,
-        productType: r.productType,
-        category: r.categoryName ?? '',
-        suppliers: r.supplierNames.join('; '),
-        warehouseCode: r.warehouseCode,
-        warehouseName: r.warehouseName,
-        stockUnit: r.stockUnit,
-        quantity: r.quantity,
-        reservedQty: r.reservedQty,
-        availableQty: r.availableQty,
-        unitCostBase: r.unitCostBase ?? '',
-        totalValueBase: r.totalValueBase,
-        asOf: report.asOf,
-        source: report.source,
-      }))
-      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'quantity', 'reservedQty', 'availableQty', 'unitCostBase', 'totalValueBase', 'asOf', 'source']), `stock-on-hand-${date}.csv`)
-    }
-
-    case 'stock-allocations': {
-      const report = await getStockAllocationReport(stockPositionFilters(req), { paginate: false })
-      const data = report.rows.map((r) => ({
-        sku: r.sku,
-        productName: r.productName,
-        productType: r.productType,
-        category: r.categoryName ?? '',
-        warehouseCode: r.warehouseCode,
-        warehouseName: r.warehouseName,
-        source: r.source,
-        referenceId: r.referenceId,
-        referenceLabel: r.referenceLabel,
-        expectedDate: r.expectedDate ?? '',
-        ageBucket: r.ageBucket,
-        stockUnit: r.stockUnit,
-        reservedQty: r.reservedQty,
-        stockLevelReservedQty: r.stockLevelReservedQty,
-        driftQty: r.driftQty,
-      }))
-      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'warehouseCode', 'warehouseName', 'source', 'referenceId', 'referenceLabel', 'expectedDate', 'ageBucket', 'stockUnit', 'reservedQty', 'stockLevelReservedQty', 'driftQty']), `stock-allocations-${date}.csv`)
-    }
-
-    case 'negative-stock': {
-      const report = await getNegativeStockReport(stockPositionFilters(req), { paginate: false })
-      const data = report.rows.map((r) => ({
-        sku: r.sku,
-        productName: r.productName,
-        productType: r.productType,
-        category: r.categoryName ?? '',
-        warehouseCode: r.warehouseCode,
-        warehouseName: r.warehouseName,
-        stockUnit: r.stockUnit,
-        status: r.status,
-        currentQty: r.currentQty,
-        minimumQty: r.minimumQty,
-        firstNegativeAt: r.firstNegativeAt ?? '',
-        lastMovementAt: r.lastMovementAt ?? '',
-        movementCount: r.movementCount,
-        dateFrom: report.dateFrom,
-        dateTo: report.dateTo,
-      }))
-      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'warehouseCode', 'warehouseName', 'stockUnit', 'status', 'currentQty', 'minimumQty', 'firstNegativeAt', 'lastMovementAt', 'movementCount', 'dateFrom', 'dateTo']), `negative-stock-${date}.csv`)
     }
 
     default:

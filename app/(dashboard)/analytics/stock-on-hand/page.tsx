@@ -1,5 +1,4 @@
 import type { Metadata } from 'next'
-import { requireRole } from '@/lib/auth/server'
 import {
   getStockOnHandReport,
   getStockPositionFilterOptions,
@@ -14,6 +13,7 @@ import {
 import { ProductLink } from '@/components/inventory/product-link'
 import { formatMoneyCode } from '@/lib/utils'
 import { getOrganisation } from '@/app/actions/company'
+import { requireStockPositionReportAccess } from '@/lib/security/stock-position-access'
 
 export const metadata: Metadata = { title: 'Stock on Hand' }
 
@@ -36,8 +36,12 @@ function filtersFromSearch(searchParams: SearchParams): StockPositionFilters {
   }
 }
 
+function isNegativeDecimalString(value: string): boolean {
+  return value.trim().startsWith('-') && !value.startsWith('-0')
+}
+
 export default async function StockOnHandPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  await requireRole('ADMIN', 'MANAGER', 'WAREHOUSE', 'FINANCE')
+  await requireStockPositionReportAccess()
   const resolvedSearchParams = await searchParams
   const filters = filtersFromSearch(resolvedSearchParams)
   const [report, filterOptions, organisation] = await Promise.all([
@@ -83,9 +87,7 @@ export default async function StockOnHandPage({ searchParams }: { searchParams: 
     },
   ]
   const notices = [
-    report.reservedQtyScope === 'current'
-      ? 'Reserved and available quantities use the current StockLevel reservation state; historical snapshots currently cover on-hand quantity and value only.'
-      : '',
+    'Reserved and available quantities use the current StockLevel reservation state; historical snapshots currently cover on-hand quantity and value only.',
     report.valueReplayReliable ? '' : 'This as-of value replay includes movements without value evidence or orphan warehouse movement rows.',
   ].filter(Boolean)
 
@@ -98,11 +100,12 @@ export default async function StockOnHandPage({ searchParams }: { searchParams: 
       filterOptions={filterOptions}
       pageInfo={report.pageInfo}
       rows={report.rows}
+      rowKey={(row) => `${row.productId}:${row.warehouseId}`}
       columns={columns}
       summary={[
         { label: 'On hand', value: report.totals.quantity },
         { label: 'Reserved', value: report.totals.reservedQty, tone: Number(report.totals.reservedQty) > 0 ? 'warning' : 'default' },
-        { label: 'Available', value: report.totals.availableQty, tone: Number(report.totals.availableQty) < 0 ? 'danger' : 'default' },
+        { label: 'Available', value: report.totals.availableQty, tone: isNegativeDecimalString(report.totals.availableQty) ? 'danger' : 'default' },
         { label: `Value (${currency})`, value: formatMoneyCode(Number(report.totals.totalValueBase), currency) },
       ]}
       notices={notices}

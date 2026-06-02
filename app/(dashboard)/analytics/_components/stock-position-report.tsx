@@ -37,6 +37,7 @@ type StockPositionReportPageProps<Row> = {
   filterOptions: StockPositionFilterOptions
   pageInfo: PageInfo
   rows: Row[]
+  rowKey: (row: Row, index: number) => string
   columns: StockPositionColumn<Row>[]
   summary: Array<{ label: string; value: string; tone?: 'default' | 'warning' | 'danger' }>
   notices?: string[]
@@ -56,7 +57,7 @@ function currentParams(filters: StockPositionFilterValues): URLSearchParams {
   const params = new URLSearchParams()
   for (const [key, value] of Object.entries(filters)) {
     if (value == null || value === '' || value === false) continue
-    params.set(key, String(value))
+    params.set(key, value === true ? '1' : String(value))
   }
   return params
 }
@@ -79,13 +80,14 @@ export function StockPositionReportPage<Row>({
   filterOptions,
   pageInfo,
   rows,
+  rowKey,
   columns,
   summary,
   notices = [],
   dateMode,
 }: StockPositionReportPageProps<Row>) {
   const params = currentParams(filters)
-  const csvHref = `/api/export/analytics?${appendParams(params, { type: reportKey })}`
+  const csvHref = `/api/export/stock-position?${appendParams(params, { type: reportKey })}`
   const previousHref = `?${appendParams(params, { page: pageInfo.page - 1 })}`
   const nextHref = `?${appendParams(params, { page: pageInfo.page + 1 })}`
 
@@ -116,18 +118,18 @@ export function StockPositionReportPage<Row>({
         <div className="grid gap-3 md:grid-cols-3 lg:grid-cols-6">
           {dateMode === 'as-of' && (
             <div className="space-y-1.5">
-              <Label htmlFor="asOf">As of</Label>
+              <Label htmlFor="asOf">As of (UTC)</Label>
               <Input id="asOf" name="asOf" type="date" defaultValue={filters.asOf ?? today()} className="h-9" />
             </div>
           )}
           {dateMode === 'range' && (
             <>
               <div className="space-y-1.5">
-                <Label htmlFor="dateFrom">From</Label>
+                <Label htmlFor="dateFrom">From (UTC)</Label>
                 <Input id="dateFrom" name="dateFrom" type="date" defaultValue={filters.dateFrom ?? ''} className="h-9" />
               </div>
               <div className="space-y-1.5">
-                <Label htmlFor="dateTo">To</Label>
+                <Label htmlFor="dateTo">To (UTC)</Label>
                 <Input id="dateTo" name="dateTo" type="date" defaultValue={filters.dateTo ?? ''} className="h-9" />
               </div>
             </>
@@ -211,7 +213,7 @@ export function StockPositionReportPage<Row>({
           </TableHeader>
           <TableBody>
             {rows.map((row, index) => (
-              <TableRow key={index}>
+              <TableRow key={rowKey(row, index)}>
                 {columns.map((column) => (
                   <TableCell key={column.key} className={column.align === 'right' ? 'text-right tabular-nums' : ''}>
                     {column.render(row)}

@@ -1,4 +1,5 @@
-import { Prisma, type ProductType, type StockMovementType } from '@/app/generated/prisma/client'
+import { cache } from 'react'
+import { Prisma, ProductType, type StockMovementType } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { getOnHandAsOf as defaultGetOnHandAsOf } from '@/lib/domain/inventory/get-on-hand-as-of'
 import {
@@ -9,10 +10,12 @@ import {
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 const DEFAULT_PAGE_SIZE = 100
+const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
 const DEFAULT_NEGATIVE_STOCK_LOOKBACK_DAYS = 90
+const NEGATIVE_STOCK_MOVEMENT_PAGE_SIZE = 10000
 const ZERO = new Prisma.Decimal(0)
-const PRODUCT_TYPES = ['SIMPLE', 'VARIABLE', 'VARIANT', 'KIT', 'BOM', 'NON_INVENTORY'] as const
+const PRODUCT_TYPES = Object.values(ProductType)
 
 type ProductMeta = {
   id: string
@@ -30,8 +33,21 @@ type WarehouseMeta = {
   name: string
 }
 
+type FindManyDelegate = {
+  findMany(args?: unknown): Promise<unknown[]>
+}
+
+export type StockPositionReportClient = {
+  warehouse: FindManyDelegate
+  productCategory: FindManyDelegate
+  supplier: FindManyDelegate
+  product: FindManyDelegate
+  stockLevel: FindManyDelegate
+  stockMovement: FindManyDelegate
+}
+
 export type StockPositionReportDeps = {
-  client?: typeof db
+  client?: StockPositionReportClient
   getOnHandAsOf?: typeof defaultGetOnHandAsOf
   loadReservationSourceRows?: typeof defaultLoadReservationSourceRows
 }
@@ -167,6 +183,28 @@ export type NegativeStockReport = {
 
 type ProductWhereInput = Prisma.ProductWhereInput
 
+type ProductMetaQueryRow = {
+  id: string
+  sku: string
+  name: string
+  type: ProductType
+  stockUnit: string
+  category: { name: string } | null
+  supplierProducts: Array<{ supplier: { name: string } }>
+}
+
+type ReservedStockLevelRow = {
+  productId: string
+  warehouseId: string
+  reservedQty: DecimalInput
+}
+
+type StockLevelQuantityRow = {
+  productId: string
+  warehouseId: string
+  quantity: DecimalInput
+}
+
 function clampPage(value: unknown): number {
   const parsed = Number(value)
   return Number.isInteger(parsed) && parsed > 0 ? parsed : 1
@@ -175,7 +213,7 @@ function clampPage(value: unknown): number {
 function clampPageSize(value: unknown): number {
   const parsed = Number(value)
   if (!Number.isInteger(parsed) || parsed <= 0) return DEFAULT_PAGE_SIZE
-  return Math.min(parsed, MAX_PAGE_SIZE)
+  return Math.min(Math.max(parsed, MIN_PAGE_SIZE), MAX_PAGE_SIZE)
 }
 
 function pageInfo(totalRows: number, page: number, pageSize: number): PageInfo {
@@ -225,7 +263,7 @@ function subtractDays(value: Date, days: number): Date {
 }
 
 function productWhere(filters: StockPositionFilters): ProductWhereInput {
-  const productType = PRODUCT_TYPES.includes(filters.productType as typeof PRODUCT_TYPES[number])
+  const productType = PRODUCT_TYPES.includes(filters.productType as ProductType)
     ? filters.productType
     : undefined
   return {
@@ -242,17 +280,16 @@ function productWhere(filters: StockPositionFilters): ProductWhereInput {
 }
 
 function keepProduct(product: ProductMeta | undefined, filters: StockPositionFilters): product is ProductMeta {
-  const productType = PRODUCT_TYPES.includes(filters.productType as typeof PRODUCT_TYPES[number])
+  const productType = PRODUCT_TYPES.includes(filters.productType as ProductType)
     ? filters.productType
     : undefined
   if (!product) return false
-  if (filters.categoryId && product.categoryName == null) return false
   if (productType && product.type !== productType) return false
   if (filters.supplierId && product.supplierNames.length === 0) return false
   return true
 }
 
-async function loadFilterOptions(client: typeof db = db): Promise<StockPositionFilterOptions> {
+async function loadFilterOptions(client: StockPositionReportClient = db as StockPositionReportClient): Promise<StockPositionFilterOptions> {
   const [warehouses, categories, suppliers] = await Promise.all([
     client.warehouse.findMany({
       where: { active: true },
@@ -271,14 +308,16 @@ async function loadFilterOptions(client: typeof db = db): Promise<StockPositionF
   ])
 
   return {
-    warehouses,
-    categories,
-    suppliers,
+    warehouses: warehouses as WarehouseMeta[],
+    categories: categories as Array<{ id: string; name: string }>,
+    suppliers: suppliers as Array<{ id: string; name: string }>,
     productTypes: [...PRODUCT_TYPES],
   }
 }
 
-async function loadProductMeta(productIds: string[], filters: StockPositionFilters = {}, client: typeof db = db): Promise<Map<string, ProductMeta>> {
+const getCachedFilterOptions = cache(() => loadFilterOptions(db as StockPositionReportClient))
+
+async function loadProductMeta(productIds: string[], filters: StockPositionFilters = {}, client: StockPositionReportClient = db as StockPositionReportClient): Promise<Map<string, ProductMeta>> {
   if (productIds.length === 0) return new Map()
   const products = await client.product.findMany({
     where: {
@@ -298,7 +337,7 @@ async function loadProductMeta(productIds: string[], filters: StockPositionFilte
         orderBy: { supplier: { name: 'asc' } },
       },
     },
-  })
+  }) as ProductMetaQueryRow[]
   return new Map(products.map((product) => [
     product.id,
     {
@@ -313,29 +352,33 @@ async function loadProductMeta(productIds: string[], filters: StockPositionFilte
   ]))
 }
 
-async function loadWarehouseMeta(warehouseIds: string[], client: typeof db = db): Promise<Map<string, WarehouseMeta>> {
+async function loadWarehouseMeta(warehouseIds: string[], client: StockPositionReportClient = db as StockPositionReportClient): Promise<Map<string, WarehouseMeta>> {
   if (warehouseIds.length === 0) return new Map()
   const warehouses = await client.warehouse.findMany({
     where: { id: { in: Array.from(new Set(warehouseIds)) } },
     select: { id: true, code: true, name: true },
-  })
+  }) as WarehouseMeta[]
   return new Map(warehouses.map((warehouse) => [warehouse.id, warehouse]))
 }
 
-async function loadReservedQty(rows: Array<{ productId: string; warehouseId: string }>, client: typeof db = db): Promise<Map<string, Decimal>> {
+async function loadReservedQty(rows: Array<{ productId: string; warehouseId: string }>, client: StockPositionReportClient = db as StockPositionReportClient): Promise<Map<string, Decimal>> {
   if (rows.length === 0) return new Map()
-  const pairs = rows.map((row) => ({
-    productId: row.productId,
-    warehouseId: row.warehouseId,
-  }))
+  const productIds = Array.from(new Set(rows.map((row) => row.productId)))
+  const warehouseIds = Array.from(new Set(rows.map((row) => row.warehouseId)))
+  const requestedKeys = new Set(rows.map((row) => stockKey(row.productId, row.warehouseId)))
   const levels = await client.stockLevel.findMany({
-    where: { OR: pairs },
+    where: {
+      productId: { in: productIds },
+      warehouseId: { in: warehouseIds },
+    },
     select: { productId: true, warehouseId: true, reservedQty: true },
-  })
-  return new Map(levels.map((level) => [
-    stockKey(level.productId, level.warehouseId),
-    toDecimal(level.reservedQty),
-  ]))
+  }) as ReservedStockLevelRow[]
+  return new Map(levels
+    .filter((level) => requestedKeys.has(stockKey(level.productId, level.warehouseId)))
+    .map((level) => [
+      stockKey(level.productId, level.warehouseId),
+      toDecimal(level.reservedQty),
+    ]))
 }
 
 function stockKey(productId: string, warehouseId: string): string {
@@ -349,7 +392,7 @@ function referenceHref(source: ReservationBreakdownRow['source'], referenceId: s
     case 'production_order':
       return `/manufacturing/${referenceId}`
     case 'stock_transfer':
-      return `/stock-control/transfers`
+      return null
     default:
       return null
   }
@@ -368,19 +411,21 @@ function ageBucket(expectedDate: string | null, now = new Date()): string {
 }
 
 export async function getStockPositionFilterOptions(deps: StockPositionReportDeps = {}): Promise<StockPositionFilterOptions> {
-  return loadFilterOptions(deps.client ?? db)
+  return deps.client ? loadFilterOptions(deps.client) : getCachedFilterOptions()
 }
 
 export async function getStockOnHandReport(
   filters: StockPositionFilters = {},
   options: { paginate?: boolean; deps?: StockPositionReportDeps } = { paginate: true },
 ): Promise<StockOnHandReport> {
-  const client = options.deps?.client ?? db
+  const client = options.deps?.client ?? db as StockPositionReportClient
   const getOnHandAsOf = options.deps?.getOnHandAsOf ?? defaultGetOnHandAsOf
   const asOfResult = await getOnHandAsOf({
     asOf: filters.asOf,
     warehouseId: filters.warehouseId,
     categoryId: filters.categoryId,
+    productType: filters.productType,
+    supplierId: filters.supplierId,
     excludeZero: !filters.includeZero,
   })
   const productIds = asOfResult.rows.map((row) => row.productId)
@@ -455,7 +500,7 @@ export async function getStockAllocationReport(
   filters: StockPositionFilters = {},
   options: { paginate?: boolean; deps?: StockPositionReportDeps } = { paginate: true },
 ): Promise<StockAllocationReport> {
-  const client = options.deps?.client ?? db
+  const client = options.deps?.client ?? db as StockPositionReportClient
   const loadReservationSourceRows = options.deps?.loadReservationSourceRows ?? defaultLoadReservationSourceRows
   const stockLevels = await client.stockLevel.findMany({
     where: {
@@ -469,7 +514,7 @@ export async function getStockAllocationReport(
       reservedQty: true,
     },
     orderBy: [{ product: { sku: 'asc' } }, { warehouse: { code: 'asc' } }],
-  })
+  }) as ReservedStockLevelRow[]
   const sourceRows = await loadReservationSourceRows(client as unknown as ReservationBreakdownClient, {
     warehouseId: filters.warehouseId,
   })
@@ -529,6 +574,7 @@ export async function getStockAllocationReport(
     }
 
     if (driftQty.abs().gt('0.0001')) {
+      const driftKind = driftQty.gt(0) ? 'unattributed' : 'over_attributed'
       rows.push({
         productId: stockLevel.productId,
         warehouseId: stockLevel.warehouseId,
@@ -540,8 +586,8 @@ export async function getStockAllocationReport(
         warehouseName: warehouse.name,
         stockUnit: product.stockUnit,
         source: 'other',
-        referenceId: key,
-        referenceLabel: 'Unattributed reserved balance',
+        referenceId: `other:${driftKind}:${key}`,
+        referenceLabel: driftQty.gt(0) ? 'Unattributed reserved balance' : 'Over-attributed reserved balance',
         referenceHref: null,
         expectedDate: null,
         ageBucket: 'undated',
@@ -563,7 +609,7 @@ export async function getStockAllocationReport(
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
-      reservedQty: decimalString(totalKnownReserved.add(totalDrift)),
+      reservedQty: decimalString(totalKnownReserved),
       stockLevelReservedQty: decimalString(totalStockLevelReserved),
       driftQty: decimalString(totalDrift),
     },
@@ -577,6 +623,16 @@ type MovementEffect = {
   productId: string
   warehouseId: string
   qtyDelta: Decimal
+}
+
+type NegativeStockMovementRow = {
+  id: string
+  createdAt: Date
+  type: StockMovementType
+  productId: string
+  fromWarehouseId: string | null
+  toWarehouseId: string | null
+  qty: DecimalInput
 }
 
 function movementEffects(movement: {
@@ -613,33 +669,16 @@ function movementEffects(movement: {
   return effects
 }
 
-export async function getNegativeStockReport(
-  filters: StockPositionFilters = {},
-  options: { paginate?: boolean; now?: () => Date; deps?: StockPositionReportDeps } = { paginate: true },
-): Promise<NegativeStockReport> {
-  const client = options.deps?.client ?? db
-  const getOnHandAsOf = options.deps?.getOnHandAsOf ?? defaultGetOnHandAsOf
-  const now = options.now?.() ?? new Date()
-  const defaultFrom = subtractDays(now, DEFAULT_NEGATIVE_STOCK_LOOKBACK_DAYS)
-  const dateFrom = parseDateOnly(filters.dateFrom, defaultFrom)
-  const dateTo = endOfUtcDay(parseDateOnly(filters.dateTo, now))
-  const openingAsOf = subtractDays(dateFrom, 1)
+async function loadNegativeStockMovements(
+  client: StockPositionReportClient,
+  where: Prisma.StockMovementWhereInput,
+): Promise<NegativeStockMovementRow[]> {
+  const rows: NegativeStockMovementRow[] = []
+  let cursor: { id: string } | undefined
 
-  const [opening, movements, currentLevels] = await Promise.all([
-    getOnHandAsOf({
-      asOf: formatDateOnly(openingAsOf),
-      warehouseId: filters.warehouseId,
-      categoryId: filters.categoryId,
-      excludeZero: false,
-    }),
-    client.stockMovement.findMany({
-      where: {
-        createdAt: { gte: dateFrom, lte: dateTo },
-        ...(filters.warehouseId
-          ? { OR: [{ fromWarehouseId: filters.warehouseId }, { toWarehouseId: filters.warehouseId }] }
-          : {}),
-        product: productWhere(filters),
-      },
+  while (true) {
+    const page = await client.stockMovement.findMany({
+      where,
       select: {
         id: true,
         createdAt: true,
@@ -650,20 +689,62 @@ export async function getNegativeStockReport(
         qty: true,
       },
       orderBy: [{ createdAt: 'asc' }, { id: 'asc' }],
+      take: NEGATIVE_STOCK_MOVEMENT_PAGE_SIZE,
+      ...(cursor ? { cursor, skip: 1 } : {}),
+    }) as NegativeStockMovementRow[]
+    rows.push(...page)
+    if (page.length < NEGATIVE_STOCK_MOVEMENT_PAGE_SIZE) break
+    cursor = { id: page[page.length - 1]!.id }
+  }
+
+  return rows
+}
+
+export async function getNegativeStockReport(
+  filters: StockPositionFilters = {},
+  options: { paginate?: boolean; now?: () => Date; deps?: StockPositionReportDeps } = { paginate: true },
+): Promise<NegativeStockReport> {
+  const client = options.deps?.client ?? db as StockPositionReportClient
+  const getOnHandAsOf = options.deps?.getOnHandAsOf ?? defaultGetOnHandAsOf
+  const now = options.now?.() ?? new Date()
+  const defaultFrom = subtractDays(now, DEFAULT_NEGATIVE_STOCK_LOOKBACK_DAYS)
+  const dateFrom = parseDateOnly(filters.dateFrom, defaultFrom)
+  const dateTo = endOfUtcDay(parseDateOnly(filters.dateTo, now))
+  // The opening balance is the end of the previous UTC day; movements inside
+  // dateFrom..dateTo are then replayed inclusively to find the trough.
+  const openingAsOf = subtractDays(dateFrom, 1)
+  const movementWhere: Prisma.StockMovementWhereInput = {
+    createdAt: { gte: dateFrom, lte: dateTo },
+    ...(filters.warehouseId
+      ? { OR: [{ fromWarehouseId: filters.warehouseId }, { toWarehouseId: filters.warehouseId }] }
+      : {}),
+    product: productWhere(filters),
+  }
+
+  const [opening, movements, currentLevels] = await Promise.all([
+    getOnHandAsOf({
+      asOf: formatDateOnly(openingAsOf),
+      warehouseId: filters.warehouseId,
+      categoryId: filters.categoryId,
+      productType: filters.productType,
+      supplierId: filters.supplierId,
+      excludeZero: false,
     }),
+    loadNegativeStockMovements(client, movementWhere),
     client.stockLevel.findMany({
       where: {
         ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
         product: productWhere(filters),
       },
       select: { productId: true, warehouseId: true, quantity: true },
-    }),
+    }) as Promise<StockLevelQuantityRow[]>,
   ])
 
-  const state = new Map<string, Decimal>()
+  const openingState = new Map<string, Decimal>()
   for (const row of opening.rows) {
-    state.set(stockKey(row.productId, row.warehouseId), toDecimal(row.qty))
+    openingState.set(stockKey(row.productId, row.warehouseId), toDecimal(row.qty))
   }
+  const state = new Map(openingState)
 
   const candidates = new Map<string, {
     productId: string
@@ -688,7 +769,7 @@ export async function getNegativeStockReport(
     const created = {
       productId,
       warehouseId,
-      minimumQty: state.get(key) ?? ZERO,
+      minimumQty: openingState.get(key) ?? ZERO,
       firstNegativeAt: null,
       lastMovementAt: null,
       movementCount: 0,
