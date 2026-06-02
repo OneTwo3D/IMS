@@ -43,6 +43,7 @@ export type StockPositionReportClient = {
   supplier: FindManyDelegate
   product: FindManyDelegate
   stockLevel: FindManyDelegate
+  inventoryReservationSnapshot: FindManyDelegate
   stockMovement: FindManyDelegate
 }
 
@@ -95,9 +96,23 @@ export type StockOnHandReportRow = {
   quantity: string
   reservedQty: string
   availableQty: string
+  reservationQtySource: StockOnHandReservationQtySource
+  reservationSnapshotDate: string | null
+  reservationSourceCount: number | null
   unitCostBase: string | null
   totalValueBase: string
 }
+
+export type StockOnHandReservationQtySource =
+  | 'current'
+  | 'snapshot'
+  | 'current_missing_snapshot'
+
+export type StockOnHandReservedQtyScope =
+  | 'current'
+  | 'snapshot'
+  | 'current_missing_snapshot'
+  | 'mixed_snapshot_current_missing'
 
 export type StockOnHandReport = {
   asOf: string
@@ -105,7 +120,10 @@ export type StockOnHandReport = {
   source: string
   anchorDate: string | null
   valueReplayReliable: boolean
-  reservedQtyScope: 'current'
+  reservedQtyScope: StockOnHandReservedQtyScope
+  reservationSnapshotDate: string | null
+  missingReservationSnapshotCount: number
+  currentReservationFallbackCount: number
   missingValueMovementCount: number
   orphanWarehouseMovementCount: number
   rows: StockOnHandReportRow[]
@@ -197,6 +215,14 @@ type ReservedStockLevelRow = {
   productId: string
   warehouseId: string
   reservedQty: DecimalInput
+}
+
+type ReservationSnapshotReportRow = {
+  productId: string
+  warehouseId: string
+  reservedQty: DecimalInput
+  availableQty: DecimalInput
+  reservationSourceCount: number
 }
 
 type StockLevelQuantityRow = {
@@ -381,6 +407,52 @@ async function loadReservedQty(rows: Array<{ productId: string; warehouseId: str
     ]))
 }
 
+async function loadReservationSnapshots(
+  rows: Array<{ productId: string; warehouseId: string }>,
+  snapshotDate: Date,
+  client: StockPositionReportClient = db as StockPositionReportClient,
+): Promise<Map<string, ReservationSnapshotReportRow>> {
+  if (rows.length === 0) return new Map()
+  const productIds = Array.from(new Set(rows.map((row) => row.productId)))
+  const warehouseIds = Array.from(new Set(rows.map((row) => row.warehouseId)))
+  const requestedKeys = new Set(rows.map((row) => stockKey(row.productId, row.warehouseId)))
+  const snapshots = await client.inventoryReservationSnapshot.findMany({
+    where: {
+      snapshotDate,
+      productId: { in: productIds },
+      warehouseId: { in: warehouseIds },
+    },
+    select: {
+      productId: true,
+      warehouseId: true,
+      reservedQty: true,
+      availableQty: true,
+      reservationSourceCount: true,
+    },
+  }) as ReservationSnapshotReportRow[]
+  return new Map(snapshots
+    .filter((snapshot) => requestedKeys.has(stockKey(snapshot.productId, snapshot.warehouseId)))
+    .map((snapshot) => [stockKey(snapshot.productId, snapshot.warehouseId), snapshot]))
+}
+
+function snapshotDateFromAsOf(asOf: string): Date {
+  const value = new Date(asOf)
+  return new Date(Date.UTC(value.getUTCFullYear(), value.getUTCMonth(), value.getUTCDate()))
+}
+
+function reservationScopeFromCounts(input: {
+  historical: boolean
+  rows: number
+  snapshotRows: number
+  missingRows: number
+}): StockOnHandReservedQtyScope {
+  if (!input.historical) return 'current'
+  if (input.rows === 0) return 'snapshot'
+  if (input.snapshotRows === input.rows) return 'snapshot'
+  if (input.snapshotRows === 0 && input.missingRows > 0) return 'current_missing_snapshot'
+  return 'mixed_snapshot_current_missing'
+}
+
 function stockKey(productId: string, warehouseId: string): string {
   return `${productId}:${warehouseId}`
 }
@@ -430,20 +502,45 @@ export async function getStockOnHandReport(
   })
   const productIds = asOfResult.rows.map((row) => row.productId)
   const warehouseIds = asOfResult.rows.map((row) => row.warehouseId)
-  const [products, warehouses, reservedQtyByStock] = await Promise.all([
+  const historicalReservationMode = asOfResult.source !== 'current'
+  const reservationSnapshotDate = historicalReservationMode ? snapshotDateFromAsOf(asOfResult.asOf) : null
+  const [products, warehouses, reservedQtyByStock, reservationSnapshotsByStock] = await Promise.all([
     loadProductMeta(productIds, filters, client),
     loadWarehouseMeta(warehouseIds, client),
     loadReservedQty(asOfResult.rows, client),
+    reservationSnapshotDate
+      ? loadReservationSnapshots(asOfResult.rows, reservationSnapshotDate, client)
+      : Promise.resolve(new Map<string, ReservationSnapshotReportRow>()),
   ])
 
+  let snapshotReservationRows = 0
+  let missingReservationSnapshotCount = 0
+  let currentReservationFallbackCount = 0
   const rows = asOfResult.rows
     .map((row): StockOnHandReportRow | null => {
       const product = products.get(row.productId)
       const warehouse = warehouses.get(row.warehouseId)
       if (!keepProduct(product, filters) || !warehouse) return null
       const quantity = toDecimal(row.qty)
-      const reservedQty = reservedQtyByStock.get(stockKey(row.productId, row.warehouseId)) ?? ZERO
-      const availableQty = quantity.sub(reservedQty)
+      const key = stockKey(row.productId, row.warehouseId)
+      const reservationSnapshot = reservationSnapshotsByStock.get(key)
+      const reservationQtySource: StockOnHandReservationQtySource = reservationSnapshot
+        ? 'snapshot'
+        : historicalReservationMode
+          ? 'current_missing_snapshot'
+          : 'current'
+      const reservedQty = reservationSnapshot
+        ? toDecimal(reservationSnapshot.reservedQty)
+        : reservedQtyByStock.get(key) ?? ZERO
+      const availableQty = reservationSnapshot
+        ? toDecimal(reservationSnapshot.availableQty)
+        : quantity.sub(reservedQty)
+      if (reservationSnapshot) {
+        snapshotReservationRows += 1
+      } else if (historicalReservationMode) {
+        missingReservationSnapshotCount += 1
+        currentReservationFallbackCount += 1
+      }
       return {
         productId: row.productId,
         warehouseId: row.warehouseId,
@@ -458,6 +555,9 @@ export async function getStockOnHandReport(
         quantity: decimalString(quantity),
         reservedQty: decimalString(reservedQty),
         availableQty: decimalString(availableQty),
+        reservationQtySource,
+        reservationSnapshotDate: reservationSnapshotDate ? formatDateOnly(reservationSnapshotDate) : null,
+        reservationSourceCount: reservationSnapshot?.reservationSourceCount ?? null,
         unitCostBase: row.unitCostBase,
         totalValueBase: moneyString(toDecimal(row.valueBase)),
       }
@@ -482,7 +582,15 @@ export async function getStockOnHandReport(
     source: asOfResult.source,
     anchorDate: asOfResult.anchorDate,
     valueReplayReliable: asOfResult.valueReplayReliable,
-    reservedQtyScope: 'current',
+    reservedQtyScope: reservationScopeFromCounts({
+      historical: historicalReservationMode,
+      rows: rows.length,
+      snapshotRows: snapshotReservationRows,
+      missingRows: missingReservationSnapshotCount,
+    }),
+    reservationSnapshotDate: reservationSnapshotDate ? formatDateOnly(reservationSnapshotDate) : null,
+    missingReservationSnapshotCount,
+    currentReservationFallbackCount,
     missingValueMovementCount: asOfResult.missingValueMovementCount,
     orphanWarehouseMovementCount: asOfResult.orphanWarehouseMovementCount,
     rows: paged.rows,

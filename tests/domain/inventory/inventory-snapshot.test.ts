@@ -4,6 +4,7 @@ import test from 'node:test'
 import { Prisma, StockMovementType } from '../../../app/generated/prisma/client.ts'
 import {
   backfillInventorySnapshots,
+  buildInventoryReservationSnapshotRows,
   buildInventorySnapshotRows,
   getAverageInventoryValueBase,
   writeDailyInventorySnapshot,
@@ -15,7 +16,7 @@ function decimal(value: string | number): Prisma.Decimal {
 }
 
 function createSnapshotClient(input: {
-  stockLevels?: Array<{ productId: string; warehouseId: string; quantity: Prisma.Decimal }>
+  stockLevels?: Array<{ productId: string; warehouseId: string; quantity: Prisma.Decimal; reservedQty?: Prisma.Decimal }>
   costLayers?: Array<{ productId: string; warehouseId: string; remainingQty: Prisma.Decimal; unitCostBase: Prisma.Decimal }>
   movements?: Array<{
     id: string
@@ -28,12 +29,27 @@ function createSnapshotClient(input: {
     createdAt: Date
   }>
   averageRows?: Array<{ snapshotDate: Date; valueBase: Prisma.Decimal }>
-} = {}): InventorySnapshotTestClient & { upserts: unknown[] } {
+  allocations?: Array<{
+    id: string
+    orderId: string
+    lineId: string
+    productId: string
+    warehouseId: string
+    qty: Prisma.Decimal
+    order: { orderNumber: string | null; externalOrderNumber: string | null; expectedDelivery: Date | null; status: string }
+    line: { sku: string | null; description: string }
+  }>
+} = {}): InventorySnapshotTestClient & { upserts: unknown[]; reservationUpserts: unknown[] } {
   const upserts: unknown[] = []
+  const reservationUpserts: unknown[] = []
   return {
     upserts,
+    reservationUpserts,
     stockLevel: {
-      findMany: async () => input.stockLevels ?? [],
+      findMany: async () => (input.stockLevels ?? []).map((level) => ({
+        ...level,
+        reservedQty: level.reservedQty ?? decimal('0'),
+      })),
     },
     costLayer: {
       findMany: async () => input.costLayers ?? [],
@@ -57,6 +73,21 @@ function createSnapshotClient(input: {
         upserts.push(args)
         return {}
       },
+    },
+    inventoryReservationSnapshot: {
+      upsert: async (args) => {
+        reservationUpserts.push(args)
+        return {}
+      },
+    },
+    orderAllocation: {
+      findMany: async () => input.allocations ?? [],
+    },
+    shipmentLine: {
+      findMany: async () => [],
+    },
+    productionOrder: {
+      findMany: async () => [],
     },
     $transaction: async (operations) => Promise.all(operations),
   }
@@ -115,8 +146,18 @@ test('inventory snapshot rows value stock from remaining FIFO layers and report 
 
 test('daily inventory snapshot upserts by date/product/warehouse and returns drift counts', async () => {
   const client = createSnapshotClient({
-    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('2') }],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('2'), reservedQty: decimal('0.5') }],
     costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('2'), unitCostBase: decimal('5') }],
+    allocations: [{
+      id: 'allocation-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('0.5'),
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'CONFIRMED' },
+      line: { sku: 'SKU-1', description: 'Widget' },
+    }],
   })
 
   const result = await writeDailyInventorySnapshot({
@@ -127,6 +168,7 @@ test('daily inventory snapshot upserts by date/product/warehouse and returns dri
   assert.deepEqual(result, {
     snapshotDate: '2026-05-28',
     snapshotsWritten: 1,
+    reservationSnapshotsWritten: 1,
     driftCount: 0,
     driftTruncated: false,
     drift: [],
@@ -140,6 +182,91 @@ test('daily inventory snapshot upserts by date/product/warehouse and returns dri
       productId: 'product-1',
       warehouseId: 'warehouse-1',
     },
+  )
+  assert.equal(client.reservationUpserts.length, 1)
+  const reservationCreate = (client.reservationUpserts[0] as {
+    create: {
+      snapshotDate: Date
+      productId: string
+      warehouseId: string
+      reservedQty: Prisma.Decimal
+      availableQty: Prisma.Decimal
+      reservationSourceCount: number
+    }
+  }).create
+  assert.deepEqual(
+    {
+      snapshotDate: reservationCreate.snapshotDate,
+      productId: reservationCreate.productId,
+      warehouseId: reservationCreate.warehouseId,
+      reservedQty: reservationCreate.reservedQty.toFixed(4),
+      availableQty: reservationCreate.availableQty.toFixed(4),
+      reservationSourceCount: reservationCreate.reservationSourceCount,
+    },
+    {
+      snapshotDate: new Date('2026-05-28T00:00:00.000Z'),
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      reservedQty: '0.5000',
+      availableQty: '1.5000',
+      reservationSourceCount: 1,
+    },
+  )
+})
+
+test('reservation snapshot rows round reserved and available quantities with source evidence counts', () => {
+  const rows = buildInventoryReservationSnapshotRows({
+    snapshotDate: '2026-05-28',
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('10'), reservedQty: decimal('2.12345') },
+      { productId: 'product-2', warehouseId: 'warehouse-1', quantity: decimal('5'), reservedQty: decimal('0') },
+    ],
+    reservationSources: [
+      {
+        source: 'sales_order',
+        productId: 'product-1',
+        warehouseId: 'warehouse-1',
+        referenceId: 'order-1',
+        referenceLabel: 'SO 1',
+        qty: '1',
+        expectedDate: null,
+      },
+      {
+        source: 'production_order',
+        productId: 'product-1',
+        warehouseId: 'warehouse-1',
+        referenceId: 'mo-1',
+        referenceLabel: 'MO 1',
+        qty: '1.1234',
+        expectedDate: null,
+      },
+    ],
+  })
+
+  assert.deepEqual(
+    rows.map((row) => ({
+      productId: row.productId,
+      warehouseId: row.warehouseId,
+      reservedQty: row.reservedQty.toFixed(4),
+      availableQty: row.availableQty.toFixed(4),
+      reservationSourceCount: row.reservationSourceCount,
+    })),
+    [
+      {
+        productId: 'product-1',
+        warehouseId: 'warehouse-1',
+        reservedQty: '2.1235',
+        availableQty: '7.8765',
+        reservationSourceCount: 2,
+      },
+      {
+        productId: 'product-2',
+        warehouseId: 'warehouse-1',
+        reservedQty: '0.0000',
+        availableQty: '5.0000',
+        reservationSourceCount: 0,
+      },
+    ],
   )
 })
 

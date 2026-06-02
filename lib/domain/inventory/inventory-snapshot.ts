@@ -1,6 +1,11 @@
 import { Prisma, type PrismaClient, type StockMovementType } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import {
+  loadReservationSourceRows,
+  type ReservationBreakdownClient,
+  type ReservationBreakdownRow,
+} from '@/lib/domain/inventory/reservation-breakdown'
+import {
   roundQuantity,
   toDecimal,
   type Decimal,
@@ -21,6 +26,10 @@ export type InventorySnapshotStockLevelRow = {
   productId: string
   warehouseId: string
   quantity: DecimalInput
+}
+
+export type InventoryReservationSnapshotStockLevelRow = InventorySnapshotStockLevelRow & {
+  reservedQty: DecimalInput
 }
 
 export type InventorySnapshotCostLayerRow = {
@@ -50,6 +59,15 @@ export type InventorySnapshotRowInput = {
   unitCostBase: Decimal | null
 }
 
+export type InventoryReservationSnapshotRowInput = {
+  snapshotDate: Date
+  productId: string
+  warehouseId: string
+  reservedQty: Decimal
+  availableQty: Decimal
+  reservationSourceCount: number
+}
+
 export type InventorySnapshotDrift = {
   productId: string
   warehouseId: string
@@ -67,6 +85,7 @@ export type InventorySnapshotBuildResult = {
 export type InventorySnapshotWriteResult = {
   snapshotDate: string
   snapshotsWritten: number
+  reservationSnapshotsWritten: number
   driftCount: number
   driftTruncated: boolean
   drift: InventorySnapshotDrift[]
@@ -84,7 +103,16 @@ export type InventorySnapshotBackfillResult = {
 
 export type InventorySnapshotClient = Pick<
   PrismaClient,
-  'stockLevel' | 'costLayer' | 'stockMovement' | 'inventorySnapshot' | '$queryRaw' | '$transaction'
+  | 'stockLevel'
+  | 'costLayer'
+  | 'stockMovement'
+  | 'inventorySnapshot'
+  | 'inventoryReservationSnapshot'
+  | 'orderAllocation'
+  | 'shipmentLine'
+  | 'productionOrder'
+  | '$queryRaw'
+  | '$transaction'
 >
 
 export type InventorySnapshotTestClient = {
@@ -101,6 +129,12 @@ export type InventorySnapshotTestClient = {
     findMany(args: unknown): Promise<Array<{ snapshotDate: Date; valueBase: DecimalInput }>>
     upsert(args: unknown): Promise<unknown>
   }
+  inventoryReservationSnapshot: {
+    upsert(args: unknown): Promise<unknown>
+  }
+  orderAllocation: ReservationBreakdownClient['orderAllocation']
+  shipmentLine: ReservationBreakdownClient['shipmentLine']
+  productionOrder: ReservationBreakdownClient['productionOrder']
   $queryRaw?: InventorySnapshotClient['$queryRaw']
   $transaction?<T>(operations: Promise<T>[]): Promise<T[]>
 }
@@ -316,6 +350,40 @@ export function buildInventorySnapshotRows(input: {
   }
 }
 
+function sourceCountKey(row: Pick<ReservationBreakdownRow, 'productId' | 'warehouseId'>): string {
+  return stockKey(row.productId, row.warehouseId)
+}
+
+export function buildInventoryReservationSnapshotRows(input: {
+  snapshotDate?: SnapshotDateInput
+  stockLevels: readonly InventoryReservationSnapshotStockLevelRow[]
+  reservationSources: readonly ReservationBreakdownRow[]
+}): InventoryReservationSnapshotRowInput[] {
+  const snapshotDate = parseSnapshotDate(input.snapshotDate)
+  const sourceCounts = new Map<string, number>()
+  for (const source of input.reservationSources) {
+    const key = sourceCountKey(source)
+    sourceCounts.set(key, (sourceCounts.get(key) ?? 0) + 1)
+  }
+
+  return input.stockLevels
+    .map((level) => {
+      const reservedQty = roundQty(level.reservedQty)
+      return {
+        snapshotDate,
+        productId: level.productId,
+        warehouseId: level.warehouseId,
+        reservedQty,
+        availableQty: roundQty(toDecimal(level.quantity).sub(reservedQty)),
+        reservationSourceCount: sourceCounts.get(stockKey(level.productId, level.warehouseId)) ?? 0,
+      }
+    })
+    .sort((a, b) => (
+      a.productId.localeCompare(b.productId) ||
+      a.warehouseId.localeCompare(b.warehouseId)
+    ))
+}
+
 async function loadCurrentSnapshotRows(client: SnapshotClient): Promise<{
   stockLevels: InventorySnapshotStockLevelRow[]
   costLayers: InventorySnapshotCostLayerRow[]
@@ -331,6 +399,24 @@ async function loadCurrentSnapshotRows(client: SnapshotClient): Promise<{
   ])
 
   return { stockLevels, costLayers }
+}
+
+async function loadCurrentReservationSnapshotRows(
+  client: SnapshotClient,
+  snapshotDate: Date,
+): Promise<InventoryReservationSnapshotRowInput[]> {
+  const [stockLevels, reservationSources] = await Promise.all([
+    client.stockLevel.findMany({
+      select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
+    }),
+    loadReservationSourceRows(client as unknown as ReservationBreakdownClient),
+  ])
+
+  return buildInventoryReservationSnapshotRows({
+    snapshotDate,
+    stockLevels: stockLevels as InventoryReservationSnapshotStockLevelRow[],
+    reservationSources,
+  })
 }
 
 function stateFromAggregatedRows(rows: readonly AggregatedSnapshotRow[]): {
@@ -454,6 +540,47 @@ async function writeSnapshotRows(
   return rows.length
 }
 
+async function writeReservationSnapshotRows(
+  client: SnapshotClient,
+  rows: readonly InventoryReservationSnapshotRowInput[],
+): Promise<number> {
+  for (let index = 0; index < rows.length; index += SNAPSHOT_WRITE_BATCH_SIZE) {
+    const batch = rows.slice(index, index + SNAPSHOT_WRITE_BATCH_SIZE)
+    const operations = batch.map((row) => (
+      client.inventoryReservationSnapshot.upsert({
+        where: {
+          snapshotDate_productId_warehouseId: {
+            snapshotDate: row.snapshotDate,
+            productId: row.productId,
+            warehouseId: row.warehouseId,
+          },
+        },
+        create: {
+          snapshotDate: row.snapshotDate,
+          productId: row.productId,
+          warehouseId: row.warehouseId,
+          reservedQty: row.reservedQty,
+          availableQty: row.availableQty,
+          reservationSourceCount: row.reservationSourceCount,
+        },
+        update: {
+          reservedQty: row.reservedQty,
+          availableQty: row.availableQty,
+          reservationSourceCount: row.reservationSourceCount,
+        },
+      } as never) as Promise<unknown>
+    ))
+
+    if ('$transaction' in client && typeof client.$transaction === 'function') {
+      await (client as SnapshotBatchTransactionClient).$transaction(operations)
+    } else {
+      await Promise.all(operations)
+    }
+  }
+
+  return rows.length
+}
+
 export async function writeDailyInventorySnapshot(options: {
   client?: SnapshotClient
   snapshotDate?: SnapshotDateInput
@@ -462,14 +589,17 @@ export async function writeDailyInventorySnapshot(options: {
   const client = options.client ?? db
   const snapshotDate = parseSnapshotDate(options.snapshotDate)
   const { state, costLayerQtyByKey } = await loadAggregatedCurrentSnapshotState(client)
+  const reservationRows = await loadCurrentReservationSnapshotRows(client, snapshotDate)
   const drift = findDrift(state, costLayerQtyByKey, options.tolerance)
   const rows = rowsFromState(snapshotDate, state)
 
   const snapshotsWritten = await writeSnapshotRows(client, rows)
+  const reservationSnapshotsWritten = await writeReservationSnapshotRows(client, reservationRows)
 
   return {
     snapshotDate: formatSnapshotDate(snapshotDate),
     snapshotsWritten,
+    reservationSnapshotsWritten,
     driftCount: drift.length,
     driftTruncated: drift.length > MAX_INVENTORY_SNAPSHOT_DRIFT_DETAILS,
     drift: drift.slice(0, MAX_INVENTORY_SNAPSHOT_DRIFT_DETAILS),
@@ -660,6 +790,7 @@ export async function getAverageInventoryValueBase(options: {
 export function inventorySnapshotCounts(result: InventorySnapshotWriteResult): Record<string, number> {
   return {
     snapshotsWritten: result.snapshotsWritten,
+    reservationSnapshotsWritten: result.reservationSnapshotsWritten,
     driftCount: result.driftCount,
   }
 }

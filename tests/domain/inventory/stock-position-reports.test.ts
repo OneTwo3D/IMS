@@ -32,6 +32,7 @@ function makeClient(overrides: Partial<StockPositionReportClient>): StockPositio
     supplier: unused,
     product: unused,
     stockLevel: unused,
+    inventoryReservationSnapshot: unused,
     stockMovement: unused,
     ...overrides,
   }
@@ -73,6 +74,7 @@ test('stock-on-hand report enriches as-of rows, totals the full filtered set, an
         { productId: 'product-2', warehouseId: 'warehouse-1', reservedQty: decimal('1') },
       ],
     },
+    inventoryReservationSnapshot: { findMany: async () => [] },
   })
 
   const report = await getStockOnHandReport(
@@ -87,8 +89,137 @@ test('stock-on-hand report enriches as-of rows, totals the full filtered set, an
     availableQty: '12',
     totalValueBase: '40',
   })
+  assert.equal(report.reservedQtyScope, 'current_missing_snapshot')
+  assert.equal(report.missingReservationSnapshotCount, 2)
+  assert.equal(report.rows[0]?.reservationQtySource, 'current_missing_snapshot')
   assert.equal(report.rows[0]?.availableQty, '8')
 
+})
+
+test('stock-on-hand current report keeps live reservation scope', async () => {
+  const getOnHandAsOf = async () => ({
+    asOf: '2026-06-02T10:00:00.000Z',
+    generatedAt: '2026-06-02T10:00:00.000Z',
+    anchorDate: null,
+    source: 'current' as const,
+    rows: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', qty: '10', valueBase: '25', unitCostBase: '2.5' },
+    ],
+    missingValueMovementCount: 0,
+    orphanWarehouseMovementCount: 0,
+    missingValueMovementSample: [],
+    valueReplayReliable: true,
+  })
+  const client = makeClient({
+    product: { findMany: async () => [product] },
+    warehouse: { findMany: async () => [warehouse] },
+    stockLevel: {
+      findMany: async () => [
+        { productId: 'product-1', warehouseId: 'warehouse-1', reservedQty: decimal('3') },
+      ],
+    },
+  })
+
+  const report = await getStockOnHandReport(
+    {},
+    { paginate: false, deps: { client, getOnHandAsOf } },
+  )
+
+  assert.equal(report.reservedQtyScope, 'current')
+  assert.equal(report.reservationSnapshotDate, null)
+  assert.equal(report.missingReservationSnapshotCount, 0)
+  assert.equal(report.rows[0]?.reservedQty, '3')
+  assert.equal(report.rows[0]?.availableQty, '7')
+  assert.equal(report.rows[0]?.reservationQtySource, 'current')
+})
+
+test('stock-on-hand as-of report uses reservation snapshots when available', async () => {
+  const getOnHandAsOf = async () => ({
+    asOf: '2026-06-01T23:59:59.999Z',
+    generatedAt: '2026-06-02T10:00:00.000Z',
+    anchorDate: '2026-06-01',
+    source: 'snapshot_forward_replay' as const,
+    rows: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', qty: '10', valueBase: '25', unitCostBase: '2.5' },
+    ],
+    missingValueMovementCount: 0,
+    orphanWarehouseMovementCount: 0,
+    missingValueMovementSample: [],
+    valueReplayReliable: true,
+  })
+  const client = makeClient({
+    product: { findMany: async () => [product] },
+    warehouse: { findMany: async () => [warehouse] },
+    stockLevel: {
+      findMany: async () => [
+        { productId: 'product-1', warehouseId: 'warehouse-1', reservedQty: decimal('9') },
+      ],
+    },
+    inventoryReservationSnapshot: {
+      findMany: async () => [
+        {
+          productId: 'product-1',
+          warehouseId: 'warehouse-1',
+          reservedQty: decimal('2'),
+          availableQty: decimal('8'),
+          reservationSourceCount: 3,
+        },
+      ],
+    },
+  })
+
+  const report = await getStockOnHandReport(
+    {},
+    { paginate: false, deps: { client, getOnHandAsOf } },
+  )
+
+  assert.equal(report.reservedQtyScope, 'snapshot')
+  assert.equal(report.reservationSnapshotDate, '2026-06-01')
+  assert.equal(report.missingReservationSnapshotCount, 0)
+  assert.equal(report.rows[0]?.reservedQty, '2')
+  assert.equal(report.rows[0]?.availableQty, '8')
+  assert.equal(report.rows[0]?.reservationQtySource, 'snapshot')
+  assert.equal(report.rows[0]?.reservationSourceCount, 3)
+})
+
+test('stock-on-hand as-of report surfaces missing reservation snapshots and marks current fallback rows', async () => {
+  const getOnHandAsOf = async () => ({
+    asOf: '2026-06-01T23:59:59.999Z',
+    generatedAt: '2026-06-02T10:00:00.000Z',
+    anchorDate: '2026-06-01',
+    source: 'snapshot_forward_replay' as const,
+    rows: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', qty: '10', valueBase: '25', unitCostBase: '2.5' },
+    ],
+    missingValueMovementCount: 0,
+    orphanWarehouseMovementCount: 0,
+    missingValueMovementSample: [],
+    valueReplayReliable: true,
+  })
+  const client = makeClient({
+    product: { findMany: async () => [product] },
+    warehouse: { findMany: async () => [warehouse] },
+    stockLevel: {
+      findMany: async () => [
+        { productId: 'product-1', warehouseId: 'warehouse-1', reservedQty: decimal('4') },
+      ],
+    },
+    inventoryReservationSnapshot: { findMany: async () => [] },
+  })
+
+  const report = await getStockOnHandReport(
+    {},
+    { paginate: false, deps: { client, getOnHandAsOf } },
+  )
+
+  assert.equal(report.reservedQtyScope, 'current_missing_snapshot')
+  assert.equal(report.reservationSnapshotDate, '2026-06-01')
+  assert.equal(report.missingReservationSnapshotCount, 1)
+  assert.equal(report.currentReservationFallbackCount, 1)
+  assert.equal(report.rows[0]?.reservedQty, '4')
+  assert.equal(report.rows[0]?.availableQty, '6')
+  assert.equal(report.rows[0]?.reservationQtySource, 'current_missing_snapshot')
+  assert.equal(report.rows[0]?.reservationSourceCount, null)
 })
 
 test('stock allocation report adds unattributed rows so source totals reconcile to StockLevel.reservedQty', async (t) => {

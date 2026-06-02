@@ -79,6 +79,7 @@ test('inventory snapshot cron snapshots the previous UTC day', async () => {
           return {
             snapshotDate: snapshotDate.toISOString().slice(0, 10),
             snapshotsWritten: 1,
+            reservationSnapshotsWritten: 1,
             driftCount: 0,
             driftTruncated: false,
             drift: [],

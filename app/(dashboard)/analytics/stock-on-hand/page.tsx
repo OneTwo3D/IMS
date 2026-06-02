@@ -87,7 +87,11 @@ export default async function StockOnHandPage({ searchParams }: { searchParams: 
     },
   ]
   const notices = [
-    'Reserved and available quantities use the current StockLevel reservation state; historical snapshots currently cover on-hand quantity and value only.',
+    report.reservedQtyScope === 'current'
+      ? 'Reserved and available quantities use the current StockLevel reservation state.'
+      : report.reservedQtyScope === 'snapshot'
+        ? `Reserved and available quantities use reservation snapshots from ${report.reservationSnapshotDate}.`
+        : `${report.missingReservationSnapshotCount} row(s) are missing reservation snapshots for ${report.reservationSnapshotDate}; those rows use current StockLevel reservations and are marked in the CSV export.`,
     report.valueReplayReliable ? '' : 'This as-of value replay includes movements without value evidence or orphan warehouse movement rows.',
   ].filter(Boolean)
 
