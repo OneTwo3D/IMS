@@ -1,18 +1,19 @@
 import Link from 'next/link'
 import { Download } from 'lucide-react'
-import { StockCountStatus, StockMovementType, StockTransferStatus } from '@/app/generated/prisma/client'
+import { LandedCostMethod } from '@/app/generated/prisma/client'
 import { Button } from '@/components/ui/button'
 import { buttonVariants } from '@/components/ui/button-variants'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
+import type { CogsGroupBy, InventoryCostingFilterUiValues, InventoryCostingReportType } from '@/lib/domain/inventory/inventory-costing-reports'
 import type { PageInfo, StockPositionFilterOptions } from '@/lib/domain/inventory/stock-position-reports'
 import { COMBOBOX_THRESHOLD } from '@/lib/ui/select-policy'
 import { cn } from '@/lib/utils'
 import { StockPositionFilterCombobox } from './stock-position-filter-combobox'
 import { appendParams, currentParams, toneClass, type SummaryTone } from './report-utils'
 
-export type InventoryLedgerColumn<Row> = {
+export type InventoryCostingColumn<Row> = {
   key: string
   label: string
   align?: 'left' | 'right'
@@ -20,44 +21,33 @@ export type InventoryLedgerColumn<Row> = {
   footer?: React.ReactNode
 }
 
-export type InventoryLedgerReportKey = 'stock-movements' | 'stock-adjustments' | 'transfers' | 'stock-counts'
-
-export type InventoryLedgerFilterValues = {
-  dateFrom?: string
-  dateTo?: string
-  warehouseId?: string
-  product?: string
-  type?: string
-  status?: string
-  reference?: string
-  minValue?: string
-  pageSize?: string
-}
-
-type InventoryLedgerReportPageProps<Row> = {
+type InventoryCostingReportPageProps<Row> = {
   title: string
   description: string
-  reportKey: InventoryLedgerReportKey
-  filters: InventoryLedgerFilterValues
+  reportKey: InventoryCostingReportType
+  filters: InventoryCostingFilterUiValues
   filterOptions: StockPositionFilterOptions
   pageInfo: PageInfo
   rows: Row[]
   rowKey: (row: Row, index: number) => string
-  columns: Array<InventoryLedgerColumn<Row>>
+  columns: Array<InventoryCostingColumn<Row>>
   summary: Array<{ label: string; value: string; tone?: SummaryTone }>
   notices?: string[]
-  statusKind?: 'transfer' | 'stock-count'
-  showMovementType?: boolean
-  showMinValue?: boolean
+  dateMode: 'as-of' | 'period'
+  showGroupBy?: boolean
+  showLandedCostMethod?: boolean
+  showIncludeZero?: boolean
 }
 
-function statusOptions(kind: 'transfer' | 'stock-count' | undefined): string[] {
-  if (kind === 'transfer') return Object.values(StockTransferStatus)
-  if (kind === 'stock-count') return Object.values(StockCountStatus)
-  return []
-}
+const COGS_GROUP_OPTIONS: Array<{ value: CogsGroupBy; label: string }> = [
+  { value: 'product', label: 'Product' },
+  { value: 'category', label: 'Category' },
+  { value: 'warehouse', label: 'Warehouse' },
+  { value: 'customer', label: 'Customer' },
+  { value: 'channel', label: 'Channel' },
+]
 
-export function InventoryLedgerReportPage<Row>({
+export function InventoryCostingReportPage<Row>({
   title,
   description,
   reportKey,
@@ -69,15 +59,15 @@ export function InventoryLedgerReportPage<Row>({
   columns,
   summary,
   notices = [],
-  statusKind,
-  showMovementType = false,
-  showMinValue = false,
-}: InventoryLedgerReportPageProps<Row>) {
+  dateMode,
+  showGroupBy = false,
+  showLandedCostMethod = false,
+  showIncludeZero = false,
+}: InventoryCostingReportPageProps<Row>) {
   const params = currentParams(filters)
-  const csvHref = `/api/export/inventory-ledger?${appendParams(params, { report: reportKey })}`
+  const csvHref = `/api/export/inventory-costing?${appendParams(params, { report: reportKey })}`
   const previousHref = `?${appendParams(params, { page: pageInfo.page - 1 })}`
   const nextHref = `?${appendParams(params, { page: pageInfo.page + 1 })}`
-  const statuses = statusOptions(statusKind)
 
   return (
     <div className="space-y-4">
@@ -104,14 +94,23 @@ export function InventoryLedgerReportPage<Row>({
       <form className="rounded-md border bg-muted/20 p-3">
         <input type="hidden" name="page" value="1" />
         <div className="grid gap-3 md:grid-cols-3 lg:grid-cols-6">
-          <div className="space-y-1.5">
-            <Label htmlFor="dateFrom">From (UTC)</Label>
-            <Input id="dateFrom" name="dateFrom" type="date" defaultValue={filters.dateFrom ?? ''} className="h-9" />
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="dateTo">To (UTC)</Label>
-            <Input id="dateTo" name="dateTo" type="date" defaultValue={filters.dateTo ?? ''} className="h-9" />
-          </div>
+          {dateMode === 'as-of' ? (
+            <div className="space-y-1.5">
+              <Label htmlFor="asOf">As of (UTC)</Label>
+              <Input id="asOf" name="asOf" type="date" defaultValue={filters.asOf ?? ''} className="h-9" />
+            </div>
+          ) : (
+            <>
+              <div className="space-y-1.5">
+                <Label htmlFor="dateFrom">From (UTC)</Label>
+                <Input id="dateFrom" name="dateFrom" type="date" defaultValue={filters.dateFrom ?? ''} className="h-9" />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="dateTo">To (UTC)</Label>
+                <Input id="dateTo" name="dateTo" type="date" defaultValue={filters.dateTo ?? ''} className="h-9" />
+              </div>
+            </>
+          )}
           <div className="space-y-1.5">
             <Label htmlFor="warehouseId">Warehouse</Label>
             <StockPositionFilterCombobox
@@ -125,42 +124,61 @@ export function InventoryLedgerReportPage<Row>({
             />
           </div>
           <div className="space-y-1.5">
+            <Label htmlFor="categoryId">Category</Label>
+            <StockPositionFilterCombobox
+              key={`category:${filters.categoryId ?? ''}`}
+              id="categoryId"
+              name="categoryId"
+              type="category"
+              allLabel="All categories"
+              value={filters.categoryId}
+              initialOptions={filterOptions.categories}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="supplierId">Supplier</Label>
+            <StockPositionFilterCombobox
+              key={`supplier:${filters.supplierId ?? ''}`}
+              id="supplierId"
+              name="supplierId"
+              type="supplier"
+              allLabel="All suppliers"
+              value={filters.supplierId}
+              initialOptions={filterOptions.suppliers}
+            />
+          </div>
+          <div className="space-y-1.5">
             <Label htmlFor="product">Product</Label>
             <Input id="product" name="product" defaultValue={filters.product ?? ''} className="h-9" placeholder="SKU or name" />
           </div>
-          {showMovementType && (
+          {showGroupBy && (
             <div className="space-y-1.5">
-              <Label htmlFor="movementType">Movement type</Label>
+              <Label htmlFor="groupBy">Group by</Label>
+              <select id="groupBy" name="groupBy" defaultValue={filters.groupBy ?? 'product'} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
+                {COGS_GROUP_OPTIONS.map((option) => (
+                  <option key={option.value} value={option.value}>{option.label}</option>
+                ))}
+              </select>
+            </div>
+          )}
+          {showLandedCostMethod && (
+            <div className="space-y-1.5">
+              <Label htmlFor="landedCostMethod">Method</Label>
               {/* Native select is intentional for enum filters below COMBOBOX_THRESHOLD options. */}
-              <select id="movementType" name="type" defaultValue={filters.type ?? ''} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
-                <option value="">All movement types</option>
-                {Object.values(StockMovementType).map((type) => (
-                  <option key={type} value={type}>{type}</option>
+              <select id="landedCostMethod" name="landedCostMethod" defaultValue={filters.landedCostMethod ?? ''} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
+                <option value="">All methods</option>
+                {Object.values(LandedCostMethod).map((method) => (
+                  <option key={method} value={method}>{method}</option>
                 ))}
               </select>
               <p className="sr-only">Searchable controls start at {COMBOBOX_THRESHOLD + 1} options.</p>
             </div>
           )}
-          {statuses.length > 0 && (
-            <div className="space-y-1.5">
-              <Label htmlFor="status">Status</Label>
-              <select id="status" name="status" defaultValue={filters.status ?? ''} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
-                <option value="">All statuses</option>
-                {statuses.map((status) => (
-                  <option key={status} value={status}>{status}</option>
-                ))}
-              </select>
-            </div>
-          )}
-          <div className="space-y-1.5">
-            <Label htmlFor="reference">Reference</Label>
-            <Input id="reference" name="reference" defaultValue={filters.reference ?? ''} className="h-9" placeholder="ID, type or note" />
-          </div>
-          {showMinValue && (
-            <div className="space-y-1.5">
-              <Label htmlFor="minValue">Min absolute value</Label>
-              <Input id="minValue" name="minValue" inputMode="decimal" defaultValue={filters.minValue ?? ''} className="h-9" />
-            </div>
+          {showIncludeZero && (
+            <label className="flex items-center gap-2 pt-8 text-sm">
+              <input type="checkbox" name="includeZero" value="1" defaultChecked={filters.includeZero} className="rounded border-input" />
+              Include zero rows
+            </label>
           )}
           <div className="space-y-1.5">
             <Label htmlFor="pageSize">Rows</Label>

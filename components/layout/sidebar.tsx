@@ -56,6 +56,12 @@ const INVENTORY_LEDGER_REPORT_LINKS = [
   { href: '/analytics/stock-counts',           label: 'Stock Counts' },
 ]
 
+const INVENTORY_COSTING_REPORT_LINKS = [
+  { href: '/analytics/inventory-valuation',    label: 'Inventory Valuation' },
+  { href: '/analytics/cogs',                   label: 'COGS Report' },
+  { href: '/analytics/landed-cost',            label: 'Landed Cost Analysis' },
+]
+
 function getSettingsChildren(accountingIntegrationEnabled: boolean) {
   return [
     { href: '/settings/company', label: 'Company' },
@@ -106,6 +112,7 @@ export function Sidebar({
   const analyticsChildren = [
     ...(can('analytics') ? ANALYTICS_CHILDREN : [...STOCK_POSITION_REPORT_LINKS]),
     ...(can('analytics.inventory_ledger') ? INVENTORY_LEDGER_REPORT_LINKS : []),
+    ...(can('analytics.inventory_costing') ? INVENTORY_COSTING_REPORT_LINKS : []),
   ]
 
   // Supplier gets a completely different navigation

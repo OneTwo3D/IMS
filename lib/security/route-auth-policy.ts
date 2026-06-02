@@ -186,6 +186,10 @@ export const apiRouteAuthPolicy = {
     access: 'authenticated',
     reason: 'Requires inventory ledger report access: ADMIN, MANAGER, FINANCE, or WAREHOUSE role.',
   },
+  '/api/export/inventory-costing': {
+    access: 'authenticated',
+    reason: 'Requires inventory costing report access: ADMIN, MANAGER, or FINANCE role.',
+  },
   '/api/export/stock-position': {
     access: 'authenticated',
     reason: 'Requires stock-position report access: analytics permission or WAREHOUSE role.',

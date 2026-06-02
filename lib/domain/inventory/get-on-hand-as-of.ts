@@ -15,6 +15,7 @@ export type OnHandAsOfFilters = {
   categoryId?: string
   productType?: ProductType
   supplierId?: string
+  productSearch?: string
   excludeZero?: boolean
 }
 
@@ -255,8 +256,16 @@ function roundValue(value: DecimalInput): Decimal {
   return roundQuantity(value, 6)
 }
 
-function productWhere(filters: OnHandAsOfFilters): ProductScopedWhere {
-  const product: Prisma.ProductWhereInput = {
+function productRelationFilter(filters: OnHandAsOfFilters): Prisma.ProductWhereInput {
+  return {
+    ...(filters.productSearch
+      ? {
+          OR: [
+            { sku: { contains: filters.productSearch, mode: 'insensitive' as const } },
+            { name: { contains: filters.productSearch, mode: 'insensitive' as const } },
+          ],
+        }
+      : {}),
     ...(filters.categoryId ? { categoryId: filters.categoryId } : {}),
     ...(filters.productType ? { type: filters.productType } : {}),
     ...(filters.supplierId
@@ -267,6 +276,10 @@ function productWhere(filters: OnHandAsOfFilters): ProductScopedWhere {
         }
       : {}),
   }
+}
+
+function productWhere(filters: OnHandAsOfFilters): ProductScopedWhere {
+  const product = productRelationFilter(filters)
   return {
     ...(filters.productId ? { productId: filters.productId } : {}),
     ...(Object.keys(product).length > 0 ? { product } : {}),
@@ -280,27 +293,30 @@ function warehouseMovementWhere(filters: OnHandAsOfFilters): WarehouseMovementWh
 }
 
 function snapshotWhere(snapshotDate: Date, filters: OnHandAsOfFilters): Prisma.InventorySnapshotWhereInput {
+  const product = productRelationFilter(filters)
   return {
     snapshotDate,
     ...(filters.productId ? { productId: filters.productId } : {}),
     ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
-    ...(filters.categoryId ? { product: { categoryId: filters.categoryId } } : {}),
+    ...(Object.keys(product).length > 0 ? { product } : {}),
   }
 }
 
 function currentStockWhere(filters: OnHandAsOfFilters): Prisma.StockLevelWhereInput {
+  const product = productRelationFilter(filters)
   return {
     ...(filters.productId ? { productId: filters.productId } : {}),
     ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
-    ...(filters.categoryId ? { product: { categoryId: filters.categoryId } } : {}),
+    ...(Object.keys(product).length > 0 ? { product } : {}),
   }
 }
 
 function currentCostLayerWhere(filters: OnHandAsOfFilters): Prisma.CostLayerWhereInput {
+  const product = productRelationFilter(filters)
   return {
     ...(filters.productId ? { productId: filters.productId } : {}),
     ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
-    ...(filters.categoryId ? { product: { categoryId: filters.categoryId } } : {}),
+    ...(Object.keys(product).length > 0 ? { product } : {}),
   }
 }
 
@@ -386,6 +402,7 @@ function currentStateSqlFilters(filters: OnHandAsOfFilters, alias: 'sl' | 'cl'):
     ${filters.warehouseId ? Prisma.sql`AND ${Prisma.raw(alias)}."warehouseId" = ${filters.warehouseId}` : Prisma.empty}
     ${filters.categoryId ? Prisma.sql`AND p."categoryId" = ${filters.categoryId}` : Prisma.empty}
     ${filters.productType ? Prisma.sql`AND p."type" = ${filters.productType}::"ProductType"` : Prisma.empty}
+    ${filters.productSearch ? Prisma.sql`AND (p.sku ILIKE ${`%${filters.productSearch}%`} OR p.name ILIKE ${`%${filters.productSearch}%`})` : Prisma.empty}
     ${filters.supplierId ? Prisma.sql`AND EXISTS (
       SELECT 1
       FROM supplier_products sp
@@ -650,6 +667,7 @@ export async function getOnHandAsOf(options: {
   categoryId?: string
   productType?: ProductType
   supplierId?: string
+  productSearch?: string
   excludeZero?: boolean
   client?: OnHandAsOfClient
   now?: () => Date
@@ -668,6 +686,7 @@ export async function getOnHandAsOf(options: {
     categoryId: options.categoryId,
     productType: options.productType,
     supplierId: options.supplierId,
+    productSearch: options.productSearch,
     excludeZero: options.excludeZero,
   }
 

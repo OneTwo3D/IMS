@@ -2019,6 +2019,49 @@ Run npm run validate.
 
 ---
 
+## PR 11.10.1 — GL account-balance ingestion for valuation variance
+
+### Goal
+
+Store accounting-system account balances inside IMS so the inventory valuation and COGS reports can show real GL variance instead of blank variance columns.
+
+In plain terms: IMS already knows what stock is worth from inventory records. This follow-up lets IMS also remember what the accounting system says the stock and COGS accounts are worth, then compare the two.
+
+### Scope
+
+- Ingest stock asset and COGS account balances from connected accounting systems, starting with Xero and using the existing accounting connector boundaries.
+- Persist account balance snapshots with accounting system, account code/id, account name, balance date, currency, functional/base amount, source payload reference, and sync run metadata.
+- Make ingestion idempotent by `(externalSystem, accountExternalId, balanceDate, currency)` or a stricter connector-provided key.
+- Surface variance in `/analytics/inventory-valuation` and `/analytics/cogs` only when a matching account-balance snapshot exists.
+- Leave variance blank with an explicit notice when no balance snapshot exists.
+- Link material variances to accounting reconciliation findings where possible.
+
+### Acceptance criteria
+
+```text
+- Accounting account-balance snapshots are persisted idempotently.
+- Inventory valuation can compare IMS stock value against the configured stock asset account balance.
+- COGS can compare period COGS against the configured accounting COGS account balance when the accounting system exposes a comparable balance.
+- Reports show explicit "no accounting balance snapshot available" notices instead of inferring balances from sync payloads.
+- Tests cover idempotent ingestion, multi-currency/base-currency handling, missing-balance behavior, and variance calculation.
+```
+
+### Codex prompt
+
+```text
+Implement PR 11.10.1.
+
+Base branch: development.
+
+Add accounting account-balance snapshot ingestion for stock asset and COGS accounts.
+Persist snapshots idempotently with connector/source metadata.
+Wire inventory valuation and COGS reports to show GL variance only when matching snapshots exist; otherwise show an explicit unavailable notice.
+Add focused tests for idempotency, currency/base amount handling, missing snapshots, and variance math.
+Run npm run validate and npm run validate:db if schema changes are needed.
+```
+
+---
+
 ## PR 11.11 — Inventory health & velocity bundle (aging, turnover, dead stock, slow/fast mover, ABC)
 
 ### Goal
@@ -2327,6 +2370,7 @@ PR 11.8.1 historical reservation snapshots for true as-of availability
 PR 11.8.2 scalable stock-position report filters
 PR 11.9 inventory ledger bundle (movements, adjustments, transfers, stocktake)
 PR 11.10 inventory valuation & costing bundle (valuation, COGS, landed cost)
+PR 11.10.1 GL account-balance ingestion for valuation variance
 PR 11.11 inventory health & velocity bundle (aging, turnover, dead stock, slow/fast mover, ABC)
 PR 11.12 replenishment & demand planning bundle (reorder, backorder, BOM shortage)
 PR 11.13 sales & fulfillment analytics bundle
