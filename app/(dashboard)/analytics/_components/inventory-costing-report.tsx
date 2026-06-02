@@ -6,7 +6,7 @@ import { buttonVariants } from '@/components/ui/button-variants'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
-import type { CogsGroupBy, InventoryCostingFilterUiValues, InventoryCostingReportType } from '@/lib/domain/inventory/inventory-costing-reports'
+import type { CogsGroupBy, InventoryCostingFilterUiValues, InventoryCostingGroupBy, InventoryCostingReportType } from '@/lib/domain/inventory/inventory-costing-reports'
 import type { PageInfo, StockPositionFilterOptions } from '@/lib/domain/inventory/stock-position-reports'
 import { COMBOBOX_THRESHOLD } from '@/lib/ui/select-policy'
 import { cn } from '@/lib/utils'
@@ -35,6 +35,7 @@ type InventoryCostingReportPageProps<Row> = {
   notices?: string[]
   dateMode: 'as-of' | 'period'
   showGroupBy?: boolean
+  groupByOptions?: Array<{ value: InventoryCostingGroupBy; label: string }>
   showLandedCostMethod?: boolean
   showIncludeZero?: boolean
 }
@@ -61,6 +62,7 @@ export function InventoryCostingReportPage<Row>({
   notices = [],
   dateMode,
   showGroupBy = false,
+  groupByOptions = COGS_GROUP_OPTIONS,
   showLandedCostMethod = false,
   showIncludeZero = false,
 }: InventoryCostingReportPageProps<Row>) {
@@ -155,7 +157,7 @@ export function InventoryCostingReportPage<Row>({
             <div className="space-y-1.5">
               <Label htmlFor="groupBy">Group by</Label>
               <select id="groupBy" name="groupBy" defaultValue={filters.groupBy ?? 'product'} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
-                {COGS_GROUP_OPTIONS.map((option) => (
+                {groupByOptions.map((option) => (
                   <option key={option.value} value={option.value}>{option.label}</option>
                 ))}
               </select>
