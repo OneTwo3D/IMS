@@ -7,6 +7,7 @@ import {
   getStockOnHandReport,
   type StockPositionFilters,
 } from '@/lib/domain/inventory/stock-position-reports'
+import { getInventoryAgingReport } from '@/lib/domain/inventory/inventory-health-reports'
 import { stockPositionApiAccessDenied } from '@/lib/security/stock-position-access'
 
 const STOCK_POSITION_CSV_ROW_LIMIT = 50000
@@ -123,6 +124,29 @@ export async function GET(req: NextRequest) {
         generatedAt: report.generatedAt,
       }))
       return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'warehouseCode', 'warehouseName', 'stockUnit', 'status', 'currentQty', 'minimumQty', 'firstNegativeAt', 'lastMovementAt', 'movementCount', 'dateFrom', 'dateTo', 'generatedAt']), `negative-stock-${date}.csv`)
+    }
+
+    case 'inventory-aging': {
+      const report = await getInventoryAgingReport(stockPositionFilters(req), { paginate: false })
+      const oversized = rejectOversizedExport(report.pageInfo.totalRows)
+      if (oversized) return oversized
+      const data = report.rows.map((r) => ({
+        sku: r.sku,
+        productName: r.productName,
+        productType: r.productType,
+        category: r.categoryName ?? '',
+        suppliers: r.supplierNames.join('; '),
+        warehouseCode: r.warehouseCode,
+        warehouseName: r.warehouseName,
+        stockUnit: r.stockUnit,
+        bucket: r.bucket,
+        minAgeDays: r.minAgeDays,
+        maxAgeDays: r.maxAgeDays ?? '',
+        qty: r.qty,
+        valueBase: r.valueBase,
+        source: r.source,
+      }))
+      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'bucket', 'minAgeDays', 'maxAgeDays', 'qty', 'valueBase', 'source']), `inventory-aging-${date}.csv`)
     }
 
     default:
