@@ -1,3 +1,26 @@
 {
-  "blocks": []
+  "blocks": [
+    {
+      "headerIncludes": "Changed the `product_categories` table",
+      "detailIncludes": [
+        "Removed index on columns (name)"
+      ],
+      "reason": "PR #104 adds a db-native pg_trgm GIN index on product_categories.name for scalable contains search; Prisma cannot represent the operator class."
+    },
+    {
+      "headerIncludes": "Changed the `suppliers` table",
+      "detailIncludes": [
+        "Removed index on columns (name)"
+      ],
+      "reason": "PR #104 adds a db-native pg_trgm GIN index on suppliers.name for scalable contains search; Prisma cannot represent the operator class."
+    },
+    {
+      "headerIncludes": "Changed the `warehouses` table",
+      "detailIncludes": [
+        "Removed index on columns (code)",
+        "Removed index on columns (name)"
+      ],
+      "reason": "PR #104 adds db-native pg_trgm GIN indexes on warehouses.code/name for scalable contains search; Prisma cannot represent the operator class or expression index."
+    }
+  ]
 }
