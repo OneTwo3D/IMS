@@ -52,7 +52,11 @@ export default async function StockAllocationsPage({ searchParams }: { searchPar
   const filters = filtersFromSearch(resolvedSearchParams)
   const [report, filterOptions] = await Promise.all([
     getStockAllocationReport(filters),
-    getStockPositionFilterOptions(),
+    getStockPositionFilterOptions({
+      selectedWarehouseId: filters.warehouseId,
+      selectedCategoryId: filters.categoryId,
+      selectedSupplierId: filters.supplierId,
+    }),
   ])
   const filtersForUi: StockPositionFilterValues = {
     warehouseId: filters.warehouseId,

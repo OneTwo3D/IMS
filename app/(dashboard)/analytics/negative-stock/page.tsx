@@ -44,7 +44,11 @@ export default async function NegativeStockPage({ searchParams }: { searchParams
   const filters = filtersFromSearch(resolvedSearchParams)
   const [report, filterOptions] = await Promise.all([
     getNegativeStockReport(filters),
-    getStockPositionFilterOptions(),
+    getStockPositionFilterOptions({
+      selectedWarehouseId: filters.warehouseId,
+      selectedCategoryId: filters.categoryId,
+      selectedSupplierId: filters.supplierId,
+    }),
   ])
   const filtersForUi: StockPositionFilterValues = {
     dateFrom: filters.dateFrom ?? report.dateFrom,

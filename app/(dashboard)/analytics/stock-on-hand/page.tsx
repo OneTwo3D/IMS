@@ -58,7 +58,11 @@ export default async function StockOnHandPage({ searchParams }: { searchParams: 
   const filters = filtersFromSearch(resolvedSearchParams)
   const [report, filterOptions, organisation] = await Promise.all([
     getStockOnHandReport(filters),
-    getStockPositionFilterOptions(),
+    getStockPositionFilterOptions({
+      selectedWarehouseId: filters.warehouseId,
+      selectedCategoryId: filters.categoryId,
+      selectedSupplierId: filters.supplierId,
+    }),
     getOrganisation(),
   ])
   const currency = organisation.baseCurrency

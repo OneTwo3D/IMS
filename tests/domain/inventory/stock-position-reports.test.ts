@@ -2,9 +2,12 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
+  getStockPositionFilterOptionPage,
+  getStockPositionFilterOptions,
   getNegativeStockReport,
   getStockAllocationReport,
   getStockOnHandReport,
+  STOCK_POSITION_FILTER_OPTION_LIMIT,
   type StockPositionReportClient,
 } from '@/lib/domain/inventory/stock-position-reports'
 
@@ -516,4 +519,98 @@ test('negative stock report replays movements from an as-of opening balance and 
   assert.equal(report.rows.find((row) => row.productId === 'product-1')?.minimumQty, '-9')
   assert.equal(report.rows.find((row) => row.productId === 'product-2')?.status, 'currently_negative')
   assert.equal(report.rows.find((row) => row.productId === 'product-2')?.minimumQty, '-1')
+})
+
+test('stock-position filter options are bounded and hydrate selected values', async () => {
+  const warehouseQueries: unknown[] = []
+  const warehouses = Array.from({ length: STOCK_POSITION_FILTER_OPTION_LIMIT + 3 }, (_, index) => ({
+    id: `warehouse-${index + 1}`,
+    code: `WH${String(index + 1).padStart(2, '0')}`,
+    name: `Warehouse ${index + 1}`,
+  }))
+  const selectedWarehouse = { id: 'warehouse-selected', code: 'WHS', name: 'Selected warehouse' }
+  const client = makeClient({
+    warehouse: {
+      findMany: async (args) => {
+        warehouseQueries.push(args)
+        const query = args as { where?: { id?: string }; take?: number }
+        if (query.where?.id === selectedWarehouse.id) return [selectedWarehouse]
+        return warehouses.slice(0, query.take)
+      },
+    },
+    productCategory: {
+      findMany: async () => [],
+    },
+    supplier: {
+      findMany: async () => [],
+    },
+  })
+
+  const options = await getStockPositionFilterOptions(
+    { selectedWarehouseId: selectedWarehouse.id },
+    { client },
+  )
+
+  assert.equal(options.warehouses.length, STOCK_POSITION_FILTER_OPTION_LIMIT + 1)
+  assert.deepEqual(options.warehouses[0], {
+    id: selectedWarehouse.id,
+    label: 'WHS - Selected warehouse',
+    description: 'WHS',
+  })
+  assert.equal(
+    (warehouseQueries[0] as { take: number }).take,
+    STOCK_POSITION_FILTER_OPTION_LIMIT + 1,
+  )
+  assert.ok(!options.warehouses.some((option) => option.id === 'warehouse-27'))
+})
+
+test('stock-position option search returns empty bounded pages', async () => {
+  const client = makeClient({
+    productCategory: {
+      findMany: async (args) => {
+        const query = args as { where?: { name?: { contains?: string } }; take?: number }
+        assert.equal(query.where?.name?.contains, 'missing')
+        assert.equal(query.take, STOCK_POSITION_FILTER_OPTION_LIMIT + 1)
+        return []
+      },
+    },
+  })
+
+  const page = await getStockPositionFilterOptionPage(
+    { type: 'category', query: 'missing' },
+    { client },
+  )
+
+  assert.deepEqual(page, {
+    options: [],
+    hasMore: false,
+    limit: STOCK_POSITION_FILTER_OPTION_LIMIT,
+  })
+})
+
+test('stock-position supplier option search is active-only but selected hydration can render inactive rows', async () => {
+  const supplierQueries: unknown[] = []
+  const client = makeClient({
+    supplier: {
+      findMany: async (args) => {
+        supplierQueries.push(args)
+        const query = args as { where?: { id?: string; active?: boolean }; take?: number }
+        if (query.where?.id === 'supplier-inactive') return [{ id: 'supplier-inactive', name: 'Inactive Supplier' }]
+        assert.equal(query.where?.active, true)
+        return [{ id: 'supplier-active', name: 'Active Supplier' }]
+      },
+    },
+  })
+
+  const page = await getStockPositionFilterOptionPage(
+    { type: 'supplier', query: 'supplier', selectedId: 'supplier-inactive' },
+    { client },
+  )
+
+  assert.deepEqual(page.options, [
+    { id: 'supplier-inactive', label: 'Inactive Supplier' },
+    { id: 'supplier-active', label: 'Active Supplier' },
+  ])
+  assert.equal((supplierQueries[0] as { where: { active?: boolean } }).where.active, true)
+  assert.deepEqual((supplierQueries[1] as { where: { id?: string } }).where, { id: 'supplier-inactive' })
 })
