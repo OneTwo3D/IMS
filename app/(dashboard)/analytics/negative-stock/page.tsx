@@ -2,6 +2,7 @@ import type { Metadata } from 'next'
 import {
   getNegativeStockReport,
   getStockPositionFilterOptions,
+  stockPositionSelectedFilterOptionInputs,
   type NegativeStockReportRow,
   type StockPositionFilters,
 } from '@/lib/domain/inventory/stock-position-reports'
@@ -44,11 +45,7 @@ export default async function NegativeStockPage({ searchParams }: { searchParams
   const filters = filtersFromSearch(resolvedSearchParams)
   const [report, filterOptions] = await Promise.all([
     getNegativeStockReport(filters),
-    getStockPositionFilterOptions({
-      selectedWarehouseId: filters.warehouseId,
-      selectedCategoryId: filters.categoryId,
-      selectedSupplierId: filters.supplierId,
-    }),
+    getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),
   ])
   const filtersForUi: StockPositionFilterValues = {
     dateFrom: filters.dateFrom ?? report.dateFrom,

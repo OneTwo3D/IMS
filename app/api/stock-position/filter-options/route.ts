@@ -2,8 +2,10 @@ import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import {
   getStockPositionFilterOptionPage,
+  normalizeStockPositionFilterOptionId,
   STOCK_POSITION_FILTER_OPTION_MAX_LIMIT,
   STOCK_POSITION_FILTER_QUERY_MAX_LENGTH,
+  type StockPositionFilterOptionPage,
   type StockPositionFilterOptionType,
 } from '@/lib/domain/inventory/stock-position-reports'
 import { checkRateLimit } from '@/lib/rate-limit'
@@ -61,12 +63,25 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'Unknown stock-position filter option type' }, { status: 400 })
   }
 
-  const result = await getStockPositionFilterOptionPage({
-    type,
-    query: query(req.nextUrl.searchParams.get('q')),
-    selectedId: req.nextUrl.searchParams.get('selectedId') ?? undefined,
-    limit: limit(req.nextUrl.searchParams.get('limit')),
-  })
+  let result: StockPositionFilterOptionPage
+  try {
+    result = await getStockPositionFilterOptionPage({
+      type,
+      query: query(req.nextUrl.searchParams.get('q')),
+      selectedId: normalizeStockPositionFilterOptionId(req.nextUrl.searchParams.get('selectedId')),
+      limit: limit(req.nextUrl.searchParams.get('limit')),
+    })
+  } catch {
+    return NextResponse.json(
+      { error: 'Filter options unavailable' },
+      {
+        status: 503,
+        headers: {
+          'Cache-Control': 'private, no-store',
+        },
+      },
+    )
+  }
 
   return NextResponse.json(result, {
     headers: {

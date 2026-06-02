@@ -46,6 +46,10 @@ export function StockPositionFilterCombobox({
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
+  useEffect(() => () => {
+    if (blurTimer.current) clearTimeout(blurTimer.current)
+  }, [])
+
   useEffect(() => {
     if (!open) return
     let controller: AbortController | null = null
@@ -53,14 +57,16 @@ export function StockPositionFilterCombobox({
     const debounce = setTimeout(() => {
       setLoading(true)
       setError(null)
-      controller = new AbortController()
+      const requestController = new AbortController()
+      controller = requestController
       const params = new URLSearchParams({ type, q: query })
       if (selectedIdRef.current) params.set('selectedId', selectedIdRef.current)
       fetch(`/api/stock-position/filter-options?${params}`, {
-        signal: controller.signal,
+        signal: requestController.signal,
         cache: 'no-store',
       })
         .then(async (response) => {
+          if (requestController.signal.aborted) return null
           if (response.status === 401) {
             window.location.assign(`/login?callbackUrl=${encodeURIComponent(window.location.pathname + window.location.search)}`)
             return null
@@ -69,6 +75,7 @@ export function StockPositionFilterCombobox({
           return await response.json() as StockPositionFilterOptionPage
         })
         .then((page) => {
+          if (requestController.signal.aborted) return
           if (!page) return
           setOptions(page.options)
           setHighlightedIndex((index) => {
@@ -85,9 +92,12 @@ export function StockPositionFilterCombobox({
         })
         .catch((fetchError: unknown) => {
           if (fetchError instanceof DOMException && fetchError.name === 'AbortError') return
+          if (requestController.signal.aborted) return
           setError(fetchError instanceof Error ? fetchError.message : 'Could not load options')
         })
-        .finally(() => setLoading(false))
+        .finally(() => {
+          if (!requestController.signal.aborted) setLoading(false)
+        })
     }, SEARCH_DEBOUNCE_MS)
 
     return () => {
@@ -103,6 +113,10 @@ export function StockPositionFilterCombobox({
     : undefined
 
   function close() {
+    if (blurTimer.current) {
+      clearTimeout(blurTimer.current)
+      blurTimer.current = null
+    }
     setOpen(false)
     setQuery('')
     setHighlightedIndex(0)
@@ -121,9 +135,26 @@ export function StockPositionFilterCombobox({
 
   function openCombobox() {
     if (blurTimer.current) clearTimeout(blurTimer.current)
+    blurTimer.current = null
     setQuery(selected?.label ?? '')
     setOpen(true)
     requestAnimationFrame(() => inputRef.current?.select())
+  }
+
+  function setHighlightedOption(index: number) {
+    const maxIndex = Math.max(visibleOptions.length - 1, 0)
+    const nextIndex = Math.min(Math.max(index, 0), maxIndex)
+    highlightedOptionIdRef.current = visibleOptions[nextIndex]?.id ?? null
+    setHighlightedIndex(nextIndex)
+  }
+
+  function moveHighlightedOption(delta: number) {
+    setHighlightedIndex((index) => {
+      const maxIndex = Math.max(visibleOptions.length - 1, 0)
+      const nextIndex = Math.min(Math.max(index + delta, 0), maxIndex)
+      highlightedOptionIdRef.current = visibleOptions[nextIndex]?.id ?? null
+      return nextIndex
+    })
   }
 
   return (
@@ -137,7 +168,7 @@ export function StockPositionFilterCombobox({
           role="combobox"
           aria-autocomplete="list"
           aria-expanded={open}
-          aria-controls={listboxId}
+          aria-controls={open ? listboxId : undefined}
           aria-activedescendant={activeOptionId}
           autoComplete="off"
           value={displayValue}
@@ -149,29 +180,41 @@ export function StockPositionFilterCombobox({
           }}
           onChange={(event) => {
             setQuery(event.target.value)
+            setHighlightedOption(0)
             setOpen(true)
           }}
           onKeyDown={(event) => {
             if (event.key === 'ArrowDown') {
               event.preventDefault()
               setOpen(true)
-              setHighlightedIndex((index) => {
-                const nextIndex = Math.min(index + 1, Math.max(visibleOptions.length - 1, 0))
-                highlightedOptionIdRef.current = visibleOptions[nextIndex]?.id ?? null
-                return nextIndex
-              })
+              moveHighlightedOption(1)
             } else if (event.key === 'ArrowUp') {
               event.preventDefault()
               setOpen(true)
-              setHighlightedIndex((index) => {
-                const nextIndex = Math.max(index - 1, 0)
-                highlightedOptionIdRef.current = visibleOptions[nextIndex]?.id ?? null
-                return nextIndex
-              })
+              moveHighlightedOption(-1)
+            } else if (event.key === 'Home') {
+              event.preventDefault()
+              setOpen(true)
+              setHighlightedOption(0)
+            } else if (event.key === 'End') {
+              event.preventDefault()
+              setOpen(true)
+              setHighlightedOption(visibleOptions.length - 1)
+            } else if (event.key === 'PageDown') {
+              event.preventDefault()
+              setOpen(true)
+              moveHighlightedOption(10)
+            } else if (event.key === 'PageUp') {
+              event.preventDefault()
+              setOpen(true)
+              moveHighlightedOption(-10)
             } else if (event.key === 'Enter' && open && !loading) {
               event.preventDefault()
               const option = visibleOptions[highlightedIndex]
               if (option) selectOption(option)
+            } else if (event.key === 'Enter' && !open) {
+              event.preventDefault()
+              openCombobox()
             } else if (event.key === 'Escape') {
               event.preventDefault()
               close()
@@ -197,7 +240,10 @@ export function StockPositionFilterCombobox({
           aria-label={`Open ${allLabel}`}
           className="absolute right-1 top-1/2 inline-flex h-7 w-7 -translate-y-1/2 items-center justify-center rounded-md text-muted-foreground hover:bg-muted hover:text-foreground"
           onMouseDown={(event) => event.preventDefault()}
-          onClick={() => setOpen((value) => !value)}
+          onClick={() => {
+            if (open) close()
+            else openCombobox()
+          }}
         >
           <ChevronDown className="h-4 w-4" />
         </button>
@@ -205,18 +251,6 @@ export function StockPositionFilterCombobox({
 
       {open && (
         <div className="absolute z-30 mt-1 max-h-60 w-full overflow-auto rounded-md border bg-popover p-1 text-sm shadow-md" aria-busy={loading}>
-          <button
-            type="button"
-            className={cn(
-              'flex w-full items-center rounded-sm px-2 py-1.5 text-left hover:bg-muted',
-              selected == null && 'bg-muted',
-              loading && 'pointer-events-none opacity-60',
-            )}
-            onMouseDown={(event) => event.preventDefault()}
-            onClick={() => selectOption(null)}
-          >
-            {allLabel}
-          </button>
           <ul id={listboxId} role="listbox" aria-label={allLabel}>
             {visibleOptions.map((option, index) => (
               <li

@@ -294,8 +294,29 @@ function clampFilterOptionLimit(value: unknown): number {
 }
 
 function normalizeFilterOptionQuery(value: string | undefined): string | undefined {
-  const query = value?.trim().slice(0, STOCK_POSITION_FILTER_QUERY_MAX_LENGTH)
+  const query = value
+    ?.normalize('NFC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, STOCK_POSITION_FILTER_QUERY_MAX_LENGTH)
   return query || undefined
+}
+
+export function normalizeStockPositionFilterOptionId(value: string | undefined | null): string | undefined {
+  const id = value?.trim()
+  if (!id || id.length > 100) return undefined
+  return /^[A-Za-z0-9_-]+$/.test(id) ? id : undefined
+}
+
+export function stockPositionSelectedFilterOptionInputs(
+  filters: Pick<StockPositionFilters, 'warehouseId' | 'categoryId' | 'supplierId'>,
+): StockPositionFilterOptionInputs {
+  return {
+    selectedWarehouseId: filters.warehouseId,
+    selectedCategoryId: filters.categoryId,
+    selectedSupplierId: filters.supplierId,
+  }
 }
 
 function pageInfo(totalRows: number, page: number, pageSize: number): PageInfo {
@@ -402,9 +423,10 @@ async function findSelectedWarehouseOption(
   client: StockPositionReportClient,
   selectedId: string | undefined,
 ): Promise<StockPositionFilterOption | null> {
-  if (!selectedId) return null
+  const id = normalizeStockPositionFilterOptionId(selectedId)
+  if (!id) return null
   const rows = await client.warehouse.findMany({
-    where: { id: selectedId },
+    where: { id },
     select: { id: true, code: true, name: true, active: true },
     take: 1,
   }) as Array<{ id: string; code: string; name: string; active?: boolean }>
@@ -416,9 +438,10 @@ async function findSelectedNamedOption(
   selectedId: string | undefined,
   selectActive = false,
 ): Promise<StockPositionFilterOption | null> {
-  if (!selectedId) return null
+  const id = normalizeStockPositionFilterOptionId(selectedId)
+  if (!id) return null
   const rows = await delegate.findMany({
-    where: { id: selectedId },
+    where: { id },
     select: selectActive ? { id: true, name: true, active: true } : { id: true, name: true },
     take: 1,
   }) as Array<{ id: string; name: string; active?: boolean }>
@@ -433,23 +456,25 @@ async function loadWarehouseFilterOptions(input: {
 }): Promise<StockPositionFilterOptionPage> {
   const limit = clampFilterOptionLimit(input.limit)
   const query = normalizeFilterOptionQuery(input.query)
-  const rows = await input.client.warehouse.findMany({
-    where: {
-      active: true,
-      ...(query
-        ? {
-            OR: [
-              { code: { contains: query, mode: 'insensitive' } },
-              { name: { contains: query, mode: 'insensitive' } },
-            ],
-          }
-        : {}),
-    },
-    select: { id: true, code: true, name: true, active: true },
-    orderBy: [{ code: 'asc' }, { name: 'asc' }],
-    take: limit + 1,
-  }) as Array<{ id: string; code: string; name: string; active?: boolean }>
-  const selected = await findSelectedWarehouseOption(input.client, input.selectedId)
+  const [rows, selected] = await Promise.all([
+    input.client.warehouse.findMany({
+      where: {
+        active: true,
+        ...(query
+          ? {
+              OR: [
+                { code: { contains: query, mode: 'insensitive' } },
+                { name: { contains: query, mode: 'insensitive' } },
+              ],
+            }
+          : {}),
+      },
+      select: { id: true, code: true, name: true, active: true },
+      orderBy: [{ code: 'asc' }, { name: 'asc' }],
+      take: limit + 1,
+    }) as Promise<Array<{ id: string; code: string; name: string; active?: boolean }>>,
+    findSelectedWarehouseOption(input.client, input.selectedId),
+  ])
   const merged = mergeSelectedOption(rows.slice(0, limit).map(warehouseOption), selected, limit)
   return {
     options: merged.options,
@@ -468,16 +493,18 @@ async function loadNamedFilterOptions(input: {
 }): Promise<StockPositionFilterOptionPage> {
   const limit = clampFilterOptionLimit(input.limit)
   const query = normalizeFilterOptionQuery(input.query)
-  const rows = await input.delegate.findMany({
-    where: {
-      ...(input.activeOnly ? { active: true } : {}),
-      ...(query ? { name: { contains: query, mode: 'insensitive' } } : {}),
-    },
-    select: { id: true, name: true },
-    orderBy: { name: 'asc' },
-    take: limit + 1,
-  }) as Array<{ id: string; name: string }>
-  const selected = await findSelectedNamedOption(input.delegate, input.selectedId, input.activeOnly)
+  const [rows, selected] = await Promise.all([
+    input.delegate.findMany({
+      where: {
+        ...(input.activeOnly ? { active: true } : {}),
+        ...(query ? { name: { contains: query, mode: 'insensitive' } } : {}),
+      },
+      select: { id: true, name: true },
+      orderBy: { name: 'asc' },
+      take: limit + 1,
+    }) as Promise<Array<{ id: string; name: string }>>,
+    findSelectedNamedOption(input.delegate, input.selectedId, input.activeOnly),
+  ])
   const merged = mergeSelectedOption(rows.slice(0, limit).map(namedOption), selected, limit)
   return {
     options: merged.options,
@@ -745,7 +772,9 @@ export async function getStockPositionFilterOptions(
   deps: StockPositionReportDeps = {},
 ): Promise<StockPositionFilterOptions> {
   if (deps.client) return loadFilterOptions(input, deps.client)
-  if (input.limit) return loadFilterOptions(input, db as StockPositionReportClient)
+  if (input.limit && clampFilterOptionLimit(input.limit) !== STOCK_POSITION_FILTER_OPTION_LIMIT) {
+    return loadFilterOptions(input, db as StockPositionReportClient)
+  }
   const options = await getCachedFilterOptions()
   const hasSelection = Boolean(input.selectedWarehouseId || input.selectedCategoryId || input.selectedSupplierId)
   return hasSelection
