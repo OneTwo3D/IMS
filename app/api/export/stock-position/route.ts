@@ -63,16 +63,16 @@ export async function GET(req: NextRequest) {
         quantity: r.quantity,
         reservedQty: r.reservedQty,
         availableQty: r.availableQty,
-        reservationQtySource: r.reservationQtySource,
-        reservationSnapshotDate: r.reservationSnapshotDate ?? '',
-        reservationSourceCount: r.reservationSourceCount ?? '',
         unitCostBase: r.unitCostBase ?? '',
         totalValueBase: r.totalValueBase,
         asOf: report.asOf,
         source: report.source,
         generatedAt: report.generatedAt,
+        reservationQtySource: r.reservationQtySource,
+        reservationSnapshotDate: r.reservationSnapshotDate ?? '',
+        reservationSourceCount: r.reservationSourceCount ?? 'unknown',
       }))
-      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'quantity', 'reservedQty', 'availableQty', 'reservationQtySource', 'reservationSnapshotDate', 'reservationSourceCount', 'unitCostBase', 'totalValueBase', 'asOf', 'source', 'generatedAt']), `stock-on-hand-${date}.csv`)
+      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'quantity', 'reservedQty', 'availableQty', 'unitCostBase', 'totalValueBase', 'asOf', 'source', 'generatedAt', 'reservationQtySource', 'reservationSnapshotDate', 'reservationSourceCount']), `stock-on-hand-${date}.csv`)
     }
 
     case 'stock-allocations': {

@@ -1837,6 +1837,44 @@ Run npm run validate and npm run validate:db.
 
 ---
 
+## PR 11.8.1.1 — Historical reservation snapshot backfill
+
+### Goal
+
+Backfill `inventory_reservation_snapshots` and
+`inventory_reservation_snapshot_runs` for historical inventory snapshot dates
+captured before PR 11.8.1, so older stock-on-hand as-of reports can show true
+historical reserved/available values instead of explicit current-state fallback.
+
+### Implementation
+
+Add an opt-in reservation backfill mode to the inventory snapshot tooling.
+
+```text
+- For each historical UTC day, reconstruct reservation balances where possible
+  from order allocations, non-pending shipment lines, and in-progress
+  production orders.
+- Write sparse reservation snapshot rows plus the daily run marker
+  idempotently by snapshotDate.
+- When reconstruction is incomplete, write an explicit run-level/result warning
+  rather than silently marking the day complete.
+- Keep the existing on-hand/value backfill behavior unchanged.
+```
+
+### Acceptance criteria
+
+```text
+- Backfilled days with reliable reservation evidence no longer fall back to
+  current StockLevel reservations in stock-on-hand as-of reports.
+- Unreliable or unsupported historical reservation reconstruction is surfaced
+  in the command output and report metadata.
+- Re-running the backfill for the same date range is idempotent.
+- Tests cover reliable reconstruction, unsupported reconstruction, and rerun
+  idempotency.
+```
+
+---
+
 ## PR 11.8.2 — Scalable stock-position report filters
 
 ### Goal

@@ -39,17 +39,20 @@ function createSnapshotClient(input: {
     order: { orderNumber: string | null; externalOrderNumber: string | null; expectedDelivery: Date | null; status: string }
     line: { sku: string | null; description: string }
   }>
-} = {}): InventorySnapshotTestClient & { upserts: unknown[]; reservationUpserts: unknown[] } {
+} = {}): InventorySnapshotTestClient & { upserts: unknown[]; reservationUpserts: unknown[]; reservationRunUpserts: unknown[] } {
   const upserts: unknown[] = []
   const reservationUpserts: unknown[] = []
+  const reservationRunUpserts: unknown[] = []
   return {
     upserts,
     reservationUpserts,
+    reservationRunUpserts,
     stockLevel: {
       findMany: async () => (input.stockLevels ?? []).map((level) => ({
         ...level,
         reservedQty: level.reservedQty ?? decimal('0'),
       })),
+      findUnique: async () => null,
     },
     costLayer: {
       findMany: async () => input.costLayers ?? [],
@@ -77,6 +80,12 @@ function createSnapshotClient(input: {
     inventoryReservationSnapshot: {
       upsert: async (args) => {
         reservationUpserts.push(args)
+        return {}
+      },
+    },
+    inventoryReservationSnapshotRun: {
+      upsert: async (args) => {
+        reservationRunUpserts.push(args)
         return {}
       },
     },
@@ -169,6 +178,7 @@ test('daily inventory snapshot upserts by date/product/warehouse and returns dri
     snapshotDate: '2026-05-28',
     snapshotsWritten: 1,
     reservationSnapshotsWritten: 1,
+    reservationSnapshotStockLevelCount: 1,
     driftCount: 0,
     driftTruncated: false,
     drift: [],
@@ -212,13 +222,22 @@ test('daily inventory snapshot upserts by date/product/warehouse and returns dri
       reservationSourceCount: 1,
     },
   )
+  assert.equal(client.reservationRunUpserts.length, 1)
+  const reservationRunCreate = (client.reservationRunUpserts[0] as {
+    create: { snapshotDate: Date; stockLevelCount: number; reservationSnapshotCount: number }
+  }).create
+  assert.deepEqual(reservationRunCreate, {
+    snapshotDate: new Date('2026-05-28T00:00:00.000Z'),
+    stockLevelCount: 1,
+    reservationSnapshotCount: 1,
+  })
 })
 
-test('reservation snapshot rows round reserved and available quantities with source evidence counts', () => {
+test('reservation snapshot rows round quantities, keep negative availability evidence, and skip zero noise', () => {
   const rows = buildInventoryReservationSnapshotRows({
     snapshotDate: '2026-05-28',
     stockLevels: [
-      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('10'), reservedQty: decimal('2.12345') },
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('1'), reservedQty: decimal('2.12345') },
       { productId: 'product-2', warehouseId: 'warehouse-1', quantity: decimal('5'), reservedQty: decimal('0') },
     ],
     reservationSources: [
@@ -256,15 +275,8 @@ test('reservation snapshot rows round reserved and available quantities with sou
         productId: 'product-1',
         warehouseId: 'warehouse-1',
         reservedQty: '2.1235',
-        availableQty: '7.8765',
+        availableQty: '-1.1235',
         reservationSourceCount: 2,
-      },
-      {
-        productId: 'product-2',
-        warehouseId: 'warehouse-1',
-        reservedQty: '0.0000',
-        availableQty: '5.0000',
-        reservationSourceCount: 0,
       },
     ],
   )

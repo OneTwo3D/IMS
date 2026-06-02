@@ -68,6 +68,12 @@ export type InventoryReservationSnapshotRowInput = {
   reservationSourceCount: number
 }
 
+export type InventoryReservationSnapshotRunInput = {
+  snapshotDate: Date
+  stockLevelCount: number
+  reservationSnapshotCount: number
+}
+
 export type InventorySnapshotDrift = {
   productId: string
   warehouseId: string
@@ -86,6 +92,7 @@ export type InventorySnapshotWriteResult = {
   snapshotDate: string
   snapshotsWritten: number
   reservationSnapshotsWritten: number
+  reservationSnapshotStockLevelCount: number
   driftCount: number
   driftTruncated: boolean
   drift: InventorySnapshotDrift[]
@@ -108,6 +115,7 @@ export type InventorySnapshotClient = Pick<
   | 'stockMovement'
   | 'inventorySnapshot'
   | 'inventoryReservationSnapshot'
+  | 'inventoryReservationSnapshotRun'
   | 'orderAllocation'
   | 'shipmentLine'
   | 'productionOrder'
@@ -117,7 +125,8 @@ export type InventorySnapshotClient = Pick<
 
 export type InventorySnapshotTestClient = {
   stockLevel: {
-    findMany(args: unknown): Promise<InventorySnapshotStockLevelRow[]>
+    findMany(args: unknown): Promise<Array<InventorySnapshotStockLevelRow | InventoryReservationSnapshotStockLevelRow>>
+    findUnique(args: unknown): Promise<{ reservedQty: DecimalInput } | null>
   }
   costLayer: {
     findMany(args: unknown): Promise<InventorySnapshotCostLayerRow[]>
@@ -130,6 +139,9 @@ export type InventorySnapshotTestClient = {
     upsert(args: unknown): Promise<unknown>
   }
   inventoryReservationSnapshot: {
+    upsert(args: unknown): Promise<unknown>
+  }
+  inventoryReservationSnapshotRun: {
     upsert(args: unknown): Promise<unknown>
   }
   orderAllocation: ReservationBreakdownClient['orderAllocation']
@@ -378,6 +390,7 @@ export function buildInventoryReservationSnapshotRows(input: {
         reservationSourceCount: sourceCounts.get(stockKey(level.productId, level.warehouseId)) ?? 0,
       }
     })
+    .filter((row) => !row.reservedQty.isZero() || row.reservationSourceCount > 0)
     .sort((a, b) => (
       a.productId.localeCompare(b.productId) ||
       a.warehouseId.localeCompare(b.warehouseId)
@@ -401,22 +414,41 @@ async function loadCurrentSnapshotRows(client: SnapshotClient): Promise<{
   return { stockLevels, costLayers }
 }
 
+function assertReservationStockLevelRow(
+  row: InventorySnapshotStockLevelRow | InventoryReservationSnapshotStockLevelRow,
+): asserts row is InventoryReservationSnapshotStockLevelRow {
+  if (!('reservedQty' in row)) {
+    throw new Error('Reservation snapshot stock-level query must select reservedQty')
+  }
+}
+
 async function loadCurrentReservationSnapshotRows(
   client: SnapshotClient,
   snapshotDate: Date,
-): Promise<InventoryReservationSnapshotRowInput[]> {
+): Promise<{ rows: InventoryReservationSnapshotRowInput[]; stockLevelCount: number }> {
   const [stockLevels, reservationSources] = await Promise.all([
     client.stockLevel.findMany({
       select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
     }),
+    // TODO: replace detail-row loading with a grouped source-count query when
+    // open allocation/manufacturing volumes make daily snapshots too slow.
+    // Keep InventorySnapshotClient delegates aligned with ReservationBreakdownClient.
     loadReservationSourceRows(client as unknown as ReservationBreakdownClient),
   ])
+  const reservationStockLevels: InventoryReservationSnapshotStockLevelRow[] = []
+  for (const stockLevel of stockLevels) {
+    assertReservationStockLevelRow(stockLevel)
+    reservationStockLevels.push(stockLevel)
+  }
 
-  return buildInventoryReservationSnapshotRows({
-    snapshotDate,
-    stockLevels: stockLevels as InventoryReservationSnapshotStockLevelRow[],
-    reservationSources,
-  })
+  return {
+    rows: buildInventoryReservationSnapshotRows({
+      snapshotDate,
+      stockLevels: reservationStockLevels,
+      reservationSources,
+    }),
+    stockLevelCount: stockLevels.length,
+  }
 }
 
 function stateFromAggregatedRows(rows: readonly AggregatedSnapshotRow[]): {
@@ -546,6 +578,7 @@ async function writeReservationSnapshotRows(
 ): Promise<number> {
   for (let index = 0; index < rows.length; index += SNAPSHOT_WRITE_BATCH_SIZE) {
     const batch = rows.slice(index, index + SNAPSHOT_WRITE_BATCH_SIZE)
+    const updatedAt = new Date()
     const operations = batch.map((row) => (
       client.inventoryReservationSnapshot.upsert({
         where: {
@@ -567,6 +600,7 @@ async function writeReservationSnapshotRows(
           reservedQty: row.reservedQty,
           availableQty: row.availableQty,
           reservationSourceCount: row.reservationSourceCount,
+          updatedAt,
         },
       } as never) as Promise<unknown>
     ))
@@ -574,6 +608,8 @@ async function writeReservationSnapshotRows(
     if ('$transaction' in client && typeof client.$transaction === 'function') {
       await (client as SnapshotBatchTransactionClient).$transaction(operations)
     } else {
+      // TODO: tighten this fallback once snapshot test doubles require $transaction.
+      // Promise.all can partially commit if a delegate rejects mid-batch.
       await Promise.all(operations)
     }
   }
@@ -581,25 +617,51 @@ async function writeReservationSnapshotRows(
   return rows.length
 }
 
+async function writeReservationSnapshotRun(
+  client: SnapshotClient,
+  row: InventoryReservationSnapshotRunInput,
+): Promise<void> {
+  const updatedAt = new Date()
+  await client.inventoryReservationSnapshotRun.upsert({
+    where: { snapshotDate: row.snapshotDate },
+    create: {
+      snapshotDate: row.snapshotDate,
+      stockLevelCount: row.stockLevelCount,
+      reservationSnapshotCount: row.reservationSnapshotCount,
+    },
+    update: {
+      stockLevelCount: row.stockLevelCount,
+      reservationSnapshotCount: row.reservationSnapshotCount,
+      updatedAt,
+    },
+  } as never)
+}
+
 export async function writeDailyInventorySnapshot(options: {
   client?: SnapshotClient
   snapshotDate?: SnapshotDateInput
   tolerance?: Decimal
 } = {}): Promise<InventorySnapshotWriteResult> {
-  const client = options.client ?? db
+  const client: SnapshotClient = options.client ?? db as SnapshotClient
   const snapshotDate = parseSnapshotDate(options.snapshotDate)
   const { state, costLayerQtyByKey } = await loadAggregatedCurrentSnapshotState(client)
-  const reservationRows = await loadCurrentReservationSnapshotRows(client, snapshotDate)
+  const reservationSnapshot = await loadCurrentReservationSnapshotRows(client, snapshotDate)
   const drift = findDrift(state, costLayerQtyByKey, options.tolerance)
   const rows = rowsFromState(snapshotDate, state)
 
   const snapshotsWritten = await writeSnapshotRows(client, rows)
-  const reservationSnapshotsWritten = await writeReservationSnapshotRows(client, reservationRows)
+  const reservationSnapshotsWritten = await writeReservationSnapshotRows(client, reservationSnapshot.rows)
+  await writeReservationSnapshotRun(client, {
+    snapshotDate,
+    stockLevelCount: reservationSnapshot.stockLevelCount,
+    reservationSnapshotCount: reservationSnapshotsWritten,
+  })
 
   return {
     snapshotDate: formatSnapshotDate(snapshotDate),
     snapshotsWritten,
     reservationSnapshotsWritten,
+    reservationSnapshotStockLevelCount: reservationSnapshot.stockLevelCount,
     driftCount: drift.length,
     driftTruncated: drift.length > MAX_INVENTORY_SNAPSHOT_DRIFT_DETAILS,
     drift: drift.slice(0, MAX_INVENTORY_SNAPSHOT_DRIFT_DETAILS),
@@ -663,7 +725,7 @@ export async function backfillInventorySnapshots(options: {
   toDate?: SnapshotDateInput
   dryRun?: boolean
 }): Promise<InventorySnapshotBackfillResult> {
-  const client = options.client ?? db
+  const client: SnapshotClient = options.client ?? db as SnapshotClient
   const fromDate = parseSnapshotDate(options.fromDate)
   const toDate = parseSnapshotDate(options.toDate)
   if (fromDate > toDate) {
@@ -791,6 +853,7 @@ export function inventorySnapshotCounts(result: InventorySnapshotWriteResult): R
   return {
     snapshotsWritten: result.snapshotsWritten,
     reservationSnapshotsWritten: result.reservationSnapshotsWritten,
+    reservationSnapshotStockLevelCount: result.reservationSnapshotStockLevelCount,
     driftCount: result.driftCount,
   }
 }
