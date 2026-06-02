@@ -1,4 +1,4 @@
-import { Prisma, type PrismaClient, type StockMovementType } from '@/app/generated/prisma/client'
+import { Prisma, type PrismaClient, type ProductType, type StockMovementType } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import {
   roundQuantity,
@@ -13,6 +13,8 @@ export type OnHandAsOfFilters = {
   productId?: string
   warehouseId?: string
   categoryId?: string
+  productType?: ProductType
+  supplierId?: string
   excludeZero?: boolean
 }
 
@@ -112,7 +114,7 @@ const MISSING_VALUE_SAMPLE_LIMIT = 25
 
 type ProductScopedWhere = {
   productId?: string
-  product?: { categoryId?: string }
+  product?: Prisma.ProductWhereInput
 }
 
 type WarehouseMovementWhere = {
@@ -254,9 +256,20 @@ function roundValue(value: DecimalInput): Decimal {
 }
 
 function productWhere(filters: OnHandAsOfFilters): ProductScopedWhere {
+  const product: Prisma.ProductWhereInput = {
+    ...(filters.categoryId ? { categoryId: filters.categoryId } : {}),
+    ...(filters.productType ? { type: filters.productType } : {}),
+    ...(filters.supplierId
+      ? {
+          supplierProducts: {
+            some: { supplierId: filters.supplierId },
+          },
+        }
+      : {}),
+  }
   return {
     ...(filters.productId ? { productId: filters.productId } : {}),
-    ...(filters.categoryId ? { product: { categoryId: filters.categoryId } } : {}),
+    ...(Object.keys(product).length > 0 ? { product } : {}),
   }
 }
 
@@ -372,6 +385,13 @@ function currentStateSqlFilters(filters: OnHandAsOfFilters, alias: 'sl' | 'cl'):
     ${filters.productId ? Prisma.sql`AND ${Prisma.raw(alias)}."productId" = ${filters.productId}` : Prisma.empty}
     ${filters.warehouseId ? Prisma.sql`AND ${Prisma.raw(alias)}."warehouseId" = ${filters.warehouseId}` : Prisma.empty}
     ${filters.categoryId ? Prisma.sql`AND p."categoryId" = ${filters.categoryId}` : Prisma.empty}
+    ${filters.productType ? Prisma.sql`AND p."type" = ${filters.productType}::"ProductType"` : Prisma.empty}
+    ${filters.supplierId ? Prisma.sql`AND EXISTS (
+      SELECT 1
+      FROM supplier_products sp
+      WHERE sp."productId" = p.id
+        AND sp."supplierId" = ${filters.supplierId}
+    )` : Prisma.empty}
   `
 }
 
@@ -628,6 +648,8 @@ export async function getOnHandAsOf(options: {
   productId?: string
   warehouseId?: string
   categoryId?: string
+  productType?: ProductType
+  supplierId?: string
   excludeZero?: boolean
   client?: OnHandAsOfClient
   now?: () => Date
@@ -644,6 +666,8 @@ export async function getOnHandAsOf(options: {
     productId: options.productId,
     warehouseId: options.warehouseId,
     categoryId: options.categoryId,
+    productType: options.productType,
+    supplierId: options.supplierId,
     excludeZero: options.excludeZero,
   }
 

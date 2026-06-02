@@ -10,9 +10,11 @@ import { hasPermission } from '@/lib/permissions'
 export async function GET(req: NextRequest) {
   const session = await requireApiAuth()
   if (session instanceof NextResponse) return session
-  if (!hasPermission(session.user.role, 'analytics')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
   const type = req.nextUrl.searchParams.get('type') ?? 'products'
+  if (!hasPermission(session.user.role, 'analytics')) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  }
   const dateFrom = req.nextUrl.searchParams.get('from') ?? undefined
   const dateTo = req.nextUrl.searchParams.get('to') ?? undefined
   const date = new Date().toISOString().slice(0, 10)
