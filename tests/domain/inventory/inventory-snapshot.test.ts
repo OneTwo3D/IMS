@@ -15,6 +15,12 @@ function decimal(value: string | number): Prisma.Decimal {
   return new Prisma.Decimal(value)
 }
 
+const EXPECTED_RESERVATION_BACKFILL_LIMITATIONS = [
+  'The mutation check assumes reservation-source writes use Prisma paths that maintain updatedAt values.',
+  'Hard-deleted reservation source rows cannot be detected without a historical source audit table.',
+  'Raw SQL updates that bypass updatedAt can make a supported day look safer than it is.',
+]
+
 function createSnapshotClient(input: {
   stockLevels?: Array<{ productId: string; warehouseId: string; quantity: Prisma.Decimal; reservedQty?: Prisma.Decimal }>
   costLayers?: Array<{ productId: string; warehouseId: string; remainingQty: Prisma.Decimal; unitCostBase: Prisma.Decimal }>
@@ -29,6 +35,11 @@ function createSnapshotClient(input: {
     createdAt: Date
   }>
   averageRows?: Array<{ snapshotDate: Date; valueBase: Prisma.Decimal }>
+  salesOrderUpdatedAt?: Date | null
+  allocationUpdatedAt?: Date | null
+  productionUpdatedAt?: Date | null
+  hasCommittedShipmentLine?: boolean
+  hasAssemblyProductionOrder?: boolean
   allocations?: Array<{
     id: string
     orderId: string
@@ -47,6 +58,9 @@ function createSnapshotClient(input: {
     upserts,
     reservationUpserts,
     reservationRunUpserts,
+    salesOrder: {
+      aggregate: async () => ({ _max: { updatedAt: input.salesOrderUpdatedAt ?? null } }),
+    },
     stockLevel: {
       findMany: async () => (input.stockLevels ?? []).map((level) => ({
         ...level,
@@ -91,12 +105,16 @@ function createSnapshotClient(input: {
     },
     orderAllocation: {
       findMany: async () => input.allocations ?? [],
+      aggregate: async () => ({ _max: { updatedAt: input.allocationUpdatedAt ?? null } }),
     },
     shipmentLine: {
       findMany: async () => [],
+      findFirst: async () => input.hasCommittedShipmentLine ? { id: 'shipment-line-1' } : null,
     },
     productionOrder: {
       findMany: async () => [],
+      aggregate: async () => ({ _max: { updatedAt: input.productionUpdatedAt ?? null } }),
+      findFirst: async () => input.hasAssemblyProductionOrder ? { id: 'production-order-1' } : null,
     },
     $transaction: async (operations) => Promise.all(operations),
   }
@@ -224,12 +242,32 @@ test('daily inventory snapshot upserts by date/product/warehouse and returns dri
   )
   assert.equal(client.reservationRunUpserts.length, 1)
   const reservationRunCreate = (client.reservationRunUpserts[0] as {
-    create: { snapshotDate: Date; stockLevelCount: number; reservationSnapshotCount: number }
+    create: {
+      snapshotDate: Date
+      stockLevelCount: number
+      reservationSnapshotCount: number
+      source: string
+      checkMethod: string
+      cutoffAt: Date
+      reservationSourceCount: number
+    }
   }).create
-  assert.deepEqual(reservationRunCreate, {
+  assert.deepEqual({
+    snapshotDate: reservationRunCreate.snapshotDate,
+    stockLevelCount: reservationRunCreate.stockLevelCount,
+    reservationSnapshotCount: reservationRunCreate.reservationSnapshotCount,
+    source: reservationRunCreate.source,
+    checkMethod: reservationRunCreate.checkMethod,
+    cutoffAt: reservationRunCreate.cutoffAt,
+    reservationSourceCount: reservationRunCreate.reservationSourceCount,
+  }, {
     snapshotDate: new Date('2026-05-28T00:00:00.000Z'),
     stockLevelCount: 1,
     reservationSnapshotCount: 1,
+    source: 'cron',
+    checkMethod: 'daily_current_state_v1',
+    cutoffAt: new Date('2026-05-28T23:59:59.999Z'),
+    reservationSourceCount: 1,
   })
 })
 
@@ -314,6 +352,17 @@ test('historical backfill replays later movements backwards from current state',
     missingValueMovementCount: 0,
     dryRun: false,
     valueReplayReliable: true,
+    reservationBackfill: {
+      enabled: false,
+      reliability: 'not_attempted',
+      totalDaysInRange: 0,
+      supportedDaysWritten: 0,
+      snapshotsWritten: 0,
+      runMarkersWritten: 0,
+      unsupportedDaysSkipped: 0,
+      warnings: [],
+      knownLimitations: [],
+    },
   })
   const creates = client.upserts.map((upsert) => (upsert as { create: { snapshotDate: Date; qty: Prisma.Decimal; valueBase: Prisma.Decimal } }).create)
   assert.deepEqual(
@@ -325,6 +374,434 @@ test('historical backfill replays later movements backwards from current state',
     [
       { snapshotDate: '2026-05-28T00:00:00.000Z', qty: '10.0000', valueBase: '20.000000' },
       { snapshotDate: '2026-05-27T00:00:00.000Z', qty: '12.0000', valueBase: '24.000000' },
+    ],
+  )
+})
+
+test('reservation backfill writes sparse rows and run markers for reliable days', async () => {
+  const client = createSnapshotClient({
+    stockLevels: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('4'), reservedQty: decimal('1.25') },
+      { productId: 'product-2', warehouseId: 'warehouse-1', quantity: decimal('3'), reservedQty: decimal('0') },
+    ],
+    costLayers: [
+      { productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('4'), unitCostBase: decimal('2') },
+      { productId: 'product-2', warehouseId: 'warehouse-1', remainingQty: decimal('3'), unitCostBase: decimal('1') },
+    ],
+    allocations: [{
+      id: 'allocation-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('1.25'),
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      line: { sku: 'SKU-1', description: 'Widget' },
+    }],
+  })
+
+  const result = await backfillInventorySnapshots({
+    client,
+    fromDate: '2026-05-28',
+    toDate: '2026-05-28',
+    includeReservationSnapshots: true,
+  })
+
+  assert.deepEqual(result.reservationBackfill, {
+    enabled: true,
+    reliability: 'reliable',
+    totalDaysInRange: 1,
+    supportedDaysWritten: 1,
+    snapshotsWritten: 1,
+    runMarkersWritten: 1,
+    unsupportedDaysSkipped: 0,
+    warnings: [],
+    knownLimitations: EXPECTED_RESERVATION_BACKFILL_LIMITATIONS,
+  })
+  assert.equal(client.reservationUpserts.length, 1)
+  const reservationCreate = (client.reservationUpserts[0] as {
+    create: {
+      snapshotDate: Date
+      productId: string
+      warehouseId: string
+      reservedQty: Prisma.Decimal
+      availableQty: Prisma.Decimal
+      reservationSourceCount: number
+    }
+  }).create
+  assert.deepEqual({
+    snapshotDate: reservationCreate.snapshotDate.toISOString(),
+    productId: reservationCreate.productId,
+    warehouseId: reservationCreate.warehouseId,
+    reservedQty: reservationCreate.reservedQty.toFixed(4),
+    availableQty: reservationCreate.availableQty.toFixed(4),
+    reservationSourceCount: reservationCreate.reservationSourceCount,
+  }, {
+    snapshotDate: '2026-05-28T00:00:00.000Z',
+    productId: 'product-1',
+    warehouseId: 'warehouse-1',
+    reservedQty: '1.2500',
+    availableQty: '2.7500',
+    reservationSourceCount: 1,
+  })
+  assert.equal(client.reservationRunUpserts.length, 1)
+  const reservationRunCreate = (client.reservationRunUpserts[0] as {
+    create: {
+      snapshotDate: Date
+      source: string
+      checkMethod: string
+      cutoffAt: Date
+      reservationSourceCount: number
+    }
+  }).create
+  assert.deepEqual({
+    snapshotDate: reservationRunCreate.snapshotDate.toISOString(),
+    source: reservationRunCreate.source,
+    checkMethod: reservationRunCreate.checkMethod,
+    cutoffAt: reservationRunCreate.cutoffAt.toISOString(),
+    reservationSourceCount: reservationRunCreate.reservationSourceCount,
+  }, {
+    snapshotDate: '2026-05-28T00:00:00.000Z',
+    source: 'backfill',
+    checkMethod: 'current_sources_updated_at_gate_v2',
+    cutoffAt: '2026-05-28T23:59:59.999Z',
+    reservationSourceCount: 1,
+  })
+})
+
+test('reservation backfill warns and skips run marker when source state changed after cutoff', async () => {
+  const client = createSnapshotClient({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('4'), reservedQty: decimal('1') }],
+    costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('4'), unitCostBase: decimal('2') }],
+    allocationUpdatedAt: new Date('2026-05-29T00:00:00.000Z'),
+    allocations: [{
+      id: 'allocation-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('1'),
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      line: { sku: 'SKU-1', description: 'Widget' },
+    }],
+  })
+
+  const result = await backfillInventorySnapshots({
+    client,
+    fromDate: '2026-05-28',
+    toDate: '2026-05-28',
+    includeReservationSnapshots: true,
+  })
+
+  assert.deepEqual(result.reservationBackfill, {
+    enabled: true,
+    reliability: 'warnings',
+    totalDaysInRange: 1,
+    supportedDaysWritten: 0,
+    snapshotsWritten: 0,
+    runMarkersWritten: 0,
+    unsupportedDaysSkipped: 1,
+    warnings: [{
+      snapshotDate: '2026-05-28',
+      code: 'reservation_source_changed_after_cutoff',
+      message: 'Reservation sources changed after 2026-05-28T23:59:59.999Z; historical reserved quantities cannot be reconstructed from current allocation/shipment/production state for this day.',
+    }],
+    knownLimitations: EXPECTED_RESERVATION_BACKFILL_LIMITATIONS,
+  })
+  assert.equal(client.reservationUpserts.length, 0)
+  assert.equal(client.reservationRunUpserts.length, 0)
+})
+
+test('reservation backfill checks each mutable reservation source path', async () => {
+  for (const [field, updatedAt] of [
+    ['salesOrderUpdatedAt', new Date('2026-05-29T00:00:00.000Z')],
+    ['productionUpdatedAt', new Date('2026-05-29T00:00:00.000Z')],
+  ] as const) {
+    const client = createSnapshotClient({
+      stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('4'), reservedQty: decimal('1') }],
+      costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('4'), unitCostBase: decimal('2') }],
+      [field]: updatedAt,
+      allocations: [{
+        id: 'allocation-1',
+        orderId: 'order-1',
+        lineId: 'line-1',
+        productId: 'product-1',
+        warehouseId: 'warehouse-1',
+        qty: decimal('1'),
+        order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+        line: { sku: 'SKU-1', description: 'Widget' },
+      }],
+    })
+
+    const result = await backfillInventorySnapshots({
+      client,
+      fromDate: '2026-05-28',
+      toDate: '2026-05-28',
+      includeReservationSnapshots: true,
+    })
+
+    assert.equal(result.reservationBackfill.reliability, 'warnings')
+    assert.equal(result.reservationBackfill.unsupportedDaysSkipped, 1)
+    assert.deepEqual(
+      result.reservationBackfill.warnings.map((warning) => warning.code),
+      ['reservation_source_changed_after_cutoff'],
+    )
+    assert.equal(client.reservationUpserts.length, 0)
+    assert.equal(client.reservationRunUpserts.length, 0)
+  }
+})
+
+test('reservation backfill skips days when shipment-line history is not provable', async () => {
+  const client = createSnapshotClient({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('4'), reservedQty: decimal('1') }],
+    costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('4'), unitCostBase: decimal('2') }],
+    hasCommittedShipmentLine: true,
+    allocations: [{
+      id: 'allocation-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('1'),
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      line: { sku: 'SKU-1', description: 'Widget' },
+    }],
+  })
+
+  const result = await backfillInventorySnapshots({
+    client,
+    fromDate: '2026-05-28',
+    toDate: '2026-05-28',
+    includeReservationSnapshots: true,
+  })
+
+  assert.deepEqual(result.reservationBackfill.warnings, [{
+    snapshotDate: '2026-05-28',
+    code: 'timestampless_shipment_line_history_unavailable',
+    message: 'Committed shipment lines exist but shipment_lines has no updatedAt column; historical reservation reconstruction cannot prove shipment-line membership for this day.',
+  }])
+  assert.equal(result.reservationBackfill.unsupportedDaysSkipped, 1)
+  assert.equal(client.reservationRunUpserts.length, 0)
+})
+
+test('reservation backfill skips days when assembly BOM component history is not provable', async () => {
+  const client = createSnapshotClient({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('4'), reservedQty: decimal('1') }],
+    costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('4'), unitCostBase: decimal('2') }],
+    hasAssemblyProductionOrder: true,
+    allocations: [{
+      id: 'allocation-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('1'),
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      line: { sku: 'SKU-1', description: 'Widget' },
+    }],
+  })
+
+  const result = await backfillInventorySnapshots({
+    client,
+    fromDate: '2026-05-28',
+    toDate: '2026-05-28',
+    includeReservationSnapshots: true,
+  })
+
+  assert.deepEqual(result.reservationBackfill.warnings, [{
+    snapshotDate: '2026-05-28',
+    code: 'assembly_component_history_unavailable',
+    message: 'In-progress assembly production orders depend on current BOM component membership; historical reservation reconstruction cannot prove component reservations for this day.',
+  }])
+  assert.equal(result.reservationBackfill.unsupportedDaysSkipped, 1)
+  assert.equal(client.reservationRunUpserts.length, 0)
+})
+
+test('reservation backfill writes negative availability as evidence with a warning', async () => {
+  const client = createSnapshotClient({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('1'), reservedQty: decimal('2') }],
+    costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('1'), unitCostBase: decimal('2') }],
+    allocations: [{
+      id: 'allocation-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('2'),
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      line: { sku: 'SKU-1', description: 'Widget' },
+    }],
+  })
+
+  const result = await backfillInventorySnapshots({
+    client,
+    fromDate: '2026-05-28',
+    toDate: '2026-05-28',
+    includeReservationSnapshots: true,
+  })
+
+  assert.deepEqual(result.reservationBackfill.warnings, [{
+    snapshotDate: '2026-05-28',
+    code: 'negative_available_qty',
+    message: '1 reservation snapshot row(s) have negative availableQty; the value is stored as evidence because reservation quantity exceeds historical on-hand quantity.',
+  }])
+  assert.equal(result.reservationBackfill.reliability, 'warnings')
+  assert.equal(client.reservationUpserts.length, 1)
+  const reservationCreate = (client.reservationUpserts[0] as {
+    create: { availableQty: Prisma.Decimal; reservedQty: Prisma.Decimal }
+  }).create
+  assert.equal(reservationCreate.reservedQty.toFixed(4), '2.0000')
+  assert.equal(reservationCreate.availableQty.toFixed(4), '-1.0000')
+  assert.equal(client.reservationRunUpserts.length, 1)
+})
+
+test('reservation backfill handles mixed supported and unsupported days', async () => {
+  const client = createSnapshotClient({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('4'), reservedQty: decimal('1') }],
+    costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('4'), unitCostBase: decimal('2') }],
+    allocationUpdatedAt: new Date('2026-05-29T12:00:00.000Z'),
+    allocations: [{
+      id: 'allocation-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('1'),
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      line: { sku: 'SKU-1', description: 'Widget' },
+    }],
+  })
+
+  const result = await backfillInventorySnapshots({
+    client,
+    fromDate: '2026-05-28',
+    toDate: '2026-05-29',
+    includeReservationSnapshots: true,
+  })
+
+  assert.deepEqual({
+    reliability: result.reservationBackfill.reliability,
+    totalDaysInRange: result.reservationBackfill.totalDaysInRange,
+    supportedDaysWritten: result.reservationBackfill.supportedDaysWritten,
+    unsupportedDaysSkipped: result.reservationBackfill.unsupportedDaysSkipped,
+    snapshotsWritten: result.reservationBackfill.snapshotsWritten,
+    runMarkersWritten: result.reservationBackfill.runMarkersWritten,
+    warningDates: result.reservationBackfill.warnings.map((warning) => warning.snapshotDate),
+  }, {
+    reliability: 'warnings',
+    totalDaysInRange: 2,
+    supportedDaysWritten: 1,
+    unsupportedDaysSkipped: 1,
+    snapshotsWritten: 1,
+    runMarkersWritten: 1,
+    warningDates: ['2026-05-28'],
+  })
+  assert.equal(client.reservationRunUpserts.length, 1)
+})
+
+test('reservation backfill reruns are idempotent by snapshot date and stock pair', async () => {
+  const client = createSnapshotClient({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('4'), reservedQty: decimal('1') }],
+    costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('4'), unitCostBase: decimal('2') }],
+    allocations: [{
+      id: 'allocation-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('1'),
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      line: { sku: 'SKU-1', description: 'Widget' },
+    }],
+  })
+
+  await backfillInventorySnapshots({
+    client,
+    fromDate: '2026-05-28',
+    toDate: '2026-05-28',
+    includeReservationSnapshots: true,
+  })
+  await backfillInventorySnapshots({
+    client,
+    fromDate: '2026-05-28',
+    toDate: '2026-05-28',
+    includeReservationSnapshots: true,
+  })
+
+  assert.equal(client.reservationUpserts.length, 2)
+  assert.deepEqual(
+    client.reservationUpserts.map((upsert) => (upsert as {
+      where: { snapshotDate_productId_warehouseId: { snapshotDate: Date; productId: string; warehouseId: string } }
+    }).where.snapshotDate_productId_warehouseId),
+    [
+      { snapshotDate: new Date('2026-05-28T00:00:00.000Z'), productId: 'product-1', warehouseId: 'warehouse-1' },
+      { snapshotDate: new Date('2026-05-28T00:00:00.000Z'), productId: 'product-1', warehouseId: 'warehouse-1' },
+    ],
+  )
+  assert.deepEqual(
+    client.reservationUpserts.map((upsert) => {
+      const update = (upsert as {
+        update: { reservedQty: Prisma.Decimal; availableQty: Prisma.Decimal; reservationSourceCount: number }
+      }).update
+      return {
+        reservedQty: update.reservedQty.toFixed(4),
+        availableQty: update.availableQty.toFixed(4),
+        reservationSourceCount: update.reservationSourceCount,
+      }
+    }),
+    [
+      { reservedQty: '1.0000', availableQty: '3.0000', reservationSourceCount: 1 },
+      { reservedQty: '1.0000', availableQty: '3.0000', reservationSourceCount: 1 },
+    ],
+  )
+  assert.equal(client.reservationRunUpserts.length, 2)
+  assert.deepEqual(
+    client.reservationRunUpserts.map((upsert) => (upsert as {
+      where: { snapshotDate: Date }
+    }).where),
+    [
+      { snapshotDate: new Date('2026-05-28T00:00:00.000Z') },
+      { snapshotDate: new Date('2026-05-28T00:00:00.000Z') },
+    ],
+  )
+  assert.deepEqual(
+    client.reservationRunUpserts.map((upsert) => {
+      const update = (upsert as {
+        update: {
+          source: string
+          checkMethod: string
+          cutoffAt: Date
+          stockLevelCount: number
+          reservationSnapshotCount: number
+          reservationSourceCount: number
+        }
+      }).update
+      return {
+        source: update.source,
+        checkMethod: update.checkMethod,
+        cutoffAt: update.cutoffAt.toISOString(),
+        stockLevelCount: update.stockLevelCount,
+        reservationSnapshotCount: update.reservationSnapshotCount,
+        reservationSourceCount: update.reservationSourceCount,
+      }
+    }),
+    [
+      {
+        source: 'backfill',
+        checkMethod: 'current_sources_updated_at_gate_v2',
+        cutoffAt: '2026-05-28T23:59:59.999Z',
+        stockLevelCount: 1,
+        reservationSnapshotCount: 1,
+        reservationSourceCount: 1,
+      },
+      {
+        source: 'backfill',
+        checkMethod: 'current_sources_updated_at_gate_v2',
+        cutoffAt: '2026-05-28T23:59:59.999Z',
+        stockLevelCount: 1,
+        reservationSnapshotCount: 1,
+        reservationSourceCount: 1,
+      },
     ],
   )
 })
@@ -458,6 +935,56 @@ test('historical backfill dry-run does not write and reports null-value movement
   assert.equal(result.dryRun, true)
   assert.equal(result.missingValueMovementCount, 1)
   assert.equal(result.valueReplayReliable, false)
+  assert.deepEqual(result.reservationBackfill, {
+    enabled: false,
+    reliability: 'not_attempted',
+    totalDaysInRange: 0,
+    supportedDaysWritten: 0,
+    snapshotsWritten: 0,
+    runMarkersWritten: 0,
+    unsupportedDaysSkipped: 0,
+    warnings: [],
+    knownLimitations: [],
+  })
+})
+
+test('reservation backfill dry-run reports supported reservation work without writing rows or run markers', async () => {
+  const client = createSnapshotClient({
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('4'), reservedQty: decimal('1') }],
+    costLayers: [{ productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('4'), unitCostBase: decimal('2') }],
+    allocations: [{
+      id: 'allocation-1',
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: decimal('1'),
+      order: { orderNumber: 'SO-1', externalOrderNumber: null, expectedDelivery: null, status: 'ALLOCATED' },
+      line: { sku: 'SKU-1', description: 'Widget' },
+    }],
+  })
+
+  const result = await backfillInventorySnapshots({
+    client,
+    fromDate: '2026-05-28',
+    toDate: '2026-05-28',
+    dryRun: true,
+    includeReservationSnapshots: true,
+  })
+
+  assert.equal(client.reservationUpserts.length, 0)
+  assert.equal(client.reservationRunUpserts.length, 0)
+  assert.deepEqual(result.reservationBackfill, {
+    enabled: true,
+    reliability: 'reliable',
+    totalDaysInRange: 1,
+    supportedDaysWritten: 1,
+    snapshotsWritten: 1,
+    runMarkersWritten: 0,
+    unsupportedDaysSkipped: 0,
+    warnings: [],
+    knownLimitations: EXPECTED_RESERVATION_BACKFILL_LIMITATIONS,
+  })
 })
 
 test('historical backfill rejects inverted and future date ranges', async () => {

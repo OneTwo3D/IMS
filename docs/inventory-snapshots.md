@@ -74,11 +74,46 @@ Backfill reconstructs older days from current state by replaying
 `missingValueMovementCount` and make the value result advisory for affected
 ranges.
 
-Reservation snapshot backfill is not part of the current on-hand backfill. Only
-days captured by the daily cron after the reservation snapshot migration have
-true historical reserved/available evidence. Older inventory snapshot days will
-surface missing reservation evidence in stock-on-hand reports until the
-reservation backfill follow-up lands.
+Reservation snapshots are opt-in during backfill:
+
+```bash
+npm run inventory:snapshots:backfill -- --from 2026-01-01 --to 2026-01-31 --include-reservations --dry-run
+npm run inventory:snapshots:backfill -- --from 2026-01-01 --to 2026-01-31 --include-reservations --yes
+```
+
+The reservation pass is conservative. It writes sparse reservation rows and a
+daily run marker only when allocation, shipment, and production reservation
+sources pass the support check for the target UTC day. The support check uses
+current source-row timestamps: it compares the latest `updatedAt` on surviving
+sales orders, order allocations, and production orders against the target
+end-of-day cutoff. It also rejects current reservation graphs with committed
+shipment lines, because `shipment_lines` has no `updatedAt`, and in-progress
+assembly production orders, because current BOM component membership may not
+match the historical day.
+
+If a day is unsupported, the backfill reports a warning for that date and does
+not write `inventory_reservation_snapshot_runs`; stock-on-hand reports will
+continue to surface missing reservation evidence rather than treating absent
+rows as zero. Negative `availableQty` is stored as evidence and reported as a
+warning because it means current source reservations exceed the replayed
+historical on-hand quantity for that day. Use `--strict-reservations` when a
+script or CI job should exit with code `2` if any reservation warning is
+reported.
+
+### Known limitations of the reservation source mutation check
+
+- Hard-deleted reservation source rows cannot be detected without a historical
+  source audit table. If hard deletes occurred after the target day, the
+  backfill can understate historical reservations.
+- Raw SQL updates that bypass Prisma `@updatedAt` fields can make source rows
+  look unchanged even when quantities or statuses changed.
+- Committed shipment-line history is unsupported until `shipment_lines` carries
+  mutation timestamps or a source audit trail.
+- Assembly production-order component history is unsupported because current
+  BOM membership can differ from the historical membership.
+
+Run the dry-run first and review every `reservationBackfill.warnings` and
+`reservationBackfill.knownLimitations` entry before writing.
 
 ## Performance
 
