@@ -13,6 +13,7 @@ export type Permission =
   | 'manufacturing'
   | 'analytics'
   | 'analytics.inventory_ledger'
+  | 'analytics.inventory_costing'
   | 'sync'
   | 'settings' | 'settings.company' | 'settings.users'
   | 'activity_log'
@@ -29,7 +30,7 @@ const ROLE_PERMISSIONS: Record<Role, Set<Permission>> = {
     'stock_control', 'stock_control.adjust', 'stock_control.transfer',
     'purchasing', 'purchasing.create', 'purchasing.receive', 'purchasing.invoice',
     'sales', 'sales.create', 'sales.process', 'sales.refund',
-    'manufacturing', 'analytics', 'analytics.inventory_ledger', 'sync',
+    'manufacturing', 'analytics', 'analytics.inventory_ledger', 'analytics.inventory_costing', 'sync',
     'settings', 'settings.company', 'settings.users',
     'activity_log', 'help',
   ]),
@@ -38,7 +39,7 @@ const ROLE_PERMISSIONS: Record<Role, Set<Permission>> = {
     'stock_control', 'stock_control.adjust', 'stock_control.transfer',
     'purchasing', 'purchasing.create', 'purchasing.receive', 'purchasing.invoice',
     'sales', 'sales.create', 'sales.process', 'sales.refund',
-    'manufacturing', 'analytics', 'analytics.inventory_ledger', 'sync',
+    'manufacturing', 'analytics', 'analytics.inventory_ledger', 'analytics.inventory_costing', 'sync',
     'activity_log', 'help',
   ]),
   WAREHOUSE: new Set([
@@ -54,7 +55,7 @@ const ROLE_PERMISSIONS: Record<Role, Set<Permission>> = {
     'dashboard', 'inventory', 'inventory.prices',
     'purchasing', 'purchasing.create', 'purchasing.invoice',
     'sales', 'sales.refund',
-    'analytics', 'analytics.inventory_ledger',
+    'analytics', 'analytics.inventory_ledger', 'analytics.inventory_costing',
     'help',
   ]),
   READONLY: new Set([
