@@ -4,7 +4,9 @@ import { ProductLink } from '@/components/inventory/product-link'
 import { getOrganisation } from '@/app/actions/company'
 import {
   getStockAdjustmentReport,
-  type InventoryLedgerFilters,
+  inventoryLedgerFiltersForUi,
+  inventoryLedgerFiltersFromSearch,
+  type InventoryLedgerSearchParams,
   type StockAdjustmentReportRow,
 } from '@/lib/domain/inventory/inventory-ledger-reports'
 import {
@@ -16,46 +18,14 @@ import { formatMoneyCode } from '@/lib/utils'
 import {
   InventoryLedgerReportPage,
   type InventoryLedgerColumn,
-  type InventoryLedgerFilterValues,
 } from '../_components/inventory-ledger-report'
 
 export const metadata: Metadata = { title: 'Stock Adjustments' }
 
-type SearchParams = Record<string, string | string[] | undefined>
-
-function one(value: string | string[] | undefined): string | undefined {
-  return Array.isArray(value) ? value[0] : value
-}
-
-function filtersFromSearch(searchParams: SearchParams): InventoryLedgerFilters {
-  return {
-    dateFrom: one(searchParams.dateFrom),
-    dateTo: one(searchParams.dateTo),
-    warehouseId: one(searchParams.warehouseId),
-    product: one(searchParams.product),
-    reference: one(searchParams.reference),
-    minValue: one(searchParams.minValue),
-    page: Number(one(searchParams.page) ?? 1),
-    pageSize: Number(one(searchParams.pageSize) ?? 100),
-  }
-}
-
-function filtersForUi(filters: InventoryLedgerFilters): InventoryLedgerFilterValues {
-  return {
-    dateFrom: filters.dateFrom,
-    dateTo: filters.dateTo,
-    warehouseId: filters.warehouseId,
-    product: filters.product,
-    reference: filters.reference,
-    minValue: filters.minValue,
-    pageSize: String(filters.pageSize ?? 100),
-  }
-}
-
-export default async function StockAdjustmentsPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
+export default async function StockAdjustmentsPage({ searchParams }: { searchParams: Promise<InventoryLedgerSearchParams> }) {
   await requireInventoryLedgerReportAccess()
   const resolvedSearchParams = await searchParams
-  const filters = filtersFromSearch(resolvedSearchParams)
+  const filters = inventoryLedgerFiltersFromSearch(resolvedSearchParams, { includeMinValue: true })
   const [report, filterOptions, organisation] = await Promise.all([
     getStockAdjustmentReport(filters),
     getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),
@@ -94,7 +64,7 @@ export default async function StockAdjustmentsPage({ searchParams }: { searchPar
       title="Stock Adjustments"
       description="Adjustment movement audit with reason matching, SKU totals and finance write-off value."
       reportKey="stock-adjustments"
-      filters={filtersForUi(filters)}
+      filters={inventoryLedgerFiltersForUi(filters, { includeMinValue: true })}
       filterOptions={filterOptions}
       pageInfo={report.pageInfo}
       rows={report.rows}

@@ -9,6 +9,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import type { PageInfo, StockPositionFilterOptions } from '@/lib/domain/inventory/stock-position-reports'
 import { cn } from '@/lib/utils'
 import { StockPositionFilterCombobox } from './stock-position-filter-combobox'
+import { appendParams, currentParams, toneClass, type SummaryTone } from './report-utils'
 
 export type InventoryLedgerColumn<Row> = {
   key: string
@@ -42,35 +43,11 @@ type InventoryLedgerReportPageProps<Row> = {
   rows: Row[]
   rowKey: (row: Row, index: number) => string
   columns: Array<InventoryLedgerColumn<Row>>
-  summary: Array<{ label: string; value: string; tone?: 'default' | 'warning' | 'danger' }>
+  summary: Array<{ label: string; value: string; tone?: SummaryTone }>
   notices?: string[]
   statusKind?: 'transfer' | 'stock-count'
   showMovementType?: boolean
   showMinValue?: boolean
-}
-
-function appendParams(base: URLSearchParams, updates: Record<string, string | number | undefined>): string {
-  const params = new URLSearchParams(base)
-  for (const [key, value] of Object.entries(updates)) {
-    if (value == null || value === '') params.delete(key)
-    else params.set(key, String(value))
-  }
-  return params.toString()
-}
-
-function currentParams(filters: InventoryLedgerFilterValues): URLSearchParams {
-  const params = new URLSearchParams()
-  for (const [key, value] of Object.entries(filters)) {
-    if (value == null || value === '') continue
-    params.set(key, String(value))
-  }
-  return params
-}
-
-function toneClass(tone: 'default' | 'warning' | 'danger' = 'default'): string {
-  if (tone === 'danger') return 'text-destructive'
-  if (tone === 'warning') return 'text-orange-600'
-  return 'text-foreground'
 }
 
 function statusOptions(kind: 'transfer' | 'stock-count' | undefined): string[] {
@@ -153,6 +130,7 @@ export function InventoryLedgerReportPage<Row>({
           {showMovementType && (
             <div className="space-y-1.5">
               <Label htmlFor="movementType">Movement type</Label>
+              {/* Native select is intentional for enum filters below the searchable-control threshold of 20 options. */}
               <select id="movementType" name="type" defaultValue={filters.type ?? ''} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
                 <option value="">All movement types</option>
                 {Object.values(StockMovementType).map((type) => (
@@ -178,7 +156,7 @@ export function InventoryLedgerReportPage<Row>({
           </div>
           {showMinValue && (
             <div className="space-y-1.5">
-              <Label htmlFor="minValue">Min value</Label>
+              <Label htmlFor="minValue">Min absolute value</Label>
               <Input id="minValue" name="minValue" inputMode="decimal" defaultValue={filters.minValue ?? ''} className="h-9" />
             </div>
           )}

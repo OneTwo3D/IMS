@@ -9,6 +9,7 @@ import type { ProductType } from '@/app/generated/prisma/client'
 import type { PageInfo, StockPositionFilterOptions } from '@/lib/domain/inventory/stock-position-reports'
 import { cn } from '@/lib/utils'
 import { StockPositionFilterCombobox } from './stock-position-filter-combobox'
+import { appendParams, currentParams, toneClass, type SummaryTone } from './report-utils'
 
 export type StockPositionColumn<Row> = {
   key: string
@@ -40,37 +41,13 @@ type StockPositionReportPageProps<Row> = {
   rows: Row[]
   rowKey: (row: Row, index: number) => string
   columns: StockPositionColumn<Row>[]
-  summary: Array<{ label: string; value: string; tone?: 'default' | 'warning' | 'danger' }>
+  summary: Array<{ label: string; value: string; tone?: SummaryTone }>
   notices?: string[]
   dateMode: 'as-of' | 'range' | 'none'
 }
 
-function appendParams(base: URLSearchParams, updates: Record<string, string | number | undefined>): string {
-  const params = new URLSearchParams(base)
-  for (const [key, value] of Object.entries(updates)) {
-    if (value == null || value === '') params.delete(key)
-    else params.set(key, String(value))
-  }
-  return params.toString()
-}
-
-function currentParams(filters: StockPositionFilterValues): URLSearchParams {
-  const params = new URLSearchParams()
-  for (const [key, value] of Object.entries(filters)) {
-    if (value == null || value === '' || value === false) continue
-    params.set(key, value === true ? '1' : String(value))
-  }
-  return params
-}
-
 function today(): string {
   return new Date().toISOString().slice(0, 10)
-}
-
-function toneClass(tone: 'default' | 'warning' | 'danger' = 'default'): string {
-  if (tone === 'danger') return 'text-destructive'
-  if (tone === 'warning') return 'text-orange-600'
-  return 'text-foreground'
 }
 
 export function StockPositionReportPage<Row>({

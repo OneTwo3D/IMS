@@ -1,16 +1,16 @@
 import { NextResponse } from 'next/server'
+import { redirect } from 'next/navigation'
 import { requireAuth, type AuthSession } from '@/lib/auth/server'
-
-const INVENTORY_LEDGER_REPORT_ROLES = new Set(['ADMIN', 'MANAGER', 'FINANCE', 'WAREHOUSE'])
+import { hasPermission } from '@/lib/permissions'
 
 export function canAccessInventoryLedgerReports(role: string): boolean {
-  return INVENTORY_LEDGER_REPORT_ROLES.has(role)
+  return hasPermission(role, 'analytics.inventory_ledger')
 }
 
 export async function requireInventoryLedgerReportAccess(): Promise<AuthSession> {
   const session = await requireAuth()
   if (!canAccessInventoryLedgerReports(session.user.role)) {
-    throw new Error('Forbidden: missing inventory ledger report access')
+    redirect('/dashboard')
   }
   return session
 }

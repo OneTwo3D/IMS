@@ -1,14 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
-import { csvStreamResponse } from '@/lib/csv'
+import { csvBufferedStreamResponse } from '@/lib/csv'
 import {
+  getInventoryLedgerExportRowCount,
   getStockAdjustmentReport,
   getStockCountReport,
   getStockMovementLedgerReport,
   getStockTransferReport,
+  type InventoryLedgerExportReportType,
   type InventoryLedgerFilters,
 } from '@/lib/domain/inventory/inventory-ledger-reports'
 import { inventoryLedgerApiAccessDenied } from '@/lib/security/inventory-ledger-access'
+
+const INVENTORY_LEDGER_CSV_ROW_LIMIT = 100000
 
 function one(req: NextRequest, key: string): string | undefined {
   return req.nextUrl.searchParams.get(key) ?? undefined
@@ -37,6 +41,17 @@ export async function GET(req: NextRequest) {
   const date = new Date().toISOString().slice(0, 10)
   const filters = filtersFromRequest(req)
 
+  if (!isInventoryLedgerExportReportType(type)) {
+    return NextResponse.json({ error: 'Unknown inventory-ledger export type' }, { status: 400 })
+  }
+  const rowCount = await getInventoryLedgerExportRowCount(type, filters)
+  if (rowCount > INVENTORY_LEDGER_CSV_ROW_LIMIT) {
+    return NextResponse.json(
+      { error: `Inventory ledger CSV exports are capped at ${INVENTORY_LEDGER_CSV_ROW_LIMIT.toLocaleString()} rows. Narrow the filters and retry.` },
+      { status: 413 },
+    )
+  }
+
   switch (type) {
     case 'stock-movements': {
       const report = await getStockMovementLedgerReport(filters, { paginate: false })
@@ -64,7 +79,7 @@ export async function GET(req: NextRequest) {
         closingValueBase: report.totals.closingValueBase,
         generatedAt: report.generatedAt,
       }))
-      return csvStreamResponse(rows, ['createdAt', 'type', 'sku', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'qty', 'signedQty', 'unitCostBase', 'totalValueBase', 'signedValueBase', 'referenceType', 'referenceId', 'note', 'openingQty', 'movementQty', 'closingQty', 'openingValueBase', 'movementValueBase', 'closingValueBase', 'generatedAt'], `stock-movements-${date}.csv`)
+      return csvBufferedStreamResponse(rows, ['createdAt', 'type', 'sku', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'qty', 'signedQty', 'unitCostBase', 'totalValueBase', 'signedValueBase', 'referenceType', 'referenceId', 'note', 'openingQty', 'movementQty', 'closingQty', 'openingValueBase', 'movementValueBase', 'closingValueBase', 'generatedAt'], `stock-movements-${date}.csv`)
     }
 
     case 'stock-adjustments': {
@@ -85,7 +100,7 @@ export async function GET(req: NextRequest) {
         note: row.note ?? '',
         generatedAt: report.generatedAt,
       }))
-      return csvStreamResponse(rows, ['createdAt', 'sku', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'reasonName', 'reasonMatched', 'signedQty', 'totalValueBase', 'referenceType', 'referenceId', 'note', 'generatedAt'], `stock-adjustments-${date}.csv`)
+      return csvBufferedStreamResponse(rows, ['createdAt', 'sku', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'reasonName', 'reasonMatched', 'signedQty', 'totalValueBase', 'referenceType', 'referenceId', 'note', 'generatedAt'], `stock-adjustments-${date}.csv`)
     }
 
     case 'transfers': {
@@ -109,7 +124,7 @@ export async function GET(req: NextRequest) {
         movementValueBase: row.movementValueBase,
         generatedAt: report.generatedAt,
       }))
-      return csvStreamResponse(rows, ['reference', 'status', 'fromWarehouseCode', 'fromWarehouseName', 'toWarehouseCode', 'toWarehouseName', 'dispatchedAt', 'completedAt', 'daysInTransit', 'overdue', 'requestedQty', 'receivedQty', 'driftQty', 'movementOutQty', 'movementInQty', 'movementValueBase', 'generatedAt'], `transfers-${date}.csv`)
+      return csvBufferedStreamResponse(rows, ['reference', 'status', 'fromWarehouseCode', 'fromWarehouseName', 'toWarehouseCode', 'toWarehouseName', 'dispatchedAt', 'completedAt', 'daysInTransit', 'overdue', 'requestedQty', 'receivedQty', 'driftQty', 'movementOutQty', 'movementInQty', 'movementValueBase', 'generatedAt'], `transfers-${date}.csv`)
     }
 
     case 'stock-counts': {
@@ -129,10 +144,14 @@ export async function GET(req: NextRequest) {
         completedAt: row.completedAt ?? '',
         generatedAt: report.generatedAt,
       }))
-      return csvStreamResponse(rows, ['reference', 'status', 'warehouseCode', 'warehouseName', 'sku', 'productId', 'expectedQty', 'countedQty', 'varianceQty', 'linkedAdjustmentValueBase', 'adjustmentEvidence', 'completedAt', 'generatedAt'], `stock-counts-${date}.csv`)
+      return csvBufferedStreamResponse(rows, ['reference', 'status', 'warehouseCode', 'warehouseName', 'sku', 'productId', 'expectedQty', 'countedQty', 'varianceQty', 'linkedAdjustmentValueBase', 'adjustmentEvidence', 'completedAt', 'generatedAt'], `stock-counts-${date}.csv`)
     }
 
     default:
       return NextResponse.json({ error: 'Unknown inventory-ledger export type' }, { status: 400 })
   }
+}
+
+function isInventoryLedgerExportReportType(value: string): value is InventoryLedgerExportReportType {
+  return value === 'stock-movements' || value === 'stock-adjustments' || value === 'transfers' || value === 'stock-counts'
 }

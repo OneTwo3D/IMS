@@ -24,7 +24,7 @@ function escapeField(value: unknown): string {
 
 /** Convert an array of objects to a CSV string */
 export function toCsv(rows: Record<string, unknown>[], headers: string[]): string {
-  const lines: string[] = [headers.join(',')]
+  const lines: string[] = [headers.map(escapeField).join(',')]
   for (const row of rows) {
     lines.push(headers.map((h) => escapeField(row[h])).join(','))
   }
@@ -44,9 +44,9 @@ export function buildTemplateCsv(
     if (index === 0) return '# REQUIRED'
     return requiredHeaders.includes(header) ? 'REQUIRED' : 'OPTIONAL'
   })
-  const lines = [headers.join(','), markerRow.map(escapeField).join(',')]
+  const lines = [headers.map(escapeField).join(','), markerRow.map(escapeField).join(',')]
   for (const row of exampleRows) {
-    lines.push(headers.map((header) => escapeField(row[header])).join(','))
+      lines.push(headers.map((header) => escapeField(row[header])).join(','))
   }
   return lines.join('\r\n')
 }
@@ -119,8 +119,11 @@ export function csvResponse(csv: string, filename: string): Response {
   })
 }
 
-/** Build a streamed CSV download response for large read-only report exports. */
-export function csvStreamResponse(rows: Iterable<Record<string, unknown>>, headers: string[], filename: string): Response {
+/**
+ * Build a streamed CSV download response from already-materialized rows.
+ * This chunks the wire response but does not make the caller's memory profile O(1).
+ */
+export function csvBufferedStreamResponse(rows: Iterable<Record<string, unknown>>, headers: string[], filename: string): Response {
   const encoder = new TextEncoder()
   const iterator = rows[Symbol.iterator]()
   let headerSent = false
@@ -128,7 +131,7 @@ export function csvStreamResponse(rows: Iterable<Record<string, unknown>>, heade
   const stream = new ReadableStream<Uint8Array>({
     pull(controller) {
       if (!headerSent) {
-        controller.enqueue(encoder.encode(headers.join(',')))
+        controller.enqueue(encoder.encode(headers.map(escapeField).join(',')))
         headerSent = true
       }
 

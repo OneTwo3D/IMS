@@ -103,10 +103,9 @@ export function Sidebar({
   const isSupplier = userRole === 'SUPPLIER'
   const settingsChildren = getSettingsChildren(accountingIntegrationEnabled)
   const showIntegrations = shoppingIntegrationEnabled || accountingIntegrationEnabled || wmsIntegrationEnabled
-  const canAccessInventoryLedgerReports = userRole === 'ADMIN' || userRole === 'MANAGER' || userRole === 'FINANCE' || userRole === 'WAREHOUSE'
   const analyticsChildren = [
     ...(can('analytics') ? ANALYTICS_CHILDREN : [...STOCK_POSITION_REPORT_LINKS]),
-    ...(canAccessInventoryLedgerReports ? INVENTORY_LEDGER_REPORT_LINKS : []),
+    ...(can('analytics.inventory_ledger') ? INVENTORY_LEDGER_REPORT_LINKS : []),
   ]
 
   // Supplier gets a completely different navigation

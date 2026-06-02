@@ -3,7 +3,9 @@ import Link from 'next/link'
 import { getOrganisation } from '@/app/actions/company'
 import {
   getStockTransferReport,
-  type InventoryLedgerFilters,
+  inventoryLedgerFiltersForUi,
+  inventoryLedgerFiltersFromSearch,
+  type InventoryLedgerSearchParams,
   type StockTransferReportRow,
 } from '@/lib/domain/inventory/inventory-ledger-reports'
 import {
@@ -15,46 +17,14 @@ import { formatMoneyCode } from '@/lib/utils'
 import {
   InventoryLedgerReportPage,
   type InventoryLedgerColumn,
-  type InventoryLedgerFilterValues,
 } from '../_components/inventory-ledger-report'
 
 export const metadata: Metadata = { title: 'Stock Transfers' }
 
-type SearchParams = Record<string, string | string[] | undefined>
-
-function one(value: string | string[] | undefined): string | undefined {
-  return Array.isArray(value) ? value[0] : value
-}
-
-function filtersFromSearch(searchParams: SearchParams): InventoryLedgerFilters {
-  return {
-    dateFrom: one(searchParams.dateFrom),
-    dateTo: one(searchParams.dateTo),
-    warehouseId: one(searchParams.warehouseId),
-    product: one(searchParams.product),
-    status: one(searchParams.status),
-    reference: one(searchParams.reference),
-    page: Number(one(searchParams.page) ?? 1),
-    pageSize: Number(one(searchParams.pageSize) ?? 100),
-  }
-}
-
-function filtersForUi(filters: InventoryLedgerFilters): InventoryLedgerFilterValues {
-  return {
-    dateFrom: filters.dateFrom,
-    dateTo: filters.dateTo,
-    warehouseId: filters.warehouseId,
-    product: filters.product,
-    status: filters.status,
-    reference: filters.reference,
-    pageSize: String(filters.pageSize ?? 100),
-  }
-}
-
-export default async function TransfersReportPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
+export default async function TransfersReportPage({ searchParams }: { searchParams: Promise<InventoryLedgerSearchParams> }) {
   await requireInventoryLedgerReportAccess()
   const resolvedSearchParams = await searchParams
-  const filters = filtersFromSearch(resolvedSearchParams)
+  const filters = inventoryLedgerFiltersFromSearch(resolvedSearchParams, { includeStatus: true })
   const [report, filterOptions, organisation] = await Promise.all([
     getStockTransferReport(filters),
     getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),
@@ -91,7 +61,7 @@ export default async function TransfersReportPage({ searchParams }: { searchPara
       title="Stock Transfers"
       description="Transfer document status with sent/received quantity, days in transit and movement-value reconciliation."
       reportKey="transfers"
-      filters={filtersForUi(filters)}
+      filters={inventoryLedgerFiltersForUi(filters, { includeStatus: true })}
       filterOptions={filterOptions}
       pageInfo={report.pageInfo}
       rows={report.rows}

@@ -6,7 +6,6 @@ import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
-const MOVEMENT_TOTAL_PAGE_SIZE = 5000
 const TRANSFER_OVERDUE_DAYS = 7
 
 const ZERO = new Prisma.Decimal(0)
@@ -42,6 +41,34 @@ export type InventoryLedgerFilters = {
   minValue?: string
   page?: number
   pageSize?: number
+}
+
+export type InventoryLedgerExportReportType = 'stock-movements' | 'stock-adjustments' | 'transfers' | 'stock-counts'
+
+export type InventoryLedgerSearchParams = Record<string, string | string[] | undefined>
+export type InventoryLedgerFilterUiValues = {
+  dateFrom?: string
+  dateTo?: string
+  warehouseId?: string
+  product?: string
+  type?: string
+  status?: string
+  reference?: string
+  minValue?: string
+  pageSize?: string
+}
+
+type InventoryLedgerFilterParseOptions = {
+  includeType?: boolean
+  includeStatus?: boolean
+  includeMinValue?: boolean
+}
+
+type InventoryLedgerReportClient = Pick<typeof db, 'stockMovement' | 'adjustmentReason' | 'product' | 'stockTransfer' | 'stockTransferLine' | 'stockCount' | 'stockCountLine'>
+
+type InventoryLedgerReportOptions = {
+  paginate?: boolean
+  client?: InventoryLedgerReportClient
 }
 
 export type InventoryLedgerSummary = Array<{ label: string; value: string; tone?: 'default' | 'warning' | 'danger' }>
@@ -93,7 +120,7 @@ export type StockAdjustmentReportRow = InventoryLedgerReportRow & {
 export type StockAdjustmentReport = Omit<InventoryLedgerReport, 'rows'> & {
   rows: StockAdjustmentReportRow[]
   reasonSummary: Array<{ reasonName: string; count: number; qty: string; valueBase: string }>
-  userSummary: Array<{ userName: string; count: number; valueBase: string }>
+  userSummary: Array<{ userName: string; count: number; valueBase: string; captured: boolean }>
   skuSummary: Array<{ sku: string; productName: string; count: number; qty: string; valueBase: string }>
 }
 
@@ -197,6 +224,45 @@ function clampPageSize(value: number | undefined): number {
   return Math.min(MAX_PAGE_SIZE, Math.max(MIN_PAGE_SIZE, Math.floor(value!)))
 }
 
+function oneSearchParam(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value
+}
+
+export function inventoryLedgerFiltersFromSearch(
+  searchParams: InventoryLedgerSearchParams,
+  options: InventoryLedgerFilterParseOptions = {},
+): InventoryLedgerFilters {
+  return {
+    dateFrom: oneSearchParam(searchParams.dateFrom),
+    dateTo: oneSearchParam(searchParams.dateTo),
+    warehouseId: oneSearchParam(searchParams.warehouseId),
+    product: oneSearchParam(searchParams.product),
+    type: options.includeType ? oneSearchParam(searchParams.type) as InventoryLedgerFilters['type'] : undefined,
+    status: options.includeStatus ? oneSearchParam(searchParams.status) : undefined,
+    reference: oneSearchParam(searchParams.reference),
+    minValue: options.includeMinValue ? oneSearchParam(searchParams.minValue) : undefined,
+    page: Number(oneSearchParam(searchParams.page) ?? 1),
+    pageSize: Number(oneSearchParam(searchParams.pageSize) ?? 100),
+  }
+}
+
+export function inventoryLedgerFiltersForUi(
+  filters: InventoryLedgerFilters,
+  options: InventoryLedgerFilterParseOptions = {},
+): InventoryLedgerFilterUiValues {
+  return {
+    dateFrom: filters.dateFrom,
+    dateTo: filters.dateTo,
+    warehouseId: filters.warehouseId,
+    product: filters.product,
+    type: options.includeType ? filters.type : undefined,
+    status: options.includeStatus ? filters.status : undefined,
+    reference: filters.reference,
+    minValue: options.includeMinValue ? filters.minValue : undefined,
+    pageSize: String(filters.pageSize ?? 100),
+  }
+}
+
 function parseDateOnly(value: string | undefined): Date | null {
   if (!value || !/^\d{4}-\d{2}-\d{2}$/.test(value)) return null
   const [year, month, day] = value.split('-').map(Number)
@@ -236,7 +302,9 @@ export function signedMovementQty(row: MovementEvidence): Decimal {
   const qty = toDecimal(row.qty)
   if (row.type === 'ADJUSTMENT') {
     if (row.fromWarehouseId && !row.toWarehouseId) return qty.negated()
-    if (row.toWarehouseId && !row.fromWarehouseId) return qty
+    // If a defensive or migration row carries both sides, treat the destination
+    // side as authoritative so the row stays visible in ledger totals.
+    if (row.toWarehouseId) return qty
     return ZERO
   }
   if (OUTBOUND_MOVEMENT_TYPES.has(row.type)) return qty.negated()
@@ -246,8 +314,9 @@ export function signedMovementQty(row: MovementEvidence): Decimal {
 
 export function signedMovementValue(row: MovementEvidence): Decimal {
   const value = row.totalValueBase == null ? ZERO : toDecimal(row.totalValueBase)
-  if (signedMovementQty(row).lt(0)) return value.negated()
-  if (signedMovementQty(row).gt(0)) return value
+  const signedQty = signedMovementQty(row)
+  if (signedQty.lt(0)) return value.negated()
+  if (signedQty.gt(0)) return value
   return ZERO
 }
 
@@ -266,13 +335,13 @@ export function inventoryLedgerReferenceHref(referenceType: string | null, refer
     case 'SalesOrder':
       return `/sales/${referenceId}`
     case 'StockTransfer':
-      return `/stock-control/transfers?reference=${encodeURIComponent(referenceId)}`
+      return null
     case 'ProductionOrder':
       return `/manufacturing/${referenceId}`
     case 'StockMovement':
-      return `/stock-control/stock-adjustments?movementId=${encodeURIComponent(referenceId)}`
+      return null
     case 'StockCount':
-      return `/analytics/stock-counts?reference=${encodeURIComponent(referenceId)}`
+      return null
     default:
       return null
   }
@@ -327,35 +396,54 @@ function movementWhere(filters: InventoryLedgerFilters, dateOverride?: Prisma.Da
   return and.length ? { AND: and } : {}
 }
 
-async function movementTotals(where: Prisma.StockMovementWhereInput): Promise<{ qty: Decimal; valueBase: Decimal }> {
-  let qty = ZERO
-  let valueBase = ZERO
-  let cursor: { id: string } | undefined
+function combineWhere(...parts: Prisma.StockMovementWhereInput[]): Prisma.StockMovementWhereInput {
+  const filtered = parts.filter((part) => Object.keys(part).length > 0)
+  if (filtered.length === 0) return {}
+  if (filtered.length === 1) return filtered[0]!
+  return { AND: filtered }
+}
 
-  while (true) {
-    const rows = await db.stockMovement.findMany({
-      where,
-      orderBy: { id: 'asc' },
-      ...(cursor ? { cursor, skip: 1 } : {}),
-      take: MOVEMENT_TOTAL_PAGE_SIZE,
-      select: {
-        id: true,
-        type: true,
-        qty: true,
-        totalValueBase: true,
-        fromWarehouseId: true,
-        toWarehouseId: true,
-      },
-    })
-    for (const row of rows) {
-      qty = qty.add(signedMovementQty(row))
-      valueBase = valueBase.add(signedMovementValue(row))
-    }
-    if (rows.length < MOVEMENT_TOTAL_PAGE_SIZE) break
-    cursor = { id: rows[rows.length - 1]!.id }
+function positiveMovementWhere(where: Prisma.StockMovementWhereInput): Prisma.StockMovementWhereInput {
+  return combineWhere(where, {
+    OR: [
+      { type: { in: [...INBOUND_MOVEMENT_TYPES] } },
+      { type: 'ADJUSTMENT', toWarehouseId: { not: null } },
+    ],
+  })
+}
+
+function negativeMovementWhere(where: Prisma.StockMovementWhereInput): Prisma.StockMovementWhereInput {
+  return combineWhere(where, {
+    OR: [
+      { type: { in: [...OUTBOUND_MOVEMENT_TYPES] } },
+      { type: 'ADJUSTMENT', fromWarehouseId: { not: null }, toWarehouseId: null },
+    ],
+  })
+}
+
+async function movementTotals(
+  client: InventoryLedgerReportClient,
+  where: Prisma.StockMovementWhereInput,
+): Promise<{ qty: Decimal; valueBase: Decimal }> {
+  const [positive, negative] = await Promise.all([
+    client.stockMovement.aggregate({
+      where: positiveMovementWhere(where),
+      _sum: { qty: true, totalValueBase: true },
+    }),
+    client.stockMovement.aggregate({
+      where: negativeMovementWhere(where),
+      _sum: { qty: true, totalValueBase: true },
+    }),
+  ])
+  const positiveQty = positive._sum.qty == null ? ZERO : toDecimal(positive._sum.qty)
+  const negativeQty = negative._sum.qty == null ? ZERO : toDecimal(negative._sum.qty)
+  const positiveValue = positive._sum.totalValueBase == null ? ZERO : toDecimal(positive._sum.totalValueBase)
+  const negativeValue = negative._sum.totalValueBase == null ? ZERO : toDecimal(negative._sum.totalValueBase)
+
+  return {
+    qty: positiveQty.sub(negativeQty),
+    valueBase: positiveValue.sub(negativeValue),
   }
-
-  return { qty, valueBase }
 }
 
 function movementWarehouse(row: {
@@ -416,11 +504,11 @@ function mapMovementRow(row: {
   }
 }
 
-async function getMovementRows(filters: InventoryLedgerFilters, paginate: boolean) {
+async function getMovementRows(client: InventoryLedgerReportClient, filters: InventoryLedgerFilters, paginate: boolean) {
   const where = movementWhere(filters)
-  const totalRows = await db.stockMovement.count({ where })
+  const totalRows = await client.stockMovement.count({ where })
   const info = pageInfo(totalRows, clampPage(filters.page), clampPageSize(filters.pageSize))
-  const rows = await db.stockMovement.findMany({
+  const rows = await client.stockMovement.findMany({
     where,
     orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
     ...(paginate ? { skip: (info.page - 1) * info.pageSize, take: info.pageSize } : {}),
@@ -435,16 +523,17 @@ async function getMovementRows(filters: InventoryLedgerFilters, paginate: boolea
 
 export async function getStockMovementLedgerReport(
   filters: InventoryLedgerFilters,
-  options: { paginate?: boolean } = {},
+  options: InventoryLedgerReportOptions = {},
 ): Promise<InventoryLedgerReport> {
   const paginate = options.paginate !== false
+  const client = options.client ?? db
   const [{ rows, pageInfo: info }, movement] = await Promise.all([
-    getMovementRows(filters, paginate),
-    movementTotals(movementWhere(filters)),
+    getMovementRows(client, filters, paginate),
+    movementTotals(client, movementWhere(filters)),
   ])
   const from = parseDateOnly(filters.dateFrom)
   const opening = from
-    ? await movementTotals(movementWhere(filters, { lt: from }))
+    ? await movementTotals(client, movementWhere(filters, { lt: from }))
     : { qty: ZERO, valueBase: ZERO }
 
   return {
@@ -467,58 +556,97 @@ export async function getStockMovementLedgerReport(
 export function matchAdjustmentReason(note: string | null, reasons: Array<{ name: string }>): { reasonName: string; matched: boolean } {
   const value = note?.trim()
   if (!value) return { reasonName: 'Uncategorised', matched: false }
+  const escaped = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   const reason = [...reasons]
     .sort((a, b) => b.name.length - a.name.length)
-    .find((candidate) => value === candidate.name || value.startsWith(`${candidate.name}:`))
+    .find((candidate) => new RegExp(`^${escaped(candidate.name)}\\b`, 'i').test(value))
   if (reason) return { reasonName: reason.name, matched: true }
   return { reasonName: value.split(':')[0]?.trim() || 'Uncategorised', matched: false }
 }
 
 export async function getStockAdjustmentReport(
   filters: InventoryLedgerFilters,
-  options: { paginate?: boolean } = {},
+  options: InventoryLedgerReportOptions = {},
 ): Promise<StockAdjustmentReport> {
+  const client = options.client ?? db
   const adjustmentFilters = { ...filters, type: 'ADJUSTMENT' as StockMovementType }
   const [ledger, reasons] = await Promise.all([
     getStockMovementLedgerReport(adjustmentFilters, options),
-    db.adjustmentReason.findMany({ select: { name: true } }),
+    client.adjustmentReason.findMany({ select: { name: true } }),
   ])
   const rows = ledger.rows.map((row) => {
     const reason = matchAdjustmentReason(row.note, reasons)
     return { ...row, reasonName: reason.reasonName, reasonMatched: reason.matched }
   })
-  const summaryRows = options.paginate === false ? rows : (await getStockMovementLedgerReport(adjustmentFilters, { paginate: false })).rows.map((row) => {
-    const reason = matchAdjustmentReason(row.note, reasons)
-    return { ...row, reasonName: reason.reasonName, reasonMatched: reason.matched }
-  })
+  const [reasonSummary, skuSummary] = await Promise.all([
+    getAdjustmentReasonSummary(client, adjustmentFilters, reasons),
+    getAdjustmentSkuSummary(client, adjustmentFilters),
+  ])
 
-  const reasonSummary = summarizeAdjustments(summaryRows, (row) => row.reasonName)
-    .map((row) => ({ reasonName: row.key, count: row.count, qty: row.qty, valueBase: row.valueBase }))
-  const skuSummary = summarizeAdjustments(summaryRows, (row) => row.sku)
-    .map((row) => ({ sku: row.key, productName: summaryRows.find((item) => item.sku === row.key)?.productName ?? row.key, count: row.count, qty: row.qty, valueBase: row.valueBase }))
+  const totalCount = await client.stockMovement.count({ where: movementWhere(adjustmentFilters) })
 
   return {
     ...ledger,
     rows,
     reasonSummary,
-    userSummary: [{ userName: 'Not captured on StockMovement', count: summaryRows.length, valueBase: ledger.totals.movementValueBase }],
+    userSummary: [{ userName: 'Not captured on StockMovement', count: totalCount, valueBase: ledger.totals.movementValueBase, captured: false }],
     skuSummary,
   }
 }
 
-function summarizeAdjustments(rows: StockAdjustmentReportRow[], keyFor: (row: StockAdjustmentReportRow) => string): Array<{ key: string; count: number; qty: string; valueBase: string }> {
-  const grouped = new Map<string, { count: number; qty: Decimal; valueBase: Decimal }>()
-  for (const row of rows) {
-    const key = keyFor(row)
-    const current = grouped.get(key) ?? { count: 0, qty: ZERO, valueBase: ZERO }
-    current.count += 1
-    current.qty = current.qty.add(toDecimal(row.signedQty).abs())
-    current.valueBase = current.valueBase.add(toDecimal(row.totalValueBase))
-    grouped.set(key, current)
+async function getAdjustmentReasonSummary(
+  client: InventoryLedgerReportClient,
+  filters: InventoryLedgerFilters,
+  reasons: Array<{ name: string }>,
+): Promise<StockAdjustmentReport['reasonSummary']> {
+  const grouped = await client.stockMovement.groupBy({
+    by: ['note'],
+    where: movementWhere(filters),
+    _count: { _all: true },
+    _sum: { qty: true, totalValueBase: true },
+  })
+  const totals = new Map<string, { count: number; qty: Decimal; valueBase: Decimal }>()
+  for (const row of grouped) {
+    const reason = matchAdjustmentReason(row.note, reasons)
+    const current = totals.get(reason.reasonName) ?? { count: 0, qty: ZERO, valueBase: ZERO }
+    current.count += row._count._all
+    current.qty = current.qty.add(row._sum.qty == null ? ZERO : toDecimal(row._sum.qty))
+    current.valueBase = current.valueBase.add(row._sum.totalValueBase == null ? ZERO : toDecimal(row._sum.totalValueBase))
+    totals.set(reason.reasonName, current)
   }
-  return [...grouped.entries()]
-    .map(([key, value]) => ({ key, count: value.count, qty: decimalString(value.qty), valueBase: moneyString(value.valueBase) }))
-    .sort((a, b) => Number(b.valueBase) - Number(a.valueBase))
+  return [...totals.entries()]
+    .map(([reasonName, value]) => ({ reasonName, count: value.count, qty: decimalString(value.qty), valueBase: moneyString(value.valueBase) }))
+    .sort((a, b) => toDecimal(b.valueBase).cmp(toDecimal(a.valueBase)) || a.reasonName.localeCompare(b.reasonName))
+    .slice(0, 10)
+}
+
+async function getAdjustmentSkuSummary(
+  client: InventoryLedgerReportClient,
+  filters: InventoryLedgerFilters,
+): Promise<StockAdjustmentReport['skuSummary']> {
+  const grouped = await client.stockMovement.groupBy({
+    by: ['productId'],
+    where: movementWhere(filters),
+    _count: { _all: true },
+    _sum: { qty: true, totalValueBase: true },
+  })
+  const products = await client.product.findMany({
+    where: { id: { in: grouped.map((row) => row.productId) } },
+    select: { id: true, sku: true, name: true },
+  })
+  const productById = new Map(products.map((product) => [product.id, product]))
+  return grouped
+    .map((row) => {
+      const product = productById.get(row.productId)
+      return {
+        sku: product?.sku ?? row.productId,
+        productName: product?.name ?? row.productId,
+        count: row._count._all,
+        qty: decimalString(row._sum.qty == null ? ZERO : toDecimal(row._sum.qty)),
+        valueBase: moneyString(row._sum.totalValueBase == null ? ZERO : toDecimal(row._sum.totalValueBase)),
+      }
+    })
+    .sort((a, b) => toDecimal(b.valueBase).cmp(toDecimal(a.valueBase)) || a.sku.localeCompare(b.sku))
     .slice(0, 10)
 }
 
@@ -550,14 +678,15 @@ function transferWhere(filters: InventoryLedgerFilters, statusOverride?: Prisma.
 
 export async function getStockTransferReport(
   filters: InventoryLedgerFilters,
-  options: { paginate?: boolean; now?: Date } = {},
+  options: InventoryLedgerReportOptions & { now?: Date } = {},
 ): Promise<StockTransferReport> {
   const paginate = options.paginate !== false
+  const client = options.client ?? db
   const now = options.now ?? new Date()
   const where = transferWhere(filters)
-  const totalRows = await db.stockTransfer.count({ where })
+  const totalRows = await client.stockTransfer.count({ where })
   const info = pageInfo(totalRows, clampPage(filters.page), clampPageSize(filters.pageSize))
-  const transfers = await db.stockTransfer.findMany({
+  const transfers = await client.stockTransfer.findMany({
     where,
     orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
     ...(paginate ? { skip: (info.page - 1) * info.pageSize, take: info.pageSize } : {}),
@@ -568,12 +697,29 @@ export async function getStockTransferReport(
     },
   })
   const ids = transfers.map((transfer) => transfer.id)
+  const allFilteredTransferIds = await client.stockTransfer.findMany({
+    where,
+    select: { id: true },
+  })
+  const allIds = allFilteredTransferIds.map((transfer) => transfer.id)
   const movements = ids.length
-    ? await db.stockMovement.findMany({
+    ? await client.stockMovement.findMany({
         where: { referenceType: 'StockTransfer', referenceId: { in: ids } },
         select: { referenceId: true, type: true, qty: true, totalValueBase: true, fromWarehouseId: true, toWarehouseId: true },
       })
     : []
+  const [allTransferLines, allMovements] = await Promise.all([
+    client.stockTransferLine.findMany({
+      where: { transfer: where },
+      select: { qty: true, qtyReceived: true },
+    }),
+    allIds.length
+      ? client.stockMovement.findMany({
+          where: { referenceType: 'StockTransfer', referenceId: { in: allIds } },
+          select: { totalValueBase: true },
+        })
+      : Promise.resolve([]),
+  ])
   const movementByTransfer = new Map<string, { outQty: Decimal; inQty: Decimal; valueBase: Decimal }>()
   for (const movement of movements) {
     if (!movement.referenceId) continue
@@ -616,10 +762,10 @@ export async function getStockTransferReport(
     }
   })
 
-  const totalRequested = rows.reduce((sum, row) => sum.add(toDecimal(row.requestedQty)), ZERO)
-  const totalReceived = rows.reduce((sum, row) => sum.add(toDecimal(row.receivedQty)), ZERO)
-  const totalValue = rows.reduce((sum, row) => sum.add(toDecimal(row.movementValueBase)), ZERO)
-  const inTransitCount = await db.stockTransfer.count({ where: transferWhere(filters, { in: ['DRAFT', 'IN_TRANSIT'] }) })
+  const totalRequested = allTransferLines.reduce((sum, row) => sum.add(toDecimal(row.qty)), ZERO)
+  const totalReceived = allTransferLines.reduce((sum, row) => sum.add(toDecimal(row.qtyReceived)), ZERO)
+  const totalValue = allMovements.reduce((sum, row) => sum.add(row.totalValueBase == null ? ZERO : toDecimal(row.totalValueBase)), ZERO)
+  const inTransitCount = await client.stockTransfer.count({ where: transferWhere(filters, { in: ['DRAFT', 'IN_TRANSIT'] }) })
   return {
     rows,
     pageInfo: paginate ? info : pageInfo(totalRows, 1, Math.max(totalRows, 1)),
@@ -649,23 +795,68 @@ function stockCountWhere(filters: InventoryLedgerFilters): Prisma.StockCountWher
   return and.length ? { AND: and } : {}
 }
 
+function stockCountLineWhere(filters: InventoryLedgerFilters): Prisma.StockCountLineWhereInput {
+  const product = normalizeTextFilter(filters.product)
+  return {
+    count: stockCountWhere(filters),
+    ...(product ? { sku: { contains: product, mode: 'insensitive' } } : {}),
+  }
+}
+
+export async function getInventoryLedgerExportRowCount(
+  reportType: InventoryLedgerExportReportType,
+  filters: InventoryLedgerFilters,
+  client: InventoryLedgerReportClient = db,
+): Promise<number> {
+  switch (reportType) {
+    case 'stock-movements':
+      return client.stockMovement.count({ where: movementWhere(filters) })
+    case 'stock-adjustments':
+      return client.stockMovement.count({ where: movementWhere({ ...filters, type: 'ADJUSTMENT' }) })
+    case 'transfers':
+      return client.stockTransfer.count({ where: transferWhere(filters) })
+    case 'stock-counts':
+      return client.stockCountLine.count({ where: stockCountLineWhere(filters) })
+  }
+}
+
 export async function getStockCountReport(
   filters: InventoryLedgerFilters,
-  options: { paginate?: boolean } = {},
+  options: InventoryLedgerReportOptions = {},
 ): Promise<StockCountReport> {
   const paginate = options.paginate !== false
-  const counts = await db.stockCount.findMany({
-    where: stockCountWhere(filters),
-    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-    include: {
-      warehouse: { select: { code: true, name: true } },
-      lines: { orderBy: { sku: 'asc' } },
-    },
-  })
-  const ids = counts.map((count) => count.id)
-  const movements = ids.length
-    ? await db.stockMovement.findMany({
-        where: { referenceType: 'StockCount', referenceId: { in: ids }, type: 'ADJUSTMENT' },
+  const client = options.client ?? db
+  const where = stockCountLineWhere(filters)
+  const totalRows = await client.stockCountLine.count({ where })
+  const info = pageInfo(totalRows, clampPage(filters.page), clampPageSize(filters.pageSize))
+  const [lines, totalsAggregate, repeatGroups] = await Promise.all([
+    client.stockCountLine.findMany({
+      where,
+      orderBy: [{ count: { createdAt: 'desc' } }, { countId: 'desc' }, { sku: 'asc' }, { id: 'asc' }],
+      ...(paginate ? { skip: (info.page - 1) * info.pageSize, take: info.pageSize } : {}),
+      include: {
+        count: {
+          include: {
+            warehouse: { select: { code: true, name: true } },
+          },
+        },
+      },
+    }),
+    client.stockCountLine.aggregate({
+      where,
+      _sum: { expectedQty: true, countedQty: true, variance: true },
+    }),
+    client.stockCountLine.groupBy({
+      by: ['sku'],
+      where: combineStockCountLineWhere(where, { variance: { not: 0 } }),
+      _count: { _all: true },
+      _sum: { variance: true },
+    }),
+  ])
+  const countIds = [...new Set(lines.map((line) => line.countId))]
+  const movements = countIds.length
+    ? await client.stockMovement.findMany({
+        where: { referenceType: 'StockCount', referenceId: { in: countIds }, type: 'ADJUSTMENT' },
         select: { referenceId: true, productId: true, totalValueBase: true },
       })
     : []
@@ -676,7 +867,8 @@ export async function getStockCountReport(
     movementValueByCountProduct.set(key, (movementValueByCountProduct.get(key) ?? ZERO).add(movement.totalValueBase == null ? ZERO : toDecimal(movement.totalValueBase)))
   }
 
-  const allRows = counts.flatMap((count) => count.lines.map((line): StockCountReportRow => {
+  const rows = lines.map((line): StockCountReportRow => {
+    const count = line.count
     const counted = line.countedQty == null ? null : toDecimal(line.countedQty)
     const variance = line.variance == null
       ? counted == null ? ZERO : counted.sub(toDecimal(line.expectedQty))
@@ -699,37 +891,32 @@ export async function getStockCountReport(
       completedAt: count.completedAt?.toISOString() ?? null,
       createdAt: count.createdAt.toISOString(),
     }
-  }))
-
-  const info = pageInfo(allRows.length, clampPage(filters.page), clampPageSize(filters.pageSize))
-  const rows = paginate ? allRows.slice((info.page - 1) * info.pageSize, info.page * info.pageSize) : allRows
-  const repeat = new Map<string, { count: number; variance: Decimal }>()
-  for (const row of allRows) {
-    if (toDecimal(row.varianceQty).eq(0)) continue
-    const current = repeat.get(row.sku) ?? { count: 0, variance: ZERO }
-    current.count += 1
-    current.variance = current.variance.add(toDecimal(row.varianceQty))
-    repeat.set(row.sku, current)
-  }
-  const expected = allRows.reduce((sum, row) => sum.add(toDecimal(row.expectedQty)), ZERO)
-  const counted = allRows.reduce((sum, row) => sum.add(row.countedQty == null ? ZERO : toDecimal(row.countedQty)), ZERO)
-  const linkedValue = allRows.reduce((sum, row) => sum.add(row.linkedAdjustmentValueBase == null ? ZERO : toDecimal(row.linkedAdjustmentValueBase)), ZERO)
+  })
+  const linkedValue = rows.reduce((sum, row) => sum.add(row.linkedAdjustmentValueBase == null ? ZERO : toDecimal(row.linkedAdjustmentValueBase)), ZERO)
+  const missingAdjustmentEvidenceRows = rows.filter((row) => row.adjustmentEvidence === 'missing' && !toDecimal(row.varianceQty).eq(0)).length
 
   return {
     rows,
-    pageInfo: paginate ? info : pageInfo(allRows.length, 1, Math.max(allRows.length, 1)),
+    pageInfo: paginate ? info : pageInfo(totalRows, 1, Math.max(totalRows, 1)),
     totals: {
-      expectedQty: decimalString(expected),
-      countedQty: decimalString(counted),
-      varianceQty: decimalString(counted.sub(expected)),
+      expectedQty: decimalString(totalsAggregate._sum.expectedQty == null ? ZERO : toDecimal(totalsAggregate._sum.expectedQty)),
+      countedQty: decimalString(totalsAggregate._sum.countedQty == null ? ZERO : toDecimal(totalsAggregate._sum.countedQty)),
+      varianceQty: decimalString(totalsAggregate._sum.variance == null ? ZERO : toDecimal(totalsAggregate._sum.variance)),
       linkedAdjustmentValueBase: moneyString(linkedValue),
-      missingAdjustmentEvidenceRows: allRows.filter((row) => row.adjustmentEvidence === 'missing' && !toDecimal(row.varianceQty).eq(0)).length,
-      repeatOffenderSkus: repeat.size,
+      missingAdjustmentEvidenceRows,
+      repeatOffenderSkus: repeatGroups.length,
     },
-    repeatOffenders: [...repeat.entries()]
-      .map(([sku, value]) => ({ sku, count: value.count, varianceQty: decimalString(value.variance) }))
-      .sort((a, b) => b.count - a.count)
+    repeatOffenders: repeatGroups
+      .map((row) => ({ sku: row.sku, count: row._count._all, varianceQty: decimalString(row._sum.variance == null ? ZERO : toDecimal(row._sum.variance)) }))
+      .sort((a, b) => b.count - a.count || toDecimal(b.varianceQty).abs().cmp(toDecimal(a.varianceQty).abs()) || a.sku.localeCompare(b.sku))
       .slice(0, 10),
     generatedAt: new Date().toISOString(),
   }
+}
+
+function combineStockCountLineWhere(...parts: Prisma.StockCountLineWhereInput[]): Prisma.StockCountLineWhereInput {
+  const filtered = parts.filter((part) => Object.keys(part).length > 0)
+  if (filtered.length === 0) return {}
+  if (filtered.length === 1) return filtered[0]!
+  return { AND: filtered }
 }

@@ -21,6 +21,37 @@
         "Removed index on columns (name)"
       ],
       "reason": "PR #104 adds db-native pg_trgm GIN indexes on warehouses.code/name for scalable contains search; Prisma cannot represent the operator class or expression index."
+    },
+    {
+      "headerIncludes": "Changed the `products` table",
+      "detailIncludes": [
+        "Removed index on columns (sku)",
+        "Removed index on columns (name)"
+      ],
+      "reason": "PR #105 adds db-native pg_trgm GIN indexes on products.sku/name for inventory-ledger product contains search; Prisma cannot represent the operator class."
+    },
+    {
+      "headerIncludes": "Changed the `stock_movements` table",
+      "detailIncludes": [
+        "Removed index on columns (referenceType)",
+        "Removed index on columns (referenceId)",
+        "Removed index on columns (note)"
+      ],
+      "reason": "PR #105 adds db-native pg_trgm GIN indexes on stock movement reference/note fields for scalable inventory-ledger filters; Prisma cannot represent the operator class."
+    },
+    {
+      "headerIncludes": "Changed the `stock_transfers` table",
+      "detailIncludes": [
+        "Removed index on columns (reference)"
+      ],
+      "reason": "PR #105 adds a db-native pg_trgm GIN index on stock_transfers.reference for scalable transfer report contains search; Prisma cannot represent the operator class."
+    },
+    {
+      "headerIncludes": "Changed the `stock_count_lines` table",
+      "detailIncludes": [
+        "Removed index on columns (sku)"
+      ],
+      "reason": "PR #105 adds a db-native pg_trgm GIN index on stock_count_lines.sku for scalable stock-count product filtering; Prisma cannot represent the operator class."
     }
   ]
 }
