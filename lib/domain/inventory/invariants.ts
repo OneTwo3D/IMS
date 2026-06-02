@@ -88,6 +88,10 @@ export type InventoryInvariantCostLayerRow = {
   warehouseId: string
   receivedQty: DecimalLike
   remainingQty: DecimalLike
+  poLineId?: string | null
+  poLine?: { poId: string } | null
+  productionOrderId?: string | null
+  adjustmentMovementId?: string | null
   product: Pick<ProductSnapshot, 'id' | 'sku' | 'type'>
 }
 
@@ -98,8 +102,11 @@ export type InventoryInvariantStockMovementRow = {
   fromWarehouseId: string | null
   toWarehouseId: string | null
   qty: DecimalLike
+  referenceType?: string | null
+  referenceId?: string | null
   unitCostBase?: DecimalLike | null
   totalValueBase?: DecimalLike | null
+  _count?: { cogsEntries?: number }
   product: Pick<ProductSnapshot, 'id' | 'sku' | 'type'>
 }
 
@@ -174,6 +181,9 @@ const MAX_SQL_COLLECTOR_PAGE_SIZE = 1000
 const DEFAULT_SQL_REPORT_MAX_FINDINGS = 5000
 const FIFO_RECONCILIATION_EXCEPTION = 'Products without FIFO cost layers are excluded; FIFO cost-layer products are expected to reconcile within tolerance.'
 const INVENTORY_INVARIANT_TRUNCATED_CODE = 'invariant_report_truncated'
+const INBOUND_COST_LAYER_MOVEMENT_TYPES = new Set(['PURCHASE_RECEIPT', 'PRODUCTION_IN'])
+const OUTBOUND_COGS_MOVEMENT_TYPES = new Set(['SALE_DISPATCH', 'PRODUCTION_OUT'])
+const ADJUSTMENT_MOVEMENT_TYPE = 'ADJUSTMENT'
 
 // KIT availability is derived from components, so KIT parents do not carry
 // their own FIFO cost layers or shipment COGS snapshots.
@@ -230,6 +240,66 @@ function stockMovementValueDelta(params: {
 
 function quantityKey(productId: string, warehouseId: string): string {
   return `${productId}:${warehouseId}`
+}
+
+function movementWarehouseId(movement: InventoryInvariantStockMovementRow): string | null {
+  return movement.fromWarehouseId ?? movement.toWarehouseId
+}
+
+function requiresInboundCostLayerEvidence(
+  movement: InventoryInvariantStockMovementRow,
+  qty: number,
+  tolerance: number,
+): boolean {
+  if (qty <= tolerance) return false
+  if (INBOUND_COST_LAYER_MOVEMENT_TYPES.has(movement.type)) return true
+  return movement.type === ADJUSTMENT_MOVEMENT_TYPE && Boolean(movement.toWarehouseId)
+}
+
+function requiresCogsEntryEvidence(
+  movement: InventoryInvariantStockMovementRow,
+  qty: number,
+  tolerance: number,
+): boolean {
+  if (qty <= tolerance) return false
+  if (OUTBOUND_COGS_MOVEMENT_TYPES.has(movement.type)) return true
+  return movement.type === ADJUSTMENT_MOVEMENT_TYPE && Boolean(movement.fromWarehouseId)
+}
+
+function hasMatchingInboundCostLayer(
+  movement: InventoryInvariantStockMovementRow,
+  costLayers: InventoryInvariantCostLayerRow[],
+  tolerance: number,
+): boolean {
+  const movementQty = decimalToNumber(movement.qty)
+  const warehouseId = movement.toWarehouseId
+  if (!warehouseId) return false
+
+  return costLayers.some((costLayer) => {
+    if (costLayer.productId !== movement.productId) return false
+    if (costLayer.warehouseId !== warehouseId) return false
+    if (Math.abs(decimalToNumber(costLayer.receivedQty) - movementQty) > tolerance) return false
+
+    if (movement.type === 'PRODUCTION_IN') {
+      return Boolean(movement.referenceId) &&
+        costLayer.productionOrderId === movement.referenceId
+    }
+
+    if (movement.type === 'PURCHASE_RECEIPT') {
+      // Purchase receipt movements do not persist the cost-layer id. The
+      // durable writer contract is product + destination warehouse + received
+      // quantity plus a PO line belonging to the referenced purchase order.
+      return movement.referenceType === 'PurchaseOrder' &&
+        Boolean(movement.referenceId) &&
+        costLayer.poLine?.poId === movement.referenceId
+    }
+
+    if (movement.type === ADJUSTMENT_MOVEMENT_TYPE) {
+      return costLayer.adjustmentMovementId === movement.id
+    }
+
+    return false
+  })
 }
 
 function sumReservationSources(
@@ -627,6 +697,52 @@ export function evaluateInventoryInvariantRows(
         },
       })
     }
+
+    if (
+      requiresInboundCostLayerEvidence(stockMovement, qty, tolerance) &&
+      !hasMatchingInboundCostLayer(stockMovement, rows.costLayers, tolerance)
+    ) {
+      findings.push({
+        severity: 'critical',
+        code: 'stock_movement_missing_cost_layer',
+        productId: stockMovement.productId,
+        warehouseId: stockMovement.toWarehouseId ?? undefined,
+        message: `Inbound stock movement is missing matching cost-layer evidence for ${stockMovement.product.sku}`,
+        details: {
+          movementId: stockMovement.id,
+          movementType: stockMovement.type,
+          sku: stockMovement.product.sku,
+          qty,
+          toWarehouseId: stockMovement.toWarehouseId,
+          referenceType: stockMovement.referenceType ?? null,
+          referenceId: stockMovement.referenceId ?? null,
+        },
+      })
+    }
+
+    if (
+      requiresCogsEntryEvidence(stockMovement, qty, tolerance) &&
+      (stockMovement._count?.cogsEntries ?? 0) < 1
+    ) {
+      findings.push({
+        severity: 'critical',
+        code: 'stock_movement_missing_cogs_entry',
+        productId: stockMovement.productId,
+        warehouseId: movementWarehouseId(stockMovement) ?? undefined,
+        message: `Outbound stock movement is missing COGS evidence for ${stockMovement.product.sku}`,
+        details: {
+          movementId: stockMovement.id,
+          movementType: stockMovement.type,
+          sku: stockMovement.product.sku,
+          qty,
+          fromWarehouseId: stockMovement.fromWarehouseId,
+          toWarehouseId: stockMovement.toWarehouseId,
+          referenceType: stockMovement.referenceType ?? null,
+          referenceId: stockMovement.referenceId ?? null,
+          cogsEntryCount: stockMovement._count?.cogsEntries ?? 0,
+        },
+      })
+    }
   }
 
   for (const shipmentLine of rows.shippedShipmentLines) {
@@ -656,7 +772,14 @@ export function evaluateInventoryInvariantRows(
 
 export async function collectInventoryInvariantRows(
   client: InventoryInvariantClient = db as unknown as InventoryInvariantClient,
+  options: Pick<InventoryInvariantSqlCollectorOptions, 'stockMovementLookbackDays'> = {},
 ): Promise<InventoryInvariantRows> {
+  const stockMovementLookbackDays = options.stockMovementLookbackDays === undefined
+    ? 90
+    : options.stockMovementLookbackDays
+  const stockMovementLookbackDate = stockMovementLookbackDays == null
+    ? null
+    : new Date(Date.now() - Math.max(1, Math.floor(stockMovementLookbackDays)) * 24 * 60 * 60 * 1000)
   const [stockLevels, costLayers, stockMovements, shippedShipmentLines, reservationSources] = await Promise.all([
     client.stockLevel.findMany({
       select: {
@@ -683,6 +806,14 @@ export async function collectInventoryInvariantRows(
         warehouseId: true,
         receivedQty: true,
         remainingQty: true,
+        poLineId: true,
+        poLine: {
+          select: {
+            poId: true,
+          },
+        },
+        productionOrderId: true,
+        adjustmentMovementId: true,
         product: {
           select: {
             id: true,
@@ -694,10 +825,16 @@ export async function collectInventoryInvariantRows(
     }),
     client.stockMovement.findMany({
       where: {
-        OR: [
-          { qty: { lt: 0 } },
-          { unitCostBase: { not: null } },
-          { totalValueBase: { not: null } },
+        AND: [
+          stockMovementLookbackDate ? { createdAt: { gte: stockMovementLookbackDate } } : {},
+          {
+            OR: [
+              { qty: { lt: 0 } },
+              { unitCostBase: { not: null } },
+              { totalValueBase: { not: null } },
+              { type: { in: [...INBOUND_COST_LAYER_MOVEMENT_TYPES, ...OUTBOUND_COGS_MOVEMENT_TYPES, ADJUSTMENT_MOVEMENT_TYPE] } },
+            ],
+          },
         ],
       },
       select: {
@@ -707,8 +844,15 @@ export async function collectInventoryInvariantRows(
         fromWarehouseId: true,
         toWarehouseId: true,
         qty: true,
+        referenceType: true,
+        referenceId: true,
         unitCostBase: true,
         totalValueBase: true,
+        _count: {
+          select: {
+            cogsEntries: true,
+          },
+        },
         product: {
           select: {
             id: true,
@@ -1311,6 +1455,98 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       UNION ALL
 
       SELECT
+        'stock_movement_missing_cost_layer:' || sm.id AS "sortKey",
+        'critical'::text AS severity,
+        'stock_movement_missing_cost_layer'::text AS code,
+        sm."productId",
+        sm."toWarehouseId" AS "warehouseId",
+        'Inbound stock movement is missing matching cost-layer evidence for ' || p.sku AS message,
+        jsonb_build_object(
+          'movementId', sm.id,
+          'movementType', sm.type,
+          'sku', p.sku,
+          'qty', sm.qty,
+          'toWarehouseId', sm."toWarehouseId",
+          'referenceType', sm."referenceType",
+          'referenceId', sm."referenceId"
+        ) AS details
+      FROM "stock_movements" sm
+      INNER JOIN "products" p ON p.id = sm."productId"
+      WHERE (
+          sm.type IN ('PURCHASE_RECEIPT', 'PRODUCTION_IN')
+          OR (sm.type = 'ADJUSTMENT' AND sm."toWarehouseId" IS NOT NULL)
+        )
+        AND sm.qty > ${tolerance}
+        AND sm."toWarehouseId" IS NOT NULL
+        AND NOT EXISTS (
+          SELECT 1
+          FROM "cost_layers" cl
+          WHERE cl."productId" = sm."productId"
+            AND cl."warehouseId" = sm."toWarehouseId"
+            AND ABS(cl."receivedQty" - sm.qty) <= ${tolerance}
+            AND (
+              (sm.type = 'PRODUCTION_IN'
+                AND sm."referenceType" = 'ProductionOrder'
+                AND sm."referenceId" IS NOT NULL
+                AND cl."production_order_id" = sm."referenceId")
+              OR
+              (sm.type = 'PURCHASE_RECEIPT'
+                AND sm."referenceType" = 'PurchaseOrder'
+                AND sm."referenceId" IS NOT NULL
+                AND EXISTS (
+                  SELECT 1
+                  FROM "purchase_order_lines" pol
+                  WHERE pol.id = cl."poLineId"
+                    AND pol."poId" = sm."referenceId"
+                ))
+              OR
+              (sm.type = 'ADJUSTMENT'
+                AND cl."adjustment_movement_id" = sm.id)
+            )
+        )
+        ${movementProductFilter}
+        ${movementToWarehouseFilter}
+        ${stockMovementLookbackFilter}
+
+      UNION ALL
+
+      SELECT
+        'stock_movement_missing_cogs_entry:' || sm.id AS "sortKey",
+        'critical'::text AS severity,
+        'stock_movement_missing_cogs_entry'::text AS code,
+        sm."productId",
+        COALESCE(sm."fromWarehouseId", sm."toWarehouseId") AS "warehouseId",
+        'Outbound stock movement is missing COGS evidence for ' || p.sku AS message,
+        jsonb_build_object(
+          'movementId', sm.id,
+          'movementType', sm.type,
+          'sku', p.sku,
+          'qty', sm.qty,
+          'fromWarehouseId', sm."fromWarehouseId",
+          'toWarehouseId', sm."toWarehouseId",
+          'referenceType', sm."referenceType",
+          'referenceId', sm."referenceId",
+          'cogsEntryCount', 0
+        ) AS details
+      FROM "stock_movements" sm
+      INNER JOIN "products" p ON p.id = sm."productId"
+      WHERE (
+          sm.type IN ('SALE_DISPATCH', 'PRODUCTION_OUT')
+          OR (sm.type = 'ADJUSTMENT' AND sm."fromWarehouseId" IS NOT NULL)
+        )
+        AND sm.qty > ${tolerance}
+        AND NOT EXISTS (
+          SELECT 1
+          FROM "cogs_entries" ce
+          WHERE ce."movementId" = sm.id
+        )
+        ${movementProductFilter}
+        ${movementPrimaryWarehouseFilter}
+        ${stockMovementLookbackFilter}
+
+      UNION ALL
+
+      SELECT
         'shipped_line_missing_cogs_snapshot:' || sl.id AS "sortKey",
         'critical'::text AS severity,
         'shipped_line_missing_cogs_snapshot'::text AS code,
@@ -1479,11 +1715,13 @@ export async function runInventoryInvariantReport(options: {
         warehouseId: options.warehouseId,
         severity: options.severity,
         stockMovementLookbackDays: options.stockMovementLookbackDays,
-        },
+      },
       )
       : {
           findings: evaluateInventoryInvariantRows(
-            await collectInventoryInvariantRows(client),
+            await collectInventoryInvariantRows(client, {
+              stockMovementLookbackDays: options.stockMovementLookbackDays,
+            }),
             { quantityTolerance: options.quantityTolerance },
           ),
           truncated: false,
