@@ -60,6 +60,7 @@ const INVENTORY_COSTING_REPORT_LINKS = [
   { href: '/analytics/inventory-valuation',    label: 'Inventory Valuation' },
   { href: '/analytics/cogs',                   label: 'COGS Report' },
   { href: '/analytics/landed-cost',            label: 'Landed Cost Analysis' },
+  { href: '/analytics/inventory-turnover',     label: 'Inventory Turnover' },
 ]
 
 function getSettingsChildren(accountingIntegrationEnabled: boolean) {

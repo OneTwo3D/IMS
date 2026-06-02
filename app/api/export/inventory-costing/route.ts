@@ -3,8 +3,10 @@ import { requireApiAuth } from '@/lib/auth/server'
 import { csvBufferedStreamResponse } from '@/lib/csv'
 import {
   getCogsReport,
+  getInventoryTurnoverReport,
   getInventoryValuationReport,
   getLandedCostReport,
+  InventoryTurnoverSourceLimitError,
   inventoryCostingFiltersFromSearch,
   INVENTORY_COSTING_CSV_ROW_LIMIT,
   type InventoryCostingSearchParams,
@@ -103,11 +105,37 @@ export async function GET(req: NextRequest) {
       }))
       return csvBufferedStreamResponse(rows, ['dateFrom', 'dateTo', 'poReference', 'supplierName', 'status', 'sku', 'productName', 'categoryName', 'qty', 'goodsUnitCostBase', 'landedUnitCostBase', 'landedUpliftUnitBase', 'landedUpliftPct', 'goodsValueBase', 'landedValueBase', 'landedCostMethod', 'revaluationCount', 'generatedAt'], `landed-cost-${date}.csv`)
     }
+
+    case 'inventory-turnover': {
+      const report = await getInventoryTurnoverReport(filters, { paginate: false }).catch((error: unknown) => {
+        if (error instanceof InventoryTurnoverSourceLimitError) return error
+        throw error
+      })
+      if (report instanceof InventoryTurnoverSourceLimitError) {
+        return NextResponse.json({ error: report.message }, { status: 413 })
+      }
+      const tooLarge = exportTooLarge(report.pageInfo.totalRows)
+      if (tooLarge) return tooLarge
+      const rows = report.rows.map((row) => ({
+        groupLabel: row.groupLabel,
+        sku: row.sku ?? '',
+        categoryName: row.categoryName ?? '',
+        warehouseCode: row.warehouseCode ?? '',
+        supplierName: row.supplierName ?? '',
+        cogsBase: row.cogsBase,
+        averageInventoryValueBase: row.averageInventoryValueBase,
+        turnoverRatio: row.turnoverRatio ?? '',
+        daysInventoryOutstanding: row.daysInventoryOutstanding ?? '',
+        cogsEntryCount: row.cogsEntryCount,
+        snapshotDayCount: row.snapshotDayCount,
+      }))
+      return csvBufferedStreamResponse(rows, ['groupLabel', 'sku', 'categoryName', 'warehouseCode', 'supplierName', 'cogsBase', 'averageInventoryValueBase', 'turnoverRatio', 'daysInventoryOutstanding', 'cogsEntryCount', 'snapshotDayCount'], `inventory-turnover-${date}.csv`)
+    }
   }
 }
 
 function isInventoryCostingReportType(value: string): value is InventoryCostingReportType {
-  return value === 'inventory-valuation' || value === 'cogs' || value === 'landed-cost'
+  return value === 'inventory-valuation' || value === 'cogs' || value === 'landed-cost' || value === 'inventory-turnover'
 }
 
 function searchParamsForFilters(searchParams: URLSearchParams): InventoryCostingSearchParams {

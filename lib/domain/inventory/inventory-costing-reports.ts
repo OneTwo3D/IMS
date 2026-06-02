@@ -1,4 +1,4 @@
-import { LandedCostMethod, Prisma } from '@/app/generated/prisma/client'
+import { LandedCostMethod, Prisma, StockMovementType } from '@/app/generated/prisma/client'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import {
@@ -9,6 +9,7 @@ import {
 } from '@/lib/domain/accounting/account-balance-snapshots'
 import { getOnHandAsOf, type OnHandAsOfRow } from '@/lib/domain/inventory/get-on-hand-as-of'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
+import { calculateInventoryTurnover, normalizeVelocityWindow } from '@/lib/domain/inventory/velocity'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getXeroSettings } from '@/lib/connectors/xero/settings'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
@@ -19,14 +20,25 @@ const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
 const INVENTORY_COSTING_EXPORT_ROW_LIMIT = 100000
 const SOURCE_SCAN_PAGE_SIZE = 1000
+const INVENTORY_TURNOVER_COGS_SOURCE_ROW_LIMIT = 100000
+const INVENTORY_TURNOVER_SNAPSHOT_SOURCE_ROW_LIMIT = 100000
 const NEAR_ZERO_LANDED_GOODS_UNIT_COST_BASE = '0.01'
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/
 
 const COGS_GROUPS = ['product', 'category', 'warehouse', 'customer', 'channel'] as const
+export const INVENTORY_TURNOVER_GROUP_OPTIONS = [
+  { value: 'product', label: 'Product' },
+  { value: 'category', label: 'Category' },
+  { value: 'warehouse', label: 'Warehouse' },
+  { value: 'supplier', label: 'Supplier' },
+] as const
+const INVENTORY_TURNOVER_GROUPS = INVENTORY_TURNOVER_GROUP_OPTIONS.map((option) => option.value)
 const LANDED_COST_METHODS = new Set(Object.values(LandedCostMethod))
 
-export type InventoryCostingReportType = 'inventory-valuation' | 'cogs' | 'landed-cost'
+export type InventoryCostingReportType = 'inventory-valuation' | 'cogs' | 'landed-cost' | 'inventory-turnover'
 export type CogsGroupBy = typeof COGS_GROUPS[number]
+export type InventoryTurnoverGroupBy = typeof INVENTORY_TURNOVER_GROUPS[number]
+export type InventoryCostingGroupBy = CogsGroupBy | InventoryTurnoverGroupBy
 
 export type InventoryCostingSearchParams = Record<string, string | string[] | undefined>
 
@@ -39,7 +51,7 @@ export type InventoryCostingFilters = {
   supplierId?: string
   product?: string
   includeZero?: boolean
-  groupBy?: CogsGroupBy
+  groupBy?: InventoryCostingGroupBy
   landedCostMethod?: LandedCostMethod
   page?: number
   pageSize?: number
@@ -133,6 +145,56 @@ export type CogsReport = {
   notices: string[]
 }
 
+export type InventoryTurnoverReportRow = {
+  groupKey: string
+  groupLabel: string
+  sku: string | null
+  productId: string | null
+  productName: string | null
+  categoryName: string | null
+  warehouseCode: string | null
+  supplierName: string | null
+  cogsBase: string
+  averageInventoryValueBase: string
+  turnoverRatio: string | null
+  daysInventoryOutstanding: string | null
+  cogsEntryCount: number
+  snapshotDayCount: number
+}
+
+export type InventoryTurnoverReport = {
+  dateFrom: string
+  dateTo: string
+  generatedAt: string
+  groupBy: InventoryTurnoverGroupBy
+  periodDays: number
+  rows: InventoryTurnoverReportRow[]
+  pageInfo: PageInfo
+  totals: {
+    cogsBase: string
+    averageInventoryValueBase: string
+    turnoverRatio: string | null
+    daysInventoryOutstanding: string | null
+    cogsEntryCount: number
+    snapshotDayCount: number
+  }
+  notices: string[]
+}
+
+export class InventoryTurnoverSourceLimitError extends Error {
+  source: 'COGS' | 'snapshot'
+  rowCount: number
+  limit: number
+
+  constructor(source: 'COGS' | 'snapshot', rowCount: number, limit: number) {
+    super(`Inventory turnover ${source} scan exceeds ${limit.toLocaleString()} rows. Narrow the date range or filters and retry.`)
+    this.name = 'InventoryTurnoverSourceLimitError'
+    this.source = source
+    this.rowCount = rowCount
+    this.limit = limit
+  }
+}
+
 export type LandedCostReportRow = {
   poId: string
   poReference: string
@@ -177,7 +239,7 @@ type ProductMeta = {
   name: string
   stockUnit: string
   category: { name: string } | null
-  supplierProducts: Array<{ supplier: { name: string } }>
+  supplierProducts: Array<{ supplier: { id: string; name: string } }>
 }
 
 type WarehouseMeta = {
@@ -226,6 +288,43 @@ type LandedCostLineRow = {
   }
 }
 
+type InventoryTurnoverSnapshotRow = {
+  id: string
+  snapshotDate: Date
+  productId: string
+  warehouseId: string
+  valueBase: DecimalInput
+  product: ProductMeta
+  warehouse: WarehouseMeta
+}
+
+export type InventoryTurnoverCogsAggregationInput = {
+  id: string
+  cogsBase: DecimalInput
+  productId: string
+  sku: string
+  productName: string
+  categoryName: string | null
+  warehouseId: string | null
+  warehouseCode: string | null
+  warehouseName: string | null
+  suppliers: Array<{ id: string; name: string }>
+}
+
+export type InventoryTurnoverSnapshotAggregationInput = {
+  id: string
+  snapshotDate: string | Date
+  inventoryValueBase: DecimalInput
+  productId: string
+  sku: string
+  productName: string
+  categoryName: string | null
+  warehouseId: string
+  warehouseCode: string
+  warehouseName: string
+  suppliers: Array<{ id: string; name: string }>
+}
+
 type RevenueKey = {
   orderId: string
   productId: string
@@ -256,8 +355,10 @@ export type LandedCostAggregationInput = {
 }
 
 type ProductWhere = Prisma.ProductWhereInput
+type InventoryTurnoverReportClient = Pick<typeof db, 'cogsEntry' | 'inventorySnapshot'>
 type ReportOptions = {
   paginate?: boolean
+  client?: InventoryTurnoverReportClient
 }
 
 function pageInfo(totalRows: number, page: number, pageSize: number): PageInfo {
@@ -355,6 +456,12 @@ function productWhere(filters: InventoryCostingFilters): ProductWhere {
 
 function supplierNames(product: ProductMeta): string[] {
   return product.supplierProducts.map((entry) => entry.supplier.name).sort((a, b) => a.localeCompare(b))
+}
+
+function supplierMetas(product: ProductMeta): Array<{ id: string; name: string }> {
+  return product.supplierProducts
+    .map((entry) => entry.supplier)
+    .sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
 }
 
 const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: 'xero' | null; baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> => {
@@ -494,6 +601,19 @@ function cogsGroupLabel(input: CogsAggregationInput, groupBy: CogsGroupBy): stri
   }
 }
 
+function isCogsGroupBy(value: InventoryCostingGroupBy | undefined): value is CogsGroupBy {
+  return COGS_GROUPS.includes(value as CogsGroupBy)
+}
+
+function isInventoryTurnoverGroupBy(value: InventoryCostingGroupBy | undefined): value is InventoryTurnoverGroupBy {
+  return INVENTORY_TURNOVER_GROUPS.includes(value as InventoryTurnoverGroupBy)
+}
+
+function dateOnly(value: string | Date): string {
+  if (typeof value === 'string') return value.slice(0, 10)
+  return value.toISOString().slice(0, 10)
+}
+
 function paginate<Row>(rows: Row[], filters: InventoryCostingFilters, options: ReportOptions = {}): { rows: Row[]; pageInfo: PageInfo } {
   if (options.paginate === false) {
     return {
@@ -520,6 +640,9 @@ function paginate<Row>(rows: Row[], filters: InventoryCostingFilters, options: R
 export function inventoryCostingFiltersFromSearch(searchParams: InventoryCostingSearchParams): InventoryCostingFilters {
   const groupBy = oneSearchParam(searchParams.groupBy)
   const landedCostMethod = oneSearchParam(searchParams.landedCostMethod)
+  const validGroupBy = COGS_GROUPS.includes(groupBy as CogsGroupBy) || INVENTORY_TURNOVER_GROUPS.includes(groupBy as InventoryTurnoverGroupBy)
+    ? groupBy as InventoryCostingGroupBy
+    : undefined
   return {
     asOf: dateSearchParam(searchParams.asOf),
     dateFrom: dateSearchParam(searchParams.dateFrom),
@@ -529,7 +652,7 @@ export function inventoryCostingFiltersFromSearch(searchParams: InventoryCosting
     supplierId: oneSearchParam(searchParams.supplierId),
     product: oneSearchParam(searchParams.product),
     includeZero: oneSearchParam(searchParams.includeZero) === '1',
-    groupBy: COGS_GROUPS.includes(groupBy as CogsGroupBy) ? groupBy as CogsGroupBy : undefined,
+    groupBy: validGroupBy,
     landedCostMethod: LANDED_COST_METHODS.has(landedCostMethod as LandedCostMethod) ? landedCostMethod as LandedCostMethod : undefined,
     page: Number(oneSearchParam(searchParams.page) ?? 1),
     pageSize: Number(oneSearchParam(searchParams.pageSize) ?? 100),
@@ -621,6 +744,155 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
     })
 }
 
+type TurnoverGroupMeta = {
+  key: string
+  label: string
+  share: Decimal
+  sku: string | null
+  productId: string | null
+  productName: string | null
+  categoryName: string | null
+  warehouseCode: string | null
+  supplierName: string | null
+}
+
+function turnoverGroupMetas(
+  input: InventoryTurnoverCogsAggregationInput | InventoryTurnoverSnapshotAggregationInput,
+  groupBy: InventoryTurnoverGroupBy,
+): TurnoverGroupMeta[] {
+  switch (groupBy) {
+    case 'category':
+      return [{
+        key: input.categoryName ?? 'uncategorised',
+        label: input.categoryName ?? 'Uncategorised',
+        share: new Prisma.Decimal(1),
+        sku: null,
+        productId: null,
+        productName: null,
+        categoryName: input.categoryName,
+        warehouseCode: null,
+        supplierName: null,
+      }]
+    case 'warehouse':
+      return [{
+        key: input.warehouseId ?? 'unknown-warehouse',
+        label: input.warehouseCode ? `${input.warehouseCode} — ${input.warehouseName ?? ''}`.trim() : 'Unknown warehouse',
+        share: new Prisma.Decimal(1),
+        sku: null,
+        productId: null,
+        productName: null,
+        categoryName: null,
+        warehouseCode: input.warehouseCode,
+        supplierName: null,
+      }]
+    case 'supplier': {
+      if (input.suppliers.length === 0) return []
+      const share = new Prisma.Decimal(1).div(input.suppliers.length)
+      return input.suppliers.map((supplier) => ({
+        key: supplier.id,
+        label: supplier.name,
+        share,
+        sku: null,
+        productId: null,
+        productName: null,
+        categoryName: null,
+        warehouseCode: null,
+        supplierName: supplier.name,
+      }))
+    }
+    case 'product':
+    default:
+      return [{
+        key: input.productId,
+        label: `${input.sku} — ${input.productName}`,
+        share: new Prisma.Decimal(1),
+        sku: input.sku,
+        productId: input.productId,
+        productName: input.productName,
+        categoryName: input.categoryName,
+        warehouseCode: null,
+        supplierName: null,
+      }]
+  }
+}
+
+export function aggregateInventoryTurnoverRows(
+  cogsInputs: InventoryTurnoverCogsAggregationInput[],
+  snapshotInputs: InventoryTurnoverSnapshotAggregationInput[],
+  groupBy: InventoryTurnoverGroupBy,
+  periodDays: number,
+): InventoryTurnoverReportRow[] {
+  const groups = new Map<string, {
+    meta: TurnoverGroupMeta
+    cogsBase: Decimal
+    cogsEntryIds: Set<string>
+    snapshotValueByDay: Map<string, Decimal>
+  }>()
+
+  const getGroup = (meta: TurnoverGroupMeta) => {
+    const existing = groups.get(meta.key)
+    if (existing) return existing
+    const created = {
+      meta,
+      cogsBase: decimalZero(),
+      cogsEntryIds: new Set<string>(),
+      snapshotValueByDay: new Map<string, Decimal>(),
+    }
+    groups.set(meta.key, created)
+    return created
+  }
+
+  for (const input of cogsInputs) {
+    for (const meta of turnoverGroupMetas(input, groupBy)) {
+      const group = getGroup(meta)
+      group.cogsBase = group.cogsBase.add(toDecimal(input.cogsBase).mul(meta.share))
+      group.cogsEntryIds.add(input.id)
+    }
+  }
+
+  for (const input of snapshotInputs) {
+    const day = dateOnly(input.snapshotDate)
+    for (const meta of turnoverGroupMetas(input, groupBy)) {
+      const group = getGroup(meta)
+      group.snapshotValueByDay.set(day, (group.snapshotValueByDay.get(day) ?? decimalZero()).add(toDecimal(input.inventoryValueBase).mul(meta.share)))
+    }
+  }
+
+  return [...groups.values()]
+    .map((group) => {
+      const snapshotValueTotal = [...group.snapshotValueByDay.values()].reduce((sum, value) => sum.add(value), decimalZero())
+      const averageInventoryValueBase = group.snapshotValueByDay.size > 0 ? snapshotValueTotal.div(group.snapshotValueByDay.size) : decimalZero()
+      const turnover = calculateInventoryTurnover({
+        cogsBase: group.cogsBase,
+        averageInventoryValueBase,
+        periodDays,
+      })
+      return {
+        groupKey: group.meta.key,
+        groupLabel: group.meta.label,
+        sku: group.meta.sku,
+        productId: group.meta.productId,
+        productName: group.meta.productName,
+        categoryName: group.meta.categoryName,
+        warehouseCode: group.meta.warehouseCode,
+        supplierName: group.meta.supplierName,
+        cogsBase: moneyString(group.cogsBase),
+        averageInventoryValueBase: moneyString(averageInventoryValueBase),
+        turnoverRatio: turnover.turnoverRatio,
+        daysInventoryOutstanding: turnover.daysInventoryOutstanding,
+        cogsEntryCount: group.cogsEntryIds.size,
+        snapshotDayCount: group.snapshotValueByDay.size,
+      }
+    })
+    .sort((a, b) => {
+      const aRatio = a.turnoverRatio == null ? new Prisma.Decimal(-1) : toDecimal(a.turnoverRatio)
+      const bRatio = b.turnoverRatio == null ? new Prisma.Decimal(-1) : toDecimal(b.turnoverRatio)
+      if (aRatio.lt(bRatio)) return 1
+      if (aRatio.gt(bRatio)) return -1
+      return a.groupLabel.localeCompare(b.groupLabel)
+    })
+}
+
 export function aggregateLandedCostMethods(inputs: LandedCostAggregationInput[]): LandedCostReport['methodSummary'] {
   const groups = new Map<LandedCostMethod, { count: number; goodsValueBase: Decimal; landedValueBase: Decimal }>()
   for (const input of inputs) {
@@ -656,7 +928,7 @@ async function loadProductMetas(productIds: string[]): Promise<Map<string, Produ
           name: true,
           stockUnit: true,
           category: { select: { name: true } },
-          supplierProducts: { select: { supplier: { select: { name: true } } } },
+          supplierProducts: { select: { supplier: { select: { id: true, name: true } } } },
         },
       })
   return new Map(rows.map((row) => [row.id, row]))
@@ -786,7 +1058,7 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
   const dateTo = filters.dateTo ?? today()
   const from = parseDateOnly(dateFrom, daysAgo(30))
   const to = parseDateOnly(dateTo, today(), true)
-  const groupBy = filters.groupBy ?? 'product'
+  const groupBy = isCogsGroupBy(filters.groupBy) ? filters.groupBy : 'product'
   const cogsWhere: Prisma.CogsEntryWhereInput = {
     createdAt: { gte: from, lte: to },
     movement: {
@@ -821,7 +1093,7 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
                 name: true,
                 stockUnit: true,
                 category: { select: { name: true } },
-                supplierProducts: { select: { supplier: { select: { name: true } } } },
+                supplierProducts: { select: { supplier: { select: { id: true, name: true } } } },
               },
             },
             fromWarehouse: { select: { id: true, code: true, name: true } },
@@ -903,6 +1175,216 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
   }
 }
 
+export function assertInventoryTurnoverSourceLimit(rowCount: number, limit: number, source: 'COGS' | 'snapshot'): void {
+  if (rowCount <= limit) return
+  throw new InventoryTurnoverSourceLimitError(source, rowCount, limit)
+}
+
+export function emptyInventoryTurnoverReportForSourceLimit(filters: InventoryCostingFilters, error: InventoryTurnoverSourceLimitError): InventoryTurnoverReport {
+  const dateFrom = filters.dateFrom ?? daysAgo(90)
+  const dateTo = filters.dateTo ?? today()
+  const window = normalizeVelocityWindow({ dateFrom, dateTo })
+  return {
+    dateFrom,
+    dateTo,
+    generatedAt: new Date().toISOString(),
+    groupBy: isInventoryTurnoverGroupBy(filters.groupBy) ? filters.groupBy : 'product',
+    periodDays: window.days,
+    rows: [],
+    pageInfo: {
+      page: 1,
+      pageSize: filters.pageSize ?? DEFAULT_PAGE_SIZE,
+      totalRows: 0,
+      totalPages: 1,
+      hasNextPage: false,
+      hasPreviousPage: false,
+    },
+    totals: {
+      cogsBase: '0.000000',
+      averageInventoryValueBase: '0.000000',
+      turnoverRatio: null,
+      daysInventoryOutstanding: null,
+      cogsEntryCount: 0,
+      snapshotDayCount: 0,
+    },
+    notices: [error.message],
+  }
+}
+
+export async function getInventoryTurnoverReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<InventoryTurnoverReport> {
+  const client = options.client ?? db
+  const dateFrom = filters.dateFrom ?? daysAgo(90)
+  const dateTo = filters.dateTo ?? today()
+  const window = normalizeVelocityWindow({ dateFrom, dateTo })
+  const from = window.dateFrom
+  const to = window.dateTo
+  const snapshotFrom = window.dateFrom
+  const snapshotTo = window.dateTo
+  const groupBy = isInventoryTurnoverGroupBy(filters.groupBy) ? filters.groupBy : 'product'
+  const periodDays = window.days
+  const productFilter = productWhere(filters)
+
+  const cogsRows: CogsEntryRow[] = await client.cogsEntry.findMany({
+    where: {
+      createdAt: { gte: from, lte: to },
+      movement: {
+        type: StockMovementType.SALE_DISPATCH,
+        ...(filters.warehouseId ? { fromWarehouseId: filters.warehouseId } : {}),
+        product: productFilter,
+      },
+    },
+    select: {
+      id: true,
+      qty: true,
+      totalCostBase: true,
+      createdAt: true,
+      movement: {
+        select: {
+          id: true,
+          referenceType: true,
+          referenceId: true,
+          fromWarehouseId: true,
+          toWarehouseId: true,
+          product: {
+            select: {
+              id: true,
+              sku: true,
+              name: true,
+              stockUnit: true,
+              category: { select: { name: true } },
+              supplierProducts: { select: { supplier: { select: { id: true, name: true } } } },
+            },
+          },
+          fromWarehouse: { select: { id: true, code: true, name: true } },
+          toWarehouse: { select: { id: true, code: true, name: true } },
+        },
+      },
+    },
+    // Newest-first keeps the limit probe deterministic; LIMIT + 1 always
+    // rejects before any truncated newest-only sample can be reported.
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+    take: INVENTORY_TURNOVER_COGS_SOURCE_ROW_LIMIT + 1,
+  })
+  assertInventoryTurnoverSourceLimit(cogsRows.length, INVENTORY_TURNOVER_COGS_SOURCE_ROW_LIMIT, 'COGS')
+
+  const snapshotRows: InventoryTurnoverSnapshotRow[] = await client.inventorySnapshot.findMany({
+    where: {
+      snapshotDate: { gte: snapshotFrom, lte: snapshotTo },
+      ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
+      product: productFilter,
+    },
+    select: {
+      id: true,
+      snapshotDate: true,
+      productId: true,
+      warehouseId: true,
+      valueBase: true,
+      product: {
+        select: {
+          id: true,
+          sku: true,
+          name: true,
+          stockUnit: true,
+          category: { select: { name: true } },
+          supplierProducts: { select: { supplier: { select: { id: true, name: true } } } },
+        },
+      },
+      warehouse: { select: { id: true, code: true, name: true } },
+    },
+    orderBy: [{ snapshotDate: 'desc' }, { id: 'desc' }],
+    take: INVENTORY_TURNOVER_SNAPSHOT_SOURCE_ROW_LIMIT + 1,
+  })
+  assertInventoryTurnoverSourceLimit(snapshotRows.length, INVENTORY_TURNOVER_SNAPSHOT_SOURCE_ROW_LIMIT, 'snapshot')
+
+  const cogsInputs: InventoryTurnoverCogsAggregationInput[] = cogsRows.map((row) => {
+    const product = row.movement.product
+    const warehouse = row.movement.fromWarehouse ?? row.movement.toWarehouse
+    return {
+      id: row.id,
+      cogsBase: row.totalCostBase,
+      productId: product.id,
+      sku: product.sku,
+      productName: product.name,
+      categoryName: product.category?.name ?? null,
+      warehouseId: warehouse?.id ?? null,
+      warehouseCode: warehouse?.code ?? null,
+      warehouseName: warehouse?.name ?? null,
+      suppliers: supplierMetas(product),
+    }
+  })
+  const snapshotInputs: InventoryTurnoverSnapshotAggregationInput[] = snapshotRows.map((row) => ({
+    id: row.id,
+    snapshotDate: row.snapshotDate,
+    inventoryValueBase: row.valueBase,
+    productId: row.product.id,
+    sku: row.product.sku,
+    productName: row.product.name,
+    categoryName: row.product.category?.name ?? null,
+    warehouseId: row.warehouse.id,
+    warehouseCode: row.warehouse.code,
+    warehouseName: row.warehouse.name,
+    suppliers: supplierMetas(row.product),
+  }))
+  const allRows = aggregateInventoryTurnoverRows(cogsInputs, snapshotInputs, groupBy, periodDays)
+  const mappedSupplierCogsEntryCount = cogsInputs.filter((row) => groupBy !== 'supplier' || row.suppliers.length > 0).length
+  const missingSupplierCogsEntryCount = groupBy === 'supplier'
+    ? cogsInputs.filter((row) => row.suppliers.length === 0).length
+    : 0
+  const missingSupplierSnapshotRowCount = groupBy === 'supplier'
+    ? snapshotInputs.filter((row) => row.suppliers.length === 0).length
+    : 0
+  const totals = allRows.reduce(
+    (sum, row) => ({
+      cogsBase: sum.cogsBase.add(toDecimal(row.cogsBase)),
+      averageInventoryValueBase: sum.averageInventoryValueBase.add(toDecimal(row.averageInventoryValueBase)),
+    }),
+    { cogsBase: decimalZero(), averageInventoryValueBase: decimalZero() },
+  )
+  const turnover = calculateInventoryTurnover({
+    cogsBase: totals.cogsBase,
+    averageInventoryValueBase: totals.averageInventoryValueBase,
+    periodDays,
+  })
+  const paged = paginate(allRows, filters, options)
+  const multiSupplierRows = groupBy === 'supplier'
+    ? cogsInputs.filter((row) => row.suppliers.length > 1).length + snapshotInputs.filter((row) => row.suppliers.length > 1).length
+    : 0
+  return {
+    dateFrom,
+    dateTo,
+    generatedAt: new Date().toISOString(),
+    groupBy,
+    periodDays,
+    rows: paged.rows,
+    pageInfo: paged.pageInfo,
+    totals: {
+      cogsBase: moneyString(totals.cogsBase),
+      averageInventoryValueBase: moneyString(totals.averageInventoryValueBase),
+      turnoverRatio: turnover.turnoverRatio,
+      daysInventoryOutstanding: turnover.daysInventoryOutstanding,
+      cogsEntryCount: mappedSupplierCogsEntryCount,
+      snapshotDayCount: Math.max(0, ...allRows.map((row) => row.snapshotDayCount)),
+    },
+    notices: [
+      cogsRows.length === 0
+        ? 'No sales-dispatch COGS exists in this period, so turnover is based on zero sales COGS.'
+        : '',
+      snapshotRows.length === 0
+        ? 'No inventory snapshots exist in this period, so turnover ratios and days-inventory-outstanding are blank.'
+        : '',
+      allRows.some((row) => row.turnoverRatio == null)
+        ? 'Rows with zero observed average inventory value show blank turnover ratios to avoid division by zero.'
+        : '',
+      groupBy === 'supplier' && multiSupplierRows > 0
+        ? 'Supplier grouping splits multi-supplier SKU COGS and snapshot value evenly across linked suppliers.'
+        : '',
+      missingSupplierCogsEntryCount > 0 || missingSupplierSnapshotRowCount > 0
+        ? `${missingSupplierCogsEntryCount.toLocaleString()} COGS rows and ${missingSupplierSnapshotRowCount.toLocaleString()} snapshot rows are excluded from supplier grouping because the product has no supplier mapping.`
+        : '',
+    ].filter(Boolean),
+  }
+}
+
 export async function getLandedCostReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<LandedCostReport> {
   const dateFrom = filters.dateFrom ?? daysAgo(90)
   const dateTo = filters.dateTo ?? today()
@@ -934,7 +1416,7 @@ export async function getLandedCostReport(filters: InventoryCostingFilters = {},
             name: true,
             stockUnit: true,
             category: { select: { name: true } },
-            supplierProducts: { select: { supplier: { select: { name: true } } } },
+            supplierProducts: { select: { supplier: { select: { id: true, name: true } } } },
           },
         },
         po: {
