@@ -34,7 +34,7 @@ export type StockPositionFilterValues = {
 type StockPositionReportPageProps<Row> = {
   title: string
   description: string
-  reportKey: 'stock-on-hand' | 'stock-allocations' | 'negative-stock'
+  reportKey: 'stock-on-hand' | 'stock-allocations' | 'negative-stock' | 'inventory-aging'
   filters: StockPositionFilterValues
   filterOptions: StockPositionFilterOptions
   pageInfo: PageInfo
@@ -44,6 +44,7 @@ type StockPositionReportPageProps<Row> = {
   summary: Array<{ label: string; value: string; tone?: SummaryTone }>
   notices?: string[]
   dateMode: 'as-of' | 'range' | 'none'
+  showIncludeZero?: boolean
 }
 
 function today(): string {
@@ -63,6 +64,7 @@ export function StockPositionReportPage<Row>({
   summary,
   notices = [],
   dateMode,
+  showIncludeZero = true,
 }: StockPositionReportPageProps<Row>) {
   const params = currentParams(filters)
   const csvHref = `/api/export/stock-position?${appendParams(params, { type: reportKey })}`
@@ -168,10 +170,12 @@ export function StockPositionReportPage<Row>({
           </div>
         </div>
         <div className="mt-3 flex items-center justify-between gap-3">
-          <label className="flex items-center gap-2 text-sm text-muted-foreground">
-            <input type="checkbox" name="includeZero" value="1" defaultChecked={filters.includeZero} className="rounded border-input" />
-            Include zero rows
-          </label>
+          {showIncludeZero ? (
+            <label className="flex items-center gap-2 text-sm text-muted-foreground">
+              <input type="checkbox" name="includeZero" value="1" defaultChecked={filters.includeZero} className="rounded border-input" />
+              Include zero rows
+            </label>
+          ) : <span />}
           <div className="flex gap-2">
             <Link href={`/analytics/${reportKey}`} className={buttonVariants({ variant: 'outline', size: 'sm' })}>Reset</Link>
             <Button size="sm" type="submit">Apply</Button>
