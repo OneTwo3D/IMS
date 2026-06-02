@@ -2,7 +2,10 @@ import type { Metadata } from 'next'
 import { ProductLink } from '@/components/inventory/product-link'
 import { getOrganisation } from '@/app/actions/company'
 import {
+  emptyInventoryTurnoverReportForSourceLimit,
   getInventoryTurnoverReport,
+  INVENTORY_TURNOVER_GROUP_OPTIONS,
+  InventoryTurnoverSourceLimitError,
   inventoryCostingFiltersForUi,
   inventoryCostingFiltersFromSearch,
   type InventoryCostingSearchParams,
@@ -21,23 +24,21 @@ import {
 
 export const metadata: Metadata = { title: 'Inventory Turnover' }
 
-const TURNOVER_GROUP_OPTIONS = [
-  { value: 'product' as const, label: 'Product' },
-  { value: 'category' as const, label: 'Category' },
-  { value: 'warehouse' as const, label: 'Warehouse' },
-  { value: 'supplier' as const, label: 'Supplier' },
-]
-
 export default async function InventoryTurnoverPage({ searchParams }: { searchParams: Promise<InventoryCostingSearchParams> }) {
   await requireInventoryCostingReportAccess()
   const resolvedSearchParams = await searchParams
   const filters = inventoryCostingFiltersFromSearch(resolvedSearchParams)
-  const [report, filterOptions, organisation] = await Promise.all([
-    getInventoryTurnoverReport(filters),
+  const [rawReport, filterOptions, organisation] = await Promise.all([
+    getInventoryTurnoverReport(filters).catch((error: unknown) => {
+      if (error instanceof InventoryTurnoverSourceLimitError) return emptyInventoryTurnoverReportForSourceLimit(filters, error)
+      throw error
+    }),
     getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),
     getOrganisation(),
   ])
+  const report = rawReport
   const currency = organisation.baseCurrency
+  const blankMetric = '-'
   const columns: Array<InventoryCostingColumn<InventoryTurnoverReportRow>> = [
     {
       key: 'group',
@@ -65,15 +66,15 @@ export default async function InventoryTurnoverPage({ searchParams }: { searchPa
       key: 'turnover',
       label: 'Turnover',
       align: 'right',
-      render: (row) => row.turnoverRatio == null ? 'No snapshot value' : row.turnoverRatio,
-      footer: report.totals.turnoverRatio ?? 'No snapshot value',
+      render: (row) => row.turnoverRatio ?? blankMetric,
+      footer: report.totals.turnoverRatio ?? blankMetric,
     },
     {
       key: 'dio',
       label: 'DIO',
       align: 'right',
-      render: (row) => row.daysInventoryOutstanding == null ? 'No snapshot value' : row.daysInventoryOutstanding,
-      footer: report.totals.daysInventoryOutstanding ?? 'No snapshot value',
+      render: (row) => row.daysInventoryOutstanding ?? blankMetric,
+      footer: report.totals.daysInventoryOutstanding ?? blankMetric,
     },
     { key: 'cogsEntries', label: 'COGS rows', align: 'right', render: (row) => row.cogsEntryCount, footer: report.totals.cogsEntryCount },
     { key: 'snapshotDays', label: 'Snapshot days', align: 'right', render: (row) => `${row.snapshotDayCount}/${report.periodDays}`, footer: `${report.totals.snapshotDayCount}/${report.periodDays}` },
@@ -93,15 +94,15 @@ export default async function InventoryTurnoverPage({ searchParams }: { searchPa
       summary={[
         { label: `Sales COGS (${currency})`, value: formatMoneyCode(Number(report.totals.cogsBase), currency) },
         { label: `Avg inventory (${currency})`, value: formatMoneyCode(Number(report.totals.averageInventoryValueBase), currency) },
-        { label: 'Turnover', value: report.totals.turnoverRatio ?? 'No snapshot value' },
-        { label: 'DIO', value: report.totals.daysInventoryOutstanding ?? 'No snapshot value' },
+        { label: 'Turnover', value: report.totals.turnoverRatio ?? blankMetric },
+        { label: 'DIO', value: report.totals.daysInventoryOutstanding ?? blankMetric },
         { label: 'Period days', value: String(report.periodDays) },
         { label: 'Snapshot days', value: `${report.totals.snapshotDayCount}/${report.periodDays}` },
       ]}
       notices={report.notices}
       dateMode="period"
       showGroupBy
-      groupByOptions={TURNOVER_GROUP_OPTIONS}
+      groupByOptions={INVENTORY_TURNOVER_GROUP_OPTIONS}
     />
   )
 }

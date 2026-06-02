@@ -9,7 +9,7 @@ import {
 } from '@/lib/domain/accounting/account-balance-snapshots'
 import { getOnHandAsOf, type OnHandAsOfRow } from '@/lib/domain/inventory/get-on-hand-as-of'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
-import { calculateInventoryTurnover } from '@/lib/domain/inventory/velocity'
+import { calculateInventoryTurnover, normalizeVelocityWindow } from '@/lib/domain/inventory/velocity'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getXeroSettings } from '@/lib/connectors/xero/settings'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
@@ -24,10 +24,15 @@ const INVENTORY_TURNOVER_COGS_SOURCE_ROW_LIMIT = 100000
 const INVENTORY_TURNOVER_SNAPSHOT_SOURCE_ROW_LIMIT = 100000
 const NEAR_ZERO_LANDED_GOODS_UNIT_COST_BASE = '0.01'
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/
-const DAY_MS = 24 * 60 * 60 * 1000
 
 const COGS_GROUPS = ['product', 'category', 'warehouse', 'customer', 'channel'] as const
-const INVENTORY_TURNOVER_GROUPS = ['product', 'category', 'warehouse', 'supplier'] as const
+export const INVENTORY_TURNOVER_GROUP_OPTIONS = [
+  { value: 'product', label: 'Product' },
+  { value: 'category', label: 'Category' },
+  { value: 'warehouse', label: 'Warehouse' },
+  { value: 'supplier', label: 'Supplier' },
+] as const
+const INVENTORY_TURNOVER_GROUPS = INVENTORY_TURNOVER_GROUP_OPTIONS.map((option) => option.value)
 const LANDED_COST_METHODS = new Set(Object.values(LandedCostMethod))
 
 export type InventoryCostingReportType = 'inventory-valuation' | 'cogs' | 'landed-cost' | 'inventory-turnover'
@@ -174,6 +179,20 @@ export type InventoryTurnoverReport = {
     snapshotDayCount: number
   }
   notices: string[]
+}
+
+export class InventoryTurnoverSourceLimitError extends Error {
+  source: 'COGS' | 'snapshot'
+  rowCount: number
+  limit: number
+
+  constructor(source: 'COGS' | 'snapshot', rowCount: number, limit: number) {
+    super(`Inventory turnover ${source} scan exceeds ${limit.toLocaleString()} rows. Narrow the date range or filters and retry.`)
+    this.name = 'InventoryTurnoverSourceLimitError'
+    this.source = source
+    this.rowCount = rowCount
+    this.limit = limit
+  }
 }
 
 export type LandedCostReportRow = {
@@ -336,8 +355,10 @@ export type LandedCostAggregationInput = {
 }
 
 type ProductWhere = Prisma.ProductWhereInput
+type InventoryTurnoverReportClient = Pick<typeof db, 'cogsEntry' | 'inventorySnapshot'>
 type ReportOptions = {
   paginate?: boolean
+  client?: InventoryTurnoverReportClient
 }
 
 function pageInfo(totalRows: number, page: number, pageSize: number): PageInfo {
@@ -588,12 +609,6 @@ function isInventoryTurnoverGroupBy(value: InventoryCostingGroupBy | undefined):
   return INVENTORY_TURNOVER_GROUPS.includes(value as InventoryTurnoverGroupBy)
 }
 
-function periodDayCount(dateFrom: string, dateTo: string): number {
-  const from = parseDateOnly(dateFrom, dateFrom)
-  const to = parseDateOnly(dateTo, dateTo)
-  return Math.max(1, Math.floor((to.getTime() - from.getTime()) / DAY_MS) + 1)
-}
-
 function dateOnly(value: string | Date): string {
   if (typeof value === 'string') return value.slice(0, 10)
   return value.toISOString().slice(0, 10)
@@ -732,6 +747,7 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
 type TurnoverGroupMeta = {
   key: string
   label: string
+  share: Decimal
   sku: string | null
   productId: string | null
   productName: string | null
@@ -749,6 +765,7 @@ function turnoverGroupMetas(
       return [{
         key: input.categoryName ?? 'uncategorised',
         label: input.categoryName ?? 'Uncategorised',
+        share: new Prisma.Decimal(1),
         sku: null,
         productId: null,
         productName: null,
@@ -760,6 +777,7 @@ function turnoverGroupMetas(
       return [{
         key: input.warehouseId ?? 'unknown-warehouse',
         label: input.warehouseCode ? `${input.warehouseCode} — ${input.warehouseName ?? ''}`.trim() : 'Unknown warehouse',
+        share: new Prisma.Decimal(1),
         sku: null,
         productId: null,
         productName: null,
@@ -768,10 +786,12 @@ function turnoverGroupMetas(
         supplierName: null,
       }]
     case 'supplier': {
-      const suppliers = input.suppliers.length > 0 ? input.suppliers : [{ id: 'unknown-supplier', name: 'Unknown supplier' }]
-      return suppliers.map((supplier) => ({
+      if (input.suppliers.length === 0) return []
+      const share = new Prisma.Decimal(1).div(input.suppliers.length)
+      return input.suppliers.map((supplier) => ({
         key: supplier.id,
         label: supplier.name,
+        share,
         sku: null,
         productId: null,
         productName: null,
@@ -785,6 +805,7 @@ function turnoverGroupMetas(
       return [{
         key: input.productId,
         label: `${input.sku} — ${input.productName}`,
+        share: new Prisma.Decimal(1),
         sku: input.sku,
         productId: input.productId,
         productName: input.productName,
@@ -824,7 +845,7 @@ export function aggregateInventoryTurnoverRows(
   for (const input of cogsInputs) {
     for (const meta of turnoverGroupMetas(input, groupBy)) {
       const group = getGroup(meta)
-      group.cogsBase = group.cogsBase.add(toDecimal(input.cogsBase))
+      group.cogsBase = group.cogsBase.add(toDecimal(input.cogsBase).mul(meta.share))
       group.cogsEntryIds.add(input.id)
     }
   }
@@ -833,14 +854,14 @@ export function aggregateInventoryTurnoverRows(
     const day = dateOnly(input.snapshotDate)
     for (const meta of turnoverGroupMetas(input, groupBy)) {
       const group = getGroup(meta)
-      group.snapshotValueByDay.set(day, (group.snapshotValueByDay.get(day) ?? decimalZero()).add(toDecimal(input.inventoryValueBase)))
+      group.snapshotValueByDay.set(day, (group.snapshotValueByDay.get(day) ?? decimalZero()).add(toDecimal(input.inventoryValueBase).mul(meta.share)))
     }
   }
 
   return [...groups.values()]
     .map((group) => {
       const snapshotValueTotal = [...group.snapshotValueByDay.values()].reduce((sum, value) => sum.add(value), decimalZero())
-      const averageInventoryValueBase = periodDays > 0 ? snapshotValueTotal.div(periodDays) : decimalZero()
+      const averageInventoryValueBase = group.snapshotValueByDay.size > 0 ? snapshotValueTotal.div(group.snapshotValueByDay.size) : decimalZero()
       const turnover = calculateInventoryTurnover({
         cogsBase: group.cogsBase,
         averageInventoryValueBase,
@@ -1156,21 +1177,54 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
 
 export function assertInventoryTurnoverSourceLimit(rowCount: number, limit: number, source: 'COGS' | 'snapshot'): void {
   if (rowCount <= limit) return
-  throw new Error(`Inventory turnover ${source} scan exceeds ${limit.toLocaleString()} rows. Narrow the date range or filters and retry.`)
+  throw new InventoryTurnoverSourceLimitError(source, rowCount, limit)
+}
+
+export function emptyInventoryTurnoverReportForSourceLimit(filters: InventoryCostingFilters, error: InventoryTurnoverSourceLimitError): InventoryTurnoverReport {
+  const dateFrom = filters.dateFrom ?? daysAgo(90)
+  const dateTo = filters.dateTo ?? today()
+  const window = normalizeVelocityWindow({ dateFrom, dateTo })
+  return {
+    dateFrom,
+    dateTo,
+    generatedAt: new Date().toISOString(),
+    groupBy: isInventoryTurnoverGroupBy(filters.groupBy) ? filters.groupBy : 'product',
+    periodDays: window.days,
+    rows: [],
+    pageInfo: {
+      page: 1,
+      pageSize: filters.pageSize ?? DEFAULT_PAGE_SIZE,
+      totalRows: 0,
+      totalPages: 1,
+      hasNextPage: false,
+      hasPreviousPage: false,
+    },
+    totals: {
+      cogsBase: '0.000000',
+      averageInventoryValueBase: '0.000000',
+      turnoverRatio: null,
+      daysInventoryOutstanding: null,
+      cogsEntryCount: 0,
+      snapshotDayCount: 0,
+    },
+    notices: [error.message],
+  }
 }
 
 export async function getInventoryTurnoverReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<InventoryTurnoverReport> {
+  const client = options.client ?? db
   const dateFrom = filters.dateFrom ?? daysAgo(90)
   const dateTo = filters.dateTo ?? today()
-  const from = parseDateOnly(dateFrom, daysAgo(90))
-  const to = parseDateOnly(dateTo, today(), true)
-  const snapshotFrom = parseDateOnly(dateFrom, daysAgo(90))
-  const snapshotTo = parseDateOnly(dateTo, today())
+  const window = normalizeVelocityWindow({ dateFrom, dateTo })
+  const from = window.dateFrom
+  const to = window.dateTo
+  const snapshotFrom = window.dateFrom
+  const snapshotTo = window.dateTo
   const groupBy = isInventoryTurnoverGroupBy(filters.groupBy) ? filters.groupBy : 'product'
-  const periodDays = periodDayCount(dateFrom, dateTo)
+  const periodDays = window.days
   const productFilter = productWhere(filters)
 
-  const cogsRows: CogsEntryRow[] = await db.cogsEntry.findMany({
+  const cogsRows: CogsEntryRow[] = await client.cogsEntry.findMany({
     where: {
       createdAt: { gte: from, lte: to },
       movement: {
@@ -1206,12 +1260,14 @@ export async function getInventoryTurnoverReport(filters: InventoryCostingFilter
         },
       },
     },
+    // Newest-first keeps the limit probe deterministic; LIMIT + 1 always
+    // rejects before any truncated newest-only sample can be reported.
     orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
     take: INVENTORY_TURNOVER_COGS_SOURCE_ROW_LIMIT + 1,
   })
   assertInventoryTurnoverSourceLimit(cogsRows.length, INVENTORY_TURNOVER_COGS_SOURCE_ROW_LIMIT, 'COGS')
 
-  const snapshotRows: InventoryTurnoverSnapshotRow[] = await db.inventorySnapshot.findMany({
+  const snapshotRows: InventoryTurnoverSnapshotRow[] = await client.inventorySnapshot.findMany({
     where: {
       snapshotDate: { gte: snapshotFrom, lte: snapshotTo },
       ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
@@ -1270,13 +1326,19 @@ export async function getInventoryTurnoverReport(filters: InventoryCostingFilter
     suppliers: supplierMetas(row.product),
   }))
   const allRows = aggregateInventoryTurnoverRows(cogsInputs, snapshotInputs, groupBy, periodDays)
+  const mappedSupplierCogsEntryCount = cogsInputs.filter((row) => groupBy !== 'supplier' || row.suppliers.length > 0).length
+  const missingSupplierCogsEntryCount = groupBy === 'supplier'
+    ? cogsInputs.filter((row) => row.suppliers.length === 0).length
+    : 0
+  const missingSupplierSnapshotRowCount = groupBy === 'supplier'
+    ? snapshotInputs.filter((row) => row.suppliers.length === 0).length
+    : 0
   const totals = allRows.reduce(
     (sum, row) => ({
       cogsBase: sum.cogsBase.add(toDecimal(row.cogsBase)),
       averageInventoryValueBase: sum.averageInventoryValueBase.add(toDecimal(row.averageInventoryValueBase)),
-      cogsEntryCount: sum.cogsEntryCount + row.cogsEntryCount,
     }),
-    { cogsBase: decimalZero(), averageInventoryValueBase: decimalZero(), cogsEntryCount: 0 },
+    { cogsBase: decimalZero(), averageInventoryValueBase: decimalZero() },
   )
   const turnover = calculateInventoryTurnover({
     cogsBase: totals.cogsBase,
@@ -1300,18 +1362,24 @@ export async function getInventoryTurnoverReport(filters: InventoryCostingFilter
       averageInventoryValueBase: moneyString(totals.averageInventoryValueBase),
       turnoverRatio: turnover.turnoverRatio,
       daysInventoryOutstanding: turnover.daysInventoryOutstanding,
-      cogsEntryCount: totals.cogsEntryCount,
-      snapshotDayCount: new Set(snapshotRows.map((row) => dateOnly(row.snapshotDate))).size,
+      cogsEntryCount: mappedSupplierCogsEntryCount,
+      snapshotDayCount: Math.max(0, ...allRows.map((row) => row.snapshotDayCount)),
     },
     notices: [
+      cogsRows.length === 0
+        ? 'No sales-dispatch COGS exists in this period, so turnover is based on zero sales COGS.'
+        : '',
       snapshotRows.length === 0
         ? 'No inventory snapshots exist in this period, so turnover ratios and days-inventory-outstanding are blank.'
         : '',
       allRows.some((row) => row.turnoverRatio == null)
-        ? 'Rows with zero average inventory value show blank turnover ratios to avoid division by zero.'
+        ? 'Rows with zero observed average inventory value show blank turnover ratios to avoid division by zero.'
         : '',
       groupBy === 'supplier' && multiSupplierRows > 0
-        ? 'Supplier grouping attributes products to every linked supplier, so multi-supplier SKUs can appear in more than one supplier group.'
+        ? 'Supplier grouping splits multi-supplier SKU COGS and snapshot value evenly across linked suppliers.'
+        : '',
+      missingSupplierCogsEntryCount > 0 || missingSupplierSnapshotRowCount > 0
+        ? `${missingSupplierCogsEntryCount.toLocaleString()} COGS rows and ${missingSupplierSnapshotRowCount.toLocaleString()} snapshot rows are excluded from supplier grouping because the product has no supplier mapping.`
         : '',
     ].filter(Boolean),
   }

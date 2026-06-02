@@ -6,12 +6,82 @@ import {
   aggregateInventoryTurnoverRows,
   aggregateLandedCostMethods,
   assertInventoryTurnoverSourceLimit,
+  getInventoryTurnoverReport,
   inventoryCostingFiltersFromSearch,
+  InventoryTurnoverSourceLimitError,
   type CogsAggregationInput,
   type InventoryTurnoverCogsAggregationInput,
   type InventoryTurnoverSnapshotAggregationInput,
   type LandedCostAggregationInput,
 } from '@/lib/domain/inventory/inventory-costing-reports'
+
+const turnoverWarehouse = { id: 'warehouse-a', code: 'WHA', name: 'Warehouse A' }
+
+function turnoverProduct(overrides: Partial<{
+  id: string
+  sku: string
+  name: string
+  categoryName: string | null
+  suppliers: Array<{ id: string; name: string }>
+}> = {}) {
+  return {
+    id: overrides.id ?? 'product-a',
+    sku: overrides.sku ?? 'A-001',
+    name: overrides.name ?? 'Widget A',
+    stockUnit: 'pcs',
+    category: overrides.categoryName === undefined ? { name: 'Widgets' } : overrides.categoryName == null ? null : { name: overrides.categoryName },
+    supplierProducts: (overrides.suppliers ?? [{ id: 'supplier-a', name: 'Supplier A' }])
+      .map((supplier) => ({ supplier })),
+  }
+}
+
+function turnoverCogsRow(overrides: Partial<{
+  id: string
+  totalCostBase: string
+  product: ReturnType<typeof turnoverProduct>
+}> = {}) {
+  return {
+    id: overrides.id ?? 'cogs-1',
+    qty: '1',
+    totalCostBase: overrides.totalCostBase ?? '90',
+    createdAt: new Date('2026-05-01T12:00:00.000Z'),
+    movement: {
+      id: `movement-${overrides.id ?? '1'}`,
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      fromWarehouseId: turnoverWarehouse.id,
+      toWarehouseId: null,
+      product: overrides.product ?? turnoverProduct(),
+      fromWarehouse: turnoverWarehouse,
+      toWarehouse: null,
+    },
+  }
+}
+
+function turnoverSnapshotRow(overrides: Partial<{
+  id: string
+  snapshotDate: string
+  valueBase: string
+  product: ReturnType<typeof turnoverProduct>
+}> = {}) {
+  const product = overrides.product ?? turnoverProduct()
+  return {
+    id: overrides.id ?? 'snapshot-1',
+    snapshotDate: new Date(`${overrides.snapshotDate ?? '2026-05-01'}T00:00:00.000Z`),
+    productId: product.id,
+    warehouseId: turnoverWarehouse.id,
+    valueBase: overrides.valueBase ?? '90',
+    product,
+    warehouse: turnoverWarehouse,
+  }
+}
+
+function turnoverClient(cogsRows: unknown[], snapshotRows: unknown[]) {
+  return {
+    cogsEntry: { findMany: async () => cogsRows },
+    inventorySnapshot: { findMany: async () => snapshotRows },
+  } as never
+}
 
 describe('inventory costing report aggregations', () => {
   it('aggregates COGS by product without recalculating cost from movement quantities', () => {
@@ -312,7 +382,7 @@ describe('inventory costing report aggregations', () => {
     assert.equal(row?.snapshotDayCount, 3)
   })
 
-  it('counts sparse inventory snapshot days as zero for turnover averages', () => {
+  it('uses observed inventory snapshot days for turnover averages', () => {
     const cogsRows: InventoryTurnoverCogsAggregationInput[] = [
       {
         id: 'cogs-1',
@@ -345,9 +415,9 @@ describe('inventory costing report aggregations', () => {
 
     const [row] = aggregateInventoryTurnoverRows(cogsRows, snapshotRows, 'product', 2)
 
-    assert.equal(row?.averageInventoryValueBase, '50.000000')
-    assert.equal(row?.turnoverRatio, '2')
-    assert.equal(row?.daysInventoryOutstanding, '1')
+    assert.equal(row?.averageInventoryValueBase, '100.000000')
+    assert.equal(row?.turnoverRatio, '1')
+    assert.equal(row?.daysInventoryOutstanding, '2')
     assert.equal(row?.snapshotDayCount, 1)
   })
 
@@ -374,7 +444,7 @@ describe('inventory costing report aggregations', () => {
     assert.equal(row?.daysInventoryOutstanding, null)
   })
 
-  it('attributes inventory turnover rows to each linked supplier when grouped by supplier', () => {
+  it('splits inventory turnover rows across linked suppliers when grouped by supplier', () => {
     const cogsRows: InventoryTurnoverCogsAggregationInput[] = [
       {
         id: 'cogs-1',
@@ -396,8 +466,8 @@ describe('inventory costing report aggregations', () => {
     const rows = aggregateInventoryTurnoverRows(cogsRows, [], 'supplier', 30)
 
     assert.deepEqual(rows.map((row) => [row.groupKey, row.groupLabel, row.cogsBase]), [
-      ['supplier-a', 'Supplier A', '20.000000'],
-      ['supplier-b', 'Supplier B', '20.000000'],
+      ['supplier-a', 'Supplier A', '10.000000'],
+      ['supplier-b', 'Supplier B', '10.000000'],
     ])
   })
 
@@ -405,7 +475,109 @@ describe('inventory costing report aggregations', () => {
     assert.doesNotThrow(() => assertInventoryTurnoverSourceLimit(100000, 100000, 'COGS'))
     assert.throws(
       () => assertInventoryTurnoverSourceLimit(100001, 100000, 'snapshot'),
-      /Inventory turnover snapshot scan exceeds 100,000 rows/,
+      InventoryTurnoverSourceLimitError,
     )
+  })
+
+  it('inventory turnover report splits multi-supplier values without inflating totals', async () => {
+    const product = turnoverProduct({
+      suppliers: [
+        { id: 'supplier-a', name: 'Supplier A' },
+        { id: 'supplier-b', name: 'Supplier B' },
+        { id: 'supplier-c', name: 'Supplier C' },
+      ],
+    })
+    const report = await getInventoryTurnoverReport(
+      { dateFrom: '2026-05-01', dateTo: '2026-05-01', groupBy: 'supplier' },
+      {
+        paginate: false,
+        client: turnoverClient(
+          [turnoverCogsRow({ totalCostBase: '90', product })],
+          [turnoverSnapshotRow({ valueBase: '90', product })],
+        ),
+      },
+    )
+
+    assert.equal(report.totals.cogsBase, '90.000000')
+    assert.equal(report.totals.averageInventoryValueBase, '90.000000')
+    assert.deepEqual(report.rows.map((row) => [row.groupLabel, row.cogsBase, row.averageInventoryValueBase]), [
+      ['Supplier A', '30.000000', '30.000000'],
+      ['Supplier B', '30.000000', '30.000000'],
+      ['Supplier C', '30.000000', '30.000000'],
+    ])
+    assert.match(report.notices.join('\n'), /splits multi-supplier SKU/)
+  })
+
+  it('inventory turnover report averages over observed snapshot days', async () => {
+    const report = await getInventoryTurnoverReport(
+      { dateFrom: '2026-05-01', dateTo: '2026-07-29', groupBy: 'product' },
+      {
+        paginate: false,
+        client: turnoverClient(
+          [turnoverCogsRow({ totalCostBase: '90' })],
+          Array.from({ length: 30 }, (_, index) => turnoverSnapshotRow({
+            id: `snapshot-${index}`,
+            snapshotDate: `2026-05-${String(index + 1).padStart(2, '0')}`,
+            valueBase: '90',
+          })),
+        ),
+      },
+    )
+
+    assert.equal(report.periodDays, 90)
+    assert.equal(report.rows[0]?.averageInventoryValueBase, '90.000000')
+    assert.equal(report.rows[0]?.snapshotDayCount, 30)
+    assert.equal(report.rows[0]?.turnoverRatio, '1')
+    assert.equal(report.rows[0]?.daysInventoryOutstanding, '90')
+  })
+
+  it('inventory turnover report falls back invalid turnover-only group values to product', async () => {
+    const report = await getInventoryTurnoverReport(
+      { dateFrom: '2026-05-01', dateTo: '2026-05-01', groupBy: 'customer' },
+      {
+        paginate: false,
+        client: turnoverClient(
+          [turnoverCogsRow()],
+          [turnoverSnapshotRow()],
+        ),
+      },
+    )
+
+    assert.equal(report.groupBy, 'product')
+    assert.equal(report.rows[0]?.groupKey, 'product-a')
+  })
+
+  it('inventory turnover report surfaces no-source notices and inclusive period days', async () => {
+    const oneDay = await getInventoryTurnoverReport(
+      { dateFrom: '2026-05-01', dateTo: '2026-05-01' },
+      { paginate: false, client: turnoverClient([], []) },
+    )
+    const thirtyOneDays = await getInventoryTurnoverReport(
+      { dateFrom: '2026-01-01', dateTo: '2026-01-31' },
+      { paginate: false, client: turnoverClient([], []) },
+    )
+
+    assert.equal(oneDay.periodDays, 1)
+    assert.equal(thirtyOneDays.periodDays, 31)
+    assert.match(oneDay.notices.join('\n'), /No sales-dispatch COGS/)
+    assert.match(oneDay.notices.join('\n'), /No inventory snapshots/)
+  })
+
+  it('inventory turnover report excludes supplierless rows from supplier grouping with a notice', async () => {
+    const product = turnoverProduct({ suppliers: [] })
+    const report = await getInventoryTurnoverReport(
+      { dateFrom: '2026-05-01', dateTo: '2026-05-01', groupBy: 'supplier' },
+      {
+        paginate: false,
+        client: turnoverClient(
+          [turnoverCogsRow({ totalCostBase: '40', product })],
+          [turnoverSnapshotRow({ valueBase: '80', product })],
+        ),
+      },
+    )
+
+    assert.equal(report.rows.length, 0)
+    assert.equal(report.totals.cogsBase, '0.000000')
+    assert.match(report.notices.join('\n'), /excluded from supplier grouping/)
   })
 })

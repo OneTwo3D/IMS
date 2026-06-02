@@ -6,6 +6,7 @@ import {
   getInventoryTurnoverReport,
   getInventoryValuationReport,
   getLandedCostReport,
+  InventoryTurnoverSourceLimitError,
   inventoryCostingFiltersFromSearch,
   INVENTORY_COSTING_CSV_ROW_LIMIT,
   type InventoryCostingSearchParams,
@@ -106,13 +107,16 @@ export async function GET(req: NextRequest) {
     }
 
     case 'inventory-turnover': {
-      const report = await getInventoryTurnoverReport(filters, { paginate: false })
+      const report = await getInventoryTurnoverReport(filters, { paginate: false }).catch((error: unknown) => {
+        if (error instanceof InventoryTurnoverSourceLimitError) return error
+        throw error
+      })
+      if (report instanceof InventoryTurnoverSourceLimitError) {
+        return NextResponse.json({ error: report.message }, { status: 413 })
+      }
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)
       if (tooLarge) return tooLarge
       const rows = report.rows.map((row) => ({
-        dateFrom: report.dateFrom,
-        dateTo: report.dateTo,
-        groupBy: report.groupBy,
         groupLabel: row.groupLabel,
         sku: row.sku ?? '',
         categoryName: row.categoryName ?? '',
@@ -124,10 +128,8 @@ export async function GET(req: NextRequest) {
         daysInventoryOutstanding: row.daysInventoryOutstanding ?? '',
         cogsEntryCount: row.cogsEntryCount,
         snapshotDayCount: row.snapshotDayCount,
-        periodDays: report.periodDays,
-        generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['dateFrom', 'dateTo', 'groupBy', 'groupLabel', 'sku', 'categoryName', 'warehouseCode', 'supplierName', 'cogsBase', 'averageInventoryValueBase', 'turnoverRatio', 'daysInventoryOutstanding', 'cogsEntryCount', 'snapshotDayCount', 'periodDays', 'generatedAt'], `inventory-turnover-${date}.csv`)
+      return csvBufferedStreamResponse(rows, ['groupLabel', 'sku', 'categoryName', 'warehouseCode', 'supplierName', 'cogsBase', 'averageInventoryValueBase', 'turnoverRatio', 'daysInventoryOutstanding', 'cogsEntryCount', 'snapshotDayCount'], `inventory-turnover-${date}.csv`)
     }
   }
 }

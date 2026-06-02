@@ -35,7 +35,7 @@ type InventoryCostingReportPageProps<Row> = {
   notices?: string[]
   dateMode: 'as-of' | 'period'
   showGroupBy?: boolean
-  groupByOptions?: Array<{ value: InventoryCostingGroupBy; label: string }>
+  groupByOptions?: ReadonlyArray<{ value: InventoryCostingGroupBy; label: string }>
   showLandedCostMethod?: boolean
   showIncludeZero?: boolean
 }
