@@ -138,6 +138,7 @@ export function StockPositionReportPage<Row>({
           <div className="space-y-1.5">
             <Label htmlFor="warehouseId">Warehouse</Label>
             <StockPositionFilterCombobox
+              key={`warehouse:${filters.warehouseId ?? ''}`}
               id="warehouseId"
               name="warehouseId"
               type="warehouse"
@@ -149,6 +150,7 @@ export function StockPositionReportPage<Row>({
           <div className="space-y-1.5">
             <Label htmlFor="categoryId">Category</Label>
             <StockPositionFilterCombobox
+              key={`category:${filters.categoryId ?? ''}`}
               id="categoryId"
               name="categoryId"
               type="category"
@@ -160,6 +162,7 @@ export function StockPositionReportPage<Row>({
           <div className="space-y-1.5">
             <Label htmlFor="supplierId">Supplier</Label>
             <StockPositionFilterCombobox
+              key={`supplier:${filters.supplierId ?? ''}`}
               id="supplierId"
               name="supplierId"
               type="supplier"

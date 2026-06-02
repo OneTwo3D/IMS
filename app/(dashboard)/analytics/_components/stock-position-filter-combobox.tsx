@@ -9,6 +9,8 @@ import type {
 } from '@/lib/domain/inventory/stock-position-reports'
 import { cn } from '@/lib/utils'
 
+const SEARCH_DEBOUNCE_MS = 250
+
 type StockPositionFilterComboboxProps = {
   id: string
   name: string
@@ -16,12 +18,6 @@ type StockPositionFilterComboboxProps = {
   allLabel: string
   value?: string
   initialOptions: StockPositionFilterOption[]
-}
-
-function optionMatches(option: StockPositionFilterOption, query: string): boolean {
-  const normalized = query.trim().toLowerCase()
-  if (!normalized) return true
-  return option.label.toLowerCase().includes(normalized) || option.description?.toLowerCase().includes(normalized) === true
 }
 
 export function StockPositionFilterCombobox({
@@ -34,7 +30,10 @@ export function StockPositionFilterCombobox({
 }: StockPositionFilterComboboxProps) {
   const listboxId = `${id}-listbox`
   const reactId = useId()
+  const inputRef = useRef<HTMLInputElement | null>(null)
   const blurTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const selectedIdRef = useRef(value ?? '')
+  const highlightedOptionIdRef = useRef<string | null>(null)
   const initialSelected = useMemo(
     () => initialOptions.find((option) => option.id === value) ?? null,
     [initialOptions, value],
@@ -48,40 +47,56 @@ export function StockPositionFilterCombobox({
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
-    setSelected(initialSelected)
-  }, [initialSelected])
-
-  useEffect(() => {
     if (!open) return
-    const controller = new AbortController()
-    const params = new URLSearchParams({ type, q: query })
-    if (selected) params.set('selectedId', selected.id)
-    setLoading(true)
-    setError(null)
-    fetch(`/api/stock-position/filter-options?${params}`, {
-      signal: controller.signal,
-      cache: 'no-store',
-    })
-      .then(async (response) => {
-        if (!response.ok) throw new Error('Could not load options')
-        return await response.json() as StockPositionFilterOptionPage
-      })
-      .then((page) => {
-        setOptions(page.options)
-        setHighlightedIndex(0)
-      })
-      .catch((fetchError: unknown) => {
-        if (fetchError instanceof DOMException && fetchError.name === 'AbortError') return
-        setError(fetchError instanceof Error ? fetchError.message : 'Could not load options')
-      })
-      .finally(() => setLoading(false))
-    return () => controller.abort()
-  }, [open, query, selected, type])
+    let controller: AbortController | null = null
 
-  const visibleOptions = useMemo(
-    () => options.filter((option) => optionMatches(option, query)),
-    [options, query],
-  )
+    const debounce = setTimeout(() => {
+      setLoading(true)
+      setError(null)
+      controller = new AbortController()
+      const params = new URLSearchParams({ type, q: query })
+      if (selectedIdRef.current) params.set('selectedId', selectedIdRef.current)
+      fetch(`/api/stock-position/filter-options?${params}`, {
+        signal: controller.signal,
+        cache: 'no-store',
+      })
+        .then(async (response) => {
+          if (response.status === 401) {
+            window.location.assign(`/login?callbackUrl=${encodeURIComponent(window.location.pathname + window.location.search)}`)
+            return null
+          }
+          if (!response.ok) throw new Error(`Could not load options (HTTP ${response.status})`)
+          return await response.json() as StockPositionFilterOptionPage
+        })
+        .then((page) => {
+          if (!page) return
+          setOptions(page.options)
+          setHighlightedIndex((index) => {
+            const highlightedId = highlightedOptionIdRef.current
+            const anchoredIndex = highlightedId
+              ? page.options.findIndex((option) => option.id === highlightedId)
+              : -1
+            const nextIndex = anchoredIndex >= 0
+              ? anchoredIndex
+              : Math.min(index, Math.max(page.options.length - 1, 0))
+            highlightedOptionIdRef.current = page.options[nextIndex]?.id ?? null
+            return nextIndex
+          })
+        })
+        .catch((fetchError: unknown) => {
+          if (fetchError instanceof DOMException && fetchError.name === 'AbortError') return
+          setError(fetchError instanceof Error ? fetchError.message : 'Could not load options')
+        })
+        .finally(() => setLoading(false))
+    }, SEARCH_DEBOUNCE_MS)
+
+    return () => {
+      clearTimeout(debounce)
+      controller?.abort()
+    }
+  }, [open, query, type])
+
+  const visibleOptions = options
   const displayValue = open ? query : selected?.label ?? ''
   const activeOptionId = open && visibleOptions[highlightedIndex]
     ? `${id}-${reactId}-${visibleOptions[highlightedIndex].id}`
@@ -91,10 +106,12 @@ export function StockPositionFilterCombobox({
     setOpen(false)
     setQuery('')
     setHighlightedIndex(0)
+    setLoading(false)
   }
 
   function selectOption(option: StockPositionFilterOption | null) {
     setSelected(option)
+    selectedIdRef.current = option?.id ?? ''
     close()
   }
 
@@ -102,12 +119,20 @@ export function StockPositionFilterCombobox({
     selectOption(null)
   }
 
+  function openCombobox() {
+    if (blurTimer.current) clearTimeout(blurTimer.current)
+    setQuery(selected?.label ?? '')
+    setOpen(true)
+    requestAnimationFrame(() => inputRef.current?.select())
+  }
+
   return (
     <div className="relative">
-      <input type="hidden" name={name} value={selected?.id ?? ''} />
+      {selected && <input type="hidden" name={name} value={selected.id} />}
       <div className="relative">
         <input
           id={id}
+          ref={inputRef}
           type="text"
           role="combobox"
           aria-autocomplete="list"
@@ -118,10 +143,7 @@ export function StockPositionFilterCombobox({
           value={displayValue}
           placeholder={allLabel}
           className="h-9 w-full rounded-md border border-input bg-background px-2 pr-16 text-sm outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          onFocus={() => {
-            if (blurTimer.current) clearTimeout(blurTimer.current)
-            setOpen(true)
-          }}
+          onFocus={openCombobox}
           onBlur={() => {
             blurTimer.current = setTimeout(close, 120)
           }}
@@ -133,12 +155,20 @@ export function StockPositionFilterCombobox({
             if (event.key === 'ArrowDown') {
               event.preventDefault()
               setOpen(true)
-              setHighlightedIndex((index) => Math.min(index + 1, Math.max(visibleOptions.length - 1, 0)))
+              setHighlightedIndex((index) => {
+                const nextIndex = Math.min(index + 1, Math.max(visibleOptions.length - 1, 0))
+                highlightedOptionIdRef.current = visibleOptions[nextIndex]?.id ?? null
+                return nextIndex
+              })
             } else if (event.key === 'ArrowUp') {
               event.preventDefault()
               setOpen(true)
-              setHighlightedIndex((index) => Math.max(index - 1, 0))
-            } else if (event.key === 'Enter' && open) {
+              setHighlightedIndex((index) => {
+                const nextIndex = Math.max(index - 1, 0)
+                highlightedOptionIdRef.current = visibleOptions[nextIndex]?.id ?? null
+                return nextIndex
+              })
+            } else if (event.key === 'Enter' && open && !loading) {
               event.preventDefault()
               const option = visibleOptions[highlightedIndex]
               if (option) selectOption(option)
@@ -174,12 +204,13 @@ export function StockPositionFilterCombobox({
       </div>
 
       {open && (
-        <div className="absolute z-30 mt-1 max-h-60 w-full overflow-auto rounded-md border bg-popover p-1 text-sm shadow-md">
+        <div className="absolute z-30 mt-1 max-h-60 w-full overflow-auto rounded-md border bg-popover p-1 text-sm shadow-md" aria-busy={loading}>
           <button
             type="button"
             className={cn(
               'flex w-full items-center rounded-sm px-2 py-1.5 text-left hover:bg-muted',
               selected == null && 'bg-muted',
+              loading && 'pointer-events-none opacity-60',
             )}
             onMouseDown={(event) => event.preventDefault()}
             onClick={() => selectOption(null)}
@@ -197,10 +228,16 @@ export function StockPositionFilterCombobox({
                   'cursor-pointer rounded-sm px-2 py-1.5',
                   index === highlightedIndex && 'bg-muted',
                   selected?.id === option.id && 'font-medium',
+                  loading && 'pointer-events-none opacity-60',
                 )}
                 onMouseDown={(event) => event.preventDefault()}
-                onMouseEnter={() => setHighlightedIndex(index)}
-                onClick={() => selectOption(option)}
+                onMouseEnter={() => {
+                  highlightedOptionIdRef.current = option.id
+                  setHighlightedIndex(index)
+                }}
+                onClick={() => {
+                  if (!loading) selectOption(option)
+                }}
               >
                 <span>{option.label}</span>
                 {option.description && option.description !== option.label && (
