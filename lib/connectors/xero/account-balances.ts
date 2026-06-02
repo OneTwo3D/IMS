@@ -56,6 +56,14 @@ type MatchedAccount = {
   name: string
 }
 
+type XeroAccountBalanceSnapshotBuildInput = {
+  accounts: MatchedAccount[]
+  parsedRows: ParsedXeroTrialBalanceRow[]
+  balanceDate: string
+  baseCurrency: string
+  syncRunId?: string | null
+}
+
 function attrValue(cell: XeroReportCell | undefined, ids: string[]): string | null {
   const attrs = cell?.Attributes ?? []
   const wanted = new Set(ids.map((id) => id.toLowerCase()))
@@ -155,6 +163,33 @@ async function getXeroBaseCurrency(): Promise<string | null> {
   }
 }
 
+export function buildXeroAccountBalanceSnapshotInputs(
+  input: XeroAccountBalanceSnapshotBuildInput,
+): { snapshots: AccountingAccountBalanceSnapshotInput[]; errors: string[] } {
+  const snapshots: AccountingAccountBalanceSnapshotInput[] = []
+  const errors: string[] = []
+  for (const account of input.accounts) {
+    const parsed = matchParsedBalance(account, input.parsedRows)
+    if (!parsed) {
+      errors.push(`No Trial Balance row matched configured account ${account.code ?? account.externalAccountId} (${account.name}).`)
+      continue
+    }
+    snapshots.push({
+      connector: XERO_CONNECTOR,
+      externalAccountId: account.externalAccountId,
+      accountCode: account.code,
+      accountName: account.name,
+      balanceDate: input.balanceDate,
+      currency: input.baseCurrency,
+      amountForeign: parsed.amount,
+      amountBase: parsed.amount,
+      sourcePayloadRef: `xero:trial-balance:${input.balanceDate}`,
+      syncRunId: input.syncRunId ?? null,
+    })
+  }
+  return { snapshots, errors }
+}
+
 export async function syncXeroAccountBalanceSnapshots(
   options: SyncXeroAccountBalanceSnapshotsOptions = {},
 ): Promise<{ fetched: number; persisted: number; skipped: number; errors: string[] }> {
@@ -193,28 +228,15 @@ export async function syncXeroAccountBalanceSnapshots(
     select: { externalAccountId: true, code: true, name: true },
   })
   const parsedRows = parseXeroTrialBalanceRows(res.data)
-  const snapshots: AccountingAccountBalanceSnapshotInput[] = []
-  for (const account of accounts) {
-    const parsed = matchParsedBalance(account, parsedRows)
-    if (!parsed) continue
-    snapshots.push({
-      connector: XERO_CONNECTOR,
-      externalAccountId: account.externalAccountId,
-      accountCode: account.code,
-      accountName: account.name,
-      balanceDate,
-      currency: baseCurrency,
-      amountForeign: parsed.amount,
-      amountBase: parsed.amount,
-      sourcePayloadRef: `xero:trial-balance:${balanceDate}`,
-      syncRunId: options.syncRunId ?? null,
-    })
-  }
+  const { snapshots, errors } = buildXeroAccountBalanceSnapshotInputs({
+    accounts,
+    parsedRows,
+    balanceDate,
+    baseCurrency,
+    syncRunId: options.syncRunId ?? null,
+  })
 
   const persisted = await persistAccountingAccountBalanceSnapshots(snapshots)
-  const errors = accounts
-    .filter((account) => !snapshots.some((snapshot) => snapshot.externalAccountId === account.externalAccountId))
-    .map((account) => `No Trial Balance row matched configured account ${account.code ?? account.externalAccountId} (${account.name}).`)
   return {
     fetched: parsedRows.length,
     persisted: persisted.persisted,
