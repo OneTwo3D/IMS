@@ -1,9 +1,15 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
+import { Prisma } from '@/app/generated/prisma/client'
 import { GET, handleInventorySnapshotCron } from '@/app/api/cron/inventory-snapshot/route'
 import { getAllCronJobs } from '@/lib/cron-jobs'
-import { previousUtcDate } from '@/lib/domain/inventory/inventory-snapshot'
+import {
+  previousUtcDate,
+  writeDailyInventorySnapshot,
+  type InventorySnapshotTestClient,
+} from '@/lib/domain/inventory/inventory-snapshot'
+import type { CronRunLog } from '@/lib/ops/cron-run'
 
 type CronEnv = {
   CRON_SECRET?: string
@@ -44,6 +50,10 @@ function cronRequest(authorization?: string): Request {
   return new Request('https://ims.example.com/api/cron/inventory-snapshot', { headers })
 }
 
+function decimal(value: string | number): Prisma.Decimal {
+  return new Prisma.Decimal(value)
+}
+
 test('inventory snapshot cron rejects requests without the cron secret', async () => {
   await withCronEnv({ CRON_SECRET: 'secret-token', NODE_ENV: 'production' }, async () => {
     const response = await GET(cronRequest())
@@ -79,6 +89,8 @@ test('inventory snapshot cron snapshots the previous UTC day', async () => {
           return {
             snapshotDate: snapshotDate.toISOString().slice(0, 10),
             snapshotsWritten: 1,
+            reservationSnapshotsWritten: 1,
+            reservationSnapshotStockLevelCount: 1,
             driftCount: 0,
             driftTruncated: false,
             drift: [],
@@ -90,6 +102,67 @@ test('inventory snapshot cron snapshots the previous UTC day', async () => {
     assert.equal(response.status, 200)
     assert.deepEqual(snapshotDates, ['2026-05-27T00:00:00.000Z'])
     assert.equal((await response.json() as { runId: string }).runId, 'run-inventory-snapshot-test')
+  })
+})
+
+test('inventory snapshot cron logs reservation snapshot counts from the real writer path', async () => {
+  await withCronEnv({ CRON_SECRET: 'secret-token', NODE_ENV: 'production' }, async () => {
+    const logs: CronRunLog[] = []
+    const client: InventorySnapshotTestClient = {
+      stockLevel: {
+        findMany: async () => [
+          { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('5'), reservedQty: decimal('2') },
+        ],
+        findUnique: async () => null,
+      },
+      costLayer: {
+        findMany: async () => [
+          { productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: decimal('5'), unitCostBase: decimal('3') },
+        ],
+      },
+      stockMovement: { findMany: async () => [] },
+      inventorySnapshot: {
+        findMany: async () => [],
+        upsert: async () => ({}),
+      },
+      inventoryReservationSnapshot: {
+        upsert: async () => ({}),
+      },
+      inventoryReservationSnapshotRun: {
+        upsert: async () => ({}),
+      },
+      orderAllocation: { findMany: async () => [] },
+      shipmentLine: { findMany: async () => [] },
+      productionOrder: { findMany: async () => [] },
+      $transaction: async (operations) => Promise.all(operations),
+    }
+    const response = await handleInventorySnapshotCron(
+      cronRequest('Bearer secret-token'),
+      {
+        now: () => new Date('2026-05-28T00:05:00.000Z'),
+        createRunId: () => 'run-inventory-snapshot-real-writer-test',
+        writeLog: async (log) => {
+          logs.push(log)
+        },
+        getMaintenanceResponse: async () => null,
+        writeSnapshot: async (options = {}) => writeDailyInventorySnapshot({
+          ...options,
+          client,
+        }),
+      },
+    )
+
+    assert.equal(response.status, 200)
+    assert.equal(logs.length, 1)
+    assert.deepEqual(logs[0]?.counts, {
+      snapshotsWritten: 1,
+      reservationSnapshotsWritten: 1,
+      reservationSnapshotStockLevelCount: 1,
+      driftCount: 0,
+    })
+    const payload = await response.json() as { reservationSnapshotsWritten: number; reservationSnapshotStockLevelCount: number }
+    assert.equal(payload.reservationSnapshotsWritten, 1)
+    assert.equal(payload.reservationSnapshotStockLevelCount, 1)
   })
 })
 

@@ -40,6 +40,18 @@ function isNegativeDecimalString(value: string): boolean {
   return value.trim().startsWith('-') && !value.startsWith('-0')
 }
 
+function reservationRowsCopy(count: number): string {
+  return count === 1 ? '1 row' : `${count} rows`
+}
+
+function reservationRowsVerb(count: number): string {
+  return count === 1 ? 'is' : 'are'
+}
+
+function reservationSnapshotsCopy(count: number): string {
+  return count === 1 ? 'reservation snapshot' : 'reservation snapshots'
+}
+
 export default async function StockOnHandPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
   await requireStockPositionReportAccess()
   const resolvedSearchParams = await searchParams
@@ -87,7 +99,13 @@ export default async function StockOnHandPage({ searchParams }: { searchParams: 
     },
   ]
   const notices = [
-    'Reserved and available quantities use the current StockLevel reservation state; historical snapshots currently cover on-hand quantity and value only.',
+    report.reservedQtyScope === 'current'
+      ? 'Reserved and available quantities use the current StockLevel reservation state.'
+      : report.reservedQtyScope === 'snapshot'
+        ? `Reserved and available quantities use reservation snapshots from ${report.reservationSnapshotDate}.`
+        : report.reservedQtyScope === 'mixed_snapshot_current_missing'
+          ? `Reservation snapshots cover ${reservationRowsCopy(report.reservationSnapshotCount)} for ${report.reservationSnapshotDate}; ${reservationRowsCopy(report.currentReservationFallbackCount)} fell back to current StockLevel reservations and are marked in the CSV export.`
+          : `${reservationRowsCopy(report.missingReservationSnapshotCount)} ${reservationRowsVerb(report.missingReservationSnapshotCount)} missing ${reservationSnapshotsCopy(report.missingReservationSnapshotCount)} for ${report.reservationSnapshotDate}; those rows use current StockLevel reservations and are marked in the CSV export.`,
     report.valueReplayReliable ? '' : 'This as-of value replay includes movements without value evidence or orphan warehouse movement rows.',
   ].filter(Boolean)
 
