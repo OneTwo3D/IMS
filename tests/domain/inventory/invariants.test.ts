@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
@@ -25,6 +26,8 @@ const CANONICAL_INVENTORY_INVARIANT_CODES = new Set([
   'stock_movement_negative_quantity',
   'stock_movement_value_mismatch',
   'stock_movement_value_partial',
+  'stock_movement_missing_cost_layer',
+  'stock_movement_missing_cogs_entry',
   'shipped_line_missing_cogs_snapshot',
 ])
 
@@ -358,6 +361,7 @@ test('stock movement value fields must reconcile within reporting tolerance', ()
         qty: 2,
         unitCostBase: 5,
         totalValueBase: 11,
+        _count: { cogsEntries: 1 },
         product: {
           id: 'product-1',
           sku: 'VALUE-MISMATCH',
@@ -373,6 +377,7 @@ test('stock movement value fields must reconcile within reporting tolerance', ()
         qty: 2,
         unitCostBase: 5,
         totalValueBase: null,
+        _count: { cogsEntries: 1 },
         product: {
           id: 'product-2',
           sku: 'VALUE-PARTIAL',
@@ -388,6 +393,7 @@ test('stock movement value fields must reconcile within reporting tolerance', ()
         qty: 2,
         unitCostBase: 5,
         totalValueBase: 10,
+        _count: { cogsEntries: 1 },
         product: {
           id: 'product-3',
           sku: 'VALUE-CLEAN',
@@ -402,6 +408,274 @@ test('stock movement value fields must reconcile within reporting tolerance', ()
     'stock_movement_value_mismatch',
     'stock_movement_value_partial',
   ])
+})
+
+test('inbound and outbound stock movements require reporting evidence rows', () => {
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [
+      {
+        id: 'stock-clean-in',
+        productId: 'product-clean-in',
+        warehouseId: 'warehouse-1',
+        quantity: 2,
+        reservedQty: 0,
+        product: {
+          id: 'product-clean-in',
+          sku: 'CLEAN-IN',
+          type: 'SIMPLE',
+          oversellAllowed: false,
+        },
+      },
+    ],
+    costLayers: [
+      {
+        id: 'layer-production-clean',
+        productId: 'product-clean-in',
+        warehouseId: 'warehouse-1',
+        receivedQty: 2,
+        remainingQty: 2,
+        productionOrderId: 'production-clean',
+        product: {
+          id: 'product-clean-in',
+          sku: 'CLEAN-IN',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    stockMovements: [
+      {
+        id: 'movement-missing-layer',
+        type: 'PRODUCTION_IN',
+        productId: 'product-missing-in',
+        fromWarehouseId: null,
+        toWarehouseId: 'warehouse-1',
+        qty: 2,
+        referenceType: 'ProductionOrder',
+        referenceId: 'production-missing',
+        product: {
+          id: 'product-missing-in',
+          sku: 'MISSING-IN',
+          type: 'SIMPLE',
+        },
+      },
+      {
+        id: 'movement-clean-layer',
+        type: 'PRODUCTION_IN',
+        productId: 'product-clean-in',
+        fromWarehouseId: null,
+        toWarehouseId: 'warehouse-1',
+        qty: 2,
+        referenceType: 'ProductionOrder',
+        referenceId: 'production-clean',
+        product: {
+          id: 'product-clean-in',
+          sku: 'CLEAN-IN',
+          type: 'SIMPLE',
+        },
+      },
+      {
+        id: 'movement-missing-cogs',
+        type: 'SALE_DISPATCH',
+        productId: 'product-missing-out',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: 1,
+        referenceType: 'SalesOrder',
+        referenceId: 'order-1',
+        _count: { cogsEntries: 0 },
+        product: {
+          id: 'product-missing-out',
+          sku: 'MISSING-OUT',
+          type: 'SIMPLE',
+        },
+      },
+      {
+        id: 'movement-clean-cogs',
+        type: 'PRODUCTION_OUT',
+        productId: 'product-clean-out',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: 1,
+        referenceType: 'ProductionOrder',
+        referenceId: 'production-clean',
+        _count: { cogsEntries: 1 },
+        product: {
+          id: 'product-clean-out',
+          sku: 'CLEAN-OUT',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    shippedShipmentLines: [],
+  })
+
+  assert.deepEqual(findings.map((finding) => finding.code).sort(), [
+    'stock_movement_missing_cogs_entry',
+    'stock_movement_missing_cost_layer',
+  ])
+})
+
+test('purchase receipt evidence must belong to the referenced purchase order', () => {
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [
+      {
+        id: 'wrong-po-layer',
+        productId: 'product-1',
+        warehouseId: 'warehouse-1',
+        receivedQty: 2,
+        remainingQty: 2,
+        poLineId: 'po-2-line',
+        poLine: { poId: 'po-2' },
+        product: {
+          id: 'product-1',
+          sku: 'PO-LINK',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    stockMovements: [
+      {
+        id: 'movement-po-1',
+        type: 'PURCHASE_RECEIPT',
+        productId: 'product-1',
+        fromWarehouseId: null,
+        toWarehouseId: 'warehouse-1',
+        qty: 2,
+        referenceType: 'PurchaseOrder',
+        referenceId: 'po-1',
+        product: {
+          id: 'product-1',
+          sku: 'PO-LINK',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    shippedShipmentLines: [],
+  })
+
+  assert.equal(findings.some((finding) => finding.code === 'stock_movement_missing_cost_layer'), true)
+})
+
+test('adjustment movements require cost-layer or COGS evidence by direction', () => {
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [
+      {
+        id: 'stock-in',
+        productId: 'product-in',
+        warehouseId: 'warehouse-1',
+        quantity: 2,
+        reservedQty: 0,
+        product: {
+          id: 'product-in',
+          sku: 'ADJ-IN',
+          type: 'SIMPLE',
+          oversellAllowed: false,
+        },
+      },
+    ],
+    costLayers: [
+      {
+        id: 'adjustment-layer',
+        productId: 'product-in',
+        warehouseId: 'warehouse-1',
+        receivedQty: 2.00005,
+        remainingQty: 2,
+        adjustmentMovementId: 'adjustment-in',
+        product: {
+          id: 'product-in',
+          sku: 'ADJ-IN',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    stockMovements: [
+      {
+        id: 'adjustment-in',
+        type: 'ADJUSTMENT',
+        productId: 'product-in',
+        fromWarehouseId: null,
+        toWarehouseId: 'warehouse-1',
+        qty: 2,
+        product: {
+          id: 'product-in',
+          sku: 'ADJ-IN',
+          type: 'SIMPLE',
+        },
+      },
+      {
+        id: 'adjustment-out',
+        type: 'ADJUSTMENT',
+        productId: 'product-out',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: 1,
+        _count: { cogsEntries: 0 },
+        product: {
+          id: 'product-out',
+          sku: 'ADJ-OUT',
+          type: 'SIMPLE',
+        },
+      },
+      {
+        id: 'adjustment-out-clean',
+        type: 'ADJUSTMENT',
+        productId: 'product-out-clean',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: 1,
+        _count: { cogsEntries: 1 },
+        product: {
+          id: 'product-out-clean',
+          sku: 'ADJ-OUT-CLEAN',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    shippedShipmentLines: [],
+  })
+
+  assert.deepEqual(findings.map((finding) => finding.code), ['stock_movement_missing_cogs_entry'])
+})
+
+test('missing COGS count instrumentation fails closed for enforced movement types', () => {
+  const findings = evaluateInventoryInvariantRows({
+    stockLevels: [],
+    costLayers: [],
+    stockMovements: [
+      {
+        id: 'movement-missing-count',
+        type: 'SALE_DISPATCH',
+        productId: 'product-1',
+        fromWarehouseId: 'warehouse-1',
+        toWarehouseId: null,
+        qty: 1,
+        product: {
+          id: 'product-1',
+          sku: 'MISSING-COUNT',
+          type: 'SIMPLE',
+        },
+      },
+    ],
+    shippedShipmentLines: [],
+  })
+
+  assert.equal(findings.some((finding) => finding.code === 'stock_movement_missing_cogs_entry'), true)
+})
+
+test('stock movement reporting guarantee migration locks reviewed trigger clauses', () => {
+  const migration = readFileSync(
+    'prisma/migrations/20260602103000_stock_movement_reporting_guarantees/migration.sql',
+    'utf8',
+  )
+
+  assert.match(migration, /DROP TRIGGER IF EXISTS stock_movements_reporting_evidence_guard/)
+  assert.match(migration, /UPDATE OF type, "productId", "fromWarehouseId", "toWarehouseId"/)
+  assert.match(migration, /ABS\(cl\."receivedQty" - NEW\.qty\) <= 0\.0001/)
+  assert.match(migration, /FROM "purchase_order_lines" pol/)
+  assert.match(migration, /pol\."poId" = NEW\."referenceId"/)
+  assert.match(migration, /cl\."production_order_id" = NEW\."referenceId"/)
+  assert.match(migration, /NEW\.type = 'ADJUSTMENT'/)
 })
 
 test('stock movement value invariant compares against absolute movement quantity', () => {
@@ -448,6 +722,7 @@ test('stock movement value invariant keeps boundary and symmetric partial contra
         qty: 2,
         unitCostBase: 5,
         totalValueBase: 10.01,
+        _count: { cogsEntries: 1 },
         product: {
           id: 'product-1',
           sku: 'VALUE-BOUNDARY',
@@ -463,6 +738,7 @@ test('stock movement value invariant keeps boundary and symmetric partial contra
         qty: 0.01,
         unitCostBase: 0.5,
         totalValueBase: 0.005002,
+        _count: { cogsEntries: 1 },
         product: {
           id: 'product-2',
           sku: 'VALUE-SMALL',
@@ -478,6 +754,7 @@ test('stock movement value invariant keeps boundary and symmetric partial contra
         qty: 2,
         unitCostBase: null,
         totalValueBase: 10,
+        _count: { cogsEntries: 1 },
         product: {
           id: 'product-3',
           sku: 'VALUE-TOTAL-ONLY',
@@ -920,32 +1197,72 @@ test('inventory row collection excludes fully refunded orders from shipped COGS 
       },
     },
   })
-  assert.deepEqual(stockMovementArgs, {
-    where: {
-      OR: [
-        { qty: { lt: 0 } },
-        { unitCostBase: { not: null } },
-        { totalValueBase: { not: null } },
-      ],
+  assert.deepEqual((stockMovementArgs as { select: unknown }).select, {
+    id: true,
+    type: true,
+    productId: true,
+    fromWarehouseId: true,
+    toWarehouseId: true,
+    qty: true,
+    referenceType: true,
+    referenceId: true,
+    unitCostBase: true,
+    totalValueBase: true,
+    _count: {
+      select: {
+        cogsEntries: true,
+      },
     },
-    select: {
-      id: true,
-      type: true,
-      productId: true,
-      fromWarehouseId: true,
-      toWarehouseId: true,
-      qty: true,
-      unitCostBase: true,
-      totalValueBase: true,
-      product: {
-        select: {
-          id: true,
-          sku: true,
-          type: true,
-        },
+    product: {
+      select: {
+        id: true,
+        sku: true,
+        type: true,
       },
     },
   })
+  const stockMovementWhere = (stockMovementArgs as { where: { AND: unknown[] } }).where
+  assert.equal(Array.isArray(stockMovementWhere.AND), true)
+  assert.ok((stockMovementWhere.AND[0] as { createdAt?: { gte?: unknown } }).createdAt?.gte instanceof Date)
+  assert.deepEqual(stockMovementWhere.AND[1], {
+    OR: [
+      { qty: { lt: 0 } },
+      { unitCostBase: { not: null } },
+      { totalValueBase: { not: null } },
+      { type: { in: ['PURCHASE_RECEIPT', 'PRODUCTION_IN', 'SALE_DISPATCH', 'PRODUCTION_OUT', 'ADJUSTMENT'] } },
+    ],
+  })
+})
+
+test('inventory row collection can disable the stock movement lookback for historical audits', async () => {
+  let stockMovementArgs: unknown
+  const client = {
+    stockLevel: {
+      async findMany() {
+        return []
+      },
+    },
+    costLayer: {
+      async findMany() {
+        return []
+      },
+    },
+    stockMovement: {
+      async findMany(args: unknown) {
+        stockMovementArgs = args
+        return []
+      },
+    },
+    shipmentLine: {
+      async findMany() {
+        return []
+      },
+    },
+  }
+
+  await collectInventoryInvariantRows(client, { stockMovementLookbackDays: null })
+
+  assert.deepEqual((stockMovementArgs as { where: { AND: unknown[] } }).where.AND[0], {})
 })
 
 test('inventory SQL collector keeps partially refunded orders eligible for shipped COGS checks', async () => {
@@ -1101,6 +1418,37 @@ test('SQL inventory collector output matches evaluator output for seeded finding
       product: {
         id: 'product-value-partial',
         sku: 'VALUE-PARTIAL',
+        type: 'SIMPLE',
+      },
+    },
+    {
+      id: 'movement-missing-layer',
+      type: 'PURCHASE_RECEIPT',
+      productId: 'product-missing-layer',
+      fromWarehouseId: null,
+      toWarehouseId: 'warehouse-1',
+      qty: 2,
+      referenceType: 'PurchaseOrder',
+      referenceId: 'po-1',
+      product: {
+        id: 'product-missing-layer',
+        sku: 'MISSING-LAYER',
+        type: 'SIMPLE',
+      },
+    },
+    {
+      id: 'movement-missing-cogs',
+      type: 'PRODUCTION_OUT',
+      productId: 'product-missing-cogs',
+      fromWarehouseId: 'warehouse-1',
+      toWarehouseId: null,
+      qty: 2,
+      referenceType: 'ProductionOrder',
+      referenceId: 'production-1',
+      _count: { cogsEntries: 0 },
+      product: {
+        id: 'product-missing-cogs',
+        sku: 'MISSING-COGS',
         type: 'SIMPLE',
       },
     },

@@ -749,6 +749,13 @@ model CogsEntry {
   @@map("cogs_entries")
 }
 
+/// Governed by additional db-native reporting guarantees from migration
+/// 20260602103000_stock_movement_reporting_guarantees:
+/// - value fields must both be null or both populated, and totalValueBase must
+///   equal ROUND(qty * unitCostBase, 6)
+/// - deferred evidence trigger requires inbound receipt/production/adjustment
+///   movements to have cost-layer evidence and outbound dispatch/production/
+///   adjustment movements to have COGS evidence by commit time
 model StockMovement {
   id              String            @id @default(cuid())
   type            StockMovementType

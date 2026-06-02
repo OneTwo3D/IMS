@@ -154,17 +154,17 @@ If `psql` and `prisma migrate deploy` work but `migrate status` or `db pull` rep
 
 The repo now enforces six rules:
 
-1. A PR that changes `prisma/migrations/` must also change `prisma/schema.prisma`.
+1. A PR that changes `prisma/migrations/` must also change `prisma/schema.prisma`, unless every changed `migration.sql` is schema-invisible DB-native SQL with an explicit lowercase SQL line-comment marker: `-- prisma-schema-scope-ok: db-native ...`.
 2. CI deploys migrations into a fresh PostgreSQL instance and fails if the resulting database differs from `prisma/schema.prisma`.
 3. Deployment scripts print the actual drift instead of failing silently.
-4. Hand-written migration SQL is allowed only when reviewed explicitly and mirrored back into `prisma/schema.prisma`.
+4. Hand-written migration SQL is allowed only when reviewed explicitly and mirrored back into `prisma/schema.prisma`; unsupported DB-native features such as triggers and CHECK predicates that Prisma cannot represent must carry the schema-scope marker and drift allowlist rationale.
 5. The PR template includes a schema checklist.
 6. Unsupported database features must be isolated and recorded in `prisma/unsupported-schema-drift-allowlist.json`.
 
 ## Scripts
 
 - `node scripts/check-prisma-schema-scope.mjs <base> <head>`
-  Fails when migration files change without a matching `prisma/schema.prisma` update.
+  Fails when migration files change without a matching `prisma/schema.prisma` update, except for migration SQL that explicitly documents a schema-invisible DB-native change with a lowercase `-- prisma-schema-scope-ok: db-native ...` line-comment marker. Non-SQL notes in migration directories are ignored by this guard.
 
 - `node scripts/check-prisma-drift.mjs`
   Runs `prisma migrate diff` against the configured datasource, suppresses only explicitly allowlisted unsupported differences, and prints the full drift when validation fails.
