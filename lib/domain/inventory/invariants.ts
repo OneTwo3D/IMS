@@ -3,6 +3,10 @@ import { db } from '@/lib/db'
 import { parseCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 // decimal-boundary-ok: report-only (inventory invariant finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
+import {
+  loadReservationSourceRows,
+  type ReservationBreakdownRow,
+} from '@/lib/domain/inventory/reservation-breakdown'
 
 export type InventoryInvariantSeverity = 'info' | 'warning' | 'critical'
 
@@ -118,6 +122,7 @@ export type InventoryInvariantRows = {
   costLayers: InventoryInvariantCostLayerRow[]
   stockMovements: InventoryInvariantStockMovementRow[]
   shippedShipmentLines: InventoryInvariantShipmentLineRow[]
+  reservationSources?: ReservationBreakdownRow[]
 }
 
 export type InventoryInvariantOptions = {
@@ -127,6 +132,7 @@ export type InventoryInvariantOptions = {
 type InventoryInvariantClient = {
   stockLevel: {
     findMany(args: unknown): Promise<InventoryInvariantStockLevelRow[]>
+    findUnique?: (args: unknown) => Promise<unknown>
   }
   costLayer: {
     findMany(args: unknown): Promise<InventoryInvariantCostLayerRow[]>
@@ -136,6 +142,12 @@ type InventoryInvariantClient = {
   }
   shipmentLine: {
     findMany(args: unknown): Promise<InventoryInvariantShipmentLineRow[]>
+  }
+  orderAllocation?: {
+    findMany(args: unknown): Promise<unknown[]>
+  }
+  productionOrder?: {
+    findMany(args: unknown): Promise<unknown[]>
   }
 }
 
@@ -218,6 +230,23 @@ function stockMovementValueDelta(params: {
 
 function quantityKey(productId: string, warehouseId: string): string {
   return `${productId}:${warehouseId}`
+}
+
+function sumReservationSources(
+  sources: ReservationBreakdownRow[],
+): Map<string, { qty: number; sourceCount: number; sampleReferences: string[] }> {
+  const totals = new Map<string, { qty: number; sourceCount: number; sampleReferences: string[] }>()
+  for (const source of sources) {
+    const key = quantityKey(source.productId, source.warehouseId)
+    const current = totals.get(key) ?? { qty: 0, sourceCount: 0, sampleReferences: [] }
+    current.qty += decimalToNumber(source.qty)
+    current.sourceCount += 1
+    if (current.sampleReferences.length < 5) {
+      current.sampleReferences.push(source.referenceLabel)
+    }
+    totals.set(key, current)
+  }
+  return totals
 }
 
 function isSqlInventoryInvariantClient(client: unknown): client is InventoryInvariantSqlClient {
@@ -353,6 +382,54 @@ export function evaluateInventoryInvariantRows(
           quantity,
           reservedQty,
           oversellAllowed: stockLevel.product.oversellAllowed,
+        },
+      })
+    }
+  }
+
+  if (rows.reservationSources) {
+    const reservationTotals = sumReservationSources(rows.reservationSources)
+    for (const stockLevel of rows.stockLevels) {
+      const key = quantityKey(stockLevel.productId, stockLevel.warehouseId)
+      const reservedQty = decimalToNumber(stockLevel.reservedQty)
+      const sourceTotal = reservationTotals.get(key)
+      const knownReservedQty = sourceTotal?.qty ?? 0
+      if (greaterThanWithTolerance(Math.abs(reservedQty - knownReservedQty), 0, tolerance)) {
+        findings.push({
+          severity: 'critical',
+          code: 'stock_reserved_source_mismatch',
+          productId: stockLevel.productId,
+          warehouseId: stockLevel.warehouseId,
+          message: `Reserved quantity does not match known reservation sources for ${stockLevel.product.sku}`,
+          details: {
+            stockLevelId: stockLevel.id,
+            sku: stockLevel.product.sku,
+            reservedQty,
+            knownReservedQty,
+            delta: reservedQty - knownReservedQty,
+            sourceCount: sourceTotal?.sourceCount ?? 0,
+            sampleReferences: sourceTotal?.sampleReferences ?? [],
+          },
+        })
+      }
+      reservationTotals.delete(key)
+    }
+
+    for (const [key, sourceTotal] of reservationTotals) {
+      const [productId, warehouseId] = key.split(':')
+      if (!greaterThanWithTolerance(Math.abs(sourceTotal.qty), 0, tolerance)) continue
+      findings.push({
+        severity: 'critical',
+        code: 'stock_reserved_source_mismatch',
+        productId,
+        warehouseId,
+        message: 'Known reservation sources exist without a matching stock level',
+        details: {
+          reservedQty: 0,
+          knownReservedQty: sourceTotal.qty,
+          delta: -sourceTotal.qty,
+          sourceCount: sourceTotal.sourceCount,
+          sampleReferences: sourceTotal.sampleReferences,
         },
       })
     }
@@ -580,7 +657,7 @@ export function evaluateInventoryInvariantRows(
 export async function collectInventoryInvariantRows(
   client: InventoryInvariantClient = db as unknown as InventoryInvariantClient,
 ): Promise<InventoryInvariantRows> {
-  const [stockLevels, costLayers, stockMovements, shippedShipmentLines] = await Promise.all([
+  const [stockLevels, costLayers, stockMovements, shippedShipmentLines, reservationSources] = await Promise.all([
     client.stockLevel.findMany({
       select: {
         id: true,
@@ -672,9 +749,12 @@ export async function collectInventoryInvariantRows(
         },
       },
     }),
+    client.orderAllocation && client.productionOrder && client.stockLevel.findUnique
+      ? loadReservationSourceRows(client as unknown as Parameters<typeof loadReservationSourceRows>[0])
+      : Promise.resolve(undefined),
   ])
 
-  return { stockLevels, costLayers, stockMovements, shippedShipmentLines }
+  return { stockLevels, costLayers, stockMovements, shippedShipmentLines, reservationSources }
 }
 
 function sqlFifoProductTypes(): Prisma.Sql {
@@ -735,6 +815,42 @@ function sqlOptionalStockMovementLookbackFilter(days: number | null | undefined)
   return Prisma.sql`AND sm."createdAt" >= NOW() - (${normalizedDays}::int * INTERVAL '1 day')`
 }
 
+function sqlOptionalAllocationProductFilter(productId: string | undefined): Prisma.Sql {
+  return productId ? Prisma.sql`AND oa."productId" = ${productId}` : Prisma.empty
+}
+
+function sqlOptionalAllocationWarehouseFilter(warehouseId: string | undefined): Prisma.Sql {
+  return warehouseId ? Prisma.sql`AND oa."warehouseId" = ${warehouseId}` : Prisma.empty
+}
+
+function sqlOptionalShipmentLineProductFilter(productId: string | undefined): Prisma.Sql {
+  return productId ? Prisma.sql`AND sl."productId" = ${productId}` : Prisma.empty
+}
+
+function sqlOptionalShipmentWarehouseFilter(warehouseId: string | undefined): Prisma.Sql {
+  return warehouseId ? Prisma.sql`AND s."warehouseId" = ${warehouseId}` : Prisma.empty
+}
+
+function sqlOptionalProductionWarehouseFilter(warehouseId: string | undefined): Prisma.Sql {
+  return warehouseId ? Prisma.sql`AND po."warehouseId" = ${warehouseId}` : Prisma.empty
+}
+
+function sqlOptionalProductionAssemblyProductFilter(productId: string | undefined): Prisma.Sql {
+  return productId ? Prisma.sql`AND pc."componentId" = ${productId}` : Prisma.empty
+}
+
+function sqlOptionalProductionDisassemblyProductFilter(productId: string | undefined): Prisma.Sql {
+  return productId ? Prisma.sql`AND po."outputProductId" = ${productId}` : Prisma.empty
+}
+
+function sqlOptionalReservationProductFilter(productId: string | undefined): Prisma.Sql {
+  return productId ? Prisma.sql`AND COALESCE(sl."productId", rt."productId") = ${productId}` : Prisma.empty
+}
+
+function sqlOptionalReservationWarehouseFilter(warehouseId: string | undefined): Prisma.Sql {
+  return warehouseId ? Prisma.sql`AND COALESCE(sl."warehouseId", rt."warehouseId") = ${warehouseId}` : Prisma.empty
+}
+
 function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvariantSqlCollectorOptions, 'quantityTolerance'>> & InventoryInvariantSqlCollectorOptions): Prisma.Sql {
   const limit = normalizeSqlQueryLimit(options.limit)
   const tolerance = options.quantityTolerance
@@ -750,6 +866,15 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
   const stockMovementLookbackFilter = sqlOptionalStockMovementLookbackFilter(options.stockMovementLookbackDays)
   const shipmentProductFilter = sqlOptionalProductFilter('sl', options.productId)
   const shipmentWarehouseFilter = sqlOptionalWarehouseFilter('s', options.warehouseId)
+  const allocationProductFilter = sqlOptionalAllocationProductFilter(options.productId)
+  const allocationWarehouseFilter = sqlOptionalAllocationWarehouseFilter(options.warehouseId)
+  const activeShipmentProductFilter = sqlOptionalShipmentLineProductFilter(options.productId)
+  const activeShipmentWarehouseFilter = sqlOptionalShipmentWarehouseFilter(options.warehouseId)
+  const productionWarehouseFilter = sqlOptionalProductionWarehouseFilter(options.warehouseId)
+  const productionAssemblyProductFilter = sqlOptionalProductionAssemblyProductFilter(options.productId)
+  const productionDisassemblyProductFilter = sqlOptionalProductionDisassemblyProductFilter(options.productId)
+  const reservationProductFilter = sqlOptionalReservationProductFilter(options.productId)
+  const reservationWarehouseFilter = sqlOptionalReservationWarehouseFilter(options.warehouseId)
   const severityFilter = sqlSeverityFilter(options.severity)
   const cursorFilter = sqlCursorFilter(options.cursor)
 
@@ -781,6 +906,78 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       WHERE p.type::text IN (${sqlFifoProductTypes()})
         ${stockProductFilter}
         ${stockWarehouseFilter}
+    ),
+    active_shipment_lines AS (
+      SELECT
+        sl."lineId",
+        sl."productId",
+        s."warehouseId",
+        SUM(sl.qty) AS qty
+      FROM "shipment_lines" sl
+      INNER JOIN "shipments" s ON s.id = sl."shipmentId"
+      INNER JOIN "sales_orders" so ON so.id = s."orderId"
+      WHERE s.status <> 'PENDING'
+        AND so.status NOT IN ('CANCELLED', 'REFUNDED')
+        ${activeShipmentProductFilter}
+        ${activeShipmentWarehouseFilter}
+      GROUP BY sl."lineId", sl."productId", s."warehouseId"
+    ),
+    reservation_sources AS (
+      SELECT
+        oa."productId",
+        oa."warehouseId",
+        SUM(GREATEST(oa.qty - COALESCE(asl.qty, 0), 0)) AS qty
+      FROM "order_allocations" oa
+      INNER JOIN "sales_orders" so ON so.id = oa."orderId"
+      LEFT JOIN active_shipment_lines asl
+        ON asl."lineId" = oa."lineId"
+       AND asl."productId" = oa."productId"
+       AND asl."warehouseId" = oa."warehouseId"
+      WHERE oa.qty > 0
+        AND so.status NOT IN ('CANCELLED', 'REFUNDED')
+        ${allocationProductFilter}
+        ${allocationWarehouseFilter}
+      GROUP BY oa."productId", oa."warehouseId"
+      HAVING SUM(GREATEST(oa.qty - COALESCE(asl.qty, 0), 0)) > ${tolerance}
+
+      UNION ALL
+
+      SELECT
+        pc."componentId" AS "productId",
+        po."warehouseId",
+        SUM(po."qtyPlanned" * pc.qty) AS qty
+      FROM "production_orders" po
+      INNER JOIN "products" output_product ON output_product.id = po."outputProductId"
+      INNER JOIN "product_components" pc ON pc."productId" = output_product.id
+      WHERE po.status = 'IN_PROGRESS'
+        AND po."orderType" = 'ASSEMBLY'
+        ${productionWarehouseFilter}
+        ${productionAssemblyProductFilter}
+      GROUP BY pc."componentId", po."warehouseId"
+      HAVING SUM(po."qtyPlanned" * pc.qty) > ${tolerance}
+
+      UNION ALL
+
+      SELECT
+        po."outputProductId" AS "productId",
+        po."warehouseId",
+        SUM(po."qtyPlanned") AS qty
+      FROM "production_orders" po
+      WHERE po.status = 'IN_PROGRESS'
+        AND po."orderType" = 'DISASSEMBLY'
+        ${productionWarehouseFilter}
+        ${productionDisassemblyProductFilter}
+      GROUP BY po."outputProductId", po."warehouseId"
+      HAVING SUM(po."qtyPlanned") > ${tolerance}
+    ),
+    reservation_totals AS (
+      SELECT
+        "productId",
+        "warehouseId",
+        SUM(qty) AS "knownReservedQty",
+        COUNT(*) AS "sourceCount"
+      FROM reservation_sources
+      GROUP BY "productId", "warehouseId"
     ),
     findings AS (
       SELECT
@@ -844,6 +1041,35 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
         AND sl."reservedQty" - sl.quantity > ${tolerance}
         ${stockProductFilter}
         ${stockWarehouseFilter}
+
+      UNION ALL
+
+      SELECT
+        'stock_reserved_source_mismatch:' || COALESCE(sl."productId", rt."productId") || ':' || COALESCE(sl."warehouseId", rt."warehouseId") AS "sortKey",
+        'critical'::text AS severity,
+        'stock_reserved_source_mismatch'::text AS code,
+        COALESCE(sl."productId", rt."productId") AS "productId",
+        COALESCE(sl."warehouseId", rt."warehouseId") AS "warehouseId",
+        CASE
+          WHEN sl.id IS NULL THEN 'Known reservation sources exist without a matching stock level for ' || p.sku
+          ELSE 'Reserved quantity does not match known reservation sources for ' || p.sku
+        END AS message,
+        jsonb_build_object(
+          'stockLevelId', sl.id,
+          'sku', p.sku,
+          'reservedQty', COALESCE(sl."reservedQty", 0),
+          'knownReservedQty', COALESCE(rt."knownReservedQty", 0),
+          'delta', COALESCE(sl."reservedQty", 0) - COALESCE(rt."knownReservedQty", 0),
+          'sourceCount', COALESCE(rt."sourceCount", 0)
+        ) AS details
+      FROM "stock_levels" sl
+      FULL OUTER JOIN reservation_totals rt
+        ON rt."productId" = sl."productId"
+       AND rt."warehouseId" = sl."warehouseId"
+      INNER JOIN "products" p ON p.id = COALESCE(sl."productId", rt."productId")
+      WHERE ABS(COALESCE(sl."reservedQty", 0) - COALESCE(rt."knownReservedQty", 0)) > ${tolerance}
+        ${reservationProductFilter}
+        ${reservationWarehouseFilter}
 
       UNION ALL
 
