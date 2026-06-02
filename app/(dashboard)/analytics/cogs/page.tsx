@@ -79,6 +79,8 @@ export default async function CogsPage({ searchParams }: { searchParams: Promise
       columns={columns}
       summary={[
         { label: `COGS (${currency})`, value: formatMoneyCode(Number(report.totals.cogsBase), currency) },
+        { label: `GL COGS (${currency})`, value: report.totals.glBalanceBase == null ? 'Not captured' : formatMoneyCode(Number(report.totals.glBalanceBase), currency) },
+        { label: 'GL variance', value: report.totals.glVarianceBase == null ? 'Not captured' : formatMoneyCode(Number(report.totals.glVarianceBase), currency) },
         { label: `Revenue (${currency})`, value: formatMoneyCode(Number(report.totals.revenueBase), currency) },
         { label: `Gross margin (${currency})`, value: formatMoneyCode(Number(report.totals.grossMarginBase), currency) },
         { label: 'Revenue matched rows', value: `${report.totals.revenueCapturedRows}/${report.pageInfo.totalRows}` },

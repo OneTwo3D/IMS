@@ -1,12 +1,13 @@
 'use server'
 
-import { requireFreshPermission, requirePermission } from '@/lib/auth/server'
+import { requireFreshPermission, requirePermission, requireRole } from '@/lib/auth/server'
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getAuthorizationUrl, disconnect, isConnected } from '@/lib/connectors/xero'
 import { syncChartOfAccounts, getXeroTaxRates } from '@/lib/connectors/xero'
+import { syncXeroAccountBalanceSnapshots } from '@/lib/connectors/xero/account-balances'
 import { processPendingXeroSync } from '@/lib/connectors/xero'
 import { getXeroSettings, XERO_SETTING_KEYS, type XeroSettings } from '@/lib/connectors/xero/settings'
 import { getPublicAppUrl } from '@/lib/public-app-url'
@@ -255,6 +256,29 @@ export async function syncAccountingAccounts(): Promise<{ synced: number; errors
   })
 
   revalidatePath('/sync')
+  return result
+}
+
+export async function syncAccountingAccountBalanceSnapshots(balanceDate?: string): Promise<{ fetched: number; persisted: number; skipped: number; errors: string[] }> {
+  await requireRole('ADMIN', 'FINANCE')
+  const result = await syncXeroAccountBalanceSnapshots({ balanceDate })
+  const hasErrors = result.errors.length > 0
+  const hasSkipped = result.skipped > 0
+
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: 'accounting_account_balance_snapshots_synced',
+    tag: 'sync',
+    level: hasErrors ? 'ERROR' : hasSkipped ? 'WARNING' : 'INFO',
+    description: hasErrors
+      ? `Synced ${result.persisted} account balance snapshots from Xero with ${result.errors.length} error(s)`
+      : `Synced ${result.persisted} account balance snapshots from Xero`,
+    metadata: { balanceDate: balanceDate ?? null, ...result },
+  })
+
+  revalidatePath('/sync')
+  revalidatePath('/analytics/inventory-valuation')
+  revalidatePath('/analytics/cogs')
   return result
 }
 

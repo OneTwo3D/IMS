@@ -1,8 +1,18 @@
 import { LandedCostMethod, Prisma } from '@/app/generated/prisma/client'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
+import {
+  calculateAccountBalanceVarianceBase,
+  DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS,
+  findLatestAccountBalanceSnapshot,
+  getAccountBalancePeriodMovement,
+} from '@/lib/domain/accounting/account-balance-snapshots'
 import { getOnHandAsOf, type OnHandAsOfRow } from '@/lib/domain/inventory/get-on-hand-as-of'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { getXeroSettings } from '@/lib/connectors/xero/settings'
+import { getIntegrationPluginState } from '@/lib/integration-plugins'
+import { cache } from 'react'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -117,6 +127,8 @@ export type CogsReport = {
     revenueBase: string
     grossMarginBase: string
     revenueCapturedRows: number
+    glBalanceBase: string | null
+    glVarianceBase: string | null
   }
   notices: string[]
 }
@@ -343,6 +355,121 @@ function productWhere(filters: InventoryCostingFilters): ProductWhere {
 
 function supplierNames(product: ProductMeta): string[] {
   return product.supplierProducts.map((entry) => entry.supplier.name).sort((a, b) => a.localeCompare(b))
+}
+
+const loadConfiguredAccountingContext = cache(async (): Promise<{ connector: 'xero' | null; baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> => {
+  const [baseCurrency, settings, plugins] = await Promise.all([getBaseCurrencyCode(), getXeroSettings(), getIntegrationPluginState()])
+  return {
+    connector: plugins.xero ? 'xero' : null,
+    baseCurrency,
+    inventoryAccountCode: settings.xero_inventory_account.trim() || null,
+    cogsAccountCode: settings.xero_cogs_account.trim() || null,
+  }
+})
+
+function hasInventoryValuationGlScope(filters: InventoryCostingFilters): boolean {
+  return !filters.warehouseId &&
+    !filters.categoryId &&
+    !filters.supplierId &&
+    !filters.product?.trim() &&
+    !filters.includeZero
+}
+
+function hasCogsGlScope(filters: InventoryCostingFilters): boolean {
+  return !filters.warehouseId &&
+    !filters.categoryId &&
+    !filters.supplierId &&
+    !filters.product?.trim()
+}
+
+async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal, filters: InventoryCostingFilters): Promise<{ glBalanceBase: Decimal | null; glVarianceBase: Decimal | null; notices: string[] }> {
+  if (!hasInventoryValuationGlScope(filters)) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: ['GL variance is account-level and is shown only for unfiltered inventory valuation totals.'],
+    }
+  }
+  const context = await loadConfiguredAccountingContext()
+  if (!context.connector) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: ['Xero is not enabled, so GL inventory variance is blank.'],
+    }
+  }
+  if (!context.inventoryAccountCode) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: ['No Xero inventory asset account is configured, so GL variance is blank.'],
+    }
+  }
+  const snapshot = await findLatestAccountBalanceSnapshot({
+    connector: context.connector,
+    accountCode: context.inventoryAccountCode,
+    balanceDate: asOf,
+    currency: context.baseCurrency,
+  })
+  if (!snapshot) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: [`No stored GL balance snapshot exists for inventory asset account ${context.inventoryAccountCode} on or before ${asOf}, so GL variance is blank.`],
+    }
+  }
+  return {
+    glBalanceBase: snapshot.amountBase,
+    glVarianceBase: calculateAccountBalanceVarianceBase(totalValueBase, snapshot.amountBase),
+    notices: [],
+  }
+}
+
+async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBase: Decimal, filters: InventoryCostingFilters): Promise<{ glBalanceBase: Decimal | null; glVarianceBase: Decimal | null; notices: string[] }> {
+  if (!hasCogsGlScope(filters)) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: ['GL COGS variance is account-level and is shown only for unfiltered COGS totals.'],
+    }
+  }
+  const context = await loadConfiguredAccountingContext()
+  if (!context.connector) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: ['Xero is not enabled, so GL COGS variance is blank.'],
+    }
+  }
+  if (!context.cogsAccountCode) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: ['No Xero COGS account is configured, so GL COGS variance is blank.'],
+    }
+  }
+  const movement = await getAccountBalancePeriodMovement({
+    connector: context.connector,
+    accountCode: context.cogsAccountCode,
+    dateFrom,
+    dateTo,
+    currency: context.baseCurrency,
+  })
+  if (!movement) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: [`No fresh opening and closing GL balance snapshots exist for COGS account ${context.cogsAccountCode} across ${dateFrom} to ${dateTo}. Opening snapshots must be within ${DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS} days before the period start, so GL COGS variance is blank.`],
+    }
+  }
+  const notices = movement.movementBase.lt(0)
+    ? ['GL COGS movement is negative. This can be caused by period-end reclassification, year-end close, or refunds; investigate before relying on the variance.']
+    : []
+  return {
+    glBalanceBase: movement.movementBase,
+    glVarianceBase: calculateAccountBalanceVarianceBase(cogsBase, movement.movementBase),
+    notices,
+  }
 }
 
 function cogsGroupKey(input: CogsAggregationInput, groupBy: CogsGroupBy): string {
@@ -591,6 +718,7 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
     }),
     { qty: decimalZero(), totalValueBase: decimalZero() },
   )
+  const gl = await inventoryGlBalanceForDate(snapshot.asOf, totals.totalValueBase, filters)
   const paged = paginate(allRows, filters, options)
   return {
     asOf: snapshot.asOf,
@@ -605,11 +733,11 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
     totals: {
       qty: decimalString(totals.qty, 4),
       totalValueBase: moneyString(totals.totalValueBase),
-      glBalanceBase: null,
-      glVarianceBase: null,
+      glBalanceBase: gl.glBalanceBase ? moneyString(gl.glBalanceBase) : null,
+      glVarianceBase: gl.glVarianceBase ? moneyString(gl.glVarianceBase) : null,
     },
     notices: [
-      'GL stock-account balance is not stored as an IMS balance row yet, so variance columns are explicit blanks rather than inferred values.',
+      ...gl.notices,
       snapshot.valueReplayReliable ? '' : 'This as-of valuation includes movements without value evidence or orphan warehouse movement rows.',
     ].filter(Boolean),
   }
@@ -748,6 +876,7 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
     }),
     { qty: decimalZero(), cogsBase: decimalZero(), revenueBase: decimalZero(), grossMarginBase: decimalZero(), revenueCapturedRows: 0 },
   )
+  const gl = await cogsGlMovementForPeriod(dateFrom, dateTo, totals.cogsBase, filters)
   const paged = paginate(allRows, filters, options)
   return {
     dateFrom,
@@ -762,8 +891,11 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
       revenueBase: moneyString(totals.revenueBase),
       grossMarginBase: moneyString(totals.grossMarginBase),
       revenueCapturedRows: totals.revenueCapturedRows,
+      glBalanceBase: gl.glBalanceBase ? moneyString(gl.glBalanceBase) : null,
+      glVarianceBase: gl.glVarianceBase ? moneyString(gl.glVarianceBase) : null,
     },
     notices: [
+      ...gl.notices,
       allRows.some((row) => !row.revenueCaptured)
         ? 'Revenue and margin are shown only where COGS movement references can be matched to a sales order line for the same product.'
         : '',

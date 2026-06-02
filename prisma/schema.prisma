@@ -1663,6 +1663,28 @@ model AccountingAccount {
   @@map("accounting_accounts")
 }
 
+model AccountingAccountBalanceSnapshot {
+  id                String   @id @default(cuid())
+  connector         String   @default("xero")
+  externalAccountId String
+  accountCode       String?
+  accountName       String
+  balanceDate       DateTime @db.Date
+  currency          String
+  amountForeign     Decimal  @db.Decimal(18, 6)
+  amountBase        Decimal  @db.Decimal(18, 6)
+  sourcePayloadRef  String?
+  syncRunId         String?
+  fetchedAt         DateTime @default(now())
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @default(now()) @updatedAt
+
+  @@unique([connector, externalAccountId, balanceDate, currency], map: "accounting_account_balance_snapshots_connector_externalAcco_key")
+  @@index([connector, accountCode, balanceDate], map: "accounting_account_balance_snapshots_connector_accountCode__idx")
+  @@index([connector, balanceDate])
+  @@map("accounting_account_balance_snapshots")
+}
+
 model AccountingSyncLog {
   id                    String               @id @default(cuid())
   connector             String               @default("xero")
