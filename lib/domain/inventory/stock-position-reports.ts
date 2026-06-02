@@ -12,6 +12,9 @@ import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
+export const STOCK_POSITION_FILTER_OPTION_LIMIT = 25
+export const STOCK_POSITION_FILTER_OPTION_MAX_LIMIT = 50
+export const STOCK_POSITION_FILTER_QUERY_MAX_LENGTH = 100
 const DEFAULT_NEGATIVE_STOCK_LOOKBACK_DAYS = 90
 const NEGATIVE_STOCK_MOVEMENT_PAGE_SIZE = 10000
 const ZERO = new Prisma.Decimal(0)
@@ -71,11 +74,40 @@ export type StockPositionFilters = {
   pageSize?: number
 }
 
+export type StockPositionFilterOption = {
+  id: string
+  label: string
+  description?: string
+}
+
+export type StockPositionFilterOptionType = 'warehouse' | 'category' | 'supplier'
+
+export type StockPositionFilterOptionPage = {
+  options: StockPositionFilterOption[]
+  hasMore: boolean
+  limit: number
+  selectedHydrated: boolean
+}
+
 export type StockPositionFilterOptions = {
-  warehouses: Array<{ id: string; code: string; name: string }>
-  categories: Array<{ id: string; name: string }>
-  suppliers: Array<{ id: string; name: string }>
+  warehouses: StockPositionFilterOption[]
+  categories: StockPositionFilterOption[]
+  suppliers: StockPositionFilterOption[]
   productTypes: ProductType[]
+}
+
+export type StockPositionFilterOptionInputs = {
+  selectedWarehouseId?: string
+  selectedCategoryId?: string
+  selectedSupplierId?: string
+  limit?: number
+}
+
+export type StockPositionFilterOptionSearch = {
+  type: StockPositionFilterOptionType
+  query?: string
+  selectedId?: string
+  limit?: number
 }
 
 export type PageInfo = {
@@ -255,6 +287,38 @@ function clampPageSize(value: unknown): number {
   return Math.min(Math.max(parsed, MIN_PAGE_SIZE), MAX_PAGE_SIZE)
 }
 
+function clampFilterOptionLimit(value: unknown): number {
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed) || parsed <= 0) return STOCK_POSITION_FILTER_OPTION_LIMIT
+  return Math.min(parsed, STOCK_POSITION_FILTER_OPTION_MAX_LIMIT)
+}
+
+function normalizeFilterOptionQuery(value: string | undefined): string | undefined {
+  const query = value
+    ?.normalize('NFC')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, STOCK_POSITION_FILTER_QUERY_MAX_LENGTH)
+  return query || undefined
+}
+
+export function normalizeStockPositionFilterOptionId(value: string | undefined | null): string | undefined {
+  const id = value?.trim()
+  if (!id || id.length > 100) return undefined
+  return /^[A-Za-z0-9_-]+$/.test(id) ? id : undefined
+}
+
+export function stockPositionSelectedFilterOptionInputs(
+  filters: Pick<StockPositionFilters, 'warehouseId' | 'categoryId' | 'supplierId'>,
+): StockPositionFilterOptionInputs {
+  return {
+    selectedWarehouseId: filters.warehouseId,
+    selectedCategoryId: filters.categoryId,
+    selectedSupplierId: filters.supplierId,
+  }
+}
+
 function pageInfo(totalRows: number, page: number, pageSize: number): PageInfo {
   const totalPages = Math.max(1, Math.ceil(totalRows / pageSize))
   const safePage = Math.min(Math.max(1, page), totalPages)
@@ -328,33 +392,211 @@ function keepProduct(product: ProductMeta | undefined, filters: StockPositionFil
   return true
 }
 
-async function loadFilterOptions(client: StockPositionReportClient = db as StockPositionReportClient): Promise<StockPositionFilterOptions> {
+function warehouseOption(row: { id: string; code: string; name: string; active?: boolean }): StockPositionFilterOption {
+  const label = `${row.code} - ${row.name}`
+  return {
+    id: row.id,
+    label: row.active === false ? `${label} (inactive)` : label,
+    description: row.code,
+  }
+}
+
+function namedOption(row: { id: string; name: string; active?: boolean }): StockPositionFilterOption {
+  return {
+    id: row.id,
+    label: row.active === false ? `${row.name} (inactive)` : row.name,
+  }
+}
+
+function mergeSelectedOption(
+  options: StockPositionFilterOption[],
+  selected: StockPositionFilterOption | null,
+  limit = STOCK_POSITION_FILTER_OPTION_LIMIT,
+): { options: StockPositionFilterOption[]; selectedHydrated: boolean } {
+  if (!selected || options.some((option) => option.id === selected.id)) {
+    return { options: options.slice(0, limit), selectedHydrated: false }
+  }
+  return { options: [selected, ...options].slice(0, limit), selectedHydrated: true }
+}
+
+async function findSelectedWarehouseOption(
+  client: StockPositionReportClient,
+  selectedId: string | undefined,
+): Promise<StockPositionFilterOption | null> {
+  const id = normalizeStockPositionFilterOptionId(selectedId)
+  if (!id) return null
+  const rows = await client.warehouse.findMany({
+    where: { id },
+    select: { id: true, code: true, name: true, active: true },
+    take: 1,
+  }) as Array<{ id: string; code: string; name: string; active?: boolean }>
+  return rows[0] ? warehouseOption(rows[0]) : null
+}
+
+async function findSelectedNamedOption(
+  delegate: FindManyDelegate,
+  selectedId: string | undefined,
+  selectActive = false,
+): Promise<StockPositionFilterOption | null> {
+  const id = normalizeStockPositionFilterOptionId(selectedId)
+  if (!id) return null
+  const rows = await delegate.findMany({
+    where: { id },
+    select: selectActive ? { id: true, name: true, active: true } : { id: true, name: true },
+    take: 1,
+  }) as Array<{ id: string; name: string; active?: boolean }>
+  return rows[0] ? namedOption(rows[0]) : null
+}
+
+async function loadWarehouseFilterOptions(input: {
+  client: StockPositionReportClient
+  query?: string
+  selectedId?: string
+  limit?: number
+}): Promise<StockPositionFilterOptionPage> {
+  const limit = clampFilterOptionLimit(input.limit)
+  const query = normalizeFilterOptionQuery(input.query)
+  const [rows, selected] = await Promise.all([
+    input.client.warehouse.findMany({
+      where: {
+        active: true,
+        ...(query
+          ? {
+              OR: [
+                { code: { contains: query, mode: 'insensitive' } },
+                { name: { contains: query, mode: 'insensitive' } },
+              ],
+            }
+          : {}),
+      },
+      select: { id: true, code: true, name: true, active: true },
+      orderBy: [{ code: 'asc' }, { name: 'asc' }],
+      take: limit + 1,
+    }) as Promise<Array<{ id: string; code: string; name: string; active?: boolean }>>,
+    findSelectedWarehouseOption(input.client, input.selectedId),
+  ])
+  const merged = mergeSelectedOption(rows.slice(0, limit).map(warehouseOption), selected, limit)
+  return {
+    options: merged.options,
+    hasMore: rows.length > limit,
+    limit,
+    selectedHydrated: merged.selectedHydrated,
+  }
+}
+
+async function loadNamedFilterOptions(input: {
+  delegate: FindManyDelegate
+  query?: string
+  selectedId?: string
+  limit?: number
+  activeOnly?: boolean
+}): Promise<StockPositionFilterOptionPage> {
+  const limit = clampFilterOptionLimit(input.limit)
+  const query = normalizeFilterOptionQuery(input.query)
+  const [rows, selected] = await Promise.all([
+    input.delegate.findMany({
+      where: {
+        ...(input.activeOnly ? { active: true } : {}),
+        ...(query ? { name: { contains: query, mode: 'insensitive' } } : {}),
+      },
+      select: { id: true, name: true },
+      orderBy: { name: 'asc' },
+      take: limit + 1,
+    }) as Promise<Array<{ id: string; name: string }>>,
+    findSelectedNamedOption(input.delegate, input.selectedId, input.activeOnly),
+  ])
+  const merged = mergeSelectedOption(rows.slice(0, limit).map(namedOption), selected, limit)
+  return {
+    options: merged.options,
+    hasMore: rows.length > limit,
+    limit,
+    selectedHydrated: merged.selectedHydrated,
+  }
+}
+
+async function loadFilterOptions(
+  input: StockPositionFilterOptionInputs = {},
+  client: StockPositionReportClient = db as StockPositionReportClient,
+): Promise<StockPositionFilterOptions> {
   const [warehouses, categories, suppliers] = await Promise.all([
-    client.warehouse.findMany({
-      where: { active: true },
-      select: { id: true, code: true, name: true },
-      orderBy: { code: 'asc' },
+    loadWarehouseFilterOptions({
+      client,
+      selectedId: input.selectedWarehouseId,
+      limit: input.limit,
     }),
-    client.productCategory.findMany({
-      select: { id: true, name: true },
-      orderBy: { name: 'asc' },
+    loadNamedFilterOptions({
+      delegate: client.productCategory,
+      selectedId: input.selectedCategoryId,
+      limit: input.limit,
+      // ProductCategory has no active flag in Prisma; archived-category
+      // filtering is intentionally asymmetric with Supplier/Warehouse.
     }),
-    client.supplier.findMany({
-      where: { active: true },
-      select: { id: true, name: true },
-      orderBy: { name: 'asc' },
+    loadNamedFilterOptions({
+      delegate: client.supplier,
+      selectedId: input.selectedSupplierId,
+      limit: input.limit,
+      activeOnly: true,
     }),
   ])
 
   return {
-    warehouses: warehouses as WarehouseMeta[],
-    categories: categories as Array<{ id: string; name: string }>,
-    suppliers: suppliers as Array<{ id: string; name: string }>,
+    warehouses: warehouses.options,
+    categories: categories.options,
+    suppliers: suppliers.options,
     productTypes: [...PRODUCT_TYPES],
   }
 }
 
-const getCachedFilterOptions = cache(() => loadFilterOptions(db as StockPositionReportClient))
+export async function getStockPositionFilterOptionPage(
+  input: StockPositionFilterOptionSearch,
+  deps: StockPositionReportDeps = {},
+): Promise<StockPositionFilterOptionPage> {
+  const client = deps.client ?? db as StockPositionReportClient
+  switch (input.type) {
+    case 'warehouse':
+      return loadWarehouseFilterOptions({
+        client,
+        query: input.query,
+        selectedId: input.selectedId,
+        limit: input.limit,
+      })
+    case 'category':
+      return loadNamedFilterOptions({
+        delegate: client.productCategory,
+        query: input.query,
+        selectedId: input.selectedId,
+        limit: input.limit,
+      })
+    case 'supplier':
+      return loadNamedFilterOptions({
+        delegate: client.supplier,
+        query: input.query,
+        selectedId: input.selectedId,
+        limit: input.limit,
+        activeOnly: true,
+      })
+  }
+}
+
+const getCachedFilterOptions = cache(() => loadFilterOptions({}, db as StockPositionReportClient))
+
+async function hydrateSelectedFilterOptions(
+  options: StockPositionFilterOptions,
+  input: StockPositionFilterOptionInputs,
+  client: StockPositionReportClient,
+): Promise<StockPositionFilterOptions> {
+  const [warehouse, category, supplier] = await Promise.all([
+    findSelectedWarehouseOption(client, input.selectedWarehouseId),
+    findSelectedNamedOption(client.productCategory, input.selectedCategoryId),
+    findSelectedNamedOption(client.supplier, input.selectedSupplierId, true),
+  ])
+  return {
+    ...options,
+    warehouses: mergeSelectedOption(options.warehouses, warehouse).options,
+    categories: mergeSelectedOption(options.categories, category).options,
+    suppliers: mergeSelectedOption(options.suppliers, supplier).options,
+  }
+}
 
 async function loadProductMeta(productIds: string[], filters: StockPositionFilters = {}, client: StockPositionReportClient = db as StockPositionReportClient): Promise<Map<string, ProductMeta>> {
   if (productIds.length === 0) return new Map()
@@ -525,8 +767,19 @@ function ageBucket(expectedDate: string | null, now = new Date()): string {
   return 'due_31_plus'
 }
 
-export async function getStockPositionFilterOptions(deps: StockPositionReportDeps = {}): Promise<StockPositionFilterOptions> {
-  return deps.client ? loadFilterOptions(deps.client) : getCachedFilterOptions()
+export async function getStockPositionFilterOptions(
+  input: StockPositionFilterOptionInputs = {},
+  deps: StockPositionReportDeps = {},
+): Promise<StockPositionFilterOptions> {
+  if (deps.client) return loadFilterOptions(input, deps.client)
+  if (input.limit && clampFilterOptionLimit(input.limit) !== STOCK_POSITION_FILTER_OPTION_LIMIT) {
+    return loadFilterOptions(input, db as StockPositionReportClient)
+  }
+  const options = await getCachedFilterOptions()
+  const hasSelection = Boolean(input.selectedWarehouseId || input.selectedCategoryId || input.selectedSupplierId)
+  return hasSelection
+    ? hydrateSelectedFilterOptions(options, input, db as StockPositionReportClient)
+    : options
 }
 
 export async function getStockOnHandReport(

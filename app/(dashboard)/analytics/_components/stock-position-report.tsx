@@ -8,6 +8,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import type { ProductType } from '@/app/generated/prisma/client'
 import type { PageInfo, StockPositionFilterOptions } from '@/lib/domain/inventory/stock-position-reports'
 import { cn } from '@/lib/utils'
+import { StockPositionFilterCombobox } from './stock-position-filter-combobox'
 
 export type StockPositionColumn<Row> = {
   key: string
@@ -136,30 +137,39 @@ export function StockPositionReportPage<Row>({
           )}
           <div className="space-y-1.5">
             <Label htmlFor="warehouseId">Warehouse</Label>
-            <select id="warehouseId" name="warehouseId" defaultValue={filters.warehouseId ?? ''} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
-              <option value="">All warehouses</option>
-              {filterOptions.warehouses.map((warehouse) => (
-                <option key={warehouse.id} value={warehouse.id}>{warehouse.code} - {warehouse.name}</option>
-              ))}
-            </select>
+            <StockPositionFilterCombobox
+              key={`warehouse:${filters.warehouseId ?? ''}`}
+              id="warehouseId"
+              name="warehouseId"
+              type="warehouse"
+              allLabel="All warehouses"
+              value={filters.warehouseId}
+              initialOptions={filterOptions.warehouses}
+            />
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="categoryId">Category</Label>
-            <select id="categoryId" name="categoryId" defaultValue={filters.categoryId ?? ''} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
-              <option value="">All categories</option>
-              {filterOptions.categories.map((category) => (
-                <option key={category.id} value={category.id}>{category.name}</option>
-              ))}
-            </select>
+            <StockPositionFilterCombobox
+              key={`category:${filters.categoryId ?? ''}`}
+              id="categoryId"
+              name="categoryId"
+              type="category"
+              allLabel="All categories"
+              value={filters.categoryId}
+              initialOptions={filterOptions.categories}
+            />
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="supplierId">Supplier</Label>
-            <select id="supplierId" name="supplierId" defaultValue={filters.supplierId ?? ''} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
-              <option value="">All suppliers</option>
-              {filterOptions.suppliers.map((supplier) => (
-                <option key={supplier.id} value={supplier.id}>{supplier.name}</option>
-              ))}
-            </select>
+            <StockPositionFilterCombobox
+              key={`supplier:${filters.supplierId ?? ''}`}
+              id="supplierId"
+              name="supplierId"
+              type="supplier"
+              allLabel="All suppliers"
+              value={filters.supplierId}
+              initialOptions={filterOptions.suppliers}
+            />
           </div>
           <div className="space-y-1.5">
             <Label htmlFor="productType">Type</Label>

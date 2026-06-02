@@ -3,6 +3,7 @@ import Link from 'next/link'
 import {
   getStockAllocationReport,
   getStockPositionFilterOptions,
+  stockPositionSelectedFilterOptionInputs,
   type StockAllocationReportRow,
   type StockPositionFilters,
 } from '@/lib/domain/inventory/stock-position-reports'
@@ -52,7 +53,7 @@ export default async function StockAllocationsPage({ searchParams }: { searchPar
   const filters = filtersFromSearch(resolvedSearchParams)
   const [report, filterOptions] = await Promise.all([
     getStockAllocationReport(filters),
-    getStockPositionFilterOptions(),
+    getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),
   ])
   const filtersForUi: StockPositionFilterValues = {
     warehouseId: filters.warehouseId,

@@ -2,9 +2,14 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
+  getStockPositionFilterOptionPage,
+  getStockPositionFilterOptions,
   getNegativeStockReport,
   getStockAllocationReport,
   getStockOnHandReport,
+  STOCK_POSITION_FILTER_OPTION_LIMIT,
+  STOCK_POSITION_FILTER_OPTION_MAX_LIMIT,
+  STOCK_POSITION_FILTER_QUERY_MAX_LENGTH,
   type StockPositionReportClient,
 } from '@/lib/domain/inventory/stock-position-reports'
 
@@ -516,4 +521,184 @@ test('negative stock report replays movements from an as-of opening balance and 
   assert.equal(report.rows.find((row) => row.productId === 'product-1')?.minimumQty, '-9')
   assert.equal(report.rows.find((row) => row.productId === 'product-2')?.status, 'currently_negative')
   assert.equal(report.rows.find((row) => row.productId === 'product-2')?.minimumQty, '-1')
+})
+
+test('stock-position filter options are bounded and hydrate selected values', async () => {
+  const warehouseQueries: unknown[] = []
+  const warehouses = Array.from({ length: STOCK_POSITION_FILTER_OPTION_LIMIT + 3 }, (_, index) => ({
+    id: `warehouse-${index + 1}`,
+    code: `WH${String(index + 1).padStart(2, '0')}`,
+    name: `Warehouse ${index + 1}`,
+  }))
+  const selectedWarehouse = { id: 'warehouse-selected', code: 'WHS', name: 'Selected warehouse', active: false }
+  const client = makeClient({
+    warehouse: {
+      findMany: async (args) => {
+        warehouseQueries.push(args)
+        const query = args as { where?: { id?: string }; take?: number }
+        if (query.where?.id === selectedWarehouse.id) return [selectedWarehouse]
+        return warehouses.slice(0, query.take)
+      },
+    },
+    productCategory: {
+      findMany: async () => [],
+    },
+    supplier: {
+      findMany: async () => [],
+    },
+  })
+
+  const options = await getStockPositionFilterOptions(
+    { selectedWarehouseId: selectedWarehouse.id },
+    { client },
+  )
+
+  assert.equal(options.warehouses.length, STOCK_POSITION_FILTER_OPTION_LIMIT)
+  assert.deepEqual(options.warehouses[0], {
+    id: selectedWarehouse.id,
+    label: 'WHS - Selected warehouse (inactive)',
+    description: 'WHS',
+  })
+  assert.equal(
+    (warehouseQueries[0] as { take: number }).take,
+    STOCK_POSITION_FILTER_OPTION_LIMIT + 1,
+  )
+  assert.ok(!options.warehouses.some((option) => option.id === 'warehouse-27'))
+})
+
+test('stock-position option search returns empty bounded pages', async () => {
+  const client = makeClient({
+    productCategory: {
+      findMany: async (args) => {
+        const query = args as { where?: { name?: { contains?: string } }; take?: number }
+        assert.equal(query.where?.name?.contains, 'missing')
+        assert.equal(query.take, STOCK_POSITION_FILTER_OPTION_LIMIT + 1)
+        return []
+      },
+    },
+  })
+
+  const page = await getStockPositionFilterOptionPage(
+    { type: 'category', query: 'missing' },
+    { client },
+  )
+
+  assert.deepEqual(page, {
+    options: [],
+    hasMore: false,
+    limit: STOCK_POSITION_FILTER_OPTION_LIMIT,
+    selectedHydrated: false,
+  })
+})
+
+test('stock-position supplier option search is active-only but selected hydration can render inactive rows', async () => {
+  const supplierQueries: unknown[] = []
+  const client = makeClient({
+    supplier: {
+      findMany: async (args) => {
+        supplierQueries.push(args)
+        const query = args as { where?: { id?: string; active?: boolean }; take?: number }
+        if (query.where?.id === 'supplier-inactive') return [{ id: 'supplier-inactive', name: 'Inactive Supplier', active: false }]
+        assert.equal(query.where?.active, true)
+        return [{ id: 'supplier-active', name: 'Active Supplier', active: true }]
+      },
+    },
+  })
+
+  const page = await getStockPositionFilterOptionPage(
+    { type: 'supplier', query: 'supplier', selectedId: 'supplier-inactive' },
+    { client },
+  )
+
+  assert.deepEqual(page.options, [
+    { id: 'supplier-inactive', label: 'Inactive Supplier (inactive)' },
+    { id: 'supplier-active', label: 'Active Supplier' },
+  ])
+  assert.equal(page.selectedHydrated, true)
+  assert.equal((supplierQueries[0] as { where: { active?: boolean } }).where.active, true)
+  assert.deepEqual((supplierQueries[1] as { where: { id?: string } }).where, { id: 'supplier-inactive' })
+})
+
+test('stock-position option pages clamp limits and report hasMore', async () => {
+  const warehouseQueries: unknown[] = []
+  const client = makeClient({
+    warehouse: {
+      findMany: async (args) => {
+        warehouseQueries.push(args)
+        const query = args as { take?: number }
+        return Array.from({ length: query.take ?? 0 }, (_, index) => ({
+          id: `warehouse-${index + 1}`,
+          code: `WH${index + 1}`,
+          name: `Warehouse ${index + 1}`,
+          active: true,
+        }))
+      },
+    },
+  })
+
+  const maxPage = await getStockPositionFilterOptionPage(
+    { type: 'warehouse', limit: 99999 },
+    { client },
+  )
+  const defaultPage = await getStockPositionFilterOptionPage(
+    { type: 'warehouse', limit: 0 },
+    { client },
+  )
+  const negativePage = await getStockPositionFilterOptionPage(
+    { type: 'warehouse', limit: -1 },
+    { client },
+  )
+
+  assert.equal(maxPage.limit, STOCK_POSITION_FILTER_OPTION_MAX_LIMIT)
+  assert.equal(maxPage.options.length, STOCK_POSITION_FILTER_OPTION_MAX_LIMIT)
+  assert.equal(maxPage.hasMore, true)
+  assert.equal((warehouseQueries[0] as { take: number }).take, STOCK_POSITION_FILTER_OPTION_MAX_LIMIT + 1)
+  assert.equal(defaultPage.limit, STOCK_POSITION_FILTER_OPTION_LIMIT)
+  assert.equal(negativePage.limit, STOCK_POSITION_FILTER_OPTION_LIMIT)
+})
+
+test('stock-position selected hydration dedupes rows already in the current page', async () => {
+  const client = makeClient({
+    warehouse: {
+      findMany: async (args) => {
+        const query = args as { where?: { id?: string }; take?: number }
+        const selected = { id: 'warehouse-1', code: 'WH1', name: 'Warehouse 1', active: true }
+        if (query.where?.id === selected.id) return [selected]
+        return [
+          selected,
+          { id: 'warehouse-2', code: 'WH2', name: 'Warehouse 2', active: true },
+        ]
+      },
+    },
+  })
+
+  const page = await getStockPositionFilterOptionPage(
+    { type: 'warehouse', selectedId: 'warehouse-1' },
+    { client },
+  )
+
+  assert.equal(page.selectedHydrated, false)
+  assert.deepEqual(page.options.map((option) => option.id), ['warehouse-1', 'warehouse-2'])
+})
+
+test('stock-position option queries are capped before Prisma contains filters', async () => {
+  const client = makeClient({
+    warehouse: {
+      findMany: async (args) => {
+        const query = args as { where?: { OR?: Array<{ code?: { contains?: string }; name?: { contains?: string } }> } }
+        const codeQuery = query.where?.OR?.[0]?.code?.contains
+        const nameQuery = query.where?.OR?.[1]?.name?.contains
+        assert.equal(codeQuery?.length, STOCK_POSITION_FILTER_QUERY_MAX_LENGTH)
+        assert.equal(nameQuery?.length, STOCK_POSITION_FILTER_QUERY_MAX_LENGTH)
+        return []
+      },
+    },
+  })
+
+  const page = await getStockPositionFilterOptionPage(
+    { type: 'warehouse', query: 'x'.repeat(STOCK_POSITION_FILTER_QUERY_MAX_LENGTH + 50) },
+    { client },
+  )
+
+  assert.equal(page.hasMore, false)
 })
