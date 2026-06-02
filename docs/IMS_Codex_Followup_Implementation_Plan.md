@@ -1748,6 +1748,119 @@ Run npm run validate.
 
 ---
 
+## PR 9.4 — Historical reservation snapshots for true as-of availability
+
+### Problem
+
+PR #101 stock-position reports can show historical on-hand quantity and value through `getOnHandAsOf`, but reserved and available quantities are still enriched from current `StockLevel.reservedQty`. That is correct for the current data model, but it means an as-of stock-on-hand report is not a true historical availability report.
+
+### Implementation
+
+Add a reservation snapshot model or extend the daily inventory snapshot pipeline with reservation evidence per product/warehouse.
+
+Capture enough data to reconstruct:
+
+```text
+reservedQty
+availableQty
+reservation source counts or reconciliation evidence
+snapshotDate
+productId
+warehouseId
+```
+
+Update stock-position reports so:
+
+```text
+- current reports still use live StockLevel data.
+- as-of reports use reservation snapshots when available.
+- missing reservation snapshots are surfaced explicitly, not silently mixed with historical on-hand values.
+- CSV exports indicate whether reservation values came from current state or a reservation snapshot.
+```
+
+### Acceptance criteria
+
+```text
+- Historical stock-on-hand can represent true as-of reserved and available quantities when reservation snapshots exist.
+- Reports do not silently mix historical on-hand quantity with current reserved quantity without a notice.
+- Snapshot writes are idempotent for a given UTC day.
+- Tests cover current mode, as-of-with-snapshot mode, and as-of-without-reservation-snapshot mode.
+```
+
+### Codex prompt
+
+```text
+Implement PR 9.4.
+
+Base branch: development.
+
+Add historical reservation snapshots for product/warehouse reserved quantities so stock-on-hand as-of reports can show true as-of reserved and available values.
+Keep current-state reporting unchanged for current dates.
+Surface missing reservation snapshot evidence explicitly in the report and CSV export.
+Add idempotency and report-mode tests.
+Run npm run validate and npm run validate:db.
+```
+
+---
+
+## PR 9.5 — Scalable stock-position report filters
+
+### Problem
+
+PR #101 uses native `<select>` controls for warehouse, category, supplier, and product type filters. This is acceptable for small tenants, but warehouses/categories/suppliers can grow large enough that native selects become hard to scan and inflate page payloads.
+
+### Implementation
+
+Replace the warehouse/category/supplier stock-position filter controls with searchable combobox/autocomplete controls backed by bounded server-side option queries.
+
+Keep:
+
+```text
+productType
+pageSize
+date controls
+includeZero
+```
+
+as simple controls unless scale requires otherwise.
+
+Support:
+
+```text
+query text
+selected id hydration
+active-only filtering where applicable
+bounded result count
+request-scoped or short-lived caching
+keyboard navigation
+empty/loading/error states
+```
+
+### Acceptance criteria
+
+```text
+- Stock-position filter option payloads are bounded.
+- Existing selected warehouse/category/supplier values render even when not in the first option page.
+- Keyboard and screen-reader behavior are covered by component tests or focused Playwright coverage.
+- The CSV/report URL contract remains unchanged.
+- No report business logic changes.
+```
+
+### Codex prompt
+
+```text
+Implement PR 9.5.
+
+Base branch: development.
+
+Replace stock-position warehouse/category/supplier native selects with scalable searchable combobox filters backed by bounded server-side option queries.
+Preserve the existing query-string contract and report behavior.
+Add tests for selected-value hydration, empty results, and keyboard navigation.
+Run npm run validate and relevant Playwright coverage.
+```
+
+---
+
 # Stage 10 — Upload and file-storage hardening
 
 ## Goal
