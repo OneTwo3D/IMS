@@ -3,11 +3,11 @@ import { requireApiAuth } from '@/lib/auth/server'
 import { csvBufferedStreamResponse } from '@/lib/csv'
 import {
   getCogsReport,
-  getInventoryCostingExportRowCount,
   getInventoryValuationReport,
   getLandedCostReport,
   inventoryCostingFiltersFromSearch,
   INVENTORY_COSTING_CSV_ROW_LIMIT,
+  type InventoryCostingSearchParams,
   type InventoryCostingReportType,
 } from '@/lib/domain/inventory/inventory-costing-reports'
 import { inventoryCostingApiAccessDenied } from '@/lib/security/inventory-costing-access'
@@ -23,18 +23,13 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: 'Unknown inventory-costing export type' }, { status: 400 })
   }
   const date = new Date().toISOString().slice(0, 10)
-  const filters = inventoryCostingFiltersFromSearch(Object.fromEntries(req.nextUrl.searchParams.entries()))
-  const rowCount = await getInventoryCostingExportRowCount(type, filters)
-  if (rowCount > INVENTORY_COSTING_CSV_ROW_LIMIT) {
-    return NextResponse.json(
-      { error: `Inventory costing CSV exports are capped at ${INVENTORY_COSTING_CSV_ROW_LIMIT.toLocaleString()} rows. Narrow the filters and retry.` },
-      { status: 413 },
-    )
-  }
+  const filters = inventoryCostingFiltersFromSearch(searchParamsForFilters(req.nextUrl.searchParams))
 
   switch (type) {
     case 'inventory-valuation': {
-      const report = await getInventoryValuationReport({ ...filters, page: 1, pageSize: INVENTORY_COSTING_CSV_ROW_LIMIT })
+      const report = await getInventoryValuationReport(filters, { paginate: false })
+      const tooLarge = exportTooLarge(report.pageInfo.totalRows)
+      if (tooLarge) return tooLarge
       const rows = report.rows.map((row) => ({
         asOf: report.asOf,
         sku: row.sku,
@@ -57,7 +52,9 @@ export async function GET(req: NextRequest) {
     }
 
     case 'cogs': {
-      const report = await getCogsReport({ ...filters, page: 1, pageSize: INVENTORY_COSTING_CSV_ROW_LIMIT })
+      const report = await getCogsReport(filters, { paginate: false })
+      const tooLarge = exportTooLarge(report.pageInfo.totalRows)
+      if (tooLarge) return tooLarge
       const rows = report.rows.map((row) => ({
         dateFrom: report.dateFrom,
         dateTo: report.dateTo,
@@ -81,7 +78,9 @@ export async function GET(req: NextRequest) {
     }
 
     case 'landed-cost': {
-      const report = await getLandedCostReport({ ...filters, page: 1, pageSize: INVENTORY_COSTING_CSV_ROW_LIMIT })
+      const report = await getLandedCostReport(filters, { paginate: false })
+      const tooLarge = exportTooLarge(report.pageInfo.totalRows)
+      if (tooLarge) return tooLarge
       const rows = report.rows.map((row) => ({
         dateFrom: report.dateFrom,
         dateTo: report.dateTo,
@@ -109,4 +108,23 @@ export async function GET(req: NextRequest) {
 
 function isInventoryCostingReportType(value: string): value is InventoryCostingReportType {
   return value === 'inventory-valuation' || value === 'cogs' || value === 'landed-cost'
+}
+
+function searchParamsForFilters(searchParams: URLSearchParams): InventoryCostingSearchParams {
+  const params: InventoryCostingSearchParams = {}
+  for (const [key, value] of searchParams.entries()) {
+    const existing = params[key]
+    if (existing == null) params[key] = value
+    else if (Array.isArray(existing)) existing.push(value)
+    else params[key] = [existing, value]
+  }
+  return params
+}
+
+function exportTooLarge(rowCount: number): NextResponse | null {
+  if (rowCount <= INVENTORY_COSTING_CSV_ROW_LIMIT) return null
+  return NextResponse.json(
+    { error: `Inventory costing CSV exports are capped at ${INVENTORY_COSTING_CSV_ROW_LIMIT.toLocaleString()} rows. Narrow the filters and retry.` },
+    { status: 413 },
+  )
 }

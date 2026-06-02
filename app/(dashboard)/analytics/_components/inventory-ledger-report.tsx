@@ -7,6 +7,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import type { PageInfo, StockPositionFilterOptions } from '@/lib/domain/inventory/stock-position-reports'
+import { COMBOBOX_THRESHOLD } from '@/lib/ui/select-policy'
 import { cn } from '@/lib/utils'
 import { StockPositionFilterCombobox } from './stock-position-filter-combobox'
 import { appendParams, currentParams, toneClass, type SummaryTone } from './report-utils'
@@ -130,13 +131,14 @@ export function InventoryLedgerReportPage<Row>({
           {showMovementType && (
             <div className="space-y-1.5">
               <Label htmlFor="movementType">Movement type</Label>
-              {/* Native select is intentional for enum filters below the searchable-control threshold of 20 options. */}
+              {/* Native select is intentional for enum filters below COMBOBOX_THRESHOLD options. */}
               <select id="movementType" name="type" defaultValue={filters.type ?? ''} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
                 <option value="">All movement types</option>
                 {Object.values(StockMovementType).map((type) => (
                   <option key={type} value={type}>{type}</option>
                 ))}
               </select>
+              <p className="sr-only">Searchable controls start at {COMBOBOX_THRESHOLD + 1} options.</p>
             </div>
           )}
           {statuses.length > 0 && (

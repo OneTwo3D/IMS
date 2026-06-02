@@ -76,6 +76,7 @@ export default async function InventoryValuationPage({ searchParams }: { searchP
       ]}
       notices={report.notices}
       dateMode="as-of"
+      showIncludeZero
     />
   )
 }

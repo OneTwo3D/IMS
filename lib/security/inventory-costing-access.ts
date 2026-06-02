@@ -10,6 +10,9 @@ export function canAccessInventoryCostingReports(role: string): boolean {
 export async function requireInventoryCostingReportAccess(): Promise<AuthSession> {
   const session = await requireAuth()
   if (!canAccessInventoryCostingReports(session.user.role)) {
+    // Keep report-page RBAC behavior aligned with inventory-ledger reports:
+    // authenticated users without the report permission return to dashboard,
+    // while API/export callers receive a 403 below.
     redirect('/dashboard')
   }
   return session

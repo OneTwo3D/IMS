@@ -8,6 +8,9 @@ const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
 const INVENTORY_COSTING_EXPORT_ROW_LIMIT = 100000
+const SOURCE_SCAN_PAGE_SIZE = 1000
+const NEAR_ZERO_LANDED_GOODS_UNIT_COST_BASE = '0.01'
+const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/
 
 const COGS_GROUPS = ['product', 'category', 'warehouse', 'customer', 'channel'] as const
 const LANDED_COST_METHODS = new Set(Object.values(LandedCostMethod))
@@ -25,6 +28,7 @@ export type InventoryCostingFilters = {
   categoryId?: string
   supplierId?: string
   product?: string
+  includeZero?: boolean
   groupBy?: CogsGroupBy
   landedCostMethod?: LandedCostMethod
   page?: number
@@ -39,6 +43,7 @@ export type InventoryCostingFilterUiValues = {
   categoryId?: string
   supplierId?: string
   product?: string
+  includeZero?: boolean
   groupBy?: string
   landedCostMethod?: string
   pageSize?: string
@@ -193,6 +198,22 @@ type SalesOrderRevenueRow = {
   lines: Array<{ productId: string | null; totalBase: DecimalInput }>
 }
 
+type LandedCostLineRow = {
+  id: string
+  qty: DecimalInput
+  unitCostBase: DecimalInput
+  landedUnitCostBase: DecimalInput
+  product: ProductMeta
+  po: {
+    id: string
+    reference: string
+    status: string
+    createdAt: Date
+    landedCostMethod: LandedCostMethod
+    supplier: { name: string }
+  }
+}
+
 type RevenueKey = {
   orderId: string
   productId: string
@@ -211,6 +232,7 @@ export type CogsAggregationInput = {
   warehouseName: string | null
   customerName: string | null
   channel: string | null
+  revenueKey?: string | null
   revenueBase: DecimalInput | null
 }
 
@@ -222,6 +244,9 @@ export type LandedCostAggregationInput = {
 }
 
 type ProductWhere = Prisma.ProductWhereInput
+type ReportOptions = {
+  paginate?: boolean
+}
 
 function pageInfo(totalRows: number, page: number, pageSize: number): PageInfo {
   const totalPages = Math.max(1, Math.ceil(totalRows / pageSize))
@@ -249,6 +274,20 @@ function oneSearchParam(value: string | string[] | undefined): string | undefine
   return Array.isArray(value) ? value[0] : value
 }
 
+function isValidDateOnly(value: string | undefined): value is string {
+  if (!value || !DATE_ONLY_RE.test(value)) return false
+  const [year, month, day] = value.split('-').map(Number)
+  const parsed = new Date(Date.UTC(year!, month! - 1, day!))
+  return parsed.getUTCFullYear() === year &&
+    parsed.getUTCMonth() === month! - 1 &&
+    parsed.getUTCDate() === day
+}
+
+function dateSearchParam(value: string | string[] | undefined): string | undefined {
+  const param = oneSearchParam(value)
+  return isValidDateOnly(param) ? param : undefined
+}
+
 function today(): string {
   return new Date().toISOString().slice(0, 10)
 }
@@ -260,7 +299,7 @@ function daysAgo(days: number): string {
 }
 
 function parseDateOnly(value: string | undefined, fallback: string, endOfDay = false): Date {
-  const source = value && /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : fallback
+  const source = isValidDateOnly(value) ? value : fallback
   const [year, month, day] = source.split('-').map(Number)
   return new Date(Date.UTC(year!, month! - 1, day!, endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0, endOfDay ? 999 : 0))
 }
@@ -270,7 +309,7 @@ function formatDateTime(value: Date): string {
 }
 
 function decimalString(value: DecimalInput, places = 4): string {
-  return roundQuantity(value, places).toFixed(places)
+  return roundQuantity(value, places).toString()
 }
 
 function moneyString(value: DecimalInput): string {
@@ -302,12 +341,6 @@ function productWhere(filters: InventoryCostingFilters): ProductWhere {
   }
 }
 
-function productMatchesSearch(product: ProductMeta, filters: InventoryCostingFilters): boolean {
-  const query = filters.product?.trim().toLocaleLowerCase()
-  if (query && !product.sku.toLocaleLowerCase().includes(query) && !product.name.toLocaleLowerCase().includes(query)) return false
-  return true
-}
-
 function supplierNames(product: ProductMeta): string[] {
   return product.supplierProducts.map((entry) => entry.supplier.name).sort((a, b) => a.localeCompare(b))
 }
@@ -334,7 +367,20 @@ function cogsGroupLabel(input: CogsAggregationInput, groupBy: CogsGroupBy): stri
   }
 }
 
-function paginate<Row>(rows: Row[], filters: InventoryCostingFilters): { rows: Row[]; pageInfo: PageInfo } {
+function paginate<Row>(rows: Row[], filters: InventoryCostingFilters, options: ReportOptions = {}): { rows: Row[]; pageInfo: PageInfo } {
+  if (options.paginate === false) {
+    return {
+      rows,
+      pageInfo: {
+        page: 1,
+        pageSize: rows.length,
+        totalRows: rows.length,
+        totalPages: 1,
+        hasNextPage: false,
+        hasPreviousPage: false,
+      },
+    }
+  }
   const page = clampPage(filters.page)
   const pageSize = clampPageSize(filters.pageSize)
   const info = pageInfo(rows.length, page, pageSize)
@@ -348,13 +394,14 @@ export function inventoryCostingFiltersFromSearch(searchParams: InventoryCosting
   const groupBy = oneSearchParam(searchParams.groupBy)
   const landedCostMethod = oneSearchParam(searchParams.landedCostMethod)
   return {
-    asOf: oneSearchParam(searchParams.asOf),
-    dateFrom: oneSearchParam(searchParams.dateFrom),
-    dateTo: oneSearchParam(searchParams.dateTo),
+    asOf: dateSearchParam(searchParams.asOf),
+    dateFrom: dateSearchParam(searchParams.dateFrom),
+    dateTo: dateSearchParam(searchParams.dateTo),
     warehouseId: oneSearchParam(searchParams.warehouseId),
     categoryId: oneSearchParam(searchParams.categoryId),
     supplierId: oneSearchParam(searchParams.supplierId),
     product: oneSearchParam(searchParams.product),
+    includeZero: oneSearchParam(searchParams.includeZero) === '1',
     groupBy: COGS_GROUPS.includes(groupBy as CogsGroupBy) ? groupBy as CogsGroupBy : undefined,
     landedCostMethod: LANDED_COST_METHODS.has(landedCostMethod as LandedCostMethod) ? landedCostMethod as LandedCostMethod : undefined,
     page: Number(oneSearchParam(searchParams.page) ?? 1),
@@ -371,6 +418,7 @@ export function inventoryCostingFiltersForUi(filters: InventoryCostingFilters): 
     categoryId: filters.categoryId,
     supplierId: filters.supplierId,
     product: filters.product,
+    includeZero: filters.includeZero,
     groupBy: filters.groupBy,
     landedCostMethod: filters.landedCostMethod,
     pageSize: String(filters.pageSize ?? DEFAULT_PAGE_SIZE),
@@ -384,6 +432,7 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
     cogsBase: Decimal
     revenueBase: Decimal
     revenueCaptured: boolean
+    revenueKeys: Set<string>
     movementIds: Set<string>
   }>()
 
@@ -395,14 +444,16 @@ export function aggregateCogsRows(inputs: CogsAggregationInput[], groupBy: CogsG
       cogsBase: decimalZero(),
       revenueBase: decimalZero(),
       revenueCaptured: true,
+      revenueKeys: new Set<string>(),
       movementIds: new Set<string>(),
     }
     existing.qty = existing.qty.add(toDecimal(input.qty))
     existing.cogsBase = existing.cogsBase.add(toDecimal(input.cogsBase))
     if (input.revenueBase == null) {
       existing.revenueCaptured = false
-    } else {
+    } else if (!input.revenueKey || !existing.revenueKeys.has(input.revenueKey)) {
       existing.revenueBase = existing.revenueBase.add(toDecimal(input.revenueBase))
+      if (input.revenueKey) existing.revenueKeys.add(input.revenueKey)
     }
     existing.movementIds.add(input.id)
     groups.set(key, existing)
@@ -494,22 +545,25 @@ async function loadWarehouseMetas(warehouseIds: string[]): Promise<Map<string, W
   return new Map(rows.map((row) => [row.id, row]))
 }
 
-export async function getInventoryValuationReport(filters: InventoryCostingFilters = {}): Promise<InventoryValuationReport> {
+export async function getInventoryValuationReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<InventoryValuationReport> {
   const asOf = filters.asOf ?? today()
   const snapshot = await getOnHandAsOf({
     asOf,
     warehouseId: filters.warehouseId,
     categoryId: filters.categoryId,
     supplierId: filters.supplierId,
-    excludeZero: true,
+    productSearch: filters.product?.trim() || undefined,
+    excludeZero: !filters.includeZero,
   })
-  const productMetas = await loadProductMetas(snapshot.rows.map((row) => row.productId))
-  const warehouseMetas = await loadWarehouseMetas(snapshot.rows.map((row) => row.warehouseId))
+  const [productMetas, warehouseMetas] = await Promise.all([
+    loadProductMetas(snapshot.rows.map((row) => row.productId)),
+    loadWarehouseMetas(snapshot.rows.map((row) => row.warehouseId)),
+  ])
   const allRows = snapshot.rows
     .map((row: OnHandAsOfRow): InventoryValuationReportRow | null => {
       const product = productMetas.get(row.productId)
       const warehouse = warehouseMetas.get(row.warehouseId)
-      if (!product || !warehouse || !productMatchesSearch(product, filters)) return null
+      if (!product || !warehouse) return null
       return {
         productId: row.productId,
         warehouseId: row.warehouseId,
@@ -537,7 +591,7 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
     }),
     { qty: decimalZero(), totalValueBase: decimalZero() },
   )
-  const paged = paginate(allRows, filters)
+  const paged = paginate(allRows, filters, options)
   return {
     asOf: snapshot.asOf,
     generatedAt: snapshot.generatedAt,
@@ -555,7 +609,6 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
       glVarianceBase: null,
     },
     notices: [
-      'Inventory value comes from InventorySnapshot/getOnHandAsOf evidence and open FIFO CostLayer value for current-state requests.',
       'GL stock-account balance is not stored as an IMS balance row yet, so variance columns are explicit blanks rather than inferred values.',
       snapshot.valueReplayReliable ? '' : 'This as-of valuation includes movements without value evidence or orphan warehouse movement rows.',
     ].filter(Boolean),
@@ -584,9 +637,12 @@ async function loadRevenueByOrderProduct(orderIds: string[]): Promise<{
   const revenueByOrderProduct = new Map<string, Decimal>()
   const orderMetaById = new Map<string, { customerName: string | null; channel: string | null }>()
   for (const order of rows) {
+    const channel = [...new Set(order.shoppingLinks.map((link) => link.connector))]
+      .sort((a, b) => a.localeCompare(b))
+      .join(',')
     orderMetaById.set(order.id, {
       customerName: order.customerName,
-      channel: order.shoppingLinks[0]?.connector ?? 'manual',
+      channel: channel || 'manual',
     })
     for (const line of order.lines) {
       if (!line.productId) continue
@@ -597,62 +653,73 @@ async function loadRevenueByOrderProduct(orderIds: string[]): Promise<{
   return { revenueByOrderProduct, orderMetaById }
 }
 
-export async function getCogsReport(filters: InventoryCostingFilters = {}): Promise<CogsReport> {
+export async function getCogsReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<CogsReport> {
   const dateFrom = filters.dateFrom ?? daysAgo(30)
   const dateTo = filters.dateTo ?? today()
   const from = parseDateOnly(dateFrom, daysAgo(30))
   const to = parseDateOnly(dateTo, today(), true)
   const groupBy = filters.groupBy ?? 'product'
-  const rows: CogsEntryRow[] = await db.cogsEntry.findMany({
-    where: {
-      createdAt: { gte: from, lte: to },
-      movement: {
-        ...(filters.warehouseId ? { fromWarehouseId: filters.warehouseId } : {}),
-        product: productWhere(filters),
-      },
+  const cogsWhere: Prisma.CogsEntryWhereInput = {
+    createdAt: { gte: from, lte: to },
+    movement: {
+      // COGS currently comes from outbound inventory consumption. Those
+      // movements leave stock through fromWarehouseId; extend this if a future
+      // COGS-producing movement records the warehouse on another side.
+      ...(filters.warehouseId ? { fromWarehouseId: filters.warehouseId } : {}),
+      product: productWhere(filters),
     },
-    select: {
-      id: true,
-      qty: true,
-      totalCostBase: true,
-      createdAt: true,
-      movement: {
-        select: {
-          id: true,
-          referenceType: true,
-          referenceId: true,
-          fromWarehouseId: true,
-          toWarehouseId: true,
-          product: {
-            select: {
-              id: true,
-              sku: true,
-              name: true,
-              stockUnit: true,
-              category: { select: { name: true } },
-              supplierProducts: { select: { supplier: { select: { name: true } } } },
+  }
+  const rows: CogsEntryRow[] = []
+  let cursor: { id: string } | undefined
+  while (true) {
+    const chunk: CogsEntryRow[] = await db.cogsEntry.findMany({
+      where: cogsWhere,
+      select: {
+        id: true,
+        qty: true,
+        totalCostBase: true,
+        createdAt: true,
+        movement: {
+          select: {
+            id: true,
+            referenceType: true,
+            referenceId: true,
+            fromWarehouseId: true,
+            toWarehouseId: true,
+            product: {
+              select: {
+                id: true,
+                sku: true,
+                name: true,
+                stockUnit: true,
+                category: { select: { name: true } },
+                supplierProducts: { select: { supplier: { select: { name: true } } } },
+              },
             },
+            fromWarehouse: { select: { id: true, code: true, name: true } },
+            toWarehouse: { select: { id: true, code: true, name: true } },
           },
-          fromWarehouse: { select: { id: true, code: true, name: true } },
-          toWarehouse: { select: { id: true, code: true, name: true } },
         },
       },
-    },
-    orderBy: { createdAt: 'desc' },
-  })
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: SOURCE_SCAN_PAGE_SIZE,
+      ...(cursor ? { cursor, skip: 1 } : {}),
+    })
+    rows.push(...chunk)
+    if (chunk.length < SOURCE_SCAN_PAGE_SIZE) break
+    cursor = { id: chunk[chunk.length - 1]!.id }
+  }
   const sourceOrderIds = rows
     .map((row) => row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null)
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
   const { revenueByOrderProduct, orderMetaById } = await loadRevenueByOrderProduct(sourceOrderIds)
-  const revenueUsed = new Set<string>()
   const inputs: CogsAggregationInput[] = rows.map((row) => {
     const product = row.movement.product
     const warehouse = row.movement.fromWarehouse ?? row.movement.toWarehouse
     const orderId = row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null
     const meta = orderId ? orderMetaById.get(orderId) : undefined
     const key = orderId ? revenueKey({ orderId, productId: product.id }) : null
-    const revenueBase = key && !revenueUsed.has(key) ? revenueByOrderProduct.get(key) ?? null : null
-    if (key && revenueBase) revenueUsed.add(key)
+    const revenueBase = key ? revenueByOrderProduct.get(key) ?? null : null
     return {
       id: row.movement.id,
       qty: row.qty,
@@ -666,6 +733,7 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}): Prom
       warehouseName: warehouse?.name ?? null,
       customerName: meta?.customerName ?? null,
       channel: meta?.channel ?? null,
+      revenueKey: key,
       revenueBase,
     }
   })
@@ -680,7 +748,7 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}): Prom
     }),
     { qty: decimalZero(), cogsBase: decimalZero(), revenueBase: decimalZero(), grossMarginBase: decimalZero(), revenueCapturedRows: 0 },
   )
-  const paged = paginate(allRows, filters)
+  const paged = paginate(allRows, filters, options)
   return {
     dateFrom,
     dateTo,
@@ -696,55 +764,66 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}): Prom
       revenueCapturedRows: totals.revenueCapturedRows,
     },
     notices: [
-      'COGS totals come from CogsEntry rows and are not recalculated from FIFO layers.',
-      'Revenue and margin are shown only where SALE_DISPATCH movement references can be matched to a sales order line for the same product.',
-    ],
+      allRows.some((row) => !row.revenueCaptured)
+        ? 'Revenue and margin are shown only where COGS movement references can be matched to a sales order line for the same product.'
+        : '',
+    ].filter(Boolean),
   }
 }
 
-export async function getLandedCostReport(filters: InventoryCostingFilters = {}): Promise<LandedCostReport> {
+export async function getLandedCostReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<LandedCostReport> {
   const dateFrom = filters.dateFrom ?? daysAgo(90)
   const dateTo = filters.dateTo ?? today()
   const from = parseDateOnly(dateFrom, daysAgo(90))
   const to = parseDateOnly(dateTo, today(), true)
-  const rows = await db.purchaseOrderLine.findMany({
-    where: {
-      po: {
-        createdAt: { gte: from, lte: to },
-        ...(filters.landedCostMethod ? { landedCostMethod: filters.landedCostMethod } : {}),
-        ...(filters.supplierId ? { supplierId: filters.supplierId } : {}),
-        ...(filters.warehouseId ? { destinationWarehouseId: filters.warehouseId } : {}),
-      },
-      product: productWhere(filters),
+  const landedCostWhere: Prisma.PurchaseOrderLineWhereInput = {
+    po: {
+      createdAt: { gte: from, lte: to },
+      ...(filters.landedCostMethod ? { landedCostMethod: filters.landedCostMethod } : {}),
+      ...(filters.supplierId ? { supplierId: filters.supplierId } : {}),
+      ...(filters.warehouseId ? { destinationWarehouseId: filters.warehouseId } : {}),
     },
-    select: {
-      id: true,
-      qty: true,
-      unitCostBase: true,
-      landedUnitCostBase: true,
-      product: {
-        select: {
-          id: true,
-          sku: true,
-          name: true,
-          stockUnit: true,
-          category: { select: { name: true } },
-          supplierProducts: { select: { supplier: { select: { name: true } } } },
+    product: productWhere(filters),
+  }
+  const rows: LandedCostLineRow[] = []
+  let cursor: { id: string } | undefined
+  while (true) {
+    const chunk: LandedCostLineRow[] = await db.purchaseOrderLine.findMany({
+      where: landedCostWhere,
+      select: {
+        id: true,
+        qty: true,
+        unitCostBase: true,
+        landedUnitCostBase: true,
+        product: {
+          select: {
+            id: true,
+            sku: true,
+            name: true,
+            stockUnit: true,
+            category: { select: { name: true } },
+            supplierProducts: { select: { supplier: { select: { name: true } } } },
+          },
+        },
+        po: {
+          select: {
+            id: true,
+            reference: true,
+            status: true,
+            createdAt: true,
+            landedCostMethod: true,
+            supplier: { select: { name: true } },
+          },
         },
       },
-      po: {
-        select: {
-          id: true,
-          reference: true,
-          status: true,
-          createdAt: true,
-          landedCostMethod: true,
-          supplier: { select: { name: true } },
-        },
-      },
-    },
-    orderBy: [{ po: { createdAt: 'desc' } }, { sortOrder: 'asc' }],
-  })
+      orderBy: [{ po: { createdAt: 'desc' } }, { sortOrder: 'asc' }, { id: 'asc' }],
+      take: SOURCE_SCAN_PAGE_SIZE,
+      ...(cursor ? { cursor, skip: 1 } : {}),
+    })
+    rows.push(...chunk)
+    if (chunk.length < SOURCE_SCAN_PAGE_SIZE) break
+    cursor = { id: chunk[chunk.length - 1]!.id }
+  }
   const poIds = [...new Set(rows.map((row) => row.po.id))]
   const revaluationRows = poIds.length === 0
     ? []
@@ -757,6 +836,8 @@ export async function getLandedCostReport(filters: InventoryCostingFilters = {})
     if (!run.primaryPoId) continue
     revaluationCountByPo.set(run.primaryPoId, (revaluationCountByPo.get(run.primaryPoId) ?? 0) + 1)
   }
+  let nearZeroGoodsUnitCostRows = 0
+  const methodInputs: LandedCostAggregationInput[] = []
   const allRows: LandedCostReportRow[] = rows.map((row) => {
     const qty = toDecimal(row.qty)
     const goodsUnit = toDecimal(row.unitCostBase)
@@ -764,7 +845,16 @@ export async function getLandedCostReport(filters: InventoryCostingFilters = {})
     const goodsValue = qty.mul(goodsUnit)
     const landedValue = qty.mul(landedUnit)
     const upliftUnit = landedUnit.sub(goodsUnit)
-    const upliftPct = goodsUnit.isZero() ? null : upliftUnit.div(goodsUnit).mul(100)
+    const upliftPct = goodsUnit.abs().lt(NEAR_ZERO_LANDED_GOODS_UNIT_COST_BASE)
+      ? null
+      : upliftUnit.div(goodsUnit).mul(100)
+    if (goodsUnit.abs().lt(NEAR_ZERO_LANDED_GOODS_UNIT_COST_BASE)) nearZeroGoodsUnitCostRows += 1
+    methodInputs.push({
+      method: row.po.landedCostMethod,
+      qty,
+      goodsValueBase: goodsValue,
+      landedValueBase: landedValue,
+    })
     return {
       poId: row.po.id,
       poReference: row.po.reference,
@@ -795,13 +885,8 @@ export async function getLandedCostReport(filters: InventoryCostingFilters = {})
     }),
     { qty: decimalZero(), goodsValueBase: decimalZero(), landedValueBase: decimalZero(), revaluationRuns: 0 },
   )
-  const methodSummary = aggregateLandedCostMethods(allRows.map((row) => ({
-    method: row.landedCostMethod,
-    qty: row.qty,
-    goodsValueBase: row.goodsValueBase,
-    landedValueBase: row.landedValueBase,
-  })))
-  const paged = paginate(allRows, filters)
+  const methodSummary = aggregateLandedCostMethods(methodInputs)
+  const paged = paginate(allRows, filters, options)
   return {
     dateFrom,
     dateTo,
@@ -817,26 +902,10 @@ export async function getLandedCostReport(filters: InventoryCostingFilters = {})
     },
     methodSummary,
     notices: [
-      'PPV-style landed-cost reference source is the PO line goods unit cost before landed-cost allocation.',
-      'Retrospective revaluation counts are grouped by primary PO when revaluation runs exist.',
-    ],
-  }
-}
-
-export async function getInventoryCostingExportRowCount(type: InventoryCostingReportType, filters: InventoryCostingFilters): Promise<number> {
-  switch (type) {
-    case 'inventory-valuation': {
-      const report = await getInventoryValuationReport({ ...filters, page: 1, pageSize: INVENTORY_COSTING_EXPORT_ROW_LIMIT })
-      return report.pageInfo.totalRows
-    }
-    case 'cogs': {
-      const report = await getCogsReport({ ...filters, page: 1, pageSize: INVENTORY_COSTING_EXPORT_ROW_LIMIT })
-      return report.pageInfo.totalRows
-    }
-    case 'landed-cost': {
-      const report = await getLandedCostReport({ ...filters, page: 1, pageSize: INVENTORY_COSTING_EXPORT_ROW_LIMIT })
-      return report.pageInfo.totalRows
-    }
+      nearZeroGoodsUnitCostRows > 0
+        ? `${nearZeroGoodsUnitCostRows.toLocaleString()} landed-cost rows have near-zero goods unit cost, so uplift percentage is left blank.`
+        : '',
+    ].filter(Boolean),
   }
 }
 

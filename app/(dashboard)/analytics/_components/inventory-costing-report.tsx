@@ -8,6 +8,7 @@ import { Label } from '@/components/ui/label'
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table'
 import type { CogsGroupBy, InventoryCostingFilterUiValues, InventoryCostingReportType } from '@/lib/domain/inventory/inventory-costing-reports'
 import type { PageInfo, StockPositionFilterOptions } from '@/lib/domain/inventory/stock-position-reports'
+import { COMBOBOX_THRESHOLD } from '@/lib/ui/select-policy'
 import { cn } from '@/lib/utils'
 import { StockPositionFilterCombobox } from './stock-position-filter-combobox'
 import { appendParams, currentParams, toneClass, type SummaryTone } from './report-utils'
@@ -35,6 +36,7 @@ type InventoryCostingReportPageProps<Row> = {
   dateMode: 'as-of' | 'period'
   showGroupBy?: boolean
   showLandedCostMethod?: boolean
+  showIncludeZero?: boolean
 }
 
 const COGS_GROUP_OPTIONS: Array<{ value: CogsGroupBy; label: string }> = [
@@ -60,6 +62,7 @@ export function InventoryCostingReportPage<Row>({
   dateMode,
   showGroupBy = false,
   showLandedCostMethod = false,
+  showIncludeZero = false,
 }: InventoryCostingReportPageProps<Row>) {
   const params = currentParams(filters)
   const csvHref = `/api/export/inventory-costing?${appendParams(params, { report: reportKey })}`
@@ -161,14 +164,21 @@ export function InventoryCostingReportPage<Row>({
           {showLandedCostMethod && (
             <div className="space-y-1.5">
               <Label htmlFor="landedCostMethod">Method</Label>
-              {/* Native select is intentional for enum filters below the searchable-control threshold of 20 options. */}
+              {/* Native select is intentional for enum filters below COMBOBOX_THRESHOLD options. */}
               <select id="landedCostMethod" name="landedCostMethod" defaultValue={filters.landedCostMethod ?? ''} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
                 <option value="">All methods</option>
                 {Object.values(LandedCostMethod).map((method) => (
                   <option key={method} value={method}>{method}</option>
                 ))}
               </select>
+              <p className="sr-only">Searchable controls start at {COMBOBOX_THRESHOLD + 1} options.</p>
             </div>
+          )}
+          {showIncludeZero && (
+            <label className="flex items-center gap-2 pt-8 text-sm">
+              <input type="checkbox" name="includeZero" value="1" defaultChecked={filters.includeZero} className="rounded border-input" />
+              Include zero rows
+            </label>
           )}
           <div className="space-y-1.5">
             <Label htmlFor="pageSize">Rows</Label>

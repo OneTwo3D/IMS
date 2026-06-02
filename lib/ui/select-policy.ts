@@ -1,0 +1,1 @@
+export const COMBOBOX_THRESHOLD = 20
