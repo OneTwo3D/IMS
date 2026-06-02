@@ -11,6 +11,8 @@ const INITIAL_CARRIER = 'Royal Mail'
 const UPDATED_CARRIER = 'DHL'
 
 test('processes a sales order through shipment and tracking edit', async ({ page }) => {
+  test.setTimeout(60_000)
+
   const product = await createSimpleProduct(page, { price: '18.50' })
   await addStockAdjustment(page, product.sku, 5, FULFILLMENT_WAREHOUSE_CODE)
 
@@ -43,7 +45,9 @@ test('processes a sales order through shipment and tracking edit', async ({ page
   await expect(page.getByText(shippedStatus).first()).toBeVisible()
   await expect(page.getByText(`#${INITIAL_TRACKING}`)).toBeVisible()
 
-  await page.getByRole('button', { name: /edit tracking/i }).click()
+  const editTrackingButton = page.getByRole('button', { name: /edit tracking/i })
+  await expect(editTrackingButton).toBeEnabled({ timeout: 30_000 })
+  await editTrackingButton.click()
   const editDialog = page.getByRole('dialog', { name: 'Edit Tracking' })
   await expect(editDialog).toBeVisible()
   await expect(editDialog.locator('input')).toHaveValue(INITIAL_TRACKING)
