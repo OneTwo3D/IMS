@@ -1,4 +1,3 @@
-import { cache } from 'react'
 import { Prisma, ProductType } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import {
@@ -12,6 +11,9 @@ import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/d
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
+const COST_LAYER_SOURCE_ROW_LIMIT = 100000
+const KIT_ITEM_SOURCE_ROW_LIMIT = 50000
+const FUTURE_COGS_SOURCE_ROW_LIMIT = 100000
 const PRODUCT_TYPES = Object.values(ProductType)
 
 export const INVENTORY_AGING_KIT_MODE = 'component' as const
@@ -113,6 +115,7 @@ type KitItemAgingRow = {
     category: { name: string } | null
     supplierProducts: Array<{ supplier: { name: string } }>
   }
+  component: CostLayerAgingRow['product']
 }
 
 type AgingLayerWithContext = AgingLayerInput & {
@@ -171,6 +174,12 @@ function supplierNames(product: CostLayerAgingRow['product'] | KitItemAgingRow['
   return product.supplierProducts.map((supplierProduct) => supplierProduct.supplier.name)
 }
 
+function rejectOverLimit(rows: unknown[], limit: number, label: string): void {
+  if (rows.length > limit) {
+    throw new Error(`Inventory aging ${label} exceeds ${limit.toLocaleString()} rows. Narrow product, warehouse, category, supplier, type, or as-of filters and retry.`)
+  }
+}
+
 function productWhere(filters: StockPositionFilters, typeOverride?: Prisma.EnumProductTypeFilter | ProductType): Prisma.ProductWhereInput {
   const productType = validProductType(filters.productType)
   return {
@@ -201,7 +210,9 @@ async function loadFutureCogsByLayer(
       costLayerId: true,
       qty: true,
     },
+    take: FUTURE_COGS_SOURCE_ROW_LIMIT + 1,
   }) as FutureCogsRow[]
+  rejectOverLimit(rows, FUTURE_COGS_SOURCE_ROW_LIMIT, 'future COGS scan')
 
   const byLayer = new Map<string, Prisma.Decimal>()
   for (const row of rows) {
@@ -249,7 +260,9 @@ async function loadCostLayerContexts(
       warehouse: { select: { id: true, code: true, name: true } },
     },
     orderBy: [{ product: { sku: 'asc' } }, { warehouse: { code: 'asc' } }, { receivedAt: 'asc' }],
+    take: COST_LAYER_SOURCE_ROW_LIMIT + 1,
   }) as CostLayerAgingRow[]
+  rejectOverLimit(layers, COST_LAYER_SOURCE_ROW_LIMIT, 'cost-layer scan')
 
   const futureCogsByLayer = await loadFutureCogsByLayer(client, layers.map((layer) => layer.id), asOf)
   return layers.flatMap((row) => {
@@ -315,9 +328,25 @@ async function loadKitAgingLayers(
           },
         },
       },
+      component: {
+        select: {
+          id: true,
+          sku: true,
+          name: true,
+          type: true,
+          stockUnit: true,
+          category: { select: { name: true } },
+          supplierProducts: {
+            select: { supplier: { select: { name: true } } },
+            orderBy: { supplier: { name: 'asc' } },
+          },
+        },
+      },
     },
     orderBy: [{ parentProduct: { sku: 'asc' } }, { sortOrder: 'asc' }],
+    take: KIT_ITEM_SOURCE_ROW_LIMIT + 1,
   }) as KitItemAgingRow[]
+  rejectOverLimit(kitItems, KIT_ITEM_SOURCE_ROW_LIMIT, 'KIT item scan')
   if (kitItems.length === 0) return []
 
   const componentIds = Array.from(new Set(kitItems.map((item) => item.componentProductId)))
@@ -348,7 +377,9 @@ async function loadKitAgingLayers(
       warehouse: { select: { id: true, code: true, name: true } },
     },
     orderBy: [{ product: { sku: 'asc' } }, { warehouse: { code: 'asc' } }, { receivedAt: 'asc' }],
+    take: COST_LAYER_SOURCE_ROW_LIMIT + 1,
   }) as CostLayerAgingRow[]
+  rejectOverLimit(componentLayers, COST_LAYER_SOURCE_ROW_LIMIT, 'KIT component cost-layer scan')
   const futureCogsByLayer = await loadFutureCogsByLayer(client, componentLayers.map((layer) => layer.id), asOf)
   const layersByComponent = new Map<string, CostLayerAgingRow[]>()
   for (const layer of componentLayers) {
@@ -362,17 +393,17 @@ async function loadKitAgingLayers(
       const componentQtyAsOf = toDecimal(layer.remainingQty).add(futureCogsByLayer.get(layer.id) ?? 0)
       if (componentQtyAsOf.lte(0)) return []
       return [{
-        productId: item.parentProductId,
-        sku: item.parentProduct.sku,
-        productName: item.parentProduct.name,
-        productType: ProductType.KIT,
-        categoryName: item.parentProduct.category?.name ?? null,
-        supplierNames: supplierNames(item.parentProduct),
+        productId: layer.productId,
+        sku: layer.product.sku,
+        productName: `${layer.product.name} for ${item.parentProduct.sku}`,
+        productType: layer.product.type,
+        categoryName: layer.product.category?.name ?? null,
+        supplierNames: supplierNames(item.component),
         warehouseId: layer.warehouseId,
         warehouseCode: layer.warehouse.code,
         warehouseName: layer.warehouse.name,
-        stockUnit: item.parentProduct.stockUnit,
-        qty: componentQtyAsOf.div(factor),
+        stockUnit: layer.product.stockUnit,
+        qty: componentQtyAsOf,
         valueBase: componentQtyAsOf.mul(toDecimal(layer.unitCostBase)),
         receivedAt: layer.receivedAt,
         source: 'kit_component' as const,
@@ -382,7 +413,7 @@ async function loadKitAgingLayers(
 }
 
 function bucketKey(layer: AgingLayerWithContext, bucket: string): string {
-  return `${layer.productId}:${layer.warehouseId}:${layer.source}:${bucket}`
+  return `${layer.productId}:${layer.productName}:${layer.warehouseId}:${layer.source}:${bucket}`
 }
 
 function toReportRows(layers: AgingLayerWithContext[], asOf: Date, buckets?: AgingBucketDefinition[]): InventoryAgingReportRow[] {
@@ -465,8 +496,9 @@ export async function getInventoryAgingReport(
   }), { qty: new Prisma.Decimal(0), valueBase: new Prisma.Decimal(0) })
   const paged = options.paginate === false ? { rows, pageInfo: pageInfo(rows.length, 1, Math.max(rows.length, 1)) } : paginate(rows, filters)
   const kitNotice = productType === ProductType.KIT
-    ? 'KIT aging uses component cost layers divided by kit component quantity; totals are virtual kit-equivalent exposure, not additional physical stock.'
+    ? 'KIT aging shows component-layer quantity and value for components used by matching KIT SKUs; totals are component exposure, not additional physical stock.'
     : 'Virtual KIT SKUs are excluded from the default aging list; filter Type to KIT to inspect component-based kit exposure.'
+  const valueNotice = 'Aging value uses the current CostLayer.unitCostBase; retrospective landed-cost revaluations are not replayed for historical as-of dates.'
 
   return {
     asOf: asOf.toISOString(),
@@ -479,8 +511,6 @@ export async function getInventoryAgingReport(
       valueBase: roundQuantity(totals.valueBase, 6).toString(),
     },
     bucketSummary: summarizeBuckets(rows),
-    notices: [kitNotice],
+    notices: [kitNotice, valueNotice],
   }
 }
-
-export const getCachedInventoryAgingReport = cache(getInventoryAgingReport)

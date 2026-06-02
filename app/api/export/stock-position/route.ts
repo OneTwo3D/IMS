@@ -145,11 +145,8 @@ export async function GET(req: NextRequest) {
         qty: r.qty,
         valueBase: r.valueBase,
         source: r.source,
-        asOf: report.asOf,
-        generatedAt: report.generatedAt,
-        kitAgingMode: report.kitAgingMode,
       }))
-      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'bucket', 'minAgeDays', 'maxAgeDays', 'qty', 'valueBase', 'source', 'asOf', 'generatedAt', 'kitAgingMode']), `inventory-aging-${date}.csv`)
+      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'bucket', 'minAgeDays', 'maxAgeDays', 'qty', 'valueBase', 'source']), `inventory-aging-${date}.csv`)
     }
 
     default:

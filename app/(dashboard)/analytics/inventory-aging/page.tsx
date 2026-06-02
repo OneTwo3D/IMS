@@ -99,7 +99,7 @@ export default async function InventoryAgingPage({ searchParams }: { searchParam
       filterOptions={filterOptions}
       pageInfo={report.pageInfo}
       rows={report.rows}
-      rowKey={(row) => `${row.productId}:${row.warehouseId}:${row.source}:${row.bucket}`}
+      rowKey={(row) => `${row.productId}:${row.productName}:${row.warehouseId}:${row.source}:${row.bucket}`}
       columns={columns}
       summary={[
         { label: 'Aged rows', value: report.pageInfo.totalRows.toLocaleString() },
