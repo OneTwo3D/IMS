@@ -70,11 +70,13 @@ export async function GET(req: NextRequest) {
         revenueBase: row.revenueBase ?? '',
         grossMarginBase: row.grossMarginBase ?? '',
         grossMarginPct: row.grossMarginPct ?? '',
+        glBalanceBase: report.totals.glBalanceBase ?? '',
+        glVarianceBase: report.totals.glVarianceBase ?? '',
         movementCount: row.movementCount,
         revenueCaptured: row.revenueCaptured,
         generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['dateFrom', 'dateTo', 'groupBy', 'groupLabel', 'sku', 'categoryName', 'warehouseCode', 'customerName', 'channel', 'qty', 'cogsBase', 'revenueBase', 'grossMarginBase', 'grossMarginPct', 'movementCount', 'revenueCaptured', 'generatedAt'], `cogs-${date}.csv`)
+      return csvBufferedStreamResponse(rows, ['dateFrom', 'dateTo', 'groupBy', 'groupLabel', 'sku', 'categoryName', 'warehouseCode', 'customerName', 'channel', 'qty', 'cogsBase', 'revenueBase', 'grossMarginBase', 'grossMarginPct', 'glBalanceBase', 'glVarianceBase', 'movementCount', 'revenueCaptured', 'generatedAt'], `cogs-${date}.csv`)
     }
 
     case 'landed-cost': {

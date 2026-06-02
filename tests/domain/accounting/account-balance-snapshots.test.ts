@@ -1,0 +1,153 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+
+import {
+  calculateAccountBalanceVarianceBase,
+  getAccountBalancePeriodMovement,
+  persistAccountingAccountBalanceSnapshots,
+  type AccountingAccountBalanceSnapshotRow,
+} from '@/lib/domain/accounting/account-balance-snapshots'
+import { toDecimal } from '@/lib/domain/math/decimal'
+
+function snapshotClient(initial: AccountingAccountBalanceSnapshotRow[] = []) {
+  const rows = [...initial]
+  return {
+    rows,
+    accountingAccountBalanceSnapshot: {
+      async upsert(args: {
+        where: { connector_externalAccountId_balanceDate_currency: { connector: string; externalAccountId: string; balanceDate: Date; currency: string } }
+        create: Record<string, unknown>
+        update: Record<string, unknown>
+      }) {
+        const key = args.where.connector_externalAccountId_balanceDate_currency
+        const existing = rows.find((row) =>
+          row.connector === key.connector &&
+          row.externalAccountId === key.externalAccountId &&
+          row.balanceDate.toISOString() === key.balanceDate.toISOString() &&
+          row.currency === key.currency,
+        )
+        if (existing) {
+          Object.assign(existing, args.update)
+          return existing
+        }
+        const created = {
+          id: `snapshot-${rows.length + 1}`,
+          connector: args.create.connector,
+          externalAccountId: args.create.externalAccountId,
+          accountCode: args.create.accountCode,
+          accountName: args.create.accountName,
+          balanceDate: args.create.balanceDate,
+          currency: args.create.currency,
+          amountForeign: args.create.amountForeign,
+          amountBase: args.create.amountBase,
+          sourcePayloadRef: args.create.sourcePayloadRef,
+          syncRunId: args.create.syncRunId,
+          fetchedAt: args.create.fetchedAt,
+        } as AccountingAccountBalanceSnapshotRow
+        rows.push(created)
+        return created
+      },
+      async findFirst(args: { where: Record<string, unknown>; orderBy: Array<Record<string, string>> }) {
+        const where = args.where as {
+          connector: string
+          balanceDate: { lte: Date }
+          currency?: string
+          OR: Array<{ externalAccountId?: string; accountCode?: string }>
+        }
+        return rows
+          .filter((row) =>
+            row.connector === where.connector &&
+            row.balanceDate <= where.balanceDate.lte &&
+            (!where.currency || row.currency === where.currency) &&
+            where.OR.some((filter) =>
+              (filter.externalAccountId && row.externalAccountId === filter.externalAccountId) ||
+              (filter.accountCode && row.accountCode === filter.accountCode),
+            ),
+          )
+          .sort((a, b) => b.balanceDate.getTime() - a.balanceDate.getTime() || b.fetchedAt.getTime() - a.fetchedAt.getTime() || b.id.localeCompare(a.id))[0] ?? null
+      },
+    },
+  }
+}
+
+test('persistAccountingAccountBalanceSnapshots upserts by connector account date and currency', async () => {
+  const client = snapshotClient()
+
+  await persistAccountingAccountBalanceSnapshots([
+    {
+      connector: 'xero',
+      externalAccountId: 'account-1',
+      accountCode: '500',
+      accountName: 'Inventory Asset',
+      balanceDate: '2026-06-01',
+      currency: 'gbp',
+      amountForeign: '100.1234567',
+      amountBase: '100.1234567',
+      sourcePayloadRef: 'xero:trial-balance:2026-06-01',
+    },
+  ], client as never)
+  const second = await persistAccountingAccountBalanceSnapshots([
+    {
+      connector: 'xero',
+      externalAccountId: 'account-1',
+      accountCode: '500',
+      accountName: 'Inventory Asset',
+      balanceDate: '2026-06-01',
+      currency: 'GBP',
+      amountForeign: '101.25',
+      amountBase: '101.25',
+      syncRunId: 'sync-2',
+    },
+  ], client as never)
+
+  assert.equal(client.rows.length, 1)
+  assert.equal(second.snapshots[0]?.amountBase.toFixed(6), '101.250000')
+  assert.equal(second.snapshots[0]?.syncRunId, 'sync-2')
+})
+
+test('getAccountBalancePeriodMovement subtracts opening from closing balance in base currency', async () => {
+  const client = snapshotClient([
+    {
+      id: 'opening',
+      connector: 'xero',
+      externalAccountId: 'cogs-account',
+      accountCode: '600',
+      accountName: 'COGS',
+      balanceDate: new Date('2026-05-31T00:00:00.000Z'),
+      currency: 'GBP',
+      amountForeign: toDecimal('12.50'),
+      amountBase: toDecimal('12.50'),
+      sourcePayloadRef: null,
+      syncRunId: null,
+      fetchedAt: new Date('2026-05-31T01:00:00.000Z'),
+    },
+    {
+      id: 'closing',
+      connector: 'xero',
+      externalAccountId: 'cogs-account',
+      accountCode: '600',
+      accountName: 'COGS',
+      balanceDate: new Date('2026-06-30T00:00:00.000Z'),
+      currency: 'GBP',
+      amountForeign: toDecimal('20.75'),
+      amountBase: toDecimal('20.75'),
+      sourcePayloadRef: null,
+      syncRunId: null,
+      fetchedAt: new Date('2026-06-30T01:00:00.000Z'),
+    },
+  ])
+
+  const movement = await getAccountBalancePeriodMovement({
+    connector: 'xero',
+    accountCode: '600',
+    dateFrom: '2026-06-01',
+    dateTo: '2026-06-30',
+    currency: 'GBP',
+  }, client as never)
+
+  assert.equal(movement?.movementBase.toFixed(6), '8.250000')
+})
+
+test('calculateAccountBalanceVarianceBase subtracts accounting balance from IMS value', () => {
+  assert.equal(calculateAccountBalanceVarianceBase('125.50', '120.25').toFixed(6), '5.250000')
+})

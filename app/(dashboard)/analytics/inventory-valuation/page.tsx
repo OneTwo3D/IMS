@@ -54,7 +54,13 @@ export default async function InventoryValuationPage({ searchParams }: { searchP
       render: (row) => formatMoneyCode(Number(row.totalValueBase), currency),
       footer: formatMoneyCode(Number(report.totals.totalValueBase), currency),
     },
-    { key: 'gl', label: `GL variance (${currency})`, align: 'right', render: (row) => row.glVarianceBase == null ? 'Not captured' : formatMoneyCode(Number(row.glVarianceBase), currency) },
+    {
+      key: 'gl',
+      label: `GL variance (${currency})`,
+      align: 'right',
+      render: (row) => row.glVarianceBase == null ? 'Account-level' : formatMoneyCode(Number(row.glVarianceBase), currency),
+      footer: report.totals.glVarianceBase == null ? 'Not captured' : formatMoneyCode(Number(report.totals.glVarianceBase), currency),
+    },
   ]
 
   return (

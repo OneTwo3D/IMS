@@ -1,8 +1,15 @@
 import { LandedCostMethod, Prisma } from '@/app/generated/prisma/client'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
+import {
+  calculateAccountBalanceVarianceBase,
+  findLatestAccountBalanceSnapshot,
+  getAccountBalancePeriodMovement,
+} from '@/lib/domain/accounting/account-balance-snapshots'
 import { getOnHandAsOf, type OnHandAsOfRow } from '@/lib/domain/inventory/get-on-hand-as-of'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { getXeroSettings } from '@/lib/connectors/xero/settings'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -117,6 +124,8 @@ export type CogsReport = {
     revenueBase: string
     grossMarginBase: string
     revenueCapturedRows: number
+    glBalanceBase: string | null
+    glVarianceBase: string | null
   }
   notices: string[]
 }
@@ -343,6 +352,74 @@ function productWhere(filters: InventoryCostingFilters): ProductWhere {
 
 function supplierNames(product: ProductMeta): string[] {
   return product.supplierProducts.map((entry) => entry.supplier.name).sort((a, b) => a.localeCompare(b))
+}
+
+async function loadConfiguredAccountingContext(): Promise<{ baseCurrency: string; inventoryAccountCode: string | null; cogsAccountCode: string | null }> {
+  const [baseCurrency, settings] = await Promise.all([getBaseCurrencyCode(), getXeroSettings()])
+  return {
+    baseCurrency,
+    inventoryAccountCode: settings.xero_inventory_account.trim() || null,
+    cogsAccountCode: settings.xero_cogs_account.trim() || null,
+  }
+}
+
+async function inventoryGlBalanceForDate(asOf: string, totalValueBase: Decimal): Promise<{ glBalanceBase: Decimal | null; glVarianceBase: Decimal | null; notices: string[] }> {
+  const context = await loadConfiguredAccountingContext()
+  if (!context.inventoryAccountCode) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: ['No Xero inventory asset account is configured, so GL variance is blank.'],
+    }
+  }
+  const snapshot = await findLatestAccountBalanceSnapshot({
+    connector: 'xero',
+    accountCode: context.inventoryAccountCode,
+    balanceDate: asOf,
+    currency: context.baseCurrency,
+  })
+  if (!snapshot) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: [`No stored GL balance snapshot exists for inventory asset account ${context.inventoryAccountCode} on or before ${asOf}, so GL variance is blank.`],
+    }
+  }
+  return {
+    glBalanceBase: snapshot.amountBase,
+    glVarianceBase: calculateAccountBalanceVarianceBase(totalValueBase, snapshot.amountBase),
+    notices: [`GL variance uses ${snapshot.connector.toUpperCase()} inventory asset account ${snapshot.accountCode ?? snapshot.externalAccountId} snapshot dated ${snapshot.balanceDate.toISOString().slice(0, 10)}.`],
+  }
+}
+
+async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBase: Decimal): Promise<{ glBalanceBase: Decimal | null; glVarianceBase: Decimal | null; notices: string[] }> {
+  const context = await loadConfiguredAccountingContext()
+  if (!context.cogsAccountCode) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: ['No Xero COGS account is configured, so GL COGS variance is blank.'],
+    }
+  }
+  const movement = await getAccountBalancePeriodMovement({
+    connector: 'xero',
+    accountCode: context.cogsAccountCode,
+    dateFrom,
+    dateTo,
+    currency: context.baseCurrency,
+  })
+  if (!movement) {
+    return {
+      glBalanceBase: null,
+      glVarianceBase: null,
+      notices: [`No stored opening and closing GL balance snapshots exist for COGS account ${context.cogsAccountCode} across ${dateFrom} to ${dateTo}, so GL COGS variance is blank.`],
+    }
+  }
+  return {
+    glBalanceBase: movement.movementBase,
+    glVarianceBase: calculateAccountBalanceVarianceBase(cogsBase, movement.movementBase),
+    notices: [`GL COGS variance uses ${movement.closing.connector.toUpperCase()} account ${movement.closing.accountCode ?? movement.closing.externalAccountId} movement from ${movement.opening.balanceDate.toISOString().slice(0, 10)} to ${movement.closing.balanceDate.toISOString().slice(0, 10)}.`],
+  }
 }
 
 function cogsGroupKey(input: CogsAggregationInput, groupBy: CogsGroupBy): string {
@@ -591,6 +668,7 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
     }),
     { qty: decimalZero(), totalValueBase: decimalZero() },
   )
+  const gl = await inventoryGlBalanceForDate(snapshot.asOf, totals.totalValueBase)
   const paged = paginate(allRows, filters, options)
   return {
     asOf: snapshot.asOf,
@@ -605,11 +683,11 @@ export async function getInventoryValuationReport(filters: InventoryCostingFilte
     totals: {
       qty: decimalString(totals.qty, 4),
       totalValueBase: moneyString(totals.totalValueBase),
-      glBalanceBase: null,
-      glVarianceBase: null,
+      glBalanceBase: gl.glBalanceBase ? moneyString(gl.glBalanceBase) : null,
+      glVarianceBase: gl.glVarianceBase ? moneyString(gl.glVarianceBase) : null,
     },
     notices: [
-      'GL stock-account balance is not stored as an IMS balance row yet, so variance columns are explicit blanks rather than inferred values.',
+      ...gl.notices,
       snapshot.valueReplayReliable ? '' : 'This as-of valuation includes movements without value evidence or orphan warehouse movement rows.',
     ].filter(Boolean),
   }
@@ -748,6 +826,7 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
     }),
     { qty: decimalZero(), cogsBase: decimalZero(), revenueBase: decimalZero(), grossMarginBase: decimalZero(), revenueCapturedRows: 0 },
   )
+  const gl = await cogsGlMovementForPeriod(dateFrom, dateTo, totals.cogsBase)
   const paged = paginate(allRows, filters, options)
   return {
     dateFrom,
@@ -762,8 +841,11 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
       revenueBase: moneyString(totals.revenueBase),
       grossMarginBase: moneyString(totals.grossMarginBase),
       revenueCapturedRows: totals.revenueCapturedRows,
+      glBalanceBase: gl.glBalanceBase ? moneyString(gl.glBalanceBase) : null,
+      glVarianceBase: gl.glVarianceBase ? moneyString(gl.glVarianceBase) : null,
     },
     notices: [
+      ...gl.notices,
       allRows.some((row) => !row.revenueCaptured)
         ? 'Revenue and margin are shown only where COGS movement references can be matched to a sales order line for the same product.'
         : '',
