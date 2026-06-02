@@ -18,7 +18,7 @@ function readArg(name: string): string | null {
 
 function usage(): never {
   console.error([
-    'Usage: tsx scripts/backfill-inventory-snapshots.ts --from YYYY-MM-DD [--to YYYY-MM-DD] [--dry-run] [--yes] [--allow-production] [--include-reservations]',
+    'Usage: tsx scripts/backfill-inventory-snapshots.ts --from YYYY-MM-DD [--to YYYY-MM-DD] [--dry-run] [--yes] [--allow-production] [--include-reservations] [--strict-reservations]',
     '',
     'Seeds daily inventory_snapshots from current StockLevel/CostLayer state,',
     'then replays StockMovement rows backwards by day using movement value fields.',
@@ -49,6 +49,7 @@ async function main(): Promise<void> {
   const yes = hasFlag('yes')
   const allowProduction = hasFlag('allow-production')
   const includeReservationSnapshots = hasFlag('include-reservations')
+  const strictReservations = hasFlag('strict-reservations')
 
   if (process.env.NODE_ENV === 'production' && !allowProduction) {
     throw new Error('Refusing to run inventory snapshot backfill in production without --allow-production')
@@ -58,7 +59,9 @@ async function main(): Promise<void> {
     const confirmed = await confirmBackfill(
       [
         `About to write inventory snapshots from ${fromDate} to ${readArg('to') ?? 'today'}.`,
-        includeReservationSnapshots ? 'Reservation snapshot backfill is enabled.' : 'Reservation snapshot backfill is disabled.',
+        includeReservationSnapshots
+          ? 'Reservation snapshot backfill is enabled. Unsupported days will be skipped and reported in reservationBackfill.warnings; run with --dry-run first to preview skipped dates.'
+          : 'Reservation snapshot backfill is disabled.',
         'Use --dry-run to preview without writes.',
       ].join(' '),
     )
@@ -81,8 +84,8 @@ async function main(): Promise<void> {
       `${result.missingValueMovementCount} movement(s) lacked value fields; historical value replay kept value unchanged for those rows.`,
     )
   }
-  for (const warning of result.reservationBackfill.warnings) {
-    console.warn(`${warning.snapshotDate}: ${warning.message}`)
+  if (strictReservations && result.reservationBackfill.warnings.length > 0) {
+    process.exitCode = 2
   }
 }
 

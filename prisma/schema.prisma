@@ -872,6 +872,10 @@ model InventoryReservationSnapshotRun {
   snapshotDate             DateTime @unique @db.Date
   stockLevelCount          Int
   reservationSnapshotCount Int
+  source                   String   @default("cron")
+  checkMethod              String   @default("daily_current_state_v1")
+  cutoffAt                 DateTime?
+  reservationSourceCount   Int?
   createdAt                DateTime @default(now())
   updatedAt                DateTime @updatedAt
 

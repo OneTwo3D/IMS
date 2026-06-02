@@ -72,6 +72,10 @@ export type InventoryReservationSnapshotRunInput = {
   snapshotDate: Date
   stockLevelCount: number
   reservationSnapshotCount: number
+  source: 'cron' | 'backfill'
+  checkMethod: string
+  cutoffAt: Date | null
+  reservationSourceCount: number | null
 }
 
 export type InventorySnapshotDrift = {
@@ -111,6 +115,9 @@ export type InventorySnapshotBackfillResult = {
 
 export type InventoryReservationSnapshotBackfillWarningCode =
   | 'reservation_source_changed_after_cutoff'
+  | 'timestampless_shipment_line_history_unavailable'
+  | 'assembly_component_history_unavailable'
+  | 'negative_available_qty'
 
 export type InventoryReservationSnapshotBackfillWarning = {
   snapshotDate: string
@@ -120,16 +127,19 @@ export type InventoryReservationSnapshotBackfillWarning = {
 
 export type InventoryReservationSnapshotBackfillResult = {
   enabled: boolean
-  daysWritten: number
+  reliability: 'not_attempted' | 'reliable' | 'warnings'
+  totalDaysInRange: number
+  supportedDaysWritten: number
   snapshotsWritten: number
   runMarkersWritten: number
-  unsupportedDays: number
-  reliable: boolean
+  unsupportedDaysSkipped: number
   warnings: InventoryReservationSnapshotBackfillWarning[]
+  knownLimitations: string[]
 }
 
 export type InventorySnapshotClient = Pick<
   PrismaClient,
+  | 'salesOrder'
   | 'stockLevel'
   | 'costLayer'
   | 'stockMovement'
@@ -144,6 +154,9 @@ export type InventorySnapshotClient = Pick<
 >
 
 export type InventorySnapshotTestClient = {
+  salesOrder: {
+    aggregate(args: unknown): Promise<{ _max: { updatedAt: Date | null } }>
+  }
   stockLevel: {
     findMany(args: unknown): Promise<Array<InventorySnapshotStockLevelRow | InventoryReservationSnapshotStockLevelRow>>
     findUnique(args: unknown): Promise<{ reservedQty: DecimalInput } | null>
@@ -164,9 +177,16 @@ export type InventorySnapshotTestClient = {
   inventoryReservationSnapshotRun: {
     upsert(args: unknown): Promise<unknown>
   }
-  orderAllocation: ReservationBreakdownClient['orderAllocation']
-  shipmentLine: ReservationBreakdownClient['shipmentLine']
-  productionOrder: ReservationBreakdownClient['productionOrder']
+  orderAllocation: ReservationBreakdownClient['orderAllocation'] & {
+    aggregate(args: unknown): Promise<{ _max: { updatedAt: Date | null } }>
+  }
+  shipmentLine: ReservationBreakdownClient['shipmentLine'] & {
+    findFirst(args: unknown): Promise<unknown | null>
+  }
+  productionOrder: ReservationBreakdownClient['productionOrder'] & {
+    aggregate(args: unknown): Promise<{ _max: { updatedAt: Date | null } }>
+    findFirst(args: unknown): Promise<unknown | null>
+  }
   $queryRaw?: InventorySnapshotClient['$queryRaw']
   $transaction?<T>(operations: Promise<T>[]): Promise<T[]>
 }
@@ -194,15 +214,30 @@ type SnapshotStateEntry = {
 
 type SnapshotState = Map<string, SnapshotStateEntry>
 
+type ReservationBackfillSupportSnapshot = {
+  latestMutableSourceUpdatedAt: Date | null
+  hasTimestamplessShipmentLine: boolean
+  hasAssemblyProductionOrder: boolean
+}
+
 const EMPTY_RESERVATION_BACKFILL_RESULT: InventoryReservationSnapshotBackfillResult = {
   enabled: false,
-  daysWritten: 0,
+  reliability: 'not_attempted',
+  totalDaysInRange: 0,
+  supportedDaysWritten: 0,
   snapshotsWritten: 0,
   runMarkersWritten: 0,
-  unsupportedDays: 0,
-  reliable: true,
+  unsupportedDaysSkipped: 0,
   warnings: [],
+  knownLimitations: [],
 }
+
+const RESERVATION_BACKFILL_CHECK_METHOD = 'current_sources_updated_at_gate_v2'
+const RESERVATION_BACKFILL_LIMITATIONS = [
+  'The mutation check assumes reservation-source writes use Prisma paths that maintain updatedAt values.',
+  'Hard-deleted reservation source rows cannot be detected without a historical source audit table.',
+  'Raw SQL updates that bypass updatedAt can make a supported day look safer than it is.',
+]
 
 function stockKey(productId: string, warehouseId: string): string {
   return JSON.stringify([productId, warehouseId])
@@ -449,7 +484,11 @@ function buildBackfilledReservationSnapshotRows(input: {
   snapshotDate: Date
   inventoryRows: readonly InventorySnapshotRowInput[]
   reservationSources: readonly ReservationBreakdownRow[]
-}): { rows: InventoryReservationSnapshotRowInput[]; stockLevelCount: number } {
+}): {
+  rows: InventoryReservationSnapshotRowInput[]
+  inventorySnapshotRowCount: number
+  negativeAvailableRowCount: number
+} {
   const sourceStats = reservationSourceStatsByKey(input.reservationSources)
   const inventoryRowsByKey = new Map(input.inventoryRows.map((row) => [
     stockKey(row.productId, row.warehouseId),
@@ -457,8 +496,9 @@ function buildBackfilledReservationSnapshotRows(input: {
   ]))
   const keys = new Set([...inventoryRowsByKey.keys(), ...sourceStats.keys()])
   const rows: InventoryReservationSnapshotRowInput[] = []
+  let negativeAvailableRowCount = 0
 
-  for (const key of keys) {
+  for (const key of [...keys].sort()) {
     const parsedKey = parseStockKey(key)
     if (!parsedKey) continue
     const [productId, warehouseId] = parsedKey
@@ -468,12 +508,14 @@ function buildBackfilledReservationSnapshotRows(input: {
     const reservationSourceCount = source?.reservationSourceCount ?? 0
     if (reservedQty.isZero() && reservationSourceCount === 0) continue
     const quantity = inventoryRow?.qty ?? toDecimal(0)
+    const availableQty = roundQty(quantity.sub(reservedQty))
+    if (availableQty.lt(0)) negativeAvailableRowCount += 1
     rows.push({
       snapshotDate: input.snapshotDate,
       productId,
       warehouseId,
       reservedQty,
-      availableQty: roundQty(quantity.sub(reservedQty)),
+      availableQty,
       reservationSourceCount,
     })
   }
@@ -485,7 +527,8 @@ function buildBackfilledReservationSnapshotRows(input: {
 
   return {
     rows,
-    stockLevelCount: input.inventoryRows.length,
+    inventorySnapshotRowCount: input.inventoryRows.length,
+    negativeAvailableRowCount,
   }
 }
 
@@ -514,43 +557,110 @@ function assertReservationStockLevelRow(
   }
 }
 
-async function hasReservationSourceMutationAfter(
+function latestDate(...values: Array<Date | null | undefined>): Date | null {
+  return values.reduce<Date | null>((latest, value) => {
+    if (!value) return latest
+    if (!latest || value > latest) return value
+    return latest
+  }, null)
+}
+
+async function loadReservationBackfillSupportSnapshot(
   client: SnapshotClient,
-  cutoff: Date,
-): Promise<boolean> {
-  const [allocationRows, shipmentRows, productionRows] = await Promise.all([
-    client.orderAllocation.findMany({
-      where: {
-        OR: [
-          { updatedAt: { gt: cutoff } },
-          { order: { updatedAt: { gt: cutoff } } },
-        ],
-      },
-      take: 1,
-    }),
-    client.shipmentLine.findMany({
+): Promise<ReservationBackfillSupportSnapshot> {
+  const [
+    allocationMax,
+    orderMax,
+    productionMax,
+    timestamplessShipmentLine,
+    assemblyProductionOrder,
+  ] = await Promise.all([
+    client.orderAllocation.aggregate({
+      _max: { updatedAt: true },
+    } as never) as Promise<{ _max: { updatedAt: Date | null } }>,
+    client.salesOrder.aggregate({
+      _max: { updatedAt: true },
+    } as never) as Promise<{ _max: { updatedAt: Date | null } }>,
+    client.productionOrder.aggregate({
+      _max: { updatedAt: true },
+    } as never) as Promise<{ _max: { updatedAt: Date | null } }>,
+    client.shipmentLine.findFirst({
       where: {
         shipment: {
-          updatedAt: { gt: cutoff },
+          status: { not: 'PENDING' },
+          order: { status: { notIn: ['CANCELLED', 'REFUNDED'] } },
         },
       },
-      take: 1,
-    }),
-    client.productionOrder.findMany({
+      select: { id: true },
+    } as never),
+    client.productionOrder.findFirst({
       where: {
-        updatedAt: { gt: cutoff },
+        status: 'IN_PROGRESS',
+        orderType: 'ASSEMBLY',
       },
-      take: 1,
-    }),
+      select: { id: true },
+    } as never),
   ])
 
-  return allocationRows.length > 0 || shipmentRows.length > 0 || productionRows.length > 0
+  return {
+    latestMutableSourceUpdatedAt: latestDate(
+      allocationMax._max.updatedAt,
+      orderMax._max.updatedAt,
+      productionMax._max.updatedAt,
+    ),
+    hasTimestamplessShipmentLine: timestamplessShipmentLine != null,
+    hasAssemblyProductionOrder: assemblyProductionOrder != null,
+  }
+}
+
+function reservationBackfillUnsupportedWarnings(
+  snapshotDate: Date,
+  cutoff: Date,
+  support: ReservationBackfillSupportSnapshot,
+): InventoryReservationSnapshotBackfillWarning[] {
+  const warnings: InventoryReservationSnapshotBackfillWarning[] = []
+  const formattedDate = formatSnapshotDate(snapshotDate)
+
+  if (support.latestMutableSourceUpdatedAt && support.latestMutableSourceUpdatedAt > cutoff) {
+    warnings.push({
+      snapshotDate: formattedDate,
+      code: 'reservation_source_changed_after_cutoff',
+      message: [
+        `Reservation sources changed after ${cutoff.toISOString()};`,
+        'historical reserved quantities cannot be reconstructed from current allocation/shipment/production state for this day.',
+      ].join(' '),
+    })
+  }
+
+  if (support.hasTimestamplessShipmentLine) {
+    warnings.push({
+      snapshotDate: formattedDate,
+      code: 'timestampless_shipment_line_history_unavailable',
+      message: [
+        'Committed shipment lines exist but shipment_lines has no updatedAt column;',
+        'historical reservation reconstruction cannot prove shipment-line membership for this day.',
+      ].join(' '),
+    })
+  }
+
+  if (support.hasAssemblyProductionOrder) {
+    warnings.push({
+      snapshotDate: formattedDate,
+      code: 'assembly_component_history_unavailable',
+      message: [
+        'In-progress assembly production orders depend on current BOM component membership;',
+        'historical reservation reconstruction cannot prove component reservations for this day.',
+      ].join(' '),
+    })
+  }
+
+  return warnings
 }
 
 async function loadCurrentReservationSnapshotRows(
   client: SnapshotClient,
   snapshotDate: Date,
-): Promise<{ rows: InventoryReservationSnapshotRowInput[]; stockLevelCount: number }> {
+): Promise<{ rows: InventoryReservationSnapshotRowInput[]; stockLevelCount: number; reservationSourceCount: number }> {
   const [stockLevels, reservationSources] = await Promise.all([
     client.stockLevel.findMany({
       select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
@@ -573,6 +683,7 @@ async function loadCurrentReservationSnapshotRows(
       reservationSources,
     }),
     stockLevelCount: stockLevels.length,
+    reservationSourceCount: reservationSources.length,
   }
 }
 
@@ -753,10 +864,18 @@ async function writeReservationSnapshotRun(
       snapshotDate: row.snapshotDate,
       stockLevelCount: row.stockLevelCount,
       reservationSnapshotCount: row.reservationSnapshotCount,
+      source: row.source,
+      checkMethod: row.checkMethod,
+      cutoffAt: row.cutoffAt,
+      reservationSourceCount: row.reservationSourceCount,
     },
     update: {
       stockLevelCount: row.stockLevelCount,
       reservationSnapshotCount: row.reservationSnapshotCount,
+      source: row.source,
+      checkMethod: row.checkMethod,
+      cutoffAt: row.cutoffAt,
+      reservationSourceCount: row.reservationSourceCount,
       updatedAt,
     },
   } as never)
@@ -780,6 +899,10 @@ export async function writeDailyInventorySnapshot(options: {
     snapshotDate,
     stockLevelCount: reservationSnapshot.stockLevelCount,
     reservationSnapshotCount: reservationSnapshotsWritten,
+    source: 'cron',
+    checkMethod: 'daily_current_state_v1',
+    cutoffAt: endOfUtcDay(snapshotDate),
+    reservationSourceCount: reservationSnapshot.reservationSourceCount,
   })
 
   return {
@@ -873,11 +996,24 @@ export async function backfillInventorySnapshots(options: {
   const reservationBackfill: InventoryReservationSnapshotBackfillResult = {
     ...EMPTY_RESERVATION_BACKFILL_RESULT,
     enabled: options.includeReservationSnapshots === true,
+    reliability: options.includeReservationSnapshots === true ? 'reliable' : 'not_attempted',
+    totalDaysInRange: options.includeReservationSnapshots === true
+      ? calendarDayCount(fromDate, toDate)
+      : 0,
     warnings: [],
+    knownLimitations: options.includeReservationSnapshots === true
+      ? [...RESERVATION_BACKFILL_LIMITATIONS]
+      : [],
   }
-  const currentReservationSources = options.includeReservationSnapshots
-    ? await loadReservationSourceRows(client as unknown as ReservationBreakdownClient)
-    : []
+  const reservationSupport = options.includeReservationSnapshots
+    ? await loadReservationBackfillSupportSnapshot(client)
+    : null
+  let currentReservationSources: ReservationBreakdownRow[] | null = null
+
+  async function getCurrentReservationSources(): Promise<ReservationBreakdownRow[]> {
+    currentReservationSources ??= await loadReservationSourceRows(client as ReservationBreakdownClient)
+    return currentReservationSources
+  }
 
   async function nextMovement(): Promise<InventorySnapshotMovementRow | null> {
     if (pendingMovement) {
@@ -934,34 +1070,46 @@ export async function backfillInventorySnapshots(options: {
 
     if (options.includeReservationSnapshots) {
       const cutoff = endOfUtcDay(day)
-      if (await hasReservationSourceMutationAfter(client, cutoff)) {
-        reservationBackfill.unsupportedDays += 1
-        reservationBackfill.reliable = false
-        reservationBackfill.warnings.push({
-          snapshotDate: formatSnapshotDate(day),
-          code: 'reservation_source_changed_after_cutoff',
-          message: [
-            `Reservation sources changed after ${cutoff.toISOString()};`,
-            'historical reserved quantities cannot be reconstructed from current allocation/shipment/production state for this day.',
-          ].join(' '),
-        })
+      const unsupportedWarnings = reservationSupport
+        ? reservationBackfillUnsupportedWarnings(day, cutoff, reservationSupport)
+        : []
+      if (unsupportedWarnings.length > 0) {
+        reservationBackfill.unsupportedDaysSkipped += 1
+        reservationBackfill.reliability = 'warnings'
+        reservationBackfill.warnings.push(...unsupportedWarnings)
       } else {
+        const reservationSources = await getCurrentReservationSources()
         const reservationSnapshot = buildBackfilledReservationSnapshotRows({
           snapshotDate: day,
           inventoryRows: rows,
-          reservationSources: currentReservationSources,
+          reservationSources,
         })
+        if (reservationSnapshot.negativeAvailableRowCount > 0) {
+          reservationBackfill.reliability = 'warnings'
+          reservationBackfill.warnings.push({
+            snapshotDate: formatSnapshotDate(day),
+            code: 'negative_available_qty',
+            message: [
+              `${reservationSnapshot.negativeAvailableRowCount} reservation snapshot row(s) have negative availableQty;`,
+              'the value is stored as evidence because reservation quantity exceeds historical on-hand quantity.',
+            ].join(' '),
+          })
+        }
         reservationBackfill.snapshotsWritten += options.dryRun
           ? reservationSnapshot.rows.length
           : await writeReservationSnapshotRows(client, reservationSnapshot.rows)
         if (!options.dryRun) {
           await writeReservationSnapshotRun(client, {
             snapshotDate: day,
-            stockLevelCount: reservationSnapshot.stockLevelCount,
+            stockLevelCount: reservationSnapshot.inventorySnapshotRowCount,
             reservationSnapshotCount: reservationSnapshot.rows.length,
+            source: 'backfill',
+            checkMethod: RESERVATION_BACKFILL_CHECK_METHOD,
+            cutoffAt: cutoff,
+            reservationSourceCount: reservationSources.length,
           })
         }
-        reservationBackfill.daysWritten += 1
+        reservationBackfill.supportedDaysWritten += 1
         reservationBackfill.runMarkersWritten += options.dryRun ? 0 : 1
       }
     }

@@ -109,6 +109,9 @@ test('inventory snapshot cron logs reservation snapshot counts from the real wri
   await withCronEnv({ CRON_SECRET: 'secret-token', NODE_ENV: 'production' }, async () => {
     const logs: CronRunLog[] = []
     const client: InventorySnapshotTestClient = {
+      salesOrder: {
+        aggregate: async () => ({ _max: { updatedAt: null } }),
+      },
       stockLevel: {
         findMany: async () => [
           { productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('5'), reservedQty: decimal('2') },
@@ -131,9 +134,19 @@ test('inventory snapshot cron logs reservation snapshot counts from the real wri
       inventoryReservationSnapshotRun: {
         upsert: async () => ({}),
       },
-      orderAllocation: { findMany: async () => [] },
-      shipmentLine: { findMany: async () => [] },
-      productionOrder: { findMany: async () => [] },
+      orderAllocation: {
+        findMany: async () => [],
+        aggregate: async () => ({ _max: { updatedAt: null } }),
+      },
+      shipmentLine: {
+        findMany: async () => [],
+        findFirst: async () => null,
+      },
+      productionOrder: {
+        findMany: async () => [],
+        aggregate: async () => ({ _max: { updatedAt: null } }),
+        findFirst: async () => null,
+      },
       $transaction: async (operations) => Promise.all(operations),
     }
     const response = await handleInventorySnapshotCron(
