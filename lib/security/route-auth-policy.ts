@@ -202,6 +202,10 @@ export const apiRouteAuthPolicy = {
     access: 'authenticated',
     reason: 'Requires sales analytics access: ADMIN, MANAGER, or FINANCE role.',
   },
+  '/api/export/purchasing-analytics': {
+    access: 'authenticated',
+    reason: 'Requires purchasing analytics access: ADMIN, MANAGER, or FINANCE role.',
+  },
   '/api/stock-position/filter-options': {
     access: 'authenticated',
     reason: 'Requires stock-position report access before returning bounded warehouse/category/supplier filter options.',

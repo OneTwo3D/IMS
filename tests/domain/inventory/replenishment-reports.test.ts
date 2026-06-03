@@ -19,6 +19,7 @@ function unusedClient(): ReplenishmentReportClient {
     stockLevel: unused,
     stockMovement: unused,
     purchaseOrderLine: unused,
+    purchaseReceipt: unused,
     salesOrderLine: unused,
     orderAllocation: unused,
     shipmentLine: unused,
@@ -113,6 +114,68 @@ test('reorder report ignores non-stock product type filters', async () => {
   )
 
   assert.equal(report.rows.length, 0)
+})
+
+test('reorder report falls back to observed supplier-product P95 lead time when configured lead time is absent', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [{
+        id: 'product-1',
+        sku: 'SKU-1',
+        name: 'Widget',
+        type: ProductType.SIMPLE,
+        stockUnit: 'pcs',
+        reorderPoint: null,
+        reorderQty: decimal('0'),
+        safetyStockQty: decimal('0'),
+        abcClass: null,
+        category,
+        supplierProducts: [{
+          supplierId: 'supplier-1',
+          supplierSku: 'SUP-SKU-1',
+          leadTimeDays: null,
+          supplier,
+        }],
+      }],
+    },
+    stockLevel: {
+      findMany: async () => [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') }],
+    },
+    stockMovement: {
+      findMany: async () => [{
+        productId: 'product-1',
+        qty: decimal('90'),
+        totalValueBase: decimal('180'),
+        createdAt: new Date('2026-06-01T12:00:00.000Z'),
+        product: { sku: 'SKU-1', name: 'Widget', category, supplierProducts: [{ supplier }] },
+      }],
+    },
+    purchaseReceipt: {
+      findMany: async () => [
+        {
+          id: 'receipt-1',
+          receivedAt: new Date('2026-05-11T00:00:00.000Z'),
+          po: { id: 'po-1', reference: 'PO-1', supplierId: 'supplier-1', expectedDelivery: null, poSentAt: new Date('2026-05-01T00:00:00.000Z'), createdAt: new Date('2026-05-01T00:00:00.000Z'), supplier },
+          lines: [{ poLineId: 'line-1', qtyReceived: decimal('1'), poLine: { qty: decimal('1'), productId: 'product-1', product: { sku: 'SKU-1', name: 'Widget', category } } }],
+        },
+        {
+          id: 'receipt-2',
+          receivedAt: new Date('2026-05-21T00:00:00.000Z'),
+          po: { id: 'po-2', reference: 'PO-2', supplierId: 'supplier-1', expectedDelivery: null, poSentAt: new Date('2026-05-01T00:00:00.000Z'), createdAt: new Date('2026-05-01T00:00:00.000Z'), supplier },
+          lines: [{ poLineId: 'line-2', qtyReceived: decimal('1'), poLine: { qty: decimal('1'), productId: 'product-1', product: { sku: 'SKU-1', name: 'Widget', category } } }],
+        },
+      ],
+    },
+  }
+
+  const report = await getReorderReport(
+    { thresholdDays: 90 },
+    { deps: { client, now: () => new Date('2026-06-01T18:00:00.000Z') } },
+  )
+
+  assert.equal(report.rows[0]?.leadTimeDays, 20)
+  assert.equal(report.rows[0]?.reorderPoint, '20')
 })
 
 test('backorder report aggregates active sales demand not covered by committed shipments and allocations', async () => {

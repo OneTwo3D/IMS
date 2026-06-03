@@ -4,6 +4,7 @@ import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/d
 import { calculateDailyVelocity, type VelocitySaleInput } from '@/lib/domain/inventory/velocity'
 import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
+import { getObservedLeadTimeP95BySupplierProduct } from '@/lib/domain/purchasing/purchasing-analytics'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -43,6 +44,7 @@ export type ReplenishmentReportClient = {
   stockLevel: FindManyDelegate
   stockMovement: FindManyDelegate
   purchaseOrderLine: FindManyDelegate
+  purchaseReceipt: FindManyDelegate
   salesOrderLine: FindManyDelegate
   orderAllocation: FindManyDelegate
   shipmentLine: FindManyDelegate
@@ -490,7 +492,7 @@ export async function getReorderReport(
   const generatedAt = nowFromDeps(options.deps)
   const demandDays = parsePositiveInteger(filters.thresholdDays, DEFAULT_DEMAND_WINDOW_DAYS)
   const window = demandWindow(generatedAt, demandDays)
-  const [products, stockLevels, velocityInputs, openPoLines] = await Promise.all([
+  const [products, stockLevels, velocityInputs, openPoLines, observedLeadTimeP95BySupplierProduct] = await Promise.all([
     client.product.findMany({
       where: productWhere(filters),
       select: {
@@ -520,6 +522,10 @@ export async function getReorderReport(
     loadStockLevels(client, filters),
     loadVelocityRows(client, filters, window),
     loadOpenPoLines(client, filters),
+    getObservedLeadTimeP95BySupplierProduct({
+      client: { purchaseReceipt: client.purchaseReceipt },
+      now: () => generatedAt,
+    }),
   ])
 
   const availableByProduct = new Map<string, Prisma.Decimal>()
@@ -534,7 +540,8 @@ export async function getReorderReport(
     const availableQty = availableByProduct.get(product.id) ?? new Prisma.Decimal(0)
     const inboundOpenPoQty = inboundByProduct.get(product.id) ?? new Prisma.Decimal(0)
     const averageDailyDemand = toDecimal(velocityByProduct.get(product.id)?.dailyQtyVelocity ?? 0)
-    const leadTimeDays = supplier?.leadTimeDays ?? DEFAULT_LEAD_TIME_DAYS
+    const observedLeadTimeDays = supplier ? observedLeadTimeP95BySupplierProduct.get(`${supplier.supplierId}:${product.id}`) : undefined
+    const leadTimeDays = supplier?.leadTimeDays ?? observedLeadTimeDays ?? DEFAULT_LEAD_TIME_DAYS
     const safetyStockQty = toDecimal(product.safetyStockQty ?? 0)
     const demandDuringLeadTime = averageDailyDemand.mul(leadTimeDays)
     const computedReorderPoint = demandDuringLeadTime.add(safetyStockQty)
@@ -598,6 +605,7 @@ export async function getReorderReport(
     },
     notices: [
       `Demand velocity uses SALE_DISPATCH movements from ${dateOnly(window.dateFrom)} to ${dateOnly(window.dateTo)}; returns are not netted.`,
+      'Lead time uses SupplierProduct.leadTimeDays first, observed PurchaseReceipt P95 by supplier/SKU second, and the default 14 days only when neither exists.',
       'Suggested reorder quantity is max(configured reorder qty, demand during lead time + safety stock - available - inbound open PO).',
     ],
   }
