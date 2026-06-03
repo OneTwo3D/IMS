@@ -17,6 +17,7 @@ export type VelocityWindow = {
 }
 
 export type VelocitySaleInput = {
+  key?: string
   productId: string
   sku: string
   productName: string
@@ -29,6 +30,7 @@ export type VelocitySaleInput = {
 }
 
 export type DailyVelocityRow = {
+  key?: string
   productId: string
   sku: string
   productName: string
@@ -67,6 +69,7 @@ export type AbcAnalysisRow = DailyVelocityRow & {
 }
 
 export type InventoryPositionInput = {
+  key?: string
   productId: string
   sku: string
   productName: string
@@ -85,6 +88,7 @@ export type DeadStockOptions = {
 }
 
 export type DeadStockRow = {
+  key?: string
   productId: string
   sku: string
   productName: string
@@ -138,6 +142,7 @@ export type AgingBucketRow = {
 }
 
 type MutableVelocityRow = {
+  key?: string
   productId: string
   sku: string
   productName: string
@@ -265,7 +270,9 @@ export function calculateDailyVelocity(sales: VelocitySaleInput[], window: Veloc
     assertNonNegative(cogsBase, 'cogsBase', sale)
     assertNonNegative(revenueBase, 'revenueBase', sale)
 
-    const current = rows.get(sale.productId) ?? {
+    const key = sale.key ?? sale.productId
+    const current = rows.get(key) ?? {
+      key: sale.key,
       productId: sale.productId,
       sku: sale.sku,
       productName: sale.productName,
@@ -288,12 +295,13 @@ export function calculateDailyVelocity(sales: VelocitySaleInput[], window: Veloc
     current.lastSaleAt = !current.lastSaleAt || occurredAt.getTime() > current.lastSaleAt.getTime()
       ? occurredAt
       : current.lastSaleAt
-    rows.set(sale.productId, current)
+    rows.set(key, current)
   }
 
   return [...rows.values()]
     .map((row) => ({
       productId: row.productId,
+      key: row.key,
       sku: row.sku,
       productName: row.productName,
       categoryName: row.categoryName,
@@ -378,14 +386,14 @@ export function calculateDeadStock(
   if (velocityWindow.days < options.thresholdDays) {
     throw new Error(`Dead-stock velocity window must be at least thresholdDays; got windowDays=${velocityWindow.days}, thresholdDays=${options.thresholdDays}`)
   }
-  const velocityByProduct = new Map(velocityRows.map((row) => [row.productId, row]))
+  const velocityByPositionKey = new Map(velocityRows.map((row) => [row.key ?? row.productId, row]))
   const excludeNew = options.excludeNeverSoldNewerThanThreshold ?? true
 
   return positions.flatMap((position) => {
     const qty = toDecimal(position.qty)
     if (qty.lte(0)) return []
 
-    const velocity = velocityByProduct.get(position.productId)
+    const velocity = velocityByPositionKey.get(position.key ?? position.productId)
     const lastSaleAt = velocity?.lastSaleAt ? normalizeDate(velocity.lastSaleAt, 'lastSaleAt') : null
     const firstStockedAt = position.firstStockedAt ? normalizeDate(position.firstStockedAt, 'firstStockedAt') : null
     if (lastSaleAt) assertNotAfter(lastSaleAt, asOf, 'lastSaleAt')
@@ -396,6 +404,7 @@ export function calculateDeadStock(
     if (daysSinceLastSale == null && excludeNew && firstStockedAt && daysBetween(firstStockedAt, asOf) < options.thresholdDays) return []
 
     return [{
+      key: position.key,
       productId: position.productId,
       sku: position.sku,
       productName: position.productName,

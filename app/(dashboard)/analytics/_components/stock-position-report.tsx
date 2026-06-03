@@ -28,13 +28,14 @@ export type StockPositionFilterValues = {
   supplierId?: string
   productType?: string
   includeZero?: boolean
+  thresholdDays?: string
   pageSize?: string
 }
 
 type StockPositionReportPageProps<Row> = {
   title: string
   description: string
-  reportKey: 'stock-on-hand' | 'stock-allocations' | 'negative-stock' | 'inventory-aging'
+  reportKey: 'stock-on-hand' | 'stock-allocations' | 'negative-stock' | 'inventory-aging' | 'dead-stock'
   filters: StockPositionFilterValues
   filterOptions: StockPositionFilterOptions
   pageInfo: PageInfo
@@ -45,6 +46,7 @@ type StockPositionReportPageProps<Row> = {
   notices?: string[]
   dateMode: 'as-of' | 'range' | 'none'
   showIncludeZero?: boolean
+  showThresholdDays?: boolean
 }
 
 function today(): string {
@@ -65,6 +67,7 @@ export function StockPositionReportPage<Row>({
   notices = [],
   dateMode,
   showIncludeZero = true,
+  showThresholdDays = false,
 }: StockPositionReportPageProps<Row>) {
   const params = currentParams(filters)
   const csvHref = `/api/export/stock-position?${appendParams(params, { type: reportKey })}`
@@ -168,6 +171,20 @@ export function StockPositionReportPage<Row>({
               <option value="500">500</option>
             </select>
           </div>
+          {showThresholdDays && (
+            <div className="space-y-1.5">
+              <Label htmlFor="thresholdDays">No sales for</Label>
+              <Input id="thresholdDays" name="thresholdDays" type="number" min="1" step="1" list="thresholdDaysOptions" defaultValue={filters.thresholdDays ?? '90'} className="h-9" />
+              <datalist id="thresholdDaysOptions">
+                <option value="30" />
+                <option value="60" />
+                <option value="90" />
+                <option value="180" />
+                <option value="365" />
+                <option value="730" />
+              </datalist>
+            </div>
+          )}
         </div>
         <div className="mt-3 flex items-center justify-between gap-3">
           {showIncludeZero ? (

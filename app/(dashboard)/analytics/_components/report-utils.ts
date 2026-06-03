@@ -23,3 +23,9 @@ export function toneClass(tone: SummaryTone = 'default'): string {
   if (tone === 'warning') return 'text-orange-600'
   return 'text-foreground'
 }
+
+export function decimalStringPositive(value: string): boolean {
+  const normalized = value.trim()
+  if (!normalized || normalized.startsWith('-')) return false
+  return /[1-9]/.test(normalized.replace('.', ''))
+}

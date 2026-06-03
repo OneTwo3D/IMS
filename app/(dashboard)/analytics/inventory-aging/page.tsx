@@ -5,7 +5,9 @@ import {
   type StockPositionFilters,
 } from '@/lib/domain/inventory/stock-position-reports'
 import {
+  emptyInventoryAgingReportForSourceLimit,
   getInventoryAgingReport,
+  InventoryHealthSourceLimitError,
   type InventoryAgingReportRow,
 } from '@/lib/domain/inventory/inventory-health-reports'
 import {
@@ -49,7 +51,10 @@ export default async function InventoryAgingPage({ searchParams }: { searchParam
   const resolvedSearchParams = await searchParams
   const filters = filtersFromSearch(resolvedSearchParams)
   const [report, filterOptions, organisation] = await Promise.all([
-    getInventoryAgingReport(filters),
+    getInventoryAgingReport(filters).catch((error: unknown) => {
+      if (error instanceof InventoryHealthSourceLimitError) return emptyInventoryAgingReportForSourceLimit(filters, error)
+      throw error
+    }),
     getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),
     getOrganisation(),
   ])

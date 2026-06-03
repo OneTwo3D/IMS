@@ -70,6 +70,7 @@ export type StockPositionFilters = {
   supplierId?: string
   productType?: ProductType
   includeZero?: boolean
+  thresholdDays?: number
   page?: number
   pageSize?: number
 }
