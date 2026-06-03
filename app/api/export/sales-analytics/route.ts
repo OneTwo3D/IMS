@@ -65,25 +65,25 @@ export async function GET(req: NextRequest) {
 
   switch (reportType) {
     case 'sales': {
-      const report = await getSalesAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT })
+      const report = await getSalesAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
       return csvResponse(toCsv(report.rows, ['key', 'label', 'groupBy', 'currency', 'orderCount', 'lineCount', 'revenue', 'tax', 'shipping', 'discount']), `sales-analytics-${date}.csv`)
     }
     case 'customers': {
-      const report = await getCustomerAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT })
+      const report = await getCustomerAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
       return csvResponse(toCsv(report.rows, ['customerId', 'customerName', 'customerEmail', 'orderCount', 'revenueBase', 'grossProfitBase', 'arExposureBase', 'shareOfRevenuePct']), `customer-mix-${date}.csv`)
     }
     case 'margin': {
-      const report = await getMarginAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT })
+      const report = await getMarginAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
       return csvResponse(toCsv(report.rows, ['productId', 'sku', 'productName', 'categoryName', 'lineCount', 'revenueBase', 'cogsBase', 'grossProfitBase', 'marginPct', 'contributionPct']), `gross-margin-${date}.csv`)
     }
     case 'returns': {
-      const report = await getReturnsAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT })
+      const report = await getReturnsAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
       return csvResponse(toCsv(report.rows, ['productId', 'sku', 'productName', 'customerName', 'reason', 'refundCount', 'returnedQty', 'refundValueBase', 'shippedQty', 'returnRatePct']), `returns-${date}.csv`)
@@ -93,7 +93,7 @@ export async function GET(req: NextRequest) {
       return csvResponse(toCsv(report.rows, ['metric', 'value', 'numerator', 'denominator']), `fulfillment-kpis-${date}.csv`)
     }
     case 'throughput': {
-      const report = await getThroughputAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT })
+      const report = await getThroughputAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
       return csvResponse(toCsv(report.rows, ['date', 'userName', 'orderCount', 'shipmentCount', 'lineCount', 'queueDepth']), `throughput-${date}.csv`)

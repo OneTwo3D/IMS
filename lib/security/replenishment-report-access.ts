@@ -1,3 +1,6 @@
+import { redirect } from 'next/navigation'
+import { requireAuth, type AuthSession } from '@/lib/auth/server'
+
 const REPLENISHMENT_REPORT_ROLES = new Set(['ADMIN', 'MANAGER', 'FINANCE'])
 
 export const REPLENISHMENT_REPORT_LINKS = [
@@ -8,4 +11,12 @@ export const REPLENISHMENT_REPORT_LINKS = [
 
 export function canAccessReplenishmentReports(role: string): boolean {
   return REPLENISHMENT_REPORT_ROLES.has(role)
+}
+
+export async function requireReplenishmentReportAccess(): Promise<AuthSession> {
+  const session = await requireAuth()
+  if (!canAccessReplenishmentReports(session.user.role)) {
+    redirect('/dashboard')
+  }
+  return session
 }

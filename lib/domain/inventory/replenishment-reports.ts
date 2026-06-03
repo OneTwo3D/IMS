@@ -9,6 +9,7 @@ import { getObservedLeadTimeP95BySupplierProduct } from '@/lib/domain/purchasing
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
+const SOURCE_ROW_LIMIT = 50000
 const DEFAULT_DEMAND_WINDOW_DAYS = 90
 const DEFAULT_LEAD_TIME_DAYS = 14
 const REPLENISHMENT_PRODUCT_TYPES: ProductType[] = [
@@ -375,7 +376,7 @@ async function loadOpenPoLines(client: ReplenishmentReportClient, filters: Stock
     where: {
       po: {
         status: { in: OPEN_PO_STATUSES },
-        ...(filters.warehouseId ? { OR: [{ destinationWarehouseId: filters.warehouseId }, { destinationWarehouseId: null }] } : {}),
+        ...(filters.warehouseId ? { destinationWarehouseId: filters.warehouseId } : {}),
       },
       product: productWhere(filters),
     },
@@ -455,7 +456,11 @@ async function loadVelocityRows(client: ReplenishmentReportClient, filters: Stoc
         },
       },
     },
+    take: SOURCE_ROW_LIMIT + 1,
   }) as SaleMovementRow[]
+  if (movements.length > SOURCE_ROW_LIMIT) {
+    throw new Error(`Replenishment velocity source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  }
 
   return movements.map((movement) => ({
     productId: movement.productId,
@@ -534,25 +539,31 @@ export async function getReorderReport(
   }
   const inboundByProduct = inboundOpenPoByProduct(openPoLines)
   const velocityByProduct = new Map(calculateDailyVelocity(velocityInputs, window).map((row) => [row.productId, row]))
+  const defaultLeadTimeSkus: string[] = []
 
   const rows = products.flatMap<ReorderReportRow>((product) => {
+    const configuredReorderQty = product.reorderQty == null ? null : toDecimal(product.reorderQty)
+    if (configuredReorderQty?.lte(0)) return []
     const supplier = product.supplierProducts[0] ?? null
     const availableQty = availableByProduct.get(product.id) ?? new Prisma.Decimal(0)
     const inboundOpenPoQty = inboundByProduct.get(product.id) ?? new Prisma.Decimal(0)
+    const projectedAvailableQty = availableQty.add(inboundOpenPoQty)
     const averageDailyDemand = toDecimal(velocityByProduct.get(product.id)?.dailyQtyVelocity ?? 0)
     const observedLeadTimeDays = supplier ? observedLeadTimeP95BySupplierProduct.get(`${supplier.supplierId}:${product.id}`) : undefined
     const leadTimeDays = supplier?.leadTimeDays ?? observedLeadTimeDays ?? DEFAULT_LEAD_TIME_DAYS
+    if (supplier?.leadTimeDays == null && observedLeadTimeDays == null) defaultLeadTimeSkus.push(product.sku)
     const safetyStockQty = toDecimal(product.safetyStockQty ?? 0)
     const demandDuringLeadTime = averageDailyDemand.mul(leadTimeDays)
     const computedReorderPoint = demandDuringLeadTime.add(safetyStockQty)
     const reorderPoint = product.reorderPoint == null ? computedReorderPoint : toDecimal(product.reorderPoint)
-    const configuredReorderQty = toDecimal(product.reorderQty ?? 0)
-    const gapQty = demandDuringLeadTime.add(safetyStockQty).sub(availableQty).sub(inboundOpenPoQty)
-    const suggestedReorderQty = Prisma.Decimal.max(new Prisma.Decimal(0), configuredReorderQty, gapQty)
-    if (suggestedReorderQty.lte(0) && availableQty.gt(reorderPoint)) return []
-    const urgency: ReorderReportRow['urgency'] = availableQty.lte(0)
+    const gapQty = reorderPoint.sub(projectedAvailableQty)
+    const suggestedReorderQty = gapQty.gt(0)
+      ? Prisma.Decimal.max(configuredReorderQty ?? new Prisma.Decimal(0), gapQty)
+      : new Prisma.Decimal(0)
+    if (suggestedReorderQty.lte(0) && projectedAvailableQty.gt(reorderPoint)) return []
+    const urgency: ReorderReportRow['urgency'] = projectedAvailableQty.lte(0)
       ? 'critical'
-      : availableQty.lte(reorderPoint)
+      : projectedAvailableQty.lte(reorderPoint)
         ? 'reorder'
         : 'watch'
     return [{
@@ -571,7 +582,7 @@ export async function getReorderReport(
       leadTimeDays,
       safetyStockQty: quantityString(safetyStockQty),
       reorderPoint: quantityString(reorderPoint),
-      configuredReorderQty: quantityString(configuredReorderQty),
+      configuredReorderQty: quantityString(configuredReorderQty ?? 0),
       suggestedReorderQty: quantityString(suggestedReorderQty),
       abcClass: product.abcClass,
       urgency,
@@ -606,7 +617,8 @@ export async function getReorderReport(
     notices: [
       `Demand velocity uses SALE_DISPATCH movements from ${dateOnly(window.dateFrom)} to ${dateOnly(window.dateTo)}; returns are not netted.`,
       'Lead time uses SupplierProduct.leadTimeDays first, observed PurchaseReceipt P95 by supplier/SKU second, and the default 14 days only when neither exists.',
-      'Suggested reorder quantity is max(configured reorder qty, demand during lead time + safety stock - available - inbound open PO).',
+      'Suggested reorder quantity only applies the configured reorder quantity when projected available stock is below the reorder point; a configured reorderQty of 0 opts the SKU out of auto-reorder suggestions.',
+      ...(defaultLeadTimeSkus.length > 0 ? [`Default ${DEFAULT_LEAD_TIME_DAYS}-day lead time used for ${defaultLeadTimeSkus.length} SKU(s) without configured or observed lead time: ${defaultLeadTimeSkus.slice(0, 10).join(', ')}${defaultLeadTimeSkus.length > 10 ? ', ...' : ''}.`] : []),
     ],
   }
 }
@@ -680,7 +692,8 @@ export async function getBackorderDemandReport(
     const orderedQty = toDecimal(line.qty)
     const committedQty = Prisma.Decimal.min(orderedQty, committedByLine.get(line.id) ?? new Prisma.Decimal(0))
     const remainingAfterCommitted = Prisma.Decimal.max(new Prisma.Decimal(0), orderedQty.sub(committedQty))
-    const allocatedQty = Prisma.Decimal.min(remainingAfterCommitted, allocatedByLine.get(line.id) ?? new Prisma.Decimal(0))
+    const openAllocationQty = Prisma.Decimal.max(new Prisma.Decimal(0), (allocatedByLine.get(line.id) ?? new Prisma.Decimal(0)).sub(committedQty))
+    const allocatedQty = Prisma.Decimal.min(remainingAfterCommitted, openAllocationQty)
     const backorderQty = remainingAfterCommitted.sub(allocatedQty)
     if (backorderQty.lte(0)) continue
     const current = rowsByProduct.get(line.productId) ?? {
@@ -737,7 +750,7 @@ export async function getBackorderDemandReport(
       allocatedQty: quantityString(totals.allocatedQty),
       backorderQty: quantityString(totals.backorderQty),
     },
-    notices: ['Backorder demand includes non-cancelled sales order lines where ordered qty exceeds committed shipment qty plus allocation qty.'],
+    notices: ['Backorder demand includes non-cancelled sales order lines where ordered qty exceeds committed shipment qty plus still-open allocation qty. Unassigned inbound POs are included in product totals but are not treated as warehouse-specific cover.'],
   }
 }
 
@@ -871,6 +884,6 @@ export async function getComponentShortageReport(
       inboundOpenPoQty: quantityString(totals.inboundOpenPoQty),
       shortageQty: quantityString(totals.shortageQty),
     },
-    notices: ['Component shortages include draft and in-progress production orders and subtract current available stock plus inbound open PO quantity.'],
+    notices: ['Component shortages include draft and in-progress production orders and subtract current available stock plus inbound open PO quantity for the production warehouse. POs without a destination warehouse are not treated as warehouse-specific cover.'],
   }
 }

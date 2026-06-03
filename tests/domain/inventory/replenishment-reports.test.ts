@@ -116,6 +116,34 @@ test('reorder report ignores non-stock product type filters', async () => {
   assert.equal(report.rows.length, 0)
 })
 
+test('reorder report treats configured reorderQty zero as opt-out', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [{
+        id: 'product-1',
+        sku: 'SKU-1',
+        name: 'Widget',
+        type: ProductType.SIMPLE,
+        stockUnit: 'pcs',
+        reorderPoint: decimal('10'),
+        reorderQty: decimal('0'),
+        safetyStockQty: decimal('0'),
+        abcClass: null,
+        category,
+        supplierProducts: [],
+      }],
+    },
+    stockLevel: {
+      findMany: async () => [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') }],
+    },
+  }
+
+  const report = await getReorderReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+
+  assert.equal(report.rows.length, 0)
+})
+
 test('reorder report falls back to observed supplier-product P95 lead time when configured lead time is absent', async () => {
   const client: ReplenishmentReportClient = {
     ...unusedClient(),
@@ -127,7 +155,7 @@ test('reorder report falls back to observed supplier-product P95 lead time when 
         type: ProductType.SIMPLE,
         stockUnit: 'pcs',
         reorderPoint: null,
-        reorderQty: decimal('0'),
+        reorderQty: null,
         safetyStockQty: decimal('0'),
         abcClass: null,
         category,
@@ -231,8 +259,8 @@ test('backorder report aggregates active sales demand not covered by committed s
   assert.equal(report.rows[0]?.orderCount, 2)
   assert.equal(report.rows[0]?.orderedQty, '13')
   assert.equal(report.rows[0]?.committedQty, '2')
-  assert.equal(report.rows[0]?.allocatedQty, '4')
-  assert.equal(report.rows[0]?.backorderQty, '7')
+  assert.equal(report.rows[0]?.allocatedQty, '2')
+  assert.equal(report.rows[0]?.backorderQty, '9')
   assert.equal(report.rows[0]?.inboundOpenPoQty, '15')
   assert.equal(report.rows[0]?.projectedFillDate, '2026-05-20')
 })

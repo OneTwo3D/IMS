@@ -8,12 +8,13 @@ import {
 import { db } from '@/lib/db'
 import { roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
+import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
+const SOURCE_ROW_LIMIT = 50000
 const DEFAULT_PERIOD_DAYS = 30
-const BASE_CURRENCY = 'GBP'
 const ACTIVE_ORDER_STATUSES = Object.values(SalesOrderStatus).filter((status) => status !== SalesOrderStatus.CANCELLED)
 
 type FindManyDelegate = {
@@ -33,6 +34,8 @@ export type SalesFulfillmentAnalyticsClient = {
 export type SalesFulfillmentAnalyticsDeps = {
   client?: SalesFulfillmentAnalyticsClient
   now?: () => Date
+  baseCurrency?: () => Promise<string>
+  paginate?: boolean
 }
 
 export type SalesAnalyticsGroupBy = 'product' | 'category' | 'customer' | 'channel'
@@ -230,6 +233,11 @@ function nowFromDeps(deps?: SalesFulfillmentAnalyticsDeps): Date {
   return deps?.now?.() ?? new Date()
 }
 
+async function baseCurrencyFromDeps(deps?: SalesFulfillmentAnalyticsDeps): Promise<string> {
+  if (deps?.baseCurrency) return deps.baseCurrency()
+  return deps?.client ? DEFAULT_BASE_CURRENCY : getBaseCurrencyCode()
+}
+
 function startOfUtcDay(date: Date): Date {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
 }
@@ -284,14 +292,15 @@ function pageInfo(totalRows: number, page: number | undefined, pageSize: number)
   }
 }
 
-function paginate<T>(rows: T[], filters: SalesAnalyticsFilters): { rows: T[]; pageInfo: PageInfo } {
+function paginate<T>(rows: T[], filters: SalesAnalyticsFilters, enabled = true): { rows: T[]; pageInfo: PageInfo } {
   const pageSize = clampPageSize(filters.pageSize)
   const info = pageInfo(rows.length, filters.page, pageSize)
+  if (!enabled) return { rows, pageInfo: { ...info, page: 1, totalPages: 1, hasNextPage: false, hasPreviousPage: false } }
   const start = (info.page - 1) * pageSize
   return { rows: rows.slice(start, start + pageSize), pageInfo: info }
 }
 
-function moneyString(value: DecimalInput, currency = BASE_CURRENCY): string {
+function moneyString(value: DecimalInput, currency = DEFAULT_BASE_CURRENCY): string {
   return roundMoney(value, currency).toString()
 }
 
@@ -361,14 +370,16 @@ async function loadSalesOrders(client: SalesFulfillmentAnalyticsClient, filters:
           product: { select: { id: true, sku: true, name: true, category: { select: { name: true } } } },
         },
       },
-      shoppingLinks: { select: { connector: true }, take: 1 },
+      shoppingLinks: { select: { connector: true }, orderBy: { createdAt: 'asc' }, take: 1 },
     },
     orderBy: { createdAt: 'asc' },
+    take: SOURCE_ROW_LIMIT + 1,
   }) as Promise<SalesOrderRow[]>
 }
 
 async function loadSalesOrdersByIds(client: SalesFulfillmentAnalyticsClient, orderIds: string[]): Promise<SalesOrderRow[]> {
   if (orderIds.length === 0) return []
+  if (orderIds.length > SOURCE_ROW_LIMIT) throw new Error(`Sales analytics source orders exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   return client.salesOrder.findMany({
     where: {
       id: { in: [...new Set(orderIds)] },
@@ -406,7 +417,7 @@ async function loadSalesOrdersByIds(client: SalesFulfillmentAnalyticsClient, ord
           product: { select: { id: true, sku: true, name: true, category: { select: { name: true } } } },
         },
       },
-      shoppingLinks: { select: { connector: true }, take: 1 },
+      shoppingLinks: { select: { connector: true }, orderBy: { createdAt: 'asc' }, take: 1 },
     },
     orderBy: { createdAt: 'asc' },
   }) as Promise<SalesOrderRow[]>
@@ -425,21 +436,26 @@ function allocatedOrderAmount(orderAmount: DecimalInput, lineAmount: DecimalInpu
 export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<SalesAnalyticsReport<SalesReportRow>> {
   const client = clientFromDeps(deps)
   const generatedAt = nowFromDeps(deps)
+  const baseCurrency = await baseCurrencyFromDeps(deps)
   const window = period(filters, generatedAt)
   const rowsByKey = new Map<string, SalesReportRow & { revenueDecimal: Prisma.Decimal; taxDecimal: Prisma.Decimal; shippingDecimal: Prisma.Decimal; discountDecimal: Prisma.Decimal; orderIds: Set<string> }>()
   const orders = await loadSalesOrders(client, filters, window)
+  if (orders.length > SOURCE_ROW_LIMIT) throw new Error(`Sales analytics source orders exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   const grouping = groupBy(filters)
   const mode = currencyMode(filters)
 
   for (const order of orders) {
     if (grouping === 'customer' || grouping === 'channel') {
-      const key = grouping === 'customer' ? (order.customerId ?? `email:${order.customerEmail ?? customerName(order)}`) : channel(order)
+      const currencyKey = mode === 'foreign' ? `:${order.currency}` : ''
+      const key = grouping === 'customer'
+        ? `${order.customerId ?? (order.customerEmail ? `guest-email:${order.customerEmail.toLowerCase()}` : `guest-name:${customerName(order)}`)}${currencyKey}`
+        : `${channel(order)}${currencyKey}`
       const label = grouping === 'customer' ? customerName(order) : channel(order)
       const current = rowsByKey.get(key) ?? {
         key,
         label,
         groupBy: grouping,
-        currency: mode === 'foreign' ? order.currency : BASE_CURRENCY,
+        currency: mode === 'foreign' ? order.currency : baseCurrency,
         orderCount: 0,
         lineCount: 0,
         revenue: '0',
@@ -459,7 +475,7 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
       current.taxDecimal = current.taxDecimal.add(toDecimal(mode === 'foreign' ? order.taxForeign : order.taxBase))
       current.shippingDecimal = current.shippingDecimal.add(toDecimal(mode === 'foreign' ? order.shippingForeign : order.shippingBase))
       current.discountDecimal = current.discountDecimal.add(toDecimal(order.discountAmount))
-      current.currency = current.currency === (mode === 'foreign' ? order.currency : BASE_CURRENCY) ? current.currency : 'Multiple'
+      current.currency = current.currency === (mode === 'foreign' ? order.currency : baseCurrency) ? current.currency : 'Multiple'
       rowsByKey.set(key, current)
       continue
     }
@@ -467,14 +483,15 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
     const lineTotal = orderLineTotal(order, mode)
     const fallbackShare = order.lines.length > 0 ? new Prisma.Decimal(1).div(order.lines.length) : new Prisma.Decimal(0)
     for (const line of order.lines) {
-      const key = grouping === 'category' ? (line.product?.category?.name ?? 'Uncategorised') : (line.productId ?? `sku:${line.sku ?? line.description}`)
+      const currencyKey = mode === 'foreign' ? `:${order.currency}` : ''
+      const key = `${grouping === 'category' ? (line.product?.category?.name ?? 'Uncategorised') : (line.productId ?? `sku:${line.sku ?? line.description}`)}${currencyKey}`
       const label = grouping === 'category' ? key : `${line.sku ?? line.product?.sku ?? 'No SKU'} ${line.product?.name ?? line.description}`.trim()
       const lineAmount = mode === 'foreign' ? line.totalForeign : line.totalBase
       const current = rowsByKey.get(key) ?? {
         key,
         label,
         groupBy: grouping,
-        currency: mode === 'foreign' ? order.currency : BASE_CURRENCY,
+        currency: mode === 'foreign' ? order.currency : baseCurrency,
         orderCount: 0,
         lineCount: 0,
         revenue: '0',
@@ -494,7 +511,7 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
       current.taxDecimal = current.taxDecimal.add(allocatedOrderAmount(mode === 'foreign' ? order.taxForeign : order.taxBase, lineAmount, lineTotal, fallbackShare))
       current.shippingDecimal = current.shippingDecimal.add(allocatedOrderAmount(mode === 'foreign' ? order.shippingForeign : order.shippingBase, lineAmount, lineTotal, fallbackShare))
       current.discountDecimal = current.discountDecimal.add(toDecimal(line.discountAmount))
-      current.currency = current.currency === (mode === 'foreign' ? order.currency : BASE_CURRENCY) ? current.currency : 'Multiple'
+      current.currency = current.currency === (mode === 'foreign' ? order.currency : baseCurrency) ? current.currency : 'Multiple'
       rowsByKey.set(key, current)
     }
   }
@@ -507,10 +524,10 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
       currency: row.currency,
       orderCount: row.orderCount,
       lineCount: row.lineCount,
-      revenue: moneyString(row.revenueDecimal, row.currency === 'Multiple' ? BASE_CURRENCY : row.currency),
-      tax: moneyString(row.taxDecimal, row.currency === 'Multiple' ? BASE_CURRENCY : row.currency),
-      shipping: moneyString(row.shippingDecimal, row.currency === 'Multiple' ? BASE_CURRENCY : row.currency),
-      discount: moneyString(row.discountDecimal, row.currency === 'Multiple' ? BASE_CURRENCY : row.currency),
+      revenue: moneyString(row.revenueDecimal, row.currency === 'Multiple' ? baseCurrency : row.currency),
+      tax: moneyString(row.taxDecimal, row.currency === 'Multiple' ? baseCurrency : row.currency),
+      shipping: moneyString(row.shippingDecimal, row.currency === 'Multiple' ? baseCurrency : row.currency),
+      discount: moneyString(row.discountDecimal, row.currency === 'Multiple' ? baseCurrency : row.currency),
     }))
     .sort((a, b) => toDecimal(b.revenue).cmp(a.revenue) || a.label.localeCompare(b.label))
 
@@ -523,7 +540,7 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
     }),
     { revenue: new Prisma.Decimal(0), tax: new Prisma.Decimal(0), shipping: new Prisma.Decimal(0), discount: new Prisma.Decimal(0) },
   )
-  const paged = paginate(rows, filters)
+  const paged = paginate(rows, filters, deps?.paginate !== false)
 
   return {
     generatedAt: generatedAt.toISOString(),
@@ -532,14 +549,14 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
-      revenue: moneyString(totals.revenue),
-      tax: moneyString(totals.tax),
-      shipping: moneyString(totals.shipping),
-      discount: moneyString(totals.discount),
+      revenue: moneyString(totals.revenue, baseCurrency),
+      tax: moneyString(totals.tax, baseCurrency),
+      shipping: moneyString(totals.shipping, baseCurrency),
+      discount: moneyString(totals.discount, baseCurrency),
     },
     notices: [
       'Sales totals exclude cancelled orders. Product/category views allocate order-level totals across lines by line value so grand totals reconcile to SalesOrder totals.',
-      mode === 'foreign' ? 'Foreign-currency rows show Multiple when a group contains more than one original currency.' : 'Base-currency rows use GBP amounts recorded on the order.',
+      mode === 'foreign' ? 'Foreign-currency product/category rows are split by original order currency; customer/channel rows show Multiple when a group contains more than one original currency.' : `Base-currency rows use ${baseCurrency} amounts recorded on the order.`,
     ],
   }
 }
@@ -558,7 +575,9 @@ async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: 
       totalCostBase: true,
       movement: { select: { referenceId: true } },
     },
+    take: SOURCE_ROW_LIMIT + 1,
   }) as Array<{ totalCostBase: DecimalInput; movement: { referenceId: string | null } }>
+  if (rows.length > SOURCE_ROW_LIMIT) throw new Error(`Sales COGS source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   const byOrder = new Map<string, Prisma.Decimal>()
   for (const row of rows) {
     if (!row.movement.referenceId) continue
@@ -570,15 +589,17 @@ async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: 
 export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<SalesAnalyticsReport<CustomerReportRow>> {
   const client = clientFromDeps(deps)
   const generatedAt = nowFromDeps(deps)
+  const baseCurrency = await baseCurrencyFromDeps(deps)
   const window = period(filters, generatedAt)
   const [orders, cogsByOrder] = await Promise.all([
     loadSalesOrders(client, filters, window),
     loadCogsByOrder(client, window),
   ])
+  if (orders.length > SOURCE_ROW_LIMIT) throw new Error(`Customer analytics source orders exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   const totalRevenue = orders.reduce((sum, order) => sum.add(toDecimal(order.totalBase)), new Prisma.Decimal(0))
   const groups = new Map<string, CustomerReportRow & { revenue: Prisma.Decimal; grossProfit: Prisma.Decimal; arExposure: Prisma.Decimal; orderIds: Set<string> }>()
   for (const order of orders) {
-    const key = order.customerId ?? `email:${order.customerEmail ?? customerName(order)}`
+    const key = order.customerId ?? (order.customerEmail ? `guest-email:${order.customerEmail.toLowerCase()}` : `guest-name:${customerName(order)}`)
     const cogs = cogsByOrder.get(order.id) ?? new Prisma.Decimal(0)
     const current = groups.get(key) ?? {
       customerId: order.customerId,
@@ -607,13 +628,13 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
       customerName: row.customerName,
       customerEmail: row.customerEmail,
       orderCount: row.orderCount,
-      revenueBase: moneyString(row.revenue),
-      grossProfitBase: moneyString(row.grossProfit),
-      arExposureBase: moneyString(row.arExposure),
+      revenueBase: moneyString(row.revenue, baseCurrency),
+      grossProfitBase: moneyString(row.grossProfit, baseCurrency),
+      arExposureBase: moneyString(row.arExposure, baseCurrency),
       shareOfRevenuePct: pctString(row.revenue, totalRevenue),
     }))
     .sort((a, b) => toDecimal(b.revenueBase).cmp(a.revenueBase) || a.customerName.localeCompare(b.customerName))
-  const paged = paginate(rows, filters)
+  const paged = paginate(rows, filters, deps?.paginate !== false)
   const grossProfit = [...groups.values()].reduce((sum, row) => sum.add(row.grossProfit), new Prisma.Decimal(0))
   const arExposure = [...groups.values()].reduce((sum, row) => sum.add(row.arExposure), new Prisma.Decimal(0))
   return {
@@ -623,9 +644,9 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
-      revenueBase: moneyString(totalRevenue),
-      grossProfitBase: moneyString(grossProfit),
-      arExposureBase: moneyString(arExposure),
+      revenueBase: moneyString(totalRevenue, baseCurrency),
+      grossProfitBase: moneyString(grossProfit, baseCurrency),
+      arExposureBase: moneyString(arExposure, baseCurrency),
     },
     notices: ['AR exposure is unpaid sales-order totalBase for the selected period. COGS comes from CogsEntry rows linked to SALE_DISPATCH movements.'],
   }
@@ -634,6 +655,7 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
 export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<SalesAnalyticsReport<MarginReportRow>> {
   const client = clientFromDeps(deps)
   const generatedAt = nowFromDeps(deps)
+  const baseCurrency = await baseCurrencyFromDeps(deps)
   const window = period(filters, generatedAt)
   const cogsRows = await client.cogsEntry.findMany({
     where: { createdAt: { gte: window.dateFrom, lte: window.dateTo }, movement: { type: StockMovementType.SALE_DISPATCH } },
@@ -650,14 +672,18 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
         },
       },
     },
+    take: SOURCE_ROW_LIMIT + 1,
   }) as CogsEntryRow[]
+  if (cogsRows.length > SOURCE_ROW_LIMIT) throw new Error(`Margin analytics COGS source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   const cogsOrderIds = cogsRows
     .map((row) => row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null)
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
+  const cogsProductIds = new Set(cogsRows.map((row) => row.movement.productId))
   const orders = await loadSalesOrdersByIds(client, cogsOrderIds)
   const groups = new Map<string, MarginReportRow & { revenue: Prisma.Decimal; cogs: Prisma.Decimal; lineIds: Set<string> }>()
   for (const order of orders) {
     for (const line of order.lines) {
+      if (!line.productId || !cogsProductIds.has(line.productId)) continue
       const key = line.productId ?? `sku:${line.sku ?? line.description}`
       const current = groups.get(key) ?? {
         productId: line.productId,
@@ -710,15 +736,15 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
         productName: row.productName,
         categoryName: row.categoryName,
         lineCount: row.lineCount,
-        revenueBase: moneyString(row.revenue),
-        cogsBase: moneyString(row.cogs),
-        grossProfitBase: moneyString(grossProfit),
+        revenueBase: moneyString(row.revenue, baseCurrency),
+        cogsBase: moneyString(row.cogs, baseCurrency),
+        grossProfitBase: moneyString(grossProfit, baseCurrency),
         marginPct: pctString(grossProfit, row.revenue),
         contributionPct: pctString(grossProfit, totalGrossProfit),
       }
     })
     .sort((a, b) => toDecimal(b.grossProfitBase).cmp(a.grossProfitBase) || a.sku.localeCompare(b.sku))
-  const paged = paginate(rows, filters)
+  const paged = paginate(rows, filters, deps?.paginate !== false)
   const totalRevenue = [...groups.values()].reduce((sum, row) => sum.add(row.revenue), new Prisma.Decimal(0))
   const totalCogs = [...groups.values()].reduce((sum, row) => sum.add(row.cogs), new Prisma.Decimal(0))
   return {
@@ -728,9 +754,9 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
-      revenueBase: moneyString(totalRevenue),
-      cogsBase: moneyString(totalCogs),
-      grossProfitBase: moneyString(totalGrossProfit),
+      revenueBase: moneyString(totalRevenue, baseCurrency),
+      cogsBase: moneyString(totalCogs, baseCurrency),
+      grossProfitBase: moneyString(totalGrossProfit, baseCurrency),
       marginPct: pctString(totalGrossProfit, totalRevenue),
     },
     notices: ['Gross margin is anchored to CogsEntry.createdAt, matches the inventory COGS report period semantics, and uses source SalesOrderLine revenue without recalculating FIFO.'],
@@ -740,6 +766,7 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
 export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<SalesAnalyticsReport<ReturnsReportRow>> {
   const client = clientFromDeps(deps)
   const generatedAt = nowFromDeps(deps)
+  const baseCurrency = await baseCurrencyFromDeps(deps)
   const window = period(filters, generatedAt)
   const [refundLines, shippedMovements] = await Promise.all([
     client.salesOrderRefundLine.findMany({
@@ -762,6 +789,7 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
           },
         },
       },
+      take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<RefundLineRow[]>,
     client.stockMovement.findMany({
       where: {
@@ -769,8 +797,10 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
         createdAt: { gte: window.dateFrom, lte: window.dateTo },
       },
       select: { productId: true, qty: true },
+      take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<Array<{ productId: string; qty: DecimalInput }>>,
   ])
+  if (refundLines.length > SOURCE_ROW_LIMIT || shippedMovements.length > SOURCE_ROW_LIMIT) throw new Error(`Returns analytics source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   const shippedByProduct = new Map<string, Prisma.Decimal>()
   for (const movement of shippedMovements) {
     shippedByProduct.set(movement.productId, (shippedByProduct.get(movement.productId) ?? new Prisma.Decimal(0)).add(toDecimal(movement.qty)))
@@ -813,13 +843,13 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
         reason: row.reason,
         refundCount: row.refundCount,
         returnedQty: qtyString(row.returned),
-        refundValueBase: moneyString(row.refundValue),
+        refundValueBase: moneyString(row.refundValue, baseCurrency),
         shippedQty: qtyString(shippedQty),
         returnRatePct: pctString(row.returned, shippedQty),
       }
     })
     .sort((a, b) => toDecimal(b.refundValueBase).cmp(a.refundValueBase) || a.sku.localeCompare(b.sku))
-  const paged = paginate(rows, filters)
+  const paged = paginate(rows, filters, deps?.paginate !== false)
   const totalReturned = [...groups.values()].reduce((sum, row) => sum.add(row.returned), new Prisma.Decimal(0))
   const totalRefund = [...groups.values()].reduce((sum, row) => sum.add(row.refundValue), new Prisma.Decimal(0))
   return {
@@ -830,7 +860,7 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
     pageInfo: paged.pageInfo,
     totals: {
       returnedQty: qtyString(totalReturned),
-      refundValueBase: moneyString(totalRefund),
+      refundValueBase: moneyString(totalRefund, baseCurrency),
     },
     notices: ['Returns analysis uses SalesOrderRefundLine values and compares returned quantity with SALE_DISPATCH quantity in the same period.'],
   }
@@ -855,7 +885,9 @@ export async function getFulfillmentAnalyticsReport(filters: SalesAnalyticsFilte
       lines: { select: { lineId: true, qty: true } },
       order: { select: { id: true, createdAt: true, expectedDelivery: true, lines: { select: { id: true, qty: true } } } },
     },
+    take: SOURCE_ROW_LIMIT + 1,
   }) as ShipmentRow[]
+  if (shipments.length > SOURCE_ROW_LIMIT) throw new Error(`Fulfillment analytics source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   const orders = new Map<string, { order: ShipmentRow['order']; shipments: ShipmentRow[] }>()
   for (const shipment of shipments) {
     const current = orders.get(shipment.orderId) ?? { order: shipment.order, shipments: [] }
@@ -924,16 +956,19 @@ export async function getThroughputAnalyticsReport(filters: SalesAnalyticsFilter
         metadata: true,
         user: { select: { name: true } },
       },
+      take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<ActivityLogRow[]>,
     client.shipment.findMany({
       where: { shippedAt: { gte: window.dateFrom, lte: window.dateTo } },
       select: { id: true, orderId: true, lines: { select: { lineId: true, qty: true } } },
+      take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<Array<{ id: string; orderId: string; lines: Array<{ lineId: string; qty: DecimalInput }> }>>,
     client.shipment.findMany({
       where: { status: { in: [ShipmentStatus.PENDING, ShipmentStatus.PICKING, ShipmentStatus.PACKED] } },
       select: { id: true },
     }) as Promise<Array<{ id: string }>>,
   ])
+  if (activities.length > SOURCE_ROW_LIMIT || shipments.length > SOURCE_ROW_LIMIT) throw new Error(`Throughput analytics source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   const shipmentById = new Map(shipments.map((shipment) => [shipment.id, shipment]))
   const groups = new Map<string, ThroughputReportRow & { orderIds: Set<string>; shipmentIds: Set<string>; lineIds: Set<string> }>()
   for (const activity of activities) {
@@ -973,7 +1008,7 @@ export async function getThroughputAnalyticsReport(filters: SalesAnalyticsFilter
       queueDepth: row.queueDepth,
     }))
     .sort((a, b) => b.date.localeCompare(a.date) || a.userName.localeCompare(b.userName))
-  const paged = paginate(rows, filters)
+  const paged = paginate(rows, filters, deps?.paginate !== false)
   return {
     generatedAt: generatedAt.toISOString(),
     dateFrom: dateOnly(window.dateFrom),

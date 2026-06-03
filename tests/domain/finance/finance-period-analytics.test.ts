@@ -39,8 +39,8 @@ test('VAT report totals sales order line tax by rate and jurisdiction', async ()
           taxRateId: 'tax-20',
           taxForeign: decimal('20'),
           taxBase: decimal('20'),
-          totalBase: decimal('100'),
-          order: { shippingAddress: { country: 'gb' } },
+          totalBase: decimal('120'),
+          order: { shippingAddress: { country: 'gb' }, pricesIncludeVat: true },
           taxRate: { name: 'UK Standard', rate: decimal('0.2'), accountingTaxType: 'OUTPUT2', countryCode: 'GB' },
         },
         {
@@ -48,7 +48,7 @@ test('VAT report totals sales order line tax by rate and jurisdiction', async ()
           taxForeign: decimal('10'),
           taxBase: decimal('10'),
           totalBase: decimal('50'),
-          order: { shippingAddress: { country: 'GB' } },
+          order: { shippingAddress: { country: 'GB' }, pricesIncludeVat: false },
           taxRate: { name: 'UK Standard', rate: decimal('0.2'), accountingTaxType: 'OUTPUT2', countryCode: 'GB' },
         },
       ],
@@ -80,6 +80,7 @@ test('AR aging subtracts non-refund payments and uses configurable buckets', asy
         totalBase: decimal('120'),
         payments: [
           { amount: decimal('20'), paidAt: new Date('2026-05-05T00:00:00.000Z'), refundId: null },
+          { amount: decimal('50'), paidAt: new Date('2026-06-05T00:00:00.000Z'), refundId: null },
           { amount: decimal('-5'), paidAt: new Date('2026-05-06T00:00:00.000Z'), refundId: 'refund-1' },
         ],
         status: SalesOrderStatus.PROCESSING,
@@ -147,8 +148,8 @@ test('FX gain/loss uses latest settlement rate and configured Xero accounts', as
     },
     fxRate: {
       findMany: async () => [
-        { toCurrency: 'USD', rate: decimal('1.5'), fetchedAt: new Date('2026-06-09T00:00:00.000Z') },
-        { toCurrency: 'USD', rate: decimal('1.1'), fetchedAt: new Date('2026-06-11T00:00:00.000Z') },
+        { fromCurrency: 'GBP', toCurrency: 'USD', rate: decimal('1.5'), fetchedAt: new Date('2026-06-09T00:00:00.000Z') },
+        { fromCurrency: 'GBP', toCurrency: 'USD', rate: decimal('1.1'), fetchedAt: new Date('2026-06-11T00:00:00.000Z') },
       ],
     },
   }
