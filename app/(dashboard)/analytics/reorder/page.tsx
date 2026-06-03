@@ -9,7 +9,7 @@ import {
   stockPositionSelectedFilterOptionInputs,
   type StockPositionFilters,
 } from '@/lib/domain/inventory/stock-position-reports'
-import { requireReplenishmentReportAccess } from '@/lib/security/replenishment-report-access'
+import { requireReplenishmentReportAccess } from '@/lib/security/replenishment-report-page-access'
 import {
   StockPositionReportPage,
   type StockPositionColumn,
