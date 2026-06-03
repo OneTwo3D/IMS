@@ -30,12 +30,14 @@ export type StockPositionFilterValues = {
   includeZero?: boolean
   thresholdDays?: string
   pageSize?: string
+  demandWindowDays?: string
 }
 
 type StockPositionReportPageProps<Row> = {
   title: string
   description: string
-  reportKey: 'stock-on-hand' | 'stock-allocations' | 'negative-stock' | 'inventory-aging' | 'dead-stock'
+  reportKey: 'stock-on-hand' | 'stock-allocations' | 'negative-stock' | 'inventory-aging' | 'dead-stock' | 'reorder' | 'backorder' | 'component-shortage'
+  exportBasePath?: string
   filters: StockPositionFilterValues
   filterOptions: StockPositionFilterOptions
   pageInfo: PageInfo
@@ -47,6 +49,7 @@ type StockPositionReportPageProps<Row> = {
   dateMode: 'as-of' | 'range' | 'none'
   showIncludeZero?: boolean
   showThresholdDays?: boolean
+  showDemandWindowDays?: boolean
 }
 
 function today(): string {
@@ -57,6 +60,7 @@ export function StockPositionReportPage<Row>({
   title,
   description,
   reportKey,
+  exportBasePath = '/api/export/stock-position',
   filters,
   filterOptions,
   pageInfo,
@@ -68,9 +72,10 @@ export function StockPositionReportPage<Row>({
   dateMode,
   showIncludeZero = true,
   showThresholdDays = false,
+  showDemandWindowDays = false,
 }: StockPositionReportPageProps<Row>) {
   const params = currentParams(filters)
-  const csvHref = `/api/export/stock-position?${appendParams(params, { type: reportKey })}`
+  const csvHref = `${exportBasePath}?${appendParams(params, { type: reportKey })}`
   const previousHref = `?${appendParams(params, { page: pageInfo.page - 1 })}`
   const nextHref = `?${appendParams(params, { page: pageInfo.page + 1 })}`
 
@@ -182,6 +187,19 @@ export function StockPositionReportPage<Row>({
                 <option value="180" />
                 <option value="365" />
                 <option value="730" />
+              </datalist>
+            </div>
+          )}
+          {showDemandWindowDays && (
+            <div className="space-y-1.5">
+              <Label htmlFor="thresholdDays">Demand window</Label>
+              <Input id="thresholdDays" name="thresholdDays" type="number" min="1" step="1" list="demandWindowOptions" defaultValue={filters.thresholdDays ?? filters.demandWindowDays ?? '90'} className="h-9" />
+              <datalist id="demandWindowOptions">
+                <option value="30" />
+                <option value="60" />
+                <option value="90" />
+                <option value="180" />
+                <option value="365" />
               </datalist>
             </div>
           )}
