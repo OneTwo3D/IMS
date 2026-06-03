@@ -25,6 +25,7 @@ import { Separator } from '@/components/ui/separator'
 import { hasPermission, type Permission } from '@/lib/permissions'
 import { canAccessStockPositionReports, STOCK_POSITION_REPORT_LINKS } from '@/lib/security/stock-position-policy'
 import { canAccessReplenishmentReports, REPLENISHMENT_REPORT_LINKS } from '@/lib/security/replenishment-report-access'
+import { canAccessSalesAnalytics, SALES_ANALYTICS_LINKS } from '@/lib/security/sales-analytics-access'
 
 const STOCK_CONTROL_CHILDREN = [
   { href: '/stock-control/stock-adjustments', label: 'Stock Adjustments' },
@@ -46,6 +47,7 @@ const ANALYTICS_CHILDREN = [
   { href: '/analytics/purchase-stats',         label: 'Purchase Statistics' },
   { href: '/analytics/product-profitability',  label: 'Product Profitability' },
   { href: '/analytics/inventory-stats',        label: 'Inventory Report' },
+  ...SALES_ANALYTICS_LINKS,
   ...STOCK_POSITION_REPORT_LINKS,
   ...REPLENISHMENT_REPORT_LINKS,
 ]
@@ -114,9 +116,12 @@ export function Sidebar({
   const analyticsChildren = [
     ...(can('analytics') ? ANALYTICS_CHILDREN : [...STOCK_POSITION_REPORT_LINKS]),
     ...(!can('analytics') && canAccessReplenishmentReports(userRole) ? [...REPLENISHMENT_REPORT_LINKS] : []),
+    ...(!can('analytics') && canAccessSalesAnalytics(userRole) ? [...SALES_ANALYTICS_LINKS] : []),
     ...(can('analytics.inventory_ledger') ? INVENTORY_LEDGER_REPORT_LINKS : []),
     ...(can('analytics.inventory_costing') ? INVENTORY_COSTING_REPORT_LINKS : []),
-  ].filter((item) => !REPLENISHMENT_REPORT_LINKS.some((link) => link.href === item.href) || canAccessReplenishmentReports(userRole))
+  ]
+    .filter((item) => !REPLENISHMENT_REPORT_LINKS.some((link) => link.href === item.href) || canAccessReplenishmentReports(userRole))
+    .filter((item) => !SALES_ANALYTICS_LINKS.some((link) => link.href === item.href) || canAccessSalesAnalytics(userRole))
 
   // Supplier gets a completely different navigation
   if (isSupplier) {
