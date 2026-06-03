@@ -59,9 +59,9 @@ export type ProductionVarianceReportRow = {
   actualQty: string
   varianceQty: string
   variancePct: string | null
-  scrapQty: string
-  scrapValueBase: string
-  yieldPct: string | null
+  overConsumedQty: string
+  overConsumedValueBase: string
+  orderYieldPct: string | null
   outcome: 'on_plan' | 'over_consumed' | 'under_consumed'
 }
 
@@ -72,7 +72,7 @@ export type WipReportRow = {
   status: ProductionOrderStatus
   startedAt: string | null
   scheduledAt: string | null
-  daysSinceStart: number
+  daysSinceStart: string
   warehouseCode: string
   outputSku: string
   outputProductName: string
@@ -131,6 +131,13 @@ type ReportOptions = {
   paginate?: boolean
 }
 
+export class ManufacturingAnalyticsSourceLimitError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ManufacturingAnalyticsSourceLimitError'
+  }
+}
+
 function clientFromDeps(deps?: ManufacturingAnalyticsDeps): ManufacturingAnalyticsClient {
   return (deps?.client ?? db) as unknown as ManufacturingAnalyticsClient
 }
@@ -159,12 +166,12 @@ function dateOnly(date: Date | undefined): string | null {
   return date ? date.toISOString().slice(0, 10) : null
 }
 
-function dateWhere(filters: ManufacturingAnalyticsFilters): Record<string, unknown> {
+function dateWhere(filters: ManufacturingAnalyticsFilters, field: 'createdAt' | 'completedAt'): Record<string, unknown> {
   const dateFrom = parseDateOnly(filters.dateFrom)
   const dateTo = parseDateOnly(filters.dateTo, true)
   if (!dateFrom && !dateTo) return {}
   return {
-    createdAt: {
+    [field]: {
       ...(dateFrom ? { gte: dateFrom } : {}),
       ...(dateTo ? { lte: dateTo } : {}),
     },
@@ -254,7 +261,7 @@ async function loadProductionOutMovements(client: ManufacturingAnalyticsClient, 
     },
   }) as ProductionOutMovementRow[]
   if (movements.length > SOURCE_ROW_LIMIT) {
-    throw new Error(`Manufacturing movement source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+    throw new ManufacturingAnalyticsSourceLimitError(`Manufacturing movement source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   }
   return movements
 }
@@ -300,9 +307,10 @@ export async function getProductionVarianceReport(
   const orders = await client.productionOrder.findMany({
     where: {
       orderType: ProductionOrderType.ASSEMBLY,
-      ...dateWhere(filters),
+      status: { in: [ProductionOrderStatus.IN_PROGRESS, ProductionOrderStatus.COMPLETED] },
+      ...dateWhere(filters, 'completedAt'),
     },
-    orderBy: [{ createdAt: 'desc' }, { reference: 'asc' }],
+    orderBy: [{ completedAt: 'desc' }, { reference: 'asc' }],
     take: SOURCE_ROW_LIMIT + 1,
     select: {
       id: true,
@@ -332,21 +340,25 @@ export async function getProductionVarianceReport(
     },
   }) as ProductionVarianceOrderRow[]
   if (orders.length > SOURCE_ROW_LIMIT) {
-    throw new Error(`Production variance source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+    throw new ManufacturingAnalyticsSourceLimitError(`Production variance source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   }
 
-  const movements = await loadProductionOutMovements(client, orders.map((order) => order.id))
+  const varianceOrders = orders.filter((order) => (
+    order.status === ProductionOrderStatus.IN_PROGRESS ||
+    order.status === ProductionOrderStatus.COMPLETED
+  ))
+  const movements = await loadProductionOutMovements(client, varianceOrders.map((order) => order.id))
   const actualByOrderAndProduct = movementTotalsByOrderAndProduct(movements)
   const rows: ProductionVarianceReportRow[] = []
   let plannedTotal = new Prisma.Decimal(0)
   let actualTotal = new Prisma.Decimal(0)
-  let scrapTotal = new Prisma.Decimal(0)
-  let scrapValueTotal = new Prisma.Decimal(0)
+  let overConsumedTotal = new Prisma.Decimal(0)
+  let overConsumedValueTotal = new Prisma.Decimal(0)
 
-  for (const order of orders) {
+  for (const order of varianceOrders) {
     const plannedOutputQty = toDecimal(order.qtyPlanned)
     const producedQty = toDecimal(order.qtyProduced)
-    const yieldPct = plannedOutputQty.gt(0) ? producedQty.div(plannedOutputQty).mul(100) : null
+    const orderYieldPct = plannedOutputQty.gt(0) ? producedQty.div(plannedOutputQty).mul(100) : null
     for (const item of order.bom.items) {
       const plannedQty = toDecimal(item.qty).mul(plannedOutputQty)
       const actual = actualByOrderAndProduct.get(movementKey(order.id, item.componentProductId)) ?? {
@@ -354,16 +366,16 @@ export async function getProductionVarianceReport(
         valueBase: new Prisma.Decimal(0),
       }
       const varianceQty = actual.qty.sub(plannedQty)
-      const scrapQty = Prisma.Decimal.max(varianceQty, new Prisma.Decimal(0))
-      const scrapValueBase = scrapQty.gt(0) && actual.qty.gt(0)
-        ? actual.valueBase.mul(scrapQty).div(actual.qty)
+      const overConsumedQty = Prisma.Decimal.max(varianceQty, new Prisma.Decimal(0))
+      const overConsumedValueBase = overConsumedQty.gt(0) && actual.qty.gt(0)
+        ? actual.valueBase.mul(overConsumedQty).div(actual.qty)
         : new Prisma.Decimal(0)
       const variancePct = plannedQty.gt(0) ? varianceQty.div(plannedQty).mul(100) : null
 
       plannedTotal = plannedTotal.add(plannedQty)
       actualTotal = actualTotal.add(actual.qty)
-      scrapTotal = scrapTotal.add(scrapQty)
-      scrapValueTotal = scrapValueTotal.add(scrapValueBase)
+      overConsumedTotal = overConsumedTotal.add(overConsumedQty)
+      overConsumedValueTotal = overConsumedValueTotal.add(overConsumedValueBase)
       rows.push({
         productionOrderId: order.id,
         productionOrderReference: order.reference,
@@ -382,9 +394,9 @@ export async function getProductionVarianceReport(
         actualQty: quantity(actual.qty),
         varianceQty: quantity(varianceQty),
         variancePct: variancePct ? percent(variancePct) : null,
-        scrapQty: quantity(scrapQty),
-        scrapValueBase: amount(scrapValueBase),
-        yieldPct: yieldPct ? percent(yieldPct) : null,
+        overConsumedQty: quantity(overConsumedQty),
+        overConsumedValueBase: amount(overConsumedValueBase),
+        orderYieldPct: orderYieldPct ? percent(orderYieldPct) : null,
         outcome: varianceOutcome(varianceQty),
       })
     }
@@ -400,10 +412,12 @@ export async function getProductionVarianceReport(
     plannedQty: quantity(plannedTotal),
     actualQty: quantity(actualTotal),
     varianceQty: quantity(actualTotal.sub(plannedTotal)),
-    scrapQty: quantity(scrapTotal),
-    scrapValueBase: amount(scrapValueTotal),
+    overConsumedQty: quantity(overConsumedTotal),
+    overConsumedValueBase: amount(overConsumedValueTotal),
   }, [
     'Production variance includes assembly orders only; disassembly consumption is excluded from BOM variance rows.',
+    'Date filters apply to completion date; in-progress orders without a completion date are shown only when no date window is selected.',
+    'Over-consumed value is averaged across the consumed movement value; drill into FIFO cost entries for layer-exact costing.',
   ], options.paginate !== false)
 }
 
@@ -417,7 +431,6 @@ export async function getWipReport(
   const orders = await client.productionOrder.findMany({
     where: {
       status: ProductionOrderStatus.IN_PROGRESS,
-      ...dateWhere(filters),
     },
     orderBy: [{ startedAt: 'asc' }, { createdAt: 'asc' }, { reference: 'asc' }],
     take: SOURCE_ROW_LIMIT + 1,
@@ -438,7 +451,7 @@ export async function getWipReport(
     },
   }) as WipProductionOrderRow[]
   if (orders.length > SOURCE_ROW_LIMIT) {
-    throw new Error(`WIP source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+    throw new ManufacturingAnalyticsSourceLimitError(`WIP source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   }
 
   const movements = await loadProductionOutMovements(client, orders.map((order) => order.id))
@@ -454,15 +467,18 @@ export async function getWipReport(
       new Prisma.Decimal(0),
     )
     const movementTotal = movementTotals.get(order.id) ?? { qty: new Prisma.Decimal(0), valueBase: new Prisma.Decimal(0) }
-    const expectedOutputValueBase = manufacturingCostBase.add(movementTotal.valueBase)
+    const wipValueBase = manufacturingCostBase.add(movementTotal.valueBase)
     const startDate = order.startedAt ?? order.createdAt
-    const daysSinceStart = Math.max(0, Math.floor((generatedAt.getTime() - startDate.getTime()) / DAY_MS))
+    const daysSinceStart = Prisma.Decimal.max(
+      new Prisma.Decimal(0),
+      new Prisma.Decimal(generatedAt.getTime() - startDate.getTime()).div(DAY_MS),
+    )
     const plannedQty = toDecimal(order.qtyPlanned)
     const producedQty = toDecimal(order.qtyProduced)
 
     manufacturingCostTotal = manufacturingCostTotal.add(manufacturingCostBase)
     consumedComponentValueTotal = consumedComponentValueTotal.add(movementTotal.valueBase)
-    expectedOutputValueTotal = expectedOutputValueTotal.add(expectedOutputValueBase)
+    expectedOutputValueTotal = expectedOutputValueTotal.add(wipValueBase)
     rows.push({
       productionOrderId: order.id,
       productionOrderReference: order.reference,
@@ -470,7 +486,7 @@ export async function getWipReport(
       status: order.status,
       startedAt: order.startedAt?.toISOString() ?? null,
       scheduledAt: order.scheduledAt?.toISOString() ?? null,
-      daysSinceStart,
+      daysSinceStart: roundQuantity(daysSinceStart, 1).toString(),
       warehouseCode: order.warehouse.code,
       outputSku: order.outputProduct.sku,
       outputProductName: order.outputProduct.name,
@@ -479,18 +495,19 @@ export async function getWipReport(
       remainingOutputQty: quantity(Prisma.Decimal.max(plannedQty.sub(producedQty), new Prisma.Decimal(0))),
       manufacturingCostBase: amount(manufacturingCostBase),
       consumedComponentValueBase: amount(movementTotal.valueBase),
-      expectedOutputValueBase: amount(expectedOutputValueBase),
-      wipValueBase: amount(manufacturingCostBase),
+      expectedOutputValueBase: amount(wipValueBase),
+      wipValueBase: amount(wipValueBase),
       costLineCount: order.manufacturingCostLines.length,
     })
   }
 
   return report(rows, filters, generatedAt, {
-    wipValueBase: amount(manufacturingCostTotal),
+    wipValueBase: amount(expectedOutputValueTotal),
     manufacturingCostBase: amount(manufacturingCostTotal),
     consumedComponentValueBase: amount(consumedComponentValueTotal),
     expectedOutputValueBase: amount(expectedOutputValueTotal),
   }, [
-    'WIP value is calculated from ManufacturingCostLine base totals on IN_PROGRESS production orders.',
+    'WIP is a current-state report of all IN_PROGRESS production orders; date filters are not applied.',
+    'WIP value includes posted consumed component value plus ManufacturingCostLine base totals.',
   ], options.paginate !== false)
 }

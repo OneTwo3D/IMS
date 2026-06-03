@@ -4,6 +4,7 @@ import { csvResponse, toCsv } from '@/lib/csv'
 import {
   getProductionVarianceReport,
   getWipReport,
+  ManufacturingAnalyticsSourceLimitError,
   type ManufacturingAnalyticsFilters,
 } from '@/lib/domain/manufacturing/manufacturing-analytics'
 import { canAccessManufacturingAnalytics } from '@/lib/security/manufacturing-analytics-access'
@@ -47,20 +48,27 @@ export async function GET(req: NextRequest) {
   const reportType = req.nextUrl.searchParams.get('report') ?? 'production-variance'
   const date = new Date().toISOString().slice(0, 10)
 
-  switch (reportType) {
-    case 'production-variance': {
-      const report = await getProductionVarianceReport({ ...filters, pageSize: MANUFACTURING_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
-      const oversized = rejectOversizedExport(report.pageInfo.totalRows)
-      if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['productionOrderReference', 'status', 'warehouseCode', 'outputSku', 'outputProductName', 'componentSku', 'componentName', 'plannedQty', 'actualQty', 'varianceQty', 'variancePct', 'scrapQty', 'scrapValueBase', 'yieldPct', 'outcome']), `production-variance-${date}.csv`)
+  try {
+    switch (reportType) {
+      case 'production-variance': {
+        const report = await getProductionVarianceReport(filters, { paginate: false })
+        const oversized = rejectOversizedExport(report.pageInfo.totalRows)
+        if (oversized) return oversized
+        return csvResponse(toCsv(report.rows, ['productionOrderReference', 'status', 'warehouseCode', 'outputSku', 'outputProductName', 'componentSku', 'componentName', 'plannedQty', 'actualQty', 'varianceQty', 'variancePct', 'overConsumedQty', 'overConsumedValueBase', 'orderYieldPct', 'outcome']), `production-variance-${date}.csv`)
+      }
+      case 'wip': {
+        const report = await getWipReport(filters, { paginate: false })
+        const oversized = rejectOversizedExport(report.pageInfo.totalRows)
+        if (oversized) return oversized
+        return csvResponse(toCsv(report.rows, ['productionOrderReference', 'status', 'warehouseCode', 'outputSku', 'outputProductName', 'startedAt', 'scheduledAt', 'daysSinceStart', 'plannedOutputQty', 'producedQty', 'remainingOutputQty', 'manufacturingCostBase', 'consumedComponentValueBase', 'expectedOutputValueBase', 'wipValueBase', 'costLineCount']), `wip-${date}.csv`)
+      }
+      default:
+        return NextResponse.json({ error: 'Unknown manufacturing analytics export type' }, { status: 400 })
     }
-    case 'wip': {
-      const report = await getWipReport({ ...filters, pageSize: MANUFACTURING_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
-      const oversized = rejectOversizedExport(report.pageInfo.totalRows)
-      if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['productionOrderReference', 'status', 'warehouseCode', 'outputSku', 'outputProductName', 'startedAt', 'scheduledAt', 'daysSinceStart', 'plannedOutputQty', 'producedQty', 'remainingOutputQty', 'manufacturingCostBase', 'consumedComponentValueBase', 'expectedOutputValueBase', 'wipValueBase', 'costLineCount']), `wip-${date}.csv`)
+  } catch (error) {
+    if (error instanceof ManufacturingAnalyticsSourceLimitError) {
+      return NextResponse.json({ error: error.message }, { status: 413 })
     }
-    default:
-      return NextResponse.json({ error: 'Unknown manufacturing analytics export type' }, { status: 400 })
+    throw error
   }
 }

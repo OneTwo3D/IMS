@@ -36,6 +36,7 @@ type ManufacturingAnalyticsReportPageProps<Row> = {
   columns: Array<ManufacturingAnalyticsColumn<Row>>
   summary: Array<{ label: string; value: string; tone?: SummaryTone }>
   notices?: string[]
+  showDateFilters?: boolean
 }
 
 export function ManufacturingAnalyticsReportPage<Row>({
@@ -49,6 +50,7 @@ export function ManufacturingAnalyticsReportPage<Row>({
   columns,
   summary,
   notices = [],
+  showDateFilters = true,
 }: ManufacturingAnalyticsReportPageProps<Row>) {
   const params = currentParams(filters)
   const csvHref = `/api/export/manufacturing-analytics?${appendParams(params, { report: reportKey })}`
@@ -80,14 +82,18 @@ export function ManufacturingAnalyticsReportPage<Row>({
       <form className="rounded-md border bg-muted/20 p-3">
         <input type="hidden" name="page" value="1" />
         <div className="grid gap-3 md:grid-cols-3 lg:grid-cols-6">
-          <div className="space-y-1.5">
-            <Label htmlFor="dateFrom">From (UTC)</Label>
-            <Input id="dateFrom" name="dateFrom" type="date" defaultValue={filters.dateFrom ?? ''} className="h-9" />
-          </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="dateTo">To (UTC)</Label>
-            <Input id="dateTo" name="dateTo" type="date" defaultValue={filters.dateTo ?? ''} className="h-9" />
-          </div>
+          {showDateFilters && (
+            <>
+              <div className="space-y-1.5">
+                <Label htmlFor="dateFrom">From (UTC)</Label>
+                <Input id="dateFrom" name="dateFrom" type="date" defaultValue={filters.dateFrom ?? ''} className="h-9" />
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="dateTo">To (UTC)</Label>
+                <Input id="dateTo" name="dateTo" type="date" defaultValue={filters.dateTo ?? ''} className="h-9" />
+              </div>
+            </>
+          )}
           <div className="space-y-1.5">
             <Label htmlFor="pageSize">Rows</Label>
             <select id="pageSize" name="pageSize" defaultValue={filters.pageSize ?? '100'} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">

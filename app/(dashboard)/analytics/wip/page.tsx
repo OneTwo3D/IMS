@@ -2,6 +2,8 @@ import Link from 'next/link'
 import type { Metadata } from 'next'
 import {
   getWipReport,
+  ManufacturingAnalyticsSourceLimitError,
+  type ManufacturingAnalyticsReport,
   type WipReportRow,
 } from '@/lib/domain/manufacturing/manufacturing-analytics'
 import { requireManufacturingAnalyticsAccess } from '@/lib/security/manufacturing-analytics-page-access'
@@ -43,13 +45,28 @@ const columns: Array<ManufacturingAnalyticsColumn<WipReportRow>> = [
 export default async function WipPage({ searchParams }: Props) {
   await requireManufacturingAnalyticsAccess()
   const filters = manufacturingAnalyticsFiltersFromSearch(await searchParams)
-  const report = await getWipReport(filters)
+  const reportFilters = { page: filters.page, pageSize: filters.pageSize }
+  let report: ManufacturingAnalyticsReport<WipReportRow>
+  try {
+    report = await getWipReport(reportFilters)
+  } catch (error) {
+    if (!(error instanceof ManufacturingAnalyticsSourceLimitError)) throw error
+    report = {
+      generatedAt: new Date().toISOString(),
+      dateFrom: null,
+      dateTo: null,
+      rows: [],
+      pageInfo: { page: 1, pageSize: filters.pageSize ?? 100, totalRows: 0, totalPages: 1, hasNextPage: false, hasPreviousPage: false },
+      totals: {},
+      notices: [error.message],
+    }
+  }
   return (
     <ManufacturingAnalyticsReportPage
       title="WIP"
-      description="In-progress production orders with WIP value from manufacturing cost-line base totals and posted consumption context."
+      description="Current in-progress production orders with WIP value from posted component consumption plus manufacturing cost-line base totals."
       reportKey="wip"
-      filters={manufacturingAnalyticsFiltersForUi(filters)}
+      filters={manufacturingAnalyticsFiltersForUi(reportFilters)}
       pageInfo={report.pageInfo}
       rows={report.rows}
       rowKey={(row) => row.productionOrderId}
@@ -61,6 +78,7 @@ export default async function WipPage({ searchParams }: Props) {
         { label: 'Expected output value', value: report.totals.expectedOutputValueBase ?? '0' },
       ]}
       notices={report.notices}
+      showDateFilters={false}
     />
   )
 }
