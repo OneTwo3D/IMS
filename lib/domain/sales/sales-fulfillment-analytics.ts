@@ -123,7 +123,6 @@ export type ThroughputReportRow = {
   orderCount: number
   shipmentCount: number
   lineCount: number
-  queueDepth: number
 }
 
 type SalesOrderLineRow = {
@@ -759,7 +758,10 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
       grossProfitBase: moneyString(totalGrossProfit, baseCurrency),
       marginPct: pctString(totalGrossProfit, totalRevenue),
     },
-    notices: ['Gross margin is anchored to CogsEntry.createdAt, matches the inventory COGS report period semantics, and uses source SalesOrderLine revenue without recalculating FIFO.'],
+    notices: [
+      'Gross margin is anchored to CogsEntry.createdAt, matches the inventory COGS report period semantics, and uses source SalesOrderLine revenue without recalculating FIFO.',
+      'Margin rows are product-level buckets: COGS is grouped by movement productId and revenue is grouped from sales-order lines for COGS-linked orders. Duplicate SKU lines share the same product bucket; this report is not line-level COGS attribution.',
+    ],
   }
 }
 
@@ -862,7 +864,7 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
       returnedQty: qtyString(totalReturned),
       refundValueBase: moneyString(totalRefund, baseCurrency),
     },
-    notices: ['Returns analysis uses SalesOrderRefundLine values and compares returned quantity with SALE_DISPATCH quantity in the same period.'],
+    notices: ['Returns analysis uses SalesOrderRefundLine values and compares returned quantity with SALE_DISPATCH quantity in the same period. Return rate is a same-period returned ÷ same-period dispatched metric, not an order-cohort return rate.'],
   }
 }
 
@@ -900,11 +902,18 @@ export async function getFulfillmentAnalyticsReport(filters: SalesAnalyticsFilte
   let orderedQty = new Prisma.Decimal(0)
   let shippedQty = new Prisma.Decimal(0)
   let totalDays = new Prisma.Decimal(0)
+  const lateOutliers: Array<{ orderId: string; lateDays: Prisma.Decimal }> = []
   for (const group of orders.values()) {
     const firstShipped = group.shipments.map((shipment) => shipment.shippedAt).filter((date): date is Date => Boolean(date)).sort((a, b) => a.getTime() - b.getTime())[0]
     if (!firstShipped) continue
     shippedOrders += 1
     if (group.order.expectedDelivery && firstShipped.getTime() <= group.order.expectedDelivery.getTime()) onTime += 1
+    if (group.order.expectedDelivery && firstShipped.getTime() > group.order.expectedDelivery.getTime()) {
+      lateOutliers.push({
+        orderId: group.order.id,
+        lateDays: new Prisma.Decimal(firstShipped.getTime() - group.order.expectedDelivery.getTime()).div(86_400_000),
+      })
+    }
     const orderQty = group.order.lines.reduce((sum, line) => sum.add(toDecimal(line.qty)), new Prisma.Decimal(0))
     const shipmentQty = group.shipments.flatMap((shipment) => shipment.lines).reduce((sum, line) => sum.add(toDecimal(line.qty)), new Prisma.Decimal(0))
     orderedQty = orderedQty.add(orderQty)
@@ -929,7 +938,12 @@ export async function getFulfillmentAnalyticsReport(filters: SalesAnalyticsFilte
       shippedOrders: String(shippedOrders),
       shippedQty: qtyString(shippedQty),
     },
-    notices: ['Fulfillment metrics use Shipment.shippedAt and ShipmentLine quantity; SalesOrder dates are used only for elapsed-day and expected-delivery comparisons.'],
+    notices: [
+      'Fulfillment metrics use Shipment.shippedAt and ShipmentLine quantity; SalesOrder dates are used only for elapsed-day and expected-delivery comparisons.',
+      ...(lateOutliers.length > 0
+        ? [`Slowest late shipments: ${lateOutliers.sort((a, b) => b.lateDays.cmp(a.lateDays)).slice(0, 5).map((row) => `${row.orderId} (${roundQuantity(row.lateDays, 2)} days late)`).join(', ')}.`]
+        : []),
+    ],
   }
 }
 
@@ -983,7 +997,6 @@ export async function getThroughputAnalyticsReport(filters: SalesAnalyticsFilter
       orderCount: 0,
       shipmentCount: 0,
       lineCount: 0,
-      queueDepth: pendingShipments.length,
       orderIds: new Set<string>(),
       shipmentIds: new Set<string>(),
       lineIds: new Set<string>(),
@@ -1005,7 +1018,6 @@ export async function getThroughputAnalyticsReport(filters: SalesAnalyticsFilter
       orderCount: row.orderCount,
       shipmentCount: row.shipmentCount,
       lineCount: row.lineCount,
-      queueDepth: row.queueDepth,
     }))
     .sort((a, b) => b.date.localeCompare(a.date) || a.userName.localeCompare(b.userName))
   const paged = paginate(rows, filters, deps?.paginate !== false)
@@ -1021,6 +1033,6 @@ export async function getThroughputAnalyticsReport(filters: SalesAnalyticsFilter
       lines: String(rows.reduce((sum, row) => sum + row.lineCount, 0)),
       queueDepth: String(pendingShipments.length),
     },
-    notices: ['Throughput uses shipment_status_changed ActivityLog rows linked to Shipment metadata; queue depth is the current pending/picking/packed shipment count.'],
+    notices: ['Throughput uses shipment_status_changed ActivityLog rows linked to Shipment metadata. Current queue depth is exposed only in totals because it is a live snapshot, not a historical per-day value.'],
   }
 }

@@ -16,7 +16,6 @@ export default async function ThroughputAnalyticsPage({ searchParams }: { search
     { key: 'orders', label: 'Orders', align: 'right', render: (row) => row.orderCount.toLocaleString(), footer: report.totals.orders },
     { key: 'shipments', label: 'Shipments', align: 'right', render: (row) => row.shipmentCount.toLocaleString(), footer: report.totals.shipments },
     { key: 'lines', label: 'Lines', align: 'right', render: (row) => row.lineCount.toLocaleString(), footer: report.totals.lines },
-    { key: 'queue', label: 'Current queue', align: 'right', render: (row) => row.queueDepth.toLocaleString(), footer: report.totals.queueDepth },
   ]
 
   return (

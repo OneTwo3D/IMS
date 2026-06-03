@@ -632,6 +632,7 @@ export async function getSupplierPerformanceReport(
     receipts: String(rows.reduce((total, row) => total + row.receiptCount, 0)),
   }, [
     'On-time rate compares PurchaseReceipt.receivedAt with PurchaseOrder.expectedDelivery for receipts that have an expected date.',
+    'Actual lead time is measured from poSentAt/createdAt to PurchaseReceipt.receivedAt, so it includes carrier transit plus any internal receiving delay before IMS receipt posting.',
     'RFQ response days use updatedAt for RFQs that reached QUOTE_RECEIVED or later because the schema does not store a dedicated quoteReceivedAt timestamp.',
   ], options.paginate !== false)
 }
@@ -855,7 +856,7 @@ export async function getLeadTimeReport(
     supplierSkuPairs: String(rows.length),
     maxP95LeadTimeDays: rows[0]?.p95LeadTimeDays ?? '0',
   }, [
-    'Lead time is PurchaseReceipt.receivedAt minus PurchaseOrder.poSentAt, falling back to PO createdAt when poSentAt is absent.',
+    'Lead time is PurchaseReceipt.receivedAt minus PurchaseOrder.poSentAt, falling back to PO createdAt when poSentAt is absent; it includes carrier transit plus any internal receiving delay before IMS receipt posting.',
     'The Reorder Planning report uses observed P95 lead time for a supplier/product when SupplierProduct.leadTimeDays is not configured.',
   ], options.paginate !== false)
 }

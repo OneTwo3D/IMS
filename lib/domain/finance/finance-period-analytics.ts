@@ -79,6 +79,7 @@ export type AgingReportRow = {
 
 export type FxGainLossReportRow = {
   side: FxSettlementSide
+  settlementId: string
   documentId: string
   reference: string
   partyName: string
@@ -119,6 +120,7 @@ type SalesOrderAgingRow = {
   customerEmail: string | null
   createdAt: Date
   invoicedAt: Date | null
+  paymentDueAt: Date | null
   paidAt: Date | null
   totalBase: DecimalInput
   payments: Array<{ amount: DecimalInput; paidAt: Date; refundId: string | null }>
@@ -479,6 +481,7 @@ export async function getArAgingReport(
       customerEmail: true,
       createdAt: true,
       invoicedAt: true,
+      paymentDueAt: true,
       paidAt: true,
       totalBase: true,
       payments: { select: { amount: true, paidAt: true, refundId: true } },
@@ -504,7 +507,11 @@ export async function getArAgingReport(
     const paidBase = order.payments
       .filter((payment) => payment.refundId == null && payment.paidAt.getTime() <= asOf.getTime())
       .reduce((total, payment) => total.add(toDecimal(payment.amount)), new Prisma.Decimal(0))
-    const outstanding = Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(order.totalBase).sub(paidBase))
+    const refundedBase = order.payments
+      .filter((payment) => payment.refundId != null && payment.paidAt.getTime() <= asOf.getTime())
+      .reduce((total, payment) => total.add(toDecimal(payment.amount).abs()), new Prisma.Decimal(0))
+    const rawOutstanding = toDecimal(order.totalBase).sub(paidBase).sub(refundedBase)
+    const outstanding = Prisma.Decimal.max(new Prisma.Decimal(0), rawOutstanding)
     if (outstanding.lte(0)) continue
     const key = order.customerId ?? order.customerEmail ?? order.customerName ?? 'unknown'
     let row = byCustomer.get(key)
@@ -524,7 +531,7 @@ export async function getArAgingReport(
       }
       byCustomer.set(key, row)
     }
-    const dueDate = order.invoicedAt ?? order.createdAt
+    const dueDate = order.paymentDueAt ?? order.invoicedAt ?? order.createdAt
     const bucket = bucketAmount(ageDays(asOf, dueDate), outstanding, buckets)
     row.current = row.current.add(bucket.current)
     row.bucket1 = row.bucket1.add(bucket.bucket1)
@@ -538,13 +545,25 @@ export async function getArAgingReport(
   }
   const rows = agingRowsFromAccumulators(byCustomer, baseCurrency)
   const outstandingBase = rows.reduce((total, row) => total.add(row.outstandingBase), new Prisma.Decimal(0))
+  const creditBalanceBase = orders.reduce((total, order) => {
+    const paidBase = order.payments
+      .filter((payment) => payment.refundId == null && payment.paidAt.getTime() <= asOf.getTime())
+      .reduce((sum, payment) => sum.add(toDecimal(payment.amount)), new Prisma.Decimal(0))
+    const refundedBase = order.payments
+      .filter((payment) => payment.refundId != null && payment.paidAt.getTime() <= asOf.getTime())
+      .reduce((sum, payment) => sum.add(toDecimal(payment.amount).abs()), new Prisma.Decimal(0))
+    const rawOutstanding = toDecimal(order.totalBase).sub(paidBase).sub(refundedBase)
+    return rawOutstanding.lt(0) ? total.add(rawOutstanding.abs()) : total
+  }, new Prisma.Decimal(0))
   return report(rows, filters, window, generatedAt, {
     outstandingBase: moneyString(outstandingBase, baseCurrency),
+    creditBalanceBase: moneyString(creditBalanceBase, baseCurrency),
     bucket1Days: String(buckets[0]),
     bucket2Days: String(buckets[1]),
     bucket3Days: String(buckets[2]),
   }, [
-    `AR aging is as of ${dateOnly(asOf)}. Outstanding balance is SalesOrder.totalBase minus non-refund Payment.amount rows paid on or before that date; due date is invoicedAt when present, otherwise createdAt because the sales-order schema has no separate receivable due date.`,
+    `AR aging is as of ${dateOnly(asOf)}. Outstanding balance is SalesOrder.totalBase minus non-refund payments and refund payments paid on or before that date; due date is paymentDueAt, falling back to invoicedAt and then createdAt.`,
+    'Customer credit balances are excluded from aging buckets and surfaced in totals.creditBalanceBase.',
     `Bucket boundaries are configurable through bucket1Days/bucket2Days/bucket3Days and currently use ${buckets[0]}/${buckets[1]}/${buckets[2]} days.`,
     ...bucketResult.notices,
   ], options.paginate !== false)
@@ -714,6 +733,7 @@ export async function getFxGainLossReport(
     })
     rows.push({
       side: 'receivable',
+      settlementId: payment.id,
       documentId: payment.order.id,
       reference: payment.order.invoiceNumber ?? payment.order.orderNumber ?? payment.order.id,
       partyName: payment.order.customerName ?? payment.order.customerEmail ?? 'Unknown customer',
@@ -741,6 +761,7 @@ export async function getFxGainLossReport(
     })
     rows.push({
       side: 'payable',
+      settlementId: invoice.id,
       documentId: invoice.id,
       reference: invoice.invoiceNumber ?? invoice.po.reference,
       partyName: invoice.po.supplier.name,
@@ -773,6 +794,8 @@ export async function getFxGainLossReport(
     rowCount: String(rows.length),
   }, [
     `FX gain/loss uses IMS FxRate semantics where rate means 1 ${baseCurrency} = foreign currency; base value is foreign amount divided by the rate, matching the Xero realised-FX posting helper.`,
+    'Receivable FX rows are one row per Payment.id so partial settlements keep their own paidAt settlement rate; purchase-invoice rows remain one row per paid invoice because supplier partial payments are not modelled.',
+    'Base-currency settlements are excluded from FX rows because they have no FX exposure; rowCount is therefore foreign-currency settlement count, not total settlement count.',
     'Settlement rate is the latest FxRate row on or before paidAt, falling back to the document booking rate when no settlement rate exists.',
     `Rows surface the configured realised FX account (${settings.realisedFxGainLossAccount || 'not configured'}) plus the AR/AP control account used by the Xero journal path.`,
   ], options.paginate !== false)

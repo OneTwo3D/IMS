@@ -96,7 +96,7 @@ export async function GET(req: NextRequest) {
       const report = await getThroughputAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['date', 'userName', 'orderCount', 'shipmentCount', 'lineCount', 'queueDepth']), `throughput-${date}.csv`)
+      return csvResponse(toCsv(report.rows, ['date', 'userName', 'orderCount', 'shipmentCount', 'lineCount']), `throughput-${date}.csv`)
     }
     default:
       return NextResponse.json({ error: 'Unknown sales analytics export type' }, { status: 400 })

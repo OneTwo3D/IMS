@@ -76,6 +76,7 @@ test('AR aging subtracts non-refund payments and uses configurable buckets', asy
         customerEmail: 'a@example.com',
         createdAt: new Date('2026-05-01T00:00:00.000Z'),
         invoicedAt: new Date('2026-05-01T00:00:00.000Z'),
+        paymentDueAt: null,
         paidAt: null,
         totalBase: decimal('120'),
         payments: [
@@ -93,10 +94,67 @@ test('AR aging subtracts non-refund payments and uses configurable buckets', asy
     { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } },
   )
 
-  assert.equal(report.rows[0]?.bucket3, '100')
-  assert.equal(report.rows[0]?.outstandingBase, '100')
-  assert.equal(report.totals.outstandingBase, '100')
+  assert.equal(report.rows[0]?.bucket3, '95')
+  assert.equal(report.rows[0]?.outstandingBase, '95')
+  assert.equal(report.totals.outstandingBase, '95')
   assert.equal(report.totals.bucket1Days, '10')
+})
+
+test('AR aging uses paymentDueAt and separates customer credit balances', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...unusedClient(),
+    salesOrder: {
+      findMany: async () => [
+        {
+          id: 'so-1',
+          customerId: 'customer-1',
+          customerName: 'Customer A',
+          customerEmail: 'a@example.com',
+          createdAt: new Date('2026-04-01T00:00:00.000Z'),
+          invoicedAt: new Date('2026-04-01T00:00:00.000Z'),
+          paymentDueAt: new Date('2026-05-25T00:00:00.000Z'),
+          paidAt: null,
+          totalBase: decimal('1000'),
+          payments: [
+            { amount: decimal('300'), paidAt: new Date('2026-05-15T00:00:00.000Z'), refundId: null },
+            { amount: decimal('200'), paidAt: new Date('2026-05-20T00:00:00.000Z'), refundId: 'refund-1' },
+          ],
+          status: SalesOrderStatus.PROCESSING,
+        },
+        {
+          id: 'so-credit',
+          customerId: 'customer-1',
+          customerName: 'Customer A',
+          customerEmail: 'a@example.com',
+          createdAt: new Date('2026-05-01T00:00:00.000Z'),
+          invoicedAt: new Date('2026-05-01T00:00:00.000Z'),
+          paymentDueAt: new Date('2026-05-01T00:00:00.000Z'),
+          paidAt: null,
+          totalBase: decimal('100'),
+          payments: [{ amount: decimal('150'), paidAt: new Date('2026-05-02T00:00:00.000Z'), refundId: null }],
+          status: SalesOrderStatus.PROCESSING,
+        },
+      ],
+    },
+  }
+
+  const report = await getArAgingReport(
+    { bucket1Days: 10, bucket2Days: 20, bucket3Days: 40, dateTo: '2026-06-01' },
+    { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } },
+  )
+
+  assert.equal(report.rows[0]?.bucket1, '500')
+  assert.equal(report.rows[0]?.outstandingBase, '500')
+  assert.equal(
+    decimal(report.rows[0]?.current ?? 0)
+      .add(report.rows[0]?.bucket1 ?? 0)
+      .add(report.rows[0]?.bucket2 ?? 0)
+      .add(report.rows[0]?.bucket3 ?? 0)
+      .add(report.rows[0]?.bucket4 ?? 0)
+      .toString(),
+    report.rows[0]?.outstandingBase,
+  )
+  assert.equal(report.totals.creditBalanceBase, '50')
 })
 
 test('AP aging reconciles unpaid supplier invoices into aging buckets', async () => {
@@ -160,8 +218,66 @@ test('FX gain/loss uses latest settlement rate and configured Xero accounts', as
   )
 
   assert.equal(report.rows[0]?.bookedBase, '100')
+  assert.equal(report.rows[0]?.settlementId, 'payment-1')
   assert.equal(report.rows[0]?.settlementBase, '80')
   assert.equal(report.rows[0]?.gainLossBase, '-20')
   assert.equal(report.rows[0]?.fxGainLossAccount, '610')
   assert.equal(report.totals.lossesBase, '20')
+})
+
+test('FX gain/loss keeps partial receivable payments as separate settlement rows', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...unusedClient(),
+    payment: {
+      findMany: async () => [
+        {
+          id: 'payment-1',
+          amount: decimal('120'),
+          currency: 'USD',
+          paidAt: new Date('2026-01-10T00:00:00.000Z'),
+          refundId: null,
+          order: {
+            id: 'so-1',
+            orderNumber: 'SO-1',
+            invoiceNumber: 'INV-1',
+            currency: 'USD',
+            fxRateToBase: decimal('1.2'),
+            customerName: 'Customer A',
+            customerEmail: null,
+          },
+        },
+        {
+          id: 'payment-2',
+          amount: decimal('120'),
+          currency: 'USD',
+          paidAt: new Date('2026-02-10T00:00:00.000Z'),
+          refundId: null,
+          order: {
+            id: 'so-1',
+            orderNumber: 'SO-1',
+            invoiceNumber: 'INV-1',
+            currency: 'USD',
+            fxRateToBase: decimal('1.2'),
+            customerName: 'Customer A',
+            customerEmail: null,
+          },
+        },
+      ],
+    },
+    fxRate: {
+      findMany: async () => [
+        { fromCurrency: 'GBP', toCurrency: 'USD', rate: decimal('1.1'), fetchedAt: new Date('2026-01-09T00:00:00.000Z') },
+        { fromCurrency: 'GBP', toCurrency: 'USD', rate: decimal('1.5'), fetchedAt: new Date('2026-02-09T00:00:00.000Z') },
+      ],
+    },
+  }
+
+  const report = await getFxGainLossReport(
+    { dateFrom: '2026-01-01', dateTo: '2026-02-28' },
+    { deps: { client, now: () => new Date('2026-02-28T00:00:00.000Z'), accountingSettings: settings } },
+  )
+
+  assert.deepEqual(report.rows.map((row) => row.settlementId), ['payment-1', 'payment-2'])
+  assert.deepEqual(report.rows.map((row) => row.settlementRateToBase), ['1.1', '1.5'])
+  assert.match(report.notices.join(' '), /one row per Payment\.id/)
 })

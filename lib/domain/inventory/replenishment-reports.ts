@@ -60,6 +60,7 @@ export type ReplenishmentReportDeps = {
 type SupplierProductRow = {
   supplierId: string
   supplierSku: string | null
+  lastUnitCost: DecimalInput
   leadTimeDays: number | null
   supplier: { name: string }
 }
@@ -184,6 +185,7 @@ export type ReorderReportRow = {
   supplierSku: string | null
   stockUnit: string
   availableQty: string
+  warehouseAvailabilityBreakdown: string
   inboundOpenPoQty: string
   averageDailyDemand: string
   leadTimeDays: number
@@ -363,12 +365,41 @@ function supplierNames(product: { supplierProducts: Array<{ supplier: { name: st
   return product.supplierProducts.map((row) => row.supplier.name)
 }
 
+function normalizeAbcClass(value: string | null): string | null {
+  if (!value) return null
+  const normalized = value.trim().toUpperCase()
+  return normalized === 'A' || normalized === 'B' || normalized === 'C' ? normalized : null
+}
+
 function stockKey(productId: string, warehouseId: string | null | undefined): string {
   return `${productId}:${warehouseId ?? 'all'}`
 }
 
 function addToMap(map: Map<string, Prisma.Decimal>, key: string, value: DecimalInput): void {
   map.set(key, (map.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(value)))
+}
+
+function availabilityBreakdownByProduct(stockLevels: StockLevelRow[]): Map<string, string> {
+  const byProductWarehouse = new Map<string, Prisma.Decimal>()
+  for (const level of stockLevels) {
+    addToMap(byProductWarehouse, stockKey(level.productId, level.warehouseId), toDecimal(level.quantity).sub(toDecimal(level.reservedQty)))
+  }
+  const byProduct = new Map<string, Array<{ warehouseId: string; available: Prisma.Decimal }>>()
+  for (const [key, available] of byProductWarehouse.entries()) {
+    const separator = key.lastIndexOf(':')
+    const productId = key.slice(0, separator)
+    const warehouseId = key.slice(separator + 1)
+    const rows = byProduct.get(productId) ?? []
+    rows.push({ warehouseId, available })
+    byProduct.set(productId, rows)
+  }
+  return new Map([...byProduct.entries()].map(([productId, rows]) => [
+    productId,
+    rows
+      .sort((a, b) => a.warehouseId.localeCompare(b.warehouseId))
+      .map((row) => `${row.warehouseId}: ${quantityString(row.available)}`)
+      .join('; '),
+  ]))
 }
 
 async function loadOpenPoLines(client: ReplenishmentReportClient, filters: StockPositionFilters): Promise<OpenPoLineRow[]> {
@@ -516,10 +547,11 @@ export async function getReorderReport(
           select: {
             supplierId: true,
             supplierSku: true,
+            lastUnitCost: true,
             leadTimeDays: true,
             supplier: { select: { name: true } },
           },
-          orderBy: { updatedAt: 'desc' },
+          orderBy: [{ lastUnitCost: 'asc' }, { updatedAt: 'desc' }],
         },
       },
       orderBy: { sku: 'asc' },
@@ -537,9 +569,11 @@ export async function getReorderReport(
   for (const level of stockLevels) {
     addToMap(availableByProduct, level.productId, toDecimal(level.quantity).sub(toDecimal(level.reservedQty)))
   }
+  const warehouseBreakdown = availabilityBreakdownByProduct(stockLevels)
   const inboundByProduct = inboundOpenPoByProduct(openPoLines)
   const velocityByProduct = new Map(calculateDailyVelocity(velocityInputs, window).map((row) => [row.productId, row]))
   const defaultLeadTimeSkus: string[] = []
+  const invalidAbcClassSkus: string[] = []
 
   const rows = products.flatMap<ReorderReportRow>((product) => {
     const configuredReorderQty = product.reorderQty == null ? null : toDecimal(product.reorderQty)
@@ -561,6 +595,8 @@ export async function getReorderReport(
       ? Prisma.Decimal.max(configuredReorderQty ?? new Prisma.Decimal(0), gapQty)
       : new Prisma.Decimal(0)
     if (suggestedReorderQty.lte(0) && projectedAvailableQty.gt(reorderPoint)) return []
+    const abcClass = normalizeAbcClass(product.abcClass)
+    if (product.abcClass && !abcClass) invalidAbcClassSkus.push(product.sku)
     const urgency: ReorderReportRow['urgency'] = projectedAvailableQty.lte(0)
       ? 'critical'
       : projectedAvailableQty.lte(reorderPoint)
@@ -577,6 +613,7 @@ export async function getReorderReport(
       supplierSku: supplier?.supplierSku ?? null,
       stockUnit: product.stockUnit,
       availableQty: quantityString(availableQty),
+      warehouseAvailabilityBreakdown: warehouseBreakdown.get(product.id) ?? '',
       inboundOpenPoQty: quantityString(inboundOpenPoQty),
       averageDailyDemand: quantityString(averageDailyDemand),
       leadTimeDays,
@@ -584,7 +621,7 @@ export async function getReorderReport(
       reorderPoint: quantityString(reorderPoint),
       configuredReorderQty: quantityString(configuredReorderQty ?? 0),
       suggestedReorderQty: quantityString(suggestedReorderQty),
-      abcClass: product.abcClass,
+      abcClass,
       urgency,
     }]
   })
@@ -618,7 +655,10 @@ export async function getReorderReport(
       `Demand velocity uses SALE_DISPATCH movements from ${dateOnly(window.dateFrom)} to ${dateOnly(window.dateTo)}; returns are not netted.`,
       'Lead time uses SupplierProduct.leadTimeDays first, observed PurchaseReceipt P95 by supplier/SKU second, and the default 14 days only when neither exists.',
       'Suggested reorder quantity only applies the configured reorder quantity when projected available stock is below the reorder point; a configured reorderQty of 0 opts the SKU out of auto-reorder suggestions.',
+      'Planning fields are optional for existing products; abcClass is displayed only for A/B/C values and invalid values are ignored with a notice.',
+      'When a product has multiple supplier-product rows, Reorder Planning chooses the lowest lastUnitCost supplier row as the default suggestion source.',
       ...(defaultLeadTimeSkus.length > 0 ? [`Default ${DEFAULT_LEAD_TIME_DAYS}-day lead time used for ${defaultLeadTimeSkus.length} SKU(s) without configured or observed lead time: ${defaultLeadTimeSkus.slice(0, 10).join(', ')}${defaultLeadTimeSkus.length > 10 ? ', ...' : ''}.`] : []),
+      ...(invalidAbcClassSkus.length > 0 ? [`Ignored invalid abcClass values for ${invalidAbcClassSkus.length} SKU(s): ${invalidAbcClassSkus.slice(0, 10).join(', ')}${invalidAbcClassSkus.length > 10 ? ', ...' : ''}.`] : []),
     ],
   }
 }
