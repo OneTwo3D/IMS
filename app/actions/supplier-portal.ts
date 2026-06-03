@@ -5,6 +5,7 @@ import { db } from '@/lib/db'
 import { auth } from '@/lib/auth'
 import { logActivity } from '@/lib/activity-log'
 import { checkRateLimit } from '@/lib/rate-limit'
+import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { z } from 'zod'
 
@@ -58,6 +59,10 @@ const supplierProductEditSchema = z.object({
     .regex(/^[A-Za-z0-9._:/#@+ -]*$/, 'Supplier SKU contains unsupported characters')
     .optional(),
 })
+
+function roundDecimalString(value: ReturnType<typeof toDecimal>, precision: number): string {
+  return roundQuantity(value, precision).toString()
+}
 
 // ---------------------------------------------------------------------------
 // Supplier's RFQs (DRAFT or RFQ_SENT purchase orders for this supplier)
@@ -276,24 +281,27 @@ export async function submitSupplierQuote(
       })
       if (!lockedPo) throw new Error('RFQ not found or not accessible')
 
-      const fxRate = Number(lockedPo.fxRateToBase) || 1
+      const fxRate = toDecimal(lockedPo.fxRateToBase)
+      const effectiveFxRate = fxRate.gt(0) ? fxRate : toDecimal(1)
       for (const line of safeData.lines) {
         // Verify line belongs to this PO (prevent cross-PO manipulation)
         const poLine = await tx.purchaseOrderLine.findFirst({ where: { id: line.lineId, poId } })
         if (!poLine) continue
 
-        const totalForeign = line.qty * line.unitPrice
-        const unitCostBase = Math.round((line.unitPrice / fxRate) * 1000000) / 1000000
-        const totalBase = Math.round((totalForeign / fxRate) * 10000) / 10000
+        const qty = toDecimal(line.qty)
+        const unitPriceForeign = toDecimal(line.unitPrice)
+        const totalForeign = qty.mul(unitPriceForeign)
+        const unitCostBase = unitPriceForeign.div(effectiveFxRate)
+        const totalBase = totalForeign.div(effectiveFxRate)
 
         await tx.purchaseOrderLine.update({
           where: { id: line.lineId },
           data: {
-            qty: line.qty,
-            unitCostForeign: line.unitPrice,
-            unitCostBase,
-            totalForeign,
-            totalBase,
+            qty: qty.toString(),
+            unitCostForeign: unitPriceForeign.toString(),
+            unitCostBase: roundDecimalString(unitCostBase, 6),
+            totalForeign: roundDecimalString(totalForeign, 4),
+            totalBase: roundDecimalString(totalBase, 4),
           },
         })
       }
@@ -302,23 +310,24 @@ export async function submitSupplierQuote(
         where: { poId },
         select: { totalForeign: true, totalBase: true, taxForeign: true, taxBase: true },
       })
-      const subtotalForeign = updatedLines.reduce((s, l) => s + Number(l.totalForeign), 0)
-      const subtotalBase = updatedLines.reduce((s, l) => s + Number(l.totalBase), 0)
-      const taxForeign = updatedLines.reduce((s, l) => s + Number(l.taxForeign), 0)
-      const taxBase = updatedLines.reduce((s, l) => s + Number(l.taxBase), 0)
-      const shippingBase = Math.round((safeData.shippingCost / fxRate) * 10000) / 10000
+      const subtotalForeign = updatedLines.reduce((sum, line) => sum.add(line.totalForeign), toDecimal(0))
+      const subtotalBase = updatedLines.reduce((sum, line) => sum.add(line.totalBase), toDecimal(0))
+      const taxForeign = updatedLines.reduce((sum, line) => sum.add(line.taxForeign), toDecimal(0))
+      const taxBase = updatedLines.reduce((sum, line) => sum.add(line.taxBase), toDecimal(0))
+      const shippingForeign = toDecimal(safeData.shippingCost)
+      const shippingBase = shippingForeign.div(effectiveFxRate)
 
       const updated = await tx.purchaseOrder.updateMany({
         where: { id: poId, supplierId: ctx.supplierId, status: { in: ['DRAFT', 'RFQ_SENT'] } },
         data: {
-          subtotalForeign,
-          subtotalBase,
-          taxForeign,
-          taxBase,
-          totalForeign: subtotalForeign + taxForeign + safeData.shippingCost,
-          totalBase: subtotalBase + taxBase + shippingBase,
-          directFreightForeign: safeData.shippingCost,
-          directFreightBase: shippingBase,
+          subtotalForeign: roundDecimalString(subtotalForeign, 4),
+          subtotalBase: roundDecimalString(subtotalBase, 4),
+          taxForeign: roundDecimalString(taxForeign, 4),
+          taxBase: roundDecimalString(taxBase, 4),
+          totalForeign: roundDecimalString(subtotalForeign.add(taxForeign).add(shippingForeign), 4),
+          totalBase: roundDecimalString(subtotalBase.add(taxBase).add(shippingBase), 4),
+          directFreightForeign: roundDecimalString(shippingForeign, 4),
+          directFreightBase: roundDecimalString(shippingBase, 4),
           supplierRef,
           expectedDelivery: safeData.expectedDelivery ? new Date(safeData.expectedDelivery) : null,
           notes: safeData.shippingMethod ? `Shipping: ${safeData.shippingMethod}` : undefined,

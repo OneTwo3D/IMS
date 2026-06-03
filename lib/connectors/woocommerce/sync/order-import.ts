@@ -13,6 +13,7 @@ import {
 import { syncRefundsForOrder } from './refund-sync'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
+import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 import { getSettingValue } from '@/lib/settings-store'
 
@@ -23,6 +24,14 @@ import { getSettingValue } from '@/lib/settings-store'
 export type ImportWcOrderOptions = { skipAccounting?: boolean; useWcDateAsCreatedAt?: boolean }
 
 const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
+
+function roundDecimalNumber(value: DecimalInput, precision: number): number {
+  return roundQuantity(value, precision).toNumber()
+}
+
+function divideRoundedNumber(value: DecimalInput, divisor: DecimalInput, precision: number): number {
+  return roundDecimalNumber(toDecimal(value).div(toDecimal(divisor)), precision)
+}
 
 function isUniqueConstraintError(error: unknown): error is { code: string } {
   return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: string }).code === 'P2002'
@@ -234,23 +243,24 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const totalForeign = parseFloat(wcOrder.total) || 0
 
     // GBP conversions
-    const subtotalBase = Math.round((subtotalForeign / fxRate) * 10000) / 10000
-    const shippingBase = Math.round((shippingForeign / fxRate) * 10000) / 10000
-    const taxBase = Math.round((taxForeign / fxRate) * 10000) / 10000
-    const totalBase = Math.round((totalForeign / fxRate) * 10000) / 10000
+    const subtotalBase = divideRoundedNumber(subtotalForeign, fxRate, 4)
+    const shippingBase = divideRoundedNumber(shippingForeign, fxRate, 4)
+    const taxBase = divideRoundedNumber(taxForeign, fxRate, 4)
+    const totalBase = divideRoundedNumber(totalForeign, fxRate, 4)
 
     // Line data for Prisma
     const lineData = mappedLines.map((l, idx) => {
       const resolved = lineTaxResolved[idx]
       const rate = resolved.taxRateValue
+      const grossForeign = toDecimal(l.qty).mul(l.unitPriceForeign).sub(l.discountAmount)
       const netForeign = pricesIncludeVat
-        ? (l.qty * l.unitPriceForeign - l.discountAmount) / (1 + rate)
-        : l.qty * l.unitPriceForeign - l.discountAmount
-      const unitPriceBase = Math.round((l.unitPriceForeign / fxRate) * 1000000) / 1000000
-      const totalLineForeign = Math.round(netForeign * 10000) / 10000
-      const totalLineGbp = Math.round((totalLineForeign / fxRate) * 10000) / 10000
+        ? grossForeign.div(toDecimal(1).add(rate))
+        : grossForeign
+      const unitPriceBase = divideRoundedNumber(l.unitPriceForeign, fxRate, 6)
+      const totalLineForeign = roundDecimalNumber(netForeign, 4)
+      const totalLineGbp = divideRoundedNumber(totalLineForeign, fxRate, 4)
       const taxLineForeign = l.taxForeign
-      const taxLineGbp = Math.round((taxLineForeign / fxRate) * 10000) / 10000
+      const taxLineGbp = divideRoundedNumber(taxLineForeign, fxRate, 4)
 
       return {
         productId: l.productId,
@@ -387,8 +397,8 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       // to Xero as tax-inclusive when WC was inclusive so gross line prices
       // are interpreted correctly — shipping is converted to gross first to
       // stay consistent with the LineAmountTypes flag.
-      const vatMultiplier = 1 + (taxRateValue || 0)
-      const shippingSendForeign = pricesIncludeVat ? shippingForeign * vatMultiplier : shippingForeign
+      const vatMultiplier = toDecimal(1).add(taxRateValue || 0)
+      const shippingSendForeign = pricesIncludeVat ? toDecimal(shippingForeign).mul(vatMultiplier) : toDecimal(shippingForeign)
       // WooCommerce coupon discounts are imported exactly as stored on the
       // order so the accounting connector sees the original order-currency
       // discount amount without a base-currency round-trip.
@@ -413,13 +423,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
             unitAmount: l.unitPriceForeign,
             accountCode: settings.salesAccount,
             taxType: lineTaxResolved[idx]?.accountingTaxType ?? accountingTaxType ?? undefined,
-            discountAmount: l.discountAmount > 0 ? Math.round(l.discountAmount * 10000) / 10000 : undefined,
+            discountAmount: l.discountAmount > 0 ? roundDecimalNumber(l.discountAmount, 4) : undefined,
           })),
-          shippingAmount: shippingSendForeign > 0 ? Math.round(shippingSendForeign * 10000) / 10000 : undefined,
+          shippingAmount: shippingSendForeign.gt(0) ? roundDecimalNumber(shippingSendForeign, 4) : undefined,
           shippingDescription: 'Shipping',
           shippingAccountCode: settings.shippingAccount || undefined,
           shippingTaxType: accountingTaxType ?? undefined,
-          discountAmount: orderDiscount.discountAmount > 0 ? Math.round(orderDiscount.discountAmount * 100) / 100 : undefined,
+          discountAmount: orderDiscount.discountAmount > 0 ? roundDecimalNumber(orderDiscount.discountAmount, 2) : undefined,
           discountAccountCode: settings.discountAccount || undefined,
           discountTaxType: accountingTaxType ?? undefined,
           lineAmountsIncludeTax: pricesIncludeVat,
@@ -429,7 +439,17 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           _paymentDate: wcOrder.date_paid_gmt || undefined,
         },
       })
-    } catch { /* Accounting queue errors should never block import */ }
+    } catch (accountingError) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: 'sales_invoice_accounting_queue_failed',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: `Failed to queue WooCommerce sales invoice for order ${orderNumber}: ${accountingError instanceof Error ? accountingError.message : String(accountingError)}`,
+        metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), orderNumber, error: String(accountingError) },
+      })
+    }
 
     // Log sync
     await db.shoppingSyncLog.create({

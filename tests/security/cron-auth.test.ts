@@ -89,18 +89,18 @@ test('localhost cron request is rejected in production by default', async () => 
   })
 })
 
-test('localhost cron request is accepted in production with explicit override', async () => {
+test('localhost cron request is rejected in production even with explicit override', async () => {
   await withCronEnv({
     ALLOW_LOCALHOST_CRON_BYPASS: 'true',
     NODE_ENV: 'production',
   }, async () => {
     const response = await verifyCron(cronRequest('127.0.0.1:3000'))
 
-    assert.equal(response, null)
+    assert.equal(response?.status, 401)
   })
 })
 
-test('production localhost override does not allow non-localhost requests', async () => {
+test('production localhost override still rejects non-localhost requests', async () => {
   await withCronEnv({
     ALLOW_LOCALHOST_CRON_BYPASS: 'true',
     NODE_ENV: 'production',

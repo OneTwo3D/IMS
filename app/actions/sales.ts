@@ -13,6 +13,7 @@ import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { decimalToNumber } from '@/lib/decimal'
+import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { validateManualSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   buildRealisedFxJournal,
@@ -31,6 +32,14 @@ import {
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
+
+function roundDecimalNumber(value: DecimalInput, precision: number): number {
+  return roundQuantity(value, precision).toNumber()
+}
+
+function divideRoundedNumber(value: DecimalInput, divisor: DecimalInput, precision: number): number {
+  return roundDecimalNumber(toDecimal(value).div(toDecimal(divisor)), precision)
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -297,25 +306,23 @@ async function refreshDraftOrderFxAtFinalization(
     })
     if (!order || order.status !== 'DRAFT') return
     const fxRate = await resolveFxRateToBase(tx, order.currency, baseCurrency, asOf)
-    const round4 = (value: number) => Math.round(value * 10000) / 10000
-    const round6 = (value: number) => Math.round(value * 1000000) / 1000000
     await tx.salesOrder.update({
       where: { id: orderId },
       data: {
         fxRateToBase: fxRate,
-        subtotalBase: round4(Number(order.subtotalForeign) / fxRate),
-        shippingBase: round4(Number(order.shippingForeign) / fxRate),
-        taxBase: round4(Number(order.taxForeign) / fxRate),
-        totalBase: round4(Number(order.totalForeign) / fxRate),
+        subtotalBase: divideRoundedNumber(order.subtotalForeign, fxRate, 4),
+        shippingBase: divideRoundedNumber(order.shippingForeign, fxRate, 4),
+        taxBase: divideRoundedNumber(order.taxForeign, fxRate, 4),
+        totalBase: divideRoundedNumber(order.totalForeign, fxRate, 4),
       },
     })
     for (const line of order.lines) {
       await tx.salesOrderLine.update({
         where: { id: line.id },
         data: {
-          unitPriceBase: round6(Number(line.unitPriceForeign) / fxRate),
-          taxBase: round4(Number(line.taxForeign) / fxRate),
-          totalBase: round4(Number(line.totalForeign) / fxRate),
+          unitPriceBase: divideRoundedNumber(line.unitPriceForeign, fxRate, 6),
+          taxBase: divideRoundedNumber(line.taxForeign, fxRate, 4),
+          totalBase: divideRoundedNumber(line.totalForeign, fxRate, 4),
         },
       })
     }
@@ -639,7 +646,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     let totalTaxForeign = 0
     let totalTaxBase = 0
 
-    const round4 = (n: number) => Math.round(n * 10000) / 10000
+    const round4 = (value: DecimalInput) => roundDecimalNumber(value, 4)
 
     // --- Tax category resolution ---------------------------------------
     // Load each line's product category + the order default rate so we can
@@ -754,14 +761,14 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       const lineRate = resolved.taxRateValue
       const lineInclVat = inclVat && lineRate > 0
       const discAmt = l.discountAmount ?? 0 // in gross if inclVat, else net
-      const lineGross = l.qty * l.unitPriceForeign - discAmt
-      const netForeign = lineInclVat ? lineGross / (1 + lineRate) : lineGross
-      const unitPriceBase = Math.round((l.unitPriceForeign / fxRate) * 1000000) / 1000000
+      const lineGross = toDecimal(l.qty).mul(l.unitPriceForeign).sub(discAmt)
+      const netForeign = lineInclVat ? lineGross.div(toDecimal(1).add(lineRate)) : lineGross
+      const unitPriceBase = divideRoundedNumber(l.unitPriceForeign, fxRate, 6)
       const totalForeign = round4(netForeign)
-      const totalBase = round4(totalForeign / fxRate)
-      const lineTax = lineInclVat ? lineGross - netForeign : netForeign * lineRate
+      const totalBase = divideRoundedNumber(totalForeign, fxRate, 4)
+      const lineTax = lineInclVat ? lineGross.sub(netForeign) : netForeign.mul(lineRate)
       const lineTaxForeign = round4(lineTax)
-      const lineTaxBase = round4(lineTaxForeign / fxRate)
+      const lineTaxBase = divideRoundedNumber(lineTaxForeign, fxRate, 4)
       linesSubtotalForeign += totalForeign
       linesSubtotalBase += totalBase
       totalTaxForeign += lineTaxForeign
@@ -788,32 +795,32 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     // rate (the per-line resolver only applies to line items).
     const shippingInclVat = inclVat && vatRate > 0
     const shippingInput = input.shippingForeign ?? 0
-    let feesTotalForeign = 0
-    if (input.fees?.length) for (const f of input.fees) feesTotalForeign += f.amount
-    const totalShippingInput = shippingInput + feesTotalForeign
-    const shippingNetForeign = shippingInclVat ? totalShippingInput / (1 + vatRate) : totalShippingInput
+    let feesTotalForeign = toDecimal(0)
+    if (input.fees?.length) for (const f of input.fees) feesTotalForeign = feesTotalForeign.add(f.amount)
+    const totalShippingInput = toDecimal(shippingInput).add(feesTotalForeign)
+    const shippingNetForeign = shippingInclVat ? totalShippingInput.div(toDecimal(1).add(vatRate)) : totalShippingInput
     const shippingTaxForeign = shippingInclVat
-      ? totalShippingInput - shippingNetForeign
-      : (vatRate > 0 ? shippingNetForeign * vatRate : 0)
+      ? totalShippingInput.sub(shippingNetForeign)
+      : (vatRate > 0 ? shippingNetForeign.mul(vatRate) : toDecimal(0))
     const shippingNetForeignR = round4(shippingNetForeign)
     const shippingTaxForeignR = round4(shippingTaxForeign)
-    const shippingNetBase = round4(shippingNetForeignR / fxRate)
-    const shippingTaxBase = round4(shippingTaxForeignR / fxRate)
+    const shippingNetBase = divideRoundedNumber(shippingNetForeignR, fxRate, 4)
+    const shippingTaxBase = divideRoundedNumber(shippingTaxForeignR, fxRate, 4)
     totalTaxForeign += shippingTaxForeignR
     totalTaxBase += shippingTaxBase
 
     // Order-level discount — cap at line subtotal (compare in gross when inclVat).
     const rawOrderDisc = input.orderDiscountForeign ?? 0
     const linesGrossForCap = shippingInclVat
-      ? linesSubtotalForeign * (1 + vatRate)
-      : linesSubtotalForeign
-    const orderDiscForeign = Math.min(rawOrderDisc, linesGrossForCap)
-    const discNetForeign = shippingInclVat ? orderDiscForeign / (1 + vatRate) : orderDiscForeign
-    const discTaxForeign = shippingInclVat ? orderDiscForeign - discNetForeign : (vatRate > 0 ? discNetForeign * vatRate : 0)
+      ? toDecimal(linesSubtotalForeign).mul(toDecimal(1).add(vatRate))
+      : toDecimal(linesSubtotalForeign)
+    const orderDiscForeign = Prisma.Decimal.min(toDecimal(rawOrderDisc), linesGrossForCap)
+    const discNetForeign = shippingInclVat ? orderDiscForeign.div(toDecimal(1).add(vatRate)) : orderDiscForeign
+    const discTaxForeign = shippingInclVat ? orderDiscForeign.sub(discNetForeign) : (vatRate > 0 ? discNetForeign.mul(vatRate) : toDecimal(0))
     const discNetForeignR = round4(discNetForeign)
     const discTaxForeignR = round4(discTaxForeign)
-    const discNetBase = round4(discNetForeignR / fxRate)
-    const discTaxBase = round4(discTaxForeignR / fxRate)
+    const discNetBase = divideRoundedNumber(discNetForeignR, fxRate, 4)
+    const discTaxBase = divideRoundedNumber(discTaxForeignR, fxRate, 4)
     totalTaxForeign -= discTaxForeignR
     totalTaxBase -= discTaxBase
 
@@ -827,8 +834,8 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
 
     // Grand total = subtotal (net, pre-discount) − net discount + net
     // shipping + total tax. Tax already nets the discount VAT above.
-    const grandTotalForeign = round4(subtotalForeign - discNetForeignR + shippingNetForeignR + totalTaxForeign)
-    const grandTotalBase = round4(subtotalBase - discNetBase + shippingNetBase + totalTaxBase)
+    const grandTotalForeign = round4(toDecimal(subtotalForeign).sub(discNetForeignR).add(shippingNetForeignR).add(totalTaxForeign))
+    const grandTotalBase = round4(toDecimal(subtotalBase).sub(discNetBase).add(shippingNetBase).add(totalTaxBase))
 
     // Keep locals that downstream Prisma / accounting queue references expect.
     const totalShippingForeign = shippingNetForeignR
@@ -908,7 +915,17 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     if (!input.isDraft) {
       try {
         await queueSalesInvoiceForOrder(so.id)
-      } catch { /* Accounting queue errors should never block the main flow */ }
+      } catch (accountingError) {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: so.id,
+          action: 'sales_invoice_accounting_queue_failed',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: `Failed to queue sales invoice for order ${getSalesOrderReference(so)} after creation: ${accountingError instanceof Error ? accountingError.message : String(accountingError)}`,
+          metadata: { orderNumber: getSalesOrderReference(so), error: String(accountingError) },
+        })
+      }
     }
 
     // Aggregated warning when any line fell back to the order default.
@@ -1023,12 +1040,12 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
   // sending inclusive so Xero calculates the correct tax.
   const shippingNetForeign = Number(so.shippingForeign ?? 0)
   const shippingSendForeign = lineAmountsIncludeTax
-    ? Math.round(shippingNetForeign * (1 + vatPct) * 10000) / 10000
+    ? roundDecimalNumber(toDecimal(shippingNetForeign).mul(toDecimal(1).add(vatPct)), 4)
     : shippingNetForeign
 
   // `discountAmount` is stored in the same inclusive/exclusive convention as
   // the order (matching WC import), so it can be passed through directly.
-  const discountForeign = Math.round(Number(so.discountAmount ?? 0) * 100) / 100
+  const discountForeign = roundDecimalNumber(so.discountAmount ?? 0, 2)
 
   await queueAccountingSync({
     type: 'SALES_INVOICE',
