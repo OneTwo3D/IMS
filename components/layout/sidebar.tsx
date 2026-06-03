@@ -70,6 +70,13 @@ const INVENTORY_COSTING_REPORT_LINKS = [
   { href: '/analytics/inventory-turnover',     label: 'Inventory Turnover' },
 ]
 
+const REPORT_ACCESS_GROUPS = [
+  { hrefs: new Set<string>(REPLENISHMENT_REPORT_LINKS.map((link) => link.href)), canAccess: canAccessReplenishmentReports },
+  { hrefs: new Set<string>(SALES_ANALYTICS_LINKS.map((link) => link.href)), canAccess: canAccessSalesAnalytics },
+  { hrefs: new Set<string>(PURCHASING_ANALYTICS_LINKS.map((link) => link.href)), canAccess: canAccessPurchasingAnalytics },
+  { hrefs: new Set<string>(FINANCE_ANALYTICS_LINKS.map((link) => link.href)), canAccess: canAccessFinanceAnalytics },
+]
+
 function getSettingsChildren(accountingIntegrationEnabled: boolean) {
   return [
     { href: '/settings/company', label: 'Company' },
@@ -126,10 +133,10 @@ export function Sidebar({
     ...(can('analytics.inventory_ledger') ? INVENTORY_LEDGER_REPORT_LINKS : []),
     ...(can('analytics.inventory_costing') ? INVENTORY_COSTING_REPORT_LINKS : []),
   ]
-    .filter((item) => !REPLENISHMENT_REPORT_LINKS.some((link) => link.href === item.href) || canAccessReplenishmentReports(userRole))
-    .filter((item) => !SALES_ANALYTICS_LINKS.some((link) => link.href === item.href) || canAccessSalesAnalytics(userRole))
-    .filter((item) => !PURCHASING_ANALYTICS_LINKS.some((link) => link.href === item.href) || canAccessPurchasingAnalytics(userRole))
-    .filter((item) => !FINANCE_ANALYTICS_LINKS.some((link) => link.href === item.href) || canAccessFinanceAnalytics(userRole))
+    .filter((item) => {
+      const group = REPORT_ACCESS_GROUPS.find((candidate) => candidate.hrefs.has(item.href))
+      return !group || group.canAccess(userRole)
+    })
 
   // Supplier gets a completely different navigation
   if (isSupplier) {

@@ -9,7 +9,7 @@ import {
   stockPositionSelectedFilterOptionInputs,
   type StockPositionFilters,
 } from '@/lib/domain/inventory/stock-position-reports'
-import { requireRole } from '@/lib/auth/server'
+import { requireReplenishmentReportAccess } from '@/lib/security/replenishment-report-page-access'
 import {
   StockPositionReportPage,
   type StockPositionColumn,
@@ -35,7 +35,7 @@ function filtersFromSearch(searchParams: SearchParams): StockPositionFilters {
 }
 
 export default async function BackorderPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  await requireRole('ADMIN', 'MANAGER', 'FINANCE')
+  await requireReplenishmentReportAccess()
   const resolvedSearchParams = await searchParams
   const filters = filtersFromSearch(resolvedSearchParams)
   const [report, filterOptions] = await Promise.all([

@@ -1,4 +1,5 @@
 import { getFxGainLossReport, type FxGainLossReportRow } from '@/lib/domain/finance/finance-period-analytics'
+import { requireFinanceAnalyticsAccess } from '@/lib/security/finance-analytics-page-access'
 import { FinanceAnalyticsReportPage, type FinanceAnalyticsColumn } from '../_components/finance-analytics-report'
 import { financeAnalyticsFiltersForUi, financeAnalyticsFiltersFromSearch, type FinanceAnalyticsSearchParams } from '../_components/finance-analytics-page-utils'
 
@@ -6,6 +7,7 @@ type Props = { searchParams: Promise<FinanceAnalyticsSearchParams> }
 
 const columns: Array<FinanceAnalyticsColumn<FxGainLossReportRow>> = [
   { key: 'side', label: 'Side', render: (row) => row.side },
+  { key: 'settlementId', label: 'Settlement', render: (row) => row.settlementId },
   { key: 'reference', label: 'Reference', render: (row) => row.reference },
   { key: 'party', label: 'Party', render: (row) => row.partyName },
   { key: 'currency', label: 'Currency', render: (row) => row.currency },
@@ -18,6 +20,7 @@ const columns: Array<FinanceAnalyticsColumn<FxGainLossReportRow>> = [
 ]
 
 export default async function FxGainLossAnalyticsPage({ searchParams }: Props) {
+  await requireFinanceAnalyticsAccess()
   const filters = financeAnalyticsFiltersFromSearch(await searchParams)
   const report = await getFxGainLossReport(filters)
   return (
@@ -28,7 +31,7 @@ export default async function FxGainLossAnalyticsPage({ searchParams }: Props) {
       filters={financeAnalyticsFiltersForUi(filters)}
       pageInfo={report.pageInfo}
       rows={report.rows}
-      rowKey={(row, index) => `${row.side}:${row.documentId}:${index}`}
+      rowKey={(row) => `${row.side}:${row.settlementId}`}
       columns={columns}
       summary={[
         { label: 'Net gain/loss', value: report.totals.gainLossBase ?? '0' },

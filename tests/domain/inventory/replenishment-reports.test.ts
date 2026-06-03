@@ -48,6 +48,7 @@ test('reorder report nets available and inbound open PO against lead-time demand
         supplierProducts: [{
           supplierId: 'supplier-1',
           supplierSku: 'SUP-SKU-1',
+          lastUnitCost: decimal('2'),
           leadTimeDays: 10,
           supplier,
         }],
@@ -84,6 +85,7 @@ test('reorder report nets available and inbound open PO against lead-time demand
   assert.equal(report.rows.length, 1)
   assert.equal(report.rows[0]?.averageDailyDemand, '1')
   assert.equal(report.rows[0]?.availableQty, '3')
+  assert.equal(report.rows[0]?.warehouseAvailabilityBreakdown, 'warehouse-1: 3')
   assert.equal(report.rows[0]?.inboundOpenPoQty, '6')
   assert.equal(report.rows[0]?.reorderPoint, '15')
   assert.equal(report.rows[0]?.suggestedReorderQty, '12')
@@ -116,6 +118,72 @@ test('reorder report ignores non-stock product type filters', async () => {
   assert.equal(report.rows.length, 0)
 })
 
+test('reorder report treats configured reorderQty zero as opt-out', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [{
+        id: 'product-1',
+        sku: 'SKU-1',
+        name: 'Widget',
+        type: ProductType.SIMPLE,
+        stockUnit: 'pcs',
+        reorderPoint: decimal('10'),
+        reorderQty: decimal('0'),
+        safetyStockQty: decimal('0'),
+        abcClass: null,
+        category,
+        supplierProducts: [],
+      }],
+    },
+    stockLevel: {
+      findMany: async () => [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') }],
+    },
+  }
+
+  const report = await getReorderReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+
+  assert.equal(report.rows.length, 0)
+})
+
+test('reorder report suppresses critical urgency when inbound covers a zero-stock SKU', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => [{
+        id: 'product-1',
+        sku: 'SKU-1',
+        name: 'Widget',
+        type: ProductType.SIMPLE,
+        stockUnit: 'pcs',
+        reorderPoint: decimal('10'),
+        reorderQty: decimal('12'),
+        safetyStockQty: decimal('0'),
+        abcClass: 'B',
+        category,
+        supplierProducts: [],
+      }],
+    },
+    stockLevel: {
+      findMany: async () => [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') }],
+    },
+    purchaseOrderLine: {
+      findMany: async () => [{
+        productId: 'product-1',
+        qty: decimal('100'),
+        qtyReceived: decimal('0'),
+        qtyReturned: decimal('0'),
+        po: { supplierId: 'supplier-1', expectedDelivery: null, destinationWarehouseId: 'warehouse-1', supplier },
+      }],
+    },
+  }
+
+  const report = await getReorderReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+
+  assert.equal(report.rows.length, 0)
+  assert.match(report.notices.join(' '), /projected available stock/)
+})
+
 test('reorder report falls back to observed supplier-product P95 lead time when configured lead time is absent', async () => {
   const client: ReplenishmentReportClient = {
     ...unusedClient(),
@@ -127,13 +195,14 @@ test('reorder report falls back to observed supplier-product P95 lead time when 
         type: ProductType.SIMPLE,
         stockUnit: 'pcs',
         reorderPoint: null,
-        reorderQty: decimal('0'),
+        reorderQty: null,
         safetyStockQty: decimal('0'),
         abcClass: null,
         category,
         supplierProducts: [{
           supplierId: 'supplier-1',
           supplierSku: 'SUP-SKU-1',
+          lastUnitCost: decimal('2'),
           leadTimeDays: null,
           supplier,
         }],
@@ -176,6 +245,62 @@ test('reorder report falls back to observed supplier-product P95 lead time when 
 
   assert.equal(report.rows[0]?.leadTimeDays, 20)
   assert.equal(report.rows[0]?.reorderPoint, '20')
+})
+
+test('reorder report surfaces default lead-time fallback and invalid ABC class notice', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async (args?: unknown) => {
+        const supplierProducts = (args as { select: { supplierProducts: { orderBy: unknown } } }).select.supplierProducts
+        assert.deepEqual(supplierProducts.orderBy, [{ lastUnitCost: 'asc' }, { updatedAt: 'desc' }])
+        return [{
+          id: 'product-1',
+          sku: 'SKU-1',
+          name: 'Widget',
+          type: ProductType.SIMPLE,
+          stockUnit: 'pcs',
+          reorderPoint: decimal('1'),
+          reorderQty: null,
+          safetyStockQty: decimal('0'),
+          abcClass: 'z',
+          category,
+          supplierProducts: [],
+        }]
+      },
+    },
+    stockLevel: {
+      findMany: async () => [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: decimal('0'), reservedQty: decimal('0') }],
+    },
+  }
+
+  const report = await getReorderReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
+
+  assert.equal(report.rows[0]?.abcClass, null)
+  assert.equal(report.rows[0]?.leadTimeDays, 14)
+  assert.match(report.notices.join(' '), /Default 14-day lead time/)
+  assert.match(report.notices.join(' '), /Ignored invalid abcClass/)
+})
+
+test('reorder report caps velocity source rows', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: { findMany: async () => [] },
+    stockMovement: {
+      findMany: async () => Array.from({ length: 50001 }, (_, index) => ({
+        productId: `product-${index}`,
+        qty: decimal('1'),
+        totalValueBase: decimal('1'),
+        createdAt: new Date('2026-06-01T00:00:00.000Z'),
+        product: { sku: `SKU-${index}`, name: 'Widget', category, supplierProducts: [] },
+      })),
+    },
+  }
+
+  await assert.rejects(
+    () => getReorderReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } }),
+    /source rows exceed 50,000/,
+  )
 })
 
 test('backorder report aggregates active sales demand not covered by committed shipments and allocations', async () => {
@@ -231,10 +356,11 @@ test('backorder report aggregates active sales demand not covered by committed s
   assert.equal(report.rows[0]?.orderCount, 2)
   assert.equal(report.rows[0]?.orderedQty, '13')
   assert.equal(report.rows[0]?.committedQty, '2')
-  assert.equal(report.rows[0]?.allocatedQty, '4')
-  assert.equal(report.rows[0]?.backorderQty, '7')
+  assert.equal(report.rows[0]?.allocatedQty, '2')
+  assert.equal(report.rows[0]?.backorderQty, '9')
   assert.equal(report.rows[0]?.inboundOpenPoQty, '15')
   assert.equal(report.rows[0]?.projectedFillDate, '2026-05-20')
+  assert.match(report.notices.join(' '), /Unassigned inbound POs/)
 })
 
 test('component shortage report includes draft and in-progress production demand', async () => {
@@ -304,4 +430,5 @@ test('component shortage report includes draft and in-progress production demand
   assert.equal(report.rows[0]?.shortageQty, '9')
   assert.deepEqual(report.rows[0]?.outputProducts, ['BOM-1 Assembly', 'BOM-2 Second assembly'])
   assert.equal(report.rows[0]?.earliestScheduledAt?.slice(0, 10), '2026-06-10')
+  assert.match(report.notices.join(' '), /without a destination warehouse/)
 })

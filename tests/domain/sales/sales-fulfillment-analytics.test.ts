@@ -6,6 +6,7 @@ import {
   getMarginAnalyticsReport,
   getReturnsAnalyticsReport,
   getSalesAnalyticsReport,
+  getThroughputAnalyticsReport,
   type SalesFulfillmentAnalyticsClient,
 } from '@/lib/domain/sales/sales-fulfillment-analytics'
 
@@ -193,4 +194,38 @@ test('fulfillment report uses Shipment.shippedAt for on-time and elapsed metrics
   assert.equal(report.rows.find((row) => row.metric === 'Fill rate')?.value, '60%')
   assert.equal(report.rows.find((row) => row.metric === 'Average order-to-ship days')?.value, '2')
   assert.equal(report.rows.find((row) => row.metric === 'Partial ship rate')?.value, '100%')
+})
+
+test('throughput report keeps current queue depth in totals, not historical rows', async () => {
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...unusedClient(),
+    activityLog: {
+      findMany: async () => [{
+        userId: 'user-1',
+        createdAt: new Date('2026-06-02T12:00:00.000Z'),
+        metadata: { shipmentId: 'shipment-1' },
+        user: { name: 'Operator A' },
+      }],
+    },
+    shipment: {
+      findMany: async (args?: unknown) => {
+        const where = (args as { where: Record<string, unknown> }).where
+        if ('status' in where) return [{ id: 'pending-1' }, { id: 'pending-2' }]
+        return [{
+          id: 'shipment-1',
+          orderId: 'order-1',
+          lines: [{ lineId: 'line-1', qty: decimal('1') }],
+        }]
+      },
+    },
+  }
+
+  const report = await getThroughputAnalyticsReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-03' },
+    { client, now: () => new Date('2026-06-03T00:00:00.000Z') },
+  )
+
+  assert.equal(report.rows[0]?.shipmentCount, 1)
+  assert.equal('queueDepth' in (report.rows[0] as unknown as Record<string, unknown>), false)
+  assert.equal(report.totals.queueDepth, '2')
 })

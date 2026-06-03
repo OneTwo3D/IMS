@@ -1303,6 +1303,7 @@ model SalesOrder {
   discountAmount    Decimal    @db.Decimal(18, 4) @default(0) // computed order discount in foreign currency
   invoiceNumber     String?    // generated invoice reference
   invoicedAt        DateTime?
+  paymentDueAt      DateTime?
   accountingInvoiceId     String?    @map("accounting_invoice_id") // Accounting invoice ID after sync
   paidAt            DateTime?
   orderNumber       String?    // IMS order number (prefix + WC number, or manual)

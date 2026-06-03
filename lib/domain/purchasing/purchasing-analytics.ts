@@ -2,12 +2,13 @@ import { Prisma, PurchaseOrderStatus } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
+import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
+const SOURCE_ROW_LIMIT = 50000
 const DEFAULT_PERIOD_DAYS = 30
-const BASE_CURRENCY = 'GBP'
 const DAY_MS = 24 * 60 * 60 * 1000
 
 export const OPEN_PURCHASE_ORDER_STATUSES: PurchaseOrderStatus[] = [
@@ -47,6 +48,7 @@ export type PurchasingAnalyticsClient = {
 export type PurchasingAnalyticsDeps = {
   client?: PurchasingAnalyticsClient
   now?: () => Date
+  baseCurrency?: () => Promise<string>
 }
 
 export type PurchasingAnalyticsFilters = {
@@ -153,6 +155,7 @@ type OpenPoRow = {
     qtyReceived: DecimalInput
     qtyReturned: DecimalInput
     unitCostBase: DecimalInput
+    landedUnitCostBase?: DecimalInput
   }>
 }
 
@@ -247,6 +250,11 @@ function nowFromDeps(deps?: PurchasingAnalyticsDeps): Date {
   return deps?.now?.() ?? new Date()
 }
 
+async function baseCurrencyFromDeps(deps?: PurchasingAnalyticsDeps): Promise<string> {
+  if (deps?.baseCurrency) return deps.baseCurrency()
+  return deps?.client ? DEFAULT_BASE_CURRENCY : getBaseCurrencyCode()
+}
+
 function startOfUtcDay(date: Date): Date {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
 }
@@ -313,8 +321,8 @@ function paginate<T>(rows: T[], filters: PurchasingAnalyticsFilters, enabled: bo
   return { rows: rows.slice(start, start + pageSize), pageInfo: info }
 }
 
-function moneyString(value: DecimalInput): string {
-  return roundMoney(value, BASE_CURRENCY).toString()
+function moneyString(value: DecimalInput, currency = DEFAULT_BASE_CURRENCY): string {
+  return roundMoney(value, currency).toString()
 }
 
 function qtyString(value: DecimalInput): string {
@@ -369,9 +377,17 @@ export async function getOpenPurchaseOrdersReport(
 ): Promise<PurchasingAnalyticsReport<OpenPurchaseOrderReportRow>> {
   const client = clientFromDeps(options.deps)
   const generatedAt = nowFromDeps(options.deps)
+  const baseCurrency = await baseCurrencyFromDeps(options.deps)
   const window = period(filters, generatedAt)
   const orders = await client.purchaseOrder.findMany({
-    where: { status: { in: OPEN_PURCHASE_ORDER_STATUSES }, archived: false },
+    where: {
+      status: { in: OPEN_PURCHASE_ORDER_STATUSES },
+      archived: false,
+      OR: [
+        { poSentAt: { gte: window.dateFrom, lte: window.dateTo } },
+        { poSentAt: null, createdAt: { gte: window.dateFrom, lte: window.dateTo } },
+      ],
+    },
     select: {
       id: true,
       reference: true,
@@ -387,11 +403,14 @@ export async function getOpenPurchaseOrdersReport(
           qtyReceived: true,
           qtyReturned: true,
           unitCostBase: true,
+          landedUnitCostBase: true,
         },
       },
     },
     orderBy: [{ expectedDelivery: 'asc' }, { createdAt: 'asc' }],
+    take: SOURCE_ROW_LIMIT + 1,
   }) as OpenPoRow[]
+  if (orders.length > SOURCE_ROW_LIMIT) throw new Error(`Open purchase order source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
 
   const rows = orders.map<OpenPurchaseOrderReportRow>((order) => {
     let outstandingQty = new Prisma.Decimal(0)
@@ -399,7 +418,10 @@ export async function getOpenPurchaseOrdersReport(
     for (const line of order.lines) {
       const outstanding = Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(line.qty).sub(toDecimal(line.qtyReceived)).sub(toDecimal(line.qtyReturned)))
       outstandingQty = outstandingQty.add(outstanding)
-      outstandingValueBase = outstandingValueBase.add(outstanding.mul(toDecimal(line.unitCostBase)))
+      const unitCost = line.landedUnitCostBase != null && toDecimal(line.landedUnitCostBase).gt(0)
+        ? line.landedUnitCostBase
+        : line.unitCostBase
+      outstandingValueBase = outstandingValueBase.add(outstanding.mul(toDecimal(unitCost)))
     }
     const sentAt = order.poSentAt ?? order.createdAt
     return {
@@ -413,7 +435,7 @@ export async function getOpenPurchaseOrdersReport(
       overdue: Boolean(order.expectedDelivery && order.expectedDelivery.getTime() < startOfUtcDay(generatedAt).getTime() && outstandingQty.gt(0)),
       daysSinceSent: daysString(daysBetween(sentAt, generatedAt)),
       outstandingQty: qtyString(outstandingQty),
-      outstandingValueBase: moneyString(outstandingValueBase),
+      outstandingValueBase: moneyString(outstandingValueBase, baseCurrency),
     }
   }).filter((row) => toDecimal(row.outstandingQty).gt(0))
 
@@ -428,15 +450,15 @@ export async function getOpenPurchaseOrdersReport(
   )
   return generatedReport(rows, filters, window, generatedAt, {
     outstandingQty: qtyString(totals.outstandingQty),
-    outstandingValueBase: moneyString(totals.outstandingValueBase),
+    outstandingValueBase: moneyString(totals.outstandingValueBase, baseCurrency),
     overdue: String(totals.overdue),
   }, [
-    'Open POs are PurchaseOrder.status in PO_SENT, PARTIALLY_RECEIVED, or SHIPPED; outstanding quantity nets qtyReceived and qtyReturned from PO lines.',
+    'Open POs are PurchaseOrder.status in PO_SENT, PARTIALLY_RECEIVED, or SHIPPED, with poSentAt/createdAt inside the selected period; outstanding quantity nets qtyReceived and qtyReturned from PO lines and values open qty with landed unit cost when present.',
   ], options.paginate !== false)
 }
 
 async function loadReceipts(client: PurchasingAnalyticsClient, window: { dateFrom: Date; dateTo: Date }): Promise<ReceiptRow[]> {
-  return client.purchaseReceipt.findMany({
+  const receipts = await client.purchaseReceipt.findMany({
     where: { receivedAt: { gte: window.dateFrom, lte: window.dateTo } },
     select: {
       id: true,
@@ -467,7 +489,10 @@ async function loadReceipts(client: PurchasingAnalyticsClient, window: { dateFro
       },
     },
     orderBy: { receivedAt: 'asc' },
-  }) as Promise<ReceiptRow[]>
+    take: SOURCE_ROW_LIMIT + 1,
+  }) as ReceiptRow[]
+  if (receipts.length > SOURCE_ROW_LIMIT) throw new Error(`Purchase receipt source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  return receipts
 }
 
 export async function getSupplierPerformanceReport(
@@ -490,6 +515,7 @@ export async function getSupplierPerformanceReport(
     client.supplierProduct.findMany({
       where: { leadTimeDays: { not: null } },
       select: { supplierId: true, productId: true, leadTimeDays: true },
+      take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<SupplierProductRow[]>,
     client.purchaseOrder.findMany({
       where: {
@@ -563,6 +589,7 @@ export async function getSupplierPerformanceReport(
     const supplier = bySupplier.get(row.supplierId)
     if (supplier && row.leadTimeDays != null) supplier.configuredLeadTimes.push(new Prisma.Decimal(row.leadTimeDays))
   }
+  if (configuredLeadTimes.length > SOURCE_ROW_LIMIT) throw new Error(`Supplier-product source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   for (const order of rfqOrders) {
     if (!order.rfqSentAt) continue
     const supplier = ensure(order.supplierId, order.supplier.name)
@@ -605,6 +632,7 @@ export async function getSupplierPerformanceReport(
     receipts: String(rows.reduce((total, row) => total + row.receiptCount, 0)),
   }, [
     'On-time rate compares PurchaseReceipt.receivedAt with PurchaseOrder.expectedDelivery for receipts that have an expected date.',
+    'Actual lead time is measured from poSentAt/createdAt to PurchaseReceipt.receivedAt, so it includes carrier transit plus any internal receiving delay before IMS receipt posting.',
     'RFQ response days use updatedAt for RFQs that reached QUOTE_RECEIVED or later because the schema does not store a dedicated quoteReceivedAt timestamp.',
   ], options.paginate !== false)
 }
@@ -615,6 +643,7 @@ export async function getPurchasePriceVarianceReport(
 ): Promise<PurchasingAnalyticsReport<PurchasePriceVarianceReportRow>> {
   const client = clientFromDeps(options.deps)
   const generatedAt = nowFromDeps(options.deps)
+  const baseCurrency = await baseCurrencyFromDeps(options.deps)
   const window = period(filters, generatedAt)
   const lines = await client.purchaseOrderLine.findMany({
     where: {
@@ -641,7 +670,9 @@ export async function getPurchasePriceVarianceReport(
       product: { select: { sku: true, name: true, category: { select: { name: true } } } },
     },
     orderBy: [{ po: { receivedAt: 'asc' } }, { po: { createdAt: 'asc' } }],
+    take: SOURCE_ROW_LIMIT + 1,
   }) as PurchaseOrderLineRow[]
+  if (lines.length > SOURCE_ROW_LIMIT) throw new Error(`PPV source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
 
   const priorBySupplierProduct = new Map<string, Prisma.Decimal>()
   const rows: PurchasePriceVarianceReportRow[] = []
@@ -662,10 +693,10 @@ export async function getPurchasePriceVarianceReport(
         poReference: line.po.reference,
         receivedAt: line.po.receivedAt ? dateOnly(line.po.receivedAt) : null,
         qty: qtyString(line.qty),
-        actualLandedUnitCostBase: moneyString(actual),
-        referenceUnitCostBase: prior ? moneyString(prior) : '0',
-        variancePerUnitBase: moneyString(variancePerUnit),
-        varianceTotalBase: moneyString(variancePerUnit.mul(toDecimal(line.qty))),
+        actualLandedUnitCostBase: moneyString(actual, baseCurrency),
+        referenceUnitCostBase: prior ? moneyString(prior, baseCurrency) : '0',
+        variancePerUnitBase: moneyString(variancePerUnit, baseCurrency),
+        varianceTotalBase: moneyString(variancePerUnit.mul(toDecimal(line.qty)), baseCurrency),
         variancePct: prior ? pctString(variancePerUnit, prior) : '0',
         referencePriceSource: prior ? 'prior_po' : 'none',
       })
@@ -675,7 +706,7 @@ export async function getPurchasePriceVarianceReport(
   rows.sort((a, b) => toDecimal(b.varianceTotalBase).abs().cmp(toDecimal(a.varianceTotalBase).abs()) || a.sku.localeCompare(b.sku))
   const totalVariance = rows.reduce((total, row) => total.add(row.varianceTotalBase), new Prisma.Decimal(0))
   return generatedReport(rows, filters, window, generatedAt, {
-    varianceTotalBase: moneyString(totalVariance),
+    varianceTotalBase: moneyString(totalVariance, baseCurrency),
     rowCount: String(rows.length),
   }, [
     'PPV reference price source is the previous received PO line for the same supplier and SKU in base currency; supplier_products.lastUnitCost is stored in supplier currency and is not used as a base-currency standard.',
@@ -688,6 +719,7 @@ export async function getSpendReport(
 ): Promise<PurchasingAnalyticsReport<SpendReportRow>> {
   const client = clientFromDeps(options.deps)
   const generatedAt = nowFromDeps(options.deps)
+  const baseCurrency = await baseCurrencyFromDeps(options.deps)
   const window = period(filters, generatedAt)
   const orders = await client.purchaseOrder.findMany({
     where: {
@@ -705,7 +737,9 @@ export async function getSpendReport(
       lines: { select: { totalBase: true, product: { select: { category: { select: { name: true } } } } } },
     },
     orderBy: { receivedAt: 'asc' },
+    take: SOURCE_ROW_LIMIT + 1,
   }) as SpendPurchaseOrderRow[]
+  if (orders.length > SOURCE_ROW_LIMIT) throw new Error(`Spend source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
 
   type SpendAccumulator = { poIds: Set<string>; spendBase: Prisma.Decimal }
   const byKey = new Map<string, SpendAccumulator & { period: string; supplierId: string; supplierName: string; categoryName: string }>()
@@ -741,12 +775,12 @@ export async function getSpendReport(
     supplierName: row.supplierName,
     categoryName: row.categoryName,
     poCount: row.poIds.size,
-    spendBase: moneyString(row.spendBase),
+    spendBase: moneyString(row.spendBase, baseCurrency),
   }))
   rows.sort((a, b) => a.period.localeCompare(b.period) || a.supplierName.localeCompare(b.supplierName) || a.categoryName.localeCompare(b.categoryName))
   const spendBase = orders.reduce((total, order) => total.add(toDecimal(order.totalBase)), new Prisma.Decimal(0))
   return generatedReport(rows, filters, window, generatedAt, {
-    spendBase: moneyString(spendBase),
+    spendBase: moneyString(spendBase, baseCurrency),
     poCount: String(orders.length),
   }, [
     'Spend totals are reconciled to SUM(PurchaseOrder.totalBase) for POs with receivedAt in the period and a received terminal status; category rows allocate each PO total across line categories by line totalBase share.',
@@ -764,7 +798,9 @@ export async function getLeadTimeReport(
   const supplierProducts = await client.supplierProduct.findMany({
     where: { leadTimeDays: { not: null } },
     select: { supplierId: true, productId: true, leadTimeDays: true },
+    take: SOURCE_ROW_LIMIT + 1,
   }) as SupplierProductRow[]
+  if (supplierProducts.length > SOURCE_ROW_LIMIT) throw new Error(`Supplier-product source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
   const configuredByKey = new Map(supplierProducts.map((row) => [`${row.supplierId}:${row.productId}`, row.leadTimeDays]))
 
   type LeadAccumulator = {
@@ -820,7 +856,7 @@ export async function getLeadTimeReport(
     supplierSkuPairs: String(rows.length),
     maxP95LeadTimeDays: rows[0]?.p95LeadTimeDays ?? '0',
   }, [
-    'Lead time is PurchaseReceipt.receivedAt minus PurchaseOrder.poSentAt, falling back to PO createdAt when poSentAt is absent.',
+    'Lead time is PurchaseReceipt.receivedAt minus PurchaseOrder.poSentAt, falling back to PO createdAt when poSentAt is absent; it includes carrier transit plus any internal receiving delay before IMS receipt posting.',
     'The Reorder Planning report uses observed P95 lead time for a supplier/product when SupplierProduct.leadTimeDays is not configured.',
   ], options.paginate !== false)
 }

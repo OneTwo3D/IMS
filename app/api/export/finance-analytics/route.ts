@@ -75,7 +75,7 @@ export async function GET(req: NextRequest) {
       const report = await getFxGainLossReport({ ...filters, pageSize: FINANCE_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['side', 'reference', 'partyName', 'currency', 'paidAt', 'amountForeign', 'bookedRateToBase', 'settlementRateToBase', 'bookedBase', 'settlementBase', 'gainLossBase', 'outcome', 'controlAccount', 'fxGainLossAccount']), `fx-gain-loss-${date}.csv`)
+      return csvResponse(toCsv(report.rows, ['side', 'settlementId', 'documentId', 'reference', 'partyName', 'currency', 'paidAt', 'amountForeign', 'bookedRateToBase', 'settlementRateToBase', 'bookedBase', 'settlementBase', 'gainLossBase', 'outcome', 'controlAccount', 'fxGainLossAccount']), `fx-gain-loss-${date}.csv`)
     }
     default:
       return NextResponse.json({ error: 'Unknown finance analytics export type' }, { status: 400 })

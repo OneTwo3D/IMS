@@ -49,7 +49,7 @@ test('open purchase order report uses only open statuses and nets received and r
           createdAt: new Date('2026-05-01T00:00:00.000Z'),
           supplierId: 'supplier-1',
           supplier,
-          lines: [{ qty: decimal('10'), qtyReceived: decimal('4'), qtyReturned: decimal('1'), unitCostBase: decimal('2') }],
+          lines: [{ qty: decimal('10'), qtyReceived: decimal('4'), qtyReturned: decimal('1'), unitCostBase: decimal('2'), landedUnitCostBase: decimal('3') }],
         }]
       },
     },
@@ -58,7 +58,7 @@ test('open purchase order report uses only open statuses and nets received and r
   const report = await getOpenPurchaseOrdersReport({}, { deps: { client, now: () => new Date('2026-06-01T00:00:00.000Z') } })
 
   assert.equal(report.rows[0]?.outstandingQty, '5')
-  assert.equal(report.rows[0]?.outstandingValueBase, '10')
+  assert.equal(report.rows[0]?.outstandingValueBase, '15')
   assert.equal(report.rows[0]?.overdue, true)
 })
 

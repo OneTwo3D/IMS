@@ -9,7 +9,7 @@ import {
   stockPositionSelectedFilterOptionInputs,
   type StockPositionFilters,
 } from '@/lib/domain/inventory/stock-position-reports'
-import { requireRole } from '@/lib/auth/server'
+import { requireReplenishmentReportAccess } from '@/lib/security/replenishment-report-page-access'
 import {
   StockPositionReportPage,
   type StockPositionColumn,
@@ -46,7 +46,7 @@ function urgencyLabel(urgency: ReorderReportRow['urgency']): string {
 }
 
 export default async function ReorderPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  await requireRole('ADMIN', 'MANAGER', 'FINANCE')
+  await requireReplenishmentReportAccess()
   const resolvedSearchParams = await searchParams
   const filters = filtersFromSearch(resolvedSearchParams)
   const [report, filterOptions] = await Promise.all([
@@ -71,6 +71,7 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
     { key: 'supplier', label: 'Supplier', render: (row) => row.supplierName ?? 'Unassigned' },
     { key: 'category', label: 'Category', render: (row) => row.categoryName ?? 'Uncategorised' },
     { key: 'available', label: 'Available', align: 'right', render: (row) => `${row.availableQty} ${row.stockUnit}`, footer: report.totals.availableQty },
+    { key: 'warehouseAvailability', label: 'Warehouse availability', render: (row) => row.warehouseAvailabilityBreakdown || 'None' },
     { key: 'inbound', label: 'Inbound PO', align: 'right', render: (row) => row.inboundOpenPoQty, footer: report.totals.inboundOpenPoQty },
     { key: 'demand', label: 'Daily demand', align: 'right', render: (row) => row.averageDailyDemand },
     { key: 'leadTime', label: 'Lead time', align: 'right', render: (row) => `${row.leadTimeDays} days` },
