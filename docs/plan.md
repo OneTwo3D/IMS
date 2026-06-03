@@ -2,11 +2,13 @@
 
 Synthesised from a full codebase audit covering security, rollout, accounting, sales, purchase, and inventory workflows. Shopify and QuickBooks paths excluded.
 
-Each item is sized as one PR with a specific scope, file targets, acceptance criteria, and required tests. Tackle in phase order — earlier phases unblock later ones.
+The IMS instance is assumed not to be in live production use yet. That means legacy compatibility and dual-write rollout phases are less important than landing clean forward-only fixes with strong tests. Before implementing any item, verify the finding still exists on `origin/development`; several entries may already be partially addressed by later work.
+
+Each item is independently testable and includes the expected file targets, acceptance criteria, and tests. Related items should be bundled into coherent PRs by domain or transaction boundary rather than implemented as one PR per finding. Tackle phases in order because earlier phases reduce the risk of later accounting, inventory, and rollout work.
 
 ---
 
-## Phase 0 — Stop-the-bleed (single PR, mergeable today)
+## Phase 0 — Stop-the-bleed
 
 These are reversible-via-recovery issues but the recovery is painful. Fix before any other work lands.
 
@@ -49,6 +51,7 @@ These are reversible-via-recovery issues but the recovery is painful. Fix before
 ### P0.5 — Migration: missing DEFAULT on `NOT NULL` add-column
 - **File:** `prisma/migrations/20260405212718_activity_log_level_tag/migration.sql:29`
 - **Problem:** `ADD COLUMN tag TEXT NOT NULL` against `activity_logs`. Fresh deploys pass; tenant deploys with existing rows fail.
+- **No-live-system note:** If the migration has never been applied to a live tenant, a forward-only companion migration is still preferred, but this is less urgent than the security and financial correctness items above.
 - **Fix:** Replace with a 3-step companion migration:
   1. Add column as nullable.
   2. Backfill `tag = 'system'` (or appropriate default per row class).
@@ -142,7 +145,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 
 ---
 
-## Phase 2 — Rollout / migration safety (3–5 days)
+## Phase 2 — Rollout / migration safety and conventions (3–5 days)
 
 ### P2.1 — Inventory snapshot CHECK constraint never validated
 - **File:** `prisma/migrations/20260528213500_inventory_snapshots_constraints/migration.sql`
@@ -154,6 +157,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ### P2.2 — RENAME COLUMN migrations land in a single shot
 - **Files:** `prisma/migrations/20260410150000_rename_adjustment_reason_account_code/`, `20260415141000_rename_gbp_columns_to_base/`
 - **Problem:** No dual-write phase. Canary or partial deploys 500 on the old column reference.
+- **No-live-system note:** Do not add compatibility shims for already-completed, non-live migrations unless a real deploy path needs them. Treat this mainly as a convention and lint/documentation task for future migrations.
 - **Fix:** For future renames, ship the 3-phase pattern. For these specific ones (already deployed), audit any remaining references in `app/` and `lib/` to confirm code matches the new name, then document the convention in `docs/development.md`.
 - **Acceptance:** Documentation lands describing the 3-phase rename pattern; lint/CI rule (if feasible) flags `RENAME COLUMN` in migrations.
 - **Tests:** N/A (process change).
@@ -400,18 +404,20 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 
 ---
 
-## Phase 8 — Tests + invariants (ongoing, ride with each phase)
+## Quality gates — tests + invariants
 
-### P8.1 — Inventory invariant check blocks deploy
+These are not a separate implementation phase except for the invariant CI gate. They are rules that apply to every PR in the plan.
+
+### QG1 — Inventory invariant check blocks deploy
 - **File:** `app/api/cron/invariant-check/route.ts`, CI pipeline
 - **Fix:** Add `npm run invariant-check:preflight` step to CI. Fail build on critical findings. Document remediation path.
 - **Tests:** Synthetic data with a known invariant violation; assert CI fails.
 
-### P8.2 — Per-phase regression test requirement
+### QG2 — Per-phase regression test requirement
 - For each fix in Phases 1–6, the regression test must exist and pass before the PR can merge. No exceptions.
 - Recommended convention: `tests/regressions/<phase>/<finding-id>.test.ts` so future readers can find the locked-down behaviour.
 
-### P8.3 — Concurrency tests for FIFO + reservation
+### QG3 — Concurrency tests for FIFO + reservation
 - **Files:** new `tests/concurrency/`
 - **Fix:** Build a small concurrency harness using `Promise.all` + `db.$transaction` that exercises:
   - Concurrent FIFO consumption (P1.1).
@@ -433,19 +439,34 @@ Bundle these into one or two PRs that touch multiple modules.
 
 ---
 
-## Suggested execution order for Codex
+## Suggested PR grouping
 
-1. **Day 1:** Phase 0 (5 small PRs that can land same-day).
-2. **Week 1:** Phase 1 items P1.1, P1.2, P1.3, P1.4, P1.5 in order. Each gets its own PR with the regression test.
-3. **Week 2:** Phase 1 items P1.6, P1.7, P1.8 + Phase 2.
-4. **Week 3:** Phase 3.
-5. **Week 4:** Phase 4 + Phase 5.
-6. **Week 5:** Phase 6.
-7. **Week 6+:** Phase 7 / cross-cutting refactors / Phase 8 invariant gates.
+This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any group further only when the diff becomes hard to review or when one item needs a schema migration that should land independently.
+
+1. **Stop-the-bleed security:** P0.1, P0.2, P0.3, P0.4.
+2. **Migration safety docs + checks:** P0.5, P2.1, P2.2, P2.4.
+3. **FIFO / concurrency correctness:** P1.1 plus QG3's FIFO harness.
+4. **Refund correctness:** P1.3, P1.4, P1.5, P3.5, P3.8.
+5. **VAT / tax correctness:** P1.6, P1.8.
+6. **WIP / manufacturing valuation:** P1.7, P4.2, P4.8.
+7. **PO cancellation and freight correctness:** P1.2, P4.1, P4.4.
+8. **Stock and cost-layer precision:** P4.3, P4.5, P4.6, P4.7, P5.5.
+9. **Sales fulfilment transaction guards:** P3.1, P3.2, P3.3, P3.6, P3.7.
+10. **Refund/order status reconciliation:** P3.4.
+11. **Accounting / FX posting correctness:** P5.1, P5.2, P5.4, P5.6, P5.7.
+12. **Account balance freshness:** P5.3.
+13. **Security hardening batch:** P6.2, P6.4, P6.5, P6.6, P6.8.
+14. **Backup / restore operational hardening:** P6.3, P6.7, P7.7.
+15. **Cron / rate / batch controls:** P6.1, P7.6.
+16. **Analytics / report scale refactor:** P7.1, P7.2, P7.3, P7.8, CR1, CR2, CR3.
+17. **CSV export cleanup:** P7.4, CR4.
+18. **Integration settings test gate:** P7.5.
+19. **Sidebar cleanup:** P2.3, CR5.
+20. **CI invariant gate:** QG1 plus QG2's regression-test convention.
 
 After each PR:
 - Run `npm run validate` and `npm run validate:db`.
-- Verify the regression test fails on `main` and passes on the branch.
+- Verify the regression test fails on `origin/development` and passes on the branch.
 - Update `docs/architecture.md` if the public contract changed.
 
 ---
@@ -457,7 +478,7 @@ After each PR:
 - **Decimal precision rule:** never round before arithmetic; always round at the storage/display boundary. Search for `Number(decimalString)` in tone-toggle and sort code — these are precision bugs waiting to happen.
 - **Migrations are append-only.** Never edit a merged migration. If a migration is wrong, ship a fix migration.
 - **Activity-log invariant:** for every mutation that touches financial state (sales, purchases, refunds, FX, manufacturing), there must be an activity-log entry with enough metadata to reconstruct the change. Audit this as part of every Phase 1–5 PR.
-- **Always check documentation for correctness and if updates are required
+- **Always check documentation** for correctness and update it when public contracts, deployment requirements, or operator workflows change.
 
 ---
 
