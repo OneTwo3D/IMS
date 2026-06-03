@@ -1,11 +1,13 @@
-# IMS Follow-up Implementation Plan for Codex
+# IMS Follow-up Implementation Plan for Codex — Historical
 
 Repository: `OneTwo3D/IMS`  
 Base branch: `development`  
 Target PR branch pattern: `codex/<short-task-name>`  
 Runtime: Node `>=22.0.0`, Next.js `16.2.3`, TypeScript, Prisma `7.7.0`
 
-This plan is the next implementation round after the first architecture/safety plan was completed. It focuses on making the new safety infrastructure enforce behavior at runtime, hardening inventory/accounting/WMS flows, and reducing operational risk.
+This plan was the implementation round after the first architecture/safety plan was completed. It focused on making the new safety infrastructure enforce behavior at runtime, hardening inventory/accounting/WMS flows, and reducing operational risk.
+
+Implementation status as of 2026-06-03: this staged follow-up plan has been implemented. Treat it as historical context and acceptance-criteria reference material unless a human explicitly asks to reopen a listed follow-up.
 
 ---
 
@@ -2004,50 +2006,12 @@ PR 11.2  Manufacturing domain extraction
 
 ---
 
-# First Codex task to run
+# Current Codex usage
 
-Use this exact task first:
-
-```text
-Repository: OneTwo3D/IMS
-Base branch: development
-Task: PR 0.1 — Add unit tests to validation
-
-Set yourself up:
-1. git fetch origin
-2. git checkout development
-3. git pull --ff-only origin development
-4. test "$(git branch --show-current)" = "development"
-5. npm ci
-6. npm run validate
-
-Implementation:
-- Add npm script test:unit using NODE_OPTIONS='--import tsx' node --test "tests/**/*.test.ts".
-- Update scripts/validate-local.sh so npm run validate runs:
-  npm run lint
-  npm run type-check
-  npx prisma generate --schema prisma/schema.prisma
-  npm run test:unit
-  npm run docs:workflows:check
-  npm run db:schema:scope -- "${schema_scope_base_ref}" "${schema_scope_head_ref}"
-
-Constraints:
-- Do not change app behavior.
-- Do not target main.
-- Do not remove existing validation steps.
-- Keep schema-scope base as origin/development.
-
-Validation:
-- npm run test:unit
-- npm run validate
-
-PR summary:
-- Base branch: development
-- Feature branch
-- Changed files
-- Validation output
-- Follow-up issues discovered
-```
+Do not start from PR 0.1; this staged plan has already shipped. For new work,
+branch from `development`, inspect the current code and any relevant historical
+plan section, and create a focused PR for the user's current request or newly
+identified gap.
 
 ---
 

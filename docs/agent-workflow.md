@@ -1,6 +1,6 @@
 # Agent Workflow
 
-This repository uses a staged reliability plan for AI-assisted work. The active plan is tracked in `docs/IMS_Codex_Followup_Implementation_Plan.md`; `docs/IMS_Codex_Implementation_Plan.md` is historical context unless a human explicitly asks to revisit it. Implement the active plan one PR or sub-stage at a time.
+This repository previously used staged reliability and production-readiness plans for AI-assisted work. `docs/IMS_Codex_Implementation_Plan.md`, `docs/IMS_Codex_Followup_Implementation_Plan.md`, and `docs/IMS_Codex_Production_Readiness_Blockers.md` are now historical implementation records unless a human explicitly asks to reopen a listed follow-up. New work should start from the user's current request, open PRs/issues, or a newly identified production-readiness gap.
 
 ## Branching
 
@@ -21,7 +21,7 @@ Do not branch from `main` and do not target `main`. If `development` is unavaila
 At the start of a Codex session:
 
 1. Load local instructions from `AGENTS.local.md` when present; otherwise follow this document and the tracked `AGENTS.md`. `AGENTS.local.md` is intentionally ignored by git for clone-specific agent preferences.
-2. Read the assigned stage or sub-stage in `docs/IMS_Codex_Followup_Implementation_Plan.md`.
+2. Read the user's assigned task and any directly relevant historical plan section if the task references one.
 3. Inspect the relevant parts of `README.md`, `package.json`, `prisma/schema.prisma`, `docs/`, `app/actions/`, `app/api/`, `lib/`, `tests/`, and CI files.
 4. Read relevant Next.js docs from `node_modules/next/dist/docs/` before editing routing, server actions, route handlers, caching, or config.
 5. Confirm validation commands from `package.json`.
@@ -115,17 +115,11 @@ Documentation is part of the change, not a later cleanup. For every PR, check wh
 
 If a behavior change intentionally has no documentation impact, say that explicitly in the PR summary or review response.
 
-## Staged PR Process
+## PR Process
 
-Recommended order:
+Do not continue the old staged plans by default; their queued sequences have been implemented through the production-readiness analytics/reporting work. Use them as historical context for why a feature exists, not as the current backlog. For new tasks, keep branches focused and reviewable, preserve behavior unless the task explicitly changes it, and update docs/tests with the code.
 
-1. Agent instructions, validation script, API route auth inventory, secret scanning, cron auth hardening, and state-machine definitions.
-2. Business logic extraction: allocation, shipment, refund, landed cost, then status enforcement.
-3. Inventory and accounting invariants, scheduled invariant reports, Decimal helpers, and high-risk conversion cleanup.
-4. Accounting events, mirroring, reconciliation, integration outbox, WooCommerce outbox, and Xero outbox.
-5. Rate limiting, upload tests, health diagnostics, cron run IDs, import dry-runs, stock availability optimization, and docs cleanup.
-
-Highest-risk work includes shipment/refund extraction, Decimal conversion in domain paths, accounting event migration, and Xero outbox migration. Deploy low-risk safety changes first, run invariant checks in read-only mode before repair behavior, and keep old sync logs as source of truth until reconciliation is stable.
+Highest-risk work still includes inventory/accounting invariants, Decimal conversion in domain paths, WMS/Mintsoft side effects, connector URL/secret safety, reconciliation persistence, migrations, and any mutation path that affects stock, COGS, GL postings, refunds, or shipments. Deploy low-risk safety changes first and use report-only diagnostics before auto-repair behavior.
 
 ## Review Expectations
 
