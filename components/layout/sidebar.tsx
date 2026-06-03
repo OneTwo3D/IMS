@@ -27,6 +27,7 @@ import { canAccessStockPositionReports, STOCK_POSITION_REPORT_LINKS } from '@/li
 import { canAccessReplenishmentReports, REPLENISHMENT_REPORT_LINKS } from '@/lib/security/replenishment-report-access'
 import { canAccessSalesAnalytics, SALES_ANALYTICS_LINKS } from '@/lib/security/sales-analytics-access'
 import { canAccessPurchasingAnalytics, PURCHASING_ANALYTICS_LINKS } from '@/lib/security/purchasing-analytics-access'
+import { canAccessFinanceAnalytics, FINANCE_ANALYTICS_LINKS } from '@/lib/security/finance-analytics-access'
 
 const STOCK_CONTROL_CHILDREN = [
   { href: '/stock-control/stock-adjustments', label: 'Stock Adjustments' },
@@ -50,6 +51,7 @@ const ANALYTICS_CHILDREN = [
   { href: '/analytics/inventory-stats',        label: 'Inventory Report' },
   ...SALES_ANALYTICS_LINKS,
   ...PURCHASING_ANALYTICS_LINKS,
+  ...FINANCE_ANALYTICS_LINKS,
   ...STOCK_POSITION_REPORT_LINKS,
   ...REPLENISHMENT_REPORT_LINKS,
 ]
@@ -120,12 +122,14 @@ export function Sidebar({
     ...(!can('analytics') && canAccessReplenishmentReports(userRole) ? [...REPLENISHMENT_REPORT_LINKS] : []),
     ...(!can('analytics') && canAccessSalesAnalytics(userRole) ? [...SALES_ANALYTICS_LINKS] : []),
     ...(!can('analytics') && canAccessPurchasingAnalytics(userRole) ? [...PURCHASING_ANALYTICS_LINKS] : []),
+    ...(!can('analytics') && canAccessFinanceAnalytics(userRole) ? [...FINANCE_ANALYTICS_LINKS] : []),
     ...(can('analytics.inventory_ledger') ? INVENTORY_LEDGER_REPORT_LINKS : []),
     ...(can('analytics.inventory_costing') ? INVENTORY_COSTING_REPORT_LINKS : []),
   ]
     .filter((item) => !REPLENISHMENT_REPORT_LINKS.some((link) => link.href === item.href) || canAccessReplenishmentReports(userRole))
     .filter((item) => !SALES_ANALYTICS_LINKS.some((link) => link.href === item.href) || canAccessSalesAnalytics(userRole))
     .filter((item) => !PURCHASING_ANALYTICS_LINKS.some((link) => link.href === item.href) || canAccessPurchasingAnalytics(userRole))
+    .filter((item) => !FINANCE_ANALYTICS_LINKS.some((link) => link.href === item.href) || canAccessFinanceAnalytics(userRole))
 
   // Supplier gets a completely different navigation
   if (isSupplier) {
