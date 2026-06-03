@@ -7,7 +7,7 @@ import {
   getStockOnHandReport,
   type StockPositionFilters,
 } from '@/lib/domain/inventory/stock-position-reports'
-import { getDeadStockReport, getInventoryAgingReport } from '@/lib/domain/inventory/inventory-health-reports'
+import { getDeadStockReport, getInventoryAgingReport, InventoryHealthSourceLimitError } from '@/lib/domain/inventory/inventory-health-reports'
 import { stockPositionApiAccessDenied } from '@/lib/security/stock-position-access'
 
 const STOCK_POSITION_CSV_ROW_LIMIT = 50000
@@ -133,7 +133,13 @@ export async function GET(req: NextRequest) {
     }
 
     case 'inventory-aging': {
-      const report = await getInventoryAgingReport(stockPositionFilters(req), { paginate: false })
+      const report = await getInventoryAgingReport(stockPositionFilters(req), { paginate: false }).catch((error: unknown) => {
+        if (error instanceof InventoryHealthSourceLimitError) return error
+        throw error
+      })
+      if (report instanceof InventoryHealthSourceLimitError) {
+        return NextResponse.json({ error: report.message }, { status: 413 })
+      }
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
       const data = report.rows.map((r) => ({
@@ -156,7 +162,13 @@ export async function GET(req: NextRequest) {
     }
 
     case 'dead-stock': {
-      const report = await getDeadStockReport(stockPositionFilters(req), { paginate: false })
+      const report = await getDeadStockReport(stockPositionFilters(req), { paginate: false }).catch((error: unknown) => {
+        if (error instanceof InventoryHealthSourceLimitError) return error
+        throw error
+      })
+      if (report instanceof InventoryHealthSourceLimitError) {
+        return NextResponse.json({ error: report.message }, { status: 413 })
+      }
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
       const data = report.rows.map((r) => ({
@@ -170,12 +182,11 @@ export async function GET(req: NextRequest) {
         stockUnit: r.stockUnit,
         qty: r.qty,
         valueBase: r.valueBase,
-        thresholdDays: report.thresholdDays,
         daysSinceLastSale: r.daysSinceLastSale ?? '',
         lastSaleAt: r.lastSaleAt ?? '',
         firstStockedAt: r.firstStockedAt ?? '',
       }))
-      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'qty', 'valueBase', 'thresholdDays', 'daysSinceLastSale', 'lastSaleAt', 'firstStockedAt']), `dead-stock-${date}.csv`)
+      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'qty', 'valueBase', 'daysSinceLastSale', 'lastSaleAt', 'firstStockedAt']), `dead-stock-${date}.csv`)
     }
 
     default:

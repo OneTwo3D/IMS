@@ -28,6 +28,18 @@ const PRODUCT_TYPES = Object.values(ProductType)
 
 export const INVENTORY_AGING_KIT_MODE = 'component' as const
 
+export class InventoryHealthSourceLimitError extends Error {
+  readonly limit: number
+  readonly scanLabel: string
+
+  constructor(limit: number, scanLabel: string) {
+    super(`Inventory health ${scanLabel} exceeds ${limit.toLocaleString()} rows. Narrow product, warehouse, category, supplier, type, or date filters and retry.`)
+    this.name = 'InventoryHealthSourceLimitError'
+    this.limit = limit
+    this.scanLabel = scanLabel
+  }
+}
+
 type FindManyDelegate = {
   findMany(args?: unknown): Promise<unknown[]>
 }
@@ -173,6 +185,7 @@ type DeadStockLevelRow = {
     name: string
     type: ProductType
     stockUnit: string
+    createdAt: Date
     category: { name: string } | null
     supplierProducts: Array<{ supplier: { name: string } }>
   }
@@ -192,7 +205,9 @@ type DeadStockCostLayerRow = {
 }
 
 type DeadStockSaleMovementRow = {
+  id: string
   productId: string
+  fromWarehouseId: string | null
   qty: DecimalInput
   totalValueBase: DecimalInput | null
   createdAt: Date
@@ -268,7 +283,7 @@ function supplierNames(product: { supplierProducts: Array<{ supplier: { name: st
 
 function rejectOverLimit(rows: unknown[], limit: number, label: string): void {
   if (rows.length > limit) {
-    throw new Error(`Inventory aging ${label} exceeds ${limit.toLocaleString()} rows. Narrow product, warehouse, category, supplier, type, or as-of filters and retry.`)
+    throw new InventoryHealthSourceLimitError(limit, label)
   }
 }
 
@@ -611,12 +626,31 @@ export async function getInventoryAgingReport(
   }
 }
 
+export function emptyInventoryAgingReportForSourceLimit(
+  filters: StockPositionFilters,
+  error: InventoryHealthSourceLimitError,
+  now = new Date(),
+): InventoryAgingReport {
+  const asOf = parseAsOf(filters.asOf, now)
+  return {
+    asOf: asOf.toISOString(),
+    generatedAt: now.toISOString(),
+    kitAgingMode: INVENTORY_AGING_KIT_MODE,
+    rows: [],
+    pageInfo: pageInfo(0, 1, clampPageSize(filters.pageSize)),
+    totals: { qty: '0', valueBase: '0' },
+    bucketSummary: [],
+    notices: [error.message],
+  }
+}
+
 function deadStockVelocityWindow(asOf: Date, thresholdDays: number): { dateFrom: Date; dateTo: Date } {
   const lookbackDays = Math.max(DEFAULT_DEAD_STOCK_LOOKBACK_DAYS, thresholdDays)
   const asOfDayStart = new Date(Date.UTC(asOf.getUTCFullYear(), asOf.getUTCMonth(), asOf.getUTCDate()))
+  const asOfDayEnd = new Date(Date.UTC(asOf.getUTCFullYear(), asOf.getUTCMonth(), asOf.getUTCDate(), 23, 59, 59, 999))
   return {
-    dateFrom: subtractDays(asOfDayStart, lookbackDays),
-    dateTo: asOf,
+    dateFrom: subtractDays(asOfDayStart, lookbackDays - 1),
+    dateTo: asOfDayEnd,
   }
 }
 
@@ -641,6 +675,7 @@ async function loadDeadStockPositions(
           name: true,
           type: true,
           stockUnit: true,
+          createdAt: true,
           category: { select: { name: true } },
           supplierProducts: {
             ...(filters.supplierId ? { where: { supplierId: filters.supplierId } } : {}),
@@ -663,7 +698,6 @@ async function loadDeadStockPositions(
     where: {
       productId: { in: productIds },
       warehouseId: { in: warehouseIds },
-      remainingQty: { gt: 0 },
     },
     select: {
       productId: true,
@@ -674,16 +708,19 @@ async function loadDeadStockPositions(
     },
     take: DEAD_STOCK_COST_LAYER_ROW_LIMIT + 1,
   }) as DeadStockCostLayerRow[]
-  rejectOverLimit(costLayers, DEAD_STOCK_COST_LAYER_ROW_LIMIT, 'cost-layer valuation scan')
+  rejectOverLimit(costLayers, DEAD_STOCK_COST_LAYER_ROW_LIMIT, 'cost-layer valuation and first-stocked scan')
 
   const valueByStock = new Map<string, Prisma.Decimal>()
   const firstStockedByStock = new Map<string, Date>()
   for (const layer of costLayers) {
     const key = stockKey(layer.productId, layer.warehouseId)
-    valueByStock.set(
-      key,
-      (valueByStock.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(layer.remainingQty).mul(toDecimal(layer.unitCostBase))),
-    )
+    const remainingQty = toDecimal(layer.remainingQty)
+    if (remainingQty.gt(0)) {
+      valueByStock.set(
+        key,
+        (valueByStock.get(key) ?? new Prisma.Decimal(0)).add(remainingQty.mul(toDecimal(layer.unitCostBase))),
+      )
+    }
     const existingFirstStocked = firstStockedByStock.get(key)
     if (!existingFirstStocked || layer.receivedAt.getTime() < existingFirstStocked.getTime()) {
       firstStockedByStock.set(key, layer.receivedAt)
@@ -703,9 +740,10 @@ async function loadDeadStockPositions(
       warehouseCode: level.warehouse.code,
       warehouseName: level.warehouse.name,
       stockUnit: level.product.stockUnit,
+      key,
       qty: toDecimal(level.quantity),
       valueBase: valueByStock.get(key) ?? new Prisma.Decimal(0),
-      firstStockedAt: firstStockedByStock.get(key) ?? null,
+      firstStockedAt: firstStockedByStock.get(key) ?? level.product.createdAt,
     }
   })
   const missingCostLayerCount = positions.filter((position) => toDecimal(position.valueBase).eq(0)).length
@@ -730,7 +768,9 @@ async function loadDeadStockVelocityRows(
       product: productWhere(filters),
     },
     select: {
+      id: true,
       productId: true,
+      fromWarehouseId: true,
       qty: true,
       totalValueBase: true,
       createdAt: true,
@@ -748,21 +788,28 @@ async function loadDeadStockVelocityRows(
         },
       },
     },
-    orderBy: [{ createdAt: 'asc' }],
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
     take: DEAD_STOCK_SALE_MOVEMENT_ROW_LIMIT + 1,
   }) as DeadStockSaleMovementRow[]
   rejectOverLimit(movements, DEAD_STOCK_SALE_MOVEMENT_ROW_LIMIT, 'sale-dispatch movement scan')
 
-  return movements.map((movement) => ({
-    productId: movement.productId,
-    sku: movement.product.sku,
-    productName: movement.product.name,
-    categoryName: movement.product.category?.name ?? null,
-    supplierNames: supplierNames(movement.product),
-    qty: movement.qty,
-    cogsBase: movement.totalValueBase ?? 0,
-    occurredAt: movement.createdAt,
-  }))
+  return movements.map((movement) => {
+    const qty = toDecimal(movement.qty)
+    if (qty.lt(0)) {
+      throw new Error(`SALE_DISPATCH movement ${movement.id} has negative qty: ${qty.toString()}`)
+    }
+    return {
+      key: movement.fromWarehouseId ? stockKey(movement.productId, movement.fromWarehouseId) : movement.productId,
+      productId: movement.productId,
+      sku: movement.product.sku,
+      productName: movement.product.name,
+      categoryName: movement.product.category?.name ?? null,
+      supplierNames: supplierNames(movement.product),
+      qty,
+      cogsBase: movement.totalValueBase ?? 0,
+      occurredAt: movement.createdAt,
+    }
+  })
 }
 
 export async function getDeadStockReport(
@@ -780,31 +827,18 @@ export async function getDeadStockReport(
   ])
   const velocityRows = calculateDailyVelocity(sales, velocityWindow)
   const positionsByKey = new Map(positions.map((position) => [
-    stockKey(position.productId, position.warehouseId),
+    position.key ?? stockKey(position.productId, position.warehouseId),
     position,
   ]))
-  const positionKeysByProduct = new Map<string, string[]>()
-  for (const position of positions) {
-    const key = stockKey(position.productId, position.warehouseId)
-    positionKeysByProduct.set(position.productId, [...(positionKeysByProduct.get(position.productId) ?? []), key])
-  }
-  const keyedPositions = positions.map((position) => ({
-    ...position,
-    productId: stockKey(position.productId, position.warehouseId),
-  }))
-  const keyedVelocityRows = velocityRows.flatMap((row) => (positionKeysByProduct.get(row.productId) ?? []).map((key) => ({
-    ...row,
-    productId: key,
-  })))
-  const deadRows = calculateDeadStock(keyedPositions, keyedVelocityRows, {
+  const deadRows = calculateDeadStock(positions, velocityRows, {
     asOf,
     thresholdDays,
     velocityWindow,
     excludeNeverSoldNewerThanThreshold: true,
   })
   const rows = deadRows.map((row) => {
-    const position = positionsByKey.get(row.productId)
-    if (!position) throw new Error(`Dead-stock position context missing for stock key ${row.productId}`)
+    const position = positionsByKey.get(row.key ?? row.productId)
+    if (!position) throw new Error(`Dead-stock position context missing for stock key ${row.key ?? row.productId}`)
     return {
       ...position,
       ...row,
@@ -834,8 +868,30 @@ export async function getDeadStockReport(
     },
     notices: [
       `Dead-stock detection uses SALE_DISPATCH movements from ${dateOnly(velocityWindow.dateFrom)} to ${dateOnly(velocityWindow.dateTo)}; older sales are treated as outside the demand window.`,
+      'Returns are not netted off for demand evidence; a SKU sold and returned still counts as having demand in the window.',
       'Never-sold products first stocked less than the selected threshold ago are excluded.',
       ...positionNotices,
     ],
+  }
+}
+
+export function emptyDeadStockReportForSourceLimit(
+  filters: StockPositionFilters,
+  error: InventoryHealthSourceLimitError,
+  now = new Date(),
+): DeadStockReport {
+  const asOf = parseAsOf(filters.asOf, now)
+  const thresholdDays = parseThresholdDays(filters.thresholdDays)
+  const velocityWindow = deadStockVelocityWindow(asOf, thresholdDays)
+  return {
+    asOf: asOf.toISOString(),
+    generatedAt: now.toISOString(),
+    thresholdDays,
+    velocityWindowDateFrom: dateOnly(velocityWindow.dateFrom),
+    velocityWindowDateTo: dateOnly(velocityWindow.dateTo),
+    rows: [],
+    pageInfo: pageInfo(0, 1, clampPageSize(filters.pageSize)),
+    totals: { qty: '0', valueBase: '0', neverSoldRows: 0 },
+    notices: [error.message],
   }
 }

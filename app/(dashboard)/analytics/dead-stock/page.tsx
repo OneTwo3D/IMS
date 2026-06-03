@@ -7,7 +7,9 @@ import {
   type StockPositionFilters,
 } from '@/lib/domain/inventory/stock-position-reports'
 import {
+  emptyDeadStockReportForSourceLimit,
   getDeadStockReport,
+  InventoryHealthSourceLimitError,
   type DeadStockReportRow,
 } from '@/lib/domain/inventory/inventory-health-reports'
 import { requireStockPositionReportAccess } from '@/lib/security/stock-position-access'
@@ -17,6 +19,7 @@ import {
   type StockPositionColumn,
   type StockPositionFilterValues,
 } from '../_components/stock-position-report'
+import { decimalStringPositive } from '../_components/report-utils'
 
 export const metadata: Metadata = { title: 'Dead Stock' }
 
@@ -26,34 +29,43 @@ function one(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value
 }
 
-function positiveInteger(value: string | undefined): number | undefined {
+function positiveInteger(value: string | undefined): { value: number | undefined; notice: string | null } {
+  if (value == null || value.trim() === '') return { value: undefined, notice: null }
   const parsed = Number(value)
-  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
+  if (Number.isInteger(parsed) && parsed > 0) return { value: parsed, notice: null }
+  return { value: undefined, notice: `Threshold value "${value}" was invalid; using 90 days.` }
 }
 
-function filtersFromSearch(searchParams: SearchParams): StockPositionFilters {
+function filtersFromSearch(searchParams: SearchParams): { filters: StockPositionFilters; thresholdNotice: string | null } {
+  const threshold = positiveInteger(one(searchParams.thresholdDays))
   return {
-    asOf: one(searchParams.asOf),
-    warehouseId: one(searchParams.warehouseId),
-    categoryId: one(searchParams.categoryId),
-    supplierId: one(searchParams.supplierId),
-    productType: one(searchParams.productType) as StockPositionFilters['productType'],
-    thresholdDays: positiveInteger(one(searchParams.thresholdDays)),
-    page: Number(one(searchParams.page) ?? 1),
-    pageSize: Number(one(searchParams.pageSize) ?? 100),
+    filters: {
+      asOf: one(searchParams.asOf),
+      warehouseId: one(searchParams.warehouseId),
+      categoryId: one(searchParams.categoryId),
+      supplierId: one(searchParams.supplierId),
+      productType: one(searchParams.productType) as StockPositionFilters['productType'],
+      thresholdDays: threshold.value,
+      page: Number(one(searchParams.page) ?? 1),
+      pageSize: Number(one(searchParams.pageSize) ?? 100),
+    },
+    thresholdNotice: threshold.notice,
   }
 }
 
 function daysSinceLastSale(row: DeadStockReportRow): string {
-  return row.daysSinceLastSale == null ? 'Never sold' : `${row.daysSinceLastSale} days`
+  return row.daysSinceLastSale == null ? 'No sales in window' : `${row.daysSinceLastSale} days`
 }
 
 export default async function DeadStockPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
   await requireStockPositionReportAccess()
   const resolvedSearchParams = await searchParams
-  const filters = filtersFromSearch(resolvedSearchParams)
+  const { filters, thresholdNotice } = filtersFromSearch(resolvedSearchParams)
   const [report, filterOptions, organisation] = await Promise.all([
-    getDeadStockReport(filters),
+    getDeadStockReport(filters).catch((error: unknown) => {
+      if (error instanceof InventoryHealthSourceLimitError) return emptyDeadStockReportForSourceLimit(filters, error)
+      throw error
+    }),
     getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),
     getOrganisation(),
   ])
@@ -77,7 +89,7 @@ export default async function DeadStockPage({ searchParams }: { searchParams: Pr
     { key: 'warehouse', label: 'Warehouse', render: (row) => <span className="font-medium">{row.warehouseCode}</span> },
     { key: 'category', label: 'Category', render: (row) => row.categoryName ?? 'Uncategorised' },
     { key: 'type', label: 'Type', render: (row) => row.productType },
-    { key: 'lastSale', label: 'Last sale', render: (row) => row.lastSaleAt ? row.lastSaleAt.slice(0, 10) : 'Never' },
+    { key: 'lastSale', label: 'Last sale in window', render: (row) => row.lastSaleAt ? row.lastSaleAt.slice(0, 10) : 'None' },
     { key: 'daysSinceLastSale', label: 'No-sales age', align: 'right', render: daysSinceLastSale },
     {
       key: 'qty',
@@ -109,11 +121,11 @@ export default async function DeadStockPage({ searchParams }: { searchParams: Pr
       summary={[
         { label: 'Dead-stock rows', value: report.pageInfo.totalRows.toLocaleString(), tone: report.pageInfo.totalRows > 0 ? 'warning' : 'default' },
         { label: 'Quantity', value: report.totals.qty },
-        { label: `Value (${currency})`, value: formatMoneyCode(Number(report.totals.valueBase), currency), tone: Number(report.totals.valueBase) > 0 ? 'warning' : 'default' },
+        { label: `Value (${currency})`, value: formatMoneyCode(Number(report.totals.valueBase), currency), tone: decimalStringPositive(report.totals.valueBase) ? 'warning' : 'default' },
         { label: 'Never sold', value: report.totals.neverSoldRows.toLocaleString() },
         { label: 'Threshold', value: `${report.thresholdDays} days` },
       ]}
-      notices={report.notices}
+      notices={thresholdNotice ? [thresholdNotice, ...report.notices] : report.notices}
       dateMode="as-of"
       showIncludeZero={false}
       showThresholdDays
