@@ -28,6 +28,7 @@ import { canAccessReplenishmentReports, REPLENISHMENT_REPORT_LINKS } from '@/lib
 import { canAccessSalesAnalytics, SALES_ANALYTICS_LINKS } from '@/lib/security/sales-analytics-access'
 import { canAccessPurchasingAnalytics, PURCHASING_ANALYTICS_LINKS } from '@/lib/security/purchasing-analytics-access'
 import { canAccessFinanceAnalytics, FINANCE_ANALYTICS_LINKS } from '@/lib/security/finance-analytics-access'
+import { canAccessManufacturingAnalytics, MANUFACTURING_ANALYTICS_LINKS } from '@/lib/security/manufacturing-analytics-access'
 
 const STOCK_CONTROL_CHILDREN = [
   { href: '/stock-control/stock-adjustments', label: 'Stock Adjustments' },
@@ -52,6 +53,7 @@ const ANALYTICS_CHILDREN = [
   ...SALES_ANALYTICS_LINKS,
   ...PURCHASING_ANALYTICS_LINKS,
   ...FINANCE_ANALYTICS_LINKS,
+  ...MANUFACTURING_ANALYTICS_LINKS,
   ...STOCK_POSITION_REPORT_LINKS,
   ...REPLENISHMENT_REPORT_LINKS,
 ]
@@ -71,10 +73,11 @@ const INVENTORY_COSTING_REPORT_LINKS = [
 ]
 
 const REPORT_ACCESS_GROUPS = [
-  { hrefs: new Set<string>(REPLENISHMENT_REPORT_LINKS.map((link) => link.href)), canAccess: canAccessReplenishmentReports },
-  { hrefs: new Set<string>(SALES_ANALYTICS_LINKS.map((link) => link.href)), canAccess: canAccessSalesAnalytics },
-  { hrefs: new Set<string>(PURCHASING_ANALYTICS_LINKS.map((link) => link.href)), canAccess: canAccessPurchasingAnalytics },
-  { hrefs: new Set<string>(FINANCE_ANALYTICS_LINKS.map((link) => link.href)), canAccess: canAccessFinanceAnalytics },
+  { links: REPLENISHMENT_REPORT_LINKS, hrefs: new Set<string>(REPLENISHMENT_REPORT_LINKS.map((link) => link.href)), canAccess: canAccessReplenishmentReports },
+  { links: SALES_ANALYTICS_LINKS, hrefs: new Set<string>(SALES_ANALYTICS_LINKS.map((link) => link.href)), canAccess: canAccessSalesAnalytics },
+  { links: PURCHASING_ANALYTICS_LINKS, hrefs: new Set<string>(PURCHASING_ANALYTICS_LINKS.map((link) => link.href)), canAccess: canAccessPurchasingAnalytics },
+  { links: FINANCE_ANALYTICS_LINKS, hrefs: new Set<string>(FINANCE_ANALYTICS_LINKS.map((link) => link.href)), canAccess: canAccessFinanceAnalytics },
+  { links: MANUFACTURING_ANALYTICS_LINKS, hrefs: new Set<string>(MANUFACTURING_ANALYTICS_LINKS.map((link) => link.href)), canAccess: canAccessManufacturingAnalytics },
 ]
 
 function getSettingsChildren(accountingIntegrationEnabled: boolean) {
@@ -124,12 +127,12 @@ export function Sidebar({
   const isSupplier = userRole === 'SUPPLIER'
   const settingsChildren = getSettingsChildren(accountingIntegrationEnabled)
   const showIntegrations = shoppingIntegrationEnabled || accountingIntegrationEnabled || wmsIntegrationEnabled
+  const roleScopedAnalyticsChildren = [
+    ...STOCK_POSITION_REPORT_LINKS,
+    ...REPORT_ACCESS_GROUPS.flatMap(({ links, canAccess }) => canAccess(userRole) ? [...links] : []),
+  ]
   const analyticsChildren = [
-    ...(can('analytics') ? ANALYTICS_CHILDREN : [...STOCK_POSITION_REPORT_LINKS]),
-    ...(!can('analytics') && canAccessReplenishmentReports(userRole) ? [...REPLENISHMENT_REPORT_LINKS] : []),
-    ...(!can('analytics') && canAccessSalesAnalytics(userRole) ? [...SALES_ANALYTICS_LINKS] : []),
-    ...(!can('analytics') && canAccessPurchasingAnalytics(userRole) ? [...PURCHASING_ANALYTICS_LINKS] : []),
-    ...(!can('analytics') && canAccessFinanceAnalytics(userRole) ? [...FINANCE_ANALYTICS_LINKS] : []),
+    ...(can('analytics') ? ANALYTICS_CHILDREN : roleScopedAnalyticsChildren),
     ...(can('analytics.inventory_ledger') ? INVENTORY_LEDGER_REPORT_LINKS : []),
     ...(can('analytics.inventory_costing') ? INVENTORY_COSTING_REPORT_LINKS : []),
   ]
