@@ -21,6 +21,12 @@ const redirectCases = [
 const routeCases = [
   { path: '/activity', heading: 'Activity Log' },
   { path: '/analytics/sales-stats', heading: 'Sales Statistics' },
+  { path: '/analytics/sales', heading: 'Sales Analytics' },
+  { path: '/analytics/customers', heading: 'Customer Mix' },
+  { path: '/analytics/margin', heading: 'Gross Margin' },
+  { path: '/analytics/returns', heading: 'Returns' },
+  { path: '/analytics/fulfillment', heading: 'Fulfillment KPIs' },
+  { path: '/analytics/throughput', heading: 'Throughput' },
   { path: '/analytics/purchase-stats', heading: 'Purchase Statistics' },
   { path: '/analytics/inventory-stats', heading: 'Inventory Report' },
   { path: '/analytics/forecast', heading: 'Reorder Forecast' },
