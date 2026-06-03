@@ -194,6 +194,10 @@ export const apiRouteAuthPolicy = {
     access: 'authenticated',
     reason: 'Requires stock-position report access: analytics permission or WAREHOUSE role.',
   },
+  '/api/export/replenishment': {
+    access: 'authenticated',
+    reason: 'Requires replenishment report access: ADMIN, MANAGER, or FINANCE role.',
+  },
   '/api/stock-position/filter-options': {
     access: 'authenticated',
     reason: 'Requires stock-position report access before returning bounded warehouse/category/supplier filter options.',
