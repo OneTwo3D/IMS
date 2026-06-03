@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Prisma, ProductType } from '@/app/generated/prisma/client'
 import {
+  getDeadStockReport,
   getInventoryAgingReport,
   type InventoryHealthReportClient,
 } from '@/lib/domain/inventory/inventory-health-reports'
@@ -33,6 +34,8 @@ function product(overrides: Partial<{
 function makeClient(overrides: Partial<InventoryHealthReportClient>): InventoryHealthReportClient {
   const unused = { findMany: async () => [] }
   return {
+    stockLevel: unused,
+    stockMovement: unused,
     costLayer: unused,
     cogsEntry: unused,
     kitItem: unused,
@@ -251,4 +254,137 @@ test('inventory aging caps KIT component layer scans before component bucketing'
     /KIT component cost-layer scan exceeds 100,000 rows/,
   )
   assert.deepEqual(observedTakes, [50001, 100001])
+})
+
+test('dead stock report sources current stocked rows and sale-dispatch velocity', async () => {
+  const calls: Array<{ delegate: string; args?: unknown }> = []
+  const client = makeClient({
+    stockLevel: {
+      findMany: async (args?: unknown) => {
+        calls.push({ delegate: 'stockLevel', args })
+        return [
+          {
+            productId: 'dead-1',
+            warehouseId: 'warehouse-1',
+            quantity: decimal('4'),
+            product: product({ id: 'dead-1', sku: 'DEAD-1', name: 'Dead item' }),
+            warehouse,
+          },
+          {
+            productId: 'fast-1',
+            warehouseId: 'warehouse-1',
+            quantity: decimal('3'),
+            product: product({ id: 'fast-1', sku: 'FAST-1', name: 'Fast item' }),
+            warehouse,
+          },
+          {
+            productId: 'new-1',
+            warehouseId: 'warehouse-1',
+            quantity: decimal('2'),
+            product: product({ id: 'new-1', sku: 'NEW-1', name: 'New item' }),
+            warehouse,
+          },
+        ]
+      },
+    },
+    costLayer: {
+      findMany: async (args?: unknown) => {
+        calls.push({ delegate: 'costLayer', args })
+        return [
+          {
+            productId: 'dead-1',
+            warehouseId: 'warehouse-1',
+            remainingQty: decimal('4'),
+            unitCostBase: decimal('5'),
+            receivedAt: new Date('2026-01-01T00:00:00.000Z'),
+          },
+          {
+            productId: 'fast-1',
+            warehouseId: 'warehouse-1',
+            remainingQty: decimal('3'),
+            unitCostBase: decimal('7'),
+            receivedAt: new Date('2026-01-01T00:00:00.000Z'),
+          },
+          {
+            productId: 'new-1',
+            warehouseId: 'warehouse-1',
+            remainingQty: decimal('2'),
+            unitCostBase: decimal('11'),
+            receivedAt: new Date('2026-05-15T00:00:00.000Z'),
+          },
+        ]
+      },
+    },
+    stockMovement: {
+      findMany: async (args?: unknown) => {
+        calls.push({ delegate: 'stockMovement', args })
+        return [
+          {
+            productId: 'dead-1',
+            qty: decimal('1'),
+            totalValueBase: decimal('5'),
+            createdAt: new Date('2026-01-01T00:00:00.000Z'),
+            product: product({ id: 'dead-1', sku: 'DEAD-1', name: 'Dead item' }),
+          },
+          {
+            productId: 'fast-1',
+            qty: decimal('1'),
+            totalValueBase: decimal('7'),
+            createdAt: new Date('2026-05-15T00:00:00.000Z'),
+            product: product({ id: 'fast-1', sku: 'FAST-1', name: 'Fast item' }),
+          },
+        ]
+      },
+    },
+  })
+
+  const report = await getDeadStockReport(
+    { asOf: '2026-06-01', thresholdDays: 90 },
+    {
+      paginate: false,
+      deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') },
+    },
+  )
+
+  assert.equal(report.asOf, '2026-06-01T23:59:59.999Z')
+  assert.equal(report.thresholdDays, 90)
+  assert.equal(report.velocityWindowDateFrom, '2025-06-01')
+  assert.equal(report.velocityWindowDateTo, '2026-06-01')
+  assert.deepEqual(report.rows.map((row) => [row.sku, row.qty, row.valueBase, row.daysSinceLastSale]), [
+    ['DEAD-1', '4', '20', 151],
+  ])
+  assert.deepEqual(report.totals, { qty: '4', valueBase: '20', neverSoldRows: 0 })
+
+  const stockMovementCall = calls.find((call) => call.delegate === 'stockMovement')
+  assert.equal((stockMovementCall?.args as { where?: { type?: unknown } }).where?.type, 'SALE_DISPATCH')
+})
+
+test('dead stock report caps stock-level source scan before valuation and velocity work', async () => {
+  let observedTake: unknown
+  const client = makeClient({
+    stockLevel: {
+      findMany: async (args?: unknown) => {
+        observedTake = (args as { take?: unknown } | undefined)?.take
+        return Array.from({ length: Number(observedTake) }, (_, index) => ({
+          productId: `product-${index}`,
+          warehouseId: 'warehouse-1',
+          quantity: decimal('1'),
+          product: product({ id: `product-${index}`, sku: `SKU-${index}` }),
+          warehouse,
+        }))
+      },
+    },
+  })
+
+  await assert.rejects(
+    () => getDeadStockReport(
+      { asOf: '2026-06-01' },
+      {
+        paginate: false,
+        deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') },
+      },
+    ),
+    /stock-level scan exceeds 100,000 rows/,
+  )
+  assert.equal(observedTake, 100001)
 })

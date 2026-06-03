@@ -28,13 +28,14 @@ export type StockPositionFilterValues = {
   supplierId?: string
   productType?: string
   includeZero?: boolean
+  thresholdDays?: string
   pageSize?: string
 }
 
 type StockPositionReportPageProps<Row> = {
   title: string
   description: string
-  reportKey: 'stock-on-hand' | 'stock-allocations' | 'negative-stock' | 'inventory-aging'
+  reportKey: 'stock-on-hand' | 'stock-allocations' | 'negative-stock' | 'inventory-aging' | 'dead-stock'
   filters: StockPositionFilterValues
   filterOptions: StockPositionFilterOptions
   pageInfo: PageInfo
@@ -45,6 +46,7 @@ type StockPositionReportPageProps<Row> = {
   notices?: string[]
   dateMode: 'as-of' | 'range' | 'none'
   showIncludeZero?: boolean
+  showThresholdDays?: boolean
 }
 
 function today(): string {
@@ -65,6 +67,7 @@ export function StockPositionReportPage<Row>({
   notices = [],
   dateMode,
   showIncludeZero = true,
+  showThresholdDays = false,
 }: StockPositionReportPageProps<Row>) {
   const params = currentParams(filters)
   const csvHref = `/api/export/stock-position?${appendParams(params, { type: reportKey })}`
@@ -168,6 +171,16 @@ export function StockPositionReportPage<Row>({
               <option value="500">500</option>
             </select>
           </div>
+          {showThresholdDays && (
+            <div className="space-y-1.5">
+              <Label htmlFor="thresholdDays">No sales for</Label>
+              <select id="thresholdDays" name="thresholdDays" defaultValue={filters.thresholdDays ?? '90'} className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm">
+                <option value="90">90 days</option>
+                <option value="180">180 days</option>
+                <option value="365">365 days</option>
+              </select>
+            </div>
+          )}
         </div>
         <div className="mt-3 flex items-center justify-between gap-3">
           {showIncludeZero ? (

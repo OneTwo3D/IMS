@@ -3,6 +3,7 @@ import { hasPermission } from '@/lib/permissions'
 export const STOCK_POSITION_REPORT_LINKS = [
   { href: '/analytics/stock-on-hand', label: 'Stock on Hand' },
   { href: '/analytics/inventory-aging', label: 'Inventory Aging' },
+  { href: '/analytics/dead-stock', label: 'Dead Stock' },
   { href: '/analytics/stock-allocations', label: 'Stock Allocations' },
   { href: '/analytics/negative-stock', label: 'Negative Stock' },
 ] as const

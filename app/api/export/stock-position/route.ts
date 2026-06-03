@@ -7,7 +7,7 @@ import {
   getStockOnHandReport,
   type StockPositionFilters,
 } from '@/lib/domain/inventory/stock-position-reports'
-import { getInventoryAgingReport } from '@/lib/domain/inventory/inventory-health-reports'
+import { getDeadStockReport, getInventoryAgingReport } from '@/lib/domain/inventory/inventory-health-reports'
 import { stockPositionApiAccessDenied } from '@/lib/security/stock-position-access'
 
 const STOCK_POSITION_CSV_ROW_LIMIT = 50000
@@ -26,7 +26,13 @@ function stockPositionFilters(req: NextRequest): StockPositionFilters {
     supplierId: one(req, 'supplierId'),
     productType: one(req, 'productType') as StockPositionFilters['productType'],
     includeZero: one(req, 'includeZero') === '1',
+    thresholdDays: positiveInteger(one(req, 'thresholdDays')),
   }
+}
+
+function positiveInteger(value: string | undefined): number | undefined {
+  const parsed = Number(value)
+  return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
 }
 
 function rejectOversizedExport(totalRows: number): NextResponse | null {
@@ -147,6 +153,29 @@ export async function GET(req: NextRequest) {
         source: r.source,
       }))
       return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'bucket', 'minAgeDays', 'maxAgeDays', 'qty', 'valueBase', 'source']), `inventory-aging-${date}.csv`)
+    }
+
+    case 'dead-stock': {
+      const report = await getDeadStockReport(stockPositionFilters(req), { paginate: false })
+      const oversized = rejectOversizedExport(report.pageInfo.totalRows)
+      if (oversized) return oversized
+      const data = report.rows.map((r) => ({
+        sku: r.sku,
+        productName: r.productName,
+        productType: r.productType,
+        category: r.categoryName ?? '',
+        suppliers: r.supplierNames.join('; '),
+        warehouseCode: r.warehouseCode,
+        warehouseName: r.warehouseName,
+        stockUnit: r.stockUnit,
+        qty: r.qty,
+        valueBase: r.valueBase,
+        thresholdDays: report.thresholdDays,
+        daysSinceLastSale: r.daysSinceLastSale ?? '',
+        lastSaleAt: r.lastSaleAt ?? '',
+        firstStockedAt: r.firstStockedAt ?? '',
+      }))
+      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'qty', 'valueBase', 'thresholdDays', 'daysSinceLastSale', 'lastSaleAt', 'firstStockedAt']), `dead-stock-${date}.csv`)
     }
 
     default:
