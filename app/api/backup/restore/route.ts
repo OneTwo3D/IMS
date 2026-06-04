@@ -8,7 +8,7 @@ import readline from 'readline'
 import { pipeline } from 'stream/promises'
 import { Readable } from 'stream'
 import type { ReadableStream as NodeReadableStream } from 'stream/web'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, redactActivityLogText } from '@/lib/activity-log'
 import { requireApiFreshAdmin } from '@/lib/auth/server'
 import { getBackupDir } from '@/lib/backup-storage'
 import { disableMaintenanceMode, enableMaintenanceMode } from '@/lib/maintenance-mode'
@@ -95,6 +95,61 @@ function getDbConfig(env: Env = process.env) {
     password: url.password,
     database: url.pathname.slice(1),
   }
+}
+
+function restoreSecretCandidates(env: Env): string[] {
+  const candidates = new Set<string>()
+  const databaseUrl = env.DATABASE_URL
+  if (!databaseUrl) return []
+
+  try {
+    const url = new URL(databaseUrl)
+    if (url.password.length >= 4) {
+      // Four chars avoids exact-replacing common short tokens that can appear
+      // innocently in error text. Short passwords still rely on URL-shaped and
+      // password-key regex redaction below.
+      candidates.add(url.password)
+    }
+    try {
+      const decoded = decodeURIComponent(url.password)
+      if (decoded.length >= 4) {
+        candidates.add(decoded)
+      }
+    } catch {
+      // Keep the raw URL password candidate when decoding malformed escapes fails.
+    }
+  } catch {
+    // Invalid DATABASE_URL is handled by the normal restore failure path.
+  }
+
+  return [...candidates]
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function isSafeExactSecretCandidate(value: string): boolean {
+  return !/^(password|passphrase|secret|token)$/i.test(value)
+}
+
+export function redactRestoreErrorMessage(message: string, env: Env = process.env): string {
+  let redacted = message
+    .replace(
+      /(\b[a-z][a-z0-9+.-]*:\/\/)([^:@/\s]+):([^@/\s]+)@/gi,
+      '$1$2:[redacted]@',
+    )
+    .replace(
+      /\b((?:pg)?password)(\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s;,)]+)/gi,
+      '$1$2[redacted]',
+    )
+
+  for (const candidate of restoreSecretCandidates(env)) {
+    if (!isSafeExactSecretCandidate(candidate)) continue
+    redacted = redacted.replace(new RegExp(escapeRegExp(candidate), 'g'), '[redacted]')
+  }
+
+  return redactActivityLogText(redacted)
 }
 
 function parseOrigin(value: string | undefined): string | null {
@@ -434,12 +489,13 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       })
       return NextResponse.json({ success: true })
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const message = redactRestoreErrorMessage(error instanceof Error ? error.message : String(error), resolvedDeps.env)
       await resolvedDeps.log({
         entityType: 'SYSTEM',
         tag: 'system',
         action: 'backup_restored',
         level: 'ERROR',
+        metadata: { error: message },
         description: `Failed to restore backup: ${message}`,
       })
       return NextResponse.json({ error: `Restore failed: ${message.slice(0, 200)}` }, { status: 500 })
