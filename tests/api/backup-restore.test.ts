@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { createHash } from 'node:crypto'
 import { mkdtemp, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
@@ -136,6 +137,10 @@ async function responseJson(response: Response): Promise<Record<string, unknown>
 
 function metadataReason(entry: RestoreLogEntry): unknown {
   return (entry.metadata as { reason?: unknown } | null | undefined)?.reason
+}
+
+function sha256Text(value: string): string {
+  return createHash('sha256').update(value).digest('hex')
 }
 
 test('restore error redactor removes database URL and password fragments', () => {
@@ -631,6 +636,43 @@ test('restore POST rejects requests without the typed confirmation phrase before
   }
 })
 
+test('restore POST preflights target database timestamp before consuming the email code', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-db-preflight-test-'))
+  try {
+    await writeFile(path.join(root, 'backup.sql'), 'select 1;\n')
+    const { deps, calls, activityLogs } = baseDeps({
+      backupDir: root,
+      env: {
+        ...productionEnv(),
+        ALLOW_DATABASE_RESTORE: 'true',
+      },
+      getTargetDatabaseTimestamp: async () => {
+        calls.getTargetDatabaseTimestamp += 1
+        throw new Error('database unavailable password=password')
+      },
+    })
+    const handler = createBackupRestorePostHandler(deps)
+
+    const response = await handler(sameOriginRequest(existingBackupBody('backup.sql')))
+    const json = await responseJson(response)
+
+    assert.equal(response.status, 500)
+    assert.equal(json.error, 'Restore preflight failed: database unavailable password=[redacted]')
+    assert.equal(calls.getTargetDatabaseTimestamp, 1)
+    assert.equal(calls.consumeToken, 0)
+    assert.equal(calls.enableMaintenance, 0)
+    assert.equal(calls.runRestore, 0)
+    assert.equal(activityLogs.length, 1)
+    assert.equal(activityLogs[0].action, 'backup_restore_preflight_failed')
+    assert.deepEqual(activityLogs[0].metadata, {
+      reason: 'target_database_timestamp_unavailable',
+      error: 'database unavailable password=[redacted]',
+    })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('non-production restore code and filename restore work without production kill-switch flags', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-dev-test-'))
   try {
@@ -675,7 +717,8 @@ test('enabled production restore runs an existing backup without upload flag', a
   try {
     const backupPath = path.join(root, 'backup.sql')
     const sourceBackupTimestamp = new Date('2026-06-03T10:11:12.000Z')
-    await writeFile(backupPath, 'select 1;\n')
+    const backupSql = 'select 1;\n'
+    await writeFile(backupPath, backupSql)
     await utimes(backupPath, sourceBackupTimestamp, sourceBackupTimestamp)
     const restored: Array<{ filePath: string; database: string }> = []
     const { deps, calls, activityLogs } = baseDeps({
@@ -711,9 +754,45 @@ test('enabled production restore runs an existing backup without upload flag', a
       initiatedBy: 'admin-1',
       sourceBackupName: 'backup.sql',
       sourceType: 'stored_backup',
+      sourceBackupBytes: Buffer.byteLength(backupSql),
+      sourceBackupSha256: sha256Text(backupSql),
     })
-    assert.equal(initiationLog.level, 'ERROR')
+    assert.equal(initiationLog.level, 'WARNING')
     assert.equal(initiationLog.userId, 'admin-1')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('default target timestamp lookup uses the injectable database client', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-db-client-test-'))
+  try {
+    await writeFile(path.join(root, 'backup.sql'), 'select 1;\n')
+    const { deps, calls, activityLogs } = baseDeps({
+      backupDir: root,
+      env: {
+        ...productionEnv(),
+        ALLOW_DATABASE_RESTORE: 'true',
+      },
+      getTargetDatabaseTimestamp: undefined,
+      dbClient: {
+        async $queryRaw<T = unknown>() {
+          calls.getTargetDatabaseTimestamp += 1
+          return [{ timestamp: new Date('2026-06-04T13:14:15.000Z') }] as T
+        },
+      },
+    })
+    const handler = createBackupRestorePostHandler(deps)
+
+    const response = await handler(sameOriginRequest(existingBackupBody('backup.sql')))
+    const body = await responseJson(response)
+
+    assert.equal(response.status, 200)
+    assert.equal(body.success, true)
+    assert.equal(calls.getTargetDatabaseTimestamp, 1)
+    const initiationLog = activityLogs.find((entry) => entry.action === 'backup_restore_initiated')
+    assert.ok(initiationLog)
+    assert.equal((initiationLog.metadata as { targetDatabaseTimestamp?: unknown }).targetDatabaseTimestamp, '2026-06-04T13:14:15.000Z')
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -771,13 +850,17 @@ test('uploaded production restore denied by the upload kill switch keeps the ema
 test('enabled production upload restore writes a temporary file, runs restore, and cleans up', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-upload-test-'))
   try {
+    const backupSql = 'select 1;\n'
     const form = new FormData()
     form.set('confirmationPhrase', 'RESTORE')
     form.set('restoreToken', 'ABCDEF12')
-    form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
+    form.set('file', new File([backupSql], 'upload.sql', {
+      type: 'application/sql',
+      lastModified: new Date('2020-01-01T00:00:00.000Z').getTime(),
+    }))
 
     let tempPath = ''
-    const { deps, calls } = baseDeps({
+    const { deps, calls, activityLogs } = baseDeps({
       backupDir: root,
       env: {
         ...productionEnv(),
@@ -808,6 +891,18 @@ test('enabled production upload restore writes a temporary file, runs restore, a
     assert.equal(calls.runRestore, 1)
     assert.equal(calls.disableMaintenance, 1)
     assert.equal(path.basename(tempPath), 'restore-upload-1234567890.sql')
+    const initiationLog = activityLogs.find((entry) => entry.action === 'backup_restore_initiated')
+    assert.ok(initiationLog)
+    assert.deepEqual(initiationLog.metadata, {
+      severity: 'critical',
+      sourceBackupTimestamp: new Date(1234567890).toISOString(),
+      targetDatabaseTimestamp: '2026-06-04T12:00:00.000Z',
+      initiatedBy: 'admin-1',
+      sourceBackupName: 'upload.sql',
+      sourceType: 'uploaded_file',
+      sourceBackupBytes: Buffer.byteLength(backupSql),
+      sourceBackupSha256: sha256Text(backupSql),
+    })
     await assert.rejects(stat(tempPath), { code: 'ENOENT' })
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -858,11 +953,14 @@ test('failed production upload restore redacts database password, disables maint
     assert.equal(calls.disableMaintenance, 1)
     assert.equal(calls.runRestore, 1)
     assert.equal(activityLogs.length, 2)
-    const initiationLog = activityLogs.find((entry) => entry.action === 'backup_restore_initiated')
-    assert.ok(initiationLog)
+    const initiationIndex = activityLogs.findIndex((entry) => entry.action === 'backup_restore_initiated')
+    const failureIndex = activityLogs.findIndex((entry) => entry.action === 'backup_restored' && entry.level === 'ERROR')
+    assert.notEqual(initiationIndex, -1)
+    assert.notEqual(failureIndex, -1)
+    assert.ok(initiationIndex < failureIndex, 'restore initiation must be logged before restore failure')
+    const initiationLog = activityLogs[initiationIndex]
     assert.equal((initiationLog.metadata as { severity?: unknown }).severity, 'critical')
-    const failureLog = activityLogs.find((entry) => entry.action === 'backup_restored' && entry.level === 'ERROR')
-    assert.ok(failureLog)
+    const failureLog = activityLogs[failureIndex]
     assert.equal(failureLog.description, 'Failed to restore backup: psql failed: postgresql://imsuser:[redacted]@localhost:5432/ims password=[redacted]')
     assert.deepEqual(failureLog.metadata, {
       error: 'psql failed: postgresql://imsuser:[redacted]@localhost:5432/ims password=[redacted]',
