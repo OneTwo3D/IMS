@@ -12,25 +12,46 @@ import { generateSecret, generateURI, verify } from 'otplib'
 import QRCode from 'qrcode'
 import { z } from 'zod'
 import { readTotpSecrets, serializeTotpSecret } from '@/lib/totp-secrets'
+import type { AuthSession } from '@/lib/auth/server'
 
 const confirmSchema = z.object({ code: z.string().length(6) })
 const disableSchema = z.object({ code: z.string().length(6) })
 
-export async function GET() {
-  const session = await requireApiAuth()
+type TotpSetupGetDependencies = {
+  authorize: () => Promise<AuthSession | Response>
+  generateSecret: () => string
+  generateUri: (input: { secret: string; label: string; issuer: string }) => string
+  generateQrDataUrl: (input: string) => Promise<string>
+  stageSecret: (userId: string, secret: string) => Promise<void>
+}
+
+export async function handleTotpSetupGet(dependencies: TotpSetupGetDependencies): Promise<Response> {
+  const session = await dependencies.authorize()
   if ('headers' in session) return session
 
-  const secret = generateSecret()
-  const otpAuthUrl = generateURI({ secret, label: session.user.email, issuer: 'onetwoInventory' })
-  const qrDataUrl = await QRCode.toDataURL(otpAuthUrl)
+  const secret = dependencies.generateSecret()
+  const otpAuthUrl = dependencies.generateUri({ secret, label: session.user.email, issuer: 'onetwoInventory' })
+  const qrDataUrl = await dependencies.generateQrDataUrl(otpAuthUrl)
 
   // Stage the secret server-side so POST can use it without trusting the client.
-  await db.user.update({
-    where: { id: session.user.id },
-    data: { pendingTotpSecret: serializeTotpSecret(secret) },
-  })
+  await dependencies.stageSecret(session.user.id, secret)
 
-  return Response.json({ secret, qrDataUrl })
+  return Response.json({ qrDataUrl })
+}
+
+export async function GET() {
+  return handleTotpSetupGet({
+    authorize: requireApiAuth,
+    generateSecret,
+    generateUri: generateURI,
+    generateQrDataUrl: QRCode.toDataURL,
+    async stageSecret(userId, secret) {
+      await db.user.update({
+        where: { id: userId },
+        data: { pendingTotpSecret: serializeTotpSecret(secret) },
+      })
+    },
+  })
 }
 
 export async function POST(request: NextRequest) {
