@@ -70,7 +70,13 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ### P1.1 — Cost layer race condition during concurrent FIFO consumption
 - **File:** `lib/cost-layers.ts:93–124`
 - **Problem:** Candidate-layer SELECT runs before the row lock is acquired. Two concurrent shipments for the same SKU can both read the same layer, then both consume it. Race window is small but real on high-throughput tenants.
-- **Fix:** Move the row lock into the candidate query: `SELECT ... FOR UPDATE SKIP LOCKED` (or `FOR NO KEY UPDATE` depending on Postgres version). Verify with `EXPLAIN` that the lock is acquired before the result is materialised.
+- **Fix:** Move the row lock into the candidate query: `SELECT ... FOR UPDATE`.
+  Do not use `SKIP LOCKED` for FIFO consumption: skipping an older locked layer
+  can preserve throughput while violating cost-layer order. Strict FIFO callers
+  should wait for the older layer, then re-check availability. Add a short
+  transaction-local `lock_timeout` so a stuck transaction fails clearly instead
+  of blocking all consumers indefinitely.
+  Verify with `EXPLAIN` that the lock is acquired before the result is materialised.
 - **Acceptance:**
   - Concurrent `consumeFifoLayersStrict` calls for the same product cannot over-consume a layer.
   - A regression test simulating concurrency proves the invariant.
