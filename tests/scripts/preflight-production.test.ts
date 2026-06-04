@@ -134,7 +134,7 @@ test('production preflight rejects common placeholder secret shapes', async () =
   })
 })
 
-test('production preflight warns for settings encryption keys using fallback derivation', async () => {
+test('production preflight fails for settings encryption keys using fallback derivation shapes', async () => {
   await withStorageDirs(async (storage) => {
     const result = await runProductionPreflight({
       env: {
@@ -143,8 +143,8 @@ test('production preflight warns for settings encryption keys using fallback der
       },
     })
 
-    assert.equal(result.ok, true)
-    assertStatus(result, 'settings-encryption-key', 'warn')
+    assert.equal(result.ok, false)
+    assertStatus(result, 'settings-encryption-key', 'fail')
   })
 })
 

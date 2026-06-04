@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'crypto'
+import { createCipheriv, createDecipheriv, randomBytes } from 'crypto'
 import { decryptSecret, isEncryptedValue as isLegacyEncryptedValue } from '@/lib/secrets'
 
 // Setting-table ciphertext format. OAuth, TOTP, and other non-Setting secrets
@@ -24,7 +24,7 @@ function resolveSettingsEncryptionKey(): Buffer | null {
   const utf8 = Buffer.from(trimmed, 'utf8')
   if (utf8.length === 32) return utf8
 
-  return createHash('sha256').update(trimmed).digest()
+  return null
 }
 
 function aadForSetting(key: string): Buffer {

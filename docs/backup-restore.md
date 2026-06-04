@@ -100,7 +100,7 @@ Scheduled backups are triggered via a cron endpoint:
 /api/cron/backup
 ```
 
-Configure your server's cron scheduler to call this endpoint at your preferred time. Cron endpoints require the `CRON_SECRET` bearer header in production. Localhost bypass is available outside production only when no `CRON_SECRET` is configured; in production it is disabled unless `CRON_SECRET` is unset and `ALLOW_LOCALHOST_CRON_BYPASS=true` is set explicitly. For example, to run backups daily at 02:00:
+Configure your server's cron scheduler to call this endpoint at your preferred time. Cron endpoints require the `CRON_SECRET` bearer header in production. Localhost bypass is available outside production only when no `CRON_SECRET` is configured; production never accepts localhost cron requests without the bearer header. For example, to run backups daily at 02:00:
 
 ```
 0 2 * * * curl -s -H "Authorization: Bearer $CRON_SECRET" http://localhost:3000/api/cron/backup

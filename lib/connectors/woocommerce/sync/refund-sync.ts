@@ -6,7 +6,21 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { wcFetch } from '../api'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
+import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { WcRefund } from './types'
+
+function roundDecimalNumber(value: DecimalInput, precision: number): number {
+  return roundQuantity(value, precision).toNumber()
+}
+
+function divideRoundedNumber(value: DecimalInput, divisor: DecimalInput, precision: number): number {
+  return roundDecimalNumber(toDecimal(value).div(toDecimal(divisor)), precision)
+}
+
+function parseDecimalAbs(value: string | number | null | undefined) {
+  const decimal = toDecimal(value ?? 0)
+  return decimal.lt(0) ? decimal.neg() : decimal
+}
 
 export async function syncWcRefund(
   externalOrderId: number,
@@ -37,8 +51,8 @@ export async function syncWcRefund(
     const existing = await db.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id } })
     if (existing) return { success: true } // already synced
 
-    const fxRate = Number(so.fxRateToBase) || 1
-    const refundAmountForeign = Math.abs(parseFloat(wcRefund.amount) || 0)
+    const fxRate = toDecimal(so.fxRateToBase).gt(0) ? toDecimal(so.fxRateToBase) : toDecimal(1)
+    const refundAmountForeign = parseDecimalAbs(wcRefund.amount)
 
     // Determine if restock is needed
     // Restock if any refund line item has qty != 0
@@ -63,15 +77,15 @@ export async function syncWcRefund(
 
         // Match by externalLineItemId
         const imsLine = so.lines.find((l) => l.externalLineItemId === rl.id)
-        const refundTotal = Math.abs(parseFloat(rl.total) || 0)
-        const refundGbp = Math.round((refundTotal / fxRate) * 10000) / 10000
+        const refundTotal = parseDecimalAbs(rl.total)
+        const refundGbp = divideRoundedNumber(refundTotal, fxRate, 4)
 
         refundLines.push({
           lineId: imsLine?.id,
           productId: imsLine?.productId ?? null,
           description: rl.name || imsLine?.description || 'Refund item',
           qty,
-          totalForeign: refundTotal,
+          totalForeign: roundDecimalNumber(refundTotal, 4),
           totalBase: refundGbp,
           lineKind: 'sale',
         })
@@ -79,14 +93,14 @@ export async function syncWcRefund(
     }
 
     for (const shippingLine of wcRefund.shipping_lines ?? []) {
-      const shippingRefundTotal = Math.abs(parseFloat(shippingLine.total) || 0)
-      if (shippingRefundTotal <= 0.000001) continue
+      const shippingRefundTotal = parseDecimalAbs(shippingLine.total)
+      if (shippingRefundTotal.lte(0.000001)) continue
       refundLines.push({
         productId: null,
         description: shippingLine.method_title || 'Shipping refund',
         qty: 0,
-        totalForeign: Math.round(shippingRefundTotal * 10000) / 10000,
-        totalBase: Math.round((shippingRefundTotal / fxRate) * 10000) / 10000,
+        totalForeign: roundDecimalNumber(shippingRefundTotal, 4),
+        totalBase: divideRoundedNumber(shippingRefundTotal, fxRate, 4),
         lineKind: 'shipping',
       })
     }
@@ -96,17 +110,18 @@ export async function syncWcRefund(
         productId: null,
         description: wcRefund.reason || 'WooCommerce refund',
         qty: 0,
-        totalForeign: Math.round(refundAmountForeign * 10000) / 10000,
-        totalBase: Math.round((refundAmountForeign / fxRate) * 10000) / 10000,
+        totalForeign: roundDecimalNumber(refundAmountForeign, 4),
+        totalBase: divideRoundedNumber(refundAmountForeign, fxRate, 4),
         lineKind: 'sale',
       })
     }
 
-    const mappedRefundTotalForeign = Math.round(
-      refundLines.reduce((sum, line) => sum + Math.abs(Number(line.totalForeign ?? 0)), 0) * 10000,
-    ) / 10000
-    if (refundLines.length > 0 && Math.abs(mappedRefundTotalForeign - refundAmountForeign) > 0.01) {
-      const error = `WooCommerce refund ${wcRefund.id} amount mismatch: mapped ${mappedRefundTotalForeign.toFixed(2)} but refund total is ${refundAmountForeign.toFixed(2)}`
+    const mappedRefundTotalForeign = roundDecimalNumber(
+      refundLines.reduce((sum, line) => sum.add(toDecimal(line.totalForeign ?? 0).abs()), toDecimal(0)),
+      4,
+    )
+    if (refundLines.length > 0 && toDecimal(mappedRefundTotalForeign).sub(refundAmountForeign).abs().gt(0.01)) {
+      const error = `WooCommerce refund ${wcRefund.id} amount mismatch: mapped ${mappedRefundTotalForeign.toFixed(2)} but refund total is ${refundAmountForeign.toDecimalPlaces(2).toFixed(2)}`
       await db.shoppingSyncLog.create({
         data: {
           direction: 'FROM_CONNECTOR',

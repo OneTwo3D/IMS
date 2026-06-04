@@ -3,8 +3,8 @@ import { getCronSecret } from '@/lib/cron-secret'
 
 /**
  * Verify cron requests via the configured cron secret.
- * Localhost bypass is allowed outside production, or in production only when
- * ALLOW_LOCALHOST_CRON_BYPASS=true, but only when CRON_SECRET is not configured.
+ * Localhost bypass is allowed outside production only when CRON_SECRET is not
+ * configured. Production cron endpoints always require the bearer secret.
  * Host and URL are used for the localhost check; x-forwarded-for is spoofable
  * and must not be trusted for cron auth.
  * Usage: const err = await verifyCron(request); if (err) return err;
@@ -40,8 +40,7 @@ export async function verifyCron(request: Request): Promise<NextResponse | null>
 }
 
 export function isLocalhostCronBypassAllowed(): boolean {
-  return process.env.NODE_ENV !== 'production' ||
-    process.env.ALLOW_LOCALHOST_CRON_BYPASS === 'true'
+  return process.env.NODE_ENV !== 'production'
 }
 
 function isLocalhostCronRequest(request: Request): boolean {

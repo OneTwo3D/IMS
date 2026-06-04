@@ -4,8 +4,13 @@
 
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { roundQuantity, type DecimalInput } from '@/lib/domain/math/decimal'
 import type { TaxCategory } from '@/app/generated/prisma/client'
 import type { WcAddress, WcFullOrder, WcLineItem, WcCouponLine, WcFeeLine } from './types'
+
+function roundDecimalNumber(value: DecimalInput, precision: number): number {
+  return roundQuantity(value, precision).toNumber()
+}
 
 // ---------------------------------------------------------------------------
 // Address mapping
@@ -163,10 +168,10 @@ export async function mapWcLineItems(
       sku: item.sku || `wc-${item.product_id}`,
       description: item.name,
       qty,
-      unitPriceForeign: Math.round(unitPrice * 1000000) / 1000000,
-      discountAmount: Math.round(lineDiscount * 10000) / 10000,
+      unitPriceForeign: roundDecimalNumber(unitPrice, 6),
+      discountAmount: roundDecimalNumber(lineDiscount, 4),
       discountStr: lineDiscount > 0 ? lineDiscount.toFixed(2) : null,
-      taxForeign: Math.round(tax * 10000) / 10000,
+      taxForeign: roundDecimalNumber(tax, 4),
       externalTaxRateId: typeof externalTaxRateId === 'number' && externalTaxRateId > 0 ? externalTaxRateId : null,
       externalLineItemId: item.id,
     }
@@ -186,10 +191,10 @@ export function mapWcFeeLines(feeLines: WcFeeLine[]): MappedLine[] {
         sku: '',
         description: feeLine.name || 'Fee',
         qty: 1,
-        unitPriceForeign: Math.round(total * 1000000) / 1000000,
+        unitPriceForeign: roundDecimalNumber(total, 6),
         discountAmount: 0,
         discountStr: null,
-        taxForeign: Math.round(tax * 10000) / 10000,
+        taxForeign: roundDecimalNumber(tax, 4),
         forceNoTax: tax <= 0.000001 && !externalTaxRateId,
         externalTaxRateId: typeof externalTaxRateId === 'number' && externalTaxRateId > 0 ? externalTaxRateId : null,
         externalLineItemId: null,
@@ -214,7 +219,7 @@ export function mapWcOrderDiscount(couponLines: WcCouponLine[]): {
 
   return {
     discountStr: codes,
-    discountAmount: Math.round(totalDiscount * 10000) / 10000,
+    discountAmount: roundDecimalNumber(totalDiscount, 4),
   }
 }
 
@@ -231,7 +236,7 @@ export function mapWcShipping(order: WcFullOrder): {
 
   return {
     shippingService: methodTitle,
-    shippingForeign: Math.round(totalShipping * 10000) / 10000,
+    shippingForeign: roundDecimalNumber(totalShipping, 4),
   }
 }
 
