@@ -182,7 +182,7 @@ const DEFAULT_SQL_REPORT_MAX_FINDINGS = 5000
 const FIFO_RECONCILIATION_EXCEPTION = 'Products without FIFO cost layers are excluded; FIFO cost-layer products are expected to reconcile within tolerance.'
 const INVENTORY_INVARIANT_TRUNCATED_CODE = 'invariant_report_truncated'
 const INBOUND_COST_LAYER_MOVEMENT_TYPES = new Set(['PURCHASE_RECEIPT', 'PRODUCTION_IN'])
-const OUTBOUND_COGS_MOVEMENT_TYPES = new Set(['SALE_DISPATCH', 'PRODUCTION_OUT'])
+const OUTBOUND_COGS_MOVEMENT_TYPES = new Set(['SALE_DISPATCH', 'PURCHASE_REVERSAL', 'PRODUCTION_OUT'])
 const ADJUSTMENT_MOVEMENT_TYPE = 'ADJUSTMENT'
 
 // KIT availability is derived from components, so KIT parents do not carry
@@ -1531,7 +1531,7 @@ function buildSqlInventoryInvariantQuery(options: Required<Pick<InventoryInvaria
       FROM "stock_movements" sm
       INNER JOIN "products" p ON p.id = sm."productId"
       WHERE (
-          sm.type IN ('SALE_DISPATCH', 'PRODUCTION_OUT')
+          sm.type IN ('SALE_DISPATCH', 'PURCHASE_REVERSAL', 'PRODUCTION_OUT')
           OR (sm.type = 'ADJUSTMENT' AND sm."fromWarehouseId" IS NOT NULL)
         )
         AND sm.qty > ${tolerance}

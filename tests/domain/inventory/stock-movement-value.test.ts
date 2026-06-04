@@ -109,6 +109,7 @@ test('all stock movement enum values are covered by the reporting value contract
     'PRODUCTION_IN',
     'PRODUCTION_OUT',
     'PURCHASE_RECEIPT',
+    'PURCHASE_REVERSAL',
     'RETURN_INBOUND',
     'SALE_DISPATCH',
     'TRANSFER_IN',
@@ -128,6 +129,7 @@ test('active stock movement writer files route reporting values through the help
     PRODUCTION_IN: ['app/actions/manufacturing.ts'],
     PRODUCTION_OUT: ['app/actions/manufacturing.ts'],
     PURCHASE_RECEIPT: ['app/actions/purchase-orders.ts', 'lib/domain/wms/booked-in-service.ts'],
+    PURCHASE_REVERSAL: ['lib/domain/purchasing/po-cancellation.ts'],
     RETURN_INBOUND: ['lib/domain/sales/refund-service.ts'],
     SALE_DISPATCH: [
       'app/actions/wc-import.ts',

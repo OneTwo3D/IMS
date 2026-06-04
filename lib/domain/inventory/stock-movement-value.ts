@@ -23,6 +23,7 @@ export const STOCK_MOVEMENT_VALUE_SOURCE_BY_TYPE: Record<StockMovementType, stri
   PRODUCTION_IN: 'manufacturing output/recovery uses consumed component and overhead cost',
   PRODUCTION_OUT: 'manufacturing consumption/disassembly uses FIFO consumption',
   PURCHASE_RECEIPT: 'purchase receipts use landed or gross purchase unit cost',
+  PURCHASE_REVERSAL: 'purchase cancellation reversals use the remaining PO receipt cost-layer cost',
   RETURN_INBOUND: 'customer returns use shipped cost snapshots where available',
   SALE_DISPATCH: 'sales dispatch uses FIFO consumption, historical imports use zero-cost provenance sentinel',
   TRANSFER_IN: 'transfer receipts use the dispatch FIFO snapshot slice',
