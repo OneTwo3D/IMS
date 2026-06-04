@@ -105,7 +105,24 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
   let shipmentSequence = state.shipments.length + 1
   let movementSequence = state.movements.length + 1
   const client = {
-    $queryRaw: async () => [],
+    $queryRaw: async (strings: TemplateStringsArray | unknown, ...values: unknown[]) => {
+      const query = typeof (strings as { join?: unknown }).join === 'function'
+        ? (strings as TemplateStringsArray).join('?')
+        : ''
+      if (query.includes('FROM "cost_layers"')) {
+        const [productId, warehouseId] = values
+        return state.costLayers
+          .filter((layer) => layer.productId === productId)
+          .filter((layer) => layer.warehouseId === warehouseId)
+          .filter((layer) => layer.remainingQty > 0)
+          .map((layer) => ({
+            id: layer.id,
+            remainingQty: layer.remainingQty,
+            unitCostBase: layer.unitCostBase,
+          }))
+      }
+      return []
+    },
     $executeRaw: async () => 0,
     $transaction: async (callback: (tx: unknown) => Promise<unknown>) => {
       options.beforeTransaction?.()

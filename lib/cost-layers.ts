@@ -71,6 +71,12 @@ export type CostLayerSourceLineInput = {
   totalCostBase?: DecimalInput
 }
 
+type LockedFifoCostLayerRow = {
+  id: string
+  remainingQty: DecimalInput
+  unitCostBase: DecimalInput
+}
+
 /**
  * Consume FIFO layers oldest-first for the given product + warehouse.
  * Decrements `remainingQty` on each layer consumed.
@@ -90,22 +96,18 @@ export async function consumeFifoLayers(
   let totalCost = toDecimal(0)
   const consumed: ConsumedLayer[] = []
 
-  const candidateLayers = await tx.costLayer.findMany({
-    where: { productId, warehouseId, remainingQty: { gt: 0 } },
-    select: { id: true, remainingQty: true, unitCostBase: true },
-    orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
-  })
-  await lockCostLayers(tx, candidateLayers.map((l) => l.id))
-
-  // Re-read after taking row locks so concurrent consumers cannot both act on
-  // the same pre-lock remainingQty snapshot and double-decrement a layer.
-  const layers = candidateLayers.length === 0
-    ? []
-    : await tx.costLayer.findMany({
-        where: { id: { in: candidateLayers.map((layer) => layer.id) } },
-        select: { id: true, remainingQty: true, unitCostBase: true },
-        orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
-      })
+  // Select and lock in one statement. A pre-lock Prisma findMany can materialize
+  // a stale FIFO snapshot under concurrency; FOR UPDATE makes the oldest
+  // candidate rows wait and re-check before this transaction can consume them.
+  const layers = await tx.$queryRaw<LockedFifoCostLayerRow[]>`
+    SELECT id, "remainingQty", "unitCostBase"
+    FROM "cost_layers"
+    WHERE "productId" = ${productId}
+      AND "warehouseId" = ${warehouseId}
+      AND "remainingQty" > 0
+    ORDER BY "receivedAt" ASC, id ASC
+    FOR UPDATE
+  `
 
   for (const layer of layers) {
     if (remaining.lte(0)) break
