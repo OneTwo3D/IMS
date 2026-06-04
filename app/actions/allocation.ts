@@ -16,7 +16,7 @@ import {
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
 import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
-import { toDecimal } from '@/lib/domain/math/decimal'
+import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import {
   allocateSalesOrder,
   applyAllocationReservationDelta,
@@ -395,7 +395,7 @@ export async function updateAllocation(
         .add(alloc.warehouseId === newWarehouseId ? toDecimal(alloc.qty) : toDecimal(0))
 
       if (requestedQty.gt(effectiveAvailable)) {
-        throw new Error(`Only ${effectiveAvailable.toString()} available in this warehouse`)
+        throw new Error(`Only ${roundQuantity(effectiveAvailable, 4).toString()} available in this warehouse`)
       }
 
       await applyAllocationReservationDelta(tx, [{

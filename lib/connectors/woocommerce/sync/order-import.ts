@@ -446,8 +446,13 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         action: 'sales_invoice_accounting_queue_failed',
         tag: 'accounting',
         level: 'WARNING',
-        description: `Failed to queue WooCommerce sales invoice for order ${orderNumber}: ${accountingError instanceof Error ? accountingError.message : String(accountingError)}`,
-        metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), orderNumber, error: String(accountingError) },
+        description: `Failed to queue WooCommerce sales invoice for order ${orderNumber}`,
+        metadata: {
+          connector: 'woocommerce',
+          externalOrderId: String(wcOrder.id),
+          orderNumber,
+          errorName: accountingError instanceof Error ? accountingError.name : typeof accountingError,
+        },
       })
     }
 

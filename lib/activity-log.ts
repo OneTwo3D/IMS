@@ -18,6 +18,10 @@ type LogParams = {
 const EMAIL_PATTERN = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/gi
 const REDACTED_VALUE = '[redacted]'
 const SENSITIVE_METADATA_KEY = /(email|address|line1|line2|postcode|postCode|zip|phone|vat|taxId|customerEmail|supplierEmail|recipientEmail)/i
+const SECRET_METADATA_KEY = /(password|passphrase|secret|token|apiKey|api_key|authorization|bearer|consumerSecret|consumer_secret|clientSecret|client_secret|refreshToken|refresh_token|accessToken|access_token|privateKey|private_key)/i
+const BEARER_PATTERN = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi
+const KEY_VALUE_SECRET_PATTERN = /\b(password|passphrase|secret|token|api[_-]?key|authorization|consumer[_-]?secret|client[_-]?secret|refresh[_-]?token|access[_-]?token|private[_-]?key)(\s*[:=]\s*)(["']?)[^"',&\s;)]+/gi
+const URL_SECRET_QUERY_PATTERN = /([?&](?:password|passphrase|secret|token|api[_-]?key|authorization|consumer[_-]?secret|client[_-]?secret|refresh[_-]?token|access[_-]?token|private[_-]?key)=)[^&#\s]+/gi
 
 const getCachedSession = cache(async () => {
   try {
@@ -27,18 +31,23 @@ const getCachedSession = cache(async () => {
   }
 })
 
-function redactText(value: string): string {
-  return value.replace(EMAIL_PATTERN, '[redacted-email]')
+export function redactActivityLogText(value: string): string {
+  return value
+    .replace(EMAIL_PATTERN, '[redacted-email]')
+    .replace(BEARER_PATTERN, 'Bearer [redacted]')
+    .replace(URL_SECRET_QUERY_PATTERN, '$1[redacted]')
+    .replace(KEY_VALUE_SECRET_PATTERN, (_match, key: string, separator: string) => `${key}${separator}${REDACTED_VALUE}`)
 }
 
-function sanitizeMetadata(value: unknown, key?: string): unknown {
+export function sanitizeActivityLogMetadata(value: unknown, key?: string): unknown {
   if (value == null) return value
+  if (key && SECRET_METADATA_KEY.test(key)) return REDACTED_VALUE
   if (key && SENSITIVE_METADATA_KEY.test(key)) return REDACTED_VALUE
-  if (typeof value === 'string') return redactText(value)
-  if (Array.isArray(value)) return value.map((item) => sanitizeMetadata(item))
+  if (typeof value === 'string') return redactActivityLogText(value)
+  if (Array.isArray(value)) return value.map((item) => sanitizeActivityLogMetadata(item))
   if (typeof value === 'object') {
     return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([childKey, childValue]) => [childKey, sanitizeMetadata(childValue, childKey)]),
+      Object.entries(value as Record<string, unknown>).map(([childKey, childValue]) => [childKey, sanitizeActivityLogMetadata(childValue, childKey)]),
     )
   }
   return value
@@ -64,8 +73,8 @@ export async function logActivity(params: LogParams) {
         action: params.action,
         tag: params.tag,
         level: params.level ?? 'INFO',
-        description: redactText(params.description),
-        metadata: params.metadata ? JSON.parse(JSON.stringify(sanitizeMetadata(params.metadata))) : undefined,
+        description: redactActivityLogText(params.description),
+        metadata: params.metadata ? JSON.parse(JSON.stringify(sanitizeActivityLogMetadata(params.metadata))) : undefined,
       },
     })
   } catch (e) {

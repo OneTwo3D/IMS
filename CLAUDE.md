@@ -2,6 +2,8 @@
 
 Complete inventory management system with sales, purchasing, stock control, manufacturing, and financial integration. Built for product companies managing inventory across multiple warehouses with multi-currency support, FIFO costing, and real-time synchronization with WooCommerce and accounting systems (Xero, QuickBooks).
 
+For the current production-readiness backlog and execution grouping, see `docs/plan.md`.
+
 ## Tech Stack
 
 | Layer | Technology | Version | Purpose |

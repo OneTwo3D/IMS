@@ -282,7 +282,10 @@ export async function submitSupplierQuote(
       if (!lockedPo) throw new Error('RFQ not found or not accessible')
 
       const fxRate = toDecimal(lockedPo.fxRateToBase)
-      const effectiveFxRate = fxRate.gt(0) ? fxRate : toDecimal(1)
+      if (!fxRate.gt(0)) {
+        throw new Error(`Purchase order ${lockedPo.reference} has no valid FX rate; ask finance to refresh the RFQ before submitting a quote.`)
+      }
+      const effectiveFxRate = fxRate
       for (const line of safeData.lines) {
         // Verify line belongs to this PO (prevent cross-PO manipulation)
         const poLine = await tx.purchaseOrderLine.findFirst({ where: { id: line.lineId, poId } })
@@ -297,8 +300,8 @@ export async function submitSupplierQuote(
         await tx.purchaseOrderLine.update({
           where: { id: line.lineId },
           data: {
-            qty: qty.toString(),
-            unitCostForeign: unitPriceForeign.toString(),
+            qty: roundDecimalString(qty, 4),
+            unitCostForeign: roundDecimalString(unitPriceForeign, 6),
             unitCostBase: roundDecimalString(unitCostBase, 6),
             totalForeign: roundDecimalString(totalForeign, 4),
             totalBase: roundDecimalString(totalBase, 4),

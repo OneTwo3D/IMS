@@ -17,6 +17,11 @@ function divideRoundedNumber(value: DecimalInput, divisor: DecimalInput, precisi
   return roundDecimalNumber(toDecimal(value).div(toDecimal(divisor)), precision)
 }
 
+function parseDecimalAbs(value: string | number | null | undefined) {
+  const decimal = toDecimal(value ?? 0)
+  return decimal.lt(0) ? decimal.neg() : decimal
+}
+
 export async function syncWcRefund(
   externalOrderId: number,
   wcRefund: WcRefund,
@@ -47,7 +52,7 @@ export async function syncWcRefund(
     if (existing) return { success: true } // already synced
 
     const fxRate = toDecimal(so.fxRateToBase).gt(0) ? toDecimal(so.fxRateToBase) : toDecimal(1)
-    const refundAmountForeign = Math.abs(parseFloat(wcRefund.amount) || 0)
+    const refundAmountForeign = parseDecimalAbs(wcRefund.amount)
 
     // Determine if restock is needed
     // Restock if any refund line item has qty != 0
@@ -72,7 +77,7 @@ export async function syncWcRefund(
 
         // Match by externalLineItemId
         const imsLine = so.lines.find((l) => l.externalLineItemId === rl.id)
-        const refundTotal = Math.abs(parseFloat(rl.total) || 0)
+        const refundTotal = parseDecimalAbs(rl.total)
         const refundGbp = divideRoundedNumber(refundTotal, fxRate, 4)
 
         refundLines.push({
@@ -80,7 +85,7 @@ export async function syncWcRefund(
           productId: imsLine?.productId ?? null,
           description: rl.name || imsLine?.description || 'Refund item',
           qty,
-          totalForeign: refundTotal,
+          totalForeign: roundDecimalNumber(refundTotal, 4),
           totalBase: refundGbp,
           lineKind: 'sale',
         })
@@ -88,8 +93,8 @@ export async function syncWcRefund(
     }
 
     for (const shippingLine of wcRefund.shipping_lines ?? []) {
-      const shippingRefundTotal = Math.abs(parseFloat(shippingLine.total) || 0)
-      if (shippingRefundTotal <= 0.000001) continue
+      const shippingRefundTotal = parseDecimalAbs(shippingLine.total)
+      if (shippingRefundTotal.lte(0.000001)) continue
       refundLines.push({
         productId: null,
         description: shippingLine.method_title || 'Shipping refund',
@@ -115,8 +120,8 @@ export async function syncWcRefund(
       refundLines.reduce((sum, line) => sum.add(toDecimal(line.totalForeign ?? 0).abs()), toDecimal(0)),
       4,
     )
-    if (refundLines.length > 0 && Math.abs(mappedRefundTotalForeign - refundAmountForeign) > 0.01) {
-      const error = `WooCommerce refund ${wcRefund.id} amount mismatch: mapped ${mappedRefundTotalForeign.toFixed(2)} but refund total is ${refundAmountForeign.toFixed(2)}`
+    if (refundLines.length > 0 && toDecimal(mappedRefundTotalForeign).sub(refundAmountForeign).abs().gt(0.01)) {
+      const error = `WooCommerce refund ${wcRefund.id} amount mismatch: mapped ${mappedRefundTotalForeign.toFixed(2)} but refund total is ${refundAmountForeign.toDecimalPlaces(2).toFixed(2)}`
       await db.shoppingSyncLog.create({
         data: {
           direction: 'FROM_CONNECTOR',

@@ -641,10 +641,10 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     //   user-entered price so the UI can display gross values, but every
     //   aggregate field is net. The Xero payload reconstructs gross from
     //   stored net when lineAmountsIncludeTax is true.
-    let linesSubtotalForeign = 0 // sum of line NETs, before order discount
-    let linesSubtotalBase = 0
-    let totalTaxForeign = 0
-    let totalTaxBase = 0
+    let linesSubtotalForeign = toDecimal(0) // sum of line NETs, before order discount
+    let linesSubtotalBase = toDecimal(0)
+    let totalTaxForeign = toDecimal(0)
+    let totalTaxBase = toDecimal(0)
 
     const round4 = (value: DecimalInput) => roundDecimalNumber(value, 4)
 
@@ -769,10 +769,10 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       const lineTax = lineInclVat ? lineGross.sub(netForeign) : netForeign.mul(lineRate)
       const lineTaxForeign = round4(lineTax)
       const lineTaxBase = divideRoundedNumber(lineTaxForeign, fxRate, 4)
-      linesSubtotalForeign += totalForeign
-      linesSubtotalBase += totalBase
-      totalTaxForeign += lineTaxForeign
-      totalTaxBase += lineTaxBase
+      linesSubtotalForeign = linesSubtotalForeign.add(totalForeign)
+      linesSubtotalBase = linesSubtotalBase.add(totalBase)
+      totalTaxForeign = totalTaxForeign.add(lineTaxForeign)
+      totalTaxBase = totalTaxBase.add(lineTaxBase)
       return {
         productId: l.productId,
         sku: l.sku,
@@ -806,8 +806,8 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     const shippingTaxForeignR = round4(shippingTaxForeign)
     const shippingNetBase = divideRoundedNumber(shippingNetForeignR, fxRate, 4)
     const shippingTaxBase = divideRoundedNumber(shippingTaxForeignR, fxRate, 4)
-    totalTaxForeign += shippingTaxForeignR
-    totalTaxBase += shippingTaxBase
+    totalTaxForeign = totalTaxForeign.add(shippingTaxForeignR)
+    totalTaxBase = totalTaxBase.add(shippingTaxBase)
 
     // Order-level discount — cap at line subtotal (compare in gross when inclVat).
     const rawOrderDisc = input.orderDiscountForeign ?? 0
@@ -821,21 +821,21 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
     const discTaxForeignR = round4(discTaxForeign)
     const discNetBase = divideRoundedNumber(discNetForeignR, fxRate, 4)
     const discTaxBase = divideRoundedNumber(discTaxForeignR, fxRate, 4)
-    totalTaxForeign -= discTaxForeignR
-    totalTaxBase -= discTaxBase
+    totalTaxForeign = totalTaxForeign.sub(discTaxForeignR)
+    totalTaxBase = totalTaxBase.sub(discTaxBase)
 
     // Subtotal stored PRE-discount (sum of line nets) — matches the WC
     // importer convention so display / accounting code can handle both
     // sources uniformly.
     const subtotalForeign = round4(linesSubtotalForeign)
     const subtotalBase = round4(linesSubtotalBase)
-    totalTaxForeign = round4(totalTaxForeign)
-    totalTaxBase = round4(totalTaxBase)
+    const totalTaxForeignRounded = round4(totalTaxForeign)
+    const totalTaxBaseRounded = round4(totalTaxBase)
 
     // Grand total = subtotal (net, pre-discount) − net discount + net
     // shipping + total tax. Tax already nets the discount VAT above.
-    const grandTotalForeign = round4(toDecimal(subtotalForeign).sub(discNetForeignR).add(shippingNetForeignR).add(totalTaxForeign))
-    const grandTotalBase = round4(toDecimal(subtotalBase).sub(discNetBase).add(shippingNetBase).add(totalTaxBase))
+    const grandTotalForeign = round4(toDecimal(subtotalForeign).sub(discNetForeignR).add(shippingNetForeignR).add(totalTaxForeignRounded))
+    const grandTotalBase = round4(toDecimal(subtotalBase).sub(discNetBase).add(shippingNetBase).add(totalTaxBaseRounded))
 
     // Keep locals that downstream Prisma / accounting queue references expect.
     const totalShippingForeign = shippingNetForeignR
@@ -881,12 +881,12 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
           shippingForeign: totalShippingForeign,
           taxRateName: input.taxRateName || null,
           taxRatePercent: vatRate > 0 ? vatRate : null,
-          taxForeign: totalTaxForeign,
+          taxForeign: totalTaxForeignRounded,
           pricesIncludeVat: inclVat,
           totalForeign: grandTotalForeign,
           subtotalBase,
           shippingBase: totalShippingBase,
-          taxBase: totalTaxBase,
+          taxBase: totalTaxBaseRounded,
           totalBase: grandTotalBase,
           shipFromWarehouseId: input.shipFromWarehouseId || null,
           expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null,
@@ -922,8 +922,11 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
           action: 'sales_invoice_accounting_queue_failed',
           tag: 'accounting',
           level: 'WARNING',
-          description: `Failed to queue sales invoice for order ${getSalesOrderReference(so)} after creation: ${accountingError instanceof Error ? accountingError.message : String(accountingError)}`,
-          metadata: { orderNumber: getSalesOrderReference(so), error: String(accountingError) },
+          description: `Failed to queue sales invoice for order ${getSalesOrderReference(so)} after creation`,
+          metadata: {
+            orderNumber: getSalesOrderReference(so),
+            errorName: accountingError instanceof Error ? accountingError.name : typeof accountingError,
+          },
         })
       }
     }
@@ -1223,8 +1226,12 @@ export async function applySalesOrderStatusTransition(
           action: 'draft_finalization_accounting_queue_failed',
           tag: 'accounting',
           level: 'WARNING',
-          description: `Failed to queue sales invoice for order ${getSalesOrderReference(so)} after status change: ${accountingError instanceof Error ? accountingError.message : String(accountingError)}`,
-          metadata: { orderNumber: getSalesOrderReference(so), targetStatus, error: String(accountingError) },
+          description: `Failed to queue sales invoice for order ${getSalesOrderReference(so)} after status change`,
+          metadata: {
+            orderNumber: getSalesOrderReference(so),
+            targetStatus,
+            errorName: accountingError instanceof Error ? accountingError.name : typeof accountingError,
+          },
         })
       }
     }
