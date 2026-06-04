@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { randomBytes } from 'crypto'
+import { createHash, randomBytes } from 'crypto'
 import { spawn } from 'child_process'
 import { createReadStream, createWriteStream } from 'fs'
 import { mkdir, access, unlink, stat } from 'fs/promises'
@@ -37,12 +37,17 @@ type RestoreUserClient = {
   findUnique(args: { where: { id: string }; select: { email: true } }): Promise<{ email: string | null } | null>
 }
 
+type RestoreTimestampDbClient = {
+  $queryRaw<T = unknown>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T>
+}
+
 export type RestoreLogEntry = Parameters<typeof logActivity>[0]
 
 /** @internal Test seam for route-handler unit tests; not an application API. */
 export type BackupRestoreHandlerDeps = {
   authorize?: RestoreAuthorizer
   users?: RestoreUserClient
+  dbClient?: RestoreTimestampDbClient
   env?: Env
   backupDir?: string
   log?: (entry: RestoreLogEntry) => Promise<void>
@@ -53,6 +58,7 @@ export type BackupRestoreHandlerDeps = {
   enableMaintenance?: typeof enableMaintenanceMode
   disableMaintenance?: typeof disableMaintenanceMode
   runRestoreFile?: typeof runRestore
+  getTargetDatabaseTimestamp?: () => Promise<Date>
   now?: () => number
 }
 
@@ -80,6 +86,26 @@ async function logDeniedRestoreAttempt(deps: RequiredRestoreDeps, userId: string
     resolveUser: false,
     metadata: { reason },
   })
+}
+
+async function getRestoreTargetDatabaseTimestamp(deps: RequiredRestoreDeps): Promise<string | NextResponse> {
+  try {
+    return (await deps.getTargetDatabaseTimestamp()).toISOString()
+  } catch (error) {
+    const message = redactRestoreErrorMessage(error instanceof Error ? error.message : String(error), deps.env)
+    await deps.log({
+      entityType: 'SYSTEM',
+      tag: 'system',
+      action: 'backup_restore_preflight_failed',
+      level: 'ERROR',
+      description: `Failed to preflight database restore: ${message}`,
+      metadata: {
+        reason: 'target_database_timestamp_unavailable',
+        error: message,
+      },
+    })
+    return NextResponse.json({ error: `Restore preflight failed: ${message.slice(0, 200)}` }, { status: 500 })
+  }
 }
 
 function restoreDisabledResponse(): NextResponse {
@@ -308,6 +334,17 @@ async function runRestore(filePath: string, db: ReturnType<typeof getDbConfig>):
   })
 }
 
+async function sha256OfFile(filePath: string): Promise<string> {
+  const hash = createHash('sha256')
+  await pipeline(createReadStream(filePath), hash)
+  return hash.digest('hex')
+}
+
+async function getTargetDatabaseTimestamp(dbClient: RestoreTimestampDbClient): Promise<Date> {
+  const rows = await dbClient.$queryRaw<Array<{ timestamp: Date }>>`SELECT now() AS "timestamp"`
+  return rows[0]?.timestamp ?? new Date()
+}
+
 type RequiredRestoreDeps = Required<Omit<BackupRestoreHandlerDeps, 'now'>> & {
   now: () => number
 }
@@ -316,6 +353,7 @@ function withDefaults(deps: BackupRestoreHandlerDeps = {}): RequiredRestoreDeps 
   return {
     authorize: deps.authorize ?? requireApiFreshAdmin,
     users: deps.users ?? db.user,
+    dbClient: deps.dbClient ?? db,
     // Keep the production route wired to the live process.env object so runtime
     // restore-window changes are observed without rebuilding handlers.
     env: deps.env ?? process.env,
@@ -328,6 +366,7 @@ function withDefaults(deps: BackupRestoreHandlerDeps = {}): RequiredRestoreDeps 
     enableMaintenance: deps.enableMaintenance ?? enableMaintenanceMode,
     disableMaintenance: deps.disableMaintenance ?? disableMaintenanceMode,
     runRestoreFile: deps.runRestoreFile ?? runRestore,
+    getTargetDatabaseTimestamp: deps.getTargetDatabaseTimestamp ?? (() => getTargetDatabaseTimestamp(deps.dbClient ?? db)),
     now: deps.now ?? Date.now,
   }
 }
@@ -400,9 +439,9 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
     }
 
     const formData = await req.formData()
-    const confirm = formData.get('confirm')
+    const confirmationPhrase = formData.get('confirmationPhrase')
     const restoreToken = formData.get('restoreToken')
-    if (confirm !== 'RESTORE') {
+    if (confirmationPhrase !== 'RESTORE') {
       return NextResponse.json({ error: 'Restore confirmation missing.' }, { status: 400 })
     }
     if (typeof restoreToken !== 'string' || !/^[0-9A-Fa-f]{8}$/.test(restoreToken.trim())) {
@@ -414,6 +453,11 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
 
     let restorePath: string
     let uploadedTempFile = false
+    let sourceBackupTimestamp: string
+    let sourceBackupName: string
+    let sourceType: 'uploaded_file' | 'stored_backup'
+    let sourceBackupBytes: number
+    let targetDatabaseTimestamp: string
 
     if (file) {
       if (!isProductionUploadRestoreAllowed(resolvedDeps.env)) {
@@ -426,6 +470,9 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       if (file.size > MAX_RESTORE_FILE_BYTES) {
         return NextResponse.json({ error: 'Restore file is too large.' }, { status: 413 })
       }
+      const targetTimestamp = await getRestoreTargetDatabaseTimestamp(resolvedDeps)
+      if (targetTimestamp instanceof NextResponse) return targetTimestamp
+      targetDatabaseTimestamp = targetTimestamp
       // Validate upload policy and shape before consuming the one-time email code.
       const restoreTokenUserId = await resolvedDeps.consumeRestoreToken(`backup_restore:${restoreToken.trim().toUpperCase()}`)
       if (restoreTokenUserId !== session.user.id) {
@@ -439,6 +486,10 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
         createWriteStream(restorePath),
       )
       uploadedTempFile = true
+      sourceBackupTimestamp = new Date(resolvedDeps.now()).toISOString()
+      sourceBackupName = path.basename(file.name)
+      sourceType = 'uploaded_file'
+      sourceBackupBytes = file.size
     } else if (filename) {
       if (!filename.endsWith('.sql')) {
         return NextResponse.json({ error: 'Invalid backup filename.' }, { status: 400 })
@@ -457,6 +508,13 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       if (fileInfo.size > MAX_RESTORE_FILE_BYTES) {
         return NextResponse.json({ error: 'Restore file is too large.' }, { status: 413 })
       }
+      sourceBackupTimestamp = fileInfo.mtime.toISOString()
+      sourceBackupName = path.basename(restorePath)
+      sourceType = 'stored_backup'
+      sourceBackupBytes = fileInfo.size
+      const targetTimestamp = await getRestoreTargetDatabaseTimestamp(resolvedDeps)
+      if (targetTimestamp instanceof NextResponse) return targetTimestamp
+      targetDatabaseTimestamp = targetTimestamp
       const restoreTokenUserId = await resolvedDeps.consumeRestoreToken(`backup_restore:${restoreToken.trim().toUpperCase()}`)
       if (restoreTokenUserId !== session.user.id) {
         return NextResponse.json({ error: 'Restore email code invalid or expired.' }, { status: 400 })
@@ -477,6 +535,26 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
     const restoreDbConfig = getDbConfig(resolvedDeps.env)
 
     try {
+      const sourceBackupSha256 = await sha256OfFile(restorePath)
+      await resolvedDeps.log({
+        entityType: 'SYSTEM',
+        tag: 'system',
+        action: 'backup_restore_initiated',
+        level: 'WARNING',
+        userId: session.user.id,
+        resolveUser: false,
+        description: `Initiated database restore from backup: ${sourceBackupName}`,
+        metadata: {
+          severity: 'critical',
+          sourceBackupTimestamp,
+          targetDatabaseTimestamp,
+          initiatedBy: session.user.id,
+          sourceBackupName,
+          sourceType,
+          sourceBackupBytes,
+          sourceBackupSha256,
+        },
+      })
       await resolvedDeps.enableMaintenance(`Database restore requested by admin ${session.user.id}`)
       await resolvedDeps.runRestoreFile(restorePath, restoreDbConfig)
       await resolvedDeps.log({
