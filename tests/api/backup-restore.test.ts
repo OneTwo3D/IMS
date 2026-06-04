@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readdir, rm, stat, writeFile } from 'node:fs/promises'
+import { mkdtemp, readdir, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
@@ -50,6 +50,7 @@ function baseDeps(overrides: BackupRestoreHandlerDeps = {}) {
     enableMaintenance: 0,
     disableMaintenance: 0,
     runRestore: 0,
+    getTargetDatabaseTimestamp: 0,
   }
 
   const deps: BackupRestoreHandlerDeps = {
@@ -87,6 +88,10 @@ function baseDeps(overrides: BackupRestoreHandlerDeps = {}) {
     runRestoreFile: async () => {
       calls.runRestore += 1
     },
+    getTargetDatabaseTimestamp: async () => {
+      calls.getTargetDatabaseTimestamp += 1
+      return new Date('2026-06-04T12:00:00.000Z')
+    },
     now: () => 1234567890,
     ...overrides,
   }
@@ -119,7 +124,7 @@ function existingBackupBody(filename = 'backup.sql'): URLSearchParams {
   // The existing-backup branch uses urlencoded form data so these tests do not
   // need multipart setup when no file upload is involved.
   return new URLSearchParams({
-    confirm: 'RESTORE',
+    confirmationPhrase: 'RESTORE',
     restoreToken: 'ABCDEF12',
     filename,
   })
@@ -595,6 +600,37 @@ test('production filename restore POST is disabled by default before consuming t
   assert.equal(metadataReason(activityLogs[0]), 'production_restore_disabled')
 })
 
+test('restore POST rejects requests without the typed confirmation phrase before consuming the email code', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-missing-confirmation-test-'))
+  try {
+    await writeFile(path.join(root, 'backup.sql'), 'select 1;\n')
+    const { deps, calls } = baseDeps({
+      backupDir: root,
+      env: {
+        ...productionEnv(),
+        ALLOW_DATABASE_RESTORE: 'true',
+      },
+    })
+    const handler = createBackupRestorePostHandler(deps)
+    const body = new URLSearchParams({
+      restoreToken: 'ABCDEF12',
+      filename: 'backup.sql',
+    })
+
+    const response = await handler(sameOriginRequest(body))
+    const json = await responseJson(response)
+
+    assert.equal(response.status, 400)
+    assert.equal(json.error, 'Restore confirmation missing.')
+    assert.equal(calls.consumeToken, 0)
+    assert.equal(calls.getTargetDatabaseTimestamp, 0)
+    assert.equal(calls.enableMaintenance, 0)
+    assert.equal(calls.runRestore, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('non-production restore code and filename restore work without production kill-switch flags', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-dev-test-'))
   try {
@@ -638,9 +674,11 @@ test('enabled production restore runs an existing backup without upload flag', a
   const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-test-'))
   try {
     const backupPath = path.join(root, 'backup.sql')
+    const sourceBackupTimestamp = new Date('2026-06-03T10:11:12.000Z')
     await writeFile(backupPath, 'select 1;\n')
+    await utimes(backupPath, sourceBackupTimestamp, sourceBackupTimestamp)
     const restored: Array<{ filePath: string; database: string }> = []
-    const { deps, calls } = baseDeps({
+    const { deps, calls, activityLogs } = baseDeps({
       backupDir: root,
       env: {
         ...productionEnv(),
@@ -659,10 +697,23 @@ test('enabled production restore runs an existing backup without upload flag', a
     assert.equal(response.status, 200)
     assert.equal(body.success, true)
     assert.equal(calls.consumeToken, 1)
+    assert.equal(calls.getTargetDatabaseTimestamp, 1)
     assert.equal(calls.enableMaintenance, 1)
     assert.equal(calls.runRestore, 1)
     assert.equal(restored[0].filePath, backupPath)
     assert.equal(restored[0].database, 'ims')
+    const initiationLog = activityLogs.find((entry) => entry.action === 'backup_restore_initiated')
+    assert.ok(initiationLog)
+    assert.deepEqual(initiationLog.metadata, {
+      severity: 'critical',
+      sourceBackupTimestamp: sourceBackupTimestamp.toISOString(),
+      targetDatabaseTimestamp: '2026-06-04T12:00:00.000Z',
+      initiatedBy: 'admin-1',
+      sourceBackupName: 'backup.sql',
+      sourceType: 'stored_backup',
+    })
+    assert.equal(initiationLog.level, 'ERROR')
+    assert.equal(initiationLog.userId, 'admin-1')
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -673,7 +724,7 @@ test('uploaded production restore denied by the upload kill switch keeps the ema
   try {
     await writeFile(path.join(root, 'backup.sql'), 'select 1;\n')
     const form = new FormData()
-    form.set('confirm', 'RESTORE')
+    form.set('confirmationPhrase', 'RESTORE')
     form.set('restoreToken', 'ABCDEF12')
     form.set('file', new File(['select 1;\n'], 'sensitive-upload.sql', { type: 'application/sql' }))
 
@@ -721,7 +772,7 @@ test('enabled production upload restore writes a temporary file, runs restore, a
   const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-upload-test-'))
   try {
     const form = new FormData()
-    form.set('confirm', 'RESTORE')
+    form.set('confirmationPhrase', 'RESTORE')
     form.set('restoreToken', 'ABCDEF12')
     form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
 
@@ -767,7 +818,7 @@ test('failed production upload restore redacts database password, disables maint
   const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-upload-failure-test-'))
   try {
     const form = new FormData()
-    form.set('confirm', 'RESTORE')
+    form.set('confirmationPhrase', 'RESTORE')
     form.set('restoreToken', 'ABCDEF12')
     form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
 
@@ -806,15 +857,20 @@ test('failed production upload restore redacts database password, disables maint
     assert.equal(calls.enableMaintenance, 1)
     assert.equal(calls.disableMaintenance, 1)
     assert.equal(calls.runRestore, 1)
-    assert.equal(activityLogs.length, 1)
-    assert.equal(activityLogs[0].description, 'Failed to restore backup: psql failed: postgresql://imsuser:[redacted]@localhost:5432/ims password=[redacted]')
-    assert.deepEqual(activityLogs[0].metadata, {
+    assert.equal(activityLogs.length, 2)
+    const initiationLog = activityLogs.find((entry) => entry.action === 'backup_restore_initiated')
+    assert.ok(initiationLog)
+    assert.equal((initiationLog.metadata as { severity?: unknown }).severity, 'critical')
+    const failureLog = activityLogs.find((entry) => entry.action === 'backup_restored' && entry.level === 'ERROR')
+    assert.ok(failureLog)
+    assert.equal(failureLog.description, 'Failed to restore backup: psql failed: postgresql://imsuser:[redacted]@localhost:5432/ims password=[redacted]')
+    assert.deepEqual(failureLog.metadata, {
       error: 'psql failed: postgresql://imsuser:[redacted]@localhost:5432/ims password=[redacted]',
     })
-    assert.equal(activityLogs[0].description.includes('imsuser:password'), false)
-    assert.equal(activityLogs[0].description.includes('password=password'), false)
-    assert.equal(JSON.stringify(activityLogs[0].metadata).includes('imsuser:password'), false)
-    assert.equal(JSON.stringify(activityLogs[0].metadata).includes('password=password'), false)
+    assert.equal(failureLog.description.includes('imsuser:password'), false)
+    assert.equal(failureLog.description.includes('password=password'), false)
+    assert.equal(JSON.stringify(failureLog.metadata).includes('imsuser:password'), false)
+    assert.equal(JSON.stringify(failureLog.metadata).includes('password=password'), false)
     await assert.rejects(stat(tempPath), { code: 'ENOENT' })
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -825,7 +881,7 @@ test('maintenance-start failure still runs disable-maintenance cleanup and remov
   const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-maintenance-failure-test-'))
   try {
     const form = new FormData()
-    form.set('confirm', 'RESTORE')
+    form.set('confirmationPhrase', 'RESTORE')
     form.set('restoreToken', 'ABCDEF12')
     form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
 

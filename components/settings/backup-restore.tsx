@@ -95,7 +95,7 @@ export function BackupRestore() {
     try {
       const formData = new FormData()
       formData.append('filename', filename)
-      formData.append('confirm', restoreConfirm)
+      formData.append('confirmationPhrase', restoreConfirm)
       formData.append('restoreToken', restoreToken.trim().toUpperCase())
       const res = await fetch('/api/backup/restore', { method: 'POST', body: formData })
       const data = await res.json()
@@ -125,7 +125,7 @@ export function BackupRestore() {
     try {
       const formData = new FormData()
       formData.append('file', file)
-      formData.append('confirm', restoreConfirm)
+      formData.append('confirmationPhrase', restoreConfirm)
       formData.append('restoreToken', restoreToken.trim().toUpperCase())
       const res = await fetch('/api/backup/restore', { method: 'POST', body: formData })
       const data = await res.json()

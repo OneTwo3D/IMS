@@ -53,6 +53,7 @@ export type BackupRestoreHandlerDeps = {
   enableMaintenance?: typeof enableMaintenanceMode
   disableMaintenance?: typeof disableMaintenanceMode
   runRestoreFile?: typeof runRestore
+  getTargetDatabaseTimestamp?: () => Promise<Date>
   now?: () => number
 }
 
@@ -308,6 +309,11 @@ async function runRestore(filePath: string, db: ReturnType<typeof getDbConfig>):
   })
 }
 
+async function getTargetDatabaseTimestamp(): Promise<Date> {
+  const rows = await db.$queryRaw<Array<{ timestamp: Date }>>`SELECT now() AS "timestamp"`
+  return rows[0]?.timestamp ?? new Date()
+}
+
 type RequiredRestoreDeps = Required<Omit<BackupRestoreHandlerDeps, 'now'>> & {
   now: () => number
 }
@@ -328,6 +334,7 @@ function withDefaults(deps: BackupRestoreHandlerDeps = {}): RequiredRestoreDeps 
     enableMaintenance: deps.enableMaintenance ?? enableMaintenanceMode,
     disableMaintenance: deps.disableMaintenance ?? disableMaintenanceMode,
     runRestoreFile: deps.runRestoreFile ?? runRestore,
+    getTargetDatabaseTimestamp: deps.getTargetDatabaseTimestamp ?? getTargetDatabaseTimestamp,
     now: deps.now ?? Date.now,
   }
 }
@@ -400,9 +407,9 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
     }
 
     const formData = await req.formData()
-    const confirm = formData.get('confirm')
+    const confirmationPhrase = formData.get('confirmationPhrase')
     const restoreToken = formData.get('restoreToken')
-    if (confirm !== 'RESTORE') {
+    if (confirmationPhrase !== 'RESTORE') {
       return NextResponse.json({ error: 'Restore confirmation missing.' }, { status: 400 })
     }
     if (typeof restoreToken !== 'string' || !/^[0-9A-Fa-f]{8}$/.test(restoreToken.trim())) {
@@ -414,6 +421,9 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
 
     let restorePath: string
     let uploadedTempFile = false
+    let sourceBackupTimestamp: string
+    let sourceBackupName: string
+    let sourceType: 'uploaded_file' | 'stored_backup'
 
     if (file) {
       if (!isProductionUploadRestoreAllowed(resolvedDeps.env)) {
@@ -439,6 +449,9 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
         createWriteStream(restorePath),
       )
       uploadedTempFile = true
+      sourceBackupTimestamp = new Date(file.lastModified || resolvedDeps.now()).toISOString()
+      sourceBackupName = path.basename(file.name)
+      sourceType = 'uploaded_file'
     } else if (filename) {
       if (!filename.endsWith('.sql')) {
         return NextResponse.json({ error: 'Invalid backup filename.' }, { status: 400 })
@@ -457,6 +470,9 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       if (fileInfo.size > MAX_RESTORE_FILE_BYTES) {
         return NextResponse.json({ error: 'Restore file is too large.' }, { status: 413 })
       }
+      sourceBackupTimestamp = fileInfo.mtime.toISOString()
+      sourceBackupName = path.basename(restorePath)
+      sourceType = 'stored_backup'
       const restoreTokenUserId = await resolvedDeps.consumeRestoreToken(`backup_restore:${restoreToken.trim().toUpperCase()}`)
       if (restoreTokenUserId !== session.user.id) {
         return NextResponse.json({ error: 'Restore email code invalid or expired.' }, { status: 400 })
@@ -477,6 +493,24 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
     const restoreDbConfig = getDbConfig(resolvedDeps.env)
 
     try {
+      const targetDatabaseTimestamp = (await resolvedDeps.getTargetDatabaseTimestamp()).toISOString()
+      await resolvedDeps.log({
+        entityType: 'SYSTEM',
+        tag: 'system',
+        action: 'backup_restore_initiated',
+        level: 'ERROR',
+        userId: session.user.id,
+        resolveUser: false,
+        description: `Initiated database restore from backup: ${sourceBackupName}`,
+        metadata: {
+          severity: 'critical',
+          sourceBackupTimestamp,
+          targetDatabaseTimestamp,
+          initiatedBy: session.user.id,
+          sourceBackupName,
+          sourceType,
+        },
+      })
       await resolvedDeps.enableMaintenance(`Database restore requested by admin ${session.user.id}`)
       await resolvedDeps.runRestoreFile(restorePath, restoreDbConfig)
       await resolvedDeps.log({
