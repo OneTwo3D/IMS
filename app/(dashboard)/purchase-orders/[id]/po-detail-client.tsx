@@ -1505,6 +1505,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const [showInvoices, setShowInvoices] = useState(false)
   const [payBillFor, setPayBillFor] = useState<InvoiceRow | null>(null)
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState('')
 
   const canEdit = po.status === 'DRAFT'
   const canRfq = po.status === 'DRAFT' || po.status === 'RFQ_SENT'
@@ -1518,7 +1519,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   const hasBillableCost = po.freightCostLines.some((c) => c.amountForeign - c.amountBilled > 0)
   const hasBillableItems = hasBillableProduct || hasBillableCost
   const canBill = ['PO_SENT', 'SHIPPED', 'RFQ_SENT', 'PARTIALLY_RECEIVED', 'RECEIVED', 'PARTIALLY_RETURNED'].includes(po.status) && hasBillableItems
-  const canCancel = po.status === 'DRAFT'
+  const canCancel = po.status === 'DRAFT' || po.status === 'PARTIALLY_RECEIVED'
   const hasRemaining = po.lines.some((l) => l.qtyToReceive > 0)
   const hasReturnable = po.lines.some((l) => l.qtyReceived - l.qtyReturned > 0)
 
@@ -1576,9 +1577,13 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
   function handleCancel() {
     if (!confirm('Cancel this purchase order?')) return
     setError('')
+    setNotice('')
     startTransition(async () => {
       const result = await cancelPurchaseOrder(po.id)
-      if (result.success) router.refresh()
+      if (result.success) {
+        if (result.notice) setNotice(result.notice)
+        router.refresh()
+      }
       else setError(result.error ?? 'Failed')
     })
   }
@@ -1694,6 +1699,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
       </div>
 
       {error && <p className="text-sm text-destructive">{error}</p>}
+      {notice && <p className="text-sm text-emerald-700 dark:text-emerald-300">{notice}</p>}
 
       {/* Header info */}
       <div className="rounded-md border p-4 grid grid-cols-1 sm:grid-cols-2 gap-x-8 gap-y-3 text-sm">

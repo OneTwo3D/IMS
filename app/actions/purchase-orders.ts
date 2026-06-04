@@ -21,6 +21,10 @@ import {
   recalculateLandedCosts,
 } from '@/lib/domain/purchasing/landed-cost-service'
 import {
+  reversePurchaseOrderCostLayersForCancellation,
+  type PurchaseOrderCostLayerReversal,
+} from '@/lib/domain/purchasing/po-cancellation'
+import {
   validateLinkedFreightReceiptStatus,
   validatePurchaseOrderStatusTransition,
   validatePurchaseReceiptStatusUpdate,
@@ -1982,15 +1986,71 @@ export async function receivePurchaseOrder(
   }
 }
 
-export async function cancelPurchaseOrder(id: string): Promise<{ success: boolean; error?: string }> {
+export async function cancelPurchaseOrder(id: string): Promise<{
+  success: boolean
+  error?: string
+  notice?: string
+  reversedCostLayers?: PurchaseOrderCostLayerReversal[]
+}> {
   try {
     await requirePermission('purchasing.create')
-    const existing = await db.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
-    if (!existing) return { success: false, error: 'PO not found' }
-    const transition = validatePurchaseOrderStatusTransition(existing.status, 'CANCELLED')
-    if (!transition.success) return { success: false, error: transition.error }
+    const cancellationDate = new Date().toISOString().slice(0, 10)
 
-    await db.purchaseOrder.update({ where: { id }, data: { status: 'CANCELLED' } })
+    const cancellation = await db.$transaction(async (tx) => {
+      const existing = await tx.purchaseOrder.findUnique({
+        where: { id },
+        select: {
+          status: true,
+          reference: true,
+          lines: { select: { id: true } },
+        },
+      })
+      if (!existing) throw new Error('PO not found')
+      const transition = validatePurchaseOrderStatusTransition(existing.status, 'CANCELLED')
+      if (!transition.success) throw new Error(transition.error)
+
+      const reversal = await reversePurchaseOrderCostLayersForCancellation(tx, {
+        poId: id,
+        poReference: existing.reference,
+        poLineIds: existing.lines.map((line) => line.id),
+      })
+
+      await tx.purchaseOrder.update({ where: { id }, data: { status: 'CANCELLED' } })
+
+      if (reversal.totalReversalValueBase.gt(0.000001)) {
+        const accountingSettings = await getAccountingSettings()
+        const amount = roundQuantity(reversal.totalReversalValueBase, 2).toNumber()
+        if (accountingSettings.syncEnabled) {
+          const payload = {
+            date: cancellationDate,
+            reference: `Cancel: ${existing.reference}`,
+            narration: `Reverse received inventory for cancelled PO ${existing.reference}`,
+            lines: [
+              {
+                accountCode: accountingSettings.transitAccount,
+                description: `Reverse cancelled PO receipt ${existing.reference}`,
+                debit: amount,
+              },
+              {
+                accountCode: accountingSettings.inventoryAccount,
+                description: `Reverse cancelled PO inventory ${existing.reference}`,
+                credit: amount,
+              },
+            ],
+          }
+          await queueAccountingSyncTx(tx, {
+            type: 'INVENTORY_ADJUSTMENT',
+            referenceType: 'PurchaseOrder',
+            referenceId: id,
+            payload,
+            idempotencyKey: accountingPayloadKey(`purchase-order-cancel:${id}:cost-layer-reversal`, payload),
+          })
+        }
+      }
+
+      return { existing, reversal }
+    }, STOCK_TX_OPTIONS)
+
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
     await logActivity({
@@ -1999,21 +2059,57 @@ export async function cancelPurchaseOrder(id: string): Promise<{ success: boolea
       action: 'cancelled',
       tag: 'purchase',
       level: 'INFO',
-      description: `Cancelled PO ${existing.reference}`,
-      metadata: { reference: existing.reference },
+      description: cancellation.reversal.reversedLayers.length > 0
+        ? `Cancelled PO ${cancellation.existing.reference} and reversed ${cancellation.reversal.reversedLayers.length} remaining cost layer(s)`
+        : `Cancelled PO ${cancellation.existing.reference}`,
+      metadata: {
+        reference: cancellation.existing.reference,
+        reversedCostLayers: cancellation.reversal.reversedLayers,
+        totalReversalValueBase: roundQuantity(cancellation.reversal.totalReversalValueBase, 6).toString(),
+      },
     })
-    return { success: true }
+
+    if (cancellation.reversal.productIds.length > 0) {
+      try {
+        await enqueueStockSync(cancellation.reversal.productIds, 'IMS_CHANGE')
+      } catch (syncError) {
+        const syncMessage = syncError instanceof Error ? syncError.message : String(syncError)
+        console.error(syncError)
+        await logActivity({
+          entityType: 'PURCHASE_ORDER',
+          entityId: id,
+          action: 'stock_sync_enqueue_failed',
+          tag: 'sync',
+          level: 'WARNING',
+          description: `Cancelled PO ${cancellation.existing.reference}, but stock sync enqueue failed: ${syncMessage}`,
+          metadata: {
+            reference: cancellation.existing.reference,
+            productIds: cancellation.reversal.productIds,
+            error: syncMessage,
+          },
+        })
+      }
+    }
+
+    return {
+      success: true,
+      reversedCostLayers: cancellation.reversal.reversedLayers,
+      notice: cancellation.reversal.reversedLayers.length > 0
+        ? `Cancelled PO and reversed ${cancellation.reversal.reversedLayers.length} remaining receipt cost layer(s).`
+        : undefined,
+    }
   } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
       action: 'cancelled',
       tag: 'purchase',
       level: 'ERROR',
-      description: `Failed to cancel PO ${id}: ${String(e)}`,
+      description: `Failed to cancel PO ${id}: ${message}`,
       metadata: null,
     })
-    return { success: false, error: String(e) }
+    return { success: false, error: message }
   }
 }
 
