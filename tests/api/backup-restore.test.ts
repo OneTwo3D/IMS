@@ -154,6 +154,30 @@ test('restore error redactor removes database URL and password fragments', () =>
   assert.match(redacted, /PGPASSWORD=\[redacted\]/)
 })
 
+test('restore error redactor handles malformed URL password escapes and literal password values', () => {
+  const malformed = redactRestoreErrorMessage(
+    'psql failed with postgresql://imsuser:abc%4@localhost:5432/ims and raw abc%4',
+    { DATABASE_URL: 'postgresql://imsuser:abc%4@localhost:5432/ims' },
+  )
+  assert.equal(malformed.includes('abc%4'), false)
+  assert.match(malformed, /postgresql:\/\/imsuser:\[redacted\]@localhost:5432\/ims/)
+
+  const literalPassword = redactRestoreErrorMessage(
+    'connection failed: PGPASSWORD=password password=password',
+    { DATABASE_URL: 'postgresql://imsuser:password@localhost:5432/ims' },
+  )
+  assert.equal(literalPassword, 'connection failed: PGPASSWORD=[redacted] password=[redacted]')
+})
+
+test('restore error redactor preserves benign restore error text', () => {
+  const redacted = redactRestoreErrorMessage(
+    'pg_restore: disk full at /var/backups/',
+    { DATABASE_URL: 'postgresql://imsuser:s3cret@localhost:5432/ims' },
+  )
+
+  assert.equal(redacted, 'pg_restore: disk full at /var/backups/')
+})
+
 test('production restore code issuance is disabled by default and logs a warning', async () => {
   const { deps, calls, activityLogs } = baseDeps()
   const handler = createBackupRestoreGetHandler(deps)
@@ -784,8 +808,13 @@ test('failed production upload restore redacts database password, disables maint
     assert.equal(calls.runRestore, 1)
     assert.equal(activityLogs.length, 1)
     assert.equal(activityLogs[0].description, 'Failed to restore backup: psql failed: postgresql://imsuser:[redacted]@localhost:5432/ims password=[redacted]')
+    assert.deepEqual(activityLogs[0].metadata, {
+      error: 'psql failed: postgresql://imsuser:[redacted]@localhost:5432/ims password=[redacted]',
+    })
     assert.equal(activityLogs[0].description.includes('imsuser:password'), false)
     assert.equal(activityLogs[0].description.includes('password=password'), false)
+    assert.equal(JSON.stringify(activityLogs[0].metadata).includes('imsuser:password'), false)
+    assert.equal(JSON.stringify(activityLogs[0].metadata).includes('password=password'), false)
     await assert.rejects(stat(tempPath), { code: 'ENOENT' })
   } finally {
     await rm(root, { recursive: true, force: true })

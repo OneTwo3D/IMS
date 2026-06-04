@@ -104,8 +104,19 @@ function restoreSecretCandidates(env: Env): string[] {
 
   try {
     const url = new URL(databaseUrl)
-    for (const value of [url.password, decodeURIComponent(url.password)]) {
-      if (value.length >= 4) candidates.add(value)
+    if (url.password.length >= 4) {
+      // Four chars avoids exact-replacing common short tokens that can appear
+      // innocently in error text. Short passwords still rely on URL-shaped and
+      // password-key regex redaction below.
+      candidates.add(url.password)
+    }
+    try {
+      const decoded = decodeURIComponent(url.password)
+      if (decoded.length >= 4) {
+        candidates.add(decoded)
+      }
+    } catch {
+      // Keep the raw URL password candidate when decoding malformed escapes fails.
     }
   } catch {
     // Invalid DATABASE_URL is handled by the normal restore failure path.
@@ -123,13 +134,13 @@ function isSafeExactSecretCandidate(value: string): boolean {
 }
 
 export function redactRestoreErrorMessage(message: string, env: Env = process.env): string {
-  let redacted = redactActivityLogText(message)
+  let redacted = message
     .replace(
       /(\b[a-z][a-z0-9+.-]*:\/\/)([^:@/\s]+):([^@/\s]+)@/gi,
       '$1$2:[redacted]@',
     )
     .replace(
-      /\b(password)(\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s;,)]+)/gi,
+      /\b((?:pg)?password)(\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s;,)]+)/gi,
       '$1$2[redacted]',
     )
 
@@ -138,7 +149,7 @@ export function redactRestoreErrorMessage(message: string, env: Env = process.en
     redacted = redacted.replace(new RegExp(escapeRegExp(candidate), 'g'), '[redacted]')
   }
 
-  return redacted
+  return redactActivityLogText(redacted)
 }
 
 function parseOrigin(value: string | undefined): string | null {
@@ -484,6 +495,7 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
         tag: 'system',
         action: 'backup_restored',
         level: 'ERROR',
+        metadata: { error: message },
         description: `Failed to restore backup: ${message}`,
       })
       return NextResponse.json({ error: `Restore failed: ${message.slice(0, 200)}` }, { status: 500 })
