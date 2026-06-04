@@ -117,8 +117,8 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
           .filter((layer) => layer.remainingQty > 0)
           .map((layer) => ({
             id: layer.id,
-            remainingQty: layer.remainingQty,
-            unitCostBase: layer.unitCostBase,
+            remainingQty: new Prisma.Decimal(layer.remainingQty),
+            unitCostBase: new Prisma.Decimal(layer.unitCostBase),
           }))
       }
       return []

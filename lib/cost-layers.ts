@@ -44,16 +44,6 @@ function isFiniteDecimalInput(value: DecimalInput): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Locking
-// ---------------------------------------------------------------------------
-
-/** Lock cost layer rows FOR UPDATE to prevent concurrent consumption. */
-export async function lockCostLayers(tx: TxClient, ids: string[]): Promise<void> {
-  if (ids.length === 0) return
-  await tx.$executeRaw`SELECT id FROM cost_layers WHERE id = ANY(${ids}::text[]) FOR UPDATE`
-}
-
-// ---------------------------------------------------------------------------
 // Consumption (negative adjustments, dispatches, transfers out)
 // ---------------------------------------------------------------------------
 
@@ -81,6 +71,15 @@ type LockedFifoCostLayerRow = {
  * Consume FIFO layers oldest-first for the given product + warehouse.
  * Decrements `remainingQty` on each layer consumed.
  *
+ * Concurrency: this takes a SELECT FOR UPDATE row lock on every currently
+ * available FIFO candidate layer for the product/warehouse pair. Concurrent
+ * consumers for the same pair serialize on those locks. That preserves strict
+ * FIFO cost accountability, but hot SKUs may wait under load rather than skip
+ * older locked layers.
+ *
+ * The transaction-local lock timeout fails the caller instead of letting a
+ * stuck transaction block all FIFO consumers for this pair indefinitely.
+ *
  * Returns the consumed entries (for snapshot/provenance) and total cost.
  * If layers are exhausted before `qty` is fully consumed, the shortfall
  * is returned in `remainingQty` — the caller decides whether to throw
@@ -95,6 +94,8 @@ export async function consumeFifoLayers(
   let remaining = toDecimal(qty)
   let totalCost = toDecimal(0)
   const consumed: ConsumedLayer[] = []
+
+  await tx.$executeRaw`SET LOCAL lock_timeout = '30s'`
 
   // Select and lock in one statement. A pre-lock Prisma findMany can materialize
   // a stale FIFO snapshot under concurrency; FOR UPDATE makes the oldest
