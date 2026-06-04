@@ -2,8 +2,7 @@
   Warnings:
 
   - You are about to drop the column `ipAddress` on the `activity_logs` table. All the data in the column will be lost.
-  - Added the required column `tag` to the `activity_logs` table without a default value. This is not possible if the table is not empty.
-  - Made the column `description` on table `activity_logs` required. This step will fail if there are existing NULL values in that column.
+  - You are about to backfill NULL activity log descriptions to preserve the new NOT NULL invariant.
 
 */
 -- CreateEnum
@@ -26,7 +25,18 @@ ALTER TYPE "ActivityEntityType" ADD VALUE 'SYSTEM';
 -- AlterTable
 ALTER TABLE "activity_logs" DROP COLUMN "ipAddress",
 ADD COLUMN     "level" "ActivityLogLevel" NOT NULL DEFAULT 'INFO',
-ADD COLUMN     "tag" TEXT NOT NULL,
+ADD COLUMN     "tag" TEXT;
+
+UPDATE "activity_logs"
+SET "tag" = 'system'
+WHERE "tag" IS NULL;
+
+UPDATE "activity_logs"
+SET "description" = ''
+WHERE "description" IS NULL;
+
+ALTER TABLE "activity_logs"
+ALTER COLUMN "tag" SET NOT NULL,
 ALTER COLUMN "description" SET NOT NULL;
 
 -- CreateIndex
