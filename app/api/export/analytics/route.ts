@@ -24,7 +24,7 @@ export async function GET(req: NextRequest) {
       const { rows } = await getProductSalesStats(dateFrom, dateTo)
       const data = rows.map((r) => ({
         sku: r.sku, name: r.name, type: r.type, stockUnit: r.stockUnit,
-        barcode: r.barcode, lifecycleStatus: r.lifecycleStatus,
+        barcode: r.barcode, mpn: r.mpn, lifecycleStatus: r.lifecycleStatus,
         qtySold: r.qtySold, qtyRefunded: r.qtyRefunded, netQty: r.netQty,
         grossRevenue: r.grossRevenue.toFixed(2), discounts: r.discounts.toFixed(2),
         refunds: r.refunds.toFixed(2), netRevenue: r.netRevenue.toFixed(2),
@@ -33,7 +33,7 @@ export async function GET(req: NextRequest) {
         avgOrderValue: r.avgOrderValue.toFixed(2),
         salesPrice: r.salesPrice?.toFixed(2) ?? '', weight: r.weight ?? '',
       }))
-      const headers = ['sku', 'name', 'type', 'stockUnit', 'barcode', 'lifecycleStatus', 'qtySold', 'qtyRefunded', 'netQty', 'grossRevenue', 'discounts', 'refunds', 'netRevenue', 'cogs', 'grossProfit', 'marginPct', 'orderCount', 'avgOrderValue', 'salesPrice', 'weight']
+      const headers = ['sku', 'name', 'type', 'stockUnit', 'barcode', 'mpn', 'lifecycleStatus', 'qtySold', 'qtyRefunded', 'netQty', 'grossRevenue', 'discounts', 'refunds', 'netRevenue', 'cogs', 'grossProfit', 'marginPct', 'orderCount', 'avgOrderValue', 'salesPrice', 'weight']
       return csvResponse(toCsv(data, headers), `sales-stats-products-${date}.csv`)
     }
 
@@ -41,21 +41,21 @@ export async function GET(req: NextRequest) {
       const rows = await getShipments(dateFrom, dateTo)
       const data = rows.map((r) => ({
         productName: r.productName, orderNumber: r.orderNumber, trackingNumber: r.trackingNumber,
-        sku: r.sku, barcode: r.barcode, customerName: r.customerName, salesRep: r.salesRep,
+        sku: r.sku, barcode: r.barcode, mpn: r.mpn, customerName: r.customerName, salesRep: r.salesRep,
         qty: r.qty, shippingService: r.shippingService, shippedAt: r.shippedAt.slice(0, 10),
         warehouse: r.warehouse, totalBase: r.totalBase.toFixed(2),
       }))
-      return csvResponse(toCsv(data, ['productName', 'orderNumber', 'trackingNumber', 'sku', 'barcode', 'customerName', 'salesRep', 'qty', 'shippingService', 'shippedAt', 'warehouse', 'totalBase']), `shipments-${date}.csv`)
+      return csvResponse(toCsv(data, ['productName', 'orderNumber', 'trackingNumber', 'sku', 'barcode', 'mpn', 'customerName', 'salesRep', 'qty', 'shippingService', 'shippedAt', 'warehouse', 'totalBase']), `shipments-${date}.csv`)
     }
 
     case 'details': {
       const rows = await getDetails(dateFrom, dateTo)
       const data = rows.map((r) => ({
-        productName: r.productName, sku: r.sku, barcode: r.barcode,
+        productName: r.productName, sku: r.sku, barcode: r.barcode, mpn: r.mpn,
         customerName: r.customerName, salesRep: r.salesRep, status: r.status,
         qty: r.qty, totalBase: r.totalBase.toFixed(2), createdAt: r.createdAt.slice(0, 10),
       }))
-      return csvResponse(toCsv(data, ['productName', 'sku', 'barcode', 'customerName', 'salesRep', 'status', 'qty', 'totalBase', 'createdAt']), `sales-details-${date}.csv`)
+      return csvResponse(toCsv(data, ['productName', 'sku', 'barcode', 'mpn', 'customerName', 'salesRep', 'status', 'qty', 'totalBase', 'createdAt']), `sales-details-${date}.csv`)
     }
 
     case 'invoices': {
@@ -107,8 +107,8 @@ export async function GET(req: NextRequest) {
 
     case 'po_products': {
       const rows = await getPurchaseProductStats(dateFrom, dateTo)
-      const data = rows.map((r) => ({ sku: r.sku, name: r.name, type: r.type, stockUnit: r.stockUnit, qtyOrdered: r.qtyOrdered, qtyReceived: r.qtyReceived, qtyReturned: r.qtyReturned, netQty: r.netQty, totalBase: r.totalBase.toFixed(2), landedCostBase: r.landedCostBase.toFixed(2), avgUnitCostBase: r.avgUnitCostBase.toFixed(4), supplierCount: r.supplierCount, poCount: r.poCount }))
-      return csvResponse(toCsv(data, ['sku', 'name', 'type', 'stockUnit', 'qtyOrdered', 'qtyReceived', 'qtyReturned', 'netQty', 'totalBase', 'landedCostBase', 'avgUnitCostBase', 'supplierCount', 'poCount']), `purchase-stats-products-${date}.csv`)
+      const data = rows.map((r) => ({ sku: r.sku, name: r.name, type: r.type, stockUnit: r.stockUnit, barcode: r.barcode, mpn: r.mpn, qtyOrdered: r.qtyOrdered, qtyReceived: r.qtyReceived, qtyReturned: r.qtyReturned, netQty: r.netQty, totalBase: r.totalBase.toFixed(2), landedCostBase: r.landedCostBase.toFixed(2), avgUnitCostBase: r.avgUnitCostBase.toFixed(4), supplierCount: r.supplierCount, poCount: r.poCount }))
+      return csvResponse(toCsv(data, ['sku', 'name', 'type', 'stockUnit', 'barcode', 'mpn', 'qtyOrdered', 'qtyReceived', 'qtyReturned', 'netQty', 'totalBase', 'landedCostBase', 'avgUnitCostBase', 'supplierCount', 'poCount']), `purchase-stats-products-${date}.csv`)
     }
     case 'po_received': {
       const rows = await getReceivedGoods(dateFrom, dateTo)
@@ -127,14 +127,14 @@ export async function GET(req: NextRequest) {
     }
     case 'po_details': {
       const rows = await getPurchaseDetails(dateFrom, dateTo)
-      const data = rows.map((r) => ({ reference: r.reference, sku: r.sku, productName: r.productName, barcode: r.barcode, type: r.type, status: r.status, supplierName: r.supplierName, currency: r.currency, qty: r.qty, totalForeign: r.totalForeign.toFixed(2), totalBase: r.totalBase.toFixed(2), createdAt: r.createdAt.slice(0, 10) }))
-      return csvResponse(toCsv(data, ['reference', 'sku', 'productName', 'barcode', 'type', 'status', 'supplierName', 'currency', 'qty', 'totalForeign', 'totalBase', 'createdAt']), `purchase-details-${date}.csv`)
+      const data = rows.map((r) => ({ reference: r.reference, sku: r.sku, productName: r.productName, barcode: r.barcode, mpn: r.mpn, type: r.type, status: r.status, supplierName: r.supplierName, currency: r.currency, qty: r.qty, totalForeign: r.totalForeign.toFixed(2), totalBase: r.totalBase.toFixed(2), createdAt: r.createdAt.slice(0, 10) }))
+      return csvResponse(toCsv(data, ['reference', 'sku', 'productName', 'barcode', 'mpn', 'type', 'status', 'supplierName', 'currency', 'qty', 'totalForeign', 'totalBase', 'createdAt']), `purchase-details-${date}.csv`)
     }
 
     case 'inv_onhand': {
       const rows = await getStockOnHand()
-      const data = rows.map((r) => ({ sku: r.sku, name: r.name, type: r.type, stockUnit: r.stockUnit, barcode: r.barcode, warehouse: r.warehouseCode, quantity: r.quantity, reserved: r.reservedQty, available: r.available, value: r.inventoryValue.toFixed(2) }))
-      return csvResponse(toCsv(data, ['sku', 'name', 'type', 'stockUnit', 'barcode', 'warehouse', 'quantity', 'reserved', 'available', 'value']), `stock-on-hand-${date}.csv`)
+      const data = rows.map((r) => ({ sku: r.sku, name: r.name, type: r.type, stockUnit: r.stockUnit, barcode: r.barcode, mpn: r.mpn, warehouse: r.warehouseCode, quantity: r.quantity, reserved: r.reservedQty, available: r.available, value: r.inventoryValue.toFixed(2) }))
+      return csvResponse(toCsv(data, ['sku', 'name', 'type', 'stockUnit', 'barcode', 'mpn', 'warehouse', 'quantity', 'reserved', 'available', 'value']), `stock-on-hand-${date}.csv`)
     }
     case 'inv_movements': {
       const rows = await getStockMovements(dateFrom, dateTo)

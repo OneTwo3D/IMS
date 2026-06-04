@@ -44,6 +44,7 @@ export type ProductRow = {
   type: ProductType
   parentSku: string | null
   barcode: string | null
+  mpn: string | null
   weight: string | null
   widthCm: string | null
   heightCm: string | null
@@ -134,7 +135,9 @@ export async function listProducts(params: {
             { sku: { contains: params.search, mode: 'insensitive' as const } },
             { name: { contains: params.search, mode: 'insensitive' as const } },
             { barcode: { contains: params.search, mode: 'insensitive' as const } },
+            { mpn: { contains: params.search, mode: 'insensitive' as const } },
             { variants: { some: { sku: { contains: params.search, mode: 'insensitive' as const } } } },
+            { variants: { some: { mpn: { contains: params.search, mode: 'insensitive' as const } } } },
           ],
         }
       : {}),
@@ -251,6 +254,7 @@ export async function listProducts(params: {
     type: p.type,
     parentSku: p.parent?.sku ?? null,
     barcode: p.barcode,
+    mpn: p.mpn,
     weight: p.weight?.toString() ?? null,
     widthCm: p.widthCm?.toString() ?? null,
     heightCm: p.heightCm?.toString() ?? null,
@@ -436,6 +440,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     parentId: p.parentId,
     parentSku: p.parent?.sku ?? null,
     barcode: p.barcode,
+    mpn: p.mpn,
     hsCode: p.hsCode ?? null,
     countryOfOrigin: p.countryOfOrigin ?? null,
     weight: p.weight?.toString() ?? null,
@@ -473,6 +478,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       type: v.type,
       parentSku: p.sku,
       barcode: v.barcode,
+      mpn: v.mpn,
       weight: v.weight?.toString() ?? null,
       widthCm: v.widthCm?.toString() ?? null,
       heightCm: v.heightCm?.toString() ?? null,
@@ -582,6 +588,7 @@ const productSchema = z.object({
   type: z.nativeEnum(ProductType),
   parentId: z.string().optional().nullable(),
   barcode: z.string().optional().nullable(),
+  mpn: z.string().max(100).optional().nullable(),
   hsCode: z.string().optional().nullable(),
   countryOfOrigin: z.string().max(2).optional().nullable(),
   weight: z.string().optional().nullable(),
@@ -667,6 +674,7 @@ export async function createProduct(
     type: formData.get('type') as string,
     parentId: formData.get('parentId') as string || null,
     barcode: ((formData.get('barcode') as string) || '').trim() || null,
+    mpn: ((formData.get('mpn') as string) || '').trim() || null,
     hsCode: formData.get('hsCode') as string || null,
     countryOfOrigin: formData.get('countryOfOrigin') as string || null,
     weight: formData.get('weight') as string || null,
@@ -723,6 +731,7 @@ export async function createProduct(
         type: data.type,
         parentId: structureValidation.normalizedParentId,
         barcode: data.barcode || null,
+        mpn: data.mpn || null,
         hsCode: data.hsCode || null,
         countryOfOrigin: data.countryOfOrigin || null,
         weight: data.weight ? data.weight : null,
@@ -749,7 +758,7 @@ export async function createProduct(
     tag: 'inventory',
     level: 'INFO',
     description: `Created product ${data.sku} — ${data.name}`,
-    metadata: { sku: data.sku, name: data.name, type: data.type, categoryName: data.categoryName ?? null },
+    metadata: { sku: data.sku, name: data.name, type: data.type, mpn: data.mpn ?? null, categoryName: data.categoryName ?? null },
   })
 
   try {
@@ -786,6 +795,7 @@ export async function updateProduct(
     type: formData.get('type') as string,
     parentId: formData.get('parentId') as string || null,
     barcode: ((formData.get('barcode') as string) || '').trim() || null,
+    mpn: ((formData.get('mpn') as string) || '').trim() || null,
     hsCode: formData.get('hsCode') as string || null,
     countryOfOrigin: formData.get('countryOfOrigin') as string || null,
     weight: formData.get('weight') as string || null,
@@ -850,6 +860,7 @@ export async function updateProduct(
         type: data.type,
         parentId: structureValidation.normalizedParentId,
         barcode: data.barcode || null,
+        mpn: data.mpn || null,
         hsCode: data.hsCode || null,
         countryOfOrigin: data.countryOfOrigin || null,
         weight: data.weight ? data.weight : null,
@@ -890,6 +901,7 @@ export async function updateProduct(
       sku: data.sku,
       name: data.name,
       type: data.type,
+      mpn: data.mpn ?? null,
       categoryName: data.categoryName ?? null,
       categoryNameChange: updatedCategoryChange,
     },

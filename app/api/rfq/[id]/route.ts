@@ -36,7 +36,7 @@ type RfqPurchaseOrder = {
     qty: RfqQuantity
     purchaseUnitQty: RfqQuantity | null
     purchaseUnit: { abbreviation: string; stockUnitName: string } | null
-    product: { sku: string; name: string; barcode: string | null }
+    product: { sku: string; name: string; barcode: string | null; mpn: string | null }
   }>
 }
 type RfqDocumentTemplate = {
@@ -89,7 +89,7 @@ const defaultRfqRouteDependencies: RfqRouteDependencies = {
             qty: true,
             purchaseUnitQty: true,
             purchaseUnit: { select: { abbreviation: true, stockUnitName: true } },
-            product: { select: { sku: true, name: true, barcode: true } },
+            product: { select: { sku: true, name: true, barcode: true, mpn: true } },
           },
           orderBy: { sortOrder: 'asc' },
         },
@@ -219,12 +219,13 @@ async function renderRfqPdf(po: RfqPurchaseOrder, tpl: RfqDocumentTemplate | nul
 
   // Table
   const columns: PdfTableColumn[] = [
-    { label: '#', width: 30, align: 'right' },
-    { label: 'SKU', width: 80 },
-    { label: 'Product', width: 170 },
-    { label: 'Barcode / EAN', width: 95 },
-    { label: 'Quantity', width: 65, align: 'right' },
-    { label: 'Unit', width: 55, align: 'right' },
+    { label: '#', width: 25, align: 'right' },
+    { label: 'SKU', width: 70 },
+    { label: 'Product', width: 140 },
+    { label: 'Barcode / EAN', width: 75 },
+    { label: 'MPN', width: 75 },
+    { label: 'Quantity', width: 60, align: 'right' },
+    { label: 'Unit', width: 45, align: 'right' },
   ]
 
   const rows = po.lines.map((l, i) => {
@@ -239,6 +240,7 @@ async function renderRfqPdf(po: RfqPurchaseOrder, tpl: RfqDocumentTemplate | nul
       l.product.sku,
       l.product.name,
       l.product.barcode ?? '—',
+      l.product.mpn ?? '—',
       qtyStr,
       unitLabel,
     ]

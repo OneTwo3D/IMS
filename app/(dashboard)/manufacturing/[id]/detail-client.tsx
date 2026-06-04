@@ -182,6 +182,12 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
                 <dd className="font-mono text-xs">{order.productBarcode}</dd>
               </div>
             )}
+            {order.productMpn && (
+              <div className="flex justify-between">
+                <dt className="text-muted-foreground">MPN</dt>
+                <dd className="font-mono text-xs">{order.productMpn}</dd>
+              </div>
+            )}
             <div className="flex justify-between">
               <dt className="text-muted-foreground">Warehouse</dt>
               <dd>{order.warehouseName} ({order.warehouseCode})</dd>
@@ -285,6 +291,7 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
               <TableHead>SKU</TableHead>
               <TableHead>Component</TableHead>
               <TableHead>Barcode</TableHead>
+              <TableHead>MPN</TableHead>
               <TableHead className="text-right">Per Unit</TableHead>
               <TableHead className="text-right">Total Qty</TableHead>
               {showComponentAvailability && (
@@ -311,6 +318,7 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
                     </Link>
                   </TableCell>
                   <TableCell className="text-muted-foreground font-mono text-xs">{c.componentBarcode ?? '—'}</TableCell>
+                  <TableCell className="text-muted-foreground font-mono text-xs">{c.componentMpn ?? '—'}</TableCell>
                   <TableCell className="text-right">{fmtQty(c.qtyPerUnit)}</TableCell>
                   <TableCell className="text-right font-medium">{fmtQty(c.requiredQty)}</TableCell>
                   {showComponentAvailability && (

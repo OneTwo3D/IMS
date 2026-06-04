@@ -38,10 +38,11 @@ export async function GET(
           sku: true,
           name: true,
           barcode: true,
+          mpn: true,
           productComponents: {
             select: {
               qty: true,
-              component: { select: { sku: true, name: true, barcode: true } },
+              component: { select: { sku: true, name: true, barcode: true, mpn: true } },
             },
             orderBy: { sortOrder: 'asc' },
           },
@@ -111,6 +112,9 @@ export async function GET(
   if (order.outputProduct.barcode) {
     doc.text(`Barcode: ${order.outputProduct.barcode}`, 50, doc.y)
   }
+  if (order.outputProduct.mpn) {
+    doc.text(`MPN: ${order.outputProduct.mpn}`, 50, doc.y)
+  }
   doc.text(`Warehouse: ${order.warehouse.name} (${order.warehouse.code})`, 50, doc.y)
   doc.text(`Quantity: ${Number(order.qtyPlanned)}`, 50, doc.y)
   doc.text(`Type: ${isDisassembly ? 'Disassembly' : 'Assembly'}`, 50, doc.y)
@@ -127,11 +131,12 @@ export async function GET(
 
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
-    { label: 'SKU', width: 80 },
-    { label: 'Component', width: 180 },
-    { label: 'Barcode / EAN', width: 90 },
-    { label: 'Per Unit', width: 55, align: 'right' },
-    { label: 'Total Qty', width: 65, align: 'right' },
+    { label: 'SKU', width: 70 },
+    { label: 'Component', width: 145 },
+    { label: 'Barcode / EAN', width: 75 },
+    { label: 'MPN', width: 75 },
+    { label: 'Per Unit', width: 50, align: 'right' },
+    { label: 'Total Qty', width: 50, align: 'right' },
   ]
 
   const rows = order.outputProduct.productComponents.map((c, i) => [
@@ -139,6 +144,7 @@ export async function GET(
     c.component.sku,
     c.component.name,
     c.component.barcode ?? '—',
+    c.component.mpn ?? '—',
     String(Number(c.qty)),
     String(Number(c.qty) * qtyPlanned),
   ])

@@ -32,6 +32,7 @@ type Props = {
     type?: string
     parentId?: string
     barcode?: string
+    mpn?: string
     hsCode?: string
     countryOfOrigin?: string
     weight?: string
@@ -90,6 +91,7 @@ export function ProductForm({ action, variableProducts, productCategories, defau
     type:                 defaultValues?.type                 ?? 'SIMPLE',
     parentId:             defaultValues?.parentId             ?? '',
     barcode:              defaultValues?.barcode              ?? '',
+    mpn:                  defaultValues?.mpn                  ?? '',
     hsCode:               defaultValues?.hsCode               ?? '',
     countryOfOrigin:      defaultValues?.countryOfOrigin      ?? '',
     weight:               defaultValues?.weight               ?? '',
@@ -263,15 +265,29 @@ export function ProductForm({ action, variableProducts, productCategories, defau
       )}
 
       {/* Identifiers */}
-      <div className="space-y-1.5">
-        <Label htmlFor="barcode">Barcode / EAN</Label>
-        <Input
-          id="barcode"
-          name="barcode"
-          value={fields.barcode}
-          onChange={(ev) => set('barcode', ev.target.value)}
-          placeholder="e.g. 5060000000000"
-        />
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div className="space-y-1.5">
+          <Label htmlFor="barcode">Barcode / EAN</Label>
+          <Input
+            id="barcode"
+            name="barcode"
+            value={fields.barcode}
+            onChange={(ev) => set('barcode', ev.target.value)}
+            placeholder="e.g. 5060000000000"
+          />
+          {e.barcode && <p className="text-xs text-destructive">{e.barcode[0]}</p>}
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="mpn">MPN</Label>
+          <Input
+            id="mpn"
+            name="mpn"
+            value={fields.mpn}
+            onChange={(ev) => set('mpn', ev.target.value)}
+            placeholder="e.g. ABC-123"
+          />
+          {e.mpn && <p className="text-xs text-destructive">{e.mpn[0]}</p>}
+        </div>
       </div>
 
       {/* Customs */}

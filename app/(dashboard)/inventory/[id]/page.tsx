@@ -143,6 +143,7 @@ export default async function ProductDetailPage({
                 type: product.type,
                 parentId: product.parentId ?? undefined,
                 barcode: product.barcode ?? undefined,
+                mpn: product.mpn ?? undefined,
                 hsCode: product.hsCode ?? undefined,
                 countryOfOrigin: product.countryOfOrigin ?? undefined,
                 weight: product.weight ?? undefined,

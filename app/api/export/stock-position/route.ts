@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
+import { db } from '@/lib/db'
 import { toCsv, csvResponse } from '@/lib/csv'
 import {
   getNegativeStockReport,
@@ -11,6 +12,16 @@ import { getDeadStockReport, getInventoryAgingReport, InventoryHealthSourceLimit
 import { stockPositionApiAccessDenied } from '@/lib/security/stock-position-access'
 
 const STOCK_POSITION_CSV_ROW_LIMIT = 50000
+
+async function loadMpnByProductId(productIds: Array<string | null | undefined>): Promise<Map<string, string>> {
+  const ids = Array.from(new Set(productIds.filter((id): id is string => Boolean(id))))
+  if (ids.length === 0) return new Map()
+  const products = await db.product.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, mpn: true },
+  })
+  return new Map(products.map((product) => [product.id, product.mpn ?? '']))
+}
 
 function one(req: NextRequest, key: string): string | undefined {
   return req.nextUrl.searchParams.get(key) ?? undefined
@@ -58,8 +69,10 @@ export async function GET(req: NextRequest) {
       const report = await getStockOnHandReport(stockPositionFilters(req), { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((r) => r.productId))
       const data = report.rows.map((r) => ({
         sku: r.sku,
+        mpn: mpnByProductId.get(r.productId) ?? '',
         productName: r.productName,
         productType: r.productType,
         category: r.categoryName ?? '',
@@ -79,15 +92,17 @@ export async function GET(req: NextRequest) {
         reservationSnapshotDate: r.reservationSnapshotDate ?? '',
         reservationSourceCount: r.reservationSourceCount ?? 'unknown',
       }))
-      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'quantity', 'reservedQty', 'availableQty', 'unitCostBase', 'totalValueBase', 'asOf', 'source', 'generatedAt', 'reservationQtySource', 'reservationSnapshotDate', 'reservationSourceCount']), `stock-on-hand-${date}.csv`)
+      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'quantity', 'reservedQty', 'availableQty', 'unitCostBase', 'totalValueBase', 'asOf', 'source', 'generatedAt', 'reservationQtySource', 'reservationSnapshotDate', 'reservationSourceCount']), `stock-on-hand-${date}.csv`)
     }
 
     case 'stock-allocations': {
       const report = await getStockAllocationReport(stockPositionFilters(req), { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((r) => r.productId))
       const data = report.rows.map((r) => ({
         sku: r.sku,
+        mpn: mpnByProductId.get(r.productId) ?? '',
         productName: r.productName,
         productType: r.productType,
         category: r.categoryName ?? '',
@@ -104,15 +119,17 @@ export async function GET(req: NextRequest) {
         driftQty: r.driftQty,
         generatedAt: report.generatedAt,
       }))
-      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'warehouseCode', 'warehouseName', 'source', 'referenceId', 'referenceLabel', 'expectedDate', 'ageBucket', 'stockUnit', 'reservedQty', 'stockLevelReservedQty', 'driftQty', 'generatedAt']), `stock-allocations-${date}.csv`)
+      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'warehouseCode', 'warehouseName', 'source', 'referenceId', 'referenceLabel', 'expectedDate', 'ageBucket', 'stockUnit', 'reservedQty', 'stockLevelReservedQty', 'driftQty', 'generatedAt']), `stock-allocations-${date}.csv`)
     }
 
     case 'negative-stock': {
       const report = await getNegativeStockReport(stockPositionFilters(req), { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((r) => r.productId))
       const data = report.rows.map((r) => ({
         sku: r.sku,
+        mpn: mpnByProductId.get(r.productId) ?? '',
         productName: r.productName,
         productType: r.productType,
         category: r.categoryName ?? '',
@@ -129,7 +146,7 @@ export async function GET(req: NextRequest) {
         dateTo: report.dateTo,
         generatedAt: report.generatedAt,
       }))
-      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'warehouseCode', 'warehouseName', 'stockUnit', 'status', 'currentQty', 'minimumQty', 'firstNegativeAt', 'lastMovementAt', 'movementCount', 'dateFrom', 'dateTo', 'generatedAt']), `negative-stock-${date}.csv`)
+      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'warehouseCode', 'warehouseName', 'stockUnit', 'status', 'currentQty', 'minimumQty', 'firstNegativeAt', 'lastMovementAt', 'movementCount', 'dateFrom', 'dateTo', 'generatedAt']), `negative-stock-${date}.csv`)
     }
 
     case 'inventory-aging': {
@@ -142,8 +159,10 @@ export async function GET(req: NextRequest) {
       }
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((r) => r.productId))
       const data = report.rows.map((r) => ({
         sku: r.sku,
+        mpn: mpnByProductId.get(r.productId) ?? '',
         productName: r.productName,
         productType: r.productType,
         category: r.categoryName ?? '',
@@ -158,7 +177,7 @@ export async function GET(req: NextRequest) {
         valueBase: r.valueBase,
         source: r.source,
       }))
-      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'bucket', 'minAgeDays', 'maxAgeDays', 'qty', 'valueBase', 'source']), `inventory-aging-${date}.csv`)
+      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'bucket', 'minAgeDays', 'maxAgeDays', 'qty', 'valueBase', 'source']), `inventory-aging-${date}.csv`)
     }
 
     case 'dead-stock': {
@@ -171,8 +190,10 @@ export async function GET(req: NextRequest) {
       }
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((r) => r.productId))
       const data = report.rows.map((r) => ({
         sku: r.sku,
+        mpn: mpnByProductId.get(r.productId) ?? '',
         productName: r.productName,
         productType: r.productType,
         category: r.categoryName ?? '',
@@ -186,7 +207,7 @@ export async function GET(req: NextRequest) {
         lastSaleAt: r.lastSaleAt ?? '',
         firstStockedAt: r.firstStockedAt ?? '',
       }))
-      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'qty', 'valueBase', 'daysSinceLastSale', 'lastSaleAt', 'firstStockedAt']), `dead-stock-${date}.csv`)
+      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'qty', 'valueBase', 'daysSinceLastSale', 'lastSaleAt', 'firstStockedAt']), `dead-stock-${date}.csv`)
     }
 
     default:

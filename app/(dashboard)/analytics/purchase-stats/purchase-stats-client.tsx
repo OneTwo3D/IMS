@@ -35,7 +35,7 @@ function makeId() { return Math.random().toString(36).slice(2, 8) }
 const PRODUCT_FIELDS: FieldDef[] = [
   { key: 'sku', label: 'SKU', type: 'text' }, { key: 'name', label: 'Product Name', type: 'text' },
   { key: 'type', label: 'Product Type', type: 'select', options: ['SIMPLE', 'VARIANT', 'KIT', 'BOM'] },
-  { key: 'barcode', label: 'Barcode', type: 'text' }, { key: 'supplierName', label: 'Supplier', type: 'text' },
+  { key: 'barcode', label: 'Barcode', type: 'text' }, { key: 'mpn', label: 'MPN', type: 'text' }, { key: 'supplierName', label: 'Supplier', type: 'text' },
   { key: 'qtyOrdered', label: 'Qty Ordered', type: 'number' }, { key: 'qtyReceived', label: 'Qty Received', type: 'number' },
   { key: 'totalBase', label: 'Total', type: 'number' }, { key: 'avgUnitCostBase', label: 'Avg Unit Cost', type: 'number' },
   { key: 'incomingQty', label: 'Incoming', type: 'number' }, { key: 'poCount', label: 'PO Count', type: 'number' },
@@ -75,6 +75,7 @@ const AGING_FIELDS: FieldDef[] = [
 const DETAIL_FIELDS: FieldDef[] = [
   { key: 'productName', label: 'Product', type: 'text' }, { key: 'reference', label: 'PO', type: 'text' },
   { key: 'sku', label: 'SKU', type: 'text' }, { key: 'barcode', label: 'Barcode', type: 'text' },
+  { key: 'mpn', label: 'MPN', type: 'text' },
   { key: 'type', label: 'Type', type: 'text' }, { key: 'supplierName', label: 'Supplier', type: 'text' },
   { key: 'status', label: 'Status', type: 'text' }, { key: 'qty', label: 'Qty', type: 'number' },
   { key: 'totalBase', label: 'Total', type: 'number' }, { key: 'createdAt', label: 'Created', type: 'text' },
@@ -91,11 +92,11 @@ const TAB_FIELDS: Record<Tab, FieldDef[]> = {
 }
 
 const DEFAULT_COLS: Record<Tab, string[]> = {
-  products: ['sku', 'name', 'type', 'barcode', 'supplierName', 'qtyOrdered', 'qtyReceived', 'totalBase', 'avgUnitCostBase', 'incomingQty', 'poCount', 'createdAt'],
+  products: ['sku', 'name', 'type', 'barcode', 'mpn', 'supplierName', 'qtyOrdered', 'qtyReceived', 'totalBase', 'avgUnitCostBase', 'incomingQty', 'poCount', 'createdAt'],
   received: ['productName', 'poReference', 'supplierName', 'grnReference', 'sku', 'warehouseCode', 'qtyReceived', 'status', 'totalBase', 'landedUnitCostBase', 'unitCostBase', 'receivedAt'],
   bills: ['poReference', 'supplierName', 'invoiceNumber', 'productName', 'sku', 'qtyBilled', 'invoiceDate', 'status', 'totalForeign', 'totalBase', 'supplierInvoiceUrl'],
   aging: ['supplierName', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'dueAmount', 'overdue0_30', 'overdue31_60', 'overdue61_90', 'overdue91plus'],
-  details: ['productName', 'reference', 'sku', 'barcode', 'type', 'supplierName', 'status', 'qty', 'totalBase', 'createdAt'],
+  details: ['productName', 'reference', 'sku', 'barcode', 'mpn', 'type', 'supplierName', 'status', 'qty', 'totalBase', 'createdAt'],
 }
 
 // ---------------------------------------------------------------------------
@@ -213,6 +214,7 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
     name: { label: 'Name', align: 'left', render: (r) => <span className="text-xs truncate max-w-32 block">{r.name}</span> },
     type: { label: 'Type', align: 'left', render: (r) => <span className="text-xs">{r.type}</span> },
     barcode: { label: 'Barcode', align: 'left', render: (r) => <span className="text-xs font-mono">{r.barcode ?? '—'}</span> },
+    mpn: { label: 'MPN', align: 'left', render: (r) => <span className="text-xs font-mono">{r.mpn ?? '—'}</span> },
     supplierName: { label: 'Supplier', align: 'left', render: (r) => <span className="text-xs">{r.supplierName ?? '—'}</span> },
     stockUnit: { label: 'Unit', align: 'left', render: (r) => <span className="text-xs">{r.stockUnit}</span> },
     qtyOrdered: { label: 'Ordered', align: 'right', render: (r) => <span className="tabular-nums text-xs">{r.qtyOrdered}</span>, footer: () => <span className="tabular-nums">{totalOrdered}</span> },

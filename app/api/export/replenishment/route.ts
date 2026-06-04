@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import { csvResponse, toCsv } from '@/lib/csv'
+import { db } from '@/lib/db'
 import {
   getBackorderDemandReport,
   getComponentShortageReport,
@@ -10,6 +11,16 @@ import type { StockPositionFilters } from '@/lib/domain/inventory/stock-position
 import { canAccessReplenishmentReports } from '@/lib/security/replenishment-report-access'
 
 const REPLENISHMENT_CSV_ROW_LIMIT = 50000
+
+async function loadMpnByProductId(productIds: Array<string | null | undefined>): Promise<Map<string, string>> {
+  const ids = Array.from(new Set(productIds.filter((id): id is string => Boolean(id))))
+  if (ids.length === 0) return new Map()
+  const products = await db.product.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, mpn: true },
+  })
+  return new Map(products.map((product) => [product.id, product.mpn ?? '']))
+}
 
 function one(req: NextRequest, key: string): string | undefined {
   return req.nextUrl.searchParams.get(key) ?? undefined
@@ -55,8 +66,10 @@ export async function GET(req: NextRequest) {
       const report = await getReorderReport(filters, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
       const data = report.rows.map((row) => ({
         sku: row.sku,
+        mpn: mpnByProductId.get(row.productId) ?? '',
         productName: row.productName,
         productType: row.productType,
         category: row.categoryName ?? '',
@@ -75,15 +88,17 @@ export async function GET(req: NextRequest) {
         abcClass: row.abcClass ?? '',
         urgency: row.urgency,
       }))
-      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'supplierName', 'supplierSku', 'stockUnit', 'availableQty', 'warehouseAvailabilityBreakdown', 'inboundOpenPoQty', 'averageDailyDemand', 'leadTimeDays', 'safetyStockQty', 'reorderPoint', 'configuredReorderQty', 'suggestedReorderQty', 'abcClass', 'urgency']), `reorder-${date}.csv`)
+      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'supplierName', 'supplierSku', 'stockUnit', 'availableQty', 'warehouseAvailabilityBreakdown', 'inboundOpenPoQty', 'averageDailyDemand', 'leadTimeDays', 'safetyStockQty', 'reorderPoint', 'configuredReorderQty', 'suggestedReorderQty', 'abcClass', 'urgency']), `reorder-${date}.csv`)
     }
 
     case 'backorder': {
       const report = await getBackorderDemandReport(filters, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
       const data = report.rows.map((row) => ({
         sku: row.sku,
+        mpn: mpnByProductId.get(row.productId) ?? '',
         productName: row.productName,
         productType: row.productType,
         category: row.categoryName ?? '',
@@ -98,15 +113,17 @@ export async function GET(req: NextRequest) {
         projectedFillDate: row.projectedFillDate ?? '',
         oldestOrderAt: row.oldestOrderAt,
       }))
-      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'stockUnit', 'orderCount', 'orderedQty', 'committedQty', 'allocatedQty', 'backorderQty', 'inboundOpenPoQty', 'projectedFillDate', 'oldestOrderAt']), `backorder-${date}.csv`)
+      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'stockUnit', 'orderCount', 'orderedQty', 'committedQty', 'allocatedQty', 'backorderQty', 'inboundOpenPoQty', 'projectedFillDate', 'oldestOrderAt']), `backorder-${date}.csv`)
     }
 
     case 'component-shortage': {
       const report = await getComponentShortageReport(filters, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
       const data = report.rows.map((row) => ({
         sku: row.sku,
+        mpn: mpnByProductId.get(row.productId) ?? '',
         productName: row.productName,
         productType: row.productType,
         category: row.categoryName ?? '',
@@ -122,7 +139,7 @@ export async function GET(req: NextRequest) {
         earliestScheduledAt: row.earliestScheduledAt ?? '',
         outputProducts: row.outputProducts.join('; '),
       }))
-      return csvResponse(toCsv(data, ['sku', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'productionOrderCount', 'requiredQty', 'availableQty', 'inboundOpenPoQty', 'shortageQty', 'earliestScheduledAt', 'outputProducts']), `component-shortage-${date}.csv`)
+      return csvResponse(toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'productionOrderCount', 'requiredQty', 'availableQty', 'inboundOpenPoQty', 'shortageQty', 'earliestScheduledAt', 'outputProducts']), `component-shortage-${date}.csv`)
     }
 
     default:

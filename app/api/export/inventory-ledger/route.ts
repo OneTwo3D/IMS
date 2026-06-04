@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import { csvBufferedStreamResponse } from '@/lib/csv'
+import { db } from '@/lib/db'
 import {
   getInventoryLedgerExportRowCount,
   getStockAdjustmentReport,
@@ -13,6 +14,16 @@ import {
 import { inventoryLedgerApiAccessDenied } from '@/lib/security/inventory-ledger-access'
 
 const INVENTORY_LEDGER_CSV_ROW_LIMIT = 100000
+
+async function loadMpnByProductId(productIds: Array<string | null | undefined>): Promise<Map<string, string>> {
+  const ids = Array.from(new Set(productIds.filter((id): id is string => Boolean(id))))
+  if (ids.length === 0) return new Map()
+  const products = await db.product.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, mpn: true },
+  })
+  return new Map(products.map((product) => [product.id, product.mpn ?? '']))
+}
 
 function one(req: NextRequest, key: string): string | undefined {
   return req.nextUrl.searchParams.get(key) ?? undefined
@@ -55,10 +66,12 @@ export async function GET(req: NextRequest) {
   switch (type) {
     case 'stock-movements': {
       const report = await getStockMovementLedgerReport(filters, { paginate: false })
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
         createdAt: row.createdAt,
         type: row.type,
         sku: row.sku,
+        mpn: mpnByProductId.get(row.productId) ?? '',
         productName: row.productName,
         stockUnit: row.stockUnit,
         warehouseCode: row.warehouseCode,
@@ -79,14 +92,16 @@ export async function GET(req: NextRequest) {
         closingValueBase: report.totals.closingValueBase,
         generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['createdAt', 'type', 'sku', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'qty', 'signedQty', 'unitCostBase', 'totalValueBase', 'signedValueBase', 'referenceType', 'referenceId', 'note', 'openingQty', 'movementQty', 'closingQty', 'openingValueBase', 'movementValueBase', 'closingValueBase', 'generatedAt'], `stock-movements-${date}.csv`)
+      return csvBufferedStreamResponse(rows, ['createdAt', 'type', 'sku', 'mpn', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'qty', 'signedQty', 'unitCostBase', 'totalValueBase', 'signedValueBase', 'referenceType', 'referenceId', 'note', 'openingQty', 'movementQty', 'closingQty', 'openingValueBase', 'movementValueBase', 'closingValueBase', 'generatedAt'], `stock-movements-${date}.csv`)
     }
 
     case 'stock-adjustments': {
       const report = await getStockAdjustmentReport(filters, { paginate: false })
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
         createdAt: row.createdAt,
         sku: row.sku,
+        mpn: mpnByProductId.get(row.productId) ?? '',
         productName: row.productName,
         stockUnit: row.stockUnit,
         warehouseCode: row.warehouseCode,
@@ -100,7 +115,7 @@ export async function GET(req: NextRequest) {
         note: row.note ?? '',
         generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['createdAt', 'sku', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'reasonName', 'reasonMatched', 'signedQty', 'totalValueBase', 'referenceType', 'referenceId', 'note', 'generatedAt'], `stock-adjustments-${date}.csv`)
+      return csvBufferedStreamResponse(rows, ['createdAt', 'sku', 'mpn', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'reasonName', 'reasonMatched', 'signedQty', 'totalValueBase', 'referenceType', 'referenceId', 'note', 'generatedAt'], `stock-adjustments-${date}.csv`)
     }
 
     case 'transfers': {
@@ -129,12 +144,14 @@ export async function GET(req: NextRequest) {
 
     case 'stock-counts': {
       const report = await getStockCountReport(filters, { paginate: false })
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
         reference: row.reference,
         status: row.status,
         warehouseCode: row.warehouseCode,
         warehouseName: row.warehouseName,
         sku: row.sku,
+        mpn: mpnByProductId.get(row.productId) ?? '',
         productId: row.productId,
         expectedQty: row.expectedQty,
         countedQty: row.countedQty ?? '',
@@ -144,7 +161,7 @@ export async function GET(req: NextRequest) {
         completedAt: row.completedAt ?? '',
         generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['reference', 'status', 'warehouseCode', 'warehouseName', 'sku', 'productId', 'expectedQty', 'countedQty', 'varianceQty', 'linkedAdjustmentValueBase', 'adjustmentEvidence', 'completedAt', 'generatedAt'], `stock-counts-${date}.csv`)
+      return csvBufferedStreamResponse(rows, ['reference', 'status', 'warehouseCode', 'warehouseName', 'sku', 'mpn', 'productId', 'expectedQty', 'countedQty', 'varianceQty', 'linkedAdjustmentValueBase', 'adjustmentEvidence', 'completedAt', 'generatedAt'], `stock-counts-${date}.csv`)
     }
 
     default:

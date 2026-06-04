@@ -84,7 +84,7 @@ export function ProductFilters({ search, type, lifecycleStatus, categoryId, prod
         <Input
           id="inventory-search"
           className="pl-8"
-          placeholder="Search SKU, name, barcode…"
+          placeholder="Search SKU, name, barcode, MPN…"
           value={searchValue}
           onChange={(e) => setSearchValue(e.target.value)}
           aria-describedby="inventory-search-status"
