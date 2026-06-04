@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { verifyCron } from '../../lib/cron-auth.ts'
+import {
+  assertProductionCronSecretConfigured,
+  verifyCron,
+} from '../../lib/cron-auth.ts'
 
 type CronEnv = {
   CRON_SECRET?: string
@@ -47,6 +50,30 @@ function cronRequest(host: string, authorization?: string): Request {
 function cronRequestWithoutHostHeader(url: string): Request {
   return new Request(url)
 }
+
+test('production boot fails fast when cron secret is unset or blank', () => {
+  assert.throws(
+    () => assertProductionCronSecretConfigured({ NODE_ENV: 'production', CRON_SECRET: undefined }),
+    /CRON_SECRET is required in production/,
+  )
+  assert.throws(
+    () => assertProductionCronSecretConfigured({ NODE_ENV: 'production', CRON_SECRET: '' }),
+    /CRON_SECRET is required in production/,
+  )
+  assert.throws(
+    () => assertProductionCronSecretConfigured({ NODE_ENV: 'production', CRON_SECRET: '   ' }),
+    /CRON_SECRET is required in production/,
+  )
+})
+
+test('cron secret boot guard allows non-production localhost development', () => {
+  assert.doesNotThrow(() => assertProductionCronSecretConfigured({ NODE_ENV: 'test', CRON_SECRET: undefined }))
+  assert.doesNotThrow(() => assertProductionCronSecretConfigured({ NODE_ENV: 'development', CRON_SECRET: '' }))
+})
+
+test('cron secret boot guard accepts configured production secret', () => {
+  assert.doesNotThrow(() => assertProductionCronSecretConfigured({ NODE_ENV: 'production', CRON_SECRET: 'secret-token' }))
+})
 
 test('valid cron secret is accepted', async () => {
   await withCronEnv({ CRON_SECRET: 'secret-token', NODE_ENV: 'production' }, async () => {

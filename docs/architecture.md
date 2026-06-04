@@ -292,7 +292,7 @@ There is no separate worker process. Background tasks are handled via HTTP endpo
 | Mintsoft webhook sweeper | `GET /api/cron/mintsoft-webhook-sweeper` | Every 5 minutes | Drain persisted Mintsoft ASN booked-in webhook events and apply stock/PO effects asynchronously |
 | Delivery status | `GET /api/cron/delivery-status` | Every 15 min | Poll delivery tracking providers for shipment status updates |
 
-All cron endpoints require the `CRON_SECRET` bearer header in production. Localhost bypass is available outside production only when no `CRON_SECRET` is configured; production never accepts localhost cron requests without the bearer header.
+All cron endpoints require the `CRON_SECRET` bearer header in production. Production startup fails fast if `CRON_SECRET` is unset or blank. Localhost bypass is available outside production only when no `CRON_SECRET` is configured; production never accepts localhost cron requests without the bearer header.
 
 
 ## PDF Generation

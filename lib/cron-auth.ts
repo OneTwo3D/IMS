@@ -1,6 +1,16 @@
 import { NextResponse } from 'next/server'
 import { getCronSecret } from '@/lib/cron-secret'
 
+export function assertProductionCronSecretConfigured(
+  env: Partial<Record<'NODE_ENV' | 'CRON_SECRET', string | undefined>> = process.env,
+): void {
+  if (env.NODE_ENV === 'production' && !env.CRON_SECRET?.trim()) {
+    throw new Error('CRON_SECRET is required in production for cron endpoint authentication.')
+  }
+}
+
+assertProductionCronSecretConfigured()
+
 /**
  * Verify cron requests via the configured cron secret.
  * Localhost bypass is allowed outside production only when CRON_SECRET is not
