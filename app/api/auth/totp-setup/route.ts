@@ -8,50 +8,16 @@ import { NextRequest } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { generateSecret, generateURI, verify } from 'otplib'
-import QRCode from 'qrcode'
+import { verify } from 'otplib'
 import { z } from 'zod'
 import { readTotpSecrets, serializeTotpSecret } from '@/lib/totp-secrets'
-import type { AuthSession } from '@/lib/auth/server'
+import { defaultTotpSetupGetDependencies, handleTotpSetupGet, totpJsonResponse } from './handler'
 
 const confirmSchema = z.object({ code: z.string().length(6) })
 const disableSchema = z.object({ code: z.string().length(6) })
 
-type TotpSetupGetDependencies = {
-  authorize: () => Promise<AuthSession | Response>
-  generateSecret: () => string
-  generateUri: (input: { secret: string; label: string; issuer: string }) => string
-  generateQrDataUrl: (input: string) => Promise<string>
-  stageSecret: (userId: string, secret: string) => Promise<void>
-}
-
-export async function handleTotpSetupGet(dependencies: TotpSetupGetDependencies): Promise<Response> {
-  const session = await dependencies.authorize()
-  if ('headers' in session) return session
-
-  const secret = dependencies.generateSecret()
-  const otpAuthUrl = dependencies.generateUri({ secret, label: session.user.email, issuer: 'onetwoInventory' })
-  const qrDataUrl = await dependencies.generateQrDataUrl(otpAuthUrl)
-
-  // Stage the secret server-side so POST can use it without trusting the client.
-  await dependencies.stageSecret(session.user.id, secret)
-
-  return Response.json({ qrDataUrl })
-}
-
 export async function GET() {
-  return handleTotpSetupGet({
-    authorize: requireApiAuth,
-    generateSecret,
-    generateUri: generateURI,
-    generateQrDataUrl: QRCode.toDataURL,
-    async stageSecret(userId, secret) {
-      await db.user.update({
-        where: { id: userId },
-        data: { pendingTotpSecret: serializeTotpSecret(secret) },
-      })
-    },
-  })
+  return handleTotpSetupGet(defaultTotpSetupGetDependencies)
 }
 
 export async function POST(request: NextRequest) {
@@ -61,17 +27,17 @@ export async function POST(request: NextRequest) {
   const body = await request.json()
   const parsed = confirmSchema.safeParse(body)
   if (!parsed.success) {
-    return Response.json({ error: 'Invalid request' }, { status: 400 })
+    return totpJsonResponse({ error: 'Invalid request' }, { status: 400 })
   }
 
   const secrets = await readTotpSecrets(session.user.id)
   if (!secrets?.pendingTotpSecret) {
-    return Response.json({ error: 'No pending 2FA setup — start again' }, { status: 400 })
+    return totpJsonResponse({ error: 'No pending 2FA setup — start again' }, { status: 400 })
   }
 
   const result = await verify({ secret: secrets.pendingTotpSecret, token: parsed.data.code })
   if (!result.valid) {
-    return Response.json({ error: 'Invalid code — please try again' }, { status: 400 })
+    return totpJsonResponse({ error: 'Invalid code — please try again' }, { status: 400 })
   }
 
   await db.user.update({
@@ -92,7 +58,7 @@ export async function POST(request: NextRequest) {
     description: 'Enabled two-factor authentication (TOTP)',
   })
 
-  return Response.json({ success: true })
+  return totpJsonResponse({ success: true })
 }
 
 export async function DELETE(request: NextRequest) {
@@ -102,17 +68,17 @@ export async function DELETE(request: NextRequest) {
   const body = await request.json()
   const parsed = disableSchema.safeParse(body)
   if (!parsed.success) {
-    return Response.json({ error: 'Invalid request' }, { status: 400 })
+    return totpJsonResponse({ error: 'Invalid request' }, { status: 400 })
   }
 
   const secrets = await readTotpSecrets(session.user.id)
   if (!secrets?.totpSecret) {
-    return Response.json({ error: '2FA not enabled' }, { status: 400 })
+    return totpJsonResponse({ error: '2FA not enabled' }, { status: 400 })
   }
 
   const result = await verify({ secret: secrets.totpSecret, token: parsed.data.code })
   if (!result.valid) {
-    return Response.json({ error: 'Invalid code' }, { status: 400 })
+    return totpJsonResponse({ error: 'Invalid code' }, { status: 400 })
   }
 
   await db.user.update({
@@ -133,5 +99,5 @@ export async function DELETE(request: NextRequest) {
     description: 'Disabled two-factor authentication (TOTP)',
   })
 
-  return Response.json({ success: true })
+  return totpJsonResponse({ success: true })
 }

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { handleTotpSetupGet } from '../../app/api/auth/totp-setup/route.ts'
+import { handleTotpSetupGet } from '../../app/api/auth/totp-setup/handler.ts'
 import type { AuthSession } from '../../lib/auth/server.ts'
 
 function session(): AuthSession {
@@ -42,8 +42,12 @@ test('TOTP setup response excludes the raw secret while staging it server-side',
   const body = await response.json() as { qrDataUrl?: unknown; secret?: unknown }
 
   assert.equal(response.status, 200)
+  assert.equal(response.headers.get('Cache-Control'), 'no-store')
   assert.deepEqual(stagedSecrets, [{ userId: 'user-1', secret: 'raw-totp-secret' }])
   assert.deepEqual(body, { qrDataUrl: 'data:image/png;base64,qr-code' })
   assert.equal('secret' in body, false)
   assert.equal(JSON.stringify(body).includes('raw-totp-secret'), false)
+
+  const headerString = [...response.headers.entries()].map(([key, value]) => `${key}:${value}`).join('|')
+  assert.equal(headerString.includes('raw-totp-secret'), false)
 })
