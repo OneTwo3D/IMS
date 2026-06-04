@@ -12,6 +12,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import {
   createBackupRestoreGetHandler,
   createBackupRestorePostHandler,
+  redactRestoreErrorMessage,
   type BackupRestoreHandlerDeps,
   type RestoreLogEntry,
 } from '../../app/api/backup/restore/route.ts'
@@ -131,6 +132,27 @@ async function responseJson(response: Response): Promise<Record<string, unknown>
 function metadataReason(entry: RestoreLogEntry): unknown {
   return (entry.metadata as { reason?: unknown } | null | undefined)?.reason
 }
+
+test('restore error redactor removes database URL and password fragments', () => {
+  const env = {
+    DATABASE_URL: 'postgresql://imsuser:s3cr%40t-value@localhost:5432/ims',
+  }
+  const redacted = redactRestoreErrorMessage(
+    [
+      'psql failed with postgresql://imsuser:s3cr%40t-value@localhost:5432/ims',
+      'connection password=s3cr@t-value rejected',
+      'PGPASSWORD=s3cr%40t-value',
+      'decoded secret s3cr@t-value',
+    ].join('\n'),
+    env,
+  )
+
+  assert.equal(redacted.includes('s3cr%40t-value'), false)
+  assert.equal(redacted.includes('s3cr@t-value'), false)
+  assert.match(redacted, /postgresql:\/\/imsuser:\[redacted\]@localhost:5432\/ims/)
+  assert.match(redacted, /password=\[redacted\]/)
+  assert.match(redacted, /PGPASSWORD=\[redacted\]/)
+})
 
 test('production restore code issuance is disabled by default and logs a warning', async () => {
   const { deps, calls, activityLogs } = baseDeps()
@@ -717,7 +739,7 @@ test('enabled production upload restore writes a temporary file, runs restore, a
   }
 })
 
-test('failed production upload restore disables maintenance and removes the temporary file', async () => {
+test('failed production upload restore redacts database password, disables maintenance, and removes the temporary file', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-upload-failure-test-'))
   try {
     const form = new FormData()
@@ -726,7 +748,7 @@ test('failed production upload restore disables maintenance and removes the temp
     form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
 
     let tempPath = ''
-    const { deps, calls } = baseDeps({
+    const { deps, calls, activityLogs } = baseDeps({
       backupDir: root,
       env: {
         ...productionEnv(),
@@ -737,7 +759,7 @@ test('failed production upload restore disables maintenance and removes the temp
         calls.runRestore += 1
         tempPath = filePath
         await stat(filePath)
-        throw new Error('psql failed')
+        throw new Error('psql failed: postgresql://imsuser:password@localhost:5432/ims password=password')
       },
     })
     const handler = createBackupRestorePostHandler(deps)
@@ -753,11 +775,17 @@ test('failed production upload restore disables maintenance and removes the temp
     const body = await responseJson(response)
 
     assert.equal(response.status, 500)
-    assert.equal(body.error, 'Restore failed: psql failed')
+    assert.equal(body.error, 'Restore failed: psql failed: postgresql://imsuser:[redacted]@localhost:5432/ims password=[redacted]')
+    assert.equal(JSON.stringify(body).includes('imsuser:password'), false)
+    assert.equal(JSON.stringify(body).includes('password=password'), false)
     assert.equal(calls.consumeToken, 1)
     assert.equal(calls.enableMaintenance, 1)
     assert.equal(calls.disableMaintenance, 1)
     assert.equal(calls.runRestore, 1)
+    assert.equal(activityLogs.length, 1)
+    assert.equal(activityLogs[0].description, 'Failed to restore backup: psql failed: postgresql://imsuser:[redacted]@localhost:5432/ims password=[redacted]')
+    assert.equal(activityLogs[0].description.includes('imsuser:password'), false)
+    assert.equal(activityLogs[0].description.includes('password=password'), false)
     await assert.rejects(stat(tempPath), { code: 'ENOENT' })
   } finally {
     await rm(root, { recursive: true, force: true })

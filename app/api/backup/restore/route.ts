@@ -8,7 +8,7 @@ import readline from 'readline'
 import { pipeline } from 'stream/promises'
 import { Readable } from 'stream'
 import type { ReadableStream as NodeReadableStream } from 'stream/web'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, redactActivityLogText } from '@/lib/activity-log'
 import { requireApiFreshAdmin } from '@/lib/auth/server'
 import { getBackupDir } from '@/lib/backup-storage'
 import { disableMaintenanceMode, enableMaintenanceMode } from '@/lib/maintenance-mode'
@@ -95,6 +95,50 @@ function getDbConfig(env: Env = process.env) {
     password: url.password,
     database: url.pathname.slice(1),
   }
+}
+
+function restoreSecretCandidates(env: Env): string[] {
+  const candidates = new Set<string>()
+  const databaseUrl = env.DATABASE_URL
+  if (!databaseUrl) return []
+
+  try {
+    const url = new URL(databaseUrl)
+    for (const value of [url.password, decodeURIComponent(url.password)]) {
+      if (value.length >= 4) candidates.add(value)
+    }
+  } catch {
+    // Invalid DATABASE_URL is handled by the normal restore failure path.
+  }
+
+  return [...candidates]
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+function isSafeExactSecretCandidate(value: string): boolean {
+  return !/^(password|passphrase|secret|token)$/i.test(value)
+}
+
+export function redactRestoreErrorMessage(message: string, env: Env = process.env): string {
+  let redacted = redactActivityLogText(message)
+    .replace(
+      /(\b[a-z][a-z0-9+.-]*:\/\/)([^:@/\s]+):([^@/\s]+)@/gi,
+      '$1$2:[redacted]@',
+    )
+    .replace(
+      /\b(password)(\s*=\s*)(?:"[^"]*"|'[^']*'|[^\s;,)]+)/gi,
+      '$1$2[redacted]',
+    )
+
+  for (const candidate of restoreSecretCandidates(env)) {
+    if (!isSafeExactSecretCandidate(candidate)) continue
+    redacted = redacted.replace(new RegExp(escapeRegExp(candidate), 'g'), '[redacted]')
+  }
+
+  return redacted
 }
 
 function parseOrigin(value: string | undefined): string | null {
@@ -434,7 +478,7 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       })
       return NextResponse.json({ success: true })
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error)
+      const message = redactRestoreErrorMessage(error instanceof Error ? error.message : String(error), resolvedDeps.env)
       await resolvedDeps.log({
         entityType: 'SYSTEM',
         tag: 'system',
