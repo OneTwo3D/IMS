@@ -160,6 +160,8 @@ function aggregateRefundReturnRows(
   return [...aggregated.values()]
 }
 
+// This key feeds SalesOrderRefund RETURN_INBOUND idempotency keys. Changing it
+// requires considering existing stock_movements.idempotencyKey values.
 function refundReturnAggregateKey(row: Pick<RefundReturnRow, 'productId' | 'refundLineId'>): string {
   return row.refundLineId ? `${row.productId}:${row.refundLineId}` : row.productId
 }
@@ -341,6 +343,16 @@ async function buildRefundFallbackReturnRows(
   })
 }
 
+/**
+ * Applies inbound stock for refund/restock rows.
+ *
+ * The returned rows describe the requested final returned state for the
+ * aggregate, not necessarily writes performed by this call. If an idempotency
+ * conflict proves a concurrent/replayed call already created the stock
+ * movement, the row is still returned so callers can keep their existing
+ * final-state contract. Downstream accounting must keep its own idempotency
+ * guard and must not infer "new work was performed" from this return value.
+ */
 export async function applyReturnInboundStockTx(
   tx: Prisma.TransactionClient,
   params: {
@@ -392,18 +404,33 @@ export async function applyReturnInboundStockTx(
           refundLineId: row.refundLineId,
         })
       : undefined
-    try {
-      await createReturnInboundMovementAndCostLayersTx(tx, {
-        movementRow: row,
-        costLayerRows: rowsByAggregateKey.get(refundReturnAggregateKey(row)) ?? [],
-        warehouseId: params.warehouseId,
-        note: params.note,
-        referenceType: params.referenceType,
-        referenceId: params.referenceId,
-        idempotencyKey,
+    const result = await createReturnInboundMovementAndCostLayersTx(tx, {
+      movementRow: row,
+      costLayerRows: rowsByAggregateKey.get(refundReturnAggregateKey(row)) ?? [],
+      warehouseId: params.warehouseId,
+      note: params.note,
+      referenceType: params.referenceType,
+      referenceId: params.referenceId,
+      idempotencyKey,
+    })
+    if (result === 'duplicate') {
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SALES_ORDER',
+          entityId: params.referenceId,
+          action: 'refund_return_deduped',
+          tag: 'sales',
+          level: 'INFO',
+          description: `Skipped duplicate refund return for product ${row.productId}`,
+          metadata: {
+            idempotencyKey,
+            productId: row.productId,
+            refundLineId: row.refundLineId ?? null,
+            referenceType: params.referenceType,
+            referenceId: params.referenceId,
+          },
+        },
       })
-    } catch (error) {
-      if (!isStockMovementIdempotencyConflict(error)) throw error
       continue
     }
   }
@@ -432,23 +459,28 @@ async function createReturnInboundMovementAndCostLayersTx(
     referenceId: string
     idempotencyKey?: string
   },
-): Promise<void> {
-  await tx.stockMovement.create({
-    data: {
-      type: 'RETURN_INBOUND',
-      productId: params.movementRow.productId,
-      toWarehouseId: params.warehouseId,
-      qty: params.movementRow.qty,
-      ...buildStockMovementValueFields({
+): Promise<'created' | 'duplicate'> {
+  try {
+    await tx.stockMovement.create({
+      data: {
+        type: 'RETURN_INBOUND',
+        productId: params.movementRow.productId,
+        toWarehouseId: params.warehouseId,
         qty: params.movementRow.qty,
-        unitCostBase: params.movementRow.unitCostBase ?? 0,
-      }),
-      note: params.note,
-      referenceType: params.referenceType,
-      referenceId: params.referenceId,
-      ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
-    },
-  })
+        ...buildStockMovementValueFields({
+          qty: params.movementRow.qty,
+          unitCostBase: params.movementRow.unitCostBase ?? 0,
+        }),
+        note: params.note,
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+        ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
+      },
+    })
+  } catch (error) {
+    if (!isStockMovementIdempotencyConflict(error)) throw error
+    return 'duplicate'
+  }
 
   await tx.stockLevel.upsert({
     where: {
@@ -483,6 +515,7 @@ async function createReturnInboundMovementAndCostLayersTx(
       await copyCostLayerSourceLinesProportionally(tx, row.sourceCostLayerId, newLayer.id, row.qty)
     }
   }
+  return 'created'
 }
 
 function consumeRefundLineQuantity(

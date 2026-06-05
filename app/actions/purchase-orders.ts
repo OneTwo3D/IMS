@@ -21,6 +21,7 @@ import {
   recalculateLandedCosts,
 } from '@/lib/domain/purchasing/landed-cost-service'
 import {
+  assertPurchaseOrderCancellationHasNoInvoices,
   reversePurchaseOrderCostLayersForCancellation,
   type PurchaseOrderCostLayerReversal,
 } from '@/lib/domain/purchasing/po-cancellation'
@@ -2003,11 +2004,13 @@ export async function cancelPurchaseOrder(id: string): Promise<{
           status: true,
           reference: true,
           lines: { select: { id: true } },
+          _count: { select: { invoices: true } },
         },
       })
       if (!existing) throw new Error('PO not found')
       const transition = validatePurchaseOrderStatusTransition(existing.status, 'CANCELLED')
       if (!transition.success) throw new Error(transition.error)
+      assertPurchaseOrderCancellationHasNoInvoices(existing._count.invoices)
 
       const reversal = await reversePurchaseOrderCostLayersForCancellation(tx, {
         poId: id,

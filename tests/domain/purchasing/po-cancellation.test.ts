@@ -2,7 +2,10 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
-import { reversePurchaseOrderCostLayersForCancellation } from '@/lib/domain/purchasing/po-cancellation'
+import {
+  assertPurchaseOrderCancellationHasNoInvoices,
+  reversePurchaseOrderCostLayersForCancellation,
+} from '@/lib/domain/purchasing/po-cancellation'
 
 type CostLayerRow = {
   id: string
@@ -226,5 +229,13 @@ test('reversePurchaseOrderCostLayersForCancellation rejects reserved stock that 
       poLineIds: ['po-line-1'],
     }),
     /stock is reserved and cannot be reversed automatically/,
+  )
+})
+
+test('assertPurchaseOrderCancellationHasNoInvoices rejects billed purchase orders', () => {
+  assert.doesNotThrow(() => assertPurchaseOrderCancellationHasNoInvoices(0))
+  assert.throws(
+    () => assertPurchaseOrderCancellationHasNoInvoices(1),
+    /Cannot cancel a purchase order after supplier invoices have been recorded/,
   )
 })
