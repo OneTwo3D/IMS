@@ -344,6 +344,29 @@ function createClient(state: State): RefundServiceClient {
   return client as unknown as RefundServiceClient
 }
 
+function findReturnCostLayer(state: State) {
+  const returnLayer = state.costLayers.find((layer) => layer.id.startsWith('return-layer-'))
+  assert.ok(returnLayer, 'expected return cost layer to be created')
+  return returnLayer
+}
+
+function findCogsReversalSync(result: Awaited<ReturnType<typeof createSalesOrderRefund>>) {
+  if (!result.success) {
+    assert.fail(result.error)
+  }
+  const sync = result.accountingSyncs.find((entry) => entry.type === 'COGS_REVERSAL')
+  assert.ok(sync, 'expected COGS_REVERSAL sync')
+  return sync
+}
+
+function findCogsReversalInventoryLine(result: Awaited<ReturnType<typeof createSalesOrderRefund>>) {
+  const sync = findCogsReversalSync(result)
+  const payload = sync.payload as { lines?: Array<{ accountCode?: string; debit?: number; credit?: number }> }
+  const inventoryLine = payload.lines?.find((line) => line.accountCode === accountingSettings.inventoryAccount)
+  assert.ok(inventoryLine, 'expected COGS reversal inventory debit line')
+  return inventoryLine
+}
+
 test('createSalesOrderRefund creates a partial refund record', async () => {
   const state = baseState()
   const result = await createSalesOrderRefund(createClient(state), {
@@ -623,8 +646,173 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   assert.equal(state.movements[0].referenceId, 'refund-1')
   assert.equal(state.movements[0].idempotencyKey, 'RETURN_INBOUND:refund:refund-1:line:refund-line-1')
   assert.equal(state.stockLevels[0].quantity, 1)
-  assert.equal(state.costLayers[1].unitCostBase, 10)
+  assert.equal(findReturnCostLayer(state).unitCostBase, 10)
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
+})
+
+test('createSalesOrderRefund uses current cost layer cost after landed cost revaluation', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 12 }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Customer return after revaluation',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
+    costLayerId: 'layer-1',
+    qty: 1,
+    unitCostBase: 12,
+    shipmentLineId: 'shipment-line-1',
+    orderAllocationId: undefined,
+    source: 'shipment',
+  }])
+  assert.equal(
+    findReturnCostLayer(state).unitCostBase,
+    12,
+    'return layer should be valued at the refreshed cost, not the shipment snapshot',
+  )
+  assert.equal(findCogsReversalInventoryLine(result).debit, 12)
+})
+
+test('createSalesOrderRefund uses decreased current cost layer cost after landed cost revaluation', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 8 }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Customer return after supplier credit',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
+    costLayerId: 'layer-1',
+    qty: 1,
+    unitCostBase: 8,
+    shipmentLineId: 'shipment-line-1',
+    orderAllocationId: undefined,
+    source: 'shipment',
+  }])
+  assert.equal(
+    findReturnCostLayer(state).unitCostBase,
+    8,
+    'return layer should follow downward landed-cost revaluation',
+  )
+  assert.equal(findCogsReversalInventoryLine(result).debit, 8)
+})
+
+test('createSalesOrderRefund falls back to shipment snapshot cost when cost layer no longer exists', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: 2, unitCostBase: 10 }],
+      }],
+    }],
+    costLayers: [],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Customer return after layer cleanup',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
+    costLayerId: 'layer-1',
+    qty: 1,
+    unitCostBase: 10,
+    shipmentLineId: 'shipment-line-1',
+    orderAllocationId: undefined,
+    source: 'shipment',
+  }])
+  assert.equal(findCogsReversalInventoryLine(result).debit, 10)
 })
 
 test('createSalesOrderRefund clears accounting deferral dates for full refunds', async () => {
