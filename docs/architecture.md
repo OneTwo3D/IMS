@@ -62,6 +62,9 @@
 | `scripts/` | Installation and maintenance scripts |
 | `UPLOAD_STORAGE_DIR` / `PUBLIC_UPLOAD_STORAGE_DIR` | Env-configured persistent upload roots for private invoice PDFs, public branding assets, and avatar assets |
 
+Migration rollout rules for schema changes are documented in
+`docs/migration-conventions.md`. New migrations should follow those patterns
+before changing required columns, constraints, indexes, renames, or drops.
 
 ## Request Flow
 

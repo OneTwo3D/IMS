@@ -99,6 +99,10 @@ without a migration plan for historical landed-cost adjustment keys.
 
 ## Schema Workflow
 
+See `docs/migration-conventions.md` for the required rollout patterns for
+`NOT NULL` add-columns, `NOT VALID` constraints, column renames, large-table
+indexes, and column drops.
+
 When changing the schema:
 
 1. Update `prisma/schema.prisma`.
