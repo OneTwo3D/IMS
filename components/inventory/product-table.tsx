@@ -210,6 +210,8 @@ export function ProductTable({ products, total, page, pageSize, searchParams }: 
         return p.parentSku ?? '—'
       case 'barcode':
         return p.barcode ?? '—'
+      case 'mpn':
+        return p.mpn ?? '—'
       case 'dimensions': {
         const parts = [p.widthCm, p.heightCm, p.depthCm].filter(Boolean)
         return parts.length === 3 ? `${p.widthCm}×${p.heightCm}×${p.depthCm} cm` : '—'

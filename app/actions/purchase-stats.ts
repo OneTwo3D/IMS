@@ -14,6 +14,7 @@ export type PurchaseProductRow = {
   type: string
   stockUnit: string
   barcode: string | null
+  mpn: string | null
   supplierName: string | null
   qtyOrdered: number
   qtyReceived: number
@@ -44,7 +45,7 @@ export async function getPurchaseProductStats(dateFrom?: string, dateTo?: string
         select: {
           productId: true, qty: true, qtyReceived: true, qtyReturned: true,
           totalBase: true, landedUnitCostBase: true,
-          product: { select: { sku: true, name: true, type: true, stockUnit: true, barcode: true } },
+          product: { select: { sku: true, name: true, type: true, stockUnit: true, barcode: true, mpn: true } },
         },
       },
     },
@@ -60,7 +61,7 @@ export async function getPurchaseProductStats(dateFrom?: string, dateTo?: string
       if (!map.has(pid)) {
         map.set(pid, {
           productId: pid, sku: l.product.sku, name: l.product.name,
-          type: l.product.type, stockUnit: l.product.stockUnit, barcode: l.product.barcode,
+          type: l.product.type, stockUnit: l.product.stockUnit, barcode: l.product.barcode, mpn: l.product.mpn,
           supplierName: po.supplier.name,
           qtyOrdered: 0, qtyReceived: 0, qtyReturned: 0, netQty: 0,
           totalBase: 0, landedCostBase: 0, avgUnitCostBase: 0,
@@ -322,6 +323,7 @@ export type PurchaseDetailRow = {
   sku: string
   productName: string
   barcode: string | null
+  mpn: string | null
   type: string
   status: string
   supplierName: string
@@ -344,7 +346,7 @@ export async function getPurchaseDetails(dateFrom?: string, dateTo?: string): Pr
     select: {
       id: true, reference: true, status: true, currency: true, createdAt: true,
       supplier: { select: { name: true } },
-      lines: { select: { productId: true, qty: true, unitCostForeign: true, totalForeign: true, totalBase: true, product: { select: { sku: true, name: true, barcode: true, type: true } } } },
+      lines: { select: { productId: true, qty: true, unitCostForeign: true, totalForeign: true, totalBase: true, product: { select: { sku: true, name: true, barcode: true, mpn: true, type: true } } } },
     },
     orderBy: { createdAt: 'desc' },
   })
@@ -354,7 +356,7 @@ export async function getPurchaseDetails(dateFrom?: string, dateTo?: string): Pr
     for (const l of po.lines) {
       rows.push({
         poId: po.id, reference: po.reference, lineProductId: l.productId,
-        sku: l.product.sku, productName: l.product.name, barcode: l.product.barcode,
+        sku: l.product.sku, productName: l.product.name, barcode: l.product.barcode, mpn: l.product.mpn,
         type: l.product.type, status: po.status, supplierName: po.supplier.name,
         currency: po.currency, qty: Number(l.qty),
         unitCostForeign: Number(l.unitCostForeign), totalForeign: Number(l.totalForeign),

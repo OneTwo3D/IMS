@@ -45,6 +45,7 @@ const ONHAND_FIELDS: FieldDef[] = [
   { key: 'name', label: 'Product Name', type: 'text' },
   { key: 'type', label: 'Product Type', type: 'select', options: ['SIMPLE', 'VARIANT', 'KIT', 'BOM'] },
   { key: 'barcode', label: 'Barcode', type: 'text' },
+  { key: 'mpn', label: 'MPN', type: 'text' },
   { key: 'warehouseCode', label: 'Warehouse', type: 'text' },
   { key: 'lifecycleStatus', label: 'Status', type: 'select', options: ['ACTIVE', 'NOT_FOR_SALE', 'ARCHIVED'] },
   { key: 'quantity', label: 'Quantity', type: 'number' },
@@ -98,7 +99,7 @@ const TAB_FIELDS: Record<Tab, FieldDef[]> = {
 }
 
 const DEFAULT_COLS: Record<Tab, string[]> = {
-  onhand: ['sku', 'name', 'type', 'warehouseCode', 'quantity', 'reservedQty', 'available', 'inventoryValue', 'stockUnit'],
+  onhand: ['sku', 'name', 'type', 'barcode', 'mpn', 'warehouseCode', 'quantity', 'reservedQty', 'available', 'inventoryValue', 'stockUnit'],
   movements: ['type', 'sku', 'productName', 'fromWarehouse', 'toWarehouse', 'qty', 'unitCostBase', 'totalValueBase', 'note', 'createdAt'],
   allocations: ['sku', 'productName', 'warehouseCode', 'totalStock', 'reservedQty', 'available', 'pendingOrders'],
   reorder: ['sku', 'name', 'currentStock', 'availableStock', 'reorderPoint', 'shortfall', 'avgDailyDemand', 'daysUntilStockout', 'supplierName'],
@@ -267,6 +268,7 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
     name: { label: 'Name', align: 'left', render: (r) => <span className="text-xs truncate max-w-32 block">{r.name}</span> },
     type: { label: 'Type', align: 'left', render: (r) => <span className="text-xs">{r.type}</span> },
     barcode: { label: 'Barcode', align: 'left', render: (r) => <span className="text-xs font-mono">{r.barcode ?? '—'}</span> },
+    mpn: { label: 'MPN', align: 'left', render: (r) => <span className="text-xs font-mono">{r.mpn ?? '—'}</span> },
     warehouseCode: { label: 'Warehouse', align: 'left', render: (r) => <span className="text-xs font-medium">{r.warehouseCode}</span> },
     lifecycleStatus: { label: 'Status', align: 'left', render: (r) => <span className="text-xs">{r.lifecycleStatus}</span> },
     stockUnit: { label: 'Unit', align: 'left', render: (r) => <span className="text-xs">{r.stockUnit}</span> },

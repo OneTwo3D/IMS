@@ -15,6 +15,7 @@ export type StockOnHandRow = {
   type: string
   stockUnit: string
   barcode: string | null
+  mpn: string | null
   lifecycleStatus: ProductLifecycleStatus
   warehouseCode: string
   warehouseName: string
@@ -28,7 +29,7 @@ export async function getStockOnHand(): Promise<StockOnHandRow[]> {
   await requirePermission('analytics')
   const levels = await db.stockLevel.findMany({
     include: {
-      product: { select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, lifecycleStatus: true } },
+      product: { select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, mpn: true, lifecycleStatus: true } },
       warehouse: { select: { code: true, name: true } },
     },
     orderBy: [{ product: { sku: 'asc' } }, { warehouse: { code: 'asc' } }],
@@ -52,6 +53,7 @@ export async function getStockOnHand(): Promise<StockOnHandRow[]> {
     type: l.product.type,
     stockUnit: l.product.stockUnit,
     barcode: l.product.barcode,
+    mpn: l.product.mpn,
     lifecycleStatus: l.product.lifecycleStatus,
     warehouseCode: l.warehouse.code,
     warehouseName: l.warehouse.name,

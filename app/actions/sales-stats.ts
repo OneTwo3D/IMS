@@ -19,6 +19,7 @@ export type SalesStatRow = {
   type: string
   stockUnit: string
   barcode: string | null
+  mpn: string | null
   lifecycleStatus: ProductLifecycleStatus
   currentStock: number
   reservedQty: number
@@ -72,7 +73,7 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
   })
 
   const products = await db.product.findMany({
-    select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, weight: true, salesPriceBase: true, lifecycleStatus: true,
+    select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, mpn: true, weight: true, salesPriceBase: true, lifecycleStatus: true,
       stockLevels: { select: { quantity: true, reservedQty: true } } },
   })
   const productInfo = new Map(products.map((p) => [p.id, p]))
@@ -87,6 +88,7 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
         productMap.set(pid, {
           productId: pid, sku: info?.sku ?? line.sku ?? '', name: info?.name ?? line.description,
           type: info?.type ?? 'SIMPLE', stockUnit: info?.stockUnit ?? 'pcs', barcode: info?.barcode ?? null,
+          mpn: info?.mpn ?? null,
           lifecycleStatus: info?.lifecycleStatus ?? 'ACTIVE',
           currentStock: info?.stockLevels.reduce((s, sl) => s + Number(sl.quantity), 0) ?? 0,
           reservedQty: info?.stockLevels.reduce((s, sl) => s + Number(sl.reservedQty), 0) ?? 0,
@@ -157,6 +159,7 @@ export type ShipmentRow = {
   productName: string
   productId: string | null
   barcode: string | null
+  mpn: string | null
   customerName: string
   salesRep: string | null
   shippedAt: string
@@ -178,7 +181,7 @@ export async function getShipments(dateFrom?: string, dateTo?: string): Promise<
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, customerName: true, salesRep: true, shippedAt: true,
       trackingNumber: true, shippingService: true, shipFromWarehouse: { select: { code: true } },
-      lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true, product: { select: { barcode: true } } } },
+      lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true, product: { select: { barcode: true, mpn: true } } } },
     },
     orderBy: { shippedAt: 'desc' },
   })
@@ -189,7 +192,7 @@ export async function getShipments(dateFrom?: string, dateTo?: string): Promise<
       rows.push({
         orderId: o.id, orderNumber: getSalesOrderReference(o),
         shipmentNumber: o.trackingNumber, sku: l.sku ?? '', productName: l.description,
-        productId: l.productId, barcode: l.product?.barcode ?? null,
+        productId: l.productId, barcode: l.product?.barcode ?? null, mpn: l.product?.mpn ?? null,
         customerName: o.customerName ?? '—', salesRep: o.salesRep,
         shippedAt: o.shippedAt!.toISOString(), shippingService: o.shippingService,
         trackingNumber: o.trackingNumber, warehouse: o.shipFromWarehouse?.code ?? null,
@@ -211,6 +214,7 @@ export type DetailRow = {
   sku: string
   productName: string
   barcode: string | null
+  mpn: string | null
   type: string | null
   customerName: string
   customerEmail: string | null
@@ -231,7 +235,7 @@ export async function getDetails(dateFrom?: string, dateTo?: string): Promise<De
     where: Object.keys(dateFilter).length ? { createdAt: dateFilter } : undefined,
     select: {
       id: true, orderNumber: true, externalOrderNumber: true, status: true, customerName: true, customerEmail: true, salesRep: true, createdAt: true,
-      lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true, product: { select: { barcode: true, type: true } } } },
+      lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true, product: { select: { barcode: true, mpn: true, type: true } } } },
     },
     orderBy: { createdAt: 'desc' },
   })
@@ -242,7 +246,7 @@ export async function getDetails(dateFrom?: string, dateTo?: string): Promise<De
       rows.push({
         orderId: o.id, orderNumber: getSalesOrderReference(o),
         productId: l.productId, sku: l.sku ?? '', productName: l.description,
-        barcode: l.product?.barcode ?? null, type: l.product?.type ?? null,
+        barcode: l.product?.barcode ?? null, mpn: l.product?.mpn ?? null, type: l.product?.type ?? null,
         customerName: o.customerName ?? '—', customerEmail: o.customerEmail,
         salesRep: o.salesRep, status: o.status,
         qty: Number(l.qty), totalBase: Number(l.totalBase), createdAt: o.createdAt.toISOString(),

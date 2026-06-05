@@ -140,14 +140,15 @@ async function generatePurchaseOrderPreview(branding: Branding) {
 
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
-    { label: 'SKU', width: 70 },
-    { label: 'Product', width: 150 },
-    { label: 'Barcode / EAN', width: 90 },
-    { label: 'Qty', width: 50, align: 'right' },
-    { label: 'Unit Price', width: 55, align: 'right' },
-    { label: 'Total', width: 55, align: 'right' },
+    { label: 'SKU', width: 65 },
+    { label: 'Product', width: 135 },
+    { label: 'Barcode / EAN', width: 75 },
+    { label: 'MPN', width: 70 },
+    { label: 'Qty', width: 45, align: 'right' },
+    { label: 'Unit Price', width: 50, align: 'right' },
+    { label: 'Total', width: 50, align: 'right' },
   ]
-  const rows = SAMPLE_LINES.map((l, i) => [String(i + 1), l.sku, l.name, '501234567890' + i, String(l.qty), `£${l.price.toFixed(2)}`, `£${(l.qty * l.price).toFixed(2)}`])
+  const rows = SAMPLE_LINES.map((l, i) => [String(i + 1), l.sku, l.name, '501234567890' + i, `MPN-${l.sku}`, String(l.qty), `£${l.price.toFixed(2)}`, `£${(l.qty * l.price).toFixed(2)}`])
   drawTable(doc, columns, rows, branding)
 
   drawTemplateNotes(doc, tpl, 'footer')
@@ -172,14 +173,15 @@ async function generateRfqPreview(branding: Branding) {
   doc.y += 12
 
   const columns: PdfTableColumn[] = [
-    { label: '#', width: 30, align: 'right' },
-    { label: 'SKU', width: 80 },
-    { label: 'Product', width: 170 },
-    { label: 'Barcode / EAN', width: 95 },
-    { label: 'Quantity', width: 65, align: 'right' },
-    { label: 'Unit', width: 55, align: 'right' },
+    { label: '#', width: 25, align: 'right' },
+    { label: 'SKU', width: 70 },
+    { label: 'Product', width: 140 },
+    { label: 'Barcode / EAN', width: 75 },
+    { label: 'MPN', width: 75 },
+    { label: 'Quantity', width: 60, align: 'right' },
+    { label: 'Unit', width: 45, align: 'right' },
   ]
-  const rows = SAMPLE_LINES.map((l, i) => [String(i + 1), l.sku, l.name, '501234567890' + i, String(l.qty), 'pcs'])
+  const rows = SAMPLE_LINES.map((l, i) => [String(i + 1), l.sku, l.name, '501234567890' + i, `MPN-${l.sku}`, String(l.qty), 'pcs'])
   drawTable(doc, columns, rows, branding)
 
   drawTemplateNotes(doc, tpl, 'footer')
@@ -275,13 +277,14 @@ async function generateManufacturingOrderPreview(branding: Branding) {
 
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
-    { label: 'SKU', width: 80 },
-    { label: 'Component', width: 180 },
-    { label: 'Barcode / EAN', width: 90 },
-    { label: 'Per Unit', width: 55, align: 'right' },
-    { label: 'Total Qty', width: 65, align: 'right' },
+    { label: 'SKU', width: 70 },
+    { label: 'Component', width: 145 },
+    { label: 'Barcode / EAN', width: 75 },
+    { label: 'MPN', width: 75 },
+    { label: 'Per Unit', width: 50, align: 'right' },
+    { label: 'Total Qty', width: 50, align: 'right' },
   ]
-  const rows = SAMPLE_LINES.slice(0, 3).map((l, i) => [String(i + 1), l.sku, l.name, '501234567890' + i, '2', String(2 * 50)])
+  const rows = SAMPLE_LINES.slice(0, 3).map((l, i) => [String(i + 1), l.sku, l.name, '501234567890' + i, `MPN-${l.sku}`, '2', String(2 * 50)])
   drawTable(doc, columns, rows, branding)
 
   drawTemplateNotes(doc, tpl, 'footer')

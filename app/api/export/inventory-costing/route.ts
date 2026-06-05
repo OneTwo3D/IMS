@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import { csvBufferedStreamResponse } from '@/lib/csv'
+import { db } from '@/lib/db'
 import {
   getCogsReport,
   getInventoryTurnoverReport,
@@ -13,6 +14,16 @@ import {
   type InventoryCostingReportType,
 } from '@/lib/domain/inventory/inventory-costing-reports'
 import { inventoryCostingApiAccessDenied } from '@/lib/security/inventory-costing-access'
+
+async function loadMpnByProductId(productIds: Array<string | null | undefined>): Promise<Map<string, string>> {
+  const ids = Array.from(new Set(productIds.filter((id): id is string => Boolean(id))))
+  if (ids.length === 0) return new Map()
+  const products = await db.product.findMany({
+    where: { id: { in: ids } },
+    select: { id: true, mpn: true },
+  })
+  return new Map(products.map((product) => [product.id, product.mpn ?? '']))
+}
 
 export async function GET(req: NextRequest) {
   const session = await requireApiAuth()
@@ -32,9 +43,11 @@ export async function GET(req: NextRequest) {
       const report = await getInventoryValuationReport(filters, { paginate: false })
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)
       if (tooLarge) return tooLarge
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
         asOf: report.asOf,
         sku: row.sku,
+        mpn: mpnByProductId.get(row.productId) ?? '',
         productName: row.productName,
         categoryName: row.categoryName ?? '',
         supplierNames: row.supplierNames.join('; '),
@@ -50,19 +63,21 @@ export async function GET(req: NextRequest) {
         valueReplayReliable: report.valueReplayReliable,
         generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['asOf', 'sku', 'productName', 'categoryName', 'supplierNames', 'warehouseCode', 'warehouseName', 'qty', 'stockUnit', 'unitCostBase', 'totalValueBase', 'glBalanceBase', 'glVarianceBase', 'source', 'valueReplayReliable', 'generatedAt'], `inventory-valuation-${date}.csv`)
+      return csvBufferedStreamResponse(rows, ['asOf', 'sku', 'mpn', 'productName', 'categoryName', 'supplierNames', 'warehouseCode', 'warehouseName', 'qty', 'stockUnit', 'unitCostBase', 'totalValueBase', 'glBalanceBase', 'glVarianceBase', 'source', 'valueReplayReliable', 'generatedAt'], `inventory-valuation-${date}.csv`)
     }
 
     case 'cogs': {
       const report = await getCogsReport(filters, { paginate: false })
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)
       if (tooLarge) return tooLarge
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
         dateFrom: report.dateFrom,
         dateTo: report.dateTo,
         groupBy: report.groupBy,
         groupLabel: row.groupLabel,
         sku: row.sku ?? '',
+        mpn: row.productId ? (mpnByProductId.get(row.productId) ?? '') : '',
         categoryName: row.categoryName ?? '',
         warehouseCode: row.warehouseCode ?? '',
         customerName: row.customerName ?? '',
@@ -76,13 +91,14 @@ export async function GET(req: NextRequest) {
         revenueCaptured: row.revenueCaptured,
         generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['dateFrom', 'dateTo', 'groupBy', 'groupLabel', 'sku', 'categoryName', 'warehouseCode', 'customerName', 'channel', 'qty', 'cogsBase', 'revenueBase', 'grossMarginBase', 'grossMarginPct', 'movementCount', 'revenueCaptured', 'generatedAt'], `cogs-${date}.csv`)
+      return csvBufferedStreamResponse(rows, ['dateFrom', 'dateTo', 'groupBy', 'groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'customerName', 'channel', 'qty', 'cogsBase', 'revenueBase', 'grossMarginBase', 'grossMarginPct', 'movementCount', 'revenueCaptured', 'generatedAt'], `cogs-${date}.csv`)
     }
 
     case 'landed-cost': {
       const report = await getLandedCostReport(filters, { paginate: false })
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)
       if (tooLarge) return tooLarge
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
         dateFrom: report.dateFrom,
         dateTo: report.dateTo,
@@ -90,6 +106,7 @@ export async function GET(req: NextRequest) {
         supplierName: row.supplierName,
         status: row.status,
         sku: row.sku,
+        mpn: mpnByProductId.get(row.productId) ?? '',
         productName: row.productName,
         categoryName: row.categoryName ?? '',
         qty: row.qty,
@@ -103,7 +120,7 @@ export async function GET(req: NextRequest) {
         revaluationCount: row.revaluationCount,
         generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['dateFrom', 'dateTo', 'poReference', 'supplierName', 'status', 'sku', 'productName', 'categoryName', 'qty', 'goodsUnitCostBase', 'landedUnitCostBase', 'landedUpliftUnitBase', 'landedUpliftPct', 'goodsValueBase', 'landedValueBase', 'landedCostMethod', 'revaluationCount', 'generatedAt'], `landed-cost-${date}.csv`)
+      return csvBufferedStreamResponse(rows, ['dateFrom', 'dateTo', 'poReference', 'supplierName', 'status', 'sku', 'mpn', 'productName', 'categoryName', 'qty', 'goodsUnitCostBase', 'landedUnitCostBase', 'landedUpliftUnitBase', 'landedUpliftPct', 'goodsValueBase', 'landedValueBase', 'landedCostMethod', 'revaluationCount', 'generatedAt'], `landed-cost-${date}.csv`)
     }
 
     case 'inventory-turnover': {
@@ -116,9 +133,11 @@ export async function GET(req: NextRequest) {
       }
       const tooLarge = exportTooLarge(report.pageInfo.totalRows)
       if (tooLarge) return tooLarge
+      const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
         groupLabel: row.groupLabel,
         sku: row.sku ?? '',
+        mpn: row.productId ? (mpnByProductId.get(row.productId) ?? '') : '',
         categoryName: row.categoryName ?? '',
         warehouseCode: row.warehouseCode ?? '',
         supplierName: row.supplierName ?? '',
@@ -129,7 +148,7 @@ export async function GET(req: NextRequest) {
         cogsEntryCount: row.cogsEntryCount,
         snapshotDayCount: row.snapshotDayCount,
       }))
-      return csvBufferedStreamResponse(rows, ['groupLabel', 'sku', 'categoryName', 'warehouseCode', 'supplierName', 'cogsBase', 'averageInventoryValueBase', 'turnoverRatio', 'daysInventoryOutstanding', 'cogsEntryCount', 'snapshotDayCount'], `inventory-turnover-${date}.csv`)
+      return csvBufferedStreamResponse(rows, ['groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'supplierName', 'cogsBase', 'averageInventoryValueBase', 'turnoverRatio', 'daysInventoryOutstanding', 'cogsEntryCount', 'snapshotDayCount'], `inventory-turnover-${date}.csv`)
     }
   }
 }

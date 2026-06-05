@@ -1065,6 +1065,7 @@ export type ManufacturingOrderDetail = {
   productSku: string
   productName: string
   productBarcode: string | null
+  productMpn: string | null
   productImageUrl: string | null
   warehouseId: string
   warehouseName: string
@@ -1086,6 +1087,7 @@ export type ManufacturingOrderDetail = {
     componentSku: string
     componentName: string
     componentBarcode: string | null
+    componentMpn: string | null
     componentImageUrl: string | null
     qtyPerUnit: number
     requiredQty: number
@@ -1121,13 +1123,14 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
           sku: true,
           name: true,
           barcode: true,
+          mpn: true,
           imageUrl: true,
           parent: { select: { imageUrl: true } },
           productComponents: {
             select: {
               componentId: true,
               qty: true,
-              component: { select: { sku: true, name: true, barcode: true, imageUrl: true, parent: { select: { imageUrl: true } } } },
+              component: { select: { sku: true, name: true, barcode: true, mpn: true, imageUrl: true, parent: { select: { imageUrl: true } } } },
             },
             orderBy: { sortOrder: 'asc' },
           },
@@ -1166,6 +1169,7 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
     productSku: o.outputProduct.sku,
     productName: o.outputProduct.name,
     productBarcode: o.outputProduct.barcode,
+    productMpn: o.outputProduct.mpn,
     productImageUrl: o.outputProduct.imageUrl ?? o.outputProduct.parent?.imageUrl ?? null,
     warehouseId: o.warehouse.id,
     warehouseName: o.warehouse.name,
@@ -1194,6 +1198,7 @@ export async function getManufacturingOrder(id: string): Promise<ManufacturingOr
         componentSku: c.component.sku,
         componentName: c.component.name,
         componentBarcode: c.component.barcode,
+        componentMpn: c.component.mpn,
         componentImageUrl: c.component.imageUrl ?? c.component.parent?.imageUrl ?? null,
         qtyPerUnit,
         requiredQty,

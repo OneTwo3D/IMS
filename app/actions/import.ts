@@ -219,7 +219,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
 
   // Build parent lookup: sku → id
   const allProducts = await db.product.findMany({
-    select: { id: true, sku: true, barcode: true, type: true, parentId: true, categoryId: true, lifecycleStatus: true },
+    select: { id: true, sku: true, barcode: true, mpn: true, type: true, parentId: true, categoryId: true, lifecycleStatus: true },
   })
   const skuToId = new Map(allProducts.map((p) => [p.sku, p.id]))
   const productById = new Map(allProducts.map((p) => [p.id, p]))
@@ -322,6 +322,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
 
       try {
         const barcode = hasCsvValue(row, 'barcode') ? row['barcode']!.trim() : undefined
+        const mpn = hasCsvValue(row, 'mpn', 'MPN') ? readCsvValue(row, 'mpn', 'MPN').trim() : undefined
       if (barcode) {
         const barcodeOwner = barcodeToId.get(barcode)
         if (barcodeOwner && barcodeOwner !== existingId) {
@@ -338,6 +339,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
         if (rawType) updateData.type = type as ProductType
         if (parentProductId || parentSku) updateData.parentId = parentId
         if (barcode) updateData.barcode = barcode
+        if (mpn !== undefined) updateData.mpn = mpn
         if (hasCsvValue(row, 'weight')) updateData.weight = row['weight']!.trim()
         if (hasCsvValue(row, 'widthCm', 'widthcm')) updateData.widthCm = readCsvValue(row, 'widthCm', 'widthcm').trim()
         if (hasCsvValue(row, 'heightCm', 'heightcm')) updateData.heightCm = readCsvValue(row, 'heightCm', 'heightcm').trim()
@@ -422,6 +424,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           ...existingProduct,
           sku,
           barcode: barcode ?? previousBarcode,
+          mpn: mpn ?? existingProduct.mpn,
           type: ((updateData.type as ProductType | undefined) ?? existingProduct.type),
           parentId: structureValidation.normalizedParentId,
           categoryId: effectiveCategoryId,
@@ -437,6 +440,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           type: type as ProductType,
           parentId,
           barcode: barcode ?? null,
+          mpn: mpn ?? null,
           weight: hasCsvValue(row, 'weight') ? row['weight']!.trim() : null,
           widthCm: hasCsvValue(row, 'widthCm', 'widthcm') ? readCsvValue(row, 'widthCm', 'widthcm').trim() : null,
           heightCm: hasCsvValue(row, 'heightCm', 'heightcm') ? readCsvValue(row, 'heightCm', 'heightcm').trim() : null,
@@ -480,6 +484,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
               id: `preview-product:${sku}`,
               sku,
               barcode: barcode ?? null,
+              mpn: mpn ?? null,
               type: createData.type,
               parentId: structureValidation.normalizedParentId,
               categoryId: await resolveImportedCategoryId(categoryName),
@@ -505,6 +510,7 @@ export async function importProductsCsv(formData: FormData): Promise<CsvImportAc
           id: created.id,
           sku: created.sku,
           barcode: created.barcode,
+          mpn: created.mpn,
           type: created.type,
           parentId: created.parentId,
           categoryId: created.categoryId,

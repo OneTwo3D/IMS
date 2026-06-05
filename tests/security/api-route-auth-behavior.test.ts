@@ -789,7 +789,7 @@ test('supplier RFQ route allows own RFQ PDFs and rejects foreign RFQs', async ()
           qty: '2.5',
           purchaseUnitQty: '1.0',
           purchaseUnit: { abbreviation: 'case', stockUnitName: 'pcs' },
-          product: { sku: 'SKU-001', name: 'Fixture Product', barcode: '1234567890123' },
+          product: { sku: 'SKU-001', name: 'Fixture Product', barcode: '1234567890123', mpn: 'MPN-SKU-001' },
         }],
       }
     },
