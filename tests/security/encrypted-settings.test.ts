@@ -98,6 +98,16 @@ test('encrypted settings keep legacy plaintext readable and require a key for ne
   })
 })
 
+test('encrypted settings reject non-32-byte key shapes instead of deriving fallback keys', () => {
+  withEnv({ SETTINGS_ENCRYPTION_KEY: 'not-32-bytes-but-long-enough-to-hash', ENCRYPTION_KEY: undefined }, () => {
+    assert.equal(hasSettingsEncryptionKey(), false)
+    assert.throws(
+      () => encryptSettingValue(SETTINGS_KEY, 'super-secret'),
+      /SETTINGS_ENCRYPTION_KEY is required/,
+    )
+  })
+})
+
 test('encrypted settings can read legacy enc:v1 values with the legacy key fallback', () => {
   withEnv({ SETTINGS_ENCRYPTION_KEY: undefined, ENCRYPTION_KEY: LEGACY_KEY_BASE64 }, () => {
     const legacyEncrypted = encryptSecret('legacy-secret')

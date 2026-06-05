@@ -1,15 +1,20 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { verifyCron } from '../../lib/cron-auth.ts'
+import {
+  assertProductionCronSecretConfigured,
+  verifyCron,
+} from '../../lib/cron-auth.ts'
+import { register } from '../../instrumentation.ts'
+
+const STRONG_CRON_SECRET = 'cron-secret-value-with-at-least-32-chars'
 
 type CronEnv = {
-  ALLOW_LOCALHOST_CRON_BYPASS?: string
   CRON_SECRET?: string
   NODE_ENV?: string
 }
 
-const ENV_KEYS = ['ALLOW_LOCALHOST_CRON_BYPASS', 'CRON_SECRET', 'NODE_ENV'] as const
+const ENV_KEYS = ['CRON_SECRET', 'NODE_ENV'] as const
 
 async function withCronEnv(env: CronEnv, fn: () => Promise<void>): Promise<void> {
   const mutableEnv = process.env as Record<string, string | undefined>
@@ -49,6 +54,43 @@ function cronRequestWithoutHostHeader(url: string): Request {
   return new Request(url)
 }
 
+test('production boot fails fast when cron secret is unset or blank', () => {
+  assert.throws(
+    () => assertProductionCronSecretConfigured({ NODE_ENV: 'production', CRON_SECRET: undefined }),
+    /CRON_SECRET is required in production/,
+  )
+  assert.throws(
+    () => assertProductionCronSecretConfigured({ NODE_ENV: 'production', CRON_SECRET: '' }),
+    /CRON_SECRET is required in production/,
+  )
+  assert.throws(
+    () => assertProductionCronSecretConfigured({ NODE_ENV: 'production', CRON_SECRET: '   ' }),
+    /CRON_SECRET is required in production/,
+  )
+})
+
+test('production boot fails fast when cron secret is too short', () => {
+  assert.throws(
+    () => assertProductionCronSecretConfigured({ NODE_ENV: 'production', CRON_SECRET: 'short-secret' }),
+    /CRON_SECRET must be at least 32 characters/,
+  )
+})
+
+test('instrumentation register enforces the production cron secret guard', async () => {
+  await withCronEnv({ NODE_ENV: 'production' }, async () => {
+    await assert.rejects(register(), /CRON_SECRET is required in production/)
+  })
+})
+
+test('cron secret boot guard allows non-production localhost development', () => {
+  assert.doesNotThrow(() => assertProductionCronSecretConfigured({ NODE_ENV: 'test', CRON_SECRET: undefined }))
+  assert.doesNotThrow(() => assertProductionCronSecretConfigured({ NODE_ENV: 'development', CRON_SECRET: '' }))
+})
+
+test('cron secret boot guard accepts configured production secret', () => {
+  assert.doesNotThrow(() => assertProductionCronSecretConfigured({ NODE_ENV: 'production', CRON_SECRET: STRONG_CRON_SECRET }))
+})
+
 test('valid cron secret is accepted', async () => {
   await withCronEnv({ CRON_SECRET: 'secret-token', NODE_ENV: 'production' }, async () => {
     const response = await verifyCron(cronRequest('ims.example.com', 'Bearer secret-token'))
@@ -84,28 +126,6 @@ test('localhost cron request is accepted outside production', async () => {
 test('localhost cron request is rejected in production by default', async () => {
   await withCronEnv({ NODE_ENV: 'production' }, async () => {
     const response = await verifyCron(cronRequest('localhost:3000'))
-
-    assert.equal(response?.status, 401)
-  })
-})
-
-test('localhost cron request is accepted in production with explicit override', async () => {
-  await withCronEnv({
-    ALLOW_LOCALHOST_CRON_BYPASS: 'true',
-    NODE_ENV: 'production',
-  }, async () => {
-    const response = await verifyCron(cronRequest('127.0.0.1:3000'))
-
-    assert.equal(response, null)
-  })
-})
-
-test('production localhost override does not allow non-localhost requests', async () => {
-  await withCronEnv({
-    ALLOW_LOCALHOST_CRON_BYPASS: 'true',
-    NODE_ENV: 'production',
-  }, async () => {
-    const response = await verifyCron(cronRequest('ims.example.com'))
 
     assert.equal(response?.status, 401)
   })

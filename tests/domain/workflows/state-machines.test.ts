@@ -124,6 +124,7 @@ test('purchase order state machine includes manual, receipt, return, and cancel 
   assert.equal(canTransitionPurchaseOrder('DRAFT', 'CANCELLED'), true)
   assert.equal(canTransitionPurchaseOrder('PO_SENT', 'PARTIALLY_RECEIVED'), true)
   assert.equal(canTransitionPurchaseOrder('PARTIALLY_RECEIVED', 'RECEIVED'), true)
+  assert.equal(canTransitionPurchaseOrder('PARTIALLY_RECEIVED', 'CANCELLED'), true)
   assert.equal(canTransitionPurchaseOrder('RECEIVED', 'INVOICED'), true)
   assert.equal(canTransitionPurchaseOrder('RECEIVED', 'PARTIALLY_RETURNED'), true)
   assert.equal(canTransitionPurchaseOrder('DRAFT', 'RECEIVED'), false)

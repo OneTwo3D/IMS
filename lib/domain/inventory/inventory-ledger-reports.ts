@@ -16,6 +16,7 @@ const STOCK_COUNT_STATUSES = new Set(Object.values(StockCountStatus))
 const OUTBOUND_MOVEMENT_TYPES = new Set<StockMovementType>([
   'SALE_DISPATCH',
   'TRANSFER_OUT',
+  'PURCHASE_REVERSAL',
   'PRODUCTION_OUT',
   'KIT_ASSEMBLY_OUT',
 ])

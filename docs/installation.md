@@ -197,7 +197,7 @@ Scheduled tasks are configured automatically:
 | Every 5 min | `/api/cron/mintsoft-webhook-sweeper` | Drain persisted Mintsoft ASN booked-in webhook events |
 | 06:00 | `/api/cron/fx-rates` | Fetch latest exchange rates from frankfurter.dev |
 
-All cron jobs run under the `imsapp` user and call the application's API endpoints via `curl`. Cron endpoints require the `CRON_SECRET` bearer header in production. Installer-generated crontab entries read only the `CRON_SECRET=` line from the protected `${APP_DIR}/.env` file at runtime so the cron secret is not embedded directly in the crontab and unrelated environment values are not shell-sourced. Localhost bypass is available outside production only when no `CRON_SECRET` is configured; in production it is disabled unless `CRON_SECRET` is unset and `ALLOW_LOCALHOST_CRON_BYPASS=true` is set explicitly.
+All cron jobs run under the `imsapp` user and call the application's API endpoints via `curl`. Cron endpoints require the `CRON_SECRET` bearer header in production, and production startup fails fast if `CRON_SECRET` is unset, blank, or shorter than 32 characters. Installer-generated crontab entries read only the `CRON_SECRET=` line from the protected `${APP_DIR}/.env` file at runtime so the cron secret is not embedded directly in the crontab and unrelated environment values are not shell-sourced. Localhost bypass is available outside production only when no `CRON_SECRET` is configured; production never accepts localhost cron requests without the bearer header. Rotating `CRON_SECRET` requires updating both `.env` and any external cron scheduler invocations in the same maintenance window because the application reads the environment value on restart.
 
 For WooCommerce specifically:
 
@@ -277,8 +277,8 @@ Key variables in the `.env` file:
 | `AUTH_SECRET` | Secret key for signing session tokens (auto-generated) |
 | `INVOICE_PDF_TOKEN_TTL_SECONDS` | Lifetime for public signed invoice PDF download links. Default `259200` (3 days), maximum `2592000` (30 days). Lower values reduce leaked-link exposure; higher values reduce customer "link expired" friction. |
 | `INVOICE_PDF_STORAGE_DIR` | Persistent storage directory for connector-downloaded invoice PDFs served through signed links. Defaults locally to `./data/invoices`; required by production preflight. Relative paths resolve against the process working directory, so production values should be absolute |
-| `SETTINGS_ENCRYPTION_KEY` | Key used to encrypt sensitive Setting values stored in the database (auto-generated) |
-| `ENCRYPTION_KEY` | Legacy fallback for older installs; keep set to the same value during migration if existing `enc:v1` secrets are present |
+| `SETTINGS_ENCRYPTION_KEY` | 32-byte raw key, or base64 value that decodes to 32 bytes, used to encrypt sensitive Setting values stored in the database (auto-generated) |
+| `ENCRYPTION_KEY` | Legacy fallback for older installs; if needed during migration, it must also be a 32-byte raw key or base64 value that decodes to 32 bytes |
 | `AUTH_URL` | Authentication callback URL (same as app URL) |
 | `DATABASE_URL` | PostgreSQL connection string |
 | `PREFLIGHT_DB_CONNECT` | Optional production preflight database connectivity probe. Set `true` during rollout when the preflight process can reach Postgres; default `false` for build-only CI jobs |
@@ -312,8 +312,7 @@ Key variables in the `.env` file:
 | `FILE_SCAN_NAME` | Optional stable scanner identifier stored in audit metadata; defaults to a short hash of the configured command |
 | `FILE_SCAN_ENV_ALLOWLIST` | Comma-separated environment variables inherited by the scanner process |
 | `FILE_SCAN_TIMEOUT_MS` | Scan command timeout in milliseconds (default: `30000`; raise for large PDFs or busy scanners) |
-| `CRON_SECRET` | Shared secret for authenticating cron endpoint requests |
-| `ALLOW_LOCALHOST_CRON_BYPASS` | Set to `true` only if production cron requests must be allowed from localhost without the bearer header and `CRON_SECRET` is unset; default is `false` |
+| `CRON_SECRET` | Shared secret for authenticating cron endpoint requests; production requires at least 32 characters |
 | `REQUIRE_TRUSTED_PROXY_CONFIG` | Set to `true` on proxied production deployments so preflight fails when `TRUSTED_PROXY_IPS` / `TRUSTED_PROXY_CIDRS` are empty |
 | `INVARIANT_CHECK_PAGE_SIZE` | Optional page size for the scheduled invariant check inventory SQL collector. Default `500`; raise temporarily only for production triage. |
 | `INVARIANT_CHECK_MAX_FINDINGS` | Optional maximum inventory invariant findings collected by the scheduled invariant check. Default `5000`; when the cap is hit, the report adds a critical truncation finding. |
@@ -324,7 +323,7 @@ Key variables in the `.env` file:
 
 ### Settings Encryption Key Rotation
 
-Sensitive connector settings are stored as AES-256-GCM ciphertext when `SETTINGS_ENCRYPTION_KEY` is configured. Current Setting-table ciphertexts use the `enc:setting:v1:` prefix and are authenticated against the setting key, so a ciphertext copied from one setting cannot be replayed into another setting. Existing plaintext settings remain readable and are lazily rewritten in encrypted form when read or saved. Older `enc:v1` values encrypted with `ENCRYPTION_KEY` also remain readable while that legacy fallback is set.
+Sensitive connector settings are stored as AES-256-GCM ciphertext when `SETTINGS_ENCRYPTION_KEY` is configured. The key must be exactly 32 raw bytes, or a base64 value that decodes to 32 bytes; ad-hoc strings are rejected rather than hashed into fallback keys. Current Setting-table ciphertexts use the `enc:setting:v1:` prefix and are authenticated against the setting key, so a ciphertext copied from one setting cannot be replayed into another setting. Existing plaintext settings remain readable and are lazily rewritten in encrypted form when read or saved. Older `enc:v1` values encrypted with `ENCRYPTION_KEY` also remain readable while that legacy fallback is set, but `ENCRYPTION_KEY` must follow the same 32-byte key-shape rule. If an existing install ever used an ad-hoc legacy key, follow `docs/encryption-key-migration.md` before deploying a strict key-shape build.
 
 Run a one-shot migration after deploying the key to avoid waiting for low-traffic settings to be read:
 

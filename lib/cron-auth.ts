@@ -1,10 +1,27 @@
+import { timingSafeEqual } from 'crypto'
 import { NextResponse } from 'next/server'
 import { getCronSecret } from '@/lib/cron-secret'
 
+export const MIN_CRON_SECRET_LENGTH = 32
+
+export function assertProductionCronSecretConfigured(
+  env: Partial<Record<'NODE_ENV' | 'CRON_SECRET', string | undefined>> = process.env,
+): void {
+  if (env.NODE_ENV !== 'production') return
+
+  const secret = env.CRON_SECRET?.trim() ?? ''
+  if (secret.length === 0) {
+    throw new Error('CRON_SECRET is required in production for cron endpoint authentication.')
+  }
+  if (secret.length < MIN_CRON_SECRET_LENGTH) {
+    throw new Error(`CRON_SECRET must be at least ${MIN_CRON_SECRET_LENGTH} characters in production.`)
+  }
+}
+
 /**
  * Verify cron requests via the configured cron secret.
- * Localhost bypass is allowed outside production, or in production only when
- * ALLOW_LOCALHOST_CRON_BYPASS=true, but only when CRON_SECRET is not configured.
+ * Localhost bypass is allowed outside production only when CRON_SECRET is not
+ * configured. Production cron endpoints always require the bearer secret.
  * Host and URL are used for the localhost check; x-forwarded-for is spoofable
  * and must not be trusted for cron auth.
  * Usage: const err = await verifyCron(request); if (err) return err;
@@ -14,7 +31,7 @@ export async function verifyCron(request: Request): Promise<NextResponse | null>
 
   if (secret) {
     const auth = request.headers.get('authorization')
-    if (auth === `Bearer ${secret}`) return null
+    if (auth && bearerMatches(auth, `Bearer ${secret}`)) return null
 
     return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
   }
@@ -39,9 +56,14 @@ export async function verifyCron(request: Request): Promise<NextResponse | null>
   return null
 }
 
+function bearerMatches(provided: string, expected: string): boolean {
+  const providedBytes = Buffer.from(provided)
+  const expectedBytes = Buffer.from(expected)
+  return providedBytes.length === expectedBytes.length && timingSafeEqual(providedBytes, expectedBytes)
+}
+
 export function isLocalhostCronBypassAllowed(): boolean {
-  return process.env.NODE_ENV !== 'production' ||
-    process.env.ALLOW_LOCALHOST_CRON_BYPASS === 'true'
+  return process.env.NODE_ENV !== 'production'
 }
 
 function isLocalhostCronRequest(request: Request): boolean {

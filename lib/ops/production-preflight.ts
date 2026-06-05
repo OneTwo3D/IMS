@@ -87,16 +87,15 @@ function checkSettingsEncryptionKey(checks: PreflightCheck[], env: Env): void {
       add(checks, 'pass', 'settings-encryption-key', 'SETTINGS_ENCRYPTION_KEY', 'Settings encryption key is configured as a 32-byte base64 key.')
       return
     }
-    add(checks, 'warn', 'settings-encryption-key', 'SETTINGS_ENCRYPTION_KEY', 'Settings encryption key looks like base64 but does not decode to 32 bytes; use openssl rand -base64 32 for new installs.')
+    add(checks, 'fail', 'settings-encryption-key', 'SETTINGS_ENCRYPTION_KEY', 'Settings encryption key looks like base64 but does not decode to 32 bytes; use openssl rand -base64 32.')
     return
   }
 
   if (value.length >= 32) {
-    add(checks, 'warn', 'settings-encryption-key', 'SETTINGS_ENCRYPTION_KEY', 'Settings encryption key will use the legacy sha256 derivation fallback; prefer a 32-byte base64 key.')
-    return
+    add(checks, 'fail', 'settings-encryption-key', 'SETTINGS_ENCRYPTION_KEY', 'Settings encryption key must be exactly 32 raw bytes or base64 that decodes to 32 bytes.')
+  } else {
+    add(checks, 'fail', 'settings-encryption-key', 'SETTINGS_ENCRYPTION_KEY', 'Settings encryption key is too short.')
   }
-
-  add(checks, 'fail', 'settings-encryption-key', 'SETTINGS_ENCRYPTION_KEY', 'Settings encryption key is too short.')
 }
 
 function parseRequiredUrl(checks: PreflightCheck[], env: Env, name: string): URL | null {

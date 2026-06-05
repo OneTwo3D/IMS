@@ -1,4 +1,4 @@
-import { createCipheriv, createDecipheriv, createHash, randomBytes } from 'crypto'
+import { createCipheriv, createDecipheriv, randomBytes } from 'crypto'
 
 const ENCRYPTED_PREFIX = 'enc:v1:'
 const IV_LENGTH = 12
@@ -20,9 +20,7 @@ function resolveEncryptionKey(): Buffer | null {
   const utf8 = Buffer.from(trimmed, 'utf8')
   if (utf8.length === 32) return utf8
 
-  // Allow deterministic migration from older ad-hoc keys without silently
-  // truncating. This still yields a 32-byte AES-256 key.
-  return createHash('sha256').update(trimmed).digest()
+  return null
 }
 
 export function isEncryptedValue(value: string | null | undefined): value is string {

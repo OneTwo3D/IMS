@@ -16,7 +16,7 @@ import {
   loadFulfillmentProductGraph,
 } from '@/lib/products/kit-fulfillment'
 import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
-import { toDecimal } from '@/lib/domain/math/decimal'
+import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import {
   allocateSalesOrder,
   applyAllocationReservationDelta,
@@ -390,17 +390,18 @@ export async function updateAllocation(
         select: { productId: true, warehouseId: true, quantity: true, reservedQty: true },
       })
       const stockMap = buildAvailableStockMap(stockLevels).get(alloc.productId) ?? new Map()
-      const effectiveAvailable = (stockMap.get(newWarehouseId)?.toNumber() ?? 0)
-        + (alloc.warehouseId === newWarehouseId ? Number(alloc.qty) : 0)
+      const requestedQty = toDecimal(newQty)
+      const effectiveAvailable = (stockMap.get(newWarehouseId) ?? toDecimal(0))
+        .add(alloc.warehouseId === newWarehouseId ? toDecimal(alloc.qty) : toDecimal(0))
 
-      if (newQty > effectiveAvailable) {
-        throw new Error(`Only ${effectiveAvailable} available in this warehouse`)
+      if (requestedQty.gt(effectiveAvailable)) {
+        throw new Error(`Only ${roundQuantity(effectiveAvailable, 4).toString()} available in this warehouse`)
       }
 
       await applyAllocationReservationDelta(tx, [{
         productId: alloc.productId,
         warehouseId: alloc.warehouseId,
-        qty: Number(alloc.qty),
+        qty: alloc.qty,
       }], 'release')
 
       if (newQty === 0) {
@@ -419,20 +420,20 @@ export async function updateAllocation(
         if (mergeTarget && mergeTarget.id !== allocationId) {
           await tx.orderAllocation.update({
             where: { id: mergeTarget.id },
-            data: { qty: Number(mergeTarget.qty) + newQty },
+            data: { qty: toDecimal(mergeTarget.qty).add(requestedQty) },
           })
           await tx.orderAllocation.delete({ where: { id: allocationId } })
         } else {
           await tx.orderAllocation.update({
             where: { id: allocationId },
-            data: { warehouseId: newWarehouseId, qty: newQty },
+            data: { warehouseId: newWarehouseId, qty: requestedQty },
           })
         }
 
         await applyAllocationReservationDelta(tx, [{
           productId: alloc.productId,
           warehouseId: newWarehouseId,
-          qty: newQty,
+          qty: requestedQty,
         }], 'reserve')
       }
 
