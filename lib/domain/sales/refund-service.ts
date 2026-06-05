@@ -140,7 +140,7 @@ function aggregateRefundReturnRows(
     // Key by refundLineId when present so same-product refund lines keep
     // distinct movement keys; legacy callers without line ids retain the old
     // product-level aggregation behavior.
-    const aggregateKey = row.refundLineId ? `${row.productId}:${row.refundLineId}` : row.productId
+    const aggregateKey = refundReturnAggregateKey(row)
     const existing = aggregated.get(aggregateKey)
     if (existing) {
       if (Number.isFinite(existing.unitCostBase) && Number.isFinite(row.unitCostBase)) {
@@ -158,6 +158,10 @@ function aggregateRefundReturnRows(
   }
 
   return [...aggregated.values()]
+}
+
+function refundReturnAggregateKey(row: Pick<RefundReturnRow, 'productId' | 'refundLineId'>): string {
+  return row.refundLineId ? `${row.productId}:${row.refundLineId}` : row.productId
 }
 
 async function getExistingCreditNoteNumberMax(
@@ -372,6 +376,15 @@ export async function applyReturnInboundStockTx(
     }))
   }
 
+  const rowsByAggregateKey = new Map<string, RefundReturnRow[]>()
+  for (const row of params.rows) {
+    if (!row.productId || !Number.isFinite(row.qty) || row.qty <= 0) continue
+    const key = refundReturnAggregateKey(row)
+    const rows = rowsByAggregateKey.get(key) ?? []
+    rows.push(row)
+    rowsByAggregateKey.set(key, rows)
+  }
+
   for (const row of aggregatedRows) {
     const idempotencyKey = row.refundLineId && params.referenceType === 'SalesOrderRefund'
       ? refundInboundMovementKey({
@@ -380,32 +393,80 @@ export async function applyReturnInboundStockTx(
         })
       : undefined
     try {
-      await tx.stockMovement.create({
-        data: {
-          type: 'RETURN_INBOUND',
-          productId: row.productId,
-          toWarehouseId: params.warehouseId,
-          qty: row.qty,
-          ...buildStockMovementValueFields({ qty: row.qty, unitCostBase: row.unitCostBase ?? 0 }),
-          note: params.note,
-          referenceType: params.referenceType,
-          referenceId: params.referenceId,
-          ...(idempotencyKey ? { idempotencyKey } : {}),
-        },
+      await createReturnInboundMovementAndCostLayersTx(tx, {
+        movementRow: row,
+        costLayerRows: rowsByAggregateKey.get(refundReturnAggregateKey(row)) ?? [],
+        warehouseId: params.warehouseId,
+        note: params.note,
+        referenceType: params.referenceType,
+        referenceId: params.referenceId,
+        idempotencyKey,
       })
     } catch (error) {
       if (!isStockMovementIdempotencyConflict(error)) throw error
       continue
     }
-
-    await tx.stockLevel.upsert({
-      where: { productId_warehouseId: { productId: row.productId, warehouseId: params.warehouseId } },
-      create: { productId: row.productId, warehouseId: params.warehouseId, quantity: row.qty, reservedQty: 0 },
-      update: { quantity: { increment: row.qty } },
-    })
   }
 
-  for (const row of params.rows) {
+  const returnedProducts = await tx.product.findMany({
+    where: { id: { in: aggregatedRows.map((row) => row.productId) } },
+    select: { id: true, sku: true },
+  })
+  const skuByProductId = new Map(returnedProducts.map((product) => [product.id, product.sku]))
+
+  return aggregatedRows.map((row) => ({
+    productId: row.productId,
+    sku: skuByProductId.get(row.productId) ?? row.productId,
+    qty: row.qty,
+  }))
+}
+
+async function createReturnInboundMovementAndCostLayersTx(
+  tx: Prisma.TransactionClient,
+  params: {
+    movementRow: RefundReturnRow
+    costLayerRows: RefundReturnRow[]
+    warehouseId: string
+    note: string
+    referenceType: string
+    referenceId: string
+    idempotencyKey?: string
+  },
+): Promise<void> {
+  await tx.stockMovement.create({
+    data: {
+      type: 'RETURN_INBOUND',
+      productId: params.movementRow.productId,
+      toWarehouseId: params.warehouseId,
+      qty: params.movementRow.qty,
+      ...buildStockMovementValueFields({
+        qty: params.movementRow.qty,
+        unitCostBase: params.movementRow.unitCostBase ?? 0,
+      }),
+      note: params.note,
+      referenceType: params.referenceType,
+      referenceId: params.referenceId,
+      ...(params.idempotencyKey ? { idempotencyKey: params.idempotencyKey } : {}),
+    },
+  })
+
+  await tx.stockLevel.upsert({
+    where: {
+      productId_warehouseId: {
+        productId: params.movementRow.productId,
+        warehouseId: params.warehouseId,
+      },
+    },
+    create: {
+      productId: params.movementRow.productId,
+      warehouseId: params.warehouseId,
+      quantity: params.movementRow.qty,
+      reservedQty: 0,
+    },
+    update: { quantity: { increment: params.movementRow.qty } },
+  })
+
+  for (const row of params.costLayerRows) {
     if (!Number.isFinite(row.unitCostBase) || row.unitCostBase == null || row.qty <= 0) continue
     const newLayer = await tx.costLayer.create({
       data: {
@@ -422,18 +483,6 @@ export async function applyReturnInboundStockTx(
       await copyCostLayerSourceLinesProportionally(tx, row.sourceCostLayerId, newLayer.id, row.qty)
     }
   }
-
-  const returnedProducts = await tx.product.findMany({
-    where: { id: { in: aggregatedRows.map((row) => row.productId) } },
-    select: { id: true, sku: true },
-  })
-  const skuByProductId = new Map(returnedProducts.map((product) => [product.id, product.sku]))
-
-  return aggregatedRows.map((row) => ({
-    productId: row.productId,
-    sku: skuByProductId.get(row.productId) ?? row.productId,
-    qty: row.qty,
-  }))
 }
 
 function consumeRefundLineQuantity(

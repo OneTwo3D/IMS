@@ -761,6 +761,38 @@ test('createSalesOrderRefund keeps same-product refund lines as distinct inbound
   assert.equal(state.stockLevels[0].quantity, 2)
 })
 
+test('applyReturnInboundStockTx does not create return cost layers on movement idempotency conflict', async () => {
+  const state = baseState({
+    movements: [{
+      productId: 'product-1',
+      qty: 1,
+      referenceType: 'SalesOrderRefund',
+      referenceId: 'other-refund',
+      idempotencyKey: 'RETURN_INBOUND:refund:refund-1:line:refund-line-1',
+    }],
+  })
+
+  const result = await applyReturnInboundStockTx(createClient(state) as Prisma.TransactionClient, {
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    warehouseId: 'warehouse-returns',
+    rows: [{
+      productId: 'product-1',
+      qty: 1,
+      refundLineId: 'refund-line-1',
+      unitCostBase: 10,
+      poLineId: 'po-line-1',
+      sourceCostLayerId: 'source-layer-1',
+    }],
+    note: 'Refund return',
+  })
+
+  assert.deepEqual(result, [{ productId: 'product-1', sku: 'PRODUCT-1', qty: 1 }])
+  assert.equal(state.movements.length, 1)
+  assert.equal(state.stockLevels.length, 0)
+  assert.equal(state.costLayers.length, 0)
+})
+
 test('retrySalesOrderRefundAccounting replays persisted syncs after full refund clears deferral dates', async () => {
   const persistedSyncs = [{
     type: 'COGS_REVERSAL' as const,
