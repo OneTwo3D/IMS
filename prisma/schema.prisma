@@ -517,6 +517,8 @@ model Warehouse {
   wmsStockDiscrepancies WmsStockDiscrepancy[]  @relation("WmsStockDiscrepancyWarehouse")
   wmsReturnsInbox       WmsReturnsInbox[]      @relation("WmsReturnsInboxWarehouse")
 
+  @@index([code(ops: raw("gin_trgm_ops"))], type: Gin, map: "warehouses_code_trgm_idx")
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "warehouses_name_trgm_idx")
   @@map("warehouses")
 }
 
@@ -623,6 +625,8 @@ model Product {
 
   @@index([parentId])
   @@index([categoryId])
+  @@index([sku(ops: raw("gin_trgm_ops"))], type: Gin, map: "products_sku_trgm_idx")
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "products_name_trgm_idx")
   @@map("products")
 }
 
@@ -643,6 +647,7 @@ model ProductCategory {
   updatedAt      DateTime          @updatedAt
 
   @@index([parentId])
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "product_categories_name_trgm_idx")
   @@map("product_categories")
 }
 
@@ -798,6 +803,9 @@ model StockMovement {
   @@index([productId, createdAt])
   @@index([type, createdAt])
   @@index([referenceType, referenceId])
+  @@index([referenceType(ops: raw("gin_trgm_ops"))], type: Gin, map: "stock_movements_reference_type_trgm_idx")
+  @@index([referenceId(ops: raw("gin_trgm_ops"))], type: Gin, map: "stock_movements_reference_id_trgm_idx")
+  @@index([note(ops: raw("gin_trgm_ops"))], type: Gin, map: "stock_movements_note_trgm_idx")
   @@map("stock_movements")
 }
 
@@ -927,6 +935,7 @@ model Supplier {
   productionOrders ProductionOrder[]
   users           User[]
 
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "suppliers_name_trgm_idx")
   @@map("suppliers")
 }
 
@@ -1468,6 +1477,7 @@ model StockTransfer {
 
   @@index([fromWarehouseId])
   @@index([toWarehouseId])
+  @@index([reference(ops: raw("gin_trgm_ops"))], type: Gin, map: "stock_transfers_reference_trgm_idx")
   @@map("stock_transfers")
 }
 
@@ -1520,6 +1530,7 @@ model StockCountLine {
 
   @@index([countId])
   @@index([productId])
+  @@index([sku(ops: raw("gin_trgm_ops"))], type: Gin, map: "stock_count_lines_sku_trgm_idx")
   @@map("stock_count_lines")
 }
 
