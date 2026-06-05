@@ -8,8 +8,10 @@ on:
       - "docs/development.md"
       - "package.json"
       - "prisma/**"
+      - "scripts/validate-db.sh"
       - "scripts/check-prisma-drift.mjs"
       - "scripts/check-prisma-schema-scope.mjs"
+      - "tests/concurrency/**"
       - "scripts/deploy.sh"
       - "scripts/install.sh"
       - "scripts/update.sh"
@@ -22,8 +24,10 @@ on:
       - "docs/development.md"
       - "package.json"
       - "prisma/**"
+      - "scripts/validate-db.sh"
       - "scripts/check-prisma-drift.mjs"
       - "scripts/check-prisma-schema-scope.mjs"
+      - "tests/concurrency/**"
       - "scripts/deploy.sh"
       - "scripts/install.sh"
       - "scripts/update.sh"
@@ -71,3 +75,5 @@ jobs:
       - run: npx prisma migrate deploy --schema prisma/schema.prisma
       - name: Verify deployed database matches prisma/schema.prisma
         run: node scripts/check-prisma-drift.mjs
+      - name: Run DB-backed concurrency regressions
+        run: npm run test:concurrency
