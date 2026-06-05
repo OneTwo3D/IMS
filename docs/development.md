@@ -99,6 +99,10 @@ without a migration plan for historical landed-cost adjustment keys.
 
 ## Schema Workflow
 
+See `docs/migration-conventions.md` for the required rollout patterns for
+`NOT NULL` add-columns, `NOT VALID` constraints, column renames, large-table
+indexes, and column drops.
+
 When changing the schema:
 
 1. Update `prisma/schema.prisma`.
@@ -106,6 +110,19 @@ When changing the schema:
 3. If you must hand-edit migration SQL, keep `prisma/schema.prisma` aligned in the same PR.
 4. If you add a database feature Prisma cannot model directly, isolate it in a dedicated manual migration and add an allowlist entry to `prisma/unsupported-schema-drift-allowlist.json`.
 5. Run the drift check against a migrated database before merging.
+
+Migrations are append-only once merged. Do not edit an applied historical migration for a live or data-bearing environment; ship a follow-up migration instead. If a not-live remediation intentionally edits a historical migration, document the checksum impact in the PR and migration comment. Ephemeral development databases should be reset or recreated and migrated from scratch. Data-bearing development or staging databases need an explicit recovery plan after DBA review, because manually changing `_prisma_migrations.checksum` or marking migrations resolved can mask real drift if done incorrectly.
+
+For large or live tables, avoid unbounded backfills followed by immediate `ALTER COLUMN ... SET NOT NULL` unless the deployment has an explicit maintenance window and row-count estimate. Prefer:
+
+1. Add the new nullable column or nullable state.
+2. Backfill in bounded batches where practical.
+3. Add a `CHECK (<column> IS NOT NULL) NOT VALID` constraint.
+4. Run `VALIDATE CONSTRAINT` after the backfill has completed.
+5. Set the column `NOT NULL` using the validated constraint as evidence.
+6. Drop the temporary check constraint when the real `NOT NULL` is in place.
+
+Historical migrations in not-live installs may use the simpler blocking form when the PR explains why the table size and environment make that acceptable.
 
 Recommended local commands:
 

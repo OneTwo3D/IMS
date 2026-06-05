@@ -29,6 +29,7 @@ import {
   type RefundAccountingSyncRequest,
   type RefundRequestLine,
 } from '@/lib/domain/sales/refund-service'
+import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -1607,13 +1608,17 @@ export async function createRefund(
 
     return { success: true, warning: accountingWarning }
   } catch (e) {
-    if (
-      options?.externalRefundId &&
-      typeof e === 'object' &&
-      e !== null &&
-      'code' in e &&
-      (e as { code?: string }).code === 'P2002'
-    ) {
+    if (options?.externalRefundId && isExternalRefundIdUniqueConflict(e)) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'refund_create_deduped',
+        tag: 'sales',
+        level: 'INFO',
+        description: `Refund creation deduped on external refund id ${options.externalRefundId}`,
+        metadata: { externalRefundId: options.externalRefundId },
+        resolveUser: false,
+      })
       return { success: true }
     }
     await logActivity({

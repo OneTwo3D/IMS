@@ -1229,7 +1229,7 @@ test('inventory row collection excludes fully refunded orders from shipped COGS 
       { qty: { lt: 0 } },
       { unitCostBase: { not: null } },
       { totalValueBase: { not: null } },
-      { type: { in: ['PURCHASE_RECEIPT', 'PRODUCTION_IN', 'SALE_DISPATCH', 'PRODUCTION_OUT', 'ADJUSTMENT'] } },
+      { type: { in: ['PURCHASE_RECEIPT', 'PRODUCTION_IN', 'SALE_DISPATCH', 'PURCHASE_REVERSAL', 'PRODUCTION_OUT', 'ADJUSTMENT'] } },
     ],
   })
 })

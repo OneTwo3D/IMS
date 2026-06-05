@@ -3,7 +3,7 @@
 Migration `20260602103000_stock_movement_reporting_guarantees` installs DB-native guarantees that Prisma cannot express:
 
 - `stock_movements_reporting_value_consistent` requires `unitCostBase` and `totalValueBase` to be either both null or both populated, and requires populated totals to equal `ROUND(qty * unitCostBase, 6)`.
-- `stock_movements_reporting_evidence_guard` is a deferred constraint trigger. At commit time it requires inbound `PURCHASE_RECEIPT`, `PRODUCTION_IN`, and inbound `ADJUSTMENT` movements to have cost-layer evidence, and outbound `SALE_DISPATCH`, `PRODUCTION_OUT`, and outbound `ADJUSTMENT` movements to have COGS evidence.
+- `stock_movements_reporting_evidence_guard` is a deferred constraint trigger. At commit time it requires inbound `PURCHASE_RECEIPT`, `PRODUCTION_IN`, and inbound `ADJUSTMENT` movements to have cost-layer evidence, and outbound `SALE_DISPATCH`, `PURCHASE_REVERSAL`, `PRODUCTION_OUT`, and outbound `ADJUSTMENT` movements to have COGS evidence.
 
 ## Deploy Recovery
 

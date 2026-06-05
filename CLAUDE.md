@@ -572,6 +572,7 @@ See `.env.example` for complete list and additional settings.
 **Database migrations:**
 - Migrations are applied during `npm run build` via `prisma migrate deploy` in postinstall hook
 - Always review schema.prisma changes before deployment
+- Follow `docs/migration-conventions.md` for NOT NULL add-columns, NOT VALID constraints, column renames, large-table indexes, and column drops
 - Test migrations on staging first
 
 See `@docs/deployment.md` for full deployment guide including backups, monitoring, and rollback procedures.

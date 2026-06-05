@@ -1,56 +1,115 @@
 # Analytics & Reports
 
-The analytics section provides detailed reporting across sales, purchasing, inventory, and demand forecasting. All reports share a common set of features for exploring and exporting your data.
+The analytics section provides operational and finance reporting across stock, purchasing, sales, replenishment, accounting, and manufacturing. Report access depends on role and report family; users only see reports they are allowed to open.
 
 ## Common Report Features
 
-Every report in the system supports:
+Most current reports provide:
 
-- **Search** — filter results by typing keywords
-- **Column visibility** — toggle which columns are shown or hidden
-- **Filter** — apply advanced filters to narrow results
-- **Sort** — click column headers to sort ascending or descending
-- **Save view** — save your current filter, sort, and column configuration for quick access later
-- **CSV export** — download the current view as a CSV file for use in spreadsheets or other tools
+- **Date or as-of filters** where the report has a period or historical view
+- **Warehouse, category, supplier, product type, or status filters** where relevant
+- **Pagination** with selectable row counts
+- **Summary tiles** for report-level totals
+- **CSV export** for the filtered result set
+- **Drill-through links** to source products, orders, shipments, purchase orders, or production orders where the source document is available
 
-## Sales Statistics
+Large exports are capped. If an export or report says the source set is too large, narrow the filters and try again.
 
-Sales statistics are organised into six tabs, each offering a different perspective on your sales data:
+## Stock Position Reports
 
-| Tab | What It Shows |
+| Report | What it shows |
 |---|---|
-| **Products** | Sales performance broken down by product — units sold, revenue, and trends |
-| **Shipments** | Dispatch and delivery data across your orders |
-| **Invoices** | Invoice totals, payment status, and ageing |
-| **Refunds** | Refund volumes, values, and affected products |
-| **Customer Aging** | Outstanding balances grouped by customer and age band |
-| **Details** | Granular line-level data for all sales transactions |
+| **Stock on Hand** | Current or as-of stock quantity, reserved quantity, available quantity, unit cost, total value, and reservation evidence. |
+| **Inventory Aging** | FIFO cost-layer quantity and value by age bucket. BOM products age from their production layers; KIT rows use component-based semantics when filtered to KIT. |
+| **Dead Stock** | Current positive-stock SKUs with no recent sales-dispatch demand inside the selected threshold. Recent never-sold SKUs can be treated separately from dead stock. |
+| **Stock Allocations** | Reserved stock by source, including sales, manufacturing, and unattributed reservation drift. |
+| **Negative Stock** | Current negative stock rows and products that went negative during the selected movement window. |
 
-## Purchase Statistics
+Warehouse users can access the stock-position report family. Broader analytics roles can access the full analytics menu.
 
-Purchase statistics provide tabs for analysing your purchase orders, including supplier spend, lead times, and order volumes. Use these reports to identify your most active suppliers and spot trends in procurement costs.
+## Inventory Ledger and Costing
 
-## Inventory Report
+| Report | What it shows |
+|---|---|
+| **Stock Movement Ledger** | Full movement history with opening and closing quantity/value reconciliation. |
+| **Stock Adjustments** | Adjustment movements grouped by reason, product, user, and value impact. |
+| **Stock Transfers** | Transfer dispatch, receipt, in-transit, overdue, and drift evidence. |
+| **Stock Counts** | Stocktake/count variance, book versus counted quantity/value, and resulting adjustment links. |
+| **Inventory Valuation** | IMS stock value by product, category, warehouse, and as-of date. When accounting balance snapshots exist, the report shows GL variance. |
+| **COGS Report** | COGS from `CogsEntry` rows, with revenue and gross margin where sales-order-line links are available. |
+| **Landed Cost Analysis** | Purchase-order landed cost uplift, allocation method, revaluation run evidence, and effective unit cost impact. |
+| **Inventory Turnover** | Sales-dispatch COGS divided by observed average inventory value from daily snapshots. |
 
-The inventory report gives you a snapshot of your current stock position:
+Inventory valuation and COGS only show accounting variance when matching account-balance snapshots have been ingested from the accounting connector. Missing snapshots are shown as explicit notices rather than inferred balances.
 
-- **Stock on hand** — current quantities across all warehouses
-- **Movements** — a log of all stock ins, outs, adjustments, and transfers
-- **Allocations** — stock currently reserved against open sales or manufacturing orders
+## Inventory Health and Demand Planning
 
-## Reorder Forecast
+| Report | What it shows |
+|---|---|
+| **Velocity Rankings** | Top and bottom movers by sales velocity over the selected window. |
+| **ABC Analysis** | Pareto classification by COGS or revenue contribution. |
+| **Reorder Planning** | Suggested reorder quantity using reorder point, reorder quantity, safety stock, supplier lead time, sales velocity, available stock, and inbound open purchase orders. |
+| **Backorders** | Non-cancelled sales-order demand not covered by committed shipments or allocations, with expected inbound quantity and projected fill date. |
+| **Component Shortages** | BOM component demand from draft and in-progress production orders compared with available plus inbound stock. |
 
-The reorder forecast uses historical demand data to suggest which products need reordering and when. Each product row includes a thumbnail image for quick visual identification.
+Reorder suggestions are never negative. They are planning guidance and should be reviewed before creating supplier documents.
 
-Use this report to:
+## Sales and Fulfillment Analytics
 
-- Identify products approaching low stock levels
-- Plan purchase orders based on projected demand
-- Avoid stockouts by acting on reorder suggestions early
+| Report | What it shows |
+|---|---|
+| **Sales Analytics** | Sales totals by product, category, customer, or channel. Cancelled orders are excluded. |
+| **Customer Mix** | Revenue, gross profit, AR exposure, and concentration by customer. |
+| **Gross Margin** | Product margin using posted COGS entries rather than recalculating FIFO. |
+| **Returns** | Refund and return activity by SKU, customer, and reason, with same-period shipment context. |
+| **Fulfillment KPIs** | Shipment-based fulfillment timing, fill rate, partial shipment rate, and late shipment evidence. |
+| **Throughput** | Shipment status activity by user and queue depth for picking, packing, and shipping work. |
 
-### Training Data
+## Purchasing and Supplier Analytics
 
-To improve forecast accuracy, you can import historical sales data:
+| Report | What it shows |
+|---|---|
+| **Open POs** | Purchase orders not fully received, including expected dates, overdue flag, outstanding quantity/value, supplier, and days since sent. |
+| **Supplier Performance** | On-time delivery, received-versus-ordered quantity variance, actual lead time, and supplier-level performance. |
+| **Purchase Price Variance** | Actual received cost compared with the prior received PO line for the same supplier/SKU. |
+| **Spend** | Received purchase-order spend by supplier, category, and month. |
+| **Lead Times** | Actual receipt lead-time distribution and P50/P95 metrics that feed reorder planning when supplier lead time is missing. |
+
+## Finance Period-End Analytics
+
+| Report | What it shows |
+|---|---|
+| **VAT** | Output VAT by tax rate and jurisdiction for invoiced, non-cancelled sales orders. |
+| **AR Aging** | Outstanding sales-order balances by customer and aging bucket. |
+| **AP Aging** | Outstanding purchase-invoice balances by supplier and aging bucket. |
+| **FX Gain/Loss** | Booked versus settlement FX delta for multi-currency transactions using IMS FX-rate semantics. |
+
+Finance period-end reports are limited to finance and admin roles.
+
+## Manufacturing Analytics
+
+| Report | What it shows |
+|---|---|
+| **Production Variance** | Planned BOM component demand versus actual `PRODUCTION_OUT` consumption for assembly production orders. Positive variance is labelled **over-consumed**, not scrap, because the cause may be scrap, substitution, BOM drift, or intentional yield padding. Date filters apply to completion date. |
+| **WIP** | Current in-progress production orders, posted consumed component value, manufacturing cost-line totals, combined WIP value, expected output value, and decimal days since start. WIP is a current-state report and does not apply date filters. |
+
+WIP value combines components already consumed into production with labour/overhead cost lines. Production variance over-consumed value is averaged across the consumed movement value; use FIFO cost entries for layer-exact costing analysis.
+
+## Legacy Analytics Pages
+
+Some legacy analytics pages remain available for continuity:
+
+- **Sales Statistics**
+- **Purchase Statistics**
+- **Product Profitability**
+- **Inventory Report**
+- **Reorder Forecast**
+
+New report families under `/analytics/*` are the preferred source for production-readiness reporting because they expose clearer provenance, RBAC, CSV exports, and reconciliation notices.
+
+## Training Data for Forecasting
+
+Historical demand can still be imported for forecasting:
 
 - **WooCommerce import** — bulk import past WooCommerce orders by date range. A progress indicator shows real-time import status including pages processed and orders imported.
-- **CSV import** — upload a CSV file of historical sales data for products not covered by WooCommerce.
+- **CSV import** — upload historical sales data for products not covered by WooCommerce.
