@@ -740,6 +740,12 @@ async function stageRefundAccountingReversals(
     const refreshSnapshotCosts = (entries: CostLayerSnapshotEntry[]): CostLayerSnapshotEntry[] => (
       entries.map((entry) => ({
         ...entry,
+        // Shipment/allocation snapshots prove which layer and quantity were
+        // consumed. Refund valuation refreshes to the current layer cost so
+        // returned stock matches its carrying value. Trade-off: if landed-cost
+        // revaluation ran after shipment, reversed COGS differs from the
+        // originally posted COGS by the revaluation delta; revisit if finance
+        // requires per-shipment posted COGS reversal instead.
         unitCostBase: currentUnitCostByCostLayerId.get(entry.costLayerId) ?? entry.unitCostBase,
       }))
     )
