@@ -8,6 +8,7 @@ npm run lint
 npm run type-check
 npm run check:decimal-boundaries
 npm run check:connector-fetch-boundaries
+npm run check:migration-conventions
 # Use direct Prisma generate so the baseline does not require DATABASE_URL.
 npx prisma generate --schema prisma/schema.prisma
 npm run test:unit
