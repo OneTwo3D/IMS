@@ -1,12 +1,14 @@
-# IMS Production Readiness Blockers — Codex Implementation Plan
+# IMS Production Readiness Blockers — Historical Codex Implementation Plan
 
 Repository: `OneTwo3D/IMS`  
 Branch to use for all work: `development`  
 Do **not** target `main` unless a human explicitly instructs it.
 
-This plan is based on a static review of the current `development` branch after the earlier implementation waves. It focuses only on issues that can reasonably block or materially de-risk production rollout: security controls, public ingress, destructive admin functions, operational gates, database invariants, and recoverability.
+This plan was based on a static review of the `development` branch after the earlier implementation waves. It focused only on issues that could reasonably block or materially de-risk production rollout: security controls, public ingress, destructive admin functions, operational gates, database invariants, and recoverability.
 
-## Current positive baseline
+Implementation status as of 2026-06-03: the staged plan through PR 11.16 has been implemented and merged through GitHub PR #117. Treat this document as a historical implementation record and source of acceptance criteria. Do not use the PR sequence below as the active backlog unless a human explicitly asks to reopen one of the listed follow-ups.
+
+## Final positive baseline
 
 Several earlier recommendations appear implemented:
 
@@ -19,7 +21,7 @@ Several earlier recommendations appear implemented:
 - CronRun persistence and richer health checks exist.
 - Route authorization and public-route policy maps exist.
 
-The remaining work is therefore not broad refactoring. It is production hardening.
+The original blocker sequence has been completed. Any new production-readiness work should start from current repository state, open PRs/issues, or newly identified rollout gaps.
 
 ---
 
@@ -101,7 +103,9 @@ Follow-up issues:
 
 ---
 
-# Production blocker summary
+# Original production blocker summary
+
+The table below records the risks this plan was created to address. It is retained for historical context; it is not the current open-task list.
 
 | Priority | Blocker | Why it can stop rollout |
 |---|---|---|
@@ -2291,18 +2295,20 @@ Run npm run validate.
 
 ### Goal
 
-Production reporting — variance, WIP value, scheduled output.
+Production reporting — variance and WIP value.
 
 ### Reports in scope
 
-- **Production variance** — `/analytics/production-variance` — per `ProductionOrder`: planned vs actual component consumption per BOM line, scrap qty/value, yield. Flags BOM accuracy issues and excessive scrap.
-- **WIP report** — `/analytics/wip` — open `ProductionOrder` rows with consumed component value (`ManufacturingCostLine` sum), expected output value, days-since-start.
+- **Production variance** — `/analytics/production-variance` — per assembly `ProductionOrder`: planned vs actual component consumption per BOM line, over-consumed qty/value, and order yield. Flags BOM accuracy issues and excessive component consumption without labelling the cause as scrap.
+- **WIP report** — `/analytics/wip` — current `IN_PROGRESS` production orders with consumed component value, manufacturing cost-line totals, combined WIP value, expected output value, and decimal days-since-start.
 
 ### Acceptance criteria
 
 ```text
-- Variance: planned qty from BomItem × ProductionOrder.qty; actual from PRODUCTION_OUT consumption movements per order.
-- WIP value matches sum of ManufacturingCostLine totals for IN_PROGRESS orders.
+- Variance: planned qty from BomItem × ProductionOrder.qty; actual from PRODUCTION_OUT consumption movements per order, scoped to assembly orders that can consume components.
+- Variance date filters apply to completedAt; in-progress rows without completedAt appear only when no date window is selected.
+- WIP is a current-state report and does not apply date filters.
+- WIP value equals posted consumed component value plus ManufacturingCostLine totals for IN_PROGRESS orders.
 - Drill-through from WIP and variance rows to source ProductionOrder.
 - CSV export; RBAC: MANAGER, FINANCE, ADMIN.
 ```
@@ -2316,15 +2322,18 @@ Base branch: development.
 
 Build two manufacturing reports under /analytics: production-variance, wip.
 Variance compares BomItem × ProductionOrder.qty (planned) against PRODUCTION_OUT consumption movements (actual).
-WIP totals ManufacturingCostLine for IN_PROGRESS ProductionOrders.
+WIP combines posted consumed component value with ManufacturingCostLine totals for IN_PROGRESS ProductionOrders.
 Run npm run validate.
 ```
 
 ---
 
-# Recommended implementation order
+# Completed implementation order
 
-## Wave 1 — must complete before production
+The original implementation order below has been completed through PR #117. It
+is retained as an audit trail of the rollout sequence, not as an active queue.
+
+## Wave 1 — completed before production readiness sign-off
 
 ```text
 PR 0.1  production-readiness CI
@@ -2340,7 +2349,7 @@ PR 7.1  encryption-key production preflight
 PR 7.2  persistent storage production preflight
 ```
 
-## Wave 2 — should complete before wider operational rollout
+## Wave 2 — completed before wider operational rollout
 
 ```text
 PR 2.2  raw connector fetch audit
@@ -2354,7 +2363,7 @@ PR 9.1  replace TODO public route behavior tests
 PR 10.1 rollout readiness endpoint
 ```
 
-## Wave 3 — hardening after controlled launch
+## Wave 3 — completed hardening and reporting build-out
 
 ```text
 PR 8.2  WMS Decimal arithmetic
@@ -2377,6 +2386,14 @@ PR 11.13 sales & fulfillment analytics bundle
 PR 11.14 purchasing & supplier analytics bundle
 PR 11.15 tax, AR/AP & FX bundle
 PR 11.16 manufacturing analytics bundle
+```
+
+## Future hardening candidates
+
+These items were left as non-blocking future candidates after the planned PR
+sequence completed:
+
+```text
 Further decomposition of app/actions/mintsoft-sync.ts and app/actions/manufacturing.ts
 More SQL-backed invariant collectors
 Automated backup restore test in staging
@@ -2384,38 +2401,8 @@ Automated backup restore test in staging
 
 ---
 
-# First Codex task to run
+# Current Codex usage
 
-```text
-Repository: OneTwo3D/IMS
-Base branch: development
-Task: PR 0.1 — Add production-readiness CI
-
-Set yourself up:
-1. git fetch origin
-2. git checkout development
-3. git pull --ff-only origin development
-4. test "$(git branch --show-current)" = "development"
-5. npm ci
-6. npm run validate
-
-Implementation:
-- Add .github/workflows/production-readiness.yml.
-- Run on pull_request to development and push to development.
-- Use Node 22.
-- Include jobs for npm run validate, npm run build, and npm run e2e:select.
-- Use existing E2E setup scripts and environment conventions.
-- Do not add production secrets.
-- Do not target main.
-
-Validation:
-- npm run validate
-- If possible locally: npm run build
-
-PR summary must include:
-- Base branch: development
-- Feature branch
-- Changed files
-- Validation output
-- Any E2E setup assumptions
-```
+Do not start from PR 0.1; it has already shipped. For new work, branch from
+`development`, inspect the current code and relevant historical section, and
+create a focused PR for the user's current request or newly identified gap.

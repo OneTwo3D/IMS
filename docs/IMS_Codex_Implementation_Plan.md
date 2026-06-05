@@ -1,8 +1,8 @@
-# OneTwo3D/IMS — Codex Implementation Plan
+# OneTwo3D/IMS — Codex Implementation Plan — Historical
 
-This document is a staged implementation brief for Codex and/or Claude Code to improve the `OneTwo3D/IMS` repository based on the code review findings.
+This document was a staged implementation brief for Codex and/or Claude Code to improve the `OneTwo3D/IMS` repository based on the code review findings.
 
-It is designed to be used directly as a task plan. Do not ask a coding agent to implement the whole document in one run. Use one branch and one pull request per stage or sub-stage.
+Implementation status as of 2026-06-03: this staged plan has been implemented and should be treated as historical context and acceptance-criteria reference material unless a human explicitly asks to revisit a listed stage. Do not use it as the active backlog.
 
 ---
 
