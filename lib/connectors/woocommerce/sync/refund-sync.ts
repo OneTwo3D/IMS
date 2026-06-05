@@ -7,7 +7,17 @@ import { logActivity } from '@/lib/activity-log'
 import { wcFetch } from '../api'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import type { WcRefund } from './types'
+import type { createRefund as createRefundAction } from '@/app/actions/sales'
+
+type CreateRefundAction = typeof createRefundAction
+
+export type WcRefundSyncDependencies = {
+  db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog'>
+  createRefund?: CreateRefundAction
+  logActivity?: typeof logActivity
+}
 
 function roundDecimalNumber(value: DecimalInput, precision: number): number {
   return roundQuantity(value, precision).toNumber()
@@ -25,10 +35,13 @@ function parseDecimalAbs(value: string | number | null | undefined) {
 export async function syncWcRefund(
   externalOrderId: number,
   wcRefund: WcRefund,
+  dependencies: WcRefundSyncDependencies = {},
 ): Promise<{ success: boolean; error?: string }> {
+  const client = dependencies.db ?? db
+  const writeActivity = dependencies.logActivity ?? logActivity
   try {
     // Find the IMS order
-    const so = await db.salesOrder.findFirst({
+    const so = await client.salesOrder.findFirst({
       where: {
         shoppingLinks: {
           some: {
@@ -48,7 +61,7 @@ export async function syncWcRefund(
     if (!so) return { success: false, error: `IMS order not found for WC order ${externalOrderId}` }
 
     // Check if already processed
-    const existing = await db.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id } })
+    const existing = await client.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id } })
     if (existing) return { success: true } // already synced
 
     const fxRate = toDecimal(so.fxRateToBase).gt(0) ? toDecimal(so.fxRateToBase) : toDecimal(1)
@@ -122,7 +135,7 @@ export async function syncWcRefund(
     )
     if (refundLines.length > 0 && toDecimal(mappedRefundTotalForeign).sub(refundAmountForeign).abs().gt(0.01)) {
       const error = `WooCommerce refund ${wcRefund.id} amount mismatch: mapped ${mappedRefundTotalForeign.toFixed(2)} but refund total is ${refundAmountForeign.toDecimalPlaces(2).toFixed(2)}`
-      await db.shoppingSyncLog.create({
+      await client.shoppingSyncLog.create({
         data: {
           direction: 'FROM_CONNECTOR',
           status: 'PENDING',
@@ -142,7 +155,7 @@ export async function syncWcRefund(
     // Find return warehouse (default return warehouse)
     let returnWarehouseId: string | undefined
     if (hasQtyRefund) {
-      const returnWh = await db.warehouse.findFirst({
+      const returnWh = await client.warehouse.findFirst({
         where: { defaultReturnWarehouse: true, active: true },
         select: { id: true },
       })
@@ -150,17 +163,45 @@ export async function syncWcRefund(
     }
 
     // Use the createRefund action
-    const { createRefund } = await import('@/app/actions/sales')
-    const result = await createRefund(
-      so.id,
-      refundLines.filter((l) => l.qty > 0 || l.totalBase > 0),
-      wcRefund.reason || 'WooCommerce refund',
-      returnWarehouseId,
-      { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id },
-    )
+    const createRefund = dependencies.createRefund
+      ?? (await import('@/app/actions/sales')).createRefund
+    let result: Awaited<ReturnType<CreateRefundAction>>
+    try {
+      result = await createRefund(
+        so.id,
+        refundLines.filter((l) => l.qty > 0 || l.totalBase > 0),
+        wcRefund.reason || 'WooCommerce refund',
+        returnWarehouseId,
+        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id },
+      )
+    } catch (error) {
+      if (!isExternalRefundIdUniqueConflict(error)) throw error
+      await client.shoppingSyncLog.create({
+        data: {
+          direction: 'FROM_CONNECTOR',
+          status: 'SYNCED',
+          entityType: 'SalesOrder',
+          entityId: so.id,
+          externalId: String(wcRefund.id),
+          errorMessage: 'Duplicate WooCommerce refund delivery deduped by external refund id',
+          syncedAt: new Date(),
+        },
+      })
+      await writeActivity({
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: 'refund_sync_deduped',
+        tag: 'sync',
+        level: 'INFO',
+        description: `WC refund ${wcRefund.id} already synced; duplicate delivery was deduped`,
+        metadata: { externalRefundId: wcRefund.id, parentOrderId: externalOrderId },
+        resolveUser: false,
+      })
+      return { success: true }
+    }
 
     if (!result.success) {
-      await db.shoppingSyncLog.create({
+      await client.shoppingSyncLog.create({
         data: {
           direction: 'FROM_CONNECTOR',
           status: 'FAILED',
@@ -174,7 +215,7 @@ export async function syncWcRefund(
       return { success: false, error: result.error }
     }
 
-    await db.shoppingSyncLog.create({
+    await client.shoppingSyncLog.create({
       data: {
         direction: 'FROM_CONNECTOR',
         status: 'SYNCED',
@@ -185,7 +226,7 @@ export async function syncWcRefund(
       },
     })
 
-    await logActivity({
+    await writeActivity({
       entityType: 'SALES_ORDER',
       entityId: so.id,
       action: 'refund_synced',

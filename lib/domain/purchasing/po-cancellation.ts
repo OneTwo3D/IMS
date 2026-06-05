@@ -37,6 +37,12 @@ export type ReversePurchaseOrderCostLayersResult = {
   totalReversalValueBase: Decimal
 }
 
+export function assertPurchaseOrderCancellationHasNoInvoices(invoiceCount: number): void {
+  if (invoiceCount > 0) {
+    throw new Error('Cannot cancel a purchase order after supplier invoices have been recorded. Create a supplier credit or bill reversal instead.')
+  }
+}
+
 export async function reversePurchaseOrderCostLayersForCancellation(
   tx: TxClient,
   params: {

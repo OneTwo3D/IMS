@@ -40,6 +40,14 @@ function uniqueStockMovementError() {
   })
 }
 
+function uniqueStockLevelError() {
+  return new Prisma.PrismaClientKnownRequestError('Unique constraint failed', {
+    code: 'P2002',
+    clientVersion: 'test',
+    meta: { target: ['productId', 'warehouseId'] },
+  })
+}
+
 type Refund = {
   id: string
   orderId: string
@@ -92,11 +100,13 @@ type State = {
     idempotencyKey?: string | null
   }>
   stockLevels: Array<{ productId: string; warehouseId: string; quantity: number; reservedQty: number }>
+  activityLogs: unknown[]
   settings: Record<string, string>
   executeRawCalls: number
   nextRefundId: number
   nextRefundLineId: number
   nextCostLayerId: number
+  failStockLevelUnique?: boolean
 }
 
 const accountingSettings: AccountingSettings = {
@@ -148,6 +158,7 @@ function baseState(overrides: Partial<State> = {}): State {
     costLayers: [],
     movements: [],
     stockLevels: [],
+    activityLogs: [],
     settings: {},
     executeRawCalls: 0,
     nextRefundId: 1,
@@ -276,6 +287,11 @@ function createClient(state: State): RefundServiceClient {
     accountingSyncLog: {
       findMany: async () => [],
     },
+    activityLog: {
+      create: async ({ data }: { data: unknown }) => {
+        state.activityLogs.push(data)
+      },
+    },
     costLayer: {
       findMany: async ({ where }: { where: { id: { in: string[] } } }) => state.costLayers
         .filter((layer) => where.id.in.includes(layer.id)),
@@ -309,6 +325,7 @@ function createClient(state: State): RefundServiceClient {
     },
     stockLevel: {
       upsert: async ({ where, create, update }: { where: { productId_warehouseId: { productId: string; warehouseId: string } }; create: { productId: string; warehouseId: string; quantity: number; reservedQty: number }; update: { quantity: { increment: number } } }) => {
+        if (state.failStockLevelUnique) throw uniqueStockLevelError()
         const row = state.stockLevels.find((stock) => (
           stock.productId === where.productId_warehouseId.productId &&
           stock.warehouseId === where.productId_warehouseId.warehouseId
@@ -790,6 +807,94 @@ test('applyReturnInboundStockTx does not create return cost layers on movement i
   assert.deepEqual(result, [{ productId: 'product-1', sku: 'PRODUCT-1', qty: 1 }])
   assert.equal(state.movements.length, 1)
   assert.equal(state.stockLevels.length, 0)
+  assert.equal(state.costLayers.length, 0)
+  assert.equal(state.activityLogs.length, 1)
+  assert.deepEqual(state.activityLogs[0], {
+    entityType: 'SALES_ORDER',
+    entityId: 'refund-1',
+    action: 'refund_return_deduped',
+    tag: 'sales',
+    level: 'INFO',
+    description: 'Skipped duplicate refund return for product product-1',
+    metadata: {
+      idempotencyKey: 'RETURN_INBOUND:refund:refund-1:line:refund-line-1',
+      productId: 'product-1',
+      refundLineId: 'refund-line-1',
+      referenceType: 'SalesOrderRefund',
+      referenceId: 'refund-1',
+    },
+  })
+})
+
+test('applyReturnInboundStockTx bubbles stock-level unique conflicts after movement creation', async () => {
+  const state = baseState({ failStockLevelUnique: true })
+
+  await assert.rejects(
+    () => applyReturnInboundStockTx(createClient(state) as Prisma.TransactionClient, {
+      referenceType: 'SalesOrderRefund',
+      referenceId: 'refund-1',
+      warehouseId: 'warehouse-returns',
+      rows: [{
+        productId: 'product-1',
+        qty: 1,
+        refundLineId: 'refund-line-1',
+        unitCostBase: 10,
+        poLineId: 'po-line-1',
+      }],
+      note: 'Refund return',
+    }),
+    /Unique constraint failed/,
+  )
+
+  assert.equal(state.movements.length, 1)
+  assert.equal(state.stockLevels.length, 0)
+  assert.equal(state.costLayers.length, 0)
+  assert.equal(state.activityLogs.length, 0)
+})
+
+test('applyReturnInboundStockTx creates movement stock and cost layers on non-conflicting rows', async () => {
+  const state = baseState()
+
+  const result = await applyReturnInboundStockTx(createClient(state) as Prisma.TransactionClient, {
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    warehouseId: 'warehouse-returns',
+    rows: [{
+      productId: 'product-1',
+      qty: 1,
+      refundLineId: 'refund-line-1',
+      unitCostBase: 10,
+      poLineId: 'po-line-1',
+      sourceCostLayerId: 'source-layer-1',
+    }],
+    note: 'Refund return',
+  })
+
+  assert.deepEqual(result, [{ productId: 'product-1', sku: 'PRODUCT-1', qty: 1 }])
+  assert.equal(state.movements.length, 1)
+  assert.equal(state.stockLevels[0].quantity, 1)
+  assert.equal(state.costLayers.length, 1)
+  assert.equal(state.costLayers[0].unitCostBase, 10)
+})
+
+test('applyReturnInboundStockTx allows return rows without cost layer inputs', async () => {
+  const state = baseState()
+
+  const result = await applyReturnInboundStockTx(createClient(state) as Prisma.TransactionClient, {
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    warehouseId: 'warehouse-returns',
+    rows: [{
+      productId: 'product-1',
+      qty: 1,
+      refundLineId: 'refund-line-1',
+    }],
+    note: 'Refund return',
+  })
+
+  assert.deepEqual(result, [{ productId: 'product-1', sku: 'PRODUCT-1', qty: 1 }])
+  assert.equal(state.movements.length, 1)
+  assert.equal(state.stockLevels[0].quantity, 1)
   assert.equal(state.costLayers.length, 0)
 })
 
