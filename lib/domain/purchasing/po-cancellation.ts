@@ -43,6 +43,10 @@ export function assertPurchaseOrderCancellationHasNoInvoices(invoiceCount: numbe
   }
 }
 
+export function isPurchaseOrderCancellationNoop(status: string): boolean {
+  return status === 'CANCELLED'
+}
+
 export async function reversePurchaseOrderCostLayersForCancellation(
   tx: TxClient,
   params: {

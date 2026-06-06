@@ -74,17 +74,16 @@ test('purchase receipt status guard permits repeated partial receipts as progres
   })
 })
 
-test('linked freight receipt guard allows derived receipt from open freight states only', () => {
-  assert.deepEqual(validateLinkedFreightReceiptStatus('DRAFT'), { success: true })
-  assert.deepEqual(validateLinkedFreightReceiptStatus('RECEIVED'), { success: true })
-  assert.deepEqual(validateLinkedFreightReceiptStatus('CANCELLED'), {
-    success: false,
-    error: 'Cannot mark linked freight purchase order as received from CANCELLED',
-  })
-  assert.deepEqual(validateLinkedFreightReceiptStatus('CLOSED'), {
-    success: false,
-    error: 'Cannot mark linked freight purchase order as received from CLOSED',
-  })
+test('linked freight receipt guard allows derived receipt from committed freight states only', () => {
+  for (const status of ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED']) {
+    assert.deepEqual(validateLinkedFreightReceiptStatus(status), { success: true })
+  }
+  for (const status of ['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'CANCELLED', 'CLOSED']) {
+    assert.deepEqual(validateLinkedFreightReceiptStatus(status), {
+      success: false,
+      error: `Cannot mark linked freight purchase order as received from ${status}`,
+    })
+  }
 })
 
 test('refund action guard blocks reverting a paid refund lifecycle', () => {

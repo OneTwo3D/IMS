@@ -22,6 +22,7 @@ import {
 } from '@/lib/domain/purchasing/landed-cost-service'
 import {
   assertPurchaseOrderCancellationHasNoInvoices,
+  isPurchaseOrderCancellationNoop,
   reversePurchaseOrderCostLayersForCancellation,
   type PurchaseOrderCostLayerReversal,
 } from '@/lib/domain/purchasing/po-cancellation'
@@ -2008,6 +2009,17 @@ export async function cancelPurchaseOrder(id: string): Promise<{
         },
       })
       if (!existing) throw new Error('PO not found')
+      if (isPurchaseOrderCancellationNoop(existing.status)) {
+        return {
+          alreadyCancelled: true,
+          existing,
+          reversal: {
+            reversedLayers: [],
+            productIds: [],
+            totalReversalValueBase: toDecimal(0),
+          },
+        }
+      }
       const transition = validatePurchaseOrderStatusTransition(existing.status, 'CANCELLED')
       if (!transition.success) throw new Error(transition.error)
       assertPurchaseOrderCancellationHasNoInvoices(existing._count.invoices)
@@ -2051,8 +2063,12 @@ export async function cancelPurchaseOrder(id: string): Promise<{
         }
       }
 
-      return { existing, reversal }
+      return { alreadyCancelled: false, existing, reversal }
     }, STOCK_TX_OPTIONS)
+
+    if (cancellation.alreadyCancelled) {
+      return { success: true }
+    }
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)

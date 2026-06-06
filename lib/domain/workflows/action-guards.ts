@@ -90,7 +90,7 @@ export function validateLinkedFreightReceiptStatus(
   if (!isKnownStatus(PURCHASE_ORDER_STATUSES, status)) {
     return { success: false, error: `Unknown current purchase order status: ${status}` }
   }
-  if (['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED'].includes(status)) {
+  if (['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED'].includes(status)) {
     return { success: true }
   }
   return {

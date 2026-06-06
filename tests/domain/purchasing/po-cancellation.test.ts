@@ -4,6 +4,7 @@ import test from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import {
   assertPurchaseOrderCancellationHasNoInvoices,
+  isPurchaseOrderCancellationNoop,
   reversePurchaseOrderCostLayersForCancellation,
 } from '@/lib/domain/purchasing/po-cancellation'
 
@@ -238,4 +239,10 @@ test('assertPurchaseOrderCancellationHasNoInvoices rejects billed purchase order
     () => assertPurchaseOrderCancellationHasNoInvoices(1),
     /Cannot cancel a purchase order after supplier invoices have been recorded/,
   )
+})
+
+test('isPurchaseOrderCancellationNoop treats already cancelled purchase orders as idempotent', () => {
+  assert.equal(isPurchaseOrderCancellationNoop('CANCELLED'), true)
+  assert.equal(isPurchaseOrderCancellationNoop('PO_SENT'), false)
+  assert.equal(isPurchaseOrderCancellationNoop('RECEIVED'), false)
 })
