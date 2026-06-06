@@ -81,3 +81,67 @@ test('sales order tax validation rejects discounts above line total', () => {
     error: 'Discount exceeds line total for DISC-BAD',
   })
 })
+
+test('sales order tax validation reports missing assertions on tax-bearing lines', () => {
+  const result = validateSalesOrderLineTaxInputs([{
+    sku: 'MISSING-TAX',
+    qty: 1,
+    unitPriceForeign: 120,
+    discountAmount: 0,
+    taxRateValue: 0.2,
+    taxForeign: null,
+  }], true)
+
+  assert.deepEqual(result, {
+    success: true,
+    warnings: [{
+      code: 'missing_line_tax_assertion',
+      sku: 'MISSING-TAX',
+      expectedTaxForeign: '20.0000',
+    }],
+  })
+})
+
+test('sales order tax validation rejects percent-shaped tax rates', () => {
+  const result = validateSalesOrderLineTaxInputs([{
+    sku: 'RATE-BAD',
+    qty: 1,
+    unitPriceForeign: 100,
+    discountAmount: 0,
+    taxRateValue: 20,
+    taxForeign: 20,
+  }], false)
+
+  assert.deepEqual(result, {
+    success: false,
+    error: 'Implausible tax rate 20 for RATE-BAD: rates must be fractions, not percents',
+  })
+})
+
+test('sales order tax validation accepts repeating-rate tax rounded by source systems', () => {
+  const line = {
+    sku: 'DE-19',
+    qty: 3,
+    unitPriceForeign: 100,
+    discountAmount: 0,
+    taxRateValue: 0.19,
+    taxForeign: 47.91,
+  }
+
+  assert.equal(expectedSalesOrderLineTaxForeign(line, true).toFixed(4), '47.8992')
+  assert.deepEqual(validateSalesOrderLineTaxInputs([line], true), { success: true })
+})
+
+test('sales order tax validation treats discountAmount as line-level only', () => {
+  const line = {
+    sku: 'LINE-DISC',
+    qty: 1,
+    unitPriceForeign: 50,
+    discountAmount: 5,
+    taxRateValue: 0.2,
+    taxForeign: 9,
+  }
+
+  assert.equal(expectedSalesOrderLineTaxForeign(line, false).toFixed(4), '9.0000')
+  assert.deepEqual(validateSalesOrderLineTaxInputs([line], false), { success: true })
+})

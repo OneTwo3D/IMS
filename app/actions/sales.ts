@@ -29,7 +29,10 @@ import {
   type RefundAccountingSyncRequest,
   type RefundRequestLine,
 } from '@/lib/domain/sales/refund-service'
-import { validateSalesOrderLineTaxInputs } from '@/lib/domain/sales/sales-order-tax-validation'
+import {
+  expectedSalesOrderLineTaxForeign,
+  validateSalesOrderLineTaxInputs,
+} from '@/lib/domain/sales/sales-order-tax-validation'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
 
@@ -787,7 +790,14 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
       const unitPriceBase = divideRoundedNumber(l.unitPriceForeign, fxRate, 6)
       const totalForeign = round4(netForeign)
       const totalBase = divideRoundedNumber(totalForeign, fxRate, 4)
-      const lineTax = lineInclVat ? lineGross.sub(netForeign) : netForeign.mul(lineRate)
+      const lineTax = expectedSalesOrderLineTaxForeign({
+        sku: l.sku,
+        qty: l.qty,
+        unitPriceForeign: l.unitPriceForeign,
+        discountAmount: discAmt,
+        taxRateValue: lineRate,
+        taxForeign: l.taxForeign ?? null,
+      }, inclVat)
       const lineTaxForeign = round4(lineTax)
       const lineTaxBase = divideRoundedNumber(lineTaxForeign, fxRate, 4)
       linesSubtotalForeign = linesSubtotalForeign.add(totalForeign)
@@ -921,6 +931,23 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
         select: SO_SELECT,
       })
     }, STOCK_TX_OPTIONS)
+
+    for (const warning of taxValidation.warnings ?? []) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: 'sales_order_line_tax_assertion_missing',
+        tag: 'sales',
+        level: 'WARNING',
+        description: `Sales order ${getSalesOrderReference(so)} line ${warning.sku} omitted caller tax assertion`,
+        metadata: {
+          sku: warning.sku,
+          expectedTaxForeign: warning.expectedTaxForeign,
+          pricesIncludeVat: inclVat,
+          currency: input.currency,
+        },
+      })
+    }
 
     // Auto-allocate stock across warehouses. Drafts stay unallocated —
     // allocation happens when the draft is finalised so the draft can still
