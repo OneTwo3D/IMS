@@ -565,7 +565,11 @@ export async function updateManufacturingOrderStatus(
         const qtyPlanned = Number(order.qtyPlanned)
         const components = order.outputProduct.productComponents
         const wasInProgress = order.status === 'IN_PROGRESS'
-        const costLayerReceivedAt = manufacturingCostLayerReceivedAt(order.completedAt, now)
+        const costLayerReceivedAt = manufacturingCostLayerReceivedAt({
+          orderType: order.orderType,
+          completedAt: order.completedAt,
+          transitionAt: now,
+        })
         const totalManufacturingCostBase = order.manufacturingCostLines.reduce(
           (sum, line) => sum.add(new Prisma.Decimal(line.amountBase)),
           new Prisma.Decimal(0),
@@ -1380,7 +1384,7 @@ export async function updateManufacturingCostLines(
     if (!po) return { success: false, error: 'Production order not found.' }
     if (po.status === 'CANCELLED') return { success: false, error: 'Cannot edit manufacturing cost lines on a cancelled production order.' }
 
-    const parsed = parseManufacturingCostLines(lines, Number(po.fxRateToBase) || 1)
+    const parsed = parseManufacturingCostLines(lines, Number(po.fxRateToBase))
     if (!parsed.success) return { success: false, error: parsed.error }
     const cleaned = parsed.lines
 

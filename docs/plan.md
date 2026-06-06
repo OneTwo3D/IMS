@@ -139,6 +139,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 
 ### P1.7 — WIP value excludes consumed component value
 - **Status:** Complete.
+- **Reference:** Covered by `tests/domain/manufacturing/manufacturing-analytics.test.ts` (`WIP value includes consumed component value and ManufacturingCostLine totals`).
 - **File:** `lib/domain/manufacturing/manufacturing-analytics.ts` (PR #117 review)
 - **Problem:** `wipValueBase = manufacturingCostBase` only. Finance reading "WIP: £5k" expects components + labour + overhead.
 - **Fix:** Either:

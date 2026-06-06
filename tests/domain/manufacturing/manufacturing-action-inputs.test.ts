@@ -8,15 +8,45 @@ import {
 
 test('manufacturing cost layer receivedAt uses completedAt when present', () => {
   const completedAt = new Date('2026-06-01T09:15:00.000Z')
-  const fallback = new Date('2026-06-02T10:30:00.000Z')
+  const transitionAt = new Date('2026-06-02T10:30:00.000Z')
 
-  assert.equal(manufacturingCostLayerReceivedAt(completedAt, fallback), completedAt)
+  assert.equal(manufacturingCostLayerReceivedAt({
+    orderType: 'ASSEMBLY',
+    completedAt,
+    transitionAt,
+  }), completedAt)
 })
 
 test('manufacturing cost layer receivedAt falls back to completion timestamp', () => {
-  const fallback = new Date('2026-06-02T10:30:00.000Z')
+  const transitionAt = new Date('2026-06-02T10:30:00.000Z')
 
-  assert.equal(manufacturingCostLayerReceivedAt(null, fallback), fallback)
+  assert.equal(manufacturingCostLayerReceivedAt({
+    orderType: 'ASSEMBLY',
+    completedAt: null,
+    transitionAt,
+  }), transitionAt)
+})
+
+test('manufacturing cost layer receivedAt uses transition time for disassembly recovery', () => {
+  const oldCompletedAt = new Date('2026-03-01T09:15:00.000Z')
+  const transitionAt = new Date('2026-06-02T10:30:00.000Z')
+
+  assert.equal(manufacturingCostLayerReceivedAt({
+    orderType: 'DISASSEMBLY',
+    completedAt: oldCompletedAt,
+    transitionAt,
+  }), transitionAt)
+})
+
+test('manufacturing cost line parser rejects invalid FX rates', () => {
+  const result = parseManufacturingCostLines([
+    { description: 'labour', amountForeign: 10, accountCode: '5100' },
+  ], 0)
+
+  assert.deepEqual(result, {
+    success: false,
+    error: 'Invalid FX rate 0 on production order; set a positive rate before editing cost lines.',
+  })
 })
 
 test('manufacturing cost line parser drops sub-half-penny negative dust', () => {
@@ -38,9 +68,10 @@ test('manufacturing cost line parser rejects real negative cost adjustments befo
   })
 })
 
-test('manufacturing cost line parser rounds positive amounts and trims accounts', () => {
+test('manufacturing cost line parser rounds positive amounts, trims accounts, and preserves input sort positions', () => {
   const result = parseManufacturingCostLines([
     { description: '   ', amountForeign: 10 },
+    { description: 'zero placeholder', amountForeign: 0 },
     { description: 'labour', amountForeign: 1.23445, accountCode: ' 5100 ' },
   ], 1.2)
 
@@ -51,7 +82,7 @@ test('manufacturing cost line parser rounds positive amounts and trims accounts'
       amountForeign: 1.2345,
       amountBase: 1.4813,
       accountCode: '5100',
-      sortOrder: 0,
+      sortOrder: 2,
     }],
   })
 })
