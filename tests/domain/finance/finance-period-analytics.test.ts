@@ -30,7 +30,7 @@ const settings = async () => ({
   realisedFxGainLossAccount: '610',
 })
 
-test('VAT report totals sales order line tax by rate and jurisdiction', async () => {
+test('VAT report subtracts tax from taxable base for tax-inclusive orders', async () => {
   const client: FinanceAnalyticsClient = {
     ...unusedClient(),
     salesOrderLine: {
@@ -43,6 +43,26 @@ test('VAT report totals sales order line tax by rate and jurisdiction', async ()
           order: { shippingAddress: { country: 'gb' }, pricesIncludeVat: true },
           taxRate: { name: 'UK Standard', rate: decimal('0.2'), accountingTaxType: 'OUTPUT2', countryCode: 'GB' },
         },
+      ],
+    },
+  }
+
+  const report = await getVatReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-30' },
+    { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } },
+  )
+
+  assert.equal(report.rows[0]?.taxableBase, '100')
+  assert.equal(report.rows[0]?.taxBase, '20')
+  assert.equal(report.totals.taxableBase, '100')
+  assert.equal(report.totals.taxBase, '20')
+})
+
+test('VAT report keeps totalBase as taxable base for tax-exclusive orders', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...unusedClient(),
+    salesOrderLine: {
+      findMany: async () => [
         {
           taxRateId: 'tax-20',
           taxForeign: decimal('10'),
@@ -60,9 +80,10 @@ test('VAT report totals sales order line tax by rate and jurisdiction', async ()
     { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } },
   )
 
-  assert.equal(report.rows[0]?.taxableBase, '150')
-  assert.equal(report.rows[0]?.taxBase, '30')
-  assert.equal(report.totals.taxBase, '30')
+  assert.equal(report.rows[0]?.taxableBase, '50')
+  assert.equal(report.rows[0]?.taxBase, '10')
+  assert.equal(report.totals.taxableBase, '50')
+  assert.equal(report.totals.taxBase, '10')
 })
 
 test('AR aging subtracts non-refund payments and uses configurable buckets', async () => {

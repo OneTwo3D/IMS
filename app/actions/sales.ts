@@ -29,6 +29,7 @@ import {
   type RefundAccountingSyncRequest,
   type RefundRequestLine,
 } from '@/lib/domain/sales/refund-service'
+import { validateSalesOrderLineTaxInputs } from '@/lib/domain/sales/sales-order-tax-validation'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
 
@@ -154,6 +155,12 @@ export type SoLineInput = {
   description: string
   qty: number
   unitPriceForeign: number
+  /**
+   * Optional caller-supplied tax assertion used by import/API boundaries. The
+   * action still computes persisted tax itself; when present, this value must
+   * match the resolved tax rate and inclusive/exclusive pricing mode.
+   */
+  taxForeign?: number | null
   /**
    * Optional manual override of the tax rate for this line. When null/omitted
    * the server resolves a rate from the product's tax category + destination
@@ -756,6 +763,19 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
         }
       )
     })
+
+    const taxValidation = validateSalesOrderLineTaxInputs(
+      input.lines.map((line, idx) => ({
+        sku: line.sku,
+        qty: line.qty,
+        unitPriceForeign: line.unitPriceForeign,
+        discountAmount: line.discountAmount ?? 0,
+        taxRateValue: lineResolved[idx]?.taxRateValue ?? 0,
+        taxForeign: line.taxForeign ?? null,
+      })),
+      inclVat,
+    )
+    if (!taxValidation.success) return { success: false, error: taxValidation.error }
 
     const lineData = input.lines.map((l, idx) => {
       const resolved = lineResolved[idx]
