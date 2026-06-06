@@ -48,6 +48,10 @@ This repository uses an `x.y.z` release scheme.
 
 - **Sales-order creation now validates caller-supplied line tax assertions.** Import/API callers may pass `taxForeign` per line as an assertion; IMS rejects values that do not match the resolved line tax rate and inclusive/exclusive pricing mode before creating the order. VAT report coverage now separately pins inclusive taxable-base reporting (`totalBase - taxBase`) and exclusive taxable-base reporting (`totalBase`).
 
+### Fixes (manufacturing valuation)
+
+- **Manufacturing WIP and cost-layer timing now align with finance expectations.** WIP reporting includes both consumed component value and manufacturing cost-line totals, production-created cost layers receive the production completion timestamp for FIFO ordering, and manufacturing cost-line parsing now drops sub-half-penny negative rounding dust while still rejecting real credit-style negative adjustments.
+
 ### Fixes (Mintsoft webhook security)
 
 - **Mintsoft ASN booked-in webhooks now bind the freshness timestamp into the HMAC signature.** IMS verifies `HMAC_SHA256(secret, "${timestamp}.${rawBody}")` and rejects body-only signatures.

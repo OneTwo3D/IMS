@@ -138,6 +138,8 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Two parameterised tests (inclusive + exclusive) asserting the taxable-base math.
 
 ### P1.7 — WIP value excludes consumed component value
+- **Status:** Complete.
+- **Reference:** Covered by `tests/domain/manufacturing/manufacturing-analytics.test.ts` (`WIP value includes consumed component value and ManufacturingCostLine totals`).
 - **File:** `lib/domain/manufacturing/manufacturing-analytics.ts` (PR #117 review)
 - **Problem:** `wipValueBase = manufacturingCostBase` only. Finance reading "WIP: £5k" expects components + labour + overhead.
 - **Fix:** Either:
@@ -253,6 +255,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Attempt to receive against DRAFT PO; assert rejection.
 
 ### P4.2 — Manufacturing output cost layer missing receivedAt
+- **Status:** Complete.
 - **File:** `app/actions/manufacturing.ts:628–635`
 - **Fix:** Pass `productionOrder.completedAt ?? new Date()` to `createCostLayer({ receivedAt })`.
 - **Tests:** Complete two production orders same day; assert FIFO order matches `completedAt`.
@@ -283,6 +286,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Recalc with two freight POs against one primary; assert each adjustment is correctly attributed.
 
 ### P4.8 — Manufacturing cost-line negativity check after rounding
+- **Status:** Complete.
 - **File:** `app/actions/manufacturing.ts:1370–1382`
 - **Fix:** Check `< 0` before rounding, or use `<= -0.005` threshold to absorb rounding drift.
 - **Tests:** Cost-line that rounds to -0.001; assert acceptance.
@@ -468,7 +472,10 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
 5. **VAT / tax correctness:**
    - [x] P1.6 — VAT taxable base for tax-inclusive pricing.
    - [x] P1.8 — Tax inclusive/exclusive validation on order create.
-6. **WIP / manufacturing valuation:** P1.7, P4.2, P4.8.
+6. **WIP / manufacturing valuation:**
+   - [x] P1.7 — WIP value includes consumed component value.
+   - [x] P4.2 — Manufacturing output cost layers use production completion timestamps.
+   - [x] P4.8 — Manufacturing cost-line negativity handles rounding dust before storage.
 7. **PO cancellation and freight correctness:** P1.2, P4.1, P4.4.
 8. **Stock and cost-layer precision:** P4.3, P4.5, P4.6, P4.7, P5.5.
 9. **Sales fulfilment transaction guards:** P3.1, P3.2, P3.3, P3.6, P3.7.
