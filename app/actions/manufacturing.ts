@@ -22,6 +22,10 @@ import {
   stableHash,
 } from '@/lib/domain/manufacturing/production-costing'
 import {
+  manufacturingCostLayerReceivedAt,
+  parseManufacturingCostLines,
+} from '@/lib/domain/manufacturing/manufacturing-action-inputs'
+import {
   buildDisassemblyRecoveryPlan,
   calculateRequiredComponentQty,
 } from '@/lib/domain/manufacturing/component-consumption'
@@ -535,6 +539,7 @@ export async function updateManufacturingOrderStatus(
             reference: true,
             status: true,
             orderType: true,
+            completedAt: true,
             outputProductId: true,
             warehouseId: true,
             qtyPlanned: true,
@@ -560,6 +565,7 @@ export async function updateManufacturingOrderStatus(
         const qtyPlanned = Number(order.qtyPlanned)
         const components = order.outputProduct.productComponents
         const wasInProgress = order.status === 'IN_PROGRESS'
+        const costLayerReceivedAt = manufacturingCostLayerReceivedAt(order.completedAt, now)
         const totalManufacturingCostBase = order.manufacturingCostLines.reduce(
           (sum, line) => sum.add(new Prisma.Decimal(line.amountBase)),
           new Prisma.Decimal(0),
@@ -632,6 +638,7 @@ export async function updateManufacturingOrderStatus(
             unitCostBase: outputTotalCostBase.div(new Prisma.Decimal(qtyPlanned)).toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP).toNumber(),
             productionOrderId: id,
             isOpeningStock: false,
+            receivedAt: costLayerReceivedAt,
           })
           await addCostLayerSourceLines(tx, outputLayerId, assemblySourceLines)
 
@@ -738,6 +745,7 @@ export async function updateManufacturingOrderStatus(
               qty: totalQtyNumber,
               unitCostBase: recoveredUnitCost.toNumber(),
               productionOrderId: id,
+              receivedAt: costLayerReceivedAt,
             })
             if (baseAllocatedCost.gt(0) && totalRecoveredCostBase.gt(0)) {
               const componentShare = baseAllocatedCost.div(totalRecoveredCostBase)
@@ -1372,20 +1380,9 @@ export async function updateManufacturingCostLines(
     if (!po) return { success: false, error: 'Production order not found.' }
     if (po.status === 'CANCELLED') return { success: false, error: 'Cannot edit manufacturing cost lines on a cancelled production order.' }
 
-    const fxRate = Number(po.fxRateToBase) || 1
-    const parsed = lines
-      .filter((l) => l.description.trim().length > 0 && Number.isFinite(l.amountForeign))
-      .map((l, idx) => ({
-        description: l.description.trim(),
-        amountForeign: Math.round(Number(l.amountForeign) * 10000) / 10000,
-        amountBase: Math.round(Number(l.amountForeign) * fxRate * 10000) / 10000,
-        accountCode: l.accountCode?.trim() || null,
-        sortOrder: idx,
-      }))
-    if (parsed.some((l) => l.amountForeign < 0 || l.amountBase < 0)) {
-      return { success: false, error: 'Manufacturing cost amounts must be non-negative. Use a separate adjustment to credit inventory.' }
-    }
-    const cleaned = parsed.filter((l) => l.amountForeign > 0 && l.amountBase > 0)
+    const parsed = parseManufacturingCostLines(lines, Number(po.fxRateToBase) || 1)
+    if (!parsed.success) return { success: false, error: parsed.error }
+    const cleaned = parsed.lines
 
     let cogsDeltaBase = 0
     let inventoryDeltaBase = 0
