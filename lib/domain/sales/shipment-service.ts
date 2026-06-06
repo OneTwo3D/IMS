@@ -19,6 +19,7 @@ import {
 import { buildStockMovementValueFieldsFromConsumed } from '@/lib/domain/inventory/stock-movement-value'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
+const SHIPMENT_QTY_EPSILON_DECIMAL = new Prisma.Decimal('0.000001')
 
 /**
  * Deliberate call-site boundary for this number-shaped shipment service contract.
@@ -116,6 +117,44 @@ function hasSameShipmentLines(
   const currentFingerprints = currentLines.map(shipmentLineDispatchFingerprint).sort()
   const lockedFingerprints = lockedLines.map(shipmentLineDispatchFingerprint).sort()
   return currentFingerprints.every((fingerprint, index) => fingerprint === lockedFingerprints[index])
+}
+
+async function validateActiveShipmentTotalsWithinOrder(
+  client: ShipmentServiceClient,
+  orderId: string,
+): Promise<string | null> {
+  const [orderLines, activeShipmentLines] = await Promise.all([
+    client.salesOrderLine.findMany({
+      where: { orderId },
+      select: { id: true, qty: true, sku: true, description: true },
+    }),
+    client.shipmentLine.findMany({
+      where: { shipment: { orderId, status: { not: 'PENDING' } } },
+      select: { lineId: true, qty: true },
+    }),
+  ])
+
+  const orderedByLine = new Map(orderLines.map((line) => [line.id, line]))
+  const activeQtyByLine = new Map<string, Prisma.Decimal>()
+  for (const shipmentLine of activeShipmentLines) {
+    activeQtyByLine.set(
+      shipmentLine.lineId,
+      (activeQtyByLine.get(shipmentLine.lineId) ?? new Prisma.Decimal(0)).add(toDecimal(shipmentLine.qty)),
+    )
+  }
+
+  for (const [lineId, activeQty] of activeQtyByLine) {
+    const line = orderedByLine.get(lineId)
+    if (!line) {
+      return `Shipment line ${lineId} no longer belongs to this order. Reload and retry.`
+    }
+    const orderedQty = toDecimal(line.qty)
+    if (activeQty.gt(orderedQty.add(SHIPMENT_QTY_EPSILON_DECIMAL))) {
+      return `Shipment quantity for line ${line.sku ?? line.description} exceeds ordered quantity. Reload and retry.`
+    }
+  }
+
+  return null
 }
 
 export async function confirmSalesOrderShipments(
@@ -293,6 +332,13 @@ export async function transitionShipmentStatus(
         return {
           success: false as const,
           error: 'Shipment has no lines to dispatch',
+        }
+      }
+      const shipmentTotalError = await validateActiveShipmentTotalsWithinOrder(tx, lockedShipment.orderId)
+      if (shipmentTotalError) {
+        return {
+          success: false as const,
+          error: shipmentTotalError,
         }
       }
 

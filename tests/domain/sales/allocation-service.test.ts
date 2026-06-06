@@ -3,8 +3,10 @@ import test from 'node:test'
 
 import {
   allocateSalesOrder,
+  assertReservationReleaseDelta,
   buildAvailableStockMapIncludingOwnReservations,
   buildAvailableStockMap,
+  cancelSalesOrderFulfillmentState,
   type AllocationServiceClient,
 } from '@/lib/domain/sales/allocation-service'
 import {
@@ -81,6 +83,7 @@ type AllocationRow = {
 type ShipmentRow = {
   id: string
   orderId: string
+  status?: string
   shipmentJournalDate: Date | null
 }
 
@@ -106,7 +109,7 @@ function createClient(state: MemoryState): AllocationServiceClient {
     salesOrder: {
       findUnique: async ({ where }: { where: { id: string } }) => {
         if (where.id !== state.order.id) return null
-        return state.order
+        return { ...state.order }
       },
       update: async ({ data }: { data: { status?: string } }) => {
         if (data.status) state.order.status = data.status
@@ -138,9 +141,17 @@ function createClient(state: MemoryState): AllocationServiceClient {
         })),
     },
     stockLevel: {
-      findMany: async ({ where }: { where: { productId: { in: string[] }; warehouseId: { in: string[] } } }) => state.stockLevels
-        .filter((row) => where.productId.in.includes(row.productId))
-        .filter((row) => where.warehouseId.in.includes(row.warehouseId)),
+      findMany: async ({ where }: { where: { OR?: Array<{ productId: string; warehouseId: string }>; productId?: { in: string[] }; warehouseId?: { in: string[] } } }) => {
+        if (where.OR) {
+          return state.stockLevels.filter((row) => (
+            where.OR?.some((scope) => scope.productId === row.productId && scope.warehouseId === row.warehouseId)
+          )).map((row) => ({ ...row }))
+        }
+        return state.stockLevels
+          .filter((row) => where.productId == null || where.productId.in.includes(row.productId))
+          .filter((row) => where.warehouseId == null || where.warehouseId.in.includes(row.warehouseId))
+          .map((row) => ({ ...row }))
+      },
       updateMany: async ({
         where,
         data,
@@ -180,6 +191,16 @@ function createClient(state: MemoryState): AllocationServiceClient {
           return rows.find((shipment) => shipment.shipmentJournalDate != null) ?? null
         }
         return rows[0] ?? null
+      },
+      deleteMany: async ({ where }: { where: { orderId: string; status: { in: string[] } } }) => {
+        const before = shipments.length
+        for (let index = shipments.length - 1; index >= 0; index -= 1) {
+          const shipment = shipments[index]
+          if (shipment.orderId === where.orderId && shipment.status && where.status.in.includes(shipment.status)) {
+            shipments.splice(index, 1)
+          }
+        }
+        return { count: before - shipments.length }
       },
     },
     shipmentLine: {
@@ -653,4 +674,50 @@ test('allocateSalesOrder blocks allocation edits after shipment accounting is jo
   assert.deepEqual(state.allocations, [])
   assert.equal(state.stockLevels[0].reservedQty, 0)
   assert.equal(state.order.status, 'PROCESSING')
+})
+
+test('assertReservationReleaseDelta verifies exact per-scope reservation release', () => {
+  assert.doesNotThrow(() => assertReservationReleaseDelta(
+    [{ productId: 'product-1', warehouseId: 'warehouse-1', reservedQty: 5 }],
+    [{ productId: 'product-1', warehouseId: 'warehouse-1', reservedQty: 3 }],
+    [{ productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
+  ))
+
+  assert.throws(
+    () => assertReservationReleaseDelta(
+      [{ productId: 'product-1', warehouseId: 'warehouse-1', reservedQty: 5 }],
+      [{ productId: 'product-1', warehouseId: 'warehouse-1', reservedQty: 4 }],
+      [{ productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
+    ),
+    /Reservation release invariant failed/,
+  )
+})
+
+test('cancelSalesOrderFulfillmentState releases allocations, deletes active non-shipped shipments, and preserves unrelated reservations', async () => {
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+    },
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 10, reservedQty: 5 }],
+    allocations: [{
+      orderId: 'order-1',
+      lineId: 'line-1',
+      productId: 'product-1',
+      warehouseId: 'warehouse-1',
+      qty: 2,
+    }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', status: 'PICKING', shipmentJournalDate: null }],
+  })
+  const client = createClient(state)
+
+  const result = await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' })
+
+  assert.equal(result.previousStatus, 'ALLOCATED')
+  assert.equal(result.releasedAllocationCount, 1)
+  assert.equal(result.deletedShipmentCount, 1)
+  assert.equal(state.order.status, 'CANCELLED')
+  assert.deepEqual(state.allocations, [])
+  assert.deepEqual(state.shipments, [])
+  assert.equal(state.stockLevels[0].reservedQty, 3)
 })

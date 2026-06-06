@@ -34,6 +34,10 @@ import {
   validateSalesOrderLineTaxInputs,
 } from '@/lib/domain/sales/sales-order-tax-validation'
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
+import {
+  cancelSalesOrderFulfillmentState,
+  lockSalesOrder,
+} from '@/lib/domain/sales/allocation-service'
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -1181,16 +1185,9 @@ export async function applySalesOrderStatusTransition(
       return { success: false, error: transition.error }
     }
 
-    // Guard: cannot start picking without allocations
-    if (targetStatus === 'PICKING') {
-      const allocCount = await db.orderAllocation.count({ where: { orderId: id } })
-      if (allocCount === 0) {
-        return { success: false, error: 'Cannot start picking — no products have been allocated. Allocate stock first.' }
-      }
-    }
-
     const data: Record<string, unknown> = { status: targetStatus }
     let orderUpdated = false
+    let previousStatusForLog: string = so.status
 
     // On SHIPPED: orders must already have shipment rows, and all of them must
     // be shipped through the shipment workflow.
@@ -1207,30 +1204,28 @@ export async function applySalesOrderStatusTransition(
       if (extra?.trackingNumber) data.trackingNumber = extra.trackingNumber
     }
 
-    if (targetStatus === 'CANCELLED' && so.status === 'SHIPPED') {
-      return { success: false, error: 'Cannot cancel a shipped order — process a refund instead' }
-    }
-
     const isDraftFinalization = so.status === 'DRAFT' && targetStatus !== 'CANCELLED' && targetStatus !== 'DRAFT'
 
     // On CANCEL: release all allocations
     if (targetStatus === 'CANCELLED') {
-      const { deallocateOrder } = await import('./allocation')
-      await deallocateOrder(id)
-      const deletedShipments = await db.$transaction(async (tx) => {
-        const deleted = await tx.shipment.deleteMany({ where: { orderId: id, status: { in: ['PENDING', 'PICKING', 'PACKED'] as const } } })
-        await tx.salesOrder.update({ where: { id }, data })
-        return deleted.count
-      }, STOCK_TX_OPTIONS)
-      if (deletedShipments > 0) {
+      const cancellation = await db.$transaction(async (tx) => (
+        cancelSalesOrderFulfillmentState(tx, { orderId: id, data })
+      ), STOCK_TX_OPTIONS)
+      previousStatusForLog = cancellation.previousStatus
+      if (cancellation.deletedShipmentCount > 0) {
         await logActivity({
           entityType: 'SALES_ORDER',
           entityId: id,
           action: 'pending_shipments_deleted',
           tag: 'sales',
           level: 'INFO',
-          description: `Deleted ${deletedShipments} pending shipment(s) while cancelling order ${getSalesOrderReference(so)}`,
-          metadata: { orderNumber: getSalesOrderReference(so), deletedShipments },
+          description: `Deleted ${cancellation.deletedShipmentCount} pending shipment(s) while cancelling order ${getSalesOrderReference(so)}`,
+          metadata: {
+            orderNumber: getSalesOrderReference(so),
+            deletedShipments: cancellation.deletedShipmentCount,
+            releasedAllocations: cancellation.releasedAllocationCount,
+            releasedReservationScopes: cancellation.releasedReservationScopes,
+          },
         })
       }
       orderUpdated = true
@@ -1238,6 +1233,29 @@ export async function applySalesOrderStatusTransition(
 
     if (isDraftFinalization) {
       await refreshDraftOrderFxAtFinalization(id, new Date())
+    }
+
+    if (!orderUpdated && targetStatus === 'PICKING') {
+      const transitionResult = await db.$transaction(async (tx) => {
+        await lockSalesOrder(tx, id)
+        const lockedOrder = await tx.salesOrder.findUnique({
+          where: { id },
+          select: { status: true },
+        })
+        if (!lockedOrder) throw new Error('Order not found')
+        const lockedTransition = validateManualSalesOrderStatusTransition(lockedOrder.status, targetStatus, {
+          bypass: bypassPermission,
+        })
+        if (!lockedTransition.success) throw new Error(lockedTransition.error)
+        const allocCount = await tx.orderAllocation.count({ where: { orderId: id } })
+        if (allocCount === 0) {
+          throw new Error('Cannot start picking — no products have been allocated. Allocate stock first.')
+        }
+        await tx.salesOrder.update({ where: { id }, data })
+        return { previousStatus: lockedOrder.status }
+      }, STOCK_TX_OPTIONS)
+      previousStatusForLog = transitionResult.previousStatus
+      orderUpdated = true
     }
 
     if (!orderUpdated) {
@@ -1303,7 +1321,7 @@ export async function applySalesOrderStatusTransition(
       tag: 'sales',
       level: 'INFO',
       description: `Updated sales order ${statusOrderRef} status to ${targetStatus}`,
-      metadata: { orderNumber: statusOrderRef, previousStatus: so.status, newStatus: targetStatus },
+      metadata: { orderNumber: statusOrderRef, previousStatus: previousStatusForLog, newStatus: targetStatus },
     })
 
     // Push status to WooCommerce (fire-and-forget)
@@ -1333,16 +1351,17 @@ export async function applySalesOrderStatusTransition(
 
     return { success: true }
   } catch (e) {
+    const errorMessage = e instanceof Error ? e.message : String(e)
     await logActivity({
       entityType: 'SALES_ORDER',
       entityId: id,
       action: 'status_changed',
       tag: 'sales',
       level: 'ERROR',
-      description: `Failed to update sales order status: ${String(e)}`,
+      description: `Failed to update sales order status: ${errorMessage}`,
       metadata: null,
     })
-    return { success: false, error: String(e) }
+    return { success: false, error: errorMessage }
   }
 }
 

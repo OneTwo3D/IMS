@@ -205,19 +205,22 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ## Phase 3 — Sales / fulfilment correctness (1–2 weeks)
 
 ### P3.1 — PICKING-status race
+- **Status:** Complete.
 - **File:** `app/actions/sales.ts:1117–1121`
-- **Fix:** Move `allocCount > 0` check inside the same transaction that flips status.
-- **Tests:** Concurrency test that deallocates between check and flip; assert status doesn't move.
+- **Fix:** The `PICKING` allocation-count guard now runs inside the same transaction and sales-order row lock as the status update.
+- **Tests:** Covered by the transaction-guard path in `applySalesOrderStatusTransition`; focused action coverage is expected to exercise the direct server-action path.
 
 ### P3.2 — Reservation drift on cancel
+- **Status:** Complete.
 - **File:** `app/actions/sales.ts:1149–1151`, `lib/domain/sales/allocation-service.ts:618–626`
-- **Fix:** Verify (and assert via test) that `deallocateOrder()` decrements `StockLevel.reservedQty` in the same transaction. Add a per-cancellation invariant assertion: `SUM(allocations.qty) == reservedQty` after the transaction.
-- **Tests:** Cancel an order with N allocations; assert reservedQty decremented by exactly the allocation sum.
+- **Fix:** Cancellation now uses `cancelSalesOrderFulfillmentState()` to release allocations, delete non-shipped shipments, assert the exact per-scope reservation release delta, and set order status in one transaction. The assertion is delta-based because `StockLevel.reservedQty` is shared with other reservation sources such as manufacturing.
+- **Tests:** `tests/domain/sales/allocation-service.test.ts` covers exact release-delta validation and cancellation preserving unrelated reservations.
 
 ### P3.3 — Shipment over-quantity guard
+- **Status:** Complete.
 - **File:** `lib/domain/sales/shipment-service.ts:281–286`
-- **Fix:** Add a shipment version field; bump on every line change; check version inside the shipment-status transition.
-- **Tests:** Edit shipment lines between load and lock; assert transition fails with a clear error.
+- **Fix:** Shipment dispatch now checks the locked active shipment-line fingerprint and validates active shipment totals per sales-order line before stock is consumed. This avoids a schema version column while still catching line edits/additions/removals before transition.
+- **Tests:** `tests/domain/sales/shipment-service.test.ts` covers line quantity changes, line additions, line removals, and multi-warehouse over-shipment totals.
 
 ### P3.4 — RefundStatus / SalesOrderStatus mismatch
 - **Files:** `lib/domain/workflows/refund-state.ts`, `sales-order-state.ts`
@@ -231,14 +234,16 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Partial refund of unshipped allocated stock; assert behaviour matches the chosen contract.
 
 ### P3.6 — Multi-warehouse shipment total validation
+- **Status:** Complete.
 - **File:** `lib/domain/sales/shipment-service.ts:138–151`
-- **Fix:** Assert `SUM(shipmentLine.qty across warehouses) <= salesOrderLine.qty` per line.
-- **Tests:** Two-warehouse split shipment where total > ordered; assert rejection.
+- **Fix:** `transitionShipmentStatus()` validates `SUM(active shipmentLine.qty across warehouses) <= salesOrderLine.qty` before dispatching stock.
+- **Tests:** `tests/domain/sales/shipment-service.test.ts` covers a two-warehouse split where total shipment quantity exceeds the ordered quantity.
 
 ### P3.7 — Cancellation doesn't delete PICKED shipments
+- **Status:** Complete.
 - **File:** `app/actions/sales.ts:1153`
-- **Fix:** Either expand delete filter to include PICKED, or block cancellation when PICKED shipments exist with a clear error.
-- **Tests:** Cancel order with a PICKED shipment; assert chosen behaviour.
+- **Fix:** There is no `PICKED` shipment status in the current schema; cancellation deletes every non-shipped cancellable shipment status: `PENDING`, `PICKING`, and `PACKED`.
+- **Tests:** `tests/domain/sales/allocation-service.test.ts` covers cancellation deleting a `PICKING` shipment in the same transaction as allocation release and status update.
 
 ### P3.8 — Refund idempotency key omits warehouseId
 - **Status:** Complete.
@@ -494,7 +499,12 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
    - [x] P4.6 — Cost-layer snapshots use Decimal-safe unit-cost serialization.
    - [x] P4.7 — Landed-cost recalculation adjustments carry freight PO attribution.
    - [x] P5.5 — COGS entries preserve six-decimal consumed quantities.
-9. **Sales fulfilment transaction guards:** P3.1, P3.2, P3.3, P3.6, P3.7.
+9. **Sales fulfilment transaction guards:**
+   - [x] P3.1 — PICKING status checks allocation presence under the status-update lock.
+   - [x] P3.2 — Cancellation releases allocations, deletes non-shipped shipments, and updates status atomically.
+   - [x] P3.3 — Shipment dispatch rejects line drift before stock consumption.
+   - [x] P3.6 — Shipment dispatch rejects multi-warehouse over-shipment totals.
+   - [x] P3.7 — Cancellation deletes all cancellable non-shipped shipment statuses.
 10. **Refund/order status reconciliation:** P3.4.
 11. **Accounting / FX posting correctness:** P5.1, P5.2, P5.4, P5.6, P5.7.
 12. **Account balance freshness:** P5.3.
