@@ -85,6 +85,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Risk:** `FOR UPDATE` interactions with Prisma's connection pool — verify no deadlock under load.
 
 ### P1.2 — Orphaned cost layers on PO cancellation
+- **Status:** Complete.
 - **File:** `app/actions/purchase-orders.ts:1985–2018`
 - **Problem:** `cancelPurchaseOrder()` flips status but doesn't delete or reverse cost layers from prior partial receipts. Layers reference a cancelled line; FIFO accountability breaks.
 - **Fix:** In the same transaction as the status flip:
@@ -94,7 +95,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Acceptance:**
   - After cancelling a partially-received PO, no `cost_layers.remainingQty > 0` rows reference the cancelled line.
   - Stock movement evidence shows the reversal.
-- **Tests:** Unit test cancellation of a PO with 2 received layers, assert reversal movements + `remainingQty = 0`.
+- **Tests:** `tests/domain/purchasing/po-cancellation.test.ts` covers reversal movements, stock decrements, COGS entries, and `remainingQty = 0`.
 
 ### P1.3 — Refund stock-movement idempotency without cost-layer guard
 - **Status:** Complete.
@@ -250,9 +251,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ## Phase 4 — Purchase / manufacturing correctness (1 week)
 
 ### P4.1 — Freight receipt allowed against uncommitted POs
+- **Status:** Complete.
 - **File:** `lib/domain/workflows/action-guards.ts:87–100`
 - **Fix:** Whitelist post-commitment statuses (`PO_SENT, SHIPPED, PARTIALLY_RECEIVED, RECEIVED`) for `validateLinkedFreightReceiptStatus`. Reject DRAFT, RFQ_SENT.
-- **Tests:** Attempt to receive against DRAFT PO; assert rejection.
+- **Tests:** `tests/domain/workflows/action-guards.test.ts` asserts draft/RFQ/quote freight POs cannot be marked received from linked freight handling.
 
 ### P4.2 — Manufacturing output cost layer missing receivedAt
 - **Status:** Complete.
@@ -266,9 +268,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Remove stock when no cost layers; assert chosen behaviour.
 
 ### P4.4 — Cancelled-PO cancellation not idempotent
+- **Status:** Complete.
 - **File:** `app/actions/purchase-orders.ts:1985–2018`
 - **Fix:** Wrap the state transition validation: if already CANCELLED, return success without changes.
-- **Tests:** Call `cancelPurchaseOrder` twice; assert second call succeeds silently.
+- **Tests:** `tests/domain/purchasing/po-cancellation.test.ts` covers the cancellation no-op helper used by `cancelPurchaseOrder()`.
 
 ### P4.5 — Stock movement `unitCostBase` not finite-checked
 - **File:** `app/actions/purchase-orders.ts:1787`
@@ -476,7 +479,10 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
    - [x] P1.7 — WIP value includes consumed component value.
    - [x] P4.2 — Manufacturing output cost layers use production completion timestamps.
    - [x] P4.8 — Manufacturing cost-line negativity handles rounding dust before storage.
-7. **PO cancellation and freight correctness:** P1.2, P4.1, P4.4.
+7. **PO cancellation and freight correctness:**
+   - [x] P1.2 — PO cancellation reverses remaining cost layers.
+   - [x] P4.1 — Freight receipts require committed purchase-order states.
+   - [x] P4.4 — Cancelled purchase-order cancellation is idempotent.
 8. **Stock and cost-layer precision:** P4.3, P4.5, P4.6, P4.7, P5.5.
 9. **Sales fulfilment transaction guards:** P3.1, P3.2, P3.3, P3.6, P3.7.
 10. **Refund/order status reconciliation:** P3.4.

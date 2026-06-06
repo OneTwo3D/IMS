@@ -20,6 +20,13 @@ export type WorkflowTransitionGuardResult =
   | { success: true }
   | { success: false; error: string }
 
+const LINKED_FREIGHT_RECEIPT_STATUSES = new Set<PurchaseOrderStatus>([
+  'PO_SENT',
+  'SHIPPED',
+  'PARTIALLY_RECEIVED',
+  'RECEIVED',
+])
+
 function isKnownStatus<Status extends string>(
   statuses: readonly Status[],
   status: string,
@@ -90,7 +97,9 @@ export function validateLinkedFreightReceiptStatus(
   if (!isKnownStatus(PURCHASE_ORDER_STATUSES, status)) {
     return { success: false, error: `Unknown current purchase order status: ${status}` }
   }
-  if (['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED'].includes(status)) {
+  // Only states committed to receiving can be auto-received from linked freight.
+  // Pre-commitment and post-completion states are intentionally rejected.
+  if (LINKED_FREIGHT_RECEIPT_STATUSES.has(status)) {
     return { success: true }
   }
   return {

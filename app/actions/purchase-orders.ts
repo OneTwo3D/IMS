@@ -22,6 +22,7 @@ import {
 } from '@/lib/domain/purchasing/landed-cost-service'
 import {
   assertPurchaseOrderCancellationHasNoInvoices,
+  isPurchaseOrderCancellationNoop,
   reversePurchaseOrderCostLayersForCancellation,
   type PurchaseOrderCostLayerReversal,
 } from '@/lib/domain/purchasing/po-cancellation'
@@ -44,6 +45,18 @@ import {
 } from '@/lib/domain/inventory/stock-movement-value'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
+
+async function logPurchaseOrderCancellationNoop(id: string, reference: string): Promise<void> {
+  await logActivity({
+    entityType: 'PURCHASE_ORDER',
+    entityId: id,
+    action: 'cancelled_noop',
+    tag: 'purchase',
+    level: 'INFO',
+    description: `Cancellation requested on already-cancelled PO ${reference}`,
+    metadata: { reference },
+  })
+}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -1997,6 +2010,18 @@ export async function cancelPurchaseOrder(id: string): Promise<{
     await requirePermission('purchasing.create')
     const cancellationDate = new Date().toISOString().slice(0, 10)
 
+    const fastExisting = await db.purchaseOrder.findUnique({
+      where: { id },
+      select: { status: true, reference: true },
+    })
+    if (!fastExisting) throw new Error('PO not found')
+    if (isPurchaseOrderCancellationNoop(fastExisting.status)) {
+      await logPurchaseOrderCancellationNoop(id, fastExisting.reference)
+      revalidatePath('/purchase-orders')
+      revalidatePath(`/purchase-orders/${id}`)
+      return { success: true }
+    }
+
     const cancellation = await db.$transaction(async (tx) => {
       const existing = await tx.purchaseOrder.findUnique({
         where: { id },
@@ -2008,6 +2033,12 @@ export async function cancelPurchaseOrder(id: string): Promise<{
         },
       })
       if (!existing) throw new Error('PO not found')
+      if (isPurchaseOrderCancellationNoop(existing.status)) {
+        return {
+          alreadyCancelled: true as const,
+          reference: existing.reference,
+        }
+      }
       const transition = validatePurchaseOrderStatusTransition(existing.status, 'CANCELLED')
       if (!transition.success) throw new Error(transition.error)
       assertPurchaseOrderCancellationHasNoInvoices(existing._count.invoices)
@@ -2051,8 +2082,15 @@ export async function cancelPurchaseOrder(id: string): Promise<{
         }
       }
 
-      return { existing, reversal }
+      return { alreadyCancelled: false as const, existing, reversal }
     }, STOCK_TX_OPTIONS)
+
+    if (cancellation.alreadyCancelled) {
+      await logPurchaseOrderCancellationNoop(id, cancellation.reference)
+      revalidatePath('/purchase-orders')
+      revalidatePath(`/purchase-orders/${id}`)
+      return { success: true }
+    }
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)

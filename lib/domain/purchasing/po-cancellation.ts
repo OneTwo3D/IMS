@@ -1,4 +1,4 @@
-import type { Prisma } from '@/app/generated/prisma/client'
+import type { Prisma, PurchaseOrderStatus } from '@/app/generated/prisma/client'
 import {
   addMoney,
   multiplyMoney,
@@ -41,6 +41,10 @@ export function assertPurchaseOrderCancellationHasNoInvoices(invoiceCount: numbe
   if (invoiceCount > 0) {
     throw new Error('Cannot cancel a purchase order after supplier invoices have been recorded. Create a supplier credit or bill reversal instead.')
   }
+}
+
+export function isPurchaseOrderCancellationNoop(status: PurchaseOrderStatus): boolean {
+  return status === 'CANCELLED'
 }
 
 export async function reversePurchaseOrderCostLayersForCancellation(

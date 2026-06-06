@@ -52,6 +52,10 @@ This repository uses an `x.y.z` release scheme.
 
 - **Manufacturing WIP and cost-layer timing now align with finance expectations.** WIP reporting includes both consumed component value and manufacturing cost-line totals, production-created cost layers receive the production completion timestamp for FIFO ordering, and manufacturing cost-line parsing now drops sub-half-penny negative rounding dust while still rejecting real credit-style negative adjustments.
 
+### Fixes (purchase cancellation and freight)
+
+- **Purchase-order cancellation and linked freight receipt guards are stricter.** Cancelling a partially received PO reverses remaining receipt cost layers, and repeated cancellation of an already-cancelled PO is now idempotent. Linked freight POs can only auto-receive from committed states (`PO_SENT`, `SHIPPED`, `PARTIALLY_RECEIVED`, `RECEIVED`), blocking draft, RFQ, and quote freight orders.
+
 ### Fixes (Mintsoft webhook security)
 
 - **Mintsoft ASN booked-in webhooks now bind the freshness timestamp into the HMAC signature.** IMS verifies `HMAC_SHA256(secret, "${timestamp}.${rawBody}")` and rejects body-only signatures.

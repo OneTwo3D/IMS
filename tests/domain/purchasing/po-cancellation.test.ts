@@ -1,9 +1,12 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { join } from 'node:path'
 import test from 'node:test'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import {
   assertPurchaseOrderCancellationHasNoInvoices,
+  isPurchaseOrderCancellationNoop,
   reversePurchaseOrderCostLayersForCancellation,
 } from '@/lib/domain/purchasing/po-cancellation'
 
@@ -238,4 +241,22 @@ test('assertPurchaseOrderCancellationHasNoInvoices rejects billed purchase order
     () => assertPurchaseOrderCancellationHasNoInvoices(1),
     /Cannot cancel a purchase order after supplier invoices have been recorded/,
   )
+})
+
+test('isPurchaseOrderCancellationNoop treats already cancelled purchase orders as idempotent', () => {
+  assert.equal(isPurchaseOrderCancellationNoop('CANCELLED'), true)
+  assert.equal(isPurchaseOrderCancellationNoop('PO_SENT'), false)
+  assert.equal(isPurchaseOrderCancellationNoop('RECEIVED'), false)
+})
+
+test('cancelPurchaseOrder action wires already-cancelled no-op before the stock transaction', () => {
+  const source = readFileSync(join(process.cwd(), 'app/actions/purchase-orders.ts'), 'utf8')
+  const fastPathIndex = source.indexOf('isPurchaseOrderCancellationNoop(fastExisting.status)')
+  const transactionIndex = source.indexOf('const cancellation = await db.$transaction')
+
+  assert.notEqual(fastPathIndex, -1)
+  assert.notEqual(transactionIndex, -1)
+  assert.ok(fastPathIndex < transactionIndex, 'expected no-op status check before stock transaction')
+  assert.match(source, /select:\s*\{\s*status:\s*true,\s*reference:\s*true\s*\}/)
+  assert.match(source, /action:\s*'cancelled_noop'/)
 })
