@@ -39,6 +39,11 @@ This repository uses an `x.y.z` release scheme.
 
 - **Allocation availability now uses Decimal arithmetic internally.** Sales allocation stock maps, product graph component quantities, kit requirement expansion, coverage checks, and reservation deltas now keep fractional quantities as `Prisma.Decimal` through the allocation service. This avoids binary floating-point drift when allocating fractional kit/component quantities while preserving existing UI and report number boundaries.
 
+### Fixes (refund correctness)
+
+- **Refund return-stock idempotency now includes the return warehouse.** Split returns of the same refund line to different warehouses no longer collide on the same `RETURN_INBOUND` idempotency key. Because IMS is not live yet, no old-key compatibility path is kept; persistent dev or staging databases with old-shape refund return keys should reset those `RETURN_INBOUND:refund:*:line:*` movement idempotency keys or rebuild the database before replaying refund returns.
+- **Refund restocking now requires shipped-stock evidence.** Allocation-only refund rows no longer silently restock from unshipped reservations when no shipment line exists on the original order. Those attempts now return a clear operator message and should be processed as cash-only refunds or corrected to refund a shipped line.
+
 ### Fixes (Mintsoft webhook security)
 
 - **Mintsoft ASN booked-in webhooks now bind the freshness timestamp into the HMAC signature.** IMS verifies `HMAC_SHA256(secret, "${timestamp}.${rawBody}")` and rejects body-only signatures.

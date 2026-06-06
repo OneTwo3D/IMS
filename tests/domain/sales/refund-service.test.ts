@@ -108,6 +108,26 @@ type State = {
   nextRefundLineId: number
   nextCostLayerId: number
   failStockLevelUnique?: boolean
+  wrapTransactionErrors?: boolean
+}
+
+function cloneTestStateValue<T>(value: T): T {
+  if (value instanceof Prisma.Decimal) return new Prisma.Decimal(value) as T
+  if (value instanceof Date) return new Date(value.getTime()) as T
+  if (Array.isArray(value)) return value.map((entry) => cloneTestStateValue(entry)) as T
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, cloneTestStateValue(entry)]),
+    ) as T
+  }
+  return value
+}
+
+function restoreTestState(state: State, snapshot: State) {
+  for (const key of Object.keys(state) as Array<keyof State>) {
+    delete state[key]
+  }
+  Object.assign(state, cloneTestStateValue(snapshot))
 }
 
 const accountingSettings: AccountingSettings = {
@@ -170,6 +190,10 @@ function baseState(overrides: Partial<State> = {}): State {
 }
 
 function createClient(state: State): RefundServiceClient {
+  // This in-memory Prisma mock is intentionally scoped to refund-service unit
+  // tests. It models transaction rollback and the two shipment read shapes used
+  // by refund creation: physical SHIPPED rows for restocking and journaled rows
+  // for accounting reversal snapshots.
   const client = {
     $queryRaw: async () => [],
     $executeRaw: async () => {
@@ -177,11 +201,14 @@ function createClient(state: State): RefundServiceClient {
       return 0
     },
     $transaction: async (callback: (tx: unknown) => Promise<unknown>) => {
-      const snapshot = structuredClone(state) as State
+      const snapshot = cloneTestStateValue(state)
       try {
         return await callback(client)
       } catch (error) {
-        Object.assign(state, snapshot)
+        restoreTestState(state, snapshot)
+        if (state.wrapTransactionErrors) {
+          throw new Error('Wrapped transaction error', { cause: error })
+        }
         throw error
       }
     },
@@ -210,10 +237,14 @@ function createClient(state: State): RefundServiceClient {
           }
         }
         if (select.allocations || select.shipments || select.refunds) {
-          const shipmentSelect = select.shipments as { where?: { shipmentJournalDate?: { not?: null } } } | undefined
+          const shipmentSelect = select.shipments as { where?: { shipmentJournalDate?: { not?: null }; status?: string } } | undefined
           const selectedShipments = state.shipments
             .filter((row) => row.orderId === order.id)
-            .filter((row) => shipmentSelect?.where?.shipmentJournalDate ? row.shipmentJournalDate != null : row.status === 'SHIPPED')
+            .filter((row) => {
+              if (shipmentSelect?.where?.shipmentJournalDate) return row.shipmentJournalDate != null
+              if (shipmentSelect?.where?.status) return row.status === shipmentSelect.where.status
+              return true
+            })
           return {
             allocations: state.allocations.filter((row) => row.orderId === order.id),
             lines: state.lines.filter((row) => row.orderId === order.id),
@@ -980,12 +1011,55 @@ test('createSalesOrderRefund rejects restocking a refund line with no shipped so
 
   assert.deepEqual(result, {
     success: false,
-    error: 'Cannot return refunded stock for product product-2: no shipped stock source exists',
+    error: 'Cannot restock product product-2 for refund: no shipment line exists on the original order. Process as cash-only or refund a shipped line.',
   })
   assert.equal(state.refunds.length, 0)
   assert.equal(state.refundLines.length, 0)
   assert.equal(state.movements.length, 0)
   assert.equal(state.stockLevels.length, 0)
+})
+
+test('createSalesOrderRefund unwraps transaction-wrapped return source errors', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: null,
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: null,
+    }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 100 }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: null,
+      revenueRecognizedAmount: null,
+      cogsBatchAmount: null,
+      lines: [],
+    }],
+    wrapTransactionErrors: true,
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 100 }],
+    reason: 'Refund unshipped line',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.deepEqual(result, {
+    success: false,
+    error: 'Cannot restock product product-1 for refund: no shipment line exists on the original order. Process as cash-only or refund a shipped line.',
+  })
+  assert.equal(state.refunds.length, 0)
+  assert.equal(state.refundLines.length, 0)
 })
 
 test('createSalesOrderRefund keeps same-product refund lines as distinct inbound movements', async () => {
@@ -1427,7 +1501,7 @@ test('retrySalesOrderRefundAccounting does not restock allocation-only refund ro
   assert.equal(result.success, false)
   assert.equal(
     result.success ? '' : result.error,
-    'Refund was created, but accounting reversal staging failed: Cannot return refunded stock for product product-1: no shipped stock source exists',
+    'Refund was created, but accounting reversal staging failed: Cannot restock product product-1 for refund: no shipment line exists on the original order. Process as cash-only or refund a shipped line.',
   )
   assert.equal(state.movements.length, 0)
   assert.equal(state.stockLevels.length, 0)
