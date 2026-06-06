@@ -8,7 +8,7 @@
  */
 
 import type { Prisma } from '@/app/generated/prisma/client'
-import { parseCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
+import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import {
   addMoney,
@@ -51,6 +51,25 @@ export type ConsumedLayer = {
   costLayerId: string
   qty: Decimal
   unitCostBase: Decimal
+}
+
+export function cogsEntryDataFromConsumed(
+  movementId: string,
+  consumed: ConsumedLayer,
+): {
+  costLayerId: string
+  movementId: string
+  qty: string
+  unitCostBase: string
+  totalCostBase: string
+} {
+  return {
+    costLayerId: consumed.costLayerId,
+    movementId,
+    qty: roundQuantity(consumed.qty, 6).toFixed(6),
+    unitCostBase: roundQuantity(consumed.unitCostBase, 6).toFixed(6),
+    totalCostBase: roundQuantity(multiplyMoney(consumed.qty, consumed.unitCostBase), 6).toFixed(6),
+  }
 }
 
 export type CostLayerSourceLineInput = {
@@ -212,7 +231,7 @@ export async function createCostLayer(
     productId: string
     warehouseId: string
     qty: number
-    unitCostBase: number
+    unitCostBase: DecimalInput
     poLineId?: string
     adjustmentMovementId?: string
     productionOrderId?: string
@@ -336,9 +355,7 @@ export async function updateSnapshotsForCostLayerChange(
   newUnitCostBase: DecimalInput,
 ): Promise<number> {
   const newUnitCost = toDecimal(newUnitCostBase)
-  // Snapshot JSON is legacy/audit data stored as a number, so values above
-  // JavaScript's double-precision ceiling are intentionally truncated here.
-  const serializedUnitCostBase = newUnitCost.toNumber()
+  const serializedUnitCostBase = roundQuantity(newUnitCost, 6).toFixed(6)
   // PostgreSQL jsonb_set can't easily iterate arrays. Use a raw UPDATE
   // that rewrites the unitCostBase for every matching array element.
   // The query: for each row whose costLayerSnapshot contains an entry
@@ -371,7 +388,12 @@ export async function updateSnapshotsForCostLayerChange(
       const patched = (row.costLayerSnapshot as Array<Record<string, unknown>>).map((entry) => {
         if (entry.costLayerId === costLayerId && !snapshotUnitCostMatches(entry.unitCostBase, newUnitCost, costLayerId)) {
           changed = true
-          return { ...entry, unitCostBase: serializedUnitCostBase }
+          return serializeCostLayerSnapshot([{
+            ...entry,
+            costLayerId,
+            qty: entry.qty as DecimalInput,
+            unitCostBase: serializedUnitCostBase,
+          }])[0]
         }
         return entry
       })

@@ -3,6 +3,7 @@ import test from 'node:test'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
+  serializeCostLayerSnapshot,
   sumCostLayerSnapshot,
   takeFromSnapshotEntries,
 } from '../lib/cost-layer-snapshots.ts'
@@ -125,4 +126,16 @@ test('snapshot cost summation uses Decimal arithmetic internally', () => {
   ])
 
   assert.equal(total.toString(), '0.05')
+})
+
+test('transfer cost-layer snapshots serialize unit costs as six-decimal strings', () => {
+  const serialized = serializeCostLayerSnapshot([
+    { costLayerId: 'L1', qty: '0.123456', unitCostBase: '1.12345678' },
+  ])
+  assert.deepEqual(serialized, [
+    { costLayerId: 'L1', qty: '0.123456', unitCostBase: '1.123457' },
+  ])
+
+  const parsed = parseCostLayerSnapshot(serialized)
+  assert.equal(parsed[0]?.unitCostBase, '1.123457')
 })

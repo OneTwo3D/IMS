@@ -56,6 +56,10 @@ This repository uses an `x.y.z` release scheme.
 
 - **Purchase-order cancellation and linked freight receipt guards are stricter.** Cancelling a partially received PO reverses remaining receipt cost layers, and repeated cancellation of an already-cancelled PO is now idempotent. Linked freight POs can only auto-receive from committed states (`PO_SENT`, `SHIPPED`, `PARTIALLY_RECEIVED`, `RECEIVED`), blocking draft, RFQ, and quote freight orders.
 
+### Fixes (stock and cost-layer precision)
+
+- **Stock and cost-layer precision paths are stricter.** Stock removals require FIFO cost-layer coverage, purchase receipts reject non-finite unit costs before stock writes, transfer and shipment cost-layer snapshots serialize Decimal-safe six-decimal unit costs, landed-cost recalculation adjustments carry `freightPoId` attribution, and COGS entries now preserve six-decimal consumed quantities.
+
 ### Fixes (Mintsoft webhook security)
 
 - **Mintsoft ASN booked-in webhooks now bind the freshness timestamp into the HMAC signature.** IMS verifies `HMAC_SHA256(secret, "${timestamp}.${rawBody}")` and rejects body-only signatures.

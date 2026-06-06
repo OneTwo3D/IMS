@@ -41,6 +41,7 @@ export type LandedCostRecalcResult = {
   inventoryTransitAdjustments: Array<{
     primaryPoId: string
     primaryPoRef: string
+    freightPoId: string | null
     eventKey: string
     totalDelta: number
   }>
@@ -49,6 +50,7 @@ export type LandedCostRecalcResult = {
   cogsAdjustments: Array<{
     primaryPoId: string
     primaryPoRef: string
+    freightPoId: string | null
     eventKey: string
     totalDelta: number
   }>
@@ -288,6 +290,7 @@ function landedCostAdjustmentKeyPayload(adj: LandedCostAdjustment): Record<strin
   return {
     primaryPoId: adj.primaryPoId,
     primaryPoRef: adj.primaryPoRef,
+    freightPoId: adj.freightPoId,
     eventKey: adj.eventKey,
     totalDelta: Math.round(adj.totalDelta * 100) / 100,
   }
@@ -729,6 +732,7 @@ export async function recalculateLandedCosts(
       result.cogsAdjustments.push({
         primaryPoId,
         primaryPoRef: primaryPo.reference,
+        freightPoId,
         eventKey,
         totalDelta: roundAdjustmentTotalDelta(totalCogsDelta),
       })
@@ -737,6 +741,7 @@ export async function recalculateLandedCosts(
       result.inventoryTransitAdjustments.push({
         primaryPoId,
         primaryPoRef: primaryPo.reference,
+        freightPoId,
         eventKey,
         totalDelta: roundAdjustmentTotalDelta(totalInventoryDelta),
       })
@@ -1012,6 +1017,7 @@ export async function recalculateDirectLandedCosts(
     result.inventoryTransitAdjustments.push({
       primaryPoId: poId,
       primaryPoRef: po.reference,
+      freightPoId: null,
       eventKey,
       totalDelta: roundAdjustmentTotalDelta(totalInventoryDelta),
     })
@@ -1020,6 +1026,7 @@ export async function recalculateDirectLandedCosts(
     result.cogsAdjustments.push({
       primaryPoId: poId,
       primaryPoRef: po.reference,
+      freightPoId: null,
       eventKey,
       totalDelta: roundAdjustmentTotalDelta(totalCogsDelta),
     })

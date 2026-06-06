@@ -17,7 +17,8 @@ import {
 } from '@/lib/cost-layers'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
-import { toDecimal } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import { serializeCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import {
   buildStockMovementValueFieldsFromConsumed,
   buildStockMovementValueFieldsFromTotal,
@@ -453,11 +454,11 @@ export async function dispatchTransfer(id: string): Promise<TransferResult> {
           await tx.stockTransferLine.update({
             where: { id: line.id },
             data: {
-              costLayerSnapshot: consumed.map((c) => ({
+              costLayerSnapshot: serializeCostLayerSnapshot(consumed.map((c) => ({
                 costLayerId: c.costLayerId,
-                qty: c.qty.toNumber(),
-                unitCostBase: c.unitCostBase.toNumber(),
-              })),
+                qty: c.qty,
+                unitCostBase: c.unitCostBase,
+              }))),
             },
           })
         }
@@ -597,8 +598,8 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
             qtyReceived: remainingQty,
           })
           const totalValueBase = snapshotSlice.reduce(
-            (sum, entry) => sum + (entry.qty * entry.unitCostBase),
-            0,
+            (sum, entry) => addMoney(sum, multiplyMoney(entry.qty, entry.unitCostBase)),
+            toDecimal(0),
           )
           await tx.stockMovement.create({
             data: {
@@ -628,12 +629,13 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
           // alreadyReceived units and returns only the next remainingQty
           // units, matching the same algorithm the WMS handler uses.
           for (const entry of snapshotSlice) {
-            if (entry.qty > 0 && entry.unitCostBase >= 0) {
+            const unitCostBase = toDecimal(entry.unitCostBase)
+            if (entry.qty > 0 && unitCostBase.gte(0)) {
               const newLayerId = await createCostLayer(tx, {
                 productId: line.productId,
                 warehouseId: transfer.toWarehouseId,
                 qty: entry.qty,
-                unitCostBase: entry.unitCostBase,
+                unitCostBase,
               })
               const copied = await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entry.qty)
               if (copied === 0) {
@@ -643,8 +645,8 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
                     sourceProductId: line.productId,
                     sourceCostLayerId: entry.costLayerId,
                     qty: entry.qty,
-                    unitCostBase: entry.unitCostBase,
-                    totalCostBase: Math.round(entry.qty * entry.unitCostBase * 1000000) / 1000000,
+                    unitCostBase,
+                    totalCostBase: roundQuantity(multiplyMoney(entry.qty, unitCostBase), 6).toFixed(6),
                   },
                 })
               }

@@ -9,6 +9,7 @@ import {
   type DecimalInput,
 } from '@/lib/domain/math/decimal'
 import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
+import { cogsEntryDataFromConsumed } from '@/lib/cost-layers'
 
 type TxClient = Prisma.TransactionClient
 
@@ -118,13 +119,11 @@ export async function reversePurchaseOrderCostLayersForCancellation(
       select: { id: true },
     })
     await tx.cogsEntry.create({
-      data: {
+      data: cogsEntryDataFromConsumed(movement.id, {
         costLayerId: layer.id,
-        movementId: movement.id,
-        qty: qty.toNumber(),
-        unitCostBase: unitCostBase.toNumber(),
-        totalCostBase: totalValueBase.toNumber(),
-      },
+        qty,
+        unitCostBase,
+      }),
     })
     await tx.stockLevel.update({
       where: { productId_warehouseId: { productId: layer.productId, warehouseId: layer.warehouseId } },

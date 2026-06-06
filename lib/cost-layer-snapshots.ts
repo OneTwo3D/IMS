@@ -1,14 +1,39 @@
-import { addMoney, multiplyMoney, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export type CostLayerSnapshotSource = 'allocation' | 'shipment'
 
 export type CostLayerSnapshotEntry = {
   costLayerId: string
   qty: number
-  unitCostBase: number
+  unitCostBase: DecimalInput
   orderAllocationId?: string
   shipmentLineId?: string
   source?: CostLayerSnapshotSource
+}
+
+export type SerializableCostLayerSnapshotEntry = Omit<CostLayerSnapshotEntry, 'qty' | 'unitCostBase'> & {
+  qty: DecimalInput
+  unitCostBase: DecimalInput
+}
+
+export function serializeCostLayerSnapshotEntry(
+  entry: SerializableCostLayerSnapshotEntry,
+): Record<string, string> & Pick<CostLayerSnapshotEntry, 'costLayerId' | 'orderAllocationId' | 'shipmentLineId' | 'source'> {
+  const serialized = {
+    costLayerId: entry.costLayerId,
+    qty: roundQuantity(entry.qty, 6).toFixed(6),
+    unitCostBase: roundQuantity(entry.unitCostBase, 6).toFixed(6),
+    ...(entry.orderAllocationId ? { orderAllocationId: entry.orderAllocationId } : {}),
+    ...(entry.shipmentLineId ? { shipmentLineId: entry.shipmentLineId } : {}),
+    ...(entry.source ? { source: entry.source } : {}),
+  }
+  return serialized
+}
+
+export function serializeCostLayerSnapshot(
+  entries: SerializableCostLayerSnapshotEntry[],
+): Array<ReturnType<typeof serializeCostLayerSnapshotEntry>> {
+  return entries.map(serializeCostLayerSnapshotEntry)
 }
 
 function isSnapshotSource(value: unknown): value is CostLayerSnapshotSource {
@@ -23,8 +48,14 @@ export function parseCostLayerSnapshot(value: unknown): CostLayerSnapshotEntry[]
     const row = entry as Record<string, unknown>
     const costLayerId = typeof row.costLayerId === 'string' ? row.costLayerId : ''
     const qty = Number(row.qty)
-    const unitCostBase = Number(row.unitCostBase)
-    if (!costLayerId || qty <= 0 || !Number.isFinite(unitCostBase)) return []
+    if (row.unitCostBase == null) return []
+    let unitCostBase: string
+    try {
+      unitCostBase = roundQuantity(row.unitCostBase as DecimalInput, 6).toFixed(6)
+    } catch {
+      return []
+    }
+    if (!costLayerId || !Number.isFinite(qty) || qty <= 0) return []
     return [{
       costLayerId,
       qty,

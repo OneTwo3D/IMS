@@ -263,9 +263,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Complete two production orders same day; assert FIFO order matches `completedAt`.
 
 ### P4.3 — Stock removal with no cost layers
+- **Status:** Complete.
 - **File:** `app/actions/stock.ts:232–248`
-- **Fix:** Either block adjustment when no layers exist, or create a sentinel zero-cost layer and emit a warning notice. Pick based on operator workflow.
-- **Tests:** Remove stock when no cost layers; assert chosen behaviour.
+- **Fix:** Stock-removal paths use strict FIFO consumption, so removals without cost-layer coverage fail before stock levels are written.
+- **Tests:** `tests/cost-layers.test.ts` covers strict FIFO rejection when no layers or insufficient layers exist.
 
 ### P4.4 — Cancelled-PO cancellation not idempotent
 - **Status:** Complete.
@@ -274,19 +275,22 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** `tests/domain/purchasing/po-cancellation.test.ts` covers the cancellation no-op helper used by `cancelPurchaseOrder()`.
 
 ### P4.5 — Stock movement `unitCostBase` not finite-checked
+- **Status:** Complete.
 - **File:** `app/actions/purchase-orders.ts:1787`
-- **Fix:** `assert(Number.isFinite(unitCostBase), 'unitCostBase must be finite')` before creating the movement.
-- **Tests:** Forge a landed-cost recalc that returns NaN; assert rejection.
+- **Fix:** Purchase receipts call `assertFinitePurchaseReceiptUnitCost()` before creating receipt stock movements or cost layers.
+- **Tests:** `tests/domain/purchasing/purchase-receipt-cost.test.ts` covers NaN, infinity, and negative receipt costs.
 
 ### P4.6 — Cost-layer snapshot precision loss
+- **Status:** Complete.
 - **File:** `app/actions/transfers.ts:456–462`
-- **Fix:** Store snapshot using `.toString()` (Decimal-safe) rather than number serialisation; restore via `new Prisma.Decimal(value)` on receive.
-- **Tests:** Round-trip a snapshot with 8-decimal `unitCostBase`; assert no precision loss.
+- **Fix:** Cost-layer snapshots serialize `qty` and `unitCostBase` as six-decimal strings and parse unit costs back through Decimal helpers before downstream valuation.
+- **Tests:** `tests/transfer-partial-receive.test.ts` and `tests/domain/purchasing/landed-cost-service.test.ts` cover snapshot serialization and refresh precision.
 
 ### P4.7 — Landed-cost recalc doesn't include freightPoId
+- **Status:** Complete.
 - **File:** `lib/domain/purchasing/landed-cost-service.ts:37–55`
 - **Fix:** Add `freightPoId: string | null` to the `LandedCostRecalcResult` adjustment objects so downstream accounting can attribute deltas correctly.
-- **Tests:** Recalc with two freight POs against one primary; assert each adjustment is correctly attributed.
+- **Tests:** `tests/domain/purchasing/landed-cost-service.test.ts` recalculates two freight POs against one primary and asserts each adjustment is attributed to the triggering freight PO.
 
 ### P4.8 — Manufacturing cost-line negativity check after rounding
 - **Status:** Complete.
@@ -319,9 +323,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Replay a synced sync log; assert no second Xero call.
 
 ### P5.5 — COGS entry decimal precision loss
+- **Status:** Complete.
 - **File:** `lib/cost-layers.ts:244`
-- **Fix:** Store `qty` with 6 decimals (or full Decimal precision) on `CogsEntry` rather than rounding to 4. Audit downstream consumers.
-- **Tests:** COGS entry for 0.123456 units; assert no precision loss on refund reversal.
+- **Fix:** `CogsEntry.qty` now stores six decimals via `DECIMAL(14,6)`, and COGS writers use centralized Decimal-safe serialization from consumed FIFO layers.
+- **Tests:** `tests/cost-layers.test.ts` covers six-decimal COGS entry serialization; related PO cancellation tests assert reversal writers use the new string contract.
 
 ### P5.6 — Payment allocation ordering not guaranteed
 - **File:** `lib/connectors/xero/sync-processor.ts:850–980`
@@ -483,7 +488,12 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
    - [x] P1.2 — PO cancellation reverses remaining cost layers.
    - [x] P4.1 — Freight receipts require committed purchase-order states.
    - [x] P4.4 — Cancelled purchase-order cancellation is idempotent.
-8. **Stock and cost-layer precision:** P4.3, P4.5, P4.6, P4.7, P5.5.
+8. **Stock and cost-layer precision:**
+   - [x] P4.3 — Stock removal requires FIFO cost-layer coverage.
+   - [x] P4.5 — Purchase receipt stock movement unit cost is finite-checked.
+   - [x] P4.6 — Cost-layer snapshots use Decimal-safe unit-cost serialization.
+   - [x] P4.7 — Landed-cost recalculation adjustments carry freight PO attribution.
+   - [x] P5.5 — COGS entries preserve six-decimal consumed quantities.
 9. **Sales fulfilment transaction guards:** P3.1, P3.2, P3.3, P3.6, P3.7.
 10. **Refund/order status reconciliation:** P3.4.
 11. **Accounting / FX posting correctness:** P5.1, P5.2, P5.4, P5.6, P5.7.

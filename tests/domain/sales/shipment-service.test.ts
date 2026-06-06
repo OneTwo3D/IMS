@@ -64,7 +64,7 @@ type State = {
     unitCostBase?: string | number | null
     totalValueBase?: string | number | null
   }>
-  cogsEntries: Array<{ costLayerId: string; movementId: string; qty: number; unitCostBase: number; totalCostBase: number }>
+  cogsEntries: Array<{ costLayerId: string; movementId: string; qty: string; unitCostBase: string; totalCostBase: string }>
   settings: Record<string, string>
 }
 
@@ -416,14 +416,14 @@ test('transitionShipmentStatus ships stock and stores FIFO COGS snapshot', async
   assert.equal(state.costLayers[0].remainingQty, 0)
   assert.equal(state.shipments[0].cogsBatchAmount, 10)
   assert.deepEqual(state.shipmentLines[0].costLayerSnapshot, [
-    { costLayerId: 'layer-1', qty: 2, unitCostBase: 5 },
+    { costLayerId: 'layer-1', qty: '2.000000', unitCostBase: '5.000000' },
   ])
   assert.deepEqual(state.cogsEntries, [{
     costLayerId: 'layer-1',
     movementId: 'movement-1',
-    qty: 2,
-    unitCostBase: 5,
-    totalCostBase: 10,
+    qty: '2.000000',
+    unitCostBase: '5.000000',
+    totalCostBase: '10.000000',
   }])
   assert.equal(state.movements[0].idempotencyKey, 'SALE_DISPATCH:shipmentLine:shipment-line-1')
   assert.equal(state.movements[0].unitCostBase, '5.000000')
@@ -707,12 +707,12 @@ test('transitionShipmentStatus consumes fractional FIFO layers without binary re
   assert.equal(state.costLayers[1].remainingQty, 0)
   assert.equal(state.shipments[0].cogsBatchAmount, 0.05)
   assert.deepEqual(state.shipmentLines[0].costLayerSnapshot, [
-    { costLayerId: 'layer-1', qty: 0.1, unitCostBase: 0.1 },
-    { costLayerId: 'layer-2', qty: 0.2, unitCostBase: 0.2 },
+    { costLayerId: 'layer-1', qty: '0.100000', unitCostBase: '0.100000' },
+    { costLayerId: 'layer-2', qty: '0.200000', unitCostBase: '0.200000' },
   ])
   assert.deepEqual(state.cogsEntries, [
-    { costLayerId: 'layer-1', movementId: 'movement-1', qty: 0.1, unitCostBase: 0.1, totalCostBase: 0.01 },
-    { costLayerId: 'layer-2', movementId: 'movement-1', qty: 0.2, unitCostBase: 0.2, totalCostBase: 0.04 },
+    { costLayerId: 'layer-1', movementId: 'movement-1', qty: '0.100000', unitCostBase: '0.100000', totalCostBase: '0.010000' },
+    { costLayerId: 'layer-2', movementId: 'movement-1', qty: '0.200000', unitCostBase: '0.200000', totalCostBase: '0.040000' },
   ])
 })
 

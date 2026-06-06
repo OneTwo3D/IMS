@@ -17,6 +17,7 @@ import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
+import { addMoney, multiplyMoney, toDecimal } from '@/lib/domain/math/decimal'
 
 type SyncBinding = {
   id: string
@@ -752,7 +753,10 @@ async function applyMintsoftAlignmentForProduct(params: {
           where: { id: movement.id },
           data: buildStockMovementValueFieldsFromTotal({
             qty: allocation.qty,
-            totalValueBase: snapshotSlice.reduce((sum, entry) => sum + (entry.qty * entry.unitCostBase), 0),
+            totalValueBase: snapshotSlice.reduce(
+              (sum, entry) => addMoney(sum, multiplyMoney(entry.qty, entry.unitCostBase)),
+              toDecimal(0),
+            ),
           }),
         })
 
