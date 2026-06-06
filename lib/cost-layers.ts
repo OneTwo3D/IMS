@@ -56,13 +56,7 @@ export type ConsumedLayer = {
 export function cogsEntryDataFromConsumed(
   movementId: string,
   consumed: ConsumedLayer,
-): {
-  costLayerId: string
-  movementId: string
-  qty: string
-  unitCostBase: string
-  totalCostBase: string
-} {
+): Omit<Prisma.CogsEntryCreateManyInput, 'id' | 'createdAt'> {
   return {
     costLayerId: consumed.costLayerId,
     movementId,
@@ -230,7 +224,7 @@ export async function createCostLayer(
   data: {
     productId: string
     warehouseId: string
-    qty: number
+    qty: DecimalInput
     unitCostBase: DecimalInput
     poLineId?: string
     adjustmentMovementId?: string
@@ -243,8 +237,8 @@ export async function createCostLayer(
     data: {
       productId: data.productId,
       warehouseId: data.warehouseId,
-      receivedQty: data.qty,
-      remainingQty: data.qty,
+      receivedQty: roundQuantity(data.qty, 6).toFixed(6),
+      remainingQty: roundQuantity(data.qty, 6).toFixed(6),
       unitCostBase: roundQuantity(data.unitCostBase, 6).toNumber(),
       poLineId: data.poLineId ?? null,
       adjustmentMovementId: data.adjustmentMovementId ?? null,
@@ -289,9 +283,10 @@ export async function copyCostLayerSourceLinesProportionally(
   tx: TxClient,
   fromCostLayerId: string,
   toCostLayerId: string,
-  copiedQty: number,
+  copiedQty: DecimalInput,
 ): Promise<number> {
-  if (!Number.isFinite(copiedQty) || copiedQty <= 0) return 0
+  const copiedQtyDecimal = toDecimal(copiedQty)
+  if (copiedQtyDecimal.lte(0)) return 0
 
   const sourceLayer = await tx.costLayer.findUnique({
     where: { id: fromCostLayerId },
@@ -313,13 +308,13 @@ export async function copyCostLayerSourceLinesProportionally(
   const sourceReceivedQty = toDecimal(sourceLayer.receivedQty)
   if (sourceReceivedQty.lte(0)) return 0
 
-  const rawRatio = toDecimal(copiedQty).div(sourceReceivedQty)
+  const rawRatio = copiedQtyDecimal.div(sourceReceivedQty)
   const ratio = rawRatio.gt(1) ? toDecimal(1) : rawRatio
   if (ratio.lte(0)) return 0
   if (rawRatio.gt('1.000001')) {
     console.warn(
       `copyCostLayerSourceLinesProportionally capped ratio at 1 for ${fromCostLayerId} -> ${toCostLayerId} ` +
-      `(copiedQty=${copiedQty}, sourceReceivedQty=${sourceReceivedQty.toString()})`,
+      `(copiedQty=${copiedQtyDecimal.toString()}, sourceReceivedQty=${sourceReceivedQty.toString()})`,
     )
   }
 

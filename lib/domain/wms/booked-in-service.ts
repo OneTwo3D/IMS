@@ -908,13 +908,14 @@ export async function processBookedInEvent(
               })
 
               for (const entry of snapshotSlice) {
+                const entryQty = toDecimal(entry.qty)
                 const newLayerId = await createCostLayer(tx, {
                   productId: transferLine.productId,
                   warehouseId: transfer.toWarehouseId,
-                  qty: entry.qty,
+                  qty: entryQty,
                   unitCostBase: entry.unitCostBase,
                 })
-                await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entry.qty)
+                await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entryQty)
               }
             }
 

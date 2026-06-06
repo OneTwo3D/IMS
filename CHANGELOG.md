@@ -58,7 +58,11 @@ This repository uses an `x.y.z` release scheme.
 
 ### Fixes (stock and cost-layer precision)
 
-- **Stock and cost-layer precision paths are stricter.** Stock removals require FIFO cost-layer coverage, purchase receipts reject non-finite unit costs before stock writes, transfer and shipment cost-layer snapshots serialize Decimal-safe six-decimal unit costs, landed-cost recalculation adjustments carry `freightPoId` attribution, and COGS entries now preserve six-decimal consumed quantities.
+- **Stock removals require FIFO cost-layer coverage.** Negative stock movements using strict FIFO consumption now fail before stock levels are written when cost-layer evidence cannot cover the removal.
+- **Purchase receipts reject invalid unit costs before stock writes.** Receipt costs must be finite and zero or greater; zero-cost receipts remain allowed for replacement, sample, or consigned stock.
+- **Cost-layer snapshots use Decimal-safe six-decimal strings.** Transfer, shipment, refund, WMS, and Mintsoft snapshot writers now share one serializer for persisted FIFO snapshot quantities and unit costs.
+- **Landed-cost recalculation adjustments carry freight PO attribution.** Adjustment idempotency now separates different linked freight POs; non-live deployments can rebuild freely, but live queues should be drained or rewritten before deploying this key-shape change.
+- **COGS entries preserve six-decimal consumed quantities.** `CogsEntry.qty` is widened to `DECIMAL(14,6)` and COGS writers now share one Decimal-safe create-data helper.
 
 ### Fixes (Mintsoft webhook security)
 

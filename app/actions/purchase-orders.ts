@@ -1806,9 +1806,13 @@ export async function receivePurchaseOrder(
         const poLine = currentPo.lines.find((l) => l.id === rl.poLineId)
         if (!poLine) continue
 
-        const unitCostBase = grossUnitCostBaseByLine.get(poLine.id) ?? Number(poLine.unitCostBase)
-        assertFinitePurchaseReceiptUnitCost(unitCostBase)
-        totalReceiptValue += rl.qtyReceived * unitCostBase
+        const unitCostBaseInput = grossUnitCostBaseByLine.get(poLine.id) ?? poLine.unitCostBase
+        assertFinitePurchaseReceiptUnitCost(unitCostBaseInput, {
+          poLineId: poLine.id,
+          poRef: currentPo.reference,
+        })
+        const unitCostBase = toDecimal(unitCostBaseInput)
+        totalReceiptValue += rl.qtyReceived * unitCostBase.toNumber()
 
         await tx.stockMovement.create({
           data: {

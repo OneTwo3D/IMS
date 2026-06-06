@@ -266,7 +266,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Status:** Complete.
 - **File:** `app/actions/stock.ts:232–248`
 - **Fix:** Stock-removal paths use strict FIFO consumption, so removals without cost-layer coverage fail before stock levels are written.
-- **Tests:** `tests/cost-layers.test.ts` covers strict FIFO rejection when no layers or insufficient layers exist.
+- **Tests:** `tests/cost-layers.test.ts` — `consumeFifoLayersStrict throws when locked FIFO rows cannot cover the request` and `consumeFifoLayersStrict throws when no FIFO rows are available`.
 
 ### P4.4 — Cancelled-PO cancellation not idempotent
 - **Status:** Complete.

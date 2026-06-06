@@ -1047,7 +1047,7 @@ async function stageRefundAccountingReversals(
           if (!productId) return []
           return [{
             productId,
-            qty: entry.qty,
+            qty: refundBoundaryNumber(entry.qty),
             refundLineId: refundLine.id,
             unitCostBase: entry.unitCostBase,
             poLineId: poLineIdByCostLayerId.get(entry.costLayerId) ?? null,

@@ -7,6 +7,7 @@ import {
   sumCostLayerSnapshot,
   takeFromSnapshotEntries,
 } from '../lib/cost-layer-snapshots.ts'
+import { toDecimal, type DecimalInput } from '../lib/domain/math/decimal.ts'
 
 /**
  * The production helper at `lib/domain/wms/asn-reconciliation.ts`
@@ -52,8 +53,8 @@ const SNAPSHOT = [
   { costLayerId: 'L2', qty: 6, unitCostBase: 12 },
 ]
 
-function totalQty(rows: Array<{ qty: number }>) {
-  return rows.reduce((sum, r) => sum + r.qty, 0)
+function totalQty(rows: Array<{ qty: DecimalInput }>) {
+  return rows.reduce((sum, r) => sum + toDecimal(r.qty).toNumber(), 0)
 }
 
 test('alreadyReceived=0 returns the full requested slice', () => {
@@ -84,7 +85,7 @@ test('alreadyReceived=4 + remaining=6 returns only L2 (the un-consumed layer)', 
   // After consuming all of L1 (4 units), only L2 should remain in the slice.
   assert.deepEqual(
     got.map((r) => ({ costLayerId: r.costLayerId, qty: r.qty })),
-    [{ costLayerId: 'L2', qty: 6 }],
+    [{ costLayerId: 'L2', qty: '6.000000' }],
   )
 })
 
@@ -104,7 +105,7 @@ test('two adjacent partial slices sum to the full snapshot — no overlap', () =
   // had in the original snapshot — that would be the double-count bug.
   const combined = new Map<string, number>()
   for (const row of [...first, ...second]) {
-    combined.set(row.costLayerId, (combined.get(row.costLayerId) ?? 0) + row.qty)
+    combined.set(row.costLayerId, (combined.get(row.costLayerId) ?? 0) + toDecimal(row.qty).toNumber())
   }
   assert.equal(combined.get('L1'), 4)
   assert.equal(combined.get('L2'), 6)

@@ -17,6 +17,20 @@ test('cogsEntryDataFromConsumed preserves six-decimal consumed quantities', () =
   })
 })
 
+test('cogsEntryDataFromConsumed pins sub-six-decimal total value rounding', () => {
+  assert.deepEqual(cogsEntryDataFromConsumed('movement-1', {
+    costLayerId: 'layer-1',
+    qty: new Prisma.Decimal('0.000001'),
+    unitCostBase: new Prisma.Decimal('0.000001'),
+  }), {
+    costLayerId: 'layer-1',
+    movementId: 'movement-1',
+    qty: '0.000001',
+    unitCostBase: '0.000001',
+    totalCostBase: '0.000000',
+  })
+})
+
 test('addCostLayerSourceLines rejects source lines without unit cost', async () => {
   const createdRows: unknown[] = []
   const tx = {

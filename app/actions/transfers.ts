@@ -629,24 +629,25 @@ export async function receiveTransfer(id: string): Promise<TransferResult> {
           // alreadyReceived units and returns only the next remainingQty
           // units, matching the same algorithm the WMS handler uses.
           for (const entry of snapshotSlice) {
+            const entryQty = toDecimal(entry.qty)
             const unitCostBase = toDecimal(entry.unitCostBase)
-            if (entry.qty > 0 && unitCostBase.gte(0)) {
+            if (entryQty.gt(0) && unitCostBase.gte(0)) {
               const newLayerId = await createCostLayer(tx, {
                 productId: line.productId,
                 warehouseId: transfer.toWarehouseId,
-                qty: entry.qty,
+                qty: entryQty,
                 unitCostBase,
               })
-              const copied = await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entry.qty)
+              const copied = await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entryQty)
               if (copied === 0) {
                 await tx.costLayerSourceLine.create({
                   data: {
                     costLayerId: newLayerId,
                     sourceProductId: line.productId,
                     sourceCostLayerId: entry.costLayerId,
-                    qty: entry.qty,
+                    qty: entryQty.toFixed(6),
                     unitCostBase,
-                    totalCostBase: roundQuantity(multiplyMoney(entry.qty, unitCostBase), 6).toFixed(6),
+                    totalCostBase: roundQuantity(multiplyMoney(entryQty, unitCostBase), 6).toFixed(6),
                   },
                 })
               }

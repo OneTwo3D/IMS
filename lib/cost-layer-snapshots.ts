@@ -4,7 +4,7 @@ export type CostLayerSnapshotSource = 'allocation' | 'shipment'
 
 export type CostLayerSnapshotEntry = {
   costLayerId: string
-  qty: number
+  qty: DecimalInput
   unitCostBase: DecimalInput
   orderAllocationId?: string
   shipmentLineId?: string
@@ -16,9 +16,17 @@ export type SerializableCostLayerSnapshotEntry = Omit<CostLayerSnapshotEntry, 'q
   unitCostBase: DecimalInput
 }
 
+export type SerializedCostLayerSnapshotEntry = Omit<CostLayerSnapshotEntry, 'qty' | 'unitCostBase'> & {
+  qty: string
+  unitCostBase: string
+}
+
+// Snapshot JSON is intentionally precision-bounded to the 6-decimal scale used
+// by IMS cost and movement value columns. This avoids JS-number serialization
+// while keeping persisted audit snapshots comparable and fixed-width.
 export function serializeCostLayerSnapshotEntry(
   entry: SerializableCostLayerSnapshotEntry,
-): Record<string, string> & Pick<CostLayerSnapshotEntry, 'costLayerId' | 'orderAllocationId' | 'shipmentLineId' | 'source'> {
+): SerializedCostLayerSnapshotEntry {
   const serialized = {
     costLayerId: entry.costLayerId,
     qty: roundQuantity(entry.qty, 6).toFixed(6),
@@ -27,12 +35,12 @@ export function serializeCostLayerSnapshotEntry(
     ...(entry.shipmentLineId ? { shipmentLineId: entry.shipmentLineId } : {}),
     ...(entry.source ? { source: entry.source } : {}),
   }
-  return serialized
+  return serialized satisfies SerializedCostLayerSnapshotEntry
 }
 
 export function serializeCostLayerSnapshot(
   entries: SerializableCostLayerSnapshotEntry[],
-): Array<ReturnType<typeof serializeCostLayerSnapshotEntry>> {
+): SerializedCostLayerSnapshotEntry[] {
   return entries.map(serializeCostLayerSnapshotEntry)
 }
 
@@ -47,15 +55,17 @@ export function parseCostLayerSnapshot(value: unknown): CostLayerSnapshotEntry[]
     if (!entry || typeof entry !== 'object') return []
     const row = entry as Record<string, unknown>
     const costLayerId = typeof row.costLayerId === 'string' ? row.costLayerId : ''
-    const qty = Number(row.qty)
+    if (row.qty == null) return []
     if (row.unitCostBase == null) return []
+    let qty: string
     let unitCostBase: string
     try {
+      qty = roundQuantity(row.qty as DecimalInput, 6).toFixed(6)
       unitCostBase = roundQuantity(row.unitCostBase as DecimalInput, 6).toFixed(6)
     } catch {
       return []
     }
-    if (!costLayerId || !Number.isFinite(qty) || qty <= 0) return []
+    if (!costLayerId || toDecimal(qty).lte(0)) return []
     return [{
       costLayerId,
       qty,
@@ -76,23 +86,24 @@ export function sumCostLayerSnapshot(entries: CostLayerSnapshotEntry[]): Decimal
 
 export function reduceSnapshotByCostLayer(
   baseEntries: CostLayerSnapshotEntry[],
-  deductions: Array<{ costLayerId: string; qty: number }>,
+  deductions: Array<{ costLayerId: string; qty: DecimalInput }>,
 ): CostLayerSnapshotEntry[] {
   const remaining = baseEntries.map((entry) => ({ ...entry }))
 
   for (const deduction of deductions) {
-    let qtyToRemove = deduction.qty
-    if (qtyToRemove <= 0) continue
+    let qtyToRemove = toDecimal(deduction.qty)
+    if (qtyToRemove.lte(0)) continue
 
     for (const entry of remaining) {
-      if (entry.costLayerId !== deduction.costLayerId || qtyToRemove <= 0) continue
-      const take = Math.min(entry.qty, qtyToRemove)
-      entry.qty -= take
-      qtyToRemove -= take
+      if (entry.costLayerId !== deduction.costLayerId || qtyToRemove.lte(0)) continue
+      const entryQty = toDecimal(entry.qty)
+      const take = entryQty.lt(qtyToRemove) ? entryQty : qtyToRemove
+      entry.qty = roundQuantity(entryQty.sub(take), 6).toFixed(6)
+      qtyToRemove = qtyToRemove.sub(take)
     }
   }
 
-  return remaining.filter((entry) => entry.qty > 0.0000001)
+  return remaining.filter((entry) => toDecimal(entry.qty).gt('0.0000001'))
 }
 
 export function takeFromSnapshotEntries(
@@ -100,23 +111,24 @@ export function takeFromSnapshotEntries(
   qty: number,
   decorate?: Partial<CostLayerSnapshotEntry>,
 ): { taken: CostLayerSnapshotEntry[]; remainingQty: number } {
-  let remainingQty = qty
+  let remainingQty = toDecimal(qty)
   const taken: CostLayerSnapshotEntry[] = []
 
   for (const entry of entries) {
-    if (remainingQty <= 0) break
-    const take = Math.min(entry.qty, remainingQty)
-    if (take <= 0) continue
+    if (remainingQty.lte(0)) break
+    const entryQty = toDecimal(entry.qty)
+    const take = entryQty.lt(remainingQty) ? entryQty : remainingQty
+    if (take.lte(0)) continue
     taken.push({
       costLayerId: entry.costLayerId,
-      qty: take,
+      qty: roundQuantity(take, 6).toFixed(6),
       unitCostBase: entry.unitCostBase,
       orderAllocationId: decorate?.orderAllocationId ?? entry.orderAllocationId,
       shipmentLineId: decorate?.shipmentLineId ?? entry.shipmentLineId,
       source: decorate?.source ?? entry.source,
     })
-    remainingQty -= take
+    remainingQty = remainingQty.sub(take)
   }
 
-  return { taken, remainingQty }
+  return { taken, remainingQty: remainingQty.toNumber() }
 }

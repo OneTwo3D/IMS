@@ -761,14 +761,15 @@ async function applyMintsoftAlignmentForProduct(params: {
         })
 
         for (const entry of snapshotSlice) {
+          const entryQty = toDecimal(entry.qty)
           const newLayerId = await createCostLayer(tx, {
             productId: transferLine.productId,
             warehouseId: params.binding.warehouseId,
-            qty: entry.qty,
+            qty: entryQty,
             unitCostBase: entry.unitCostBase,
             adjustmentMovementId: movement.id,
           })
-          await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entry.qty)
+          await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entryQty)
         }
       }
 

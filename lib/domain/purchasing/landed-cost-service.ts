@@ -287,6 +287,9 @@ function revaluationAccountingJson(params: {
 }
 
 function landedCostAdjustmentKeyPayload(adj: LandedCostAdjustment): Record<string, unknown> {
+  // Including freightPoId intentionally separates linked freight adjustments
+  // for the same primary PO. A live deployment must drain or rewrite any
+  // pre-change queued adjustment keys before replaying landed-cost syncs.
   return {
     primaryPoId: adj.primaryPoId,
     primaryPoRef: adj.primaryPoRef,
