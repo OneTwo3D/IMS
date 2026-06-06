@@ -1,7 +1,8 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
-import { consumeFifoLayersStrict, refreshSalesOrderLineCogs } from '@/lib/cost-layers'
-import { addMoney, multiplyMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, refreshSalesOrderLineCogs } from '@/lib/cost-layers'
+import { serializeCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
+import { addMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import {
   validateSalesOrderStatusTransition,
   validateShipmentStatusTransition,
@@ -360,22 +361,16 @@ export async function transitionShipmentStatus(
         })
         if (consumed.length > 0) {
           await tx.cogsEntry.createMany({
-            data: consumed.map((entry) => ({
-              costLayerId: entry.costLayerId,
-              movementId: movement.id,
-              qty: entry.qty.toNumber(),
-              unitCostBase: entry.unitCostBase.toNumber(),
-              totalCostBase: roundQuantity(multiplyMoney(entry.qty, entry.unitCostBase), 6).toNumber(),
-            })),
+            data: consumed.map((entry) => cogsEntryDataFromConsumed(movement.id, entry)),
           })
           await tx.shipmentLine.update({
             where: { id: line.id },
             data: {
-              costLayerSnapshot: consumed.map((entry) => ({
+              costLayerSnapshot: serializeCostLayerSnapshot(consumed.map((entry) => ({
                 costLayerId: entry.costLayerId,
-                qty: entry.qty.toNumber(),
-                unitCostBase: entry.unitCostBase.toNumber(),
-              })),
+                qty: entry.qty,
+                unitCostBase: entry.unitCostBase,
+              }))),
             },
           })
         }

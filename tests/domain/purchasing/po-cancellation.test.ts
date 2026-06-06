@@ -199,11 +199,11 @@ test('reversePurchaseOrderCostLayersForCancellation reverses remaining PO cost l
   assert.deepEqual(cogsEntries.map((entry) => ({
     costLayerId: (entry as { costLayerId: string }).costLayerId,
     movementId: (entry as { movementId: string }).movementId,
-    qty: (entry as { qty: number }).qty,
-    totalCostBase: (entry as { totalCostBase: number }).totalCostBase,
+    qty: (entry as { qty: string }).qty,
+    totalCostBase: (entry as { totalCostBase: string }).totalCostBase,
   })), [
-    { costLayerId: 'layer-1', movementId: 'movement-1', qty: 2, totalCostBase: 10.5 },
-    { costLayerId: 'layer-2', movementId: 'movement-2', qty: 3, totalCostBase: 12 },
+    { costLayerId: 'layer-1', movementId: 'movement-1', qty: '2.000000', totalCostBase: '10.500000' },
+    { costLayerId: 'layer-2', movementId: 'movement-2', qty: '3.000000', totalCostBase: '12.000000' },
   ])
 })
 

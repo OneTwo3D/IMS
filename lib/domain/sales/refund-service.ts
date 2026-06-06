@@ -5,6 +5,7 @@ import { copyCostLayerSourceLinesProportionally } from '@/lib/cost-layers'
 import {
   parseCostLayerSnapshot,
   reduceSnapshotByCostLayer,
+  serializeCostLayerSnapshot,
   sumCostLayerSnapshot,
   takeFromSnapshotEntries,
   type CostLayerSnapshotEntry,
@@ -79,7 +80,7 @@ export type RefundReturnRow = {
   productId: string
   qty: number
   refundLineId?: string | null
-  unitCostBase?: number
+  unitCostBase?: DecimalInput
   poLineId?: string | null
   sourceCostLayerId?: string | null
 }
@@ -187,10 +188,16 @@ function aggregateRefundReturnRows(
     const aggregateKey = refundReturnAggregateKey(row)
     const existing = aggregated.get(aggregateKey)
     if (existing) {
-      if (Number.isFinite(existing.unitCostBase) && Number.isFinite(row.unitCostBase)) {
+      if (existing.unitCostBase != null && row.unitCostBase != null) {
         const combinedQty = existing.qty + row.qty
         existing.unitCostBase = combinedQty > 0
-          ? (((existing.unitCostBase ?? 0) * existing.qty) + ((row.unitCostBase ?? 0) * row.qty)) / combinedQty
+          ? roundQuantity(
+              toDecimal(existing.unitCostBase)
+                .mul(existing.qty)
+                .add(toDecimal(row.unitCostBase).mul(row.qty))
+                .div(combinedQty),
+              6,
+            ).toFixed(6)
           : existing.unitCostBase
       } else if (existing.unitCostBase == null && row.unitCostBase != null) {
         existing.unitCostBase = row.unitCostBase
@@ -544,14 +551,16 @@ async function createReturnInboundMovementAndCostLayersTx(
   })
 
   for (const row of params.costLayerRows) {
-    if (!Number.isFinite(row.unitCostBase) || row.unitCostBase == null || row.qty <= 0) continue
+    if (row.unitCostBase == null || row.qty <= 0) continue
+    const unitCostBase = roundQuantity(row.unitCostBase, 6)
+    if (unitCostBase.lt(0)) continue
     const newLayer = await tx.costLayer.create({
       data: {
         productId: row.productId,
         warehouseId: params.warehouseId,
         receivedQty: row.qty,
         remainingQty: row.qty,
-        unitCostBase: row.unitCostBase,
+        unitCostBase: unitCostBase.toFixed(6),
         poLineId: row.poLineId ?? null,
       },
       select: { id: true },
@@ -1025,7 +1034,7 @@ async function stageRefundAccountingReversals(
       await tx.salesOrderRefundLine.update({
         where: { id: refundLine.id },
         data: {
-          costLayerSnapshot: costSnapshot as never,
+          costLayerSnapshot: serializeCostLayerSnapshot(costSnapshot) as never,
         },
       })
     }
@@ -1038,7 +1047,7 @@ async function stageRefundAccountingReversals(
           if (!productId) return []
           return [{
             productId,
-            qty: entry.qty,
+            qty: refundBoundaryNumber(entry.qty),
             refundLineId: refundLine.id,
             unitCostBase: entry.unitCostBase,
             poLineId: poLineIdByCostLayerId.get(entry.costLayerId) ?? null,

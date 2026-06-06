@@ -9,7 +9,7 @@ import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
-import { consumeFifoLayersStrict } from '@/lib/cost-layers'
+import { cogsEntryDataFromConsumed, consumeFifoLayersStrict } from '@/lib/cost-layers'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { resolveLineTaxRateBatch, type ResolvedTaxRate } from '@/lib/tax/resolve-rate'
@@ -26,6 +26,7 @@ import {
   reversePurchaseOrderCostLayersForCancellation,
   type PurchaseOrderCostLayerReversal,
 } from '@/lib/domain/purchasing/po-cancellation'
+import { assertFinitePurchaseReceiptUnitCost } from '@/lib/domain/purchasing/purchase-receipt-cost'
 import {
   validateLinkedFreightReceiptStatus,
   validatePurchaseOrderStatusTransition,
@@ -1805,8 +1806,13 @@ export async function receivePurchaseOrder(
         const poLine = currentPo.lines.find((l) => l.id === rl.poLineId)
         if (!poLine) continue
 
-        const unitCostBase = grossUnitCostBaseByLine.get(poLine.id) ?? Number(poLine.unitCostBase)
-        totalReceiptValue += rl.qtyReceived * unitCostBase
+        const unitCostBaseInput = grossUnitCostBaseByLine.get(poLine.id) ?? poLine.unitCostBase
+        assertFinitePurchaseReceiptUnitCost(unitCostBaseInput, {
+          poLineId: poLine.id,
+          poRef: currentPo.reference,
+        })
+        const unitCostBase = toDecimal(unitCostBaseInput)
+        totalReceiptValue += rl.qtyReceived * unitCostBase.toNumber()
 
         await tx.stockMovement.create({
           data: {
@@ -2296,13 +2302,7 @@ export async function returnPurchaseOrder(
         )
         if (consumed.length > 0) {
           await tx.cogsEntry.createMany({
-            data: consumed.map((entry) => ({
-              costLayerId: entry.costLayerId,
-              movementId: movement.id,
-              qty: entry.qty.toNumber(),
-              unitCostBase: entry.unitCostBase.toNumber(),
-              totalCostBase: roundQuantity(multiplyMoney(entry.qty, entry.unitCostBase), 6).toNumber(),
-            })),
+            data: consumed.map((entry) => cogsEntryDataFromConsumed(movement.id, entry)),
           })
         }
         await tx.stockLevel.updateMany({

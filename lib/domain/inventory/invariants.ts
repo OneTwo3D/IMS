@@ -1,6 +1,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { parseCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
+import { toDecimal } from '@/lib/domain/math/decimal'
 // decimal-boundary-ok: report-only (inventory invariant finding details)
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import {
@@ -324,7 +325,7 @@ function isSqlInventoryInvariantClient(client: unknown): client is InventoryInva
 }
 
 function hasCostLayerSnapshot(value: unknown): boolean {
-  return parseCostLayerSnapshot(value).some((entry) => Number.isFinite(entry.qty) && entry.qty > 0)
+  return parseCostLayerSnapshot(value).some((entry) => toDecimal(entry.qty).gt(0))
 }
 
 function buildSummary(findings: InventoryInvariantFinding[]): InventoryInvariantReport['summary'] {

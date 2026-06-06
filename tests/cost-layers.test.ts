@@ -1,7 +1,35 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
-import { addCostLayerSourceLines, consumeFifoLayers, consumeFifoLayersStrict } from '../lib/cost-layers.ts'
+import { addCostLayerSourceLines, cogsEntryDataFromConsumed, consumeFifoLayers, consumeFifoLayersStrict } from '../lib/cost-layers.ts'
+
+test('cogsEntryDataFromConsumed preserves six-decimal consumed quantities', () => {
+  assert.deepEqual(cogsEntryDataFromConsumed('movement-1', {
+    costLayerId: 'layer-1',
+    qty: new Prisma.Decimal('0.123456'),
+    unitCostBase: new Prisma.Decimal('7.654321'),
+  }), {
+    costLayerId: 'layer-1',
+    movementId: 'movement-1',
+    qty: '0.123456',
+    unitCostBase: '7.654321',
+    totalCostBase: '0.944972',
+  })
+})
+
+test('cogsEntryDataFromConsumed pins sub-six-decimal total value rounding', () => {
+  assert.deepEqual(cogsEntryDataFromConsumed('movement-1', {
+    costLayerId: 'layer-1',
+    qty: new Prisma.Decimal('0.000001'),
+    unitCostBase: new Prisma.Decimal('0.000001'),
+  }), {
+    costLayerId: 'layer-1',
+    movementId: 'movement-1',
+    qty: '0.000001',
+    unitCostBase: '0.000001',
+    totalCostBase: '0.000000',
+  })
+})
 
 test('addCostLayerSourceLines rejects source lines without unit cost', async () => {
   const createdRows: unknown[] = []

@@ -19,6 +19,7 @@ import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
+import { addMoney, multiplyMoney, toDecimal } from '@/lib/domain/math/decimal'
 
 // Booked-in reconciliation mutates stock levels, FIFO layers, PO lines, and sync state in one unit.
 // The longer timeout avoids false rollback on large ASNs while preserving a bounded lock window.
@@ -862,8 +863,8 @@ export async function processBookedInEvent(
                 qtyReceived: receiptLine.stockQtyToAdd,
               })
               const totalValueBase = snapshotSlice.reduce(
-                (sum, entry) => sum + (entry.qty * entry.unitCostBase),
-                0,
+                (sum, entry) => addMoney(sum, multiplyMoney(entry.qty, entry.unitCostBase)),
+                toDecimal(0),
               )
               try {
                 await tx.stockMovement.create({
@@ -907,13 +908,14 @@ export async function processBookedInEvent(
               })
 
               for (const entry of snapshotSlice) {
+                const entryQty = toDecimal(entry.qty)
                 const newLayerId = await createCostLayer(tx, {
                   productId: transferLine.productId,
                   warehouseId: transfer.toWarehouseId,
-                  qty: entry.qty,
+                  qty: entryQty,
                   unitCostBase: entry.unitCostBase,
                 })
-                await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entry.qty)
+                await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entryQty)
               }
             }
 

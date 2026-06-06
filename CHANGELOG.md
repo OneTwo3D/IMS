@@ -56,6 +56,14 @@ This repository uses an `x.y.z` release scheme.
 
 - **Purchase-order cancellation and linked freight receipt guards are stricter.** Cancelling a partially received PO reverses remaining receipt cost layers, and repeated cancellation of an already-cancelled PO is now idempotent. Linked freight POs can only auto-receive from committed states (`PO_SENT`, `SHIPPED`, `PARTIALLY_RECEIVED`, `RECEIVED`), blocking draft, RFQ, and quote freight orders.
 
+### Fixes (stock and cost-layer precision)
+
+- **Stock removals require FIFO cost-layer coverage.** Negative stock movements using strict FIFO consumption now fail before stock levels are written when cost-layer evidence cannot cover the removal.
+- **Purchase receipts reject invalid unit costs before stock writes.** Receipt costs must be finite and zero or greater; zero-cost receipts remain allowed for replacement, sample, or consigned stock.
+- **Cost-layer snapshots use Decimal-safe six-decimal strings.** Transfer, shipment, refund, WMS, and Mintsoft snapshot writers now share one serializer for persisted FIFO snapshot quantities and unit costs.
+- **Landed-cost recalculation adjustments carry freight PO attribution.** Adjustment idempotency now separates different linked freight POs; non-live deployments can rebuild freely, but live queues should be drained or rewritten before deploying this key-shape change.
+- **COGS entries preserve six-decimal consumed quantities.** `CogsEntry.qty` is widened to `DECIMAL(14,6)` and COGS writers now share one Decimal-safe create-data helper.
+
 ### Fixes (Mintsoft webhook security)
 
 - **Mintsoft ASN booked-in webhooks now bind the freshness timestamp into the HMAC signature.** IMS verifies `HMAC_SHA256(secret, "${timestamp}.${rawBody}")` and rejects body-only signatures.

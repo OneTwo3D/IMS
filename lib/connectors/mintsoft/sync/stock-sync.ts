@@ -17,6 +17,7 @@ import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
+import { addMoney, multiplyMoney, toDecimal } from '@/lib/domain/math/decimal'
 
 type SyncBinding = {
   id: string
@@ -752,19 +753,23 @@ async function applyMintsoftAlignmentForProduct(params: {
           where: { id: movement.id },
           data: buildStockMovementValueFieldsFromTotal({
             qty: allocation.qty,
-            totalValueBase: snapshotSlice.reduce((sum, entry) => sum + (entry.qty * entry.unitCostBase), 0),
+            totalValueBase: snapshotSlice.reduce(
+              (sum, entry) => addMoney(sum, multiplyMoney(entry.qty, entry.unitCostBase)),
+              toDecimal(0),
+            ),
           }),
         })
 
         for (const entry of snapshotSlice) {
+          const entryQty = toDecimal(entry.qty)
           const newLayerId = await createCostLayer(tx, {
             productId: transferLine.productId,
             warehouseId: params.binding.warehouseId,
-            qty: entry.qty,
+            qty: entryQty,
             unitCostBase: entry.unitCostBase,
             adjustmentMovementId: movement.id,
           })
-          await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entry.qty)
+          await copyCostLayerSourceLinesProportionally(tx, entry.costLayerId, newLayerId, entryQty)
         }
       }
 

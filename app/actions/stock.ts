@@ -12,9 +12,8 @@ import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import type { Prisma } from '@/app/generated/prisma/client'
-import { consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost } from '@/lib/cost-layers'
+import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost } from '@/lib/cost-layers'
 import { decimalToNumber } from '@/lib/decimal'
-import { multiplyMoney, roundQuantity } from '@/lib/domain/math/decimal'
 import {
   buildStockLevelMap,
   isEmptyStockLevelMapScope,
@@ -237,13 +236,7 @@ export async function applyStockAdjustment({
     })
     if (consumed.length > 0) {
       await tx.cogsEntry.createMany({
-        data: consumed.map((entry) => ({
-          costLayerId: entry.costLayerId,
-          movementId: movement.id,
-          qty: entry.qty.toNumber(),
-          unitCostBase: entry.unitCostBase.toNumber(),
-          totalCostBase: roundQuantity(multiplyMoney(entry.qty, entry.unitCostBase), 6).toNumber(),
-        })),
+        data: consumed.map((entry) => cogsEntryDataFromConsumed(movement.id, entry)),
       })
     }
   }
@@ -789,13 +782,7 @@ export async function updateAdjustmentMovement(
         nextMovementValueFields = buildStockMovementValueFieldsFromConsumed(consumed)
         if (consumed.length > 0) {
           await tx.cogsEntry.createMany({
-            data: consumed.map((entry) => ({
-              costLayerId: entry.costLayerId,
-              movementId: id,
-              qty: entry.qty.toNumber(),
-              unitCostBase: entry.unitCostBase.toNumber(),
-              totalCostBase: roundQuantity(multiplyMoney(entry.qty, entry.unitCostBase), 6).toNumber(),
-            })),
+            data: consumed.map((entry) => cogsEntryDataFromConsumed(id, entry)),
           })
         }
       }

@@ -199,7 +199,7 @@ test('returned quantity helpers return Decimal without fractional drift', async 
   assert.equal(supplierReturned.toString(), '0.3')
 })
 
-test('snapshot updates accept Decimal input and serialize the legacy JSON number shape', async () => {
+test('snapshot updates accept Decimal input and serialize JSON unit costs as strings', async () => {
   const updates: Array<{ sql: string; snapshot: unknown; id: string }> = []
   const tx = {
     $queryRawUnsafe: async (_sql: string, containsCostLayer: string) => (
@@ -226,13 +226,13 @@ test('snapshot updates accept Decimal input and serialize the legacy JSON number
   for (const update of updates) {
     assert.equal(update.id, 'row-a')
     assert.deepEqual(update.snapshot, [
-      { costLayerId: 'layer-a', qty: 1, unitCostBase: 14.123456 },
+      { costLayerId: 'layer-a', qty: '1.000000', unitCostBase: '14.123456' },
       { costLayerId: 'layer-b', qty: 1, unitCostBase: 5 },
     ])
   }
 })
 
-test('snapshot updates document the JSON number precision boundary', async () => {
+test('snapshot updates avoid the JSON number precision boundary', async () => {
   const runSnapshotUpdate = async (newUnitCostBase: Prisma.Decimal) => {
     let snapshot: unknown = null
     const tx = {
@@ -252,11 +252,11 @@ test('snapshot updates document the JSON number precision boundary', async () =>
 
     const updated = await updateSnapshotsForCostLayerChange(tx as never, 'layer-a', newUnitCostBase)
     assert.equal(updated, 1)
-    return (snapshot as Array<{ unitCostBase: number }>)[0].unitCostBase
+    return (snapshot as Array<{ unitCostBase: string }>)[0].unitCostBase
   }
 
-  assert.equal(await runSnapshotUpdate(new Prisma.Decimal('1.123456789012345')), 1.123456789012345)
-  assert.equal(await runSnapshotUpdate(new Prisma.Decimal('1.1234567890123456789')), 1.1234567890123457)
+  assert.equal(await runSnapshotUpdate(new Prisma.Decimal('1.123456789012345')), '1.123457')
+  assert.equal(await runSnapshotUpdate(new Prisma.Decimal('1.1234567890123456789')), '1.123457')
 })
 
 test('snapshot updates rewrite malformed unit costs and emit warnings', async () => {
@@ -297,9 +297,9 @@ test('snapshot updates rewrite malformed unit costs and emit warnings', async ()
     assert.match(warnings[1], /value="abc"/)
     assert.match(warnings[2], /value=\{\}/)
     assert.deepEqual(updates, [[
-      { costLayerId: 'layer-a', qty: 1, unitCostBase: 9.25 },
-      { costLayerId: 'layer-a', qty: 1, unitCostBase: 9.25 },
-      { costLayerId: 'layer-a', qty: 1, unitCostBase: 9.25 },
+      { costLayerId: 'layer-a', qty: '1.000000', unitCostBase: '9.250000' },
+      { costLayerId: 'layer-a', qty: '1.000000', unitCostBase: '9.250000' },
+      { costLayerId: 'layer-a', qty: '1.000000', unitCostBase: '9.250000' },
       { costLayerId: 'layer-b', qty: 1, unitCostBase: 5 },
     ]])
   } finally {
@@ -334,7 +334,7 @@ test('snapshot updates skip rows whose unit cost already matches', async () => {
 })
 
 test('landed-cost adjustment idempotency key ignores wall-clock journal date', () => {
-  const adj = { primaryPoId: 'po-1', primaryPoRef: 'PO-1', eventKey: 'event-a', totalDelta: 12.345 }
+  const adj = { primaryPoId: 'po-1', primaryPoRef: 'PO-1', freightPoId: null, eventKey: 'event-a', totalDelta: 12.345 }
 
   assert.equal(
     landedCostAdjustmentIdempotencyKey('inventory', adj),
@@ -347,11 +347,15 @@ test('landed-cost adjustment idempotency key ignores wall-clock journal date', (
 })
 
 test('landed-cost adjustment idempotency key includes recalculation context', () => {
-  const adj = { primaryPoId: 'po-1', primaryPoRef: 'PO-1', eventKey: 'event-a', totalDelta: 10 }
+  const adj = { primaryPoId: 'po-1', primaryPoRef: 'PO-1', freightPoId: 'freight-1', eventKey: 'event-a', totalDelta: 10 }
 
   assert.notEqual(
     landedCostAdjustmentIdempotencyKey('inventory', adj),
     landedCostAdjustmentIdempotencyKey('inventory', { ...adj, eventKey: 'event-b' }),
+  )
+  assert.notEqual(
+    landedCostAdjustmentIdempotencyKey('inventory', adj),
+    landedCostAdjustmentIdempotencyKey('inventory', { ...adj, freightPoId: 'freight-2' }),
   )
 })
 
@@ -476,6 +480,56 @@ test('recalculateLandedCosts rejects CLOSED linked primary purchase orders', asy
   await assert.rejects(
     recalculateLandedCosts(tx as never, 'freight-1', noopDeps(), TEST_AUDIT_OPTIONS),
     /locked status/,
+  )
+})
+
+test('recalculateLandedCosts attributes adjustments to the triggering freight PO', async () => {
+  const createLinkedTx = (freightPoId: string) => ({
+    landedCostLink: {
+      findMany: async ({ where }: { where: { freightPoId?: string; primaryPoId?: string } }) => {
+        if (where.freightPoId) return [{ primaryPoId: 'po-1' }]
+        if (where.primaryPoId) {
+          return [
+            { freightPO: { freightCostLines: [{ amountBase: '0.10', distributionMethod: 'BY_QUANTITY' }] } },
+            { freightPO: { freightCostLines: [{ amountBase: '0.20', distributionMethod: 'BY_QUANTITY' }] } },
+          ]
+        }
+        return []
+      },
+      updateMany: async () => ({ count: 1 }),
+    },
+    purchaseOrder: {
+      findUnique: async () => ({
+        id: 'po-1',
+        reference: 'PO-1',
+        status: 'RECEIVED',
+        subtotalBase: '1',
+        directFreightBase: '0',
+        lines: [{
+          id: 'line-a',
+          qty: '1',
+          unitCostBase: '1.00',
+          landedUnitCostBase: '1.00',
+          totalBase: '1.00',
+          product: { weight: 1 },
+          costLayers: [{ id: 'layer-a', unitCostBase: '1.00', receivedQty: '1', remainingQty: '1' }],
+        }],
+        freightCostLines: [],
+      }),
+    },
+    purchaseOrderLine: { update: async () => ({}) },
+    costLayer: { update: async () => ({}) },
+    landedCostRevaluationRun: { create: async () => ({ id: `audit-${freightPoId}` }) },
+  })
+
+  const first = await recalculateLandedCosts(createLinkedTx('freight-1') as never, 'freight-1', noopDeps(), TEST_AUDIT_OPTIONS)
+  const second = await recalculateLandedCosts(createLinkedTx('freight-2') as never, 'freight-2', noopDeps(), TEST_AUDIT_OPTIONS)
+
+  assert.equal(first.inventoryTransitAdjustments[0]?.freightPoId, 'freight-1')
+  assert.equal(second.inventoryTransitAdjustments[0]?.freightPoId, 'freight-2')
+  assert.notEqual(
+    landedCostAdjustmentIdempotencyKey('inventory', first.inventoryTransitAdjustments[0]!),
+    landedCostAdjustmentIdempotencyKey('inventory', second.inventoryTransitAdjustments[0]!),
   )
 })
 
@@ -679,7 +733,9 @@ test('recalculateDirectLandedCosts keeps fractional returns and snapshot cost as
 
   assert.equal(snapshotUnitCost, '1.1')
   assert.deepEqual(result.cogsAdjustments.map((adj) => adj.totalDelta), [0.02])
+  assert.deepEqual(result.cogsAdjustments.map((adj) => adj.freightPoId), [null])
   assert.deepEqual(result.inventoryTransitAdjustments.map((adj) => adj.totalDelta), [0.05])
+  assert.deepEqual(result.inventoryTransitAdjustments.map((adj) => adj.freightPoId), [null])
 })
 
 test('recalculateDirectLandedCosts writes an audit run with cost-layer and accounting context', async () => {

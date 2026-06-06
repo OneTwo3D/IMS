@@ -685,10 +685,9 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   assert.equal(result.success, true)
   assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
     costLayerId: 'layer-1',
-    qty: 1,
-    unitCostBase: 10,
+    qty: '1.000000',
+    unitCostBase: '10.000000',
     shipmentLineId: 'shipment-line-1',
-    orderAllocationId: undefined,
     source: 'shipment',
   }])
   assert.equal(state.movements[0].productId, 'product-1')
@@ -697,7 +696,7 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   assert.equal(state.movements[0].referenceId, 'refund-1')
   assert.equal(state.movements[0].idempotencyKey, 'RETURN_INBOUND:refund:refund-1:line:refund-line-1:warehouse:warehouse-returns')
   assert.equal(state.stockLevels[0].quantity, 1)
-  assert.equal(findReturnCostLayer(state).unitCostBase, 10)
+  assert.equal(findReturnCostLayer(state).unitCostBase, '10.000000')
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
 })
 
@@ -744,15 +743,14 @@ test('createSalesOrderRefund uses current cost layer cost after landed cost reva
   assert.equal(result.success, true)
   assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
     costLayerId: 'layer-1',
-    qty: 1,
-    unitCostBase: 12,
+    qty: '1.000000',
+    unitCostBase: '12.000000',
     shipmentLineId: 'shipment-line-1',
-    orderAllocationId: undefined,
     source: 'shipment',
   }])
   assert.equal(
     findReturnCostLayer(state).unitCostBase,
-    12,
+    '12.000000',
     'return layer should be valued at the refreshed cost, not the shipment snapshot',
   )
   assert.equal(findCogsReversalInventoryLine(result).debit, 12)
@@ -801,15 +799,14 @@ test('createSalesOrderRefund uses decreased current cost layer cost after landed
   assert.equal(result.success, true)
   assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
     costLayerId: 'layer-1',
-    qty: 1,
-    unitCostBase: 8,
+    qty: '1.000000',
+    unitCostBase: '8.000000',
     shipmentLineId: 'shipment-line-1',
-    orderAllocationId: undefined,
     source: 'shipment',
   }])
   assert.equal(
     findReturnCostLayer(state).unitCostBase,
-    8,
+    '8.000000',
     'return layer should follow downward landed-cost revaluation',
   )
   assert.equal(findCogsReversalInventoryLine(result).debit, 8)
@@ -857,10 +854,9 @@ test('createSalesOrderRefund falls back to shipment snapshot cost when cost laye
   assert.equal(result.success, true)
   assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
     costLayerId: 'layer-1',
-    qty: 1,
-    unitCostBase: 10,
+    qty: '1.000000',
+    unitCostBase: '10.000000',
     shipmentLineId: 'shipment-line-1',
-    orderAllocationId: undefined,
     source: 'shipment',
   }])
   assert.equal(findCogsReversalInventoryLine(result).debit, 10)
@@ -1248,7 +1244,7 @@ test('applyReturnInboundStockTx creates movement stock and cost layers on non-co
   assert.equal(state.movements.length, 1)
   assert.equal(state.stockLevels[0].quantity, 1)
   assert.equal(state.costLayers.length, 1)
-  assert.equal(state.costLayers[0].unitCostBase, 10)
+  assert.equal(state.costLayers[0].unitCostBase, '10.000000')
 })
 
 test('applyReturnInboundStockTx allows return rows without cost layer inputs', async () => {
@@ -1430,10 +1426,9 @@ test('retrySalesOrderRefundAccounting stages accounting and return stock for an 
   )
   assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
     costLayerId: 'layer-1',
-    qty: 1,
-    unitCostBase: 10,
+    qty: '1.000000',
+    unitCostBase: '10.000000',
     shipmentLineId: 'shipment-line-1',
-    orderAllocationId: undefined,
     source: 'shipment',
   }])
   assert.equal(state.movements[0].productId, 'product-1')
@@ -1652,10 +1647,9 @@ test('retrySalesOrderRefundAccounting uses persisted sales line identity and ref
   assert.equal(result.success, true)
   assert.deepEqual(state.refundLines[1].costLayerSnapshot, [{
     costLayerId: 'layer-2',
-    qty: 1,
-    unitCostBase: 15,
+    qty: '1.000000',
+    unitCostBase: '15.000000',
     shipmentLineId: 'shipment-line-2',
-    orderAllocationId: undefined,
     source: 'shipment',
   }])
   assert.equal(state.movements.length, 2)

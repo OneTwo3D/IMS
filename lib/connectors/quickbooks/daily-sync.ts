@@ -909,7 +909,7 @@ export async function runDailyBatchSync(): Promise<{
             for (const entry of shipmentCostSnapshot) {
               orderLayerDecrements.set(
                 entry.costLayerId,
-                (orderLayerDecrements.get(entry.costLayerId) ?? 0) + entry.qty,
+                (orderLayerDecrements.get(entry.costLayerId) ?? 0) + toDecimal(entry.qty).toNumber(),
               )
             }
 

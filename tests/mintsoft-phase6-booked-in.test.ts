@@ -83,8 +83,8 @@ test('sliceTransferSnapshotForReceipt takes the next cost-layer slice after prio
       qtyReceived: 3,
     }),
     [
-      { costLayerId: 'layer-a', qty: 1, unitCostBase: 10, orderAllocationId: undefined, shipmentLineId: undefined, source: undefined },
-      { costLayerId: 'layer-b', qty: 2, unitCostBase: 12, orderAllocationId: undefined, shipmentLineId: undefined, source: undefined },
+      { costLayerId: 'layer-a', qty: '1.000000', unitCostBase: '10.000000', orderAllocationId: undefined, shipmentLineId: undefined, source: undefined },
+      { costLayerId: 'layer-b', qty: '2.000000', unitCostBase: '12.000000', orderAllocationId: undefined, shipmentLineId: undefined, source: undefined },
     ],
   )
 })
