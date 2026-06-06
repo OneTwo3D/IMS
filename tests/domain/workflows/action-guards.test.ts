@@ -12,6 +12,7 @@ import {
   validateShipmentStatusTransition,
   validateStockTransferStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
+import { PURCHASE_ORDER_STATUSES } from '@/lib/domain/workflows/status-types'
 
 test('sales order action guard allows current aggregate ship flow and blocks direct draft ship', () => {
   assert.deepEqual(validateSalesOrderStatusTransition('DRAFT', 'ALLOCATED'), { success: true })
@@ -75,14 +76,18 @@ test('purchase receipt status guard permits repeated partial receipts as progres
 })
 
 test('linked freight receipt guard allows derived receipt from committed freight states only', () => {
-  for (const status of ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED']) {
-    assert.deepEqual(validateLinkedFreightReceiptStatus(status), { success: true })
-  }
-  for (const status of ['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'CANCELLED', 'CLOSED']) {
-    assert.deepEqual(validateLinkedFreightReceiptStatus(status), {
-      success: false,
-      error: `Cannot mark linked freight purchase order as received from ${status}`,
-    })
+  const allowedStatuses = new Set(['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED'])
+
+  for (const status of PURCHASE_ORDER_STATUSES) {
+    const result = validateLinkedFreightReceiptStatus(status)
+    if (allowedStatuses.has(status)) {
+      assert.deepEqual(result, { success: true }, `expected ${status} to be accepted`)
+    } else {
+      assert.deepEqual(result, {
+        success: false,
+        error: `Cannot mark linked freight purchase order as received from ${status}`,
+      }, `expected ${status} to be rejected`)
+    }
   }
 })
 

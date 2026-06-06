@@ -1,4 +1,4 @@
-import type { Prisma } from '@/app/generated/prisma/client'
+import type { Prisma, PurchaseOrderStatus } from '@/app/generated/prisma/client'
 import {
   addMoney,
   multiplyMoney,
@@ -43,7 +43,7 @@ export function assertPurchaseOrderCancellationHasNoInvoices(invoiceCount: numbe
   }
 }
 
-export function isPurchaseOrderCancellationNoop(status: string): boolean {
+export function isPurchaseOrderCancellationNoop(status: PurchaseOrderStatus): boolean {
   return status === 'CANCELLED'
 }
 
