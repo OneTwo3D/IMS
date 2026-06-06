@@ -24,8 +24,8 @@ test('builds deterministic stock movement idempotency keys for irreversible flow
     'TRANSFER_IN:wmsAsnLine:asn-line-2:receipt:event-2',
   )
   assert.equal(
-    refundInboundMovementKey({ refundId: 'refund-1', refundLineId: 'refund-line-1' }),
-    'RETURN_INBOUND:refund:refund-1:line:refund-line-1',
+    refundInboundMovementKey({ refundId: 'refund-1', refundLineId: 'refund-line-1', warehouseId: 'warehouse-returns' }),
+    'RETURN_INBOUND:refund:refund-1:line:refund-line-1:warehouse:warehouse-returns',
   )
 })
 
@@ -33,14 +33,18 @@ test('builds stable disjoint keys across calls and movement kinds', () => {
   assert.equal(saleDispatchMovementKey('same-id'), saleDispatchMovementKey('same-id'))
   assert.notEqual(
     saleDispatchMovementKey('same-id'),
-    refundInboundMovementKey({ refundId: 'same-id', refundLineId: 'same-id' }),
+    refundInboundMovementKey({ refundId: 'same-id', refundLineId: 'same-id', warehouseId: 'same-id' }),
+  )
+  assert.notEqual(
+    refundInboundMovementKey({ refundId: 'refund-1', refundLineId: 'refund-line-1', warehouseId: 'warehouse-a' }),
+    refundInboundMovementKey({ refundId: 'refund-1', refundLineId: 'refund-line-1', warehouseId: 'warehouse-b' }),
   )
 })
 
 test('rejects blank, overlong, or invalid key parts', () => {
   assert.throws(() => saleDispatchMovementKey(' '), /must not be blank/)
   assert.throws(
-    () => refundInboundMovementKey({ refundId: 'refund:1', refundLineId: 'line-1' }),
+    () => refundInboundMovementKey({ refundId: 'refund:1', refundLineId: 'line-1', warehouseId: 'warehouse-1' }),
     /invalid characters/,
   )
   assert.throws(() => saleDispatchMovementKey('a'.repeat(201)), /200 characters or fewer/)

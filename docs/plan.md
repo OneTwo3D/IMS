@@ -96,7 +96,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
   - Stock movement evidence shows the reversal.
 - **Tests:** Unit test cancellation of a PO with 2 received layers, assert reversal movements + `remainingQty = 0`.
 
-### P1.3 — Refund stock-movement idempotency without cost-layer guard
+### [x] P1.3 — Refund stock-movement idempotency without cost-layer guard
 - **File:** `lib/domain/sales/refund-service.ts:396–423`
 - **Problem:** When the refund movement hits idempotency conflict, the loop `continue`s — but the cost-layer creation below isn't gated by the same key. Retries leave dangling cost layers without matching stock movements.
 - **Fix:** Wrap movement + cost-layer creation in a single helper that takes the idempotency key and rolls back the entire pair on conflict.
@@ -105,7 +105,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
   - A test simulating retry asserts the state is identical to first-run state.
 - **Tests:** `tests/refund-service.idempotency.test.ts` — call `processRefund` twice with same key, assert one set of movements and one set of layers.
 
-### P1.4 — WooCommerce refund webhook not idempotent
+### [x] P1.4 — WooCommerce refund webhook not idempotent
 - **File:** `lib/connectors/woocommerce/sync/order-import.ts:27–29`, `webhooks.ts:80–93`, `syncWcRefund()`
 - **Problem:** `syncWcRefund()` has no idempotency check. Duplicate webhook delivery creates duplicate `SalesOrderRefund` rows with different internal IDs but the same `wcRefundId`. Xero downstream double-posts reversals.
 - **Fix:**
@@ -116,7 +116,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
   - No duplicate Xero reversal entries.
 - **Tests:** Integration test that calls the refund webhook twice; assert only one `SalesOrderRefund` and one Xero sync log.
 
-### P1.5 — Refund-after-shipment uses stale cost-layer snapshot
+### [x] P1.5 — Refund-after-shipment uses stale cost-layer snapshot
 - **File:** `lib/domain/sales/refund-service.ts:238–280`
 - **Problem:** Refund reads `costLayerSnapshot` frozen at shipment time. If a landed-cost revaluation changed `unitCostBase` later, the refund reverses the wrong amount.
 - **Fix:** On refund creation, re-read current `unitCostBase` from `cost_layers` and recompute the reversal cost. Document inline that the snapshot is informational only.
@@ -216,7 +216,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Fix:** Add a daily reconciliation job that pulls all refunds + orders and flags mismatches to admin activity log. Long-term: collapse to one state machine.
 - **Tests:** Synthetic data with a known mismatch; assert the job emits the alert.
 
-### P3.5 — Refund-without-restocking silent zero-return
+### [x] P3.5 — Refund-without-restocking silent zero-return
 - **File:** `lib/domain/sales/refund-service.ts:341–406`
 - **Fix:** `buildRefundFallbackReturnRows()` must throw when no returnable source exists, OR accept an explicit `includeUnshippedAllocations` flag. Log when zero-stock return is intentional.
 - **Tests:** Partial refund of unshipped allocated stock; assert behaviour matches the chosen contract.
@@ -231,7 +231,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Fix:** Either expand delete filter to include PICKED, or block cancellation when PICKED shipments exist with a clear error.
 - **Tests:** Cancel order with a PICKED shipment; assert chosen behaviour.
 
-### P3.8 — Refund idempotency key omits warehouseId
+### [x] P3.8 — Refund idempotency key omits warehouseId
 - **File:** `lib/domain/sales/refund-service.ts:376–381`
 - **Fix:** Include `warehouseId` in `refundInboundMovementKey()`.
 - **Tests:** Refund line returning to two warehouses; assert both stock movements created.
@@ -452,7 +452,7 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
 1. **Stop-the-bleed security:** P0.1, P0.2, P0.3, P0.4.
 2. **Migration safety docs + checks:** P0.5, P2.1, P2.2, P2.4.
 3. **FIFO / concurrency correctness:** P1.1 plus QG3's FIFO harness.
-4. **Refund correctness:** P1.3, P1.4, P1.5, P3.5, P3.8.
+4. **[x] Refund correctness:** P1.3, P1.4, P1.5, P3.5, P3.8.
 5. **VAT / tax correctness:** P1.6, P1.8.
 6. **WIP / manufacturing valuation:** P1.7, P4.2, P4.8.
 7. **PO cancellation and freight correctness:** P1.2, P4.1, P4.4.

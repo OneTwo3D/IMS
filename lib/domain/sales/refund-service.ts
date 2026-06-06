@@ -29,6 +29,8 @@ function refundBoundaryNumber(value: DecimalInput): number {
   return toDecimal(value).toNumber()
 }
 
+class RefundReturnSourceError extends Error {}
+
 export type RefundServiceClient = Prisma.TransactionClient | typeof db
 
 export type RefundReturnRow = {
@@ -273,13 +275,8 @@ async function buildRefundFallbackReturnRows(
     sourceRowsByLine.set(lineId, byProduct)
   }
 
-  for (const allocation of order.allocations) {
-    addSourceQty(allocation.lineId, allocation.productId, refundBoundaryNumber(allocation.qty))
-  }
   for (const shipment of order.shipments) {
     for (const line of shipment.lines) {
-      const existing = sourceRowsByLine.get(line.lineId)
-      if (existing && existing.size > 0) continue
       addSourceQty(line.lineId, line.productId, refundBoundaryNumber(line.qty))
     }
   }
@@ -320,13 +317,15 @@ async function buildRefundFallbackReturnRows(
         ?? null
 
     if (!sourceLine) {
-      return [{ productId: line.productId, qty: line.qty, refundLineId }]
+      throw new RefundReturnSourceError(`Cannot return refunded stock for product ${line.productId}: no matching sales order line exists`)
     }
 
     const sourceRows = sourceRowsByLine.get(sourceLine.id)
     const sourceLineQty = refundBoundaryNumber(sourceLine.qty)
     if (!sourceRows || sourceRows.size === 0 || !Number.isFinite(sourceLineQty) || sourceLineQty <= 0) {
-      return [{ productId: sourceLine.productId ?? line.productId, qty: line.qty, refundLineId }]
+      throw new RefundReturnSourceError(
+        `Cannot return refunded stock for product ${sourceLine.productId ?? line.productId}: no shipped stock source exists`,
+      )
     }
 
     return [...sourceRows.entries()].flatMap(([productId, totalQty]) => {
@@ -371,6 +370,7 @@ export async function applyReturnInboundStockTx(
       type: 'RETURN_INBOUND',
       referenceType: params.referenceType,
       referenceId: params.referenceId,
+      toWarehouseId: params.warehouseId,
     },
     select: { productId: true, qty: true },
   })
@@ -402,6 +402,7 @@ export async function applyReturnInboundStockTx(
       ? refundInboundMovementKey({
           refundId: params.referenceId,
           refundLineId: row.refundLineId,
+          warehouseId: params.warehouseId,
         })
       : undefined
     const result = await createReturnInboundMovementAndCostLayersTx(tx, {
@@ -1301,6 +1302,10 @@ export async function createSalesOrderRefund(
     if (!refundTransition.success) throw new Error(refundTransition.error)
     await tx.salesOrder.update({ where: { id: input.orderId }, data: { status: newStatus } })
 
+    const fallbackReturnRows = input.returnWarehouseId
+      ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id)
+      : []
+
     return {
       so,
       fxRate,
@@ -1308,7 +1313,13 @@ export async function createSalesOrderRefund(
       createdRefundLines,
       creditNoteNumber,
       newStatus,
+      fallbackReturnRows,
     }
+  }).catch((error) => {
+    if (error instanceof RefundReturnSourceError) {
+      return { error: error.message } as const
+    }
+    throw error
   })
 
   if ('error' in txResult) return { success: false, error: txResult.error ?? 'Refund failed' }
@@ -1354,9 +1365,7 @@ export async function createSalesOrderRefund(
     const snapshotRows = snapshotReturnRows ?? []
     const returnRows = snapshotRows.length > 0
       ? snapshotRows
-      // Use persisted refund lines so fallback rows carry refundLineId for
-      // deterministic RETURN_INBOUND movement keys.
-      : await buildRefundFallbackReturnRows(client, input.orderId, txResult.createdRefundLines, txResult.createdRefund.id)
+      : txResult.fallbackReturnRows
 
     returnedRows = await runInTransaction(client, (tx) => (
       applyReturnInboundStockTx(tx, {

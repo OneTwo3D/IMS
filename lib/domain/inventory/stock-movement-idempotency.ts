@@ -52,15 +52,19 @@ function wmsReceiptMovementKey(
 export function refundInboundMovementKey(params: {
   refundId: string
   refundLineId: string
+  warehouseId: string
 }): string {
   // Include both ids for operator triage: refundLineId provides uniqueness,
-  // while refundId makes grouped DB inspection straightforward.
+  // while refundId and warehouseId make grouped DB inspection straightforward
+  // and keep split returns to different warehouses from colliding.
   return [
     'RETURN_INBOUND',
     'refund',
     requireKeyPart('refundId', params.refundId),
     'line',
     requireKeyPart('refundLineId', params.refundLineId),
+    'warehouse',
+    requireKeyPart('warehouseId', params.warehouseId),
   ].join(':')
 }
 
