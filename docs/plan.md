@@ -128,6 +128,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** `tests/refund-service.revaluation.test.ts` — ship, revalue, refund, assert COGS reversal matches the new cost.
 
 ### P1.6 — VAT taxable base wrong for tax-inclusive pricing
+- **Status:** Complete.
 - **File:** `lib/domain/finance/finance-period-analytics.ts` (PR #115 review, not addressed)
 - **Problem:** `taxableBase = sum(line.totalBase)`. For tax-EXCLUSIVE rows totalBase IS taxable (correct). For tax-INCLUSIVE rows totalBase already contains tax — taxable should be `totalBase - taxBase`.
 - **Fix:** Load `taxRate.inclusive` on the VAT-line query. In the aggregator, subtract `taxBase` from `totalBase` for inclusive rows.
@@ -146,6 +147,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Unit test asserting the math; one fixture with components-only, one with cost-lines-only, one mixed.
 
 ### P1.8 — Tax inclusive/exclusive validation missing on order create
+- **Status:** Complete.
 - **File:** `app/actions/sales.ts:86–91`
 - **Problem:** `pricesIncludeVat` flag stored on the order isn't asserted against line-level tax math. Inconsistent orders post wrong amounts to Xero.
 - **Fix:** In `createSalesOrder()`, validate each line: for `pricesIncludeVat=true`, `taxForeign ≈ (unitPriceForeign × qty × rate) / (1 + rate)` within tolerance. Otherwise reject with a clear error.
@@ -463,7 +465,9 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
    - [x] P1.5 — Refund-after-shipment cost-layer revaluation.
    - [x] P3.5 — Refund-without-restocking silent zero-return.
    - [x] P3.8 — Refund idempotency key omits warehouseId.
-5. **VAT / tax correctness:** P1.6, P1.8.
+5. **VAT / tax correctness:**
+   - [x] P1.6 — VAT taxable base for tax-inclusive pricing.
+   - [x] P1.8 — Tax inclusive/exclusive validation on order create.
 6. **WIP / manufacturing valuation:** P1.7, P4.2, P4.8.
 7. **PO cancellation and freight correctness:** P1.2, P4.1, P4.4.
 8. **Stock and cost-layer precision:** P4.3, P4.5, P4.6, P4.7, P5.5.

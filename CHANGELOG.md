@@ -44,6 +44,10 @@ This repository uses an `x.y.z` release scheme.
 - **Refund return-stock idempotency now includes the return warehouse.** Split returns of the same refund line to different warehouses no longer collide on the same `RETURN_INBOUND` idempotency key. Because IMS is not live yet, no old-key compatibility path is kept; persistent dev or staging databases with old-shape refund return keys should reset those `RETURN_INBOUND:refund:*:line:*` movement idempotency keys or rebuild the database before replaying refund returns.
 - **Refund restocking now requires shipped-stock evidence.** Allocation-only refund rows no longer silently restock from unshipped reservations when no shipment line exists on the original order. Those attempts now return a clear operator message and should be processed as cash-only refunds or corrected to refund a shipped line.
 
+### Fixes (VAT and tax correctness)
+
+- **Sales-order creation now validates caller-supplied line tax assertions.** Import/API callers may pass `taxForeign` per line as an assertion; IMS rejects values that do not match the resolved line tax rate and inclusive/exclusive pricing mode before creating the order. VAT report coverage now separately pins inclusive taxable-base reporting (`totalBase - taxBase`) and exclusive taxable-base reporting (`totalBase`).
+
 ### Fixes (Mintsoft webhook security)
 
 - **Mintsoft ASN booked-in webhooks now bind the freshness timestamp into the HMAC signature.** IMS verifies `HMAC_SHA256(secret, "${timestamp}.${rawBody}")` and rejects body-only signatures.
