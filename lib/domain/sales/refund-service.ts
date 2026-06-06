@@ -29,6 +29,50 @@ function refundBoundaryNumber(value: DecimalInput): number {
   return toDecimal(value).toNumber()
 }
 
+const REFUND_RETURN_SOURCE_ERROR_TAG = 'RefundReturnSourceError'
+
+class RefundReturnSourceError extends Error {
+  readonly _tag = REFUND_RETURN_SOURCE_ERROR_TAG
+
+  constructor(message: string) {
+    super(message)
+    this.name = REFUND_RETURN_SOURCE_ERROR_TAG
+  }
+}
+
+function isRefundReturnSourceError(error: unknown): error is Error {
+  const seen = new WeakSet<object>()
+  let current = error
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current)
+    const candidate = current as { _tag?: unknown; name?: unknown; cause?: unknown }
+    if (candidate._tag === REFUND_RETURN_SOURCE_ERROR_TAG || candidate.name === REFUND_RETURN_SOURCE_ERROR_TAG) {
+      return true
+    }
+    current = candidate.cause
+  }
+  return false
+}
+
+function refundReturnSourceErrorMessage(error: unknown): string {
+  const seen = new WeakSet<object>()
+  let current = error
+  let fallbackMessage: string | null = null
+  while (current && typeof current === 'object' && !seen.has(current)) {
+    seen.add(current)
+    const candidate = current as { _tag?: unknown; name?: unknown; message?: unknown; cause?: unknown }
+    const message = typeof candidate.message === 'string' && candidate.message.trim()
+      ? candidate.message
+      : null
+    if ((candidate._tag === REFUND_RETURN_SOURCE_ERROR_TAG || candidate.name === REFUND_RETURN_SOURCE_ERROR_TAG) && message) {
+      return message
+    }
+    fallbackMessage ??= message
+    current = candidate.cause
+  }
+  return fallbackMessage ?? 'Refund return source validation failed'
+}
+
 export type RefundServiceClient = Prisma.TransactionClient | typeof db
 
 export type RefundReturnRow = {
@@ -273,13 +317,8 @@ async function buildRefundFallbackReturnRows(
     sourceRowsByLine.set(lineId, byProduct)
   }
 
-  for (const allocation of order.allocations) {
-    addSourceQty(allocation.lineId, allocation.productId, refundBoundaryNumber(allocation.qty))
-  }
   for (const shipment of order.shipments) {
     for (const line of shipment.lines) {
-      const existing = sourceRowsByLine.get(line.lineId)
-      if (existing && existing.size > 0) continue
       addSourceQty(line.lineId, line.productId, refundBoundaryNumber(line.qty))
     }
   }
@@ -320,13 +359,17 @@ async function buildRefundFallbackReturnRows(
         ?? null
 
     if (!sourceLine) {
-      return [{ productId: line.productId, qty: line.qty, refundLineId }]
+      throw new RefundReturnSourceError(
+        `Cannot restock product ${line.productId} for refund: no matching sales order line exists on the original order.`,
+      )
     }
 
     const sourceRows = sourceRowsByLine.get(sourceLine.id)
     const sourceLineQty = refundBoundaryNumber(sourceLine.qty)
     if (!sourceRows || sourceRows.size === 0 || !Number.isFinite(sourceLineQty) || sourceLineQty <= 0) {
-      return [{ productId: sourceLine.productId ?? line.productId, qty: line.qty, refundLineId }]
+      throw new RefundReturnSourceError(
+        `Cannot restock product ${sourceLine.productId ?? line.productId} for refund: no shipment line exists on the original order. Process as cash-only or refund a shipped line.`,
+      )
     }
 
     return [...sourceRows.entries()].flatMap(([productId, totalQty]) => {
@@ -371,6 +414,7 @@ export async function applyReturnInboundStockTx(
       type: 'RETURN_INBOUND',
       referenceType: params.referenceType,
       referenceId: params.referenceId,
+      toWarehouseId: params.warehouseId,
     },
     select: { productId: true, qty: true },
   })
@@ -402,6 +446,7 @@ export async function applyReturnInboundStockTx(
       ? refundInboundMovementKey({
           refundId: params.referenceId,
           refundLineId: row.refundLineId,
+          warehouseId: params.warehouseId,
         })
       : undefined
     const result = await createReturnInboundMovementAndCostLayersTx(tx, {
@@ -1301,6 +1346,16 @@ export async function createSalesOrderRefund(
     if (!refundTransition.success) throw new Error(refundTransition.error)
     await tx.salesOrder.update({ where: { id: input.orderId }, data: { status: newStatus } })
 
+    // Build fallback rows inside the refund transaction so source-stock errors
+    // roll back the refund and its lines. Stock application remains in the
+    // later return-stock transaction because accounting staging may provide a
+    // fresher cost-layer snapshot; if that later step fails, the persisted
+    // refund is retained and marked for accounting retry like other post-refund
+    // side-effect failures.
+    const fallbackReturnRows = input.returnWarehouseId
+      ? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id)
+      : []
+
     return {
       so,
       fxRate,
@@ -1308,7 +1363,13 @@ export async function createSalesOrderRefund(
       createdRefundLines,
       creditNoteNumber,
       newStatus,
+      fallbackReturnRows,
     }
+  }).catch((error) => {
+    if (isRefundReturnSourceError(error)) {
+      return { error: refundReturnSourceErrorMessage(error) } as const
+    }
+    throw error
   })
 
   if ('error' in txResult) return { success: false, error: txResult.error ?? 'Refund failed' }
@@ -1354,9 +1415,7 @@ export async function createSalesOrderRefund(
     const snapshotRows = snapshotReturnRows ?? []
     const returnRows = snapshotRows.length > 0
       ? snapshotRows
-      // Use persisted refund lines so fallback rows carry refundLineId for
-      // deterministic RETURN_INBOUND movement keys.
-      : await buildRefundFallbackReturnRows(client, input.orderId, txResult.createdRefundLines, txResult.createdRefund.id)
+      : txResult.fallbackReturnRows
 
     returnedRows = await runInTransaction(client, (tx) => (
       applyReturnInboundStockTx(tx, {

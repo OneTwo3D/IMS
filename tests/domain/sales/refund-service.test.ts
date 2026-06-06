@@ -97,6 +97,7 @@ type State = {
     qty: number
     referenceType: string
     referenceId: string
+    toWarehouseId?: string | null
     idempotencyKey?: string | null
   }>
   stockLevels: Array<{ productId: string; warehouseId: string; quantity: number; reservedQty: number }>
@@ -107,6 +108,26 @@ type State = {
   nextRefundLineId: number
   nextCostLayerId: number
   failStockLevelUnique?: boolean
+  wrapTransactionErrors?: boolean
+}
+
+function cloneTestStateValue<T>(value: T): T {
+  if (value instanceof Prisma.Decimal) return new Prisma.Decimal(value) as T
+  if (value instanceof Date) return new Date(value.getTime()) as T
+  if (Array.isArray(value)) return value.map((entry) => cloneTestStateValue(entry)) as T
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, cloneTestStateValue(entry)]),
+    ) as T
+  }
+  return value
+}
+
+function restoreTestState(state: State, snapshot: State) {
+  for (const key of Object.keys(state) as Array<keyof State>) {
+    delete state[key]
+  }
+  Object.assign(state, cloneTestStateValue(snapshot))
 }
 
 const accountingSettings: AccountingSettings = {
@@ -169,13 +190,28 @@ function baseState(overrides: Partial<State> = {}): State {
 }
 
 function createClient(state: State): RefundServiceClient {
+  // This in-memory Prisma mock is intentionally scoped to refund-service unit
+  // tests. It models transaction rollback and the two shipment read shapes used
+  // by refund creation: physical SHIPPED rows for restocking and journaled rows
+  // for accounting reversal snapshots.
   const client = {
     $queryRaw: async () => [],
     $executeRaw: async () => {
       state.executeRawCalls += 1
       return 0
     },
-    $transaction: async (callback: (tx: unknown) => Promise<unknown>) => callback(client),
+    $transaction: async (callback: (tx: unknown) => Promise<unknown>) => {
+      const snapshot = cloneTestStateValue(state)
+      try {
+        return await callback(client)
+      } catch (error) {
+        restoreTestState(state, snapshot)
+        if (state.wrapTransactionErrors) {
+          throw new Error('Wrapped transaction error', { cause: error })
+        }
+        throw error
+      }
+    },
     setting: {
       findUnique: async ({ where }: { where: { key: string } }) => {
         const value = state.settings[where.key]
@@ -201,10 +237,24 @@ function createClient(state: State): RefundServiceClient {
           }
         }
         if (select.allocations || select.shipments || select.refunds) {
+          const shipmentSelect = select.shipments as { where?: { shipmentJournalDate?: { not?: null }; status?: string } } | undefined
+          const selectedShipments = state.shipments
+            .filter((row) => row.orderId === order.id)
+            .filter((row) => {
+              if (shipmentSelect?.where?.shipmentJournalDate) return row.shipmentJournalDate != null
+              if (shipmentSelect?.where?.status) return row.status === shipmentSelect.where.status
+              return true
+            })
           return {
             allocations: state.allocations.filter((row) => row.orderId === order.id),
             lines: state.lines.filter((row) => row.orderId === order.id),
-            shipments: state.shipments.filter((row) => row.orderId === order.id && row.shipmentJournalDate),
+            shipments: selectedShipments.map((shipment) => ({
+              ...shipment,
+              lines: shipment.lines.map((line) => ({
+                ...line,
+                productId: state.lines.find((salesLine) => salesLine.id === line.lineId)?.productId,
+              })),
+            })),
             refunds: state.refunds
               .filter((refund) => refund.orderId === order.id)
               .filter((refund) => {
@@ -303,8 +353,9 @@ function createClient(state: State): RefundServiceClient {
       findUnique: async () => ({ receivedQty: 1, sourceLines: [] }),
     },
     stockMovement: {
-      findMany: async ({ where }: { where: { referenceType: string; referenceId: string } }) => state.movements
-        .filter((movement) => movement.referenceType === where.referenceType && movement.referenceId === where.referenceId),
+      findMany: async ({ where }: { where: { referenceType: string; referenceId: string; toWarehouseId?: string } }) => state.movements
+        .filter((movement) => movement.referenceType === where.referenceType && movement.referenceId === where.referenceId)
+        .filter((movement) => where.toWarehouseId == null || movement.toWarehouseId === where.toWarehouseId),
       createMany: async ({ data, skipDuplicates }: { data: Array<{ productId: string; qty: number; referenceType: string; referenceId: string; idempotencyKey?: string | null }>; skipDuplicates?: boolean }) => {
         let count = 0
         for (const entry of data) {
@@ -316,7 +367,7 @@ function createClient(state: State): RefundServiceClient {
         }
         return { count }
       },
-      create: async ({ data }: { data: { productId: string; qty: number; referenceType: string; referenceId: string; idempotencyKey?: string | null } }) => {
+      create: async ({ data }: { data: { productId: string; qty: number; referenceType: string; referenceId: string; toWarehouseId?: string | null; idempotencyKey?: string | null } }) => {
         if (data.idempotencyKey && state.movements.some((movement) => movement.idempotencyKey === data.idempotencyKey)) {
           throw uniqueStockMovementError()
         }
@@ -644,7 +695,7 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   assert.equal(state.movements[0].qty, 1)
   assert.equal(state.movements[0].referenceType, 'SalesOrderRefund')
   assert.equal(state.movements[0].referenceId, 'refund-1')
-  assert.equal(state.movements[0].idempotencyKey, 'RETURN_INBOUND:refund:refund-1:line:refund-line-1')
+  assert.equal(state.movements[0].idempotencyKey, 'RETURN_INBOUND:refund:refund-1:line:refund-line-1:warehouse:warehouse-returns')
   assert.equal(state.stockLevels[0].quantity, 1)
   assert.equal(findReturnCostLayer(state).unitCostBase, 10)
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
@@ -908,8 +959,107 @@ test('createSalesOrderRefund fallback stock return excludes the current refund f
   assert.equal(state.movements[0].qty, 2)
   assert.equal(state.movements[0].referenceType, 'SalesOrderRefund')
   assert.equal(state.movements[0].referenceId, 'refund-1')
-  assert.equal(state.movements[0].idempotencyKey, 'RETURN_INBOUND:refund:refund-1:line:refund-line-1')
+  assert.equal(state.movements[0].idempotencyKey, 'RETURN_INBOUND:refund:refund-1:line:refund-line-1:warehouse:warehouse-returns')
   assert.equal(state.stockLevels[0].quantity, 2)
+})
+
+test('createSalesOrderRefund rejects restocking a refund line with no shipped source stock', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: null,
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: null,
+    }],
+    lines: [
+      { id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 },
+      { id: 'line-2', orderId: 'order-1', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 50 },
+    ],
+    allocations: [{
+      id: 'allocation-1',
+      orderId: 'order-1',
+      lineId: 'line-2',
+      productId: 'product-2',
+      warehouseId: 'warehouse-main',
+      qty: 1,
+      costLayerSnapshot: [],
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: null,
+      revenueRecognizedAmount: null,
+      cogsBatchAmount: null,
+      lines: [{ id: 'shipment-line-1', lineId: 'line-1', qty: 1, costLayerSnapshot: [] }],
+    }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-2', productId: 'product-2', description: 'Product 2', qty: 1, totalBase: 50 }],
+    reason: 'Refund unshipped allocation',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.deepEqual(result, {
+    success: false,
+    error: 'Cannot restock product product-2 for refund: no shipment line exists on the original order. Process as cash-only or refund a shipped line.',
+  })
+  assert.equal(state.refunds.length, 0)
+  assert.equal(state.refundLines.length, 0)
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.stockLevels.length, 0)
+})
+
+test('createSalesOrderRefund unwraps transaction-wrapped return source errors', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: null,
+      unearnedRevenueAmount: null,
+      inventoryAllocatedDate: null,
+      allocationBatchAmount: null,
+    }],
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 100 }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: null,
+      revenueRecognizedAmount: null,
+      cogsBatchAmount: null,
+      lines: [],
+    }],
+    wrapTransactionErrors: true,
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 100 }],
+    reason: 'Refund unshipped line',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+  })
+
+  assert.deepEqual(result, {
+    success: false,
+    error: 'Cannot restock product product-1 for refund: no shipment line exists on the original order. Process as cash-only or refund a shipped line.',
+  })
+  assert.equal(state.refunds.length, 0)
+  assert.equal(state.refundLines.length, 0)
 })
 
 test('createSalesOrderRefund keeps same-product refund lines as distinct inbound movements', async () => {
@@ -959,11 +1109,46 @@ test('createSalesOrderRefund keeps same-product refund lines as distinct inbound
   assert.deepEqual(
     state.movements.map((movement) => movement.idempotencyKey),
     [
-      'RETURN_INBOUND:refund:refund-1:line:refund-line-1',
-      'RETURN_INBOUND:refund:refund-1:line:refund-line-2',
+      'RETURN_INBOUND:refund:refund-1:line:refund-line-1:warehouse:warehouse-returns',
+      'RETURN_INBOUND:refund:refund-1:line:refund-line-2:warehouse:warehouse-returns',
     ],
   )
   assert.equal(state.stockLevels[0].quantity, 2)
+})
+
+test('applyReturnInboundStockTx scopes refund movement idempotency to the return warehouse', async () => {
+  const state = baseState()
+
+  await applyReturnInboundStockTx(createClient(state) as Prisma.TransactionClient, {
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    warehouseId: 'warehouse-a',
+    rows: [{ productId: 'product-1', qty: 1, refundLineId: 'refund-line-1' }],
+    note: 'Refund return',
+  })
+  await applyReturnInboundStockTx(createClient(state) as Prisma.TransactionClient, {
+    referenceType: 'SalesOrderRefund',
+    referenceId: 'refund-1',
+    warehouseId: 'warehouse-b',
+    rows: [{ productId: 'product-1', qty: 1, refundLineId: 'refund-line-1' }],
+    note: 'Refund return',
+  })
+
+  assert.deepEqual(
+    state.movements.map((movement) => movement.idempotencyKey),
+    [
+      'RETURN_INBOUND:refund:refund-1:line:refund-line-1:warehouse:warehouse-a',
+      'RETURN_INBOUND:refund:refund-1:line:refund-line-1:warehouse:warehouse-b',
+    ],
+  )
+  assert.deepEqual(state.stockLevels.map((stockLevel) => ({
+    productId: stockLevel.productId,
+    warehouseId: stockLevel.warehouseId,
+    quantity: stockLevel.quantity,
+  })), [
+    { productId: 'product-1', warehouseId: 'warehouse-a', quantity: 1 },
+    { productId: 'product-1', warehouseId: 'warehouse-b', quantity: 1 },
+  ])
 })
 
 test('applyReturnInboundStockTx does not create return cost layers on movement idempotency conflict', async () => {
@@ -973,7 +1158,8 @@ test('applyReturnInboundStockTx does not create return cost layers on movement i
       qty: 1,
       referenceType: 'SalesOrderRefund',
       referenceId: 'other-refund',
-      idempotencyKey: 'RETURN_INBOUND:refund:refund-1:line:refund-line-1',
+      idempotencyKey: 'RETURN_INBOUND:refund:refund-1:line:refund-line-1:warehouse:warehouse-returns',
+      toWarehouseId: 'warehouse-returns',
     }],
   })
 
@@ -1005,7 +1191,7 @@ test('applyReturnInboundStockTx does not create return cost layers on movement i
     level: 'INFO',
     description: 'Skipped duplicate refund return for product product-1',
     metadata: {
-      idempotencyKey: 'RETURN_INBOUND:refund:refund-1:line:refund-line-1',
+      idempotencyKey: 'RETURN_INBOUND:refund:refund-1:line:refund-line-1:warehouse:warehouse-returns',
       productId: 'product-1',
       refundLineId: 'refund-line-1',
       referenceType: 'SalesOrderRefund',
@@ -1153,7 +1339,13 @@ test('retrySalesOrderRefundAccounting replays persisted syncs after full refund 
 
 test('applyReturnInboundStockTx returns existing movement rows without duplicating stock', async () => {
   const state = baseState({
-    movements: [{ productId: 'product-1', qty: 1, referenceType: 'SalesOrder', referenceId: 'order-1' }],
+    movements: [{
+      productId: 'product-1',
+      qty: 1,
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      toWarehouseId: 'warehouse-returns',
+    }],
   })
 
   const rows = await applyReturnInboundStockTx(createClient(state) as Parameters<typeof applyReturnInboundStockTx>[0], {
@@ -1251,7 +1443,7 @@ test('retrySalesOrderRefundAccounting stages accounting and return stock for an 
   assert.equal(state.executeRawCalls, 1)
 })
 
-test('retrySalesOrderRefundAccounting falls back to order rows when staged return snapshots are empty', async () => {
+test('retrySalesOrderRefundAccounting does not restock allocation-only refund rows', async () => {
   const state = baseState({
     orders: [{
       id: 'order-1',
@@ -1306,13 +1498,14 @@ test('retrySalesOrderRefundAccounting falls back to order rows when staged retur
     accountingSettings,
   })
 
-  assert.equal(result.success, true)
-  assert.equal(result.success && result.accountingSyncs[0].type, 'UNEARNED_REV_REVERSAL')
-  assert.equal(state.movements[0].productId, 'product-1')
-  assert.equal(state.movements[0].qty, 2)
-  assert.equal(state.movements[0].referenceType, 'SalesOrderRefund')
-  assert.equal(state.movements[0].referenceId, 'refund-1')
-  assert.equal(state.stockLevels[0].quantity, 2)
+  assert.equal(result.success, false)
+  assert.equal(
+    result.success ? '' : result.error,
+    'Refund was created, but accounting reversal staging failed: Cannot restock product product-1 for refund: no shipment line exists on the original order. Process as cash-only or refund a shipped line.',
+  )
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.stockLevels.length, 0)
+  assert.equal(state.refunds[0].accountingRetryRequired, true)
 })
 
 test('retrySalesOrderRefundAccounting requires a pending accounting failure', async () => {
