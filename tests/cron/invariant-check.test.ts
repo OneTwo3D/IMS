@@ -6,6 +6,7 @@ import { getAllCronJobs } from '@/lib/cron-jobs'
 import { runScheduledInvariantCheck } from '@/lib/cron/invariant-check'
 import type { AccountingInvariantReport } from '@/lib/domain/accounting/invariants'
 import type { InventoryInvariantReport } from '@/lib/domain/inventory/invariants'
+import type { RefundStatusReconciliationReport } from '@/lib/domain/sales/refund-status-reconciliation'
 
 type CronEnv = {
   CRON_SECRET?: string
@@ -100,6 +101,19 @@ function accountingReport(): AccountingInvariantReport {
   }
 }
 
+function cleanSalesReport(): RefundStatusReconciliationReport {
+  return {
+    checkedAt: '2026-01-01T00:00:03.000Z',
+    findings: [],
+    summary: {
+      total: 0,
+      info: 0,
+      warning: 0,
+      critical: 0,
+    },
+  }
+}
+
 test('cron invariant check rejects requests without the cron secret', async () => {
   await withCronEnv({ CRON_SECRET: 'secret-token', NODE_ENV: 'production' }, async () => {
     const response = await GET(cronRequest())
@@ -128,6 +142,7 @@ test('scheduled invariant check logs counts and notifies only for critical findi
     now: () => new Date('2026-01-01T00:00:00.000Z'),
     runInventoryReport: async () => inventoryReport(),
     runAccountingReport: async () => accountingReport(),
+    runSalesReport: async () => cleanSalesReport(),
     writeActivityLog: async (entry) => {
       activityLogs.push(entry as unknown as Record<string, unknown>)
     },
@@ -176,6 +191,7 @@ test('scheduled invariant check logs counts and notifies only for critical findi
     createRunId: () => 'run-2',
     runInventoryReport: async () => inventoryReport(),
     runAccountingReport: async () => accountingReport(),
+    runSalesReport: async () => cleanSalesReport(),
     writeActivityLog: async (entry) => {
       activityLogs.push(entry as unknown as Record<string, unknown>)
     },
@@ -209,6 +225,7 @@ test('scheduled invariant check does not notify when there are no critical findi
       findings: [],
       summary: { total: 0, info: 0, warning: 0, critical: 0 },
     }),
+    runSalesReport: async () => cleanSalesReport(),
     writeActivityLog: async (entry) => {
       activityLogs.push(entry as unknown as Record<string, unknown>)
     },
@@ -240,6 +257,18 @@ test('scheduled invariant check logs partial report failures without discarding 
       throw new Error('inventory query failed')
     },
     runAccountingReport: async () => accountingReport(),
+    runSalesReport: async () => ({
+      checkedAt: '2026-01-01T00:00:03.000Z',
+      findings: [{
+        severity: 'critical',
+        code: 'sales_order_refund_status_mismatch',
+        orderId: 'order-1',
+        refundId: 'refund-1',
+        message: 'Sales order refund status is stale',
+        details: { status: 'SHIPPED', expectedStatus: 'PARTIALLY_REFUNDED' },
+      }],
+      summary: { total: 1, info: 0, warning: 0, critical: 1 },
+    }),
     writeActivityLog: async (entry) => {
       activityLogs.push(entry as unknown as Record<string, unknown>)
     },
@@ -255,6 +284,7 @@ test('scheduled invariant check logs partial report failures without discarding 
   assert.equal(result.status, 'partial_failure')
   assert.equal(result.reports.inventory, null)
   assert.equal(result.reports.accounting?.summary.critical, 1)
+  assert.equal(result.reports.sales?.summary.critical, 1)
   assert.deepEqual(result.errors, [
     { domain: 'inventory', message: 'inventory query failed' },
   ])

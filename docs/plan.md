@@ -223,9 +223,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** `tests/domain/sales/shipment-service.test.ts` covers line quantity changes, line additions, line removals, and multi-warehouse over-shipment totals.
 
 ### P3.4 — RefundStatus / SalesOrderStatus mismatch
-- **Files:** `lib/domain/workflows/refund-state.ts`, `sales-order-state.ts`
-- **Fix:** Add a daily reconciliation job that pulls all refunds + orders and flags mismatches to admin activity log. Long-term: collapse to one state machine.
-- **Tests:** Synthetic data with a known mismatch; assert the job emits the alert.
+- **Status:** Complete.
+- **Files:** `lib/domain/sales/refund-status-reconciliation.ts`, `lib/cron/invariant-check.ts`
+- **Fix:** Scheduled invariant checks now include a sales refund-status reconciliation report. It pulls orders with refund rows or refund statuses, flags orders whose cumulative refunds imply a different `SalesOrder.status`, and surfaces mismatches through the existing admin activity-log and notification path.
+- **Tests:** `tests/domain/sales/refund-status-reconciliation.test.ts` covers clean, stale, and unsupported refund-status rows. `tests/cron/invariant-check.test.ts` asserts sales-domain findings are included in the scheduled invariant result and admin alert path.
 
 ### P3.5 — Refund-without-restocking silent zero-return
 - **Status:** Complete. This plan item used the throw-on-missing-source option so unshipped allocation-only refunds cannot create physical restock movements without shipped stock evidence.
