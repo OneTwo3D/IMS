@@ -25,6 +25,18 @@ export type ImportWcOrderOptions = { skipAccounting?: boolean; useWcDateAsCreate
 
 const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
 
+export type WcTaxRateFallbackLine = {
+  sku: string
+  productCategory: TaxCategory
+  externalTaxRateId: number | null
+  taxRateValue: number
+  warning: string | null
+}
+
+export function shouldBlockWcTaxRateFallback(lines: WcTaxRateFallbackLine[]): boolean {
+  return lines.some((line) => line.taxRateValue > 0)
+}
+
 function roundDecimalNumber(value: DecimalInput, precision: number): number {
   return roundQuantity(value, precision).toNumber()
 }
@@ -137,7 +149,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     ]))
     const wcResolvedById = new Map<
       number,
-      { taxRateId: string | null; taxRateName: string | null; taxRateValue: number; accountingTaxType: string | null }
+      { taxRateId: string | null; taxRateName: string | null; taxRateValue: number; accountingTaxType: string | null; source?: 'mapped' | 'default' }
     >()
     for (const id of distinctWcRateIds) {
       wcResolvedById.set(id, await resolveWcTaxRateById(id))
@@ -188,14 +200,15 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       .map((l, idx) => ({
         id: String(idx),
         productCategory: (l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory),
-        hasWc: l.externalTaxRateId != null,
+        hasMappedWc: l.externalTaxRateId != null && wcResolvedById.get(l.externalTaxRateId)?.source === 'mapped',
       }))
-      .filter((l) => !l.hasWc)
+      .filter((l) => !l.hasMappedWc)
     const resolverMap = await resolveLineTaxRateBatch(
       needsResolver.map((l) => ({ id: l.id, productCategory: l.productCategory })),
       { destinationCountry: destCountry, usedFor: 'SALES', orderDefault: orderDefaultCtx },
     )
 
+    const taxFallbackLines: WcTaxRateFallbackLine[] = []
     const lineTaxResolved = mappedLines.map((l, idx) => {
       if (l.forceNoTax) {
         return {
@@ -207,17 +220,46 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       }
       if (l.externalTaxRateId != null) {
         const wc = wcResolvedById.get(l.externalTaxRateId)
-        if (wc) return wc
+        if (wc?.source === 'mapped') return wc
       }
-      return (
-        resolverMap.get(String(idx)) ?? {
-          taxRateId: orderDefaultTaxRateId,
-          taxRateName: taxRateName,
-          taxRateValue: taxRateValue,
-          accountingTaxType: accountingTaxType,
-        }
-      )
+      const resolved = resolverMap.get(String(idx)) ?? {
+        taxRateId: orderDefaultTaxRateId,
+        taxRateName,
+        taxRateValue,
+        accountingTaxType,
+        matched: 'fallback' as const,
+        warning: `No configured sales rate for ${destCountry ? destCountry.toUpperCase() : 'unknown country'} / ${l.taxCategoryFallback ?? 'STANDARD'}. Using order default.`,
+      }
+      if (resolved.matched === 'fallback') {
+        taxFallbackLines.push({
+          sku: l.sku,
+          productCategory: (l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory),
+          externalTaxRateId: l.externalTaxRateId ?? null,
+          taxRateValue: resolved.taxRateValue,
+          warning: resolved.warning,
+        })
+      }
+      return resolved
     })
+    if (shouldBlockWcTaxRateFallback(taxFallbackLines)) {
+      const description = `Blocked WooCommerce order ${wcOrder.number} import because ${taxFallbackLines.length} line(s) would use the order default tax rate.`
+      await logActivity({
+        entityType: 'SYNC',
+        entityId: null,
+        action: 'tax_rate_fallback_blocked',
+        tag: 'sync',
+        level: 'ERROR',
+        description,
+        metadata: {
+          connector: 'woocommerce',
+          externalOrderId: String(wcOrder.id),
+          externalOrderNumber: wcOrder.number,
+          destCountry,
+          lines: taxFallbackLines,
+        },
+      })
+      return { success: false, error: description }
+    }
 
     // Calculate totals from WC data (per-line rates for net extraction)
     const subtotalForeign = mappedLines.reduce((s, l, idx) => {
@@ -360,6 +402,24 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
         return { success: true, orderId: concurrent.id }
       }
       throw error
+    }
+
+    if (taxFallbackLines.length > 0) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: 'tax_rate_fallback',
+        tag: 'sales',
+        level: 'WARNING',
+        description: `WooCommerce order ${wcOrder.number} used order default tax rate on ${taxFallbackLines.length} zero-rated line(s).`,
+        metadata: {
+          connector: 'woocommerce',
+          externalOrderId: String(wcOrder.id),
+          externalOrderNumber: wcOrder.number,
+          destCountry,
+          lines: taxFallbackLines,
+        },
+      })
     }
 
     // Auto-allocate stock (skip for terminal statuses)

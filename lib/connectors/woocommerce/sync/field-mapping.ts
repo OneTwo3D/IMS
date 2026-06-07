@@ -249,6 +249,7 @@ type ResolvedTaxRate = {
   taxRateName: string | null
   taxRateValue: number
   accountingTaxType: string | null
+  source: 'mapped' | 'default'
 }
 
 async function fallbackDefaultTaxRate(): Promise<ResolvedTaxRate> {
@@ -262,9 +263,10 @@ async function fallbackDefaultTaxRate(): Promise<ResolvedTaxRate> {
       taxRateName: defaultRate.name,
       taxRateValue: Number(defaultRate.rate),
       accountingTaxType: defaultRate.accountingTaxType,
+      source: 'default',
     }
   }
-  return { taxRateId: null, taxRateName: null, taxRateValue: 0, accountingTaxType: null }
+  return { taxRateId: null, taxRateName: null, taxRateValue: 0, accountingTaxType: null, source: 'default' }
 }
 
 export async function resolveWcTaxRateById(wcRateId: number | null | undefined): Promise<ResolvedTaxRate> {
@@ -286,6 +288,7 @@ export async function resolveWcTaxRateById(wcRateId: number | null | undefined):
     taxRateName: mapping.taxRate.name,
     taxRateValue: Number(mapping.taxRate.rate),
     accountingTaxType: mapping.taxRate.accountingTaxType,
+    source: 'mapped',
   }
 }
 

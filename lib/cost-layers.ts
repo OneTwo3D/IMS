@@ -446,9 +446,19 @@ export async function updateSnapshotsForCostLayerChange(
     for (const row of rows) {
       if (!Array.isArray(row.costLayerSnapshot)) continue
       let changed = false
+      const changedEntries: Array<{
+        previousUnitCostBase: unknown
+        newUnitCostBase: string
+        qty: unknown
+      }> = []
       const patched = (row.costLayerSnapshot as Array<Record<string, unknown>>).map((entry) => {
         if (entry.costLayerId === costLayerId && !snapshotUnitCostMatches(entry.unitCostBase, newUnitCost, costLayerId)) {
           changed = true
+          changedEntries.push({
+            previousUnitCostBase: entry.unitCostBase,
+            newUnitCostBase: serializedUnitCostBase,
+            qty: entry.qty,
+          })
           return serializeCostLayerSnapshot([{
             ...entry,
             costLayerId,
@@ -464,12 +474,73 @@ export async function updateSnapshotsForCostLayerChange(
           JSON.stringify(patched),
           row.id,
         )
+        await recordCostLayerSnapshotRevaluation(tx, {
+          tableName: table.model,
+          rowId: row.id,
+          costLayerId,
+          previousSnapshot: row.costLayerSnapshot,
+          patchedSnapshot: patched,
+          changedEntries,
+        })
         updated++
       }
     }
   }
 
   return updated
+}
+
+async function recordCostLayerSnapshotRevaluation(
+  tx: TxClient,
+  params: {
+    tableName: string
+    rowId: string
+    costLayerId: string
+    previousSnapshot: unknown
+    patchedSnapshot: unknown
+    changedEntries: Array<{
+      previousUnitCostBase: unknown
+      newUnitCostBase: string
+      qty: unknown
+    }>
+  },
+): Promise<void> {
+  const client = tx as TxClient & {
+    activityLog?: {
+      create(args: {
+        data: {
+          entityType: 'SYSTEM'
+          entityId: string
+          action: string
+          tag: string
+          level: 'INFO'
+          description: string
+          metadata: Record<string, unknown>
+        }
+      }): Promise<unknown>
+    }
+  }
+  if (!client.activityLog) return
+
+  await client.activityLog.create({
+    data: {
+      entityType: 'SYSTEM',
+      entityId: params.rowId,
+      action: 'cost_layer_snapshot_revalued',
+      tag: 'inventory',
+      level: 'INFO',
+      description: `Revalued ${params.tableName} cost-layer snapshot ${params.rowId} for cost layer ${params.costLayerId}`,
+      metadata: {
+        tableName: params.tableName,
+        rowId: params.rowId,
+        costLayerId: params.costLayerId,
+        changedEntryCount: params.changedEntries.length,
+        changedEntries: params.changedEntries,
+        previousSnapshot: params.previousSnapshot,
+        patchedSnapshot: params.patchedSnapshot,
+      },
+    },
+  })
 }
 
 function snapshotUnitCostMatches(value: unknown, expected: Decimal, costLayerId: string): boolean {
