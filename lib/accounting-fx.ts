@@ -161,7 +161,7 @@ export async function resolveSettlementFxRateToBase(
           referenceId: params.referenceId ?? null,
         },
       },
-    }).catch(() => undefined)
+    })
   }
   return Number.isFinite(resolved) && resolved > 0 ? resolved : 1
 }

@@ -460,6 +460,38 @@ test('old mirrorable sync logs report missing accounting events', () => {
   assert.ok(finding)
 })
 
+test('shipment COGS revaluation sync logs count as source state for mirrored events', () => {
+  const rows = cleanRows()
+  rows.syncLogs.push({
+    id: 'sync-shipment-cogs-revaluation',
+    connector: 'xero',
+    type: 'COGS_REVERSAL',
+    status: 'SYNCED',
+    referenceType: 'Shipment',
+    referenceId: 'shipment-1',
+    externalTransactionId: 'journal-shipment-cogs-revaluation',
+    payload: { _idempotencyKey: 'shipment-cogs-revalue:shipment-1:layer-1:20:27.5' },
+  })
+  rows.accountingEvents.push({
+    id: 'event-shipment-cogs-revaluation',
+    type: 'COGS_REVERSAL',
+    sourceEntityType: 'Shipment',
+    sourceEntityId: 'shipment-1',
+    businessDate: B_DATE,
+    status: 'POSTED',
+    idempotencyKey: 'event-shipment-cogs-revaluation-key',
+    externalSystem: 'xero',
+    externalId: 'journal-shipment-cogs-revaluation',
+  })
+
+  const findings = evaluateAccountingReconciliationRows(rows)
+
+  assert.equal(findings.some((finding) => (
+    finding.code === 'event_without_source' &&
+    finding.accountingEventId === 'event-shipment-cogs-revaluation'
+  )), false)
+})
+
 test('events report missing source state, posted external IDs, and duplicate external references', () => {
   const rows = cleanRows()
   rows.accountingEvents.push(

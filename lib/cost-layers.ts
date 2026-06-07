@@ -22,6 +22,13 @@ import {
 } from '@/lib/domain/math/decimal'
 
 type TxClient = Prisma.TransactionClient
+type ShipmentCogsRevaluationSyncOptions = {
+  accountingSettings?: {
+    inventoryAccount?: string | null
+    cogsAccount?: string | null
+  }
+  queueAccountingSync?: typeof queueAccountingSyncTx
+}
 
 export function buildShipmentCogsRevaluationSyncPayload(input: {
   shipmentId: string
@@ -39,6 +46,8 @@ export function buildShipmentCogsRevaluationSyncPayload(input: {
     date: new Date().toISOString().slice(0, 10),
     reference: `Shipment COGS revaluation: ${input.shipmentId}`,
     narration: `Reverse and repost shipment COGS after cost-layer revaluation for shipment ${input.shipmentId}`,
+    // Use a 4-line reverse + repost journal rather than a 2-line delta so the
+    // accounting audit trail shows both the old and recomputed shipment COGS.
     lines: [
       { accountCode: input.inventoryAccount, description: `Reverse old shipment COGS ${input.shipmentId}`, debit: oldCogs.toNumber() },
       { accountCode: input.cogsAccount, description: `Reverse old shipment COGS ${input.shipmentId}`, credit: oldCogs.toNumber() },
@@ -59,8 +68,9 @@ async function queueShipmentCogsRevaluationSync(
     oldCogsBase: DecimalInput
     newCogsBase: DecimalInput
   },
+  options: ShipmentCogsRevaluationSyncOptions = {},
 ): Promise<void> {
-  const settings = await getAccountingSettings().catch(() => null)
+  const settings = options.accountingSettings ?? await getAccountingSettings().catch(() => null)
   if (!settings?.inventoryAccount || !settings.cogsAccount) return
   const payload = buildShipmentCogsRevaluationSyncPayload({
     ...input,
@@ -69,7 +79,7 @@ async function queueShipmentCogsRevaluationSync(
   })
   if (!payload) return
 
-  await queueAccountingSyncTx(tx, {
+  await (options.queueAccountingSync ?? queueAccountingSyncTx)(tx, {
     type: 'COGS_REVERSAL',
     referenceType: 'Shipment',
     referenceId: input.shipmentId,
@@ -548,6 +558,7 @@ export async function getSupplierReturnedQtyForCostLayer(
 export async function refreshShipmentCogsForCostLayerChange(
   tx: TxClient,
   costLayerId: string,
+  options: ShipmentCogsRevaluationSyncOptions = {},
 ): Promise<number> {
   const containsCostLayer = JSON.stringify([{ costLayerId }])
   const shipments = await tx.$queryRawUnsafe<Array<{ id: string }>>(
@@ -580,7 +591,7 @@ export async function refreshShipmentCogsForCostLayerChange(
         costLayerId,
         oldCogsBase: currentShipment.cogsBatchAmount,
         newCogsBase: cogs,
-      })
+      }, options)
     }
     updated++
   }

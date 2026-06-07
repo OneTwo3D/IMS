@@ -524,6 +524,9 @@ export function evaluateAccountingReconciliationRows(
   }
 
   for (const log of rows.syncLogs) {
+    if (log.type === 'COGS_REVERSAL' && log.referenceType === 'Shipment') {
+      sourceKeys.add(sourceKey(log.type, log.referenceType, log.referenceId))
+    }
     if (!isMirrorableAccountingSyncType(log.type)) continue
     if (hasAccountingEvent(rows.accountingEvents, {
       externalSystem: log.connector,

@@ -329,7 +329,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Status:** Complete.
 - **Files:** `lib/connectors/xero/sync-processor.ts:822, 843, 868`
 - **Fix:** Xero outbox workers now explicitly complete stale outbox jobs for already-synced logs with external transaction IDs before any connector post can run. Existing processing paths already mark logs with external IDs as synced without posting.
-- **Tests:** Covered by `tests/xero-sync-processor.test.ts` stale/outbox guard coverage and `npm run validate`.
+- **Tests:** `tests/xero-sync-processor.test.ts` covers stale/outbox guard coverage; `npm run validate` covers the full unit suite.
 
 ### P5.5 — COGS entry decimal precision loss
 - **Status:** Complete.
@@ -341,13 +341,13 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Status:** Complete.
 - **File:** `lib/connectors/xero/sync-processor.ts:850–980`
 - **Fix:** Xero payment sync logs are claimed oldest-first, and `INVOICE_PAYMENT` processing now defers a payment when an older live payment sync for the same invoice reference is still pending/processing. This preserves oldest-first allocation across outbox retries.
-- **Tests:** Focused worker behavior is covered by the Xero sync processor tests; `npm run validate` covers the full unit suite.
+- **Tests:** `tests/xero-sync-processor.test.ts` covers out-of-order `INVOICE_PAYMENT` entries and asserts later payments are blocked by older live logs through a single batched lookup.
 
 ### P5.7 — Shipment COGS re-calc after layer revalue
 - **Status:** Complete.
 - **File:** `lib/cost-layers.ts:472–501`
 - **Fix:** When `refreshShipmentCogsForCostLayerChange()` changes a posted shipment's COGS amount, it queues a `COGS_REVERSAL` sync log that reverses old shipment COGS and posts the recomputed amount with deterministic idempotency.
-- **Tests:** `tests/cost-layers.test.ts` covers the reversal/repost journal payload and sub-cent no-op behavior.
+- **Tests:** `tests/cost-layers.test.ts` covers the reversal/repost journal payload, journal balance, sub-cent no-op behavior, and posted/unposted shipment queueing.
 
 ---
 

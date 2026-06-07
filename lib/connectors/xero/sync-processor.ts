@@ -49,6 +49,13 @@ type ProcessResult = {
 
 type SyncPayload = Record<string, unknown>
 type FollowUpSyncType = 'INVOICE_PAYMENT' | 'BILL_ATTACHMENT' | 'INVOICE_PDF' | 'INVOICE_EMAIL' | 'WC_INVOICE_NOTE'
+type InvoicePaymentOrderingEntry = {
+  id: string
+  type: AccountingSyncType
+  referenceType: string
+  referenceId: string
+  createdAt: Date
+}
 
 export function isXeroAccountingOutboxEnabled(value = process.env.XERO_ACCOUNTING_OUTBOX_ENABLED): boolean {
   return !['false', '0', 'off'].includes(String(value ?? 'true').trim().toLowerCase())
@@ -170,27 +177,50 @@ function syncLogNextAttemptAt(log: { status: string; processingStartedAt: Date |
   return null
 }
 
-async function hasEarlierLiveInvoicePayment(entry: {
-  id: string
-  type: AccountingSyncType
-  referenceType: string
-  referenceId: string
-  createdAt: Date
-}): Promise<boolean> {
-  if (entry.type !== 'INVOICE_PAYMENT') return false
-  const older = await db.accountingSyncLog.findFirst({
-    where: {
-      id: { not: entry.id },
-      connector: XERO_CONNECTOR,
-      type: 'INVOICE_PAYMENT',
+function invoicePaymentReferenceKey(entry: Pick<InvoicePaymentOrderingEntry, 'referenceType' | 'referenceId'>): string {
+  return `${entry.referenceType}\u0000${entry.referenceId}`
+}
+
+export async function findInvoicePaymentsBlockedByEarlierLiveLogs(
+  client: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  entries: InvoicePaymentOrderingEntry[],
+): Promise<Set<string>> {
+  const paymentEntries = entries.filter((entry) => entry.type === 'INVOICE_PAYMENT')
+  if (paymentEntries.length === 0) return new Set()
+
+  const referenceFilters = [...new Map(
+    paymentEntries.map((entry) => [invoicePaymentReferenceKey(entry), {
       referenceType: entry.referenceType,
       referenceId: entry.referenceId,
+    }]),
+  ).values()]
+  const liveLogs = await client.accountingSyncLog.findMany({
+    where: {
+      connector: XERO_CONNECTOR,
+      type: 'INVOICE_PAYMENT',
       status: { in: ['PENDING', 'PROCESSING'] },
-      createdAt: { lt: entry.createdAt },
+      OR: referenceFilters,
     },
-    select: { id: true },
+    select: { id: true, referenceType: true, referenceId: true, createdAt: true },
+    orderBy: { createdAt: 'asc' },
   })
-  return older != null
+
+  const earliestLiveByReference = new Map<string, { id: string; createdAt: Date }>()
+  for (const log of liveLogs) {
+    const key = invoicePaymentReferenceKey(log)
+    if (!earliestLiveByReference.has(key)) {
+      earliestLiveByReference.set(key, log)
+    }
+  }
+
+  const blocked = new Set<string>()
+  for (const entry of paymentEntries) {
+    const earliest = earliestLiveByReference.get(invoicePaymentReferenceKey(entry))
+    if (earliest && earliest.id !== entry.id && earliest.createdAt < entry.createdAt) {
+      blocked.add(entry.id)
+    }
+  }
+  return blocked
 }
 
 async function deferPaymentUntilEarlierLogsPost(entry: { id: string }): Promise<void> {
@@ -198,6 +228,8 @@ async function deferPaymentUntilEarlierLogsPost(entry: { id: string }): Promise<
     where: { id: entry.id },
     data: {
       status: 'PENDING',
+      // Future processingStartedAt is the existing retry gate for PENDING sync
+      // rows. Treat future values on PENDING rows as "earliest next claim time".
       processingStartedAt: new Date(Date.now() + 60_000),
       errorMessage: 'Deferred until older invoice payment sync logs post',
     },
@@ -360,6 +392,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
     orderBy: { createdAt: 'asc' },
     take: MAX_PER_RUN,
   })
+  const blockedPaymentEntryIds = await findInvoicePaymentsBlockedByEarlierLiveLogs(db, pending)
 
   for (const entry of pending) {
     const claim = await db.accountingSyncLog.updateMany({
@@ -375,7 +408,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
     const payload = (entry.payload ?? {}) as SyncPayload
 
     try {
-      if (await hasEarlierLiveInvoicePayment(entry)) {
+      if (blockedPaymentEntryIds.has(entry.id)) {
         await deferPaymentUntilEarlierLogsPost(entry)
         result.skipped++
         continue
@@ -563,22 +596,32 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
     maxAttempts: MAX_RETRIES,
   })
 
+  const jobWork: Array<{ job: IntegrationOutboxRow; syncLogId: string }> = []
   for (const job of jobs) {
     if (!job.lockedAt) {
       result.failed++
       continue
     }
 
-    let syncLogId: string
     try {
-      syncLogId = parseXeroAccountingOutboxPayload(job).accountingSyncLogId
+      jobWork.push({ job, syncLogId: parseXeroAccountingOutboxPayload(job).accountingSyncLogId })
     } catch (error) {
       await markXeroOutboxPermanent(job, error instanceof Error ? error.message : String(error))
       result.failed++
       continue
     }
+  }
 
-    const entry = await db.accountingSyncLog.findUnique({ where: { id: syncLogId } })
+  const entries = jobWork.length > 0
+    ? await db.accountingSyncLog.findMany({
+        where: { id: { in: [...new Set(jobWork.map((work) => work.syncLogId))] } },
+      })
+    : []
+  const entriesById = new Map(entries.map((entry) => [entry.id, entry]))
+  const blockedPaymentEntryIds = await findInvoicePaymentsBlockedByEarlierLiveLogs(db, entries)
+
+  for (const { job, syncLogId } of jobWork) {
+    const entry = entriesById.get(syncLogId)
     if (!entry) {
       await markXeroOutboxPermanent(job, `Accounting sync log ${syncLogId} was not found`)
       result.failed++
@@ -612,12 +655,14 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
     const payload = (entry.payload ?? {}) as SyncPayload
 
     try {
-      if (await hasEarlierLiveInvoicePayment(entry)) {
+      if (blockedPaymentEntryIds.has(entry.id)) {
         await db.$transaction(async (tx) => {
           await tx.accountingSyncLog.update({
             where: { id: entry.id },
             data: {
               status: 'PENDING',
+              // Future processingStartedAt is the existing retry gate for
+              // PENDING sync rows; here it means "earliest next claim time".
               processingStartedAt: new Date(Date.now() + 60_000),
               errorMessage: 'Deferred until older invoice payment sync logs post',
             },
