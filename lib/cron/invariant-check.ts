@@ -12,6 +12,11 @@ import {
   type InventoryInvariantFinding,
   type InventoryInvariantReport,
 } from '@/lib/domain/inventory/invariants'
+import {
+  runRefundStatusReconciliationReport,
+  type RefundStatusReconciliationFinding,
+  type RefundStatusReconciliationReport,
+} from '@/lib/domain/sales/refund-status-reconciliation'
 import { notify } from '@/lib/notifications'
 
 const CRITICAL_FINDINGS_HASH_SETTING = 'cron_invariant_check_critical_findings_hash'
@@ -36,7 +41,7 @@ function stockMovementLookbackDays(): number {
   return positiveIntEnv('INVARIANT_CHECK_STOCK_MOVEMENT_LOOKBACK_DAYS', DEFAULT_STOCK_MOVEMENT_LOOKBACK_DAYS)
 }
 
-type InvariantDomain = 'inventory' | 'accounting'
+type InvariantDomain = 'inventory' | 'accounting' | 'sales'
 
 type InvariantReportSummary = {
   total: number
@@ -66,6 +71,7 @@ export type ScheduledInvariantCheckResult = {
     total: InvariantReportSummary
     inventory: InvariantReportSummary
     accounting: InvariantReportSummary
+    sales: InvariantReportSummary
   }
   errors: Array<{
     domain: InvariantDomain
@@ -75,6 +81,7 @@ export type ScheduledInvariantCheckResult = {
   reports: {
     inventory: InventoryInvariantReport | null
     accounting: AccountingInvariantReport | null
+    sales: RefundStatusReconciliationReport | null
   }
 }
 
@@ -83,6 +90,7 @@ type ScheduledInvariantCheckDependencies = {
   now?: () => Date
   runInventoryReport?: () => Promise<InventoryInvariantReport>
   runAccountingReport?: () => Promise<AccountingInvariantReport>
+  runSalesReport?: () => Promise<RefundStatusReconciliationReport>
   writeActivityLog?: typeof logActivity
   notifyAdmins?: (params: Omit<Parameters<typeof notify>[0], 'userId'>) => Promise<void>
   getPreviousCriticalFindingsHash?: () => Promise<string | null>
@@ -117,8 +125,12 @@ function toCriticalFinding(
   finding: AccountingInvariantFinding,
 ): ScheduledInvariantCriticalFinding
 function toCriticalFinding(
+  domain: 'sales',
+  finding: RefundStatusReconciliationFinding,
+): ScheduledInvariantCriticalFinding
+function toCriticalFinding(
   domain: InvariantDomain,
-  finding: InventoryInvariantFinding | AccountingInvariantFinding,
+  finding: InventoryInvariantFinding | AccountingInvariantFinding | RefundStatusReconciliationFinding,
 ): ScheduledInvariantCriticalFinding {
   return {
     domain,
@@ -137,6 +149,7 @@ function toCriticalFinding(
 function criticalFindingsForReports(
   inventory: InventoryInvariantReport,
   accounting: AccountingInvariantReport,
+  sales: RefundStatusReconciliationReport,
 ): ScheduledInvariantCriticalFinding[] {
   return [
     ...inventory.findings
@@ -145,6 +158,9 @@ function criticalFindingsForReports(
     ...accounting.findings
       .filter((finding) => finding.severity === 'critical')
       .map((finding) => toCriticalFinding('accounting', finding)),
+    ...sales.findings
+      .filter((finding) => finding.severity === 'critical')
+      .map((finding) => toCriticalFinding('sales', finding)),
   ]
 }
 
@@ -164,9 +180,10 @@ function resultStatus(
   errors: ScheduledInvariantCheckResult['errors'],
   inventory: InventoryInvariantReport | null,
   accounting: AccountingInvariantReport | null,
+  sales: RefundStatusReconciliationReport | null,
 ): ScheduledInvariantCheckResult['status'] {
   if (errors.length === 0) return 'completed'
-  if (inventory || accounting) return 'partial_failure'
+  if (inventory || accounting || sales) return 'partial_failure'
   return 'failed'
 }
 
@@ -241,17 +258,20 @@ export async function runScheduledInvariantCheck(
     stockMovementLookbackDays: stockMovementLookbackDays(),
   }))
   const runAccountingReport = dependencies.runAccountingReport ?? runAccountingInvariantReport
+  const runSalesReport = dependencies.runSalesReport ?? runRefundStatusReconciliationReport
   const writeActivityLog = dependencies.writeActivityLog ?? logActivity
   const notifyAdmins = dependencies.notifyAdmins ?? notifyActiveAdmins
   const readCriticalFindingsHash = dependencies.getPreviousCriticalFindingsHash ?? getPreviousCriticalFindingsHash
   const writeCriticalFindingsHash = dependencies.setCriticalFindingsHash ?? setCriticalFindingsHash
 
-  const [inventoryResult, accountingResult] = await Promise.allSettled([
+  const [inventoryResult, accountingResult, salesResult] = await Promise.allSettled([
     runInventoryReport(),
     runAccountingReport(),
+    runSalesReport(),
   ])
   const inventory = inventoryResult.status === 'fulfilled' ? inventoryResult.value : null
   const accounting = accountingResult.status === 'fulfilled' ? accountingResult.value : null
+  const sales = salesResult.status === 'fulfilled' ? salesResult.value : null
   const errors: ScheduledInvariantCheckResult['errors'] = [
     ...(inventoryResult.status === 'rejected'
       ? [{ domain: 'inventory' as const, message: normalizeError(inventoryResult.reason) }]
@@ -259,15 +279,20 @@ export async function runScheduledInvariantCheck(
     ...(accountingResult.status === 'rejected'
       ? [{ domain: 'accounting' as const, message: normalizeError(accountingResult.reason) }]
       : []),
+    ...(salesResult.status === 'rejected'
+      ? [{ domain: 'sales' as const, message: normalizeError(salesResult.reason) }]
+      : []),
   ]
   const inventorySummary = inventory?.summary ?? EMPTY_SUMMARY
   const accountingSummary = accounting?.summary ?? EMPTY_SUMMARY
-  const total = addSummary(inventorySummary, accountingSummary)
+  const salesSummary = sales?.summary ?? EMPTY_SUMMARY
+  const total = addSummary(addSummary(inventorySummary, accountingSummary), salesSummary)
   const criticalFindings = criticalFindingsForReports(
     inventory ?? { checkedAt, findings: [], summary: EMPTY_SUMMARY },
     accounting ?? { checkedAt, findings: [], summary: EMPTY_SUMMARY },
+    sales ?? { checkedAt, findings: [], summary: EMPTY_SUMMARY },
   )
-  const status = resultStatus(errors, inventory, accounting)
+  const status = resultStatus(errors, inventory, accounting, sales)
   const result: ScheduledInvariantCheckResult = {
     runId,
     checkedAt,
@@ -276,12 +301,14 @@ export async function runScheduledInvariantCheck(
       total,
       inventory: inventorySummary,
       accounting: accountingSummary,
+      sales: salesSummary,
     },
     errors,
     criticalFindings,
     reports: {
       inventory,
       accounting,
+      sales,
     },
   }
 
