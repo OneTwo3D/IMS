@@ -1034,8 +1034,9 @@ export async function createSalesOrder(input: CreateSoInput): Promise<{ success:
  * draft order is finalised (DRAFT → PENDING_PAYMENT / PROCESSING / etc.) — the
  * invoice was skipped at creation time and must now be sent to Xero.
  *
- * Safe to call multiple times: checks `accountingInvoiceId` and bails if the
- * invoice has already been posted.
+ * Safe to call multiple times. Once the connector has returned an external
+ * invoice id, IMS cannot mutate that accounting document through this create
+ * queue; attempts are logged so post-push changes are not silently dropped.
  */
 async function queueSalesInvoiceForOrder(id: string): Promise<void> {
   const so = await db.salesOrder.findUnique({
@@ -1071,7 +1072,22 @@ async function queueSalesInvoiceForOrder(id: string): Promise<void> {
     },
   })
   if (!so) return
-  if (so.accountingInvoiceId) return // already posted to accounting
+  if (so.accountingInvoiceId) {
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: so.id,
+      action: 'sales_invoice_sync_skipped_existing_external_id',
+      tag: 'accounting',
+      level: 'WARNING',
+      description: `Skipped sales invoice queue for ${getSalesOrderReference(so)} because it already has accounting invoice ${so.accountingInvoiceId}`,
+      metadata: {
+        accountingInvoiceId: so.accountingInvoiceId,
+        orderNumber: getSalesOrderReference(so),
+        reason: 'accounting_invoice_already_posted',
+      },
+    })
+    return
+  }
 
   const settings = await getAccountingSettings()
   if (!settings.syncEnabled) return

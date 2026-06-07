@@ -17,6 +17,7 @@ import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import {
   isStockMovementIdempotencyConflict,
   refundInboundMovementKey,
+  saleDispatchMovementKey,
 } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { buildStockMovementValueFields } from '@/lib/domain/inventory/stock-movement-value'
 
@@ -76,6 +77,11 @@ function refundReturnSourceErrorMessage(error: unknown): string {
 }
 
 export type RefundServiceClient = Prisma.TransactionClient | typeof db
+
+type ShipmentLineCostSnapshotSource = {
+  id: string
+  costLayerSnapshot: Prisma.JsonValue | null
+}
 
 export type RefundReturnRow = {
   productId: string
@@ -257,6 +263,35 @@ async function nextCreditNoteNumber(
     update: { value: String(next) },
   })
   return `${params.prefix}${year}-${String(next).padStart(5, '0')}`
+}
+
+async function getShipmentLineCostSnapshot(
+  tx: Prisma.TransactionClient,
+  shipmentLine: ShipmentLineCostSnapshotSource,
+): Promise<CostLayerSnapshotEntry[]> {
+  const explicitSnapshot = parseCostLayerSnapshot(shipmentLine.costLayerSnapshot)
+  if (explicitSnapshot.length > 0) return explicitSnapshot
+
+  const movement = await tx.stockMovement.findUnique({
+    where: { idempotencyKey: saleDispatchMovementKey(shipmentLine.id) },
+    select: {
+      cogsEntries: {
+        orderBy: { createdAt: 'asc' },
+        select: {
+          costLayerId: true,
+          qty: true,
+          unitCostBase: true,
+        },
+      },
+    },
+  })
+  return serializeCostLayerSnapshot(
+    (movement?.cogsEntries ?? []).map((entry) => ({
+      costLayerId: entry.costLayerId,
+      qty: entry.qty,
+      unitCostBase: entry.unitCostBase,
+    })),
+  )
 }
 
 async function buildRefundFallbackReturnRows(
@@ -767,13 +802,23 @@ async function stageRefundAccountingReversals(
       select: { type: true, payload: true },
     })
 
+    const shipmentLineSnapshots = new Map<string, CostLayerSnapshotEntry[]>()
+    for (const shipment of orderAccounting?.shipments ?? []) {
+      for (const shipmentLine of shipment.lines) {
+        shipmentLineSnapshots.set(
+          shipmentLine.id,
+          await getShipmentLineCostSnapshot(tx, shipmentLine),
+        )
+      }
+    }
+
     const referencedCostLayerIds = Array.from(new Set([
       ...(orderAccounting?.allocations ?? []).flatMap((allocation) => (
         parseCostLayerSnapshot(allocation.costLayerSnapshot).map((entry) => entry.costLayerId)
       )),
       ...(orderAccounting?.shipments ?? []).flatMap((shipment) => (
         shipment.lines.flatMap((line) => (
-          parseCostLayerSnapshot(line.costLayerSnapshot).map((entry) => entry.costLayerId)
+          (shipmentLineSnapshots.get(line.id) ?? []).map((entry) => entry.costLayerId)
         ))
       )),
       ...(orderAccounting?.refunds ?? []).flatMap((refund) => (
@@ -880,7 +925,7 @@ async function stageRefundAccountingReversals(
       for (const shipmentLine of shipment.lines) {
         shipmentLineAvailability.set(
           shipmentLine.id,
-          parseCostLayerSnapshot(shipmentLine.costLayerSnapshot),
+          shipmentLineSnapshots.get(shipmentLine.id) ?? [],
         )
       }
     }
@@ -894,7 +939,7 @@ async function stageRefundAccountingReversals(
 
     for (const shipment of orderAccounting?.shipments ?? []) {
       for (const shipmentLine of shipment.lines) {
-        for (const entry of parseCostLayerSnapshot(shipmentLine.costLayerSnapshot)) {
+        for (const entry of shipmentLineSnapshots.get(shipmentLine.id) ?? []) {
           if (!entry.orderAllocationId) continue
           const available = allocationAvailability.get(entry.orderAllocationId) ?? []
           allocationAvailability.set(

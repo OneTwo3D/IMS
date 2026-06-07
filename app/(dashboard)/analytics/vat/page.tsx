@@ -6,6 +6,7 @@ import { financeAnalyticsFiltersForUi, financeAnalyticsFiltersFromSearch, type F
 type Props = { searchParams: Promise<FinanceAnalyticsSearchParams> }
 
 const columns: Array<FinanceAnalyticsColumn<VatReportRow>> = [
+  { key: 'side', label: 'Side', render: (row) => row.side === 'sales' ? 'Sales' : 'Purchases' },
   { key: 'jurisdiction', label: 'Jurisdiction', render: (row) => row.jurisdiction },
   { key: 'rate', label: 'Rate', render: (row) => row.taxRateName },
   { key: 'accounting', label: 'Accounting tax type', render: (row) => row.accountingTaxType ?? 'Unmapped' },
@@ -22,16 +23,18 @@ export default async function VatAnalyticsPage({ searchParams }: Props) {
   return (
     <FinanceAnalyticsReportPage
       title="VAT"
-      description="Output VAT by tax rate and jurisdiction for invoiced sales-order lines in the selected period."
+      description="Output and input VAT by tax rate and jurisdiction for invoiced sales and purchase lines in the selected period."
       reportKey="vat"
       filters={financeAnalyticsFiltersForUi(filters)}
       pageInfo={report.pageInfo}
       rows={report.rows}
-      rowKey={(row, index) => `${row.taxRateId ?? 'none'}:${row.jurisdiction}:${index}`}
+      rowKey={(row, index) => `${row.side}:${row.taxRateId ?? 'none'}:${row.jurisdiction}:${index}`}
       columns={columns}
       summary={[
         { label: 'Taxable base', value: report.totals.taxableBase ?? '0' },
-        { label: 'VAT base', value: report.totals.taxBase ?? '0' },
+        { label: 'Sales VAT', value: report.totals.salesTaxBase ?? '0' },
+        { label: 'Purchase VAT', value: report.totals.purchaseTaxBase ?? '0' },
+        { label: 'Net VAT liability', value: report.totals.taxBase ?? '0' },
       ]}
       notices={report.notices}
     />

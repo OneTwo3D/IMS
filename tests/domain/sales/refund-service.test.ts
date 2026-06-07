@@ -93,12 +93,20 @@ type State = {
   allocations: Array<{ id: string; orderId: string; lineId: string; productId: string; warehouseId: string; qty: number; costLayerSnapshot: unknown }>
   costLayers: Array<{ id: string; productId: string; poLineId: string | null; receivedQty: number; unitCostBase: number }>
   movements: Array<{
+    id?: string
     productId: string
     qty: number
     referenceType: string
     referenceId: string
     toWarehouseId?: string | null
     idempotencyKey?: string | null
+  }>
+  cogsEntries: Array<{
+    movementId: string
+    costLayerId: string
+    qty: number
+    unitCostBase: number
+    createdAt: Date
   }>
   stockLevels: Array<{ productId: string; warehouseId: string; quantity: number; reservedQty: number }>
   activityLogs: unknown[]
@@ -178,6 +186,7 @@ function baseState(overrides: Partial<State> = {}): State {
     allocations: [],
     costLayers: [],
     movements: [],
+    cogsEntries: [],
     stockLevels: [],
     activityLogs: [],
     settings: {},
@@ -353,6 +362,15 @@ function createClient(state: State): RefundServiceClient {
       findUnique: async () => ({ receivedQty: 1, sourceLines: [] }),
     },
     stockMovement: {
+      findUnique: async ({ where }: { where: { idempotencyKey: string } }) => {
+        const movement = state.movements.find((row) => row.idempotencyKey === where.idempotencyKey)
+        if (!movement?.id) return null
+        return {
+          cogsEntries: state.cogsEntries
+            .filter((entry) => entry.movementId === movement.id)
+            .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime()),
+        }
+      },
       findMany: async ({ where }: { where: { referenceType: string; referenceId: string; toWarehouseId?: string } }) => state.movements
         .filter((movement) => movement.referenceType === where.referenceType && movement.referenceId === where.referenceId)
         .filter((movement) => where.toWarehouseId == null || movement.toWarehouseId === where.toWarehouseId),
@@ -362,7 +380,7 @@ function createClient(state: State): RefundServiceClient {
           if (skipDuplicates && entry.idempotencyKey && state.movements.some((movement) => movement.idempotencyKey === entry.idempotencyKey)) {
             continue
           }
-          state.movements.push(entry)
+          state.movements.push({ id: `movement-${state.movements.length + 1}`, ...entry })
           count += 1
         }
         return { count }
@@ -371,7 +389,7 @@ function createClient(state: State): RefundServiceClient {
         if (data.idempotencyKey && state.movements.some((movement) => movement.idempotencyKey === data.idempotencyKey)) {
           throw uniqueStockMovementError()
         }
-        state.movements.push(data)
+        state.movements.push({ id: `movement-${state.movements.length + 1}`, ...data })
       },
     },
     stockLevel: {
@@ -698,6 +716,77 @@ test('createSalesOrderRefund stages COGS reversal and returns shipped stock from
   assert.equal(state.stockLevels[0].quantity, 1)
   assert.equal(findReturnCostLayer(state).unitCostBase, '10.000000')
   assert.equal(result.success && result.accountingSyncs[0].type, 'COGS_REVERSAL')
+})
+
+test('createSalesOrderRefund reconstructs legacy shipment snapshots from COGS entries', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1',
+      externalOrderNumber: null,
+      orderNumber: 'SO-1',
+      status: 'SHIPPED',
+      fxRateToBase: 1,
+      totalBase: 100,
+      revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
+      unearnedRevenueAmount: 100,
+      inventoryAllocatedDate: new Date('2026-01-01T00:00:00.000Z'),
+      allocationBatchAmount: 20,
+    }],
+    shipments: [{
+      id: 'shipment-1',
+      orderId: 'order-1',
+      status: 'SHIPPED',
+      shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z'),
+      revenueRecognizedAmount: 100,
+      cogsBatchAmount: 20,
+      lines: [{
+        id: 'shipment-line-1',
+        lineId: 'line-1',
+        qty: 2,
+        costLayerSnapshot: null,
+      }],
+    }],
+    movements: [{
+      id: 'dispatch-movement-1',
+      productId: 'product-1',
+      qty: 2,
+      referenceType: 'SalesOrder',
+      referenceId: 'order-1',
+      idempotencyKey: 'SALE_DISPATCH:shipmentLine:shipment-line-1',
+    }],
+    cogsEntries: [{
+      movementId: 'dispatch-movement-1',
+      costLayerId: 'layer-1',
+      qty: 2,
+      unitCostBase: 10,
+      createdAt: new Date('2026-01-02T00:00:00.000Z'),
+    }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', poLineId: 'po-line-1', receivedQty: 2, unitCostBase: 10 }],
+  })
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 1, totalBase: 50 }],
+    reason: 'Customer return',
+    returnWarehouseId: 'warehouse-returns',
+    creditNotePrefix: 'CN-',
+    accountingSettings,
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(result.success && result.accountingWarning, undefined)
+  assert.deepEqual(state.refundLines[0].costLayerSnapshot, [{
+    costLayerId: 'layer-1',
+    qty: '1.000000',
+    unitCostBase: '10.000000',
+    shipmentLineId: 'shipment-line-1',
+    source: 'shipment',
+  }])
+  assert.equal(findCogsReversalInventoryLine(result).debit, 10)
+  const refundMovement = state.movements.find((movement) => movement.referenceType === 'SalesOrderRefund')
+  assert.ok(refundMovement, 'expected refund return movement')
+  assert.equal(refundMovement.qty, 1)
+  assert.equal(findReturnCostLayer(state).unitCostBase, '10.000000')
 })
 
 test('createSalesOrderRefund uses current cost layer cost after landed cost revaluation', async () => {

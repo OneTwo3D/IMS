@@ -332,7 +332,19 @@ Each phase is independently shippable.
 
 ---
 
-## 13. Open questions
+## 13. Idempotency
+
+Accounting queue idempotency keys hash the full outbound document payload,
+including `currencyRateToBase`. Normal retries remain idempotent because the
+payload is rebuilt from the document-stamped FX rate, not from a newly fetched
+daily rate. If an operator deliberately re-stamps a document with a different FX
+rate and requeues it, IMS treats that as a materially different accounting
+payload and generates a new key rather than hiding the change behind the
+previous sync attempt.
+
+---
+
+## 14. Open questions
 
 - **Manual override scope** — does an override apply only to new documents from
   that point, or retroactively recompute? Strong default: only new documents,

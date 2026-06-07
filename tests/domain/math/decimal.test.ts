@@ -78,6 +78,25 @@ test('FX multiplication preserves precision before currency rounding', () => {
   assert.equal(roundMoney(eur, 'EUR').toString(), '117.23')
 })
 
+test('large document batches round only at explicit boundaries', () => {
+  const lineCount = 1000
+  const unitForeign = toDecimal('0.3333')
+  const rateToBase = toDecimal('1.17654321')
+  const taxRate = toDecimal('0.2')
+
+  const totals = { base: toDecimal(0), tax: toDecimal(0) }
+  for (let index = 0; index < lineCount; index += 1) {
+    const base = unitForeign.div(rateToBase)
+    totals.base = totals.base.add(base)
+    totals.tax = totals.tax.add(base.mul(taxRate))
+  }
+
+  assert.equal(roundQuantity(totals.base, 4).toFixed(4), '283.2875')
+  assert.equal(roundMoney(totals.base, 'GBP').toFixed(2), '283.29')
+  assert.equal(roundQuantity(totals.tax, 4).toFixed(4), '56.6575')
+  assert.equal(roundMoney(totals.tax, 'GBP').toFixed(2), '56.66')
+})
+
 test('comparison and zero checks use decimal semantics', () => {
   assert.equal(compareDecimal('0.30', addMoney('0.1', '0.2')), 0)
   assert.equal(compareDecimal('0.2999', '0.3'), -1)

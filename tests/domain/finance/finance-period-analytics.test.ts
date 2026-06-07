@@ -4,6 +4,7 @@ import { Prisma, SalesOrderStatus } from '@/app/generated/prisma/client'
 import {
   getApAgingReport,
   getArAgingReport,
+  getCurrencySummaryReport,
   getFxGainLossReport,
   getVatReport,
   type FinanceAnalyticsClient,
@@ -84,6 +85,42 @@ test('VAT report keeps totalBase as taxable base for tax-exclusive orders', asyn
   assert.equal(report.rows[0]?.taxBase, '10')
   assert.equal(report.totals.taxableBase, '50')
   assert.equal(report.totals.taxBase, '10')
+})
+
+test('VAT report includes purchase invoice input tax by prorating source PO line tax', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...unusedClient(),
+    salesOrderLine: { findMany: async () => [] },
+    purchaseInvoice: {
+      findMany: async () => [
+        {
+          invoiceDate: new Date('2026-06-15T00:00:00.000Z'),
+          po: { supplier: { country: 'GB' } },
+          lines: [{
+            qtyBilled: decimal('2'),
+            totalBase: decimal('100'),
+            poLine: {
+              qty: decimal('4'),
+              taxRateId: 'tax-20',
+              taxBase: decimal('40'),
+              taxRate: { name: 'UK Standard', rate: decimal('0.2'), accountingTaxType: 'INPUT2', countryCode: 'GB' },
+            },
+          }],
+        },
+      ],
+    },
+  }
+
+  const report = await getVatReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-30' },
+    { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } },
+  )
+
+  assert.equal(report.rows[0]?.side, 'purchases')
+  assert.equal(report.rows[0]?.taxableBase, '100')
+  assert.equal(report.rows[0]?.taxBase, '20')
+  assert.equal(report.totals.purchaseTaxBase, '20')
+  assert.equal(report.totals.taxBase, '-20')
 })
 
 test('AR aging subtracts non-refund payments and uses configurable buckets', async () => {
@@ -202,6 +239,54 @@ test('AP aging reconciles unpaid supplier invoices into aging buckets', async ()
   assert.equal(report.rows[0]?.bucket1, '75')
   assert.equal(report.rows[0]?.outstandingBase, '75')
   assert.equal(report.totals.outstandingBase, '75')
+})
+
+test('currency summary rolls up sales, purchases, AR and AP by document currency', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...unusedClient(),
+    salesOrder: {
+      findMany: async () => [
+        {
+          id: 'so-usd',
+          currency: 'USD',
+          totalForeign: decimal('120'),
+          totalBase: decimal('100'),
+          paidAt: null,
+          payments: [{ amount: decimal('20'), currency: 'USD', paidAt: new Date('2026-06-12T00:00:00.000Z'), refundId: null }],
+        },
+      ],
+    },
+    purchaseInvoice: {
+      findMany: async () => [
+        {
+          id: 'pi-eur',
+          paidAt: null,
+          totalForeign: decimal('60'),
+          totalBase: decimal('50'),
+          po: { currency: 'EUR' },
+        },
+      ],
+    },
+  }
+
+  const report = await getCurrencySummaryReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-30' },
+    { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } },
+  )
+
+  const eur = report.rows.find((row) => row.currency === 'EUR')
+  const usd = report.rows.find((row) => row.currency === 'USD')
+
+  assert.equal(usd?.salesForeign, '120')
+  assert.equal(usd?.salesBase, '100')
+  assert.equal(usd?.arOutstandingForeign, '100')
+  assert.equal(usd?.arOutstandingBase, '83.33')
+  assert.equal(eur?.purchasesForeign, '60')
+  assert.equal(eur?.purchasesBase, '50')
+  assert.equal(eur?.apOutstandingForeign, '60')
+  assert.equal(eur?.apOutstandingBase, '50')
+  assert.equal(report.totals.salesBase, '100')
+  assert.equal(report.totals.apOutstandingBase, '50')
 })
 
 test('FX gain/loss uses latest settlement rate and configured Xero accounts', async () => {

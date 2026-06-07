@@ -15,8 +15,10 @@ type XeroCreditNoteResponse = {
   }>
 }
 
+export const XERO_SALES_CREDIT_NOTE_TYPE = 'ACCRECCREDIT'
+
 /**
- * Create a credit note (ACCREC) in Xero.
+ * Create a sales credit note (ACCRECCREDIT) in Xero.
  */
 export async function pushCreditNote(
   data: CreditNoteData,
@@ -56,7 +58,7 @@ export async function pushCreditNote(
   })
 
   const creditNote: Record<string, unknown> = {
-    Type: 'ACCREC',
+    Type: XERO_SALES_CREDIT_NOTE_TYPE,
     Contact: { ContactID: contactResult.contactId },
     CreditNoteNumber: data.creditNoteNumber,
     Date: data.date,
