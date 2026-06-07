@@ -52,6 +52,7 @@ function shouldLogShipmentStatusFailure(error: string): boolean {
   return (
     error.startsWith('Shipment status changed') ||
     error.startsWith('Insufficient physical or reserved stock to dispatch') ||
+    error.startsWith('Shipment quantity for line') ||
     error === 'Shipment lines changed. Reload and retry.' ||
     error === 'Shipment has no lines to dispatch'
   )

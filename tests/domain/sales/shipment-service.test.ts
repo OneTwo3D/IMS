@@ -8,6 +8,7 @@ import {
   transitionShipmentStatus,
   type ShipmentServiceClient,
 } from '@/lib/domain/sales/shipment-service'
+import { SHIPMENT_STATUSES } from '@/lib/domain/workflows/status-types'
 
 type Order = {
   id: string
@@ -355,6 +356,10 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
   return client as unknown as ShipmentServiceClient
 }
 
+test('shipment workflow has no PICKED status', () => {
+  assert.equal(SHIPMENT_STATUSES.includes('PICKED' as never), false)
+})
+
 test('confirmSalesOrderShipments creates a full pending shipment from allocations', async () => {
   const state = baseState()
   const result = await confirmSalesOrderShipments(createClient(state), 'order-1')
@@ -561,6 +566,38 @@ test('transitionShipmentStatus fails cleanly when dispatch shipment lines are ad
   assert.equal(state.shipments[0].status, 'PACKED')
   assert.equal(state.stockLevels[0].quantity, 2)
   assert.equal(state.stockLevels[0].reservedQty, 2)
+  assert.equal(state.movements.length, 0)
+  assert.equal(state.cogsEntries.length, 0)
+})
+
+test('transitionShipmentStatus rejects multi-warehouse shipment totals above the ordered quantity', async () => {
+  const state = baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 2, sku: 'SKU-1', description: 'Product 1' }],
+    shipments: [
+      { id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+      { id: 'shipment-2', orderId: 'order-1', warehouseId: 'warehouse-2', status: 'PICKING', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 },
+      { id: 'shipment-line-2', shipmentId: 'shipment-2', lineId: 'line-1', productId: 'product-1', qty: 1 },
+    ],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 2, reservedQty: 2 }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 2, unitCostBase: 5 }],
+  })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.deepEqual(result, {
+    success: false,
+    error: 'Shipment quantity for line SKU-1 exceeds ordered quantity. Reload and retry.',
+  })
+  assert.equal(state.shipments[0].status, 'PACKED')
+  assert.equal(state.stockLevels[0].quantity, 2)
+  assert.equal(state.stockLevels[0].reservedQty, 2)
+  assert.equal(state.costLayers[0].remainingQty, 2)
   assert.equal(state.movements.length, 0)
   assert.equal(state.cogsEntries.length, 0)
 })

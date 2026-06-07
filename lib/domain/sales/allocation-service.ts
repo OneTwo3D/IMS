@@ -14,7 +14,11 @@ import {
   type FulfillmentGraphNode,
 } from '@/lib/products/kit-fulfillment'
 import { buildBackorderReport, type BackorderReportLine } from '@/lib/domain/inventory/backorder-report'
-import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
+import {
+  validateManualSalesOrderStatusTransition,
+  validateSalesOrderStatusTransition,
+} from '@/lib/domain/workflows/action-guards'
+import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export const ALLOCATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -228,6 +232,39 @@ export async function resetAllocationAccountingIfStaged(
   })
 }
 
+export async function updateSalesOrderStatusUnderLock(
+  tx: Prisma.TransactionClient,
+  input: {
+    orderId: string
+    targetStatus: SalesOrderStatus
+    data?: Prisma.SalesOrderUpdateInput
+    bypass?: boolean
+    beforeUpdate?: (context: {
+      tx: Prisma.TransactionClient
+      previousStatus: string
+    }) => Promise<void>
+  },
+): Promise<{ previousStatus: string }> {
+  await lockSalesOrder(tx, input.orderId)
+  const lockedOrder = await tx.salesOrder.findUnique({
+    where: { id: input.orderId },
+    select: { status: true },
+  })
+  if (!lockedOrder) throw new Error('Order not found')
+
+  const transition = validateManualSalesOrderStatusTransition(lockedOrder.status, input.targetStatus, {
+    bypass: input.bypass,
+  })
+  if (!transition.success) throw new Error(transition.error)
+
+  await input.beforeUpdate?.({ tx, previousStatus: lockedOrder.status })
+  await tx.salesOrder.update({
+    where: { id: input.orderId },
+    data: { ...(input.data ?? {}), status: input.targetStatus },
+  })
+  return { previousStatus: lockedOrder.status }
+}
+
 export async function applyAllocationReservationDelta(
   tx: Prisma.TransactionClient,
   rows: Array<{ productId: string; warehouseId: string; qty: DecimalInput }>,
@@ -251,6 +288,141 @@ export async function applyAllocationReservationDelta(
       where: { productId: row.productId, warehouseId: row.warehouseId },
       data: { reservedQty: { decrement: qty } },
     })
+  }
+}
+
+type ReservationScope = { productId: string; warehouseId: string }
+
+function reservationScopeKey(scope: ReservationScope): string {
+  return `${scope.productId}:${scope.warehouseId}`
+}
+
+function uniqueReservationScopes(rows: ReservationScope[]): ReservationScope[] {
+  const scopes = new Map<string, ReservationScope>()
+  for (const row of rows) {
+    scopes.set(reservationScopeKey(row), row)
+  }
+  return [...scopes.values()]
+}
+
+function sumReservationRows(rows: Array<ReservationScope & { qty: DecimalInput }>): Map<string, Prisma.Decimal> {
+  const totals = new Map<string, Prisma.Decimal>()
+  for (const row of rows) {
+    const key = reservationScopeKey(row)
+    totals.set(key, (totals.get(key) ?? new Prisma.Decimal(0)).add(toDecimal(row.qty)))
+  }
+  return totals
+}
+
+export function assertReservationReleaseDelta(
+  beforeRows: Array<ReservationScope & { reservedQty: DecimalInput }>,
+  afterRows: Array<ReservationScope & { reservedQty: DecimalInput }>,
+  releasedRows: Array<ReservationScope & { qty: DecimalInput }>,
+): void {
+  const beforeByKey = new Map(beforeRows.map((row) => [reservationScopeKey(row), toDecimal(row.reservedQty)]))
+  const afterByKey = new Map(afterRows.map((row) => [reservationScopeKey(row), toDecimal(row.reservedQty)]))
+  const releasedByKey = sumReservationRows(releasedRows)
+
+  for (const [key, releasedQty] of releasedByKey) {
+    const beforeQty = beforeByKey.get(key)
+    const afterQty = afterByKey.get(key)
+    if (beforeQty == null || afterQty == null) {
+      throw new Error(`Reservation release invariant failed for ${key}: stock level missing`)
+    }
+    if (beforeQty.lt(releasedQty)) {
+      throw new Error(
+        `Cannot cancel order because reservedQty drifted below allocation for ${key}: reservedQty ${beforeQty.toString()}, allocationQty ${releasedQty.toString()}`,
+      )
+    }
+    const expectedAfter = beforeQty.sub(releasedQty)
+    if (afterQty.lt(0)) {
+      throw new Error(`Reservation release invariant failed for ${key}: reservedQty cannot be negative`)
+    }
+    if (afterQty.sub(expectedAfter).abs().gt(ALLOCATION_EPSILON_DECIMAL)) {
+      throw new Error(
+        `Reservation release invariant failed for ${key}: expected reservedQty ${expectedAfter.toString()}, got ${afterQty.toString()}`,
+      )
+    }
+  }
+}
+
+export async function cancelSalesOrderFulfillmentState(
+  tx: Prisma.TransactionClient,
+  input: {
+    orderId: string
+    data?: Prisma.SalesOrderUpdateInput
+    bypass?: boolean
+  },
+): Promise<{
+  previousStatus: string
+  releasedAllocationCount: number
+  deletedShipmentCount: number
+  releasedReservationScopes: ReservationScope[]
+}> {
+  await lockSalesOrder(tx, input.orderId)
+  const lockedOrder = await tx.salesOrder.findUnique({
+    where: { id: input.orderId },
+    select: { status: true },
+  })
+  if (!lockedOrder) throw new Error('Order not found')
+  if (lockedOrder.status === 'SHIPPED') {
+    throw new Error('Cannot cancel a shipped order — process a refund instead')
+  }
+
+  const transition = validateManualSalesOrderStatusTransition(lockedOrder.status, 'CANCELLED', {
+    bypass: input.bypass,
+  })
+  if (!transition.success) throw new Error(transition.error)
+
+  await resetAllocationAccountingIfStaged(tx, input.orderId)
+  const currentAllocs = await tx.orderAllocation.findMany({
+    where: { orderId: input.orderId },
+    select: { productId: true, warehouseId: true, qty: true },
+  })
+  const releasedReservationScopes = uniqueReservationScopes(currentAllocs)
+  await lockStockLevels(
+    tx,
+    releasedReservationScopes.map((scope) => scope.productId),
+    releasedReservationScopes.map((scope) => scope.warehouseId),
+  )
+  const stockBefore = releasedReservationScopes.length
+    ? await tx.stockLevel.findMany({
+      where: { OR: releasedReservationScopes },
+      select: { productId: true, warehouseId: true, reservedQty: true },
+    })
+    : []
+
+  // Keep the before/after reads bracketing the release: the extra locked-row
+  // read is small, and it verifies the actual database delta rather than only
+  // trusting the requested decrement shape.
+  await applyAllocationReservationDelta(tx, currentAllocs, 'release')
+  await tx.orderAllocation.deleteMany({ where: { orderId: input.orderId } })
+
+  const deletedShipments = await tx.shipment.deleteMany({
+    where: {
+      orderId: input.orderId,
+      status: { in: ['PENDING', 'PICKING', 'PACKED'] },
+    },
+  })
+
+  const stockAfter = releasedReservationScopes.length
+    ? await tx.stockLevel.findMany({
+      where: { OR: releasedReservationScopes },
+      select: { productId: true, warehouseId: true, reservedQty: true },
+    })
+    : []
+  assertReservationReleaseDelta(stockBefore, stockAfter, currentAllocs)
+
+  await tx.salesOrder.update({
+    where: { id: input.orderId },
+    data: { ...(input.data ?? {}), status: 'CANCELLED' },
+  })
+
+  return {
+    previousStatus: lockedOrder.status,
+    releasedAllocationCount: currentAllocs.length,
+    deletedShipmentCount: deletedShipments.count,
+    releasedReservationScopes,
   }
 }
 
