@@ -272,19 +272,13 @@ test('snapshot updates write an activity-log audit trail for changed rows', asyn
         rowId: 'shipment-line-a',
         costLayerId: 'layer-a',
         changedEntryCount: 1,
+        previousSnapshotEntryCount: 2,
+        patchedSnapshotEntryCount: 2,
         changedEntries: [{
           previousUnitCostBase: 10,
           newUnitCostBase: '14.123456',
           qty: 2,
         }],
-        previousSnapshot: [
-          { costLayerId: 'layer-a', qty: 2, unitCostBase: 10 },
-          { costLayerId: 'layer-b', qty: 1, unitCostBase: 5 },
-        ],
-        patchedSnapshot: [
-          { costLayerId: 'layer-a', qty: '2.000000', unitCostBase: '14.123456' },
-          { costLayerId: 'layer-b', qty: 1, unitCostBase: 5 },
-        ],
       },
     },
   })

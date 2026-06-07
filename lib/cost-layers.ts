@@ -478,8 +478,8 @@ export async function updateSnapshotsForCostLayerChange(
           tableName: table.model,
           rowId: row.id,
           costLayerId,
-          previousSnapshot: row.costLayerSnapshot,
-          patchedSnapshot: patched,
+          previousSnapshotEntryCount: row.costLayerSnapshot.length,
+          patchedSnapshotEntryCount: patched.length,
           changedEntries,
         })
         updated++
@@ -496,8 +496,8 @@ async function recordCostLayerSnapshotRevaluation(
     tableName: string
     rowId: string
     costLayerId: string
-    previousSnapshot: unknown
-    patchedSnapshot: unknown
+    previousSnapshotEntryCount: number
+    patchedSnapshotEntryCount: number
     changedEntries: Array<{
       previousUnitCostBase: unknown
       newUnitCostBase: string
@@ -535,9 +535,9 @@ async function recordCostLayerSnapshotRevaluation(
         rowId: params.rowId,
         costLayerId: params.costLayerId,
         changedEntryCount: params.changedEntries.length,
+        previousSnapshotEntryCount: params.previousSnapshotEntryCount,
+        patchedSnapshotEntryCount: params.patchedSnapshotEntryCount,
         changedEntries: params.changedEntries,
-        previousSnapshot: params.previousSnapshot,
-        patchedSnapshot: params.patchedSnapshot,
       },
     },
   })

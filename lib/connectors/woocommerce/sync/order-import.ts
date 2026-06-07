@@ -31,17 +31,24 @@ export type ImportWcOrderOptions = {
 
 const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
 const DEFAULT_PENDING_FX_NOTIFY_THRESHOLD = 5
+const TAX_RATE_EPSILON = 0.000001
 
 export type WcTaxRateFallbackLine = {
   sku: string
   productCategory: TaxCategory
   externalTaxRateId: number | null
   taxRateValue: number
+  expectedTaxRateValue: number | null
   warning: string | null
 }
 
 export function shouldBlockWcTaxRateFallback(lines: WcTaxRateFallbackLine[]): boolean {
-  return lines.some((line) => line.taxRateValue > 0)
+  return lines.some((line) => {
+    if (line.expectedTaxRateValue != null) {
+      return Math.abs(line.taxRateValue - line.expectedTaxRateValue) > TAX_RATE_EPSILON
+    }
+    return line.taxRateValue > TAX_RATE_EPSILON
+  })
 }
 
 function roundDecimalNumber(value: DecimalInput, precision: number): number {
@@ -58,6 +65,42 @@ function isUniqueConstraintError(error: unknown): error is { code: string } {
 
 function getPendingFxNotifyThreshold(env: Record<string, string | undefined> = process.env): number {
   return parsePositiveIntegerEnv(env.WC_PENDING_FX_ORDER_NOTIFY_THRESHOLD, DEFAULT_PENDING_FX_NOTIFY_THRESHOLD)
+}
+
+export function pendingFxQueueWhere(externalOrderId?: string): Prisma.ShoppingSyncLogWhereInput {
+  return {
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR',
+    status: 'PENDING',
+    entityType: 'SalesOrder',
+    ...(externalOrderId ? { externalId: externalOrderId } : {}),
+    payload: {
+      path: ['reason'],
+      equals: 'missing_fx_rate',
+    },
+  }
+}
+
+async function loadExpectedDestinationSalesTaxRates(
+  categories: TaxCategory[],
+  destinationCountry: string | null,
+): Promise<Map<TaxCategory, number>> {
+  const result = new Map<TaxCategory, number>()
+  if (!destinationCountry || categories.length === 0) return result
+  const distinctCategories = Array.from(new Set(categories))
+  const rows = await db.taxRate.findMany({
+    where: {
+      active: true,
+      usedFor: { in: ['SALES', 'BOTH'] },
+      countryCode: destinationCountry,
+      taxCategory: { in: distinctCategories },
+    },
+    select: { taxCategory: true, rate: true },
+  })
+  for (const row of rows) {
+    if (!result.has(row.taxCategory)) result.set(row.taxCategory, Number(row.rate))
+  }
+  return result
 }
 
 async function notifyActiveAdmins(params: Omit<Parameters<typeof notify>[0], 'userId'>): Promise<void> {
@@ -101,14 +144,7 @@ async function recordPendingFxOrder(
     })
   } else {
     const existing = await db.shoppingSyncLog.findFirst({
-      where: {
-        connector: 'woocommerce',
-        direction: 'FROM_CONNECTOR',
-        status: 'PENDING',
-        entityType: 'SalesOrder',
-        externalId: String(wcOrder.id),
-        errorMessage: { startsWith: 'Missing GBP FX rate' },
-      },
+      where: pendingFxQueueWhere(String(wcOrder.id)),
       orderBy: { createdAt: 'desc' },
       select: { id: true },
     })
@@ -136,13 +172,7 @@ async function recordPendingFxOrder(
   })
 
   const depth = await db.shoppingSyncLog.count({
-    where: {
-      connector: 'woocommerce',
-      direction: 'FROM_CONNECTOR',
-      status: 'PENDING',
-      entityType: 'SalesOrder',
-      errorMessage: { startsWith: 'Missing GBP FX rate' },
-    },
+    where: pendingFxQueueWhere(),
   })
   const threshold = getPendingFxNotifyThreshold()
   if (depth >= threshold) {
@@ -337,6 +367,10 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       needsResolver.map((l) => ({ id: l.id, productCategory: l.productCategory })),
       { destinationCountry: destCountry, usedFor: 'SALES', orderDefault: orderDefaultCtx },
     )
+    const expectedDestinationRates = await loadExpectedDestinationSalesTaxRates(
+      needsResolver.map((line) => line.productCategory),
+      destCountry,
+    )
 
     const taxFallbackLines: WcTaxRateFallbackLine[] = []
     const lineTaxResolved = mappedLines.map((l, idx) => {
@@ -366,6 +400,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
           productCategory: (l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory),
           externalTaxRateId: l.externalTaxRateId ?? null,
           taxRateValue: resolved.taxRateValue,
+          expectedTaxRateValue: expectedDestinationRates.get((l.productId && productCategoryById.get(l.productId)) || l.taxCategoryFallback || ('STANDARD' as TaxCategory)) ?? null,
           warning: resolved.warning,
         })
       }
@@ -723,13 +758,7 @@ function isQueuedWcOrderPayload(payload: unknown): payload is { reason: 'missing
 
 export async function retryPendingWcOrdersWaitingForFx(limit = 50): Promise<{ attempted: number; imported: number; stillPending: number; failed: number }> {
   const rows = await db.shoppingSyncLog.findMany({
-    where: {
-      connector: 'woocommerce',
-      direction: 'FROM_CONNECTOR',
-      status: 'PENDING',
-      entityType: 'SalesOrder',
-      errorMessage: { startsWith: 'Missing GBP FX rate' },
-    },
+    where: pendingFxQueueWhere(),
     orderBy: { createdAt: 'asc' },
     take: Math.min(Math.max(limit, 1), 250),
     select: { id: true, payload: true },
