@@ -2171,6 +2171,8 @@ export async function addPayment(input: {
         baseCurrency,
         asOf: payment.paidAt,
         fallbackRateToBase: Number(so.fxRateToBase),
+        referenceType: 'Payment',
+        referenceId: payment.id,
       })
       return { so, becamePaid, paymentId: payment.id, paidAt: payment.paidAt, settlementRateToBase, baseCurrency }
     }, STOCK_TX_OPTIONS)

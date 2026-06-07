@@ -13,6 +13,7 @@ import {
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { validateRefundSalesOrderStatusUpdate } from '@/lib/domain/workflows/action-guards'
+import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 import {
   isStockMovementIdempotencyConflict,
   refundInboundMovementKey,
@@ -1348,7 +1349,7 @@ export async function createSalesOrderRefund(
 
     const totalRefundedNow = previouslyRefunded + totalBase
     const orderTotal = refundBoundaryNumber(so.totalBase)
-    const newStatus: 'REFUNDED' | 'PARTIALLY_REFUNDED' = totalRefundedNow >= orderTotal * 0.999
+    const newStatus: 'REFUNDED' | 'PARTIALLY_REFUNDED' = isFullRefundAmount(totalRefundedNow, orderTotal)
       ? 'REFUNDED'
       : 'PARTIALLY_REFUNDED'
     const refundTransition = validateRefundSalesOrderStatusUpdate(so.status, newStatus)

@@ -8,6 +8,7 @@
  */
 
 import type { Prisma } from '@/app/generated/prisma/client'
+import { getAccountingSettings, queueAccountingSyncTx } from '@/lib/accounting'
 import { parseCostLayerSnapshot, serializeCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import { getInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import {
@@ -21,6 +22,71 @@ import {
 } from '@/lib/domain/math/decimal'
 
 type TxClient = Prisma.TransactionClient
+type ShipmentCogsRevaluationSyncOptions = {
+  accountingSettings?: {
+    inventoryAccount?: string | null
+    cogsAccount?: string | null
+  }
+  queueAccountingSync?: typeof queueAccountingSyncTx
+}
+
+export function buildShipmentCogsRevaluationSyncPayload(input: {
+  shipmentId: string
+  costLayerId: string
+  inventoryAccount: string
+  cogsAccount: string
+  oldCogsBase: DecimalInput
+  newCogsBase: DecimalInput
+}): Record<string, unknown> | null {
+  const oldCogs = roundQuantity(input.oldCogsBase, 2)
+  const newCogs = roundQuantity(input.newCogsBase, 2)
+  if (oldCogs.sub(newCogs).abs().lt(0.01)) return null
+
+  return {
+    date: new Date().toISOString().slice(0, 10),
+    reference: `Shipment COGS revaluation: ${input.shipmentId}`,
+    narration: `Reverse and repost shipment COGS after cost-layer revaluation for shipment ${input.shipmentId}`,
+    // Use a 4-line reverse + repost journal rather than a 2-line delta so the
+    // accounting audit trail shows both the old and recomputed shipment COGS.
+    lines: [
+      { accountCode: input.inventoryAccount, description: `Reverse old shipment COGS ${input.shipmentId}`, debit: oldCogs.toNumber() },
+      { accountCode: input.cogsAccount, description: `Reverse old shipment COGS ${input.shipmentId}`, credit: oldCogs.toNumber() },
+      { accountCode: input.cogsAccount, description: `Post revalued shipment COGS ${input.shipmentId}`, debit: newCogs.toNumber() },
+      { accountCode: input.inventoryAccount, description: `Post revalued shipment COGS ${input.shipmentId}`, credit: newCogs.toNumber() },
+    ],
+    sourceCostLayerId: input.costLayerId,
+    oldCogsBase: oldCogs.toNumber(),
+    newCogsBase: newCogs.toNumber(),
+  }
+}
+
+async function queueShipmentCogsRevaluationSync(
+  tx: TxClient,
+  input: {
+    shipmentId: string
+    costLayerId: string
+    oldCogsBase: DecimalInput
+    newCogsBase: DecimalInput
+  },
+  options: ShipmentCogsRevaluationSyncOptions = {},
+): Promise<void> {
+  const settings = options.accountingSettings ?? await getAccountingSettings().catch(() => null)
+  if (!settings?.inventoryAccount || !settings.cogsAccount) return
+  const payload = buildShipmentCogsRevaluationSyncPayload({
+    ...input,
+    inventoryAccount: settings.inventoryAccount,
+    cogsAccount: settings.cogsAccount,
+  })
+  if (!payload) return
+
+  await (options.queueAccountingSync ?? queueAccountingSyncTx)(tx, {
+    type: 'COGS_REVERSAL',
+    referenceType: 'Shipment',
+    referenceId: input.shipmentId,
+    idempotencyKey: `shipment-cogs-revalue:${input.shipmentId}:${input.costLayerId}:${payload.oldCogsBase}:${payload.newCogsBase}`,
+    payload,
+  })
+}
 
 function minDecimal(a: Decimal, b: Decimal): Decimal {
   return a.lte(b) ? a : b
@@ -492,6 +558,7 @@ export async function getSupplierReturnedQtyForCostLayer(
 export async function refreshShipmentCogsForCostLayerChange(
   tx: TxClient,
   costLayerId: string,
+  options: ShipmentCogsRevaluationSyncOptions = {},
 ): Promise<number> {
   const containsCostLayer = JSON.stringify([{ costLayerId }])
   const shipments = await tx.$queryRawUnsafe<Array<{ id: string }>>(
@@ -501,6 +568,10 @@ export async function refreshShipmentCogsForCostLayerChange(
 
   let updated = 0
   for (const shipment of shipments) {
+    const currentShipment = await tx.shipment.findUnique({
+      where: { id: shipment.id },
+      select: { cogsBatchAmount: true, shipmentJournalDate: true },
+    })
     const lines = await tx.shipmentLine.findMany({
       where: { shipmentId: shipment.id },
       select: { costLayerSnapshot: true },
@@ -514,6 +585,14 @@ export async function refreshShipmentCogsForCostLayerChange(
       where: { id: shipment.id },
       data: { cogsBatchAmount: cogs },
     })
+    if (currentShipment?.shipmentJournalDate) {
+      await queueShipmentCogsRevaluationSync(tx, {
+        shipmentId: shipment.id,
+        costLayerId,
+        oldCogsBase: currentShipment.cogsBatchAmount,
+        newCogsBase: cogs,
+      }, options)
+    }
     updated++
   }
 

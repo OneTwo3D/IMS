@@ -1,5 +1,6 @@
 import { db } from '@/lib/db'
 import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
 
 export type RefundStatusReconciliationSeverity = 'info' | 'warning' | 'critical'
 
@@ -49,7 +50,6 @@ export type RefundStatusReconciliationRows = {
 }
 
 const REFUNDED_STATUSES = new Set(['REFUNDED', 'PARTIALLY_REFUNDED'])
-const FULL_REFUND_RATIO = toDecimal('0.999')
 const DEFAULT_SOURCE_ROW_LIMIT = 5000
 
 function orderLabel(order: Pick<RefundStatusOrderRow, 'id' | 'orderNumber' | 'externalOrderNumber'>): string {
@@ -75,7 +75,7 @@ function expectedRefundStatus(order: RefundStatusOrderRow): 'REFUNDED' | 'PARTIA
   if (orderTotal.lte(0)) {
     return refundedTotal.gte(0) ? 'REFUNDED' : 'PARTIALLY_REFUNDED'
   }
-  return refundedTotal.gte(orderTotal.mul(FULL_REFUND_RATIO))
+  return isFullRefundAmount(refundedTotal, orderTotal)
     ? 'REFUNDED'
     : 'PARTIALLY_REFUNDED'
 }
@@ -89,9 +89,10 @@ export function evaluateRefundStatusReconciliationRows(
     findings.push({
       severity: 'warning',
       code: 'refund_status_reconciliation_row_cap_reached',
-      message: 'Refund status reconciliation reached the source row cap; narrow or paginate the daily check before trusting a clean result',
+      message: 'Refund status reconciliation reached the source row cap; rows are scanned by stable id order, but add pagination or narrow the daily check before trusting a clean result',
       details: {
         sourceRowLimitReached: true,
+        coverage: 'bounded_to_first_sourceRowLimit_rows_by_id_asc',
       },
     })
   }
@@ -152,7 +153,7 @@ export async function collectRefundStatusReconciliationRows(
         { refunds: { some: {} } },
       ],
     },
-    orderBy: { updatedAt: 'desc' },
+    orderBy: { id: 'asc' },
     take: sourceRowLimit + 1,
     select: {
       id: true,

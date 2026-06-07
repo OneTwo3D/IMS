@@ -2800,6 +2800,8 @@ export async function markBillPaid(
         baseCurrency,
         asOf: paymentDate,
         fallbackRateToBase: Number(invoice.fxRateToBase),
+        referenceType: 'PurchaseInvoice',
+        referenceId: invoice.id,
       }),
       STOCK_TX_OPTIONS,
     )

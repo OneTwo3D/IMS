@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
-import { addCostLayerSourceLines, cogsEntryDataFromConsumed, consumeFifoLayers, consumeFifoLayersStrict } from '../lib/cost-layers.ts'
+import {
+  addCostLayerSourceLines,
+  buildShipmentCogsRevaluationSyncPayload,
+  cogsEntryDataFromConsumed,
+  consumeFifoLayers,
+  consumeFifoLayersStrict,
+  refreshShipmentCogsForCostLayerChange,
+} from '../lib/cost-layers.ts'
 
 test('cogsEntryDataFromConsumed preserves six-decimal consumed quantities', () => {
   assert.deepEqual(cogsEntryDataFromConsumed('movement-1', {
@@ -57,6 +64,125 @@ test('addCostLayerSourceLines rejects source lines without unit cost', async () 
     unitCostBase: 2.5,
     totalCostBase: 2.5,
   }])
+})
+
+test('shipment COGS revaluation payload reverses old COGS and posts the recomputed amount', () => {
+  const payload = buildShipmentCogsRevaluationSyncPayload({
+    shipmentId: 'shipment-1',
+    costLayerId: 'layer-1',
+    inventoryAccount: '120',
+    cogsAccount: '500',
+    oldCogsBase: '20.00',
+    newCogsBase: '27.50',
+  })
+
+  assert.deepEqual(payload, {
+    date: new Date().toISOString().slice(0, 10),
+    reference: 'Shipment COGS revaluation: shipment-1',
+    narration: 'Reverse and repost shipment COGS after cost-layer revaluation for shipment shipment-1',
+    lines: [
+      { accountCode: '120', description: 'Reverse old shipment COGS shipment-1', debit: 20 },
+      { accountCode: '500', description: 'Reverse old shipment COGS shipment-1', credit: 20 },
+      { accountCode: '500', description: 'Post revalued shipment COGS shipment-1', debit: 27.5 },
+      { accountCode: '120', description: 'Post revalued shipment COGS shipment-1', credit: 27.5 },
+    ],
+    sourceCostLayerId: 'layer-1',
+    oldCogsBase: 20,
+    newCogsBase: 27.5,
+  })
+  const lines = payload.lines as Array<{ debit?: number; credit?: number }>
+  assert.equal(
+    lines.reduce((sum, line) => sum + (line.debit ?? 0), 0),
+    lines.reduce((sum, line) => sum + (line.credit ?? 0), 0),
+  )
+})
+
+test('shipment COGS revaluation payload ignores sub-cent changes', () => {
+  assert.equal(buildShipmentCogsRevaluationSyncPayload({
+    shipmentId: 'shipment-1',
+    costLayerId: 'layer-1',
+    inventoryAccount: '120',
+    cogsAccount: '500',
+    oldCogsBase: '20.00',
+    newCogsBase: '20.004',
+  }), null)
+})
+
+test('refreshShipmentCogsForCostLayerChange queues COGS revaluation sync for posted shipments', async () => {
+  const updates: unknown[] = []
+  const queued: unknown[] = []
+  const tx = {
+    $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
+    shipment: {
+      findUnique: async () => ({ cogsBatchAmount: '20.00', shipmentJournalDate: new Date('2026-01-02T00:00:00.000Z') }),
+      update: async (args: unknown) => {
+        updates.push(args)
+      },
+    },
+    shipmentLine: {
+      findMany: async () => [{
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: '5.000000', unitCostBase: '5.500000' }],
+      }],
+    },
+  }
+
+  const updated = await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
+    accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
+    queueAccountingSync: async (_tx, params) => {
+      queued.push(params)
+    },
+  })
+
+  assert.equal(updated, 1)
+  assert.deepEqual(updates, [{
+    where: { id: 'shipment-1' },
+    data: { cogsBatchAmount: 27.5 },
+  }])
+  assert.deepEqual(queued, [{
+    type: 'COGS_REVERSAL',
+    referenceType: 'Shipment',
+    referenceId: 'shipment-1',
+    idempotencyKey: 'shipment-cogs-revalue:shipment-1:layer-1:20:27.5',
+    payload: {
+      date: new Date().toISOString().slice(0, 10),
+      reference: 'Shipment COGS revaluation: shipment-1',
+      narration: 'Reverse and repost shipment COGS after cost-layer revaluation for shipment shipment-1',
+      lines: [
+        { accountCode: '120', description: 'Reverse old shipment COGS shipment-1', debit: 20 },
+        { accountCode: '500', description: 'Reverse old shipment COGS shipment-1', credit: 20 },
+        { accountCode: '500', description: 'Post revalued shipment COGS shipment-1', debit: 27.5 },
+        { accountCode: '120', description: 'Post revalued shipment COGS shipment-1', credit: 27.5 },
+      ],
+      sourceCostLayerId: 'layer-1',
+      oldCogsBase: 20,
+      newCogsBase: 27.5,
+    },
+  }])
+})
+
+test('refreshShipmentCogsForCostLayerChange does not queue COGS revaluation sync for unposted shipments', async () => {
+  const queued: unknown[] = []
+  const tx = {
+    $queryRawUnsafe: async () => [{ id: 'shipment-1' }],
+    shipment: {
+      findUnique: async () => ({ cogsBatchAmount: '20.00', shipmentJournalDate: null }),
+      update: async () => {},
+    },
+    shipmentLine: {
+      findMany: async () => [{
+        costLayerSnapshot: [{ costLayerId: 'layer-1', qty: '5.000000', unitCostBase: '5.500000' }],
+      }],
+    },
+  }
+
+  await refreshShipmentCogsForCostLayerChange(tx as never, 'layer-1', {
+    accountingSettings: { inventoryAccount: '120', cogsAccount: '500' },
+    queueAccountingSync: async (_tx, params) => {
+      queued.push(params)
+    },
+  })
+
+  assert.deepEqual(queued, [])
 })
 
 test('consumeFifoLayers selects FIFO candidates with row locks before consuming', async () => {

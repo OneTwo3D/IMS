@@ -42,6 +42,53 @@ test('clean refund status rows produce no findings', () => {
   assert.deepEqual(findings, [])
 })
 
+test('refund status reconciliation pins full-refund threshold and zero-total behavior', () => {
+  const findings = evaluateRefundStatusReconciliationRows({
+    sourceRowLimitReached: false,
+    salesOrders: [
+      order({
+        id: 'order-threshold',
+        orderNumber: 'SO-THRESHOLD',
+        status: 'REFUNDED',
+        totalBase: '100.00',
+        refunds: [{ id: 'refund-threshold', creditNoteNumber: 'CN-THRESHOLD', totalBase: '99.90', refundedAt: REFUNDED_AT }],
+      }),
+      order({
+        id: 'order-zero-total',
+        orderNumber: 'SO-ZERO',
+        status: 'REFUNDED',
+        totalBase: '0.00',
+        refunds: [{ id: 'refund-zero', creditNoteNumber: 'CN-ZERO', totalBase: '0.00', refundedAt: REFUNDED_AT }],
+      }),
+    ],
+  })
+
+  assert.deepEqual(findings, [])
+})
+
+test('refund status reconciliation applies negative correction totals to the effective refund sum', () => {
+  const findings = evaluateRefundStatusReconciliationRows({
+    sourceRowLimitReached: false,
+    salesOrders: [
+      order({
+        id: 'order-corrected',
+        orderNumber: 'SO-CORRECTED',
+        status: 'REFUNDED',
+        totalBase: '100.00',
+        refunds: [
+          { id: 'refund-full', creditNoteNumber: 'CN-FULL', totalBase: '100.00', refundedAt: REFUNDED_AT },
+          { id: 'refund-correction', creditNoteNumber: 'CN-CORRECTION', totalBase: '-10.00', refundedAt: REFUNDED_AT },
+        ],
+      }),
+    ],
+  })
+
+  assert.equal(findings.length, 1)
+  assert.equal(findings[0]?.code, 'sales_order_refund_status_mismatch')
+  assert.equal((findings[0]?.details as { expectedStatus: string }).expectedStatus, 'PARTIALLY_REFUNDED')
+  assert.equal((findings[0]?.details as { refundedTotalBase: string }).refundedTotalBase, '90')
+})
+
 test('refund status reconciliation flags stale and unsupported refund statuses', () => {
   const findings = evaluateRefundStatusReconciliationRows({
     sourceRowLimitReached: false,
@@ -111,7 +158,7 @@ test('refund status reconciliation reports source row cap and caps collected row
         { refunds: { some: {} } },
       ],
     },
-    orderBy: { updatedAt: 'desc' },
+    orderBy: { id: 'asc' },
     take: 3,
     select: {
       id: true,
