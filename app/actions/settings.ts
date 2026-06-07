@@ -7,6 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { toIsoCountryCode } from '@/lib/countries'
 import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
+import { refreshMutableDocumentTaxSnapshotsForRate } from '@/lib/tax/document-tax-snapshot-refresh'
 
 // ---------------------------------------------------------------------------
 // Adjustment Reasons
@@ -211,20 +212,38 @@ export async function updateTaxRate(id: string, input: {
 }): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
   try {
-    await db.taxRate.update({
-      where: { id },
-      data: {
-        ...(input.name !== undefined && { name: input.name }),
-        ...(input.rate !== undefined && { rate: input.rate }),
-        ...(input.usedFor !== undefined && { usedFor: input.usedFor }),
-        ...(input.accountingTaxType !== undefined && { accountingTaxType: input.accountingTaxType || null }),
-        ...(input.countryCode !== undefined && { countryCode: input.countryCode ? input.countryCode.toLowerCase() : null }),
-        ...(input.taxCategory !== undefined && { taxCategory: normaliseTaxCategory(input.taxCategory) }),
-        ...(input.active !== undefined && { active: input.active }),
-      },
+    const summary = await db.$transaction(async (tx) => {
+      const oldRate = await tx.taxRate.findUnique({
+        where: { id },
+        select: { id: true, name: true, rate: true },
+      })
+      if (!oldRate) throw new Error(`Tax rate ${id} not found`)
+      const updated = await tx.taxRate.update({
+        where: { id },
+        data: {
+          ...(input.name !== undefined && { name: input.name }),
+          ...(input.rate !== undefined && { rate: input.rate }),
+          ...(input.usedFor !== undefined && { usedFor: input.usedFor }),
+          ...(input.accountingTaxType !== undefined && { accountingTaxType: input.accountingTaxType || null }),
+          ...(input.countryCode !== undefined && { countryCode: input.countryCode ? input.countryCode.toLowerCase() : null }),
+          ...(input.taxCategory !== undefined && { taxCategory: normaliseTaxCategory(input.taxCategory) }),
+          ...(input.active !== undefined && { active: input.active }),
+        },
+        select: { id: true, name: true, rate: true },
+      })
+      return refreshMutableDocumentTaxSnapshotsForRate(tx, { oldRate, newRate: updated })
     })
-    await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', description: `Updated tax rate: ${input.name ?? id}` })
+    await logActivity({
+      entityType: 'SETTING',
+      entityId: id,
+      tag: 'settings',
+      action: 'updated',
+      description: `Updated tax rate: ${input.name ?? id}`,
+      metadata: summary,
+    })
     revalidatePath('/settings', 'layout')
+    revalidatePath('/sales')
+    revalidatePath('/purchase-orders')
     return { success: true }
   } catch (e) {
     await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update tax rate: ${input.name ?? id}` })

@@ -4,6 +4,7 @@ import { csvResponse, toCsv } from '@/lib/csv'
 import {
   getApAgingReport,
   getArAgingReport,
+  getCurrencySummaryReport,
   getFxGainLossReport,
   getVatReport,
   type FinanceAnalyticsFilters,
@@ -57,7 +58,7 @@ export async function GET(req: NextRequest) {
       const report = await getVatReport({ ...filters, pageSize: FINANCE_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
-      return csvResponse(toCsv(report.rows, ['jurisdiction', 'taxRateName', 'accountingTaxType', 'ratePct', 'lineCount', 'taxableBase', 'taxBase']), `vat-${date}.csv`)
+      return csvResponse(toCsv(report.rows, ['side', 'jurisdiction', 'taxRateName', 'accountingTaxType', 'ratePct', 'lineCount', 'taxableBase', 'taxBase']), `vat-${date}.csv`)
     }
     case 'ar-aging': {
       const report = await getArAgingReport({ ...filters, pageSize: FINANCE_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
@@ -70,6 +71,12 @@ export async function GET(req: NextRequest) {
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
       return csvResponse(toCsv(report.rows, ['partyName', 'contact', 'documentCount', 'current', 'bucket1', 'bucket2', 'bucket3', 'bucket4', 'outstandingBase', 'lastPaymentDate']), `ap-aging-${date}.csv`)
+    }
+    case 'currency-summary': {
+      const report = await getCurrencySummaryReport({ ...filters, pageSize: FINANCE_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
+      const oversized = rejectOversizedExport(report.pageInfo.totalRows)
+      if (oversized) return oversized
+      return csvResponse(toCsv(report.rows, ['currency', 'salesDocumentCount', 'salesForeign', 'salesBase', 'arOutstandingForeign', 'arOutstandingBase', 'purchaseDocumentCount', 'purchasesForeign', 'purchasesBase', 'apOutstandingForeign', 'apOutstandingBase']), `currency-summary-${date}.csv`)
     }
     case 'fx-gain-loss': {
       const report = await getFxGainLossReport({ ...filters, pageSize: FINANCE_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })

@@ -249,6 +249,7 @@ type ResolvedTaxRate = {
   taxRateName: string | null
   taxRateValue: number
   accountingTaxType: string | null
+  source: 'mapped' | 'default'
 }
 
 async function fallbackDefaultTaxRate(): Promise<ResolvedTaxRate> {
@@ -262,9 +263,10 @@ async function fallbackDefaultTaxRate(): Promise<ResolvedTaxRate> {
       taxRateName: defaultRate.name,
       taxRateValue: Number(defaultRate.rate),
       accountingTaxType: defaultRate.accountingTaxType,
+      source: 'default',
     }
   }
-  return { taxRateId: null, taxRateName: null, taxRateValue: 0, accountingTaxType: null }
+  return { taxRateId: null, taxRateName: null, taxRateValue: 0, accountingTaxType: null, source: 'default' }
 }
 
 export async function resolveWcTaxRateById(wcRateId: number | null | undefined): Promise<ResolvedTaxRate> {
@@ -286,6 +288,7 @@ export async function resolveWcTaxRateById(wcRateId: number | null | undefined):
     taxRateName: mapping.taxRate.name,
     taxRateValue: Number(mapping.taxRate.rate),
     accountingTaxType: mapping.taxRate.accountingTaxType,
+    source: 'mapped',
   }
 }
 
@@ -308,6 +311,21 @@ export function extractWcTracking(order: WcFullOrder): { carrier: string; tracki
 // ---------------------------------------------------------------------------
 // FX rate lookup
 // ---------------------------------------------------------------------------
+
+export class MissingFxRateError extends Error {
+  constructor(
+    message: string,
+    readonly currency: string,
+    readonly asOf: Date | undefined,
+  ) {
+    super(message)
+    this.name = 'MissingFxRateError'
+  }
+}
+
+export function isMissingFxRateError(error: unknown): error is MissingFxRateError {
+  return error instanceof MissingFxRateError
+}
 
 export async function getFxRateToGbp(currency: string, asOf?: Date): Promise<number> {
   const normalizedCurrency = currency.trim().toUpperCase()
@@ -336,7 +354,7 @@ export async function getFxRateToGbp(currency: string, asOf?: Date): Promise<num
       metadata: { currency: normalizedCurrency, asOf: asOf?.toISOString() ?? null },
       resolveUser: false,
     })
-    throw new Error(message)
+    throw new MissingFxRateError(message, normalizedCurrency, asOf)
   }
   // fxRateToBase in the SalesOrder means: foreign / fxRate = GBP
   // So if 1 GBP = 1.15 EUR, fxRateToBase = 1.15

@@ -9,7 +9,7 @@ import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { cn } from '@/lib/utils'
 import { appendParams, currentParams, toneClass, type SummaryTone } from './report-utils'
 
-export type FinanceAnalyticsReportKey = 'vat' | 'ar-aging' | 'ap-aging' | 'fx-gain-loss'
+export type FinanceAnalyticsReportKey = 'vat' | 'ar-aging' | 'ap-aging' | 'fx-gain-loss' | 'currency-summary'
 
 export type FinanceAnalyticsFilterValues = {
   dateFrom?: string

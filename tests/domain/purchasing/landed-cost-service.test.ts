@@ -232,6 +232,58 @@ test('snapshot updates accept Decimal input and serialize JSON unit costs as str
   }
 })
 
+test('snapshot updates write an activity-log audit trail for changed rows', async () => {
+  const activityLogs: unknown[] = []
+  const tx = {
+    $queryRawUnsafe: async (sql: string) => (
+      sql.includes('"shipment_lines"')
+        ? [{
+          id: 'shipment-line-a',
+          costLayerSnapshot: [
+            { costLayerId: 'layer-a', qty: 2, unitCostBase: 10 },
+            { costLayerId: 'layer-b', qty: 1, unitCostBase: 5 },
+          ],
+        }]
+        : []
+    ),
+    $executeRawUnsafe: async () => 1,
+    activityLog: {
+      create: async (args: unknown) => {
+        activityLogs.push(args)
+        return { id: 'activity-1' }
+      },
+    },
+  }
+
+  const updated = await updateSnapshotsForCostLayerChange(tx as never, 'layer-a', new Prisma.Decimal('14.123456'))
+
+  assert.equal(updated, 1)
+  assert.equal(activityLogs.length, 1)
+  assert.deepEqual(activityLogs[0], {
+    data: {
+      entityType: 'SYSTEM',
+      entityId: 'shipment-line-a',
+      action: 'cost_layer_snapshot_revalued',
+      tag: 'inventory',
+      level: 'INFO',
+      description: 'Revalued shipment_lines cost-layer snapshot shipment-line-a for cost layer layer-a',
+      metadata: {
+        tableName: 'shipment_lines',
+        rowId: 'shipment-line-a',
+        costLayerId: 'layer-a',
+        changedEntryCount: 1,
+        previousSnapshotEntryCount: 2,
+        patchedSnapshotEntryCount: 2,
+        changedEntries: [{
+          previousUnitCostBase: 10,
+          newUnitCostBase: '14.123456',
+          qty: 2,
+        }],
+      },
+    },
+  })
+})
+
 test('snapshot updates avoid the JSON number precision boundary', async () => {
   const runSnapshotUpdate = async (newUnitCostBase: Prisma.Decimal) => {
     let snapshot: unknown = null

@@ -53,6 +53,7 @@ export type FinanceAnalyticsReport<Row> = {
 }
 
 export type VatReportRow = {
+  side: 'sales' | 'purchases'
   taxRateId: string | null
   taxRateName: string
   accountingTaxType: string | null
@@ -96,6 +97,20 @@ export type FxGainLossReportRow = {
   fxGainLossAccount: string
 }
 
+export type CurrencySummaryReportRow = {
+  currency: string
+  salesDocumentCount: number
+  salesForeign: string
+  salesBase: string
+  arOutstandingForeign: string
+  arOutstandingBase: string
+  purchaseDocumentCount: number
+  purchasesForeign: string
+  purchasesBase: string
+  apOutstandingForeign: string
+  apOutstandingBase: string
+}
+
 type SalesOrderLineTaxRow = {
   taxRateId: string | null
   taxForeign: DecimalInput
@@ -113,6 +128,30 @@ type SalesOrderLineTaxRow = {
   } | null
 }
 
+type PurchaseInvoiceTaxRow = {
+  invoiceDate: Date
+  lines: Array<{
+    qtyBilled: DecimalInput
+    totalBase: DecimalInput
+    poLine: {
+      qty: DecimalInput
+      taxRateId: string | null
+      taxBase: DecimalInput
+      taxRate: {
+        name: string
+        rate: DecimalInput
+        accountingTaxType: string | null
+        countryCode: string | null
+      } | null
+    } | null
+  }>
+  po: {
+    supplier: {
+      country: string | null
+    } | null
+  }
+}
+
 type SalesOrderAgingRow = {
   id: string
   customerId: string | null
@@ -126,6 +165,15 @@ type SalesOrderAgingRow = {
   payments: Array<{ amount: DecimalInput; paidAt: Date; refundId: string | null }>
 }
 
+type SalesOrderCurrencyRow = {
+  id: string
+  currency: string
+  totalForeign: DecimalInput
+  totalBase: DecimalInput
+  paidAt: Date | null
+  payments: Array<{ amount: DecimalInput; currency: string; paidAt: Date; refundId: string | null }>
+}
+
 type PurchaseInvoiceAgingRow = {
   id: string
   invoiceNumber: string | null
@@ -137,6 +185,14 @@ type PurchaseInvoiceAgingRow = {
     supplierId: string
     supplier: { name: string; email: string | null }
   }
+}
+
+type PurchaseInvoiceCurrencyRow = {
+  id: string
+  paidAt: Date | null
+  totalForeign: DecimalInput
+  totalBase: DecimalInput
+  po: { currency: string }
 }
 
 type SalesPaymentFxRow = {
@@ -342,27 +398,57 @@ export async function getVatReport(
   const generatedAt = nowFromDeps(options.deps)
   const baseCurrency = await baseCurrencyFromDeps(options.deps)
   const window = period(filters, generatedAt)
-  const lines = await client.salesOrderLine.findMany({
-    where: {
-      order: {
-        invoicedAt: { gte: window.dateFrom, lte: window.dateTo },
-        status: { not: SalesOrderStatus.CANCELLED },
-        archived: false,
+  const [salesLines, purchaseInvoices] = await Promise.all([
+    client.salesOrderLine.findMany({
+      where: {
+        order: {
+          invoicedAt: { gte: window.dateFrom, lte: window.dateTo },
+          status: { not: SalesOrderStatus.CANCELLED },
+          archived: false,
+        },
       },
-    },
-    select: {
-      taxRateId: true,
-      taxForeign: true,
-      taxBase: true,
-      totalBase: true,
-      order: { select: { shippingAddress: true, pricesIncludeVat: true } },
-      taxRate: { select: { name: true, rate: true, accountingTaxType: true, countryCode: true } },
-    },
-    take: SOURCE_ROW_LIMIT + 1,
-  }) as SalesOrderLineTaxRow[]
-  if (lines.length > SOURCE_ROW_LIMIT) throw new Error(`VAT report source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+      select: {
+        taxRateId: true,
+        taxForeign: true,
+        taxBase: true,
+        totalBase: true,
+        order: { select: { shippingAddress: true, pricesIncludeVat: true } },
+        taxRate: { select: { name: true, rate: true, accountingTaxType: true, countryCode: true } },
+      },
+      take: SOURCE_ROW_LIMIT + 1,
+    }) as Promise<SalesOrderLineTaxRow[]>,
+    client.purchaseInvoice.findMany({
+      where: {
+        invoiceDate: { gte: window.dateFrom, lte: window.dateTo },
+      },
+      select: {
+        invoiceDate: true,
+        lines: {
+          select: {
+            qtyBilled: true,
+            totalBase: true,
+            poLine: {
+              select: {
+                qty: true,
+                taxRateId: true,
+                taxBase: true,
+                taxRate: { select: { name: true, rate: true, accountingTaxType: true, countryCode: true } },
+              },
+            },
+          },
+        },
+        po: { select: { supplier: { select: { country: true } } } },
+      },
+      take: SOURCE_ROW_LIMIT + 1,
+    }) as Promise<PurchaseInvoiceTaxRow[]>,
+  ])
+  const purchaseLineCount = purchaseInvoices.reduce((sum, invoice) => sum + invoice.lines.length, 0)
+  if (salesLines.length + purchaseLineCount > SOURCE_ROW_LIMIT) {
+    throw new Error(`VAT report source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  }
 
   type Accumulator = {
+    side: 'sales' | 'purchases'
     taxRateId: string | null
     taxRateName: string
     accountingTaxType: string | null
@@ -373,24 +459,40 @@ export async function getVatReport(
     taxBase: Prisma.Decimal
   }
   const byKey = new Map<string, Accumulator>()
-  for (const line of lines) {
-    const jurisdiction = line.taxRate?.countryCode ?? countryFromShippingAddress(line.order.shippingAddress)
-    const ratePct = pctString(line.taxRate?.rate ?? 0)
-    const key = `${line.taxRateId ?? 'none'}:${jurisdiction}`
+
+  const getOrCreateRow = (params: {
+    side: 'sales' | 'purchases'
+    taxRateId: string | null
+    taxRateName: string
+    accountingTaxType: string | null
+    jurisdiction: string
+    ratePct: string
+  }) => {
+    const key = `${params.side}:${params.taxRateId ?? 'none'}:${params.jurisdiction}`
     let row = byKey.get(key)
     if (!row) {
       row = {
-        taxRateId: line.taxRateId,
-        taxRateName: line.taxRate?.name ?? 'No tax rate',
-        accountingTaxType: line.taxRate?.accountingTaxType ?? null,
-        jurisdiction,
-        ratePct,
+        ...params,
         lineCount: 0,
         taxableBase: new Prisma.Decimal(0),
         taxBase: new Prisma.Decimal(0),
       }
       byKey.set(key, row)
     }
+    return row
+  }
+
+  for (const line of salesLines) {
+    const jurisdiction = line.taxRate?.countryCode ?? countryFromShippingAddress(line.order.shippingAddress)
+    const ratePct = pctString(line.taxRate?.rate ?? 0)
+    const row = getOrCreateRow({
+      side: 'sales',
+      taxRateId: line.taxRateId,
+      taxRateName: line.taxRate?.name ?? 'No tax rate',
+      accountingTaxType: line.taxRate?.accountingTaxType ?? null,
+      jurisdiction,
+      ratePct,
+    })
     row.lineCount += 1
     const taxableBase = line.order.pricesIncludeVat
       ? Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(line.totalBase).sub(toDecimal(line.taxBase)))
@@ -398,7 +500,30 @@ export async function getVatReport(
     row.taxableBase = row.taxableBase.add(taxableBase)
     row.taxBase = row.taxBase.add(toDecimal(line.taxBase))
   }
+
+  for (const invoice of purchaseInvoices) {
+    for (const line of invoice.lines) {
+      const taxRate = line.poLine?.taxRate ?? null
+      const poLineQty = toDecimal(line.poLine?.qty)
+      const ratio = poLineQty.gt(0) ? toDecimal(line.qtyBilled).div(poLineQty) : new Prisma.Decimal(0)
+      const taxBase = line.poLine ? toDecimal(line.poLine.taxBase).mul(ratio) : new Prisma.Decimal(0)
+      const jurisdiction = taxRate?.countryCode ?? invoice.po.supplier?.country?.trim().toUpperCase() ?? 'Unknown'
+      const row = getOrCreateRow({
+        side: 'purchases',
+        taxRateId: line.poLine?.taxRateId ?? null,
+        taxRateName: taxRate?.name ?? 'No tax rate',
+        accountingTaxType: taxRate?.accountingTaxType ?? null,
+        jurisdiction,
+        ratePct: pctString(taxRate?.rate ?? 0),
+      })
+      row.lineCount += 1
+      row.taxableBase = row.taxableBase.add(toDecimal(line.totalBase))
+      row.taxBase = row.taxBase.add(taxBase)
+    }
+  }
+
   const rows = [...byKey.values()].map<VatReportRow>((row) => ({
+    side: row.side,
     taxRateId: row.taxRateId,
     taxRateName: row.taxRateName,
     accountingTaxType: row.accountingTaxType,
@@ -408,17 +533,21 @@ export async function getVatReport(
     taxableBase: moneyString(row.taxableBase, baseCurrency),
     taxBase: moneyString(row.taxBase, baseCurrency),
   }))
-  rows.sort((a, b) => a.jurisdiction.localeCompare(b.jurisdiction) || a.taxRateName.localeCompare(b.taxRateName))
+  rows.sort((a, b) => a.side.localeCompare(b.side) || a.jurisdiction.localeCompare(b.jurisdiction) || a.taxRateName.localeCompare(b.taxRateName))
   const totals = rows.reduce((total, row) => ({
     taxableBase: total.taxableBase.add(row.taxableBase),
-    taxBase: total.taxBase.add(row.taxBase),
-  }), { taxableBase: new Prisma.Decimal(0), taxBase: new Prisma.Decimal(0) })
+    salesTaxBase: row.side === 'sales' ? total.salesTaxBase.add(row.taxBase) : total.salesTaxBase,
+    purchaseTaxBase: row.side === 'purchases' ? total.purchaseTaxBase.add(row.taxBase) : total.purchaseTaxBase,
+  }), { taxableBase: new Prisma.Decimal(0), salesTaxBase: new Prisma.Decimal(0), purchaseTaxBase: new Prisma.Decimal(0) })
+  const netTaxBase = totals.salesTaxBase.sub(totals.purchaseTaxBase)
   return report(rows, filters, window, generatedAt, {
     taxableBase: moneyString(totals.taxableBase, baseCurrency),
-    taxBase: moneyString(totals.taxBase, baseCurrency),
+    salesTaxBase: moneyString(totals.salesTaxBase, baseCurrency),
+    purchaseTaxBase: moneyString(totals.purchaseTaxBase, baseCurrency),
+    taxBase: moneyString(netTaxBase, baseCurrency),
   }, [
-    'VAT totals use SalesOrderLine.taxBase for sales orders invoiced in the period; taxable base subtracts tax for tax-inclusive orders. Cancelled and archived sales orders are excluded.',
-    'Jurisdiction uses TaxRate.countryCode when configured, otherwise the sales order shipping address country.',
+    'VAT totals use SalesOrderLine.taxBase for invoiced sales and proportional PurchaseOrderLine.taxBase for purchase invoice lines in the period; taxable base subtracts tax for tax-inclusive sales orders. Cancelled and archived sales orders are excluded.',
+    'Jurisdiction uses TaxRate.countryCode when configured, otherwise the sales shipping country or supplier country.',
   ], options.paginate !== false)
 }
 
@@ -652,6 +781,154 @@ export async function getApAgingReport(
     `AP aging is as of ${dateOnly(asOf)} and treats PurchaseInvoice.totalBase as fully outstanding until PurchaseInvoice.paidAt is set because the schema does not store partial supplier payments.`,
     `Bucket boundaries are configurable through bucket1Days/bucket2Days/bucket3Days and currently use ${buckets[0]}/${buckets[1]}/${buckets[2]} days.`,
     ...bucketResult.notices,
+  ], options.paginate !== false)
+}
+
+export async function getCurrencySummaryReport(
+  filters: FinanceAnalyticsFilters = {},
+  options: { paginate?: boolean; deps?: FinanceAnalyticsDeps } = {},
+): Promise<FinanceAnalyticsReport<CurrencySummaryReportRow>> {
+  const client = clientFromDeps(options.deps)
+  const generatedAt = nowFromDeps(options.deps)
+  const baseCurrency = await baseCurrencyFromDeps(options.deps)
+  const window = period(filters, generatedAt)
+  const [salesOrders, purchaseInvoices] = await Promise.all([
+    client.salesOrder.findMany({
+      where: {
+        status: { not: SalesOrderStatus.CANCELLED },
+        archived: false,
+        invoicedAt: { gte: window.dateFrom, lte: window.dateTo },
+      },
+      select: {
+        id: true,
+        currency: true,
+        totalForeign: true,
+        totalBase: true,
+        paidAt: true,
+        payments: { select: { amount: true, currency: true, paidAt: true, refundId: true } },
+      },
+      take: SOURCE_ROW_LIMIT + 1,
+    }) as Promise<SalesOrderCurrencyRow[]>,
+    client.purchaseInvoice.findMany({
+      where: {
+        invoiceDate: { gte: window.dateFrom, lte: window.dateTo },
+      },
+      select: {
+        id: true,
+        paidAt: true,
+        totalForeign: true,
+        totalBase: true,
+        po: { select: { currency: true } },
+      },
+      take: SOURCE_ROW_LIMIT + 1,
+    }) as Promise<PurchaseInvoiceCurrencyRow[]>,
+  ])
+  if (salesOrders.length > SOURCE_ROW_LIMIT || purchaseInvoices.length > SOURCE_ROW_LIMIT) {
+    throw new Error(`Currency summary source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  }
+
+  const rowsByCurrency = new Map<string, {
+    currency: string
+    salesDocumentIds: Set<string>
+    salesForeign: Prisma.Decimal
+    salesBase: Prisma.Decimal
+    arOutstandingForeign: Prisma.Decimal
+    arOutstandingBase: Prisma.Decimal
+    purchaseDocumentIds: Set<string>
+    purchasesForeign: Prisma.Decimal
+    purchasesBase: Prisma.Decimal
+    apOutstandingForeign: Prisma.Decimal
+    apOutstandingBase: Prisma.Decimal
+  }>()
+
+  const getRow = (currency: string) => {
+    const normalized = currency.trim().toUpperCase() || baseCurrency
+    let row = rowsByCurrency.get(normalized)
+    if (!row) {
+      row = {
+        currency: normalized,
+        salesDocumentIds: new Set(),
+        salesForeign: new Prisma.Decimal(0),
+        salesBase: new Prisma.Decimal(0),
+        arOutstandingForeign: new Prisma.Decimal(0),
+        arOutstandingBase: new Prisma.Decimal(0),
+        purchaseDocumentIds: new Set(),
+        purchasesForeign: new Prisma.Decimal(0),
+        purchasesBase: new Prisma.Decimal(0),
+        apOutstandingForeign: new Prisma.Decimal(0),
+        apOutstandingBase: new Prisma.Decimal(0),
+      }
+      rowsByCurrency.set(normalized, row)
+    }
+    return row
+  }
+
+  for (const order of salesOrders) {
+    const row = getRow(order.currency)
+    row.salesDocumentIds.add(order.id)
+    const totalForeign = toDecimal(order.totalForeign)
+    const totalBase = toDecimal(order.totalBase)
+    row.salesForeign = row.salesForeign.add(totalForeign)
+    row.salesBase = row.salesBase.add(totalBase)
+    const paidForeign = order.payments
+      .filter((payment) => payment.refundId == null && payment.currency === row.currency)
+      .reduce((sum, payment) => sum.add(toDecimal(payment.amount)), new Prisma.Decimal(0))
+    const outstandingForeign = Prisma.Decimal.max(new Prisma.Decimal(0), totalForeign.sub(paidForeign))
+    if (!order.paidAt && outstandingForeign.gt(0)) {
+      row.arOutstandingForeign = row.arOutstandingForeign.add(outstandingForeign)
+      row.arOutstandingBase = row.arOutstandingBase.add(
+        totalForeign.gt(0) ? totalBase.mul(outstandingForeign).div(totalForeign) : new Prisma.Decimal(0),
+      )
+    }
+  }
+
+  for (const invoice of purchaseInvoices) {
+    const row = getRow(invoice.po.currency)
+    row.purchaseDocumentIds.add(invoice.id)
+    const totalForeign = toDecimal(invoice.totalForeign)
+    const totalBase = toDecimal(invoice.totalBase)
+    row.purchasesForeign = row.purchasesForeign.add(totalForeign)
+    row.purchasesBase = row.purchasesBase.add(totalBase)
+    if (!invoice.paidAt) {
+      row.apOutstandingForeign = row.apOutstandingForeign.add(totalForeign)
+      row.apOutstandingBase = row.apOutstandingBase.add(totalBase)
+    }
+  }
+
+  const rows = [...rowsByCurrency.values()].map<CurrencySummaryReportRow>((row) => ({
+    currency: row.currency,
+    salesDocumentCount: row.salesDocumentIds.size,
+    salesForeign: moneyString(row.salesForeign, row.currency),
+    salesBase: moneyString(row.salesBase, baseCurrency),
+    arOutstandingForeign: moneyString(row.arOutstandingForeign, row.currency),
+    arOutstandingBase: moneyString(row.arOutstandingBase, baseCurrency),
+    purchaseDocumentCount: row.purchaseDocumentIds.size,
+    purchasesForeign: moneyString(row.purchasesForeign, row.currency),
+    purchasesBase: moneyString(row.purchasesBase, baseCurrency),
+    apOutstandingForeign: moneyString(row.apOutstandingForeign, row.currency),
+    apOutstandingBase: moneyString(row.apOutstandingBase, baseCurrency),
+  })).sort((a, b) => a.currency.localeCompare(b.currency))
+
+  const totals = rows.reduce((total, row) => ({
+    salesBase: total.salesBase.add(row.salesBase),
+    arOutstandingBase: total.arOutstandingBase.add(row.arOutstandingBase),
+    purchasesBase: total.purchasesBase.add(row.purchasesBase),
+    apOutstandingBase: total.apOutstandingBase.add(row.apOutstandingBase),
+  }), {
+    salesBase: new Prisma.Decimal(0),
+    arOutstandingBase: new Prisma.Decimal(0),
+    purchasesBase: new Prisma.Decimal(0),
+    apOutstandingBase: new Prisma.Decimal(0),
+  })
+
+  return report(rows, filters, window, generatedAt, {
+    salesBase: moneyString(totals.salesBase, baseCurrency),
+    arOutstandingBase: moneyString(totals.arOutstandingBase, baseCurrency),
+    purchasesBase: moneyString(totals.purchasesBase, baseCurrency),
+    apOutstandingBase: moneyString(totals.apOutstandingBase, baseCurrency),
+  }, [
+    'Currency summary groups invoiced sales orders and purchase invoices by their document currency, preserving foreign-currency totals alongside base equivalents.',
+    'AR outstanding is estimated per sales order from same-currency non-refund payments; AP outstanding is full invoice value until PurchaseInvoice.paidAt because supplier partial payments are not modelled.',
   ], options.paginate !== false)
 }
 

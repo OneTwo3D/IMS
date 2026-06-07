@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { accountingPayloadKey } from '../lib/accounting/payload-key.ts'
+import { XERO_SALES_CREDIT_NOTE_TYPE } from '../lib/connectors/xero/credit-notes.ts'
 import { imsRateToXeroCurrencyRate } from '../lib/connectors/xero/fx.ts'
 
 test('inverts IMS fxRateToBase into Xero CurrencyRate', () => {
@@ -33,4 +35,33 @@ test('returns undefined for missing, zero, negative, and non-finite rates', () =
   assert.equal(imsRateToXeroCurrencyRate(-1.5), undefined)
   assert.equal(imsRateToXeroCurrencyRate(NaN), undefined)
   assert.equal(imsRateToXeroCurrencyRate(Infinity), undefined)
+})
+
+test('uses the Xero CreditNotes sales-credit enum, not the invoice enum', () => {
+  assert.equal(XERO_SALES_CREDIT_NOTE_TYPE, 'ACCRECCREDIT')
+})
+
+test('accounting payload keys include the document-stamped FX rate', () => {
+  const basePayload = {
+    documentId: 'po-1',
+    currency: 'EUR',
+    totalForeign: 100,
+    lines: [{ description: 'Line', unitAmount: 100, quantity: 1 }],
+  }
+
+  const first = accountingPayloadKey('purchase-invoice:po-1', {
+    ...basePayload,
+    currencyRateToBase: 1.18,
+  })
+  const restamped = accountingPayloadKey('purchase-invoice:po-1', {
+    ...basePayload,
+    currencyRateToBase: 1.19,
+  })
+  const retry = accountingPayloadKey('purchase-invoice:po-1', {
+    ...basePayload,
+    currencyRateToBase: 1.18,
+  })
+
+  assert.equal(first, retry)
+  assert.notEqual(first, restamped)
 })
