@@ -1,7 +1,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
-import { addCostLayerSourceLines, cogsEntryDataFromConsumed, consumeFifoLayers, consumeFifoLayersStrict } from '../lib/cost-layers.ts'
+import {
+  addCostLayerSourceLines,
+  buildShipmentCogsRevaluationSyncPayload,
+  cogsEntryDataFromConsumed,
+  consumeFifoLayers,
+  consumeFifoLayersStrict,
+} from '../lib/cost-layers.ts'
 
 test('cogsEntryDataFromConsumed preserves six-decimal consumed quantities', () => {
   assert.deepEqual(cogsEntryDataFromConsumed('movement-1', {
@@ -57,6 +63,43 @@ test('addCostLayerSourceLines rejects source lines without unit cost', async () 
     unitCostBase: 2.5,
     totalCostBase: 2.5,
   }])
+})
+
+test('shipment COGS revaluation payload reverses old COGS and posts the recomputed amount', () => {
+  const payload = buildShipmentCogsRevaluationSyncPayload({
+    shipmentId: 'shipment-1',
+    costLayerId: 'layer-1',
+    inventoryAccount: '120',
+    cogsAccount: '500',
+    oldCogsBase: '20.00',
+    newCogsBase: '27.50',
+  })
+
+  assert.deepEqual(payload, {
+    date: new Date().toISOString().slice(0, 10),
+    reference: 'Shipment COGS revaluation: shipment-1',
+    narration: 'Reverse and repost shipment COGS after cost-layer revaluation for shipment shipment-1',
+    lines: [
+      { accountCode: '120', description: 'Reverse old shipment COGS shipment-1', debit: 20 },
+      { accountCode: '500', description: 'Reverse old shipment COGS shipment-1', credit: 20 },
+      { accountCode: '500', description: 'Post revalued shipment COGS shipment-1', debit: 27.5 },
+      { accountCode: '120', description: 'Post revalued shipment COGS shipment-1', credit: 27.5 },
+    ],
+    sourceCostLayerId: 'layer-1',
+    oldCogsBase: 20,
+    newCogsBase: 27.5,
+  })
+})
+
+test('shipment COGS revaluation payload ignores sub-cent changes', () => {
+  assert.equal(buildShipmentCogsRevaluationSyncPayload({
+    shipmentId: 'shipment-1',
+    costLayerId: 'layer-1',
+    inventoryAccount: '120',
+    cogsAccount: '500',
+    oldCogsBase: '20.00',
+    newCogsBase: '20.004',
+  }), null)
 })
 
 test('consumeFifoLayers selects FIFO candidates with row locks before consuming', async () => {

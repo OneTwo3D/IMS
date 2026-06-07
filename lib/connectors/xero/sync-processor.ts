@@ -170,6 +170,40 @@ function syncLogNextAttemptAt(log: { status: string; processingStartedAt: Date |
   return null
 }
 
+async function hasEarlierLiveInvoicePayment(entry: {
+  id: string
+  type: AccountingSyncType
+  referenceType: string
+  referenceId: string
+  createdAt: Date
+}): Promise<boolean> {
+  if (entry.type !== 'INVOICE_PAYMENT') return false
+  const older = await db.accountingSyncLog.findFirst({
+    where: {
+      id: { not: entry.id },
+      connector: XERO_CONNECTOR,
+      type: 'INVOICE_PAYMENT',
+      referenceType: entry.referenceType,
+      referenceId: entry.referenceId,
+      status: { in: ['PENDING', 'PROCESSING'] },
+      createdAt: { lt: entry.createdAt },
+    },
+    select: { id: true },
+  })
+  return older != null
+}
+
+async function deferPaymentUntilEarlierLogsPost(entry: { id: string }): Promise<void> {
+  await db.accountingSyncLog.update({
+    where: { id: entry.id },
+    data: {
+      status: 'PENDING',
+      processingStartedAt: new Date(Date.now() + 60_000),
+      errorMessage: 'Deferred until older invoice payment sync logs post',
+    },
+  })
+}
+
 async function ensureXeroOutboxForPendingSyncLogs(limit: number, staleClaimCutoff: Date): Promise<void> {
   const now = new Date()
   const logs = await db.accountingSyncLog.findMany({
@@ -341,6 +375,12 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
     const payload = (entry.payload ?? {}) as SyncPayload
 
     try {
+      if (await hasEarlierLiveInvoicePayment(entry)) {
+        await deferPaymentUntilEarlierLogsPost(entry)
+        result.skipped++
+        continue
+      }
+
       if (entry.externalTransactionId) {
         await db.$transaction(async (tx) => {
           await tx.accountingSyncLog.update({
@@ -544,6 +584,11 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
       result.failed++
       continue
     }
+    if (entry.status === 'SYNCED' && entry.externalTransactionId) {
+      await markXeroOutboxSuccess(job)
+      result.skipped++
+      continue
+    }
 
     const claim = await db.accountingSyncLog.updateMany({
       where: accountingSyncLogClaimWhere(entry.id, staleClaimCutoff),
@@ -567,6 +612,22 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
     const payload = (entry.payload ?? {}) as SyncPayload
 
     try {
+      if (await hasEarlierLiveInvoicePayment(entry)) {
+        await db.$transaction(async (tx) => {
+          await tx.accountingSyncLog.update({
+            where: { id: entry.id },
+            data: {
+              status: 'PENDING',
+              processingStartedAt: new Date(Date.now() + 60_000),
+              errorMessage: 'Deferred until older invoice payment sync logs post',
+            },
+          })
+          await markXeroOutboxRetry(job, 'Deferred until older invoice payment sync logs post', tx)
+        })
+        result.skipped++
+        continue
+      }
+
       if (entry.externalTransactionId) {
         await db.$transaction(async (tx) => {
           await tx.accountingSyncLog.update({

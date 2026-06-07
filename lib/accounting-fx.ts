@@ -126,6 +126,8 @@ export async function resolveSettlementFxRateToBase(
     baseCurrency: string
     asOf: Date
     fallbackRateToBase: number
+    referenceType?: string
+    referenceId?: string
   },
 ): Promise<number> {
   const currency = params.currency.trim().toUpperCase()
@@ -141,5 +143,25 @@ export async function resolveSettlementFxRateToBase(
     select: { rate: true },
   })
   const resolved = rate ? Number(rate.rate) : Number(params.fallbackRateToBase)
+  if (!rate && Number.isFinite(resolved) && resolved > 0) {
+    await tx.activityLog.create({
+      data: {
+        entityType: 'SYSTEM',
+        entityId: params.referenceId ?? null,
+        action: 'fx_rate_fallback_used',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: `Used fallback FX rate for ${currency} settlement on ${params.asOf.toISOString().slice(0, 10)}`,
+        metadata: {
+          currency,
+          baseCurrency,
+          settlementDate: params.asOf.toISOString().slice(0, 10),
+          fallbackRateToBase: resolved,
+          referenceType: params.referenceType ?? null,
+          referenceId: params.referenceId ?? null,
+        },
+      },
+    }).catch(() => undefined)
+  }
   return Number.isFinite(resolved) && resolved > 0 ? resolved : 1
 }

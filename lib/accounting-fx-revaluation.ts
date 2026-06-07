@@ -221,6 +221,8 @@ async function buildRevaluationLines(params: {
       baseCurrency: params.baseCurrency,
       asOf: valuationDate,
       fallbackRateToBase: balance.bookedRateToBase,
+      referenceType: params.side === 'receivable' ? 'SalesOrder' : 'PurchaseInvoice',
+      referenceId: balance.id,
     }))
     const revaluation = computeRealisedFx({
       side: params.side,

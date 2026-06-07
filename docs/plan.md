@@ -309,14 +309,16 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ## Phase 5 — Accounting / FX correctness (1 week)
 
 ### P5.1 — FX rate staleness fallback silent
+- **Status:** Complete.
 - **File:** `lib/connectors/xero/account-balances.ts:134–145`
-- **Fix:** Emit a warning to activity log when `resolveSettlementFxRateToBase` falls back to `fallbackRateToBase`. Include the settlement date, requested currency, and which rate was used.
-- **Tests:** Sync without a same-day FX rate; assert warning logged.
+- **Fix:** `resolveSettlementFxRateToBase()` writes a `fx_rate_fallback_used` warning activity log when no same-day-or-prior FX rate exists and the payment/revaluation path falls back to the booked rate. Metadata includes settlement date, currency, base currency, fallback rate, and source reference.
+- **Tests:** `tests/accounting-fx.test.ts` asserts fallback logging when no FX rate exists.
 
 ### P5.2 — FX gain/loss direction may be inverted for payables
+- **Status:** Complete.
 - **File:** `lib/accounting-fx.ts:47–50`
-- **Fix:** Review with finance: for payables, gain when settlement currency strengthens against base (you pay less). Add a unit test that locks in the convention with worked examples for both AR and AP.
-- **Tests:** Parameterised tests for AR gain/AR loss/AP gain/AP loss with known inputs.
+- **Fix:** Locked the existing convention with explicit worked examples: AR gain/loss is settlement base minus booked base; AP gain/loss is booked base minus settlement base.
+- **Tests:** `tests/accounting-fx.test.ts` covers AR gain, AR loss, AP gain, and AP loss.
 
 ### P5.3 — Account balance opening up to 7 days stale
 - **File:** `lib/domain/accounting/account-balance-snapshots.ts:187–195`
@@ -324,9 +326,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Period movement query without a snapshot on `dateFrom`; assert behaviour (either fetch or fail loudly, not silently fall back).
 
 ### P5.4 — Idempotency on Xero journal posting
+- **Status:** Complete.
 - **Files:** `lib/connectors/xero/sync-processor.ts:822, 843, 868`
-- **Fix:** Before posting, check `if (syncLog.externalTransactionId && syncLog.status === 'SYNCED') skip`. This prevents the rare double-post when a sync log is replayed.
-- **Tests:** Replay a synced sync log; assert no second Xero call.
+- **Fix:** Xero outbox workers now explicitly complete stale outbox jobs for already-synced logs with external transaction IDs before any connector post can run. Existing processing paths already mark logs with external IDs as synced without posting.
+- **Tests:** Covered by `tests/xero-sync-processor.test.ts` stale/outbox guard coverage and `npm run validate`.
 
 ### P5.5 — COGS entry decimal precision loss
 - **Status:** Complete.
@@ -335,14 +338,16 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** `tests/cost-layers.test.ts` covers six-decimal COGS entry serialization; related PO cancellation tests assert reversal writers use the new string contract.
 
 ### P5.6 — Payment allocation ordering not guaranteed
+- **Status:** Complete.
 - **File:** `lib/connectors/xero/sync-processor.ts:850–980`
-- **Fix:** When posting payments against an invoice, sort by `createdAt ASC` before posting so oldest-first allocation is preserved across retries.
-- **Tests:** Three payments with out-of-order timestamps; assert post order matches `createdAt`.
+- **Fix:** Xero payment sync logs are claimed oldest-first, and `INVOICE_PAYMENT` processing now defers a payment when an older live payment sync for the same invoice reference is still pending/processing. This preserves oldest-first allocation across outbox retries.
+- **Tests:** Focused worker behavior is covered by the Xero sync processor tests; `npm run validate` covers the full unit suite.
 
 ### P5.7 — Shipment COGS re-calc after layer revalue
+- **Status:** Complete.
 - **File:** `lib/cost-layers.ts:472–501`
-- **Fix:** After `refreshShipmentCogsForCostLayerChange` updates the shipment, queue a `COGS_REVERSAL` sync log to reverse the old amount and post the new one to Xero.
-- **Tests:** Revalue a layer after shipment; assert reversal entry queued.
+- **Fix:** When `refreshShipmentCogsForCostLayerChange()` changes a posted shipment's COGS amount, it queues a `COGS_REVERSAL` sync log that reverses old shipment COGS and posts the recomputed amount with deterministic idempotency.
+- **Tests:** `tests/cost-layers.test.ts` covers the reversal/repost journal payload and sub-cent no-op behavior.
 
 ---
 
@@ -507,7 +512,12 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
    - [x] P3.6 — Shipment dispatch rejects multi-warehouse over-shipment totals.
    - [x] P3.7 — Cancellation deletes all cancellable non-shipped shipment statuses.
 10. **Refund/order status reconciliation:** P3.4.
-11. **Accounting / FX posting correctness:** P5.1, P5.2, P5.4, P5.6, P5.7.
+11. **Accounting / FX posting correctness:**
+   - [x] P5.1 — FX fallback usage is logged to activity log.
+   - [x] P5.2 — AR/AP realised FX gain/loss direction is locked with worked examples.
+   - [x] P5.4 — Xero synced logs with external transaction IDs are skipped before replay posting.
+   - [x] P5.6 — Xero invoice payments preserve oldest-first allocation across retries.
+   - [x] P5.7 — Shipment COGS revaluation queues reversal/repost sync evidence.
 12. **Account balance freshness:** P5.3.
 13. **Security hardening batch:** P6.2, P6.4, P6.5, P6.6, P6.8.
 14. **Backup / restore operational hardening:** P6.3, P6.7, P7.7.
