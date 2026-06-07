@@ -44,6 +44,11 @@ import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromConsumed,
 } from '@/lib/domain/inventory/stock-movement-value'
+import {
+  shouldResolvePurchaseOrderFxRate,
+  resolvePurchaseOrderFxRateToBase,
+  type PurchaseOrderFxResolution,
+} from '@/lib/domain/purchasing/purchase-order-fx'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -223,7 +228,7 @@ export type CreatePoInput = {
   reference?: string
   supplierId: string
   currency: string
-  fxRateToBase: number
+  fxRateToBase?: number | null
   destinationWarehouseId?: string
   supplierRef?: string
   expectedDelivery?: string
@@ -266,6 +271,15 @@ async function makeReference(): Promise<string> {
 
 function safeFxRate(rate: number): number {
   return rate > 0 ? rate : 1
+}
+
+function poFxActivityMetadata(resolution: PurchaseOrderFxResolution): Record<string, unknown> {
+  return {
+    fxRateToBase: resolution.fxRateToBase,
+    expectedFxRateToBase: resolution.expectedRateToBase,
+    fxRateSource: resolution.source,
+    fxRateWarning: resolution.warning,
+  }
 }
 
 function calcLineTotals(unitCostForeign: number, qty: number, fxRate: number) {
@@ -795,7 +809,15 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       if (l.unitCostForeign < 0) return { success: false, error: `Negative cost for ${l.sku}` }
     }
 
-    const fxRate = safeFxRate(input.fxRateToBase || 1)
+    const poCreatedAt = new Date()
+    const baseCurrency = await getBaseCurrencyCode()
+    const fxResolution = await resolvePurchaseOrderFxRateToBase(db, {
+      currency: input.currency,
+      baseCurrency,
+      asOf: poCreatedAt,
+      manualRateToBase: input.fxRateToBase,
+    })
+    const fxRate = fxResolution.fxRateToBase
     const vatRate = input.taxRateValue ?? 0
     const inclVat = !!input.pricesIncludeVat
     let subtotalForeign = 0
@@ -1124,8 +1146,25 @@ export async function createPurchaseOrder(input: CreatePoInput): Promise<{ succe
       tag: 'purchase',
       level: 'INFO',
       description: `Created PO ${mapped.reference} for ${mapped.supplierName}`,
-      metadata: { reference: mapped.reference, supplierId: input.supplierId, currency: input.currency, lineCount: input.lines.length },
+      metadata: {
+        reference: mapped.reference,
+        supplierId: input.supplierId,
+        currency: input.currency,
+        lineCount: input.lines.length,
+        ...poFxActivityMetadata(fxResolution),
+      },
     })
+    if (fxResolution.warning) {
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: mapped.id,
+        action: 'fx_rate_override_warning',
+        tag: 'purchase',
+        level: 'WARNING',
+        description: `PO ${mapped.reference} FX override differs from latest stored rate by ${(fxResolution.warning.deltaPercent * 100).toFixed(2)}%.`,
+        metadata: poFxActivityMetadata(fxResolution),
+      })
+    }
 
     return { success: true, po: mapped }
   } catch (e) {
@@ -1150,19 +1189,45 @@ export async function updatePurchaseOrder(
     const session = await requirePermission('purchasing.create')
     const existing = await db.purchaseOrder.findUnique({
       where: { id },
-      select: { status: true, fxRateToBase: true, directFreightForeign: true, directFreightBase: true },
+      select: {
+        status: true,
+        currency: true,
+        fxRateToBase: true,
+        directFreightForeign: true,
+        directFreightBase: true,
+        createdAt: true,
+      },
     })
     if (!existing) return { success: false, error: 'PO not found' }
     if (existing.status !== 'DRAFT') return { success: false, error: 'Only DRAFT POs can be edited' }
 
-    const fxRate = input.fxRateToBase ?? Number(existing.fxRateToBase)
+    const shouldResolveFx = shouldResolvePurchaseOrderFxRate({
+      existingCurrency: existing.currency,
+      existingRateToBase: existing.fxRateToBase,
+      inputCurrency: input.currency,
+      inputRateToBase: input.fxRateToBase,
+    })
+    const fxInputProvided = input.currency !== undefined || input.fxRateToBase !== undefined
+    const fxRevalidationSkipped = fxInputProvided && !shouldResolveFx
+    let fxResolution: PurchaseOrderFxResolution | null = null
+    let fxRate = Number(existing.fxRateToBase)
+    if (shouldResolveFx) {
+      const baseCurrency = await getBaseCurrencyCode()
+      fxResolution = await resolvePurchaseOrderFxRateToBase(db, {
+        currency: input.currency ?? existing.currency,
+        baseCurrency,
+        asOf: existing.createdAt,
+        manualRateToBase: input.fxRateToBase,
+      })
+      fxRate = fxResolution.fxRateToBase
+    }
     const inclVat = !!input.pricesIncludeVat
     const vatRate = input.taxRateValue ?? 0
 
     const updates: Record<string, unknown> = {
       ...(input.supplierId !== undefined && { supplierId: input.supplierId }),
       ...(input.currency !== undefined && { currency: input.currency }),
-      ...(input.fxRateToBase !== undefined && { fxRateToBase: input.fxRateToBase }),
+      ...(fxResolution && { fxRateToBase: fxRate }),
       ...(input.destinationWarehouseId !== undefined && { destinationWarehouseId: input.destinationWarehouseId || null }),
       ...(input.supplierRef !== undefined && { supplierRef: input.supplierRef || null }),
       ...(input.expectedDelivery !== undefined && { expectedDelivery: input.expectedDelivery ? new Date(input.expectedDelivery) : null }),
@@ -1530,8 +1595,39 @@ export async function updatePurchaseOrder(
       tag: 'purchase',
       level: 'INFO',
       description: `Updated PO ${mapped.reference}`,
-      metadata: { reference: mapped.reference, landedCostAuditRunIds },
+      metadata: {
+        reference: mapped.reference,
+        landedCostAuditRunIds,
+        ...(fxResolution ? poFxActivityMetadata(fxResolution) : {}),
+      },
     })
+    if (fxRevalidationSkipped) {
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: id,
+        action: 'fx_rate_revalidation_skipped',
+        tag: 'purchase',
+        level: 'INFO',
+        description: `PO ${mapped.reference} edited without FX change; retained existing rate ${Number(existing.fxRateToBase).toFixed(4)} from ${existing.createdAt.toISOString().slice(0, 10)}.`,
+        metadata: {
+          reference: mapped.reference,
+          currency: existing.currency,
+          fxRateToBase: Number(existing.fxRateToBase),
+          asOf: existing.createdAt.toISOString(),
+        },
+      })
+    }
+    if (fxResolution?.warning) {
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: id,
+        action: 'fx_rate_override_warning',
+        tag: 'purchase',
+        level: 'WARNING',
+        description: `PO ${mapped.reference} FX override differs from latest stored rate by ${(fxResolution.warning.deltaPercent * 100).toFixed(2)}%.`,
+        metadata: poFxActivityMetadata(fxResolution),
+      })
+    }
     return { success: true, po: mapped }
   } catch (e) {
     await logActivity({

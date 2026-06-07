@@ -25,6 +25,10 @@ import { formatMoney } from '@/lib/utils'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { formatCountryDisplay, toIsoCountryCode } from '@/lib/countries'
 import type { TaxCategory } from '@/app/generated/prisma/client'
+import {
+  evaluatePurchaseOrderFxRateOverride,
+  PURCHASE_ORDER_FX_OVERRIDE_REJECT_THRESHOLD,
+} from '@/lib/domain/purchasing/purchase-order-fx'
 
 type Warehouse = { id: string; code: string; name: string; country?: string | null; contactName?: string | null; email?: string | null; phone?: string | null; addressLine1?: string | null; addressLine2?: string | null; city?: string | null; postcode?: string | null }
 
@@ -33,6 +37,7 @@ type Props = {
   products: ProductRow[]
   warehouses: Warehouse[]
   currencies: CurrencyRow[]
+  fxReferenceRates?: Record<string, number>
   taxRates: TaxRateRow[]
   purchaseUnits: PurchaseUnitRow[]
   /** Fallback destination country when the receiving warehouse has none. */
@@ -153,7 +158,7 @@ function parseDiscount(input: string, lineTotal: number): number {
   return isNaN(abs) ? 0 : abs
 }
 
-export function PoFormDialog({ suppliers, products, warehouses, currencies, taxRates, purchaseUnits, companyHomeCountry, onClose, existingPo }: Props) {
+export function PoFormDialog({ suppliers, products, warehouses, currencies, fxReferenceRates, taxRates, purchaseUnits, companyHomeCountry, onClose, existingPo }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const isEditMode = !!existingPo
@@ -335,11 +340,30 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   for (const c of currencies) {
     if (c.latestRate != null) rateMap[c.code] = c.latestRate
   }
+  const effectiveRateMap = existingPo && fxReferenceRates ? fxReferenceRates : rateMap
+  const latestFxRate = currency === baseCurrency.code ? 1 : effectiveRateMap[currency]
+  const fxReferenceDate = existingPo?.createdAt.slice(0, 10) ?? 'today'
+  const fxChangedFromExisting = !existingPo
+    || currency !== existingPo.currency
+    || Math.abs(fxRate - existingPo.fxRateToBase) > 0.000001
+  const fxEvaluation = fxChangedFromExisting
+    ? evaluatePurchaseOrderFxRateOverride({
+        currency,
+        baseCurrency: baseCurrency.code,
+        asOf: existingPo ? new Date(existingPo.createdAt) : new Date(),
+        referenceRateToBase: latestFxRate,
+        manualRateToBase: fxRate,
+      })
+    : null
+  const fxRateError = fxEvaluation && !fxEvaluation.ok ? fxEvaluation.error : null
+  const fxRateWarning = fxEvaluation?.ok && fxEvaluation.resolution.warning
+    ? `Manual FX rate differs from stored rate (${latestFxRate?.toFixed(4)}) as of ${fxReferenceDate} by ${(fxEvaluation.resolution.warning.deltaPercent * 100).toFixed(2)}%.`
+    : null
 
   function setCurrencyAndRate(code: string) {
     setCurrency(code)
     if (code === baseCurrency.code) setFxRate(1)
-    else if (rateMap[code]) setFxRate(rateMap[code])
+    else if (effectiveRateMap[code]) setFxRate(effectiveRateMap[code])
   }
 
   async function handleSupplierChange(id: string) {
@@ -589,6 +613,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
     setError('')
     if (!supplierId) { setError('Please select a supplier'); return }
     if (!lines.length) { setError('Add at least one product line'); return }
+    if (fxRateError) { setError(fxRateError); return }
 
     const payload = {
       supplierId,
@@ -746,6 +771,23 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                 />
               </div>
             </div>
+            {fxRateError && (
+              <p className="flex items-start gap-1.5 text-xs text-destructive">
+                <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                {fxRateError}
+              </p>
+            )}
+            {fxRateWarning && (
+              <p className="flex items-start gap-1.5 text-xs text-amber-600">
+                <AlertTriangle className="mt-0.5 h-3 w-3 shrink-0" />
+                {fxRateWarning}
+              </p>
+            )}
+            {existingPo && currency !== baseCurrency.code && !fxRateError && (
+              <p className="text-xs text-muted-foreground">
+                Compared with the stored {baseCurrency.code} to {currency} rate as of {fxReferenceDate}. Overrides outside {(PURCHASE_ORDER_FX_OVERRIDE_REJECT_THRESHOLD * 100).toFixed(0)}% are blocked.
+              </p>
+            )}
           </div>
 
           <div className="space-y-1.5">

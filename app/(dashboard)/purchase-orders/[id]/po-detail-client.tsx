@@ -57,6 +57,7 @@ type Props = {
   products: ProductRow[]
   warehouses: Warehouse[]
   currencies: CurrencyRow[]
+  fxReferenceRates: Record<string, number>
   taxRates: TaxRateRow[]
   purchaseUnits: PurchaseUnitRow[]
   carriers: string[]
@@ -1474,7 +1475,7 @@ function ShipDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, mintsoftAsnState }: Props) {
+export function PoDetailClient({ po: initialPo, suppliers, products, warehouses, currencies, fxReferenceRates, taxRates, purchaseUnits, carriers, companyHomeCountry, accountingAvailable, accountingBillUrlTemplate, mintsoftAsnState }: Props) {
   const baseCurrency = useBaseCurrency()
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
@@ -1792,6 +1793,7 @@ export function PoDetailClient({ po: initialPo, suppliers, products, warehouses,
           products={products}
           warehouses={warehouses}
           currencies={currencies}
+          fxReferenceRates={fxReferenceRates}
           taxRates={taxRates}
           purchaseUnits={purchaseUnits}
           companyHomeCountry={companyHomeCountry}

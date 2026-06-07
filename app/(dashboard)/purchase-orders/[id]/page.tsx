@@ -7,7 +7,7 @@ import { getMintsoftPurchaseOrderAsnState } from '@/app/actions/mintsoft-sync'
 import { getSuppliers } from '@/app/actions/suppliers'
 import { listProducts } from '@/app/actions/products'
 import { getWarehouses } from '@/app/actions/stock'
-import { getCurrencies } from '@/app/actions/currencies'
+import { getCurrencies, getCurrencyRateMapAsOf } from '@/app/actions/currencies'
 import { getTaxRates, getPurchaseUnits, getSetting } from '@/app/actions/settings'
 import { getOrganisation } from '@/app/actions/company'
 import { getAccountingSettings } from '@/lib/accounting'
@@ -38,6 +38,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
   ])
 
   if (!po) notFound()
+  const fxReferenceRates = await getCurrencyRateMapAsOf(po.createdAt)
 
   let carriers: string[] = DEFAULT_CARRIERS
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
@@ -54,7 +55,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
         </Link>
         <h1 className="text-2xl font-semibold font-mono">{po.reference}</h1>
       </div>
-      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} mintsoftAsnState={mintsoftAsnState} />
+      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} fxReferenceRates={fxReferenceRates} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} mintsoftAsnState={mintsoftAsnState} />
     </div>
   )
 }

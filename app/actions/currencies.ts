@@ -77,6 +77,37 @@ export async function getCurrencyRateMap(): Promise<Record<string, number>> {
   return map
 }
 
+/** Returns map: { BASE: 1, EUR: 1.17, ... } using rates on or before `asOf`. */
+export async function getCurrencyRateMapAsOf(asOf: Date | string): Promise<Record<string, number>> {
+  await requireAuth()
+  const date = typeof asOf === 'string' ? new Date(asOf) : asOf
+  if (Number.isNaN(date.getTime())) return {}
+  const baseCurrency = await getBaseCurrencyCode()
+  const currencies = await db.currency.findMany({
+    where: { active: true },
+    orderBy: { code: 'asc' },
+    include: {
+      fxRates: {
+        where: {
+          fromCurrency: baseCurrency,
+          fetchedAt: { lte: date },
+        },
+        orderBy: { fetchedAt: 'desc' },
+        take: 1,
+      },
+    },
+  })
+  const map: Record<string, number> = { [baseCurrency]: 1 }
+  for (const c of currencies) {
+    if (c.code === baseCurrency) {
+      map[c.code] = 1
+    } else if (c.fxRates[0]) {
+      map[c.code] = Number(c.fxRates[0].rate)
+    }
+  }
+  return map
+}
+
 // ---------------------------------------------------------------------------
 // Mutations
 // ---------------------------------------------------------------------------
