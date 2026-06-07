@@ -8,22 +8,29 @@ import { wcFetch } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems, mapWcOrderDiscount,
-  mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp,
+  mapWcFeeLines, mapWcShipping, resolveWcTaxRateById, getFxRateToGbp, isMissingFxRateError,
 } from './field-mapping'
 import { syncRefundsForOrder } from './refund-sync'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { resolveLineTaxRateBatch } from '@/lib/tax/resolve-rate'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import type { TaxCategory } from '@/app/generated/prisma/client'
+import type { Prisma, TaxCategory } from '@/app/generated/prisma/client'
 import { getSettingValue } from '@/lib/settings-store'
+import { notify } from '@/lib/notifications'
+import { parsePositiveIntegerEnv } from '@/lib/env'
 
 // ---------------------------------------------------------------------------
 // Import a single WC order into IMS
 // ---------------------------------------------------------------------------
 
-export type ImportWcOrderOptions = { skipAccounting?: boolean; useWcDateAsCreatedAt?: boolean }
+export type ImportWcOrderOptions = {
+  skipAccounting?: boolean
+  useWcDateAsCreatedAt?: boolean
+  pendingFxRetryLogId?: string
+}
 
 const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
+const DEFAULT_PENDING_FX_NOTIFY_THRESHOLD = 5
 
 export type WcTaxRateFallbackLine = {
   sku: string
@@ -47,6 +54,128 @@ function divideRoundedNumber(value: DecimalInput, divisor: DecimalInput, precisi
 
 function isUniqueConstraintError(error: unknown): error is { code: string } {
   return typeof error === 'object' && error !== null && 'code' in error && (error as { code?: string }).code === 'P2002'
+}
+
+function getPendingFxNotifyThreshold(env: Record<string, string | undefined> = process.env): number {
+  return parsePositiveIntegerEnv(env.WC_PENDING_FX_ORDER_NOTIFY_THRESHOLD, DEFAULT_PENDING_FX_NOTIFY_THRESHOLD)
+}
+
+async function notifyActiveAdmins(params: Omit<Parameters<typeof notify>[0], 'userId'>): Promise<void> {
+  const admins = await db.user.findMany({
+    where: { role: 'ADMIN', active: true },
+    select: { id: true },
+  })
+  await Promise.all(admins.map((admin) => notify({ ...params, userId: admin.id })))
+}
+
+async function recordPendingFxOrder(
+  wcOrder: WcFullOrder,
+  error: { message: string; currency: string; asOf?: Date },
+  retryLogId?: string,
+): Promise<void> {
+  const payload = {
+    reason: 'missing_fx_rate',
+    connector: 'woocommerce',
+    externalOrderId: String(wcOrder.id),
+    externalOrderNumber: wcOrder.number,
+    currency: error.currency,
+    asOf: error.asOf?.toISOString() ?? null,
+    order: wcOrder,
+  }
+  const jsonPayload = JSON.parse(JSON.stringify(payload)) as Prisma.InputJsonValue
+  const data = {
+    connector: 'woocommerce',
+    direction: 'FROM_CONNECTOR' as const,
+    status: 'PENDING' as const,
+    entityType: 'SalesOrder',
+    externalId: String(wcOrder.id),
+    payload: jsonPayload,
+    errorMessage: error.message,
+    syncedAt: null,
+  }
+
+  if (retryLogId) {
+    await db.shoppingSyncLog.update({
+      where: { id: retryLogId },
+      data,
+    })
+  } else {
+    const existing = await db.shoppingSyncLog.findFirst({
+      where: {
+        connector: 'woocommerce',
+        direction: 'FROM_CONNECTOR',
+        status: 'PENDING',
+        entityType: 'SalesOrder',
+        externalId: String(wcOrder.id),
+        errorMessage: { startsWith: 'Missing GBP FX rate' },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { id: true },
+    })
+    if (existing) {
+      await db.shoppingSyncLog.update({ where: { id: existing.id }, data })
+    } else {
+      await db.shoppingSyncLog.create({ data })
+    }
+  }
+
+  await logActivity({
+    entityType: 'SYNC',
+    action: 'wc_order_fx_pending',
+    tag: 'sync',
+    level: 'WARNING',
+    description: `WooCommerce order #${wcOrder.number} is waiting for a ${error.currency} FX rate before import`,
+    metadata: {
+      connector: 'woocommerce',
+      externalOrderId: String(wcOrder.id),
+      externalOrderNumber: wcOrder.number,
+      currency: error.currency,
+      asOf: error.asOf?.toISOString() ?? null,
+    },
+    resolveUser: false,
+  })
+
+  const depth = await db.shoppingSyncLog.count({
+    where: {
+      connector: 'woocommerce',
+      direction: 'FROM_CONNECTOR',
+      status: 'PENDING',
+      entityType: 'SalesOrder',
+      errorMessage: { startsWith: 'Missing GBP FX rate' },
+    },
+  })
+  const threshold = getPendingFxNotifyThreshold()
+  if (depth >= threshold) {
+    await notifyActiveAdmins({
+      type: 'warning',
+      title: 'WooCommerce orders waiting for FX rates',
+      message: `${depth} WooCommerce order imports are pending because IMS has no matching FX rate. The queue retries after the next FX-rate fetch.`,
+      actionUrl: '/sync',
+    })
+  }
+}
+
+async function markPendingFxRetryLogSynced(logId: string, orderId: string): Promise<void> {
+  await db.shoppingSyncLog.update({
+    where: { id: logId },
+    data: {
+      status: 'SYNCED',
+      entityId: orderId,
+      errorMessage: null,
+      syncedAt: new Date(),
+    },
+  })
+}
+
+async function markPendingFxRetryLogFailed(logId: string, error: unknown): Promise<void> {
+  await db.shoppingSyncLog.update({
+    where: { id: logId },
+    data: {
+      status: 'FAILED',
+      errorMessage: String(error),
+      syncedAt: new Date(),
+    },
+  })
 }
 
 export async function isWcOrderWebhookPrimaryActive(): Promise<boolean> {
@@ -103,6 +232,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     })
     if (existing) {
       await updateExistingWcOrderFromPayload(existing.id, wcOrder)
+      if (options.pendingFxRetryLogId) await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, existing.id)
       return { success: true, orderId: existing.id }
     }
 
@@ -399,6 +529,7 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
       })
       if (concurrent) {
         await updateExistingWcOrderFromPayload(concurrent.id, wcOrder)
+        if (options.pendingFxRetryLogId) await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, concurrent.id)
         return { success: true, orderId: concurrent.id }
       }
       throw error
@@ -437,16 +568,28 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     const shouldInvoice = imsStatus === 'PROCESSING' && !options.skipAccounting
     if (!shouldInvoice) {
       // Log sync but skip accounting
-      await db.shoppingSyncLog.create({
-        data: {
-          direction: 'FROM_CONNECTOR',
-          entityType: 'ORDER',
-          entityId: so.id,
-          externalId: String(wcOrder.id),
-          status: 'SYNCED',
-          errorMessage: `Imported as ${imsStatus}${options.skipAccounting ? ' (initial import)' : ''} — skipped accounting sync`,
-        },
-      })
+      if (options.pendingFxRetryLogId) {
+        await db.shoppingSyncLog.update({
+          where: { id: options.pendingFxRetryLogId },
+          data: {
+            entityId: so.id,
+            status: 'SYNCED',
+            errorMessage: `Imported as ${imsStatus}${options.skipAccounting ? ' (initial import)' : ''} — skipped accounting sync`,
+            syncedAt: new Date(),
+          },
+        })
+      } else {
+        await db.shoppingSyncLog.create({
+          data: {
+            direction: 'FROM_CONNECTOR',
+            entityType: 'ORDER',
+            entityId: so.id,
+            externalId: String(wcOrder.id),
+            status: 'SYNCED',
+            errorMessage: `Imported as ${imsStatus}${options.skipAccounting ? ' (initial import)' : ''} — skipped accounting sync`,
+          },
+        })
+      }
       return { success: true, orderId: so.id }
     }
     try {
@@ -517,16 +660,20 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
     }
 
     // Log sync
-    await db.shoppingSyncLog.create({
-      data: {
-        direction: 'FROM_CONNECTOR',
-        status: 'SYNCED',
-        entityType: 'SalesOrder',
-        entityId: so.id,
-        externalId: String(wcOrder.id),
-        syncedAt: new Date(),
-      },
-    })
+    if (options.pendingFxRetryLogId) {
+      await markPendingFxRetryLogSynced(options.pendingFxRetryLogId, so.id)
+    } else {
+      await db.shoppingSyncLog.create({
+        data: {
+          direction: 'FROM_CONNECTOR',
+          status: 'SYNCED',
+          entityType: 'SalesOrder',
+          entityId: so.id,
+          externalId: String(wcOrder.id),
+          syncedAt: new Date(),
+        },
+      })
+    }
 
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -541,18 +688,81 @@ export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrder
 
     return { success: true, orderId: so.id }
   } catch (e) {
-    await db.shoppingSyncLog.create({
-      data: {
-        direction: 'FROM_CONNECTOR',
-        status: 'FAILED',
-        entityType: 'SalesOrder',
-        externalId: String(wcOrder.id),
-        errorMessage: String(e),
-        syncedAt: new Date(),
-      },
-    })
+    if (isMissingFxRateError(e)) {
+      await recordPendingFxOrder(wcOrder, {
+        message: e.message,
+        currency: e.currency,
+        asOf: e.asOf,
+      }, options.pendingFxRetryLogId)
+      return { success: false, error: `${e.message}; queued for retry after the next FX-rate refresh` }
+    }
+    if (options.pendingFxRetryLogId) {
+      await markPendingFxRetryLogFailed(options.pendingFxRetryLogId, e)
+    } else {
+      await db.shoppingSyncLog.create({
+        data: {
+          direction: 'FROM_CONNECTOR',
+          status: 'FAILED',
+          entityType: 'SalesOrder',
+          externalId: String(wcOrder.id),
+          errorMessage: String(e),
+          syncedAt: new Date(),
+        },
+      })
+    }
     return { success: false, error: String(e) }
   }
+}
+
+function isQueuedWcOrderPayload(payload: unknown): payload is { reason: 'missing_fx_rate'; order: WcFullOrder } {
+  return typeof payload === 'object'
+    && payload !== null
+    && (payload as { reason?: unknown }).reason === 'missing_fx_rate'
+    && typeof (payload as { order?: { id?: unknown } }).order?.id === 'number'
+}
+
+export async function retryPendingWcOrdersWaitingForFx(limit = 50): Promise<{ attempted: number; imported: number; stillPending: number; failed: number }> {
+  const rows = await db.shoppingSyncLog.findMany({
+    where: {
+      connector: 'woocommerce',
+      direction: 'FROM_CONNECTOR',
+      status: 'PENDING',
+      entityType: 'SalesOrder',
+      errorMessage: { startsWith: 'Missing GBP FX rate' },
+    },
+    orderBy: { createdAt: 'asc' },
+    take: Math.min(Math.max(limit, 1), 250),
+    select: { id: true, payload: true },
+  })
+
+  const result = { attempted: rows.length, imported: 0, stillPending: 0, failed: 0 }
+  for (const row of rows) {
+    if (!isQueuedWcOrderPayload(row.payload)) {
+      await markPendingFxRetryLogFailed(row.id, 'Pending FX queue payload is missing the WooCommerce order snapshot')
+      result.failed++
+      continue
+    }
+    const importResult = await importWcOrder(row.payload.order, { pendingFxRetryLogId: row.id })
+    if (importResult.success) {
+      result.imported++
+    } else if (importResult.error?.includes('queued for retry after the next FX-rate refresh')) {
+      result.stillPending++
+    } else {
+      result.failed++
+    }
+  }
+  if (result.attempted > 0) {
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_order_fx_pending_retry',
+      tag: 'sync',
+      level: result.failed > 0 ? 'WARNING' : 'INFO',
+      description: `Retried ${result.attempted} WooCommerce order(s) waiting for FX rates: ${result.imported} imported, ${result.stillPending} still pending, ${result.failed} failed`,
+      metadata: result,
+      resolveUser: false,
+    })
+  }
+  return result
 }
 
 // ---------------------------------------------------------------------------

@@ -307,6 +307,12 @@ function FxHealthCard({ health }: { health: FxHealth }) {
           warning={health.fetchStale ? 'Stale — fetch hasn\'t run in over 36h. Check the cron schedule.' : null}
         />
         <HealthRow
+          ok={health.lastFetchAttemptStatus !== 'failed'}
+          label="Last fetch attempt"
+          value={formatFetchAttempt(health)}
+          warning={formatFetchAttemptWarning(health)}
+        />
+        <HealthRow
           ok={health.wcPushEnabled ? !health.wcPushStale : true}
           label="Last WooCommerce push"
           value={
@@ -346,6 +352,24 @@ function FxHealthCard({ health }: { health: FxHealth }) {
       </div>
     </div>
   )
+}
+
+function formatFetchAttempt(health: FxHealth): string {
+  const status = health.lastFetchAttemptStatus ?? 'unknown'
+  const when = health.lastFetchAttemptAt ? `${new Date(health.lastFetchAttemptAt).toLocaleString('en-GB')} ` : ''
+  const retrySuffix = health.lastFetchRetryCount > 0 ? ` (${health.lastFetchRetryCount} attempt${health.lastFetchRetryCount === 1 ? '' : 's'})` : ''
+  return `${when}${status.replaceAll('_', ' ')}${retrySuffix}`.trim()
+}
+
+function formatFetchAttemptWarning(health: FxHealth): string | null {
+  if (health.lastFetchAttemptStatus === 'failed') {
+    const failed = health.failedCurrencies.length ? ` Affected: ${health.failedCurrencies.join(', ')}.` : ''
+    return `${health.lastFetchError ?? 'FX fetch failed.'}${failed}`
+  }
+  if (health.lastFetchAttemptStatus === 'skipped_manual_override' && health.skippedManualOverrideCurrencies.length) {
+    return `Skipped because these currencies are manually pinned: ${health.skippedManualOverrideCurrencies.join(', ')}.`
+  }
+  return null
 }
 
 function HealthRow({ ok, label, value, warning }: { ok: boolean; label: string; value: string; warning: string | null }) {

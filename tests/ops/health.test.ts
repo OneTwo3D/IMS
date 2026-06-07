@@ -193,6 +193,12 @@ test('FX health uses last successful fetch timestamp instead of FX rate rows', (
       details: {
         ageMs: 21600000,
         staleAfterMs: 129600000,
+        lastAttemptAt: null,
+        lastAttemptStatus: null,
+        retryCount: 0,
+        failedCurrencies: [],
+        skippedManualOverrideCurrencies: [],
+        error: null,
       },
     },
   )
@@ -207,6 +213,50 @@ test('FX health warns when the last successful fetch timestamp is stale or missi
   assert.equal(stale.message, 'Latest FX fetch is stale')
   assert.equal(missing.status, 'warning')
   assert.equal(missing.message, 'No FX rate fetch timestamp found')
+})
+
+test('FX health reports latest failed fetch attempt with retry metadata', () => {
+  const health = buildFxSyncHealthFromLastFetched('2026-04-28T06:00:00.000Z', FIXED_DATE, {
+    lastAttemptAt: '2026-04-28T11:58:00.000Z',
+    lastAttemptStatus: 'failed',
+    retryCount: 3,
+    failedCurrencies: ['EUR', 'USD'],
+    error: 'API returned no response',
+  })
+
+  assert.equal(health.status, 'warning')
+  assert.equal(health.lastRunAt, '2026-04-28T11:58:00.000Z')
+  assert.equal(health.lastStatus, 'failed')
+  assert.equal(health.message, 'Latest FX fetch failed: API returned no response')
+  assert.deepEqual(health.details, {
+    lastAttemptAt: '2026-04-28T11:58:00.000Z',
+    lastAttemptStatus: 'failed',
+    retryCount: 3,
+    failedCurrencies: ['EUR', 'USD'],
+    skippedManualOverrideCurrencies: [],
+    error: 'API returned no response',
+  })
+})
+
+test('FX health treats manual-override skip separately from failed fetches', () => {
+  const health = buildFxSyncHealthFromLastFetched('2026-04-26T00:00:00.000Z', FIXED_DATE, {
+    lastAttemptAt: '2026-04-28T11:58:00.000Z',
+    lastAttemptStatus: 'skipped_manual_override',
+    retryCount: 0,
+    skippedManualOverrideCurrencies: ['EUR'],
+  })
+
+  assert.equal(health.status, 'ok')
+  assert.equal(health.lastStatus, 'skipped_manual_override')
+  assert.equal(health.reference, 'manual override')
+  assert.deepEqual(health.details, {
+    lastAttemptAt: '2026-04-28T11:58:00.000Z',
+    lastAttemptStatus: 'skipped_manual_override',
+    retryCount: 0,
+    failedCurrencies: [],
+    skippedManualOverrideCurrencies: ['EUR'],
+    error: null,
+  })
 })
 
 test('operational health builders summarize outbox webhook accounting and cron risk', () => {

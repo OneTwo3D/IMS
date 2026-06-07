@@ -5,6 +5,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireAuth, requirePermission } from '@/lib/auth/server'
 import { getBaseCurrencyCode, getFallbackCurrencyMeta } from '@/lib/base-currency'
+import { notify } from '@/lib/notifications'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -175,7 +176,15 @@ async function fetchSingleFxRate(code: string): Promise<number | null> {
 }
 
 /** Core FX rate fetching logic (no auth — used by cron and the server action) */
-export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; updated: string[]; failed: string[]; error?: string }> {
+export async function fetchAllFxRatesInternal(): Promise<{
+  success: boolean
+  updated: string[]
+  failed: string[]
+  error?: string
+  retryCount?: number
+  skippedManualOverrides?: string[]
+  pendingWcOrderRetry?: { attempted: number; imported: number; stillPending: number; failed: number } | null
+}> {
   try {
     const baseCurrency = await getBaseCurrencyCode()
     const currencies = await db.currency.findMany({
@@ -194,18 +203,25 @@ export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; upd
     const codes = allCodes.filter((c) => !overrideCodes.has(c))
 
     if (!codes.length) {
+      await recordFxFetchAttempt({
+        status: 'skipped_manual_override',
+        retryCount: 0,
+        skippedManualOverrides: allCodes,
+      })
       await logActivity({
         entityType: 'SYNC',
         tag: 'sync',
         action: 'fx_rates_fetched',
         description: `FX fetch skipped — all ${allCodes.length} currencies have manual overrides`,
       })
-      return { success: true, updated: [], failed: [] }
+      return { success: true, updated: [], failed: [], retryCount: 0, skippedManualOverrides: allCodes }
     }
     const symbols = encodeURIComponent(codes.join(','))
 
     let res: Response | null = null
+    let retryCount = 0
     for (let attempt = 1; attempt <= 3; attempt++) {
+      retryCount = attempt
       res = await fetch(`https://api.frankfurter.dev/v1/latest?base=${encodeURIComponent(baseCurrency)}&symbols=${symbols}`, {
         signal: AbortSignal.timeout(15000),
       }).catch(() => null)
@@ -214,15 +230,28 @@ export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; upd
     }
 
     if (!res?.ok) {
+      const error = `API returned ${res?.status ?? 'no response'}`
+      await recordFxFetchAttempt({
+        status: 'failed',
+        retryCount,
+        failed: codes,
+        error,
+      })
       await logActivity({
         entityType: 'SYNC',
         tag: 'sync',
         action: 'fx_rates_fetched',
-        level: 'WARNING',
+        level: 'ERROR',
         description: `FX rate refresh failed; existing rates remain in use for ${codes.length} currencies`,
-        metadata: { failed: codes, status: res?.status ?? null },
+        metadata: { failed: codes, status: res?.status ?? null, retryCount },
       })
-      return { success: false, updated: [], failed: codes, error: `API returned ${res?.status ?? 'no response'}` }
+      await notifyActiveAdmins({
+        type: 'error',
+        title: 'FX rate refresh failed',
+        message: `Frankfurter FX refresh failed after ${retryCount} attempts. Existing rates remain in use for ${codes.join(', ')}.`,
+        actionUrl: '/settings/accounting?tab=fx-rates',
+      })
+      return { success: false, updated: [], failed: codes, error, retryCount }
     }
 
     const data = await res.json()
@@ -242,6 +271,13 @@ export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; upd
       }
     }
 
+    await recordFxFetchAttempt({
+      status: failed.length ? 'partial' : 'success',
+      retryCount,
+      failed,
+      skippedManualOverrides: Array.from(overrideCodes),
+    })
+
     // Record last fetched timestamp
     await db.setting.upsert({
       where: { key: 'fx_last_fetched' },
@@ -249,6 +285,22 @@ export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; upd
       update: { value: new Date().toISOString() },
     })
     await logActivity({ entityType: 'SYNC', tag: 'sync', action: 'fx_rates_fetched', description: `Fetched FX rates for ${updated.length} currencies` })
+
+    let pendingWcOrderRetry: { attempted: number; imported: number; stillPending: number; failed: number } | null = null
+    if (updated.length > 0) {
+      try {
+        const { retryPendingWcOrdersWaitingForFx } = await import('@/lib/connectors/woocommerce/sync/order-import')
+        pendingWcOrderRetry = await retryPendingWcOrdersWaitingForFx()
+      } catch (e) {
+        await logActivity({
+          entityType: 'SYNC',
+          tag: 'sync',
+          action: 'wc_order_fx_pending_retry',
+          level: 'WARNING',
+          description: `Failed to retry WooCommerce orders waiting for FX rates: ${String(e).slice(0, 240)}`,
+        })
+      }
+    }
 
     // Fan out the new rates to enabled shopping connectors so the storefront,
     // IMS and the accounting platform all use the same rate. Failure here must
@@ -302,10 +354,22 @@ export async function fetchAllFxRatesInternal(): Promise<{ success: boolean; upd
 
     revalidatePath('/settings', 'layout')
     revalidatePath('/purchase-orders')
-    return { success: true, updated, failed }
+    return { success: true, updated, failed, retryCount, skippedManualOverrides: Array.from(overrideCodes), pendingWcOrderRetry }
   } catch (e) {
-    await logActivity({ entityType: 'SYNC', tag: 'sync', action: 'fx_rates_fetched', level: 'ERROR', description: `Failed to fetch FX rates: ${String(e)}` })
-    return { success: false, updated: [], failed: [], error: String(e) }
+    const error = String(e)
+    await recordFxFetchAttempt({
+      status: 'failed',
+      retryCount: 0,
+      error,
+    })
+    await logActivity({ entityType: 'SYNC', tag: 'sync', action: 'fx_rates_fetched', level: 'ERROR', description: `Failed to fetch FX rates: ${error}` })
+    await notifyActiveAdmins({
+      type: 'error',
+      title: 'FX rate refresh failed',
+      message: `FX refresh failed before contacting Frankfurter: ${error.slice(0, 200)}`,
+      actionUrl: '/settings/accounting?tab=fx-rates',
+    })
+    return { success: false, updated: [], failed: [], error, retryCount: 0 }
   }
 }
 
@@ -335,6 +399,42 @@ async function getActiveOverrideCurrencies(codes: string[]): Promise<Set<string>
     ORDER BY "toCurrency", "fetchedAt" DESC
   `
   return new Set(rows.filter((r) => r.manualOverride).map((r) => r.toCurrency))
+}
+
+type FxFetchAttemptStatus = 'success' | 'partial' | 'failed' | 'skipped_manual_override'
+
+async function setSetting(key: string, value: string): Promise<void> {
+  await db.setting.upsert({
+    where: { key },
+    create: { key, value },
+    update: { value },
+  })
+}
+
+async function recordFxFetchAttempt(input: {
+  status: FxFetchAttemptStatus
+  retryCount: number
+  failed?: string[]
+  skippedManualOverrides?: string[]
+  error?: string
+}): Promise<void> {
+  const now = new Date().toISOString()
+  await Promise.all([
+    setSetting('fx_last_fetch_attempt_at', now),
+    setSetting('fx_last_fetch_attempt_status', input.status),
+    setSetting('fx_last_fetch_retry_count', String(input.retryCount)),
+    setSetting('fx_last_fetch_failed_currencies', (input.failed ?? []).join(',')),
+    setSetting('fx_last_fetch_skipped_manual_overrides', (input.skippedManualOverrides ?? []).join(',')),
+    setSetting('fx_last_fetch_error', input.error ?? ''),
+  ])
+}
+
+async function notifyActiveAdmins(params: Omit<Parameters<typeof notify>[0], 'userId'>): Promise<void> {
+  const admins = await db.user.findMany({
+    where: { role: 'ADMIN', active: true },
+    select: { id: true },
+  })
+  await Promise.all(admins.map((admin) => notify({ ...params, userId: admin.id })))
 }
 
 export type FxRateRow = {
@@ -457,6 +557,12 @@ export type FxHealth = {
   lastFetchedAt: string | null
   lastFetchAgeMs: number | null
   fetchStale: boolean
+  lastFetchAttemptAt: string | null
+  lastFetchAttemptStatus: string | null
+  lastFetchRetryCount: number
+  lastFetchError: string | null
+  failedCurrencies: string[]
+  skippedManualOverrideCurrencies: string[]
   wcPushEnabled: boolean
   lastWcPushAt: string | null
   lastWcPushAgeMs: number | null
@@ -473,8 +579,25 @@ export async function getFxHealth(): Promise<FxHealth> {
   await requireAuth()
   const baseCurrency = await getBaseCurrencyCode()
 
-  const [lastFetchedSetting, wcEnabledSetting, lastPushSetting, overrideRows] = await Promise.all([
+  const [
+    lastFetchedSetting,
+    lastAttemptAtSetting,
+    lastAttemptStatusSetting,
+    lastAttemptRetrySetting,
+    lastAttemptErrorSetting,
+    failedCurrenciesSetting,
+    skippedManualOverridesSetting,
+    wcEnabledSetting,
+    lastPushSetting,
+    overrideRows,
+  ] = await Promise.all([
     db.setting.findUnique({ where: { key: 'fx_last_fetched' }, select: { value: true } }),
+    db.setting.findUnique({ where: { key: 'fx_last_fetch_attempt_at' }, select: { value: true } }),
+    db.setting.findUnique({ where: { key: 'fx_last_fetch_attempt_status' }, select: { value: true } }),
+    db.setting.findUnique({ where: { key: 'fx_last_fetch_retry_count' }, select: { value: true } }),
+    db.setting.findUnique({ where: { key: 'fx_last_fetch_error' }, select: { value: true } }),
+    db.setting.findUnique({ where: { key: 'fx_last_fetch_failed_currencies' }, select: { value: true } }),
+    db.setting.findUnique({ where: { key: 'fx_last_fetch_skipped_manual_overrides' }, select: { value: true } }),
     db.setting.findUnique({ where: { key: 'wc_fx_push_enabled' }, select: { value: true } }),
     db.setting.findUnique({ where: { key: 'last_wc_fx_push_at' }, select: { value: true } }),
     db.$queryRaw<Array<{ count: number }>>`
@@ -499,6 +622,12 @@ export async function getFxHealth(): Promise<FxHealth> {
     lastFetchedAt,
     lastFetchAgeMs,
     fetchStale: lastFetchAgeMs == null || lastFetchAgeMs > FX_STALE_THRESHOLD_MS,
+    lastFetchAttemptAt: lastAttemptAtSetting?.value ?? null,
+    lastFetchAttemptStatus: lastAttemptStatusSetting?.value ?? null,
+    lastFetchRetryCount: Number(lastAttemptRetrySetting?.value ?? 0) || 0,
+    lastFetchError: lastAttemptErrorSetting?.value || null,
+    failedCurrencies: splitSettingList(failedCurrenciesSetting?.value),
+    skippedManualOverrideCurrencies: splitSettingList(skippedManualOverridesSetting?.value),
     wcPushEnabled,
     lastWcPushAt,
     lastWcPushAgeMs,
@@ -506,6 +635,10 @@ export async function getFxHealth(): Promise<FxHealth> {
     wcPushStale: wcPushEnabled && (lastWcPushAgeMs == null || lastWcPushAgeMs > FX_STALE_THRESHOLD_MS),
     manualOverrideCount: Number(overrideRows[0]?.count ?? 0),
   }
+}
+
+function splitSettingList(value: string | null | undefined): string[] {
+  return (value ?? '').split(',').map((item) => item.trim()).filter(Boolean)
 }
 
 export async function getFxPushLog(limit = 20): Promise<FxPushLogRow[]> {

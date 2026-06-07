@@ -444,10 +444,53 @@ function summarizeHealthError(error: unknown): string {
   return message.slice(0, 200)
 }
 
+export type FxSyncAttemptHealthInput = {
+  lastAttemptAt?: string | null
+  lastAttemptStatus?: string | null
+  retryCount?: number | null
+  failedCurrencies?: string[] | null
+  skippedManualOverrideCurrencies?: string[] | null
+  error?: string | null
+}
+
 export function buildFxSyncHealthFromLastFetched(
   lastFetchedAt: string | null | undefined,
   now: Date = new Date(),
+  attempt: FxSyncAttemptHealthInput = {},
 ): LatestOperationHealthCheck {
+  const attemptDetails = {
+    lastAttemptAt: attempt.lastAttemptAt ?? null,
+    lastAttemptStatus: attempt.lastAttemptStatus ?? null,
+    retryCount: attempt.retryCount ?? 0,
+    failedCurrencies: attempt.failedCurrencies ?? [],
+    skippedManualOverrideCurrencies: attempt.skippedManualOverrideCurrencies ?? [],
+    error: attempt.error ?? null,
+  }
+
+  if (attempt.lastAttemptStatus === 'failed') {
+    return {
+      status: 'warning',
+      checkedAt: checkedAtFrom(now),
+      message: attempt.error ? `Latest FX fetch failed: ${attempt.error}` : 'Latest FX fetch failed',
+      lastRunAt: attempt.lastAttemptAt ?? null,
+      lastStatus: 'failed',
+      reference: 'frankfurter',
+      details: attemptDetails,
+    }
+  }
+
+  if (attempt.lastAttemptStatus === 'skipped_manual_override') {
+    return {
+      status: 'ok',
+      checkedAt: checkedAtFrom(now),
+      message: undefined,
+      lastRunAt: attempt.lastAttemptAt ?? null,
+      lastStatus: 'skipped_manual_override',
+      reference: 'manual override',
+      details: attemptDetails,
+    }
+  }
+
   if (!lastFetchedAt) {
     return {
       status: 'warning',
@@ -456,6 +499,7 @@ export function buildFxSyncHealthFromLastFetched(
       lastRunAt: null,
       lastStatus: null,
       reference: null,
+      details: attemptDetails,
     }
   }
 
@@ -468,6 +512,7 @@ export function buildFxSyncHealthFromLastFetched(
       lastRunAt: null,
       lastStatus: null,
       reference: null,
+      details: attemptDetails,
     }
   }
 
@@ -484,6 +529,7 @@ export function buildFxSyncHealthFromLastFetched(
     details: {
       ageMs,
       staleAfterMs: FX_SYNC_STALE_AFTER_MS,
+      ...attemptDetails,
     },
   }
 }
@@ -893,16 +939,40 @@ async function getLatestWooCommerceSync(now: Date = new Date()): Promise<LatestO
 async function getLatestFxSync(now: Date = new Date()): Promise<LatestOperationHealthCheck> {
   try {
     const { db } = await import('@/lib/db')
-    const latestFetch = await db.setting.findUnique({
-      where: { key: 'fx_last_fetched' },
-      select: { value: true },
-    })
+    const [
+      latestFetch,
+      lastAttemptAt,
+      lastAttemptStatus,
+      retryCount,
+      failedCurrencies,
+      skippedManualOverrides,
+      lastError,
+    ] = await Promise.all([
+      db.setting.findUnique({ where: { key: 'fx_last_fetched' }, select: { value: true } }),
+      db.setting.findUnique({ where: { key: 'fx_last_fetch_attempt_at' }, select: { value: true } }),
+      db.setting.findUnique({ where: { key: 'fx_last_fetch_attempt_status' }, select: { value: true } }),
+      db.setting.findUnique({ where: { key: 'fx_last_fetch_retry_count' }, select: { value: true } }),
+      db.setting.findUnique({ where: { key: 'fx_last_fetch_failed_currencies' }, select: { value: true } }),
+      db.setting.findUnique({ where: { key: 'fx_last_fetch_skipped_manual_overrides' }, select: { value: true } }),
+      db.setting.findUnique({ where: { key: 'fx_last_fetch_error' }, select: { value: true } }),
+    ])
 
-    return buildFxSyncHealthFromLastFetched(latestFetch?.value, now)
+    return buildFxSyncHealthFromLastFetched(latestFetch?.value, now, {
+      lastAttemptAt: lastAttemptAt?.value ?? null,
+      lastAttemptStatus: lastAttemptStatus?.value ?? null,
+      retryCount: Number(retryCount?.value ?? 0) || 0,
+      failedCurrencies: splitCsvSetting(failedCurrencies?.value),
+      skippedManualOverrideCurrencies: splitCsvSetting(skippedManualOverrides?.value),
+      error: lastError?.value || null,
+    })
   } catch (error) {
     console.error('Admin health FX sync check failed', error)
     return errorLatest('FX sync check failed', now)
   }
+}
+
+function splitCsvSetting(value: string | null | undefined): string[] {
+  return (value ?? '').split(',').map((item) => item.trim()).filter(Boolean)
 }
 
 async function getIntegrationOutboxHealth(now: Date = new Date()): Promise<HealthCheck> {
