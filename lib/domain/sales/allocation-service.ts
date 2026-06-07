@@ -14,7 +14,11 @@ import {
   type FulfillmentGraphNode,
 } from '@/lib/products/kit-fulfillment'
 import { buildBackorderReport, type BackorderReportLine } from '@/lib/domain/inventory/backorder-report'
-import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
+import {
+  validateManualSalesOrderStatusTransition,
+  validateSalesOrderStatusTransition,
+} from '@/lib/domain/workflows/action-guards'
+import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export const ALLOCATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -228,6 +232,39 @@ export async function resetAllocationAccountingIfStaged(
   })
 }
 
+export async function updateSalesOrderStatusUnderLock(
+  tx: Prisma.TransactionClient,
+  input: {
+    orderId: string
+    targetStatus: SalesOrderStatus
+    data?: Prisma.SalesOrderUpdateInput
+    bypass?: boolean
+    beforeUpdate?: (context: {
+      tx: Prisma.TransactionClient
+      previousStatus: string
+    }) => Promise<void>
+  },
+): Promise<{ previousStatus: string }> {
+  await lockSalesOrder(tx, input.orderId)
+  const lockedOrder = await tx.salesOrder.findUnique({
+    where: { id: input.orderId },
+    select: { status: true },
+  })
+  if (!lockedOrder) throw new Error('Order not found')
+
+  const transition = validateManualSalesOrderStatusTransition(lockedOrder.status, input.targetStatus, {
+    bypass: input.bypass,
+  })
+  if (!transition.success) throw new Error(transition.error)
+
+  await input.beforeUpdate?.({ tx, previousStatus: lockedOrder.status })
+  await tx.salesOrder.update({
+    where: { id: input.orderId },
+    data: { ...(input.data ?? {}), status: input.targetStatus },
+  })
+  return { previousStatus: lockedOrder.status }
+}
+
 export async function applyAllocationReservationDelta(
   tx: Prisma.TransactionClient,
   rows: Array<{ productId: string; warehouseId: string; qty: DecimalInput }>,
@@ -292,7 +329,15 @@ export function assertReservationReleaseDelta(
     if (beforeQty == null || afterQty == null) {
       throw new Error(`Reservation release invariant failed for ${key}: stock level missing`)
     }
+    if (beforeQty.lt(releasedQty)) {
+      throw new Error(
+        `Cannot cancel order because reservedQty drifted below allocation for ${key}: reservedQty ${beforeQty.toString()}, allocationQty ${releasedQty.toString()}`,
+      )
+    }
     const expectedAfter = beforeQty.sub(releasedQty)
+    if (afterQty.lt(0)) {
+      throw new Error(`Reservation release invariant failed for ${key}: reservedQty cannot be negative`)
+    }
     if (afterQty.sub(expectedAfter).abs().gt(ALLOCATION_EPSILON_DECIMAL)) {
       throw new Error(
         `Reservation release invariant failed for ${key}: expected reservedQty ${expectedAfter.toString()}, got ${afterQty.toString()}`,
@@ -306,6 +351,7 @@ export async function cancelSalesOrderFulfillmentState(
   input: {
     orderId: string
     data?: Prisma.SalesOrderUpdateInput
+    bypass?: boolean
   },
 ): Promise<{
   previousStatus: string
@@ -323,7 +369,9 @@ export async function cancelSalesOrderFulfillmentState(
     throw new Error('Cannot cancel a shipped order — process a refund instead')
   }
 
-  const transition = validateSalesOrderStatusTransition(lockedOrder.status, 'CANCELLED')
+  const transition = validateManualSalesOrderStatusTransition(lockedOrder.status, 'CANCELLED', {
+    bypass: input.bypass,
+  })
   if (!transition.success) throw new Error(transition.error)
 
   await resetAllocationAccountingIfStaged(tx, input.orderId)
@@ -344,6 +392,9 @@ export async function cancelSalesOrderFulfillmentState(
     })
     : []
 
+  // Keep the before/after reads bracketing the release: the extra locked-row
+  // read is small, and it verifies the actual database delta rather than only
+  // trusting the requested decrement shape.
   await applyAllocationReservationDelta(tx, currentAllocs, 'release')
   await tx.orderAllocation.deleteMany({ where: { orderId: input.orderId } })
 

@@ -208,13 +208,13 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Status:** Complete.
 - **File:** `app/actions/sales.ts:1117–1121`
 - **Fix:** The `PICKING` allocation-count guard now runs inside the same transaction and sales-order row lock as the status update.
-- **Tests:** Covered by the transaction-guard path in `applySalesOrderStatusTransition`; focused action coverage is expected to exercise the direct server-action path.
+- **Tests:** `tests/domain/sales/allocation-service.test.ts` covers the locked transition helper refusing `PICKING` when allocations disappear before the locked update.
 
 ### P3.2 — Reservation drift on cancel
 - **Status:** Complete.
 - **File:** `app/actions/sales.ts:1149–1151`, `lib/domain/sales/allocation-service.ts:618–626`
 - **Fix:** Cancellation now uses `cancelSalesOrderFulfillmentState()` to release allocations, delete non-shipped shipments, assert the exact per-scope reservation release delta, and set order status in one transaction. The assertion is delta-based because `StockLevel.reservedQty` is shared with other reservation sources such as manufacturing.
-- **Tests:** `tests/domain/sales/allocation-service.test.ts` covers exact release-delta validation and cancellation preserving unrelated reservations.
+- **Tests:** `tests/domain/sales/allocation-service.test.ts` covers exact release-delta validation, multi-scope cancellation deltas, cancellation preserving unrelated reservations, and drifted reservations that would otherwise go negative.
 
 ### P3.3 — Shipment over-quantity guard
 - **Status:** Complete.
@@ -243,7 +243,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Status:** Complete.
 - **File:** `app/actions/sales.ts:1153`
 - **Fix:** There is no `PICKED` shipment status in the current schema; cancellation deletes every non-shipped cancellable shipment status: `PENDING`, `PICKING`, and `PACKED`.
-- **Tests:** `tests/domain/sales/allocation-service.test.ts` covers cancellation deleting a `PICKING` shipment in the same transaction as allocation release and status update.
+- **Tests:** `tests/domain/sales/allocation-service.test.ts` covers cancellation deleting a `PICKING` shipment in the same transaction as allocation release and status update. `tests/domain/sales/shipment-service.test.ts` asserts `ShipmentStatus` has no `PICKED` value so a future schema addition reopens this item explicitly.
 
 ### P3.8 — Refund idempotency key omits warehouseId
 - **Status:** Complete.

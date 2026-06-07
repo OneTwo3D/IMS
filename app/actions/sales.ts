@@ -36,7 +36,7 @@ import {
 import { isExternalRefundIdUniqueConflict } from '@/lib/domain/sales/refund-idempotency'
 import {
   cancelSalesOrderFulfillmentState,
-  lockSalesOrder,
+  updateSalesOrderStatusUnderLock,
 } from '@/lib/domain/sales/allocation-service'
 import { Prisma, type ProductType, type TaxCategory } from '@/app/generated/prisma/client'
 
@@ -1190,16 +1190,9 @@ export async function applySalesOrderStatusTransition(
     let previousStatusForLog: string = so.status
 
     // On SHIPPED: orders must already have shipment rows, and all of them must
-    // be shipped through the shipment workflow.
+    // be shipped through the shipment workflow. The counts are checked again
+    // under the order lock before the status update below.
     if (targetStatus === 'SHIPPED') {
-      const shipmentCount = await db.shipment.count({ where: { orderId: id } })
-      if (shipmentCount === 0) {
-        return { success: false, error: 'Shipments are required before an order can be marked as shipped' }
-      }
-      const unshipped = await db.shipment.count({ where: { orderId: id, status: { not: 'SHIPPED' } } })
-      if (unshipped > 0) {
-        return { success: false, error: 'Ship individual shipments first — not all shipments are shipped yet' }
-      }
       data.shippedAt = new Date()
       if (extra?.trackingNumber) data.trackingNumber = extra.trackingNumber
     }
@@ -1209,7 +1202,7 @@ export async function applySalesOrderStatusTransition(
     // On CANCEL: release all allocations
     if (targetStatus === 'CANCELLED') {
       const cancellation = await db.$transaction(async (tx) => (
-        cancelSalesOrderFulfillmentState(tx, { orderId: id, data })
+        cancelSalesOrderFulfillmentState(tx, { orderId: id, data, bypass: bypassPermission })
       ), STOCK_TX_OPTIONS)
       previousStatusForLog = cancellation.previousStatus
       if (cancellation.deletedShipmentCount > 0) {
@@ -1235,31 +1228,36 @@ export async function applySalesOrderStatusTransition(
       await refreshDraftOrderFxAtFinalization(id, new Date())
     }
 
-    if (!orderUpdated && targetStatus === 'PICKING') {
+    if (!orderUpdated) {
       const transitionResult = await db.$transaction(async (tx) => {
-        await lockSalesOrder(tx, id)
-        const lockedOrder = await tx.salesOrder.findUnique({
-          where: { id },
-          select: { status: true },
-        })
-        if (!lockedOrder) throw new Error('Order not found')
-        const lockedTransition = validateManualSalesOrderStatusTransition(lockedOrder.status, targetStatus, {
+        return updateSalesOrderStatusUnderLock(tx, {
+          orderId: id,
+          targetStatus,
+          data,
           bypass: bypassPermission,
+          beforeUpdate: async ({ tx: lockedTx }) => {
+            if (targetStatus === 'PICKING') {
+              const allocCount = await lockedTx.orderAllocation.count({ where: { orderId: id } })
+              if (allocCount === 0) {
+                throw new Error('Cannot start picking — no products have been allocated. Allocate stock first.')
+              }
+              return
+            }
+            if (targetStatus === 'SHIPPED') {
+              const shipmentCount = await lockedTx.shipment.count({ where: { orderId: id } })
+              if (shipmentCount === 0) {
+                throw new Error('Shipments are required before an order can be marked as shipped')
+              }
+              const unshipped = await lockedTx.shipment.count({ where: { orderId: id, status: { not: 'SHIPPED' } } })
+              if (unshipped > 0) {
+                throw new Error('Ship individual shipments first — not all shipments are shipped yet')
+              }
+            }
+          },
         })
-        if (!lockedTransition.success) throw new Error(lockedTransition.error)
-        const allocCount = await tx.orderAllocation.count({ where: { orderId: id } })
-        if (allocCount === 0) {
-          throw new Error('Cannot start picking — no products have been allocated. Allocate stock first.')
-        }
-        await tx.salesOrder.update({ where: { id }, data })
-        return { previousStatus: lockedOrder.status }
       }, STOCK_TX_OPTIONS)
       previousStatusForLog = transitionResult.previousStatus
       orderUpdated = true
-    }
-
-    if (!orderUpdated) {
-      await db.salesOrder.update({ where: { id }, data })
     }
 
     // Draft finalisation: when a DRAFT is moved to any non-cancelled status,

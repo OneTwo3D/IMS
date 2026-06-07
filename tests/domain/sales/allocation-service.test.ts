@@ -7,6 +7,7 @@ import {
   buildAvailableStockMapIncludingOwnReservations,
   buildAvailableStockMap,
   cancelSalesOrderFulfillmentState,
+  updateSalesOrderStatusUnderLock,
   type AllocationServiceClient,
 } from '@/lib/domain/sales/allocation-service'
 import {
@@ -171,6 +172,9 @@ function createClient(state: MemoryState): AllocationServiceClient {
       findMany: async ({ where }: { where: { orderId: string } }) => allocations
         .filter((allocation) => allocation.orderId === where.orderId)
         .map((allocation) => ({ ...allocation })),
+      count: async ({ where }: { where: { orderId: string } }) => allocations
+        .filter((allocation) => allocation.orderId === where.orderId)
+        .length,
       deleteMany: async ({ where }: { where: { orderId: string } }) => {
         const before = allocations.length
         for (let index = allocations.length - 1; index >= 0; index -= 1) {
@@ -691,22 +695,34 @@ test('assertReservationReleaseDelta verifies exact per-scope reservation release
     ),
     /Reservation release invariant failed/,
   )
+
+  assert.throws(
+    () => assertReservationReleaseDelta(
+      [{ productId: 'product-1', warehouseId: 'warehouse-1', reservedQty: 1 }],
+      [{ productId: 'product-1', warehouseId: 'warehouse-1', reservedQty: -1 }],
+      [{ productId: 'product-1', warehouseId: 'warehouse-1', qty: 2 }],
+    ),
+    /reservedQty drifted below allocation/,
+  )
 })
 
-test('cancelSalesOrderFulfillmentState releases allocations, deletes active non-shipped shipments, and preserves unrelated reservations', async () => {
+test('cancelSalesOrderFulfillmentState aggregates multi-scope reservation release deltas', async () => {
   const state = baseState({
     order: {
       ...baseState().order,
       status: 'ALLOCATED',
     },
-    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 10, reservedQty: 5 }],
-    allocations: [{
-      orderId: 'order-1',
-      lineId: 'line-1',
-      productId: 'product-1',
-      warehouseId: 'warehouse-1',
-      qty: 2,
-    }],
+    stockLevels: [
+      { productId: 'product-a', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 7 },
+      { productId: 'product-b', warehouseId: 'warehouse-1', quantity: 20, reservedQty: 3 },
+      { productId: 'product-a', warehouseId: 'warehouse-2', quantity: 20, reservedQty: 2 },
+    ],
+    allocations: [
+      { orderId: 'order-1', lineId: 'line-1', productId: 'product-a', warehouseId: 'warehouse-1', qty: 2 },
+      { orderId: 'order-1', lineId: 'line-2', productId: 'product-a', warehouseId: 'warehouse-1', qty: 3 },
+      { orderId: 'order-1', lineId: 'line-3', productId: 'product-b', warehouseId: 'warehouse-1', qty: 3 },
+      { orderId: 'order-1', lineId: 'line-4', productId: 'product-a', warehouseId: 'warehouse-2', qty: 2 },
+    ],
     shipments: [{ id: 'shipment-1', orderId: 'order-1', status: 'PICKING', shipmentJournalDate: null }],
   })
   const client = createClient(state)
@@ -714,10 +730,40 @@ test('cancelSalesOrderFulfillmentState releases allocations, deletes active non-
   const result = await cancelSalesOrderFulfillmentState(client as never, { orderId: 'order-1' })
 
   assert.equal(result.previousStatus, 'ALLOCATED')
-  assert.equal(result.releasedAllocationCount, 1)
+  assert.equal(result.releasedAllocationCount, 4)
   assert.equal(result.deletedShipmentCount, 1)
   assert.equal(state.order.status, 'CANCELLED')
   assert.deepEqual(state.allocations, [])
   assert.deepEqual(state.shipments, [])
-  assert.equal(state.stockLevels[0].reservedQty, 3)
+  assert.deepEqual(state.stockLevels.map((row) => [row.productId, row.warehouseId, row.reservedQty]), [
+    ['product-a', 'warehouse-1', 2],
+    ['product-b', 'warehouse-1', 0],
+    ['product-a', 'warehouse-2', 0],
+  ])
+})
+
+test('updateSalesOrderStatusUnderLock refuses PICKING when allocations disappeared before locked update', async () => {
+  const state = baseState({
+    order: {
+      ...baseState().order,
+      status: 'ALLOCATED',
+    },
+    allocations: [],
+  })
+  const client = createClient(state)
+
+  await assert.rejects(
+    () => updateSalesOrderStatusUnderLock(client as never, {
+      orderId: 'order-1',
+      targetStatus: 'PICKING',
+      beforeUpdate: async ({ tx }) => {
+        const allocCount = await tx.orderAllocation.count({ where: { orderId: 'order-1' } })
+        if (allocCount === 0) {
+          throw new Error('Cannot start picking — no products have been allocated. Allocate stock first.')
+        }
+      },
+    }),
+    /Cannot start picking/,
+  )
+  assert.equal(state.order.status, 'ALLOCATED')
 })

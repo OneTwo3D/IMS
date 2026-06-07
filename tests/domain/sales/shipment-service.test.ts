@@ -8,6 +8,7 @@ import {
   transitionShipmentStatus,
   type ShipmentServiceClient,
 } from '@/lib/domain/sales/shipment-service'
+import { SHIPMENT_STATUSES } from '@/lib/domain/workflows/status-types'
 
 type Order = {
   id: string
@@ -354,6 +355,10 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
   }
   return client as unknown as ShipmentServiceClient
 }
+
+test('shipment workflow has no PICKED status', () => {
+  assert.equal(SHIPMENT_STATUSES.includes('PICKED' as never), false)
+})
 
 test('confirmSalesOrderShipments creates a full pending shipment from allocations', async () => {
   const state = baseState()

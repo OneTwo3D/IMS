@@ -123,6 +123,10 @@ async function validateActiveShipmentTotalsWithinOrder(
   client: ShipmentServiceClient,
   orderId: string,
 ): Promise<string | null> {
+  // Non-PENDING shipment lines are already committed to the order's fulfilment
+  // plan, so this check intentionally includes PICKING/PACKED rows as well as
+  // SHIPPED rows. That makes concurrent dispatches race-safe for total-qty
+  // validation: both transactions see the same active planned shipment set.
   const [orderLines, activeShipmentLines] = await Promise.all([
     client.salesOrderLine.findMany({
       where: { orderId },
