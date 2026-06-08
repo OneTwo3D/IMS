@@ -3,6 +3,14 @@ import { connectorFetch } from '@/lib/security/connector-fetch'
 import type { ConnectorCredentials } from '../types'
 import { validateWooCommerceBaseUrl } from './url-safety'
 
+export const WOOCOMMERCE_INTEGRATION_NOT_CONFIGURED_ERROR = 'WooCommerce integration is not configured.'
+
+function logWooCommerceConfigurationFailure(error: unknown): void {
+  console.warn('[woocommerce] integration configuration failed', {
+    error: error instanceof Error ? error.message : String(error),
+  })
+}
+
 async function readErrorDetails(res: Response): Promise<string> {
   const contentType = res.headers.get('content-type') ?? ''
   try {
@@ -50,13 +58,21 @@ export async function wcFetch(
   params: Record<string, string> = {},
   creds?: ConnectorCredentials | null,
 ): Promise<{ data: unknown; totalPages: number; totalItems: number; error?: string }> {
-  const credentials = creds ?? (await getWcCredentials())
+  let credentials: ConnectorCredentials | null
+  try {
+    credentials = creds ?? (await getWcCredentials())
+  } catch (error) {
+    logWooCommerceConfigurationFailure(error)
+    return { data: null, totalPages: 0, totalItems: 0, error: WOOCOMMERCE_INTEGRATION_NOT_CONFIGURED_ERROR }
+  }
   if (!credentials) {
-    return { data: null, totalPages: 0, totalItems: 0, error: 'WooCommerce not configured. Set wc_url, wc_consumer_key, wc_consumer_secret in Settings.' }
+    logWooCommerceConfigurationFailure('missing WooCommerce URL, consumer key, or consumer secret setting')
+    return { data: null, totalPages: 0, totalItems: 0, error: WOOCOMMERCE_INTEGRATION_NOT_CONFIGURED_ERROR }
   }
   const validatedCredentials = validateWooCommerceCredentials(credentials)
   if (!validatedCredentials.ok) {
-    return { data: null, totalPages: 0, totalItems: 0, error: validatedCredentials.error }
+    logWooCommerceConfigurationFailure(validatedCredentials.error)
+    return { data: null, totalPages: 0, totalItems: 0, error: WOOCOMMERCE_INTEGRATION_NOT_CONFIGURED_ERROR }
   }
   const safeCredentials = validatedCredentials.credentials
 
@@ -92,10 +108,22 @@ export async function wcPost(
   body: unknown,
   creds?: ConnectorCredentials | null,
 ): Promise<{ data: unknown; error?: string }> {
-  const credentials = creds ?? (await getWcCredentials())
-  if (!credentials) return { data: null, error: 'WooCommerce not configured.' }
+  let credentials: ConnectorCredentials | null
+  try {
+    credentials = creds ?? (await getWcCredentials())
+  } catch (error) {
+    logWooCommerceConfigurationFailure(error)
+    return { data: null, error: WOOCOMMERCE_INTEGRATION_NOT_CONFIGURED_ERROR }
+  }
+  if (!credentials) {
+    logWooCommerceConfigurationFailure('missing WooCommerce URL, consumer key, or consumer secret setting')
+    return { data: null, error: WOOCOMMERCE_INTEGRATION_NOT_CONFIGURED_ERROR }
+  }
   const validatedCredentials = validateWooCommerceCredentials(credentials)
-  if (!validatedCredentials.ok) return { data: null, error: validatedCredentials.error }
+  if (!validatedCredentials.ok) {
+    logWooCommerceConfigurationFailure(validatedCredentials.error)
+    return { data: null, error: WOOCOMMERCE_INTEGRATION_NOT_CONFIGURED_ERROR }
+  }
   const safeCredentials = validatedCredentials.credentials
 
   const auth = Buffer.from(`${safeCredentials.key}:${safeCredentials.secret}`).toString('base64')
@@ -120,10 +148,22 @@ export async function wcPut(
   body: unknown,
   creds?: ConnectorCredentials | null,
 ): Promise<{ data: unknown; error?: string }> {
-  const credentials = creds ?? (await getWcCredentials())
-  if (!credentials) return { data: null, error: 'WooCommerce not configured.' }
+  let credentials: ConnectorCredentials | null
+  try {
+    credentials = creds ?? (await getWcCredentials())
+  } catch (error) {
+    logWooCommerceConfigurationFailure(error)
+    return { data: null, error: WOOCOMMERCE_INTEGRATION_NOT_CONFIGURED_ERROR }
+  }
+  if (!credentials) {
+    logWooCommerceConfigurationFailure('missing WooCommerce URL, consumer key, or consumer secret setting')
+    return { data: null, error: WOOCOMMERCE_INTEGRATION_NOT_CONFIGURED_ERROR }
+  }
   const validatedCredentials = validateWooCommerceCredentials(credentials)
-  if (!validatedCredentials.ok) return { data: null, error: validatedCredentials.error }
+  if (!validatedCredentials.ok) {
+    logWooCommerceConfigurationFailure(validatedCredentials.error)
+    return { data: null, error: WOOCOMMERCE_INTEGRATION_NOT_CONFIGURED_ERROR }
+  }
   const safeCredentials = validatedCredentials.credentials
 
   const auth = Buffer.from(`${safeCredentials.key}:${safeCredentials.secret}`).toString('base64')

@@ -19,6 +19,16 @@ async function requireSupplier(): Promise<{ userId: string; supplierId: string }
   return { userId: session.user.id, supplierId: session.user.supplierId }
 }
 
+export function assertSupplierResourceBoundary(
+  ctx: { supplierId: string },
+  resource: { supplierId: string | null },
+  label = 'resource',
+): void {
+  if (resource.supplierId !== ctx.supplierId) {
+    throw new Error(`Supplier ${label} is not accessible`)
+  }
+}
+
 function sanitizeSupplierRef(value: string): string {
   return value
     .replace(/[\u0000-\u001f\u007f]/g, ' ')
@@ -194,7 +204,7 @@ export async function getSupplierRfqDetail(poId: string): Promise<{
     where: { id: poId, supplierId: ctx.supplierId },
     select: {
       id: true, reference: true, status: true, currency: true,
-      expectedDelivery: true, supplierRef: true, createdAt: true, notes: true,
+      supplierId: true, expectedDelivery: true, supplierRef: true, createdAt: true, notes: true,
       _count: { select: { lines: true } },
       lines: {
         select: {
@@ -206,6 +216,7 @@ export async function getSupplierRfqDetail(poId: string): Promise<{
     },
   })
   if (!po) return null
+  assertSupplierResourceBoundary(ctx, po, 'RFQ')
 
   // Get supplier SKUs
   const supplierProducts = await db.supplierProduct.findMany({
@@ -277,9 +288,10 @@ export async function submitSupplierQuote(
       `
       const lockedPo = await tx.purchaseOrder.findFirst({
         where: { id: poId, supplierId: ctx.supplierId, status: { in: ['DRAFT', 'RFQ_SENT'] } },
-        select: { id: true, reference: true, currency: true, fxRateToBase: true },
+        select: { id: true, supplierId: true, reference: true, currency: true, fxRateToBase: true },
       })
       if (!lockedPo) throw new Error('RFQ not found or not accessible')
+      assertSupplierResourceBoundary(ctx, lockedPo, 'RFQ')
 
       const fxRate = toDecimal(lockedPo.fxRateToBase)
       if (!fxRate.gt(0)) {
@@ -378,6 +390,7 @@ export async function submitProductEdit(
       include: { product: { select: { sku: true } } },
     })
     if (!link) return { success: false, error: 'Product not accessible' }
+    assertSupplierResourceBoundary(ctx, link, 'product')
 
     await logActivity({
       entityType: 'PRODUCT', entityId: productId, action: 'supplier_edit_proposed', tag: 'inventory', level: 'INFO',

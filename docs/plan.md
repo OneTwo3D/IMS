@@ -369,9 +369,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Hammer a cron endpoint; assert subsequent calls return 429.
 
 ### P6.2 — Supplier portal cross-tenant boundary
+- **Status:** Complete.
 - **File:** `app/actions/supplier-portal.ts:77–89`
 - **Fix:** Add an explicit assertion `ctx.supplierId === purchaseOrder.supplierId` (and similar for RFQs/products) inside each portal action.
-- **Tests:** Forge a session with a different `supplierId` than the requested resource; assert 403.
+- **Tests:** `tests/security/supplier-portal-boundary.test.ts` covers the explicit supplier-resource assertion; `tests/security/api-route-auth-behavior.test.ts` covers supplier-owned vs foreign RFQ route access.
 
 ### P6.3 — Restore token TTL + binding
 - **File:** `app/api/backup/restore/route.ts:20`
@@ -379,19 +380,22 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Use a token from a different session; assert rejection.
 
 ### P6.4 — Invoice PDF token leakage mitigation
+- **Status:** Complete.
 - **File:** `app/api/invoices/[id]/route.ts:105`
 - **Fix:** Bind token to session ID + IP (currently IP only). Reduce TTL to 5–10 minutes. Use UUID/hash in the filename rather than the sequential order ID.
-- **Tests:** Forwarded token from a different IP; assert rejection.
+- **Tests:** `tests/security/invoice-pdf-token.test.ts` covers session/IP binding, missing/mismatched binding rejection, 10-minute TTL cap, token-value audit redaction, and nonce-based Content-Disposition filenames.
 
 ### P6.5 — Error messages reveal connector field names
+- **Status:** Complete.
 - **File:** `lib/connectors/woocommerce/api.ts:55`
 - **Fix:** Generic "Integration not configured" message at the API surface; detailed message in server logs only.
-- **Tests:** API call without settings; assert generic message in response body, detailed message in server logs.
+- **Tests:** `tests/woocommerce-api-url-safety.test.ts` asserts unsafe WooCommerce config returns the generic integration error while detailed diagnostics stay in server warnings.
 
 ### P6.6 — Password minimum length
+- **Status:** Complete.
 - **File:** `app/actions/users.ts:94`
 - **Fix:** Raise minimum to 12. Add complexity requirements (uppercase + number + symbol) or rely on a deny-list of common passwords.
-- **Tests:** Password under new minimum is rejected; existing users grandfathered until next login (or forced rotation per security policy).
+- **Tests:** `tests/security/password-policy.test.ts` covers 12-character minimum, uppercase/number/symbol requirements, common-password rejection, and strong-password acceptance.
 
 ### P6.7 — Restore upload size + disk space
 - **File:** `app/api/backup/restore/route.ts:21`
@@ -399,9 +403,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Upload at 51 MiB rejected; mocked low-disk scenario rejected.
 
 ### P6.8 — Activity logging redaction
+- **Status:** Complete.
 - **File:** `app/actions/users.ts:113–115`, `lib/activity-log.ts`
 - **Fix:** Add an explicit `password` (and `secret`, `token`) redactor in `logActivity()` that strips sensitive fields from the metadata before writing.
-- **Tests:** Log an activity with `metadata: { password: 'x' }`; assert the stored row has no password.
+- **Tests:** `tests/security/activity-log-redaction.test.ts` covers text and recursive metadata redaction for password, secret, token, refreshToken, access_token, and email-like fields.
 
 ---
 
@@ -538,7 +543,12 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
    - [x] P5.7 — Shipment COGS revaluation queues reversal/repost sync evidence.
 12. **Account balance freshness:**
    - [x] P5.3 — GL period movement requires a previous-day opening snapshot by default.
-13. **Security hardening batch:** P6.2, P6.4, P6.5, P6.6, P6.8.
+13. **Security hardening batch:**
+   - [x] P6.2 — Supplier portal actions assert the session supplier owns loaded RFQ/product resources.
+   - [x] P6.4 — Invoice PDF tokens are short-lived and bound to invoice id, authenticated session, and client IP.
+   - [x] P6.5 — WooCommerce connector API surfaces return generic configuration errors.
+   - [x] P6.6 — User passwords require 12+ chars with uppercase, number, symbol, and common-password rejection.
+   - [x] P6.8 — Activity log metadata redacts password/secret/token fields recursively.
 14. **Backup / restore operational hardening:** P6.3, P6.7, P7.7.
 15. **Cron / rate / batch controls:** P6.1, P7.6.
 16. **Analytics / report scale refactor:** P7.1, P7.2, P7.3, P7.8, CR1, CR2, CR3.

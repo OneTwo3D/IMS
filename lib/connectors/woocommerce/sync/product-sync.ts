@@ -7,7 +7,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { decryptSettingValue } from '@/lib/security/encrypted-settings'
 import { getSettingValue } from '@/lib/settings-store'
-import { wcFetch, wcPut } from '../api'
+import { WOOCOMMERCE_INTEGRATION_NOT_CONFIGURED_ERROR, wcFetch, wcPut } from '../api'
 import { WC_SETTINGS_VERSION_KEY, WC_SYNC_ADVISORY_LOCK_KEY } from '../sync-lock'
 import { validateWooCommerceBaseUrl } from '../url-safety'
 import type { ConnectorCredentials } from '../../types'
@@ -578,7 +578,7 @@ export async function pushImsProductToWc(productId: string): Promise<{ success: 
   try {
     const { creds, syncVersion } = await snapshotProductSyncContext()
     if (!creds) {
-      return { success: false, error: 'WooCommerce not configured. Set wc_url, wc_consumer_key, wc_consumer_secret in Settings.' }
+      return { success: false, error: WOOCOMMERCE_INTEGRATION_NOT_CONFIGURED_ERROR }
     }
     const product = await db.product.findUnique({
       where: { id: productId },

@@ -22,6 +22,9 @@ test('activity log text redacts tokens, secrets, passwords, and emails', () => {
 test('activity log metadata redacts sensitive keys recursively', () => {
   const redacted = sanitizeActivityLogMetadata({
     orderNumber: 'SO-1',
+    password: 'hunter2',
+    secret: 'shared-secret',
+    token: 'tok_123',
     error: 'request failed with access_token=tok_123',
     nested: {
       refreshToken: 'refresh-secret',
@@ -29,11 +32,17 @@ test('activity log metadata redacts sensitive keys recursively', () => {
     },
   }) as {
     orderNumber: string
+    password: string
+    secret: string
+    token: string
     error: string
     nested: { refreshToken: string; customerEmail: string }
   }
 
   assert.equal(redacted.orderNumber, 'SO-1')
+  assert.equal(redacted.password, '[redacted]')
+  assert.equal(redacted.secret, '[redacted]')
+  assert.equal(redacted.token, '[redacted]')
   assert.equal(redacted.error.includes('tok_123'), false)
   assert.equal(redacted.nested.refreshToken, '[redacted]')
   assert.equal(redacted.nested.customerEmail, '[redacted]')

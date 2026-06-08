@@ -361,6 +361,9 @@ test('public signed invoice route rejects missing signed token before loading PD
           assert.equal(token, null)
           return { valid: false, reason: 'missing' }
         },
+        async getTokenBinding() {
+          return { sessionId: 'session-1', clientIp: '203.0.113.10' }
+        },
         async auditTokenAttempt() {},
       },
     ),

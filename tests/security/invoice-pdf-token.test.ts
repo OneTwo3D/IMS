@@ -8,6 +8,7 @@ import { handleInvoicePdfRoute } from '../../app/api/invoices/[id]/route.ts'
 import {
   signPdfToken,
   verifyPdfTokenDetailed,
+  type InvoicePdfTokenBinding,
   type InvoicePdfTokenPayload,
   type PdfTokenVerificationResult,
 } from '../../lib/invoice-pdf.ts'
@@ -16,6 +17,10 @@ import { withEnvPatch } from '../helpers/env.ts'
 const SECRET = 'invoice-pdf-test-secret'
 const NOW = new Date('2026-05-27T10:00:00.000Z')
 const NOW_SECONDS = seconds(NOW)
+const BINDING: InvoicePdfTokenBinding = {
+  sessionId: 'user-1:3:1700000000',
+  clientIp: '203.0.113.10',
+}
 
 async function withInvoiceTokenEnv<T>(
   env: Record<string, string | undefined>,
@@ -44,6 +49,14 @@ function bareDeterministicToken(orderId: string): string {
   return createHmac('sha256', SECRET).update(orderId, 'utf8').digest('hex')
 }
 
+function testBindingHash(kind: keyof InvoicePdfTokenBinding, value: string): string {
+  return createHmac('sha256', SECRET).update(`invoice-pdf:${kind}:${value}`, 'utf8').digest('hex')
+}
+
+function verifyOptions(now: Date = NOW) {
+  return { now, binding: BINDING }
+}
+
 function validPayload(overrides: Partial<InvoicePdfTokenPayload> = {}): InvoicePdfTokenPayload {
   return {
     v: 1,
@@ -52,16 +65,16 @@ function validPayload(overrides: Partial<InvoicePdfTokenPayload> = {}): InvoiceP
     iat: NOW_SECONDS,
     exp: NOW_SECONDS + 60,
     nonce: 'nonce-1',
+    sessionHash: testBindingHash('sessionId', BINDING.sessionId),
+    ipHash: testBindingHash('clientIp', BINDING.clientIp),
     ...overrides,
   }
 }
 
 test('invoice PDF tokens verify while inside their configured TTL', async () => {
   await withInvoiceTokenEnv({ INVOICE_PDF_TOKEN_TTL_SECONDS: '120' }, () => {
-    const token = signPdfToken('order-1', { now: NOW, nonce: 'nonce-1' })
-    const result = verifyPdfTokenDetailed('order-1', token, {
-      now: new Date(NOW.getTime() + 119_000),
-    })
+    const token = signPdfToken('order-1', { now: NOW, nonce: 'nonce-1', binding: BINDING })
+    const result = verifyPdfTokenDetailed('order-1', token, verifyOptions(new Date(NOW.getTime() + 119_000)))
 
     assert.equal(result.valid, true)
     assert.equal(result.payload.v, 1)
@@ -75,8 +88,8 @@ test('invoice PDF tokens verify while inside their configured TTL', async () => 
 
 test('invoice PDF token signing is deterministic when the nonce and clock are fixed', async () => {
   await withInvoiceTokenEnv({ INVOICE_PDF_TOKEN_TTL_SECONDS: '120' }, () => {
-    const first = signPdfToken('order-1', { now: NOW, nonce: 'nonce-1' })
-    const second = signPdfToken('order-1', { now: NOW, nonce: 'nonce-1' })
+    const first = signPdfToken('order-1', { now: NOW, nonce: 'nonce-1', binding: BINDING })
+    const second = signPdfToken('order-1', { now: NOW, nonce: 'nonce-1', binding: BINDING })
 
     assert.equal(first, second)
   })
@@ -84,10 +97,8 @@ test('invoice PDF token signing is deterministic when the nonce and clock are fi
 
 test('invoice PDF tokens expire at the expiry boundary', async () => {
   await withInvoiceTokenEnv({}, () => {
-    const token = signPdfToken('order-1', { now: NOW, ttlSeconds: 10, nonce: 'nonce-1' })
-    const result = verifyPdfTokenDetailed('order-1', token, {
-      now: new Date(NOW.getTime() + 10_000),
-    })
+    const token = signPdfToken('order-1', { now: NOW, ttlSeconds: 10, nonce: 'nonce-1', binding: BINDING })
+    const result = verifyPdfTokenDetailed('order-1', token, verifyOptions(new Date(NOW.getTime() + 10_000)))
 
     assert.deepEqual(result, { valid: false, reason: 'expired' })
   })
@@ -96,12 +107,16 @@ test('invoice PDF tokens expire at the expiry boundary', async () => {
 test('invoice PDF token signing rejects invalid TTL options', async () => {
   await withInvoiceTokenEnv({}, () => {
     assert.throws(
-      () => signPdfToken('order-1', { now: NOW, ttlSeconds: 0, nonce: 'nonce-1' }),
+      () => signPdfToken('order-1', { now: NOW, ttlSeconds: 0, nonce: 'nonce-1', binding: BINDING }),
       /positive integer/,
     )
     assert.throws(
-      () => signPdfToken('order-1', { now: NOW, ttlSeconds: 30 * 24 * 60 * 60 + 1, nonce: 'nonce-1' }),
+      () => signPdfToken('order-1', { now: NOW, ttlSeconds: 10 * 60 + 1, nonce: 'nonce-1', binding: BINDING }),
       /must not exceed/,
+    )
+    assert.throws(
+      () => signPdfToken('order-1', { now: NOW, ttlSeconds: 60, nonce: 'nonce-1' }),
+      /requires session and client IP bindings/,
     )
   })
 })
@@ -112,15 +127,39 @@ test('invoice PDF token verification rejects wrong purpose and wrong order ids',
       verifyPdfTokenDetailed(
         'order-1',
         signedPayload({ ...validPayload(), purpose: 'packing-slip' }),
-        { now: NOW },
+        verifyOptions(),
       ),
       { valid: false, reason: 'wrong_purpose' },
     )
 
     const token = signedPayload(validPayload())
     assert.deepEqual(
-      verifyPdfTokenDetailed('order-2', token, { now: NOW }),
+      verifyPdfTokenDetailed('order-2', token, verifyOptions()),
       { valid: false, reason: 'wrong_order' },
+    )
+  })
+})
+
+test('invoice PDF token verification rejects missing or mismatched bindings', async () => {
+  await withInvoiceTokenEnv({}, () => {
+    const token = signedPayload(validPayload())
+    assert.deepEqual(
+      verifyPdfTokenDetailed('order-1', token, { now: NOW }),
+      { valid: false, reason: 'missing_binding' },
+    )
+    assert.deepEqual(
+      verifyPdfTokenDetailed('order-1', token, {
+        now: NOW,
+        binding: { ...BINDING, sessionId: 'other-session' },
+      }),
+      { valid: false, reason: 'wrong_session' },
+    )
+    assert.deepEqual(
+      verifyPdfTokenDetailed('order-1', token, {
+        now: NOW,
+        binding: { ...BINDING, clientIp: '203.0.113.11' },
+      }),
+      { valid: false, reason: 'wrong_ip' },
     )
   })
 })
@@ -128,15 +167,15 @@ test('invoice PDF token verification rejects wrong purpose and wrong order ids',
 test('invoice PDF token verification rejects malformed signed payloads', async () => {
   await withInvoiceTokenEnv({}, () => {
     assert.deepEqual(
-      verifyPdfTokenDetailed('order-1', signedPayload({ ...validPayload(), purpose: 123 }), { now: NOW }),
+      verifyPdfTokenDetailed('order-1', signedPayload({ ...validPayload(), purpose: 123 }), verifyOptions()),
       { valid: false, reason: 'malformed' },
     )
     assert.deepEqual(
-      verifyPdfTokenDetailed('order-1', signedPayload(validPayload({ sub: '' })), { now: NOW }),
+      verifyPdfTokenDetailed('order-1', signedPayload(validPayload({ sub: '' })), verifyOptions()),
       { valid: false, reason: 'malformed' },
     )
     assert.deepEqual(
-      verifyPdfTokenDetailed('order-1', signedPayload(validPayload({ iat: NOW_SECONDS + 61 })), { now: NOW }),
+      verifyPdfTokenDetailed('order-1', signedPayload(validPayload({ iat: NOW_SECONDS + 61 })), verifyOptions()),
       { valid: false, reason: 'malformed' },
     )
   })
@@ -145,14 +184,14 @@ test('invoice PDF token verification rejects malformed signed payloads', async (
 test('invoice PDF token verification rejects invalid version and TTL windows', async () => {
   await withInvoiceTokenEnv({}, () => {
     assert.deepEqual(
-      verifyPdfTokenDetailed('order-1', signedPayload({ ...validPayload(), v: 2 }), { now: NOW }),
+      verifyPdfTokenDetailed('order-1', signedPayload({ ...validPayload(), v: 2 }), verifyOptions()),
       { valid: false, reason: 'wrong_version' },
     )
     assert.deepEqual(
       verifyPdfTokenDetailed(
         'order-1',
-        signedPayload(validPayload({ exp: NOW_SECONDS + 30 * 24 * 60 * 60 + 1 })),
-        { now: NOW },
+        signedPayload(validPayload({ exp: NOW_SECONDS + 10 * 60 + 1 })),
+        verifyOptions(),
       ),
       { valid: false, reason: 'ttl_exceeded' },
     )
@@ -163,7 +202,7 @@ test('invoice PDF token verification rejects invalid version and TTL windows', a
           iat: NOW_SECONDS + 6 * 60,
           exp: NOW_SECONDS + 6 * 60 + 60,
         })),
-        { now: NOW },
+        verifyOptions(),
       ),
       { valid: false, reason: 'not_yet_valid' },
     )
@@ -172,17 +211,17 @@ test('invoice PDF token verification rejects invalid version and TTL windows', a
 
 test('invoice PDF token verification rejects malformed token envelopes and tampered payloads', async () => {
   await withInvoiceTokenEnv({}, () => {
-    const token = signPdfToken('order-1', { now: NOW, ttlSeconds: 60, nonce: 'nonce-1' })
+    const token = signPdfToken('order-1', { now: NOW, ttlSeconds: 60, nonce: 'nonce-1', binding: BINDING })
     const [encodedPayload, signature] = token.split('.')
     const payload = JSON.parse(Buffer.from(encodedPayload, 'base64url').toString('utf8')) as InvoicePdfTokenPayload
     const tamperedPayload = Buffer.from(JSON.stringify({ ...payload, sub: 'order-2' }), 'utf8').toString('base64url')
 
     assert.deepEqual(
-      verifyPdfTokenDetailed('order-1', `${tamperedPayload}.${signature}`, { now: NOW }),
+      verifyPdfTokenDetailed('order-1', `${tamperedPayload}.${signature}`, verifyOptions()),
       { valid: false, reason: 'bad_signature' },
     )
     assert.deepEqual(
-      verifyPdfTokenDetailed('order-1', `${encodedPayload}.${signature}.extra`, { now: NOW }),
+      verifyPdfTokenDetailed('order-1', `${encodedPayload}.${signature}.extra`, verifyOptions()),
       { valid: false, reason: 'malformed' },
     )
   })
@@ -191,7 +230,7 @@ test('invoice PDF token verification rejects malformed token envelopes and tampe
 test('old deterministic invoice PDF tokens are rejected as malformed tokens', async () => {
   await withInvoiceTokenEnv({}, () => {
     assert.deepEqual(
-      verifyPdfTokenDetailed('order-1', bareDeterministicToken('order-1'), { now: NOW }),
+      verifyPdfTokenDetailed('order-1', bareDeterministicToken('order-1'), verifyOptions()),
       { valid: false, reason: 'malformed' },
     )
   })
@@ -214,6 +253,9 @@ test('invoice PDF route audits rejected token attempts without logging token val
       },
       verifyPdfToken() {
         return { valid: false, reason: 'bad_signature' }
+      },
+      async getTokenBinding() {
+        return BINDING
       },
       async auditTokenAttempt(input) {
         audits.push(input)
@@ -253,6 +295,9 @@ test('invoice PDF route audits accepted tokens and serves PDFs with no-store cac
           payload: validPayload(),
         }
       },
+      async getTokenBinding() {
+        return BINDING
+      },
       async auditTokenAttempt(input) {
         audits.push(input)
       },
@@ -285,7 +330,10 @@ test('invoice PDF route sanitizes the Content-Disposition filename', async () =>
       },
       verifyPdfToken(orderId) {
         assert.equal(orderId, unsafeId)
-        return { valid: true, payload: validPayload({ sub: unsafeId }) }
+        return { valid: true, payload: validPayload({ sub: unsafeId, nonce: 'nonce/with\r\nbad"chars' }) }
+      },
+      async getTokenBinding() {
+        return BINDING
       },
       async auditTokenAttempt() {},
     },
@@ -294,7 +342,7 @@ test('invoice PDF route sanitizes the Content-Disposition filename', async () =>
   assert.equal(response.status, 200)
   assert.equal(
     response.headers.get('content-disposition'),
-    'inline; filename="invoice-order___Set-Cookie_x.pdf"',
+    'inline; filename="invoice-nonce_with__bad_chars.pdf"',
   )
 })
 
@@ -314,6 +362,9 @@ test('invoice PDF route audit failures do not block accepted downloads', async (
         },
         verifyPdfToken() {
           return { valid: true, payload: validPayload() }
+        },
+        async getTokenBinding() {
+          return BINDING
         },
         async auditTokenAttempt() {
           throw new Error('audit unavailable')
@@ -346,6 +397,9 @@ test('invoice PDF route audit failures do not block rejected token responses', a
         verifyPdfToken() {
           return { valid: false, reason: 'bad_signature' }
         },
+        async getTokenBinding() {
+          return BINDING
+        },
         async auditTokenAttempt() {
           throw new Error('audit unavailable')
         },
@@ -372,6 +426,9 @@ test('invoice PDF route applies request rate limiting before token verification'
       verifyPdfToken() {
         verifyCalled = true
         return { valid: true, payload: validPayload() }
+      },
+      async getTokenBinding() {
+        return BINDING
       },
       async auditTokenAttempt() {
         throw new Error('Audit should not be reached when rate limited')

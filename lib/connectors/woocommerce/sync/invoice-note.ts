@@ -5,10 +5,8 @@
 
 import { db } from '@/lib/db'
 import { wcPost, wcPut } from '../api'
-import { getInvoiceDownloadUrl } from '@/lib/invoice-pdf'
 import { getAccountingSettings } from '@/lib/accounting'
 import { logActivity } from '@/lib/activity-log'
-import { getPublicAppUrl } from '@/lib/public-app-url'
 
 /**
  * Push an invoice download note to the WC order (customer-visible).
@@ -36,11 +34,11 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
 
   const ref = so.invoiceNumber ?? so.orderNumber ?? so.externalOrderNumber ?? orderId.slice(0, 8)
   const wcOrderLabel = wcLink.externalOrderNumber ?? so.externalOrderNumber ?? wcLink.externalOrderId
-  const appUrl = (await getPublicAppUrl())?.replace(/\/$/, '') ?? ''
   let failure: string | null = null
 
-  // Build absolute download URL
-  const downloadUrl = so.invoicePdfPath ? `${appUrl}${getInvoiceDownloadUrl(orderId)}` : null
+  // Public invoice PDF URLs are intentionally not generated here: signed PDF
+  // tokens are bound to the authenticated request session and client IP.
+  const downloadUrl: string | null = null
 
   // Build accounting invoice URL
   let accountingInvoiceUrl: string | null = null

@@ -5,12 +5,15 @@
  */
 
 import { NextRequest, NextResponse } from 'next/server'
+import { auth } from '@/lib/auth'
 import { logActivity } from '@/lib/activity-log'
 import { checkRateLimit, type RateLimitResult } from '@/lib/rate-limit'
 import { getClientIp } from '@/lib/request-ip'
 import {
+  buildInvoicePdfSessionBinding,
   loadInvoicePdf,
   verifyPdfTokenDetailed,
+  type InvoicePdfTokenBinding,
   type PdfTokenVerificationResult,
 } from '@/lib/invoice-pdf'
 
@@ -28,6 +31,7 @@ type InvoicePdfTokenAuditInput = {
 type InvoicePdfRouteDependencies = {
   loadInvoicePdf: typeof loadInvoicePdf
   verifyPdfToken: typeof verifyPdfTokenDetailed
+  getTokenBinding: (request: NextRequest) => Promise<InvoicePdfTokenBinding | null>
   auditTokenAttempt: (input: InvoicePdfTokenAuditInput) => Promise<void>
   checkRateLimit?: (key: string, max: number, windowMs: number) => Promise<RateLimitResult>
 }
@@ -39,6 +43,7 @@ const NO_STORE_HEADERS = {
 const defaultDependencies: InvoicePdfRouteDependencies = {
   loadInvoicePdf,
   verifyPdfToken: verifyPdfTokenDetailed,
+  getTokenBinding: getInvoicePdfTokenBinding,
   auditTokenAttempt: auditInvoicePdfTokenAttempt,
   checkRateLimit,
 }
@@ -50,6 +55,21 @@ function jsonNoStore(body: object, status: number): NextResponse {
 function safeInvoiceFilenameId(id: string): string {
   const safe = id.replace(/[^a-zA-Z0-9_-]/g, '_')
   return safe.length > 0 ? safe : 'invoice'
+}
+
+async function getInvoicePdfTokenBinding(request: NextRequest): Promise<InvoicePdfTokenBinding | null> {
+  const session = await auth()
+  if (!session?.user?.id || session.user.sessionInvalidReason) return null
+  if (session.user.totpEnabled && !session.user.totpVerified) return null
+  const clientIp = getClientIp(request.headers) ?? 'unknown'
+  return {
+    sessionId: buildInvoicePdfSessionBinding({
+      userId: session.user.id,
+      sessionVersion: session.user.sessionVersion,
+      sessionAuthTime: session.user.sessionAuthTime,
+    }),
+    clientIp,
+  }
 }
 
 async function auditTokenAttemptSafely(
@@ -116,7 +136,8 @@ export async function handleInvoicePdfRoute(
     )
   }
 
-  const verification = dependencies.verifyPdfToken(id, token)
+  const tokenBinding = await dependencies.getTokenBinding(request)
+  const verification = dependencies.verifyPdfToken(id, token, { binding: tokenBinding ?? undefined })
   if (!verification.valid) {
     await auditTokenAttemptSafely(dependencies, {
       orderId: id,
@@ -143,7 +164,7 @@ export async function handleInvoicePdfRoute(
     status: 200,
     headers: {
       'Content-Type': 'application/pdf',
-      'Content-Disposition': `inline; filename="invoice-${safeInvoiceFilenameId(id)}.pdf"`,
+      'Content-Disposition': `inline; filename="invoice-${safeInvoiceFilenameId(verification.payload.nonce)}.pdf"`,
       ...NO_STORE_HEADERS,
     },
   })

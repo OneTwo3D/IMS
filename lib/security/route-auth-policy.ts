@@ -272,7 +272,7 @@ export const apiRouteAuthPolicy = {
   },
   '/api/invoices/[id]': {
     access: 'public-webhook',
-    reason: 'Public signed-URL invoice PDF endpoint; requires a valid expiring signed token for the invoice id.',
+    reason: 'Signed-URL invoice PDF endpoint; token verification is bound to invoice id, current authenticated session, and client IP.',
   },
   '/api/manufacturing-order/[id]': {
     access: 'authenticated',

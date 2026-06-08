@@ -1,6 +1,6 @@
 import type { ShoppingExternalLink, ShoppingProductLinkResult } from '@/lib/shopping'
 import { db } from '@/lib/db'
-import { getWcCredentials, wcFetch } from './api'
+import { WOOCOMMERCE_INTEGRATION_NOT_CONFIGURED_ERROR, getWcCredentials, wcFetch } from './api'
 
 function createWcLink(url: string, label: string): ShoppingExternalLink {
   return {
@@ -14,7 +14,7 @@ function createWcLink(url: string, label: string): ShoppingExternalLink {
 export async function getWcProductExternalLink(sku: string): Promise<ShoppingProductLinkResult> {
   try {
     const creds = await getWcCredentials()
-    if (!creds) return { link: null, error: 'WooCommerce not configured in Settings' }
+    if (!creds) return { link: null, error: WOOCOMMERCE_INTEGRATION_NOT_CONFIGURED_ERROR }
 
     const { data, error } = await wcFetch('/products', { sku, per_page: '1' }, creds)
     if (error) return { link: null, error }
