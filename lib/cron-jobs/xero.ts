@@ -12,6 +12,16 @@ registerCronJobs([
     defaultEnabled: true,
   },
   {
+    slug: 'account-balance-snapshot',
+    settingKey: 'xero_account_balance_snapshot',
+    module: 'accounting',
+    moduleLabel: 'Accounting',
+    label: 'Account Balance Snapshot',
+    description: 'Fetches Xero Trial Balance account balances for GL variance reporting.',
+    defaultSchedule: '0 1 * * *',
+    defaultEnabled: true,
+  },
+  {
     slug: 'accounting-daily-batch',
     settingKey: 'xero_daily_batch',
     module: 'accounting',

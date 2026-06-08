@@ -190,6 +190,7 @@ Scheduled tasks are configured automatically:
 
 | Time | Endpoint | Purpose |
 |---|---|---|
+| 01:00 | `/api/cron/account-balance-snapshot` | Fetch previous-day Xero Trial Balance account balances for GL variance reporting |
 | 02:00 | `/api/cron/backup` | Scheduled backup (if enabled in settings) with retention and remote upload |
 | 03:00 | `/api/cron/activity-cleanup` | Purge activity log entries past their retention period |
 | 04:00 | `/api/cron/wc-reconcile` | WooCommerce backup reconciliation for orders/products plus stock retry draining |

@@ -10,6 +10,11 @@ This repository uses an `x.y.z` release scheme.
 
 ### Developer-facing
 
+- **Account-balance snapshots now have a daily cron dependency.** Installations
+  should schedule `GET /api/cron/account-balance-snapshot` daily, before
+  accounting reports are reviewed, so inventory and COGS GL variance reports
+  have previous-day Xero Trial Balance snapshots available. The production
+  rollout readiness check treats a missing or stale run as a blocker.
 - **Upload storage roots are now environment-configured.** `UPLOAD_STORAGE_DIR`
   stores private uploads such as supplier invoice PDFs and
   `PUBLIC_UPLOAD_STORAGE_DIR` stores branding/avatar assets. Local defaults
