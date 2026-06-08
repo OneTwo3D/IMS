@@ -13,6 +13,7 @@ Each item is independently testable and includes the expected file targets, acce
 These are reversible-via-recovery issues but the recovery is painful. Fix before any other work lands.
 
 ### P0.1 — TOTP secret leakage in API response
+- **Status:** Complete.
 - **File:** `app/api/auth/totp-setup/route.ts:33`
 - **Problem:** Endpoint returns `{ secret, qrDataUrl }`. The raw secret reaches the client even though `qrDataUrl` already encodes it. Anything that captures response bodies (CDN edge logs, error tracking, browser dev-tools auto-capture) leaks the second factor.
 - **Fix:** Return only `{ qrDataUrl }`. The secret is already staged server-side in the user record; the client doesn't need it back.
@@ -22,6 +23,7 @@ These are reversible-via-recovery issues but the recovery is painful. Fix before
 - **Tests:** Add an integration test asserting the response shape excludes `secret`.
 
 ### P0.2 — Plaintext DB password handled in restore error paths
+- **Status:** Complete.
 - **File:** `app/api/backup/restore/route.ts:90–97`
 - **Problem:** `getDbConfig()` extracts the password from `DATABASE_URL`. `pg_restore` failure paths can bleed the password into error messages.
 - **Fix:** Use a `.pgpass` file written before invoking `pg_restore`, or wrap error messages in a redactor that strips `password=...` and `://user:pass@` patterns before logging.
@@ -31,6 +33,7 @@ These are reversible-via-recovery issues but the recovery is painful. Fix before
 - **Tests:** Add a unit test for the redactor with sample error strings.
 
 ### P0.3 — Backup restore needs a typed confirmation prompt
+- **Status:** Complete.
 - **File:** `app/api/backup/restore/route.ts:425`
 - **Problem:** Restore enters maintenance mode and begins overwriting current data on first POST. The 2FA gate and token are good safety, but the irreversible step has no "type RESTORE" confirmation and doesn't log the source-vs-target timestamps for audit.
 - **Fix:**
@@ -42,6 +45,7 @@ These are reversible-via-recovery issues but the recovery is painful. Fix before
 - **Tests:** Integration test for the rejection path and the activity-log assertion.
 
 ### P0.4 — CRON_SECRET unset in production silently degrades auth
+- **Status:** Complete.
 - **File:** `lib/cron-auth.ts:25–39`
 - **Problem:** When `CRON_SECRET` is empty, the code falls back to localhost-only auth in dev (fine) but in prod it should fail loudly.
 - **Fix:** At module load (or `instrumentation.ts`), check `if (process.env.NODE_ENV === 'production' && !process.env.CRON_SECRET) throw new Error(...)`.
@@ -49,6 +53,7 @@ These are reversible-via-recovery issues but the recovery is painful. Fix before
 - **Tests:** Unit test the env-validation helper.
 
 ### P0.5 — Migration: missing DEFAULT on `NOT NULL` add-column
+- **Status:** Complete.
 - **File:** `prisma/migrations/20260405212718_activity_log_level_tag/migration.sql:29`
 - **Problem:** `ADD COLUMN tag TEXT NOT NULL` against `activity_logs`. Fresh deploys pass; tenant deploys with existing rows fail.
 - **No-live-system note:** If the migration has never been applied to a live tenant, a forward-only companion migration is still preferred, but this is less urgent than the security and financial correctness items above.
@@ -162,6 +167,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ## Phase 2 — Rollout / migration safety and conventions (3–5 days)
 
 ### P2.1 — Inventory snapshot CHECK constraint never validated
+- **Status:** Complete.
 - **File:** `prisma/migrations/20260528213500_inventory_snapshots_constraints/migration.sql`
 - **Problem:** CHECK added `NOT VALID` and never validated. Future writes can violate it silently.
 - **Fix:** Add a follow-up migration that runs `ALTER TABLE ... VALIDATE CONSTRAINT ...` for each NOT VALID constraint. Include a preflight `DO $$` block that counts violations and raises EXCEPTION before VALIDATE.
@@ -169,6 +175,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Manual: `\d+ inventory_snapshots` in psql shows no NOT VALID constraints.
 
 ### P2.2 — RENAME COLUMN migrations land in a single shot
+- **Status:** Complete.
 - **Files:** `prisma/migrations/20260410150000_rename_adjustment_reason_account_code/`, `20260415141000_rename_gbp_columns_to_base/`
 - **Problem:** No dual-write phase. Canary or partial deploys 500 on the old column reference.
 - **No-live-system note:** Do not add compatibility shims for already-completed, non-live migrations unless a real deploy path needs them. Treat this mainly as a convention and lint/documentation task for future migrations.
@@ -191,6 +198,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Snapshot test per role.
 
 ### P2.4 — Migration-doc / convention page
+- **Status:** Complete.
 - **File:** new `docs/migration-conventions.md`
 - **Content:**
   - `NOT NULL` add-column must include `DEFAULT` or be split.
@@ -321,6 +329,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** `tests/accounting-fx.test.ts` covers AR gain, AR loss, AP gain, and AP loss.
 
 ### P5.3 — Account balance opening up to 7 days stale
+- **Status:** Complete.
 - **File:** `lib/domain/accounting/account-balance-snapshots.ts:187–195`
 - **Fix:** Reduce staleness window to 1 day. When no snapshot exists for the exact `dateFrom`, query Xero on demand rather than falling back.
 - **Tests:** Period movement query without a snapshot on `dateFrom`; assert behaviour (either fetch or fail loudly, not silently fall back).
@@ -479,8 +488,16 @@ Bundle these into one or two PRs that touch multiple modules.
 
 This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any group further only when the diff becomes hard to review or when one item needs a schema migration that should land independently.
 
-1. **Stop-the-bleed security:** P0.1, P0.2, P0.3, P0.4.
-2. **Migration safety docs + checks:** P0.5, P2.1, P2.2, P2.4.
+1. **Stop-the-bleed security:**
+   - [x] P0.1 — TOTP setup response excludes the raw shared secret.
+   - [x] P0.2 — Backup restore errors redact database credentials.
+   - [x] P0.3 — Backup restore requires typed confirmation and logs source/target timestamps.
+   - [x] P0.4 — Production boot fails fast when `CRON_SECRET` is missing.
+2. **Migration safety docs + checks:**
+   - [x] P0.5 — Activity-log tag migration uses nullable/backfill/not-null sequencing.
+   - [x] P2.1 — Inventory snapshot CHECK constraints are validated.
+   - [x] P2.2 — Rename-column migration conventions are documented and linted.
+   - [x] P2.4 — Migration convention documentation is linked from project docs.
 3. **FIFO / concurrency correctness:** P1.1 plus QG3's FIFO harness.
 4. **Refund correctness:**
    - [x] P1.3 — Refund stock-movement idempotency without cost-layer guard.
@@ -518,7 +535,8 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
    - [x] P5.4 — Xero synced logs with external transaction IDs are skipped before replay posting.
    - [x] P5.6 — Xero invoice payments preserve oldest-first allocation across retries.
    - [x] P5.7 — Shipment COGS revaluation queues reversal/repost sync evidence.
-12. **Account balance freshness:** P5.3.
+12. **Account balance freshness:**
+   - [x] P5.3 — GL period movement requires a previous-day opening snapshot by default.
 13. **Security hardening batch:** P6.2, P6.4, P6.5, P6.6, P6.8.
 14. **Backup / restore operational hardening:** P6.3, P6.7, P7.7.
 15. **Cron / rate / batch controls:** P6.1, P7.6.

@@ -3,7 +3,6 @@ import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import {
   calculateAccountBalanceVarianceBase,
-  DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS,
   findLatestAccountBalanceSnapshot,
   getAccountBalancePeriodMovement,
 } from '@/lib/domain/accounting/account-balance-snapshots'
@@ -566,7 +565,7 @@ async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBas
     return {
       glBalanceBase: null,
       glVarianceBase: null,
-      notices: [`No fresh opening and closing GL balance snapshots exist for COGS account ${context.cogsAccountCode} across ${dateFrom} to ${dateTo}. Opening snapshots must be within ${DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS} days before the period start, so GL COGS variance is blank.`],
+      notices: [`No fresh opening and closing GL balance snapshots exist for COGS account ${context.cogsAccountCode} across ${dateFrom} to ${dateTo}. The opening snapshot must be from the day before the period start, so GL COGS variance is blank.`],
     }
   }
   const notices = movement.movementBase.lt(0)

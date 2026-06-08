@@ -192,6 +192,35 @@ test('getAccountBalancePeriodMovement rejects stale opening snapshots', async ()
   assert.equal(movement, null)
 })
 
+test('getAccountBalancePeriodMovement requires a previous-day opening snapshot by default', async () => {
+  const client = snapshotClient([
+    makeSnapshot({
+      id: 'two-day-old-opening',
+      externalAccountId: 'cogs-account',
+      accountCode: '600',
+      balanceDate: new Date('2026-05-30T00:00:00.000Z'),
+      amountBase: toDecimal('12.50'),
+    }),
+    makeSnapshot({
+      id: 'closing',
+      externalAccountId: 'cogs-account',
+      accountCode: '600',
+      balanceDate: new Date('2026-06-30T00:00:00.000Z'),
+      amountBase: toDecimal('20.75'),
+    }),
+  ])
+
+  const movement = await getAccountBalancePeriodMovement({
+    connector: 'xero',
+    accountCode: '600',
+    dateFrom: '2026-06-01',
+    dateTo: '2026-06-30',
+    currency: 'GBP',
+  }, client as never)
+
+  assert.equal(movement, null)
+})
+
 test('findLatestAccountBalanceSnapshot prefers external account id before account code', async () => {
   const client = snapshotClient([
     makeSnapshot({

@@ -4,7 +4,7 @@ import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib
 
 const DATE_ONLY_RE = /^\d{4}-\d{2}-\d{2}$/
 const DAY_MS = 24 * 60 * 60 * 1000
-export const DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS = 7
+export const DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS = 1
 
 export type AccountingAccountBalanceSnapshotInput = {
   connector: string
