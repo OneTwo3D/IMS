@@ -964,6 +964,7 @@ header "Setting up cron jobs"
 CRON_ENV_FILE="${APP_DIR}/.env"
 CRON_CURL_PREFIX="CRON_SECRET=\$(grep -m 1 '^CRON_SECRET=' '${CRON_ENV_FILE}' | cut -d= -f2-) && curl -fsS -H \"Authorization: Bearer \${CRON_SECRET}\""
 CRON_LINES=(
+  "0 1 * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/account-balance-snapshot > /dev/null 2>&1"
   "0 6 * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/fx-rates > /dev/null 2>&1"
   "0 3 * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/activity-cleanup > /dev/null 2>&1"
   "0 2 * * * ${CRON_CURL_PREFIX} http://localhost:${APP_PORT}/api/cron/backup > /dev/null 2>&1"

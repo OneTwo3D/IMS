@@ -5,12 +5,14 @@ import {
   calculateAccountBalanceVarianceBase,
   findLatestAccountBalanceSnapshot,
   getAccountBalancePeriodMovement,
+  MissingAccountBalanceSnapshotError,
 } from '@/lib/domain/accounting/account-balance-snapshots'
 import { getOnHandAsOf, type OnHandAsOfRow } from '@/lib/domain/inventory/get-on-hand-as-of'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { calculateInventoryTurnover, normalizeVelocityWindow } from '@/lib/domain/inventory/velocity'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getXeroSettings } from '@/lib/connectors/xero/settings'
+import { syncXeroAccountBalanceSnapshots } from '@/lib/connectors/xero/account-balances'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { cache } from 'react'
 
@@ -554,20 +556,14 @@ async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBas
       notices: ['No Xero COGS account is configured, so GL COGS variance is blank.'],
     }
   }
-  const movement = await getAccountBalancePeriodMovement({
+  const movement = await loadCogsGlMovementWithOnDemandSnapshotSync({
     connector: context.connector,
     accountCode: context.cogsAccountCode,
     dateFrom,
     dateTo,
     currency: context.baseCurrency,
   })
-  if (!movement) {
-    return {
-      glBalanceBase: null,
-      glVarianceBase: null,
-      notices: [`No fresh opening and closing GL balance snapshots exist for COGS account ${context.cogsAccountCode} across ${dateFrom} to ${dateTo}. The opening snapshot must be from the day before the period start, so GL COGS variance is blank.`],
-    }
-  }
+  if (!movement.ok) return missingCogsGlMovementResult(context.cogsAccountCode, dateFrom, dateTo, movement.notice)
   const notices = movement.movementBase.lt(0)
     ? ['GL COGS movement is negative. This can be caused by period-end reclassification, year-end close, or refunds; investigate before relying on the variance.']
     : []
@@ -575,6 +571,58 @@ async function cogsGlMovementForPeriod(dateFrom: string, dateTo: string, cogsBas
     glBalanceBase: movement.movementBase,
     glVarianceBase: calculateAccountBalanceVarianceBase(cogsBase, movement.movementBase),
     notices,
+  }
+}
+
+type CogsGlMovementLookup = Parameters<typeof getAccountBalancePeriodMovement>[0]
+
+type CogsGlMovementResult =
+  | { ok: true; movementBase: Decimal }
+  | { ok: false; notice?: string }
+
+async function loadCogsGlMovementWithOnDemandSnapshotSync(lookup: CogsGlMovementLookup): Promise<CogsGlMovementResult> {
+  try {
+    const movement = await getAccountBalancePeriodMovement(lookup)
+    return { ok: true, movementBase: movement.movementBase }
+  } catch (error) {
+    if (!(error instanceof MissingAccountBalanceSnapshotError)) throw error
+    if (lookup.connector !== 'xero') return { ok: false }
+
+    const syncResult = await syncXeroAccountBalanceSnapshots({
+      balanceDate: error.requiredBalanceDate,
+      accountCodes: lookup.accountCode ? [lookup.accountCode] : undefined,
+      syncRunId: `report-demand:${error.requiredBalanceDate}:${error.reason}`,
+    })
+    if (syncResult.errors.length > 0 || syncResult.persisted === 0) {
+      return {
+        ok: false,
+        notice: `On-demand Xero Trial Balance sync for ${error.requiredBalanceDate} did not create the required GL balance snapshot.`,
+      }
+    }
+
+    try {
+      const movement = await getAccountBalancePeriodMovement(lookup)
+      return { ok: true, movementBase: movement.movementBase }
+    } catch (retryError) {
+      if (retryError instanceof MissingAccountBalanceSnapshotError) return { ok: false }
+      throw retryError
+    }
+  }
+}
+
+function missingCogsGlMovementResult(
+  cogsAccountCode: string,
+  dateFrom: string,
+  dateTo: string,
+  extraNotice?: string,
+): { glBalanceBase: null; glVarianceBase: null; notices: string[] } {
+  return {
+    glBalanceBase: null,
+    glVarianceBase: null,
+    notices: [
+      `No fresh opening and closing GL balance snapshots exist for COGS account ${cogsAccountCode} across ${dateFrom} to ${dateTo}. The opening snapshot must be from the day before the period start, so GL COGS variance is blank.`,
+      ...(extraNotice ? [extraNotice] : []),
+    ],
   }
 }
 

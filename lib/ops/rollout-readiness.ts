@@ -22,6 +22,7 @@ const DEFAULT_READINESS_TIMEOUT_MS = 10_000
 const DEFAULT_READINESS_CACHE_TTL_MS = 30_000
 const TERMINAL_ACCOUNTING_RECONCILIATION_RUN_STATUSES = ['COMPLETED', 'FAILED', 'PARTIAL'] as const
 const BLOCKING_CRON_JOBS = new Set([
+  'account-balance-snapshot',
   'accounting-daily-batch',
   'accounting-sync',
   'invariant-check',

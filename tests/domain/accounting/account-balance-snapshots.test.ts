@@ -5,6 +5,7 @@ import {
   calculateAccountBalanceVarianceBase,
   findLatestAccountBalanceSnapshot,
   getAccountBalancePeriodMovement,
+  MissingAccountBalanceSnapshotError,
   normalizeBalanceDate,
   persistAccountingAccountBalanceSnapshots,
   type AccountingAccountBalanceSnapshotRow,
@@ -163,7 +164,7 @@ test('calculateAccountBalanceVarianceBase subtracts accounting balance from IMS 
   assert.equal(calculateAccountBalanceVarianceBase('125.50', '120.25').toFixed(6), '5.250000')
 })
 
-test('getAccountBalancePeriodMovement rejects stale opening snapshots', async () => {
+test('getAccountBalancePeriodMovement throws when the opening snapshot is stale', async () => {
   const client = snapshotClient([
     makeSnapshot({
       id: 'stale-opening',
@@ -181,18 +182,25 @@ test('getAccountBalancePeriodMovement rejects stale opening snapshots', async ()
     }),
   ])
 
-  const movement = await getAccountBalancePeriodMovement({
-    connector: 'xero',
-    accountCode: '600',
-    dateFrom: '2026-06-01',
-    dateTo: '2026-06-30',
-    currency: 'GBP',
-  }, client as never)
-
-  assert.equal(movement, null)
+  await assert.rejects(
+    () => getAccountBalancePeriodMovement({
+      connector: 'xero',
+      accountCode: '600',
+      dateFrom: '2026-06-01',
+      dateTo: '2026-06-30',
+      currency: 'GBP',
+    }, client as never),
+    (error) => {
+      assert.equal(error instanceof MissingAccountBalanceSnapshotError, true)
+      assert.equal((error as MissingAccountBalanceSnapshotError).reason, 'missing_previous_day_snapshot')
+      assert.equal((error as MissingAccountBalanceSnapshotError).requiredBalanceDate, '2026-05-31')
+      assert.equal((error as MissingAccountBalanceSnapshotError).foundBalanceDate, '2026-01-31')
+      return true
+    },
+  )
 })
 
-test('getAccountBalancePeriodMovement requires a previous-day opening snapshot by default', async () => {
+test('getAccountBalancePeriodMovement throws when the previous-day opening snapshot is missing by default', async () => {
   const client = snapshotClient([
     makeSnapshot({
       id: 'two-day-old-opening',
@@ -210,15 +218,22 @@ test('getAccountBalancePeriodMovement requires a previous-day opening snapshot b
     }),
   ])
 
-  const movement = await getAccountBalancePeriodMovement({
-    connector: 'xero',
-    accountCode: '600',
-    dateFrom: '2026-06-01',
-    dateTo: '2026-06-30',
-    currency: 'GBP',
-  }, client as never)
-
-  assert.equal(movement, null)
+  await assert.rejects(
+    () => getAccountBalancePeriodMovement({
+      connector: 'xero',
+      accountCode: '600',
+      dateFrom: '2026-06-01',
+      dateTo: '2026-06-30',
+      currency: 'GBP',
+    }, client as never),
+    (error) => {
+      assert.equal(error instanceof MissingAccountBalanceSnapshotError, true)
+      assert.equal((error as MissingAccountBalanceSnapshotError).reason, 'missing_previous_day_snapshot')
+      assert.equal((error as MissingAccountBalanceSnapshotError).requiredBalanceDate, '2026-05-31')
+      assert.equal((error as MissingAccountBalanceSnapshotError).foundBalanceDate, '2026-05-30')
+      return true
+    },
+  )
 })
 
 test('findLatestAccountBalanceSnapshot prefers external account id before account code', async () => {

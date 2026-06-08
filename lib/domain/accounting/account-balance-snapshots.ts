@@ -57,6 +57,45 @@ export type AccountBalancePeriodMovement = {
   movementBase: Decimal
 }
 
+export type MissingAccountBalanceSnapshotReason =
+  | 'missing_previous_day_snapshot'
+  | 'missing_closing_snapshot'
+
+export class MissingAccountBalanceSnapshotError extends Error {
+  reason: MissingAccountBalanceSnapshotReason
+  requiredBalanceDate: string
+  connector: string
+  currency: string | null
+  externalAccountId: string | null
+  accountCode: string | null
+  foundBalanceDate: string | null
+
+  constructor(input: {
+    reason: MissingAccountBalanceSnapshotReason
+    requiredBalanceDate: Date | string
+    connector: string
+    currency?: string | null
+    externalAccountId?: string | null
+    accountCode?: string | null
+    foundBalanceDate?: Date | string | null
+  }) {
+    const requiredBalanceDate = balanceDateString(input.requiredBalanceDate)
+    const foundBalanceDate = input.foundBalanceDate ? balanceDateString(input.foundBalanceDate) : null
+    const accountRef = input.accountCode ?? input.externalAccountId ?? 'unknown-account'
+    super(input.reason === 'missing_previous_day_snapshot'
+      ? `Missing previous-day account balance snapshot for ${accountRef} on ${requiredBalanceDate}.`
+      : `Missing closing account balance snapshot for ${accountRef} on ${requiredBalanceDate}.`)
+    this.name = 'MissingAccountBalanceSnapshotError'
+    this.reason = input.reason
+    this.requiredBalanceDate = requiredBalanceDate
+    this.connector = input.connector
+    this.currency = input.currency ?? null
+    this.externalAccountId = input.externalAccountId ?? null
+    this.accountCode = input.accountCode ?? null
+    this.foundBalanceDate = foundBalanceDate
+  }
+}
+
 type NormalizedAccountingAccountBalanceSnapshotInput = ReturnType<typeof normalizeInput>
 
 function assertNonEmpty(value: string, label: string): string {
@@ -183,16 +222,37 @@ export async function findLatestAccountBalanceSnapshot(
 export async function getAccountBalancePeriodMovement(
   lookup: Omit<AccountBalanceSnapshotLookup, 'balanceDate'> & { dateFrom: Date | string; dateTo: Date | string; maxOpeningStalenessDays?: number },
   client: SnapshotClient = db,
-): Promise<AccountBalancePeriodMovement | null> {
+): Promise<AccountBalancePeriodMovement> {
   const dateFrom = normalizeBalanceDate(lookup.dateFrom)
+  const requiredOpeningDate = previousDate(lookup.dateFrom)
+  const requiredClosingDate = normalizeBalanceDate(lookup.dateTo)
   const [opening, closing] = await Promise.all([
-    findLatestAccountBalanceSnapshot({ ...lookup, balanceDate: previousDate(lookup.dateFrom) }, client),
-    findLatestAccountBalanceSnapshot({ ...lookup, balanceDate: lookup.dateTo }, client),
+    findLatestAccountBalanceSnapshot({ ...lookup, balanceDate: requiredOpeningDate }, client),
+    findLatestAccountBalanceSnapshot({ ...lookup, balanceDate: requiredClosingDate }, client),
   ])
-  if (!opening || !closing) return null
   const maxStalenessDays = lookup.maxOpeningStalenessDays ?? DEFAULT_ACCOUNT_BALANCE_OPENING_MAX_STALENESS_DAYS
   const staleBefore = dateFrom.getTime() - maxStalenessDays * DAY_MS
-  if (opening.balanceDate.getTime() < staleBefore) return null
+  if (!opening || opening.balanceDate.getTime() < staleBefore) {
+    throw new MissingAccountBalanceSnapshotError({
+      reason: 'missing_previous_day_snapshot',
+      requiredBalanceDate: requiredOpeningDate,
+      connector: lookup.connector,
+      currency: lookup.currency,
+      externalAccountId: lookup.externalAccountId,
+      accountCode: lookup.accountCode,
+      foundBalanceDate: opening?.balanceDate ?? null,
+    })
+  }
+  if (!closing) {
+    throw new MissingAccountBalanceSnapshotError({
+      reason: 'missing_closing_snapshot',
+      requiredBalanceDate: requiredClosingDate,
+      connector: lookup.connector,
+      currency: lookup.currency,
+      externalAccountId: lookup.externalAccountId,
+      accountCode: lookup.accountCode,
+    })
+  }
   return {
     opening,
     closing,

@@ -94,6 +94,10 @@ export const apiRouteAuthPolicy = {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
   },
+  '/api/cron/account-balance-snapshot': {
+    access: 'cron-secret',
+    reason: 'Fetches Xero Trial Balance account balance snapshots for GL variance reports; guarded by verifyCron.',
+  },
   '/api/cron/accounting-fx-revaluation': {
     access: 'cron-secret',
     reason: 'Cron endpoint guarded by verifyCron.',
