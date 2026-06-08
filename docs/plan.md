@@ -450,6 +450,32 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 
 ---
 
+## Phase 8 — Product lifecycle controls
+
+### P8.1 — Product end-of-life flag and automatic archival
+- **Files:** `prisma/schema.prisma`, `app/(dashboard)/products/**`, `app/actions/products.ts`, `lib/domain/inventory/replenishment-reports.ts`, product/report filter APIs, scheduled inventory/product maintenance job.
+- **Problem:** Products that should no longer be bought or replenished can still appear in reorder forecasts. Operators also need a way to find end-of-life products and have them leave the active catalogue once remaining stock is exhausted.
+- **Fix:**
+  1. Add a boolean `endOfLife` field to `Product` with a default of `false`.
+  2. Add an "End of life" checkbox on the product create/edit/detail flow next to SKU/EAN/MPN and other product metadata.
+  3. Exclude `endOfLife = true` products from reorder forecasts/replenishment recommendations by default. If a report supports advanced filters, expose an explicit "include end-of-life products" option rather than silently mixing them in.
+  4. Add product-list and relevant report filters for `endOfLife` so operators can find active, end-of-life, and archived/end-of-life products.
+  5. Add an automatic archival path: when an end-of-life product has zero stock in every warehouse and no incoming stock remains, set its status to `ARCHIVED`.
+- **Acceptance:**
+  - Product create/edit persists the checkbox and shows the current value on reload.
+  - End-of-life products do not appear in reorder forecasts unless the user explicitly opts into including them.
+  - Product list/report filters can show only end-of-life products.
+  - Automatic archival does not run while any warehouse has positive on-hand stock, reserved stock that needs fulfilment, open inbound purchase-order quantity, pending transfer receipt, or pending manufacturing output for the product.
+  - Once all warehouse stock is zero and no incoming stock exists, the product is archived and an activity-log entry records the reason and evidence counts.
+- **Tests:**
+  - Product action/UI test: toggling `endOfLife` persists and renders correctly.
+  - Reorder forecast test: an end-of-life product with low/zero stock is excluded by default and included only when the filter requests it.
+  - Filter test: product list/report filters can return end-of-life products without leaking archived products unless requested.
+  - Auto-archive tests: archive when stock is zero and no incoming exists; do not archive when any warehouse stock, open PO quantity, pending transfer receipt, or pending manufacturing output exists.
+  - Activity-log test: auto-archive writes evidence metadata without sensitive payloads.
+
+---
+
 ## Quality gates — tests + invariants
 
 These are not a separate implementation phase except for the invariant CI gate. They are rules that apply to every PR in the plan.
@@ -546,6 +572,7 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
 18. **Integration settings test gate:** P7.5.
 19. **Sidebar cleanup:** P2.3, CR5.
 20. **CI invariant gate:** QG1 plus QG2's regression-test convention.
+21. **Product lifecycle controls:** P8.1.
 
 After each PR:
 - Run `npm run validate` and `npm run validate:db`.
