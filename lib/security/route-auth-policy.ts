@@ -272,7 +272,7 @@ export const apiRouteAuthPolicy = {
   },
   '/api/invoices/[id]': {
     access: 'public-webhook',
-    reason: 'Signed-URL invoice PDF endpoint; token verification is bound to invoice id, current authenticated session, and client IP.',
+    reason: 'Signed-URL invoice PDF endpoint; token verification is bound to invoice id and current authenticated session.',
   },
   '/api/manufacturing-order/[id]': {
     access: 'authenticated',

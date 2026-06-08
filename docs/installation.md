@@ -88,7 +88,7 @@ After installation, sign in and set the organisation base currency in **Settings
 | `/opt/one-two-inventory` | Application root directory |
 | `/opt/one-two-inventory/.env` | Environment configuration (chmod 600) |
 | `/var/lib/one-two-inventory/backups` | Runtime backup storage directory used by backup create/restore/upload flows |
-| `/var/lib/one-two-inventory/invoice-pdfs` | Accounting connector invoice PDFs served through short-lived, session/IP-bound signed invoice links |
+| `/var/lib/one-two-inventory/invoice-pdfs` | Accounting connector invoice PDFs served through short-lived, session-bound signed invoice links |
 | `/var/lib/one-two-inventory/uploads` | Private uploaded files served through authenticated routes, such as supplier invoice PDFs |
 | `/var/lib/one-two-inventory/public-uploads/branding` | Logo and branding images served through `/api/uploads/branding/*` |
 | `/var/lib/one-two-inventory/public-uploads/avatars` | User avatar images served through `/uploads/avatars/*` |
@@ -276,7 +276,8 @@ Key variables in the `.env` file:
 | `NEXT_PUBLIC_APP_URL` | Public URL of the application (e.g. `https://ims.yourdomain.com`) |
 | `NODE_ENV` | Set to `production` for deployment |
 | `AUTH_SECRET` | Secret key for signing session tokens (auto-generated) |
-| `INVOICE_PDF_TOKEN_TTL_SECONDS` | Lifetime for signed invoice PDF download links. Default `600` (10 minutes), maximum `600`. Tokens are bound to the invoice id, current authenticated session, and client IP, so leaked links cannot be replayed from another session or network. |
+| `INVOICE_PDF_TOKEN_TTL_SECONDS` | Lifetime for signed invoice PDF download links. Default `600` (10 minutes). Tokens are bound to the invoice id and current authenticated session, so leaked links cannot be replayed without that session. |
+| `INVOICE_PDF_TOKEN_MAX_TTL_SECONDS` | Maximum accepted invoice PDF token lifetime. Default `86400` (24 hours). Raise only for trusted internal workflows that need longer-lived links. |
 | `INVOICE_PDF_STORAGE_DIR` | Persistent storage directory for connector-downloaded invoice PDFs served through signed links. Defaults locally to `./data/invoices`; required by production preflight. Relative paths resolve against the process working directory, so production values should be absolute |
 | `SETTINGS_ENCRYPTION_KEY` | 32-byte raw key, or base64 value that decodes to 32 bytes, used to encrypt sensitive Setting values stored in the database (auto-generated) |
 | `ENCRYPTION_KEY` | Legacy fallback for older installs; if needed during migration, it must also be a 32-byte raw key or base64 value that decodes to 32 bytes |

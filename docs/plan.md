@@ -382,8 +382,8 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ### P6.4 — Invoice PDF token leakage mitigation
 - **Status:** Complete.
 - **File:** `app/api/invoices/[id]/route.ts:105`
-- **Fix:** Bind token to session ID + IP (currently IP only). Reduce TTL to 5–10 minutes. Use UUID/hash in the filename rather than the sequential order ID.
-- **Tests:** `tests/security/invoice-pdf-token.test.ts` covers session/IP binding, missing/mismatched binding rejection, 10-minute TTL cap, token-value audit redaction, and nonce-based Content-Disposition filenames.
+- **Fix:** Bind token to invoice ID + current authenticated session, keep the default TTL at 10 minutes, add a configurable max TTL, and keep the user-facing filename based on the invoice ID.
+- **Tests:** `tests/security/invoice-pdf-token.test.ts` covers session binding, missing/mismatched binding rejection, configurable max TTL, token-value audit redaction, and sanitized invoice-ID Content-Disposition filenames.
 
 ### P6.5 — Error messages reveal connector field names
 - **Status:** Complete.
@@ -545,7 +545,7 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
    - [x] P5.3 — GL period movement requires a previous-day opening snapshot by default.
 13. **Security hardening batch:**
    - [x] P6.2 — Supplier portal actions assert the session supplier owns loaded RFQ/product resources.
-   - [x] P6.4 — Invoice PDF tokens are short-lived and bound to invoice id, authenticated session, and client IP.
+   - [x] P6.4 — Invoice PDF tokens are short-lived and bound to invoice id and authenticated session.
    - [x] P6.5 — WooCommerce connector API surfaces return generic configuration errors.
    - [x] P6.6 — User passwords require 12+ chars with uppercase, number, symbol, and common-password rejection.
    - [x] P6.8 — Activity log metadata redacts password/secret/token fields recursively.

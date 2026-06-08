@@ -26,12 +26,13 @@ type InvoicePdfTokenAuditInput = {
   verification: PdfTokenVerificationResult
   tokenPresent: boolean
   tokenLength: number
+  userAgent: string | null
 }
 
 type InvoicePdfRouteDependencies = {
   loadInvoicePdf: typeof loadInvoicePdf
   verifyPdfToken: typeof verifyPdfTokenDetailed
-  getTokenBinding: (request: NextRequest) => Promise<InvoicePdfTokenBinding | null>
+  getTokenBinding: () => Promise<InvoicePdfTokenBinding | null>
   auditTokenAttempt: (input: InvoicePdfTokenAuditInput) => Promise<void>
   checkRateLimit?: (key: string, max: number, windowMs: number) => Promise<RateLimitResult>
 }
@@ -57,18 +58,16 @@ function safeInvoiceFilenameId(id: string): string {
   return safe.length > 0 ? safe : 'invoice'
 }
 
-async function getInvoicePdfTokenBinding(request: NextRequest): Promise<InvoicePdfTokenBinding | null> {
+async function getInvoicePdfTokenBinding(): Promise<InvoicePdfTokenBinding | null> {
   const session = await auth()
   if (!session?.user?.id || session.user.sessionInvalidReason) return null
   if (session.user.totpEnabled && !session.user.totpVerified) return null
-  const clientIp = getClientIp(request.headers) ?? 'unknown'
   return {
     sessionId: buildInvoicePdfSessionBinding({
       userId: session.user.id,
       sessionVersion: session.user.sessionVersion,
       sessionAuthTime: session.user.sessionAuthTime,
     }),
-    clientIp,
   }
 }
 
@@ -83,6 +82,7 @@ async function auditTokenAttemptSafely(
       orderId: input.orderId,
       tokenPresent: input.tokenPresent,
       tokenLength: input.tokenLength,
+      userAgent: input.userAgent,
       accepted: input.verification.valid,
       reason: input.verification.valid ? null : input.verification.reason,
       error: error instanceof Error ? error.message : String(error),
@@ -93,12 +93,13 @@ async function auditTokenAttemptSafely(
 /** @internal Test seam for the invoice PDF route handler. */
 export async function auditInvoicePdfTokenAttempt(input: InvoicePdfTokenAuditInput): Promise<void> {
   const accepted = input.verification.valid
+  const suspiciousSessionMismatch = !accepted && input.verification.reason === 'wrong_session'
   await logActivity({
     entityType: 'SALES_ORDER',
     entityId: input.orderId,
     tag: 'auth',
     action: accepted ? 'invoice_pdf_token_verified' : 'invoice_pdf_token_rejected',
-    level: accepted ? 'INFO' : 'WARNING',
+    level: accepted || !suspiciousSessionMismatch ? 'INFO' : 'WARNING',
     description: accepted
       ? 'Invoice PDF token accepted'
       : `Invoice PDF token rejected: ${input.verification.reason}`,
@@ -106,6 +107,8 @@ export async function auditInvoicePdfTokenAttempt(input: InvoicePdfTokenAuditInp
       tokenPresent: input.tokenPresent,
       tokenLength: input.tokenLength,
       tokenFormat: 'expiring',
+      userAgent: input.userAgent,
+      suspiciousSessionMismatch,
       reason: accepted ? null : input.verification.reason,
     },
     resolveUser: false,
@@ -121,6 +124,7 @@ export async function handleInvoicePdfRoute(
   const { id } = params
   const token = request.nextUrl.searchParams.get('token')
   const tokenLength = token?.length ?? 0
+  const userAgent = request.headers.get('user-agent')
   const clientIp = getClientIp(request.headers) ?? 'unknown'
   const rateLimit = await dependencies.checkRateLimit?.(`invoice-pdf:${clientIp}`, 30, 60_000)
   if (rateLimit && !rateLimit.allowed) {
@@ -136,7 +140,7 @@ export async function handleInvoicePdfRoute(
     )
   }
 
-  const tokenBinding = await dependencies.getTokenBinding(request)
+  const tokenBinding = await dependencies.getTokenBinding()
   const verification = dependencies.verifyPdfToken(id, token, { binding: tokenBinding ?? undefined })
   if (!verification.valid) {
     await auditTokenAttemptSafely(dependencies, {
@@ -144,8 +148,9 @@ export async function handleInvoicePdfRoute(
       verification,
       tokenPresent: Boolean(token),
       tokenLength,
+      userAgent,
     })
-    return jsonNoStore({ error: 'Invalid or missing token' }, 403)
+    return jsonNoStore({ error: 'Invalid or expired invoice PDF link. Refresh the invoice page to request a new link.' }, 403)
   }
 
   await auditTokenAttemptSafely(dependencies, {
@@ -153,6 +158,7 @@ export async function handleInvoicePdfRoute(
     verification,
     tokenPresent: Boolean(token),
     tokenLength,
+    userAgent,
   })
 
   const pdf = await dependencies.loadInvoicePdf(id)
@@ -164,7 +170,7 @@ export async function handleInvoicePdfRoute(
     status: 200,
     headers: {
       'Content-Type': 'application/pdf',
-      'Content-Disposition': `inline; filename="invoice-${safeInvoiceFilenameId(verification.payload.nonce)}.pdf"`,
+      'Content-Disposition': `inline; filename="invoice-${safeInvoiceFilenameId(id)}.pdf"`,
       ...NO_STORE_HEADERS,
     },
   })

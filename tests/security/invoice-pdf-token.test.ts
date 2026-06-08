@@ -19,7 +19,6 @@ const NOW = new Date('2026-05-27T10:00:00.000Z')
 const NOW_SECONDS = seconds(NOW)
 const BINDING: InvoicePdfTokenBinding = {
   sessionId: 'user-1:3:1700000000',
-  clientIp: '203.0.113.10',
 }
 
 async function withInvoiceTokenEnv<T>(
@@ -49,8 +48,8 @@ function bareDeterministicToken(orderId: string): string {
   return createHmac('sha256', SECRET).update(orderId, 'utf8').digest('hex')
 }
 
-function testBindingHash(kind: keyof InvoicePdfTokenBinding, value: string): string {
-  return createHmac('sha256', SECRET).update(`invoice-pdf:${kind}:${value}`, 'utf8').digest('hex')
+function testSessionBindingHash(value: string): string {
+  return createHmac('sha256', SECRET).update(`invoice-pdf:sessionId:${value}`, 'utf8').digest('hex')
 }
 
 function verifyOptions(now: Date = NOW) {
@@ -65,8 +64,7 @@ function validPayload(overrides: Partial<InvoicePdfTokenPayload> = {}): InvoiceP
     iat: NOW_SECONDS,
     exp: NOW_SECONDS + 60,
     nonce: 'nonce-1',
-    sessionHash: testBindingHash('sessionId', BINDING.sessionId),
-    ipHash: testBindingHash('clientIp', BINDING.clientIp),
+    sessionHash: testSessionBindingHash(BINDING.sessionId),
     ...overrides,
   }
 }
@@ -111,12 +109,29 @@ test('invoice PDF token signing rejects invalid TTL options', async () => {
       /positive integer/,
     )
     assert.throws(
-      () => signPdfToken('order-1', { now: NOW, ttlSeconds: 10 * 60 + 1, nonce: 'nonce-1', binding: BINDING }),
+      () => signPdfToken('order-1', {
+        now: NOW,
+        ttlSeconds: 24 * 60 * 60 + 1,
+        nonce: 'nonce-1',
+        binding: BINDING,
+      }),
       /must not exceed/,
     )
     assert.throws(
       () => signPdfToken('order-1', { now: NOW, ttlSeconds: 60, nonce: 'nonce-1' }),
-      /requires session and client IP bindings/,
+      /requires a session binding/,
+    )
+  })
+})
+
+test('invoice PDF token max TTL is configurable', async () => {
+  await withInvoiceTokenEnv({ INVOICE_PDF_TOKEN_MAX_TTL_SECONDS: '3600' }, () => {
+    assert.doesNotThrow(() => {
+      signPdfToken('order-1', { now: NOW, ttlSeconds: 3600, nonce: 'nonce-1', binding: BINDING })
+    })
+    assert.throws(
+      () => signPdfToken('order-1', { now: NOW, ttlSeconds: 3601, nonce: 'nonce-1', binding: BINDING }),
+      /must not exceed 3600 seconds/,
     )
   })
 })
@@ -154,13 +169,6 @@ test('invoice PDF token verification rejects missing or mismatched bindings', as
       }),
       { valid: false, reason: 'wrong_session' },
     )
-    assert.deepEqual(
-      verifyPdfTokenDetailed('order-1', token, {
-        now: NOW,
-        binding: { ...BINDING, clientIp: '203.0.113.11' },
-      }),
-      { valid: false, reason: 'wrong_ip' },
-    )
   })
 })
 
@@ -190,7 +198,7 @@ test('invoice PDF token verification rejects invalid version and TTL windows', a
     assert.deepEqual(
       verifyPdfTokenDetailed(
         'order-1',
-        signedPayload(validPayload({ exp: NOW_SECONDS + 10 * 60 + 1 })),
+        signedPayload(validPayload({ exp: NOW_SECONDS + 24 * 60 * 60 + 1 })),
         verifyOptions(),
       ),
       { valid: false, reason: 'ttl_exceeded' },
@@ -243,9 +251,12 @@ test('invoice PDF route audits rejected token attempts without logging token val
     verification: PdfTokenVerificationResult
     tokenPresent: boolean
     tokenLength: number
+    userAgent: string | null
   }> = []
   const response = await handleInvoicePdfRoute(
-    new NextRequest(`http://ims.test/api/invoices/order-1?token=${token}`),
+    new NextRequest(`http://ims.test/api/invoices/order-1?token=${token}`, {
+      headers: { 'user-agent': 'InvoiceAuditTest/1.0' },
+    }),
     { id: 'order-1' },
     {
       async loadInvoicePdf() {
@@ -269,6 +280,7 @@ test('invoice PDF route audits rejected token attempts without logging token val
   assert.equal(audits[0].orderId, 'order-1')
   assert.equal(audits[0].tokenPresent, true)
   assert.equal(audits[0].tokenLength, token.length)
+  assert.equal(audits[0].userAgent, 'InvoiceAuditTest/1.0')
   assert.deepEqual(audits[0].verification, { valid: false, reason: 'bad_signature' })
   assert.doesNotMatch(JSON.stringify(audits), /secret-token-value/)
 })
@@ -279,6 +291,7 @@ test('invoice PDF route audits accepted tokens and serves PDFs with no-store cac
     verification: PdfTokenVerificationResult
     tokenPresent: boolean
     tokenLength: number
+    userAgent: string | null
   }> = []
   const response = await handleInvoicePdfRoute(
     new NextRequest('http://ims.test/api/invoices/order-1?token=valid-token'),
@@ -342,7 +355,7 @@ test('invoice PDF route sanitizes the Content-Disposition filename', async () =>
   assert.equal(response.status, 200)
   assert.equal(
     response.headers.get('content-disposition'),
-    'inline; filename="invoice-nonce_with__bad_chars.pdf"',
+    'inline; filename="invoice-order___Set-Cookie_x.pdf"',
   )
 })
 
