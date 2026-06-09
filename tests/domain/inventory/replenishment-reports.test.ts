@@ -7,6 +7,7 @@ import {
   getReorderReport,
   type ReplenishmentReportClient,
 } from '@/lib/domain/inventory/replenishment-reports'
+import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 function decimal(value: string | number): Prisma.Decimal {
   return new Prisma.Decimal(value)
@@ -29,6 +30,20 @@ function unusedClient(): ReplenishmentReportClient {
 
 const category = { id: 'category-1', name: 'Finished goods' }
 const supplier = { name: 'Supplier A' }
+
+test('reorder report throws a typed source-scan error at the source row cap', async () => {
+  const client: ReplenishmentReportClient = {
+    ...unusedClient(),
+    product: {
+      findMany: async () => Array.from({ length: 50001 }, (_, index) => ({ id: `product-${index}` })),
+    },
+  }
+
+  await assert.rejects(
+    getReorderReport({}, { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } }),
+    (error: unknown) => error instanceof SourceScanTooLargeError && /Replenishment product source rows exceed 50,000/.test(error.message),
+  )
+})
 
 test('reorder report nets available and inbound open PO against lead-time demand', async () => {
   const client: ReplenishmentReportClient = {

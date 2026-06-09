@@ -1,15 +1,15 @@
 import type { Metadata } from 'next'
 import { requireRole } from '@/lib/auth/server'
-import { getThroughputAnalyticsReport, type ThroughputReportRow } from '@/lib/domain/sales/sales-fulfillment-analytics'
+import type { ThroughputReportRow } from '@/lib/domain/sales/sales-fulfillment-analytics'
 import { SalesAnalyticsReportPage, type SalesAnalyticsColumn } from '../_components/sales-analytics-report'
-import { salesAnalyticsFiltersForUi, salesAnalyticsFiltersFromSearch, type SalesAnalyticsSearchParams } from '../_components/sales-analytics-page-utils'
+import { loadThroughputAnalyticsReportForPage, salesAnalyticsFiltersForUi, salesAnalyticsFiltersFromSearch, type SalesAnalyticsSearchParams } from '../_components/sales-analytics-page-utils'
 
 export const metadata: Metadata = { title: 'Throughput' }
 
 export default async function ThroughputAnalyticsPage({ searchParams }: { searchParams: Promise<SalesAnalyticsSearchParams> }) {
   await requireRole('ADMIN', 'MANAGER', 'FINANCE')
   const filters = salesAnalyticsFiltersFromSearch(await searchParams)
-  const report = await getThroughputAnalyticsReport(filters)
+  const report = await loadThroughputAnalyticsReportForPage(filters)
   const columns: Array<SalesAnalyticsColumn<ThroughputReportRow>> = [
     { key: 'date', label: 'Date', render: (row) => row.date, footer: 'Totals' },
     { key: 'user', label: 'User', render: (row) => row.userName },

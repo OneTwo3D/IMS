@@ -1,7 +1,7 @@
-import { getCurrencySummaryReport, type CurrencySummaryReportRow } from '@/lib/domain/finance/finance-period-analytics'
+import type { CurrencySummaryReportRow } from '@/lib/domain/finance/finance-period-analytics'
 import { requireFinanceAnalyticsAccess } from '@/lib/security/finance-analytics-page-access'
 import { FinanceAnalyticsReportPage, type FinanceAnalyticsColumn } from '../_components/finance-analytics-report'
-import { financeAnalyticsFiltersForUi, financeAnalyticsFiltersFromSearch, type FinanceAnalyticsSearchParams } from '../_components/finance-analytics-page-utils'
+import { financeAnalyticsFiltersForUi, financeAnalyticsFiltersFromSearch, loadCurrencySummaryReportForPage, type FinanceAnalyticsSearchParams } from '../_components/finance-analytics-page-utils'
 
 type Props = { searchParams: Promise<FinanceAnalyticsSearchParams> }
 
@@ -22,7 +22,7 @@ const columns: Array<FinanceAnalyticsColumn<CurrencySummaryReportRow>> = [
 export default async function CurrencySummaryAnalyticsPage({ searchParams }: Props) {
   await requireFinanceAnalyticsAccess()
   const filters = financeAnalyticsFiltersFromSearch(await searchParams)
-  const report = await getCurrencySummaryReport(filters)
+  const report = await loadCurrencySummaryReportForPage(filters)
   return (
     <FinanceAnalyticsReportPage
       title="Currency Summary"

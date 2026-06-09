@@ -113,7 +113,7 @@ test('production variance compares BOM planned quantities with PRODUCTION_OUT co
         status: { in: ['IN_PROGRESS', 'COMPLETED'] },
         completedAt: {
           gte: new Date('2026-05-01T00:00:00Z'),
-          lte: new Date('2026-05-31T23:59:59.999Z'),
+          lt: new Date('2026-06-01T00:00:00Z'),
         },
       },
       orderBy: [{ completedAt: 'desc' }, { reference: 'asc' }],
@@ -266,7 +266,7 @@ test('production variance scopes by completedAt and consumption-capable statuses
     status: { in: ['IN_PROGRESS', 'COMPLETED'] },
     completedAt: {
       gte: new Date('2026-03-01T00:00:00Z'),
-      lte: new Date('2026-03-31T23:59:59.999Z'),
+      lt: new Date('2026-04-01T00:00:00Z'),
     },
   })
   assert.deepEqual((stockMovementArgs[0] as { where: { referenceId: { in: string[] } } }).where.referenceId.in, ['po-completed'])

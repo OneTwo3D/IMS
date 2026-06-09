@@ -1,4 +1,17 @@
-import type { SalesAnalyticsFilters, SalesAnalyticsGroupBy, SalesCurrencyMode } from '@/lib/domain/sales/sales-fulfillment-analytics'
+import {
+  emptySalesAnalyticsReportForSourceLimit,
+  getCustomerAnalyticsReport,
+  getFulfillmentAnalyticsReport,
+  getMarginAnalyticsReport,
+  getReturnsAnalyticsReport,
+  getSalesAnalyticsReport,
+  getThroughputAnalyticsReport,
+  type SalesAnalyticsFilters,
+  type SalesAnalyticsGroupBy,
+  type SalesAnalyticsReport,
+  type SalesCurrencyMode,
+} from '@/lib/domain/sales/sales-fulfillment-analytics'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import type { SalesAnalyticsFilterValues } from './sales-analytics-report'
 
 export type SalesAnalyticsSearchParams = Record<string, string | string[] | undefined>
@@ -39,4 +52,50 @@ export function salesAnalyticsFiltersForUi(filters: SalesAnalyticsFilters): Sale
     currencyMode: filters.currencyMode,
     pageSize: String(filters.pageSize ?? 100),
   }
+}
+
+export const salesAnalyticsEmptyTotals = {
+  sales: { revenue: '0', tax: '0', shipping: '0', discount: '0' },
+  customers: { revenueBase: '0', grossProfitBase: '0', arExposureBase: '0' },
+  margin: { revenueBase: '0', cogsBase: '0', grossProfitBase: '0', marginPct: '0' },
+  returns: { refundValueBase: '0', returnedQty: '0' },
+  fulfillment: { shippedOrders: '0', shippedQty: '0' },
+  throughput: { orders: '0', shipments: '0', lines: '0', queueDepth: '0' },
+} as const satisfies Record<string, Record<string, string>>
+
+async function loadSalesAnalyticsReportForPage<Row>(
+  filters: SalesAnalyticsFilters,
+  load: (filters: SalesAnalyticsFilters) => Promise<SalesAnalyticsReport<Row>>,
+  emptyTotals: Record<string, string>,
+): Promise<SalesAnalyticsReport<Row>> {
+  try {
+    return await load(filters)
+  } catch (error) {
+    if (isSourceScanTooLargeError(error)) return emptySalesAnalyticsReportForSourceLimit<Row>(filters, error, emptyTotals)
+    throw error
+  }
+}
+
+export function loadSalesReportForPage(filters: SalesAnalyticsFilters, load = getSalesAnalyticsReport) {
+  return loadSalesAnalyticsReportForPage(filters, load, salesAnalyticsEmptyTotals.sales)
+}
+
+export function loadCustomerAnalyticsReportForPage(filters: SalesAnalyticsFilters, load = getCustomerAnalyticsReport) {
+  return loadSalesAnalyticsReportForPage(filters, load, salesAnalyticsEmptyTotals.customers)
+}
+
+export function loadMarginAnalyticsReportForPage(filters: SalesAnalyticsFilters, load = getMarginAnalyticsReport) {
+  return loadSalesAnalyticsReportForPage(filters, load, salesAnalyticsEmptyTotals.margin)
+}
+
+export function loadReturnsAnalyticsReportForPage(filters: SalesAnalyticsFilters, load = getReturnsAnalyticsReport) {
+  return loadSalesAnalyticsReportForPage(filters, load, salesAnalyticsEmptyTotals.returns)
+}
+
+export function loadFulfillmentAnalyticsReportForPage(filters: SalesAnalyticsFilters, load = getFulfillmentAnalyticsReport) {
+  return loadSalesAnalyticsReportForPage(filters, load, salesAnalyticsEmptyTotals.fulfillment)
+}
+
+export function loadThroughputAnalyticsReportForPage(filters: SalesAnalyticsFilters, load = getThroughputAnalyticsReport) {
+  return loadSalesAnalyticsReportForPage(filters, load, salesAnalyticsEmptyTotals.throughput)
 }

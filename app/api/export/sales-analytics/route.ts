@@ -13,6 +13,7 @@ import {
   type SalesCurrencyMode,
 } from '@/lib/domain/sales/sales-fulfillment-analytics'
 import { canAccessSalesAnalytics } from '@/lib/security/sales-analytics-access'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 const SALES_ANALYTICS_CSV_ROW_LIMIT = 50000
 
@@ -63,7 +64,8 @@ export async function GET(req: NextRequest) {
   const reportType = req.nextUrl.searchParams.get('report') ?? 'sales'
   const date = new Date().toISOString().slice(0, 10)
 
-  switch (reportType) {
+  try {
+    switch (reportType) {
     case 'sales': {
       const report = await getSalesAnalyticsReport({ ...filters, pageSize: SALES_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
@@ -100,5 +102,9 @@ export async function GET(req: NextRequest) {
     }
     default:
       return NextResponse.json({ error: 'Unknown sales analytics export type' }, { status: 400 })
+    }
+  } catch (error) {
+    if (isSourceScanTooLargeError(error)) return NextResponse.json({ error: error.message }, { status: 413 })
+    throw error
   }
 }

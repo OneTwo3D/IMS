@@ -11,6 +11,8 @@ import { getOnHandAsOf, type OnHandAsOfRow } from '@/lib/domain/inventory/get-on
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { calculateInventoryTurnover, normalizeVelocityWindow } from '@/lib/domain/inventory/velocity'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { dateOnly as utcDateOnly, exclusiveEndOfUtcDay, parseDateOnly as parseUtcDateOnly, subtractUtcDays } from '@/lib/domain/math/date-window'
+import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import { getXeroSettings } from '@/lib/connectors/xero/settings'
 import { syncXeroAccountBalanceSnapshots } from '@/lib/connectors/xero/account-balances'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
@@ -182,13 +184,16 @@ export type InventoryTurnoverReport = {
   notices: string[]
 }
 
-export class InventoryTurnoverSourceLimitError extends Error {
+export class InventoryTurnoverSourceLimitError extends SourceScanTooLargeError {
   source: 'COGS' | 'snapshot'
   rowCount: number
   limit: number
 
   constructor(source: 'COGS' | 'snapshot', rowCount: number, limit: number) {
-    super(`Inventory turnover ${source} scan exceeds ${limit.toLocaleString()} rows. Narrow the date range or filters and retry.`)
+    super(`Inventory turnover ${source} scan`, limit, {
+      rowCount,
+      message: `Inventory turnover ${source} scan exceeds ${limit.toLocaleString()} rows. Narrow the date range or filters and retry.`,
+    })
     this.name = 'InventoryTurnoverSourceLimitError'
     this.source = source
     this.rowCount = rowCount
@@ -403,19 +408,16 @@ function dateSearchParam(value: string | string[] | undefined): string | undefin
 }
 
 function today(): string {
-  return new Date().toISOString().slice(0, 10)
+  return utcDateOnly(new Date())
 }
 
 function daysAgo(days: number): string {
-  const date = new Date()
-  date.setUTCDate(date.getUTCDate() - days)
-  return date.toISOString().slice(0, 10)
+  return utcDateOnly(subtractUtcDays(new Date(), days))
 }
 
 function parseDateOnly(value: string | undefined, fallback: string, endOfDay = false): Date {
   const source = isValidDateOnly(value) ? value : fallback
-  const [year, month, day] = source.split('-').map(Number)
-  return new Date(Date.UTC(year!, month! - 1, day!, endOfDay ? 23 : 0, endOfDay ? 59 : 0, endOfDay ? 59 : 0, endOfDay ? 999 : 0))
+  return parseUtcDateOnly(source, parseUtcDateOnly(fallback, new Date()), { endOfDay })
 }
 
 function formatDateTime(value: Date): string {
@@ -1105,9 +1107,10 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
   const dateTo = filters.dateTo ?? today()
   const from = parseDateOnly(dateFrom, daysAgo(30))
   const to = parseDateOnly(dateTo, today(), true)
+  const toExclusive = exclusiveEndOfUtcDay(to)
   const groupBy = isCogsGroupBy(filters.groupBy) ? filters.groupBy : 'product'
   const cogsWhere: Prisma.CogsEntryWhereInput = {
-    createdAt: { gte: from, lte: to },
+    createdAt: { gte: from, lt: toExclusive },
     movement: {
       // COGS currently comes from outbound inventory consumption. Those
       // movements leave stock through fromWarehouseId; extend this if a future
@@ -1265,6 +1268,7 @@ export async function getInventoryTurnoverReport(filters: InventoryCostingFilter
   const window = normalizeVelocityWindow({ dateFrom, dateTo })
   const from = window.dateFrom
   const to = window.dateTo
+  const toExclusive = exclusiveEndOfUtcDay(to)
   const snapshotFrom = window.dateFrom
   const snapshotTo = window.dateTo
   const groupBy = isInventoryTurnoverGroupBy(filters.groupBy) ? filters.groupBy : 'product'
@@ -1273,7 +1277,7 @@ export async function getInventoryTurnoverReport(filters: InventoryCostingFilter
 
   const cogsRows: CogsEntryRow[] = await client.cogsEntry.findMany({
     where: {
-      createdAt: { gte: from, lte: to },
+      createdAt: { gte: from, lt: toExclusive },
       movement: {
         type: StockMovementType.SALE_DISPATCH,
         ...(filters.warehouseId ? { fromWarehouseId: filters.warehouseId } : {}),
@@ -1437,9 +1441,10 @@ export async function getLandedCostReport(filters: InventoryCostingFilters = {},
   const dateTo = filters.dateTo ?? today()
   const from = parseDateOnly(dateFrom, daysAgo(90))
   const to = parseDateOnly(dateTo, today(), true)
+  const toExclusive = exclusiveEndOfUtcDay(to)
   const landedCostWhere: Prisma.PurchaseOrderLineWhereInput = {
     po: {
-      createdAt: { gte: from, lte: to },
+      createdAt: { gte: from, lt: toExclusive },
       ...(filters.landedCostMethod ? { landedCostMethod: filters.landedCostMethod } : {}),
       ...(filters.supplierId ? { supplierId: filters.supplierId } : {}),
       ...(filters.warehouseId ? { destinationWarehouseId: filters.warehouseId } : {}),

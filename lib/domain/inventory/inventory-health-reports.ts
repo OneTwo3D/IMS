@@ -12,6 +12,8 @@ import {
 } from '@/lib/domain/inventory/velocity'
 import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { exclusiveEndOfUtcDay, subtractUtcDays } from '@/lib/domain/math/date-window'
+import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -28,15 +30,12 @@ const PRODUCT_TYPES = Object.values(ProductType)
 
 export const INVENTORY_AGING_KIT_MODE = 'component' as const
 
-export class InventoryHealthSourceLimitError extends Error {
-  readonly limit: number
-  readonly scanLabel: string
-
+export class InventoryHealthSourceLimitError extends SourceScanTooLargeError {
   constructor(limit: number, scanLabel: string) {
-    super(`Inventory health ${scanLabel} exceeds ${limit.toLocaleString()} rows. Narrow product, warehouse, category, supplier, type, or date filters and retry.`)
+    super(`Inventory health ${scanLabel}`, limit, {
+      message: `Inventory health ${scanLabel} exceeds ${limit.toLocaleString()} rows. Narrow product, warehouse, category, supplier, type, or date filters and retry.`,
+    })
     this.name = 'InventoryHealthSourceLimitError'
-    this.limit = limit
-    this.scanLabel = scanLabel
   }
 }
 
@@ -264,7 +263,7 @@ function dateOnly(value: Date): string {
 }
 
 function subtractDays(value: Date, days: number): Date {
-  return new Date(value.getTime() - days * 24 * 60 * 60 * 1000)
+  return subtractUtcDays(value, days)
 }
 
 function parseThresholdDays(value: unknown): number {
@@ -760,10 +759,11 @@ async function loadDeadStockVelocityRows(
   filters: StockPositionFilters,
   velocityWindow: { dateFrom: Date; dateTo: Date },
 ): Promise<VelocitySaleInput[]> {
+  const dateToExclusive = exclusiveEndOfUtcDay(velocityWindow.dateTo)
   const movements = await client.stockMovement.findMany({
     where: {
       type: StockMovementType.SALE_DISPATCH,
-      createdAt: { gte: velocityWindow.dateFrom, lte: velocityWindow.dateTo },
+      createdAt: { gte: velocityWindow.dateFrom, lt: dateToExclusive },
       ...(filters.warehouseId ? { fromWarehouseId: filters.warehouseId } : {}),
       product: productWhere(filters),
     },

@@ -9,6 +9,7 @@ import {
   getSupplierPerformanceReport,
   type PurchasingAnalyticsClient,
 } from '@/lib/domain/purchasing/purchasing-analytics'
+import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 function decimal(value: string | number): Prisma.Decimal {
   return new Prisma.Decimal(value)
@@ -28,6 +29,20 @@ function unusedClient(): PurchasingAnalyticsClient {
 const supplier = { name: 'Supplier A' }
 const category = { name: 'Components' }
 const product = { sku: 'SKU-1', name: 'Widget', category }
+
+test('open purchase order report throws a typed source-scan error at the source row cap', async () => {
+  const client: PurchasingAnalyticsClient = {
+    ...unusedClient(),
+    purchaseOrder: {
+      findMany: async () => Array.from({ length: 50001 }, (_, index) => ({ id: `po-${index}` })),
+    },
+  }
+
+  await assert.rejects(
+    getOpenPurchaseOrdersReport({}, { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } }),
+    (error: unknown) => error instanceof SourceScanTooLargeError && /Open purchase order source rows exceed 50,000/.test(error.message),
+  )
+})
 
 test('open purchase order report uses only open statuses and nets received and returned quantities', async () => {
   const client: PurchasingAnalyticsClient = {
@@ -60,6 +75,32 @@ test('open purchase order report uses only open statuses and nets received and r
   assert.equal(report.rows[0]?.outstandingQty, '5')
   assert.equal(report.rows[0]?.outstandingValueBase, '15')
   assert.equal(report.rows[0]?.overdue, true)
+})
+
+test('purchasing analytics formats base amounts with the configured base currency minor units', async () => {
+  const client: PurchasingAnalyticsClient = {
+    ...unusedClient(),
+    purchaseOrder: {
+      findMany: async () => [{
+        id: 'po-1',
+        reference: 'PO-1',
+        status: PurchaseOrderStatus.PO_SENT,
+        poSentAt: new Date('2026-06-01T00:00:00.000Z'),
+        expectedDelivery: null,
+        createdAt: new Date('2026-06-01T00:00:00.000Z'),
+        supplierId: 'supplier-1',
+        supplier,
+        lines: [{ qty: decimal('1'), qtyReceived: decimal('0'), qtyReturned: decimal('0'), unitCostBase: decimal('10.5'), landedUnitCostBase: decimal('10.5') }],
+      }],
+    },
+  }
+
+  const report = await getOpenPurchaseOrdersReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-30' },
+    { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z'), baseCurrency: async () => 'JPY' } },
+  )
+
+  assert.equal(report.totals.outstandingValueBase, '11')
 })
 
 test('supplier performance uses receipt timestamps for on-time and return-rate metrics', async () => {

@@ -9,6 +9,7 @@ import {
   getVatReport,
   type FinanceAnalyticsClient,
 } from '@/lib/domain/finance/finance-period-analytics'
+import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 function decimal(value: string | number): Prisma.Decimal {
   return new Prisma.Decimal(value)
@@ -29,6 +30,20 @@ const settings = async () => ({
   accountsReceivableAccount: '110',
   accountsPayableAccount: '210',
   realisedFxGainLossAccount: '610',
+})
+
+test('AR aging report throws a typed source-scan error at the source row cap', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...unusedClient(),
+    salesOrder: {
+      findMany: async () => Array.from({ length: 50001 }, (_, index) => ({ id: `so-${index}` })),
+    },
+  }
+
+  await assert.rejects(
+    getArAgingReport({}, { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z') } }),
+    (error: unknown) => error instanceof SourceScanTooLargeError && /AR aging source rows exceed 50,000/.test(error.message),
+  )
 })
 
 test('VAT report subtracts tax from taxable base for tax-inclusive orders', async () => {
@@ -57,6 +72,31 @@ test('VAT report subtracts tax from taxable base for tax-inclusive orders', asyn
   assert.equal(report.rows[0]?.taxBase, '20')
   assert.equal(report.totals.taxableBase, '100')
   assert.equal(report.totals.taxBase, '20')
+})
+
+test('finance analytics formats base amounts with the configured base currency minor units', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...unusedClient(),
+    salesOrderLine: {
+      findMany: async () => [
+        {
+          taxRateId: 'tax-0',
+          taxForeign: decimal('0'),
+          taxBase: decimal('0'),
+          totalBase: decimal('100.5'),
+          order: { shippingAddress: { country: 'JP' }, pricesIncludeVat: false },
+          taxRate: { name: 'No VAT', rate: decimal('0'), accountingTaxType: 'NONE', countryCode: 'JP' },
+        },
+      ],
+    },
+  }
+
+  const report = await getVatReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-30' },
+    { deps: { client, now: () => new Date('2026-06-30T00:00:00.000Z'), baseCurrency: async () => 'JPY' } },
+  )
+
+  assert.equal(report.totals.taxableBase, '101')
 })
 
 test('VAT report keeps totalBase as taxable base for tax-exclusive orders', async () => {

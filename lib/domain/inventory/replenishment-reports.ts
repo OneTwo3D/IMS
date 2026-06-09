@@ -1,10 +1,12 @@
 import { Prisma, ProductType, PurchaseOrderStatus, SalesOrderStatus, StockMovementType } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay } from '@/lib/domain/math/date-window'
 import { calculateDailyVelocity, type VelocitySaleInput } from '@/lib/domain/inventory/velocity'
 import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { getObservedLeadTimeP95BySupplierProduct } from '@/lib/domain/purchasing/purchasing-analytics'
+import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -308,22 +310,50 @@ function paginate<T>(rows: T[], page: number | undefined, pageSize: number, enab
   return { rows: rows.slice(start, start + pageSize), pageInfo: info }
 }
 
-function dateOnly(date: Date): string {
-  return date.toISOString().slice(0, 10)
+export function emptyReorderReportForSourceLimit(
+  filters: StockPositionFilters,
+  error: SourceScanTooLargeError,
+  now = new Date(),
+): ReorderReport {
+  const demandDays = parsePositiveInteger(filters.thresholdDays, DEFAULT_DEMAND_WINDOW_DAYS)
+  const window = demandWindow(now, demandDays)
+  return {
+    generatedAt: now.toISOString(),
+    demandWindowDateFrom: dateOnly(window.dateFrom),
+    demandWindowDateTo: dateOnly(window.dateTo),
+    rows: [],
+    pageInfo: pageInfo(0, filters.page, clampPageSize(filters.pageSize)),
+    totals: { availableQty: '0', inboundOpenPoQty: '0', suggestedReorderQty: '0' },
+    notices: [error.message],
+  }
 }
 
-function startOfUtcDay(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
+export function emptyBackorderDemandReportForSourceLimit(
+  filters: StockPositionFilters,
+  error: SourceScanTooLargeError,
+  now = new Date(),
+): BackorderDemandReport {
+  return {
+    generatedAt: now.toISOString(),
+    rows: [],
+    pageInfo: pageInfo(0, filters.page, clampPageSize(filters.pageSize)),
+    totals: { orderedQty: '0', committedQty: '0', allocatedQty: '0', backorderQty: '0' },
+    notices: [error.message],
+  }
 }
 
-function endOfUtcDay(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 23, 59, 59, 999))
-}
-
-function subtractDays(date: Date, days: number): Date {
-  const next = new Date(date)
-  next.setUTCDate(next.getUTCDate() - days)
-  return next
+export function emptyComponentShortageReportForSourceLimit(
+  filters: StockPositionFilters,
+  error: SourceScanTooLargeError,
+  now = new Date(),
+): ComponentShortageReport {
+  return {
+    generatedAt: now.toISOString(),
+    rows: [],
+    pageInfo: pageInfo(0, filters.page, clampPageSize(filters.pageSize)),
+    totals: { requiredQty: '0', availableQty: '0', inboundOpenPoQty: '0', shortageQty: '0' },
+    notices: [error.message],
+  }
 }
 
 function parsePositiveInteger(value: number | undefined, fallback: number): number {
@@ -403,7 +433,7 @@ function availabilityBreakdownByProduct(stockLevels: StockLevelRow[]): Map<strin
 }
 
 async function loadOpenPoLines(client: ReplenishmentReportClient, filters: StockPositionFilters): Promise<OpenPoLineRow[]> {
-  return client.purchaseOrderLine.findMany({
+  const lines = await client.purchaseOrderLine.findMany({
     where: {
       po: {
         status: { in: OPEN_PO_STATUSES },
@@ -425,7 +455,10 @@ async function loadOpenPoLines(client: ReplenishmentReportClient, filters: Stock
         },
       },
     },
-  }) as Promise<OpenPoLineRow[]>
+    take: SOURCE_ROW_LIMIT + 1,
+  }) as OpenPoLineRow[]
+  assertSourceLimit(lines.length, SOURCE_ROW_LIMIT, 'Replenishment open PO source rows')
+  return lines
 }
 
 function inboundOpenPoByProduct(lines: OpenPoLineRow[]): Map<string, Prisma.Decimal> {
@@ -457,17 +490,16 @@ function earliestInboundDateByProduct(lines: OpenPoLineRow[]): Map<string, strin
   return new Map([...dates.entries()].map(([key, value]) => [key, dateOnly(value)]))
 }
 
-function demandWindow(now: Date, days: number): { dateFrom: Date; dateTo: Date } {
-  const dateTo = endOfUtcDay(now)
-  const dateFrom = subtractDays(startOfUtcDay(now), days - 1)
-  return { dateFrom, dateTo }
+function demandWindow(now: Date, days: number): { dateFrom: Date; dateTo: Date; dateToExclusive: Date } {
+  const window = defaultUtcDateWindow(now, days)
+  return { ...window, dateToExclusive: exclusiveEndOfUtcDay(window.dateTo) }
 }
 
-async function loadVelocityRows(client: ReplenishmentReportClient, filters: StockPositionFilters, window: { dateFrom: Date; dateTo: Date }): Promise<VelocitySaleInput[]> {
+async function loadVelocityRows(client: ReplenishmentReportClient, filters: StockPositionFilters, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<VelocitySaleInput[]> {
   const movements = await client.stockMovement.findMany({
     where: {
       type: StockMovementType.SALE_DISPATCH,
-      createdAt: { gte: window.dateFrom, lte: window.dateTo },
+      createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
       product: productWhere(filters),
     },
     select: {
@@ -489,9 +521,7 @@ async function loadVelocityRows(client: ReplenishmentReportClient, filters: Stoc
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as SaleMovementRow[]
-  if (movements.length > SOURCE_ROW_LIMIT) {
-    throw new Error(`Replenishment velocity source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
-  }
+  assertSourceLimit(movements.length, SOURCE_ROW_LIMIT, 'Replenishment velocity source rows')
 
   return movements.map((movement) => ({
     productId: movement.productId,
@@ -506,7 +536,7 @@ async function loadVelocityRows(client: ReplenishmentReportClient, filters: Stoc
 }
 
 async function loadStockLevels(client: ReplenishmentReportClient, filters: StockPositionFilters): Promise<StockLevelRow[]> {
-  return client.stockLevel.findMany({
+  const levels = await client.stockLevel.findMany({
     where: {
       ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
       product: productWhere(filters),
@@ -517,7 +547,10 @@ async function loadStockLevels(client: ReplenishmentReportClient, filters: Stock
       quantity: true,
       reservedQty: true,
     },
-  }) as Promise<StockLevelRow[]>
+    take: SOURCE_ROW_LIMIT + 1,
+  }) as StockLevelRow[]
+  assertSourceLimit(levels.length, SOURCE_ROW_LIMIT, 'Replenishment stock-level source rows')
+  return levels
 }
 
 export async function getReorderReport(
@@ -555,6 +588,7 @@ export async function getReorderReport(
         },
       },
       orderBy: { sku: 'asc' },
+      take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<ProductPlanningRow[]>,
     loadStockLevels(client, filters),
     loadVelocityRows(client, filters, window),
@@ -564,6 +598,7 @@ export async function getReorderReport(
       now: () => generatedAt,
     }),
   ])
+  assertSourceLimit(products.length, SOURCE_ROW_LIMIT, 'Replenishment product source rows')
 
   const availableByProduct = new Map<string, Prisma.Decimal>()
   for (const level of stockLevels) {
@@ -700,9 +735,11 @@ export async function getBackorderDemandReport(
         },
       },
       orderBy: [{ order: { createdAt: 'asc' } }, { id: 'asc' }],
+      take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<BackorderSalesLineRow[]>,
     loadOpenPoLines(client, filters),
   ])
+  assertSourceLimit(lines.length, SOURCE_ROW_LIMIT, 'Backorder demand source rows')
   const lineIds = new Set(lines.map((line) => line.id))
   const [allocations, shipmentLines] = lineIds.size === 0
     ? [[], []] as [AllocationRow[], ShipmentLineRow[]]
@@ -710,12 +747,15 @@ export async function getBackorderDemandReport(
       client.orderAllocation.findMany({
         where: { lineId: { in: [...lineIds] } },
         select: { lineId: true, qty: true },
+        take: SOURCE_ROW_LIMIT + 1,
       }) as Promise<AllocationRow[]>,
       client.shipmentLine.findMany({
         where: { lineId: { in: [...lineIds] } },
         select: { lineId: true, qty: true, shipment: { select: { status: true } } },
+        take: SOURCE_ROW_LIMIT + 1,
       }) as Promise<ShipmentLineRow[]>,
     ])
+  assertSourceLimit(Math.max(allocations.length, shipmentLines.length), SOURCE_ROW_LIMIT, 'Backorder coverage source rows')
   const allocatedByLine = new Map<string, Prisma.Decimal>()
   for (const allocation of allocations) {
     if (lineIds.has(allocation.lineId)) addToMap(allocatedByLine, allocation.lineId, allocation.qty)
@@ -842,10 +882,12 @@ export async function getComponentShortageReport(
         },
       },
       orderBy: [{ scheduledAt: 'asc' }, { createdAt: 'asc' }],
+      take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<ProductionOrderRow[]>,
     loadStockLevels(client, filters),
     loadOpenPoLines(client, filters),
   ])
+  assertSourceLimit(orders.length, SOURCE_ROW_LIMIT, 'Component shortage production order source rows')
   const availableByStock = new Map<string, Prisma.Decimal>()
   for (const level of stockLevels) {
     addToMap(availableByStock, stockKey(level.productId, level.warehouseId), toDecimal(level.quantity).sub(toDecimal(level.reservedQty)))

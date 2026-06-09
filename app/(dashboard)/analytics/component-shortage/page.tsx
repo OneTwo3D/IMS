@@ -1,6 +1,7 @@
 import type { Metadata } from 'next'
 import { ProductLink } from '@/components/inventory/product-link'
 import {
+  emptyComponentShortageReportForSourceLimit,
   getComponentShortageReport,
   type ComponentShortageReportRow,
 } from '@/lib/domain/inventory/replenishment-reports'
@@ -10,6 +11,7 @@ import {
   type StockPositionFilters,
 } from '@/lib/domain/inventory/stock-position-reports'
 import { requireReplenishmentReportAccess } from '@/lib/security/replenishment-report-page-access'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import {
   StockPositionReportPage,
   type StockPositionColumn,
@@ -40,7 +42,10 @@ export default async function ComponentShortagePage({ searchParams }: { searchPa
   const resolvedSearchParams = await searchParams
   const filters = filtersFromSearch(resolvedSearchParams)
   const [report, filterOptions] = await Promise.all([
-    getComponentShortageReport(filters),
+    getComponentShortageReport(filters).catch((error: unknown) => {
+      if (isSourceScanTooLargeError(error)) return emptyComponentShortageReportForSourceLimit(filters, error)
+      throw error
+    }),
     getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),
   ])
   const filtersForUi: StockPositionFilterValues = {

@@ -9,6 +9,7 @@ import {
   getThroughputAnalyticsReport,
   type SalesFulfillmentAnalyticsClient,
 } from '@/lib/domain/sales/sales-fulfillment-analytics'
+import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 function decimal(value: string | number): Prisma.Decimal {
   return new Prisma.Decimal(value)
@@ -34,6 +35,23 @@ const product = {
   type: ProductType.SIMPLE,
   category: { name: 'Widgets' },
 }
+
+test('sales analytics throws a typed source-scan error at the source row cap', async () => {
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...unusedClient(),
+    salesOrder: {
+      findMany: async () => Array.from({ length: 50001 }, (_, index) => ({ id: `order-${index}` })),
+    },
+  }
+
+  await assert.rejects(
+    getSalesAnalyticsReport(
+      { dateFrom: '2026-06-01', dateTo: '2026-06-30' },
+      { client, now: () => new Date('2026-06-30T00:00:00.000Z') },
+    ),
+    (error: unknown) => error instanceof SourceScanTooLargeError && /Sales analytics source orders exceed 50,000/.test(error.message),
+  )
+})
 
 test('sales product grouping allocates order totals so revenue reconciles to SalesOrder totals', async () => {
   const client: SalesFulfillmentAnalyticsClient = {
@@ -74,6 +92,42 @@ test('sales product grouping allocates order totals so revenue reconciles to Sal
   assert.equal(report.totals.revenue, '132')
   assert.equal(report.rows[0]?.revenue, '66')
   assert.equal(report.rows[1]?.revenue, '66')
+})
+
+test('sales analytics formats base amounts with the configured base currency minor units', async () => {
+  const client: SalesFulfillmentAnalyticsClient = {
+    ...unusedClient(),
+    salesOrder: {
+      findMany: async () => [{
+        id: 'order-1',
+        status: SalesOrderStatus.PROCESSING,
+        currency: 'USD',
+        customerId: 'customer-1',
+        customerName: 'Customer A',
+        customerEmail: 'a@example.com',
+        createdAt: new Date('2026-06-01T12:00:00.000Z'),
+        expectedDelivery: null,
+        paidAt: null,
+        totalForeign: decimal('100.25'),
+        totalBase: decimal('100.5'),
+        taxForeign: decimal('0'),
+        taxBase: decimal('0'),
+        shippingForeign: decimal('0'),
+        shippingBase: decimal('0'),
+        discountAmount: decimal('0'),
+        shoppingLinks: [],
+        lines: [{ id: 'line-1', productId: 'product-1', sku: 'SKU-1', description: 'Widget', qty: decimal('1'), totalForeign: decimal('100.25'), totalBase: decimal('100.5'), taxForeign: decimal('0'), taxBase: decimal('0'), discountAmount: decimal('0'), product }],
+      }],
+    },
+  }
+
+  const report = await getSalesAnalyticsReport(
+    { dateFrom: '2026-06-01', dateTo: '2026-06-01', currencyMode: 'base' },
+    { client, now: () => new Date('2026-06-01T15:00:00.000Z'), baseCurrency: async () => 'JPY' },
+  )
+
+  assert.equal(report.rows[0]?.currency, 'JPY')
+  assert.equal(report.totals.revenue, '101')
 })
 
 test('gross margin report uses CogsEntry totals without recalculating FIFO', async () => {
