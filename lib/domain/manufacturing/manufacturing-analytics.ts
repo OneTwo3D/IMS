@@ -1,13 +1,14 @@
 import { Prisma, ProductionOrderStatus, ProductionOrderType, StockMovementType } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { dateOnly, elapsedDaysDecimal, parseOptionalDateOnly } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
+import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
 const SOURCE_ROW_LIMIT = 50000
-const DAY_MS = 24 * 60 * 60 * 1000
 const QUANTITY_TOLERANCE = new Prisma.Decimal('0.0001')
 
 type FindManyDelegate = {
@@ -131,9 +132,9 @@ type ReportOptions = {
   paginate?: boolean
 }
 
-export class ManufacturingAnalyticsSourceLimitError extends Error {
+export class ManufacturingAnalyticsSourceLimitError extends SourceScanTooLargeError {
   constructor(message: string) {
-    super(message)
+    super('Manufacturing analytics source rows', SOURCE_ROW_LIMIT, { message })
     this.name = 'ManufacturingAnalyticsSourceLimitError'
   }
 }
@@ -146,24 +147,12 @@ function nowFromDeps(deps?: ManufacturingAnalyticsDeps): Date {
   return deps?.now?.() ?? new Date()
 }
 
-function startOfUtcDay(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
-}
-
-function endOfUtcDay(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 23, 59, 59, 999))
-}
-
 function parseDateOnly(value: string | undefined, endOfDay = false): Date | undefined {
-  if (!value) return undefined
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
-  if (!match) return undefined
-  const parsed = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])))
-  return endOfDay ? endOfUtcDay(parsed) : startOfUtcDay(parsed)
+  return parseOptionalDateOnly(value, { endOfDay })
 }
 
-function dateOnly(date: Date | undefined): string | null {
-  return date ? date.toISOString().slice(0, 10) : null
+function optionalDateOnly(date: Date | undefined): string | null {
+  return date ? dateOnly(date) : null
 }
 
 function dateWhere(filters: ManufacturingAnalyticsFilters, field: 'createdAt' | 'completedAt'): Record<string, unknown> {
@@ -215,8 +204,8 @@ function report<Row>(
   const paged = paginate(rows, filters, paginateRows)
   return {
     generatedAt: generatedAt.toISOString(),
-    dateFrom: dateOnly(parseDateOnly(filters.dateFrom)),
-    dateTo: dateOnly(parseDateOnly(filters.dateTo, true)),
+    dateFrom: optionalDateOnly(parseDateOnly(filters.dateFrom)),
+    dateTo: optionalDateOnly(parseDateOnly(filters.dateTo, true)),
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals,
@@ -471,7 +460,7 @@ export async function getWipReport(
     const startDate = order.startedAt ?? order.createdAt
     const daysSinceStart = Prisma.Decimal.max(
       new Prisma.Decimal(0),
-      new Prisma.Decimal(generatedAt.getTime() - startDate.getTime()).div(DAY_MS),
+      elapsedDaysDecimal(startDate, generatedAt),
     )
     const plannedQty = toDecimal(order.qtyPlanned)
     const producedQty = toDecimal(order.qtyProduced)

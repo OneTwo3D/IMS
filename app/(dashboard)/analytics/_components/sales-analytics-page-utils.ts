@@ -1,4 +1,5 @@
-import type { SalesAnalyticsFilters, SalesAnalyticsGroupBy, SalesCurrencyMode } from '@/lib/domain/sales/sales-fulfillment-analytics'
+import { emptySalesAnalyticsReportForSourceLimit, type SalesAnalyticsFilters, type SalesAnalyticsGroupBy, type SalesAnalyticsReport, type SalesCurrencyMode } from '@/lib/domain/sales/sales-fulfillment-analytics'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import type { SalesAnalyticsFilterValues } from './sales-analytics-report'
 
 export type SalesAnalyticsSearchParams = Record<string, string | string[] | undefined>
@@ -38,5 +39,18 @@ export function salesAnalyticsFiltersForUi(filters: SalesAnalyticsFilters): Sale
     groupBy: filters.groupBy,
     currencyMode: filters.currencyMode,
     pageSize: String(filters.pageSize ?? 100),
+  }
+}
+
+export async function loadSalesAnalyticsReportForPage<Row>(
+  filters: SalesAnalyticsFilters,
+  load: (filters: SalesAnalyticsFilters) => Promise<SalesAnalyticsReport<Row>>,
+  emptyTotals: Record<string, string>,
+): Promise<SalesAnalyticsReport<Row>> {
+  try {
+    return await load(filters)
+  } catch (error) {
+    if (isSourceScanTooLargeError(error)) return emptySalesAnalyticsReportForSourceLimit<Row>(filters, error, emptyTotals)
+    throw error
   }
 }

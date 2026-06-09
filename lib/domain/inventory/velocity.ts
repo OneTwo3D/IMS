@@ -1,7 +1,7 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { UTC_DAY_MS, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 
-const DAY_MS = 24 * 60 * 60 * 1000
 const DEFAULT_ABC_A_CUTOFF = new Prisma.Decimal('0.8')
 const DEFAULT_ABC_B_CUTOFF = new Prisma.Decimal('0.95')
 const DEFAULT_AGING_BUCKETS: AgingBucketDefinition[] = [
@@ -188,13 +188,8 @@ function iso(date: Date | null): string | null {
   return date ? date.toISOString() : null
 }
 
-function utcDayNumber(date: Date): number {
-  return Math.floor(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()) / DAY_MS)
-}
-
 function daysBetween(start: Date, end: Date): number {
-  // Calendar-day delta in UTC, not elapsed 24-hour periods.
-  return Math.max(0, utcDayNumber(end) - utcDayNumber(start))
+  return utcCalendarDayDelta(start, end)
 }
 
 function assertNotAfter(date: Date, max: Date, label: string): void {
@@ -251,7 +246,7 @@ export function normalizeVelocityWindow(window: VelocityWindow): { dateFrom: Dat
   return {
     dateFrom,
     dateTo,
-    days: Math.max(1, Math.ceil((dateTo.getTime() - dateFrom.getTime() + 1) / DAY_MS)),
+    days: Math.max(1, Math.ceil((dateTo.getTime() - dateFrom.getTime() + 1) / UTC_DAY_MS)),
   }
 }
 

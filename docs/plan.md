@@ -411,20 +411,23 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ## Phase 7 — Performance / scale (ongoing)
 
 ### P7.1 — Source-row cap pattern uniformly applied
+- **Status:** Complete.
 - **Files:** `lib/domain/sales/sales-fulfillment-analytics.ts`, `lib/domain/purchasing/purchasing-analytics.ts`, `lib/domain/finance/finance-period-analytics.ts`, `lib/domain/inventory/replenishment-reports.ts`, others (see findings).
-- **Fix:** Apply `take: LIMIT + 1` + `if (rows.length > LIMIT) throw ...` pattern uniformly. Extract a shared helper `assertSourceLimit(rowCount, limit, source)` from `inventory-health-reports.ts`.
+- **Fix:** Analytics modules now use `take: LIMIT + 1` plus the shared `assertSourceLimit(rowCount, limit, source)` helper. Replenishment helper/report scans are capped as well.
 - **Acceptance:** No `findMany` in the analytics modules without a cap.
-- **Tests:** Mock-data tests asserting the cap fires at LIMIT + 1.
+- **Tests:** `tests/domain/sales/sales-fulfillment-analytics.test.ts`, `tests/domain/purchasing/purchasing-analytics.test.ts`, `tests/domain/finance/finance-period-analytics.test.ts`, and `tests/domain/inventory/replenishment-reports.test.ts` assert representative caps fire at `LIMIT + 1`.
 
 ### P7.2 — `BASE_CURRENCY = 'GBP'` hardcoded across analytics modules
+- **Status:** Complete.
 - **Files:** `sales-fulfillment-analytics.ts`, `purchasing-analytics.ts`, `finance-period-analytics.ts`
-- **Fix:** Replace with `await getBaseCurrencyCode()` (already used by `inventory-costing-reports.ts`).
-- **Tests:** Tenant config with non-GBP base; assert reports format with the configured currency.
+- **Fix:** Analytics modules resolve base currency via `getBaseCurrencyCode()` in production and accept injected base-currency providers in tests.
+- **Tests:** Sales, purchasing, and finance analytics tests assert JPY base-currency minor-unit formatting.
 
 ### P7.3 — "What is N days" convention drift
+- **Status:** Complete.
 - **Files:** `lib/domain/inventory/velocity.ts`, `inventory-costing-reports.ts`, `replenishment-reports.ts`, `sales-fulfillment-analytics.ts`, `purchasing-analytics.ts`, `finance-period-analytics.ts`
-- **Fix:** Extract `lib/domain/math/date-window.ts` with one canonical helper. Refactor all six modules to import it.
-- **Tests:** Locked-down test asserting Jan 1 → Jan 31 returns a fixed day count; all six modules return the same.
+- **Fix:** Added `lib/domain/math/date-window.ts` and refactored the six analytics/report modules to import shared UTC day-boundary and day-count helpers.
+- **Tests:** `tests/domain/math/date-window.test.ts` locks Jan 1 → Jan 31 inclusive day count and UTC date-only parsing.
 
 ### P7.4 — CSV exports embed report-level metadata per row
 - **Files:** analytics CSV export routes
@@ -449,9 +452,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** `tests/backup-manifest.test.ts` covers manifest generation, advisory row-count metadata, and critical-table validation including FIFO tables. `tests/api/backup-restore.test.ts` covers restore rejection for a manifest missing `users` and uploaded restores without the sidecar.
 
 ### P7.8 — `throw new Error(...)` for source-row caps bubbles to Next.js error boundary
+- **Status:** Complete.
 - **Files:** `lib/domain/inventory/inventory-health-reports.ts`, `manufacturing-analytics.ts`, `finance-period-analytics.ts`, `purchasing-analytics.ts`
-- **Fix:** Introduce typed `SourceScanTooLargeError` class. Catch at the page boundary and render the "narrow your filters" message inline rather than the generic 500 page.
-- **Tests:** Force the cap; assert the page shows the structured error.
+- **Fix:** Introduced `SourceScanTooLargeError`, refactored analytics source caps to throw it, preserved existing inventory/manufacturing source-limit subclasses, and caught it at analytics page/API boundaries so pages render inline notices and CSV exports return HTTP 413.
+- **Tests:** `tests/security/source-scan-error.test.ts` covers the helper. Focused analytics tests assert representative typed cap failures.
 
 ---
 
@@ -552,6 +556,11 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
    - [x] P6.1 — Cron endpoints rate-limited after cron auth.
    - [x] P7.6 — Xero daily batch groups process bounded candidate windows.
 16. **Analytics / report scale refactor:** P7.1, P7.2, P7.3, P7.8, CR1, CR2, CR3.
+   - [x] P7.1 — Source-row cap pattern uniformly applied.
+   - [x] P7.2 — Analytics base-currency formatting uses configured base currency.
+   - [x] P7.3 — Shared UTC date-window helper extracted and adopted.
+   - [x] P7.8 — Source-row cap failures use typed errors and render inline/413 responses.
+   - [x] CR1/CR2/CR3 — Shared date-window, source-scan, and base-currency refactors landed.
 17. **CSV export cleanup:** P7.4, CR4.
 18. **Integration settings test gate:** P7.5.
 19. **Sidebar cleanup:** P2.3, CR5.

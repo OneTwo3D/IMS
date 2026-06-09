@@ -1,4 +1,5 @@
-import type { PurchasingAnalyticsFilters } from '@/lib/domain/purchasing/purchasing-analytics'
+import { emptyPurchasingAnalyticsReportForSourceLimit, type PurchasingAnalyticsFilters, type PurchasingAnalyticsReport } from '@/lib/domain/purchasing/purchasing-analytics'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import type { PurchasingAnalyticsFilterValues } from './purchasing-analytics-report'
 
 export type PurchasingAnalyticsSearchParams = Record<string, string | string[] | undefined>
@@ -26,5 +27,18 @@ export function purchasingAnalyticsFiltersForUi(filters: PurchasingAnalyticsFilt
     dateFrom: filters.dateFrom,
     dateTo: filters.dateTo,
     pageSize: String(filters.pageSize ?? 100),
+  }
+}
+
+export async function loadPurchasingAnalyticsReportForPage<Row>(
+  filters: PurchasingAnalyticsFilters,
+  load: (filters: PurchasingAnalyticsFilters) => Promise<PurchasingAnalyticsReport<Row>>,
+  emptyTotals: Record<string, string>,
+): Promise<PurchasingAnalyticsReport<Row>> {
+  try {
+    return await load(filters)
+  } catch (error) {
+    if (isSourceScanTooLargeError(error)) return emptyPurchasingAnalyticsReportForSourceLimit<Row>(filters, error, emptyTotals)
+    throw error
   }
 }

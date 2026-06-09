@@ -3,14 +3,14 @@ import { ProductLink } from '@/components/inventory/product-link'
 import { requireRole } from '@/lib/auth/server'
 import { getMarginAnalyticsReport, type MarginReportRow } from '@/lib/domain/sales/sales-fulfillment-analytics'
 import { SalesAnalyticsReportPage, type SalesAnalyticsColumn } from '../_components/sales-analytics-report'
-import { salesAnalyticsFiltersForUi, salesAnalyticsFiltersFromSearch, type SalesAnalyticsSearchParams } from '../_components/sales-analytics-page-utils'
+import { loadSalesAnalyticsReportForPage, salesAnalyticsFiltersForUi, salesAnalyticsFiltersFromSearch, type SalesAnalyticsSearchParams } from '../_components/sales-analytics-page-utils'
 
 export const metadata: Metadata = { title: 'Gross Margin' }
 
 export default async function MarginAnalyticsPage({ searchParams }: { searchParams: Promise<SalesAnalyticsSearchParams> }) {
   await requireRole('ADMIN', 'MANAGER', 'FINANCE')
   const filters = salesAnalyticsFiltersFromSearch(await searchParams)
-  const report = await getMarginAnalyticsReport(filters)
+  const report = await loadSalesAnalyticsReportForPage(filters, getMarginAnalyticsReport, { revenueBase: '0', cogsBase: '0', grossProfitBase: '0', marginPct: '0' })
   const columns: Array<SalesAnalyticsColumn<MarginReportRow>> = [
     { key: 'product', label: 'Product', render: (row) => row.productId ? <ProductLink productId={row.productId} sku={row.sku} name={row.productName} /> : `${row.sku} ${row.productName}`, footer: 'Totals' },
     { key: 'category', label: 'Category', render: (row) => row.categoryName ?? 'Uncategorised' },

@@ -10,6 +10,7 @@ import {
   type FinanceAnalyticsFilters,
 } from '@/lib/domain/finance/finance-period-analytics'
 import { canAccessFinanceAnalytics } from '@/lib/security/finance-analytics-access'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 const FINANCE_ANALYTICS_CSV_ROW_LIMIT = 50000
 
@@ -53,7 +54,8 @@ export async function GET(req: NextRequest) {
   const reportType = req.nextUrl.searchParams.get('report') ?? 'vat'
   const date = new Date().toISOString().slice(0, 10)
 
-  switch (reportType) {
+  try {
+    switch (reportType) {
     case 'vat': {
       const report = await getVatReport({ ...filters, pageSize: FINANCE_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
@@ -86,5 +88,9 @@ export async function GET(req: NextRequest) {
     }
     default:
       return NextResponse.json({ error: 'Unknown finance analytics export type' }, { status: 400 })
+    }
+  } catch (error) {
+    if (isSourceScanTooLargeError(error)) return NextResponse.json({ error: error.message }, { status: 413 })
+    throw error
   }
 }

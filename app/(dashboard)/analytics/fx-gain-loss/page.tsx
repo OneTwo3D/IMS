@@ -1,7 +1,7 @@
 import { getFxGainLossReport, type FxGainLossReportRow } from '@/lib/domain/finance/finance-period-analytics'
 import { requireFinanceAnalyticsAccess } from '@/lib/security/finance-analytics-page-access'
 import { FinanceAnalyticsReportPage, type FinanceAnalyticsColumn } from '../_components/finance-analytics-report'
-import { financeAnalyticsFiltersForUi, financeAnalyticsFiltersFromSearch, type FinanceAnalyticsSearchParams } from '../_components/finance-analytics-page-utils'
+import { financeAnalyticsFiltersForUi, financeAnalyticsFiltersFromSearch, loadFinanceAnalyticsReportForPage, type FinanceAnalyticsSearchParams } from '../_components/finance-analytics-page-utils'
 
 type Props = { searchParams: Promise<FinanceAnalyticsSearchParams> }
 
@@ -22,7 +22,7 @@ const columns: Array<FinanceAnalyticsColumn<FxGainLossReportRow>> = [
 export default async function FxGainLossAnalyticsPage({ searchParams }: Props) {
   await requireFinanceAnalyticsAccess()
   const filters = financeAnalyticsFiltersFromSearch(await searchParams)
-  const report = await getFxGainLossReport(filters)
+  const report = await loadFinanceAnalyticsReportForPage(filters, getFxGainLossReport, { gainLossBase: '0', gainsBase: '0', lossesBase: '0', rowCount: '0' })
   return (
     <FinanceAnalyticsReportPage
       title="FX Gain/Loss"

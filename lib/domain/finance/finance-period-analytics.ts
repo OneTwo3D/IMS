@@ -1,17 +1,18 @@
 import { Prisma, SalesOrderStatus } from '@/app/generated/prisma/client'
 import { computeRealisedFx, type FxSettlementSide } from '@/lib/accounting-fx'
 import { getAccountingSettings } from '@/lib/accounting'
+import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import { roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { dateOnly, defaultUtcDateWindow, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
-import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
+import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
 const SOURCE_ROW_LIMIT = 50000
 const DEFAULT_PERIOD_DAYS = 30
-const DAY_MS = 24 * 60 * 60 * 1000
 
 type FindManyDelegate = {
   findMany(args?: unknown): Promise<unknown[]>
@@ -246,40 +247,13 @@ async function baseCurrencyFromDeps(deps?: FinanceAnalyticsDeps): Promise<string
   return deps?.client ? DEFAULT_BASE_CURRENCY : getBaseCurrencyCode()
 }
 
-function startOfUtcDay(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
-}
-
-function endOfUtcDay(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 23, 59, 59, 999))
-}
-
-function subtractDays(date: Date, days: number): Date {
-  const next = new Date(date)
-  next.setUTCDate(next.getUTCDate() - days)
-  return next
-}
-
-function parseDateOnly(value: string | undefined, fallback: Date, endOfDay = false): Date {
-  if (!value) return fallback
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
-  if (!match) return fallback
-  const parsed = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])))
-  return endOfDay ? endOfUtcDay(parsed) : startOfUtcDay(parsed)
-}
-
 function period(filters: FinanceAnalyticsFilters, now: Date): { dateFrom: Date; dateTo: Date } {
-  const defaultTo = endOfUtcDay(now)
-  const defaultFrom = subtractDays(startOfUtcDay(now), DEFAULT_PERIOD_DAYS - 1)
-  const dateTo = parseDateOnly(filters.dateTo, defaultTo, true)
+  const { dateFrom: defaultFrom, dateTo: defaultTo } = defaultUtcDateWindow(now, DEFAULT_PERIOD_DAYS)
+  const dateTo = parseDateOnly(filters.dateTo, defaultTo, { endOfDay: true })
   const dateFrom = parseDateOnly(filters.dateFrom, defaultFrom)
   return dateFrom.getTime() <= dateTo.getTime()
     ? { dateFrom, dateTo }
     : { dateFrom: startOfUtcDay(dateTo), dateTo }
-}
-
-function dateOnly(date: Date): string {
-  return date.toISOString().slice(0, 10)
 }
 
 function clampPageSize(value: number | undefined): number {
@@ -297,6 +271,25 @@ function pageInfo(totalRows: number, page: number | undefined, pageSize: number)
     totalPages,
     hasNextPage: currentPage < totalPages,
     hasPreviousPage: currentPage > 1,
+  }
+}
+
+export function emptyFinanceAnalyticsReportForSourceLimit<Row>(
+  filters: FinanceAnalyticsFilters,
+  error: SourceScanTooLargeError,
+  totals: Record<string, string>,
+  now = new Date(),
+): FinanceAnalyticsReport<Row> {
+  const window = period(filters, now)
+  const pageSize = clampPageSize(filters.pageSize)
+  return {
+    generatedAt: now.toISOString(),
+    dateFrom: dateOnly(window.dateFrom),
+    dateTo: dateOnly(window.dateTo),
+    rows: [],
+    pageInfo: pageInfo(0, filters.page, pageSize),
+    totals,
+    notices: [error.message],
   }
 }
 
@@ -370,7 +363,7 @@ function bucketConfig(filters: FinanceAnalyticsFilters): { buckets: [number, num
 }
 
 function ageDays(asOf: Date, dueDate: Date): number {
-  return Math.max(0, Math.floor((startOfUtcDay(asOf).getTime() - startOfUtcDay(dueDate).getTime()) / DAY_MS))
+  return utcCalendarDayDelta(dueDate, asOf)
 }
 
 function bucketAmount(age: number, amount: Prisma.Decimal, buckets: [number, number, number]) {
@@ -443,9 +436,7 @@ export async function getVatReport(
     }) as Promise<PurchaseInvoiceTaxRow[]>,
   ])
   const purchaseLineCount = purchaseInvoices.reduce((sum, invoice) => sum + invoice.lines.length, 0)
-  if (salesLines.length + purchaseLineCount > SOURCE_ROW_LIMIT) {
-    throw new Error(`VAT report source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
-  }
+  assertSourceLimit(salesLines.length + purchaseLineCount, SOURCE_ROW_LIMIT, 'VAT report source rows')
 
   type Accumulator = {
     side: 'sales' | 'purchases'
@@ -617,7 +608,7 @@ export async function getArAgingReport(
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as SalesOrderAgingRow[]
-  if (orders.length > SOURCE_ROW_LIMIT) throw new Error(`AR aging source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(orders.length, SOURCE_ROW_LIMIT, 'AR aging source rows')
 
   const byCustomer = new Map<string, {
     partyId: string | null
@@ -725,7 +716,7 @@ export async function getApAgingReport(
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as PurchaseInvoiceAgingRow[]
-  if (invoices.length > SOURCE_ROW_LIMIT) throw new Error(`AP aging source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(invoices.length, SOURCE_ROW_LIMIT, 'AP aging source rows')
   const bySupplier = new Map<string, {
     partyId: string | null
     partyName: string
@@ -823,9 +814,7 @@ export async function getCurrencySummaryReport(
       take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<PurchaseInvoiceCurrencyRow[]>,
   ])
-  if (salesOrders.length > SOURCE_ROW_LIMIT || purchaseInvoices.length > SOURCE_ROW_LIMIT) {
-    throw new Error(`Currency summary source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
-  }
+  assertSourceLimit(Math.max(salesOrders.length, purchaseInvoices.length), SOURCE_ROW_LIMIT, 'Currency summary source rows')
 
   const rowsByCurrency = new Map<string, {
     currency: string
@@ -995,9 +984,7 @@ export async function getFxGainLossReport(
     }) as Promise<PurchaseInvoiceFxRow[]>,
     loadFxRates(client, baseCurrency, window),
   ])
-  if (payments.length > SOURCE_ROW_LIMIT || purchaseInvoices.length > SOURCE_ROW_LIMIT || fxRates.length > SOURCE_ROW_LIMIT) {
-    throw new Error(`FX gain/loss source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
-  }
+  assertSourceLimit(Math.max(payments.length, purchaseInvoices.length, fxRates.length), SOURCE_ROW_LIMIT, 'FX gain/loss source rows')
 
   const rows: FxGainLossReportRow[] = []
   for (const payment of payments) {

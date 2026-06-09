@@ -7,8 +7,10 @@ import {
 } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { dateOnly, defaultUtcDateWindow, parseDateOnly, startOfUtcDay } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
+import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -237,36 +239,9 @@ async function baseCurrencyFromDeps(deps?: SalesFulfillmentAnalyticsDeps): Promi
   return deps?.client ? DEFAULT_BASE_CURRENCY : getBaseCurrencyCode()
 }
 
-function startOfUtcDay(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
-}
-
-function endOfUtcDay(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 23, 59, 59, 999))
-}
-
-function subtractDays(date: Date, days: number): Date {
-  const next = new Date(date)
-  next.setUTCDate(next.getUTCDate() - days)
-  return next
-}
-
-function dateOnly(date: Date): string {
-  return date.toISOString().slice(0, 10)
-}
-
-function parseDateOnly(value: string | undefined, fallback: Date, endOfDay = false): Date {
-  if (!value) return fallback
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
-  if (!match) return fallback
-  const parsed = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])))
-  return endOfDay ? endOfUtcDay(parsed) : startOfUtcDay(parsed)
-}
-
 function period(filters: SalesAnalyticsFilters, now: Date): { dateFrom: Date; dateTo: Date } {
-  const defaultTo = endOfUtcDay(now)
-  const defaultFrom = subtractDays(startOfUtcDay(now), DEFAULT_PERIOD_DAYS - 1)
-  const dateTo = parseDateOnly(filters.dateTo, defaultTo, true)
+  const { dateFrom: defaultFrom, dateTo: defaultTo } = defaultUtcDateWindow(now, DEFAULT_PERIOD_DAYS)
+  const dateTo = parseDateOnly(filters.dateTo, defaultTo, { endOfDay: true })
   const dateFrom = parseDateOnly(filters.dateFrom, defaultFrom)
   return dateFrom.getTime() <= dateTo.getTime()
     ? { dateFrom, dateTo }
@@ -288,6 +263,25 @@ function pageInfo(totalRows: number, page: number | undefined, pageSize: number)
     totalPages,
     hasNextPage: currentPage < totalPages,
     hasPreviousPage: currentPage > 1,
+  }
+}
+
+export function emptySalesAnalyticsReportForSourceLimit<Row>(
+  filters: SalesAnalyticsFilters,
+  error: SourceScanTooLargeError,
+  totals: Record<string, string>,
+  now = new Date(),
+): SalesAnalyticsReport<Row> {
+  const window = period(filters, now)
+  const pageSize = clampPageSize(filters.pageSize)
+  return {
+    generatedAt: now.toISOString(),
+    dateFrom: dateOnly(window.dateFrom),
+    dateTo: dateOnly(window.dateTo),
+    rows: [],
+    pageInfo: pageInfo(0, filters.page, pageSize),
+    totals,
+    notices: [error.message],
   }
 }
 
@@ -378,7 +372,7 @@ async function loadSalesOrders(client: SalesFulfillmentAnalyticsClient, filters:
 
 async function loadSalesOrdersByIds(client: SalesFulfillmentAnalyticsClient, orderIds: string[]): Promise<SalesOrderRow[]> {
   if (orderIds.length === 0) return []
-  if (orderIds.length > SOURCE_ROW_LIMIT) throw new Error(`Sales analytics source orders exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(orderIds.length, SOURCE_ROW_LIMIT, 'Sales analytics source orders')
   return client.salesOrder.findMany({
     where: {
       id: { in: [...new Set(orderIds)] },
@@ -439,7 +433,7 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
   const window = period(filters, generatedAt)
   const rowsByKey = new Map<string, SalesReportRow & { revenueDecimal: Prisma.Decimal; taxDecimal: Prisma.Decimal; shippingDecimal: Prisma.Decimal; discountDecimal: Prisma.Decimal; orderIds: Set<string> }>()
   const orders = await loadSalesOrders(client, filters, window)
-  if (orders.length > SOURCE_ROW_LIMIT) throw new Error(`Sales analytics source orders exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(orders.length, SOURCE_ROW_LIMIT, 'Sales analytics source orders')
   const grouping = groupBy(filters)
   const mode = currencyMode(filters)
 
@@ -576,7 +570,7 @@ async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: 
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as Array<{ totalCostBase: DecimalInput; movement: { referenceId: string | null } }>
-  if (rows.length > SOURCE_ROW_LIMIT) throw new Error(`Sales COGS source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(rows.length, SOURCE_ROW_LIMIT, 'Sales COGS source rows')
   const byOrder = new Map<string, Prisma.Decimal>()
   for (const row of rows) {
     if (!row.movement.referenceId) continue
@@ -594,7 +588,7 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
     loadSalesOrders(client, filters, window),
     loadCogsByOrder(client, window),
   ])
-  if (orders.length > SOURCE_ROW_LIMIT) throw new Error(`Customer analytics source orders exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(orders.length, SOURCE_ROW_LIMIT, 'Customer analytics source orders')
   const totalRevenue = orders.reduce((sum, order) => sum.add(toDecimal(order.totalBase)), new Prisma.Decimal(0))
   const groups = new Map<string, CustomerReportRow & { revenue: Prisma.Decimal; grossProfit: Prisma.Decimal; arExposure: Prisma.Decimal; orderIds: Set<string> }>()
   for (const order of orders) {
@@ -673,7 +667,7 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as CogsEntryRow[]
-  if (cogsRows.length > SOURCE_ROW_LIMIT) throw new Error(`Margin analytics COGS source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(cogsRows.length, SOURCE_ROW_LIMIT, 'Margin analytics COGS source rows')
   const cogsOrderIds = cogsRows
     .map((row) => row.movement.referenceType === 'SalesOrder' ? row.movement.referenceId : null)
     .filter((id): id is string => typeof id === 'string' && id.length > 0)
@@ -802,7 +796,7 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
       take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<Array<{ productId: string; qty: DecimalInput }>>,
   ])
-  if (refundLines.length > SOURCE_ROW_LIMIT || shippedMovements.length > SOURCE_ROW_LIMIT) throw new Error(`Returns analytics source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(Math.max(refundLines.length, shippedMovements.length), SOURCE_ROW_LIMIT, 'Returns analytics source rows')
   const shippedByProduct = new Map<string, Prisma.Decimal>()
   for (const movement of shippedMovements) {
     shippedByProduct.set(movement.productId, (shippedByProduct.get(movement.productId) ?? new Prisma.Decimal(0)).add(toDecimal(movement.qty)))
@@ -889,7 +883,7 @@ export async function getFulfillmentAnalyticsReport(filters: SalesAnalyticsFilte
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as ShipmentRow[]
-  if (shipments.length > SOURCE_ROW_LIMIT) throw new Error(`Fulfillment analytics source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(shipments.length, SOURCE_ROW_LIMIT, 'Fulfillment analytics source rows')
   const orders = new Map<string, { order: ShipmentRow['order']; shipments: ShipmentRow[] }>()
   for (const shipment of shipments) {
     const current = orders.get(shipment.orderId) ?? { order: shipment.order, shipments: [] }
@@ -982,7 +976,7 @@ export async function getThroughputAnalyticsReport(filters: SalesAnalyticsFilter
       select: { id: true },
     }) as Promise<Array<{ id: string }>>,
   ])
-  if (activities.length > SOURCE_ROW_LIMIT || shipments.length > SOURCE_ROW_LIMIT) throw new Error(`Throughput analytics source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(Math.max(activities.length, shipments.length), SOURCE_ROW_LIMIT, 'Throughput analytics source rows')
   const shipmentById = new Map(shipments.map((shipment) => [shipment.id, shipment]))
   const groups = new Map<string, ThroughputReportRow & { orderIds: Set<string>; shipmentIds: Set<string>; lineIds: Set<string> }>()
   for (const activity of activities) {

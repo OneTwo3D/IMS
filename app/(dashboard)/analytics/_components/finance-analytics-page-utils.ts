@@ -1,4 +1,5 @@
-import type { FinanceAnalyticsFilters } from '@/lib/domain/finance/finance-period-analytics'
+import { emptyFinanceAnalyticsReportForSourceLimit, type FinanceAnalyticsFilters, type FinanceAnalyticsReport } from '@/lib/domain/finance/finance-period-analytics'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import type { FinanceAnalyticsFilterValues } from './finance-analytics-report'
 
 export type FinanceAnalyticsSearchParams = Record<string, string | string[] | undefined>
@@ -32,5 +33,18 @@ export function financeAnalyticsFiltersForUi(filters: FinanceAnalyticsFilters): 
     bucket1Days: String(filters.bucket1Days ?? 30),
     bucket2Days: String(filters.bucket2Days ?? 60),
     bucket3Days: String(filters.bucket3Days ?? 90),
+  }
+}
+
+export async function loadFinanceAnalyticsReportForPage<Row>(
+  filters: FinanceAnalyticsFilters,
+  load: (filters: FinanceAnalyticsFilters) => Promise<FinanceAnalyticsReport<Row>>,
+  emptyTotals: Record<string, string>,
+): Promise<FinanceAnalyticsReport<Row>> {
+  try {
+    return await load(filters)
+  } catch (error) {
+    if (isSourceScanTooLargeError(error)) return emptyFinanceAnalyticsReportForSourceLimit<Row>(filters, error, emptyTotals)
+    throw error
   }
 }

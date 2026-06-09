@@ -1,6 +1,7 @@
 import type { Metadata } from 'next'
 import { ProductLink } from '@/components/inventory/product-link'
 import {
+  emptyReorderReportForSourceLimit,
   getReorderReport,
   type ReorderReportRow,
 } from '@/lib/domain/inventory/replenishment-reports'
@@ -10,6 +11,7 @@ import {
   type StockPositionFilters,
 } from '@/lib/domain/inventory/stock-position-reports'
 import { requireReplenishmentReportAccess } from '@/lib/security/replenishment-report-page-access'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import {
   StockPositionReportPage,
   type StockPositionColumn,
@@ -50,7 +52,10 @@ export default async function ReorderPage({ searchParams }: { searchParams: Prom
   const resolvedSearchParams = await searchParams
   const filters = filtersFromSearch(resolvedSearchParams)
   const [report, filterOptions] = await Promise.all([
-    getReorderReport(filters),
+    getReorderReport(filters).catch((error: unknown) => {
+      if (isSourceScanTooLargeError(error)) return emptyReorderReportForSourceLimit(filters, error)
+      throw error
+    }),
     getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),
   ])
   const filtersForUi: StockPositionFilterValues = {

@@ -10,6 +10,7 @@ import {
   type PurchasingAnalyticsFilters,
 } from '@/lib/domain/purchasing/purchasing-analytics'
 import { canAccessPurchasingAnalytics } from '@/lib/security/purchasing-analytics-access'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 const PURCHASING_ANALYTICS_CSV_ROW_LIMIT = 50000
 
@@ -50,7 +51,8 @@ export async function GET(req: NextRequest) {
   const reportType = req.nextUrl.searchParams.get('report') ?? 'open-pos'
   const date = new Date().toISOString().slice(0, 10)
 
-  switch (reportType) {
+  try {
+    switch (reportType) {
     case 'open-pos': {
       const report = await getOpenPurchaseOrdersReport({ ...filters, pageSize: PURCHASING_ANALYTICS_CSV_ROW_LIMIT }, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
@@ -83,5 +85,9 @@ export async function GET(req: NextRequest) {
     }
     default:
       return NextResponse.json({ error: 'Unknown purchasing analytics export type' }, { status: 400 })
+    }
+  } catch (error) {
+    if (isSourceScanTooLargeError(error)) return NextResponse.json({ error: error.message }, { status: 413 })
+    throw error
   }
 }

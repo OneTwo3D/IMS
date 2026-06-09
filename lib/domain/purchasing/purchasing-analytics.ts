@@ -1,15 +1,16 @@
 import { Prisma, PurchaseOrderStatus } from '@/app/generated/prisma/client'
+import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import { roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { dateOnly, defaultUtcDateWindow, elapsedDaysDecimal, parseDateOnly, startOfUtcDay, subtractUtcDays } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
-import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
+import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
 const MAX_PAGE_SIZE = 500
 const SOURCE_ROW_LIMIT = 50000
 const DEFAULT_PERIOD_DAYS = 30
-const DAY_MS = 24 * 60 * 60 * 1000
 
 export const OPEN_PURCHASE_ORDER_STATUSES: PurchaseOrderStatus[] = [
   PurchaseOrderStatus.PO_SENT,
@@ -255,40 +256,13 @@ async function baseCurrencyFromDeps(deps?: PurchasingAnalyticsDeps): Promise<str
   return deps?.client ? DEFAULT_BASE_CURRENCY : getBaseCurrencyCode()
 }
 
-function startOfUtcDay(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate()))
-}
-
-function endOfUtcDay(date: Date): Date {
-  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 23, 59, 59, 999))
-}
-
-function subtractDays(date: Date, days: number): Date {
-  const next = new Date(date)
-  next.setUTCDate(next.getUTCDate() - days)
-  return next
-}
-
-function parseDateOnly(value: string | undefined, fallback: Date, endOfDay = false): Date {
-  if (!value) return fallback
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
-  if (!match) return fallback
-  const parsed = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])))
-  return endOfDay ? endOfUtcDay(parsed) : startOfUtcDay(parsed)
-}
-
 function period(filters: PurchasingAnalyticsFilters, now: Date): { dateFrom: Date; dateTo: Date } {
-  const defaultTo = endOfUtcDay(now)
-  const defaultFrom = subtractDays(startOfUtcDay(now), DEFAULT_PERIOD_DAYS - 1)
-  const dateTo = parseDateOnly(filters.dateTo, defaultTo, true)
+  const { dateFrom: defaultFrom, dateTo: defaultTo } = defaultUtcDateWindow(now, DEFAULT_PERIOD_DAYS)
+  const dateTo = parseDateOnly(filters.dateTo, defaultTo, { endOfDay: true })
   const dateFrom = parseDateOnly(filters.dateFrom, defaultFrom)
   return dateFrom.getTime() <= dateTo.getTime()
     ? { dateFrom, dateTo }
     : { dateFrom: startOfUtcDay(dateTo), dateTo }
-}
-
-function dateOnly(date: Date): string {
-  return date.toISOString().slice(0, 10)
 }
 
 function monthKey(date: Date): string {
@@ -310,6 +284,25 @@ function pageInfo(totalRows: number, page: number | undefined, pageSize: number)
     totalPages,
     hasNextPage: currentPage < totalPages,
     hasPreviousPage: currentPage > 1,
+  }
+}
+
+export function emptyPurchasingAnalyticsReportForSourceLimit<Row>(
+  filters: PurchasingAnalyticsFilters,
+  error: SourceScanTooLargeError,
+  totals: Record<string, string>,
+  now = new Date(),
+): PurchasingAnalyticsReport<Row> {
+  const window = period(filters, now)
+  const pageSize = clampPageSize(filters.pageSize)
+  return {
+    generatedAt: now.toISOString(),
+    dateFrom: dateOnly(window.dateFrom),
+    dateTo: dateOnly(window.dateTo),
+    rows: [],
+    pageInfo: pageInfo(0, filters.page, pageSize),
+    totals,
+    notices: [error.message],
   }
 }
 
@@ -340,7 +333,7 @@ function pctString(numerator: DecimalInput, denominator: DecimalInput): string {
 }
 
 function daysBetween(start: Date, end: Date): Prisma.Decimal {
-  return new Prisma.Decimal(end.getTime() - start.getTime()).div(DAY_MS)
+  return elapsedDaysDecimal(start, end)
 }
 
 function percentile(values: Prisma.Decimal[], percentileRank: number): Prisma.Decimal {
@@ -410,7 +403,7 @@ export async function getOpenPurchaseOrdersReport(
     orderBy: [{ expectedDelivery: 'asc' }, { createdAt: 'asc' }],
     take: SOURCE_ROW_LIMIT + 1,
   }) as OpenPoRow[]
-  if (orders.length > SOURCE_ROW_LIMIT) throw new Error(`Open purchase order source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(orders.length, SOURCE_ROW_LIMIT, 'Open purchase order source rows')
 
   const rows = orders.map<OpenPurchaseOrderReportRow>((order) => {
     let outstandingQty = new Prisma.Decimal(0)
@@ -491,7 +484,7 @@ async function loadReceipts(client: PurchasingAnalyticsClient, window: { dateFro
     orderBy: { receivedAt: 'asc' },
     take: SOURCE_ROW_LIMIT + 1,
   }) as ReceiptRow[]
-  if (receipts.length > SOURCE_ROW_LIMIT) throw new Error(`Purchase receipt source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(receipts.length, SOURCE_ROW_LIMIT, 'Purchase receipt source rows')
   return receipts
 }
 
@@ -511,6 +504,7 @@ export async function getSupplierPerformanceReport(
         return: { select: { returnedAt: true, po: { select: { supplierId: true, supplier: { select: { name: true } } } } } },
         poLine: { select: { productId: true } },
       },
+      take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<ReturnLineRow[]>,
     client.supplierProduct.findMany({
       where: { leadTimeDays: { not: null } },
@@ -529,8 +523,10 @@ export async function getSupplierPerformanceReport(
         updatedAt: true,
         supplier: { select: { name: true } },
       },
+      take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<Array<{ supplierId: string; rfqSentAt: Date | null; updatedAt: Date; supplier: { name: string } }>>,
   ])
+  assertSourceLimit(Math.max(returns.length, rfqOrders.length), SOURCE_ROW_LIMIT, 'Supplier performance source rows')
 
   type SupplierAccumulator = {
     supplierName: string
@@ -589,7 +585,7 @@ export async function getSupplierPerformanceReport(
     const supplier = bySupplier.get(row.supplierId)
     if (supplier && row.leadTimeDays != null) supplier.configuredLeadTimes.push(new Prisma.Decimal(row.leadTimeDays))
   }
-  if (configuredLeadTimes.length > SOURCE_ROW_LIMIT) throw new Error(`Supplier-product source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(configuredLeadTimes.length, SOURCE_ROW_LIMIT, 'Supplier-product source rows')
   for (const order of rfqOrders) {
     if (!order.rfqSentAt) continue
     const supplier = ensure(order.supplierId, order.supplier.name)
@@ -672,7 +668,7 @@ export async function getPurchasePriceVarianceReport(
     orderBy: [{ po: { receivedAt: 'asc' } }, { po: { createdAt: 'asc' } }],
     take: SOURCE_ROW_LIMIT + 1,
   }) as PurchaseOrderLineRow[]
-  if (lines.length > SOURCE_ROW_LIMIT) throw new Error(`PPV source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(lines.length, SOURCE_ROW_LIMIT, 'PPV source rows')
 
   const priorBySupplierProduct = new Map<string, Prisma.Decimal>()
   const rows: PurchasePriceVarianceReportRow[] = []
@@ -739,7 +735,7 @@ export async function getSpendReport(
     orderBy: { receivedAt: 'asc' },
     take: SOURCE_ROW_LIMIT + 1,
   }) as SpendPurchaseOrderRow[]
-  if (orders.length > SOURCE_ROW_LIMIT) throw new Error(`Spend source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(orders.length, SOURCE_ROW_LIMIT, 'Spend source rows')
 
   type SpendAccumulator = { poIds: Set<string>; spendBase: Prisma.Decimal }
   const byKey = new Map<string, SpendAccumulator & { period: string; supplierId: string; supplierName: string; categoryName: string }>()
@@ -800,7 +796,7 @@ export async function getLeadTimeReport(
     select: { supplierId: true, productId: true, leadTimeDays: true },
     take: SOURCE_ROW_LIMIT + 1,
   }) as SupplierProductRow[]
-  if (supplierProducts.length > SOURCE_ROW_LIMIT) throw new Error(`Supplier-product source rows exceed ${SOURCE_ROW_LIMIT.toLocaleString()}; narrow the filters and retry.`)
+  assertSourceLimit(supplierProducts.length, SOURCE_ROW_LIMIT, 'Supplier-product source rows')
   const configuredByKey = new Map(supplierProducts.map((row) => [`${row.supplierId}:${row.productId}`, row.leadTimeDays]))
 
   type LeadAccumulator = {
@@ -867,8 +863,8 @@ export async function getObservedLeadTimeP95BySupplierProduct(
   const client = (options.client ?? db) as unknown as Pick<PurchasingAnalyticsClient, 'purchaseReceipt'>
   const generatedAt = options.now?.() ?? new Date()
   const window = {
-    dateFrom: options.dateFrom ?? subtractDays(startOfUtcDay(generatedAt), 365),
-    dateTo: options.dateTo ?? endOfUtcDay(generatedAt),
+    dateFrom: options.dateFrom ?? subtractUtcDays(startOfUtcDay(generatedAt), 365),
+    dateTo: options.dateTo ?? defaultUtcDateWindow(generatedAt, 1).dateTo,
   }
   const receipts = await loadReceipts(client as PurchasingAnalyticsClient, window)
   const byKey = new Map<string, Prisma.Decimal[]>()

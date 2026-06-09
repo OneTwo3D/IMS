@@ -9,6 +9,7 @@ import {
 } from '@/lib/domain/inventory/replenishment-reports'
 import type { StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { canAccessReplenishmentReports } from '@/lib/security/replenishment-report-access'
+import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
 const REPLENISHMENT_CSV_ROW_LIMIT = 50000
 
@@ -61,7 +62,8 @@ export async function GET(req: NextRequest) {
   const filters = filtersFromRequest(req)
   const date = new Date().toISOString().slice(0, 10)
 
-  switch (type) {
+  try {
+    switch (type) {
     case 'reorder': {
       const report = await getReorderReport(filters, { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
@@ -144,5 +146,9 @@ export async function GET(req: NextRequest) {
 
     default:
       return NextResponse.json({ error: 'Unknown replenishment export type' }, { status: 400 })
+    }
+  } catch (error) {
+    if (isSourceScanTooLargeError(error)) return NextResponse.json({ error: error.message }, { status: 413 })
+    throw error
   }
 }

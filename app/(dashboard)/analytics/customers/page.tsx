@@ -2,14 +2,14 @@ import type { Metadata } from 'next'
 import { requireRole } from '@/lib/auth/server'
 import { getCustomerAnalyticsReport, type CustomerReportRow } from '@/lib/domain/sales/sales-fulfillment-analytics'
 import { SalesAnalyticsReportPage, type SalesAnalyticsColumn } from '../_components/sales-analytics-report'
-import { salesAnalyticsFiltersForUi, salesAnalyticsFiltersFromSearch, type SalesAnalyticsSearchParams } from '../_components/sales-analytics-page-utils'
+import { loadSalesAnalyticsReportForPage, salesAnalyticsFiltersForUi, salesAnalyticsFiltersFromSearch, type SalesAnalyticsSearchParams } from '../_components/sales-analytics-page-utils'
 
 export const metadata: Metadata = { title: 'Customer Mix' }
 
 export default async function CustomerAnalyticsPage({ searchParams }: { searchParams: Promise<SalesAnalyticsSearchParams> }) {
   await requireRole('ADMIN', 'MANAGER', 'FINANCE')
   const filters = salesAnalyticsFiltersFromSearch(await searchParams)
-  const report = await getCustomerAnalyticsReport(filters)
+  const report = await loadSalesAnalyticsReportForPage(filters, getCustomerAnalyticsReport, { revenueBase: '0', grossProfitBase: '0', arExposureBase: '0' })
   const columns: Array<SalesAnalyticsColumn<CustomerReportRow>> = [
     { key: 'customer', label: 'Customer', render: (row) => row.customerName, footer: 'Totals' },
     { key: 'email', label: 'Email', render: (row) => row.customerEmail ?? '' },
