@@ -84,15 +84,13 @@ export async function GET(req: NextRequest) {
         referenceType: row.referenceType ?? '',
         referenceId: row.referenceId ?? '',
         note: row.note ?? '',
-        openingQty: report.totals.openingQty,
-        movementQty: report.totals.movementQty,
-        closingQty: report.totals.closingQty,
-        openingValueBase: report.totals.openingValueBase,
-        movementValueBase: report.totals.movementValueBase,
-        closingValueBase: report.totals.closingValueBase,
-        generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['createdAt', 'type', 'sku', 'mpn', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'qty', 'signedQty', 'unitCostBase', 'totalValueBase', 'signedValueBase', 'referenceType', 'referenceId', 'note', 'openingQty', 'movementQty', 'closingQty', 'openingValueBase', 'movementValueBase', 'closingValueBase', 'generatedAt'], `stock-movements-${date}.csv`)
+      return csvBufferedStreamResponse(
+        rows,
+        ['createdAt', 'type', 'sku', 'mpn', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'qty', 'signedQty', 'unitCostBase', 'totalValueBase', 'signedValueBase', 'referenceType', 'referenceId', 'note'],
+        `stock-movements-${date}.csv`,
+        { generatedAt: report.generatedAt, ...report.totals },
+      )
     }
 
     case 'stock-adjustments': {
@@ -113,9 +111,13 @@ export async function GET(req: NextRequest) {
         referenceType: row.referenceType ?? '',
         referenceId: row.referenceId ?? '',
         note: row.note ?? '',
-        generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['createdAt', 'sku', 'mpn', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'reasonName', 'reasonMatched', 'signedQty', 'totalValueBase', 'referenceType', 'referenceId', 'note', 'generatedAt'], `stock-adjustments-${date}.csv`)
+      return csvBufferedStreamResponse(
+        rows,
+        ['createdAt', 'sku', 'mpn', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'reasonName', 'reasonMatched', 'signedQty', 'totalValueBase', 'referenceType', 'referenceId', 'note'],
+        `stock-adjustments-${date}.csv`,
+        { generatedAt: report.generatedAt },
+      )
     }
 
     case 'transfers': {
@@ -137,9 +139,13 @@ export async function GET(req: NextRequest) {
         movementOutQty: row.movementOutQty,
         movementInQty: row.movementInQty,
         movementValueBase: row.movementValueBase,
-        generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['reference', 'status', 'fromWarehouseCode', 'fromWarehouseName', 'toWarehouseCode', 'toWarehouseName', 'dispatchedAt', 'completedAt', 'daysInTransit', 'overdue', 'requestedQty', 'receivedQty', 'driftQty', 'movementOutQty', 'movementInQty', 'movementValueBase', 'generatedAt'], `transfers-${date}.csv`)
+      return csvBufferedStreamResponse(
+        rows,
+        ['reference', 'status', 'fromWarehouseCode', 'fromWarehouseName', 'toWarehouseCode', 'toWarehouseName', 'dispatchedAt', 'completedAt', 'daysInTransit', 'overdue', 'requestedQty', 'receivedQty', 'driftQty', 'movementOutQty', 'movementInQty', 'movementValueBase'],
+        `transfers-${date}.csv`,
+        { generatedAt: report.generatedAt },
+      )
     }
 
     case 'stock-counts': {
@@ -159,9 +165,13 @@ export async function GET(req: NextRequest) {
         linkedAdjustmentValueBase: row.linkedAdjustmentValueBase ?? '',
         adjustmentEvidence: row.adjustmentEvidence,
         completedAt: row.completedAt ?? '',
-        generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['reference', 'status', 'warehouseCode', 'warehouseName', 'sku', 'mpn', 'productId', 'expectedQty', 'countedQty', 'varianceQty', 'linkedAdjustmentValueBase', 'adjustmentEvidence', 'completedAt', 'generatedAt'], `stock-counts-${date}.csv`)
+      return csvBufferedStreamResponse(
+        rows,
+        ['reference', 'status', 'warehouseCode', 'warehouseName', 'sku', 'mpn', 'productId', 'expectedQty', 'countedQty', 'varianceQty', 'linkedAdjustmentValueBase', 'adjustmentEvidence', 'completedAt'],
+        `stock-counts-${date}.csv`,
+        { generatedAt: report.generatedAt },
+      )
     }
 
     default:

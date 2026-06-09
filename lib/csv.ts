@@ -6,6 +6,9 @@
 // when they appear at the start of a cell. We neutralise by prefixing with `'`.
 const FORMULA_PREFIX = /^[=+\-@\t\r]/
 const NUMERIC_LITERAL = /^-?\d+(?:\.\d+)?$/
+export const CSV_EXPORT_METADATA_HEADER = 'X-IMS-Export-Metadata'
+
+type CsvExportMetadata = Record<string, unknown>
 
 /** Escape a single value for CSV output */
 function escapeField(value: unknown): string {
@@ -109,13 +112,21 @@ function parseRows(text: string): string[][] {
   return rows
 }
 
+function csvHeaders(filename: string, metadata?: CsvExportMetadata): Record<string, string> {
+  const headers: Record<string, string> = {
+    'Content-Type': 'text/csv; charset=utf-8',
+    'Content-Disposition': `attachment; filename="${filename}"`,
+  }
+  if (metadata && Object.keys(metadata).length > 0) {
+    headers[CSV_EXPORT_METADATA_HEADER] = JSON.stringify(metadata)
+  }
+  return headers
+}
+
 /** Build a Response that triggers a file download */
-export function csvResponse(csv: string, filename: string): Response {
+export function csvResponse(csv: string, filename: string, metadata?: CsvExportMetadata): Response {
   return new Response(csv, {
-    headers: {
-      'Content-Type': 'text/csv; charset=utf-8',
-      'Content-Disposition': `attachment; filename="${filename}"`,
-    },
+    headers: csvHeaders(filename, metadata),
   })
 }
 
@@ -123,7 +134,7 @@ export function csvResponse(csv: string, filename: string): Response {
  * Build a streamed CSV download response from already-materialized rows.
  * This chunks the wire response but does not make the caller's memory profile O(1).
  */
-export function csvBufferedStreamResponse(rows: Iterable<Record<string, unknown>>, headers: string[], filename: string): Response {
+export function csvBufferedStreamResponse(rows: Iterable<Record<string, unknown>>, headers: string[], filename: string, metadata?: CsvExportMetadata): Response {
   const encoder = new TextEncoder()
   const iterator = rows[Symbol.iterator]()
   let headerSent = false
@@ -149,9 +160,6 @@ export function csvBufferedStreamResponse(rows: Iterable<Record<string, unknown>
   })
 
   return new Response(stream, {
-    headers: {
-      'Content-Type': 'text/csv; charset=utf-8',
-      'Content-Disposition': `attachment; filename="${filename}"`,
-    },
+    headers: csvHeaders(filename, metadata),
   })
 }

@@ -340,6 +340,8 @@ PDFs are streamed directly as responses from route handlers.
 
 CSV utilities are in `lib/csv.ts`.
 
+Report CSV exports keep the first CSV row as the data header and avoid repeating report-level metadata on every data row. When an export has report-scoped context such as `generatedAt`, date windows, valuation source, or ledger opening/closing totals, the route exposes it once in the `X-IMS-Export-Metadata` response header as JSON. Row-level provenance remains in the CSV body when it can vary by row, for example stock-on-hand reservation snapshot fields and allocation source values.
+
 
 ## External Integrations
 
