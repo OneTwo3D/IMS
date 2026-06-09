@@ -14,6 +14,7 @@ import {
 import { inventoryLedgerApiAccessDenied } from '@/lib/security/inventory-ledger-access'
 
 const INVENTORY_LEDGER_CSV_ROW_LIMIT = 100000
+export const STOCK_MOVEMENT_LEDGER_CSV_HEADERS = ['createdAt', 'type', 'sku', 'mpn', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'qty', 'signedQty', 'unitCostBase', 'totalValueBase', 'signedValueBase', 'referenceType', 'referenceId', 'note']
 
 async function loadMpnByProductId(productIds: Array<string | null | undefined>): Promise<Map<string, string>> {
   const ids = Array.from(new Set(productIds.filter((id): id is string => Boolean(id))))
@@ -87,7 +88,7 @@ export async function GET(req: NextRequest) {
       }))
       return csvBufferedStreamResponse(
         rows,
-        ['createdAt', 'type', 'sku', 'mpn', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'qty', 'signedQty', 'unitCostBase', 'totalValueBase', 'signedValueBase', 'referenceType', 'referenceId', 'note'],
+        STOCK_MOVEMENT_LEDGER_CSV_HEADERS,
         `stock-movements-${date}.csv`,
         { generatedAt: report.generatedAt, ...report.totals },
       )

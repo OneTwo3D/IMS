@@ -15,6 +15,8 @@ import {
 } from '@/lib/domain/inventory/inventory-costing-reports'
 import { inventoryCostingApiAccessDenied } from '@/lib/security/inventory-costing-access'
 
+export const INVENTORY_VALUATION_CSV_HEADERS = ['sku', 'mpn', 'productName', 'categoryName', 'supplierNames', 'warehouseCode', 'warehouseName', 'qty', 'stockUnit', 'unitCostBase', 'totalValueBase', 'glBalanceBase', 'glVarianceBase']
+
 async function loadMpnByProductId(productIds: Array<string | null | undefined>): Promise<Map<string, string>> {
   const ids = Array.from(new Set(productIds.filter((id): id is string => Boolean(id))))
   if (ids.length === 0) return new Map()
@@ -61,7 +63,7 @@ export async function GET(req: NextRequest) {
       }))
       return csvBufferedStreamResponse(
         rows,
-        ['sku', 'mpn', 'productName', 'categoryName', 'supplierNames', 'warehouseCode', 'warehouseName', 'qty', 'stockUnit', 'unitCostBase', 'totalValueBase', 'glBalanceBase', 'glVarianceBase'],
+        INVENTORY_VALUATION_CSV_HEADERS,
         `inventory-valuation-${date}.csv`,
         { asOf: report.asOf, source: report.source, valueReplayReliable: report.valueReplayReliable, generatedAt: report.generatedAt },
       )

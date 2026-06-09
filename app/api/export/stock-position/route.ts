@@ -12,6 +12,7 @@ import { getDeadStockReport, getInventoryAgingReport, InventoryHealthSourceLimit
 import { stockPositionApiAccessDenied } from '@/lib/security/stock-position-access'
 
 const STOCK_POSITION_CSV_ROW_LIMIT = 50000
+export const STOCK_ON_HAND_CSV_HEADERS = ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'quantity', 'reservedQty', 'availableQty', 'unitCostBase', 'totalValueBase', 'reservationQtySource', 'reservationSnapshotDate', 'reservationSourceCount']
 
 async function loadMpnByProductId(productIds: Array<string | null | undefined>): Promise<Map<string, string>> {
   const ids = Array.from(new Set(productIds.filter((id): id is string => Boolean(id))))
@@ -90,7 +91,7 @@ export async function GET(req: NextRequest) {
         reservationSourceCount: r.reservationSourceCount ?? 'unknown',
       }))
       return csvResponse(
-        toCsv(data, ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'quantity', 'reservedQty', 'availableQty', 'unitCostBase', 'totalValueBase', 'reservationQtySource', 'reservationSnapshotDate', 'reservationSourceCount']),
+        toCsv(data, STOCK_ON_HAND_CSV_HEADERS),
         `stock-on-hand-${date}.csv`,
         { asOf: report.asOf, source: report.source, generatedAt: report.generatedAt },
       )

@@ -432,7 +432,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ### P7.4 — CSV exports embed report-level metadata per row
 - **Status:** Complete.
 - **Files:** analytics CSV export routes
-- **Fix:** Dropped repeated report-level metadata from affected `/api/export/*` row schemas and exposed those values once per export via `X-IMS-Export-Metadata`.
+- **Fix:** Dropped repeated report-level metadata from affected `/api/export/*` row schemas and exposed those values once per export via trailing CSV `#` comment rows plus the encoded `X-IMS-Export-Metadata` response header.
 - **Tests:** `tests/api/export-csv-metadata.test.ts` asserts metadata headers and representative stock-position, inventory-ledger, and inventory-costing row schemas.
 
 ### P7.5 — Settings integration "test connection" gate
@@ -563,7 +563,7 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
    - [x] P7.8 — Source-row cap failures use typed errors and render inline/413 responses.
    - [x] CR1/CR2/CR3 — Shared date-window, source-scan, and base-currency refactors landed.
 17. **CSV export cleanup:**
-   - [x] P7.4 — Report-level metadata removed from per-row CSV schemas and emitted once via `X-IMS-Export-Metadata`.
+   - [x] P7.4 — Report-level metadata removed from per-row CSV schemas and emitted once via trailing CSV comments plus `X-IMS-Export-Metadata`.
    - [x] CR4 — `/api/export/*` metadata sweep completed for affected report exports.
 18. **Integration settings test gate:** P7.5.
 19. **Sidebar cleanup:** P2.3, CR5.

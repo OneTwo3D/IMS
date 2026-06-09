@@ -1,56 +1,173 @@
 import assert from 'node:assert/strict'
-import { readFile } from 'node:fs/promises'
+import { Buffer } from 'node:buffer'
 import test from 'node:test'
 
+import { INVENTORY_VALUATION_CSV_HEADERS } from '../../app/api/export/inventory-costing/route.ts'
+import { STOCK_MOVEMENT_LEDGER_CSV_HEADERS } from '../../app/api/export/inventory-ledger/route.ts'
+import { STOCK_ON_HAND_CSV_HEADERS } from '../../app/api/export/stock-position/route.ts'
 import {
+  CSV_EXPORT_METADATA_ENCODING,
+  CSV_EXPORT_METADATA_ENCODING_HEADER,
   CSV_EXPORT_METADATA_HEADER,
+  CSV_EXPORT_METADATA_MAX_JSON_BYTES,
+  CSV_EXPORT_METADATA_TRUNCATED_HEADER,
   csvBufferedStreamResponse,
   csvResponse,
   parseCsv,
   toCsv,
 } from '@/lib/csv'
 
-test('csvResponse exposes export metadata once without changing the CSV row schema', async () => {
+function decodeMetadata(response: Response): Record<string, unknown> {
+  assert.equal(response.headers.get(CSV_EXPORT_METADATA_ENCODING_HEADER), CSV_EXPORT_METADATA_ENCODING)
+  const encoded = response.headers.get(CSV_EXPORT_METADATA_HEADER)
+  assert.ok(encoded)
+  return JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8')) as Record<string, unknown>
+}
+
+test('csvResponse exposes encoded export metadata once and keeps metadata visible in the downloaded CSV', async () => {
   const response = csvResponse(
     toCsv([{ sku: 'SKU-1', qty: '10.000000' }], ['sku', 'qty']),
     'stock.csv',
-    { generatedAt: '2026-06-09T10:00:00.000Z', source: 'snapshot' },
+    { generatedAt: '2026-06-09T10:00:00.000Z', source: 'snapshot', generatedBy: 'café Admin' },
   )
+  const body = await response.text()
 
-  assert.deepEqual(parseCsv(await response.text()), [{ sku: 'SKU-1', qty: '10.000000' }])
-  assert.deepEqual(JSON.parse(response.headers.get(CSV_EXPORT_METADATA_HEADER) ?? '{}'), {
+  assert.deepEqual(parseCsv(body), [{ sku: 'SKU-1', qty: '10.000000' }])
+  assert.deepEqual(decodeMetadata(response), {
     generatedAt: '2026-06-09T10:00:00.000Z',
     source: 'snapshot',
+    generatedBy: 'café Admin',
   })
+  assert.match(body, /\r\n# IMS export metadata\r\n/)
+  assert.match(body, /\r\n# generatedBy,café Admin/)
+  assert.match(response.headers.get('Access-Control-Expose-Headers') ?? '', new RegExp(CSV_EXPORT_METADATA_HEADER))
 })
 
-test('csvBufferedStreamResponse exposes export metadata once without adding metadata columns', async () => {
+test('csvBufferedStreamResponse exposes encoded metadata without adding data columns', async () => {
   const response = csvBufferedStreamResponse(
     [{ createdAt: '2026-06-09T10:00:00.000Z', sku: 'SKU-1' }],
     ['createdAt', 'sku'],
     'ledger.csv',
     { generatedAt: '2026-06-09T10:05:00.000Z', openingQty: '1.000000', closingQty: '2.000000' },
   )
+  const body = await response.text()
 
-  assert.deepEqual(parseCsv(await response.text()), [{ createdAt: '2026-06-09T10:00:00.000Z', sku: 'SKU-1' }])
-  assert.deepEqual(JSON.parse(response.headers.get(CSV_EXPORT_METADATA_HEADER) ?? '{}'), {
+  assert.deepEqual(parseCsv(body), [{ createdAt: '2026-06-09T10:00:00.000Z', sku: 'SKU-1' }])
+  assert.deepEqual(decodeMetadata(response), {
     generatedAt: '2026-06-09T10:05:00.000Z',
     openingQty: '1.000000',
     closingQty: '2.000000',
   })
+  assert.match(body, /\r\n# openingQty,1.000000/)
 })
 
-test('inventory report export route schemas do not repeat report metadata per CSV row', async () => {
-  const stockPosition = await readFile('app/api/export/stock-position/route.ts', 'utf8')
-  assert.doesNotMatch(stockPosition, /'totalValueBase', 'asOf', 'source', 'generatedAt', 'reservationQtySource'/)
-  assert.doesNotMatch(stockPosition, /'movementCount', 'dateFrom', 'dateTo', 'generatedAt'/)
+test('oversized metadata is capped before it becomes an HTTP header', () => {
+  const response = csvResponse(
+    toCsv([], ['sku']),
+    'stock.csv',
+    {
+      generatedAt: '2026-06-09T10:00:00.000Z',
+      perWarehouseTotals: Array.from({ length: 500 }, (_, index) => ({ warehouseId: `warehouse-${index}`, qty: index })),
+    },
+  )
+  const decoded = decodeMetadata(response)
 
-  const inventoryLedger = await readFile('app/api/export/inventory-ledger/route.ts', 'utf8')
-  assert.doesNotMatch(inventoryLedger, /'note', 'openingQty', 'movementQty', 'closingQty'/)
-  assert.doesNotMatch(inventoryLedger, /'completedAt', 'generatedAt'/)
+  assert.equal(response.headers.get(CSV_EXPORT_METADATA_TRUNCATED_HEADER), 'true')
+  assert.equal(decoded.metadataTruncated, true)
+  assert.equal(decoded.generatedAt, '2026-06-09T10:00:00.000Z')
+  assert.equal(typeof decoded.originalByteLength, 'number')
+  assert.ok((decoded.originalByteLength as number) > CSV_EXPORT_METADATA_MAX_JSON_BYTES)
+  assert.ok(Buffer.byteLength(response.headers.get(CSV_EXPORT_METADATA_HEADER) ?? '', 'utf8') < CSV_EXPORT_METADATA_MAX_JSON_BYTES)
+})
 
-  const inventoryCosting = await readFile('app/api/export/inventory-costing/route.ts', 'utf8')
-  assert.doesNotMatch(inventoryCosting, /'asOf', 'sku'/)
-  assert.doesNotMatch(inventoryCosting, /'dateFrom', 'dateTo', 'groupBy', 'groupLabel'/)
-  assert.doesNotMatch(inventoryCosting, /'dateFrom', 'dateTo', 'poReference'/)
+test('representative affected export schemas keep report metadata out of CSV data rows', async () => {
+  const stockResponse = csvResponse(
+    toCsv([{
+      sku: 'SKU-1',
+      mpn: 'MPN-1',
+      productName: 'Product',
+      productType: 'SIMPLE',
+      category: 'Category',
+      suppliers: 'Supplier',
+      warehouseCode: 'WH',
+      warehouseName: 'Warehouse',
+      stockUnit: 'pcs',
+      quantity: '10.000000',
+      reservedQty: '2.000000',
+      availableQty: '8.000000',
+      unitCostBase: '1.000000',
+      totalValueBase: '10.000000',
+      reservationQtySource: 'snapshot',
+      reservationSnapshotDate: '2026-06-09',
+      reservationSourceCount: 1,
+    }], STOCK_ON_HAND_CSV_HEADERS),
+    'stock-on-hand.csv',
+    { asOf: '2026-06-09', source: 'snapshot', generatedAt: '2026-06-09T10:00:00.000Z' },
+  )
+  const stockBody = await stockResponse.text()
+  assert.equal(stockBody.split('\r\n')[0], STOCK_ON_HAND_CSV_HEADERS.join(','))
+  assert.deepEqual(Object.keys(parseCsv(stockBody)[0] ?? {}), STOCK_ON_HAND_CSV_HEADERS)
+  assert.deepEqual(decodeMetadata(stockResponse), {
+    asOf: '2026-06-09',
+    source: 'snapshot',
+    generatedAt: '2026-06-09T10:00:00.000Z',
+  })
+
+  const ledgerResponse = csvBufferedStreamResponse(
+    [{
+      createdAt: '2026-06-09T10:00:00.000Z',
+      type: 'SALE_DISPATCH',
+      sku: 'SKU-1',
+      mpn: 'MPN-1',
+      productName: 'Product',
+      stockUnit: 'pcs',
+      warehouseCode: 'WH',
+      warehouseName: 'Warehouse',
+      qty: '1.000000',
+      signedQty: '-1.000000',
+      unitCostBase: '1.000000',
+      totalValueBase: '1.000000',
+      signedValueBase: '-1.000000',
+      referenceType: 'SHIPMENT',
+      referenceId: 'shipment-1',
+      note: '',
+    }],
+    STOCK_MOVEMENT_LEDGER_CSV_HEADERS,
+    'stock-movements.csv',
+    { generatedAt: '2026-06-09T10:05:00.000Z', openingQty: '10.000000', closingQty: '9.000000' },
+  )
+  assert.equal((await ledgerResponse.text()).split('\r\n')[0], STOCK_MOVEMENT_LEDGER_CSV_HEADERS.join(','))
+  assert.deepEqual(decodeMetadata(ledgerResponse), {
+    generatedAt: '2026-06-09T10:05:00.000Z',
+    openingQty: '10.000000',
+    closingQty: '9.000000',
+  })
+
+  const costingResponse = csvBufferedStreamResponse(
+    [{
+      sku: 'SKU-1',
+      mpn: 'MPN-1',
+      productName: 'Product',
+      categoryName: 'Category',
+      supplierNames: 'Supplier',
+      warehouseCode: 'WH',
+      warehouseName: 'Warehouse',
+      qty: '10.000000',
+      stockUnit: 'pcs',
+      unitCostBase: '1.000000',
+      totalValueBase: '10.000000',
+      glBalanceBase: '10.000000',
+      glVarianceBase: '0.000000',
+    }],
+    INVENTORY_VALUATION_CSV_HEADERS,
+    'inventory-valuation.csv',
+    { asOf: '2026-06-09', source: 'snapshot', valueReplayReliable: true, generatedAt: '2026-06-09T10:10:00.000Z' },
+  )
+  assert.equal((await costingResponse.text()).split('\r\n')[0], INVENTORY_VALUATION_CSV_HEADERS.join(','))
+  assert.deepEqual(decodeMetadata(costingResponse), {
+    asOf: '2026-06-09',
+    source: 'snapshot',
+    valueReplayReliable: true,
+    generatedAt: '2026-06-09T10:10:00.000Z',
+  })
 })

@@ -2,13 +2,31 @@
 // Minimal CSV utilities — no dependencies
 // ---------------------------------------------------------------------------
 
+import { Buffer } from 'node:buffer'
+
 // Characters that trigger formula evaluation in Excel / LibreOffice / Google Sheets
 // when they appear at the start of a cell. We neutralise by prefixing with `'`.
 const FORMULA_PREFIX = /^[=+\-@\t\r]/
 const NUMERIC_LITERAL = /^-?\d+(?:\.\d+)?$/
+
+/**
+ * Base64url-encoded JSON object with report-level metadata for API consumers.
+ * The CSV body also includes `#` comment rows with the same metadata for
+ * operator downloads. Header payloads are capped to avoid proxy/header limits.
+ */
 export const CSV_EXPORT_METADATA_HEADER = 'X-IMS-Export-Metadata'
+export const CSV_EXPORT_METADATA_ENCODING_HEADER = 'X-IMS-Export-Metadata-Encoding'
+export const CSV_EXPORT_METADATA_TRUNCATED_HEADER = 'X-IMS-Export-Metadata-Truncated'
+export const CSV_EXPORT_METADATA_ENCODING = 'base64url-json'
+export const CSV_EXPORT_METADATA_MAX_JSON_BYTES = 4096
 
 type CsvExportMetadata = Record<string, unknown>
+type CsvHeaderMetadata = CsvExportMetadata & {
+  metadataTruncated?: true
+  originalByteLength?: number
+}
+
+const ESSENTIAL_METADATA_KEYS = ['generatedAt', 'asOf', 'dateFrom', 'dateTo', 'source', 'groupBy', 'valueReplayReliable']
 
 /** Escape a single value for CSV output */
 function escapeField(value: unknown): string {
@@ -36,6 +54,50 @@ export function toCsv(rows: Record<string, unknown>[], headers: string[]): strin
 
 function csvLine(row: Record<string, unknown>, headers: string[]): string {
   return headers.map((header) => escapeField(row[header])).join(',')
+}
+
+function safeCsvFilename(filename: string): string {
+  return filename.replace(/[\u0000-\u001f\u007f"]/g, '_')
+}
+
+function metadataJsonByteLength(metadata: CsvHeaderMetadata): number {
+  return Buffer.byteLength(JSON.stringify(metadata), 'utf8')
+}
+
+function headerMetadata(metadata: CsvExportMetadata): CsvHeaderMetadata {
+  const byteLength = metadataJsonByteLength(metadata)
+  if (byteLength <= CSV_EXPORT_METADATA_MAX_JSON_BYTES) return metadata
+
+  const fallback: CsvHeaderMetadata = {
+    metadataTruncated: true,
+    originalByteLength: byteLength,
+  }
+  for (const key of ESSENTIAL_METADATA_KEYS) {
+    const value = metadata[key]
+    if (value !== undefined) fallback[key] = value
+  }
+  return metadataJsonByteLength(fallback) <= CSV_EXPORT_METADATA_MAX_JSON_BYTES
+    ? fallback
+    : { metadataTruncated: true, originalByteLength: byteLength }
+}
+
+function encodeMetadataHeader(metadata: CsvHeaderMetadata): string {
+  return Buffer.from(JSON.stringify(metadata), 'utf8').toString('base64url')
+}
+
+function metadataCommentRows(metadata?: CsvExportMetadata): string {
+  if (!metadata || Object.keys(metadata).length === 0) return ''
+  const rows = ['# IMS export metadata']
+  for (const [key, value] of Object.entries(headerMetadata(metadata))) {
+    rows.push(csvLine({ key: `# ${key}`, value: valueForMetadataComment(value) }, ['key', 'value']))
+  }
+  return `\r\n${rows.join('\r\n')}`
+}
+
+function valueForMetadataComment(value: unknown): string {
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return String(value)
+  return JSON.stringify(value)
 }
 
 export function buildTemplateCsv(
@@ -115,17 +177,26 @@ function parseRows(text: string): string[][] {
 function csvHeaders(filename: string, metadata?: CsvExportMetadata): Record<string, string> {
   const headers: Record<string, string> = {
     'Content-Type': 'text/csv; charset=utf-8',
-    'Content-Disposition': `attachment; filename="${filename}"`,
+    'Content-Disposition': `attachment; filename="${safeCsvFilename(filename)}"`,
   }
   if (metadata && Object.keys(metadata).length > 0) {
-    headers[CSV_EXPORT_METADATA_HEADER] = JSON.stringify(metadata)
+    const encodedMetadata = headerMetadata(metadata)
+    headers[CSV_EXPORT_METADATA_HEADER] = encodeMetadataHeader(encodedMetadata)
+    headers[CSV_EXPORT_METADATA_ENCODING_HEADER] = CSV_EXPORT_METADATA_ENCODING
+    headers['Access-Control-Expose-Headers'] = [
+      'Content-Disposition',
+      CSV_EXPORT_METADATA_HEADER,
+      CSV_EXPORT_METADATA_ENCODING_HEADER,
+      CSV_EXPORT_METADATA_TRUNCATED_HEADER,
+    ].join(', ')
+    if (encodedMetadata.metadataTruncated) headers[CSV_EXPORT_METADATA_TRUNCATED_HEADER] = 'true'
   }
   return headers
 }
 
 /** Build a Response that triggers a file download */
 export function csvResponse(csv: string, filename: string, metadata?: CsvExportMetadata): Response {
-  return new Response(csv, {
+  return new Response(`${csv}${metadataCommentRows(metadata)}`, {
     headers: csvHeaders(filename, metadata),
   })
 }
@@ -150,6 +221,8 @@ export function csvBufferedStreamResponse(rows: Iterable<Record<string, unknown>
       while (pushed < 100) {
         const next = iterator.next()
         if (next.done) {
+          const comments = metadataCommentRows(metadata)
+          if (comments) controller.enqueue(encoder.encode(comments))
           controller.close()
           return
         }
