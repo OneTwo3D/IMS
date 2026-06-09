@@ -15,6 +15,8 @@ import {
 } from '@/lib/domain/inventory/inventory-costing-reports'
 import { inventoryCostingApiAccessDenied } from '@/lib/security/inventory-costing-access'
 
+export const INVENTORY_VALUATION_CSV_HEADERS = ['sku', 'mpn', 'productName', 'categoryName', 'supplierNames', 'warehouseCode', 'warehouseName', 'qty', 'stockUnit', 'unitCostBase', 'totalValueBase', 'glBalanceBase', 'glVarianceBase']
+
 async function loadMpnByProductId(productIds: Array<string | null | undefined>): Promise<Map<string, string>> {
   const ids = Array.from(new Set(productIds.filter((id): id is string => Boolean(id))))
   if (ids.length === 0) return new Map()
@@ -45,7 +47,6 @@ export async function GET(req: NextRequest) {
       if (tooLarge) return tooLarge
       const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
-        asOf: report.asOf,
         sku: row.sku,
         mpn: mpnByProductId.get(row.productId) ?? '',
         productName: row.productName,
@@ -59,11 +60,13 @@ export async function GET(req: NextRequest) {
         totalValueBase: row.totalValueBase,
         glBalanceBase: row.glBalanceBase ?? '',
         glVarianceBase: row.glVarianceBase ?? '',
-        source: report.source,
-        valueReplayReliable: report.valueReplayReliable,
-        generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['asOf', 'sku', 'mpn', 'productName', 'categoryName', 'supplierNames', 'warehouseCode', 'warehouseName', 'qty', 'stockUnit', 'unitCostBase', 'totalValueBase', 'glBalanceBase', 'glVarianceBase', 'source', 'valueReplayReliable', 'generatedAt'], `inventory-valuation-${date}.csv`)
+      return csvBufferedStreamResponse(
+        rows,
+        INVENTORY_VALUATION_CSV_HEADERS,
+        `inventory-valuation-${date}.csv`,
+        { asOf: report.asOf, source: report.source, valueReplayReliable: report.valueReplayReliable, generatedAt: report.generatedAt },
+      )
     }
 
     case 'cogs': {
@@ -72,9 +75,6 @@ export async function GET(req: NextRequest) {
       if (tooLarge) return tooLarge
       const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
-        dateFrom: report.dateFrom,
-        dateTo: report.dateTo,
-        groupBy: report.groupBy,
         groupLabel: row.groupLabel,
         sku: row.sku ?? '',
         mpn: row.productId ? (mpnByProductId.get(row.productId) ?? '') : '',
@@ -89,9 +89,13 @@ export async function GET(req: NextRequest) {
         grossMarginPct: row.grossMarginPct ?? '',
         movementCount: row.movementCount,
         revenueCaptured: row.revenueCaptured,
-        generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['dateFrom', 'dateTo', 'groupBy', 'groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'customerName', 'channel', 'qty', 'cogsBase', 'revenueBase', 'grossMarginBase', 'grossMarginPct', 'movementCount', 'revenueCaptured', 'generatedAt'], `cogs-${date}.csv`)
+      return csvBufferedStreamResponse(
+        rows,
+        ['groupLabel', 'sku', 'mpn', 'categoryName', 'warehouseCode', 'customerName', 'channel', 'qty', 'cogsBase', 'revenueBase', 'grossMarginBase', 'grossMarginPct', 'movementCount', 'revenueCaptured'],
+        `cogs-${date}.csv`,
+        { dateFrom: report.dateFrom, dateTo: report.dateTo, groupBy: report.groupBy, generatedAt: report.generatedAt },
+      )
     }
 
     case 'landed-cost': {
@@ -100,8 +104,6 @@ export async function GET(req: NextRequest) {
       if (tooLarge) return tooLarge
       const mpnByProductId = await loadMpnByProductId(report.rows.map((row) => row.productId))
       const rows = report.rows.map((row) => ({
-        dateFrom: report.dateFrom,
-        dateTo: report.dateTo,
         poReference: row.poReference,
         supplierName: row.supplierName,
         status: row.status,
@@ -118,9 +120,13 @@ export async function GET(req: NextRequest) {
         landedValueBase: row.landedValueBase,
         landedCostMethod: row.landedCostMethod,
         revaluationCount: row.revaluationCount,
-        generatedAt: report.generatedAt,
       }))
-      return csvBufferedStreamResponse(rows, ['dateFrom', 'dateTo', 'poReference', 'supplierName', 'status', 'sku', 'mpn', 'productName', 'categoryName', 'qty', 'goodsUnitCostBase', 'landedUnitCostBase', 'landedUpliftUnitBase', 'landedUpliftPct', 'goodsValueBase', 'landedValueBase', 'landedCostMethod', 'revaluationCount', 'generatedAt'], `landed-cost-${date}.csv`)
+      return csvBufferedStreamResponse(
+        rows,
+        ['poReference', 'supplierName', 'status', 'sku', 'mpn', 'productName', 'categoryName', 'qty', 'goodsUnitCostBase', 'landedUnitCostBase', 'landedUpliftUnitBase', 'landedUpliftPct', 'goodsValueBase', 'landedValueBase', 'landedCostMethod', 'revaluationCount'],
+        `landed-cost-${date}.csv`,
+        { dateFrom: report.dateFrom, dateTo: report.dateTo, generatedAt: report.generatedAt },
+      )
     }
 
     case 'inventory-turnover': {
