@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 
 import { runScheduledInvariantCheck } from '@/lib/cron/invariant-check'
 import { verifyCron } from '@/lib/cron-auth'
+import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
 
@@ -10,6 +11,8 @@ export const runtime = 'nodejs'
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
+  const rateLimitErr = await enforceCronRateLimit('invariant-check')
+  if (rateLimitErr) return rateLimitErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 
 import { verifyCron } from '@/lib/cron-auth'
+import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { db } from '@/lib/db'
 import { getShopifySettings } from '@/lib/connectors/shopify/settings'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
@@ -69,6 +70,8 @@ async function getShopifySyncEnabled(): Promise<boolean> {
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
+  const rateLimitErr = await enforceCronRateLimit('shopping-webhook-inbox', { max: 12 })
+  if (rateLimitErr) return rateLimitErr
 
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance

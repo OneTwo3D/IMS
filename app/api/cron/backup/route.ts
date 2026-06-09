@@ -5,6 +5,7 @@ import path from 'path'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { verifyCron } from '@/lib/cron-auth'
+import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getBackupDir } from '@/lib/backup-storage'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { BackupArtifactUploadError, uploadBackupArtifactsToTarget } from '@/lib/backup-remote'
@@ -32,6 +33,8 @@ function getDbConfig() {
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
+  const rateLimitErr = await enforceCronRateLimit('backup')
+  if (rateLimitErr) return rateLimitErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 

@@ -1,6 +1,7 @@
 import { NextResponse } from 'next/server'
 
 import { verifyCron } from '@/lib/cron-auth'
+import { enforceCronRateLimit, type CronRateLimitChecker } from '@/lib/cron-rate-limit'
 import {
   inventorySnapshotCounts,
   inventorySnapshotStatusReason,
@@ -28,10 +29,13 @@ export async function handleInventorySnapshotCron(
     writeLog?: CronRunLogWriter
     getMaintenanceResponse?: typeof getMaintenanceModeResponse
     writeSnapshot?: typeof writeDailyInventorySnapshot
+    checkCronRateLimit?: CronRateLimitChecker
   } = {},
 ) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
+  const rateLimitErr = await enforceCronRateLimit('inventory-snapshot', { checker: options.checkCronRateLimit })
+  if (rateLimitErr) return rateLimitErr
 
   const getMaintenanceResponse = options.getMaintenanceResponse ?? getMaintenanceModeResponse
   const maintenance = await getMaintenanceResponse('cron')

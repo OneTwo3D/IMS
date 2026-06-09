@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
+import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { db } from '@/lib/db'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { runWcReconcile } from '@/lib/connectors/woocommerce/sync/reconcile'
@@ -10,6 +11,8 @@ import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
+  const rateLimitErr = await enforceCronRateLimit('wc-reconcile')
+  if (rateLimitErr) return rateLimitErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 

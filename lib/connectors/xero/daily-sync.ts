@@ -13,6 +13,8 @@
  *   Per-shipment, with FIFO cost layer consumption.
  */
 
+import { createHash } from 'node:crypto'
+
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -53,6 +55,8 @@ type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog'
 
 const XERO_DAILY_BATCH_LOCK_KEY = 4_112_208_031
 const XERO_CONNECTOR = 'xero'
+export const XERO_DAILY_BATCH_DEFAULT_LIMIT = 1_000
+export const XERO_DAILY_BATCH_MAX_LIMIT = 5_000
 const DAILY_BATCH_TYPES = [
   'DAILY_BATCH_REVENUE_DEFERRAL',
   'DAILY_BATCH_INVENTORY_ALLOC',
@@ -80,6 +84,18 @@ function normalizeDeferredDiscountBase(order: {
 
 function makeLayerKey(productId: string, warehouseId: string): string {
   return `${productId}|${warehouseId}`
+}
+
+export function buildDailyBatchReferenceId(
+  group: 'A1' | 'A2' | 'B',
+  date: string,
+  entityIds: string[],
+): string {
+  const digest = createHash('sha256')
+    .update(entityIds.join('|'))
+    .digest('hex')
+    .slice(0, 8)
+  return `${group}-${date}-${digest}`
 }
 
 async function buildLayerSnapshot(
@@ -263,6 +279,34 @@ async function resetFailedDailyBatchLogs(): Promise<void> {
 }
 
 type DailyBatchLogType = typeof DAILY_BATCH_TYPES[number]
+type DailyBatchGroup = 'groupA1' | 'groupA2' | 'groupB'
+
+export type XeroDailyBatchResult = {
+  groupA1: number
+  groupA2: number
+  groupB: number
+  batchLimit: number
+  hasMore: Record<DailyBatchGroup, boolean>
+  errors: string[]
+}
+
+export function resolveXeroDailyBatchLimit(value = process.env.XERO_DAILY_BATCH_LIMIT): number {
+  if (value === undefined || value.trim() === '') return XERO_DAILY_BATCH_DEFAULT_LIMIT
+  const parsed = Number(value)
+  if (!Number.isFinite(parsed) || parsed <= 0) return XERO_DAILY_BATCH_DEFAULT_LIMIT
+  return Math.min(Math.floor(parsed), XERO_DAILY_BATCH_MAX_LIMIT)
+}
+
+export function takeDailyBatchWindow<T>(
+  rows: T[],
+  limit: number,
+): { rows: T[]; hasMore: boolean } {
+  if (rows.length <= limit) return { rows, hasMore: false }
+  return {
+    rows: rows.slice(0, limit),
+    hasMore: true,
+  }
+}
 
 async function hasLiveDailyBatchLog(type: DailyBatchLogType, referenceId: string): Promise<boolean> {
   const count = await db.accountingSyncLog.count({
@@ -404,13 +448,16 @@ async function recreateMissingDailyBatchLogs(settings: Awaited<ReturnType<typeof
   }
 }
 
-export async function runDailyBatchSync(): Promise<{
-  groupA1: number
-  groupA2: number
-  groupB: number
-  errors: string[]
-}> {
-  const result = { groupA1: 0, groupA2: 0, groupB: 0, errors: [] as string[] }
+export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
+  const batchLimit = resolveXeroDailyBatchLimit()
+  const result: XeroDailyBatchResult = {
+    groupA1: 0,
+    groupA2: 0,
+    groupB: 0,
+    batchLimit,
+    hasMore: { groupA1: false, groupA2: false, groupB: false },
+    errors: [],
+  }
   const lockRows = await db.$queryRaw<Array<{ locked: boolean }>>`
     SELECT pg_try_advisory_lock(${XERO_DAILY_BATCH_LOCK_KEY}) AS locked
   `
@@ -433,7 +480,7 @@ export async function runDailyBatchSync(): Promise<{
 
   // --- Group A1: Revenue Deferral ---
   try {
-    const orders = await db.salesOrder.findMany({
+    const orderWindow = takeDailyBatchWindow(await db.salesOrder.findMany({
       where: {
         paidAt: { not: null },
         revenueDeferredDate: null,
@@ -460,7 +507,11 @@ export async function runDailyBatchSync(): Promise<{
           },
         },
       },
-    })
+      orderBy: [{ paidAt: 'asc' }, { id: 'asc' }],
+      take: batchLimit + 1,
+    }), batchLimit)
+    const orders = orderWindow.rows
+    result.hasMore.groupA1 = orderWindow.hasMore
 
     if (orders.length > 0) {
       const orderDeferrals = orders.map((order) => {
@@ -490,16 +541,18 @@ export async function runDailyBatchSync(): Promise<{
 
       await db.$transaction(async (tx) => {
         if (journalLines.length > 0) {
+          const referenceId = buildDailyBatchReferenceId('A1', today, orders.map((order) => order.id))
           await createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_REVENUE_DEFERRAL',
-            referenceId: `A1-${today}`,
+            referenceId,
             currency: baseCurrency,
             payload: {
               date: today,
-              reference: `Revenue Deferral ${today}`,
+              reference: `Revenue Deferral ${today} ${referenceId.slice(-8)}`,
               narration: `Daily revenue deferral: ${orders.length} order(s), £${totalRevenueDeferred.toFixed(2)}`,
               lines: journalLines,
               orderDeferrals,
+              batchReferenceId: referenceId,
               _postingMode: 'submitted',
             },
           })
@@ -525,7 +578,7 @@ export async function runDailyBatchSync(): Promise<{
 
   // --- Group A2: Inventory Reclassification ---
   try {
-    const orders = await db.salesOrder.findMany({
+    const orderWindow = takeDailyBatchWindow(await db.salesOrder.findMany({
       where: {
         revenueDeferredDate: { not: null },
         inventoryAllocatedDate: null,
@@ -560,7 +613,10 @@ export async function runDailyBatchSync(): Promise<{
           },
         },
       },
-    })
+      take: batchLimit + 1,
+    }), batchLimit)
+    const orders = orderWindow.rows
+    result.hasMore.groupA2 = orderWindow.hasMore
 
     if (orders.length > 0) {
       await db.$transaction(async (tx) => {
@@ -603,18 +659,20 @@ export async function runDailyBatchSync(): Promise<{
 
         const totalAllocatedValueNumber = round2Decimal(totalAllocatedValue)
         if (totalAllocatedValueNumber > 0) {
+          const referenceId = buildDailyBatchReferenceId('A2', today, orders.map((order) => order.id))
           await createPendingSyncLog(tx, {
             type: 'DAILY_BATCH_INVENTORY_ALLOC',
-            referenceId: `A2-${today}`,
+            referenceId,
             currency: baseCurrency,
             payload: {
               date: today,
-              reference: `Inventory Allocation ${today}`,
+              reference: `Inventory Allocation ${today} ${referenceId.slice(-8)}`,
               narration: `Daily inventory reclassification: ${orders.length} order(s), £${totalAllocatedValueNumber.toFixed(2)}`,
               lines: [
                 { accountCode: settings.xero_allocated_inventory_account, description: `Daily inventory allocation — ${orders.length} order(s)`, debit: totalAllocatedValueNumber },
                 { accountCode: settings.xero_inventory_account, description: `Daily inventory allocation — ${orders.length} order(s)`, credit: totalAllocatedValueNumber },
               ],
+              batchReferenceId: referenceId,
               _postingMode: 'submitted',
             },
           })
@@ -648,7 +706,7 @@ export async function runDailyBatchSync(): Promise<{
   // --- Group B: Shipment Revenue Recognition + COGS ---
   try {
     const groupBCount = await db.$transaction(async (tx) => {
-      const shipments = await tx.shipment.findMany({
+      const shipmentWindow = takeDailyBatchWindow(await tx.shipment.findMany({
         where: {
           status: 'SHIPPED',
           shipmentJournalDate: null,
@@ -695,7 +753,10 @@ export async function runDailyBatchSync(): Promise<{
           },
         },
         orderBy: { createdAt: 'asc' },
-      })
+        take: batchLimit + 1,
+      }), batchLimit)
+      const shipments = shipmentWindow.rows
+      result.hasMore.groupB = shipmentWindow.hasMore
 
       if (shipments.length === 0) {
         return 0
@@ -990,15 +1051,17 @@ export async function runDailyBatchSync(): Promise<{
       }
 
       if (journalLines.length > 0) {
+        const referenceId = buildDailyBatchReferenceId('B', today, [...shipmentResults.keys()])
         await createPendingSyncLog(tx, {
           type: 'DAILY_BATCH_GROUP_B',
-          referenceId: `B-${today}`,
+          referenceId,
           currency: baseCurrency,
           payload: {
             date: today,
-            reference: `Shipment COGS ${today}`,
+            reference: `Shipment COGS ${today} ${referenceId.slice(-8)}`,
             narration: `Daily shipment batch: ${processedShipmentCount} shipment(s), revenue £${totalRevenue.toFixed(2)}, COGS £${totalCogsNumber.toFixed(2)}`,
             lines: journalLines,
+            batchReferenceId: referenceId,
             _postingMode: 'submitted',
           },
         })

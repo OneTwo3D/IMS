@@ -78,6 +78,7 @@ test('account balance snapshot cron syncs the previous UTC day', async () => {
         writeLog: async (log) => {
           logs.push(log)
         },
+        checkCronRateLimit: async () => ({ allowed: true, retryAfterSec: 0, remaining: 0 }),
         getMaintenanceResponse: async () => null,
         syncSnapshots: async (options = {}) => {
           calls.push(options)
@@ -113,6 +114,7 @@ test('account balance snapshot cron records connector errors as failed runs', as
         writeLog: async (log) => {
           logs.push(log)
         },
+        checkCronRateLimit: async () => ({ allowed: true, retryAfterSec: 0, remaining: 0 }),
         getMaintenanceResponse: async () => null,
         syncSnapshots: async () => ({ fetched: 0, persisted: 0, skipped: 0, errors: ['Xero Trial Balance unavailable'] }),
       },
