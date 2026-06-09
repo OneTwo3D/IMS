@@ -7,7 +7,7 @@ import { logActivity } from '@/lib/activity-log'
 import { verifyCron } from '@/lib/cron-auth'
 import { getBackupDir } from '@/lib/backup-storage'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
-import { uploadBackupToTarget } from '@/lib/backup-remote'
+import { BackupArtifactUploadError, uploadBackupArtifactsToTarget } from '@/lib/backup-remote'
 import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
 import { backupManifestPath, writeBackupManifestForFile } from '@/lib/backup-manifest'
 
@@ -86,21 +86,25 @@ export async function GET(request: Request) {
       let uploaded = false
       if (autoUploadTarget === 's3' || autoUploadTarget === 'sftp') {
         try {
-          await uploadBackupToTarget(filePath, filename, autoUploadTarget)
-          await uploadBackupToTarget(
+          await uploadBackupArtifactsToTarget(
+            filePath,
+            filename,
             backupManifestPath(filePath),
             `${filename}.manifest.json`,
             autoUploadTarget,
-            'application/json',
           )
           uploaded = true
         } catch (error) {
+          const metadata = error instanceof BackupArtifactUploadError
+            ? error.details
+            : { target: autoUploadTarget, backupFilename: filename, manifestFilename: `${filename}.manifest.json` }
           await logActivity({
             entityType: 'SYSTEM',
             tag: 'system',
             action: 'scheduled_backup',
             level: 'WARNING',
             description: `Scheduled backup created but remote upload to ${autoUploadTarget} failed: ${String(error)}`,
+            metadata,
           })
         }
       }

@@ -23,13 +23,17 @@ The backup list shows all backups stored on the server, with:
 You can restore from:
 
 - **An existing backup** in the list — click the restore action next to it
-- **An uploaded file** — upload a previously downloaded backup file
+- **An uploaded file** — upload a previously downloaded `.sql` backup file and its matching `.manifest.json` sidecar
 
 Restoring overwrites all current data. To confirm, you must type **RESTORE** into the confirmation field. This safeguard prevents accidental restores.
 
-The restore API also enforces this confirmation server-side, requires a short-lived one-time confirmation code emailed to the authenticated admin address, requires a fresh admin login, and only accepts plain `.sql` files from the configured backup directory or an uploaded `.sql` file for that request. The confirmation code expires after five minutes; by default the fresh-login window is 15 minutes (`FRESH_AUTH_MAX_AGE_SECONDS`), so admins may need to sign in again and request a new code if either window expires.
+The restore API also enforces this confirmation server-side, requires a short-lived one-time confirmation code emailed to the authenticated admin address, requires a fresh admin login, and only accepts plain `.sql` files from the configured backup directory or an uploaded `.sql` file for that request. The confirmation code expires after two minutes and is bound to the issuing session and verifiable client IP; by default the fresh-login window is 15 minutes (`FRESH_AUTH_MAX_AGE_SECONDS`), so admins may need to sign in again and request a new code if either window expires.
 
 When `NODE_ENV=production`, restore is disabled unless `ALLOW_DATABASE_RESTORE=true` is set for a supervised restore window. Restoring from a server-side backup only requires that base flag; restoring from an uploaded SQL file also requires `ALLOW_DATABASE_RESTORE_UPLOAD=true`. Leave both flags unset or `false` during normal operation. Non-production environments bypass these kill switches, so staging restore drills should run with `NODE_ENV=production` if they need to exercise production restore gating.
+
+Restore uploads default to a 50 MiB SQL-file cap. Override with `DATABASE_RESTORE_MAX_FILE_BYTES` when a supervised restore drill needs a larger dump. The restore preflight also checks available disk space against a conservative estimate: approximately 10x the SQL file size or 1.25x the database size recorded in the manifest, whichever is larger.
+
+Every generated backup has a `.manifest.json` sidecar containing the manifest schema version, backup filename, database size, critical IMS table names, and advisory post-dump row counts. Stored and uploaded restores reject manifests missing FIFO, COGS, stock movement, accounting sync, payment, shipment, or audit-log critical tables. Row counts are an operator diagnostic and are not a snapshot-consistent equality check against the dump.
 
 Denied restore attempts are written to the activity log as `WARNING` entries with action `backup_restore_denied` and a machine-readable `metadata.reason`, such as `production_restore_disabled`, `production_upload_restore_disabled`, or `cross_origin_restore_request`.
 
@@ -82,6 +86,8 @@ Each backup in the list offers the following actions:
 - **Upload via SFTP** — push the backup to your configured SFTP server
 - **Restore** — restore the system from this backup
 - **Delete** — remove the backup from the server
+
+Remote upload and delete actions apply to both the SQL backup and the `.manifest.json` sidecar. If a remote manifest upload fails after the SQL file uploaded, IMS attempts to delete the orphan SQL artifact and logs the cleanup result.
 
 ## Scheduled Backups
 

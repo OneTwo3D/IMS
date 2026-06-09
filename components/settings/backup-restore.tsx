@@ -37,7 +37,10 @@ export function BackupRestore() {
   const [restoreToken, setRestoreToken] = useState('')
   const [restoreTokenStatus, setRestoreTokenStatus] = useState<string | null>(null)
   const [sendingRestoreToken, setSendingRestoreToken] = useState(false)
+  const [uploadRestoreFile, setUploadRestoreFile] = useState<File | null>(null)
+  const [uploadManifestFile, setUploadManifestFile] = useState<File | null>(null)
   const fileRef = useRef<HTMLInputElement>(null)
+  const manifestFileRef = useRef<HTMLInputElement>(null)
 
   const refreshList = () => listBackups().then(setBackups)
 
@@ -116,15 +119,15 @@ export function BackupRestore() {
     }
   }
 
-  async function handleUploadRestore(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0]
-    if (!file) return
+  async function handleUploadRestore() {
+    if (!uploadRestoreFile || !uploadManifestFile) return
     if (restoreConfirm !== 'RESTORE' || restoreToken.trim().length < 6) return
     setRestoring(true)
     setMsg(null)
     try {
       const formData = new FormData()
-      formData.append('file', file)
+      formData.append('file', uploadRestoreFile)
+      formData.append('manifestFile', uploadManifestFile)
       formData.append('confirmationPhrase', restoreConfirm)
       formData.append('restoreToken', restoreToken.trim().toUpperCase())
       const res = await fetch('/api/backup/restore', { method: 'POST', body: formData })
@@ -135,6 +138,8 @@ export function BackupRestore() {
         setRestoreConfirm('')
         setRestoreToken('')
         setRestoreTokenStatus(null)
+        setUploadRestoreFile(null)
+        setUploadManifestFile(null)
         router.refresh()
       } else {
         setMsg({ text: data.error ?? 'Restore failed.', isError: true })
@@ -144,6 +149,7 @@ export function BackupRestore() {
     } finally {
       setRestoring(false)
       if (fileRef.current) fileRef.current.value = ''
+      if (manifestFileRef.current) manifestFileRef.current.value = ''
     }
   }
 
@@ -190,6 +196,8 @@ export function BackupRestore() {
             setShowUploadRestore(true)
             setRestoreConfirm('')
             setRestoreToken('')
+            setUploadRestoreFile(null)
+            setUploadManifestFile(null)
             void sendRestoreTokenEmail()
           }}
         >
@@ -377,7 +385,20 @@ export function BackupRestore() {
                     ref={fileRef}
                     type="file"
                     accept=".sql"
-                    onChange={handleUploadRestore}
+                    onChange={(e) => setUploadRestoreFile(e.target.files?.[0] ?? null)}
+                    disabled={restoring}
+                    className="h-9"
+                  />
+                </div>
+              )}
+              {restoreConfirm === 'RESTORE' && restoreToken.trim().length >= 6 && (
+                <div className="space-y-1.5">
+                  <Label>Select backup manifest</Label>
+                  <Input
+                    ref={manifestFileRef}
+                    type="file"
+                    accept=".manifest.json,application/json"
+                    onChange={(e) => setUploadManifestFile(e.target.files?.[0] ?? null)}
                     disabled={restoring}
                     className="h-9"
                   />
@@ -385,8 +406,11 @@ export function BackupRestore() {
               )}
             </div>
             <DialogFooter>
-              <Button variant="outline" onClick={() => { setShowUploadRestore(false); setRestoreToken(''); setRestoreTokenStatus(null) }} disabled={restoring}>Cancel</Button>
-              {restoring && <Loader2 className="h-4 w-4 animate-spin" />}
+              <Button variant="outline" onClick={() => { setShowUploadRestore(false); setRestoreToken(''); setRestoreTokenStatus(null); setUploadRestoreFile(null); setUploadManifestFile(null) }} disabled={restoring}>Cancel</Button>
+              <Button variant="destructive" onClick={handleUploadRestore} disabled={restoring || restoreConfirm !== 'RESTORE' || restoreToken.trim().length < 6 || !uploadRestoreFile || !uploadManifestFile}>
+                {restoring && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
+                Confirm Restore
+              </Button>
             </DialogFooter>
           </DialogContent>
         </Dialog>

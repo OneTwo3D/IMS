@@ -17,12 +17,19 @@ import { consumeAuthToken, deleteAuthToken, setAuthToken } from '@/lib/auth/toke
 import { db } from '@/lib/db'
 import { parsePositiveIntegerEnv } from '@/lib/env'
 import { getClientIp } from '@/lib/request-ip'
-import { validateBackupManifestForFile, type BackupManifest } from '@/lib/backup-manifest'
+import {
+  parseBackupManifestContent,
+  validateBackupManifestForFile,
+  type BackupManifest,
+} from '@/lib/backup-manifest'
 
 const BACKUP_DIR = getBackupDir()
 const RESTORE_TOKEN_TTL_MS = 2 * 60_000
 const DEFAULT_MAX_RESTORE_FILE_BYTES = 50 * 1024 * 1024
 const RESTORE_FORM_OVERHEAD_BYTES = 64 * 1024
+const MAX_RESTORE_MANIFEST_BYTES = 1024 * 1024
+const RESTORE_SQL_DISK_SPACE_MULTIPLIER = 10
+const RESTORE_DATABASE_DISK_SPACE_MULTIPLIER = 1.25
 
 export const runtime = 'nodejs'
 
@@ -102,17 +109,19 @@ async function getAvailableDiskBytes(directory: string): Promise<number> {
   return Number(stats.bavail) * Number(stats.bsize)
 }
 
-function restoreTokenClientIp(request?: Pick<NextRequest, 'headers'> | null): string {
-  if (!request) return 'unknown'
-  return getClientIp(request.headers) ?? 'unknown'
+function restoreTokenClientIp(request?: Pick<NextRequest, 'headers'> | null): string | null {
+  if (!request) return null
+  return getClientIp(request.headers)
 }
 
-function restoreTokenPayload(session: RestoreSession, request?: Pick<NextRequest, 'headers'> | null): RestoreTokenPayload {
+function restoreTokenPayload(session: RestoreSession, request?: Pick<NextRequest, 'headers'> | null): RestoreTokenPayload | null {
+  const clientIp = restoreTokenClientIp(request)
+  if (!clientIp) return null
   return {
     userId: session.user.id,
     sessionVersion: session.user.sessionVersion ?? null,
     sessionAuthTime: session.user.sessionAuthTime ?? null,
-    clientIp: restoreTokenClientIp(request),
+    clientIp,
   }
 }
 
@@ -137,6 +146,54 @@ function parseRestoreTokenPayload(value: string | null): RestoreTokenPayload | n
   } catch {
     return null
   }
+}
+
+function missingRestoreClientIpResponse(): NextResponse {
+  return NextResponse.json({ error: 'Cannot issue restore token without verifiable client IP.' }, { status: 400 })
+}
+
+function estimateRestoreDiskBytes(sqlFileBytes: number, manifest: BackupManifest): number {
+  return Math.max(
+    Math.ceil(sqlFileBytes * RESTORE_SQL_DISK_SPACE_MULTIPLIER),
+    Math.ceil(manifest.databaseSizeBytes * RESTORE_DATABASE_DISK_SPACE_MULTIPLIER) + sqlFileBytes,
+  )
+}
+
+async function validateRestoreDiskSpace(
+  deps: RequiredRestoreDeps,
+  sqlFileBytes: number,
+  manifest: BackupManifest,
+): Promise<NextResponse | null> {
+  const requiredBytes = estimateRestoreDiskBytes(sqlFileBytes, manifest)
+  const availableBytes = await deps.getAvailableDiskBytes(deps.backupDir)
+  if (availableBytes >= requiredBytes) return null
+  return NextResponse.json({
+    error: `Not enough disk space for restore. Requires approximately ${RESTORE_SQL_DISK_SPACE_MULTIPLIER}x the SQL file size or ${RESTORE_DATABASE_DISK_SPACE_MULTIPLIER}x the manifest database size.`,
+  }, { status: 507 })
+}
+
+async function parseUploadedBackupManifest(file: File | null, backupFilename: string): Promise<BackupManifest | NextResponse> {
+  if (!file) {
+    return NextResponse.json({ error: 'Backup manifest file is required for uploaded restores.' }, { status: 400 })
+  }
+  if (!file.name.endsWith('.manifest.json')) {
+    return NextResponse.json({ error: 'Invalid manifest file type. Upload the .manifest.json sidecar for the SQL backup.' }, { status: 400 })
+  }
+  if (file.size > MAX_RESTORE_MANIFEST_BYTES) {
+    return NextResponse.json({ error: 'Backup manifest file is too large.' }, { status: 413 })
+  }
+
+  let manifest: BackupManifest
+  try {
+    manifest = parseBackupManifestContent(await file.text())
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return NextResponse.json({ error: `Backup manifest validation failed: ${message.slice(0, 200)}` }, { status: 400 })
+  }
+  if (manifest.backupFilename !== path.basename(backupFilename)) {
+    return NextResponse.json({ error: 'Backup manifest does not match the uploaded backup.' }, { status: 400 })
+  }
+  return manifest
 }
 
 function restoreTokenPayloadMatches(actual: RestoreTokenPayload | null, expected: RestoreTokenPayload): boolean {
@@ -474,9 +531,11 @@ export function createBackupRestoreGetHandler(deps: BackupRestoreHandlerDeps = {
 
     const restoreToken = randomBytes(4).toString('hex').toUpperCase()
     const restoreTokenKey = `backup_restore:${restoreToken}`
+    const payload = restoreTokenPayload(session, req)
+    if (!payload) return missingRestoreClientIpResponse()
     await resolvedDeps.setRestoreToken(
       restoreTokenKey,
-      serializeRestoreTokenPayload(restoreTokenPayload(session, req)),
+      serializeRestoreTokenPayload(payload),
       RESTORE_TOKEN_TTL_MS,
     )
     const mail = await resolvedDeps.mailer({
@@ -537,7 +596,12 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
     }
 
     const file = formData.get('file') as File | null
+    const manifestFile = formData.get('manifestFile') as File | null
     const filename = formData.get('filename') as string | null
+    const expectedRestoreTokenPayload = restoreTokenPayload(session, req)
+    if (!expectedRestoreTokenPayload) {
+      return NextResponse.json({ error: 'Cannot verify restore token without verifiable client IP.' }, { status: 400 })
+    }
 
     let restorePath: string
     let uploadedTempFile = false
@@ -558,16 +622,16 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       if (file.size > maxRestoreFileBytes) {
         return NextResponse.json({ error: 'Restore file is too large.' }, { status: 413 })
       }
+      const manifest = await parseUploadedBackupManifest(manifestFile, file.name)
+      if (manifest instanceof NextResponse) return manifest
       await mkdir(resolvedDeps.backupDir, { recursive: true })
-      const availableBytes = await resolvedDeps.getAvailableDiskBytes(resolvedDeps.backupDir)
-      if (availableBytes < file.size * 2) {
-        return NextResponse.json({ error: 'Not enough disk space for restore upload.' }, { status: 507 })
-      }
+      const diskSpaceResponse = await validateRestoreDiskSpace(resolvedDeps, file.size, manifest)
+      if (diskSpaceResponse) return diskSpaceResponse
       const targetTimestamp = await getRestoreTargetDatabaseTimestamp(resolvedDeps)
       if (targetTimestamp instanceof NextResponse) return targetTimestamp
       targetDatabaseTimestamp = targetTimestamp
       // Validate upload policy and shape before consuming the one-time email code.
-      const tokenMatches = await consumeMatchingRestoreToken(resolvedDeps, restoreToken, restoreTokenPayload(session, req))
+      const tokenMatches = await consumeMatchingRestoreToken(resolvedDeps, restoreToken, expectedRestoreTokenPayload)
       if (!tokenMatches) {
         return NextResponse.json({ error: 'Restore email code invalid or expired.' }, { status: 400 })
       }
@@ -610,6 +674,8 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       if (manifest.backupFilename !== path.basename(restorePath)) {
         return NextResponse.json({ error: 'Backup manifest does not match the selected backup.' }, { status: 400 })
       }
+      const diskSpaceResponse = await validateRestoreDiskSpace(resolvedDeps, fileInfo.size, manifest)
+      if (diskSpaceResponse) return diskSpaceResponse
       sourceBackupTimestamp = fileInfo.mtime.toISOString()
       sourceBackupName = path.basename(restorePath)
       sourceType = 'stored_backup'
@@ -617,7 +683,7 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       const targetTimestamp = await getRestoreTargetDatabaseTimestamp(resolvedDeps)
       if (targetTimestamp instanceof NextResponse) return targetTimestamp
       targetDatabaseTimestamp = targetTimestamp
-      const tokenMatches = await consumeMatchingRestoreToken(resolvedDeps, restoreToken, restoreTokenPayload(session, req))
+      const tokenMatches = await consumeMatchingRestoreToken(resolvedDeps, restoreToken, expectedRestoreTokenPayload)
       if (!tokenMatches) {
         return NextResponse.json({ error: 'Restore email code invalid or expired.' }, { status: 400 })
       }

@@ -36,9 +36,41 @@ function restoreTokenPayload(overrides: Partial<{
     userId: 'admin-1',
     sessionVersion: adminSession.user.sessionVersion,
     sessionAuthTime: adminSession.user.sessionAuthTime,
-    clientIp: 'unknown',
+    clientIp: '203.0.113.25',
     ...overrides,
   })
+}
+
+function manifestJson(backupFilename = 'backup.sql'): string {
+  return JSON.stringify({
+    schemaVersion: 1,
+    createdAt: '2026-06-03T10:11:12.000Z',
+    backupFilename,
+    databaseSizeBytes: 16,
+    rowCountConsistency: 'post-dump-advisory',
+    tables: [
+      { name: 'users', rowCount: 1 },
+      { name: 'products', rowCount: 2 },
+      { name: 'sales_orders', rowCount: 3 },
+      { name: 'purchase_orders', rowCount: 4 },
+      { name: 'purchase_invoices', rowCount: 0 },
+      { name: 'payments', rowCount: 0 },
+      { name: 'stock_levels', rowCount: 0 },
+      { name: 'stock_movements', rowCount: 0 },
+      { name: 'cost_layers', rowCount: 0 },
+      { name: 'cogs_entries', rowCount: 0 },
+      { name: 'order_allocations', rowCount: 0 },
+      { name: 'shipments', rowCount: 0 },
+      { name: 'shipment_lines', rowCount: 0 },
+      { name: 'accounting_sync_logs', rowCount: 0 },
+      { name: 'accounting_events', rowCount: 0 },
+      { name: 'activity_logs', rowCount: 0 },
+    ],
+  })
+}
+
+function appendUploadManifest(form: FormData, backupFilename = 'upload.sql'): void {
+  form.set('manifestFile', new File([manifestJson(backupFilename)], `${backupFilename}.manifest.json`, { type: 'application/json' }))
 }
 
 function productionEnv(): Record<string, string> {
@@ -112,11 +144,25 @@ function baseDeps(overrides: BackupRestoreHandlerDeps = {}) {
       schemaVersion: 1,
       createdAt: '2026-06-03T10:11:12.000Z',
       backupFilename: 'backup.sql',
+      databaseSizeBytes: 16,
+      rowCountConsistency: 'post-dump-advisory',
       tables: [
         { name: 'users', rowCount: 1 },
         { name: 'products', rowCount: 2 },
         { name: 'sales_orders', rowCount: 3 },
         { name: 'purchase_orders', rowCount: 4 },
+        { name: 'purchase_invoices', rowCount: 0 },
+        { name: 'payments', rowCount: 0 },
+        { name: 'stock_levels', rowCount: 0 },
+        { name: 'stock_movements', rowCount: 0 },
+        { name: 'cost_layers', rowCount: 0 },
+        { name: 'cogs_entries', rowCount: 0 },
+        { name: 'order_allocations', rowCount: 0 },
+        { name: 'shipments', rowCount: 0 },
+        { name: 'shipment_lines', rowCount: 0 },
+        { name: 'accounting_sync_logs', rowCount: 0 },
+        { name: 'accounting_events', rowCount: 0 },
+        { name: 'activity_logs', rowCount: 0 },
       ],
     }),
     getAvailableDiskBytes: async () => 1024 * 1024 * 1024,
@@ -136,6 +182,7 @@ function sameOriginRequest(body: BodyInit): NextRequest {
     method: 'POST',
     headers: {
       origin: 'https://ims.example.test',
+      'x-real-ip': '203.0.113.25',
     },
     body,
   })
@@ -147,6 +194,7 @@ function refererRequest(body: BodyInit, referer: string): NextRequest {
     method: 'POST',
     headers: {
       referer,
+      'x-real-ip': '203.0.113.25',
     },
     body,
   })
@@ -172,6 +220,13 @@ function metadataReason(entry: RestoreLogEntry): unknown {
 
 function sha256Text(value: string): string {
   return createHash('sha256').update(value).digest('hex')
+}
+
+function restoreGetRequest(headers: Record<string, string> = { 'x-real-ip': '203.0.113.25' }): NextRequest {
+  return new NextRequest('https://ims.example.test/api/backup/restore', {
+    method: 'GET',
+    headers,
+  })
 }
 
 test('restore error redactor removes database URL and password fragments', () => {
@@ -223,7 +278,7 @@ test('production restore code issuance is disabled by default and logs a warning
   const { deps, calls, activityLogs } = baseDeps()
   const handler = createBackupRestoreGetHandler(deps)
 
-  const response = await handler()
+  const response = await handler(restoreGetRequest())
   const body = await responseJson(response)
 
   assert.equal(response.status, 403)
@@ -256,13 +311,31 @@ test('production restore code issuance removes the one-time token when email del
   })
   const handler = createBackupRestoreGetHandler(deps)
 
-  const response = await handler()
+  const response = await handler(restoreGetRequest())
   const body = await responseJson(response)
 
   assert.equal(response.status, 500)
   assert.equal(body.error, 'smtp down')
   assert.equal(calls.setToken, 1)
   assert.equal(calls.deleteToken, 1)
+})
+
+test('restore code issuance rejects requests without a verifiable client IP', async () => {
+  const { deps, calls } = baseDeps({
+    env: {
+      ...productionEnv(),
+      ALLOW_DATABASE_RESTORE: 'true',
+    },
+  })
+  const handler = createBackupRestoreGetHandler(deps)
+
+  const response = await handler(restoreGetRequest({}))
+  const body = await responseJson(response)
+
+  assert.equal(response.status, 400)
+  assert.equal(body.error, 'Cannot issue restore token without verifiable client IP.')
+  assert.equal(calls.setToken, 0)
+  assert.equal(calls.mailer, 0)
 })
 
 test('restore code issuance stores a two-minute session and IP bound token payload', async () => {
@@ -362,6 +435,7 @@ test('production restore POST accepts configured app origin even behind an inter
       method: 'POST',
       headers: {
         origin: 'https://app.ims.example.test',
+        'x-real-ip': '203.0.113.25',
       },
       body: existingBackupBody('backup.sql'),
     }))
@@ -395,6 +469,7 @@ test('production restore POST normalizes origin header casing before comparison'
       method: 'POST',
       headers: {
         origin: 'HTTPS://IMS.EXAMPLE.TEST',
+        'x-real-ip': '203.0.113.25',
       },
       body: existingBackupBody('backup.sql'),
     }))
@@ -444,6 +519,7 @@ test('production restore POST trusts NEXT_PUBLIC_APP_URL before AUTH_URL when or
       method: 'POST',
       headers: {
         origin: 'https://app.ims.example.test',
+        'x-real-ip': '203.0.113.25',
       },
       body: existingBackupBody('backup.sql'),
     }))
@@ -478,6 +554,7 @@ test('production restore POST falls back to AUTH_URL only when app URL is absent
       method: 'POST',
       headers: {
         origin: 'https://auth-only.ims.example.test',
+        'x-real-ip': '203.0.113.25',
       },
       body: existingBackupBody('backup.sql'),
     }))
@@ -808,7 +885,7 @@ test('non-production restore code and filename restore work without production k
     })
 
     const getHandler = createBackupRestoreGetHandler(deps)
-    const getResponse = await getHandler()
+    const getResponse = await getHandler(restoreGetRequest())
     const getBody = await responseJson(getResponse)
 
     assert.equal(getResponse.status, 200)
@@ -941,6 +1018,7 @@ test('uploaded production restore denied by the upload kill switch keeps the ema
       method: 'POST',
       headers: {
         origin: 'https://ims.example.test',
+        'x-real-ip': '203.0.113.25',
         'content-length': '100',
       },
       body: form,
@@ -988,6 +1066,7 @@ test('uploaded restore rejects requests above the configured form limit before c
     method: 'POST',
     headers: {
       origin: 'https://ims.example.test',
+      'x-real-ip': '203.0.113.25',
       'content-length': String(8 + 64 * 1024 + 1),
     },
     body: form,
@@ -1020,6 +1099,7 @@ test('uploaded restore rejects files above the configured file limit before cons
     method: 'POST',
     headers: {
       origin: 'https://ims.example.test',
+      'x-real-ip': '203.0.113.25',
       'content-length': '100',
     },
     body: form,
@@ -1032,6 +1112,38 @@ test('uploaded restore rejects files above the configured file limit before cons
   assert.equal(calls.runRestore, 0)
 })
 
+test('uploaded restore requires the backup manifest sidecar before consuming the email code', async () => {
+  const form = new FormData()
+  form.set('confirmationPhrase', 'RESTORE')
+  form.set('restoreToken', 'ABCDEF12')
+  form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
+
+  const { deps, calls } = baseDeps({
+    env: {
+      ...productionEnv(),
+      ALLOW_DATABASE_RESTORE: 'true',
+      ALLOW_DATABASE_RESTORE_UPLOAD: 'true',
+    },
+  })
+  const handler = createBackupRestorePostHandler(deps)
+
+  const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', {
+    method: 'POST',
+    headers: {
+      origin: 'https://ims.example.test',
+      'x-real-ip': '203.0.113.25',
+      'content-length': '100',
+    },
+    body: form,
+  }))
+  const body = await responseJson(response)
+
+  assert.equal(response.status, 400)
+  assert.equal(body.error, 'Backup manifest file is required for uploaded restores.')
+  assert.equal(calls.consumeToken, 0)
+  assert.equal(calls.runRestore, 0)
+})
+
 test('uploaded restore rejects low disk space before consuming the email code', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-low-disk-test-'))
   try {
@@ -1039,6 +1151,7 @@ test('uploaded restore rejects low disk space before consuming the email code', 
     form.set('confirmationPhrase', 'RESTORE')
     form.set('restoreToken', 'ABCDEF12')
     form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
+    appendUploadManifest(form)
 
     const { deps, calls } = baseDeps({
       backupDir: root,
@@ -1055,6 +1168,7 @@ test('uploaded restore rejects low disk space before consuming the email code', 
       method: 'POST',
       headers: {
         origin: 'https://ims.example.test',
+        'x-real-ip': '203.0.113.25',
         'content-length': '100',
       },
       body: form,
@@ -1062,7 +1176,7 @@ test('uploaded restore rejects low disk space before consuming the email code', 
     const body = await responseJson(response)
 
     assert.equal(response.status, 507)
-    assert.equal(body.error, 'Not enough disk space for restore upload.')
+    assert.equal(body.error, 'Not enough disk space for restore. Requires approximately 10x the SQL file size or 1.25x the manifest database size.')
     assert.equal(calls.consumeToken, 0)
     assert.equal(calls.enableMaintenance, 0)
     assert.equal(calls.runRestore, 0)
@@ -1082,6 +1196,7 @@ test('enabled production upload restore writes a temporary file, runs restore, a
       type: 'application/sql',
       lastModified: new Date('2020-01-01T00:00:00.000Z').getTime(),
     }))
+    appendUploadManifest(form)
 
     let tempPath = ''
     const { deps, calls, activityLogs } = baseDeps({
@@ -1103,6 +1218,7 @@ test('enabled production upload restore writes a temporary file, runs restore, a
       method: 'POST',
       headers: {
         origin: 'https://ims.example.test',
+        'x-real-ip': '203.0.113.25',
         'content-length': '100',
       },
       body: form,
@@ -1140,6 +1256,7 @@ test('failed production upload restore redacts database password, disables maint
     form.set('confirmationPhrase', 'RESTORE')
     form.set('restoreToken', 'ABCDEF12')
     form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
+    appendUploadManifest(form)
 
     let tempPath = ''
     const { deps, calls, activityLogs } = baseDeps({
@@ -1162,6 +1279,7 @@ test('failed production upload restore redacts database password, disables maint
       method: 'POST',
       headers: {
         origin: 'https://ims.example.test',
+        'x-real-ip': '203.0.113.25',
         'content-length': '100',
       },
       body: form,
@@ -1206,6 +1324,7 @@ test('maintenance-start failure still runs disable-maintenance cleanup and remov
     form.set('confirmationPhrase', 'RESTORE')
     form.set('restoreToken', 'ABCDEF12')
     form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
+    appendUploadManifest(form)
 
     let tempPath = ''
     const { deps, calls } = baseDeps({
@@ -1230,6 +1349,7 @@ test('maintenance-start failure still runs disable-maintenance cleanup and remov
       method: 'POST',
       headers: {
         origin: 'https://ims.example.test',
+        'x-real-ip': '203.0.113.25',
         'content-length': '100',
       },
       body: form,

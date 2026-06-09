@@ -7,6 +7,18 @@ export const CRITICAL_BACKUP_TABLES = [
   'products',
   'sales_orders',
   'purchase_orders',
+  'purchase_invoices',
+  'payments',
+  'stock_levels',
+  'stock_movements',
+  'cost_layers',
+  'cogs_entries',
+  'order_allocations',
+  'shipments',
+  'shipment_lines',
+  'accounting_sync_logs',
+  'accounting_events',
+  'activity_logs',
 ] as const
 
 export type CriticalBackupTable = typeof CRITICAL_BACKUP_TABLES[number]
@@ -16,10 +28,20 @@ export type BackupManifestTable = {
   rowCount: number
 }
 
+/**
+ * Sidecar metadata for an IMS SQL backup.
+ *
+ * `tables[].rowCount` is an advisory post-dump count used for operator
+ * diagnostics, not a snapshot-consistent parity assertion against the dump.
+ * The restore gate uses schema version, critical-table presence, backup
+ * filename matching, and databaseSizeBytes for disk preflight.
+ */
 export type BackupManifest = {
   schemaVersion: typeof BACKUP_MANIFEST_SCHEMA_VERSION
   createdAt: string
   backupFilename: string
+  databaseSizeBytes: number
+  rowCountConsistency: 'post-dump-advisory'
   tables: BackupManifestTable[]
 }
 
@@ -58,6 +80,10 @@ function validateManifestShape(value: unknown): BackupManifest {
   if (typeof manifest.backupFilename !== 'string' || manifest.backupFilename.trim() === '') {
     throw new Error('Backup manifest backupFilename is invalid.')
   }
+  const databaseSizeBytes = parseRowCount(manifest.databaseSizeBytes, 'database')
+  if (manifest.rowCountConsistency !== 'post-dump-advisory') {
+    throw new Error('Backup manifest row-count consistency is invalid.')
+  }
   if (!Array.isArray(manifest.tables)) {
     throw new Error('Backup manifest tables list is invalid.')
   }
@@ -81,6 +107,8 @@ function validateManifestShape(value: unknown): BackupManifest {
     schemaVersion: BACKUP_MANIFEST_SCHEMA_VERSION,
     createdAt: manifest.createdAt,
     backupFilename: manifest.backupFilename,
+    databaseSizeBytes,
+    rowCountConsistency: 'post-dump-advisory',
     tables,
   }
 }
@@ -99,6 +127,10 @@ export async function collectBackupManifest(
   backupFilename: string,
   now: Date = new Date(),
 ): Promise<BackupManifest> {
+  const databaseSizeRows = await dbClient.$queryRawUnsafe<Array<{ databaseSizeBytes: bigint | number | string }>>(
+    `SELECT pg_database_size(current_database())::bigint AS "databaseSizeBytes"`,
+  )
+  const databaseSizeBytes = parseRowCount(databaseSizeRows[0]?.databaseSizeBytes ?? 0, 'database')
   const tableRows = await dbClient.$queryRawUnsafe<Array<{ name: string }>>(
     `SELECT tablename AS "name" FROM pg_tables WHERE schemaname = 'public' ORDER BY tablename`,
   )
@@ -119,8 +151,16 @@ export async function collectBackupManifest(
     schemaVersion: BACKUP_MANIFEST_SCHEMA_VERSION,
     createdAt: now.toISOString(),
     backupFilename,
+    databaseSizeBytes,
+    rowCountConsistency: 'post-dump-advisory',
     tables,
   }
+}
+
+export function parseBackupManifestContent(content: string): BackupManifest {
+  const parsed = validateManifestShape(JSON.parse(content))
+  validateCriticalBackupTables(parsed)
+  return parsed
 }
 
 export async function writeBackupManifestForFile(
@@ -137,7 +177,5 @@ export async function writeBackupManifestForFile(
 
 export async function validateBackupManifestForFile(backupFilePath: string): Promise<BackupManifest> {
   const raw = await readFile(backupManifestPath(backupFilePath), 'utf8')
-  const parsed = validateManifestShape(JSON.parse(raw))
-  validateCriticalBackupTables(parsed)
-  return parsed
+  return parseBackupManifestContent(raw)
 }

@@ -7,6 +7,7 @@ import test from 'node:test'
 import {
   backupManifestPath,
   collectBackupManifest,
+  CRITICAL_BACKUP_TABLES,
   validateBackupManifestForFile,
   writeBackupManifestForFile,
   type BackupManifestDbClient,
@@ -15,6 +16,9 @@ import {
 function manifestDbClient(tables: Array<{ name: string; rowCount: bigint | number | string }>): BackupManifestDbClient {
   return {
     async $queryRawUnsafe<T = unknown>(query: string): Promise<T> {
+      if (query.includes('pg_database_size')) {
+        return [{ databaseSizeBytes: BigInt(4096) }] as T
+      }
       if (query.includes('FROM pg_tables')) {
         return tables.map((table) => ({ name: table.name })) as T
       }
@@ -27,13 +31,12 @@ function manifestDbClient(tables: Array<{ name: string; rowCount: bigint | numbe
 }
 
 test('collectBackupManifest records public table row counts', async () => {
+  const rows = CRITICAL_BACKUP_TABLES.map((name, index) => ({
+    name,
+    rowCount: BigInt(index + 1),
+  }))
   const manifest = await collectBackupManifest(
-    manifestDbClient([
-      { name: 'products', rowCount: BigInt(2) },
-      { name: 'purchase_orders', rowCount: BigInt(3) },
-      { name: 'sales_orders', rowCount: BigInt(4) },
-      { name: 'users', rowCount: BigInt(1) },
-    ]),
+    manifestDbClient(rows),
     'backup.sql',
     new Date('2026-06-09T12:00:00.000Z'),
   )
@@ -42,12 +45,9 @@ test('collectBackupManifest records public table row counts', async () => {
     schemaVersion: 1,
     createdAt: '2026-06-09T12:00:00.000Z',
     backupFilename: 'backup.sql',
-    tables: [
-      { name: 'products', rowCount: 2 },
-      { name: 'purchase_orders', rowCount: 3 },
-      { name: 'sales_orders', rowCount: 4 },
-      { name: 'users', rowCount: 1 },
-    ],
+    databaseSizeBytes: 4096,
+    rowCountConsistency: 'post-dump-advisory',
+    tables: rows.map((row, index) => ({ name: row.name, rowCount: index + 1 })),
   })
 })
 
@@ -81,6 +81,8 @@ test('validateBackupManifestForFile rejects stored manifests missing users', asy
       schemaVersion: 1,
       createdAt: '2026-06-09T12:00:00.000Z',
       backupFilename: 'backup.sql',
+      databaseSizeBytes: 4096,
+      rowCountConsistency: 'post-dump-advisory',
       tables: [
         { name: 'products', rowCount: 2 },
         { name: 'purchase_orders', rowCount: 3 },
@@ -91,6 +93,31 @@ test('validateBackupManifestForFile rejects stored manifests missing users', asy
     await assert.rejects(
       validateBackupManifestForFile(backupPath),
       /Backup manifest missing critical table: users/,
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('validateBackupManifestForFile rejects manifests missing FIFO and accounting critical tables', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-backup-manifest-critical-'))
+  try {
+    const backupPath = path.join(root, 'backup.sql')
+    await writeFile(backupPath, 'select 1;\n')
+    await writeFile(backupManifestPath(backupPath), JSON.stringify({
+      schemaVersion: 1,
+      createdAt: '2026-06-09T12:00:00.000Z',
+      backupFilename: 'backup.sql',
+      databaseSizeBytes: 4096,
+      rowCountConsistency: 'post-dump-advisory',
+      tables: CRITICAL_BACKUP_TABLES
+        .filter((name) => name !== 'cost_layers')
+        .map((name) => ({ name, rowCount: 0 })),
+    }))
+
+    await assert.rejects(
+      validateBackupManifestForFile(backupPath),
+      /Backup manifest missing critical table: cost_layers/,
     )
   } finally {
     await rm(root, { recursive: true, force: true })

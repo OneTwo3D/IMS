@@ -397,8 +397,8 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ### P6.7 — Restore upload size + disk space
 - **Status:** Complete.
 - **File:** `app/api/backup/restore/route.ts:21`
-- **Fix:** Cap upload at 50 MiB (configurable). Before accepting upload, call `statvfs` (or equivalent) to check available disk space ≥ 2× upload size.
-- **Tests:** `tests/api/backup-restore.test.ts` covers configurable form/file upload caps and mocked low-disk rejection before consuming the restore code.
+- **Fix:** Cap upload at 50 MiB (configurable). Before accepting upload, call `statvfs` (or equivalent) to check available disk space against the larger of a conservative 10× SQL-size estimate or 1.25× the database size recorded in the manifest.
+- **Tests:** `tests/api/backup-restore.test.ts` covers configurable form/file upload caps and mocked low-disk rejection using the manifest-backed 10x SQL / 1.25x database-size estimate before consuming the restore code.
 
 ### P6.8 — Activity logging redaction
 - **File:** `app/actions/users.ts:113–115`, `lib/activity-log.ts`
@@ -443,8 +443,8 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ### P7.7 — Backup manifest
 - **Status:** Complete.
 - **File:** `app/api/cron/backup/route.ts`
-- **Fix:** Generate a manifest (list of tables + row counts) alongside the dump. On restore, validate the manifest against the current Prisma schema. Fail restore if critical tables (users, products, sales_orders, purchase_orders) are missing.
-- **Tests:** `tests/backup-manifest.test.ts` covers manifest generation and critical-table validation. `tests/api/backup-restore.test.ts` covers restore rejection for a manifest missing `users`.
+- **Fix:** Generate a manifest (schema version, backup filename, database size, critical tables, and advisory post-dump row counts) alongside the dump. On restore, validate the manifest against the current Prisma schema. Fail stored and uploaded restores if critical tables for auth, products, sales, purchase, FIFO, COGS, stock movements, accounting sync/events, payments, shipments, allocations, or audit logs are missing.
+- **Tests:** `tests/backup-manifest.test.ts` covers manifest generation, advisory row-count metadata, and critical-table validation including FIFO tables. `tests/api/backup-restore.test.ts` covers restore rejection for a manifest missing `users` and uploaded restores without the sidecar.
 
 ### P7.8 — `throw new Error(...)` for source-row caps bubbles to Next.js error boundary
 - **Files:** `lib/domain/inventory/inventory-health-reports.ts`, `manufacturing-analytics.ts`, `finance-period-analytics.ts`, `purchasing-analytics.ts`
