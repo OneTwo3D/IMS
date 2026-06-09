@@ -81,6 +81,7 @@ test('inventory snapshot cron snapshots the previous UTC day', async () => {
         now: () => new Date('2026-05-28T00:05:00.000Z'),
         createRunId: () => 'run-inventory-snapshot-test',
         writeLog: async () => {},
+        checkCronRateLimit: async () => ({ allowed: true, retryAfterSec: 0, remaining: 0 }),
         getMaintenanceResponse: async () => null,
         writeSnapshot: async (options = {}) => {
           const { snapshotDate } = options
@@ -157,6 +158,7 @@ test('inventory snapshot cron logs reservation snapshot counts from the real wri
         writeLog: async (log) => {
           logs.push(log)
         },
+        checkCronRateLimit: async () => ({ allowed: true, retryAfterSec: 0, remaining: 0 }),
         getMaintenanceResponse: async () => null,
         writeSnapshot: async (options = {}) => writeDailyInventorySnapshot({
           ...options,

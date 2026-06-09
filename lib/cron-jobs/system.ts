@@ -59,7 +59,7 @@ registerCronJobs([
     moduleLabel: 'System',
     label: 'Delivery Status Check',
     description: 'Polls carrier APIs for delivery status updates on shipped orders.',
-    defaultSchedule: '*/30 * * * *',
+    defaultSchedule: '*/15 * * * *',
     defaultEnabled: true,
   },
 ])

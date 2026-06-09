@@ -1,5 +1,6 @@
 import { NextResponse } from 'next/server'
 import { verifyCron } from '@/lib/cron-auth'
+import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { purgeExpiredActivityLogs, purgeExpiredCronRuns } from '@/lib/activity-log-cleanup'
 import { purgeExpiredDemandHistory } from '@/lib/connectors/woocommerce/sync/initial-import'
 import { purgeExpiredData } from '@/lib/data-retention'
@@ -9,6 +10,8 @@ import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 export async function GET(request: Request) {
   const err = await verifyCron(request)
   if (err) return err
+  const rateLimitErr = await enforceCronRateLimit('activity-cleanup', { request })
+  if (rateLimitErr) return rateLimitErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
   const { totalDeleted, retention } = await purgeExpiredActivityLogs()

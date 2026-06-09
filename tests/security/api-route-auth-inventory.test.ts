@@ -71,6 +71,23 @@ test('cron-secret routes call verifyCron before doing cron work', async () => {
   }
 })
 
+test('cron-secret routes apply the shared cron rate limiter after cron auth', async () => {
+  const files = await discoverApiRouteFiles()
+  const fileByRoute = new Map(files.map((file) => [apiRoutePathFromFile(file), file]))
+
+  for (const [route, policy] of Object.entries(apiRouteAuthPolicy)) {
+    if (policy.access !== 'cron-secret') continue
+    const file = fileByRoute.get(route)
+    assert.ok(file, `${route} route file was not discovered`)
+    const source = await readFile(file, 'utf8')
+    assert.match(source, /enforceCronRateLimit\s*\(/, `${route} must enforce cron rate limiting at runtime`)
+    assert.ok(
+      source.indexOf('verifyCron') < source.indexOf('enforceCronRateLimit'),
+      `${route} must authenticate cron requests before consuming the rate-limit quota`,
+    )
+  }
+})
+
 test('admin-fresh routes call requireApiFreshAdmin before mutating high-risk state', async () => {
   const files = await discoverApiRouteFiles()
   const fileByRoute = new Map(files.map((file) => [apiRoutePathFromFile(file), file]))

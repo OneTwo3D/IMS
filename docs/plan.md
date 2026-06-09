@@ -364,9 +364,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ## Phase 6 — Security hardening (1 week)
 
 ### P6.1 — Cron endpoints rate-limited
+- **Status:** Complete.
 - **Files:** `app/api/cron/*`
-- **Fix:** Apply `checkRateLimit('cron:job-name', 1, 3600_000)` (1 call per hour) to each cron endpoint as a per-key throttle.
-- **Tests:** Hammer a cron endpoint; assert subsequent calls return 429.
+- **Fix:** Apply shared cron rate limiting after successful cron auth: daily/hourly jobs default to one accepted run per job per hour, high-frequency jobs use source-IP-aware schedule-compatible hourly quotas with jitter headroom, and rate-limited requests return `429` + `Retry-After`. Multi-replica installs must use the Redis rate-limit backend for cluster-wide cron throttles.
+- **Tests:** `tests/security/cron-rate-limit.test.ts` covers the 429 helper response, source-IP keying, and 5-minute quota headroom; `tests/security/api-route-auth-inventory.test.ts` asserts every cron-secret route calls `enforceCronRateLimit` after `verifyCron`.
 
 ### P6.2 — Supplier portal cross-tenant boundary
 - **File:** `app/actions/supplier-portal.ts:77–89`
@@ -436,9 +437,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Mocked integration test; assert settings can't be enabled with a failed test.
 
 ### P7.6 — Xero daily batch sync batch-size cap
+- **Status:** Complete.
 - **File:** `app/api/cron/accounting-daily-batch/route.ts:24`
-- **Fix:** Add batch size limit (e.g., 1000 entries per run); track cursor for next run. Log batch size + duration per run.
-- **Tests:** Batch of 1001; assert two runs are needed.
+- **Fix:** Xero daily batch groups now query `limit + 1`, process at most `XERO_DAILY_BATCH_LIMIT` rows per group per run, leave remaining marker-null rows eligible for the next run, use stable ordering plus deterministic batch-reference suffixes for split journals, include batch metadata for finance reconciliation, and report `batchLimit` plus per-group `hasMore` in the cron/activity summary. CronRun already records duration.
+- **Tests:** `tests/xero-daily-batch.test.ts` covers limit normalization, deterministic reference IDs, and the two-run window behavior.
 
 ### P7.7 — Backup manifest
 - **Status:** Complete.
@@ -547,6 +549,8 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
    - [x] P6.7 — Restore uploads have a configurable 50 MiB default cap plus disk-space preflight.
    - [x] P7.7 — Backups write manifests and stored restores reject missing critical tables.
 15. **Cron / rate / batch controls:** P6.1, P7.6.
+   - [x] P6.1 — Cron endpoints rate-limited after cron auth.
+   - [x] P7.6 — Xero daily batch groups process bounded candidate windows.
 16. **Analytics / report scale refactor:** P7.1, P7.2, P7.3, P7.8, CR1, CR2, CR3.
 17. **CSV export cleanup:** P7.4, CR4.
 18. **Integration settings test gate:** P7.5.

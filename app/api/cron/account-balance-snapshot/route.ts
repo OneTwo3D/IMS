@@ -2,6 +2,7 @@ import { NextResponse } from 'next/server'
 
 import { syncXeroAccountBalanceSnapshots } from '@/lib/connectors/xero/account-balances'
 import { verifyCron } from '@/lib/cron-auth'
+import { enforceCronRateLimit, type CronRateLimitChecker } from '@/lib/cron-rate-limit'
 import { balanceDateString } from '@/lib/domain/accounting/account-balance-snapshots'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import {
@@ -41,10 +42,13 @@ export async function handleAccountBalanceSnapshotCron(
     writeLog?: CronRunLogWriter
     getMaintenanceResponse?: typeof getMaintenanceModeResponse
     syncSnapshots?: AccountBalanceSnapshotSync
+    checkCronRateLimit?: CronRateLimitChecker
   } = {},
 ) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
+  const rateLimitErr = await enforceCronRateLimit('account-balance-snapshot', { request, checker: options.checkCronRateLimit })
+  if (rateLimitErr) return rateLimitErr
 
   const getMaintenanceResponse = options.getMaintenanceResponse ?? getMaintenanceModeResponse
   const maintenance = await getMaintenanceResponse('cron')
