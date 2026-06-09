@@ -374,9 +374,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Forge a session with a different `supplierId` than the requested resource; assert 403.
 
 ### P6.3 — Restore token TTL + binding
+- **Status:** Complete.
 - **File:** `app/api/backup/restore/route.ts:20`
 - **Fix:** Reduce TTL to 1–2 minutes. Bind token to session ID + IP so a copied token from a different session is rejected.
-- **Tests:** Use a token from a different session; assert rejection.
+- **Tests:** `tests/api/backup-restore.test.ts` covers two-minute token issuance, session/IP payload binding, and copied-token rejection before restore.
 
 ### P6.4 — Invoice PDF token leakage mitigation
 - **File:** `app/api/invoices/[id]/route.ts:105`
@@ -394,9 +395,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Password under new minimum is rejected; existing users grandfathered until next login (or forced rotation per security policy).
 
 ### P6.7 — Restore upload size + disk space
+- **Status:** Complete.
 - **File:** `app/api/backup/restore/route.ts:21`
-- **Fix:** Cap upload at 50 MiB (configurable). Before accepting upload, call `statvfs` (or equivalent) to check available disk space ≥ 2× upload size.
-- **Tests:** Upload at 51 MiB rejected; mocked low-disk scenario rejected.
+- **Fix:** Cap upload at 50 MiB (configurable). Before accepting upload, call `statvfs` (or equivalent) to check available disk space against the larger of a conservative 10× SQL-size estimate or 1.25× the database size recorded in the manifest.
+- **Tests:** `tests/api/backup-restore.test.ts` covers configurable form/file upload caps and mocked low-disk rejection using the manifest-backed 10x SQL / 1.25x database-size estimate before consuming the restore code.
 
 ### P6.8 — Activity logging redaction
 - **File:** `app/actions/users.ts:113–115`, `lib/activity-log.ts`
@@ -439,9 +441,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** Batch of 1001; assert two runs are needed.
 
 ### P7.7 — Backup manifest
+- **Status:** Complete.
 - **File:** `app/api/cron/backup/route.ts`
-- **Fix:** Generate a manifest (list of tables + row counts) alongside the dump. On restore, validate the manifest against the current Prisma schema. Fail restore if critical tables (users, products, sales_orders, purchase_orders) are missing.
-- **Tests:** Restore against a manifest missing `users`; assert rejection.
+- **Fix:** Generate a manifest (schema version, backup filename, database size, critical tables, and advisory post-dump row counts) alongside the dump. On restore, validate the manifest against the current Prisma schema. Fail stored and uploaded restores if critical tables for auth, products, sales, purchase, FIFO, COGS, stock movements, accounting sync/events, payments, shipments, allocations, or audit logs are missing.
+- **Tests:** `tests/backup-manifest.test.ts` covers manifest generation, advisory row-count metadata, and critical-table validation including FIFO tables. `tests/api/backup-restore.test.ts` covers restore rejection for a manifest missing `users` and uploaded restores without the sidecar.
 
 ### P7.8 — `throw new Error(...)` for source-row caps bubbles to Next.js error boundary
 - **Files:** `lib/domain/inventory/inventory-health-reports.ts`, `manufacturing-analytics.ts`, `finance-period-analytics.ts`, `purchasing-analytics.ts`
@@ -539,7 +542,10 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
 12. **Account balance freshness:**
    - [x] P5.3 — GL period movement requires a previous-day opening snapshot by default.
 13. **Security hardening batch:** P6.2, P6.4, P6.5, P6.6, P6.8.
-14. **Backup / restore operational hardening:** P6.3, P6.7, P7.7.
+14. **Backup / restore operational hardening:**
+   - [x] P6.3 — Restore tokens expire after two minutes and bind to session/IP.
+   - [x] P6.7 — Restore uploads have a configurable 50 MiB default cap plus disk-space preflight.
+   - [x] P7.7 — Backups write manifests and stored restores reject missing critical tables.
 15. **Cron / rate / batch controls:** P6.1, P7.6.
 16. **Analytics / report scale refactor:** P7.1, P7.2, P7.3, P7.8, CR1, CR2, CR3.
 17. **CSV export cleanup:** P7.4, CR4.

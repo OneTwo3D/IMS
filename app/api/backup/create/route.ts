@@ -7,6 +7,8 @@ import { Readable } from 'stream'
 import { logActivity } from '@/lib/activity-log'
 import { requireApiAdmin } from '@/lib/auth/server'
 import { getBackupDir } from '@/lib/backup-storage'
+import { db as prisma } from '@/lib/db'
+import { writeBackupManifestForFile } from '@/lib/backup-manifest'
 
 const BACKUP_DIR = getBackupDir()
 
@@ -25,7 +27,7 @@ export async function POST() {
   const session = await requireApiAdmin()
   if (session instanceof NextResponse) return session
 
-  const db = getDbConfig()
+  const dbConfig = getDbConfig()
   const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)
   const filename = `backup-${ts}.sql`
   const filePath = path.join(BACKUP_DIR, filename)
@@ -33,8 +35,8 @@ export async function POST() {
   await mkdir(BACKUP_DIR, { recursive: true })
 
   return new Promise<NextResponse>((resolve) => {
-    const args = ['-h', db.host, '-p', db.port, '-U', db.user, '-d', db.database, '--no-owner', '--no-acl', '-F', 'p', '-f', filePath]
-    execFile('pg_dump', args, { timeout: 120000, env: { ...process.env, PGPASSWORD: db.password } }, async (error) => {
+    const args = ['-h', dbConfig.host, '-p', dbConfig.port, '-U', dbConfig.user, '-d', dbConfig.database, '--no-owner', '--no-acl', '-F', 'p', '-f', filePath]
+    execFile('pg_dump', args, { timeout: 120000, env: { ...process.env, PGPASSWORD: dbConfig.password } }, async (error) => {
       if (error) {
         await logActivity({
           entityType: 'SYSTEM',
@@ -44,6 +46,20 @@ export async function POST() {
           description: `Failed to create backup: ${error.message}`,
         })
         resolve(NextResponse.json({ error: 'Backup failed.' }, { status: 500 }))
+        return
+      }
+
+      try {
+        await writeBackupManifestForFile(filePath, filename, prisma)
+      } catch (manifestError) {
+        await logActivity({
+          entityType: 'SYSTEM',
+          tag: 'system',
+          action: 'backup_created',
+          level: 'ERROR',
+          description: `Failed to create backup manifest: ${manifestError instanceof Error ? manifestError.message : String(manifestError)}`,
+        })
+        resolve(NextResponse.json({ error: 'Backup manifest failed.' }, { status: 500 }))
         return
       }
 

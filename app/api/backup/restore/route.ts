@@ -2,7 +2,7 @@ import { NextRequest, NextResponse } from 'next/server'
 import { createHash, randomBytes } from 'crypto'
 import { spawn } from 'child_process'
 import { createReadStream, createWriteStream } from 'fs'
-import { mkdir, access, unlink, stat } from 'fs/promises'
+import { mkdir, access, unlink, stat, statfs } from 'fs/promises'
 import path from 'path'
 import readline from 'readline'
 import { pipeline } from 'stream/promises'
@@ -15,11 +15,21 @@ import { disableMaintenanceMode, enableMaintenanceMode } from '@/lib/maintenance
 import { sendEmail } from '@/lib/mailer'
 import { consumeAuthToken, deleteAuthToken, setAuthToken } from '@/lib/auth/token-store'
 import { db } from '@/lib/db'
+import { parsePositiveIntegerEnv } from '@/lib/env'
+import { getClientIp } from '@/lib/request-ip'
+import {
+  parseBackupManifestContent,
+  validateBackupManifestForFile,
+  type BackupManifest,
+} from '@/lib/backup-manifest'
 
 const BACKUP_DIR = getBackupDir()
-const RESTORE_TOKEN_TTL_MS = 5 * 60_000
-const MAX_RESTORE_FILE_BYTES = 256 * 1024 * 1024
-const MAX_RESTORE_FORM_BYTES = MAX_RESTORE_FILE_BYTES + 64 * 1024
+const RESTORE_TOKEN_TTL_MS = 2 * 60_000
+const DEFAULT_MAX_RESTORE_FILE_BYTES = 50 * 1024 * 1024
+const RESTORE_FORM_OVERHEAD_BYTES = 64 * 1024
+const MAX_RESTORE_MANIFEST_BYTES = 1024 * 1024
+const RESTORE_SQL_DISK_SPACE_MULTIPLIER = 10
+const RESTORE_DATABASE_DISK_SPACE_MULTIPLIER = 1.25
 
 export const runtime = 'nodejs'
 
@@ -28,6 +38,8 @@ type Env = Record<string, string | undefined>
 type RestoreSession = {
   user: {
     id: string
+    sessionVersion?: number | null
+    sessionAuthTime?: number | null
   }
 }
 
@@ -58,8 +70,17 @@ export type BackupRestoreHandlerDeps = {
   enableMaintenance?: typeof enableMaintenanceMode
   disableMaintenance?: typeof disableMaintenanceMode
   runRestoreFile?: typeof runRestore
+  validateBackupManifest?: typeof validateBackupManifestForFile
+  getAvailableDiskBytes?: typeof getAvailableDiskBytes
   getTargetDatabaseTimestamp?: () => Promise<Date>
   now?: () => number
+}
+
+type RestoreTokenPayload = {
+  userId: string
+  sessionVersion: number | null
+  sessionAuthTime: number | null
+  clientIp: string
 }
 
 function isTruthy(value: string | undefined): boolean {
@@ -73,6 +94,122 @@ function isProductionRestoreAllowed(env: Env): boolean {
 
 function isProductionUploadRestoreAllowed(env: Env): boolean {
   return env.NODE_ENV !== 'production' || isTruthy(env.ALLOW_DATABASE_RESTORE_UPLOAD)
+}
+
+function getMaxRestoreFileBytes(env: Env): number {
+  return parsePositiveIntegerEnv(env.DATABASE_RESTORE_MAX_FILE_BYTES, DEFAULT_MAX_RESTORE_FILE_BYTES)
+}
+
+function getMaxRestoreFormBytes(env: Env): number {
+  return getMaxRestoreFileBytes(env) + RESTORE_FORM_OVERHEAD_BYTES
+}
+
+async function getAvailableDiskBytes(directory: string): Promise<number> {
+  const stats = await statfs(directory)
+  return Number(stats.bavail) * Number(stats.bsize)
+}
+
+function restoreTokenClientIp(request?: Pick<NextRequest, 'headers'> | null): string | null {
+  if (!request) return null
+  return getClientIp(request.headers)
+}
+
+function restoreTokenPayload(session: RestoreSession, request?: Pick<NextRequest, 'headers'> | null): RestoreTokenPayload | null {
+  const clientIp = restoreTokenClientIp(request)
+  if (!clientIp) return null
+  return {
+    userId: session.user.id,
+    sessionVersion: session.user.sessionVersion ?? null,
+    sessionAuthTime: session.user.sessionAuthTime ?? null,
+    clientIp,
+  }
+}
+
+function serializeRestoreTokenPayload(payload: RestoreTokenPayload): string {
+  return JSON.stringify(payload)
+}
+
+function parseRestoreTokenPayload(value: string | null): RestoreTokenPayload | null {
+  if (!value) return null
+  try {
+    const parsed = JSON.parse(value) as Partial<RestoreTokenPayload>
+    if (!parsed || typeof parsed !== 'object') return null
+    if (typeof parsed.userId !== 'string' || typeof parsed.clientIp !== 'string') return null
+    if (parsed.sessionVersion !== null && typeof parsed.sessionVersion !== 'number') return null
+    if (parsed.sessionAuthTime !== null && typeof parsed.sessionAuthTime !== 'number') return null
+    return {
+      userId: parsed.userId,
+      sessionVersion: parsed.sessionVersion ?? null,
+      sessionAuthTime: parsed.sessionAuthTime ?? null,
+      clientIp: parsed.clientIp,
+    }
+  } catch {
+    return null
+  }
+}
+
+function missingRestoreClientIpResponse(): NextResponse {
+  return NextResponse.json({ error: 'Cannot issue restore token without verifiable client IP.' }, { status: 400 })
+}
+
+function estimateRestoreDiskBytes(sqlFileBytes: number, manifest: BackupManifest): number {
+  return Math.max(
+    Math.ceil(sqlFileBytes * RESTORE_SQL_DISK_SPACE_MULTIPLIER),
+    Math.ceil(manifest.databaseSizeBytes * RESTORE_DATABASE_DISK_SPACE_MULTIPLIER) + sqlFileBytes,
+  )
+}
+
+async function validateRestoreDiskSpace(
+  deps: RequiredRestoreDeps,
+  sqlFileBytes: number,
+  manifest: BackupManifest,
+): Promise<NextResponse | null> {
+  const requiredBytes = estimateRestoreDiskBytes(sqlFileBytes, manifest)
+  const availableBytes = await deps.getAvailableDiskBytes(deps.backupDir)
+  if (availableBytes >= requiredBytes) return null
+  return NextResponse.json({
+    error: `Not enough disk space for restore. Requires approximately ${RESTORE_SQL_DISK_SPACE_MULTIPLIER}x the SQL file size or ${RESTORE_DATABASE_DISK_SPACE_MULTIPLIER}x the manifest database size.`,
+  }, { status: 507 })
+}
+
+async function parseUploadedBackupManifest(file: File | null, backupFilename: string): Promise<BackupManifest | NextResponse> {
+  if (!file) {
+    return NextResponse.json({ error: 'Backup manifest file is required for uploaded restores.' }, { status: 400 })
+  }
+  if (!file.name.endsWith('.manifest.json')) {
+    return NextResponse.json({ error: 'Invalid manifest file type. Upload the .manifest.json sidecar for the SQL backup.' }, { status: 400 })
+  }
+  if (file.size > MAX_RESTORE_MANIFEST_BYTES) {
+    return NextResponse.json({ error: 'Backup manifest file is too large.' }, { status: 413 })
+  }
+
+  let manifest: BackupManifest
+  try {
+    manifest = parseBackupManifestContent(await file.text())
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return NextResponse.json({ error: `Backup manifest validation failed: ${message.slice(0, 200)}` }, { status: 400 })
+  }
+  if (manifest.backupFilename !== path.basename(backupFilename)) {
+    return NextResponse.json({ error: 'Backup manifest does not match the uploaded backup.' }, { status: 400 })
+  }
+  return manifest
+}
+
+function restoreTokenPayloadMatches(actual: RestoreTokenPayload | null, expected: RestoreTokenPayload): boolean {
+  return actual?.userId === expected.userId
+    && actual.sessionVersion === expected.sessionVersion
+    && actual.sessionAuthTime === expected.sessionAuthTime
+    && actual.clientIp === expected.clientIp
+}
+
+async function consumeMatchingRestoreToken(
+  deps: RequiredRestoreDeps,
+  restoreToken: string,
+  expected: RestoreTokenPayload,
+): Promise<boolean> {
+  const tokenValue = await deps.consumeRestoreToken(`backup_restore:${restoreToken.trim().toUpperCase()}`)
+  return restoreTokenPayloadMatches(parseRestoreTokenPayload(tokenValue), expected)
 }
 
 async function logDeniedRestoreAttempt(deps: RequiredRestoreDeps, userId: string, reason: string): Promise<void> {
@@ -256,7 +393,7 @@ function formatRestoreEmail(token: string) {
     <p>A database restore was requested for your onetwoInventory admin account.</p>
     <p>Use this confirmation code to continue:</p>
     <p style="font-size:24px;font-weight:700;letter-spacing:0.2em;"><code>${token}</code></p>
-    <p>This code expires in 5 minutes and can be used only once.</p>
+    <p>This code expires in 2 minutes and can be used only once.</p>
     <p>If you did not request this, review admin access immediately.</p>
   `
 }
@@ -366,6 +503,8 @@ function withDefaults(deps: BackupRestoreHandlerDeps = {}): RequiredRestoreDeps 
     enableMaintenance: deps.enableMaintenance ?? enableMaintenanceMode,
     disableMaintenance: deps.disableMaintenance ?? disableMaintenanceMode,
     runRestoreFile: deps.runRestoreFile ?? runRestore,
+    validateBackupManifest: deps.validateBackupManifest ?? validateBackupManifestForFile,
+    getAvailableDiskBytes: deps.getAvailableDiskBytes ?? getAvailableDiskBytes,
     getTargetDatabaseTimestamp: deps.getTargetDatabaseTimestamp ?? (() => getTargetDatabaseTimestamp(deps.dbClient ?? db)),
     now: deps.now ?? Date.now,
   }
@@ -373,7 +512,7 @@ function withDefaults(deps: BackupRestoreHandlerDeps = {}): RequiredRestoreDeps 
 
 export function createBackupRestoreGetHandler(deps: BackupRestoreHandlerDeps = {}) {
   const resolvedDeps = withDefaults(deps)
-  return async function GET() {
+  return async function GET(req?: NextRequest) {
     const session = await resolvedDeps.authorize()
     if (session instanceof NextResponse) return session
     if (!isProductionRestoreAllowed(resolvedDeps.env)) {
@@ -392,7 +531,13 @@ export function createBackupRestoreGetHandler(deps: BackupRestoreHandlerDeps = {
 
     const restoreToken = randomBytes(4).toString('hex').toUpperCase()
     const restoreTokenKey = `backup_restore:${restoreToken}`
-    await resolvedDeps.setRestoreToken(restoreTokenKey, session.user.id, RESTORE_TOKEN_TTL_MS)
+    const payload = restoreTokenPayload(session, req)
+    if (!payload) return missingRestoreClientIpResponse()
+    await resolvedDeps.setRestoreToken(
+      restoreTokenKey,
+      serializeRestoreTokenPayload(payload),
+      RESTORE_TOKEN_TTL_MS,
+    )
     const mail = await resolvedDeps.mailer({
       to: email,
       subject: 'Backup restore confirmation code',
@@ -423,6 +568,8 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       return restoreDisabledResponse()
     }
 
+    const maxRestoreFileBytes = getMaxRestoreFileBytes(resolvedDeps.env)
+    const maxRestoreFormBytes = getMaxRestoreFormBytes(resolvedDeps.env)
     const contentType = req.headers.get('content-type') ?? ''
     const contentLength = req.headers.get('content-length')
     if (contentType.includes('multipart/form-data')) {
@@ -433,7 +580,7 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       if (!Number.isFinite(requestBytes) || requestBytes <= 0) {
         return NextResponse.json({ error: 'Restore upload size is invalid.' }, { status: 400 })
       }
-      if (requestBytes > MAX_RESTORE_FORM_BYTES) {
+      if (requestBytes > maxRestoreFormBytes) {
         return NextResponse.json({ error: 'Restore upload is too large.' }, { status: 413 })
       }
     }
@@ -449,7 +596,12 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
     }
 
     const file = formData.get('file') as File | null
+    const manifestFile = formData.get('manifestFile') as File | null
     const filename = formData.get('filename') as string | null
+    const expectedRestoreTokenPayload = restoreTokenPayload(session, req)
+    if (!expectedRestoreTokenPayload) {
+      return NextResponse.json({ error: 'Cannot verify restore token without verifiable client IP.' }, { status: 400 })
+    }
 
     let restorePath: string
     let uploadedTempFile = false
@@ -467,18 +619,22 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       if (!file.name.endsWith('.sql')) {
         return NextResponse.json({ error: 'Invalid file type. Only plain SQL (.sql) backups are supported. PostgreSQL custom-format .dump files require pg_restore and are not supported.' }, { status: 400 })
       }
-      if (file.size > MAX_RESTORE_FILE_BYTES) {
+      if (file.size > maxRestoreFileBytes) {
         return NextResponse.json({ error: 'Restore file is too large.' }, { status: 413 })
       }
+      const manifest = await parseUploadedBackupManifest(manifestFile, file.name)
+      if (manifest instanceof NextResponse) return manifest
+      await mkdir(resolvedDeps.backupDir, { recursive: true })
+      const diskSpaceResponse = await validateRestoreDiskSpace(resolvedDeps, file.size, manifest)
+      if (diskSpaceResponse) return diskSpaceResponse
       const targetTimestamp = await getRestoreTargetDatabaseTimestamp(resolvedDeps)
       if (targetTimestamp instanceof NextResponse) return targetTimestamp
       targetDatabaseTimestamp = targetTimestamp
       // Validate upload policy and shape before consuming the one-time email code.
-      const restoreTokenUserId = await resolvedDeps.consumeRestoreToken(`backup_restore:${restoreToken.trim().toUpperCase()}`)
-      if (restoreTokenUserId !== session.user.id) {
+      const tokenMatches = await consumeMatchingRestoreToken(resolvedDeps, restoreToken, expectedRestoreTokenPayload)
+      if (!tokenMatches) {
         return NextResponse.json({ error: 'Restore email code invalid or expired.' }, { status: 400 })
       }
-      await mkdir(resolvedDeps.backupDir, { recursive: true })
       restorePath = path.join(resolvedDeps.backupDir, `restore-upload-${resolvedDeps.now()}.sql`)
       const uploadStream = file.stream() as unknown as NodeReadableStream<Uint8Array>
       await pipeline(
@@ -505,9 +661,21 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
         return NextResponse.json({ error: 'Backup file not found.' }, { status: 404 })
       }
       const fileInfo = await stat(restorePath)
-      if (fileInfo.size > MAX_RESTORE_FILE_BYTES) {
+      if (fileInfo.size > maxRestoreFileBytes) {
         return NextResponse.json({ error: 'Restore file is too large.' }, { status: 413 })
       }
+      let manifest: BackupManifest
+      try {
+        manifest = await resolvedDeps.validateBackupManifest(restorePath)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return NextResponse.json({ error: `Backup manifest validation failed: ${message.slice(0, 200)}` }, { status: 400 })
+      }
+      if (manifest.backupFilename !== path.basename(restorePath)) {
+        return NextResponse.json({ error: 'Backup manifest does not match the selected backup.' }, { status: 400 })
+      }
+      const diskSpaceResponse = await validateRestoreDiskSpace(resolvedDeps, fileInfo.size, manifest)
+      if (diskSpaceResponse) return diskSpaceResponse
       sourceBackupTimestamp = fileInfo.mtime.toISOString()
       sourceBackupName = path.basename(restorePath)
       sourceType = 'stored_backup'
@@ -515,8 +683,8 @@ export function createBackupRestorePostHandler(deps: BackupRestoreHandlerDeps = 
       const targetTimestamp = await getRestoreTargetDatabaseTimestamp(resolvedDeps)
       if (targetTimestamp instanceof NextResponse) return targetTimestamp
       targetDatabaseTimestamp = targetTimestamp
-      const restoreTokenUserId = await resolvedDeps.consumeRestoreToken(`backup_restore:${restoreToken.trim().toUpperCase()}`)
-      if (restoreTokenUserId !== session.user.id) {
+      const tokenMatches = await consumeMatchingRestoreToken(resolvedDeps, restoreToken, expectedRestoreTokenPayload)
+      if (!tokenMatches) {
         return NextResponse.json({ error: 'Restore email code invalid or expired.' }, { status: 400 })
       }
     } else {
