@@ -9,6 +9,7 @@ import { getBackupDir } from '@/lib/backup-storage'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 import { uploadBackupToTarget } from '@/lib/backup-remote'
 import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/ops/cron-run'
+import { backupManifestPath, writeBackupManifestForFile } from '@/lib/backup-manifest'
 
 const BACKUP_DIR = getBackupDir()
 
@@ -67,12 +68,31 @@ export async function GET(request: Request) {
 
       if (!created) return { error: 'Backup creation failed' }
 
+      try {
+        await writeBackupManifestForFile(filePath, filename, db)
+      } catch (error) {
+        await logActivity({
+          entityType: 'SYSTEM',
+          tag: 'system',
+          action: 'scheduled_backup',
+          level: 'ERROR',
+          description: `Scheduled backup manifest failed: ${error instanceof Error ? error.message : String(error)}`,
+        })
+        return { error: 'Backup manifest creation failed' }
+      }
+
       // Upload to remote if configured
       const autoUploadTarget = await getSetting('backup_auto_upload')
       let uploaded = false
       if (autoUploadTarget === 's3' || autoUploadTarget === 'sftp') {
         try {
           await uploadBackupToTarget(filePath, filename, autoUploadTarget)
+          await uploadBackupToTarget(
+            backupManifestPath(filePath),
+            `${filename}.manifest.json`,
+            autoUploadTarget,
+            'application/json',
+          )
           uploaded = true
         } catch (error) {
           await logActivity({

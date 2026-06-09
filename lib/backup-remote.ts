@@ -3,12 +3,17 @@ import { readFile } from 'fs/promises'
 import path from 'path'
 import { getSettingValues } from '@/lib/settings-store'
 
-export async function uploadBackupToTarget(filePath: string, filename: string, target: 's3' | 'sftp') {
-  if (target === 's3') return uploadToS3(filePath, filename)
+export async function uploadBackupToTarget(
+  filePath: string,
+  filename: string,
+  target: 's3' | 'sftp',
+  contentType = 'application/sql',
+) {
+  if (target === 's3') return uploadToS3(filePath, filename, contentType)
   return uploadToSftp(filePath, filename)
 }
 
-async function uploadToS3(filePath: string, filename: string) {
+async function uploadToS3(filePath: string, filename: string, contentType: string) {
   const { S3Client, PutObjectCommand } = await import('@aws-sdk/client-s3')
   const settings = await getSettingValues([
     'backup_s3_endpoint',
@@ -43,7 +48,7 @@ async function uploadToS3(filePath: string, filename: string) {
     Bucket: bucket,
     Key: key,
     Body: buffer,
-    ContentType: 'application/sql',
+    ContentType: contentType,
   }))
 
   return { destination: `s3://${bucket}/${key}` }

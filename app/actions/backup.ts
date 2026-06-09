@@ -5,6 +5,7 @@ import path from 'path'
 import { freshAuthFailureResult, requireAdmin, requireFreshAdmin } from '@/lib/auth/server'
 import { logActivity } from '@/lib/activity-log'
 import { getBackupDir } from '@/lib/backup-storage'
+import { backupManifestPath } from '@/lib/backup-manifest'
 
 const BACKUP_DIR = getBackupDir()
 
@@ -56,7 +57,13 @@ export async function deleteBackup(filename: string): Promise<{ success: boolean
   if (!safe.endsWith('.sql') && !safe.endsWith('.dump')) return { success: false, error: 'Invalid file' }
 
   try {
-    await unlink(path.join(BACKUP_DIR, safe))
+    const backupPath = path.join(BACKUP_DIR, safe)
+    await unlink(backupPath)
+    try {
+      await unlink(backupManifestPath(backupPath))
+    } catch {
+      // Older/manual backups may not have a manifest sidecar.
+    }
     await logActivity({
       entityType: 'SYSTEM',
       tag: 'system',

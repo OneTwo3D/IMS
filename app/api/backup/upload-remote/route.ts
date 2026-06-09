@@ -4,6 +4,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireApiAdmin } from '@/lib/auth/server'
 import { getBackupDir } from '@/lib/backup-storage'
 import { uploadBackupToTarget } from '@/lib/backup-remote'
+import { backupManifestPath } from '@/lib/backup-manifest'
 
 const BACKUP_DIR = getBackupDir()
 
@@ -21,6 +22,12 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ error: 'Invalid target.' }, { status: 400 })
     }
     const result = await uploadBackupToTarget(filePath, safe, target)
+    await uploadBackupToTarget(
+      backupManifestPath(filePath),
+      `${safe}.manifest.json`,
+      target,
+      'application/json',
+    )
 
     await logActivity({
       entityType: 'SYSTEM',

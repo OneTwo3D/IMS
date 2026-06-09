@@ -21,7 +21,24 @@ import {
 const adminSession = {
   user: {
     id: 'admin-1',
+    sessionVersion: 7,
+    sessionAuthTime: 1_771_234_567_000,
   },
+}
+
+function restoreTokenPayload(overrides: Partial<{
+  userId: string
+  sessionVersion: number | null
+  sessionAuthTime: number | null
+  clientIp: string
+}> = {}): string {
+  return JSON.stringify({
+    userId: 'admin-1',
+    sessionVersion: adminSession.user.sessionVersion,
+    sessionAuthTime: adminSession.user.sessionAuthTime,
+    clientIp: 'unknown',
+    ...overrides,
+  })
 }
 
 function productionEnv(): Record<string, string> {
@@ -46,6 +63,7 @@ function baseDeps(overrides: BackupRestoreHandlerDeps = {}) {
     userFindUnique: 0,
     mailer: 0,
     setToken: 0,
+    setTokenArgs: [] as Array<{ key: string; value: string; ttlMs: number }>,
     consumeToken: 0,
     deleteToken: 0,
     enableMaintenance: 0,
@@ -70,12 +88,13 @@ function baseDeps(overrides: BackupRestoreHandlerDeps = {}) {
       calls.mailer += 1
       return { success: true }
     },
-    setRestoreToken: async () => {
+    setRestoreToken: async (key, value, ttlMs) => {
       calls.setToken += 1
+      calls.setTokenArgs.push({ key, value, ttlMs: ttlMs ?? 0 })
     },
     consumeRestoreToken: async () => {
       calls.consumeToken += 1
-      return 'admin-1'
+      return restoreTokenPayload()
     },
     deleteRestoreToken: async () => {
       calls.deleteToken += 1
@@ -89,6 +108,18 @@ function baseDeps(overrides: BackupRestoreHandlerDeps = {}) {
     runRestoreFile: async () => {
       calls.runRestore += 1
     },
+    validateBackupManifest: async () => ({
+      schemaVersion: 1,
+      createdAt: '2026-06-03T10:11:12.000Z',
+      backupFilename: 'backup.sql',
+      tables: [
+        { name: 'users', rowCount: 1 },
+        { name: 'products', rowCount: 2 },
+        { name: 'sales_orders', rowCount: 3 },
+        { name: 'purchase_orders', rowCount: 4 },
+      ],
+    }),
+    getAvailableDiskBytes: async () => 1024 * 1024 * 1024,
     getTargetDatabaseTimestamp: async () => {
       calls.getTargetDatabaseTimestamp += 1
       return new Date('2026-06-04T12:00:00.000Z')
@@ -232,6 +263,36 @@ test('production restore code issuance removes the one-time token when email del
   assert.equal(body.error, 'smtp down')
   assert.equal(calls.setToken, 1)
   assert.equal(calls.deleteToken, 1)
+})
+
+test('restore code issuance stores a two-minute session and IP bound token payload', async () => {
+  const { deps, calls } = baseDeps({
+    env: {
+      ...productionEnv(),
+      ALLOW_DATABASE_RESTORE: 'true',
+    },
+  })
+  const handler = createBackupRestoreGetHandler(deps)
+
+  const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', {
+    method: 'GET',
+    headers: {
+      'x-real-ip': '203.0.113.25',
+    },
+  }))
+  const body = await responseJson(response)
+
+  assert.equal(response.status, 200)
+  assert.equal(body.expiresInSec, 120)
+  assert.equal(calls.setToken, 1)
+  assert.equal(calls.setTokenArgs[0].ttlMs, 120_000)
+  assert.match(calls.setTokenArgs[0].key, /^backup_restore:[0-9A-F]{8}$/)
+  assert.deepEqual(JSON.parse(calls.setTokenArgs[0].value), {
+    userId: 'admin-1',
+    sessionVersion: 7,
+    sessionAuthTime: 1_771_234_567_000,
+    clientIp: '203.0.113.25',
+  })
 })
 
 test('cross-origin production restore POST is denied and logged before the production kill switch', async () => {
@@ -673,6 +734,66 @@ test('restore POST preflights target database timestamp before consuming the ema
   }
 })
 
+test('restore POST rejects a copied restore code from a different bound session before restore', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-token-binding-test-'))
+  try {
+    await writeFile(path.join(root, 'backup.sql'), 'select 1;\n')
+    const { deps, calls } = baseDeps({
+      backupDir: root,
+      env: {
+        ...productionEnv(),
+        ALLOW_DATABASE_RESTORE: 'true',
+      },
+      consumeRestoreToken: async () => {
+        calls.consumeToken += 1
+        return restoreTokenPayload({ sessionAuthTime: 1_771_234_568_000 })
+      },
+    })
+    const handler = createBackupRestorePostHandler(deps)
+
+    const response = await handler(sameOriginRequest(existingBackupBody('backup.sql')))
+    const json = await responseJson(response)
+
+    assert.equal(response.status, 400)
+    assert.equal(json.error, 'Restore email code invalid or expired.')
+    assert.equal(calls.consumeToken, 1)
+    assert.equal(calls.enableMaintenance, 0)
+    assert.equal(calls.runRestore, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('stored backup restore rejects a missing critical-table manifest before consuming the email code', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-manifest-test-'))
+  try {
+    await writeFile(path.join(root, 'backup.sql'), 'select 1;\n')
+    const { deps, calls } = baseDeps({
+      backupDir: root,
+      env: {
+        ...productionEnv(),
+        ALLOW_DATABASE_RESTORE: 'true',
+      },
+      validateBackupManifest: async () => {
+        throw new Error('Backup manifest missing critical table: users')
+      },
+    })
+    const handler = createBackupRestorePostHandler(deps)
+
+    const response = await handler(sameOriginRequest(existingBackupBody('backup.sql')))
+    const json = await responseJson(response)
+
+    assert.equal(response.status, 400)
+    assert.equal(json.error, 'Backup manifest validation failed: Backup manifest missing critical table: users')
+    assert.equal(calls.consumeToken, 0)
+    assert.equal(calls.getTargetDatabaseTimestamp, 0)
+    assert.equal(calls.enableMaintenance, 0)
+    assert.equal(calls.runRestore, 0)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test('non-production restore code and filename restore work without production kill-switch flags', async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-dev-test-'))
   try {
@@ -842,6 +963,109 @@ test('uploaded production restore denied by the upload kill switch keeps the ema
     assert.equal(retryBody.success, true)
     assert.equal(calls.consumeToken, 1)
     assert.equal(calls.runRestore, 1)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('uploaded restore rejects requests above the configured form limit before consuming the email code', async () => {
+  const form = new FormData()
+  form.set('confirmationPhrase', 'RESTORE')
+  form.set('restoreToken', 'ABCDEF12')
+  form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
+
+  const { deps, calls } = baseDeps({
+    env: {
+      ...productionEnv(),
+      ALLOW_DATABASE_RESTORE: 'true',
+      ALLOW_DATABASE_RESTORE_UPLOAD: 'true',
+      DATABASE_RESTORE_MAX_FILE_BYTES: '8',
+    },
+  })
+  const handler = createBackupRestorePostHandler(deps)
+
+  const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', {
+    method: 'POST',
+    headers: {
+      origin: 'https://ims.example.test',
+      'content-length': String(8 + 64 * 1024 + 1),
+    },
+    body: form,
+  }))
+  const body = await responseJson(response)
+
+  assert.equal(response.status, 413)
+  assert.equal(body.error, 'Restore upload is too large.')
+  assert.equal(calls.consumeToken, 0)
+  assert.equal(calls.runRestore, 0)
+})
+
+test('uploaded restore rejects files above the configured file limit before consuming the email code', async () => {
+  const form = new FormData()
+  form.set('confirmationPhrase', 'RESTORE')
+  form.set('restoreToken', 'ABCDEF12')
+  form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
+
+  const { deps, calls } = baseDeps({
+    env: {
+      ...productionEnv(),
+      ALLOW_DATABASE_RESTORE: 'true',
+      ALLOW_DATABASE_RESTORE_UPLOAD: 'true',
+      DATABASE_RESTORE_MAX_FILE_BYTES: '8',
+    },
+  })
+  const handler = createBackupRestorePostHandler(deps)
+
+  const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', {
+    method: 'POST',
+    headers: {
+      origin: 'https://ims.example.test',
+      'content-length': '100',
+    },
+    body: form,
+  }))
+  const body = await responseJson(response)
+
+  assert.equal(response.status, 413)
+  assert.equal(body.error, 'Restore file is too large.')
+  assert.equal(calls.consumeToken, 0)
+  assert.equal(calls.runRestore, 0)
+})
+
+test('uploaded restore rejects low disk space before consuming the email code', async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), 'ims-restore-low-disk-test-'))
+  try {
+    const form = new FormData()
+    form.set('confirmationPhrase', 'RESTORE')
+    form.set('restoreToken', 'ABCDEF12')
+    form.set('file', new File(['select 1;\n'], 'upload.sql', { type: 'application/sql' }))
+
+    const { deps, calls } = baseDeps({
+      backupDir: root,
+      env: {
+        ...productionEnv(),
+        ALLOW_DATABASE_RESTORE: 'true',
+        ALLOW_DATABASE_RESTORE_UPLOAD: 'true',
+      },
+      getAvailableDiskBytes: async () => 1,
+    })
+    const handler = createBackupRestorePostHandler(deps)
+
+    const response = await handler(new NextRequest('https://ims.example.test/api/backup/restore', {
+      method: 'POST',
+      headers: {
+        origin: 'https://ims.example.test',
+        'content-length': '100',
+      },
+      body: form,
+    }))
+    const body = await responseJson(response)
+
+    assert.equal(response.status, 507)
+    assert.equal(body.error, 'Not enough disk space for restore upload.')
+    assert.equal(calls.consumeToken, 0)
+    assert.equal(calls.enableMaintenance, 0)
+    assert.equal(calls.runRestore, 0)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
