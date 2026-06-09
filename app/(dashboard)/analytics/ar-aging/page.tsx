@@ -1,7 +1,7 @@
-import { getArAgingReport, type AgingReportRow } from '@/lib/domain/finance/finance-period-analytics'
+import type { AgingReportRow } from '@/lib/domain/finance/finance-period-analytics'
 import { requireFinanceAnalyticsAccess } from '@/lib/security/finance-analytics-page-access'
 import { FinanceAnalyticsReportPage, type FinanceAnalyticsColumn } from '../_components/finance-analytics-report'
-import { financeAnalyticsFiltersForUi, financeAnalyticsFiltersFromSearch, loadFinanceAnalyticsReportForPage, type FinanceAnalyticsSearchParams } from '../_components/finance-analytics-page-utils'
+import { financeAnalyticsFiltersForUi, financeAnalyticsFiltersFromSearch, loadArAgingReportForPage, type FinanceAnalyticsSearchParams } from '../_components/finance-analytics-page-utils'
 
 type Props = { searchParams: Promise<FinanceAnalyticsSearchParams> }
 
@@ -21,7 +21,7 @@ const columns: Array<FinanceAnalyticsColumn<AgingReportRow>> = [
 export default async function ArAgingAnalyticsPage({ searchParams }: Props) {
   await requireFinanceAnalyticsAccess()
   const filters = financeAnalyticsFiltersFromSearch(await searchParams)
-  const report = await loadFinanceAnalyticsReportForPage(filters, getArAgingReport, { outstandingBase: '0', creditBalanceBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' })
+  const report = await loadArAgingReportForPage(filters)
   return (
     <FinanceAnalyticsReportPage
       title="AR Aging"

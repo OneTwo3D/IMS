@@ -1,7 +1,7 @@
-import { getVatReport, type VatReportRow } from '@/lib/domain/finance/finance-period-analytics'
+import type { VatReportRow } from '@/lib/domain/finance/finance-period-analytics'
 import { requireFinanceAnalyticsAccess } from '@/lib/security/finance-analytics-page-access'
 import { FinanceAnalyticsReportPage, type FinanceAnalyticsColumn } from '../_components/finance-analytics-report'
-import { financeAnalyticsFiltersForUi, financeAnalyticsFiltersFromSearch, loadFinanceAnalyticsReportForPage, type FinanceAnalyticsSearchParams } from '../_components/finance-analytics-page-utils'
+import { financeAnalyticsFiltersForUi, financeAnalyticsFiltersFromSearch, loadVatReportForPage, type FinanceAnalyticsSearchParams } from '../_components/finance-analytics-page-utils'
 
 type Props = { searchParams: Promise<FinanceAnalyticsSearchParams> }
 
@@ -19,7 +19,7 @@ const columns: Array<FinanceAnalyticsColumn<VatReportRow>> = [
 export default async function VatAnalyticsPage({ searchParams }: Props) {
   await requireFinanceAnalyticsAccess()
   const filters = financeAnalyticsFiltersFromSearch(await searchParams)
-  const report = await loadFinanceAnalyticsReportForPage(filters, getVatReport, { taxableBase: '0', salesTaxBase: '0', purchaseTaxBase: '0', taxBase: '0' })
+  const report = await loadVatReportForPage(filters)
   return (
     <FinanceAnalyticsReportPage
       title="VAT"

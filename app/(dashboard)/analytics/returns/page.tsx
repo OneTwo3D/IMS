@@ -1,16 +1,16 @@
 import type { Metadata } from 'next'
 import { ProductLink } from '@/components/inventory/product-link'
 import { requireRole } from '@/lib/auth/server'
-import { getReturnsAnalyticsReport, type ReturnsReportRow } from '@/lib/domain/sales/sales-fulfillment-analytics'
+import type { ReturnsReportRow } from '@/lib/domain/sales/sales-fulfillment-analytics'
 import { SalesAnalyticsReportPage, type SalesAnalyticsColumn } from '../_components/sales-analytics-report'
-import { loadSalesAnalyticsReportForPage, salesAnalyticsFiltersForUi, salesAnalyticsFiltersFromSearch, type SalesAnalyticsSearchParams } from '../_components/sales-analytics-page-utils'
+import { loadReturnsAnalyticsReportForPage, salesAnalyticsFiltersForUi, salesAnalyticsFiltersFromSearch, type SalesAnalyticsSearchParams } from '../_components/sales-analytics-page-utils'
 
 export const metadata: Metadata = { title: 'Returns' }
 
 export default async function ReturnsAnalyticsPage({ searchParams }: { searchParams: Promise<SalesAnalyticsSearchParams> }) {
   await requireRole('ADMIN', 'MANAGER', 'FINANCE')
   const filters = salesAnalyticsFiltersFromSearch(await searchParams)
-  const report = await loadSalesAnalyticsReportForPage(filters, getReturnsAnalyticsReport, { refundValueBase: '0', returnedQty: '0' })
+  const report = await loadReturnsAnalyticsReportForPage(filters)
   const columns: Array<SalesAnalyticsColumn<ReturnsReportRow>> = [
     { key: 'product', label: 'Product', render: (row) => row.productId ? <ProductLink productId={row.productId} sku={row.sku} name={row.productName} /> : `${row.sku} ${row.productName}`, footer: 'Totals' },
     { key: 'customer', label: 'Customer', render: (row) => row.customerName },

@@ -1,6 +1,6 @@
-import { getPurchasePriceVarianceReport, type PurchasePriceVarianceReportRow } from '@/lib/domain/purchasing/purchasing-analytics'
+import type { PurchasePriceVarianceReportRow } from '@/lib/domain/purchasing/purchasing-analytics'
 import { PurchasingAnalyticsReportPage, type PurchasingAnalyticsColumn } from '../_components/purchasing-analytics-report'
-import { loadPurchasingAnalyticsReportForPage, purchasingAnalyticsFiltersForUi, purchasingAnalyticsFiltersFromSearch, type PurchasingAnalyticsSearchParams } from '../_components/purchasing-analytics-page-utils'
+import { loadPurchasePriceVarianceReportForPage, purchasingAnalyticsFiltersForUi, purchasingAnalyticsFiltersFromSearch, type PurchasingAnalyticsSearchParams } from '../_components/purchasing-analytics-page-utils'
 
 type Props = {
   searchParams: Promise<PurchasingAnalyticsSearchParams>
@@ -21,7 +21,7 @@ const columns: Array<PurchasingAnalyticsColumn<PurchasePriceVarianceReportRow>> 
 
 export default async function PurchasePriceVarianceAnalyticsPage({ searchParams }: Props) {
   const filters = purchasingAnalyticsFiltersFromSearch(await searchParams)
-  const report = await loadPurchasingAnalyticsReportForPage(filters, getPurchasePriceVarianceReport, { varianceTotalBase: '0', rowCount: '0' })
+  const report = await loadPurchasePriceVarianceReportForPage(filters)
   return (
     <PurchasingAnalyticsReportPage
       title="Purchase Price Variance"

@@ -1,7 +1,7 @@
-import { getApAgingReport, type AgingReportRow } from '@/lib/domain/finance/finance-period-analytics'
+import type { AgingReportRow } from '@/lib/domain/finance/finance-period-analytics'
 import { requireFinanceAnalyticsAccess } from '@/lib/security/finance-analytics-page-access'
 import { FinanceAnalyticsReportPage, type FinanceAnalyticsColumn } from '../_components/finance-analytics-report'
-import { financeAnalyticsFiltersForUi, financeAnalyticsFiltersFromSearch, loadFinanceAnalyticsReportForPage, type FinanceAnalyticsSearchParams } from '../_components/finance-analytics-page-utils'
+import { financeAnalyticsFiltersForUi, financeAnalyticsFiltersFromSearch, loadApAgingReportForPage, type FinanceAnalyticsSearchParams } from '../_components/finance-analytics-page-utils'
 
 type Props = { searchParams: Promise<FinanceAnalyticsSearchParams> }
 
@@ -20,7 +20,7 @@ const columns: Array<FinanceAnalyticsColumn<AgingReportRow>> = [
 export default async function ApAgingAnalyticsPage({ searchParams }: Props) {
   await requireFinanceAnalyticsAccess()
   const filters = financeAnalyticsFiltersFromSearch(await searchParams)
-  const report = await loadFinanceAnalyticsReportForPage(filters, getApAgingReport, { outstandingBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' })
+  const report = await loadApAgingReportForPage(filters)
   return (
     <FinanceAnalyticsReportPage
       title="AP Aging"

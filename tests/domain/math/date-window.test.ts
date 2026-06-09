@@ -5,6 +5,7 @@ import {
   defaultUtcDateWindow,
   elapsedDaysDecimal,
   endOfUtcDay,
+  exclusiveEndOfUtcDay,
   inclusiveUtcDayCount,
   parseDateOnly,
   parseOptionalDateOnly,
@@ -27,9 +28,12 @@ test('date-only parsing normalizes to UTC day boundaries', () => {
 
   assert.equal(parseDateOnly('2026-01-02', fallback).toISOString(), '2026-01-02T00:00:00.000Z')
   assert.equal(parseDateOnly('2026-01-02', fallback, { endOfDay: true }).toISOString(), '2026-01-02T23:59:59.999Z')
+  assert.equal(exclusiveEndOfUtcDay(parseDateOnly('2026-01-02', fallback)).toISOString(), '2026-01-03T00:00:00.000Z')
   assert.equal(parseDateOnly('bad', fallback).toISOString(), fallback.toISOString())
+  assert.equal(parseDateOnly('2026-13-45', fallback).toISOString(), fallback.toISOString())
   assert.equal(parseOptionalDateOnly('2026-04-05')?.toISOString(), '2026-04-05T00:00:00.000Z')
   assert.equal(parseOptionalDateOnly('bad'), undefined)
+  assert.equal(parseOptionalDateOnly('2026-02-30'), undefined)
 })
 
 test('default window and subtract helpers keep UTC dates stable', () => {

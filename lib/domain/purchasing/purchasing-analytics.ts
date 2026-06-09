@@ -2,7 +2,7 @@ import { Prisma, PurchaseOrderStatus } from '@/app/generated/prisma/client'
 import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import { roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { dateOnly, defaultUtcDateWindow, elapsedDaysDecimal, parseDateOnly, startOfUtcDay, subtractUtcDays } from '@/lib/domain/math/date-window'
+import { dateOnly, defaultUtcDateWindow, elapsedDaysDecimal, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, subtractUtcDays } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
@@ -256,13 +256,13 @@ async function baseCurrencyFromDeps(deps?: PurchasingAnalyticsDeps): Promise<str
   return deps?.client ? DEFAULT_BASE_CURRENCY : getBaseCurrencyCode()
 }
 
-function period(filters: PurchasingAnalyticsFilters, now: Date): { dateFrom: Date; dateTo: Date } {
+function period(filters: PurchasingAnalyticsFilters, now: Date): { dateFrom: Date; dateTo: Date; dateToExclusive: Date } {
   const { dateFrom: defaultFrom, dateTo: defaultTo } = defaultUtcDateWindow(now, DEFAULT_PERIOD_DAYS)
   const dateTo = parseDateOnly(filters.dateTo, defaultTo, { endOfDay: true })
   const dateFrom = parseDateOnly(filters.dateFrom, defaultFrom)
   return dateFrom.getTime() <= dateTo.getTime()
-    ? { dateFrom, dateTo }
-    : { dateFrom: startOfUtcDay(dateTo), dateTo }
+    ? { dateFrom, dateTo, dateToExclusive: exclusiveEndOfUtcDay(dateTo) }
+    : { dateFrom: startOfUtcDay(dateTo), dateTo, dateToExclusive: exclusiveEndOfUtcDay(dateTo) }
 }
 
 function monthKey(date: Date): string {
@@ -377,8 +377,8 @@ export async function getOpenPurchaseOrdersReport(
       status: { in: OPEN_PURCHASE_ORDER_STATUSES },
       archived: false,
       OR: [
-        { poSentAt: { gte: window.dateFrom, lte: window.dateTo } },
-        { poSentAt: null, createdAt: { gte: window.dateFrom, lte: window.dateTo } },
+        { poSentAt: { gte: window.dateFrom, lt: window.dateToExclusive } },
+        { poSentAt: null, createdAt: { gte: window.dateFrom, lt: window.dateToExclusive } },
       ],
     },
     select: {
@@ -450,9 +450,9 @@ export async function getOpenPurchaseOrdersReport(
   ], options.paginate !== false)
 }
 
-async function loadReceipts(client: PurchasingAnalyticsClient, window: { dateFrom: Date; dateTo: Date }): Promise<ReceiptRow[]> {
+async function loadReceipts(client: PurchasingAnalyticsClient, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<ReceiptRow[]> {
   const receipts = await client.purchaseReceipt.findMany({
-    where: { receivedAt: { gte: window.dateFrom, lte: window.dateTo } },
+    where: { receivedAt: { gte: window.dateFrom, lt: window.dateToExclusive } },
     select: {
       id: true,
       receivedAt: true,
@@ -498,7 +498,7 @@ export async function getSupplierPerformanceReport(
   const [receipts, returns, configuredLeadTimes, rfqOrders] = await Promise.all([
     loadReceipts(client, window),
     client.purchaseReturnLine.findMany({
-      where: { return: { returnedAt: { gte: window.dateFrom, lte: window.dateTo } } },
+      where: { return: { returnedAt: { gte: window.dateFrom, lt: window.dateToExclusive } } },
       select: {
         qtyReturned: true,
         return: { select: { returnedAt: true, po: { select: { supplierId: true, supplier: { select: { name: true } } } } } },
@@ -514,7 +514,7 @@ export async function getSupplierPerformanceReport(
     client.purchaseOrder.findMany({
       where: {
         rfqSentAt: { not: null },
-        updatedAt: { gte: window.dateFrom, lte: window.dateTo },
+        updatedAt: { gte: window.dateFrom, lt: window.dateToExclusive },
         status: { in: RFQ_RESPONSE_STATUSES },
       },
       select: {
@@ -643,7 +643,7 @@ export async function getPurchasePriceVarianceReport(
   const window = period(filters, generatedAt)
   const lines = await client.purchaseOrderLine.findMany({
     where: {
-      po: { status: { in: RECEIVED_PURCHASE_ORDER_STATUSES }, receivedAt: { lte: window.dateTo } },
+      po: { status: { in: RECEIVED_PURCHASE_ORDER_STATUSES }, receivedAt: { lt: window.dateToExclusive } },
     },
     select: {
       id: true,
@@ -677,7 +677,7 @@ export async function getPurchasePriceVarianceReport(
     const actual = toDecimal(line.landedUnitCostBase).gt(0) ? toDecimal(line.landedUnitCostBase) : toDecimal(line.unitCostBase)
     const key = `${line.po.supplierId}:${line.productId}`
     const prior = priorBySupplierProduct.get(key)
-    if (receivedAt.getTime() >= window.dateFrom.getTime() && receivedAt.getTime() <= window.dateTo.getTime()) {
+    if (receivedAt.getTime() >= window.dateFrom.getTime() && receivedAt.getTime() < window.dateToExclusive.getTime()) {
       const variancePerUnit = prior ? actual.sub(prior) : new Prisma.Decimal(0)
       rows.push({
         supplierId: line.po.supplierId,
@@ -720,7 +720,7 @@ export async function getSpendReport(
   const orders = await client.purchaseOrder.findMany({
     where: {
       status: { in: RECEIVED_PURCHASE_ORDER_STATUSES },
-      receivedAt: { gte: window.dateFrom, lte: window.dateTo },
+      receivedAt: { gte: window.dateFrom, lt: window.dateToExclusive },
       archived: false,
     },
     select: {
@@ -866,7 +866,8 @@ export async function getObservedLeadTimeP95BySupplierProduct(
     dateFrom: options.dateFrom ?? subtractUtcDays(startOfUtcDay(generatedAt), 365),
     dateTo: options.dateTo ?? defaultUtcDateWindow(generatedAt, 1).dateTo,
   }
-  const receipts = await loadReceipts(client as PurchasingAnalyticsClient, window)
+  const receiptWindow = { ...window, dateToExclusive: exclusiveEndOfUtcDay(window.dateTo) }
+  const receipts = await loadReceipts(client as PurchasingAnalyticsClient, receiptWindow)
   const byKey = new Map<string, Prisma.Decimal[]>()
   for (const receipt of receipts) {
     const sentAt = receipt.po.poSentAt ?? receipt.po.createdAt

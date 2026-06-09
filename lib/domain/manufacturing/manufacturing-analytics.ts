@@ -1,7 +1,7 @@
 import { Prisma, ProductionOrderStatus, ProductionOrderType, StockMovementType } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { dateOnly, elapsedDaysDecimal, parseOptionalDateOnly } from '@/lib/domain/math/date-window'
+import { dateOnly, elapsedDaysDecimal, exclusiveEndOfUtcDay, parseOptionalDateOnly } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 
@@ -158,11 +158,12 @@ function optionalDateOnly(date: Date | undefined): string | null {
 function dateWhere(filters: ManufacturingAnalyticsFilters, field: 'createdAt' | 'completedAt'): Record<string, unknown> {
   const dateFrom = parseDateOnly(filters.dateFrom)
   const dateTo = parseDateOnly(filters.dateTo, true)
+  const dateToExclusive = dateTo ? exclusiveEndOfUtcDay(dateTo) : undefined
   if (!dateFrom && !dateTo) return {}
   return {
     [field]: {
       ...(dateFrom ? { gte: dateFrom } : {}),
-      ...(dateTo ? { lte: dateTo } : {}),
+      ...(dateToExclusive ? { lt: dateToExclusive } : {}),
     },
   }
 }

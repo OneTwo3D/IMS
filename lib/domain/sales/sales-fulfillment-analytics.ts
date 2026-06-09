@@ -7,7 +7,7 @@ import {
 } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { dateOnly, defaultUtcDateWindow, parseDateOnly, startOfUtcDay } from '@/lib/domain/math/date-window'
+import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
@@ -239,13 +239,13 @@ async function baseCurrencyFromDeps(deps?: SalesFulfillmentAnalyticsDeps): Promi
   return deps?.client ? DEFAULT_BASE_CURRENCY : getBaseCurrencyCode()
 }
 
-function period(filters: SalesAnalyticsFilters, now: Date): { dateFrom: Date; dateTo: Date } {
+function period(filters: SalesAnalyticsFilters, now: Date): { dateFrom: Date; dateTo: Date; dateToExclusive: Date } {
   const { dateFrom: defaultFrom, dateTo: defaultTo } = defaultUtcDateWindow(now, DEFAULT_PERIOD_DAYS)
   const dateTo = parseDateOnly(filters.dateTo, defaultTo, { endOfDay: true })
   const dateFrom = parseDateOnly(filters.dateFrom, defaultFrom)
   return dateFrom.getTime() <= dateTo.getTime()
-    ? { dateFrom, dateTo }
-    : { dateFrom: startOfUtcDay(dateTo), dateTo }
+    ? { dateFrom, dateTo, dateToExclusive: exclusiveEndOfUtcDay(dateTo) }
+    : { dateFrom: startOfUtcDay(dateTo), dateTo, dateToExclusive: exclusiveEndOfUtcDay(dateTo) }
 }
 
 function clampPageSize(value: number | undefined): number {
@@ -324,11 +324,11 @@ function currencyMode(filters: SalesAnalyticsFilters): SalesCurrencyMode {
   return filters.currencyMode === 'foreign' ? 'foreign' : 'base'
 }
 
-async function loadSalesOrders(client: SalesFulfillmentAnalyticsClient, filters: SalesAnalyticsFilters, window: { dateFrom: Date; dateTo: Date }): Promise<SalesOrderRow[]> {
+async function loadSalesOrders(client: SalesFulfillmentAnalyticsClient, filters: SalesAnalyticsFilters, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<SalesOrderRow[]> {
   return client.salesOrder.findMany({
     where: {
       status: { in: ACTIVE_ORDER_STATUSES },
-      createdAt: { gte: window.dateFrom, lte: window.dateTo },
+      createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
       archived: false,
     },
     select: {
@@ -554,12 +554,12 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
   }
 }
 
-async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: { dateFrom: Date; dateTo: Date }): Promise<Map<string, Prisma.Decimal>> {
+async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<Map<string, Prisma.Decimal>> {
   const rows = await client.cogsEntry.findMany({
     where: {
       movement: {
         type: StockMovementType.SALE_DISPATCH,
-        createdAt: { gte: window.dateFrom, lte: window.dateTo },
+        createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
         referenceType: 'SalesOrder',
         referenceId: { not: null },
       },
@@ -651,7 +651,7 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
   const baseCurrency = await baseCurrencyFromDeps(deps)
   const window = period(filters, generatedAt)
   const cogsRows = await client.cogsEntry.findMany({
-    where: { createdAt: { gte: window.dateFrom, lte: window.dateTo }, movement: { type: StockMovementType.SALE_DISPATCH } },
+    where: { createdAt: { gte: window.dateFrom, lt: window.dateToExclusive }, movement: { type: StockMovementType.SALE_DISPATCH } },
     select: {
       id: true,
       totalCostBase: true,
@@ -766,7 +766,7 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
   const window = period(filters, generatedAt)
   const [refundLines, shippedMovements] = await Promise.all([
     client.salesOrderRefundLine.findMany({
-      where: { refund: { refundedAt: { gte: window.dateFrom, lte: window.dateTo } } },
+      where: { refund: { refundedAt: { gte: window.dateFrom, lt: window.dateToExclusive } } },
       select: {
         id: true,
         refundId: true,
@@ -790,7 +790,7 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
     client.stockMovement.findMany({
       where: {
         type: StockMovementType.SALE_DISPATCH,
-        createdAt: { gte: window.dateFrom, lte: window.dateTo },
+        createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
       },
       select: { productId: true, qty: true },
       take: SOURCE_ROW_LIMIT + 1,
@@ -869,7 +869,7 @@ export async function getFulfillmentAnalyticsReport(filters: SalesAnalyticsFilte
   const shipments = await client.shipment.findMany({
     where: {
       status: ShipmentStatus.SHIPPED,
-      shippedAt: { gte: window.dateFrom, lte: window.dateTo },
+      shippedAt: { gte: window.dateFrom, lt: window.dateToExclusive },
     },
     select: {
       id: true,
@@ -956,7 +956,7 @@ export async function getThroughputAnalyticsReport(filters: SalesAnalyticsFilter
       where: {
         entityType: ActivityEntityType.SALES_ORDER,
         action: 'shipment_status_changed',
-        createdAt: { gte: window.dateFrom, lte: window.dateTo },
+        createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
       },
       select: {
         userId: true,
@@ -967,7 +967,7 @@ export async function getThroughputAnalyticsReport(filters: SalesAnalyticsFilter
       take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<ActivityLogRow[]>,
     client.shipment.findMany({
-      where: { shippedAt: { gte: window.dateFrom, lte: window.dateTo } },
+      where: { shippedAt: { gte: window.dateFrom, lt: window.dateToExclusive } },
       select: { id: true, orderId: true, lines: { select: { lineId: true, qty: true } } },
       take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<Array<{ id: string; orderId: string; lines: Array<{ lineId: string; qty: DecimalInput }> }>>,

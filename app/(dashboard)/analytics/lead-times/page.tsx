@@ -1,6 +1,6 @@
-import { getLeadTimeReport, type LeadTimeReportRow } from '@/lib/domain/purchasing/purchasing-analytics'
+import type { LeadTimeReportRow } from '@/lib/domain/purchasing/purchasing-analytics'
 import { PurchasingAnalyticsReportPage, type PurchasingAnalyticsColumn } from '../_components/purchasing-analytics-report'
-import { loadPurchasingAnalyticsReportForPage, purchasingAnalyticsFiltersForUi, purchasingAnalyticsFiltersFromSearch, type PurchasingAnalyticsSearchParams } from '../_components/purchasing-analytics-page-utils'
+import { loadLeadTimeReportForPage, purchasingAnalyticsFiltersForUi, purchasingAnalyticsFiltersFromSearch, type PurchasingAnalyticsSearchParams } from '../_components/purchasing-analytics-page-utils'
 
 type Props = {
   searchParams: Promise<PurchasingAnalyticsSearchParams>
@@ -20,7 +20,7 @@ const columns: Array<PurchasingAnalyticsColumn<LeadTimeReportRow>> = [
 
 export default async function LeadTimeAnalyticsPage({ searchParams }: Props) {
   const filters = purchasingAnalyticsFiltersFromSearch(await searchParams)
-  const report = await loadPurchasingAnalyticsReportForPage(filters, getLeadTimeReport, { supplierSkuPairs: '0', maxP95LeadTimeDays: '0' })
+  const report = await loadLeadTimeReportForPage(filters)
   return (
     <PurchasingAnalyticsReportPage
       title="Lead Times"

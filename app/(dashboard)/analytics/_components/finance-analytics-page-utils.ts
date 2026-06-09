@@ -1,4 +1,13 @@
-import { emptyFinanceAnalyticsReportForSourceLimit, type FinanceAnalyticsFilters, type FinanceAnalyticsReport } from '@/lib/domain/finance/finance-period-analytics'
+import {
+  emptyFinanceAnalyticsReportForSourceLimit,
+  getApAgingReport,
+  getArAgingReport,
+  getCurrencySummaryReport,
+  getFxGainLossReport,
+  getVatReport,
+  type FinanceAnalyticsFilters,
+  type FinanceAnalyticsReport,
+} from '@/lib/domain/finance/finance-period-analytics'
 import { isSourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import type { FinanceAnalyticsFilterValues } from './finance-analytics-report'
 
@@ -36,7 +45,15 @@ export function financeAnalyticsFiltersForUi(filters: FinanceAnalyticsFilters): 
   }
 }
 
-export async function loadFinanceAnalyticsReportForPage<Row>(
+export const financeAnalyticsEmptyTotals = {
+  vat: { taxableBase: '0', salesTaxBase: '0', purchaseTaxBase: '0', taxBase: '0' },
+  arAging: { outstandingBase: '0', creditBalanceBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' },
+  apAging: { outstandingBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' },
+  currencySummary: { salesBase: '0', arOutstandingBase: '0', purchasesBase: '0', apOutstandingBase: '0' },
+  fxGainLoss: { gainLossBase: '0', gainsBase: '0', lossesBase: '0', rowCount: '0' },
+} as const satisfies Record<string, Record<string, string>>
+
+async function loadFinanceAnalyticsReportForPage<Row>(
   filters: FinanceAnalyticsFilters,
   load: (filters: FinanceAnalyticsFilters) => Promise<FinanceAnalyticsReport<Row>>,
   emptyTotals: Record<string, string>,
@@ -47,4 +64,24 @@ export async function loadFinanceAnalyticsReportForPage<Row>(
     if (isSourceScanTooLargeError(error)) return emptyFinanceAnalyticsReportForSourceLimit<Row>(filters, error, emptyTotals)
     throw error
   }
+}
+
+export function loadVatReportForPage(filters: FinanceAnalyticsFilters, load = getVatReport) {
+  return loadFinanceAnalyticsReportForPage(filters, load, financeAnalyticsEmptyTotals.vat)
+}
+
+export function loadArAgingReportForPage(filters: FinanceAnalyticsFilters, load = getArAgingReport) {
+  return loadFinanceAnalyticsReportForPage(filters, load, financeAnalyticsEmptyTotals.arAging)
+}
+
+export function loadApAgingReportForPage(filters: FinanceAnalyticsFilters, load = getApAgingReport) {
+  return loadFinanceAnalyticsReportForPage(filters, load, financeAnalyticsEmptyTotals.apAging)
+}
+
+export function loadCurrencySummaryReportForPage(filters: FinanceAnalyticsFilters, load = getCurrencySummaryReport) {
+  return loadFinanceAnalyticsReportForPage(filters, load, financeAnalyticsEmptyTotals.currencySummary)
+}
+
+export function loadFxGainLossReportForPage(filters: FinanceAnalyticsFilters, load = getFxGainLossReport) {
+  return loadFinanceAnalyticsReportForPage(filters, load, financeAnalyticsEmptyTotals.fxGainLoss)
 }

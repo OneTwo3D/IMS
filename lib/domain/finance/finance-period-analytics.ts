@@ -4,7 +4,7 @@ import { getAccountingSettings } from '@/lib/accounting'
 import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import { roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { dateOnly, defaultUtcDateWindow, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
+import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { SourceScanTooLargeError, assertSourceLimit } from '@/lib/security/source-scan-error'
 
@@ -247,13 +247,13 @@ async function baseCurrencyFromDeps(deps?: FinanceAnalyticsDeps): Promise<string
   return deps?.client ? DEFAULT_BASE_CURRENCY : getBaseCurrencyCode()
 }
 
-function period(filters: FinanceAnalyticsFilters, now: Date): { dateFrom: Date; dateTo: Date } {
+function period(filters: FinanceAnalyticsFilters, now: Date): { dateFrom: Date; dateTo: Date; dateToExclusive: Date } {
   const { dateFrom: defaultFrom, dateTo: defaultTo } = defaultUtcDateWindow(now, DEFAULT_PERIOD_DAYS)
   const dateTo = parseDateOnly(filters.dateTo, defaultTo, { endOfDay: true })
   const dateFrom = parseDateOnly(filters.dateFrom, defaultFrom)
   return dateFrom.getTime() <= dateTo.getTime()
-    ? { dateFrom, dateTo }
-    : { dateFrom: startOfUtcDay(dateTo), dateTo }
+    ? { dateFrom, dateTo, dateToExclusive: exclusiveEndOfUtcDay(dateTo) }
+    : { dateFrom: startOfUtcDay(dateTo), dateTo, dateToExclusive: exclusiveEndOfUtcDay(dateTo) }
 }
 
 function clampPageSize(value: number | undefined): number {
@@ -395,7 +395,7 @@ export async function getVatReport(
     client.salesOrderLine.findMany({
       where: {
         order: {
-          invoicedAt: { gte: window.dateFrom, lte: window.dateTo },
+          invoicedAt: { gte: window.dateFrom, lt: window.dateToExclusive },
           status: { not: SalesOrderStatus.CANCELLED },
           archived: false,
         },
@@ -412,7 +412,7 @@ export async function getVatReport(
     }) as Promise<SalesOrderLineTaxRow[]>,
     client.purchaseInvoice.findMany({
       where: {
-        invoiceDate: { gte: window.dateFrom, lte: window.dateTo },
+        invoiceDate: { gte: window.dateFrom, lt: window.dateToExclusive },
       },
       select: {
         invoiceDate: true,
@@ -584,15 +584,16 @@ export async function getArAgingReport(
   const bucketResult = bucketConfig(filters)
   const buckets = bucketResult.buckets
   const asOf = window.dateTo
+  const asOfExclusive = window.dateToExclusive
   const orders = await client.salesOrder.findMany({
     where: {
       status: { not: SalesOrderStatus.CANCELLED },
       archived: false,
       OR: [
-        { invoicedAt: { lte: asOf } },
-        { invoicedAt: null, createdAt: { lte: asOf } },
+        { invoicedAt: { lt: asOfExclusive } },
+        { invoicedAt: null, createdAt: { lt: asOfExclusive } },
       ],
-      AND: [{ OR: [{ paidAt: null }, { paidAt: { gt: asOf } }, { payments: { some: { refundId: null, paidAt: { lte: asOf } } } }] }],
+      AND: [{ OR: [{ paidAt: null }, { paidAt: { gte: asOfExclusive } }, { payments: { some: { refundId: null, paidAt: { lt: asOfExclusive } } } }] }],
     },
     select: {
       id: true,
@@ -625,10 +626,10 @@ export async function getArAgingReport(
   }>()
   for (const order of orders) {
     const paidBase = order.payments
-      .filter((payment) => payment.refundId == null && payment.paidAt.getTime() <= asOf.getTime())
+      .filter((payment) => payment.refundId == null && payment.paidAt.getTime() < asOfExclusive.getTime())
       .reduce((total, payment) => total.add(toDecimal(payment.amount)), new Prisma.Decimal(0))
     const refundedBase = order.payments
-      .filter((payment) => payment.refundId != null && payment.paidAt.getTime() <= asOf.getTime())
+      .filter((payment) => payment.refundId != null && payment.paidAt.getTime() < asOfExclusive.getTime())
       .reduce((total, payment) => total.add(toDecimal(payment.amount).abs()), new Prisma.Decimal(0))
     const rawOutstanding = toDecimal(order.totalBase).sub(paidBase).sub(refundedBase)
     const outstanding = Prisma.Decimal.max(new Prisma.Decimal(0), rawOutstanding)
@@ -660,17 +661,17 @@ export async function getArAgingReport(
     row.bucket4 = row.bucket4.add(bucket.bucket4)
     row.outstandingBase = row.outstandingBase.add(outstanding)
     row.documentIds.add(order.id)
-    const lastPayment = order.payments.filter((payment) => payment.refundId == null && payment.paidAt.getTime() <= asOf.getTime()).sort((a, b) => b.paidAt.getTime() - a.paidAt.getTime())[0]
+    const lastPayment = order.payments.filter((payment) => payment.refundId == null && payment.paidAt.getTime() < asOfExclusive.getTime()).sort((a, b) => b.paidAt.getTime() - a.paidAt.getTime())[0]
     if (lastPayment && (!row.lastPaymentDate || lastPayment.paidAt.getTime() > row.lastPaymentDate.getTime())) row.lastPaymentDate = lastPayment.paidAt
   }
   const rows = agingRowsFromAccumulators(byCustomer, baseCurrency)
   const outstandingBase = rows.reduce((total, row) => total.add(row.outstandingBase), new Prisma.Decimal(0))
   const creditBalanceBase = orders.reduce((total, order) => {
     const paidBase = order.payments
-      .filter((payment) => payment.refundId == null && payment.paidAt.getTime() <= asOf.getTime())
+      .filter((payment) => payment.refundId == null && payment.paidAt.getTime() < asOfExclusive.getTime())
       .reduce((sum, payment) => sum.add(toDecimal(payment.amount)), new Prisma.Decimal(0))
     const refundedBase = order.payments
-      .filter((payment) => payment.refundId != null && payment.paidAt.getTime() <= asOf.getTime())
+      .filter((payment) => payment.refundId != null && payment.paidAt.getTime() < asOfExclusive.getTime())
       .reduce((sum, payment) => sum.add(toDecimal(payment.amount).abs()), new Prisma.Decimal(0))
     const rawOutstanding = toDecimal(order.totalBase).sub(paidBase).sub(refundedBase)
     return rawOutstanding.lt(0) ? total.add(rawOutstanding.abs()) : total
@@ -700,10 +701,11 @@ export async function getApAgingReport(
   const bucketResult = bucketConfig(filters)
   const buckets = bucketResult.buckets
   const asOf = window.dateTo
+  const asOfExclusive = window.dateToExclusive
   const invoices = await client.purchaseInvoice.findMany({
     where: {
-      invoiceDate: { lte: asOf },
-      OR: [{ paidAt: null }, { paidAt: { gt: asOf } }],
+      invoiceDate: { lt: asOfExclusive },
+      OR: [{ paidAt: null }, { paidAt: { gte: asOfExclusive } }],
     },
     select: {
       id: true,
@@ -788,7 +790,7 @@ export async function getCurrencySummaryReport(
       where: {
         status: { not: SalesOrderStatus.CANCELLED },
         archived: false,
-        invoicedAt: { gte: window.dateFrom, lte: window.dateTo },
+        invoicedAt: { gte: window.dateFrom, lt: window.dateToExclusive },
       },
       select: {
         id: true,
@@ -802,7 +804,7 @@ export async function getCurrencySummaryReport(
     }) as Promise<SalesOrderCurrencyRow[]>,
     client.purchaseInvoice.findMany({
       where: {
-        invoiceDate: { gte: window.dateFrom, lte: window.dateTo },
+        invoiceDate: { gte: window.dateFrom, lt: window.dateToExclusive },
       },
       select: {
         id: true,
@@ -921,9 +923,9 @@ export async function getCurrencySummaryReport(
   ], options.paginate !== false)
 }
 
-async function loadFxRates(client: FinanceAnalyticsClient, baseCurrency: string, window: { dateTo: Date }): Promise<FxRateRow[]> {
+async function loadFxRates(client: FinanceAnalyticsClient, baseCurrency: string, window: { dateToExclusive: Date }): Promise<FxRateRow[]> {
   return client.fxRate.findMany({
-    where: { fromCurrency: baseCurrency, fetchedAt: { lte: window.dateTo } },
+    where: { fromCurrency: baseCurrency, fetchedAt: { lt: window.dateToExclusive } },
     select: { fromCurrency: true, toCurrency: true, rate: true, fetchedAt: true },
     orderBy: { fetchedAt: 'desc' },
     take: SOURCE_ROW_LIMIT + 1,
@@ -944,7 +946,7 @@ export async function getFxGainLossReport(
       where: {
         refundId: null,
         currency: { not: baseCurrency },
-        paidAt: { gte: window.dateFrom, lte: window.dateTo },
+        paidAt: { gte: window.dateFrom, lt: window.dateToExclusive },
       },
       select: {
         id: true,
@@ -968,7 +970,7 @@ export async function getFxGainLossReport(
     }) as Promise<SalesPaymentFxRow[]>,
     client.purchaseInvoice.findMany({
       where: {
-        paidAt: { gte: window.dateFrom, lte: window.dateTo },
+        paidAt: { gte: window.dateFrom, lt: window.dateToExclusive },
         po: { currency: { not: baseCurrency } },
       },
       select: {

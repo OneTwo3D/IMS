@@ -16,25 +16,39 @@ export function endOfUtcDay(date: Date): Date {
   return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate(), 23, 59, 59, 999))
 }
 
+export function exclusiveEndOfUtcDay(date: Date): Date {
+  return new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), date.getUTCDate() + 1))
+}
+
 export function subtractUtcDays(date: Date, days: number): Date {
   const next = new Date(date)
   next.setUTCDate(next.getUTCDate() - days)
   return next
 }
 
+function parseValidDateOnly(value: string): Date | null {
+  const match = DATE_ONLY_RE.exec(value)
+  if (!match) return null
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const parsed = new Date(Date.UTC(year, month - 1, day))
+  return parsed.getUTCFullYear() === year && parsed.getUTCMonth() + 1 === month && parsed.getUTCDate() === day
+    ? parsed
+    : null
+}
+
 export function parseDateOnly(value: string | undefined, fallback: Date, options: { endOfDay?: boolean } = {}): Date {
   if (!value) return fallback
-  const match = DATE_ONLY_RE.exec(value)
-  if (!match) return fallback
-  const parsed = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])))
+  const parsed = parseValidDateOnly(value)
+  if (!parsed) return fallback
   return options.endOfDay ? endOfUtcDay(parsed) : startOfUtcDay(parsed)
 }
 
 export function parseOptionalDateOnly(value: string | undefined, options: { endOfDay?: boolean } = {}): Date | undefined {
   if (!value) return undefined
-  const match = DATE_ONLY_RE.exec(value)
-  if (!match) return undefined
-  const parsed = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])))
+  const parsed = parseValidDateOnly(value)
+  if (!parsed) return undefined
   return options.endOfDay ? endOfUtcDay(parsed) : startOfUtcDay(parsed)
 }
 

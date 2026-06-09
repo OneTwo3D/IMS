@@ -1,6 +1,6 @@
-import { getOpenPurchaseOrdersReport, type OpenPurchaseOrderReportRow } from '@/lib/domain/purchasing/purchasing-analytics'
+import type { OpenPurchaseOrderReportRow } from '@/lib/domain/purchasing/purchasing-analytics'
 import { PurchasingAnalyticsReportPage, type PurchasingAnalyticsColumn } from '../_components/purchasing-analytics-report'
-import { loadPurchasingAnalyticsReportForPage, purchasingAnalyticsFiltersForUi, purchasingAnalyticsFiltersFromSearch, type PurchasingAnalyticsSearchParams } from '../_components/purchasing-analytics-page-utils'
+import { loadOpenPurchaseOrdersReportForPage, purchasingAnalyticsFiltersForUi, purchasingAnalyticsFiltersFromSearch, type PurchasingAnalyticsSearchParams } from '../_components/purchasing-analytics-page-utils'
 
 type Props = {
   searchParams: Promise<PurchasingAnalyticsSearchParams>
@@ -19,7 +19,7 @@ const columns: Array<PurchasingAnalyticsColumn<OpenPurchaseOrderReportRow>> = [
 
 export default async function OpenPurchaseOrdersAnalyticsPage({ searchParams }: Props) {
   const filters = purchasingAnalyticsFiltersFromSearch(await searchParams)
-  const report = await loadPurchasingAnalyticsReportForPage(filters, getOpenPurchaseOrdersReport, { outstandingValueBase: '0', outstandingQty: '0', overdue: '0' })
+  const report = await loadOpenPurchaseOrdersReportForPage(filters)
   return (
     <PurchasingAnalyticsReportPage
       title="Open Purchase Orders"

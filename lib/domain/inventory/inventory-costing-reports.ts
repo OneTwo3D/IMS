@@ -11,7 +11,7 @@ import { getOnHandAsOf, type OnHandAsOfRow } from '@/lib/domain/inventory/get-on
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { calculateInventoryTurnover, normalizeVelocityWindow } from '@/lib/domain/inventory/velocity'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { dateOnly as utcDateOnly, parseDateOnly as parseUtcDateOnly, subtractUtcDays } from '@/lib/domain/math/date-window'
+import { dateOnly as utcDateOnly, exclusiveEndOfUtcDay, parseDateOnly as parseUtcDateOnly, subtractUtcDays } from '@/lib/domain/math/date-window'
 import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
 import { getXeroSettings } from '@/lib/connectors/xero/settings'
 import { syncXeroAccountBalanceSnapshots } from '@/lib/connectors/xero/account-balances'
@@ -1107,9 +1107,10 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
   const dateTo = filters.dateTo ?? today()
   const from = parseDateOnly(dateFrom, daysAgo(30))
   const to = parseDateOnly(dateTo, today(), true)
+  const toExclusive = exclusiveEndOfUtcDay(to)
   const groupBy = isCogsGroupBy(filters.groupBy) ? filters.groupBy : 'product'
   const cogsWhere: Prisma.CogsEntryWhereInput = {
-    createdAt: { gte: from, lte: to },
+    createdAt: { gte: from, lt: toExclusive },
     movement: {
       // COGS currently comes from outbound inventory consumption. Those
       // movements leave stock through fromWarehouseId; extend this if a future
@@ -1267,6 +1268,7 @@ export async function getInventoryTurnoverReport(filters: InventoryCostingFilter
   const window = normalizeVelocityWindow({ dateFrom, dateTo })
   const from = window.dateFrom
   const to = window.dateTo
+  const toExclusive = exclusiveEndOfUtcDay(to)
   const snapshotFrom = window.dateFrom
   const snapshotTo = window.dateTo
   const groupBy = isInventoryTurnoverGroupBy(filters.groupBy) ? filters.groupBy : 'product'
@@ -1275,7 +1277,7 @@ export async function getInventoryTurnoverReport(filters: InventoryCostingFilter
 
   const cogsRows: CogsEntryRow[] = await client.cogsEntry.findMany({
     where: {
-      createdAt: { gte: from, lte: to },
+      createdAt: { gte: from, lt: toExclusive },
       movement: {
         type: StockMovementType.SALE_DISPATCH,
         ...(filters.warehouseId ? { fromWarehouseId: filters.warehouseId } : {}),
@@ -1439,9 +1441,10 @@ export async function getLandedCostReport(filters: InventoryCostingFilters = {},
   const dateTo = filters.dateTo ?? today()
   const from = parseDateOnly(dateFrom, daysAgo(90))
   const to = parseDateOnly(dateTo, today(), true)
+  const toExclusive = exclusiveEndOfUtcDay(to)
   const landedCostWhere: Prisma.PurchaseOrderLineWhereInput = {
     po: {
-      createdAt: { gte: from, lte: to },
+      createdAt: { gte: from, lt: toExclusive },
       ...(filters.landedCostMethod ? { landedCostMethod: filters.landedCostMethod } : {}),
       ...(filters.supplierId ? { supplierId: filters.supplierId } : {}),
       ...(filters.warehouseId ? { destinationWarehouseId: filters.warehouseId } : {}),

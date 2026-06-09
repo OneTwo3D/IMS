@@ -1,15 +1,15 @@
 import type { Metadata } from 'next'
 import { requireRole } from '@/lib/auth/server'
-import { getFulfillmentAnalyticsReport, type FulfillmentReportRow } from '@/lib/domain/sales/sales-fulfillment-analytics'
+import type { FulfillmentReportRow } from '@/lib/domain/sales/sales-fulfillment-analytics'
 import { SalesAnalyticsReportPage, type SalesAnalyticsColumn } from '../_components/sales-analytics-report'
-import { loadSalesAnalyticsReportForPage, salesAnalyticsFiltersForUi, salesAnalyticsFiltersFromSearch, type SalesAnalyticsSearchParams } from '../_components/sales-analytics-page-utils'
+import { loadFulfillmentAnalyticsReportForPage, salesAnalyticsFiltersForUi, salesAnalyticsFiltersFromSearch, type SalesAnalyticsSearchParams } from '../_components/sales-analytics-page-utils'
 
 export const metadata: Metadata = { title: 'Fulfillment KPIs' }
 
 export default async function FulfillmentAnalyticsPage({ searchParams }: { searchParams: Promise<SalesAnalyticsSearchParams> }) {
   await requireRole('ADMIN', 'MANAGER', 'FINANCE')
   const filters = salesAnalyticsFiltersFromSearch(await searchParams)
-  const report = await loadSalesAnalyticsReportForPage(filters, getFulfillmentAnalyticsReport, { shippedOrders: '0', shippedQty: '0' })
+  const report = await loadFulfillmentAnalyticsReportForPage(filters)
   const columns: Array<SalesAnalyticsColumn<FulfillmentReportRow>> = [
     { key: 'metric', label: 'Metric', render: (row) => row.metric },
     { key: 'value', label: 'Value', align: 'right', render: (row) => row.value },

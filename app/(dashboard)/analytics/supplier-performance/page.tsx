@@ -1,6 +1,6 @@
-import { getSupplierPerformanceReport, type SupplierPerformanceReportRow } from '@/lib/domain/purchasing/purchasing-analytics'
+import type { SupplierPerformanceReportRow } from '@/lib/domain/purchasing/purchasing-analytics'
 import { PurchasingAnalyticsReportPage, type PurchasingAnalyticsColumn } from '../_components/purchasing-analytics-report'
-import { loadPurchasingAnalyticsReportForPage, purchasingAnalyticsFiltersForUi, purchasingAnalyticsFiltersFromSearch, type PurchasingAnalyticsSearchParams } from '../_components/purchasing-analytics-page-utils'
+import { loadSupplierPerformanceReportForPage, purchasingAnalyticsFiltersForUi, purchasingAnalyticsFiltersFromSearch, type PurchasingAnalyticsSearchParams } from '../_components/purchasing-analytics-page-utils'
 
 type Props = {
   searchParams: Promise<PurchasingAnalyticsSearchParams>
@@ -21,7 +21,7 @@ const columns: Array<PurchasingAnalyticsColumn<SupplierPerformanceReportRow>> = 
 
 export default async function SupplierPerformanceAnalyticsPage({ searchParams }: Props) {
   const filters = purchasingAnalyticsFiltersFromSearch(await searchParams)
-  const report = await loadPurchasingAnalyticsReportForPage(filters, getSupplierPerformanceReport, { supplierCount: '0', receipts: '0' })
+  const report = await loadSupplierPerformanceReportForPage(filters)
   return (
     <PurchasingAnalyticsReportPage
       title="Supplier Performance"

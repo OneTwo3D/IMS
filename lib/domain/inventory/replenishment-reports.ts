@@ -1,7 +1,7 @@
 import { Prisma, ProductType, PurchaseOrderStatus, SalesOrderStatus, StockMovementType } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { dateOnly, defaultUtcDateWindow } from '@/lib/domain/math/date-window'
+import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay } from '@/lib/domain/math/date-window'
 import { calculateDailyVelocity, type VelocitySaleInput } from '@/lib/domain/inventory/velocity'
 import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { OPERATIONAL_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
@@ -490,15 +490,16 @@ function earliestInboundDateByProduct(lines: OpenPoLineRow[]): Map<string, strin
   return new Map([...dates.entries()].map(([key, value]) => [key, dateOnly(value)]))
 }
 
-function demandWindow(now: Date, days: number): { dateFrom: Date; dateTo: Date } {
-  return defaultUtcDateWindow(now, days)
+function demandWindow(now: Date, days: number): { dateFrom: Date; dateTo: Date; dateToExclusive: Date } {
+  const window = defaultUtcDateWindow(now, days)
+  return { ...window, dateToExclusive: exclusiveEndOfUtcDay(window.dateTo) }
 }
 
-async function loadVelocityRows(client: ReplenishmentReportClient, filters: StockPositionFilters, window: { dateFrom: Date; dateTo: Date }): Promise<VelocitySaleInput[]> {
+async function loadVelocityRows(client: ReplenishmentReportClient, filters: StockPositionFilters, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<VelocitySaleInput[]> {
   const movements = await client.stockMovement.findMany({
     where: {
       type: StockMovementType.SALE_DISPATCH,
-      createdAt: { gte: window.dateFrom, lte: window.dateTo },
+      createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
       product: productWhere(filters),
     },
     select: {
