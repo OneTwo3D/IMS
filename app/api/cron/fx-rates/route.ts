@@ -8,7 +8,7 @@ import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/
 export async function GET(request: Request) {
   const err = await verifyCron(request)
   if (err) return err
-  const rateLimitErr = await enforceCronRateLimit('fx-rates')
+  const rateLimitErr = await enforceCronRateLimit('fx-rates', { request })
   if (rateLimitErr) return rateLimitErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance

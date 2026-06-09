@@ -33,7 +33,7 @@ function getDbConfig() {
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
-  const rateLimitErr = await enforceCronRateLimit('backup')
+  const rateLimitErr = await enforceCronRateLimit('backup', { request })
   if (rateLimitErr) return rateLimitErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance

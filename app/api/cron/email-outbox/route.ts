@@ -7,7 +7,7 @@ import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 export async function GET(request: Request) {
   const err = await verifyCron(request)
   if (err) return err
-  const rateLimitErr = await enforceCronRateLimit('email-outbox')
+  const rateLimitErr = await enforceCronRateLimit('email-outbox', { request })
   if (rateLimitErr) return rateLimitErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance

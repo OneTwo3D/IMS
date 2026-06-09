@@ -91,8 +91,9 @@ export function buildDailyBatchReferenceId(
   date: string,
   entityIds: string[],
 ): string {
+  const stableEntityIds = [...entityIds].sort()
   const digest = createHash('sha256')
-    .update(entityIds.join('|'))
+    .update(stableEntityIds.join('|'))
     .digest('hex')
     .slice(0, 8)
   return `${group}-${date}-${digest}`
@@ -553,6 +554,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
               lines: journalLines,
               orderDeferrals,
               batchReferenceId: referenceId,
+              batchDate: today,
+              batchGroup: 'A1',
+              batchEntityCount: orders.length,
+              splitBatch: result.hasMore.groupA1,
               _postingMode: 'submitted',
             },
           })
@@ -584,7 +589,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         inventoryAllocatedDate: null,
         status: { in: ['ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'PARTIALLY_REFUNDED'] },
       },
-      orderBy: { revenueDeferredDate: 'asc' },
+      orderBy: [{ revenueDeferredDate: 'asc' }, { id: 'asc' }],
       select: {
         id: true,
         orderNumber: true,
@@ -673,6 +678,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
                 { accountCode: settings.xero_inventory_account, description: `Daily inventory allocation — ${orders.length} order(s)`, credit: totalAllocatedValueNumber },
               ],
               batchReferenceId: referenceId,
+              batchDate: today,
+              batchGroup: 'A2',
+              batchEntityCount: orders.length,
+              splitBatch: result.hasMore.groupA2,
               _postingMode: 'submitted',
             },
           })
@@ -1062,6 +1071,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             narration: `Daily shipment batch: ${processedShipmentCount} shipment(s), revenue £${totalRevenue.toFixed(2)}, COGS £${totalCogsNumber.toFixed(2)}`,
             lines: journalLines,
             batchReferenceId: referenceId,
+            batchDate: today,
+            batchGroup: 'B',
+            batchEntityCount: processedShipmentCount,
+            splitBatch: result.hasMore.groupB,
             _postingMode: 'submitted',
           },
         })

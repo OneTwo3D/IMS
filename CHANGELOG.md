@@ -10,6 +10,8 @@ This repository uses an `x.y.z` release scheme.
 
 ### Developer-facing
 
+- **Cron endpoint rate limits now include high-frequency headroom and source-IP scoping.** Daily/hourly jobs default to one accepted run per hour, 5-minute jobs allow 15 runs per hour, and 15-minute jobs allow 6 runs per hour so normal scheduling jitter is not denied. Multi-replica deployments must use `RATE_LIMIT_BACKEND=redis` with `REDIS_URL` for cluster-wide login/TOTP and cron throttles.
+- **High-volume Xero daily batch journals can split into multiple entries per day.** Tenants posting more than `XERO_DAILY_BATCH_LIMIT` eligible orders or shipments in a daily-batch group receive multiple Xero journals for the same business date. References include deterministic hash suffixes, and reconciliation should sum entries by the shared date/group prefix or payload metadata (`batchDate`, `batchGroup`, `batchReferenceId`).
 - **Account-balance snapshots now have a daily cron dependency.** Installations
   should schedule `GET /api/cron/account-balance-snapshot` daily, before
   accounting reports are reviewed, so inventory and COGS GL variance reports

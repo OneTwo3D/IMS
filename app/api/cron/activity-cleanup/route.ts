@@ -10,7 +10,7 @@ import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
 export async function GET(request: Request) {
   const err = await verifyCron(request)
   if (err) return err
-  const rateLimitErr = await enforceCronRateLimit('activity-cleanup')
+  const rateLimitErr = await enforceCronRateLimit('activity-cleanup', { request })
   if (rateLimitErr) return rateLimitErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance

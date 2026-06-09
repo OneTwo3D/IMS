@@ -366,8 +366,8 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ### P6.1 — Cron endpoints rate-limited
 - **Status:** Complete.
 - **Files:** `app/api/cron/*`
-- **Fix:** Apply shared cron rate limiting after successful cron auth: daily/hourly jobs default to one accepted run per job per hour, high-frequency jobs use schedule-compatible hourly quotas, and rate-limited requests return `429` + `Retry-After`.
-- **Tests:** `tests/security/cron-rate-limit.test.ts` covers the 429 helper response and `tests/security/api-route-auth-inventory.test.ts` asserts every cron-secret route calls `enforceCronRateLimit` after `verifyCron`.
+- **Fix:** Apply shared cron rate limiting after successful cron auth: daily/hourly jobs default to one accepted run per job per hour, high-frequency jobs use source-IP-aware schedule-compatible hourly quotas with jitter headroom, and rate-limited requests return `429` + `Retry-After`. Multi-replica installs must use the Redis rate-limit backend for cluster-wide cron throttles.
+- **Tests:** `tests/security/cron-rate-limit.test.ts` covers the 429 helper response, source-IP keying, and 5-minute quota headroom; `tests/security/api-route-auth-inventory.test.ts` asserts every cron-secret route calls `enforceCronRateLimit` after `verifyCron`.
 
 ### P6.2 — Supplier portal cross-tenant boundary
 - **File:** `app/actions/supplier-portal.ts:77–89`
@@ -439,8 +439,8 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 ### P7.6 — Xero daily batch sync batch-size cap
 - **Status:** Complete.
 - **File:** `app/api/cron/accounting-daily-batch/route.ts:24`
-- **Fix:** Xero daily batch groups now query `limit + 1`, process at most `XERO_DAILY_BATCH_LIMIT` rows per group per run, leave remaining marker-null rows eligible for the next run, use deterministic batch-reference suffixes for split journals, and report `batchLimit` plus per-group `hasMore` in the cron/activity summary. CronRun already records duration.
-- **Tests:** `tests/xero-daily-batch.test.ts` covers limit normalization and the two-run window behavior.
+- **Fix:** Xero daily batch groups now query `limit + 1`, process at most `XERO_DAILY_BATCH_LIMIT` rows per group per run, leave remaining marker-null rows eligible for the next run, use stable ordering plus deterministic batch-reference suffixes for split journals, include batch metadata for finance reconciliation, and report `batchLimit` plus per-group `hasMore` in the cron/activity summary. CronRun already records duration.
+- **Tests:** `tests/xero-daily-batch.test.ts` covers limit normalization, deterministic reference IDs, and the two-run window behavior.
 
 ### P7.7 — Backup manifest
 - **Status:** Complete.

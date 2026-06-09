@@ -29,6 +29,10 @@ test('Xero daily batch window processes only the first limit rows and signals re
 })
 
 test('Xero daily batch reference ids distinguish split batches for the same date', () => {
+  assert.equal(
+    buildDailyBatchReferenceId('A2', '2026-06-09', ['order-3', 'order-1', 'order-2']),
+    buildDailyBatchReferenceId('A2', '2026-06-09', ['order-1', 'order-2', 'order-3']),
+  )
   assert.notEqual(
     buildDailyBatchReferenceId('A1', '2026-06-09', ['order-1', 'order-2']),
     buildDailyBatchReferenceId('A1', '2026-06-09', ['order-3']),

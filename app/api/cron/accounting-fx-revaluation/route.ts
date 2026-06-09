@@ -7,7 +7,7 @@ import { runArApFxRevaluation } from '@/lib/accounting-fx-revaluation'
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
-  const rateLimitErr = await enforceCronRateLimit('accounting-fx-revaluation')
+  const rateLimitErr = await enforceCronRateLimit('accounting-fx-revaluation', { request })
   if (rateLimitErr) return rateLimitErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance

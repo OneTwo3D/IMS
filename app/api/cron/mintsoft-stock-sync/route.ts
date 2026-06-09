@@ -10,7 +10,7 @@ import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
-  const rateLimitErr = await enforceCronRateLimit('mintsoft-stock-sync')
+  const rateLimitErr = await enforceCronRateLimit('mintsoft-stock-sync', { request })
   if (rateLimitErr) return rateLimitErr
 
   const maintenance = await getMaintenanceModeResponse('cron')

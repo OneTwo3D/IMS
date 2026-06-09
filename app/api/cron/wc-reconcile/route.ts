@@ -11,7 +11,7 @@ import { appendCronRunId, cronRunResponseInit, runCronWithLogging } from '@/lib/
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
-  const rateLimitErr = await enforceCronRateLimit('wc-reconcile')
+  const rateLimitErr = await enforceCronRateLimit('wc-reconcile', { request })
   if (rateLimitErr) return rateLimitErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance

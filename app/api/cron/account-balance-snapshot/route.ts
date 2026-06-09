@@ -47,7 +47,7 @@ export async function handleAccountBalanceSnapshotCron(
 ) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
-  const rateLimitErr = await enforceCronRateLimit('account-balance-snapshot', { checker: options.checkCronRateLimit })
+  const rateLimitErr = await enforceCronRateLimit('account-balance-snapshot', { request, checker: options.checkCronRateLimit })
   if (rateLimitErr) return rateLimitErr
 
   const getMaintenanceResponse = options.getMaintenanceResponse ?? getMaintenanceModeResponse

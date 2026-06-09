@@ -34,7 +34,7 @@ export async function handleInventorySnapshotCron(
 ) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
-  const rateLimitErr = await enforceCronRateLimit('inventory-snapshot', { checker: options.checkCronRateLimit })
+  const rateLimitErr = await enforceCronRateLimit('inventory-snapshot', { request, checker: options.checkCronRateLimit })
   if (rateLimitErr) return rateLimitErr
 
   const getMaintenanceResponse = options.getMaintenanceResponse ?? getMaintenanceModeResponse

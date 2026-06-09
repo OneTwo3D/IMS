@@ -11,7 +11,7 @@ export const runtime = 'nodejs'
 export async function GET(request: Request) {
   const cronErr = await verifyCron(request)
   if (cronErr) return cronErr
-  const rateLimitErr = await enforceCronRateLimit('invariant-check')
+  const rateLimitErr = await enforceCronRateLimit('invariant-check', { request })
   if (rateLimitErr) return rateLimitErr
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
