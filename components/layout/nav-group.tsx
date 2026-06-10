@@ -8,9 +8,12 @@ import { cn } from '@/lib/utils'
 import type { LucideIcon } from 'lucide-react'
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 
-interface NavChild {
-  href: string
-  label: string
+type NavLink = { href: string; label: string }
+type NavHeading = { heading: string }
+export type NavChild = NavLink | NavHeading
+
+function isLink(c: NavChild): c is NavLink {
+  return 'href' in c
 }
 
 interface NavGroupProps {
@@ -24,9 +27,10 @@ interface NavGroupProps {
 
 export function NavGroup({ label, icon: Icon, items, collapsed, onExpand, onNavigate }: NavGroupProps) {
   const pathname = usePathname()
-  const isChildActive = (c: NavChild) =>
-    pathname === c.href || (pathname.startsWith(c.href + '/') && !items.some((other) => other.href !== c.href && pathname.startsWith(other.href)))
-  const isAnyChildActive = items.some(isChildActive)
+  const linkItems = items.filter(isLink)
+  const isChildActive = (c: NavLink) =>
+    pathname === c.href || (pathname.startsWith(c.href + '/') && !linkItems.some((other) => other.href !== c.href && pathname.startsWith(other.href)))
+  const isAnyChildActive = linkItems.some(isChildActive)
   const [expandedByUser, setExpandedByUser] = useState(false)
   const open = isAnyChildActive || expandedByUser
 
@@ -76,7 +80,17 @@ export function NavGroup({ label, icon: Icon, items, collapsed, onExpand, onNavi
 
       {open && (
         <div className="ml-4 mt-0.5 flex flex-col gap-0.5 border-l border-border pl-3">
-          {items.map((child) => {
+          {items.map((child, idx) => {
+            if (!isLink(child)) {
+              return (
+                <div
+                  key={`h-${idx}-${child.heading}`}
+                  className="mt-2 first:mt-0 px-2 pt-1 pb-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70 select-none"
+                >
+                  {child.heading}
+                </div>
+              )
+            }
             const isActive = isChildActive(child)
             return (
               <Link

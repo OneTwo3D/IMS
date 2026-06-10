@@ -44,6 +44,8 @@ export const REPORT_ACCESS_GROUPS = [
   canAccess: (role: string) => boolean
 }>
 
+export type SidebarItem = SidebarLink | { heading: string }
+
 export function uniqueLinks(links: readonly SidebarLink[]): SidebarLink[] {
   const seen = new Set<string>()
   return links.filter((link) => {
@@ -53,16 +55,35 @@ export function uniqueLinks(links: readonly SidebarLink[]): SidebarLink[] {
   })
 }
 
-export function getSidebarAnalyticsChildren(userRole: string): SidebarLink[] {
+export function getSidebarAnalyticsChildren(userRole: string): SidebarItem[] {
   const can = (p: Permission) => hasPermission(userRole, p)
-  return uniqueLinks([
-    ...(can('analytics') ? BASE_ANALYTICS_LINKS : []),
-    ...REPORT_ACCESS_GROUPS.flatMap(({ links, canAccess }) => (canAccess(userRole) ? [...links] : [])),
-    ...(can('analytics.inventory_ledger') ? INVENTORY_LEDGER_REPORT_LINKS : []),
-    ...(can('analytics.inventory_costing') ? INVENTORY_COSTING_REPORT_LINKS : []),
-  ])
+  const sections: Array<{ heading: string; links: readonly SidebarLink[] }> = [
+    { heading: 'Overview', links: can('analytics') ? BASE_ANALYTICS_LINKS : [] },
+    { heading: 'Stock Position', links: canAccessStockPositionReports(userRole) ? STOCK_POSITION_REPORT_LINKS : [] },
+    { heading: 'Inventory Ledger', links: can('analytics.inventory_ledger') ? INVENTORY_LEDGER_REPORT_LINKS : [] },
+    { heading: 'Inventory Costing', links: can('analytics.inventory_costing') ? INVENTORY_COSTING_REPORT_LINKS : [] },
+    { heading: 'Replenishment', links: canAccessReplenishmentReports(userRole) ? REPLENISHMENT_REPORT_LINKS : [] },
+    { heading: 'Sales', links: canAccessSalesAnalytics(userRole) ? SALES_ANALYTICS_LINKS : [] },
+    { heading: 'Purchasing', links: canAccessPurchasingAnalytics(userRole) ? PURCHASING_ANALYTICS_LINKS : [] },
+    { heading: 'Manufacturing', links: canAccessManufacturingAnalytics(userRole) ? MANUFACTURING_ANALYTICS_LINKS : [] },
+    { heading: 'Finance', links: canAccessFinanceAnalytics(userRole) ? FINANCE_ANALYTICS_LINKS : [] },
+  ]
+
+  const seen = new Set<string>()
+  const result: SidebarItem[] = []
+  for (const section of sections) {
+    const links = section.links.filter((link) => {
+      if (seen.has(link.href)) return false
+      seen.add(link.href)
+      return true
+    })
+    if (links.length === 0) continue
+    result.push({ heading: section.heading })
+    for (const link of links) result.push(link)
+  }
+  return result
 }
 
 export function shouldShowSidebarAnalyticsGroup(userRole: string): boolean {
-  return getSidebarAnalyticsChildren(userRole).length > 0
+  return getSidebarAnalyticsChildren(userRole).some((item) => 'href' in item)
 }
