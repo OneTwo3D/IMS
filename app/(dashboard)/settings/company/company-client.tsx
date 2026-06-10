@@ -170,7 +170,11 @@ export function CompanySettingsClient({ org, baseCurrencyLocked, numbering, emai
   function handleSaveEmail() {
     startEmailTransition(async () => {
       setEmailTestResult(null)
-      await saveEmailSettings(em)
+      const result = await saveEmailSettings(em)
+      if (!result.success) {
+        setEmailTestResult({ type: 'error', message: result.error ?? 'Failed to save email settings.' })
+        return
+      }
       showSaved('email')
     })
   }

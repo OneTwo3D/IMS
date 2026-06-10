@@ -19,6 +19,7 @@ import {
   saveAccountingSettings,
   syncAccountingAccountBalanceSnapshots,
   syncAccountingAccounts,
+  testAccountingConnection,
   triggerAccountingSync,
   type AccountingConnectorSettings,
   type AccountingSyncLogRow,
@@ -31,6 +32,7 @@ import {
 } from '@/app/actions/accounting-batch'
 import { savePaymentAccountMap } from '@/app/actions/accounting'
 import { updateTaxRate, type TaxRateRow } from '@/app/actions/settings'
+import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
 
 type AccountingAccount = { id: string; externalAccountId: string; code: string | null; name: string; type: string }
 
@@ -40,6 +42,7 @@ type Props = {
   settings: AccountingConnectorSettings & { secretMasked: boolean }
   connected: boolean
   tenantName?: string
+  connectionTest: IntegrationConnectionTestState
   accounts: AccountingAccount[]
   logs: AccountingSyncLogRow[]
   paymentMethodCombos: Array<{ paymentMethod: string; currency: string }>
@@ -122,7 +125,7 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
   return JSON.stringify(map)
 }
 
-export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: Props) {
+export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, connectionTest, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: Props) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [s, setS] = useState(init)
@@ -137,6 +140,7 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [accountsMsgLevel, setAccountsMsgLevel] = useState<'info' | 'warning' | 'error'>('info')
   const [connecting, setConnecting] = useState(false)
   const [savingConnection, setSavingConnection] = useState(false)
+  const [testingConnection, setTestingConnection] = useState(false)
   const [syncingAccounts, setSyncingAccounts] = useState(false)
   const [syncingBalances, setSyncingBalances] = useState(false)
   const [paymentMapRows, setPaymentMapRows] = useState<PaymentMapRow[]>(() => parsePaymentMap(paymentAccountMap))
@@ -257,6 +261,22 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
       window.location.href = result.redirectUrl
     } else {
       setConnectMsg(`Failed: ${result.error}`)
+    }
+  }
+
+  async function handleTestConnection() {
+    setConnectMsg(null)
+    setTestingConnection(true)
+    try {
+      const result = await testAccountingConnection()
+      if (result.success) {
+        setConnectMsg(result.message ?? `${connectorLabel} connection test passed.`)
+        router.refresh()
+      } else {
+        setConnectMsg(`Failed: ${result.error ?? `${connectorLabel} connection test failed.`}`)
+      }
+    } finally {
+      setTestingConnection(false)
     }
   }
 
@@ -472,6 +492,10 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
               {savingConnection ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <ArrowUpFromLine className="h-3 w-3 mr-1" />}
               Save Connection
             </Button>
+            <Button variant="outline" size="sm" onClick={handleTestConnection} disabled={connecting || savingConnection || testingConnection || !connected}>
+              {testingConnection ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <RefreshCw className="h-3 w-3 mr-1" />}
+              Test Connection
+            </Button>
             {connected ? (
               <Button variant="outline" size="sm" onClick={handleDisconnect} disabled={connecting || savingConnection}>
                 {connecting ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Link2Off className="h-3 w-3 mr-1" />}
@@ -485,6 +509,13 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
             )}
             {connectMsg && <span className="text-xs text-muted-foreground">{connectMsg}</span>}
           </div>
+          {connectionTest.status !== 'never' && (
+            <p className={`text-xs ${connectionTest.status === 'success' ? 'text-green-600' : 'text-destructive'}`}>
+              Last connection test: {connectionTest.status === 'success' ? 'passed' : 'failed'}
+              {connectionTest.testedAt ? ` at ${new Date(connectionTest.testedAt).toLocaleString('en-GB')}` : ''}
+              {connectionTest.message ? ` — ${connectionTest.message}` : ''}
+            </p>
+          )}
         </Card>
       )}
 

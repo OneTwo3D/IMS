@@ -8,6 +8,12 @@ import { getSettingValue, getSettingValues, serializeSettingValue } from '@/lib/
 import { DEFAULT_BASE_CURRENCY, getFallbackCurrencyMeta, isBaseCurrencyLocked } from '@/lib/base-currency'
 import { toIsoCountryCode } from '@/lib/countries'
 import { sendEmailWithSmtpSettings } from '@/lib/mailer'
+import {
+  assertIntegrationConnectionTestPassed,
+  buildIntegrationConnectionFingerprint,
+  integrationConnectionFingerprintSecret,
+  recordIntegrationConnectionTest,
+} from '@/lib/integration-connection-test-gate'
 
 // ---------------------------------------------------------------------------
 // Organisation
@@ -305,8 +311,32 @@ export async function getEmailSettings(): Promise<EmailSettings> {
   return result
 }
 
-export async function saveEmailSettings(data: EmailSettings): Promise<{ success: boolean }> {
+function isSmtpConfigured(data: EmailSettings): boolean {
+  return Boolean(data.smtp_host.trim() || data.smtp_user.trim() || data.smtp_pass.trim() || data.from_email.trim())
+}
+
+async function buildEmailConnectionFingerprint(data: EmailSettings): Promise<string> {
+  const storedPassword = data.smtp_pass.endsWith('***')
+    ? (await getSettingValue('email_smtp_pass')) ?? ''
+    : data.smtp_pass
+  return buildIntegrationConnectionFingerprint({
+    host: data.smtp_host.trim(),
+    port: data.smtp_port.trim(),
+    user: data.smtp_user.trim(),
+    pass: integrationConnectionFingerprintSecret(storedPassword),
+    secure: data.smtp_secure.trim(),
+    fromName: data.from_name.trim(),
+    fromEmail: data.from_email.trim(),
+    replyTo: data.reply_to.trim(),
+  })
+}
+
+export async function saveEmailSettings(data: EmailSettings): Promise<{ success: boolean; error?: string }> {
   await requirePermission('settings.company')
+  if (isSmtpConfigured(data)) {
+    const gate = await assertIntegrationConnectionTestPassed('smtp', await buildEmailConnectionFingerprint(data), 'SMTP')
+    if (!gate.ok) return { success: false, error: gate.error }
+  }
   const ops = Object.entries(data)
     .filter(([k, v]) => !(k === 'smtp_pass' && v.endsWith('***')))
     .map(([k, v]) =>
@@ -331,6 +361,7 @@ export async function sendTestEmailSettings(
   const storedPassword = data.smtp_pass.endsWith('***')
     ? (await getSettingValue('email_smtp_pass')) ?? ''
     : data.smtp_pass
+  const fingerprint = await buildEmailConnectionFingerprint(data)
 
   const result = await sendEmailWithSmtpSettings(
     {
@@ -361,6 +392,11 @@ export async function sendTestEmailSettings(
   )
 
   if (!result.success) {
+    await recordIntegrationConnectionTest('smtp', {
+      success: false,
+      fingerprint,
+      message: result.error ?? 'Failed to send test email.',
+    })
     await logActivity({
       entityType: 'SETTING',
       tag: 'settings',
@@ -370,6 +406,11 @@ export async function sendTestEmailSettings(
     })
     return { success: false, error: result.error ?? 'Failed to send test email.' }
   }
+  await recordIntegrationConnectionTest('smtp', {
+    success: true,
+    fingerprint,
+    message: `Test email sent to ${recipientEmail}.`,
+  })
 
   await logActivity({
     entityType: 'SETTING',

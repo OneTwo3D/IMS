@@ -38,6 +38,13 @@ import { hasPermission } from '@/lib/permissions'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getActiveSettingEnvOverrides, serializeSettingValue } from '@/lib/settings-store'
 import { maskSecret } from '@/lib/security/secret-mask'
+import {
+  buildIntegrationConnectionFingerprint,
+  getIntegrationConnectionTestState,
+  integrationConnectionFingerprintSecret,
+  recordIntegrationConnectionTest,
+  type IntegrationConnectionTestState,
+} from '@/lib/integration-connection-test-gate'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import type { WmsAsnPackagingType } from '@/lib/connectors/wms/types'
 
@@ -117,6 +124,7 @@ export type MintsoftConnectionSettingsMasked = {
   envOverrides: Record<string, string>
   orderLookupConnector: MintsoftOrderLookupConnector
   active: boolean
+  connectionTest: IntegrationConnectionTestState
 }
 
 export type MintsoftConnectionStatus = {
@@ -367,6 +375,7 @@ function mapMintsoftConnection(
     active: boolean
   } | null,
   settings: MintsoftSettings,
+  connectionTest: IntegrationConnectionTestState,
 ): MintsoftConnectionSettingsMasked {
   const username = settings.mintsoft_username
   const password = settings.mintsoft_password
@@ -388,6 +397,7 @@ function mapMintsoftConnection(
     ]),
     orderLookupConnector: (connection?.orderLookupConnector as MintsoftOrderLookupConnector | null) ?? '',
     active: connection?.active ?? true,
+    connectionTest,
   }
 }
 
@@ -624,6 +634,20 @@ function getAvailableOrderLookupConnectors(pluginState: {
   return connectors
 }
 
+function buildMintsoftConnectionFingerprint(input: {
+  baseUrl: string
+  username: string
+  password: string
+  orderLookupConnector: string | null | undefined
+}): string {
+  return buildIntegrationConnectionFingerprint({
+    baseUrl: input.baseUrl.trim(),
+    username: input.username.trim(),
+    password: integrationConnectionFingerprintSecret(input.password.trim()),
+    orderLookupConnector: input.orderLookupConnector ?? '',
+  })
+}
+
 async function ensureMintsoftConnectionId(): Promise<string> {
   const inferredOrderLookupConnector = await inferMintsoftOrderLookupConnector()
   const existingConnection = await db.wmsConnection.findFirst({
@@ -735,7 +759,7 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
     processingStatus: MINTSOFT_WEBHOOK_PROCESSING_STATUS.requiresReview,
   }
 
-  const [connection, settings, warehouses, bindings, recentStockSyncJobs, dryRunReadyJobs, openDiscrepancies, bundleLinks, returnsInbox, receiptReviewEventCount, receiptReviewEvents, pluginState] = await Promise.all([
+  const [connection, settings, connectionTest, warehouses, bindings, recentStockSyncJobs, dryRunReadyJobs, openDiscrepancies, bundleLinks, returnsInbox, receiptReviewEventCount, receiptReviewEvents, pluginState] = await Promise.all([
     db.wmsConnection.findFirst({
       where: { connector: 'mintsoft' },
       orderBy: [{ createdAt: 'asc' }],
@@ -753,6 +777,7 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
       },
     }),
     getMintsoftSettings(),
+    getIntegrationConnectionTestState('mintsoft'),
     db.warehouse.findMany({
       orderBy: [{ active: 'desc' }, { code: 'asc' }],
       select: {
@@ -928,7 +953,7 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
     .filter((value): value is Date => value instanceof Date)
     .sort((left, right) => right.getTime() - left.getTime())[0] ?? null
 
-  const mappedConnection = mapMintsoftConnection(connection, settings)
+  const mappedConnection = mapMintsoftConnection(connection, settings, connectionTest)
   const sanitizedConnection = {
     ...mappedConnection,
     orderLookupConnector: availableOrderLookupConnectors.includes(mappedConnection.orderLookupConnector as ShoppingConnectorId)
@@ -989,7 +1014,7 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
 export async function getMintsoftOnboardingConnectionData(): Promise<MintsoftOnboardingConnectionData> {
   await requireMintsoftReadAccess()
 
-  const [connection, settings] = await Promise.all([
+  const [connection, settings, connectionTest] = await Promise.all([
     db.wmsConnection.findFirst({
       where: { connector: 'mintsoft' },
       orderBy: [{ createdAt: 'asc' }],
@@ -1006,6 +1031,7 @@ export async function getMintsoftOnboardingConnectionData(): Promise<MintsoftOnb
       },
     }),
     getMintsoftSettings(),
+    getIntegrationConnectionTestState('mintsoft'),
   ])
 
   const lastStockSyncAt = await db.wmsSyncJob.findFirst({
@@ -1024,7 +1050,7 @@ export async function getMintsoftOnboardingConnectionData(): Promise<MintsoftOnb
   )
 
   return {
-    connection: mapMintsoftConnection(connection, settings),
+    connection: mapMintsoftConnection(connection, settings, connectionTest),
     status: {
       configured: Boolean((connection?.baseUrl ?? '').trim() && hasMintsoftAuthMaterial),
       active: connection?.active ?? true,
@@ -1358,9 +1384,20 @@ export async function saveMintsoftConnectionSettings(
     return { success: false, error: 'Choose the shopping connector Mintsoft order numbers belong to before activating the connection.' }
   }
 
+  const testFingerprint = buildMintsoftConnectionFingerprint({
+    baseUrl,
+    username,
+    password,
+    orderLookupConnector,
+  })
   try {
     await testMintsoftConnectionSettings(baseUrl, username, password)
   } catch (error) {
+    await recordIntegrationConnectionTest('mintsoft', {
+      success: false,
+      fingerprint: testFingerprint,
+      message: error instanceof Error ? error.message : 'Mintsoft connection test failed.',
+    })
     return {
       success: false,
       error: error instanceof Error ? error.message : 'Mintsoft connection test failed.',
@@ -1429,10 +1466,71 @@ export async function saveMintsoftConnectionSettings(
       active: data.active ?? true,
     },
   })
+  await recordIntegrationConnectionTest('mintsoft', {
+    success: true,
+    fingerprint: testFingerprint,
+    message: 'Connection verified with Mintsoft.',
+  })
 
   revalidatePath('/settings/system')
   revalidatePath('/sync')
   return { success: true, message: 'Connection verified with Mintsoft.' }
+}
+
+export async function testMintsoftConnection(input: unknown): Promise<{ success: boolean; error?: string; message?: string }> {
+  await requireFreshMintsoftWriteAccess()
+
+  const parsedInput = MintsoftConnectionInputSchema.safeParse(input)
+  if (!parsedInput.success) {
+    return { success: false, error: getValidationErrorMessage(parsedInput.error) }
+  }
+  const data = parsedInput.data
+  const [existingSettings, pluginState] = await Promise.all([
+    getMintsoftSettings(),
+    getIntegrationPluginState(),
+  ])
+  const baseUrlValidation = validateMintsoftBaseUrl(data.baseUrl)
+  const baseUrl = baseUrlValidation.ok ? baseUrlValidation.normalizedUrl : null
+  const username = data.username.trim() || existingSettings.mintsoft_username
+  const password = data.password.trim() || existingSettings.mintsoft_password
+  const availableOrderLookupConnectors = getAvailableOrderLookupConnectors(pluginState)
+  const requestedOrderLookupConnector = data.orderLookupConnector.trim() as MintsoftOrderLookupConnector | undefined
+  const orderLookupConnector = requestedOrderLookupConnector
+    || (availableOrderLookupConnectors.length === 1 ? availableOrderLookupConnectors[0] : '')
+
+  if (!baseUrl) {
+    return { success: false, error: baseUrlValidation.ok ? 'Enter a valid Mintsoft base URL.' : baseUrlValidation.error }
+  }
+  if (!username) return { success: false, error: 'Mintsoft username is required.' }
+  if (!password) return { success: false, error: 'Mintsoft password is required.' }
+  if (orderLookupConnector && !availableOrderLookupConnectors.includes(orderLookupConnector)) {
+    return { success: false, error: 'Choose an enabled shopping connector for order lookup.' }
+  }
+
+  const fingerprint = buildMintsoftConnectionFingerprint({
+    baseUrl,
+    username,
+    password,
+    orderLookupConnector,
+  })
+  try {
+    await testMintsoftConnectionSettings(baseUrl, username, password)
+    await recordIntegrationConnectionTest('mintsoft', {
+      success: true,
+      fingerprint,
+      message: 'Connection verified with Mintsoft.',
+    })
+    revalidatePath('/sync')
+    return { success: true, message: 'Connection verified with Mintsoft.' }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Mintsoft connection test failed.'
+    await recordIntegrationConnectionTest('mintsoft', {
+      success: false,
+      fingerprint,
+      message,
+    })
+    return { success: false, error: message }
+  }
 }
 
 export async function saveMintsoftBinding(

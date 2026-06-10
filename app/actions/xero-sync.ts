@@ -15,6 +15,14 @@ import { getSettingValue, serializeSettingValue } from '@/lib/settings-store'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { xeroGet } from '@/lib/connectors/xero/api'
 import { isMaskedSecret, maskSecret, shouldFreshGateSecretWrite } from '@/lib/security/secret-mask'
+import {
+  assertIntegrationConnectionTestPassed,
+  buildIntegrationConnectionFingerprint,
+  getIntegrationConnectionTestState,
+  integrationConnectionFingerprintSecret,
+  recordIntegrationConnectionTest,
+  type IntegrationConnectionTestState,
+} from '@/lib/integration-connection-test-gate'
 
 // Type re-export (allowed in 'use server' files)
 export type { XeroSettings } from '@/lib/connectors/xero/settings'
@@ -37,6 +45,25 @@ export async function getXeroSettingsMasked(): Promise<XeroSettings & { secretMa
   return { ...settings, xero_client_secret: masked, secretMasked: !!settings.xero_client_secret }
 }
 
+async function buildXeroConnectionFingerprint(): Promise<string> {
+  const [clientId, clientSecret, expectedTenantId, token] = await Promise.all([
+    getSettingValue('xero_client_id'),
+    getSettingValue('xero_client_secret'),
+    getSettingValue('xero_expected_tenant_id'),
+    db.accountingToken.findUnique({
+      where: { connector: 'xero' },
+      select: { tenantId: true, tenantName: true },
+    }),
+  ])
+  return buildIntegrationConnectionFingerprint({
+    clientId: clientId ?? '',
+    clientSecret: integrationConnectionFingerprintSecret(clientSecret ?? ''),
+    expectedTenantId: expectedTenantId ?? '',
+    tenantId: token?.tenantId ?? '',
+    tenantName: token?.tenantName ?? '',
+  })
+}
+
 export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ success: boolean; error?: string }> {
   try {
     await requireAdmin()
@@ -51,6 +78,9 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
       const currentEnabled = await getSettingValue('xero_sync_enabled')
       const isTransitioningOn = currentEnabled !== 'true'
       if (isTransitioningOn) {
+        const testGate = await assertIntegrationConnectionTestPassed('xero', await buildXeroConnectionFingerprint(), 'Xero')
+        if (!testGate.ok) return { success: false, error: testGate.error }
+
         const [imsBaseCurrency, orgRes] = await Promise.all([
           getBaseCurrencyCode(),
           xeroGet<{ Organisations?: Array<{ BaseCurrency?: string }>; Organisation?: Array<{ BaseCurrency?: string }> }>('Organisation'),
@@ -106,6 +136,39 @@ export async function saveXeroSettings(data: Partial<XeroSettings>): Promise<{ s
   } catch (e) {
     return { success: false, error: String(e) }
   }
+}
+
+export async function getXeroConnectionTestState(): Promise<IntegrationConnectionTestState> {
+  await requireAdmin()
+  return getIntegrationConnectionTestState('xero')
+}
+
+export async function testXeroConnection(): Promise<{ success: boolean; error?: string; message?: string }> {
+  await requireAdmin()
+
+  const fingerprint = await buildXeroConnectionFingerprint()
+  const [imsBaseCurrency, orgRes] = await Promise.all([
+    getBaseCurrencyCode(),
+    xeroGet<{ Organisations?: Array<{ Name?: string; BaseCurrency?: string }>; Organisation?: Array<{ Name?: string; BaseCurrency?: string }> }>('Organisation'),
+  ])
+  const organisations = orgRes.data?.Organisations ?? orgRes.data?.Organisation ?? []
+  const organisation = organisations[0]
+  const xeroBaseCurrency = organisation?.BaseCurrency?.toUpperCase() ?? null
+  let message: string
+  let success = false
+
+  if (!orgRes.ok || !xeroBaseCurrency) {
+    message = 'Cannot verify Xero because the connected organisation base currency could not be determined.'
+  } else if (xeroBaseCurrency !== imsBaseCurrency) {
+    message = `Xero organisation base currency (${xeroBaseCurrency}) does not match the IMS base currency (${imsBaseCurrency}).`
+  } else {
+    success = true
+    message = `Connection verified against Xero${organisation?.Name ? ` (${organisation.Name})` : ''}.`
+  }
+
+  await recordIntegrationConnectionTest('xero', { success, fingerprint, message })
+  revalidatePath('/sync')
+  return success ? { success, message } : { success, error: message }
 }
 
 export async function saveXeroConnectionSettings(

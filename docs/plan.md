@@ -436,9 +436,10 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** `tests/api/export-csv-metadata.test.ts` asserts metadata headers and representative stock-position, inventory-ledger, and inventory-costing row schemas.
 
 ### P7.5 — Settings integration "test connection" gate
+- **Status:** Complete.
 - **File:** `app/(dashboard)/settings/*`
-- **Fix:** Add a "Test connection" button to each integration settings tab (Xero, WC, Mintsoft, SMTP). Require a successful test before enabling the integration. Store the last-test timestamp + result on the settings record.
-- **Tests:** Mocked integration test; assert settings can't be enabled with a failed test.
+- **Fix:** Added persisted connection-test status/fingerprint records for Xero, WooCommerce, Mintsoft, and SMTP. WooCommerce/Xero enable paths now require the latest saved connection fingerprint to have a successful test; Mintsoft continues to test before saving/activating; SMTP settings must pass the test-email action before saving active SMTP configuration.
+- **Tests:** `tests/domain/integrations/connection-test-gate.test.ts` covers stable fingerprints plus failed/stale/successful gate evaluation and mocked settings persistence.
 
 ### P7.6 — Xero daily batch sync batch-size cap
 - **Status:** Complete.
@@ -566,6 +567,7 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
    - [x] P7.4 — Report-level metadata removed from per-row CSV schemas and emitted once via trailing CSV comments plus `X-IMS-Export-Metadata`.
    - [x] CR4 — `/api/export/*` metadata sweep completed for affected report exports.
 18. **Integration settings test gate:** P7.5.
+   - [x] P7.5 — Xero, WooCommerce, Mintsoft, and SMTP settings persist test results and gate enablement/saves on successful tests.
 19. **Sidebar cleanup:** P2.3, CR5.
 20. **CI invariant gate:** QG1 plus QG2's regression-test convention.
 

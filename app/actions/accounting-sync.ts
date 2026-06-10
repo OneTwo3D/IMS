@@ -2,6 +2,7 @@
 
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { getAccountingConnector } from '@/lib/connectors/accounting-registry'
+import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
 
 export type AccountingAccountRow = {
   id: string
@@ -92,6 +93,24 @@ export async function saveAccountingConnectionSettings(
     return { success: false, error: 'Enable Xero or QuickBooks first.' }
   }
   return connector.saveConnectionSettings(clientId, clientSecret)
+}
+
+export async function getAccountingConnectionTestState(): Promise<IntegrationConnectionTestState> {
+  const connectorId = await getActiveConnector()
+  if (connectorId !== 'xero') {
+    return { status: 'never', testedAt: null, message: '', fingerprint: null }
+  }
+  const { getXeroConnectionTestState } = await import('@/app/actions/xero-sync')
+  return getXeroConnectionTestState()
+}
+
+export async function testAccountingConnection(): Promise<{ success: boolean; error?: string; message?: string }> {
+  const connectorId = await getActiveConnector()
+  if (connectorId !== 'xero') {
+    return { success: false, error: 'Enable Xero before testing the accounting connection.' }
+  }
+  const { testXeroConnection } = await import('@/app/actions/xero-sync')
+  return testXeroConnection()
 }
 
 export async function getAccountingConnectionStatus(): Promise<AccountingConnectionStatus> {

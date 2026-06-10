@@ -13,6 +13,7 @@ import {
   runMintsoftStockSyncNow,
   saveMintsoftBinding,
   saveMintsoftConnectionSettings,
+  testMintsoftConnection,
   updateMintsoftReturnInboxStatus,
   type MintsoftDashboardData,
 } from '@/app/actions/mintsoft-sync'
@@ -135,6 +136,7 @@ export function MintsoftClient({ data }: Props) {
   const [error, setError] = useState('')
   const [feedbackMessage, setFeedbackMessage] = useState('')
   const [saved, setSaved] = useState(false)
+  const [testingConnection, setTestingConnection] = useState(false)
   const orderLookupConnectorRequired = data.orderLookupConnectorRequired
 
   useEffect(() => {
@@ -216,6 +218,33 @@ export function MintsoftClient({ data }: Props) {
       flashSaved(result.message ?? 'Connection verified with Mintsoft.')
       router.refresh()
     })
+  }
+
+  async function handleTestConnection() {
+    setError('')
+    setFeedbackMessage('')
+    setTestingConnection(true)
+    try {
+      const result = await testMintsoftConnection({
+        label,
+        baseUrl,
+        username,
+        password,
+        webhookSecret,
+        orderLookupConnector,
+        active: active === 'true',
+      })
+
+      if (!result.success) {
+        setError(result.error ?? 'Mintsoft connection test failed.')
+        return
+      }
+
+      flashSaved(result.message ?? 'Connection verified with Mintsoft.')
+      router.refresh()
+    } finally {
+      setTestingConnection(false)
+    }
   }
 
   function handleCreateBinding() {
@@ -936,13 +965,29 @@ export function MintsoftClient({ data }: Props) {
                 <option value="false">Disabled</option>
               </Select>
             </div>
+            {data.connection.connectionTest.status !== 'never' ? (
+              <p className={`md:col-span-2 text-xs ${data.connection.connectionTest.status === 'success' ? 'text-green-600' : 'text-destructive'}`}>
+                Last connection test: {data.connection.connectionTest.status === 'success' ? 'passed' : 'failed'}
+                {data.connection.connectionTest.testedAt ? ` at ${new Date(data.connection.connectionTest.testedAt).toLocaleString('en-GB')}` : ''}
+                {data.connection.connectionTest.message ? ` — ${data.connection.connectionTest.message}` : ''}
+              </p>
+            ) : null}
           </div>
 
           <DialogFooter showCloseButton>
             <Button
               type="button"
+              variant="outline"
+              onClick={handleTestConnection}
+              disabled={isPending || testingConnection || (orderLookupConnectorRequired && !orderLookupConnector)}
+            >
+              {testingConnection ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
+              Test Connection
+            </Button>
+            <Button
+              type="button"
               onClick={handleSaveConnection}
-              disabled={isPending || (orderLookupConnectorRequired && !orderLookupConnector)}
+              disabled={isPending || testingConnection || (orderLookupConnectorRequired && !orderLookupConnector)}
             >
               {isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
               Save Connection
