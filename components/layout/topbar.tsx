@@ -15,6 +15,7 @@ import {
 } from '@/components/ui/dropdown-menu'
 import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
 import { useTheme } from '@/components/providers/theme-provider'
+import { usePageTitleOverride } from '@/lib/page-title'
 
 interface TopbarProps {
   userName: string
@@ -63,6 +64,40 @@ const SECTION_TITLES: Array<{ prefix: string; title: string }> = [
   { prefix: '/analytics/inventory-stats', title: 'Inventory Report' },
   { prefix: '/analytics/forecast', title: 'Reorder Forecast' },
   { prefix: '/analytics/product-profitability', title: 'Product Profitability' },
+  { prefix: '/analytics/ap-aging', title: 'AP Aging' },
+  { prefix: '/analytics/ar-aging', title: 'AR Aging' },
+  { prefix: '/analytics/backorder', title: 'Backorders' },
+  { prefix: '/analytics/cogs', title: 'COGS Report' },
+  { prefix: '/analytics/component-shortage', title: 'Component Shortages' },
+  { prefix: '/analytics/currency-summary', title: 'Currency Summary' },
+  { prefix: '/analytics/customers', title: 'Customer Mix' },
+  { prefix: '/analytics/dead-stock', title: 'Dead Stock' },
+  { prefix: '/analytics/fulfillment', title: 'Fulfillment KPIs' },
+  { prefix: '/analytics/fx-gain-loss', title: 'FX Gain/Loss' },
+  { prefix: '/analytics/inventory-aging', title: 'Inventory Aging' },
+  { prefix: '/analytics/inventory-turnover', title: 'Inventory Turnover' },
+  { prefix: '/analytics/inventory-valuation', title: 'Inventory Valuation' },
+  { prefix: '/analytics/landed-cost', title: 'Landed Cost Analysis' },
+  { prefix: '/analytics/lead-times', title: 'Lead Times' },
+  { prefix: '/analytics/margin', title: 'Gross Margin' },
+  { prefix: '/analytics/negative-stock', title: 'Negative Stock' },
+  { prefix: '/analytics/open-pos', title: 'Open Purchase Orders' },
+  { prefix: '/analytics/ppv', title: 'Purchase Price Variance' },
+  { prefix: '/analytics/production-variance', title: 'Production Variance' },
+  { prefix: '/analytics/reorder', title: 'Reorder Planning' },
+  { prefix: '/analytics/returns', title: 'Returns' },
+  { prefix: '/analytics/sales', title: 'Sales Analytics' },
+  { prefix: '/analytics/spend', title: 'Spend' },
+  { prefix: '/analytics/stock-adjustments', title: 'Stock Adjustments' },
+  { prefix: '/analytics/stock-allocations', title: 'Stock Allocations' },
+  { prefix: '/analytics/stock-counts', title: 'Stock Counts' },
+  { prefix: '/analytics/stock-movements', title: 'Stock Movement Ledger' },
+  { prefix: '/analytics/stock-on-hand', title: 'Stock on Hand' },
+  { prefix: '/analytics/supplier-performance', title: 'Supplier Performance' },
+  { prefix: '/analytics/throughput', title: 'Throughput' },
+  { prefix: '/analytics/transfers', title: 'Stock Transfers' },
+  { prefix: '/analytics/vat', title: 'VAT' },
+  { prefix: '/analytics/wip', title: 'WIP' },
   { prefix: '/analytics', title: 'Analytics' },
   { prefix: '/sync', title: 'Integrations' },
   { prefix: '/settings/company', title: 'Company Settings' },
@@ -107,7 +142,8 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
   const { setTheme, resolvedTheme } = useTheme()
   const router = useRouter()
   const pathname = usePathname()
-  const sectionTitle = sectionTitleFor(pathname)
+  const titleOverride = usePageTitleOverride()
+  const sectionTitle = titleOverride ?? sectionTitleFor(pathname)
   const { data: session } = useSession()
   const [notifications, setNotifications] = useState<Notification[]>([])
   const [unreadCount, setUnreadCount] = useState(0)

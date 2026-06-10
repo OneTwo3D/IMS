@@ -336,7 +336,6 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
 
   return (
     <div className="space-y-4">
-      <h1 className="text-2xl font-semibold">Purchase Statistics</h1>
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Total Spend</p><p className="text-xl font-bold">{fmtBase(totalSpend)}</p></div>
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Landed Cost</p><p className="text-xl font-bold">{fmtBase(totalLanded)}</p></div>

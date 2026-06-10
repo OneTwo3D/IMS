@@ -4,6 +4,7 @@ import { useState } from 'react'
 import { Sidebar } from './sidebar'
 import { Topbar } from './topbar'
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
+import { PageTitleProvider } from '@/lib/page-title'
 
 interface DashboardShellProps {
   companyName?: string
@@ -33,6 +34,7 @@ export function DashboardShell({
   const [mobileOpen, setMobileOpen] = useState(false)
 
   return (
+    <PageTitleProvider>
     <div className="flex h-screen overflow-hidden">
       {/* Desktop sidebar */}
       <div className="hidden md:flex">
@@ -76,5 +78,6 @@ export function DashboardShell({
         <main className="flex-1 overflow-auto p-3 sm:p-4 md:p-6">{children}</main>
       </div>
     </div>
+    </PageTitleProvider>
   )
 }

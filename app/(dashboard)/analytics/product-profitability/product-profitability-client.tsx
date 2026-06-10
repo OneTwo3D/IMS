@@ -333,7 +333,6 @@ export function ProductProfitabilityClient({ data }: Props) {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Product Profitability</h1>
         <div className="flex items-center gap-2">
           <Button variant="outline" size="sm" className="h-8" onClick={openColPicker} title="Column settings">
             <Settings2 className="h-4 w-4" />

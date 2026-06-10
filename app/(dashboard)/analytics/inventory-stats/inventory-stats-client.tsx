@@ -332,7 +332,6 @@ export function InventoryStatsClient({ stockOnHand, movements, allocations, reor
 
   return (
     <div className="space-y-4">
-      <h1 className="text-2xl font-semibold">Inventory Report</h1>
 
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div className="rounded-md border p-3"><p className="text-xs text-muted-foreground">Total Quantity</p><p className="text-xl font-bold">{totalQty.toLocaleString()}</p></div>

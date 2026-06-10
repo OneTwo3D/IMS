@@ -391,7 +391,6 @@ export function ForecastClient({ forecasts, settings }: Props) {
   return (
     <div className="space-y-4">
       <div className="flex items-center justify-between">
-        <h1 className="text-2xl font-semibold">Reorder Forecast</h1>
         <div className="flex items-center gap-2">
           <a href="/api/export/analytics?type=forecast" className="inline-flex items-center gap-1 rounded-md border border-input bg-background px-2.5 h-8 text-sm font-medium hover:bg-muted">
             <Download className="h-4 w-4" />Export CSV
