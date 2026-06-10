@@ -467,14 +467,93 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 
 ---
 
+## Phase 8 — Product lifecycle controls
+
+### P8.1 — Product lifecycle statuses and end-of-life sell-off
+- **Status:** Planned.
+- **Files:** `prisma/schema.prisma`, product create/edit actions and pages, reorder forecast/report modules, product list filters, inventory/purchasing incoming-stock helpers, lifecycle cron/job.
+- **Problem:** Product lifecycle state is not expressive enough for sell-off workflows. Operators need to mark products as end-of-life (EOL): still sellable while stock remains, but blocked from re-ordering and excluded from replenishment forecasts. Once stock reaches zero across all warehouses and no incoming stock remains, EOL products should automatically become archived.
+- **Product statuses:**
+  - `active`: published/sellable and can be re-ordered.
+  - `draft`: generated or being prepared, not published for sale yet, but can already be purchased.
+  - `eol`: can still be sold from existing stock, cannot be re-ordered, and must not appear in reorder forecasts.
+  - `archived`: withdrawn from sales and cannot be re-ordered.
+- **Migration from the current enum:** `Product.lifecycleStatus` already uses `ProductLifecycleStatus { ACTIVE, NOT_FOR_SALE, ARCHIVED }`. Migrate existing rows as:
+  - `ACTIVE` -> `active`.
+  - `NOT_FOR_SALE` -> `eol` by default, because it is the safest sell-off interpretation for existing stock. Operators can reclassify individual products to `draft` during the rollout if they were genuinely pre-publication products rather than sell-off products.
+  - `ARCHIVED` -> `archived`.
+  - `draft` is a new IMS lifecycle concept for purchasable, not-yet-sellable products. It does not replace channel publication state such as WooCommerce draft/private/published status; shopping connector publication remains a separate channel concern.
+- **Allowed lifecycle transitions:**
+  - `draft` -> `active` when a product is ready to sell.
+  - `active` -> `eol` to start sell-off without replenishment.
+  - `active` -> `archived` for immediate withdrawal.
+  - `eol` -> `active` to undo EOL.
+  - `eol` -> `archived` manually or through the auto-archive job.
+  - `archived` -> `active` or `archived` -> `eol` only through an admin restore action with an activity-log reason. `archived` -> `draft` is not allowed; clone/recreate instead.
+- **Fix:**
+  1. Model product lifecycle state explicitly, either by extending the existing product status enum or by replacing the old status/archived marker with a single status field that represents `active`, `draft`, `eol`, and `archived`.
+  2. Add an EOL/status control on the product page and product edit form, with list/report filters for EOL and archived products.
+  3. Treat `eol` products as sellable wherever available stock exists, but block purchase/reorder creation and replenishment suggestions for them.
+  4. Exclude `eol` and `archived` products from reorder forecasts and reorder recommendation reports.
+  5. Add a single lifecycle helper used by product actions, purchase-order actions, sales-order actions, allocation/shipment flows, reorder reports, shopping/WMS sync filters, and imports so `active`, `draft`, `eol`, and `archived` are interpreted consistently. Replace current ad-hoc `ProductLifecycleStatus`, `lifecycleStatus`, `ACTIVE`, `NOT_FOR_SALE`, `ARCHIVED`, `active`, and `isOperationalProductStatus` checks with that helper.
+  6. Add a `getProductIncomingStock(productId)` helper that returns a structured breakdown by source. The minimum source contract is:
+     - Open purchase orders: `purchase_order_lines` where the parent `purchase_orders.status` is `PO_SENT`, `SHIPPED`, or `PARTIALLY_RECEIVED`, and `qty - qtyReceived > 0`.
+     - Inbound stock transfers: `stock_transfer_lines` where the parent `stock_transfers.status` is `IN_TRANSIT`, `productId` matches, and `qty - qtyReceived > 0`.
+     - Manufacturing output: `production_orders` where `outputProductId` matches, status is `DRAFT` or `IN_PROGRESS`, and `qtyPlanned - qtyProduced > 0`.
+     - WMS inbound evidence: `wms_asn_line_maps` whose parent `wms_asn_maps.status` is `CREATE_PENDING`, `CREATE_IN_FLIGHT`, `OPEN`, or `PARTIALLY_BOOKED_IN`, using `expectedQty - qtyAccountedViaSnapshot - qtyAccountedViaReceipt > 0`, plus pending `wms_inbound_receipt_events` for matching ASN/product evidence where available.
+     - Customer returns do not count as incoming stock unless they create explicit inbound receipt/restock evidence; speculative returns must not block EOL archival.
+  7. Add an automatic archival job: when an EOL product has zero stock in every warehouse and `getProductIncomingStock(productId)` returns zero for every source, transition it to `archived` and write an activity-log entry. Run daily after inventory/WMS receipt processing. The job must lock the product row or take a product-scoped advisory lock, re-read stock levels and incoming-stock breakdown inside the transaction, and update only if the product is still `eol`. PO/reorder creation must also re-check lifecycle after locking the product so a concurrent inbound order cannot race the archive transition.
+- **Acceptance:**
+  - Operators can filter product lists/reports by `active`, `draft`, `eol`, and `archived`.
+  - `active` products can be sold and re-ordered.
+  - `draft` products can be purchased but are not published/sellable.
+  - `eol` products remain sellable from existing stock, cannot be re-ordered, and do not appear in reorder forecasts.
+  - `archived` products cannot be sold or re-ordered.
+  - The archive job only archives EOL products after all warehouse stock is zero and incoming supply is zero.
+  - Lifecycle transitions are activity-logged with actor/job context and previous/new status.
+  - Existing `NOT_FOR_SALE` products are migrated to `eol` by default, with an operator-visible rollout note for reclassifying true drafts.
+- **Tests:**
+  - Product action/unit tests for each allowed and blocked transition.
+  - Reorder forecast tests asserting EOL and archived products are excluded while active products remain included.
+  - Purchase/reorder creation tests asserting EOL and archived products are blocked, while draft products can be purchased.
+  - Sales/allocation tests asserting EOL products can be sold from available stock but archived and draft products cannot be sold.
+  - Auto-archive job tests for zero-stock/no-incoming, positive-stock, open PO incoming, inbound transfer incoming, production-order incoming, WMS ASN/receipt incoming, and a race case where a new PO line for the product is created between the initial read and the transaction re-check.
+
+### P8.2 — Product supplier field and supplier-scoped reorder drafts
+- **Status:** Planned.
+- **Files:** `prisma/schema.prisma`, product create/edit actions and pages, product list filters, purchase-order create/update actions, reorder forecast/report modules, draft purchase-order generation workflow.
+- **Problem:** Reorder planning has no product-level supplier signal. Operators need to filter products by supplier and turn reorder forecasts into supplier-specific draft purchase orders. The product supplier should reflect the supplier used for the most recent purchase order placed for that product, so the replenishment workflow follows real buying history instead of stale manual metadata.
+- **Fix:**
+  1. Add a supplier field to products, backed by a relation to the supplier/vendor model used by purchase orders.
+  2. Update the product supplier automatically when a purchase order is placed for that product. If a PO contains multiple products, update each included product to that PO's supplier. If a product appears on multiple POs, the latest placed PO wins.
+  3. Surface supplier on product create/edit/detail screens and product exports/reports where SKU/EAN/MPN/product identity fields are shown.
+  4. Add supplier filters to product lists and relevant inventory/replenishment reports.
+  5. Add a supplier-scoped draft-PO generator from reorder forecasts. It should let operators choose a supplier, include only reorder-eligible products assigned to that supplier, group lines into a draft purchase order for that supplier, and preserve forecast evidence on each line.
+  6. Respect lifecycle constraints from P8.1: `eol` and `archived` products must not be included in generated reorder drafts; `draft` and `active` products may be included when otherwise reorder-eligible.
+- **Acceptance:**
+  - Products expose a supplier field in the UI, API/action payloads, and relevant reports.
+  - Placing a purchase order updates every included product's supplier to the PO supplier.
+  - Product list/report filters can narrow results by supplier.
+  - Reorder forecasts can generate a draft PO for one supplier, containing only products assigned to that supplier and only products that are reorder-eligible.
+  - Generated draft PO lines carry enough forecast metadata to explain the suggested quantity.
+  - EOL and archived products are excluded from supplier draft-PO generation even if the forecast would otherwise suggest a reorder.
+- **Tests:**
+  - Product action/unit tests for setting and filtering by supplier.
+  - Purchase-order tests asserting the latest placed PO supplier updates product supplier for all included products.
+  - Reorder forecast tests asserting supplier filters and lifecycle exclusions.
+  - Draft-PO generation tests for one supplier, mixed-supplier forecast candidates, EOL/archive exclusions, and forecast-evidence metadata.
+
+---
+
 ## Quality gates — tests + invariants
 
 These are not a separate implementation phase except for the invariant CI gate. They are rules that apply to every PR in the plan.
 
 ### QG1 — Inventory invariant check blocks deploy
+- **Status:** Complete.
 - **File:** `app/api/cron/invariant-check/route.ts`, CI pipeline
-- **Fix:** Add `npm run invariant-check:preflight` step to CI. Fail build on critical findings. Document remediation path.
-- **Tests:** Synthetic data with a known invariant violation; assert CI fails.
+- **Fix:** `npm run invariant-check:preflight` runs the scheduled inventory, accounting, and sales invariant reporters with cron side effects disabled. Production-readiness CI applies migrations to a clean PostgreSQL service, runs `npm run invariant-check:preflight:fixture` to seed a known reserved-source mismatch and prove the gate fails on real data, clears that fixture, and then runs the clean preflight. This is a code-correctness gate; scheduled cron/operator runs remain responsible for tenant-data invariant checks. The remediation path is documented in `docs/development.md`.
+- **Tests:** `tests/cron/invariant-check-preflight.test.ts` covers clean reports, critical findings, divergent critical summary/list evidence, and partial report failures. `tests/scripts/invariant-check-preflight-script.test.ts` covers CLI exit codes, report-error output, critical-finding output, and truncation.
 
 ### QG2 — Per-phase regression test requirement
 - For each fix in Phases 1–6, the regression test must exist and pass before the PR can merge. No exceptions.
@@ -577,6 +656,10 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
 19. **Sidebar cleanup:** P2.3, CR5.
    - [x] P2.3 / CR5 — Sidebar analytics links are built from a single report-access grouping helper with per-role coverage.
 20. **CI invariant gate:** QG1 plus QG2's regression-test convention.
+   - [x] QG1 — Production-readiness CI runs `npm run invariant-check:preflight` against a migrated database and blocks on critical findings/report failures.
+21. **Product lifecycle, supplier, and reorder planning:** P8.1 and P8.2.
+   - [ ] P8.1 — Add `active`, `draft`, `eol`, and `archived` product statuses; block EOL reordering and forecasts; auto-archive EOL products once stock and incoming supply are exhausted.
+   - [ ] P8.2 — Add product supplier tracking from latest placed PO, supplier filters, and supplier-scoped draft PO generation from reorder forecasts.
 
 After each PR:
 - Run `npm run validate` and `npm run validate:db`.

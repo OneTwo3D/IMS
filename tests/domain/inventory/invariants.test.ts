@@ -1279,7 +1279,10 @@ test('inventory SQL collector keeps partially refunded orders eligible for shipp
   const sql = String((capturedQuery as { sql?: string }).sql ?? '')
   assert.match(sql, /so\.status <> 'REFUNDED'/)
   assert.match(sql, /ABS\(sm\.qty\) \* sm\."unitCostBase"/)
+  assert.match(sql, /sl\."reservedQty" - sl\.quantity > \?::numeric/)
+  assert.match(sql, /sm\.qty > \?::numeric/)
   assert.match(sql, /relativeTolerance/)
+  assert.match(sql, /relativeTolerance', \?::numeric/)
   assert.doesNotMatch(sql, /PARTIALLY_REFUNDED/)
 })
 

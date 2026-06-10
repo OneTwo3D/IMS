@@ -56,6 +56,21 @@ Focused tests can also be run directly:
 npx tsx --test tests/<relevant-file>.test.ts
 ```
 
+## Invariant Preflight
+
+Production-readiness CI runs the invariant reporters against a freshly migrated database as a code-correctness gate, not as tenant-data validation. The workflow first runs `npm run invariant-check:preflight:fixture`, which seeds a known reserved-source mismatch, asserts the preflight fails, removes the fixture rows, and asserts the clean database passes. It then runs `npm run invariant-check:preflight` against the clean migrated database.
+
+The preflight command uses the same inventory, accounting, and sales invariant reporters as the scheduled cron but disables activity-log writes, admin notifications, and stored critical-finding hashes. It fails the build when any report fails or when any critical invariant finding is present. Tenant data still needs scheduled cron/operator runs against the tenant database, because CI's clean database cannot prove production data is healthy.
+
+Warnings and info findings do not block deploy, but they should be reviewed before merge when they relate to financial, inventory, or sales-order state.
+
+Remediation path:
+
+1. Run `npm run invariant-check:preflight` locally against the target database, or trigger `/api/cron/invariant-check` with `CRON_SECRET` in an environment where activity logs and notifications are expected.
+2. Use the printed `domain:code` and entity references to inspect the matching invariant reporter details.
+3. Repair the underlying data or writer bug. Do not suppress the finding unless the invariant contract itself is wrong and the PR updates the invariant plus its regression tests.
+4. Rerun the preflight command before merging.
+
 This repository treats `prisma/schema.prisma` as the canonical application schema. Migrations, deployment scripts, and CI all assume the Prisma schema and the live database describe the same shape unless a difference is intentionally documented as unsupported by Prisma.
 
 ## Decimal Boundary Guard

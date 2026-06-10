@@ -20,6 +20,8 @@
     "docs:workflows": "tsx scripts/generate-workflow-docs.ts",
     "docs:workflows:check": "tsx scripts/generate-workflow-docs.ts --check",
     "preflight:production": "tsx scripts/preflight-production.ts",
+    "invariant-check:preflight": "tsx scripts/invariant-check-preflight.ts",
+    "invariant-check:preflight:fixture": "tsx scripts/invariant-check-preflight-fixture.ts",
     "inventory:snapshots:backfill": "tsx scripts/backfill-inventory-snapshots.ts",
     "validate": "bash scripts/validate-local.sh",
     "validate:db": "bash scripts/validate-db.sh",
