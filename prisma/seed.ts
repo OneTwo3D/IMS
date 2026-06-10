@@ -10,6 +10,7 @@ import 'dotenv/config'
 import { PrismaClient } from '../app/generated/prisma/client'
 import { PrismaPg } from '@prisma/adapter-pg'
 import bcrypt from 'bcryptjs'
+import { validateUserPassword } from '../lib/security/password-policy'
 
 const adapter = new PrismaPg({ connectionString: process.env.DATABASE_URL! })
 const db = new PrismaClient({ adapter })
@@ -73,10 +74,20 @@ async function main() {
   console.log(`  ✓ ${taxRates.length} tax rates`)
 
   if (seedTestAdmin) {
-    const adminEmail = 'admin@example.com'
+    const adminEmail = process.env.SEED_TEST_ADMIN_EMAIL ?? 'admin@example.com'
+    const adminPassword = process.env.SEED_TEST_ADMIN_PASSWORD
+    if (!adminPassword) {
+      throw new Error(
+        'SEED_TEST_ADMIN=true requires SEED_TEST_ADMIN_PASSWORD to be set to a value that satisfies the user password policy.',
+      )
+    }
+    const policyError = validateUserPassword(adminPassword)
+    if (policyError) {
+      throw new Error(`SEED_TEST_ADMIN_PASSWORD does not satisfy the password policy: ${policyError}.`)
+    }
     const existing = await db.user.findUnique({ where: { email: adminEmail } })
     if (!existing) {
-      const passwordHash = await bcrypt.hash('changeme123', 12)
+      const passwordHash = await bcrypt.hash(adminPassword, 12)
       await db.user.create({
         data: {
           email: adminEmail,
@@ -86,7 +97,7 @@ async function main() {
           active: true,
         },
       })
-      console.log(`  ✓ Admin user: ${adminEmail} / changeme123`)
+      console.log(`  ✓ Admin user: ${adminEmail}`)
     } else {
       console.log(`  ✓ Admin user already exists (${adminEmail})`)
     }
