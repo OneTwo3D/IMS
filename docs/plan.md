@@ -184,6 +184,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
 - **Tests:** `tests/scripts/check-migration-conventions.test.ts` — `migration convention analyzer detects renames and drops` and `migration convention markers suppress only the named pattern`.
 
 ### P2.3 — Sidebar filter chain refactor
+- **Status:** Complete.
 - **File:** `components/layout/sidebar.tsx:133` (post PR #117)
 - **Problem:** `REPORT_ACCESS_GROUPS` was added but the conditional-spread chain wasn't removed. Two patterns coexist.
 - **Fix:** Drop the spread chain. Build `analyticsChildren` as:
@@ -195,7 +196,7 @@ These are silent-corruption risks where the failure mode is "the numbers are wro
       )
   ```
 - **Acceptance:** Sidebar renders correctly for each role; no duplicate links; one place to update for new report sets.
-- **Tests:** Snapshot test per role.
+- **Tests:** `tests/components/sidebar.test.ts` covers analytics link visibility and duplicate prevention for `ADMIN`, `MANAGER`, `WAREHOUSE`, `FINANCE`, `READONLY`, and `SUPPLIER`.
 
 ### P2.4 — Migration-doc / convention page
 - **Status:** Complete.
@@ -569,6 +570,7 @@ This reduces the plan from 45+ tiny PRs to roughly 16-20 coherent PRs. Split any
 18. **Integration settings test gate:** P7.5.
    - [x] P7.5 — Xero, WooCommerce, Mintsoft, and SMTP settings persist test results and gate enablement/saves on successful tests.
 19. **Sidebar cleanup:** P2.3, CR5.
+   - [x] P2.3 / CR5 — Sidebar analytics links are built from a single report-access grouping helper with per-role coverage.
 20. **CI invariant gate:** QG1 plus QG2's regression-test convention.
 
 After each PR:

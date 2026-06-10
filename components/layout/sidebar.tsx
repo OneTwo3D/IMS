@@ -45,18 +45,17 @@ const SALES_CHILDREN = [
   { href: '/sales/contacts', label: 'Customers' },
 ]
 
-const ANALYTICS_CHILDREN = [
+type SidebarLink = {
+  href: string
+  label: string
+}
+
+const BASE_ANALYTICS_LINKS = [
   { href: '/analytics/sales-stats',            label: 'Sales Statistics' },
   { href: '/analytics/purchase-stats',         label: 'Purchase Statistics' },
   { href: '/analytics/product-profitability',  label: 'Product Profitability' },
   { href: '/analytics/inventory-stats',        label: 'Inventory Report' },
-  ...SALES_ANALYTICS_LINKS,
-  ...PURCHASING_ANALYTICS_LINKS,
-  ...FINANCE_ANALYTICS_LINKS,
-  ...MANUFACTURING_ANALYTICS_LINKS,
-  ...STOCK_POSITION_REPORT_LINKS,
-  ...REPLENISHMENT_REPORT_LINKS,
-]
+] as const satisfies readonly SidebarLink[]
 
 const INVENTORY_LEDGER_REPORT_LINKS = [
   { href: '/analytics/stock-movements',        label: 'Stock Movement Ledger' },
@@ -73,12 +72,35 @@ const INVENTORY_COSTING_REPORT_LINKS = [
 ]
 
 const REPORT_ACCESS_GROUPS = [
-  { links: REPLENISHMENT_REPORT_LINKS, hrefs: new Set<string>(REPLENISHMENT_REPORT_LINKS.map((link) => link.href)), canAccess: canAccessReplenishmentReports },
-  { links: SALES_ANALYTICS_LINKS, hrefs: new Set<string>(SALES_ANALYTICS_LINKS.map((link) => link.href)), canAccess: canAccessSalesAnalytics },
-  { links: PURCHASING_ANALYTICS_LINKS, hrefs: new Set<string>(PURCHASING_ANALYTICS_LINKS.map((link) => link.href)), canAccess: canAccessPurchasingAnalytics },
-  { links: FINANCE_ANALYTICS_LINKS, hrefs: new Set<string>(FINANCE_ANALYTICS_LINKS.map((link) => link.href)), canAccess: canAccessFinanceAnalytics },
-  { links: MANUFACTURING_ANALYTICS_LINKS, hrefs: new Set<string>(MANUFACTURING_ANALYTICS_LINKS.map((link) => link.href)), canAccess: canAccessManufacturingAnalytics },
-]
+  { links: STOCK_POSITION_REPORT_LINKS, canAccess: canAccessStockPositionReports },
+  { links: REPLENISHMENT_REPORT_LINKS, canAccess: canAccessReplenishmentReports },
+  { links: SALES_ANALYTICS_LINKS, canAccess: canAccessSalesAnalytics },
+  { links: PURCHASING_ANALYTICS_LINKS, canAccess: canAccessPurchasingAnalytics },
+  { links: FINANCE_ANALYTICS_LINKS, canAccess: canAccessFinanceAnalytics },
+  { links: MANUFACTURING_ANALYTICS_LINKS, canAccess: canAccessManufacturingAnalytics },
+] as const satisfies ReadonlyArray<{
+  links: readonly SidebarLink[]
+  canAccess: (role: string) => boolean
+}>
+
+function uniqueLinks(links: readonly SidebarLink[]): SidebarLink[] {
+  const seen = new Set<string>()
+  return links.filter((link) => {
+    if (seen.has(link.href)) return false
+    seen.add(link.href)
+    return true
+  })
+}
+
+export function getSidebarAnalyticsChildren(userRole: string): SidebarLink[] {
+  const can = (p: Permission) => hasPermission(userRole, p)
+  return uniqueLinks([
+    ...(can('analytics') ? BASE_ANALYTICS_LINKS : []),
+    ...REPORT_ACCESS_GROUPS.flatMap(({ links, canAccess }) => canAccess(userRole) ? [...links] : []),
+    ...(can('analytics.inventory_ledger') ? INVENTORY_LEDGER_REPORT_LINKS : []),
+    ...(can('analytics.inventory_costing') ? INVENTORY_COSTING_REPORT_LINKS : []),
+  ])
+}
 
 function getSettingsChildren(accountingIntegrationEnabled: boolean) {
   return [
@@ -127,19 +149,7 @@ export function Sidebar({
   const isSupplier = userRole === 'SUPPLIER'
   const settingsChildren = getSettingsChildren(accountingIntegrationEnabled)
   const showIntegrations = shoppingIntegrationEnabled || accountingIntegrationEnabled || wmsIntegrationEnabled
-  const roleScopedAnalyticsChildren = [
-    ...STOCK_POSITION_REPORT_LINKS,
-    ...REPORT_ACCESS_GROUPS.flatMap(({ links, canAccess }) => canAccess(userRole) ? [...links] : []),
-  ]
-  const analyticsChildren = [
-    ...(can('analytics') ? ANALYTICS_CHILDREN : roleScopedAnalyticsChildren),
-    ...(can('analytics.inventory_ledger') ? INVENTORY_LEDGER_REPORT_LINKS : []),
-    ...(can('analytics.inventory_costing') ? INVENTORY_COSTING_REPORT_LINKS : []),
-  ]
-    .filter((item) => {
-      const group = REPORT_ACCESS_GROUPS.find((candidate) => candidate.hrefs.has(item.href))
-      return !group || group.canAccess(userRole)
-    })
+  const analyticsChildren = getSidebarAnalyticsChildren(userRole)
 
   // Supplier gets a completely different navigation
   if (isSupplier) {
@@ -211,7 +221,7 @@ export function Sidebar({
         {can('sales') && (
           <NavGroup label="Sales" icon={TrendingUp} items={SALES_CHILDREN} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
-        {canAccessStockPositionReports(userRole) && (
+        {analyticsChildren.length > 0 && (
           <NavGroup label="Analytics" icon={BarChart3} items={analyticsChildren} collapsed={collapsed} onExpand={() => setCollapsed(false)} onNavigate={onNavigate} />
         )}
         {can('manufacturing') && <NavItem href="/manufacturing" label="Manufacturing" icon={Factory} collapsed={collapsed} onNavigate={onNavigate} />}
