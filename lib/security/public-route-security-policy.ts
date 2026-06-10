@@ -67,7 +67,7 @@ export const publicRouteSecurityPolicy: Partial<Record<ApiRoutePath, PublicRoute
   },
   '/api/invoices/[id]': {
     properties: ['signed-url-token', 'no-sensitive-output'],
-    rationale: 'Public invoice PDFs require an expiring signed token for the invoice id before storage is accessed.',
+    rationale: 'Public invoice PDFs require an expiring signed token bound to the current IMS session and client IP before storage is accessed.',
   },
   '/api/uploads/branding/[filename]': {
     properties: ['path-traversal-protection', 'extension-allowlist', 'no-sensitive-output'],

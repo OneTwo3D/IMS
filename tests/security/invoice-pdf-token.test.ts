@@ -8,6 +8,7 @@ import { handleInvoicePdfRoute } from '../../app/api/invoices/[id]/route.ts'
 import {
   signPdfToken,
   verifyPdfTokenDetailed,
+  type InvoicePdfTokenBinding,
   type InvoicePdfTokenPayload,
   type PdfTokenVerificationResult,
 } from '../../lib/invoice-pdf.ts'
@@ -16,6 +17,10 @@ import { withEnvPatch } from '../helpers/env.ts'
 const SECRET = 'invoice-pdf-test-secret'
 const NOW = new Date('2026-05-27T10:00:00.000Z')
 const NOW_SECONDS = seconds(NOW)
+const BINDING: InvoicePdfTokenBinding = {
+  sessionId: 'user-1:2:1770000000',
+  clientIp: '203.0.113.10',
+}
 
 async function withInvoiceTokenEnv<T>(
   env: Record<string, string | undefined>,
@@ -58,9 +63,11 @@ function validPayload(overrides: Partial<InvoicePdfTokenPayload> = {}): InvoiceP
 
 test('invoice PDF tokens verify while inside their configured TTL', async () => {
   await withInvoiceTokenEnv({ INVOICE_PDF_TOKEN_TTL_SECONDS: '120' }, () => {
-    const token = signPdfToken('order-1', { now: NOW, nonce: 'nonce-1' })
+    const token = signPdfToken('order-1', { now: NOW, nonce: 'nonce-1', binding: BINDING })
     const result = verifyPdfTokenDetailed('order-1', token, {
       now: new Date(NOW.getTime() + 119_000),
+      binding: BINDING,
+      requireBinding: true,
     })
 
     assert.equal(result.valid, true)
@@ -70,13 +77,15 @@ test('invoice PDF tokens verify while inside their configured TTL', async () => 
     assert.equal(result.payload.iat, NOW_SECONDS)
     assert.equal(result.payload.exp, NOW_SECONDS + 120)
     assert.equal(result.payload.nonce, 'nonce-1')
+    assert.equal(result.payload.sid?.includes(BINDING.sessionId), false)
+    assert.equal(result.payload.ip?.includes(BINDING.clientIp), false)
   })
 })
 
 test('invoice PDF token signing is deterministic when the nonce and clock are fixed', async () => {
   await withInvoiceTokenEnv({ INVOICE_PDF_TOKEN_TTL_SECONDS: '120' }, () => {
-    const first = signPdfToken('order-1', { now: NOW, nonce: 'nonce-1' })
-    const second = signPdfToken('order-1', { now: NOW, nonce: 'nonce-1' })
+    const first = signPdfToken('order-1', { now: NOW, nonce: 'nonce-1', binding: BINDING })
+    const second = signPdfToken('order-1', { now: NOW, nonce: 'nonce-1', binding: BINDING })
 
     assert.equal(first, second)
   })
@@ -84,9 +93,11 @@ test('invoice PDF token signing is deterministic when the nonce and clock are fi
 
 test('invoice PDF tokens expire at the expiry boundary', async () => {
   await withInvoiceTokenEnv({}, () => {
-    const token = signPdfToken('order-1', { now: NOW, ttlSeconds: 10, nonce: 'nonce-1' })
+    const token = signPdfToken('order-1', { now: NOW, ttlSeconds: 10, nonce: 'nonce-1', binding: BINDING })
     const result = verifyPdfTokenDetailed('order-1', token, {
       now: new Date(NOW.getTime() + 10_000),
+      binding: BINDING,
+      requireBinding: true,
     })
 
     assert.deepEqual(result, { valid: false, reason: 'expired' })
@@ -100,9 +111,61 @@ test('invoice PDF token signing rejects invalid TTL options', async () => {
       /positive integer/,
     )
     assert.throws(
-      () => signPdfToken('order-1', { now: NOW, ttlSeconds: 30 * 24 * 60 * 60 + 1, nonce: 'nonce-1' }),
+      () => signPdfToken('order-1', { now: NOW, ttlSeconds: 10 * 60 + 1, nonce: 'nonce-1' }),
       /must not exceed/,
     )
+  })
+})
+
+test('invoice PDF token verification rejects copied tokens from another session or IP', async () => {
+  await withInvoiceTokenEnv({}, () => {
+    const token = signPdfToken('order-1', { now: NOW, nonce: 'nonce-1', binding: BINDING })
+
+    assert.deepEqual(
+      verifyPdfTokenDetailed('order-1', token, {
+        now: NOW,
+        requireBinding: true,
+        binding: { ...BINDING, sessionId: 'user-2:2:1770000000' },
+      }),
+      { valid: false, reason: 'wrong_session' },
+    )
+    assert.deepEqual(
+      verifyPdfTokenDetailed('order-1', token, {
+        now: NOW,
+        requireBinding: true,
+        binding: { ...BINDING, clientIp: '203.0.113.11' },
+      }),
+      { valid: false, reason: 'wrong_ip' },
+    )
+    assert.deepEqual(
+      verifyPdfTokenDetailed('order-1', token, { now: NOW, requireBinding: true }),
+      { valid: false, reason: 'missing_binding' },
+    )
+  })
+})
+
+test('invoice PDF route rejects validly signed but unbound tokens before storage access', async () => {
+  await withInvoiceTokenEnv({}, async () => {
+    const token = signPdfToken('order-1', { now: NOW, nonce: 'nonce-1' })
+    let loaded = false
+    const response = await handleInvoicePdfRoute(
+      new NextRequest(`http://ims.test/api/invoices/order-1?token=${token}`),
+      { id: 'order-1' },
+      {
+        async loadInvoicePdf() {
+          loaded = true
+          return Buffer.from('%PDF-1.4 test')
+        },
+        verifyPdfToken: verifyPdfTokenDetailed,
+        async auditTokenAttempt() {},
+        async getTokenBinding() {
+          return BINDING
+        },
+      },
+    )
+
+    assert.equal(response.status, 403)
+    assert.equal(loaded, false)
   })
 })
 
@@ -285,7 +348,7 @@ test('invoice PDF route sanitizes the Content-Disposition filename', async () =>
       },
       verifyPdfToken(orderId) {
         assert.equal(orderId, unsafeId)
-        return { valid: true, payload: validPayload({ sub: unsafeId }) }
+        return { valid: true, payload: validPayload({ sub: unsafeId, nonce: 'download-nonce-1' }) }
       },
       async auditTokenAttempt() {},
     },
@@ -294,7 +357,7 @@ test('invoice PDF route sanitizes the Content-Disposition filename', async () =>
   assert.equal(response.status, 200)
   assert.equal(
     response.headers.get('content-disposition'),
-    'inline; filename="invoice-order___Set-Cookie_x.pdf"',
+    'inline; filename="invoice-download-nonce-1.pdf"',
   )
 })
 

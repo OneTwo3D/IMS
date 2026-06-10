@@ -6,6 +6,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { freshAuthFailureResult, requireAdmin, requireFreshAdmin, requirePermission } from '@/lib/auth/server'
 import type { AuthSession } from '@/lib/auth/server'
+import { validateUserPassword } from '@/lib/security/password-policy'
 
 const VALID_ROLES = ['ADMIN', 'MANAGER', 'WAREHOUSE', 'FINANCE', 'READONLY', 'SUPPLIER'] as const
 type ValidRole = typeof VALID_ROLES[number]
@@ -91,7 +92,8 @@ export async function createUser(data: {
 
     if (!data.name?.trim()) return { success: false, error: 'Name is required' }
     if (!data.email?.trim()) return { success: false, error: 'Email is required' }
-    if (!data.password || data.password.length < 8) return { success: false, error: 'Password must be at least 8 characters' }
+    const passwordError = validateUserPassword(data.password)
+    if (passwordError) return { success: false, error: passwordError }
     if (!VALID_ROLES.includes(data.role as ValidRole)) return { success: false, error: 'Invalid role' }
 
     const existing = await db.user.findUnique({ where: { email: data.email.trim().toLowerCase() } })
@@ -170,14 +172,16 @@ export async function updateUser(
     if (data.role !== undefined) updateData.role = data.role
     if (data.supplierId !== undefined) updateData.supplierId = data.role === 'SUPPLIER' && data.supplierId ? data.supplierId : null
     if (data.active !== undefined) updateData.active = data.active
-    if (data.password && data.password.length >= 8) {
+    if (data.password !== undefined) {
+      const passwordError = validateUserPassword(data.password)
+      if (passwordError) return { success: false, error: passwordError }
       updateData.passwordHash = await hash(data.password, 12)
     }
     const roleChanged = data.role !== undefined && data.role !== target.role
     const emailChanged = nextEmail !== undefined && nextEmail !== target.email
     const activeChanged = data.active !== undefined && data.active !== target.active
     const supplierChanged = data.supplierId !== undefined && data.supplierId !== target.supplierId
-    const passwordChanged = Boolean(data.password && data.password.length >= 8)
+    const passwordChanged = data.password !== undefined
     if (roleChanged || emailChanged || activeChanged || supplierChanged || passwordChanged) {
       updateData.sessionVersion = { increment: 1 }
       if (data.active === false) updateData.forceLogoutAt = new Date()

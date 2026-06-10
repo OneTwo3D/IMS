@@ -3,10 +3,9 @@
  * These are not Xero-specific; any accounting connector can save PDFs to disk.
  * Xero-specific download logic stays in lib/connectors/xero/invoice-pdf.ts.
  *
- * Invoice PDF tokens are replayable within their TTL by design: they are
- * shareable signed links, not single-use capabilities. The nonce gives each
- * generated link unique entropy for auditing and cache isolation, not one-shot
- * consumption semantics.
+ * Invoice PDF tokens are replayable within their short TTL by design, but
+ * generated links are bound to the IMS session context and client IP so copied
+ * tokens cannot be replayed from another browser/session boundary.
  */
 
 import { constants } from 'node:fs'
@@ -21,8 +20,8 @@ const SAFE_INVOICE_PDF_ID = /^[a-zA-Z0-9][a-zA-Z0-9._-]*$/
 const MAX_INVOICE_PDF_ID_LENGTH = 256
 const INVOICE_PDF_TOKEN_PURPOSE = 'invoice-pdf'
 const INVOICE_PDF_TOKEN_VERSION = 1
-const DEFAULT_INVOICE_PDF_TOKEN_TTL_SECONDS = 3 * 24 * 60 * 60
-const MAX_INVOICE_PDF_TOKEN_TTL_SECONDS = 30 * 24 * 60 * 60
+const DEFAULT_INVOICE_PDF_TOKEN_TTL_SECONDS = 10 * 60
+const MAX_INVOICE_PDF_TOKEN_TTL_SECONDS = 10 * 60
 const INVOICE_PDF_TOKEN_CLOCK_SKEW_SECONDS = 5 * 60
 
 export type InvoicePdfTokenPayload = {
@@ -32,6 +31,8 @@ export type InvoicePdfTokenPayload = {
   iat: number
   exp: number
   nonce: string
+  sid?: string
+  ip?: string
 }
 
 export type PdfTokenVerificationFailureReason =
@@ -41,6 +42,9 @@ export type PdfTokenVerificationFailureReason =
   | 'wrong_version'
   | 'wrong_purpose'
   | 'wrong_order'
+  | 'missing_binding'
+  | 'wrong_session'
+  | 'wrong_ip'
   | 'not_yet_valid'
   | 'ttl_exceeded'
   | 'expired'
@@ -62,6 +66,17 @@ type TokenOptions = {
   ttlSeconds?: number
   nonce?: string
   env?: Record<string, string | undefined>
+  binding?: InvoicePdfTokenBinding
+}
+
+export type InvoicePdfTokenBinding = {
+  sessionId: string
+  clientIp: string
+}
+
+type VerifyTokenOptions = Pick<TokenOptions, 'now'> & {
+  binding?: InvoicePdfTokenBinding | null
+  requireBinding?: boolean
 }
 
 function configuredInvoicePdfStorageDir(env: Record<string, string | undefined> = process.env): string {
@@ -169,6 +184,10 @@ function hmacHex(value: string): string {
   return createHmac('sha256', getSigningSecret()).update(value, 'utf8').digest('hex')
 }
 
+function bindingDigest(kind: 'session' | 'ip', value: string): string {
+  return hmacHex(`${kind}:${value}`)
+}
+
 function constantTimeEqual(a: string, b: string): boolean {
   const aBuffer = Buffer.from(a, 'utf8')
   const bBuffer = Buffer.from(b, 'utf8')
@@ -191,6 +210,8 @@ function parsePayload(encoded: string): InvoicePdfTokenPayload | null {
     if (typeof payload.iat !== 'number' || !Number.isSafeInteger(payload.iat)) return null
     if (typeof payload.exp !== 'number' || !Number.isSafeInteger(payload.exp)) return null
     if (typeof payload.nonce !== 'string' || payload.nonce.length === 0) return null
+    if (payload.sid !== undefined && (typeof payload.sid !== 'string' || payload.sid.length === 0)) return null
+    if (payload.ip !== undefined && (typeof payload.ip !== 'string' || payload.ip.length === 0)) return null
 
     return {
       v: payload.v as typeof INVOICE_PDF_TOKEN_VERSION,
@@ -199,6 +220,8 @@ function parsePayload(encoded: string): InvoicePdfTokenPayload | null {
       iat: payload.iat,
       exp: payload.exp,
       nonce: payload.nonce,
+      sid: payload.sid,
+      ip: payload.ip,
     }
   } catch {
     return null
@@ -260,6 +283,8 @@ export function signPdfToken(orderId: string, options: TokenOptions = {}): strin
     iat: issuedAt,
     exp: issuedAt + ttlSeconds,
     nonce: options.nonce ?? randomBytes(16).toString('base64url'),
+    sid: options.binding ? bindingDigest('session', options.binding.sessionId) : undefined,
+    ip: options.binding ? bindingDigest('ip', options.binding.clientIp) : undefined,
   }
   const encodedPayload = encodePayload(payload)
   return `${encodedPayload}.${hmacHex(encodedPayload)}`
@@ -269,7 +294,7 @@ export function signPdfToken(orderId: string, options: TokenOptions = {}): strin
 export function verifyPdfTokenDetailed(
   orderId: string,
   token: string | null | undefined,
-  options: Pick<TokenOptions, 'now'> = {},
+  options: VerifyTokenOptions = {},
 ): PdfTokenVerificationResult {
   if (!token) return { valid: false, reason: 'missing' }
 
@@ -292,6 +317,19 @@ export function verifyPdfTokenDetailed(
     return { valid: false, reason: 'wrong_purpose' }
   }
   if (payload.sub !== orderId) return { valid: false, reason: 'wrong_order' }
+  const hasBinding = Boolean(payload.sid && payload.ip)
+  if (options.requireBinding && !hasBinding) {
+    return { valid: false, reason: 'missing_binding' }
+  }
+  if (hasBinding) {
+    if (!options.binding) return { valid: false, reason: 'missing_binding' }
+    if (payload.sid !== bindingDigest('session', options.binding.sessionId)) {
+      return { valid: false, reason: 'wrong_session' }
+    }
+    if (payload.ip !== bindingDigest('ip', options.binding.clientIp)) {
+      return { valid: false, reason: 'wrong_ip' }
+    }
+  }
 
   const now = nowSeconds(options.now)
   if (payload.iat > payload.exp) return { valid: false, reason: 'malformed' }
@@ -307,7 +345,7 @@ export function verifyPdfTokenDetailed(
 }
 
 /** Get a signed public URL for downloading the invoice PDF */
-export function getInvoiceDownloadUrl(orderId: string): string {
-  const token = signPdfToken(orderId)
+export function getInvoiceDownloadUrl(orderId: string, binding: InvoicePdfTokenBinding): string {
+  const token = signPdfToken(orderId, { binding })
   return `/api/invoices/${orderId}?token=${token}`
 }

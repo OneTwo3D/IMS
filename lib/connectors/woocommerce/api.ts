@@ -3,6 +3,14 @@ import { connectorFetch } from '@/lib/security/connector-fetch'
 import type { ConnectorCredentials } from '../types'
 import { validateWooCommerceBaseUrl } from './url-safety'
 
+const GENERIC_WC_NOT_CONFIGURED_ERROR = 'WooCommerce integration is not configured.'
+
+function logMissingWooCommerceCredentials(): void {
+  console.warn('[woocommerce-api] missing required WooCommerce settings', {
+    missing: ['wc_url', 'wc_consumer_key', 'wc_consumer_secret'],
+  })
+}
+
 async function readErrorDetails(res: Response): Promise<string> {
   const contentType = res.headers.get('content-type') ?? ''
   try {
@@ -50,9 +58,10 @@ export async function wcFetch(
   params: Record<string, string> = {},
   creds?: ConnectorCredentials | null,
 ): Promise<{ data: unknown; totalPages: number; totalItems: number; error?: string }> {
-  const credentials = creds ?? (await getWcCredentials())
+  const credentials = creds === undefined ? await getWcCredentials() : creds
   if (!credentials) {
-    return { data: null, totalPages: 0, totalItems: 0, error: 'WooCommerce not configured. Set wc_url, wc_consumer_key, wc_consumer_secret in Settings.' }
+    logMissingWooCommerceCredentials()
+    return { data: null, totalPages: 0, totalItems: 0, error: GENERIC_WC_NOT_CONFIGURED_ERROR }
   }
   const validatedCredentials = validateWooCommerceCredentials(credentials)
   if (!validatedCredentials.ok) {
@@ -92,8 +101,11 @@ export async function wcPost(
   body: unknown,
   creds?: ConnectorCredentials | null,
 ): Promise<{ data: unknown; error?: string }> {
-  const credentials = creds ?? (await getWcCredentials())
-  if (!credentials) return { data: null, error: 'WooCommerce not configured.' }
+  const credentials = creds === undefined ? await getWcCredentials() : creds
+  if (!credentials) {
+    logMissingWooCommerceCredentials()
+    return { data: null, error: GENERIC_WC_NOT_CONFIGURED_ERROR }
+  }
   const validatedCredentials = validateWooCommerceCredentials(credentials)
   if (!validatedCredentials.ok) return { data: null, error: validatedCredentials.error }
   const safeCredentials = validatedCredentials.credentials
@@ -120,8 +132,11 @@ export async function wcPut(
   body: unknown,
   creds?: ConnectorCredentials | null,
 ): Promise<{ data: unknown; error?: string }> {
-  const credentials = creds ?? (await getWcCredentials())
-  if (!credentials) return { data: null, error: 'WooCommerce not configured.' }
+  const credentials = creds === undefined ? await getWcCredentials() : creds
+  if (!credentials) {
+    logMissingWooCommerceCredentials()
+    return { data: null, error: GENERIC_WC_NOT_CONFIGURED_ERROR }
+  }
   const validatedCredentials = validateWooCommerceCredentials(credentials)
   if (!validatedCredentials.ok) return { data: null, error: validatedCredentials.error }
   const safeCredentials = validatedCredentials.credentials

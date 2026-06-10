@@ -276,7 +276,7 @@ Key variables in the `.env` file:
 | `NEXT_PUBLIC_APP_URL` | Public URL of the application (e.g. `https://ims.yourdomain.com`) |
 | `NODE_ENV` | Set to `production` for deployment |
 | `AUTH_SECRET` | Secret key for signing session tokens (auto-generated) |
-| `INVOICE_PDF_TOKEN_TTL_SECONDS` | Lifetime for public signed invoice PDF download links. Default `259200` (3 days), maximum `2592000` (30 days). Lower values reduce leaked-link exposure; higher values reduce customer "link expired" friction. |
+| `INVOICE_PDF_TOKEN_TTL_SECONDS` | Lifetime for signed invoice PDF download links. Default `600` (10 minutes), maximum `600`. Links are bound to the current IMS session and client IP, so they are not suitable for customer-visible storefront notes. |
 | `INVOICE_PDF_STORAGE_DIR` | Persistent storage directory for connector-downloaded invoice PDFs served through signed links. Defaults locally to `./data/invoices`; required by production preflight. Relative paths resolve against the process working directory, so production values should be absolute |
 | `SETTINGS_ENCRYPTION_KEY` | 32-byte raw key, or base64 value that decodes to 32 bytes, used to encrypt sensitive Setting values stored in the database (auto-generated) |
 | `ENCRYPTION_KEY` | Legacy fallback for older installs; if needed during migration, it must also be a 32-byte raw key or base64 value that decodes to 32 bytes |
