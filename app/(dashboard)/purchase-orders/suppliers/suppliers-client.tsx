@@ -1,8 +1,9 @@
 'use client'
 
 import { useState, useTransition } from 'react'
+import Link from 'next/link'
 import { useRouter, useSearchParams } from 'next/navigation'
-import { Plus, Pencil, X, Loader2, Check } from 'lucide-react'
+import { Plus, Pencil, X, Loader2, Check, ChevronLeft } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { CountrySelect } from '@/components/ui/country-select'
 import { Input } from '@/components/ui/input'
@@ -352,11 +353,19 @@ export function SuppliersClient({ initialSuppliers, taxRates, currencies }: Prop
 
   return (
     <div className="space-y-4">
-      <div className="flex flex-wrap items-center gap-2">
-        <CsvBar exportUrl="/api/export/suppliers" templateUrl="/api/export/suppliers?template=1" importAction={importSuppliersCsv} />
-        <Button size="sm" onClick={() => setEditing(null)}>
-          <Plus className="h-4 w-4 mr-1" />New Supplier
-        </Button>
+      <div className="flex items-center justify-between gap-4">
+        <div className="flex items-center gap-2">
+          <Link href="/purchase-orders" className="text-muted-foreground hover:text-foreground">
+            <ChevronLeft className="h-4 w-4" />
+          </Link>
+          <h1 className="text-2xl font-semibold">Suppliers</h1>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <CsvBar exportUrl="/api/export/suppliers" templateUrl="/api/export/suppliers?template=1" importAction={importSuppliersCsv} />
+          <Button size="sm" onClick={() => setEditing(null)}>
+            <Plus className="h-4 w-4 mr-1" />New Supplier
+          </Button>
+        </div>
       </div>
 
       {initialSuppliers.length === 0 ? (

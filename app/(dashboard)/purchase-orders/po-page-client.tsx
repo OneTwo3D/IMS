@@ -42,7 +42,7 @@ export function PurchaseOrdersClient({ initialPos, suppliers, products, warehous
 
   return (
     <div className="space-y-4">
-      <div className="space-y-3">
+      <div className="flex items-center justify-between gap-4">
         <h1 className="text-2xl font-semibold">Purchase Orders</h1>
         <div className="flex flex-wrap items-center gap-2">
           <CsvBar exportUrl="/api/export/purchase-orders" templateUrl="/api/export/purchase-orders?template=1" importAction={importPurchaseOrdersCsv} />

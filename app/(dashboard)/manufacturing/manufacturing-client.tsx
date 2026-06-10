@@ -117,14 +117,16 @@ export function ManufacturingClient({ initialRows, initialTotal }: Props) {
   return (
     <div className="space-y-4">
       <div className="space-y-2">
-        <h1 className="text-2xl font-semibold">Manufacturing</h1>
-        <div className="flex flex-wrap items-center gap-2">
-          <Button variant="outline" size="sm" onClick={handleExport}>
-            <Download className="h-4 w-4 mr-1" />Export
-          </Button>
-          <Button size="sm" onClick={() => setShowCreate(true)}>
-            <Plus className="h-4 w-4 mr-1" />New Order
-          </Button>
+        <div className="flex items-center justify-between gap-4">
+          <h1 className="text-2xl font-semibold">Manufacturing</h1>
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="outline" size="sm" onClick={handleExport}>
+              <Download className="h-4 w-4 mr-1" />Export
+            </Button>
+            <Button size="sm" onClick={() => setShowCreate(true)}>
+              <Plus className="h-4 w-4 mr-1" />New Order
+            </Button>
+          </div>
         </div>
         <p className="text-sm text-muted-foreground">{total} order{total !== 1 ? 's' : ''}</p>
       </div>
