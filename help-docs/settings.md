@@ -91,6 +91,7 @@ Use the **PDF preview** and **Email preview** buttons to see how your template l
 Found at **Settings > Inventory**, this section includes:
 
 - **Warehouses** — create and edit warehouses, default sales/returns warehouses, and store-sync eligibility when a shopping connector is enabled
+- **Product Categories** — manage the reporting category tree. Add top-level categories or sub-categories under any node; rename inline; move a subtree under a new parent (cycles are prevented); delete a node to promote its children one level up and reassign its products to the parent. The same leaf name can be reused under different parents — for example `Apparel > T-Shirts` and `Promo > T-Shirts` are distinct. WooCommerce product sync mirrors the WC category tree into this list automatically, so connected stores stay in step without manual entry.
 - **Stock adjustment reasons** — define selectable reasons for manual stock adjustments
 - **Accounting mapping** — when an accounting connector is enabled, each adjustment reason can be linked to an account code
 

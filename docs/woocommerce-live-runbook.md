@@ -28,6 +28,25 @@ Expected result:
 - IMS product import/update completes without manual cron intervention
 - WooCommerce product data appears in IMS
 
+### 1a. Category mirror
+
+Use this to confirm the WC product-category tree mirrors into IMS during product sync.
+
+1. In WooCommerce, place the product under a nested category (e.g. `Apparel > T-Shirts > V-Neck`). If any of those segments do not exist yet on the WC side, create them with the right parents.
+2. Trigger a product sync (edit + save the product so the `product.updated` webhook fires, or force the action ID).
+3. In IMS:
+   - open **Settings → Inventory → Product Categories** and confirm all three segments now exist, with the correct parent chain
+   - open the synced product in Inventory and verify the **Category** field reads the full path (`Apparel > T-Shirts > V-Neck`)
+4. Now move the product in WooCommerce to a different category at the same depth (e.g. `Promo > T-Shirts`) and re-sync.
+5. Confirm the IMS product's Category updates to the new path and the original tree remains in IMS (we never delete mirrored categories — only add and link). Both `Apparel > T-Shirts` and `Promo > T-Shirts` should coexist as distinct rows.
+
+Expected result:
+
+- the WC category tree appears in **Settings → Inventory** with parents preserved
+- the product is linked to the deepest WC category it carries
+- repeated leaf names under different parents remain distinct
+- a transient WC categories-endpoint failure does not wipe the existing IMS `categoryId` link
+
 ## 2. WC → IMS order create/update
 
 1. Create a WooCommerce order in a status included by IMS order sync.

@@ -57,6 +57,9 @@ The publishing state of a product. Four values:
 **Preferred supplier**
 The supplier the system associates with a product for reorder forecasting. Updated automatically the first time you send a purchase order to a supplier for that product. If you ever need to override (for example, you placed a one-off PO with a backup supplier), you can lock the preferred supplier on the product page.
 
+**Category path**
+A reporting category for a product, written as `Parent > Child > Grand-child` with `>` as the nesting separator. The category tree is managed in **Settings > Inventory**. The same leaf name can be reused under different parents (so `Apparel > T-Shirts` and `Promo > T-Shirts` are distinct), and the path is what the inventory table, exports, and filter dropdowns display. WooCommerce mirrors its store category tree into this list on product sync.
+
 
 ## Purchasing
 

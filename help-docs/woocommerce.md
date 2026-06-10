@@ -131,6 +131,7 @@ The **Products** tab controls bidirectional product synchronisation.
 - Weight and dimensions (length, width, height)
 - GTIN/barcode from WooCommerce's `global_unique_id` field (only written if the IMS barcode field is empty)
 - HS code and country of origin from WC product attributes (only written if the IMS fields are empty)
+- **Categories** — the WC product-category tree is mirrored into IMS. Each WC category becomes an IMS reporting category with its WC parent chain preserved (so `Apparel > T-Shirts > V-Neck` arrives as a 3-level path). The product is linked to its **deepest** WC category. The mirror is cached for 5 minutes so per-product webhooks do not re-fetch the whole tree. If the WC categories endpoint is unreachable, the product's existing category link is left alone rather than wiped.
 - Variable products: all variations are synced as child VARIANT products linked to the parent
 - Variation attributes are synced for the options panel
 

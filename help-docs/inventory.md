@@ -61,6 +61,7 @@ Click **New Product** to open the product form. The following fields are availab
 |---|---|
 | **SKU** | A unique code that identifies the product. |
 | **Name** | The display name shown throughout the system. |
+| **Category** | Reporting category as a path with `>` as the nesting separator (e.g. `Apparel > T-Shirts`). Pick from the dropdown — it lists every known category as a full path — or type a new path and the system creates each missing segment on save. Two leaves with the same name under different parents (`Apparel > T-Shirts` vs `Promo > T-Shirts`) are distinct. Manage the full tree in **Settings > Inventory**. |
 | **Type** | The product type (see below). |
 | **Barcode** | An optional barcode or EAN for scanning. |
 | **HS Code** | The Harmonised System code for customs declarations. |
