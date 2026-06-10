@@ -19,6 +19,7 @@ import {
   assertIntegrationConnectionTestPassed,
   buildIntegrationConnectionFingerprint,
   getIntegrationConnectionTestState,
+  integrationConnectionFingerprintSecret,
   recordIntegrationConnectionTest,
   type IntegrationConnectionTestState,
 } from '@/lib/integration-connection-test-gate'
@@ -45,8 +46,9 @@ export async function getXeroSettingsMasked(): Promise<XeroSettings & { secretMa
 }
 
 async function buildXeroConnectionFingerprint(): Promise<string> {
-  const [clientId, expectedTenantId, token] = await Promise.all([
+  const [clientId, clientSecret, expectedTenantId, token] = await Promise.all([
     getSettingValue('xero_client_id'),
+    getSettingValue('xero_client_secret'),
     getSettingValue('xero_expected_tenant_id'),
     db.accountingToken.findUnique({
       where: { connector: 'xero' },
@@ -55,6 +57,7 @@ async function buildXeroConnectionFingerprint(): Promise<string> {
   ])
   return buildIntegrationConnectionFingerprint({
     clientId: clientId ?? '',
+    clientSecret: integrationConnectionFingerprintSecret(clientSecret ?? ''),
     expectedTenantId: expectedTenantId ?? '',
     tenantId: token?.tenantId ?? '',
     tenantName: token?.tenantName ?? '',

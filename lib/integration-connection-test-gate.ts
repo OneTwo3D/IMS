@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto'
+import { createHash, createHmac } from 'node:crypto'
 
 import { db } from '@/lib/db'
 
@@ -23,28 +23,80 @@ type SettingRepository = {
     create: { key: string; value: string }
     update: { value: string }
   }): Promise<unknown>
+  transaction?(operations: Array<() => Promise<unknown>>): Promise<unknown>
 }
 
 const TEST_KEYS = ['status', 'tested_at', 'message', 'fingerprint'] as const
+const SECRET_FINGERPRINT_MARKER = '__imsConnectionFingerprintSecret'
+
+export type IntegrationConnectionFingerprintSecret = {
+  [SECRET_FINGERPRINT_MARKER]: true
+  value: string
+}
 
 function testSettingKey(id: IntegrationConnectionId, suffix: (typeof TEST_KEYS)[number]): string {
   return `${id}_connection_test_${suffix}`
 }
 
+function getFingerprintHmacKey(): string {
+  const key = process.env.INTEGRATION_CONNECTION_FINGERPRINT_KEY
+    ?? process.env.AUTH_SECRET
+    ?? process.env.NEXTAUTH_SECRET
+    ?? process.env.SETTINGS_ENCRYPTION_KEY
+    ?? process.env.ENCRYPTION_KEY
+  if (key) return key
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('INTEGRATION_CONNECTION_FINGERPRINT_KEY or AUTH_SECRET is required to fingerprint integration secrets')
+  }
+  return 'ims-development-connection-fingerprint-key'
+}
+
+function isFingerprintSecret(value: unknown): value is IntegrationConnectionFingerprintSecret {
+  return Boolean(
+    value
+      && typeof value === 'object'
+      && (value as Partial<IntegrationConnectionFingerprintSecret>)[SECRET_FINGERPRINT_MARKER] === true,
+  )
+}
+
+export function integrationConnectionFingerprintSecret(value: string | null | undefined): IntegrationConnectionFingerprintSecret {
+  return { [SECRET_FINGERPRINT_MARKER]: true, value: value ?? '' }
+}
+
+function fingerprintSecretValue(value: string): string {
+  return createHmac('sha256', getFingerprintHmacKey()).update(value).digest('hex')
+}
+
 function normalizeForFingerprint(value: unknown): unknown {
-  if (value == null) return null
+  if (isFingerprintSecret(value)) return { secretHmac: fingerprintSecretValue(value.value) }
+  if (value == null || value === '') return undefined
   if (value instanceof Date) return value.toISOString()
-  if (Array.isArray(value)) return value.map((entry) => normalizeForFingerprint(entry))
+  if (Array.isArray(value)) {
+    return value
+      .map((entry) => normalizeForFingerprint(entry))
+      .filter((entry) => entry !== undefined)
+  }
   if (typeof value === 'object') {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
         .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, entry]) => [key, normalizeForFingerprint(entry)]),
+        .map(([key, entry]) => [key, normalizeForFingerprint(entry)])
+        .filter((entry): entry is [string, unknown] => entry[1] !== undefined),
     )
   }
   return String(value)
 }
 
+/**
+ * Builds the durable fingerprint used by integration settings gates.
+ *
+ * Include every setting that affects connectivity. Secret values must be wrapped
+ * with `integrationConnectionFingerprintSecret(...)`; they are HMACed with a
+ * server-side key before the fingerprint is stored so a read-only database dump
+ * cannot be used for offline password guessing. Absent values (`undefined`,
+ * `null`, and empty strings) are normalized out so equivalent empty UI states do
+ * not force unnecessary retests.
+ */
 export function buildIntegrationConnectionFingerprint(parts: Record<string, unknown>): string {
   const normalized = normalizeForFingerprint(parts)
   return createHash('sha256').update(JSON.stringify(normalized)).digest('hex')
@@ -96,7 +148,12 @@ export async function recordIntegrationConnectionTest(
     message: string
     testedAt?: Date
   },
-  repository: Pick<SettingRepository, 'upsert'> = db.setting,
+  repository: Pick<SettingRepository, 'upsert' | 'transaction'> = {
+    upsert: (args) => db.setting.upsert(args),
+    transaction: async (operations) => {
+      await db.$transaction(operations.map((operation) => operation() as never))
+    },
+  },
 ): Promise<void> {
   const testedAt = params.testedAt ?? new Date()
   const values: Record<(typeof TEST_KEYS)[number], string> = {
@@ -106,13 +163,18 @@ export async function recordIntegrationConnectionTest(
     fingerprint: params.fingerprint,
   }
 
-  await Promise.all(TEST_KEYS.map((suffix) =>
+  const operations = TEST_KEYS.map((suffix) => () =>
     repository.upsert({
       where: { key: testSettingKey(id, suffix) },
       create: { key: testSettingKey(id, suffix), value: values[suffix] },
       update: { value: values[suffix] },
     }),
-  ))
+  )
+  if (repository.transaction) {
+    await repository.transaction(operations)
+  } else {
+    await Promise.all(operations.map((operation) => operation()))
+  }
 }
 
 export async function assertIntegrationConnectionTestPassed(

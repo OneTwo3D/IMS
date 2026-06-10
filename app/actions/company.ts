@@ -11,6 +11,7 @@ import { sendEmailWithSmtpSettings } from '@/lib/mailer'
 import {
   assertIntegrationConnectionTestPassed,
   buildIntegrationConnectionFingerprint,
+  integrationConnectionFingerprintSecret,
   recordIntegrationConnectionTest,
 } from '@/lib/integration-connection-test-gate'
 
@@ -322,7 +323,7 @@ async function buildEmailConnectionFingerprint(data: EmailSettings): Promise<str
     host: data.smtp_host.trim(),
     port: data.smtp_port.trim(),
     user: data.smtp_user.trim(),
-    pass: storedPassword,
+    pass: integrationConnectionFingerprintSecret(storedPassword),
     secure: data.smtp_secure.trim(),
     fromName: data.from_name.trim(),
     fromEmail: data.from_email.trim(),

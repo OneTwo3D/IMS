@@ -21,12 +21,14 @@ import {
   WC_SETTINGS_VERSION_KEY,
 } from '@/lib/connectors/woocommerce/sync-lock'
 import {
-  assertIntegrationConnectionTestPassed,
-  buildIntegrationConnectionFingerprint,
   getIntegrationConnectionTestState,
   recordIntegrationConnectionTest,
   type IntegrationConnectionTestState,
 } from '@/lib/integration-connection-test-gate'
+import {
+  buildWooCommerceConnectionFingerprint,
+  evaluateWooCommerceEnableConnectionGate,
+} from '@/lib/connectors/woocommerce/connection-test-gate'
 
 // All mutating exports in this file require the `sync` permission.
 async function requireAdmin() {
@@ -63,13 +65,6 @@ export type WcSyncSettings = {
   last_wc_fx_push_at: string
   envOverrides: Record<string, string>
 }
-
-const WC_ENABLE_SETTING_KEYS = [
-  'wc_sync_enabled',
-  'wc_sync_product_enabled',
-  'wc_stock_sync_enabled',
-  'wc_fx_push_enabled',
-] as const
 
 const SYNC_SETTING_KEYS = [
   'wc_sync_enabled', 'wc_sync_order_statuses', 'wc_sync_interval_minutes',
@@ -177,32 +172,17 @@ async function validateWooStoreBaseCurrency(credentials?: { url: string; key: st
   return { ok: true, storeCurrency, baseCurrency }
 }
 
-function buildWcConnectionFingerprint(input: { url: string; key: string; secret: string }): string {
-  return buildIntegrationConnectionFingerprint({
-    url: input.url.trim(),
-    key: input.key.trim(),
-    secret: input.secret.trim(),
-  })
-}
-
 async function getCurrentWcConnectionFingerprint(): Promise<string> {
   const [url, key, secret] = await Promise.all([
     getSettingValue('wc_url'),
     getSettingValue('wc_consumer_key'),
     getSettingValue('wc_consumer_secret'),
   ])
-  return buildWcConnectionFingerprint({
+  return buildWooCommerceConnectionFingerprint({
     url: url ?? '',
     key: key ?? '',
     secret: secret ?? '',
   })
-}
-
-async function shouldGateWcEnable(data: Partial<WcSyncSettings>): Promise<boolean> {
-  const enabledKeys = WC_ENABLE_SETTING_KEYS.filter((key) => data[key] === 'true')
-  if (enabledKeys.length === 0) return false
-  const current = await getSettingValues([...enabledKeys])
-  return enabledKeys.some((key) => current.get(key) !== 'true')
 }
 
 export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise<{ success: boolean; error?: string }> {
@@ -214,10 +194,12 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
     const validation = await validateWooStoreBaseCurrency()
     if (!validation.ok) return { success: false, error: validation.error }
   }
-  if (await shouldGateWcEnable(data)) {
-    const gate = await assertIntegrationConnectionTestPassed('woocommerce', await getCurrentWcConnectionFingerprint(), 'WooCommerce')
-    if (!gate.ok) return { success: false, error: gate.error }
-  }
+  const gate = await evaluateWooCommerceEnableConnectionGate(data, {
+    getCurrentSettings: (keys) => getSettingValues([...keys]),
+    getCurrentFingerprint: getCurrentWcConnectionFingerprint,
+    getConnectionTestState: () => getIntegrationConnectionTestState('woocommerce'),
+  })
+  if (!gate.ok) return { success: false, error: gate.error }
   const ops = Object.entries(data)
     .filter((entry): entry is [string, string] => SYNC_SETTING_KEYS.includes(entry[0]) && typeof entry[1] === 'string')
     .map(([k, v]) =>
@@ -293,7 +275,7 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     key: currentKey ?? '',
     secret: currentSecret ?? '',
   })
-  const testFingerprint = buildWcConnectionFingerprint({
+  const testFingerprint = buildWooCommerceConnectionFingerprint({
     url: validatedUrl.normalizedUrl,
     key: currentKey ?? '',
     secret: currentSecret ?? '',
@@ -467,7 +449,7 @@ export async function testWcCredentials(url: string, key: string, secret: string
   const nextSecret = secret.trim()
   const currentKey = isMaskedSecret(nextKey) ? await getSettingValue('wc_consumer_key') : nextKey
   const currentSecret = isMaskedSecret(nextSecret) || !nextSecret ? await getSettingValue('wc_consumer_secret') : nextSecret
-  const fingerprint = buildWcConnectionFingerprint({
+  const fingerprint = buildWooCommerceConnectionFingerprint({
     url: validatedUrl.normalizedUrl,
     key: currentKey ?? '',
     secret: currentSecret ?? '',

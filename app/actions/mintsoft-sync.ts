@@ -41,6 +41,7 @@ import { maskSecret } from '@/lib/security/secret-mask'
 import {
   buildIntegrationConnectionFingerprint,
   getIntegrationConnectionTestState,
+  integrationConnectionFingerprintSecret,
   recordIntegrationConnectionTest,
   type IntegrationConnectionTestState,
 } from '@/lib/integration-connection-test-gate'
@@ -642,7 +643,7 @@ function buildMintsoftConnectionFingerprint(input: {
   return buildIntegrationConnectionFingerprint({
     baseUrl: input.baseUrl.trim(),
     username: input.username.trim(),
-    password: input.password.trim(),
+    password: integrationConnectionFingerprintSecret(input.password.trim()),
     orderLookupConnector: input.orderLookupConnector ?? '',
   })
 }
