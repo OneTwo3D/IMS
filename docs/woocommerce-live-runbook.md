@@ -5,6 +5,7 @@ Use this runbook for scoped stage/live WooCommerce verification after connector 
 ## Preconditions
 
 - WooCommerce connector is configured in IMS
+- A successful **Test Connection** has been recorded against the current WooCommerce credentials in IMS (Sync → WooCommerce → Test Connection). Without this, sync is gated off and webhook deliveries are accepted but not processed against state — the connection test gate is a hard precondition, not a checkbox.
 - Initial WooCommerce order import has already completed
 - WooCommerce order/product webhooks are configured and signing correctly
 - At least one IMS warehouse intended for WooCommerce fulfillment has **Sync to WooCommerce** enabled
@@ -82,7 +83,47 @@ Expected result:
 - repeated saves are safe
 - reflected `order.updated` webhook events are suppressed rather than re-processing the order
 
-## 5. Backup reconciliation check
+## 5. Customer-facing invoice PDF download
+
+1. Pick an IMS-generated invoice for a WooCommerce-backed order.
+2. From the WC storefront, sign in as the order's customer and open the order page.
+3. Click **Download Invoice**.
+4. Verify:
+   - The download link is served via the `wc-invoice-handoff` WordPress helper plugin (not a direct IMS URL).
+   - The token used by the handoff is single-use and scoped to that customer + order.
+   - The PDF streams back through the storefront, not via an IMS login redirect.
+5. Repeat the download from a different network/incognito session as the same customer to confirm a fresh token is issued for each request.
+6. Attempt to download as a different customer or while signed out — both must be rejected.
+7. In IMS, confirm the activity log carries `invoice_pdf_customer_download` entries with the WC order id, not the customer's credentials.
+
+Expected result:
+
+- the customer can download their own invoice without an IMS account
+- tokens cannot be replayed across customers, sessions, or networks
+- redacted activity-log entries record each access for audit
+
+
+## 6. Pending FX retry queue
+
+1. Force a WooCommerce order in a foreign currency for which the FX rate is intentionally missing (e.g. a currency with no `FxRate` row for the order's `paidAt` date).
+2. Observe the sync attempt:
+   - The order is recorded in `wc_pending_fx_orders` with the missing rate's date and currency.
+   - Sync is deferred (no half-finished journal posting).
+   - An activity-log entry `wc_order_pending_fx` is written.
+3. Populate the missing FX rate (manually upsert, or run `GET /api/cron/fx-rates`).
+4. Trigger `GET /api/cron/wc-fx-retry` (or wait for the hourly cron).
+5. Confirm:
+   - The pending row is drained and the order syncs to Xero with the now-available rate.
+   - The activity log records `wc_order_fx_retry_succeeded`.
+   - No duplicate journal entries appear in Xero.
+
+Expected result:
+
+- missing-rate orders are queued, not silently failed
+- once the rate appears the order syncs idempotently on the next retry pass
+
+
+## 7. Backup reconciliation check
 
 Use this only to validate the backup path, not as the primary success criterion.
 

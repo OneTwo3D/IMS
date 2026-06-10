@@ -9,6 +9,10 @@ Mintsoft is the WMS connector for stock alignment, ASN creation, product verific
 - `WmsStockSyncMode` decides whether a warehouse is notification-only or allowed to align IMS quantities to Mintsoft.
 - `WmsReturnsMode` controls returns polling/webhook behavior per warehouse.
 
+### Connection Test Gate
+
+Mintsoft connector settings cannot be marked active until a **Test Connection** succeeds against the current credential fingerprint. The save form runs the test inline before persisting, so saving with bad credentials is impossible from the UI. The fingerprint (a SHA256 of the credential payload) is written to the activity log on each test, so silent credential rotation is visible in the audit trail. Changing any byte of the credentials invalidates the gate and forces a fresh test before sync resumes.
+
 ## Stock Alignment
 
 - Mintsoft stock is normalized and consolidated before comparison with IMS.
