@@ -80,33 +80,118 @@ export function NavGroup({ label, icon: Icon, items, collapsed, onExpand, onNavi
 
       {open && (
         <div className="ml-4 mt-0.5 flex flex-col gap-0.5 border-l border-border pl-3">
-          {items.map((child, idx) => {
-            if (!isLink(child)) {
-              return (
-                <div
-                  key={`h-${idx}-${child.heading}`}
-                  className="mt-2 first:mt-0 px-2 pt-1 pb-0.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70 select-none"
-                >
-                  {child.heading}
-                </div>
-              )
-            }
-            const isActive = isChildActive(child)
-            return (
-              <Link
-                key={child.href}
-                href={child.href}
-                onClick={onNavigate}
-                className={cn(
-                  'rounded-md px-2 py-1.5 text-sm transition-colors',
-                  'hover:bg-accent hover:text-accent-foreground',
-                  isActive ? 'bg-accent text-accent-foreground font-medium' : 'text-muted-foreground',
-                )}
-              >
-                {child.label}
-              </Link>
-            )
-          })}
+          {renderItems(items, isChildActive, onNavigate)}
+        </div>
+      )}
+    </div>
+  )
+}
+
+type Section = { heading: string | null; links: NavLink[] }
+
+function groupIntoSections(items: NavChild[]): Section[] {
+  const sections: Section[] = []
+  let current: Section | null = null
+  for (const item of items) {
+    if (isLink(item)) {
+      if (!current) {
+        current = { heading: null, links: [] }
+        sections.push(current)
+      }
+      current.links.push(item)
+    } else {
+      current = { heading: item.heading, links: [] }
+      sections.push(current)
+    }
+  }
+  return sections
+}
+
+function renderItems(
+  items: NavChild[],
+  isChildActive: (c: NavLink) => boolean,
+  onNavigate?: () => void,
+) {
+  const sections = groupIntoSections(items)
+  const hasHeadings = sections.some((s) => s.heading !== null)
+  if (!hasHeadings) {
+    return sections.flatMap((s) =>
+      s.links.map((link) => (
+        <ChildLink key={link.href} link={link} isActive={isChildActive(link)} onNavigate={onNavigate} />
+      )),
+    )
+  }
+  return sections.map((section, idx) =>
+    section.heading === null ? (
+      <div key={`pre-${idx}`} className="flex flex-col gap-0.5">
+        {section.links.map((link) => (
+          <ChildLink key={link.href} link={link} isActive={isChildActive(link)} onNavigate={onNavigate} />
+        ))}
+      </div>
+    ) : (
+      <CollapsibleSection
+        key={`section-${idx}-${section.heading}`}
+        heading={section.heading}
+        links={section.links}
+        isChildActive={isChildActive}
+        onNavigate={onNavigate}
+      />
+    ),
+  )
+}
+
+function ChildLink({ link, isActive, onNavigate }: { link: NavLink; isActive: boolean; onNavigate?: () => void }) {
+  return (
+    <Link
+      href={link.href}
+      onClick={onNavigate}
+      className={cn(
+        'rounded-md px-2 py-1.5 text-sm transition-colors',
+        'hover:bg-accent hover:text-accent-foreground',
+        isActive ? 'bg-accent text-accent-foreground font-medium' : 'text-muted-foreground',
+      )}
+    >
+      {link.label}
+    </Link>
+  )
+}
+
+function CollapsibleSection({
+  heading,
+  links,
+  isChildActive,
+  onNavigate,
+}: {
+  heading: string
+  links: NavLink[]
+  isChildActive: (c: NavLink) => boolean
+  onNavigate?: () => void
+}) {
+  const hasActiveLink = links.some(isChildActive)
+  const [expandedByUser, setExpandedByUser] = useState(false)
+  const open = hasActiveLink || expandedByUser
+  return (
+    <div className="mt-2 first:mt-0">
+      <button
+        type="button"
+        onClick={() => setExpandedByUser((v) => !v)}
+        className={cn(
+          'flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-[10px] font-semibold uppercase tracking-wider transition-colors select-none cursor-pointer',
+          'hover:text-foreground',
+          hasActiveLink ? 'text-foreground' : 'text-muted-foreground/70',
+        )}
+        aria-expanded={open}
+      >
+        <ChevronDown
+          className={cn('h-3 w-3 shrink-0 transition-transform', open ? 'rotate-0' : '-rotate-90')}
+        />
+        <span className="truncate text-left">{heading}</span>
+      </button>
+      {open && (
+        <div className="mt-0.5 flex flex-col gap-0.5">
+          {links.map((link) => (
+            <ChildLink key={link.href} link={link} isActive={isChildActive(link)} onNavigate={onNavigate} />
+          ))}
         </div>
       )}
     </div>
