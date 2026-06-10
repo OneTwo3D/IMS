@@ -20,7 +20,8 @@ function rewriteHelpHref(href: string | undefined): string | undefined {
 
 type HelpMarkdownLinkProps = ComponentPropsWithoutRef<'a'> & { node?: unknown }
 
-function HelpMarkdownLink({ href, children, node: _node, ...props }: HelpMarkdownLinkProps) {
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+function HelpMarkdownLink({ href, children, node, ...props }: HelpMarkdownLinkProps) {
   const rewritten = rewriteHelpHref(href)
   if (rewritten && rewritten.startsWith('/help/')) {
     return <Link href={rewritten} {...props}>{children}</Link>
