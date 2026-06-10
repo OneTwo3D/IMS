@@ -188,7 +188,7 @@ function CollapsibleSection({
         <span className="truncate text-left">{heading}</span>
       </button>
       {open && (
-        <div className="mt-0.5 flex flex-col gap-0.5">
+        <div className="mt-0.5 flex flex-col gap-0.5 pl-5">
           {links.map((link) => (
             <ChildLink key={link.href} link={link} isActive={isChildActive(link)} onNavigate={onNavigate} />
           ))}
