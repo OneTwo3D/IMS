@@ -21,7 +21,7 @@ type Props = {
   lifecycleStatus?: string
   categoryId?: string
   supplierId?: string
-  productCategories: { id: string; name: string; parentId: string | null }[]
+  productCategories: { id: string; name: string; parentId: string | null; path: string }[]
   supplierOptions: { id: string; name: string }[]
 }
 
@@ -140,7 +140,7 @@ export function ProductFilters({ search, type, lifecycleStatus, categoryId, supp
         >
           <option value="">All Categories</option>
           {productCategories.map((category) => (
-            <option key={category.id} value={category.id}>{category.name}</option>
+            <option key={category.id} value={category.id}>{category.path}</option>
           ))}
         </Select>
       </div>

@@ -24,10 +24,10 @@ import {
 import { detectComponentCycle } from '@/lib/products/component-cycle'
 import {
   cleanProductCategoryName,
-  listProductCategoryOptions,
+  listProductCategoryNodes,
   PRODUCT_CATEGORY_NAME_MAX_LENGTH,
   resolveProductCategoryIdByName,
-  type ProductCategoryOption,
+  type ProductCategoryNode,
 } from '@/lib/products/categories'
 import type { ProductLifecycleStatus, TaxCategory } from '@/app/generated/prisma/client'
 
@@ -162,6 +162,9 @@ export async function listProducts(params: {
     ...(params.supplierId ? { preferredSupplierId: params.supplierId } : {}),
   }
 
+  const categoryNodes = await listProductCategoryNodes()
+  const categoryPathById = new Map(categoryNodes.map((n) => [n.id, n.path] as const))
+
   const [rawProducts, total] = await Promise.all([
     db.product.findMany({
       where,
@@ -258,7 +261,7 @@ export async function listProducts(params: {
     sku: p.sku,
     name: p.name,
     categoryId: p.category?.id ?? null,
-    categoryName: p.category?.name ?? null,
+    categoryName: p.category ? (categoryPathById.get(p.category.id) ?? p.category.name) : null,
     type: p.type,
     parentSku: p.parent?.sku ?? null,
     preferredSupplierId: p.preferredSupplier?.id ?? null,
@@ -310,6 +313,8 @@ export async function listProducts(params: {
 
 export async function getProduct(id: string): Promise<ProductDetail | null> {
   await requireAuth()
+  const categoryNodes = await listProductCategoryNodes()
+  const categoryPathById = new Map(categoryNodes.map((n) => [n.id, n.path] as const))
   const [p, activeOrderLines, inTransferLines, openPoLines] = await Promise.all([
     db.product.findUnique({
       where: { id },
@@ -447,7 +452,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     sku: p.sku,
     name: p.name,
     categoryId: p.category?.id ?? null,
-    categoryName: p.category?.name ?? null,
+    categoryName: p.category ? (categoryPathById.get(p.category.id) ?? p.category.name) : null,
     description: p.description,
     type: p.type,
     parentId: p.parentId,
@@ -490,7 +495,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       sku: v.sku,
       name: v.name,
       categoryId: v.category?.id ?? null,
-      categoryName: v.category?.name ?? null,
+      categoryName: v.category ? (categoryPathById.get(v.category.id) ?? v.category.name) : null,
       type: v.type,
       parentSku: p.sku,
       preferredSupplierId: v.preferredSupplier?.id ?? null,
@@ -588,11 +593,11 @@ export async function getVariableProducts() {
   })
 }
 
-export async function listProductCategories(): Promise<ProductCategoryOption[]> {
+export async function listProductCategories(): Promise<ProductCategoryNode[]> {
   // Internal inventory/admin surface only. Re-check ownership/portal semantics
   // before reusing product reporting categories in supplier- or customer-facing UI.
   await requireAuth()
-  return listProductCategoryOptions()
+  return listProductCategoryNodes()
 }
 
 export type ProductSupplierOption = { id: string; name: string }

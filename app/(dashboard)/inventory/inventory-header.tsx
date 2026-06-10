@@ -12,7 +12,7 @@ import { createProduct } from '@/app/actions/products'
 import { importProductsCsv } from '@/app/actions/import'
 
 type VariableProduct = { id: string; sku: string; name: string }
-type ProductCategoryOption = { id: string; name: string; parentId: string | null }
+type ProductCategoryOption = { id: string; name: string; parentId: string | null; path: string }
 type SupplierOption = { id: string; name: string }
 
 type Props = {

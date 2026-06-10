@@ -18,7 +18,7 @@ import { COUNTRY_LIST } from '@/lib/countries'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 
 type VariableProduct = { id: string; sku: string; name: string }
-type ProductCategoryOption = { id: string; name: string; parentId: string | null }
+type ProductCategoryOption = { id: string; name: string; parentId: string | null; path: string }
 type SupplierOption = { id: string; name: string }
 
 type Props = {
@@ -120,10 +120,14 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
   }
 
   const e = state.errors ?? {}
-  const cleanedCategoryName = fields.categoryName.trim().replace(/\s+/g, ' ')
-  const categoryMatchesExisting = cleanedCategoryName.length > 0
-    && (productCategories ?? []).some((category) => normalizeCategoryOption(category.name) === normalizeCategoryOption(cleanedCategoryName))
-  const willCreateCategory = cleanedCategoryName.length > 0 && !categoryMatchesExisting
+  const cleanedCategoryPath = fields.categoryName
+    .split('>')
+    .map((segment) => segment.trim().replace(/\s+/g, ' '))
+    .filter((segment) => segment.length > 0)
+    .join(' > ')
+  const categoryMatchesExisting = cleanedCategoryPath.length > 0
+    && (productCategories ?? []).some((category) => normalizeCategoryOption(category.path) === normalizeCategoryOption(cleanedCategoryPath))
+  const willCreateCategory = cleanedCategoryPath.length > 0 && !categoryMatchesExisting
 
   const formContent = (
     <form action={formAction} className="space-y-6">
@@ -210,7 +214,7 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
             value={fields.categoryName}
             onChange={(ev) => set('categoryName', ev.target.value)}
             list="product-category-options"
-            placeholder="e.g. Filament"
+            placeholder="e.g. Apparel > T-Shirts"
           />
           {fields.categoryName.trim() && (
             <Button
@@ -226,11 +230,14 @@ export function ProductForm({ action, variableProducts, productCategories, suppl
         </div>
         <datalist id="product-category-options">
           {(productCategories ?? []).map((category) => (
-            <option key={category.id} value={category.name} />
+            <option key={category.id} value={category.path} />
           ))}
         </datalist>
+        <p className="text-xs text-muted-foreground">
+          Type or pick from the list. Use <span className="font-mono">&gt;</span> to nest (e.g. <span className="font-mono">Apparel &gt; T-Shirts</span>). Manage the full tree in <a className="underline" href="/settings/inventory">Settings &gt; Inventory</a>.
+        </p>
         {willCreateCategory && (
-          <p className="text-xs text-muted-foreground">Will create new category &ldquo;{cleanedCategoryName}&rdquo;.</p>
+          <p className="text-xs text-muted-foreground">Will create new category &ldquo;{cleanedCategoryPath}&rdquo;.</p>
         )}
         {e.categoryName && <p className="text-xs text-destructive">{e.categoryName[0]}</p>}
       </div>
