@@ -2,9 +2,13 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 
 import {
+  buildProductCategoryPathMap,
+  buildProductCategoryPathNormalized,
   cleanProductCategoryName,
+  getProductCategoryAncestry,
   normalizeProductCategoryName,
   PRODUCT_CATEGORY_NAME_MAX_LENGTH,
+  parseProductCategoryPath,
   resolveProductCategoryIdByName,
 } from '../lib/products/categories.ts'
 import { toCsv } from '../lib/csv.ts'
@@ -49,6 +53,68 @@ test('product export csv escapes category names containing csv syntax', () => {
     toCsv([{ sku: 'SKU-1', category: 'Hardware, "Special"\nParts' }], ['sku', 'category']),
     'sku,category\r\nSKU-1,"Hardware, ""Special""\nParts"',
   )
+})
+
+test('parseProductCategoryPath splits on > and cleans each segment', () => {
+  assert.deepEqual(parseProductCategoryPath('Apparel > T-Shirts > V-Neck'), ['Apparel', 'T-Shirts', 'V-Neck'])
+  assert.deepEqual(parseProductCategoryPath('  Apparel  >  T-Shirts  '), ['Apparel', 'T-Shirts'])
+  assert.deepEqual(parseProductCategoryPath('Apparel >> T-Shirts'), ['Apparel', 'T-Shirts'])
+  assert.deepEqual(parseProductCategoryPath('OnlyOne'), ['OnlyOne'])
+  assert.deepEqual(parseProductCategoryPath(''), [])
+  assert.deepEqual(parseProductCategoryPath(null), [])
+})
+
+test('buildProductCategoryPathNormalized joins normalized segments with the delimiter', () => {
+  assert.equal(buildProductCategoryPathNormalized(['Apparel', 'T-Shirts']), 'apparel>t-shirts')
+  assert.equal(buildProductCategoryPathNormalized(['Café']), 'cafe')
+  assert.equal(buildProductCategoryPathNormalized(['Promo', 'T-Shirts']), 'promo>t-shirts')
+})
+
+test('repeat leaf names under different parents normalize distinctly', async () => {
+  assert.notEqual(
+    await resolveProductCategoryIdByName('Apparel > T-Shirts', { dryRun: true }),
+    await resolveProductCategoryIdByName('Promo > T-Shirts', { dryRun: true }),
+  )
+  assert.equal(
+    await resolveProductCategoryIdByName('Apparel > T-Shirts', { dryRun: true }),
+    'preview-category:apparel>t-shirts',
+  )
+})
+
+test('path normalization is whitespace-tolerant and case-insensitive', async () => {
+  assert.equal(
+    await resolveProductCategoryIdByName(' apparel > t-shirts ', { dryRun: true }),
+    await resolveProductCategoryIdByName('APPAREL > T-Shirts', { dryRun: true }),
+  )
+})
+
+test('getProductCategoryAncestry returns root-most-first chain', () => {
+  const opts = [
+    { id: 'a', name: 'Apparel', parentId: null },
+    { id: 'b', name: 'T-Shirts', parentId: 'a' },
+    { id: 'c', name: 'V-Neck', parentId: 'b' },
+  ]
+  assert.deepEqual(
+    getProductCategoryAncestry('c', opts).map((n) => n.name),
+    ['Apparel', 'T-Shirts', 'V-Neck'],
+  )
+  assert.deepEqual(getProductCategoryAncestry('missing', opts), [])
+})
+
+test('buildProductCategoryPathMap renders full display path per id', () => {
+  const opts = [
+    { id: 'a', name: 'Apparel', parentId: null },
+    { id: 'b', name: 'T-Shirts', parentId: 'a' },
+    { id: 'c', name: 'V-Neck', parentId: 'b' },
+    { id: 'd', name: 'Promo', parentId: null },
+    { id: 'e', name: 'T-Shirts', parentId: 'd' },
+  ]
+  const map = buildProductCategoryPathMap(opts)
+  assert.equal(map.get('a'), 'Apparel')
+  assert.equal(map.get('b'), 'Apparel > T-Shirts')
+  assert.equal(map.get('c'), 'Apparel > T-Shirts > V-Neck')
+  assert.equal(map.get('e'), 'Promo > T-Shirts')
+  assert.notEqual(map.get('b'), map.get('e'))
 })
 
 test('csv export preserves fixed decimal reporting values as dot-decimal literals', () => {
