@@ -1,11 +1,30 @@
 'use client'
 
+import type { ComponentPropsWithoutRef } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import Markdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { cn } from '@/lib/utils'
 import type { HelpDoc } from '@/app/actions/help'
+
+function rewriteHelpHref(href: string | undefined): string | undefined {
+  if (!href) return href
+  if (/^[a-z][a-z0-9+.-]*:/i.test(href)) return href
+  if (href.startsWith('//') || href.startsWith('#') || href.startsWith('/')) return href
+  const match = href.match(/^(?:\.\/)?([a-z0-9-]+)\.md(#.*)?$/i)
+  if (!match) return href
+  const [, slug, anchor = ''] = match
+  return `/help/${slug}${anchor}`
+}
+
+function HelpMarkdownLink({ href, children, ...props }: ComponentPropsWithoutRef<'a'>) {
+  const rewritten = rewriteHelpHref(href)
+  if (rewritten && rewritten.startsWith('/help/')) {
+    return <Link href={rewritten} {...props}>{children}</Link>
+  }
+  return <a href={rewritten} {...props}>{children}</a>
+}
 
 type Props = {
   doc: HelpDoc
@@ -58,7 +77,7 @@ export function HelpClient({ doc, allDocs }: Props) {
           prose-strong:font-semibold
           prose-hr:my-6
         ">
-          <Markdown remarkPlugins={[remarkGfm]}>{doc.content}</Markdown>
+          <Markdown remarkPlugins={[remarkGfm]} components={{ a: HelpMarkdownLink }}>{doc.content}</Markdown>
         </div>
       </article>
     </div>

@@ -13,6 +13,9 @@ const DOCS_DIR = path.join(process.cwd(), 'help-docs')
 
 const HELP_DOCS = [
   { slug: 'getting-started', title: 'Getting Started' },
+  { slug: 'onboarding-walkthrough', title: 'Setup Wizard Walkthrough' },
+  { slug: 'glossary', title: 'Glossary' },
+  { slug: 'troubleshooting', title: 'Troubleshooting' },
   { slug: 'dashboard', title: 'Dashboard' },
   { slug: 'inventory', title: 'Inventory Management' },
   { slug: 'stock-control', title: 'Stock Control' },
