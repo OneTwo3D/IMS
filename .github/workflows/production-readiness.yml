@@ -172,6 +172,7 @@ jobs:
       - run: npm ci
       - run: npx prisma generate --schema prisma/schema.prisma
       - run: npx prisma migrate deploy --schema prisma/schema.prisma
+      - run: npm run invariant-check:preflight:fixture
       - run: npm run invariant-check:preflight
 
   build:

@@ -58,7 +58,9 @@ npx tsx --test tests/<relevant-file>.test.ts
 
 ## Invariant Preflight
 
-Production-readiness CI runs `npm run invariant-check:preflight` against a freshly migrated database. The command uses the same inventory, accounting, and sales invariant reporters as the scheduled cron but disables activity-log writes, admin notifications, and stored critical-finding hashes. It fails the build when any report fails or when any critical invariant finding is present.
+Production-readiness CI runs the invariant reporters against a freshly migrated database as a code-correctness gate, not as tenant-data validation. The workflow first runs `npm run invariant-check:preflight:fixture`, which seeds a known reserved-source mismatch, asserts the preflight fails, removes the fixture rows, and asserts the clean database passes. It then runs `npm run invariant-check:preflight` against the clean migrated database.
+
+The preflight command uses the same inventory, accounting, and sales invariant reporters as the scheduled cron but disables activity-log writes, admin notifications, and stored critical-finding hashes. It fails the build when any report fails or when any critical invariant finding is present. Tenant data still needs scheduled cron/operator runs against the tenant database, because CI's clean database cannot prove production data is healthy.
 
 Warnings and info findings do not block deploy, but they should be reviewed before merge when they relate to financial, inventory, or sales-order state.
 
