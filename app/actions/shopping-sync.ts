@@ -16,6 +16,7 @@ import {
   pushFxRatesToWcNow,
   saveWcCredentials,
   saveWcSyncSettings,
+  testWcCredentials,
   triggerManualSync,
   updateShoppingTaxRateMapping as updateShoppingTaxRateMappingImpl,
   upsertShoppingStatusMapping as upsertShoppingStatusMappingImpl,
@@ -37,6 +38,7 @@ import {
 import { isMaskedSecret, maskSecret } from '@/lib/security/secret-mask'
 import { getActiveShoppingConnectorInfo, syncShoppingConnectorStock } from '@/lib/shopping'
 import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
+import type { IntegrationConnectionTestState } from '@/lib/integration-connection-test-gate'
 
 export type ShoppingSyncSettings = WcSyncSettings
 export type ShoppingTaxRateMappingRow = TaxRateMappingRow
@@ -48,6 +50,7 @@ export type ShoppingConnectorCredentials = {
   secret: string
   secretMasked: boolean
   envOverrides: Record<string, string>
+  connectionTest: IntegrationConnectionTestState
 }
 export type ShopifySyncSettings = {
   shopify_sync_enabled: string
@@ -138,6 +141,10 @@ export async function getShoppingConnectorCredentials(): Promise<ShoppingConnect
 
 export async function saveShoppingConnectorCredentials(url: string, key: string, secret: string) {
   return saveWcCredentials(url, key, secret)
+}
+
+export async function testShoppingConnectorCredentials(url: string, key: string, secret: string) {
+  return testWcCredentials(url, key, secret)
 }
 
 export async function resetShoppingProductIdCache() {

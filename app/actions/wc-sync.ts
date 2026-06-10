@@ -20,6 +20,13 @@ import {
   WC_SYNC_ADVISORY_LOCK_KEY,
   WC_SETTINGS_VERSION_KEY,
 } from '@/lib/connectors/woocommerce/sync-lock'
+import {
+  assertIntegrationConnectionTestPassed,
+  buildIntegrationConnectionFingerprint,
+  getIntegrationConnectionTestState,
+  recordIntegrationConnectionTest,
+  type IntegrationConnectionTestState,
+} from '@/lib/integration-connection-test-gate'
 
 // All mutating exports in this file require the `sync` permission.
 async function requireAdmin() {
@@ -56,6 +63,13 @@ export type WcSyncSettings = {
   last_wc_fx_push_at: string
   envOverrides: Record<string, string>
 }
+
+const WC_ENABLE_SETTING_KEYS = [
+  'wc_sync_enabled',
+  'wc_sync_product_enabled',
+  'wc_stock_sync_enabled',
+  'wc_fx_push_enabled',
+] as const
 
 const SYNC_SETTING_KEYS = [
   'wc_sync_enabled', 'wc_sync_order_statuses', 'wc_sync_interval_minutes',
@@ -163,6 +177,34 @@ async function validateWooStoreBaseCurrency(credentials?: { url: string; key: st
   return { ok: true, storeCurrency, baseCurrency }
 }
 
+function buildWcConnectionFingerprint(input: { url: string; key: string; secret: string }): string {
+  return buildIntegrationConnectionFingerprint({
+    url: input.url.trim(),
+    key: input.key.trim(),
+    secret: input.secret.trim(),
+  })
+}
+
+async function getCurrentWcConnectionFingerprint(): Promise<string> {
+  const [url, key, secret] = await Promise.all([
+    getSettingValue('wc_url'),
+    getSettingValue('wc_consumer_key'),
+    getSettingValue('wc_consumer_secret'),
+  ])
+  return buildWcConnectionFingerprint({
+    url: url ?? '',
+    key: key ?? '',
+    secret: secret ?? '',
+  })
+}
+
+async function shouldGateWcEnable(data: Partial<WcSyncSettings>): Promise<boolean> {
+  const enabledKeys = WC_ENABLE_SETTING_KEYS.filter((key) => data[key] === 'true')
+  if (enabledKeys.length === 0) return false
+  const current = await getSettingValues([...enabledKeys])
+  return enabledKeys.some((key) => current.get(key) !== 'true')
+}
+
 export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise<{ success: boolean; error?: string }> {
   await requireAdmin()
   if (shouldFreshGateSecretWrite(data, 'wc_webhook_secret')) {
@@ -171,6 +213,10 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
   if (data.wc_sync_enabled === 'true') {
     const validation = await validateWooStoreBaseCurrency()
     if (!validation.ok) return { success: false, error: validation.error }
+  }
+  if (await shouldGateWcEnable(data)) {
+    const gate = await assertIntegrationConnectionTestPassed('woocommerce', await getCurrentWcConnectionFingerprint(), 'WooCommerce')
+    if (!gate.ok) return { success: false, error: gate.error }
   }
   const ops = Object.entries(data)
     .filter((entry): entry is [string, string] => SYNC_SETTING_KEYS.includes(entry[0]) && typeof entry[1] === 'string')
@@ -247,7 +293,17 @@ export async function saveWcCredentials(url: string, key: string, secret: string
     key: currentKey ?? '',
     secret: currentSecret ?? '',
   })
+  const testFingerprint = buildWcConnectionFingerprint({
+    url: validatedUrl.normalizedUrl,
+    key: currentKey ?? '',
+    secret: currentSecret ?? '',
+  })
   if (!currencyValidation.ok) {
+    await recordIntegrationConnectionTest('woocommerce', {
+      success: false,
+      fingerprint: testFingerprint,
+      message: currencyValidation.error,
+    })
     return { success: false, wipedMappings: 0, error: currencyValidation.error }
   }
 
@@ -336,6 +392,11 @@ export async function saveWcCredentials(url: string, key: string, secret: string
       : 'Updated WooCommerce connection credentials (no change detected, cache preserved)',
     metadata: { isRebind: saveOutcome.isRebind, wipedMappings: saveOutcome.wipedMappings },
   })
+  await recordIntegrationConnectionTest('woocommerce', {
+    success: true,
+    fingerprint: testFingerprint,
+    message: `Connection verified against WooCommerce (${currencyValidation.storeCurrency}).`,
+  })
   revalidatePath('/sync')
   return {
     success: true,
@@ -394,9 +455,47 @@ export async function resetWcProductIdCache(): Promise<{ success: boolean; wiped
   return { success: true, wipedMappings: wipedCount }
 }
 
-export async function getWcCredentials(): Promise<{ url: string; key: string; secret: string; secretMasked: boolean; envOverrides: Record<string, string> }> {
+export async function testWcCredentials(url: string, key: string, secret: string): Promise<{ success: boolean; error?: string; message?: string }> {
+  await requireFreshAdmin()
+
+  const validatedUrl = validateWooCommerceBaseUrl(url)
+  if (!validatedUrl.ok) {
+    return { success: false, error: validatedUrl.error }
+  }
+
+  const nextKey = key.trim()
+  const nextSecret = secret.trim()
+  const currentKey = isMaskedSecret(nextKey) ? await getSettingValue('wc_consumer_key') : nextKey
+  const currentSecret = isMaskedSecret(nextSecret) || !nextSecret ? await getSettingValue('wc_consumer_secret') : nextSecret
+  const fingerprint = buildWcConnectionFingerprint({
+    url: validatedUrl.normalizedUrl,
+    key: currentKey ?? '',
+    secret: currentSecret ?? '',
+  })
+  const validation = await validateWooStoreBaseCurrency({
+    url: validatedUrl.normalizedUrl,
+    key: currentKey ?? '',
+    secret: currentSecret ?? '',
+  })
+  await recordIntegrationConnectionTest('woocommerce', {
+    success: validation.ok,
+    fingerprint,
+    message: validation.ok
+      ? `Connection verified against WooCommerce (${validation.storeCurrency}).`
+      : validation.error,
+  })
+
+  if (!validation.ok) return { success: false, error: validation.error }
+  revalidatePath('/sync')
+  return { success: true, message: `Connection verified against WooCommerce (${validation.storeCurrency}).` }
+}
+
+export async function getWcCredentials(): Promise<{ url: string; key: string; secret: string; secretMasked: boolean; envOverrides: Record<string, string>; connectionTest: IntegrationConnectionTestState }> {
   await requireAdmin()
-  const map = await getSettingValues(['wc_url', 'wc_consumer_key', 'wc_consumer_secret'])
+  const [map, connectionTest] = await Promise.all([
+    getSettingValues(['wc_url', 'wc_consumer_key', 'wc_consumer_secret']),
+    getIntegrationConnectionTestState('woocommerce'),
+  ])
   const key = map.get('wc_consumer_key') ?? ''
   const secret = map.get('wc_consumer_secret') ?? ''
   return {
@@ -406,6 +505,7 @@ export async function getWcCredentials(): Promise<{ url: string; key: string; se
     secret: maskSecret(secret, 7),
     secretMasked: !!secret,
     envOverrides: getActiveSettingEnvOverrides(['wc_consumer_key', 'wc_consumer_secret']),
+    connectionTest,
   }
 }
 

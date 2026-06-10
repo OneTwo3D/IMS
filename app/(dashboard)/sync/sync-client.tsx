@@ -17,6 +17,7 @@ import {
   pushShoppingFxRatesNow,
   saveShoppingConnectorCredentials,
   saveShoppingSyncSettings,
+  testShoppingConnectorCredentials,
   triggerShoppingManualSync,
   updateShoppingTaxRateMapping,
   upsertShoppingStatusMapping,
@@ -429,6 +430,7 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
   const [saved, setSaved] = useState(false)
   const [connectionMessage, setConnectionMessage] = useState<string | null>(null)
   const [connectionError, setConnectionError] = useState(false)
+  const [testingConnection, setTestingConnection] = useState(false)
   const [syncResult, setSyncResult] = useState<{ text: string; isError: boolean } | null>(null)
   const [syncingType, setSyncingType] = useState<'orders' | 'products' | 'stock' | null>(null)
   const [importingTax, setImportingTax] = useState(false)
@@ -636,6 +638,24 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
     })
   }
 
+  async function handleTestConnection() {
+    setConnectionMessage(null)
+    setConnectionError(false)
+    setTestingConnection(true)
+    try {
+      const result = await testShoppingConnectorCredentials(wcUrl.trim(), wcKey.trim(), wcSecret.trim())
+      if (!result.success) {
+        setConnectionError(true)
+        setConnectionMessage(result.error ?? 'Connection test failed.')
+        return
+      }
+      setConnectionMessage(result.message ?? 'Connection test passed.')
+      router.refresh()
+    } finally {
+      setTestingConnection(false)
+    }
+  }
+
   function handleSaveSettings() {
     setSaved(false)
     startTransition(async () => {
@@ -796,8 +816,18 @@ export function SyncClient({ settings: init, taxMappings, statusMappings, logs, 
           {wcConfigured && (
             <p className="text-xs text-green-600 flex items-center gap-1"><Check className="h-3 w-3" />Connected to {wcUrl}</p>
           )}
+          {shoppingCredentials.connectionTest.status !== 'never' && (
+            <p className={`text-xs ${shoppingCredentials.connectionTest.status === 'success' ? 'text-green-600' : 'text-destructive'}`}>
+              Last connection test: {shoppingCredentials.connectionTest.status === 'success' ? 'passed' : 'failed'}
+              {shoppingCredentials.connectionTest.testedAt ? ` at ${new Date(shoppingCredentials.connectionTest.testedAt).toLocaleString('en-GB')}` : ''}
+              {shoppingCredentials.connectionTest.message ? ` — ${shoppingCredentials.connectionTest.message}` : ''}
+            </p>
+          )}
           <div className="flex items-center gap-2 pt-2">
-            <Button onClick={handleSaveConnection} disabled={isPending}>
+            <Button variant="outline" onClick={handleTestConnection} disabled={isPending || testingConnection}>
+              {testingConnection ? <Loader2 className="h-4 w-4 mr-2 animate-spin" /> : <RefreshCw className="h-4 w-4 mr-2" />}Test Connection
+            </Button>
+            <Button onClick={handleSaveConnection} disabled={isPending || testingConnection}>
               {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}Save Connection
             </Button>
             {connectionMessage && (

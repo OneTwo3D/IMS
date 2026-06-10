@@ -15,6 +15,7 @@ import {
   fetchAccountingTaxRates,
   getAccountingAccounts,
   getAccountingConnectionStatus,
+  getAccountingConnectionTestState,
   getAccountingSettingsMasked,
   getAccountingSyncLogs,
   getAccountingSyncReadiness,
@@ -36,7 +37,7 @@ export default async function SyncPage() {
     redirect('/settings/system?tab=plugins')
   }
 
-  const [shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, taxRatesRaw, accountingSettings, accountingStatus, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, accountingReadiness, currenciesRaw, shoppingPaymentMethods, accountingBatchPreview, accountingBatchHistory, mintsoftData] = await Promise.all([
+  const [shoppingSettings, shoppingTaxMappings, shoppingStatusMappings, shoppingLogs, shoppingCredentials, shopifySettings, shopifyCredentials, shopifyLogs, taxRatesRaw, accountingSettings, accountingStatus, accountingConnectionTest, accountingAccounts, accountingLogs, paymentMethodCombos, paymentAccountMap, accountingReadiness, currenciesRaw, shoppingPaymentMethods, accountingBatchPreview, accountingBatchHistory, mintsoftData] = await Promise.all([
     getShoppingSyncSettings(),
     getShoppingTaxRateMappings(),
     getShoppingStatusMappings(),
@@ -57,6 +58,7 @@ export default async function SyncPage() {
     getTaxRates(),
     getAccountingSettingsMasked(),
     getAccountingConnectionStatus(),
+    getAccountingConnectionTestState(),
     getAccountingAccounts(),
     getAccountingSyncLogs(50),
     getPaymentMethodCombos(),
@@ -102,6 +104,7 @@ export default async function SyncPage() {
         accountingSettings={accountingSettings}
         accountingConnected={accountingStatus.connected}
         accountingTenantName={accountingStatus.tenantName}
+        accountingConnectionTest={accountingConnectionTest}
         accountingAccounts={accountingAccounts}
         accountingLogs={accountingLogs}
         paymentMethodCombos={paymentMethodCombos}

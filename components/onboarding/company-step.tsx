@@ -217,7 +217,7 @@ export const CompanyStep = forwardRef<CompanyStepHandle, Props>(function Company
 
       const emailResult = await saveEmailSettings(emailSettings)
       if (!emailResult.success) {
-        setError('Failed to save email settings.')
+        setError(emailResult.error ?? 'Failed to save email settings.')
         return false
       }
 
