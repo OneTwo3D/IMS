@@ -6,6 +6,7 @@ import test from 'node:test'
 import { NextResponse } from 'next/server'
 import { GET as publicHealthGet } from '../../app/api/health/route.ts'
 import { handleInvoicePdfRoute } from '../../app/api/invoices/[id]/route.ts'
+import { handleShoppingInvoicePdfRoute } from '../../app/api/shopping/[connector]/invoice-pdf/route.ts'
 import { handleRfqGet, handleRfqGetRequest } from '../../app/api/rfq/[id]/route.ts'
 import { POST as e2eNotificationsPost } from '../../app/api/e2e/notifications/route.ts'
 import {
@@ -362,6 +363,37 @@ test('public signed invoice route rejects missing signed token before loading PD
           return { valid: false, reason: 'missing' }
         },
         async auditTokenAttempt() {},
+      },
+    ),
+    403,
+  )
+})
+
+test('public shopping invoice PDF route rejects unsigned requests before order lookup', async () => {
+  assertRouteAccess('/api/shopping/[connector]/invoice-pdf', 'public-webhook')
+
+  await expectStatus(
+    'shopping invoice without signature',
+    handleShoppingInvoicePdfRoute(
+      nextApiRouteRequest('/api/shopping/woocommerce/invoice-pdf', {
+        method: 'POST',
+        body: JSON.stringify({ connector: 'woocommerce', externalOrderId: '123' }),
+      }),
+      { connector: 'woocommerce' },
+      {
+        async getPluginEnabled() {
+          return true
+        },
+        async getSecret() {
+          return 'secret'
+        },
+        async findOrder() {
+          throw new Error('Order lookup should not be reached without a valid signature')
+        },
+        async loadInvoicePdf() {
+          throw new Error('PDF storage should not be reached without a valid signature')
+        },
+        async auditAttempt() {},
       },
     ),
     403,

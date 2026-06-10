@@ -274,6 +274,10 @@ export const apiRouteAuthPolicy = {
     access: 'public-webhook',
     reason: 'Public signed-URL invoice PDF endpoint; requires a valid expiring token bound to the current IMS session and client IP.',
   },
+  '/api/shopping/[connector]/invoice-pdf': {
+    access: 'public-webhook',
+    reason: 'Public shopping customer invoice PDF handoff; requires connector plugin enablement plus a short-lived connector HMAC request from the shopping platform.',
+  },
   '/api/manufacturing-order/[id]': {
     access: 'authenticated',
     reason: 'Requires an authenticated user with manufacturing permission.',

@@ -7,16 +7,19 @@ import { db } from '@/lib/db'
 import { wcPost, wcPut } from '../api'
 import { getAccountingSettings } from '@/lib/accounting'
 import { logActivity } from '@/lib/activity-log'
+import { getPublicAppUrl } from '@/lib/public-app-url'
 
 /**
- * Push an accounting invoice link as an admin-only note and order meta.
- * IMS PDF links are session/IP-bound, so they are not written to storefront notes.
+ * Push invoice metadata for WooCommerce order screens.
+ * Customer PDF downloads use the WooCommerce helper plugin as the customer
+ * authorization boundary, then the plugin calls IMS server-to-server.
  */
 export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: boolean; error?: string }> {
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
     select: {
       invoiceNumber: true,
+      invoicePdfPath: true,
       orderNumber: true,
       externalOrderNumber: true,
       accountingInvoiceId: true,
@@ -33,6 +36,7 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
 
   const wcOrderLabel = wcLink.externalOrderNumber ?? so.externalOrderNumber ?? wcLink.externalOrderId
   let failure: string | null = null
+  const publicAppUrl = await getPublicAppUrl()
 
   // Build accounting invoice URL
   let accountingInvoiceUrl: string | null = null
@@ -60,6 +64,25 @@ export async function pushInvoiceNoteToWc(orderId: string): Promise<{ success: b
   // Store meta on WC order for button rendering by mu-plugin
   const metaData: { key: string; value: string }[] = []
   if (accountingInvoiceUrl) metaData.push({ key: '_accounting_invoice_url', value: accountingInvoiceUrl })
+  if (so.invoicePdfPath) {
+    if (publicAppUrl) {
+      metaData.push(
+        { key: '_ims_invoice_pdf_available', value: 'yes' },
+        { key: '_ims_invoice_pdf_endpoint', value: `${publicAppUrl}/api/shopping/woocommerce/invoice-pdf` },
+      )
+    } else {
+      const message = `Cannot expose customer invoice PDF for WC order #${wcOrderLabel}: public_app_url is not configured`
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'wc_invoice_pdf_customer_link_skipped',
+        tag: 'sync',
+        level: 'WARNING',
+        description: message,
+      })
+      if (!failure) failure = message
+    }
+  }
 
   if (metaData.length > 0) {
     try {

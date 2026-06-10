@@ -40,12 +40,31 @@ if (!function_exists('oti_get_order_meta')) {
     }
 }
 
+if (!function_exists('oti_order_has_invoice_pdf')) {
+    function oti_order_has_invoice_pdf(int $order_id): bool
+    {
+        return oti_get_order_meta($order_id, '_ims_invoice_pdf_available') === 'yes'
+            && oti_get_order_meta($order_id, '_ims_invoice_pdf_endpoint') !== '';
+    }
+}
+
+if (!function_exists('oti_invoice_download_url')) {
+    function oti_invoice_download_url(int $order_id): string
+    {
+        return wp_nonce_url(
+            rest_url(OTI_FX_NAMESPACE . '/invoice-pdf/' . $order_id),
+            'oti_invoice_pdf_' . $order_id,
+            '_wpnonce'
+        );
+    }
+}
+
 // Customer: "Invoice" button on My Account orders list
 add_filter('woocommerce_my_account_my_orders_actions', function (array $actions, $order) {
-    $pdf_url = oti_get_order_meta($order->get_id(), '_invoice_pdf_url');
-    if ($pdf_url) {
+    $order_id = $order->get_id();
+    if (oti_order_has_invoice_pdf($order_id)) {
         $actions['invoice_pdf'] = [
-            'url'  => esc_url($pdf_url),
+            'url'  => esc_url(oti_invoice_download_url($order_id)),
             'name' => __('Invoice', 'woocommerce'),
         ];
     }
@@ -54,12 +73,12 @@ add_filter('woocommerce_my_account_my_orders_actions', function (array $actions,
 
 // Customer: "Download Invoice" button on order detail page
 add_action('woocommerce_order_details_after_order_table', function ($order) {
-    $pdf_url = oti_get_order_meta($order->get_id(), '_invoice_pdf_url');
-    if (!$pdf_url) return;
+    $order_id = $order->get_id();
+    if (!oti_order_has_invoice_pdf($order_id)) return;
 
     printf(
         '<p class="oti-invoice-download"><a href="%s" class="button" target="_blank" rel="noopener noreferrer">%s</a></p>',
-        esc_url($pdf_url),
+        esc_url(oti_invoice_download_url($order_id)),
         esc_html__('Download Invoice PDF', 'woocommerce')
     );
 });
@@ -86,18 +105,18 @@ if (!function_exists('oti_render_invoice_meta_box')) {
     {
         $order_id = $post_or_order instanceof WP_Post ? $post_or_order->ID : $post_or_order->get_id();
 
-        $pdf_url        = oti_get_order_meta($order_id, '_invoice_pdf_url');
+        $has_pdf        = oti_order_has_invoice_pdf($order_id);
         $accounting_url = oti_get_order_meta($order_id, '_accounting_invoice_url');
 
-        if (!$pdf_url && !$accounting_url) {
+        if (!$has_pdf && !$accounting_url) {
             echo '<p>' . esc_html__('No invoice available yet.', 'woocommerce') . '</p>';
             return;
         }
 
-        if ($pdf_url) {
+        if ($has_pdf) {
             printf(
                 '<p><a href="%s" class="button" target="_blank" rel="noopener noreferrer">%s</a></p>',
-                esc_url($pdf_url),
+                esc_url(oti_invoice_download_url($order_id)),
                 esc_html__('Download PDF', 'woocommerce')
             );
         }
@@ -146,6 +165,17 @@ add_action('rest_api_init', function () {
         'methods'             => 'POST',
         'permission_callback' => 'oti_verify_fx_signature',
         'callback'            => 'oti_handle_fx_push',
+    ]);
+    register_rest_route(OTI_FX_NAMESPACE, '/invoice-pdf/(?P<order_id>\d+)', [
+        'methods'             => 'GET',
+        'permission_callback' => 'oti_can_download_invoice_pdf',
+        'callback'            => 'oti_proxy_invoice_pdf',
+        'args'                => [
+            'order_id' => [
+                'required'          => true,
+                'sanitize_callback' => 'absint',
+            ],
+        ],
     ]);
 });
 
@@ -215,6 +245,87 @@ if (!function_exists('oti_handle_fx_push')) {
             'pushed'  => count($clean),
             'skipped' => $skipped,
         ]);
+    }
+}
+
+if (!function_exists('oti_can_download_invoice_pdf')) {
+    function oti_can_download_invoice_pdf(WP_REST_Request $request)
+    {
+        $order_id = absint($request['order_id']);
+        if ($order_id <= 0 || !function_exists('wc_get_order')) {
+            return new WP_Error('oti_invoice_not_found', 'Invoice not found', ['status' => 404]);
+        }
+
+        $nonce = $request->get_param('_wpnonce');
+        if (!is_string($nonce) || !wp_verify_nonce($nonce, 'oti_invoice_pdf_' . $order_id)) {
+            return new WP_Error('oti_invoice_bad_nonce', 'Invalid invoice download request', ['status' => 403]);
+        }
+
+        $order = wc_get_order($order_id);
+        if (!$order || !oti_order_has_invoice_pdf($order_id)) {
+            return new WP_Error('oti_invoice_not_found', 'Invoice not found', ['status' => 404]);
+        }
+
+        if (current_user_can('manage_woocommerce')) return true;
+        $user_id = get_current_user_id();
+        if ($user_id > 0 && (int) $order->get_customer_id() === $user_id) return true;
+
+        return new WP_Error('oti_invoice_forbidden', 'Invoice not found', ['status' => 404]);
+    }
+}
+
+if (!function_exists('oti_proxy_invoice_pdf')) {
+    function oti_proxy_invoice_pdf(WP_REST_Request $request)
+    {
+        $order_id = absint($request['order_id']);
+        $order = function_exists('wc_get_order') ? wc_get_order($order_id) : null;
+        if (!$order) {
+            return new WP_Error('oti_invoice_not_found', 'Invoice not found', ['status' => 404]);
+        }
+
+        $endpoint = oti_get_order_meta($order_id, '_ims_invoice_pdf_endpoint');
+        $secret = (string) get_option(OTI_FX_SECRET_OPT, '');
+        if ($endpoint === '' || $secret === '') {
+            return new WP_Error('oti_invoice_not_configured', 'Invoice download is not configured', ['status' => 503]);
+        }
+
+        $now = time();
+        $payload = [
+            'connector'          => 'woocommerce',
+            'externalOrderId'    => (string) $order_id,
+            'externalCustomerId' => (string) $order->get_customer_id(),
+            'issuedAt'           => $now,
+            'expiresAt'          => $now + 300,
+            'nonce'              => wp_generate_uuid4(),
+        ];
+        $body = wp_json_encode($payload);
+        if (!is_string($body)) {
+            return new WP_Error('oti_invoice_payload_failed', 'Invoice download failed', ['status' => 500]);
+        }
+
+        $response = wp_remote_post($endpoint, [
+            'timeout' => 30,
+            'headers' => [
+                'Content-Type'    => 'application/json',
+                'X-OTI-Signature' => hash_hmac('sha256', $body, $secret),
+            ],
+            'body' => $body,
+        ]);
+        if (is_wp_error($response)) {
+            return new WP_Error('oti_invoice_upstream_failed', 'Invoice download failed', ['status' => 502]);
+        }
+
+        $code = (int) wp_remote_retrieve_response_code($response);
+        $pdf = wp_remote_retrieve_body($response);
+        if ($code !== 200 || $pdf === '') {
+            return new WP_Error('oti_invoice_unavailable', 'Invoice not found', ['status' => $code >= 400 ? $code : 502]);
+        }
+
+        nocache_headers();
+        header('Content-Type: application/pdf');
+        header('Content-Disposition: inline; filename="invoice-' . $order_id . '.pdf"');
+        echo $pdf;
+        exit;
     }
 }
 
@@ -333,14 +444,14 @@ if (!function_exists('oti_render_settings_page')) {
 
         echo '<div class="wrap">';
         echo '<h1>onetwoInventory Helper</h1>';
-        echo '<p>Companion plugin for One Two Inventory. Receives FX rates from IMS so the storefront, IMS and Xero use the same exchange rates.</p>';
+        echo '<p>Companion plugin for One Two Inventory. Receives FX rates from IMS and proxies customer invoice PDF downloads after WooCommerce account ownership checks.</p>';
 
         echo '<form method="post" action="options.php">';
         settings_fields('oti_helper');
         echo '<table class="form-table" role="presentation">';
         echo '<tr><th scope="row"><label for="oti-secret">Shared secret</label></th>';
         echo '<td><input type="password" id="oti-secret" name="' . esc_attr(OTI_FX_SECRET_OPT) . '" value="' . esc_attr($secret) . '" class="regular-text" autocomplete="off">';
-        echo '<p class="description">Paste the same value you set as <code>WC_WEBHOOK_SECRET</code> in One Two Inventory. Used to verify FX rate pushes.</p></td></tr>';
+        echo '<p class="description">Paste the same value you set as <code>WC_WEBHOOK_SECRET</code> in One Two Inventory. Used to verify FX rate pushes and sign customer invoice PDF requests back to IMS.</p></td></tr>';
         echo '</table>';
         submit_button();
         echo '</form>';

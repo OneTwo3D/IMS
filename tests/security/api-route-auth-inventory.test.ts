@@ -41,6 +41,7 @@ test('public-webhook policy entries are tracked for executable behavior coverage
     '/api/auth/[...nextauth]',
     '/api/health',
     '/api/invoices/[id]',
+    '/api/shopping/[connector]/invoice-pdf',
     '/api/uploads/branding/[filename]',
     '/api/webhooks/mintsoft/asn-booked-in',
     '/api/webhooks/shopping/[connector]/[resource]',
