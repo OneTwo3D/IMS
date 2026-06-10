@@ -176,14 +176,14 @@ function CollapsibleSection({
         type="button"
         onClick={() => setExpandedByUser((v) => !v)}
         className={cn(
-          'flex w-full items-center gap-1.5 rounded-md px-2 py-1 text-[10px] font-semibold uppercase tracking-wider transition-colors select-none cursor-pointer',
+          'flex w-full items-center gap-1.5 rounded-md px-2 py-1.5 text-sm font-semibold transition-colors select-none cursor-pointer',
           'hover:text-foreground',
-          hasActiveLink ? 'text-foreground' : 'text-muted-foreground/70',
+          hasActiveLink ? 'text-foreground' : 'text-muted-foreground',
         )}
         aria-expanded={open}
       >
         <ChevronDown
-          className={cn('h-3 w-3 shrink-0 transition-transform', open ? 'rotate-0' : '-rotate-90')}
+          className={cn('h-3.5 w-3.5 shrink-0 transition-transform', open ? 'rotate-0' : '-rotate-90')}
         />
         <span className="truncate text-left">{heading}</span>
       </button>
